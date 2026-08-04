@@ -25,10 +25,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from server_bot_ai import BotPlanner
+
 
 PROTOCOL_VERSION = 5
 TICK_HZ = 30.0
-MAX_LINE_BYTES = 16 * 1024
+MAX_LINE_BYTES = 256 * 1024
 DEFAULT_MAP = "server_random"
 MAP_POOL = (
     "01_karelia",
@@ -163,6 +165,8 @@ class BattleState:
         self.bot_authority_id = None
         self.bot_manifest = []
         self.bot_states = {}
+        self.bot_planner = BotPlanner()
+        self.bot_orders = {"revision": 0, "orders": []}
         self.bot_reported_hits = set()
         self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
                                       "2": {"points": 0, "stopped": False}}}
@@ -278,6 +282,8 @@ class BattleState:
                 self.bot_authority_id = None
                 self.bot_manifest = []
                 self.bot_states = {}
+                self.bot_planner.reset()
+                self.bot_orders = {"revision": 0, "orders": []}
                 self.bot_reported_hits = set()
                 self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
                                                "2": {"points": 0, "stopped": False}}}
@@ -324,6 +330,8 @@ class BattleState:
                 "bots": list(self.bot_roster),
                 "bot_authority_id": self.bot_authority_id,
                 "bot_manifest": list(self.bot_manifest),
+                "bot_order_revision": self.bot_orders["revision"],
+                "bot_orders": list(self.bot_orders["orders"]),
                 "rules": self.rules_state,
                 "battle_result": self.battle_result,
             }, None
@@ -345,6 +353,8 @@ class BattleState:
                 "bots": list(self.bot_roster),
                 "bot_authority_id": self.bot_authority_id,
                 "bot_manifest": list(self.bot_manifest),
+                "bot_order_revision": self.bot_orders["revision"],
+                "bot_orders": list(self.bot_orders["orders"]),
                 "rules": self.rules_state,
                 "battle_result": self.battle_result,
             }
@@ -382,6 +392,8 @@ class BattleState:
                     "vehicle": _safe_vehicle(raw.get("vehicle"), "ussr:MS-1"),
                     "max_health": max_health,
                     "health": health,
+                    "profile": self._sanitize_bot_profile(raw.get("profile")),
+                    "route": self._sanitize_bot_route(raw.get("route")),
                 }
                 manifest.append(entry)
                 states[bot_id] = self._sanitize_bot_state(raw, entry, None)
@@ -392,6 +404,63 @@ class BattleState:
                 self.bot_states = states
             self.pending_events.append({"kind": "bot_manifest", "bots": list(manifest)})
             return True
+
+    @staticmethod
+    def _sanitize_bot_profile(raw):
+        raw = raw if isinstance(raw, dict) else {}
+        profile = {}
+        for key in ("class_tag", "dominant_role"):
+            profile[key] = _safe_name(raw.get(key), "unknown")
+        roles = raw.get("roles")
+        profile["roles"] = {}
+        if isinstance(roles, dict):
+            for key, value in list(roles.items())[:8]:
+                role = _safe_name(key, "unknown")
+                profile["roles"][role] = round(
+                    _clamp(_finite_float(value), 0.0, 1.0), 3)
+        for key, default, maximum in (("desired_range", 180.0, 2000.0),
+                                      ("fire_range", 500.0, 2500.0),
+                                      ("speed", 0.0, 200.0),
+                                      ("armor", 0.0, 10000.0)):
+            profile[key] = round(_clamp(_finite_float(raw.get(key), default), 0.0, maximum), 3)
+        profile["shells"] = []
+        for shell in (raw.get("shells") or [])[:5]:
+            if not isinstance(shell, dict):
+                continue
+            profile["shells"].append({
+                "index": max(0, min(int(_finite_float(shell.get("index"), 0)), 9)),
+                "kind": _safe_name(shell.get("kind"), "unknown"),
+                "penetration": round(_clamp(_finite_float(shell.get("penetration")), 0.0, 10000.0), 3),
+                "damage": round(_clamp(_finite_float(shell.get("damage")), 0.0, 10000.0), 3),
+                "speed": round(_clamp(_finite_float(shell.get("speed")), 0.0, 10000.0), 3),
+            })
+        return profile
+
+    @staticmethod
+    def _sanitize_bot_route(raw):
+        raw = raw if isinstance(raw, dict) else {}
+        route = {"id": _safe_name(raw.get("id"), "server_route"),
+                 "waypoints": []}
+        for point in (raw.get("waypoints") or [])[:16]:
+            if not isinstance(point, dict):
+                continue
+            route["waypoints"].append({
+                "x": round(_clamp(_finite_float(point.get("x")), -2000.0, 2000.0), 3),
+                "y": round(_clamp(_finite_float(point.get("y")), -1000.0, 1000.0), 3),
+                "z": round(_clamp(_finite_float(point.get("z")), -2000.0, 2000.0), 3),
+                "hold": bool(point.get("hold", False)),
+            })
+        return route
+
+    def update_bot_observation(self, player_id, message):
+        """Accept authority observations; never derive contacts from snapshots."""
+        with self.lock:
+            if self.phase != "battle" or player_id != self.bot_authority_id:
+                return False
+            players = [self._public_player(p) for p in self.players.values() if p.connected]
+            known_targets = self.bot_planner.known_targets(list(self.bot_states.values()), players)
+            accepted = self.bot_planner.report_contacts(message.get("contacts"), known_targets, time.monotonic())
+            return accepted > 0
 
     @staticmethod
     def _sanitize_bot_state(raw, identity, previous):
@@ -405,6 +474,7 @@ class BattleState:
             fire_seq = 0
         if previous is not None:
             fire_seq = max(fire_seq, int(previous.get("fire_seq", 0)))
+        yaw = _finite_float(raw.get("yaw"), 0.0)
         return {
             "id": int(identity["id"]),
             "team": int(identity["team"]),
@@ -415,8 +485,8 @@ class BattleState:
             "x": round(_clamp(_finite_float(raw.get("x")), -2000.0, 2000.0), 4),
             "y": round(_clamp(_finite_float(raw.get("y")), -1000.0, 1000.0), 4),
             "z": round(_clamp(_finite_float(raw.get("z")), -2000.0, 2000.0), 4),
-            "yaw": round(_finite_float(raw.get("yaw")), 5),
-            "aim_yaw": round(_finite_float(raw.get("aim_yaw"), raw.get("yaw")), 5),
+            "yaw": round(yaw, 5),
+            "aim_yaw": round(_finite_float(raw.get("aim_yaw"), yaw), 5),
             "gun_pitch": round(_clamp(_finite_float(raw.get("gun_pitch")), -1.2, 1.2), 5),
             "fire_seq": fire_seq,
             "shell_index": max(0, min(int(_finite_float(raw.get("shell_index"), 0)), 9)),
@@ -690,6 +760,10 @@ class BattleState:
             self.tick += 1
             for player in list(self.players.values()):
                 self._apply_movement(player, dt)
+            self.bot_orders = self.bot_planner.build_orders(
+                self.bot_manifest, list(self.bot_states.values()),
+                [self._public_player(p) for p in self.players.values() if p.connected],
+                time.monotonic())
             events = self.pending_events
             self.pending_events = []
             snapshot = {
@@ -700,6 +774,8 @@ class BattleState:
                 "bot_authority_id": self.bot_authority_id,
                 "players": [self._public_player(p) for p in self.players.values() if p.connected],
                 "bots": [self.bot_states[key] for key in sorted(self.bot_states)],
+                "bot_order_revision": self.bot_orders["revision"],
+                "bot_orders": list(self.bot_orders["orders"]),
                 "rules": self.rules_state,
                 "battle_result": self.battle_result,
             }
@@ -859,6 +935,9 @@ class ClientHandler(socketserver.BaseRequestHandler):
                             _server_log("BOT MANIFEST rejected sender=%d" % player.player_id)
                     elif message.get("type") == "bot_state":
                         server.state.update_bot_states(player.player_id, message)
+                    elif message.get("type") == "bot_observation":
+                        if not server.state.update_bot_observation(player.player_id, message):
+                            _server_log("BOT OBSERVATION rejected sender=%d" % player.player_id)
                     elif message.get("type") == "bot_hit_report":
                         if not server.state.report_bot_hit(player.player_id, message):
                             _server_log("BOT HIT rejected attacker=%d target=%s seq=%s" % (

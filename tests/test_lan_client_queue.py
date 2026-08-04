@@ -541,6 +541,44 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertEqual(1, bot._network_bot_shell_index)
         self.assertEqual(1, len(self.network._test_shot_presentations))
 
+    def test_snapshot_stores_revisioned_server_order_and_converts_coordinates(self):
+        player = Player()
+        player._offhangar_network_id = 1
+        player._offhangar_network_formation = lambda team, slot: (
+            (0.0, 0.0, 0.0) if team == 1 else (0.0, 100.0, math.pi)
+        )
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        player._offhangar_network_client = client
+        client.player_id = 1
+        client.ready = True
+        client.phase = "battle"
+
+        client._handle_message({
+            "type": "snapshot", "bot_authority_id": 1,
+            "players": [], "bots": [], "bot_order_revision": 7,
+            "bot_orders": [{
+                "id": 16, "target_id": 2, "target_kind": "human",
+                "move_position": {"x": 5.0, "y": 2.0, "z": 20.0},
+                "aim_position": {"x": -4.0, "y": 1.0, "z": 80.0},
+            }],
+        })
+
+        mock = types.SimpleNamespace(_network_bot_id=16)
+        order = self.network.authoritative_bot_order(player, mock)
+        self.assertEqual(7, client.bot_order_revision)
+        self.assertEqual(2, order["target_id"])
+        self.assertEqual((5.0, 2.0, 20.0), order["move_position"])
+        self.assertEqual((-4.0, 1.0, 80.0), order["aim_position"])
+
+        client._handle_message({
+            "type": "snapshot", "bot_authority_id": 1,
+            "players": [], "bots": [], "bot_order_revision": 6,
+            "bot_orders": [{"id": 16, "target_id": 999}],
+        })
+        self.assertEqual(2, client.bot_orders[16]["target_id"])
+
     def test_remote_pose_is_interpolated_between_thirty_hz_snapshots(self):
         class Matrix:
             def setRotateYPR(self, rotation):

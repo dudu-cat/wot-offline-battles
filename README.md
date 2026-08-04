@@ -15,6 +15,14 @@ from congestion. This AI is used in both normal offline play and LAN-authority
 simulation. Assault and encounter variants are intentionally outside the
 supported mode.
 
+The same AI can run through the companion server with only one connected
+player. In that mode the server owns global route progress, target reservations,
+last-known contacts and revisioned bot orders. The elected authority client
+keeps only the work that depends on proprietary client data: spotting
+observations, terrain/vehicle collision, local steering, shell collision and
+BigWorld entity control. Normal offline mode uses the same new AI locally as a
+server-free fallback; it does not switch back to the legacy chase logic.
+
 
 Install
 -------
@@ -76,13 +84,17 @@ broadcasts one start with that map to every client. LAN mode never starts a
 local random-map timer while it is waiting or after a failed connection. A
 client that connects after the round starts joins that same running round.
 
-The first client in the battle is elected as bot/rules authority. All clients
-receive the same bot names, tanks, positions, movement, firing, HP and deaths,
-plus shared capture progress and one shared battle result. If that client
-disconnects, the server elects another connected client. Human input, bot
-state and server snapshots use 30 Hz updates; remote vehicles are interpolated
-every render frame with a short bounded prediction. The stock ping and
-connection indicator show the measured LAN connection rather than placeholders.
+The first client in the battle is elected as map-simulation/rules authority.
+It uploads vehicle profiles, standard-battle route anchors and limited spotting
+observations. The server assigns targets, advances routes and sends monotonic
+revisioned orders back; the authority client executes those orders against the
+real map. All clients receive the same bot names, tanks, positions, movement,
+firing, HP and deaths, plus shared capture progress and one shared battle
+result. If that client disconnects, the server elects another connected client.
+Human input, bot state and server snapshots use 30 Hz updates; remote vehicles
+are interpolated every render frame with a short bounded prediction. The stock
+ping and connection indicator show the measured LAN connection rather than
+placeholders.
 
 Only the server process needs an external Python 3 installation; the client
 mod uses the Python 2 runtime already embedded in the 0.8.2 client. See

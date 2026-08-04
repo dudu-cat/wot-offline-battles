@@ -72,11 +72,15 @@ class BotAITest(unittest.TestCase):
         group_index = bootstrap.index("'bot_ai_maps_group_a'")
         maps_index = bootstrap.index("'bot_ai_maps',")
         ai_index = bootstrap.index("'bot_ai',")
+        navigation_index = bootstrap.index("'bot_ai_navigation'")
+        driver_index = bootstrap.index("'bot_ai_driver'")
         battle_index = bootstrap.index("'offline_battle',")
 
         self.assertLess(group_index, maps_index)
         self.assertLess(maps_index, ai_index)
-        self.assertLess(ai_index, battle_index)
+        self.assertLess(ai_index, navigation_index)
+        self.assertLess(navigation_index, driver_index)
+        self.assertLess(driver_index, battle_index)
 
     def test_vehicle_stats_produce_distinct_tactical_profiles(self):
         heavy = self.ai.build_vehicle_profile(
@@ -293,6 +297,83 @@ class BotAITest(unittest.TestCase):
             403, position, 0.0, 1000, 1000, 0.0
         )
         self.assertIsNone(light_order["throttle_override"])
+
+    def test_serialized_profile_can_be_registered_by_a_remote_planner(self):
+        profile = self.ai.build_vehicle_profile(
+            descriptor("mediumTank", speed=17.0, armor=70.0)
+        )
+        director = self.ai.BattleDirector("04_himmelsdorf", "server-round")
+        agent = director.register_profile(701, 1, profile, "Remote medium")
+
+        self.assertEqual("mediumTank", agent["profile"]["class_tag"])
+        self.assertIsNotNone(agent["route"])
+        self.assertEqual(profile["roles"], agent["profile"]["roles"])
+
+    def test_team_target_assignment_spreads_fire_after_reservation(self):
+        director = self.ai.BattleDirector("04_himmelsdorf", "focus-fire")
+        for bot_id in range(801, 805):
+            director.register(
+                bot_id, 1, descriptor("mediumTank", speed=16.0),
+                "Medium %s" % bot_id,
+            )
+        for target_id, x in ((901, 150.0), (902, 220.0)):
+            director.update_contact(
+                1, target_id, 2, (x, 0.0, 20.0), 600, 600,
+                "mediumTank", True, 1.0, armor=70.0,
+            )
+
+        assignments = [
+            director.order_for(
+                bot_id, (185.0, 0.0, -82.0), 0.0, 800, 800, 1.0
+            )["target_id"]
+            for bot_id in range(801, 805)
+        ]
+
+        self.assertEqual({901, 902}, set(assignments))
+        self.assertLessEqual(max(assignments.count(901), assignments.count(902)), 3)
+
+    def test_mobile_vehicle_uses_force_aware_flanking_position(self):
+        director = self.ai.BattleDirector("04_himmelsdorf", "flank")
+        agent = director.register(
+            1001, 1, descriptor("mediumTank", speed=18.0), "Flanker"
+        )
+        agent["personality"].update({
+            "initiative": 0.9,
+            "caution": 0.35,
+            "aggression": 0.65,
+        })
+        position = (185.0, 0.0, -82.0)
+        target = (185.0, 0.0, 35.0)
+        director.update_contact(
+            1, 1002, 2, target, 800, 800, "heavyTank", True, 2.0,
+            armor=140.0,
+        )
+
+        order = director.order_for(1001, position, 0.0, 800, 800, 2.0)
+
+        self.assertEqual("flank", order["combat_mode"])
+        self.assertNotEqual(target, order["move_position"])
+        self.assertNotEqual(position, order["move_position"])
+
+    def test_shell_selection_uses_armor_instead_of_always_slot_zero(self):
+        profile = {
+            "shells": (
+                {"index": 0, "kind": "ARMOR_PIERCING", "penetration": 105,
+                 "damage": 220},
+                {"index": 1, "kind": "HOLLOW_CHARGE", "penetration": 210,
+                 "damage": 200},
+                {"index": 2, "kind": "HIGH_EXPLOSIVE", "penetration": 45,
+                 "damage": 330},
+            )
+        }
+
+        shell_index = self.ai.select_shell_index(
+            profile,
+            {"armor": 170, "health": 900, "distance": 180},
+            {"aggression": 0.55},
+        )
+
+        self.assertEqual(1, shell_index)
 
 
 if __name__ == "__main__":

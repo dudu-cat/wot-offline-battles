@@ -1575,6 +1575,65 @@ def _offh_ai_navigator(director):
 	return navigator
 
 
+def _offh_ai_driver():
+	"""Return the per-battle local driver shared by every simulated bot."""
+	driver = globals().get('g_offh_local_driver')
+	if driver is not None:
+		return driver
+	from gui.mods.offhangar.bot_ai_driver import LocalDriver
+	driver = LocalDriver()
+	globals()['g_offh_local_driver'] = driver
+	LOG_DEBUG('OfflineBattle.SMART_AI local driver enabled')
+	return driver
+
+
+def _offh_ai_direction_clear(vehicle, absolute_yaw):
+	"""Probe one hull-width movement corridor for the engine-free driver."""
+	try:
+		import BigWorld, Math, math
+		speed = abs(float(getattr(vehicle, '_veh_velocity', 0.0) or 0.0))
+		far_distance = 20.0 if speed > 5.0 else 15.0
+		previous_y = float(vehicle.position.y)
+		previous_distance = 0.0
+		sine = math.sin(float(absolute_yaw))
+		cosine = math.cos(float(absolute_yaw))
+		lateral_x = cosine
+		lateral_z = -sine
+		for height, distance in ((0.7, 8.0), (1.5, far_distance)):
+			x = float(vehicle.position.x) + sine * distance
+			z = float(vehicle.position.z) + cosine * distance
+			run = distance - previous_distance
+			probe_up = max(4.5, run * 0.52)
+			probe_down = max(5.0, run * 0.45)
+			ground = BigWorld.wg_collideSegment(
+				_offh_bspace(), Math.Vector3(x, previous_y + probe_up, z),
+				Math.Vector3(x, previous_y - probe_down, z), 128)
+			if ground is None:
+				return False
+			y = float(ground[0].y)
+			if _offh_water_depth(x, y, z) > 1.0:
+				return False
+			delta = y - previous_y
+			if delta > run * 0.48 or delta < -run * 0.38:
+				return False
+			for offset in (-2.2, 0.0, 2.2):
+				start = Math.Vector3(
+					float(vehicle.position.x) + lateral_x * offset,
+					float(vehicle.position.y) + height,
+					float(vehicle.position.z) + lateral_z * offset)
+				end = Math.Vector3(
+					x + lateral_x * offset, y + height,
+					z + lateral_z * offset)
+				if BigWorld.wg_collideSegment(
+						_offh_bspace(), start, end, 128) is not None:
+					return False
+			previous_y = y
+			previous_distance = distance
+		return True
+	except Exception:
+		return False
+
+
 def _offh_ai_class_tag(mock, descriptor):
 	if mock is not None:
 		cached = getattr(mock, '_offh_ai_class_tag', None)
@@ -1638,13 +1697,19 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 	player_mock = mock_vehicles.get(player_id)
 	player_health = getattr(player_mock, 'health', getattr(player, 'health', 1))
 	player_max_health = getattr(player_mock, 'maxHealth', max(1, player_health))
+	from gui.mods.offhangar.bot_ai import build_vehicle_profile
+	player_profile = build_vehicle_profile(player_descriptor)
 	entries[player_id] = {
 		'id': player_id,
 		'team': int(getattr(player, '_offhangar_team', 1) or 1),
 		'position': (float(veh_pos[0]), float(veh_pos[1]), float(veh_pos[2])),
 		'health': float(player_health or 0),
 		'max_health': float(player_max_health or 1),
-		'class_tag': _offh_ai_class_tag(player_mock, player_descriptor),
+		'class_tag': player_profile.get('class_tag', 'mediumTank'),
+		'armor': player_profile.get('armor', 0.0),
+		'speed': player_profile.get('speed', 0.0),
+		'server_id': getattr(player, '_offhangar_network_id', None),
+		'target_kind': 'human',
 		'descriptor': player_descriptor,
 		'alive': bool((player_health or 0) > 0 and not getattr(player, '_is_dead', False)),
 	}
@@ -1654,7 +1719,13 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 		info = getattr(mock, 'publicInfo', None)
 		team = getattr(mock, '_bot_team', info.get('team', 2) if info else 2)
 		descriptor = getattr(mock, 'typeDescriptor', None) or player_descriptor
+		profile = build_vehicle_profile(descriptor)
 		health = getattr(mock, 'health', 0) or 0
+		server_id = getattr(mock, '_network_server_id', None)
+		target_kind = 'human'
+		if server_id is None:
+			server_id = getattr(mock, '_network_bot_id', None)
+			target_kind = 'bot'
 		entries[entity_id] = {
 			'id': entity_id,
 			'team': int(team or 2),
@@ -1662,11 +1733,16 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 			             float(mock.position.z)),
 			'health': float(health),
 			'max_health': float(getattr(mock, 'maxHealth', 1) or 1),
-			'class_tag': _offh_ai_class_tag(mock, descriptor),
+			'class_tag': profile.get('class_tag', 'mediumTank'),
+			'armor': profile.get('armor', 0.0),
+			'speed': profile.get('speed', 0.0),
+			'server_id': server_id,
+			'target_kind': target_kind,
 			'descriptor': descriptor,
 			'alive': bool(getattr(mock, 'isAlive', False) and health > 0),
 		}
 	living = [entry for entry in entries.values() if entry['alive']]
+	network_contacts = []
 	for target in entries.values():
 		observing_team = 2 if target['team'] == 1 else 1
 		visible = False
@@ -1692,7 +1768,26 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 		director.update_contact(
 			observing_team, target['id'], target['team'], target['position'],
 			target['health'], target['max_health'], target['class_tag'],
-			visible or not target['alive'], now)
+			visible or not target['alive'], now,
+			target.get('armor', 0.0), target.get('speed', 0.0))
+		if target.get('server_id') is not None:
+			network_contacts.append({
+				'observing_team': observing_team,
+				'target_id': int(target['server_id']),
+				'target_kind': target.get('target_kind', 'human'),
+				'target_team': int(target['team']),
+				'position': target['position'],
+				'health': int(target['health']),
+				'max_health': int(target['max_health']),
+				'class_tag': target['class_tag'],
+				'armor': float(target.get('armor', 0.0)),
+				'visible': bool(visible or not target['alive']),
+			})
+	try:
+		from gui.mods.offhangar.network_battle import publish_bot_observation
+		publish_bot_observation(player, network_contacts)
+	except Exception:
+		pass
 
 
 def _offh_battle_sweep(tag='exit'):
@@ -1764,6 +1859,7 @@ def _offh_battle_sweep(tag='exit'):
 		globals()['g_offh_exhaust_owners'] = []
 		globals().pop('g_offh_bot_director', None)
 		globals().pop('g_offh_terrain_navigator', None)
+		globals().pop('g_offh_local_driver', None)
 		globals().pop('g_offh_ai_contacts_t', None)
 		globals().pop('g_offh_ai_init_error_logged', None)
 		_stage = 'models'
@@ -5007,6 +5103,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		_offh_my_gen = [globals()['g_offh_battle_gen']]
 		globals().pop('g_offh_bot_director', None)
 		globals().pop('g_offh_terrain_navigator', None)
+		globals().pop('g_offh_local_driver', None)
 		globals().pop('g_offh_ai_contacts_t', None)
 		globals().pop('g_offh_ai_init_error_logged', None)
 		_offh_seen_arena = [False]
@@ -8319,6 +8416,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_ai_fire_range = 150.0
 							_ai_target_id = None
 							_ai_throttle_override = None
+							_ai_shell_index = 0
 							# INIT BOT STATES
 							if getattr(m_veh, '_veh_velocity', None) is None: m_veh._veh_velocity = 0.0
 							if getattr(m_veh, '_veh_turn_velocity', None) is None: m_veh._veh_turn_velocity = 0.0
@@ -8328,18 +8426,34 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_public_info = getattr(m_veh, 'publicInfo', None) or {}
 									_display_name = _public_info.get('name', 'Bot %s' % eid)
 									_ai_director.register(eid, my_team, _td, _display_name)
-									_ai_order = _ai_director.order_for(
-										eid,
-										(m_veh.position.x, m_veh.position.y, m_veh.position.z),
-										m_veh.yaw, getattr(m_veh, 'health', 1),
-										getattr(m_veh, 'maxHealth', 1), BigWorld.time())
-									target_pos = _ai_order['aim_position']
-									drive_pos = _ai_order['move_position']
+									_network_ai = getattr(player, '_offhangar_network_client', None)
+									if _network_ai is not None and getattr(_network_ai, 'ready', False):
+										from gui.mods.offhangar.network_battle import authoritative_bot_order
+										_ai_order = authoritative_bot_order(player, m_veh)
+									else:
+										_ai_order = _ai_director.order_for(
+											eid,
+											(m_veh.position.x, m_veh.position.y, m_veh.position.z),
+											m_veh.yaw, getattr(m_veh, 'health', 1),
+											getattr(m_veh, 'maxHealth', 1), BigWorld.time())
+									if _ai_order is None:
+										_hold = (m_veh.position.x, m_veh.position.y, m_veh.position.z)
+										_ai_order = {
+											'aim_position': _hold, 'move_position': _hold,
+											'face_position': _hold, 'fire_allowed': False,
+											'fire_range': 0.0, 'target_id': None,
+											'throttle_override': None, 'shell_index': 0,
+											'combat_mode': 'server_wait', 'route_id': 'server_wait',
+											'route_index': 0, 'route_anchor': _hold,
+										}
+									target_pos = _ai_order.get('aim_position')
+									drive_pos = _ai_order.get('move_position')
 									face_pos = _ai_order.get('face_position', target_pos)
 									_ai_fire_allowed = bool(_ai_order.get('fire_allowed', False))
 									_ai_fire_range = float(_ai_order.get('fire_range', 150.0))
 									_ai_target_id = _ai_order.get('target_id')
 									_ai_throttle_override = _ai_order.get('throttle_override')
+									_ai_shell_index = max(0, int(_ai_order.get('shell_index', 0) or 0))
 									if not getattr(m_veh, '_offh_ai_logged', False):
 										from gui.mods.offhangar.bot_ai import route_summary
 										m_veh._offh_ai_logged = True
@@ -8452,180 +8566,38 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							while _raw_diff_yaw > math.pi:  _raw_diff_yaw -= 2*math.pi
 							while _raw_diff_yaw < -math.pi: _raw_diff_yaw += 2*math.pi
 
-							# --- STUCK DETECTOR ---
-							# Track last position; if not moved >0.5m in 100 ticks (2 sec), force reverse escape
-							_last_p = getattr(m_veh, '_last_pos', None)
-							_cur_escape = getattr(m_veh, '_wall_escape', None) or 0
-							_stuck_ctr = getattr(m_veh, '_stuck_ctr', 0) or 0
-							
-							if _cur_escape > 0:
-								_stuck_ctr = 0
-								m_veh._last_pos = (m_veh.position.x, m_veh.position.z)
-							else:
-								_stuck_ctr += 1
-								if _stuck_ctr >= 100:
-									if _last_p is not None:
-										_moved = math.sqrt((m_veh.position.x-_last_p[0])**2 + (m_veh.position.z-_last_p[1])**2)
-										if _moved < 0.5:
-											m_veh._wall_escape = 60
-											m_veh._wall_turn = 1 if _raw_diff_yaw > 0 else -1
-									m_veh._last_pos = (m_veh.position.x, m_veh.position.z)
-									_stuck_ctr = 0
-							m_veh._stuck_ctr = _stuck_ctr
-							
-							_escape = getattr(m_veh, '_wall_escape', None) or 0
-							if _escape > 0:
-								m_veh._wall_escape = _escape - 1
-								# Reversing escape: drive backwards and turn
-								throttle = -0.7
-								turn_dir = getattr(m_veh, '_wall_turn', 1)
-								diff_yaw = _raw_diff_yaw
-								target_yaw = _raw_target_yaw
-							else:
-								# --- SEPARATION: repulsion from nearby bots ---
-								sep_x = 0.0
-								sep_z = 0.0
-								for _seid, _smeh in mock_vehicles.iteritems():
-									if _seid == eid: continue
-									_sdx = m_veh.position.x - _smeh.position.x
-									_sdz = m_veh.position.z - _smeh.position.z
-									_sd = math.sqrt(_sdx*_sdx + _sdz*_sdz)
-									if 0.5 < _sd < 12.0:
-										_w = (12.0 - _sd) / 12.0
-										sep_x += (_sdx / _sd) * _w
-										sep_z += (_sdz / _sd) * _w
-
-								# --- ADVANCED MULTI-RAY SENSORS (Local Avoidance) ---
-								_feeler_steer_yaw = None
-								if True:
-									_ray_angles = [0.0]
-									_step = 0.25
-									for i in range(1, 6): # up to 1.25 rad (~71 degrees)
-										if _raw_diff_yaw > 0:
-											_ray_angles.extend([i * _step, -i * _step])
-										else:
-											_ray_angles.extend([-i * _step, i * _step])
-									
-									# Two passes: first try a wide safe margin (2.2m), if boxed in, try a tighter margin (1.6m)
-									for _hw in (2.2, 1.6):
-										_center_blocked = False
-										_best_clear_angle = None
-										
-										for _fyo in _ray_angles:
-											_fy = m_veh.yaw + _fyo
-											_hit = False
-											
-											# Width-aware sensors: Left track, Center, Right track
-											_cos_fy = math.cos(_fy)
-											_sin_fy = math.sin(_fy)
-											
-											# Dual-height, speed-aware rays: the far sample must see a
-											# ravine early enough for a fast tank to turn before the lip.
-											_far_feeler = 20.0 if abs(m_veh._veh_velocity) > 5.0 else 15.0
-											_ray_profiles = [(0.7, 8.0), (1.5, _far_feeler)]
-											_previous_ground_y = m_veh.position.y
-											_previous_ground_dist = 0.0
-											
-											for _h, _dist in _ray_profiles:
-												if _hit: break
-												
-												# 1. Terrain elevation check (Cliffs and High Hills)
-												_dest_x = m_veh.position.x + _sin_fy * _dist
-												_dest_z = m_veh.position.z + _cos_fy * _dist
-												_dest_y = m_veh.position.y
-												
-												try:
-													_probe_run = _dist - _previous_ground_dist
-													_probe_up = max(4.5, _probe_run * 0.52)
-													_probe_down = max(5.0, _probe_run * 0.45)
-													_g_hit = BigWorld.wg_collideSegment(_offh_bspace(),
-													Math.Vector3(_dest_x, _previous_ground_y + _probe_up, _dest_z),
-													Math.Vector3(_dest_x, _previous_ground_y - _probe_down, _dest_z), 128)
-													if _g_hit:
-														_dest_y = _g_hit[0].y
-													else:
-														_hit = True # Abyss / out of bounds
-												except: pass
-
-												if _hit: break
-												# Terrain can be smooth yet submerged. Reject drowning-depth
-												# water in every candidate direction, not only in macro A*.
-												if _offh_water_depth(_dest_x, _dest_y, _dest_z) > 1.0:
-													_hit = True
-													break
-
-												_y_diff = _dest_y - _previous_ground_y
-												_ground_run = _dist - _previous_ground_dist
-												if (_y_diff > _ground_run * 0.48 or
-												        _y_diff < -_ground_run * 0.38):
-													_hit = True
-													break
-												_previous_ground_y = _dest_y
-												_previous_ground_dist = _dist
-													
-												# 2. Obstacle check (parallel to slope)
-												for _ox in (-_hw, 0.0, _hw):
-													_sx = m_veh.position.x + _cos_fy * _ox
-													_sz = m_veh.position.z - _sin_fy * _ox
-													try:
-														_fs = Math.Vector3(_sx, m_veh.position.y + _h, _sz)
-														_fe = Math.Vector3(_sx + _sin_fy*_dist, _dest_y + _h, _sz + _cos_fy*_dist)
-														if BigWorld.wg_collideSegment(_offh_bspace(), _fs, _fe, 128):
-															_hit = True
-															break
-													except: pass
-											
-											if _fyo == 0.0:
-												if _hit: 
-													_center_blocked = True
-												else:
-													break # Center is clear
-											else:
-												if not _hit:
-													_best_clear_angle = _fyo
-													break
-													
-										if not _center_blocked:
-											break # Center is clear on this margin
-										if _best_clear_angle is not None:
-											_feeler_steer_yaw = m_veh.yaw + _best_clear_angle
-											break # Found a clear path
-											
-									# If even tight margin fails, we just keep current steering and let stuck detector handle reversing if we crash
-								
-								# Hysteresis: keep steering into the clear path for a moment
-								if _feeler_steer_yaw is not None:
-									m_veh._feeler_timer = 15
-									m_veh._feeler_mem = _feeler_steer_yaw
-								else:
-									_ft = getattr(m_veh, '_feeler_timer', 0) or 0
-									if _ft > 0:
-										m_veh._feeler_timer = _ft - 1
-										_feeler_steer_yaw = getattr(m_veh, '_feeler_mem', None)
-								
-								if _feeler_steer_yaw is not None:
-									target_yaw = _feeler_steer_yaw
-								else:
-									# Blend target dir + separation
-									_ndx = dx / dist if dist > 0.1 else math.sin(_raw_target_yaw)
-									_ndz = dz / dist if dist > 0.1 else math.cos(_raw_target_yaw)
-									_rdx = _ndx + sep_x * 1.5
-									_rdz = _ndz + sep_z * 1.5
-									target_yaw = math.atan2(_rdx, _rdz)
-								diff_yaw = target_yaw - m_veh.yaw
-								while diff_yaw > math.pi:  diff_yaw -= 2*math.pi
-								while diff_yaw < -math.pi: diff_yaw += 2*math.pi
-
-								if dist > 15.0:
-									if abs(diff_yaw) < 0.5: throttle = 1.0
-									elif abs(diff_yaw) > 2.0: throttle = -0.5
-									else: throttle = 0.5
-
-								if diff_yaw > 0.05: turn_dir = 1
-								elif diff_yaw < -0.05: turn_dir = -1
-								if (_ai_throttle_override is not None and
-								        abs(diff_yaw) < 0.65 and _feeler_steer_yaw is None):
-									throttle = float(_ai_throttle_override)
+							# Pure local driver: the engine supplies terrain/collision probes;
+							# timing, traffic separation, steering hysteresis and alternating
+							# recovery live in one testable state machine.
+							_driver_neighbours = []
+							for _driver_eid, _driver_vehicle in mock_vehicles.iteritems():
+								if (_driver_eid == eid or _driver_vehicle is None or
+								        not getattr(_driver_vehicle, 'isAlive', False)):
+									continue
+								_driver_neighbours.append((
+									float(_driver_vehicle.position.x),
+									float(_driver_vehicle.position.y),
+									float(_driver_vehicle.position.z)))
+							_driver_order = _offh_ai_driver().drive(
+								eid,
+								(float(m_veh.position.x), float(m_veh.position.y),
+								 float(m_veh.position.z)),
+								float(m_veh.yaw), float(m_veh._veh_velocity), float(dt),
+								(float(drive_pos[0]), float(drive_pos[1]), float(drive_pos[2])),
+								_driver_neighbours,
+								lambda _driver_yaw: _offh_ai_direction_clear(
+									m_veh, _driver_yaw))
+							throttle = float(_driver_order.get('throttle', 0.0))
+							turn_dir = float(_driver_order.get('turn', 0.0))
+							target_yaw = float(_driver_order.get('target_yaw', _raw_target_yaw))
+							diff_yaw = target_yaw - m_veh.yaw
+							while diff_yaw > math.pi: diff_yaw -= 2 * math.pi
+							while diff_yaw < -math.pi: diff_yaw += 2 * math.pi
+							_driver_mode = _driver_order.get('recovery_mode', 'drive')
+							_feeler_steer_yaw = target_yaw if _driver_mode == 'avoid' else None
+							if (_ai_throttle_override is not None and _driver_mode == 'drive' and
+							        abs(diff_yaw) < 0.65):
+								throttle = float(_ai_throttle_override)
 
 							m_veh._dbg_ctr = (getattr(m_veh, '_dbg_ctr', 0) or 0) + 1
 							
@@ -9309,8 +9281,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								
 								has_limited_traverse = not (bot_gun_min_yaw <= -math.pi + 0.1 and bot_gun_max_yaw >= math.pi - 0.1)
 								
-								# TD nesmí přebíjet řízení trupu kvůli míření, pokud se právě vyhýbá překážce!
-								is_avoiding_obstacle = getattr(m_veh, '_feeler_timer', 0) > 0 or (_feeler_steer_yaw is not None if '_feeler_steer_yaw' in locals() else False)
+								# A limited-traverse gun must not fight the local recovery controller.
+								is_avoiding_obstacle = _driver_mode in (
+									'avoid', 'blocked', 'reverse_turn')
 								
 								if has_limited_traverse and not is_avoiding_obstacle:
 									# TD/Arty: pokud je cíl mimo limity, bot musí otočit celý trup
@@ -9460,7 +9433,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							if _ai_ready_to_fire and _ai_shot_clear:
 								m_veh._ai_shoot_timer = 0
 								m_veh._network_bot_fire_seq = int(getattr(m_veh, '_network_bot_fire_seq', 0) or 0) + 1
-								m_veh._network_bot_shell_index = 0
+								m_veh._network_bot_shell_index = _ai_shell_index
 								if m_veh._ai_clip_size > 1:
 									m_veh._ai_clip -= 1
 									if m_veh._ai_clip <= 0:
@@ -9471,7 +9444,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										_shots = _td.gun['shots'] if hasattr(_td, 'gun') and 'shots' in _td.gun else []
 										if not _shots and isinstance(_td.gun, dict): _shots = _td.gun.get('shots', [])
 										if _shots:
-											_shot = _shots[0]
+											_ai_shell_index = min(_ai_shell_index, len(_shots) - 1)
+											m_veh._network_bot_shell_index = _ai_shell_index
+											_shot = _shots[_ai_shell_index]
 											_effectsDescr = vehicles.g_cache.shotEffects[_shot['shell']['effectsIndex']]
 											_gravity = _shot['gravity']
 											_speed = _shot['speed']
@@ -14466,8 +14441,11 @@ def _step_on_arena_created(player, cmdName):
 		LOG_CURRENT_EXCEPTION()
 
 
-def _schedule_arena_created_resilient(cmdName, player):
+def _schedule_arena_created_resilient(cmdName, player, queue_generation):
 	def _fire():
+		if queue_generation != getattr(player, '_offhangar_queue_generation', 0):
+			LOG_DEBUG('OfflineBattle.arenaCreated skipped: stale queue', cmdName)
+			return
 		# Cancel button pressed while the fake matchmaker was counting down
 		# (Account.dequeueRandom sets this). Without the check the battle booted
 		# anyway a few seconds after the player had left the queue.
@@ -14486,128 +14464,80 @@ def _schedule_arena_created_resilient(cmdName, player):
 	BigWorld.callback(queue_time + 0.10, _fire)
 
 
-def schedule_random_battle_flow_after_enqueue(cmd, cmdName, args):
-	"""
-	Call after RES_SUCCESS was delivered for an enqueue-like command.
-	args: tuple from doCmdInt3 (int1, int2, int3) or similar.
-	"""
+def begin_offline_battle_queue(player, vehInvID, cmdName, cmd=0, args=()):
+	"""Start one local or LAN queue flow; all enqueue paths use this gate."""
 	if not OFFLINE_BATTLE_ENABLED:
-		LOG_DEBUG('OfflineBattle.disabled schedule', cmdName, cmd, args)
-		return
-	player = BigWorld.player()
-	if player is not None:
-		now = time.time()
-		if now - getattr(player, '_offhangar_sched_debounce', 0) < 1.0:
-			LOG_DEBUG('OfflineBattle.schedule debounce', cmdName, cmd, args)
-			return
-		player._offhangar_sched_debounce = now
-
-	int1 = args[0] if args else 0
-	# Never treat server-stats traffic as battle (same numeric cmd id can alias in AccountCommands index).
-	if cmdName and ('SERVER_STATS' in cmdName or 'REQ_SERVER_STATS' in cmdName):
-		if int1 == 0 and (len(args) < 2 or args[1] == 0) and (len(args) < 3 or args[2] == 0):
-			LOG_DEBUG('OfflineBattle.skip stats-shaped packet', cmdName, cmd, args)
-			return
+		LOG_DEBUG('OfflineBattle.disabled queue', cmdName, cmd, args)
+		return False
+	if player is None or not getattr(player, 'isOffline', False):
+		return False
+	if not vehInvID:
+		vehInvID = _resolve_vehicle_inv_id(player, 0)
+	if not vehInvID:
+		LOG_DEBUG('OfflineBattle.skip no vehInvID', cmdName, cmd, args)
+		return False
+	try:
+		from gui import WindowsManager as _WMg
+		if getattr(_WMg.g_windowsManager, 'battleWindow', None) is not None:
+			LOG_DEBUG('OfflineBattle.queue skip active battle window', cmdName)
+			return False
+	except Exception:
+		pass
+	try:
+		input_handler = getattr(player, 'inputHandler', None)
+		if input_handler is not None and hasattr(input_handler, 'ctrls'):
+			LOG_DEBUG('OfflineBattle.queue skip active battle input', cmdName)
+			return False
+	except Exception:
+		pass
+	now = time.time()
+	if now - getattr(player, '_offline_boot_time', 0.0) < 10.0:
+		LOG_DEBUG('OfflineBattle.queue skip active boot', cmdName)
+		return False
+	if now - getattr(player, '_offhangar_battle_last_boot', 0.0) < _BATTLE_BOOT_DEBOUNCE_SEC:
+		LOG_DEBUG('OfflineBattle.queue debounce skip', cmdName, vehInvID)
+		return False
+	player._offhangar_battle_last_boot = now
+	if getattr(player, '_offhangar_queue_pending', False):
+		LOG_DEBUG('OfflineBattle.queue skip duplicate', cmdName, vehInvID)
+		return False
+	player._offhangar_queue_pending = True
+	player._offhangar_queue_cancelled = False
+	player._offhangar_arena_created_once = False
+	queue_generation = getattr(player, '_offhangar_queue_generation', 0) + 1
+	player._offhangar_queue_generation = queue_generation
 
 	def _run():
-		player = BigWorld.player()
-		if player is None or not getattr(player, 'isOffline', False):
+		current = BigWorld.player()
+		if current is not player or queue_generation != getattr(player, '_offhangar_queue_generation', 0):
 			return
-		player._offhangar_arena_created_once = False
-		player._offhangar_queue_cancelled = False
-		vehInvID = int1
-		if vehInvID == 0 and cmdName and 'ENQUEUE' in cmdName:
-			vehInvID = _resolve_vehicle_inv_id(player, 0)
-		if not vehInvID:
-			LOG_DEBUG('OfflineBattle.skip no vehInvID', cmdName, cmd, args)
+		player._offhangar_queue_pending = False
+		if getattr(player, '_offhangar_queue_cancelled', False):
 			return
 		if _network_mode_enabled():
 			_join_network_waiting_room(player, vehInvID, cmdName)
 		else:
 			_step_on_enqueued(player, vehInvID, cmdName)
-			_schedule_arena_created_resilient(cmdName, player)
+			_schedule_arena_created_resilient(cmdName, player, queue_generation)
 
-	# Run after the current frame so onCmdResponse callbacks finish first.
+	# Run after onCmdResponse so native queue state is visible before transition.
 	BigWorld.callback(0.05, _run)
+	return True
+
+
+def schedule_random_battle_flow_after_enqueue(cmd, cmdName, args):
+	"""Compatibility adapter for command-router enqueue handlers."""
+	int1 = args[0] if args else 0
+	# One numeric command id aliases stats in some 0.8.x indexes.
+	if cmdName and ('SERVER_STATS' in cmdName or 'REQ_SERVER_STATS' in cmdName):
+		if int1 == 0 and (len(args) < 2 or args[1] == 0) and (len(args) < 3 or args[2] == 0):
+			LOG_DEBUG('OfflineBattle.skip stats-shaped packet', cmdName, cmd, args)
+			return False
+	return begin_offline_battle_queue(BigWorld.player(), int1, cmdName, cmd, args)
 
 
 def start_offline_random_from_hangar(player, vehInvID):
-	import debug_utils
-	try:
-		from gui.battle_control import constants as bc_constants
-		debug_utils.LOG_DEBUG("VEHICLE_VIEW_STATE:", dir(bc_constants.VEHICLE_VIEW_STATE))
-		for k in dir(bc_constants.VEHICLE_VIEW_STATE):
-			if not k.startswith('_'): debug_utils.LOG_DEBUG("VIEW_STATE", k, getattr(bc_constants.VEHICLE_VIEW_STATE, k))
-	except Exception as e: debug_utils.LOG_DEBUG("DUMP ERR1", e)
-	try:
-		import constants
-		debug_utils.LOG_DEBUG("VEHICLE_DEVICE_STATES:", dir(constants.VEHICLE_DEVICE_STATES))
-		for k in dir(constants.VEHICLE_DEVICE_STATES):
-			if not k.startswith('_'): debug_utils.LOG_DEBUG("DEV_STATE", k, getattr(constants.VEHICLE_DEVICE_STATES, k))
-	except Exception as e: debug_utils.LOG_DEBUG("DUMP ERR2", e)
-	
-	import traceback
-	LOG_DEBUG('OfflineBattle.start_offline_random_from_hangar CALLED', player, getattr(player, 'isOffline', None))
-	"""
-	0.8.x hangar may spam other doCmd ids before/instead of CMD_ENQUEUE_RANDOM (700).
-	When the client calls PlayerAccount.enqueueRandom, short-circuit here so we still
-	fire the same BW-side chain as a real matchmaker ack.
-	"""
-	if not OFFLINE_BATTLE_ENABLED:
-		LOG_DEBUG('OfflineBattle.disabled start', vehInvID)
-		return
-	if player is None:
-		LOG_DEBUG('OfflineBattle.disabled start player is None')
-		return
-	# Never boot a second battle on top of a running one: duplicate account
-	# input during loading used to re-enter the whole battle flow and leave the
-	# battle aim GUI painted over the hangar.
-	try:
-		from gui import WindowsManager as _WMg
-		if getattr(_WMg.g_windowsManager, 'battleWindow', None) is not None:
-			LOG_DEBUG('OfflineBattle.hook skip: battle window active during loading')
-			return
-	except Exception:
-		pass
-	try:
-		_ihg = getattr(player, 'inputHandler', None)
-		if _ihg is not None and hasattr(_ihg, 'ctrls'):
-			LOG_DEBUG('OfflineBattle.hook skip: battle input handler active')
-			return
-	except Exception:
-		pass
-	now = time.time()
-	if now - getattr(player, '_offline_boot_time', 0.0) < 10.0:
-		LOG_DEBUG('OfflineBattle.hook IGNORED AUTO-START inside start_offline')
-		return
-	last = getattr(player, '_offhangar_battle_last_boot', 0.0)
-	if now - last < _BATTLE_BOOT_DEBOUNCE_SEC:
-		LOG_DEBUG('OfflineBattle.hook debounce skip', vehInvID)
-		return
-	player._offhangar_battle_last_boot = now
-	cmdName = 'offline.enqueueRandom'
-
-	def _run():
-		import BigWorld
-		p = BigWorld.player()
-		if p is None:
-			LOG_DEBUG('OfflineBattle.hook skip p is None')
-			return
-		p._offhangar_arena_created_once = False
-		p._offhangar_queue_cancelled = False
-		vid = vehInvID or _resolve_vehicle_inv_id(p, 0)
-		if not vid:
-			LOG_DEBUG('OfflineBattle.hook skip no vehInvID', vehInvID)
-			return
-		LOG_DEBUG('OfflineBattle.hook start', cmdName, 'vehInvID', vid)
-		if _network_mode_enabled():
-			_join_network_waiting_room(p, vid, cmdName)
-		else:
-			_step_on_enqueued(p, vid, cmdName)
-			_schedule_arena_created_resilient(cmdName, p)
-
-	import BigWorld
-	BigWorld.callback(0.05, _run)
+	return begin_offline_battle_queue(player, vehInvID, 'offline.enqueueRandom')
 
 try:
 	import gui.Scaleform.battledispatcherinterface as bdi

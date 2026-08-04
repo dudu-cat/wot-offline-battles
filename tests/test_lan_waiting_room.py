@@ -196,6 +196,38 @@ class WaitingRoomTest(unittest.TestCase):
         self.assertEqual(2, snapshot["battle_result"]["winner"])
         self.assertEqual(1, snapshot["battle_result"]["base_team"])
 
+    def test_authority_observation_produces_non_omniscient_server_bot_order(self):
+        first = self.connect("Alpha")
+        first_welcome = first.receive_type("welcome")
+        first.receive_type("roster")
+        second = self.connect("Bravo")
+        second.receive_type("welcome")
+        first.receive_type("roster")
+        second.receive_type("roster")
+        first.send({"type": "start_battle"})
+        first.receive_type("battle_start")
+        second.receive_type("battle_start")
+        bot = {"id": 16, "team": 2, "slot": 0, "vehicle": "germany:PzIV",
+               "max_health": 500, "health": 500, "x": 0.0, "z": 100.0,
+               "profile": {"class_tag": "mediumTank", "dominant_role": "support",
+                           "roles": ["support"], "desired_range": 220, "fire_range": 600}}
+        first.send({"type": "bot_manifest", "bots": [bot]})
+        first.send({"type": "bot_state", "bots": [bot]})
+        first.send({"type": "bot_observation", "contacts": [{
+            "observing_team": 2, "target_id": first_welcome["player_id"], "target_team": 1,
+            "visible": True, "x": 17.0, "y": 2.0, "z": -31.0,
+            "health": 880, "max_health": 880, "class_tag": "mediumTank",
+        }]})
+        time.sleep(0.05)
+        self.state.tick_once(0.05)
+        snapshot = second.receive_type("snapshot")
+        self.assertGreater(snapshot["bot_order_revision"], 0)
+        order = snapshot["bot_orders"][0]
+        self.assertEqual(16, order["id"])
+        self.assertEqual(first_welcome["player_id"], order["target_id"])
+        self.assertEqual({"x": 17.0, "y": 2.0, "z": -31.0}, order["aim_position"])
+        self.assertTrue(order["fire_allowed"])
+
     def test_ping_echo_and_authority_failover(self):
         first = self.connect("Alpha")
         first_welcome = first.receive_type("welcome")

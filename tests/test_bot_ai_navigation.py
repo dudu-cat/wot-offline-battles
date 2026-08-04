@@ -119,11 +119,12 @@ class BotNavigationTest(unittest.TestCase):
         ).read_text()
 
         self.assertIn(
-            "_offh_water_depth(_dest_x, _dest_y, _dest_z) > 1.0",
+            "_offh_water_depth(x, y, z) > 1.0",
             battle_source,
         )
-        self.assertIn("_y_diff > _ground_run * 0.48", battle_source)
-        self.assertIn("_y_diff < -_ground_run * 0.38", battle_source)
+        self.assertIn("delta > run * 0.48", battle_source)
+        self.assertIn("delta < -run * 0.38", battle_source)
+        self.assertIn("lambda _driver_yaw: _offh_ai_direction_clear(", battle_source)
 
 
 if __name__ == "__main__":

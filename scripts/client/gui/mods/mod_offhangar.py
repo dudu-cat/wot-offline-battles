@@ -121,7 +121,7 @@ def _safe_import_offhangar():
 	submodules = ['paths', 'utils', 'logging', '_constants', 'physics', 'physics_monitor',
 	              'bot_ai_maps_group_a', 'bot_ai_maps_group_b', 'bot_ai_maps_group_c',
 	              'bot_ai_maps_extra',
-	              'bot_ai_maps', 'bot_ai', 'bot_ai_navigation',
+	              'bot_ai_maps', 'bot_ai', 'bot_ai_navigation', 'bot_ai_driver',
 	              'state', 'session_guards', 'offline_battle_stack', 'offline_battle',
 	              'data', 'command_router', 'command_handlers', 'server',
 	              'destructibles_authority', 'pen_indicator', 'lan_settings', 'lan_waiting_room',
@@ -720,6 +720,10 @@ def _install_offline_account__do_cmd_hook():
 				return baseFunc(baseSelf, doCmdMethod, cmd, callback, *args)
 			if doCmdMethod != 'doCmdInt3' or (cmd != _offline_enqueue_random_cmd_id() and cmd != _offline_enqueue_tutorial_cmd_id()):
 				return baseFunc(baseSelf, doCmdMethod, cmd, callback, *args)
+			# Some 0.8.x command indexes alias random enqueue with server-stats.
+			# Preserve the all-zero stats request instead of treating it as a battle.
+			if cmd == _offline_enqueue_random_cmd_id() and len(args) >= 3 and args[0] == 0 and args[1] == 0 and args[2] == 0:
+				return baseFunc(baseSelf, doCmdMethod, cmd, callback, *args)
 			getRid = getattr(baseSelf, '_PlayerAccount__getRequestID', None)
 			if not callable(getRid):
 				LOG_DEBUG('Offline.__doCmd ENQUEUE_RANDOM skip no __getRequestID')
@@ -734,14 +738,15 @@ def _install_offline_account__do_cmd_hook():
 
 			def _ack_and_boot():
 				try:
-					import traceback
-					LOG_DEBUG('Offline.__doCmd ENQUEUE_RANDOM caller traceback:')
-					for line in traceback.format_stack():
-						LOG_DEBUG(line.strip())
 					baseSelf.onCmdResponse(rid, AccountCommands.RES_SUCCESS, '')
 				except Exception:
 					LOG_CURRENT_EXCEPTION()
-				LOG_DEBUG('Offline.__doCmd ENQUEUE_RANDOM IGNORED')
+				# The direct Account path bypasses FakeServer/__router entirely.
+				# Enter the same idempotent queue gate only after its native ACK.
+				try:
+					start_offline_random_from_hangar(baseSelf, vehInvID)
+				except Exception:
+					LOG_CURRENT_EXCEPTION()
 
 			LOG_DEBUG('Offline.__doCmd ENQUEUE_RANDOM', rid, vehInvID)
 			BigWorld.callback(0.0, _ack_and_boot)
@@ -772,6 +777,8 @@ def _install_offline_enqueue_public_hooks():
 			if not getattr(baseSelf, 'isOffline', False):
 				return baseFunc(baseSelf, *args, **kwargs)
 			baseSelf._offhangar_queue_cancelled = True
+			baseSelf._offhangar_queue_pending = False
+			baseSelf._offhangar_queue_generation = getattr(baseSelf, '_offhangar_queue_generation', 0) + 1
 			LOG_DEBUG('Offline.dequeueRandom -> queue cancelled')
 			try:
 				from gui.mods.offhangar.network_battle import stop_for_player

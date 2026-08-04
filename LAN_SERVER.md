@@ -1,9 +1,10 @@
 # LAN battle MVP
 
 This repository contains an optional LAN battle path for the 0.8.2 offline client.
-The normal offline mode remains the default. The LAN path reuses the existing
-garage, map loading, tank models, HUD and bot code, while a separate Python 3
-process owns the shared roster, health, deaths, battle rules and the relay for
+The normal offline mode remains available. The server-backed path also works
+with one connected player and reuses the existing garage, map loading, tank
+models, HUD and local driving code. A separate Python 3 process owns the shared
+roster, health, deaths, battle rules, global bot orders and the relay for
 human/bot movement, firing and client-resolved armor impacts.
 
 ## Start the server
@@ -131,20 +132,45 @@ mock-vehicle resource path. Vehicle movement still uses the existing client
 physics and is relayed through the server; this trusted-LAN checkpoint is not
 anti-cheat authoritative. Local garage data remains client-side.
 
-At battle start the server elects one connected client as bot/rules authority.
-That client chooses one exact bot manifest and runs the existing offline AI.
-The server stores and relays each bot's identity, vehicle, team, slot, position,
-hull/turret aim, firing sequence, shell, health and death, so every client
-renders the same population and combat result. If the authority disconnects,
-the server elects the next player and preserves the latest shared bot state.
-The same authority publishes base-capture progress, capture interruption and
-the final winner/reason for capture, team elimination or timer expiry. The
-server remains the shared source of truth for HP and the final battle result.
+At battle start the server elects one connected client as map-simulation/rules
+authority. That client chooses one exact bot manifest and uploads each tank's
+vehicle profile plus the assigned standard-battle route. It reports only
+contacts observed through client-side range and terrain line-of-sight checks.
+The server retains last-known contacts, reserves targets across the team,
+advances uploaded routes, chooses combat mode and shell, and emits monotonic
+revisioned bot orders. The authority client executes those orders with the real
+map collision, local driver, armor and shell systems, then publishes canonical
+pose/fire/HP state. Every client therefore renders the same population and
+combat result. If the authority disconnects, the server elects the next player
+and preserves the latest shared state. The same authority publishes
+base-capture progress, capture interruption and the final winner/reason for
+capture, team elimination or timer expiry. The server remains the shared
+source of truth for HP and the final battle result.
+
+### Bot planner portability boundary
+
+`server_bot_ai.py` is intentionally pure data: it imports no BigWorld or client
+module. Its inputs and outputs are JSON-compatible dictionaries carried by
+protocol v5:
+
+- `bot_manifest`: identity, team, vehicle profile, shell profiles and sparse
+  route waypoints;
+- `bot_observation`: authority-reported visible/hidden contacts with explicit
+  `target_kind` and shared coordinates;
+- `bot_state`: the latest authority-executed bot pose, health and fire state;
+- `bot_orders`: route index, movement/aim points, target reservation, combat
+  mode, throttle override and shell index, guarded by `bot_order_revision`.
+
+This boundary is suitable for replacing the Python server planner with Go
+without moving proprietary map queries or BigWorld entity control off the
+client. A Go implementation must preserve non-omniscient contact handling,
+stable orders between revisions and target identity as `(target_kind, id)`.
 
 This is an implementation checkpoint, not a complete replacement for the
-retail battle server. One elected client still owns map collision, bot AI and
-the original client physics; authority failover preserves visible state but
-does not preserve every hidden AI timer/target. It does not provide the retail
+retail battle server. One elected client still owns map collision, short-range
+driving, shell/armor resolution and the original client physics. Authority
+failover preserves server-side contacts, routes and orders but cannot preserve
+every client-local recovery or reload timer. It does not provide the retail
 server's authoritative physics, complete cross-client module/crew state,
 reconnection recovery, anti-cheat, NAT traversal or internet-safe
 authentication. Keep it on a trusted LAN while testing.

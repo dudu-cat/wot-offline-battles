@@ -113,6 +113,7 @@ class LANClient(object):
 		self._recv_buffer = ''
 		self._last_input = 0.0
 		self._last_bot_state = 0.0
+		self._last_bot_observation = 0.0
 		self._fire_seq = 0
 		self._ping_seq = 0
 		self._last_ping = 0.0
@@ -120,6 +121,8 @@ class LANClient(object):
 		self._last_snapshot = 0.0
 		self.rtt_ms = None
 		self.bot_authority_id = None
+		self.bot_order_revision = 0
+		self.bot_orders = {}
 		self._last_error = None
 		self._error_notified = False
 		self._stop_requested = False
@@ -171,7 +174,7 @@ class LANClient(object):
 					self._recv_buffer += chunk.decode('utf-8')
 				except UnicodeError:
 					continue
-				if len(self._recv_buffer) > 65536:
+				if len(self._recv_buffer) > 512 * 1024:
 					self._last_error = 'server message buffer exceeded limit'
 					break
 				while '\n' in self._recv_buffer:
@@ -278,6 +281,13 @@ class LANClient(object):
 			return False
 		self._last_bot_state = now
 		return self._send({'type': 'bot_state', 'bots': bots[:30]})
+
+	def send_bot_observation(self, contacts):
+		now = time.time()
+		if now - self._last_bot_observation < 0.45:
+			return False
+		self._last_bot_observation = now
+		return self._send({'type': 'bot_observation', 'contacts': contacts[:64]})
 
 	def send_bot_hit(self, target_id, shot_seq, damage, shot_result,
 			impact_position=None):
@@ -508,6 +518,21 @@ class LANClient(object):
 		elif kind == 'snapshot':
 			self._last_snapshot = time.time()
 			self._set_authority(message.get('bot_authority_id'))
+			try:
+				revision = int(message.get('bot_order_revision', 0) or 0)
+			except (TypeError, ValueError):
+				revision = 0
+			if revision >= self.bot_order_revision:
+				orders = {}
+				for order in message.get('bot_orders') or ():
+					try:
+						orders[int(order.get('id'))] = order
+					except Exception:
+						continue
+				self.bot_order_revision = revision
+				self.bot_orders = orders
+				self.player._offhangar_network_bot_order_revision = revision
+				self.player._offhangar_network_bot_orders = orders
 			self.player._offhangar_network_snapshot = message
 			_apply_snapshot(self.player, message)
 		elif kind == 'events':
@@ -765,6 +790,8 @@ def stop_for_player(player):
 		player._offhangar_network_authority_id = None
 		player._offhangar_network_is_authority = False
 		player._offhangar_network_bot_manifest = []
+		player._offhangar_network_bot_orders = {}
+		player._offhangar_network_bot_order_revision = 0
 		player._offhangar_network_result_applied = False
 
 
@@ -868,6 +895,37 @@ def publish_bot_manifest(player, jobs):
 	for job in jobs[:30]:
 		try:
 			bot_id, team, slot, vehicle, name, max_health, world_x, world_z, world_yaw = job
+			profile = {}
+			route_payload = {}
+			try:
+				from items import vehicles
+				from gui.mods.offhangar.bot_ai import build_vehicle_profile
+				descriptor = vehicles.VehicleDescr(typeName=str(vehicle))
+				profile = build_vehicle_profile(descriptor)
+			except Exception:
+				profile = {}
+			try:
+				import sys
+				offline = sys.modules.get('gui.mods.offhangar.offline_battle')
+				director_getter = getattr(offline, '_offh_ai_director', None)
+				director = director_getter(player) if callable(director_getter) else None
+				if director is not None:
+					agent = director.register_profile(bot_id, team, profile, name)
+					route = agent.get('route') or {}
+					waypoints = []
+					for point in route.get('waypoints', ()):
+						shared, unused_yaw = _server_pose_from_world(
+							player, point[0], 0.0, point[1], 0.0)
+						waypoints.append({
+							'x': shared[0], 'y': shared[1], 'z': shared[2],
+							'hold': bool(point[2]) if len(point) > 2 else False,
+						})
+					route_payload = {
+						'id': route.get('id', 'server_route'),
+						'waypoints': waypoints,
+					}
+			except Exception:
+				route_payload = {}
 			server_pos, server_yaw = _server_pose_from_world(
 				player, world_x, 0.0, world_z, world_yaw)
 			manifest.append({
@@ -877,6 +935,8 @@ def publish_bot_manifest(player, jobs):
 				'health': max(1, int(max_health)),
 				'x': server_pos[0], 'y': server_pos[1], 'z': server_pos[2],
 				'yaw': server_yaw, 'aim_yaw': server_yaw,
+				'profile': profile,
+				'route': route_payload,
 			})
 		except Exception:
 			continue
@@ -884,6 +944,52 @@ def publish_bot_manifest(player, jobs):
 		return False
 	player._offhangar_network_bot_manifest = manifest
 	return client.send_bot_manifest(manifest)
+
+
+def publish_bot_observation(player, contacts):
+	"""Send the authority's team-visibility report to the global planner."""
+	if not network_is_authority(player):
+		return False
+	client = getattr(player, '_offhangar_network_client', None)
+	if client is None or not client.ready:
+		return False
+	payload = []
+	for raw in contacts or ():
+		try:
+			point = raw.get('position')
+			server_pos, unused_yaw = _server_pose_from_world(
+				player, point[0], point[1], point[2], 0.0)
+			item = dict(raw)
+			item.pop('position', None)
+			item['x'], item['y'], item['z'] = server_pos
+			payload.append(item)
+		except Exception:
+			continue
+	return client.send_bot_observation(payload)
+
+
+def authoritative_bot_order(player, mock):
+	"""Return one server order converted from shared to loaded-map coordinates."""
+	if not network_is_authority(player) or mock is None:
+		return None
+	bot_id = getattr(mock, '_network_bot_id', None)
+	if bot_id is None:
+		return None
+	client = getattr(player, '_offhangar_network_client', None)
+	if client is None:
+		return None
+	raw = client.bot_orders.get(int(bot_id))
+	if raw is None:
+		return None
+	order = dict(raw)
+	for key in ('aim_position', 'face_position', 'move_position', 'route_anchor'):
+		point = raw.get(key)
+		if not isinstance(point, dict):
+			continue
+		world = _world_from_server(player, dict(point, world_pose=True))
+		if world is not None:
+			order[key] = (float(world.x), float(world.y), float(world.z))
+	return order
 
 
 def publish_authoritative_bots(player, mocks):

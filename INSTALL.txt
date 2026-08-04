@@ -55,13 +55,15 @@ Bots in this build
 - Bots have stable individual aggression, caution, teamwork and driving habits.
 - Combat behavior includes limited spotting information, target memory, hull
   angling, peek-and-withdraw timing and occasional forward/backward jiggling.
-- The same smart AI runs in normal offline battles and on the elected LAN
-  authority client.
+- The same smart AI runs in normal offline battles and in a one-player or
+  multiplayer server-backed room.
 
 LAN synchronization
 -------------------
 
-- One elected client runs bot AI and battle-rule calculation.
+- The server owns global target reservations, route progression and revisioned
+  bot orders. One elected client supplies limited spotting observations and
+  executes map collision, local steering, shell/armor and battle-rule work.
 - Every client receives shared bot identity, movement, aiming, firing, HP,
   deaths, wreck positions, capture progress and the final battle result.
 - If the authority disconnects, the server elects another connected client.
