@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+!scripts/client/CameraNode.pyc
+!scripts/client/OfflineEntity.pyc
+
+# Runtime state belongs beside the user's game installation, not in source.
+offhangar_user/
+python.log
+*.log
