@@ -113,6 +113,18 @@ class BotNavigationTest(unittest.TestCase):
         self.assertNotEqual(current, target)
         self.assertGreater(target[2], 2.0)
 
+    def test_local_driver_rejects_deep_water_and_unsafe_grades(self):
+        battle_source = (
+            ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
+        ).read_text()
+
+        self.assertIn(
+            "_offh_water_depth(_dest_x, _dest_y, _dest_z) > 1.0",
+            battle_source,
+        )
+        self.assertIn("_y_diff > _ground_run * 0.48", battle_source)
+        self.assertIn("_y_diff < -_ground_run * 0.38", battle_source)
+
 
 if __name__ == "__main__":
     unittest.main()

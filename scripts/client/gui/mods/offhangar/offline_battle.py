@@ -8546,9 +8546,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 													else:
 														_hit = True # Abyss / out of bounds
 												except: pass
-												
+
 												if _hit: break
-												
+												# Terrain can be smooth yet submerged. Reject drowning-depth
+												# water in every candidate direction, not only in macro A*.
+												if _offh_water_depth(_dest_x, _dest_y, _dest_z) > 1.0:
+													_hit = True
+													break
+
 												_y_diff = _dest_y - _previous_ground_y
 												_ground_run = _dist - _previous_ground_dist
 												if (_y_diff > _ground_run * 0.48 or
