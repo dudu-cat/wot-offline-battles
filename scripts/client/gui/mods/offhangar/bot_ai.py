@@ -383,6 +383,17 @@ class BattleDirector(object):
 		waypoint = waypoints[index]
 		return (float(waypoint[0]), float(position[1]), float(waypoint[1]))
 
+	def _route_anchor(self, agent, position):
+		"""Return the strategic anchor immediately before the current waypoint."""
+		route = agent.get('route')
+		waypoints = route.get('waypoints', ()) if route is not None else ()
+		if not waypoints:
+			return tuple(position)
+		index = max(0, min(int(agent.get('waypoint_index', 0)) - 1,
+		                   len(waypoints) - 1))
+		waypoint = waypoints[index]
+		return (float(waypoint[0]), float(position[1]), float(waypoint[1]))
+
 	def _angled_face_position(self, agent, position, target_position):
 		"""Give armoured turreted tanks a stable 12-30 degree hull angle."""
 		profile = agent['profile']
@@ -422,6 +433,8 @@ class BattleDirector(object):
 			'desired_range': profile['desired_range'],
 			'fire_range': profile['fire_range'],
 			'route_id': agent['route'].get('id') if agent.get('route') else 'direct',
+			'route_index': int(agent.get('waypoint_index', 0)),
+			'route_anchor': self._route_anchor(agent, position),
 			'personality': personality,
 			'profile': profile,
 		}

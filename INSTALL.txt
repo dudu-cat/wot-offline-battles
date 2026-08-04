@@ -1,0 +1,79 @@
+World of Tanks 0.8.2 LAN package (protocol 5)
+=================================================
+
+Client installation (repeat on every Windows machine)
+------------------------------------------------------
+
+1. Close the game.
+2. Delete or move aside <game root>\res_mods\0.8.2.
+3. Copy this package's complete 0.8.2 folder into <game root>\res_mods.
+4. Start the game and open LAN SETTINGS in the upper-right of the hangar.
+5. Enter the server IP and TCP port, enable LAN Battle, then click SAVE.
+
+Expected entry file:
+
+    <game root>\res_mods\0.8.2\scripts\client\gui\mods\mod_offhangar.py
+
+There must not be a mod_offhangar.pyc next to that file. Keep both
+scripts\client\CameraNode.pyc and scripts\client\OfflineEntity.pyc: they are
+Python 2.6 compatibility entry points required by this client. No external
+Python installation is needed on client-only machines.
+
+Start the included server
+-------------------------
+
+Replace every older client package and lan_battle_server.py with the files in
+THIS package. Protocol 5 is intentionally incompatible with older client/server
+builds, so every player and the server must use this same package.
+
+On the one machine that has Python 3, open a terminal in this package folder:
+
+    python3 lan_battle_server.py --host 0.0.0.0 --port 28782
+
+Windows may use `python` instead of `python3` if that command launches Python 3.
+Allow TCP port 28782 through that machine's firewall when prompted.
+
+Waiting room and battle start
+-----------------------------
+
+1. Click Battle! on every client that should join.
+2. Confirm one JOIN line per machine in the server terminal.
+3. In the clickable waiting-room panel, choose one of the 33 stock maps.
+4. Click START BATTLE; the server sends that map and roster to every client.
+
+The old F12 and 0-key start shortcuts are not used by this build.
+
+Bots in this build
+------------------
+
+- Standard base-capture battles are supported; assault and encounter variants
+  are intentionally outside this build.
+- All 33 stock maps have macro tactical routes.
+- Terrain-aware A* connects strategic anchors while local feelers avoid cliffs,
+  deep water, hard obstacles, nearby tanks and congestion.
+- Vehicle roles cover brawling, support, flanking, sniping, scouting and SPGs.
+- Bots have stable individual aggression, caution, teamwork and driving habits.
+- Combat behavior includes limited spotting information, target memory, hull
+  angling, peek-and-withdraw timing and occasional forward/backward jiggling.
+- The same smart AI runs in normal offline battles and on the elected LAN
+  authority client.
+
+LAN synchronization
+-------------------
+
+- One elected client runs bot AI and battle-rule calculation.
+- Every client receives shared bot identity, movement, aiming, firing, HP,
+  deaths, wreck positions, capture progress and the final battle result.
+- If the authority disconnects, the server elects another connected client.
+- Human input, bot state and server snapshots run at 30 Hz. Clients interpolate
+  remote vehicles every render frame with bounded prediction.
+
+Current boundary
+----------------
+
+This is a trusted-LAN implementation, not the original retail BigWorld server.
+The elected client still owns map collision, bot AI and client physics. Hidden
+AI state is not preserved perfectly across authority failover, and complete
+module/crew synchronization, reconnection recovery, anti-cheat, NAT traversal
+and internet-safe authentication are outside this build. See LAN_SERVER.md for
+detailed diagnostics and the protocol boundary.

@@ -8,8 +8,12 @@ offline-battle mod - World of Tanks 0.8.2
 Play World of Tanks 0.8.2 offline: no login, no server. You go straight to the
 hangar, pick a tank and fight bots on the real maps.
 Bots use vehicle roles, stable individual personalities and shared team spots;
-all 33 stock maps have dedicated standard-battle tactical routes. Assault and
-encounter variants are intentionally outside the supported mode.
+all 33 stock maps have dedicated standard-battle tactical routes. Strategic
+route anchors are connected at runtime by a cached terrain-aware A* layer,
+then local feelers handle cliffs, solid obstacles, nearby tanks and recovery
+from congestion. This AI is used in both normal offline play and LAN-authority
+simulation. Assault and encounter variants are intentionally outside the
+supported mode.
 
 
 Install

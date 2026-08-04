@@ -9,6 +9,7 @@ _player = None
 _panel = None
 _text = None
 _controls = {}
+_labels = {}
 _selected_map = None
 _status = ''
 _hover_control = None
@@ -34,6 +35,11 @@ def _log(message):
 def _make_simple():
 	import GUI
 	return GUI.Simple(PANEL_TEXTURE)
+
+
+def _make_window():
+	import GUI
+	return GUI.Window(PANEL_TEXTURE)
 
 
 def _acquire_cursor():
@@ -133,56 +139,81 @@ class _ControlScript(object):
 
 
 def _make_control(role, position, width, height):
-	import GUI
 	component = _make_simple()
 	for name, value in (
 			('horizontalPositionMode', 'CLIP'), ('verticalPositionMode', 'CLIP'),
 			('widthMode', 'CLIP'), ('heightMode', 'CLIP'),
-			('horizontalAnchor', 'LEFT'), ('verticalAnchor', 'TOP'),
+			('horizontalAnchor', 'CENTER'), ('verticalAnchor', 'CENTER'),
 			('position', position), ('width', width), ('height', height),
 			('materialFX', 'SOLID'), ('colour', (24, 55, 78, 245)),
 			('focus', True), ('mouseButtonFocus', True), ('crossFocus', True),
+			('moveFocus', True),
 			('visible', False)):
 		_safe_set(component, name, value)
 	_safe_set(component, 'script', _ControlScript(role, component))
-	GUI.addRoot(component)
+	_panel.addChild(component)
 	_controls[role] = component
+	return component
+
+
+def _make_label(role, text, position, width, height, anchor='LEFT',
+		colour=(255, 255, 255, 255)):
+	import GUI
+	component = GUI.Text()
+	for name, value in (
+			('text', text),
+			('horizontalPositionMode', 'CLIP'), ('verticalPositionMode', 'CLIP'),
+			('widthMode', 'CLIP'), ('heightMode', 'CLIP'),
+			('horizontalAnchor', anchor), ('verticalAnchor', 'CENTER'),
+			('position', position), ('width', width), ('height', height),
+			('font', 'default_small.font'), ('colour', colour),
+			('multiline', False), ('shadow', True), ('dropShadow', True),
+			('focus', False), ('mouseButtonFocus', False),
+			('crossFocus', False), ('moveFocus', False), ('visible', True)):
+		_safe_set(component, name, value)
+	_panel.addChild(component)
+	_labels[role] = component
+	return component
 
 
 def _make_panel():
-	global _panel, _text, _controls
+	global _panel, _text, _controls, _labels
 	try:
 		import GUI
-		_panel = _make_simple()
+		_panel = _make_window()
 		for name, value in (
 				('horizontalPositionMode', 'CLIP'), ('verticalPositionMode', 'CLIP'),
-				('widthMode', 'CLIP'), ('heightMode', 'CLIP'),
-				('horizontalAnchor', 'LEFT'), ('verticalAnchor', 'TOP'),
-				('position', (-0.70, 0.66, 0.02)), ('width', 1.40),
-				('height', 0.42), ('materialFX', 'SOLID'),
+				('widthMode', 'PIXEL'), ('heightMode', 'PIXEL'),
+				('horizontalAnchor', 'CENTER'), ('verticalAnchor', 'CENTER'),
+				('position', (0.0, 0.0, 0.10)), ('width', 680),
+				('height', 280), ('materialFX', 'SOLID'),
 				('colour', (5, 12, 20, 245)), ('focus', True),
+				('mouseButtonFocus', False), ('crossFocus', False),
+				('moveFocus', False),
 				('visible', False)):
 			_safe_set(_panel, name, value)
 		_safe_set(_panel, 'script', _PanelScript(_panel))
-		GUI.addRoot(_panel)
-
-		_text = GUI.Text()
-		for name, value in (
-				('horizontalPositionMode', 'CLIP'), ('verticalPositionMode', 'CLIP'),
-				('horizontalAnchor', 'LEFT'), ('verticalAnchor', 'TOP'),
-				('position', (-0.65, 0.615, 0.01)), ('font', 'default_small.font'),
-				('colour', (255, 255, 255, 255)), ('multiline', True),
-				('widthMode', 'CLIP'), ('heightMode', 'CLIP'),
-				('width', 1.30), ('height', 0.34), ('shadow', True),
-				('dropShadow', True), ('visible', False)):
-			_safe_set(_text, name, value)
-		GUI.addRoot(_text)
-
 		_controls = {}
-		_make_control('previous', (-0.64, 0.385, 0.00), 0.18, 0.075)
-		_make_control('map', (-0.43, 0.385, 0.00), 0.86, 0.075)
-		_make_control('next', (0.46, 0.385, 0.00), 0.18, 0.075)
-		_make_control('start', (-0.43, 0.215, 0.00), 0.86, 0.095)
+		_labels = {}
+		_make_control('previous', (-0.72, 0.15, 0.05), 0.20, 0.22)
+		_make_control('map', (0.0, 0.15, 0.05), 1.15, 0.22)
+		_make_control('next', (0.72, 0.15, 0.05), 0.20, 0.22)
+		_make_control('start', (0.0, -0.32, 0.05), 1.62, 0.24)
+		_make_label('title', 'LAN WAITING ROOM', (-0.84, 0.78, 0.00),
+			1.68, 0.12, colour=(232, 244, 255, 255))
+		_make_label('count', '', (-0.84, 0.54, 0.00), 1.68, 0.11)
+		_make_label('previous', '<', (-0.72, 0.15, 0.00), 0.18, 0.12,
+			anchor='CENTER')
+		_make_label('map', '', (0.0, 0.15, 0.00), 1.10, 0.12,
+			anchor='CENTER')
+		_make_label('next', '>', (0.72, 0.15, 0.00), 0.18, 0.12,
+			anchor='CENTER')
+		_make_label('start', 'START BATTLE', (0.0, -0.32, 0.00),
+			1.58, 0.12, anchor='CENTER')
+		_make_label('status', '', (-0.84, -0.68, 0.00), 1.68, 0.12,
+			colour=(184, 205, 222, 255))
+		_text = _labels['status']
+		GUI.addRoot(_panel)
 		method = getattr(GUI, 'reSort', None)
 		if callable(method):
 			method()
@@ -196,9 +227,9 @@ def _make_panel():
 def _set_visible(value):
 	if _panel is not None:
 		_safe_set(_panel, 'visible', bool(value))
-	if _text is not None:
-		_safe_set(_text, 'visible', bool(value))
 	for component in _controls.values():
+		_safe_set(component, 'visible', bool(value))
+	for component in _labels.values():
 		_safe_set(component, 'visible', bool(value))
 
 
@@ -216,19 +247,15 @@ def _paint_controls():
 
 
 def _refresh():
-	if not _active or _text is None:
+	if not _active or not _labels:
 		return
 	client = _client()
 	count = int(getattr(client, 'waiting_count', 0) or 0) if client else 0
 	map_name = _friendly_map_name(_selected_map)
-	message = (
-		'LAN WAITING ROOM\n'
-		'%d player(s) connected. Choose the battlefield, then click START.\n\n'
-		' <              MAP: %-28s              >\n\n'
-		'                 START BATTLE\n'
-		'Status: %s'
-	) % (count, map_name, _status or 'Ready.')
-	_safe_set(_text, 'text', message)
+	_safe_set(_labels['count'], 'text',
+		'%d player(s) connected. Choose the battlefield, then click START.' % count)
+	_safe_set(_labels['map'], 'text', 'MAP: %s' % map_name)
+	_safe_set(_labels['status'], 'text', 'STATUS: %s' % (_status or 'Ready.'))
 	_paint_controls()
 
 

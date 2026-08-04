@@ -22,6 +22,7 @@ _status = ''
 _panel = None
 _text = None
 _controls = {}
+_labels = {}
 _hover_control = None
 _replace_on_type = False
 _cursor_acquired = False
@@ -45,6 +46,12 @@ def _make_simple():
 	"""Create a solid component; 0.8.2 requires an explicit texture name."""
 	import GUI
 	return GUI.Simple(PANEL_TEXTURE)
+
+
+def _make_window():
+	"""Create a real parent window so its children share one coordinate space."""
+	import GUI
+	return GUI.Window(PANEL_TEXTURE)
 
 
 def _log(message):
@@ -281,6 +288,7 @@ def _make_entry():
 		_safe_set(_entry_panel, 'focus', True)
 		_safe_set(_entry_panel, 'mouseButtonFocus', True)
 		_safe_set(_entry_panel, 'crossFocus', True)
+		_safe_set(_entry_panel, 'moveFocus', True)
 		_entry_script = _EntryScript(_entry_panel)
 		_safe_set(_entry_panel, 'script', _entry_script)
 		_safe_set(_entry_panel, 'visible', False)
@@ -301,6 +309,11 @@ def _make_entry():
 		_safe_set(_entry_text, 'height', 0.04)
 		_safe_set(_entry_text, 'shadow', True)
 		_safe_set(_entry_text, 'dropShadow', True)
+		# A decorative Text root must never sit in front of the clickable panel.
+		_safe_set(_entry_text, 'focus', False)
+		_safe_set(_entry_text, 'mouseButtonFocus', False)
+		_safe_set(_entry_text, 'crossFocus', False)
+		_safe_set(_entry_text, 'moveFocus', False)
 		_safe_set(_entry_text, 'visible', False)
 		GUI.addRoot(_entry_text)
 		_refresh_entry()
@@ -375,6 +388,32 @@ def _load_values():
 	_replace_on_type = True
 
 
+def _add_panel_child(component):
+	_panel.addChild(component)
+	return component
+
+
+def _make_label(role, text, position, width, height, anchor='LEFT',
+		colour=(255, 255, 255, 255)):
+	import GUI
+	component = GUI.Text()
+	for name, value in (
+			('text', text),
+			('horizontalPositionMode', 'CLIP'),
+			('verticalPositionMode', 'CLIP'),
+			('widthMode', 'CLIP'), ('heightMode', 'CLIP'),
+			('horizontalAnchor', anchor), ('verticalAnchor', 'CENTER'),
+			('position', position), ('width', width), ('height', height),
+			('font', 'default_small.font'), ('colour', colour),
+			('multiline', False), ('shadow', True), ('dropShadow', True),
+			('focus', False), ('mouseButtonFocus', False),
+			('crossFocus', False), ('moveFocus', False), ('visible', True)):
+		_safe_set(component, name, value)
+	_add_panel_child(component)
+	_labels[role] = component
+	return component
+
+
 def _make_control(role, position, width, height):
 	import GUI
 	component = _make_simple()
@@ -382,8 +421,8 @@ def _make_control(role, position, width, height):
 	_safe_set(component, 'verticalPositionMode', 'CLIP')
 	_safe_set(component, 'widthMode', 'CLIP')
 	_safe_set(component, 'heightMode', 'CLIP')
-	_safe_set(component, 'horizontalAnchor', 'LEFT')
-	_safe_set(component, 'verticalAnchor', 'TOP')
+	_safe_set(component, 'horizontalAnchor', 'CENTER')
+	_safe_set(component, 'verticalAnchor', 'CENTER')
 	_safe_set(component, 'position', position)
 	_safe_set(component, 'width', width)
 	_safe_set(component, 'height', height)
@@ -392,15 +431,18 @@ def _make_control(role, position, width, height):
 	_safe_set(component, 'focus', True)
 	_safe_set(component, 'mouseButtonFocus', True)
 	_safe_set(component, 'crossFocus', True)
+	_safe_set(component, 'moveFocus', True)
 	_safe_set(component, 'script', _ControlScript(role, component))
 	_safe_set(component, 'visible', False)
-	GUI.addRoot(component)
+	_add_panel_child(component)
 	_controls[role] = component
 	return component
 
 
 def _set_controls_visible(value):
 	for component in _controls.values():
+		_safe_set(component, 'visible', bool(value))
+	for component in _labels.values():
 		_safe_set(component, 'visible', bool(value))
 
 
@@ -422,50 +464,55 @@ def _paint_controls():
 
 
 def _make_panel():
-	global _panel, _text, _controls
+	global _panel, _text, _controls, _labels
 	try:
 		import GUI
-		_panel = _make_simple()
+		_panel = _make_window()
 		_safe_set(_panel, 'horizontalPositionMode', 'CLIP')
 		_safe_set(_panel, 'verticalPositionMode', 'CLIP')
-		_safe_set(_panel, 'widthMode', 'CLIP')
-		_safe_set(_panel, 'heightMode', 'CLIP')
-		_safe_set(_panel, 'horizontalAnchor', 'LEFT')
-		_safe_set(_panel, 'verticalAnchor', 'TOP')
-		_safe_set(_panel, 'position', (-0.76, 0.78, 0.10))
-		_safe_set(_panel, 'width', 1.52)
-		_safe_set(_panel, 'height', 0.82)
+		_safe_set(_panel, 'widthMode', 'PIXEL')
+		_safe_set(_panel, 'heightMode', 'PIXEL')
+		_safe_set(_panel, 'horizontalAnchor', 'CENTER')
+		_safe_set(_panel, 'verticalAnchor', 'CENTER')
+		_safe_set(_panel, 'position', (0.0, 0.0, 0.10))
+		_safe_set(_panel, 'width', 720)
+		_safe_set(_panel, 'height', 360)
 		_safe_set(_panel, 'materialFX', 'SOLID')
 		_safe_set(_panel, 'colour', (5, 12, 20, 245))
 		_safe_set(_panel, 'visible', False)
-		GUI.addRoot(_panel)
-
-		_text = GUI.Text()
-		_safe_set(_text, 'horizontalPositionMode', 'CLIP')
-		_safe_set(_text, 'verticalPositionMode', 'CLIP')
-		_safe_set(_text, 'horizontalAnchor', 'LEFT')
-		_safe_set(_text, 'verticalAnchor', 'TOP')
-		_safe_set(_text, 'position', (-0.71, 0.735, 0.04))
-		_safe_set(_text, 'font', 'default_small.font')
-		_safe_set(_text, 'colour', (255, 255, 255, 255))
-		_safe_set(_text, 'multiline', True)
-		_safe_set(_text, 'widthMode', 'CLIP')
-		_safe_set(_text, 'heightMode', 'CLIP')
-		_safe_set(_text, 'width', 1.42)
-		_safe_set(_text, 'height', 0.73)
-		_safe_set(_text, 'shadow', True)
-		_safe_set(_text, 'dropShadow', True)
 		_safe_set(_panel, 'focus', False)
+		_safe_set(_panel, 'mouseButtonFocus', False)
+		_safe_set(_panel, 'crossFocus', False)
+		_safe_set(_panel, 'moveFocus', False)
 		_safe_set(_panel, 'script', _PanelScript(_panel))
-		_safe_set(_text, 'visible', False)
-		GUI.addRoot(_text)
-
 		_controls = {}
-		_make_control('host', (-0.70, 0.535, 0.07), 1.40, 0.07)
-		_make_control('port', (-0.70, 0.455, 0.07), 1.40, 0.07)
-		_make_control('mode', (-0.70, 0.375, 0.07), 1.40, 0.07)
-		_make_control('save', (-0.70, 0.035, 0.07), 0.66, 0.09)
-		_make_control('cancel', (0.04, 0.035, 0.07), 0.66, 0.09)
+		_labels = {}
+		_make_control('host', (0.0, 0.40, 0.05), 1.76, 0.15)
+		_make_control('port', (0.0, 0.20, 0.05), 1.76, 0.15)
+		_make_control('mode', (0.0, 0.00, 0.05), 1.76, 0.15)
+		_make_control('save', (-0.46, -0.72, 0.05), 0.78, 0.18)
+		_make_control('cancel', (0.46, -0.72, 0.05), 0.78, 0.18)
+
+		_make_label('title', 'LAN MULTIPLAYER SETTINGS',
+			(-0.88, 0.82, 0.00), 1.76, 0.12,
+			colour=(232, 244, 255, 255))
+		_make_label('help', '', (-0.88, 0.65, 0.00), 1.76, 0.11)
+		_make_label('host', '', (-0.82, 0.40, 0.00), 1.62, 0.12)
+		_make_label('port', '', (-0.82, 0.20, 0.00), 1.62, 0.12)
+		_make_label('mode', '', (-0.82, 0.00, 0.00), 1.62, 0.12)
+		_make_label('map', '', (-0.88, -0.19, 0.00), 1.76, 0.10)
+		_make_label('connection', '', (-0.88, -0.34, 0.00), 1.76, 0.10)
+		_make_label('status', '', (-0.88, -0.49, 0.00), 1.76, 0.10)
+		_make_label('save', 'SAVE', (-0.46, -0.72, 0.00), 0.70, 0.12,
+			anchor='CENTER')
+		_make_label('cancel', 'CANCEL', (0.46, -0.72, 0.00), 0.70, 0.12,
+			anchor='CENTER')
+		_make_label('keyboard',
+			'TAB select  |  SPACE toggle  |  ENTER save  |  ESC cancel',
+			(-0.88, -0.91, 0.00), 1.76, 0.08,
+			colour=(184, 205, 222, 255))
+		_text = _labels['status']
+		GUI.addRoot(_panel)
 		_resort_gui()
 		return True
 	except Exception:
@@ -481,7 +528,7 @@ def _make_panel():
 
 
 def _refresh():
-	if _panel is None or _text is None:
+	if _panel is None or not _labels:
 		return
 	marker_host = '>' if _field == 0 else ' '
 	marker_port = '>' if _field == 1 else ' '
@@ -502,26 +549,19 @@ def _refresh():
 				connection = 'Connecting to %s:%s...' % (client.host, client.port)
 	except Exception:
 		pass
-	message = (
-		'LAN MULTIPLAYER SETTINGS\n'
-		'Click a blue row, type the new value, then click SAVE.\n'
-		'The first number typed replaces the selected value.\n'
-		'\n'
-		'%s  SERVER IP       %s\n'
-		'%s  TCP PORT        %s\n'
-		'%s  LAN BATTLE      %s\n'
-		'\n'
-		'Map: choose it in the clickable waiting room after joining\n'
-		'Connection: %s\n'
-		'Status: %s\n'
-		'\n'
-		'        SAVE                         CANCEL\n'
-		'Keyboard: TAB select | SPACE toggle | ENTER save | ESC cancel'
-	) % (marker_host, _host, marker_port, _port, marker_mode, mode,
-		connection, _status)
+	_safe_set(_labels['help'], 'text',
+		'Click a row to edit. The first typed digit replaces its value.')
+	_safe_set(_labels['host'], 'text',
+		'%s  SERVER IP       %s' % (marker_host, _host))
+	_safe_set(_labels['port'], 'text',
+		'%s  TCP PORT        %s' % (marker_port, _port))
+	_safe_set(_labels['mode'], 'text',
+		'%s  LAN BATTLE      %s' % (marker_mode, mode))
+	_safe_set(_labels['map'], 'text',
+		'MAP: choose it in the waiting room after joining')
+	_safe_set(_labels['connection'], 'text', 'CONNECTION: %s' % connection)
+	_safe_set(_labels['status'], 'text', 'STATUS: %s' % _status)
 	_safe_set(_panel, 'visible', True)
-	_safe_set(_text, 'visible', True)
-	_safe_set(_text, 'text', message)
 	_set_controls_visible(True)
 	_paint_controls()
 
@@ -550,8 +590,6 @@ def close():
 	if _panel is not None:
 		_safe_set(_panel, 'visible', False)
 		_safe_set(_panel, 'focus', False)
-	if _text is not None:
-		_safe_set(_text, 'visible', False)
 	_set_controls_visible(False)
 	_release_cursor()
 	_set_entry_visible(not _in_battle())

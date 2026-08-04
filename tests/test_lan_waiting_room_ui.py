@@ -16,9 +16,16 @@ def load_waiting_room():
         def __init__(self, texture=None):
             self.texture = texture
             self.visible = False
+            self.children = []
+            self.parent = None
+
+        def addChild(self, child):
+            child.parent = self
+            self.children.append(child)
 
     gui_engine = types.ModuleType("GUI")
     gui_engine.Simple = Component
+    gui_engine.Window = Component
     gui_engine.Text = Component
     gui_engine.addRoot = lambda component: roots.append(component)
     gui_engine.reSort = lambda: None
@@ -73,7 +80,33 @@ class WaitingRoomUITest(unittest.TestCase):
             {"previous", "map", "next", "start"}, set(self.ui._controls)
         )
         self.assertEqual([True], self.cursor_calls)
-        self.assertIn("2 player(s)", self.ui._text.text)
+        self.assertIn("2 player(s)", self.ui._labels["count"].text)
+        self.assertEqual("MAP: 04 - Himmelsdorf", self.ui._labels["map"].text)
+        self.assertEqual("PIXEL", self.ui._panel.widthMode)
+        self.assertEqual((680, 280), (self.ui._panel.width, self.ui._panel.height))
+        self.assertEqual([self.ui._panel], self.roots)
+        self.assertTrue(
+            all(control.parent is self.ui._panel for control in self.ui._controls.values())
+        )
+        self.assertTrue(
+            all(label.parent is self.ui._panel for label in self.ui._labels.values())
+        )
+        for role in ("previous", "map", "next", "start"):
+            self.assertEqual("CENTER", self.ui._controls[role].horizontalAnchor)
+            self.assertEqual("CENTER", self.ui._controls[role].verticalAnchor)
+            self.assertEqual(
+                self.ui._controls[role].position[1],
+                self.ui._labels[role].position[1],
+            )
+        self.assertTrue(
+            all(
+                not label.focus
+                and not label.mouseButtonFocus
+                and not label.crossFocus
+                and not label.moveFocus
+                for label in self.ui._labels.values()
+            )
+        )
 
         self.ui._controls["next"].script.handleMouseClickEvent(
             self.ui._controls["next"]
@@ -84,14 +117,14 @@ class WaitingRoomUITest(unittest.TestCase):
         )
 
         self.assertEqual([(self.player, "31_airfield")], self.starts)
-        self.assertIn("Starting 31 - Airfield", self.ui._text.text)
+        self.assertIn("Starting 31 - Airfield", self.ui._labels["status"].text)
 
     def test_roster_update_refreshes_count_and_battle_transition_closes(self):
         self.ui.open(self.player)
         self.client.waiting_count = 4
 
         self.assertTrue(self.ui.update(self.player))
-        self.assertIn("4 player(s)", self.ui._text.text)
+        self.assertIn("4 player(s)", self.ui._labels["count"].text)
 
         self.client.phase = "battle"
         self.assertFalse(self.ui.update(self.player))

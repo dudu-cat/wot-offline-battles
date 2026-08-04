@@ -16,9 +16,16 @@ def load_settings_module():
         def __init__(self, texture=None):
             self.texture = texture
             self.visible = False
+            self.children = []
+            self.parent = None
+
+        def addChild(self, child):
+            child.parent = self
+            self.children.append(child)
 
     gui_engine = types.ModuleType("GUI")
     gui_engine.Simple = Component
+    gui_engine.Window = Component
     gui_engine.Text = Component
     gui_engine.addRoot = lambda component: roots.append(component)
     gui_engine.reSort = lambda: None
@@ -87,13 +94,38 @@ class LANSettingsTest(unittest.TestCase):
         self.assertEqual([True], self.cursor_calls)
         self.assertEqual({"host", "port", "mode", "save", "cancel"}, set(self.settings._controls))
         self.assertTrue(all(control.visible for control in self.settings._controls.values()))
-        self.assertIn("Click a blue row", self.settings._text.text)
-        self.assertGreaterEqual(self.settings._panel.width, 1.5)
+        self.assertIn("Click a row", self.settings._labels["help"].text)
+        self.assertEqual("PIXEL", self.settings._panel.widthMode)
+        self.assertEqual((720, 360), (self.settings._panel.width, self.settings._panel.height))
+        self.assertEqual([self.settings._panel], self.roots)
+        self.assertTrue(
+            all(control.parent is self.settings._panel for control in self.settings._controls.values())
+        )
+        self.assertTrue(
+            all(label.parent is self.settings._panel for label in self.settings._labels.values())
+        )
+        for role in ("host", "port", "mode", "save", "cancel"):
+            self.assertEqual("CENTER", self.settings._controls[role].horizontalAnchor)
+            self.assertEqual("CENTER", self.settings._controls[role].verticalAnchor)
+            self.assertEqual(
+                self.settings._controls[role].position[1],
+                self.settings._labels[role].position[1],
+            )
+        self.assertTrue(
+            all(
+                not label.focus
+                and not label.mouseButtonFocus
+                and not label.crossFocus
+                and not label.moveFocus
+                for label in self.settings._labels.values()
+            )
+        )
 
         self.settings.close()
 
         self.assertEqual([True, False], self.cursor_calls)
         self.assertTrue(all(not control.visible for control in self.settings._controls.values()))
+        self.assertTrue(all(not label.visible for label in self.settings._labels.values()))
 
     def test_clicking_a_field_makes_the_first_typed_digit_replace_it(self):
         self.settings.open()

@@ -1514,6 +1514,67 @@ def _offh_ai_director(player):
 	return director
 
 
+def _offh_ai_navigator(director):
+	"""Create the shared terrain graph used below the strategic director."""
+	navigator = globals().get('g_offh_terrain_navigator')
+	if navigator is not None:
+		return navigator
+	import BigWorld, Math, math
+	from gui.mods.offhangar.bot_ai_navigation import TerrainNavigator
+
+	def _ground_probe(x, z, hint_y):
+		# Stay on the current terrain layer. A long top-down ray can select a
+		# bridge or roof while the tank is driving underneath it.
+		probe_top = float(hint_y) + 8.0
+		probe_bottom = float(hint_y) - 18.0
+		for _unused in range(3):
+			hit = BigWorld.wg_collideSegment(
+				_offh_bspace(), Math.Vector3(x, probe_top, z),
+				Math.Vector3(x, probe_bottom, z), 128)
+			if hit is None:
+				return None
+			height = float(hit[0].y)
+			if height <= float(hint_y) + 4.5:
+				# Shallow fords remain usable, but a route through drowning-depth
+				# water is never a valid shortcut across a lake or harbour.
+				if _offh_water_depth(x, height, z) > 1.0:
+					return None
+				return height
+			probe_top = height - 0.35
+		return None
+
+	def _obstacle_probe(start, end, half_width):
+		dx = float(end[0]) - float(start[0])
+		dz = float(end[2]) - float(start[2])
+		length = math.sqrt(dx * dx + dz * dz)
+		if length < 0.1:
+			return False
+		lateral_x = dz / length
+		lateral_z = -dx / length
+		# One hull-height, three-lane sweep is enough for the coarse graph;
+		# the per-frame feelers below retain their dual-height fine check.
+		for height in (0.9,):
+			for offset in (-float(half_width), 0.0, float(half_width)):
+				start_ray = Math.Vector3(
+					float(start[0]) + lateral_x * offset,
+					float(start[1]) + height,
+					float(start[2]) + lateral_z * offset)
+				end_ray = Math.Vector3(
+					float(end[0]) + lateral_x * offset,
+					float(end[1]) + height,
+					float(end[2]) + lateral_z * offset)
+				if BigWorld.wg_collideSegment(
+						_offh_bspace(), start_ray, end_ray, 128) is not None:
+					return True
+		return False
+
+	navigator = TerrainNavigator(_ground_probe, _obstacle_probe,
+	                             getattr(director, 'bounds', None), 18.0)
+	globals()['g_offh_terrain_navigator'] = navigator
+	LOG_DEBUG('OfflineBattle.SMART_AI terrain navigation enabled cell=18m')
+	return navigator
+
+
 def _offh_ai_class_tag(mock, descriptor):
 	if mock is not None:
 		cached = getattr(mock, '_offh_ai_class_tag', None)
@@ -1702,6 +1763,7 @@ def _offh_battle_sweep(tag='exit'):
 		globals()['G_MOCK_VEHICLES'] = {}
 		globals()['g_offh_exhaust_owners'] = []
 		globals().pop('g_offh_bot_director', None)
+		globals().pop('g_offh_terrain_navigator', None)
 		globals().pop('g_offh_ai_contacts_t', None)
 		globals().pop('g_offh_ai_init_error_logged', None)
 		_stage = 'models'
@@ -4944,6 +5006,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		globals()['g_offh_battle_gen'] = (globals().get('g_offh_battle_gen', 0) or 0) + 1
 		_offh_my_gen = [globals()['g_offh_battle_gen']]
 		globals().pop('g_offh_bot_director', None)
+		globals().pop('g_offh_terrain_navigator', None)
 		globals().pop('g_offh_ai_contacts_t', None)
 		globals().pop('g_offh_ai_init_error_logged', None)
 		_offh_seen_arena = [False]
@@ -8303,6 +8366,45 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								target_pos = (m_veh.position.x, m_veh.position.y, m_veh.position.z)
 							if drive_pos is None: drive_pos = target_pos
 							if face_pos is None: face_pos = target_pos
+							# Hierarchical navigation: strategic routes choose the battle lane;
+							# a shared lazy A* graph connects their sparse anchors without
+							# crossing cliffs, water gaps or solid geometry. Nearby tanks remain
+							# the responsibility of the fast per-frame separation/feeler layer.
+							if _ai_director is not None and _ai_order is not None:
+								try:
+									_nav_dx = drive_pos[0] - m_veh.position.x
+									_nav_dz = drive_pos[2] - m_veh.position.z
+									_nav_distance = math.sqrt(_nav_dx*_nav_dx + _nav_dz*_nav_dz)
+									if _nav_distance > 15.0:
+										_nav_mode = _ai_order.get('combat_mode', 'route')
+										_nav_index = int(_ai_order.get('route_index', 0))
+										if _nav_mode == 'route':
+											_nav_key = ('route', int(my_team),
+											            _ai_order.get('route_id', 'direct'), _nav_index)
+											_nav_anchor = (_ai_order.get('route_anchor')
+											               if _nav_index > 0 else None)
+										else:
+											_nav_key = ('local', int(eid), _nav_mode,
+											            _ai_order.get('target_id'))
+											_nav_anchor = None
+										_avoid_points = []
+										for _nav_eid, _nav_vehicle in mock_vehicles.iteritems():
+											if (_nav_eid == eid or _nav_vehicle is None or
+											        not getattr(_nav_vehicle, 'isAlive', False)):
+												continue
+											_nav_position = getattr(_nav_vehicle, 'position', None)
+											if _nav_position is not None:
+												_avoid_points.append((_nav_position.x, _nav_position.y,
+												                      _nav_position.z))
+										drive_pos = _offh_ai_navigator(_ai_director).next_target(
+											eid, (m_veh.position.x, m_veh.position.y, m_veh.position.z),
+											drive_pos, _nav_key, BigWorld.time(), _nav_anchor,
+											_avoid_points)
+								except Exception as _nav_error:
+									if not getattr(m_veh, '_offh_nav_error_logged', False):
+										m_veh._offh_nav_error_logged = True
+										LOG_DEBUG('OfflineBattle.SMART_AI navigation error id=%s: %s' % (
+											str(eid), str(_nav_error)))
 							dx = drive_pos[0] - m_veh.position.x
 							dz = drive_pos[2] - m_veh.position.z
 							dist = math.sqrt(dx*dx + dz*dz)
@@ -8417,8 +8519,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											_cos_fy = math.cos(_fy)
 											_sin_fy = math.sin(_fy)
 											
-											# Dual-height rays: catch low rocks (0.7m) and tall buildings (1.5m)
-											_ray_profiles = [(0.7, 7.0), (1.5, 12.0)]
+											# Dual-height, speed-aware rays: the far sample must see a
+											# ravine early enough for a fast tank to turn before the lip.
+											_far_feeler = 20.0 if abs(m_veh._veh_velocity) > 5.0 else 15.0
+											_ray_profiles = [(0.7, 8.0), (1.5, _far_feeler)]
+											_previous_ground_y = m_veh.position.y
+											_previous_ground_dist = 0.0
 											
 											for _h, _dist in _ray_profiles:
 												if _hit: break
@@ -8429,9 +8535,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 												_dest_y = m_veh.position.y
 												
 												try:
-													_g_hit = BigWorld.wg_collideSegment(_offh_bspace(), 
-														Math.Vector3(_dest_x, m_veh.position.y + 4.0, _dest_z), 
-														Math.Vector3(_dest_x, m_veh.position.y - 15.0, _dest_z), 128)
+													_probe_run = _dist - _previous_ground_dist
+													_probe_up = max(4.5, _probe_run * 0.52)
+													_probe_down = max(5.0, _probe_run * 0.45)
+													_g_hit = BigWorld.wg_collideSegment(_offh_bspace(),
+													Math.Vector3(_dest_x, _previous_ground_y + _probe_up, _dest_z),
+													Math.Vector3(_dest_x, _previous_ground_y - _probe_down, _dest_z), 128)
 													if _g_hit:
 														_dest_y = _g_hit[0].y
 													else:
@@ -8440,10 +8549,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 												
 												if _hit: break
 												
-												_y_diff = _dest_y - m_veh.position.y
-												if _y_diff > _dist * 0.45 or _y_diff < -_dist * 0.7:
+												_y_diff = _dest_y - _previous_ground_y
+												_ground_run = _dist - _previous_ground_dist
+												if (_y_diff > _ground_run * 0.48 or
+												        _y_diff < -_ground_run * 0.38):
 													_hit = True
 													break
+												_previous_ground_y = _dest_y
+												_previous_ground_dist = _dist
 													
 												# 2. Obstacle check (parallel to slope)
 												for _ox in (-_hw, 0.0, _hw):
