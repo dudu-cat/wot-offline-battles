@@ -220,6 +220,8 @@ class LANClientQueueTest(unittest.TestCase):
                       "ignored": 999},
             "active": {"safe_direct": 0, "safe_local": 1, "reactive": 2},
             "recovered": 4,
+            "search": {"pending": 13, "completed": 4, "failed": 2,
+                       "oldest_ms": 12345, "ignored": 999},
         }
         self.assertTrue(self.network.publish_bot_observation(
             player, [contact] * 65, reports, raw_navigation
@@ -233,6 +235,9 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertEqual(3, navigation["total"]["safe_local"])
         self.assertNotIn("ignored", navigation["total"])
         self.assertEqual(4, navigation["recovered"])
+        self.assertEqual(13, navigation["search"]["pending"])
+        self.assertEqual(12345, navigation["search"]["oldest_ms"])
+        self.assertNotIn("ignored", navigation["search"])
 
         captured[:] = []
         malformed_contact = dict(contact, position={"x": 1})

@@ -451,11 +451,15 @@ class TerrainNavigator(object):
 		self.paths = {}
 		self.path_times = {}
 		self.searches = {}
+		self.search_times = {}
 		self.bot_states = {}
 		self.search_frame = None
-		self.search_budget = 0
-		self.search_budget_per_frame = 24
+		self.search_next_key = None
+		self.search_budget_per_frame = 32
 		self.search_budget_per_path = 4
+		self.search_completed = 0
+		self.search_failed = 0
+		self.search_now = 0.0
 		self.fallback_totals = {
 			'safe_direct': 0, 'safe_local': 0, 'reactive': 0}
 		self.fallback_recovered = 0
@@ -486,6 +490,14 @@ class TerrainNavigator(object):
 			'total': dict(self.fallback_totals),
 			'active': active,
 			'recovered': int(self.fallback_recovered),
+			'search': {
+				'pending': len(self.searches),
+				'completed': int(self.search_completed),
+				'failed': int(self.search_failed),
+				'oldest_ms': int(max(0.0, self.search_now -
+					min(self.search_times.values())) * 1000.0)
+					if self.search_times else 0,
+			},
 		}
 
 	def _fallback_target(self, bot_id, current, goal, now, avoid_points, state,
@@ -520,6 +532,58 @@ class TerrainNavigator(object):
 			self.paths.pop(key, None)
 			self.path_times.pop(key, None)
 
+	def _finish_search(self, key, search, now):
+		path = search.result or ()
+		self.searches.pop(key, None)
+		self.search_times.pop(key, None)
+		self.paths[key] = path
+		self.path_times[key] = float(now)
+		if path:
+			self.search_completed += 1
+		else:
+			self.search_failed += 1
+
+	def _advance_searches(self, now):
+		"""Give every pending A* task a fair share of the current frame.
+
+		The old on-demand scheduler handed the whole frame budget to whichever bots
+		were updated first. With a 29-bot room, later join searches could therefore
+		remain pending forever. This rotating queue gives every task one expansion
+		before any task receives a second, and remembers the next task across frames.
+		"""
+		self.search_now = float(now)
+		frame = int(float(now) * 30.0 + 0.5)
+		if frame == self.search_frame:
+			return
+		self.search_frame = frame
+		keys = sorted(self.searches, key=lambda value: repr(value))
+		if not keys:
+			self.search_next_key = None
+			return
+		if self.search_next_key in keys:
+			start = keys.index(self.search_next_key)
+			queue = keys[start:] + keys[:start]
+		else:
+			queue = keys
+		steps = {}
+		budget = max(0, int(self.search_budget_per_frame))
+		per_path = max(1, int(self.search_budget_per_path))
+		while budget > 0 and queue:
+			key = queue.pop(0)
+			search = self.searches.get(key)
+			if search is None:
+				continue
+			search.step(1)
+			search.last_frame = frame
+			budget -= 1
+			steps[key] = steps.get(key, 0) + 1
+			if search.done:
+				self._finish_search(key, search, now)
+			elif steps[key] < per_path:
+				queue.append(key)
+		self.search_next_key = queue[0] if queue else None
+		self._trim_cache(now)
+
 	def _path(self, path_key, start, goal, now, avoid_points):
 		key = self._cache_key(path_key, goal)
 		if key in self.paths:
@@ -551,23 +615,16 @@ class TerrainNavigator(object):
 			search = self.grid.begin_plan(
 				start, goal, avoid_points=avoid_points, now=now)
 			self.searches[key] = search
-		frame = int(float(now) * 30.0 + 0.5)
-		if frame != self.search_frame:
-			self.search_frame = frame
-			self.search_budget = self.search_budget_per_frame
-		if search.last_frame != frame and self.search_budget > 0:
-			budget = min(self.search_budget_per_path, self.search_budget)
-			search.step(budget)
-			search.last_frame = frame
-			self.search_budget -= budget
+			self.search_times[key] = float(now)
+		self._advance_searches(now)
+		if key in self.paths:
+			return key, self.paths[key]
 		if not search.done:
 			return key, None
-		path = search.result or ()
-		self.searches.pop(key, None)
-		self.paths[key] = path
-		self.path_times[key] = float(now)
-		self._trim_cache(now)
-		return key, path
+		# _advance_searches normally caches completed jobs. This branch only covers
+		# a test double or an externally completed task.
+		self._finish_search(key, search, now)
+		return key, self.paths[key]
 
 	def next_target(self, bot_id, current, goal, path_key, now,
 			anchor=None, avoid_points=None):
@@ -647,6 +704,17 @@ class TerrainNavigator(object):
 			state['path_key'] = key
 			return self._fallback_target(
 				bot_id, current, goal, now, avoid_points, state, True)
+		active_key = state.get('path_key')
+		if active_key is not None and active_key != key:
+			active_path = self.paths.get(active_key)
+			if (active_path and
+					not self.grid.path_has_penalty(active_path, now)):
+				# A join/recovery/continuation path starts at this hull's real
+				# position. Follow it to completion instead of replacing it with
+				# the shared strategic path again on the next frame.
+				key = active_key
+				path = active_path
+				self.path_times[key] = float(now)
 		if state.get('path_key') != key:
 			state['path_key'] = key
 			state['index'] = 0

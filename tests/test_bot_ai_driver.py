@@ -69,6 +69,61 @@ class BotAIDriverTest(unittest.TestCase):
         self.assertEqual(current, move)
         self.assertEqual(current, face)
 
+    def test_limited_traverse_gun_turns_hull_before_physics(self):
+        minimum, maximum, limited = self.module.gun_yaw_limits({
+            "gun": {"turretYawLimits": (-10.0, 10.0)},
+            "turret": {},
+        })
+        turn, throttle, aiming = self.module.combat_hull_aim(
+            0.0, math.pi / 2.0, minimum, maximum,
+            -0.3, 0.8, "drive", True,
+        )
+
+        self.assertTrue(limited)
+        self.assertTrue(aiming)
+        self.assertEqual(1.0, turn)
+        self.assertEqual(0.0, throttle)
+
+    def test_obstacle_recovery_outranks_limited_traverse_hull_aim(self):
+        turn, throttle, aiming = self.module.combat_hull_aim(
+            0.0, math.pi / 2.0, -0.2, 0.2,
+            -1.0, -0.72, "reverse_turn", True,
+        )
+
+        self.assertFalse(aiming)
+        self.assertEqual(-1.0, turn)
+        self.assertEqual(-0.72, throttle)
+
+    def test_fire_waits_for_visible_yaw_and_pitch_alignment(self):
+        self.assertFalse(self.module.gun_aligned(
+            0.0, 0.0, 0.0, -0.20, -0.05
+        ))
+        self.assertFalse(self.module.gun_aligned(
+            0.20, 0.0, 0.0, -0.10, -0.10
+        ))
+        self.assertTrue(self.module.gun_aligned(
+            0.20, 0.10, 0.08, -0.10, -0.08
+        ))
+
+    def test_projectile_direction_follows_rendered_barrel_pitch(self):
+        direction = self.module.barrel_direction(0.0, -0.25)
+
+        self.assertAlmostEqual(0.0, direction[0], places=6)
+        self.assertGreater(direction[1], 0.0)
+        self.assertAlmostEqual(1.0, math.sqrt(sum(v * v for v in direction)), places=6)
+
+    def test_battle_loop_integrates_prebattle_freeze_and_physical_aim(self):
+        source = (
+            ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
+        ).read_text()
+
+        hull_aim = source.index(".combat_hull_aim(")
+        physics_turn = source.index("_PHY.traverse_step(", hull_aim)
+        self.assertLess(hull_aim, physics_turn)
+        self.assertIn("if _battle_active and hasattr(m_veh, '_t_mat'):", source)
+        self.assertIn("_ai_gun_aligned = _offh_ai_driver().gun_aligned(", source)
+        self.assertIn("_offh_ai_driver().barrel_direction(", source)
+
     def test_flat_ground_drives_straight_to_target(self):
         driver = self.module.LocalDriver()
         order = driver.drive(1, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,

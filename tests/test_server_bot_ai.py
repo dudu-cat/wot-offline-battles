@@ -60,12 +60,15 @@ class ServerBotPlannerTests(unittest.TestCase):
                 "total": {"safe_direct": 2, "safe_local": 3, "reactive": 200000},
                 "active": {"safe_direct": 0, "safe_local": 1, "reactive": 2},
                 "recovered": 4,
+                "search": {"pending": 13, "completed": 4, "failed": 2,
+                           "oldest_ms": 12345},
             },
         })
 
         self.assertEqual(100000, state.bot_navigation_stats["total"]["reactive"])
         self.assertEqual(1, state.bot_navigation_stats["active"]["safe_local"])
         self.assertEqual(4, state.bot_navigation_stats["recovered"])
+        self.assertEqual(13, state.bot_navigation_stats["search"]["pending"])
         before = dict(state.bot_navigation_stats)
         state.update_bot_observation(2, {
             "navigation": {"total": {"reactive": 0}}
@@ -81,6 +84,9 @@ class ServerBotPlannerTests(unittest.TestCase):
         text = output.getvalue()
         self.assertEqual(1, text.count("BOT AI reports="))
         self.assertIn("nav=direct:2,local:3,reactive:100000 recovered:4", text)
+        self.assertIn(
+            "astar=pending:13,oldest:12345ms,done:4,failed:2", text
+        )
 
     def test_downloadable_layout_imports_shared_cover_module(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -337,6 +337,80 @@ class BotNavigationTest(unittest.TestCase):
         self.assertNotEqual(current, target)
         self.assertGreater(target[2], 2.0)
 
+    def test_search_budget_rotates_across_every_pending_path(self):
+        navigator = self.navigation.TerrainNavigator(
+            lambda x, z, hint: 0.0, cell_size=10.0
+        )
+        navigator.search_budget_per_frame = 24
+        navigator.search_budget_per_path = 4
+
+        class PendingSearch:
+            def __init__(self):
+                self.done = False
+                self.result = None
+                self.last_frame = None
+                self.steps = 0
+
+            def step(self, budget):
+                self.steps += budget
+                return False
+
+        searches = {}
+        for index in range(29):
+            key = ("search", index)
+            searches[key] = PendingSearch()
+            navigator.search_times[key] = 0.0
+        navigator.searches = searches
+
+        navigator._advance_searches(1.0)
+        navigator._advance_searches(1.0 + 1.0 / 30.0)
+
+        steps = [search.steps for search in searches.values()]
+        self.assertEqual(48, sum(steps))
+        self.assertGreater(min(steps), 0)
+        self.assertLessEqual(max(steps) - min(steps), 1)
+
+    def test_completed_join_path_is_not_replaced_by_shared_path_next_frame(self):
+        navigator = self.navigation.TerrainNavigator(
+            lambda x, z, hint: 0.0,
+            bounds=(-100.0, -100.0, 100.0, 100.0),
+            cell_size=10.0,
+        )
+        main_key = ("route", 1, "joined", 0)
+        goal = (60.0, 0.0, 0.0)
+        joined_key = navigator._cache_key(
+            ("join", 5, navigator.grid.cell_for((0.0, 0.0, 0.0))) + main_key,
+            goal,
+        )
+        joined_path = (
+            (0.0, 0.0, 0.0),
+            (10.0, 0.0, 0.0),
+            goal,
+        )
+        join_calls = []
+
+        def fake_path(path_key, start, target, now, avoid_points):
+            if path_key[0] == "join":
+                join_calls.append(path_key)
+                navigator.paths[joined_key] = joined_path
+                navigator.path_times[joined_key] = now
+                return joined_key, joined_path
+            return navigator._cache_key(path_key, target), (
+                (30.0, 0.0, 0.0), goal
+            )
+
+        navigator._path = fake_path
+        navigator.grid.segment_clear = (
+            lambda start, end: float(end[0]) <= 10.0
+        )
+
+        first = navigator.next_target(5, (0.0, 0.0, 0.0), goal, main_key, 1.0)
+        second = navigator.next_target(5, (5.0, 0.0, 0.0), goal, main_key, 1.1)
+
+        self.assertEqual((10.0, 0.0, 0.0), first)
+        self.assertEqual((10.0, 0.0, 0.0), second)
+        self.assertEqual(1, len(join_calls))
+
     def test_local_driver_rejects_deep_water_and_unsafe_grades(self):
         battle_source = (
             ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"

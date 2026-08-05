@@ -8919,6 +8919,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							bot_terrainCoeff = _bphys['terrainResist'][0]
 							bot_specificFriction = _bphys['specificFriction']
 							bot_chassisRotSpd = _bphys['rotSpd']
+							_battle_active = (getattr(
+								getattr(player, 'arena', None), 'period', 3) == 3)
+							_bot_gun_min_yaw, _bot_gun_max_yaw, _has_limited_traverse = (
+								_offh_ai_driver().gun_yaw_limits(_td))
+							_desired_gun_pitch = float(
+								getattr(m_veh, '_gun_pitch', 0.0) or 0.0)
+							m_veh._offh_desired_gun_pitch = _desired_gun_pitch
 							
 							# VIRTUAL DRIVER
 							throttle = 0.0
@@ -9001,9 +9008,16 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								elif m_veh._veh_velocity < 0.0:
 									m_veh._veh_velocity = min(0.0, m_veh._veh_velocity + 20.0 * dt)
 							elif (_ai_throttle_override is not None and
-							        _driver_mode in ('drive', 'arrived') and
-							        abs(diff_yaw) < 0.65):
+								        _driver_mode in ('drive', 'arrived') and
+								        abs(diff_yaw) < 0.65):
 								throttle = float(_ai_throttle_override)
+							if _battle_active:
+								turn_dir, throttle, _unused_hull_aiming = (
+									_offh_ai_driver().combat_hull_aim(
+										m_veh.yaw, _aim_target_yaw,
+										_bot_gun_min_yaw, _bot_gun_max_yaw,
+										turn_dir, throttle, _driver_mode,
+										_ai_target_id is not None))
 
 							# IMMOBILIZATION CHECK
 							_dev_hp = getattr(m_veh, 'devices_hp', None)
@@ -9071,8 +9085,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 													LOG_DEBUG('Fire HP updated via marker, HP=%d' % m_veh.health)
 									except: pass
 
-							# Pre-battle countdown: the line-up holds position (like the original)
-							if getattr(getattr(player, 'arena', None), 'period', 3) < 3:
+							# Outside the active battle, the line-up holds its current pose.
+							if not _battle_active:
 								throttle = 0.0
 								turn_dir = 0
 								m_veh._veh_velocity = 0.0
@@ -9655,50 +9669,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										m_veh._servo_added = True
 									except: pass
 									
-							# Otaceni veze nezavisle
-							if hasattr(m_veh, '_t_mat'):
+							# Turret and gun stay in their spawn pose until the countdown ends.
+							if _battle_active and hasattr(m_veh, '_t_mat'):
 								# Věž by měla vždy mířit na hráče (cíl), nezávisle na tom, kam se vyhýbá trup
 								t_yaw = _aim_target_yaw - m_veh.yaw
 								while t_yaw > math.pi: t_yaw -= 2*math.pi
 								while t_yaw < -math.pi: t_yaw += 2*math.pi
-								
-								# Načíst limity otáčení věže/děla z dat vozidla (pro TD a arty)
-								bot_gun_min_yaw = -math.pi
-								bot_gun_max_yaw =  math.pi
-								try:
-									if _td:
-										yl = None
-										if hasattr(_td, 'gun') and isinstance(_td.gun, dict):
-											yl = _td.gun.get('turretYawLimits', None)
-										if yl is None and hasattr(_td, 'turret') and isinstance(_td.turret, dict):
-											yl = _td.turret.get('yawLimits', None)
-										if yl is not None:
-											bot_gun_min_yaw = float(yl[0])
-											bot_gun_max_yaw = float(yl[1])
-											# Konverze stupňů -> radiány (hodnoty > 10 jsou ve stupních)
-											if abs(bot_gun_min_yaw) > 10.0 or abs(bot_gun_max_yaw) > 10.0:
-												bot_gun_min_yaw = math.radians(bot_gun_min_yaw)
-												bot_gun_max_yaw = math.radians(bot_gun_max_yaw)
-								except: pass
-								
-								has_limited_traverse = not (bot_gun_min_yaw <= -math.pi + 0.1 and bot_gun_max_yaw >= math.pi - 0.1)
-								
-								# A limited-traverse gun must not fight the local recovery controller.
-								is_avoiding_obstacle = _driver_mode in (
-									'avoid', 'blocked', 'reverse_turn')
-								
-								if has_limited_traverse and not is_avoiding_obstacle:
-									# TD/Arty: pokud je cíl mimo limity, bot musí otočit celý trup
-									if t_yaw < bot_gun_min_yaw - 0.05:
-										# Cíl vlevo od limitu – otočit trup doleva
-										m_veh._veh_turn_velocity = -bot_chassisRotSpd
-									elif t_yaw > bot_gun_max_yaw + 0.05:
-										# Cíl vpravo od limitu – otočit trup doprava
-										m_veh._veh_turn_velocity = bot_chassisRotSpd
-									
 								# Omezit věž na limity vždy
-								if has_limited_traverse:
-									t_yaw = max(bot_gun_min_yaw, min(bot_gun_max_yaw, t_yaw))
+								if _has_limited_traverse:
+									t_yaw = max(_bot_gun_min_yaw, min(_bot_gun_max_yaw, t_yaw))
 								
 								if getattr(m_veh, '_turret_yaw', None) is None: m_veh._turret_yaw = 0.0
 								t_diff = t_yaw - m_veh._turret_yaw
@@ -9748,6 +9727,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											pass
 										if _bp_want < _bp_min: _bp_want = _bp_min
 										elif _bp_want > _bp_max: _bp_want = _bp_max
+										_desired_gun_pitch = _bp_want
+										m_veh._offh_desired_gun_pitch = _bp_want
 										if getattr(m_veh, '_gun_pitch', None) is None: m_veh._gun_pitch = 0.0
 										_bp_speed = 0.35
 										try:
@@ -9796,9 +9777,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# the steering direction (separation/feeler blended), so a
 							# limited-traverse TD whose hull lined up with its own driving
 							# direction fired at a player sitting 90 deg off to the side.
-							gun_diff = _aim_target_yaw - abs_gun_yaw
-							while gun_diff > math.pi: gun_diff -= 2*math.pi
-							while gun_diff < -math.pi: gun_diff += 2*math.pi
+							_ai_gun_aligned = _offh_ai_driver().gun_aligned(
+								_aim_target_yaw, m_veh.yaw,
+								getattr(m_veh, '_turret_yaw', 0.0),
+								getattr(m_veh, '_offh_desired_gun_pitch',
+								        _desired_gun_pitch),
+								getattr(m_veh, '_gun_pitch', 0.0))
 							
 							bot_reload = m_veh._ai_reload_intra if (m_veh._ai_clip_size > 1 and m_veh._ai_clip > 0 and m_veh._ai_clip < m_veh._ai_clip_size) else m_veh._ai_reload_full
 							# A downed loader drags the reload out for a bot exactly as it does for the
@@ -9818,7 +9802,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# firing lane.
 							_ai_ready_to_fire = (
 								m_veh._ai_shoot_timer > bot_reload and _ai_fire_allowed and
-								1.0 < _enemy_dist < _ai_fire_range and abs(gun_diff) < 0.15)
+								1.0 < _enemy_dist < _ai_fire_range and _ai_gun_aligned)
 							_ai_shot_clear = False
 							if _ai_ready_to_fire:
 								_ai_los_now = BigWorld.time()
@@ -9853,14 +9837,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											_gravity = _shot['gravity']
 											_speed = _shot['speed']
 											
-											target_y = target_pos[1] if target_pos else veh_pos[1]
-											# Shell leaves along the BARREL azimuth (hull yaw + slewed
-											# turret yaw = exactly what _t_mat renders), not conjured
-											# straight at the target: the fire gate allows up to ~8.5 deg
-											# of remaining slew, and shots taken mid-slew used to home in
-											# anyway - now they genuinely go where the gun points.
-											dir_v = Math.Vector3(math.sin(abs_gun_yaw) * _enemy_dist, (target_y+1.0) - (m_veh.position.y+1.5), math.cos(abs_gun_yaw) * _enemy_dist)
-											dir_v.normalise()
+											# Spawn the shell along the rendered barrel in both yaw and
+											# pitch. It must never home vertically toward target_pos while
+											# the visible gun is still elevating.
+											_barrel_dir = _offh_ai_driver().barrel_direction(
+												abs_gun_yaw, getattr(m_veh, '_gun_pitch', 0.0))
+											dir_v = Math.Vector3(
+												_barrel_dir[0], _barrel_dir[1], _barrel_dir[2])
 											# Apply Bot Dispersion (approx 0.03 rad circle)
 											sigma = 0.03 / 3.0
 											dir_v.x += random.gauss(0, sigma)
@@ -9870,7 +9853,18 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											
 											_vel = dir_v.scale(_speed)
 											
-											start_p = Math.Vector3(m_veh.position.x, m_veh.position.y + 1.5, m_veh.position.z)
+											start_p = None
+											try:
+												_gun_model = getattr(m_veh, '_gun_model', None)
+												if _gun_model is not None:
+													start_p = Math.Matrix(
+														_gun_model.node('HP_gunFire')).translation
+											except Exception:
+												pass
+											if start_p is None:
+												start_p = Math.Vector3(
+													m_veh.position.x, m_veh.position.y + 1.5,
+													m_veh.position.z)
 											_cam_pos = BigWorld.camera().position if BigWorld.camera() else start_p
 											# keep the shot id: explode() needs it to detonate this very tracer
 											_b_sid = random.randint(10000, 99999)

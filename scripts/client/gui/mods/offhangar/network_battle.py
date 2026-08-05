@@ -1102,7 +1102,8 @@ def publish_bot_observation(player, contacts, affordances=None, navigation=None)
 			continue
 	shared_navigation = None
 	if isinstance(navigation, dict):
-		shared_navigation = {'total': {}, 'active': {}, 'recovered': 0}
+		shared_navigation = {
+			'total': {}, 'active': {}, 'recovered': 0, 'search': {}}
 		for group in ('total', 'active'):
 			raw_group = navigation.get(group)
 			if not isinstance(raw_group, dict):
@@ -1118,6 +1119,14 @@ def publish_bot_observation(player, contacts, affordances=None, navigation=None)
 		except Exception:
 			value = 0
 		shared_navigation['recovered'] = max(0, min(value, 100000))
+		raw_search = navigation.get('search')
+		if isinstance(raw_search, dict):
+			for name in ('pending', 'completed', 'failed', 'oldest_ms'):
+				try:
+					value = int(raw_search.get(name, 0) or 0)
+				except Exception:
+					value = 0
+				shared_navigation['search'][name] = max(0, min(value, 3600000))
 	return client.send_bot_observation(
 		payload, shared_affordances, shared_navigation)
 

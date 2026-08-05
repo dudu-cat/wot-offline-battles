@@ -38,6 +38,80 @@ def _identity_phase(bot_id):
 	return float(value % 997) / 997.0
 
 
+def _component_value(component, name, default=None):
+	if component is None:
+		return default
+	try:
+		if hasattr(component, 'get'):
+			return component.get(name, default)
+	except Exception:
+		pass
+	try:
+		return getattr(component, name)
+	except Exception:
+		return default
+
+
+def gun_yaw_limits(descriptor):
+	"""Return installed gun yaw limits in radians plus a limited-arc flag."""
+	gun = _component_value(descriptor, 'gun')
+	turret = _component_value(descriptor, 'turret')
+	limits = _component_value(gun, 'turretYawLimits')
+	if limits is None:
+		limits = _component_value(turret, 'yawLimits')
+	minimum = -math.pi
+	maximum = math.pi
+	try:
+		minimum = float(limits[0])
+		maximum = float(limits[1])
+		if abs(minimum) > math.pi + 0.1 or abs(maximum) > math.pi + 0.1:
+			minimum = math.radians(minimum)
+			maximum = math.radians(maximum)
+	except Exception:
+		minimum = -math.pi
+		maximum = math.pi
+	limited = not (minimum <= -math.pi + 0.1 and maximum >= math.pi - 0.1)
+	return minimum, maximum, limited
+
+
+def combat_hull_aim(hull_yaw, target_yaw, minimum_yaw, maximum_yaw,
+		turn, throttle, recovery_mode, has_target=True):
+	"""Turn a limited-traverse hull until its gun can physically bear."""
+	if not has_target or recovery_mode in ('avoid', 'blocked', 'reverse_turn',
+			'pivot_recovery'):
+		return float(turn), float(throttle), False
+	limited = not (float(minimum_yaw) <= -math.pi + 0.1 and
+	               float(maximum_yaw) >= math.pi - 0.1)
+	if not limited:
+		return float(turn), float(throttle), False
+	relative = _angle_delta(target_yaw, hull_yaw)
+	if float(minimum_yaw) + 0.04 <= relative <= float(maximum_yaw) - 0.04:
+		return float(turn), float(throttle), False
+	# Rotate before the physics step. The former post-physics velocity write was
+	# overwritten by LocalDriver on the next frame and never moved the hull.
+	hull_delta = _angle_delta(target_yaw, hull_yaw)
+	aim_turn = max(-1.0, min(1.0, hull_delta / 0.58))
+	return aim_turn, 0.0, True
+
+
+def gun_aligned(target_yaw, hull_yaw, turret_yaw, desired_pitch, gun_pitch,
+		yaw_tolerance=0.06, pitch_tolerance=0.04):
+	"""Require both rendered traverse and elevation to settle before firing."""
+	abs_yaw = float(hull_yaw) + float(turret_yaw)
+	yaw_error = abs(_angle_delta(target_yaw, abs_yaw))
+	pitch_error = abs(float(desired_pitch) - float(gun_pitch))
+	return (yaw_error <= float(yaw_tolerance) and
+	        pitch_error <= float(pitch_tolerance))
+
+
+def barrel_direction(yaw, pitch):
+	"""Unit direction for BigWorld's negative-pitch-is-up convention."""
+	horizontal = math.cos(float(pitch))
+	return (math.sin(float(yaw)) * horizontal,
+	        -math.sin(float(pitch)),
+	        math.cos(float(yaw)) * horizontal)
+
+
 class LocalDriver(object):
 	"""Stateful local steering, keyed only by bot id.
 
@@ -47,6 +121,10 @@ class LocalDriver(object):
 	"""
 	_CANDIDATE_OFFSETS = (
 		0.0, 0.42, -0.42, 0.78, -0.78, 1.18, -1.18, 1.55, -1.55)
+	gun_yaw_limits = staticmethod(gun_yaw_limits)
+	combat_hull_aim = staticmethod(combat_hull_aim)
+	gun_aligned = staticmethod(gun_aligned)
+	barrel_direction = staticmethod(barrel_direction)
 
 	def __init__(self, stuck_seconds=1.8, recovery_seconds=0.85,
 			separation_radius=12.0, failure_ttl=2.0):

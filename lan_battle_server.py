@@ -179,6 +179,8 @@ class BattleState:
             "total": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
             "active": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
             "recovered": 0,
+            "search": {"pending": 0, "completed": 0, "failed": 0,
+                       "oldest_ms": 0},
         }
         self.next_bot_ai_log = 0.0
         self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
@@ -217,6 +219,8 @@ class BattleState:
                 "total": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
                 "active": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
                 "recovered": 0,
+                "search": {"pending": 0, "completed": 0, "failed": 0,
+                           "oldest_ms": 0},
             }
             self.pending_events.append({
                 "kind": "authority",
@@ -309,6 +313,8 @@ class BattleState:
                     "total": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
                     "active": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
                     "recovered": 0,
+                    "search": {"pending": 0, "completed": 0, "failed": 0,
+                               "oldest_ms": 0},
                 }
                 self.next_bot_ai_log = 0.0
                 self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
@@ -517,7 +523,7 @@ class BattleState:
             }
             raw_navigation = message.get("navigation")
             if isinstance(raw_navigation, dict):
-                navigation = {"total": {}, "active": {}}
+                navigation = {"total": {}, "active": {}, "search": {}}
                 for group in ("total", "active"):
                     raw_group = raw_navigation.get(group)
                     if not isinstance(raw_group, dict):
@@ -527,6 +533,12 @@ class BattleState:
                             int(_finite_float(raw_group.get(name), 0)), 100000))
                 navigation["recovered"] = max(0, min(
                     int(_finite_float(raw_navigation.get("recovered"), 0)), 100000))
+                raw_search = raw_navigation.get("search")
+                if not isinstance(raw_search, dict):
+                    raw_search = {}
+                for name in ("pending", "completed", "failed", "oldest_ms"):
+                    navigation["search"][name] = max(0, min(
+                        int(_finite_float(raw_search.get(name), 0)), 3600000))
                 self.bot_navigation_stats = navigation
             return accepted_contacts > 0 or accepted_affordances > 0
 
@@ -889,7 +901,7 @@ class BattleState:
                 "contacts=t1:%d/%d,t2:%d/%d targets=t1:%d,t2:%d "
                 "fire=t1:%d,t2:%d modes=%s "
                 "nav=direct:%d,local:%d,reactive:%d recovered:%d "
-                "active:%d/%d/%d" % (
+                "active:%d/%d/%d astar=pending:%d,oldest:%dms,done:%d,failed:%d" % (
                     reports.get(1, 0), reports.get(2, 0), reports.get("accepted", 0),
                     teams[1]["visible"], teams[1]["contacts"],
                     teams[2]["visible"], teams[2]["contacts"],
@@ -901,7 +913,11 @@ class BattleState:
                     navigation.get("recovered", 0),
                     navigation["active"].get("safe_direct", 0),
                     navigation["active"].get("safe_local", 0),
-                    navigation["active"].get("reactive", 0)))
+                    navigation["active"].get("reactive", 0),
+                    navigation.get("search", {}).get("pending", 0),
+                    navigation.get("search", {}).get("oldest_ms", 0),
+                    navigation.get("search", {}).get("completed", 0),
+                    navigation.get("search", {}).get("failed", 0)))
         for player in recipients:
             outgoing = snapshot
             if player.bot_order_revision_sent != self.bot_orders["revision"]:
