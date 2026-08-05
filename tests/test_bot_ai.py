@@ -73,13 +73,15 @@ class BotAITest(unittest.TestCase):
         maps_index = bootstrap.index("'bot_ai_maps',")
         ai_index = bootstrap.index("'bot_ai',")
         navigation_index = bootstrap.index("'bot_ai_navigation'")
+        cover_index = bootstrap.index("'bot_ai_cover'")
         driver_index = bootstrap.index("'bot_ai_driver'")
         battle_index = bootstrap.index("'offline_battle',")
 
         self.assertLess(group_index, maps_index)
         self.assertLess(maps_index, ai_index)
         self.assertLess(ai_index, navigation_index)
-        self.assertLess(navigation_index, driver_index)
+        self.assertLess(navigation_index, cover_index)
+        self.assertLess(cover_index, driver_index)
         self.assertLess(driver_index, battle_index)
 
     def test_vehicle_stats_produce_distinct_tactical_profiles(self):

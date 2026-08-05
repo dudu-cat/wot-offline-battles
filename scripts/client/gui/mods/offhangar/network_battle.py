@@ -24,6 +24,12 @@ POLL_INTERVAL = 1.0 / 60.0
 INPUT_INTERVAL = 1.0 / 30.0
 BOT_STATE_INTERVAL = 1.0 / 30.0
 PING_INTERVAL = 1.0
+MAX_MESSAGE_BYTES = 256 * 1024
+
+try:
+	_TEXT_TYPES = (basestring,)
+except NameError:
+	_TEXT_TYPES = (str,)
 
 
 def _system_message(message, level='information'):
@@ -81,6 +87,60 @@ def _finite_float(value, fallback=0.0):
 	except Exception:
 		pass
 	return value
+
+
+def _safe_text(value, limit=80):
+	try:
+		if not isinstance(value, _TEXT_TYPES):
+			value = str(value)
+		return value[:limit]
+	except Exception:
+		return ''
+
+
+def _safe_position(value):
+	try:
+		if isinstance(value, dict):
+			return (_finite_float(value.get('x')), _finite_float(value.get('y')),
+					_finite_float(value.get('z')))
+		if isinstance(value, (tuple, list)) and len(value) >= 3:
+			return (_finite_float(value[0]), _finite_float(value[1]),
+					_finite_float(value[2]))
+	except Exception:
+		pass
+	return None
+
+
+def _protocol_bool(value, default=False):
+	if value is True or (value == 1 and not isinstance(value, _TEXT_TYPES)):
+		return True
+	if value is False or (value == 0 and not isinstance(value, _TEXT_TYPES)):
+		return False
+	return bool(default) if value is None else False
+
+
+def _protocol_position(value):
+	if isinstance(value, dict):
+		if not all(key in value for key in ('x', 'y', 'z')):
+			return None
+		values = (value.get('x'), value.get('y'), value.get('z'))
+	elif isinstance(value, (tuple, list)) and len(value) >= 3:
+		values = (value[0], value[1], value[2])
+	else:
+		return None
+	result = []
+	for item in values:
+		try:
+			number = float(item)
+		except (TypeError, ValueError):
+			return None
+		try:
+			if math.isnan(number) or math.isinf(number):
+				return None
+		except Exception:
+			pass
+		result.append(number)
+	return tuple(result)
 
 
 class LANClient(object):
@@ -205,6 +265,8 @@ class LANClient(object):
 			return False
 		try:
 			payload = (json.dumps(message, separators=(',', ':')) + '\n').encode('utf-8')
+			if len(payload) > MAX_MESSAGE_BYTES:
+				return False
 			with self._send_lock:
 				self.sock.sendall(payload)
 			return True
@@ -282,12 +344,18 @@ class LANClient(object):
 		self._last_bot_state = now
 		return self._send({'type': 'bot_state', 'bots': bots[:30]})
 
-	def send_bot_observation(self, contacts):
+	def send_bot_observation(self, contacts, affordances=None):
 		now = time.time()
 		if now - self._last_bot_observation < 0.45:
 			return False
-		self._last_bot_observation = now
-		return self._send({'type': 'bot_observation', 'contacts': contacts[:64]})
+		sent = self._send({
+			'type': 'bot_observation',
+			'contacts': contacts[:64],
+			'affordances': (affordances or ())[:16],
+		})
+		if sent:
+			self._last_bot_observation = now
+		return sent
 
 	def send_bot_hit(self, target_id, shot_seq, damage, shot_result,
 			impact_position=None):
@@ -522,7 +590,7 @@ class LANClient(object):
 				revision = int(message.get('bot_order_revision', 0) or 0)
 			except (TypeError, ValueError):
 				revision = 0
-			if revision >= self.bot_order_revision:
+			if revision > self.bot_order_revision or (revision == 0 and not self.bot_orders):
 				orders = {}
 				for order in message.get('bot_orders') or ():
 					try:
@@ -946,7 +1014,7 @@ def publish_bot_manifest(player, jobs):
 	return client.send_bot_manifest(manifest)
 
 
-def publish_bot_observation(player, contacts):
+def publish_bot_observation(player, contacts, affordances=None):
 	"""Send the authority's team-visibility report to the global planner."""
 	if not network_is_authority(player):
 		return False
@@ -954,18 +1022,82 @@ def publish_bot_observation(player, contacts):
 	if client is None or not client.ready:
 		return False
 	payload = []
-	for raw in contacts or ():
+	for raw in (contacts or ())[:64]:
 		try:
-			point = raw.get('position')
+			point = _protocol_position(raw.get('position'))
+			if point is None:
+				continue
 			server_pos, unused_yaw = _server_pose_from_world(
 				player, point[0], point[1], point[2], 0.0)
-			item = dict(raw)
-			item.pop('position', None)
-			item['x'], item['y'], item['z'] = server_pos
+			if server_pos is None:
+				continue
+			item = {
+				'observing_team': int(raw.get('observing_team')),
+				'target_id': int(raw.get('target_id')),
+				'target_kind': _safe_text(raw.get('target_kind'), 16),
+				'target_team': int(raw.get('target_team')),
+				'x': server_pos[0], 'y': server_pos[1], 'z': server_pos[2],
+				'health': max(0, int(raw.get('health', 0))),
+				'max_health': max(1, int(raw.get('max_health', 1))),
+				'class_tag': _safe_text(raw.get('class_tag'), 24),
+				'armor': max(0.0, _finite_float(raw.get('armor'))),
+				'visible': _protocol_bool(raw.get('visible'), True),
+			}
 			payload.append(item)
 		except Exception:
 			continue
-	return client.send_bot_observation(payload)
+	shared_affordances = []
+	for raw in (affordances or ())[:16]:
+		try:
+			item = {
+				'bot_id': int(raw.get('bot_id')),
+				'target_id': int(raw.get('target_id')),
+				'target_kind': str(raw.get('target_kind') or ''),
+				'candidates': [],
+			}
+			for candidate in (raw.get('candidates') or ())[:12]:
+				position = _protocol_position(candidate.get('position'))
+				if position is None:
+					continue
+				server_position, unused_yaw = _server_pose_from_world(
+					player, position[0], position[1], position[2], 0.0)
+				if server_position is None:
+					continue
+				value = {
+					'id': _safe_text(candidate.get('id'), 80),
+					'position': {
+					'x': server_position[0], 'y': server_position[1],
+					'z': server_position[2],
+					},
+					'travel_distance': max(0.0, _finite_float(candidate.get('travel_distance'))),
+					'route_alignment': max(0.0, min(1.0, _finite_float(candidate.get('route_alignment')))),
+					'enemy_occlusion': max(0.0, min(1.0, _finite_float(candidate.get('enemy_occlusion')))),
+					'exposure': max(0.0, min(1.0, _finite_float(candidate.get('exposure'), 1.0))),
+					'slope': max(0.0, _finite_float(candidate.get('slope'))),
+					'water': max(0.0, min(1.0, _finite_float(candidate.get('water')))),
+					'ally_congestion': max(0.0, min(1.0, _finite_float(candidate.get('ally_congestion')))),
+					'peek_feasible': _protocol_bool(candidate.get('peek_feasible')),
+					'escape_feasible': _protocol_bool(candidate.get('escape_feasible')),
+				}
+				peek = _protocol_position(candidate.get('peek_position'))
+				if peek is not None:
+					server_peek, unused_yaw = _server_pose_from_world(
+						player, peek[0], peek[1], peek[2], 0.0)
+					if server_peek is not None:
+						value['peek_position'] = {
+							'x': server_peek[0], 'y': server_peek[1],
+							'z': server_peek[2],
+						}
+					else:
+						value['peek_feasible'] = False
+				else:
+					value['peek_feasible'] = False
+				item['candidates'].append(value)
+			if item['candidates']:
+				shared_affordances.append(item)
+		except Exception:
+			continue
+	return client.send_bot_observation(payload, shared_affordances)
 
 
 def authoritative_bot_order(player, mock):

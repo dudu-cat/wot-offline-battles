@@ -126,6 +126,55 @@ class BotNavigationTest(unittest.TestCase):
         self.assertIn("delta < -run * 0.38", battle_source)
         self.assertIn("lambda _driver_yaw: _offh_ai_direction_clear(", battle_source)
 
+    def test_stalled_route_temporarily_penalizes_its_failed_first_edge(self):
+        navigator = self.navigation.TerrainNavigator(
+            lambda x, z, hint: 0.0,
+            bounds=(-100.0, -100.0, 100.0, 100.0),
+            cell_size=10.0,
+        )
+        current = (0.0, 0.0, 0.0)
+        goal = (60.0, 0.0, 0.0)
+        first = navigator.next_target(
+            12, current, goal, (1, "failed-road", 0), 0.0, anchor=current
+        )
+        self.assertGreater(first[0], current[0])
+
+        target = first
+        for frame in range(1, 220):
+            target = navigator.next_target(
+                12, current, goal, (1, "failed-road", 0),
+                frame / 30.0, anchor=current,
+            )
+            if target != current and abs(target[2]) > 0.1:
+                break
+
+        self.assertNotEqual(current, target)
+        self.assertGreater(abs(target[2]), 0.1)
+        self.assertTrue(navigator.grid._failed_edges)
+
+    def test_failed_edges_are_bidirectional_bounded_and_invalidate_cached_path(self):
+        grid = self.navigation.TerrainGrid(lambda x, z, hint: 0.0, cell_size=1.0)
+        start = (0.0, 0.0, 0.0)
+        goal = (1.0, 0.0, 0.0)
+        grid.remember_failed_segment(start, goal, 1.0, ttl=10.0)
+        self.assertGreater(grid.segment_penalty(start, goal, 2.0), 0.0)
+        self.assertGreater(grid.segment_penalty(goal, start, 2.0), 0.0)
+        self.assertTrue(grid.path_has_penalty((start, goal), 2.0))
+
+        grid.remember_failed_segment((18.0, 0.0, 0.0), (60.0, 0.0, 0.0),
+                                     2.0, ttl=20.0)
+        self.assertTrue(grid.path_has_penalty(
+            ((0.0, 0.0, 0.0), (60.0, 0.0, 0.0)), 2.0
+        ))
+
+        for index in range(180):
+            grid.remember_failed_segment(
+                (float(index), 0.0, 0.0), (float(index + 2), 0.0, 0.0),
+                2.0, ttl=20.0
+            )
+        grid.prune_failed_edges(2.0)
+        self.assertLessEqual(len(grid._failed_edges), 128)
+
 
 if __name__ == "__main__":
     unittest.main()

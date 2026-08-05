@@ -1,17 +1,25 @@
 """Pure-data tactical planner for the LAN bot authority.
 
-The planner deliberately has no socket, BigWorld, or client imports.  Its
-input and output are JSON-compatible dictionaries so an eventual Go service
-can preserve the same contract.  Enemy data is accepted only through
-``report_contacts``; players and bot state are used to validate identities,
-never to invent a target position.
+The planner deliberately has no socket or BigWorld dependency. It imports only
+the pure-data cover scorer shared with the client; all inputs and outputs are
+JSON-compatible dictionaries so an eventual Go service can preserve the same
+contract. Enemy data is accepted only through ``report_contacts``; players and
+bot state are used to validate identities, never to invent a target position.
 """
 
 import math
 
+from scripts.client.gui.mods.offhangar.bot_ai_cover import (
+    normalize_candidate,
+    score_candidates,
+)
+
 
 CONTACT_TTL_SECONDS = 8.0
 MAX_CONTACTS_PER_TEAM = 32
+COVER_TTL_SECONDS = 8.0
+MAX_COVER_REPORTS = 16
+MAX_COVER_CANDIDATES = 12
 
 
 def _number(value, default=0.0):
@@ -50,14 +58,24 @@ class BotPlanner(object):
         self._contacts = {1: {}, 2: {}}
         self._last_orders = None
         self._route_states = {}
+        self._route_assignments = {}
+        self._next_route_rebalance = {1: 0.0, 2: 0.0}
         self._engage_anchors = {}
+        self._affordances = {}
+        self._cover_states = {}
+        self._cover_reservations = set()
 
     def reset(self):
         self.revision = 0
         self._contacts = {1: {}, 2: {}}
         self._last_orders = None
         self._route_states = {}
+        self._route_assignments = {}
+        self._next_route_rebalance = {1: 0.0, 2: 0.0}
         self._engage_anchors = {}
+        self._affordances = {}
+        self._cover_states = {}
+        self._cover_reservations = set()
 
     def report_contacts(self, contacts, known_targets, now):
         """Store only authority-reported observations after identity checks.
@@ -67,7 +85,11 @@ class BotPlanner(object):
         this server from becoming omniscient.
         """
         accepted = 0
-        for raw in (contacts or [])[:MAX_CONTACTS_PER_TEAM * 2]:
+        if not isinstance(contacts, (list, tuple)):
+            return accepted
+        for raw in contacts[:MAX_CONTACTS_PER_TEAM * 2]:
+            if not isinstance(raw, dict):
+                continue
             observing_team = _integer(raw.get("observing_team"))
             target_id = _integer(raw.get("target_id"))
             target_kind = str(raw.get("target_kind") or "")
@@ -108,13 +130,79 @@ class BotPlanner(object):
                 accepted += 1
         return accepted
 
+    def report_affordances(self, reports, known_bots, known_targets, now):
+        """Store client-probed cover geometry after identity validation.
+
+        The server never probes map geometry.  It accepts only candidates for
+        a live bot and an enemy already present in that bot team's contact
+        memory, then chooses among those candidates globally.
+        """
+        accepted = 0
+        if not isinstance(reports, (list, tuple)):
+            return accepted
+        for raw in reports[:MAX_COVER_REPORTS]:
+            if not isinstance(raw, dict):
+                continue
+            bot_id = _integer(raw.get("bot_id"))
+            bot = known_bots.get(bot_id)
+            target_kind = str(raw.get("target_kind") or "")
+            target_id = _integer(raw.get("target_id"))
+            target_key = (target_kind, target_id)
+            target = known_targets.get(target_key)
+            if (bot is None or not bot.get("alive", True) or target is None or
+                    _integer(bot.get("team")) == _integer(target.get("team"))):
+                continue
+            contact = self._contacts.get(_integer(bot.get("team")), {}).get(target_key)
+            if (contact is None or not contact.get("visible") or
+                    _number(now) - _number(contact.get("last_seen")) > CONTACT_TTL_SECONDS):
+                continue
+            candidates = []
+            raw_candidates = raw.get("candidates")
+            if not isinstance(raw_candidates, (list, tuple)):
+                continue
+            bx = _number(bot.get("x"))
+            bz = _number(bot.get("z"))
+            for value in raw_candidates[:MAX_COVER_CANDIDATES]:
+                candidate = normalize_candidate(value)
+                if candidate.get("position") is None:
+                    continue
+                if candidate.get("peek_feasible") and candidate.get("peek_position") is None:
+                    continue
+                candidate["position"] = _point(candidate.get("position"))
+                if candidate.get("peek_position") is not None:
+                    candidate["peek_position"] = _point(candidate.get("peek_position"))
+                if (candidate["travel_distance"] > 180.0 or
+                        candidate["water"] >= 0.5 or candidate["slope"] > 28.0):
+                    continue
+                if math.hypot(candidate["position"]["x"] - bx,
+                              candidate["position"]["z"] - bz) > 180.0:
+                    continue
+                if (candidate.get("peek_position") is not None and
+                        math.hypot(candidate["peek_position"]["x"] - bx,
+                                   candidate["peek_position"]["z"] - bz) > 200.0):
+                    continue
+                candidates.append(candidate)
+            if not candidates:
+                continue
+            self._affordances[bot_id] = {
+                "target": target_key,
+                "reported_at": _number(now),
+                "candidates": candidates,
+            }
+            accepted += 1
+        return accepted
+
     def build_orders(self, manifest, bot_states, players, now):
         known_targets = self.known_targets(bot_states, players)
         contacts = self._prune_contacts(known_targets, now)
         bots = self._alive_bots(manifest, bot_states)
+        self._prune_tactical_state(bots, known_targets, now)
+        self._cover_reservations = set()
         orders = []
         for team in (1, 2):
-            team_bots = [bot for bot in bots if bot["team"] == team]
+            team_bots = sorted((bot for bot in bots if bot["team"] == team),
+                               key=lambda value: value["id"])
+            self._rebalance_routes(team, team_bots, contacts[team], now)
             assignments = self._assign_targets(team_bots, contacts[team])
             for index, bot in enumerate(team_bots):
                 orders.append(self._order_for(
@@ -143,6 +231,58 @@ class BotPlanner(object):
                     "kind": "bot", "team": _integer(raw.get("team")),
                     "alive": bool(raw.get("alive", True))}
         return result
+
+    @staticmethod
+    def known_bots(manifest, bot_states):
+        states = {_integer(value.get("id")): value for value in (bot_states or [])}
+        result = {}
+        for raw in manifest or []:
+            bot_id = _integer(raw.get("id"))
+            if not bot_id:
+                continue
+            state = states.get(bot_id, {})
+            result[bot_id] = {
+                "team": _integer(raw.get("team")),
+                "alive": bool(state.get("alive", raw.get("health", 1) > 0)),
+                "x": _number(state.get("x", raw.get("x"))),
+                "z": _number(state.get("z", raw.get("z"))),
+            }
+        return result
+
+    def clear_observations(self):
+        """Discard authority-owned tactical observations after a failover."""
+        self._contacts = {1: {}, 2: {}}
+        self._affordances = {}
+        self._cover_states = {}
+        self._cover_reservations = set()
+        self._engage_anchors = {}
+
+    def _prune_tactical_state(self, bots, known_targets, now):
+        live_bots = dict((bot["id"], bot) for bot in bots)
+        for bot_id in list(self._route_states):
+            if bot_id not in live_bots:
+                del self._route_states[bot_id]
+        for bot_id in list(self._route_assignments):
+            if bot_id not in live_bots:
+                del self._route_assignments[bot_id]
+        for bot_id in list(self._engage_anchors):
+            if bot_id not in live_bots:
+                del self._engage_anchors[bot_id]
+        for bot_id, report in list(self._affordances.items()):
+            bot = live_bots.get(bot_id)
+            target_key = report.get("target") if isinstance(report, dict) else None
+            target = known_targets.get(target_key)
+            contact = (self._contacts.get(_integer(bot.get("team")), {}).get(target_key)
+                       if bot is not None else None)
+            if (bot is None or target is None or not target.get("alive") or
+                    contact is None or not contact.get("visible") or
+                    _number(now) - _number(report.get("reported_at")) > COVER_TTL_SECONDS):
+                del self._affordances[bot_id]
+        for bot_id, state in list(self._cover_states.items()):
+            report = self._affordances.get(bot_id)
+            if (bot_id not in live_bots or not isinstance(state, dict) or
+                    report is None or state.get("target") != report.get("target")):
+                del self._cover_states[bot_id]
 
     def _prune_contacts(self, known_targets, now):
         result = {1: [], 2: []}
@@ -221,8 +361,115 @@ class BotPlanner(object):
                 assigned[bot["id"]] = best
         return assigned
 
+    @staticmethod
+    def _route_catalog(bots):
+        result = {}
+        for bot in bots:
+            route = bot.get("route") if isinstance(bot.get("route"), dict) else {}
+            route_id = str(route.get("id") or "")
+            if route_id and route.get("waypoints") and route_id not in result:
+                result[route_id] = route
+        return result
+
+    @staticmethod
+    def _nearest_route(contact, catalog):
+        best = None
+        best_key = None
+        point = contact.get("position") or {}
+        for route_id, route in sorted(catalog.items()):
+            distance = None
+            for waypoint in route.get("waypoints") or []:
+                dx = _number(waypoint.get("x")) - _number(point.get("x"))
+                dz = _number(waypoint.get("z")) - _number(point.get("z"))
+                value = dx * dx + dz * dz
+                if distance is None or value < distance:
+                    distance = value
+            key = (distance if distance is not None else 1e18, route_id)
+            if best_key is None or key < best_key:
+                best_key = key
+                best = route_id
+        return best
+
+    def _rebalance_routes(self, team, bots, contacts, now):
+        """Move at most one adaptable tank toward a pressured route every 4s."""
+        catalog = self._route_catalog(bots)
+        for bot in bots:
+            route = bot.get("route") if isinstance(bot.get("route"), dict) else {}
+            route_id = str(route.get("id") or "")
+            assigned = self._route_assignments.get(bot["id"])
+            assigned_route = assigned.get("route") if isinstance(assigned, dict) else None
+            assigned_id = (str(assigned_route.get("id") or "")
+                           if isinstance(assigned_route, dict) else "")
+            assigned_until = _number(assigned.get("until")) if isinstance(assigned, dict) else 0.0
+            if (assigned_id not in catalog or
+                    assigned_route != catalog.get(assigned_id) or
+                    (assigned_until > 0.0 and assigned_until <= _number(now))):
+                if route_id in catalog:
+                    self._route_assignments[bot["id"]] = {
+                        "route": catalog[route_id], "until": 0.0,
+                    }
+                else:
+                    self._route_assignments.pop(bot["id"], None)
+                self._route_states.pop(bot["id"], None)
+        if len(catalog) < 2:
+            return
+        if _number(now) < _number(self._next_route_rebalance.get(team)):
+            return
+        self._next_route_rebalance[team] = _number(now) + 4.0
+        pressure = dict((route_id, 0.0) for route_id in catalog)
+        for contact in contacts:
+            route_id = self._nearest_route(contact, catalog)
+            if route_id is None:
+                continue
+            health_fraction = (_number(contact.get("health"), 1.0) /
+                               max(1.0, _number(contact.get("max_health"), 1.0)))
+            pressure[route_id] += max(0.3, health_fraction)
+        if not pressure or max(pressure.values()) <= 0.0:
+            return
+        counts = dict((route_id, 0) for route_id in catalog)
+        for bot in bots:
+            assignment = self._route_assignments.get(bot["id"], {})
+            route = assignment.get("route") if isinstance(assignment, dict) else None
+            if not isinstance(route, dict):
+                route = bot.get("route") or {}
+            route_id = str(route.get("id") or "")
+            if route_id in counts:
+                counts[route_id] += 1
+        target_route = max(sorted(catalog), key=lambda route_id:
+                           pressure[route_id] - counts[route_id] * 0.45)
+        if pressure[target_route] - counts[target_route] * 0.45 <= 0.0:
+            return
+        candidates = []
+        for bot in bots:
+            assignment = self._route_assignments.get(bot["id"], {})
+            current = assignment.get("route") if isinstance(assignment, dict) else None
+            if not isinstance(current, dict):
+                current = bot.get("route") or {}
+            current_id = str(current.get("id") or "")
+            if current_id == target_route or counts.get(current_id, 0) <= 1:
+                continue
+            roles = bot.get("profile", {}).get("roles") or {}
+            mobility = max(_number(roles.get("support")),
+                           _number(roles.get("flanker")),
+                           _number(roles.get("scout")))
+            personality = self._personality(bot["id"])
+            score = (mobility * 2.0 + personality["adaptability"] -
+                     _number(roles.get("brawler")) * 0.65 -
+                     pressure.get(current_id, 0.0) * 0.7)
+            candidates.append((score, -bot["id"], bot))
+        if not candidates:
+            return
+        donor = max(candidates)[2]
+        self._route_assignments[donor["id"]] = {
+            "route": catalog[target_route], "until": _number(now) + 4.0,
+        }
+        self._route_states.pop(donor["id"], None)
+
     def _route(self, bot, now):
-        route = bot.get("route") if isinstance(bot.get("route"), dict) else {}
+        assignment = self._route_assignments.get(bot["id"])
+        route = assignment.get("route") if isinstance(assignment, dict) else None
+        if not isinstance(route, dict):
+            route = bot.get("route") if isinstance(bot.get("route"), dict) else {}
         waypoints = route.get("waypoints") if isinstance(route.get("waypoints"), list) else []
         if not waypoints:
             route_ids = ("left_flank", "center_line", "right_flank")
@@ -232,8 +479,17 @@ class BotPlanner(object):
             point = {"x": round(side * 115.0, 3), "y": 0.0,
                      "z": round(direction * 18.0, 3)}
             return route_id, 0, point, point, False
-        state = self._route_states.setdefault(
-            bot["id"], {"index": 0, "hold_until": 0.0})
+        route_id = str(route.get("id") or "uploaded_route")
+        state = self._route_states.get(bot["id"])
+        if state is None or state.get("route_id") != route_id:
+            bx = _number(bot["state"].get("x"))
+            bz = _number(bot["state"].get("z"))
+            nearest = min(range(len(waypoints)), key=lambda value:
+                          (_number(waypoints[value].get("x")) - bx) ** 2 +
+                          (_number(waypoints[value].get("z")) - bz) ** 2)
+            state = {"index": nearest, "hold_until": 0.0,
+                     "route_id": route_id}
+            self._route_states[bot["id"]] = state
         index = min(max(0, _integer(state.get("index"))), len(waypoints) - 1)
         point = _point(waypoints[index])
         bx = _number(bot["state"].get("x"))
@@ -250,7 +506,7 @@ class BotPlanner(object):
             state["hold_until"] = 0.0
             point = _point(waypoints[index])
         anchor = _point(waypoints[max(0, index - 1)])
-        return str(route.get("id") or "uploaded_route"), index, point, anchor, holding
+        return route_id, index, point, anchor, holding
 
     @staticmethod
     def _flank_point(bot, contact, desired_range):
@@ -291,6 +547,114 @@ class BotPlanner(object):
                 best = candidate
         return max(0, _integer(best[2].get("index"))) if best is not None else 0
 
+    def _cover_candidate(self, bot, focus, personality, now):
+        report = self._affordances.get(bot["id"])
+        target_key = (focus.get("target_kind"), focus["id"])
+        if (report is None or report.get("target") != target_key or
+                _number(now) - _number(report.get("reported_at")) > COVER_TTL_SECONDS):
+            self._cover_states.pop(bot["id"], None)
+            return None
+        weights = {
+            "enemy_occlusion": 26.0 + personality["caution"] * 18.0,
+            "travel_distance": -0.035 - personality["caution"] * 0.035,
+            "escape_feasible": 8.0 + personality["patience"] * 10.0,
+            "peek_feasible": 6.0 + personality["aggression"] * 8.0,
+        }
+        ranked = score_candidates(report.get("candidates"), weights)
+        usable = [candidate for candidate in ranked
+                  if candidate["water"] < 0.5 and candidate["slope"] <= 24.0 and
+                  candidate["enemy_occlusion"] >= 0.45 and
+                  candidate["peek_feasible"] and candidate["escape_feasible"] and
+                  candidate.get("peek_position") is not None]
+        if not usable:
+            self._cover_states.pop(bot["id"], None)
+            return None
+        current = self._cover_states.get(bot["id"])
+        selected = None
+        if (current is not None and current.get("target") == target_key and
+                not current.pop("refresh_candidate", False)):
+            current_id = current.get("candidate_id")
+            for candidate in usable:
+                if candidate.get("id") == current_id:
+                    selected = candidate
+                    current["candidate"] = candidate
+                    break
+        if selected is None:
+            for candidate in usable:
+                point = candidate["position"]
+                reservation = (int(round(point["x"] / 8.0)),
+                               int(round(point["z"] / 8.0)))
+                if reservation not in self._cover_reservations:
+                    selected = candidate
+                    break
+            if selected is None:
+                selected = usable[0]
+            current = {
+                "target": target_key,
+                "candidate_id": selected["id"],
+                "candidate": selected,
+                "phase": "approach",
+                "phase_until": 0.0,
+            }
+            self._cover_states[bot["id"]] = current
+        point = selected["position"]
+        self._cover_reservations.add((int(round(point["x"] / 8.0)),
+                                      int(round(point["z"] / 8.0))))
+        return selected, current
+
+    def _apply_cover_order(self, order, bot, focus, personality, now):
+        selected_state = self._cover_candidate(bot, focus, personality, now)
+        if selected_state is None:
+            return False
+        candidate, state = selected_state
+        bx = _number(bot["state"].get("x"))
+        bz = _number(bot["state"].get("z"))
+        cover = candidate["position"]
+        peek = candidate["peek_position"]
+        cover_distance = math.hypot(cover["x"] - bx, cover["z"] - bz)
+        peek_distance = math.hypot(peek["x"] - bx, peek["z"] - bz)
+        phase = state.get("phase", "approach")
+        if phase in ("approach", "return") and cover_distance <= 4.5:
+            completed_return = phase == "return"
+            phase = "hold"
+            state["phase"] = phase
+            if completed_return:
+                state["refresh_candidate"] = True
+            state["phase_until"] = (_number(now) + 0.65 +
+                                    personality["patience"] * 1.35)
+        elif phase == "hold" and _number(now) >= _number(state.get("phase_until")):
+            phase = "peek"
+            state["phase"] = phase
+            state["phase_until"] = 0.0
+        elif phase == "peek" and peek_distance <= 4.5:
+            if _number(state.get("phase_until")) <= 0.0:
+                state["phase_until"] = (_number(now) + 1.0 +
+                                        personality["aggression"] * 1.8)
+            elif _number(now) >= _number(state.get("phase_until")):
+                phase = "return"
+                state["phase"] = phase
+                state["phase_until"] = 0.0
+        order["cover_id"] = candidate["id"]
+        order["fire_allowed"] = False
+        if phase == "approach":
+            order["combat_mode"] = "take_cover"
+            order["move_position"] = dict(cover)
+            order["throttle_override"] = 0.72
+        elif phase == "hold":
+            order["combat_mode"] = "cover_hold"
+            order["move_position"] = dict(cover)
+            order["throttle_override"] = 0.0
+        elif phase == "peek":
+            order["combat_mode"] = "cover_peek"
+            order["move_position"] = dict(peek)
+            order["throttle_override"] = 0.56 if peek_distance > 4.5 else 0.0
+            order["fire_allowed"] = bool(focus.get("visible")) and peek_distance <= 4.5
+        else:
+            order["combat_mode"] = "cover_return"
+            order["move_position"] = dict(cover)
+            order["throttle_override"] = None
+        return True
+
     def _order_for(self, bot, index, count, focus, contacts, now):
         route_id, route_index, move, route_anchor, holding = self._route(bot, now)
         profile = dict(bot["profile"])
@@ -318,6 +682,7 @@ class BotPlanner(object):
         }
         if focus is None or holding:
             self._engage_anchors.pop(bot["id"], None)
+            self._cover_states.pop(bot["id"], None)
             return order
         order["target_id"] = focus["id"]
         order["target_kind"] = focus.get("target_kind")
@@ -333,9 +698,13 @@ class BotPlanner(object):
         roles = profile.get("roles") if isinstance(profile.get("roles"), dict) else {}
         if not focus.get("visible"):
             self._engage_anchors.pop(bot["id"], None)
+            self._cover_states.pop(bot["id"], None)
             order["combat_mode"] = "investigate"
             order["move_position"] = dict(focus["position"])
             order["throttle_override"] = 0.65
+        elif (distance <= fire_range * 1.15 and
+              self._apply_cover_order(order, bot, focus, personality, now)):
+            self._engage_anchors.pop(bot["id"], None)
         elif roles.get("flanker", 0.0) >= 0.68 and personality["initiative"] > 0.42:
             self._engage_anchors.pop(bot["id"], None)
             order["combat_mode"] = "flank"

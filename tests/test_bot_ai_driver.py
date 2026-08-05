@@ -66,7 +66,7 @@ class BotAIDriverTest(unittest.TestCase):
         # A close neighbour on the east makes an otherwise clear driver choose
         # the westward candidate, proving separation is considered.
         crowded = driver.drive("west", (0.0, 0.0, 0.0), 0.0, 2.0, 0.1,
-                               (0.0, 0.0, 40.0), [(3.0, 0.0, 1.0)],
+                               (0.0, 0.0, 40.0), [(8.0, 0.0, 0.0)],
                                lambda angle: True)
         self.assertLess(crowded["target_yaw"], 0.0)
 
@@ -81,6 +81,77 @@ class BotAIDriverTest(unittest.TestCase):
                     break
             states.append(active)
         self.assertNotEqual(states[0], states[1])
+
+    def test_short_horizon_obb_prediction_rejects_a_clear_head_on_path(self):
+        driver = self.module.LocalDriver()
+        # The ray itself is clear, but at 0.75s the two oriented hulls overlap.
+        clear = driver._prediction_clear(
+            (0.0, 0.0, 0.0), 0.0, 8.0, None,
+            [{"position": (0.0, 0.0, 10.0), "yaw": 0.0,
+              "velocity": (0.0, 0.0, -6.0),
+              "half_length": 3.5, "half_width": 1.7}], 3.5, 1.7
+        )
+        self.assertFalse(clear)
+
+        stacked = driver._prediction_clear(
+            (0.0, 0.0, 0.0), 0.0, 8.0, None,
+            [{"position": (0.0, 8.0, 10.0), "yaw": 0.0,
+              "velocity": (0.0, 0.0, -6.0),
+              "half_length": 3.5, "half_width": 1.7}], 3.5, 1.7
+        )
+        self.assertTrue(stacked)
+
+    def test_failed_direction_is_penalized_until_its_ttl_expires(self):
+        driver = self.module.LocalDriver(failure_ttl=0.5)
+        initial = driver.drive(55, (0.0, 0.0, 0.0), 0.0, 2.0, 0.1,
+                               (0.0, 0.0, 40.0), (), lambda angle: True)
+        self.assertAlmostEqual(0.0, initial["target_yaw"], places=5)
+        driver.remember_failure(55, 0.0)
+        diverted = driver.drive(55, (0.0, 0.0, 0.2), 0.0, 2.0, 0.1,
+                                (0.0, 0.0, 40.0), (), lambda angle: True)
+        self.assertEqual("avoid", diverted["recovery_mode"])
+        self.assertNotAlmostEqual(0.0, diverted["target_yaw"], places=3)
+        driver.drive(55, (0.0, 0.0, 1.0), 0.0, 2.0, 0.35,
+                     (0.0, 0.0, 40.0), (), lambda angle: True)
+        expired = driver.drive(55, (0.0, 0.0, 2.0), 0.0, 2.0, 0.35,
+                               (0.0, 0.0, 40.0), (), lambda angle: True)
+        self.assertAlmostEqual(0.0, expired["target_yaw"], places=5)
+
+    def test_recent_plan_uses_one_hard_probe_and_keeps_dynamic_prediction(self):
+        driver = self.module.LocalDriver()
+        probes = []
+
+        def clear(angle):
+            probes.append(angle)
+            return True
+
+        driver.drive(77, (0.0, 0.0, 0.0), 0.0, 4.0, 0.01,
+                     (0.0, 0.0, 50.0), (), clear)
+        first_count = len(probes)
+        driver.drive(77, (0.0, 0.0, 0.1), 0.0, 4.0, 0.05,
+                     (0.0, 0.0, 50.0), (), clear)
+
+        self.assertEqual(1, first_count)
+        self.assertEqual(first_count + 1, len(probes))
+
+        blocked = driver.drive(
+            77, (0.0, 0.0, 0.2), 0.0, 4.0, 0.05,
+            (0.0, 0.0, 50.0), (), lambda angle: False,
+        )
+        self.assertEqual("blocked", blocked["recovery_mode"])
+
+    def test_transient_blockers_do_not_fill_failure_memory(self):
+        driver = self.module.LocalDriver()
+        for unused in range(40):
+            driver.drive(71, (0.0, 0.0, 0.0), 0.0, 3.0, 0.1,
+                         (0.0, 0.0, 40.0), (), lambda angle: False)
+        self.assertEqual({}, driver.states[71]["failed_yaws"])
+
+        for unused in range(60):
+            driver.remember_failure(71, unused * 0.12, ttl=20.0)
+            driver.drive(71, (float(unused), 0.0, 0.0), 0.0, 3.0, 0.1,
+                         (0.0, 0.0, 100.0), (), lambda angle: True)
+        self.assertLessEqual(len(driver.states[71]["failed_yaws"]), 32)
 
 
 if __name__ == "__main__":

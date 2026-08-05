@@ -245,11 +245,20 @@ class WaitingRoomTest(unittest.TestCase):
         self.assertEqual(7, pong["seq"])
         self.assertEqual(123.5, pong["client_time"])
 
+        self.state.bot_planner._contacts[1][("human", 99)] = {"id": 99}
+        self.state.bot_planner._affordances[16] = {"target": ("human", 99)}
+        self.state.bot_planner._cover_states[16] = {"target": ("human", 99)}
+        self.state.bot_planner._engage_anchors[16] = {"x": 0.0}
+
         first.close()
         deadline = time.time() + 2
         while time.time() < deadline and self.state.bot_authority_id != second_welcome["player_id"]:
             time.sleep(0.02)
         self.assertEqual(second_welcome["player_id"], self.state.bot_authority_id)
+        self.assertEqual({1: {}, 2: {}}, self.state.bot_planner._contacts)
+        self.assertEqual({}, self.state.bot_planner._affordances)
+        self.assertEqual({}, self.state.bot_planner._cover_states)
+        self.assertEqual({}, self.state.bot_planner._engage_anchors)
 
     def test_late_player_joins_the_current_battle(self):
         first = self.connect("Alpha")

@@ -10,18 +10,23 @@ hangar, pick a tank and fight bots on the real maps.
 Bots use vehicle roles, stable individual personalities and shared team spots;
 all 33 stock maps have dedicated standard-battle tactical routes. Strategic
 route anchors are connected at runtime by a cached terrain-aware A* layer,
-then local feelers handle cliffs, solid obstacles, nearby tanks and recovery
-from congestion. This AI is used in both normal offline play and LAN-authority
-simulation. Assault and encounter variants are intentionally outside the
-supported mode.
+then bounded local probes reject cliffs, deep water and solid obstacles. A
+short-horizon oriented-hull predictor separates nearby tanks, and failed
+terrain segments are remembered briefly so a stalled bot replans instead of
+repeating the same bad edge. In combat, client-probed cover candidates feed a
+hold/peek/fire/return cycle; cautious and aggressive personalities weight them
+differently, while some armoured drivers also jiggle forward and backward.
+This AI is used in both normal offline play and LAN-authority simulation.
+Assault and encounter variants are intentionally outside the supported mode.
 
 The same AI can run through the companion server with only one connected
 player. In that mode the server owns global route progress, target reservations,
-last-known contacts and revisioned bot orders. The elected authority client
-keeps only the work that depends on proprietary client data: spotting
-observations, terrain/vehicle collision, local steering, shell collision and
-BigWorld entity control. Normal offline mode uses the same new AI locally as a
-server-free fallback; it does not switch back to the legacy chase logic.
+last-known contacts, lane-pressure rebalancing, cover reservations and
+revisioned bot orders. The elected authority client keeps only the work that
+depends on proprietary client data: spotting observations, bounded terrain and
+cover probes, local steering, shell collision and BigWorld entity control.
+Normal offline mode uses the same new AI locally as a server-free fallback; it
+does not switch back to the legacy chase logic.
 
 
 Install
@@ -86,11 +91,15 @@ client that connects after the round starts joins that same running round.
 
 The first client in the battle is elected as map-simulation/rules authority.
 It uploads vehicle profiles, standard-battle route anchors and limited spotting
-observations. The server assigns targets, advances routes and sends monotonic
-revisioned orders back; the authority client executes those orders against the
-real map. All clients receive the same bot names, tanks, positions, movement,
-firing, HP and deaths, plus shared capture progress and one shared battle
-result. If that client disconnects, the server elects another connected client.
+observations plus a bounded set of drivable cover candidates. The server
+assigns targets, advances or rebalances routes, reserves cover and sends
+monotonic revisioned orders back; unchanged orders are omitted from later
+snapshots. The authority client executes those orders against the real map.
+All clients receive the same bot names, tanks, positions, movement, firing, HP
+and deaths, plus shared capture progress and one shared battle result. If that
+client disconnects, the server elects another connected client and discards the
+old authority's short-lived spotting and cover observations before reacquiring
+them.
 Human input, bot state and server snapshots use 30 Hz updates; remote vehicles
 are interpolated every render frame with a short bounded prediction. The stock
 ping and connection indicator show the measured LAN connection rather than

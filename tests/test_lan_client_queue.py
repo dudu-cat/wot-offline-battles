@@ -147,6 +147,104 @@ class LANClientQueueTest(unittest.TestCase):
 
         self.assertEqual({"type": "start_battle", "map": "31_airfield"}, sent[-1])
 
+    def test_bot_observation_carries_bounded_cover_affordances(self):
+        player = Player()
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        sent = []
+        client._last_bot_observation = 0.0
+        client._send = lambda message: sent.append(message) or True
+        affordances = [{
+            "bot_id": 3,
+            "target_id": 7,
+            "target_kind": "bot",
+            "candidates": [{"id": "rock"}],
+        }]
+
+        self.assertTrue(client.send_bot_observation(
+            [{"observing_team": 1, "target_id": 7, "target_kind": "bot",
+              "target_team": 2, "position": (0, 0, 1)}], affordances
+        ))
+
+        self.assertEqual("bot_observation", sent[-1]["type"])
+        self.assertEqual(affordances, sent[-1]["affordances"])
+        self.assertEqual(1, len(sent[-1]["contacts"]))
+
+    def test_observation_failed_send_does_not_consume_throttle_window(self):
+        player = Player()
+        client = self.network.LANClient(player, "127.0.0.1", 28782, "Alpha", "ussr:T-34")
+        old_time = self.network.time.time
+        self.network.time.time = lambda: 10.0
+        try:
+            client._send = lambda message: False
+            self.assertFalse(client.send_bot_observation([], []))
+            self.assertEqual(0.0, client._last_bot_observation)
+            client._send = lambda message: True
+            self.assertTrue(client.send_bot_observation([], []))
+            self.assertEqual(10.0, client._last_bot_observation)
+        finally:
+            self.network.time.time = old_time
+
+    def test_publish_observation_caps_before_conversion_and_whitelists_candidates(self):
+        player = Player()
+        captured = []
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True, phase="battle",
+            send_bot_observation=lambda contacts, affordances: captured.append(
+                (contacts, affordances)) or True,
+        )
+        contact = {
+            "observing_team": 1, "target_id": 7, "target_kind": "bot", "target_team": 2,
+            "position": (1, 2, 3), "health": 100, "max_health": 200,
+            "class_tag": "heavyTank", "armor": 80, "visible": True,
+        }
+        candidate = {
+            "id": "rock", "position": (4, 5, 6), "peek_position": (7, 8, 9),
+            "travel_distance": 10, "route_alignment": 0.5, "enemy_occlusion": 0.8,
+            "exposure": 0.1, "slope": 4, "water": 0, "ally_congestion": 0.2,
+            "peek_feasible": True, "escape_feasible": True, "not_json": object(),
+        }
+        reports = [{"bot_id": index, "target_id": 7, "target_kind": "bot",
+                    "candidates": [candidate] * 13} for index in range(20)]
+
+        self.assertTrue(self.network.publish_bot_observation(player, [contact] * 65, reports))
+        contacts, affordances = captured[0]
+        self.assertEqual(64, len(contacts))
+        self.assertEqual(16, len(affordances))
+        self.assertEqual(12, len(affordances[0]["candidates"]))
+        self.assertNotIn("not_json", affordances[0]["candidates"][0])
+
+        captured[:] = []
+        malformed_contact = dict(contact, position={"x": 1})
+        strict_contact = dict(contact, visible="false")
+        malformed_candidate = dict(candidate, position={"x": 4})
+        strict_candidate = dict(
+            candidate, peek_feasible="false", escape_feasible="true"
+        )
+        strict_report = [{
+            "bot_id": 1, "target_id": 7, "target_kind": "bot",
+            "candidates": [malformed_candidate, strict_candidate],
+        }]
+
+        self.assertTrue(self.network.publish_bot_observation(
+            player, [malformed_contact, strict_contact], strict_report
+        ))
+        contacts, affordances = captured[0]
+        self.assertEqual(1, len(contacts))
+        self.assertFalse(contacts[0]["visible"])
+        self.assertEqual(1, len(affordances[0]["candidates"]))
+        self.assertFalse(affordances[0]["candidates"][0]["peek_feasible"])
+        self.assertFalse(affordances[0]["candidates"][0]["escape_feasible"])
+
+    def test_send_rejects_client_message_over_server_limit(self):
+        player = Player()
+        client = self.network.LANClient(player, "127.0.0.1", 28782, "Alpha", "ussr:T-34")
+        client.connected = True
+        client.sock = types.SimpleNamespace(sendall=lambda payload: None)
+        self.assertFalse(client._send({"type": "oversized", "data": "x" * self.network.MAX_MESSAGE_BYTES}))
+
     def test_roster_updates_native_queue_payload(self):
         install_vehicle_descriptors({
             "china:Type_59": ({"mediumTank"}, 8),
@@ -576,6 +674,20 @@ class LANClientQueueTest(unittest.TestCase):
             "type": "snapshot", "bot_authority_id": 1,
             "players": [], "bots": [], "bot_order_revision": 6,
             "bot_orders": [{"id": 16, "target_id": 999}],
+        })
+        self.assertEqual(2, client.bot_orders[16]["target_id"])
+
+    def test_snapshot_same_revision_does_not_replace_orders_but_initial_zero_does(self):
+        player = Player()
+        client = self.network.LANClient(player, "127.0.0.1", 28782, "Alpha", "ussr:T-34")
+        client._handle_message({
+            "type": "snapshot", "bot_authority_id": 1, "players": [], "bots": [],
+            "bot_order_revision": 0, "bot_orders": [{"id": 16, "target_id": 2}],
+        })
+        self.assertEqual(2, client.bot_orders[16]["target_id"])
+        client._handle_message({
+            "type": "snapshot", "bot_authority_id": 1, "players": [], "bots": [],
+            "bot_order_revision": 0, "bot_orders": [{"id": 16, "target_id": 999}],
         })
         self.assertEqual(2, client.bot_orders[16]["target_id"])
 

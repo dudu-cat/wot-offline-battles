@@ -41,6 +41,7 @@ class TerrainGrid(object):
 		self._ground_cache = {}
 		self._edge_cache = {}
 		self._segment_cache = {}
+		self._failed_edges = {}
 
 	def cell_for(self, point):
 		return (int(math.floor(float(point[0]) / self.cell_size + 0.5)),
@@ -76,6 +77,90 @@ class TerrainGrid(object):
 		return (int(math.floor(float(point[0]) * 0.5 + 0.5)),
 		        int(math.floor(float(point[2]) * 0.5 + 0.5)),
 		        self._layer(point[1]))
+
+	def _edge_cells_for_segment(self, start, end):
+		edges = self._edge_keys_for_segment(start, end)
+		return edges[0] if edges else None
+
+	def _edge_keys_for_segment(self, start, end):
+		start_cell = self.cell_for(start)
+		end_cell = self.cell_for(end)
+		if start_cell == end_cell:
+			return ()
+		x, z = start_cell
+		target_x, target_z = end_cell
+		dx = abs(target_x - x)
+		dz = abs(target_z - z)
+		step_x = 1 if x < target_x else -1
+		step_z = 1 if z < target_z else -1
+		error = dx - dz
+		cells = [start_cell]
+		while x != target_x or z != target_z:
+			double_error = error * 2
+			if double_error > -dz:
+				error -= dz
+				x += step_x
+			if double_error < dx:
+				error += dx
+				z += step_z
+			cells.append((x, z))
+		return tuple(tuple(sorted((cells[index], cells[index + 1])))
+		             for index in range(len(cells) - 1))
+
+	def prune_failed_edges(self, now):
+		for key, value in list(self._failed_edges.items()):
+			if float(now) >= value[0]:
+				self._failed_edges.pop(key, None)
+		if len(self._failed_edges) > 128:
+			ordered = sorted(self._failed_edges.items(), key=lambda item: item[1][0])
+			for key, unused in ordered[:len(self._failed_edges) - 128]:
+				self._failed_edges.pop(key, None)
+
+	def trim_caches(self):
+		for cache, limit in ((self._ground_cache, 4096),
+		                     (self._edge_cache, 4096),
+		                     (self._segment_cache, 4096)):
+			while len(cache) > limit:
+				try:
+					cache.popitem()
+				except Exception:
+					break
+
+	def remember_failed_segment(self, start, end, now, ttl=18.0, penalty=240.0):
+		"""Penalize the first coarse edge of a route that made no progress."""
+		key = self._edge_cells_for_segment(start, end)
+		if key is None:
+			return
+		self._failed_edges[key] = (float(now) + max(1.0, float(ttl)),
+		                           max(0.0, float(penalty)))
+		if len(self._failed_edges) > 512:
+			alive = [(edge, value) for edge, value in self._failed_edges.items()
+			         if value[0] > float(now)]
+			alive.sort(key=lambda item: item[1][0], reverse=True)
+			self._failed_edges = dict(alive[:384])
+
+	def _failed_edge_penalty(self, first_cell, second_cell, now):
+		key = tuple(sorted((first_cell, second_cell)))
+		value = self._failed_edges.get(key)
+		if value is None:
+			return 0.0
+		if float(now) >= value[0]:
+			self._failed_edges.pop(key, None)
+			return 0.0
+		return value[1]
+
+	def segment_penalty(self, start, end, now):
+		penalty = 0.0
+		for key in self._edge_keys_for_segment(start, end):
+			penalty = max(penalty,
+			              self._failed_edge_penalty(key[0], key[1], now))
+		return penalty
+
+	def path_has_penalty(self, path, now):
+		for index in range(len(path) - 1):
+			if self.segment_penalty(path[index], path[index + 1], now) > 0.0:
+				return True
+		return False
 
 	def _ground(self, x, z, hint_y):
 		if not self._inside(x, z):
@@ -167,18 +252,19 @@ class TerrainGrid(object):
 				penalty += (self.cell_size * 1.5 - distance) * 3.0
 		return penalty
 
-	def plan(self, start, goal, avoid_points=None, max_expansions=1600):
+	def plan(self, start, goal, avoid_points=None, max_expansions=1600, now=0.0):
 		"""Return a supported path synchronously (mainly for tests/tools)."""
-		search = self.begin_plan(start, goal, avoid_points, max_expansions)
+		search = self.begin_plan(start, goal, avoid_points, max_expansions, now)
 		while not search.done:
 			search.step(256)
 		return search.result
 
-	def begin_plan(self, start, goal, avoid_points=None, max_expansions=1600):
+	def begin_plan(self, start, goal, avoid_points=None, max_expansions=1600,
+			now=0.0):
 		return _TerrainSearch(self._plan_steps(
-			start, goal, avoid_points, max_expansions))
+			start, goal, avoid_points, max_expansions, now))
 
-	def _plan_steps(self, start, goal, avoid_points, max_expansions):
+	def _plan_steps(self, start, goal, avoid_points, max_expansions, now):
 		start_cell = self.cell_for(start)
 		goal_cell = self.cell_for(goal)
 		start_y = self._ground(float(start[0]), float(start[2]), float(start[1]))
@@ -214,7 +300,8 @@ class TerrainGrid(object):
 				run = self.cell_size * length_scale
 				slope = abs(next_y - current_y) / max(run, 0.1)
 				new_cost = (cost_so_far[current] + run * (1.0 + slope * 3.0) +
-				            self._penalty(next_cell, avoid_points))
+				            self._penalty(next_cell, avoid_points) +
+				            self._failed_edge_penalty(current, next_cell, now))
 				if next_cell not in cost_so_far or new_cost < cost_so_far[next_cell]:
 					cost_so_far[next_cell] = new_cost
 					came_from[next_cell] = current
@@ -243,9 +330,9 @@ class TerrainGrid(object):
 		              float(goal[2]))
 		if self.segment_clear(path[-1], goal_point):
 			path.append(goal_point)
-		yield self._smooth(tuple(path))
+		yield self._smooth(tuple(path), now)
 
-	def _smooth(self, path):
+	def _smooth(self, path, now=0.0):
 		if len(path) < 3:
 			return path
 		result = [path[0]]
@@ -253,7 +340,8 @@ class TerrainGrid(object):
 		while index < len(path) - 1:
 			furthest = min(len(path) - 1, index + 6)
 			while furthest > index + 1:
-				if self.segment_clear(path[index], path[furthest]):
+				if (self.segment_penalty(path[index], path[furthest], now) <= 0.0 and
+						self.segment_clear(path[index], path[furthest])):
 					break
 				furthest -= 1
 			result.append(path[furthest])
@@ -319,24 +407,30 @@ class TerrainNavigator(object):
 			path = self.paths[key]
 			# A probe can fail while distant chunks are still streaming. Successful
 			# paths are permanent for the battle; failed ones get another chance.
-			if path:
+			if path and not self.grid.path_has_penalty(path, now):
 				self.path_times[key] = float(now)
 				return key, path
-			if float(now) - self.path_times.get(key, 0.0) < 3.0:
-				return key, path
-			del self.paths[key]
-			self.path_times.pop(key, None)
-			self.grid.clear_negative_cache()
+			if path:
+				del self.paths[key]
+				self.path_times.pop(key, None)
+			else:
+				if float(now) - self.path_times.get(key, 0.0) < 3.0:
+					return key, path
+				del self.paths[key]
+				self.path_times.pop(key, None)
+				self.grid.clear_negative_cache()
 		search = self.searches.get(key)
 		if search is None:
 			# Most annotated segments are already open roads. Avoid invoking A*
 			# when one continuous support/collision check proves the direct link.
-			if self.grid.segment_clear(start, goal):
+			if (self.grid.segment_penalty(start, goal, now) <= 0.0 and
+					self.grid.segment_clear(start, goal)):
 				path = (tuple(start), tuple(goal))
 				self.paths[key] = path
 				self.path_times[key] = float(now)
 				return key, path
-			search = self.grid.begin_plan(start, goal, avoid_points=avoid_points)
+			search = self.grid.begin_plan(
+				start, goal, avoid_points=avoid_points, now=now)
 			self.searches[key] = search
 		frame = int(float(now) * 30.0 + 0.5)
 		if frame != self.search_frame:
@@ -360,6 +454,8 @@ class TerrainNavigator(object):
 			anchor=None, avoid_points=None):
 		"""Return a terrain-safe local target, holding if no safe path is ready."""
 		bot_id = int(bot_id)
+		self.grid.prune_failed_edges(now)
+		self.grid.trim_caches()
 		state = self.bot_states.get(bot_id)
 		if state is None:
 			state = {'last_position': tuple(current), 'progress_time': float(now),
@@ -378,6 +474,11 @@ class TerrainNavigator(object):
 		effective_key = tuple(path_key)
 		if stalled:
 			state['recovery'] = int(state.get('recovery', 0)) + 1
+			failed_target = state.get('last_target')
+			if failed_target is not None:
+				self.grid.remember_failed_segment(
+					current, failed_target, now,
+					ttl=14.0 + min(18.0, state['recovery'] * 3.0))
 			state['recovery_key'] = ('recovery', bot_id, state['recovery'],
 			                         self.grid.cell_for(current))
 			state['recovery_start'] = tuple(current)
@@ -391,8 +492,11 @@ class TerrainNavigator(object):
 		key, path = self._path(effective_key, plan_start, goal, now,
 		                       avoid_points if recovering else None)
 		if not path:
-			if self.grid.segment_clear(current, goal):
+			if (self.grid.segment_penalty(current, goal, now) <= 0.0 and
+					self.grid.segment_clear(current, goal)):
+				state['last_target'] = tuple(goal)
 				return tuple(goal)
+			state['last_target'] = tuple(current)
 			return tuple(current)
 		if state.get('path_key') != key:
 			state['path_key'] = key
@@ -406,10 +510,12 @@ class TerrainNavigator(object):
 					best_index = index
 			state['index'] = best_index
 		index = min(int(state.get('index', 0)), len(path) - 1)
-		if not self.grid.segment_clear(current, path[index]):
+		if (self.grid.segment_penalty(current, path[index], now) > 0.0 or
+				not self.grid.segment_clear(current, path[index])):
 			join_key = ('join', bot_id, self.grid.cell_for(current)) + tuple(path_key)
 			key, joined_path = self._path(join_key, current, goal, now, avoid_points)
 			if not joined_path:
+				state['last_target'] = tuple(current)
 				return tuple(current)
 			path = joined_path
 			state['path_key'] = key
@@ -418,14 +524,17 @@ class TerrainNavigator(object):
 		reach_radius = min(10.0, max(1.5, self.grid.cell_size * 0.55))
 		while (index + 1 < len(path) and
 		       _distance_2d(current, path[index]) < reach_radius and
+		       self.grid.segment_penalty(current, path[index + 1], now) <= 0.0 and
 		       self.grid.segment_clear(current, path[index + 1])):
 			index += 1
 		# Look ahead only while every skipped piece is continuously supported.
 		lookahead = index
 		for candidate in range(index + 1, min(len(path), index + 3)):
-			if self.grid.segment_clear(current, path[candidate]):
+			if (self.grid.segment_penalty(current, path[candidate], now) <= 0.0 and
+					self.grid.segment_clear(current, path[candidate])):
 				lookahead = candidate
 			else:
 				break
 		state['index'] = lookahead
+		state['last_target'] = tuple(path[lookahead])
 		return tuple(path[lookahead])

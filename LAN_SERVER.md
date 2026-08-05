@@ -137,29 +137,40 @@ authority. That client chooses one exact bot manifest and uploads each tank's
 vehicle profile plus the assigned standard-battle route. It reports only
 contacts observed through client-side range and terrain line-of-sight checks.
 The server retains last-known contacts, reserves targets across the team,
-advances uploaded routes, chooses combat mode and shell, and emits monotonic
-revisioned bot orders. The authority client executes those orders with the real
-map collision, local driver, armor and shell systems, then publishes canonical
-pose/fire/HP state. Every client therefore renders the same population and
-combat result. If the authority disconnects, the server elects the next player
-and preserves the latest shared state. The same authority publishes
+advances uploaded routes, shifts at most one adaptable tank toward a pressured
+lane, chooses combat mode and shell, and emits monotonic revisioned bot orders.
+For nearby visible contacts the authority also probes a bounded fan of
+drivable, dry, low-slope cover and peek points. The server validates those
+points against the bot's shared pose, scores them by role/personality, reserves
+them across the team, and controls the approach/hold/peek/return cycle. The
+authority client executes those orders with the real map collision, local
+driver, armor and shell systems, then publishes canonical pose/fire/HP state.
+Every client therefore renders the same population and combat result. If the
+authority disconnects, the server elects the next player, preserves canonical
+bot/HP/rules state, and clears the departed client's short-lived contacts and
+cover probes until the new authority reports its own observations. The same
+authority publishes
 base-capture progress, capture interruption and the final winner/reason for
 capture, team elimination or timer expiry. The server remains the shared
 source of truth for HP and the final battle result.
 
 ### Bot planner portability boundary
 
-`server_bot_ai.py` is intentionally pure data: it imports no BigWorld or client
-module. Its inputs and outputs are JSON-compatible dictionaries carried by
-protocol v5:
+`server_bot_ai.py` and the cover scorer it shares with the client are
+intentionally pure data: neither imports BigWorld or touches a client runtime.
+Their inputs and outputs are JSON-compatible dictionaries carried by protocol
+v5:
 
 - `bot_manifest`: identity, team, vehicle profile, shell profiles and sparse
   route waypoints;
 - `bot_observation`: authority-reported visible/hidden contacts with explicit
-  `target_kind` and shared coordinates;
+  `target_kind` and shared coordinates, plus bounded client-probed cover and
+  peek affordances for visible contacts;
 - `bot_state`: the latest authority-executed bot pose, health and fire state;
-- `bot_orders`: route index, movement/aim points, target reservation, combat
-  mode, throttle override and shell index, guarded by `bot_order_revision`.
+- `bot_orders`: route index, movement/aim points, target and cover reservation,
+  combat mode, throttle override and shell index, guarded by
+  `bot_order_revision`. A snapshot includes the order list only when that
+  revision is new for its recipient.
 
 This boundary is suitable for replacing the Python server planner with Go
 without moving proprietary map queries or BigWorld entity control off the
@@ -169,10 +180,11 @@ stable orders between revisions and target identity as `(target_kind, id)`.
 This is an implementation checkpoint, not a complete replacement for the
 retail battle server. One elected client still owns map collision, short-range
 driving, shell/armor resolution and the original client physics. Authority
-failover preserves server-side contacts, routes and orders but cannot preserve
-every client-local recovery or reload timer. It does not provide the retail
-server's authoritative physics, complete cross-client module/crew state,
-reconnection recovery, anti-cheat, NAT traversal or internet-safe
+failover preserves canonical bot poses, HP, rules and uploaded routes, but
+intentionally discards authority-derived contacts/cover probes and cannot
+preserve every client-local recovery or reload timer. It does not provide the
+retail server's authoritative physics, complete cross-client module/crew
+state, reconnection recovery, anti-cheat, NAT traversal or internet-safe
 authentication. Keep it on a trusted LAN while testing.
 
 ## Disable or roll back

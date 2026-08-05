@@ -132,6 +132,7 @@ class Player:
     alive: bool = True
     client_position: bool = False
     connected: bool = True
+    bot_order_revision_sent: int = -1
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def send(self, message):
@@ -143,6 +144,11 @@ class Player:
         try:
             with self.send_lock:
                 self.conn.sendall(payload)
+            if "bot_orders" in message:
+                try:
+                    self.bot_order_revision_sent = int(message.get("bot_order_revision", -1))
+                except (TypeError, ValueError):
+                    pass
             return True
         except (BrokenPipeError, ConnectionError, OSError):
             self.connected = False
@@ -199,6 +205,7 @@ class BattleState:
         old = self.bot_authority_id
         self.bot_authority_id = connected[0] if connected else None
         if old != self.bot_authority_id and self.phase == "battle":
+            self.bot_planner.clear_observations()
             self.pending_events.append({
                 "kind": "authority",
                 "player_id": self.bot_authority_id,
@@ -365,11 +372,15 @@ class BattleState:
             if self.phase != "battle" or player_id != self.bot_authority_id:
                 return False
             incoming = message.get("bots") or []
+            if not isinstance(incoming, (list, tuple)):
+                return False
             roster = {entry["id"]: entry for entry in self.bot_roster}
             manifest = []
             states = {}
             seen = set()
             for raw in incoming[:30]:
+                if not isinstance(raw, dict):
+                    continue
                 try:
                     bot_id = int(raw.get("id"))
                 except (TypeError, ValueError):
@@ -424,7 +435,10 @@ class BattleState:
                                       ("armor", 0.0, 10000.0)):
             profile[key] = round(_clamp(_finite_float(raw.get(key), default), 0.0, maximum), 3)
         profile["shells"] = []
-        for shell in (raw.get("shells") or [])[:5]:
+        shells = raw.get("shells") or []
+        if not isinstance(shells, (list, tuple)):
+            shells = []
+        for shell in shells[:5]:
             if not isinstance(shell, dict):
                 continue
             profile["shells"].append({
@@ -441,7 +455,10 @@ class BattleState:
         raw = raw if isinstance(raw, dict) else {}
         route = {"id": _safe_name(raw.get("id"), "server_route"),
                  "waypoints": []}
-        for point in (raw.get("waypoints") or [])[:16]:
+        waypoints = raw.get("waypoints") or []
+        if not isinstance(waypoints, (list, tuple)):
+            waypoints = []
+        for point in waypoints[:16]:
             if not isinstance(point, dict):
                 continue
             route["waypoints"].append({
@@ -459,8 +476,14 @@ class BattleState:
                 return False
             players = [self._public_player(p) for p in self.players.values() if p.connected]
             known_targets = self.bot_planner.known_targets(list(self.bot_states.values()), players)
-            accepted = self.bot_planner.report_contacts(message.get("contacts"), known_targets, time.monotonic())
-            return accepted > 0
+            now = time.monotonic()
+            accepted_contacts = self.bot_planner.report_contacts(
+                message.get("contacts"), known_targets, now)
+            known_bots = self.bot_planner.known_bots(
+                self.bot_manifest, list(self.bot_states.values()))
+            accepted_affordances = self.bot_planner.report_affordances(
+                message.get("affordances"), known_bots, known_targets, now)
+            return accepted_contacts > 0 or accepted_affordances > 0
 
     @staticmethod
     def _sanitize_bot_state(raw, identity, previous):
@@ -501,7 +524,12 @@ class BattleState:
                 return False
             identities = {entry["id"]: entry for entry in self.bot_manifest}
             changed = False
-            for raw in (message.get("bots") or [])[:30]:
+            incoming = message.get("bots") or []
+            if not isinstance(incoming, (list, tuple)):
+                return False
+            for raw in incoming[:30]:
+                if not isinstance(raw, dict):
+                    continue
                 try:
                     bot_id = int(raw.get("id"))
                 except (TypeError, ValueError):
@@ -588,9 +616,16 @@ class BattleState:
             if self.phase != "battle" or player_id != self.bot_authority_id or self.battle_result is not None:
                 return False
             bases = {}
-            incoming = (message.get("rules") or {}).get("bases") or {}
+            rules = message.get("rules") or {}
+            if not isinstance(rules, dict):
+                return False
+            incoming = rules.get("bases") or {}
+            if not isinstance(incoming, dict):
+                return False
             for team in (1, 2):
                 raw = incoming.get(str(team), incoming.get(team, {})) or {}
+                if not isinstance(raw, dict):
+                    raw = {}
                 bases[str(team)] = {
                     "points": max(0, min(int(_finite_float(raw.get("points"), 0)), 100)),
                     "stopped": bool(raw.get("stopped", False)),
@@ -775,13 +810,16 @@ class BattleState:
                 "players": [self._public_player(p) for p in self.players.values() if p.connected],
                 "bots": [self.bot_states[key] for key in sorted(self.bot_states)],
                 "bot_order_revision": self.bot_orders["revision"],
-                "bot_orders": list(self.bot_orders["orders"]),
                 "rules": self.rules_state,
                 "battle_result": self.battle_result,
             }
             recipients = list(self.players.values())
         for player in recipients:
-            if not player.send(snapshot):
+            outgoing = snapshot
+            if player.bot_order_revision_sent != self.bot_orders["revision"]:
+                outgoing = dict(snapshot)
+                outgoing["bot_orders"] = list(self.bot_orders["orders"])
+            if not player.send(outgoing):
                 self.remove_player(player.player_id)
         if events:
             for event in events:
@@ -857,7 +895,8 @@ class ClientHandler(socketserver.BaseRequestHandler):
                 buffer += chunk
             line, _, buffer = buffer.partition(b"\n")
             hello = json.loads(line.decode("utf-8"))
-            if hello.get("type") != "hello" or int(hello.get("protocol", -1)) != PROTOCOL_VERSION:
+            if (not isinstance(hello, dict) or hello.get("type") != "hello" or
+                    int(hello.get("protocol", -1)) != PROTOCOL_VERSION):
                 self._send_raw(conn, {"type": "error", "code": "protocol", "message": "protocol mismatch"})
                 _server_log("Rejected %s:%d: protocol mismatch" % self.client_address)
                 return
@@ -921,6 +960,8 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     if len(line) > MAX_LINE_BYTES:
                         return
                     message = json.loads(line.decode("utf-8"))
+                    if not isinstance(message, dict):
+                        continue
                     if message.get("type") == "input":
                         server.state.update_input(player.player_id, message)
                     elif message.get("type") == "hit_report":
@@ -936,8 +977,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     elif message.get("type") == "bot_state":
                         server.state.update_bot_states(player.player_id, message)
                     elif message.get("type") == "bot_observation":
-                        if not server.state.update_bot_observation(player.player_id, message):
-                            _server_log("BOT OBSERVATION rejected sender=%d" % player.player_id)
+                        server.state.update_bot_observation(player.player_id, message)
                     elif message.get("type") == "bot_hit_report":
                         if not server.state.report_bot_hit(player.player_id, message):
                             _server_log("BOT HIT rejected attacker=%d target=%s seq=%s" % (

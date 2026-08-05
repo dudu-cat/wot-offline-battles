@@ -1587,6 +1587,24 @@ def _offh_ai_driver():
 	return driver
 
 
+def _offh_ai_hull_dims(descriptor):
+	"""Return conservative OBB half length/width from the native hull tester."""
+	cache = globals().setdefault('g_offh_ai_hull_dims', {})
+	key = id(descriptor)
+	if key in cache:
+		return cache[key]
+	half_length = 3.5
+	half_width = 1.7
+	try:
+		bbox = descriptor.hull['hitTester'].bbox
+		half_width = max(0.8, abs(float(bbox[0][0])), abs(float(bbox[1][0])))
+		half_length = max(1.5, abs(float(bbox[0][2])), abs(float(bbox[1][2])))
+	except Exception:
+		pass
+	cache[key] = (half_length, half_width)
+	return cache[key]
+
+
 def _offh_ai_direction_clear(vehicle, absolute_yaw):
 	"""Probe one hull-width movement corridor for the engine-free driver."""
 	try:
@@ -1683,6 +1701,217 @@ def _offh_ai_has_los(observer_position, target_position):
 
 def _offh_ai_clear_shot(shooter_position, target_position):
 	return _offh_ai_has_los(shooter_position, target_position)
+
+
+def _offh_ai_ground_point(x, z, hint_y):
+	"""Return nearby drivable ground without jumping onto roofs or bridges."""
+	try:
+		import BigWorld, Math
+		probe_top = float(hint_y) + 7.0
+		probe_bottom = float(hint_y) - 14.0
+		for _unused in range(3):
+			hit = BigWorld.wg_collideSegment(
+				_offh_bspace(), Math.Vector3(float(x), probe_top, float(z)),
+				Math.Vector3(float(x), probe_bottom, float(z)), 128)
+			if hit is None:
+				return None
+			height = float(hit[0].y)
+			if height <= float(hint_y) + 4.0:
+				return (float(x), height, float(z))
+			probe_top = height - 0.35
+	except Exception:
+		pass
+	return None
+
+
+def _offh_ai_candidate_slope(point):
+	"""Estimate the steepest local grade in degrees around one candidate."""
+	try:
+		import math
+		maximum = 0.0
+		for offset_x, offset_z in ((2.5, 0.0), (-2.5, 0.0),
+		                             (0.0, 2.5), (0.0, -2.5)):
+			other = _offh_ai_ground_point(
+				point[0] + offset_x, point[2] + offset_z, point[1])
+			if other is None:
+				return 90.0
+			grade = math.degrees(math.atan2(abs(other[1] - point[1]), 2.5))
+			maximum = max(maximum, grade)
+		return maximum
+	except Exception:
+		return 90.0
+
+
+def _offh_ai_sample_cover(director, bot_id, vehicle, target_position,
+						   route_position, ally_positions):
+	"""Probe a small cover fan; never queries an unobserved enemy position."""
+	try:
+		import math
+		from gui.mods.offhangar.bot_ai_cover import score_candidates
+		current = (float(vehicle.position.x), float(vehicle.position.y),
+		           float(vehicle.position.z))
+		dx = current[0] - float(target_position[0])
+		dz = current[2] - float(target_position[2])
+		length = math.sqrt(dx * dx + dz * dz)
+		if length < 2.0:
+			return ()
+		away_x = dx / length
+		away_z = dz / length
+		right_x = away_z
+		right_z = -away_x
+		offsets = (
+			(0.0, 0.0), (14.0, 0.0),
+			(10.0, 13.0), (10.0, -13.0),
+		)
+		route_dx = float(route_position[0]) - current[0]
+		route_dz = float(route_position[2]) - current[2]
+		route_length = math.sqrt(route_dx * route_dx + route_dz * route_dz)
+		navigator = _offh_ai_navigator(director)
+		candidates = []
+		for index, (away, lateral) in enumerate(offsets):
+			x = current[0] + away_x * away + right_x * lateral
+			z = current[2] + away_z * away + right_z * lateral
+			point = _offh_ai_ground_point(x, z, current[1])
+			if point is None:
+				continue
+			travel = math.sqrt((point[0] - current[0]) ** 2 +
+			                   (point[2] - current[2]) ** 2)
+			water_depth = _offh_water_depth(point[0], point[1], point[2])
+			if water_depth > 1.0:
+				continue
+			try:
+				escape = bool(navigator.grid.segment_clear(current, point))
+			except Exception:
+				escape = False
+			if not escape:
+				continue
+			occluded = not _offh_ai_has_los(point, target_position)
+			if not occluded:
+				continue
+			slope = _offh_ai_candidate_slope(point)
+			if slope > 24.0:
+				continue
+			peek = None
+			to_target_x = -away_x
+			to_target_z = -away_z
+			for side in (-1.0, 1.0):
+				peek_point = _offh_ai_ground_point(
+					point[0] + right_x * side * 6.5 + to_target_x * 2.0,
+					point[2] + right_z * side * 6.5 + to_target_z * 2.0,
+					point[1])
+				if peek_point is None or _offh_water_depth(
+						peek_point[0], peek_point[1], peek_point[2]) > 1.0:
+					continue
+				try:
+					peek_clear = navigator.grid.segment_clear(point, peek_point)
+				except Exception:
+					peek_clear = False
+				if peek_clear and _offh_ai_has_los(peek_point, target_position):
+					peek = peek_point
+					break
+			move_dx = point[0] - current[0]
+			move_dz = point[2] - current[2]
+			move_length = math.sqrt(move_dx * move_dx + move_dz * move_dz)
+			alignment = 0.5
+			if move_length > 0.1 and route_length > 0.1:
+				dot = ((move_dx / move_length) * (route_dx / route_length) +
+				       (move_dz / move_length) * (route_dz / route_length))
+				alignment = max(0.0, min(1.0, (dot + 1.0) * 0.5))
+			nearby = 0
+			for ally in ally_positions or ():
+				ally_distance = math.sqrt((point[0] - ally[0]) ** 2 +
+				                          (point[2] - ally[2]) ** 2)
+				if ally_distance < 13.0 and ally_distance > 0.5:
+					nearby += 1
+			candidate = {
+				'id': '%s:%d:%d' % (
+					str(bot_id), int(round(point[0] / 4.0)),
+					int(round(point[2] / 4.0))),
+				'position': point,
+				'travel_distance': travel,
+				'route_alignment': alignment,
+				'enemy_occlusion': 1.0 if occluded else 0.0,
+				'exposure': 0.12 if occluded else 1.0,
+				'slope': slope,
+				'water': max(0.0, min(1.0, water_depth)),
+				'ally_congestion': max(0.0, min(1.0, nearby / 3.0)),
+				'peek_feasible': peek is not None,
+				'escape_feasible': escape,
+			}
+			if peek is not None:
+				candidate['peek_position'] = peek
+			candidates.append(candidate)
+		ranked = score_candidates(candidates)
+		for candidate in ranked:
+			candidate.pop('breakdown', None)
+			candidate.pop('reasons', None)
+			candidate.pop('rank', None)
+			candidate.pop('score', None)
+		return tuple(ranked)
+	except Exception:
+		return ()
+
+
+def _offh_ai_apply_local_cover(bot_id, position, order, now):
+	"""Apply the same cover/peek cycle when LAN mode is disabled."""
+	cache = globals().get('g_offh_ai_local_covers', {}).get(int(bot_id))
+	if (cache is None or float(now) > float(cache.get('expires', 0.0)) or
+			cache.get('target_id') != order.get('target_id')):
+		return order
+	candidate = cache.get('candidate') or {}
+	cover = candidate.get('position')
+	peek = candidate.get('peek_position')
+	if cover is None or peek is None:
+		return order
+	try:
+		import math
+		cover_distance = math.sqrt((cover['x'] - position[0]) ** 2 +
+		                           (cover['z'] - position[2]) ** 2)
+		peek_distance = math.sqrt((peek['x'] - position[0]) ** 2 +
+		                          (peek['z'] - position[2]) ** 2)
+	except Exception:
+		return order
+	phase = cache.get('phase', 'approach')
+	if phase in ('approach', 'return') and cover_distance <= 4.5:
+		phase = 'hold'
+		cache['phase'] = phase
+		personality = order.get('personality') or {}
+		cache['phase_until'] = (float(now) + 0.65 +
+			float(personality.get('patience', 0.5)) * 1.35)
+	elif phase == 'hold' and float(now) >= float(cache.get('phase_until', 0.0)):
+		phase = 'peek'
+		cache['phase'] = phase
+		cache['phase_until'] = 0.0
+	elif phase == 'peek' and peek_distance <= 4.5:
+		if float(cache.get('phase_until', 0.0)) <= 0.0:
+			personality = order.get('personality') or {}
+			cache['phase_until'] = (float(now) + 1.0 +
+				float(personality.get('aggression', 0.5)) * 1.8)
+		elif float(now) >= float(cache.get('phase_until', 0.0)):
+			phase = 'return'
+			cache['phase'] = phase
+			cache['phase_until'] = 0.0
+	result = dict(order)
+	result['cover_id'] = candidate.get('id')
+	result['fire_allowed'] = False
+	if phase == 'approach':
+		result['combat_mode'] = 'take_cover'
+		result['move_position'] = (cover['x'], cover['y'], cover['z'])
+		result['throttle_override'] = 0.72
+	elif phase == 'hold':
+		result['combat_mode'] = 'cover_hold'
+		result['move_position'] = (cover['x'], cover['y'], cover['z'])
+		result['throttle_override'] = 0.0
+	elif phase == 'peek':
+		result['combat_mode'] = 'cover_peek'
+		result['move_position'] = (peek['x'], peek['y'], peek['z'])
+		result['throttle_override'] = 0.56 if peek_distance > 4.5 else 0.0
+		result['fire_allowed'] = bool(order.get('fire_allowed')) and peek_distance <= 4.5
+	else:
+		result['combat_mode'] = 'cover_return'
+		result['move_position'] = (cover['x'], cover['y'], cover['z'])
+		result['throttle_override'] = None
+	return result
 
 
 def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
@@ -1783,9 +2012,90 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 				'armor': float(target.get('armor', 0.0)),
 				'visible': bool(visible or not target['alive']),
 			})
+	cover_reports = []
+	try:
+		cover_jobs = []
+		shared_entries = {}
+		for value in entries.values():
+			if value.get('server_id') is not None:
+				shared_entries[(value.get('target_kind'),
+				                int(value.get('server_id')))] = value
+		for entity_id, entry in entries.items():
+			if entity_id == player_id or not entry.get('alive'):
+				continue
+			agent = director.agents.get(int(entity_id))
+			order = agent.get('last_order') if agent is not None else None
+			vehicle = mock_vehicles.get(entity_id)
+			try:
+				from gui.mods.offhangar.network_battle import authoritative_bot_order
+				network_order = authoritative_bot_order(player, vehicle)
+				if network_order is not None:
+					order = network_order
+			except Exception:
+				pass
+			mode = order.get('combat_mode') if order else None
+			cover_modes = ('take_cover', 'cover_hold', 'cover_peek', 'cover_return')
+			if (not order or
+					(mode not in cover_modes and
+					 (not order.get('fire_allowed') or
+					  mode not in ('engage', 'advance_contact',
+					               'jiggle_forward', 'jiggle_back')))):
+				continue
+			target_kind = order.get('target_kind')
+			if target_kind and order.get('target_id') is not None:
+				target = shared_entries.get((target_kind, int(order.get('target_id'))))
+			else:
+				target = entries.get(order.get('target_id'))
+			if target is None or vehicle is None or not target.get('alive'):
+				continue
+			cover_jobs.append((entity_id, entry, target, vehicle, order))
+		cover_jobs.sort(key=lambda value: value[0])
+		cursor = int(globals().get('g_offh_ai_cover_cursor', 0) or 0)
+		if cover_jobs:
+			ordered_jobs = cover_jobs[cursor:] + cover_jobs[:cursor]
+			globals()['g_offh_ai_cover_cursor'] = (cursor + 3) % len(cover_jobs)
+		else:
+			ordered_jobs = ()
+		for entity_id, entry, target, vehicle, order in ordered_jobs[:3]:
+			allies = [value['position'] for value in living
+			          if value['team'] == entry['team']]
+			candidates = _offh_ai_sample_cover(
+				director, entity_id, vehicle, target['position'],
+				order.get('route_anchor') or order.get('move_position'), allies)
+			usable = [candidate for candidate in candidates
+			          if candidate.get('water', 1.0) < 0.5 and
+			          candidate.get('slope', 90.0) <= 24.0 and
+			          candidate.get('enemy_occlusion', 0.0) >= 0.45 and
+			          candidate.get('peek_feasible') and candidate.get('escape_feasible')]
+			if not usable:
+				continue
+			bot_server_id = getattr(vehicle, '_network_bot_id', None)
+			if bot_server_id is not None and target.get('server_id') is not None:
+				cover_reports.append({
+					'bot_id': int(bot_server_id),
+					'target_id': int(target['server_id']),
+					'target_kind': target.get('target_kind', 'human'),
+					'candidates': usable,
+				})
+			else:
+				local_covers = globals().setdefault('g_offh_ai_local_covers', {})
+				old = local_covers.get(int(entity_id))
+				selected = usable[0]
+				if (old is not None and old.get('target_id') == target['id'] and
+						old.get('candidate', {}).get('id') == selected.get('id')):
+					old['candidate'] = selected
+					old['expires'] = float(now) + 8.0
+				else:
+					local_covers[int(entity_id)] = {
+						'target_id': target['id'], 'candidate': selected,
+						'expires': float(now) + 8.0, 'phase': 'approach',
+						'phase_until': 0.0,
+					}
+	except Exception:
+		cover_reports = []
 	try:
 		from gui.mods.offhangar.network_battle import publish_bot_observation
-		publish_bot_observation(player, network_contacts)
+		publish_bot_observation(player, network_contacts, cover_reports)
 	except Exception:
 		pass
 
@@ -1860,6 +2170,9 @@ def _offh_battle_sweep(tag='exit'):
 		globals().pop('g_offh_bot_director', None)
 		globals().pop('g_offh_terrain_navigator', None)
 		globals().pop('g_offh_local_driver', None)
+		globals().pop('g_offh_ai_hull_dims', None)
+		globals().pop('g_offh_ai_local_covers', None)
+		globals().pop('g_offh_ai_cover_cursor', None)
 		globals().pop('g_offh_ai_contacts_t', None)
 		globals().pop('g_offh_ai_init_error_logged', None)
 		_stage = 'models'
@@ -5104,6 +5417,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		globals().pop('g_offh_bot_director', None)
 		globals().pop('g_offh_terrain_navigator', None)
 		globals().pop('g_offh_local_driver', None)
+		globals().pop('g_offh_ai_hull_dims', None)
+		globals().pop('g_offh_ai_local_covers', None)
+		globals().pop('g_offh_ai_cover_cursor', None)
 		globals().pop('g_offh_ai_contacts_t', None)
 		globals().pop('g_offh_ai_init_error_logged', None)
 		_offh_seen_arena = [False]
@@ -8436,6 +8752,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											(m_veh.position.x, m_veh.position.y, m_veh.position.z),
 											m_veh.yaw, getattr(m_veh, 'health', 1),
 											getattr(m_veh, 'maxHealth', 1), BigWorld.time())
+										_ai_order = _offh_ai_apply_local_cover(
+											eid,
+											(m_veh.position.x, m_veh.position.y, m_veh.position.z),
+											_ai_order, BigWorld.time())
 									if _ai_order is None:
 										_hold = (m_veh.position.x, m_veh.position.y, m_veh.position.z)
 										_ai_order = {
@@ -8454,11 +8774,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_ai_target_id = _ai_order.get('target_id')
 									_ai_throttle_override = _ai_order.get('throttle_override')
 									_ai_shell_index = max(0, int(_ai_order.get('shell_index', 0) or 0))
-									if not getattr(m_veh, '_offh_ai_logged', False):
-										from gui.mods.offhangar.bot_ai import route_summary
-										m_veh._offh_ai_logged = True
-										LOG_DEBUG('OfflineBattle.SMART_AI bot=%s team=%s %s' % (
-											eid, my_team, route_summary(_ai_director, eid)))
 								except Exception as _ai_bot_error:
 									if not getattr(m_veh, '_offh_ai_error_logged', False):
 										m_veh._offh_ai_error_logged = True
@@ -8529,12 +8844,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_face_dx = face_pos[0] - m_veh.position.x
 							_face_dz = face_pos[2] - m_veh.position.z
 							_face_dist = math.sqrt(_face_dx*_face_dx + _face_dz*_face_dz)
-							_dc = (getattr(m_veh, '_dbg_ctr', 0) or 0)
-							if _dc % 200 == 0:
-								LOG_DEBUG('BOT_AI eid=%s vel=%.2f drive=%.1f enemy=%.1f tgt=%s mode=%s escape=%s' % (
-									str(eid), m_veh._veh_velocity, dist, _enemy_dist,
-									str(_ai_target_id), _ai_order.get('combat_mode') if _ai_order else 'safe_hold',
-									str(getattr(m_veh, '_wall_escape', 0))))
 
 							# PHYSICS PARAMS: same law module as the player, derived ONCE
 							# per bot from its real descriptor (the old inline block
@@ -8574,10 +8883,35 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								if (_driver_eid == eid or _driver_vehicle is None or
 								        not getattr(_driver_vehicle, 'isAlive', False)):
 									continue
-								_driver_neighbours.append((
-									float(_driver_vehicle.position.x),
-									float(_driver_vehicle.position.y),
-									float(_driver_vehicle.position.z)))
+								_driver_dx = float(_driver_vehicle.position.x) - float(m_veh.position.x)
+								_driver_dy = float(_driver_vehicle.position.y) - float(m_veh.position.y)
+								_driver_dz = float(_driver_vehicle.position.z) - float(m_veh.position.z)
+								# Local OBB prediction has no value for distant or vertically
+								# separated vehicles. Filter before descriptor and dict work.
+								if (abs(_driver_dy) > 5.0 or
+								        _driver_dx * _driver_dx + _driver_dz * _driver_dz > 576.0):
+									continue
+								_driver_td = getattr(_driver_vehicle, 'typeDescriptor', None)
+								_driver_half_length, _driver_half_width = _offh_ai_hull_dims(_driver_td)
+								_driver_speed = float(getattr(_driver_vehicle, '_veh_velocity', 0.0) or 0.0)
+								_driver_neighbours.append({
+									'position': (
+										float(_driver_vehicle.position.x),
+										float(_driver_vehicle.position.y),
+										float(_driver_vehicle.position.z)),
+									'yaw': float(_driver_vehicle.yaw),
+									'velocity': (
+										math.sin(float(_driver_vehicle.yaw)) * _driver_speed,
+										0.0,
+										math.cos(float(_driver_vehicle.yaw)) * _driver_speed),
+									'half_length': _driver_half_length,
+									'half_width': _driver_half_width,
+								})
+							_own_half_length, _own_half_width = _offh_ai_hull_dims(_td)
+							_own_velocity = (
+								math.sin(float(m_veh.yaw)) * float(m_veh._veh_velocity),
+								0.0,
+								math.cos(float(m_veh.yaw)) * float(m_veh._veh_velocity))
 							_driver_order = _offh_ai_driver().drive(
 								eid,
 								(float(m_veh.position.x), float(m_veh.position.y),
@@ -8586,7 +8920,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								(float(drive_pos[0]), float(drive_pos[1]), float(drive_pos[2])),
 								_driver_neighbours,
 								lambda _driver_yaw: _offh_ai_direction_clear(
-									m_veh, _driver_yaw))
+									m_veh, _driver_yaw),
+								_own_velocity, _own_half_length, _own_half_width)
 							throttle = float(_driver_order.get('throttle', 0.0))
 							turn_dir = float(_driver_order.get('turn', 0.0))
 							target_yaw = float(_driver_order.get('target_yaw', _raw_target_yaw))
@@ -8599,8 +8934,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							        abs(diff_yaw) < 0.65):
 								throttle = float(_ai_throttle_override)
 
-							m_veh._dbg_ctr = (getattr(m_veh, '_dbg_ctr', 0) or 0) + 1
-							
 							# IMMOBILIZATION CHECK
 							_dev_hp = getattr(m_veh, 'devices_hp', None)
 							# is_tracked = locked tracks (handbrake below), a dead engine only coasts.
