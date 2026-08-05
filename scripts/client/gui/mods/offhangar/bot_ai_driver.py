@@ -224,6 +224,14 @@ class LocalDriver(object):
 				other_length = float(neighbour.get('half_length', half_length) or half_length)
 				other_width = float(neighbour.get('half_width', half_width) or half_width)
 			other_vx, other_vz = self._velocity(other_velocity)
+			# Spawn formations can place two hull boxes slightly inside each other.
+			# Treating that existing overlap as a future collision rejects every
+			# steering candidate, so all bots stop and enter the recovery turn loop.
+			# Separation steering already handles this case; predictive vetoes resume
+			# as soon as the hulls have moved apart.
+			if self._obb_overlap(position, candidate_yaw, half_length, half_width,
+					other, other_yaw, other_length, other_width):
+				continue
 			for horizon in (0.35, 0.75, 1.20):
 				own = (float(position[0]) + own_vx * horizon, 0.0,
 				       float(position[2]) + own_vz * horizon)

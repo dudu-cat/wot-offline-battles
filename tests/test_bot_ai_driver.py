@@ -101,6 +101,26 @@ class BotAIDriverTest(unittest.TestCase):
         )
         self.assertTrue(stacked)
 
+    def test_spawn_overlap_uses_separation_instead_of_deadlocking(self):
+        driver = self.module.LocalDriver()
+        close_leader = [{
+            "position": (0.0, 0.0, 5.0),
+            "yaw": 0.0,
+            "velocity": (0.0, 0.0, 0.0),
+            "half_length": 3.5,
+            "half_width": 1.7,
+        }]
+
+        order = driver.drive(
+            88, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+            (0.0, 0.0, 50.0), close_leader, lambda angle: True,
+            None, 3.5, 1.7,
+        )
+
+        self.assertEqual("avoid", order["recovery_mode"])
+        self.assertGreater(order["throttle"], 0.0)
+        self.assertGreater(abs(order["turn"]), 0.5)
+
     def test_failed_direction_is_penalized_until_its_ttl_expires(self):
         driver = self.module.LocalDriver(failure_ttl=0.5)
         initial = driver.drive(55, (0.0, 0.0, 0.0), 0.0, 2.0, 0.1,

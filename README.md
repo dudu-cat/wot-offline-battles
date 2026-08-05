@@ -31,7 +31,7 @@ does not switch back to the legacy chase logic.
 
 Install
 -------
-For the downloadable v1.0.0 release, open `START_HERE.txt`: close the game,
+For the downloadable v1.0.1 release, open `START_HERE.txt`: close the game,
 delete or move aside the old `res_mods\0.8.2`, then drag the package's complete
 `0.8.2` folder into the game's `res_mods` folder. The release also includes
 double-clickable Windows and macOS LAN-server launchers.

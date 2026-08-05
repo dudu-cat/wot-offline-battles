@@ -1,4 +1,4 @@
-World of Tanks 0.8.2 Offline/LAN v1.0.0
+World of Tanks 0.8.2 Offline/LAN v1.0.1
 ========================================
 
 This package does NOT contain the World of Tanks client. You must already have

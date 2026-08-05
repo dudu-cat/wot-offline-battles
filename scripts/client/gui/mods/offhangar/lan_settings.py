@@ -30,6 +30,7 @@ _diagnostic_logged = False
 _entry_panel = None
 _entry_text = None
 _entry_script = None
+_entry_hovered = False
 _entry_poll_scheduled = False
 _game_key_hook_installed = False
 
@@ -99,40 +100,45 @@ def _notify(message, level='information'):
 		return False
 
 
+def _set_native_cursor_visible(visible):
+	"""Show BigWorld's pointer over native GUI layered above lobby Scaleform.
+
+	The 0.8.2 lobby renders its normal pointer inside Flash and deliberately keeps
+	``GUI.mcursor`` hidden. Native GUI roots cover that Flash pointer, so they must
+	show the engine cursor while they own the mouse, then restore the hidden
+	Scaleform-compatible cursor instead of switching to ``BigWorld.dcursor``.
+	"""
+	try:
+		import BigWorld, GUI
+		cursor = GUI.mcursor()
+		BigWorld.setCursor(cursor)
+		cursor.visible = bool(visible)
+		return True
+	except Exception:
+		return False
+
+
 def _acquire_cursor():
 	global _cursor_acquired
 	if _cursor_acquired:
-		return
-	try:
-		# gui.Cursor.showCursor is the exact reference-counted API used by the
-		# 0.8.2 client. It switches BigWorld to GUI.mcursor and makes it visible.
-		from gui.Cursor import showCursor
-		showCursor(True)
-		_cursor_acquired = True
-	except Exception:
 		try:
-			import BigWorld, GUI
-			BigWorld.setCursor(GUI.mcursor())
-			GUI.mcursor().visible = True
-			_cursor_acquired = True
+			import GUI
+			if not GUI.mcursor().visible:
+				_set_native_cursor_visible(True)
 		except Exception:
-			_log_error('LAN settings could not show the mouse cursor')
+			_set_native_cursor_visible(True)
+		return
+	if _set_native_cursor_visible(True):
+		_cursor_acquired = True
+	else:
+		_log_error('LAN settings could not show the mouse cursor')
 
 
 def _release_cursor():
 	global _cursor_acquired
 	if not _cursor_acquired:
 		return
-	try:
-		from gui.Cursor import showCursor
-		showCursor(False)
-	except Exception:
-		try:
-			import BigWorld, GUI
-			GUI.mcursor().visible = False
-			BigWorld.setCursor(BigWorld.dcursor())
-		except Exception:
-			pass
+	_set_native_cursor_visible(False)
 	_cursor_acquired = False
 
 
@@ -163,9 +169,16 @@ class _EntryScript(object):
 		return True
 
 	def handleMouseEnterEvent(self, component):
+		global _entry_hovered
+		_entry_hovered = True
+		_set_native_cursor_visible(True)
 		return True
 
 	def handleMouseLeaveEvent(self, component):
+		global _entry_hovered
+		_entry_hovered = False
+		if not _active:
+			_set_native_cursor_visible(False)
 		return True
 
 	def handleMouseButtonEvent(self, component, event):
@@ -259,12 +272,16 @@ def _refresh_entry():
 
 
 def _set_entry_visible(value):
+	global _entry_hovered
 	if _entry_panel is not None:
 		_safe_set(_entry_panel, 'visible', bool(value))
 	if _entry_text is not None:
 		_safe_set(_entry_text, 'visible', bool(value))
 	if value:
 		_refresh_entry()
+	elif _entry_hovered and not _active:
+		_entry_hovered = False
+		_set_native_cursor_visible(False)
 
 
 def _make_entry():
@@ -564,6 +581,7 @@ def _refresh():
 	_safe_set(_panel, 'visible', True)
 	_set_controls_visible(True)
 	_paint_controls()
+	_acquire_cursor()
 
 
 def open():
@@ -577,7 +595,9 @@ def open():
 		return False
 	_active = True
 	_acquire_cursor()
-	_safe_set(_panel, 'focus', True)
+	# The full-window background must not win hit testing over its child controls.
+	# Keyboard input already arrives through the global game hook.
+	_safe_set(_panel, 'focus', False)
 	_set_entry_visible(False)
 	_refresh()
 	_log_note('LAN settings panel opened')
@@ -585,8 +605,9 @@ def open():
 
 
 def close():
-	global _active
+	global _active, _entry_hovered
 	_active = False
+	_entry_hovered = False
 	if _panel is not None:
 		_safe_set(_panel, 'visible', False)
 		_safe_set(_panel, 'focus', False)

@@ -1,4 +1,4 @@
-World of Tanks 0.8.2 Offline/LAN v1.0.0 (protocol 5)
+World of Tanks 0.8.2 Offline/LAN v1.0.1 (protocol 5)
 =====================================================
 
 Read START_HERE.txt for the shortest installation and startup path.

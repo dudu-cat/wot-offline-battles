@@ -11,6 +11,20 @@ SETTINGS_PATH = ROOT / "scripts/client/gui/mods/offhangar/lan_settings.py"
 
 def load_settings_module():
     roots = []
+    cursor_calls = []
+
+    class MouseCursor:
+        def __init__(self):
+            self._visible = False
+
+        @property
+        def visible(self):
+            return self._visible
+
+        @visible.setter
+        def visible(self, value):
+            self._visible = bool(value)
+            cursor_calls.append(bool(value))
 
     class Component:
         def __init__(self, texture=None):
@@ -29,6 +43,8 @@ def load_settings_module():
     gui_engine.Text = Component
     gui_engine.addRoot = lambda component: roots.append(component)
     gui_engine.reSort = lambda: None
+    mouse_cursor = MouseCursor()
+    gui_engine.mcursor = lambda: mouse_cursor
     sys.modules["GUI"] = gui_engine
 
     player = types.SimpleNamespace(isOffline=True, _offhangar_network_client=None)
@@ -58,9 +74,8 @@ def load_settings_module():
     logging.LOG_ERROR = lambda *args: None
     sys.modules[logging.__name__] = logging
 
-    cursor_calls = []
     cursor = types.ModuleType("gui.Cursor")
-    cursor.showCursor = lambda visible: cursor_calls.append(visible)
+    cursor.showCursor = lambda visible: None
     sys.modules[cursor.__name__] = cursor
 
     notices = []
@@ -98,6 +113,7 @@ class LANSettingsTest(unittest.TestCase):
         self.assertEqual("PIXEL", self.settings._panel.widthMode)
         self.assertEqual((720, 360), (self.settings._panel.width, self.settings._panel.height))
         self.assertEqual([self.settings._panel], self.roots)
+        self.assertFalse(self.settings._panel.focus)
         self.assertTrue(
             all(control.parent is self.settings._panel for control in self.settings._controls.values())
         )
@@ -126,6 +142,16 @@ class LANSettingsTest(unittest.TestCase):
         self.assertEqual([True, False], self.cursor_calls)
         self.assertTrue(all(not control.visible for control in self.settings._controls.values()))
         self.assertTrue(all(not label.visible for label in self.settings._labels.values()))
+
+    def test_garage_entry_shows_a_native_cursor_only_while_hovered(self):
+        self.assertTrue(self.settings._make_entry())
+        script = self.settings._entry_panel.script
+
+        script.handleMouseEnterEvent(self.settings._entry_panel)
+        self.assertEqual([True], self.cursor_calls)
+
+        script.handleMouseLeaveEvent(self.settings._entry_panel)
+        self.assertEqual([True, False], self.cursor_calls)
 
     def test_clicking_a_field_makes_the_first_typed_digit_replace_it(self):
         self.settings.open()
