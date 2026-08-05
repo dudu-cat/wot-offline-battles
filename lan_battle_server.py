@@ -972,8 +972,16 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         if server.state.update_bot_manifest(player.player_id, message):
                             routed = sum(1 for entry in server.state.bot_manifest
                                          if entry.get("route", {}).get("waypoints"))
-                            _server_log("BOT MANIFEST authority=%d bots=%d routes=%d" % (
-                                player.player_id, len(server.state.bot_manifest), routed))
+                            lanes = {}
+                            for entry in server.state.bot_manifest:
+                                route_id = str(entry.get("route", {}).get("id") or "none")
+                                key = "t%d:%s" % (int(entry.get("team", 0)), route_id)
+                                lanes[key] = lanes.get(key, 0) + 1
+                            lane_text = ",".join("%s=%d" % item
+                                                     for item in sorted(lanes.items()))
+                            _server_log("BOT MANIFEST authority=%d bots=%d routes=%d lanes=%s" % (
+                                player.player_id, len(server.state.bot_manifest), routed,
+                                lane_text or "none"))
                         else:
                             _server_log("BOT MANIFEST rejected sender=%d" % player.player_id)
                     elif message.get("type") == "bot_state":

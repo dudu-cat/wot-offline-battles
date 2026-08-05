@@ -77,12 +77,35 @@ class BotAITest(unittest.TestCase):
         self.assertFalse(self.ai.bot_initially_visible(2, 1, True))
         self.assertTrue(self.ai.bot_initially_visible(1, 1, True))
         self.assertTrue(self.ai.bot_initially_visible(2, 1, False))
+        self.assertFalse(self.ai.entity_visible_to_minimap(
+            types.SimpleNamespace(_spot_visible=False)
+        ))
+        self.assertTrue(self.ai.entity_visible_to_minimap(
+            types.SimpleNamespace(_spot_visible=True)
+        ))
 
         battle_source = (
             ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
         ).read_text()
         self.assertGreaterEqual(battle_source.count("vehicle_in_battle_tier_band"), 3)
         self.assertIn("e_mock._spot_visible = bot_initially_visible(", battle_source)
+        self.assertIn("if not _offh_minimap_visible(value):", battle_source)
+
+    def test_lakeville_lane_capacities_force_a_balanced_split(self):
+        director = self.ai.BattleDirector("07_lakeville", "lane-capacity")
+        for bot_id in range(1, 15):
+            director.register(
+                bot_id, 1, descriptor("heavyTank", armor=200.0),
+                "Heavy %s" % bot_id,
+            )
+        counts = {}
+        for agent in director.agents.values():
+            route_id = agent["route"]["id"]
+            counts[route_id] = counts.get(route_id, 0) + 1
+
+        self.assertEqual(
+            {"east_town": 5, "lake_road": 5, "middle_ridge": 4}, counts
+        )
 
     def test_routes_start_at_own_flag_and_finish_at_enemy_flag(self):
         for map_name, tactical_map in self.maps.TACTICAL_MAPS.items():

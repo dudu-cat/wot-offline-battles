@@ -4702,6 +4702,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		# no bot ever reached the minimap. Wrap the dict: real entities first,
 		# then the mock registry; enumeration stays original-only (engine-safe).
 		if not getattr(BigWorld, '_offh_entities_wrapped', False):
+			try:
+				from gui.mods.offhangar.bot_ai import entity_visible_to_minimap as _offh_minimap_visible
+			except Exception:
+				_offh_minimap_visible = lambda entity: getattr(entity, '_spot_visible', True)
 			class _OffhEntities(object):
 				def __init__(self, orig):
 					self._o = orig
@@ -4715,7 +4719,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						raise
 				def get(self, k, d=None):
 					try:
-						return self[k]
+						value = self[k]
+						# Stock minimap.__detectLocation uses entities.get(). Hiding an
+						# unspotted mock here prevents arena.onVehicleAdded from creating
+						# an enemy icon. notifyVehicleStart uses __getitem__, so the icon
+						# still appears normally on the first real spot.
+						if not _offh_minimap_visible(value):
+							return d
+						return value
 					except KeyError:
 						return d
 				def __contains__(self, k):

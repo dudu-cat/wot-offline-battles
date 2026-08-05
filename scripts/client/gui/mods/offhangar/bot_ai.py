@@ -48,6 +48,11 @@ def bot_initially_visible(bot_team, player_team, spotting_enabled):
 		return not bool(spotting_enabled)
 
 
+def entity_visible_to_minimap(entity):
+	"""Expose a mock entity to the minimap only after its first spot."""
+	return bool(getattr(entity, '_spot_visible', True))
+
+
 def route_toward_enemy(route, team, bases):
 	"""Orient a multi-point route from the own flag to the enemy flag."""
 	result = dict(route or {})
@@ -373,6 +378,17 @@ class BattleDirector(object):
 		routes = self._routes_for(agent['team'])
 		if not routes:
 			return None
+		# Capacities are a lane distribution contract, not a soft preference.
+		# Without this gate a strongly specialised lineup can all choose the same
+		# corridor even though the map advertises several viable approaches.
+		open_routes = []
+		for route in routes:
+			key = (agent['team'], route.get('id'))
+			capacity = max(1, int(route.get('capacity', 1)))
+			if int(self.route_usage.get(key, 0)) < capacity:
+				open_routes.append(route)
+		if open_routes:
+			routes = tuple(open_routes)
 		profile = agent['profile']
 		personality = agent['personality']
 		best = None
