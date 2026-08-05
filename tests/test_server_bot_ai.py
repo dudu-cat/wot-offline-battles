@@ -3,7 +3,9 @@ import threading
 import time
 import unittest
 
-from lan_battle_server import BattleState, ClientHandler, Player, PROTOCOL_VERSION
+from lan_battle_server import (
+    BattleState, CLIENT_BUILD_0922, ClientHandler, Player, PROTOCOL_VERSION,
+)
 from server_bot_ai import BotPlanner
 
 
@@ -65,9 +67,22 @@ class ServerBotPlannerTests(unittest.TestCase):
         return state
 
     def test_map_pool_is_unique_and_invalid_fixed_map_fails_early(self):
-        from lan_battle_server import MAP_POOL
+        from lan_battle_server import MAP_POOL, MAP_POOL_082, MAP_POOL_0922
 
         self.assertEqual(len(MAP_POOL), len(set(MAP_POOL)))
+        self.assertEqual(33, len(MAP_POOL_082))
+        self.assertEqual(42, len(MAP_POOL_0922))
+        self.assertEqual({
+            "03_campania", "15_komarin", "39_crimea",
+            "42_north_america", "51_asia",
+        }, set(MAP_POOL_082) - set(MAP_POOL_0922))
+        self.assertEqual({
+            "59_asia_great_wall", "63_tundra", "73_asia_korea",
+            "83_kharkiv", "84_winter", "86_himmelsdorf_winter",
+            "92_stalingrad", "95_lost_city", "100_thepit", "101_dday",
+            "103_ruinberg_winter", "112_eiffel_tower_ctf", "114_czech",
+            "217_er_alaska",
+        }, set(MAP_POOL_0922) - set(MAP_POOL_082))
         with self.assertRaises(ValueError):
             BattleState(map_name="not_a_standard_map")
 
@@ -703,6 +718,7 @@ class ServerBotPlannerTests(unittest.TestCase):
                 self.chunks = [
                     (json.dumps({
                         "type": "hello", "protocol": PROTOCOL_VERSION,
+                        "client_build": CLIENT_BUILD_0922,
                         "name": "Alpha", "vehicle": "ussr:T-34",
                     }) + "\n").encode("utf-8"),
                     b"[]\n",
@@ -751,6 +767,7 @@ class ServerBotPlannerTests(unittest.TestCase):
                 self.chunks = [
                     (json.dumps({
                         "type": "hello", "protocol": PROTOCOL_VERSION,
+                        "client_build": CLIENT_BUILD_0922,
                         "name": "Alpha", "vehicle": "ussr:T-34",
                     }) + "\n").encode("utf-8"),
                     b'{"type":"leave"}\n',

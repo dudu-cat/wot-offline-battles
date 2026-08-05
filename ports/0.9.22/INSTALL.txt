@@ -1,4 +1,4 @@
-World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.2
+World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.3
 ================================================================
 
 This folder is directly mergeable into the frozen Chinese HD client root.
@@ -8,6 +8,10 @@ server, including when there is only one player.
 Use `lan_battle_server.py` from the same repository checkpoint as this package.
 The v5 message schema is round-scoped and stricter than older v5 packages, so
 mixing an old client and new server (or the reverse) is unsupported.
+This #1513 client identifies its build during the LAN handshake. The first
+client pins an empty server room to one build; a legacy 0.8.2 client cannot join
+that room because its map and coordinate contracts are different. Use another
+server port for a simultaneous 0.8.2 room.
 
 Install
 -------
@@ -22,7 +26,7 @@ Install
 3. Copy this folder's `mods` directory into the game root.
 4. Confirm this file exists:
 
-       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.2.wotmod
+       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.3.wotmod
 
 5. This copy-ready package includes:
 
@@ -51,6 +55,9 @@ Start a battle
 4. The stock training settings window opens as soon as the hangar is ready,
    even when the server is not running. Its Description field contains
    `LAN SERVER: host:port`; edit it if the server address changed.
+   Only this stock window is reused as the LAN settings and map-selection UI;
+   the mod does not create a retail training room or contact its prebattle
+   service.
 5. Choose a standard (`ctf`) map with the mouse and use the window's normal
    primary action. The address is saved and the selected map starts once the
    server accepts the connection.
@@ -66,7 +73,7 @@ Troubleshooting
 ---------------
 
 - `unsupported compression type`: an older or incorrectly compressed wotmod
-  is still present. Keep only the 0.3.2 package; its members use Store method.
+  is still present. Keep only the 0.3.3 package; its members use Store method.
 - No connection in the server terminal: check `config.json`, the host LAN IP,
   virtual-machine network mode and TCP 28782 firewall access.
 - A traceback appears: close the client and keep `python.log`; it identifies the

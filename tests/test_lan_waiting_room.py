@@ -5,22 +5,28 @@ import time
 import unittest
 
 from lan_battle_server import (
-    BattleState, ClientHandler, PROTOCOL_VERSION, TICK_HZ, ThreadedTCPServer,
+    BattleState, CLIENT_BUILD_082, CLIENT_BUILD_0922, ClientHandler,
+    MAP_POOL_082, MAP_POOL_0922, PROTOCOL_VERSION, TICK_HZ,
+    ThreadedTCPServer,
 )
 
 
 class WireClient:
-    def __init__(self, port, name, vehicle="ussr:T-34", max_health=880):
+    def __init__(self, port, name, vehicle="ussr:T-34", max_health=880,
+                 client_build=CLIENT_BUILD_0922):
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=2)
         self.sock.settimeout(2)
         self.buffer = b""
-        self.send({
+        hello = {
             "type": "hello",
             "protocol": PROTOCOL_VERSION,
             "name": name,
             "vehicle": vehicle,
             "max_health": max_health,
-        })
+        }
+        if client_build is not None:
+            hello["client_build"] = client_build
+        self.send(hello)
 
     def send(self, message):
         payload = (json.dumps(message) + "\n").encode("utf-8")
@@ -86,13 +92,71 @@ class WaitingRoomTest(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
 
-    def connect(self, name):
-        client = WireClient(self.port, name)
+    def connect(self, name, client_build=CLIENT_BUILD_0922):
+        client = WireClient(self.port, name, client_build=client_build)
         self.clients.append(client)
         return client
 
     def test_server_snapshots_run_at_thirty_hz(self):
         self.assertEqual(30.0, TICK_HZ)
+
+    def test_room_is_pinned_to_one_client_build_and_its_exact_map_pool(self):
+        modern = self.connect("Modern")
+        welcome = modern.receive_type("welcome")
+        modern.receive_type("roster")
+
+        self.assertEqual(CLIENT_BUILD_0922, welcome["client_build"])
+        self.assertEqual(list(MAP_POOL_0922), welcome["map_pool"])
+        self.assertNotIn("03_campania", welcome["map_pool"])
+
+        legacy = self.connect("Legacy", client_build=None)
+        rejected = legacy.receive_type("error")
+        self.assertEqual("incompatible_client_build", rejected["code"])
+
+    def test_legacy_hello_needs_no_new_field_and_receives_082_maps(self):
+        legacy = self.connect("Legacy", client_build=None)
+        welcome = legacy.receive_type("welcome")
+
+        self.assertEqual(CLIENT_BUILD_082, welcome["client_build"])
+        self.assertEqual(list(MAP_POOL_082), welcome["map_pool"])
+        self.assertIn("03_campania", welcome["map_pool"])
+        self.assertNotIn("59_asia_great_wall", welcome["map_pool"])
+
+    def test_unknown_explicit_client_build_is_rejected(self):
+        client = self.connect("Unknown", client_build="wot-unknown")
+        rejected = client.receive_type("error")
+        self.assertEqual("unsupported_client_build", rejected["code"])
+
+    def test_empty_room_can_be_reused_by_the_other_client_build(self):
+        modern = self.connect("Modern")
+        modern.receive_type("welcome")
+        modern.close()
+        self.clients.remove(modern)
+        deadline = time.time() + 2
+        while self.state.client_build is not None and time.time() < deadline:
+            time.sleep(0.01)
+
+        legacy = self.connect("Legacy", client_build=None)
+        welcome = legacy.receive_type("welcome")
+        self.assertEqual(CLIENT_BUILD_082, welcome["client_build"])
+
+    def test_fixed_map_unavailable_to_the_joining_build_is_rejected(self):
+        state = BattleState(map_name="03_campania", max_players=30)
+        server = ThreadedTCPServer(("127.0.0.1", 0), ClientHandler)
+        server.game_server = type("GameServer", (), {"state": state})()
+        thread = threading.Thread(target=server.serve_forever)
+        thread.daemon = True
+        thread.start()
+        client = WireClient(
+            server.server_address[1], "Modern", client_build=CLIENT_BUILD_0922)
+        try:
+            rejected = client.receive_type("error")
+            self.assertEqual("map_not_available_for_client", rejected["code"])
+        finally:
+            client.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     def test_one_player_can_start_from_clickable_panel_request(self):
         client = self.connect("Solo")

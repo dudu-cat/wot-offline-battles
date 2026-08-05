@@ -65,6 +65,7 @@ def _load_runtime():
     import constants
     from OfflineMapCreator import g_offlineMapCreator
     from gun_rotation_shared import encodeGunAngles
+    from gui.app_loader import g_appLoader
     from gui.mods.offline_lan_0922.compat import g_compatibility
     from items import vehicles
 
@@ -73,6 +74,7 @@ def _load_runtime():
 
     runtime = Runtime()
     runtime.account_commands = AccountCommands
+    runtime.app_loader = g_appLoader
     runtime.arena_cache = ArenaType.g_cache
     runtime.bigworld = BigWorld
     runtime.compatibility = g_compatibility
@@ -210,13 +212,14 @@ class BattleRuntime(object):
             self._runtime.compatibility.configure_battle(
                 getattr(constants.ARENA_GUI_TYPE, 'RANDOM', 0),
                 getattr(constants.ARENA_BONUS_TYPE, 'REGULAR', 0))
+            self._retire_lobby_entities()
             # OfflineMapCreator.create() catches some native setup failures and
             # only calls cancel(), which resets ids but does not clear the
             # partially-created Avatar or space.  Remember the attempt before
             # entering stock code so every exit can run its stronger destroy()
             # rollback, even when Active() is already false afterward.
             self._map_create_attempted = True
-            self._runtime.offline_map_creator.create(self._config['map'])
+            self._create_native_battle_map(self._config['map'])
             if not self._runtime.offline_map_creator.Active():
                 raise RuntimeError('stock OfflineMapCreator rejected the map')
             self._avatar = self._runtime.bigworld.player()
@@ -230,12 +233,117 @@ class BattleRuntime(object):
                     self._avatar, '_offlineLANPlayerReady', False):
                 raise RuntimeError(
                     'stock OfflineMapCreator did not promote its Avatar')
+            # From this point onward every stock Avatar branch must see a real
+            # battle, not the viewer mode used by OfflineMapCreator.  destroy()
+            # does not require Active(), so it still owns the exact space ids.
+            self._runtime.offline_map_creator.SetActive(False)
             self.state = 'loading_space'
             self._schedule(0.05, self._wait_for_space)
             return True
         except Exception as error:
             self._fail(error)
             return False
+
+    def _retire_lobby_entities(self):
+        """Cross the same Account-to-Avatar boundary as the #1513 observer.
+
+        BigWorld cannot safely promote a client-only Avatar while the lobby
+        Account and hangar space are still alive.  The public 0.9.22 observer
+        clears them before creating its Avatar; retaining the Account here can
+        terminate the native process before Python gets a traceback.
+        """
+        clear = getattr(
+            self._runtime.bigworld, 'clearEntitiesAndSpaces', None)
+        if not callable(clear):
+            raise RuntimeError(
+                'BigWorld.clearEntitiesAndSpaces is unavailable')
+        # Keep Account.g_accountRepository alive deliberately.  Exact #1513
+        # PlayerAvatar.__init__ reuses its syncData, intUserSettings and
+        # prebattleInvitations; the public observer creates that repository
+        # when necessary instead of deleting it during this transition.
+        clear()
+        try:
+            player = self._runtime.bigworld.player()
+        except ReferenceError:
+            player = None
+        if player is not None:
+            raise RuntimeError('lobby Account survived battle transition')
+
+    def _create_native_battle_map(self, map_name):
+        """Use stock map bookkeeping without starting its viewer UI.
+
+        OfflineMapCreator is a map-viewer helper: it opens the battle page
+        before loading, then replaces the battle camera and leaves the GUI
+        visibility watcher disabled.  The LAN runtime intentionally starts the
+        normal PlayerAvatar battle session, whose ArenaLoadController owns the
+        eventual battle page.  Both viewer-only steps are suppressed here.
+        The stock helper still owns space creation, geometry mapping, Avatar
+        properties and teardown ids.
+        """
+        creator = self._runtime.offline_map_creator
+        setup_name = '_OfflineMapCreator__setupCamera'
+        original_setup = getattr(creator, setup_name, None)
+        if not callable(original_setup):
+            raise RuntimeError(
+                'OfflineMapCreator viewer-camera boundary is unavailable')
+        creator_dict = getattr(creator, '__dict__', {})
+        had_instance_setup = setup_name in creator_dict
+        original_instance_setup = creator_dict.get(setup_name)
+
+        app_loader = self._runtime.app_loader
+        page_name = 'showBattlePage'
+        original_show_page = getattr(app_loader, page_name, None)
+        if not callable(original_show_page):
+            raise RuntimeError(
+                'OfflineMapCreator battle-page boundary is unavailable')
+        # Exact _AppLoader uses __slots__, so its instance cannot be patched.
+        # Patch the defining class for this synchronous create() window.  Read
+        # and restore the raw class attribute to avoid Python 2 bound-method
+        # wrappers and never overwrite another patch installed meanwhile.
+        loader_type = type(app_loader)
+        loader_dict = getattr(loader_type, '__dict__', {})
+        had_class_show_page = page_name in loader_dict
+        original_class_show_page = loader_dict.get(page_name)
+
+        bigworld = self._runtime.bigworld
+
+        def defer_battle_page(unused_app_loader):
+            return None
+
+        def finish_native_setup():
+            set_watcher = getattr(bigworld, 'setWatcher', None)
+            if callable(set_watcher):
+                set_watcher('Visibility/GUI', True)
+
+        setattr(loader_type, page_name, defer_battle_page)
+        try:
+            setattr(creator, setup_name, finish_native_setup)
+            try:
+                creator.create(map_name)
+            finally:
+                current_setup = getattr(
+                    creator, '__dict__', {}).get(setup_name)
+                if current_setup is finish_native_setup:
+                    if had_instance_setup:
+                        setattr(
+                            creator, setup_name, original_instance_setup)
+                    else:
+                        try:
+                            delattr(creator, setup_name)
+                        except AttributeError:
+                            pass
+        finally:
+            current_show_page = getattr(
+                loader_type, '__dict__', {}).get(page_name)
+            if current_show_page is defer_battle_page:
+                if had_class_show_page:
+                    setattr(
+                        loader_type, page_name, original_class_show_page)
+                else:
+                    try:
+                        delattr(loader_type, page_name)
+                    except AttributeError:
+                        pass
 
     def _standard_arena(self, map_name):
         for unused_id, arena_type in self._runtime.arena_cache.items():

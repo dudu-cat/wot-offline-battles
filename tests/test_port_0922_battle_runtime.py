@@ -200,16 +200,51 @@ class _Compatibility(object):
         return object()
 
 
+class _AppLoader(object):
+    __slots__ = (
+        '__state', '__ctx', '__appFactory',
+        'onGUISpaceLeft', 'onGUISpaceEntered')
+
+    battle_page_calls = mock.Mock(return_value=True)
+    lobby_callback = None
+
+    def showBattlePage(self):
+        return type(self).battle_page_calls()
+
+    def showLobby(self):
+        callback = type(self).lobby_callback
+        if callable(callback):
+            return callback()
+        return True
+
+
+_APP_LOADER_SHOW_BATTLE_PAGE = _AppLoader.__dict__['showBattlePage']
+_APP_LOADER_SHOW_LOBBY = _AppLoader.__dict__['showLobby']
+
+
 class _OfflineMap(object):
-    def __init__(self, bigworld=None):
+    def __init__(self, bigworld=None, app_loader=None):
         self.active = False
         self.bigworld = bigworld
+        self.app_loader = app_loader
+        self.viewer_camera_calls = 0
 
     def create(self, map_name):
+        if self.app_loader is not None:
+            self.app_loader.showBattlePage()
+        if self.bigworld is not None:
+            self.bigworld.operations.append(('map_create', map_name))
         self.active = True
         self.map_name = map_name
         if self.bigworld is not None and self.bigworld.avatar is None:
             self.bigworld.avatar = _Avatar()
+        self._OfflineMapCreator__setupCamera()
+
+    def _OfflineMapCreator__setupCamera(self):
+        self.viewer_camera_calls += 1
+
+    def SetActive(self, active):
+        self.active = bool(active)
 
     def Active(self):
         return self.active
@@ -226,6 +261,7 @@ class _BigWorld(object):
         self.compatibility = compatibility
         self.entities = {}
         self.callbacks = []
+        self.operations = []
         self.now = 10.0
         self.next_id = 100
 
@@ -264,8 +300,12 @@ class _BigWorld(object):
         return self.entities.get(entity_id)
 
     def clearEntitiesAndSpaces(self):
+        self.operations.append(('clear_entities_spaces',))
         self.entities.clear()
         self.avatar = None
+
+    def setWatcher(self, name, enabled):
+        self.operations.append(('watcher', name, enabled))
 
     def clearAllSpaces(self):
         self.clearEntitiesAndSpaces()
@@ -307,6 +347,11 @@ def _runtime():
     avatar = _Avatar()
     compatibility = _Compatibility()
     bigworld = _BigWorld(avatar, compatibility)
+    _AppLoader.showBattlePage = _APP_LOADER_SHOW_BATTLE_PAGE
+    _AppLoader.showLobby = _APP_LOADER_SHOW_LOBBY
+    app_loader = _AppLoader()
+    _AppLoader.battle_page_calls = mock.Mock(return_value=True)
+    _AppLoader.lobby_callback = None
     constants = types.SimpleNamespace(
         ARENA_GUI_TYPE=types.SimpleNamespace(RANDOM=1),
         ARENA_BONUS_TYPE=types.SimpleNamespace(REGULAR=2),
@@ -326,15 +371,119 @@ def _runtime():
             CMD_GET_AVATAR_SYNC=1, CMD_ADD_INT_USER_SETTINGS=2,
             CMD_DEL_INT_USER_SETTINGS=3),
         arena_cache={1: arena}, bigworld=bigworld,
-        app_loader=types.SimpleNamespace(showLobby=mock.Mock(return_value=True)),
+        app_loader=app_loader,
         compatibility=compatibility, constants=constants,
         encode_gun_angles=lambda *unused: 0,
         math=types.SimpleNamespace(Vector3=_Vector),
-        offline_map_creator=_OfflineMap(bigworld),
+        offline_map_creator=_OfflineMap(bigworld, app_loader),
         vehicles=types.SimpleNamespace(VehicleDescr=_VehicleDescr))
 
 
 class BattleRuntimeContractTests(unittest.TestCase):
+    def test_lobby_is_retired_before_native_map_without_viewer_camera(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
+
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, start, client))
+
+        self.assertEqual(
+            [('clear_entities_spaces',), ('map_create', '01_karelia'),
+             ('watcher', 'Visibility/GUI', True)],
+            runtime.bigworld.operations)
+        self.assertEqual(0, runtime.offline_map_creator.viewer_camera_calls)
+        self.assertFalse(hasattr(runtime.app_loader, '__dict__'))
+        type(runtime.app_loader).battle_page_calls.assert_not_called()
+        self.assertFalse(runtime.offline_map_creator.Active())
+        self.assertTrue(runtime.bigworld.avatar._offlineLANPlayerReady)
+
+        runtime.app_loader.showBattlePage()
+        type(runtime.app_loader).battle_page_calls.assert_called_once_with()
+
+    def test_missing_viewer_camera_boundary_fails_closed_and_restores_lobby(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        calls = []
+        runtime.offline_map_creator._OfflineMapCreator__setupCamera = None
+        runtime.offline_map_creator.create = mock.Mock()
+
+        def destroy():
+            calls.append('destroy')
+            runtime.bigworld.avatar = None
+
+        def restore():
+            self.assertIsNone(runtime.bigworld.avatar)
+            calls.append('restore')
+
+        runtime.offline_map_creator.destroy = destroy
+        runtime.compatibility.restore_lobby_account = restore
+
+        self.assertFalse(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {}, _Client()))
+
+        runtime.offline_map_creator.create.assert_not_called()
+        self.assertEqual(['destroy', 'restore'], calls)
+        self.assertEqual('failed', battle.state)
+        self.assertFalse(battle._map_create_attempted)
+
+    def test_missing_battle_page_boundary_fails_closed_and_restores_lobby(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        calls = []
+        type(runtime.app_loader).showBattlePage = None
+        runtime.offline_map_creator.create = mock.Mock()
+
+        def destroy():
+            calls.append('destroy')
+            runtime.bigworld.avatar = None
+
+        def restore():
+            self.assertIsNone(runtime.bigworld.avatar)
+            calls.append('restore')
+
+        runtime.offline_map_creator.destroy = destroy
+        runtime.compatibility.restore_lobby_account = restore
+
+        self.assertFalse(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {}, _Client()))
+
+        runtime.offline_map_creator.create.assert_not_called()
+        self.assertEqual(['destroy', 'restore'], calls)
+        self.assertEqual('failed', battle.state)
+        self.assertFalse(battle._map_create_attempted)
+
+    def test_battle_page_patch_does_not_overwrite_a_newer_class_patch(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+
+        def newer_show_battle_page(unused_loader):
+            return 'newer'
+
+        def replace_during_create(unused_map_name):
+            runtime.app_loader.showBattlePage()
+            type(runtime.app_loader).showBattlePage = \
+                newer_show_battle_page
+            runtime.offline_map_creator._OfflineMapCreator__setupCamera()
+
+        runtime.offline_map_creator.create = replace_during_create
+
+        battle._create_native_battle_map('01_karelia')
+
+        self.assertIs(
+            newer_show_battle_page,
+            type(runtime.app_loader).__dict__['showBattlePage'])
+        self.assertEqual('newer', runtime.app_loader.showBattlePage())
+
     def test_map_to_native_vehicle_to_ready_lifecycle(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -579,7 +728,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.offline_map_creator.destroy = lambda: calls.append('destroy')
         runtime.compatibility.restore_lobby_account = (
             lambda: calls.append('restore'))
-        runtime.app_loader.showLobby = lambda: calls.append('lobby')
+        type(runtime.app_loader).lobby_callback = lambda: calls.append(
+            'lobby')
 
         battle.stop(show_login=False)
 
@@ -653,6 +803,11 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         calls = []
+        original_clear = runtime.bigworld.clearEntitiesAndSpaces
+
+        def clear_lobby():
+            calls.append('clear')
+            original_clear()
 
         def partial_create(unused_map_name):
             runtime.bigworld.avatar = object()
@@ -669,12 +824,13 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.offline_map_creator.create = partial_create
         runtime.offline_map_creator.destroy = full_destroy
         runtime.compatibility.restore_lobby_account = restore
+        runtime.bigworld.clearEntitiesAndSpaces = clear_lobby
 
         self.assertFalse(battle.start({
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, {}, _Client()))
 
-        self.assertEqual(['destroy', 'restore'], calls)
+        self.assertEqual(['clear', 'destroy', 'restore'], calls)
         self.assertEqual('failed', battle.state)
         self.assertFalse(battle._map_create_attempted)
 
@@ -682,6 +838,11 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         calls = []
+        original_clear = runtime.bigworld.clearEntitiesAndSpaces
+
+        def clear_lobby():
+            calls.append('clear')
+            original_clear()
 
         def create_partial(unused_map_name):
             runtime.offline_map_creator.active = True
@@ -696,12 +857,13 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.offline_map_creator.destroy = destroy_partial
         runtime.compatibility.restore_lobby_account = (
             lambda: calls.append('restore'))
+        runtime.bigworld.clearEntitiesAndSpaces = clear_lobby
 
         self.assertFalse(battle.start({
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, {}, _Client()))
 
-        self.assertEqual(['destroy', 'restore'], calls)
+        self.assertEqual(['clear', 'destroy', 'restore'], calls)
         self.assertEqual('failed', battle.state)
 
     def test_avatar_leave_defers_destroy_until_mailbox_returns(self):
@@ -789,7 +951,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.offline_map_creator.destroy = lambda: calls.append('destroy')
         runtime.compatibility.restore_lobby_account = (
             lambda: calls.append('restore'))
-        runtime.app_loader.showLobby = lambda: calls.append('lobby')
+        type(runtime.app_loader).lobby_callback = lambda: calls.append(
+            'lobby')
         callback = mock.Mock()
         battle.client = types.SimpleNamespace(on_event=callback)
 

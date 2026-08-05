@@ -133,11 +133,20 @@ map list; the clicked waiting-room selection is authoritative for the round.
 
 The server speaks a small newline-delimited JSON protocol, not the original
 Wargaming/BigWorld server protocol. Protocol v5 has one waiting room per server
-process and a server-authoritative `battle_start` barrier. It synchronizes
+process and a server-authoritative `battle_start` barrier. The first client in
+an empty room pins that room to either the legacy `wot-0.8.2` profile or the
+exact `wot-0.9.22.0.1-cn-1513` profile. Existing 0.8.2 packages send no
+`client_build` field and remain supported; the 0.9.22 package declares its
+build explicitly. A different build is rejected until the room is empty. This
+is required because the two clients use different coordinate frames, vehicle
+names and installed map sets. The server advertises and validates the pinned
+build's map pool (33 maps for 0.8.2, 42 for 0.9.22), so neither client can select
+a map resource it does not have. Run a second server process on another port if
+both builds must host rooms simultaneously. It synchronizes
 player identity, selected vehicle, opposing team, position, hull/turret aim,
 shell selection, firing, impact outcome, health and death.
-The firing client reuses the existing 0.8.2 map collision, shell and armor
-calculation and reports that result; the server validates and owns the shared
+The firing client reuses its local map collision, shell and armor calculation
+and reports that result; the server validates and owns the shared
 HP result. Damage caused by local bots, fire, drowning and collisions is
 reported downward by the affected client so other players see the resulting
 health and death state. Generic
@@ -158,13 +167,13 @@ For nearby visible contacts the authority also probes a bounded fan of
 drivable, dry, low-slope cover and peek points. The server validates those
 points against the bot's shared pose, scores them by role/personality, reserves
 them across the team, and controls the approach/hold/peek/return cycle. The
-0.8.2 authority client executes those orders with the real map collision, local
+authority client executes those orders with its real map collision, local
 driver, armor and shell systems, then publishes canonical pose/fire/HP state.
 Every client therefore renders the same population and combat result. If the
 authority disconnects, the server elects the next player, preserves canonical
 bot/HP/rules state, and clears the departed client's short-lived contacts and
 cover probes until the new authority reports its own observations. The same
-0.8.2 authority publishes
+authority publishes
 base-capture progress, capture interruption and the final winner/reason for
 capture, team elimination or timer expiry. The server remains the shared
 source of truth for HP and the final battle result.

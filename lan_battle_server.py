@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small LAN battle server for the 0.8.2 offhangar client.
+"""Small LAN battle server for the supported offline LAN clients.
 
 This is deliberately a separate, dependency-free process.  It is the first
 network slice, not an implementation of the original BigWorld server
@@ -33,7 +33,44 @@ TICK_HZ = 30.0
 RESULT_RESET_SECONDS = 3.0
 MAX_LINE_BYTES = 256 * 1024
 DEFAULT_MAP = "server_random"
-MAP_POOL = (
+CLIENT_BUILD_082 = "wot-0.8.2"
+CLIENT_BUILD_0922 = "wot-0.9.22.0.1-cn-1513"
+MAP_POOL_082 = (
+    "01_karelia",
+    "02_malinovka",
+    "03_campania",
+    "04_himmelsdorf",
+    "05_prohorovka",
+    "06_ensk",
+    "07_lakeville",
+    "08_ruinberg",
+    "10_hills",
+    "11_murovanka",
+    "13_erlenberg",
+    "14_siegfried_line",
+    "15_komarin",
+    "17_munchen",
+    "18_cliff",
+    "19_monastery",
+    "22_slough",
+    "23_westfeld",
+    "28_desert",
+    "29_el_hallouf",
+    "31_airfield",
+    "33_fjord",
+    "34_redshire",
+    "35_steppes",
+    "36_fishing_bay",
+    "37_caucasus",
+    "38_mannerheim_line",
+    "39_crimea",
+    "42_north_america",
+    "44_north_america",
+    "45_north_america",
+    "47_canada_a",
+    "51_asia",
+)
+MAP_POOL_0922 = (
     "01_karelia",
     "02_malinovka",
     "04_himmelsdorf",
@@ -77,6 +114,16 @@ MAP_POOL = (
     "114_czech",
     "217_er_alaska",
 )
+MAP_POOL = MAP_POOL_0922
+CLIENT_MAP_POOLS = {
+    CLIENT_BUILD_082: MAP_POOL_082,
+    CLIENT_BUILD_0922: MAP_POOL_0922,
+}
+CLIENT_DEFAULT_VEHICLES = {
+    CLIENT_BUILD_082: "ussr:MS-1",
+    CLIENT_BUILD_0922: "ussr:R11_MS-1",
+}
+ALL_MAP_POOL = tuple(sorted(set(MAP_POOL_082 + MAP_POOL_0922)))
 BOT_CALLSIGNS = (
     "Atlas", "Badger", "Bison", "Cedar", "Comet", "Condor", "Coyote", "Dagger",
     "Echo", "Falcon", "Frost", "Golem", "Harbor", "Hawk", "Ibis", "Jade",
@@ -189,6 +236,7 @@ class BattleState:
     def __init__(self, map_name=DEFAULT_MAP, max_players=30):
         self.map_option = map_name
         self.map_name = self._choose_map()
+        self.client_build = None
         self.max_players = max(1, min(int(max_players), 30))
         self.players: Dict[int, Player] = {}
         self.next_id = 1
@@ -212,16 +260,20 @@ class BattleState:
         self.roster_finalized = False
         self.pending_events = []
 
-    def _choose_map(self):
+    def _choose_map(self, map_pool=None):
+        map_pool = MAP_POOL if map_pool is None else tuple(map_pool)
         if self.map_option in (None, "", "random", DEFAULT_MAP):
-            return random.choice(MAP_POOL)
+            return random.choice(map_pool)
         selected = str(self.map_option)
-        if selected not in MAP_POOL:
+        if selected not in ALL_MAP_POOL:
             raise ValueError("unsupported standard map: %s" % selected)
         return selected
 
+    def _active_map_pool(self):
+        return CLIENT_MAP_POOLS.get(self.client_build, MAP_POOL)
+
     def _message_round_matches(self, message):
-        """Fence modern clients by round while accepting legacy v5 payloads."""
+        """Fence round-aware clients while accepting 0.8.2 payloads."""
         if not isinstance(message, dict):
             return False
         if "round_id" not in message:
@@ -308,8 +360,22 @@ class BattleState:
         with self.lock:
             if self.phase != "waiting":
                 return None, "battle_in_progress"
+            client_build = hello.get("client_build", CLIENT_BUILD_082)
+            if (not isinstance(client_build, str) or
+                    client_build not in CLIENT_MAP_POOLS):
+                return None, "unsupported_client_build"
+            if (self.client_build is not None and
+                    client_build != self.client_build):
+                return None, "incompatible_client_build"
             if len(self.players) >= self.max_players:
                 return None, "full"
+            if self.client_build is None:
+                map_pool = CLIENT_MAP_POOLS[client_build]
+                if (self.map_option not in (None, "", "random", DEFAULT_MAP) and
+                        str(self.map_option) not in map_pool):
+                    return None, "map_not_available_for_client"
+                self.client_build = client_build
+                self.map_name = self._choose_map(map_pool)
             occupied = {
                 team: {player.slot for player in self.players.values()
                        if player.connected and player.team == team}
@@ -332,7 +398,8 @@ class BattleState:
                 conn=conn,
                 address=address,
                 name=self._unique_name(hello.get("name"), address, player_id),
-                vehicle=_safe_vehicle(hello.get("vehicle"), "ussr:R11_MS-1"),
+                vehicle=_safe_vehicle(
+                    hello.get("vehicle"), CLIENT_DEFAULT_VEHICLES[client_build]),
                 team=team,
                 slot=slot,
                 x=x,
@@ -359,6 +426,8 @@ class BattleState:
             if not self.players and self.phase == "battle":
                 self._reset_round()
                 reset = True
+            if not self.players:
+                self.client_build = None
             return player, reset
 
     def _finish_abandoned_battle(self):
@@ -374,7 +443,7 @@ class BattleState:
         self.phase = "waiting"
         self.round_id += 1
         self.tick = 0
-        self.map_name = self._choose_map()
+        self.map_name = self._choose_map(self._active_map_pool())
         for player in self.players.values():
             player.health = player.max_health
             player.alive = True
@@ -412,10 +481,11 @@ class BattleState:
             return {
                 "type": "roster",
                 "protocol": PROTOCOL_VERSION,
+                "client_build": self.client_build,
                 "phase": self.phase,
                 "round_id": self.round_id,
                 "map": self.map_name,
-                "map_pool": list(MAP_POOL),
+                "map_pool": list(self._active_map_pool()),
                 "bot_authority_id": self.bot_authority_id,
                 "players": [self._public_player(p) for p in self.players.values() if p.connected],
             }
@@ -429,7 +499,7 @@ class BattleState:
                 return None, "already_started"
             if requested_map not in (None, ""):
                 requested_map = str(requested_map)
-                if requested_map not in MAP_POOL:
+                if requested_map not in self._active_map_pool():
                     return None, "invalid_map"
                 self.map_name = requested_map
             connected = [p for p in self.players.values() if p.connected]
@@ -443,6 +513,7 @@ class BattleState:
             return {
                 "type": "battle_start",
                 "protocol": PROTOCOL_VERSION,
+                "client_build": self.client_build,
                 "round_id": self.round_id,
                 "map": self.map_name,
                 "requested_by": player_id,
@@ -1280,6 +1351,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     welcomed = player.send({
                         "type": "welcome",
                         "protocol": PROTOCOL_VERSION,
+                        "client_build": server.state.client_build,
                         "player_id": player.player_id,
                         "name": player.name,
                         "vehicle": player.vehicle,
@@ -1287,22 +1359,28 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         "slot": player.slot,
                         "max_health": player.max_health,
                         "map": server.state.map_name,
-                        "map_pool": list(MAP_POOL),
+                        "map_pool": list(server.state._active_map_pool()),
                         "phase": server.state.phase,
                         "round_id": server.state.round_id,
                         "spawn": {"x": player.x, "y": player.y, "z": player.z, "yaw": player.yaw},
                         "bot_authority_id": server.state.bot_authority_id,
                     })
             if player is None:
-                message = ("battle already in progress"
-                           if join_error == "battle_in_progress"
-                           else "server is full")
+                messages = {
+                    "battle_in_progress": "battle already in progress",
+                    "full": "server is full",
+                    "unsupported_client_build": "unsupported or missing client build",
+                    "incompatible_client_build": "this room is using a different client build",
+                    "map_not_available_for_client": "the fixed server map is unavailable in this client build",
+                }
+                message = messages.get(join_error, "join rejected")
                 self._send_raw(conn, {"type": "error", "code": join_error, "message": message})
                 _server_log("Rejected %s:%d: %s" % (self.client_address[0], self.client_address[1], message))
                 return
-            _server_log("JOIN id=%d name=%s vehicle=%s max_hp=%d team=%d address=%s:%d phase=%s players=%d" % (
+            _server_log("JOIN id=%d name=%s build=%s vehicle=%s max_hp=%d team=%d address=%s:%d phase=%s players=%d" % (
                 player.player_id,
                 player.name,
+                server.state.client_build,
                 player.vehicle,
                 player.max_health,
                 player.team,
@@ -1475,7 +1553,7 @@ def main():
     parser.add_argument("--port", type=int, default=28782, help="TCP port (default: 28782)")
     parser.add_argument(
         "--map", dest="map_name", default=DEFAULT_MAP,
-        choices=(DEFAULT_MAP,) + MAP_POOL,
+        choices=(DEFAULT_MAP,) + ALL_MAP_POOL,
         help="standard map name, or server_random")
     parser.add_argument("--max-players", type=int, default=30, help="maximum connected clients")
     args = parser.parse_args()

@@ -173,6 +173,7 @@ EXPECTED_ABI = {
         'OfflineMapCreator.cancel': ('self',),
         'OfflineMapCreator.Active': ('self',),
         'OfflineMapCreator.SetActive': ('self', '_active'),
+        'OfflineMapCreator.__setupCamera': ('self',),
     },
     'scripts/client/connection_mgr.pyc': {
         'ConnectionManager.initiateConnection': (
@@ -182,6 +183,7 @@ EXPECTED_ABI = {
     'scripts/client/gui/app_loader/loader.pyc': {
         '_AppLoader.getDefLobbyApp': ('self',),
         '_AppLoader.getSpaceID': ('self',),
+        '_AppLoader.showBattlePage': ('self',),
         '_AppLoader.showLobby': ('self',),
     },
     'scripts/client/gui/app_loader/states.pyc': {
@@ -302,6 +304,11 @@ EXPECTED_CODE_LITERALS = {
 EXPECTED_CODE_NAMES = {
     'scripts/client/Account.pyc': {
         'PlayerAccount.onBecomePlayer': ('BigWorld', 'clearAllSpaces'),
+    },
+    'scripts/client/Avatar.pyc': {
+        'PlayerAvatar.__init__': (
+            'Account', 'g_accountRepository', 'intUserSettings',
+            'prebattleInvitations'),
     },
     'scripts/client/gui/shared/personality.pyc': {
         'onCenterIsLongDisconnected': (

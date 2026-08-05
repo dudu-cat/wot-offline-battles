@@ -8,6 +8,7 @@ import time
 
 
 PROTOCOL_VERSION = 5
+CLIENT_BUILD = 'wot-0.9.22.0.1-cn-1513'
 POLL_INTERVAL = 1.0 / 60.0
 PING_INTERVAL = 1.0
 MAX_MESSAGE_BYTES = 256 * 1024
@@ -339,6 +340,7 @@ class LANClient(object):
             self._send({
                 'type': 'hello',
                 'protocol': PROTOCOL_VERSION,
+                'client_build': CLIENT_BUILD,
                 'name': self.name,
                 'vehicle': self.vehicle,
                 'max_health': self.max_health,
@@ -477,6 +479,10 @@ class LANClient(object):
                 self.stop()
                 return
         if kind == 'welcome':
+            if _safe_text(message.get('client_build'), '') != CLIENT_BUILD:
+                self.last_error = 'client build mismatch'
+                self.stop()
+                return
             player_id = _exact_int(message.get('player_id'))
             team = _exact_int(message.get('team'))
             round_id = _exact_int(message.get('round_id'))

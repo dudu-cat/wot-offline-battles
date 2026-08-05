@@ -9,7 +9,7 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.2` replaces the old compatibility slice. It is a server-backed
+Version `0.3.3` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, tactical bots and repeatable rounds. The removed `vertical_slice.py`
@@ -23,6 +23,8 @@ runtime is not packaged as a fallback.
 3. The stock training settings window opens immediately. Its Description field
    is the editable `LAN SERVER: host:port` endpoint, and its map list contains
    locally installed standard maps while the connection is pending.
+   This reuses only the stock window as a local settings/map picker; it is not
+   a retail training room and does not use the original prebattle service.
 4. Choose a map and activate the window's normal primary button. The endpoint
    is saved, connection failures remain visible and retryable, and the server's
    map pool is checked before the start request is sent.
@@ -70,8 +72,13 @@ matchmaking, reconnect recovery, internet authentication, anti-cheat and full
 module/crew replication are outside this release.
 
 Protocol v5 messages are now strictly round-scoped. Keep the client package
-and `lan_battle_server.py` from the same checkout; an older v5 client or server
-may reject the newer bot manifest without a visible protocol-version error.
+and `lan_battle_server.py` from the same checkout; this client rejects an older
+server before entering the waiting room when its welcome lacks the build tag.
+The #1513 client also declares `wot-0.9.22.0.1-cn-1513` in its handshake. The
+server pins each non-empty room to one client build and its exact map pool,
+preventing 0.8.2 synthetic coordinates from being mixed with 0.9.22 world
+coordinates. Separate server ports are required for simultaneous rooms using
+different client versions.
 
 ## Configuration
 
@@ -121,8 +128,8 @@ OFFLINE_LAN_RELEASE_HOST=192.168.1.164 ./build_for_client.sh \
 
 The script uses local CPython 2.7 when available and otherwise the pinned
 Docker build. Before compiling, it reads code objects directly from the pinned
-client's `scripts.pkg`, rejects any mismatch in the 118 stock method signatures,
-18 direct-consumer literals and 20 lifecycle code names used by this port,
+client's `scripts.pkg`, rejects any mismatch in the 120 stock method signatures,
+18 direct-consumer literals and 24 lifecycle code names used by this port,
 verifies 11 exact `AccountCommands` constants, runs the complete raw `serverSettings`
 subscript inventory against the local producers, and checks 14 ordered
 lifecycle contracts plus the complete Account-helper binding inventory.
@@ -144,8 +151,8 @@ properties and mailboxes at runtime.
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.2.wotmod
-org.peng.offline_lan_0922_0.3.2.wotmod.sha256
+org.peng.offline_lan_0922_0.3.3.wotmod
+org.peng.offline_lan_0922_0.3.3.wotmod.sha256
 WoT-0.9.22-LAN-Client-<package hash>/
 WoT-0.9.22-LAN-Client-<package hash>.zip
 ```

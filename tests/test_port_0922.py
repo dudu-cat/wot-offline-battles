@@ -115,7 +115,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.2</version></root>')
+            '<version>0.3.3</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -1474,6 +1474,7 @@ class LANClientTests(unittest.TestCase):
         client._handle_message({
             'type': 'welcome',
             'protocol': module.PROTOCOL_VERSION,
+            'client_build': module.CLIENT_BUILD,
             'player_id': 7,
             'name': 'Player',
             'vehicle': 'ussr:MS-1',
@@ -1549,6 +1550,17 @@ class LANClientTests(unittest.TestCase):
         self.assertFalse(client.running)
         self.assertEqual('protocol mismatch', client.last_error)
 
+    def test_client_build_mismatch_stops_before_accepting_welcome(self):
+        module, client, _, _ = self._client()
+        client.running = True
+        client._handle_message({
+            'type': 'welcome', 'protocol': module.PROTOCOL_VERSION,
+            'client_build': 'wot-0.8.2',
+        })
+        self.assertFalse(client.running)
+        self.assertFalse(client.ready)
+        self.assertEqual('client build mismatch', client.last_error)
+
     def test_round_barriers_drop_stale_snapshot_and_clear_terminal_cache(self):
         _, client, events, _ = self._client()
         client.round_id = 5
@@ -1591,11 +1603,12 @@ class LANClientTests(unittest.TestCase):
         self.assertEqual('roster', client._pending[-1]['type'])
 
     def test_malformed_required_server_messages_fail_closed(self):
-        _, client, _, _ = self._client()
+        module, client, _, _ = self._client()
         client.running = True
 
         client._handle_message({
-            'type': 'welcome', 'protocol': 5, 'player_id': 'bad',
+            'type': 'welcome', 'protocol': 5,
+            'client_build': module.CLIENT_BUILD, 'player_id': 'bad',
             'team': 1, 'round_id': 1})
 
         self.assertFalse(client.running)
@@ -1679,7 +1692,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.2'
+        package.PORT_VERSION = '0.3.3'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []
