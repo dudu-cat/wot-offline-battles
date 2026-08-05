@@ -466,13 +466,33 @@ class LANClient(object):
 		# remote tank, applying every stale 30 Hz snapshot would create an
 		# unbounded queue and make the visual state increasingly lag behind.
 		latest_snapshot = None
+		order_payloads = {}
 		coalesced = []
 		for message in messages:
 			if isinstance(message, dict) and message.get('type') == 'snapshot':
+				if 'bot_orders' in message:
+					try:
+						order_revision = int(message.get('bot_order_revision', 0) or 0)
+					except (TypeError, ValueError):
+						order_revision = 0
+					order_payloads[order_revision] = message.get('bot_orders') or []
 				latest_snapshot = message
 			else:
 				coalesced.append(message)
 		if latest_snapshot is not None:
+			# The server sends an order body only once per revision, while snapshots
+			# are coalesced to the newest state on the game thread. Preserve the body
+			# from an earlier snapshot of the same revision; otherwise a busy frame
+			# keeps the new revision number but silently clears every bot order.
+			try:
+				latest_revision = int(
+					latest_snapshot.get('bot_order_revision', 0) or 0)
+			except (TypeError, ValueError):
+				latest_revision = 0
+			if ('bot_orders' not in latest_snapshot and
+					latest_revision in order_payloads):
+				latest_snapshot = dict(latest_snapshot)
+				latest_snapshot['bot_orders'] = order_payloads[latest_revision]
 			coalesced.append(latest_snapshot)
 		messages = coalesced
 		for message in messages:
@@ -593,7 +613,10 @@ class LANClient(object):
 				revision = int(message.get('bot_order_revision', 0) or 0)
 			except (TypeError, ValueError):
 				revision = 0
-			if revision > self.bot_order_revision or (revision == 0 and not self.bot_orders):
+			has_order_payload = 'bot_orders' in message
+			if (has_order_payload and
+					(revision > self.bot_order_revision or
+					 (revision == 0 and not self.bot_orders))):
 				orders = {}
 				for order in message.get('bot_orders') or ():
 					try:
@@ -1127,6 +1150,15 @@ def publish_bot_observation(player, contacts, affordances=None, navigation=None)
 				except Exception:
 					value = 0
 				shared_navigation['search'][name] = max(0, min(value, 3600000))
+		raw_orders = navigation.get('orders')
+		if isinstance(raw_orders, dict):
+			shared_navigation['orders'] = {}
+			for name, maximum in (('revision', 1000000000), ('loaded', 30)):
+				try:
+					value = int(raw_orders.get(name, 0) or 0)
+				except Exception:
+					value = 0
+				shared_navigation['orders'][name] = max(0, min(value, maximum))
 		raw_aim = navigation.get('aim')
 		if isinstance(raw_aim, dict):
 			shared_navigation['aim'] = {}

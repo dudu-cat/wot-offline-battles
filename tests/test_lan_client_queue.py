@@ -754,6 +754,48 @@ class LANClientQueueTest(unittest.TestCase):
         })
         self.assertEqual(2, client.bot_orders[16]["target_id"])
 
+    def test_snapshot_coalescing_preserves_order_body_for_latest_revision(self):
+        player = Player()
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        player._offhangar_network_client = client
+        with client._pending_lock:
+            client._pending = [
+                {
+                    "type": "snapshot", "bot_authority_id": 1,
+                    "players": [], "bots": [], "bot_order_revision": 12,
+                    "bot_orders": [{"id": 16, "target_id": 2}],
+                },
+                {
+                    "type": "snapshot", "bot_authority_id": 1,
+                    "players": [], "bots": [], "bot_order_revision": 12,
+                    "server_tick": 101,
+                },
+            ]
+
+        client._poll()
+
+        self.assertEqual(12, client.bot_order_revision)
+        self.assertEqual(2, client.bot_orders[16]["target_id"])
+        self.assertEqual(101, player._offhangar_network_snapshot["server_tick"])
+
+    def test_revision_without_order_body_keeps_last_executable_orders(self):
+        player = Player()
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        client.bot_order_revision = 7
+        client.bot_orders = {16: {"id": 16, "target_id": 2}}
+
+        client._handle_message({
+            "type": "snapshot", "bot_authority_id": 1,
+            "players": [], "bots": [], "bot_order_revision": 8,
+        })
+
+        self.assertEqual(7, client.bot_order_revision)
+        self.assertEqual(2, client.bot_orders[16]["target_id"])
+
     def test_remote_pose_is_interpolated_between_thirty_hz_snapshots(self):
         class Matrix:
             def setRotateYPR(self, rotation):

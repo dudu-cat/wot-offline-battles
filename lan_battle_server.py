@@ -181,6 +181,7 @@ class BattleState:
             "recovered": 0,
             "search": {"pending": 0, "completed": 0, "failed": 0,
                        "oldest_ms": 0},
+            "orders": {"revision": 0, "loaded": 0},
             "aim": {"alive": 0, "targeted": 0, "aligned": 0,
                     "traversing": 0, "limited": 0},
             "driver": {"moving": 0, "drive": 0, "avoid": 0,
@@ -225,6 +226,7 @@ class BattleState:
                 "recovered": 0,
                 "search": {"pending": 0, "completed": 0, "failed": 0,
                            "oldest_ms": 0},
+                "orders": {"revision": 0, "loaded": 0},
                 "aim": {"alive": 0, "targeted": 0, "aligned": 0,
                         "traversing": 0, "limited": 0},
                 "driver": {"moving": 0, "drive": 0, "avoid": 0,
@@ -323,6 +325,7 @@ class BattleState:
                     "recovered": 0,
                     "search": {"pending": 0, "completed": 0, "failed": 0,
                                "oldest_ms": 0},
+                    "orders": {"revision": 0, "loaded": 0},
                     "aim": {"alive": 0, "targeted": 0, "aligned": 0,
                             "traversing": 0, "limited": 0},
                     "driver": {"moving": 0, "drive": 0, "avoid": 0,
@@ -551,6 +554,15 @@ class BattleState:
                 for name in ("pending", "completed", "failed", "oldest_ms"):
                     navigation["search"][name] = max(0, min(
                         int(_finite_float(raw_search.get(name), 0)), 3600000))
+                raw_orders = raw_navigation.get("orders")
+                if not isinstance(raw_orders, dict):
+                    raw_orders = {}
+                navigation["orders"] = {
+                    "revision": max(0, min(int(_finite_float(
+                        raw_orders.get("revision"), 0)), 1000000000)),
+                    "loaded": max(0, min(int(_finite_float(
+                        raw_orders.get("loaded"), 0)), 30)),
+                }
                 raw_aim = raw_navigation.get("aim")
                 if not isinstance(raw_aim, dict):
                     raw_aim = {}
@@ -928,6 +940,7 @@ class BattleState:
                 "fire=t1:%d,t2:%d modes=%s "
                 "nav=direct:%d,local:%d,reactive:%d recovered:%d "
                 "active:%d/%d/%d astar=pending:%d,oldest:%dms,done:%d,failed:%d "
+                "orders=server:%d,client:%d,loaded:%d "
                 "aim=targeted:%d,aligned:%d,traversing:%d,limited:%d,alive:%d "
                 "driver=moving:%d,drive:%d,avoid:%d,blocked:%d,recovery:%d,arrived:%d" % (
                     reports.get(1, 0), reports.get(2, 0), reports.get("accepted", 0),
@@ -946,6 +959,9 @@ class BattleState:
                     navigation.get("search", {}).get("oldest_ms", 0),
                     navigation.get("search", {}).get("completed", 0),
                     navigation.get("search", {}).get("failed", 0),
+                    self.bot_orders.get("revision", 0),
+                    navigation.get("orders", {}).get("revision", 0),
+                    navigation.get("orders", {}).get("loaded", 0),
                     navigation.get("aim", {}).get("targeted", 0),
                     navigation.get("aim", {}).get("aligned", 0),
                     navigation.get("aim", {}).get("traversing", 0),

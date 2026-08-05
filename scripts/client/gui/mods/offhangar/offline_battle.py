@@ -2129,6 +2129,11 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 		_navigation = (_navigator.fallback_diagnostics(_active_bot_ids)
 		               if _navigator is not None else None)
 		if _navigation is not None:
+			_network_client = getattr(player, '_offhangar_network_client', None)
+			_navigation['orders'] = {
+				'revision': int(getattr(_network_client, 'bot_order_revision', 0) or 0),
+				'loaded': len(getattr(_network_client, 'bot_orders', {}) or {}),
+			}
 			_aim = {'alive': 0, 'targeted': 0, 'aligned': 0,
 			        'traversing': 0, 'limited': 0}
 			_driver = {'moving': 0, 'drive': 0, 'avoid': 0, 'blocked': 0,
