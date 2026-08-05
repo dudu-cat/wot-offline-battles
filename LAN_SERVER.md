@@ -103,6 +103,18 @@ Each actual client-simulated shot also prints `BOT FIRE`. This separates
 spotting, delivery, navigation and client execution without enabling verbose
 client debug logging.
 
+Long terrain routes use bounded weighted-A* continuations instead of one large
+search per bot. Moving tanks are handled by the local driver and are not baked
+into the shared static path cache. Water deeper than 12 cm is a hard navigation
+boundary for routes, local steering, cover and peek positions; this deliberately
+forgoes shallow fords to keep autonomous tanks out of rivers and harbours.
+
+If a snapshot cannot be delivered, the server prints `SEND DROP` with the
+player and socket error before removing that connection. An unexpected tick
+exception prints `BATTLE TICK ERROR (server remains running)` and does not kill
+the server's battle loop silently. Either line is actionable evidence to include
+with the client `python.log` when reporting a frozen ping/lag indicator.
+
 In battle, opposing LAN humans use the same local 50 m proximity spot,
 view-range/terrain line-of-sight check, allied vision and five-second spot
 memory as NPC opponents. Allied humans remain visible. When a human dies, the
@@ -174,6 +186,9 @@ authority publishes
 base-capture progress, capture interruption and the final winner/reason for
 capture, team elimination or timer expiry. The server remains the shared
 source of truth for HP and the final battle result.
+The top HUD score is recomputed from the same canonical alive/dead roster after
+every death, including shells, fire, collisions and drowning, rather than from
+client-local frag side effects.
 
 ### Bot planner portability boundary
 

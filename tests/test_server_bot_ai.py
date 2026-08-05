@@ -240,6 +240,81 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertIsNone(orders[2]["target_id"])
         self.assertEqual("route", orders[2]["combat_mode"])
 
+    def test_visible_local_threat_interrupts_route_within_340_metres(self):
+        planner = BotPlanner()
+        manifest = _manifest()
+        states = _states()
+        states[0] = dict(states[0], x=0, z=0)
+        states[1] = dict(states[1], x=-500, z=0)
+        players = [{"id": 99, "team": 2, "alive": True}]
+        planner.report_contacts([{
+            "observing_team": 1, "target_kind": "human", "target_id": 99,
+            "target_team": 2, "visible": True,
+            "x": 300, "y": 0, "z": 0, "health": 1000,
+            "max_health": 1000,
+        }], planner.known_targets(states, players), 1.0)
+
+        orders = {order["id"]: order for order in planner.build_orders(
+            manifest, states, players, 1.0)["orders"]}
+
+        self.assertEqual(99, orders[1]["target_id"])
+        self.assertIsNone(orders[2]["target_id"])
+
+    def test_close_visible_threat_holds_to_fight_without_cover(self):
+        planner = BotPlanner()
+        manifest = _manifest()
+        players = [{"id": 99, "team": 2, "alive": True}]
+        known = planner.known_targets(_states(), players)
+        planner.report_contacts([{
+            "observing_team": 1, "target_kind": "human", "target_id": 99,
+            "target_team": 2, "visible": True,
+            "x": 0, "y": 0, "z": 80, "health": 1000,
+            "max_health": 1000,
+        }], known, 1.0)
+
+        order = next(order for order in planner.build_orders(
+            manifest, _states(), players, 1.0)["orders"] if order["id"] == 1)
+
+        self.assertEqual("engage", order["combat_mode"])
+        self.assertEqual(0.0, order["throttle_override"])
+
+    def test_live_visible_pose_does_not_churn_structural_order_revision(self):
+        planner = BotPlanner()
+        manifest = _manifest()
+        players = [{"id": 99, "team": 2, "alive": True}]
+        known = planner.known_targets(_states(), players)
+        base = {
+            "observing_team": 1, "target_kind": "human", "target_id": 99,
+            "target_team": 2, "visible": True, "y": 0,
+            "health": 1000, "max_health": 1000,
+        }
+        planner.report_contacts([dict(base, x=0, z=300)], known, 1.0)
+        first = planner.build_orders(manifest, _states(), players, 1.0)
+        planner.report_contacts([dict(base, x=3, z=300)], known, 1.1)
+        second = planner.build_orders(manifest, _states(), players, 1.1)
+
+        self.assertEqual(first["revision"], second["revision"])
+        first_order = next(order for order in first["orders"] if order["id"] == 1)
+        second_order = next(order for order in second["orders"] if order["id"] == 1)
+        self.assertNotEqual(first_order["aim_position"], second_order["aim_position"])
+
+    def test_snapshot_send_failure_is_logged_and_resets_the_room(self):
+        class BrokenConnection(object):
+            def sendall(self, payload):
+                raise TimeoutError("simulated slow receiver")
+
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        state.players[1] = Player(1, BrokenConnection(), ("127.0.0.1", 0))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            state.tick_once(0.05)
+
+        self.assertFalse(state.players)
+        self.assertEqual("waiting", state.phase)
+        self.assertIn("SEND DROP id=1", output.getvalue())
+        self.assertIn("ROOM RESET", output.getvalue())
+
     def test_visible_enemy_overrides_route_until_contact_expires(self):
         planner = BotPlanner()
         manifest = _manifest()

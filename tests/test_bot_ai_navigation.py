@@ -559,18 +559,57 @@ class BotNavigationTest(unittest.TestCase):
         ).read_text()
 
         self.assertIn(
-            "_offh_water_depth(x, y, z) > 1.0",
+            "_OFFH_AI_WATER_AVOID_DEPTH = 0.12",
             battle_source,
         )
+        water_helper = battle_source[
+            battle_source.index("def _offh_water_depth"):
+            battle_source.index("_OFFH_AI_WATER_AVOID_DEPTH")
+        ]
+        self.assertIn("return 20.0 - _w", water_helper)
+        self.assertNotIn("water_depth > 1.0", battle_source)
+        self.assertIn("wet_escape = current_water >", battle_source)
+        self.assertIn("16.0 + speed * 2.2", battle_source)
         self.assertIn("delta > run * 0.48", battle_source)
         self.assertIn("delta < -run * 0.38", battle_source)
         self.assertIn("lambda _driver_yaw: _offh_ai_direction_clear(", battle_source)
-        self.assertIn("ground_step = 4.0", battle_source)
+        self.assertIn("ground_step = 3.0", battle_source)
         self.assertIn(
             "# Fall back to the old reactive steering intent.",
             battle_source,
         )
         self.assertIn("drive_pos = _requested_drive_pos", battle_source)
+
+    def test_astar_jobs_are_bounded_and_ignore_transient_vehicle_penalties(self):
+        navigator = self.navigation.TerrainNavigator(
+            lambda x, z, hint: 0.0, cell_size=10.0
+        )
+        navigator.grid.segment_clear = lambda start, end: False
+        captured = {}
+
+        class PendingSearch:
+            done = False
+            result = None
+            last_frame = None
+
+            def step(self, budget):
+                return False
+
+        def begin_plan(start, goal, avoid_points=None, max_expansions=1600,
+                       now=0.0):
+            captured["avoid_points"] = avoid_points
+            captured["max_expansions"] = max_expansions
+            return PendingSearch()
+
+        navigator.grid.begin_plan = begin_plan
+        navigator._path(
+            ("local", 7, "advance_contact", 2),
+            (0.0, 0.0, 0.0), (100.0, 0.0, 0.0), 1.0,
+            [(10.0, 0.0, 0.0)] * 28,
+        )
+
+        self.assertIsNone(captured["avoid_points"])
+        self.assertEqual(128, captured["max_expansions"])
 
     def test_stalled_route_temporarily_penalizes_its_failed_first_edge(self):
         navigator = self.navigation.TerrainNavigator(

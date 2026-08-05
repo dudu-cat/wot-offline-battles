@@ -44,6 +44,10 @@ class TerrainGrid(object):
 		self.cell_size = max(1.0, float(cell_size))
 		self.max_grade_up = float(max_grade_up)
 		self.max_grade_down = float(max_grade_down)
+		# Weighted A* deliberately favours forward progress over a perfectly
+		# shortest coarse-grid route. Every returned edge is still terrain-probed;
+		# only the amount of side exploration changes.
+		self.heuristic_weight = 1.70
 		self._ground_cache = {}
 		self._edge_cache = {}
 		self._segment_cache = {}
@@ -370,7 +374,8 @@ class TerrainGrid(object):
 					dz = next_cell[1] - goal_cell[1]
 					# A modest weighted heuristic keeps the old 32-bit client from
 					# exploring a broad irrelevant front around long ridges.
-					heuristic = math.sqrt(dx * dx + dz * dz) * self.cell_size * 1.35
+					heuristic = (math.sqrt(dx * dx + dz * dz) * self.cell_size *
+					             self.heuristic_weight)
 					sequence += 1
 					heapq.heappush(frontier,
 					               (new_cost + heuristic, sequence, next_cell))
@@ -464,6 +469,10 @@ class TerrainNavigator(object):
 		self.search_budget_per_frame = 128
 		self.search_budget_per_path = 4
 		self.search_time_budget = 0.0025
+		# A bounded search returns its best fully-probed partial path. This keeps a
+		# 29-bot room from waiting tens of seconds for 1600 expansions per job; the
+		# continuation search starts after the bot reaches that safe endpoint.
+		self.search_max_expansions = 128
 		self.search_completed = 0
 		self.search_failed = 0
 		self.search_now = 0.0
@@ -637,7 +646,7 @@ class TerrainNavigator(object):
 				del self.paths[key]
 				self.path_times.pop(key, None)
 			else:
-				if float(now) - self.path_times.get(key, 0.0) < 3.0:
+				if float(now) - self.path_times.get(key, 0.0) < 8.0:
 					return key, path
 				del self.paths[key]
 				self.path_times.pop(key, None)
@@ -652,8 +661,13 @@ class TerrainNavigator(object):
 				self.paths[key] = path
 				self.path_times[key] = float(now)
 				return key, path
+			# Moving tanks do not belong in a cached static terrain path. Including all
+			# 28 peers made every expansion scan transient positions, permanently baked
+			# traffic into shared paths, and multiplied probe cost. LocalDriver handles
+			# moving OBBs every frame; A* only owns static terrain and remembered edges.
 			search = self.grid.begin_plan(
-				start, goal, avoid_points=avoid_points, now=now)
+				start, goal, avoid_points=None,
+				max_expansions=self.search_max_expansions, now=now)
 			self.searches[key] = search
 			self.search_times[key] = float(now)
 		self._advance_searches(now)

@@ -9,8 +9,8 @@ Play World of Tanks 0.8.2 offline: no login, no server. You go straight to the
 hangar, pick a tank and fight bots on the real maps.
 Bots use vehicle roles, stable individual personalities and shared team spots;
 all 33 stock maps have dedicated standard-battle tactical routes. Strategic
-route anchors are connected at runtime by a cached terrain-aware A* layer,
-then bounded local probes reject cliffs, deep water and solid obstacles. A
+route anchors are connected at runtime by a cached, bounded weighted-A* layer,
+then local probes reject cliffs, all water and solid obstacles. A
 short-horizon oriented-hull predictor separates nearby tanks, and failed
 terrain segments are remembered briefly so a stalled bot replans instead of
 repeating the same bad edge. In combat, client-probed cover candidates feed a

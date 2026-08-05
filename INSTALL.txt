@@ -53,8 +53,8 @@ Bots in this build
 - Standard base-capture battles are supported; assault and encounter variants
   are intentionally outside this build.
 - All 33 stock maps have macro tactical routes.
-- Terrain-aware A* connects strategic anchors while local feelers avoid cliffs,
-  deep water, hard obstacles, nearby tanks and congestion.
+- Bounded weighted A* connects strategic anchors while local feelers avoid
+  cliffs, all water, hard obstacles, nearby tanks and congestion.
 - Vehicle roles cover brawling, support, flanking, sniping, scouting and SPGs.
 - Bots have stable individual aggression, caution, teamwork and driving habits.
 - Combat behavior includes limited spotting information, target memory, hull

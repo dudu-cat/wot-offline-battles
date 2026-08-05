@@ -22,6 +22,7 @@ import socket
 import socketserver
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -135,6 +136,7 @@ class Player:
     bot_order_revision_sent: int = -1
     bot_order_revision_ack: int = -1
     bot_order_sent_at: float = 0.0
+    last_send_error: str = ""
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def send(self, message):
@@ -142,6 +144,7 @@ class Player:
             return False
         payload = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
         if len(payload) > MAX_LINE_BYTES:
+            self.last_send_error = "outbound message exceeds %d bytes" % MAX_LINE_BYTES
             return False
         try:
             with self.send_lock:
@@ -153,7 +156,8 @@ class Player:
                 except (TypeError, ValueError):
                     pass
             return True
-        except (BrokenPipeError, ConnectionError, OSError):
+        except (BrokenPipeError, ConnectionError, OSError) as error:
+            self.last_send_error = "%s: %s" % (type(error).__name__, error)
             self.connected = False
             return False
 
@@ -1016,6 +1020,7 @@ class BattleState:
                     navigation.get("driver", {}).get("recovery", 0),
                     navigation.get("driver", {}).get("arrived", 0),
                     navigation.get("driver", {}).get("server_wait", 0)))
+        failed_recipients = []
         for player in recipients:
             outgoing = snapshot
             revision = int(self.bot_orders["revision"])
@@ -1027,7 +1032,19 @@ class BattleState:
                 outgoing = dict(snapshot)
                 outgoing["bot_orders"] = list(self.bot_orders["orders"])
             if not player.send(outgoing):
-                self.remove_player(player.player_id)
+                failed_recipients.append(player)
+        for player in failed_recipients:
+            removed, reset = self.remove_player(player.player_id)
+            if removed is not None:
+                _server_log(
+                    "SEND DROP id=%d name=%s remaining=%d error=%s" % (
+                        removed.player_id, removed.name, len(self.players),
+                        removed.last_send_error or "unknown send failure"))
+            if reset:
+                _server_log("ROOM RESET round=%d map=%s after send failure" % (
+                    self.round_id, self.map_name))
+        if failed_recipients:
+            self.broadcast(self.lobby_message())
         if events:
             for event in events:
                 if event.get("kind") == "shot":
@@ -1153,11 +1170,16 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     current_battle["round_id"],
                     current_battle["map"],
                 ))
-            conn.settimeout(0.5)
+            # A half-second write timeout could evict a healthy old client during
+            # one expensive render/GC spike. Two seconds remains bounded below the
+            # HUD's lag threshold while tolerating short receive-buffer stalls.
+            conn.settimeout(2.0)
             while True:
                 try:
                     chunk = conn.recv(4096)
                 except socket.timeout:
+                    if player is not None and not player.connected:
+                        break
                     continue
                 if not chunk:
                     break
@@ -1281,9 +1303,17 @@ def run_server(host, port, map_name, max_players):
     def tick_loop():
         interval = 1.0 / TICK_HZ
         next_tick = time.monotonic()
+        next_error_log = 0.0
         while state.running:
             next_tick += interval
-            state.tick_once(min(interval, 0.1))
+            try:
+                state.tick_once(min(interval, 0.1))
+            except Exception:
+                now = time.monotonic()
+                if now >= next_error_log:
+                    next_error_log = now + 2.0
+                    _server_log("BATTLE TICK ERROR (server remains running):\n%s" % (
+                        traceback.format_exc().rstrip()))
             delay = next_tick - time.monotonic()
             if delay > 0:
                 time.sleep(delay)

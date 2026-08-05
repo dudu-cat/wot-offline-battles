@@ -657,6 +657,46 @@ def _offh_water_depth(x, y, z):
 	return 20.0 - _w
 
 
+# Bot navigation treats water as a hard boundary. This is intentionally much
+# stricter than the player drowning threshold: giving up shallow fords is safer
+# than letting momentum carry an autonomous tank over a river or harbour edge.
+_OFFH_AI_WATER_AVOID_DEPTH = 0.12
+
+
+def _offh_refresh_team_score(player):
+	'''Refresh the top HUD score from canonical alive state after any death.
+
+	The legacy frag counter is not updated by a bare arena.onVehicleKilled event.
+	Counting destroyed enemy/ally vehicles also handles drowning and network deaths,
+	which correctly change the team score even when no tank receives an individual
+	frag credit.
+	'''
+	try:
+		vehicles = getattr(getattr(player, 'arena', None), 'vehicles', {}) or {}
+		player_team = int(getattr(player, '_offhangar_team',
+		                          getattr(player, 'team', 1)) or 1)
+		allied_losses = 0
+		enemy_losses = 0
+		for info in vehicles.values():
+			if not isinstance(info, dict) or bool(info.get('isAlive', True)):
+				continue
+			team = int(info.get('team', 0) or 0)
+			if team not in (1, 2):
+				continue
+			if team == player_team:
+				allied_losses += 1
+			else:
+				enemy_losses += 1
+		from gui import WindowsManager
+		battle = getattr(WindowsManager.g_windowsManager, 'battleWindow', None)
+		correlation = getattr(battle, '_Battle__fragCorrelation', None)
+		if correlation is not None:
+			correlation.updateFrags(enemy_losses, allied_losses)
+		return enemy_losses, allied_losses
+	except Exception:
+		return None
+
+
 def _offh_hp_display(mock):
 	'''HP to SHOW for a mock, which is not always its .health.
 	
@@ -1535,9 +1575,9 @@ def _offh_ai_navigator(director):
 				return None
 			height = float(hit[0].y)
 			if height <= float(hint_y) + 4.5:
-				# Shallow fords remain usable, but a route through drowning-depth
-				# water is never a valid shortcut across a lake or harbour.
-				if _offh_water_depth(x, height, z) > 1.0:
+				# Water is not part of the autonomous navigation mesh. A conservative
+				# dry-only graph is preferable to routing a tank into a river or harbour.
+				if _offh_water_depth(x, height, z) > _OFFH_AI_WATER_AVOID_DEPTH:
 					return None
 				return height
 			probe_top = height - 0.35
@@ -1610,11 +1650,11 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 	try:
 		import BigWorld, Math, math
 		speed = abs(float(getattr(vehicle, '_veh_velocity', 0.0) or 0.0))
-		# A stopped tank only needs enough clear road to leave the line-up. Longer
-		# look-ahead returns once it is moving. Ground is sampled every ~4 metres:
-		# checking only the old 6/10 m endpoints could miss a ravine between them.
-		lookahead = 10.0 if speed < 1.5 else (20.0 if speed > 5.0 else 15.0)
-		ground_step = 4.0
+		# Start braking well before a shoreline. The old 10/20 m ray was shorter
+		# than the stopping/turning envelope of a fast heavy tank, so a direction
+		# could become blocked only after momentum had already committed the hull.
+		lookahead = max(18.0, min(38.0, 16.0 + speed * 2.2))
+		ground_step = 3.0
 		try:
 			_unused_length, hull_half_width = _offh_ai_hull_dims(
 				getattr(vehicle, 'typeDescriptor', None))
@@ -1622,6 +1662,10 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 			hull_half_width = 1.7
 		corridor_half_width = max(1.4, min(2.0, float(hull_half_width) + 0.15))
 		previous_y = float(vehicle.position.y)
+		current_water = _offh_water_depth(
+			float(vehicle.position.x), previous_y, float(vehicle.position.z))
+		wet_escape = current_water > _OFFH_AI_WATER_AVOID_DEPTH
+		last_water = current_water
 		sine = math.sin(float(absolute_yaw))
 		cosine = math.cos(float(absolute_yaw))
 		lateral_x = cosine
@@ -1645,13 +1689,48 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 			if ground is None:
 				return False
 			y = float(ground[0].y)
-			if _offh_water_depth(x, y, z) > 1.0:
-				return False
+			water_depth = _offh_water_depth(x, y, z)
+			if wet_escape:
+				# A tank already touching water may take only a route that never gets
+				# deeper and finishes measurably closer to dry ground.
+				if water_depth > current_water + 0.10:
+					return False
+			else:
+				if water_depth > _OFFH_AI_WATER_AVOID_DEPTH:
+					return False
+			last_water = water_depth
 			delta = y - previous_y
 			if delta > run * 0.48 or delta < -run * 0.38:
 				return False
 			previous_y = y
 			previous_distance = distance
+		if wet_escape and last_water > max(
+				_OFFH_AI_WATER_AVOID_DEPTH, current_water - 0.15):
+			return False
+		# Turning tanks initially continue along a blend of the old and requested
+		# headings. Probe that momentum corridor too; a safe straight ray on the far
+		# side of a turn must not hide water directly under the actual arc.
+		if not wet_escape and speed > 1.25:
+			delta_yaw = float(absolute_yaw) - float(vehicle.yaw)
+			while delta_yaw > math.pi: delta_yaw -= math.pi * 2.0
+			while delta_yaw < -math.pi: delta_yaw += math.pi * 2.0
+			motion_yaw = float(vehicle.yaw) + delta_yaw * 0.45
+			motion_distance = min(lookahead, max(9.0, speed * 1.6))
+			motion_step = 4.0
+			probe_distance = motion_step
+			motion_y = float(vehicle.position.y)
+			while probe_distance <= motion_distance + 0.01:
+				mx = float(vehicle.position.x) + math.sin(motion_yaw) * probe_distance
+				mz = float(vehicle.position.z) + math.cos(motion_yaw) * probe_distance
+				motion_ground = BigWorld.wg_collideSegment(
+					_offh_bspace(), Math.Vector3(mx, motion_y + 6.0, mz),
+					Math.Vector3(mx, motion_y - 8.0, mz), 128)
+				if motion_ground is None:
+					return False
+				motion_y = float(motion_ground[0].y)
+				if _offh_water_depth(mx, motion_y, mz) > _OFFH_AI_WATER_AVOID_DEPTH:
+					return False
+				probe_distance += motion_step
 		# Sweep the complete supported corridor at two hull heights. This remains
 		# cheaper than repeating three collision rays at every ground sample.
 		final_x = float(vehicle.position.x) + sine * lookahead
@@ -1803,7 +1882,7 @@ def _offh_ai_sample_cover(director, bot_id, vehicle, target_position,
 			travel = math.sqrt((point[0] - current[0]) ** 2 +
 			                   (point[2] - current[2]) ** 2)
 			water_depth = _offh_water_depth(point[0], point[1], point[2])
-			if water_depth > 1.0:
+			if water_depth > _OFFH_AI_WATER_AVOID_DEPTH:
 				continue
 			try:
 				escape = bool(navigator.grid.segment_clear(current, point))
@@ -1826,7 +1905,7 @@ def _offh_ai_sample_cover(director, bot_id, vehicle, target_position,
 					point[2] + right_z * side * 6.5 + to_target_z * 2.0,
 					point[1])
 				if peek_point is None or _offh_water_depth(
-						peek_point[0], peek_point[1], peek_point[2]) > 1.0:
+						peek_point[0], peek_point[1], peek_point[2]) > _OFFH_AI_WATER_AVOID_DEPTH:
 					continue
 				try:
 					peek_clear = navigator.grid.segment_clear(point, peek_point)
@@ -14269,6 +14348,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							try:
 								if self._orig is not None:
 									self._orig(victimID, killerID, reason)
+							except Exception:
+								pass
+							# One canonical score path covers shells, fire, ramming, drowning and
+							# LAN deaths. Repeat on the next callback so older per-weapon code that
+							# updates individual frags after this event cannot overwrite the HUD.
+							_offh_refresh_team_score(_pl)
+							try:
+								BigWorld.callback(0.0, lambda _score_player=_pl:
+									_offh_refresh_team_score(_score_player))
 							except Exception:
 								pass
 							# Kill feed, ONCE per victim. Four separate sites used to post this, one of

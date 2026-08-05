@@ -1260,6 +1260,8 @@ def authoritative_bot_order(player, mock):
 					float(position.x), float(position.y), float(position.z))
 				order['aim_position'] = live_position
 				order['face_position'] = live_position
+				if order.get('combat_mode') == 'advance_contact':
+					order['move_position'] = live_position
 			except Exception:
 				order['fire_allowed'] = False
 		else:

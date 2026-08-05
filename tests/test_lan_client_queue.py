@@ -721,8 +721,10 @@ class LANClientQueueTest(unittest.TestCase):
             bot_orders={16: {
                 "id": 16, "target_id": 2, "target_kind": "human",
                 "fire_allowed": True,
+                "combat_mode": "advance_contact",
                 "aim_position": {"x": -4.0, "y": 1.0, "z": 80.0},
                 "face_position": {"x": -4.0, "y": 1.0, "z": 80.0},
+                "move_position": {"x": -4.0, "y": 1.0, "z": 80.0},
             }}
         )
         bot = types.SimpleNamespace(_network_bot_id=16)
@@ -739,6 +741,7 @@ class LANClientQueueTest(unittest.TestCase):
 
         self.assertEqual((12.0, 3.0, -7.0), order["aim_position"])
         self.assertEqual(order["aim_position"], order["face_position"])
+        self.assertEqual(order["aim_position"], order["move_position"])
 
     def test_visible_order_fails_closed_when_live_target_is_missing(self):
         player = Player()
@@ -1084,6 +1087,16 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertIn("send_authoritative_rules(player, g_base_capture)", source)
         self.assertIn("send_authoritative_result", source)
         self.assertIn("if not network_is_authority(player):", source)
+
+    def test_every_death_refreshes_the_team_score_from_alive_state(self):
+        source = (ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py").read_text()
+
+        self.assertIn("def _offh_refresh_team_score(player):", source)
+        self.assertIn("correlation.updateFrags(enemy_losses, allied_losses)", source)
+        wrapper = source[source.index("class _KillEventWrapper(object):"):]
+        wrapper = wrapper[:8000]
+        self.assertIn("_offh_refresh_team_score(_pl)", wrapper)
+        self.assertIn("BigWorld.callback(0.0", wrapper)
 
     def test_initial_spawn_uses_the_actual_lan_team(self):
         source = (ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py").read_text()

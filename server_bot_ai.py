@@ -69,6 +69,7 @@ class BotPlanner(object):
         self.revision = 0
         self._contacts = {1: {}, 2: {}}
         self._last_orders = None
+        self._last_order_signature = None
         self._route_states = {}
         self._route_assignments = {}
         self._next_route_rebalance = {1: 0.0, 2: 0.0}
@@ -81,6 +82,7 @@ class BotPlanner(object):
         self.revision = 0
         self._contacts = {1: {}, 2: {}}
         self._last_orders = None
+        self._last_order_signature = None
         self._route_states = {}
         self._route_assignments = {}
         self._next_route_rebalance = {1: 0.0, 2: 0.0}
@@ -222,9 +224,24 @@ class BotPlanner(object):
                     contacts[team], now))
         orders.sort(key=lambda value: value["id"])
         payload = {"orders": orders}
-        if payload != self._last_orders:
+        signature_orders = []
+        for order in orders:
+            signature = dict(order)
+            if (signature.get("target_id") is not None and
+                    bool(signature.get("fire_allowed"))):
+                # The authority client resolves a visible target's rendered live
+                # pose by id. Sub-metre contact movement must not create a new
+                # 29-order payload and revision on every observation frame.
+                signature.pop("aim_position", None)
+                signature.pop("face_position", None)
+                if signature.get("combat_mode") == "advance_contact":
+                    signature.pop("move_position", None)
+            signature_orders.append(signature)
+        signature_payload = {"orders": signature_orders}
+        if signature_payload != self._last_order_signature:
             self.revision += 1
-            self._last_orders = payload
+            self._last_order_signature = signature_payload
+        self._last_orders = payload
         return {"revision": self.revision, "orders": orders}
 
     def debug_summary(self, now):
@@ -377,9 +394,12 @@ class BotPlanner(object):
         desired = max(40.0, _number(profile.get("desired_range"), 180.0))
         mobility = max(_number(roles.get("scout")),
                        _number(roles.get("flanker")))
-        distance = max(220.0, min(520.0, desired * 2.0 + mobility * 300.0))
-        if not contact.get("visible"):
-            distance *= 0.75
+        if contact.get("visible"):
+            distance = max(340.0, min(560.0,
+                                     desired * 2.0 + mobility * 300.0))
+        else:
+            distance = max(240.0, min(420.0,
+                                     desired * 1.5 + mobility * 210.0))
         return distance
 
     def _assign_targets(self, bots, contacts):
@@ -781,6 +801,22 @@ class BotPlanner(object):
         elif (distance <= fire_range * 1.15 and
               self._apply_cover_order(order, bot, focus, personality, now)):
             self._engage_anchors.pop(bot["id"], None)
+        elif distance <= min(fire_range, max(150.0, desired_range * 1.35)):
+            # A visible enemy inside an effective firing envelope interrupts
+            # route travel immediately when no client-probed cover manoeuvre is
+            # active. Existing cover remains a higher-quality combat action.
+            self._cover_states.pop(bot["id"], None)
+            order["combat_mode"] = "engage"
+            target_key = (focus.get("target_kind"), focus["id"])
+            anchor_state = self._engage_anchors.get(bot["id"])
+            if anchor_state is None or anchor_state["target"] != target_key:
+                anchor_state = {
+                    "target": target_key,
+                    "position": _point(bot["state"]),
+                }
+                self._engage_anchors[bot["id"]] = anchor_state
+            order["move_position"] = dict(anchor_state["position"])
+            order["throttle_override"] = 0.0
         elif distance < close_limit and dominant != "brawler":
             self._engage_anchors.pop(bot["id"], None)
             self._cover_states.pop(bot["id"], None)
