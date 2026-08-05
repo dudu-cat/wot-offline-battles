@@ -731,8 +731,6 @@ class TerrainNavigator(object):
 			state['progress_time'] = float(now)
 			state['recovery'] = 0
 			state['recovery_until'] = 0.0
-		stalled = (state.get('path_key') is not None and
-		           float(now) - state['progress_time'] >= 4.0)
 		plan_start = tuple(anchor or current)
 		if anchor is not None:
 			# Strategic route annotations are two-dimensional and LAN protocol v5
@@ -741,26 +739,15 @@ class TerrainNavigator(object):
 			# route search start below the map and fail before its first edge.
 			plan_start = (float(plan_start[0]), float(current[1]),
 			              float(plan_start[2]))
+		# A lack of displacement is not proof that the static terrain edge is bad.
+		# It is commonly a traffic jam, a tank-to-tank push, or LocalDriver turning
+		# in place.  The former recovery path marked that edge globally, invalidated
+		# every bot's shared route, and caused an expanding replan/failure storm.
+		# LocalDriver already owns short-range stuck recovery; the terrain graph is
+		# now changed only by actual terrain/collision probes.
 		effective_key = tuple(path_key)
-		if stalled:
-			state['recovery'] = int(state.get('recovery', 0)) + 1
-			failed_target = state.get('last_target')
-			if failed_target is not None:
-				self.grid.remember_failed_segment(
-					current, failed_target, now,
-					ttl=14.0 + min(18.0, state['recovery'] * 3.0))
-			state['recovery_key'] = ('recovery', bot_id, state['recovery'],
-			                         self.grid.cell_for(current))
-			state['recovery_start'] = tuple(current)
-			state['recovery_until'] = float(now) + 6.0
-			state['progress_time'] = float(now)
-		recovering = (state.get('recovery_key') is not None and
-		              float(now) < float(state.get('recovery_until', 0.0)))
-		if recovering:
-			effective_key = state['recovery_key']
-			plan_start = state['recovery_start']
 		key, path = self._path(effective_key, plan_start, goal, now,
-		                       avoid_points if recovering else None)
+		                       None)
 		if path is None:
 			if (self.grid.segment_penalty(current, goal, now) <= 0.0 and
 					self.grid.segment_clear(current, goal)):

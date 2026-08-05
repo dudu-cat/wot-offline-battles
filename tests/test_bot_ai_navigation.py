@@ -569,7 +569,8 @@ class BotNavigationTest(unittest.TestCase):
         self.assertIn("return 20.0 - _w", water_helper)
         self.assertNotIn("water_depth > 1.0", battle_source)
         self.assertIn("wet_escape = current_water >", battle_source)
-        self.assertIn("16.0 + speed * 2.2", battle_source)
+        self.assertIn("7.0 + speed * 1.2", battle_source)
+        self.assertIn("14.0 + speed * 2.2", battle_source)
         self.assertIn("delta > run * 0.48", battle_source)
         self.assertIn("delta < -run * 0.38", battle_source)
         self.assertIn("lambda _driver_yaw: _offh_ai_direction_clear(", battle_source)
@@ -579,6 +580,39 @@ class BotNavigationTest(unittest.TestCase):
             battle_source,
         )
         self.assertIn("drive_pos = _requested_drive_pos", battle_source)
+        self.assertIn("def _offh_ai_pose_water_depth", battle_source)
+        self.assertIn("def _offh_ai_dry_rollback", battle_source)
+        self.assertIn("if distance >= 3.0:", battle_source)
+        self.assertIn("m_veh._offh_ai_driver_mode = 'water_guard'", battle_source)
+        self.assertGreater(
+            battle_source.index("# Final realised-pose water guard."),
+            battle_source.index("# --- Slope slide (bot):"),
+        )
+        lines = battle_source.splitlines()
+
+        def leading_tabs(marker):
+            line = next(line for line in lines if marker in line)
+            return len(line) - len(line.lstrip("\t"))
+
+        # The transaction must run for active battles too, and the final veto must
+        # run after both grounded slide and airborne drift before model/network state.
+        self.assertEqual(
+            leading_tabs("if not _battle_active:"),
+            leading_tabs("bot_gravity = _PHY.GRAVITY"),
+        )
+        self.assertEqual(
+            leading_tabs("# --- Slope slide (bot):"),
+            leading_tabs("# Final realised-pose water guard."),
+        )
+        final_guard = battle_source.index("# Final realised-pose water guard.")
+        self.assertLess(
+            final_guard,
+            battle_source.index("m_veh.matrix.setRotateYPR", final_guard),
+        )
+        self.assertLess(
+            final_guard,
+            battle_source.index("publish_authoritative_bots", final_guard),
+        )
 
     def test_astar_jobs_are_bounded_and_ignore_transient_vehicle_penalties(self):
         navigator = self.navigation.TerrainNavigator(
@@ -611,7 +645,7 @@ class BotNavigationTest(unittest.TestCase):
         self.assertIsNone(captured["avoid_points"])
         self.assertEqual(128, captured["max_expansions"])
 
-    def test_stalled_route_temporarily_penalizes_its_failed_first_edge(self):
+    def test_stationary_traffic_does_not_poison_the_shared_static_route(self):
         navigator = self.navigation.TerrainNavigator(
             lambda x, z, hint: 0.0,
             bounds=(-100.0, -100.0, 100.0, 100.0),
@@ -624,18 +658,19 @@ class BotNavigationTest(unittest.TestCase):
         )
         self.assertGreater(first[0], current[0])
 
+
         target = first
         for frame in range(1, 220):
             target = navigator.next_target(
                 12, current, goal, (1, "failed-road", 0),
                 frame / 30.0, anchor=current,
             )
-            if target != current and abs(target[2]) > 0.1:
-                break
-
         self.assertNotEqual(current, target)
-        self.assertGreater(abs(target[2]), 0.1)
-        self.assertTrue(navigator.grid._failed_edges)
+        self.assertEqual({}, navigator.grid._failed_edges)
+        self.assertFalse(any(
+            isinstance(key[0], tuple) and key[0] and key[0][0] == "recovery"
+            for key in navigator.searches
+        ))
 
     def test_failed_edges_are_bidirectional_bounded_and_invalidate_cached_path(self):
         grid = self.navigation.TerrainGrid(lambda x, z, hint: 0.0, cell_size=1.0)

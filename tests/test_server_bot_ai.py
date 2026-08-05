@@ -66,7 +66,10 @@ class ServerBotPlannerTests(unittest.TestCase):
                         "traversing": 11, "limited": 7},
                 "driver": {"moving": 9, "drive": 8, "avoid": 3,
                            "blocked": 6, "recovery": 7, "arrived": 5,
-                           "server_wait": 2},
+                           "server_wait": 2, "water_guard": 2},
+                "safety": {"water_guard_total": 11, "water_guard_active": 2,
+                           "veto_water": 4, "veto_terrain": 3,
+                           "veto_obstacle": 2, "veto_error": 1},
             },
         })
 
@@ -76,6 +79,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(13, state.bot_navigation_stats["search"]["pending"])
         self.assertEqual(15, state.bot_navigation_stats["aim"]["targeted"])
         self.assertEqual(9, state.bot_navigation_stats["driver"]["moving"])
+        self.assertEqual(11, state.bot_navigation_stats["safety"]["water_guard_total"])
         before = dict(state.bot_navigation_stats)
         state.update_bot_observation(2, {
             "navigation": {"total": {"reactive": 0}}
@@ -103,6 +107,7 @@ class ServerBotPlannerTests(unittest.TestCase):
             "driver=moving:9,drive:8,avoid:3,blocked:6,recovery:7,arrived:5,wait:2",
             text,
         )
+        self.assertIn("safety=guard:11/2,veto:w4,t3,o2,e1", text)
 
     def test_downloadable_layout_imports_shared_cover_module(self):
         with tempfile.TemporaryDirectory() as temp_dir:

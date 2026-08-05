@@ -432,9 +432,13 @@ class LocalDriver(object):
 					'target_yaw': recovery_yaw,
 					'recovery_mode': 'pivot_recovery',
 				}
+			# physics.traverse_step reverses the steering response once the tracks
+			# are moving backwards.  Invert the command as well so the resulting hull
+			# yaw still turns toward recovery_yaw instead of back into the blockage.
+			recovery_turn = -direction if float(speed) < -0.05 else direction
 			return {
 				'throttle': -0.72,
-				'turn': direction,
+				'turn': recovery_turn,
 				'target_yaw': recovery_yaw,
 				'recovery_mode': 'reverse_turn',
 			}
@@ -479,6 +483,11 @@ class LocalDriver(object):
 
 		delta = _angle_delta(chosen_yaw, yaw)
 		turn = max(-1.0, min(1.0, delta / 0.58))
+		# This is a target-yaw controller, not a raw keyboard input.  If recovery
+		# has left the hull rolling backwards, compensate for reverse track steering
+		# so the realised yaw still converges on chosen_yaw while it brakes to drive.
+		if float(speed) < -0.05:
+			turn = -turn
 		throttle = 1.0
 		if abs(delta) > 1.0:
 			# 0.35 cannot overcome the steering resistance in the shared vehicle

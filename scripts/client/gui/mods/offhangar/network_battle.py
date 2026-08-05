@@ -1199,12 +1199,23 @@ def publish_bot_observation(player, contacts, affordances=None, navigation=None)
 		if isinstance(raw_driver, dict):
 			shared_navigation['driver'] = {}
 			for name in ('moving', 'drive', 'avoid', 'blocked', 'recovery', 'arrived',
-					'server_wait'):
+					'server_wait', 'water_guard'):
 				try:
 					value = int(raw_driver.get(name, 0) or 0)
 				except Exception:
 					value = 0
 				shared_navigation['driver'][name] = max(0, min(value, 30))
+		raw_safety = navigation.get('safety')
+		if isinstance(raw_safety, dict):
+			shared_navigation['safety'] = {}
+			for name in ('water_guard_total', 'water_guard_active', 'veto_water',
+					'veto_terrain', 'veto_obstacle', 'veto_error'):
+				try:
+					value = int(raw_safety.get(name, 0) or 0)
+				except Exception:
+					value = 0
+				maximum = 100000 if name == 'water_guard_total' else 30
+				shared_navigation['safety'][name] = max(0, min(value, maximum))
 	return client.send_bot_observation(
 		payload, shared_affordances, shared_navigation)
 

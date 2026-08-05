@@ -515,7 +515,11 @@ def traverse_step(p, omega, steer_dir, v, dt, terrainIdx=0):
 	ter_mod = p['terrainResist'][0] / p['terrainResist'][terrainIdx]
 	max_rot = p['rotSpd'] * rot_mod * ter_mod
 
-	target = steer_dir * max_rot
+	# A tracked vehicle yaws the opposite way for the same steering input while
+	# reversing.  Keeping the forward sign made S+A rotate the hull as if it were
+	# still moving forward, and made reverse recovery steer back into the obstacle.
+	motion_sign = -1.0 if v < -0.05 else 1.0
+	target = steer_dir * motion_sign * max_rot
 	diff = target - omega
 	ramp = max_rot / ANG_ACCELERATION_TIME
 	if abs(diff) < ramp * dt:

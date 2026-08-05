@@ -8,10 +8,18 @@ from server_bot_ai import BotPlanner
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER_PATH = ROOT / "scripts/client/gui/mods/offhangar/bot_ai_driver.py"
+PHYSICS_PATH = ROOT / "scripts/client/gui/mods/offhangar/physics.py"
 
 
 def load_driver():
     spec = importlib.util.spec_from_file_location("bot_ai_driver_under_test", DRIVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_physics():
+    spec = importlib.util.spec_from_file_location("physics_under_test", PHYSICS_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -162,6 +170,48 @@ class BotAIDriverTest(unittest.TestCase):
         self.assertGreater(order["throttle"], 0.9)
         self.assertAlmostEqual(0.0, order["turn"], places=5)
         self.assertAlmostEqual(0.0, order["target_yaw"], places=5)
+
+    def test_reverse_steering_yaws_opposite_to_forward_steering(self):
+        physics = load_physics()
+        params = {
+            "speedFwd": 12.0,
+            "rotSpd": 1.0,
+            "terrainResist": (1.0, 1.0, 1.0),
+        }
+
+        forward = physics.traverse_step(params, 0.0, -1.0, 2.0, 0.1)
+        reverse = physics.traverse_step(params, 0.0, -1.0, -2.0, 0.1)
+
+        self.assertLess(forward, 0.0)
+        self.assertGreater(reverse, 0.0)
+
+    def test_reverse_recovery_command_compensates_for_reverse_physics(self):
+        driver = self.module.LocalDriver(stuck_seconds=0.4, recovery_seconds=0.8)
+        order = None
+        for unused in range(10):
+            order = driver.drive(
+                303, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+                (0.0, 0.0, 50.0), (), lambda angle: True,
+            )
+            if order["recovery_mode"] == "reverse_turn":
+                break
+        order = driver.drive(
+            303, (0.0, 0.0, 0.0), 0.0, -2.0, 0.1,
+            (0.0, 0.0, 50.0), (), lambda angle: True,
+        )
+
+        self.assertEqual("reverse_turn", order["recovery_mode"])
+        self.assertLess(order["turn"] * order["target_yaw"], 0.0)
+
+    def test_target_yaw_controller_compensates_while_rolling_backwards(self):
+        driver = self.module.LocalDriver()
+        order = driver.drive(
+            304, (0.0, 0.0, 0.0), 0.0, -2.0, 0.1,
+            (50.0, 0.0, 0.0), (), lambda angle: True,
+        )
+
+        self.assertGreater(order["target_yaw"], 0.0)
+        self.assertLess(order["turn"], 0.0)
 
     def test_reaching_a_target_never_turns_zero_vector_into_full_throttle(self):
         driver = self.module.LocalDriver()

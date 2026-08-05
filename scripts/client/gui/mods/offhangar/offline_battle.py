@@ -663,6 +663,133 @@ def _offh_water_depth(x, y, z):
 _OFFH_AI_WATER_AVOID_DEPTH = 0.12
 
 
+def _offh_ai_probe_reject(vehicle, reason):
+	'''Remember a short-lived probe reason for aggregate LAN diagnostics.'''
+	try:
+		import BigWorld
+		vehicle._offh_ai_probe_reject = str(reason)
+		vehicle._offh_ai_probe_reject_until = BigWorld.time() + 0.75
+	except Exception:
+		pass
+	return False
+
+
+def _offh_ai_pose_water_depth(vehicle, position=None, yaw=None):
+	'''Maximum water depth below the centre and four corners of a bot hull.
+
+	Direction feelers only describe commanded drive.  Tank impulses, lateral slope
+	slide and ballistic drift can move a hull somewhere else, so the final realised
+	pose needs an independent footprint check.  A fine pose cache keeps the five
+	terrain + water probes off frames where a slow tank has barely moved.'''
+	try:
+		import BigWorld, Math, math
+		if position is None:
+			position = vehicle.position
+		if yaw is None:
+			yaw = float(vehicle.yaw)
+		px = float(position.x)
+		py = float(position.y)
+		pz = float(position.z)
+		key = (int(math.floor(px * 5.0 + 0.5)),
+		       int(math.floor(py * 2.0 + 0.5)),
+		       int(math.floor(pz * 5.0 + 0.5)),
+		       int(math.floor(float(yaw) * 16.0 + 0.5)))
+		cached = getattr(vehicle, '_offh_ai_water_pose_cache', None)
+		if cached is not None and cached[0] == key:
+			return cached[1]
+		half_length, half_width = _offh_ai_hull_dims(
+			getattr(vehicle, 'typeDescriptor', None))
+		half_length = max(1.5, float(half_length) + 0.25)
+		half_width = max(0.8, float(half_width) + 0.20)
+		forward_x = math.sin(float(yaw))
+		forward_z = math.cos(float(yaw))
+		side_x = math.cos(float(yaw))
+		side_z = -math.sin(float(yaw))
+		local_points = ((0.0, 0.0),
+		                (-half_width, -half_length),
+		                (half_width, -half_length),
+		                (-half_width, half_length),
+		                (half_width, half_length))
+		maximum = -1.0
+		for side, forward in local_points:
+			x = px + side_x * side + forward_x * forward
+			z = pz + side_z * side + forward_z * forward
+			probe_top = py + 8.0
+			ground_y = None
+			for unused in range(3):
+				hit = BigWorld.wg_collideSegment(
+					_offh_bspace(), Math.Vector3(x, probe_top, z),
+					Math.Vector3(x, py - 60.0, z), 128)
+				if hit is None:
+					break
+				ground_y = float(hit[0].y)
+				if ground_y <= py + 4.5:
+					break
+				probe_top = ground_y - 0.35
+				ground_y = None
+			if ground_y is None:
+				continue
+			depth = _offh_water_depth(x, ground_y, z)
+			if depth > maximum:
+				maximum = depth
+		vehicle._offh_ai_water_pose_cache = (key, maximum)
+		return maximum
+	except Exception:
+		_offh_ai_probe_reject(vehicle, 'error')
+		return -1.0
+
+
+def _offh_ai_remember_dry_pose(vehicle, now=None):
+	'''Keep a short dry trail so a water veto can retreat beyond a one-way lip.'''
+	try:
+		import BigWorld, math
+		if now is None:
+			now = BigWorld.time()
+		position = vehicle.position
+		pose = (float(now), float(position.x), float(position.y), float(position.z))
+		history = getattr(vehicle, '_offh_ai_dry_history', None)
+		if history is None:
+			history = []
+			vehicle._offh_ai_dry_history = history
+		if history:
+			last = history[-1]
+			distance = math.sqrt((pose[1] - last[1]) ** 2 +
+			                     (pose[3] - last[3]) ** 2)
+			if distance < 0.8 and pose[0] - last[0] < 0.8:
+				vehicle._offh_ai_dry_anchor = pose[1:]
+				return
+		history.append(pose)
+		if len(history) > 12:
+			del history[:-12]
+		vehicle._offh_ai_dry_anchor = pose[1:]
+	except Exception:
+		pass
+
+
+def _offh_ai_dry_rollback(vehicle):
+	'''Return and retain a dry pose at least 3 m behind the wet realised pose.'''
+	try:
+		import math
+		position = vehicle.position
+		history = getattr(vehicle, '_offh_ai_dry_history', None) or []
+		chosen_index = None
+		for index in range(len(history) - 1, -1, -1):
+			pose = history[index]
+			distance = math.sqrt((float(position.x) - pose[1]) ** 2 +
+			                     (float(position.z) - pose[3]) ** 2)
+			if distance >= 3.0:
+				chosen_index = index
+				break
+		if chosen_index is not None:
+			pose = history[chosen_index]
+			del history[chosen_index + 1:]
+			vehicle._offh_ai_dry_anchor = pose[1:]
+			return pose[1:]
+	except Exception:
+		pass
+	return getattr(vehicle, '_offh_ai_dry_anchor', None)
+
+
 def _offh_refresh_team_score(player):
 	'''Refresh the top HUD score from canonical alive state after any death.
 
@@ -1611,6 +1738,7 @@ def _offh_ai_navigator(director):
 	navigator = TerrainNavigator(_ground_probe, _obstacle_probe,
 	                             getattr(director, 'bounds', None), 18.0)
 	globals()['g_offh_terrain_navigator'] = navigator
+	globals()['g_offh_ai_water_guard_total'] = 0
 	LOG_DEBUG('OfflineBattle.SMART_AI terrain navigation enabled cell=18m')
 	return navigator
 
@@ -1649,11 +1777,15 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 	"""Probe one hull-width movement corridor for the engine-free driver."""
 	try:
 		import BigWorld, Math, math
-		speed = abs(float(getattr(vehicle, '_veh_velocity', 0.0) or 0.0))
-		# Start braking well before a shoreline. The old 10/20 m ray was shorter
-		# than the stopping/turning envelope of a fast heavy tank, so a direction
-		# could become blocked only after momentum had already committed the hull.
-		lookahead = max(18.0, min(38.0, 16.0 + speed * 2.2))
+		velocity = float(getattr(vehicle, '_veh_velocity', 0.0) or 0.0)
+		speed = abs(velocity)
+		# A city turn needs only a local driving corridor.  The former 18-38 m
+		# straight wall sweep looked through the next bend into a building and
+		# rejected every candidate, even though the road immediately ahead was open.
+		lookahead = max(8.0, min(20.0, 7.0 + speed * 1.2))
+		# Water/drop detection remains long-range and follows the realised momentum
+		# corridor below, so shortening the wall sweep does not shorten braking room.
+		hazard_lookahead = max(14.0, min(38.0, 14.0 + speed * 2.2))
 		ground_step = 3.0
 		try:
 			_unused_length, hull_half_width = _offh_ai_hull_dims(
@@ -1687,35 +1819,38 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 				_offh_bspace(), Math.Vector3(x, previous_y + probe_up, z),
 				Math.Vector3(x, previous_y - probe_down, z), 128)
 			if ground is None:
-				return False
+				return _offh_ai_probe_reject(vehicle, 'terrain')
 			y = float(ground[0].y)
 			water_depth = _offh_water_depth(x, y, z)
 			if wet_escape:
 				# A tank already touching water may take only a route that never gets
 				# deeper and finishes measurably closer to dry ground.
 				if water_depth > current_water + 0.10:
-					return False
+					return _offh_ai_probe_reject(vehicle, 'water')
 			else:
 				if water_depth > _OFFH_AI_WATER_AVOID_DEPTH:
-					return False
+					return _offh_ai_probe_reject(vehicle, 'water')
 			last_water = water_depth
 			delta = y - previous_y
 			if delta > run * 0.48 or delta < -run * 0.38:
-				return False
+				return _offh_ai_probe_reject(vehicle, 'terrain')
 			previous_y = y
 			previous_distance = distance
 		if wet_escape and last_water > max(
 				_OFFH_AI_WATER_AVOID_DEPTH, current_water - 0.15):
-			return False
+			return _offh_ai_probe_reject(vehicle, 'water')
 		# Turning tanks initially continue along a blend of the old and requested
 		# headings. Probe that momentum corridor too; a safe straight ray on the far
 		# side of a turn must not hide water directly under the actual arc.
 		if not wet_escape and speed > 1.25:
-			delta_yaw = float(absolute_yaw) - float(vehicle.yaw)
+			motion_heading = float(vehicle.yaw)
+			if velocity < -0.05:
+				motion_heading += math.pi
+			delta_yaw = float(absolute_yaw) - motion_heading
 			while delta_yaw > math.pi: delta_yaw -= math.pi * 2.0
 			while delta_yaw < -math.pi: delta_yaw += math.pi * 2.0
-			motion_yaw = float(vehicle.yaw) + delta_yaw * 0.45
-			motion_distance = min(lookahead, max(9.0, speed * 1.6))
+			motion_yaw = motion_heading + delta_yaw * 0.45
+			motion_distance = min(hazard_lookahead, max(9.0, speed * 2.0))
 			motion_step = 4.0
 			probe_distance = motion_step
 			motion_y = float(vehicle.position.y)
@@ -1726,11 +1861,26 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 					_offh_bspace(), Math.Vector3(mx, motion_y + 6.0, mz),
 					Math.Vector3(mx, motion_y - 8.0, mz), 128)
 				if motion_ground is None:
-					return False
+					return _offh_ai_probe_reject(vehicle, 'terrain')
 				motion_y = float(motion_ground[0].y)
 				if _offh_water_depth(mx, motion_y, mz) > _OFFH_AI_WATER_AVOID_DEPTH:
-					return False
+					return _offh_ai_probe_reject(vehicle, 'water')
 				probe_distance += motion_step
+		# Check the two outer tracks at the selected local endpoint.  The final-pose
+		# guard below catches all realised motion, while this cheaper early veto lets
+		# LocalDriver choose a dry candidate before a track hangs over the bank.
+		for offset in (-corridor_half_width, corridor_half_width):
+			x = (float(vehicle.position.x) + sine * lookahead +
+			     lateral_x * offset)
+			z = (float(vehicle.position.z) + cosine * lookahead +
+			     lateral_z * offset)
+			ground = BigWorld.wg_collideSegment(
+				_offh_bspace(), Math.Vector3(x, previous_y + 6.0, z),
+				Math.Vector3(x, previous_y - 12.0, z), 128)
+			if ground is None:
+				return _offh_ai_probe_reject(vehicle, 'terrain')
+			if _offh_water_depth(x, float(ground[0].y), z) > _OFFH_AI_WATER_AVOID_DEPTH:
+				return _offh_ai_probe_reject(vehicle, 'water')
 		# Sweep the complete supported corridor at two hull heights. This remains
 		# cheaper than repeating three collision rays at every ground sample.
 		final_x = float(vehicle.position.x) + sine * lookahead
@@ -1746,10 +1896,10 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 					final_z + lateral_z * offset)
 				if BigWorld.wg_collideSegment(
 						_offh_bspace(), start, end, 128) is not None:
-					return False
+					return _offh_ai_probe_reject(vehicle, 'obstacle')
 		return True
 	except Exception:
-		return False
+		return _offh_ai_probe_reject(vehicle, 'error')
 
 
 def _offh_ai_class_tag(mock, descriptor):
@@ -2216,7 +2366,13 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 			_aim = {'alive': 0, 'targeted': 0, 'aligned': 0,
 			        'traversing': 0, 'limited': 0}
 			_driver = {'moving': 0, 'drive': 0, 'avoid': 0, 'blocked': 0,
-			           'recovery': 0, 'arrived': 0, 'server_wait': 0}
+			           'recovery': 0, 'arrived': 0, 'server_wait': 0,
+			           'water_guard': 0}
+			_safety = {'water_guard_total': int(
+				globals().get('g_offh_ai_water_guard_total', 0) or 0),
+				'water_guard_active': 0, 'veto_water': 0,
+				'veto_terrain': 0, 'veto_obstacle': 0, 'veto_error': 0}
+			_diag_now = BigWorld.time()
 			for _aim_vehicle in (mock_vehicles or {}).values():
 				if (getattr(_aim_vehicle, '_network_bot_id', None) is None or
 						not getattr(_aim_vehicle, 'isAlive', False)):
@@ -2234,8 +2390,16 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 					_driver_mode = 'recovery'
 				if _driver_mode in _driver:
 					_driver[_driver_mode] += 1
+				if float(getattr(_aim_vehicle, '_offh_ai_water_guard_until', 0.0) or 0.0) > _diag_now:
+					_safety['water_guard_active'] += 1
+				if float(getattr(_aim_vehicle, '_offh_ai_probe_reject_until', 0.0) or 0.0) > _diag_now:
+					_reason = getattr(_aim_vehicle, '_offh_ai_probe_reject', '')
+					_reason_key = 'veto_' + str(_reason)
+					if _reason_key in _safety:
+						_safety[_reason_key] += 1
 			_navigation['aim'] = _aim
 			_navigation['driver'] = _driver
+			_navigation['safety'] = _safety
 		publish_bot_observation(
 			player, network_contacts, cover_reports, _navigation)
 	except Exception:
@@ -9218,6 +9382,18 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# -0.5): the law scales engine force by it, like a part-pressed
 							# key. Slope probe stays rate-limited (~7x/s per bot).
 							bot_gravity = _PHY.GRAVITY
+							# Seed the rollback point before any commanded movement, tank impulse,
+							# airborne drift or slope slide can move this hull during the tick.
+							_initial_water = _offh_ai_pose_water_depth(m_veh)
+							if _initial_water <= _OFFH_AI_WATER_AVOID_DEPTH:
+								# Transaction start: this exact dry pose is restored before the
+								# matrix/network state is committed if any later motion becomes wet.
+								m_veh._offh_ai_tick_dry_pose = (
+									float(m_veh.position.x), float(m_veh.position.y),
+									float(m_veh.position.z))
+								_offh_ai_remember_dry_pose(m_veh)
+							else:
+								m_veh._offh_ai_tick_dry_pose = None
 							cur_vel = m_veh._veh_velocity
 							if not getattr(m_veh, '_airborne', False) and (throttle != 0 or abs(cur_vel) > 0.01):
 								m_veh._dp_acc = (getattr(m_veh, '_dp_acc', 9.0) or 9.0) + dt
@@ -9432,17 +9608,79 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							else:
 								m_veh._air_lat_vx = _bsl_dx * _bss
 								m_veh._air_lat_vz = _bsl_dz * _bss
-							if not getattr(m_veh, '_airborne', False) and _bss > 0.01 and (abs(_bsl_dx) > 1e-04 or abs(_bsl_dz) > 1e-04):
-								_slb_x = m_veh.position.x + _bsl_dx * _bss * dt
-								_slb_z = m_veh.position.z + _bsl_dz * _bss * dt
-								try:
-									_slb_c = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(_slb_x, m_veh.position.y + 8.0, _slb_z), Math.Vector3(_slb_x, m_veh.position.y - 30.0, _slb_z), 128)
-								except Exception:
-									_slb_c = None
-								if _slb_c is not None and (m_veh.position.y - _slb_c[0].y) < 4.0:
-									m_veh.position = Math.Vector3(_slb_x, _slb_c[0].y, _slb_z)
+								if not getattr(m_veh, '_airborne', False) and _bss > 0.01 and (abs(_bsl_dx) > 1e-04 or abs(_bsl_dz) > 1e-04):
+									_slb_len = math.sqrt(_bsl_dx * _bsl_dx + _bsl_dz * _bsl_dz)
+									_slide_blocked_by_water = False
+									if _slb_len > 1e-04:
+										# Look ahead along the gravity-driven path, not the commanded
+										# heading. This catches a tank sliding sideways toward a one-way
+										# shoreline lip before the current frame actually crosses it.
+										_slide_forecast = max(3.0, min(8.0, _bss * _slb_len * 1.5))
+										_slide_probe = Math.Vector3(
+											m_veh.position.x + _bsl_dx / _slb_len * _slide_forecast,
+											m_veh.position.y,
+											m_veh.position.z + _bsl_dz / _slb_len * _slide_forecast)
+										if _offh_ai_pose_water_depth(
+												m_veh, _slide_probe, m_veh.yaw) > _OFFH_AI_WATER_AVOID_DEPTH:
+											_slide_blocked_by_water = True
+											m_veh._slide_spd = 0.0
+											m_veh._air_lat_vx = 0.0
+											m_veh._air_lat_vz = 0.0
+											_offh_ai_probe_reject(m_veh, 'water')
+											try:
+												_offh_ai_driver().remember_failure(eid, target_yaw, 5.0)
+											except Exception:
+												pass
+										_slb_x = m_veh.position.x + _bsl_dx * _bss * dt
+										_slb_z = m_veh.position.z + _bsl_dz * _bss * dt
+										try:
+											_slb_c = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(_slb_x, m_veh.position.y + 8.0, _slb_z), Math.Vector3(_slb_x, m_veh.position.y - 30.0, _slb_z), 128)
+										except Exception:
+											_slb_c = None
+										if (not _slide_blocked_by_water and _slb_c is not None and
+												(m_veh.position.y - _slb_c[0].y) < 4.0):
+											m_veh.position = Math.Vector3(_slb_x, _slb_c[0].y, _slb_z)
+											m_veh._vert_vel = 0.0
+											m_veh._airborne = False
+							# Final realised-pose water guard.  This is intentionally after all
+							# horizontal drive, vehicle impulses, vertical falling and lateral slope
+							# slide: none of those paths may push an autonomous hull over a wet bank.
+							_pose_water = _offh_ai_pose_water_depth(m_veh)
+							if _pose_water > _OFFH_AI_WATER_AVOID_DEPTH:
+								# Normal case: cancel this frame's motion before it is rendered or
+								# published. The older trail is only for a pose that was already wet
+								# when this frame began (streaming/probe edge case).
+								_dry_anchor = getattr(m_veh, '_offh_ai_tick_dry_pose', None)
+								if _dry_anchor is None:
+									_dry_anchor = _offh_ai_dry_rollback(m_veh)
+								if _dry_anchor is not None:
+									m_veh.position = Math.Vector3(
+										_dry_anchor[0], _dry_anchor[1], _dry_anchor[2])
+									m_veh._veh_velocity = 0.0
+									m_veh._veh_turn_velocity = 0.0
+									m_veh._slide_spd = 0.0
+									m_veh._air_lat_vx = 0.0
+									m_veh._air_lat_vz = 0.0
 									m_veh._vert_vel = 0.0
 									m_veh._airborne = False
+									m_veh._push_x = 0.0
+									m_veh._push_z = 0.0
+									m_veh._offh_ai_driver_mode = 'water_guard'
+									m_veh._offh_ai_water_guard_until = BigWorld.time() + 1.0
+									globals()['g_offh_ai_water_guard_total'] = int(
+										globals().get('g_offh_ai_water_guard_total', 0) or 0) + 1
+									try:
+										_offh_ai_driver().remember_failure(
+											eid, target_yaw, 5.0)
+									except Exception:
+										pass
+									m_veh._ypr_c = _get_terrain_ypr(
+										_offh_bspace(), m_veh.position, m_veh.yaw)
+									_b_ypr = (m_veh.yaw, m_veh._ypr_c[1],
+									          m_veh._ypr_c[2], m_veh._ypr_c[3],
+									          m_veh._ypr_c[4], m_veh._ypr_c[5])
+							else:
+								_offh_ai_remember_dry_pose(m_veh)
 							# Smooth pitch/roll so bots don't jitter on rough terrain
 							_b_blend = min(1.0, dt * 8.0)
 							_b_p0 = getattr(m_veh, 'pitch', 0.0) or 0.0

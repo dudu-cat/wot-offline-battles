@@ -226,6 +226,10 @@ class LANClientQueueTest(unittest.TestCase):
                     "traversing": 11, "limited": 7, "ignored": 999},
             "driver": {"moving": 9, "drive": 8, "avoid": 3,
                        "blocked": 6, "recovery": 7, "arrived": 5,
+                       "water_guard": 2, "ignored": 999},
+            "safety": {"water_guard_total": 100005, "water_guard_active": 2,
+                       "veto_water": 4, "veto_terrain": 3,
+                       "veto_obstacle": 2, "veto_error": 1,
                        "ignored": 999},
         }
         self.assertTrue(self.network.publish_bot_observation(
@@ -248,7 +252,11 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertNotIn("ignored", navigation["aim"])
         self.assertEqual(9, navigation["driver"]["moving"])
         self.assertEqual(6, navigation["driver"]["blocked"])
+        self.assertEqual(2, navigation["driver"]["water_guard"])
         self.assertNotIn("ignored", navigation["driver"])
+        self.assertEqual(100000, navigation["safety"]["water_guard_total"])
+        self.assertEqual(4, navigation["safety"]["veto_water"])
+        self.assertNotIn("ignored", navigation["safety"])
 
         captured[:] = []
         malformed_contact = dict(contact, position={"x": 1})

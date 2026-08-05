@@ -193,7 +193,10 @@ class BattleState:
                     "traversing": 0, "limited": 0},
             "driver": {"moving": 0, "drive": 0, "avoid": 0,
                        "blocked": 0, "recovery": 0, "arrived": 0,
-                       "server_wait": 0},
+                       "server_wait": 0, "water_guard": 0},
+            "safety": {"water_guard_total": 0, "water_guard_active": 0,
+                       "veto_water": 0, "veto_terrain": 0,
+                       "veto_obstacle": 0, "veto_error": 0},
         }
         self.next_bot_ai_log = 0.0
         self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
@@ -239,7 +242,10 @@ class BattleState:
                         "traversing": 0, "limited": 0},
                 "driver": {"moving": 0, "drive": 0, "avoid": 0,
                            "blocked": 0, "recovery": 0, "arrived": 0,
-                           "server_wait": 0},
+                           "server_wait": 0, "water_guard": 0},
+                "safety": {"water_guard_total": 0, "water_guard_active": 0,
+                           "veto_water": 0, "veto_terrain": 0,
+                           "veto_obstacle": 0, "veto_error": 0},
             }
             self.pending_events.append({
                 "kind": "authority",
@@ -339,7 +345,10 @@ class BattleState:
                             "traversing": 0, "limited": 0},
                     "driver": {"moving": 0, "drive": 0, "avoid": 0,
                                "blocked": 0, "recovery": 0, "arrived": 0,
-                               "server_wait": 0},
+                               "server_wait": 0, "water_guard": 0},
+                    "safety": {"water_guard_total": 0, "water_guard_active": 0,
+                               "veto_water": 0, "veto_terrain": 0,
+                               "veto_obstacle": 0, "veto_error": 0},
                 }
                 self.next_bot_ai_log = 0.0
                 self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
@@ -614,9 +623,18 @@ class BattleState:
                     raw_driver = {}
                 navigation["driver"] = {}
                 for name in ("moving", "drive", "avoid", "blocked", "recovery",
-                             "arrived", "server_wait"):
+                             "arrived", "server_wait", "water_guard"):
                     navigation["driver"][name] = max(0, min(
                         int(_finite_float(raw_driver.get(name), 0)), 30))
+                raw_safety = raw_navigation.get("safety")
+                if not isinstance(raw_safety, dict):
+                    raw_safety = {}
+                navigation["safety"] = {}
+                for name in ("water_guard_total", "water_guard_active", "veto_water",
+                             "veto_terrain", "veto_obstacle", "veto_error"):
+                    maximum = 100000 if name == "water_guard_total" else 30
+                    navigation["safety"][name] = max(0, min(
+                        int(_finite_float(raw_safety.get(name), 0)), maximum))
                 self.bot_navigation_stats = navigation
             return accepted_contacts > 0 or accepted_affordances > 0
 
@@ -986,7 +1004,8 @@ class BattleState:
                 "astar=pending:%d,oldest:%dms,tick_age:%dms,done:%d,failed:%d "
                 "orders=server:%d,client:%d,loaded:%d,acked:%d "
                 "aim=targeted:%d,aligned:%d,traversing:%d,limited:%d,alive:%d "
-                "driver=moving:%d,drive:%d,avoid:%d,blocked:%d,recovery:%d,arrived:%d,wait:%d" % (
+                "driver=moving:%d,drive:%d,avoid:%d,blocked:%d,recovery:%d,arrived:%d,wait:%d "
+                "safety=guard:%d/%d,veto:w%d,t%d,o%d,e%d" % (
                     reports.get(1, 0), reports.get(2, 0), reports.get("accepted", 0),
                     teams[1]["visible"], teams[1]["contacts"],
                     teams[2]["visible"], teams[2]["contacts"],
@@ -1019,7 +1038,13 @@ class BattleState:
                     navigation.get("driver", {}).get("blocked", 0),
                     navigation.get("driver", {}).get("recovery", 0),
                     navigation.get("driver", {}).get("arrived", 0),
-                    navigation.get("driver", {}).get("server_wait", 0)))
+                    navigation.get("driver", {}).get("server_wait", 0),
+                    navigation.get("safety", {}).get("water_guard_total", 0),
+                    navigation.get("safety", {}).get("water_guard_active", 0),
+                    navigation.get("safety", {}).get("veto_water", 0),
+                    navigation.get("safety", {}).get("veto_terrain", 0),
+                    navigation.get("safety", {}).get("veto_obstacle", 0),
+                    navigation.get("safety", {}).get("veto_error", 0)))
         failed_recipients = []
         for player in recipients:
             outgoing = snapshot
