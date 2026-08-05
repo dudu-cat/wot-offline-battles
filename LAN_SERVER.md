@@ -1,29 +1,43 @@
-# LAN battle MVP
+# LAN battle server
 
-This repository contains an optional LAN battle path for the 0.8.2 offline client.
-The normal offline mode remains available. The server-backed path also works
-with one connected player and reuses the existing garage, map loading, tank
-models, HUD and local driving code. A separate Python 3 process owns the shared
-roster, health, deaths, battle rules, global bot orders and the relay for
-human/bot movement, firing and client-resolved armor impacts.
+This repository contains the shared Python 3 server for the 0.8.2 offline
+client and the pinned Chinese 0.9.22.0.1 `#1513` port. A server-backed battle
+works with one connected player. The server owns the room, teams and slots,
+canonical health, deaths, accepted shot events and round phase. Clients retain
+the proprietary map queries, entity presentation and collision/armor work.
 
 ## Start the server
 
 Run this on the machine that hosts the battle:
 
 ```bash
-python3 lan_battle_server.py --host 0.0.0.0 --port 28782
+python3 lan_battle_server.py --host 0.0.0.0 --port 28782 --map server_random
 ```
 
-With no `--map` argument, the server chooses the map initially highlighted in
-the waiting room. `--map 04_himmelsdorf` changes that initial selection; any
+`server_random` chooses the map initially highlighted in the waiting room.
+`--map 04_himmelsdorf` changes that initial selection; any
 waiting player can still choose another stock map before clicking start.
 
 Allow TCP port `28782` through the host firewall if clients are on another
 machine. Use the host machine's LAN address, for example `192.168.1.20`, in
 the client configuration.
 
-## Enable the client path
+## Install a client
+
+### World of Tanks 0.9.22.0.1 #1513
+
+Use the hash-named folder built under `ports/0.9.22/dist/`, or the corresponding
+copy-ready deliverable. Close the game, remove older
+`org.peng.offline_lan_0922_*.wotmod` files, and merge its `mods` directory into
+the client root. Configure `mods/configs/offline_lan_0922/config.json` with the
+server's LAN address. The mod connects automatically and opens the stock
+training settings map picker; select a standard map with the mouse and use the
+window's primary action. See `ports/0.9.22/INSTALL.txt` for details.
+
+The 0.9.22 port always uses this server when enabled, including for one player.
+It does not have an old-AI or local-only fallback.
+
+### World of Tanks 0.8.2
 
 Close the game and refresh each Windows client from this repository:
 
@@ -58,8 +72,9 @@ module runs inside the embedded Python 2 runtime shipped with the 0.8.2 client.
 
 The start button appears after the server accepts the client and sends the
 `welcome` message.
-A client that connects after `BATTLE START` receives a `LATE JOIN` message and
-enters the current round on the same map.
+A connection made after `BATTLE START` is rejected until the round returns to
+the waiting room. This keeps the manifest at exactly 15 occupied human or bot
+slots per team.
 
 There is no independent client-side LAN countdown. A failed LAN connection
 does not silently fall back to a local random battle. Use the queue screen's
@@ -143,16 +158,23 @@ For nearby visible contacts the authority also probes a bounded fan of
 drivable, dry, low-slope cover and peek points. The server validates those
 points against the bot's shared pose, scores them by role/personality, reserves
 them across the team, and controls the approach/hold/peek/return cycle. The
-authority client executes those orders with the real map collision, local
+0.8.2 authority client executes those orders with the real map collision, local
 driver, armor and shell systems, then publishes canonical pose/fire/HP state.
 Every client therefore renders the same population and combat result. If the
 authority disconnects, the server elects the next player, preserves canonical
 bot/HP/rules state, and clears the departed client's short-lived contacts and
 cover probes until the new authority reports its own observations. The same
-authority publishes
+0.8.2 authority publishes
 base-capture progress, capture interruption and the final winner/reason for
 capture, team elimination or timer expiry. The server remains the shared
 source of truth for HP and the final battle result.
+
+The 0.9.22 authority now reports bounded visibility observations and consumes
+the server planner's revisioned global `bot_orders` as macro targets. It still
+owns BigWorld terrain queries and local collision/water/slope avoidance, and
+falls back to its local planner when no server order is available. Its standard
+battles end by team elimination and reset to the waiting room after three
+seconds; base capture is not implemented there.
 
 ### Bot planner portability boundary
 
@@ -187,7 +209,7 @@ retail server's authoritative physics, complete cross-client module/crew
 state, reconnection recovery, anti-cheat, NAT traversal or internet-safe
 authentication. Keep it on a trusted LAN while testing.
 
-## Disable or roll back
+## Disable or roll back 0.8.2
 
 Set `network_mode` back to `false` to return to the original offline path. The
 Git baseline before the LAN changes is:

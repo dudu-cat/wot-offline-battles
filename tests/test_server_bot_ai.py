@@ -38,7 +38,410 @@ def _cover_candidate(candidate_id="rock", x=-8.0, z=-12.0):
     }
 
 
+def _wire_manifest(state):
+    return [dict(value, vehicle="ussr:R11_MS-1", health=500,
+                 max_health=500, x=float(value["slot"]), y=0.0,
+                 z=-20.0 if value["team"] == 1 else 20.0,
+                 yaw=0.0 if value["team"] == 1 else 3.14)
+            for value in state.bot_roster]
+
+
+def _wire_states(state):
+    return [dict(value) for unused_id, value in sorted(state.bot_states.items())]
+
+
 class ServerBotPlannerTests(unittest.TestCase):
+    def _started_state(self, players=1):
+        state = BattleState(map_name="04_himmelsdorf")
+        for player_id in range(1, players + 1):
+            team = 1 if player_id % 2 else 2
+            slot = (player_id - 1) // 2
+            state.players[player_id] = Player(
+                player_id, object(), ("127.0.0.1", player_id),
+                team=team, slot=slot)
+        state.request_start(1)
+        return state
+
+    def test_map_pool_is_unique_and_invalid_fixed_map_fails_early(self):
+        from lan_battle_server import MAP_POOL
+
+        self.assertEqual(len(MAP_POOL), len(set(MAP_POOL)))
+        with self.assertRaises(ValueError):
+            BattleState(map_name="not_a_standard_map")
+
+    def test_manifest_must_cover_exact_final_roster_atomically(self):
+        state = self._started_state(players=1)
+        manifest = _wire_manifest(state)
+
+        self.assertFalse(state.update_bot_manifest(1, {
+            "bots": manifest[:-1]}))
+        self.assertEqual([], state.bot_manifest)
+        duplicate = list(manifest)
+        duplicate[-1] = dict(duplicate[0])
+        self.assertFalse(state.update_bot_manifest(1, {"bots": duplicate}))
+        self.assertEqual([], state.bot_manifest)
+        self.assertTrue(state.update_bot_manifest(1, {"bots": manifest}))
+        self.assertEqual(len(state.bot_roster), len(state.bot_manifest))
+        self.assertEqual({value["id"] for value in state.bot_roster},
+                         set(state.bot_states))
+
+    def test_empty_full_human_manifest_rejects_injected_bot_atomically(self):
+        state = self._started_state(players=30)
+        self.assertEqual([], state.bot_roster)
+
+        self.assertFalse(state.update_bot_manifest(1, {"bots": [{"id": 99}]}))
+        self.assertIsNone(state.bot_manifest_authority_id)
+        self.assertTrue(state.update_bot_manifest(1, {"bots": []}))
+        self.assertEqual(1, state.bot_manifest_authority_id)
+
+    def test_modern_round_id_fences_late_battle_messages(self):
+        state = self._started_state(players=1)
+        stale_round = state.round_id - 1
+
+        self.assertFalse(state.update_input(1, {
+            "round_id": stale_round, "fire_seq": 1}))
+        self.assertEqual(0, state.players[1].fire_seq)
+        self.assertFalse(state.update_bot_manifest(1, {
+            "round_id": stale_round, "bots": _wire_manifest(state)}))
+        self.assertEqual([], state.bot_manifest)
+        self.assertFalse(state.report_battle_result(1, {
+            "round_id": stale_round, "winner": 1, "reason": "late"}))
+        self.assertIsNone(state.battle_result)
+
+        self.assertTrue(state.update_bot_manifest(1, {
+            "round_id": state.round_id, "bots": _wire_manifest(state)}))
+
+    def test_malformed_combat_messages_do_not_mutate_round(self):
+        state = self._started_state(players=2)
+        state.players[1].fire_seq = 1
+        before_health = state.players[2].health
+
+        self.assertFalse(state.report_hit(1, {
+            "target": 2, "shot_seq": 1}))
+        self.assertFalse(state.report_hit(1, {
+            "target": 2, "shot_seq": 1, "damage": "invalid"}))
+        self.assertEqual(before_health, state.players[2].health)
+        self.assertEqual(set(), state.players[1].reported_hits)
+        self.assertFalse(state.update_bot_observation(1, {
+            "contacts": {"not": "a list"}}))
+        self.assertFalse(state.report_battle_result(1, {"winner": 1}))
+        self.assertIsNone(state.battle_result)
+
+    def test_human_fire_edges_must_be_contiguous(self):
+        state = self._started_state(players=1)
+
+        state.update_input(1, {"fire_seq": 3})
+        self.assertEqual(0, state.players[1].fire_seq)
+        self.assertEqual([], [value for value in state.pending_events
+                              if value.get("kind") == "shot"])
+
+        state.update_input(1, {"fire_seq": 1})
+        self.assertEqual(1, state.players[1].fire_seq)
+        self.assertEqual([1], [value["shot_seq"]
+                               for value in state.pending_events
+                               if value.get("kind") == "shot"])
+
+    def test_bot_state_batch_is_complete_atomic_and_fire_edge_is_contiguous(self):
+        state = self._started_state(players=1)
+        self.assertTrue(state.update_bot_manifest(
+            1, {"bots": _wire_manifest(state)}))
+        states = _wire_states(state)
+        first_id = states[0]["id"]
+        original_x = state.bot_states[first_id]["x"]
+        incomplete = [dict(value) for value in states[:-1]]
+        incomplete[0]["x"] = 99.0
+
+        self.assertFalse(state.update_bot_states(1, {"bots": incomplete}))
+        self.assertEqual(original_x, state.bot_states[first_id]["x"])
+        jumped = [dict(value) for value in states]
+        jumped[0]["fire_seq"] = 2
+        self.assertFalse(state.update_bot_states(1, {"bots": jumped}))
+        self.assertEqual(0, state.bot_states[first_id]["fire_seq"])
+        malformed = [dict(value) for value in states]
+        malformed[0]["x"] = "nan"
+        self.assertFalse(state.update_bot_states(1, {"bots": malformed}))
+        inconsistent = [dict(value) for value in states]
+        inconsistent[0]["alive"] = False
+        self.assertFalse(state.update_bot_states(1, {"bots": inconsistent}))
+        valid = [dict(value) for value in states]
+        valid[0]["fire_seq"] = 1
+        self.assertTrue(state.update_bot_states(1, {"bots": valid}))
+        shots = [value for value in state.pending_events
+                 if value.get("kind") == "bot_shot"]
+        self.assertEqual([(first_id, 1)], [
+            (value["attacker_bot"], value["shot_seq"])
+            for value in shots])
+
+    def test_authority_failover_preserves_bot_fire_sequence_without_replay(self):
+        state = self._started_state(players=2)
+        manifest = _wire_manifest(state)
+        self.assertTrue(state.update_bot_manifest(1, {"bots": manifest}))
+        states = _wire_states(state)
+        states[0]["fire_seq"] = 1
+        self.assertTrue(state.update_bot_states(1, {"bots": states}))
+        state.pending_events = []
+
+        state.remove_player(1)
+
+        self.assertEqual(2, state.bot_authority_id)
+        self.assertFalse(state.update_bot_states(1, {"bots": states}))
+        self.assertFalse(state.update_bot_states(2, {"bots": states}))
+        self.assertTrue(state.update_bot_manifest(2, {"bots": manifest}))
+        resumed = _wire_states(state)
+        resumed[0]["fire_seq"] = 2
+        self.assertTrue(state.update_bot_states(2, {"bots": resumed}))
+        shots = [value for value in state.pending_events
+                 if value.get("kind") == "bot_shot"]
+        self.assertEqual([2], [value["shot_seq"] for value in shots])
+
+    def test_disconnect_of_last_live_team_member_finishes_round(self):
+        state = self._started_state(players=2)
+        self.assertTrue(state.update_bot_manifest(
+            1, {"bots": _wire_manifest(state)}))
+        for bot in state.bot_states.values():
+            if bot["team"] == 1:
+                bot["health"] = 0
+                bot["alive"] = False
+
+        state.remove_player(1)
+
+        self.assertEqual(2, state.bot_authority_id)
+        self.assertEqual(2, state.battle_result["winner"])
+        self.assertEqual("team_eliminated", state.battle_result["reason"])
+
+    def test_start_fills_only_unoccupied_team_slots_and_rejects_late_join(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        state.players[1] = Player(
+            1, object(), ("127.0.0.1", 0), team=1, slot=0)
+        state.players[2] = Player(
+            2, object(), ("127.0.0.1", 0), team=2, slot=0)
+
+        started, error = state.request_start(1)
+
+        self.assertIsNone(error)
+        self.assertEqual(28, len(started["bots"]))
+        slots = [(value["team"], value["slot"])
+                 for value in started["players"] + started["bots"]]
+        self.assertEqual(30, len(slots))
+        self.assertEqual(30, len(set(slots)))
+        late, join_error = state.add_player(
+            object(), ("127.0.0.1", 1), {"name": "Late"})
+        self.assertIsNone(late)
+        self.assertEqual("battle_in_progress", join_error)
+
+    def test_elimination_waits_for_expected_bot_manifest(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        player = Player(1, object(), ("127.0.0.1", 0), team=1, slot=0)
+        state.players[1] = player
+        state.request_start(1)
+
+        state.update_input(1, {"reported_health": 0})
+
+        self.assertFalse(player.alive)
+        self.assertIsNone(state.battle_result)
+
+    def test_terminal_round_resets_connected_players_and_broadcasts_waiting(self):
+        class CaptureConnection(object):
+            def __init__(self):
+                self.messages = []
+
+            def sendall(self, payload):
+                self.messages.append(json.loads(payload.decode("utf-8")))
+
+        connection = CaptureConnection()
+        state = BattleState(map_name="04_himmelsdorf")
+        player = Player(
+            1, connection, ("127.0.0.1", 0), team=1, slot=0,
+            health=100, max_health=500, alive=True)
+        player.fire_seq = 9
+        player.client_position = True
+        state.players[1] = player
+        state.phase = "battle"
+        self.assertTrue(state._finish_battle(1, "team_eliminated"))
+        state.result_reset_tick = state.tick + 1
+
+        state.tick_once(1.0 / 30.0)
+
+        self.assertEqual("waiting", state.phase)
+        self.assertEqual(2, state.round_id)
+        self.assertEqual(500, player.health)
+        self.assertTrue(player.alive)
+        self.assertEqual(0, player.fire_seq)
+        self.assertFalse(player.client_position)
+        self.assertEqual([], state.bot_manifest)
+        self.assertEqual({}, state.bot_states)
+        self.assertEqual("roster", connection.messages[-1]["type"])
+        self.assertEqual("waiting", connection.messages[-1]["phase"])
+
+        state.update_input(1, {"forward": 1.0, "x": 999, "z": 999})
+        self.assertEqual(0.0, player.forward)
+        self.assertFalse(player.client_position)
+
+    def test_bot_human_hit_requires_an_observed_bot_fire_sequence(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        state.bot_authority_id = 1
+        state.bot_manifest_authority_id = 1
+        state.players[1] = Player(1, object(), ("127.0.0.1", 0), team=1)
+        state.players[2] = Player(2, object(), ("127.0.0.1", 0), team=2)
+        state.bot_states[11] = {"id": 11, "team": 1, "alive": True,
+                                "health": 1000, "fire_seq": 3,
+                                "x": 0.0, "y": 0.0, "z": 0.0}
+
+        self.assertFalse(state.report_bot_human_hit(1, {
+            "attacker_bot": 11, "target": 2, "shot_seq": 4,
+            "damage": 100, "shot_result": 2}))
+        self.assertEqual(1000, state.players[2].health)
+        self.assertTrue(state.report_bot_human_hit(1, {
+            "attacker_bot": 11, "target": 2, "shot_seq": 3,
+            "damage": 100, "shot_result": 2}))
+        self.assertEqual(900, state.players[2].health)
+
+    def test_authority_bot_can_damage_enemy_bot_once_per_fire_sequence(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        state.bot_authority_id = 1
+        state.bot_manifest_authority_id = 1
+        state.players[1] = Player(1, object(), ("127.0.0.1", 0), team=1)
+        state.bot_states[11] = {
+            "id": 11, "team": 1, "alive": True, "health": 1000,
+            "fire_seq": 2, "shell_index": 1, "x": 0.0, "y": 0.0, "z": 0.0}
+        state.bot_states[12] = {
+            "id": 12, "team": 2, "alive": True, "health": 1000,
+            "fire_seq": 0, "shell_index": 0, "x": 0.0, "y": 0.0, "z": 20.0}
+        report = {"attacker_bot": 11, "target": 12, "shot_seq": 2,
+                  "damage": 175, "shot_result": 2}
+
+        self.assertTrue(state.report_bot_hit(1, report))
+        self.assertEqual(825, state.bot_states[12]["health"])
+        self.assertFalse(state.report_bot_hit(1, report))
+        self.assertEqual("bot_bot_hit", state.pending_events[-1]["kind"])
+
+    def test_one_human_shell_cannot_damage_bot_and_human_targets(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        state.players[1] = Player(
+            1, object(), ("127.0.0.1", 0), team=1, fire_seq=1)
+        state.players[2] = Player(
+            2, object(), ("127.0.0.1", 0), team=2)
+        state.bot_states[12] = {
+            "id": 12, "team": 2, "alive": True, "health": 500,
+            "x": 0.0, "y": 0.0, "z": 20.0}
+
+        self.assertTrue(state.report_bot_hit(1, {
+            "target": 12, "shot_seq": 1, "damage": 100}))
+        self.assertFalse(state.report_hit(1, {
+            "target": 2, "shot_seq": 1, "damage": 100}))
+        self.assertEqual(1000, state.players[2].health)
+
+    def test_one_bot_shell_cannot_damage_bot_and_human_targets(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        state.bot_authority_id = 1
+        state.bot_manifest_authority_id = 1
+        state.players[1] = Player(
+            1, object(), ("127.0.0.1", 0), team=1)
+        state.players[2] = Player(
+            2, object(), ("127.0.0.1", 0), team=2)
+        state.bot_states[11] = {
+            "id": 11, "team": 1, "alive": True, "health": 500,
+            "fire_seq": 1, "shell_index": 0,
+            "x": 0.0, "y": 0.0, "z": 0.0}
+        state.bot_states[12] = {
+            "id": 12, "team": 2, "alive": True, "health": 500,
+            "fire_seq": 0, "shell_index": 0,
+            "x": 0.0, "y": 0.0, "z": 20.0}
+
+        self.assertTrue(state.report_bot_hit(1, {
+            "attacker_bot": 11, "target": 12,
+            "shot_seq": 1, "damage": 100}))
+        self.assertFalse(state.report_bot_human_hit(1, {
+            "attacker_bot": 11, "target": 2,
+            "shot_seq": 1, "damage": 100}))
+        self.assertEqual(1000, state.players[2].health)
+
+    def test_last_kill_finishes_standard_battle_exactly_once(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        state.bot_authority_id = 1
+        state.bot_manifest_authority_id = 1
+        state.players[1] = Player(
+            1, object(), ("127.0.0.1", 0), team=1)
+        state.bot_manifest = [
+            {"id": 11, "team": 1, "slot": 0, "name": "Ally",
+             "vehicle": "ussr:R11_MS-1", "max_health": 1000},
+            {"id": 12, "team": 2, "slot": 0, "name": "Enemy",
+             "vehicle": "ussr:R11_MS-1", "max_health": 100},
+        ]
+        state.bot_roster = list(state.bot_manifest)
+        state.bot_states[11] = {
+            "id": 11, "team": 1, "alive": True, "health": 1000,
+            "fire_seq": 1, "shell_index": 0,
+            "x": 0.0, "y": 0.0, "z": 0.0}
+        state.bot_states[12] = {
+            "id": 12, "team": 2, "alive": True, "health": 100,
+            "fire_seq": 0, "shell_index": 0,
+            "x": 0.0, "y": 0.0, "z": 20.0}
+        report = {"attacker_bot": 11, "target": 12, "shot_seq": 1,
+                  "damage": 100, "shot_result": 2}
+
+        self.assertTrue(state.report_bot_hit(1, report))
+        self.assertEqual({"winner": 1, "reason": "team_eliminated",
+                          "base_team": 0}, state.battle_result)
+        self.assertEqual(1, sum(
+            event.get("kind") == "battle_result"
+            for event in state.pending_events))
+        self.assertFalse(state.report_bot_hit(1, dict(report, shot_seq=2)))
+        self.assertFalse(state.report_battle_result(1, {
+            "winner": 1, "reason": "duplicate"}))
+        self.assertEqual(1, sum(
+            event.get("kind") == "battle_result"
+            for event in state.pending_events))
+
+    def test_bot_state_fire_edge_creates_visual_shot_event(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        state.bot_authority_id = 1
+        state.bot_manifest_authority_id = 1
+        state.bot_manifest = [{
+            "id": 11, "team": 1, "slot": 0, "name": "Bot",
+            "vehicle": "ussr:R11_MS-1", "max_health": 1000}]
+        state.bot_states[11] = {
+            "id": 11, "team": 1, "slot": 0, "name": "Bot",
+            "vehicle": "ussr:R11_MS-1", "health": 1000,
+            "max_health": 1000, "alive": True, "fire_seq": 0,
+            "shell_index": 0, "x": 0.0, "y": 0.0, "z": 0.0,
+            "yaw": 0.0, "aim_yaw": 0.0, "gun_pitch": 0.0}
+
+        self.assertTrue(state.update_bot_states(1, {"bots": [{
+            "id": 11, "x": 0, "y": 0, "z": 1, "yaw": 0,
+            "health": 1000, "alive": True, "fire_seq": 1}]}))
+        self.assertEqual("bot_shot", state.pending_events[-1]["kind"])
+
+    def test_dead_bot_cannot_emit_late_visual_shot_edge(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        state.bot_authority_id = 1
+        state.bot_manifest_authority_id = 1
+        state.bot_manifest = [{
+            "id": 11, "team": 1, "slot": 0, "name": "Bot",
+            "vehicle": "ussr:R11_MS-1", "max_health": 1000}]
+        state.bot_states[11] = {
+            "id": 11, "team": 1, "slot": 0, "name": "Bot",
+            "vehicle": "ussr:R11_MS-1", "health": 0,
+            "max_health": 1000, "alive": False, "fire_seq": 1,
+            "shell_index": 0, "x": 0.0, "y": 0.0, "z": 0.0,
+            "yaw": 0.0, "aim_yaw": 0.0, "gun_pitch": 0.0}
+
+        self.assertTrue(state.update_bot_states(1, {"bots": [{
+            "id": 11, "x": 0, "y": 0, "z": 1,
+            "yaw": 0, "alive": True, "health": 1000,
+            "fire_seq": 2}]}))
+
+        self.assertFalse(state.bot_states[11]["alive"])
+        self.assertEqual([], [event for event in state.pending_events
+                              if event.get("kind") == "bot_shot"])
+
     def test_orders_are_stable_then_revision_only_changes_for_new_information(self):
         planner = BotPlanner()
         first = planner.build_orders(_manifest(), _states(), [], 0.0)
@@ -64,6 +467,9 @@ class ServerBotPlannerTests(unittest.TestCase):
         state.tick_once(0.05)
 
         self.assertIn("bot_orders", connection.messages[0])
+        self.assertEqual(state.round_id, connection.messages[0]["round_id"])
+        self.assertEqual(PROTOCOL_VERSION,
+                         connection.messages[0]["protocol"])
         self.assertNotIn("bot_orders", connection.messages[1])
 
     def test_only_reported_enemy_contact_becomes_shared_target(self):

@@ -1,0 +1,735 @@
+from __future__ import print_function
+
+try:
+    import cPickle as _pickle
+except ImportError:
+    import pickle as _pickle
+
+
+OFFLINE_SERVER_ADDRESS = 'offline-lan.local:0'
+
+_SERVER_SETTINGS = {
+    'file_server': {
+        'clan_emblems': {'url_template': '', 'cache_life_time': 0},
+        'clan_emblems_small': {'url_template': '', 'cache_life_time': 0},
+    },
+    'regional_settings': {
+        'starting_time_of_a_new_day': 0,
+        'starting_day_of_a_new_week': 0,
+        'starting_time_of_a_new_game_day': 3,
+    },
+    # ServerSettings consumes the first three values, while the exact #1513
+    # predefined-host list directly indexes the fourth roaming-host list.
+    'roaming': (0, 0, [], []),
+    'wallet': (1, 1),
+    # ClientRanked indexes this setting directly even when ranked battles are
+    # disabled.  Presence, rather than truthiness, is the native contract.
+    'ranked_config': {'isEnabled': False},
+    # The exact #1513 default is enabled when this section is absent.  The
+    # event-board client then starts HTTP-backed clan/event synchronization,
+    # which has no producer in the offline account service.
+    'elenSettings': {
+        'isElenEnabled': False,
+        'elenUpdateInterval': 60,
+    },
+    'isEncyclopediaEnabled': 'all',
+    'isVehiclesCompareEnabled': True,
+    'isCustomizationEnabled': True,
+}
+
+_LOBBY_GUI_CONTEXT = {
+    'databaseID': 1,
+    'logUXEvents': False,
+    'aogasStartedAt': 0,
+    'sessionStartedAt': 0,
+    'isAogasEnabled': False,
+    'collectUiStats': False,
+    'isLongDisconnectedFromCenter': False,
+}
+
+
+def _load_runtime():
+    import Account
+    import Avatar
+    import AvatarInputHandler
+    import BigWorld
+    import Vehicle
+    import constants
+    from OfflineMapCreator import g_offlineMapCreator
+    from PlayerEvents import g_playerEvents
+    from connection_mgr import LOGIN_STATUS
+    from helpers import dependency
+    from predefined_hosts import g_preDefinedHosts
+    from skeletons.connection_mgr import IConnectionManager
+
+    class Runtime(object):
+        pass
+
+    runtime = Runtime()
+    runtime.account_module = Account
+    runtime.avatar_module = Avatar
+    runtime.avatar_input_handler = AvatarInputHandler
+    runtime.bigworld = BigWorld
+    runtime.constants = constants
+    runtime.connection_manager = dependency.instance(IConnectionManager)
+    runtime.login_status = LOGIN_STATUS
+    runtime.offline_map_creator = g_offlineMapCreator
+    runtime.player_events = g_playerEvents
+    runtime.predefined_hosts = g_preDefinedHosts
+    runtime.vehicle_module = Vehicle
+    return runtime
+
+
+class _FallbackServer(object):
+
+    def __getattr__(self, name):
+        def ignored(*args, **kwargs):
+            return None
+
+        return ignored
+
+
+class _DeferredAvatarServer(object):
+    """Exact early Avatar requests before the entity binding is available."""
+
+    def __init__(self):
+        self._target = None
+        self._pending = []
+
+    @property
+    def voipController(self):
+        return self
+
+    def attach(self, target):
+        if self._target is not None and self._target is not target:
+            raise RuntimeError('Avatar server is already attached')
+        self._target = target
+        pending = self._pending
+        self._pending = []
+        for name, args in pending:
+            getattr(target, name)(*args)
+
+    def invalidateMicrophoneMute(self):
+        if self._target is not None:
+            return self._target.invalidateMicrophoneMute()
+        return None
+
+    def switchObserverFPV(self, enabled):
+        if self._target is not None:
+            return self._target.switchObserverFPV(enabled)
+        return None
+
+    def setClientReady(self):
+        # BigWorld may finish Vehicle prerequisites and the stock Avatar init
+        # from inside createEntity(), before BattleRuntime receives the id and
+        # attaches its concrete bridge.  Preserve that readiness barrier.
+        return self._defer('setClientReady', ())
+
+    def autoAim(self, vehicle_id):
+        return self._defer('autoAim', (vehicle_id,))
+
+    def doCmdStr(self, *args):
+        return self._defer('doCmdStr', args)
+
+    def doCmdIntArr(self, *args):
+        return self._defer('doCmdIntArr', args)
+
+    def _defer(self, name, args):
+        if self._target is not None:
+            return getattr(self._target, name)(*args)
+        self._pending.append((name, args))
+        return None
+
+    def __getattr__(self, name):
+        if self._target is None:
+            raise AttributeError(
+                'Avatar server is not attached for mailbox %s' % name)
+        return getattr(self._target, name)
+
+
+class _OfflineInputHandler(object):
+
+    def prerequisites(self):
+        return []
+
+    def start(self):
+        return None
+
+    def stop(self):
+        return None
+
+    def handleKeyEvent(self, event):
+        return False
+
+    def handleMouseEvent(self, dx, dy, dz):
+        return False
+
+
+class _RemoteCameraData(object):
+    """Attribute-compatible empty value for AvatarObserver.REMOTE_CAMERA_DATA."""
+
+    def __init__(self):
+        self.time = 0.0
+        self.shotPoint = None
+        self.zoom = 0
+
+
+class OfflineCompatibility(object):
+
+    def __init__(self, runtime=None):
+        self._runtime = runtime
+        self._installed = False
+        self._connecting = False
+        self._fake_connected = False
+        self._host = None
+        self._host_added = False
+        self._account_context = {}
+        self._account_state = None
+        self._show_lobby = False
+        self._battle_active = False
+        self._native_battle = False
+        self._battle_gui_type = None
+        self._battle_bonus_type = None
+        self._original_account_init = None
+        self._original_account_getattribute = None
+        self._original_account_become_player = None
+        self._original_avatar_init = None
+        self._original_avatar_getattribute = None
+        self._original_avatar_become_player = None
+        self._original_avatar_vehicle_enter = None
+        self._original_vehicle_getattribute = None
+        self._original_connect = None
+        self._original_disconnect = None
+        self._account_init_wrapper = None
+        self._account_getattribute_wrapper = None
+        self._account_become_player_wrapper = None
+        self._avatar_init_wrapper = None
+        self._avatar_getattribute_wrapper = None
+        self._avatar_become_player_wrapper = None
+        self._avatar_vehicle_enter_wrapper = None
+        self._vehicle_getattribute_wrapper = None
+        self._connect_wrapper = None
+        self._disconnect_wrapper = None
+
+    def install(self):
+        if self._installed:
+            return
+        self._runtime = self._runtime or _load_runtime()
+        if self._account_state is None:
+            from gui.mods.offline_lan_0922.account_rpc.state import AccountState
+            self._account_state = AccountState()
+        runtime = self._runtime
+        account_type = runtime.account_module.PlayerAccount
+        avatar_type = runtime.avatar_module.PlayerAvatar
+        vehicle_type = getattr(
+            getattr(runtime, 'vehicle_module', None), 'Vehicle', None)
+        self._original_account_init = account_type.__dict__.get(
+            '__init__', account_type.__init__)
+        self._original_account_getattribute = account_type.__dict__.get(
+            '__getattribute__', account_type.__getattribute__)
+        self._original_account_become_player = account_type.__dict__.get(
+            'onBecomePlayer', getattr(account_type, 'onBecomePlayer', None))
+        self._original_avatar_init = avatar_type.__dict__.get(
+            '__init__', avatar_type.__init__)
+        self._original_avatar_getattribute = avatar_type.__dict__.get(
+            '__getattribute__', avatar_type.__getattribute__)
+        self._original_avatar_become_player = avatar_type.__dict__.get(
+            'onBecomePlayer', avatar_type.onBecomePlayer)
+        self._original_avatar_vehicle_enter = avatar_type.__dict__.get(
+            'vehicle_onEnterWorld',
+            getattr(avatar_type, 'vehicle_onEnterWorld', None))
+        if vehicle_type is not None:
+            self._original_vehicle_getattribute = vehicle_type.__dict__.get(
+                '__getattribute__', vehicle_type.__getattribute__)
+        self._original_connect = runtime.bigworld.connect
+        self._original_disconnect = runtime.bigworld.disconnect
+        compatibility = self
+
+        def account_init(account):
+            if compatibility._connecting:
+                account.isOffline = True
+                account.name = 'offline_account'
+                account.initialServerSettings = dict(_SERVER_SETTINGS)
+                property_name, property_value = (
+                    runtime.account_module._CLIENT_SERVER_VERSION)
+                setattr(account, property_name, property_value)
+                context = dict(compatibility._account_context)
+                context['account_state'] = compatibility._account_state
+                receive_stats = getattr(account, 'receiveServerStats', None)
+                if callable(receive_stats):
+                    context['receive_server_stats'] = receive_stats
+                callback = getattr(runtime.bigworld, 'callback', None)
+                if callback is None:
+                    account.fakeServer = _FallbackServer()
+                else:
+                    from gui.mods.offline_lan_0922.account_rpc.server import \
+                        FakeServer
+
+                    def active_account():
+                        try:
+                            player = runtime.bigworld.player()
+                        except ReferenceError:
+                            return None
+                        if player is account:
+                            return player
+                        return None
+
+                    account.fakeServer = FakeServer(
+                        active_account, callback=callback, context=context)
+            compatibility._original_account_init(account)
+
+        def avatar_init(avatar):
+            if compatibility._fake_connected:
+                compatibility._prepare_avatar_properties(avatar)
+            compatibility._original_avatar_init(avatar)
+            if compatibility._fake_connected:
+                avatar.filter = runtime.bigworld.AvatarFilter()
+                avatar.filter.enableLagDetection(True)
+
+        def avatar_become_player(avatar):
+            if not compatibility._fake_connected:
+                return compatibility._original_avatar_become_player(avatar)
+            compatibility.prepare_avatar(avatar)
+            offline_filter = avatar.filter
+            original_filter_factory = runtime.bigworld.AvatarFilter
+            active = getattr(runtime.offline_map_creator, 'Active', None)
+            if callable(active):
+                map_was_active = bool(active())
+            else:
+                # Test doubles and a few unpacked client variants expose the
+                # same state as a field.  The #1513 runtime uses Active().
+                map_was_active = bool(getattr(
+                    runtime.offline_map_creator, 'active', False))
+
+            if compatibility._battle_gui_type is not None:
+                avatar.arenaGuiType = compatibility._battle_gui_type
+            if compatibility._battle_bonus_type is not None:
+                avatar.arenaBonusType = compatibility._battle_bonus_type
+
+            def reuse_offline_filter():
+                return offline_filter
+
+            runtime.bigworld.AvatarFilter = reuse_offline_filter
+            if compatibility._native_battle:
+                # The stock offline viewer intentionally skips the battle
+                # session and real AvatarInputHandler.  A playable LAN battle
+                # needs the normal #1513 initialization branches instead.
+                runtime.offline_map_creator.SetActive(False)
+            try:
+                return compatibility._original_avatar_become_player(avatar)
+            finally:
+                if runtime.bigworld.AvatarFilter is reuse_offline_filter:
+                    runtime.bigworld.AvatarFilter = original_filter_factory
+                runtime.offline_map_creator.SetActive(map_was_active)
+
+        def avatar_getattribute(avatar, name):
+            if (name in ('base', 'cell', 'server', 'bwProto') and
+                    compatibility._battle_active):
+                try:
+                    return compatibility._original_avatar_getattribute(
+                        avatar, 'fakeServer')
+                except AttributeError:
+                    pass
+            return compatibility._original_avatar_getattribute(avatar, name)
+
+        def avatar_vehicle_enter(avatar, vehicle):
+            if compatibility._battle_active:
+                try:
+                    server = compatibility._original_avatar_getattribute(
+                        avatar, 'fakeServer')
+                    accept = getattr(server, 'acceptVehicleEnter', None)
+                    if callable(accept):
+                        accept(vehicle.id)
+                except AttributeError:
+                    pass
+            if compatibility._original_avatar_vehicle_enter is not None:
+                return compatibility._original_avatar_vehicle_enter(
+                    avatar, vehicle)
+            return None
+
+        def vehicle_getattribute(vehicle, name):
+            if name == 'cell' and compatibility._battle_active:
+                try:
+                    return compatibility._original_vehicle_getattribute(
+                        vehicle, 'fakeCell')
+                except AttributeError:
+                    player = runtime.bigworld.player()
+                    if player is not None:
+                        try:
+                            return compatibility._original_avatar_getattribute(
+                                player, 'fakeServer')
+                        except AttributeError:
+                            pass
+            return compatibility._original_vehicle_getattribute(vehicle, name)
+
+        def account_getattribute(account, name):
+            if name in ('base', 'cell', 'server'):
+                try:
+                    is_offline = compatibility._original_account_getattribute(
+                        account, 'isOffline')
+                except AttributeError:
+                    is_offline = False
+                if is_offline:
+                    return compatibility._original_account_getattribute(
+                        account, 'fakeServer')
+            return compatibility._original_account_getattribute(account, name)
+
+        def account_become_player(account):
+            is_offline = bool(getattr(account, 'isOffline', False))
+            if not is_offline:
+                return compatibility._original_account_become_player(account)
+
+            # PlayerAccount.onBecomePlayer in exact build #1513 starts by
+            # calling BigWorld.clearAllSpaces().  Our client-only Account is
+            # itself hosted in a newly-created space, so the native call would
+            # retire the Account that is currently becoming the player.  Skip
+            # only that one destructive call and restore the engine function
+            # before any lobby code runs.
+            original_clear_all_spaces = getattr(
+                runtime.bigworld, 'clearAllSpaces', None)
+
+            def preserve_offline_account_space():
+                return None
+
+            if callable(original_clear_all_spaces):
+                runtime.bigworld.clearAllSpaces = \
+                    preserve_offline_account_space
+            try:
+                result = compatibility._original_account_become_player(
+                    account)
+            finally:
+                if (callable(original_clear_all_spaces) and
+                        getattr(runtime.bigworld, 'clearAllSpaces', None) is
+                        preserve_offline_account_space):
+                    runtime.bigworld.clearAllSpaces = \
+                        original_clear_all_spaces
+
+            if compatibility._show_lobby:
+                show_gui = getattr(account, 'showGUI', None)
+                if callable(show_gui):
+                    show_gui(_pickle.dumps(
+                        dict(_LOBBY_GUI_CONTEXT), _pickle.HIGHEST_PROTOCOL))
+            return result
+
+        def connect(server, login_params, progress):
+            if server != OFFLINE_SERVER_ADDRESS:
+                return compatibility._original_connect(
+                    server, login_params, progress)
+            progress(1, runtime.login_status.LOGGED_ON, '{}')
+            compatibility._fake_connected = True
+            try:
+                compatibility._create_account_player()
+                compatibility._connecting = False
+            except Exception:
+                compatibility._connecting = False
+                compatibility._fake_connected = False
+                # Promotion can fail after BigWorld.player(account) has
+                # already bound the client-only entity.  The narrow
+                # onBecomePlayer guard has restored clearAllSpaces by this
+                # point, so retire the partial Account and its space before
+                # exposing a failed connection state.
+                clear_all_spaces = getattr(
+                    runtime.bigworld, 'clearAllSpaces', None)
+                if callable(clear_all_spaces):
+                    try:
+                        clear_all_spaces()
+                    except Exception:
+                        pass
+                setattr(runtime.connection_manager,
+                        '_ConnectionManager__connectionStatus',
+                        runtime.login_status.NOT_SET)
+                # ``progress(LOGGED_ON)`` has already published the native
+                # connected events before Account creation starts.  Balance
+                # them even when promotion fails so lobby controllers do not
+                # retain a ghost connected state.
+                notifications = (
+                    (getattr(runtime.bigworld,
+                             'WGC_onServerResponse', None), (False,)),
+                    (getattr(runtime.connection_manager,
+                             'onDisconnected', None), ()),
+                    (getattr(runtime.player_events,
+                             'onDisconnected', None), ()),
+                )
+                for notification, arguments in notifications:
+                    if callable(notification):
+                        try:
+                            notification(*arguments)
+                        except Exception:
+                            pass
+                raise
+            return None
+
+        def disconnect():
+            if not compatibility._fake_connected:
+                return compatibility._original_disconnect()
+            compatibility._fake_connected = False
+            compatibility._connecting = False
+            setattr(runtime.connection_manager,
+                    '_ConnectionManager__connectionStatus',
+                    runtime.login_status.NOT_SET)
+            wgc_response = getattr(
+                runtime.bigworld, 'WGC_onServerResponse', None)
+            if wgc_response is not None:
+                wgc_response(False)
+            runtime.connection_manager.onDisconnected()
+            runtime.player_events.onDisconnected()
+            return None
+
+        self._account_init_wrapper = account_init
+        self._account_getattribute_wrapper = account_getattribute
+        self._account_become_player_wrapper = account_become_player
+        self._avatar_init_wrapper = avatar_init
+        self._avatar_getattribute_wrapper = avatar_getattribute
+        self._avatar_become_player_wrapper = avatar_become_player
+        self._avatar_vehicle_enter_wrapper = avatar_vehicle_enter
+        self._vehicle_getattribute_wrapper = vehicle_getattribute
+        self._connect_wrapper = connect
+        self._disconnect_wrapper = disconnect
+        try:
+            self._install_host()
+            account_type.__init__ = account_init
+            account_type.__getattribute__ = account_getattribute
+            if self._original_account_become_player is not None:
+                account_type.onBecomePlayer = account_become_player
+            avatar_type.__init__ = avatar_init
+            avatar_type.__getattribute__ = avatar_getattribute
+            avatar_type.onBecomePlayer = avatar_become_player
+            if self._original_avatar_vehicle_enter is not None:
+                avatar_type.vehicle_onEnterWorld = avatar_vehicle_enter
+            if vehicle_type is not None:
+                vehicle_type.__getattribute__ = vehicle_getattribute
+            runtime.bigworld.connect = connect
+            runtime.bigworld.disconnect = disconnect
+            self._installed = True
+        except Exception:
+            self._rollback_install()
+            raise
+
+    def _install_host(self):
+        hosts = self._runtime.predefined_hosts
+        for host in hosts._hosts:
+            if getattr(host, 'url', None) == OFFLINE_SERVER_ADDRESS:
+                self._host = host
+                self._host_added = False
+                return
+        self._host = hosts._makeHostItem(
+            OFFLINE_SERVER_ADDRESS,
+            OFFLINE_SERVER_ADDRESS,
+            OFFLINE_SERVER_ADDRESS)
+        hosts._hosts.append(self._host)
+        self._host_added = True
+
+    def _rollback_install(self):
+        runtime = self._runtime
+        account_type = runtime.account_module.PlayerAccount
+        avatar_type = runtime.avatar_module.PlayerAvatar
+        vehicle_type = getattr(
+            getattr(runtime, 'vehicle_module', None), 'Vehicle', None)
+        if (account_type.__dict__.get('__init__') is
+                self._account_init_wrapper):
+            account_type.__init__ = self._original_account_init
+        if (account_type.__dict__.get('__getattribute__') is
+                self._account_getattribute_wrapper):
+            account_type.__getattribute__ = (
+                self._original_account_getattribute)
+        if (self._original_account_become_player is not None and
+                account_type.__dict__.get('onBecomePlayer') is
+                self._account_become_player_wrapper):
+            account_type.onBecomePlayer = self._original_account_become_player
+        if (avatar_type.__dict__.get('__init__') is
+                self._avatar_init_wrapper):
+            avatar_type.__init__ = self._original_avatar_init
+        if (avatar_type.__dict__.get('__getattribute__') is
+                self._avatar_getattribute_wrapper):
+            avatar_type.__getattribute__ = self._original_avatar_getattribute
+        if (avatar_type.__dict__.get('onBecomePlayer') is
+                self._avatar_become_player_wrapper):
+            avatar_type.onBecomePlayer = self._original_avatar_become_player
+        if (self._original_avatar_vehicle_enter is not None and
+                avatar_type.__dict__.get('vehicle_onEnterWorld') is
+                self._avatar_vehicle_enter_wrapper):
+            avatar_type.vehicle_onEnterWorld = (
+                self._original_avatar_vehicle_enter)
+        if (vehicle_type is not None and
+                vehicle_type.__dict__.get('__getattribute__') is
+                self._vehicle_getattribute_wrapper):
+            vehicle_type.__getattribute__ = self._original_vehicle_getattribute
+        if runtime.bigworld.connect is self._connect_wrapper:
+            runtime.bigworld.connect = self._original_connect
+        if runtime.bigworld.disconnect is self._disconnect_wrapper:
+            runtime.bigworld.disconnect = self._original_disconnect
+        if self._host_added and self._host is not None:
+            try:
+                runtime.predefined_hosts._hosts.remove(self._host)
+            except ValueError:
+                pass
+        self._host = None
+        self._host_added = False
+        self._installed = False
+
+    def connect(self, show_lobby=False, account_context=None):
+        self.install()
+        if self.is_ready() or self._connecting:
+            return
+        self._show_lobby = bool(show_lobby)
+        self._account_context = dict(account_context or {})
+        provided_state = self._account_context.get('account_state')
+        if provided_state is not None:
+            self._account_state = provided_state
+        self._connecting = True
+        params = {
+            'login': 'offline',
+            'auth_method': 'basic',
+            'session': '',
+            'token2': '',
+        }
+        try:
+            self._runtime.connection_manager.initiateConnection(
+                params, '', OFFLINE_SERVER_ADDRESS)
+        except Exception:
+            self._connecting = False
+            raise
+
+    def is_ready(self):
+        if not self._installed:
+            return False
+        try:
+            player = self._runtime.bigworld.player()
+            return (self._runtime.connection_manager.isConnected() and
+                    player is not None and
+                    bool(getattr(player, 'isOffline', False)))
+        except Exception:
+            return False
+
+    def _create_account_player(self):
+        runtime = self._runtime
+        space_id = runtime.bigworld.createSpace()
+        account_id = runtime.bigworld.createEntity(
+            'Account', space_id, 0, (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0), {})
+        account = runtime.bigworld.entities[account_id]
+        runtime.bigworld.player(account)
+        return account
+
+    def restore_lobby_account(self):
+        """Recreate the fake Account after #1513 clears battle entities.
+
+        ``OfflineMapCreator.destroy()`` calls ``clearEntitiesAndSpaces()``, so
+        merely switching the application back to lobby leaves no player
+        mailbox.  Creating another Account through the normal patched
+        constructor rebinds the retained native account repository and starts
+        its synchronization lifecycle again.
+        """
+        self.install()
+        if (not self._fake_connected or
+                not self._runtime.connection_manager.isConnected()):
+            raise RuntimeError('offline connection is not active')
+        player = self._runtime.bigworld.player()
+        if player is not None:
+            if bool(getattr(player, 'isOffline', False)):
+                return player
+            raise RuntimeError('another player entity is still active')
+
+        was_connecting = self._connecting
+        self._connecting = True
+        try:
+            return self._create_account_player()
+        finally:
+            self._connecting = was_connecting
+
+    def activate_map(self):
+        if self._runtime is None:
+            raise RuntimeError('offline compatibility is not installed')
+        self._runtime.offline_map_creator.SetActive(True)
+
+    def configure_battle(self, gui_type=None, bonus_type=None):
+        """Enable the normal battle UI/input path for the next native Avatar."""
+        self.install()
+        self._battle_active = True
+        self._native_battle = True
+        self._battle_gui_type = gui_type
+        self._battle_bonus_type = bonus_type
+        self.activate_map()
+
+    def attach_avatar_server(self, avatar, server):
+        proxy = getattr(avatar, 'fakeServer', None)
+        attach = getattr(proxy, 'attach', None)
+        if not callable(attach):
+            raise RuntimeError('Avatar deferred server is unavailable')
+        attach(server)
+        # Vehicle.cell is resolved through this same strict bridge.
+        for entity in getattr(self._runtime.bigworld, 'entities', {}).values():
+            if entity is avatar:
+                continue
+            try:
+                entity.fakeCell = proxy
+            except Exception:
+                pass
+
+    def _prepare_avatar_properties(self, avatar):
+        values = {
+            'name': 'OfflinePlayer',
+            'team': 1,
+            'playerVehicleID': 0,
+            'ownVehicleAuxPhysicsData': 0,
+            'ownVehicleGear': 0,
+            'denunciationsLeft': 10,
+            'tkillIsSuspected': False,
+            'clientCtx': '',
+            'isObserverBothTeams': False,
+            'isGunLocked': False,
+            'arenaUniqueID': 0,
+            'arenaTypeID': 0,
+            'arenaBonusType': 0,
+            'arenaGuiType': 0,
+            'arenaExtraData': {},
+            'weatherPresetID': 0,
+            'playLimits': {},
+            # These four OWN_CLIENT properties come from AvatarObserver.def,
+            # not the root Avatar.def.  A client-only Avatar created with an
+            # empty property dictionary does not receive server defaults.
+            'remoteCamera': _RemoteCameraData(),
+            'isObserverFPV': False,
+            'observerFPVControlMode': 0,
+            'numOfObservers': 0,
+        }
+        for name, value in values.items():
+            if not hasattr(avatar, name):
+                setattr(avatar, name, value)
+        avatar.fakeServer = _DeferredAvatarServer()
+
+    def prepare_avatar(self, avatar):
+        if not self._native_battle:
+            avatar.inputHandler = _OfflineInputHandler()
+        if not hasattr(avatar, 'playLimits'):
+            avatar.playLimits = {}
+
+    def deactivate_map(self):
+        if self._runtime is not None:
+            self._runtime.offline_map_creator.SetActive(False)
+        self._battle_active = False
+        self._native_battle = False
+        self._battle_gui_type = None
+        self._battle_bonus_type = None
+
+    def disconnect(self):
+        if self._runtime is None:
+            return
+        self._connecting = False
+        if self._fake_connected:
+            if (self._runtime.bigworld.disconnect is
+                    self._disconnect_wrapper):
+                self._runtime.connection_manager.disconnect()
+            else:
+                self._disconnect_wrapper()
+        self.deactivate_map()
+
+    def fini(self):
+        if not self._installed:
+            return
+        self.disconnect()
+        runtime = self._runtime
+        self._rollback_install()
+
+
+g_compatibility = OfflineCompatibility()

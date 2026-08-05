@@ -1,0 +1,237 @@
+{
+  "clientBuild": "0.9.22.0.1 #1513",
+  "syncData": {
+    "directKeys": [
+      "rev",
+      "prevRev",
+      "inventory",
+      "account",
+      "stats",
+      "cache",
+      "quests",
+      "tokens",
+      "potapovQuests",
+      "intUserSettings",
+      "goodies",
+      "groupLocks",
+      "vehiclesGroupMapping",
+      "recycleBin",
+      "ranked",
+      "badges",
+      "newYear",
+      "eventsData"
+    ],
+    "potapovQuests": {
+      "directKeys": ["compDescr", "regular", "training"],
+      "progressDirectKeys": ["slots", "selected", "lastIDs"]
+    },
+    "groupLocksDirectKeys": ["groupBattles", "isGroupLocked"],
+    "accountDirectKeys": [
+      "clanDBID",
+      "attrs",
+      "premiumExpiryTime",
+      "autoBanTime",
+      "globalRating"
+    ],
+    "statsDirectKeys": [
+      "credits",
+      "gold",
+      "crystal",
+      "freeXP",
+      "slots",
+      "berths",
+      "accOnline",
+      "accOffline",
+      "freeTMenLeft",
+      "freeVehiclesLeft",
+      "vehicleSellsLeft",
+      "captchaTriesLeft",
+      "denunciationsLeft",
+      "tutorialsCompleted",
+      "battlesTillCaptcha",
+      "dailyPlayHours",
+      "playLimits",
+      "vehTypeXP",
+      "vehTypeLocks",
+      "restrictions",
+      "globalVehicleLocks",
+      "refSystem",
+      "unlocks",
+      "eliteVehicles",
+      "multipliedXPVehs"
+    ],
+    "cacheDirectKeys": [
+      "isFinPswdVerified",
+      "mayConsumeWalletResources",
+      "unitAcceptDeadline",
+      "oldVehInvIDs"
+    ],
+    "playLimitsTupleArities": [2, 2]
+  },
+  "inventory": {
+    "itemTypeIndices": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    "vehicleDirectKeys": [
+      "repair",
+      "lastCrew",
+      "crew",
+      "settings",
+      "compDescr",
+      "eqs",
+      "eqsLayout",
+      "shells",
+      "shellsLayout",
+      "lock"
+    ],
+    "selectedVehicleTupleArities": {"repair": 2},
+    "selectedVehicleMappingValues": ["shellsLayout"],
+    "tankmanDirectKeys": ["vehicle", "compDescr"]
+  },
+  "accountValidator": {
+    "emptyItemTypeIndices": [2, 3, 4, 5, 6, 7, 9, 10, 11, 12],
+    "vehicleCompDescrIsMapping": true,
+    "tankmanCompDescrIsMapping": true,
+    "eliteVehiclesIsIterable": true,
+    "selectedVehicleCompDescrProducer": "VehicleDescr.makeCompactDescr"
+  },
+  "shop": {
+    "directKeys": [
+      "rev",
+      "prevRev",
+      "crystalExchangeRate",
+      "sellPriceFactor",
+      "items",
+      "defaults",
+      "goodies",
+      "berthsPrices",
+      "slotsPrices",
+      "freeXPConversion",
+      "paidRemovalCost"
+    ],
+    "itemsDirectKeys": [
+      "itemPrices",
+      "notInShopItems",
+      "vehiclesNotToBuy",
+      "vehiclesRentPrices",
+      "vehiclesToSellForGold",
+      "vehicleSellPriceFactors"
+    ],
+    "goodiesDirectKeys": ["prices", "notInShop", "goodies"],
+    "tupleArities": {
+      "berthsPrices": 3,
+      "slotsPrices": 2,
+      "freeXPConversion": 2
+    },
+    "currencyMappings": ["paidRemovalCost"],
+    "refSystem": {
+      "directKeys": [
+        "periods",
+        "maxReferralXPPool",
+        "maxNumberOfReferrals",
+        "posByXPinTeam"
+      ],
+      "disabledDefaults": {
+        "periods": 0,
+        "maxReferralXPPool": 0,
+        "maxNumberOfReferrals": 0,
+        "posByXPinTeam": 0
+      },
+      "posByXPinTeamType": "int"
+    }
+  },
+  "dossiers": {
+    "streamTupleArity": 2,
+    "changeTupleArity": 3
+  },
+  "chatAction": {
+    "publishedByOfflineServer": false,
+    "commandIndexMayBeUsedAsActionIndex": false,
+    "requiredKeysIfPublished": [
+      "requestID",
+      "action",
+      "channel",
+      "actionResponse",
+      "originator",
+      "originatorNickName",
+      "group",
+      "data",
+      "time",
+      "sentTime",
+      "flags"
+    ]
+  },
+  "mailboxAritiesExcludingSelf": {
+    "doCmdStr": 3,
+    "doCmdInt3": 5,
+    "doCmdIntArr": 3,
+    "doCmdInt2Str": 5,
+    "doCmdIntStr": 4,
+    "doCmdInt4": 6,
+    "doCmdIntStrArr": 4,
+    "doCmdIntArrStrArr": 4,
+    "chatCommandFromClient": 7,
+    "messenger_onActionByClient_chat2": 3
+  },
+  "deliveryOrder": {
+    "allClientCallbacksAreAsynchronous": true,
+    "serverStatsBeforeCommandResponse": true,
+    "streamCommandResponseBeforePayload": true
+  },
+  "intUserSettings": {
+    "eulaVersionKey": 54,
+    "addCommand": 1600,
+    "deleteCommand": 1601,
+    "addPayload": "alternatingKeyValueIntegers"
+  },
+  "initialServerSettings": {
+    "directKeys": [
+      "file_server",
+      "regional_settings",
+      "roaming",
+      "wallet",
+      "ranked_config"
+    ],
+    "rankedConfigDirectKeys": ["isEnabled"],
+    "elenSettings": {
+      "isElenEnabled": false,
+      "elenUpdateInterval": 60
+    },
+    "tupleArities": {"roaming": 4, "wallet": 2},
+    "roamingHostsIndex": 3,
+    "roamingHostTupleArity": 5
+  },
+  "lobbyControllerChain": {
+    "mappingPaths": [
+      "syncData.stats.restrictions",
+      "syncData.stats.vehTypeLocks",
+      "syncData.stats.globalVehicleLocks",
+      "syncData.stats.refSystem",
+      "syncData.stats.refSystem.referrals",
+      "shop.goodies",
+      "shop.goodies.goodies",
+      "shop.refSystem"
+    ],
+    "numberPaths": [
+      "syncData.stats.credits",
+      "syncData.stats.gold",
+      "syncData.stats.crystal",
+      "syncData.account.attrs",
+      "syncData.account.premiumExpiryTime"
+    ],
+    "booleanPaths": [
+      "syncData.cache.mayConsumeWalletResources"
+    ],
+    "minimumSequenceLengths": {
+      "syncData.stats.dailyPlayHours": 1
+    },
+    "tupleArities": {
+      "syncData.stats.playLimits": 2,
+      "serverSettings.wallet": 2
+    },
+    "defaultedShopKeys": ["tradeIn", "restore_config"],
+    "directServerSettingsKeys": ["wallet"],
+    "newYearEmptySyncDataIsSupported": true
+  },
+  "lobbyGuiContext": {
+    "directKeys": ["databaseID"]
+  }
+}

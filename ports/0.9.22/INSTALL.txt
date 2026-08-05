@@ -1,0 +1,80 @@
+World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.0
+================================================================
+
+This folder is directly mergeable into the frozen Chinese HD client root.
+It supports standard battles only and always uses the matching Python 3 LAN
+server, including when there is only one player.
+
+Use `lan_battle_server.py` from the same repository checkpoint as this package.
+The v5 message schema is round-scoped and stricter than older v5 packages, so
+mixing an old client and new server (or the reverse) is unsupported.
+
+Install
+-------
+
+1. Close the game.
+2. Delete older `org.peng.offline_lan_0922_*.wotmod` files from:
+
+       <game root>\mods\0.9.22.0.1\
+
+   The old loader scans every package, so leaving an incompatible package next
+   to the new one can still stop startup.
+3. Copy this folder's `mods` directory into the game root.
+4. Confirm this file exists:
+
+       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.0.wotmod
+
+5. If the server is on another machine, edit:
+
+       <game root>\mods\configs\offline_lan_0922\config.json
+
+   Set `host` to the server machine's LAN address and keep `port` at `28782`.
+   If no config exists yet, the client creates one on first load.
+
+Start the server
+----------------
+
+From the repository on the Mac host, run:
+
+    python3 lan_battle_server.py --host 0.0.0.0 --port 28782 --map server_random
+
+Allow inbound TCP port 28782 through the host firewall when another computer
+or virtual machine connects.
+
+Start a battle
+--------------
+
+1. Leave the server terminal open.
+2. Start `WorldOfTanks.exe` without logging into an online account.
+3. On a fresh profile, accept the stock EULA once. Its version is stored in
+   `mods\configs\offline_lan_0922\account_state.json` for later launches.
+4. Wait for the stock training settings window. The visible maps come from the
+   server and include standard (`ctf`) definitions only.
+5. Choose a map with the mouse and use the window's normal primary action.
+   There is no F12 or `0` key workflow.
+6. The server starts the selected map and fills both teams to 15 vehicles.
+
+After a team is eliminated, the battle freezes and returns to the map picker
+after three seconds. Connected players can start another round without
+restarting either process. New connections are rejected while a round is
+already active and may join when the server returns to the waiting room.
+
+Troubleshooting
+---------------
+
+- `unsupported compression type`: an older or incorrectly compressed wotmod
+  is still present. Keep only the 0.3.0 package; its members use Store method.
+- No connection in the server terminal: check `config.json`, the host LAN IP,
+  virtual-machine network mode and TCP 28782 firewall access.
+- A traceback appears: close the client and keep `python.log`; it identifies the
+  exact remaining client API boundary. This package does not create separate
+  probe or trace files.
+
+Current boundary
+----------------
+
+The release uses native map, Avatar, Vehicle, HUD and collision resources, but
+local driving is bounded kinematic movement rather than retail server physics.
+Bots run on one elected client; the Python server owns shared HP, shot events,
+elimination and round reset. Base capture and non-standard modes are not
+implemented. Do not install this mod into a current or online client.

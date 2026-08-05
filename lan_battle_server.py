@@ -30,12 +30,12 @@ from server_bot_ai import BotPlanner
 
 PROTOCOL_VERSION = 5
 TICK_HZ = 30.0
+RESULT_RESET_SECONDS = 3.0
 MAX_LINE_BYTES = 256 * 1024
 DEFAULT_MAP = "server_random"
 MAP_POOL = (
     "01_karelia",
     "02_malinovka",
-    "03_campania",
     "04_himmelsdorf",
     "05_prohorovka",
     "06_ensk",
@@ -45,7 +45,6 @@ MAP_POOL = (
     "11_murovanka",
     "13_erlenberg",
     "14_siegfried_line",
-    "15_komarin",
     "17_munchen",
     "18_cliff",
     "19_monastery",
@@ -60,12 +59,23 @@ MAP_POOL = (
     "36_fishing_bay",
     "37_caucasus",
     "38_mannerheim_line",
-    "39_crimea",
-    "42_north_america",
     "44_north_america",
     "45_north_america",
     "47_canada_a",
-    "51_asia",
+    "59_asia_great_wall",
+    "63_tundra",
+    "73_asia_korea",
+    "83_kharkiv",
+    "84_winter",
+    "86_himmelsdorf_winter",
+    "92_stalingrad",
+    "95_lost_city",
+    "100_thepit",
+    "101_dday",
+    "103_ruinberg_winter",
+    "112_eiffel_tower_ctf",
+    "114_czech",
+    "217_er_alaska",
 )
 BOT_CALLSIGNS = (
     "Atlas", "Badger", "Bison", "Cedar", "Comet", "Condor", "Coyote", "Dagger",
@@ -74,6 +84,11 @@ BOT_CALLSIGNS = (
     "Orion", "Otter", "Panda", "Quartz", "Raven", "Rook", "Saber", "Scout",
     "Shark", "Sparrow", "Talon", "Tiger", "Viper", "Wolf", "Yak", "Zephyr",
 )
+ROUND_SCOPED_MESSAGE_TYPES = frozenset((
+    "start_battle", "input", "hit_report", "bot_manifest", "bot_state",
+    "bot_observation", "bot_hit_report", "bot_human_hit", "rules_state",
+    "battle_result",
+))
 
 
 def _server_log(message):
@@ -89,6 +104,20 @@ def _finite_float(value, default=0.0):
     if not math.isfinite(value):
         return float(default)
     return value
+
+
+def _has_finite_fields(value, names):
+    if not isinstance(value, dict):
+        return False
+    for name in names:
+        if name not in value:
+            return False
+        try:
+            if not math.isfinite(float(value[name])):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
 
 
 def _clamp(value, low, high):
@@ -113,7 +142,7 @@ class Player:
     conn: socket.socket
     address: Tuple[str, int]
     name: str = "Player"
-    vehicle: str = "ussr:MS-1"
+    vehicle: str = "ussr:R11_MS-1"
     team: int = 1
     slot: int = 0
     x: float = 0.0
@@ -159,7 +188,7 @@ class BattleState:
     def __init__(self, map_name=DEFAULT_MAP, max_players=30):
         self.map_option = map_name
         self.map_name = self._choose_map()
-        self.max_players = max(1, min(int(max_players), 64))
+        self.max_players = max(1, min(int(max_players), 30))
         self.players: Dict[int, Player] = {}
         self.next_id = 1
         self.tick = 0
@@ -169,6 +198,7 @@ class BattleState:
         self.round_id = 1
         self.bot_roster = self._new_bot_roster()
         self.bot_authority_id = None
+        self.bot_manifest_authority_id = None
         self.bot_manifest = []
         self.bot_states = {}
         self.bot_planner = BotPlanner()
@@ -177,27 +207,52 @@ class BattleState:
         self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
                                       "2": {"points": 0, "stopped": False}}}
         self.battle_result = None
+        self.result_reset_tick = None
+        self.roster_finalized = False
         self.pending_events = []
 
     def _choose_map(self):
         if self.map_option in (None, "", "random", DEFAULT_MAP):
             return random.choice(MAP_POOL)
-        return str(self.map_option)
+        selected = str(self.map_option)
+        if selected not in MAP_POOL:
+            raise ValueError("unsupported standard map: %s" % selected)
+        return selected
+
+    def _message_round_matches(self, message):
+        """Fence modern clients by round while accepting legacy v5 payloads."""
+        if not isinstance(message, dict):
+            return False
+        if "round_id" not in message:
+            return True
+        try:
+            raw_round = message.get("round_id")
+            parsed_round = int(raw_round)
+            return (not isinstance(raw_round, bool) and
+                    float(raw_round) == parsed_round and
+                    parsed_round == self.round_id)
+        except (TypeError, ValueError, OverflowError):
+            return False
 
     @staticmethod
-    def _new_bot_roster():
+    def _new_bot_roster(occupied_slots=None):
+        occupied_slots = set(occupied_slots or ())
         roster = []
         used = set()
-        bot_id = 1
         for team in (1, 2):
             for slot in range(15):
+                if (team, slot) in occupied_slots:
+                    continue
                 while True:
                     name = "%s-%02d" % (random.choice(BOT_CALLSIGNS), random.randint(10, 99))
                     if name.lower() not in used:
                         used.add(name.lower())
                         break
+                # Preserve the canonical id for a team slot even when humans
+                # occupy other slots.  This keeps bot identity deterministic
+                # across different waiting-room sizes without slot collisions.
+                bot_id = slot + 1 if team == 1 else slot + 16
                 roster.append({"id": bot_id, "team": team, "slot": slot, "name": name})
-                bot_id += 1
         return roster
 
     def _elect_bot_authority(self):
@@ -205,18 +260,19 @@ class BattleState:
         old = self.bot_authority_id
         self.bot_authority_id = connected[0] if connected else None
         if old != self.bot_authority_id and self.phase == "battle":
+            self.bot_manifest_authority_id = None
             self.bot_planner.clear_observations()
             self.pending_events.append({
                 "kind": "authority",
                 "player_id": self.bot_authority_id,
+                "round_id": self.round_id,
             })
         return old, self.bot_authority_id
 
-    def _spawn_for(self, player_id, team):
+    def _spawn_for(self, slot, team):
         # Coordinates are intentionally simple and are also sent to clients.
         # The client maps these onto the same local battle space.
         # Keep the synthetic arena small; clients map it onto the loaded map.
-        slot = (player_id - 1) // 2
         return self._spawn_x_for(slot), self._spawn_z_for(team), (0.0 if team == 1 else math.pi)
 
     @staticmethod
@@ -246,19 +302,33 @@ class BattleState:
 
     def add_player(self, conn, address, hello):
         with self.lock:
+            if self.phase != "waiting":
+                return None, "battle_in_progress"
             if len(self.players) >= self.max_players:
                 return None, "full"
+            occupied = {
+                team: {player.slot for player in self.players.values()
+                       if player.connected and player.team == team}
+                for team in (1, 2)}
+            available = {
+                team: [slot for slot in range(15)
+                       if slot not in occupied[team]]
+                for team in (1, 2)}
+            candidates = [team for team in (1, 2) if available[team]]
+            if not candidates:
+                return None, "full"
+            team = min(candidates, key=lambda value: (
+                len(occupied[value]), value))
+            slot = available[team][0]
             player_id = self.next_id
             self.next_id += 1
-            team = 1 if player_id % 2 else 2
-            slot = (player_id - 1) // 2
-            x, z, yaw = self._spawn_for(player_id, team)
+            x, z, yaw = self._spawn_for(slot, team)
             player = Player(
                 player_id=player_id,
                 conn=conn,
                 address=address,
                 name=self._unique_name(hello.get("name"), address, player_id),
-                vehicle=_safe_vehicle(hello.get("vehicle"), "ussr:MS-1"),
+                vehicle=_safe_vehicle(hello.get("vehicle"), "ussr:R11_MS-1"),
                 team=team,
                 slot=slot,
                 x=x,
@@ -279,24 +349,49 @@ class BattleState:
             if player_id == self.bot_authority_id:
                 self._elect_bot_authority()
             reset = False
+            if self.players and self.phase == "battle":
+                self._maybe_finish_battle()
             if not self.players and self.phase == "battle":
-                self.phase = "waiting"
-                self.round_id += 1
-                self.next_id = 1
-                self.tick = 0
-                self.map_name = self._choose_map()
-                self.bot_roster = self._new_bot_roster()
-                self.bot_authority_id = None
-                self.bot_manifest = []
-                self.bot_states = {}
-                self.bot_planner.reset()
-                self.bot_orders = {"revision": 0, "orders": []}
-                self.bot_reported_hits = set()
-                self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
-                                               "2": {"points": 0, "stopped": False}}}
-                self.battle_result = None
+                self._reset_round()
                 reset = True
             return player, reset
+
+    def _reset_round(self):
+        """Return connected players to a clean waiting-room round."""
+        self.phase = "waiting"
+        self.round_id += 1
+        self.tick = 0
+        self.map_name = self._choose_map()
+        for player in self.players.values():
+            player.health = player.max_health
+            player.alive = True
+            player.forward = 0.0
+            player.turn = 0.0
+            player.fire_seq = 0
+            player.shell_index = 0
+            player.reported_hits.clear()
+            player.client_position = False
+            player.x, player.z, player.yaw = self._spawn_for(
+                player.slot, player.team)
+            player.y = 0.0
+            player.aim_yaw = player.yaw
+            player.gun_pitch = 0.0
+            player.bot_order_revision_sent = -1
+        self.next_id = max([player.player_id for player in self.players.values()] or [0]) + 1
+        self.bot_roster = self._new_bot_roster()
+        self.bot_authority_id = None
+        self.bot_manifest_authority_id = None
+        self.bot_manifest = []
+        self.bot_states = {}
+        self.bot_planner.reset()
+        self.bot_orders = {"revision": 0, "orders": []}
+        self.bot_reported_hits = set()
+        self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
+                                       "2": {"points": 0, "stopped": False}}}
+        self.battle_result = None
+        self.result_reset_tick = None
+        self.roster_finalized = False
+        self.pending_events = []
 
     def lobby_message(self):
         with self.lock:
@@ -324,6 +419,9 @@ class BattleState:
                     return None, "invalid_map"
                 self.map_name = requested_map
             connected = [p for p in self.players.values() if p.connected]
+            occupied_slots = {(p.team, p.slot) for p in connected}
+            self.bot_roster = self._new_bot_roster(occupied_slots)
+            self.roster_finalized = True
             self.phase = "battle"
             self._elect_bot_authority()
             return {
@@ -369,29 +467,44 @@ class BattleState:
     def update_bot_manifest(self, player_id, message):
         """Accept the canonical bot lineup from the elected simulation client."""
         with self.lock:
-            if self.phase != "battle" or player_id != self.bot_authority_id:
+            if (not self._message_round_matches(message) or
+                    self.phase != "battle" or self.battle_result is not None or
+                    player_id != self.bot_authority_id):
                 return False
             incoming = message.get("bots") or []
             if not isinstance(incoming, (list, tuple)):
                 return False
             roster = {entry["id"]: entry for entry in self.bot_roster}
+            if not roster:
+                if incoming:
+                    return False
+                self.bot_manifest_authority_id = player_id
+                return True
+            if len(incoming) != len(roster):
+                return False
             manifest = []
             states = {}
             seen = set()
-            for raw in incoming[:30]:
-                if not isinstance(raw, dict):
-                    continue
+            required = ("id", "team", "slot", "vehicle", "health",
+                        "max_health", "x", "y", "z", "yaw")
+            for raw in incoming:
+                if (not isinstance(raw, dict) or
+                        not all(key in raw for key in required) or
+                        not _has_finite_fields(
+                            raw, ("id", "team", "slot", "health",
+                                  "max_health", "x", "y", "z", "yaw"))):
+                    return False
                 try:
                     bot_id = int(raw.get("id"))
+                    raw_team = int(raw.get("team", roster.get(bot_id, {}).get("team", 0)))
+                    raw_slot = int(raw.get("slot", roster.get(bot_id, {}).get("slot", -1)))
                 except (TypeError, ValueError):
-                    continue
+                    return False
                 identity = roster.get(bot_id)
                 if identity is None or bot_id in seen:
-                    continue
-                if int(raw.get("team", identity["team"])) != identity["team"]:
-                    continue
-                if int(raw.get("slot", identity["slot"])) != identity["slot"]:
-                    continue
+                    return False
+                if raw_team != identity["team"] or raw_slot != identity["slot"]:
+                    return False
                 seen.add(bot_id)
                 max_health = max(1, min(int(_finite_float(raw.get("max_health"), 1000)), 100000))
                 health = max(0, min(int(_finite_float(raw.get("health"), max_health)), max_health))
@@ -400,7 +513,7 @@ class BattleState:
                     "team": identity["team"],
                     "slot": identity["slot"],
                     "name": identity["name"],
-                    "vehicle": _safe_vehicle(raw.get("vehicle"), "ussr:MS-1"),
+                    "vehicle": _safe_vehicle(raw.get("vehicle"), "ussr:R11_MS-1"),
                     "max_health": max_health,
                     "health": health,
                     "profile": self._sanitize_bot_profile(raw.get("profile")),
@@ -408,9 +521,11 @@ class BattleState:
                 }
                 manifest.append(entry)
                 states[bot_id] = self._sanitize_bot_state(raw, entry, None)
-            if not manifest:
+            if seen != set(roster):
                 return False
+            manifest.sort(key=lambda value: value["id"])
             self.bot_manifest = manifest
+            self.bot_manifest_authority_id = player_id
             if not self.bot_states:
                 self.bot_states = states
             self.pending_events.append({"kind": "bot_manifest", "bots": list(manifest)})
@@ -472,7 +587,13 @@ class BattleState:
     def update_bot_observation(self, player_id, message):
         """Accept authority observations; never derive contacts from snapshots."""
         with self.lock:
-            if self.phase != "battle" or player_id != self.bot_authority_id:
+            if (not self._message_round_matches(message) or
+                    self.phase != "battle" or player_id != self.bot_authority_id or
+                    player_id != self.bot_manifest_authority_id):
+                return False
+            if (not isinstance(message.get("contacts"), (list, tuple)) or
+                    ("affordances" in message and
+                     not isinstance(message.get("affordances"), (list, tuple)))):
                 return False
             players = [self._public_player(p) for p in self.players.values() if p.connected]
             known_targets = self.bot_planner.known_targets(list(self.bot_states.values()), players)
@@ -503,7 +624,7 @@ class BattleState:
             "team": int(identity["team"]),
             "slot": int(identity["slot"]),
             "name": identity["name"],
-            "vehicle": identity.get("vehicle", "ussr:MS-1"),
+            "vehicle": identity.get("vehicle", "ussr:R11_MS-1"),
             "world_pose": True,
             "x": round(_clamp(_finite_float(raw.get("x")), -2000.0, 2000.0), 4),
             "y": round(_clamp(_finite_float(raw.get("y")), -1000.0, 1000.0), 4),
@@ -520,52 +641,134 @@ class BattleState:
 
     def update_bot_states(self, player_id, message):
         with self.lock:
-            if self.phase != "battle" or player_id != self.bot_authority_id or not self.bot_manifest:
+            if (not self._message_round_matches(message) or
+                    self.phase != "battle" or self.battle_result is not None or
+                    player_id != self.bot_authority_id or
+                    player_id != self.bot_manifest_authority_id or
+                    not self.bot_manifest):
                 return False
             identities = {entry["id"]: entry for entry in self.bot_manifest}
-            changed = False
             incoming = message.get("bots") or []
-            if not isinstance(incoming, (list, tuple)):
+            if (not isinstance(incoming, (list, tuple)) or
+                    len(incoming) != len(identities)):
                 return False
-            for raw in incoming[:30]:
-                if not isinstance(raw, dict):
-                    continue
+            next_states = {}
+            shot_events = []
+            seen = set()
+            required = ("id", "x", "y", "z", "yaw", "health",
+                        "alive", "fire_seq")
+            for raw in incoming:
+                if (not isinstance(raw, dict) or
+                        not all(key in raw for key in required) or
+                        not _has_finite_fields(
+                            raw, ("id", "x", "y", "z", "yaw",
+                                  "health", "fire_seq")) or
+                        not isinstance(raw.get("alive"), bool)):
+                    return False
                 try:
                     bot_id = int(raw.get("id"))
                 except (TypeError, ValueError):
-                    continue
+                    return False
                 identity = identities.get(bot_id)
-                if identity is None:
-                    continue
+                if identity is None or bot_id in seen:
+                    return False
+                seen.add(bot_id)
+                try:
+                    fire_seq = int(raw.get("fire_seq"))
+                except (TypeError, ValueError):
+                    return False
+                if (fire_seq < 0 or float(raw.get("fire_seq")) != fire_seq or
+                        bool(raw.get("alive")) !=
+                        (int(float(raw.get("health"))) > 0)):
+                    return False
                 previous = self.bot_states.get(bot_id)
-                self.bot_states[bot_id] = self._sanitize_bot_state(raw, identity, previous)
-                changed = True
-            return changed
+                current = self._sanitize_bot_state(raw, identity, previous)
+                previous_fire = int((previous or {}).get("fire_seq", 0))
+                if current["fire_seq"] > previous_fire + 1:
+                    return False
+                next_states[bot_id] = current
+                if (current["alive"] and
+                        (previous is None or previous.get("alive")) and
+                        current["fire_seq"] > previous_fire):
+                    shot_events.append({
+                        "kind": "bot_shot", "attacker_bot": bot_id,
+                        "shot_seq": current["fire_seq"],
+                        "shell_index": current["shell_index"],
+                    })
+            if seen != set(identities):
+                return False
+            self.bot_states = next_states
+            self.pending_events.extend(shot_events)
+            self._maybe_finish_battle()
+            return True
 
     def report_bot_hit(self, player_id, message):
-        """Apply a human shot against a server-owned bot HP record."""
+        """Apply a human or authority-owned bot shot to a bot HP record."""
         with self.lock:
-            attacker = self.players.get(player_id)
-            if self.phase != "battle" or attacker is None or not attacker.alive:
+            if (not self._message_round_matches(message) or
+                    self.phase != "battle" or self.battle_result is not None):
+                return False
+            if not all(key in message for key in
+                       ("target", "shot_seq", "damage")):
+                return False
+            if (not _has_finite_fields(
+                    message, ("target", "shot_seq", "damage")) or
+                    _finite_float(message.get("damage"), -1.0) < 0.0):
                 return False
             try:
                 shot_seq = int(message.get("shot_seq", 0))
                 bot_id = int(message.get("target", 0))
             except (TypeError, ValueError):
                 return False
-            hit_key = ("bot", shot_seq, bot_id)
             state = self.bot_states.get(bot_id)
-            if (state is None or not state.get("alive") or state.get("team") == attacker.team or
-                    shot_seq <= 0 or shot_seq > attacker.fire_seq or hit_key in attacker.reported_hits):
+            if state is None or not state.get("alive"):
                 return False
-            attacker.reported_hits.add(hit_key)
+            attacker_bot_value = message.get("attacker_bot")
+            if attacker_bot_value is not None:
+                if player_id != self.bot_authority_id:
+                    return False
+                if player_id != self.bot_manifest_authority_id:
+                    return False
+                try:
+                    attacker_bot_id = int(attacker_bot_value)
+                except (TypeError, ValueError):
+                    return False
+                attacker_bot = self.bot_states.get(attacker_bot_id)
+                hit_key = ("bot_shot", attacker_bot_id, shot_seq)
+                if (attacker_bot is None or not attacker_bot.get("alive") or
+                        attacker_bot_id == bot_id or
+                        attacker_bot.get("team") == state.get("team") or
+                        shot_seq <= 0 or
+                        shot_seq > int(attacker_bot.get("fire_seq", 0)) or
+                        hit_key in self.bot_reported_hits or
+                        math.hypot(state["x"] - attacker_bot["x"],
+                                   state["z"] - attacker_bot["z"]) > 2200.0):
+                    return False
+                self.bot_reported_hits.add(hit_key)
+                attacker_id = attacker_bot_id
+                shell_index = attacker_bot.get("shell_index", 0)
+                event_kind = "bot_bot_hit"
+            else:
+                attacker = self.players.get(player_id)
+                hit_key = ("shot", shot_seq)
+                if (attacker is None or not attacker.alive or
+                        state.get("team") == attacker.team or shot_seq <= 0 or
+                        shot_seq > attacker.fire_seq or
+                        hit_key in attacker.reported_hits):
+                    return False
+                attacker.reported_hits.add(hit_key)
+                attacker_id = player_id
+                shell_index = attacker.shell_index
+                event_kind = "bot_hit"
             damage = max(0, min(int(_finite_float(message.get("damage"), 0)), 5000))
             applied = min(damage, int(state.get("health", 0)))
             state["health"] -= applied
             state["alive"] = state["health"] > 0
             self.pending_events.append({
-                "kind": "bot_hit", "attacker": player_id, "target_bot": bot_id,
-                "shot_seq": shot_seq, "shell_index": attacker.shell_index,
+                "kind": event_kind,
+                "attacker_bot" if event_kind == "bot_bot_hit" else "attacker": attacker_id,
+                "target_bot": bot_id,
+                "shot_seq": shot_seq, "shell_index": shell_index,
                 "shot_result": max(0, min(int(_finite_float(message.get("shot_result"), 2)), 2)),
                 "damage": applied, "health": state["health"], "dead": not state["alive"],
                 "world_pose": True,
@@ -573,12 +776,23 @@ class BattleState:
                 "y": round(_clamp(_finite_float(message.get("y"), state["y"] + 1.0), -1000.0, 1000.0), 4),
                 "z": round(_clamp(_finite_float(message.get("z"), state["z"]), -2000.0, 2000.0), 4),
             })
+            self._maybe_finish_battle()
             return True
 
     def report_bot_human_hit(self, player_id, message):
         """Apply an authority-resolved bot shot against shared human HP."""
         with self.lock:
-            if self.phase != "battle" or player_id != self.bot_authority_id:
+            if (not self._message_round_matches(message) or
+                    self.phase != "battle" or self.battle_result is not None or
+                    player_id != self.bot_authority_id or
+                    player_id != self.bot_manifest_authority_id):
+                return False
+            if not all(key in message for key in
+                       ("attacker_bot", "target", "shot_seq", "damage")):
+                return False
+            if (not _has_finite_fields(
+                    message, ("attacker_bot", "target", "shot_seq", "damage")) or
+                    _finite_float(message.get("damage"), -1.0) < 0.0):
                 return False
             try:
                 bot_id = int(message.get("attacker_bot", 0))
@@ -592,8 +806,13 @@ class BattleState:
                 return False
             if bot.get("team") == target.team:
                 return False
-            hit_key = (bot_id, shot_seq, target_id)
-            if shot_seq <= 0 or hit_key in self.bot_reported_hits:
+            try:
+                bot_fire_seq = int(bot.get("fire_seq", 0))
+            except (TypeError, ValueError):
+                bot_fire_seq = 0
+            hit_key = ("bot_shot", bot_id, shot_seq)
+            if (shot_seq <= 0 or shot_seq > bot_fire_seq or
+                    hit_key in self.bot_reported_hits):
                 return False
             self.bot_reported_hits.add(hit_key)
             damage = max(0, min(int(_finite_float(message.get("damage"), 0)), 5000))
@@ -609,11 +828,15 @@ class BattleState:
                 "y": round(_clamp(_finite_float(message.get("y"), target.y + 1.0), -1000.0, 1000.0), 4),
                 "z": round(_clamp(_finite_float(message.get("z"), target.z), -2000.0, 2000.0), 4),
             })
+            self._maybe_finish_battle()
             return True
 
     def update_rules(self, player_id, message):
         with self.lock:
-            if self.phase != "battle" or player_id != self.bot_authority_id or self.battle_result is not None:
+            if (not self._message_round_matches(message) or
+                    self.phase != "battle" or
+                    player_id != self.bot_authority_id or
+                    self.battle_result is not None):
                 return False
             bases = {}
             rules = message.get("rules") or {}
@@ -635,22 +858,89 @@ class BattleState:
 
     def report_battle_result(self, player_id, message):
         with self.lock:
-            if self.phase != "battle" or player_id != self.bot_authority_id or self.battle_result is not None:
+            if (not self._message_round_matches(message) or
+                    self.phase != "battle" or
+                    player_id != self.bot_authority_id or
+                    self.battle_result is not None):
                 return False
-            winner = max(0, min(int(_finite_float(message.get("winner"), 0)), 2))
-            base_team = max(0, min(int(_finite_float(message.get("base_team"), 0)), 2))
-            self.battle_result = {
-                "winner": winner,
-                "reason": _safe_name(message.get("reason"), "battle finished"),
-                "base_team": base_team,
-            }
-            self.pending_events.append(dict(self.battle_result, kind="battle_result"))
-            return True
+            if "winner" not in message or "reason" not in message:
+                return False
+            try:
+                winner = int(message.get("winner"))
+                base_team = int(message.get("base_team", 0))
+            except (TypeError, ValueError):
+                return False
+            reason = _safe_name(message.get("reason"), "")
+            if winner not in (0, 1, 2) or base_team not in (0, 1, 2) or not reason:
+                return False
+            return self._finish_battle(
+                winner, reason, base_team)
+
+    def _finish_battle(self, winner, reason, base_team=0):
+        """Store and announce a terminal result exactly once."""
+        if self.battle_result is not None:
+            return False
+        self.battle_result = {
+            "winner": max(0, min(int(winner), 2)),
+            "reason": _safe_name(reason, "battle finished"),
+            "base_team": max(0, min(int(base_team), 2)),
+        }
+        self.result_reset_tick = self.tick + max(
+            1, int(round(RESULT_RESET_SECONDS * TICK_HZ)))
+        for player in self.players.values():
+            player.forward = 0.0
+            player.turn = 0.0
+        self.pending_events.append(dict(self.battle_result, kind="battle_result"))
+        return True
+
+    def _maybe_finish_battle(self):
+        """Finish a standard battle once one of the two teams is eliminated.
+
+        Wait for the authority manifest before evaluating.  The stock roster is
+        intentionally not counted as alive: it has no health state yet, while
+        treating it as dead would end the round during the startup handshake.
+        """
+        if (self.phase != "battle" or self.battle_result is not None or
+                (not self.roster_finalized and not self.bot_manifest)):
+            return False
+        if self.bot_roster and not self.bot_manifest:
+            return False
+        if self.bot_roster:
+            roster_ids = {int(entry.get("id", 0))
+                          for entry in self.bot_roster}
+            manifest_ids = {int(entry.get("id", 0))
+                            for entry in self.bot_manifest}
+            if not roster_ids.issubset(manifest_ids):
+                return False
+        participant_teams = {
+            int(entry.get("team", 0)) for entry in self.bot_roster}
+        participant_teams.update(
+            player.team for player in self.players.values()
+            if player.connected)
+        if not {1, 2}.issubset(participant_teams):
+            return False
+        alive_teams = set()
+        for player in self.players.values():
+            if player.connected and player.alive and player.team in (1, 2):
+                alive_teams.add(player.team)
+        for state in self.bot_states.values():
+            if state.get("alive") and state.get("team") in (1, 2):
+                alive_teams.add(int(state["team"]))
+        if alive_teams == {1, 2}:
+            return False
+        winner = next(iter(alive_teams)) if len(alive_teams) == 1 else 0
+        return self._finish_battle(winner, "team_eliminated", 0)
 
     def update_input(self, player_id, message):
         with self.lock:
+            if not self._message_round_matches(message):
+                return False
             player = self.players.get(player_id)
             if player is None or not player.connected:
+                return
+            if self.phase != "battle" or self.battle_result is not None:
+                player.forward = 0.0
+                player.turn = 0.0
                 return
             if player.alive:
                 if "forward" in message:
@@ -675,7 +965,8 @@ class BattleState:
                 player.shell_index = max(0, min(int(message.get("shell_index", player.shell_index)), 9))
             except (TypeError, ValueError):
                 pass
-            if fire_seq > player.fire_seq and self.phase == "battle" and player.alive:
+            if (fire_seq == player.fire_seq + 1 and
+                    self.phase == "battle" and player.alive):
                 player.fire_seq = fire_seq
                 self.pending_events.append({
                     "kind": "shot",
@@ -721,6 +1012,7 @@ class BattleState:
             "dead": not player.alive,
             "source": "client_simulation",
         })
+        self._maybe_finish_battle()
 
     def report_hit(self, player_id, message):
         """Apply a map/armor hit resolved by the firing 0.8.2 client.
@@ -731,14 +1023,23 @@ class BattleState:
         """
         with self.lock:
             attacker = self.players.get(player_id)
-            if self.phase != "battle" or attacker is None or not attacker.connected or not attacker.alive:
+            if (not self._message_round_matches(message) or
+                    self.phase != "battle" or self.battle_result is not None or
+                    attacker is None or not attacker.connected or not attacker.alive):
+                return False
+            if not all(key in message for key in
+                       ("target", "shot_seq", "damage")):
+                return False
+            if (not _has_finite_fields(
+                    message, ("target", "shot_seq", "damage")) or
+                    _finite_float(message.get("damage"), -1.0) < 0.0):
                 return False
             try:
                 shot_seq = int(message.get("shot_seq", 0))
                 target_id = int(message.get("target", 0))
             except (TypeError, ValueError):
                 return False
-            hit_key = (shot_seq, target_id)
+            hit_key = ("shot", shot_seq)
             if shot_seq <= 0 or shot_seq > attacker.fire_seq or hit_key in attacker.reported_hits:
                 return False
             target = self.players.get(target_id)
@@ -775,10 +1076,11 @@ class BattleState:
                 "z": round(_clamp(_finite_float(message.get("z"), target.z), -2000.0, 2000.0), 4),
             }
             self.pending_events.append(event)
+            self._maybe_finish_battle()
             return True
 
     def _apply_movement(self, player, dt):
-        if not player.alive:
+        if not player.alive or self.battle_result is not None:
             return
         if not player.client_position:
             player.yaw += player.turn * 0.85 * dt
@@ -789,22 +1091,34 @@ class BattleState:
             player.z = _clamp(player.z, -220.0, 220.0)
 
     def tick_once(self, dt):
+        reset_message = None
+        with self.lock:
+            if (self.phase == "battle" and self.battle_result is not None and
+                    self.result_reset_tick is not None and
+                    self.tick + 1 >= self.result_reset_tick):
+                self._reset_round()
+                reset_message = self.lobby_message()
+        if reset_message is not None:
+            self.broadcast(reset_message)
+            return
         with self.lock:
             if self.phase != "battle":
                 return
             self.tick += 1
             for player in list(self.players.values()):
                 self._apply_movement(player, dt)
-            self.bot_orders = self.bot_planner.build_orders(
-                self.bot_manifest, list(self.bot_states.values()),
-                [self._public_player(p) for p in self.players.values() if p.connected],
-                time.monotonic())
+            if self.battle_result is None:
+                self.bot_orders = self.bot_planner.build_orders(
+                    self.bot_manifest, list(self.bot_states.values()),
+                    [self._public_player(p) for p in self.players.values() if p.connected],
+                    time.monotonic())
             events = self.pending_events
             self.pending_events = []
             snapshot = {
                 "type": "snapshot",
                 "protocol": PROTOCOL_VERSION,
                 "server_tick": self.tick,
+                "round_id": self.round_id,
                 "map": self.map_name,
                 "bot_authority_id": self.bot_authority_id,
                 "players": [self._public_player(p) for p in self.players.values() if p.connected],
@@ -834,7 +1148,7 @@ class BattleState:
                     _server_log("HEALTH target=%s damage=%s health=%s dead=%s source=%s" % (
                         event.get("target"), event.get("damage"), event.get("health"),
                         event.get("dead"), event.get("source")))
-                elif event.get("kind") in ("bot_hit", "bot_human_hit"):
+                elif event.get("kind") in ("bot_hit", "bot_human_hit", "bot_bot_hit"):
                     _server_log("BOT COMBAT kind=%s attacker=%s target=%s damage=%s health=%s dead=%s" % (
                         event.get("kind"), event.get("attacker", event.get("attacker_bot")),
                         event.get("target", event.get("target_bot")), event.get("damage"),
@@ -844,7 +1158,9 @@ class BattleState:
                 elif event.get("kind") == "battle_result":
                     _server_log("BATTLE RESULT winner=%s reason=%s base_team=%s" % (
                         event.get("winner"), event.get("reason"), event.get("base_team")))
-            self.broadcast({"type": "events", "server_tick": self.tick, "events": events})
+            self.broadcast({"type": "events", "protocol": PROTOCOL_VERSION,
+                            "round_id": self.round_id,
+                            "server_tick": self.tick, "events": events})
 
     @staticmethod
     def _public_player(player):
@@ -895,14 +1211,21 @@ class ClientHandler(socketserver.BaseRequestHandler):
                 buffer += chunk
             line, _, buffer = buffer.partition(b"\n")
             hello = json.loads(line.decode("utf-8"))
+            try:
+                hello_protocol = (int(hello.get("protocol", -1))
+                                  if isinstance(hello, dict) else -1)
+            except (TypeError, ValueError):
+                hello_protocol = -1
             if (not isinstance(hello, dict) or hello.get("type") != "hello" or
-                    int(hello.get("protocol", -1)) != PROTOCOL_VERSION):
+                    hello_protocol != PROTOCOL_VERSION):
                 self._send_raw(conn, {"type": "error", "code": "protocol", "message": "protocol mismatch"})
                 _server_log("Rejected %s:%d: protocol mismatch" % self.client_address)
                 return
             player, join_error = server.state.add_player(conn, self.client_address, hello)
             if player is None:
-                message = "server is full"
+                message = ("battle already in progress"
+                           if join_error == "battle_in_progress"
+                           else "server is full")
                 self._send_raw(conn, {"type": "error", "code": join_error, "message": message})
                 _server_log("Rejected %s:%d: %s" % (self.client_address[0], self.client_address[1], message))
                 return
@@ -962,41 +1285,47 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     message = json.loads(line.decode("utf-8"))
                     if not isinstance(message, dict):
                         continue
-                    if message.get("type") == "input":
+                    message_type = message.get("type")
+                    if (message_type in ROUND_SCOPED_MESSAGE_TYPES and
+                            not server.state._message_round_matches(message)):
+                        continue
+                    if message_type == "input":
                         server.state.update_input(player.player_id, message)
-                    elif message.get("type") == "hit_report":
+                    elif message_type == "hit_report":
                         if not server.state.report_hit(player.player_id, message):
                             _server_log("HIT REPORT rejected attacker=%d target=%s seq=%s" % (
                                 player.player_id, message.get("target"), message.get("shot_seq")))
-                    elif message.get("type") == "bot_manifest":
+                    elif message_type == "bot_manifest":
                         if server.state.update_bot_manifest(player.player_id, message):
                             _server_log("BOT MANIFEST authority=%d bots=%d" % (
                                 player.player_id, len(server.state.bot_manifest)))
                         else:
                             _server_log("BOT MANIFEST rejected sender=%d" % player.player_id)
-                    elif message.get("type") == "bot_state":
+                    elif message_type == "bot_state":
                         server.state.update_bot_states(player.player_id, message)
-                    elif message.get("type") == "bot_observation":
+                    elif message_type == "bot_observation":
                         server.state.update_bot_observation(player.player_id, message)
-                    elif message.get("type") == "bot_hit_report":
+                    elif message_type == "bot_hit_report":
                         if not server.state.report_bot_hit(player.player_id, message):
                             _server_log("BOT HIT rejected attacker=%d target=%s seq=%s" % (
                                 player.player_id, message.get("target"), message.get("shot_seq")))
-                    elif message.get("type") == "bot_human_hit":
+                    elif message_type == "bot_human_hit":
                         if not server.state.report_bot_human_hit(player.player_id, message):
                             _server_log("BOT HUMAN HIT rejected authority=%d target=%s" % (
                                 player.player_id, message.get("target")))
-                    elif message.get("type") == "rules_state":
+                    elif message_type == "rules_state":
                         server.state.update_rules(player.player_id, message)
-                    elif message.get("type") == "battle_result":
+                    elif message_type == "battle_result":
                         if not server.state.report_battle_result(player.player_id, message):
                             _server_log("BATTLE RESULT rejected sender=%d" % player.player_id)
-                    elif message.get("type") == "start_battle":
+                    elif message_type == "start_battle":
                         start_message, start_error = server.state.request_start(
                             player.player_id, message.get("map"))
                         if start_message is None:
                             player.send({
                                 "type": "start_denied",
+                                "protocol": PROTOCOL_VERSION,
+                                "round_id": server.state.round_id,
                                 "code": start_error,
                                 "players": len(server.state.players),
                             })
@@ -1009,16 +1338,16 @@ class ClientHandler(socketserver.BaseRequestHandler):
                                 player.name,
                             ))
                             server.state.broadcast(start_message)
-                    elif message.get("type") == "ping":
+                    elif message_type == "ping":
                         player.send({
                             "type": "pong",
                             "seq": message.get("seq"),
                             "client_time": message.get("client_time"),
                             "server_time": time.time(),
                         })
-                    elif message.get("type") == "leave":
+                    elif message_type == "leave":
                         return
-        except (ValueError, UnicodeError, json.JSONDecodeError) as error:
+        except (TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
             _server_log("Invalid message from %s:%d: %s" % (self.client_address[0], self.client_address[1], error))
         except (ConnectionError, OSError) as error:
             _server_log("Connection error from %s:%d: %s" % (self.client_address[0], self.client_address[1], error))
@@ -1067,7 +1396,7 @@ def run_server(host, port, map_name, max_players):
     thread = threading.Thread(target=tick_loop, name="battle-tick", daemon=True)
     thread.start()
     _server_log("LAN battle server listening on %s:%d (map=%s, max_players=%d)" % (
-        host, port, state.map_name, max_players))
+        host, port, state.map_name, state.max_players))
     _server_log("Ready: clients click Battle! to join, choose a map, then click START BATTLE")
     try:
         tcp_server.serve_forever(poll_interval=0.5)
@@ -1083,7 +1412,10 @@ def main():
     parser = argparse.ArgumentParser(description="LAN server for the offhangar network MVP")
     parser.add_argument("--host", default="0.0.0.0", help="bind address (default: all interfaces)")
     parser.add_argument("--port", type=int, default=28782, help="TCP port (default: 28782)")
-    parser.add_argument("--map", dest="map_name", default=DEFAULT_MAP, help="map name, or server_random (default: server chooses one)")
+    parser.add_argument(
+        "--map", dest="map_name", default=DEFAULT_MAP,
+        choices=(DEFAULT_MAP,) + MAP_POOL,
+        help="standard map name, or server_random")
     parser.add_argument("--max-players", type=int, default=30, help="maximum connected clients")
     args = parser.parse_args()
     run_server(args.host, args.port, args.map_name, args.max_players)

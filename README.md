@@ -1,5 +1,22 @@
-offline-battle mod - World of Tanks 0.8.2
-===================================================
+offline/LAN battles - World of Tanks 0.8.2 and 0.9.22.0.1
+================================================================
+
+## World of Tanks 0.9.22.0.1 #1513
+
+The `ports/0.9.22` release targets the frozen Chinese HD client. It is a
+separate CPython 2.7 `.wotmod`, not a copy of the 0.8.2 scripts. Start the
+Python 3 LAN server even for a one-player battle, then use the stock training
+settings window to choose a standard map and start. There is no F12 or `0` key
+workflow.
+
+The 0.9.22 runtime uses native map, Avatar, Vehicle and HUD objects, fills each
+team to 15 vehicles, and supports movement, aiming, firing, damage, tactical
+bots, elimination, return to the picker and another round. See
+`ports/0.9.22/INSTALL.txt` for the copy-ready package instructions and
+`ports/0.9.22/COMPATIBILITY_REVIEW.md` for the exact `#1513` review and honest
+runtime boundary.
+
+## World of Tanks 0.8.2
 
 > [!IMPORTANT]
 > This project targets the original Windows 0.8.2 client and its embedded
@@ -75,8 +92,8 @@ The ones people change most:
   perfect_accuracy        shells always land in the centre of the circle
   prebattle_countdown_seconds / auto_spawn_delay_seconds
 
-LAN setup
----------
+LAN setup (0.8.2)
+-----------------
 For the optional LAN mode, click the visible `LAN SETTINGS` entry in the
 upper-right of the offline hangar. If mouse input is unavailable, `F11` remains
 a fallback. Enter the server IP and TCP port, toggle LAN battle, and press
@@ -87,7 +104,7 @@ server roster. The server terminal prints one `JOIN` line per client. Use the
 clickable waiting-room panel to choose a map and click `START BATTLE`; the server
 broadcasts one start with that map to every client. LAN mode never starts a
 local random-map timer while it is waiting or after a failed connection. A
-client that connects after the round starts joins that same running round.
+client that connects after the round starts waits until the next round.
 
 The first client in the battle is elected as map-simulation/rules authority.
 It uploads vehicle profiles, standard-battle route anchors and limited spotting

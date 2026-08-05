@@ -43,6 +43,30 @@ class WireClient:
         self.sock.close()
 
 
+def bot_manifest(started, selected_id=None):
+    result = []
+    for identity in started["bots"]:
+        selected = identity["id"] == selected_id
+        result.append(dict(
+            identity,
+            vehicle="germany:PzIV" if selected else "ussr:R11_MS-1",
+            max_health=500,
+            health=500,
+            x=0.0 if selected else float(identity["slot"]),
+            y=0.0,
+            z=100.0 if selected else (
+                -35.0 if identity["team"] == 1 else 35.0),
+            yaw=3.14 if identity["team"] == 2 else 0.0,
+        ))
+    return result
+
+
+def bot_states(manifest):
+    return [dict(value, alive=True, fire_seq=0, shell_index=0,
+                 aim_yaw=value["yaw"], gun_pitch=0.0)
+            for value in manifest]
+
+
 class WaitingRoomTest(unittest.TestCase):
     def setUp(self):
         state = BattleState(map_name="04_himmelsdorf", max_players=30)
@@ -124,8 +148,13 @@ class WaitingRoomTest(unittest.TestCase):
         self.assertEqual(first_start["map"], second_start["map"])
         self.assertEqual(2, len(first_start["players"]))
         self.assertEqual(first_start["bots"], second_start["bots"])
-        self.assertEqual(30, len(first_start["bots"]))
-        self.assertEqual(30, len({bot["name"] for bot in first_start["bots"]}))
+        self.assertEqual(28, len(first_start["bots"]))
+        self.assertEqual(28, len({bot["name"] for bot in first_start["bots"]}))
+        participants = [
+            (value["team"], value["slot"])
+            for value in first_start["players"] + first_start["bots"]]
+        self.assertEqual(30, len(participants))
+        self.assertEqual(30, len(set(participants)))
         self.assertEqual(first_welcome["player_id"], first_start["bot_authority_id"])
 
     def test_authority_owns_bot_rules_and_result_state(self):
@@ -137,29 +166,35 @@ class WaitingRoomTest(unittest.TestCase):
         first.receive_type("roster")
         second.receive_type("roster")
         first.send({"type": "start_battle"})
-        first.receive_type("battle_start")
+        started = first.receive_type("battle_start")
         second.receive_type("battle_start")
-        bot = {
-            "id": 16, "team": 2, "slot": 0, "name": "ignored",
-            "vehicle": "germany:PzIV", "max_health": 500, "health": 500,
-            "x": 0.0, "y": 0.0, "z": 100.0, "yaw": 3.14,
-        }
+        identity = next(value for value in started["bots"]
+                        if value["team"] == 2)
+        manifest = bot_manifest(started, identity["id"])
+        bot = next(value for value in manifest
+                   if value["id"] == identity["id"])
 
-        second.send({"type": "bot_manifest", "bots": [bot]})
-        first.send({"type": "bot_manifest", "bots": [bot]})
+        second.send({"type": "bot_manifest", "bots": manifest})
+        first.send({"type": "bot_manifest", "bots": manifest})
         time.sleep(0.05)
-        self.assertEqual(1, len(self.state.bot_manifest))
-        first.send({"type": "bot_state", "bots": [dict(
-            bot, x=4.0, z=92.0, aim_yaw=3.0, gun_pitch=-0.1,
-            fire_seq=2, shell_index=1,
-        )]})
+        self.assertEqual(len(started["bots"]), len(self.state.bot_manifest))
+        first_state = bot_states(manifest)
+        target_state = next(value for value in first_state
+                            if value["id"] == bot["id"])
+        target_state.update(x=4.0, z=92.0, aim_yaw=3.0, gun_pitch=-0.1,
+                            fire_seq=1, shell_index=1)
+        first.send({"type": "bot_state", "bots": first_state})
+        second_state = [dict(value) for value in first_state]
+        next(value for value in second_state
+             if value["id"] == bot["id"])["fire_seq"] = 2
+        first.send({"type": "bot_state", "bots": second_state})
         first.send({"type": "input", "fire_seq": 1, "shell_index": 0})
         first.send({
-            "type": "bot_hit_report", "target": 16, "shot_seq": 1,
+            "type": "bot_hit_report", "target": bot["id"], "shot_seq": 1,
             "damage": 125, "shot_result": 2, "x": 4.0, "y": 1.0, "z": 92.0,
         })
         bot_human_hit = {
-            "type": "bot_human_hit", "attacker_bot": 16,
+            "type": "bot_human_hit", "attacker_bot": bot["id"],
             "target": first_welcome["player_id"], "shot_seq": 2,
             "damage": 50, "shot_result": 2,
         }
@@ -182,7 +217,8 @@ class WaitingRoomTest(unittest.TestCase):
         self.state.tick_once(0.05)
 
         snapshot = second.receive_type("snapshot")
-        shared_bot = snapshot["bots"][0]
+        shared_bot = next(value for value in snapshot["bots"]
+                          if value["id"] == bot["id"])
         self.assertEqual(first_welcome["player_id"], snapshot["bot_authority_id"])
         self.assertEqual("germany:PzIV", shared_bot["vehicle"])
         self.assertEqual(4.0, shared_bot["x"])
@@ -205,14 +241,19 @@ class WaitingRoomTest(unittest.TestCase):
         first.receive_type("roster")
         second.receive_type("roster")
         first.send({"type": "start_battle"})
-        first.receive_type("battle_start")
+        started = first.receive_type("battle_start")
         second.receive_type("battle_start")
-        bot = {"id": 16, "team": 2, "slot": 0, "vehicle": "germany:PzIV",
-               "max_health": 500, "health": 500, "x": 0.0, "z": 100.0,
-               "profile": {"class_tag": "mediumTank", "dominant_role": "support",
-                           "roles": ["support"], "desired_range": 220, "fire_range": 600}}
-        first.send({"type": "bot_manifest", "bots": [bot]})
-        first.send({"type": "bot_state", "bots": [bot]})
+        identity = next(value for value in started["bots"]
+                        if value["team"] == 2)
+        manifest = bot_manifest(started, identity["id"])
+        bot = next(value for value in manifest
+                   if value["id"] == identity["id"])
+        bot["profile"] = {
+            "class_tag": "mediumTank", "dominant_role": "support",
+            "roles": ["support"], "desired_range": 220,
+            "fire_range": 600}
+        first.send({"type": "bot_manifest", "bots": manifest})
+        first.send({"type": "bot_state", "bots": bot_states(manifest)})
         first.send({"type": "bot_observation", "contacts": [{
             "observing_team": 2, "target_id": first_welcome["player_id"], "target_team": 1,
             "visible": True, "x": 17.0, "y": 2.0, "z": -31.0,
@@ -222,8 +263,9 @@ class WaitingRoomTest(unittest.TestCase):
         self.state.tick_once(0.05)
         snapshot = second.receive_type("snapshot")
         self.assertGreater(snapshot["bot_order_revision"], 0)
-        order = snapshot["bot_orders"][0]
-        self.assertEqual(16, order["id"])
+        order = next(value for value in snapshot["bot_orders"]
+                     if value["id"] == bot["id"])
+        self.assertEqual(bot["id"], order["id"])
         self.assertEqual(first_welcome["player_id"], order["target_id"])
         self.assertEqual({"x": 17.0, "y": 2.0, "z": -31.0}, order["aim_position"])
         self.assertTrue(order["fire_allowed"])
@@ -260,22 +302,18 @@ class WaitingRoomTest(unittest.TestCase):
         self.assertEqual({}, self.state.bot_planner._cover_states)
         self.assertEqual({}, self.state.bot_planner._engage_anchors)
 
-    def test_late_player_joins_the_current_battle(self):
+    def test_late_player_is_rejected_until_the_next_waiting_round(self):
         first = self.connect("Alpha")
-        first_welcome = first.receive_type("welcome")
+        first.receive_type("welcome")
         first.receive_type("roster")
         first.send({"type": "start_battle"})
-        first_start = first.receive_type("battle_start")
+        first.receive_type("battle_start")
 
         late = self.connect("LateBravo")
-        late_welcome = late.receive_type("welcome")
-        late_start = late.receive_type("battle_start")
+        error = late.receive_type("error")
 
-        self.assertEqual("battle", late_welcome["phase"])
-        self.assertTrue(late_start["late_join"])
-        self.assertEqual(first_welcome["map"], first_start["map"])
-        self.assertEqual(first_start["map"], late_start["map"])
-        self.assertEqual(2, len(late_start["players"]))
+        self.assertEqual("battle_in_progress", error["code"])
+        self.assertEqual(1, len(self.state.players))
 
     def test_default_names_are_unique_and_vehicle_identity_is_preserved(self):
         first = self.connect("Defaultplayer")

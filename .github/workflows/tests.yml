@@ -23,3 +23,17 @@ jobs:
         run: >-
           docker run --rm -v "$PWD:/work" -w /work zinainfra/python26
           -m compileall -q scripts/client/gui/mods
+      - name: Build Python 2.7 0.9.22 LAN client
+        run: >-
+          docker run --rm --platform linux/amd64 -v "$PWD:/work"
+          -w /work/ports/0.9.22 python:2.7.18
+          python build_wotmod.py
+      - name: Validate 0.9.22 wotmod package
+        run: >-
+          python ports/0.9.22/tools/validate_wotmod.py
+          ports/0.9.22/dist/org.peng.offline_lan_0922_0.3.0.wotmod
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wot-0.9.22-lan-client
+          path: ports/0.9.22/dist/*
+          if-no-files-found: error
