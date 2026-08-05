@@ -5,7 +5,7 @@ This review is pinned to the Chinese HD client whose `version.xml` reports
 CPython 2.7 bytecode magic `03 f3 0d 0a`; the embedded build identifies itself
 as Python 2.7.7.
 
-The goal of version 0.3.4 is a complete playable vertical path, not another
+The goal of version 0.3.5 is a complete playable vertical path, not another
 login-only probe: local Account -> stock Lobby/map selection -> native map and
 Avatar -> native Vehicle entities -> local movement/aim/fire -> synchronized
 humans and bots -> damage/death/result -> cleanup -> a second round.
@@ -57,17 +57,30 @@ dictionary. The exact Account repository survives across replacement Account
 entities, while `AccountSyncData.setAccount()` saves its persistent cache
 through the old weak proxy before rebinding that cache to the new Account. The
 offline constructor therefore prebinds that one cache before native repository
-reuse. Initialization and player-promotion sentinels are set only after their
-native methods return successfully; a partial Entity returned by BigWorld is
-never promoted. FakeServer and uncancellable Avatar resource callbacks require
-both sentinels and current-player identity, so a zombie object cannot receive a
-late mailbox callback even during the destruction tick.
+reuse. The initialization sentinel is set only after the native constructor
+returns. A separate retirement token is opened immediately before native
+`onBecomePlayer()`, because that method can attach global helpers and chat and
+then fail; the ready sentinel is set only after the complete promotion passes
+validation. FakeServer and uncancellable Avatar resource callbacks require the
+ready sentinel and current-player identity, so a zombie object cannot receive
+a late mailbox callback even during the destruction tick.
 
 The LOGGED_ON notification, Account construction and promotion are one
 transaction. Any listener or constructor failure clears client-only spaces,
 resets connection status, invokes every disconnect boundary independently and
 deletes the retained Account repository even if an earlier event listener
 raises. Shutdown restores every patched class and host entry in `finally`.
+
+Before any bulk entity clear, the current offline Account or Avatar now runs
+its complete native `onBecomeNonPlayer()` method exactly once. This detaches
+`ChatManager.playerProxy` and every Account/Avatar helper while the entity
+fields still exist; the later engine callback is ignored by the closed
+retirement token. If native retirement itself raises before its late chat
+detach, the wrapper still clears `ChatManager.playerProxy` and preserves the
+first error. The regression fake clears the retired object's entire `__dict__`,
+exercises Account -> Avatar -> replacement Account, and injects failures after
+partial Account/Avatar promotion, reproducing the native failure mode in which
+`ChatManager.switchPlayerProxy()` first cleans the old proxy.
 
 The Account surface was checked consumer-first against the local `#1513` PYC,
 not inferred from another 0.9.22 build:
@@ -201,14 +214,27 @@ this client.
 
 The Lobby-to-Avatar transition also follows the exact `#1513` native ownership
 order. It requires a fully initialized HangarSpace, calls
-`g_hangarSpace.destroy()` so the hangar vehicle, camera, input handlers,
-callbacks and geometry are retired by their owner, verifies both readiness
-flags are false, and only then calls `BigWorld.clearEntitiesAndSpaces()`.
-Calling the bulk clear first can leave the later Account/Avatar hangar cleanup
-re-entering already-cleared native objects. During synchronous map creation,
+`PlayerAccount.onBecomeNonPlayer()` so chat, all Account helpers, current and
+preview vehicles, HangarSpace, camera, input handlers, callbacks and geometry
+are retired by their native owners, verifies both HangarSpace readiness flags
+are false, and only then calls `BigWorld.clearEntitiesAndSpaces()`. The reverse
+Avatar-to-Account transition runs `PlayerAvatar.onBecomeNonPlayer()` before
+`OfflineMapCreator.destroy()` for the same reason. Calling the bulk clear first
+leaves global managers holding an object whose instance dictionary has already
+been erased. Every cleanup boundary remains best-effort if an earlier one
+fails; if neither a clean Avatar teardown nor a replacement Account can be
+proved, the fake WoT connection is retired instead of leaving a LOGGED_ON
+client without a valid player. During synchronous map creation,
 `game.abort()` is scoped to a recoverable Python failure so a rejected arena
 cannot silently schedule process shutdown; the original function is restored
 without overwriting a newer third-party wrapper.
+
+`AvatarObserver.remoteCamera` is not a Python helper object in this build. Its
+exact `REMOTE_CAMERA_DATA` alias is a fixed dictionary with `time` (`FLOAT64`),
+`shotPoint` (`VECTOR3`), and `zoom` (`UINT8`); the producer now supplies that
+mapping with a zero `Math.Vector3`. The inspector pins the hashes of
+`alias.xml`, `Avatar.def`, and `AvatarObserver.def`, while the property test
+rejects the previously accepted object/`None` shape.
 
 `PlayerAvatar.leaveArena()` calls its base mailbox before the rest of its
 native cleanup. The local bridge therefore schedules runtime teardown for the
@@ -217,7 +243,10 @@ retires that participant from only the active server round, restores the local
 Account and keeps the waiting-room socket. The server transfers bot authority
 to another participating client, or records a draw when no simulator remains;
 the departed client cannot consume a duplicate start for the same round and is
-re-enabled only by the next waiting roster. Explicit VOIP queries used by
+re-enabled only by the next waiting roster. Local failure events are accepted
+only for the synchronously starting or currently active round; duplicates from
+the departed round and delayed failures from an older round cannot retire a
+newer Avatar or send a second leave request. Explicit VOIP queries used by
 vehicle markers are present and conservatively disabled. The local slice cannot
 perform the cell-server attachment needed for postmortem spectator switching,
 so the exact switch mailbox rejects the request without falsely updating only
@@ -283,7 +312,7 @@ The pure-data server planner emits revisioned global `bot_orders`, which the
 0.9.22 authority now uses for macro targets after reporting bounded visibility
 observations. BigWorld terrain, collision, water and slope probes remain local,
 and the client planner is a fallback when no server order is available.
-Base-capture rules are not part of 0.3.4; standard battles currently end by
+Base-capture rules are not part of 0.3.5; standard battles currently end by
 elimination.
 
 ## Reference implementations reviewed
@@ -312,15 +341,16 @@ multi-round reset.
 
 The release build additionally:
 
-1. inspects the exact client version, build, executable architecture and
-   required resource archives;
+1. inspects the exact client version, build, executable architecture, required
+   resource archives and pinned Avatar entity-definition hashes;
 2. reads exact code objects from `scripts.pkg` and compares every stock method
    signature, direct-consumer literal, lifecycle name and `AccountCommands`
    constant used by the port, including variadic flags on the stock view
    loader;
 3. checks the ordered lifecycle contracts and inventories every exact
    Account-helper `setAccount` implementation, including the native
-   Account-to-Hangar-to-Avatar retirement order;
+   Account-to-Hangar-to-Avatar retirement order, chat-proxy detachment and
+   callback-registry initialization;
 4. compiles every packaged source with CPython 2.7;
 5. removes source and stale Python 3 bytecode;
 6. requires the packaged PYC manifest to match every current source module and

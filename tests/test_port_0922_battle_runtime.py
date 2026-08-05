@@ -186,6 +186,9 @@ class _Compatibility(object):
         self.bridge = None
         self.configured = []
         self.hangar_space = None
+        self.bigworld = None
+        self.retired_players = set()
+        self.disconnect_calls = 0
 
     def configure_battle(self, gui_type, bonus_type):
         self.configured.append((gui_type, bonus_type))
@@ -196,12 +199,37 @@ class _Compatibility(object):
     def deactivate_map(self):
         self.deactivated = True
 
+    def retire_current_player(self):
+        if self.bigworld is None or self.bigworld.player() is None:
+            return False
+        player = self.bigworld.player()
+        if player in self.retired_players:
+            return False
+        self.retired_players.add(player)
+        if (self.hangar_space is not None and
+                self.hangar_space.inited and
+                self.hangar_space.spaceInited):
+            self.bigworld.operations.append(('account_retire',))
+            self.hangar_space.destroy()
+        else:
+            self.bigworld.operations.append(('avatar_retire',))
+        return True
+
     def restore_lobby_account(self):
         self.account_restored = True
         if self.hangar_space is not None:
             self.hangar_space.inited = True
             self.hangar_space.spaceInited = True
-        return object()
+        account = _Avatar()
+        if self.bigworld is not None:
+            self.bigworld.avatar = account
+        return account
+
+    def disconnect(self):
+        self.disconnect_calls += 1
+        if self.bigworld is not None:
+            self.bigworld.operations.append(('offline_disconnect',))
+            self.bigworld.avatar = None
 
 
 class _AppLoader(object):
@@ -363,6 +391,7 @@ def _runtime():
     avatar = _Avatar()
     compatibility = _Compatibility()
     bigworld = _BigWorld(avatar, compatibility)
+    compatibility.bigworld = bigworld
     hangar_space = _HangarSpace(bigworld.operations)
     compatibility.hangar_space = hangar_space
     _AppLoader.showBattlePage = _APP_LOADER_SHOW_BATTLE_PAGE
@@ -461,7 +490,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'name': 'Player'}, start, client))
 
         self.assertEqual(
-            [('hangar_destroy',), ('clear_entities_spaces',),
+            [('account_retire',), ('hangar_destroy',),
+             ('clear_entities_spaces',),
              ('map_create', '01_karelia'),
              ('watcher', 'Visibility/GUI', True)],
             runtime.bigworld.operations)
@@ -507,11 +537,14 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'name': 'Player'}, {}, _Client()))
 
         self.assertEqual(
-            [('hangar_destroy',), ('clear_entities_spaces',)],
+            [('account_retire',), ('hangar_destroy',),
+             ('clear_entities_spaces',)],
             runtime.bigworld.operations)
         runtime.offline_map_creator.create.assert_not_called()
         self.assertEqual('failed', battle.state)
-        self.assertIn('hangar space destroy did not finish', battle.error)
+        self.assertIn(
+            'Account retirement did not destroy the hangar space',
+            battle.error)
 
     def test_failed_lobby_clear_uses_second_boundary_before_restore(self):
         runtime = _runtime()
@@ -533,10 +566,13 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'name': 'Player'}, {}, _Client()))
 
         self.assertEqual([
-            ('hangar_destroy',), ('clear_failed',),
+            ('account_retire',), ('hangar_destroy',), ('clear_failed',),
             ('clear_failed',), ('clear_all_spaces',),
+            ('offline_disconnect',),
         ], runtime.bigworld.operations)
-        self.assertTrue(runtime.compatibility.account_restored)
+        self.assertFalse(getattr(
+            runtime.compatibility, 'account_restored', False))
+        self.assertEqual(1, runtime.compatibility.disconnect_calls)
         self.assertEqual('failed', battle.state)
         self.assertIn('first clear failed', battle.error)
 
@@ -559,7 +595,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'name': 'Player'}, {}, _Client()))
 
         self.assertEqual([
-            ('hangar_destroy',), ('clear_retained',),
+            ('account_retire',), ('hangar_destroy',), ('clear_retained',),
             ('clear_retained',), ('clear_all_spaces',),
         ], runtime.bigworld.operations)
         self.assertTrue(runtime.compatibility.account_restored)
@@ -1119,7 +1155,96 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(['destroy', 'restore'], calls)
         self.assertEqual('failed', battle.state)
         callback.assert_called_once_with(
-            'error', {'message': 'entity loading failed'})
+            'battle_failed', {
+                'message': 'entity loading failed',
+                'round_id': None,
+                'lobby_restored': True,
+            })
+
+    def test_failed_lobby_restore_is_reported_without_transport_error(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.state = 'loading_entities'
+        battle._start_message = {'round_id': 9}
+        battle._map_create_attempted = True
+        runtime.offline_map_creator.destroy = lambda: None
+        runtime.bigworld.avatar = None
+        runtime.compatibility.restore_lobby_account = mock.Mock(
+            side_effect=RuntimeError('replacement Account failed'))
+        callback = mock.Mock()
+        battle.client = types.SimpleNamespace(on_event=callback)
+
+        battle._fail(RuntimeError('entity loading failed'))
+
+        self.assertEqual('failed', battle.state)
+        self.assertIn('entity loading failed', battle.error)
+        self.assertIn('replacement Account failed', battle.error)
+        self.assertEqual(1, runtime.compatibility.disconnect_calls)
+        self.assertIsNone(runtime.bigworld.player())
+        callback.assert_called_once_with('battle_failed', {
+            'message': battle.error,
+            'round_id': 9,
+            'lobby_restored': False,
+        })
+
+    def test_retirement_failure_does_not_skip_map_destroy_or_disconnect(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.state = 'loading_entities'
+        battle._start_message = {'round_id': 11}
+        battle._map_create_attempted = True
+        runtime.compatibility.retire_current_player = mock.Mock(
+            side_effect=RuntimeError('native retirement failed'))
+        runtime.offline_map_creator.destroy = mock.Mock(
+            side_effect=runtime.bigworld.clearEntitiesAndSpaces)
+        callback = mock.Mock()
+        battle.client = types.SimpleNamespace(on_event=callback)
+
+        battle._fail(RuntimeError('entity loading failed'))
+
+        runtime.offline_map_creator.destroy.assert_called_once_with()
+        self.assertIsNone(runtime.bigworld.player())
+        self.assertEqual(1, runtime.compatibility.disconnect_calls)
+        self.assertIn('native retirement failed', battle.error)
+        callback.assert_called_once_with('battle_failed', {
+            'message': battle.error,
+            'round_id': 11,
+            'lobby_restored': False,
+        })
+
+    def test_force_clear_runs_after_native_retirement_failure(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        runtime.compatibility.retire_current_player = mock.Mock(
+            side_effect=RuntimeError('native retirement failed'))
+
+        error = battle._force_clear_engine_player(
+            'engine retained its player')
+
+        self.assertIsNone(runtime.bigworld.player())
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual('native retirement failed', str(error))
+        self.assertIn(('clear_entities_spaces',), runtime.bigworld.operations)
+
+    def test_failure_notification_exception_never_replaces_first_error(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.state = 'loading_entities'
+        battle._start_message = {'round_id': 9}
+        battle._map_create_attempted = True
+        runtime.offline_map_creator.destroy = lambda: None
+        runtime.bigworld.avatar = None
+        runtime.compatibility.restore_lobby_account = lambda: object()
+
+        def fail_callback(kind, message):
+            raise RuntimeError('notification failed')
+
+        battle.client = types.SimpleNamespace(on_event=fail_callback)
+
+        battle._fail(RuntimeError('first native failure'))
+
+        self.assertEqual('failed', battle.state)
+        self.assertEqual('first native failure', battle.error)
 
     def test_bot_to_bot_collision_uses_authority_report(self):
         runtime = _runtime()

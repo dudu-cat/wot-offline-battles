@@ -22,6 +22,7 @@ EXPECTED_ABI = {
     'scripts/client/Account.pyc': {
         'PlayerAccount.__init__': ('self',),
         'PlayerAccount.onBecomePlayer': ('self',),
+        'PlayerAccount.onBecomeNonPlayer': ('self',),
         'PlayerAccount.onCmdResponse': (
             'self', 'requestID', 'resultID', 'errorStr'),
         'PlayerAccount.onCmdResponseExt': (
@@ -32,8 +33,14 @@ EXPECTED_ABI = {
         'PlayerAccount._update': ('self', 'triggerEvents', 'diff'),
     },
     'scripts/client_common/ClientChat.pyc': {
+        'ClientChat.__init__': ('self',),
         'ClientChat.onChatAction': ('self', 'chatActionData'),
+        'ClientChat.unsubscribeChatAction': (
+            'self', 'callback', 'action', 'channelId'),
         'ClientChat.__dataTimeProcessor': ('self', 'actionData'),
+    },
+    'scripts/client/ChatManager.pyc': {
+        'ChatManager.switchPlayerProxy': ('self', 'proxy'),
     },
     'scripts/client/account_helpers/AccountSyncData.pyc': {
         'AccountSyncData.setAccount': ('self', 'account'),
@@ -122,6 +129,7 @@ EXPECTED_ABI = {
     'scripts/client/Avatar.pyc': {
         'PlayerAvatar.__init__': ('self',),
         'PlayerAvatar.onBecomePlayer': ('self',),
+        'PlayerAvatar.onBecomeNonPlayer': ('self',),
         'PlayerAvatar.onEnterWorld': ('self', 'prereqs'),
         'PlayerAvatar.onLeaveWorld': ('self',),
         'PlayerAvatar.onPrereqsLoaded': (
@@ -304,11 +312,24 @@ EXPECTED_CODE_LITERALS = {
 EXPECTED_CODE_NAMES = {
     'scripts/client/Account.pyc': {
         'PlayerAccount.onBecomePlayer': ('BigWorld', 'clearAllSpaces'),
+        'PlayerAccount.onBecomeNonPlayer': (
+            'chatManager', 'switchPlayerProxy', 'events',
+            'onAccountBecomeNonPlayer'),
     },
     'scripts/client/Avatar.pyc': {
         'PlayerAvatar.__init__': (
             'Account', 'g_accountRepository', 'intUserSettings',
             'prebattleInvitations'),
+        'PlayerAvatar.onBecomeNonPlayer': (
+            'chatManager', 'switchPlayerProxy', 'g_playerEvents',
+            'onAvatarBecomeNonPlayer'),
+    },
+    'scripts/client_common/ClientChat.pyc': {
+        'ClientChat.__init__': ('_ClientChat__chatActionCallbacks',),
+    },
+    'scripts/client/ChatManager.pyc': {
+        'ChatManager.switchPlayerProxy': (
+            '_ChatManager__cleanupMyCallbacks', 'playerProxy'),
     },
     'scripts/client/gui/shared/personality.pyc': {
         'onCenterIsLongDisconnected': (

@@ -520,6 +520,111 @@ class LANSessionTests(unittest.TestCase):
         self.emit('battle_start', second)
         self.assertEqual(2, len(self.battle_runtime.started))
 
+    def test_synchronous_runtime_failure_keeps_lan_until_server_reset(self):
+        start = {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]}
+
+        def fail_start(config, message=None, lan_client=None,
+                       on_local_leave=None):
+            self.battle_runtime.started.append({
+                'config': dict(config), 'message': message,
+                'lan_client': lan_client,
+                'on_local_leave': on_local_leave})
+            lan_client.on_event('battle_failed', {
+                'round_id': 7, 'message': 'invalid entity property',
+                'lobby_restored': True})
+            # Even a buggy runtime return cannot reclaim a round whose
+            # synchronous failure callback already consumed start ownership.
+            return True
+
+        self.battle_runtime.start = fail_start
+        self.emit('battle_start', start)
+
+        self.assertEqual('awaiting_round_end', self.session.state)
+        self.assertFalse(self.session._battle_started)
+        self.assertEqual(7, self.session._departed_round_id)
+        self.assertEqual(1, self.client.leave_calls)
+        self.assertEqual(0, self.client.stop_calls)
+        self.assertEqual([], self.battle_runtime.stopped)
+        self.assertIn('Returning to the map picker', self.statuses[-1])
+
+        self.emit('battle_start', start)
+        self.assertEqual(1, len(self.battle_runtime.started))
+        self.emit('roster', {
+            'phase': 'waiting', 'round_id': 8,
+            'map_pool': ['05_prohorovka']})
+        self.assertEqual('waiting', self.session.state)
+        self.assertIsNone(self.session._departed_round_id)
+        self.assertTrue(self.session._picker_open)
+
+    def test_unrestored_runtime_failure_stops_only_lan_owners(self):
+        self.emit('battle_start', {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]})
+        self.emit('battle_failed', {
+            'round_id': 7, 'message': 'lobby restore failed',
+            'lobby_restored': False})
+
+        self.assertTrue(self.session._stopped)
+        self.assertEqual('stopped', self.session.state)
+        self.assertEqual(1, self.client.stop_calls)
+        self.assertEqual([], self.battle_runtime.stopped)
+        self.assertEqual([], self.battle_runtime.restore_accounts)
+
+    def test_failed_battle_leave_does_not_reenter_runtime_cleanup(self):
+        self.emit('battle_start', {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]})
+        self.client.leave_battle = mock.Mock(return_value=False)
+
+        self.emit('battle_failed', {
+            'round_id': 7, 'message': 'invalid entity property',
+            'lobby_restored': True})
+
+        self.client.leave_battle.assert_called_once_with()
+        self.assertTrue(self.session._stopped)
+        self.assertEqual(1, self.client.stop_calls)
+        self.assertEqual([], self.battle_runtime.stopped)
+
+    def test_duplicate_and_stale_battle_failures_do_not_retire_new_round(self):
+        first = {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]}
+        self.emit('battle_start', first)
+        self.emit('battle_failed', {
+            'round_id': 7, 'message': 'first round failed',
+            'lobby_restored': True})
+
+        self.assertEqual(1, self.client.leave_calls)
+        self.emit('battle_failed', {
+            'round_id': 7, 'message': 'duplicate failure',
+            'lobby_restored': True})
+        self.assertEqual(1, self.client.leave_calls)
+        self.assertFalse(self.session._stopped)
+
+        self.emit('roster', {
+            'phase': 'waiting', 'round_id': 8,
+            'map_pool': ['05_prohorovka']})
+        second = {
+            'round_id': 8, 'map': '05_prohorovka', 'players': [{
+                'id': 'p1', 'x': 4, 'y': 5, 'z': 6,
+                'vehicle': 'ussr:T-34'}]}
+        self.emit('battle_start', second)
+        self.emit('battle_failed', {
+            'round_id': 7, 'message': 'late old failure',
+            'lobby_restored': False})
+
+        self.assertEqual('battle', self.session.state)
+        self.assertTrue(self.session._battle_started)
+        self.assertEqual(8, self.session._active_round_id)
+        self.assertEqual(1, self.client.leave_calls)
+        self.assertEqual(0, self.client.stop_calls)
+
     def test_failed_local_leave_still_cleans_runtime_and_stops_session(self):
         self.emit('battle_start', {
             'round_id': 7, 'map': '01_karelia', 'players': [{

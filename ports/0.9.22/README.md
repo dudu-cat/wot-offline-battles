@@ -9,11 +9,19 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.4` replaces the old compatibility slice. It is a server-backed
+Version `0.3.5` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, tactical bots and repeatable rounds. The removed `vertical_slice.py`
 runtime is not packaged as a fallback.
+
+This release fixes the first real Account-to-Avatar transition found in
+`#1513`: `remoteCamera` now uses the exact fixed-dictionary entity schema, and
+both Account and Avatar run their native `onBecomeNonPlayer` lifecycle before
+BigWorld clears their instance data. A recoverable local map-start failure now
+leaves the round without misreporting a LAN transport disconnect; an
+unrecoverable native cleanup failure explicitly retires the fake WoT
+connection instead of leaving a half-connected lobby.
 
 ## User flow
 
@@ -151,8 +159,8 @@ properties and mailboxes at runtime.
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.4.wotmod
-org.peng.offline_lan_0922_0.3.4.wotmod.sha256
+org.peng.offline_lan_0922_0.3.5.wotmod
+org.peng.offline_lan_0922_0.3.5.wotmod.sha256
 WoT-0.9.22-LAN-Client-<package hash>/
 WoT-0.9.22-LAN-Client-<package hash>.zip
 ```

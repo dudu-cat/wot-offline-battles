@@ -82,6 +82,7 @@ class LANSession(object):
         self._pending_battle_start = None
         self._pending_map = None
         self._start_requested = False
+        self._starting_round_id = None
         self._active_round_id = None
         self._departed_round_id = None
         self._battle_started = False
@@ -373,6 +374,7 @@ class LANSession(object):
             # old round is still gone, so never retain ownership flags that
             # route later snapshots into a stopped runtime.
             self._battle_started = False
+            self._starting_round_id = None
             self._active_round_id = None
             self.snapshot = None
             self._start_requested = False
@@ -389,6 +391,7 @@ class LANSession(object):
         phase = _message_value(message, 'phase', getattr(self.client, 'phase', None))
         if phase == 'waiting':
             self._clear_pending_battle_start()
+            self._starting_round_id = None
             if self._battle_started:
                 try:
                     self._stop_active_round()
@@ -506,16 +509,29 @@ class LANSession(object):
         config.update({'map': map_name, 'spawn': spawn, 'vehicle': vehicle})
         if 'startupTimeoutSeconds' not in config:
             config['startupTimeoutSeconds'] = 30.0
-        started = bool(self._battle_runtime.start(
-            config, message=message, lan_client=self.client,
-            on_local_leave=self._on_local_battle_leave))
-        if started:
+        # The runtime can report a synchronous native failure from inside
+        # start().  Record ownership before entering it, then only commit the
+        # active round if that ownership token survived the callback.
+        self._starting_round_id = round_id
+        try:
+            started = bool(self._battle_runtime.start(
+                config, message=message, lan_client=self.client,
+                on_local_leave=self._on_local_battle_leave))
+        except Exception:
+            if self._starting_round_id == round_id:
+                self._starting_round_id = None
+            raise
+        owns_start = self._starting_round_id == round_id
+        if owns_start:
+            self._starting_round_id = None
+        if started and owns_start and not self._stopped:
             self._battle_started = True
             self._active_round_id = round_id
             self._start_requested = False
             self._pending_map = None
             self.state = 'battle'
-        return started
+            return True
+        return False
 
     def _on_local_battle_leave(self):
         """Retire one local round while retaining the waiting-room socket."""
@@ -546,6 +562,65 @@ class LANSession(object):
         self.state = 'awaiting_round_end'
         return True
 
+    def _on_battle_failed(self, message):
+        """Handle a local native-runtime failure without faking socket loss."""
+        owned_round_id = self._starting_round_id
+        if owned_round_id is None and self._battle_started:
+            owned_round_id = self._active_round_id
+        round_id = _message_value(message, 'round_id', owned_round_id)
+        # A duplicate failure for a locally-departed round, or a delayed
+        # callback from an older round, must not tear down a newer Avatar or
+        # send a second leave_battle request.
+        if owned_round_id is None or round_id != owned_round_id:
+            return False
+        self._clear_pending_battle_start()
+        self._starting_round_id = None
+        self._battle_started = False
+        self._active_round_id = None
+        self._departed_round_id = round_id
+        self.snapshot = None
+        self._start_requested = False
+        self._pending_map = None
+        reason = _message_value(message, 'message', 'unknown error')
+
+        if bool(_message_value(message, 'lobby_restored', False)):
+            leave = getattr(self.client, 'leave_battle', None)
+            try:
+                if not callable(leave) or not leave():
+                    raise RuntimeError(
+                        'LAN server did not accept failed battle leave')
+            except Exception:
+                self.state = 'error'
+                self._status_notifier(
+                    'Battle could not start (%s). LAN session stopped.' %
+                    reason)
+                try:
+                    # BattleRuntime already owns cleanup and Account restore.
+                    # Close only the LAN/picker owners on this failure path.
+                    self.stop(show_login=True, restore_account=False,
+                              stop_runtime=False)
+                except Exception:
+                    pass
+                return False
+            self.state = 'awaiting_round_end'
+            self._status_notifier(
+                'Battle could not start (%s). Returning to the map picker.' %
+                reason)
+            return True
+
+        self.state = 'error'
+        self._status_notifier(
+            'Battle could not start and the lobby was not restored (%s).' %
+            reason)
+        try:
+            # Runtime recovery already failed.  Do not recurse through its
+            # cleanup or Account reconstruction a second time.
+            self.stop(show_login=True, restore_account=False,
+                      stop_runtime=False)
+        except Exception:
+            pass
+        return False
+
     def _on_event(self, kind, message):
         if self._stopped:
             return
@@ -565,6 +640,8 @@ class LANSession(object):
             self._open_waiting_picker()
         elif kind == 'battle_start':
             self._start_battle(message)
+        elif kind == 'battle_failed':
+            self._on_battle_failed(message)
         elif kind == 'snapshot':
             round_id = _message_value(message, 'round_id')
             if (not self._battle_started or
@@ -641,6 +718,7 @@ class LANSession(object):
             except Exception as error:
                 errors.append(error)
         self._battle_started = False
+        self._starting_round_id = None
         self._active_round_id = None
         self._departed_round_id = None
         self.snapshot = None

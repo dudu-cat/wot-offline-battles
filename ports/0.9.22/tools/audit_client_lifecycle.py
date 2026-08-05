@@ -15,6 +15,33 @@ from audit_lobby_consumers import _instructions
 
 ORDERED_USES = (
     (
+        'scripts/client/ChatManager.pyc',
+        'ChatManager.switchPlayerProxy',
+        ('_ChatManager__cleanupMyCallbacks', 'proxy', 'playerProxy'),
+        'old chat proxy cleanup precedes replacement proxy assignment',
+    ),
+    (
+        'scripts/client_common/ClientChat.pyc',
+        'ClientChat.__init__',
+        ('self', '_ClientChat__chatActionCallbacks'),
+        'every chat-capable player initializes its callback registry',
+    ),
+    (
+        'scripts/client/Account.pyc',
+        'PlayerAccount.onBecomeNonPlayer',
+        ('chatManager', 'switchPlayerProxy', 'syncData',
+         'onAccountBecomeNonPlayer', 'events',
+         'onAccountBecomeNonPlayer'),
+        'Account detaches chat and helpers before GUI retirement completes',
+    ),
+    (
+        'scripts/client/Avatar.pyc',
+        'PlayerAvatar.onBecomeNonPlayer',
+        ('chatManager', 'switchPlayerProxy', 'g_playerEvents',
+         'onAvatarBecomeNonPlayer'),
+        'Avatar detaches chat before publishing its retirement event',
+    ),
+    (
         'scripts/client/account_helpers/AccountSyncData.pyc',
         'AccountSyncData.setAccount',
         ('_AccountSyncData__account',

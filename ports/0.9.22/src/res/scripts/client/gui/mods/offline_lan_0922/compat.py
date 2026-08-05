@@ -10,6 +10,7 @@ OFFLINE_SERVER_ADDRESS = 'offline-lan.local:0'
 _OFFLINE_ACCOUNT_NAME = 'offline_account'
 _OFFLINE_INIT_COMPLETE = '_offlineLANInitComplete'
 _OFFLINE_PLAYER_READY = '_offlineLANPlayerReady'
+_OFFLINE_RETIRE_PENDING = '_offlineLANRetirePending'
 
 _SERVER_SETTINGS = {
     'file_server': {
@@ -61,6 +62,8 @@ def _load_runtime():
     import Avatar
     import AvatarInputHandler
     import BigWorld
+    import ChatManager
+    import Math
     import Vehicle
     import constants
     from OfflineMapCreator import g_offlineMapCreator
@@ -78,9 +81,11 @@ def _load_runtime():
     runtime.avatar_module = Avatar
     runtime.avatar_input_handler = AvatarInputHandler
     runtime.bigworld = BigWorld
+    runtime.chat_manager = ChatManager.chatManager
     runtime.constants = constants
     runtime.connection_manager = dependency.instance(IConnectionManager)
     runtime.login_status = LOGIN_STATUS
+    runtime.math = Math
     runtime.offline_map_creator = g_offlineMapCreator
     runtime.player_events = g_playerEvents
     runtime.predefined_hosts = g_preDefinedHosts
@@ -173,15 +178,6 @@ class _OfflineInputHandler(object):
         return False
 
 
-class _RemoteCameraData(object):
-    """Attribute-compatible empty value for AvatarObserver.REMOTE_CAMERA_DATA."""
-
-    def __init__(self):
-        self.time = 0.0
-        self.shotPoint = None
-        self.zoom = 0
-
-
 class OfflineCompatibility(object):
 
     def __init__(self, runtime=None):
@@ -201,9 +197,11 @@ class OfflineCompatibility(object):
         self._original_account_init = None
         self._original_account_getattribute = None
         self._original_account_become_player = None
+        self._original_account_become_non_player = None
         self._original_avatar_init = None
         self._original_avatar_getattribute = None
         self._original_avatar_become_player = None
+        self._original_avatar_become_non_player = None
         self._original_avatar_vehicle_enter = None
         self._original_avatar_prereqs_loaded = None
         self._original_vehicle_getattribute = None
@@ -212,9 +210,11 @@ class OfflineCompatibility(object):
         self._account_init_wrapper = None
         self._account_getattribute_wrapper = None
         self._account_become_player_wrapper = None
+        self._account_become_non_player_wrapper = None
         self._avatar_init_wrapper = None
         self._avatar_getattribute_wrapper = None
         self._avatar_become_player_wrapper = None
+        self._avatar_become_non_player_wrapper = None
         self._avatar_vehicle_enter_wrapper = None
         self._avatar_prereqs_loaded_wrapper = None
         self._vehicle_getattribute_wrapper = None
@@ -239,12 +239,18 @@ class OfflineCompatibility(object):
             '__getattribute__', account_type.__getattribute__)
         self._original_account_become_player = account_type.__dict__.get(
             'onBecomePlayer', getattr(account_type, 'onBecomePlayer', None))
+        self._original_account_become_non_player = account_type.__dict__.get(
+            'onBecomeNonPlayer',
+            getattr(account_type, 'onBecomeNonPlayer', None))
         self._original_avatar_init = avatar_type.__dict__.get(
             '__init__', avatar_type.__init__)
         self._original_avatar_getattribute = avatar_type.__dict__.get(
             '__getattribute__', avatar_type.__getattribute__)
         self._original_avatar_become_player = avatar_type.__dict__.get(
             'onBecomePlayer', avatar_type.onBecomePlayer)
+        self._original_avatar_become_non_player = avatar_type.__dict__.get(
+            'onBecomeNonPlayer',
+            getattr(avatar_type, 'onBecomeNonPlayer', None))
         self._original_avatar_vehicle_enter = avatar_type.__dict__.get(
             'vehicle_onEnterWorld',
             getattr(avatar_type, 'vehicle_onEnterWorld', None))
@@ -354,6 +360,11 @@ class OfflineCompatibility(object):
                 # session and real AvatarInputHandler.  A playable LAN battle
                 # needs the normal #1513 initialization branches instead.
                 runtime.offline_map_creator.SetActive(False)
+            # Native onBecomePlayer attaches ChatManager, player events and
+            # battle controllers before every later validation has finished.
+            # Open the retirement token before entering stock code so a
+            # partial promotion is still torn down exactly once.
+            setattr(avatar, _OFFLINE_RETIRE_PENDING, True)
             try:
                 result = compatibility._original_avatar_become_player(avatar)
             finally:
@@ -369,6 +380,53 @@ class OfflineCompatibility(object):
                     'offline Avatar has no initialized arena type')
             setattr(avatar, _OFFLINE_PLAYER_READY, True)
             return result
+
+        def retire_offline_player(player, original):
+            """Run a client-only player's native retirement exactly once."""
+            if not getattr(player, _OFFLINE_INIT_COMPLETE, False):
+                if compatibility._fake_connected:
+                    # A failed constructor or an already-cleared PyEntity has
+                    # no complete native lifecycle left to detach.  Never call
+                    # stock teardown against its missing instance fields.
+                    return None
+                return original(player)
+            if not getattr(player, _OFFLINE_RETIRE_PENDING, False):
+                return None
+            # BigWorld.clear* can invoke onBecomeNonPlayer again after our
+            # explicit lifecycle boundary.  Close the token before entering
+            # stock code so that second delivery cannot detach global owners
+            # twice, even if the first call raises part-way through.
+            setattr(player, _OFFLINE_RETIRE_PENDING, False)
+            setattr(player, _OFFLINE_PLAYER_READY, False)
+            try:
+                result = original(player)
+            except Exception:
+                # Account/Avatar teardown can itself fail before reaching the
+                # late ChatManager detach.  Preserve that first exception, but
+                # never leave the global proxy pointing at an Entity whose
+                # instance dictionary will be cleared next.
+                try:
+                    chat_manager = getattr(runtime, 'chat_manager', None)
+                    if (chat_manager is not None and
+                            getattr(chat_manager, 'playerProxy', None) is not
+                            None):
+                        chat_manager.switchPlayerProxy(None)
+                except Exception:
+                    pass
+                raise
+            chat_manager = getattr(runtime, 'chat_manager', None)
+            if (chat_manager is not None and
+                    getattr(chat_manager, 'playerProxy', None) is not None):
+                chat_manager.switchPlayerProxy(None)
+            return result
+
+        def account_become_non_player(account):
+            return retire_offline_player(
+                account, compatibility._original_account_become_non_player)
+
+        def avatar_become_non_player(avatar):
+            return retire_offline_player(
+                avatar, compatibility._original_avatar_become_non_player)
 
         def avatar_getattribute(avatar, name):
             if (name in ('base', 'cell', 'server', 'bwProto') and
@@ -461,6 +519,9 @@ class OfflineCompatibility(object):
             if callable(original_clear_all_spaces):
                 runtime.bigworld.clearAllSpaces = \
                     preserve_offline_account_space
+            # See the Avatar wrapper above: a native Account can bind helpers,
+            # chat and global events and then fail before the lobby is ready.
+            setattr(account, _OFFLINE_RETIRE_PENDING, True)
             try:
                 result = compatibility._original_account_become_player(
                     account)
@@ -481,19 +542,24 @@ class OfflineCompatibility(object):
 
         def retire_fake_connection():
             """Run every native disconnect boundary and return its first error."""
-            compatibility._fake_connected = False
             compatibility._connecting = False
             first_error = None
 
             # A native disconnect retires the current player and its spaces.
             # The fake transport has no engine connection to perform that
             # cleanup for us, so do it before repository listeners run.
+            try:
+                compatibility.retire_current_player()
+            except Exception as error:
+                first_error = error
             clear_all_spaces = getattr(runtime.bigworld, 'clearAllSpaces', None)
             if callable(clear_all_spaces):
                 try:
                     clear_all_spaces()
                 except Exception as error:
-                    first_error = error
+                    if first_error is None:
+                        first_error = error
+            compatibility._fake_connected = False
 
             try:
                 setattr(runtime.connection_manager,
@@ -568,9 +634,11 @@ class OfflineCompatibility(object):
         self._account_init_wrapper = account_init
         self._account_getattribute_wrapper = account_getattribute
         self._account_become_player_wrapper = account_become_player
+        self._account_become_non_player_wrapper = account_become_non_player
         self._avatar_init_wrapper = avatar_init
         self._avatar_getattribute_wrapper = avatar_getattribute
         self._avatar_become_player_wrapper = avatar_become_player
+        self._avatar_become_non_player_wrapper = avatar_become_non_player
         self._avatar_vehicle_enter_wrapper = avatar_vehicle_enter
         self._avatar_prereqs_loaded_wrapper = avatar_prereqs_loaded
         self._vehicle_getattribute_wrapper = vehicle_getattribute
@@ -582,9 +650,13 @@ class OfflineCompatibility(object):
             account_type.__getattribute__ = account_getattribute
             if self._original_account_become_player is not None:
                 account_type.onBecomePlayer = account_become_player
+            if self._original_account_become_non_player is not None:
+                account_type.onBecomeNonPlayer = account_become_non_player
             avatar_type.__init__ = avatar_init
             avatar_type.__getattribute__ = avatar_getattribute
             avatar_type.onBecomePlayer = avatar_become_player
+            if self._original_avatar_become_non_player is not None:
+                avatar_type.onBecomeNonPlayer = avatar_become_non_player
             if self._original_avatar_vehicle_enter is not None:
                 avatar_type.vehicle_onEnterWorld = avatar_vehicle_enter
             if self._original_avatar_prereqs_loaded is not None:
@@ -629,6 +701,11 @@ class OfflineCompatibility(object):
                 account_type.__dict__.get('onBecomePlayer') is
                 self._account_become_player_wrapper):
             account_type.onBecomePlayer = self._original_account_become_player
+        if (self._original_account_become_non_player is not None and
+                account_type.__dict__.get('onBecomeNonPlayer') is
+                self._account_become_non_player_wrapper):
+            account_type.onBecomeNonPlayer = \
+                self._original_account_become_non_player
         if (avatar_type.__dict__.get('__init__') is
                 self._avatar_init_wrapper):
             avatar_type.__init__ = self._original_avatar_init
@@ -638,6 +715,11 @@ class OfflineCompatibility(object):
         if (avatar_type.__dict__.get('onBecomePlayer') is
                 self._avatar_become_player_wrapper):
             avatar_type.onBecomePlayer = self._original_avatar_become_player
+        if (self._original_avatar_become_non_player is not None and
+                avatar_type.__dict__.get('onBecomeNonPlayer') is
+                self._avatar_become_non_player_wrapper):
+            avatar_type.onBecomeNonPlayer = \
+                self._original_avatar_become_non_player
         if (self._original_avatar_vehicle_enter is not None and
                 avatar_type.__dict__.get('vehicle_onEnterWorld') is
                 self._avatar_vehicle_enter_wrapper):
@@ -785,6 +867,48 @@ class OfflineCompatibility(object):
         finally:
             self._connecting = was_connecting
 
+    def retire_current_player(self):
+        """Detach the current offline Account or Avatar before engine clear.
+
+        BigWorld removes a PyEntity's complete instance dictionary.  Native
+        Account and Avatar retirement must therefore first release ChatManager,
+        account helpers, battle controllers and GUI-space listeners that retain
+        the object.  The patched onBecomeNonPlayer methods make this boundary
+        idempotent when the later engine clear delivers the callback again.
+        """
+        self.install()
+        try:
+            player = self._runtime.bigworld.player()
+        except ReferenceError:
+            return False
+        if player is None:
+            return False
+        account_type = self._runtime.account_module.PlayerAccount
+        avatar_type = self._runtime.avatar_module.PlayerAvatar
+        if not isinstance(player, (account_type, avatar_type)):
+            raise RuntimeError('unsupported player entity is active')
+        if not getattr(player, _OFFLINE_INIT_COMPLETE, False):
+            # The wrapper opens its retirement token only after construction
+            # has completed and immediately before native onBecomePlayer.
+            # A partial constructor therefore has no stock player lifecycle
+            # to detach; its owning map cleanup must clear it directly.
+            return False
+        if not getattr(player, _OFFLINE_RETIRE_PENDING, False):
+            return False
+        retire = getattr(player, 'onBecomeNonPlayer', None)
+        if not callable(retire):
+            raise RuntimeError('player retirement boundary is unavailable')
+        retire()
+        if getattr(player, _OFFLINE_RETIRE_PENDING, False):
+            raise RuntimeError('player retirement did not finish')
+        if getattr(player, _OFFLINE_PLAYER_READY, False):
+            raise RuntimeError('retired player is still marked ready')
+        chat_manager = getattr(self._runtime, 'chat_manager', None)
+        if (chat_manager is not None and
+                getattr(chat_manager, 'playerProxy', None) is not None):
+            raise RuntimeError('chat manager retained the retired player')
+        return True
+
     def activate_map(self):
         if self._runtime is None:
             raise RuntimeError('offline compatibility is not installed')
@@ -836,7 +960,11 @@ class OfflineCompatibility(object):
             # These four OWN_CLIENT properties come from AvatarObserver.def,
             # not the root Avatar.def.  A client-only Avatar created with an
             # empty property dictionary does not receive server defaults.
-            'remoteCamera': _RemoteCameraData(),
+            'remoteCamera': {
+                'time': 0.0,
+                'shotPoint': self._runtime.math.Vector3(0.0, 0.0, 0.0),
+                'zoom': 0,
+            },
             'isObserverFPV': False,
             'observerFPVControlMode': 0,
             'numOfObservers': 0,

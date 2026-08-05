@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -28,6 +29,15 @@ REQUIRED_SCRIPT_MEMBERS = (
     'scripts/entity_defs/OfflineEntity.def',
     'scripts/item_defs/vehicles/ussr/R11_MS-1.xml',
 )
+
+PINNED_ENTITY_DEFINITION_SHA256 = {
+    'scripts/entity_defs/alias.xml':
+        '20892cd23c5fe285927e599a197ba99436032207c5c071aa726febc42b59274d',
+    'scripts/entity_defs/Avatar.def':
+        'ddbfb9fb94b574ba5133ff272eab81ad798eea535e4a64d37865cff5b8b91831',
+    'scripts/entity_defs/interfaces/AvatarObserver.def':
+        'fbf32f5462d959648f60757288a49a63cd194df0a77618a703d96d8096a456d8',
+}
 
 REQUIRED_RESOURCE_MEMBERS = {
     '01_karelia.pkg': (
@@ -94,6 +104,7 @@ def inspect_client(client_root):
         (path for path in resource_paths if path.startswith('./res_mods/')), None)
 
     bytecode = {}
+    entity_definition_hashes = {}
     missing_assets = []
     with zipfile.ZipFile(str(archive_path), 'r') as archive:
         names = set(archive.namelist())
@@ -110,6 +121,12 @@ def inspect_client(client_root):
         for member in REQUIRED_SCRIPT_MEMBERS:
             if member not in names:
                 missing_assets.append('scripts.pkg:%s' % member)
+        for member in PINNED_ENTITY_DEFINITION_SHA256:
+            if member not in names:
+                missing_assets.append('scripts.pkg:%s' % member)
+                continue
+            entity_definition_hashes[member] = hashlib.sha256(
+                archive.read(member)).hexdigest()
 
     packages_root = client_root / 'res' / 'packages'
     for package_name, required_members in REQUIRED_RESOURCE_MEMBERS.items():
@@ -144,6 +161,11 @@ def inspect_client(client_root):
     if missing_assets:
         errors.append('battle assets are missing: %s' %
                       ', '.join(missing_assets))
+    for member, expected_hash in PINNED_ENTITY_DEFINITION_SHA256.items():
+        actual_hash = entity_definition_hashes.get(member)
+        if actual_hash is not None and actual_hash != expected_hash:
+            errors.append(
+                'entity definition differs from pinned #1513: %s' % member)
     if errors:
         raise ValueError('; '.join(errors))
 
@@ -156,6 +178,7 @@ def inspect_client(client_root):
         'peMachine': '0x%04x' % machine,
         'architecture': 'x86',
         'battleProbeAssets': '01_karelia + ussr:R11_MS-1',
+        'entityDefinitionSha256': entity_definition_hashes,
         'scriptsPackageBytes': archive_path.stat().st_size,
         'bytecode': bytecode,
     }

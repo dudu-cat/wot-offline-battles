@@ -271,19 +271,18 @@ class BattleRuntime(object):
                 bool(getattr(hangar_space, 'spaceInited', False))):
             raise RuntimeError(
                 'hangar space is not ready for battle transition')
-        destroy_hangar = getattr(hangar_space, 'destroy', None)
-        if not callable(destroy_hangar):
-            raise RuntimeError('hangar space destroy boundary is unavailable')
-
-        # ClientHangarSpace.__destroy owns its vehicle, geometry mapping,
-        # callbacks, camera and input handlers.  Retire that graph before the
-        # engine-wide clear; reversing the order can make its later Account or
-        # Avatar lifecycle callback re-enter already-cleared native objects.
+        # PlayerAccount.onBecomeNonPlayer owns the complete stock transition:
+        # it first detaches ChatManager and all account helpers, then its
+        # personality event destroys current/preview vehicles and HangarSpace.
+        # Clearing only HangarSpace leaves zombie references to the Account
+        # after BigWorld empties the PyEntity dictionary.
         self._lobby_retire_started = True
-        destroy_hangar()
+        if not self._runtime.compatibility.retire_current_player():
+            raise RuntimeError('lobby Account retirement did not run')
         if (bool(getattr(hangar_space, 'inited', False)) or
                 bool(getattr(hangar_space, 'spaceInited', False))):
-            raise RuntimeError('hangar space destroy did not finish')
+            raise RuntimeError(
+                'Account retirement did not destroy the hangar space')
 
         # Keep Account.g_accountRepository alive deliberately.  Exact #1513
         # PlayerAvatar.__init__ reuses its syncData, intUserSettings and
@@ -1303,9 +1302,18 @@ class BattleRuntime(object):
         self._records = {}
         if self._map_create_attempted:
             try:
-                self._runtime.offline_map_creator.destroy()
+                self._runtime.compatibility.retire_current_player()
             except Exception as error:
                 cleanup_error = error
+            # Native retirement and stock map ownership are independent
+            # cleanup boundaries.  A partial onBecomeNonPlayer failure must
+            # not prevent OfflineMapCreator from releasing its entity, space,
+            # mapping and camera ids.
+            try:
+                self._runtime.offline_map_creator.destroy()
+            except Exception as error:
+                if cleanup_error is None:
+                    cleanup_error = error
             player, player_error = self._read_engine_player()
             if player_error is not None and cleanup_error is None:
                 cleanup_error = player_error
@@ -1365,6 +1373,10 @@ class BattleRuntime(object):
         first_error = None
         found_clear = False
         player = None
+        try:
+            self._runtime.compatibility.retire_current_player()
+        except Exception as error:
+            first_error = error
         for name in ('clearEntitiesAndSpaces', 'clearAllSpaces'):
             clear = getattr(self._runtime.bigworld, name, None)
             if not callable(clear):
@@ -1381,7 +1393,7 @@ class BattleRuntime(object):
             if player_error is not None and first_error is None:
                 first_error = player_error
             if succeeded and player_error is None and player is None:
-                return None
+                return first_error
         if not found_clear:
             return RuntimeError('no engine entity-clear boundary is available')
         if player is not None:
@@ -1402,16 +1414,38 @@ class BattleRuntime(object):
         self.state = 'failed'
         # Asynchronous map/entity failures happen after OfflineMapCreator has
         # replaced the lobby Account.  Recover the same boundary as a normal
-        # round exit before telling LANSession to close the failed connection;
-        # otherwise #1513 remains in WAITING with no player mailbox.
+        # round exit, but report it separately from a LAN transport failure so
+        # the waiting-room socket can survive a local map construction error.
+        lobby_restored = False
         if cleanup_error is None:
             try:
                 self._runtime.compatibility.restore_lobby_account()
-            except Exception:
-                pass
+                lobby_restored = True
+            except Exception as restore_failure:
+                self.error = '%s; lobby restore failed: %s' % (
+                    self.error, restore_failure)
+        if not lobby_restored:
+            # A failed cleanup/restore cannot remain LOGGED_ON without a
+            # valid Account or Avatar.  Retire the fake WoT connection here;
+            # LANSession owns only its socket/picker and must not recurse into
+            # this native runtime boundary.
+            try:
+                self._runtime.compatibility.disconnect()
+            except Exception as disconnect_failure:
+                self.error = '%s; offline disconnect failed: %s' % (
+                    self.error, disconnect_failure)
         callback = getattr(self.client, 'on_event', None)
         if callable(callback):
-            callback('error', {'message': self.error})
+            try:
+                callback('battle_failed', {
+                    'message': self.error,
+                    'round_id': (self._start_message or {}).get('round_id'),
+                    'lobby_restored': lobby_restored,
+                })
+            except Exception:
+                # A recovery notification is not allowed to replace the first
+                # native failure or escape into the LAN poll callback.
+                pass
         sys.stdout.write('[Offline LAN 0.9.22] battle failed: %s\n' %
                          self.error)
 

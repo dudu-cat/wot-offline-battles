@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -45,7 +46,7 @@ def _write_fake_executable(path, machine=0x014C):
     path.write_bytes(payload)
 
 
-def _write_fake_client(root, inspector, build='1513'):
+def _write_fake_client(root, inspector, build='1513', changed_entity=False):
     (root / 'res' / 'packages').mkdir(parents=True)
     _write_fake_executable(root / 'WorldOfTanks.exe')
     (root / 'version.xml').write_text(
@@ -61,6 +62,17 @@ def _write_fake_client(root, inspector, build='1513'):
             archive.writestr(member, b'\x03\xf3\r\n' + b'payload')
         for member in inspector.REQUIRED_SCRIPT_MEMBERS:
             archive.writestr(member, b'payload')
+        entity_payload = b'pinned-entity-definition'
+        for member in inspector.PINNED_ENTITY_DEFINITION_SHA256:
+            payload = entity_payload
+            if (changed_entity and member ==
+                    'scripts/entity_defs/interfaces/AvatarObserver.def'):
+                payload = b'changed'
+            archive.writestr(member, payload)
+    inspector.PINNED_ENTITY_DEFINITION_SHA256 = {
+        member: hashlib.sha256(entity_payload).hexdigest()
+        for member in inspector.PINNED_ENTITY_DEFINITION_SHA256
+    }
     for package_name, members in inspector.REQUIRED_RESOURCE_MEMBERS.items():
         with zipfile.ZipFile(
                 root / 'res' / 'packages' / package_name, 'w') as archive:
@@ -100,6 +112,16 @@ class ClientInspectorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'build must be #1513'):
                 inspector.inspect_client(root)
 
+    def test_rejects_changed_avatar_entity_definition(self):
+        inspector = _load_tool('inspect_client')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_fake_client(root, inspector, changed_entity=True)
+
+            with self.assertRaisesRegex(
+                    ValueError, 'entity definition differs'):
+                inspector.inspect_client(root)
+
 
 class WotmodValidatorTests(unittest.TestCase):
     def _write_archive(self, path, compression, include_directories,
@@ -115,7 +137,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.4</version></root>')
+            '<version>0.3.5</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -528,6 +550,22 @@ class _CompatEvent(object):
         self.operations.append((self.name,) + args)
 
 
+class _CompatChatManager(object):
+    def __init__(self, operations):
+        self.operations = operations
+        self.playerProxy = None
+
+    def switchPlayerProxy(self, player):
+        if self.playerProxy is not None:
+            # Exact #1513 cleans the previous proxy before assigning the new
+            # one.  Dereferencing this field makes a bulk-cleared zombie
+            # Account fail in the same place as the native client.
+            callbacks = self.playerProxy._ClientChat__chatActionCallbacks
+            self.operations.append(('chat_cleanup', len(callbacks)))
+        self.playerProxy = player
+        self.operations.append(('chat_proxy', player))
+
+
 class _CompatBigWorld(object):
     _MISSING = object()
 
@@ -575,8 +613,18 @@ class _CompatBigWorld(object):
 
     def clearAllSpaces(self):
         self.operations.append(('clear_all_spaces',))
+        player = self._player
+        if player is not None:
+            retire = getattr(player, 'onBecomeNonPlayer', None)
+            if callable(retire):
+                retire()
+        retired = list(self.entities.values())
+        if player is not None and player not in retired:
+            retired.append(player)
         self.entities.clear()
         self._player = None
+        for entity in retired:
+            entity.__dict__.clear()
 
     def WGC_onServerResponse(self, accepted):
         self.operations.append(('wgc', accepted))
@@ -677,6 +725,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
         operations = []
         statuses = types.SimpleNamespace(NOT_SET=0, LOGGED_ON=1)
         bigworld = _CompatBigWorld(operations)
+        chat_manager = _CompatChatManager(operations)
 
         class PlayerAccount(object):
             def __init__(self):
@@ -705,6 +754,11 @@ class OfflineCompatibilityTests(unittest.TestCase):
             def onBecomePlayer(self):
                 operations.append(('original_account_become_player',))
                 bigworld.clearAllSpaces()
+                chat_manager.switchPlayerProxy(self)
+
+            def onBecomeNonPlayer(self):
+                operations.append(('original_account_become_non_player',))
+                chat_manager.switchPlayerProxy(None)
 
             def showGUI(self, context):
                 operations.append(('show_gui', context))
@@ -722,13 +776,31 @@ class OfflineCompatibilityTests(unittest.TestCase):
                                    avatar.filter))
 
         class PlayerAvatar(object):
+            def __setattr__(self, name, value):
+                if name == 'remoteCamera':
+                    if (not isinstance(value, dict) or
+                            set(value) != {'time', 'shotPoint', 'zoom'} or
+                            not isinstance(value['time'], float) or
+                            not isinstance(value['shotPoint'], _Vector3) or
+                            not isinstance(value['zoom'], int) or
+                            not 0 <= value['zoom'] <= 255):
+                        raise TypeError('invalid REMOTE_CAMERA_DATA')
+                    value = types.SimpleNamespace(**value)
+                object.__setattr__(self, name, value)
+
             def __init__(self):
                 operations.append(('original_avatar_init',))
+                self._ClientChat__chatActionCallbacks = {}
 
             def onBecomePlayer(self):
                 operations.append(('original_avatar_become_player',))
+                chat_manager.switchPlayerProxy(self)
                 self.filter = bigworld.AvatarFilter()
                 self.arena = types.SimpleNamespace(arenaType=object())
+
+            def onBecomeNonPlayer(self):
+                operations.append(('original_avatar_become_non_player',))
+                chat_manager.switchPlayerProxy(None)
 
             def onPrereqsLoaded(self, resource_names, resource_refs):
                 operations.append(
@@ -750,11 +822,13 @@ class OfflineCompatibilityTests(unittest.TestCase):
             account_module=account_module,
             avatar_module=avatar_module,
             bigworld=bigworld,
+            chat_manager=chat_manager,
             connection_manager=manager,
             login_status=statuses,
             offline_map_creator=_OfflineMapCreator(operations),
             player_events=player_events,
             predefined_hosts=_Hosts(existing_hosts, host_failure),
+            math=types.SimpleNamespace(Vector3=_Vector3),
             vehicle_module=types.SimpleNamespace(Vehicle=Vehicle))
         return runtime, operations
 
@@ -806,7 +880,11 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertEqual(0, avatar.observerFPVControlMode)
         self.assertEqual(0, avatar.numOfObservers)
         self.assertEqual(0.0, avatar.remoteCamera.time)
-        self.assertIsNone(avatar.remoteCamera.shotPoint)
+        self.assertEqual(
+            (0.0, 0.0, 0.0),
+            (avatar.remoteCamera.shotPoint.x,
+             avatar.remoteCamera.shotPoint.y,
+             avatar.remoteCamera.shotPoint.z))
         self.assertEqual(0, avatar.remoteCamera.zoom)
         first_filter = avatar.filter
         original_filter_factory = runtime.bigworld.AvatarFilter
@@ -952,6 +1030,9 @@ class OfflineCompatibilityTests(unittest.TestCase):
 
         # PyEntity::onEntityDestroyed clears the complete instance dictionary,
         # while #1513's shared persistent cache still holds its weak proxy.
+        # Detach ChatManager explicitly so this test isolates the intentionally
+        # stale persistent-cache proxy rather than the separate chat lifecycle.
+        runtime.chat_manager.playerProxy = None
         first_account.__dict__.clear()
         with self.assertRaises(AttributeError):
             unused = persistent_cache.account.name
@@ -1046,6 +1127,75 @@ class OfflineCompatibilityTests(unittest.TestCase):
             avatar, '_offlineLANPlayerReady', False))
         compatibility.fini()
 
+    def test_partial_avatar_promotion_is_retired_exactly_once(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+
+        def partial_avatar_become_player(avatar):
+            operations.append(('partial_avatar_become_player',))
+            runtime.chat_manager.switchPlayerProxy(avatar)
+            raise RuntimeError('native Avatar promotion failed')
+
+        runtime.avatar_module.PlayerAvatar.onBecomePlayer = \
+            partial_avatar_become_player
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.connect(show_lobby=True)
+        self.assertTrue(compatibility.retire_current_player())
+        runtime.bigworld.clearAllSpaces()
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        runtime.bigworld._player = avatar
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'native Avatar promotion failed'):
+            avatar.onBecomePlayer()
+
+        self.assertIs(avatar, runtime.chat_manager.playerProxy)
+        self.assertTrue(getattr(
+            avatar, '_offlineLANRetirePending', False))
+        self.assertFalse(getattr(
+            avatar, '_offlineLANPlayerReady', False))
+        self.assertTrue(compatibility.retire_current_player())
+        self.assertFalse(compatibility.retire_current_player())
+        self.assertIsNone(runtime.chat_manager.playerProxy)
+        self.assertEqual(
+            1, [item[0] for item in operations].count(
+                'original_avatar_become_non_player'))
+        compatibility.fini()
+
+    def test_failed_native_retirement_still_detaches_chat_proxy(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+
+        def failing_avatar_become_non_player(avatar):
+            operations.append(('failing_avatar_become_non_player',))
+            raise RuntimeError('native Avatar retirement failed')
+
+        runtime.avatar_module.PlayerAvatar.onBecomeNonPlayer = \
+            failing_avatar_become_non_player
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.connect(show_lobby=True)
+        self.assertTrue(compatibility.retire_current_player())
+        runtime.bigworld.clearAllSpaces()
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        runtime.bigworld._player = avatar
+        avatar.onBecomePlayer()
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'native Avatar retirement failed'):
+            compatibility.retire_current_player()
+
+        self.assertIsNone(runtime.chat_manager.playerProxy)
+        self.assertFalse(getattr(
+            avatar, '_offlineLANRetirePending', False))
+        self.assertFalse(compatibility.retire_current_player())
+        self.assertEqual(
+            1, [item[0] for item in operations].count(
+                'failing_avatar_become_non_player'))
+        runtime.bigworld.clearAllSpaces()
+        compatibility.fini()
+
     def test_retired_avatar_drops_uncancellable_resource_callback(self):
         compatibility_module = _load_port_source('compat')
         runtime, operations = self._runtime()
@@ -1120,8 +1270,8 @@ class OfflineCompatibilityTests(unittest.TestCase):
         compatibility.connect(show_lobby=True)
         first_account = runtime.bigworld.player()
 
-        runtime.bigworld.entities.clear()
-        runtime.bigworld._player = None
+        self.assertTrue(compatibility.retire_current_player())
+        runtime.bigworld.clearAllSpaces()
         restored = compatibility.restore_lobby_account()
 
         self.assertIsNot(first_account, restored)
@@ -1134,6 +1284,38 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertEqual(2, names.count('account_entity'))
         self.assertEqual(2, names.count('original_account_init'))
         self.assertFalse(compatibility._connecting)
+
+    def test_account_avatar_account_handoff_detaches_chat_before_each_clear(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.connect(show_lobby=True)
+        first_account = runtime.bigworld.player()
+
+        self.assertTrue(compatibility.retire_current_player())
+        self.assertIsNone(runtime.chat_manager.playerProxy)
+        runtime.bigworld.clearAllSpaces()
+        self.assertEqual({}, first_account.__dict__)
+
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        runtime.bigworld._player = avatar
+        avatar.onBecomePlayer()
+        self.assertIs(avatar, runtime.chat_manager.playerProxy)
+
+        self.assertTrue(compatibility.retire_current_player())
+        self.assertFalse(compatibility.retire_current_player())
+        self.assertIsNone(runtime.chat_manager.playerProxy)
+        runtime.bigworld.clearAllSpaces()
+        self.assertEqual({}, avatar.__dict__)
+
+        replacement = compatibility.restore_lobby_account()
+        self.assertIs(replacement, runtime.chat_manager.playerProxy)
+        self.assertIsNot(first_account, replacement)
+        names = [item[0] for item in operations]
+        self.assertEqual(2, names.count('original_account_become_player'))
+        self.assertEqual(1, names.count('original_account_become_non_player'))
+        self.assertEqual(1, names.count('original_avatar_become_non_player'))
 
     def test_account_promotion_restores_clear_all_spaces_after_failure(self):
         compatibility_module = _load_port_source('compat')
@@ -1167,6 +1349,33 @@ class OfflineCompatibilityTests(unittest.TestCase):
         runtime.bigworld.clearAllSpaces()
         self.assertEqual(
             3, runtime.bigworld.operations.count(('clear_all_spaces',)))
+
+    def test_partial_account_promotion_detaches_chat_before_entity_clear(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+
+        def partial_account_become_player(account):
+            runtime.bigworld.clearAllSpaces()
+            runtime.chat_manager.switchPlayerProxy(account)
+            operations.append(('partial_account_become_player',))
+            raise RuntimeError('native Account promotion failed')
+
+        runtime.account_module.PlayerAccount.onBecomePlayer = \
+            partial_account_become_player
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'native Account promotion failed'):
+            compatibility.connect(show_lobby=True)
+
+        self.assertIsNone(runtime.chat_manager.playerProxy)
+        self.assertIsNone(runtime.bigworld.player())
+        self.assertEqual({}, runtime.bigworld.entities)
+        self.assertEqual(
+            1, [item[0] for item in operations].count(
+                'original_account_become_non_player'))
+        self.assertFalse(compatibility._fake_connected)
+        compatibility.fini()
 
     def test_logged_on_listener_failure_rolls_back_entire_connection(self):
         compatibility_module = _load_port_source('compat')
@@ -1276,8 +1485,8 @@ class OfflineCompatibilityTests(unittest.TestCase):
         compatibility = compatibility_module.OfflineCompatibility(runtime)
         compatibility.connect(show_lobby=True)
         runtime.account_module.g_accountRepository = object()
-        runtime.bigworld.entities.clear()
-        runtime.bigworld._player = None
+        self.assertTrue(compatibility.retire_current_player())
+        runtime.bigworld.clearAllSpaces()
 
         with self.assertRaisesRegex(
                 RuntimeError, 'replacement Account init failed'):
@@ -1692,7 +1901,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.4'
+        package.PORT_VERSION = '0.3.5'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []
