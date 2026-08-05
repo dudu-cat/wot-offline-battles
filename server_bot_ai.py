@@ -8,6 +8,18 @@ bot state are used to validate identities, never to invent a target position.
 """
 
 import math
+import os
+import sys
+
+
+# In a source checkout ``scripts`` is beside this file. In the downloadable
+# client package it lives under the drag-and-drop ``0.8.2`` directory. Add that
+# release layout explicitly so running lan_battle_server.py from the package
+# root works without asking users to configure PYTHONPATH.
+_RELEASE_CLIENT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "0.8.2")
+if os.path.isdir(os.path.join(_RELEASE_CLIENT_ROOT, "scripts")):
+    if _RELEASE_CLIENT_ROOT not in sys.path:
+        sys.path.insert(0, _RELEASE_CLIENT_ROOT)
 
 from scripts.client.gui.mods.offhangar.bot_ai_cover import (
     normalize_candidate,

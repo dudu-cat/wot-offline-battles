@@ -1,5 +1,7 @@
-World of Tanks 0.8.2 LAN package (protocol 5)
-=================================================
+World of Tanks 0.8.2 Offline/LAN v1.0.0 (protocol 5)
+=====================================================
+
+Read START_HERE.txt for the shortest installation and startup path.
 
 Client installation (repeat on every Windows machine)
 ------------------------------------------------------
@@ -26,7 +28,9 @@ Replace every older client package and lan_battle_server.py with the files in
 THIS package. Protocol 5 is intentionally incompatible with older client/server
 builds, so every player and the server must use this same package.
 
-On the one machine that has Python 3, open a terminal in this package folder:
+Install Python 3 from https://www.python.org/downloads/ on the one machine that
+will host LAN battles. Then double-click RUN_SERVER.bat on Windows or
+RUN_SERVER.command on macOS. The equivalent terminal command is:
 
     python3 lan_battle_server.py --host 0.0.0.0 --port 28782
 

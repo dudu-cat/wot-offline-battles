@@ -1,8 +1,17 @@
 import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from lan_battle_server import BattleState, ClientHandler, Player, PROTOCOL_VERSION
 from server_bot_ai import BotPlanner
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _manifest():
@@ -39,6 +48,32 @@ def _cover_candidate(candidate_id="rock", x=-8.0, z=-12.0):
 
 
 class ServerBotPlannerTests(unittest.TestCase):
+    def test_downloadable_layout_imports_shared_cover_module(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_root = Path(temp_dir)
+            shutil.copyfile(ROOT / "server_bot_ai.py", package_root / "server_bot_ai.py")
+            cover_target = (
+                package_root / "0.8.2" / "scripts" / "client" / "gui" / "mods" /
+                "offhangar" / "bot_ai_cover.py"
+            )
+            cover_target.parent.mkdir(parents=True)
+            shutil.copyfile(
+                ROOT / "scripts" / "client" / "gui" / "mods" / "offhangar" /
+                "bot_ai_cover.py",
+                cover_target,
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", "from server_bot_ai import BotPlanner; print(BotPlanner.__name__)"],
+                cwd=str(package_root),
+                env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("BotPlanner", result.stdout.strip())
+
     def test_orders_are_stable_then_revision_only_changes_for_new_information(self):
         planner = BotPlanner()
         first = planner.build_orders(_manifest(), _states(), [], 0.0)
