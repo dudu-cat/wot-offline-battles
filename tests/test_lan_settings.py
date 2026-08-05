@@ -24,7 +24,6 @@ def load_settings_module():
         @visible.setter
         def visible(self, value):
             self._visible = bool(value)
-            cursor_calls.append(bool(value))
 
     class Component:
         def __init__(self, texture=None):
@@ -86,7 +85,7 @@ def load_settings_module():
     sys.modules[logging.__name__] = logging
 
     cursor = types.ModuleType("gui.Cursor")
-    cursor.showCursor = lambda visible: None
+    cursor.showCursor = lambda visible: cursor_calls.append(bool(visible))
     sys.modules[cursor.__name__] = cursor
 
     notices = []
@@ -162,6 +161,17 @@ class LANSettingsTest(unittest.TestCase):
         self.assertEqual([True], self.cursor_calls)
 
         script.handleMouseLeaveEvent(self.settings._entry_panel)
+        self.assertEqual([True, False], self.cursor_calls)
+
+    def test_clicking_hovered_entry_transfers_one_cursor_lease_to_panel(self):
+        self.assertTrue(self.settings._make_entry())
+        script = self.settings._entry_panel.script
+
+        script.handleMouseEnterEvent(self.settings._entry_panel)
+        script.handleMouseClickEvent(self.settings._entry_panel)
+
+        self.assertEqual([True], self.cursor_calls)
+        self.settings.close()
         self.assertEqual([True, False], self.cursor_calls)
 
     def test_clicking_a_field_makes_the_first_typed_digit_replace_it(self):

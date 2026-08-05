@@ -184,6 +184,25 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(1, order["route_index"])
         self.assertEqual({"x": 60.0, "y": 0.0, "z": -20.0}, order["move_position"])
 
+    def test_deployed_bot_does_not_drive_back_to_base_route_anchor(self):
+        planner = BotPlanner()
+        manifest = _manifest()
+        manifest[0]["route"] = {
+            "id": "leave_spawn",
+            "waypoints": [
+                {"x": 0, "y": 0, "z": -40},
+                {"x": 0, "y": 0, "z": 80},
+            ],
+        }
+        states = _states()
+        states[0] = dict(states[0], x=0, z=-20)
+
+        result = planner.build_orders(manifest, states, [], 0.0)
+        order = next(value for value in result["orders"] if value["id"] == 1)
+
+        self.assertEqual(1, order["route_index"])
+        self.assertEqual({"x": 0.0, "y": 0.0, "z": 80.0}, order["move_position"])
+
     def test_client_probed_cover_drives_a_hold_peek_return_cycle(self):
         planner = BotPlanner()
         manifest = _manifest()

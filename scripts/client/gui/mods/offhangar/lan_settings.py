@@ -101,32 +101,34 @@ def _notify(message, level='information'):
 
 
 def _set_native_cursor_visible(visible):
-	"""Show BigWorld's pointer over native GUI layered above lobby Scaleform.
+	"""Use the stock lobby cursor owner for native GUI layered above Scaleform.
 
-	The 0.8.2 lobby renders its normal pointer inside Flash and deliberately keeps
-	``GUI.mcursor`` hidden. Native GUI roots cover that Flash pointer, so they must
-	show the engine cursor while they own the mouse, then restore the hidden
-	Scaleform-compatible cursor instead of switching to ``BigWorld.dcursor``.
+	Calling ``GUI.mcursor`` directly bypasses gui.Cursor's ownership counter. On
+	some Windows/Parallels combinations that leaves the host busy/resize pointer
+	visible above the game. The stock helper is the path used by the working
+	waiting-room overlay and restores the direct-input cursor on release.
 	"""
 	try:
-		import BigWorld, GUI
-		cursor = GUI.mcursor()
-		BigWorld.setCursor(cursor)
-		cursor.visible = bool(visible)
+		from gui.Cursor import showCursor
+		showCursor(bool(visible))
 		return True
 	except Exception:
-		return False
+		try:
+			import BigWorld, GUI
+			if visible:
+				BigWorld.setCursor(GUI.mcursor())
+				GUI.mcursor().visible = True
+			else:
+				GUI.mcursor().visible = False
+				BigWorld.setCursor(BigWorld.dcursor())
+			return True
+		except Exception:
+			return False
 
 
 def _acquire_cursor():
 	global _cursor_acquired
 	if _cursor_acquired:
-		try:
-			import GUI
-			if not GUI.mcursor().visible:
-				_set_native_cursor_visible(True)
-		except Exception:
-			_set_native_cursor_visible(True)
 		return
 	if _set_native_cursor_visible(True):
 		_cursor_acquired = True
@@ -171,14 +173,14 @@ class _EntryScript(object):
 	def handleMouseEnterEvent(self, component):
 		global _entry_hovered
 		_entry_hovered = True
-		_set_native_cursor_visible(True)
+		_acquire_cursor()
 		return True
 
 	def handleMouseLeaveEvent(self, component):
 		global _entry_hovered
 		_entry_hovered = False
 		if not _active:
-			_set_native_cursor_visible(False)
+			_release_cursor()
 		return True
 
 	def handleMouseButtonEvent(self, component, event):
@@ -281,7 +283,7 @@ def _set_entry_visible(value):
 		_refresh_entry()
 	elif _entry_hovered and not _active:
 		_entry_hovered = False
-		_set_native_cursor_visible(False)
+		_release_cursor()
 
 
 def _make_entry():

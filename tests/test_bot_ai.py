@@ -65,6 +65,54 @@ class BotAITest(unittest.TestCase):
         }
         self.assertGreaterEqual(len(personalities), 10)
 
+    def test_matchmaking_uses_a_three_tier_band(self):
+        allowed = {
+            tier for tier in range(1, 11)
+            if self.ai.vehicle_in_battle_tier_band(7, tier)
+        }
+
+        self.assertEqual({6, 7, 8}, allowed)
+
+    def test_enemy_is_hidden_until_spotted_but_ally_is_visible(self):
+        self.assertFalse(self.ai.bot_initially_visible(2, 1, True))
+        self.assertTrue(self.ai.bot_initially_visible(1, 1, True))
+        self.assertTrue(self.ai.bot_initially_visible(2, 1, False))
+
+        battle_source = (
+            ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
+        ).read_text()
+        self.assertGreaterEqual(battle_source.count("vehicle_in_battle_tier_band"), 3)
+        self.assertIn("e_mock._spot_visible = bot_initially_visible(", battle_source)
+
+    def test_routes_start_at_own_flag_and_finish_at_enemy_flag(self):
+        for map_name, tactical_map in self.maps.TACTICAL_MAPS.items():
+            for team in (1, 2):
+                own = tactical_map["bases"][team]
+                enemy = tactical_map["bases"][3 - team]
+                for source_route in tactical_map["routes"][team]:
+                    points = self.ai.route_toward_enemy(
+                        source_route, team, tactical_map["bases"]
+                    )["waypoints"]
+                    if len(points) < 2:
+                        continue
+                    self.assertEqual((float(own[0]), float(own[1]), 0), points[0])
+                    self.assertEqual(
+                        (float(enemy[0]), float(enemy[1]), 0), points[-1]
+                    )
+
+                director = self.ai.BattleDirector(map_name, "flag-goal")
+                agent = director.register(
+                    8000 + team, team, descriptor("mediumTank"), "Route check"
+                )
+                points = agent["route"]["waypoints"]
+                if len(points) < 2:
+                    continue
+                order = director.order_for(
+                    agent["id"], (own[0] + 15.0, 0.0, own[1] + 15.0),
+                    0.0, 1000, 1000, 0.0,
+                )
+                self.assertGreaterEqual(order["route_index"], 1)
+
     def test_python26_source_loader_orders_ai_dependencies_before_battle(self):
         bootstrap = (
             ROOT / "scripts/client/gui/mods/mod_offhangar.py"

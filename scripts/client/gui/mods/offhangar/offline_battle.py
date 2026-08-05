@@ -13358,12 +13358,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								import random
 								from items import vehicles
 								import nations
+								from gui.mods.offhangar.bot_ai import vehicle_in_battle_tier_band
 								cur_tier = loaded_models['td'].type.level
 								candidates = []
 								for nation in nations.AVAILABLE_NAMES:
 									nationID = nations.INDICES[nation]
 									for v in vehicles.g_list.getList(nationID).itervalues():
-										if abs(v['level'] - cur_tier) <= 2 and not _offh_veh_excluded(v):
+										if vehicle_in_battle_tier_band(cur_tier, v['level']) and not _offh_veh_excluded(v):
 											candidates.append(v['name'])
 								LOG_DEBUG('KEY P pressed! cur_tier=%d candidates=%d' % (cur_tier, len(candidates)))
 								if candidates:
@@ -13443,6 +13444,16 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_offh_set_alive(e_mock, bool(_network_server_state.get('alive', True)) and e_mock.health > 0)
 							e_mock.isStarted = True
 							e_mock._bot_team = bot_team
+							try:
+								from _constants import CONFIG_OPTIONS as _BOT_VIS_CFG
+								_bot_spotting = bool(_BOT_VIS_CFG.get('spotting_enabled', True))
+							except Exception:
+								_bot_spotting = True
+							from gui.mods.offhangar.bot_ai import bot_initially_visible
+							e_mock._spot_visible = bot_initially_visible(
+								bot_team, getattr(player, '_offhangar_team', 1) or 1,
+								_bot_spotting)
+							e_mock._spot_until = 0.0
 							e_mock._network_server_id = _network_server_id
 							e_mock._network_remote = _network_server_id is not None
 							e_mock._network_bot_id = _network_bot_id
@@ -13467,6 +13478,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							}
 							ch.position = e_mock.position
 							ch.yaw = e_mock.yaw
+							try:
+								ch.visible = bool(e_mock._spot_visible)
+								ch.visibleAttachments = bool(e_mock._spot_visible)
+							except Exception:
+								pass
 							
 							_eid = BigWorld.createEntity('OfflineEntity', _offh_bspace(), 0, e_mock.position, (0, 0, e_mock.yaw), dict())
 							e_mock.bw_entity = None
@@ -13476,6 +13492,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								ent = BigWorld.entity(eid)
 								if ent:
 									ent.model = model_to_add  # Outline needs it!
+									try:
+										_model_visible = bool(getattr(_e_mock, '_spot_visible', True))
+										model_to_add.visible = _model_visible
+										model_to_add.visibleAttachments = _model_visible
+									except Exception:
+										pass
 									try:
 										ent.filter = BigWorld.AvatarFilter()
 										_e_mock.filter = ent.filter
@@ -13660,11 +13682,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							except: pass
 							
 							try:
-								if hasattr(WindowsManager.g_windowsManager.battleWindow, 'vMarkersManager'):
+								if (getattr(e_mock, '_spot_visible', True) and
+										hasattr(WindowsManager.g_windowsManager.battleWindow, 'vMarkersManager')):
 									e_mock.marker = WindowsManager.g_windowsManager.battleWindow.vMarkersManager.createMarker(e_mock.proxy)
-								
+
 								minimap = WindowsManager.g_windowsManager.battleWindow.minimap
-								if minimap:
+								if minimap and getattr(e_mock, '_spot_visible', True):
 									minimap.notifyVehicleStart(e_mock.id)
 							except Exception as e:
 								LOG_DEBUG('GUI Add error:', str(e))
@@ -13860,12 +13883,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							import random as _rnd
 							from items import vehicles as _veh_items
 							import nations as _nations
+							from gui.mods.offhangar.bot_ai import vehicle_in_battle_tier_band
 							_tier = loaded_models['td'].type.level
 							_cand = []
 							for _nat in _nations.AVAILABLE_NAMES:
 								_nid = _nations.INDICES[_nat]
 								for _v in _veh_items.g_list.getList(_nid).itervalues():
-									if abs(_v['level'] - _tier) <= 2 and not _offh_veh_excluded(_v):
+									if vehicle_in_battle_tier_band(_tier, _v['level']) and not _offh_veh_excluded(_v):
 										_cand.append(_v)
 							def _class_key(_v):
 								try:
@@ -14026,12 +14050,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				try:
 					from items import vehicles as _pv
 					import nations as _pn
+					from gui.mods.offhangar.bot_ai import vehicle_in_battle_tier_band
 					_ptier = loaded_models['td'].type.level
 					_pcand = []
 					for _pnat in _pn.AVAILABLE_NAMES:
 						_pnid = _pn.INDICES[_pnat]
 						for _pvh in _pv.g_list.getList(_pnid).itervalues():
-							if abs(_pvh['level'] - _ptier) <= 2 and not _offh_veh_excluded(_pvh):
+							if vehicle_in_battle_tier_band(_ptier, _pvh['level']) and not _offh_veh_excluded(_pvh):
 								_pcand.append(_pvh)
 					_ppool = _offh_bot_pool(_pcand, _ptier)
 					if not _ppool:

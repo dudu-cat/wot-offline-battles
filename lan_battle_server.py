@@ -970,8 +970,10 @@ class ClientHandler(socketserver.BaseRequestHandler):
                                 player.player_id, message.get("target"), message.get("shot_seq")))
                     elif message.get("type") == "bot_manifest":
                         if server.state.update_bot_manifest(player.player_id, message):
-                            _server_log("BOT MANIFEST authority=%d bots=%d" % (
-                                player.player_id, len(server.state.bot_manifest)))
+                            routed = sum(1 for entry in server.state.bot_manifest
+                                         if entry.get("route", {}).get("waypoints"))
+                            _server_log("BOT MANIFEST authority=%d bots=%d routes=%d" % (
+                                player.player_id, len(server.state.bot_manifest), routed))
                         else:
                             _server_log("BOT MANIFEST rejected sender=%d" % player.player_id)
                     elif message.get("type") == "bot_state":

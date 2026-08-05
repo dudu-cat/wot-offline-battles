@@ -18,6 +18,7 @@ from gui.mods.offhangar import bot_ai_maps
 CONTACT_MEMORY_SECONDS = 7.0
 TARGET_HYSTERESIS_BONUS = 18.0
 LOCAL_FORCE_RADIUS = 185.0
+BATTLE_TIER_RADIUS = 1
 
 
 def _number(value, default=0.0):
@@ -28,6 +29,60 @@ def _number(value, default=0.0):
 		return result
 	except Exception:
 		return float(default)
+
+
+def vehicle_in_battle_tier_band(player_tier, candidate_tier):
+	"""Keep one battle within a three-tier band, e.g. VI-VIII for tier VII."""
+	try:
+		return abs(int(candidate_tier) - int(player_tier)) <= BATTLE_TIER_RADIUS
+	except Exception:
+		return False
+
+
+def bot_initially_visible(bot_team, player_team, spotting_enabled):
+	"""Hide an enemy model before its first spotting update can run."""
+	try:
+		return (not bool(spotting_enabled) or
+			int(bot_team) == int(player_team))
+	except Exception:
+		return not bool(spotting_enabled)
+
+
+def route_toward_enemy(route, team, bases):
+	"""Orient a multi-point route from the own flag to the enemy flag."""
+	result = dict(route or {})
+	result['role_weights'] = dict(result.get('role_weights', {}) or {})
+	points = list(result.get('waypoints', ()) or ())
+	if len(points) < 2:
+		result['waypoints'] = tuple(points)
+		return result
+	try:
+		own = bases.get(int(team))
+		enemy = bases.get(3 - int(team))
+		if own is None or enemy is None:
+			result['waypoints'] = tuple(points)
+			return result
+		def _distance(point, base):
+			return ((float(point[0]) - float(base[0])) ** 2 +
+				(float(point[1]) - float(base[1])) ** 2)
+		forward = _distance(points[0], own) + _distance(points[-1], enemy)
+		reverse = _distance(points[-1], own) + _distance(points[0], enemy)
+		if reverse < forward:
+			points.reverse()
+		own_point = (float(own[0]), float(own[1]), 0)
+		enemy_point = (float(enemy[0]), float(enemy[1]), 0)
+		if _distance(points[0], own) > 1.0:
+			points.insert(0, own_point)
+		else:
+			points[0] = own_point
+		if _distance(points[-1], enemy) > 1.0:
+			points.append(enemy_point)
+		else:
+			points[-1] = enemy_point
+	except Exception:
+		pass
+	result['waypoints'] = tuple(points)
+	return result
 
 
 def _mapping_get(value, key, default=None):
@@ -344,7 +399,8 @@ class BattleDirector(object):
 		if best is not None:
 			key = (agent['team'], best.get('id'))
 			self.route_usage[key] = int(self.route_usage.get(key, 0)) + 1
-		return best
+			return route_toward_enemy(best, agent['team'], self.bases)
+		return None
 
 	def update_contact(self, observing_team, target_id, target_team, position,
 	                   health, max_health, class_tag, visible, now,
@@ -484,6 +540,16 @@ class BattleDirector(object):
 		waypoints = route.get('waypoints', ())
 		if not waypoints:
 			return tuple(position)
+		if not agent.get('route_started', False):
+			nearest = min(range(len(waypoints)), key=lambda value:
+				_distance_2d(position, (float(waypoints[value][0]),
+					position[1], float(waypoints[value][1]))))
+			# Point zero is the own flag. The formation is deployed in front of
+			# it, so entering battle must continue to the first tactical point.
+			if nearest == 0 and len(waypoints) > 1:
+				nearest = 1
+			agent['waypoint_index'] = nearest
+			agent['route_started'] = True
 		index = min(int(agent.get('waypoint_index', 0)), len(waypoints) - 1)
 		waypoint = waypoints[index]
 		world = (float(waypoint[0]), float(position[1]), float(waypoint[1]))

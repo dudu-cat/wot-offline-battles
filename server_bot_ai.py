@@ -499,7 +499,13 @@ class BotPlanner(object):
             nearest = min(range(len(waypoints)), key=lambda value:
                           (_number(waypoints[value].get("x")) - bx) ** 2 +
                           (_number(waypoints[value].get("z")) - bz) ** 2)
-            state = {"index": nearest, "hold_until": 0.0,
+            index = nearest
+            # Route point zero is the team's own flag. The actual line-up starts
+            # in front of it, so do not order every deployed tank to turn around
+            # and visit its own base before it may advance toward the enemy flag.
+            if nearest == 0 and len(waypoints) > 1:
+                index = 1
+            state = {"index": index, "hold_until": 0.0,
                      "route_id": route_id}
             self._route_states[bot["id"]] = state
         index = min(max(0, _integer(state.get("index"))), len(waypoints) - 1)
