@@ -55,6 +55,22 @@ class LocalDriver(object):
 		self.failure_ttl = max(0.25, float(failure_ttl))
 		self.states = {}
 
+	@staticmethod
+	def resolve_order_positions(position, aim_position, move_position, face_position):
+		"""Resolve optional tactical targets without mistaking travel for a hold."""
+		stop_without_route = aim_position is None and move_position is None
+		if stop_without_route:
+			aim_position = position
+		elif aim_position is None:
+			# Server route orders intentionally omit an aim target until an enemy is
+			# spotted.  Use the route target for facing, but do not apply idle braking.
+			aim_position = move_position
+		if move_position is None:
+			move_position = aim_position
+		if face_position is None:
+			face_position = move_position
+		return aim_position, move_position, face_position, stop_without_route
+
 	def forget(self, bot_id):
 		self.states.pop(bot_id, None)
 

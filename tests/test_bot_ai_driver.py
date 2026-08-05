@@ -3,6 +3,8 @@ import math
 import unittest
 from pathlib import Path
 
+from server_bot_ai import BotPlanner
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER_PATH = ROOT / "scripts/client/gui/mods/offhangar/bot_ai_driver.py"
@@ -18,6 +20,54 @@ def load_driver():
 class BotAIDriverTest(unittest.TestCase):
     def setUp(self):
         self.module = load_driver()
+
+    def test_route_without_spotted_target_does_not_become_idle_hold(self):
+        driver = self.module.LocalDriver()
+        current = (0.0, 0.0, 0.0)
+        route = (0.0, 0.0, 80.0)
+
+        aim, move, face, should_stop = driver.resolve_order_positions(
+            current, None, route, None
+        )
+
+        self.assertFalse(should_stop)
+        self.assertEqual(route, aim)
+        self.assertEqual(route, move)
+        self.assertEqual(route, face)
+
+    def test_real_server_advance_order_is_not_braked_by_client(self):
+        order = BotPlanner().build_orders(
+            [{"id": 1, "team": 1, "slot": 0, "health": 1000}],
+            [{"id": 1, "team": 1, "alive": True, "x": 0.0, "z": -20.0}],
+            [],
+            0.0,
+        )["orders"][0]
+
+        aim, move, face, should_stop = self.module.LocalDriver.resolve_order_positions(
+            (0.0, 0.0, -20.0),
+            order["aim_position"],
+            order["move_position"],
+            order["face_position"],
+        )
+
+        self.assertEqual("advance", order["combat_mode"])
+        self.assertIsNone(order["aim_position"])
+        self.assertFalse(should_stop)
+        self.assertEqual(order["move_position"], aim)
+        self.assertEqual(move, face)
+
+    def test_missing_route_and_target_remains_an_idle_hold(self):
+        driver = self.module.LocalDriver()
+        current = (12.0, 3.0, -7.0)
+
+        aim, move, face, should_stop = driver.resolve_order_positions(
+            current, None, None, None
+        )
+
+        self.assertTrue(should_stop)
+        self.assertEqual(current, aim)
+        self.assertEqual(current, move)
+        self.assertEqual(current, face)
 
     def test_flat_ground_drives_straight_to_target(self):
         driver = self.module.LocalDriver()

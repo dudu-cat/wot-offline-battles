@@ -8801,13 +8801,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								drive_pos = target_pos
 								face_pos = target_pos
 
-							if target_pos is None:
-								# No known enemy and no tactical route: stop safely.
+							_current_bot_pos = (
+								m_veh.position.x, m_veh.position.y, m_veh.position.z)
+							target_pos, drive_pos, face_pos, _stop_without_route = (
+								_offh_ai_driver().resolve_order_positions(
+									_current_bot_pos, target_pos, drive_pos, face_pos))
+							if _stop_without_route:
+								# Only an order without both aim and movement is an idle hold.
 								m_veh._veh_velocity = max(0.0, m_veh._veh_velocity - 20.0 * dt)
 								m_veh._veh_turn_velocity = 0.0
-								target_pos = (m_veh.position.x, m_veh.position.y, m_veh.position.z)
-							if drive_pos is None: drive_pos = target_pos
-							if face_pos is None: face_pos = target_pos
 							# Hierarchical navigation: strategic routes choose the battle lane;
 							# a shared lazy A* graph connects their sparse anchors without
 							# crossing cliffs, water gaps or solid geometry. Nearby tanks remain
