@@ -80,7 +80,8 @@ class BootstrapLifecycleTests(unittest.TestCase):
         config_module = types.ModuleType(
             'gui.mods.offline_lan_0922.config')
         config_module.load = lambda: {
-            'enabled': True, 'startupTimeoutSeconds': 30.0}
+            'enabled': True, 'startupTimeoutSeconds': 30.0,
+            'vehicle': 'ussr:R11_MS-1'}
         state_module = types.ModuleType(
             'gui.mods.offline_lan_0922.account_rpc.state')
         state_module.AccountState = object
@@ -88,6 +89,50 @@ class BootstrapLifecycleTests(unittest.TestCase):
         app_loader_module.g_appLoader = app_loader
         settings_module = types.ModuleType('gui.app_loader.settings')
         settings_module.GUI_GLOBAL_SPACE_ID = spaces
+
+        descriptor = types.SimpleNamespace(
+            type=types.SimpleNamespace(
+                id=(0, 11),
+                crewRoles=(('commander',), ('driver',))),
+            chassis=types.SimpleNamespace(compactDescr=2002),
+            turret=types.SimpleNamespace(compactDescr=2003),
+            gun=types.SimpleNamespace(compactDescr=2004),
+            engine=types.SimpleNamespace(compactDescr=2005),
+            fuelTank=types.SimpleNamespace(compactDescr=2006),
+            radio=types.SimpleNamespace(compactDescr=2007),
+            maxHealth=100,
+            makeCompactDescr=lambda: b'vehicle')
+        customization = types.SimpleNamespace(
+            paints={12001: types.SimpleNamespace(compactDescr=12001)},
+            camouflages={12002: types.SimpleNamespace(compactDescr=12002)},
+            decals={12003: types.SimpleNamespace(compactDescr=12003)},
+            modifications={12004: types.SimpleNamespace(compactDescr=12004)},
+            styles={12005: types.SimpleNamespace(compactDescr=12005)})
+        vehicles = types.SimpleNamespace(
+            VehicleDescr=lambda **unused_kwargs: descriptor,
+            getDefaultAmmoForGun=lambda unused_gun: [10010, 20],
+            makeIntCompactDescrByID=lambda *unused_args: 1001,
+            g_cache=types.SimpleNamespace(
+                customization20=lambda: customization))
+        tankman_roles = {b'commander': 'commander', b'driver': 'driver'}
+        tankmen = types.SimpleNamespace(
+            MAX_SKILL_LEVEL=100,
+            generateTankmen=lambda *unused_args: [b'commander', b'driver'],
+            TankmanDescr=lambda compact: types.SimpleNamespace(
+                nationID=0, vehicleTypeID=11,
+                role=tankman_roles[compact]))
+        items = types.ModuleType('items')
+        items.ITEM_TYPE_INDICES = {
+            'vehicle': 1, 'vehicleChassis': 2, 'vehicleTurret': 3,
+            'vehicleGun': 4, 'vehicleEngine': 5,
+            'vehicleFuelTank': 6, 'vehicleRadio': 7, 'tankman': 8,
+            'optionalDevice': 9, 'shell': 10, 'equipment': 11,
+            'customization': 12,
+        }
+        items.tankmen = tankmen
+        items.vehicles = vehicles
+        nations = types.ModuleType('nations')
+        nations.NAMES = tuple('nation-%d' % index for index in range(9))
 
         modules = {
             'BigWorld': bigworld,
@@ -102,6 +147,8 @@ class BootstrapLifecycleTests(unittest.TestCase):
             'gui.mods.offline_lan_0922.config': config_module,
             'gui.app_loader': app_loader_module,
             'gui.app_loader.settings': settings_module,
+            'items': items,
+            'nations': nations,
         }
         name = 'test_offline_lan_0922_bootstrap_lifecycle'
         spec = importlib.util.spec_from_file_location(name, BOOTSTRAP)
@@ -110,6 +157,37 @@ class BootstrapLifecycleTests(unittest.TestCase):
             spec.loader.exec_module(module)
         return (module, callbacks, compatibility, app_loader, spaces, events,
                 modules)
+
+    def test_selected_vehicle_snapshot_is_relationally_complete(self):
+        (bootstrap, unused_callbacks, unused_compatibility,
+         unused_app_loader, unused_spaces, unused_events, modules) = self._load()
+
+        with mock.patch.dict(sys.modules, modules):
+            selected = bootstrap._selected_vehicle(
+                {'vehicle': 'ussr:R11_MS-1'})
+
+        self.assertEqual([1001, 1002], selected['crew'])
+        self.assertEqual(
+            {1001: b'commander', 1002: b'driver'}, selected['tankmen'])
+        self.assertEqual((0, 100), selected['repair'])
+        self.assertEqual((0, 0), selected['lock'])
+        self.assertEqual([0, 0, 0], selected['eqs'])
+        self.assertEqual([0, 0, 0], selected['eqsLayout'])
+        self.assertEqual(set(range(2, 8)),
+                         set(selected['inventoryItems']) - {10})
+        required_prices = set()
+        for item_type in tuple(range(2, 8)) + (10,):
+            required_prices.update(selected['inventoryItems'][item_type])
+        self.assertTrue(
+            required_prices.issubset(selected['shopItemPrices']))
+        self.assertEqual(9, selected['shopNationCount'])
+        self.assertEqual(5, selected['customizationItemCount'])
+        self.assertTrue(
+            {12001, 12002, 12003, 12004, 12005}.issubset(
+                selected['shopItemPrices']))
+        for compact_descr in (12001, 12002, 12003, 12004, 12005):
+            self.assertEqual(
+                {'credits': 0}, selected['shopItemPrices'][compact_descr])
 
     def test_account_is_created_after_login_state_clear_and_next_tick(self):
         (bootstrap, callbacks, compatibility, app_loader,

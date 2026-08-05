@@ -34,9 +34,24 @@ def _server_stats(context, args):
     return Result(commands.RES_SUCCESS, before_response=publish_stats)
 
 
+def _wrap_shop_item_prices(value, factory=None):
+    """Convert wire mappings to #1513's dual-purpose ItemsPrices object."""
+    if factory is None:
+        from items import ItemsPrices
+        factory = ItemsPrices
+    current = value['items']['itemPrices']
+    defaults = value['defaults']['items']['itemPrices']
+    value['items']['itemPrices'] = factory(current)
+    value['defaults']['items']['itemPrices'] = factory(defaults)
+    return value
+
+
 def _sync_shop(context, args):
     revision = args[0] if args else 0
-    return Result(commands.RES_STREAM, '', data.shop(revision))
+    value = data.shop(revision, context.get('selected_vehicle'))
+    value = _wrap_shop_item_prices(
+        value, context.get('items_prices_factory'))
+    return Result(commands.RES_STREAM, '', value)
 
 
 def _sync_dossiers(context, args):

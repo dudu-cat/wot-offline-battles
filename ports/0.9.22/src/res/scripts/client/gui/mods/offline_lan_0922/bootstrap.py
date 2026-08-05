@@ -28,11 +28,105 @@ def _schedule(delay, function):
 
 def _selected_vehicle(config):
     try:
-        from items import vehicles
+        import nations
+        from items import ITEM_TYPE_INDICES, tankmen, vehicles
         descriptor = vehicles.VehicleDescr(typeName=config['vehicle'])
-        return {'id': 1, 'compDescr': descriptor.makeCompactDescr()}
+        vehicle_id = 1
+        nation_id, vehicle_type_id = descriptor.type.id
+
+        crew_compact_descrs = list(tankmen.generateTankmen(
+            nation_id, vehicle_type_id, descriptor.type.crewRoles,
+            False, tankmen.MAX_SKILL_LEVEL, 0))
+        if len(crew_compact_descrs) != len(descriptor.type.crewRoles):
+            raise ValueError('generated crew does not match vehicle crew slots')
+
+        crew_ids = []
+        tankman_compact_descrs = {}
+        for index, compact_descr in enumerate(crew_compact_descrs):
+            tankman_id = 1001 + index
+            tankman_descr = tankmen.TankmanDescr(compact_descr)
+            roles = descriptor.type.crewRoles[index]
+            if (tankman_descr.nationID != nation_id or
+                    tankman_descr.vehicleTypeID != vehicle_type_id or
+                    tankman_descr.role != roles[0]):
+                raise ValueError(
+                    'generated tankman does not match vehicle crew slot')
+            crew_ids.append(tankman_id)
+            tankman_compact_descrs[tankman_id] = compact_descr
+
+        inventory_items = {}
+        shop_item_prices = {}
+        components = (
+            ('vehicleChassis', descriptor.chassis),
+            ('vehicleTurret', descriptor.turret),
+            ('vehicleGun', descriptor.gun),
+            ('vehicleEngine', descriptor.engine),
+            ('vehicleRadio', descriptor.radio),
+            ('vehicleFuelTank', descriptor.fuelTank),
+        )
+        for item_type_name, component in components:
+            compact_descr = component.compactDescr
+            item_type = ITEM_TYPE_INDICES[item_type_name]
+            inventory_items.setdefault(item_type, {})[compact_descr] = 1
+            # ShopDataParser uses membership in itemPrices as its module
+            # catalogue.  A zero price keeps installed modules discoverable
+            # without reimplementing the client's XML price reader.
+            shop_item_prices[compact_descr] = {'credits': 0, 'gold': 0}
+
+        shells = list(vehicles.getDefaultAmmoForGun(descriptor.gun))
+        shell_items = inventory_items.setdefault(
+            ITEM_TYPE_INDICES['shell'], {})
+        for index in range(0, len(shells), 2):
+            shell_compact_descr = shells[index]
+            shell_items[shell_compact_descr] = shells[index + 1]
+            shop_item_prices[shell_compact_descr] = {
+                'credits': 0, 'gold': 0,
+            }
+
+        vehicle_compact_descr = descriptor.makeCompactDescr()
+        vehicle_int_compact_descr = vehicles.makeIntCompactDescrByID(
+            'vehicle', nation_id, vehicle_type_id)
+        shop_item_prices[vehicle_int_compact_descr] = {
+            'credits': 0, 'gold': 0,
+        }
+
+        customization_count = 0
+        customization_cache = vehicles.g_cache.customization20()
+        for collection_name in (
+                'paints', 'camouflages', 'decals', 'modifications', 'styles'):
+            collection = getattr(customization_cache, collection_name)
+            for item in collection.values():
+                shop_item_prices[item.compactDescr] = {
+                    # Keep zero-price appearance items credit-denominated.
+                    # Money's weighted currency chooser prefers gold when
+                    # both zero-valued keys are present.
+                    'credits': 0,
+                }
+                customization_count += 1
+        if customization_count <= 0:
+            raise ValueError('client customization catalogue is empty')
+
+        return {
+            'id': vehicle_id,
+            'compDescr': vehicle_compact_descr,
+            'crew': crew_ids,
+            'tankmen': tankman_compact_descrs,
+            'repair': (0, descriptor.maxHealth),
+            'lock': (0, 0),
+            'shells': shells,
+            'shellsLayout': {},
+            'eqs': [0, 0, 0],
+            'eqsLayout': [0, 0, 0],
+            'inventoryItems': inventory_items,
+            'shopItemPrices': shop_item_prices,
+            'shopNationCount': len(nations.NAMES),
+            'customizationItemCount': customization_count,
+        }
     except Exception:
-        return None
+        # _run_once owns startup error reporting.  Returning an empty snapshot
+        # here would merely defer a deterministic descriptor problem until a
+        # native Hangar consumer crashes with a misleading IndexError.
+        raise
 
 
 def _on_lobby_view_loaded(event):

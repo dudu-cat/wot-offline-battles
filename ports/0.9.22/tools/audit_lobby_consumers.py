@@ -188,6 +188,172 @@ SAFE_STATS_GETTERS = {
     'mayConsumeWalletResources': 'StatsRequester.mayConsumeWalletResources',
 }
 
+# These consumers are reached during the first native Hangar render.  Their
+# failure modes are semantic cardinality errors: an outer tuple/list can have
+# the correct type and arity while an inner price list, module catalogue, or
+# relational crew table is still unusable.
+HANGAR_CARDINALITY_CONSUMERS = (
+    {
+        'member': (
+            'scripts/client/gui/Scaleform/daapi/view/lobby/shared/'
+            'fitting_slot_vo.pyc'),
+        'function': 'FittingSlotVO._prepareModule',
+        'directIndices': [0],
+        'reason': 'fixed vehicle module list must be non-empty',
+    },
+    {
+        'member': 'scripts/common/items/item_price.pyc',
+        'function': 'getNextSlotPrice',
+        'directIndices': [0, 1, -1],
+        'reason': 'slot price fallback list must be non-empty',
+    },
+    {
+        'member': 'scripts/common/items/item_price.pyc',
+        'function': 'getNextBerthPackPrice',
+        'directIndices': [0, 1, 2, -1],
+        'reason': 'berth pack size is a divisor and fallback list is indexed',
+    },
+    {
+        'member': 'scripts/client/gui/shared/gui_items/Vehicle.pyc',
+        'function': 'Vehicle.isLocked',
+        'directIndices': [0],
+        'reason': 'vehicle lock must be a sequence, not requester default 0',
+    },
+    {
+        'member': 'scripts/client/gui/shared/gui_items/Vehicle.pyc',
+        'function': 'Vehicle.typeOfLockingArena',
+        'directIndices': [1],
+        'reason': 'vehicle lock carries the arena id in its second position',
+    },
+    {
+        'member': 'scripts/client/gui/shared/gui_items/Vehicle.pyc',
+        'function': 'Vehicle._buildCrew',
+        'directIndices': ['compDescr'],
+        'reason': 'every non-empty crew id must resolve to a tankman record',
+    },
+)
+
+# Method-level contracts which cannot be expressed as literal subscripts.
+# These prove why producer values need richer semantics than plain container
+# type checks: itemPrices needs the ItemsPrices API, and exchange ratios are
+# native divisors rather than merely two numeric-looking fields.
+HANGAR_SEMANTIC_CONSUMERS = (
+    {
+        'member': (
+            'scripts/client/gui/shared/utils/requesters/'
+            'ShopRequester.pyc'),
+        'function': 'ShopCommonStats.getItemPrice',
+        'requiredNames': ['getPrices'],
+        'requiredOpcodes': [],
+        'reason': 'itemPrices must expose getPrices, not only mapping methods',
+    },
+    {
+        'member': (
+            'scripts/client/gui/shared/utils/requesters/parsers/'
+            'ShopDataParser.pyc'),
+        'function': 'ShopDataParser.getPrices',
+        'requiredNames': ['get', 'ItemsPrices'],
+        'requiredOpcodes': [],
+        'reason': 'the parser returns supplied itemPrices without wrapping it',
+    },
+    {
+        'member': (
+            'scripts/client/gui/shared/gui_items/processors/common.pyc'),
+        'function': 'FreeXPExchanger.__init__',
+        'requiredNames': ['freeXPConversion'],
+        'requiredOpcodes': ['BINARY_DIVIDE'],
+        'reason': 'freeXPConversion[0] is a divisor',
+    },
+    {
+        'member': (
+            'scripts/client/gui/Scaleform/daapi/view/lobby/exchange/'
+            'ExchangeFreeToTankmanXpWindow.pyc'),
+        'function': 'ExchangeFreeToTankmanXpWindow.calcValueRequest',
+        'requiredNames': ['freeXPToTManXPRate'],
+        'requiredOpcodes': ['BINARY_DIVIDE'],
+        'reason': 'freeXPToTManXPRate is a divisor',
+    },
+    {
+        'member': (
+            'scripts/client/gui/Scaleform/daapi/view/lobby/'
+            'crewOperations/CrewOperationsPopOver.pyc'),
+        'function': 'CrewOperationsPopOver.__getReturnOperationData',
+        'requiredNames': ['lastCrew'],
+        'requiredOpcodes': [],
+        'reason': 'missing lastCrew means no history; an empty list does not',
+    },
+    {
+        'member': (
+            'scripts/client/gui/shared/utils/requesters/'
+            'ShopRequester.pyc'),
+        'function': 'ShopCommonStats.getInscriptionsGroupPriceFactors',
+        'requiredNames': ['getItemsData'],
+        'requiredOpcodes': ['BINARY_SUBSCR'],
+        'reason': 'inscription factors are indexed directly by nation',
+    },
+    {
+        'member': (
+            'scripts/client/gui/shared/utils/requesters/'
+            'ShopRequester.pyc'),
+        'function': 'ShopCommonStats.getCamouflagesPriceFactors',
+        'requiredNames': ['getItemsData'],
+        'requiredOpcodes': ['BINARY_SUBSCR'],
+        'reason': 'camouflage factors are indexed directly by nation',
+    },
+    {
+        'member': (
+            'scripts/client/gui/Scaleform/daapi/view/lobby/customization/'
+            'customization_carousel.pyc'),
+        'function': 'CustomizationCarouselDataProvider.__init__',
+        'requiredNames': ['getItems', 'CUSTOMIZATIONS'],
+        'requiredOpcodes': [],
+        'reason': 'customization tabs are populated from the priced shop catalog',
+    },
+    {
+        'member': (
+            'scripts/client/gui/Scaleform/daapi/view/lobby/customization/'
+            'main_view.pyc'),
+        'function': 'MainView.__setFooterInitData',
+        'requiredNames': ['first'],
+        'requiredOpcodes': [],
+        'reason': 'an empty customization catalog leaves tabIndex as None',
+    },
+)
+
+BOOTSTRAP_SELECTED_VEHICLE_NAMES = (
+    'generateTankmen',
+    'TankmanDescr',
+    'getDefaultAmmoForGun',
+    'makeIntCompactDescrByID',
+    'chassis',
+    'turret',
+    'gun',
+    'engine',
+    'radio',
+    'fuelTank',
+    'customization20',
+    'NAMES',
+)
+
+BOOTSTRAP_SELECTED_VEHICLE_LITERALS = (
+    'crew',
+    'tankmen',
+    'repair',
+    'lock',
+    'shells',
+    'eqs',
+    'eqsLayout',
+    'inventoryItems',
+    'shopItemPrices',
+    'shopNationCount',
+    'customizationItemCount',
+    'paints',
+    'camouflages',
+    'decals',
+    'modifications',
+    'styles',
+)
+
 # Complete exact-build inventory of literal dictionary subscripts whose base
 # is the raw Account ``serverSettings`` mapping.  The scanner below discovers
 # these from bytecode data flow (direct attribute or a local alias), so a new
@@ -363,10 +529,42 @@ def _load_producers(port_root):
     with open(data_path, 'rb') as source_file:
         source = source_file.read()
     exec compile(source, data_path, 'exec') in namespace
+    selected_vehicle = {
+        'id': 1,
+        'compDescr': 'vehicle-compact-descriptor',
+        'crew': [1001, 1002],
+        'tankmen': {
+            1001: 'commander-compact-descriptor',
+            1002: 'driver-compact-descriptor',
+        },
+        'repair': (0, 100),
+        'lock': (0, 0),
+        'shells': [10010, 20],
+        'shellsLayout': {},
+        'eqs': [0, 0, 0],
+        'eqsLayout': [0, 0, 0],
+        'inventoryItems': {
+            2: {2002: 1}, 3: {2003: 1}, 4: {2004: 1},
+            5: {2005: 1}, 6: {2006: 1}, 7: {2007: 1},
+            10: {10010: 20},
+        },
+        'shopItemPrices': dict(
+            (compact_descr,
+             ({'credits': 0} if compact_descr >= 12000 else
+              {'credits': 0, 'gold': 0}))
+            for compact_descr in (
+                2002, 2003, 2004, 2005, 2006, 2007, 10010,
+                12001, 12002)),
+        'shopNationCount': 9,
+        'customizationItemCount': 2,
+    }
     return {
         'serverSettings': settings,
         'shop': namespace['shop'](),
         'syncData': namespace['sync_data'](),
+        'selectedShop': namespace['shop'](0, selected_vehicle),
+        'selectedSyncData': namespace['sync_data'](
+            0, selected_vehicle),
     }
 
 
@@ -462,6 +660,167 @@ def _check_controller_shapes(producers):
             'syncData.cache.mayConsumeWalletResources must be a bool')
 
 
+def _check_hangar_shapes(producers):
+    shop = producers['selectedShop']
+    sync_data = producers['selectedSyncData']
+    slots_prices = shop.get('slotsPrices')
+    if (not isinstance(slots_prices, (tuple, list)) or
+            len(slots_prices) != 2 or
+            not isinstance(slots_prices[1], (tuple, list)) or
+            not slots_prices[1]):
+        raise ValueError(
+            'shop.slotsPrices must contain a non-empty fallback list')
+
+    berths_prices = shop.get('berthsPrices')
+    if (not isinstance(berths_prices, (tuple, list)) or
+            len(berths_prices) != 3 or
+            not isinstance(berths_prices[1], (int, long)) or
+            isinstance(berths_prices[1], bool) or
+            berths_prices[1] <= 0 or
+            not isinstance(berths_prices[2], (tuple, list)) or
+            not berths_prices[2]):
+        raise ValueError(
+            'shop.berthsPrices must have a positive pack size and prices')
+
+    tankman_cost = shop.get('tankmanCost')
+    required_cost_keys = set((
+        'credits', 'gold', 'roleLevel', 'baseRoleLoss',
+        'classChangeRoleLoss', 'isPremium'))
+    if (not isinstance(tankman_cost, (tuple, list)) or
+            len(tankman_cost) != 3 or
+            any(not isinstance(cost, dict) or
+                set(cost) != required_cost_keys for cost in tankman_cost)):
+        raise ValueError(
+            'shop.tankmanCost must contain three complete recruitment costs')
+
+    free_xp_conversion = shop.get('freeXPConversion')
+    if (not isinstance(free_xp_conversion, (tuple, list)) or
+            len(free_xp_conversion) != 2 or
+            not isinstance(free_xp_conversion[0], (int, long, float)) or
+            isinstance(free_xp_conversion[0], bool) or
+            free_xp_conversion[0] <= 0):
+        raise ValueError(
+            'shop.freeXPConversion must have a positive first divisor')
+    tankman_xp_rate = shop.get('freeXPToTManXPRate')
+    default_tankman_xp_rate = shop.get('defaults', {}).get(
+        'freeXPToTManXPRate')
+    if (not isinstance(tankman_xp_rate, (int, long, float)) or
+            isinstance(tankman_xp_rate, bool) or tankman_xp_rate <= 0 or
+            tankman_xp_rate != default_tankman_xp_rate):
+        raise ValueError(
+            'shop.freeXPToTManXPRate must be positive and match defaults')
+
+    nation_count = None
+    nation_indexed_mapping_keys = (
+        'inscriptionGroupPriceFactors', 'camouflagePriceFactors')
+    nation_indexed_set_keys = (
+        'notInShopInscriptionGroups', 'notInShopCamouflages')
+    for item_scope in (shop.get('items', {}),
+                       shop.get('defaults', {}).get('items', {})):
+        for key in nation_indexed_mapping_keys + nation_indexed_set_keys:
+            value = item_scope.get(key)
+            if not isinstance(value, (tuple, list)) or not value:
+                raise ValueError(
+                    'shop items %s must be indexed for every nation' % key)
+            if nation_count is None:
+                nation_count = len(value)
+            elif len(value) != nation_count:
+                raise ValueError(
+                    'shop nation-indexed item arrays must have equal lengths')
+            expected_type = dict if key in nation_indexed_mapping_keys else set
+            if any(not isinstance(entry, expected_type) for entry in value):
+                raise ValueError(
+                    'shop items %s contains invalid nation entries' % key)
+
+    vehicle_data = sync_data['inventory'][1]
+    vehicle_id = 1
+    crew = vehicle_data['crew'].get(vehicle_id)
+    tankmen_data = sync_data['inventory'][8]
+    if (not crew or set(crew) != set(tankmen_data['compDescr']) or
+            any(tankmen_data['vehicle'].get(tankman_id) != vehicle_id
+                for tankman_id in crew)):
+        raise ValueError(
+            'selected vehicle crew/tankman foreign keys are incomplete')
+    if vehicle_data['lastCrew'].get(vehicle_id) is not None:
+        raise ValueError(
+            'selected vehicle without crew history must omit lastCrew entry')
+    if (len(vehicle_data['lock'][vehicle_id]) != 2 or
+            len(vehicle_data['repair'][vehicle_id]) != 2):
+        raise ValueError('selected vehicle lock/repair must be two-tuples')
+    if (len(vehicle_data['eqs'][vehicle_id]) != 3 or
+            len(vehicle_data['eqsLayout'][vehicle_id]) != 3):
+        raise ValueError('selected vehicle equipment layouts need three slots')
+    shells = vehicle_data['shells'][vehicle_id]
+    if not shells or len(shells) % 2:
+        raise ValueError(
+            'selected vehicle shells must be descriptor/count pairs')
+
+    prices = shop['items']['itemPrices']
+    required_prices = set()
+    for item_type in (2, 3, 4, 5, 6, 7, 10):
+        items = sync_data['inventory'][item_type]
+        if not items:
+            raise ValueError(
+                'selected vehicle item type %d is empty' % item_type)
+        required_prices.update(items)
+    if not required_prices.issubset(set(prices)):
+        raise ValueError(
+            'installed modules and shells are missing from shop.itemPrices')
+    for compact_descr, price in prices.items():
+        if isinstance(price, dict):
+            currencies = set(price)
+            if (not currencies or
+                    not currencies.issubset(
+                        set(('credits', 'gold', 'crystal')))):
+                raise ValueError(
+                    'shop price %r has invalid currencies' % compact_descr)
+        elif not isinstance(price, tuple) or len(price) < 2:
+            raise ValueError(
+                'shop price %r is not accepted by ItemsPrices' %
+                compact_descr)
+
+
+def _check_bootstrap_selected_vehicle(port_root):
+    path = os.path.join(
+        port_root, 'src', 'res', 'scripts', 'client', 'gui', 'mods',
+        'offline_lan_0922', 'bootstrap.py')
+    with open(path, 'rb') as source_file:
+        root = compile(source_file.read(), path, 'exec')
+    functions = dict(_walk_code(root))
+    code = functions.get('_selected_vehicle')
+    if code is None:
+        raise ValueError('bootstrap.py is missing _selected_vehicle')
+    missing_names = sorted(
+        set(BOOTSTRAP_SELECTED_VEHICLE_NAMES) - set(code.co_names))
+    missing_literals = sorted(
+        set(BOOTSTRAP_SELECTED_VEHICLE_LITERALS) - set(code.co_consts))
+    if missing_names or missing_literals:
+        raise ValueError(
+            'bootstrap selected vehicle contract changed; names=%r literals=%r' %
+            (missing_names, missing_literals))
+
+
+def _check_shop_item_prices_boundary(port_root):
+    path = os.path.join(
+        port_root, 'src', 'res', 'scripts', 'client', 'gui', 'mods',
+        'offline_lan_0922', 'account_rpc', 'requests.py')
+    with open(path, 'rb') as source_file:
+        root = compile(source_file.read(), path, 'exec')
+    functions = dict(_walk_code(root))
+    wrapper = functions.get('_wrap_shop_item_prices')
+    sync_shop = functions.get('_sync_shop')
+    if wrapper is None or sync_shop is None:
+        raise ValueError('shop request path is missing itemPrices wrapper')
+    if ('ItemsPrices' not in wrapper.co_names or
+            'itemPrices' not in wrapper.co_consts or
+            'items' not in wrapper.co_consts or
+            'defaults' not in wrapper.co_consts):
+        raise ValueError(
+            'shop itemPrices wrapper no longer converts current and defaults')
+    if '_wrap_shop_item_prices' not in sync_shop.co_names:
+        raise ValueError('shop sync no longer applies the itemPrices wrapper')
+
+
 def audit(client_root, port_root):
     package_path = os.path.join(
         os.path.abspath(client_root), 'res', 'packages', 'scripts.pkg')
@@ -475,6 +834,8 @@ def audit(client_root, port_root):
     safe_stats_evidence = []
     raw_settings_evidence = []
     lobby_callbacks = []
+    hangar_cardinality_evidence = []
+    hangar_semantic_evidence = []
 
     with zipfile.ZipFile(package_path, 'r') as archive:
         names = set(archive.namelist())
@@ -623,6 +984,49 @@ def audit(client_root, port_root):
             })
 
         _check_controller_shapes(producer_values)
+        _check_hangar_shapes(producer_values)
+        _check_bootstrap_selected_vehicle(os.path.abspath(port_root))
+        _check_shop_item_prices_boundary(os.path.abspath(port_root))
+
+        for requirement in HANGAR_CARDINALITY_CONSUMERS:
+            root = _read_code(archive, requirement['member'])
+            functions = dict(_walk_code(root))
+            code = functions.get(requirement['function'])
+            if code is None:
+                raise ValueError(
+                    '%s: missing %s' %
+                    (requirement['member'], requirement['function']))
+            lines = {}
+            for index in requirement['directIndices']:
+                index_lines = _literal_subscript_lines(code, index)
+                if not index_lines:
+                    raise ValueError(
+                        '%s:%s no longer directly indexes %r' %
+                        (requirement['member'], requirement['function'],
+                         index))
+                lines[str(index)] = index_lines
+            hangar_cardinality_evidence.append(dict(
+                requirement, lines=lines))
+
+        for requirement in HANGAR_SEMANTIC_CONSUMERS:
+            root = _read_code(archive, requirement['member'])
+            functions = dict(_walk_code(root))
+            code = functions.get(requirement['function'])
+            if code is None:
+                raise ValueError(
+                    '%s: missing %s' %
+                    (requirement['member'], requirement['function']))
+            missing_names = sorted(
+                set(requirement['requiredNames']) - set(code.co_names))
+            opcodes = set(item['opname'] for item in _instructions(code))
+            missing_opcodes = sorted(
+                set(requirement['requiredOpcodes']) - opcodes)
+            if missing_names or missing_opcodes:
+                raise ValueError(
+                    '%s:%s semantic contract changed; names=%r opcodes=%r' %
+                    (requirement['member'], requirement['function'],
+                     missing_names, missing_opcodes))
+            hangar_semantic_evidence.append(dict(requirement))
 
         controller_members = [
             name for name in names
@@ -656,6 +1060,20 @@ def audit(client_root, port_root):
             'syncData.stats.refSystem': 'mapping',
             'syncData.stats.money': 'numeric credits/gold/crystal',
             'syncData.cache.mayConsumeWalletResources': 'bool',
+        },
+        'hangarCardinalityConsumers': hangar_cardinality_evidence,
+        'hangarSemanticConsumers': hangar_semantic_evidence,
+        'shopItemPricesBoundary': {
+            'currentAndDefaultsWrappedAsItemsPrices': True,
+        },
+        'selectedVehicleProducer': {
+            'requiredComponentItemTypes': [2, 3, 4, 5, 6, 7],
+            'shellItemType': 10,
+            'crewTankmanForeignKeys': True,
+            'moduleAndShellPrices': True,
+            'equipmentSlots': 3,
+            'customizationItemCatalog': True,
+            'nationIndexedCustomizationFactors': True,
         },
         'conditionalRankedKeysWhenEnabled': [
             'serverSettings.ranked_config.cycleTimes',

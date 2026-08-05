@@ -82,12 +82,19 @@
       "shellsLayout",
       "lock"
     ],
-    "selectedVehicleTupleArities": {"repair": 2},
+    "selectedVehicleTupleArities": {"repair": 2, "lock": 2},
+    "selectedVehicleSequenceLengths": {"eqs": 3, "eqsLayout": 3},
     "selectedVehicleMappingValues": ["shellsLayout"],
-    "tankmanDirectKeys": ["vehicle", "compDescr"]
+    "tankmanDirectKeys": ["vehicle", "compDescr"],
+    "requiredComponentItemTypeIndices": [2, 3, 4, 5, 6, 7],
+    "shellItemTypeIndex": 10,
+    "shellLayoutIsDescriptorCountPairs": true,
+    "crewMustBeNonEmpty": true,
+    "crewTankmanForeignKeysMustMatch": true
   },
   "accountValidator": {
-    "emptyItemTypeIndices": [2, 3, 4, 5, 6, 7, 9, 10, 11, 12],
+    "emptyItemTypeIndicesWithoutSelectedVehicle": [2, 3, 4, 5, 6, 7, 9, 10, 11, 12],
+    "emptyItemTypeIndicesWithSelectedVehicle": [9, 11, 12],
     "vehicleCompDescrIsMapping": true,
     "tankmanCompDescrIsMapping": true,
     "eliteVehiclesIsIterable": true,
@@ -104,7 +111,10 @@
       "goodies",
       "berthsPrices",
       "slotsPrices",
+      "dropSkillsCost",
+      "tankmanCost",
       "freeXPConversion",
+      "freeXPToTManXPRate",
       "paidRemovalCost"
     ],
     "itemsDirectKeys": [
@@ -113,14 +123,48 @@
       "vehiclesNotToBuy",
       "vehiclesRentPrices",
       "vehiclesToSellForGold",
-      "vehicleSellPriceFactors"
+      "vehicleSellPriceFactors",
+      "inscriptionGroupPriceFactors",
+      "notInShopInscriptionGroups",
+      "camouflagePriceFactors",
+      "notInShopCamouflages",
+      "playerEmblemGroupPriceFactors",
+      "notInShopPlayerEmblemGroups",
+      "vehicleCamouflagePriceFactors",
+      "vehicleHornPriceFactors"
+    ],
+    "nationIndexedMappingItemKeys": [
+      "inscriptionGroupPriceFactors",
+      "camouflagePriceFactors"
+    ],
+    "nationIndexedSetItemKeys": [
+      "notInShopInscriptionGroups",
+      "notInShopCamouflages"
     ],
     "goodiesDirectKeys": ["prices", "notInShop", "goodies"],
     "tupleArities": {
       "berthsPrices": 3,
       "slotsPrices": 2,
-      "freeXPConversion": 2
+      "freeXPConversion": 2,
+      "tankmanCost": 3
     },
+    "nonEmptyPriceScheduleIndices": {
+      "berthsPrices": 2,
+      "slotsPrices": 1
+    },
+    "positiveIntegerIndices": {
+      "berthsPrices": 1,
+      "freeXPConversion": 0
+    },
+    "positiveIntegerValues": ["freeXPToTManXPRate"],
+    "tankmanCostDirectKeys": [
+      "credits",
+      "gold",
+      "roleLevel",
+      "baseRoleLoss",
+      "classChangeRoleLoss",
+      "isPremium"
+    ],
     "currencyMappings": ["paidRemovalCost"],
     "refSystem": {
       "directKeys": [

@@ -10,7 +10,7 @@ import zipfile
 
 
 MOD_ID = 'org.peng.offline_lan_0922'
-MOD_VERSION = '0.3.0'
+MOD_VERSION = '0.3.1'
 PYTHON_MAGIC = '\x03\xf3\r\n'
 
 

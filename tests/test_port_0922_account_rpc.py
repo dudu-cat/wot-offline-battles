@@ -1,3 +1,4 @@
+import copy
 import inspect
 import json
 import pickle
@@ -25,6 +26,33 @@ CONTRACT_PATH = (
     'account_lobby_consumer_contract.json')
 CONTRACT = json.loads(CONTRACT_PATH.read_text(encoding='utf-8'))
 
+SELECTED_VEHICLE = {
+    'id': 9,
+    'compDescr': b'compact',
+    'crew': [101, 102],
+    'tankmen': {101: b'commander', 102: b'driver'},
+    'repair': (0, 100),
+    'lock': (0, 0),
+    'shells': [10010, 20, 10011, 10],
+    'shellsLayout': {},
+    'eqs': [0, 0, 0],
+    'eqsLayout': [0, 0, 0],
+    'inventoryItems': {
+        2: {2002: 1}, 3: {2003: 1}, 4: {2004: 1},
+        5: {2005: 1}, 6: {2006: 1}, 7: {2007: 1},
+        10: {10010: 20, 10011: 10},
+    },
+    'shopItemPrices': dict(
+        (compact_descr,
+         ({'credits': 0} if compact_descr >= 12000 else
+          {'credits': 0, 'gold': 0}))
+        for compact_descr in (
+            2002, 2003, 2004, 2005, 2006, 2007, 10010, 10011,
+            12001, 12002)),
+    'shopNationCount': 9,
+    'customizationItemCount': 2,
+}
+
 
 def _contract_path(values, path):
     """Resolve one producer path from the machine-readable lobby contract."""
@@ -51,12 +79,19 @@ class _Player(object):
         self.ext_responses.append((request_id, result_id, error, ext))
 
 
+class _ItemsPrices(dict):
+    """Test double for exact #1513 items.ItemsPrices."""
+    def getPrices(self, compact_descr):
+        return self[compact_descr]
+
+
 class AccountRpcTests(unittest.TestCase):
     def setUp(self):
         self.pending = []
         self.player = _Player()
         self.server = FakeServer(lambda: self.player,
-                                 lambda delay, fn: self.pending.append((delay, fn)))
+                                 lambda delay, fn: self.pending.append((delay, fn)),
+                                 {'items_prices_factory': _ItemsPrices})
 
     def _run(self):
         self.assertTrue(self.pending)
@@ -74,7 +109,8 @@ class AccountRpcTests(unittest.TestCase):
         active = [self.player]
         server = FakeServer(
             lambda: active[0],
-            lambda delay, fn: self.pending.append((delay, fn)))
+            lambda delay, fn: self.pending.append((delay, fn)),
+            {'items_prices_factory': _ItemsPrices})
 
         server.doCmdInt3(39, commands.CMD_REQ_SERVER_STATS, 0, 0, 0)
         active[0] = None
@@ -86,7 +122,8 @@ class AccountRpcTests(unittest.TestCase):
         active = [self.player]
         server = FakeServer(
             lambda: active[0],
-            lambda delay, fn: self.pending.append((delay, fn)))
+            lambda delay, fn: self.pending.append((delay, fn)),
+            {'items_prices_factory': _ItemsPrices})
 
         server.doCmdInt3(40, commands.CMD_SYNC_SHOP, 0, 0, 0)
         self._run()
@@ -193,6 +230,9 @@ class AccountRpcTests(unittest.TestCase):
         self.assertEqual(zlib.crc32(payload) & 0xffffffff, crc)
         self.assertEqual(crc, original_crc)
         shop = pickle.loads(zlib.decompress(payload))
+        self.assertIsInstance(shop['items']['itemPrices'], _ItemsPrices)
+        self.assertIsInstance(
+            shop['defaults']['items']['itemPrices'], _ItemsPrices)
         self.assertEqual(0.5, shop['sellPriceFactor'])
         shop_contract = CONTRACT['shop']
         self.assertTrue(set(shop_contract['directKeys']).issubset(shop))
@@ -208,6 +248,17 @@ class AccountRpcTests(unittest.TestCase):
             set(shop['defaults']['goodies']))
         for key, arity in shop_contract['tupleArities'].items():
             self.assertEqual(arity, len(shop[key]), key)
+        for key, index in shop_contract[
+                'nonEmptyPriceScheduleIndices'].items():
+            self.assertTrue(shop[key][index], key)
+        for key, index in shop_contract['positiveIntegerIndices'].items():
+            self.assertGreater(shop[key][index], 0, key)
+        for key in shop_contract['positiveIntegerValues']:
+            self.assertGreater(shop[key], 0, key)
+            self.assertEqual(shop[key], shop['defaults'][key])
+        for cost in shop['tankmanCost']:
+            self.assertEqual(
+                set(shop_contract['tankmanCostDirectKeys']), set(cost))
         for key in shop_contract['currencyMappings']:
             self.assertIsInstance(shop[key], dict)
             self.assertEqual(0, shop[key].get('gold'))
@@ -273,7 +324,10 @@ class AccountRpcTests(unittest.TestCase):
         server = FakeServer(
             lambda: self.player,
             lambda delay, fn: self.pending.append((delay, fn)),
-            {'selected_vehicle': {'id': 9, 'compDescr': b'compact'}})
+            {
+                'selected_vehicle': SELECTED_VEHICLE,
+                'items_prices_factory': _ItemsPrices,
+            })
         server.doCmdInt3(35, commands.CMD_SYNC_DATA, 0, 0, 0)
         self._run()
         data = pickle.loads(self.player.ext_responses[0][3])
@@ -293,24 +347,129 @@ class AccountRpcTests(unittest.TestCase):
             self.assertEqual(arity, len(vehicle_data[key][9]), key)
         for key in inventory_contract['selectedVehicleMappingValues']:
             self.assertIsInstance(vehicle_data[key][9], dict)
-        self.assertEqual((0, 0), vehicle_data['repair'][9])
+        for key, length in inventory_contract[
+                'selectedVehicleSequenceLengths'].items():
+            self.assertEqual(length, len(vehicle_data[key][9]), key)
+        self.assertEqual((0, 100), vehicle_data['repair'][9])
+        self.assertEqual((0, 0), vehicle_data['lock'][9])
+        self.assertEqual([101, 102], vehicle_data['crew'][9])
+        self.assertNotIn(9, vehicle_data['lastCrew'])
+        self.assertEqual(
+            {101: b'commander', 102: b'driver'},
+            data['inventory'][8]['compDescr'])
+        self.assertEqual(
+            {101: 9, 102: 9}, data['inventory'][8]['vehicle'])
+        self.assertEqual(
+            set(vehicle_data['crew'][9]),
+            set(data['inventory'][8]['compDescr']))
+        for item_type in inventory_contract[
+                'requiredComponentItemTypeIndices']:
+            self.assertTrue(data['inventory'][item_type], item_type)
+        shell_type = inventory_contract['shellItemTypeIndex']
+        self.assertTrue(data['inventory'][shell_type])
+        self.assertEqual(0, len(vehicle_data['shells'][9]) % 2)
         self.assertEqual({}, data['inventory'][1]['shellsLayout'][9])
         self.assertEqual(
             ((86400, ''), (604800, '')), data['stats']['playLimits'])
-        self.assertEqual({}, data['inventory'][6])
+        self.assertEqual({}, data['inventory'][9])
+        self.assertEqual({}, data['inventory'][11])
+        self.assertEqual({}, data['inventory'][12])
+
+    def test_incomplete_selected_vehicle_is_rejected_before_hangar_build(self):
+        with self.assertRaisesRegex(ValueError, 'crew and tankmen'):
+            account_data.sync_data(
+                selected_vehicle={'id': 9, 'compDescr': b'compact'})
+
+    def test_selected_vehicle_relational_contract_rejects_semantic_empties(self):
+        cases = (
+            ('crew and tankmen', lambda value: value.update(crew=[])),
+            ('crew ids must resolve',
+             lambda value: value['tankmen'].pop(102)),
+            ('lock must contain two', lambda value: value.update(lock=0)),
+            ('health must be positive',
+             lambda value: value.update(repair=(0, 0))),
+            ('eqs must contain three', lambda value: value.update(eqs=[])),
+            ('descriptor/count pairs',
+             lambda value: value.update(shells=[10010])),
+            ('item type 4 must be non-empty',
+             lambda value: value['inventoryItems'].__setitem__(4, {})),
+            ('must have shop prices',
+             lambda value: value['shopItemPrices'].pop(2004)),
+            ('must contain valid currencies',
+             lambda value: value['shopItemPrices'].__setitem__(
+                 2004, {'bonds': 0})),
+            ('must be a currency mapping or tuple',
+             lambda value: value['shopItemPrices'].__setitem__(
+                 2004, [0, 0])),
+            ('shell layout and inventory must match',
+             lambda value: value['inventoryItems'][10].__setitem__(
+                 10010, 19)),
+            ('shop nation count must be positive',
+             lambda value: value.update(shopNationCount=0)),
+            ('customization catalogue must be non-empty',
+             lambda value: value.update(customizationItemCount=0)),
+        )
+        for message, mutate in cases:
+            selected = copy.deepcopy(SELECTED_VEHICLE)
+            mutate(selected)
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    account_data.sync_data(selected_vehicle=selected)
+
+    def test_selected_vehicle_shop_catalog_prices_every_required_item(self):
+        server = FakeServer(
+            lambda: self.player,
+            lambda delay, fn: self.pending.append((delay, fn)),
+            {
+                'selected_vehicle': SELECTED_VEHICLE,
+                'items_prices_factory': _ItemsPrices,
+            })
+        server.doCmdInt3(46, commands.CMD_SYNC_SHOP, 0, 0, 0)
+        self._run()
+        self._run()
+        shop = pickle.loads(zlib.decompress(self.player.streams[-1][2]))
+        prices = shop['items']['itemPrices']
+        self.assertIsInstance(prices, _ItemsPrices)
+        self.assertEqual(set(SELECTED_VEHICLE['shopItemPrices']), set(prices))
+        self.assertEqual({'credits': 0}, prices[12001])
+        self.assertEqual({'credits': 0}, prices[12002])
+        self.assertEqual(prices, shop['defaults']['items']['itemPrices'])
+        for key in CONTRACT['shop']['nationIndexedMappingItemKeys']:
+            self.assertEqual(
+                SELECTED_VEHICLE['shopNationCount'],
+                len(shop['items'][key]), key)
+            self.assertEqual(
+                SELECTED_VEHICLE['shopNationCount'],
+                len(shop['defaults']['items'][key]), key)
+            self.assertTrue(all(
+                isinstance(value, dict) for value in shop['items'][key]))
+        for key in CONTRACT['shop']['nationIndexedSetItemKeys']:
+            self.assertEqual(
+                SELECTED_VEHICLE['shopNationCount'],
+                len(shop['items'][key]), key)
+            self.assertEqual(
+                SELECTED_VEHICLE['shopNationCount'],
+                len(shop['defaults']['items'][key]), key)
+            self.assertTrue(all(
+                isinstance(value, set) for value in shop['items'][key]))
 
     def test_account_validator_receives_only_validatable_inventory_shapes(self):
         value = account_data.sync_data()
         inventory = value['inventory']
         validator = CONTRACT['accountValidator']
 
-        for item_type in validator['emptyItemTypeIndices']:
+        for item_type in validator['emptyItemTypeIndicesWithoutSelectedVehicle']:
             self.assertEqual({}, inventory[item_type], item_type)
         self.assertIsInstance(inventory[1]['compDescr'], Mapping)
         self.assertIsInstance(inventory[8]['compDescr'], Mapping)
         self.assertIsInstance(value['stats']['eliteVehicles'], set)
         self.assertEqual({}, inventory[1]['compDescr'])
         self.assertEqual({}, inventory[8]['compDescr'])
+
+        selected_inventory = account_data.sync_data(
+            selected_vehicle=SELECTED_VEHICLE)['inventory']
+        for item_type in validator['emptyItemTypeIndicesWithSelectedVehicle']:
+            self.assertEqual({}, selected_inventory[item_type], item_type)
 
         bootstrap = (
             CLIENT_SCRIPTS / 'gui' / 'mods' / 'offline_lan_0922' /

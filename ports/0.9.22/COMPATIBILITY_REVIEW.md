@@ -5,7 +5,7 @@ This review is pinned to the Chinese HD client whose `version.xml` reports
 CPython 2.7 bytecode magic `03 f3 0d 0a`; the embedded build identifies itself
 as Python 2.7.7.
 
-The goal of version 0.3.0 is a complete playable vertical path, not another
+The goal of version 0.3.1 is a complete playable vertical path, not another
 login-only probe: local Account -> stock Lobby/map selection -> native map and
 Avatar -> native Vehicle entities -> local movement/aim/fire -> synchronized
 humans and bots -> damage/death/result -> cleanup -> a second round.
@@ -257,7 +257,7 @@ The pure-data server planner emits revisioned global `bot_orders`, which the
 0.9.22 authority now uses for macro targets after reporting bounded visibility
 observations. BigWorld terrain, collision, water and slope probes remain local,
 and the client planner is a fallback when no server order is available.
-Base-capture rules are not part of 0.3.0; standard battles currently end by
+Base-capture rules are not part of 0.3.1; standard battles currently end by
 elimination.
 
 ## Reference implementations reviewed

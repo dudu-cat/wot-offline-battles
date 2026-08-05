@@ -1,4 +1,4 @@
-World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.0
+World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.1
 ================================================================
 
 This folder is directly mergeable into the frozen Chinese HD client root.
@@ -22,7 +22,7 @@ Install
 3. Copy this folder's `mods` directory into the game root.
 4. Confirm this file exists:
 
-       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.0.wotmod
+       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.1.wotmod
 
 5. If the server is on another machine, edit:
 
@@ -63,7 +63,7 @@ Troubleshooting
 ---------------
 
 - `unsupported compression type`: an older or incorrectly compressed wotmod
-  is still present. Keep only the 0.3.0 package; its members use Store method.
+  is still present. Keep only the 0.3.1 package; its members use Store method.
 - No connection in the server terminal: check `config.json`, the host LAN IP,
   virtual-machine network mode and TCP 28782 firewall access.
 - A traceback appears: close the client and keep `python.log`; it identifies the

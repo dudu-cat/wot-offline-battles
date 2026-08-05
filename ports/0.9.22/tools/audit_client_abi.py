@@ -60,6 +60,65 @@ EXPECTED_ABI = {
         '_PersonalMissionsProgressRequester._response': (
             'self', 'resID', 'value', 'callback'),
     },
+    'scripts/common/items/tankmen.pyc': {
+        'generateTankmen': (
+            'nationID', 'vehicleTypeID', 'roles', 'isPremium',
+            'roleLevel', 'skillsMask', 'isPreview'),
+        'TankmanDescr.__init__': ('self', 'compactDescr', 'battleOnly'),
+    },
+    'scripts/common/items/__init__.pyc': {
+        'ItemsPrices.__init__': ('self', 'prices'),
+        'ItemsPrices.getPrices': ('self', 'descriptor'),
+        'makeIntCompactDescrByID': (
+            'itemTypeName', 'nationID', 'itemID'),
+    },
+    'scripts/common/items/vehicles.pyc': {
+        'VehicleDescr': ('compactDescr', 'typeID', 'typeName'),
+        'getDefaultAmmoForGun': ('gunDescr',),
+        'Cache.customization20': ('self',),
+    },
+    'scripts/common/items/VehicleDescrCrew.pyc': {
+        'VehicleDescrCrew.__init__': (
+            'self', 'vehicleDescr', 'crewCompactDescrs',
+            'mainSkillQualifiersApplier', 'activityFlags', 'isFire',
+            'stunFactors'),
+        'VehicleDescrCrew._validateAndComputeCrew': ('self',),
+    },
+    'scripts/common/items/item_price.pyc': {
+        'getNextSlotPrice': ('slots', 'slotsPrices'),
+        'getNextBerthPackPrice': ('berths', 'berthsPrices'),
+    },
+    'scripts/client/gui/shared/items_parameters/functions.pyc': {
+        'extractCrewDescrs': ('vehicle', 'replaceNone'),
+    },
+    'scripts/client/gui/shared/utils/requesters/ItemsRequester.pyc': {
+        'ItemsRequester.getItemsEx': (
+            'self', 'itemTypeIDs', 'criteria', 'nationID'),
+    },
+    'scripts/client/gui/shared/utils/requesters/parsers/ShopDataParser.pyc': {
+        'ShopDataParser.getItemsIterator': (
+            'self', 'nationID', 'itemTypeID'),
+    },
+    'scripts/client/gui/shared/gui_items/Vehicle.pyc': {
+        'Vehicle._calcCrewBonuses': ('self', 'crew', 'proxy'),
+        'Vehicle._buildCrew': ('self', 'crew', 'proxy'),
+        'Vehicle._parseShells': (
+            'self', 'layoutList', 'defaultLayoutList', 'proxy'),
+        'Vehicle.isLocked': ('self',),
+        'Vehicle.typeOfLockingArena': ('self',),
+    },
+    'scripts/client/gui/Scaleform/daapi/view/lobby/hangar/'
+    'AmmunitionPanel.pyc': {
+        'getFittingSlotsData': (
+            'vehicle', 'slotsRange', 'VoClass', 'itemsCache'),
+    },
+    'scripts/client/gui/Scaleform/daapi/view/lobby/shared/'
+    'fitting_slot_vo.pyc': {
+        'FittingSlotVO._prepareModule': (
+            'self', 'modulesData', 'vehicle', 'slotType', 'slotId'),
+        'HangarFittingSlotVO._prepareModule': (
+            'self', 'modulesData', 'vehicle', 'slotType', 'slotId'),
+    },
     'scripts/client/Avatar.pyc': {
         'PlayerAvatar.__init__': ('self',),
         'PlayerAvatar.onBecomePlayer': ('self',),

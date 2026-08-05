@@ -9,7 +9,7 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.0` replaces the old compatibility slice. It is a server-backed
+Version `0.3.1` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, tactical bots and repeatable rounds. The removed `vertical_slice.py`
@@ -131,8 +131,8 @@ properties and mailboxes at runtime.
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.0.wotmod
-org.peng.offline_lan_0922_0.3.0.wotmod.sha256
+org.peng.offline_lan_0922_0.3.1.wotmod
+org.peng.offline_lan_0922_0.3.1.wotmod.sha256
 WoT-0.9.22-LAN-Client-<package hash>/
 WoT-0.9.22-LAN-Client-<package hash>.zip
 ```
