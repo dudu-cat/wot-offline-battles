@@ -157,7 +157,10 @@ class BattleRuntime(object):
         self._generation = 0
         self._callback_id = None
         self._ammo_callback_id = None
+        self._callback_token = None
+        self._ammo_callback_token = None
         self._deadline = 0.0
+        self._vehicle_ready_deadline = 0.0
         self._map_create_attempted = False
         self._lobby_retire_started = False
         self._avatar = None
@@ -173,6 +176,7 @@ class BattleRuntime(object):
         self._local_yaw = 0.0
         self._last_health = {}
         self._client_ready_received = False
+        self._local_descriptor = None
         self._bot_fire_seen = {}
         self._local_speed = 0.0
         self._input_accumulator = 0.0
@@ -196,6 +200,7 @@ class BattleRuntime(object):
         self._last_frame_time = None
         self._last_health = {}
         self._client_ready_received = False
+        self._local_descriptor = None
         self._bot_fire_seen = {}
         self._local_speed = 0.0
         self._input_accumulator = 0.0
@@ -208,6 +213,7 @@ class BattleRuntime(object):
         self._generation += 1
         self._deadline = self._clock() + float(
             self._config.get('startupTimeoutSeconds', 30.0))
+        self._vehicle_ready_deadline = 0.0
         self.state = 'creating_map'
         self.error = None
         try:
@@ -403,20 +409,38 @@ class BattleRuntime(object):
 
     def _schedule(self, delay, function, ammo=False):
         generation = self._generation
+        token = object()
+        if ammo:
+            self._ammo_callback_token = token
+        else:
+            self._callback_token = token
 
         def invoke():
             if ammo:
-                self._ammo_callback_id = None
+                if self._ammo_callback_token is token:
+                    self._ammo_callback_token = None
+                    self._ammo_callback_id = None
             else:
-                self._callback_id = None
+                if self._callback_token is token:
+                    self._callback_token = None
+                    self._callback_id = None
             if generation == self._generation:
                 function()
 
-        callback_id = self._runtime.bigworld.callback(delay, invoke)
+        try:
+            callback_id = self._runtime.bigworld.callback(delay, invoke)
+        except Exception:
+            if ammo and self._ammo_callback_token is token:
+                self._ammo_callback_token = None
+            elif not ammo and self._callback_token is token:
+                self._callback_token = None
+            raise
         if ammo:
-            self._ammo_callback_id = callback_id
+            if self._ammo_callback_token is token:
+                self._ammo_callback_id = callback_id
         else:
-            self._callback_id = callback_id
+            if self._callback_token is token:
+                self._callback_id = callback_id
 
     def _wait_for_space(self):
         try:
@@ -434,6 +458,8 @@ class BattleRuntime(object):
     def _create_entities(self):
         try:
             self.state = 'loading_entities'
+            self._vehicle_ready_deadline = self._clock() + float(
+                self._config.get('startupTimeoutSeconds', 30.0))
             local = self._local_state()
             descriptor = self._runtime.vehicles.VehicleDescr(
                 typeName=local.get('vehicle', self._config['vehicle']))
@@ -469,14 +495,45 @@ class BattleRuntime(object):
                 'period': 'battle',
             }
             vehicle_id = self._server.addVehicleToArena(snapshot)
-            self._server.bindToVehicle(vehicle_id)
             local_key = 'player:%s' % self.client.player_id
             self._records[local_key] = {
                 'engine_id': vehicle_id, 'state': dict(local),
                 'kind': 'player', 'network_id': self.client.player_id,
-                'local': True}
+                'local': True, 'ready': False}
             self._local_position = position
             self._local_yaw = yaw
+            self._local_descriptor = descriptor
+            self._schedule(0.0, self._wait_for_client_ready)
+        except Exception as error:
+            self._fail(error)
+
+    def _wait_for_client_ready(self):
+        if self.state != 'loading_entities':
+            return
+        try:
+            self._server.flushClientReady()
+            if self._client_ready_received:
+                self._finish_entity_startup()
+                return
+        except Exception as error:
+            self._fail(error)
+            return
+        if self._clock() >= self._vehicle_ready_deadline:
+            self._fail(RuntimeError(
+                'player Vehicle did not enter world before startup timeout'))
+            return
+        self._schedule(0.05, self._wait_for_client_ready)
+
+    def _finish_entity_startup(self):
+        try:
+            descriptor = self._local_descriptor
+            if descriptor is None:
+                raise RuntimeError('player Vehicle descriptor is unavailable')
+            local_key = 'player:%s' % self.client.player_id
+            record = self._records.get(local_key)
+            if record is None:
+                raise RuntimeError('player Vehicle record is unavailable')
+            record['ready'] = True
             self._sync = SnapshotSync(
                 self.client.player_id, on_event=self._apply_sync_event,
                 clock=self._clock)
@@ -495,11 +552,14 @@ class BattleRuntime(object):
                 self._bots.apply_snapshot(self._last_snapshot)
             self.state = 'running'
             self._last_frame_time = self._clock()
-            if self._client_ready_received:
-                self._sender.send_current()
-                self._ammo_tick()
+            self._sender.send_current()
+            self._ammo_tick()
+            if self.state != 'running':
+                return
             if self._battle_result is not None:
                 self._apply_battle_result(self._battle_result)
+            if self.state != 'running':
+                return
             self._schedule(FRAME_SECONDS, self._frame)
         except Exception as error:
             self._fail(error)
@@ -621,8 +681,6 @@ class BattleRuntime(object):
 
     def _on_client_ready(self):
         self._client_ready_received = True
-        if self.state not in ('running', 'loading_entities'):
-            return
         if self.state == 'running':
             self._sender.send_current()
             self._ammo_tick()
@@ -676,16 +734,22 @@ class BattleRuntime(object):
         self._schedule(AMMO_SECONDS, self._ammo_tick, ammo=True)
 
     def on_snapshot(self, message):
-        self._last_snapshot = dict(message or {})
-        if self._last_snapshot.get('battle_result') is not None:
-            self._apply_battle_result(self._last_snapshot['battle_result'])
-        if self._bots is not None:
-            if 'bot_authority_id' in self._last_snapshot:
-                self._reconcile_bot_authority(
-                    self._last_snapshot.get('bot_authority_id'))
-            self._bots.apply_snapshot(self._last_snapshot)
-        if self._sync is not None:
-            self._sync.snapshot(message)
+        if self.state in ('failed', 'stopped'):
+            return
+        try:
+            self._last_snapshot = dict(message or {})
+            if self._last_snapshot.get('battle_result') is not None:
+                self._apply_battle_result(
+                    self._last_snapshot['battle_result'])
+            if self._bots is not None:
+                if 'bot_authority_id' in self._last_snapshot:
+                    self._reconcile_bot_authority(
+                        self._last_snapshot.get('bot_authority_id'))
+                self._bots.apply_snapshot(self._last_snapshot)
+            if self._sync is not None:
+                self._sync.snapshot(message)
+        except Exception as error:
+            self._fail(error)
 
     def _reconcile_bot_authority(self, player_id):
         """Recover authority changes even if the one-shot event was missed."""
@@ -776,6 +840,7 @@ class BattleRuntime(object):
         dt = max(0.0, min(now - self._last_frame_time, 0.1))
         self._last_frame_time = now
         try:
+            self._flush_pending_entities(now)
             self._drive_local(dt)
             if self._sync is not None:
                 self._sync.advance(now)
@@ -994,29 +1059,33 @@ class BattleRuntime(object):
         if event.get('kind') == 'bot' and not all(
                 name in state for name in ('x', 'z')):
             return
-        try:
-            descriptor = self._resolve_descriptor(
-                state.get('vehicle', self._config['vehicle']))
-            properties = self._binding.properties_from_compact_descr(
-                descriptor.makeCompactDescr(), int(state.get('team', 1)),
-                state.get('name', 'Vehicle'))
-            properties['health'] = max(0, min(
-                int(state.get('health', descriptor.maxHealth)),
-                int(descriptor.maxHealth)))
-            position, yaw = self._state_world_pose(state)
-            engine_id = self._binding.create_vehicle(
-                properties, self._vector(position), (yaw, 0.0, 0.0))
-            self._binding.arena_vehicle_added(engine_id, {
-                'properties': properties})
-            self._records[key] = {
-                'engine_id': engine_id, 'state': state,
-                'kind': event.get('kind'), 'network_id': event.get('id'),
-                'local': False}
-        except Exception as error:
-            self._fail(error)
+        descriptor = self._resolve_descriptor(
+            state.get('vehicle', self._config['vehicle']))
+        properties = self._binding.properties_from_compact_descr(
+            descriptor.makeCompactDescr(), int(state.get('team', 1)),
+            state.get('name', 'Vehicle'))
+        properties['health'] = max(0, min(
+            int(state.get('health', descriptor.maxHealth)),
+            int(descriptor.maxHealth)))
+        position, yaw = self._state_world_pose(state)
+        engine_id = self._binding.create_vehicle(
+            properties, self._vector(position), (yaw, 0.0, 0.0))
+        if engine_id is None:
+            raise RuntimeError('createEntity returned no remote Vehicle id')
+        self._records[key] = {
+            'engine_id': engine_id, 'state': state,
+            'kind': event.get('kind'), 'network_id': event.get('id'),
+            'local': False, 'ready': False,
+            'ready_deadline': self._clock() + float(
+                self._config.get('startupTimeoutSeconds', 30.0))}
+        self._binding.arena_vehicle_added(engine_id, {
+            'properties': properties})
+        self._materialize_record(self._records[key])
 
     def _update_entity(self, event):
         record = self._records.get(event.get('entity'))
+        if record is not None and record.get('tombstone'):
+            return
         if record is None:
             state = event.get('state') or {}
             self._create_remote({
@@ -1026,41 +1095,94 @@ class BattleRuntime(object):
             record = self._records.get(event.get('entity'))
             if record is None:
                 return
-        state = dict(event.get('state') or record.get('state') or {})
+        state = dict(record.get('state') or {})
+        state.update(event.get('state') or {})
+        record['state'] = state
         pose = event.get('pose')
         if pose is not None:
-            position = (_number(pose.get('x')), _number(pose.get('y')),
-                        _number(pose.get('z')))
-            ground = self._ground_y(position[0], position[2], position[1])
-            if ground is not None and abs(position[1] - ground) < 8.0:
-                position = (position[0], ground, position[2])
-            yaw = _number(pose.get('yaw'))
-            if record.get('local'):
-                # The server pose is an echo of this client's 30 Hz input.  Do
-                # not rewind the locally driven tank on every delayed snapshot;
-                # retain a coarse correction for real divergence/reconnects.
-                local, unused_yaw = self.local_pose()
-                dx = position[0] - local[0]
-                dz = position[2] - local[2]
-                if dx * dx + dz * dz > 25.0:
-                    self._binding.update_vehicle(
-                        record['engine_id'], self._vector(position),
-                        (yaw, 0.0, 0.0))
-                    self._local_position, self._local_yaw = position, yaw
-                    self._avatar.updateOwnVehiclePosition(
-                        self._vector(position), self._vector((yaw, 0.0, 0.0)),
-                        _number(state.get('speed')), 0.0)
-            else:
+            record['pending_pose'] = dict(pose)
+        self._materialize_record(record)
+
+    def _materialize_record(self, record):
+        if record.get('ready'):
+            ready = True
+        else:
+            status = ('completed', None)
+            status_getter = getattr(self._server, 'vehicleEnterStatus', None)
+            if callable(status_getter):
+                status = status_getter(record['engine_id'])
+            if status[0] == 'failed':
+                raise RuntimeError('Vehicle %s enter failed: %s' % (
+                    record['engine_id'], status[1]))
+            ready = (status[0] == 'completed' and
+                     self._binding.is_vehicle_ready(record['engine_id']))
+            if not ready:
+                return False
+            record['ready'] = True
+        pose = record.pop('pending_pose', None)
+        if pose is not None:
+            self._apply_record_pose(record, pose)
+        self._apply_health(record, record.get('state') or {})
+        return True
+
+    def _apply_record_pose(self, record, pose):
+        state = record.get('state') or {}
+        position = (_number(pose.get('x')), _number(pose.get('y')),
+                    _number(pose.get('z')))
+        ground = self._ground_y(position[0], position[2], position[1])
+        if ground is not None and abs(position[1] - ground) < 8.0:
+            position = (position[0], ground, position[2])
+        yaw = _number(pose.get('yaw'))
+        if record.get('local'):
+            # The server pose is an echo of this client's 30 Hz input.  Do not
+            # rewind the locally driven tank on every delayed snapshot.
+            local, unused_yaw = self.local_pose()
+            dx = position[0] - local[0]
+            dz = position[2] - local[2]
+            if dx * dx + dz * dz > 25.0:
                 self._binding.update_vehicle(
                     record['engine_id'], self._vector(position),
                     (yaw, 0.0, 0.0))
-                self._binding.update_vehicle_aim(
-                    record['engine_id'], yaw,
-                    _number(pose.get('aim_yaw', yaw)),
-                    _number(pose.get('gun_pitch')))
-        if state:
-            record['state'] = state
-            self._apply_health(record, state)
+                self._local_position, self._local_yaw = position, yaw
+                self._avatar.updateOwnVehiclePosition(
+                    self._vector(position), self._vector((yaw, 0.0, 0.0)),
+                    _number(state.get('speed')), 0.0)
+        else:
+            self._binding.update_vehicle(
+                record['engine_id'], self._vector(position),
+                (yaw, 0.0, 0.0))
+            self._binding.update_vehicle_aim(
+                record['engine_id'], yaw,
+                _number(pose.get('aim_yaw', yaw)),
+                _number(pose.get('gun_pitch')))
+
+    def _flush_pending_entities(self, now):
+        for unused_key, record in list(self._records.items()):
+            if record.get('tombstone'):
+                self._flush_tombstone(record)
+                continue
+            if record.get('ready'):
+                continue
+            if self._materialize_record(record):
+                continue
+            deadline = record.get('ready_deadline')
+            if deadline is not None and now >= deadline:
+                raise RuntimeError(
+                    'Vehicle %s did not enter world before timeout' %
+                    record['engine_id'])
+
+    def _flush_tombstone(self, record):
+        """Destroy a remote Vehicle that entered after its network removal."""
+        if record.get('visible_destroy_requested'):
+            return
+        try:
+            entity = self._runtime.bigworld.entity(record['engine_id'])
+        except ReferenceError:
+            entity = None
+        if entity is None:
+            return
+        self._binding.destroy_entity(record['engine_id'])
+        record['visible_destroy_requested'] = True
 
     def _apply_health(self, record, state):
         if 'health' not in state:
@@ -1069,10 +1191,10 @@ class BattleRuntime(object):
         engine_id = record['engine_id']
         if self._last_health.get(engine_id) == health:
             return
-        self._last_health[engine_id] = health
         entity = self._runtime.bigworld.entity(engine_id)
         if entity is None:
             return
+        self._last_health[engine_id] = health
         previous = getattr(entity, 'health', health)
         entity.health = health
         health_changed = getattr(entity, 'onHealthChanged', None)
@@ -1100,9 +1222,30 @@ class BattleRuntime(object):
         if record is None or record.get('local'):
             return
         if event.get('keep_corpse'):
-            self._apply_health(record, {'health': 0})
+            state = dict(record.get('state') or {})
+            state.update(event.get('state') or {})
+            state['health'] = 0
+            state['alive'] = False
+            record['state'] = state
+            self._materialize_record(record)
             return
-        self._records.pop(event.get('entity'), None)
+        if record.get('ready'):
+            self._records.pop(event.get('entity'), None)
+            forget = getattr(self._server, 'forgetVehicleEnter', None)
+            if callable(forget):
+                forget(record['engine_id'])
+        else:
+            # destroyEntity may be called before an asynchronous Vehicle has
+            # entered BigWorld's registry.  Keep a tombstone for the rest of
+            # the round so a late onEnterWorld cannot leave an orphan entity.
+            record['tombstone'] = True
+            record.pop('pending_pose', None)
+            try:
+                visible = self._runtime.bigworld.entity(
+                    record['engine_id']) is not None
+            except ReferenceError:
+                visible = False
+            record['visible_destroy_requested'] = visible
         try:
             self._binding.arena_vehicle_removed(record['engine_id'])
         finally:
@@ -1271,6 +1414,8 @@ class BattleRuntime(object):
             self._runtime.compatibility.restore_lobby_account()
 
     def _cancel_callbacks(self):
+        self._callback_token = None
+        self._ammo_callback_token = None
         for callback_id in (self._callback_id, self._ammo_callback_id):
             if callback_id is not None:
                 try:
@@ -1350,6 +1495,8 @@ class BattleRuntime(object):
         self._last_frame_time = None
         self._last_health = {}
         self._client_ready_received = False
+        self._local_descriptor = None
+        self._vehicle_ready_deadline = 0.0
         self._bot_fire_seen = {}
         self._local_speed = 0.0
         self._input_accumulator = 0.0

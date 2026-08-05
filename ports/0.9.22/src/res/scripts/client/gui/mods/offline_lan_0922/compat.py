@@ -64,11 +64,13 @@ def _load_runtime():
     import BigWorld
     import ChatManager
     import Math
+    import SoundGroups
     import Vehicle
     import constants
     from OfflineMapCreator import g_offlineMapCreator
     from PlayerEvents import g_playerEvents
     from connection_mgr import LOGIN_STATUS
+    from gui.prb_control.dispatcher import g_prbLoader
     from helpers import dependency
     from predefined_hosts import g_preDefinedHosts
     from skeletons.connection_mgr import IConnectionManager
@@ -89,6 +91,8 @@ def _load_runtime():
     runtime.offline_map_creator = g_offlineMapCreator
     runtime.player_events = g_playerEvents
     runtime.predefined_hosts = g_preDefinedHosts
+    runtime.prb_loader = g_prbLoader
+    runtime.sound_groups_module = SoundGroups
     runtime.vehicle_module = Vehicle
     return runtime
 
@@ -439,19 +443,37 @@ class OfflineCompatibility(object):
             return compatibility._original_avatar_getattribute(avatar, name)
 
         def avatar_vehicle_enter(avatar, vehicle):
+            server = None
             if compatibility._battle_active:
                 try:
                     server = compatibility._original_avatar_getattribute(
                         avatar, 'fakeServer')
-                    accept = getattr(server, 'acceptVehicleEnter', None)
-                    if callable(accept):
-                        accept(vehicle.id)
                 except AttributeError:
-                    pass
-            if compatibility._original_avatar_vehicle_enter is not None:
-                return compatibility._original_avatar_vehicle_enter(
-                    avatar, vehicle)
-            return None
+                    server = None
+                accept = getattr(server, 'acceptVehicleEnter', None)
+                if callable(accept):
+                    try:
+                        accept(vehicle.id)
+                    except Exception as error:
+                        fail = getattr(server, 'failVehicleEnter', None)
+                        if callable(fail):
+                            fail(vehicle.id, error)
+                        raise
+            try:
+                if compatibility._original_avatar_vehicle_enter is not None:
+                    result = compatibility._original_avatar_vehicle_enter(
+                        avatar, vehicle)
+                else:
+                    result = None
+            except Exception as error:
+                fail = getattr(server, 'failVehicleEnter', None)
+                if callable(fail):
+                    fail(vehicle.id, error)
+                raise
+            complete = getattr(server, 'completeVehicleEnter', None)
+            if callable(complete):
+                complete(vehicle.id)
+            return result
 
         def avatar_prereqs_loaded(avatar, resource_names, resource_refs):
             if compatibility._fake_connected:
@@ -852,6 +874,24 @@ class OfflineCompatibility(object):
         self._connecting = True
         try:
             try:
+                # Avatar.onBecomePlayer removes the battle dispatcher.  During
+                # Account.showGUI, #1513 broadcasts IGR state before the normal
+                # lobby path recreates it; Hangar remains subscribed and reads
+                # the dispatcher in that window.  Pre-create the idempotent
+                # default dispatcher so the native coroutine can complete.
+                create_dispatcher = getattr(
+                    self._runtime.prb_loader,
+                    'createBattleDispatcher', None)
+                if not callable(create_dispatcher):
+                    raise RuntimeError(
+                        'prebattle dispatcher restore is unavailable')
+                create_dispatcher()
+                get_dispatcher = getattr(
+                    self._runtime.prb_loader, 'getDispatcher', None)
+                if (not callable(get_dispatcher) or
+                        get_dispatcher() is None):
+                    raise RuntimeError(
+                        'prebattle dispatcher restore did not complete')
                 return self._create_account_player()
             except Exception:
                 # A constructor may have partially rebound the shared native
@@ -1018,7 +1058,66 @@ class OfflineCompatibility(object):
         try:
             self.disconnect()
         finally:
+            self._arm_sound_shutdown_guard()
             self._rollback_install()
+
+    def _arm_sound_shutdown_guard(self):
+        """Protect exact #1513's late SoundGroups.destroy zombie lookup.
+
+        game.fini clears the player Entity before guiModsFini calls this mod,
+        but invokes SoundGroups.destroy only afterward.  The engine can retain
+        a PlayerAccount identity whose instance dictionary is already empty;
+        stock destroy then directly reads its deleted inputHandler.  Arm a
+        one-shot instance wrapper that hides only that zombie for the duration
+        of the original destroy call and then removes itself.
+        """
+        module = getattr(self._runtime, 'sound_groups_module', None)
+        instance = getattr(module, 'g_instance', None)
+        if instance is None:
+            return False
+        instance_dict = getattr(instance, '__dict__', None)
+        if instance_dict is None:
+            return False
+        current_destroy = getattr(instance, 'destroy', None)
+        if not callable(current_destroy):
+            return False
+        runtime = self._runtime
+        player_types = (runtime.account_module.PlayerAccount,
+                        runtime.avatar_module.PlayerAvatar)
+
+        def guarded_destroy():
+            player_owner_dict = getattr(runtime.bigworld, '__dict__', {})
+            had_player_attribute = 'player' in player_owner_dict
+            raw_player_attribute = player_owner_dict.get('player')
+            original_player = runtime.bigworld.player
+            temporary_player = None
+            try:
+                try:
+                    player = original_player()
+                except ReferenceError:
+                    player = None
+                if isinstance(player, player_types):
+                    try:
+                        player.inputHandler
+                    except (AttributeError, ReferenceError):
+                        def no_player(*unused_args, **unused_kwargs):
+                            return None
+
+                        temporary_player = no_player
+                        runtime.bigworld.player = temporary_player
+                return current_destroy()
+            finally:
+                if (temporary_player is not None and
+                        runtime.bigworld.player is temporary_player):
+                    if had_player_attribute:
+                        runtime.bigworld.player = raw_player_attribute
+                    else:
+                        delattr(runtime.bigworld, 'player')
+                if instance.__dict__.get('destroy') is guarded_destroy:
+                    delattr(instance, 'destroy')
+
+        instance.destroy = guarded_destroy
+        return True
 
 
 g_compatibility = OfflineCompatibility()

@@ -9,19 +9,25 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.5` replaces the old compatibility slice. It is a server-backed
+Version `0.3.6` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, tactical bots and repeatable rounds. The removed `vertical_slice.py`
 runtime is not packaged as a fallback.
 
-This release fixes the first real Account-to-Avatar transition found in
-`#1513`: `remoteCamera` now uses the exact fixed-dictionary entity schema, and
-both Account and Avatar run their native `onBecomeNonPlayer` lifecycle before
-BigWorld clears their instance data. A recoverable local map-start failure now
-leaves the round without misreporting a LAN transport disconnect; an
-unrecoverable native cleanup failure explicitly retires the fake WoT
-connection instead of leaving a half-connected lobby.
+This release fixes the asynchronous Vehicle-entry boundary exposed by the real
+`#1513` client. A returned client-only entity id is no longer treated as a
+materialized tank: startup waits for native `onEnterWorld`, registry presence,
+`inWorld`, `isStarted` and a descriptor before publishing client ready,
+`AVATAR_READY` and battle period. Pending remote updates are coalesced until the
+same boundary, and a late entity whose network record was already removed is
+destroyed through a retained tombstone instead of becoming an orphan.
+
+Map-start failure now restores the stock prebattle dispatcher before rebuilding
+the Account lobby, while final process shutdown guards the exact late
+`SoundGroups.destroy` lookup against a retired Account. Callback ownership is
+generation-safe, so a late callback from an earlier attempt cannot cancel or
+overwrite the next round.
 
 ## User flow
 
@@ -159,8 +165,8 @@ properties and mailboxes at runtime.
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.5.wotmod
-org.peng.offline_lan_0922_0.3.5.wotmod.sha256
+org.peng.offline_lan_0922_0.3.6.wotmod
+org.peng.offline_lan_0922_0.3.6.wotmod.sha256
 WoT-0.9.22-LAN-Client-<package hash>/
 WoT-0.9.22-LAN-Client-<package hash>.zip
 ```

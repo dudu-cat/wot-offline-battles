@@ -308,6 +308,8 @@ class _BigWorld(object):
         self.operations = []
         self.now = 10.0
         self.next_id = 100
+        self.defer_vehicle_entry = False
+        self.pending_entities = {}
 
     def player(self):
         return self.avatar
@@ -332,10 +334,25 @@ class _BigWorld(object):
             compactDescr=properties['publicInfo']['compDescr'])
         entity = _Vehicle(
             self.next_id, descriptor, position, rotation, properties)
-        self.entities[entity.id] = entity
-        if self.compatibility.bridge is not None:
-            self.compatibility.bridge.acceptVehicleEnter(entity.id)
+        if self.defer_vehicle_entry:
+            self.pending_entities[entity.id] = entity
+        else:
+            self._enter_vehicle(entity)
         return entity.id
+
+    def _enter_vehicle(self, entity):
+        bridge = self.compatibility.bridge
+        if bridge is not None:
+            bridge.acceptVehicleEnter(entity.id)
+            bridge.setClientReady()
+            bridge.completeVehicleEnter(entity.id)
+        # Match #1513: BigWorld.entity(id) becomes visible only after the
+        # native vehicle_onEnterWorld callback has returned.
+        self.entities[entity.id] = entity
+
+    def enter_pending_vehicle(self, entity_id):
+        entity = self.pending_entities.pop(entity_id)
+        self._enter_vehicle(entity)
 
     def destroyEntity(self, entity_id):
         self.entities.pop(entity_id, None)
@@ -346,6 +363,7 @@ class _BigWorld(object):
     def clearEntitiesAndSpaces(self):
         self.operations.append(('clear_entities_spaces',))
         self.entities.clear()
+        self.pending_entities.clear()
         self.avatar = None
 
     def setWatcher(self, name, enabled):
@@ -680,6 +698,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
     def test_map_to_native_vehicle_to_ready_lifecycle(self):
         runtime = _runtime()
+        runtime.bigworld.defer_vehicle_entry = True
         battle = BattleRuntime(runtime)
         client = _Client()
         start = {
@@ -694,13 +713,137 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'name': 'Player'}, start, client))
         runtime.bigworld.callbacks.pop(0)()
 
-        self.assertEqual('running', battle.state)
+        self.assertEqual('loading_entities', battle.state)
         self.assertIsNotNone(battle._server.vehicle_id)
+        self.assertIsNone(runtime.bigworld.entity(battle._server.vehicle_id))
+        runtime.bigworld.enter_pending_vehicle(battle._server.vehicle_id)
+        self.assertEqual('loading_entities', battle.state)
+        runtime.bigworld.callbacks.pop(0)()
+
+        self.assertEqual('running', battle.state)
         self.assertEqual(1, runtime.bigworld.avatar.vehicle_changed)
-        self.assertTrue(battle._server.setClientReady())
         self.assertFalse(battle._server.setClientReady())
         self.assertEqual(500, runtime.bigworld.entity(
             battle._server.vehicle_id).health)
+
+    def test_local_vehicle_ready_timeout_recovers_lobby(self):
+        runtime = _runtime()
+        runtime.bigworld.defer_vehicle_entry = True
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
+
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player', 'startupTimeoutSeconds': 0.5}, start, client))
+        runtime.bigworld.callbacks.pop(0)()
+        runtime.bigworld.now = battle._vehicle_ready_deadline
+        runtime.bigworld.callbacks.pop(0)()
+
+        self.assertEqual('failed', battle.state)
+        self.assertIn('did not enter world', battle.error)
+        self.assertTrue(runtime.compatibility.account_restored)
+
+    def test_vehicle_ready_gets_a_fresh_timeout_after_slow_map_load(self):
+        runtime = _runtime()
+        runtime.bigworld.defer_vehicle_entry = True
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
+
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player', 'startupTimeoutSeconds': 30.0}, start, client))
+        map_deadline = battle._deadline
+        runtime.bigworld.now = map_deadline - 0.1
+        runtime.bigworld.callbacks.pop(0)()
+
+        self.assertEqual('loading_entities', battle.state)
+        self.assertGreater(battle._vehicle_ready_deadline, map_deadline)
+
+    def test_initial_ammo_failure_does_not_leave_a_frame_callback(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
+
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, start, client))
+        runtime.bigworld.avatar.updateVehicleAmmo = mock.Mock(
+            side_effect=RuntimeError('ammo failed'))
+        runtime.bigworld.callbacks.pop(0)()
+        runtime.bigworld.callbacks.pop(0)()
+
+        self.assertEqual('failed', battle.state)
+        self.assertIsNone(battle._callback_id)
+        self.assertIsNone(battle._ammo_callback_id)
+        self.assertEqual([], runtime.bigworld.callbacks)
+
+    def test_stale_callback_cannot_clear_a_new_generation_handle(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._generation = 1
+        old_call = mock.Mock()
+        new_call = mock.Mock()
+
+        battle._schedule(0.0, old_call)
+        old_wrapper = runtime.bigworld.callbacks.pop(0)
+        battle._generation = 2
+        battle._schedule(0.0, new_call)
+        new_handle = battle._callback_id
+
+        old_wrapper()
+
+        self.assertEqual(new_handle, battle._callback_id)
+        self.assertFalse(old_call.called)
+        runtime.bigworld.callbacks.pop(0)()
+        self.assertIsNone(battle._callback_id)
+        new_call.assert_called_once_with()
+
+    def test_local_vehicle_enter_failure_never_publishes_ready(self):
+        runtime = _runtime()
+        runtime.bigworld.defer_vehicle_entry = True
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
+
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, start, client))
+        runtime.bigworld.callbacks.pop(0)()
+        vehicle_id = battle._server.vehicle_id
+        avatar = battle._avatar
+        battle._server.acceptVehicleEnter(vehicle_id)
+        battle._server.failVehicleEnter(
+            vehicle_id, RuntimeError('native enter failed'))
+        runtime.bigworld.callbacks.pop(0)()
+
+        self.assertEqual('failed', battle.state)
+        self.assertIn('native enter failed', battle.error)
+        self.assertFalse(any(
+            update[0] == runtime.constants.ARENA_UPDATE.AVATAR_READY
+            for update in avatar.arena_updates))
 
     def test_local_input_moves_vehicle_and_publishes_pose(self):
         runtime = _runtime()
@@ -828,6 +971,120 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         battle._binding.update_vehicle_aim.assert_called_once_with(
             11, 3.0, -3.0, -0.15)
+
+    def test_remote_update_is_coalesced_until_vehicle_materializes(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._server = types.SimpleNamespace()
+        battle._binding = mock.Mock()
+        battle._binding.is_vehicle_ready.side_effect = lambda entity_id: (
+            runtime.bigworld.entity(entity_id) is not None)
+        battle._records = {
+            'player:2': {
+                'engine_id': 11, 'state': {'health': 500},
+                'kind': 'player', 'network_id': 2, 'local': False,
+                'ready': False, 'ready_deadline': runtime.bigworld.now + 5.0}}
+
+        battle._update_entity({
+            'entity': 'player:2', 'kind': 'player', 'id': 2,
+            'pose': {'x': 4.0, 'y': 0.0, 'z': 8.0, 'yaw': 0.5,
+                     'aim_yaw': 0.7, 'gun_pitch': -0.1},
+            'state': {'health': 125}})
+
+        battle._binding.update_vehicle.assert_not_called()
+        battle._binding.update_vehicle_aim.assert_not_called()
+        self.assertNotIn(11, battle._last_health)
+
+        entity = _Vehicle(11, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[11] = entity
+        battle._flush_pending_entities(runtime.bigworld.now)
+
+        self.assertTrue(battle._records['player:2']['ready'])
+        battle._binding.update_vehicle.assert_called_once()
+        battle._binding.update_vehicle_aim.assert_called_once_with(
+            11, 0.5, 0.7, -0.1)
+        self.assertEqual(125, entity.health)
+        self.assertEqual((125, 0, 0), entity.health_change)
+
+    def test_pending_remote_death_materializes_as_corpse(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._server = types.SimpleNamespace()
+        battle._binding = mock.Mock()
+        battle._binding.is_vehicle_ready.side_effect = lambda entity_id: (
+            runtime.bigworld.entity(entity_id) is not None)
+        battle._records = {
+            'bot:2': {
+                'engine_id': 11, 'state': {'health': 500, 'alive': True},
+                'kind': 'bot', 'network_id': 2, 'local': False,
+                'ready': False, 'ready_deadline': runtime.bigworld.now + 5.0}}
+
+        battle._destroy_entity({
+            'entity': 'bot:2', 'keep_corpse': True,
+            'state': {'health': 0, 'alive': False}})
+        self.assertFalse(battle._records['bot:2']['ready'])
+
+        entity = _Vehicle(11, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[11] = entity
+        battle._flush_pending_entities(runtime.bigworld.now)
+
+        self.assertEqual(0, entity.health)
+        self.assertEqual((0, 0, 0), entity.health_change)
+        battle._binding.arena_vehicle_killed.assert_called_once_with(
+            11, 0, 0)
+
+    def test_pending_remote_destroy_catches_late_world_entry(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._config = {
+            'map': '01_karelia',
+            'vehicle': 'ussr:R11_MS-1',
+            'startupTimeoutSeconds': 30.0}
+        battle._server = types.SimpleNamespace(
+            vehicleEnterStatus=lambda unused_id: ('completed', None))
+        battle._binding = mock.Mock()
+        battle._binding.is_vehicle_ready.side_effect = lambda entity_id: (
+            runtime.bigworld.entity(entity_id) is not None)
+        battle._binding.create_vehicle.side_effect = (
+            lambda properties, position, rotation:
+            runtime.bigworld.createEntity(
+                'Vehicle', 7, 0, position, rotation, properties))
+        battle._binding.properties_from_compact_descr.return_value = {
+            'publicInfo': {'compDescr': 'ussr:R11_MS-1'},
+            'health': 500}
+        runtime.bigworld.defer_vehicle_entry = True
+
+        battle._create_remote({
+            'type': 'create', 'entity': 'bot:2', 'kind': 'bot', 'id': 2,
+            'state': {
+                'team': 2, 'slot': 0, 'x': 5.0, 'z': 5.0,
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}})
+        record = battle._records['bot:2']
+        vehicle_id = record['engine_id']
+        battle._binding.destroy_entity.side_effect = \
+            runtime.bigworld.destroyEntity
+
+        battle._destroy_entity({'entity': 'bot:2'})
+        self.assertTrue(record['tombstone'])
+        self.assertIn(vehicle_id, runtime.bigworld.pending_entities)
+        original_state = dict(record['state'])
+        battle._update_entity({
+            'entity': 'bot:2',
+            'pose': {'x': 99.0, 'y': 0.0, 'z': 99.0},
+            'state': {'health': 1}})
+        self.assertEqual(original_state, record['state'])
+        self.assertNotIn('pending_pose', record)
+
+        runtime.bigworld.enter_pending_vehicle(vehicle_id)
+        self.assertIsNotNone(runtime.bigworld.entity(vehicle_id))
+        battle._flush_pending_entities(runtime.bigworld.now)
+
+        self.assertIsNone(runtime.bigworld.entity(vehicle_id))
+        self.assertTrue(record['visible_destroy_requested'])
 
     def test_terminal_result_notifies_native_hud_once_with_finish_reason(self):
         runtime = _runtime()
@@ -1074,6 +1331,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, start, client))
         runtime.bigworld.callbacks.pop(0)()
+        runtime.bigworld.callbacks.pop(0)()
         self.assertEqual('running', battle.state)
         server = battle._server
 
@@ -1101,6 +1359,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'name': 'Player'}, start, client,
             on_local_leave=local_leave))
         runtime.bigworld.callbacks.pop(0)()
+        runtime.bigworld.callbacks.pop(0)()
         server = battle._server
 
         server.leaveArena({})
@@ -1127,6 +1386,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             self.assertTrue(battle.start({
                 'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
                 'name': 'Player'}, start, client))
+            runtime.bigworld.callbacks.pop(0)()
             runtime.bigworld.callbacks.pop(0)()
             self.assertEqual('running', battle.state)
             self.assertEqual(round_id, battle._sync.round_id)

@@ -40,48 +40,6 @@ def _avatar_bridge_module():
     return module
 
 
-class _Runtime(object):
-    def __init__(self, fail_at=None):
-        self.events = []
-        self.fail_at = fail_at
-
-    def _event(self, name, *args):
-        self.events.append((name,) + args)
-        if name == self.fail_at:
-            raise RuntimeError(name)
-
-    def create_vehicle(self, properties, position, rotation):
-        self._event('create_vehicle', properties, position, rotation)
-        return 91
-
-    def destroy_entity(self, entity_id):
-        self._event('destroy_entity', entity_id)
-
-    def arena_vehicle_added(self, entity_id, snapshot):
-        self._event('arena_vehicle_added', entity_id, snapshot)
-
-    def arena_vehicle_removed(self, entity_id):
-        self._event('arena_vehicle_removed', entity_id)
-
-    def avatar_client_ready(self):
-        self._event('avatar_client_ready')
-
-    def avatar_bind_vehicle(self, entity_id):
-        self._event('avatar_bind_vehicle', entity_id)
-
-    def avatar_ready(self):
-        self._event('avatar_ready')
-
-    def arena_period(self, period):
-        self._event('arena_period', period)
-
-    def update_vehicle(self, entity_id, position, rotation):
-        self._event('update_vehicle', entity_id, position, rotation)
-
-    def send_vehicle_input(self, entity_id, command):
-        self._event('send_vehicle_input', entity_id, command)
-
-
 def _snapshot(**overrides):
     value = {
         'properties': {'typeCompDescr': 17, 'team': 1},
@@ -136,6 +94,7 @@ class _Entity(object):
     def __init__(self):
         self.teleports = []
         self.gunAnglesPacked = 0
+        self.isStarted = True
 
     def teleport(self, position, rotation):
         self.teleports.append((position, rotation))
@@ -200,81 +159,6 @@ class _VehicleDescr(object):
         return str(self.compact_descr)
 
 
-class ArenaVehicleRuntimeTests(unittest.TestCase):
-    def _controller(self, runtime=None):
-        module = _runtime_module()
-        builder = module.EntityPropertyBuilder(('typeCompDescr', 'team'))
-        return module, module.ArenaVehicleRuntime(runtime or _Runtime(), builder)
-
-    def test_strict_creation_readiness_and_snapshot_order(self):
-        runtime = _Runtime()
-        module, controller = self._controller(runtime)
-
-        self.assertEqual(91, controller.start(_snapshot()))
-        controller.apply_snapshot(_snapshot(position=(4.0, 5.0, 6.0)))
-        controller.apply_input({'throttle': 1})
-
-        self.assertEqual(module.ArenaVehicleRuntime.BATTLE, controller.state)
-        self.assertEqual([
-            'create_vehicle', 'arena_vehicle_added', 'avatar_bind_vehicle',
-            'avatar_client_ready', 'avatar_ready', 'arena_period', 'update_vehicle',
-            'arena_period', 'send_vehicle_input'],
-            [event[0] for event in runtime.events])
-
-    def test_rejects_unverified_or_missing_vehicle_properties_before_create(self):
-        runtime = _Runtime()
-        module, controller = self._controller(runtime)
-        with self.assertRaisesRegex(module.EntityStageError,
-                                    'unverified Vehicle properties'):
-            controller.start(_snapshot(properties={
-                'typeCompDescr': 17, 'team': 1, 'health': 100}))
-        self.assertEqual([], runtime.events)
-        with self.assertRaisesRegex(module.EntityStageError,
-                                    'missing exact Vehicle properties'):
-            controller.start(_snapshot(properties={'team': 1}))
-        self.assertEqual([], runtime.events)
-
-    def test_failure_rolls_back_arena_before_entity(self):
-        runtime = _Runtime(fail_at='avatar_client_ready')
-        module, controller = self._controller(runtime)
-
-        with self.assertRaisesRegex(RuntimeError, 'avatar_client_ready'):
-            controller.start(_snapshot())
-
-        self.assertEqual(module.ArenaVehicleRuntime.FAILED, controller.state)
-        self.assertEqual([
-            'create_vehicle', 'arena_vehicle_added', 'avatar_bind_vehicle',
-            'avatar_client_ready', 'arena_vehicle_removed', 'destroy_entity'],
-            [event[0] for event in runtime.events])
-        self.assertIsNone(controller.vehicle_id)
-
-    def test_destroy_is_idempotent_and_input_requires_battle(self):
-        runtime = _Runtime()
-        module, controller = self._controller(runtime)
-        with self.assertRaisesRegex(module.EntityStageError, 'input'):
-            controller.apply_input({'throttle': 1})
-        controller.start(_snapshot())
-        self.assertTrue(controller.destroy())
-        self.assertFalse(controller.destroy())
-        self.assertEqual(module.ArenaVehicleRuntime.DESTROYED, controller.state)
-        self.assertEqual(1, [event[0] for event in runtime.events].count(
-            'arena_vehicle_removed'))
-        self.assertEqual(1, [event[0] for event in runtime.events].count(
-            'destroy_entity'))
-
-    def test_destroy_attempts_entity_cleanup_when_arena_removal_fails(self):
-        runtime = _Runtime(fail_at='arena_vehicle_removed')
-        module, controller = self._controller(runtime)
-        controller.start(_snapshot())
-
-        with self.assertRaisesRegex(RuntimeError, 'arena_vehicle_removed'):
-            controller.destroy()
-
-        self.assertEqual(module.ArenaVehicleRuntime.DESTROYED, controller.state)
-        self.assertIsNone(controller.vehicle_id)
-        self.assertEqual('destroy_entity', runtime.events[-1][0])
-
-
 class BigWorldBindingTests(unittest.TestCase):
     def test_exact_property_contract_and_lifecycle_operations(self):
         module = _binding_module()
@@ -304,7 +188,8 @@ class BigWorldBindingTests(unittest.TestCase):
             properties, (1, 2, 3), (0, 0, 0)))
         snapshot = _snapshot(properties=properties)
         binding.arena_vehicle_added(91, snapshot)
-        binding.avatar_bind_vehicle(91)
+        binding.avatar_select_vehicle(91)
+        binding.avatar_vehicle_entered()
         binding.avatar_client_ready()
         binding.avatar_ready()
         binding.arena_period('battle')
@@ -385,10 +270,32 @@ class BigWorldBindingTests(unittest.TestCase):
         self.assertTrue(binding.self_check())
         self.assertIsNone(binding.arena_vehicle_removed(91))
 
+    def test_vehicle_ready_waits_for_registry_world_start_and_descriptor(self):
+        module = _binding_module()
+        bigworld = _BigWorld()
+        avatar = _Avatar()
+        binding = module.BigWorldVehicleBinding(
+            bigworld, avatar, _Constants, _VehicleDescr,
+            lambda *args: 0, outfit_provider=lambda descriptor: '')
+
+        self.assertFalse(binding.is_vehicle_ready(90))
+        bigworld.entity_value.inWorld = False
+        self.assertFalse(binding.is_vehicle_ready(91))
+        bigworld.entity_value.inWorld = True
+        descriptor = bigworld.entity_value.typeDescriptor
+        bigworld.entity_value.typeDescriptor = None
+        self.assertFalse(binding.is_vehicle_ready(91))
+        bigworld.entity_value.typeDescriptor = descriptor
+        bigworld.entity_value.isStarted = False
+        self.assertFalse(binding.is_vehicle_ready(91))
+        bigworld.entity_value.isStarted = True
+        self.assertTrue(binding.is_vehicle_ready(91))
+
 
 class _BridgeBinding(object):
     def __init__(self):
         self.events = []
+        self.ready = True
 
     def create_vehicle(self, properties, position, rotation):
         self.events.append(('create', properties, position, rotation))
@@ -397,8 +304,14 @@ class _BridgeBinding(object):
     def arena_vehicle_added(self, vehicle_id, snapshot):
         self.events.append(('added', vehicle_id))
 
-    def avatar_bind_vehicle(self, vehicle_id):
-        self.events.append(('bind', vehicle_id))
+    def avatar_select_vehicle(self, vehicle_id):
+        self.events.append(('select', vehicle_id))
+
+    def avatar_vehicle_entered(self):
+        self.events.append(('entered',))
+
+    def is_vehicle_ready(self, vehicle_id):
+        return self.ready
 
     def avatar_client_ready(self):
         self.events.append(('client_ready',))
@@ -425,6 +338,7 @@ class _ReentrantBridgeBinding(_BridgeBinding):
         self.events.append(('create', properties, position, rotation))
         self.bridge.acceptVehicleEnter(91)
         self.bridge.setClientReady()
+        self.bridge.completeVehicleEnter(91)
         return 91
 
 
@@ -505,8 +419,10 @@ class AvatarServerBridgeTests(unittest.TestCase):
                                            account_commands=('sync',))
 
         self.assertEqual(91, bridge.addVehicleToArena(_snapshot()))
-        bridge.bindToVehicle(91)
+        bridge.acceptVehicleEnter(91)
         self.assertTrue(bridge.setClientReady())
+        bridge.completeVehicleEnter(91)
+        self.assertTrue(bridge.flushClientReady())
         self.assertFalse(bridge.setClientReady())
         bridge.syncVehicleAttrs({'radioDistance': 730})
         bridge.vehicle_moveWith(7)
@@ -523,7 +439,7 @@ class AvatarServerBridgeTests(unittest.TestCase):
         bridge.doCmdStr(4, 'sync', '')
         self.assertTrue(bridge.destroy())
 
-        self.assertEqual(['create', 'added', 'bind', 'client_ready',
+        self.assertEqual(['create', 'added', 'select', 'entered', 'client_ready',
                           'avatar_ready', 'period', 'removed', 'destroy'],
                          [event[0] for event in binding.events])
         self.assertEqual([(91, 'move', {'flags': 7}),
@@ -548,12 +464,19 @@ class AvatarServerBridgeTests(unittest.TestCase):
                 ('typeCompDescr', 'team')),
             _Sender(), on_ready=lambda: ready.append(True))
         binding.bridge = bridge
+        binding.ready = False
 
         self.assertEqual(91, bridge.addVehicleToArena(_snapshot()))
 
         self.assertEqual(
-            ['create', 'bind', 'added', 'client_ready', 'avatar_ready',
-             'period'],
+            ['create', 'select', 'added'],
+            [event[0] for event in binding.events])
+        self.assertEqual([], ready)
+        binding.ready = True
+        self.assertTrue(bridge.flushClientReady())
+        self.assertEqual(
+            ['create', 'select', 'added', 'entered', 'client_ready',
+             'avatar_ready', 'period'],
             [event[0] for event in binding.events])
         self.assertEqual([True], ready)
         self.assertFalse(bridge.setClientReady())
@@ -570,11 +493,95 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertTrue(bridge.setClientReady())
         self.assertEqual(91, bridge.addVehicleToArena(_snapshot()))
         self.assertNotIn('client_ready', [event[0] for event in binding.events])
-        self.assertTrue(bridge.bindToVehicle(91))
+        self.assertTrue(bridge.acceptVehicleEnter(91))
+        self.assertTrue(bridge.completeVehicleEnter(91))
+        self.assertTrue(bridge.flushClientReady())
         self.assertEqual(
-            ['create', 'added', 'bind', 'client_ready', 'avatar_ready',
-             'period'],
+            ['create', 'added', 'select', 'entered', 'client_ready',
+             'avatar_ready', 'period'],
             [event[0] for event in binding.events])
+
+    def test_destroy_rejects_late_vehicle_enter_callback(self):
+        module = _avatar_bridge_module()
+        binding = _BridgeBinding()
+        bridge = module.AvatarServerBridge(
+            _BridgeAvatar(), binding,
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            _Sender())
+
+        self.assertEqual(91, bridge.addVehicleToArena(_snapshot()))
+        self.assertTrue(bridge.destroy())
+        self.assertFalse(bridge.acceptVehicleEnter(91))
+        self.assertFalse(bridge.completeVehicleEnter(91))
+        self.assertFalse(bridge.setClientReady())
+        self.assertEqual(
+            ['create', 'added', 'removed', 'destroy'],
+            [event[0] for event in binding.events])
+
+    def test_duplicate_leave_mailbox_is_delivered_once(self):
+        module = _avatar_bridge_module()
+        leaves = []
+        bridge = module.AvatarServerBridge(
+            _BridgeAvatar(), _BridgeBinding(),
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            _Sender(), on_leave=lambda: leaves.append(True))
+
+        self.assertTrue(bridge.leaveArena({}))
+        self.assertFalse(bridge.leaveArena({}))
+        self.assertEqual([True], leaves)
+
+    def test_failed_leave_registration_can_be_retried(self):
+        module = _avatar_bridge_module()
+        leaves = []
+
+        def leave():
+            leaves.append(True)
+            if len(leaves) == 1:
+                raise RuntimeError('callback registration failed')
+
+        bridge = module.AvatarServerBridge(
+            _BridgeAvatar(), _BridgeBinding(),
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            _Sender(), on_leave=leave)
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'callback registration failed'):
+            bridge.leaveArena({})
+        self.assertTrue(bridge.leaveArena({}))
+        self.assertEqual([True, True], leaves)
+
+    def test_partial_ready_publish_is_latched_and_never_replayed(self):
+        module = _avatar_bridge_module()
+        binding = _BridgeBinding()
+
+        def fail_client_ready():
+            binding.events.append(('client_ready_failed',))
+            raise RuntimeError('client ready failed')
+
+        binding.avatar_client_ready = fail_client_ready
+        bridge = module.AvatarServerBridge(
+            _BridgeAvatar(), binding,
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            _Sender())
+        self.assertEqual(91, bridge.addVehicleToArena(_snapshot()))
+        self.assertTrue(bridge.acceptVehicleEnter(91))
+        self.assertTrue(bridge.setClientReady())
+        self.assertTrue(bridge.completeVehicleEnter(91))
+
+        with self.assertRaisesRegex(RuntimeError, 'client ready failed'):
+            bridge.flushClientReady()
+        with self.assertRaisesRegex(
+                module.AvatarBridgeError, 'client ready failed'):
+            bridge.flushClientReady()
+
+        names = [event[0] for event in binding.events]
+        self.assertEqual(1, names.count('entered'))
+        self.assertEqual(1, names.count('client_ready_failed'))
+        self.assertNotIn('avatar_ready', names)
 
     def test_exact_1513_mailbox_arity_is_explicit(self):
         module = _avatar_bridge_module()

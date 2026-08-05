@@ -5,7 +5,7 @@ This review is pinned to the Chinese HD client whose `version.xml` reports
 CPython 2.7 bytecode magic `03 f3 0d 0a`; the embedded build identifies itself
 as Python 2.7.7.
 
-The goal of version 0.3.5 is a complete playable vertical path, not another
+The goal of version 0.3.6 is a complete playable vertical path, not another
 login-only probe: local Account -> stock Lobby/map selection -> native map and
 Avatar -> native Vehicle entities -> local movement/aim/fire -> synchronized
 humans and bots -> damage/death/result -> cleanup -> a second round.
@@ -146,6 +146,15 @@ the message is retained and fenced by round id until the native lobby is ready,
 so a waiting roster and next start delivered in one network poll cannot replace
 an Account while its hangar is still assembling.
 
+`PlayerAvatar.onBecomePlayer()` removes the prebattle dispatcher. On a failed
+battle start, exact `#1513` broadcasts IGR state to the still-live Hangar before
+normal `Account.onAccountShowGUI` would recreate that dispatcher. Recovery now
+creates and verifies the stock dispatcher before constructing the replacement
+Account, closing that observable `getFunctionalState()` gap. During final game
+shutdown, `guiModsFini` still runs before `SoundGroups.destroy`; a one-shot
+instance guard hides only a retired Account/Avatar missing `inputHandler` for
+that late call and then removes itself.
+
 The required order is:
 
 ```text
@@ -254,11 +263,24 @@ the HUD.
 
 Vehicle creation uses all properties from the local `Vehicle.def`, the exact
 18-item compressed `VEHICLE_ADDED` tuple, native descriptors and native entity
-creation. `setClientReady` is an ordered barrier: even if native
-`createEntity` re-enters `Vehicle.onEnterWorld` before returning, the bridge
-does not publish `AVATAR_READY` or `PERIOD` until `VEHICLE_ADDED` has reached
-`ClientArena` and the Avatar is bound to the same entity. Two false
-cross-version assumptions were removed during review:
+creation. Exact bytecode shows that `Vehicle.prerequisites()` builds appearance
+resources asynchronously: the id returned from client-only `createEntity` can
+exist before `BigWorld.entity(id)` is available. The bridge therefore separates
+id selection from readiness. It selects `playerVehicleID` before stock
+`PlayerAvatar.vehicle_onEnterWorld`, lets the native callback and its
+`setClientReady` mailbox return, and only from a later BigWorld callback accepts
+the entity after registry presence, `inWorld`, `isStarted`, and a descriptor are
+all true. `onVehicleChanged`, client attributes, `AVATAR_READY`, and `PERIOD`
+then publish exactly once, after `VEHICLE_ADDED` has reached `ClientArena`.
+
+Remote Vehicles use the same readiness gate. Their newest health and pose are
+coalesced while prerequisites load. A remote removal before world entry leaves
+a round-owned tombstone; if the native callback arrives late, the materialized
+entity is destroyed instead of becoming an untracked tank. Map loading and
+Vehicle readiness have independent timeouts, and callback handles carry
+generation tokens so an uncancellable callback from an earlier attempt cannot
+clear a newer round's handle. Two false cross-version assumptions were removed
+during review:
 
 - build `#1513` calls `Vehicle.cell.trackRelativePointWithGun(point)`; the
   bridge now exposes that exact mailbox;
@@ -312,7 +334,7 @@ The pure-data server planner emits revisioned global `bot_orders`, which the
 0.9.22 authority now uses for macro targets after reporting bounded visibility
 observations. BigWorld terrain, collision, water and slope probes remain local,
 and the client planner is a fallback when no server order is available.
-Base-capture rules are not part of 0.3.5; standard battles currently end by
+Base-capture rules are not part of 0.3.6; standard battles currently end by
 elimination.
 
 ## Reference implementations reviewed

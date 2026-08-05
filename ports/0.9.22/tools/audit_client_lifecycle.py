@@ -15,6 +15,95 @@ from audit_lobby_consumers import _instructions
 
 ORDERED_USES = (
     (
+        'scripts/client/Vehicle.pyc',
+        'Vehicle.prerequisites',
+        ('typeDescriptor', 'getDescr', 'appearance_cache',
+         'createAppearance'),
+        'Vehicle descriptor and appearance prerequisites precede world entry',
+    ),
+    (
+        'scripts/client/Vehicle.pyc',
+        'Vehicle.onEnterWorld',
+        ('vehicle_onEnterWorld', 'isPlayerVehicle', 'cell',
+         'sendStateToOwnClient'),
+        'Avatar entry callback precedes the own-client ready mailbox',
+    ),
+    (
+        'scripts/client/Avatar.pyc',
+        'PlayerAvatar.set_playerVehicleID',
+        ('SET_PLAYER_ID', '_PlayerAvatar__onInitStepCompleted', 'BigWorld',
+         'entity', 'playerVehicleID', 'inWorld', 'VEHICLE_ENTERED',
+         '_PlayerAvatar__onInitStepCompleted'),
+        'player id selection can run before the Vehicle is visible in-world',
+    ),
+    (
+        'scripts/client/Avatar.pyc',
+        'PlayerAvatar.vehicle_onEnterWorld',
+        ('playerVehicleID', 'VEHICLE_ENTERED',
+         '_PlayerAvatar__onInitStepCompleted'),
+        'matching Vehicle entry completes the native Avatar init step',
+    ),
+    (
+        'scripts/client/Avatar.pyc',
+        'PlayerAvatar.__onInitStepCompleted',
+        ('BigWorld', 'entities', 'values', 'inWorld', 'isStarted',
+         'base', 'setClientReady'),
+        'native readiness scans materialized Vehicles before the mailbox',
+    ),
+    (
+        'scripts/client/gui/ClientHangarSpace.pyc',
+        '_VehicleAppearance.__startBuild',
+        ('BigWorld', 'loadResourceListBG',
+         '_VehicleAppearance__onResourcesLoaded'),
+        'Vehicle appearance resources are loaded asynchronously',
+    ),
+    (
+        'scripts/client/gui/ClientHangarSpace.pyc',
+        '_VehicleAppearance.__onResourcesLoaded',
+        ('failedIDs', '_VehicleAppearance__setupModel'),
+        'appearance resource completion gates model setup',
+    ),
+    (
+        'scripts/client/gui/ClientHangarSpace.pyc',
+        '_VehicleAppearance.__doFinalSetup',
+        ('BigWorld', 'entity', '_VehicleAppearance__vEntityId', 'model'),
+        'appearance finalization resolves the owning entity again',
+    ),
+    (
+        'scripts/client/gui/shared/personality.pyc',
+        'onAccountShowGUI',
+        ('ServicesLocator', 'gameState', 'onAccountShowGUI',
+         'g_appLoader', 'showLobby', 'g_prbLoader', 'onAccountShowGUI'),
+        'lobby consumers run before the normal prebattle dispatcher restore',
+    ),
+    (
+        'scripts/client/gui/prb_control/dispatcher.pyc',
+        '_PrbControlLoader.onAvatarBecomePlayer',
+        ('_PrbControlLoader__isEnabled',
+         '_PrbControlLoader__removeDispatcher'),
+        'Avatar promotion removes the lobby prebattle dispatcher',
+    ),
+    (
+        'scripts/client/gui/prb_control/dispatcher.pyc',
+        '_PrbControlLoader.createBattleDispatcher',
+        ('_PrbControlLoader__prbDispatcher', '_PreBattleDispatcher',
+         '_PrbControlLoader__prbDispatcher'),
+        'battle dispatcher creation installs the replacement synchronously',
+    ),
+    (
+        'scripts/client/game.pyc',
+        'fini',
+        ('BigWorld', 'clearAllSpaces', 'gui_personality', 'fini',
+         'SoundGroups', 'g_instance', 'destroy'),
+        'mod shutdown precedes the late sound teardown zombie lookup',
+    ),
+    (
+        'scripts/client/SoundGroups.pyc',
+        'SoundGroups.destroy',
+        ('BigWorld', 'player', 'inputHandler'),
+        'sound teardown directly dereferences the retained player identity',
+    ),
+    (
         'scripts/client/ChatManager.pyc',
         'ChatManager.switchPlayerProxy',
         ('_ChatManager__cleanupMyCallbacks', 'proxy', 'playerProxy'),
@@ -116,6 +205,18 @@ ORDERED_USES = (
 
 
 REQUIRED_USES = (
+    (
+        'scripts/client/gui/prb_control/dispatcher.pyc',
+        '_PrbControlLoader.onAccountShowGUI',
+        ('createBattleDispatcher',),
+        'normal Account GUI recreates the battle dispatcher',
+    ),
+    (
+        'scripts/client/gui/prb_control/__init__.pyc',
+        'prbDispatcherProperty.__get__',
+        ('g_prbLoader', 'getDispatcher'),
+        'lobby views resolve dispatcher state through the global loader',
+    ),
     (
         'scripts/client/gui/app_loader/states.pyc',
         'LoginState._clearEntitiesAndSpaces',
@@ -243,6 +344,26 @@ def audit(client_root):
             checked.append({
                 'contract': 'complete Account helper binding inventory',
                 'binders': len(actual_binders),
+            })
+        avatar_prerequisites = _code(
+            archive, cache, 'scripts/client/Avatar.pyc',
+            'PlayerAvatar.prerequisites')
+        prerequisite_instructions = _instructions(avatar_prerequisites)
+        prerequisite_opnames = tuple(
+            item['opname'] for item in prerequisite_instructions)
+        prerequisite_values = tuple(
+            item['value'] for item in prerequisite_instructions)
+        if (prerequisite_opnames != ('LOAD_CONST', 'RETURN_VALUE') or
+                prerequisite_values != ((), None)):
+            errors.append(
+                'PlayerAvatar.prerequisites is no longer the immediate '
+                'empty-tuple boundary: opnames=%r values=%r' %
+                (prerequisite_opnames, prerequisite_values))
+        else:
+            checked.append({
+                'member': 'scripts/client/Avatar.pyc',
+                'function': 'PlayerAvatar.prerequisites',
+                'contract': 'Avatar itself has no asynchronous prerequisites',
             })
         for member, function, expected, reason in ORDERED_USES:
             if member in missing:

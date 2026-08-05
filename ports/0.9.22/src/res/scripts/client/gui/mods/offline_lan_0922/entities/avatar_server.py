@@ -119,9 +119,17 @@ class AvatarServerBridge(object):
         self._vehicle_id = None
         self._bound_vehicle_id = None
         self._arena_vehicle_added = False
+        self._vehicle_enter_started = False
+        self._vehicle_enter_completed = False
+        self._vehicle_enter_error = None
+        self._vehicle_enter_states = {}
         self._ready_requested = False
         self._client_ready = False
+        self._ready_publish_started = False
+        self._ready_publish_error = None
         self._client_context = ''
+        self._destroyed = False
+        self._leave_requested = False
 
     @property
     def vehicle_id(self):
@@ -132,6 +140,8 @@ class AvatarServerBridge(object):
         return self
 
     def addVehicleToArena(self, snapshot):
+        if self._destroyed:
+            raise AvatarBridgeError('Avatar server is destroyed')
         if self._vehicle_id is not None:
             raise AvatarBridgeError('Vehicle already exists')
         properties = self._builder.build(snapshot)
@@ -150,7 +160,6 @@ class AvatarServerBridge(object):
         try:
             self._binding.arena_vehicle_added(self._vehicle_id, snapshot)
             self._arena_vehicle_added = True
-            self._flush_client_ready()
         except Exception:
             try:
                 self._binding.destroy_entity(self._vehicle_id)
@@ -158,22 +167,72 @@ class AvatarServerBridge(object):
                 self._vehicle_id = None
                 self._bound_vehicle_id = None
                 self._arena_vehicle_added = False
+                self._vehicle_enter_started = False
+                self._vehicle_enter_completed = False
+                self._vehicle_enter_error = None
+                self._vehicle_enter_states = {}
                 self._ready_requested = False
                 self._client_ready = False
+                self._ready_publish_started = False
+                self._ready_publish_error = None
             raise
         return self._vehicle_id
 
     def acceptVehicleEnter(self, vehicle_id):
         """Bind the first locally-created Vehicle before stock enter handling."""
+        if self._destroyed:
+            return False
         vehicle_id = int(vehicle_id)
+        current = self._vehicle_enter_states.get(vehicle_id)
+        if current is None or current[0] == 'started':
+            self._vehicle_enter_states[vehicle_id] = ('started', None)
         if self._vehicle_id is None:
             self._vehicle_id = vehicle_id
         elif self._vehicle_id != vehicle_id:
             return False
+        self._vehicle_enter_started = True
         self._bind_avatar_once(vehicle_id)
         return True
 
+    def completeVehicleEnter(self, vehicle_id):
+        """Commit local entry only after stock vehicle_onEnterWorld returns."""
+        if self._destroyed:
+            return False
+        vehicle_id = int(vehicle_id)
+        current = self._vehicle_enter_states.get(vehicle_id)
+        if current is None or current[0] == 'failed':
+            return False
+        self._vehicle_enter_states[vehicle_id] = ('completed', None)
+        if vehicle_id != self._vehicle_id or not self._vehicle_enter_started:
+            return True
+        if self._vehicle_enter_error is not None:
+            return False
+        self._vehicle_enter_completed = True
+        return True
+
+    def failVehicleEnter(self, vehicle_id, error):
+        """Latch a local native-enter failure for the deferred ready poll."""
+        if self._destroyed:
+            return False
+        vehicle_id = int(vehicle_id)
+        message = str(error)
+        self._vehicle_enter_states[vehicle_id] = ('failed', message)
+        if vehicle_id != self._vehicle_id:
+            return True
+        self._vehicle_enter_error = message
+        return True
+
+    def vehicleEnterStatus(self, vehicle_id):
+        """Expose the exact native-enter phase to pending remote records."""
+        return self._vehicle_enter_states.get(int(vehicle_id),
+                                              ('pending', None))
+
+    def forgetVehicleEnter(self, vehicle_id):
+        self._vehicle_enter_states.pop(int(vehicle_id), None)
+
     def bindToVehicle(self, vehicle_id):
+        if self._destroyed:
+            return False
         vehicle_id = int(vehicle_id)
         if self._vehicle_id is None:
             self._vehicle_id = vehicle_id
@@ -199,30 +258,56 @@ class AvatarServerBridge(object):
             return False
         if self._bound_vehicle_id is not None:
             raise AvatarBridgeError('Avatar is already bound to another Vehicle')
-        self._binding.avatar_bind_vehicle(vehicle_id)
+        self._binding.avatar_select_vehicle(vehicle_id)
         self._bound_vehicle_id = vehicle_id
-        self._flush_client_ready()
         return True
 
     def setClientReady(self):
-        # Native createEntity may synchronously enter Vehicle.onEnterWorld and
-        # call this mailbox before createEntity returns.  Accept the first
-        # request, but do not publish AVATAR_READY/PERIOD until ClientArena has
-        # received VEHICLE_ADDED and the Avatar is bound to that same entity.
-        if self._client_ready or self._ready_requested:
+        # Vehicle.onEnterWorld calls this mailbox before its engine callback
+        # has returned.  Record the request only: BigWorld.entity(id) may not
+        # become visible until the next engine tick.
+        if self._destroyed or self._client_ready or self._ready_requested:
             return False
         self._ready_requested = True
-        self._flush_client_ready()
         return True
 
+    def flushClientReady(self):
+        """Publish native readiness from a later BigWorld callback.
+
+        BattleRuntime polls this boundary outside Vehicle.onEnterWorld.  It is
+        deliberately separate from the server mailbox so a synchronous native
+        callback cannot observe a half-materialized Vehicle.
+        """
+        return self._flush_client_ready()
+
     def _flush_client_ready(self):
+        if self._destroyed:
+            return False
+        if self._ready_publish_error is not None:
+            raise AvatarBridgeError(
+                'player Vehicle ready failed: %s' %
+                self._ready_publish_error)
+        if self._vehicle_enter_error is not None:
+            raise AvatarBridgeError(
+                'player Vehicle enter failed: %s' % self._vehicle_enter_error)
         if (not self._ready_requested or self._client_ready or
                 self._vehicle_id is None or not self._arena_vehicle_added or
-                self._bound_vehicle_id != self._vehicle_id):
+                self._bound_vehicle_id != self._vehicle_id or
+                not self._vehicle_enter_completed):
             return False
-        self._binding.avatar_client_ready()
-        self._binding.avatar_ready()
-        self._binding.arena_period('battle')
+        if not self._binding.is_vehicle_ready(self._vehicle_id):
+            return False
+        if self._ready_publish_started:
+            return False
+        self._ready_publish_started = True
+        try:
+            self._binding.avatar_vehicle_entered()
+            self._binding.avatar_client_ready()
+            self._binding.avatar_ready()
+            self._binding.arena_period('battle')
+        except Exception as error:
+            self._ready_publish_error = str(error)
+            raise
         self._ready_requested = False
         self._client_ready = True
         if callable(self._on_ready):
@@ -366,8 +451,16 @@ class AvatarServerBridge(object):
         self._client_context = value
 
     def leaveArena(self, statistics):
-        if callable(self._on_leave):
-            self._on_leave()
+        if self._destroyed or self._leave_requested:
+            return False
+        self._leave_requested = True
+        try:
+            if callable(self._on_leave):
+                self._on_leave()
+        except Exception:
+            self._leave_requested = False
+            raise
+        return True
 
     def doCmdStr(self, request_id, command, string):
         self._ack_command(request_id, command)
@@ -376,14 +469,24 @@ class AvatarServerBridge(object):
         self._ack_command(request_id, command)
 
     def destroy(self):
+        if self._destroyed:
+            return False
+        self._destroyed = True
         if self._vehicle_id is None:
+            self._vehicle_enter_states = {}
             return False
         vehicle_id = self._vehicle_id
         self._vehicle_id = None
         self._bound_vehicle_id = None
         self._arena_vehicle_added = False
+        self._vehicle_enter_started = False
+        self._vehicle_enter_completed = False
+        self._vehicle_enter_error = None
+        self._vehicle_enter_states = {}
         self._ready_requested = False
         self._client_ready = False
+        self._ready_publish_started = False
+        self._ready_publish_error = None
         try:
             self._binding.arena_vehicle_removed(vehicle_id)
         finally:

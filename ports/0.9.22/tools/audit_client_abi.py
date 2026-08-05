@@ -142,6 +142,9 @@ EXPECTED_ABI = {
             'self', 'requestID', 'tokenType', 'data'),
         'PlayerAvatar.receiveAccountStats': (
             'self', 'requestID', 'stats'),
+        'PlayerAvatar.prerequisites': ('self',),
+        'PlayerAvatar.set_playerVehicleID': ('self', 'prev'),
+        'PlayerAvatar.__onInitStepCompleted': ('self',),
         'PlayerAvatar.vehicle_onEnterWorld': ('self', 'vehicle'),
         'PlayerAvatar.updateVehicleHealth': (
             'self', 'vehicleID', 'health', 'deathReasonID', 'isCrewActive',
@@ -167,6 +170,7 @@ EXPECTED_ABI = {
     },
     'scripts/client/Vehicle.pyc': {
         'Vehicle.__init__': ('self',),
+        'Vehicle.prerequisites': ('self', 'respawnCompactDescr'),
         'Vehicle.onEnterWorld': ('self', 'prereqs'),
         'Vehicle.onLeaveWorld': ('self',),
         'Vehicle.showShooting': ('self', 'burstCount', 'isPredictedShot'),
@@ -256,7 +260,20 @@ EXPECTED_ABI = {
     },
     'scripts/client/gui/ClientHangarSpace.pyc': {
         'ClientHangarSpace.getVehicleEntity': ('self',),
+        '_VehicleAppearance.__startBuild': ('self', 'vDesc', 'vState'),
+        '_VehicleAppearance.__onResourcesLoaded': (
+            'self', 'buildInd', 'resourceRefs'),
         '_VehicleAppearance.__doFinalSetup': ('self', 'buildIdx', 'model'),
+    },
+    'scripts/client/gui/prb_control/dispatcher.pyc': {
+        '_PrbControlLoader.createBattleDispatcher': ('self',),
+        '_PrbControlLoader.getDispatcher': ('self',),
+    },
+    'scripts/client/gui/prb_control/__init__.pyc': {
+        'prbDispatcherProperty.__get__': ('self', 'obj', 'objType'),
+    },
+    'scripts/client/SoundGroups.pyc': {
+        'SoundGroups.destroy': ('self',),
     },
     'scripts/client/helpers/server_settings.pyc': {
         'ServerSettings.isElenEnabled': ('self',),
@@ -323,6 +340,18 @@ EXPECTED_CODE_NAMES = {
         'PlayerAvatar.onBecomeNonPlayer': (
             'chatManager', 'switchPlayerProxy', 'g_playerEvents',
             'onAvatarBecomeNonPlayer'),
+        'PlayerAvatar.set_playerVehicleID': (
+            'BigWorld', 'entity', 'inWorld'),
+        'PlayerAvatar.vehicle_onEnterWorld': (
+            'playerVehicleID', 'VEHICLE_ENTERED',
+            '_PlayerAvatar__onInitStepCompleted'),
+        'PlayerAvatar.__onInitStepCompleted': ('setClientReady',),
+    },
+    'scripts/client/Vehicle.pyc': {
+        'Vehicle.prerequisites': (
+            'typeDescriptor', 'appearance_cache', 'createAppearance'),
+        'Vehicle.onEnterWorld': (
+            'vehicle_onEnterWorld', 'sendStateToOwnClient'),
     },
     'scripts/client_common/ClientChat.pyc': {
         'ClientChat.__init__': ('_ClientChat__chatActionCallbacks',),
@@ -352,7 +381,21 @@ EXPECTED_CODE_NAMES = {
             'fireEvent', 'GUICommonEvent', 'LOBBY_VIEW_LOADED'),
     },
     'scripts/client/gui/ClientHangarSpace.pyc': {
+        '_VehicleAppearance.__startBuild': ('loadResourceListBG',),
+        '_VehicleAppearance.__onResourcesLoaded': (
+            '_VehicleAppearance__setupModel',),
         '_VehicleAppearance.__doFinalSetup': ('entity', 'model'),
+    },
+    'scripts/client/gui/prb_control/dispatcher.pyc': {
+        '_PrbControlLoader.createBattleDispatcher': (
+            '_PrbControlLoader__prbDispatcher',),
+    },
+    'scripts/client/gui/prb_control/__init__.pyc': {
+        'prbDispatcherProperty.__get__': (
+            'g_prbLoader', 'getDispatcher'),
+    },
+    'scripts/client/SoundGroups.pyc': {
+        'SoundGroups.destroy': ('BigWorld', 'player', 'inputHandler'),
     },
 }
 

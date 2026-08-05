@@ -137,7 +137,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.5</version></root>')
+            '<version>0.3.6</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -676,6 +676,32 @@ class _OfflineMapCreator(object):
         self.operations.append(('map_active', active))
 
 
+class _PrbLoader(object):
+    def __init__(self, operations):
+        self.operations = operations
+        self.dispatcher = None
+
+    def createBattleDispatcher(self):
+        self.operations.append(('prb_dispatcher_create',))
+        if self.dispatcher is None:
+            self.dispatcher = object()
+
+    def getDispatcher(self):
+        return self.dispatcher
+
+
+class _SoundGroups(object):
+    def __init__(self, bigworld, operations):
+        self.bigworld = bigworld
+        self.operations = operations
+
+    def destroy(self):
+        player = self.bigworld.player()
+        self.operations.append(('sound_destroy_player', player))
+        if player is not None and player.inputHandler is not None:
+            self.operations.append(('sound_input_handler',))
+
+
 class _CompatAvatarFilter(object):
     def __init__(self, operations):
         self.operations = operations
@@ -720,6 +746,73 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertEqual(
             [mock.call.setClientReady(), mock.call.autoAim(0)],
             target.mock_calls)
+
+    def test_vehicle_enter_wraps_stock_handler_with_two_phase_barrier(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+
+        class Server(object):
+            def acceptVehicleEnter(self, vehicle_id):
+                operations.append(('accept_vehicle_enter', vehicle_id))
+
+            def completeVehicleEnter(self, vehicle_id):
+                operations.append(('complete_vehicle_enter', vehicle_id))
+
+        avatar.fakeServer = Server()
+        avatar.vehicle_onEnterWorld(types.SimpleNamespace(id=91))
+
+        names = [item[0] for item in operations]
+        self.assertLess(names.index('accept_vehicle_enter'),
+                        names.index('original_avatar_vehicle_enter'))
+        self.assertLess(names.index('original_avatar_vehicle_enter'),
+                        names.index('complete_vehicle_enter'))
+        compatibility.fini()
+
+    def test_vehicle_accept_failure_is_latched_before_stock_handler(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+
+        class Server(object):
+            def acceptVehicleEnter(self, vehicle_id):
+                operations.append(('accept_vehicle_enter', vehicle_id))
+                raise RuntimeError('select failed')
+
+            def failVehicleEnter(self, vehicle_id, error):
+                operations.append(
+                    ('fail_vehicle_enter', vehicle_id, str(error)))
+
+        avatar.fakeServer = Server()
+        with self.assertRaisesRegex(RuntimeError, 'select failed'):
+            avatar.vehicle_onEnterWorld(types.SimpleNamespace(id=91))
+
+        names = [item[0] for item in operations]
+        self.assertIn('fail_vehicle_enter', names)
+        self.assertNotIn('original_avatar_vehicle_enter', names)
+        compatibility.fini()
+
+    def test_fini_arms_one_shot_sound_guard_for_zombie_account(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+        zombie = object.__new__(runtime.account_module.PlayerAccount)
+        zombie.__dict__.clear()
+        runtime.bigworld._player = zombie
+        compatibility.disconnect = lambda: None
+
+        compatibility.fini()
+        runtime.sound_groups_module.g_instance.destroy()
+
+        self.assertIn(('sound_destroy_player', None), operations)
+        self.assertNotIn(
+            'destroy', runtime.sound_groups_module.g_instance.__dict__)
+        self.assertIs(zombie, runtime.bigworld.player())
 
     def _runtime(self, existing_hosts=None, host_failure=False):
         operations = []
@@ -806,6 +899,10 @@ class OfflineCompatibilityTests(unittest.TestCase):
                 operations.append(
                     ('avatar_prereqs_loaded', resource_names, resource_refs))
 
+            def vehicle_onEnterWorld(self, vehicle):
+                operations.append(('original_avatar_vehicle_enter',
+                                   vehicle.id))
+
         class Vehicle(object):
             pass
 
@@ -818,6 +915,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
         manager = _CompatConnectionManager(bigworld, statuses, operations)
         player_events = types.SimpleNamespace(
             onDisconnected=_CompatEvent(operations, 'player_disconnected'))
+        sound_groups = _SoundGroups(bigworld, operations)
         runtime = types.SimpleNamespace(
             account_module=account_module,
             avatar_module=avatar_module,
@@ -828,6 +926,9 @@ class OfflineCompatibilityTests(unittest.TestCase):
             offline_map_creator=_OfflineMapCreator(operations),
             player_events=player_events,
             predefined_hosts=_Hosts(existing_hosts, host_failure),
+            prb_loader=_PrbLoader(operations),
+            sound_groups_module=types.SimpleNamespace(
+                g_instance=sound_groups),
             math=types.SimpleNamespace(Vector3=_Vector3),
             vehicle_module=types.SimpleNamespace(Vehicle=Vehicle))
         return runtime, operations
@@ -1272,6 +1373,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
 
         self.assertTrue(compatibility.retire_current_player())
         runtime.bigworld.clearAllSpaces()
+        restore_offset = len(operations)
         restored = compatibility.restore_lobby_account()
 
         self.assertIsNot(first_account, restored)
@@ -1284,6 +1386,9 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertEqual(2, names.count('account_entity'))
         self.assertEqual(2, names.count('original_account_init'))
         self.assertFalse(compatibility._connecting)
+        restore_names = [item[0] for item in operations[restore_offset:]]
+        self.assertLess(restore_names.index('prb_dispatcher_create'),
+                        restore_names.index('account_entity'))
 
     def test_account_avatar_account_handoff_detaches_chat_before_each_clear(self):
         compatibility_module = _load_port_source('compat')
@@ -1901,7 +2006,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.5'
+        package.PORT_VERSION = '0.3.6'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []

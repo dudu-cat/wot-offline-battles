@@ -3,7 +3,7 @@
 The phase layout and wire shapes are an original implementation informed by
 the observable flow in AvatarServer.py and VehicleMover.py from
 https://github.com/the-tuxedo-cat/WoT-Offline-Server/tree/c0bc550c46deac980194b7b860ee8781d53ec97b
-(GPL; no source code copied).  In particular, local movement physics is
+(Boost Software License 1.0; no source code copied).  In particular, local movement physics is
 intentionally not migrated: pose snapshots and input are passed to the
 server-facing owner instead.
 
@@ -35,7 +35,7 @@ class CapabilityError(RuntimeError):
 
 
 class BigWorldVehicleBinding(object):
-    """Concrete binding used by ``ArenaVehicleRuntime``.
+    """Concrete binding used by the asynchronous ``BattleRuntime``.
 
     Dependencies are injected so the capability contract can be tested
     outside BigWorld.  In the game loader pass ``BigWorld``, the player Avatar,
@@ -144,8 +144,12 @@ class BigWorldVehicleBinding(object):
         self._avatar.updateArena(self._constants.ARENA_UPDATE.VEHICLE_KILLED,
                                  _pickle.dumps(payload))
 
-    def avatar_bind_vehicle(self, entity_id):
+    def avatar_select_vehicle(self, entity_id):
+        """Select the local id before stock PlayerAvatar enter handling."""
         self._set_avatar_property('playerVehicleID', entity_id)
+
+    def avatar_vehicle_entered(self):
+        """Notify consumers only after the Vehicle is visible in-world."""
         self._avatar.onVehicleChanged()
 
     def avatar_client_ready(self):
@@ -203,6 +207,23 @@ class BigWorldVehicleBinding(object):
 
     def destroy_entity(self, entity_id):
         self._bigworld.destroyEntity(entity_id)
+
+    def is_vehicle_ready(self, entity_id):
+        """Return only after BigWorld has materialized the Vehicle in-world.
+
+        ``createEntity`` returns the client-only id before Vehicle resource
+        prerequisites finish.  During ``Vehicle.onEnterWorld`` the id can
+        already be bound to the Avatar while ``BigWorld.entity(id)`` is still
+        unavailable.  Native consumers use the same entity + inWorld gate.
+        """
+        try:
+            entity = self._bigworld.entity(entity_id)
+            return (entity is not None and
+                    bool(getattr(entity, 'inWorld', False)) and
+                    bool(getattr(entity, 'isStarted', False)) and
+                    getattr(entity, 'typeDescriptor', None) is not None)
+        except ReferenceError:
+            return False
 
     def _pack_vehicle_arena_info(self, entity_id, properties):
         """Exact #1513 ClientArena 18-item vehicle-list shape."""
