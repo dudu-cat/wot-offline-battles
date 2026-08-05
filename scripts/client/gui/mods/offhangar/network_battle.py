@@ -1127,6 +1127,24 @@ def publish_bot_observation(player, contacts, affordances=None, navigation=None)
 				except Exception:
 					value = 0
 				shared_navigation['search'][name] = max(0, min(value, 3600000))
+		raw_aim = navigation.get('aim')
+		if isinstance(raw_aim, dict):
+			shared_navigation['aim'] = {}
+			for name in ('alive', 'targeted', 'aligned', 'traversing', 'limited'):
+				try:
+					value = int(raw_aim.get(name, 0) or 0)
+				except Exception:
+					value = 0
+				shared_navigation['aim'][name] = max(0, min(value, 30))
+		raw_driver = navigation.get('driver')
+		if isinstance(raw_driver, dict):
+			shared_navigation['driver'] = {}
+			for name in ('moving', 'drive', 'avoid', 'blocked', 'recovery', 'arrived'):
+				try:
+					value = int(raw_driver.get(name, 0) or 0)
+				except Exception:
+					value = 0
+				shared_navigation['driver'][name] = max(0, min(value, 30))
 	return client.send_bot_observation(
 		payload, shared_affordances, shared_navigation)
 
@@ -1152,6 +1170,34 @@ def authoritative_bot_order(player, mock):
 		world = _world_from_server(player, dict(point, world_pose=True))
 		if world is not None:
 			order[key] = (float(world.x), float(world.y), float(world.z))
+	# The server selects who the bot may engage; the authority client owns the
+	# rendered simulation and therefore has the freshest exact pose. Aim a
+	# currently visible target at its live local mock, as the original offline AI
+	# did, instead of at the last 2 Hz contact-report coordinate. Last-known
+	# investigate orders retain the server coordinate and cannot see through fog.
+	if bool(raw.get('fire_allowed')) and raw.get('target_id') is not None:
+		target = None
+		try:
+			target_id = int(raw.get('target_id'))
+			if raw.get('target_kind') == 'human':
+				if target_id == getattr(player, '_offhangar_network_id', None):
+					target = _local_mock(player)
+				else:
+					target = _find_mock(player, target_id)
+			elif raw.get('target_kind') == 'bot':
+				target = _find_bot(target_id)
+		except Exception:
+			target = None
+		if (target is not None and getattr(target, 'isAlive', True) and
+				getattr(target, 'health', 1) > 0):
+			try:
+				position = target.position
+				live_position = (
+					float(position.x), float(position.y), float(position.z))
+				order['aim_position'] = live_position
+				order['face_position'] = live_position
+			except Exception:
+				pass
 	return order
 
 

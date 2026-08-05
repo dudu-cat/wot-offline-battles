@@ -2128,6 +2128,28 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 		                   if entry['id'] != player_id]
 		_navigation = (_navigator.fallback_diagnostics(_active_bot_ids)
 		               if _navigator is not None else None)
+		if _navigation is not None:
+			_aim = {'alive': 0, 'targeted': 0, 'aligned': 0,
+			        'traversing': 0, 'limited': 0}
+			_driver = {'moving': 0, 'drive': 0, 'avoid': 0, 'blocked': 0,
+			           'recovery': 0, 'arrived': 0}
+			for _aim_vehicle in (mock_vehicles or {}).values():
+				if (getattr(_aim_vehicle, '_network_bot_id', None) is None or
+						not getattr(_aim_vehicle, 'isAlive', False)):
+					continue
+				_aim['alive'] += 1
+				for _aim_name in ('targeted', 'aligned', 'traversing', 'limited'):
+					if getattr(_aim_vehicle, '_offh_ai_' + _aim_name, False):
+						_aim[_aim_name] += 1
+				if abs(float(getattr(_aim_vehicle, '_veh_velocity', 0.0) or 0.0)) > 0.5:
+					_driver['moving'] += 1
+				_driver_mode = getattr(_aim_vehicle, '_offh_ai_driver_mode', '')
+				if _driver_mode in ('reverse_turn', 'pivot_recovery'):
+					_driver_mode = 'recovery'
+				if _driver_mode in _driver:
+					_driver[_driver_mode] += 1
+			_navigation['aim'] = _aim
+			_navigation['driver'] = _driver
 		publish_bot_observation(
 			player, network_contacts, cover_reports, _navigation)
 	except Exception:
@@ -8779,6 +8801,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_ai_throttle_override = None
 							_ai_shell_index = 0
 							_nav_paused = False
+							_ai_hull_aiming = False
 							# INIT BOT STATES
 							if getattr(m_veh, '_veh_velocity', None) is None: m_veh._veh_velocity = 0.0
 							if getattr(m_veh, '_veh_turn_velocity', None) is None: m_veh._veh_turn_velocity = 0.0
@@ -8923,6 +8946,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								getattr(player, 'arena', None), 'period', 3) == 3)
 							_bot_gun_min_yaw, _bot_gun_max_yaw, _has_limited_traverse = (
 								_offh_ai_driver().gun_yaw_limits(_td))
+							m_veh._offh_ai_targeted = _ai_target_id is not None
+							m_veh._offh_ai_aligned = False
+							m_veh._offh_ai_traversing = False
+							m_veh._offh_ai_limited = bool(_has_limited_traverse)
 							_desired_gun_pitch = float(
 								getattr(m_veh, '_gun_pitch', 0.0) or 0.0)
 							m_veh._offh_desired_gun_pitch = _desired_gun_pitch
@@ -8996,6 +9023,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							while diff_yaw > math.pi: diff_yaw -= 2 * math.pi
 							while diff_yaw < -math.pi: diff_yaw += 2 * math.pi
 							_driver_mode = _driver_order.get('recovery_mode', 'drive')
+							m_veh._offh_ai_driver_mode = _driver_mode
 							_feeler_steer_yaw = target_yaw if _driver_mode == 'avoid' else None
 							if _nav_paused:
 								# A* returns the current point while a safe path is pending or
@@ -9012,7 +9040,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								        abs(diff_yaw) < 0.65):
 								throttle = float(_ai_throttle_override)
 							if _battle_active:
-								turn_dir, throttle, _unused_hull_aiming = (
+								turn_dir, throttle, _ai_hull_aiming = (
 									_offh_ai_driver().combat_hull_aim(
 										m_veh.yaw, _aim_target_yaw,
 										_bot_gun_min_yaw, _bot_gun_max_yaw,
@@ -9681,6 +9709,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								
 								if getattr(m_veh, '_turret_yaw', None) is None: m_veh._turret_yaw = 0.0
 								t_diff = t_yaw - m_veh._turret_yaw
+								m_veh._offh_ai_traversing = bool(
+									_ai_hull_aiming or abs(t_diff) > 0.04)
 								rot_speed = 0.5
 								try:
 									if _td: rot_speed = _td.turret['rotationSpeed']
@@ -9783,6 +9813,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								getattr(m_veh, '_offh_desired_gun_pitch',
 								        _desired_gun_pitch),
 								getattr(m_veh, '_gun_pitch', 0.0))
+							m_veh._offh_ai_aligned = bool(_ai_gun_aligned)
 							
 							bot_reload = m_veh._ai_reload_intra if (m_veh._ai_clip_size > 1 and m_veh._ai_clip > 0 and m_veh._ai_clip < m_veh._ai_clip_size) else m_veh._ai_reload_full
 							# A downed loader drags the reload out for a bot exactly as it does for the

@@ -543,6 +543,21 @@ class TerrainNavigator(object):
 		else:
 			self.search_failed += 1
 
+	def _cancel_bot_searches(self, bot_id):
+		"""Discard superseded private jobs without touching shared route plans."""
+		bot_id = int(bot_id)
+		for key in list(self.searches):
+			try:
+				path_key = key[0]
+				owned = (isinstance(path_key, tuple) and len(path_key) > 1 and
+				         path_key[0] in ('local', 'join', 'recovery', 'continue') and
+				         int(path_key[1]) == bot_id)
+			except Exception:
+				owned = False
+			if owned:
+				self.searches.pop(key, None)
+				self.search_times.pop(key, None)
+
 	def _advance_searches(self, now):
 		"""Give every pending A* task a fair share of the current frame.
 
@@ -630,6 +645,11 @@ class TerrainNavigator(object):
 			anchor=None, avoid_points=None):
 		"""Return a terrain-safe local target, holding if no safe path is ready."""
 		bot_id = int(bot_id)
+		# Search progress is a navigator-wide frame task, not a cache-miss side
+		# effect. Once every active bot had a cached/partial path, _path() returned
+		# before advancing unrelated join and continuation jobs, leaving the whole
+		# room parked with an ever-growing pending queue.
+		self._advance_searches(now)
 		self.grid.prune_failed_edges(now)
 		self.grid.trim_caches()
 		state = self.bot_states.get(bot_id)
@@ -643,6 +663,7 @@ class TerrainNavigator(object):
 		if state.get('request_key') != request_key:
 			# A new route segment or combat target is not evidence that the previous
 			# request stalled. Reset recovery before evaluating progress.
+			self._cancel_bot_searches(bot_id)
 			state['request_key'] = request_key
 			state['path_key'] = None
 			state['index'] = 0

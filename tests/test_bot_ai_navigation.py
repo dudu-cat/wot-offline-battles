@@ -370,6 +370,78 @@ class BotNavigationTest(unittest.TestCase):
         self.assertGreater(min(steps), 0)
         self.assertLessEqual(max(steps) - min(steps), 1)
 
+    def test_cached_path_still_advances_unrelated_pending_searches(self):
+        navigator = self.navigation.TerrainNavigator(
+            lambda x, z, hint: 0.0, cell_size=10.0
+        )
+        navigator.search_budget_per_frame = 4
+
+        class PendingSearch:
+            def __init__(self):
+                self.done = False
+                self.result = None
+                self.last_frame = None
+                self.steps = 0
+
+            def step(self, budget):
+                self.steps += budget
+                return False
+
+        current = (0.0, 0.0, 0.0)
+        goal = (0.0, 0.0, 40.0)
+        route_key = ("route", 1, "cached", 1)
+        cache_key = navigator._cache_key(route_key, goal)
+        navigator.paths[cache_key] = (current, goal)
+        navigator.path_times[cache_key] = 0.0
+        pending_key = (("join", 99, (0, 0), "route"), (9, 9))
+        pending = PendingSearch()
+        navigator.searches[pending_key] = pending
+        navigator.search_times[pending_key] = 0.0
+
+        navigator.next_target(1, current, goal, route_key, 1.0)
+
+        self.assertGreater(pending.steps, 0)
+
+    def test_new_bot_request_cancels_only_its_superseded_private_searches(self):
+        navigator = self.navigation.TerrainNavigator(
+            lambda x, z, hint: 0.0, cell_size=10.0
+        )
+
+        class PendingSearch:
+            done = False
+            result = None
+            last_frame = None
+
+            def step(self, budget):
+                return False
+
+        own_key = (("local", 7, "withdraw", 3), (4, 4))
+        other_key = (("local", 8, "withdraw", 3), (4, 4))
+        navigator.searches = {
+            own_key: PendingSearch(),
+            other_key: PendingSearch(),
+        }
+        navigator.search_times = {own_key: 0.0, other_key: 0.0}
+        navigator.bot_states[7] = {
+            "last_position": (0.0, 0.0, 0.0),
+            "progress_time": 0.0,
+            "path_key": None,
+            "index": 0,
+            "recovery": 0,
+            "recovery_until": 0.0,
+            "recovery_key": None,
+            "recovery_start": None,
+            "request_key": (("local", 7, "withdraw", 3), (4, 4)),
+        }
+
+        navigator.next_target(
+            7, (0.0, 0.0, 0.0), (0.0, 0.0, 50.0),
+            ("local", 7, "advance_contact", 3), 1.0,
+        )
+
+        self.assertNotIn(own_key, navigator.searches)
+        self.assertIn(other_key, navigator.searches)
+
     def test_completed_join_path_is_not_replaced_by_shared_path_next_frame(self):
         navigator = self.navigation.TerrainNavigator(
             lambda x, z, hint: 0.0,

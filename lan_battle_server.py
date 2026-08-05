@@ -181,6 +181,10 @@ class BattleState:
             "recovered": 0,
             "search": {"pending": 0, "completed": 0, "failed": 0,
                        "oldest_ms": 0},
+            "aim": {"alive": 0, "targeted": 0, "aligned": 0,
+                    "traversing": 0, "limited": 0},
+            "driver": {"moving": 0, "drive": 0, "avoid": 0,
+                       "blocked": 0, "recovery": 0, "arrived": 0},
         }
         self.next_bot_ai_log = 0.0
         self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
@@ -221,6 +225,10 @@ class BattleState:
                 "recovered": 0,
                 "search": {"pending": 0, "completed": 0, "failed": 0,
                            "oldest_ms": 0},
+                "aim": {"alive": 0, "targeted": 0, "aligned": 0,
+                        "traversing": 0, "limited": 0},
+                "driver": {"moving": 0, "drive": 0, "avoid": 0,
+                           "blocked": 0, "recovery": 0, "arrived": 0},
             }
             self.pending_events.append({
                 "kind": "authority",
@@ -315,6 +323,10 @@ class BattleState:
                     "recovered": 0,
                     "search": {"pending": 0, "completed": 0, "failed": 0,
                                "oldest_ms": 0},
+                    "aim": {"alive": 0, "targeted": 0, "aligned": 0,
+                            "traversing": 0, "limited": 0},
+                    "driver": {"moving": 0, "drive": 0, "avoid": 0,
+                               "blocked": 0, "recovery": 0, "arrived": 0},
                 }
                 self.next_bot_ai_log = 0.0
                 self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
@@ -539,6 +551,20 @@ class BattleState:
                 for name in ("pending", "completed", "failed", "oldest_ms"):
                     navigation["search"][name] = max(0, min(
                         int(_finite_float(raw_search.get(name), 0)), 3600000))
+                raw_aim = raw_navigation.get("aim")
+                if not isinstance(raw_aim, dict):
+                    raw_aim = {}
+                navigation["aim"] = {}
+                for name in ("alive", "targeted", "aligned", "traversing", "limited"):
+                    navigation["aim"][name] = max(0, min(
+                        int(_finite_float(raw_aim.get(name), 0)), 30))
+                raw_driver = raw_navigation.get("driver")
+                if not isinstance(raw_driver, dict):
+                    raw_driver = {}
+                navigation["driver"] = {}
+                for name in ("moving", "drive", "avoid", "blocked", "recovery", "arrived"):
+                    navigation["driver"][name] = max(0, min(
+                        int(_finite_float(raw_driver.get(name), 0)), 30))
                 self.bot_navigation_stats = navigation
             return accepted_contacts > 0 or accepted_affordances > 0
 
@@ -901,7 +927,9 @@ class BattleState:
                 "contacts=t1:%d/%d,t2:%d/%d targets=t1:%d,t2:%d "
                 "fire=t1:%d,t2:%d modes=%s "
                 "nav=direct:%d,local:%d,reactive:%d recovered:%d "
-                "active:%d/%d/%d astar=pending:%d,oldest:%dms,done:%d,failed:%d" % (
+                "active:%d/%d/%d astar=pending:%d,oldest:%dms,done:%d,failed:%d "
+                "aim=targeted:%d,aligned:%d,traversing:%d,limited:%d,alive:%d "
+                "driver=moving:%d,drive:%d,avoid:%d,blocked:%d,recovery:%d,arrived:%d" % (
                     reports.get(1, 0), reports.get(2, 0), reports.get("accepted", 0),
                     teams[1]["visible"], teams[1]["contacts"],
                     teams[2]["visible"], teams[2]["contacts"],
@@ -917,7 +945,18 @@ class BattleState:
                     navigation.get("search", {}).get("pending", 0),
                     navigation.get("search", {}).get("oldest_ms", 0),
                     navigation.get("search", {}).get("completed", 0),
-                    navigation.get("search", {}).get("failed", 0)))
+                    navigation.get("search", {}).get("failed", 0),
+                    navigation.get("aim", {}).get("targeted", 0),
+                    navigation.get("aim", {}).get("aligned", 0),
+                    navigation.get("aim", {}).get("traversing", 0),
+                    navigation.get("aim", {}).get("limited", 0),
+                    navigation.get("aim", {}).get("alive", 0),
+                    navigation.get("driver", {}).get("moving", 0),
+                    navigation.get("driver", {}).get("drive", 0),
+                    navigation.get("driver", {}).get("avoid", 0),
+                    navigation.get("driver", {}).get("blocked", 0),
+                    navigation.get("driver", {}).get("recovery", 0),
+                    navigation.get("driver", {}).get("arrived", 0)))
         for player in recipients:
             outgoing = snapshot
             if player.bot_order_revision_sent != self.bot_orders["revision"]:

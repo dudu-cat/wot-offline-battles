@@ -84,6 +84,36 @@ class BotAIDriverTest(unittest.TestCase):
         self.assertEqual(1.0, turn)
         self.assertEqual(0.0, throttle)
 
+    def test_missing_installed_yaw_limits_means_full_rotation(self):
+        minimum, maximum, limited = self.module.gun_yaw_limits({
+            "gun": {},
+            "turret": {},
+        })
+
+        self.assertFalse(limited)
+        self.assertAlmostEqual(-math.pi, minimum)
+        self.assertAlmostEqual(math.pi, maximum)
+
+    def test_installed_turret_yaw_limits_are_used_per_vehicle(self):
+        minimum, maximum, limited = self.module.gun_yaw_limits({
+            "gun": {},
+            "turret": {"yawLimits": (-0.2, 0.3)},
+        })
+
+        self.assertTrue(limited)
+        self.assertAlmostEqual(-0.2, minimum)
+        self.assertAlmostEqual(0.3, maximum)
+
+    def test_installed_gun_yaw_limits_override_turret_limits(self):
+        minimum, maximum, limited = self.module.gun_yaw_limits({
+            "gun": {"turretYawLimits": (-0.1, 0.1)},
+            "turret": {"yawLimits": (-math.pi, math.pi)},
+        })
+
+        self.assertTrue(limited)
+        self.assertAlmostEqual(-0.1, minimum)
+        self.assertAlmostEqual(0.1, maximum)
+
     def test_obstacle_recovery_outranks_limited_traverse_hull_aim(self):
         turn, throttle, aiming = self.module.combat_hull_aim(
             0.0, math.pi / 2.0, -0.2, 0.2,

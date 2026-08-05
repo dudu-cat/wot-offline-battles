@@ -222,6 +222,11 @@ class LANClientQueueTest(unittest.TestCase):
             "recovered": 4,
             "search": {"pending": 13, "completed": 4, "failed": 2,
                        "oldest_ms": 12345, "ignored": 999},
+            "aim": {"alive": 29, "targeted": 15, "aligned": 4,
+                    "traversing": 11, "limited": 7, "ignored": 999},
+            "driver": {"moving": 9, "drive": 8, "avoid": 3,
+                       "blocked": 6, "recovery": 7, "arrived": 5,
+                       "ignored": 999},
         }
         self.assertTrue(self.network.publish_bot_observation(
             player, [contact] * 65, reports, raw_navigation
@@ -238,6 +243,12 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertEqual(13, navigation["search"]["pending"])
         self.assertEqual(12345, navigation["search"]["oldest_ms"])
         self.assertNotIn("ignored", navigation["search"])
+        self.assertEqual(15, navigation["aim"]["targeted"])
+        self.assertEqual(11, navigation["aim"]["traversing"])
+        self.assertNotIn("ignored", navigation["aim"])
+        self.assertEqual(9, navigation["driver"]["moving"])
+        self.assertEqual(6, navigation["driver"]["blocked"])
+        self.assertNotIn("ignored", navigation["driver"])
 
         captured[:] = []
         malformed_contact = dict(contact, position={"x": 1})
@@ -700,6 +711,34 @@ class LANClientQueueTest(unittest.TestCase):
             "bot_orders": [{"id": 16, "target_id": 999}],
         })
         self.assertEqual(2, client.bot_orders[16]["target_id"])
+
+    def test_visible_server_target_aims_at_its_live_authority_pose(self):
+        player = Player()
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_id = 2
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True, phase="battle",
+            bot_orders={16: {
+                "id": 16, "target_id": 2, "target_kind": "human",
+                "fire_allowed": True,
+                "aim_position": {"x": -4.0, "y": 1.0, "z": 80.0},
+                "face_position": {"x": -4.0, "y": 1.0, "z": 80.0},
+            }}
+        )
+        bot = types.SimpleNamespace(_network_bot_id=16)
+        local_target = types.SimpleNamespace(
+            isAlive=True, health=880,
+            position=types.SimpleNamespace(x=12.0, y=3.0, z=-7.0),
+        )
+        original_local_mock = self.network._local_mock
+        self.network._local_mock = lambda unused_player: local_target
+        try:
+            order = self.network.authoritative_bot_order(player, bot)
+        finally:
+            self.network._local_mock = original_local_mock
+
+        self.assertEqual((12.0, 3.0, -7.0), order["aim_position"])
+        self.assertEqual(order["aim_position"], order["face_position"])
 
     def test_snapshot_same_revision_does_not_replace_orders_but_initial_zero_does(self):
         player = Player()

@@ -62,6 +62,10 @@ class ServerBotPlannerTests(unittest.TestCase):
                 "recovered": 4,
                 "search": {"pending": 13, "completed": 4, "failed": 2,
                            "oldest_ms": 12345},
+                "aim": {"alive": 29, "targeted": 15, "aligned": 4,
+                        "traversing": 11, "limited": 7},
+                "driver": {"moving": 9, "drive": 8, "avoid": 3,
+                           "blocked": 6, "recovery": 7, "arrived": 5},
             },
         })
 
@@ -69,6 +73,8 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(1, state.bot_navigation_stats["active"]["safe_local"])
         self.assertEqual(4, state.bot_navigation_stats["recovered"])
         self.assertEqual(13, state.bot_navigation_stats["search"]["pending"])
+        self.assertEqual(15, state.bot_navigation_stats["aim"]["targeted"])
+        self.assertEqual(9, state.bot_navigation_stats["driver"]["moving"])
         before = dict(state.bot_navigation_stats)
         state.update_bot_observation(2, {
             "navigation": {"total": {"reactive": 0}}
@@ -86,6 +92,12 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertIn("nav=direct:2,local:3,reactive:100000 recovered:4", text)
         self.assertIn(
             "astar=pending:13,oldest:12345ms,done:4,failed:2", text
+        )
+        self.assertIn(
+            "aim=targeted:15,aligned:4,traversing:11,limited:7,alive:29", text
+        )
+        self.assertIn(
+            "driver=moving:9,drive:8,avoid:3,blocked:6,recovery:7,arrived:5", text
         )
 
     def test_downloadable_layout_imports_shared_cover_module(self):
