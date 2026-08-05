@@ -466,6 +466,28 @@ class BotAITest(unittest.TestCase):
         self.assertNotEqual(target, order["move_position"])
         self.assertNotEqual(position, order["move_position"])
 
+    def test_mobile_vehicle_approaches_a_distant_contact_before_flanking(self):
+        director = self.ai.BattleDirector("04_himmelsdorf", "far-flank")
+        agent = director.register(
+            1003, 1, descriptor("mediumTank", speed=18.0), "Far flanker"
+        )
+        agent["personality"].update({
+            "initiative": 0.9,
+            "caution": 0.35,
+            "aggression": 0.65,
+        })
+        position = (0.0, 0.0, -200.0)
+        target = (0.0, 0.0, 200.0)
+        director.update_contact(
+            1, 1004, 2, target, 800, 800, "heavyTank", True, 2.0,
+            armor=140.0,
+        )
+
+        order = director.order_for(1003, position, 0.0, 800, 800, 2.0)
+
+        self.assertEqual("advance_contact", order["combat_mode"])
+        self.assertEqual(target, order["move_position"])
+
     def test_shell_selection_uses_armor_instead_of_always_slot_zero(self):
         profile = {
             "shells": (

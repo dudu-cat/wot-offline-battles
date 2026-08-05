@@ -162,14 +162,20 @@ class LANClientQueueTest(unittest.TestCase):
             "candidates": [{"id": "rock"}],
         }]
 
+        navigation = {
+            "total": {"safe_direct": 2, "safe_local": 3, "reactive": 1},
+            "active": {"safe_direct": 0, "safe_local": 1, "reactive": 1},
+            "recovered": 4,
+        }
         self.assertTrue(client.send_bot_observation(
             [{"observing_team": 1, "target_id": 7, "target_kind": "bot",
-              "target_team": 2, "position": (0, 0, 1)}], affordances
+              "target_team": 2, "position": (0, 0, 1)}], affordances, navigation
         ))
 
         self.assertEqual("bot_observation", sent[-1]["type"])
         self.assertEqual(affordances, sent[-1]["affordances"])
         self.assertEqual(1, len(sent[-1]["contacts"]))
+        self.assertEqual(navigation, sent[-1]["navigation"])
 
     def test_observation_failed_send_does_not_consume_throttle_window(self):
         player = Player()
@@ -192,8 +198,8 @@ class LANClientQueueTest(unittest.TestCase):
         player._offhangar_network_is_authority = True
         player._offhangar_network_client = types.SimpleNamespace(
             ready=True, phase="battle",
-            send_bot_observation=lambda contacts, affordances: captured.append(
-                (contacts, affordances)) or True,
+            send_bot_observation=lambda contacts, affordances, navigation: captured.append(
+                (contacts, affordances, navigation)) or True,
         )
         contact = {
             "observing_team": 1, "target_id": 7, "target_kind": "bot", "target_team": 2,
@@ -209,12 +215,24 @@ class LANClientQueueTest(unittest.TestCase):
         reports = [{"bot_id": index, "target_id": 7, "target_kind": "bot",
                     "candidates": [candidate] * 13} for index in range(20)]
 
-        self.assertTrue(self.network.publish_bot_observation(player, [contact] * 65, reports))
-        contacts, affordances = captured[0]
+        raw_navigation = {
+            "total": {"safe_direct": 2, "safe_local": 3, "reactive": -5,
+                      "ignored": 999},
+            "active": {"safe_direct": 0, "safe_local": 1, "reactive": 2},
+            "recovered": 4,
+        }
+        self.assertTrue(self.network.publish_bot_observation(
+            player, [contact] * 65, reports, raw_navigation
+        ))
+        contacts, affordances, navigation = captured[0]
         self.assertEqual(64, len(contacts))
         self.assertEqual(16, len(affordances))
         self.assertEqual(12, len(affordances[0]["candidates"]))
         self.assertNotIn("not_json", affordances[0]["candidates"][0])
+        self.assertEqual(0, navigation["total"]["reactive"])
+        self.assertEqual(3, navigation["total"]["safe_local"])
+        self.assertNotIn("ignored", navigation["total"])
+        self.assertEqual(4, navigation["recovered"])
 
         captured[:] = []
         malformed_contact = dict(contact, position={"x": 1})
@@ -231,12 +249,13 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertTrue(self.network.publish_bot_observation(
             player, [malformed_contact, strict_contact], strict_report
         ))
-        contacts, affordances = captured[0]
+        contacts, affordances, navigation = captured[0]
         self.assertEqual(1, len(contacts))
         self.assertFalse(contacts[0]["visible"])
         self.assertEqual(1, len(affordances[0]["candidates"]))
         self.assertFalse(affordances[0]["candidates"][0]["peek_feasible"])
         self.assertFalse(affordances[0]["candidates"][0]["escape_feasible"])
+        self.assertIsNone(navigation)
 
     def test_send_rejects_client_message_over_server_limit(self):
         player = Player()

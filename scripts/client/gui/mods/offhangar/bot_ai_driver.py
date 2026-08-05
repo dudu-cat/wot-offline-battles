@@ -45,7 +45,8 @@ class LocalDriver(object):
 	segment in that direction is drivable.  It may raise; a failed probe is
 	treated as blocked.
 	"""
-	_CANDIDATE_OFFSETS = (0.0, 0.42, -0.42, 0.78, -0.78, 1.18, -1.18)
+	_CANDIDATE_OFFSETS = (
+		0.0, 0.42, -0.42, 0.78, -0.78, 1.18, -1.18, 1.55, -1.55)
 
 	def __init__(self, stuck_seconds=1.8, recovery_seconds=0.85,
 			separation_radius=12.0, failure_ttl=2.0):
@@ -301,10 +302,23 @@ class LocalDriver(object):
 		state['steering_age'] += step
 		state['plan_age'] += step
 		desired_yaw = _yaw_to(position, target)
+		target_distance = _distance(position, target)
 		displacement = _distance((position[0], 0.0, position[2]),
 		                         (state['last_position'][0], 0.0,
 		                          state['last_position'][1]))
 		state['last_position'] = (float(position[0]), float(position[2]))
+		if target_distance <= 1.5:
+			# Reaching a waypoint is a stop, not a request to drive north: atan2(0, 0)
+			# is zero and previously produced full throttle until the next order tick.
+			state['stuck_time'] = 0.0
+			state['recovery_time'] = 0.0
+			state['steering_yaw'] = None
+			return {
+				'throttle': 0.0,
+				'turn': 0.0,
+				'target_yaw': float(yaw),
+				'recovery_mode': 'arrived',
+			}
 
 		# A low reported speed alone is not enough: waiting at a hold point should
 		# not trigger recovery.  Both physical displacement and velocity must fail.
@@ -328,9 +342,18 @@ class LocalDriver(object):
 
 		if state['recovery_time'] > 0.0:
 			# Alternate the turn direction each recovery so a bot does not grind a
-			# wall forever.  Phase makes adjacent ids leave a traffic jam apart.
+			# wall forever.  Phase makes adjacent ids leave a traffic jam apart. Never
+			# reverse blindly: at a cliff or shoreline the space behind the hull can be
+			# the unsafe side that caused the stall in the first place.
 			direction = 1.0 if ((state['recovery_count'] + int(state['phase'] * 10)) % 2) else -1.0
 			recovery_yaw = float(yaw) + direction * 0.85
+			if not self._clear(direction_clear, float(yaw) + math.pi):
+				return {
+					'throttle': 0.0,
+					'turn': direction,
+					'target_yaw': recovery_yaw,
+					'recovery_mode': 'pivot_recovery',
+				}
 			return {
 				'throttle': -0.72,
 				'turn': direction,

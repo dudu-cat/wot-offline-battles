@@ -1610,14 +1610,11 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 	try:
 		import BigWorld, Math, math
 		speed = abs(float(getattr(vehicle, '_veh_velocity', 0.0) or 0.0))
-		# A stopped tank only needs enough clear road to leave the line-up.  The
-		# previous 15 m x 4.4 m startup corridor touched nearby spawn props on city
-		# maps, rejected every steering candidate and left the recovery logic
-		# pivoting in place.  Longer look-ahead returns once the tank is moving.
-		if speed < 1.5:
-			probe_profile = ((0.9, 6.0), (1.5, 10.0))
-		else:
-			probe_profile = ((0.9, 8.0), (1.5, 20.0 if speed > 5.0 else 15.0))
+		# A stopped tank only needs enough clear road to leave the line-up. Longer
+		# look-ahead returns once it is moving. Ground is sampled every ~4 metres:
+		# checking only the old 6/10 m endpoints could miss a ravine between them.
+		lookahead = 10.0 if speed < 1.5 else (20.0 if speed > 5.0 else 15.0)
+		ground_step = 4.0
 		try:
 			_unused_length, hull_half_width = _offh_ai_hull_dims(
 				getattr(vehicle, 'typeDescriptor', None))
@@ -1625,12 +1622,18 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 			hull_half_width = 1.7
 		corridor_half_width = max(1.4, min(2.0, float(hull_half_width) + 0.15))
 		previous_y = float(vehicle.position.y)
-		previous_distance = 0.0
 		sine = math.sin(float(absolute_yaw))
 		cosine = math.cos(float(absolute_yaw))
 		lateral_x = cosine
 		lateral_z = -sine
-		for height, distance in probe_profile:
+		ground_points = []
+		distance = ground_step
+		while distance < lookahead:
+			ground_points.append(distance)
+			distance += ground_step
+		ground_points.append(lookahead)
+		previous_distance = 0.0
+		for distance in ground_points:
 			x = float(vehicle.position.x) + sine * distance
 			z = float(vehicle.position.z) + cosine * distance
 			run = distance - previous_distance
@@ -1647,19 +1650,24 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 			delta = y - previous_y
 			if delta > run * 0.48 or delta < -run * 0.38:
 				return False
+			previous_y = y
+			previous_distance = distance
+		# Sweep the complete supported corridor at two hull heights. This remains
+		# cheaper than repeating three collision rays at every ground sample.
+		final_x = float(vehicle.position.x) + sine * lookahead
+		final_z = float(vehicle.position.z) + cosine * lookahead
+		for height in (0.9, 1.5):
 			for offset in (-corridor_half_width, 0.0, corridor_half_width):
 				start = Math.Vector3(
 					float(vehicle.position.x) + lateral_x * offset,
 					float(vehicle.position.y) + height,
 					float(vehicle.position.z) + lateral_z * offset)
 				end = Math.Vector3(
-					x + lateral_x * offset, y + height,
-					z + lateral_z * offset)
+					final_x + lateral_x * offset, previous_y + height,
+					final_z + lateral_z * offset)
 				if BigWorld.wg_collideSegment(
 						_offh_bspace(), start, end, 128) is not None:
 					return False
-			previous_y = y
-			previous_distance = distance
 		return True
 	except Exception:
 		return False
@@ -1911,7 +1919,9 @@ def _offh_ai_apply_local_cover(bot_id, position, order, now):
 			cache['phase_until'] = 0.0
 	result = dict(order)
 	result['cover_id'] = candidate.get('id')
-	result['fire_allowed'] = False
+	# Permission remains live throughout the cover cycle. The firing loop below
+	# still requires current LOS, turret alignment and reload completion.
+	result['fire_allowed'] = bool(order.get('fire_allowed'))
 	if phase == 'approach':
 		result['combat_mode'] = 'take_cover'
 		result['move_position'] = (cover['x'], cover['y'], cover['z'])
@@ -1924,7 +1934,7 @@ def _offh_ai_apply_local_cover(bot_id, position, order, now):
 		result['combat_mode'] = 'cover_peek'
 		result['move_position'] = (peek['x'], peek['y'], peek['z'])
 		result['throttle_override'] = 0.56 if peek_distance > 4.5 else 0.0
-		result['fire_allowed'] = bool(order.get('fire_allowed')) and peek_distance <= 4.5
+		result['fire_allowed'] = bool(order.get('fire_allowed'))
 	else:
 		result['combat_mode'] = 'cover_return'
 		result['move_position'] = (cover['x'], cover['y'], cover['z'])
@@ -2113,7 +2123,13 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 		cover_reports = []
 	try:
 		from gui.mods.offhangar.network_battle import publish_bot_observation
-		publish_bot_observation(player, network_contacts, cover_reports)
+		_navigator = globals().get('g_offh_terrain_navigator')
+		_active_bot_ids = [entry['id'] for entry in living
+		                   if entry['id'] != player_id]
+		_navigation = (_navigator.fallback_diagnostics(_active_bot_ids)
+		               if _navigator is not None else None)
+		publish_bot_observation(
+			player, network_contacts, cover_reports, _navigation)
 	except Exception:
 		pass
 
@@ -8762,6 +8778,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_ai_target_id = None
 							_ai_throttle_override = None
 							_ai_shell_index = 0
+							_nav_paused = False
 							# INIT BOT STATES
 							if getattr(m_veh, '_veh_velocity', None) is None: m_veh._veh_velocity = 0.0
 							if getattr(m_veh, '_veh_turn_velocity', None) is None: m_veh._veh_turn_velocity = 0.0
@@ -8838,7 +8855,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									if _nav_distance > 15.0:
 										_nav_mode = _ai_order.get('combat_mode', 'route')
 										_nav_index = int(_ai_order.get('route_index', 0))
-										if _nav_mode == 'route':
+										# LAN server route orders used the name "advance" while the
+										# local planner used "route". Both are the same strategic state.
+										if (_nav_mode in ('route', 'advance') and
+										        _ai_target_id is None):
 											_nav_key = ('route', int(my_team),
 											            _ai_order.get('route_id', 'direct'), _nav_index)
 											_nav_anchor = (_ai_order.get('route_anchor')
@@ -8856,11 +8876,20 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											if _nav_position is not None:
 												_avoid_points.append((_nav_position.x, _nav_position.y,
 												                      _nav_position.z))
-										drive_pos = _offh_ai_navigator(_ai_director).next_target(
+										_navigator = _offh_ai_navigator(_ai_director)
+										_requested_drive_pos = drive_pos
+										drive_pos = _navigator.next_target(
 											eid, (m_veh.position.x, m_veh.position.y, m_veh.position.z),
 											drive_pos, _nav_key, BigWorld.time(), _nav_anchor,
 											_avoid_points)
+										_nav_paused = _navigator.navigation_paused(
+											(m_veh.position.x, m_veh.position.y, m_veh.position.z),
+											_requested_drive_pos, drive_pos)
 								except Exception as _nav_error:
+									# Fall back to the old reactive steering intent. LocalDriver still
+									# probes every candidate corridor and fails closed on probe errors.
+									drive_pos = _requested_drive_pos
+									_nav_paused = False
 									if not getattr(m_veh, '_offh_nav_error_logged', False):
 										m_veh._offh_nav_error_logged = True
 										LOG_DEBUG('OfflineBattle.SMART_AI navigation error id=%s: %s' % (
@@ -8961,7 +8990,18 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							while diff_yaw < -math.pi: diff_yaw += 2 * math.pi
 							_driver_mode = _driver_order.get('recovery_mode', 'drive')
 							_feeler_steer_yaw = target_yaw if _driver_mode == 'avoid' else None
-							if (_ai_throttle_override is not None and _driver_mode == 'drive' and
+							if _nav_paused:
+								# A* returns the current point while a safe path is pending or
+								# unavailable. This is a hard safety stop and must outrank the
+								# strategic route's normal 0.75 throttle request.
+								throttle = 0.0
+								turn_dir = 0.0
+								if m_veh._veh_velocity > 0.0:
+									m_veh._veh_velocity = max(0.0, m_veh._veh_velocity - 20.0 * dt)
+								elif m_veh._veh_velocity < 0.0:
+									m_veh._veh_velocity = min(0.0, m_veh._veh_velocity + 20.0 * dt)
+							elif (_ai_throttle_override is not None and
+							        _driver_mode in ('drive', 'arrived') and
 							        abs(diff_yaw) < 0.65):
 								throttle = float(_ai_throttle_override)
 

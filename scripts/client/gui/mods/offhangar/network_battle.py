@@ -344,15 +344,18 @@ class LANClient(object):
 		self._last_bot_state = now
 		return self._send({'type': 'bot_state', 'bots': bots[:30]})
 
-	def send_bot_observation(self, contacts, affordances=None):
+	def send_bot_observation(self, contacts, affordances=None, navigation=None):
 		now = time.time()
 		if now - self._last_bot_observation < 0.45:
 			return False
-		sent = self._send({
+		message = {
 			'type': 'bot_observation',
 			'contacts': contacts[:64],
 			'affordances': (affordances or ())[:16],
-		})
+		}
+		if navigation is not None:
+			message['navigation'] = navigation
+		sent = self._send(message)
 		if sent:
 			self._last_bot_observation = now
 		return sent
@@ -1014,7 +1017,7 @@ def publish_bot_manifest(player, jobs):
 	return client.send_bot_manifest(manifest)
 
 
-def publish_bot_observation(player, contacts, affordances=None):
+def publish_bot_observation(player, contacts, affordances=None, navigation=None):
 	"""Send the authority's team-visibility report to the global planner."""
 	if not network_is_authority(player):
 		return False
@@ -1097,7 +1100,26 @@ def publish_bot_observation(player, contacts, affordances=None):
 				shared_affordances.append(item)
 		except Exception:
 			continue
-	return client.send_bot_observation(payload, shared_affordances)
+	shared_navigation = None
+	if isinstance(navigation, dict):
+		shared_navigation = {'total': {}, 'active': {}, 'recovered': 0}
+		for group in ('total', 'active'):
+			raw_group = navigation.get(group)
+			if not isinstance(raw_group, dict):
+				continue
+			for name in ('safe_direct', 'safe_local', 'reactive'):
+				try:
+					value = int(raw_group.get(name, 0) or 0)
+				except Exception:
+					value = 0
+				shared_navigation[group][name] = max(0, min(value, 100000))
+		try:
+			value = int(navigation.get('recovered', 0) or 0)
+		except Exception:
+			value = 0
+		shared_navigation['recovered'] = max(0, min(value, 100000))
+	return client.send_bot_observation(
+		payload, shared_affordances, shared_navigation)
 
 
 def authoritative_bot_order(player, mock):

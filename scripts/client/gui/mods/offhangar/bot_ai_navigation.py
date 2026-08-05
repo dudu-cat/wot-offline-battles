@@ -58,7 +58,8 @@ class TerrainGrid(object):
 			return (float(self.bounds[0]) <= x <= float(self.bounds[2]) and
 			        float(self.bounds[1]) <= z <= float(self.bounds[3]))
 		except Exception:
-			return True
+			# Invalid bounds must not silently disable the map-edge guard.
+			return False
 
 	def clear_negative_cache(self):
 		"""Retry cells that may have missed while distant chunks streamed in."""
@@ -217,7 +218,9 @@ class TerrainGrid(object):
 				if self.obstacle_probe(grounded_start, previous, 2.15):
 					clear = False
 			except Exception:
-				pass
+				# Collision-query failure is unknown terrain, not proof that a
+				# several-ton vehicle has a clear corridor.
+				clear = False
 		self._segment_cache[key] = bool(clear)
 		self._segment_cache[(end_key, start_key)] = bool(clear)
 		return clear
@@ -251,6 +254,47 @@ class TerrainGrid(object):
 			if distance < self.cell_size * 1.5:
 				penalty += (self.cell_size * 1.5 - distance) * 3.0
 		return penalty
+
+	def safe_local_target(self, current, goal, now, avoid_points=None,
+			side_preference=1.0):
+		"""Choose one short, fully probed detour when the global search fails.
+
+		This is deliberately not a direct-to-goal fallback. Every candidate must
+		have supported ground, a safe grade, no deep water, no static collision and
+		no remembered failed edge. Returning ``None`` means the only safe action is
+		to stop and retry the global planner later.
+		"""
+		dx = float(goal[0]) - float(current[0])
+		dz = float(goal[2]) - float(current[2])
+		if abs(dx) + abs(dz) < 0.1:
+			return None
+		desired_yaw = math.atan2(dx, dz)
+		side = 1.0 if float(side_preference) >= 0.0 else -1.0
+		offsets = (0.0, side * 0.45, -side * 0.45,
+		           side * 0.85, -side * 0.85,
+		           side * 1.30, -side * 1.30,
+		           side * 1.75, -side * 1.75)
+		distances = (self.cell_size * 0.78, self.cell_size * 0.52)
+		best = None
+		for distance in distances:
+			for offset in offsets:
+				yaw = desired_yaw + offset
+				x = float(current[0]) + math.sin(yaw) * distance
+				z = float(current[2]) + math.cos(yaw) * distance
+				y = self._ground(x, z, float(current[1]))
+				if y is None:
+					continue
+				candidate = (x, y, z)
+				if (self.segment_penalty(current, candidate, now) > 0.0 or
+						not self.segment_clear(current, candidate)):
+					continue
+				cell = self.cell_for(candidate)
+				score = (_distance_2d(candidate, goal) + abs(offset) * 3.5 +
+				         self._penalty(cell, avoid_points) * 2.0)
+				value = (score, abs(offset), candidate)
+				if best is None or value[:2] < best[:2]:
+					best = value
+		return best[2] if best is not None else None
 
 	def plan(self, start, goal, avoid_points=None, max_expansions=1600, now=0.0):
 		"""Return a supported path synchronously (mainly for tests/tools)."""
@@ -333,6 +377,11 @@ class TerrainGrid(object):
 			# anchor still fails instead of silently changing battle lanes.
 			if closest_distance <= 3.0:
 				reached = closest
+			elif frontier and closest != start_cell:
+				# The bounded search still has work, so return the safest progress it
+				# has already proved instead of reporting a false hard failure. The next
+				# request continues from that supported partial path.
+				reached = closest
 			else:
 				yield ()
 				return
@@ -407,6 +456,58 @@ class TerrainNavigator(object):
 		self.search_budget = 0
 		self.search_budget_per_frame = 24
 		self.search_budget_per_path = 4
+		self.fallback_totals = {
+			'safe_direct': 0, 'safe_local': 0, 'reactive': 0}
+		self.fallback_recovered = 0
+		self.fallback_modes = {}
+
+	def _set_fallback_mode(self, bot_id, mode):
+		old_mode = self.fallback_modes.get(int(bot_id))
+		if old_mode == mode:
+			return
+		if old_mode is not None and mode is None:
+			self.fallback_recovered += 1
+		if mode is None:
+			self.fallback_modes.pop(int(bot_id), None)
+		else:
+			self.fallback_modes[int(bot_id)] = mode
+			self.fallback_totals[mode] = self.fallback_totals.get(mode, 0) + 1
+
+	def fallback_diagnostics(self, active_bot_ids=None):
+		if active_bot_ids is not None:
+			active_ids = set(int(value) for value in active_bot_ids)
+			for bot_id in list(self.fallback_modes):
+				if bot_id not in active_ids:
+					self.fallback_modes.pop(bot_id, None)
+		active = {'safe_direct': 0, 'safe_local': 0, 'reactive': 0}
+		for mode in self.fallback_modes.values():
+			active[mode] = active.get(mode, 0) + 1
+		return {
+			'total': dict(self.fallback_totals),
+			'active': active,
+			'recovered': int(self.fallback_recovered),
+		}
+
+	def _fallback_target(self, bot_id, current, goal, now, avoid_points, state,
+			allow_safe_local=True):
+		"""Keep moving without treating an unproved long segment as drivable.
+
+		A fully probed short waypoint is preferred after a conclusive A* failure.
+		If none exists (or the search is merely pending), return the strategic goal
+		as steering intent for LocalDriver. The caller still probes every candidate
+		vehicle-width corridor and can only throttle into one that is locally safe.
+		"""
+		if allow_safe_local:
+			fallback = self.grid.safe_local_target(
+				current, goal, now, avoid_points,
+				1.0 if (int(bot_id) % 2) else -1.0)
+			if fallback is not None:
+				state['last_target'] = tuple(fallback)
+				self._set_fallback_mode(bot_id, 'safe_local')
+				return tuple(fallback)
+		state['last_target'] = tuple(goal)
+		self._set_fallback_mode(bot_id, 'reactive')
+		return tuple(goal)
 
 	def _cache_key(self, path_key, goal):
 		return (tuple(path_key), self.grid.cell_for(goal))
@@ -479,8 +580,21 @@ class TerrainNavigator(object):
 			state = {'last_position': tuple(current), 'progress_time': float(now),
 			         'path_key': None, 'index': 0, 'recovery': 0,
 			         'recovery_until': 0.0, 'recovery_key': None,
-			         'recovery_start': None}
+			         'recovery_start': None, 'request_key': None}
 			self.bot_states[bot_id] = state
+		request_key = self._cache_key(path_key, goal)
+		if state.get('request_key') != request_key:
+			# A new route segment or combat target is not evidence that the previous
+			# request stalled. Reset recovery before evaluating progress.
+			state['request_key'] = request_key
+			state['path_key'] = None
+			state['index'] = 0
+			state['last_position'] = tuple(current)
+			state['progress_time'] = float(now)
+			state['recovery'] = 0
+			state['recovery_until'] = 0.0
+			state['recovery_key'] = None
+			state['recovery_start'] = None
 		if _distance_2d(current, state['last_position']) >= 2.0:
 			state['last_position'] = tuple(current)
 			state['progress_time'] = float(now)
@@ -489,6 +603,13 @@ class TerrainNavigator(object):
 		stalled = (state.get('path_key') is not None and
 		           float(now) - state['progress_time'] >= 4.0)
 		plan_start = tuple(anchor or current)
+		if anchor is not None:
+			# Strategic route annotations are two-dimensional and LAN protocol v5
+			# historically transported them with y=0.  Use the live vehicle layer as
+			# the terrain-probe hint; otherwise elevated spawns make every shared
+			# route search start below the map and fail before its first edge.
+			plan_start = (float(plan_start[0]), float(current[1]),
+			              float(plan_start[2]))
 		effective_key = tuple(path_key)
 		if stalled:
 			state['recovery'] = int(state.get('recovery', 0)) + 1
@@ -509,13 +630,23 @@ class TerrainNavigator(object):
 			plan_start = state['recovery_start']
 		key, path = self._path(effective_key, plan_start, goal, now,
 		                       avoid_points if recovering else None)
+		if path is None:
+			if (self.grid.segment_penalty(current, goal, now) <= 0.0 and
+					self.grid.segment_clear(current, goal)):
+				state['last_target'] = tuple(goal)
+				self._set_fallback_mode(bot_id, 'safe_direct')
+				return tuple(goal)
+			return self._fallback_target(
+				bot_id, current, goal, now, avoid_points, state, False)
 		if not path:
 			if (self.grid.segment_penalty(current, goal, now) <= 0.0 and
 					self.grid.segment_clear(current, goal)):
 				state['last_target'] = tuple(goal)
+				self._set_fallback_mode(bot_id, 'safe_direct')
 				return tuple(goal)
-			state['last_target'] = tuple(current)
-			return tuple(current)
+			state['path_key'] = key
+			return self._fallback_target(
+				bot_id, current, goal, now, avoid_points, state, True)
 		if state.get('path_key') != key:
 			state['path_key'] = key
 			state['index'] = 0
@@ -532,9 +663,17 @@ class TerrainNavigator(object):
 				not self.grid.segment_clear(current, path[index])):
 			join_key = ('join', bot_id, self.grid.cell_for(current)) + tuple(path_key)
 			key, joined_path = self._path(join_key, current, goal, now, avoid_points)
+			if joined_path is None:
+				return self._fallback_target(
+					bot_id, current, goal, now, avoid_points, state, False)
 			if not joined_path:
-				state['last_target'] = tuple(current)
-				return tuple(current)
+				# The cached strategic path is unusable from this hull's actual
+				# position and the join search has conclusively failed. Reuse the
+				# same fully probed short fallback as a failed global search; if no
+				# safe candidate exists, remain stopped and retry.
+				state['path_key'] = key
+				return self._fallback_target(
+					bot_id, current, goal, now, avoid_points, state, True)
 			path = joined_path
 			state['path_key'] = key
 			state['index'] = 0
@@ -553,6 +692,42 @@ class TerrainNavigator(object):
 				lookahead = candidate
 			else:
 				break
+		if (lookahead == len(path) - 1 and
+				_distance_2d(current, path[lookahead]) < reach_radius and
+				_distance_2d(path[lookahead], goal) > reach_radius):
+			# A bounded A* may return a safe partial path. Reaching that endpoint
+			# means "continue planning from here", not "the strategic goal is
+			# complete" and not "wait four seconds until stall recovery".
+			continue_key = (('continue', bot_id, self.grid.cell_for(current)) +
+			                tuple(path_key))
+			next_key, continued = self._path(
+				continue_key, current, goal, now, avoid_points)
+			if continued:
+				path = continued
+				state['path_key'] = next_key
+				next_index = 0
+				for candidate in range(1, min(len(path), 3)):
+					if (self.grid.segment_penalty(current, path[candidate], now) <= 0.0 and
+							self.grid.segment_clear(current, path[candidate])):
+						next_index = candidate
+					else:
+						break
+				state['index'] = next_index
+				state['last_target'] = tuple(path[next_index])
+				return tuple(path[next_index])
+			if continued is None:
+				return self._fallback_target(
+					bot_id, current, goal, now, avoid_points, state, False)
+			return self._fallback_target(
+				bot_id, current, goal, now, avoid_points, state, True)
 		state['index'] = lookahead
 		state['last_target'] = tuple(path[lookahead])
+		self._set_fallback_mode(bot_id, None)
 		return tuple(path[lookahead])
+
+	@staticmethod
+	def navigation_paused(current, requested_goal, selected_target,
+			minimum_request_distance=15.0, hold_radius=0.5):
+		"""True when pathfinding intentionally returned the current position."""
+		return (_distance_2d(current, requested_goal) > float(minimum_request_distance) and
+		        _distance_2d(current, selected_target) <= float(hold_radius))

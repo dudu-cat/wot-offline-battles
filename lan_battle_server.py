@@ -175,6 +175,11 @@ class BattleState:
         self.bot_orders = {"revision": 0, "orders": []}
         self.bot_reported_hits = set()
         self.bot_observation_stats = {1: 0, 2: 0, "accepted": 0}
+        self.bot_navigation_stats = {
+            "total": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
+            "active": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
+            "recovered": 0,
+        }
         self.next_bot_ai_log = 0.0
         self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
                                       "2": {"points": 0, "stopped": False}}}
@@ -208,6 +213,11 @@ class BattleState:
         self.bot_authority_id = connected[0] if connected else None
         if old != self.bot_authority_id and self.phase == "battle":
             self.bot_planner.clear_observations()
+            self.bot_navigation_stats = {
+                "total": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
+                "active": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
+                "recovered": 0,
+            }
             self.pending_events.append({
                 "kind": "authority",
                 "player_id": self.bot_authority_id,
@@ -295,6 +305,11 @@ class BattleState:
                 self.bot_orders = {"revision": 0, "orders": []}
                 self.bot_reported_hits = set()
                 self.bot_observation_stats = {1: 0, 2: 0, "accepted": 0}
+                self.bot_navigation_stats = {
+                    "total": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
+                    "active": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
+                    "recovered": 0,
+                }
                 self.next_bot_ai_log = 0.0
                 self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
                                                "2": {"points": 0, "stopped": False}}}
@@ -500,6 +515,19 @@ class BattleState:
                 1: visible_reports[1], 2: visible_reports[2],
                 "accepted": accepted_contacts,
             }
+            raw_navigation = message.get("navigation")
+            if isinstance(raw_navigation, dict):
+                navigation = {"total": {}, "active": {}}
+                for group in ("total", "active"):
+                    raw_group = raw_navigation.get(group)
+                    if not isinstance(raw_group, dict):
+                        raw_group = {}
+                    for name in ("safe_direct", "safe_local", "reactive"):
+                        navigation[group][name] = max(0, min(
+                            int(_finite_float(raw_group.get(name), 0)), 100000))
+                navigation["recovered"] = max(0, min(
+                    int(_finite_float(raw_navigation.get("recovered"), 0)), 100000))
+                self.bot_navigation_stats = navigation
             return accepted_contacts > 0 or accepted_affordances > 0
 
     @staticmethod
@@ -831,6 +859,7 @@ class BattleState:
                 self.next_bot_ai_log = now + 3.0
                 ai_debug = self.bot_planner.debug_summary(now)
                 ai_debug["reported"] = dict(self.bot_observation_stats)
+                ai_debug["navigation"] = dict(self.bot_navigation_stats)
             events = self.pending_events
             self.pending_events = []
             snapshot = {
@@ -849,6 +878,7 @@ class BattleState:
         if ai_debug is not None:
             teams = ai_debug["teams"]
             reports = ai_debug["reported"]
+            navigation = ai_debug["navigation"]
             mode_counts = {}
             for team in (1, 2):
                 for mode, count in teams[team]["modes"].items():
@@ -857,12 +887,21 @@ class BattleState:
             _server_log(
                 "BOT AI reports=t1:%d,t2:%d accepted=%d "
                 "contacts=t1:%d/%d,t2:%d/%d targets=t1:%d,t2:%d "
-                "fire=t1:%d,t2:%d modes=%s" % (
+                "fire=t1:%d,t2:%d modes=%s "
+                "nav=direct:%d,local:%d,reactive:%d recovered:%d "
+                "active:%d/%d/%d" % (
                     reports.get(1, 0), reports.get(2, 0), reports.get("accepted", 0),
                     teams[1]["visible"], teams[1]["contacts"],
                     teams[2]["visible"], teams[2]["contacts"],
                     teams[1]["targeted"], teams[2]["targeted"],
-                    teams[1]["fire"], teams[2]["fire"], modes or "none"))
+                    teams[1]["fire"], teams[2]["fire"], modes or "none",
+                    navigation["total"].get("safe_direct", 0),
+                    navigation["total"].get("safe_local", 0),
+                    navigation["total"].get("reactive", 0),
+                    navigation.get("recovered", 0),
+                    navigation["active"].get("safe_direct", 0),
+                    navigation["active"].get("safe_local", 0),
+                    navigation["active"].get("reactive", 0)))
         for player in recipients:
             outgoing = snapshot
             if player.bot_order_revision_sent != self.bot_orders["revision"]:

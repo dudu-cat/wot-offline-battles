@@ -684,7 +684,11 @@ class BotPlanner(object):
                 state["phase"] = phase
                 state["phase_until"] = 0.0
         order["cover_id"] = candidate["id"]
-        order["fire_allowed"] = False
+        # This flag is permission to shoot, not a claim that the current lane
+        # is clear.  The authority client still performs the final per-bot LOS,
+        # turret alignment and reload checks.  Keeping it enabled lets a bot
+        # engage an exposed target while approaching, holding or leaving cover.
+        can_fire = bool(order.get("fire_allowed"))
         if phase == "approach":
             order["combat_mode"] = "take_cover"
             order["move_position"] = dict(cover)
@@ -697,7 +701,7 @@ class BotPlanner(object):
             order["combat_mode"] = "cover_peek"
             order["move_position"] = dict(peek)
             order["throttle_override"] = 0.56 if peek_distance > 4.5 else 0.0
-            order["fire_allowed"] = bool(focus.get("visible")) and peek_distance <= 4.5
+            order["fire_allowed"] = can_fire
         else:
             order["combat_mode"] = "cover_return"
             order["move_position"] = dict(cover)
@@ -718,7 +722,7 @@ class BotPlanner(object):
             "face_position": None,
             "move_position": move,
             "fire_allowed": False,
-            "combat_mode": "hold" if holding else "advance",
+            "combat_mode": "hold" if holding else "route",
             "throttle_override": 0.0 if holding else 0.75,
             "desired_range": round(desired_range, 3),
             "fire_range": round(fire_range, 3),
@@ -729,7 +733,7 @@ class BotPlanner(object):
             "profile": profile,
             "shell_index": 0,
         }
-        if focus is None or holding:
+        if focus is None:
             self._engage_anchors.pop(bot["id"], None)
             self._cover_states.pop(bot["id"], None)
             return order
@@ -745,30 +749,34 @@ class BotPlanner(object):
                               focus["position"]["z"] - bz)
         dominant = str(profile.get("dominant_role") or "support")
         roles = profile.get("roles") if isinstance(profile.get("roles"), dict) else {}
+        far_limit = desired_range * (1.08 + personality["caution"] * 0.18)
+        close_limit = desired_range * (0.48 + personality["aggression"] * 0.10)
         if not focus.get("visible"):
             self._engage_anchors.pop(bot["id"], None)
             self._cover_states.pop(bot["id"], None)
             order["combat_mode"] = "investigate"
             order["move_position"] = dict(focus["position"])
             order["throttle_override"] = 0.65
+        elif distance > far_limit:
+            self._engage_anchors.pop(bot["id"], None)
+            self._cover_states.pop(bot["id"], None)
+            order["combat_mode"] = "advance_contact"
+            order["move_position"] = dict(focus["position"])
+            order["throttle_override"] = 0.72
         elif (distance <= fire_range * 1.15 and
               self._apply_cover_order(order, bot, focus, personality, now)):
             self._engage_anchors.pop(bot["id"], None)
+        elif distance < close_limit and dominant != "brawler":
+            self._engage_anchors.pop(bot["id"], None)
+            self._cover_states.pop(bot["id"], None)
+            order["combat_mode"] = "withdraw"
+            order["move_position"] = dict(route_anchor)
+            order["throttle_override"] = None
         elif roles.get("flanker", 0.0) >= 0.68 and personality["initiative"] > 0.42:
             self._engage_anchors.pop(bot["id"], None)
             order["combat_mode"] = "flank"
             order["move_position"] = self._flank_point(bot, focus, desired_range)
             order["throttle_override"] = 0.78
-        elif distance > desired_range * (1.08 + personality["caution"] * 0.18):
-            self._engage_anchors.pop(bot["id"], None)
-            order["combat_mode"] = "advance_contact"
-            order["move_position"] = dict(focus["position"])
-            order["throttle_override"] = 0.72
-        elif distance < desired_range * (0.48 + personality["aggression"] * 0.10) and dominant != "brawler":
-            self._engage_anchors.pop(bot["id"], None)
-            order["combat_mode"] = "withdraw"
-            order["move_position"] = dict(route_anchor)
-            order["throttle_override"] = None
         else:
             order["combat_mode"] = "engage"
             target_key = (focus.get("target_kind"), focus["id"])

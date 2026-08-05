@@ -711,14 +711,9 @@ class BattleDirector(object):
 				        profile['dominant_role'] != 'brawler'):
 					order['move_position'] = self._fallback_position(agent, position)
 					order['combat_mode'] = 'withdraw'
-				elif (profile['roles'].get('flanker', 0.0) >= 0.68 and
-				      distance < profile['fire_range'] * 1.15 and
-				      force_balance >= -0.35 and personality['initiative'] > 0.38):
-					order['move_position'] = self._flank_position(
-						agent, position, contact['position'])
-					order['combat_mode'] = 'flank'
 				elif distance > profile['desired_range'] * far_ratio:
 					order['move_position'] = contact['position']
+					order['combat_mode'] = 'advance_contact'
 				elif distance < profile['desired_range'] * close_ratio:
 					# Use the route as a known-safe fallback instead of reversing into
 					# arbitrary geometry. Brawlers with high aggression are less eager.
@@ -727,6 +722,12 @@ class BattleDirector(object):
 						order['combat_mode'] = 'withdraw'
 					else:
 						order['move_position'] = tuple(position)
+				elif (profile['roles'].get('flanker', 0.0) >= 0.68 and
+				      distance < profile['fire_range'] * 1.15 and
+				      force_balance >= -0.35 and personality['initiative'] > 0.38):
+					order['move_position'] = self._flank_position(
+						agent, position, contact['position'])
+					order['combat_mode'] = 'flank'
 				else:
 					order['move_position'] = tuple(position)
 				# Some armoured turreted drivers habitually rock their hull while

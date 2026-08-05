@@ -50,7 +50,7 @@ class BotAIDriverTest(unittest.TestCase):
             order["face_position"],
         )
 
-        self.assertEqual("advance", order["combat_mode"])
+        self.assertEqual("route", order["combat_mode"])
         self.assertIsNone(order["aim_position"])
         self.assertFalse(should_stop)
         self.assertEqual(order["move_position"], aim)
@@ -77,6 +77,18 @@ class BotAIDriverTest(unittest.TestCase):
         self.assertGreater(order["throttle"], 0.9)
         self.assertAlmostEqual(0.0, order["turn"], places=5)
         self.assertAlmostEqual(0.0, order["target_yaw"], places=5)
+
+    def test_reaching_a_target_never_turns_zero_vector_into_full_throttle(self):
+        driver = self.module.LocalDriver()
+
+        order = driver.drive(
+            101, (4.0, 12.0, -8.0), 1.2, 0.0, 0.1,
+            (4.0, 0.0, -8.0), (), lambda angle: True,
+        )
+
+        self.assertEqual("arrived", order["recovery_mode"])
+        self.assertEqual(0.0, order["throttle"])
+        self.assertEqual(0.0, order["turn"])
 
     def test_blocked_forward_ray_chooses_open_side(self):
         driver = self.module.LocalDriver()
@@ -110,6 +122,25 @@ class BotAIDriverTest(unittest.TestCase):
                 break
         self.assertEqual("reverse_turn", order["recovery_mode"])
         self.assertNotEqual(first_turn, order["turn"])
+
+    def test_recovery_never_reverses_into_an_unsafe_corridor(self):
+        driver = self.module.LocalDriver(stuck_seconds=0.4, recovery_seconds=0.5)
+        order = None
+
+        def only_forward_is_clear(angle):
+            return abs(math.atan2(math.sin(angle), math.cos(angle))) < 1.0
+
+        for unused in range(10):
+            order = driver.drive(
+                102, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+                (0.0, 0.0, 50.0), (), only_forward_is_clear,
+            )
+            if order["recovery_mode"] == "pivot_recovery":
+                break
+
+        self.assertEqual("pivot_recovery", order["recovery_mode"])
+        self.assertEqual(0.0, order["throttle"])
+        self.assertNotEqual(0.0, order["turn"])
 
     def test_neighbours_and_identity_phase_stagger_bots(self):
         driver = self.module.LocalDriver(stuck_seconds=0.6)

@@ -1,4 +1,6 @@
 import json
+import contextlib
+import io
 import os
 from pathlib import Path
 import shutil
@@ -48,6 +50,38 @@ def _cover_candidate(candidate_id="rock", x=-8.0, z=-12.0):
 
 
 class ServerBotPlannerTests(unittest.TestCase):
+    def test_navigation_fallback_diagnostics_are_bounded_and_rate_limited(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        state.bot_authority_id = 1
+        state.update_bot_observation(1, {
+            "contacts": [],
+            "navigation": {
+                "total": {"safe_direct": 2, "safe_local": 3, "reactive": 200000},
+                "active": {"safe_direct": 0, "safe_local": 1, "reactive": 2},
+                "recovered": 4,
+            },
+        })
+
+        self.assertEqual(100000, state.bot_navigation_stats["total"]["reactive"])
+        self.assertEqual(1, state.bot_navigation_stats["active"]["safe_local"])
+        self.assertEqual(4, state.bot_navigation_stats["recovered"])
+        before = dict(state.bot_navigation_stats)
+        state.update_bot_observation(2, {
+            "navigation": {"total": {"reactive": 0}}
+        })
+        self.assertEqual(before, state.bot_navigation_stats)
+
+        state.bot_manifest = _manifest()
+        state.bot_states = {entry["id"]: entry for entry in _states()}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            state.tick_once(0.05)
+            state.tick_once(0.05)
+        text = output.getvalue()
+        self.assertEqual(1, text.count("BOT AI reports="))
+        self.assertIn("nav=direct:2,local:3,reactive:100000 recovered:4", text)
+
     def test_downloadable_layout_imports_shared_cover_module(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             package_root = Path(temp_dir)
@@ -80,7 +114,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         second = planner.build_orders(_manifest(), _states(), [], 0.1)
         self.assertEqual(1, first["revision"])
         self.assertEqual(first, second)
-        self.assertEqual({"advance"}, {order["combat_mode"] for order in first["orders"]})
+        self.assertEqual({"route"}, {order["combat_mode"] for order in first["orders"]})
 
     def test_unchanged_orders_are_omitted_from_following_snapshots(self):
         class CaptureConnection(object):
@@ -132,7 +166,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         before = planner.build_orders(manifest, _states(), [], 0.0)
         before_order = next(order for order in before["orders"] if order["id"] == 1)
         self.assertIsNone(before_order["target_id"])
-        self.assertEqual("advance", before_order["combat_mode"])
+        self.assertEqual("route", before_order["combat_mode"])
 
         planner.report_contacts([{
             "observing_team": 1, "target_kind": "bot", "target_id": 3,
@@ -145,12 +179,63 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(3, engaged_order["target_id"])
         self.assertEqual({"x": 0.0, "y": 0.0, "z": 20.0}, engaged_order["aim_position"])
         self.assertTrue(engaged_order["fire_allowed"])
-        self.assertNotEqual("advance", engaged_order["combat_mode"])
+        self.assertNotEqual("route", engaged_order["combat_mode"])
 
         expired = planner.build_orders(manifest, _states(), [], 9.1)
         expired_order = next(order for order in expired["orders"] if order["id"] == 1)
         self.assertIsNone(expired_order["target_id"])
-        self.assertEqual("advance", expired_order["combat_mode"])
+        self.assertEqual("route", expired_order["combat_mode"])
+
+    def test_visible_enemy_overrides_a_route_hold(self):
+        planner = BotPlanner()
+        manifest = _manifest()
+        manifest[0]["profile"] = {
+            "dominant_role": "brawler", "desired_range": 40.0,
+            "fire_range": 500.0, "roles": {"brawler": 1.0},
+        }
+        manifest[0]["route"] = {
+            "id": "held_lane", "waypoints": [
+                {"x": 0, "y": 0, "z": -40},
+                {"x": 0, "y": 0, "z": -20, "hold": True},
+                {"x": 0, "y": 0, "z": 200},
+            ],
+        }
+        planner.report_contacts([{
+            "observing_team": 1, "target_kind": "bot", "target_id": 3,
+            "target_team": 2, "visible": True,
+            "x": 0, "y": 0, "z": 20, "health": 1000,
+            "max_health": 1000,
+        }], planner.known_targets(_states(), []), 1.0)
+
+        result = planner.build_orders(manifest, _states(), [], 1.0)
+        order = next(value for value in result["orders"] if value["id"] == 1)
+
+        self.assertEqual(3, order["target_id"])
+        self.assertTrue(order["fire_allowed"])
+        self.assertNotEqual("hold", order["combat_mode"])
+
+    def test_distant_mobile_bot_approaches_before_attempting_a_flank(self):
+        planner = BotPlanner()
+        manifest = _manifest()
+        manifest[0]["profile"] = {
+            "dominant_role": "flanker", "desired_range": 80.0,
+            "fire_range": 500.0,
+            "roles": {"flanker": 1.0, "support": 0.7},
+        }
+        states = _states()
+        states[2] = dict(states[2], x=0, z=420)
+        planner.report_contacts([{
+            "observing_team": 1, "target_kind": "bot", "target_id": 3,
+            "target_team": 2, "visible": True,
+            "x": 0, "y": 0, "z": 420, "health": 1000,
+            "max_health": 1000,
+        }], planner.known_targets(states, []), 1.0)
+
+        result = planner.build_orders(manifest, states, [], 1.0)
+        order = next(value for value in result["orders"] if value["id"] == 1)
+
+        self.assertEqual("advance_contact", order["combat_mode"])
+        self.assertEqual(order["aim_position"], order["move_position"])
 
     def test_debug_summary_exposes_contact_order_and_fire_chain(self):
         planner = BotPlanner()
@@ -283,7 +368,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         approach = planner.build_orders(manifest, _states(), players, 1.0)
         approach_order = next(value for value in approach["orders"] if value["id"] == 1)
         self.assertEqual("take_cover", approach_order["combat_mode"])
-        self.assertFalse(approach_order["fire_allowed"])
+        self.assertTrue(approach_order["fire_allowed"])
 
         at_cover = _states()
         at_cover[0] = dict(at_cover[0], x=-8.0, z=-12.0)
@@ -294,7 +379,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         peek = planner.build_orders(manifest, at_cover, players, 3.0)
         peek_order = next(value for value in peek["orders"] if value["id"] == 1)
         self.assertEqual("cover_peek", peek_order["combat_mode"])
-        self.assertFalse(peek_order["fire_allowed"])
+        self.assertTrue(peek_order["fire_allowed"])
 
         at_peek = _states()
         at_peek[0] = dict(at_peek[0], x=-2.0, z=-10.0)
@@ -306,7 +391,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         returning = planner.build_orders(manifest, at_peek, players, 5.5)
         returning_order = next(value for value in returning["orders"] if value["id"] == 1)
         self.assertEqual("cover_return", returning_order["combat_mode"])
-        self.assertFalse(returning_order["fire_allowed"])
+        self.assertTrue(returning_order["fire_allowed"])
 
     def test_cover_report_requires_an_existing_team_contact(self):
         planner = BotPlanner()
