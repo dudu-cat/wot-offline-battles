@@ -10,9 +10,15 @@ probes so it can be tested outside the legacy client.
 
 import heapq
 import math
+import time
 
 
 SQRT_TWO = math.sqrt(2.0)
+
+try:
+	_CLOCK = time.clock
+except AttributeError:
+	_CLOCK = time.perf_counter
 
 
 def _distance_2d(first, second):
@@ -453,10 +459,11 @@ class TerrainNavigator(object):
 		self.searches = {}
 		self.search_times = {}
 		self.bot_states = {}
-		self.search_frame = None
+		self.search_frame_time = None
 		self.search_next_key = None
-		self.search_budget_per_frame = 32
+		self.search_budget_per_frame = 128
 		self.search_budget_per_path = 4
+		self.search_time_budget = 0.0025
 		self.search_completed = 0
 		self.search_failed = 0
 		self.search_now = 0.0
@@ -477,7 +484,7 @@ class TerrainNavigator(object):
 			self.fallback_modes[int(bot_id)] = mode
 			self.fallback_totals[mode] = self.fallback_totals.get(mode, 0) + 1
 
-	def fallback_diagnostics(self, active_bot_ids=None):
+	def fallback_diagnostics(self, active_bot_ids=None, now=None):
 		if active_bot_ids is not None:
 			active_ids = set(int(value) for value in active_bot_ids)
 			for bot_id in list(self.fallback_modes):
@@ -497,6 +504,8 @@ class TerrainNavigator(object):
 				'oldest_ms': int(max(0.0, self.search_now -
 					min(self.search_times.values())) * 1000.0)
 					if self.search_times else 0,
+				'tick_age_ms': int(max(0.0, float(now) - self.search_now) * 1000.0)
+					if now is not None else 0,
 			},
 		}
 
@@ -567,10 +576,10 @@ class TerrainNavigator(object):
 		before any task receives a second, and remembers the next task across frames.
 		"""
 		self.search_now = float(now)
-		frame = int(float(now) * 30.0 + 0.5)
-		if frame == self.search_frame:
+		if (self.search_frame_time is not None and
+				abs(float(now) - self.search_frame_time) < 0.000001):
 			return
-		self.search_frame = frame
+		self.search_frame_time = float(now)
 		keys = sorted(self.searches, key=lambda value: repr(value))
 		if not keys:
 			self.search_next_key = None
@@ -583,21 +592,37 @@ class TerrainNavigator(object):
 		steps = {}
 		budget = max(0, int(self.search_budget_per_frame))
 		per_path = max(1, int(self.search_budget_per_path))
+		# Preserve the old 32-expansion floor so one expensive probe cannot reduce
+		# a lone search to one node per frame; the clock budget limits only the
+		# additional burst up to the new hard cap.
+		minimum_round = min(budget, max(len(queue), 32))
+		processed = 0
+		started = _CLOCK()
 		while budget > 0 and queue:
 			key = queue.pop(0)
 			search = self.searches.get(key)
 			if search is None:
 				continue
 			search.step(1)
-			search.last_frame = frame
+			search.last_frame = float(now)
 			budget -= 1
+			processed += 1
 			steps[key] = steps.get(key, 0) + 1
 			if search.done:
 				self._finish_search(key, search, now)
 			elif steps[key] < per_path:
 				queue.append(key)
+			if (processed >= minimum_round and self.search_time_budget > 0.0 and
+					_CLOCK() - started >= self.search_time_budget):
+				break
 		self.search_next_key = queue[0] if queue else None
 		self._trim_cache(now)
+
+	def tick(self, now):
+		"""Advance shared path jobs once per rendered frame, even when bots hold."""
+		self._advance_searches(now)
+		self.grid.prune_failed_edges(now)
+		self.grid.trim_caches()
 
 	def _path(self, path_key, start, goal, now, avoid_points):
 		key = self._cache_key(path_key, goal)
@@ -649,16 +674,30 @@ class TerrainNavigator(object):
 		# effect. Once every active bot had a cached/partial path, _path() returned
 		# before advancing unrelated join and continuation jobs, leaving the whole
 		# room parked with an ever-growing pending queue.
-		self._advance_searches(now)
-		self.grid.prune_failed_edges(now)
-		self.grid.trim_caches()
+		self.tick(now)
 		state = self.bot_states.get(bot_id)
 		if state is None:
 			state = {'last_position': tuple(current), 'progress_time': float(now),
 			         'path_key': None, 'index': 0, 'recovery': 0,
 			         'recovery_until': 0.0, 'recovery_key': None,
-			         'recovery_start': None, 'request_key': None}
+			         'recovery_start': None, 'request_key': None,
+			         'request_path_key': None, 'planned_goal': None,
+			         'planned_at': 0.0}
 			self.bot_states[bot_id] = state
+		path_identity = tuple(path_key)
+		planned_goal = state.get('planned_goal')
+		if (state.get('request_path_key') == path_identity and
+				planned_goal is not None and
+				_distance_2d(planned_goal, goal) < self.grid.cell_size * 2.0 and
+				float(now) - float(state.get('planned_at', 0.0)) < 2.0):
+			# A moving contact may cross a coarse cell every observation. Keep the
+			# current terrain plan briefly instead of cancelling it before A* can
+			# finish; aiming still uses the target's current live pose.
+			goal = tuple(planned_goal)
+		else:
+			state['request_path_key'] = path_identity
+			state['planned_goal'] = tuple(goal)
+			state['planned_at'] = float(now)
 		request_key = self._cache_key(path_key, goal)
 		if state.get('request_key') != request_key:
 			# A new route segment or combat target is not evidence that the previous
@@ -809,10 +848,17 @@ class TerrainNavigator(object):
 					bot_id, current, goal, now, avoid_points, state, False)
 			return self._fallback_target(
 				bot_id, current, goal, now, avoid_points, state, True)
+		selected = tuple(path[lookahead])
+		if (_distance_2d(current, selected) <= 0.5 and
+				_distance_2d(current, goal) > 15.0):
+			# A cached path whose first usable edge has become blocked must not park
+			# the hull on its own position until the four-second stall timer fires.
+			return self._fallback_target(
+				bot_id, current, goal, now, avoid_points, state, True)
 		state['index'] = lookahead
-		state['last_target'] = tuple(path[lookahead])
+		state['last_target'] = selected
 		self._set_fallback_mode(bot_id, None)
-		return tuple(path[lookahead])
+		return selected
 
 	@staticmethod
 	def navigation_paused(current, requested_goal, selected_target,

@@ -183,6 +183,7 @@ class LANClient(object):
 		self.bot_authority_id = None
 		self.bot_order_revision = 0
 		self.bot_orders = {}
+		self._last_order_resync = 0.0
 		self._last_error = None
 		self._error_notified = False
 		self._stop_requested = False
@@ -360,6 +361,18 @@ class LANClient(object):
 			self._last_bot_observation = now
 		return sent
 
+	def request_bot_orders(self):
+		"""Rate-limited application-level recovery for a missing bot order."""
+		now = time.time()
+		if now - self._last_order_resync < 0.5:
+			return False
+		self._last_order_resync = now
+		return self._send({
+			'type': 'bot_order_resync',
+			'revision': int(self.bot_order_revision or 0),
+			'loaded': len(self.bot_orders or {}),
+		})
+
 	def send_bot_hit(self, target_id, shot_seq, damage, shot_result,
 			impact_position=None):
 		message = {
@@ -416,6 +429,31 @@ class LANClient(object):
 			role = 'simulation authority' if self.player._offhangar_network_is_authority else 'relay client'
 			LOG_NOTE('LAN bot authority=%s; local role=%s' % (authority_id, role))
 			_system_message('LAN battle authority: player %s (%s).' % (authority_id, role))
+
+	def _load_bot_orders(self, message):
+		"""Apply a complete revision body and acknowledge game-thread delivery."""
+		if not isinstance(message, dict) or 'bot_orders' not in message:
+			return False
+		try:
+			revision = int(message.get('bot_order_revision', 0) or 0)
+		except (TypeError, ValueError):
+			return False
+		if revision < self.bot_order_revision:
+			return False
+		if (revision > self.bot_order_revision or
+				(revision == 0 and not self.bot_orders)):
+			orders = {}
+			for order in message.get('bot_orders') or ():
+				try:
+					orders[int(order.get('id'))] = order
+				except Exception:
+					continue
+			self.bot_order_revision = revision
+			self.bot_orders = orders
+			self.player._offhangar_network_bot_order_revision = revision
+			self.player._offhangar_network_bot_orders = orders
+		self._send({'type': 'bot_order_ack', 'revision': revision})
+		return True
 
 	def request_start(self, map_name=None):
 		if not self.ready or self.phase != 'waiting':
@@ -565,6 +603,7 @@ class LANClient(object):
 				self.player._offhangar_network_roster_count = count
 				LOG_NOTE('LAN waiting room: %d player(s); choose a map and click START BATTLE' % count)
 		elif kind == 'battle_start':
+			self._load_bot_orders(message)
 			if self.battle_started:
 				return
 			self.battle_started = True
@@ -609,24 +648,7 @@ class LANClient(object):
 		elif kind == 'snapshot':
 			self._last_snapshot = time.time()
 			self._set_authority(message.get('bot_authority_id'))
-			try:
-				revision = int(message.get('bot_order_revision', 0) or 0)
-			except (TypeError, ValueError):
-				revision = 0
-			has_order_payload = 'bot_orders' in message
-			if (has_order_payload and
-					(revision > self.bot_order_revision or
-					 (revision == 0 and not self.bot_orders))):
-				orders = {}
-				for order in message.get('bot_orders') or ():
-					try:
-						orders[int(order.get('id'))] = order
-					except Exception:
-						continue
-				self.bot_order_revision = revision
-				self.bot_orders = orders
-				self.player._offhangar_network_bot_order_revision = revision
-				self.player._offhangar_network_bot_orders = orders
+			self._load_bot_orders(message)
 			self.player._offhangar_network_snapshot = message
 			_apply_snapshot(self.player, message)
 		elif kind == 'events':
@@ -1004,12 +1026,16 @@ def publish_bot_manifest(player, jobs):
 				director_getter = getattr(offline, '_offh_ai_director', None)
 				director = director_getter(player) if callable(director_getter) else None
 				if director is not None:
+					import Math
 					agent = director.register_profile(bot_id, team, profile, name)
 					route = agent.get('route') or {}
 					waypoints = []
 					for point in route.get('waypoints', ()):
+						grounded = _ground_world_point(
+							Math.Vector3(float(point[0]), 0.0, float(point[1])))
+						world_y = float(grounded.y) if grounded is not None else 0.0
 						shared, unused_yaw = _server_pose_from_world(
-							player, point[0], 0.0, point[1], 0.0)
+							player, point[0], world_y, point[1], 0.0)
 						waypoints.append({
 							'x': shared[0], 'y': shared[1], 'z': shared[2],
 							'hold': bool(point[2]) if len(point) > 2 else False,
@@ -1144,7 +1170,8 @@ def publish_bot_observation(player, contacts, affordances=None, navigation=None)
 		shared_navigation['recovered'] = max(0, min(value, 100000))
 		raw_search = navigation.get('search')
 		if isinstance(raw_search, dict):
-			for name in ('pending', 'completed', 'failed', 'oldest_ms'):
+			for name in ('pending', 'completed', 'failed', 'oldest_ms',
+					'tick_age_ms'):
 				try:
 					value = int(raw_search.get(name, 0) or 0)
 				except Exception:
@@ -1171,7 +1198,8 @@ def publish_bot_observation(player, contacts, affordances=None, navigation=None)
 		raw_driver = navigation.get('driver')
 		if isinstance(raw_driver, dict):
 			shared_navigation['driver'] = {}
-			for name in ('moving', 'drive', 'avoid', 'blocked', 'recovery', 'arrived'):
+			for name in ('moving', 'drive', 'avoid', 'blocked', 'recovery', 'arrived',
+					'server_wait'):
 				try:
 					value = int(raw_driver.get(name, 0) or 0)
 				except Exception:
@@ -1193,6 +1221,10 @@ def authoritative_bot_order(player, mock):
 		return None
 	raw = client.bot_orders.get(int(bot_id))
 	if raw is None:
+		try:
+			client.request_bot_orders()
+		except Exception:
+			pass
 		return None
 	order = dict(raw)
 	for key in ('aim_position', 'face_position', 'move_position', 'route_anchor'):
@@ -1229,7 +1261,11 @@ def authoritative_bot_order(player, mock):
 				order['aim_position'] = live_position
 				order['face_position'] = live_position
 			except Exception:
-				pass
+				order['fire_allowed'] = False
+		else:
+			# A visible order is permission to attempt a shot, but only the authority
+			# client can prove the rendered target still exists at a live pose.
+			order['fire_allowed'] = False
 	return order
 
 

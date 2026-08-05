@@ -135,6 +135,7 @@ class BotNavigationTest(unittest.TestCase):
         )
         navigator.search_budget_per_frame = 512
         navigator.search_budget_per_path = 512
+        navigator.search_time_budget = 0.0
         current = (-10.0, 0.0, 0.0)
         goal = (10.0, 0.0, 0.0)
         target = current
@@ -369,6 +370,75 @@ class BotNavigationTest(unittest.TestCase):
         self.assertEqual(48, sum(steps))
         self.assertGreater(min(steps), 0)
         self.assertLessEqual(max(steps) - min(steps), 1)
+
+    def test_global_tick_advances_searches_without_a_long_distance_bot_request(self):
+        navigator = self.navigation.TerrainNavigator(
+            lambda x, z, hint: 0.0, cell_size=10.0
+        )
+        navigator.search_budget_per_frame = 1
+        navigator.search_time_budget = 0.0
+
+        class PendingSearch:
+            def __init__(self):
+                self.done = False
+                self.result = None
+                self.steps = 0
+
+            def step(self, budget):
+                self.steps += budget
+                return False
+
+        key = (("join", 9), (3, 3))
+        search = PendingSearch()
+        navigator.searches[key] = search
+        navigator.search_times[key] = 0.0
+
+        navigator.tick(1.0)
+        navigator.tick(1.0)
+        self.assertEqual(1, search.steps)
+        navigator.tick(1.01)
+        self.assertEqual(2, search.steps)
+
+    def test_moving_contact_keeps_a_short_lived_stable_planning_goal(self):
+        navigator = self.navigation.TerrainNavigator(
+            lambda x, z, hint: 0.0,
+            bounds=(-100.0, -100.0, 100.0, 100.0),
+            cell_size=10.0,
+        )
+        current = (0.0, 0.0, 0.0)
+        path_key = ("local", 7, "advance_contact", 3)
+        first_goal = (0.0, 0.0, 60.0)
+        navigator.next_target(7, current, first_goal, path_key, 1.0)
+        first_request = navigator.bot_states[7]["request_key"]
+
+        navigator.next_target(
+            7, current, (15.0, 0.0, 60.0), path_key, 1.5
+        )
+
+        self.assertEqual(first_goal, navigator.bot_states[7]["planned_goal"])
+        self.assertEqual(first_request, navigator.bot_states[7]["request_key"])
+
+    def test_blocked_first_path_edge_uses_fallback_instead_of_current_position(self):
+        navigator = self.navigation.TerrainNavigator(
+            lambda x, z, hint: 0.0,
+            bounds=(-100.0, -100.0, 100.0, 100.0),
+            cell_size=10.0,
+        )
+        current = (0.0, 0.0, 0.0)
+        goal = (0.0, 0.0, 60.0)
+        key = navigator._cache_key(("route", 1, "blocked", 1), goal)
+        navigator._path = lambda *args: (
+            key, (current, (0.0, 0.0, 10.0), goal)
+        )
+        navigator.grid.segment_clear = lambda start, end: start == end
+        navigator.grid.safe_local_target = lambda *args: None
+
+        selected = navigator.next_target(
+            7, current, goal, ("route", 1, "blocked", 1), 1.0
+        )
+
+        self.assertEqual(goal, selected)
+        self.assertEqual("reactive", navigator.fallback_modes[7])
 
     def test_cached_path_still_advances_unrelated_pending_searches(self):
         navigator = self.navigation.TerrainNavigator(

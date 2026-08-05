@@ -740,6 +740,86 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertEqual((12.0, 3.0, -7.0), order["aim_position"])
         self.assertEqual(order["aim_position"], order["face_position"])
 
+    def test_visible_order_fails_closed_when_live_target_is_missing(self):
+        player = Player()
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_id = 2
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True, phase="battle",
+            bot_orders={16: {
+                "id": 16, "target_id": 999, "target_kind": "human",
+                "fire_allowed": True,
+                "aim_position": {"x": -4.0, "y": 1.0, "z": 80.0},
+            }},
+        )
+
+        order = self.network.authoritative_bot_order(
+            player, types.SimpleNamespace(_network_bot_id=16)
+        )
+
+        self.assertFalse(order["fire_allowed"])
+
+    def test_battle_start_loads_and_acknowledges_initial_orders(self):
+        player = Player()
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        sent = []
+        client._send = lambda message: sent.append(message) or True
+
+        client._handle_message({
+            "type": "battle_start", "map": "04_himmelsdorf", "round_id": 3,
+            "players": [], "bots": [], "bot_manifest": [],
+            "bot_authority_id": 1, "bot_order_revision": 6,
+            "bot_orders": [{"id": 16, "target_id": 2}],
+        })
+
+        self.assertEqual(6, client.bot_order_revision)
+        self.assertEqual(2, client.bot_orders[16]["target_id"])
+        self.assertIn({"type": "bot_order_ack", "revision": 6}, sent)
+
+    def test_published_route_waypoints_include_probed_ground_height(self):
+        player = Player()
+        player._offhangar_network_is_authority = True
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        client.ready = True
+        client.phase = "battle"
+        player._offhangar_network_client = client
+        captured = []
+        client.send_bot_manifest = lambda manifest: captured.extend(manifest) or True
+        director = types.SimpleNamespace(register_profile=lambda *args: {
+            "route": {"id": "ridge", "waypoints": [(10.0, 20.0, False)]}
+        })
+        offline = sys.modules["gui.mods.offhangar.offline_battle"]
+        old_director = getattr(offline, "_offh_ai_director", None)
+        old_space = getattr(offline, "_offh_bspace", None)
+        old_collide = sys.modules["BigWorld"].wg_collideSegment
+        vector3 = sys.modules["Math"].Vector3
+        offline._offh_ai_director = lambda unused: director
+        offline._offh_bspace = lambda: 1
+        sys.modules["BigWorld"].wg_collideSegment = (
+            lambda space, start, end, flags: (vector3(start.x, 42.0, start.z),)
+        )
+        try:
+            result = self.network.publish_bot_manifest(player, [
+                (1, 1, 0, "ussr:T-34", "Bot", 1000, 0.0, 0.0, 0.0)
+            ])
+        finally:
+            sys.modules["BigWorld"].wg_collideSegment = old_collide
+            if old_director is None:
+                del offline._offh_ai_director
+            else:
+                offline._offh_ai_director = old_director
+            if old_space is None:
+                del offline._offh_bspace
+            else:
+                offline._offh_bspace = old_space
+
+        self.assertTrue(result)
+        self.assertEqual(42.0, captured[0]["route"]["waypoints"][0]["y"])
+
     def test_snapshot_same_revision_does_not_replace_orders_but_initial_zero_does(self):
         player = Player()
         client = self.network.LANClient(player, "127.0.0.1", 28782, "Alpha", "ussr:T-34")
@@ -795,6 +875,65 @@ class LANClientQueueTest(unittest.TestCase):
 
         self.assertEqual(7, client.bot_order_revision)
         self.assertEqual(2, client.bot_orders[16]["target_id"])
+
+    def test_cross_revision_coalesce_recovers_from_server_retransmit(self):
+        player = Player()
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        player._offhangar_network_client = client
+        client.bot_order_revision = 7
+        client.bot_orders = {16: {"id": 16, "target_id": 2}}
+        sent = []
+        client._send = lambda message: sent.append(message) or True
+        with client._pending_lock:
+            client._pending = [
+                {
+                    "type": "snapshot", "bot_authority_id": 1,
+                    "players": [], "bots": [], "bot_order_revision": 8,
+                    "bot_orders": [{"id": 16, "target_id": 3}],
+                },
+                {
+                    "type": "snapshot", "bot_authority_id": 1,
+                    "players": [], "bots": [], "bot_order_revision": 9,
+                    "server_tick": 102,
+                },
+            ]
+
+        client._poll()
+        self.assertEqual(7, client.bot_order_revision)
+        self.assertEqual(2, client.bot_orders[16]["target_id"])
+
+        client._handle_message({
+            "type": "snapshot", "bot_authority_id": 1,
+            "players": [], "bots": [], "bot_order_revision": 9,
+            "bot_orders": [{"id": 16, "target_id": 4}],
+        })
+        self.assertEqual(9, client.bot_order_revision)
+        self.assertEqual(4, client.bot_orders[16]["target_id"])
+        self.assertIn({"type": "bot_order_ack", "revision": 9}, sent)
+
+    def test_missing_bot_order_requests_rate_limited_resync(self):
+        player = Player()
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_id = 1
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        client.ready = True
+        client.phase = "battle"
+        client.player_id = 1
+        player._offhangar_network_client = client
+        sent = []
+        client._send = lambda message: sent.append(message) or True
+        bot = types.SimpleNamespace(_network_bot_id=16)
+
+        self.assertIsNone(self.network.authoritative_bot_order(player, bot))
+        self.assertIsNone(self.network.authoritative_bot_order(player, bot))
+
+        requests = [message for message in sent
+                    if message.get("type") == "bot_order_resync"]
+        self.assertEqual(1, len(requests))
 
     def test_remote_pose_is_interpolated_between_thirty_hz_snapshots(self):
         class Matrix:

@@ -89,15 +89,19 @@ mismatch`, the client and server packages are from different builds.
 During a battle the server prints one compact bot-AI line every three seconds:
 
 ```text
-BOT AI reports=t1:2,t2:3 accepted=5 contacts=t1:2/2,t2:3/3 targets=t1:14,t2:15 fire=t1:14,t2:15 modes=engage:29
+BOT AI reports=t1:2,t2:3 accepted=5 contacts=t1:2/2,t2:3/3 targets=t1:8,t2:9 fire=t1:5,t2:6 modes=engage:17,route:12 nav_total=direct:20,local:4,reactive:3 recovered:9 nav_active=direct:2,local:1,reactive:0 astar=pending:5,oldest:420ms,tick_age:0ms,done:41,failed:2 orders=server:18,client:18,loaded:29,acked:18 aim=targeted:17,aligned:6,traversing:11,limited:7,alive:29 driver=moving:24,drive:20,avoid:4,blocked:0,recovery:1,arrived:4,wait:0
 ```
 
 `reports` is the authority client's current visible-contact count, `contacts`
 is visible/remembered state accepted by the server, `targets` is the number of
 bots with a combat target, and `fire` is the number currently authorized to
-shoot. Each actual client-simulated shot also prints `BOT FIRE`. This separates
-spotting, server orders and client execution without enabling verbose client
-debug logging.
+shoot. `nav_total` is cumulative while `nav_active`, `aim` and `driver` are
+current samples. `tick_age` reveals a stalled path scheduler. A healthy order
+pipeline has matching `orders` server/client/acked revisions and `loaded:29`;
+`wait` counts bots deliberately holding while an order body is being recovered.
+Each actual client-simulated shot also prints `BOT FIRE`. This separates
+spotting, delivery, navigation and client execution without enabling verbose
+client debug logging.
 
 In battle, opposing LAN humans use the same local 50 m proximity spot,
 view-range/terrain line-of-sight check, allied vision and five-second spot
@@ -152,6 +156,10 @@ contacts observed through client-side range and terrain line-of-sight checks.
 The server retains last-known contacts, reserves targets across the team,
 advances uploaded routes, shifts at most one adaptable tank toward a pressured
 lane, chooses combat mode and shell, and emits monotonic revisioned bot orders.
+Order bodies use an application-level acknowledgement and bounded retransmit;
+the client keeps its last executable revision and requests a resync rather than
+clearing every bot to an accidental local hold when a busy frame coalesces
+snapshots.
 For nearby visible contacts the authority also probes a bounded fan of
 drivable, dry, low-slope cover and peek points. The server validates those
 points against the bot's shared pose, scores them by role/personality, reserves

@@ -2126,7 +2126,7 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 		_navigator = globals().get('g_offh_terrain_navigator')
 		_active_bot_ids = [entry['id'] for entry in living
 		                   if entry['id'] != player_id]
-		_navigation = (_navigator.fallback_diagnostics(_active_bot_ids)
+		_navigation = (_navigator.fallback_diagnostics(_active_bot_ids, now)
 		               if _navigator is not None else None)
 		if _navigation is not None:
 			_network_client = getattr(player, '_offhangar_network_client', None)
@@ -2137,14 +2137,16 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 			_aim = {'alive': 0, 'targeted': 0, 'aligned': 0,
 			        'traversing': 0, 'limited': 0}
 			_driver = {'moving': 0, 'drive': 0, 'avoid': 0, 'blocked': 0,
-			           'recovery': 0, 'arrived': 0}
+			           'recovery': 0, 'arrived': 0, 'server_wait': 0}
 			for _aim_vehicle in (mock_vehicles or {}).values():
 				if (getattr(_aim_vehicle, '_network_bot_id', None) is None or
 						not getattr(_aim_vehicle, 'isAlive', False)):
 					continue
 				_aim['alive'] += 1
+				_targeted = bool(getattr(_aim_vehicle, '_offh_ai_targeted', False))
 				for _aim_name in ('targeted', 'aligned', 'traversing', 'limited'):
-					if getattr(_aim_vehicle, '_offh_ai_' + _aim_name, False):
+					if (getattr(_aim_vehicle, '_offh_ai_' + _aim_name, False) and
+							(_aim_name in ('targeted', 'limited') or _targeted)):
 						_aim[_aim_name] += 1
 				if abs(float(getattr(_aim_vehicle, '_veh_velocity', 0.0) or 0.0)) > 0.5:
 					_driver['moving'] += 1
@@ -8748,6 +8750,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				try:
 					_ai_director = _offh_ai_director(player)
 					if _ai_director is not None:
+						_offh_ai_navigator(_ai_director).tick(BigWorld.time())
 						_offh_ai_refresh_contacts(
 							_ai_director, player, mock_vehicles, veh_pos,
 							loaded_models.get('td'), BigWorld.time())
@@ -8807,6 +8810,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_ai_shell_index = 0
 							_nav_paused = False
 							_ai_hull_aiming = False
+							_ai_server_wait = False
 							# INIT BOT STATES
 							if getattr(m_veh, '_veh_velocity', None) is None: m_veh._veh_velocity = 0.0
 							if getattr(m_veh, '_veh_turn_velocity', None) is None: m_veh._veh_turn_velocity = 0.0
@@ -8840,6 +8844,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											'combat_mode': 'server_wait', 'route_id': 'server_wait',
 											'route_index': 0, 'route_anchor': _hold,
 										}
+										_ai_server_wait = True
 									target_pos = _ai_order.get('aim_position')
 									drive_pos = _ai_order.get('move_position')
 									face_pos = _ai_order.get('face_position', target_pos)
@@ -8861,6 +8866,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								target_pos = (m_veh.position.x, m_veh.position.y, m_veh.position.z)
 								drive_pos = target_pos
 								face_pos = target_pos
+								_ai_server_wait = True
 
 							_current_bot_pos = (
 								m_veh.position.x, m_veh.position.y, m_veh.position.z)
@@ -9028,6 +9034,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							while diff_yaw > math.pi: diff_yaw -= 2 * math.pi
 							while diff_yaw < -math.pi: diff_yaw += 2 * math.pi
 							_driver_mode = _driver_order.get('recovery_mode', 'drive')
+							if _ai_server_wait:
+								_driver_mode = 'server_wait'
 							m_veh._offh_ai_driver_mode = _driver_mode
 							_feeler_steer_yaw = target_yaw if _driver_mode == 'avoid' else None
 							if _nav_paused:
@@ -9715,7 +9723,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								if getattr(m_veh, '_turret_yaw', None) is None: m_veh._turret_yaw = 0.0
 								t_diff = t_yaw - m_veh._turret_yaw
 								m_veh._offh_ai_traversing = bool(
-									_ai_hull_aiming or abs(t_diff) > 0.04)
+									_ai_target_id is not None and
+									(_ai_hull_aiming or abs(t_diff) > 0.04))
 								rot_speed = 0.5
 								try:
 									if _td: rot_speed = _td.turret['rotationSpeed']
@@ -9818,7 +9827,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								getattr(m_veh, '_offh_desired_gun_pitch',
 								        _desired_gun_pitch),
 								getattr(m_veh, '_gun_pitch', 0.0))
-							m_veh._offh_ai_aligned = bool(_ai_gun_aligned)
+							m_veh._offh_ai_aligned = bool(
+								_ai_target_id is not None and _ai_gun_aligned)
 							
 							bot_reload = m_veh._ai_reload_intra if (m_veh._ai_clip_size > 1 and m_veh._ai_clip > 0 and m_veh._ai_clip < m_veh._ai_clip_size) else m_veh._ai_reload_full
 							# A downed loader drags the reload out for a bot exactly as it does for the

@@ -61,11 +61,12 @@ class ServerBotPlannerTests(unittest.TestCase):
                 "active": {"safe_direct": 0, "safe_local": 1, "reactive": 2},
                 "recovered": 4,
                 "search": {"pending": 13, "completed": 4, "failed": 2,
-                           "oldest_ms": 12345},
+                           "oldest_ms": 12345, "tick_age_ms": 17},
                 "aim": {"alive": 29, "targeted": 15, "aligned": 4,
                         "traversing": 11, "limited": 7},
                 "driver": {"moving": 9, "drive": 8, "avoid": 3,
-                           "blocked": 6, "recovery": 7, "arrived": 5},
+                           "blocked": 6, "recovery": 7, "arrived": 5,
+                           "server_wait": 2},
             },
         })
 
@@ -89,15 +90,18 @@ class ServerBotPlannerTests(unittest.TestCase):
             state.tick_once(0.05)
         text = output.getvalue()
         self.assertEqual(1, text.count("BOT AI reports="))
-        self.assertIn("nav=direct:2,local:3,reactive:100000 recovered:4", text)
         self.assertIn(
-            "astar=pending:13,oldest:12345ms,done:4,failed:2", text
+            "nav_total=direct:2,local:3,reactive:100000 recovered:4", text
+        )
+        self.assertIn(
+            "astar=pending:13,oldest:12345ms,tick_age:17ms,done:4,failed:2", text
         )
         self.assertIn(
             "aim=targeted:15,aligned:4,traversing:11,limited:7,alive:29", text
         )
         self.assertIn(
-            "driver=moving:9,drive:8,avoid:3,blocked:6,recovery:7,arrived:5", text
+            "driver=moving:9,drive:8,avoid:3,blocked:6,recovery:7,arrived:5,wait:2",
+            text,
         )
 
     def test_downloadable_layout_imports_shared_cover_module(self):
@@ -153,6 +157,53 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertIn("bot_orders", connection.messages[0])
         self.assertNotIn("bot_orders", connection.messages[1])
 
+    def test_unacknowledged_orders_are_retried_then_stop_after_ack(self):
+        class CaptureConnection(object):
+            def __init__(self):
+                self.messages = []
+
+            def sendall(self, payload):
+                self.messages.append(json.loads(payload.decode("utf-8")))
+
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        connection = CaptureConnection()
+        player = Player(1, connection, ("127.0.0.1", 0))
+        state.players[1] = player
+
+        state.tick_once(0.05)
+        player.bot_order_sent_at -= 1.0
+        state.tick_once(0.05)
+        revision = state.bot_orders["revision"]
+        self.assertIn("bot_orders", connection.messages[-1])
+
+        self.assertTrue(state.acknowledge_bot_orders(1, {"revision": revision}))
+        state.tick_once(0.05)
+        self.assertNotIn("bot_orders", connection.messages[-1])
+
+    def test_resync_request_forces_current_order_body(self):
+        class CaptureConnection(object):
+            def __init__(self):
+                self.messages = []
+
+            def sendall(self, payload):
+                self.messages.append(json.loads(payload.decode("utf-8")))
+
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        connection = CaptureConnection()
+        player = Player(1, connection, ("127.0.0.1", 0))
+        state.players[1] = player
+        state.tick_once(0.05)
+        revision = state.bot_orders["revision"]
+        state.acknowledge_bot_orders(1, {"revision": revision})
+
+        self.assertTrue(state.request_bot_order_resync(1))
+        state.tick_once(0.05)
+
+        self.assertIn("bot_orders", connection.messages[-1])
+        self.assertEqual(revision, connection.messages[-1]["bot_order_revision"])
+
     def test_only_reported_enemy_contact_becomes_shared_target(self):
         planner = BotPlanner()
         players = [{"id": 99, "team": 2, "alive": True, "x": 999, "z": 999}]
@@ -167,6 +218,27 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(99, team_one[0]["target_id"])
         self.assertEqual({"x": 40.0, "y": 0.0, "z": 30.0}, team_one[0]["aim_position"])
         self.assertTrue(team_one[0]["fire_allowed"])
+
+    def test_distant_contact_does_not_pull_every_bot_off_its_route(self):
+        planner = BotPlanner()
+        manifest = _manifest()
+        states = _states()
+        states[0] = dict(states[0], x=0, z=0)
+        states[1] = dict(states[1], x=-650, z=0)
+        players = [{"id": 99, "team": 2, "alive": True}]
+        planner.report_contacts([{
+            "observing_team": 1, "target_kind": "human", "target_id": 99,
+            "target_team": 2, "visible": True,
+            "x": 120, "y": 0, "z": 0, "health": 1000,
+            "max_health": 1000,
+        }], planner.known_targets(states, players), 1.0)
+
+        result = planner.build_orders(manifest, states, players, 1.0)
+        orders = {order["id"]: order for order in result["orders"]}
+
+        self.assertEqual(99, orders[1]["target_id"])
+        self.assertIsNone(orders[2]["target_id"])
+        self.assertEqual("route", orders[2]["combat_mode"])
 
     def test_visible_enemy_overrides_route_until_contact_expires(self):
         planner = BotPlanner()

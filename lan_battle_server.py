@@ -133,6 +133,8 @@ class Player:
     client_position: bool = False
     connected: bool = True
     bot_order_revision_sent: int = -1
+    bot_order_revision_ack: int = -1
+    bot_order_sent_at: float = 0.0
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def send(self, message):
@@ -147,6 +149,7 @@ class Player:
             if "bot_orders" in message:
                 try:
                     self.bot_order_revision_sent = int(message.get("bot_order_revision", -1))
+                    self.bot_order_sent_at = time.monotonic()
                 except (TypeError, ValueError):
                     pass
             return True
@@ -180,12 +183,13 @@ class BattleState:
             "active": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
             "recovered": 0,
             "search": {"pending": 0, "completed": 0, "failed": 0,
-                       "oldest_ms": 0},
+                       "oldest_ms": 0, "tick_age_ms": 0},
             "orders": {"revision": 0, "loaded": 0},
             "aim": {"alive": 0, "targeted": 0, "aligned": 0,
                     "traversing": 0, "limited": 0},
             "driver": {"moving": 0, "drive": 0, "avoid": 0,
-                       "blocked": 0, "recovery": 0, "arrived": 0},
+                       "blocked": 0, "recovery": 0, "arrived": 0,
+                       "server_wait": 0},
         }
         self.next_bot_ai_log = 0.0
         self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
@@ -225,12 +229,13 @@ class BattleState:
                 "active": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
                 "recovered": 0,
                 "search": {"pending": 0, "completed": 0, "failed": 0,
-                           "oldest_ms": 0},
+                           "oldest_ms": 0, "tick_age_ms": 0},
                 "orders": {"revision": 0, "loaded": 0},
                 "aim": {"alive": 0, "targeted": 0, "aligned": 0,
                         "traversing": 0, "limited": 0},
                 "driver": {"moving": 0, "drive": 0, "avoid": 0,
-                           "blocked": 0, "recovery": 0, "arrived": 0},
+                           "blocked": 0, "recovery": 0, "arrived": 0,
+                           "server_wait": 0},
             }
             self.pending_events.append({
                 "kind": "authority",
@@ -324,12 +329,13 @@ class BattleState:
                     "active": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
                     "recovered": 0,
                     "search": {"pending": 0, "completed": 0, "failed": 0,
-                               "oldest_ms": 0},
+                               "oldest_ms": 0, "tick_age_ms": 0},
                     "orders": {"revision": 0, "loaded": 0},
                     "aim": {"alive": 0, "targeted": 0, "aligned": 0,
                             "traversing": 0, "limited": 0},
                     "driver": {"moving": 0, "drive": 0, "avoid": 0,
-                               "blocked": 0, "recovery": 0, "arrived": 0},
+                               "blocked": 0, "recovery": 0, "arrived": 0,
+                               "server_wait": 0},
                 }
                 self.next_bot_ai_log = 0.0
                 self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
@@ -405,6 +411,34 @@ class BattleState:
                 "rules": self.rules_state,
                 "battle_result": self.battle_result,
             }
+
+    def acknowledge_bot_orders(self, player_id, message):
+        """Record application-level delivery, not merely a successful TCP write."""
+        with self.lock:
+            player = self.players.get(player_id)
+            if self.phase != "battle" or player is None or not player.connected:
+                return False
+            try:
+                revision = int(message.get("revision", -1))
+            except (TypeError, ValueError):
+                return False
+            current = int(self.bot_orders.get("revision", 0))
+            if revision < 0 or revision > current:
+                return False
+            player.bot_order_revision_ack = max(
+                int(player.bot_order_revision_ack), revision)
+            return True
+
+    def request_bot_order_resync(self, player_id):
+        """Force the next snapshot to carry the current executable order body."""
+        with self.lock:
+            player = self.players.get(player_id)
+            if self.phase != "battle" or player is None or not player.connected:
+                return False
+            player.bot_order_revision_ack = -1
+            player.bot_order_revision_sent = -1
+            player.bot_order_sent_at = 0.0
+            return True
 
     def update_bot_manifest(self, player_id, message):
         """Accept the canonical bot lineup from the elected simulation client."""
@@ -551,7 +585,8 @@ class BattleState:
                 raw_search = raw_navigation.get("search")
                 if not isinstance(raw_search, dict):
                     raw_search = {}
-                for name in ("pending", "completed", "failed", "oldest_ms"):
+                for name in ("pending", "completed", "failed", "oldest_ms",
+                             "tick_age_ms"):
                     navigation["search"][name] = max(0, min(
                         int(_finite_float(raw_search.get(name), 0)), 3600000))
                 raw_orders = raw_navigation.get("orders")
@@ -574,7 +609,8 @@ class BattleState:
                 if not isinstance(raw_driver, dict):
                     raw_driver = {}
                 navigation["driver"] = {}
-                for name in ("moving", "drive", "avoid", "blocked", "recovery", "arrived"):
+                for name in ("moving", "drive", "avoid", "blocked", "recovery",
+                             "arrived", "server_wait"):
                     navigation["driver"][name] = max(0, min(
                         int(_finite_float(raw_driver.get(name), 0)), 30))
                 self.bot_navigation_stats = navigation
@@ -925,6 +961,9 @@ class BattleState:
                 "battle_result": self.battle_result,
             }
             recipients = list(self.players.values())
+            authority = self.players.get(self.bot_authority_id)
+            authority_order_ack = (
+                int(authority.bot_order_revision_ack) if authority is not None else -1)
         if ai_debug is not None:
             teams = ai_debug["teams"]
             reports = ai_debug["reported"]
@@ -938,11 +977,12 @@ class BattleState:
                 "BOT AI reports=t1:%d,t2:%d accepted=%d "
                 "contacts=t1:%d/%d,t2:%d/%d targets=t1:%d,t2:%d "
                 "fire=t1:%d,t2:%d modes=%s "
-                "nav=direct:%d,local:%d,reactive:%d recovered:%d "
-                "active:%d/%d/%d astar=pending:%d,oldest:%dms,done:%d,failed:%d "
-                "orders=server:%d,client:%d,loaded:%d "
+                "nav_total=direct:%d,local:%d,reactive:%d recovered:%d "
+                "nav_active=direct:%d,local:%d,reactive:%d "
+                "astar=pending:%d,oldest:%dms,tick_age:%dms,done:%d,failed:%d "
+                "orders=server:%d,client:%d,loaded:%d,acked:%d "
                 "aim=targeted:%d,aligned:%d,traversing:%d,limited:%d,alive:%d "
-                "driver=moving:%d,drive:%d,avoid:%d,blocked:%d,recovery:%d,arrived:%d" % (
+                "driver=moving:%d,drive:%d,avoid:%d,blocked:%d,recovery:%d,arrived:%d,wait:%d" % (
                     reports.get(1, 0), reports.get(2, 0), reports.get("accepted", 0),
                     teams[1]["visible"], teams[1]["contacts"],
                     teams[2]["visible"], teams[2]["contacts"],
@@ -957,11 +997,13 @@ class BattleState:
                     navigation["active"].get("reactive", 0),
                     navigation.get("search", {}).get("pending", 0),
                     navigation.get("search", {}).get("oldest_ms", 0),
+                    navigation.get("search", {}).get("tick_age_ms", 0),
                     navigation.get("search", {}).get("completed", 0),
                     navigation.get("search", {}).get("failed", 0),
                     self.bot_orders.get("revision", 0),
                     navigation.get("orders", {}).get("revision", 0),
                     navigation.get("orders", {}).get("loaded", 0),
+                    authority_order_ack,
                     navigation.get("aim", {}).get("targeted", 0),
                     navigation.get("aim", {}).get("aligned", 0),
                     navigation.get("aim", {}).get("traversing", 0),
@@ -972,10 +1014,16 @@ class BattleState:
                     navigation.get("driver", {}).get("avoid", 0),
                     navigation.get("driver", {}).get("blocked", 0),
                     navigation.get("driver", {}).get("recovery", 0),
-                    navigation.get("driver", {}).get("arrived", 0)))
+                    navigation.get("driver", {}).get("arrived", 0),
+                    navigation.get("driver", {}).get("server_wait", 0)))
         for player in recipients:
             outgoing = snapshot
-            if player.bot_order_revision_sent != self.bot_orders["revision"]:
+            revision = int(self.bot_orders["revision"])
+            needs_order_body = (
+                player.bot_order_revision_ack != revision and
+                (player.bot_order_revision_sent != revision or
+                 now - player.bot_order_sent_at >= 0.25))
+            if needs_order_body:
                 outgoing = dict(snapshot)
                 outgoing["bot_orders"] = list(self.bot_orders["orders"])
             if not player.send(outgoing):
@@ -1151,6 +1199,11 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         server.state.update_bot_states(player.player_id, message)
                     elif message.get("type") == "bot_observation":
                         server.state.update_bot_observation(player.player_id, message)
+                    elif message.get("type") == "bot_order_ack":
+                        server.state.acknowledge_bot_orders(player.player_id, message)
+                    elif message.get("type") == "bot_order_resync":
+                        if server.state.request_bot_order_resync(player.player_id):
+                            _server_log("BOT ORDERS RESYNC player_id=%d" % player.player_id)
                     elif message.get("type") == "bot_hit_report":
                         if not server.state.report_bot_hit(player.player_id, message):
                             _server_log("BOT HIT rejected attacker=%d target=%s seq=%s" % (

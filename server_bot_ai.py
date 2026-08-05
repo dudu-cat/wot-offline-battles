@@ -369,6 +369,19 @@ class BotPlanner(object):
             return 2
         return 1
 
+    @staticmethod
+    def _engagement_range(bot, contact):
+        """Keep nearby combat primary without pulling an entire team off-route."""
+        profile = bot.get("profile") if isinstance(bot.get("profile"), dict) else {}
+        roles = profile.get("roles") if isinstance(profile.get("roles"), dict) else {}
+        desired = max(40.0, _number(profile.get("desired_range"), 180.0))
+        mobility = max(_number(roles.get("scout")),
+                       _number(roles.get("flanker")))
+        distance = max(220.0, min(520.0, desired * 2.0 + mobility * 300.0))
+        if not contact.get("visible"):
+            distance *= 0.75
+        return distance
+
     def _assign_targets(self, bots, contacts):
         """Reserve targets per bot instead of issuing one team-wide dog-pile."""
         if not bots or not contacts:
@@ -387,6 +400,8 @@ class BotPlanner(object):
                 distance = math.hypot(
                     contact["position"]["x"] - bx,
                     contact["position"]["z"] - bz)
+                if distance > self._engagement_range(bot, contact):
+                    continue
                 score = (0.0 if contact.get("visible") else 42.0)
                 score += contact["health"] / float(max(1, contact["max_health"])) * 28.0
                 score += distance * 0.018
