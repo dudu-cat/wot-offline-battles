@@ -24,6 +24,7 @@ class NativeNavmeshProbeTest(unittest.TestCase):
         self.logs = []
         self.messages = []
         self.navigation_calls = []
+        self.now = 100.0
 
         bigworld = types.ModuleType("BigWorld")
 
@@ -32,6 +33,7 @@ class NativeNavmeshProbeTest(unittest.TestCase):
             return [source, destination]
 
         bigworld.navigatePathPoints = navigate
+        bigworld.time = lambda: self.now
         math_module = types.ModuleType("Math")
         math_module.Vector3 = Vector3
         logging = types.ModuleType("gui.mods.offhangar.logging")
@@ -71,6 +73,10 @@ class NativeNavmeshProbeTest(unittest.TestCase):
         player = self.player()
         position = Vector3(-169.5, 12.0, 299.4)
 
+        initial = self.probe.maybe_run(
+            player, "spaces/07_lakeville", position, 7
+        )
+        self.now += self.probe.INITIAL_DELAY
         first = self.probe.maybe_run(
             player, "spaces/07_lakeville", position, 7
         )
@@ -78,6 +84,7 @@ class NativeNavmeshProbeTest(unittest.TestCase):
             player, "spaces/07_lakeville", position, 7
         )
 
+        self.assertFalse(initial)
         self.assertTrue(first)
         self.assertFalse(second)
         self.assertEqual(1, len(self.navigation_calls))
@@ -85,8 +92,64 @@ class NativeNavmeshProbeTest(unittest.TestCase):
         self.assertEqual((-169.5, 299.4), (source.x, source.z))
         self.assertEqual((-161.5, 299.4), (destination.x, destination.z))
         self.assertEqual((100.0, 0.5), (distance, girth))
-        self.assertIn("NAVMESH_PROBE PASS", self.logs[0][1])
+        self.assertTrue(any("NAVMESH_PROBE PASS" in message
+                            for unused, message in self.logs))
         self.assertEqual("information", self.messages[0][1])
+
+    def test_probe_retries_a_transient_unbound_navmesh_failure(self):
+        player = self.player()
+        position = Vector3(-169.5, 12.0, 299.4)
+        calls = {"count": 0}
+
+        def transient(source, destination, distance, girth):
+            calls["count"] += 1
+            if calls["count"] <= 2:
+                raise ValueError("not bound yet")
+            return [source, destination]
+
+        sys.modules["BigWorld"].navigatePathPoints = transient
+        self.probe.BigWorld.navigatePathPoints = transient
+
+        self.assertFalse(self.probe.maybe_run(
+            player, "07_lakeville", position, 3
+        ))
+        self.now += self.probe.INITIAL_DELAY
+        self.assertFalse(self.probe.maybe_run(
+            player, "07_lakeville", position, 3
+        ))
+        self.now += self.probe.RETRY_INTERVAL
+        self.assertTrue(self.probe.maybe_run(
+            player, "07_lakeville", position, 3
+        ))
+        self.assertEqual(3, calls["count"])
+        self.assertTrue(any("NAVMESH_PROBE WAIT" in message
+                            for unused, message in self.logs))
+
+    def test_probe_can_verify_loaded_chunk_at_its_safe_centre(self):
+        player = self.player()
+        position = Vector3(-169.5, 12.0, 299.4)
+
+        def boundary_sensitive(source, destination, distance, girth):
+            self.navigation_calls.append((source, destination, distance, girth))
+            if abs(source.z - 299.4) < 0.01:
+                raise ValueError("boundary lookup selected another chunk")
+            return [source, destination]
+
+        self.probe.BigWorld.navigatePathPoints = boundary_sensitive
+
+        self.assertFalse(self.probe.maybe_run(
+            player, "07_lakeville", position, 4
+        ))
+        self.now += self.probe.INITIAL_DELAY
+        self.assertTrue(self.probe.maybe_run(
+            player, "07_lakeville", position, 4
+        ))
+        self.assertEqual((-150.0, 250.0), (
+            self.navigation_calls[-1][0].x,
+            self.navigation_calls[-1][0].z,
+        ))
+        self.assertTrue(any("mode=chunk_center" in message
+                            for unused, message in self.logs))
 
     def test_probe_waits_for_live_period_and_spawn_correction(self):
         player = self.player()

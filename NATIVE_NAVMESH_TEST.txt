@@ -35,6 +35,9 @@ Test
 
    That is a PASS.
 
+   The 0.8.2 battle HUD does not always render stock system messages. The
+   python.log result below is authoritative if no lower-right text appears.
+
 4. A red message beginning with this text is a FAIL and includes the native
    engine error:
 
@@ -44,6 +47,14 @@ The same result is written to python.log as exactly one of:
 
     NAVMESH_PROBE PASS ...
     NAVMESH_PROBE FAIL ...
+
+The probe waits one second and retries for up to eight seconds while streamed
+chunk items finish binding. Its first attempt also writes a resource audit:
+
+    NAVMESH_PROBE RESOURCE enable=... chunk=... ref=... bytes=... header=...
+
+Short NAVMESH_PROBE WAIT lines are expected while the native mesh is still
+binding. Only the final PASS or FAIL is the result.
 
 If no message appears, send python.log. The dispatch is also guarded and logs
 "Native navmesh probe dispatch error" if the diagnostic module itself fails.

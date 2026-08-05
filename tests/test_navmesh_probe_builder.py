@@ -45,7 +45,7 @@ class NavmeshProbeBuilderTest(unittest.TestCase):
 
     def test_probe_navmesh_uses_version_zero_clockwise_polygon(self):
         b = self.builder
-        data = b.build_probe_navmesh((-199.5, 300.5, -100.5, 399.5))
+        data = b.build_probe_navmesh(b.PROBE_CHUNKS["fffe0002o"])
         version, girth, polygons, edges = struct.unpack_from("<ifii", data, 0)
         min_height, max_height, vertex_count = struct.unpack_from("<ffi", data, 16)
         vertices = [
@@ -58,10 +58,24 @@ class NavmeshProbeBuilderTest(unittest.TestCase):
         self.assertEqual((1, 4), (polygons, edges))
         self.assertEqual((-1000.0, 1000.0, 4), (min_height, max_height, vertex_count))
         self.assertEqual(
-            [(-100.5, 300.5), (-199.5, 300.5), (-199.5, 399.5), (-100.5, 399.5)],
+            [(-100.5, 200.5), (-199.5, 200.5), (-199.5, 299.5), (-100.5, 299.5)],
             [(x, z) for x, z, unused_neighbour in vertices],
         )
         self.assertEqual([-1] * 4, [neighbour for x, z, neighbour in vertices])
+
+        # Reproduce BigWorld 2.0 ChunkWaypoint::containsProjection for the
+        # exact north-spawn position observed in the live test log.
+        point = (-169.51, 299.35)
+        polygon = [(x, z) for x, z, unused_neighbour in vertices]
+        previous = polygon[-1]
+        for current in polygon:
+            edge_x = current[0] - previous[0]
+            edge_z = current[1] - previous[1]
+            point_x = point[0] - previous[0]
+            point_z = point[1] - previous[1]
+            cross = point_x * edge_z - point_z * edge_x
+            self.assertGreater(cross, -0.01)
+            previous = current
 
     def test_cdata_overlay_preserves_entries_and_adds_world_navmesh(self):
         b = self.builder
