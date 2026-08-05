@@ -18,7 +18,8 @@ runtime is not packaged as a fallback.
 ## User flow
 
 1. Start `lan_battle_server.py`. A single connected client is supported.
-2. Start the frozen client. The mod creates its local Account and enters Lobby.
+2. Start the frozen client. After the native intro/login state finishes its
+   destructive cleanup, the mod creates its local Account and enters Lobby.
 3. The stock training settings window opens with the server's map list.
 4. Choose a map and activate the window's normal primary button.
 5. The server fills vacant slots with bots and starts the same round for every
@@ -26,6 +27,9 @@ runtime is not packaged as a fallback.
 6. A team-elimination result freezes the round. After three seconds the server
    returns connected players to the waiting room and the stock picker opens for
    the next round.
+7. Returning to the garage during a round retires that player, transfers bot
+   authority when necessary and retains the LAN connection until the server's
+   next waiting-room barrier.
 
 No F12, `0`, or other battle-start hotkey is used. Setting `enabled` to `false`
 disables this port; it does not select a second or legacy AI path.
@@ -37,8 +41,9 @@ capture-the-flag variant. Assault and encounter definitions are excluded.
 ## Runtime ownership
 
 The Python 3 server owns the room, teams and slots, canonical health, accepted
-shot events, elimination result and round reset. It exposes a newline-delimited
-JSON protocol rather than emulating the original BigWorld game server.
+shot events, active-round retirement, elimination result and round reset. It
+exposes a newline-delimited JSON protocol rather than emulating the original
+BigWorld game server.
 
 One elected client owns bot simulation because only the client can query the
 proprietary map collision, water, terrain and tank resources. Bots receive
@@ -103,10 +108,12 @@ CPython 2.7. Verify the exact client and build the package together:
 
 The script uses local CPython 2.7 when available and otherwise the pinned
 Docker build. Before compiling, it reads code objects directly from the pinned
-client's `scripts.pkg`, rejects any mismatch in the 82 stock method signatures,
-18 direct-consumer literals and 16 lifecycle code names used by this port,
-verifies 11 exact `AccountCommands` constants, and runs the complete raw `serverSettings`
-subscript inventory against the local producers. Signature checks include
+client's `scripts.pkg`, rejects any mismatch in the 92 stock method signatures,
+18 direct-consumer literals and 20 lifecycle code names used by this port,
+verifies 11 exact `AccountCommands` constants, runs the complete raw `serverSettings`
+subscript inventory against the local producers, and checks 14 ordered
+lifecycle contracts plus the complete Account-helper binding inventory.
+Signature checks include
 `*args`/`**kwargs` flags at the stock picker boundary, rather than comparing
 only positional argument counts. It then validates the package
 version, exact source-to-PYC module manifest, CPython 2.7 magic, absence of
@@ -116,9 +123,10 @@ explicit directory entries and Store compression for every member.
 Signature matching is only one gate. The tests also validate the exact
 Vehicle/Avatar property and mailbox schemas, the Account/Lobby direct-key and
 tuple contracts recorded in `tools/account_lobby_consumer_contract.json`, and
-LAN round/message state transitions. A conventional static type checker cannot
-replace these checks because BigWorld injects dynamic Entity properties and
-mailboxes at runtime.
+LAN round/message state transitions, including active leave and a next battle
+arriving before native Lobby/Hangar recovery. A conventional static type
+checker cannot replace these checks because BigWorld injects dynamic Entity
+properties and mailboxes at runtime.
 
 Outputs are written to `dist/`:
 

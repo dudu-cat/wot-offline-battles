@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +43,7 @@ class _Client(object):
         self.round_id = None
         self.start_calls = 0
         self.stop_calls = 0
+        self.leave_calls = 0
         self.requests = []
 
     def start(self):
@@ -55,11 +57,16 @@ class _Client(object):
         self.requests.append(map_name)
         return True
 
+    def leave_battle(self):
+        self.leave_calls += 1
+        return True
+
 
 class _Queue(object):
-    def __init__(self, request_start, map_pool):
+    def __init__(self, request_start, map_pool, on_close=None):
         self.request_start = request_start
         self.map_pool = map_pool
+        self.on_close = on_close
         self.install_calls = 0
         self.uninstall_calls = 0
         self.close_calls = 0
@@ -78,13 +85,16 @@ class _BattleRuntime(object):
     def __init__(self):
         self.started = []
         self.stopped = []
+        self.restore_accounts = []
         self.snapshots = []
         self.events = []
 
-    def start(self, config, message=None, lan_client=None):
+    def start(self, config, message=None, lan_client=None,
+              on_local_leave=None):
         self.started.append({
             'config': dict(config), 'message': message,
-            'lan_client': lan_client})
+            'lan_client': lan_client,
+            'on_local_leave': on_local_leave})
         return True
 
     def on_snapshot(self, message):
@@ -93,8 +103,9 @@ class _BattleRuntime(object):
     def on_events(self, message):
         self.events.append(message)
 
-    def stop(self, show_login=True):
+    def stop(self, show_login=True, restore_account=True):
         self.stopped.append(show_login)
+        self.restore_accounts.append(restore_account)
 
 
 class LANSessionTests(unittest.TestCase):
@@ -111,8 +122,8 @@ class LANSessionTests(unittest.TestCase):
             self.clients.append(client)
             return client
 
-        def queue_factory(*args):
-            queue = _Queue(*args)
+        def queue_factory(*args, **kwargs):
+            queue = _Queue(*args, **kwargs)
             self.queues.append(queue)
             return queue
 
@@ -151,6 +162,15 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual([True, True], self.opens)
         self.assertEqual([], self.battle_runtime.started)
 
+    def test_stock_picker_close_allows_the_waiting_view_to_reopen(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+
+        self.queues[0].on_close()
+        self.emit('start_denied', {'reason': 'try again'})
+
+        self.assertEqual([True, True], self.opens)
+        self.assertTrue(self.session._picker_open)
+
     def test_battle_start_uses_server_map_and_local_roster_spawn_once(self):
         self.emit('welcome', {'phase': 'battle'})
         self.assertEqual('awaiting_battle_start', self.session.state)
@@ -181,6 +201,57 @@ class LANSessionTests(unittest.TestCase):
         self.assertIs(snapshot, self.session.snapshot)
         self.assertEqual([snapshot], self.snapshots)
 
+    def test_local_avatar_leave_retires_round_and_waits_for_server_reset(self):
+        first = {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]}
+        self.emit('battle_start', first)
+
+        self.assertTrue(
+            self.battle_runtime.started[0]['on_local_leave']())
+
+        self.assertEqual(1, self.client.leave_calls)
+        self.assertEqual(0, self.client.stop_calls)
+        self.assertEqual([False], self.battle_runtime.stopped)
+        self.assertFalse(self.session._battle_started)
+        self.assertEqual(7, self.session._departed_round_id)
+        self.assertEqual('awaiting_round_end', self.session.state)
+
+        # A duplicate start already queued for the departed round cannot put
+        # the recovered Account straight back into an Avatar.
+        self.emit('battle_start', first)
+        self.assertEqual(1, len(self.battle_runtime.started))
+
+        self.emit('roster', {
+            'phase': 'waiting', 'round_id': 8,
+            'map_pool': ['05_prohorovka']})
+        self.assertEqual('waiting', self.session.state)
+        self.assertIsNone(self.session._departed_round_id)
+
+        second = {
+            'round_id': 8, 'map': '05_prohorovka', 'players': [{
+                'id': 'p1', 'x': 4, 'y': 5, 'z': 6,
+                'vehicle': 'ussr:T-34'}]}
+        self.emit('battle_start', second)
+        self.assertEqual(2, len(self.battle_runtime.started))
+
+    def test_failed_local_leave_still_cleans_runtime_and_stops_session(self):
+        self.emit('battle_start', {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]})
+        self.client.leave_battle = lambda: False
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'did not accept battle leave'):
+            self.battle_runtime.started[0]['on_local_leave']()
+
+        self.assertEqual('stopped', self.session.state)
+        self.assertTrue(self.session._stopped)
+        self.assertEqual([False], self.battle_runtime.stopped)
+        self.assertEqual(1, self.client.stop_calls)
+
     def test_waiting_roster_after_result_stops_old_battle_and_allows_next_round(self):
         self.emit('welcome', {
             'phase': 'waiting', 'map_pool': ['01_karelia']})
@@ -209,6 +280,150 @@ class LANSessionTests(unittest.TestCase):
         self.emit('battle_start', second)
         self.assertEqual(2, len(self.battle_runtime.started))
         self.assertEqual('battle', self.session.state)
+
+    def test_next_picker_waits_for_native_lobby_recovery(self):
+        ready = [True]
+        pending = []
+        self.session._lobby_ready = lambda: ready[0]
+        self.session._callback = (
+            lambda unused_delay, function: pending.append(function) or
+            len(pending))
+        self.session._cancel_callback = lambda unused_id: None
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
+        self.emit('battle_start', {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]})
+
+        ready[0] = False
+        self.emit('roster', {
+            'phase': 'waiting', 'round_id': 8,
+            'map_pool': ['05_prohorovka']})
+
+        self.assertEqual([True], self.opens)
+        self.assertFalse(self.session._picker_open)
+        self.assertEqual(1, len(pending))
+        ready[0] = True
+        pending.pop(0)()
+        self.assertEqual([True, True], self.opens)
+        self.assertTrue(self.session._picker_open)
+
+    def test_next_battle_start_waits_for_native_lobby_recovery(self):
+        ready = [True]
+        pending = {}
+        next_id = [0]
+
+        def schedule(unused_delay, function):
+            next_id[0] += 1
+            pending[next_id[0]] = function
+            return next_id[0]
+
+        self.session._lobby_ready = lambda: ready[0]
+        self.session._callback = schedule
+        self.session._cancel_callback = lambda callback_id: pending.pop(
+            callback_id, None)
+        self.emit('battle_start', {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]})
+
+        ready[0] = False
+        self.emit('roster', {
+            'phase': 'waiting', 'round_id': 8,
+            'map_pool': ['05_prohorovka']})
+        self.emit('battle_start', {
+            'round_id': 8, 'map': '05_prohorovka', 'players': [{
+                'id': 'p1', 'x': 4, 'y': 5, 'z': 6,
+                'vehicle': 'ussr:T-34'}]})
+
+        self.assertEqual(1, len(self.battle_runtime.started))
+        self.assertEqual('awaiting_lobby_for_battle', self.session.state)
+        self.assertIsNotNone(self.session._pending_battle_start)
+        self.assertEqual(1, len(pending))
+
+        ready[0] = True
+        pending.pop(next(iter(pending)))()
+
+        self.assertEqual(2, len(self.battle_runtime.started))
+        self.assertEqual('battle', self.session.state)
+        self.assertIsNone(self.session._pending_battle_start)
+        self.assertIsNone(self.session._battle_start_callback_id)
+
+    def test_late_start_denial_cannot_cancel_deferred_accepted_battle(self):
+        ready = [False]
+        pending = []
+        self.session._lobby_ready = lambda: ready[0]
+        self.session._callback = (
+            lambda unused_delay, function: pending.append(function) or
+            len(pending))
+        self.session._cancel_callback = lambda unused_id: None
+        start = {
+            'round_id': 8, 'map': '05_prohorovka', 'players': [{
+                'id': 'p1', 'x': 4, 'y': 5, 'z': 6,
+                'vehicle': 'ussr:T-34'}]}
+        self.emit('battle_start', start)
+
+        self.emit('start_denied', {
+            'round_id': 8, 'code': 'already_started'})
+
+        self.assertEqual('awaiting_lobby_for_battle', self.session.state)
+        self.assertEqual(start, self.session._pending_battle_start)
+        self.assertEqual(1, len(pending))
+        ready[0] = True
+        pending.pop()()
+        self.assertEqual(1, len(self.battle_runtime.started))
+        self.assertEqual('battle', self.session.state)
+
+    def test_stop_cancels_deferred_battle_start(self):
+        ready = [False]
+        pending = {}
+        cancelled = []
+
+        def schedule(unused_delay, function):
+            pending[1] = function
+            return 1
+
+        def cancel(callback_id):
+            cancelled.append(callback_id)
+            pending.pop(callback_id, None)
+
+        self.session._lobby_ready = lambda: ready[0]
+        self.session._callback = schedule
+        self.session._cancel_callback = cancel
+        self.emit('battle_start', {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]})
+        self.assertEqual('awaiting_lobby_for_battle', self.session.state)
+
+        self.session.stop(show_login=False)
+
+        self.assertEqual([1], cancelled)
+        self.assertEqual({}, pending)
+        self.assertIsNone(self.session._pending_battle_start)
+
+    def test_failed_round_cleanup_cannot_leave_session_half_in_battle(self):
+        self.emit('battle_start', {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]})
+        self.battle_runtime.stop = mock.Mock(
+            side_effect=RuntimeError('account restore failed'))
+
+        with self.assertRaisesRegex(RuntimeError,
+                                    'account restore failed'):
+            self.emit('roster', {
+                'phase': 'waiting', 'round_id': 8,
+                'map_pool': ['05_prohorovka']})
+
+        self.assertEqual('stopped', self.session.state)
+        self.assertTrue(self.session._stopped)
+        self.assertFalse(self.session._battle_started)
+        self.assertIsNone(self.session._active_round_id)
+        self.assertIsNone(self.session.snapshot)
+        self.assertIsNone(self.session._picker_callback_id)
+        self.assertIsNone(self.client.on_event)
 
     def test_battle_phase_roster_during_disconnect_keeps_active_battle(self):
         start = {'round_id': 7, 'map': '01_karelia', 'players': [{
@@ -277,6 +492,13 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual(1, self.client.stop_calls)
         self.assertIsNone(self.client.on_event)
         self.assertEqual([False], self.battle_runtime.stopped)
+        self.assertEqual([True], self.battle_runtime.restore_accounts)
+
+    def test_global_shutdown_skips_account_restore(self):
+        self.session.stop(show_login=False, restore_account=False)
+
+        self.assertEqual([False], self.battle_runtime.stopped)
+        self.assertEqual([False], self.battle_runtime.restore_accounts)
 
     def test_disconnect_closes_stock_picker_before_uninstalling_adapter(self):
         self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
@@ -287,3 +509,46 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual(1, self.queues[0].uninstall_calls)
         self.assertEqual(1, self.client.stop_calls)
         self.assertEqual([True], self.battle_runtime.stopped)
+
+    def test_stop_finishes_every_cleanup_stage_then_raises_first_error(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+        queue = self.queues[0]
+        calls = []
+
+        def fail_close():
+            queue.close_calls += 1
+            calls.append('close')
+            raise RuntimeError('close failed')
+
+        def fail_uninstall():
+            queue.uninstall_calls += 1
+            calls.append('uninstall')
+            raise RuntimeError('uninstall failed')
+
+        def fail_client_stop():
+            self.client.stop_calls += 1
+            calls.append('client')
+            raise RuntimeError('client failed')
+
+        def fail_battle_stop(show_login=True, restore_account=True):
+            self.battle_runtime.stopped.append(show_login)
+            self.battle_runtime.restore_accounts.append(restore_account)
+            calls.append('battle')
+            raise RuntimeError('battle failed')
+
+        queue.close = fail_close
+        queue.uninstall = fail_uninstall
+        self.client.stop = fail_client_stop
+        self.battle_runtime.stop = fail_battle_stop
+
+        with self.assertRaisesRegex(RuntimeError, 'close failed'):
+            self.session.stop(show_login=False)
+
+        self.assertEqual(['close', 'uninstall', 'client', 'battle'], calls)
+        self.assertEqual('stopped', self.session.state)
+        self.assertIsNone(self.client.on_event)
+        self.assertEqual(1, queue.close_calls)
+        self.assertEqual(1, queue.uninstall_calls)
+        self.assertEqual(1, self.client.stop_calls)
+        self.assertEqual([False], self.battle_runtime.stopped)
+        self.session.stop(show_login=False)

@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,6 +62,7 @@ class _Window(object):
 
 _WINDOW_INIT = _Window.__init__
 _WINDOW_UPDATE = _Window.updateTrainingRoom
+_WINDOW_CLOSE = _Window.onWindowClose
 
 
 class QueueUITests(unittest.TestCase):
@@ -73,14 +75,17 @@ class QueueUITests(unittest.TestCase):
             3: _ArenaType('05_prohorovka'),
         })
         self.started = []
+        self.closed = []
         self.adapter = self.queue_ui.QueueUI(
             self.started.append, lambda: ('05_prohorovka',),
-            runtime=(self.arena_type, _Window))
+            runtime=(self.arena_type, _Window),
+            on_close=lambda: self.closed.append(True))
 
     def tearDown(self):
         self.adapter.uninstall()
         _Window.__init__ = _WINDOW_INIT
         _Window.updateTrainingRoom = _WINDOW_UPDATE
+        _Window.onWindowClose = _WINDOW_CLOSE
 
     def test_catalog_filters_non_ctf_and_server_pool(self):
         rows = self.catalog.build(self.arena_type.g_cache,
@@ -105,7 +110,7 @@ class QueueUITests(unittest.TestCase):
             'gui.Scaleform.daapi.view.lobby.trainings.formatters': formatters,
         }
 
-        with unittest.mock.patch.dict(sys.modules, modules):
+        with mock.patch.dict(sys.modules, modules):
             row = self.catalog.build(
                 self.arena_type.g_cache, ('05_prohorovka',)).cache[0]
 
@@ -124,7 +129,7 @@ class QueueUITests(unittest.TestCase):
                 self.alias = alias
                 self.name = name
 
-        app = types.SimpleNamespace(loadView=unittest.mock.Mock())
+        app = types.SimpleNamespace(loadView=mock.Mock())
         loaders = types.ModuleType(
             'gui.Scaleform.framework.managers.loaders')
         loaders.ViewLoadParams = ViewLoadParams
@@ -134,7 +139,7 @@ class QueueUITests(unittest.TestCase):
             TRAINING_SETTINGS_WINDOW_PY='trainingSettingsWindow')
         app_loader = types.ModuleType('gui.app_loader')
         app_loader.g_appLoader = types.SimpleNamespace(
-            getDefLobbyApp=unittest.mock.Mock(return_value=app))
+            getDefLobbyApp=mock.Mock(return_value=app))
         modules = {
             'gui.Scaleform': types.ModuleType('gui.Scaleform'),
             'gui.Scaleform.framework': types.ModuleType(
@@ -148,7 +153,7 @@ class QueueUITests(unittest.TestCase):
             'gui.app_loader': app_loader,
         }
 
-        with unittest.mock.patch.dict(sys.modules, modules):
+        with mock.patch.dict(sys.modules, modules):
             self.assertTrue(self.queue_ui.open_picker())
 
         app_loader.g_appLoader.getDefLobbyApp.assert_called_once_with()
@@ -178,8 +183,23 @@ class QueueUITests(unittest.TestCase):
         window = _Window({'isOfflineLanPicker': True})
 
         self.assertTrue(self.adapter.close())
+        self.assertFalse(self.adapter.close())
         self.assertTrue(window.closed)
+        self.assertEqual(1, window.close_calls)
+        self.assertEqual([True], self.closed)
         self.assertFalse(getattr(window, self.queue_ui._PICKER_MARKER))
+
+    def test_stock_close_detaches_picker_and_notifies_owner_once(self):
+        self.adapter.install()
+        window = _Window({'isOfflineLanPicker': True})
+
+        window.onWindowClose()
+        window.onWindowClose()
+
+        self.assertIsNone(self.adapter._picker_window)
+        self.assertFalse(self.adapter.close())
+        self.assertEqual(2, window.close_calls)
+        self.assertEqual([True], self.closed)
 
     def test_synchronous_session_close_does_not_destroy_window_twice(self):
         adapter = None
@@ -229,6 +249,7 @@ class QueueUITests(unittest.TestCase):
     def test_uninstall_restores_raw_class_functions(self):
         original_init = _Window.__dict__['__init__']
         original_update = _Window.__dict__['updateTrainingRoom']
+        original_close = _Window.__dict__['onWindowClose']
         self.adapter.install()
 
         self.adapter.uninstall()
@@ -236,3 +257,5 @@ class QueueUITests(unittest.TestCase):
         self.assertIs(original_init, _Window.__dict__['__init__'])
         self.assertIs(original_update,
                       _Window.__dict__['updateTrainingRoom'])
+        self.assertIs(original_close,
+                      _Window.__dict__['onWindowClose'])

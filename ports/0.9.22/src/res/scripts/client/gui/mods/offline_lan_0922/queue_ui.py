@@ -44,18 +44,22 @@ def open_picker():
 class QueueUI(object):
     """A reversible, chain-safe adapter for the stock map picker."""
 
-    def __init__(self, request_start, map_pool, runtime=None):
+    def __init__(self, request_start, map_pool, runtime=None, on_close=None):
         self._request_start = request_start
         self._map_pool = map_pool
+        self._on_close = on_close
         self._runtime = runtime
         self._installed = False
         self._window_type = None
         self._original_init = None
         self._original_update = None
+        self._original_close = None
         self._had_own_init = False
         self._had_own_update = False
+        self._had_own_close = False
         self._init_wrapper = None
         self._update_wrapper = None
+        self._close_wrapper = None
         self._picker_window = None
 
     def install(self):
@@ -66,6 +70,7 @@ class QueueUI(object):
         self._window_type = window_type
         self._had_own_init = '__init__' in window_type.__dict__
         self._had_own_update = 'updateTrainingRoom' in window_type.__dict__
+        self._had_own_close = 'onWindowClose' in window_type.__dict__
         # In Python 2, getattr(class, method) returns a fresh unbound-method
         # wrapper.  Keep the raw class members so identity checks during
         # chain-safe uninstall remain meaningful on the target runtime.
@@ -73,6 +78,8 @@ class QueueUI(object):
             '__init__', getattr(window_type, '__init__'))
         self._original_update = window_type.__dict__.get(
             'updateTrainingRoom', getattr(window_type, 'updateTrainingRoom'))
+        self._original_close = window_type.__dict__.get(
+            'onWindowClose', getattr(window_type, 'onWindowClose'))
         adapter = self
 
         def wrapped_init(window, ctx=None):
@@ -110,22 +117,77 @@ class QueueUI(object):
                 setattr(window, _PICKER_MARKER, False)
             return True
 
+        def wrapped_close(window):
+            detach_error = None
+            try:
+                adapter._detach_picker(window)
+            except Exception as error:
+                detach_error = error
+            try:
+                result = adapter._original_close(window)
+            except Exception:
+                if detach_error is not None:
+                    raise detach_error
+                raise
+            if detach_error is not None:
+                raise detach_error
+            return result
+
         self._init_wrapper = wrapped_init
         self._update_wrapper = wrapped_update
+        self._close_wrapper = wrapped_close
         window_type.__init__ = wrapped_init
         window_type.updateTrainingRoom = wrapped_update
+        window_type.onWindowClose = wrapped_close
         self._installed = True
+
+    def _detach_picker(self, window):
+        """Forget one picker before its stock view destroys itself."""
+        owned = self._picker_window is window
+        marked = False
+        try:
+            marked = bool(getattr(window, _PICKER_MARKER, False))
+        except ReferenceError:
+            pass
+        if not owned and not marked:
+            return False
+        if owned:
+            self._picker_window = None
+        try:
+            setattr(window, _PICKER_MARKER, False)
+        except ReferenceError:
+            pass
+        if callable(self._on_close):
+            self._on_close()
+        return True
 
     def close(self):
         """Close only the stock window created by this LAN picker adapter."""
         window = self._picker_window
-        self._picker_window = None
         if window is None:
             return False
-        setattr(window, _PICKER_MARKER, False)
-        close = getattr(window, 'onWindowClose', None)
+        detach_error = None
+        try:
+            self._detach_picker(window)
+        except Exception as error:
+            detach_error = error
+        try:
+            close = getattr(window, 'onWindowClose', None)
+        except ReferenceError:
+            if detach_error is not None:
+                raise detach_error
+            return True
         if callable(close):
-            close()
+            try:
+                close()
+            except ReferenceError:
+                pass
+            except Exception:
+                if detach_error is not None:
+                    raise detach_error
+                raise
+        if detach_error is not None:
+            raise detach_error
         return True
 
     def _restore(self, name, original, installed, had_own):
@@ -144,5 +206,7 @@ class QueueUI(object):
                       self._had_own_init)
         self._restore('updateTrainingRoom', self._original_update,
                       self._update_wrapper, self._had_own_update)
+        self._restore('onWindowClose', self._original_close,
+                      self._close_wrapper, self._had_own_close)
         self._installed = False
         self._picker_window = None

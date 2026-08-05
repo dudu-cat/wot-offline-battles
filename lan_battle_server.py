@@ -87,7 +87,7 @@ BOT_CALLSIGNS = (
 ROUND_SCOPED_MESSAGE_TYPES = frozenset((
     "start_battle", "input", "hit_report", "bot_manifest", "bot_state",
     "bot_observation", "bot_hit_report", "bot_human_hit", "rules_state",
-    "battle_result",
+    "battle_result", "leave_battle",
 ))
 
 
@@ -161,6 +161,7 @@ class Player:
     alive: bool = True
     client_position: bool = False
     connected: bool = True
+    participating: bool = True
     bot_order_revision_sent: int = -1
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -256,7 +257,10 @@ class BattleState:
         return roster
 
     def _elect_bot_authority(self):
-        connected = sorted(p.player_id for p in self.players.values() if p.connected)
+        connected = sorted(
+            p.player_id for p in self.players.values()
+            if p.connected and
+            (self.phase != "battle" or p.participating))
         old = self.bot_authority_id
         self.bot_authority_id = connected[0] if connected else None
         if old != self.bot_authority_id and self.phase == "battle":
@@ -351,10 +355,19 @@ class BattleState:
             reset = False
             if self.players and self.phase == "battle":
                 self._maybe_finish_battle()
+                self._finish_abandoned_battle()
             if not self.players and self.phase == "battle":
                 self._reset_round()
                 reset = True
             return player, reset
+
+    def _finish_abandoned_battle(self):
+        """End a round that has no connected client left to simulate it."""
+        if (self.phase != "battle" or self.battle_result is not None or
+                any(player.connected and player.participating
+                    for player in self.players.values())):
+            return False
+        return self._finish_battle(0, "all_players_left", 0)
 
     def _reset_round(self):
         """Return connected players to a clean waiting-room round."""
@@ -365,6 +378,7 @@ class BattleState:
         for player in self.players.values():
             player.health = player.max_health
             player.alive = True
+            player.participating = True
             player.forward = 0.0
             player.turn = 0.0
             player.fire_seq = 0
@@ -419,6 +433,8 @@ class BattleState:
                     return None, "invalid_map"
                 self.map_name = requested_map
             connected = [p for p in self.players.values() if p.connected]
+            for participant in connected:
+                participant.participating = True
             occupied_slots = {(p.team, p.slot) for p in connected}
             self.bot_roster = self._new_bot_roster(occupied_slots)
             self.roster_finalized = True
@@ -440,6 +456,37 @@ class BattleState:
                 "rules": self.rules_state,
                 "battle_result": self.battle_result,
             }, None
+
+    def leave_battle(self, player_id, message):
+        """Retire a client from one round while keeping its lobby socket."""
+        with self.lock:
+            if (not self._message_round_matches(message) or
+                    self.phase != "battle"):
+                return False
+            player = self.players.get(player_id)
+            if player is None or not player.connected:
+                return False
+            if not player.participating:
+                return True
+            player.participating = False
+            previous_health = player.health
+            player.health = 0
+            player.alive = False
+            player.forward = 0.0
+            player.turn = 0.0
+            self.pending_events.append({
+                "kind": "health",
+                "target": player.player_id,
+                "damage": previous_health,
+                "health": 0,
+                "dead": True,
+                "source": "player_left",
+            })
+            if player_id == self.bot_authority_id:
+                self._elect_bot_authority()
+            self._maybe_finish_battle()
+            self._finish_abandoned_battle()
+            return True
 
     def current_battle_message(self):
         with self.lock:
@@ -1221,7 +1268,31 @@ class ClientHandler(socketserver.BaseRequestHandler):
                 self._send_raw(conn, {"type": "error", "code": "protocol", "message": "protocol mismatch"})
                 _server_log("Rejected %s:%d: protocol mismatch" % self.client_address)
                 return
-            player, join_error = server.state.add_player(conn, self.client_address, hello)
+            # Publish membership and this connection's welcome atomically.
+            # Otherwise an existing handler can start a battle after add_player
+            # releases the state lock but before this handler sends welcome,
+            # making battle_start the new client's first state message.
+            welcomed = False
+            with server.state.lock:
+                player, join_error = server.state.add_player(
+                    conn, self.client_address, hello)
+                if player is not None:
+                    welcomed = player.send({
+                        "type": "welcome",
+                        "protocol": PROTOCOL_VERSION,
+                        "player_id": player.player_id,
+                        "name": player.name,
+                        "vehicle": player.vehicle,
+                        "team": player.team,
+                        "slot": player.slot,
+                        "max_health": player.max_health,
+                        "map": server.state.map_name,
+                        "map_pool": list(MAP_POOL),
+                        "phase": server.state.phase,
+                        "round_id": server.state.round_id,
+                        "spawn": {"x": player.x, "y": player.y, "z": player.z, "yaw": player.yaw},
+                        "bot_authority_id": server.state.bot_authority_id,
+                    })
             if player is None:
                 message = ("battle already in progress"
                            if join_error == "battle_in_progress"
@@ -1240,22 +1311,8 @@ class ClientHandler(socketserver.BaseRequestHandler):
                 server.state.phase,
                 len(server.state.players),
             ))
-            player.send({
-                "type": "welcome",
-                "protocol": PROTOCOL_VERSION,
-                "player_id": player.player_id,
-                "name": player.name,
-                "vehicle": player.vehicle,
-                "team": player.team,
-                "slot": player.slot,
-                "max_health": player.max_health,
-                "map": server.state.map_name,
-                "map_pool": list(MAP_POOL),
-                "phase": server.state.phase,
-                "round_id": server.state.round_id,
-                "spawn": {"x": player.x, "y": player.y, "z": player.z, "yaw": player.yaw},
-                "bot_authority_id": server.state.bot_authority_id,
-            })
+            if not welcomed:
+                return
             server.state.broadcast(server.state.lobby_message())
             current_battle = server.state.current_battle_message()
             if current_battle is not None:
@@ -1318,6 +1375,10 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     elif message_type == "battle_result":
                         if not server.state.report_battle_result(player.player_id, message):
                             _server_log("BATTLE RESULT rejected sender=%d" % player.player_id)
+                    elif message_type == "leave_battle":
+                        if server.state.leave_battle(player.player_id, message):
+                            _server_log("BATTLE LEAVE id=%d round=%d" % (
+                                player.player_id, server.state.round_id))
                     elif message_type == "start_battle":
                         start_message, start_error = server.state.request_start(
                             player.player_id, message.get("map"))

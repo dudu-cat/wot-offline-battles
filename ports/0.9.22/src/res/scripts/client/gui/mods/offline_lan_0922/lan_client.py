@@ -161,6 +161,15 @@ class LANClient(object):
             message['map'] = map_name
         return self._send(message)
 
+    def leave_battle(self):
+        """Retire this player from the current round without closing TCP."""
+        if not self.ready or self.phase != 'battle':
+            return False
+        return self._send({
+            'type': 'leave_battle',
+            'round_id': self.round_id,
+        })
+
     def send_input(self, forward, turn, aim_yaw=0.0, gun_pitch=0.0,
                    position=None, yaw=None, fire_seq=0):
         if not self.ready or self.phase != 'battle':
@@ -512,6 +521,14 @@ class LANClient(object):
             if phase not in ('waiting', 'battle') or not map_name or players is None:
                 self.last_error = 'invalid roster message'
                 self.stop()
+                return
+            # Different server threads serialize through Player.send_lock, but
+            # a new battle_start can acquire it before the reset thread sends
+            # its same-round waiting roster.  Round phase is monotonic: once
+            # this client has entered battle, that older waiting roster cannot
+            # demote it or cancel a deferred local start.
+            if (round_id == self.round_id and self.phase == 'battle' and
+                    phase == 'waiting'):
                 return
             if round_id != self.round_id:
                 self.last_snapshot = None

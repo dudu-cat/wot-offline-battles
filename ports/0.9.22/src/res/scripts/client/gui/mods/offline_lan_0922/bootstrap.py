@@ -14,7 +14,9 @@ _callback_id = None
 _started = False
 _session = None
 _config = None
+_account_context = None
 _deadline = 0.0
+_login_space_seen = False
 _lobby_view_loaded = False
 _lobby_listener_installed = False
 
@@ -61,8 +63,9 @@ def _remove_lobby_listener():
 
 
 def _cleanup_runtime():
-    global _callback_id, _config, _deadline, _lobby_listener_installed
-    global _lobby_view_loaded, _session, _started
+    global _account_context, _callback_id, _config, _deadline
+    global _lobby_listener_installed, _lobby_view_loaded
+    global _login_space_seen, _session, _started
     errors = []
 
     callback_id = _callback_id
@@ -77,7 +80,10 @@ def _cleanup_runtime():
     _session = None
     if session is not None:
         try:
-            session.stop(show_login=False)
+            # Global mod shutdown is followed by compatibility.disconnect().
+            # Do not create a fresh Account and start lobby coroutines only to
+            # destroy it immediately in the next cleanup stage.
+            session.stop(show_login=False, restore_account=False)
         except Exception as error:
             errors.append(error)
 
@@ -92,8 +98,10 @@ def _cleanup_runtime():
     except Exception as error:
         errors.append(error)
 
+    _account_context = None
     _config = None
     _deadline = 0.0
+    _login_space_seen = False
     _lobby_view_loaded = False
     _started = False
     if errors:
@@ -137,6 +145,47 @@ def _lobby_is_ready(app_loader, lobby):
     return True
 
 
+def _login_space_is_ready():
+    """Whether LoginState has finished entering its exact GUI space."""
+    from gui.app_loader import g_appLoader
+    from gui.app_loader.settings import GUI_GLOBAL_SPACE_ID
+
+    if g_appLoader.getSpaceID() != GUI_GLOBAL_SPACE_ID.LOGIN:
+        return False
+    lobby = g_appLoader.getDefLobbyApp()
+    return (lobby is not None and
+            bool(getattr(lobby, 'initialized', True)))
+
+
+def _native_lobby_is_ready():
+    from gui.app_loader import g_appLoader
+    return _lobby_is_ready(g_appLoader, g_appLoader.getDefLobbyApp())
+
+
+def _wait_for_login_space():
+    """Create the client-only Account one tick after stable LoginState."""
+    global _callback_id, _login_space_seen
+    _callback_id = None
+    try:
+        if not _login_space_is_ready():
+            _login_space_seen = False
+            _schedule(0.10, _wait_for_login_space)
+            return
+        if not _login_space_seen:
+            # LoginState.init() clears every client-only entity and space.
+            # Recheck on the next engine tick so that cleanup always precedes
+            # creation of our Account, including after the startup video.
+            _login_space_seen = True
+            _schedule(0.0, _wait_for_login_space)
+            return
+        _login_space_seen = False
+        g_compatibility.connect(
+            show_lobby=True, account_context=_account_context)
+        _schedule(0.10, _wait_for_lobby)
+    except Exception as error:
+        _fail_startup(error)
+
+
 def _wait_for_lobby():
     global _callback_id, _deadline, _session
     _callback_id = None
@@ -149,9 +198,12 @@ def _wait_for_lobby():
         if (g_compatibility.is_ready() and
                 _lobby_is_ready(g_appLoader, lobby)):
             from gui.mods.offline_lan_0922.lan_session import LANSession
-            _session = LANSession(_config)
+            _session = LANSession(
+                _config, lobby_ready=_native_lobby_is_ready,
+                callback=BigWorld.callback,
+                cancel_callback=BigWorld.cancelCallback)
             if not _session.start():
-                _session.stop(show_login=False)
+                _session.stop(show_login=False, restore_account=False)
                 _session = None
                 raise RuntimeError('LAN session did not start')
             _remove_lobby_listener()
@@ -170,7 +222,7 @@ def _wait_for_lobby():
 
 
 def _run_once():
-    global _callback_id, _config, _deadline
+    global _account_context, _callback_id, _config, _deadline
     _callback_id = None
     try:
         _config = port_config.load()
@@ -178,15 +230,14 @@ def _run_once():
             _cleanup_runtime()
             sys.stdout.write('[Offline LAN 0.9.22] disabled by config\n')
             return
-        context = {
+        _account_context = {
             'selected_vehicle': _selected_vehicle(_config),
             # Account settings are server-owned in #1513.  Keep their local
             # offline substitute beside config.json across client restarts.
             'account_state': AccountState(),
         }
         _deadline = 0.0
-        g_compatibility.connect(show_lobby=True, account_context=context)
-        _schedule(0.10, _wait_for_lobby)
+        _wait_for_login_space()
     except Exception as error:
         _fail_startup(error)
 

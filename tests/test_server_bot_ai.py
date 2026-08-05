@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 import unittest
 
 from lan_battle_server import BattleState, ClientHandler, Player, PROTOCOL_VERSION
@@ -110,6 +112,65 @@ class ServerBotPlannerTests(unittest.TestCase):
 
         self.assertTrue(state.update_bot_manifest(1, {
             "round_id": state.round_id, "bots": _wire_manifest(state)}))
+
+    def test_round_leave_keeps_socket_and_transfers_bot_authority(self):
+        state = self._started_state(players=2)
+
+        self.assertTrue(state.leave_battle(1, {
+            "round_id": state.round_id}))
+
+        self.assertTrue(state.players[1].connected)
+        self.assertFalse(state.players[1].participating)
+        self.assertFalse(state.players[1].alive)
+        self.assertEqual(0, state.players[1].health)
+        self.assertEqual(2, state.bot_authority_id)
+        self.assertIsNone(state.battle_result)
+        self.assertTrue(any(
+            event.get("kind") == "authority" and
+            event.get("player_id") == 2
+            for event in state.pending_events))
+
+    def test_last_round_participant_leave_finishes_draw_and_reset_revives(self):
+        state = self._started_state(players=1)
+
+        self.assertTrue(state.leave_battle(1, {
+            "round_id": state.round_id}))
+
+        self.assertIsNone(state.bot_authority_id)
+        self.assertEqual(0, state.battle_result["winner"])
+        self.assertEqual("all_players_left",
+                         state.battle_result["reason"])
+        state._reset_round()
+        self.assertTrue(state.players[1].connected)
+        self.assertTrue(state.players[1].participating)
+        self.assertTrue(state.players[1].alive)
+        self.assertEqual(state.players[1].max_health,
+                         state.players[1].health)
+
+    def test_disconnect_of_last_simulator_finishes_round_with_departed_waiter(self):
+        state = self._started_state(players=2)
+        self.assertTrue(state.leave_battle(1, {
+            "round_id": state.round_id}))
+        self.assertEqual(2, state.bot_authority_id)
+
+        state.remove_player(2)
+
+        self.assertIn(1, state.players)
+        self.assertTrue(state.players[1].connected)
+        self.assertFalse(state.players[1].participating)
+        self.assertIsNone(state.bot_authority_id)
+        self.assertEqual(0, state.battle_result["winner"])
+        self.assertEqual("all_players_left",
+                         state.battle_result["reason"])
+
+    def test_stale_round_leave_cannot_retire_current_player(self):
+        state = self._started_state(players=1)
+
+        self.assertFalse(state.leave_battle(1, {
+            "round_id": state.round_id - 1}))
+
+        self.assertTrue(state.players[1].participating)
+        self.assertTrue(state.players[1].alive)
 
     def test_malformed_combat_messages_do_not_mutate_round(self):
         state = self._started_state(players=2)
@@ -676,6 +737,67 @@ class ServerBotPlannerTests(unittest.TestCase):
         pong = [message for message in connection.messages
                 if message.get("type") == "pong"]
         self.assertEqual(9, pong[0]["seq"])
+
+    def test_new_membership_cannot_start_before_its_welcome_is_sent(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        attempted = threading.Event()
+        completed = threading.Event()
+        request_thread = []
+        blocked_during_welcome = []
+        testcase = self
+
+        class FakeConnection(object):
+            def __init__(self):
+                self.chunks = [
+                    (json.dumps({
+                        "type": "hello", "protocol": PROTOCOL_VERSION,
+                        "name": "Alpha", "vehicle": "ussr:T-34",
+                    }) + "\n").encode("utf-8"),
+                    b'{"type":"leave"}\n',
+                ]
+                self.messages = []
+
+            def setsockopt(self, *unused):
+                pass
+
+            def settimeout(self, *unused):
+                pass
+
+            def recv(self, unused_size):
+                return self.chunks.pop(0) if self.chunks else b""
+
+            def sendall(self, payload):
+                message = json.loads(payload.decode("utf-8"))
+                self.messages.append(message)
+                if message.get("type") != "welcome":
+                    return
+
+                def request_start():
+                    attempted.set()
+                    state.request_start(1)
+                    completed.set()
+
+                thread = threading.Thread(target=request_start)
+                request_thread.append(thread)
+                thread.start()
+                testcase.assertTrue(attempted.wait(1.0))
+                time.sleep(0.01)
+                blocked_during_welcome.append(not completed.is_set())
+
+            def close(self):
+                pass
+
+        connection = FakeConnection()
+        server = type("FakeServer", (), {
+            "game_server": type("GameServer", (), {"state": state})(),
+        })()
+
+        ClientHandler(connection, ("127.0.0.1", 12345), server)
+        request_thread[0].join(timeout=1.0)
+
+        self.assertEqual([True], blocked_during_welcome)
+        self.assertTrue(completed.is_set())
+        self.assertEqual("welcome", connection.messages[0]["type"])
 
     def test_malformed_bot_collections_are_rejected_without_state_change(self):
         state = BattleState(map_name="04_himmelsdorf")

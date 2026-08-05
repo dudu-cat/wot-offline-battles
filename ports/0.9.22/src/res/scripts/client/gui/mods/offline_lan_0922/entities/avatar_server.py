@@ -11,6 +11,11 @@ The public 0.9.22 observer implementation at tuxedo commit
 ``c0bc550c46deac980194b7b860ee8781d53ec97b`` confirms the same lifecycle.
 This implementation is intentionally explicit.  Unknown mailboxes still raise
 ``AttributeError`` instead of turning client errors into silent success.
+
+Postmortem spectator switching is deliberately unavailable in the local
+standard-battle slice.  Exact #1513 delegates the actual Avatar attachment to
+the cell server; invoking only ``PlayerAvatar.onSwitchViewpoint`` would update
+the HUD without moving the camera and leave the client in a split state.
 """
 
 try:
@@ -52,6 +57,21 @@ class DeferredAvatarServer(object):
         if self._target is not None:
             return self._target.invalidateMicrophoneMute()
         return None
+
+    def isReady(self):
+        return False
+
+    def isVOIPEnabled(self):
+        return False
+
+    def isVivox(self):
+        return False
+
+    def isYY(self):
+        return False
+
+    def isPlayerSpeaking(self, account_dbid):
+        return False
 
     def switchObserverFPV(self, enabled):
         if self._target is not None:
@@ -161,6 +181,18 @@ class AvatarServerBridge(object):
             raise AvatarBridgeError('cannot bind unknown Vehicle')
         self._bind_avatar_once(vehicle_id)
         return True
+
+    def switchViewPointOrBindToVehicle(self, is_viewpoint,
+                                       vehicle_or_point_id):
+        """Reject unsupported spectator changes without desynchronizing UI.
+
+        ``AvatarPositionControl.switchViewpoint`` discards this mailbox's
+        return value.  A successful server implementation would reattach the
+        Avatar and then call ``PlayerAvatar.onSwitchViewpoint``.  The local
+        bridge cannot perform that engine-owned attachment, so it must not
+        emit the client callback on its own.
+        """
+        return False
 
     def _bind_avatar_once(self, vehicle_id):
         if self._bound_vehicle_id == vehicle_id:
@@ -311,6 +343,21 @@ class AvatarServerBridge(object):
 
     def invalidateMicrophoneMute(self):
         return None
+
+    def isReady(self):
+        return False
+
+    def isVOIPEnabled(self):
+        return False
+
+    def isVivox(self):
+        return False
+
+    def isYY(self):
+        return False
+
+    def isPlayerSpeaking(self, account_dbid):
+        return False
 
     def setMicrophoneMute(self, muted):
         return None

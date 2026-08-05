@@ -1,11 +1,13 @@
 import importlib.util
 from pathlib import Path
+import gc
 import struct
 import sys
 import tempfile
 import types
 import unittest
 from unittest import mock
+import weakref
 import zipfile
 
 
@@ -683,6 +685,11 @@ class OfflineCompatibilityTests(unittest.TestCase):
             def onBecomePlayer(self):
                 operations.append(('original_avatar_become_player',))
                 self.filter = bigworld.AvatarFilter()
+                self.arena = types.SimpleNamespace(arenaType=object())
+
+            def onPrereqsLoaded(self, resource_names, resource_refs):
+                operations.append(
+                    ('avatar_prereqs_loaded', resource_names, resource_refs))
 
         class Vehicle(object):
             pass
@@ -821,6 +828,139 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertFalse(compatibility._connecting)
         compatibility.fini()
 
+    def test_retired_account_drops_callbacks_even_if_player_identity_lingers(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, _ = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.connect(show_lobby=True)
+        account = runtime.bigworld.player()
+        server = account.fakeServer
+
+        server.doCmdInt3(91, 999999, 0, 0, 0)
+        self.assertEqual(1, len(runtime.bigworld._callbacks))
+        account.__dict__.clear()
+        self.assertIs(account, runtime.bigworld.player())
+        unused_delay, callback = runtime.bigworld._callbacks.pop(0)
+
+        callback()
+
+        self.assertIsNone(server._player())
+        compatibility.disconnect()
+        compatibility.fini()
+
+    def test_relogin_cache_can_read_retired_offline_account_name(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, _ = self._runtime()
+        account_type = runtime.account_module.PlayerAccount
+        native_init = account_type.__init__
+        cache_keys = []
+        repository_creations = [0]
+
+        class PersistentCache(object):
+            def __init__(self):
+                self.account = None
+
+            def setAccount(self, account):
+                self.account = (weakref.proxy(account)
+                                if account is not None else None)
+
+            def save(self):
+                if self.account is not None:
+                    cache_keys.append('%s_%s_data' % (
+                        self.account.name,
+                        self.account.__class__.__name__))
+
+        class SyncData(object):
+            def __init__(self):
+                self.account = None
+                self._AccountSyncData__persistentCache = PersistentCache()
+
+            def setAccount(self, account):
+                # Exact #1513 saves through the old cache proxy before it
+                # normally rebinds that proxy to the replacement Account.
+                self.account = account
+                self._AccountSyncData__persistentCache.save()
+                if account is not None:
+                    self._AccountSyncData__persistentCache.setAccount(account)
+
+        class Repository(object):
+            def __init__(self):
+                self.className = account_type.__name__
+                self.syncData = SyncData()
+
+        def repository_init(account):
+            native_init(account)
+            repository = runtime.account_module.g_accountRepository
+            if repository is None:
+                repository_creations[0] += 1
+                repository = Repository()
+                runtime.account_module.g_accountRepository = repository
+            account.syncData = repository.syncData
+            account.syncData.setAccount(account)
+
+        runtime.account_module.g_accountRepository = None
+        account_type.__init__ = repository_init
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.connect(show_lobby=True)
+        first_account = runtime.bigworld.player()
+        repository = runtime.account_module.g_accountRepository
+        persistent_cache = (
+            repository.syncData._AccountSyncData__persistentCache)
+
+        # PyEntity::onEntityDestroyed clears the complete instance dictionary,
+        # while #1513's shared persistent cache still holds its weak proxy.
+        first_account.__dict__.clear()
+        with self.assertRaises(AttributeError):
+            unused = persistent_cache.account.name
+        runtime.bigworld.entities.clear()
+        runtime.bigworld._player = None
+
+        restored = compatibility.restore_lobby_account()
+
+        self.assertEqual(1, repository_creations[0])
+        self.assertEqual(
+            ['offline_account_PlayerAccount_data'], cache_keys)
+        self.assertFalse(compatibility._connecting)
+        restored.name = 'native_name'
+        self.assertEqual('native_name', restored.name)
+
+        # A dead weak proxy fails before any attribute getter can run.  The
+        # prebind must replace it without dereferencing the retired object.
+        class RetiredAccount(object):
+            pass
+
+        retired = RetiredAccount()
+        retired.name = 'retired'
+        persistent_cache.setAccount(retired)
+        dead_proxy = persistent_cache.account
+        del retired
+        gc.collect()
+        with self.assertRaises(ReferenceError):
+            unused = dead_proxy.name
+        runtime.bigworld.entities.clear()
+        runtime.bigworld._player = None
+
+        compatibility.restore_lobby_account()
+
+        self.assertEqual(
+            ['offline_account_PlayerAccount_data'] * 2, cache_keys)
+        compatibility.fini()
+
+    def test_relogin_does_not_prebind_a_different_account_repository(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, _ = self._runtime()
+        persistent_cache = mock.Mock()
+        runtime.account_module.g_accountRepository = types.SimpleNamespace(
+            className='DifferentPlayerAccount',
+            syncData=types.SimpleNamespace(
+                _AccountSyncData__persistentCache=persistent_cache))
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+
+        compatibility.connect(show_lobby=True)
+
+        persistent_cache.setAccount.assert_not_called()
+        compatibility.fini()
+
     def test_avatar_properties_and_mailboxes_exist_during_native_init(self):
         compatibility_module = _load_port_source('compat')
         runtime, _ = self._runtime()
@@ -843,6 +983,49 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertEqual(0, observed['vehicle_id'])
         self.assertEqual(
             (avatar.fakeServer,) * 4, observed['mailboxes'])
+        compatibility.fini()
+
+    def test_avatar_normal_return_without_arena_is_not_marked_ready(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, _ = self._runtime()
+        runtime.avatar_module.PlayerAvatar.onBecomePlayer = (
+            lambda avatar: None)
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.connect(show_lobby=True)
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+
+        with self.assertRaisesRegex(RuntimeError,
+                                    'no initialized arena type'):
+            avatar.onBecomePlayer()
+
+        self.assertFalse(getattr(
+            avatar, '_offlineLANPlayerReady', False))
+        compatibility.fini()
+
+    def test_retired_avatar_drops_uncancellable_resource_callback(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.connect(show_lobby=True)
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        runtime.bigworld._player = avatar
+        avatar.onBecomePlayer()
+        delayed = avatar.onPrereqsLoaded
+
+        delayed(('tank',), {'tank': object()})
+        self.assertEqual(
+            1, len([item for item in operations
+                   if item[0] == 'avatar_prereqs_loaded']))
+        avatar.__dict__.clear()
+        self.assertIs(avatar, runtime.bigworld.player())
+
+        delayed(('tank',), {'tank': object()})
+
+        self.assertEqual(
+            1, len([item for item in operations
+                   if item[0] == 'avatar_prereqs_loaded']))
         compatibility.fini()
 
     def test_vehicle_cell_uses_only_vehicle_or_avatar_mailbox(self):
@@ -931,7 +1114,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertIsNone(runtime.bigworld.player())
         self.assertEqual({}, runtime.bigworld.entities)
         self.assertEqual(
-            1, runtime.bigworld.operations.count(('clear_all_spaces',)))
+            2, runtime.bigworld.operations.count(('clear_all_spaces',)))
         self.assertIn(('wgc', False), runtime.bigworld.operations)
         self.assertEqual(
             1, runtime.bigworld.operations.count(('disconnected',)))
@@ -940,7 +1123,208 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertFalse(compatibility._connecting)
         runtime.bigworld.clearAllSpaces()
         self.assertEqual(
-            2, runtime.bigworld.operations.count(('clear_all_spaces',)))
+            3, runtime.bigworld.operations.count(('clear_all_spaces',)))
+
+    def test_logged_on_listener_failure_rolls_back_entire_connection(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        deleted = []
+        runtime.account_module.g_accountRepository = object()
+
+        def delete_repository():
+            deleted.append(True)
+            runtime.account_module.g_accountRepository = None
+
+        def fail_logged_on(unused_context):
+            operations.append(('logged_on_failed',))
+            raise RuntimeError('logged-on listener failed')
+
+        runtime.account_module._delAccountRepository = delete_repository
+        runtime.connection_manager.onLoggedOn = fail_logged_on
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+
+        with self.assertRaisesRegex(RuntimeError,
+                                    'logged-on listener failed'):
+            compatibility.connect(show_lobby=True)
+
+        self.assertIsNone(runtime.bigworld.player())
+        self.assertEqual({}, runtime.bigworld.entities)
+        self.assertEqual(runtime.login_status.NOT_SET,
+                         runtime.connection_manager.
+                         _ConnectionManager__connectionStatus)
+        self.assertEqual([True], deleted)
+        self.assertNotIn('account_entity', [item[0] for item in operations])
+        self.assertIn(('wgc', False), operations)
+        self.assertIn(('disconnected',), operations)
+        self.assertIn(('player_disconnected',), operations)
+        self.assertFalse(compatibility._fake_connected)
+        self.assertFalse(compatibility._connecting)
+        compatibility.fini()
+
+    def test_swallowed_account_init_failure_is_never_promoted(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        account_type = runtime.account_module.PlayerAccount
+        deleted = []
+
+        def fail_native_init(account):
+            operations.append(('partial_account_init',))
+            account.partial = True
+            raise RuntimeError('native Account init failed')
+
+        account_type.__init__ = fail_native_init
+
+        def swallow_create_error(entity_type, unused_space_id,
+                                 unused_client_only, unused_position,
+                                 unused_orientation, unused_properties):
+            self.assertEqual('Account', entity_type)
+            entity_id = runtime.bigworld._next_entity
+            runtime.bigworld._next_entity += 1
+            account = account_type.__new__(account_type)
+            try:
+                account_type.__init__(account)
+            except RuntimeError:
+                pass
+            runtime.bigworld.entities[entity_id] = account
+            return entity_id
+
+        def delete_repository():
+            deleted.append(True)
+            runtime.account_module.g_accountRepository = None
+
+        runtime.bigworld.createEntity = swallow_create_error
+        runtime.account_module.g_accountRepository = object()
+        runtime.account_module._delAccountRepository = delete_repository
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'partial offline Account'):
+            compatibility.connect(show_lobby=True)
+
+        names = [item[0] for item in operations]
+        self.assertNotIn('player', names)
+        self.assertNotIn('show_gui', names)
+        self.assertIsNone(runtime.bigworld.player())
+        self.assertEqual({}, runtime.bigworld.entities)
+        self.assertEqual([True, True], deleted)
+        self.assertFalse(compatibility._fake_connected)
+        compatibility.fini()
+
+    def test_failed_lobby_restore_retires_partial_connection_and_reconnects(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, _ = self._runtime()
+        account_type = runtime.account_module.PlayerAccount
+        native_init = account_type.__init__
+        constructions = [0]
+        deleted = []
+
+        def fail_second_construction(account):
+            constructions[0] += 1
+            native_init(account)
+            if constructions[0] == 2:
+                raise RuntimeError('replacement Account init failed')
+
+        def delete_repository():
+            deleted.append(True)
+            runtime.account_module.g_accountRepository = None
+
+        account_type.__init__ = fail_second_construction
+        runtime.account_module._delAccountRepository = delete_repository
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.connect(show_lobby=True)
+        runtime.account_module.g_accountRepository = object()
+        runtime.bigworld.entities.clear()
+        runtime.bigworld._player = None
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'replacement Account init failed'):
+            compatibility.restore_lobby_account()
+
+        self.assertEqual({}, runtime.bigworld.entities)
+        self.assertIsNone(runtime.bigworld.player())
+        self.assertIsNone(runtime.account_module.g_accountRepository)
+        self.assertFalse(compatibility._fake_connected)
+        self.assertGreaterEqual(len(deleted), 1)
+
+        compatibility.connect(show_lobby=True)
+        self.assertTrue(compatibility.is_ready())
+        self.assertEqual(1, len(runtime.bigworld.entities))
+        compatibility.fini()
+
+    def test_disconnect_listener_failure_still_cleans_every_boundary(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.connect(show_lobby=True)
+        deleted = []
+
+        def fail_disconnected():
+            operations.append(('disconnected_failed',))
+            raise RuntimeError('disconnect listener failed')
+
+        def delete_repository():
+            deleted.append(True)
+
+        runtime.connection_manager.onDisconnected = fail_disconnected
+        runtime.account_module._delAccountRepository = delete_repository
+        runtime.offline_map_creator.active = True
+
+        with self.assertRaisesRegex(RuntimeError,
+                                    'disconnect listener failed'):
+            compatibility.disconnect()
+
+        self.assertIsNone(runtime.bigworld.player())
+        self.assertEqual({}, runtime.bigworld.entities)
+        self.assertEqual([True], deleted)
+        self.assertIn(('player_disconnected',), operations)
+        self.assertFalse(runtime.offline_map_creator.active)
+        self.assertFalse(compatibility._fake_connected)
+        compatibility.fini()
+
+    def test_fini_restores_all_patches_even_when_disconnect_listener_fails(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, _ = self._runtime()
+        account_type = runtime.account_module.PlayerAccount
+        avatar_type = runtime.avatar_module.PlayerAvatar
+        vehicle_type = runtime.vehicle_module.Vehicle
+        originals = (
+            account_type.__dict__['__init__'],
+            account_type.__getattribute__,
+            avatar_type.__dict__['__init__'],
+            avatar_type.__getattribute__,
+            vehicle_type.__getattribute__,
+            runtime.bigworld.connect,
+            runtime.bigworld.disconnect,
+        )
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.connect(show_lobby=True)
+        compatibility.configure_battle()
+
+        def fail_disconnected():
+            raise RuntimeError('disconnect listener failed')
+
+        runtime.connection_manager.onDisconnected = fail_disconnected
+        with self.assertRaisesRegex(RuntimeError,
+                                    'disconnect listener failed'):
+            compatibility.fini()
+
+        self.assertFalse(compatibility._installed)
+        self.assertFalse(compatibility._battle_active)
+        self.assertFalse(compatibility._native_battle)
+        self.assertEqual([], runtime.predefined_hosts._hosts)
+        self.assertIs(originals[0], account_type.__dict__['__init__'])
+        self.assertIs(originals[1], account_type.__getattribute__)
+        self.assertIs(originals[2], avatar_type.__dict__['__init__'])
+        self.assertIs(originals[3], avatar_type.__getattribute__)
+        self.assertIs(originals[4], vehicle_type.__getattribute__)
+        self.assertIs(originals[5].__func__,
+                      runtime.bigworld.connect.__func__)
+        self.assertIs(originals[5].__self__,
+                      runtime.bigworld.connect.__self__)
+        self.assertIs(originals[6].__func__,
+                      runtime.bigworld.disconnect.__func__)
+        self.assertIs(originals[6].__self__,
+                      runtime.bigworld.disconnect.__self__)
 
     def test_lobby_restore_does_not_replace_an_existing_player(self):
         compatibility_module = _load_port_source('compat')
@@ -1374,6 +1758,14 @@ class BootstrapContractTests(unittest.TestCase):
                 hangar_vehicle.model = None
                 event_bus.fire(lobby_loaded)
                 self.assertEqual(0.0, module._deadline)
+                # First stable LOGIN observation deliberately waits one more
+                # engine tick so LoginState's entity clear cannot race the
+                # client-only Account construction.
+                bigworld.run_next()
+                self.assertEqual(0.0, module._deadline)
+                compatibility.connect.assert_not_called()
+                bigworld.run_next()
+                self.assertEqual(0.0, module._deadline)
                 bigworld.run_next()
                 self.assertEqual(1030.0, module._deadline)
                 lan_session.LANSession.assert_not_called()
@@ -1395,13 +1787,16 @@ class BootstrapContractTests(unittest.TestCase):
             # and listener, then allow a clean init.  Keep the hangar not
             # ready so no second LANSession can be constructed.
             hangar_space.spaceInited = False
+            loader.getSpaceID.return_value = 3
             module.init()
             self.assertEqual(1, len(bigworld._callbacks))
             self.assertEqual(
                 [module._on_lobby_view_loaded],
                 event_bus.listeners[lobby_loaded])
             bigworld.run_next()
+            bigworld.run_next()
             event_bus.fire(lobby_loaded)
+            loader.getSpaceID.return_value = 4
             clock = [1000.0]
             with mock.patch.object(
                     module.time, 'time', side_effect=lambda: clock[0]):
@@ -1423,9 +1818,14 @@ class BootstrapContractTests(unittest.TestCase):
             module.fini()
             self.assertFalse(module._started)
             self.assertEqual([], bigworld._callbacks)
-        lan_session.LANSession.assert_called_once_with(config.load.return_value)
+        lan_session.LANSession.assert_called_once_with(
+            config.load.return_value,
+            lobby_ready=module._native_lobby_is_ready,
+            callback=bigworld.callback,
+            cancel_callback=bigworld.cancelCallback)
         session.start.assert_called_once_with()
-        session.stop.assert_called_once_with(show_login=False)
+        session.stop.assert_called_once_with(
+            show_login=False, restore_account=False)
         expected_connect = mock.call(
             show_lobby=True,
             account_context={'selected_vehicle': {

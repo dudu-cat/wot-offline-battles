@@ -435,6 +435,7 @@ class _BridgeAvatar(object):
         self.responses = []
         self.tokens = []
         self.account_stats = []
+        self.viewpoint_switches = []
 
     def syncVehicleAttrs(self, attrs):
         self.synced.append(attrs)
@@ -450,6 +451,9 @@ class _BridgeAvatar(object):
 
     def receiveAccountStats(self, request_id, data):
         self.account_stats.append((request_id, pickle.loads(data)))
+
+    def onSwitchViewpoint(self, vehicle_id, position):
+        self.viewpoint_switches.append((vehicle_id, position))
 
 
 class _Sender(object):
@@ -473,6 +477,23 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertEqual(
             [mock.call.setClientReady(), mock.call.autoAim(0)],
             target.mock_calls)
+
+    def test_exact_voip_queries_are_explicitly_disabled(self):
+        module = _avatar_bridge_module()
+        deferred = module.DeferredAvatarServer()
+        bridge = module.AvatarServerBridge(
+            _BridgeAvatar(), _BridgeBinding(),
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            _Sender())
+
+        for server in (deferred, bridge):
+            self.assertIs(server.voipController, server)
+            self.assertFalse(server.isReady())
+            self.assertFalse(server.isVOIPEnabled())
+            self.assertFalse(server.isVivox())
+            self.assertFalse(server.isYY())
+            self.assertFalse(server.isPlayerSpeaking(12345))
 
     def test_stock_sequence_forwards_known_mailbox_and_lan_inputs(self):
         module = _avatar_bridge_module()
@@ -581,6 +602,7 @@ class AvatarServerBridgeTests(unittest.TestCase):
             'monitorVehicleDamagedDevices': 1,
             'activateEquipment': 1,
             'switchObserverFPV': 1,
+            'switchViewPointOrBindToVehicle': 2,
             'trackRelativePointWithGun': 1,
             'setRemoteCamera': 1,
             'switchObserverFPVControlMode': 1,
@@ -596,6 +618,24 @@ class AvatarServerBridgeTests(unittest.TestCase):
                                inspect.Parameter.VAR_KEYWORD)
                 for value in parameters), name)
             self.assertEqual(wire_count + 1, len(parameters), name)
+
+    def test_spectator_switch_is_explicitly_rejected_without_client_desync(self):
+        module = _avatar_bridge_module()
+        avatar = _BridgeAvatar()
+        binding = _BridgeBinding()
+        sender = _Sender()
+        bridge = module.AvatarServerBridge(
+            avatar, binding,
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            sender)
+
+        self.assertFalse(bridge.switchViewPointOrBindToVehicle(False, 92))
+        self.assertFalse(bridge.switchViewPointOrBindToVehicle(True, 7))
+
+        self.assertEqual([], avatar.viewpoint_switches)
+        self.assertEqual([], binding.events)
+        self.assertEqual([], sender.events)
 
     def test_unknown_mailbox_interface_is_not_silently_accepted(self):
         module = _avatar_bridge_module()

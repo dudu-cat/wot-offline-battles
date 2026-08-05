@@ -65,7 +65,6 @@ def _load_runtime():
     import constants
     from OfflineMapCreator import g_offlineMapCreator
     from gun_rotation_shared import encodeGunAngles
-    from gui.app_loader import g_appLoader
     from gui.mods.offline_lan_0922.compat import g_compatibility
     from items import vehicles
 
@@ -79,7 +78,6 @@ def _load_runtime():
     runtime.compatibility = g_compatibility
     runtime.constants = constants
     runtime.encode_gun_angles = encodeGunAngles
-    runtime.app_loader = g_appLoader
     runtime.math = Math
     runtime.offline_map_creator = g_offlineMapCreator
     runtime.vehicles = vehicles
@@ -154,7 +152,7 @@ class BattleRuntime(object):
         self._callback_id = None
         self._ammo_callback_id = None
         self._deadline = 0.0
-        self._map_created = False
+        self._map_create_attempted = False
         self._avatar = None
         self._binding = None
         self._server = None
@@ -175,8 +173,10 @@ class BattleRuntime(object):
         self._player_reload_time = 0.0
         self._battle_result = None
         self._round_finished_notified = False
+        self._on_local_leave = None
 
-    def start(self, config, message=None, lan_client=None):
+    def start(self, config, message=None, lan_client=None,
+              on_local_leave=None):
         if self.state not in ('idle', 'stopped', 'failed'):
             return False
         if lan_client is None:
@@ -196,6 +196,7 @@ class BattleRuntime(object):
         self._player_reload_time = 0.0
         self._battle_result = self._start_message.get('battle_result')
         self._round_finished_notified = False
+        self._on_local_leave = on_local_leave
         self._generation += 1
         self._deadline = self._clock() + float(
             self._config.get('startupTimeoutSeconds', 30.0))
@@ -209,13 +210,26 @@ class BattleRuntime(object):
             self._runtime.compatibility.configure_battle(
                 getattr(constants.ARENA_GUI_TYPE, 'RANDOM', 0),
                 getattr(constants.ARENA_BONUS_TYPE, 'REGULAR', 0))
+            # OfflineMapCreator.create() catches some native setup failures and
+            # only calls cancel(), which resets ids but does not clear the
+            # partially-created Avatar or space.  Remember the attempt before
+            # entering stock code so every exit can run its stronger destroy()
+            # rollback, even when Active() is already false afterward.
+            self._map_create_attempted = True
             self._runtime.offline_map_creator.create(self._config['map'])
             if not self._runtime.offline_map_creator.Active():
                 raise RuntimeError('stock OfflineMapCreator rejected the map')
-            self._map_created = True
             self._avatar = self._runtime.bigworld.player()
             if self._avatar is None:
                 raise RuntimeError('stock OfflineMapCreator created no Avatar')
+            if not getattr(
+                    self._avatar, '_offlineLANInitComplete', False):
+                raise RuntimeError(
+                    'stock OfflineMapCreator returned a partial Avatar')
+            if not getattr(
+                    self._avatar, '_offlineLANPlayerReady', False):
+                raise RuntimeError(
+                    'stock OfflineMapCreator did not promote its Avatar')
             self.state = 'loading_space'
             self._schedule(0.05, self._wait_for_space)
             return True
@@ -290,7 +304,8 @@ class BattleRuntime(object):
                 account_commands=(commands.CMD_GET_AVATAR_SYNC,
                                   commands.CMD_ADD_INT_USER_SETTINGS,
                                   commands.CMD_DEL_INT_USER_SETTINGS),
-                on_ready=self._on_client_ready, on_leave=self.stop)
+                on_ready=self._on_client_ready,
+                on_leave=self._defer_avatar_leave)
             self._runtime.compatibility.attach_avatar_server(
                 self._avatar, self._server)
             position, yaw = self._state_world_pose(local)
@@ -1069,23 +1084,44 @@ class BattleRuntime(object):
         return max(1, int(random.uniform(
             damage_average * 0.75, damage_average * 1.25))), 2
 
-    def stop(self, show_login=False):
+    def _defer_avatar_leave(self):
+        """Finish the native leaveArena stack before retiring its Avatar."""
+        generation = self._generation
+        server = self._server
+        on_local_leave = self._on_local_leave
+
+        def leave_after_mailbox_returns():
+            if (generation == self._generation and
+                    server is self._server):
+                if callable(on_local_leave):
+                    on_local_leave()
+                else:
+                    self.stop(show_login=False)
+
+        self._runtime.bigworld.callback(0.0, leave_after_mailbox_returns)
+
+    def stop(self, show_login=False, restore_account=True):
         if self.state in ('idle', 'stopped'):
             return
         self._generation += 1
         self._cancel_callbacks()
-        self._cleanup()
-        if not show_login:
-            # OfflineMapCreator.destroy() clears entities and Avatar teardown
-            # calls destroyBattle(), which leaves #1513 in WAITING with no
-            # Account player.  Recreate that native mailbox before entering
-            # LOBBY, whose transition reattaches the lobby cursor before
-            # LANSession opens the next stock TrainingSettingsWindow.
-            self._runtime.compatibility.restore_lobby_account()
-            app_loader = getattr(self._runtime, 'app_loader', None)
-            if app_loader is not None:
-                app_loader.showLobby()
+        cleanup_error = None
+        try:
+            self._cleanup()
+        except Exception as error:
+            cleanup_error = error
+        # Mark ownership closed even when native Account reconstruction fails;
+        # otherwise this runtime rejects every later start as still running.
         self.state = 'stopped'
+        if cleanup_error is not None:
+            raise cleanup_error
+        if restore_account:
+            # A LAN transport failure is not a WoT account disconnect.
+            # OfflineMapCreator.destroy() removed the Avatar and the fake
+            # connection needs a replacement Account.  Account.showGUI owns
+            # the eventual native showLobby transition after synchronization;
+            # calling g_appLoader here would race and duplicate it.
+            self._runtime.compatibility.restore_lobby_account()
 
     def _cancel_callbacks(self):
         for callback_id in (self._callback_id, self._ammo_callback_id):
@@ -1098,6 +1134,7 @@ class BattleRuntime(object):
         self._ammo_callback_id = None
 
     def _cleanup(self):
+        cleanup_error = None
         if self._binding is not None:
             for key, record in list(self._records.items()):
                 if record.get('local'):
@@ -1116,13 +1153,52 @@ class BattleRuntime(object):
                 except Exception:
                     pass
         self._records = {}
-        if self._map_created:
+        if self._map_create_attempted:
             try:
                 self._runtime.offline_map_creator.destroy()
-            except Exception:
-                pass
-        self._runtime.compatibility.deactivate_map()
-        self._map_created = False
+            except Exception as error:
+                cleanup_error = error
+            try:
+                player = self._runtime.bigworld.player()
+            except ReferenceError:
+                player = None
+            except Exception as error:
+                player = None
+                if cleanup_error is None:
+                    cleanup_error = error
+            if player is not None:
+                # Exact OfflineMapCreator.destroy() catches its own teardown
+                # exception and calls cancel(), losing the ids while a zombie
+                # Avatar may remain.  Retry the engine-owned clear directly
+                # and verify the ownership boundary before restoring Account.
+                for name in ('clearEntitiesAndSpaces', 'clearAllSpaces'):
+                    clear = getattr(self._runtime.bigworld, name, None)
+                    if not callable(clear):
+                        continue
+                    try:
+                        clear()
+                    except Exception as error:
+                        if cleanup_error is None:
+                            cleanup_error = error
+                    try:
+                        player = self._runtime.bigworld.player()
+                    except ReferenceError:
+                        player = None
+                    except Exception as error:
+                        if cleanup_error is None:
+                            cleanup_error = error
+                        player = None
+                    if player is None:
+                        break
+                if player is not None and cleanup_error is None:
+                    cleanup_error = RuntimeError(
+                        'stock map teardown retained the Avatar')
+        try:
+            self._runtime.compatibility.deactivate_map()
+        except Exception as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        self._map_create_attempted = False
         self._avatar = None
         self._binding = None
         self._server = None
@@ -1140,24 +1216,31 @@ class BattleRuntime(object):
         self._player_reload_time = 0.0
         self._battle_result = None
         self._round_finished_notified = False
+        self._on_local_leave = None
+        if cleanup_error is not None:
+            raise cleanup_error
 
     def _fail(self, error):
         self.error = str(error)
         self._generation += 1
         self._cancel_callbacks()
-        self._cleanup()
+        cleanup_error = None
+        try:
+            self._cleanup()
+        except Exception as cleanup_failure:
+            cleanup_error = cleanup_failure
+            self.error = '%s; cleanup failed: %s' % (
+                self.error, cleanup_failure)
         self.state = 'failed'
         # Asynchronous map/entity failures happen after OfflineMapCreator has
         # replaced the lobby Account.  Recover the same boundary as a normal
         # round exit before telling LANSession to close the failed connection;
         # otherwise #1513 remains in WAITING with no player mailbox.
-        try:
-            self._runtime.compatibility.restore_lobby_account()
-            app_loader = getattr(self._runtime, 'app_loader', None)
-            if app_loader is not None:
-                app_loader.showLobby()
-        except Exception:
-            pass
+        if cleanup_error is None:
+            try:
+                self._runtime.compatibility.restore_lobby_account()
+            except Exception:
+                pass
         callback = getattr(self.client, 'on_event', None)
         if callable(callback):
             callback('error', {'message': self.error})

@@ -52,6 +52,23 @@ current player identity before delivery, so a retired Account cannot receive a
 late response during a battle/lobby transition. The lifecycle regression fake
 uses destructive `clearAllSpaces()` semantics rather than a logging-only stub.
 
+BigWorld entity destruction also clears the Python Entity's entire instance
+dictionary. The exact Account repository survives across replacement Account
+entities, while `AccountSyncData.setAccount()` saves its persistent cache
+through the old weak proxy before rebinding that cache to the new Account. The
+offline constructor therefore prebinds that one cache before native repository
+reuse. Initialization and player-promotion sentinels are set only after their
+native methods return successfully; a partial Entity returned by BigWorld is
+never promoted. FakeServer and uncancellable Avatar resource callbacks require
+both sentinels and current-player identity, so a zombie object cannot receive a
+late mailbox callback even during the destruction tick.
+
+The LOGGED_ON notification, Account construction and promotion are one
+transaction. Any listener or constructor failure clears client-only spaces,
+resets connection status, invokes every disconnect boundary independently and
+deletes the retained Account repository even if an earlier event listener
+raises. Shutdown restores every patched class and host entry in `finally`.
+
 The Account surface was checked consumer-first against the local `#1513` PYC,
 not inferred from another 0.9.22 build:
 
@@ -100,17 +117,30 @@ test fixture was insufficient even though the wrapper itself initialized.
 
 It also caught a multi-round boundary. `OfflineMapCreator.destroy()` calls
 `BigWorld.clearEntitiesAndSpaces()`, which removes the fake Account as well as
-the battle entities. Returning only through `showLobby()` therefore leaves no
-player mailbox. Cleanup now recreates the offline Account through the same
-patched constructor, rebinds the retained native account repository and only
-then asks the app loader to show Lobby.
+the battle entities. Its broad exception handler can fall back to `cancel()`,
+which resets ids without clearing entities or spaces. Cleanup now records every
+map-create attempt, runs the stronger stock destroy even after a rejected map,
+verifies that no Avatar remains, and retries the engine clear directly before
+it considers ownership released.
+
+After a clean teardown, the offline Account is recreated through the same
+patched constructor. The native `Account.showGUI` synchronization coroutine,
+not BattleRuntime, owns the eventual `g_appLoader.showLobby()` call. The next
+picker waits for native Lobby space, HangarSpace and the current vehicle model;
+opening it synchronously after Account construction would race cursor and
+Scaleform ownership. A server-initiated next `battle_start` uses the same gate:
+the message is retained and fenced by round id until the native lobby is ready,
+so a waiting roster and next start delivered in one network poll cannot replace
+an Account while its hangar is still assembling.
 
 The required order is:
 
 ```text
 OfflineMapCreator.destroy()
   -> restore_lobby_account()
-  -> g_appLoader.showLobby()
+  -> Account.showGUI() / native synchronization
+  -> native g_appLoader.showLobby()
+  -> wait for Lobby + HangarSpace + vehicle model
   -> open the next stock TrainingSettingsWindow
 ```
 
@@ -122,14 +152,26 @@ window instance's arena cache with the server's standard-mode pool and sends
 its chosen geometry to `request_start`. Other training windows continue down
 the original method.
 
-The wrapper waits for the exact public `LOBBY_VIEW_LOADED` event, Lobby GUI
+Before creating the first Account, bootstrap waits until the exact app loader
+has entered `GUI_GLOBAL_SPACE_ID.LOGIN` for two consecutive engine ticks.
+`personality.init()` loads mods before `personality.start()` starts the native
+Start/IntroVideo-to-Login state machine; creating an Account in that interval
+lets `LoginState.init()` destroy it with `clearEntitiesAndSpaces()`. The same
+clear invalidates an in-flight hangar CompoundAssembler, which explains the
+observed `R11_MS-1` resource-dictionary KeyError despite complete vehicle
+resources. No vehicle-specific exception or resource replacement is needed.
+
+After Account promotion, the wrapper waits for the exact public
+`LOBBY_VIEW_LOADED` event, Lobby GUI
 space, initialized hangar space and (when present) a completed hangar vehicle
 model before it starts the LAN session. Merely finding an initialized
 Scaleform application is insufficient because that object already exists in
 the login/EULA space. The hangar timeout starts only after the lobby event, so
 first-run EULA interaction is not treated as a startup failure. Raw class
 members are preserved so Python 2 unbound-method identity is restored
-correctly, and the picker closes only once. The stock window remains
+correctly. A chain-safe `onWindowClose` adapter releases session ownership when
+the user presses Cancel, and programmatic close is idempotent even if Scaleform
+has already retired the weak view. The stock window remains
 responsible for mouse and cursor behavior; no transparent hotkey overlay or
 F12/`0` handler is installed.
 
@@ -141,6 +183,19 @@ battle branch while `PlayerAvatar.onBecomePlayer` runs, but preserves the one
 native `AvatarFilter` established before world entry. A strict local mailbox
 implements only the exact early Account/Avatar/Vehicle server calls needed by
 this client.
+
+`PlayerAvatar.leaveArena()` calls its base mailbox before the rest of its
+native cleanup. The local bridge therefore schedules runtime teardown for the
+next engine tick instead of destroying the Avatar reentrantly. LANSession then
+retires that participant from only the active server round, restores the local
+Account and keeps the waiting-room socket. The server transfers bot authority
+to another participating client, or records a draw when no simulator remains;
+the departed client cannot consume a duplicate start for the same round and is
+re-enabled only by the next waiting roster. Explicit VOIP queries used by
+vehicle markers are present and conservatively disabled. The local slice cannot
+perform the cell-server attachment needed for postmortem spectator switching,
+so the exact switch mailbox rejects the request without falsely updating only
+the HUD.
 
 Vehicle creation uses all properties from the local `Vehicle.def`, the exact
 18-item compressed `VEHICLE_ADDED` tuple, native descriptors and native entity
@@ -182,7 +237,10 @@ returns the room to waiting.
 
 Humans take real team slots first. Bots fill the unoccupied slots so each team
 has exactly 15 vehicles. Battle-time late joins are rejected to prevent a
-16th slot or an incomplete local manifest.
+16th slot or an incomplete local manifest. A waiting-room membership is not
+published to other handlers until its own `welcome` has been sent under the
+same state lock, so another player cannot start a battle whose first message to
+the new client would arrive before its identity and round assignment.
 
 The elected authority client runs tactical bots using standard-map annotations,
 vehicle roles, persistent randomized personalities, bounded line-of-sight
@@ -190,7 +248,10 @@ caching and local avoidance of terrain, water, steep slopes, obstacles and
 nearby vehicles. The Python server remains canonical for room phase, HP, shot
 events, elimination and the three-second round reset. The next waiting roster
 is a synchronization barrier: the previous battle runtime is destroyed before
-the map picker reopens, and snapshots cannot be reordered across that barrier.
+either the map picker or a queued next battle can cross the native Lobby/Hangar
+readiness gate. Per-round phase is monotonic, so a delayed same-round waiting
+roster or start denial cannot cancel an accepted battle, and snapshots cannot
+be reordered across that barrier.
 
 The pure-data server planner emits revisioned global `bot_orders`, which the
 0.9.22 authority now uses for macro targets after reporting bounded visibility
@@ -214,6 +275,7 @@ not carried into this runtime.
 The test suites cover configuration, protocol ordering, fake Account RPC data,
 stock picker installation/restoration, exact battle mailboxes, Vehicle property
 packing, local movement, aiming, shooting, health/death, snapshot barriers,
+active-round leave and authority transfer, same-poll lobby/start interleaving,
 bot authority, tactical maps, 15-per-team allocation, elimination and
 multi-round reset.
 
@@ -221,18 +283,21 @@ The release build additionally:
 
 1. inspects the exact client version, build, executable architecture and
    required resource archives;
-2. reads exact code objects from `scripts.pkg` and compares all 82 stock method
-   signatures, 18 direct-consumer literals, 16 lifecycle code names and 11
+2. reads exact code objects from `scripts.pkg` and compares all 92 stock method
+   signatures, 18 direct-consumer literals, 20 lifecycle code names and 11
    `AccountCommands` constants used by the port, including variadic flags on
    the stock view loader;
-3. compiles every packaged source with CPython 2.7;
-4. removes source and stale Python 3 bytecode;
-5. requires the packaged PYC manifest to match every current source module and
+3. checks 14 ordered lifecycle contracts and inventories every exact
+   Account-helper `setAccount` implementation, so weak-reference, login-state,
+   map rollback and leave-arena assumptions cannot silently change;
+4. compiles every packaged source with CPython 2.7;
+5. removes source and stale Python 3 bytecode;
+6. requires the packaged PYC manifest to match every current source module and
    checks every PYC magic value;
-6. rejects duplicate or corrupt archive members, `.pyo` and `__pycache__`;
-7. requires Store compression and explicit directory entries for all wotmod
+7. rejects duplicate or corrupt archive members, `.pyo` and `__pycache__`;
+8. requires Store compression and explicit directory entries for all wotmod
    members; and
-8. produces a checksum and hash-named copy-ready client overlay.
+9. produces a checksum and hash-named copy-ready client overlay.
 
 The ABI gate is intentionally paired with consumer-contract tests. Python code
 object signatures cannot describe Entity `.def` flags, mailbox wire arities,
@@ -254,6 +319,11 @@ Windows BigWorld engine. The first real-client run still has to verify:
   frame rate; and
 - a full result -> lobby -> picker -> second battle cycle completes without a
   new traceback.
+
+Postmortem spectator attachment, SPG/strategic camera movement, battle-settings
+capture-device enumeration and combat-equipment placement are outside the
+current standard light/medium/heavy/tank-destroyer slice. Their exact mailboxes
+are not generalized into silent no-ops.
 
 No additional Python mismatch is known in the consumer matrix above. Optional
 lobby features outside that matrix and all BigWorld-side behavior still remain

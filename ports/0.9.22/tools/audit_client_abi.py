@@ -35,6 +35,14 @@ EXPECTED_ABI = {
         'ClientChat.onChatAction': ('self', 'chatActionData'),
         'ClientChat.__dataTimeProcessor': ('self', 'actionData'),
     },
+    'scripts/client/account_helpers/AccountSyncData.pyc': {
+        'AccountSyncData.setAccount': ('self', 'account'),
+    },
+    'scripts/client/account_helpers/persistent_caches.pyc': {
+        'SimpleCache.setAccount': ('self', 'account'),
+        'SimpleCache.getFileName': ('self',),
+        'cacheFileName': ('account', 'cacheType', 'cacheName'),
+    },
     'scripts/client/account_helpers/QuestProgress.pyc': {
         'QuestProgress.synchronize': ('self', 'isFullSync', 'diff'),
     },
@@ -57,6 +65,9 @@ EXPECTED_ABI = {
         'PlayerAvatar.onBecomePlayer': ('self',),
         'PlayerAvatar.onEnterWorld': ('self', 'prereqs'),
         'PlayerAvatar.onLeaveWorld': ('self',),
+        'PlayerAvatar.onPrereqsLoaded': (
+            'self', 'resNames', 'resourceRefs'),
+        'PlayerAvatar.leaveArena': ('self',),
         'PlayerAvatar.onVehicleChanged': ('self',),
         'PlayerAvatar.onCmdResponse': (
             'self', 'requestID', 'resultID', 'errorStr'),
@@ -100,6 +111,7 @@ EXPECTED_ABI = {
     'scripts/client/OfflineMapCreator.pyc': {
         'OfflineMapCreator.create': ('self', 'mapName'),
         'OfflineMapCreator.destroy': ('self',),
+        'OfflineMapCreator.cancel': ('self',),
         'OfflineMapCreator.Active': ('self',),
         'OfflineMapCreator.SetActive': ('self', '_active'),
     },
@@ -112,6 +124,11 @@ EXPECTED_ABI = {
         '_AppLoader.getDefLobbyApp': ('self',),
         '_AppLoader.getSpaceID': ('self',),
         '_AppLoader.showLobby': ('self',),
+    },
+    'scripts/client/gui/app_loader/states.pyc': {
+        'LoginState.init': ('self', 'ctx'),
+        'LoginState.update': ('self', 'ctx'),
+        'LoginState._clearEntitiesAndSpaces': (),
     },
     'scripts/client/gui/Scaleform/daapi/view/lobby/LobbyView.pyc': {
         'LobbyView._populate': ('self',),
@@ -225,6 +242,12 @@ EXPECTED_CODE_NAMES = {
     'scripts/client/gui/shared/personality.pyc': {
         'onCenterIsLongDisconnected': (
             'BigWorld', 'player', 'isLongDisconnectedFromCenter'),
+    },
+    'scripts/client/gui/app_loader/states.pyc': {
+        'LoginState.init': ('_clearEntitiesAndSpaces',),
+        'LoginState.update': ('_clearEntitiesAndSpaces',),
+        'LoginState._clearEntitiesAndSpaces': (
+            'BigWorld', 'clearEntitiesAndSpaces'),
     },
     'scripts/client/gui/game_control/state_tracker.pyc': {
         'GameStateTracker.init': (

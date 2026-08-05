@@ -25,6 +25,7 @@ class LanProtocolTests(unittest.TestCase):
         self.client._send = send
 
     def test_v5_explicit_control_messages(self):
+        self.assertTrue(self.client.leave_battle())
         self.assertTrue(self.client.send_hit(2, 4, 500, 2, 1, (1, 2, 3)))
         self.assertTrue(self.client.send_bot_manifest([{'id': 1}] * 40))
         self.assertTrue(self.client.send_bot_state([{'id': 1}]))
@@ -32,11 +33,12 @@ class LanProtocolTests(unittest.TestCase):
         self.assertTrue(self.client.send_bot_bot_hit(1, 2, 3, 120, 2))
         self.assertTrue(self.client.send_rules_state({'1': {'points': 10}}))
         self.assertTrue(self.client.send_battle_result(1, 'elimination'))
-        self.assertEqual('hit_report', self.sent[0]['type'])
-        self.assertEqual(30, len(self.sent[1]['bots']))
-        self.assertEqual(64, len(self.sent[3]['contacts']))
-        self.assertEqual(1, self.sent[4]['attacker_bot'])
-        self.assertEqual('rules_state', self.sent[5]['type'])
+        self.assertEqual('leave_battle', self.sent[0]['type'])
+        self.assertEqual('hit_report', self.sent[1]['type'])
+        self.assertEqual(30, len(self.sent[2]['bots']))
+        self.assertEqual(64, len(self.sent[4]['contacts']))
+        self.assertEqual(1, self.sent[5]['attacker_bot'])
+        self.assertEqual('rules_state', self.sent[6]['type'])
         self.assertTrue(all(message['round_id'] == 7
                             for message in self.sent))
 
@@ -61,6 +63,22 @@ class LanProtocolTests(unittest.TestCase):
         self.client._send = lambda message: self.sent.append(message) or True
         self.assertEqual(1, self.client.send_fire())
         self.assertEqual(1, self.sent[-1]['fire_seq'])
+
+    def test_same_round_waiting_roster_cannot_demote_accepted_battle(self):
+        players = [{
+            'id': 1, 'team': 1, 'slot': 0, 'name': 'P',
+            'vehicle': 'ussr:MS-1', 'x': 0, 'y': 0, 'z': 0}]
+        self.client._handle_message({
+            'type': 'battle_start', 'protocol': 5, 'round_id': 7,
+            'map': '01_karelia', 'players': players})
+
+        self.client._handle_message({
+            'type': 'roster', 'protocol': 5, 'round_id': 7,
+            'phase': 'waiting', 'map': '05_prohorovka', 'players': []})
+
+        self.assertEqual('battle', self.client.phase)
+        self.assertEqual('01_karelia', self.client.map_name)
+        self.assertEqual(players, self.client.roster)
 
     def test_battle_rpc_translator_only_maps_existing_input_fields(self):
         translator = BattleRpcTranslator(self.client, lambda: ((10, 0, 20), 0.5))
