@@ -194,6 +194,13 @@ class LocalDriver(object):
 				neighbours, half_length, half_width):
 		"""Reject a locally clear ray if its next 1.2s overlaps another OBB."""
 		own_speed = max(0.0, abs(float(speed)))
+		# At walking pace there is not enough velocity for an OBB extrapolation
+		# to be useful.  In a dense line-up it instead predicts every neighbour's
+		# acceleration against a nearly stationary hull and vetoes all exits.
+		# Separation steering and the physical tank resolver remain active; resume
+		# predictive collision avoidance once the bot has actually got moving.
+		if own_speed < 1.25:
+			return True
 		desired_vx = math.sin(candidate_yaw) * own_speed
 		desired_vz = math.cos(candidate_yaw) * own_speed
 		actual_vx, actual_vz = self._velocity(velocity)
@@ -357,9 +364,12 @@ class LocalDriver(object):
 		turn = max(-1.0, min(1.0, delta / 0.58))
 		throttle = 1.0
 		if abs(delta) > 1.0:
-			throttle = 0.35
+			# 0.35 cannot overcome the steering resistance in the shared vehicle
+			# physics: the tank settles below walking speed and traces a tiny circle
+			# around its spawn.  Keep enough drive to make a real clearing arc.
+			throttle = 0.72
 		elif abs(delta) > 0.55:
-			throttle = 0.62
+			throttle = 0.78
 		return {
 			'throttle': throttle,
 			'turn': turn,

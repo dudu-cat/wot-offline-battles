@@ -1610,14 +1610,27 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 	try:
 		import BigWorld, Math, math
 		speed = abs(float(getattr(vehicle, '_veh_velocity', 0.0) or 0.0))
-		far_distance = 20.0 if speed > 5.0 else 15.0
+		# A stopped tank only needs enough clear road to leave the line-up.  The
+		# previous 15 m x 4.4 m startup corridor touched nearby spawn props on city
+		# maps, rejected every steering candidate and left the recovery logic
+		# pivoting in place.  Longer look-ahead returns once the tank is moving.
+		if speed < 1.5:
+			probe_profile = ((0.9, 6.0), (1.5, 10.0))
+		else:
+			probe_profile = ((0.9, 8.0), (1.5, 20.0 if speed > 5.0 else 15.0))
+		try:
+			_unused_length, hull_half_width = _offh_ai_hull_dims(
+				getattr(vehicle, 'typeDescriptor', None))
+		except Exception:
+			hull_half_width = 1.7
+		corridor_half_width = max(1.4, min(2.0, float(hull_half_width) + 0.15))
 		previous_y = float(vehicle.position.y)
 		previous_distance = 0.0
 		sine = math.sin(float(absolute_yaw))
 		cosine = math.cos(float(absolute_yaw))
 		lateral_x = cosine
 		lateral_z = -sine
-		for height, distance in ((0.7, 8.0), (1.5, far_distance)):
+		for height, distance in probe_profile:
 			x = float(vehicle.position.x) + sine * distance
 			z = float(vehicle.position.z) + cosine * distance
 			run = distance - previous_distance
@@ -1634,7 +1647,7 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 			delta = y - previous_y
 			if delta > run * 0.48 or delta < -run * 0.38:
 				return False
-			for offset in (-2.2, 0.0, 2.2):
+			for offset in (-corridor_half_width, 0.0, corridor_half_width):
 				start = Math.Vector3(
 					float(vehicle.position.x) + lateral_x * offset,
 					float(vehicle.position.y) + height,

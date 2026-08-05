@@ -595,9 +595,9 @@ def open():
 		return False
 	_active = True
 	_acquire_cursor()
-	# The full-window background must not win hit testing over its child controls.
-	# Keyboard input already arrives through the global game hook.
-	_safe_set(_panel, 'focus', False)
+	# Match the working waiting-room overlay: the parent window owns focus and
+	# its GUI.Simple children own the individual mouse targets.
+	_safe_set(_panel, 'focus', True)
 	_set_entry_visible(False)
 	_refresh()
 	_log_note('LAN settings panel opened')
@@ -771,7 +771,10 @@ def handle_key_event(event):
 			close()
 			return False
 		if not _is_down(event):
-			return True
+			# Mouse buttons also arrive here as key-up events in 0.8.2.  Only
+			# consume the keyboard actions handled below; otherwise the native GUI
+			# controls never receive their click.
+			return False
 		if key == _key(Keys, 'KEY_ESCAPE'):
 			close()
 			return True
@@ -800,7 +803,9 @@ def handle_key_event(event):
 			_status = ''
 			_refresh()
 			return True
-		return True
+		# Do not swallow mouse buttons or unrelated lobby shortcuts while the
+		# panel is open.  GUI.Simple dispatches its click after this global hook.
+		return False
 	except Exception:
 		try:
 			import traceback

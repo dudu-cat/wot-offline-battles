@@ -55,6 +55,17 @@ def load_settings_module():
     bigworld.dcursor = lambda: object()
     sys.modules["BigWorld"] = bigworld
 
+    keys = types.ModuleType("Keys")
+    keys.KEY_F11 = 87
+    keys.KEY_LEFTMOUSE = 256
+    keys.KEY_ESCAPE = 1
+    keys.KEY_TAB = 15
+    keys.KEY_BACKSPACE = 14
+    keys.KEY_SPACE = 57
+    keys.KEY_RETURN = 28
+    keys.KEY_1 = 2
+    sys.modules["Keys"] = keys
+
     for name in ("gui", "gui.mods", "gui.mods.offhangar"):
         package = types.ModuleType(name)
         package.__path__ = []
@@ -113,7 +124,7 @@ class LANSettingsTest(unittest.TestCase):
         self.assertEqual("PIXEL", self.settings._panel.widthMode)
         self.assertEqual((720, 360), (self.settings._panel.width, self.settings._panel.height))
         self.assertEqual([self.settings._panel], self.roots)
-        self.assertFalse(self.settings._panel.focus)
+        self.assertTrue(self.settings._panel.focus)
         self.assertTrue(
             all(control.parent is self.settings._panel for control in self.settings._controls.values())
         )
@@ -179,6 +190,26 @@ class LANSettingsTest(unittest.TestCase):
         message, level = self.notices[-1]
         self.assertIn(b"Invalid IP", message)
         self.assertEqual("error", level)
+
+    def test_active_panel_only_consumes_keyboard_actions_it_handles(self):
+        class Event:
+            def __init__(self, key, down=True):
+                self.key = key
+                self.down = down
+
+            def isKeyDown(self):
+                return self.down
+
+        self.settings.open()
+
+        # BigWorld reports mouse buttons through the same global key callback.
+        # They must continue to GUI.Simple so its click script can run.
+        self.assertFalse(self.settings.handle_key_event(Event(256, True)))
+        self.assertFalse(self.settings.handle_key_event(Event(256, False)))
+        self.assertFalse(self.settings.handle_key_event(Event(9999, True)))
+
+        self.assertTrue(self.settings.handle_key_event(Event(15, True)))
+        self.assertEqual(1, self.settings._field)
 
 
 if __name__ == "__main__":

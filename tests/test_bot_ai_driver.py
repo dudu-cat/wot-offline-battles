@@ -121,6 +121,48 @@ class BotAIDriverTest(unittest.TestCase):
         self.assertGreater(order["throttle"], 0.0)
         self.assertGreater(abs(order["turn"]), 0.5)
 
+    def test_dense_spawn_turns_with_enough_throttle_to_leave_the_lineup(self):
+        driver = self.module.LocalDriver()
+        positions = [
+            ((column - 2) * 9.0, 0.0, row * 9.0)
+            for row in range(3)
+            for column in range(5)
+        ]
+        orders = []
+        for bot_id, position in enumerate(positions):
+            neighbours = [
+                {
+                    "position": other,
+                    "yaw": 0.0,
+                    "velocity": (0.0, 0.0, 0.0),
+                    "half_length": 3.5,
+                    "half_width": 1.7,
+                }
+                for other in positions
+                if other != position
+            ]
+            orders.append(driver.drive(
+                bot_id, position, 0.0, 0.0, 0.1,
+                (position[0], 0.0, position[2] + 100.0),
+                neighbours, lambda angle: True,
+                None, 3.5, 1.7,
+            ))
+
+        self.assertEqual(15, len(orders))
+        self.assertTrue(all(order["throttle"] >= 0.70 for order in orders))
+        self.assertTrue(any(order["recovery_mode"] == "avoid" for order in orders))
+
+    def test_walking_pace_does_not_deadlock_on_neighbour_prediction(self):
+        driver = self.module.LocalDriver()
+        clear = driver._prediction_clear(
+            (0.0, 0.0, 0.0), 0.0, 0.7, None,
+            [{"position": (0.0, 0.0, 8.0), "yaw": 3.1415926535,
+              "velocity": (0.0, 0.0, -4.0),
+              "half_length": 3.5, "half_width": 1.7}],
+            3.5, 1.7,
+        )
+        self.assertTrue(clear)
+
     def test_failed_direction_is_penalized_until_its_ttl_expires(self):
         driver = self.module.LocalDriver(failure_ttl=0.5)
         initial = driver.drive(55, (0.0, 0.0, 0.0), 0.0, 2.0, 0.1,
