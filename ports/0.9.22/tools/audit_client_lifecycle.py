@@ -177,6 +177,30 @@ ORDERED_USES = (
         'native lobby fight click reaches the stock prebattle action boundary',
     ),
     (
+        'scripts/client/gui/Scaleform/daapi/view/lobby/header/'
+        'LobbyHeader.pyc',
+        'LobbyHeader._updatePrebattleControls',
+        ('prbEntity', 'canPlayerDoAction', '_checkFightButtonDisabled',
+         'as_disableFightButtonS'),
+        'stock prebattle validation computes and paints the fight-button state',
+    ),
+    (
+        'scripts/client/gui/prb_control/events_dispatcher.pyc',
+        'EventDispatcher.updateUI',
+        ('_EventDispatcher__fireEvent', 'FightButtonEvent',
+         'FIGHT_BUTTON_UPDATE', '_EventDispatcher__invalidatePrbEntity'),
+        'the stock UI refresh event precedes prebattle entity invalidation',
+    ),
+    (
+        'scripts/client/gui/Scaleform/daapi/view/lobby/header/'
+        'LobbyHeader.pyc',
+        'LobbyHeader.__addListeners',
+        ('FightButtonEvent', 'FIGHT_BUTTON_UPDATE',
+         '_LobbyHeader__handleFightButtonUpdated',
+         'EVENT_BUS_SCOPE', 'LOBBY'),
+        'the lobby header subscribes its repaint handler in lobby scope',
+    ),
+    (
         'scripts/client/gui/app_loader/states.pyc',
         'LobbyState._getNextState',
         ('guiSpaceID', '_SPACE_ID', 'BATTLE_LOADING',

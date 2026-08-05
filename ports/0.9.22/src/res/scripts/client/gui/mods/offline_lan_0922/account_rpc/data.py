@@ -11,50 +11,145 @@ TANKMAN_ITEM_TYPE = 8
 CUSTOMIZATION_ITEM_TYPE = 12
 ITEM_TYPE_INDICES = tuple(range(1, 13))
 REQUIRED_VEHICLE_COMPONENT_TYPES = (2, 3, 4, 5, 6, 7)
+OFFLINE_CREDITS = 100000000
+OFFLINE_GOLD = 1000000
+OFFLINE_FREE_XP = 100000000
+OFFLINE_GARAGE_SLOTS = 2000
+OFFLINE_BARRACKS_BERTHS = 2000
+
+
+def _vehicle_records(vehicle):
+    records = vehicle.get('vehicles')
+    if records is None:
+        return [vehicle] if vehicle.get('compDescr') else []
+    if not isinstance(records, (tuple, list)) or not records:
+        raise ValueError('vehicles must be a non-empty sequence')
+    if any(not isinstance(record, dict) for record in records):
+        raise ValueError('vehicle records must be mappings')
+    return list(records)
 
 
 def _validate_selected_vehicle(vehicle):
-    """Reject incomplete snapshots before native requesters consume them."""
-    compact = vehicle.get('compDescr')
-    if not compact:
+    """Reject incomplete garage snapshots before native requesters consume them."""
+    records = _vehicle_records(vehicle)
+    if not records:
         return
 
-    crew = list(vehicle.get('crew', ()))
-    tankmen = dict(vehicle.get('tankmen', {}))
-    if not crew or not tankmen:
-        raise ValueError('selected vehicle crew and tankmen must be non-empty')
-    if any(tankman_id in (None, 0) for tankman_id in crew):
-        raise ValueError('selected vehicle crew ids must be positive')
-    if len(crew) != len(tankmen) or set(crew) != set(tankmen):
-        raise ValueError('selected vehicle crew ids must resolve to tankmen')
+    item_prices = dict(vehicle.get('shopItemPrices', {}))
+    vehicle_ids = []
+    tankman_ids = []
+    comp_descrs = []
+    vehicle_type_compact_descrs = []
+    installed_item_compact_descrs = set()
+    for record in records:
+        if not record.get('compDescr'):
+            raise ValueError('vehicle compact descriptor must be non-empty')
+        vehicle_id = int(record.get('id', 0))
+        if vehicle_id <= 0:
+            raise ValueError('vehicle inventory ids must be positive')
+        vehicle_ids.append(vehicle_id)
+        comp_descrs.append(record['compDescr'])
+        crew = list(record.get('crew', ()))
+        tankmen = dict(record.get('tankmen', {}))
+        tankman_ids.extend(crew)
+        vehicle_type_compact_descr = record.get(
+            'vehicleTypeCompactDescr')
+        if vehicle_type_compact_descr is not None:
+            vehicle_type_compact_descrs.append(vehicle_type_compact_descr)
 
-    for key in ('repair', 'lock'):
-        value = vehicle.get(key)
-        if not isinstance(value, (tuple, list)) or len(value) != 2:
-            raise ValueError('selected vehicle %s must contain two values' % key)
-    if vehicle['repair'][1] <= 0:
-        raise ValueError('selected vehicle health must be positive')
-    for key in ('eqs', 'eqsLayout'):
-        value = vehicle.get(key)
-        if not isinstance(value, (tuple, list)) or len(value) != 3:
-            raise ValueError('selected vehicle %s must contain three slots' % key)
+        if not crew or not tankmen:
+            raise ValueError(
+                'selected vehicle crew and tankmen must be non-empty')
+        try:
+            crew_ids_are_positive = all(
+                int(tankman_id) > 0 for tankman_id in crew)
+        except (TypeError, ValueError):
+            crew_ids_are_positive = False
+        if not crew_ids_are_positive:
+            raise ValueError('selected vehicle crew ids must be positive')
+        if len(crew) != len(tankmen) or set(crew) != set(tankmen):
+            raise ValueError(
+                'selected vehicle crew ids must resolve to tankmen')
 
-    shells = vehicle.get('shells')
-    if (not isinstance(shells, (tuple, list)) or not shells or
-            len(shells) % 2):
+        for key in ('repair', 'lock'):
+            value = record.get(key)
+            if not isinstance(value, (tuple, list)) or len(value) != 2:
+                raise ValueError(
+                    'selected vehicle %s must contain two values' % key)
+        if record['repair'][1] <= 0:
+            raise ValueError('selected vehicle health must be positive')
+        for key in ('eqs', 'eqsLayout'):
+            value = record.get(key)
+            if not isinstance(value, (tuple, list)) or len(value) != 3:
+                raise ValueError(
+                    'selected vehicle %s must contain three slots' % key)
+
+        shells = record.get('shells')
+        if (not isinstance(shells, (tuple, list)) or not shells or
+                len(shells) % 2):
+            raise ValueError(
+                'selected vehicle shells must contain descriptor/count pairs')
+        if not isinstance(record.get('shellsLayout'), dict):
+            raise ValueError('selected vehicle shellsLayout must be a mapping')
+
+        inventory_items = dict(record.get('inventoryItems', {}))
+        for item_type in REQUIRED_VEHICLE_COMPONENT_TYPES + (10,):
+            items = inventory_items.get(item_type)
+            if not isinstance(items, dict) or not items:
+                raise ValueError(
+                    'selected vehicle item type %d must be non-empty' %
+                    item_type)
+
+        required_prices = set()
+        for item_type in REQUIRED_VEHICLE_COMPONENT_TYPES + (10,):
+            required_prices.update(inventory_items[item_type])
+        installed_item_compact_descrs.update(required_prices)
+        if not required_prices.issubset(set(item_prices)):
+            raise ValueError(
+                'selected vehicle modules and shells must have shop prices')
+        shell_pairs = dict(
+            (shells[index], shells[index + 1])
+            for index in range(0, len(shells), 2))
+        if shell_pairs != inventory_items[10]:
+            raise ValueError(
+                'selected vehicle shell layout and inventory must match')
+
+    if len(set(vehicle_ids)) != len(vehicle_ids):
+        raise ValueError('vehicle inventory ids must be unique')
+    if len(set(comp_descrs)) != len(comp_descrs):
+        raise ValueError('vehicle compact descriptors must be unique')
+    if len(set(tankman_ids)) != len(tankman_ids):
+        raise ValueError('tankman inventory ids must be unique')
+    if (vehicle_type_compact_descrs and
+            len(set(vehicle_type_compact_descrs)) != len(records)):
+        raise ValueError('vehicle type compact descriptors must be unique')
+
+    published_vehicle_types = set(
+        vehicle.get('vehicleTypeCompactDescrs', ()))
+    if (published_vehicle_types and
+            published_vehicle_types != set(vehicle_type_compact_descrs)):
         raise ValueError(
-            'selected vehicle shells must contain descriptor/count pairs')
-    if not isinstance(vehicle.get('shellsLayout'), dict):
-        raise ValueError('selected vehicle shellsLayout must be a mapping')
+            'vehicle type compact descriptor catalogue must match garage')
+
+    unlocks = set(vehicle.get('unlockItemCompactDescrs', ()))
+    required_unlocks = (set(vehicle_type_compact_descrs) |
+                        installed_item_compact_descrs)
+    if unlocks and not required_unlocks.issubset(unlocks):
+        raise ValueError(
+            'every garage vehicle, module and shell must be unlocked')
+    if not set(vehicle_type_compact_descrs).issubset(set(item_prices)):
+        raise ValueError('every garage vehicle type must have a shop price')
 
     inventory_items = dict(vehicle.get('inventoryItems', {}))
-    for item_type in REQUIRED_VEHICLE_COMPONENT_TYPES + (10,):
-        items = inventory_items.get(item_type)
-        if not isinstance(items, dict) or not items:
-            raise ValueError(
-                'selected vehicle item type %d must be non-empty' % item_type)
+    if 'vehicles' in vehicle:
+        for record in records:
+            for item_type, items in record['inventoryItems'].items():
+                published = inventory_items.get(item_type, {})
+                if any(int(published.get(compact_descr, 0)) < int(count)
+                       for compact_descr, count in items.items()):
+                    raise ValueError(
+                        'garage inventory must contain every installed item')
 
-    item_prices = dict(vehicle.get('shopItemPrices', {}))
     for compact_descr, price in item_prices.items():
         if isinstance(price, dict):
             currencies = set(price)
@@ -68,19 +163,7 @@ def _validate_selected_vehicle(vehicle):
             raise ValueError(
                 'shop price %r must be a currency mapping or tuple' %
                 compact_descr)
-    priced_items = set(item_prices)
-    required_prices = set()
-    for item_type in REQUIRED_VEHICLE_COMPONENT_TYPES + (10,):
-        required_prices.update(inventory_items[item_type])
-    if not required_prices.issubset(priced_items):
-        raise ValueError(
-            'selected vehicle modules and shells must have shop prices')
-    shell_pairs = dict(
-        (shells[index], shells[index + 1])
-        for index in range(0, len(shells), 2))
-    if shell_pairs != inventory_items[10]:
-        raise ValueError(
-            'selected vehicle shell layout and inventory must match')
+
     if int(vehicle.get('shopNationCount', 0)) <= 0:
         raise ValueError('selected vehicle shop nation count must be positive')
     if int(vehicle.get('customizationItemCount', 0)) <= 0:
@@ -89,7 +172,7 @@ def _validate_selected_vehicle(vehicle):
 
 
 def inventory(selected_vehicle=None):
-    """Return the selected vehicle and its relational inventory records.
+    """Return every loadable garage vehicle and its relational records.
 
     ``selected_vehicle`` is serialized by ``bootstrap._selected_vehicle``.  It
     carries engine-derived compact descriptors, while this low-level module
@@ -97,72 +180,92 @@ def inventory(selected_vehicle=None):
     """
     vehicle = selected_vehicle if isinstance(selected_vehicle, dict) else {}
     _validate_selected_vehicle(vehicle)
-    compact = vehicle.get('compDescr')
+    records = _vehicle_records(vehicle)
     values = dict((item_type, {}) for item_type in ITEM_TYPE_INDICES)
     vehicle_values = {
         'repair': {}, 'lastCrew': {}, 'crew': {}, 'settings': {},
         'compDescr': {}, 'eqs': {}, 'eqsLayout': {}, 'shells': {},
         'shellsLayout': {}, 'lock': {},
     }
-    if compact:
-        vehicle_id = int(vehicle.get('id', 1))
-        crew = list(vehicle.get('crew', ()))
-        tankmen = dict(vehicle.get('tankmen', {}))
+    all_tankmen = {}
+    tankman_vehicles = {}
+    for record in records:
+        vehicle_id = int(record.get('id', 1))
+        crew = list(record.get('crew', ()))
+        tankmen = dict(record.get('tankmen', {}))
         vehicle_values['crew'][vehicle_id] = crew
         # #1513's InventoryRequester defaults a missing repair entry to the
         # integer 0, while the GUI Vehicle constructor unpacks a two-tuple.
         vehicle_values['repair'][vehicle_id] = tuple(
-            vehicle.get('repair', (0, 0)))
+            record.get('repair', (0, 0)))
         vehicle_values['settings'][vehicle_id] = 0
-        vehicle_values['compDescr'][vehicle_id] = compact
+        vehicle_values['compDescr'][vehicle_id] = record['compDescr']
         vehicle_values['eqs'][vehicle_id] = list(
-            vehicle.get('eqs', (0, 0, 0)))
+            record.get('eqs', (0, 0, 0)))
         vehicle_values['eqsLayout'][vehicle_id] = list(
-            vehicle.get('eqsLayout', (0, 0, 0)))
+            record.get('eqsLayout', (0, 0, 0)))
         vehicle_values['shells'][vehicle_id] = list(
-            vehicle.get('shells', ()))
+            record.get('shells', ()))
         # GUI Vehicle calls .get() on this value before parsing the layout.
         vehicle_values['shellsLayout'][vehicle_id] = dict(
-            vehicle.get('shellsLayout', {}))
+            record.get('shellsLayout', {}))
         # GUI Vehicle.isLocked indexes both positions without normalizing the
         # InventoryRequester default (which is the integer zero).
         vehicle_values['lock'][vehicle_id] = tuple(
-            vehicle.get('lock', (0, 0)))
+            record.get('lock', (0, 0)))
         # A missing lastCrew record means that no historical crew is stored.
         # An empty per-vehicle list is not equivalent in #1513: the crew
         # operations popover treats presence as a real history entry.
 
         for item_type, items in dict(
-                vehicle.get('inventoryItems', {})).items():
+                record.get('inventoryItems', {})).items():
             item_type = int(item_type)
             if item_type in values and item_type not in (
                     VEHICLE_ITEM_TYPE, TANKMAN_ITEM_TYPE,
                     CUSTOMIZATION_ITEM_TYPE):
-                values[item_type] = dict(items)
+                target = values[item_type]
+                for compact_descr, count in items.items():
+                    target[compact_descr] = max(
+                        int(target.get(compact_descr, 0)), int(count))
 
-        values[TANKMAN_ITEM_TYPE] = {
-            'compDescr': tankmen,
-            # This foreign key is the vehicle inventory id, not its type id.
-            'vehicle': dict((tankman_id, vehicle_id)
-                            for tankman_id in tankmen),
-        }
+        all_tankmen.update(tankmen)
+        # This foreign key is the vehicle inventory id, not its type id.
+        tankman_vehicles.update(dict(
+            (tankman_id, vehicle_id) for tankman_id in tankmen))
+
+    values[TANKMAN_ITEM_TYPE] = {
+        'compDescr': all_tankmen,
+        'vehicle': tankman_vehicles,
+    }
     values[VEHICLE_ITEM_TYPE] = vehicle_values
-    if not compact:
-        values[TANKMAN_ITEM_TYPE] = {'vehicle': {}, 'compDescr': {}}
     values[CUSTOMIZATION_ITEM_TYPE] = {}
     return {'inventory': values}
 
 
-def stats():
-    """Return conservative, zeroed stats suitable for a local selected vehicle."""
+def stats(selected_vehicle=None):
+    """Return an unlocked, well-funded account for the local garage."""
+    vehicle = selected_vehicle if isinstance(selected_vehicle, dict) else {}
+    vehicle_types = set(vehicle.get('vehicleTypeCompactDescrs', ()))
+    if not vehicle_types:
+        vehicle_types.update(
+            record.get('vehicleTypeCompactDescr')
+            for record in _vehicle_records(vehicle)
+            if record.get('vehicleTypeCompactDescr') is not None)
+    unlocks = set(vehicle.get('unlockItemCompactDescrs', ()))
+    unlocks.update(vehicle_types)
     return {
         'account': {
             'clanDBID': 0, 'attrs': 0, 'premiumExpiryTime': 0,
             'autoBanTime': 0, 'globalRating': 0,
         },
         'stats': {
-            'credits': 0, 'gold': 0, 'crystal': 0, 'freeXP': 0,
-            'slots': 1, 'berths': 0, 'accOnline': 0, 'accOffline': 0,
+            'credits': OFFLINE_CREDITS,
+            'gold': OFFLINE_GOLD,
+            'crystal': 0,
+            'freeXP': OFFLINE_FREE_XP,
+            'slots': OFFLINE_GARAGE_SLOTS,
+            'berths': OFFLINE_BARRACKS_BERTHS,
+            'accOnline': 0, 'accOffline': 0,
             'freeTMenLeft': 0, 'freeVehiclesLeft': 0,
             'vehicleSellsLeft': 0, 'captchaTriesLeft': 0,
             # Match the established offline-server account profile.  Zero
@@ -173,10 +276,13 @@ def stats():
             # Full daily/weekly periods disable parental-control blocking in
             # the native #1513 GameSessionController.  Zero means no allowed
             # play time, not "unlimited".
-            'playLimits': ((86400, ''), (604800, '')), 'vehTypeXP': {},
+            'playLimits': ((86400, ''), (604800, '')),
+            'vehTypeXP': dict((compact_descr, 0)
+                              for compact_descr in vehicle_types),
             'vehTypeLocks': {}, 'restrictions': {},
             'globalVehicleLocks': {}, 'refSystem': {'referrals': {}},
-            'unlocks': set(), 'eliteVehicles': set(),
+            'unlocks': unlocks,
+            'eliteVehicles': set(vehicle_types),
             'multipliedXPVehs': set(),
         },
         'cache': {
@@ -217,7 +323,7 @@ def sync_data(revision=0, selected_vehicle=None, int_user_settings=None):
         'eventsData': {},
     }
     result.update(inventory(selected_vehicle))
-    result.update(stats())
+    result.update(stats(selected_vehicle))
     return result
 
 

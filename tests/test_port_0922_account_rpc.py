@@ -54,6 +54,46 @@ SELECTED_VEHICLE = {
 }
 
 
+def _full_garage_snapshot():
+    first = copy.deepcopy(SELECTED_VEHICLE)
+    first['vehicleTypeCompactDescr'] = 50001
+    second = {
+        'id': 10,
+        'compDescr': b'compact-2',
+        'crew': [201, 202],
+        'tankmen': {201: b'commander-2', 202: b'driver-2'},
+        'repair': (0, 200),
+        'lock': (0, 0),
+        'shells': [11010, 30, 11011, 15],
+        'shellsLayout': {},
+        'eqs': [0, 0, 0],
+        'eqsLayout': [0, 0, 0],
+        'inventoryItems': {
+            2: {3002: 1}, 3: {3003: 1}, 4: {3004: 1},
+            5: {3005: 1}, 6: {3006: 1}, 7: {3007: 1},
+            10: {11010: 30, 11011: 15},
+        },
+        'vehicleTypeCompactDescr': 50002,
+    }
+    snapshot = copy.deepcopy(SELECTED_VEHICLE)
+    snapshot['vehicles'] = [first, second]
+    for item_type, items in second['inventoryItems'].items():
+        snapshot['inventoryItems'].setdefault(item_type, {}).update(items)
+    snapshot['shopItemPrices'].update(dict(
+        (compact_descr, {'credits': 0, 'gold': 0})
+        for compact_descr in (
+            3002, 3003, 3004, 3005, 3006, 3007, 11010, 11011,
+            50001, 50002)))
+    snapshot['vehicleTypeCompactDescrs'] = {50001, 50002}
+    snapshot['unlockItemCompactDescrs'] = set(
+        compact_descr
+        for item_type in tuple(range(2, 8)) + (10,)
+        for compact_descr in snapshot['inventoryItems'][item_type])
+    snapshot['unlockItemCompactDescrs'].update(
+        snapshot['vehicleTypeCompactDescrs'])
+    return snapshot
+
+
 def _contract_path(values, path):
     """Resolve one producer path from the machine-readable lobby contract."""
     root, remainder = path.split('.', 1)
@@ -375,6 +415,73 @@ class AccountRpcTests(unittest.TestCase):
         self.assertEqual({}, data['inventory'][11])
         self.assertEqual({}, data['inventory'][12])
 
+    def test_full_garage_expands_every_vehicle_and_tankman_foreign_key(self):
+        garage = _full_garage_snapshot()
+        value = account_data.sync_data(selected_vehicle=garage)
+        inventory = value['inventory']
+
+        self.assertEqual(
+            {9: b'compact', 10: b'compact-2'},
+            inventory[1]['compDescr'])
+        self.assertEqual([101, 102], inventory[1]['crew'][9])
+        self.assertEqual([201, 202], inventory[1]['crew'][10])
+        self.assertEqual(
+            {101: 9, 102: 9, 201: 10, 202: 10},
+            inventory[8]['vehicle'])
+        self.assertEqual(
+            {101, 102, 201, 202},
+            set(inventory[8]['compDescr']))
+        for item_type in tuple(range(2, 8)) + (10,):
+            expected = set(garage['inventoryItems'][item_type])
+            self.assertEqual(expected, set(inventory[item_type]), item_type)
+        for vehicle_id in (9, 10):
+            self.assertEqual((0, 0), inventory[1]['lock'][vehicle_id])
+            self.assertEqual(3, len(inventory[1]['eqs'][vehicle_id]))
+            self.assertEqual(3, len(inventory[1]['eqsLayout'][vehicle_id]))
+
+    def test_full_garage_rejects_duplicate_vehicle_and_tankman_ids(self):
+        cases = (
+            ('vehicle inventory ids must be unique',
+             lambda value: value['vehicles'][1].update(id=9)),
+            ('tankman inventory ids must be unique',
+             lambda value: (
+                 value['vehicles'][1].update(crew=[101, 202]),
+                 value['vehicles'][1]['tankmen'].update(
+                     {101: value['vehicles'][1]['tankmen'].pop(201)}))),
+            ('vehicle type compact descriptors must be unique',
+             lambda value: value['vehicles'][1].update(
+                 vehicleTypeCompactDescr=50001)),
+            ('every garage vehicle type must have a shop price',
+             lambda value: value['shopItemPrices'].pop(50002)),
+            ('every garage vehicle, module and shell must be unlocked',
+             lambda value: value['unlockItemCompactDescrs'].remove(3004)),
+            ('garage inventory must contain every installed item',
+             lambda value: value['inventoryItems'][10].__setitem__(
+                 11010, 29)),
+        )
+        for message, mutate in cases:
+            garage = _full_garage_snapshot()
+            mutate(garage)
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    account_data.sync_data(selected_vehicle=garage)
+
+    def test_offline_account_is_well_funded_and_all_vehicles_are_elite(self):
+        garage = _full_garage_snapshot()
+        value = account_data.sync_data(selected_vehicle=garage)
+        stats = value['stats']
+
+        self.assertEqual(account_data.OFFLINE_CREDITS, stats['credits'])
+        self.assertEqual(account_data.OFFLINE_GOLD, stats['gold'])
+        self.assertEqual(account_data.OFFLINE_FREE_XP, stats['freeXP'])
+        self.assertEqual(account_data.OFFLINE_GARAGE_SLOTS, stats['slots'])
+        self.assertEqual(
+            account_data.OFFLINE_BARRACKS_BERTHS, stats['berths'])
+        self.assertEqual({50001, 50002}, set(stats['vehTypeXP']))
+        self.assertEqual({50001, 50002}, stats['eliteVehicles'])
+        self.assertTrue(
+            garage['unlockItemCompactDescrs'].issubset(stats['unlocks']))
+
     def test_incomplete_selected_vehicle_is_rejected_before_hangar_build(self):
         with self.assertRaisesRegex(ValueError, 'crew and tankmen'):
             account_data.sync_data(
@@ -383,6 +490,11 @@ class AccountRpcTests(unittest.TestCase):
     def test_selected_vehicle_relational_contract_rejects_semantic_empties(self):
         cases = (
             ('crew and tankmen', lambda value: value.update(crew=[])),
+            ('crew ids must be positive',
+             lambda value: (
+                 value.update(crew=[-101, 102]),
+                 value['tankmen'].update(
+                     {-101: value['tankmen'].pop(101)}))),
             ('crew ids must resolve',
              lambda value: value['tankmen'].pop(102)),
             ('lock must contain two', lambda value: value.update(lock=0)),

@@ -90,37 +90,91 @@ class BootstrapLifecycleTests(unittest.TestCase):
         settings_module = types.ModuleType('gui.app_loader.settings')
         settings_module.GUI_GLOBAL_SPACE_ID = spaces
 
-        descriptor = types.SimpleNamespace(
-            type=types.SimpleNamespace(
-                id=(0, 11),
-                crewRoles=(('commander',), ('driver',))),
-            chassis=types.SimpleNamespace(compactDescr=2002),
-            turret=types.SimpleNamespace(compactDescr=2003),
-            gun=types.SimpleNamespace(compactDescr=2004),
-            engine=types.SimpleNamespace(compactDescr=2005),
-            fuelTank=types.SimpleNamespace(compactDescr=2006),
-            radio=types.SimpleNamespace(compactDescr=2007),
-            maxHealth=100,
-            makeCompactDescr=lambda: b'vehicle')
+        def make_descriptor(nation_id, vehicle_type_id, base, tags=()):
+            return types.SimpleNamespace(
+                type=types.SimpleNamespace(
+                    id=(nation_id, vehicle_type_id),
+                    crewRoles=(('commander',), ('driver',)),
+                    tags=frozenset(tags)),
+                chassis=types.SimpleNamespace(compactDescr=base + 2),
+                turret=types.SimpleNamespace(compactDescr=base + 3),
+                gun=types.SimpleNamespace(compactDescr=base + 4),
+                engine=types.SimpleNamespace(compactDescr=base + 5),
+                fuelTank=types.SimpleNamespace(compactDescr=base + 6),
+                radio=types.SimpleNamespace(compactDescr=base + 7),
+                maxHealth=100 + vehicle_type_id,
+                makeCompactDescr=lambda: (
+                    'vehicle-%d-%d' %
+                    (nation_id, vehicle_type_id)).encode('ascii'))
+
+        descriptors = {
+            (0, 11): make_descriptor(0, 11, 2000),
+            (0, 12): make_descriptor(0, 12, 3000),
+            (1, 7): make_descriptor(1, 7, 4000),
+            (1, 8): make_descriptor(1, 8, 5000),
+            (1, 9): make_descriptor(1, 9, 6000),
+            (2, 1): make_descriptor(2, 1, 7000, ('event_battles',)),
+            (2, 2): make_descriptor(2, 2, 8000, ('premiumIGR',)),
+            (2, 3): make_descriptor(2, 3, 9000, ('observer',)),
+        }
+        delattr(descriptors[(1, 9)], 'gun')
+
+        attempted_type_ids = []
+
+        def vehicle_descr(**kwargs):
+            if 'typeName' in kwargs:
+                return descriptors[(0, 11)]
+            type_id = tuple(kwargs['typeID'])
+            attempted_type_ids.append(type_id)
+            return descriptors[type_id]
+
+        class _VehicleList(object):
+            def getList(self, nation_id):
+                return {
+                    0: {11: object(), 12: object()},
+                    1: {7: object(), 8: object(), 9: object()},
+                    2: {1: object(), 2: object(), 3: object()},
+                }.get(nation_id, {})
+
         customization = types.SimpleNamespace(
             paints={12001: types.SimpleNamespace(compactDescr=12001)},
             camouflages={12002: types.SimpleNamespace(compactDescr=12002)},
             decals={12003: types.SimpleNamespace(compactDescr=12003)},
             modifications={12004: types.SimpleNamespace(compactDescr=12004)},
             styles={12005: types.SimpleNamespace(compactDescr=12005)})
+        crew_type_ids = []
         vehicles = types.SimpleNamespace(
-            VehicleDescr=lambda **unused_kwargs: descriptor,
-            getDefaultAmmoForGun=lambda unused_gun: [10010, 20],
-            makeIntCompactDescrByID=lambda *unused_args: 1001,
+            VehicleDescr=vehicle_descr,
+            getDefaultAmmoForGun=lambda gun: [gun.compactDescr + 10000, 20],
+            makeIntCompactDescrByID=lambda unused_name, nation_id, type_id: (
+                90000 + nation_id * 1000 + type_id),
+            g_list=_VehicleList(),
+            attemptedTypeIDs=attempted_type_ids,
+            crewTypeIDs=crew_type_ids,
             g_cache=types.SimpleNamespace(
                 customization20=lambda: customization))
-        tankman_roles = {b'commander': 'commander', b'driver': 'driver'}
+
+        def generate_tankmen(nation_id, vehicle_type_id, roles,
+                             *unused_args):
+            crew_type_ids.append((nation_id, vehicle_type_id))
+            if (nation_id, vehicle_type_id) == (1, 8):
+                raise ValueError('unloadable crew definition')
+            return [
+                ('%d:%d:%s' % (nation_id, vehicle_type_id, role[0])).encode(
+                    'ascii')
+                for role in roles]
+
+        def tankman_descr(compact):
+            nation_id, vehicle_type_id, role = compact.decode('ascii').split(
+                ':')
+            return types.SimpleNamespace(
+                nationID=int(nation_id), vehicleTypeID=int(vehicle_type_id),
+                role=role)
+
         tankmen = types.SimpleNamespace(
             MAX_SKILL_LEVEL=100,
-            generateTankmen=lambda *unused_args: [b'commander', b'driver'],
-            TankmanDescr=lambda compact: types.SimpleNamespace(
-                nationID=0, vehicleTypeID=11,
-                role=tankman_roles[compact]))
+            generateTankmen=generate_tankmen,
+            TankmanDescr=tankman_descr)
         items = types.ModuleType('items')
         items.ITEM_TYPE_INDICES = {
             'vehicle': 1, 'vehicleChassis': 2, 'vehicleTurret': 3,
@@ -166,10 +220,11 @@ class BootstrapLifecycleTests(unittest.TestCase):
             selected = bootstrap._selected_vehicle(
                 {'vehicle': 'ussr:R11_MS-1'})
 
-        self.assertEqual([1001, 1002], selected['crew'])
+        self.assertEqual([100001, 100002], selected['crew'])
         self.assertEqual(
-            {1001: b'commander', 1002: b'driver'}, selected['tankmen'])
-        self.assertEqual((0, 100), selected['repair'])
+            {100001: b'0:11:commander', 100002: b'0:11:driver'},
+            selected['tankmen'])
+        self.assertEqual((0, 111), selected['repair'])
         self.assertEqual((0, 0), selected['lock'])
         self.assertEqual([0, 0, 0], selected['eqs'])
         self.assertEqual([0, 0, 0], selected['eqsLayout'])
@@ -188,6 +243,31 @@ class BootstrapLifecycleTests(unittest.TestCase):
         for compact_descr in (12001, 12002, 12003, 12004, 12005):
             self.assertEqual(
                 {'credits': 0}, selected['shopItemPrices'][compact_descr])
+        self.assertEqual(3, len(selected['vehicles']))
+        self.assertEqual([1, 2, 3], [
+            record['id'] for record in selected['vehicles']])
+        self.assertEqual(
+            {90011, 90012, 91007},
+            selected['vehicleTypeCompactDescrs'])
+        self.assertTrue(
+            selected['vehicleTypeCompactDescrs'].issubset(
+                selected['unlockItemCompactDescrs']))
+        all_tankman_ids = []
+        for record in selected['vehicles']:
+            all_tankman_ids.extend(record['crew'])
+            self.assertEqual(set(record['crew']), set(record['tankmen']))
+            for item_type in tuple(range(2, 8)) + (10,):
+                self.assertTrue(record['inventoryItems'][item_type])
+        self.assertEqual(len(all_tankman_ids), len(set(all_tankman_ids)))
+        runtime_vehicles = modules['items'].vehicles
+        self.assertTrue(
+            {(1, 8), (1, 9), (2, 1), (2, 2), (2, 3)}.issubset(
+                set(runtime_vehicles.attemptedTypeIDs)))
+        self.assertTrue({(1, 8), (1, 9)}.issubset(
+                        set(runtime_vehicles.crewTypeIDs)))
+        self.assertTrue(
+            {(2, 1), (2, 2), (2, 3)}.isdisjoint(
+                set(runtime_vehicles.crewTypeIDs)))
 
     def test_account_is_created_after_login_state_clear_and_next_tick(self):
         (bootstrap, callbacks, compatibility, app_loader,

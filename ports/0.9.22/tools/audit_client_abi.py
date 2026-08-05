@@ -83,6 +83,7 @@ EXPECTED_ABI = {
         'VehicleDescr': ('compactDescr', 'typeID', 'typeName'),
         'getDefaultAmmoForGun': ('gunDescr',),
         'Cache.customization20': ('self',),
+        'VehicleList.getList': ('self', 'nationID'),
     },
     'scripts/common/items/VehicleDescrCrew.pyc': {
         'VehicleDescrCrew.__init__': (
@@ -107,6 +108,7 @@ EXPECTED_ABI = {
             'self', 'nationID', 'itemTypeID'),
     },
     'scripts/client/gui/shared/gui_items/Vehicle.pyc': {
+        'Vehicle.descriptor': ('self',),
         'Vehicle._calcCrewBonuses': ('self', 'crew', 'proxy'),
         'Vehicle._buildCrew': ('self', 'crew', 'proxy'),
         'Vehicle._parseShells': (
@@ -224,6 +226,21 @@ EXPECTED_ABI = {
     'scripts/client/gui/Scaleform/daapi/view/lobby/header/'
     'LobbyHeader.pyc': {
         'LobbyHeader.fightClick': ('self', 'mapID', 'actionName'),
+        'LobbyHeader._updatePrebattleControls': ('self',),
+        'LobbyHeader._checkFightButtonDisabled': (
+            'self', 'canDo', 'isFightButtonForcedDisabled'),
+        'LobbyHeader.__handleFightButtonUpdated': ('self', '_'),
+        'LobbyHeader.__addListeners': ('self',),
+    },
+    'scripts/client/gui/Scaleform/daapi/view/meta/LobbyHeaderMeta.pyc': {
+        'LobbyHeaderMeta.as_disableFightButtonS': (
+            'self', 'isDisabled'),
+    },
+    'scripts/client/gui/prb_control/events_dispatcher.pyc': {
+        'EventDispatcher.updateUI': ('self', 'loadedAlias'),
+    },
+    'scripts/client/gui/shared/event_bus.pyc': {
+        'EventBus.handleEvent': ('self', 'event', 'scope'),
     },
     'scripts/client/gui/Scaleform/framework/application.pyc': {
         'SFApplication.loadView': (
@@ -276,6 +293,7 @@ EXPECTED_ABI = {
     },
     'scripts/client/CurrentVehicle.pyc': {
         '_CachedVehicle.isPresent': ('self',),
+        '_CurrentVehicle.item': ('self',),
     },
     'scripts/client/gui/ClientHangarSpace.pyc': {
         'ClientHangarSpace.getVehicleEntity': ('self',),
@@ -410,6 +428,28 @@ EXPECTED_CODE_NAMES = {
         'LobbyHeader.fightClick': (
             'lobbyContext', 'isHeaderNavigationPossible',
             'prbDispatcher', 'doAction', 'PrbAction'),
+        'LobbyHeader._updatePrebattleControls': (
+            'prbEntity', 'canPlayerDoAction',
+            '_checkFightButtonDisabled', 'as_disableFightButtonS'),
+        'LobbyHeader.__handleFightButtonUpdated': (
+            '_updatePrebattleControls',),
+        'LobbyHeader.__addListeners': (
+            'FightButtonEvent', 'FIGHT_BUTTON_UPDATE',
+            '_LobbyHeader__handleFightButtonUpdated',
+            'EVENT_BUS_SCOPE', 'LOBBY'),
+    },
+    'scripts/client/gui/Scaleform/daapi/view/meta/LobbyHeaderMeta.pyc': {
+        'LobbyHeaderMeta.as_disableFightButtonS': (
+            '_isDAAPIInited', 'flashObject', 'as_disableFightButton'),
+    },
+    'scripts/client/gui/prb_control/events_dispatcher.pyc': {
+        'EventDispatcher.updateUI': (
+            '_EventDispatcher__fireEvent', 'FightButtonEvent',
+            'FIGHT_BUTTON_UPDATE', '_EventDispatcher__invalidatePrbEntity'),
+    },
+    'scripts/client/gui/shared/event_bus.pyc': {
+        'EventBus.handleEvent': (
+            '_EventBus__scopes', 'eventType', 'copy'),
     },
     'scripts/client/gui/battle_control/controllers/arena_load_ctrl.pyc': {
         'ArenaLoadController.invalidateArenaInfo': (
@@ -450,6 +490,14 @@ EXPECTED_CODE_NAMES = {
     'scripts/client/SoundGroups.pyc': {
         'SoundGroups.destroy': ('BigWorld', 'player', 'inputHandler'),
     },
+    'scripts/client/CurrentVehicle.pyc': {
+        '_CurrentVehicle.item': (
+            '_CurrentVehicle__vehInvID', 'itemsCache', 'items',
+            'getVehicle'),
+    },
+    'scripts/client/gui/shared/gui_items/Vehicle.pyc': {
+        'Vehicle.descriptor': ('_Vehicle__descriptor',),
+    },
 }
 
 
@@ -476,6 +524,16 @@ EXPECTED_CLASS_CONSTANTS = {
             'LOBBY': 4,
             'BATTLE_LOADING': 5,
             'BATTLE': 6,
+        },
+    },
+    'scripts/client/gui/shared/events.pyc': {
+        'FightButtonEvent': {
+            'FIGHT_BUTTON_UPDATE': 'updateFightButton',
+        },
+    },
+    'scripts/client/gui/shared/event_bus.pyc': {
+        'EVENT_BUS_SCOPE': {
+            'LOBBY': 1,
         },
     },
 }

@@ -155,6 +155,7 @@ class LANSessionTests(unittest.TestCase):
             client_factory=client_factory, queue_factory=queue_factory,
             picker_opener=lambda: self.opens.append(True) or True,
             battle_runtime=self.battle_runtime,
+            vehicle_provider=lambda: ('ussr:R11_MS-1', 90),
             on_snapshot=self.snapshots.append,
             status_notifier=self.statuses.append)
         self.assertTrue(self.session.start())
@@ -200,6 +201,7 @@ class LANSessionTests(unittest.TestCase):
         session = self.module.LANSession(
             {'host': '10.0.0.5', 'port': 28782},
             client_factory=client_factory, join_factory=join_factory,
+            vehicle_provider=lambda: ('ussr:R11_MS-1', 90),
             status_notifier=lambda unused_message: None)
 
         self.assertTrue(session.install())
@@ -211,6 +213,157 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual(1, clients[0].start_calls)
         session.stop(show_login=False)
         self.assertEqual(1, join_views[0].uninstall_calls)
+
+    def test_selected_vehicle_provider_is_used_for_each_new_client(self):
+        clients = []
+        callbacks = []
+        selections = iter((
+            ('china:Ch01_Type59', 1300),
+            ('usa:A12_T32', 1550),
+        ))
+
+        def client_factory(*args, **kwargs):
+            client = _Client(*args, **kwargs)
+            clients.append(client)
+            return client
+
+        def schedule(unused_delay, callback):
+            callbacks.append(callback)
+            return len(callbacks)
+
+        session = self.module.LANSession(
+            {'host': '10.0.0.5', 'port': 28782,
+             'vehicle': 'ussr:R11_MS-1', 'max_health': 90},
+            client_factory=client_factory,
+            vehicle_provider=lambda: next(selections),
+            callback=schedule,
+            status_notifier=lambda unused_message: None)
+
+        self.assertTrue(session.start())
+        clients[0].on_event('error', {'message': 'connection refused'})
+        callbacks[0]()
+
+        self.assertEqual('china:Ch01_Type59', clients[0].vehicle)
+        self.assertEqual(1300, clients[0].max_health)
+        self.assertEqual('usa:A12_T32', clients[1].vehicle)
+        self.assertEqual(1550, clients[1].max_health)
+
+    def test_first_join_with_no_selected_vehicle_stays_ready_to_join(self):
+        clients = []
+        join_views = []
+        statuses = []
+
+        def client_factory(*args, **kwargs):
+            client = _Client(*args, **kwargs)
+            clients.append(client)
+            return client
+
+        def join_factory(callback):
+            view = _JoinUI(callback)
+            join_views.append(view)
+            return view
+
+        def fail_selection():
+            raise RuntimeError('garage selection is not ready')
+
+        session = self.module.LANSession(
+            {'vehicle': 'ussr:R11_MS-1', 'max_health': 90},
+            client_factory=client_factory,
+            join_factory=join_factory,
+            vehicle_provider=fail_selection,
+            status_notifier=statuses.append)
+
+        self.assertTrue(session.install())
+        self.assertTrue(join_views[0].on_join(0, 'battle'))
+
+        self.assertEqual('ready_to_join', session.state)
+        self.assertIsNone(session.client)
+        self.assertEqual([], clients)
+        self.assertEqual(
+            [self.module.VEHICLE_SELECTION_WARNING], statuses)
+
+    def test_invalid_selected_vehicle_never_falls_back_to_config(self):
+        clients = []
+        statuses = []
+
+        session = self.module.LANSession(
+            {'vehicle': 'ussr:R11_MS-1', 'max_health': 90},
+            client_factory=lambda *args, **kwargs: clients.append(
+                _Client(*args, **kwargs)),
+            vehicle_provider=lambda: ('', 0),
+            status_notifier=statuses.append)
+
+        self.assertFalse(session.start())
+
+        self.assertEqual('ready_to_join', session.state)
+        self.assertIsNone(session.client)
+        self.assertEqual([], clients)
+        self.assertEqual(
+            [self.module.VEHICLE_SELECTION_WARNING], statuses)
+
+    def test_retry_with_lost_selection_retires_socket_and_can_rejoin(self):
+        clients = []
+        callbacks = []
+        statuses = []
+        selections = [
+            ('china:Ch01_Type59', 1300),
+            RuntimeError('garage selection was cleared'),
+            ('usa:A12_T32', 1550),
+        ]
+
+        def client_factory(*args, **kwargs):
+            client = _Client(*args, **kwargs)
+            clients.append(client)
+            return client
+
+        def vehicle_provider():
+            selection = selections.pop(0)
+            if isinstance(selection, Exception):
+                raise selection
+            return selection
+
+        def schedule(unused_delay, callback):
+            callbacks.append(callback)
+            return len(callbacks)
+
+        session = self.module.LANSession(
+            {'host': '10.0.0.5', 'port': 28782},
+            client_factory=client_factory,
+            vehicle_provider=vehicle_provider,
+            callback=schedule,
+            status_notifier=statuses.append)
+
+        self.assertTrue(session.start())
+        old_client = clients[0]
+        old_client.on_event('error', {'message': 'connection refused'})
+        callbacks[0]()
+
+        self.assertEqual(1, old_client.stop_calls)
+        self.assertIsNone(old_client.on_event)
+        self.assertIsNone(session.client)
+        self.assertEqual('ready_to_join', session.state)
+        self.assertEqual(
+            self.module.VEHICLE_SELECTION_WARNING, statuses[-1])
+
+        self.assertTrue(session.join())
+        self.assertEqual('connecting', session.state)
+        self.assertEqual(2, len(clients))
+        self.assertEqual('usa:A12_T32', clients[1].vehicle)
+        self.assertEqual(1550, clients[1].max_health)
+
+    def test_default_provider_reads_exact_0922_current_vehicle_item(self):
+        current_vehicle = types.ModuleType('CurrentVehicle')
+        current_vehicle.g_currentVehicle = types.SimpleNamespace(
+            item=types.SimpleNamespace(
+                descriptor=types.SimpleNamespace(
+                    type=types.SimpleNamespace(name='germany:G04_PzVI_Tiger_I'),
+                    maxHealth=1500)))
+
+        with mock.patch.dict(
+                sys.modules, {'CurrentVehicle': current_vehicle}):
+            self.assertEqual(
+                ('germany:G04_PzVI_Tiger_I', 1500),
+                self.module._selected_vehicle_details())
 
     def test_picker_is_not_open_before_server_welcome(self):
         self.assertEqual('connecting', self.session.state)

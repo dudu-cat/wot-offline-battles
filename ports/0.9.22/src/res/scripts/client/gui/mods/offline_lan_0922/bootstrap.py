@@ -30,65 +30,140 @@ def _selected_vehicle(config):
     try:
         import nations
         from items import ITEM_TYPE_INDICES, tankmen, vehicles
-        descriptor = vehicles.VehicleDescr(typeName=config['vehicle'])
-        vehicle_id = 1
-        nation_id, vehicle_type_id = descriptor.type.id
+        selected_descriptor = vehicles.VehicleDescr(
+            typeName=config['vehicle'])
+        selected_type_id = tuple(selected_descriptor.type.id)
 
-        crew_compact_descrs = list(tankmen.generateTankmen(
-            nation_id, vehicle_type_id, descriptor.type.crewRoles,
-            False, tankmen.MAX_SKILL_LEVEL, 0))
-        if len(crew_compact_descrs) != len(descriptor.type.crewRoles):
-            raise ValueError('generated crew does not match vehicle crew slots')
+        # The exact #1513 VehicleList exposes one nation-indexed mapping for
+        # every nations.NAMES entry.  Put the configured vehicle first so its
+        # inventory id remains stable while the rest of the loadable local
+        # catalogue is discovered from the client, rather than hard-coded.
+        type_ids = [selected_type_id]
+        for nation_id in range(len(nations.NAMES)):
+            for vehicle_type_id in sorted(
+                    vehicles.g_list.getList(nation_id).keys()):
+                type_id = (nation_id, vehicle_type_id)
+                if type_id not in type_ids:
+                    type_ids.append(type_id)
 
-        crew_ids = []
-        tankman_compact_descrs = {}
-        for index, compact_descr in enumerate(crew_compact_descrs):
-            tankman_id = 1001 + index
-            tankman_descr = tankmen.TankmanDescr(compact_descr)
-            roles = descriptor.type.crewRoles[index]
-            if (tankman_descr.nationID != nation_id or
-                    tankman_descr.vehicleTypeID != vehicle_type_id or
-                    tankman_descr.role != roles[0]):
-                raise ValueError(
-                    'generated tankman does not match vehicle crew slot')
-            crew_ids.append(tankman_id)
-            tankman_compact_descrs[tankman_id] = compact_descr
-
+        vehicle_records = []
         inventory_items = {}
         shop_item_prices = {}
-        components = (
-            ('vehicleChassis', descriptor.chassis),
-            ('vehicleTurret', descriptor.turret),
-            ('vehicleGun', descriptor.gun),
-            ('vehicleEngine', descriptor.engine),
-            ('vehicleRadio', descriptor.radio),
-            ('vehicleFuelTank', descriptor.fuelTank),
-        )
-        for item_type_name, component in components:
-            compact_descr = component.compactDescr
-            item_type = ITEM_TYPE_INDICES[item_type_name]
-            inventory_items.setdefault(item_type, {})[compact_descr] = 1
-            # ShopDataParser uses membership in itemPrices as its module
-            # catalogue.  A zero price keeps installed modules discoverable
-            # without reimplementing the client's XML price reader.
-            shop_item_prices[compact_descr] = {'credits': 0, 'gold': 0}
+        vehicle_type_compact_descrs = set()
+        unlock_item_compact_descrs = set()
+        next_tankman_id = 100001
+        for type_id in type_ids:
+            try:
+                if type_id == selected_type_id:
+                    descriptor = selected_descriptor
+                else:
+                    descriptor = vehicles.VehicleDescr(typeID=type_id)
 
-        shells = list(vehicles.getDefaultAmmoForGun(descriptor.gun))
-        shell_items = inventory_items.setdefault(
-            ITEM_TYPE_INDICES['shell'], {})
-        for index in range(0, len(shells), 2):
-            shell_compact_descr = shells[index]
-            shell_items[shell_compact_descr] = shells[index + 1]
-            shop_item_prices[shell_compact_descr] = {
+                nation_id, vehicle_type_id = descriptor.type.id
+                if set(('event_battles', 'premiumIGR', 'observer')).intersection(
+                        descriptor.type.tags):
+                    raise ValueError(
+                        'vehicle type is not available in standard battles')
+                crew_compact_descrs = list(tankmen.generateTankmen(
+                    nation_id, vehicle_type_id, descriptor.type.crewRoles,
+                    False, tankmen.MAX_SKILL_LEVEL, 0, False))
+                if (not crew_compact_descrs or
+                        len(crew_compact_descrs) !=
+                        len(descriptor.type.crewRoles)):
+                    raise ValueError(
+                        'generated crew does not match vehicle crew slots')
+
+                validated_tankmen = []
+                for index, compact_descr in enumerate(crew_compact_descrs):
+                    tankman_descr = tankmen.TankmanDescr(compact_descr)
+                    roles = descriptor.type.crewRoles[index]
+                    if (tankman_descr.nationID != nation_id or
+                            tankman_descr.vehicleTypeID != vehicle_type_id or
+                            tankman_descr.role != roles[0]):
+                        raise ValueError(
+                            'generated tankman does not match vehicle crew slot')
+                    validated_tankmen.append(compact_descr)
+
+                components = (
+                    ('vehicleChassis', descriptor.chassis),
+                    ('vehicleTurret', descriptor.turret),
+                    ('vehicleGun', descriptor.gun),
+                    ('vehicleEngine', descriptor.engine),
+                    ('vehicleRadio', descriptor.radio),
+                    ('vehicleFuelTank', descriptor.fuelTank),
+                )
+                record_inventory_items = {}
+                for item_type_name, component in components:
+                    compact_descr = component.compactDescr
+                    item_type = ITEM_TYPE_INDICES[item_type_name]
+                    record_inventory_items.setdefault(
+                        item_type, {})[compact_descr] = 1
+
+                shells = list(vehicles.getDefaultAmmoForGun(descriptor.gun))
+                if not shells or len(shells) % 2:
+                    raise ValueError(
+                        'default ammo must contain descriptor/count pairs')
+                record_shell_items = record_inventory_items.setdefault(
+                    ITEM_TYPE_INDICES['shell'], {})
+                for index in range(0, len(shells), 2):
+                    record_shell_items[shells[index]] = shells[index + 1]
+
+                vehicle_compact_descr = descriptor.makeCompactDescr()
+                if not vehicle_compact_descr or descriptor.maxHealth <= 0:
+                    raise ValueError('vehicle descriptor is not garage-ready')
+                vehicle_int_compact_descr = (
+                    vehicles.makeIntCompactDescrByID(
+                        'vehicle', nation_id, vehicle_type_id))
+            except Exception:
+                if type_id == selected_type_id:
+                    raise
+                # Special or incomplete definitions can be advertised by
+                # g_list but still fail native garage construction.  Skip a
+                # non-selected entry unless its entire relational record is
+                # valid; never publish a half-built vehicle.
+                continue
+
+            crew_ids = []
+            tankman_compact_descrs = {}
+            for compact_descr in validated_tankmen:
+                tankman_id = next_tankman_id
+                next_tankman_id += 1
+                crew_ids.append(tankman_id)
+                tankman_compact_descrs[tankman_id] = compact_descr
+
+            for item_type, items in record_inventory_items.items():
+                published_items = inventory_items.setdefault(item_type, {})
+                for compact_descr, count in items.items():
+                    published_items[compact_descr] = max(
+                        int(published_items.get(compact_descr, 0)),
+                        int(count))
+                    shop_item_prices[compact_descr] = {
+                        'credits': 0, 'gold': 0,
+                    }
+                    unlock_item_compact_descrs.add(compact_descr)
+
+            vehicle_type_compact_descrs.add(vehicle_int_compact_descr)
+            unlock_item_compact_descrs.add(vehicle_int_compact_descr)
+            shop_item_prices[vehicle_int_compact_descr] = {
                 'credits': 0, 'gold': 0,
             }
+            vehicle_records.append({
+                'id': len(vehicle_records) + 1,
+                'compDescr': vehicle_compact_descr,
+                'crew': crew_ids,
+                'tankmen': tankman_compact_descrs,
+                'repair': (0, descriptor.maxHealth),
+                'lock': (0, 0),
+                'shells': shells,
+                'shellsLayout': {},
+                'eqs': [0, 0, 0],
+                'eqsLayout': [0, 0, 0],
+                'inventoryItems': record_inventory_items,
+                'vehicleTypeCompactDescr': vehicle_int_compact_descr,
+            })
 
-        vehicle_compact_descr = descriptor.makeCompactDescr()
-        vehicle_int_compact_descr = vehicles.makeIntCompactDescrByID(
-            'vehicle', nation_id, vehicle_type_id)
-        shop_item_prices[vehicle_int_compact_descr] = {
-            'credits': 0, 'gold': 0,
-        }
+        if not vehicle_records:
+            raise ValueError('client vehicle catalogue is empty')
 
         customization_count = 0
         customization_cache = vehicles.g_cache.customization20()
@@ -106,22 +181,20 @@ def _selected_vehicle(config):
         if customization_count <= 0:
             raise ValueError('client customization catalogue is empty')
 
-        return {
-            'id': vehicle_id,
-            'compDescr': vehicle_compact_descr,
-            'crew': crew_ids,
-            'tankmen': tankman_compact_descrs,
-            'repair': (0, descriptor.maxHealth),
-            'lock': (0, 0),
-            'shells': shells,
-            'shellsLayout': {},
-            'eqs': [0, 0, 0],
-            'eqsLayout': [0, 0, 0],
+        # Preserve the historical selected-vehicle fields for consumers that
+        # only need the configured tank.  ``vehicles`` carries the complete
+        # garage and account_rpc expands every record into native inventory.
+        result = dict(vehicle_records[0])
+        result.update({
+            'vehicles': vehicle_records,
             'inventoryItems': inventory_items,
             'shopItemPrices': shop_item_prices,
             'shopNationCount': len(nations.NAMES),
             'customizationItemCount': customization_count,
-        }
+            'vehicleTypeCompactDescrs': vehicle_type_compact_descrs,
+            'unlockItemCompactDescrs': unlock_item_compact_descrs,
+        })
+        return result
     except Exception:
         # _run_once owns startup error reporting.  Returning an empty snapshot
         # here would merely defer a deterministic descriptor problem until a

@@ -11,7 +11,7 @@ import zipfile
 
 
 MOD_ID = 'org.peng.offline_lan_0922'
-MOD_VERSION = '0.3.7'
+MOD_VERSION = '0.3.8'
 PYTHON_MAGIC = '\x03\xf3\r\n'
 
 
@@ -51,8 +51,15 @@ def _archive_tree(source_root, destination):
             for filename in files:
                 absolute_path = os.path.join(current_root, filename)
                 relative_path = os.path.relpath(absolute_path, source_root)
-                archive.write(absolute_path,
-                              relative_path.replace(os.sep, '/'))
+                info = zipfile.ZipInfo(
+                    relative_path.replace(os.sep, '/'))
+                info.compress_type = zipfile.ZIP_STORED
+                info.create_system = 0
+                # DOS archive bit.  Keeping this non-zero also prevents
+                # zipfile.writestr from injecting host-specific permissions.
+                info.external_attr = 32
+                with open(absolute_path, 'rb') as stream:
+                    archive.writestr(info, stream.read())
     finally:
         archive.close()
 

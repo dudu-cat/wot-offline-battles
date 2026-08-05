@@ -137,7 +137,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.7</version></root>')
+            '<version>0.3.8</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -251,6 +251,33 @@ class PortSourceTests(unittest.TestCase):
             self.assertFalse(cache.exists())
             self.assertFalse((root / 'package' / 'stale.pyc').exists())
             self.assertTrue((root / 'package' / 'keep.py').exists())
+
+    def test_archive_bytes_do_not_depend_on_source_timestamps(self):
+        packager_path = PORT_ROOT / 'build_wotmod.py'
+        spec = importlib.util.spec_from_file_location(
+            'build_wotmod_archive_test', packager_path)
+        packager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packager)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'package'
+            nested = source / 'nested'
+            nested.mkdir(parents=True)
+            payload = nested / 'module.pyc'
+            payload.write_bytes(b'fixed payload')
+            first = root / 'first.wotmod'
+            second = root / 'second.wotmod'
+
+            os.utime(payload, (1000000000, 1000000000))
+            packager._archive_tree(str(source), str(first))
+            os.utime(payload, (1700000000, 1700000000))
+            packager._archive_tree(str(source), str(second))
+
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            with zipfile.ZipFile(first) as archive:
+                self.assertTrue(all(
+                    info.date_time == (1980, 1, 1, 0, 0, 0)
+                    for info in archive.infolist()))
 
     def test_copy_ready_overlay_contains_pinned_lan_endpoint(self):
         packager_path = PORT_ROOT / 'build_wotmod.py'
@@ -2168,7 +2195,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.7'
+        package.PORT_VERSION = '0.3.8'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []

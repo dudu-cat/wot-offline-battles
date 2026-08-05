@@ -7,6 +7,12 @@ from gui.mods.offline_lan_0922 import queue_ui
 
 
 RECONNECT_DELAY = 2.0
+VEHICLE_SELECTION_WARNING = (
+    'Select a valid vehicle in the garage, then click Battle! again.')
+
+
+class _VehicleSelectionError(Exception):
+    pass
 
 
 def _show_status(message):
@@ -28,6 +34,21 @@ def _load_client():
 def _load_battle_runtime():
     from gui.mods.offline_lan_0922.battle_runtime import g_battle_runtime
     return g_battle_runtime
+
+
+def _selected_vehicle_details():
+    """Return the canonical type name and HP of the selected #1513 vehicle."""
+    from CurrentVehicle import g_currentVehicle
+
+    item = g_currentVehicle.item
+    if item is None:
+        raise ValueError('the current garage vehicle is not available')
+    descriptor = item.descriptor
+    type_name = descriptor.type.name
+    max_health = int(descriptor.maxHealth)
+    if not type_name or max_health < 1:
+        raise ValueError('the current garage vehicle descriptor is invalid')
+    return type_name, max_health
 
 
 def _message_value(message, name, default=None):
@@ -54,7 +75,8 @@ class LANSession(object):
     def __init__(self, config, client_factory=None, queue_factory=None,
                  picker_opener=None, join_factory=None, battle_runtime=None,
                  on_snapshot=None, on_event=None, lobby_ready=None,
-                 callback=None, cancel_callback=None, status_notifier=None):
+                 callback=None, cancel_callback=None, status_notifier=None,
+                 vehicle_provider=None):
         self._config = dict(config or {})
         self._client_factory = client_factory or _load_client
         self._queue_factory = queue_factory or queue_ui.QueueUI
@@ -67,6 +89,7 @@ class LANSession(object):
         self._callback = callback
         self._cancel_callback = cancel_callback
         self._status_notifier = status_notifier or _show_status
+        self._vehicle_provider = vehicle_provider or _selected_vehicle_details
         self.client = None
         self.snapshot = None
         self.state = 'idle'
@@ -95,11 +118,21 @@ class LANSession(object):
         self._waiting_notice_host_id = None
 
     def _new_client(self):
+        # Advancing before resolution also retires callbacks from an old
+        # socket when the garage selection becomes unavailable during retry.
+        self._client_generation += 1
+        generation = self._client_generation
+        try:
+            vehicle, max_health = self._vehicle_provider()
+            max_health = int(max_health)
+            if not vehicle or max_health < 1:
+                raise ValueError('selected vehicle details are invalid')
+        except Exception:
+            raise _VehicleSelectionError()
+
         factory = self._client_factory
         if factory is _load_client:
             factory = factory()
-        self._client_generation += 1
-        generation = self._client_generation
 
         def on_event(kind, message):
             # A cancelled BigWorld poll can still already be dispatching.  Do
@@ -112,14 +145,30 @@ class LANSession(object):
             self._config.get('host', '127.0.0.1'),
             self._config.get('port', 28782),
             self._config.get('name', 'Player'),
-            self._config.get('vehicle', 'ussr:R11_MS-1'),
-            max_health=self._config.get('max_health', 100),
+            vehicle,
+            max_health=max_health,
             on_event=on_event)
+
+    def _return_to_join_after_vehicle_selection_error(self):
+        self.client = None
+        self.state = 'ready_to_join'
+        self._host_player_id = None
+        self._waiting_notice_host_id = None
+        self._map_pool = None
+        self._pending_map = None
+        self._connection_error_notified = False
+        if self._picker_open:
+            self._close_picker_after_event()
+        self._status_notifier(VEHICLE_SELECTION_WARNING)
+        return False
 
     def start(self):
         if self._stopped or self.client is not None:
             return False
-        self.client = self._new_client()
+        try:
+            self.client = self._new_client()
+        except _VehicleSelectionError:
+            return self._return_to_join_after_vehicle_selection_error()
         self.state = 'connecting'
         started = bool(self.client.start())
         return started
@@ -140,7 +189,9 @@ class LANSession(object):
             return False
         if self.client is None:
             if not self.start():
-                self._status_notifier('The LAN room could not be joined.')
+                if self.state != 'ready_to_join':
+                    self._status_notifier(
+                        'The LAN room could not be joined.')
             else:
                 self._status_notifier(
                     'Joining LAN room at %s...' % self._endpoint_value())
@@ -189,7 +240,12 @@ class LANSession(object):
             if old_client is not None:
                 old_client.on_event = None
                 old_client.stop()
-            self.client = self._new_client()
+            self.client = None
+            try:
+                self.client = self._new_client()
+            except _VehicleSelectionError:
+                self._return_to_join_after_vehicle_selection_error()
+                return
             self.state = 'connecting'
             if not self.client.start():
                 self.state = 'retrying'
@@ -413,7 +469,12 @@ class LANSession(object):
         if old_client is not None:
             old_client.on_event = None
             old_client.stop()
-        self.client = self._new_client()
+        self.client = None
+        try:
+            self.client = self._new_client()
+        except _VehicleSelectionError:
+            self._return_to_join_after_vehicle_selection_error()
+            return False
         self.state = 'connecting'
         if not self.client.start():
             self.state = 'retrying'

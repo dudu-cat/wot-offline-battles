@@ -79,13 +79,22 @@ _WINDOW_GET_INFO = _Window.getInfo
 class _LobbyHeader(object):
     def __init__(self):
         self.calls = []
+        self.disabled = []
 
     def fightClick(self, map_id, action_name):
         self.calls.append((map_id, action_name))
         return 'stock'
 
+    def _updatePrebattleControls(self):
+        self.as_disableFightButtonS(True)
+        return 'updated'
+
+    def as_disableFightButtonS(self, disabled):
+        self.disabled.append(disabled)
+
 
 _LOBBY_HEADER_FIGHT_CLICK = _LobbyHeader.fightClick
+_LOBBY_HEADER_UPDATE_CONTROLS = _LobbyHeader._updatePrebattleControls
 
 
 class JoinButtonUITests(unittest.TestCase):
@@ -93,12 +102,15 @@ class JoinButtonUITests(unittest.TestCase):
         self.queue_ui = _load('queue_ui')
         self.join_calls = []
         self.handled = True
+        self.refresh = mock.Mock()
         self.adapter = self.queue_ui.JoinButtonUI(
-            self._join, runtime=_LobbyHeader)
+            self._join, runtime=_LobbyHeader, refresh=self.refresh)
 
     def tearDown(self):
         self.adapter.uninstall()
         _LobbyHeader.fightClick = _LOBBY_HEADER_FIGHT_CLICK
+        _LobbyHeader._updatePrebattleControls = (
+            _LOBBY_HEADER_UPDATE_CONTROLS)
 
     def _join(self, map_id, action_name):
         self.join_calls.append((map_id, action_name))
@@ -113,6 +125,15 @@ class JoinButtonUITests(unittest.TestCase):
         self.assertEqual([(7, 'random')], self.join_calls)
         self.assertEqual([], header.calls)
 
+    def test_install_refreshes_existing_header_and_forces_button_enabled(self):
+        self.adapter.install()
+        header = _LobbyHeader()
+
+        self.assertEqual('updated', header._updatePrebattleControls())
+
+        self.refresh.assert_called_once_with()
+        self.assertEqual([True, False], header.disabled)
+
     def test_unhandled_click_fully_forwards_to_stock_method(self):
         self.handled = False
         self.adapter.install()
@@ -125,12 +146,34 @@ class JoinButtonUITests(unittest.TestCase):
 
     def test_uninstall_restores_raw_class_function(self):
         original = _LobbyHeader.__dict__['fightClick']
+        original_update = _LobbyHeader.__dict__['_updatePrebattleControls']
         self.adapter.install()
         self.assertIsNot(original, _LobbyHeader.__dict__['fightClick'])
+        self.assertIsNot(
+            original_update,
+            _LobbyHeader.__dict__['_updatePrebattleControls'])
 
         self.adapter.uninstall()
 
         self.assertIs(original, _LobbyHeader.__dict__['fightClick'])
+        self.assertIs(
+            original_update,
+            _LobbyHeader.__dict__['_updatePrebattleControls'])
+
+    def test_failed_refresh_rolls_back_both_wrappers(self):
+        adapter = self.queue_ui.JoinButtonUI(
+            self._join, runtime=_LobbyHeader,
+            refresh=mock.Mock(side_effect=RuntimeError('refresh failed')))
+
+        with self.assertRaisesRegex(RuntimeError, 'refresh failed'):
+            adapter.install()
+
+        self.assertIs(
+            _LOBBY_HEADER_FIGHT_CLICK,
+            _LobbyHeader.__dict__['fightClick'])
+        self.assertIs(
+            _LOBBY_HEADER_UPDATE_CONTROLS,
+            _LobbyHeader.__dict__['_updatePrebattleControls'])
 
     def test_uninstall_does_not_clobber_later_wrapper(self):
         self.adapter.install()
@@ -142,6 +185,9 @@ class JoinButtonUITests(unittest.TestCase):
         self.adapter.uninstall()
 
         self.assertIs(later_wrapper, _LobbyHeader.fightClick)
+        self.assertIs(
+            _LOBBY_HEADER_UPDATE_CONTROLS,
+            _LobbyHeader.__dict__['_updatePrebattleControls'])
 
 
 class QueueUITests(unittest.TestCase):

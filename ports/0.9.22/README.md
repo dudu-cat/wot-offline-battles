@@ -9,11 +9,18 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.7` replaces the old compatibility slice. It is a server-backed
+Version `0.3.8` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, tactical bots and repeatable rounds. The removed `vertical_slice.py`
 runtime is not packaged as a fallback.
+
+The offline account discovers every complete standard-battle vehicle definition
+from the pinned client at startup instead of maintaining a hard-coded tank list.
+Each garage vehicle receives its stock configuration, a full trained crew and
+default ammunition. Event, IGR-only and observer definitions are excluded. The
+account starts with 100,000,000 credits, 100,000,000 free XP, 1,000,000 gold,
+2,000 garage slots and 2,000 barracks berths.
 
 This release fixes both halves of the real `#1513` battle-entry boundary. The
 local Vehicle id and `VEHICLE_ADDED` roster are now published before the native
@@ -32,11 +39,16 @@ overwrite the next round.
 
 ## User flow
 
-1. Start `lan_battle_server.py`. A single connected client is supported.
+1. Start `lan_battle_server.py`. One client is sufficient for an offline round;
+   additional clients can join the same waiting room over LAN.
 2. Start the frozen client. After the native intro/login state finishes its
    destructive cleanup, the mod creates its local Account and enters Lobby.
-3. Click the garage's native **Battle!** button. It joins the LAN waiting room;
-   it does not call retail matchmaking or a retail training-room service.
+3. Select the tank you want to use, then click the garage's native **Battle!**
+   button. The LAN handshake uses that tank's exact type name and descriptor
+   health; it does not silently fall back to MS-1. If no valid tank is selected,
+   the client stays in the garage and displays a native warning. The button
+   joins the LAN waiting room; it does not call retail matchmaking or a retail
+   training-room service.
 4. While the client is connecting or retrying, clicking **Battle!** again
    explicitly opens the stock settings window. Any not-yet-accepted client can
    edit `LAN SERVER: host:port` there; this does not grant host authority.
@@ -90,8 +102,8 @@ slopes and solid obstacles. This is intentionally not a reimplementation of
 the retail server's authoritative vehicle physics.
 
 Current battle completion is by team elimination. Base capture, retail
-matchmaking, reconnect recovery, internet authentication, anti-cheat and full
-module/crew replication are outside this release.
+matchmaking, reconnect recovery, internet authentication, anti-cheat, alternate
+module purchases and persistent garage mutations are outside this release.
 
 Protocol v5 messages are now strictly round-scoped. Keep the client package
 and `lan_battle_server.py` from the same checkout; this client rejects an older
@@ -130,9 +142,12 @@ Before receiving a server welcome, any client can click **Battle!** again to
 edit the same endpoint in the native training settings window. Once waiting,
 only the room host owns that window as the map picker; guests continue to use
 their saved `config.json`. The server supplies the selected map and spawn. The
-release does not write a
-capability trace or vertical-slice status file; normal failures are reported in
-`python.log` without verbose per-frame logging.
+`vehicle` field seeds the initial offline garage record; the tank selected in
+the carousel when **Battle!** is clicked is authoritative for the LAN join. The
+legacy `max_health` field remains accepted for configuration compatibility, but
+battle health is read from that selected vehicle's descriptor. The release does
+not write a capability trace or vertical-slice status file; normal failures are
+reported in `python.log` without verbose per-frame logging.
 
 ## Build
 
@@ -177,10 +192,10 @@ properties and mailboxes at runtime.
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.7.wotmod
-org.peng.offline_lan_0922_0.3.7.wotmod.sha256
-WoT-0.9.22-LAN-Client-<package hash>/
-WoT-0.9.22-LAN-Client-<package hash>.zip
+org.peng.offline_lan_0922_0.3.8.wotmod
+org.peng.offline_lan_0922_0.3.8.wotmod.sha256
+WoT-0.9.22-LAN-Client-<release hash>/
+WoT-0.9.22-LAN-Client-<release hash>.zip
 ```
 
 The hash-named directory is directly mergeable into the game root. Each build

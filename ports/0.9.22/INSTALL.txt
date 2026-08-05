@@ -1,9 +1,13 @@
-World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.7
+World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.8
 ================================================================
 
 This folder is directly mergeable into the frozen Chinese HD client root.
 It supports standard battles only and always uses the matching Python 3 LAN
 server, including when there is only one player.
+
+If you received the ZIP form, extract its contents directly into the game
+root. The archive itself contains `mods` and `INSTALL.txt`; it does not add an
+extra wrapper directory.
 
 Use `lan_battle_server.py` from the same repository checkpoint as this package.
 The v5 message schema is round-scoped and stricter than older v5 packages, so
@@ -26,7 +30,7 @@ Install
 3. Copy this folder's `mods` directory into the game root.
 4. Confirm this file exists:
 
-       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.7.wotmod
+       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.8.wotmod
 
 5. This copy-ready package includes:
 
@@ -52,7 +56,10 @@ Start a battle
 2. Start `WorldOfTanks.exe` without logging into an online account.
 3. On a fresh profile, accept the stock EULA once. Its version is stored in
    `mods\configs\offline_lan_0922\account_state.json` for later launches.
-4. Click the hangar's native Battle! button to join the LAN waiting room.
+4. Select the tank you want to use, then click the hangar's native Battle!
+   button to join the LAN waiting room. The current tank and its descriptor
+   health are sent to the LAN server; there is no silent MS-1 fallback. If no
+   valid tank is selected, the client stays in the hangar and shows a warning.
    This does not use retail matchmaking or the retail training-room service.
 5. If the client is still connecting or retrying, click Battle! again to open
    the stock settings window explicitly. Its Description field contains
@@ -79,7 +86,7 @@ Troubleshooting
 ---------------
 
 - `unsupported compression type`: an older or incorrectly compressed wotmod
-  is still present. Keep only the 0.3.7 package; its members use Store method.
+  is still present. Keep only the 0.3.8 package; its members use Store method.
 - No connection in the server terminal: check `config.json`, the host LAN IP,
   virtual-machine network mode and TCP 28782 firewall access. While the client
   retries, click Battle! again to open the endpoint editor.
@@ -94,4 +101,9 @@ The release uses native map, Avatar, Vehicle, HUD and collision resources, but
 local driving is bounded kinematic movement rather than retail server physics.
 Bots run on one elected client; the Python server owns shared HP, shot events,
 elimination and round reset. Base capture and non-standard modes are not
-implemented. Do not install this mod into a current or online client.
+implemented. The offline garage contains every complete standard-battle vehicle
+definition loadable by this client, with its stock configuration, full crew and
+default ammunition. Alternate module purchases and persistent garage mutations
+are not implemented. The account starts with 100,000,000 credits, 100,000,000
+free XP, 1,000,000 gold, 2,000 garage slots and 2,000 barracks berths. Do not
+install this mod into a current or online client.
