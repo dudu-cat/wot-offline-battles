@@ -1697,14 +1697,19 @@ def _offh_ai_view_range(descriptor):
 
 
 def _offh_ai_has_los(observer_position, target_position):
-	"""Static two-point LOS, matching the existing player spotting model."""
+	"""Static LOS between hulls, excluding both vehicle collision volumes."""
 	try:
 		import BigWorld, Math
-		start = Math.Vector3(observer_position[0], observer_position[1] + 2.5,
-		                     observer_position[2])
+		from gui.mods.offhangar.bot_ai import trimmed_sight_segment
 		for height in (1.5, 2.2):
-			end = Math.Vector3(target_position[0], target_position[1] + height,
-			                   target_position[2])
+			segment = trimmed_sight_segment(
+				observer_position, target_position, target_height=height)
+			if segment is None:
+				return True
+			if not segment:
+				continue
+			start = Math.Vector3(*segment[0])
+			end = Math.Vector3(*segment[1])
 			if BigWorld.wg_collideSegment(_offh_bspace(), start, end, 128) is None:
 				return True
 	except Exception:
@@ -9315,15 +9320,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										if _sd2 <= 2500.0:
 											_seen = True  # 50 m proximity spot
 										elif _sd2 <= _svr * _svr:
-											_slos = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(veh_pos[0], veh_pos[1] + 2.5, veh_pos[2]), Math.Vector3(m_veh.position.x, m_veh.position.y + 1.5, m_veh.position.z), 128)
-											_seen = _slos is None
-											if not _seen:
-												# Second sample at turret height: a single mid-hull
-												# ray grazing a crest could keep a plainly exposed
-												# (and firing) tank unspotted; real spotting checks
-												# several points on the target.
-												_slos = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(veh_pos[0], veh_pos[1] + 2.5, veh_pos[2]), Math.Vector3(m_veh.position.x, m_veh.position.y + 2.2, m_veh.position.z), 128)
-												_seen = _slos is None
+											_seen = _offh_ai_has_los(
+												(veh_pos[0], veh_pos[1], veh_pos[2]),
+												(m_veh.position.x, m_veh.position.y,
+												 m_veh.position.z))
 										if not _seen:
 											# Team vision: living allied bots relay spots to the player (radio).
 											# Cheap distance pass over all allies, then ONE ray to the nearest.
@@ -9373,8 +9373,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 													_tvd = _td2
 													_tvb = _tvm
 											if (not _seen) and _tvb is not None:
-												_tlos = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(_tvb.position.x, _tvb.position.y + 2.5, _tvb.position.z), Math.Vector3(m_veh.position.x, m_veh.position.y + 1.5, m_veh.position.z), 128)
-												_seen = _tlos is None
+												_seen = _offh_ai_has_los(
+													(_tvb.position.x, _tvb.position.y,
+													 _tvb.position.z),
+													(m_veh.position.x, m_veh.position.y,
+													 m_veh.position.z))
 										if _seen:
 											m_veh._spot_until = BigWorld.time() + 5.0  # spot memory
 										# Re-apply the model state on every check (idempotent): a

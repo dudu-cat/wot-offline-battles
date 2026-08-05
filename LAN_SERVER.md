@@ -86,6 +86,19 @@ protocol: verify LAN mode is ON, the configured IP, Parallels network mode and
 the server firewall. If it prints a TCP connection followed by `protocol
 mismatch`, the client and server packages are from different builds.
 
+During a battle the server prints one compact bot-AI line every three seconds:
+
+```text
+BOT AI reports=t1:2,t2:3 accepted=5 contacts=t1:2/2,t2:3/3 targets=t1:14,t2:15 fire=t1:14,t2:15 modes=engage:29
+```
+
+`reports` is the authority client's current visible-contact count, `contacts`
+is visible/remembered state accepted by the server, `targets` is the number of
+bots with a combat target, and `fire` is the number currently authorized to
+shoot. Each actual client-simulated shot also prints `BOT FIRE`. This separates
+spotting, server orders and client execution without enabling verbose client
+debug logging.
+
 In battle, opposing LAN humans use the same local 50 m proximity spot,
 view-range/terrain line-of-sight check, allied vision and five-second spot
 memory as NPC opponents. Allied humans remain visible. When a human dies, the

@@ -116,6 +116,58 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual({"x": 40.0, "y": 0.0, "z": 30.0}, team_one[0]["aim_position"])
         self.assertTrue(team_one[0]["fire_allowed"])
 
+    def test_visible_enemy_overrides_route_until_contact_expires(self):
+        planner = BotPlanner()
+        manifest = _manifest()
+        manifest[0]["profile"] = {
+            "dominant_role": "brawler", "desired_range": 40.0,
+            "fire_range": 500.0, "roles": {"brawler": 1.0},
+        }
+        manifest[0]["route"] = {
+            "id": "enemy_base", "waypoints": [
+                {"x": 0, "y": 0, "z": -20},
+                {"x": 0, "y": 0, "z": 300},
+            ],
+        }
+        before = planner.build_orders(manifest, _states(), [], 0.0)
+        before_order = next(order for order in before["orders"] if order["id"] == 1)
+        self.assertIsNone(before_order["target_id"])
+        self.assertEqual("advance", before_order["combat_mode"])
+
+        planner.report_contacts([{
+            "observing_team": 1, "target_kind": "bot", "target_id": 3,
+            "target_team": 2, "visible": True,
+            "x": 0, "y": 0, "z": 20, "health": 1000,
+            "max_health": 1000,
+        }], planner.known_targets(_states(), []), 1.0)
+        engaged = planner.build_orders(manifest, _states(), [], 1.0)
+        engaged_order = next(order for order in engaged["orders"] if order["id"] == 1)
+        self.assertEqual(3, engaged_order["target_id"])
+        self.assertEqual({"x": 0.0, "y": 0.0, "z": 20.0}, engaged_order["aim_position"])
+        self.assertTrue(engaged_order["fire_allowed"])
+        self.assertNotEqual("advance", engaged_order["combat_mode"])
+
+        expired = planner.build_orders(manifest, _states(), [], 9.1)
+        expired_order = next(order for order in expired["orders"] if order["id"] == 1)
+        self.assertIsNone(expired_order["target_id"])
+        self.assertEqual("advance", expired_order["combat_mode"])
+
+    def test_debug_summary_exposes_contact_order_and_fire_chain(self):
+        planner = BotPlanner()
+        planner.report_contacts([{
+            "observing_team": 1, "target_kind": "bot", "target_id": 3,
+            "target_team": 2, "visible": True,
+            "x": 0, "y": 0, "z": 20, "health": 1000,
+            "max_health": 1000,
+        }], planner.known_targets(_states(), []), 1.0)
+        planner.build_orders(_manifest(), _states(), [], 1.0)
+
+        summary = planner.debug_summary(1.0)
+
+        self.assertEqual(1, summary["teams"][1]["visible"])
+        self.assertGreater(summary["teams"][1]["targeted"], 0)
+        self.assertGreater(summary["teams"][1]["fire"], 0)
+
     def test_unreported_player_and_stale_contact_do_not_leak_target(self):
         planner = BotPlanner()
         players = [{"id": 99, "team": 2, "alive": True, "x": 999, "z": 999}]
@@ -333,6 +385,30 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertFalse(state.update_bot_manifest(1, {"bots": {"id": 1}}))
         self.assertFalse(state.update_bot_states(1, {"bots": {"id": 1}}))
         self.assertEqual([], state.bot_manifest)
+
+    def test_bot_state_fire_sequence_creates_a_server_diagnostic_event(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        state.bot_authority_id = 1
+        identity = state.bot_roster[0]
+        self.assertTrue(state.update_bot_manifest(1, {"bots": [{
+            "id": identity["id"], "team": identity["team"],
+            "slot": identity["slot"], "max_health": 1000,
+            "health": 1000, "fire_seq": 0,
+        }]}))
+        state.pending_events = []
+
+        self.assertTrue(state.update_bot_states(1, {"bots": [{
+            "id": identity["id"], "health": 1000, "alive": True,
+            "x": 0, "y": 0, "z": 0, "fire_seq": 1,
+            "shell_index": 2,
+        }]}))
+
+        events = [event for event in state.pending_events
+                  if event.get("kind") == "bot_shot"]
+        self.assertEqual(1, len(events))
+        self.assertEqual(identity["id"], events[0]["attacker_bot"])
+        self.assertEqual(2, events[0]["shell_index"])
 
     def test_cover_requires_live_contact_and_nearby_server_pose(self):
         planner = BotPlanner()

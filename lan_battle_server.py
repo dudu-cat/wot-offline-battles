@@ -174,6 +174,8 @@ class BattleState:
         self.bot_planner = BotPlanner()
         self.bot_orders = {"revision": 0, "orders": []}
         self.bot_reported_hits = set()
+        self.bot_observation_stats = {1: 0, 2: 0, "accepted": 0}
+        self.next_bot_ai_log = 0.0
         self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
                                       "2": {"points": 0, "stopped": False}}}
         self.battle_result = None
@@ -292,6 +294,8 @@ class BattleState:
                 self.bot_planner.reset()
                 self.bot_orders = {"revision": 0, "orders": []}
                 self.bot_reported_hits = set()
+                self.bot_observation_stats = {1: 0, 2: 0, "accepted": 0}
+                self.next_bot_ai_log = 0.0
                 self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
                                                "2": {"points": 0, "stopped": False}}}
                 self.battle_result = None
@@ -483,6 +487,19 @@ class BattleState:
                 self.bot_manifest, list(self.bot_states.values()))
             accepted_affordances = self.bot_planner.report_affordances(
                 message.get("affordances"), known_bots, known_targets, now)
+            visible_reports = {1: 0, 2: 0}
+            raw_contacts = message.get("contacts")
+            if isinstance(raw_contacts, (list, tuple)):
+                for raw in raw_contacts:
+                    if not isinstance(raw, dict) or not bool(raw.get("visible")):
+                        continue
+                    team = int(_finite_float(raw.get("observing_team"), 0))
+                    if team in visible_reports:
+                        visible_reports[team] += 1
+            self.bot_observation_stats = {
+                1: visible_reports[1], 2: visible_reports[2],
+                "accepted": accepted_contacts,
+            }
             return accepted_contacts > 0 or accepted_affordances > 0
 
     @staticmethod
@@ -538,7 +555,16 @@ class BattleState:
                 if identity is None:
                     continue
                 previous = self.bot_states.get(bot_id)
-                self.bot_states[bot_id] = self._sanitize_bot_state(raw, identity, previous)
+                updated = self._sanitize_bot_state(raw, identity, previous)
+                self.bot_states[bot_id] = updated
+                if (previous is not None and
+                        int(updated.get("fire_seq", 0)) > int(previous.get("fire_seq", 0))):
+                    self.pending_events.append({
+                        "kind": "bot_shot", "attacker_bot": bot_id,
+                        "team": int(identity["team"]),
+                        "shot_seq": int(updated["fire_seq"]),
+                        "shell_index": int(updated.get("shell_index", 0)),
+                    })
                 changed = True
             return changed
 
@@ -795,10 +821,16 @@ class BattleState:
             self.tick += 1
             for player in list(self.players.values()):
                 self._apply_movement(player, dt)
+            now = time.monotonic()
             self.bot_orders = self.bot_planner.build_orders(
                 self.bot_manifest, list(self.bot_states.values()),
                 [self._public_player(p) for p in self.players.values() if p.connected],
-                time.monotonic())
+                now)
+            ai_debug = None
+            if self.bot_manifest and now >= self.next_bot_ai_log:
+                self.next_bot_ai_log = now + 3.0
+                ai_debug = self.bot_planner.debug_summary(now)
+                ai_debug["reported"] = dict(self.bot_observation_stats)
             events = self.pending_events
             self.pending_events = []
             snapshot = {
@@ -814,6 +846,23 @@ class BattleState:
                 "battle_result": self.battle_result,
             }
             recipients = list(self.players.values())
+        if ai_debug is not None:
+            teams = ai_debug["teams"]
+            reports = ai_debug["reported"]
+            mode_counts = {}
+            for team in (1, 2):
+                for mode, count in teams[team]["modes"].items():
+                    mode_counts[mode] = mode_counts.get(mode, 0) + count
+            modes = ",".join("%s:%s" % item for item in sorted(mode_counts.items()))
+            _server_log(
+                "BOT AI reports=t1:%d,t2:%d accepted=%d "
+                "contacts=t1:%d/%d,t2:%d/%d targets=t1:%d,t2:%d "
+                "fire=t1:%d,t2:%d modes=%s" % (
+                    reports.get(1, 0), reports.get(2, 0), reports.get("accepted", 0),
+                    teams[1]["visible"], teams[1]["contacts"],
+                    teams[2]["visible"], teams[2]["contacts"],
+                    teams[1]["targeted"], teams[2]["targeted"],
+                    teams[1]["fire"], teams[2]["fire"], modes or "none"))
         for player in recipients:
             outgoing = snapshot
             if player.bot_order_revision_sent != self.bot_orders["revision"]:
@@ -834,6 +883,10 @@ class BattleState:
                     _server_log("HEALTH target=%s damage=%s health=%s dead=%s source=%s" % (
                         event.get("target"), event.get("damage"), event.get("health"),
                         event.get("dead"), event.get("source")))
+                elif event.get("kind") == "bot_shot":
+                    _server_log("BOT FIRE attacker=%s team=%s seq=%s shell=%s" % (
+                        event.get("attacker_bot"), event.get("team"),
+                        event.get("shot_seq"), event.get("shell_index")))
                 elif event.get("kind") in ("bot_hit", "bot_human_hit"):
                     _server_log("BOT COMBAT kind=%s attacker=%s target=%s damage=%s health=%s dead=%s" % (
                         event.get("kind"), event.get("attacker", event.get("attacker_bot")),

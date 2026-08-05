@@ -91,6 +91,20 @@ class BotAITest(unittest.TestCase):
         self.assertIn("e_mock._spot_visible = bot_initially_visible(", battle_source)
         self.assertIn("if not _offh_minimap_visible(value):", battle_source)
 
+    def test_sight_segment_excludes_shooter_and_target_hulls(self):
+        segment = self.ai.trimmed_sight_segment(
+            (0.0, 10.0, 0.0), (0.0, 12.0, 100.0)
+        )
+
+        self.assertEqual((0.0, 12.5, 4.0), segment[0])
+        self.assertEqual((0.0, 13.5, 96.0), segment[1])
+        self.assertIsNone(self.ai.trimmed_sight_segment(
+            (0.0, 0.0, 0.0), (0.0, 0.0, 8.0)
+        ))
+        self.assertEqual((), self.ai.trimmed_sight_segment(
+            ("bad", 0.0, 0.0), (0.0, 0.0, 100.0)
+        ))
+
     def test_lakeville_lane_capacities_force_a_balanced_split(self):
         director = self.ai.BattleDirector("07_lakeville", "lane-capacity")
         for bot_id in range(1, 15):
@@ -104,8 +118,32 @@ class BotAITest(unittest.TestCase):
             counts[route_id] = counts.get(route_id, 0) + 1
 
         self.assertEqual(
-            {"east_town": 5, "lake_road": 5, "middle_ridge": 4}, counts
+            {"east_town": 5, "lake_road": 4, "west_valley": 5}, counts
         )
+
+    def test_lakeville_routes_use_three_real_corridors(self):
+        tactical_map = self.maps.get_tactical_map("07_lakeville")
+        routes = {
+            route["id"]: route["waypoints"]
+            for route in tactical_map["routes"][1]
+        }
+
+        self.assertLess(min(point[0] for point in routes["west_valley"]), -320)
+        self.assertTrue(all(
+            -180 <= point[0] <= -50
+            for point in routes["lake_road"]
+        ))
+        self.assertGreater(max(point[0] for point in routes["east_town"]), 300)
+
+        # Near the map's middle latitude the lanes must still be separated.
+        # This catches the old data where the west route sat on the mountain
+        # and the town route ended in the lake instead of reaching the city.
+        lane_x = {}
+        for route_id, points in routes.items():
+            lane_x[route_id] = min(points, key=lambda point: abs(point[1]))[0]
+        self.assertLess(lane_x["west_valley"], -280)
+        self.assertTrue(-130 < lane_x["lake_road"] < -40)
+        self.assertGreater(lane_x["east_town"], 260)
 
     def test_routes_start_at_own_flag_and_finish_at_enemy_flag(self):
         for map_name, tactical_map in self.maps.TACTICAL_MAPS.items():

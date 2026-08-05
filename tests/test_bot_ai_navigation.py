@@ -50,6 +50,35 @@ class BotNavigationTest(unittest.TestCase):
 
         self.assertEqual((), grid.plan((-4.0, 0.0, 0.0), (4.0, -10.0, 0.0)))
 
+    def test_astar_stops_at_nearest_reachable_cell_for_a_slightly_bad_anchor(self):
+        def ground(x, z, hint):
+            return 0.0
+
+        def obstacle(start, end, half_width):
+            return end[0] > 6.5
+
+        grid = self.navigation.TerrainGrid(
+            ground, obstacle_probe=obstacle,
+            bounds=(-10.0, -10.0, 10.0, 10.0), cell_size=1.0
+        )
+        path = grid.plan((-8.0, 0.0, 0.0), (8.0, 0.0, 0.0))
+
+        self.assertTrue(path)
+        self.assertLessEqual(path[-1][0], 6.0)
+        self.assertGreaterEqual(path[-1][0], 5.0)
+
+    def test_astar_does_not_mask_a_grossly_wrong_anchor(self):
+        def ground(x, z, hint):
+            return None if x > 0.0 else 0.0
+
+        grid = self.navigation.TerrainGrid(
+            ground, bounds=(-20.0, -5.0, 20.0, 5.0), cell_size=1.0
+        )
+
+        self.assertEqual((), grid.plan(
+            (-15.0, 0.0, 0.0), (15.0, 0.0, 0.0)
+        ))
+
     def test_shared_route_path_is_cached_and_followed(self):
         probes = []
 

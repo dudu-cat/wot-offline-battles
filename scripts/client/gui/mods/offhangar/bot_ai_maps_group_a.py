@@ -75,9 +75,14 @@ ENSK = _map('06_ensk', (-300.0, -300.0, 300.0, 300.0),
 
 LAKEVILLE = _map('07_lakeville', (-400.0, -400.0, 400.0, 400.0),
 	(-169.5, 319.4), (-169.5, -319.0), (
-		_route('lake_road', 'brawl', 5, 0.63, ((-170, 310, 0), (-255, 245, 0), (-305, 145, 1), (-305, 20, 1), (-280, -110, 1), (-220, -245, 0))),
-		_route('middle_ridge', 'fire', 4, 0.62, ((-165, 310, 0), (-130, 215, 0), (-110, 115, 1), (-100, 10, 1), (-110, -100, 1), (-145, -235, 0))),
-		_route('east_town', 'flank', 5, 0.74, ((-155, 310, 0), (5, 255, 0), (115, 155, 1), (135, 30, 1), (90, -100, 1), (-20, -240, 0))),
+		# Lakeville's world axes line up with the minimap.  The previous west
+		# route crossed the mountain and the previous town route put three
+		# anchors in the lake, leaving the terrain navigator with an impossible
+		# goal.  These are sparse corridor gates: live A* still chooses the exact
+		# road around rocks, buildings and traffic between them.
+		_route('west_valley', 'brawl', 5, 0.63, ((-169, 319, 0), (-258, 350, 0), (-314, 298, 0), (-330, 189, 1), (-331, 40, 1), (-315, -101, 1), (-278, -211, 0), (-225, -273, 0))),
+		_route('lake_road', 'fire', 4, 0.62, ((-169, 319, 0), (-110, 268, 0), (-76, 189, 0), (-81, 56, 1), (-77, -101, 1), (-102, -211, 0), (-165, -294, 0))),
+		_route('east_town', 'flank', 5, 0.74, ((-169, 319, 0), (-9, 325, 0), (164, 306, 0), (289, 267, 0), (322, 173, 1), (314, 40, 1), (284, -93, 1), (218, -187, 0), (70, -265, 0), (-79, -297, 0))),
 	))
 
 RUINBERG = _map('08_ruinberg', (-400.0, -400.0, 400.0, 400.0),

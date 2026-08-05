@@ -277,10 +277,20 @@ class TerrainGrid(object):
 		cost_so_far = {start_cell: 0.0}
 		heights = {start_cell: start_y}
 		reached = None
+		closest = start_cell
+		closest_distance = math.sqrt(
+			(start_cell[0] - goal_cell[0]) ** 2 +
+			(start_cell[1] - goal_cell[1]) ** 2)
 		expansions = 0
 		while frontier and expansions < int(max_expansions):
 			_unused_priority, _unused_sequence, current = heapq.heappop(frontier)
 			expansions += 1
+			goal_distance = math.sqrt(
+				(current[0] - goal_cell[0]) ** 2 +
+				(current[1] - goal_cell[1]) ** 2)
+			if goal_distance < closest_distance:
+				closest = current
+				closest_distance = goal_distance
 			if current == goal_cell:
 				reached = current
 				break
@@ -316,8 +326,16 @@ class TerrainGrid(object):
 					               (new_cost + heuristic, sequence, next_cell))
 			yield None
 		if reached is None:
-			yield ()
-			return
+			# Sparse strategic anchors are hand placed on a minimap. A point a few
+			# metres inside a building footprint, cliff lip or water edge must not
+			# invalidate an otherwise complete route. Use the nearest cell A* could
+			# actually reach, but only within three coarse cells: a grossly wrong
+			# anchor still fails instead of silently changing battle lanes.
+			if closest_distance <= 3.0:
+				reached = closest
+			else:
+				yield ()
+				return
 		cells = [reached]
 		while cells[-1] != start_cell:
 			cells.append(came_from[cells[-1]])

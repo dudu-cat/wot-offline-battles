@@ -227,6 +227,37 @@ class BotPlanner(object):
             self._last_orders = payload
         return {"revision": self.revision, "orders": orders}
 
+    def debug_summary(self, now):
+        """Return low-volume evidence for contact -> order diagnostics."""
+        result = {"teams": {}}
+        orders = ((self._last_orders or {}).get("orders") or [])
+        for team in (1, 2):
+            known = 0
+            visible = 0
+            for contact in self._contacts.get(team, {}).values():
+                if _number(now) - _number(contact.get("last_seen")) > CONTACT_TTL_SECONDS:
+                    continue
+                known += 1
+                if contact.get("visible"):
+                    visible += 1
+            team_orders = [order for order in orders
+                           if _integer(order.get("team")) == team]
+            modes = {}
+            for order in team_orders:
+                mode = str(order.get("combat_mode") or "unknown")
+                modes[mode] = modes.get(mode, 0) + 1
+            result["teams"][team] = {
+                "contacts": known,
+                "visible": visible,
+                "orders": len(team_orders),
+                "targeted": sum(order.get("target_id") is not None
+                                for order in team_orders),
+                "fire": sum(bool(order.get("fire_allowed"))
+                            for order in team_orders),
+                "modes": modes,
+            }
+        return result
+
     @staticmethod
     def known_targets(bot_states, players):
         result = {}
