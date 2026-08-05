@@ -5,7 +5,7 @@ This review is pinned to the Chinese HD client whose `version.xml` reports
 CPython 2.7 bytecode magic `03 f3 0d 0a`; the embedded build identifies itself
 as Python 2.7.7.
 
-The goal of version 0.3.3 is a complete playable vertical path, not another
+The goal of version 0.3.4 is a complete playable vertical path, not another
 login-only probe: local Account -> stock Lobby/map selection -> native map and
 Avatar -> native Vehicle entities -> local movement/aim/fire -> synchronized
 humans and bots -> damage/death/result -> cleanup -> a second round.
@@ -179,6 +179,17 @@ has already retired the weak view. The stock window remains
 responsible for mouse and cursor behavior; no transparent hotkey overlay or
 F12/`0` handler is installed.
 
+A first-chance Windows dump identified a stricter boundary in the picker
+action. `updateTrainingRoom` was synchronously closing its own Scaleform view
+and then returning `True`. The native dispatcher still attempted to convert
+that non-`None` result through the view whose display-object pointer had just
+been cleared, producing a `NULL + 0x0c` access violation before battle setup
+began. The accepted action is now void, matching the stock/public observer
+shape, and the owner closes the picker with `BigWorld.callback(0.0, ...)` only
+after the current Scaleform event returns. If `battle_start` arrives first,
+the network poll cancels that callback, closes the picker once, and only then
+crosses the Account-to-Avatar boundary. There is no synchronous-close fallback.
+
 ## Battle and entity lifecycle
 
 The client delegates space, mapping, Avatar construction, camera setup and
@@ -187,6 +198,17 @@ battle branch while `PlayerAvatar.onBecomePlayer` runs, but preserves the one
 native `AvatarFilter` established before world entry. A strict local mailbox
 implements only the exact early Account/Avatar/Vehicle server calls needed by
 this client.
+
+The Lobby-to-Avatar transition also follows the exact `#1513` native ownership
+order. It requires a fully initialized HangarSpace, calls
+`g_hangarSpace.destroy()` so the hangar vehicle, camera, input handlers,
+callbacks and geometry are retired by their owner, verifies both readiness
+flags are false, and only then calls `BigWorld.clearEntitiesAndSpaces()`.
+Calling the bulk clear first can leave the later Account/Avatar hangar cleanup
+re-entering already-cleared native objects. During synchronous map creation,
+`game.abort()` is scoped to a recoverable Python failure so a rejected arena
+cannot silently schedule process shutdown; the original function is restored
+without overwriting a newer third-party wrapper.
 
 `PlayerAvatar.leaveArena()` calls its base mailbox before the rest of its
 native cleanup. The local bridge therefore schedules runtime teardown for the
@@ -261,18 +283,23 @@ The pure-data server planner emits revisioned global `bot_orders`, which the
 0.9.22 authority now uses for macro targets after reporting bounded visibility
 observations. BigWorld terrain, collision, water and slope probes remain local,
 and the client planner is a fallback when no server order is available.
-Base-capture rules are not part of 0.3.3; standard battles currently end by
+Base-capture rules are not part of 0.3.4; standard battles currently end by
 elimination.
 
 ## Reference implementations reviewed
 
 The migration compared the local build with several public offline layers,
-including `Fedar459/WoTOfflineHangar0.9.22`,
-`cyberjois/private-wot-server` and the Tuxedo WoT offline-server projects.
-Useful patterns were adopted only after checking their corresponding local
-`#1513` call sites. Broad login-view replacements, blanket exception handling,
-forced process exit, global entity-clear bypasses and development hotkeys were
-not carried into this runtime.
+including the Tuxedo 0.9.22 observer, WOTClassicReborn's later observer fork,
+the full `webiumsk/WOT-0.9.20.0` client source and
+`Fedar459/WoTOfflineHangar0.9.22`. Tuxedo's useful pattern is the separation of
+the training-window selection action from the later observer start; its direct
+entity clear starts from Login rather than a fully initialized Hangar and is
+therefore not copied into this Lobby path. The 0.9.20 source was useful for
+checking Account, HangarSpace and Avatar ownership order, then every adopted
+name and ordering was verified against local `#1513` bytecode. Broad
+login-view replacements, blanket exception handling, forced process exit,
+global entity-clear bypasses and development hotkeys were not carried into
+this runtime.
 
 ## Automated and package verification
 
@@ -287,13 +314,13 @@ The release build additionally:
 
 1. inspects the exact client version, build, executable architecture and
    required resource archives;
-2. reads exact code objects from `scripts.pkg` and compares all 120 stock method
-   signatures, 18 direct-consumer literals, 24 lifecycle code names and 11
-   `AccountCommands` constants used by the port, including variadic flags on
-   the stock view loader;
-3. checks 14 ordered lifecycle contracts and inventories every exact
-   Account-helper `setAccount` implementation, so weak-reference, login-state,
-   map rollback and leave-arena assumptions cannot silently change;
+2. reads exact code objects from `scripts.pkg` and compares every stock method
+   signature, direct-consumer literal, lifecycle name and `AccountCommands`
+   constant used by the port, including variadic flags on the stock view
+   loader;
+3. checks the ordered lifecycle contracts and inventories every exact
+   Account-helper `setAccount` implementation, including the native
+   Account-to-Hangar-to-Avatar retirement order;
 4. compiles every packaged source with CPython 2.7;
 5. removes source and stale Python 3 bytecode;
 6. requires the packaged PYC manifest to match every current source module and

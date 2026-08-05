@@ -53,6 +53,21 @@ ORDERED_USES = (
         'native Account GUI owns asynchronous hangar then lobby transition',
     ),
     (
+        'scripts/client/gui/shared/personality.pyc',
+        'onAccountBecomeNonPlayer',
+        ('g_currentVehicle', 'destroy',
+         'g_currentPreviewVehicle', 'destroy',
+         'g_hangarSpace', 'destroy'),
+        'Account retirement destroys lobby vehicles before hangar space',
+    ),
+    (
+        'scripts/client/Avatar.pyc',
+        'PlayerAvatar.onBecomePlayer',
+        ('cameraSpaceID', 'g_hangarSpace', 'destroy',
+         'ClientArena', 'arenaType', 'abort'),
+        'Avatar promotion retires hangar before validating its arena',
+    ),
+    (
         'scripts/client/OfflineMapCreator.pyc',
         'OfflineMapCreator.create',
         ('showBattlePage', 'createSpace', 'createEntity', 'player', 'cancel'),

@@ -121,17 +121,13 @@ class QueueUI(object):
             accepted = adapter._request_start(map_name, comment)
             if accepted is False:
                 return False
-            if adapter._picker_window is window:
-                adapter._picker_window = None
-                setattr(window, _PICKER_MARKER, False)
-                close = getattr(window, 'onWindowClose', None)
-                if callable(close):
-                    close()
-            else:
-                # LANSession.request_start closes the picker synchronously.
-                # Do not invoke stock destroy() for the same window twice.
-                setattr(window, _PICKER_MARKER, False)
-            return True
+            # This method is entered from Scaleform's native event dispatcher.
+            # Destroying the view before that dispatcher regains control leaves
+            # native return-value state pointing at a retired window.  The
+            # session owns a next-tick close after this Python callback returns.
+            # The stock/Tuxedo hook is also void.  Returning a Python value
+            # makes Scaleform convert it through that same native window.
+            return None
 
         def wrapped_close(window):
             detach_error = None

@@ -190,9 +190,11 @@ class LANSessionTests(unittest.TestCase):
     def test_preconnection_selection_starts_once_after_welcome(self):
         self.assertTrue(self.queues[0].request_start(
             '01_karelia', 'LAN SERVER: 10.0.0.5:28782'))
+        self.assertFalse(self.queues[0].request_start(
+            '05_prohorovka', 'LAN SERVER: 10.0.0.5:28782'))
         self.assertEqual('01_karelia', self.session._pending_map)
         self.assertEqual([], self.client.requests)
-        self.assertFalse(self.session._picker_open)
+        self.assertTrue(self.session._picker_open)
 
         message = {'phase': 'waiting', 'map_pool': ['01_karelia']}
         self.emit('welcome', message)
@@ -338,13 +340,111 @@ class LANSessionTests(unittest.TestCase):
     def test_selection_only_sends_start_request_and_denial_reopens(self):
         self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
         self.assertTrue(self.queues[0].request_start('01_karelia'))
+        self.assertFalse(self.queues[0].request_start('01_karelia'))
         self.assertEqual(['01_karelia'], self.client.requests)
         self.assertEqual([], self.battle_runtime.started)
 
         self.emit('start_denied', {'reason': 'host only'})
         self.assertEqual('waiting', self.session.state)
-        self.assertEqual([True, True], self.opens)
+        self.assertEqual([True], self.opens)
         self.assertEqual([], self.battle_runtime.started)
+
+    def test_selection_closes_picker_after_scaleform_event_returns(self):
+        callbacks = {}
+        cancelled = []
+
+        def schedule(delay, function):
+            callback_id = len(callbacks) + 1
+            callbacks[callback_id] = (delay, function)
+            return callback_id
+
+        def cancel(callback_id):
+            cancelled.append(callback_id)
+            callbacks.pop(callback_id, None)
+
+        self.session._callback = schedule
+        self.session._cancel_callback = cancel
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
+
+        self.assertTrue(self.queues[0].request_start('01_karelia'))
+
+        self.assertTrue(self.session._picker_open)
+        self.assertEqual(0, self.queues[0].close_calls)
+        self.assertEqual(1, len(callbacks))
+        callback_id, (delay, close_picker) = next(iter(callbacks.items()))
+        self.assertEqual(0.0, delay)
+
+        callbacks.pop(callback_id)
+        close_picker()
+
+        self.assertFalse(self.session._picker_open)
+        self.assertEqual(1, self.queues[0].close_calls)
+        self.assertIsNone(self.session._picker_close_callback_id)
+        self.assertEqual([], cancelled)
+
+    def test_early_battle_start_finishes_deferred_picker_close_first(self):
+        callbacks = {}
+        cancelled = []
+
+        def schedule(delay, function):
+            callbacks[7] = (delay, function)
+            return 7
+
+        def cancel(callback_id):
+            cancelled.append(callback_id)
+            callbacks.pop(callback_id, None)
+
+        self.session._callback = schedule
+        self.session._cancel_callback = cancel
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
+        self.assertTrue(self.queues[0].request_start('01_karelia'))
+
+        self.emit('battle_start', {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]})
+
+        self.assertEqual([7], cancelled)
+        self.assertEqual({}, callbacks)
+        self.assertFalse(self.session._picker_open)
+        self.assertEqual(1, self.queues[0].close_calls)
+        self.assertEqual(1, len(self.battle_runtime.started))
+        self.assertEqual('battle', self.session.state)
+
+    def test_real_close_notification_cannot_reopen_before_early_start(self):
+        callbacks = {}
+
+        def schedule(delay, function):
+            callbacks[7] = (delay, function)
+            return 7
+
+        self.session._callback = schedule
+        self.session._cancel_callback = lambda callback_id: callbacks.pop(
+            callback_id, None)
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
+        queue = self.queues[0]
+        original_close = queue.close
+
+        def close_with_native_notification():
+            original_close()
+            queue.on_close()
+
+        queue.close = close_with_native_notification
+        self.assertTrue(queue.request_start('01_karelia'))
+
+        self.emit('battle_start', {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]})
+
+        self.assertEqual({}, callbacks)
+        self.assertEqual([True], self.opens)
+        self.assertFalse(self.session._picker_open)
+        self.assertEqual(1, queue.close_calls)
+        self.assertEqual('battle', self.session.state)
 
     def test_stock_picker_close_allows_the_waiting_view_to_reopen(self):
         self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})

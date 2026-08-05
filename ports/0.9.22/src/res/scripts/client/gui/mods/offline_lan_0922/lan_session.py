@@ -75,6 +75,7 @@ class LANSession(object):
         self._queue = None
         self._picker_open = False
         self._picker_callback_id = None
+        self._picker_close_callback_id = None
         self._battle_start_callback_id = None
         self._retry_callback_id = None
         self._retry_token = None
@@ -210,6 +211,30 @@ class LANSession(object):
         if callback_id is not None and callable(self._cancel_callback):
             self._cancel_callback(callback_id)
 
+    def _cancel_picker_close_callback(self):
+        callback_id = self._picker_close_callback_id
+        self._picker_close_callback_id = None
+        if callback_id is not None and callable(self._cancel_callback):
+            self._cancel_callback(callback_id)
+
+    def _close_picker_after_event(self):
+        """Close the Scaleform picker after its current event stack returns."""
+        if self._picker_close_callback_id is not None:
+            return True
+        if not callable(self._callback):
+            # Never fall back to a synchronous native view teardown.  The
+            # battle_start poll event can safely close an otherwise-retained
+            # picker after the Scaleform update callback has returned.
+            return False
+
+        def close_picker():
+            self._picker_close_callback_id = None
+            if not self._stopped:
+                self._close_picker()
+
+        self._picker_close_callback_id = self._callback(0.0, close_picker)
+        return True
+
     def _schedule_picker_when_lobby_ready(self):
         if self._picker_callback_id is not None or not callable(self._callback):
             return False
@@ -255,7 +280,10 @@ class LANSession(object):
     def _defer_battle_until_lobby_ready(self, message):
         self._pending_battle_start = dict(message or {})
         self.state = 'awaiting_lobby_for_battle'
-        self._close_picker()
+        self._cancel_picker_close_callback()
+        self._cancel_picker_callback()
+        if self._picker_open:
+            self._close_picker()
         self._schedule_battle_when_lobby_ready()
         return False
 
@@ -308,26 +336,32 @@ class LANSession(object):
     def request_start(self, map_name, endpoint=None):
         if self._stopped:
             return False
+        # The native button can deliver more than one event before the
+        # next-tick picker close runs.  One accepted selection owns the
+        # transition until the server accepts or denies it.
+        if self._start_requested:
+            return False
         if endpoint is not None and not self._save_endpoint(endpoint):
+            return False
+        if self._pending_map is not None:
             return False
         if self.client is None:
             return False
-        if (self.state not in ('waiting', 'connecting', 'retrying') and
-                not self._start_requested):
+        if self.state not in ('waiting', 'connecting', 'retrying'):
             return False
         if not bool(getattr(self.client, 'ready', False)):
             self._pending_map = map_name
             self._status_notifier(
                 'Connecting to %s. The selected map will start automatically.' %
                 self._endpoint_value())
-            self._close_picker()
+            self._close_picker_after_event()
             return True
         accepted = bool(self.client.request_start(map_name))
         if accepted:
             self._start_requested = True
             self._pending_map = None
             self.state = 'awaiting_battle_start'
-            self._close_picker()
+            self._close_picker_after_event()
         return accepted
 
     def _stop_active_round(self):
@@ -448,6 +482,14 @@ class LANSession(object):
                 except Exception:
                     pass
                 raise
+        # LAN messages are dispatched from a BigWorld poll callback, after the
+        # Scaleform method that sent the request has returned.  If the next-tick
+        # picker close has not run yet, it is safe to finish it on this stack
+        # before any native Account/Avatar transition begins.
+        self._cancel_picker_close_callback()
+        self._cancel_picker_callback()
+        if self._picker_open:
+            self._close_picker()
         if not self._lobby_ready():
             return self._defer_battle_until_lobby_ready(message)
         self._clear_pending_battle_start()
@@ -473,7 +515,6 @@ class LANSession(object):
             self._start_requested = False
             self._pending_map = None
             self.state = 'battle'
-            self._close_picker()
         return started
 
     def _on_local_battle_leave(self):
@@ -564,6 +605,10 @@ class LANSession(object):
         errors = []
         try:
             self._cancel_retry_callback()
+        except Exception as error:
+            errors.append(error)
+        try:
+            self._cancel_picker_close_callback()
         except Exception as error:
             errors.append(error)
         try:

@@ -185,6 +185,7 @@ class _Compatibility(object):
     def __init__(self):
         self.bridge = None
         self.configured = []
+        self.hangar_space = None
 
     def configure_battle(self, gui_type, bonus_type):
         self.configured.append((gui_type, bonus_type))
@@ -197,6 +198,9 @@ class _Compatibility(object):
 
     def restore_lobby_account(self):
         self.account_restored = True
+        if self.hangar_space is not None:
+            self.hangar_space.inited = True
+            self.hangar_space.spaceInited = True
         return object()
 
 
@@ -253,6 +257,18 @@ class _OfflineMap(object):
         self.active = False
         if self.bigworld is not None:
             self.bigworld.clearEntitiesAndSpaces()
+
+
+class _HangarSpace(object):
+    def __init__(self, operations):
+        self.inited = True
+        self.spaceInited = True
+        self.operations = operations
+
+    def destroy(self):
+        self.operations.append(('hangar_destroy',))
+        self.inited = False
+        self.spaceInited = False
 
 
 class _BigWorld(object):
@@ -347,6 +363,8 @@ def _runtime():
     avatar = _Avatar()
     compatibility = _Compatibility()
     bigworld = _BigWorld(avatar, compatibility)
+    hangar_space = _HangarSpace(bigworld.operations)
+    compatibility.hangar_space = hangar_space
     _AppLoader.showBattlePage = _APP_LOADER_SHOW_BATTLE_PAGE
     _AppLoader.showLobby = _APP_LOADER_SHOW_LOBBY
     app_loader = _AppLoader()
@@ -374,12 +392,59 @@ def _runtime():
         app_loader=app_loader,
         compatibility=compatibility, constants=constants,
         encode_gun_angles=lambda *unused: 0,
+        game=types.SimpleNamespace(abort=mock.Mock()),
+        hangar_space=types.SimpleNamespace(
+            g_hangarSpace=hangar_space),
         math=types.SimpleNamespace(Vector3=_Vector),
         offline_map_creator=_OfflineMap(bigworld, app_loader),
         vehicles=types.SimpleNamespace(VehicleDescr=_VehicleDescr))
 
 
 class BattleRuntimeContractTests(unittest.TestCase):
+    def test_game_abort_is_rejected_and_original_is_restored(self):
+        runtime = _runtime()
+        original_abort = runtime.game.abort
+        normal_create = runtime.offline_map_creator.create
+
+        def create_then_abort(unused_map_name):
+            runtime.game.abort()
+
+        runtime.offline_map_creator.create = create_then_abort
+        battle = BattleRuntime(runtime)
+
+        self.assertFalse(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {'round_id': 3}, _Client()))
+
+        self.assertIs(original_abort, runtime.game.abort)
+        original_abort.assert_not_called()
+        self.assertEqual('failed', battle.state)
+        self.assertIn('game.abort', battle.error)
+
+        runtime.offline_map_creator.create = normal_create
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {'round_id': 4}, _Client()))
+
+    def test_game_abort_patch_does_not_overwrite_a_newer_patch(self):
+        runtime = _runtime()
+
+        def newer_abort():
+            return 'newer'
+
+        def replace_during_create(unused_map_name):
+            runtime.game.abort = newer_abort
+
+        runtime.offline_map_creator.create = replace_during_create
+        battle = BattleRuntime(runtime)
+
+        self.assertFalse(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {'round_id': 3}, _Client()))
+
+        self.assertIs(newer_abort, runtime.game.abort)
+        self.assertEqual('newer', runtime.game.abort())
+
     def test_lobby_is_retired_before_native_map_without_viewer_camera(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -396,7 +461,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'name': 'Player'}, start, client))
 
         self.assertEqual(
-            [('clear_entities_spaces',), ('map_create', '01_karelia'),
+            [('hangar_destroy',), ('clear_entities_spaces',),
+             ('map_create', '01_karelia'),
              ('watcher', 'Visibility/GUI', True)],
             runtime.bigworld.operations)
         self.assertEqual(0, runtime.offline_map_creator.viewer_camera_calls)
@@ -407,6 +473,98 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         runtime.app_loader.showBattlePage()
         type(runtime.app_loader).battle_page_calls.assert_called_once_with()
+
+    def test_incomplete_hangar_fails_before_native_clear(self):
+        runtime = _runtime()
+        hangar = runtime.hangar_space.g_hangarSpace
+        hangar.spaceInited = False
+        runtime.offline_map_creator.create = mock.Mock()
+        battle = BattleRuntime(runtime)
+
+        self.assertFalse(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {}, _Client()))
+
+        self.assertEqual([], runtime.bigworld.operations)
+        runtime.offline_map_creator.create.assert_not_called()
+        self.assertEqual('failed', battle.state)
+        self.assertIn('hangar space is not ready', battle.error)
+
+    def test_incomplete_hangar_destroy_fails_before_native_clear(self):
+        runtime = _runtime()
+        hangar = runtime.hangar_space.g_hangarSpace
+
+        def incomplete_destroy():
+            runtime.bigworld.operations.append(('hangar_destroy',))
+            hangar.inited = False
+
+        hangar.destroy = incomplete_destroy
+        runtime.offline_map_creator.create = mock.Mock()
+        battle = BattleRuntime(runtime)
+
+        self.assertFalse(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {}, _Client()))
+
+        self.assertEqual(
+            [('hangar_destroy',), ('clear_entities_spaces',)],
+            runtime.bigworld.operations)
+        runtime.offline_map_creator.create.assert_not_called()
+        self.assertEqual('failed', battle.state)
+        self.assertIn('hangar space destroy did not finish', battle.error)
+
+    def test_failed_lobby_clear_uses_second_boundary_before_restore(self):
+        runtime = _runtime()
+
+        def failing_clear():
+            runtime.bigworld.operations.append(('clear_failed',))
+            raise RuntimeError('first clear failed')
+
+        def fallback_clear():
+            runtime.bigworld.operations.append(('clear_all_spaces',))
+            runtime.bigworld.avatar = None
+
+        runtime.bigworld.clearEntitiesAndSpaces = failing_clear
+        runtime.bigworld.clearAllSpaces = fallback_clear
+        battle = BattleRuntime(runtime)
+
+        self.assertFalse(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {}, _Client()))
+
+        self.assertEqual([
+            ('hangar_destroy',), ('clear_failed',),
+            ('clear_failed',), ('clear_all_spaces',),
+        ], runtime.bigworld.operations)
+        self.assertTrue(runtime.compatibility.account_restored)
+        self.assertEqual('failed', battle.state)
+        self.assertIn('first clear failed', battle.error)
+
+    def test_retained_lobby_account_is_forced_out_before_restore(self):
+        runtime = _runtime()
+
+        def retaining_clear():
+            runtime.bigworld.operations.append(('clear_retained',))
+
+        def fallback_clear():
+            runtime.bigworld.operations.append(('clear_all_spaces',))
+            runtime.bigworld.avatar = None
+
+        runtime.bigworld.clearEntitiesAndSpaces = retaining_clear
+        runtime.bigworld.clearAllSpaces = fallback_clear
+        battle = BattleRuntime(runtime)
+
+        self.assertFalse(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {}, _Client()))
+
+        self.assertEqual([
+            ('hangar_destroy',), ('clear_retained',),
+            ('clear_retained',), ('clear_all_spaces',),
+        ], runtime.bigworld.operations)
+        self.assertTrue(runtime.compatibility.account_restored)
+        self.assertEqual('failed', battle.state)
+        self.assertIn('lobby Account survived', battle.error)
 
     def test_missing_viewer_camera_boundary_fails_closed_and_restores_lobby(self):
         runtime = _runtime()

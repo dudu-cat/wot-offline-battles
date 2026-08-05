@@ -9,7 +9,7 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.3` replaces the old compatibility slice. It is a server-backed
+Version `0.3.4` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, tactical bots and repeatable rounds. The removed `vertical_slice.py`
@@ -128,10 +128,10 @@ OFFLINE_LAN_RELEASE_HOST=192.168.1.164 ./build_for_client.sh \
 
 The script uses local CPython 2.7 when available and otherwise the pinned
 Docker build. Before compiling, it reads code objects directly from the pinned
-client's `scripts.pkg`, rejects any mismatch in the 120 stock method signatures,
-18 direct-consumer literals and 24 lifecycle code names used by this port,
-verifies 11 exact `AccountCommands` constants, runs the complete raw `serverSettings`
-subscript inventory against the local producers, and checks 14 ordered
+client's `scripts.pkg`, rejects mismatches in the stock method signatures,
+direct-consumer literals and lifecycle code paths used by this port, verifies
+the exact `AccountCommands` constants, runs the complete raw `serverSettings`
+subscript inventory against the local producers, and checks the ordered
 lifecycle contracts plus the complete Account-helper binding inventory.
 Signature checks include
 `*args`/`**kwargs` flags at the stock picker boundary, rather than comparing
@@ -151,8 +151,8 @@ properties and mailboxes at runtime.
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.3.wotmod
-org.peng.offline_lan_0922_0.3.3.wotmod.sha256
+org.peng.offline_lan_0922_0.3.4.wotmod
+org.peng.offline_lan_0922_0.3.4.wotmod.sha256
 WoT-0.9.22-LAN-Client-<package hash>/
 WoT-0.9.22-LAN-Client-<package hash>.zip
 ```

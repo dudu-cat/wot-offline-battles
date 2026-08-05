@@ -186,7 +186,7 @@ class QueueUITests(unittest.TestCase):
             'isOfflineLanPicker': True,
         }, context)
 
-    def test_offline_picker_requests_allowed_map_without_stock_event(self):
+    def test_offline_picker_returns_before_owner_closes_native_view(self):
         self.adapter.install()
         window = _Window({'isOfflineLanPicker': True})
 
@@ -196,9 +196,14 @@ class QueueUITests(unittest.TestCase):
         self.assertEqual(
             'LAN SERVER: 10.0.0.5:28782',
             window.getInfo()['description'])
-        self.assertTrue(window.updateTrainingRoom(3, 15, False, 'ignored'))
+        self.assertIsNone(
+            window.updateTrainingRoom(3, 15, False, 'ignored'))
         self.assertEqual([('05_prohorovka', 'ignored')], self.started)
         self.assertEqual([], window.calls)
+        self.assertFalse(window.closed)
+        self.assertTrue(getattr(window, self.queue_ui._PICKER_MARKER))
+
+        self.assertTrue(self.adapter.close())
         self.assertTrue(window.closed)
         self.assertFalse(getattr(window, self.queue_ui._PICKER_MARKER))
 
@@ -224,25 +229,6 @@ class QueueUITests(unittest.TestCase):
         self.assertFalse(self.adapter.close())
         self.assertEqual(2, window.close_calls)
         self.assertEqual([True], self.closed)
-
-    def test_synchronous_session_close_does_not_destroy_window_twice(self):
-        adapter = None
-
-        def request_start(map_name, endpoint):
-            self.started.append((map_name, endpoint))
-            adapter.close()
-            return True
-
-        adapter = self.queue_ui.QueueUI(
-            request_start, lambda: ('05_prohorovka',),
-            runtime=(self.arena_type, _Window))
-        self.adapter = adapter
-        adapter.install()
-        window = _Window({'isOfflineLanPicker': True})
-
-        self.assertTrue(window.updateTrainingRoom(3, 15, False, 'ignored'))
-        self.assertEqual([('05_prohorovka', 'ignored')], self.started)
-        self.assertEqual(1, window.close_calls)
 
     def test_offline_picker_rejects_unavailable_map(self):
         self.adapter.install()

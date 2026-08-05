@@ -63,10 +63,12 @@ def _load_runtime():
     import BigWorld
     import Math
     import constants
+    import game
     from OfflineMapCreator import g_offlineMapCreator
     from gun_rotation_shared import encodeGunAngles
     from gui.app_loader import g_appLoader
     from gui.mods.offline_lan_0922.compat import g_compatibility
+    from gui.shared.utils import HangarSpace
     from items import vehicles
 
     class Runtime(object):
@@ -80,6 +82,8 @@ def _load_runtime():
     runtime.compatibility = g_compatibility
     runtime.constants = constants
     runtime.encode_gun_angles = encodeGunAngles
+    runtime.game = game
+    runtime.hangar_space = HangarSpace
     runtime.math = Math
     runtime.offline_map_creator = g_offlineMapCreator
     runtime.vehicles = vehicles
@@ -155,6 +159,7 @@ class BattleRuntime(object):
         self._ammo_callback_id = None
         self._deadline = 0.0
         self._map_create_attempted = False
+        self._lobby_retire_started = False
         self._avatar = None
         self._binding = None
         self._server = None
@@ -199,6 +204,7 @@ class BattleRuntime(object):
         self._battle_result = self._start_message.get('battle_result')
         self._round_finished_notified = False
         self._on_local_leave = on_local_leave
+        self._lobby_retire_started = False
         self._generation += 1
         self._deadline = self._clock() + float(
             self._config.get('startupTimeoutSeconds', 30.0))
@@ -257,6 +263,28 @@ class BattleRuntime(object):
         if not callable(clear):
             raise RuntimeError(
                 'BigWorld.clearEntitiesAndSpaces is unavailable')
+        hangar_space = getattr(
+            self._runtime.hangar_space, 'g_hangarSpace', None)
+        if hangar_space is None:
+            raise RuntimeError('hangar space owner is unavailable')
+        if not (bool(getattr(hangar_space, 'inited', False)) and
+                bool(getattr(hangar_space, 'spaceInited', False))):
+            raise RuntimeError(
+                'hangar space is not ready for battle transition')
+        destroy_hangar = getattr(hangar_space, 'destroy', None)
+        if not callable(destroy_hangar):
+            raise RuntimeError('hangar space destroy boundary is unavailable')
+
+        # ClientHangarSpace.__destroy owns its vehicle, geometry mapping,
+        # callbacks, camera and input handlers.  Retire that graph before the
+        # engine-wide clear; reversing the order can make its later Account or
+        # Avatar lifecycle callback re-enter already-cleared native objects.
+        self._lobby_retire_started = True
+        destroy_hangar()
+        if (bool(getattr(hangar_space, 'inited', False)) or
+                bool(getattr(hangar_space, 'spaceInited', False))):
+            raise RuntimeError('hangar space destroy did not finish')
+
         # Keep Account.g_accountRepository alive deliberately.  Exact #1513
         # PlayerAvatar.__init__ reuses its syncData, intUserSettings and
         # prebattleInvitations; the public observer creates that repository
@@ -306,6 +334,11 @@ class BattleRuntime(object):
         original_class_show_page = loader_dict.get(page_name)
 
         bigworld = self._runtime.bigworld
+        game_module = self._runtime.game
+
+        original_abort = getattr(game_module, 'abort', None)
+        if not callable(original_abort):
+            raise RuntimeError('game.abort boundary is unavailable')
 
         def defer_battle_page(unused_app_loader):
             return None
@@ -315,8 +348,13 @@ class BattleRuntime(object):
             if callable(set_watcher):
                 set_watcher('Visibility/GUI', True)
 
+        def reject_game_abort(*unused_args, **unused_kwargs):
+            raise RuntimeError(
+                'native Avatar requested game.abort during battle start')
+
         setattr(loader_type, page_name, defer_battle_page)
         try:
+            game_module.abort = reject_game_abort
             setattr(creator, setup_name, finish_native_setup)
             try:
                 creator.create(map_name)
@@ -333,6 +371,8 @@ class BattleRuntime(object):
                         except AttributeError:
                             pass
         finally:
+            if getattr(game_module, 'abort', None) is reject_game_abort:
+                game_module.abort = original_abort
             current_show_page = getattr(
                 loader_type, '__dict__', {}).get(page_name)
             if current_show_page is defer_battle_page:
@@ -1266,47 +1306,32 @@ class BattleRuntime(object):
                 self._runtime.offline_map_creator.destroy()
             except Exception as error:
                 cleanup_error = error
-            try:
-                player = self._runtime.bigworld.player()
-            except ReferenceError:
-                player = None
-            except Exception as error:
-                player = None
-                if cleanup_error is None:
-                    cleanup_error = error
+            player, player_error = self._read_engine_player()
+            if player_error is not None and cleanup_error is None:
+                cleanup_error = player_error
             if player is not None:
                 # Exact OfflineMapCreator.destroy() catches its own teardown
                 # exception and calls cancel(), losing the ids while a zombie
                 # Avatar may remain.  Retry the engine-owned clear directly
                 # and verify the ownership boundary before restoring Account.
-                for name in ('clearEntitiesAndSpaces', 'clearAllSpaces'):
-                    clear = getattr(self._runtime.bigworld, name, None)
-                    if not callable(clear):
-                        continue
-                    try:
-                        clear()
-                    except Exception as error:
-                        if cleanup_error is None:
-                            cleanup_error = error
-                    try:
-                        player = self._runtime.bigworld.player()
-                    except ReferenceError:
-                        player = None
-                    except Exception as error:
-                        if cleanup_error is None:
-                            cleanup_error = error
-                        player = None
-                    if player is None:
-                        break
-                if player is not None and cleanup_error is None:
-                    cleanup_error = RuntimeError(
-                        'stock map teardown retained the Avatar')
+                clear_error = self._force_clear_engine_player(
+                    'stock map teardown retained the Avatar')
+                if clear_error is not None and cleanup_error is None:
+                    cleanup_error = clear_error
+        elif self._lobby_retire_started:
+            # HangarSpace.destroy() is itself a destructive boundary.  A
+            # later failure in the engine-wide clear must not leave the old
+            # Account alive: restore_lobby_account() would treat it as valid
+            # and skip rebuilding the now-destroyed HangarSpace.
+            cleanup_error = self._force_clear_engine_player(
+                'lobby teardown retained the Account')
         try:
             self._runtime.compatibility.deactivate_map()
         except Exception as error:
             if cleanup_error is None:
                 cleanup_error = error
         self._map_create_attempted = False
+        self._lobby_retire_started = False
         self._avatar = None
         self._binding = None
         self._server = None
@@ -1327,6 +1352,41 @@ class BattleRuntime(object):
         self._on_local_leave = None
         if cleanup_error is not None:
             raise cleanup_error
+
+    def _read_engine_player(self):
+        try:
+            return self._runtime.bigworld.player(), None
+        except ReferenceError:
+            return None, None
+        except Exception as error:
+            return None, error
+
+    def _force_clear_engine_player(self, retained_message):
+        first_error = None
+        found_clear = False
+        player = None
+        for name in ('clearEntitiesAndSpaces', 'clearAllSpaces'):
+            clear = getattr(self._runtime.bigworld, name, None)
+            if not callable(clear):
+                continue
+            found_clear = True
+            succeeded = False
+            try:
+                clear()
+                succeeded = True
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+            player, player_error = self._read_engine_player()
+            if player_error is not None and first_error is None:
+                first_error = player_error
+            if succeeded and player_error is None and player is None:
+                return None
+        if not found_clear:
+            return RuntimeError('no engine entity-clear boundary is available')
+        if player is not None:
+            return RuntimeError(retained_message)
+        return first_error
 
     def _fail(self, error):
         self.error = str(error)
