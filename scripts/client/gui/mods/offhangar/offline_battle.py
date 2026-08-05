@@ -6338,7 +6338,18 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									LOG_DEBUG('OfflineBattle: spawn corrected to line-up slot:', _sx, _gy, _sz)
 					except Exception as _sce:
 						LOG_DEBUG('Spawn correction error:', str(_sce))
-				
+
+				# Lakeville-only native-navigation experiment. It is a one-shot loader/API
+				# diagnostic and does not feed any result into bot movement.
+				try:
+					from gui.mods.offhangar.native_navmesh_probe import maybe_run as _run_native_navmesh_probe
+					_run_native_navmesh_probe(
+						player, globals().get('g_offh_battle_mapname', ''),
+						Math.Vector3(veh_pos[0], veh_pos[1], veh_pos[2]),
+						_offh_my_gen[0])
+				except Exception as _npe:
+					LOG_DEBUG('Native navmesh probe dispatch error:', str(_npe))
+
 				import debug_utils
 				if not hasattr(player, '_debug_dump_done_6'):
 					player._debug_dump_done_6 = True

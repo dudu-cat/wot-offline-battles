@@ -1,0 +1,58 @@
+NATIVE NAVMESH EXPERIMENT - LAKEVILLE ONLY
+==========================================
+
+Purpose
+-------
+This test answers one question only: can the original World of Tanks 0.8.2
+client load a worldNavmesh supplied through res_mods and execute
+BigWorld.navigatePathPoints()?
+
+The synthetic mesh covers only the two Lakeville spawn areas. Bot navigation
+is unchanged in this build. Do not use bot driving quality to judge this test.
+
+
+Install
+-------
+Install this package exactly like the preceding test build:
+
+1. Close the game.
+2. Delete or move aside the old res_mods\0.8.2 folder.
+3. Copy this package's complete 0.8.2 folder into the game's res_mods folder.
+4. Start the same LAN server if you want to test with two clients.
+
+Both clients must install this build because each client loads its own map
+resources locally.
+
+
+Test
+----
+1. Select 07_lakeville in the LAN waiting room.
+2. Start the battle and wait until the countdown ends.
+3. After the player tank is placed on the ground, look for one lower-right
+   system message:
+
+       Native navmesh loaded: N path point(s).
+
+   That is a PASS.
+
+4. A red message beginning with this text is a FAIL and includes the native
+   engine error:
+
+       Native navmesh probe failed:
+
+The same result is written to python.log as exactly one of:
+
+    NAVMESH_PROBE PASS ...
+    NAVMESH_PROBE FAIL ...
+
+If no message appears, send python.log. The dispatch is also guarded and logs
+"Native navmesh probe dispatch error" if the diagnostic module itself fails.
+
+
+Important limitation
+--------------------
+This is not a complete Lakeville navmesh. The injected polygons deliberately
+cover only the spawn chunks and use a broad synthetic height range. They are
+not connected to bot movement and are not intended for driving. A successful
+result proves the loading/API path so that the next build can replace the
+current grid A* with fully baked map meshes.
