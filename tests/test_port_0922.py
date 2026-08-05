@@ -684,6 +684,9 @@ class OfflineCompatibilityTests(unittest.TestCase):
                 operations.append(('original_avatar_become_player',))
                 self.filter = bigworld.AvatarFilter()
 
+        class Vehicle(object):
+            pass
+
         account_module = types.SimpleNamespace(
             PlayerAccount=PlayerAccount,
             _CLIENT_SERVER_VERSION=('requiredVersion_92200', '0.9.22'))
@@ -701,13 +704,20 @@ class OfflineCompatibilityTests(unittest.TestCase):
             login_status=statuses,
             offline_map_creator=_OfflineMapCreator(operations),
             player_events=player_events,
-            predefined_hosts=_Hosts(existing_hosts, host_failure))
+            predefined_hosts=_Hosts(existing_hosts, host_failure),
+            vehicle_module=types.SimpleNamespace(Vehicle=Vehicle))
         return runtime, operations
 
     def test_connects_account_in_native_event_order_and_disconnects_once(self):
         compatibility_module = _load_port_source('compat')
         runtime, operations = self._runtime()
         original_init = runtime.account_module.PlayerAccount.__dict__['__init__']
+        original_account_getattribute = \
+            runtime.account_module.PlayerAccount.__getattribute__
+        original_avatar_getattribute = \
+            runtime.avatar_module.PlayerAvatar.__getattribute__
+        original_vehicle_getattribute = \
+            runtime.vehicle_module.Vehicle.__getattribute__
         original_connect = runtime.bigworld.connect
         original_disconnect = runtime.bigworld.disconnect
         original_clear_all_spaces = runtime.bigworld.clearAllSpaces
@@ -772,9 +782,95 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertIs(
             original_init,
             runtime.account_module.PlayerAccount.__dict__['__init__'])
+        self.assertIs(
+            original_account_getattribute,
+            runtime.account_module.PlayerAccount.__getattribute__)
+        self.assertIs(
+            original_avatar_getattribute,
+            runtime.avatar_module.PlayerAvatar.__getattribute__)
+        self.assertIs(
+            original_vehicle_getattribute,
+            runtime.vehicle_module.Vehicle.__getattribute__)
         self.assertEqual(original_connect, runtime.bigworld.connect)
         self.assertEqual(original_disconnect, runtime.bigworld.disconnect)
         self.assertEqual([], runtime.predefined_hosts._hosts)
+
+    def test_manual_offline_host_login_prepares_account_properties(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, _ = self._runtime()
+        account_type = runtime.account_module.PlayerAccount
+        property_name, property_value = \
+            runtime.account_module._CLIENT_SERVER_VERSION
+        # Exact #1513 supplies entity-definition properties before Python
+        # __init__, but does not supply Account.name while the offline map is
+        # inactive.  This mirrors the second login after accepting the EULA.
+        setattr(account_type, property_name, property_value)
+        account_type.initialServerSettings = dict(
+            compatibility_module._SERVER_SETTINGS)
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+
+        runtime.connection_manager.initiateConnection(
+            {}, '', compatibility_module.OFFLINE_SERVER_ADDRESS)
+
+        account = runtime.bigworld.player()
+        self.assertTrue(compatibility.is_ready())
+        self.assertEqual('offline_account', account.name)
+        self.assertTrue(account.isOffline)
+        self.assertIs(account.fakeServer, account.base)
+        self.assertFalse(compatibility._connecting)
+        compatibility.fini()
+
+    def test_avatar_properties_and_mailboxes_exist_during_native_init(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, _ = self._runtime()
+        observed = {}
+
+        def strict_avatar_init(avatar):
+            observed['name'] = avatar.name
+            observed['vehicle_id'] = avatar.playerVehicleID
+            observed['mailboxes'] = (
+                avatar.base, avatar.cell, avatar.server, avatar.bwProto)
+
+        runtime.avatar_module.PlayerAvatar.__init__ = strict_avatar_init
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.connect(show_lobby=True)
+        compatibility.configure_battle()
+
+        avatar = runtime.avatar_module.PlayerAvatar()
+
+        self.assertEqual('OfflinePlayer', observed['name'])
+        self.assertEqual(0, observed['vehicle_id'])
+        self.assertEqual(
+            (avatar.fakeServer,) * 4, observed['mailboxes'])
+        compatibility.fini()
+
+    def test_vehicle_cell_uses_only_vehicle_or_avatar_mailbox(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, _ = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.connect(show_lobby=True)
+        account = runtime.bigworld.player()
+        compatibility.configure_battle()
+        vehicle = runtime.vehicle_module.Vehicle()
+
+        explicit_cell = object()
+        vehicle.fakeCell = explicit_cell
+        self.assertIs(explicit_cell, vehicle.cell)
+        del vehicle.fakeCell
+
+        runtime.bigworld._player = account
+        with self.assertRaises(AttributeError):
+            unused = vehicle.cell
+
+        avatar = runtime.avatar_module.PlayerAvatar()
+        runtime.bigworld._player = avatar
+        self.assertIs(avatar.fakeServer, vehicle.cell)
+
+        compatibility.deactivate_map()
+        with self.assertRaises(AttributeError):
+            unused = vehicle.cell
+        compatibility.fini()
 
     def test_delegates_real_server_and_preserves_existing_offline_host(self):
         compatibility_module = _load_port_source('compat')
@@ -841,6 +937,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
             1, runtime.bigworld.operations.count(('disconnected',)))
         self.assertEqual(
             1, runtime.bigworld.operations.count(('player_disconnected',)))
+        self.assertFalse(compatibility._connecting)
         runtime.bigworld.clearAllSpaces()
         self.assertEqual(
             2, runtime.bigworld.operations.count(('clear_all_spaces',)))

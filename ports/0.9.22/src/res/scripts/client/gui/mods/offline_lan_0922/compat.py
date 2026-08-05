@@ -354,7 +354,7 @@ class OfflineCompatibility(object):
                         vehicle, 'fakeCell')
                 except AttributeError:
                     player = runtime.bigworld.player()
-                    if player is not None:
+                    if isinstance(player, avatar_type):
                         try:
                             return compatibility._original_avatar_getattribute(
                                 player, 'fakeServer')
@@ -603,13 +603,22 @@ class OfflineCompatibility(object):
 
     def _create_account_player(self):
         runtime = self._runtime
-        space_id = runtime.bigworld.createSpace()
-        account_id = runtime.bigworld.createEntity(
-            'Account', space_id, 0, (0.0, 0.0, 0.0),
-            (0.0, 0.0, 0.0), {})
-        account = runtime.bigworld.entities[account_id]
-        runtime.bigworld.player(account)
-        return account
+        was_connecting = self._connecting
+        # The login screen can call the patched low-level BigWorld.connect
+        # directly after the first-run EULA.  Keep every client-only Account
+        # construction inside the same property-injection scope, rather than
+        # relying on connect() having been entered through our public helper.
+        self._connecting = True
+        try:
+            space_id = runtime.bigworld.createSpace()
+            account_id = runtime.bigworld.createEntity(
+                'Account', space_id, 0, (0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0), {})
+            account = runtime.bigworld.entities[account_id]
+            runtime.bigworld.player(account)
+            return account
+        finally:
+            self._connecting = was_connecting
 
     def restore_lobby_account(self):
         """Recreate the fake Account after #1513 clears battle entities.
