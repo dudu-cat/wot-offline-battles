@@ -9,7 +9,7 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.1` replaces the old compatibility slice. It is a server-backed
+Version `0.3.2` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, tactical bots and repeatable rounds. The removed `vertical_slice.py`
@@ -20,8 +20,12 @@ runtime is not packaged as a fallback.
 1. Start `lan_battle_server.py`. A single connected client is supported.
 2. Start the frozen client. After the native intro/login state finishes its
    destructive cleanup, the mod creates its local Account and enters Lobby.
-3. The stock training settings window opens with the server's map list.
-4. Choose a map and activate the window's normal primary button.
+3. The stock training settings window opens immediately. Its Description field
+   is the editable `LAN SERVER: host:port` endpoint, and its map list contains
+   locally installed standard maps while the connection is pending.
+4. Choose a map and activate the window's normal primary button. The endpoint
+   is saved, connection failures remain visible and retryable, and the server's
+   map pool is checked before the start request is sent.
 5. The server fills vacant slots with bots and starts the same round for every
    waiting client.
 6. A team-elimination result freezes the round. After three seconds the server
@@ -71,7 +75,7 @@ may reject the newer bot manifest without a visible protocol-version error.
 
 ## Configuration
 
-On first load the client writes:
+The copy-ready overlay installs, and the client subsequently updates:
 
 ```text
 mods/configs/offline_lan_0922/config.json
@@ -92,7 +96,8 @@ The supported fields are:
 }
 ```
 
-The server supplies the selected map and spawn. The release does not write a
+The same endpoint is editable in the native training settings window. The
+server supplies the selected map and spawn. The release does not write a
 capability trace or vertical-slice status file; normal failures are reported in
 `python.log` without verbose per-frame logging.
 
@@ -106,9 +111,17 @@ CPython 2.7. Verify the exact client and build the package together:
   ~/Downloads/World_of_Tanks_0.09.22.00.01_CH_1513_HD
 ```
 
+To produce a copy-ready overlay for a server on another machine, pin its LAN
+address at build time:
+
+```bash
+OFFLINE_LAN_RELEASE_HOST=192.168.1.164 ./build_for_client.sh \
+  ~/Downloads/World_of_Tanks_0.09.22.00.01_CH_1513_HD
+```
+
 The script uses local CPython 2.7 when available and otherwise the pinned
 Docker build. Before compiling, it reads code objects directly from the pinned
-client's `scripts.pkg`, rejects any mismatch in the 92 stock method signatures,
+client's `scripts.pkg`, rejects any mismatch in the 118 stock method signatures,
 18 direct-consumer literals and 20 lifecycle code names used by this port,
 verifies 11 exact `AccountCommands` constants, runs the complete raw `serverSettings`
 subscript inventory against the local producers, and checks 14 ordered
@@ -131,8 +144,8 @@ properties and mailboxes at runtime.
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.1.wotmod
-org.peng.offline_lan_0922_0.3.1.wotmod.sha256
+org.peng.offline_lan_0922_0.3.2.wotmod
+org.peng.offline_lan_0922_0.3.2.wotmod.sha256
 WoT-0.9.22-LAN-Client-<package hash>/
 WoT-0.9.22-LAN-Client-<package hash>.zip
 ```

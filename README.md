@@ -6,8 +6,9 @@ offline/LAN battles - World of Tanks 0.8.2 and 0.9.22.0.1
 The `ports/0.9.22` release targets the frozen Chinese HD client. It is a
 separate CPython 2.7 `.wotmod`, not a copy of the 0.8.2 scripts. Start the
 Python 3 LAN server even for a one-player battle, then use the stock training
-settings window to choose a standard map and start. There is no F12 or `0` key
-workflow.
+settings window to edit `LAN SERVER: host:port`, choose a standard map and
+start. The window opens before the connection succeeds and owns the mouse
+through the native Scaleform UI. There is no F12 or `0` key workflow.
 
 The 0.9.22 runtime uses native map, Avatar, Vehicle and HUD objects, fills each
 team to 15 vehicles, and supports movement, aiming, firing, damage, tactical

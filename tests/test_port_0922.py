@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import os
 from pathlib import Path
 import gc
 import struct
@@ -113,7 +115,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.1</version></root>')
+            '<version>0.3.2</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -228,6 +230,31 @@ class PortSourceTests(unittest.TestCase):
             self.assertFalse((root / 'package' / 'stale.pyc').exists())
             self.assertTrue((root / 'package' / 'keep.py').exists())
 
+    def test_copy_ready_overlay_contains_pinned_lan_endpoint(self):
+        packager_path = PORT_ROOT / 'build_wotmod.py'
+        spec = importlib.util.spec_from_file_location(
+            'build_wotmod_overlay_test', packager_path)
+        packager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packager)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / 'mod.wotmod'
+            checksum = root / 'mod.wotmod.sha256'
+            package.write_bytes(b'mod')
+            checksum.write_text('checksum\n', encoding='ascii')
+            with mock.patch.dict(os.environ, {
+                    'OFFLINE_LAN_RELEASE_HOST': '192.168.1.164',
+                    'OFFLINE_LAN_RELEASE_PORT': '28782'}):
+                overlay, archive = packager._write_client_overlay(
+                    str(root), str(package), str(checksum), 'a' * 64)
+
+            config_path = (Path(overlay) / 'mods' / 'configs' /
+                           'offline_lan_0922' / 'config.json')
+            config = json.loads(config_path.read_text(encoding='utf-8'))
+            self.assertEqual('192.168.1.164', config['host'])
+            self.assertEqual(28782, config['port'])
+            self.assertTrue(Path(archive).is_file())
+
 class PortConfigTests(unittest.TestCase):
     def test_writes_default_and_reads_override(self):
         config_module = _load_port_source('config')
@@ -243,6 +270,22 @@ class PortConfigTests(unittest.TestCase):
             config = config_module.load(path)
             self.assertFalse(config['enabled'])
             self.assertEqual('192.168.1.20', config['host'])
+
+    def test_native_picker_endpoint_round_trip_and_validation(self):
+        config_module = _load_port_source('config')
+
+        value = config_module.format_endpoint('192.168.1.164', 28782)
+        self.assertEqual('LAN SERVER: 192.168.1.164:28782', value)
+        self.assertEqual(
+            ('192.168.1.164', 28782),
+            config_module.parse_endpoint(value))
+        self.assertEqual(
+            ('wot-host.local', 28782),
+            config_module.parse_endpoint('wot-host.local'))
+        for invalid in ('', 'host:0', 'host:65536', 'bad host:28782',
+                        'http://host:28782'):
+            with self.assertRaises(ValueError, msg=invalid):
+                config_module.parse_endpoint(invalid)
 
 
 class _Vector3(object):
@@ -1636,7 +1679,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.1'
+        package.PORT_VERSION = '0.3.2'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []

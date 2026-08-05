@@ -302,7 +302,10 @@ def _wait_for_lobby():
                 raise RuntimeError('LAN session did not start')
             _remove_lobby_listener()
             sys.stdout.write(
-                '[Offline LAN 0.9.22] lobby and LAN session ready\n')
+                '[Offline LAN 0.9.22] lobby ready; LAN settings opened for '
+                '%s:%s\n' % (
+                    _config.get('host', '127.0.0.1'),
+                    _config.get('port', 28782)))
             return
         # EULA and other first-run screens require user interaction and must
         # not consume the hangar-startup timeout.  The deadline begins when

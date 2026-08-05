@@ -203,9 +203,14 @@ EXPECTED_ABI = {
     'scripts/client/gui/Scaleform/daapi/view/lobby/trainings/'
     'TrainingSettingsWindow.pyc': {
         'TrainingSettingsWindow.__init__': ('self', 'ctx'),
+        'TrainingSettingsWindow.getMapsData': ('self',),
+        'TrainingSettingsWindow.getInfo': ('self',),
         'TrainingSettingsWindow.onWindowClose': ('self',),
         'TrainingSettingsWindow.updateTrainingRoom': (
             'self', 'arena', 'roundLength', 'isPrivate', 'comment'),
+    },
+    'scripts/client/gui/Scaleform/daapi/view/meta/TrainingWindowMeta.pyc': {
+        'TrainingWindowMeta.as_setDataS': ('self', 'info', 'mapsData'),
     },
     'scripts/client_common/ClientArena.pyc': {
         'ClientArena.update': ('self', 'updateType', 'argStr'),

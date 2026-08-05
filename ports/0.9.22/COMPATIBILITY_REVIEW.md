@@ -5,7 +5,7 @@ This review is pinned to the Chinese HD client whose `version.xml` reports
 CPython 2.7 bytecode magic `03 f3 0d 0a`; the embedded build identifies itself
 as Python 2.7.7.
 
-The goal of version 0.3.1 is a complete playable vertical path, not another
+The goal of version 0.3.2 is a complete playable vertical path, not another
 login-only probe: local Account -> stock Lobby/map selection -> native map and
 Avatar -> native Vehicle entities -> local movement/aim/fire -> synchronized
 humans and bots -> damage/death/result -> cleanup -> a second round.
@@ -75,14 +75,14 @@ not inferred from another 0.9.22 build:
 | Producer | Exact consumer contract covered |
 | --- | --- |
 | `CMD_SYNC_DATA` / `AccountSyncData` | `rev` and `prevRev`; every initial `Account._update` subscriber receives an explicit cache value instead of depending on a missing-key fallback. |
-| `Stats` / `StatsRequester` / lobby controllers | Zeroed money and account scalars; mapping-shaped restrictions, referral data and clan locks; a non-empty `dailyPlayHours`; and full daily/weekly `playLimits`. Zero periods mean exhausted parental-control time in this build. |
+| `Stats` / `StatsRequester` / lobby controllers | Zeroed money and account scalars; mapping-shaped restrictions, referral data and clan locks; a non-empty `dailyPlayHours`; and full daily/weekly `playLimits`. Zero periods mean exhausted parental-control time in this build. `mayConsumeWalletResources` starts true because false is the native wallet's `SYNCING` state, and `tutorialsCompleted` carries the completed offline bitmask. |
 | `Inventory` / `InventoryRequester` | All item-type indices exist; vehicle `compDescr` and crew maps exist; `repair` is a two-item tuple and `shellsLayout` is a mapping. |
 | `QuestProgress` / personal-mission requesters | `quests`, `tokens`, and `potapovQuests`; both `regular` and `training` contain `slots`, `selected`, and `lastIDs`, while `compDescr` is always present. |
 | goodies, vehicle rotation, recycle bin, ranked, badges, New Year | Readable empty caches exist. `groupLocks` contains both directly indexed lists, the ranked helper can directly index an empty `ranked` cache, and `ClientNewYear` plus the New Year controller accept the empty sync/goodie mappings without fabricated event data. |
 | `Shop` / `ShopRequester` / `RefSystem` | Mandatory `sellPriceFactor`; all directly read item/goodie collections; currency-mapped `paidRemovalCost`; exact berth, slot, and free-XP tuple arities; and the four-key disabled referral configuration, including integer `posByXPinTeam = 0`. |
 | `DossierCache` / `DossierRequester` | The stream body is the exact `(revision, dossierChanges)` pair; an empty change list completes synchronization without fabricating dossier data. |
 | `ClientChat` and BW Chat2 | Both client mailboxes exist. Offline chat commands are accepted as one-way no-ops: `CHAT_COMMANDS` indices are never echoed as `CHAT_ACTIONS`, and no malformed partial action is delivered to `ClientChat.onChatAction`. |
-| initial server settings / lobby controllers / `ClientRanked` | `file_server`, regional settings, the four-item roaming tuple and the directly indexed two-item `wallet` retain their native shapes; roaming item 3 is the host list consumed by `predefined_hosts`, while `ranked_config` is present and explicitly disabled because `ClientRanked` indexes it directly. `elenSettings` is also explicitly disabled because its exact missing-section default is enabled and would start an unsupported HTTP event-board chain. |
+| initial server settings / lobby controllers / `ClientRanked` | `file_server`, regional settings, the four-item roaming tuple and the directly indexed two-item `wallet` retain their native shapes; roaming item 3 is the host list consumed by `predefined_hosts`, while `ranked_config` is present and explicitly disabled because `ClientRanked` indexes it directly. `elenSettings` and the server-owned tutorial are explicitly disabled because their exact missing-section defaults start unsupported event-board or tutorial GUI lifecycles. |
 
 The controller chain itself was enumerated from `game_control.__init__` and
 `new_year.__init__`. `NewYearController` is invoked first, followed by the
@@ -147,10 +147,14 @@ OfflineMapCreator.destroy()
 ## Stock map-selection lifecycle
 
 The release opens `TRAINING_SETTINGS_WINDOW_PY` through the exact
-`ViewLoadParams(alias, alias)` contract. A scoped wrapper replaces only that
-window instance's arena cache with the server's standard-mode pool and sends
-its chosen geometry to `request_start`. Other training windows continue down
-the original method.
+`ViewLoadParams(alias, alias)` contract as soon as the hangar is ready, without
+waiting for a server welcome. A scoped wrapper replaces only that window
+instance's arena cache with locally installed standard-mode maps while the
+server policy is unknown, puts the editable `LAN SERVER: host:port` endpoint in
+the native description field, and sends the chosen geometry after the server
+pool confirms it. Connection failures retain this surface and retry instead of
+tearing down the local Account. Other training windows continue down the
+original methods.
 
 Before creating the first Account, bootstrap waits until the exact app loader
 has entered `GUI_GLOBAL_SPACE_ID.LOGIN` for two consecutive engine ticks.
@@ -257,7 +261,7 @@ The pure-data server planner emits revisioned global `bot_orders`, which the
 0.9.22 authority now uses for macro targets after reporting bounded visibility
 observations. BigWorld terrain, collision, water and slope probes remain local,
 and the client planner is a fallback when no server order is available.
-Base-capture rules are not part of 0.3.1; standard battles currently end by
+Base-capture rules are not part of 0.3.2; standard battles currently end by
 elimination.
 
 ## Reference implementations reviewed
@@ -283,7 +287,7 @@ The release build additionally:
 
 1. inspects the exact client version, build, executable architecture and
    required resource archives;
-2. reads exact code objects from `scripts.pkg` and compares all 92 stock method
+2. reads exact code objects from `scripts.pkg` and compares all 118 stock method
    signatures, 18 direct-consumer literals, 20 lifecycle code names and 11
    `AccountCommands` constants used by the port, including variadic flags on
    the stock view loader;

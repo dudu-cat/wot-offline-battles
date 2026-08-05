@@ -12,6 +12,7 @@ except NameError:
 
 CONFIG_PATH = os.path.join(
     '.', 'mods', 'configs', 'offline_lan_0922', 'config.json')
+ENDPOINT_PREFIX = 'LAN SERVER:'
 
 DEFAULT_CONFIG = {
     'schema': 1,
@@ -45,6 +46,36 @@ def write_json(path, value):
 
 # Backward-compatible private name for older extracted packages.
 _write = write_json
+
+
+def format_endpoint(host, port):
+    return '%s %s:%s' % (ENDPOINT_PREFIX, host, int(port))
+
+
+def parse_endpoint(value, default_port=28782):
+    """Parse the native training window's editable LAN endpoint field."""
+    if not isinstance(value, string_types):
+        raise ValueError('LAN server must be text')
+    value = value.strip()
+    if value.upper().startswith(ENDPOINT_PREFIX):
+        value = value[len(ENDPOINT_PREFIX):].strip()
+    if not value:
+        raise ValueError('LAN server is empty')
+    if ':' in value:
+        host, raw_port = value.rsplit(':', 1)
+    else:
+        host, raw_port = value, default_port
+    host = host.strip()
+    if (not host or any(character.isspace() for character in host) or
+            '/' in host or ':' in host):
+        raise ValueError('LAN server host is invalid')
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        raise ValueError('LAN server port is invalid')
+    if port < 1 or port > 65535:
+        raise ValueError('LAN server port must be 1-65535')
+    return (host, port)
 
 
 def load(path=CONFIG_PATH):

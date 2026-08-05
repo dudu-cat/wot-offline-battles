@@ -165,7 +165,10 @@ def stats():
             'slots': 1, 'berths': 0, 'accOnline': 0, 'accOffline': 0,
             'freeTMenLeft': 0, 'freeVehiclesLeft': 0,
             'vehicleSellsLeft': 0, 'captchaTriesLeft': 0,
-            'denunciationsLeft': 0, 'tutorialsCompleted': 0,
+            # Match the established offline-server account profile.  Zero
+            # starts the stock lobby tutorial/hints lifecycle even though this
+            # account cannot persist its tutorial actions on a retail server.
+            'denunciationsLeft': 0, 'tutorialsCompleted': 33553532,
             'battlesTillCaptcha': 0, 'dailyPlayHours': [0],
             # Full daily/weekly periods disable parental-control blocking in
             # the native #1513 GameSessionController.  Zero means no allowed
@@ -178,7 +181,10 @@ def stats():
         },
         'cache': {
             'isFinPswdVerified': True,
-            'mayConsumeWalletResources': False,
+            # False means "wallet synchronization is still in progress" in
+            # #1513, so the header deliberately renders gold/free XP as "--".
+            # The offline snapshot above is already authoritative.
+            'mayConsumeWalletResources': True,
             'unitAcceptDeadline': 0,
             'oldVehInvIDs': set(),
         },

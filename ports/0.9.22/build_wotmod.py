@@ -2,6 +2,7 @@ from __future__ import print_function
 
 import compileall
 import hashlib
+import json
 import os
 import shutil
 import sys
@@ -10,7 +11,7 @@ import zipfile
 
 
 MOD_ID = 'org.peng.offline_lan_0922'
-MOD_VERSION = '0.3.1'
+MOD_VERSION = '0.3.2'
 PYTHON_MAGIC = '\x03\xf3\r\n'
 
 
@@ -56,20 +57,56 @@ def _archive_tree(source_root, destination):
         archive.close()
 
 
+def _release_config():
+    host = os.environ.get('OFFLINE_LAN_RELEASE_HOST', '127.0.0.1').strip()
+    if (not host or any(character.isspace() for character in host) or
+            '/' in host or ':' in host):
+        raise SystemExit('OFFLINE_LAN_RELEASE_HOST is invalid')
+    try:
+        port = int(os.environ.get('OFFLINE_LAN_RELEASE_PORT', '28782'))
+    except ValueError:
+        raise SystemExit('OFFLINE_LAN_RELEASE_PORT is invalid')
+    if port < 1 or port > 65535:
+        raise SystemExit('OFFLINE_LAN_RELEASE_PORT must be 1-65535')
+    return {
+        'schema': 1,
+        'enabled': True,
+        'host': host,
+        'port': port,
+        'name': 'Player',
+        'vehicle': 'ussr:R11_MS-1',
+        'max_health': 90,
+        'startupTimeoutSeconds': 30.0,
+    }
+
+
 def _write_client_overlay(dist_root, package_path, checksum_path, digest):
-    release_name = 'WoT-0.9.22-LAN-Client-%s' % digest[:7]
+    release_config = _release_config()
+    release_seed = '%s\n%s:%s' % (
+        digest, release_config['host'], release_config['port'])
+    release_digest = hashlib.sha256(release_seed.encode('utf-8')).hexdigest()
+    release_name = 'WoT-0.9.22-LAN-Client-%s' % release_digest[:7]
     overlay_root = os.path.join(dist_root, release_name)
     mod_root = os.path.join(
         overlay_root, 'mods', '0.9.22.0.1')
     os.makedirs(mod_root)
     shutil.copy2(package_path, mod_root)
     shutil.copy2(checksum_path, mod_root)
+    config_root = os.path.join(
+        overlay_root, 'mods', 'configs', 'offline_lan_0922')
+    os.makedirs(config_root)
+    with open(os.path.join(config_root, 'config.json'), 'wb') as stream:
+        payload = json.dumps(
+            release_config, indent=2, sort_keys=True) + '\n'
+        stream.write(payload.encode('utf-8'))
     shutil.copy2(os.path.join(os.path.dirname(__file__), 'INSTALL.txt'),
                  overlay_root)
     zip_path = os.path.join(
         dist_root,
         release_name + '.zip')
     _archive_tree(overlay_root, zip_path)
+    print('client endpoint=%s:%s' % (
+        release_config['host'], release_config['port']))
     return overlay_root, zip_path
 
 

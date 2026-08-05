@@ -512,6 +512,16 @@ class AccountRpcTests(unittest.TestCase):
         self.assertEqual(
             set(chain['directServerSettingsKeys']), {'wallet'})
 
+    def test_offline_wallet_and_tutorials_are_terminal_not_syncing(self):
+        sync_data = account_data.sync_data()
+
+        self.assertTrue(
+            sync_data['cache']['mayConsumeWalletResources'])
+        self.assertEqual(
+            33553532, sync_data['stats']['tutorialsCompleted'])
+        self.assertFalse(
+            compatibility._SERVER_SETTINGS['isTutorialEnabled'])
+
     def test_dossier_stream_matches_native_two_tuple_consumer(self):
         self.server.doCmdInt3(36, commands.CMD_SYNC_DOSSIERS, 4, 0, 0)
         self._run()

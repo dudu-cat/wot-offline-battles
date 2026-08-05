@@ -41,6 +41,7 @@ class _Client(object):
         self.map_name = None
         self.spawn = [1, 2, 3]
         self.round_id = None
+        self.ready = False
         self.start_calls = 0
         self.stop_calls = 0
         self.leave_calls = 0
@@ -63,13 +64,15 @@ class _Client(object):
 
 
 class _Queue(object):
-    def __init__(self, request_start, map_pool, on_close=None):
+    def __init__(self, request_start, map_pool, endpoint=None, on_close=None):
         self.request_start = request_start
         self.map_pool = map_pool
+        self.endpoint = endpoint
         self.on_close = on_close
         self.install_calls = 0
         self.uninstall_calls = 0
         self.close_calls = 0
+        self.refresh_calls = 0
 
     def install(self):
         self.install_calls += 1
@@ -79,6 +82,10 @@ class _Queue(object):
 
     def close(self):
         self.close_calls += 1
+
+    def refresh(self):
+        self.refresh_calls += 1
+        return True
 
 
 class _BattleRuntime(object):
@@ -116,6 +123,7 @@ class LANSessionTests(unittest.TestCase):
         self.opens = []
         self.battle_runtime = _BattleRuntime()
         self.snapshots = []
+        self.statuses = []
 
         def client_factory(*args, **kwargs):
             client = _Client(*args, **kwargs)
@@ -133,11 +141,15 @@ class LANSessionTests(unittest.TestCase):
             client_factory=client_factory, queue_factory=queue_factory,
             picker_opener=lambda: self.opens.append(True) or True,
             battle_runtime=self.battle_runtime,
-            on_snapshot=self.snapshots.append)
+            on_snapshot=self.snapshots.append,
+            status_notifier=self.statuses.append)
         self.assertTrue(self.session.start())
         self.client = self.clients[0]
 
     def emit(self, kind, message):
+        if kind == 'welcome':
+            self.client.ready = True
+            self.client.phase = message.get('phase', self.client.phase)
         self.client.on_event(kind, message)
 
     def test_waiting_messages_install_and_open_picker_once(self):
@@ -148,8 +160,180 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual('waiting', self.session.state)
         self.assertEqual(1, len(self.queues))
         self.assertEqual(1, self.queues[0].install_calls)
+        self.assertEqual(1, self.queues[0].refresh_calls)
         self.assertEqual([True], self.opens)
         self.assertEqual(['01_karelia'], self.queues[0].map_pool())
+        self.assertEqual(
+            'LAN SERVER: 10.0.0.5:28782',
+            self.queues[0].endpoint())
+
+    def test_picker_is_available_before_server_welcome(self):
+        self.assertEqual('connecting', self.session.state)
+        self.assertEqual([True], self.opens)
+        self.assertIsNone(self.queues[0].map_pool())
+
+    def test_dismissed_preconnection_picker_reopens_without_key_hook(self):
+        pending = []
+        self.session._callback = (
+            lambda delay, function: pending.append((delay, function)) or 1)
+
+        self.queues[0].on_close()
+
+        self.assertFalse(self.session._picker_open)
+        self.assertEqual(1, len(pending))
+        delay, reopen = pending.pop()
+        self.assertEqual(0.10, delay)
+        reopen()
+        self.assertEqual([True, True], self.opens)
+        self.assertTrue(self.session._picker_open)
+
+    def test_preconnection_selection_starts_once_after_welcome(self):
+        self.assertTrue(self.queues[0].request_start(
+            '01_karelia', 'LAN SERVER: 10.0.0.5:28782'))
+        self.assertEqual('01_karelia', self.session._pending_map)
+        self.assertEqual([], self.client.requests)
+        self.assertFalse(self.session._picker_open)
+
+        message = {'phase': 'waiting', 'map_pool': ['01_karelia']}
+        self.emit('welcome', message)
+        self.emit('roster', message)
+
+        self.assertEqual(['01_karelia'], self.client.requests)
+        self.assertTrue(self.session._start_requested)
+        self.assertEqual('awaiting_battle_start', self.session.state)
+        self.assertFalse(self.session._picker_open)
+
+    def test_pending_map_rejected_by_server_reopens_picker(self):
+        self.assertTrue(self.queues[0].request_start(
+            '01_karelia', 'LAN SERVER: 10.0.0.5:28782'))
+
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['05_prohorovka']})
+
+        self.assertEqual([], self.client.requests)
+        self.assertEqual('waiting', self.session.state)
+        self.assertTrue(self.session._picker_open)
+        self.assertIn('does not offer', self.statuses[-1])
+
+    def test_edited_endpoint_is_saved_and_replaces_client_generation(self):
+        old_client = self.client
+        stale_event = old_client.on_event
+        with mock.patch.object(
+                self.module.port_config, 'write_json') as write_json:
+            self.assertTrue(self.queues[0].request_start(
+                '01_karelia', 'LAN SERVER: 192.168.1.164:30000'))
+
+        self.assertIsNone(old_client.on_event)
+        self.assertEqual(1, old_client.stop_calls)
+        self.assertEqual(2, len(self.clients))
+        replacement = self.session.client
+        self.assertEqual('192.168.1.164', replacement.host)
+        self.assertEqual(30000, replacement.port)
+        self.assertEqual('01_karelia', self.session._pending_map)
+        saved_path, saved_value = write_json.call_args[0]
+        self.assertEqual(self.module.port_config.CONFIG_PATH, saved_path)
+        self.assertEqual('192.168.1.164', saved_value['host'])
+        self.assertEqual(30000, saved_value['port'])
+
+        stale_event('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
+        self.assertEqual('connecting', self.session.state)
+        self.assertEqual([], replacement.requests)
+
+    def test_cancelled_retry_cannot_replace_edited_endpoint_client(self):
+        callbacks = {}
+        cancelled = []
+
+        def schedule(unused_delay, function):
+            callbacks[7] = function
+            return 7
+
+        self.session._callback = schedule
+        self.session._cancel_callback = cancelled.append
+        self.emit('error', {'message': 'connection refused'})
+        stale_retry = callbacks[7]
+
+        with mock.patch.object(self.module.port_config, 'write_json'):
+            self.assertTrue(self.queues[0].request_start(
+                '01_karelia', 'LAN SERVER: 192.168.1.164:30000'))
+        replacement = self.session.client
+
+        stale_retry()
+
+        self.assertEqual([7], cancelled)
+        self.assertIs(replacement, self.session.client)
+        self.assertEqual(2, len(self.clients))
+        self.assertEqual(0, replacement.stop_calls)
+
+    def test_invalid_edited_endpoint_keeps_picker_open(self):
+        self.assertFalse(self.queues[0].request_start(
+            '01_karelia', 'LAN SERVER: bad host:28782'))
+
+        self.assertIs(self.client, self.session.client)
+        self.assertTrue(self.session._picker_open)
+        self.assertIn('invalid', self.statuses[-1])
+
+    def test_initial_connection_failure_is_visible_and_retries(self):
+        callbacks = {}
+        cancelled = []
+
+        def schedule(delay, function):
+            callback_id = len(callbacks) + 1
+            callbacks[callback_id] = (delay, function)
+            return callback_id
+
+        self.session._callback = schedule
+        self.session._cancel_callback = cancelled.append
+
+        self.emit('error', {'message': 'connection refused'})
+
+        self.assertEqual('retrying', self.session.state)
+        self.assertEqual(1, len(self.statuses))
+        self.assertIn('10.0.0.5:28782', self.statuses[0])
+        self.assertEqual(1, len(callbacks))
+        callback_id, (delay, retry) = next(iter(callbacks.items()))
+        self.assertEqual(self.module.RECONNECT_DELAY, delay)
+
+        del callbacks[callback_id]
+        retry()
+
+        self.assertEqual(2, len(self.clients))
+        self.assertEqual(1, self.client.stop_calls)
+        replacement = self.clients[-1]
+        self.assertEqual(1, replacement.start_calls)
+        self.assertEqual('connecting', self.session.state)
+
+        replacement.ready = True
+        replacement.on_event(
+            'welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+
+        self.assertEqual('waiting', self.session.state)
+        self.assertEqual(2, len(self.statuses))
+        self.assertEqual([True], self.opens)
+        self.assertIsNone(self.session._retry_callback_id)
+        self.assertEqual([], cancelled)
+
+    def test_stop_cancels_pending_initial_connection_retry(self):
+        callbacks = {}
+        cancelled = []
+
+        def schedule(unused_delay, function):
+            callbacks[7] = function
+            return 7
+
+        def cancel(callback_id):
+            cancelled.append(callback_id)
+            callbacks.pop(callback_id, None)
+
+        self.session._callback = schedule
+        self.session._cancel_callback = cancel
+        self.emit('error', {'message': 'connection refused'})
+
+        self.session.stop(show_login=False)
+
+        self.assertEqual([7], cancelled)
+        self.assertEqual({}, callbacks)
+        self.assertEqual('stopped', self.session.state)
 
     def test_selection_only_sends_start_request_and_denial_reopens(self):
         self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
@@ -374,6 +558,52 @@ class LANSessionTests(unittest.TestCase):
         pending.pop()()
         self.assertEqual(1, len(self.battle_runtime.started))
         self.assertEqual('battle', self.session.state)
+
+    def test_new_waiting_round_discards_deferred_stale_battle(self):
+        ready = [True]
+        callbacks = {}
+        cancelled = []
+        next_id = [0]
+
+        def schedule(unused_delay, function):
+            next_id[0] += 1
+            callbacks[next_id[0]] = function
+            return next_id[0]
+
+        def cancel(callback_id):
+            cancelled.append(callback_id)
+            callbacks.pop(callback_id, None)
+
+        self.session._lobby_ready = lambda: ready[0]
+        self.session._callback = schedule
+        self.session._cancel_callback = cancel
+        self.emit('battle_start', {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]})
+
+        ready[0] = False
+        self.emit('roster', {
+            'phase': 'waiting', 'round_id': 8,
+            'map_pool': ['05_prohorovka']})
+        self.emit('battle_start', {
+            'round_id': 8, 'map': '05_prohorovka', 'players': [{
+                'id': 'p1', 'x': 4, 'y': 5, 'z': 6,
+                'vehicle': 'ussr:T-34'}]})
+        stale_callback_id = self.session._battle_start_callback_id
+
+        self.emit('roster', {
+            'phase': 'waiting', 'round_id': 9,
+            'map_pool': ['01_karelia']})
+
+        self.assertIn(stale_callback_id, cancelled)
+        self.assertIsNone(self.session._pending_battle_start)
+        self.assertIsNone(self.session._battle_start_callback_id)
+        self.assertEqual('waiting', self.session.state)
+        ready[0] = True
+        for callback in list(callbacks.values()):
+            callback()
+        self.assertEqual(1, len(self.battle_runtime.started))
 
     def test_stop_cancels_deferred_battle_start(self):
         ready = [False]

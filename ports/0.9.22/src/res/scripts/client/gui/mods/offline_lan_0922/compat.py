@@ -38,6 +38,11 @@ _SERVER_SETTINGS = {
     'isEncyclopediaEnabled': 'all',
     'isVehiclesCompareEnabled': True,
     'isCustomizationEnabled': True,
+    # The retail default is enabled.  Offline accounts have no tutorial
+    # service, and letting the hints player start leaves weak GUI proxies that
+    # raise during game.fini().  Public 0.9.x offline servers disable the same
+    # server-owned feature and publish a completed tutorial bitmask.
+    'isTutorialEnabled': False,
 }
 
 _LOBBY_GUI_CONTEXT = {

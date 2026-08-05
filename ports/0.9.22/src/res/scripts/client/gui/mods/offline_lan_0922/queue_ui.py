@@ -44,9 +44,11 @@ def open_picker():
 class QueueUI(object):
     """A reversible, chain-safe adapter for the stock map picker."""
 
-    def __init__(self, request_start, map_pool, runtime=None, on_close=None):
+    def __init__(self, request_start, map_pool, endpoint=None, runtime=None,
+                 on_close=None):
         self._request_start = request_start
         self._map_pool = map_pool
+        self._endpoint = endpoint or (lambda: '')
         self._on_close = on_close
         self._runtime = runtime
         self._installed = False
@@ -54,12 +56,15 @@ class QueueUI(object):
         self._original_init = None
         self._original_update = None
         self._original_close = None
+        self._original_get_info = None
         self._had_own_init = False
         self._had_own_update = False
         self._had_own_close = False
+        self._had_own_get_info = False
         self._init_wrapper = None
         self._update_wrapper = None
         self._close_wrapper = None
+        self._get_info_wrapper = None
         self._picker_window = None
 
     def install(self):
@@ -71,6 +76,7 @@ class QueueUI(object):
         self._had_own_init = '__init__' in window_type.__dict__
         self._had_own_update = 'updateTrainingRoom' in window_type.__dict__
         self._had_own_close = 'onWindowClose' in window_type.__dict__
+        self._had_own_get_info = 'getInfo' in window_type.__dict__
         # In Python 2, getattr(class, method) returns a fresh unbound-method
         # wrapper.  Keep the raw class members so identity checks during
         # chain-safe uninstall remain meaningful on the target runtime.
@@ -80,6 +86,8 @@ class QueueUI(object):
             'updateTrainingRoom', getattr(window_type, 'updateTrainingRoom'))
         self._original_close = window_type.__dict__.get(
             'onWindowClose', getattr(window_type, 'onWindowClose'))
+        self._original_get_info = window_type.__dict__.get(
+            'getInfo', getattr(window_type, 'getInfo'))
         adapter = self
 
         def wrapped_init(window, ctx=None):
@@ -94,6 +102,14 @@ class QueueUI(object):
                         catalog)
             return result
 
+        def wrapped_get_info(window):
+            info = adapter._original_get_info(window)
+            if not getattr(window, _PICKER_MARKER, False):
+                return info
+            result = dict(info or {})
+            result['description'] = adapter._endpoint()
+            return result
+
         def wrapped_update(window, arena, round_length, is_private, comment):
             if not getattr(window, _PICKER_MARKER, False):
                 return adapter._original_update(
@@ -102,7 +118,7 @@ class QueueUI(object):
                                                  adapter._map_pool())
             if map_name is None:
                 return False
-            accepted = adapter._request_start(map_name)
+            accepted = adapter._request_start(map_name, comment)
             if accepted is False:
                 return False
             if adapter._picker_window is window:
@@ -136,9 +152,11 @@ class QueueUI(object):
         self._init_wrapper = wrapped_init
         self._update_wrapper = wrapped_update
         self._close_wrapper = wrapped_close
+        self._get_info_wrapper = wrapped_get_info
         window_type.__init__ = wrapped_init
         window_type.updateTrainingRoom = wrapped_update
         window_type.onWindowClose = wrapped_close
+        window_type.getInfo = wrapped_get_info
         self._installed = True
 
     def _detach_picker(self, window):
@@ -190,6 +208,23 @@ class QueueUI(object):
             raise detach_error
         return True
 
+    def refresh(self):
+        """Refresh the open stock view after the server publishes its maps."""
+        window = self._picker_window
+        if window is None:
+            return False
+        arena_type, unused_window_type = self._runtime
+        catalog = map_catalog.build(arena_type.g_cache, self._map_pool())
+        try:
+            setattr(window, '_TrainingSettingsWindow__arenasCache', catalog)
+            # This is the exact #1513 _populate data contract.  Updating the
+            # existing native view avoids a destroy/reopen cursor race.
+            window.as_setDataS(window.getInfo(), window.getMapsData())
+        except ReferenceError:
+            self._picker_window = None
+            return False
+        return True
+
     def _restore(self, name, original, installed, had_own):
         current = self._window_type.__dict__.get(name)
         if current is not installed:
@@ -208,5 +243,7 @@ class QueueUI(object):
                       self._update_wrapper, self._had_own_update)
         self._restore('onWindowClose', self._original_close,
                       self._close_wrapper, self._had_own_close)
+        self._restore('getInfo', self._original_get_info,
+                      self._get_info_wrapper, self._had_own_get_info)
         self._installed = False
         self._picker_window = None

@@ -655,9 +655,21 @@ def _check_controller_shapes(producers):
 
     wallet_cache = _lookup(
         producers, 'syncData.cache.mayConsumeWalletResources')
-    if not isinstance(wallet_cache, bool):
+    if wallet_cache is not True:
         raise ValueError(
-            'syncData.cache.mayConsumeWalletResources must be a bool')
+            'syncData.cache.mayConsumeWalletResources must start true; '
+            'false leaves the native wallet in SYNCING')
+
+    tutorials_completed = _lookup(
+        producers, 'syncData.stats.tutorialsCompleted')
+    if (not isinstance(tutorials_completed, (int, long)) or
+            isinstance(tutorials_completed, bool) or
+            tutorials_completed <= 0):
+        raise ValueError(
+            'syncData.stats.tutorialsCompleted must be a completed bitmask')
+    if _lookup(producers, 'serverSettings.isTutorialEnabled') is not False:
+        raise ValueError(
+            'serverSettings.isTutorialEnabled must be false offline')
 
 
 def _check_hangar_shapes(producers):
@@ -1059,7 +1071,9 @@ def audit(client_root, port_root):
             'syncData.stats.globalVehicleLocks': 'mapping',
             'syncData.stats.refSystem': 'mapping',
             'syncData.stats.money': 'numeric credits/gold/crystal',
-            'syncData.cache.mayConsumeWalletResources': 'bool',
+            'syncData.cache.mayConsumeWalletResources': 'true/AVAILABLE',
+            'syncData.stats.tutorialsCompleted': 'positive bitmask',
+            'serverSettings.isTutorialEnabled': False,
         },
         'hangarCardinalityConsumers': hangar_cardinality_evidence,
         'hangarSemanticConsumers': hangar_semantic_evidence,

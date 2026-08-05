@@ -1,4 +1,4 @@
-World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.1
+World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.2
 ================================================================
 
 This folder is directly mergeable into the frozen Chinese HD client root.
@@ -22,14 +22,14 @@ Install
 3. Copy this folder's `mods` directory into the game root.
 4. Confirm this file exists:
 
-       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.1.wotmod
+       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.2.wotmod
 
-5. If the server is on another machine, edit:
+5. This copy-ready package includes:
 
        <game root>\mods\configs\offline_lan_0922\config.json
 
-   Set `host` to the server machine's LAN address and keep `port` at `28782`.
-   If no config exists yet, the client creates one on first load.
+   It is preconfigured for the server address shown in that file. You can also
+   change the address in the native LAN settings window described below.
 
 Start the server
 ----------------
@@ -48,9 +48,12 @@ Start a battle
 2. Start `WorldOfTanks.exe` without logging into an online account.
 3. On a fresh profile, accept the stock EULA once. Its version is stored in
    `mods\configs\offline_lan_0922\account_state.json` for later launches.
-4. Wait for the stock training settings window. The visible maps come from the
-   server and include standard (`ctf`) definitions only.
-5. Choose a map with the mouse and use the window's normal primary action.
+4. The stock training settings window opens as soon as the hangar is ready,
+   even when the server is not running. Its Description field contains
+   `LAN SERVER: host:port`; edit it if the server address changed.
+5. Choose a standard (`ctf`) map with the mouse and use the window's normal
+   primary action. The address is saved and the selected map starts once the
+   server accepts the connection.
    There is no F12 or `0` key workflow.
 6. The server starts the selected map and fills both teams to 15 vehicles.
 
@@ -63,7 +66,7 @@ Troubleshooting
 ---------------
 
 - `unsupported compression type`: an older or incorrectly compressed wotmod
-  is still present. Keep only the 0.3.1 package; its members use Store method.
+  is still present. Keep only the 0.3.2 package; its members use Store method.
 - No connection in the server terminal: check `config.json`, the host LAN IP,
   virtual-machine network mode and TCP 28782 firewall access.
 - A traceback appears: close the client and keep `python.log`; it identifies the

@@ -49,11 +49,21 @@ class _Window(object):
         self.calls = []
         self.closed = False
         self.close_calls = 0
+        self.data_updates = []
         self._TrainingSettingsWindow__arenasCache = None
 
     def updateTrainingRoom(self, arena, round_length, is_private, comment):
         self.calls.append((arena, round_length, is_private, comment))
         return 'stock'
+
+    def getInfo(self):
+        return {'description': 'stock'}
+
+    def getMapsData(self):
+        return self._TrainingSettingsWindow__arenasCache.cache
+
+    def as_setDataS(self, info, maps):
+        self.data_updates.append((info, maps))
 
     def onWindowClose(self):
         self.closed = True
@@ -63,6 +73,7 @@ class _Window(object):
 _WINDOW_INIT = _Window.__init__
 _WINDOW_UPDATE = _Window.updateTrainingRoom
 _WINDOW_CLOSE = _Window.onWindowClose
+_WINDOW_GET_INFO = _Window.getInfo
 
 
 class QueueUITests(unittest.TestCase):
@@ -77,7 +88,9 @@ class QueueUITests(unittest.TestCase):
         self.started = []
         self.closed = []
         self.adapter = self.queue_ui.QueueUI(
-            self.started.append, lambda: ('05_prohorovka',),
+            lambda *args: self.started.append(args),
+            lambda: ('05_prohorovka',),
+            endpoint=lambda: 'LAN SERVER: 10.0.0.5:28782',
             runtime=(self.arena_type, _Window),
             on_close=lambda: self.closed.append(True))
 
@@ -86,11 +99,19 @@ class QueueUITests(unittest.TestCase):
         _Window.__init__ = _WINDOW_INIT
         _Window.updateTrainingRoom = _WINDOW_UPDATE
         _Window.onWindowClose = _WINDOW_CLOSE
+        _Window.getInfo = _WINDOW_GET_INFO
 
     def test_catalog_filters_non_ctf_and_server_pool(self):
         rows = self.catalog.build(self.arena_type.g_cache,
                                   ('05_prohorovka',)).cache
         self.assertEqual(['05_prohorovka'], [row['name'] for row in rows])
+
+    def test_unknown_server_pool_shows_all_local_standard_maps(self):
+        rows = self.catalog.build(self.arena_type.g_cache, None).cache
+
+        self.assertEqual(
+            ['01_karelia', '05_prohorovka'],
+            [row['name'] for row in rows])
 
     def test_catalog_uses_stock_1513_map_icon_formatter(self):
         formatters = types.ModuleType(
@@ -172,8 +193,11 @@ class QueueUITests(unittest.TestCase):
         self.assertEqual(['05_prohorovka'], [
             row['name'] for row in
             window._TrainingSettingsWindow__arenasCache.cache])
+        self.assertEqual(
+            'LAN SERVER: 10.0.0.5:28782',
+            window.getInfo()['description'])
         self.assertTrue(window.updateTrainingRoom(3, 15, False, 'ignored'))
-        self.assertEqual(['05_prohorovka'], self.started)
+        self.assertEqual([('05_prohorovka', 'ignored')], self.started)
         self.assertEqual([], window.calls)
         self.assertTrue(window.closed)
         self.assertFalse(getattr(window, self.queue_ui._PICKER_MARKER))
@@ -204,8 +228,8 @@ class QueueUITests(unittest.TestCase):
     def test_synchronous_session_close_does_not_destroy_window_twice(self):
         adapter = None
 
-        def request_start(map_name):
-            self.started.append(map_name)
+        def request_start(map_name, endpoint):
+            self.started.append((map_name, endpoint))
             adapter.close()
             return True
 
@@ -217,7 +241,7 @@ class QueueUITests(unittest.TestCase):
         window = _Window({'isOfflineLanPicker': True})
 
         self.assertTrue(window.updateTrainingRoom(3, 15, False, 'ignored'))
-        self.assertEqual(['05_prohorovka'], self.started)
+        self.assertEqual([('05_prohorovka', 'ignored')], self.started)
         self.assertEqual(1, window.close_calls)
 
     def test_offline_picker_rejects_unavailable_map(self):
@@ -228,12 +252,34 @@ class QueueUITests(unittest.TestCase):
         self.assertEqual([], self.started)
         self.assertFalse(window.closed)
 
+    def test_refresh_replaces_preconnection_catalog_in_the_same_window(self):
+        pool = [None]
+        self.adapter = self.queue_ui.QueueUI(
+            lambda *args: self.started.append(args), lambda: pool[0],
+            endpoint=lambda: 'LAN SERVER: 10.0.0.5:28782',
+            runtime=(self.arena_type, _Window))
+        self.adapter.install()
+        window = _Window({'isOfflineLanPicker': True})
+        self.assertEqual(2, len(window.getMapsData()))
+
+        pool[0] = ('05_prohorovka',)
+        self.assertTrue(self.adapter.refresh())
+
+        self.assertIs(window, self.adapter._picker_window)
+        self.assertEqual(['05_prohorovka'], [
+            row['name'] for row in window.getMapsData()])
+        self.assertEqual(1, len(window.data_updates))
+        self.assertEqual(
+            'LAN SERVER: 10.0.0.5:28782',
+            window.data_updates[0][0]['description'])
+
     def test_normal_training_window_fully_forwards(self):
         self.adapter.install()
         window = _Window({'isCreateRequest': True})
 
         self.assertEqual('stock', window.updateTrainingRoom(1, 15, True, 'x'))
         self.assertEqual([(1, 15, True, 'x')], window.calls)
+        self.assertEqual({'description': 'stock'}, window.getInfo())
         self.assertEqual([], self.started)
 
     def test_uninstall_does_not_clobber_later_wrapper(self):
@@ -250,6 +296,7 @@ class QueueUITests(unittest.TestCase):
         original_init = _Window.__dict__['__init__']
         original_update = _Window.__dict__['updateTrainingRoom']
         original_close = _Window.__dict__['onWindowClose']
+        original_get_info = _Window.__dict__['getInfo']
         self.adapter.install()
 
         self.adapter.uninstall()
@@ -259,3 +306,5 @@ class QueueUITests(unittest.TestCase):
                       _Window.__dict__['updateTrainingRoom'])
         self.assertIs(original_close,
                       _Window.__dict__['onWindowClose'])
+        self.assertIs(original_get_info,
+                      _Window.__dict__['getInfo'])
