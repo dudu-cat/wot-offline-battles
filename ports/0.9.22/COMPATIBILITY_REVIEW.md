@@ -5,8 +5,8 @@ This review is pinned to the Chinese HD client whose `version.xml` reports
 CPython 2.7 bytecode magic `03 f3 0d 0a`; the embedded build identifies itself
 as Python 2.7.7.
 
-The goal of version 0.3.6 is a complete playable vertical path, not another
-login-only probe: local Account -> stock Lobby/map selection -> native map and
+The goal of version 0.3.7 is a complete playable vertical path, not another
+login-only probe: local Account -> stock Lobby/join/map selection -> native map and
 Avatar -> native Vehicle entities -> local movement/aim/fire -> synchronized
 humans and bots -> damage/death/result -> cleanup -> a second round.
 
@@ -18,8 +18,9 @@ at their call sites and lifecycle boundaries:
 - connection and Account: `connection_mgr.py`, `Account.py`, `PlayerEvents.py`,
   the Account sync helpers and lobby requesters listed in the consumer matrix
   below, server settings and lobby context;
-- lobby and map selection: `gui/app_loader`, Scaleform view loaders,
-  `TrainingSettingsWindow`, arena cache and the generated prebattle aliases;
+- lobby and map selection: `gui/app_loader`, `LobbyHeader.fightClick`, Scaleform
+  view loaders, `TrainingSettingsWindow`, arena cache and the generated
+  prebattle aliases;
 - battle entry and exit: `OfflineMapCreator.py`, `Avatar.py`,
   `AvatarInputHandler.py`, battle session/controller repositories and arena
   listeners;
@@ -163,20 +164,34 @@ OfflineMapCreator.destroy()
   -> Account.showGUI() / native synchronization
   -> native g_appLoader.showLobby()
   -> wait for Lobby + HangarSpace + vehicle model
-  -> open the next stock TrainingSettingsWindow
+  -> if local player is room host, open the next TrainingSettingsWindow
 ```
 
 ## Stock map-selection lifecycle
 
-The release opens `TRAINING_SETTINGS_WINDOW_PY` through the exact
-`ViewLoadParams(alias, alias)` contract as soon as the hangar is ready, without
-waiting for a server welcome. A scoped wrapper replaces only that window
-instance's arena cache with locally installed standard-mode maps while the
-server policy is unknown, puts the editable `LAN SERVER: host:port` endpoint in
-the native description field, and sends the chosen geometry after the server
-pool confirms it. Connection failures retain this surface and retry instead of
-tearing down the local Account. Other training windows continue down the
-original methods.
+After the hangar is ready, a chain-safe adapter intercepts the exact
+`LobbyHeader.fightClick(self, mapID, actionName)` boundary. The first click joins
+the LAN waiting room rather than calling the stock prebattle dispatcher. The
+server elects the first connected 0.9.22 player as room host and includes that
+id in `welcome`, `roster` and `battle_start`; only the host opens
+`TRAINING_SETTINGS_WINDOW_PY` through the exact
+`ViewLoadParams(alias, alias)` contract. A scoped wrapper replaces only that
+window instance's arena cache with server-offered standard maps, puts the
+editable `LAN SERVER: host:port` endpoint in the native description field and
+sends the chosen geometry. Guests remain in the hangar and wait for the
+server-owned start. A guest request is rejected before map validation or map
+mutation. Waiting-room host departure elects the lowest connected id and the
+new host then receives the picker. Other fight actions and training windows
+continue down their original methods when the adapter does not own them.
+
+There is one explicit pre-welcome settings path. The first **Battle!** click
+starts the connection without opening a window. If that client is still
+connecting or retrying, a later click opens the same native form so its saved
+endpoint can be corrected. Its provisional map choice does not confer host
+authority: after `welcome`, a guest selection is discarded and only the
+elected host may request the start. Manually closing a host picker leaves it
+closed until that host clicks **Battle!** again, avoiding asynchronous cursor
+recapture while Scaleform is retiring the view.
 
 Before creating the first Account, bootstrap waits until the exact app loader
 has entered `GUI_GLOBAL_SPACE_ID.LOGIN` for two consecutive engine ticks.
@@ -190,12 +205,12 @@ resources. No vehicle-specific exception or resource replacement is needed.
 After Account promotion, the wrapper waits for the exact public
 `LOBBY_VIEW_LOADED` event, Lobby GUI
 space, initialized hangar space and (when present) a completed hangar vehicle
-model before it starts the LAN session. Merely finding an initialized
+model before it installs the LAN join action. Merely finding an initialized
 Scaleform application is insufficient because that object already exists in
 the login/EULA space. The hangar timeout starts only after the lobby event, so
 first-run EULA interaction is not treated as a startup failure. Raw class
 members are preserved so Python 2 unbound-method identity is restored
-correctly. A chain-safe `onWindowClose` adapter releases session ownership when
+correctly. A chain-safe `onWindowClose` adapter releases picker ownership when
 the user presses Cancel, and programmatic close is idempotent even if Scaleform
 has already retired the weak view. The stock window remains
 responsible for mouse and cursor behavior; no transparent hotkey overlay or
@@ -266,12 +281,19 @@ Vehicle creation uses all properties from the local `Vehicle.def`, the exact
 creation. Exact bytecode shows that `Vehicle.prerequisites()` builds appearance
 resources asynchronously: the id returned from client-only `createEntity` can
 exist before `BigWorld.entity(id)` is available. The bridge therefore separates
-id selection from readiness. It selects `playerVehicleID` before stock
-`PlayerAvatar.vehicle_onEnterWorld`, lets the native callback and its
-`setClientReady` mailbox return, and only from a later BigWorld callback accepts
-the entity after registry presence, `inWorld`, `isStarted`, and a descriptor are
-all true. `onVehicleChanged`, client attributes, `AVATAR_READY`, and `PERIOD`
-then publish exactly once, after `VEHICLE_ADDED` has reached `ClientArena`.
+metadata from readiness. Immediately after Avatar creation it creates the local
+Vehicle, selects `playerVehicleID`, publishes `VEHICLE_ADDED`, and invokes the
+native `ArenaLoadController.invalidateArenaInfo()`. This establishes
+`Lobby(4) -> BattleLoading(5)` before a completed space can request
+`Battle(6)`. A scoped AppLoader guard makes both callback orders idempotent: a
+premature battle-page request first establishes loading, while a late loading
+request cannot regress an active battle. The Avatar name/team are seeded from
+the same server roster, so `ArenaDataProvider` can resolve the local entry by id
+or name. Stock `PlayerAvatar.vehicle_onEnterWorld` and its `setClientReady`
+mailbox still run normally; only a later BigWorld callback accepts the entity
+after registry presence, `inWorld`, `isStarted`, and a descriptor are all true.
+`onVehicleChanged`, client attributes, `AVATAR_READY`, and `PERIOD` then publish
+exactly once.
 
 Remote Vehicles use the same readiness gate. Their newest health and pose are
 coalesced while prerequisites load. A remote removal before world entry leaves
@@ -312,8 +334,9 @@ returns the room to waiting.
 
 ## AI, room and round boundaries
 
-Humans take real team slots first. Bots fill the unoccupied slots so each team
-has exactly 15 vehicles. Battle-time late joins are rejected to prevent a
+Humans take real team slots first. The first waiting 0.9.22 player owns map
+selection and start; guests cannot race a second map choice into the room. Bots
+fill the unoccupied slots so each team has exactly 15 vehicles. Battle-time late joins are rejected to prevent a
 16th slot or an incomplete local manifest. A waiting-room membership is not
 published to other handlers until its own `welcome` has been sent under the
 same state lock, so another player cannot start a battle whose first message to
@@ -334,7 +357,7 @@ The pure-data server planner emits revisioned global `bot_orders`, which the
 0.9.22 authority now uses for macro targets after reporting bounded visibility
 observations. BigWorld terrain, collision, water and slope probes remain local,
 and the client planner is a fallback when no server order is available.
-Base-capture rules are not part of 0.3.6; standard battles currently end by
+Base-capture rules are not part of 0.3.7; standard battles currently end by
 elimination.
 
 ## Reference implementations reviewed

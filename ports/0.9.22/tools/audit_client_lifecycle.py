@@ -163,6 +163,70 @@ ORDERED_USES = (
         'LoginState update repeats the destructive entity boundary',
     ),
     (
+        'scripts/client/gui/app_loader/loader.pyc',
+        '_AppLoader.showBattleLoading',
+        ('changeSpace', '_SPACE_ID', 'BATTLE_LOADING'),
+        'battle loading entry changes to the native loading GUI space',
+    ),
+    (
+        'scripts/client/gui/Scaleform/daapi/view/lobby/header/'
+        'LobbyHeader.pyc',
+        'LobbyHeader.fightClick',
+        ('lobbyContext', 'isHeaderNavigationPossible',
+         'prbDispatcher', 'doAction', 'PrbAction'),
+        'native lobby fight click reaches the stock prebattle action boundary',
+    ),
+    (
+        'scripts/client/gui/app_loader/states.pyc',
+        'LobbyState._getNextState',
+        ('guiSpaceID', '_SPACE_ID', 'BATTLE_LOADING',
+         'BattleLoadingState', 'arenaGuiType'),
+        'lobby enters battle loading with the selected arena GUI type',
+    ),
+    (
+        'scripts/client/gui/app_loader/states.pyc',
+        'BattleLoadingState._getNextState',
+        ('guiSpaceID', '_SPACE_ID', 'BATTLE', 'True',
+         '_doStartBattle', '_createBattleState', '_SPACE_ID', 'LOBBY',
+         'LobbyState'),
+        'battle loading starts battle before retaining the lobby fallback',
+    ),
+    (
+        'scripts/client/gui/app_loader/states.pyc',
+        'BattleLoadingState._createBattleState',
+        ('_isBattleReplayPlaying', 'ReplayBattleState', '_arenaGuiType',
+         'BattleState', '_arenaGuiType'),
+        'battle loading selects replay or normal battle with its GUI type',
+    ),
+    (
+        'scripts/client/gui/app_loader/states.pyc',
+        'BattleState._getNextState',
+        ('guiSpaceID', '_SPACE_ID', 'WAITING', 'WaitingState'),
+        'battle exit passes through the native waiting state',
+    ),
+    (
+        'scripts/client/gui/battle_control/controllers/'
+        'arena_load_ctrl.pyc',
+        'ArenaLoadController.invalidateArenaInfo',
+        ('g_appLoader', 'showBattleLoading'),
+        'arena invalidation enters the battle loading GUI space',
+    ),
+    (
+        'scripts/client/gui/battle_control/controllers/'
+        'arena_load_ctrl.pyc',
+        'ArenaLoadController.arenaLoadCompleted',
+        ('True', '_ArenaLoadController__isCompleted', 'g_appLoader',
+         'showBattlePage', '_viewComponents', 'arenaLoadCompleted'),
+        'arena completion shows battle before notifying view components',
+    ),
+    (
+        'scripts/client/gui/battle_control/controllers/repositories.pyc',
+        'SharedControllersLocator.arenaLoad',
+        ('_repository', 'getController', 'BATTLE_CTRL_ID',
+         'ARENA_LOAD_PROGRESS'),
+        'shared arena-load access resolves the native progress controller',
+    ),
+    (
         'scripts/client/gui/shared/personality.pyc',
         'onAccountShowGUI',
         ('g_hangarSpace', 'g_currentVehicle', 'showLobby'),

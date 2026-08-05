@@ -36,6 +36,7 @@ class _Client(object):
         self.max_health = max_health
         self.on_event = on_event
         self.player_id = 'p1'
+        self.host_player_id = 'p1'
         self.phase = 'waiting'
         self.map_pool = []
         self.map_name = None
@@ -86,6 +87,19 @@ class _Queue(object):
     def refresh(self):
         self.refresh_calls += 1
         return True
+
+
+class _JoinUI(object):
+    def __init__(self, on_join):
+        self.on_join = on_join
+        self.install_calls = 0
+        self.uninstall_calls = 0
+
+    def install(self):
+        self.install_calls += 1
+
+    def uninstall(self):
+        self.uninstall_calls += 1
 
 
 class _BattleRuntime(object):
@@ -150,6 +164,8 @@ class LANSessionTests(unittest.TestCase):
         if kind == 'welcome':
             self.client.ready = True
             self.client.phase = message.get('phase', self.client.phase)
+        if 'host_player_id' in message:
+            self.client.host_player_id = message['host_player_id']
         self.client.on_event(kind, message)
 
     def test_waiting_messages_install_and_open_picker_once(self):
@@ -160,64 +176,131 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual('waiting', self.session.state)
         self.assertEqual(1, len(self.queues))
         self.assertEqual(1, self.queues[0].install_calls)
-        self.assertEqual(1, self.queues[0].refresh_calls)
+        self.assertEqual(0, self.queues[0].refresh_calls)
         self.assertEqual([True], self.opens)
         self.assertEqual(['01_karelia'], self.queues[0].map_pool())
         self.assertEqual(
             'LAN SERVER: 10.0.0.5:28782',
             self.queues[0].endpoint())
 
-    def test_picker_is_available_before_server_welcome(self):
+    def test_install_owns_battle_button_until_join_and_stop(self):
+        clients = []
+        join_views = []
+
+        def client_factory(*args, **kwargs):
+            client = _Client(*args, **kwargs)
+            clients.append(client)
+            return client
+
+        def join_factory(callback):
+            view = _JoinUI(callback)
+            join_views.append(view)
+            return view
+
+        session = self.module.LANSession(
+            {'host': '10.0.0.5', 'port': 28782},
+            client_factory=client_factory, join_factory=join_factory,
+            status_notifier=lambda unused_message: None)
+
+        self.assertTrue(session.install())
+        self.assertEqual('ready_to_join', session.state)
+        self.assertEqual(1, join_views[0].install_calls)
+        self.assertEqual([], clients)
+        self.assertTrue(join_views[0].on_join(0, 'battle'))
+        self.assertEqual(1, len(clients))
+        self.assertEqual(1, clients[0].start_calls)
+        session.stop(show_login=False)
+        self.assertEqual(1, join_views[0].uninstall_calls)
+
+    def test_picker_is_not_open_before_server_welcome(self):
         self.assertEqual('connecting', self.session.state)
+        self.assertEqual([], self.opens)
+        self.assertEqual([], self.queues)
+
+    def test_repeated_join_does_not_create_a_second_connection(self):
+        self.assertTrue(self.session.join())
+        self.assertEqual(1, len(self.clients))
+        self.assertEqual(1, self.client.start_calls)
+        self.assertIn('Still connecting', self.statuses[-1])
         self.assertEqual([True], self.opens)
+        self.assertEqual(1, len(self.queues))
         self.assertIsNone(self.queues[0].map_pool())
 
-    def test_dismissed_preconnection_picker_reopens_without_key_hook(self):
-        pending = []
-        self.session._callback = (
-            lambda delay, function: pending.append((delay, function)) or 1)
+    def test_connection_picker_endpoint_change_replaces_unready_client(self):
+        self.assertTrue(self.session.join())
+        old_client = self.client
 
-        self.queues[0].on_close()
+        with mock.patch.object(
+                self.module.port_config, 'write_json') as write_json:
+            self.assertTrue(self.queues[0].request_start(
+                '01_karelia', 'LAN SERVER: 192.168.1.164:30000'))
 
+        self.assertIsNone(old_client.on_event)
+        self.assertEqual(1, old_client.stop_calls)
+        self.assertEqual(2, len(self.clients))
+        self.assertEqual('01_karelia', self.session._pending_map)
+        self.assertEqual('connecting', self.session.state)
+        self.assertEqual('192.168.1.164', self.session.client.host)
+        self.assertEqual(30000, self.session.client.port)
+        write_json.assert_called_once()
+
+    def test_guest_discards_map_selected_in_preconnection_settings(self):
+        self.assertTrue(self.session.join())
+        self.assertTrue(self.queues[0].request_start(
+            '01_karelia', 'LAN SERVER: 10.0.0.5:28782'))
+        self.assertEqual('01_karelia', self.session._pending_map)
+
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia'],
+            'host_player_id': 'other'})
+
+        self.assertIsNone(self.session._pending_map)
+        self.assertEqual([], self.client.requests)
+        self.assertEqual('waiting', self.session.state)
         self.assertFalse(self.session._picker_open)
-        self.assertEqual(1, len(pending))
-        delay, reopen = pending.pop()
-        self.assertEqual(0.10, delay)
-        reopen()
-        self.assertEqual([True, True], self.opens)
-        self.assertTrue(self.session._picker_open)
+        self.assertIn('Waiting for host', self.statuses[-1])
 
-    def test_preconnection_selection_starts_once_after_welcome(self):
+    def test_host_selection_starts_once_after_welcome(self):
+        message = {'phase': 'waiting', 'map_pool': ['01_karelia']}
+        self.emit('welcome', message)
         self.assertTrue(self.queues[0].request_start(
             '01_karelia', 'LAN SERVER: 10.0.0.5:28782'))
         self.assertFalse(self.queues[0].request_start(
             '05_prohorovka', 'LAN SERVER: 10.0.0.5:28782'))
-        self.assertEqual('01_karelia', self.session._pending_map)
-        self.assertEqual([], self.client.requests)
-        self.assertTrue(self.session._picker_open)
-
-        message = {'phase': 'waiting', 'map_pool': ['01_karelia']}
-        self.emit('welcome', message)
-        self.emit('roster', message)
-
+        self.assertIsNone(self.session._pending_map)
         self.assertEqual(['01_karelia'], self.client.requests)
+        self.assertTrue(self.session._picker_open)
         self.assertTrue(self.session._start_requested)
         self.assertEqual('awaiting_battle_start', self.session.state)
-        self.assertFalse(self.session._picker_open)
 
-    def test_pending_map_rejected_by_server_reopens_picker(self):
-        self.assertTrue(self.queues[0].request_start(
-            '01_karelia', 'LAN SERVER: 10.0.0.5:28782'))
-
+    def test_guest_waits_without_opening_map_picker(self):
         self.emit('welcome', {
-            'phase': 'waiting', 'map_pool': ['05_prohorovka']})
+            'phase': 'waiting', 'map_pool': ['05_prohorovka'],
+            'host_player_id': 'other'})
 
         self.assertEqual([], self.client.requests)
         self.assertEqual('waiting', self.session.state)
+        self.assertFalse(self.session._picker_open)
+        self.assertEqual([], self.queues)
+        self.assertIn('Waiting for host', self.statuses[-1])
+
+    def test_waiting_guest_becomes_host_and_gets_picker(self):
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia'],
+            'host_player_id': 'other'})
+        self.assertEqual([], self.opens)
+
+        self.emit('roster', {
+            'phase': 'waiting', 'map_pool': ['01_karelia'],
+            'host_player_id': 'p1'})
+
+        self.assertEqual([True], self.opens)
         self.assertTrue(self.session._picker_open)
-        self.assertIn('does not offer', self.statuses[-1])
+        self.assertIn('now the LAN room host', self.statuses[-1])
 
     def test_edited_endpoint_is_saved_and_replaces_client_generation(self):
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
         old_client = self.client
         stale_event = old_client.on_event
         with mock.patch.object(
@@ -252,6 +335,9 @@ class LANSessionTests(unittest.TestCase):
 
         self.session._callback = schedule
         self.session._cancel_callback = cancelled.append
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
+        self.client.ready = False
         self.emit('error', {'message': 'connection refused'})
         stale_retry = callbacks[7]
 
@@ -268,6 +354,8 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual(0, replacement.stop_calls)
 
     def test_invalid_edited_endpoint_keeps_picker_open(self):
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
         self.assertFalse(self.queues[0].request_start(
             '01_karelia', 'LAN SERVER: bad host:28782'))
 
@@ -292,6 +380,7 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual('retrying', self.session.state)
         self.assertEqual(1, len(self.statuses))
         self.assertIn('10.0.0.5:28782', self.statuses[0])
+        self.assertIn('edit the server address', self.statuses[0])
         self.assertEqual(1, len(callbacks))
         callback_id, (delay, retry) = next(iter(callbacks.items()))
         self.assertEqual(self.module.RECONNECT_DELAY, delay)
@@ -454,6 +543,22 @@ class LANSessionTests(unittest.TestCase):
 
         self.assertEqual([True, True], self.opens)
         self.assertTrue(self.session._picker_open)
+
+    def test_stock_picker_close_stays_closed_until_explicit_action(self):
+        callbacks = []
+        self.session._callback = (
+            lambda delay, function: callbacks.append((delay, function)) or 7)
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+
+        self.queues[0].on_close()
+
+        self.assertFalse(self.session._picker_open)
+        self.assertEqual([], callbacks)
+        self.assertEqual([True], self.opens)
+
+        self.assertTrue(self.session.join())
+        self.assertTrue(self.session._picker_open)
+        self.assertEqual([True, True], self.opens)
 
     def test_battle_start_uses_server_map_and_local_roster_spawn_once(self):
         self.emit('welcome', {'phase': 'battle'})
@@ -935,12 +1040,44 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual([False], self.battle_runtime.stopped)
         self.assertEqual([False], self.battle_runtime.restore_accounts)
 
-    def test_disconnect_closes_stock_picker_before_uninstalling_adapter(self):
+    def test_waiting_disconnect_keeps_lobby_hook_and_can_rejoin(self):
         self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+        stale_event = self.client.on_event
+        self.emit('disconnected', {'reason': 'network'})
+
+        self.assertEqual('ready_to_join', self.session.state)
+        self.assertFalse(self.session._stopped)
+        self.assertIsNone(self.session.client)
+        self.assertEqual(1, self.queues[0].close_calls)
+        self.assertEqual(0, self.queues[0].uninstall_calls)
+        self.assertEqual(1, self.client.stop_calls)
+        self.assertIsNone(self.client.on_event)
+        self.assertEqual([], self.battle_runtime.stopped)
+        self.assertIn('Click Battle! to rejoin', self.statuses[-1])
+
+        self.assertTrue(self.session.join())
+        self.assertEqual(2, len(self.clients))
+        self.assertIs(self.clients[-1], self.session.client)
+        self.assertEqual(1, self.clients[-1].start_calls)
+        self.assertEqual('connecting', self.session.state)
+
+        stale_event('welcome', {
+            'phase': 'waiting', 'map_pool': ['05_prohorovka'],
+            'host_player_id': 'old-host'})
+        self.assertIs(self.clients[-1], self.session.client)
+        self.assertEqual('connecting', self.session.state)
+
+    def test_active_battle_disconnect_still_uses_conservative_cleanup(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+        self.emit('battle_start', {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]})
+
         self.emit('disconnected', {'reason': 'network'})
 
         self.assertEqual('stopped', self.session.state)
-        self.assertEqual(1, self.queues[0].close_calls)
+        self.assertTrue(self.session._stopped)
         self.assertEqual(1, self.queues[0].uninstall_calls)
         self.assertEqual(1, self.client.stop_calls)
         self.assertEqual([True], self.battle_runtime.stopped)

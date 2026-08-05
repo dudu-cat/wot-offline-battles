@@ -9,19 +9,20 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.6` replaces the old compatibility slice. It is a server-backed
+Version `0.3.7` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, tactical bots and repeatable rounds. The removed `vertical_slice.py`
 runtime is not packaged as a fallback.
 
-This release fixes the asynchronous Vehicle-entry boundary exposed by the real
-`#1513` client. A returned client-only entity id is no longer treated as a
-materialized tank: startup waits for native `onEnterWorld`, registry presence,
-`inWorld`, `isStarted` and a descriptor before publishing client ready,
-`AVATAR_READY` and battle period. Pending remote updates are coalesced until the
-same boundary, and a late entity whose network record was already removed is
-destroyed through a retained tombstone instead of becoming an orphan.
+This release fixes both halves of the real `#1513` battle-entry boundary. The
+local Vehicle id and `VEHICLE_ADDED` roster are now published before the native
+arena-load controller can request the battle page, while the state transition is
+fenced to `Lobby -> BattleLoading -> Battle`. A returned client-only entity id
+is still not treated as a materialized tank: client ready, `AVATAR_READY` and
+battle period wait for native `onEnterWorld`, registry presence, `inWorld`,
+`isStarted` and a descriptor. Pending remote updates are coalesced until the
+same boundary, and a late removed entity is destroyed instead of orphaned.
 
 Map-start failure now restores the stock prebattle dispatcher before rebuilding
 the Account lobby, while final process shutdown guards the exact late
@@ -34,20 +35,27 @@ overwrite the next round.
 1. Start `lan_battle_server.py`. A single connected client is supported.
 2. Start the frozen client. After the native intro/login state finishes its
    destructive cleanup, the mod creates its local Account and enters Lobby.
-3. The stock training settings window opens immediately. Its Description field
-   is the editable `LAN SERVER: host:port` endpoint, and its map list contains
-   locally installed standard maps while the connection is pending.
-   This reuses only the stock window as a local settings/map picker; it is not
-   a retail training room and does not use the original prebattle service.
-4. Choose a map and activate the window's normal primary button. The endpoint
-   is saved, connection failures remain visible and retryable, and the server's
-   map pool is checked before the start request is sent.
-5. The server fills vacant slots with bots and starts the same round for every
-   waiting client.
-6. A team-elimination result freezes the round. After three seconds the server
+3. Click the garage's native **Battle!** button. It joins the LAN waiting room;
+   it does not call retail matchmaking or a retail training-room service.
+4. While the client is connecting or retrying, clicking **Battle!** again
+   explicitly opens the stock settings window. Any not-yet-accepted client can
+   edit `LAN SERVER: host:port` there; this does not grant host authority.
+5. The first waiting player is the room host. Only that client opens the stock
+   training settings window as a local map picker. Its Description field is the
+   editable `LAN SERVER: host:port` endpoint. Later players click the same
+   **Battle!** button, remain in the garage and wait for the host.
+   If the host closes the picker, it remains closed until that client clicks
+   **Battle!** again.
+6. The host chooses one server-offered standard map and uses the window's
+   primary action. The server is authoritative for the host, selected map and
+   start; guest start requests are rejected before they can change the map.
+7. The server fills vacant slots with bots and broadcasts the same round to
+   every waiting client.
+8. A team-elimination result freezes the round. After three seconds the server
    returns connected players to the waiting room and the stock picker opens for
-   the next round.
-7. Returning to the garage during a round retires that player, transfers bot
+   the current host. If the waiting host leaves, ownership passes to the lowest
+   connected player id and that client receives the picker.
+9. Returning to the garage during a round retires that player, transfers bot
    authority when necessary and retains the LAN connection until the server's
    next waiting-room barrier.
 
@@ -60,8 +68,8 @@ capture-the-flag variant. Assault and encounter definitions are excluded.
 
 ## Runtime ownership
 
-The Python 3 server owns the room, teams and slots, canonical health, accepted
-shot events, active-round retirement, elimination result and round reset. It
+The Python 3 server owns the room host, selected map, teams and slots, canonical
+health, accepted shot events, active-round retirement, elimination result and round reset. It
 exposes a newline-delimited JSON protocol rather than emulating the original
 BigWorld game server.
 
@@ -87,7 +95,8 @@ module/crew replication are outside this release.
 
 Protocol v5 messages are now strictly round-scoped. Keep the client package
 and `lan_battle_server.py` from the same checkout; this client rejects an older
-server before entering the waiting room when its welcome lacks the build tag.
+server before entering the waiting room when its welcome lacks the build or
+room-host contract.
 The #1513 client also declares `wot-0.9.22.0.1-cn-1513` in its handshake. The
 server pins each non-empty room to one client build and its exact map pool,
 preventing 0.8.2 synthetic coordinates from being mixed with 0.9.22 world
@@ -117,8 +126,11 @@ The supported fields are:
 }
 ```
 
-The same endpoint is editable in the native training settings window. The
-server supplies the selected map and spawn. The release does not write a
+Before receiving a server welcome, any client can click **Battle!** again to
+edit the same endpoint in the native training settings window. Once waiting,
+only the room host owns that window as the map picker; guests continue to use
+their saved `config.json`. The server supplies the selected map and spawn. The
+release does not write a
 capability trace or vertical-slice status file; normal failures are reported in
 `python.log` without verbose per-frame logging.
 
@@ -165,8 +177,8 @@ properties and mailboxes at runtime.
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.6.wotmod
-org.peng.offline_lan_0922_0.3.6.wotmod.sha256
+org.peng.offline_lan_0922_0.3.7.wotmod
+org.peng.offline_lan_0922_0.3.7.wotmod.sha256
 WoT-0.9.22-LAN-Client-<package hash>/
 WoT-0.9.22-LAN-Client-<package hash>.zip
 ```

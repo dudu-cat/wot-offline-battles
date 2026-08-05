@@ -14,9 +14,10 @@ Run this on the machine that hosts the battle:
 python3 lan_battle_server.py --host 0.0.0.0 --port 28782 --map server_random
 ```
 
-`server_random` chooses the map initially highlighted in the waiting room.
-`--map 04_himmelsdorf` changes that initial selection; any
-waiting player can still choose another stock map before clicking start.
+`server_random` gives the room an initial random map.
+`--map 04_himmelsdorf` changes that initial selection. In 0.8.2, a waiting
+player can replace it through the custom queue panel. In 0.9.22, only the
+elected room host can replace it through the native map picker.
 
 Allow TCP port `28782` through the host firewall if clients are on another
 machine. Use the host machine's LAN address, for example `192.168.1.20`, in
@@ -30,9 +31,13 @@ Use the hash-named folder built under `ports/0.9.22/dist/`, or the corresponding
 copy-ready deliverable. Close the game, remove older
 `org.peng.offline_lan_0922_*.wotmod` files, and merge its `mods` directory into
 the client root. Configure `mods/configs/offline_lan_0922/config.json` with the
-server's LAN address. The mod connects automatically and opens the stock
-training settings map picker; select a standard map with the mouse and use the
-window's primary action. See `ports/0.9.22/INSTALL.txt` for details.
+server's LAN address. Click the stock **Battle!** button to connect and join
+the waiting room. If the client is still connecting or retrying, click
+**Battle!** again to open the native settings window explicitly and edit the
+endpoint. The first accepted player becomes room host and receives that window
+as a local map picker. Later players remain in the garage; once the room is
+waiting, only the host selects the map and uses the window's primary action.
+See `ports/0.9.22/INSTALL.txt` for details.
 
 The 0.9.22 port always uses this server when enabled, including for one player.
 It does not have an old-AI or local-only fallback.
@@ -58,6 +63,31 @@ module runs inside the embedded Python 2 runtime shipped with the 0.8.2 client.
 
 ## Enter one battle together
 
+### World of Tanks 0.9.22.0.1 #1513
+
+1. Start the server and leave its terminal visible.
+2. Set every client's `mods/configs/offline_lan_0922/config.json` to the same
+   server IP and port.
+3. Click **Battle!** on every client. Each click joins the shared LAN waiting
+   room; it does not contact retail matchmaking or create a retail training
+   room.
+4. If a client is still connecting or retrying, click **Battle!** again to
+   open the native settings window and edit its endpoint. This pre-welcome
+   surface does not grant room-host authority.
+5. Confirm that the server printed one `JOIN` line for every client.
+6. The first waiting player is the room host and receives the native
+   training-settings map picker. Guests remain in the garage and wait.
+7. The host chooses a standard map and uses the picker's primary action. The
+   server prints `BATTLE START` and broadcasts that map and roster to every
+   waiting client. A single connected player may also start.
+
+If the waiting host disconnects, the server transfers ownership to the lowest
+connected player id and that client receives the picker. Guests cannot change
+the selected map or start the round. Closing the host picker leaves it closed;
+the host can reopen it by clicking **Battle!** again.
+
+### World of Tanks 0.8.2
+
 1. Start the server and leave its terminal visible.
 2. On every client, enable LAN mode with the same server IP and port.
 3. Click `Battle!` on every client. The queue screen opens only after the
@@ -80,7 +110,7 @@ There is no independent client-side LAN countdown. A failed LAN connection
 does not silently fall back to a local random battle. Use the queue screen's
 cancel button to leave the waiting room.
 
-With normal logging settings, each client writes these milestones to
+With normal 0.8.2 logging settings, each client writes these milestones to
 `python.log`:
 
 ```text
@@ -97,8 +127,11 @@ LAN bot manifest received: 30 bot(s)
 ```
 
 If the server prints no `TCP connection` line, the problem is before the
-protocol: verify LAN mode is ON, the configured IP, Parallels network mode and
-the server firewall. If it prints a TCP connection followed by `protocol
+protocol. For 0.9.22, verify that the client clicked **Battle!** and that its
+`config.json` contains the correct IP and port; clicking **Battle!** again while
+it retries opens the native endpoint editor. For 0.8.2, verify that LAN mode is
+ON. For either version, also check Parallels network mode and the server
+firewall. If the server prints a TCP connection followed by `protocol
 mismatch`, the client and server packages are from different builds.
 
 In battle, opposing LAN humans use the same local 50 m proximity spot,

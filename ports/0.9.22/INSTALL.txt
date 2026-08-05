@@ -1,4 +1,4 @@
-World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.6
+World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.7
 ================================================================
 
 This folder is directly mergeable into the frozen Chinese HD client root.
@@ -26,7 +26,7 @@ Install
 3. Copy this folder's `mods` directory into the game root.
 4. Confirm this file exists:
 
-       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.6.wotmod
+       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.7.wotmod
 
 5. This copy-ready package includes:
 
@@ -52,30 +52,37 @@ Start a battle
 2. Start `WorldOfTanks.exe` without logging into an online account.
 3. On a fresh profile, accept the stock EULA once. Its version is stored in
    `mods\configs\offline_lan_0922\account_state.json` for later launches.
-4. The stock training settings window opens as soon as the hangar is ready,
-   even when the server is not running. Its Description field contains
-   `LAN SERVER: host:port`; edit it if the server address changed.
-   Only this stock window is reused as the LAN settings and map-selection UI;
-   the mod does not create a retail training room or contact its prebattle
-   service.
-5. Choose a standard (`ctf`) map with the mouse and use the window's normal
-   primary action. The address is saved and the selected map starts once the
-   server accepts the connection.
+4. Click the hangar's native Battle! button to join the LAN waiting room.
+   This does not use retail matchmaking or the retail training-room service.
+5. If the client is still connecting or retrying, click Battle! again to open
+   the stock settings window explicitly. Its Description field contains
+   `LAN SERVER: host:port`; edit it if the server address changed. Before a
+   welcome, this settings surface does not grant room-host authority.
+6. The first waiting player becomes room host and receives the stock training
+   settings window as a map picker. Its Description field contains
+   `LAN SERVER: host:port`; the host may edit and save it there.
+7. Every later player clicks the same Battle! button and waits in the hangar.
+   Only the host can choose a standard (`ctf`) map and use the window's primary
+   action. The server broadcasts that one selected map to every waiting client.
    There is no F12 or `0` key workflow.
-6. The server starts the selected map and fills both teams to 15 vehicles.
+   Closing the host picker leaves it closed; the host clicks Battle! to reopen
+   it.
+8. The server starts the selected map and fills both teams to 15 vehicles.
 
-After a team is eliminated, the battle freezes and returns to the map picker
-after three seconds. Connected players can start another round without
-restarting either process. New connections are rejected while a round is
-already active and may join when the server returns to the waiting room.
+After a team is eliminated, the battle freezes and returns all connected
+players to the waiting room after three seconds. The current host receives the
+map picker again. If the host leaves while waiting, ownership and the picker
+move to the lowest connected player id. New connections are rejected while a
+round is active and may join after the room returns to waiting.
 
 Troubleshooting
 ---------------
 
 - `unsupported compression type`: an older or incorrectly compressed wotmod
-  is still present. Keep only the 0.3.6 package; its members use Store method.
+  is still present. Keep only the 0.3.7 package; its members use Store method.
 - No connection in the server terminal: check `config.json`, the host LAN IP,
-  virtual-machine network mode and TCP 28782 firewall access.
+  virtual-machine network mode and TCP 28782 firewall access. While the client
+  retries, click Battle! again to open the endpoint editor.
 - A traceback appears: close the client and keep `python.log`; it identifies the
   exact remaining client API boundary. This package does not create separate
   probe or trace files.

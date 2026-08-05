@@ -16,7 +16,9 @@ class LanProtocolTests(unittest.TestCase):
         self.client.ready = True
         self.client.phase = 'battle'
         self.client.round_id = 7
+        self.client.state_revision = 4
         self.client.player_id = 1
+        self.client.host_player_id = 1
         self.client.bot_authority_id = 1
         self.sent = []
         def send(message):
@@ -70,11 +72,17 @@ class LanProtocolTests(unittest.TestCase):
             'vehicle': 'ussr:MS-1', 'x': 0, 'y': 0, 'z': 0}]
         self.client._handle_message({
             'type': 'battle_start', 'protocol': 5, 'round_id': 7,
-            'map': '01_karelia', 'players': players})
+            'state_revision': 5,
+            'map': '01_karelia', 'host_player_id': 1,
+            'players': players})
 
         self.client._handle_message({
             'type': 'roster', 'protocol': 5, 'round_id': 7,
-            'phase': 'waiting', 'map': '05_prohorovka', 'players': []})
+            'state_revision': 6,
+            'phase': 'waiting', 'map': '05_prohorovka',
+            'host_player_id': 1, 'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Changed',
+                'vehicle': 'ussr:MS-1', 'x': 1, 'y': 0, 'z': 1}]})
 
         self.assertEqual('battle', self.client.phase)
         self.assertEqual('01_karelia', self.client.map_name)

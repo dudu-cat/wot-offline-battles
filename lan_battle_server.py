@@ -245,6 +245,8 @@ class BattleState:
         self.running = True
         self.phase = "waiting"
         self.round_id = 1
+        self.state_revision = 0
+        self.host_player_id = None
         self.bot_roster = self._new_bot_roster()
         self.bot_authority_id = None
         self.bot_manifest_authority_id = None
@@ -324,6 +326,12 @@ class BattleState:
                 "round_id": self.round_id,
             })
         return old, self.bot_authority_id
+
+    def _elect_room_host(self):
+        connected = sorted(
+            p.player_id for p in self.players.values() if p.connected)
+        self.host_player_id = connected[0] if connected else None
+        return self.host_player_id
 
     def _spawn_for(self, slot, team):
         # Coordinates are intentionally simple and are also sent to clients.
@@ -410,6 +418,9 @@ class BattleState:
                 max_health=max(1, min(int(_finite_float(hello.get("max_health"), 1000)), 100000)),
             )
             self.players[player_id] = player
+            if self.host_player_id is None:
+                self.host_player_id = player_id
+            self.state_revision += 1
             return player, None
 
     def remove_player(self, player_id):
@@ -417,6 +428,9 @@ class BattleState:
             player = self.players.pop(player_id, None)
             if player is not None:
                 player.connected = False
+                self.state_revision += 1
+            if player_id == self.host_player_id:
+                self._elect_room_host()
             if player_id == self.bot_authority_id:
                 self._elect_bot_authority()
             reset = False
@@ -428,6 +442,7 @@ class BattleState:
                 reset = True
             if not self.players:
                 self.client_build = None
+                self.host_player_id = None
             return player, reset
 
     def _finish_abandoned_battle(self):
@@ -475,6 +490,8 @@ class BattleState:
         self.result_reset_tick = None
         self.roster_finalized = False
         self.pending_events = []
+        self._elect_room_host()
+        self.state_revision += 1
 
     def lobby_message(self):
         with self.lock:
@@ -484,8 +501,10 @@ class BattleState:
                 "client_build": self.client_build,
                 "phase": self.phase,
                 "round_id": self.round_id,
+                "state_revision": self.state_revision,
                 "map": self.map_name,
                 "map_pool": list(self._active_map_pool()),
+                "host_player_id": self.host_player_id,
                 "bot_authority_id": self.bot_authority_id,
                 "players": [self._public_player(p) for p in self.players.values() if p.connected],
             }
@@ -497,6 +516,9 @@ class BattleState:
                 return None, "player_not_found"
             if self.phase != "waiting":
                 return None, "already_started"
+            if (self.client_build == CLIENT_BUILD_0922 and
+                    player_id != self.host_player_id):
+                return None, "host_only"
             if requested_map not in (None, ""):
                 requested_map = str(requested_map)
                 if requested_map not in self._active_map_pool():
@@ -510,13 +532,16 @@ class BattleState:
             self.roster_finalized = True
             self.phase = "battle"
             self._elect_bot_authority()
+            self.state_revision += 1
             return {
                 "type": "battle_start",
                 "protocol": PROTOCOL_VERSION,
                 "client_build": self.client_build,
                 "round_id": self.round_id,
+                "state_revision": self.state_revision,
                 "map": self.map_name,
                 "requested_by": player_id,
+                "host_player_id": self.host_player_id,
                 "delay": 0.75,
                 "players": [self._public_player(p) for p in connected],
                 "bots": list(self.bot_roster),
@@ -568,8 +593,10 @@ class BattleState:
                 "type": "battle_start",
                 "protocol": PROTOCOL_VERSION,
                 "round_id": self.round_id,
+                "state_revision": self.state_revision,
                 "map": self.map_name,
                 "requested_by": 0,
+                "host_player_id": self.host_player_id,
                 "delay": 0.75,
                 "late_join": True,
                 "players": [self._public_player(p) for p in connected],
@@ -1360,8 +1387,10 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         "max_health": player.max_health,
                         "map": server.state.map_name,
                         "map_pool": list(server.state._active_map_pool()),
+                        "host_player_id": server.state.host_player_id,
                         "phase": server.state.phase,
                         "round_id": server.state.round_id,
+                        "state_revision": server.state.state_revision,
                         "spawn": {"x": player.x, "y": player.y, "z": player.z, "yaw": player.yaw},
                         "bot_authority_id": server.state.bot_authority_id,
                     })
@@ -1465,6 +1494,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                                 "type": "start_denied",
                                 "protocol": PROTOCOL_VERSION,
                                 "round_id": server.state.round_id,
+                                "state_revision": server.state.state_revision,
                                 "code": start_error,
                                 "players": len(server.state.players),
                             })

@@ -158,6 +158,12 @@ class AvatarServerBridge(object):
             self._binding.destroy_entity(created_id)
             raise AvatarBridgeError('BigWorld entered a different Vehicle')
         try:
+            # Retail receives playerVehicleID before arena consumers inspect
+            # the vehicle roster.  A client-only createEntity can return its
+            # id before the Vehicle is visible, but the exact Avatar setter
+            # deliberately supports that phase: it records SET_PLAYER_ID and
+            # defers VEHICLE_ENTERED until the entity reaches the world.
+            self._bind_avatar_once(self._vehicle_id)
             self._binding.arena_vehicle_added(self._vehicle_id, snapshot)
             self._arena_vehicle_added = True
         except Exception:
@@ -175,6 +181,10 @@ class AvatarServerBridge(object):
                 self._client_ready = False
                 self._ready_publish_started = False
                 self._ready_publish_error = None
+                try:
+                    self._binding.avatar_select_vehicle(0)
+                except Exception:
+                    pass
             raise
         return self._vehicle_id
 
@@ -191,7 +201,16 @@ class AvatarServerBridge(object):
         elif self._vehicle_id != vehicle_id:
             return False
         self._vehicle_enter_started = True
-        self._bind_avatar_once(vehicle_id)
+        bound_now = self._bind_avatar_once(vehicle_id)
+        if not bound_now:
+            # addVehicleToArena can publish playerVehicleID before the entity
+            # enters the world.  The exact Avatar setter intentionally stops
+            # after SET_PLAYER_ID in that phase.  Re-run the same notifier at
+            # the native enter boundary so it can configure the battle session
+            # provider while the Vehicle is materialized.  A re-entrant
+            # createEntity path binds here for the first time and must not be
+            # notified twice.
+            self._binding.avatar_select_vehicle(vehicle_id)
         return True
 
     def completeVehicleEnter(self, vehicle_id):

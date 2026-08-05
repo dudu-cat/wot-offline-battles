@@ -195,16 +195,35 @@ EXPECTED_ABI = {
     'scripts/client/gui/app_loader/loader.pyc': {
         '_AppLoader.getDefLobbyApp': ('self',),
         '_AppLoader.getSpaceID': ('self',),
+        '_AppLoader.showBattleLoading': ('self',),
         '_AppLoader.showBattlePage': ('self',),
         '_AppLoader.showLobby': ('self',),
     },
     'scripts/client/gui/app_loader/states.pyc': {
+        'LobbyState.getSpaceID': ('self',),
+        'LobbyState._getNextState': ('self', 'ctx'),
+        'BattleLoadingState.getSpaceID': ('self',),
+        'BattleLoadingState._getNextState': ('self', 'ctx'),
+        'BattleLoadingState._createBattleState': ('self',),
+        'BattleState.getSpaceID': ('self',),
+        'BattleState._getNextState': ('self', 'ctx'),
         'LoginState.init': ('self', 'ctx'),
         'LoginState.update': ('self', 'ctx'),
         'LoginState._clearEntitiesAndSpaces': (),
     },
+    'scripts/client/gui/battle_control/controllers/arena_load_ctrl.pyc': {
+        'ArenaLoadController.invalidateArenaInfo': ('self',),
+        'ArenaLoadController.arenaLoadCompleted': ('self',),
+    },
+    'scripts/client/gui/battle_control/controllers/repositories.pyc': {
+        'SharedControllersLocator.arenaLoad': ('self',),
+    },
     'scripts/client/gui/Scaleform/daapi/view/lobby/LobbyView.pyc': {
         'LobbyView._populate': ('self',),
+    },
+    'scripts/client/gui/Scaleform/daapi/view/lobby/header/'
+    'LobbyHeader.pyc': {
+        'LobbyHeader.fightClick': ('self', 'mapID', 'actionName'),
     },
     'scripts/client/gui/Scaleform/framework/application.pyc': {
         'SFApplication.loadView': (
@@ -365,10 +384,44 @@ EXPECTED_CODE_NAMES = {
             'BigWorld', 'player', 'isLongDisconnectedFromCenter'),
     },
     'scripts/client/gui/app_loader/states.pyc': {
+        'LobbyState.getSpaceID': ('_SPACE_ID', 'LOBBY'),
+        'LobbyState._getNextState': (
+            '_SPACE_ID', 'BATTLE_LOADING', 'BattleLoadingState'),
+        'BattleLoadingState.getSpaceID': (
+            '_SPACE_ID', 'BATTLE_LOADING'),
+        'BattleLoadingState._getNextState': (
+            '_SPACE_ID', 'BATTLE', '_doStartBattle',
+            '_createBattleState', 'LOBBY', 'LobbyState'),
+        'BattleLoadingState._createBattleState': ('BattleState',),
+        'BattleState.getSpaceID': ('_SPACE_ID', 'BATTLE'),
+        'BattleState._getNextState': (
+            '_SPACE_ID', 'WAITING', 'WaitingState'),
         'LoginState.init': ('_clearEntitiesAndSpaces',),
         'LoginState.update': ('_clearEntitiesAndSpaces',),
         'LoginState._clearEntitiesAndSpaces': (
             'BigWorld', 'clearEntitiesAndSpaces'),
+    },
+    'scripts/client/gui/app_loader/loader.pyc': {
+        '_AppLoader.showBattleLoading': (
+            'changeSpace', '_SPACE_ID', 'BATTLE_LOADING'),
+    },
+    'scripts/client/gui/Scaleform/daapi/view/lobby/header/'
+    'LobbyHeader.pyc': {
+        'LobbyHeader.fightClick': (
+            'lobbyContext', 'isHeaderNavigationPossible',
+            'prbDispatcher', 'doAction', 'PrbAction'),
+    },
+    'scripts/client/gui/battle_control/controllers/arena_load_ctrl.pyc': {
+        'ArenaLoadController.invalidateArenaInfo': (
+            'g_appLoader', 'showBattleLoading'),
+        'ArenaLoadController.arenaLoadCompleted': (
+            '_ArenaLoadController__isCompleted', 'g_appLoader',
+            'showBattlePage', '_viewComponents', 'arenaLoadCompleted'),
+    },
+    'scripts/client/gui/battle_control/controllers/repositories.pyc': {
+        'SharedControllersLocator.arenaLoad': (
+            '_repository', 'getController', 'BATTLE_CTRL_ID',
+            'ARENA_LOAD_PROGRESS'),
     },
     'scripts/client/gui/game_control/state_tracker.pyc': {
         'GameStateTracker.init': (
@@ -417,6 +470,17 @@ EXPECTED_GLOBALS = {
 }
 
 
+EXPECTED_CLASS_CONSTANTS = {
+    'scripts/client/gui/app_loader/settings.pyc': {
+        'GUI_GLOBAL_SPACE_ID': {
+            'LOBBY': 4,
+            'BATTLE_LOADING': 5,
+            'BATTLE': 6,
+        },
+    },
+}
+
+
 def _signature(code):
     values = list(code.co_varnames[:code.co_argcount])
     offset = code.co_argcount
@@ -440,7 +504,7 @@ def _walk_code(code, path, signatures, code_objects):
 
 
 def _module_constant_globals(code):
-    """Extract immediate ``NAME = constant`` assignments from Python 2.7."""
+    """Extract immediate ``NAME = constant`` assignments from a code body."""
     result = {}
     bytecode = code.co_code
     index = 0
@@ -493,11 +557,13 @@ def audit(client_root):
     checked_literals = []
     checked_names = []
     checked_globals = []
+    checked_class_constants = []
     errors = []
     with zipfile.ZipFile(package_path, 'r') as archive:
         names = set(archive.namelist())
         members = (set(EXPECTED_ABI) | set(EXPECTED_CODE_LITERALS) |
-                   set(EXPECTED_CODE_NAMES) | set(EXPECTED_GLOBALS))
+                   set(EXPECTED_CODE_NAMES) | set(EXPECTED_GLOBALS) |
+                   set(EXPECTED_CLASS_CONSTANTS))
         for member in sorted(members):
             if member not in names:
                 errors.append('missing bytecode member: %s' % member)
@@ -558,6 +624,27 @@ def audit(client_root):
                 else:
                     checked_globals.append('%s:%s=%r' %
                                            (member, name, expected_value))
+            for class_name, expected_constants in sorted(
+                    EXPECTED_CLASS_CONSTANTS.get(member, {}).items()):
+                class_code = code_objects.get(class_name)
+                if class_code is None:
+                    errors.append('%s: missing class body %s for constants' %
+                                  (member, class_name))
+                    continue
+                class_constants = _module_constant_globals(class_code)
+                for name, expected_value in sorted(
+                        expected_constants.items()):
+                    if name not in class_constants:
+                        errors.append('%s: %s missing constant %s' %
+                                      (member, class_name, name))
+                    elif class_constants[name] != expected_value:
+                        errors.append('%s: %s.%s is %r, expected %r' %
+                                      (member, class_name, name,
+                                       class_constants[name], expected_value))
+                    else:
+                        checked_class_constants.append(
+                            '%s:%s.%s=%r' %
+                            (member, class_name, name, expected_value))
     if errors:
         raise ValueError('; '.join(errors))
     return {
@@ -567,10 +654,12 @@ def audit(client_root):
         'checkedConsumerLiterals': len(checked_literals),
         'checkedCodeNames': len(checked_names),
         'checkedConstantGlobals': len(checked_globals),
+        'checkedClassConstants': len(checked_class_constants),
         'contracts': checked,
         'consumerLiterals': checked_literals,
         'codeNames': checked_names,
         'constantGlobals': checked_globals,
+        'classConstants': checked_class_constants,
     }
 
 

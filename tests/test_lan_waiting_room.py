@@ -135,10 +135,12 @@ class WaitingRoomTest(unittest.TestCase):
         deadline = time.time() + 2
         while self.state.client_build is not None and time.time() < deadline:
             time.sleep(0.01)
+        self.assertIsNone(self.state.host_player_id)
 
         legacy = self.connect("Legacy", client_build=None)
         welcome = legacy.receive_type("welcome")
         self.assertEqual(CLIENT_BUILD_082, welcome["client_build"])
+        self.assertEqual(welcome["player_id"], welcome["host_player_id"])
 
     def test_fixed_map_unavailable_to_the_joining_build_is_rejected(self):
         state = BattleState(map_name="03_campania", max_players=30)
@@ -161,14 +163,41 @@ class WaitingRoomTest(unittest.TestCase):
     def test_one_player_can_start_from_clickable_panel_request(self):
         client = self.connect("Solo")
         welcome = client.receive_type("welcome")
-        client.receive_type("roster")
+        roster = client.receive_type("roster")
 
         client.send({"type": "start_battle"})
         started = client.receive_type("battle_start")
 
         self.assertEqual("04_himmelsdorf", welcome["map"])
         self.assertEqual(welcome["map"], started["map"])
+        self.assertEqual(welcome["player_id"], welcome["host_player_id"])
+        self.assertEqual(welcome["player_id"], roster["host_player_id"])
+        self.assertEqual(welcome["player_id"], started["host_player_id"])
+        self.assertEqual(welcome["state_revision"],
+                         roster["state_revision"])
+        self.assertGreater(started["state_revision"],
+                           roster["state_revision"])
         self.assertEqual(1, len(started["players"]))
+
+    def test_modern_guest_cannot_start_or_change_the_host_map(self):
+        host = self.connect("Host")
+        host_welcome = host.receive_type("welcome")
+        host.receive_type("roster")
+        guest = self.connect("Guest")
+        guest_welcome = guest.receive_type("welcome")
+        host_roster = host.receive_type("roster")
+        guest_roster = guest.receive_type("roster")
+        original_map = self.state.map_name
+
+        guest.send({"type": "start_battle", "map": "31_airfield"})
+        denied = guest.receive_type("start_denied")
+
+        self.assertEqual("host_only", denied["code"])
+        self.assertEqual("waiting", self.state.phase)
+        self.assertEqual(original_map, self.state.map_name)
+        self.assertEqual(host_welcome["player_id"], guest_welcome["host_player_id"])
+        self.assertEqual(host_welcome["player_id"], host_roster["host_player_id"])
+        self.assertEqual(host_welcome["player_id"], guest_roster["host_player_id"])
 
     def test_start_request_selects_and_validates_the_map(self):
         client = self.connect("MapPicker")
@@ -201,7 +230,7 @@ class WaitingRoomTest(unittest.TestCase):
         first_roster = first.receive_type("roster")
         second_roster = second.receive_type("roster")
 
-        second.send({"type": "start_battle"})
+        first.send({"type": "start_battle"})
         first_start = first.receive_type("battle_start")
         second_start = second.receive_type("battle_start")
 
@@ -210,6 +239,8 @@ class WaitingRoomTest(unittest.TestCase):
         self.assertEqual(first_welcome["map"], second_welcome["map"])
         self.assertEqual(first_welcome["map"], first_start["map"])
         self.assertEqual(first_start["map"], second_start["map"])
+        self.assertEqual(first_welcome["player_id"], first_start["host_player_id"])
+        self.assertEqual(first_start["host_player_id"], second_start["host_player_id"])
         self.assertEqual(2, len(first_start["players"]))
         self.assertEqual(first_start["bots"], second_start["bots"])
         self.assertEqual(28, len(first_start["bots"]))
@@ -220,6 +251,65 @@ class WaitingRoomTest(unittest.TestCase):
         self.assertEqual(30, len(participants))
         self.assertEqual(30, len(set(participants)))
         self.assertEqual(first_welcome["player_id"], first_start["bot_authority_id"])
+
+    def test_waiting_host_leave_transfers_host_to_lowest_connected_id(self):
+        first = self.connect("Alpha")
+        first_welcome = first.receive_type("welcome")
+        first_initial_roster = first.receive_type("roster")
+        second = self.connect("Bravo")
+        second_welcome = second.receive_type("welcome")
+        first_second_roster = first.receive_type("roster")
+        second_initial_roster = second.receive_type("roster")
+        third = self.connect("Charlie")
+        third_welcome = third.receive_type("welcome")
+        first_third_roster = first.receive_type("roster")
+        second_third_roster = second.receive_type("roster")
+        third_initial_roster = third.receive_type("roster")
+
+        first.close()
+        self.clients.remove(first)
+        second_roster = second.receive_type("roster")
+        third_roster = third.receive_type("roster")
+
+        self.assertEqual(first_welcome["player_id"], first_welcome["host_player_id"])
+        self.assertEqual(second_welcome["player_id"], self.state.host_player_id)
+        self.assertLess(second_welcome["player_id"], third_welcome["player_id"])
+        self.assertEqual(second_welcome["player_id"], second_roster["host_player_id"])
+        self.assertEqual(second_welcome["player_id"], third_roster["host_player_id"])
+        self.assertEqual(first_welcome["state_revision"],
+                         first_initial_roster["state_revision"])
+        self.assertEqual(second_welcome["state_revision"],
+                         first_second_roster["state_revision"])
+        self.assertEqual(second_welcome["state_revision"],
+                         second_initial_roster["state_revision"])
+        self.assertEqual(third_welcome["state_revision"],
+                         first_third_roster["state_revision"])
+        self.assertEqual(third_welcome["state_revision"],
+                         second_third_roster["state_revision"])
+        self.assertEqual(third_welcome["state_revision"],
+                         third_initial_roster["state_revision"])
+        self.assertGreater(second_roster["state_revision"],
+                           third_welcome["state_revision"])
+        self.assertEqual(second_roster["state_revision"],
+                         third_roster["state_revision"])
+
+    def test_legacy_guest_can_still_select_the_map_and_start(self):
+        first = self.connect("LegacyHost", client_build=None)
+        first_welcome = first.receive_type("welcome")
+        first.receive_type("roster")
+        second = self.connect("LegacyGuest", client_build=None)
+        second_welcome = second.receive_type("welcome")
+        first.receive_type("roster")
+        second.receive_type("roster")
+
+        second.send({"type": "start_battle", "map": "31_airfield"})
+        first_start = first.receive_type("battle_start")
+        second_start = second.receive_type("battle_start")
+
+        self.assertEqual("31_airfield", first_start["map"])
+        self.assertEqual(second_welcome["player_id"], first_start["requested_by"])
+        self.assertEqual(first_welcome["player_id"], first_start["host_player_id"])
+        self.assertEqual(first_start["host_player_id"], second_start["host_player_id"])
 
     def test_authority_owns_bot_rules_and_result_state(self):
         first = self.connect("Alpha")
@@ -357,10 +447,14 @@ class WaitingRoomTest(unittest.TestCase):
         self.state.bot_planner._engage_anchors[16] = {"x": 0.0}
 
         first.close()
+        self.clients.remove(first)
         deadline = time.time() + 2
         while time.time() < deadline and self.state.bot_authority_id != second_welcome["player_id"]:
             time.sleep(0.02)
+        roster = second.receive_type("roster")
         self.assertEqual(second_welcome["player_id"], self.state.bot_authority_id)
+        self.assertEqual(second_welcome["player_id"], self.state.host_player_id)
+        self.assertEqual(second_welcome["player_id"], roster["host_player_id"])
         self.assertEqual({1: {}, 2: {}}, self.state.bot_planner._contacts)
         self.assertEqual({}, self.state.bot_planner._affordances)
         self.assertEqual({}, self.state.bot_planner._cover_states)

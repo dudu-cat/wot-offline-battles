@@ -24,6 +24,11 @@ def _load_runtime():
     return (ArenaType, TrainingSettingsWindow)
 
 
+def _load_join_runtime():
+    from gui.Scaleform.daapi.view.lobby.header.LobbyHeader import LobbyHeader
+    return LobbyHeader
+
+
 def open_picker():
     """Open the stock training settings view, following the observer hook."""
     from gui.Scaleform.framework.managers.loaders import ViewLoadParams
@@ -39,6 +44,53 @@ def open_picker():
         OFFLINE_PICKER_FLAG: True,
     })
     return True
+
+
+class JoinButtonUI(object):
+    """A reversible adapter for #1513's native lobby fight button."""
+
+    def __init__(self, on_join, runtime=None):
+        self._on_join = on_join
+        self._runtime = runtime
+        self._installed = False
+        self._header_type = None
+        self._original_fight_click = None
+        self._had_own_fight_click = False
+        self._fight_click_wrapper = None
+
+    def install(self):
+        if self._installed:
+            return
+        header_type = self._runtime or _load_join_runtime()
+        self._runtime = header_type
+        self._header_type = header_type
+        self._had_own_fight_click = 'fightClick' in header_type.__dict__
+        # Python 2 returns a fresh unbound-method wrapper from getattr(class,
+        # method).  Retain the raw member so uninstall can compare identity.
+        self._original_fight_click = header_type.__dict__.get(
+            'fightClick', getattr(header_type, 'fightClick'))
+        adapter = self
+
+        def wrapped_fight_click(header, map_id, action_name):
+            if adapter._on_join(map_id, action_name) is True:
+                return None
+            return adapter._original_fight_click(
+                header, map_id, action_name)
+
+        self._fight_click_wrapper = wrapped_fight_click
+        header_type.fightClick = wrapped_fight_click
+        self._installed = True
+
+    def uninstall(self):
+        if not self._installed:
+            return
+        current = self._header_type.__dict__.get('fightClick')
+        if current is self._fight_click_wrapper:
+            if self._had_own_fight_click:
+                self._header_type.fightClick = self._original_fight_click
+            else:
+                delattr(self._header_type, 'fightClick')
+        self._installed = False
 
 
 class QueueUI(object):

@@ -52,13 +52,14 @@ class LANSession(object):
     """Owns one LAN connection and its reversible lobby/battle transitions."""
 
     def __init__(self, config, client_factory=None, queue_factory=None,
-                 picker_opener=None, battle_runtime=None, on_snapshot=None,
-                 on_event=None, lobby_ready=None, callback=None,
-                 cancel_callback=None, status_notifier=None):
+                 picker_opener=None, join_factory=None, battle_runtime=None,
+                 on_snapshot=None, on_event=None, lobby_ready=None,
+                 callback=None, cancel_callback=None, status_notifier=None):
         self._config = dict(config or {})
         self._client_factory = client_factory or _load_client
         self._queue_factory = queue_factory or queue_ui.QueueUI
         self._picker_opener = picker_opener or queue_ui.open_picker
+        self._join_factory = join_factory or queue_ui.JoinButtonUI
         self._battle_runtime = battle_runtime
         self._on_snapshot = on_snapshot
         self._on_event_callback = on_event
@@ -69,10 +70,11 @@ class LANSession(object):
         self.client = None
         self.snapshot = None
         self.state = 'idle'
-        # None means the server policy is not known yet.  The stock picker can
-        # still show every locally installed standard map while connecting.
+        # None means the server policy is not known yet.  Only the elected
+        # room host opens the stock picker after the welcome/roster barrier.
         self._map_pool = None
         self._queue = None
+        self._join_ui = None
         self._picker_open = False
         self._picker_callback_id = None
         self._picker_close_callback_id = None
@@ -89,6 +91,8 @@ class LANSession(object):
         self._stopped = False
         self._connection_error_notified = False
         self._client_generation = 0
+        self._host_player_id = None
+        self._waiting_notice_host_id = None
 
     def _new_client(self):
         factory = self._client_factory
@@ -118,12 +122,41 @@ class LANSession(object):
         self.client = self._new_client()
         self.state = 'connecting'
         started = bool(self.client.start())
-        if started:
-            # This is the LAN settings surface as well as the map picker.  It
-            # must exist even when the endpoint is wrong or the server starts
-            # after the client.
-            self._open_waiting_picker()
         return started
+
+    def install(self):
+        """Own the native Battle button without joining until the user clicks."""
+        if self._stopped:
+            return False
+        if self._join_ui is None:
+            self._join_ui = self._join_factory(self.join)
+            self._join_ui.install()
+        self.state = 'ready_to_join'
+        return True
+
+    def join(self, unused_map_id=None, unused_action_name=None):
+        """Handle the stock lobby Battle button as one LAN-room join action."""
+        if self._stopped:
+            return False
+        if self.client is None:
+            if not self.start():
+                self._status_notifier('The LAN room could not be joined.')
+            else:
+                self._status_notifier(
+                    'Joining LAN room at %s...' % self._endpoint_value())
+            return True
+        if self.state in ('connecting', 'retrying'):
+            self._status_notifier(
+                'Still connecting to LAN room at %s. '
+                'Opening server settings.' %
+                self._endpoint_value())
+            self._open_connection_picker()
+        elif self.state == 'waiting':
+            if self._is_local_host():
+                self._open_waiting_picker()
+            else:
+                self._show_waiting_notice(force=True)
+        return True
 
     def _endpoint_value(self):
         return port_config.format_endpoint(
@@ -176,11 +209,11 @@ class LANSession(object):
             host = self._config.get('host', '127.0.0.1')
             port = self._config.get('port', 28782)
             self._status_notifier(
-                'LAN server %s:%s is unavailable (%s). Retrying...' %
+                'LAN server %s:%s is unavailable (%s). Retrying; click '
+                'Battle! again to edit the server address.' %
                 (host, port, error))
             self._connection_error_notified = True
         if self._schedule_connection_retry():
-            self._open_waiting_picker()
             return True
         return False
 
@@ -199,12 +232,11 @@ class LANSession(object):
 
     def _on_picker_closed(self):
         self._picker_open = False
-        if (not self._stopped and self._pending_map is None and
-                self.state in ('connecting', 'retrying', 'waiting')):
-            # The retail fight button is deliberately not wired to this LAN
-            # protocol.  Keep the native LAN settings surface reachable if it
-            # is dismissed before a start request.
-            self._schedule_picker_when_lobby_ready()
+        # A user close is final.  Reopening on the next BigWorld callback can
+        # recapture the cursor while the stock window is still unwinding.
+        # The host can explicitly reopen the picker with the Battle button;
+        # start denial and host transfer also reopen it through their own
+        # state transitions.
 
     def _cancel_picker_callback(self):
         callback_id = self._picker_callback_id
@@ -242,8 +274,8 @@ class LANSession(object):
 
         def retry():
             self._picker_callback_id = None
-            if (not self._stopped and self.state in
-                    ('connecting', 'retrying', 'waiting')):
+            if (not self._stopped and self.state == 'waiting' and
+                    self._is_local_host()):
                 self._open_waiting_picker()
 
         self._picker_callback_id = self._callback(0.10, retry)
@@ -289,7 +321,8 @@ class LANSession(object):
         return False
 
     def _open_waiting_picker(self):
-        if self._stopped or self._picker_open:
+        if (self._stopped or self._picker_open or
+                not self._is_local_host()):
             return False
         if not self._lobby_ready():
             self._schedule_picker_when_lobby_ready()
@@ -298,6 +331,59 @@ class LANSession(object):
         self._ensure_queue()
         self._picker_open = bool(self._picker_opener())
         return self._picker_open
+
+    def _open_connection_picker(self):
+        """Open the native form explicitly to edit an unreachable endpoint."""
+        if (self._stopped or self._picker_open or
+                self.state not in ('connecting', 'retrying') or
+                bool(getattr(self.client, 'ready', False))):
+            return False
+        if not self._lobby_ready():
+            return False
+        # Before welcome, map_pool is None and QueueUI shows the local standard
+        # maps.  The selection is provisional: the server later decides both
+        # the valid pool and whether this client is the room host.
+        self._ensure_queue()
+        self._picker_open = bool(self._picker_opener())
+        return self._picker_open
+
+    def _is_local_host(self):
+        player_id = getattr(self.client, 'player_id', None)
+        host_player_id = self._host_player_id
+        if host_player_id is None:
+            host_player_id = getattr(self.client, 'host_player_id', None)
+        return player_id is not None and player_id == host_player_id
+
+    def _host_name(self):
+        host_player_id = self._host_player_id
+        for player in getattr(self.client, 'roster', ()) or ():
+            if (isinstance(player, dict) and
+                    player.get('id') == host_player_id):
+                return player.get('name') or str(host_player_id)
+        return str(host_player_id or 'unknown')
+
+    def _show_waiting_notice(self, force=False):
+        if (not force and
+                self._waiting_notice_host_id == self._host_player_id):
+            return
+        self._waiting_notice_host_id = self._host_player_id
+        self._status_notifier(
+            'Joined LAN room. Waiting for host %s to choose the map.' %
+            self._host_name())
+
+    def _sync_waiting_surface(self, previous_host_player_id=None):
+        if self._is_local_host():
+            self._waiting_notice_host_id = None
+            if (previous_host_player_id is not None and
+                    previous_host_player_id != self._host_player_id):
+                self._status_notifier(
+                    'You are now the LAN room host. Choose a map to start.')
+            self._open_waiting_picker()
+            return
+        if self._picker_open:
+            self._close_picker()
+        self._show_waiting_notice(
+            force=previous_host_player_id != self._host_player_id)
 
     def _close_picker(self):
         self._cancel_picker_callback()
@@ -381,9 +467,14 @@ class LANSession(object):
 
     def _waiting_event(self, message):
         self._cancel_retry_callback()
-        if self._connection_error_notified:
-            self._status_notifier('LAN server connected. Choose a map to start.')
+        recovered_connection = self._connection_error_notified
+        previous_host_player_id = self._host_player_id
+        self._host_player_id = _message_value(
+            message, 'host_player_id',
+            getattr(self.client, 'host_player_id', None))
         self._connection_error_notified = False
+        if recovered_connection:
+            self._status_notifier('LAN server connected.')
         previous_map_pool = self._map_pool
         self._map_pool = list(_message_value(
             message, 'map_pool', getattr(self.client, 'map_pool', [])) or [])
@@ -409,17 +500,24 @@ class LANSession(object):
                 self.state = 'awaiting_battle_start'
                 return
             self.state = 'waiting'
-            if map_pool_changed and self._picker_open and self._queue is not None:
+            if (map_pool_changed and self._is_local_host() and
+                    self._picker_open and self._queue is not None):
                 refresh = getattr(self._queue, 'refresh', None)
                 if callable(refresh):
                     refresh()
             if self._pending_map is not None:
                 pending_map = self._pending_map
                 self._pending_map = None
+                if not self._is_local_host():
+                    # A connection-settings form can be used before the
+                    # server has elected a host.  Guests never turn that
+                    # provisional map choice into a start request.
+                    self._sync_waiting_surface(previous_host_player_id)
+                    return
                 if pending_map not in self._map_pool:
                     self._status_notifier(
                         'The LAN server does not offer the selected map.')
-                    self._open_waiting_picker()
+                    self._sync_waiting_surface(previous_host_player_id)
                     return
                 if self.client.request_start(pending_map):
                     self._start_requested = True
@@ -428,7 +526,7 @@ class LANSession(object):
                     return
                 self._status_notifier(
                     'The LAN server did not accept the start request.')
-            self._open_waiting_picker()
+            self._sync_waiting_surface(previous_host_player_id)
         elif phase == 'battle':
             # Disconnect/failover roster updates are broadcast during a live
             # round.  They update membership but must not demote the active
@@ -621,6 +719,61 @@ class LANSession(object):
             pass
         return False
 
+    def _return_to_join_after_waiting_disconnect(self, message):
+        """Retire one lost waiting-room socket without leaving the lobby."""
+        reason = _message_value(message, 'message',
+                                _message_value(message, 'reason',
+                                               'connection lost'))
+        old_client = self.client
+
+        # Move out of waiting before closing the native picker. Its close
+        # callback must not reopen a surface owned by the retired connection.
+        self.state = 'ready_to_join'
+        self._client_generation += 1
+        self.client = None
+        self._host_player_id = None
+        self._waiting_notice_host_id = None
+        self._map_pool = None
+        self.snapshot = None
+        self._starting_round_id = None
+        self._active_round_id = None
+        self._departed_round_id = None
+        self._battle_started = False
+        self._start_requested = False
+        self._pending_map = None
+        self._connection_error_notified = False
+
+        try:
+            self._cancel_retry_callback()
+        except Exception:
+            pass
+        try:
+            self._cancel_picker_close_callback()
+        except Exception:
+            pass
+        try:
+            self._clear_pending_battle_start()
+        except Exception:
+            pass
+        try:
+            self._close_picker()
+        except Exception:
+            pass
+        if old_client is not None:
+            try:
+                old_client.on_event = None
+            except Exception:
+                pass
+            try:
+                old_client.stop()
+            except Exception:
+                pass
+
+        self._status_notifier(
+            'LAN room connection lost (%s). Click Battle! to rejoin.' %
+            reason)
+        return True
+
     def _on_event(self, kind, message):
         if self._stopped:
             return
@@ -637,7 +790,14 @@ class LANSession(object):
             self._clear_pending_battle_start()
             self._start_requested = False
             self.state = 'waiting'
-            self._open_waiting_picker()
+            self._host_player_id = _message_value(
+                message, 'host_player_id',
+                getattr(self.client, 'host_player_id',
+                        self._host_player_id))
+            if _message_value(message, 'code') == 'host_only':
+                self._status_notifier(
+                    'Only the LAN room host can choose the map and start.')
+            self._sync_waiting_surface()
         elif kind == 'battle_start':
             self._start_battle(message)
         elif kind == 'battle_failed':
@@ -662,15 +822,21 @@ class LANSession(object):
             if self._battle_runtime is not None:
                 self._battle_runtime.on_events(message)
         elif kind in ('disconnected', 'connection_lost', 'error'):
-            if (kind == 'error' and not self._battle_started and
+            if (not self._battle_started and
+                    bool(getattr(self.client, 'ready', False)) and
+                    getattr(self.client, 'phase', None) == 'waiting'):
+                self._return_to_join_after_waiting_disconnect(message)
+            elif (kind == 'error' and not self._battle_started and
                     not bool(getattr(self.client, 'ready', False)) and
                     self._retry_initial_connection(message)):
                 if self._on_event_callback is not None:
                     self._on_event_callback(kind, message)
                 return
-            # The stock window owns cursor capture.  Closing it before
-            # uninstalling our wrappers lets its normal close path release it.
-            self.stop(show_login=True)
+            else:
+                # The stock window owns cursor capture. Closing it before
+                # uninstalling our wrappers lets its normal close path release
+                # it on active-battle and unrecoverable failure paths.
+                self.stop(show_login=True)
         if self._on_event_callback is not None:
             self._on_event_callback(kind, message)
 
@@ -699,6 +865,11 @@ class LANSession(object):
         if self._queue is not None:
             try:
                 self._queue.uninstall()
+            except Exception as error:
+                errors.append(error)
+        if self._join_ui is not None:
+            try:
+                self._join_ui.uninstall()
             except Exception as error:
                 errors.append(error)
         if self.client is not None:

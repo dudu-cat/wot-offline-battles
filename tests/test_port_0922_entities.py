@@ -439,8 +439,9 @@ class AvatarServerBridgeTests(unittest.TestCase):
         bridge.doCmdStr(4, 'sync', '')
         self.assertTrue(bridge.destroy())
 
-        self.assertEqual(['create', 'added', 'select', 'entered', 'client_ready',
-                          'avatar_ready', 'period', 'removed', 'destroy'],
+        self.assertEqual(['create', 'select', 'added', 'select', 'entered',
+                          'client_ready', 'avatar_ready', 'period', 'removed',
+                          'destroy'],
                          [event[0] for event in binding.events])
         self.assertEqual([(91, 'move', {'flags': 7}),
                           (91, 'track_relative', {'point': (1, 2, 3)}),
@@ -481,6 +482,23 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertEqual([True], ready)
         self.assertFalse(bridge.setClientReady())
 
+    def test_early_player_id_is_reannounced_at_native_vehicle_enter(self):
+        module = _avatar_bridge_module()
+        binding = _BridgeBinding()
+        bridge = module.AvatarServerBridge(
+            _BridgeAvatar(), binding,
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            _Sender())
+
+        self.assertEqual(91, bridge.addVehicleToArena(_snapshot()))
+        self.assertEqual(1, [event[0] for event in binding.events].count(
+            'select'))
+
+        self.assertTrue(bridge.acceptVehicleEnter(91))
+        self.assertEqual(2, [event[0] for event in binding.events].count(
+            'select'))
+
     def test_early_ready_waits_for_vehicle_bind_and_arena_registration(self):
         module = _avatar_bridge_module()
         binding = _BridgeBinding()
@@ -497,7 +515,7 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertTrue(bridge.completeVehicleEnter(91))
         self.assertTrue(bridge.flushClientReady())
         self.assertEqual(
-            ['create', 'added', 'select', 'entered', 'client_ready',
+            ['create', 'select', 'added', 'select', 'entered', 'client_ready',
              'avatar_ready', 'period'],
             [event[0] for event in binding.events])
 
@@ -516,7 +534,7 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertFalse(bridge.completeVehicleEnter(91))
         self.assertFalse(bridge.setClientReady())
         self.assertEqual(
-            ['create', 'added', 'removed', 'destroy'],
+            ['create', 'select', 'added', 'removed', 'destroy'],
             [event[0] for event in binding.events])
 
     def test_duplicate_leave_mailbox_is_delivered_once(self):

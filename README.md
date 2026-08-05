@@ -5,10 +5,14 @@ offline/LAN battles - World of Tanks 0.8.2 and 0.9.22.0.1
 
 The `ports/0.9.22` release targets the frozen Chinese HD client. It is a
 separate CPython 2.7 `.wotmod`, not a copy of the 0.8.2 scripts. Start the
-Python 3 LAN server even for a one-player battle, then use the stock training
-settings window to edit `LAN SERVER: host:port`, choose a standard map and
-start. The window opens before the connection succeeds and owns the mouse
-through the native Scaleform UI. There is no F12 or `0` key workflow.
+Python 3 LAN server even for a one-player battle, then click the stock
+**Battle!** button to join its waiting room. The first waiting player becomes
+room host and receives the native training-settings window as a local map
+picker; later players click the same button and remain in the garage while
+they wait. Before the server accepts a client, clicking **Battle!** again
+explicitly opens the same native window to edit `LAN SERVER: host:port`. Once
+the room is waiting, only the host can open that picker, choose a standard map
+and start the shared round. There is no F12 or `0` key workflow.
 
 The 0.9.22 runtime uses native map, Avatar, Vehicle and HUD objects, fills each
 team to 15 vehicles, and supports movement, aiming, firing, damage, tactical

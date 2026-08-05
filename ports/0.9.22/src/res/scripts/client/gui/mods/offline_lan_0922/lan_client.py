@@ -103,7 +103,10 @@ class LANClient(object):
         self.map_pool = []
         self.spawn = None
         self.round_id = None
+        self.state_revision = None
+        self._battle_start_round_id = None
         self.roster = []
+        self.host_player_id = None
         self.bot_authority_id = None
         self.last_snapshot = None
         self.last_error = None
@@ -152,7 +155,8 @@ class LANClient(object):
         self.sock = None
 
     def request_start(self, map_name=None):
-        if not self.ready or self.phase != 'waiting':
+        if (not self.ready or self.phase != 'waiting' or
+                self.player_id != self.host_player_id):
             return False
         message = {'type': 'start_battle', 'round_id': self.round_id}
         if map_name:
@@ -161,6 +165,11 @@ class LANClient(object):
                 return False
             message['map'] = map_name
         return self._send(message)
+
+    def is_room_host(self):
+        return (self.ready and self.phase == 'waiting' and
+                self.player_id is not None and
+                self.player_id == self.host_player_id)
 
     def leave_battle(self):
         """Retire this player from the current round without closing TCP."""
@@ -486,12 +495,16 @@ class LANClient(object):
             player_id = _exact_int(message.get('player_id'))
             team = _exact_int(message.get('team'))
             round_id = _exact_int(message.get('round_id'))
+            state_revision = _exact_int(message.get('state_revision'))
+            host_player_id = _exact_int(message.get('host_player_id'))
             slot = _exact_int(message.get('slot'))
             max_health = _exact_int(message.get('max_health'))
             phase = _safe_text(message.get('phase'), '')
             map_name = _safe_text(message.get('map'), '')
             spawn = message.get('spawn')
-            if (player_id is None or team not in (1, 2) or
+            if (player_id is None or state_revision is None or
+                    state_revision < 0 or host_player_id is None or
+                    host_player_id <= 0 or team not in (1, 2) or
                     round_id is None or slot is None or not 0 <= slot < 15 or
                     max_health is None or max_health <= 0 or
                     phase != 'waiting' or not map_name or
@@ -512,6 +525,8 @@ class LANClient(object):
             self.spawn = dict(spawn)
             self.phase = phase
             self.round_id = round_id
+            self.state_revision = state_revision
+            self.host_player_id = host_player_id
             self.bot_authority_id = message.get('bot_authority_id')
         elif kind == 'roster':
             round_id = _exact_int(message.get('round_id'))
@@ -521,10 +536,23 @@ class LANClient(object):
                 return
             if self.round_id is not None and round_id < self.round_id:
                 return
+            state_revision = _exact_int(message.get('state_revision'))
+            if state_revision is None or state_revision < 0:
+                self.last_error = 'invalid roster message'
+                self.stop()
+                return
+            if (round_id == self.round_id and
+                    self.state_revision is not None and
+                    state_revision < self.state_revision):
+                return
             phase = _safe_text(message.get('phase'), '')
             map_name = _safe_text(message.get('map'), '')
             players = _strict_mapping_list(message.get('players'), 64)
-            if phase not in ('waiting', 'battle') or not map_name or players is None:
+            host_player_id = _exact_int(message.get('host_player_id'))
+            player_ids = set(_exact_int(value.get('id'))
+                             for value in players or ())
+            if (phase not in ('waiting', 'battle') or not map_name or
+                    players is None or host_player_id not in player_ids):
                 self.last_error = 'invalid roster message'
                 self.stop()
                 return
@@ -539,13 +567,16 @@ class LANClient(object):
             if round_id != self.round_id:
                 self.last_snapshot = None
                 self._fire_seq = 0
+                self._battle_start_round_id = None
             self.round_id = round_id
+            self.state_revision = state_revision
             self.phase = phase
             self.map_name = map_name
             maps = self._map_names(message.get('map_pool'))
             if maps:
                 self.map_pool = maps
             self.roster = players
+            self.host_player_id = host_player_id
             self.bot_authority_id = message.get(
                 'bot_authority_id', self.bot_authority_id)
         elif kind == 'battle_start':
@@ -556,21 +587,54 @@ class LANClient(object):
                 return
             if self.round_id is not None and round_id < self.round_id:
                 return
+            state_revision = _exact_int(message.get('state_revision'))
+            if state_revision is None or state_revision < 0:
+                self.last_error = 'invalid battle_start message'
+                self.stop()
+                return
+            stale_revision = (round_id == self.round_id and
+                              self.state_revision is not None and
+                              state_revision < self.state_revision)
+            if (stale_revision and
+                    self._battle_start_round_id == round_id):
+                return
+            if stale_revision:
+                # battle_start is a transition barrier, not only a state
+                # snapshot. A newer membership roster can overtake it on a
+                # different server thread. Preserve that newer roster while
+                # delivering the first start barrier exactly once.
+                message = dict(message)
+                state_revision = self.state_revision
+                message['state_revision'] = state_revision
+                if self.map_name:
+                    message['map'] = self.map_name
+                if self.roster:
+                    message['players'] = list(self.roster)
+                if self.host_player_id is not None:
+                    message['host_player_id'] = self.host_player_id
+                if self.bot_authority_id is not None:
+                    message['bot_authority_id'] = self.bot_authority_id
             map_name = _safe_text(message.get('map'), '')
             players = _strict_mapping_list(message.get('players'), 64)
             local_ids = set(_exact_int(value.get('id')) for value in players or ())
+            host_player_id = _exact_int(message.get('host_player_id'))
             if (not map_name or not players or
-                    self.player_id not in local_ids):
+                    self.player_id not in local_ids or
+                    host_player_id not in local_ids):
                 self.last_error = 'invalid battle_start message'
                 self.stop()
                 return
             if round_id != self.round_id:
                 self.last_snapshot = None
                 self._fire_seq = 0
+                self._battle_start_round_id = None
             self.phase = 'battle'
             self.map_name = map_name
             self.round_id = round_id
+            self.state_revision = state_revision
             self.roster = players
+            self.host_player_id = host_player_id
+            self._battle_start_round_id = round_id
             self.bot_authority_id = message.get(
                 'bot_authority_id', self.bot_authority_id)
         elif kind == 'start_denied':

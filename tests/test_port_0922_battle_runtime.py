@@ -187,11 +187,14 @@ class _Compatibility(object):
         self.configured = []
         self.hangar_space = None
         self.bigworld = None
+        self.app_loader = None
         self.retired_players = set()
         self.disconnect_calls = 0
 
-    def configure_battle(self, gui_type, bonus_type):
-        self.configured.append((gui_type, bonus_type))
+    def configure_battle(self, gui_type, bonus_type, player_name=None,
+                         player_team=None):
+        self.configured.append(
+            (gui_type, bonus_type, player_name, player_team))
 
     def attach_avatar_server(self, avatar, bridge):
         self.bridge = bridge
@@ -223,6 +226,8 @@ class _Compatibility(object):
         account = _Avatar()
         if self.bigworld is not None:
             self.bigworld.avatar = account
+        if self.app_loader is not None:
+            self.app_loader.showLobby()
         return account
 
     def disconnect(self):
@@ -235,23 +240,75 @@ class _Compatibility(object):
 class _AppLoader(object):
     __slots__ = (
         '__state', '__ctx', '__appFactory',
-        'onGUISpaceLeft', 'onGUISpaceEntered')
+        'onGUISpaceLeft', 'onGUISpaceEntered', 'space_id',
+        'actual_space_id', 'transitions')
 
     battle_page_calls = mock.Mock(return_value=True)
+    battle_loading_calls = mock.Mock(return_value=True)
     lobby_callback = None
 
+    def __init__(self):
+        self._AppLoader__state = _AppState(self)
+        self._AppLoader__ctx = None
+        self._AppLoader__appFactory = None
+        self.onGUISpaceLeft = None
+        self.onGUISpaceEntered = None
+        self.space_id = 4
+        self.actual_space_id = 4
+        self.transitions = []
+
+    def getSpaceID(self):
+        return self.space_id
+
+    def showBattleLoading(self):
+        result = type(self).battle_loading_calls()
+        self.transitions.append((self.actual_space_id, 5))
+        # Match exact changeSpace(): ctx is mutated before the current state
+        # accepts or rejects the requested transition.
+        self.space_id = 5
+        if result:
+            self.actual_space_id = 5
+        return result
+
     def showBattlePage(self):
-        return type(self).battle_page_calls()
+        result = type(self).battle_page_calls()
+        self.transitions.append((self.actual_space_id, 6))
+        self.space_id = 6
+        if result:
+            self.actual_space_id = 6
+        return result
 
     def showLobby(self):
         callback = type(self).lobby_callback
+        self.transitions.append((self.actual_space_id, 4))
+        self.space_id = 4
+        self.actual_space_id = 4
         if callable(callback):
             return callback()
         return True
 
 
+class _AppState(object):
+    def __init__(self, loader):
+        self.loader = loader
+
+    def getSpaceID(self):
+        return self.loader.actual_space_id
+
+
 _APP_LOADER_SHOW_BATTLE_PAGE = _AppLoader.__dict__['showBattlePage']
+_APP_LOADER_SHOW_BATTLE_LOADING = _AppLoader.__dict__['showBattleLoading']
 _APP_LOADER_SHOW_LOBBY = _AppLoader.__dict__['showLobby']
+
+
+class _ArenaLoadController(object):
+    def __init__(self, app_loader):
+        self.app_loader = app_loader
+        self.invalidations = 0
+
+    def invalidateArenaInfo(self):
+        self.invalidations += 1
+        return self.app_loader.showBattleLoading()
 
 
 class _OfflineMap(object):
@@ -270,6 +327,10 @@ class _OfflineMap(object):
         self.map_name = map_name
         if self.bigworld is not None and self.bigworld.avatar is None:
             self.bigworld.avatar = _Avatar()
+        if self.bigworld is not None:
+            self.bigworld.avatar.guiSessionProvider = types.SimpleNamespace(
+                shared=types.SimpleNamespace(
+                    arenaLoad=_ArenaLoadController(self.app_loader)))
         self._OfflineMapCreator__setupCamera()
 
     def _OfflineMapCreator__setupCamera(self):
@@ -307,6 +368,7 @@ class _BigWorld(object):
         self.callbacks = []
         self.operations = []
         self.now = 10.0
+        self.space_status = 1.0
         self.next_id = 100
         self.defer_vehicle_entry = False
         self.pending_entities = {}
@@ -325,7 +387,7 @@ class _BigWorld(object):
         pass
 
     def spaceLoadStatus(self):
-        return 1.0
+        return self.space_status
 
     def createEntity(self, name, space_id, vehicle_id, position, rotation,
                      properties):
@@ -413,9 +475,12 @@ def _runtime():
     hangar_space = _HangarSpace(bigworld.operations)
     compatibility.hangar_space = hangar_space
     _AppLoader.showBattlePage = _APP_LOADER_SHOW_BATTLE_PAGE
+    _AppLoader.showBattleLoading = _APP_LOADER_SHOW_BATTLE_LOADING
     _AppLoader.showLobby = _APP_LOADER_SHOW_LOBBY
     app_loader = _AppLoader()
+    compatibility.app_loader = app_loader
     _AppLoader.battle_page_calls = mock.Mock(return_value=True)
+    _AppLoader.battle_loading_calls = mock.Mock(return_value=True)
     _AppLoader.lobby_callback = None
     constants = types.SimpleNamespace(
         ARENA_GUI_TYPE=types.SimpleNamespace(RANDOM=1),
@@ -440,6 +505,8 @@ def _runtime():
         compatibility=compatibility, constants=constants,
         encode_gun_angles=lambda *unused: 0,
         game=types.SimpleNamespace(abort=mock.Mock()),
+        gui_global_space_id=types.SimpleNamespace(
+            LOBBY=4, BATTLE_LOADING=5, BATTLE=6),
         hangar_space=types.SimpleNamespace(
             g_hangarSpace=hangar_space),
         math=types.SimpleNamespace(Vector3=_Vector),
@@ -670,7 +737,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'name': 'Player'}, {}, _Client()))
 
         runtime.offline_map_creator.create.assert_not_called()
-        self.assertEqual(['destroy', 'restore'], calls)
+        self.assertEqual(['restore'], calls)
         self.assertEqual('failed', battle.state)
         self.assertFalse(battle._map_create_attempted)
 
@@ -711,11 +778,19 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(battle.start({
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, start, client))
-        runtime.bigworld.callbacks.pop(0)()
 
         self.assertEqual('loading_entities', battle.state)
         self.assertIsNotNone(battle._server.vehicle_id)
+        self.assertEqual(
+            battle._server.vehicle_id,
+            runtime.bigworld.avatar.playerVehicleID)
+        self.assertEqual(
+            runtime.constants.ARENA_UPDATE.VEHICLE_ADDED,
+            runtime.bigworld.avatar.arena_updates[0][0])
         self.assertIsNone(runtime.bigworld.entity(battle._server.vehicle_id))
+        self.assertEqual([(4, 5)], runtime.app_loader.transitions)
+
+        runtime.bigworld.callbacks.pop(0)()
         runtime.bigworld.enter_pending_vehicle(battle._server.vehicle_id)
         self.assertEqual('loading_entities', battle.state)
         runtime.bigworld.callbacks.pop(0)()
@@ -752,6 +827,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
     def test_vehicle_ready_gets_a_fresh_timeout_after_slow_map_load(self):
         runtime = _runtime()
         runtime.bigworld.defer_vehicle_entry = True
+        runtime.bigworld.space_status = 0.0
         battle = BattleRuntime(runtime)
         client = _Client()
         start = {
@@ -769,6 +845,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.bigworld.callbacks.pop(0)()
 
         self.assertEqual('loading_entities', battle.state)
+        self.assertEqual(0.0, battle._vehicle_ready_deadline)
+        runtime.bigworld.space_status = 1.0
+        runtime.bigworld.callbacks.pop(0)()
         self.assertGreater(battle._vehicle_ready_deadline, map_deadline)
 
     def test_initial_ammo_failure_does_not_leave_a_frame_callback(self):
@@ -788,12 +867,57 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.bigworld.avatar.updateVehicleAmmo = mock.Mock(
             side_effect=RuntimeError('ammo failed'))
         runtime.bigworld.callbacks.pop(0)()
-        runtime.bigworld.callbacks.pop(0)()
 
         self.assertEqual('failed', battle.state)
         self.assertIsNone(battle._callback_id)
         self.assertIsNone(battle._ammo_callback_id)
         self.assertEqual([], runtime.bigworld.callbacks)
+
+    def test_gui_guard_orders_fast_page_and_ignores_late_loading(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+
+        battle._install_battle_gui_guard()
+        runtime.app_loader.showBattlePage()
+        runtime.app_loader.showBattleLoading()
+
+        self.assertEqual([(4, 5), (5, 6)], runtime.app_loader.transitions)
+        type(runtime.app_loader).battle_loading_calls.assert_called_once_with()
+        type(runtime.app_loader).battle_page_calls.assert_called_once_with()
+        battle._restore_battle_gui_guard()
+        self.assertIs(
+            _APP_LOADER_SHOW_BATTLE_LOADING,
+            type(runtime.app_loader).__dict__['showBattleLoading'])
+        self.assertIs(
+            _APP_LOADER_SHOW_BATTLE_PAGE,
+            type(runtime.app_loader).__dict__['showBattlePage'])
+
+    def test_gui_guard_does_not_trust_ctx_after_rejected_loading(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        type(runtime.app_loader).battle_loading_calls.return_value = False
+
+        battle._install_battle_gui_guard()
+        runtime.app_loader.showBattlePage()
+
+        # Exact changeSpace() has already polluted __ctx.guiSpaceID, which is
+        # what public getSpaceID() returns, but LobbyState rejected the change.
+        self.assertEqual(5, runtime.app_loader.getSpaceID())
+        self.assertEqual(4, runtime.app_loader.actual_space_id)
+        self.assertEqual([(4, 5)], runtime.app_loader.transitions)
+        type(runtime.app_loader).battle_page_calls.assert_not_called()
+
+    def test_gui_guard_never_enters_loading_from_waiting(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        runtime.app_loader.space_id = 7
+        runtime.app_loader.actual_space_id = 7
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'not in the lobby state'):
+            battle._install_battle_gui_guard()
+
+        type(runtime.app_loader).battle_loading_calls.assert_not_called()
 
     def test_stale_callback_cannot_clear_a_new_generation_handle(self):
         runtime = _runtime()

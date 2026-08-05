@@ -198,6 +198,8 @@ class OfflineCompatibility(object):
         self._native_battle = False
         self._battle_gui_type = None
         self._battle_bonus_type = None
+        self._battle_player_name = 'OfflinePlayer'
+        self._battle_player_team = 1
         self._original_account_init = None
         self._original_account_getattribute = None
         self._original_account_become_player = None
@@ -954,13 +956,18 @@ class OfflineCompatibility(object):
             raise RuntimeError('offline compatibility is not installed')
         self._runtime.offline_map_creator.SetActive(True)
 
-    def configure_battle(self, gui_type=None, bonus_type=None):
+    def configure_battle(self, gui_type=None, bonus_type=None,
+                         player_name=None, player_team=None):
         """Enable the normal battle UI/input path for the next native Avatar."""
         self.install()
         self._battle_active = True
         self._native_battle = True
         self._battle_gui_type = gui_type
         self._battle_bonus_type = bonus_type
+        if player_name is not None:
+            self._battle_player_name = player_name
+        if player_team is not None:
+            self._battle_player_team = int(player_team)
         self.activate_map()
 
     def attach_avatar_server(self, avatar, server):
@@ -980,8 +987,12 @@ class OfflineCompatibility(object):
 
     def _prepare_avatar_properties(self, avatar):
         values = {
-            'name': 'OfflinePlayer',
-            'team': 1,
+            # These are server properties in a retail battle.  Seed the exact
+            # LAN roster identity before PlayerAvatar.onBecomePlayer creates
+            # ArenaDataProvider; a later name fallback must never disagree
+            # with the VEHICLE_ADDED record.
+            'name': self._battle_player_name,
+            'team': self._battle_player_team,
             'playerVehicleID': 0,
             'ownVehicleAuxPhysicsData': 0,
             'ownVehicleGear': 0,
@@ -1029,6 +1040,8 @@ class OfflineCompatibility(object):
             self._native_battle = False
             self._battle_gui_type = None
             self._battle_bonus_type = None
+            self._battle_player_name = 'OfflinePlayer'
+            self._battle_player_team = 1
 
     def disconnect(self):
         if self._runtime is None:

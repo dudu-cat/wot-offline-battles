@@ -296,13 +296,13 @@ def _wait_for_lobby():
                 _config, lobby_ready=_native_lobby_is_ready,
                 callback=BigWorld.callback,
                 cancel_callback=BigWorld.cancelCallback)
-            if not _session.start():
+            if not _session.install():
                 _session.stop(show_login=False, restore_account=False)
                 _session = None
-                raise RuntimeError('LAN session did not start')
+                raise RuntimeError('LAN Battle button did not install')
             _remove_lobby_listener()
             sys.stdout.write(
-                '[Offline LAN 0.9.22] lobby ready; LAN settings opened for '
+                '[Offline LAN 0.9.22] lobby ready; click Battle to join '
                 '%s:%s\n' % (
                     _config.get('host', '127.0.0.1'),
                     _config.get('port', 28782)))

@@ -67,6 +67,7 @@ def _load_runtime():
     from OfflineMapCreator import g_offlineMapCreator
     from gun_rotation_shared import encodeGunAngles
     from gui.app_loader import g_appLoader
+    from gui.app_loader.settings import GUI_GLOBAL_SPACE_ID
     from gui.mods.offline_lan_0922.compat import g_compatibility
     from gui.shared.utils import HangarSpace
     from items import vehicles
@@ -83,6 +84,7 @@ def _load_runtime():
     runtime.constants = constants
     runtime.encode_gun_angles = encodeGunAngles
     runtime.game = game
+    runtime.gui_global_space_id = GUI_GLOBAL_SPACE_ID
     runtime.hangar_space = HangarSpace
     runtime.math = Math
     runtime.offline_map_creator = g_offlineMapCreator
@@ -163,6 +165,7 @@ class BattleRuntime(object):
         self._vehicle_ready_deadline = 0.0
         self._map_create_attempted = False
         self._lobby_retire_started = False
+        self._app_loader_guard = None
         self._avatar = None
         self._binding = None
         self._server = None
@@ -221,10 +224,14 @@ class BattleRuntime(object):
             if arena_type is None:
                 raise RuntimeError('standard arena definition is unavailable')
             constants = self._runtime.constants
+            local_identity = self._local_state()
             self._runtime.compatibility.configure_battle(
                 getattr(constants.ARENA_GUI_TYPE, 'RANDOM', 0),
-                getattr(constants.ARENA_BONUS_TYPE, 'REGULAR', 0))
+                getattr(constants.ARENA_BONUS_TYPE, 'REGULAR', 0),
+                local_identity.get('name', self.client.name),
+                int(local_identity.get('team', self.client.team)))
             self._retire_lobby_entities()
+            self._install_battle_gui_guard()
             # OfflineMapCreator.create() catches some native setup failures and
             # only calls cancel(), which resets ids but does not clear the
             # partially-created Avatar or space.  Remember the attempt before
@@ -249,9 +256,12 @@ class BattleRuntime(object):
             # battle, not the viewer mode used by OfflineMapCreator.  destroy()
             # does not require Active(), so it still owns the exact space ids.
             self._runtime.offline_map_creator.SetActive(False)
-            self.state = 'loading_space'
-            self._schedule(0.05, self._wait_for_space)
-            return True
+            # Arena metadata exists while geometry and Vehicle prerequisites
+            # are still loading in a normal battle.  Publishing it now gives
+            # ArenaDataProvider a player id before a fast space-complete
+            # callback can request the final battle page.
+            self._create_entities()
+            return self.state != 'failed'
         except Exception as error:
             self._fail(error)
             return False
@@ -390,6 +400,98 @@ class BattleRuntime(object):
                     except AttributeError:
                         pass
 
+    def _install_battle_gui_guard(self):
+        """Keep exact #1513 GUI transitions ordered for this local round.
+
+        Space loading and arena-roster polling run on separate callbacks.  The
+        stock server makes their ordering deterministic; this client-only
+        runtime must tolerate either callback arriving first without allowing
+        Lobby -> Battle or a late Battle -> BattleLoading regression.
+        """
+        if self._app_loader_guard is not None:
+            return
+        app_loader = self._runtime.app_loader
+        loader_type = type(app_loader)
+        loader_dict = getattr(loader_type, '__dict__', {})
+        original_loading = loader_dict.get('showBattleLoading')
+        original_page = loader_dict.get('showBattlePage')
+        space_ids = getattr(self._runtime, 'gui_global_space_id', None)
+        if (not callable(original_loading) or not callable(original_page) or
+                space_ids is None):
+            raise RuntimeError('battle GUI state boundaries are unavailable')
+        lobby_id = space_ids.LOBBY
+        loading_id = space_ids.BATTLE_LOADING
+        battle_id = space_ids.BATTLE
+
+        def actual_space_id(loader):
+            # Exact #1513 getSpaceID() returns __ctx.guiSpaceID.  changeSpace()
+            # writes that requested id *before* asking the current state to
+            # accept it, so a rejected transition leaves the public value
+            # polluted.  The state object is the authoritative boundary.
+            state = getattr(loader, '_AppLoader__state', None)
+            get_state_space_id = getattr(state, 'getSpaceID', None)
+            if not callable(get_state_space_id):
+                raise RuntimeError('actual battle GUI state is unavailable')
+            return get_state_space_id()
+
+        if actual_space_id(app_loader) != lobby_id:
+            raise RuntimeError('battle GUI is not in the lobby state')
+
+        def ordered_loading(loader):
+            if loader is not app_loader:
+                return original_loading(loader)
+            if actual_space_id(loader) != lobby_id:
+                return None
+            result = original_loading(loader)
+            if (not result or
+                    actual_space_id(loader) != loading_id):
+                return None
+            return result
+
+        def ordered_page(loader):
+            if loader is not app_loader:
+                return original_page(loader)
+            current = actual_space_id(loader)
+            if current == battle_id:
+                return None
+            if current == lobby_id:
+                if not ordered_loading(loader):
+                    return None
+                current = actual_space_id(loader)
+            # Never hand an illegal transition to Scaleform.  The startup
+            # timeout will recover the lobby if the native loading state could
+            # not be established.
+            if current != loading_id:
+                return None
+            result = original_page(loader)
+            if (not result or
+                    actual_space_id(loader) != battle_id):
+                return None
+            return result
+
+        loader_type.showBattleLoading = ordered_loading
+        loader_type.showBattlePage = ordered_page
+        self._app_loader_guard = {
+            'type': loader_type,
+            'loading_original': original_loading,
+            'loading_wrapper': ordered_loading,
+            'page_original': original_page,
+            'page_wrapper': ordered_page,
+        }
+
+    def _restore_battle_gui_guard(self):
+        guard = self._app_loader_guard
+        self._app_loader_guard = None
+        if guard is None:
+            return
+        loader_type = guard['type']
+        loader_dict = getattr(loader_type, '__dict__', {})
+        if (loader_dict.get('showBattleLoading') is
+                guard['loading_wrapper']):
+            loader_type.showBattleLoading = guard['loading_original']
+        if loader_dict.get('showBattlePage') is guard['page_wrapper']:
+            loader_type.showBattlePage = guard['page_original']
+
     def _standard_arena(self, map_name):
         for unused_id, arena_type in self._runtime.arena_cache.items():
             if (getattr(arena_type, 'geometryName', None) == map_name and
@@ -442,24 +544,10 @@ class BattleRuntime(object):
             if self._callback_token is token:
                 self._callback_id = callback_id
 
-    def _wait_for_space(self):
-        try:
-            if float(self._runtime.bigworld.spaceLoadStatus()) >= 1.0:
-                self._create_entities()
-                return
-        except Exception as error:
-            self._fail(error)
-            return
-        if self._clock() >= self._deadline:
-            self._fail(RuntimeError('map loading timed out'))
-            return
-        self._schedule(0.05, self._wait_for_space)
-
     def _create_entities(self):
         try:
             self.state = 'loading_entities'
-            self._vehicle_ready_deadline = self._clock() + float(
-                self._config.get('startupTimeoutSeconds', 30.0))
+            self._vehicle_ready_deadline = 0.0
             local = self._local_state()
             descriptor = self._runtime.vehicles.VehicleDescr(
                 typeName=local.get('vehicle', self._config['vehicle']))
@@ -495,6 +583,7 @@ class BattleRuntime(object):
                 'period': 'battle',
             }
             vehicle_id = self._server.addVehicleToArena(snapshot)
+            self._invalidate_native_arena_info()
             local_key = 'player:%s' % self.client.player_id
             self._records[local_key] = {
                 'engine_id': vehicle_id, 'state': dict(local),
@@ -507,10 +596,29 @@ class BattleRuntime(object):
         except Exception as error:
             self._fail(error)
 
+    def _invalidate_native_arena_info(self):
+        """Start stock BattleLoading after player id and roster are present."""
+        provider = getattr(self._avatar, 'guiSessionProvider', None)
+        shared = getattr(provider, 'shared', None)
+        arena_load = getattr(shared, 'arenaLoad', None)
+        invalidate = getattr(arena_load, 'invalidateArenaInfo', None)
+        if not callable(invalidate):
+            raise RuntimeError('native arena-load controller is unavailable')
+        invalidate()
+
     def _wait_for_client_ready(self):
         if self.state != 'loading_entities':
             return
         try:
+            if float(self._runtime.bigworld.spaceLoadStatus()) < 1.0:
+                if self._clock() >= self._deadline:
+                    self._fail(RuntimeError('map loading timed out'))
+                    return
+                self._schedule(0.05, self._wait_for_client_ready)
+                return
+            if self._vehicle_ready_deadline <= 0.0:
+                self._vehicle_ready_deadline = self._clock() + float(
+                    self._config.get('startupTimeoutSeconds', 30.0))
             self._server.flushClientReady()
             if self._client_ready_received:
                 self._finish_entity_startup()
@@ -1480,6 +1588,11 @@ class BattleRuntime(object):
                 'lobby teardown retained the Account')
         try:
             self._runtime.compatibility.deactivate_map()
+        except Exception as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        try:
+            self._restore_battle_gui_guard()
         except Exception as error:
             if cleanup_error is None:
                 cleanup_error = error

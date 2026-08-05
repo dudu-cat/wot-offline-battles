@@ -137,7 +137,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.6</version></root>')
+            '<version>0.3.7</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -1193,6 +1193,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
 
         def strict_avatar_init(avatar):
             observed['name'] = avatar.name
+            observed['team'] = avatar.team
             observed['vehicle_id'] = avatar.playerVehicleID
             observed['mailboxes'] = (
                 avatar.base, avatar.cell, avatar.server, avatar.bwProto)
@@ -1200,11 +1201,13 @@ class OfflineCompatibilityTests(unittest.TestCase):
         runtime.avatar_module.PlayerAvatar.__init__ = strict_avatar_init
         compatibility = compatibility_module.OfflineCompatibility(runtime)
         compatibility.connect(show_lobby=True)
-        compatibility.configure_battle()
+        compatibility.configure_battle(
+            player_name='Player-250', player_team=2)
 
         avatar = runtime.avatar_module.PlayerAvatar()
 
-        self.assertEqual('OfflinePlayer', observed['name'])
+        self.assertEqual('Player-250', observed['name'])
+        self.assertEqual(2, observed['team'])
         self.assertEqual(0, observed['vehicle_id'])
         self.assertEqual(
             (avatar.fakeServer,) * 4, observed['mailboxes'])
@@ -1790,6 +1793,7 @@ class LANClientTests(unittest.TestCase):
             'protocol': module.PROTOCOL_VERSION,
             'client_build': module.CLIENT_BUILD,
             'player_id': 7,
+            'host_player_id': 7,
             'name': 'Player',
             'vehicle': 'ussr:MS-1',
             'max_health': 100,
@@ -1799,6 +1803,7 @@ class LANClientTests(unittest.TestCase):
             'map_pool': ['01_karelia', '04_himmelsdorf'],
             'phase': 'waiting',
             'round_id': 3,
+            'state_revision': 4,
             'spawn': {'x': 0, 'y': 0, 'z': 0, 'yaw': 0},
         })
         client._handle_message({
@@ -1806,13 +1811,16 @@ class LANClientTests(unittest.TestCase):
             'protocol': module.PROTOCOL_VERSION,
             'phase': 'waiting',
             'round_id': 3,
+            'state_revision': 4,
             'map': '01_karelia',
             'map_pool': ['01_karelia', '04_himmelsdorf'],
+            'host_player_id': 7,
             'players': [{'id': 7}, {'id': 8}],
         })
 
         self.assertTrue(client.ready)
         self.assertEqual(7, client.player_id)
+        self.assertTrue(client.is_room_host())
         self.assertEqual(2, len(client.roster))
         self.assertFalse(client.request_start('99_missing'))
         self.assertTrue(client.request_start('04_himmelsdorf'))
@@ -1821,6 +1829,91 @@ class LANClientTests(unittest.TestCase):
         self.assertIn('"map":"04_himmelsdorf"', sent)
         self.assertEqual(['welcome', 'roster'],
                          [item[0] for item in events])
+
+    def test_guest_cannot_request_start_or_select_map(self):
+        _, client, _, _ = self._client()
+        client.ready = True
+        client.connected = True
+        client.phase = 'waiting'
+        client.player_id = 8
+        client.host_player_id = 7
+        client.round_id = 3
+        client.map_pool = ['01_karelia', '04_himmelsdorf']
+        client.sock = _LANSocket()
+
+        self.assertFalse(client.is_room_host())
+        self.assertFalse(client.request_start('04_himmelsdorf'))
+        self.assertEqual([], client.sock.payloads)
+
+    def test_older_same_round_roster_cannot_roll_back_room_host(self):
+        _, client, events, _ = self._client()
+        client.running = True
+        client.connected = True
+        client.ready = True
+        client.player_id = 2
+        client.round_id = 3
+        client.state_revision = 4
+        client.phase = 'waiting'
+        client.map_pool = ['01_karelia']
+        client.sock = _LANSocket()
+
+        client._handle_message({
+            'type': 'roster', 'protocol': 5, 'round_id': 3,
+            'state_revision': 6, 'phase': 'waiting',
+            'map': '01_karelia', 'host_player_id': 2,
+            'players': [{'id': 2, 'name': 'NewHost'}]})
+        client._handle_message({
+            'type': 'roster', 'protocol': 5, 'round_id': 3,
+            'state_revision': 5, 'phase': 'waiting',
+            'map': '01_karelia', 'host_player_id': 1,
+            'players': [{'id': 1, 'name': 'OldHost'},
+                        {'id': 2, 'name': 'NewHost'}]})
+
+        self.assertEqual(6, client.state_revision)
+        self.assertEqual(2, client.host_player_id)
+        self.assertEqual([2], [value['id'] for value in client.roster])
+        self.assertEqual(['roster'], [value[0] for value in events])
+        self.assertTrue(client.request_start('01_karelia'))
+
+    def test_overtaken_battle_start_keeps_newer_roster_and_fires_once(self):
+        _, client, events, _ = self._client()
+        client.running = True
+        client.ready = True
+        client.player_id = 2
+        client.round_id = 3
+        client.state_revision = 4
+        client.phase = 'waiting'
+
+        client._handle_message({
+            'type': 'roster', 'protocol': 5, 'round_id': 3,
+            'state_revision': 6, 'phase': 'battle',
+            'map': '01_karelia', 'host_player_id': 2,
+            'bot_authority_id': 2,
+            'players': [{'id': 2, 'name': 'NewHost'}]})
+        stale_start = {
+            'type': 'battle_start', 'protocol': 5, 'round_id': 3,
+            'state_revision': 5, 'map': '01_karelia',
+            'host_player_id': 1,
+            'bot_authority_id': 1,
+            'players': [{'id': 1, 'name': 'OldHost'},
+                        {'id': 2, 'name': 'NewHost'}],
+            'bots': [],
+        }
+        client._handle_message(stale_start)
+        client._handle_message(stale_start)
+
+        self.assertEqual(6, client.state_revision)
+        self.assertEqual(2, client.host_player_id)
+        self.assertEqual([2], [value['id'] for value in client.roster])
+        self.assertEqual(['roster', 'battle_start'],
+                         [value[0] for value in events])
+        delivered = events[-1][1]
+        self.assertEqual(6, delivered['state_revision'])
+        self.assertEqual(2, delivered['host_player_id'])
+        self.assertEqual(2, delivered['bot_authority_id'])
+        self.assertEqual(2, client.bot_authority_id)
+        self.assertEqual([2], [value['id']
+                              for value in delivered['players']])
 
     def test_poll_coalesces_snapshots_without_crossing_state_barriers(self):
         _, client, events, bigworld = self._client()
@@ -1836,8 +1929,9 @@ class LANClientTests(unittest.TestCase):
             'players': [], 'bots': []})
         client._queue_message({
             'type': 'roster', 'protocol': 5,
-            'round_id': 4, 'phase': 'battle',
-            'map': '01_karelia', 'players': []})
+            'round_id': 4, 'state_revision': 2, 'phase': 'battle',
+            'map': '01_karelia', 'host_player_id': 7,
+            'players': [{'id': 7}]})
         client._queue_message({
             'type': 'snapshot', 'protocol': 5,
             'round_id': 4, 'server_tick': 2,
@@ -1858,9 +1952,17 @@ class LANClientTests(unittest.TestCase):
         self.assertIsNone(client._poll_callback)
 
     def test_protocol_mismatch_stops_without_raising(self):
-        _, client, _, _ = self._client()
+        module, client, _, _ = self._client()
         client.running = True
-        client._handle_message({'type': 'welcome', 'protocol': 'invalid'})
+        client._handle_message({
+            'type': 'welcome', 'protocol': 'invalid',
+            'client_build': module.CLIENT_BUILD, 'player_id': 7,
+            'host_player_id': 7, 'name': 'Player',
+            'vehicle': 'ussr:MS-1', 'max_health': 100,
+            'team': 1, 'slot': 0, 'round_id': 1,
+            'state_revision': 1,
+            'phase': 'waiting', 'map': '01_karelia',
+            'spawn': {'x': 0, 'y': 0, 'z': 0}})
         self.assertFalse(client.running)
         self.assertEqual('protocol mismatch', client.last_error)
 
@@ -1870,6 +1972,12 @@ class LANClientTests(unittest.TestCase):
         client._handle_message({
             'type': 'welcome', 'protocol': module.PROTOCOL_VERSION,
             'client_build': 'wot-0.8.2',
+            'player_id': 7, 'host_player_id': 7, 'name': 'Player',
+            'vehicle': 'ussr:MS-1', 'max_health': 100,
+            'team': 1, 'slot': 0, 'round_id': 1,
+            'state_revision': 1,
+            'phase': 'waiting', 'map': '01_karelia',
+            'spawn': {'x': 0, 'y': 0, 'z': 0},
         })
         self.assertFalse(client.running)
         self.assertFalse(client.ready)
@@ -1897,8 +2005,9 @@ class LANClientTests(unittest.TestCase):
         client._fire_seq = 9
         client._handle_message({
             'type': 'roster', 'protocol': 5,
-            'round_id': 6, 'phase': 'waiting',
-            'map': '01_karelia', 'players': []})
+            'round_id': 6, 'state_revision': 8, 'phase': 'waiting',
+            'map': '01_karelia', 'host_player_id': 7,
+            'players': [{'id': 7}]})
         self.assertEqual(6, client.round_id)
         self.assertIsNone(client.last_snapshot)
         self.assertEqual(0, client._fire_seq)
@@ -1911,7 +2020,7 @@ class LANClientTests(unittest.TestCase):
 
         client._queue_message({
             'type': 'roster', 'round_id': 2, 'phase': 'waiting',
-            'players': []})
+            'host_player_id': 7, 'players': [{'id': 7}]})
 
         self.assertEqual(module.MAX_PENDING_MESSAGES, len(client._pending))
         self.assertEqual('roster', client._pending[-1]['type'])
@@ -1923,11 +2032,64 @@ class LANClientTests(unittest.TestCase):
         client._handle_message({
             'type': 'welcome', 'protocol': 5,
             'client_build': module.CLIENT_BUILD, 'player_id': 'bad',
-            'team': 1, 'round_id': 1})
+            'host_player_id': 7, 'name': 'Player',
+            'vehicle': 'ussr:MS-1', 'max_health': 100,
+            'team': 1, 'slot': 0, 'round_id': 1,
+            'state_revision': 1,
+            'phase': 'waiting', 'map': '01_karelia',
+            'spawn': {'x': 0, 'y': 0, 'z': 0}})
 
         self.assertFalse(client.running)
         self.assertFalse(client.ready)
         self.assertEqual('invalid welcome message', client.last_error)
+
+    def test_missing_welcome_host_fails_closed(self):
+        module, client, _, _ = self._client()
+        client.running = True
+
+        client._handle_message({
+            'type': 'welcome', 'protocol': 5,
+            'client_build': module.CLIENT_BUILD, 'player_id': 7,
+            'name': 'Player', 'vehicle': 'ussr:MS-1',
+            'max_health': 100, 'team': 1, 'slot': 0, 'round_id': 1,
+            'state_revision': 1,
+            'phase': 'waiting', 'map': '01_karelia',
+            'spawn': {'x': 0, 'y': 0, 'z': 0}})
+
+        self.assertFalse(client.running)
+        self.assertFalse(client.ready)
+        self.assertEqual('invalid welcome message', client.last_error)
+
+    def test_malformed_roster_host_fails_closed(self):
+        _, client, _, _ = self._client()
+        client.running = True
+        client.round_id = 3
+
+        client._handle_message({
+            'type': 'roster', 'protocol': 5, 'round_id': 3,
+            'state_revision': 4,
+            'phase': 'waiting', 'map': '01_karelia',
+            'host_player_id': 'not-an-id', 'players': [{'id': 7}]})
+
+        self.assertFalse(client.running)
+        self.assertEqual('invalid roster message', client.last_error)
+
+    def test_battle_start_host_must_be_in_roster(self):
+        _, client, _, _ = self._client()
+        client.running = True
+        client.ready = True
+        client.player_id = 7
+        client.round_id = 3
+
+        client._handle_message({
+            'type': 'battle_start', 'protocol': 5, 'round_id': 3,
+            'state_revision': 4,
+            'map': '01_karelia', 'host_player_id': 8,
+            'players': [{'id': 7}]})
+
+        self.assertFalse(client.running)
+        self.assertFalse(client.ready)
+        self.assertEqual('invalid battle_start message', client.last_error)
 
     def test_malformed_current_round_snapshot_fails_closed(self):
         _, client, _, _ = self._client()
@@ -2006,7 +2168,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.6'
+        package.PORT_VERSION = '0.3.7'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []
@@ -2021,7 +2183,7 @@ class BootstrapContractTests(unittest.TestCase):
             'startupTimeoutSeconds': 30.0,
         })
         session = types.SimpleNamespace(
-            start=mock.Mock(return_value=True), stop=mock.Mock())
+            install=mock.Mock(return_value=True), stop=mock.Mock())
         lan_session = types.ModuleType(
             'gui.mods.offline_lan_0922.lan_session')
         lan_session.LANSession = mock.Mock(return_value=session)
@@ -2193,7 +2355,7 @@ class BootstrapContractTests(unittest.TestCase):
             lobby_ready=module._native_lobby_is_ready,
             callback=bigworld.callback,
             cancel_callback=bigworld.cancelCallback)
-        session.start.assert_called_once_with()
+        session.install.assert_called_once_with()
         session.stop.assert_called_once_with(
             show_login=False, restore_account=False)
         expected_connect = mock.call(

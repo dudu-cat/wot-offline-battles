@@ -76,6 +76,74 @@ _WINDOW_CLOSE = _Window.onWindowClose
 _WINDOW_GET_INFO = _Window.getInfo
 
 
+class _LobbyHeader(object):
+    def __init__(self):
+        self.calls = []
+
+    def fightClick(self, map_id, action_name):
+        self.calls.append((map_id, action_name))
+        return 'stock'
+
+
+_LOBBY_HEADER_FIGHT_CLICK = _LobbyHeader.fightClick
+
+
+class JoinButtonUITests(unittest.TestCase):
+    def setUp(self):
+        self.queue_ui = _load('queue_ui')
+        self.join_calls = []
+        self.handled = True
+        self.adapter = self.queue_ui.JoinButtonUI(
+            self._join, runtime=_LobbyHeader)
+
+    def tearDown(self):
+        self.adapter.uninstall()
+        _LobbyHeader.fightClick = _LOBBY_HEADER_FIGHT_CLICK
+
+    def _join(self, map_id, action_name):
+        self.join_calls.append((map_id, action_name))
+        return self.handled
+
+    def test_install_routes_one_native_fight_click_to_join(self):
+        self.adapter.install()
+        header = _LobbyHeader()
+
+        self.assertIsNone(header.fightClick(7, 'random'))
+
+        self.assertEqual([(7, 'random')], self.join_calls)
+        self.assertEqual([], header.calls)
+
+    def test_unhandled_click_fully_forwards_to_stock_method(self):
+        self.handled = False
+        self.adapter.install()
+        header = _LobbyHeader()
+
+        self.assertEqual('stock', header.fightClick(9, 'ranked'))
+
+        self.assertEqual([(9, 'ranked')], self.join_calls)
+        self.assertEqual([(9, 'ranked')], header.calls)
+
+    def test_uninstall_restores_raw_class_function(self):
+        original = _LobbyHeader.__dict__['fightClick']
+        self.adapter.install()
+        self.assertIsNot(original, _LobbyHeader.__dict__['fightClick'])
+
+        self.adapter.uninstall()
+
+        self.assertIs(original, _LobbyHeader.__dict__['fightClick'])
+
+    def test_uninstall_does_not_clobber_later_wrapper(self):
+        self.adapter.install()
+
+        def later_wrapper(header, map_id, action_name):
+            return 'later'
+
+        _LobbyHeader.fightClick = later_wrapper
+        self.adapter.uninstall()
+
+        self.assertIs(later_wrapper, _LobbyHeader.fightClick)
+
+
 class QueueUITests(unittest.TestCase):
     def setUp(self):
         self.catalog = _load('map_catalog')
