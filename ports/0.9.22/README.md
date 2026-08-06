@@ -9,7 +9,7 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.11` replaces the old compatibility slice. It is a server-backed
+Version `0.3.12` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, tactical bots and repeatable rounds. The removed `vertical_slice.py`
@@ -26,13 +26,18 @@ This release fixes both halves of the real `#1513` battle-entry boundary. The
 `VEHICLE_ADDED` roster is published before selecting the local Vehicle id, and
 the compatibility wrapper no longer repeats the player-id notifier inside the
 native `vehicle_onEnterWorld` stack. This preserves the stock own-vehicle matrix
-initialization order. The offline-only physics seam also suppresses the one
-initial `WGVehicleFilter.syncGunAngles` call that dereferences an unavailable
-retail filter dependency for client-created entities; all other stock physics
-initialization remains active. A returned client-only entity id is still not
-treated as a materialized tank: client ready, `AVATAR_READY` and battle period
-wait for native `onEnterWorld`, registry presence, `inWorld`, `isStarted` and a
-descriptor.
+initialization order. Full Windows dumps identified two unsafe native methods
+that dereference the unavailable retail server/filter chain on client-created
+entities: `WGVehicleFilter.syncGunAngles` and
+`WGVehicleFilter.syncStabilisedYPR`. A complete `scripts.pkg` scan finds exactly
+four Python call sites: initial Vehicle physics, packed gun-angle updates,
+damaged-model refresh and the Avatar auxiliary-physics handler. Scoped adapters
+suppress only those calls inside their exact stock handlers. Vehicle physics,
+speed providers, model refresh, track/RPM updates and filter identity everywhere
+else remain stock. A returned
+client-only entity id is still not treated as a materialized tank: client
+ready, `AVATAR_READY` and battle period wait for native `onEnterWorld`, registry
+presence, `inWorld`, `isStarted` and a descriptor.
 
 LAN JSON text is Unicode on the embedded Python 2 runtime, while BigWorld's
 Avatar and Vehicle `STRING` properties require byte strings. The release now
@@ -183,7 +188,8 @@ The script uses local CPython 2.7 when available and otherwise the pinned
 Docker build. Before compiling, it reads code objects directly from the pinned
 client's `scripts.pkg`, rejects mismatches in the stock method signatures,
 direct-consumer literals and lifecycle code paths used by this port, verifies
-the exact `AccountCommands` constants, runs the complete raw `serverSettings`
+the exact `AccountCommands` constants, inventories every exact-client call site
+for the guarded Vehicle filter syncs, runs the complete raw `serverSettings`
 subscript inventory against the local producers, and checks the ordered
 lifecycle contracts plus the complete Account-helper binding inventory.
 Signature checks include
@@ -204,8 +210,8 @@ properties and mailboxes at runtime.
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.11.wotmod
-org.peng.offline_lan_0922_0.3.11.wotmod.sha256
+org.peng.offline_lan_0922_0.3.12.wotmod
+org.peng.offline_lan_0922_0.3.12.wotmod.sha256
 WoT-0.9.22-LAN-Client-<release hash>/
 WoT-0.9.22-LAN-Client-<release hash>.zip
 ```

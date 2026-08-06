@@ -146,6 +146,7 @@ EXPECTED_ABI = {
             'self', 'requestID', 'stats'),
         'PlayerAvatar.prerequisites': ('self',),
         'PlayerAvatar.set_playerVehicleID': ('self', 'prev'),
+        'PlayerAvatar.__onSetOwnVehicleAuxPhysicsData': ('self', 'prev'),
         'PlayerAvatar.__onInitStepCompleted': ('self',),
         'PlayerAvatar.vehicle_onEnterWorld': ('self', 'vehicle'),
         'PlayerAvatar.updateVehicleHealth': (
@@ -172,6 +173,7 @@ EXPECTED_ABI = {
     },
     'scripts/client/Vehicle.pyc': {
         'Vehicle.__init__': ('self',),
+        'Vehicle.__startWGPhysics': ('self',),
         'Vehicle.prerequisites': ('self', 'respawnCompactDescr'),
         'Vehicle.onEnterWorld': ('self', 'prereqs'),
         'Vehicle.onLeaveWorld': ('self',),
@@ -180,6 +182,10 @@ EXPECTED_ABI = {
         'Vehicle.set_isCrewActive': ('self', 'prev'),
         'Vehicle.set_gunAnglesPacked': ('self', 'prev'),
         'Vehicle.getAimParams': ('self',),
+    },
+    'scripts/client/vehicle_systems/CompoundAppearance.pyc': {
+        'CompoundAppearance.__onModelsRefresh': (
+            'self', 'modelState', 'resourceList'),
     },
     'scripts/client/OfflineMapCreator.pyc': {
         'OfflineMapCreator.create': ('self', 'mapName'),
@@ -330,10 +336,17 @@ EXPECTED_ABI = {
 }
 
 
-# Signatures cannot describe dictionary payloads.  These literals are direct
-# string subscripts in exact #1513 consumers; producer contract tests verify
-# that the corresponding payloads actually contain them with the right shape.
+# Signatures cannot describe dictionary payloads or dynamic getattr targets.
+# These literals are direct string subscripts or native-method names in exact
+# #1513 consumers. Producer contract tests verify dictionary payload shapes.
 EXPECTED_CODE_LITERALS = {
+    'scripts/client/Avatar.pyc': {
+        'PlayerAvatar.__onSetOwnVehicleAuxPhysicsData': (
+            'syncStabilisedYPR',),
+    },
+    'scripts/client/Vehicle.pyc': {
+        'Vehicle.set_gunAnglesPacked': ('syncGunAngles',),
+    },
     'scripts/client_common/ClientChat.pyc': {
         'ClientChat.__dataTimeProcessor': ('time', 'sentTime'),
     },
@@ -393,10 +406,15 @@ EXPECTED_CODE_NAMES = {
         'PlayerAvatar.__onInitStepCompleted': ('setClientReady',),
     },
     'scripts/client/Vehicle.pyc': {
+        'Vehicle.__startWGPhysics': ('filter', 'syncGunAngles', 'speedInfo'),
         'Vehicle.prerequisites': (
             'typeDescriptor', 'appearance_cache', 'createAppearance'),
         'Vehicle.onEnterWorld': (
             'vehicle_onEnterWorld', 'sendStateToOwnClient'),
+    },
+    'scripts/client/vehicle_systems/CompoundAppearance.pyc': {
+        'CompoundAppearance.__onModelsRefresh': (
+            '_CompoundAppearance__filter', 'syncGunAngles'),
     },
     'scripts/client_common/ClientChat.pyc': {
         'ClientChat.__init__': ('_ClientChat__chatActionCallbacks',),
@@ -557,6 +575,20 @@ EXPECTED_CLASS_CONSTANTS = {
 }
 
 
+_FILTER_SYNC_METHODS = ('syncGunAngles', 'syncStabilisedYPR')
+EXPECTED_FILTER_SYNC_CALLS = frozenset((
+    ('scripts/client/Avatar.pyc',
+     'PlayerAvatar.__onSetOwnVehicleAuxPhysicsData',
+     'syncStabilisedYPR'),
+    ('scripts/client/Vehicle.pyc',
+     'Vehicle.__startWGPhysics', 'syncGunAngles'),
+    ('scripts/client/Vehicle.pyc',
+     'Vehicle.set_gunAnglesPacked', 'syncGunAngles'),
+    ('scripts/client/vehicle_systems/CompoundAppearance.pyc',
+     'CompoundAppearance.__onModelsRefresh', 'syncGunAngles'),
+))
+
+
 def _signature(code):
     values = list(code.co_varnames[:code.co_argcount])
     offset = code.co_argcount
@@ -624,6 +656,30 @@ def _read_module_contract(archive, member):
     return signatures, code_objects, _module_constant_globals(code)
 
 
+def _find_filter_sync_calls(archive):
+    """Inventory every Python call site for unsafe retail filter syncs."""
+    calls = set()
+    for member in sorted(archive.namelist()):
+        if not member.endswith('.pyc'):
+            continue
+        payload = archive.read(member)
+        if payload[:4] != '\x03\xf3\r\n':
+            continue
+        code = marshal.loads(payload[8:])
+        signatures = {}
+        code_objects = {}
+        _walk_code(code, (), signatures, code_objects)
+        for name, item in code_objects.items():
+            references = set(item.co_names)
+            references.update(
+                value for value in item.co_consts
+                if isinstance(value, basestring))
+            for method in _FILTER_SYNC_METHODS:
+                if method in references:
+                    calls.add((member, name, method))
+    return calls
+
+
 def audit(client_root):
     package_path = os.path.join(
         os.path.abspath(client_root), 'res', 'packages', 'scripts.pkg')
@@ -634,6 +690,7 @@ def audit(client_root):
     checked_names = []
     checked_globals = []
     checked_class_constants = []
+    checked_filter_sync_calls = []
     errors = []
     with zipfile.ZipFile(package_path, 'r') as archive:
         names = set(archive.namelist())
@@ -721,6 +778,19 @@ def audit(client_root):
                         checked_class_constants.append(
                             '%s:%s.%s=%r' %
                             (member, class_name, name, expected_value))
+        actual_filter_sync_calls = _find_filter_sync_calls(archive)
+        missing_filter_calls = (
+            EXPECTED_FILTER_SYNC_CALLS - actual_filter_sync_calls)
+        unexpected_filter_calls = (
+            actual_filter_sync_calls - EXPECTED_FILTER_SYNC_CALLS)
+        for item in sorted(missing_filter_calls):
+            errors.append('missing filter sync call site: %s:%s:%s' % item)
+        for item in sorted(unexpected_filter_calls):
+            errors.append('unexpected filter sync call site: %s:%s:%s' % item)
+        checked_filter_sync_calls.extend(
+            '%s:%s:%s' % item
+            for item in sorted(
+                actual_filter_sync_calls & EXPECTED_FILTER_SYNC_CALLS))
     if errors:
         raise ValueError('; '.join(errors))
     return {
@@ -731,11 +801,13 @@ def audit(client_root):
         'checkedCodeNames': len(checked_names),
         'checkedConstantGlobals': len(checked_globals),
         'checkedClassConstants': len(checked_class_constants),
+        'checkedFilterSyncCalls': len(checked_filter_sync_calls),
         'contracts': checked,
         'consumerLiterals': checked_literals,
         'codeNames': checked_names,
         'constantGlobals': checked_globals,
         'classConstants': checked_class_constants,
+        'filterSyncCalls': checked_filter_sync_calls,
     }
 
 

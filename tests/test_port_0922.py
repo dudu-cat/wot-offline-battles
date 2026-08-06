@@ -138,7 +138,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.11</version></root>')
+            '<version>0.3.12</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -942,6 +942,17 @@ class OfflineCompatibilityTests(unittest.TestCase):
                 operations.append(
                     ('avatar_prereqs_loaded', resource_names, resource_refs))
 
+            def __onSetOwnVehicleAuxPhysicsData(self, previous):
+                operations.append(('avatar_aux_physics_before', previous))
+                self.aux_nested_filter = self._readAuxVehicleFilter()
+                self.aux_vehicle.filter.syncStabilisedYPR(0.1, 0.2, 0.3)
+                if getattr(self, 'fail_aux_physics', False):
+                    raise RuntimeError('aux physics update failed')
+                operations.append(('avatar_aux_physics_after',))
+
+            def _readAuxVehicleFilter(self):
+                return self.aux_vehicle.filter
+
             def vehicle_onEnterWorld(self, vehicle):
                 operations.append(('original_avatar_vehicle_enter',
                                    vehicle.id))
@@ -955,12 +966,43 @@ class OfflineCompatibilityTests(unittest.TestCase):
                     ('vehicle_physics_static_mode',),
                     ('vehicle_physics_movement_signals',),
                 ))
+                self.nested_start_filter = self._readFilterFromHelper()
                 vehicle_filter = self.filter
                 vehicle_filter.setVehiclePhysics(self.physics)
                 operations.append(('vehicle_physics_visibility',))
                 vehicle_filter.syncGunAngles(0.25, -0.5)
                 self.speed_info = vehicle_filter.speedInfo
                 operations.append(('vehicle_physics_speed', self.speed_info))
+
+            def set_gunAnglesPacked(self, previous):
+                operations.append(('vehicle_gun_angles_before', previous))
+                self.nested_gun_filter = self._readFilterFromHelper()
+                self.filter.syncGunAngles(0.75, -0.25)
+                if getattr(self, 'fail_gun_angles', False):
+                    raise RuntimeError('gun angle update failed')
+                operations.append(('vehicle_gun_angles_after',))
+
+            def _readFilterFromHelper(self):
+                return self.filter
+
+        class CompoundAppearance(object):
+            def __init__(self, vehicle_filter):
+                self._CompoundAppearance__filter = vehicle_filter
+
+            def __onModelsRefresh(self, model_state, resource_list):
+                operations.append(
+                    ('compound_refresh_before', model_state, resource_list))
+                replacement = getattr(self, 'replacement_filter', None)
+                if replacement is not None:
+                    self._CompoundAppearance__filter = replacement
+                self.nested_filter = self._readFilterDuringRefresh()
+                self._CompoundAppearance__filter.syncGunAngles(0.5, -0.1)
+                if getattr(self, 'fail_models_refresh', False):
+                    raise RuntimeError('models refresh failed')
+                operations.append(('compound_refresh_after',))
+
+            def _readFilterDuringRefresh(self):
+                return self._CompoundAppearance__filter
 
         account_module = types.SimpleNamespace(
             PlayerAccount=PlayerAccount,
@@ -977,6 +1019,8 @@ class OfflineCompatibilityTests(unittest.TestCase):
             avatar_module=avatar_module,
             bigworld=bigworld,
             chat_manager=chat_manager,
+            compound_appearance_module=types.SimpleNamespace(
+                CompoundAppearance=CompoundAppearance),
             connection_manager=manager,
             login_status=statuses,
             offline_map_creator=_OfflineMapCreator(operations),
@@ -1132,6 +1176,9 @@ class OfflineCompatibilityTests(unittest.TestCase):
                 ('vehicle_physics_speed', 'native-speed-info'),
             ],
             operations)
+        self.assertIs(
+            offline_vehicle.nested_start_filter,
+            offline_vehicle.__dict__['filter'])
         self.assertIsNone(compatibility._vehicle_starting_wg_physics)
 
         compatibility.fini()
@@ -1160,6 +1207,160 @@ class OfflineCompatibilityTests(unittest.TestCase):
 
         self.assertIsNone(compatibility._vehicle_starting_wg_physics)
         self.assertIs(vehicle.filter, vehicle.__dict__['filter'])
+        compatibility.fini()
+
+    def test_offline_gun_property_notifier_suppresses_native_sync(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        vehicle_type = runtime.vehicle_module.Vehicle
+        original = vehicle_type.__dict__['set_gunAnglesPacked']
+
+        class VehicleFilter(object):
+            def syncGunAngles(self, yaw, pitch):
+                operations.append(('unsafe_gun_sync', yaw, pitch))
+
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+        vehicle = vehicle_type()
+        vehicle.filter = VehicleFilter()
+
+        vehicle.set_gunAnglesPacked('normal')
+        self.assertIn(('unsafe_gun_sync', 0.75, -0.25), operations)
+
+        compatibility.configure_battle()
+        operations[:] = []
+        vehicle.set_gunAnglesPacked('offline')
+        self.assertEqual(
+            [('vehicle_gun_angles_before', 'offline'),
+             ('vehicle_gun_angles_after',)],
+            operations)
+        self.assertIsNone(compatibility._vehicle_syncing_gun_angles)
+        self.assertIs(vehicle.nested_gun_filter, vehicle.__dict__['filter'])
+        self.assertIs(vehicle.filter, vehicle.__dict__['filter'])
+
+        vehicle.fail_gun_angles = True
+        with self.assertRaisesRegex(RuntimeError, 'gun angle update failed'):
+            vehicle.set_gunAnglesPacked('failure')
+        self.assertIsNone(compatibility._vehicle_syncing_gun_angles)
+
+        compatibility.fini()
+        self.assertIs(original, vehicle_type.__dict__['set_gunAnglesPacked'])
+
+    def test_offline_damaged_model_refresh_suppresses_native_gun_sync(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        appearance_type = (
+            runtime.compound_appearance_module.CompoundAppearance)
+        method_name = '_CompoundAppearance__onModelsRefresh'
+        original = appearance_type.__dict__[method_name]
+        original_getattribute = appearance_type.__getattribute__
+
+        class VehicleFilter(object):
+            def __init__(self, name):
+                self.name = name
+
+            def syncGunAngles(self, yaw, pitch):
+                operations.append(
+                    ('unsafe_compound_gun_sync', self.name, yaw, pitch))
+
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+        appearance = appearance_type(VehicleFilter('initial'))
+
+        getattr(appearance, method_name)('normal', {'normal': True})
+        self.assertIn(
+            ('unsafe_compound_gun_sync', 'initial', 0.5, -0.1),
+            operations)
+
+        compatibility.configure_battle()
+        operations[:] = []
+        replacement = VehicleFilter('replacement')
+        appearance.replacement_filter = replacement
+        getattr(appearance, method_name)('offline', {'offline': True})
+        self.assertEqual(
+            [('compound_refresh_before', 'offline', {'offline': True}),
+             ('compound_refresh_after',)],
+            operations)
+        self.assertIsNone(compatibility._compound_refreshing_models)
+        self.assertIs(replacement, appearance.nested_filter)
+        self.assertIs(
+            replacement,
+            appearance._CompoundAppearance__filter)
+
+        appearance.fail_models_refresh = True
+        with self.assertRaisesRegex(RuntimeError, 'models refresh failed'):
+            getattr(appearance, method_name)('failure', {})
+        self.assertIsNone(compatibility._compound_refreshing_models)
+
+        compatibility.fini()
+        self.assertIs(original, appearance_type.__dict__[method_name])
+        self.assertIs(
+            original_getattribute, appearance_type.__getattribute__)
+
+    def test_offline_aux_physics_skips_only_native_stabilised_sync(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        avatar_type = runtime.avatar_module.PlayerAvatar
+        vehicle_type = runtime.vehicle_module.Vehicle
+        method_name = '_PlayerAvatar__onSetOwnVehicleAuxPhysicsData'
+        original = avatar_type.__dict__[method_name]
+
+        class VehicleFilter(object):
+            def syncStabilisedYPR(self, yaw, pitch, roll):
+                operations.append(
+                    ('unsafe_stabilised_sync', yaw, pitch, roll))
+
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+        avatar = avatar_type()
+        vehicle = vehicle_type()
+        vehicle.filter = VehicleFilter()
+        avatar.aux_vehicle = vehicle
+
+        getattr(avatar, method_name)('normal')
+        self.assertIn(
+            ('unsafe_stabilised_sync', 0.1, 0.2, 0.3), operations)
+
+        compatibility.configure_battle()
+        operations[:] = []
+        getattr(avatar, method_name)('offline')
+
+        self.assertEqual(
+            [('avatar_aux_physics_before', 'offline'),
+             ('avatar_aux_physics_after',)],
+            operations)
+        self.assertIsNone(compatibility._avatar_syncing_aux_physics)
+        self.assertIs(vehicle.__dict__['filter'], avatar.aux_nested_filter)
+        self.assertIs(vehicle.filter, vehicle.__dict__['filter'])
+
+        compatibility.fini()
+        self.assertIs(original, avatar_type.__dict__[method_name])
+
+    def test_aux_physics_scope_is_cleared_when_stock_handler_raises(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, _ = self._runtime()
+        avatar_type = runtime.avatar_module.PlayerAvatar
+        vehicle_type = runtime.vehicle_module.Vehicle
+        method_name = '_PlayerAvatar__onSetOwnVehicleAuxPhysicsData'
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+
+        class VehicleFilter(object):
+            def syncStabilisedYPR(self, yaw, pitch, roll):
+                raise AssertionError('native sync must be suppressed')
+
+        avatar = avatar_type()
+        avatar.aux_vehicle = vehicle_type()
+        avatar.aux_vehicle.filter = VehicleFilter()
+        avatar.fail_aux_physics = True
+        with self.assertRaisesRegex(
+                RuntimeError, 'aux physics update failed'):
+            getattr(avatar, method_name)('offline')
+
+        self.assertIsNone(compatibility._avatar_syncing_aux_physics)
+        self.assertIs(
+            avatar.aux_vehicle.filter,
+            avatar.aux_vehicle.__dict__['filter'])
         compatibility.fini()
 
     def test_manual_offline_host_login_prepares_account_properties(self):
@@ -2410,7 +2611,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.11'
+        package.PORT_VERSION = '0.3.12'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []

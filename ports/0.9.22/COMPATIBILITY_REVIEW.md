@@ -5,7 +5,7 @@ This review is pinned to the Chinese HD client whose `version.xml` reports
 CPython 2.7 bytecode magic `03 f3 0d 0a`; the embedded build identifies itself
 as Python 2.7.7.
 
-The goal of version 0.3.11 is a complete playable vertical path, not another
+The goal of version 0.3.12 is a complete playable vertical path, not another
 login-only probe: local Account -> stock Lobby/join/map selection -> native map and
 Avatar -> native Vehicle entities -> local movement/aim/fire -> synchronized
 humans and bots -> damage/death/result -> cleanup -> a second round.
@@ -313,16 +313,26 @@ accepts the entity after registry presence, `inWorld`, `isStarted`, and a
 descriptor are all true. `onVehicleChanged`, client attributes,
 `AVATAR_READY`, and `PERIOD` then publish exactly once.
 
-A full Windows dump from the first native Vehicle entry placed the access
-violation in `WGVehicleFilter.syncGunAngles`: the client-created entity has no
-retail gun-angle filter dependency at that instant, and the native method
-dereferences its null result. Both reviewed public 0.9.22 observer layers omit
-that same initial call. During the stock private physics initializer only, the
-compatibility layer presents a transparent filter proxy whose
-`syncGunAngles()` is a no-op. Physics creation, descriptor initialization,
-arena bounds, ownership, `setVehiclePhysics`, visibility and speed providers
-remain stock; the proxy is removed even if initialization raises, and normal
-online execution delegates untouched.
+Two full Windows dumps isolated the complete client-created Vehicle filter
+boundary. The first access violation was in `WGVehicleFilter.syncGunAngles`
+inside `Vehicle.__startWGPhysics`; the second run passed that address and
+failed in `WGVehicleFilter.syncStabilisedYPR` inside
+`PlayerAvatar.__onSetOwnVehicleAuxPhysicsData`. Both native methods reach the
+same absent retail server-connection/filter chain. A complete exact-`#1513`
+bytecode scan inventories every Python reference to those two methods and finds
+four call sites: `Vehicle.__startWGPhysics`, `Vehicle.set_gunAnglesPacked`,
+`CompoundAppearance.__onModelsRefresh`, and the Avatar auxiliary-physics
+handler. The build audit rejects a missing or additional call site instead of
+silently widening this compatibility seam. Reviewed public 0.9.22 observer
+layers omit the initial and auxiliary calls; the packed-angle path is specific
+to this LAN snapshot implementation, while damaged-model refresh is a stock
+late path that must also be safe. During each exact handler only, the
+compatibility layer presents a transparent filter proxy whose unsafe method is
+a no-op. Physics creation, descriptor initialization, arena bounds, ownership,
+`setVehiclePhysics`, visibility, speed providers, packed property values, model
+refresh, auxiliary track/RPM updates and filter identity outside the scoped
+stacks remain stock. Every scope is removed in `finally`, including when the
+original handler raises; normal online execution delegates untouched.
 
 Remote Vehicles use the same readiness gate. Their newest health and pose are
 coalesced while prerequisites load. A remote removal before world entry leaves
@@ -386,7 +396,7 @@ The pure-data server planner emits revisioned global `bot_orders`, which the
 0.9.22 authority now uses for macro targets after reporting bounded visibility
 observations. BigWorld terrain, collision, water and slope probes remain local,
 and the client planner is a fallback when no server order is available.
-Base-capture rules are not part of 0.3.11; standard battles currently end by
+Base-capture rules are not part of 0.3.12; standard battles currently end by
 elimination.
 
 ## Reference implementations reviewed
@@ -420,7 +430,8 @@ The release build additionally:
 2. reads exact code objects from `scripts.pkg` and compares every stock method
    signature, direct-consumer literal, lifecycle name and `AccountCommands`
    constant used by the port, including variadic flags on the stock view
-   loader;
+   loader, and inventories the complete exact-client call-site set for the two
+   unsafe retail filter sync methods;
 3. checks the ordered lifecycle contracts and inventories every exact
    Account-helper `setAccount` implementation, including the native
    Account-to-Hangar-to-Avatar retirement order, chat-proxy detachment and

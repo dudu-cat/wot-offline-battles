@@ -1,5 +1,7 @@
 from __future__ import print_function
 
+import sys
+
 try:
     import cPickle as _pickle
 except ImportError:
@@ -78,6 +80,7 @@ def _load_runtime():
     import Math
     import SoundGroups
     import Vehicle
+    import vehicle_systems.CompoundAppearance as CompoundAppearanceModule
     import constants
     from OfflineMapCreator import g_offlineMapCreator
     from PlayerEvents import g_playerEvents
@@ -96,6 +99,7 @@ def _load_runtime():
     runtime.avatar_input_handler = AvatarInputHandler
     runtime.bigworld = BigWorld
     runtime.chat_manager = ChatManager.chatManager
+    runtime.compound_appearance_module = CompoundAppearanceModule
     runtime.constants = constants
     runtime.connection_manager = dependency.instance(IConnectionManager)
     runtime.login_status = LOGIN_STATUS
@@ -194,8 +198,8 @@ class _OfflineInputHandler(object):
         return False
 
 
-class _InitialGunSyncFilterProxy(object):
-    """Delegate WGVehicleFilter except for the unsafe first gun sync."""
+class _OfflineVehicleFilterSyncProxy(object):
+    """Delegate WGVehicleFilter except for unsafe retail-only syncs."""
 
     __slots__ = ('_vehicle_filter',)
 
@@ -208,7 +212,14 @@ class _InitialGunSyncFilterProxy(object):
     def syncGunAngles(self, yaw, pitch):
         # A client-only Vehicle has no retail interpolation filter behind its
         # initial gun-angle sample.  Exact #1513 asserts a null native filter
-        # here; later LAN state updates own gun synchronization.
+        # here, so the sample cannot be submitted through this native path.
+        return None
+
+    def syncStabilisedYPR(self, yaw, pitch, roll):
+        # PlayerAvatar's auxiliary-physics property handler forwards its
+        # first stabilised sample into the same missing retail server/filter
+        # chain.  Keep the stock handler, including track and RPM updates, but
+        # omit only this native sync while that exact handler is running.
         return None
 
 
@@ -242,8 +253,16 @@ class OfflineCompatibility(object):
         self._original_avatar_leave_world = None
         self._original_avatar_vehicle_enter = None
         self._original_avatar_prereqs_loaded = None
+        self._original_avatar_aux_physics = None
+        self._avatar_aux_physics_code = None
         self._original_vehicle_getattribute = None
         self._original_vehicle_start_wg_physics = None
+        self._vehicle_start_wg_physics_code = None
+        self._original_vehicle_set_gun_angles = None
+        self._vehicle_set_gun_angles_code = None
+        self._original_compound_getattribute = None
+        self._original_compound_models_refresh = None
+        self._compound_models_refresh_code = None
         self._original_connect = None
         self._original_disconnect = None
         self._account_init_wrapper = None
@@ -258,9 +277,16 @@ class OfflineCompatibility(object):
         self._avatar_leave_world_wrapper = None
         self._avatar_vehicle_enter_wrapper = None
         self._avatar_prereqs_loaded_wrapper = None
+        self._avatar_aux_physics_wrapper = None
         self._vehicle_getattribute_wrapper = None
         self._vehicle_start_wg_physics_wrapper = None
+        self._vehicle_set_gun_angles_wrapper = None
+        self._compound_getattribute_wrapper = None
+        self._compound_models_refresh_wrapper = None
         self._vehicle_starting_wg_physics = None
+        self._vehicle_syncing_gun_angles = None
+        self._avatar_syncing_aux_physics = None
+        self._compound_refreshing_models = None
         self._connect_wrapper = None
         self._disconnect_wrapper = None
 
@@ -276,6 +302,9 @@ class OfflineCompatibility(object):
         avatar_type = runtime.avatar_module.PlayerAvatar
         vehicle_type = getattr(
             getattr(runtime, 'vehicle_module', None), 'Vehicle', None)
+        compound_type = getattr(
+            getattr(runtime, 'compound_appearance_module', None),
+            'CompoundAppearance', None)
         self._original_account_init = account_type.__dict__.get(
             '__init__', account_type.__init__)
         self._original_account_getattribute = account_type.__dict__.get(
@@ -303,6 +332,16 @@ class OfflineCompatibility(object):
             getattr(avatar_type, 'vehicle_onEnterWorld', None))
         self._original_avatar_prereqs_loaded = avatar_type.__dict__.get(
             'onPrereqsLoaded', getattr(avatar_type, 'onPrereqsLoaded', None))
+        self._original_avatar_aux_physics = avatar_type.__dict__.get(
+            '_PlayerAvatar__onSetOwnVehicleAuxPhysicsData',
+            getattr(
+                avatar_type,
+                '_PlayerAvatar__onSetOwnVehicleAuxPhysicsData', None))
+        if self._original_avatar_aux_physics is not None:
+            self._avatar_aux_physics_code = getattr(
+                self._original_avatar_aux_physics,
+                'func_code', getattr(
+                    self._original_avatar_aux_physics, '__code__', None))
         if vehicle_type is not None:
             self._original_vehicle_getattribute = vehicle_type.__dict__.get(
                 '__getattribute__', vehicle_type.__getattribute__)
@@ -310,6 +349,38 @@ class OfflineCompatibility(object):
                 vehicle_type.__dict__.get(
                     '_Vehicle__startWGPhysics',
                     getattr(vehicle_type, '_Vehicle__startWGPhysics', None)))
+            if self._original_vehicle_start_wg_physics is not None:
+                self._vehicle_start_wg_physics_code = getattr(
+                    self._original_vehicle_start_wg_physics,
+                    'func_code', getattr(
+                        self._original_vehicle_start_wg_physics,
+                        '__code__', None))
+            self._original_vehicle_set_gun_angles = (
+                vehicle_type.__dict__.get(
+                    'set_gunAnglesPacked',
+                    getattr(vehicle_type, 'set_gunAnglesPacked', None)))
+            if self._original_vehicle_set_gun_angles is not None:
+                self._vehicle_set_gun_angles_code = getattr(
+                    self._original_vehicle_set_gun_angles,
+                    'func_code', getattr(
+                        self._original_vehicle_set_gun_angles,
+                        '__code__', None))
+        if compound_type is not None:
+            self._original_compound_getattribute = (
+                compound_type.__dict__.get(
+                    '__getattribute__', compound_type.__getattribute__))
+            self._original_compound_models_refresh = (
+                compound_type.__dict__.get(
+                    '_CompoundAppearance__onModelsRefresh',
+                    getattr(
+                        compound_type,
+                        '_CompoundAppearance__onModelsRefresh', None)))
+            if self._original_compound_models_refresh is not None:
+                self._compound_models_refresh_code = getattr(
+                    self._original_compound_models_refresh,
+                    'func_code', getattr(
+                        self._original_compound_models_refresh,
+                        '__code__', None))
         self._original_connect = runtime.bigworld.connect
         self._original_disconnect = runtime.bigworld.disconnect
         compatibility = self
@@ -558,13 +629,43 @@ class OfflineCompatibility(object):
             return compatibility._original_avatar_prereqs_loaded(
                 avatar, resource_names, resource_refs)
 
+        def avatar_aux_physics(avatar, previous):
+            original = compatibility._original_avatar_aux_physics
+            if not compatibility._battle_active:
+                return original(avatar, previous)
+            outer_avatar = compatibility._avatar_syncing_aux_physics
+            compatibility._avatar_syncing_aux_physics = avatar
+            try:
+                return original(avatar, previous)
+            finally:
+                compatibility._avatar_syncing_aux_physics = outer_avatar
+
         def vehicle_getattribute(vehicle, name):
+            caller_code = None
+            if (compatibility._vehicle_starting_wg_physics is not None or
+                    compatibility._vehicle_syncing_gun_angles is not None or
+                    compatibility._avatar_syncing_aux_physics is not None):
+                try:
+                    caller_code = sys._getframe(1).f_code
+                except (AttributeError, ValueError):
+                    pass
+            direct_start_filter = (
+                compatibility._vehicle_starting_wg_physics is vehicle and
+                caller_code is compatibility._vehicle_start_wg_physics_code)
+            direct_gun_sync = (
+                compatibility._vehicle_syncing_gun_angles is vehicle and
+                caller_code is compatibility._vehicle_set_gun_angles_code)
+            direct_avatar_aux_sync = False
+            if compatibility._avatar_syncing_aux_physics is not None:
+                direct_avatar_aux_sync = (
+                    caller_code is compatibility._avatar_aux_physics_code)
             if (name == 'filter' and compatibility._battle_active and
-                    compatibility._vehicle_starting_wg_physics is vehicle):
+                    (direct_start_filter or direct_gun_sync or
+                     direct_avatar_aux_sync)):
                 vehicle_filter = (
                     compatibility._original_vehicle_getattribute(
                         vehicle, name))
-                return _InitialGunSyncFilterProxy(vehicle_filter)
+                return _OfflineVehicleFilterSyncProxy(vehicle_filter)
             if name == 'cell' and compatibility._battle_active:
                 try:
                     return compatibility._original_vehicle_getattribute(
@@ -592,6 +693,47 @@ class OfflineCompatibility(object):
                 return original(vehicle)
             finally:
                 compatibility._vehicle_starting_wg_physics = previous
+
+        def vehicle_set_gun_angles(vehicle, previous):
+            original = compatibility._original_vehicle_set_gun_angles
+            if not compatibility._battle_active:
+                return original(vehicle, previous)
+            outer_vehicle = compatibility._vehicle_syncing_gun_angles
+            compatibility._vehicle_syncing_gun_angles = vehicle
+            try:
+                return original(vehicle, previous)
+            finally:
+                compatibility._vehicle_syncing_gun_angles = outer_vehicle
+
+        def compound_getattribute(appearance, name):
+            value = compatibility._original_compound_getattribute(
+                appearance, name)
+            if (name == '_CompoundAppearance__filter' and
+                    compatibility._battle_active and
+                    compatibility._compound_refreshing_models is appearance):
+                # __onModelsRefresh calls deactivate()/activate() before its
+                # final gun-angle restore.  Those nested methods also read the
+                # private filter and must retain its real identity; activate()
+                # stores it back on Vehicle.  Return the proxy only to the
+                # direct LOAD_ATTR in the original refresh code object.
+                try:
+                    caller_code = sys._getframe(1).f_code
+                except (AttributeError, ValueError):
+                    caller_code = None
+                if caller_code is compatibility._compound_models_refresh_code:
+                    return _OfflineVehicleFilterSyncProxy(value)
+            return value
+
+        def compound_models_refresh(appearance, model_state, resource_list):
+            original = compatibility._original_compound_models_refresh
+            if not compatibility._battle_active:
+                return original(appearance, model_state, resource_list)
+            outer_appearance = compatibility._compound_refreshing_models
+            compatibility._compound_refreshing_models = appearance
+            try:
+                return original(appearance, model_state, resource_list)
+            finally:
+                compatibility._compound_refreshing_models = outer_appearance
 
         def account_getattribute(account, name):
             if name in ('base', 'cell', 'server'):
@@ -752,8 +894,12 @@ class OfflineCompatibility(object):
         self._avatar_leave_world_wrapper = avatar_leave_world
         self._avatar_vehicle_enter_wrapper = avatar_vehicle_enter
         self._avatar_prereqs_loaded_wrapper = avatar_prereqs_loaded
+        self._avatar_aux_physics_wrapper = avatar_aux_physics
         self._vehicle_getattribute_wrapper = vehicle_getattribute
         self._vehicle_start_wg_physics_wrapper = vehicle_start_wg_physics
+        self._vehicle_set_gun_angles_wrapper = vehicle_set_gun_angles
+        self._compound_getattribute_wrapper = compound_getattribute
+        self._compound_models_refresh_wrapper = compound_models_refresh
         self._connect_wrapper = connect
         self._disconnect_wrapper = disconnect
         try:
@@ -777,11 +923,21 @@ class OfflineCompatibility(object):
                 avatar_type.vehicle_onEnterWorld = avatar_vehicle_enter
             if self._original_avatar_prereqs_loaded is not None:
                 avatar_type.onPrereqsLoaded = avatar_prereqs_loaded
+            if self._original_avatar_aux_physics is not None:
+                avatar_type._PlayerAvatar__onSetOwnVehicleAuxPhysicsData = (
+                    avatar_aux_physics)
             if vehicle_type is not None:
                 vehicle_type.__getattribute__ = vehicle_getattribute
                 if self._original_vehicle_start_wg_physics is not None:
                     vehicle_type._Vehicle__startWGPhysics = (
                         vehicle_start_wg_physics)
+                if self._original_vehicle_set_gun_angles is not None:
+                    vehicle_type.set_gunAnglesPacked = vehicle_set_gun_angles
+            if compound_type is not None:
+                compound_type.__getattribute__ = compound_getattribute
+                if self._original_compound_models_refresh is not None:
+                    compound_type._CompoundAppearance__onModelsRefresh = (
+                        compound_models_refresh)
             runtime.bigworld.connect = connect
             runtime.bigworld.disconnect = disconnect
             self._installed = True
@@ -809,6 +965,9 @@ class OfflineCompatibility(object):
         avatar_type = runtime.avatar_module.PlayerAvatar
         vehicle_type = getattr(
             getattr(runtime, 'vehicle_module', None), 'Vehicle', None)
+        compound_type = getattr(
+            getattr(runtime, 'compound_appearance_module', None),
+            'CompoundAppearance', None)
         if (account_type.__dict__.get('__init__') is
                 self._account_init_wrapper):
             account_type.__init__ = self._original_account_init
@@ -857,6 +1016,12 @@ class OfflineCompatibility(object):
                 self._avatar_prereqs_loaded_wrapper):
             avatar_type.onPrereqsLoaded = (
                 self._original_avatar_prereqs_loaded)
+        if (self._original_avatar_aux_physics is not None and
+                avatar_type.__dict__.get(
+                    '_PlayerAvatar__onSetOwnVehicleAuxPhysicsData') is
+                self._avatar_aux_physics_wrapper):
+            avatar_type._PlayerAvatar__onSetOwnVehicleAuxPhysicsData = (
+                self._original_avatar_aux_physics)
         if (vehicle_type is not None and
                 self._original_vehicle_start_wg_physics is not None and
                 vehicle_type.__dict__.get('_Vehicle__startWGPhysics') is
@@ -867,6 +1032,24 @@ class OfflineCompatibility(object):
                 vehicle_type.__dict__.get('__getattribute__') is
                 self._vehicle_getattribute_wrapper):
             vehicle_type.__getattribute__ = self._original_vehicle_getattribute
+        if (vehicle_type is not None and
+                self._original_vehicle_set_gun_angles is not None and
+                vehicle_type.__dict__.get('set_gunAnglesPacked') is
+                self._vehicle_set_gun_angles_wrapper):
+            vehicle_type.set_gunAnglesPacked = (
+                self._original_vehicle_set_gun_angles)
+        if (compound_type is not None and
+                self._original_compound_models_refresh is not None and
+                compound_type.__dict__.get(
+                    '_CompoundAppearance__onModelsRefresh') is
+                self._compound_models_refresh_wrapper):
+            compound_type._CompoundAppearance__onModelsRefresh = (
+                self._original_compound_models_refresh)
+        if (compound_type is not None and
+                compound_type.__dict__.get('__getattribute__') is
+                self._compound_getattribute_wrapper):
+            compound_type.__getattribute__ = (
+                self._original_compound_getattribute)
         if runtime.bigworld.connect is self._connect_wrapper:
             runtime.bigworld.connect = self._original_connect
         if runtime.bigworld.disconnect is self._disconnect_wrapper:
@@ -879,6 +1062,13 @@ class OfflineCompatibility(object):
         self._host = None
         self._host_added = False
         self._vehicle_starting_wg_physics = None
+        self._vehicle_start_wg_physics_code = None
+        self._vehicle_syncing_gun_angles = None
+        self._vehicle_set_gun_angles_code = None
+        self._avatar_syncing_aux_physics = None
+        self._avatar_aux_physics_code = None
+        self._compound_refreshing_models = None
+        self._compound_models_refresh_code = None
         self._installed = False
 
     def connect(self, show_lobby=False, account_context=None):
