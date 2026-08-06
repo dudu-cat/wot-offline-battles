@@ -2,6 +2,8 @@ from __future__ import print_function
 
 """Coordinator between LAN protocol, stock map picker and battle runtime."""
 
+import sys
+
 from gui.mods.offline_lan_0922 import config as port_config
 from gui.mods.offline_lan_0922 import queue_ui
 
@@ -170,7 +172,14 @@ class LANSession(object):
         except _VehicleSelectionError:
             return self._return_to_join_after_vehicle_selection_error()
         self.state = 'connecting'
-        started = bool(self.client.start())
+        try:
+            started = bool(self.client.start())
+        except Exception as error:
+            self._retry_initial_connection({'message': str(error)})
+            return False
+        if not started:
+            self._retry_initial_connection(
+                {'message': 'LAN client could not start'})
         return started
 
     def install(self):
@@ -188,8 +197,11 @@ class LANSession(object):
         if self._stopped:
             return False
         if self.client is None:
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] LAN join requested: %s\n' %
+                self._endpoint_value())
             if not self.start():
-                if self.state != 'ready_to_join':
+                if self.state not in ('ready_to_join', 'retrying'):
                     self._status_notifier(
                         'The LAN room could not be joined.')
             else:
@@ -265,10 +277,19 @@ class LANSession(object):
             host = self._config.get('host', '127.0.0.1')
             port = self._config.get('port', 28782)
             self._status_notifier(
-                'LAN server %s:%s is unavailable (%s). Retrying; click '
-                'Battle! again to edit the server address.' %
+                'LAN server %s:%s is unavailable (%s). Retrying and opening '
+                'server settings.' %
+                (host, port, error))
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] LAN connection failed: %s:%s (%s)\n' %
                 (host, port, error))
             self._connection_error_notified = True
+            try:
+                self._open_connection_picker()
+            except Exception:
+                # Endpoint editing is a convenience surface.  It must never
+                # replace a recoverable socket failure with a lobby crash.
+                pass
         if self._schedule_connection_retry():
             return True
         return False

@@ -92,10 +92,11 @@ class JoinButtonUI(object):
         adapter = self
 
         def wrapped_fight_click(header, map_id, action_name):
-            if adapter._on_join(map_id, action_name) is True:
-                return None
-            return adapter._original_fight_click(
-                header, map_id, action_name)
+            # LAN mode never falls through to retail matchmaking.  In #1513
+            # that path opens the global ``prebattle/join`` Waiting screen and
+            # waits for an Account RPC this offline client cannot complete.
+            adapter._on_join(map_id, action_name)
+            return None
 
         def wrapped_update_controls(header):
             result = adapter._original_update_controls(header)

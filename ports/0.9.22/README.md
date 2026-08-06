@@ -9,7 +9,7 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.8` replaces the old compatibility slice. It is a server-backed
+Version `0.3.9` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, tactical bots and repeatable rounds. The removed `vertical_slice.py`
@@ -49,9 +49,10 @@ overwrite the next round.
    the client stays in the garage and displays a native warning. The button
    joins the LAN waiting room; it does not call retail matchmaking or a retail
    training-room service.
-4. While the client is connecting or retrying, clicking **Battle!** again
-   explicitly opens the stock settings window. Any not-yet-accepted client can
-   edit `LAN SERVER: host:port` there; this does not grant host authority.
+4. If the endpoint cannot be reached, the stock settings window opens
+   automatically while the client retries. Clicking **Battle!** again while
+   connecting also opens it. Any not-yet-accepted client can edit
+   `LAN SERVER: host:port` there; this does not grant host authority.
 5. The first waiting player is the room host. Only that client opens the stock
    training settings window as a local map picker. Its Description field is the
    editable `LAN SERVER: host:port` endpoint. Later players click the same
@@ -138,8 +139,9 @@ The supported fields are:
 }
 ```
 
-Before receiving a server welcome, any client can click **Battle!** again to
-edit the same endpoint in the native training settings window. Once waiting,
+Before receiving a server welcome, a failed connection opens the native
+training settings window automatically; **Battle!** also reopens it while the
+client is connecting. Once waiting,
 only the room host owns that window as the map picker; guests continue to use
 their saved `config.json`. The server supplies the selected map and spawn. The
 `vehicle` field seeds the initial offline garage record; the tank selected in
@@ -192,8 +194,8 @@ properties and mailboxes at runtime.
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.8.wotmod
-org.peng.offline_lan_0922_0.3.8.wotmod.sha256
+org.peng.offline_lan_0922_0.3.9.wotmod
+org.peng.offline_lan_0922_0.3.9.wotmod.sha256
 WoT-0.9.22-LAN-Client-<release hash>/
 WoT-0.9.22-LAN-Client-<release hash>.zip
 ```

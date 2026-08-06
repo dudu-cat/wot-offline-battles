@@ -5,7 +5,7 @@ This review is pinned to the Chinese HD client whose `version.xml` reports
 CPython 2.7 bytecode magic `03 f3 0d 0a`; the embedded build identifies itself
 as Python 2.7.7.
 
-The goal of version 0.3.8 is a complete playable vertical path, not another
+The goal of version 0.3.9 is a complete playable vertical path, not another
 login-only probe: local Account -> stock Lobby/join/map selection -> native map and
 Avatar -> native Vehicle entities -> local movement/aim/fire -> synchronized
 humans and bots -> damage/death/result -> cleanup -> a second round.
@@ -176,9 +176,14 @@ OfflineMapCreator.destroy()
 
 ## Stock map-selection lifecycle
 
-After the hangar is ready, a chain-safe adapter intercepts the exact
-`LobbyHeader.fightClick(self, mapID, actionName)` boundary. The first click joins
-the LAN waiting room rather than calling the stock prebattle dispatcher. The
+Before the local Account creates the lobby, a chain-safe adapter intercepts the
+exact `LobbyHeader.fightClick(self, mapID, actionName)` boundary. Exact `#1513`
+Flash stores that Python callback when `LobbyHeaderMeta` first binds its script;
+patching the class after `HANGAR_READY` can repaint the button but leaves Flash
+calling the old bound function. The first click now joins the LAN waiting room
+rather than calling the stock prebattle dispatcher. While LAN mode owns the
+button it never falls through to retail matchmaking: that unsupported path
+opens `Waiting('prebattle/join')` and cannot receive its server completion. The
 server elects the first connected 0.9.22 player as room host and includes that
 id in `welcome`, `roster` and `battle_start`; only the host opens
 `TRAINING_SETTINGS_WINDOW_PY` through the exact
@@ -188,13 +193,13 @@ editable `LAN SERVER: host:port` endpoint in the native description field and
 sends the chosen geometry. Guests remain in the hangar and wait for the
 server-owned start. A guest request is rejected before map validation or map
 mutation. Waiting-room host departure elects the lowest connected id and the
-new host then receives the picker. Other fight actions and training windows
-continue down their original methods when the adapter does not own them.
+new host then receives the picker. Unmarked stock training windows continue
+down their original methods.
 
 There is one explicit pre-welcome settings path. The first **Battle!** click
-starts the connection without opening a window. If that client is still
-connecting or retrying, a later click opens the same native form so its saved
-endpoint can be corrected. Its provisional map choice does not confer host
+starts the connection without opening a window. A failed connection opens the
+same native form automatically while retry continues; another click while
+connecting can also open it. Its provisional map choice does not confer host
 authority: after `welcome`, a guest selection is discarded and only the
 elected host may request the start. Manually closing a host picker leaves it
 closed until that host clicks **Battle!** again, avoiding asynchronous cursor
@@ -209,10 +214,12 @@ clear invalidates an in-flight hangar CompoundAssembler, which explains the
 observed `R11_MS-1` resource-dictionary KeyError despite complete vehicle
 resources. No vehicle-specific exception or resource replacement is needed.
 
-After Account promotion, the wrapper waits for the exact public
+The Battle adapter is installed immediately before Account promotion, while
+the client is still in stable Login space, so the first Scaleform binding sees
+the LAN callback. The wrapper then waits for the exact public
 `LOBBY_VIEW_LOADED` event, Lobby GUI
 space, initialized hangar space and (when present) a completed hangar vehicle
-model before it installs the LAN join action. Merely finding an initialized
+model before declaring the lobby ready. Merely finding an initialized
 Scaleform application is insufficient because that object already exists in
 the login/EULA space. The hangar timeout starts only after the lobby event, so
 first-run EULA interaction is not treated as a startup failure. Raw class
@@ -364,7 +371,7 @@ The pure-data server planner emits revisioned global `bot_orders`, which the
 0.9.22 authority now uses for macro targets after reporting bounded visibility
 observations. BigWorld terrain, collision, water and slope probes remain local,
 and the client planner is a fallback when no server order is available.
-Base-capture rules are not part of 0.3.8; standard battles currently end by
+Base-capture rules are not part of 0.3.9; standard battles currently end by
 elimination.
 
 ## Reference implementations reviewed

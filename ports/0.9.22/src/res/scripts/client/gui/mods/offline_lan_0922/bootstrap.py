@@ -329,6 +329,26 @@ def _native_lobby_is_ready():
     return _lobby_is_ready(g_appLoader, g_appLoader.getDefLobbyApp())
 
 
+def _install_lan_session():
+    """Install the Battle callback before Scaleform binds LobbyHeader."""
+    global _session
+    if _session is not None:
+        return True
+    from gui.mods.offline_lan_0922.lan_session import LANSession
+    session = LANSession(
+        _config, lobby_ready=_native_lobby_is_ready,
+        callback=BigWorld.callback,
+        cancel_callback=BigWorld.cancelCallback)
+    try:
+        if not session.install():
+            raise RuntimeError('LAN Battle button did not install')
+    except Exception:
+        session.stop(show_login=False, restore_account=False)
+        raise
+    _session = session
+    return True
+
+
 def _wait_for_login_space():
     """Create the client-only Account one tick after stable LoginState."""
     global _callback_id, _login_space_seen
@@ -346,6 +366,11 @@ def _wait_for_login_space():
             _schedule(0.0, _wait_for_login_space)
             return
         _login_space_seen = False
+        # LobbyHeaderMeta stores a bound ``fightClick`` Function when its
+        # Scaleform movie receives ``script = self``.  A class patch installed
+        # after HANGAR_READY can repaint the button but cannot replace that
+        # cached callback.  Own the action before connect creates the lobby.
+        _install_lan_session()
         g_compatibility.connect(
             show_lobby=True, account_context=_account_context)
         _schedule(0.10, _wait_for_lobby)
@@ -354,7 +379,7 @@ def _wait_for_login_space():
 
 
 def _wait_for_lobby():
-    global _callback_id, _deadline, _session
+    global _callback_id, _deadline
     _callback_id = None
     try:
         if _lobby_view_loaded and _deadline <= 0.0:
@@ -364,15 +389,8 @@ def _wait_for_lobby():
         lobby = g_appLoader.getDefLobbyApp()
         if (g_compatibility.is_ready() and
                 _lobby_is_ready(g_appLoader, lobby)):
-            from gui.mods.offline_lan_0922.lan_session import LANSession
-            _session = LANSession(
-                _config, lobby_ready=_native_lobby_is_ready,
-                callback=BigWorld.callback,
-                cancel_callback=BigWorld.cancelCallback)
-            if not _session.install():
-                _session.stop(show_login=False, restore_account=False)
-                _session = None
-                raise RuntimeError('LAN Battle button did not install')
+            if _session is None:
+                raise RuntimeError('LAN Battle button is not installed')
             _remove_lobby_listener()
             sys.stdout.write(
                 '[Offline LAN 0.9.22] lobby ready; click Battle to join '

@@ -177,6 +177,13 @@ ORDERED_USES = (
         'native lobby fight click reaches the stock prebattle action boundary',
     ),
     (
+        'scripts/client/gui/Scaleform/framework/entities/'
+        'BaseDAAPIModule.pyc',
+        'BaseDAAPIModule.setFlashObject',
+        ('turnDAAPIon', 'isCreated', 'create'),
+        'Scaleform binds the Python script before populating LobbyHeader',
+    ),
+    (
         'scripts/client/gui/Scaleform/daapi/view/lobby/header/'
         'LobbyHeader.pyc',
         'LobbyHeader._updatePrebattleControls',

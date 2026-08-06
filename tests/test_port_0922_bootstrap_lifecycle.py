@@ -85,6 +85,12 @@ class BootstrapLifecycleTests(unittest.TestCase):
         state_module = types.ModuleType(
             'gui.mods.offline_lan_0922.account_rpc.state')
         state_module.AccountState = object
+        session = types.SimpleNamespace(
+            install=lambda: events.append('install_battle_router') or True,
+            stop=lambda **unused_kwargs: None)
+        lan_session_module = types.ModuleType(
+            'gui.mods.offline_lan_0922.lan_session')
+        lan_session_module.LANSession = lambda *args, **kwargs: session
         app_loader_module = _package('gui.app_loader')
         app_loader_module.g_appLoader = app_loader
         settings_module = types.ModuleType('gui.app_loader.settings')
@@ -199,6 +205,7 @@ class BootstrapLifecycleTests(unittest.TestCase):
             'gui.mods.offline_lan_0922.account_rpc.state': state_module,
             'gui.mods.offline_lan_0922.compat': compat_module,
             'gui.mods.offline_lan_0922.config': config_module,
+            'gui.mods.offline_lan_0922.lan_session': lan_session_module,
             'gui.app_loader': app_loader_module,
             'gui.app_loader.settings': settings_module,
             'items': items,
@@ -291,7 +298,8 @@ class BootstrapLifecycleTests(unittest.TestCase):
             callbacks.run_next()
 
         self.assertEqual(
-            ['clear_entities_and_spaces', 'connect'], events)
+            ['clear_entities_and_spaces', 'install_battle_router', 'connect'],
+            events)
         self.assertEqual(1, len(compatibility.connect_calls))
         self.assertTrue(compatibility.connect_calls[0][0])
 

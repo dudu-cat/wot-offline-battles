@@ -1,4 +1,4 @@
-World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.8
+World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.9
 ================================================================
 
 This folder is directly mergeable into the frozen Chinese HD client root.
@@ -30,7 +30,7 @@ Install
 3. Copy this folder's `mods` directory into the game root.
 4. Confirm this file exists:
 
-       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.8.wotmod
+       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.9.wotmod
 
 5. This copy-ready package includes:
 
@@ -61,10 +61,11 @@ Start a battle
    health are sent to the LAN server; there is no silent MS-1 fallback. If no
    valid tank is selected, the client stays in the hangar and shows a warning.
    This does not use retail matchmaking or the retail training-room service.
-5. If the client is still connecting or retrying, click Battle! again to open
-   the stock settings window explicitly. Its Description field contains
+5. If the endpoint cannot be reached, the stock settings window opens
+   automatically while retrying. Its Description field contains
    `LAN SERVER: host:port`; edit it if the server address changed. Before a
-   welcome, this settings surface does not grant room-host authority.
+   welcome, this settings surface does not grant room-host authority. You can
+   also click Battle! again while connecting to open it explicitly.
 6. The first waiting player becomes room host and receives the stock training
    settings window as a map picker. Its Description field contains
    `LAN SERVER: host:port`; the host may edit and save it there.
@@ -86,10 +87,10 @@ Troubleshooting
 ---------------
 
 - `unsupported compression type`: an older or incorrectly compressed wotmod
-  is still present. Keep only the 0.3.8 package; its members use Store method.
+  is still present. Keep only the 0.3.9 package; its members use Store method.
 - No connection in the server terminal: check `config.json`, the host LAN IP,
-  virtual-machine network mode and TCP 28782 firewall access. While the client
-  retries, click Battle! again to open the endpoint editor.
+  virtual-machine network mode and TCP 28782 firewall access. A failed attempt
+  automatically opens the native endpoint editor; Battle! can reopen it.
 - A traceback appears: close the client and keep `python.log`; it identifies the
   exact remaining client API boundary. This package does not create separate
   probe or trace files.

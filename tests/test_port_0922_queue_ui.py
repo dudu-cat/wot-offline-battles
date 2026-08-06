@@ -134,15 +134,15 @@ class JoinButtonUITests(unittest.TestCase):
         self.refresh.assert_called_once_with()
         self.assertEqual([True, False], header.disabled)
 
-    def test_unhandled_click_fully_forwards_to_stock_method(self):
+    def test_lan_mode_never_falls_through_to_stock_matchmaking(self):
         self.handled = False
         self.adapter.install()
         header = _LobbyHeader()
 
-        self.assertEqual('stock', header.fightClick(9, 'ranked'))
+        self.assertIsNone(header.fightClick(9, 'ranked'))
 
         self.assertEqual([(9, 'ranked')], self.join_calls)
-        self.assertEqual([(9, 'ranked')], header.calls)
+        self.assertEqual([], header.calls)
 
     def test_uninstall_restores_raw_class_function(self):
         original = _LobbyHeader.__dict__['fightClick']

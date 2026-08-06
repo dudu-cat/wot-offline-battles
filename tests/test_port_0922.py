@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import gc
+import socket
 import struct
 import sys
 import tempfile
@@ -137,7 +138,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.8</version></root>')
+            '<version>0.3.9</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -1810,6 +1811,39 @@ class LANClientTests(unittest.TestCase):
             bigworld=bigworld)
         return module, client, events, bigworld
 
+    def test_start_worker_connects_and_sends_protocol_hello(self):
+        module = _load_port_source('lan_client')
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.settimeout(2.0)
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(1)
+        connection = None
+        client = module.LANClient(
+            '127.0.0.1', listener.getsockname()[1], 'Loopback',
+            'china:Ch01_Type59', 1300, bigworld=_LANBigWorld())
+        try:
+            self.assertTrue(client.start())
+            connection, unused_address = listener.accept()
+            connection.settimeout(2.0)
+            payload = b''
+            while b'\n' not in payload:
+                payload += connection.recv(4096)
+            hello = json.loads(payload.split(b'\n', 1)[0].decode('utf-8'))
+
+            self.assertEqual('hello', hello['type'])
+            self.assertEqual(module.PROTOCOL_VERSION, hello['protocol'])
+            self.assertEqual(module.CLIENT_BUILD, hello['client_build'])
+            self.assertEqual('Loopback', hello['name'])
+            self.assertEqual('china:Ch01_Type59', hello['vehicle'])
+            self.assertEqual(1300, hello['max_health'])
+        finally:
+            if connection is not None:
+                connection.close()
+            client.stop()
+            if client.thread is not None:
+                client.thread.join(2.0)
+            listener.close()
+
     def test_welcome_roster_and_server_validated_start_request(self):
         module, client, events, _ = self._client()
         client.connected = True
@@ -2195,7 +2229,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.8'
+        package.PORT_VERSION = '0.3.9'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []
@@ -2217,6 +2251,9 @@ class BootstrapContractTests(unittest.TestCase):
         compatibility = types.SimpleNamespace(
             connect=mock.Mock(), is_ready=mock.Mock(return_value=True),
             fini=mock.Mock())
+        lobby_entry = mock.Mock()
+        lobby_entry.attach_mock(session.install, 'install')
+        lobby_entry.attach_mock(compatibility.connect, 'connect')
         compatibility_module = types.ModuleType(
             'gui.mods.offline_lan_0922.compat')
         compatibility_module.g_compatibility = compatibility
@@ -2325,17 +2362,27 @@ class BootstrapContractTests(unittest.TestCase):
                 compatibility.connect.assert_not_called()
                 bigworld.run_next()
                 self.assertEqual(0.0, module._deadline)
+                lan_session.LANSession.assert_called_once()
+                session.install.assert_called_once_with()
+                compatibility.connect.assert_called_once()
+                self.assertEqual(
+                    [mock.call.install(), mock.call.connect(
+                        show_lobby=True,
+                        account_context={'selected_vehicle': {
+                            'id': 1, 'compDescr': 12345},
+                            'account_state': account_state})],
+                    lobby_entry.mock_calls)
                 bigworld.run_next()
                 self.assertEqual(1030.0, module._deadline)
-                lan_session.LANSession.assert_not_called()
+                self.assertEqual(1, lan_session.LANSession.call_count)
                 self.assertEqual(1, len(bigworld._callbacks))
                 loader.getSpaceID.return_value = 4
                 bigworld.run_next()
-                lan_session.LANSession.assert_not_called()
+                self.assertEqual(1, lan_session.LANSession.call_count)
                 self.assertEqual(1, len(bigworld._callbacks))
                 hangar_space.spaceInited = True
                 bigworld.run_next()
-                lan_session.LANSession.assert_not_called()
+                self.assertEqual(1, lan_session.LANSession.call_count)
                 self.assertEqual(1, len(bigworld._callbacks))
                 hangar_vehicle.model = object()
                 bigworld.run_next()
@@ -2377,14 +2424,19 @@ class BootstrapContractTests(unittest.TestCase):
             module.fini()
             self.assertFalse(module._started)
             self.assertEqual([], bigworld._callbacks)
-        lan_session.LANSession.assert_called_once_with(
+        expected_session = mock.call(
             config.load.return_value,
             lobby_ready=module._native_lobby_is_ready,
             callback=bigworld.callback,
             cancel_callback=bigworld.cancelCallback)
-        session.install.assert_called_once_with()
-        session.stop.assert_called_once_with(
-            show_login=False, restore_account=False)
+        self.assertEqual(
+            [expected_session, expected_session],
+            lan_session.LANSession.call_args_list)
+        self.assertEqual(2, session.install.call_count)
+        self.assertEqual(
+            [mock.call(show_login=False, restore_account=False),
+             mock.call(show_login=False, restore_account=False)],
+            session.stop.call_args_list)
         expected_connect = mock.call(
             show_lobby=True,
             account_context={'selected_vehicle': {

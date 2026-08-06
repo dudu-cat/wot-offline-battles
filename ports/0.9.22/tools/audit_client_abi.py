@@ -236,6 +236,14 @@ EXPECTED_ABI = {
         'LobbyHeaderMeta.as_disableFightButtonS': (
             'self', 'isDisabled'),
     },
+    'scripts/client/gui/Scaleform/framework/entities/'
+    'BaseDAAPIModule.pyc': {
+        'BaseDAAPIModule.setFlashObject': (
+            'self', 'movieClip', 'autoPopulate', 'setScript'),
+    },
+    'scripts/client/gui/Scaleform/framework/entities/DAAPIEntity.pyc': {
+        'DAAPIEntity.turnDAAPIon': ('self', 'setScript', 'movieClip'),
+    },
     'scripts/client/gui/prb_control/events_dispatcher.pyc': {
         'EventDispatcher.updateUI': ('self', 'loadedAlias'),
     },
@@ -441,6 +449,16 @@ EXPECTED_CODE_NAMES = {
     'scripts/client/gui/Scaleform/daapi/view/meta/LobbyHeaderMeta.pyc': {
         'LobbyHeaderMeta.as_disableFightButtonS': (
             '_isDAAPIInited', 'flashObject', 'as_disableFightButton'),
+    },
+    'scripts/client/gui/Scaleform/framework/entities/'
+    'BaseDAAPIModule.pyc': {
+        'BaseDAAPIModule.setFlashObject': (
+            'turnDAAPIon', 'isCreated', 'create'),
+    },
+    'scripts/client/gui/Scaleform/framework/entities/DAAPIEntity.pyc': {
+        'DAAPIEntity.turnDAAPIon': (
+            '_DAAPIEntity__isDAAPIInited',
+            '_DAAPIEntity__flashObject', 'script'),
     },
     'scripts/client/gui/prb_control/events_dispatcher.pyc': {
         'EventDispatcher.updateUI': (
