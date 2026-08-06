@@ -56,6 +56,7 @@ Bots in this build
 - Bounded weighted A* connects strategic anchors while local feelers avoid
   cliffs, all water, hard obstacles, nearby tanks and congestion.
 - Vehicle roles cover brawling, support, flanking, sniping, scouting and SPGs.
+- Each team has at most one SPG, including any SPG selected by a LAN player.
 - Bots have stable individual aggression, caution, teamwork and driving habits.
 - Combat behavior includes limited spotting information, target memory, hull
   angling, peek-and-withdraw timing and occasional forward/backward jiggling.

@@ -39,6 +39,51 @@ def vehicle_in_battle_tier_band(player_tier, candidate_tier):
 		return False
 
 
+def select_bot_lineup(pool, count, spg_limit=1, fallback_candidates=()):
+	"""Fill a team while enforcing an exact SPG cap.
+
+	``AT-SPG`` is a tank destroyer in the legacy tags and does not consume the
+	artillery slot.  Human artillery is accounted for by the caller through a
+	reduced ``spg_limit``.
+	"""
+	count = max(0, int(count))
+	spg_limit = max(0, int(spg_limit))
+	pool = list(pool or ())
+	if not pool or count <= 0:
+		return []
+	regular = []
+	seen = set()
+	for candidate in pool + list(fallback_candidates or ()):
+		try:
+			tags = candidate['tags']
+			name = candidate['name']
+		except Exception:
+			continue
+		if 'SPG' in tags or name in seen:
+			continue
+		seen.add(name)
+		regular.append(candidate)
+	result = []
+	spg_count = 0
+	regular_index = 0
+	for index in range(count):
+		candidate = pool[index % len(pool)]
+		try:
+			is_spg = 'SPG' in candidate['tags']
+		except Exception:
+			is_spg = False
+		if is_spg and spg_count >= spg_limit:
+			if not regular:
+				continue
+			candidate = regular[regular_index % len(regular)]
+			regular_index += 1
+			is_spg = False
+		if is_spg:
+			spg_count += 1
+		result.append(candidate)
+	return result
+
+
 def bot_initially_visible(bot_team, player_team, spotting_enabled):
 	"""Hide an enemy model before its first spotting update can run."""
 	try:

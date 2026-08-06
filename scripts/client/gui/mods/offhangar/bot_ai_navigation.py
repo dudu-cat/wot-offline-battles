@@ -112,6 +112,13 @@ class TerrainGrid(object):
 			return None
 		return float(self._baked_heights[index]) / 1000.0
 
+	def near_baked_navigation(self, point, max_radius=1):
+		"""Return whether a realised pose remains in the baked safe corridor."""
+		if not self.prebaked:
+			return True
+		return self._nearest_baked_cell(
+			self.cell_for(point), max(0, int(max_radius))) is not None
+
 	def _nearest_baked_cell(self, cell, max_radius):
 		if self._baked_index(cell) is not None:
 			return cell
@@ -645,6 +652,12 @@ class TerrainNavigator(object):
 		for mode in self.fallback_modes.values():
 			active[mode] = active.get(mode, 0) + 1
 		return {
+			'graph': {
+				'source': 'baked' if self.grid.prebaked else 'runtime',
+				'cell_mm': int(round(self.grid.cell_size * 1000.0)),
+				'nodes': (sum(1 for value in self.grid._baked_heights
+				              if value is not None) if self.grid.prebaked else 0),
+			},
 			'total': dict(self.fallback_totals),
 			'active': active,
 			'recovered': int(self.fallback_recovered),

@@ -216,6 +216,8 @@ class LANClientQueueTest(unittest.TestCase):
                     "candidates": [candidate] * 13} for index in range(20)]
 
         raw_navigation = {
+            "graph": {"source": "baked", "cell_mm": 4000, "nodes": 16808,
+                      "ignored": 999},
             "total": {"safe_direct": 2, "safe_local": 3, "reactive": -5,
                       "ignored": 999},
             "active": {"safe_direct": 0, "safe_local": 1, "reactive": 2},
@@ -228,6 +230,7 @@ class LANClientQueueTest(unittest.TestCase):
                        "blocked": 6, "recovery": 7, "arrived": 5,
                        "water_guard": 2, "ignored": 999},
             "safety": {"water_guard_total": 100005, "water_guard_active": 2,
+                       "edge_guard_total": 17, "edge_guard_active": 1,
                        "veto_water": 4, "veto_terrain": 3,
                        "veto_obstacle": 2, "veto_error": 1,
                        "ignored": 999},
@@ -244,6 +247,9 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertEqual(3, navigation["total"]["safe_local"])
         self.assertNotIn("ignored", navigation["total"])
         self.assertEqual(4, navigation["recovered"])
+        self.assertEqual("baked", navigation["graph"]["source"])
+        self.assertEqual(16808, navigation["graph"]["nodes"])
+        self.assertNotIn("ignored", navigation["graph"])
         self.assertEqual(13, navigation["search"]["pending"])
         self.assertEqual(12345, navigation["search"]["oldest_ms"])
         self.assertNotIn("ignored", navigation["search"])
@@ -255,6 +261,7 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertEqual(2, navigation["driver"]["water_guard"])
         self.assertNotIn("ignored", navigation["driver"])
         self.assertEqual(100000, navigation["safety"]["water_guard_total"])
+        self.assertEqual(17, navigation["safety"]["edge_guard_total"])
         self.assertEqual(4, navigation["safety"]["veto_water"])
         self.assertNotIn("ignored", navigation["safety"])
 

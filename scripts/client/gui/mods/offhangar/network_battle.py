@@ -1152,7 +1152,20 @@ def publish_bot_observation(player, contacts, affordances=None, navigation=None)
 	shared_navigation = None
 	if isinstance(navigation, dict):
 		shared_navigation = {
+			'graph': {'source': 'none', 'cell_mm': 0, 'nodes': 0},
 			'total': {}, 'active': {}, 'recovered': 0, 'search': {}}
+		raw_graph = navigation.get('graph')
+		if isinstance(raw_graph, dict):
+			source = str(raw_graph.get('source') or 'none')
+			if source not in ('baked', 'runtime'):
+				source = 'none'
+			shared_navigation['graph']['source'] = source
+			for name, maximum in (('cell_mm', 100000), ('nodes', 100000)):
+				try:
+					value = int(raw_graph.get(name, 0) or 0)
+				except Exception:
+					value = 0
+				shared_navigation['graph'][name] = max(0, min(value, maximum))
 		for group in ('total', 'active'):
 			raw_group = navigation.get(group)
 			if not isinstance(raw_group, dict):
@@ -1208,13 +1221,14 @@ def publish_bot_observation(player, contacts, affordances=None, navigation=None)
 		raw_safety = navigation.get('safety')
 		if isinstance(raw_safety, dict):
 			shared_navigation['safety'] = {}
-			for name in ('water_guard_total', 'water_guard_active', 'veto_water',
+			for name in ('water_guard_total', 'water_guard_active',
+					'edge_guard_total', 'edge_guard_active', 'veto_water',
 					'veto_terrain', 'veto_obstacle', 'veto_error'):
 				try:
 					value = int(raw_safety.get(name, 0) or 0)
 				except Exception:
 					value = 0
-				maximum = 100000 if name == 'water_guard_total' else 30
+				maximum = 100000 if name.endswith('_total') else 30
 				shared_navigation['safety'][name] = max(0, min(value, maximum))
 	return client.send_bot_observation(
 		payload, shared_affordances, shared_navigation)

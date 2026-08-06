@@ -73,6 +73,22 @@ class BotAITest(unittest.TestCase):
 
         self.assertEqual({6, 7, 8}, allowed)
 
+    def test_lineup_limits_exact_spg_but_not_tank_destroyers(self):
+        vehicles = [
+            {"name": "spg-a", "tags": {"SPG"}},
+            {"name": "spg-b", "tags": {"SPG"}},
+            {"name": "td", "tags": {"AT-SPG"}},
+            {"name": "medium", "tags": {"mediumTank"}},
+        ]
+
+        lineup = self.ai.select_bot_lineup(vehicles, 12, 1, vehicles)
+        no_bot_spg = self.ai.select_bot_lineup(vehicles, 12, 0, vehicles)
+
+        self.assertEqual(12, len(lineup))
+        self.assertLessEqual(sum("SPG" in item["tags"] for item in lineup), 1)
+        self.assertEqual(0, sum("SPG" in item["tags"] for item in no_bot_spg))
+        self.assertTrue(any("AT-SPG" in item["tags"] for item in lineup))
+
     def test_enemy_is_hidden_until_spotted_but_ally_is_visible(self):
         self.assertFalse(self.ai.bot_initially_visible(2, 1, True))
         self.assertTrue(self.ai.bot_initially_visible(1, 1, True))

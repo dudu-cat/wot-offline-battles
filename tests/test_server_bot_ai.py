@@ -57,6 +57,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         state.update_bot_observation(1, {
             "contacts": [],
             "navigation": {
+                "graph": {"source": "baked", "cell_mm": 4000, "nodes": 16808},
                 "total": {"safe_direct": 2, "safe_local": 3, "reactive": 200000},
                 "active": {"safe_direct": 0, "safe_local": 1, "reactive": 2},
                 "recovered": 4,
@@ -68,6 +69,7 @@ class ServerBotPlannerTests(unittest.TestCase):
                            "blocked": 6, "recovery": 7, "arrived": 5,
                            "server_wait": 2, "water_guard": 2},
                 "safety": {"water_guard_total": 11, "water_guard_active": 2,
+                           "edge_guard_total": 7, "edge_guard_active": 1,
                            "veto_water": 4, "veto_terrain": 3,
                            "veto_obstacle": 2, "veto_error": 1},
             },
@@ -80,6 +82,8 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(15, state.bot_navigation_stats["aim"]["targeted"])
         self.assertEqual(9, state.bot_navigation_stats["driver"]["moving"])
         self.assertEqual(11, state.bot_navigation_stats["safety"]["water_guard_total"])
+        self.assertEqual("baked", state.bot_navigation_stats["graph"]["source"])
+        self.assertEqual(16808, state.bot_navigation_stats["graph"]["nodes"])
         before = dict(state.bot_navigation_stats)
         state.update_bot_observation(2, {
             "navigation": {"total": {"reactive": 0}}
@@ -97,6 +101,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertIn(
             "nav_total=direct:2,local:3,reactive:100000 recovered:4", text
         )
+        self.assertIn("nav=baked,cell:4000mm,nodes:16808", text)
         self.assertIn(
             "astar=pending:13,oldest:12345ms,tick_age:17ms,done:4,failed:2", text
         )
@@ -107,7 +112,7 @@ class ServerBotPlannerTests(unittest.TestCase):
             "driver=moving:9,drive:8,avoid:3,blocked:6,recovery:7,arrived:5,wait:2",
             text,
         )
-        self.assertIn("safety=guard:11/2,veto:w4,t3,o2,e1", text)
+        self.assertIn("safety=water:11/2,edge:7/1,veto:w4,t3,o2,e1", text)
 
     def test_downloadable_layout_imports_shared_cover_module(self):
         with tempfile.TemporaryDirectory() as temp_dir:

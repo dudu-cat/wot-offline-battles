@@ -89,16 +89,19 @@ mismatch`, the client and server packages are from different builds.
 During a battle the server prints one compact bot-AI line every three seconds:
 
 ```text
-BOT AI reports=t1:2,t2:3 accepted=5 contacts=t1:2/2,t2:3/3 targets=t1:8,t2:9 fire=t1:5,t2:6 modes=engage:17,route:12 nav_total=direct:20,local:4,reactive:3 recovered:9 nav_active=direct:2,local:1,reactive:0 astar=pending:5,oldest:420ms,tick_age:0ms,done:41,failed:2 orders=server:18,client:18,loaded:29,acked:18 aim=targeted:17,aligned:6,traversing:11,limited:7,alive:29 driver=moving:24,drive:20,avoid:4,blocked:0,recovery:1,arrived:4,wait:0
+BOT AI reports=t1:2,t2:3 accepted=5 contacts=t1:2/2,t2:3/3 targets=t1:8,t2:9 fire=t1:5,t2:6 modes=engage:17,route:12 nav=baked,cell:4000mm,nodes:16808 nav_total=direct:20,local:4,reactive:3 recovered:9 nav_active=direct:2,local:1,reactive:0 astar=pending:5,oldest:420ms,tick_age:0ms,done:41,failed:2 orders=server:18,client:18,loaded:29,acked:18 aim=targeted:17,aligned:6,traversing:11,limited:7,alive:29 driver=moving:24,drive:20,avoid:4,blocked:0,recovery:1,arrived:4,wait:0 safety=water:2/0,edge:5/1,veto:w0,t1,o0,e0
 ```
 
 `reports` is the authority client's current visible-contact count, `contacts`
 is visible/remembered state accepted by the server, `targets` is the number of
 bots with a combat target, and `fire` is the number currently authorized to
-shoot. `nav_total` is cumulative while `nav_active`, `aim` and `driver` are
+shoot. `nav=baked` is direct proof that the shipped graph is active; `runtime`
+means this map is still using live terrain probes. `nav_total` is cumulative
+while `nav_active`, `aim` and `driver` are
 current samples. `tick_age` reveals a stalled path scheduler. A healthy order
 pipeline has matching `orders` server/client/acked revisions and `loaded:29`;
 `wait` counts bots deliberately holding while an order body is being recovered.
+`safety` counts water rollbacks and baked-edge rollbacks as total/current.
 Each actual client-simulated shot also prints `BOT FIRE`. This separates
 spotting, delivery, navigation and client execution without enabling verbose
 client debug logging.

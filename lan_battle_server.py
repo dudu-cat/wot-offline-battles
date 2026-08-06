@@ -183,6 +183,7 @@ class BattleState:
         self.bot_reported_hits = set()
         self.bot_observation_stats = {1: 0, 2: 0, "accepted": 0}
         self.bot_navigation_stats = {
+            "graph": {"source": "none", "cell_mm": 0, "nodes": 0},
             "total": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
             "active": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
             "recovered": 0,
@@ -195,6 +196,7 @@ class BattleState:
                        "blocked": 0, "recovery": 0, "arrived": 0,
                        "server_wait": 0, "water_guard": 0},
             "safety": {"water_guard_total": 0, "water_guard_active": 0,
+                       "edge_guard_total": 0, "edge_guard_active": 0,
                        "veto_water": 0, "veto_terrain": 0,
                        "veto_obstacle": 0, "veto_error": 0},
         }
@@ -232,6 +234,7 @@ class BattleState:
         if old != self.bot_authority_id and self.phase == "battle":
             self.bot_planner.clear_observations()
             self.bot_navigation_stats = {
+                "graph": {"source": "none", "cell_mm": 0, "nodes": 0},
                 "total": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
                 "active": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
                 "recovered": 0,
@@ -244,6 +247,7 @@ class BattleState:
                            "blocked": 0, "recovery": 0, "arrived": 0,
                            "server_wait": 0, "water_guard": 0},
                 "safety": {"water_guard_total": 0, "water_guard_active": 0,
+                           "edge_guard_total": 0, "edge_guard_active": 0,
                            "veto_water": 0, "veto_terrain": 0,
                            "veto_obstacle": 0, "veto_error": 0},
             }
@@ -335,6 +339,7 @@ class BattleState:
                 self.bot_reported_hits = set()
                 self.bot_observation_stats = {1: 0, 2: 0, "accepted": 0}
                 self.bot_navigation_stats = {
+                    "graph": {"source": "none", "cell_mm": 0, "nodes": 0},
                     "total": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
                     "active": {"safe_direct": 0, "safe_local": 0, "reactive": 0},
                     "recovered": 0,
@@ -347,6 +352,7 @@ class BattleState:
                                "blocked": 0, "recovery": 0, "arrived": 0,
                                "server_wait": 0, "water_guard": 0},
                     "safety": {"water_guard_total": 0, "water_guard_active": 0,
+                               "edge_guard_total": 0, "edge_guard_active": 0,
                                "veto_water": 0, "veto_terrain": 0,
                                "veto_obstacle": 0, "veto_error": 0},
                 }
@@ -585,7 +591,20 @@ class BattleState:
             }
             raw_navigation = message.get("navigation")
             if isinstance(raw_navigation, dict):
-                navigation = {"total": {}, "active": {}, "search": {}}
+                navigation = {"graph": {}, "total": {}, "active": {}, "search": {}}
+                raw_graph = raw_navigation.get("graph")
+                if not isinstance(raw_graph, dict):
+                    raw_graph = {}
+                graph_source = str(raw_graph.get("source") or "none")
+                if graph_source not in ("baked", "runtime"):
+                    graph_source = "none"
+                navigation["graph"] = {
+                    "source": graph_source,
+                    "cell_mm": max(0, min(int(_finite_float(
+                        raw_graph.get("cell_mm"), 0)), 100000)),
+                    "nodes": max(0, min(int(_finite_float(
+                        raw_graph.get("nodes"), 0)), 100000)),
+                }
                 for group in ("total", "active"):
                     raw_group = raw_navigation.get(group)
                     if not isinstance(raw_group, dict):
@@ -630,9 +649,10 @@ class BattleState:
                 if not isinstance(raw_safety, dict):
                     raw_safety = {}
                 navigation["safety"] = {}
-                for name in ("water_guard_total", "water_guard_active", "veto_water",
+                for name in ("water_guard_total", "water_guard_active",
+                             "edge_guard_total", "edge_guard_active", "veto_water",
                              "veto_terrain", "veto_obstacle", "veto_error"):
-                    maximum = 100000 if name == "water_guard_total" else 30
+                    maximum = 100000 if name.endswith("_total") else 30
                     navigation["safety"][name] = max(0, min(
                         int(_finite_float(raw_safety.get(name), 0)), maximum))
                 self.bot_navigation_stats = navigation
@@ -999,18 +1019,22 @@ class BattleState:
                 "BOT AI reports=t1:%d,t2:%d accepted=%d "
                 "contacts=t1:%d/%d,t2:%d/%d targets=t1:%d,t2:%d "
                 "fire=t1:%d,t2:%d modes=%s "
+                "nav=%s,cell:%dmm,nodes:%d "
                 "nav_total=direct:%d,local:%d,reactive:%d recovered:%d "
                 "nav_active=direct:%d,local:%d,reactive:%d "
                 "astar=pending:%d,oldest:%dms,tick_age:%dms,done:%d,failed:%d "
                 "orders=server:%d,client:%d,loaded:%d,acked:%d "
                 "aim=targeted:%d,aligned:%d,traversing:%d,limited:%d,alive:%d "
                 "driver=moving:%d,drive:%d,avoid:%d,blocked:%d,recovery:%d,arrived:%d,wait:%d "
-                "safety=guard:%d/%d,veto:w%d,t%d,o%d,e%d" % (
+                "safety=water:%d/%d,edge:%d/%d,veto:w%d,t%d,o%d,e%d" % (
                     reports.get(1, 0), reports.get(2, 0), reports.get("accepted", 0),
                     teams[1]["visible"], teams[1]["contacts"],
                     teams[2]["visible"], teams[2]["contacts"],
                     teams[1]["targeted"], teams[2]["targeted"],
                     teams[1]["fire"], teams[2]["fire"], modes or "none",
+                    navigation.get("graph", {}).get("source", "none"),
+                    navigation.get("graph", {}).get("cell_mm", 0),
+                    navigation.get("graph", {}).get("nodes", 0),
                     navigation["total"].get("safe_direct", 0),
                     navigation["total"].get("safe_local", 0),
                     navigation["total"].get("reactive", 0),
@@ -1041,6 +1065,8 @@ class BattleState:
                     navigation.get("driver", {}).get("server_wait", 0),
                     navigation.get("safety", {}).get("water_guard_total", 0),
                     navigation.get("safety", {}).get("water_guard_active", 0),
+                    navigation.get("safety", {}).get("edge_guard_total", 0),
+                    navigation.get("safety", {}).get("edge_guard_active", 0),
                     navigation.get("safety", {}).get("veto_water", 0),
                     navigation.get("safety", {}).get("veto_terrain", 0),
                     navigation.get("safety", {}).get("veto_obstacle", 0),

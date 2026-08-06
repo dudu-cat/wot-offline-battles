@@ -89,6 +89,30 @@ class NavigationBakerTest(unittest.TestCase):
         self.assertEqual(2, graph["bake"]["pruned_nodes"])
         self.assertEqual(1, validation["components"])
 
+    def test_edge_clearance_rejects_water_and_one_way_drops(self):
+        class Terrain:
+            def __init__(self, water=False, drop=False):
+                self.water = water
+                self.drop = drop
+
+            def height(self, x, z):
+                if self.drop and x >= 3.0:
+                    return -4.0
+                return 0.0
+
+            def water_depth(self, x, z, ground):
+                return 1.0 if self.water and x >= 3.0 else 0.0
+
+        self.assertTrue(self.baker._has_safe_edge_clearance(
+            Terrain(), 0.0, 0.0, 0.0
+        ))
+        self.assertFalse(self.baker._has_safe_edge_clearance(
+            Terrain(water=True), 0.0, 0.0, 0.0
+        ))
+        self.assertFalse(self.baker._has_safe_edge_clearance(
+            Terrain(drop=True), 0.0, 0.0, 0.0
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

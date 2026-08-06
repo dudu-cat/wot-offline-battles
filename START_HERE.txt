@@ -65,7 +65,7 @@ IF SOMETHING DOES NOT LOAD
 - Do NOT delete scripts\client\CameraNode.pyc or OfflineEntity.pyc.
 - Check <game folder>\python.log for:
 
-  Offline Battles source loader active; LAN settings module enabled
+  Offline Battles source loader active; LAN settings and prebaked navigation enabled
 
 See INSTALL.txt for the feature summary and LAN_SERVER.md for detailed network
 diagnostics and limitations.

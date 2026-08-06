@@ -790,6 +790,21 @@ def _offh_ai_dry_rollback(vehicle):
 	return getattr(vehicle, '_offh_ai_dry_anchor', None)
 
 
+def _offh_ai_baked_pose_safe(position, shoulder_cells=1):
+	'''Whether a realised pose remains close to the shipped safe graph.'''
+	try:
+		navigator = globals().get('g_offh_terrain_navigator')
+		if navigator is None or not navigator.grid.prebaked:
+			return True
+		return bool(navigator.grid.near_baked_navigation(
+			(float(position[0]), float(position[1]), float(position[2])),
+			int(shoulder_cells)))
+	except Exception:
+		# Existing water and local terrain probes remain fail-closed. Do not
+		# immobilise every bot if only this optional shipped-graph guard breaks.
+		return True
+
+
 def _offh_refresh_team_score(player):
 	'''Refresh the top HUD score from canonical alive state after any death.
 
@@ -1786,6 +1801,7 @@ def _offh_ai_navigator(director):
 			return None
 	globals()['g_offh_terrain_navigator'] = navigator
 	globals()['g_offh_ai_water_guard_total'] = 0
+	globals()['g_offh_ai_edge_guard_total'] = 0
 	if baked_graph is not None and navigator.grid.prebaked:
 		LOG_NOTE('OfflineBattle.SMART_AI using baked navigation map=%s cell=%.1fm nodes=%d' % (
 			getattr(director, 'map_name', ''), navigator.grid.cell_size,
@@ -2424,7 +2440,9 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 			           'water_guard': 0}
 			_safety = {'water_guard_total': int(
 				globals().get('g_offh_ai_water_guard_total', 0) or 0),
-				'water_guard_active': 0, 'veto_water': 0,
+				'water_guard_active': 0, 'edge_guard_total': int(
+				globals().get('g_offh_ai_edge_guard_total', 0) or 0),
+				'edge_guard_active': 0, 'veto_water': 0,
 				'veto_terrain': 0, 'veto_obstacle': 0, 'veto_error': 0}
 			_diag_now = BigWorld.time()
 			for _aim_vehicle in (mock_vehicles or {}).values():
@@ -2446,6 +2464,8 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 					_driver[_driver_mode] += 1
 				if float(getattr(_aim_vehicle, '_offh_ai_water_guard_until', 0.0) or 0.0) > _diag_now:
 					_safety['water_guard_active'] += 1
+				if float(getattr(_aim_vehicle, '_offh_ai_edge_guard_until', 0.0) or 0.0) > _diag_now:
+					_safety['edge_guard_active'] += 1
 				if float(getattr(_aim_vehicle, '_offh_ai_probe_reject_until', 0.0) or 0.0) > _diag_now:
 					_reason = getattr(_aim_vehicle, '_offh_ai_probe_reject', '')
 					_reason_key = 'veto_' + str(_reason)
@@ -9461,9 +9481,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								m_veh._offh_ai_tick_dry_pose = (
 									float(m_veh.position.x), float(m_veh.position.y),
 									float(m_veh.position.z))
+								m_veh._offh_ai_tick_nav_safe = _offh_ai_baked_pose_safe(
+									m_veh._offh_ai_tick_dry_pose)
 								_offh_ai_remember_dry_pose(m_veh)
 							else:
 								m_veh._offh_ai_tick_dry_pose = None
+								m_veh._offh_ai_tick_nav_safe = False
 							cur_vel = m_veh._veh_velocity
 							if not getattr(m_veh, '_airborne', False) and (throttle != 0 or abs(cur_vel) > 0.01):
 								m_veh._dp_acc = (getattr(m_veh, '_dp_acc', 9.0) or 9.0) + dt
@@ -9701,6 +9724,26 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 												_offh_ai_driver().remember_failure(eid, target_yaw, 5.0)
 											except Exception:
 												pass
+										if not _slide_blocked_by_water:
+											try:
+												_forecast_hit = BigWorld.wg_collideSegment(
+													_offh_bspace(),
+													Math.Vector3(_slide_probe.x,
+													             m_veh.position.y + 8.0,
+													             _slide_probe.z),
+													Math.Vector3(_slide_probe.x,
+													             m_veh.position.y - 30.0,
+													             _slide_probe.z), 128)
+											except Exception:
+												_forecast_hit = None
+											if (_forecast_hit is None or
+													m_veh.position.y - _forecast_hit[0].y >
+													_slide_forecast * 0.38):
+												_slide_blocked_by_water = True
+												m_veh._slide_spd = 0.0
+												m_veh._air_lat_vx = 0.0
+												m_veh._air_lat_vz = 0.0
+												_offh_ai_probe_reject(m_veh, 'terrain')
 										_slb_x = m_veh.position.x + _bsl_dx * _bss * dt
 										_slb_z = m_veh.position.z + _bsl_dz * _bss * dt
 										try:
@@ -9751,6 +9794,38 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									          m_veh._ypr_c[4], m_veh._ypr_c[5])
 							else:
 								_offh_ai_remember_dry_pose(m_veh)
+							# The baked graph is eroded away from cliffs and water. Local avoidance,
+							# tank impulses and lateral slide can still move the rendered hull, so
+							# validate the realised pose after all of those effects too.
+							if (getattr(m_veh, '_offh_ai_tick_nav_safe', False) and
+									not _offh_ai_baked_pose_safe((m_veh.position.x,
+										m_veh.position.y, m_veh.position.z))):
+								_edge_anchor = getattr(m_veh, '_offh_ai_tick_dry_pose', None)
+								if _edge_anchor is not None:
+									m_veh.position = Math.Vector3(
+										_edge_anchor[0], _edge_anchor[1], _edge_anchor[2])
+									m_veh._veh_velocity = 0.0
+									m_veh._veh_turn_velocity = 0.0
+									m_veh._slide_spd = 0.0
+									m_veh._air_lat_vx = 0.0
+									m_veh._air_lat_vz = 0.0
+									m_veh._vert_vel = 0.0
+									m_veh._airborne = False
+									m_veh._push_x = 0.0
+									m_veh._push_z = 0.0
+									m_veh._offh_ai_driver_mode = 'edge_guard'
+									m_veh._offh_ai_edge_guard_until = BigWorld.time() + 1.0
+									globals()['g_offh_ai_edge_guard_total'] = int(
+										globals().get('g_offh_ai_edge_guard_total', 0) or 0) + 1
+									try:
+										_offh_ai_driver().remember_failure(eid, target_yaw, 5.0)
+									except Exception:
+										pass
+									m_veh._ypr_c = _get_terrain_ypr(
+										_offh_bspace(), m_veh.position, m_veh.yaw)
+									_b_ypr = (m_veh.yaw, m_veh._ypr_c[1],
+									          m_veh._ypr_c[2], m_veh._ypr_c[3],
+									          m_veh._ypr_c[4], m_veh._ypr_c[5])
 							# Smooth pitch/roll so bots don't jitter on rough terrain
 							_b_blend = min(1.0, dt * 8.0)
 							_b_p0 = getattr(m_veh, 'pitch', 0.0) or 0.0
@@ -14364,7 +14439,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							import random as _rnd
 							from items import vehicles as _veh_items
 							import nations as _nations
-							from gui.mods.offhangar.bot_ai import vehicle_in_battle_tier_band
+							from gui.mods.offhangar.bot_ai import (vehicle_in_battle_tier_band,
+								select_bot_lineup)
 							_tier = loaded_models['td'].type.level
 							_cand = []
 							for _nat in _nations.AVAILABLE_NAMES:
@@ -14389,7 +14465,29 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								# loading ~30 fresh random tanks each battle (the leak
 								# that climbed the baseline until map-load OOM).
 								_pool = _offh_bot_pool(_cand, _tier)
-								_picked = [_pool[_x % len(_pool)] for _x in range(_count)]
+								# One artillery slot per team, including LAN humans. AT-SPG is
+								# an exact, separate tank-destroyer tag and does not consume it.
+								_human_spgs = 0
+								_human_team_seen = False
+								for _human in (getattr(_pl, '_offhangar_network_roster', None) or []):
+									if int(_human.get('team', 0) or 0) != _t:
+										continue
+									_human_team_seen = True
+									try:
+										_human_td = _veh_items.VehicleDescr(
+											typeName=str(_human.get('vehicle')))
+										if 'SPG' in _human_td.type.tags:
+											_human_spgs += 1
+									except Exception:
+										pass
+								if not _human_team_seen and _t == _p_team:
+									try:
+										if 'SPG' in loaded_models['td'].type.tags:
+											_human_spgs = 1
+									except Exception:
+										pass
+								_picked = select_bot_lineup(
+									_pool, _count, max(0, 1 - _human_spgs), _cand)
 								_rnd.shuffle(_picked)
 								_picked.sort(key=_class_key)
 								_veh_names = [_p['name'] for _p in _picked]

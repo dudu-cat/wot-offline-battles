@@ -94,6 +94,19 @@ class BotNavigationTest(unittest.TestCase):
         self.assertEqual(768, navigator.search_budget_per_frame)
         self.assertEqual(4096, navigator.search_max_expansions)
 
+        diagnostics = navigator.fallback_diagnostics()
+        self.assertEqual("baked", diagnostics["graph"]["source"])
+        self.assertEqual(4000, diagnostics["graph"]["cell_mm"])
+        self.assertEqual(9, diagnostics["graph"]["nodes"])
+
+    def test_prebaked_corridor_allows_one_cell_shoulder_only(self):
+        graph = self.baked_graph(5, 1, blocked=((2, 0), (3, 0), (4, 0)))
+        grid = self.navigation.TerrainGrid(lambda *args: None, baked_graph=graph)
+
+        self.assertTrue(grid.near_baked_navigation((14.0, 0.0, 20.0), 0))
+        self.assertTrue(grid.near_baked_navigation((18.0, 0.0, 20.0), 1))
+        self.assertFalse(grid.near_baked_navigation((22.0, 0.0, 20.0), 1))
+
     def test_shipped_lakeville_graph_connects_every_route_both_ways(self):
         graph_path = (
             ROOT / "scripts/client/gui/mods/offhangar/navgraphs/07_lakeville.json"
@@ -716,6 +729,8 @@ class BotNavigationTest(unittest.TestCase):
         self.assertIn("def _offh_ai_dry_rollback", battle_source)
         self.assertIn("if distance >= 3.0:", battle_source)
         self.assertIn("m_veh._offh_ai_driver_mode = 'water_guard'", battle_source)
+        self.assertIn("def _offh_ai_baked_pose_safe", battle_source)
+        self.assertIn("m_veh._offh_ai_driver_mode = 'edge_guard'", battle_source)
         self.assertGreater(
             battle_source.index("# Final realised-pose water guard."),
             battle_source.index("# --- Slope slide (bot):"),
@@ -744,6 +759,14 @@ class BotNavigationTest(unittest.TestCase):
         self.assertLess(
             final_guard,
             battle_source.index("publish_authoritative_bots", final_guard),
+        )
+        edge_guard = battle_source.index(
+            "# The baked graph is eroded away from cliffs and water."
+        )
+        self.assertGreater(edge_guard, final_guard)
+        self.assertLess(
+            edge_guard,
+            battle_source.index("m_veh.matrix.setRotateYPR", edge_guard),
         )
 
     def test_astar_jobs_are_bounded_and_ignore_transient_vehicle_penalties(self):

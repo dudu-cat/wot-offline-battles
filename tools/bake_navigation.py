@@ -49,6 +49,7 @@ WATER_DEPTH_LIMIT = 0.12
 VEHICLE_HALF_WIDTH = 2.15
 VEHICLE_CLEARANCE_HEIGHT = 2.40
 MAX_GRADE = 0.38
+EDGE_CLEARANCE_RADII = (3.0, 6.0)
 
 DIRECTIONS = (
     (-1, -1), (0, -1), (1, -1),
@@ -985,6 +986,36 @@ def _segment_clear(terrain, obstacles, start, end):
     return True
 
 
+def _has_safe_edge_clearance(terrain, x, z, ground_y):
+    """Reject cells whose hull shoulder can fall into water or off a steep lip.
+
+    A route centre can be dry while collision avoidance places one track over a
+    shoreline or cliff.  Sampling an eroded shoulder around every baked node
+    gives the runtime driver room to deviate without relying on map-specific
+    forbidden polygons.
+    """
+    directions = (
+        (-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0),
+        (-math.sqrt(0.5), -math.sqrt(0.5)),
+        (math.sqrt(0.5), -math.sqrt(0.5)),
+        (-math.sqrt(0.5), math.sqrt(0.5)),
+        (math.sqrt(0.5), math.sqrt(0.5)),
+    )
+    for radius in EDGE_CLEARANCE_RADII:
+        maximum_drop = radius * MAX_GRADE
+        for direction_x, direction_z in directions:
+            sample_x = float(x) + direction_x * radius
+            sample_z = float(z) + direction_z * radius
+            sample_y = terrain.height(sample_x, sample_z)
+            if sample_y is None:
+                return False
+            if terrain.water_depth(sample_x, sample_z, sample_y) > WATER_DEPTH_LIMIT:
+                return False
+            if float(ground_y) - float(sample_y) > maximum_drop:
+                return False
+    return True
+
+
 def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
     map_config = MAPS[map_name]
     bounds = map_config["bounds"]
@@ -997,6 +1028,7 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
     heights = [None] * (width * height)
     rejected_water = 0
     rejected_obstacle = 0
+    rejected_edge = 0
     for z_index in range(height):
         z = origin_z + z_index * cell_size
         for x_index in range(width):
@@ -1007,6 +1039,9 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
                 continue
             if terrain.water_depth(x, z, ground) > WATER_DEPTH_LIMIT:
                 rejected_water += 1
+                continue
+            if not _has_safe_edge_clearance(terrain, x, z, ground):
+                rejected_edge += 1
                 continue
             if obstacles.blocked(x, z, ground):
                 rejected_obstacle += 1
@@ -1058,6 +1093,7 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
             "vehicle_half_width": VEHICLE_HALF_WIDTH,
             "vehicle_clearance_height": VEHICLE_CLEARANCE_HEIGHT,
             "max_grade": MAX_GRADE,
+            "edge_clearance_radii": list(EDGE_CLEARANCE_RADII),
             "terrain_chunks": len(terrain.chunks),
             "water_planes": len(terrain.waters),
             "model_shapes": len(obstacles.model_library.cache),
@@ -1067,6 +1103,7 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
             "skipped_models": obstacles.skipped,
             "rejected_water_nodes": rejected_water,
             "rejected_obstacle_nodes": rejected_obstacle,
+            "rejected_edge_nodes": rejected_edge,
         },
     }
     retain_base_component(graph, map_config)
