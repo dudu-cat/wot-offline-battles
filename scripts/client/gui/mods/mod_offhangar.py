@@ -278,6 +278,21 @@ class _OfflineArenaStub(object):
 				except Exception as e:
 					LOG_DEBUG('EventStub Delegate Error', e)
 
+	def __setattr__(self, name, value):
+		# ``arena.onFoo += handler`` is a read-modify-write operation.  Python
+		# therefore writes the EventStub returned by __getattr__ back onto the
+		# arena after __iadd__.  If that becomes a normal instance attribute it
+		# escapes _event_stubs, so the persistent offline arena retains one new
+		# set of battle UI handlers (and all 30 vehicles they close over) every
+		# round.  Keep dynamic events in the registry on both the read and write
+		# sides so one cleanup path owns every delegate.
+		if name.startswith('on') and isinstance(value, self._EventStub):
+			events = self.__dict__.get('_event_stubs')
+			if events is not None:
+				events[name] = value
+				return
+		object.__setattr__(self, name, value)
+
 	def __init__(self):
 		self.vehicles = {}
 		self.statistics = {}

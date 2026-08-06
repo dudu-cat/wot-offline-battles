@@ -1328,6 +1328,52 @@ def _offh_battle_entity_ids(*sources):
 	return list(entity_ids.keys())
 
 
+def _offh_clear_arena_events(arena):
+	"""Drop every synthetic-arena event delegate, including legacy attributes.
+
+	Older _OfflineArenaStub versions let ``arena.onFoo += handler`` materialise
+	``onFoo`` in arena.__dict__.  Those events are outside _event_stubs and keep
+	a whole battle window, its closures and all mock vehicles alive.  New stubs
+	prevent that write, but the direct-attribute scan makes teardown complete and
+	keeps this safe across an in-place mod update.
+	"""
+	if arena is None:
+		return 0
+	events = []
+	registry = getattr(arena, '_event_stubs', None)
+	if isinstance(registry, dict):
+		events.extend(list(registry.values()))
+	try:
+		direct = list(arena.__dict__.items())
+	except Exception:
+		direct = []
+	for name, event in direct:
+		if name.startswith('on'):
+			events.append(event)
+			try:
+				delattr(arena, name)
+			except Exception:
+				pass
+	seen_delegate_lists = {}
+	removed = 0
+	for event in events:
+		try:
+			delegates = getattr(event, 'delegates', None)
+		except Exception:
+			delegates = None
+		if not isinstance(delegates, list):
+			continue
+		key = id(delegates)
+		if key in seen_delegate_lists:
+			continue
+		seen_delegate_lists[key] = True
+		removed += len(delegates)
+		del delegates[:]
+	if isinstance(registry, dict):
+		registry.clear()
+	return removed
+
+
 def _offh_battle_callback(delay, callback):
 	"""Schedule a battle-owned callback that the sweep can cancel safely."""
 	import BigWorld
@@ -1446,6 +1492,30 @@ def _offh_proc_mem_mb():
 			return (_v.get('WorkingSetSize', 0) // (1024 * 1024),
 			        _v.get('VirtualSize', 0) // (1024 * 1024),
 			        _v.get('PageFileUsage', 0) // 1024)
+	except Exception:
+		pass
+	# WMIC is no longer installed by default on current Windows releases.  Use
+	# the built-in PowerShell process object as the equivalent read-only probe.
+	try:
+		import os
+		_pid = os.getpid()
+		_ps = ('powershell -NoProfile -NonInteractive -Command '
+		       '"$p=Get-Process -Id %d; '
+		       "'WorkingSetSize='+$p.WorkingSet64; "
+		       "'VirtualSize='+$p.VirtualMemorySize64; "
+		       "'PrivateBytes='+$p.PrivateMemorySize64" + '"') % _pid
+		_out = os.popen(_ps).read()
+		_v = {}
+		for _ln in _out.splitlines():
+			if '=' in _ln:
+				_k, _, _val = _ln.partition('=')
+				_val = _val.strip()
+				if _val.isdigit():
+					_v[_k.strip()] = int(_val)
+		if _v:
+			return (_v.get('WorkingSetSize', 0) // (1024 * 1024),
+			        _v.get('VirtualSize', 0) // (1024 * 1024),
+			        _v.get('PrivateBytes', 0) // (1024 * 1024))
 	except Exception:
 		pass
 	return (-1, -1, -1)
@@ -3420,15 +3490,7 @@ def _offh_battle_sweep(tag='exit'):
 			_arena_player = BigWorld.player()
 			_arena = getattr(_arena_player, '_offhangar_arena', None)
 			if _arena is not None:
-				_event_stubs = getattr(_arena, '_event_stubs', {}) or {}
-				for _event in list(_event_stubs.values()):
-					_delegates = getattr(_event, 'delegates', None)
-					if isinstance(_delegates, list):
-						_n_arena_delegates += len(_delegates)
-						del _delegates[:]
-				_event_stubs.clear()
-				try: delattr(_arena, 'onVehicleKilled')
-				except Exception: pass
+				_n_arena_delegates += _offh_clear_arena_events(_arena)
 				try: delattr(_arena, 'collideWithSpaceBB')
 				except Exception: pass
 				try: _arena._offh_kill_wrapped = False
@@ -16054,7 +16116,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 	except Exception:
 		LOG_CURRENT_EXCEPTION()
 	player._offline_allow_become_non_player = False
-	LOG_DEBUG('OfflineBattle.spawnAvatar.fail', cmdName)
+	LOG_DEBUG('OfflineBattle.spawnAvatar.done', cmdName)
 	return
 
 def _network_mode_enabled():

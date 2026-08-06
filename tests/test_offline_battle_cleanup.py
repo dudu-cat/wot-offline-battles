@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BATTLE = ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
+LOADER = ROOT / "scripts/client/gui/mods/mod_offhangar.py"
 NETWORK = ROOT / "scripts/client/gui/mods/offhangar/network_battle.py"
 DEFAULTS = ROOT / "scripts/client/gui/mods/offhangar/config_defaults.json"
 
@@ -52,6 +53,15 @@ class Sticker:
 class Player:
     def getOwnVehicleMatrix(self):
         return "class-method"
+
+
+class ArenaEvent:
+    def __init__(self, *delegates):
+        self.delegates = list(delegates)
+
+
+class Arena:
+    pass
 
 
 class OfflineBattleCleanupTest(unittest.TestCase):
@@ -126,6 +136,39 @@ class OfflineBattleCleanupTest(unittest.TestCase):
         self.assertFalse("_outlined_bot" in player.__dict__)
         self.assertEqual("class-method", player.getOwnVehicleMatrix())
 
+    def test_arena_cleanup_clears_registered_and_materialized_events(self):
+        helpers = load_cleanup_helpers()
+        arena = Arena()
+        shared = ArenaEvent(object(), object())
+        direct = ArenaEvent(object())
+        arena._event_stubs = {"onPeriodChange": shared}
+        # Simulate the old augmented-assignment bug: the same registered event
+        # was also materialized as a direct arena attribute.
+        arena.onPeriodChange = shared
+        arena.onVehicleAdded = direct
+
+        self.assertEqual(3, helpers["_offh_clear_arena_events"](arena))
+        self.assertEqual({}, arena._event_stubs)
+        self.assertEqual([], shared.delegates)
+        self.assertEqual([], direct.delegates)
+        self.assertNotIn("onPeriodChange", arena.__dict__)
+        self.assertNotIn("onVehicleAdded", arena.__dict__)
+
+    def test_arena_augmented_assignment_stays_in_event_registry(self):
+        source = LOADER.read_text()
+        start = source.index("class _OfflineArenaStub(object):")
+        end = source.index("class _OfflineVehicleStub(object):", start)
+        namespace = {}
+        exec(source[start:end], namespace)
+        arena = namespace["_OfflineArenaStub"]()
+        handler = lambda *args: None
+
+        arena.onPeriodChange += handler
+
+        self.assertNotIn("onPeriodChange", arena.__dict__)
+        self.assertIs(arena.onPeriodChange, arena._event_stubs["onPeriodChange"])
+        self.assertEqual([handler], arena.onPeriodChange.delegates)
+
     def test_every_bsp_load_uses_the_tracked_lifecycle(self):
         source = BATTLE.read_text()
         self.assertEqual(1, source.count(".loadBspModel()"))
@@ -143,7 +186,7 @@ class OfflineBattleCleanupTest(unittest.TestCase):
         self.assertIn("BigWorld.cancelCallback(_callback_id)", source)
         self.assertIn("_offh_restore_player_battle_attrs(BigWorld.player())", source)
         self.assertIn("BigWorld.wgDelEdgeDetectEntity(_outlined_bot.bw_entity)", source)
-        self.assertIn("_event_stubs.clear()", source)
+        self.assertIn("_offh_clear_arena_events(_arena)", source)
         self.assertIn("_offh_battle_entity_ids(_cached_entities, _world_entities)", source)
         self.assertIn("globals().get('g_offh_battle_gen', 0) != _offh_my_gen[0]", source)
         self.assertIn("residual models=%d mocks=%d hitBSP=%d callbacks=%d", source)
@@ -186,6 +229,15 @@ class OfflineBattleCleanupTest(unittest.TestCase):
         self.assertIn("OfflineBattle.released prev space", release)
         self.assertEqual(1, release.count("OfflineBattle.released prev space"))
         self.assertIn("OfflineBattle.release prev FAILED", release)
+
+    def test_memory_probe_supports_windows_without_wmic(self):
+        source = BATTLE.read_text()
+        probe = source[source.index("def _offh_proc_mem_mb("):
+                       source.index("def _offh_gc_census_line(")]
+        self.assertIn("powershell -NoProfile -NonInteractive", probe)
+        self.assertIn("WorkingSet64", probe)
+        self.assertIn("VirtualMemorySize64", probe)
+        self.assertIn("PrivateMemorySize64", probe)
 
     def test_network_battle_closures_are_released(self):
         source = NETWORK.read_text()
