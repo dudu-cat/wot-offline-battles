@@ -108,7 +108,8 @@ class AvatarServerBridge(object):
     """Bridge native Avatar/Vehicle mailbox calls to entities and LAN input."""
 
     def __init__(self, avatar, entity_binding, property_builder, lan_sender,
-                 account_commands=None, on_ready=None, on_leave=None):
+                 account_commands=None, on_ready=None, on_leave=None,
+                 initial_period='battle', initial_period_seconds=0.0):
         self._avatar = avatar
         self._binding = entity_binding
         self._builder = property_builder
@@ -116,6 +117,9 @@ class AvatarServerBridge(object):
         self._account_commands = tuple(account_commands or ())
         self._on_ready = on_ready
         self._on_leave = on_leave
+        self._initial_period = initial_period
+        self._initial_period_seconds = max(
+            0.0, float(initial_period_seconds))
         self._vehicle_id = None
         self._bound_vehicle_id = None
         self._arena_vehicle_added = False
@@ -342,7 +346,8 @@ class AvatarServerBridge(object):
             # so the mailbox must accept input before entering that callback.
             # All entity/materialization gates above have passed already.
             self._client_ready = True
-            self._binding.arena_period('battle')
+            self._binding.arena_period(
+                self._initial_period, self._initial_period_seconds)
         except Exception as error:
             self._client_ready = False
             self._ready_publish_error = str(error)

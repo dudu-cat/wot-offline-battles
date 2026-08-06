@@ -85,6 +85,7 @@ def _load_runtime():
     from OfflineMapCreator import g_offlineMapCreator
     from PlayerEvents import g_playerEvents
     from connection_mgr import LOGIN_STATUS
+    from gui.Scaleform.daapi.view.battle.shared.debug_panel import DebugPanel
     from gui.prb_control.dispatcher import g_prbLoader
     from helpers import dependency
     from predefined_hosts import g_preDefinedHosts
@@ -102,6 +103,7 @@ def _load_runtime():
     runtime.compound_appearance_module = CompoundAppearanceModule
     runtime.constants = constants
     runtime.connection_manager = dependency.instance(IConnectionManager)
+    runtime.debug_panel_type = DebugPanel
     runtime.login_status = LOGIN_STATUS
     runtime.math = Math
     runtime.offline_map_creator = g_offlineMapCreator
@@ -241,6 +243,7 @@ class OfflineCompatibility(object):
         self._battle_bonus_type = None
         self._battle_player_name = 'OfflinePlayer'
         self._battle_player_team = 1
+        self._battle_network_client = None
         self._original_account_init = None
         self._original_account_getattribute = None
         self._original_account_become_player = None
@@ -265,6 +268,7 @@ class OfflineCompatibility(object):
         self._compound_models_refresh_code = None
         self._original_connect = None
         self._original_disconnect = None
+        self._original_debug_update = None
         self._account_init_wrapper = None
         self._account_getattribute_wrapper = None
         self._account_become_player_wrapper = None
@@ -289,6 +293,7 @@ class OfflineCompatibility(object):
         self._compound_refreshing_models = None
         self._connect_wrapper = None
         self._disconnect_wrapper = None
+        self._debug_update_wrapper = None
 
     def install(self):
         if self._installed:
@@ -305,6 +310,7 @@ class OfflineCompatibility(object):
         compound_type = getattr(
             getattr(runtime, 'compound_appearance_module', None),
             'CompoundAppearance', None)
+        debug_panel_type = getattr(runtime, 'debug_panel_type', None)
         self._original_account_init = account_type.__dict__.get(
             '__init__', account_type.__init__)
         self._original_account_getattribute = account_type.__dict__.get(
@@ -383,6 +389,10 @@ class OfflineCompatibility(object):
                         '__code__', None))
         self._original_connect = runtime.bigworld.connect
         self._original_disconnect = runtime.bigworld.disconnect
+        if debug_panel_type is not None:
+            self._original_debug_update = debug_panel_type.__dict__.get(
+                'updateDebugInfo',
+                getattr(debug_panel_type, 'updateDebugInfo', None))
         compatibility = self
 
         def account_init(account):
@@ -882,6 +892,32 @@ class OfflineCompatibility(object):
                 raise first_error
             return None
 
+        def debug_update(panel, ping, fps, isLaggingNow, fpsReplay=-1):
+            """Render LAN transport health during a client-only battle.
+
+            Exact #1513's DebugController reads BigWorld.statPing() and
+            statLagDetected(), which describe the absent retail game-server
+            transport.  Keep the stock panel and replace only those two
+            values while the explicit LAN battle client is attached.
+            """
+            client = compatibility._battle_network_client
+            if compatibility._battle_active and client is not None:
+                connected = bool(getattr(client, 'connected', False))
+                sample = getattr(client, 'rtt_ms', None)
+                if sample is None:
+                    ping = 0 if connected else 999
+                else:
+                    try:
+                        sample = float(sample)
+                        if sample != sample:
+                            raise ValueError('NaN LAN RTT')
+                        ping = int(round(max(0.0, min(sample, 999.0))))
+                    except (TypeError, ValueError, OverflowError):
+                        ping = 0 if connected else 999
+                isLaggingNow = not connected
+            return compatibility._original_debug_update(
+                panel, ping, fps, isLaggingNow, fpsReplay)
+
         self._account_init_wrapper = account_init
         self._account_getattribute_wrapper = account_getattribute
         self._account_become_player_wrapper = account_become_player
@@ -902,6 +938,7 @@ class OfflineCompatibility(object):
         self._compound_models_refresh_wrapper = compound_models_refresh
         self._connect_wrapper = connect
         self._disconnect_wrapper = disconnect
+        self._debug_update_wrapper = debug_update
         try:
             self._install_host()
             account_type.__init__ = account_init
@@ -940,6 +977,8 @@ class OfflineCompatibility(object):
                         compound_models_refresh)
             runtime.bigworld.connect = connect
             runtime.bigworld.disconnect = disconnect
+            if self._original_debug_update is not None:
+                debug_panel_type.updateDebugInfo = debug_update
             self._installed = True
         except Exception:
             self._rollback_install()
@@ -968,6 +1007,7 @@ class OfflineCompatibility(object):
         compound_type = getattr(
             getattr(runtime, 'compound_appearance_module', None),
             'CompoundAppearance', None)
+        debug_panel_type = getattr(runtime, 'debug_panel_type', None)
         if (account_type.__dict__.get('__init__') is
                 self._account_init_wrapper):
             account_type.__init__ = self._original_account_init
@@ -1054,6 +1094,11 @@ class OfflineCompatibility(object):
             runtime.bigworld.connect = self._original_connect
         if runtime.bigworld.disconnect is self._disconnect_wrapper:
             runtime.bigworld.disconnect = self._original_disconnect
+        if (debug_panel_type is not None and
+                self._original_debug_update is not None and
+                debug_panel_type.__dict__.get('updateDebugInfo') is
+                self._debug_update_wrapper):
+            debug_panel_type.updateDebugInfo = self._original_debug_update
         if self._host_added and self._host is not None:
             try:
                 runtime.predefined_hosts._hosts.remove(self._host)
@@ -1069,6 +1114,7 @@ class OfflineCompatibility(object):
         self._avatar_aux_physics_code = None
         self._compound_refreshing_models = None
         self._compound_models_refresh_code = None
+        self._battle_network_client = None
         self._installed = False
 
     def connect(self, show_lobby=False, account_context=None):
@@ -1276,6 +1322,11 @@ class OfflineCompatibility(object):
             self._battle_player_team = player_team
         self.activate_map()
 
+    def set_battle_network_client(self, client):
+        """Attach the LAN transport whose RTT should drive the battle HUD."""
+        self.install()
+        self._battle_network_client = client
+
     def attach_avatar_server(self, avatar, server):
         proxy = getattr(avatar, 'fakeServer', None)
         attach = getattr(proxy, 'attach', None)
@@ -1354,6 +1405,7 @@ class OfflineCompatibility(object):
             self._battle_bonus_type = None
             self._battle_player_name = 'OfflinePlayer'
             self._battle_player_team = 1
+            self._battle_network_client = None
 
     def disconnect(self):
         if self._runtime is None:

@@ -9,7 +9,7 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.13` replaces the old compatibility slice. It is a server-backed
+Version `0.3.14` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, tactical bots and repeatable rounds. The removed `vertical_slice.py`
@@ -156,7 +156,9 @@ The supported fields are:
   "name": "Player",
   "vehicle": "ussr:R11_MS-1",
   "max_health": 90,
-  "startupTimeoutSeconds": 30.0
+  "startupTimeoutSeconds": 30.0,
+  "prebattleCountdownSeconds": 15.0,
+  "battleDurationSeconds": 900.0
 }
 ```
 
@@ -171,6 +173,20 @@ legacy `max_health` field remains accepted for configuration compatibility, but
 battle health is read from that selected vehicle's descriptor. The release does
 not write a capability trace or vertical-slice status file; normal failures are
 reported in `python.log` without verbose per-frame logging.
+
+The real Avatar enters `PREBATTLE` for the configured countdown before the
+runtime accepts movement or shooting, then receives a timed `BATTLE` period.
+Authority bot poses are materialized locally without waiting for their server
+echo. Bot Vehicle creation is staggered across the countdown, matching the
+0.8.2 loading pattern and avoiding a burst of 29 HD model prerequisites in one
+32-bit BigWorld callback.
+
+Authoritative shot events use the selected gun's finite burst count. This
+closes the stock Avatar shot-acknowledgement wait and prevents one click from
+leaving the native firing effect active indefinitely. During an offline LAN
+battle the stock debug panel displays the independent LAN socket's measured
+round-trip time and connection state instead of the absent retail transport's
+`999`/red result.
 
 ## Build
 
@@ -216,8 +232,8 @@ properties and mailboxes at runtime.
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.13.wotmod
-org.peng.offline_lan_0922_0.3.13.wotmod.sha256
+org.peng.offline_lan_0922_0.3.14.wotmod
+org.peng.offline_lan_0922_0.3.14.wotmod.sha256
 WoT-0.9.22-LAN-Client-<release hash>/
 WoT-0.9.22-LAN-Client-<release hash>.zip
 ```

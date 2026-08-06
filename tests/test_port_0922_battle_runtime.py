@@ -1,9 +1,11 @@
 import math
 from pathlib import Path
+import pickle
 import sys
 import types
 import unittest
 from unittest import mock
+import zlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,7 +52,7 @@ class _Descriptor(object):
         self.gun = types.SimpleNamespace(
             pitchLimits={'absolute': (-0.2, 0.4)}, shots=[{'shell': shell}],
             maxAmmo=40, clip=(1,), reloadTime=1.5, rotationSpeed=1.0,
-            aimingTime=1.0)
+            aimingTime=1.0, burst=(1, 0.1))
         self.turret = types.SimpleNamespace(
             circularVisionRadius=330.0, rotationSpeed=1.0)
         self.radio = types.SimpleNamespace(distance=400.0)
@@ -90,8 +92,8 @@ class _Vehicle(object):
     def getAimParams(self):
         return (0.0, 0.0)
 
-    def showShooting(self, burst):
-        self.last_shot = burst
+    def showShooting(self, burst, is_predicted=False):
+        self.last_shot = (burst, is_predicted)
 
     def set_gunAnglesPacked(self, previous):
         self.previous_gun_angles = previous
@@ -190,6 +192,10 @@ class _Compatibility(object):
         self.app_loader = None
         self.retired_players = set()
         self.disconnect_calls = 0
+        self.network_client = None
+
+    def set_battle_network_client(self, client):
+        self.network_client = client
 
     def configure_battle(self, gui_type, bonus_type, player_name=None,
                          player_team=None):
@@ -380,6 +386,9 @@ class _BigWorld(object):
     def time(self):
         return self.now
 
+    def serverTime(self):
+        return self.now
+
     def callback(self, delay, function):
         if self.pending_entities and not self.defer_vehicle_entry:
             original = function
@@ -501,7 +510,7 @@ def _runtime():
         ARENA_UPDATE=types.SimpleNamespace(
             VEHICLE_ADDED=1, VEHICLE_KILLED=5,
             AVATAR_READY=3, PERIOD=4),
-        ARENA_PERIOD=types.SimpleNamespace(BATTLE=5),
+        ARENA_PERIOD=types.SimpleNamespace(PREBATTLE=2, BATTLE=5),
         VEHICLE_PHYSICS_MODE=types.SimpleNamespace(STANDARD=0),
         VEHICLE_SIEGE_STATE=types.SimpleNamespace(DISABLED=0),
         VEHICLE_SETTING=types.SimpleNamespace(CURRENT_SHELLS=1),
@@ -814,6 +823,104 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(500, runtime.bigworld.entity(
             battle._server.vehicle_id).health)
 
+    def test_empty_loading_snapshot_cannot_tombstone_authority_bots(self):
+        runtime = _runtime()
+        runtime.bigworld.defer_vehicle_entry = True
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        player = {
+            'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+            'vehicle': 'ussr:R11_MS-1', 'health': 500}
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [player],
+            # The server start barrier reserves identities but intentionally
+            # has no canonical pose until the authority publishes a manifest.
+            'bots': [{
+                'id': 11, 'team': 2, 'slot': 0, 'name': 'Enemy 1'}, {
+                'id': 12, 'team': 2, 'slot': 1, 'name': 'Enemy 2'}]}
+
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, start, client))
+        battle.on_snapshot({
+            'round_id': 1, 'server_tick': 1,
+            'players': [player], 'bots': []})
+        runtime.bigworld.callbacks.pop(0)()
+        runtime.bigworld.enter_pending_vehicle(battle._server.vehicle_id)
+        runtime.bigworld.callbacks.pop(0)()
+
+        self.assertIn('bot:11', battle._pending_bot_creates)
+        self.assertIn('bot:12', battle._pending_bot_creates)
+        manifests = [value[1] for value in client.sent
+                     if value[0] == 'manifest']
+        self.assertEqual(1, len(manifests))
+
+        # A second empty snapshot can race with the outbound authority
+        # manifest. It must not register/tombstone the local lineup either.
+        battle.on_snapshot({
+            'round_id': 1, 'server_tick': 2,
+            'players': [player], 'bots': []})
+        self.assertNotIn('bot:11', battle._sync._entities)
+        battle.on_snapshot({
+            'round_id': 1, 'server_tick': 3,
+            'players': [player], 'bots': manifests[0]})
+        self.assertFalse(battle._sync._entities['bot:11']['dead'])
+        self.assertFalse(battle._sync._entities['bot:12']['dead'])
+
+        battle._frame()
+        self.assertIn('bot:11', battle._records)
+        self.assertNotIn('bot:12', battle._records)
+        runtime.bigworld.now += 0.19
+        battle._frame()
+        self.assertNotIn('bot:12', battle._records)
+        runtime.bigworld.now += 0.02
+        battle._frame()
+        self.assertIn('bot:12', battle._records)
+
+    def test_prebattle_freezes_input_and_publishes_battle_after_countdown(self):
+        runtime = _runtime()
+        runtime.bigworld.defer_vehicle_entry = True
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
+
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player', 'prebattleCountdownSeconds': 15.0,
+            'battleDurationSeconds': 900.0}, start, client))
+        self.assertIs(client, runtime.compatibility.network_client)
+        runtime.bigworld.callbacks.pop(0)()
+        runtime.bigworld.enter_pending_vehicle(battle._server.vehicle_id)
+        runtime.bigworld.callbacks.pop(0)()
+
+        periods = [pickle.loads(zlib.decompress(payload))
+                   for kind, payload in runtime.bigworld.avatar.arena_updates
+                   if kind == runtime.constants.ARENA_UPDATE.PERIOD]
+        self.assertEqual([(2, 25.0, 15.0, [])], periods)
+        self.assertFalse(battle._battle_live)
+        battle._sender.forward = 1.0
+        self.assertFalse(battle.shoot(0.0, 0.0))
+        local = runtime.bigworld.entity(battle._server.vehicle_id)
+
+        runtime.bigworld.now = 24.9
+        battle._frame()
+        self.assertEqual([], local.teleports)
+        self.assertFalse(battle._battle_live)
+
+        runtime.bigworld.now = 25.0
+        battle._frame()
+        self.assertTrue(battle._battle_live)
+        periods = [pickle.loads(zlib.decompress(payload))
+                   for kind, payload in runtime.bigworld.avatar.arena_updates
+                   if kind == runtime.constants.ARENA_UPDATE.PERIOD]
+        self.assertEqual((5, 925.0, 900.0, []), periods[-1])
+
     def test_reentrant_vehicle_enter_fails_before_roster_publication(self):
         runtime = _runtime()
         runtime.bigworld.reenter_vehicle_during_create = True
@@ -1115,8 +1222,36 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._show_shot({'attacker': 1})
         battle._show_shot({'attacker': 2})
 
-        self.assertEqual(0, local.last_shot)
-        self.assertEqual(0, remote.last_shot)
+        self.assertEqual((1, False), local.last_shot)
+        self.assertEqual((1, False), remote.last_shot)
+
+    def test_server_shot_uses_finite_descriptor_burst(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        entity.typeDescriptor.gun.burst = (3, 0.05)
+        runtime.bigworld.entities[10] = entity
+        battle._records = {
+            'player:1': {'engine_id': 10, 'local': True}}
+
+        battle._show_shot({'attacker': 1})
+
+        self.assertEqual((3, False), entity.last_shot)
+
+    def test_invalid_server_shot_burst_falls_back_to_one(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        entity.typeDescriptor.gun.burst = (0,)
+        runtime.bigworld.entities[10] = entity
+        battle._records = {
+            'player:1': {'engine_id': 10, 'local': True}}
+
+        battle._show_shot({'attacker': 1})
+
+        self.assertEqual((1, False), entity.last_shot)
 
     def test_remote_pose_updates_exact_packed_gun_angles(self):
         runtime = _runtime()

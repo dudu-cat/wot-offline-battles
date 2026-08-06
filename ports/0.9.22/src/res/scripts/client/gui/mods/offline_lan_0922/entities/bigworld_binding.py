@@ -73,6 +73,7 @@ class BigWorldVehicleBinding(object):
         self._need(self._bigworld, 'createEntity')
         self._need(self._bigworld, 'destroyEntity')
         self._need(self._bigworld, 'entity')
+        self._need(self._bigworld, 'serverTime')
         self._need(self._avatar, 'spaceID')
         self._need(self._avatar, 'updateArena')
         self._need(self._avatar, 'syncVehicleAttrs')
@@ -84,6 +85,7 @@ class BigWorldVehicleBinding(object):
         for name in ('VEHICLE_ADDED', 'VEHICLE_KILLED', 'AVATAR_READY',
                      'PERIOD'):
             self._need(self._constants.ARENA_UPDATE, name)
+        self._need(self._constants.ARENA_PERIOD, 'PREBATTLE')
         self._need(self._constants.ARENA_PERIOD, 'BATTLE')
         self._need(self._constants.VEHICLE_PHYSICS_MODE, 'STANDARD')
         self._need(self._constants.VEHICLE_SIEGE_STATE, 'DISABLED')
@@ -179,10 +181,24 @@ class BigWorldVehicleBinding(object):
         self._avatar.updateArena(self._constants.ARENA_UPDATE.AVATAR_READY,
                                  _pickle.dumps(self._avatar.playerVehicleID))
 
-    def arena_period(self, period):
-        if period != 'battle':
-            raise CapabilityError('only explicit battle period is supported')
-        payload = (self._constants.ARENA_PERIOD.BATTLE, 0, 0, [])
+    def arena_period(self, period, duration=0.0):
+        """Publish one native #1513 arena-period tuple.
+
+        The stock HUD derives both its prebattle countdown and battle clock
+        from ``periodEndTime``.  Publishing BATTLE immediately made the local
+        Avatar playable as soon as it entered the world and skipped the same
+        PREBATTLE barrier that the 0.8.2 runtime preserves.
+        """
+        if period == 'prebattle':
+            value = self._constants.ARENA_PERIOD.PREBATTLE
+        elif period == 'battle':
+            value = self._constants.ARENA_PERIOD.BATTLE
+        else:
+            raise CapabilityError('unsupported arena period: %s' % period)
+        duration = max(0.0, float(duration))
+        end_time = (float(self._bigworld.serverTime()) + duration
+                    if duration > 0.0 else 0.0)
+        payload = (value, end_time, duration, [])
         self._avatar.updateArena(self._constants.ARENA_UPDATE.PERIOD,
                                  zlib.compress(_pickle.dumps(payload)))
 

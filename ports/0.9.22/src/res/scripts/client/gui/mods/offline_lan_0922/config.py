@@ -23,6 +23,8 @@ DEFAULT_CONFIG = {
     'vehicle': 'ussr:R11_MS-1',
     'max_health': 90,
     'startupTimeoutSeconds': 30.0,
+    'prebattleCountdownSeconds': 15.0,
+    'battleDurationSeconds': 900.0,
 }
 
 
@@ -92,6 +94,10 @@ def load(path=CONFIG_PATH):
             config[key] = value[key]
     config['startupTimeoutSeconds'] = max(
         1.0, float(config['startupTimeoutSeconds']))
+    config['prebattleCountdownSeconds'] = max(
+        0.0, float(config['prebattleCountdownSeconds']))
+    config['battleDurationSeconds'] = max(
+        1.0, float(config['battleDurationSeconds']))
     config['port'] = max(1, min(65535, int(config['port'])))
     config['max_health'] = max(1, int(config['max_health']))
     if not isinstance(config.get('enabled'), bool):

@@ -59,6 +59,7 @@ class _ArenaUpdate(object):
 
 
 class _ArenaPeriod(object):
+    PREBATTLE = 2
     BATTLE = 5
 
 
@@ -118,6 +119,9 @@ class _BigWorld(object):
 
     def entity(self, entity_id):
         return self.entity_value if entity_id == 91 else None
+
+    def serverTime(self):
+        return 100.0
 
 
 class _Avatar(object):
@@ -242,6 +246,21 @@ class BigWorldBindingTests(unittest.TestCase):
                          pickle.loads(avatar.updates[3][1]))
         self.assertEqual([91], bigworld.destroyed)
 
+    def test_prebattle_period_carries_native_countdown_deadline(self):
+        module = _binding_module()
+        bigworld = _BigWorld()
+        avatar = _Avatar()
+        binding = module.BigWorldVehicleBinding(
+            bigworld, avatar, _Constants, _VehicleDescr,
+            lambda yaw, pitch, limits: 321,
+            outfit_provider=lambda descriptor: '')
+
+        binding.arena_period('prebattle', 15.0)
+
+        self.assertEqual(
+            (2, 115.0, 15.0, []),
+            pickle.loads(zlib.decompress(avatar.updates[0][1])))
+
     def test_exact_property_schema_rejects_jointly_wrong_producer_values(self):
         module = _binding_module()
         binding = module.BigWorldVehicleBinding(
@@ -340,8 +359,8 @@ class _BridgeBinding(object):
     def avatar_ready(self):
         self.events.append(('avatar_ready',))
 
-    def arena_period(self, period):
-        self.events.append(('period', period))
+    def arena_period(self, period, duration=0.0):
+        self.events.append(('period', period, duration))
 
     def arena_vehicle_removed(self, vehicle_id):
         self.events.append(('removed', vehicle_id))
@@ -523,8 +542,8 @@ class AvatarServerBridgeTests(unittest.TestCase):
             sender)
         original_arena_period = binding.arena_period
 
-        def arena_period(period):
-            original_arena_period(period)
+        def arena_period(period, duration=0.0):
+            original_arena_period(period, duration)
             bridge.vehicle_moveWith(0)
 
         binding.arena_period = arena_period

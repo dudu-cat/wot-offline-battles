@@ -58,6 +58,13 @@ ORDERED_USES = (
     ),
     (
         'scripts/client/Avatar.pyc',
+        'PlayerAvatar.__onArenaPeriodChange',
+        ('ARENA_PERIOD', 'PREBATTLE', 'LightManager', 'GameLights',
+         'startTicks'),
+        'prebattle period starts the stock countdown presentation',
+    ),
+    (
+        'scripts/client/Avatar.pyc',
         'PlayerAvatar.__setIsOnArena',
         ('_PlayerAvatar__isOnArena', 'moveVehicle',
          'makeVehicleMovementCommandByKeys', 'False'),
@@ -68,6 +75,25 @@ ORDERED_USES = (
         'PlayerAvatar.moveVehicle',
         ('base', 'vehicle_moveWith'),
         'initial movement reaches the Avatar server mailbox synchronously',
+    ),
+    (
+        'scripts/client/Avatar.pyc',
+        'PlayerAvatar.shoot',
+        ('base', 'vehicle_shoot', '_PlayerAvatar__startWaitingForShot'),
+        'shoot mailbox starts the native acknowledgement wait synchronously',
+    ),
+    (
+        'scripts/client/Avatar.pyc',
+        'PlayerAvatar.__showTimedOutShooting',
+        ('typeDescriptor', 'gun', 'burst', 'showShooting', 'True'),
+        'shot timeout predicts a finite descriptor burst',
+    ),
+    (
+        'scripts/client/Vehicle.pyc',
+        'Vehicle.showShooting',
+        ('typeDescriptor', 'extrasDict', 'stopFor', 'startFor',
+         'cancelWaitingForShot'),
+        'authoritative shooting restarts one finite extra and closes the wait',
     ),
     (
         'scripts/client/gui/ClientHangarSpace.pyc',
@@ -275,6 +301,19 @@ ORDERED_USES = (
         ('_repository', 'getController', 'BATTLE_CTRL_ID',
          'ARENA_LOAD_PROGRESS'),
         'shared arena-load access resolves the native progress controller',
+    ),
+    (
+        'scripts/client/gui/battle_control/controllers/debug_ctrl.pyc',
+        'DebugController._update',
+        ('statLagDetected', 'statPing', 'updateDebugInfo'),
+        'stock battle diagnostics source lag and ping from retail BigWorld',
+    ),
+    (
+        'scripts/client/gui/Scaleform/daapi/view/battle/shared/'
+        'debug_panel.pyc',
+        'DebugPanel.updateDebugInfo',
+        ('as_updatePingFPSLagInfoS', 'as_updatePingFPSInfoS'),
+        'debug panel paints the supplied lag and ping values directly',
     ),
     (
         'scripts/client/gui/shared/personality.pyc',

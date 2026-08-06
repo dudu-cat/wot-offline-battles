@@ -11,7 +11,7 @@ import zipfile
 
 
 MOD_ID = 'org.peng.offline_lan_0922'
-MOD_VERSION = '0.3.13'
+MOD_VERSION = '0.3.14'
 PYTHON_MAGIC = '\x03\xf3\r\n'
 
 
@@ -84,6 +84,8 @@ def _release_config():
         'vehicle': 'ussr:R11_MS-1',
         'max_health': 90,
         'startupTimeoutSeconds': 30.0,
+        'prebattleCountdownSeconds': 15.0,
+        'battleDurationSeconds': 900.0,
     }
 
 

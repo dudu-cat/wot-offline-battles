@@ -153,6 +153,9 @@ EXPECTED_ABI = {
         'PlayerAvatar.__setIsOnArena': ('self', 'onArena'),
         'PlayerAvatar.__onInitStepCompleted': ('self',),
         'PlayerAvatar.moveVehicle': ('self', 'flags', 'isKeyDown'),
+        'PlayerAvatar.shoot': ('self', 'isRepeat'),
+        'PlayerAvatar.cancelWaitingForShot': ('self',),
+        'PlayerAvatar.__showTimedOutShooting': ('self',),
         'PlayerAvatar.vehicle_onEnterWorld': ('self', 'vehicle'),
         'PlayerAvatar.updateVehicleHealth': (
             'self', 'vehicleID', 'health', 'deathReasonID', 'isCrewActive',
@@ -230,6 +233,14 @@ EXPECTED_ABI = {
     },
     'scripts/client/gui/battle_control/controllers/repositories.pyc': {
         'SharedControllersLocator.arenaLoad': ('self',),
+    },
+    'scripts/client/gui/battle_control/controllers/debug_ctrl.pyc': {
+        'DebugController._update': ('self',),
+    },
+    'scripts/client/gui/Scaleform/daapi/view/battle/shared/'
+    'debug_panel.pyc': {
+        'DebugPanel.updateDebugInfo': (
+            'self', 'ping', 'fps', 'isLaggingNow', 'fpsReplay'),
     },
     'scripts/client/gui/Scaleform/daapi/view/lobby/LobbyView.pyc': {
         'LobbyView._populate': ('self',),
@@ -414,6 +425,13 @@ EXPECTED_CODE_NAMES = {
         'PlayerAvatar.__setIsOnArena': (
             'moveVehicle', 'makeVehicleMovementCommandByKeys'),
         'PlayerAvatar.moveVehicle': ('base', 'vehicle_moveWith'),
+        'PlayerAvatar.shoot': (
+            'base', 'vehicle_shoot', '_PlayerAvatar__startWaitingForShot'),
+        'PlayerAvatar.__showTimedOutShooting': (
+            'typeDescriptor', 'gun', 'burst', 'showShooting'),
+        'PlayerAvatar.cancelWaitingForShot': (
+            'BigWorld', 'cancelCallback', 'setAimingMode',
+            'targetLastShotPoint'),
     },
     'scripts/client/Vehicle.pyc': {
         'Vehicle.__startWGPhysics': ('filter', 'syncGunAngles', 'speedInfo'),
@@ -421,6 +439,9 @@ EXPECTED_CODE_NAMES = {
             'typeDescriptor', 'appearance_cache', 'createAppearance'),
         'Vehicle.onEnterWorld': (
             'vehicle_onEnterWorld', 'sendStateToOwnClient'),
+        'Vehicle.showShooting': (
+            'typeDescriptor', 'extrasDict', 'stopFor', 'startFor',
+            'isPlayerVehicle', 'cancelWaitingForShot'),
     },
     'scripts/client/vehicle_systems/CompoundAppearance.pyc': {
         'CompoundAppearance.__onModelsRefresh': (
@@ -509,6 +530,16 @@ EXPECTED_CODE_NAMES = {
             '_repository', 'getController', 'BATTLE_CTRL_ID',
             'ARENA_LOAD_PROGRESS'),
     },
+    'scripts/client/gui/battle_control/controllers/debug_ctrl.pyc': {
+        'DebugController._update': (
+            'BigWorld', 'statPing', 'statLagDetected',
+            'updateDebugInfo'),
+    },
+    'scripts/client/gui/Scaleform/daapi/view/battle/shared/'
+    'debug_panel.pyc': {
+        'DebugPanel.updateDebugInfo': (
+            'as_updatePingFPSLagInfoS', 'as_updatePingFPSInfoS'),
+    },
     'scripts/client/gui/game_control/state_tracker.pyc': {
         'GameStateTracker.init': (
             'g_eventBus', 'addListener', 'LOBBY_VIEW_LOADED'),
@@ -565,6 +596,12 @@ EXPECTED_GLOBALS = {
 
 
 EXPECTED_CLASS_CONSTANTS = {
+    'scripts/common/constants.pyc': {
+        'ARENA_PERIOD': {
+            'PREBATTLE': 2,
+            'BATTLE': 3,
+        },
+    },
     'scripts/client/gui/app_loader/settings.pyc': {
         'GUI_GLOBAL_SPACE_ID': {
             'LOBBY': 4,

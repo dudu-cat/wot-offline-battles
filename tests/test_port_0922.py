@@ -138,7 +138,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.13</version></root>')
+            '<version>0.3.14</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -762,6 +762,56 @@ class _Hosts(object):
 
 
 class OfflineCompatibilityTests(unittest.TestCase):
+    def test_offline_battle_debug_panel_uses_lan_transport_health(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+
+        class DebugPanel(object):
+            def updateDebugInfo(self, ping, fps, isLaggingNow,
+                                fpsReplay=-1):
+                operations.append(
+                    ('debug_info', ping, fps, isLaggingNow, fpsReplay))
+
+        runtime.debug_panel_type = DebugPanel
+        original = DebugPanel.__dict__['updateDebugInfo']
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+        panel = DebugPanel()
+
+        # The global patch must preserve stock diagnostics outside the
+        # explicit LAN-battle lifetime, even when a client is attached.
+        compatibility.set_battle_network_client(types.SimpleNamespace(
+            connected=True, rtt_ms=42.6))
+        panel.updateDebugInfo(999, 60, True, 55)
+        self.assertEqual(
+            ('debug_info', 999, 60, True, 55), operations[-1])
+
+        compatibility.configure_battle()
+        panel.updateDebugInfo(999, 60, True, 55)
+        self.assertEqual(
+            ('debug_info', 43, 60, False, 55), operations[-1])
+
+        compatibility.set_battle_network_client(types.SimpleNamespace(
+            connected=True, rtt_ms=None))
+        panel.updateDebugInfo(999, 59, True)
+        self.assertEqual(
+            ('debug_info', 0, 59, False, -1), operations[-1])
+
+        compatibility.set_battle_network_client(types.SimpleNamespace(
+            connected=False, rtt_ms=43.2))
+        panel.updateDebugInfo(1, 58, False)
+        self.assertEqual(
+            ('debug_info', 43, 58, True, -1), operations[-1])
+
+        compatibility.deactivate_map()
+        panel.updateDebugInfo(999, 57, True)
+        self.assertEqual(
+            ('debug_info', 999, 57, True, -1), operations[-1])
+        self.assertIsNone(compatibility._battle_network_client)
+
+        compatibility.fini()
+        self.assertIs(original, DebugPanel.__dict__['updateDebugInfo'])
+
     def test_native_ready_is_deferred_until_runtime_bridge_attaches(self):
         compatibility_module = _load_port_source('compat')
         deferred = compatibility_module._DeferredAvatarServer()
@@ -2611,7 +2661,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.13'
+        package.PORT_VERSION = '0.3.14'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []

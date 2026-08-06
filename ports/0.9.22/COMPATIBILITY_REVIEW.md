@@ -5,7 +5,7 @@ This review is pinned to the Chinese HD client whose `version.xml` reports
 CPython 2.7 bytecode magic `03 f3 0d 0a`; the embedded build identifies itself
 as Python 2.7.7.
 
-The goal of version 0.3.13 is a complete playable vertical path, not another
+The goal of version 0.3.14 is a complete playable vertical path, not another
 login-only probe: local Account -> stock Lobby/join/map selection -> native map and
 Avatar -> native Vehicle entities -> local movement/aim/fire -> synchronized
 humans and bots -> damage/death/result -> cleanup -> a second round.
@@ -366,14 +366,32 @@ Remote snapshots are smoothed, while a local echoed pose only corrects drift
 larger than five metres instead of rewinding the player's tank at network
 frequency.
 
+The runtime publishes the exact `PREBATTLE` period tuple before enabling the
+round and changes to `BATTLE` only after the countdown. The authority's first
+canonical bot manifest creates local bots without a server round trip, while
+all bot `createEntity` calls are staggered during that countdown. Pose-less
+`battle_start.bots` reservations are never inserted into `SnapshotSync`; doing
+so allowed an empty map-loading snapshot to tombstone the entire lineup before
+the authority manifest arrived.
+
 ## Aiming, shooting, health and death
 
 The exact relative-aim call treats the point as relative coordinates. Stopping
 gun tracking reconstructs world aim from the current hull yaw. A local shot
 uses the public `gunRotator.getCurShotPosition()` boundary, performs client
 map/vehicle collision and armor checks, and reports the proposed hit to the
-server. The echoed server shot event confirms the local shot after the native
-Avatar waiting timer starts; remote shots use the predicted presentation path.
+server. The echoed server shot event calls `Vehicle.showShooting()` with the
+descriptor's positive `gun.burst[0]` and the authoritative flag. Exact #1513
+then cancels the local Avatar's shot-wait callback; zero is not a single-shot
+sentinel and leaves the native firing extra unbounded. Remote events use the
+same finite presentation without claiming prediction.
+
+The stock debug controller reads `BigWorld.statPing()` and
+`statLagDetected()`, which report the unavailable retail transport in this
+client-only battle. A scoped, identity-safe `DebugPanel.updateDebugInfo`
+wrapper substitutes only the attached LAN client's measured RTT and connection
+state while the offline battle is active, and restores the stock method during
+shutdown.
 
 Server health is applied through the entity's health callback and the native
 Avatar vehicle-health path. Crossing zero publishes `VEHICLE_KILLED`; a dead
@@ -406,7 +424,7 @@ The pure-data server planner emits revisioned global `bot_orders`, which the
 0.9.22 authority now uses for macro targets after reporting bounded visibility
 observations. BigWorld terrain, collision, water and slope probes remain local,
 and the client planner is a fallback when no server order is available.
-Base-capture rules are not part of 0.3.13; standard battles currently end by
+Base-capture rules are not part of 0.3.14; standard battles currently end by
 elimination.
 
 ## Reference implementations reviewed

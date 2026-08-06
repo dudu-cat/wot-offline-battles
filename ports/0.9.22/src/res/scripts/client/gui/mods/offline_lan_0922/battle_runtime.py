@@ -20,6 +20,9 @@ FRAME_SECONDS = 1.0 / 60.0
 AMMO_SECONDS = 0.10
 NETWORK_INPUT_SECONDS = 1.0 / 30.0
 STANDARD_GAMEPLAY = 'ctf'
+PREBATTLE_SECONDS = 15.0
+BATTLE_SECONDS = 900.0
+BOT_SPAWN_SECONDS = 0.20
 
 BOT_VEHICLE_CANDIDATES = (
     'ussr:R05_KV', 'germany:G04_PzVI_Tiger_I',
@@ -188,6 +191,11 @@ class BattleRuntime(object):
         self._battle_result = None
         self._round_finished_notified = False
         self._on_local_leave = None
+        self._battle_live = True
+        self._prebattle_deadline = None
+        self._pending_bot_creates = {}
+        self._pending_bot_create_order = []
+        self._next_bot_create_time = 0.0
 
     def start(self, config, message=None, lan_client=None,
               on_local_leave=None):
@@ -212,6 +220,11 @@ class BattleRuntime(object):
         self._battle_result = self._start_message.get('battle_result')
         self._round_finished_notified = False
         self._on_local_leave = on_local_leave
+        self._battle_live = False
+        self._prebattle_deadline = None
+        self._pending_bot_creates = {}
+        self._pending_bot_create_order = []
+        self._next_bot_create_time = 0.0
         self._lobby_retire_started = False
         self._generation += 1
         self._deadline = self._clock() + float(
@@ -225,6 +238,7 @@ class BattleRuntime(object):
                 raise RuntimeError('standard arena definition is unavailable')
             constants = self._runtime.constants
             local_identity = self._local_state()
+            self._runtime.compatibility.set_battle_network_client(self.client)
             self._runtime.compatibility.configure_battle(
                 getattr(constants.ARENA_GUI_TYPE, 'RANDOM', 0),
                 getattr(constants.ARENA_BONUS_TYPE, 'REGULAR', 0),
@@ -566,7 +580,9 @@ class BattleRuntime(object):
                                   commands.CMD_ADD_INT_USER_SETTINGS,
                                   commands.CMD_DEL_INT_USER_SETTINGS),
                 on_ready=self._on_client_ready,
-                on_leave=self._defer_avatar_leave)
+                on_leave=self._defer_avatar_leave,
+                initial_period='prebattle',
+                initial_period_seconds=self._prebattle_seconds())
             self._runtime.compatibility.attach_avatar_server(
                 self._avatar, self._server)
             position, yaw = self._state_world_pose(local)
@@ -645,7 +661,15 @@ class BattleRuntime(object):
             self._sync = SnapshotSync(
                 self.client.player_id, on_event=self._apply_sync_event,
                 clock=self._clock)
-            self._sync.manifest(self._start_message)
+            # ``battle_start.bots`` is only a roster reservation.  It has no
+            # world pose yet.  Registering those identities here used to make
+            # an empty snapshot received during map loading tombstone all 29
+            # bots; later canonical states were then intentionally ignored as
+            # attempts to resurrect dead entities.  Seed only humans and let
+            # the authority manifest / first canonical snapshot create bots.
+            initial_manifest = dict(self._start_message)
+            initial_manifest['bots'] = []
+            self._sync.manifest(initial_manifest)
             if self._last_snapshot is not None:
                 self._sync.snapshot(self._last_snapshot)
             self._bots = BotRuntime(
@@ -655,11 +679,27 @@ class BattleRuntime(object):
                 vehicle_selector=self._select_bot_vehicle,
                 visibility_probe=self._bot_visibility)
             for outgoing in self._bots.battle_start(self._start_message):
+                # The authority already owns the exact bot poses it is about
+                # to publish.  Materialize that canonical lineup locally now,
+                # like 0.8.2 does, instead of waiting for a server echo.  Do
+                # not register it in SnapshotSync until the server echoes the
+                # canonical lineup: an in-flight empty snapshot between send
+                # and echo must not tombstone the local manifest.
+                if outgoing.get('type') == 'bot_manifest':
+                    for state in outgoing.get('bots') or ():
+                        if isinstance(state, dict) and state.get('id') is not None:
+                            self._queue_bot_create({
+                                'type': 'create',
+                                'entity': 'bot:%s' % state['id'],
+                                'kind': 'bot', 'id': state['id'],
+                                'state': state})
                 self._send_bot_message(outgoing)
             if self._last_snapshot is not None:
                 self._bots.apply_snapshot(self._last_snapshot)
             self.state = 'running'
             self._last_frame_time = self._clock()
+            self._prebattle_deadline = (
+                self._last_frame_time + self._prebattle_seconds())
             self._sender.send_current()
             self._ammo_tick()
             if self.state != 'running':
@@ -681,6 +721,25 @@ class BattleRuntime(object):
             'vehicle': self.client.vehicle, 'team': self.client.team,
             'slot': self.client.slot, 'health': self.client.max_health,
             'max_health': self.client.max_health, 'alive': True}
+
+    def _prebattle_seconds(self):
+        return max(0.0, _number(
+            self._config.get('prebattleCountdownSeconds',
+                             PREBATTLE_SECONDS), PREBATTLE_SECONDS))
+
+    def _battle_seconds(self):
+        return max(1.0, _number(
+            self._config.get('battleDurationSeconds', BATTLE_SECONDS),
+            BATTLE_SECONDS))
+
+    def _begin_battle(self):
+        if self._battle_live:
+            return False
+        self._binding.arena_period('battle', self._battle_seconds())
+        self._battle_live = True
+        self._prebattle_deadline = None
+        self._last_frame_time = self._clock()
+        return True
 
     def _resolve_descriptor(self, vehicle_name):
         try:
@@ -933,10 +992,18 @@ class BattleRuntime(object):
             entity = self._runtime.bigworld.entity(record['engine_id'])
             if entity is not None:
                 try:
-                    # Vehicle.def transports only burstCount.  The Python
-                    # implementation's optional prediction flag is not part
-                    # of the #1513 mailbox schema.
-                    entity.showShooting(0)
+                    # Exact #1513 uses gun.burst[0] for the predicted-shot
+                    # fallback.  Zero is not a one-shot sentinel: it reaches
+                    # the native shoot extra as an unbounded burst.  A server
+                    # event is authoritative, so pass False explicitly; for
+                    # the local vehicle that also closes Avatar's
+                    # isWaitingForShot/cancelWaitingForShot handshake.
+                    burst = _field(entity.typeDescriptor.gun, 'burst', (1,))
+                    try:
+                        burst_count = int(burst[0])
+                    except (TypeError, ValueError, IndexError):
+                        burst_count = 1
+                    entity.showShooting(max(1, burst_count), False)
                 except Exception:
                     pass
             return
@@ -948,11 +1015,18 @@ class BattleRuntime(object):
         dt = max(0.0, min(now - self._last_frame_time, 0.1))
         self._last_frame_time = now
         try:
+            self._flush_pending_bot_create(now)
             self._flush_pending_entities(now)
-            self._drive_local(dt)
             if self._sync is not None:
                 self._sync.advance(now)
-            if self._bots is not None:
+            if (not self._battle_live and
+                    self._prebattle_deadline is not None and
+                    now >= self._prebattle_deadline):
+                self._begin_battle()
+                dt = 0.0
+            if self._battle_live:
+                self._drive_local(dt)
+            if self._battle_live and self._bots is not None:
                 players = (self._last_snapshot or {}).get('players', [])
                 for outgoing in self._bots.update(dt, now, players=players):
                     for state in outgoing.get('bots') or ():
@@ -1151,11 +1225,58 @@ class BattleRuntime(object):
             return
         kind = event.get('type')
         if kind == 'create':
-            self._create_remote(event)
+            if event.get('kind') == 'bot':
+                self._queue_bot_create(event)
+            else:
+                self._create_remote(event)
         elif kind == 'update':
-            self._update_entity(event)
+            if (event.get('kind') == 'bot' and
+                    event.get('entity') not in self._records):
+                self._queue_bot_create(event)
+            else:
+                self._update_entity(event)
         elif kind == 'destroy':
             self._destroy_entity(event)
+
+    def _queue_bot_create(self, event):
+        """Coalesce one bot until its staggered native createEntity call.
+
+        The 0.8.2 implementation deliberately spreads the line-up over time.
+        Creating 29 HD Vehicle entities and their model prerequisites in one
+        BigWorld callback is both visibly janky and unsafe in this 32-bit
+        client.  Keep the newest snapshot pose while preserving roster order.
+        """
+        key = event.get('entity')
+        if not key or key in self._records:
+            return False
+        state = dict(event.get('state') or {})
+        pose = event.get('pose')
+        if isinstance(pose, dict):
+            for name in ('x', 'y', 'z', 'yaw', 'aim_yaw', 'gun_pitch'):
+                if name in pose:
+                    state[name] = pose[name]
+        pending = self._pending_bot_creates.get(key)
+        if pending is None:
+            pending = {
+                'type': 'create', 'entity': key, 'kind': 'bot',
+                'id': event.get('id'), 'state': state}
+            self._pending_bot_creates[key] = pending
+            self._pending_bot_create_order.append(key)
+        else:
+            pending['state'].update(state)
+        return True
+
+    def _flush_pending_bot_create(self, now):
+        if (not self._pending_bot_create_order or
+                now < self._next_bot_create_time):
+            return False
+        key = self._pending_bot_create_order.pop(0)
+        event = self._pending_bot_creates.pop(key, None)
+        self._next_bot_create_time = now + BOT_SPAWN_SECONDS
+        if event is None or key in self._records:
+            return False
+        self._create_remote(event)
+        return key in self._records
 
     def _create_remote(self, event):
         key = event.get('entity')
@@ -1328,6 +1449,13 @@ class BattleRuntime(object):
     def _destroy_entity(self, event):
         record = self._records.get(event.get('entity'))
         if record is None or record.get('local'):
+            key = event.get('entity')
+            if key in self._pending_bot_creates:
+                self._pending_bot_creates.pop(key, None)
+                try:
+                    self._pending_bot_create_order.remove(key)
+                except ValueError:
+                    pass
             return
         if event.get('keep_corpse'):
             state = dict(record.get('state') or {})
@@ -1360,7 +1488,8 @@ class BattleRuntime(object):
             self._binding.destroy_entity(record['engine_id'])
 
     def shoot(self, aim_yaw, gun_pitch):
-        if self.state != 'running' or self._battle_result is not None:
+        if (self.state != 'running' or not self._battle_live or
+                self._battle_result is not None):
             return False
         if self._server is None:
             return False
