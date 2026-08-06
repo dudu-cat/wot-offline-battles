@@ -19,6 +19,7 @@ CONTACT_MEMORY_SECONDS = 7.0
 TARGET_HYSTERESIS_BONUS = 18.0
 LOCAL_FORCE_RADIUS = 185.0
 BATTLE_TIER_RADIUS = 1
+MATCH_CLASSES = ('heavyTank', 'mediumTank', 'AT-SPG', 'lightTank', 'SPG')
 
 
 def _number(value, default=0.0):
@@ -82,6 +83,270 @@ def select_bot_lineup(pool, count, spg_limit=1, fallback_candidates=()):
 			spg_count += 1
 		result.append(candidate)
 	return result
+
+
+def vehicle_match_class(candidate):
+	"""Return the exact legacy matchmaking class for a vehicle record."""
+	try:
+		tags = candidate['tags']
+	except Exception:
+		tags = ()
+	for class_tag in MATCH_CLASSES:
+		if class_tag in tags:
+			return class_tag
+	return 'mediumTank'
+
+
+def choose_match_tiers(player_tier, mode_roll, side_roll=0.5,
+		available_tiers=()):
+	"""Choose a one-, two-, or three-tier battle that includes the player."""
+	try:
+		player_tier = max(1, min(10, int(player_tier)))
+	except Exception:
+		player_tier = 1
+	available = set()
+	for value in (available_tiers or range(1, 11)):
+		try:
+			value = int(value)
+		except Exception:
+			continue
+		if 1 <= value <= 10:
+			available.add(value)
+	available.add(player_tier)
+	lower = player_tier - 1 if player_tier - 1 in available else None
+	upper = player_tier + 1 if player_tier + 1 in available else None
+	try:
+		mode_roll = float(mode_roll)
+		side_roll = float(side_roll)
+	except Exception:
+		mode_roll = side_roll = 0.5
+	if mode_roll < 0.28 or (lower is None and upper is None):
+		return (player_tier,)
+	if mode_roll < 0.72 or lower is None or upper is None:
+		if lower is not None and upper is not None:
+			other = lower if side_roll < 0.5 else upper
+		elif lower is not None:
+			other = lower
+		else:
+			other = upper
+		return tuple(sorted((player_tier, other)))
+	return (lower, player_tier, upper)
+
+
+def select_vehicle_variety_pool(candidates, player_tier, max_unique,
+		rng=None):
+	"""Build a small texture-safe pool while preserving tiers and classes."""
+	rng = rng or random
+	max_unique = max(0, int(max_unique))
+	if max_unique <= 0:
+		return list(candidates or ())
+	unique = []
+	seen = set()
+	for candidate in (candidates or ()):
+		try:
+			name = str(candidate['name'])
+		except Exception:
+			continue
+		if name in seen:
+			continue
+		seen.add(name)
+		unique.append(candidate)
+	try:
+		rng.shuffle(unique)
+	except Exception:
+		random.shuffle(unique)
+	selected = []
+	selected_names = set()
+
+	def _take(options):
+		for candidate in options:
+			name = str(candidate['name'])
+			if name not in selected_names:
+				selected.append(candidate)
+				selected_names.add(name)
+				return True
+		return False
+
+	# Prefer one of each role at the selected tier, then fill any missing role
+	# from a neighbouring tier. This keeps single-tier matches tactically varied.
+	for class_tag in MATCH_CLASSES:
+		if len(selected) >= max_unique:
+			break
+		exact = [candidate for candidate in unique
+			if int(candidate.get('level', 0) or 0) == int(player_tier) and
+			vehicle_match_class(candidate) == class_tag]
+		if not _take(exact):
+			_take([candidate for candidate in unique
+				if vehicle_match_class(candidate) == class_tag])
+	# Make every available tier representable before using the remaining slots.
+	levels = sorted(set(int(candidate.get('level', 0) or 0)
+		for candidate in unique))
+	for level in levels:
+		if len(selected) >= max_unique:
+			break
+		if any(int(candidate.get('level', 0) or 0) == level
+				for candidate in selected):
+			continue
+		_take([candidate for candidate in unique
+			if int(candidate.get('level', 0) or 0) == level])
+	for candidate in unique:
+		if len(selected) >= max_unique:
+			break
+		_take((candidate,))
+	return selected
+
+
+def shared_human_requirements(team_profiles):
+	"""Return the per-profile maxima that a mirrored team template must hold."""
+	representatives = {}
+	required_counts = {}
+	for profiles in (team_profiles or {}).values():
+		team_counts = {}
+		for profile in (profiles or ()):
+			try:
+				key = (int(profile.get('level', 0) or 0),
+					vehicle_match_class(profile))
+			except Exception:
+				continue
+			team_counts[key] = team_counts.get(key, 0) + 1
+			representatives.setdefault(key, profile)
+		for key, count in team_counts.items():
+			required_counts[key] = max(required_counts.get(key, 0), count)
+	result = []
+	for key in sorted(required_counts):
+		for unused in range(required_counts[key]):
+			result.append(representatives[key])
+	return result
+
+
+def build_match_template(pool, team_size, player_candidate, allowed_tiers,
+		rng=None, required_profiles=()):
+	"""Return one tier/class template that both teams can independently fill."""
+	rng = rng or random
+	team_size = max(1, int(team_size))
+	allowed = tuple(sorted(set(int(value) for value in allowed_tiers)))
+	if not allowed:
+		allowed = (int(player_candidate.get('level', 1) or 1),)
+	player_tier = int(player_candidate.get('level', allowed[0]) or allowed[0])
+	player_class = vehicle_match_class(player_candidate)
+	usable = [candidate for candidate in (pool or ())
+		if int(candidate.get('level', 0) or 0) in allowed]
+	if not usable:
+		usable = [player_candidate]
+	required = list(required_profiles or ())
+	if not required:
+		required = [player_candidate]
+	required = required[:team_size]
+
+	tier_slots = []
+	while len(tier_slots) < team_size:
+		for level in allowed:
+			if len(tier_slots) >= team_size:
+				break
+			tier_slots.append(level)
+	try:
+		rng.shuffle(tier_slots)
+	except Exception:
+		random.shuffle(tier_slots)
+
+	regular_classes = ('heavyTank', 'mediumTank', 'AT-SPG', 'lightTank')
+	class_slots = []
+	while len(class_slots) < team_size:
+		for class_tag in regular_classes:
+			if len(class_slots) >= team_size:
+				break
+			class_slots.append(class_tag)
+	has_spg = any(vehicle_match_class(candidate) == 'SPG' for candidate in usable)
+	required_spgs = sum(vehicle_match_class(profile) == 'SPG'
+		for profile in required)
+	try:
+		include_spg = has_spg and (required_spgs > 0 or rng.random() < 0.65)
+	except Exception:
+		include_spg = required_spgs > 0
+	if include_spg:
+		class_slots[-1] = 'SPG'
+	try:
+		rng.shuffle(class_slots)
+	except Exception:
+		random.shuffle(class_slots)
+
+	result = []
+	usage = {}
+	spg_count = 0
+	# Reserve an exact tier/class slot for every human profile needed by either
+	# team. If one side lacks that human, its bot lineup fills the same slot.
+	for profile in required:
+		desired_tier = int(profile.get('level', player_tier) or player_tier)
+		desired_class = vehicle_match_class(profile)
+		choices = [candidate for candidate in usable
+			if int(candidate.get('level', 0) or 0) == desired_tier and
+			vehicle_match_class(candidate) == desired_class]
+		candidate = choices[0] if choices else profile
+		result.append(candidate)
+		name = str(candidate.get('name', ''))
+		usage[name] = usage.get(name, 0) + 1
+		if desired_class == 'SPG':
+			spg_count += 1
+		if desired_tier in tier_slots:
+			tier_slots.remove(desired_tier)
+		elif tier_slots:
+			tier_slots.pop()
+		if desired_class in class_slots:
+			class_slots.remove(desired_class)
+		elif class_slots:
+			class_slots.pop()
+
+	for index in range(len(result), team_size):
+		desired_tier = tier_slots.pop() if tier_slots else player_tier
+		desired_class = class_slots.pop() if class_slots else player_class
+		choices = [candidate for candidate in usable
+			if int(candidate.get('level', 0) or 0) == desired_tier and
+			vehicle_match_class(candidate) == desired_class]
+		if not choices:
+			choices = [candidate for candidate in usable
+				if int(candidate.get('level', 0) or 0) == desired_tier]
+		if not choices:
+			choices = list(usable)
+		if spg_count >= 1:
+			regular = [candidate for candidate in choices
+				if vehicle_match_class(candidate) != 'SPG']
+			if regular:
+				choices = regular
+		try:
+			rng.shuffle(choices)
+		except Exception:
+			random.shuffle(choices)
+		candidate = min(choices, key=lambda value:
+			usage.get(str(value.get('name', '')), 0))
+		name = str(candidate.get('name', ''))
+		usage[name] = usage.get(name, 0) + 1
+		if vehicle_match_class(candidate) == 'SPG':
+			spg_count += 1
+		result.append(candidate)
+	return result
+
+
+def remaining_match_template(template, human_profiles):
+	"""Remove the closest template slot for each human already on a team."""
+	remaining = list(template or ())
+	for human in (human_profiles or ()):
+		if not remaining:
+			break
+		human_tier = int(human.get('level', 0) or 0)
+		human_class = vehicle_match_class(human)
+		best_index = 0
+		best_score = None
+		for index, candidate in enumerate(remaining):
+			candidate_tier = int(candidate.get('level', 0) or 0)
+			candidate_class = vehicle_match_class(candidate)
+			score = abs(candidate_tier - human_tier) * 3
+			if candidate_class != human_class:
+				score += 8
+			if best_score is None or score < best_score:
+				best_score = score
+				best_index = index
+		remaining.pop(best_index)
+	return remaining
 
 
 def bot_initially_visible(bot_team, player_team, spotting_enabled):

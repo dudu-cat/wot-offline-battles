@@ -1639,7 +1639,8 @@ def _offh_bot_pool(cand, tier, max_unique=None):
 		import random as _r
 		n = min(max_unique, len(cand))
 		try:
-			pool[key] = _r.sample(cand, n)
+			from gui.mods.offhangar.bot_ai import select_vehicle_variety_pool
+			pool[key] = select_vehicle_variety_pool(cand, tier, n, _r)
 		except Exception:
 			pool[key] = [_r.choice(cand) for _x in range(n)]
 	return pool[key]
@@ -14752,7 +14753,93 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						except Exception:
 							pass
 						return math.atan2(-x, -z)
-					
+
+					# Build one public matchmaking template before either team is filled.
+					# Humans remove their closest exact slot; bots fill every remaining
+					# slot, so both aggregate tier and vehicle-class distributions match.
+					_balanced_bot_templates = {}
+					try:
+						import random as _match_random
+						from items import vehicles as _match_vehicles
+						import nations as _match_nations
+						from gui.mods.offhangar.bot_ai import (build_match_template,
+							choose_match_tiers, remaining_match_template,
+							shared_human_requirements, vehicle_in_battle_tier_band,
+							vehicle_match_class)
+						_player_type = loaded_models['td'].type
+						_player_profile = {
+							'name': str(_player_type.name),
+							'level': int(_player_type.level),
+							'tags': _player_type.tags,
+						}
+						_human_profiles = {1: [], 2: []}
+						for _human in (getattr(_pl, '_offhangar_network_roster', None) or []):
+							try:
+								_human_team = int(_human.get('team', 0) or 0)
+								if _human_team not in (1, 2):
+									continue
+								_human_td = _match_vehicles.VehicleDescr(
+									typeName=str(_human.get('vehicle')))
+								_human_profiles[_human_team].append({
+									'name': str(_human_td.type.name),
+									'level': int(_human_td.type.level),
+									'tags': _human_td.type.tags,
+								})
+							except Exception:
+								pass
+						if not _human_profiles[1] and not _human_profiles[2]:
+							_human_profiles[_p_team].append(_player_profile)
+
+						_band_candidates = []
+						for _match_nation in _match_nations.AVAILABLE_NAMES:
+							_match_nid = _match_nations.INDICES[_match_nation]
+							for _match_vehicle in _match_vehicles.g_list.getList(_match_nid).itervalues():
+								if (vehicle_in_battle_tier_band(_player_profile['level'],
+										_match_vehicle['level']) and
+										not _offh_veh_excluded(_match_vehicle)):
+									_band_candidates.append(_match_vehicle)
+						_available_tiers = sorted(set(int(_candidate['level'])
+							for _candidate in _band_candidates))
+						_match_tiers = list(choose_match_tiers(
+							_player_profile['level'], _match_random.random(),
+							_match_random.random(), _available_tiers))
+						for _profiles in _human_profiles.values():
+							for _profile in _profiles:
+								if int(_profile['level']) not in _match_tiers:
+									_match_tiers.append(int(_profile['level']))
+						_match_tiers = tuple(sorted(set(_match_tiers)))
+						_match_pool = list(_offh_bot_pool(
+							_band_candidates, _player_profile['level']) or ())
+						# A LAN player outside the authority's normal three-tier band is
+						# still a legal selected vehicle. Make that profile available as a
+						# compensating bot on the opposite team rather than hiding the skew.
+						for _profiles in _human_profiles.values():
+							for _profile in _profiles:
+								if not any(int(_candidate.get('level', 0) or 0) == int(_profile['level']) and
+										vehicle_match_class(_candidate) == vehicle_match_class(_profile)
+										for _candidate in _match_pool):
+									_match_pool.append(_profile)
+						_requirements = shared_human_requirements(_human_profiles)
+						_match_template = build_match_template(
+							_match_pool, _n_per_team, _player_profile, _match_tiers,
+							_match_random, _requirements)
+						for _match_team in (1, 2):
+							_balanced_bot_templates[_match_team] = remaining_match_template(
+								_match_template, _human_profiles[_match_team])
+						_tier_text = ','.join(str(_value) for _value in _match_tiers)
+						_class_counts = {}
+						for _candidate in _match_template:
+							_class_tag = vehicle_match_class(_candidate)
+							_class_counts[_class_tag] = _class_counts.get(_class_tag, 0) + 1
+						LOG_DEBUG('MATCHMAKER: tiers=%s template=%s team1_bots=%d team2_bots=%d' % (
+							_tier_text, repr(_class_counts),
+							len(_balanced_bot_templates[1]),
+							len(_balanced_bot_templates[2])))
+					except Exception:
+						import traceback
+						LOG_DEBUG('MATCHMAKER template failed; using legacy lineup:',
+							traceback.format_exc())
+
 					_jobs = []
 					for _t in (1, 2):
 						_pts = _anchors(_t)
@@ -14806,7 +14893,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								if 'lightTank' in _tg: return 3
 								if 'SPG' in _tg: return 4
 								return 1
-							if _cand:
+							_picked = list(_balanced_bot_templates.get(_t, ()) or ())
+							if len(_picked) != _count and _cand:
 								# Limit to a small STABLE per-tier pool reused across
 								# battles so bot tank TEXTURES cache once instead of
 								# loading ~30 fresh random tanks each battle (the leak
@@ -14835,6 +14923,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										pass
 								_picked = select_bot_lineup(
 									_pool, _count, max(0, 1 - _human_spgs), _cand)
+							if len(_picked) > _count:
+								_picked = _picked[:_count]
+							if _picked:
 								_rnd.shuffle(_picked)
 								_picked.sort(key=_class_key)
 								_veh_names = [_p['name'] for _p in _picked]

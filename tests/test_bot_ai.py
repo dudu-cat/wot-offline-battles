@@ -1,5 +1,6 @@
 import importlib.util
 import math
+import random
 import sys
 import types
 import unittest
@@ -72,6 +73,124 @@ class BotAITest(unittest.TestCase):
         }
 
         self.assertEqual({6, 7, 8}, allowed)
+
+    def test_match_tier_mode_can_be_single_double_or_triple(self):
+        available = (6, 7, 8)
+
+        self.assertEqual(
+            (7,), self.ai.choose_match_tiers(7, 0.10, 0.5, available)
+        )
+        self.assertEqual(
+            (6, 7), self.ai.choose_match_tiers(7, 0.50, 0.1, available)
+        )
+        self.assertEqual(
+            (7, 8), self.ai.choose_match_tiers(7, 0.50, 0.9, available)
+        )
+        self.assertEqual(
+            (6, 7, 8), self.ai.choose_match_tiers(7, 0.90, 0.5, available)
+        )
+
+    def test_small_vehicle_pool_preserves_tiers_and_match_classes(self):
+        vehicles = []
+        for tier in (6, 7, 8):
+            for class_tag in self.ai.MATCH_CLASSES:
+                vehicles.append({
+                    "name": "%s-%s" % (tier, class_tag),
+                    "level": tier,
+                    "tags": {class_tag},
+                })
+
+        pool = self.ai.select_vehicle_variety_pool(
+            vehicles, 7, 8, random.Random(11)
+        )
+
+        self.assertLessEqual(len(pool), 8)
+        self.assertEqual({6, 7, 8}, {item["level"] for item in pool})
+        self.assertEqual(
+            set(self.ai.MATCH_CLASSES),
+            {self.ai.vehicle_match_class(item) for item in pool},
+        )
+
+    def test_both_teams_consume_the_same_tier_and_class_template(self):
+        vehicles = []
+        for tier in (6, 7, 8):
+            for class_tag in self.ai.MATCH_CLASSES:
+                vehicles.append({
+                    "name": "%s-%s" % (tier, class_tag),
+                    "level": tier,
+                    "tags": {class_tag},
+                })
+        player = {
+            "name": "player", "level": 7, "tags": {"mediumTank"}
+        }
+        pool = self.ai.select_vehicle_variety_pool(
+            vehicles, 7, 8, random.Random(3)
+        )
+        template = self.ai.build_match_template(
+            pool, 15, player, (7, 8), random.Random(9)
+        )
+        peer = {"name": "peer", "level": 7, "tags": {"mediumTank"}}
+        team_one_bots = self.ai.remaining_match_template(template, [player])
+        team_two_bots = self.ai.remaining_match_template(template, [peer])
+
+        def profile_counts(lineup):
+            counts = {}
+            for item in lineup:
+                profile = (
+                    item["level"], self.ai.vehicle_match_class(item)
+                )
+                counts[profile] = counts.get(profile, 0) + 1
+            return counts
+
+        self.assertEqual(15, len(template))
+        self.assertEqual({7, 8}, {item["level"] for item in template})
+        self.assertLessEqual(sum(
+            self.ai.vehicle_match_class(item) == "SPG" for item in template
+        ), 1)
+        self.assertEqual(
+            profile_counts(team_one_bots), profile_counts(team_two_bots)
+        )
+
+    def test_different_humans_are_compensated_by_the_shared_template(self):
+        vehicles = []
+        for tier in (7, 8):
+            for class_tag in self.ai.MATCH_CLASSES:
+                vehicles.append({
+                    "name": "%s-%s" % (tier, class_tag),
+                    "level": tier,
+                    "tags": {class_tag},
+                })
+        team_profiles = {
+            1: [{"name": "medium-7", "level": 7, "tags": {"mediumTank"}}],
+            2: [{"name": "heavy-8", "level": 8, "tags": {"heavyTank"}}],
+        }
+        requirements = self.ai.shared_human_requirements(team_profiles)
+        template = self.ai.build_match_template(
+            vehicles, 15, team_profiles[1][0], (7, 8), random.Random(17),
+            requirements,
+        )
+        teams = {}
+        for team in (1, 2):
+            teams[team] = (
+                team_profiles[team]
+                + self.ai.remaining_match_template(
+                    template, team_profiles[team]
+                )
+            )
+
+        def distributions(lineup):
+            tiers = {}
+            classes = {}
+            for item in lineup:
+                tier = item["level"]
+                class_tag = self.ai.vehicle_match_class(item)
+                tiers[tier] = tiers.get(tier, 0) + 1
+                classes[class_tag] = classes.get(class_tag, 0) + 1
+            return tiers, classes
+
+        self.assertEqual(15, len(teams[1]))
+        self.assertEqual(15, len(teams[2]))
+        self.assertEqual(distributions(teams[1]), distributions(teams[2]))
 
     def test_live_ctf_bases_override_static_tactical_fallbacks(self):
         live = {1: (-47.5, -302.6), 2: (17.1, 300.0)}
