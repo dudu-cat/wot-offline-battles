@@ -138,7 +138,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.9</version></root>')
+            '<version>0.3.10</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -898,6 +898,11 @@ class OfflineCompatibilityTests(unittest.TestCase):
 
         class PlayerAvatar(object):
             def __setattr__(self, name, value):
+                if (name in ('name', 'clientCtx') and
+                        not isinstance(value, bytes)):
+                    raise NameError(
+                        'Attempted to set attribute %s on Avatar to an '
+                        'invalid value.' % name)
                 if name == 'remoteCamera':
                     if (not isinstance(value, dict) or
                             set(value) != {'time', 'shotPoint', 'zoom'} or
@@ -912,6 +917,16 @@ class OfflineCompatibilityTests(unittest.TestCase):
             def __init__(self):
                 operations.append(('original_avatar_init',))
                 self._ClientChat__chatActionCallbacks = {}
+                self._PlayerAvatar__initProgress = 0
+                self._PlayerAvatar__consistentMatrices = object()
+
+            def onEnterWorld(self, prereqs):
+                unused = self._PlayerAvatar__initProgress
+                operations.append(('original_avatar_enter_world', prereqs))
+
+            def onLeaveWorld(self):
+                unused = self._PlayerAvatar__consistentMatrices
+                operations.append(('original_avatar_leave_world',))
 
             def onBecomePlayer(self):
                 operations.append(('original_avatar_become_player',))
@@ -1221,6 +1236,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
 
         def strict_avatar_init(avatar):
             observed['name'] = avatar.name
+            observed['client_ctx'] = avatar.clientCtx
             observed['team'] = avatar.team
             observed['vehicle_id'] = avatar.playerVehicleID
             observed['mailboxes'] = (
@@ -1230,15 +1246,63 @@ class OfflineCompatibilityTests(unittest.TestCase):
         compatibility = compatibility_module.OfflineCompatibility(runtime)
         compatibility.connect(show_lobby=True)
         compatibility.configure_battle(
-            player_name='Player-250', player_team=2)
+            player_name=u'Player-玩家', player_team=2)
 
         avatar = runtime.avatar_module.PlayerAvatar()
 
-        self.assertEqual('Player-250', observed['name'])
+        self.assertEqual(b'Player-\xe7\x8e\xa9\xe5\xae\xb6',
+                         observed['name'])
+        self.assertIsInstance(observed['name'], bytes)
+        self.assertEqual(b'', observed['client_ctx'])
+        self.assertIsInstance(observed['client_ctx'], bytes)
         self.assertEqual(2, observed['team'])
         self.assertEqual(0, observed['vehicle_id'])
         self.assertEqual(
             (avatar.fakeServer,) * 4, observed['mailboxes'])
+        compatibility.fini()
+
+    def test_partial_avatar_world_callbacks_skip_stock_fields_offline(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.connect(show_lobby=True)
+
+        partial = object.__new__(runtime.avatar_module.PlayerAvatar)
+        partial.onEnterWorld(('partial',))
+        partial.onLeaveWorld()
+
+        names = [item[0] for item in operations]
+        self.assertNotIn('original_avatar_enter_world', names)
+        self.assertNotIn('original_avatar_leave_world', names)
+
+        complete = runtime.avatar_module.PlayerAvatar()
+        complete.onEnterWorld(('complete',))
+        complete.onLeaveWorld()
+        self.assertIn(
+            ('original_avatar_enter_world', ('complete',)), operations)
+        self.assertIn(('original_avatar_leave_world',), operations)
+        compatibility.fini()
+
+    def test_partial_avatar_world_callbacks_are_not_hidden_online(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, _ = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+        partial = object.__new__(runtime.avatar_module.PlayerAvatar)
+
+        with self.assertRaises(AttributeError):
+            partial.onEnterWorld(('online',))
+        with self.assertRaises(AttributeError):
+            partial.onLeaveWorld()
+        compatibility.fini()
+
+    def test_avatar_team_rejects_out_of_entity_range(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, _ = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+
+        with self.assertRaisesRegex(ValueError, 'team must be 1 or 2'):
+            compatibility.configure_battle(player_team=3)
         compatibility.fini()
 
     def test_avatar_normal_return_without_arena_is_not_marked_ready(self):
@@ -1680,6 +1744,8 @@ class OfflineCompatibilityTests(unittest.TestCase):
             account_type.__getattribute__,
             avatar_type.__dict__['__init__'],
             avatar_type.__getattribute__,
+            avatar_type.__dict__['onEnterWorld'],
+            avatar_type.__dict__['onLeaveWorld'],
             vehicle_type.__getattribute__,
             runtime.bigworld.connect,
             runtime.bigworld.disconnect,
@@ -1704,14 +1770,16 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertIs(originals[1], account_type.__getattribute__)
         self.assertIs(originals[2], avatar_type.__dict__['__init__'])
         self.assertIs(originals[3], avatar_type.__getattribute__)
-        self.assertIs(originals[4], vehicle_type.__getattribute__)
-        self.assertIs(originals[5].__func__,
+        self.assertIs(originals[4], avatar_type.__dict__['onEnterWorld'])
+        self.assertIs(originals[5], avatar_type.__dict__['onLeaveWorld'])
+        self.assertIs(originals[6], vehicle_type.__getattribute__)
+        self.assertIs(originals[7].__func__,
                       runtime.bigworld.connect.__func__)
-        self.assertIs(originals[5].__self__,
+        self.assertIs(originals[7].__self__,
                       runtime.bigworld.connect.__self__)
-        self.assertIs(originals[6].__func__,
+        self.assertIs(originals[8].__func__,
                       runtime.bigworld.disconnect.__func__)
-        self.assertIs(originals[6].__self__,
+        self.assertIs(originals[8].__self__,
                       runtime.bigworld.disconnect.__self__)
 
     def test_lobby_restore_does_not_replace_an_existing_player(self):
@@ -1765,13 +1833,27 @@ class OfflineCompatibilityTests(unittest.TestCase):
         def later_connect(server, params, progress):
             return 'later'
 
+        def later_avatar_enter(avatar, prereqs):
+            return 'later-enter'
+
+        def later_avatar_leave(avatar):
+            return 'later-leave'
+
         runtime.account_module.PlayerAccount.__init__ = later_account_init
+        runtime.avatar_module.PlayerAvatar.onEnterWorld = later_avatar_enter
+        runtime.avatar_module.PlayerAvatar.onLeaveWorld = later_avatar_leave
         runtime.bigworld.connect = later_connect
         compatibility.fini()
 
         self.assertIs(
             later_account_init,
             runtime.account_module.PlayerAccount.__dict__['__init__'])
+        self.assertIs(
+            later_avatar_enter,
+            runtime.avatar_module.PlayerAvatar.__dict__['onEnterWorld'])
+        self.assertIs(
+            later_avatar_leave,
+            runtime.avatar_module.PlayerAvatar.__dict__['onLeaveWorld'])
         self.assertIs(later_connect, runtime.bigworld.connect)
 
 
@@ -2229,7 +2311,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.9'
+        package.PORT_VERSION = '0.3.10'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []

@@ -160,6 +160,27 @@ class _VehicleDescr(object):
 
 
 class BigWorldBindingTests(unittest.TestCase):
+    def test_json_unicode_names_are_encoded_for_bigworld_string(self):
+        module = _binding_module()
+
+        class LegacyUnicode(str):
+            pass
+
+        # Python 3 has no distinct unicode/str pair.  Substitute the legacy
+        # text class here so this test exercises the embedded Python 2 branch.
+        module._unicode_types = (LegacyUnicode,)
+        binding = module.BigWorldVehicleBinding(
+            _BigWorld(), _Avatar(), _Constants, _VehicleDescr,
+            lambda yaw, pitch, limits: 321,
+            outfit_provider=lambda descriptor: LegacyUnicode('verified'))
+
+        properties = binding.properties_from_compact_descr(
+            17, 1, LegacyUnicode('Player-250'))
+
+        self.assertEqual(b'Player-250', properties['publicInfo']['name'])
+        self.assertEqual(b'verified', properties['publicInfo']['outfit'])
+        self.assertEqual(str, type(properties['publicInfo']['compDescr']))
+
     def test_exact_property_contract_and_lifecycle_operations(self):
         module = _binding_module()
         bigworld = _BigWorld()

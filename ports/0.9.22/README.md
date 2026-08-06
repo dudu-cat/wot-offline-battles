@@ -9,7 +9,7 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.9` replaces the old compatibility slice. It is a server-backed
+Version `0.3.10` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, tactical bots and repeatable rounds. The removed `vertical_slice.py`
@@ -30,6 +30,12 @@ is still not treated as a materialized tank: client ready, `AVATAR_READY` and
 battle period wait for native `onEnterWorld`, registry presence, `inWorld`,
 `isStarted` and a descriptor. Pending remote updates are coalesced until the
 same boundary, and a late removed entity is destroyed instead of orphaned.
+
+LAN JSON text is Unicode on the embedded Python 2 runtime, while BigWorld's
+Avatar and Vehicle `STRING` properties require byte strings. The release now
+normalizes those entity-bound values to UTF-8 and suppresses only the stock
+world callbacks emitted for an Avatar whose constructor already failed. A
+Python 2 build audit covers both Avatar and Vehicle string boundaries.
 
 Map-start failure now restores the stock prebattle dispatcher before rebuilding
 the Account lobby, while final process shutdown guards the exact late
@@ -194,8 +200,8 @@ properties and mailboxes at runtime.
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.9.wotmod
-org.peng.offline_lan_0922_0.3.9.wotmod.sha256
+org.peng.offline_lan_0922_0.3.10.wotmod
+org.peng.offline_lan_0922_0.3.10.wotmod.sha256
 WoT-0.9.22-LAN-Client-<release hash>/
 WoT-0.9.22-LAN-Client-<release hash>.zip
 ```

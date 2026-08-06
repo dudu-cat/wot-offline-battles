@@ -24,10 +24,22 @@ import zlib
 
 try:
     _integer_types = (int, long)
-    _string_types = (basestring,)
+    _unicode_types = (unicode,)
 except NameError:
     _integer_types = (int,)
-    _string_types = (str,)
+    _unicode_types = ()
+
+# BigWorld ``STRING`` is Python 2 ``str``, not ``unicode``.  LAN messages are
+# decoded as UTF-8 before json.loads(), so every server-provided name reaches
+# this boundary as unicode on the embedded 2.7 runtime.  Normalize all STRING
+# members before handing the property dictionary to createEntity().
+_entity_string_types = (str,)
+
+
+def _entity_string(value):
+    if _unicode_types and isinstance(value, _unicode_types):
+        return value.encode('utf-8')
+    return value
 
 
 class CapabilityError(RuntimeError):
@@ -100,13 +112,13 @@ class BigWorldVehicleBinding(object):
             raise CapabilityError('VehicleDescr.gun.pitchLimits.absolute unavailable')
         return {
             'publicInfo': {
-                'compDescr': descriptor.makeCompactDescr(),
-                'name': name,
+                'compDescr': _entity_string(descriptor.makeCompactDescr()),
+                'name': _entity_string(name),
                 'team': team,
                 'prebattleID': 0,
                 'marksOnGun': 0,
                 'index': 0,
-                'outfit': self._outfit_provider(descriptor)},
+                'outfit': _entity_string(self._outfit_provider(descriptor))},
             'gunAnglesPacked': self._encode_gun_angles(
                 0, 0, pitch_limits['absolute']),
             'health': descriptor.maxHealth,
@@ -256,7 +268,7 @@ class BigWorldVehicleBinding(object):
         if set(public_info) != required:
             raise CapabilityError('Vehicle publicInfo contract mismatch')
         for name in ('compDescr', 'name', 'outfit'):
-            if not isinstance(public_info[name], _string_types):
+            if not isinstance(public_info[name], _entity_string_types):
                 raise CapabilityError('Vehicle publicInfo.%s must be STRING' %
                                       name)
         for name in ('team', 'marksOnGun', 'index'):

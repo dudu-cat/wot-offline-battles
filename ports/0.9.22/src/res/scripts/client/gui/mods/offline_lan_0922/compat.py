@@ -12,6 +12,18 @@ _OFFLINE_INIT_COMPLETE = '_offlineLANInitComplete'
 _OFFLINE_PLAYER_READY = '_offlineLANPlayerReady'
 _OFFLINE_RETIRE_PENDING = '_offlineLANRetirePending'
 
+
+def _entity_bytes(value, default=''):
+    """Return the exact byte-string shape expected by BigWorld STRING."""
+    if value is None:
+        value = default
+    if isinstance(value, bytes):
+        return value
+    try:
+        return value.encode('utf-8')
+    except AttributeError:
+        return str(value)
+
 _SERVER_SETTINGS = {
     'file_server': {
         'clan_emblems': {'url_template': '', 'cache_life_time': 0},
@@ -208,6 +220,8 @@ class OfflineCompatibility(object):
         self._original_avatar_getattribute = None
         self._original_avatar_become_player = None
         self._original_avatar_become_non_player = None
+        self._original_avatar_enter_world = None
+        self._original_avatar_leave_world = None
         self._original_avatar_vehicle_enter = None
         self._original_avatar_prereqs_loaded = None
         self._original_vehicle_getattribute = None
@@ -221,6 +235,8 @@ class OfflineCompatibility(object):
         self._avatar_getattribute_wrapper = None
         self._avatar_become_player_wrapper = None
         self._avatar_become_non_player_wrapper = None
+        self._avatar_enter_world_wrapper = None
+        self._avatar_leave_world_wrapper = None
         self._avatar_vehicle_enter_wrapper = None
         self._avatar_prereqs_loaded_wrapper = None
         self._vehicle_getattribute_wrapper = None
@@ -257,6 +273,10 @@ class OfflineCompatibility(object):
         self._original_avatar_become_non_player = avatar_type.__dict__.get(
             'onBecomeNonPlayer',
             getattr(avatar_type, 'onBecomeNonPlayer', None))
+        self._original_avatar_enter_world = avatar_type.__dict__.get(
+            'onEnterWorld', getattr(avatar_type, 'onEnterWorld', None))
+        self._original_avatar_leave_world = avatar_type.__dict__.get(
+            'onLeaveWorld', getattr(avatar_type, 'onLeaveWorld', None))
         self._original_avatar_vehicle_enter = avatar_type.__dict__.get(
             'vehicle_onEnterWorld',
             getattr(avatar_type, 'vehicle_onEnterWorld', None))
@@ -433,6 +453,26 @@ class OfflineCompatibility(object):
         def avatar_become_non_player(avatar):
             return retire_offline_player(
                 avatar, compatibility._original_avatar_become_non_player)
+
+        def avatar_enter_world(avatar, prereqs):
+            if (compatibility._fake_connected and
+                    not getattr(avatar, _OFFLINE_INIT_COMPLETE, False)):
+                # BigWorld still delivers world callbacks after a Python
+                # constructor raises.  Stock PlayerAvatar.onEnterWorld then
+                # dereferences fields that its interrupted __init__ never
+                # created, obscuring the first property/constructor error.
+                return None
+            return compatibility._original_avatar_enter_world(
+                avatar, prereqs)
+
+        def avatar_leave_world(avatar):
+            if (compatibility._fake_connected and
+                    not getattr(avatar, _OFFLINE_INIT_COMPLETE, False)):
+                # The matching entity clear can arrive for the same partial
+                # PyEntity.  It has no native ConsistentMatrices owner to
+                # notify and therefore no stock leave lifecycle to run.
+                return None
+            return compatibility._original_avatar_leave_world(avatar)
 
         def avatar_getattribute(avatar, name):
             if (name in ('base', 'cell', 'server', 'bwProto') and
@@ -663,6 +703,8 @@ class OfflineCompatibility(object):
         self._avatar_getattribute_wrapper = avatar_getattribute
         self._avatar_become_player_wrapper = avatar_become_player
         self._avatar_become_non_player_wrapper = avatar_become_non_player
+        self._avatar_enter_world_wrapper = avatar_enter_world
+        self._avatar_leave_world_wrapper = avatar_leave_world
         self._avatar_vehicle_enter_wrapper = avatar_vehicle_enter
         self._avatar_prereqs_loaded_wrapper = avatar_prereqs_loaded
         self._vehicle_getattribute_wrapper = vehicle_getattribute
@@ -681,6 +723,10 @@ class OfflineCompatibility(object):
             avatar_type.onBecomePlayer = avatar_become_player
             if self._original_avatar_become_non_player is not None:
                 avatar_type.onBecomeNonPlayer = avatar_become_non_player
+            if self._original_avatar_enter_world is not None:
+                avatar_type.onEnterWorld = avatar_enter_world
+            if self._original_avatar_leave_world is not None:
+                avatar_type.onLeaveWorld = avatar_leave_world
             if self._original_avatar_vehicle_enter is not None:
                 avatar_type.vehicle_onEnterWorld = avatar_vehicle_enter
             if self._original_avatar_prereqs_loaded is not None:
@@ -744,6 +790,14 @@ class OfflineCompatibility(object):
                 self._avatar_become_non_player_wrapper):
             avatar_type.onBecomeNonPlayer = \
                 self._original_avatar_become_non_player
+        if (self._original_avatar_enter_world is not None and
+                avatar_type.__dict__.get('onEnterWorld') is
+                self._avatar_enter_world_wrapper):
+            avatar_type.onEnterWorld = self._original_avatar_enter_world
+        if (self._original_avatar_leave_world is not None and
+                avatar_type.__dict__.get('onLeaveWorld') is
+                self._avatar_leave_world_wrapper):
+            avatar_type.onLeaveWorld = self._original_avatar_leave_world
         if (self._original_avatar_vehicle_enter is not None and
                 avatar_type.__dict__.get('vehicle_onEnterWorld') is
                 self._avatar_vehicle_enter_wrapper):
@@ -959,6 +1013,12 @@ class OfflineCompatibility(object):
     def configure_battle(self, gui_type=None, bonus_type=None,
                          player_name=None, player_team=None):
         """Enable the normal battle UI/input path for the next native Avatar."""
+        if player_name is not None:
+            player_name = _entity_bytes(player_name, 'OfflinePlayer')
+        if player_team is not None:
+            player_team = int(player_team)
+            if player_team not in (1, 2):
+                raise ValueError('Avatar team must be 1 or 2')
         self.install()
         self._battle_active = True
         self._native_battle = True
@@ -967,7 +1027,7 @@ class OfflineCompatibility(object):
         if player_name is not None:
             self._battle_player_name = player_name
         if player_team is not None:
-            self._battle_player_team = int(player_team)
+            self._battle_player_team = player_team
         self.activate_map()
 
     def attach_avatar_server(self, avatar, server):
@@ -986,19 +1046,26 @@ class OfflineCompatibility(object):
                 pass
 
     def _prepare_avatar_properties(self, avatar):
+        # A client-only BigWorld Entity accepts its typed properties during
+        # Python construction, but its STRING converter accepts Python-2
+        # ``str`` only.  LAN JSON values are ``unicode``; normalize them here
+        # before any property setter runs.  Public 0.9.22 offline layers use
+        # this same pre-super property boundary.
+        avatar.fakeServer = _DeferredAvatarServer()
         values = {
             # These are server properties in a retail battle.  Seed the exact
             # LAN roster identity before PlayerAvatar.onBecomePlayer creates
             # ArenaDataProvider; a later name fallback must never disagree
             # with the VEHICLE_ADDED record.
-            'name': self._battle_player_name,
+            'name': _entity_bytes(
+                self._battle_player_name, 'OfflinePlayer'),
             'team': self._battle_player_team,
             'playerVehicleID': 0,
             'ownVehicleAuxPhysicsData': 0,
             'ownVehicleGear': 0,
             'denunciationsLeft': 10,
             'tkillIsSuspected': False,
-            'clientCtx': '',
+            'clientCtx': _entity_bytes(''),
             'isObserverBothTeams': False,
             'isGunLocked': False,
             'arenaUniqueID': 0,
@@ -1023,7 +1090,6 @@ class OfflineCompatibility(object):
         for name, value in values.items():
             if not hasattr(avatar, name):
                 setattr(avatar, name, value)
-        avatar.fakeServer = _DeferredAvatarServer()
 
     def prepare_avatar(self, avatar):
         if not self._native_battle:
