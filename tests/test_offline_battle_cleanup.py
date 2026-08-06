@@ -150,6 +150,30 @@ class OfflineBattleCleanupTest(unittest.TestCase):
         self.assertEqual(1, source.count("player._offhangar_stickers.append(stickers)"))
         self.assertNotIn("Account.shoot = _mock_shoot", source)
 
+    def test_battle_generation_is_initialized_on_the_normal_spawn_path(self):
+        source = BATTLE.read_text()
+        spawn = source[source.index("def _try_spawn_battle_avatar_stub("):
+                       source.index("def start_network_battle_from_server(")]
+        generation_line = next(
+            line for line in spawn.splitlines()
+            if "globals()['g_offh_battle_gen'] = (" in line
+        )
+        capture_line = next(
+            line for line in spawn.splitlines()
+            if "_offh_capture_player_battle_attrs(player)" in line
+        )
+
+        # Both statements belong to the outer spawn try (two tabs). Three tabs
+        # would leave them inside the sweep exception handler, making the normal
+        # first-battle path reach model callbacks with _offh_my_gen undefined.
+        self.assertTrue(generation_line.startswith("\t\tglobals()"))
+        self.assertFalse(generation_line.startswith("\t\t\t"))
+        self.assertTrue(capture_line.startswith("\t\t_offh_capture"))
+        self.assertLess(
+            spawn.index("_offh_my_gen ="),
+            spawn.index("def _add_models_when_ready("),
+        )
+
     def test_pending_space_is_only_cleared_after_native_release(self):
         source = BATTLE.read_text()
         start = source.index("_prev = globals().get('g_offh_pending_release'")

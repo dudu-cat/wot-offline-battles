@@ -4728,11 +4728,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				pass
 		# One battle = one generation. Establish it before any asynchronous model,
 		# camera or spawn callback is scheduled so every callback can reject a
-			# completed battle instead of recreating visuals in the hangar.
-			globals()['g_offh_battle_gen'] = (
-				(globals().get('g_offh_battle_gen', 0) or 0) + 1)
-			_offh_my_gen = [globals()['g_offh_battle_gen']]
-			_offh_capture_player_battle_attrs(player)
+		# completed battle instead of recreating visuals in the hangar.
+		globals()['g_offh_battle_gen'] = (
+			(globals().get('g_offh_battle_gen', 0) or 0) + 1)
+		_offh_my_gen = [globals()['g_offh_battle_gen']]
+		_offh_capture_player_battle_attrs(player)
 		# The sweep destroys the projectile mover on battle exit (it owns
 		# the shell models) - recreate it per battle or tracers are gone
 		# from the second battle on. The __calcTrajectory patch lives on
