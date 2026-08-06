@@ -354,13 +354,48 @@ class _ReentrantBridgeBinding(_BridgeBinding):
     def __init__(self):
         _BridgeBinding.__init__(self)
         self.bridge = None
+        self.in_native_enter = False
+        self.native_matrices_initialized = False
+
+    def avatar_select_vehicle(self, vehicle_id):
+        if self.in_native_enter and not self.native_matrices_initialized:
+            raise AssertionError(
+                'player id notifier ran before native matrix initialization')
+        _BridgeBinding.avatar_select_vehicle(self, vehicle_id)
 
     def create_vehicle(self, properties, position, rotation):
         self.events.append(('create', properties, position, rotation))
-        self.bridge.acceptVehicleEnter(91)
-        self.bridge.setClientReady()
-        self.bridge.completeVehicleEnter(91)
+        self.in_native_enter = True
+        try:
+            self.bridge.acceptVehicleEnter(91)
+            # playerVehicleID is still zero here, so exact
+            # PlayerAvatar.vehicle_onEnterWorld treats this entity as remote
+            # and never initializes the own-vehicle matrix providers.
+            self.bridge.setClientReady()
+            self.bridge.completeVehicleEnter(91)
+        finally:
+            self.in_native_enter = False
         return 91
+
+
+class _NativeEnterOrderBinding(_BridgeBinding):
+    def __init__(self):
+        _BridgeBinding.__init__(self)
+        self.in_native_enter = False
+        self.native_matrices_initialized = False
+
+    def avatar_select_vehicle(self, vehicle_id):
+        if self.in_native_enter and not self.native_matrices_initialized:
+            raise AssertionError(
+                'player id notifier ran before native matrix initialization')
+        _BridgeBinding.avatar_select_vehicle(self, vehicle_id)
+
+
+class _FailingSelectBinding(_BridgeBinding):
+    def avatar_select_vehicle(self, vehicle_id):
+        _BridgeBinding.avatar_select_vehicle(self, vehicle_id)
+        if vehicle_id:
+            raise RuntimeError('player Vehicle selection failed')
 
 
 class _BridgeAvatar(object):
@@ -460,7 +495,7 @@ class AvatarServerBridgeTests(unittest.TestCase):
         bridge.doCmdStr(4, 'sync', '')
         self.assertTrue(bridge.destroy())
 
-        self.assertEqual(['create', 'select', 'added', 'select', 'entered',
+        self.assertEqual(['create', 'added', 'select', 'entered',
                           'client_ready', 'avatar_ready', 'period', 'removed',
                           'destroy'],
                          [event[0] for event in binding.events])
@@ -476,7 +511,7 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertEqual([(6, {'wins': 0, 'losses': 0})],
                          avatar.account_stats)
 
-    def test_reentrant_vehicle_enter_waits_for_arena_registration(self):
+    def test_reentrant_vehicle_enter_fails_closed_before_registration(self):
         module = _avatar_bridge_module()
         binding = _ReentrantBridgeBinding()
         ready = []
@@ -488,24 +523,21 @@ class AvatarServerBridgeTests(unittest.TestCase):
         binding.bridge = bridge
         binding.ready = False
 
-        self.assertEqual(91, bridge.addVehicleToArena(_snapshot()))
+        with self.assertRaisesRegex(
+                module.AvatarBridgeError,
+                'before createEntity returned'):
+            bridge.addVehicleToArena(_snapshot())
 
         self.assertEqual(
-            ['create', 'select', 'added'],
+            ['create', 'destroy'],
             [event[0] for event in binding.events])
         self.assertEqual([], ready)
-        binding.ready = True
-        self.assertTrue(bridge.flushClientReady())
-        self.assertEqual(
-            ['create', 'select', 'added', 'entered', 'client_ready',
-             'avatar_ready', 'period'],
-            [event[0] for event in binding.events])
-        self.assertEqual([True], ready)
-        self.assertFalse(bridge.setClientReady())
+        self.assertIsNone(bridge.vehicle_id)
+        self.assertFalse(bridge.flushClientReady())
 
-    def test_early_player_id_is_reannounced_at_native_vehicle_enter(self):
+    def test_native_vehicle_enter_does_not_repeat_player_id_notifier(self):
         module = _avatar_bridge_module()
-        binding = _BridgeBinding()
+        binding = _NativeEnterOrderBinding()
         bridge = module.AvatarServerBridge(
             _BridgeAvatar(), binding,
             _runtime_module().EntityPropertyBuilder(
@@ -516,9 +548,38 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertEqual(1, [event[0] for event in binding.events].count(
             'select'))
 
+        binding.in_native_enter = True
         self.assertTrue(bridge.acceptVehicleEnter(91))
-        self.assertEqual(2, [event[0] for event in binding.events].count(
+        # Exact PlayerAvatar.vehicle_onEnterWorld must initialize its own
+        # matrices before it records VEHICLE_ENTERED.  Repeating the notifier
+        # from the wrapper would record that step and start visuals too early.
+        self.assertEqual(1, [event[0] for event in binding.events].count(
             'select'))
+        binding.native_matrices_initialized = True
+        binding.in_native_enter = False
+        self.assertTrue(bridge.completeVehicleEnter(91))
+
+    def test_failed_player_selection_resets_partial_avatar_binding(self):
+        module = _avatar_bridge_module()
+        binding = _FailingSelectBinding()
+        bridge = module.AvatarServerBridge(
+            _BridgeAvatar(), binding,
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            _Sender())
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'player Vehicle selection failed'):
+            bridge.addVehicleToArena(_snapshot())
+
+        self.assertEqual(
+            [('create', {'typeCompDescr': 17, 'team': 1},
+              (1.0, 2.0, 3.0), (0.0, 0.0, 0.0)),
+             ('added', 91), ('select', 91), ('destroy', 91),
+             ('select', 0)],
+            binding.events)
+        self.assertIsNone(bridge.vehicle_id)
+        self.assertFalse(bridge.flushClientReady())
 
     def test_early_ready_waits_for_vehicle_bind_and_arena_registration(self):
         module = _avatar_bridge_module()
@@ -536,7 +597,7 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertTrue(bridge.completeVehicleEnter(91))
         self.assertTrue(bridge.flushClientReady())
         self.assertEqual(
-            ['create', 'select', 'added', 'select', 'entered', 'client_ready',
+            ['create', 'added', 'select', 'entered', 'client_ready',
              'avatar_ready', 'period'],
             [event[0] for event in binding.events])
 
@@ -555,7 +616,7 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertFalse(bridge.completeVehicleEnter(91))
         self.assertFalse(bridge.setClientReady())
         self.assertEqual(
-            ['create', 'select', 'added', 'removed', 'destroy'],
+            ['create', 'added', 'select', 'removed', 'destroy'],
             [event[0] for event in binding.events])
 
     def test_duplicate_leave_mailbox_is_delivered_once(self):

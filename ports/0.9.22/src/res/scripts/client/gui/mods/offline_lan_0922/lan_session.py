@@ -17,6 +17,12 @@ class _VehicleSelectionError(Exception):
     pass
 
 
+try:
+    text_type = unicode
+except NameError:
+    text_type = str
+
+
 def _show_status(message):
     """Show one native lobby notification without owning mouse focus."""
     try:
@@ -101,6 +107,7 @@ class LANSession(object):
         self._queue = None
         self._join_ui = None
         self._picker_open = False
+        self._picker_dismissed = False
         self._picker_callback_id = None
         self._picker_close_callback_id = None
         self._battle_start_callback_id = None
@@ -197,6 +204,7 @@ class LANSession(object):
         if self._stopped:
             return False
         if self.client is None:
+            self._picker_dismissed = False
             sys.stdout.write(
                 '[Offline LAN 0.9.22] LAN join requested: %s\n' %
                 self._endpoint_value())
@@ -216,6 +224,9 @@ class LANSession(object):
             self._open_connection_picker()
         elif self.state == 'waiting':
             if self._is_local_host():
+                # An explicit Battle click is the user's request to reopen a
+                # picker they previously dismissed.
+                self._picker_dismissed = False
                 self._open_waiting_picker()
             else:
                 self._show_waiting_notice(force=True)
@@ -225,6 +236,55 @@ class LANSession(object):
         return port_config.format_endpoint(
             self._config.get('host', '127.0.0.1'),
             self._config.get('port', 28782))
+
+    @staticmethod
+    def _player_label(player):
+        if not isinstance(player, dict):
+            return None
+        value = player.get('name')
+        if not value:
+            value = player.get('id', player.get('player_id'))
+        if value is None:
+            return None
+        try:
+            label = text_type(value)
+        except Exception:
+            return None
+        label = u' '.join(label.split())
+        return label[:16] or None
+
+    def _picker_description(self):
+        """Describe the live room inside the stock editable comment field."""
+        players = list(getattr(self.client, 'roster', ()) or ())
+        labels = []
+        for player in players:
+            label = self._player_label(player)
+            if label is not None:
+                labels.append(label)
+        shown = labels[:3]
+        if len(labels) > len(shown):
+            shown.append(u'+%d more' % (len(labels) - len(shown)))
+        if shown:
+            roster = u', '.join(shown)
+        else:
+            roster = u'waiting for roster'
+        lines = [
+            text_type(self._endpoint_value()),
+            u'PLAYERS (%d): %s' % (len(players), roster),
+        ]
+        if self._is_local_host():
+            lines.extend((
+                u'YOU ARE HOST; OTHERS JOIN WITH BATTLE',
+                u'CREATE = START BATTLE FOR EVERYONE',
+            ))
+        elif self.state == 'waiting':
+            lines.extend((
+                u'HOST: %s' % text_type(self._host_name()),
+                u'WAIT FOR THE HOST TO START',
+            ))
+        else:
+            lines.append(u'CONNECTING; EDIT THE FIRST LINE IF NEEDED')
+        return u'\n'.join(lines)
 
     def _cancel_retry_callback(self):
         callback_id = self._retry_callback_id
@@ -303,12 +363,15 @@ class LANSession(object):
         if self._queue is None:
             self._queue = self._queue_factory(self.request_start,
                                               self._map_pool_value,
-                                              endpoint=self._endpoint_value,
+                                              endpoint=self._picker_description,
                                               on_close=self._on_picker_closed)
             self._queue.install()
 
     def _on_picker_closed(self):
         self._picker_open = False
+        if (not self._stopped and self.state == 'waiting' and
+                self._is_local_host()):
+            self._picker_dismissed = True
         # A user close is final.  Reopening on the next BigWorld callback can
         # recapture the cursor while the stock window is still unwinding.
         # The host can explicitly reopen the picker with the Battle button;
@@ -352,7 +415,8 @@ class LANSession(object):
         def retry():
             self._picker_callback_id = None
             if (not self._stopped and self.state == 'waiting' and
-                    self._is_local_host()):
+                    self._is_local_host() and
+                    not self._picker_dismissed):
                 self._open_waiting_picker()
 
         self._picker_callback_id = self._callback(0.10, retry)
@@ -398,7 +462,7 @@ class LANSession(object):
         return False
 
     def _open_waiting_picker(self):
-        if (self._stopped or self._picker_open or
+        if (self._stopped or self._picker_open or self._picker_dismissed or
                 not self._is_local_host()):
             return False
         if not self._lobby_ready():
@@ -450,12 +514,17 @@ class LANSession(object):
 
     def _sync_waiting_surface(self, previous_host_player_id=None):
         if self._is_local_host():
+            if previous_host_player_id != self._host_player_id:
+                # First host election and host transfer are explicit room
+                # ownership changes, so they may present the map picker.
+                self._picker_dismissed = False
             self._waiting_notice_host_id = None
             if (previous_host_player_id is not None and
                     previous_host_player_id != self._host_player_id):
                 self._status_notifier(
                     'You are now the LAN room host. Choose a map to start.')
-            self._open_waiting_picker()
+            if not self._picker_dismissed:
+                self._open_waiting_picker()
             return
         if self._picker_open:
             self._close_picker()
@@ -471,6 +540,18 @@ class LANSession(object):
                 close()
 
     def _save_endpoint(self, value):
+        # The stock training description is also the only editable text area
+        # available without shipping a custom SWF.  Room status occupies the
+        # following lines, while the first non-empty line remains the endpoint
+        # accepted by older packages.
+        try:
+            lines = value.splitlines()
+        except AttributeError:
+            lines = ()
+        for line in lines:
+            if line.strip():
+                value = line.strip()
+                break
         try:
             host, port = port_config.parse_endpoint(
                 value, self._config.get('port', 28782))
@@ -557,12 +638,13 @@ class LANSession(object):
         self._connection_error_notified = False
         if recovered_connection:
             self._status_notifier('LAN server connected.')
-        previous_map_pool = self._map_pool
         self._map_pool = list(_message_value(
             message, 'map_pool', getattr(self.client, 'map_pool', [])) or [])
-        map_pool_changed = previous_map_pool != self._map_pool
         phase = _message_value(message, 'phase', getattr(self.client, 'phase', None))
         if phase == 'waiting':
+            returning_from_round = (
+                self._battle_started or self._active_round_id is not None or
+                self._departed_round_id is not None)
             self._clear_pending_battle_start()
             self._starting_round_id = None
             if self._battle_started:
@@ -578,12 +660,14 @@ class LANSession(object):
             # A waiting roster is the server-owned barrier that makes a
             # locally departed player eligible for another battle.
             self._departed_round_id = None
+            if returning_from_round:
+                self._picker_dismissed = False
             if self._start_requested:
                 self.state = 'awaiting_battle_start'
                 return
             self.state = 'waiting'
-            if (map_pool_changed and self._is_local_host() and
-                    self._picker_open and self._queue is not None):
+            if (self._is_local_host() and self._picker_open and
+                    self._queue is not None):
                 refresh = getattr(self._queue, 'refresh', None)
                 if callable(refresh):
                     refresh()
@@ -872,6 +956,7 @@ class LANSession(object):
             self._clear_pending_battle_start()
             self._start_requested = False
             self.state = 'waiting'
+            self._picker_dismissed = False
             self._host_player_id = _message_value(
                 message, 'host_player_id',
                 getattr(self.client, 'host_player_id',

@@ -371,6 +371,7 @@ class _BigWorld(object):
         self.space_status = 1.0
         self.next_id = 100
         self.defer_vehicle_entry = False
+        self.reenter_vehicle_during_create = False
         self.pending_entities = {}
 
     def player(self):
@@ -380,6 +381,18 @@ class _BigWorld(object):
         return self.now
 
     def callback(self, delay, function):
+        if self.pending_entities and not self.defer_vehicle_entry:
+            original = function
+
+            def enter_pending_then_invoke():
+                # Model the normal BigWorld lifecycle: createEntity returns
+                # first, then Vehicle.onEnterWorld runs on an engine tick.
+                for entity_id in list(self.pending_entities):
+                    if entity_id in self.pending_entities:
+                        self.enter_pending_vehicle(entity_id)
+                return original()
+
+            function = enter_pending_then_invoke
         self.callbacks.append(function)
         return len(self.callbacks)
 
@@ -396,10 +409,10 @@ class _BigWorld(object):
             compactDescr=properties['publicInfo']['compDescr'])
         entity = _Vehicle(
             self.next_id, descriptor, position, rotation, properties)
-        if self.defer_vehicle_entry:
-            self.pending_entities[entity.id] = entity
-        else:
+        if self.reenter_vehicle_during_create:
             self._enter_vehicle(entity)
+        else:
+            self.pending_entities[entity.id] = entity
         return entity.id
 
     def _enter_vehicle(self, entity):
@@ -800,6 +813,36 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertFalse(battle._server.setClientReady())
         self.assertEqual(500, runtime.bigworld.entity(
             battle._server.vehicle_id).health)
+
+    def test_reentrant_vehicle_enter_fails_before_roster_publication(self):
+        runtime = _runtime()
+        runtime.bigworld.reenter_vehicle_during_create = True
+        created_avatars = []
+        original_create = runtime.offline_map_creator.create
+
+        def record_created_avatar(map_name):
+            original_create(map_name)
+            created_avatars.append(runtime.bigworld.avatar)
+
+        runtime.offline_map_creator.create = record_created_avatar
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
+
+        self.assertFalse(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, start, client))
+
+        self.assertEqual('failed', battle.state)
+        self.assertIn(
+            'Vehicle entered before createEntity returned', battle.error)
+        self.assertEqual(1, len(created_avatars))
+        self.assertEqual([], created_avatars[0].arena_updates)
 
     def test_local_vehicle_ready_timeout_recovers_lobby(self):
         runtime = _runtime()

@@ -194,6 +194,24 @@ class _OfflineInputHandler(object):
         return False
 
 
+class _InitialGunSyncFilterProxy(object):
+    """Delegate WGVehicleFilter except for the unsafe first gun sync."""
+
+    __slots__ = ('_vehicle_filter',)
+
+    def __init__(self, vehicle_filter):
+        self._vehicle_filter = vehicle_filter
+
+    def __getattr__(self, name):
+        return getattr(self._vehicle_filter, name)
+
+    def syncGunAngles(self, yaw, pitch):
+        # A client-only Vehicle has no retail interpolation filter behind its
+        # initial gun-angle sample.  Exact #1513 asserts a null native filter
+        # here; later LAN state updates own gun synchronization.
+        return None
+
+
 class OfflineCompatibility(object):
 
     def __init__(self, runtime=None):
@@ -225,6 +243,7 @@ class OfflineCompatibility(object):
         self._original_avatar_vehicle_enter = None
         self._original_avatar_prereqs_loaded = None
         self._original_vehicle_getattribute = None
+        self._original_vehicle_start_wg_physics = None
         self._original_connect = None
         self._original_disconnect = None
         self._account_init_wrapper = None
@@ -240,6 +259,8 @@ class OfflineCompatibility(object):
         self._avatar_vehicle_enter_wrapper = None
         self._avatar_prereqs_loaded_wrapper = None
         self._vehicle_getattribute_wrapper = None
+        self._vehicle_start_wg_physics_wrapper = None
+        self._vehicle_starting_wg_physics = None
         self._connect_wrapper = None
         self._disconnect_wrapper = None
 
@@ -285,6 +306,10 @@ class OfflineCompatibility(object):
         if vehicle_type is not None:
             self._original_vehicle_getattribute = vehicle_type.__dict__.get(
                 '__getattribute__', vehicle_type.__getattribute__)
+            self._original_vehicle_start_wg_physics = (
+                vehicle_type.__dict__.get(
+                    '_Vehicle__startWGPhysics',
+                    getattr(vehicle_type, '_Vehicle__startWGPhysics', None)))
         self._original_connect = runtime.bigworld.connect
         self._original_disconnect = runtime.bigworld.disconnect
         compatibility = self
@@ -534,6 +559,12 @@ class OfflineCompatibility(object):
                 avatar, resource_names, resource_refs)
 
         def vehicle_getattribute(vehicle, name):
+            if (name == 'filter' and compatibility._battle_active and
+                    compatibility._vehicle_starting_wg_physics is vehicle):
+                vehicle_filter = (
+                    compatibility._original_vehicle_getattribute(
+                        vehicle, name))
+                return _InitialGunSyncFilterProxy(vehicle_filter)
             if name == 'cell' and compatibility._battle_active:
                 try:
                     return compatibility._original_vehicle_getattribute(
@@ -547,6 +578,20 @@ class OfflineCompatibility(object):
                         except AttributeError:
                             pass
             return compatibility._original_vehicle_getattribute(vehicle, name)
+
+        def vehicle_start_wg_physics(vehicle):
+            original = compatibility._original_vehicle_start_wg_physics
+            if not compatibility._battle_active:
+                return original(vehicle)
+            previous = compatibility._vehicle_starting_wg_physics
+            compatibility._vehicle_starting_wg_physics = vehicle
+            try:
+                # Keep the pinned client's complete physics setup.  The
+                # scoped filter proxy suppresses only its unsafe initial
+                # syncGunAngles native call.
+                return original(vehicle)
+            finally:
+                compatibility._vehicle_starting_wg_physics = previous
 
         def account_getattribute(account, name):
             if name in ('base', 'cell', 'server'):
@@ -708,6 +753,7 @@ class OfflineCompatibility(object):
         self._avatar_vehicle_enter_wrapper = avatar_vehicle_enter
         self._avatar_prereqs_loaded_wrapper = avatar_prereqs_loaded
         self._vehicle_getattribute_wrapper = vehicle_getattribute
+        self._vehicle_start_wg_physics_wrapper = vehicle_start_wg_physics
         self._connect_wrapper = connect
         self._disconnect_wrapper = disconnect
         try:
@@ -733,6 +779,9 @@ class OfflineCompatibility(object):
                 avatar_type.onPrereqsLoaded = avatar_prereqs_loaded
             if vehicle_type is not None:
                 vehicle_type.__getattribute__ = vehicle_getattribute
+                if self._original_vehicle_start_wg_physics is not None:
+                    vehicle_type._Vehicle__startWGPhysics = (
+                        vehicle_start_wg_physics)
             runtime.bigworld.connect = connect
             runtime.bigworld.disconnect = disconnect
             self._installed = True
@@ -809,6 +858,12 @@ class OfflineCompatibility(object):
             avatar_type.onPrereqsLoaded = (
                 self._original_avatar_prereqs_loaded)
         if (vehicle_type is not None and
+                self._original_vehicle_start_wg_physics is not None and
+                vehicle_type.__dict__.get('_Vehicle__startWGPhysics') is
+                self._vehicle_start_wg_physics_wrapper):
+            vehicle_type._Vehicle__startWGPhysics = (
+                self._original_vehicle_start_wg_physics)
+        if (vehicle_type is not None and
                 vehicle_type.__dict__.get('__getattribute__') is
                 self._vehicle_getattribute_wrapper):
             vehicle_type.__getattribute__ = self._original_vehicle_getattribute
@@ -823,6 +878,7 @@ class OfflineCompatibility(object):
                 pass
         self._host = None
         self._host_added = False
+        self._vehicle_starting_wg_physics = None
         self._installed = False
 
     def connect(self, show_lobby=False, account_context=None):

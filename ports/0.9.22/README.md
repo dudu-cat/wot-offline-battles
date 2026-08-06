@@ -9,7 +9,7 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.10` replaces the old compatibility slice. It is a server-backed
+Version `0.3.11` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, tactical bots and repeatable rounds. The removed `vertical_slice.py`
@@ -23,13 +23,16 @@ account starts with 100,000,000 credits, 100,000,000 free XP, 1,000,000 gold,
 2,000 garage slots and 2,000 barracks berths.
 
 This release fixes both halves of the real `#1513` battle-entry boundary. The
-local Vehicle id and `VEHICLE_ADDED` roster are now published before the native
-arena-load controller can request the battle page, while the state transition is
-fenced to `Lobby -> BattleLoading -> Battle`. A returned client-only entity id
-is still not treated as a materialized tank: client ready, `AVATAR_READY` and
-battle period wait for native `onEnterWorld`, registry presence, `inWorld`,
-`isStarted` and a descriptor. Pending remote updates are coalesced until the
-same boundary, and a late removed entity is destroyed instead of orphaned.
+`VEHICLE_ADDED` roster is published before selecting the local Vehicle id, and
+the compatibility wrapper no longer repeats the player-id notifier inside the
+native `vehicle_onEnterWorld` stack. This preserves the stock own-vehicle matrix
+initialization order. The offline-only physics seam also suppresses the one
+initial `WGVehicleFilter.syncGunAngles` call that dereferences an unavailable
+retail filter dependency for client-created entities; all other stock physics
+initialization remains active. A returned client-only entity id is still not
+treated as a materialized tank: client ready, `AVATAR_READY` and battle period
+wait for native `onEnterWorld`, registry presence, `inWorld`, `isStarted` and a
+descriptor.
 
 LAN JSON text is Unicode on the embedded Python 2 runtime, while BigWorld's
 Avatar and Vehicle `STRING` properties require byte strings. The release now
@@ -60,9 +63,10 @@ overwrite the next round.
    connecting also opens it. Any not-yet-accepted client can edit
    `LAN SERVER: host:port` there; this does not grant host authority.
 5. The first waiting player is the room host. Only that client opens the stock
-   training settings window as a local map picker. Its Description field is the
-   editable `LAN SERVER: host:port` endpoint. Later players click the same
-   **Battle!** button, remain in the garage and wait for the host.
+   training settings window as a local map picker. Its Description field shows
+   the editable `LAN SERVER: host:port` endpoint on the first line, the live
+   player list and `CREATE = START BATTLE FOR EVERYONE`. Later players click
+   the same **Battle!** button, remain in the garage and wait for the host.
    If the host closes the picker, it remains closed until that client clicks
    **Battle!** again.
 6. The host chooses one server-offered standard map and uses the window's
@@ -200,8 +204,8 @@ properties and mailboxes at runtime.
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.10.wotmod
-org.peng.offline_lan_0922_0.3.10.wotmod.sha256
+org.peng.offline_lan_0922_0.3.11.wotmod
+org.peng.offline_lan_0922_0.3.11.wotmod.sha256
 WoT-0.9.22-LAN-Client-<release hash>/
 WoT-0.9.22-LAN-Client-<release hash>.zip
 ```

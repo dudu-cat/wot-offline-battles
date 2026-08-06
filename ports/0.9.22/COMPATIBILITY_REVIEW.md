@@ -5,7 +5,7 @@ This review is pinned to the Chinese HD client whose `version.xml` reports
 CPython 2.7 bytecode magic `03 f3 0d 0a`; the embedded build identifies itself
 as Python 2.7.7.
 
-The goal of version 0.3.10 is a complete playable vertical path, not another
+The goal of version 0.3.11 is a complete playable vertical path, not another
 login-only probe: local Account -> stock Lobby/join/map selection -> native map and
 Avatar -> native Vehicle entities -> local movement/aim/fire -> synchronized
 humans and bots -> damage/death/result -> cleanup -> a second round.
@@ -296,18 +296,33 @@ creation. Exact bytecode shows that `Vehicle.prerequisites()` builds appearance
 resources asynchronously: the id returned from client-only `createEntity` can
 exist before `BigWorld.entity(id)` is available. The bridge therefore separates
 metadata from readiness. Immediately after Avatar creation it creates the local
-Vehicle, selects `playerVehicleID`, publishes `VEHICLE_ADDED`, and invokes the
-native `ArenaLoadController.invalidateArenaInfo()`. This establishes
+Vehicle, publishes `VEHICLE_ADDED`, selects `playerVehicleID` while the entity
+is not yet in-world, and invokes the native
+`ArenaLoadController.invalidateArenaInfo()`. This establishes
 `Lobby(4) -> BattleLoading(5)` before a completed space can request
 `Battle(6)`. A scoped AppLoader guard makes both callback orders idempotent: a
 premature battle-page request first establishes loading, while a late loading
 request cannot regress an active battle. The Avatar name/team are seeded from
 the same server roster, so `ArenaDataProvider` can resolve the local entry by id
-or name. Stock `PlayerAvatar.vehicle_onEnterWorld` and its `setClientReady`
-mailbox still run normally; only a later BigWorld callback accepts the entity
-after registry presence, `inWorld`, `isStarted`, and a descriptor are all true.
-`onVehicleChanged`, client attributes, `AVATAR_READY`, and `PERIOD` then publish
-exactly once.
+or name. The compatibility wrapper does not repeat the player-id notifier from
+inside `PlayerAvatar.vehicle_onEnterWorld`: in exact `#1513`, doing so can mark
+`VEHICLE_ENTERED` and start visuals before the native handler initializes its
+own-vehicle matrices. Stock `vehicle_onEnterWorld` and its `setClientReady`
+mailbox therefore run in their original order; only a later BigWorld callback
+accepts the entity after registry presence, `inWorld`, `isStarted`, and a
+descriptor are all true. `onVehicleChanged`, client attributes,
+`AVATAR_READY`, and `PERIOD` then publish exactly once.
+
+A full Windows dump from the first native Vehicle entry placed the access
+violation in `WGVehicleFilter.syncGunAngles`: the client-created entity has no
+retail gun-angle filter dependency at that instant, and the native method
+dereferences its null result. Both reviewed public 0.9.22 observer layers omit
+that same initial call. During the stock private physics initializer only, the
+compatibility layer presents a transparent filter proxy whose
+`syncGunAngles()` is a no-op. Physics creation, descriptor initialization,
+arena bounds, ownership, `setVehiclePhysics`, visibility and speed providers
+remain stock; the proxy is removed even if initialization raises, and normal
+online execution delegates untouched.
 
 Remote Vehicles use the same readiness gate. Their newest health and pose are
 coalesced while prerequisites load. A remote removal before world entry leaves
@@ -371,7 +386,7 @@ The pure-data server planner emits revisioned global `bot_orders`, which the
 0.9.22 authority now uses for macro targets after reporting bounded visibility
 observations. BigWorld terrain, collision, water and slope probes remain local,
 and the client planner is a fallback when no server order is available.
-Base-capture rules are not part of 0.3.10; standard battles currently end by
+Base-capture rules are not part of 0.3.11; standard battles currently end by
 elimination.
 
 ## Reference implementations reviewed

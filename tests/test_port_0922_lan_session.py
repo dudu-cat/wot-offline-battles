@@ -167,22 +167,45 @@ class LANSessionTests(unittest.TestCase):
             self.client.phase = message.get('phase', self.client.phase)
         if 'host_player_id' in message:
             self.client.host_player_id = message['host_player_id']
+        if 'players' in message:
+            self.client.roster = list(message['players'])
         self.client.on_event(kind, message)
 
     def test_waiting_messages_install_and_open_picker_once(self):
-        message = {'phase': 'waiting', 'map_pool': ['01_karelia']}
-        self.emit('welcome', message)
-        self.emit('roster', message)
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
+        self.emit('roster', {
+            'phase': 'waiting', 'map_pool': ['01_karelia'],
+            'players': [{'id': 'p1', 'name': 'Host'}]})
 
         self.assertEqual('waiting', self.session.state)
         self.assertEqual(1, len(self.queues))
         self.assertEqual(1, self.queues[0].install_calls)
-        self.assertEqual(0, self.queues[0].refresh_calls)
+        self.assertEqual(1, self.queues[0].refresh_calls)
         self.assertEqual([True], self.opens)
         self.assertEqual(['01_karelia'], self.queues[0].map_pool())
         self.assertEqual(
-            'LAN SERVER: 10.0.0.5:28782',
+            'LAN SERVER: 10.0.0.5:28782\n'
+            'PLAYERS (1): Host\n'
+            'YOU ARE HOST; OTHERS JOIN WITH BATTLE\n'
+            'CREATE = START BATTLE FOR EVERYONE',
             self.queues[0].endpoint())
+
+    def test_open_picker_description_refreshes_with_live_roster(self):
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
+        queue = self.queues[0]
+
+        self.emit('roster', {
+            'phase': 'waiting', 'map_pool': ['01_karelia'],
+            'players': [
+                {'id': 'p1', 'name': 'Host'},
+                {'id': 'p2', 'name': 'Guest'},
+            ]})
+
+        self.assertEqual(1, queue.refresh_calls)
+        self.assertIn('PLAYERS (2): Host, Guest', queue.endpoint())
+        self.assertEqual([True], self.opens)
 
     def test_install_owns_battle_button_until_join_and_stop(self):
         clients = []
@@ -386,7 +409,10 @@ class LANSessionTests(unittest.TestCase):
         with mock.patch.object(
                 self.module.port_config, 'write_json') as write_json:
             self.assertTrue(self.queues[0].request_start(
-                '01_karelia', 'LAN SERVER: 192.168.1.164:30000'))
+                '01_karelia',
+                'LAN SERVER: 192.168.1.164:30000\n'
+                'PLAYERS (0): waiting for roster\n'
+                'CONNECTING; EDIT THE FIRST LINE IF NEEDED'))
 
         self.assertIsNone(old_client.on_event)
         self.assertEqual(1, old_client.stop_calls)
@@ -706,6 +732,17 @@ class LANSessionTests(unittest.TestCase):
         self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
 
         self.queues[0].on_close()
+
+        self.assertFalse(self.session._picker_open)
+        self.assertEqual([], callbacks)
+        self.assertEqual([True], self.opens)
+
+        self.emit('roster', {
+            'phase': 'waiting', 'map_pool': ['01_karelia'],
+            'players': [
+                {'id': 'p1', 'name': 'Host'},
+                {'id': 'p2', 'name': 'Guest'},
+            ]})
 
         self.assertFalse(self.session._picker_open)
         self.assertEqual([], callbacks)

@@ -1,4 +1,4 @@
-World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.10
+World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.11
 ================================================================
 
 This folder is directly mergeable into the frozen Chinese HD client root.
@@ -30,7 +30,7 @@ Install
 3. Copy this folder's `mods` directory into the game root.
 4. Confirm this file exists:
 
-       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.10.wotmod
+       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.11.wotmod
 
 5. This copy-ready package includes:
 
@@ -67,8 +67,9 @@ Start a battle
    welcome, this settings surface does not grant room-host authority. You can
    also click Battle! again while connecting to open it explicitly.
 6. The first waiting player becomes room host and receives the stock training
-   settings window as a map picker. Its Description field contains
-   `LAN SERVER: host:port`; the host may edit and save it there.
+   settings window as a map picker. Its Description field shows the endpoint,
+   live player list and `CREATE = START BATTLE FOR EVERYONE`; the host may edit
+   the endpoint on the first line and save it there.
 7. Every later player clicks the same Battle! button and waits in the hangar.
    Only the host can choose a standard (`ctf`) map and use the window's primary
    action. The server broadcasts that one selected map to every waiting client.
@@ -87,7 +88,7 @@ Troubleshooting
 ---------------
 
 - `unsupported compression type`: an older or incorrectly compressed wotmod
-  is still present. Keep only the 0.3.10 package; its members use Store method.
+  is still present. Keep only the 0.3.11 package; its members use Store method.
 - No connection in the server terminal: check `config.json`, the host LAN IP,
   virtual-machine network mode and TCP 28782 firewall access. A failed attempt
   automatically opens the native endpoint editor; Battle! can reopen it.

@@ -354,15 +354,18 @@ class QueueUITests(unittest.TestCase):
 
     def test_refresh_replaces_preconnection_catalog_in_the_same_window(self):
         pool = [None]
+        description = ['LAN SERVER: 10.0.0.5:28782\nPLAYERS (0)']
         self.adapter = self.queue_ui.QueueUI(
             lambda *args: self.started.append(args), lambda: pool[0],
-            endpoint=lambda: 'LAN SERVER: 10.0.0.5:28782',
+            endpoint=lambda: description[0],
             runtime=(self.arena_type, _Window))
         self.adapter.install()
         window = _Window({'isOfflineLanPicker': True})
         self.assertEqual(2, len(window.getMapsData()))
 
         pool[0] = ('05_prohorovka',)
+        description[0] = (
+            'LAN SERVER: 10.0.0.5:28782\nPLAYERS (2): Host, Guest')
         self.assertTrue(self.adapter.refresh())
 
         self.assertIs(window, self.adapter._picker_window)
@@ -370,7 +373,7 @@ class QueueUITests(unittest.TestCase):
             row['name'] for row in window.getMapsData()])
         self.assertEqual(1, len(window.data_updates))
         self.assertEqual(
-            'LAN SERVER: 10.0.0.5:28782',
+            'LAN SERVER: 10.0.0.5:28782\nPLAYERS (2): Host, Guest',
             window.data_updates[0][0]['description'])
 
     def test_normal_training_window_fully_forwards(self):

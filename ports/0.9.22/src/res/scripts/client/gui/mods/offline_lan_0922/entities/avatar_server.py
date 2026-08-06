@@ -150,23 +150,38 @@ class AvatarServerBridge(object):
             self._required(snapshot, 'rotation'))
         if created_id is None:
             raise AvatarBridgeError('createEntity returned no Vehicle id')
-        # BigWorld may call Vehicle.onEnterWorld before createEntity returns.
-        # acceptVehicleEnter pre-binds that same entity in the Avatar wrapper.
+        # Record the id returned by BigWorld.  Exact #1513 normally enters the
+        # entity asynchronously, after createEntity has returned.
         if self._vehicle_id is None:
             self._vehicle_id = created_id
         elif self._vehicle_id != created_id:
             self._binding.destroy_entity(created_id)
             raise AvatarBridgeError('BigWorld entered a different Vehicle')
+        selection_attempted = False
         try:
-            # Retail receives playerVehicleID before arena consumers inspect
-            # the vehicle roster.  A client-only createEntity can return its
-            # id before the Vehicle is visible, but the exact Avatar setter
-            # deliberately supports that phase: it records SET_PLAYER_ID and
-            # defers VEHICLE_ENTERED until the entity reaches the world.
-            self._bind_avatar_once(self._vehicle_id)
+            # A synchronous/re-entrant Vehicle.onEnterWorld cannot be made
+            # safe here.  playerVehicleID was necessarily still zero while
+            # the stock handler ran, so it treated the local tank as remote
+            # and skipped the own-vehicle matrix initialization.  Publishing
+            # the id afterwards would only complete a partially initialized
+            # Avatar and can crash the native client.  Tear it down instead.
+            if self._vehicle_enter_started:
+                raise AvatarBridgeError(
+                    'Vehicle entered before createEntity returned')
+            # Publish the roster before playerVehicleID.  The exact Avatar
+            # setter may finish the complete battle GUI/visual lifecycle when
+            # the entity is already in-world, and those consumers immediately
+            # resolve the selected id through ClientArena.
             self._binding.arena_vehicle_added(self._vehicle_id, snapshot)
             self._arena_vehicle_added = True
+            # On the normal #1513 path createEntity returns while Vehicle
+            # prerequisites are still loading.  This setter therefore records
+            # SET_PLAYER_ID only; native vehicle_onEnterWorld later initializes
+            # the own-vehicle matrices and records VEHICLE_ENTERED.
+            selection_attempted = True
+            self._bind_avatar_once(self._vehicle_id)
         except Exception:
+            was_bound = self._bound_vehicle_id is not None
             try:
                 self._binding.destroy_entity(self._vehicle_id)
             finally:
@@ -181,15 +196,16 @@ class AvatarServerBridge(object):
                 self._client_ready = False
                 self._ready_publish_started = False
                 self._ready_publish_error = None
-                try:
-                    self._binding.avatar_select_vehicle(0)
-                except Exception:
-                    pass
+                if was_bound or selection_attempted:
+                    try:
+                        self._binding.avatar_select_vehicle(0)
+                    except Exception:
+                        pass
             raise
         return self._vehicle_id
 
     def acceptVehicleEnter(self, vehicle_id):
-        """Bind the first locally-created Vehicle before stock enter handling."""
+        """Retain the first local Vehicle without pre-empting stock enter."""
         if self._destroyed:
             return False
         vehicle_id = int(vehicle_id)
@@ -201,16 +217,14 @@ class AvatarServerBridge(object):
         elif self._vehicle_id != vehicle_id:
             return False
         self._vehicle_enter_started = True
-        bound_now = self._bind_avatar_once(vehicle_id)
-        if not bound_now:
-            # addVehicleToArena can publish playerVehicleID before the entity
-            # enters the world.  The exact Avatar setter intentionally stops
-            # after SET_PLAYER_ID in that phase.  Re-run the same notifier at
-            # the native enter boundary so it can configure the battle session
-            # provider while the Vehicle is materialized.  A re-entrant
-            # createEntity path binds here for the first time and must not be
-            # notified twice.
-            self._binding.avatar_select_vehicle(vehicle_id)
+        # Do not repeat the playerVehicleID notifier from inside
+        # Vehicle.onEnterWorld.  In exact #1513 that notifier can mark
+        # VEHICLE_ENTERED and synchronously start Vehicle visuals before native
+        # PlayerAvatar.vehicle_onEnterWorld has initialized the own-vehicle
+        # matrices.  The initial post-create bind is sufficient on the normal
+        # asynchronous path.  addVehicleToArena rejects a callback that occurs
+        # re-entrantly before createEntity returns because stock #1513 has
+        # already skipped the local-only matrix initialization at that point.
         return True
 
     def completeVehicleEnter(self, vehicle_id):

@@ -138,7 +138,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.10</version></root>')
+            '<version>0.3.11</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -947,7 +947,20 @@ class OfflineCompatibilityTests(unittest.TestCase):
                                    vehicle.id))
 
         class Vehicle(object):
-            pass
+            def __startWGPhysics(self):
+                operations.extend((
+                    ('vehicle_physics_init',),
+                    ('vehicle_physics_bounds',),
+                    ('vehicle_physics_owner',),
+                    ('vehicle_physics_static_mode',),
+                    ('vehicle_physics_movement_signals',),
+                ))
+                vehicle_filter = self.filter
+                vehicle_filter.setVehiclePhysics(self.physics)
+                operations.append(('vehicle_physics_visibility',))
+                vehicle_filter.syncGunAngles(0.25, -0.5)
+                self.speed_info = vehicle_filter.speedInfo
+                operations.append(('vehicle_physics_speed', self.speed_info))
 
         account_module = types.SimpleNamespace(
             PlayerAccount=PlayerAccount,
@@ -986,6 +999,9 @@ class OfflineCompatibilityTests(unittest.TestCase):
             runtime.avatar_module.PlayerAvatar.__getattribute__
         original_vehicle_getattribute = \
             runtime.vehicle_module.Vehicle.__getattribute__
+        original_vehicle_start_wg_physics = (
+            runtime.vehicle_module.Vehicle.__dict__[
+                '_Vehicle__startWGPhysics'])
         original_connect = runtime.bigworld.connect
         original_disconnect = runtime.bigworld.disconnect
         original_clear_all_spaces = runtime.bigworld.clearAllSpaces
@@ -1063,9 +1079,88 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertIs(
             original_vehicle_getattribute,
             runtime.vehicle_module.Vehicle.__getattribute__)
+        self.assertIs(
+            original_vehicle_start_wg_physics,
+            runtime.vehicle_module.Vehicle.__dict__[
+                '_Vehicle__startWGPhysics'])
         self.assertEqual(original_connect, runtime.bigworld.connect)
         self.assertEqual(original_disconnect, runtime.bigworld.disconnect)
         self.assertEqual([], runtime.predefined_hosts._hosts)
+
+    def test_offline_vehicle_physics_skips_only_initial_native_gun_sync(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        vehicle_type = runtime.vehicle_module.Vehicle
+        original = vehicle_type.__dict__['_Vehicle__startWGPhysics']
+
+        class VehicleFilter(object):
+            speedInfo = 'native-speed-info'
+
+            def setVehiclePhysics(self, physics):
+                operations.append(('vehicle_filter_physics', physics))
+
+            def syncGunAngles(self, yaw, pitch):
+                operations.append(('unsafe_initial_gun_sync', yaw, pitch))
+
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+
+        normal_vehicle = vehicle_type()
+        normal_vehicle.filter = VehicleFilter()
+        normal_vehicle.physics = 'normal-physics'
+        normal_vehicle._Vehicle__startWGPhysics()
+        self.assertIn(
+            ('unsafe_initial_gun_sync', 0.25, -0.5), operations)
+
+        operations[:] = []
+        compatibility.configure_battle()
+        operations[:] = []
+        offline_vehicle = vehicle_type()
+        offline_vehicle.filter = VehicleFilter()
+        offline_vehicle.physics = 'offline-physics'
+        offline_vehicle._Vehicle__startWGPhysics()
+
+        self.assertEqual(
+            [
+                ('vehicle_physics_init',),
+                ('vehicle_physics_bounds',),
+                ('vehicle_physics_owner',),
+                ('vehicle_physics_static_mode',),
+                ('vehicle_physics_movement_signals',),
+                ('vehicle_filter_physics', 'offline-physics'),
+                ('vehicle_physics_visibility',),
+                ('vehicle_physics_speed', 'native-speed-info'),
+            ],
+            operations)
+        self.assertIsNone(compatibility._vehicle_starting_wg_physics)
+
+        compatibility.fini()
+        self.assertIs(
+            original,
+            vehicle_type.__dict__['_Vehicle__startWGPhysics'])
+
+    def test_vehicle_physics_scope_is_cleared_when_stock_setup_raises(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, _ = self._runtime()
+        vehicle_type = runtime.vehicle_module.Vehicle
+
+        class FailingFilter(object):
+            def setVehiclePhysics(self, physics):
+                raise RuntimeError('native physics setup failed')
+
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        vehicle = vehicle_type()
+        vehicle.filter = FailingFilter()
+        vehicle.physics = object()
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'native physics setup failed'):
+            vehicle._Vehicle__startWGPhysics()
+
+        self.assertIsNone(compatibility._vehicle_starting_wg_physics)
+        self.assertIs(vehicle.filter, vehicle.__dict__['filter'])
+        compatibility.fini()
 
     def test_manual_offline_host_login_prepares_account_properties(self):
         compatibility_module = _load_port_source('compat')
@@ -1747,6 +1842,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
             avatar_type.__dict__['onEnterWorld'],
             avatar_type.__dict__['onLeaveWorld'],
             vehicle_type.__getattribute__,
+            vehicle_type.__dict__['_Vehicle__startWGPhysics'],
             runtime.bigworld.connect,
             runtime.bigworld.disconnect,
         )
@@ -1773,13 +1869,16 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertIs(originals[4], avatar_type.__dict__['onEnterWorld'])
         self.assertIs(originals[5], avatar_type.__dict__['onLeaveWorld'])
         self.assertIs(originals[6], vehicle_type.__getattribute__)
-        self.assertIs(originals[7].__func__,
-                      runtime.bigworld.connect.__func__)
-        self.assertIs(originals[7].__self__,
-                      runtime.bigworld.connect.__self__)
+        self.assertIs(
+            originals[7],
+            vehicle_type.__dict__['_Vehicle__startWGPhysics'])
         self.assertIs(originals[8].__func__,
-                      runtime.bigworld.disconnect.__func__)
+                      runtime.bigworld.connect.__func__)
         self.assertIs(originals[8].__self__,
+                      runtime.bigworld.connect.__self__)
+        self.assertIs(originals[9].__func__,
+                      runtime.bigworld.disconnect.__func__)
+        self.assertIs(originals[9].__self__,
                       runtime.bigworld.disconnect.__self__)
 
     def test_lobby_restore_does_not_replace_an_existing_player(self):
@@ -2311,7 +2410,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.10'
+        package.PORT_VERSION = '0.3.11'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []
