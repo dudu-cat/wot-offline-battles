@@ -147,7 +147,12 @@ EXPECTED_ABI = {
         'PlayerAvatar.prerequisites': ('self',),
         'PlayerAvatar.set_playerVehicleID': ('self', 'prev'),
         'PlayerAvatar.__onSetOwnVehicleAuxPhysicsData': ('self', 'prev'),
+        'PlayerAvatar.__onArenaPeriodChange': (
+            'self', 'period', 'periodEndTime', 'periodLength',
+            'periodAdditionalInfo'),
+        'PlayerAvatar.__setIsOnArena': ('self', 'onArena'),
         'PlayerAvatar.__onInitStepCompleted': ('self',),
+        'PlayerAvatar.moveVehicle': ('self', 'flags', 'isKeyDown'),
         'PlayerAvatar.vehicle_onEnterWorld': ('self', 'vehicle'),
         'PlayerAvatar.updateVehicleHealth': (
             'self', 'vehicleID', 'health', 'deathReasonID', 'isCrewActive',
@@ -404,6 +409,11 @@ EXPECTED_CODE_NAMES = {
             'playerVehicleID', 'VEHICLE_ENTERED',
             '_PlayerAvatar__onInitStepCompleted'),
         'PlayerAvatar.__onInitStepCompleted': ('setClientReady',),
+        'PlayerAvatar.__onArenaPeriodChange': (
+            '_PlayerAvatar__setIsOnArena', 'ARENA_PERIOD', 'BATTLE'),
+        'PlayerAvatar.__setIsOnArena': (
+            'moveVehicle', 'makeVehicleMovementCommandByKeys'),
+        'PlayerAvatar.moveVehicle': ('base', 'vehicle_moveWith'),
     },
     'scripts/client/Vehicle.pyc': {
         'Vehicle.__startWGPhysics': ('filter', 'syncGunAngles', 'speedInfo'),

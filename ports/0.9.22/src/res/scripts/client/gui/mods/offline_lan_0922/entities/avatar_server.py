@@ -337,12 +337,17 @@ class AvatarServerBridge(object):
             self._binding.avatar_vehicle_entered()
             self._binding.avatar_client_ready()
             self._binding.avatar_ready()
+            # Exact #1513 handles the PERIOD update synchronously.  Its
+            # PlayerAvatar.__setIsOnArena path immediately calls moveVehicle,
+            # so the mailbox must accept input before entering that callback.
+            # All entity/materialization gates above have passed already.
+            self._client_ready = True
             self._binding.arena_period('battle')
         except Exception as error:
+            self._client_ready = False
             self._ready_publish_error = str(error)
             raise
         self._ready_requested = False
-        self._client_ready = True
         if callable(self._on_ready):
             self._on_ready()
         return True

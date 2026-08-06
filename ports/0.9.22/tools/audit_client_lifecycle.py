@@ -51,6 +51,25 @@ ORDERED_USES = (
         'native readiness scans materialized Vehicles before the mailbox',
     ),
     (
+        'scripts/client/Avatar.pyc',
+        'PlayerAvatar.__onArenaPeriodChange',
+        ('_PlayerAvatar__setIsOnArena', 'ARENA_PERIOD', 'BATTLE'),
+        'battle period synchronously enters the playable arena state',
+    ),
+    (
+        'scripts/client/Avatar.pyc',
+        'PlayerAvatar.__setIsOnArena',
+        ('_PlayerAvatar__isOnArena', 'moveVehicle',
+         'makeVehicleMovementCommandByKeys', 'False'),
+        'arena entry synchronously sends the initial movement command',
+    ),
+    (
+        'scripts/client/Avatar.pyc',
+        'PlayerAvatar.moveVehicle',
+        ('base', 'vehicle_moveWith'),
+        'initial movement reaches the Avatar server mailbox synchronously',
+    ),
+    (
         'scripts/client/gui/ClientHangarSpace.pyc',
         '_VehicleAppearance.__startBuild',
         ('BigWorld', 'loadResourceListBG',

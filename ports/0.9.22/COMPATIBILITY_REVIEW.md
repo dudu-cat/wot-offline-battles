@@ -5,7 +5,7 @@ This review is pinned to the Chinese HD client whose `version.xml` reports
 CPython 2.7 bytecode magic `03 f3 0d 0a`; the embedded build identifies itself
 as Python 2.7.7.
 
-The goal of version 0.3.12 is a complete playable vertical path, not another
+The goal of version 0.3.13 is a complete playable vertical path, not another
 login-only probe: local Account -> stock Lobby/join/map selection -> native map and
 Avatar -> native Vehicle entities -> local movement/aim/fire -> synchronized
 humans and bots -> damage/death/result -> cleanup -> a second round.
@@ -313,6 +313,16 @@ accepts the entity after registry presence, `inWorld`, `isStarted`, and a
 descriptor are all true. `onVehicleChanged`, client attributes,
 `AVATAR_READY`, and `PERIOD` then publish exactly once.
 
+The final `PERIOD` publication is itself a synchronous mailbox boundary in
+exact `#1513`: `PlayerAvatar.__onArenaPeriodChange()` calls
+`__setIsOnArena(True)`, which immediately calls `moveVehicle(..., False)` and
+then `Avatar.base.vehicle_moveWith(flags)` before `updateArena()` returns. The
+bridge opens `_client_ready` only after every materialization gate and the
+preceding ready publications have passed, but before entering that period
+callback. If period publication raises, the input gate is closed again and the
+first failure remains latched. The lifecycle audit pins all three stock methods
+and their synchronous call order.
+
 Two full Windows dumps isolated the complete client-created Vehicle filter
 boundary. The first access violation was in `WGVehicleFilter.syncGunAngles`
 inside `Vehicle.__startWGPhysics`; the second run passed that address and
@@ -396,7 +406,7 @@ The pure-data server planner emits revisioned global `bot_orders`, which the
 0.9.22 authority now uses for macro targets after reporting bounded visibility
 observations. BigWorld terrain, collision, water and slope probes remain local,
 and the client planner is a fallback when no server order is available.
-Base-capture rules are not part of 0.3.12; standard battles currently end by
+Base-capture rules are not part of 0.3.13; standard battles currently end by
 elimination.
 
 ## Reference implementations reviewed

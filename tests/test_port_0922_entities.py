@@ -511,6 +511,31 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertEqual([(6, {'wins': 0, 'losses': 0})],
                          avatar.account_stats)
 
+    def test_period_reentry_accepts_stock_initial_move(self):
+        module = _avatar_bridge_module()
+        binding = _BridgeBinding()
+        avatar = _BridgeAvatar()
+        sender = _Sender()
+        bridge = module.AvatarServerBridge(
+            avatar, binding,
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            sender)
+        original_arena_period = binding.arena_period
+
+        def arena_period(period):
+            original_arena_period(period)
+            bridge.vehicle_moveWith(0)
+
+        binding.arena_period = arena_period
+        self.assertEqual(91, bridge.addVehicleToArena(_snapshot()))
+        self.assertTrue(bridge.acceptVehicleEnter(91))
+        self.assertTrue(bridge.setClientReady())
+        self.assertTrue(bridge.completeVehicleEnter(91))
+
+        self.assertTrue(bridge.flushClientReady())
+        self.assertEqual([(91, 'move', {'flags': 0})], sender.events)
+
     def test_reentrant_vehicle_enter_fails_closed_before_registration(self):
         module = _avatar_bridge_module()
         binding = _ReentrantBridgeBinding()
@@ -674,6 +699,9 @@ class AvatarServerBridgeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, 'client ready failed'):
             bridge.flushClientReady()
+        with self.assertRaisesRegex(
+                module.AvatarBridgeError, 'Vehicle is not ready'):
+            bridge.vehicle_moveWith(0)
         with self.assertRaisesRegex(
                 module.AvatarBridgeError, 'client ready failed'):
             bridge.flushClientReady()
