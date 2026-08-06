@@ -23,6 +23,118 @@ class BotNavigationTest(unittest.TestCase):
     def setUp(self):
         self.navigation = load_navigation()
 
+    @staticmethod
+    def baked_graph(width, height, blocked=()):
+        directions = (
+            (-1, -1), (0, -1), (1, -1),
+            (-1, 0), (1, 0),
+            (-1, 1), (0, 1), (1, 1),
+        )
+        blocked = set(blocked)
+        heights = [0 if (x, z) not in blocked else None
+                   for z in range(height) for x in range(width)]
+        links = [0] * (width * height)
+        for z in range(height):
+            for x in range(width):
+                index = z * width + x
+                if heights[index] is None:
+                    continue
+                for direction_index, (dx, dz) in enumerate(directions):
+                    nx, nz = x + dx, z + dz
+                    if not (0 <= nx < width and 0 <= nz < height):
+                        continue
+                    if heights[nz * width + nx] is None:
+                        continue
+                    if dx and dz:
+                        if (heights[z * width + nx] is None or
+                                heights[nz * width + x] is None):
+                            continue
+                    links[index] |= 1 << direction_index
+        return {
+            "format": "offhangar-navgraph",
+            "version": 1,
+            "cell_size": 4.0,
+            "origin": [10.0, 20.0],
+            "bounds": [8.0, 18.0, 10.0 + width * 4.0,
+                       20.0 + height * 4.0],
+            "width": width,
+            "height": height,
+            "heights_mm": heights,
+            "links": links,
+        }
+
+    def test_prebaked_astar_uses_shipped_links_without_engine_probes(self):
+        probe_calls = []
+
+        def forbidden_probe(*args):
+            probe_calls.append(args)
+            raise AssertionError("prebaked navigation must not probe the engine")
+
+        graph = self.baked_graph(5, 3, blocked=((2, 0),))
+        grid = self.navigation.TerrainGrid(
+            forbidden_probe, obstacle_probe=forbidden_probe,
+            baked_graph=graph,
+        )
+
+        path = grid.plan((10.0, 0.0, 20.0), (26.0, 0.0, 20.0),
+                         max_expansions=100)
+
+        self.assertTrue(path)
+        self.assertGreater(max(point[2] for point in path), 20.0)
+        self.assertEqual([], probe_calls)
+        self.assertEqual((0, 0), grid.cell_for((10.0, 0.0, 20.0)))
+
+    def test_prebaked_navigator_uses_larger_cheap_search_budget(self):
+        navigator = self.navigation.TerrainNavigator(
+            lambda *args: None, baked_graph=self.baked_graph(3, 3)
+        )
+
+        self.assertTrue(navigator.grid.prebaked)
+        self.assertEqual(4.0, navigator.grid.cell_size)
+        self.assertEqual(768, navigator.search_budget_per_frame)
+        self.assertEqual(4096, navigator.search_max_expansions)
+
+    def test_shipped_lakeville_graph_connects_every_route_both_ways(self):
+        graph_path = (
+            ROOT / "scripts/client/gui/mods/offhangar/navgraphs/07_lakeville.json"
+        )
+        maps_path = (
+            ROOT / "scripts/client/gui/mods/offhangar/bot_ai_maps_group_a.py"
+        )
+        import json
+        graph = json.loads(graph_path.read_text())
+        spec = importlib.util.spec_from_file_location(
+            "bot_ai_maps_group_a_route_audit", maps_path
+        )
+        maps = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(maps)
+        probe_calls = []
+
+        def forbidden_probe(*args):
+            probe_calls.append(args)
+            raise AssertionError("the shipped graph must be self-contained")
+
+        grid = self.navigation.TerrainGrid(
+            forbidden_probe, obstacle_probe=forbidden_probe,
+            baked_graph=graph,
+        )
+        segment_count = 0
+        for team in (1, 2):
+            enemy_base = maps.LAKEVILLE["bases"][3 - team]
+            for route in maps.LAKEVILLE["routes"][team]:
+                points = [(point[0], 0.0, point[1])
+                          for point in route["waypoints"]]
+                points.append((enemy_base[0], 0.0, enemy_base[1]))
+                for start, goal in zip(points, points[1:]):
+                    segment_count += 1
+                    self.assertTrue(
+                        grid.plan(start, goal, max_expansions=4096),
+                        (team, route["id"], start, goal),
+                    )
+
+        self.assertEqual(50, segment_count)
+        self.assertEqual([], probe_calls)
+
     def test_astar_routes_around_an_unsupported_ravine(self):
         def ground(x, z, hint):
             if -1.25 < x < 1.25 and z < 3.0:

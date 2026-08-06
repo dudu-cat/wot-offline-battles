@@ -181,6 +181,7 @@ class BotAITest(unittest.TestCase):
         group_index = bootstrap.index("'bot_ai_maps_group_a'")
         maps_index = bootstrap.index("'bot_ai_maps',")
         ai_index = bootstrap.index("'bot_ai',")
+        prebaked_index = bootstrap.index("'prebaked_navigation'")
         navigation_index = bootstrap.index("'bot_ai_navigation'")
         cover_index = bootstrap.index("'bot_ai_cover'")
         driver_index = bootstrap.index("'bot_ai_driver'")
@@ -188,7 +189,8 @@ class BotAITest(unittest.TestCase):
 
         self.assertLess(group_index, maps_index)
         self.assertLess(maps_index, ai_index)
-        self.assertLess(ai_index, navigation_index)
+        self.assertLess(ai_index, prebaked_index)
+        self.assertLess(prebaked_index, navigation_index)
         self.assertLess(navigation_index, cover_index)
         self.assertLess(cover_index, driver_index)
         self.assertLess(driver_index, battle_index)

@@ -37,11 +37,20 @@ class TerrainGrid(object):
 	)
 
 	def __init__(self, ground_probe, obstacle_probe=None, bounds=None,
-			cell_size=18.0, max_grade_up=0.48, max_grade_down=0.38):
+			cell_size=18.0, max_grade_up=0.48, max_grade_down=0.38,
+			baked_graph=None):
 		self.ground_probe = ground_probe
 		self.obstacle_probe = obstacle_probe
 		self.bounds = bounds
 		self.cell_size = max(1.0, float(cell_size))
+		self.prebaked = False
+		self._baked_origin = (0.0, 0.0)
+		self._baked_width = 0
+		self._baked_height = 0
+		self._baked_heights = ()
+		self._baked_links = ()
+		if baked_graph is not None:
+			self._install_baked_graph(baked_graph)
 		self.max_grade_up = float(max_grade_up)
 		self.max_grade_down = float(max_grade_down)
 		# Weighted A* deliberately favours forward progress over a perfectly
@@ -53,13 +62,76 @@ class TerrainGrid(object):
 		self._segment_cache = {}
 		self._failed_edges = {}
 
+	def _install_baked_graph(self, graph):
+		if (graph.get('format') != 'offhangar-navgraph' or
+				int(graph.get('version', -1)) != 1):
+			raise ValueError('unsupported baked navigation graph')
+		width = int(graph.get('width', 0))
+		height = int(graph.get('height', 0))
+		heights = graph.get('heights_mm') or ()
+		links = graph.get('links') or ()
+		origin = graph.get('origin') or ()
+		if (width <= 0 or height <= 0 or len(origin) != 2 or
+				len(heights) != width * height or len(links) != width * height):
+			raise ValueError('invalid baked navigation graph')
+		self.cell_size = max(1.0, float(graph.get('cell_size', 0.0)))
+		self._baked_origin = (float(origin[0]), float(origin[1]))
+		self._baked_width = width
+		self._baked_height = height
+		self._baked_heights = heights
+		self._baked_links = links
+		self.bounds = tuple(graph.get('bounds') or self.bounds or ()) or None
+		self.prebaked = True
+
 	def cell_for(self, point):
-		return (int(math.floor(float(point[0]) / self.cell_size + 0.5)),
-		        int(math.floor(float(point[2]) / self.cell_size + 0.5)))
+		origin_x, origin_z = self._baked_origin if self.prebaked else (0.0, 0.0)
+		return (int(math.floor((float(point[0]) - origin_x) /
+		                       self.cell_size + 0.5)),
+		        int(math.floor((float(point[2]) - origin_z) /
+		                       self.cell_size + 0.5)))
 
 	def point_for(self, cell, height):
-		return (cell[0] * self.cell_size, float(height),
-		        cell[1] * self.cell_size)
+		origin_x, origin_z = self._baked_origin if self.prebaked else (0.0, 0.0)
+		return (origin_x + cell[0] * self.cell_size, float(height),
+		        origin_z + cell[1] * self.cell_size)
+
+	def _baked_index(self, cell):
+		if not self.prebaked:
+			return None
+		x, z = cell
+		if x < 0 or x >= self._baked_width or z < 0 or z >= self._baked_height:
+			return None
+		index = z * self._baked_width + x
+		if self._baked_heights[index] is None:
+			return None
+		return index
+
+	def _baked_cell_height(self, cell):
+		index = self._baked_index(cell)
+		if index is None:
+			return None
+		return float(self._baked_heights[index]) / 1000.0
+
+	def _nearest_baked_cell(self, cell, max_radius):
+		if self._baked_index(cell) is not None:
+			return cell
+		best = None
+		best_distance = None
+		for radius in range(1, max(0, int(max_radius)) + 1):
+			for z in range(cell[1] - radius, cell[1] + radius + 1):
+				for x in range(cell[0] - radius, cell[0] + radius + 1):
+					if max(abs(x - cell[0]), abs(z - cell[1])) != radius:
+						continue
+					candidate = (x, z)
+					if self._baked_index(candidate) is None:
+						continue
+					distance = ((x - cell[0]) ** 2 + (z - cell[1]) ** 2)
+					if best_distance is None or distance < best_distance:
+						best = candidate
+						best_distance = distance
+			if best is not None:
+				return best
+		return None
 
 	def _inside(self, x, z):
 		if self.bounds is None:
@@ -176,6 +248,8 @@ class TerrainGrid(object):
 	def _ground(self, x, z, hint_y):
 		if not self._inside(x, z):
 			return None
+		if self.prebaked:
+			return self._baked_cell_height(self.cell_for((x, hint_y, z)))
 		key = (int(math.floor(x * 10.0 + 0.5)),
 		       int(math.floor(z * 10.0 + 0.5)), self._layer(hint_y))
 		if key in self._ground_cache:
@@ -193,6 +267,32 @@ class TerrainGrid(object):
 		"""Check continuous support and drivable grade, not just both endpoints."""
 		distance = _distance_2d(start, end)
 		if distance < 0.25:
+			return True
+		if self.prebaked:
+			start_cell = self._nearest_baked_cell(self.cell_for(start), 2)
+			end_cell = self.cell_for(end)
+			if start_cell is None or self._baked_index(end_cell) is None:
+				return False
+			if start_cell == end_cell:
+				return True
+			x, z = start_cell
+			target_x, target_z = end_cell
+			dx = abs(target_x - x)
+			dz = abs(target_z - z)
+			step_x = 1 if x < target_x else -1
+			step_z = 1 if z < target_z else -1
+			error = dx - dz
+			while x != target_x or z != target_z:
+				old_cell = (x, z)
+				double_error = error * 2
+				if double_error > -dz:
+					error -= dz
+					x += step_x
+				if double_error < dx:
+					error += dx
+					z += step_z
+				if self._baked_edge_height(old_cell, (x, z)) is None:
+					return False
 			return True
 		start_key = self._point_key(start)
 		end_key = self._point_key(end)
@@ -236,12 +336,15 @@ class TerrainGrid(object):
 		return clear
 
 	def _edge(self, cell, height, next_cell):
+		if self.prebaked:
+			return self._baked_edge_height(cell, next_cell)
 		key = (cell, next_cell, self._layer(height))
 		if key in self._edge_cache:
 			return self._edge_cache[key]
 		start = self.point_for(cell, height)
-		x = next_cell[0] * self.cell_size
-		z = next_cell[1] * self.cell_size
+		point = self.point_for(next_cell, height)
+		x = point[0]
+		z = point[2]
 		end_y = self._ground(x, z, height)
 		if end_y is None:
 			result = None
@@ -251,11 +354,29 @@ class TerrainGrid(object):
 		self._edge_cache[key] = result
 		return result
 
+	def _baked_edge_height(self, cell, next_cell):
+		index = self._baked_index(cell)
+		next_index = self._baked_index(next_cell)
+		if index is None or next_index is None:
+			return None
+		dx = next_cell[0] - cell[0]
+		dz = next_cell[1] - cell[1]
+		direction_index = None
+		for candidate, neighbour in enumerate(self._NEIGHBOURS):
+			if neighbour[0] == dx and neighbour[1] == dz:
+				direction_index = candidate
+				break
+		if (direction_index is None or
+				not (int(self._baked_links[index]) & (1 << direction_index))):
+			return None
+		return float(self._baked_heights[next_index]) / 1000.0
+
 	def _penalty(self, cell, avoid_points):
 		if not avoid_points:
 			return 0.0
-		x = cell[0] * self.cell_size
-		z = cell[1] * self.cell_size
+		point = self.point_for(cell, 0.0)
+		x = point[0]
+		z = point[2]
 		penalty = 0.0
 		for point in avoid_points:
 			dx = x - float(point[0])
@@ -321,9 +442,19 @@ class TerrainGrid(object):
 	def _plan_steps(self, start, goal, avoid_points, max_expansions, now):
 		start_cell = self.cell_for(start)
 		goal_cell = self.cell_for(goal)
-		start_y = self._ground(float(start[0]), float(start[2]), float(start[1]))
-		if start_y is None:
-			start_y = float(start[1])
+		if self.prebaked:
+			# The baker accepts tactical annotations up to 24 metres from the
+			# retained graph. Use the same six-cell contract at runtime.
+			start_cell = self._nearest_baked_cell(start_cell, 6)
+			goal_cell = self._nearest_baked_cell(goal_cell, 6)
+			if start_cell is None or goal_cell is None:
+				yield ()
+				return
+			start_y = self._baked_cell_height(start_cell)
+		else:
+			start_y = self._ground(float(start[0]), float(start[2]), float(start[1]))
+			if start_y is None:
+				start_y = float(start[1])
 		frontier = []
 		sequence = 0
 		heapq.heappush(frontier, (0.0, sequence, start_cell))
@@ -354,7 +485,7 @@ class TerrainGrid(object):
 				next_y = self._edge(current, current_y, next_cell)
 				if next_y is None:
 					continue
-				if offset_x and offset_z:
+				if offset_x and offset_z and not self.prebaked:
 					# Do not squeeze diagonally across a blocked corner.
 					if (self._edge(current, current_y,
 					               (current[0] + offset_x, current[1])) is None or
@@ -400,7 +531,10 @@ class TerrainGrid(object):
 		while cells[-1] != start_cell:
 			cells.append(came_from[cells[-1]])
 		cells.reverse()
-		path = [(float(start[0]), start_y, float(start[2]))]
+		if self.prebaked:
+			path = [self.point_for(start_cell, start_y)]
+		else:
+			path = [(float(start[0]), start_y, float(start[2]))]
 		for cell in cells[1:]:
 			path.append(self.point_for(cell, heights[cell]))
 		goal_y = self._ground(float(goal[0]), float(goal[2]), path[-1][1])
@@ -457,8 +591,9 @@ class TerrainNavigator(object):
 	"""Shared strategic path cache plus per-bot path following and recovery."""
 
 	def __init__(self, ground_probe, obstacle_probe=None, bounds=None,
-			cell_size=18.0):
-		self.grid = TerrainGrid(ground_probe, obstacle_probe, bounds, cell_size)
+			cell_size=18.0, baked_graph=None):
+		self.grid = TerrainGrid(ground_probe, obstacle_probe, bounds, cell_size,
+		                        baked_graph=baked_graph)
 		self.paths = {}
 		self.path_times = {}
 		self.searches = {}
@@ -473,6 +608,13 @@ class TerrainNavigator(object):
 		# 29-bot room from waiting tens of seconds for 1600 expansions per job; the
 		# continuation search starts after the bot reaches that safe endpoint.
 		self.search_max_expansions = 128
+		if self.grid.prebaked:
+			# Static link lookups are cheap; spend a few milliseconds completing a
+			# useful route instead of returning 128-node partial paths forever.
+			self.search_budget_per_frame = 768
+			self.search_budget_per_path = 32
+			self.search_time_budget = 0.006
+			self.search_max_expansions = 4096
 		self.search_completed = 0
 		self.search_failed = 0
 		self.search_now = 0.0

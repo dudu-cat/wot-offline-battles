@@ -1688,6 +1688,13 @@ def _offh_ai_navigator(director):
 		return navigator
 	import BigWorld, Math, math
 	from gui.mods.offhangar.bot_ai_navigation import TerrainNavigator
+	baked_graph = None
+	try:
+		from gui.mods.offhangar.prebaked_navigation import load_graph
+		baked_graph = load_graph(getattr(director, 'map_name', ''))
+	except Exception as error:
+		LOG_ERROR('OfflineBattle.SMART_AI prebaked navigation rejected: %s' %
+		          str(error))
 
 	def _ground_probe(x, z, hint_y):
 		# Stay on the current terrain layer. A long top-down ray can select a
@@ -1736,10 +1743,17 @@ def _offh_ai_navigator(director):
 		return False
 
 	navigator = TerrainNavigator(_ground_probe, _obstacle_probe,
-	                             getattr(director, 'bounds', None), 18.0)
+	                             getattr(director, 'bounds', None), 18.0,
+	                             baked_graph=baked_graph)
 	globals()['g_offh_terrain_navigator'] = navigator
 	globals()['g_offh_ai_water_guard_total'] = 0
-	LOG_DEBUG('OfflineBattle.SMART_AI terrain navigation enabled cell=18m')
+	if baked_graph is not None:
+		LOG_NOTE('OfflineBattle.SMART_AI using baked navigation map=%s cell=%.1fm nodes=%d' % (
+			getattr(director, 'map_name', ''), navigator.grid.cell_size,
+			sum(1 for value in baked_graph.get('heights_mm', ())
+			    if value is not None)))
+	else:
+		LOG_DEBUG('OfflineBattle.SMART_AI runtime navigation enabled cell=18m')
 	return navigator
 
 
@@ -6338,17 +6352,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									LOG_DEBUG('OfflineBattle: spawn corrected to line-up slot:', _sx, _gy, _sz)
 					except Exception as _sce:
 						LOG_DEBUG('Spawn correction error:', str(_sce))
-
-				# Lakeville-only native-navigation experiment. It is a one-shot loader/API
-				# diagnostic and does not feed any result into bot movement.
-				try:
-					from gui.mods.offhangar.native_navmesh_probe import maybe_run as _run_native_navmesh_probe
-					_run_native_navmesh_probe(
-						player, globals().get('g_offh_battle_mapname', ''),
-						Math.Vector3(veh_pos[0], veh_pos[1], veh_pos[2]),
-						_offh_my_gen[0])
-				except Exception as _npe:
-					LOG_DEBUG('Native navmesh probe dispatch error:', str(_npe))
 
 				import debug_utils
 				if not hasattr(player, '_debug_dump_done_6'):
