@@ -1681,11 +1681,36 @@ def _offh_ai_director(player):
 	return director
 
 
+def _offh_ai_navigation_failure(stage, error):
+	"""Report navigation failures loudly without disabling tactical bot AI."""
+	key = 'g_offh_ai_navigation_error_' + str(stage)
+	if globals().get(key, False):
+		return
+	globals()[key] = True
+	try:
+		import traceback
+		detail = traceback.format_exc()
+	except Exception:
+		detail = '<traceback unavailable>'
+	LOG_ERROR('OfflineBattle.SMART_AI navigation failure stage=%s error=%s' % (
+		str(stage), str(error)))
+	LOG_ERROR(detail)
+	try:
+		from gui.SystemMessages import SM_TYPE, pushMessage
+		message = ('Baked navigation failed at %s; bots are using the safe fallback. '
+		           'See python.log.' % str(stage))
+		pushMessage(message.encode('utf-8'), SM_TYPE.Error)
+	except Exception:
+		pass
+
+
 def _offh_ai_navigator(director):
 	"""Create the shared terrain graph used below the strategic director."""
 	navigator = globals().get('g_offh_terrain_navigator')
 	if navigator is not None:
 		return navigator
+	if globals().get('g_offh_ai_navigation_disabled', False):
+		return None
 	import BigWorld, Math, math
 	from gui.mods.offhangar.bot_ai_navigation import TerrainNavigator
 	baked_graph = None
@@ -1693,8 +1718,7 @@ def _offh_ai_navigator(director):
 		from gui.mods.offhangar.prebaked_navigation import load_graph
 		baked_graph = load_graph(getattr(director, 'map_name', ''))
 	except Exception as error:
-		LOG_ERROR('OfflineBattle.SMART_AI prebaked navigation rejected: %s' %
-		          str(error))
+		_offh_ai_navigation_failure('load', error)
 
 	def _ground_probe(x, z, hint_y):
 		# Stay on the current terrain layer. A long top-down ray can select a
@@ -1742,18 +1766,34 @@ def _offh_ai_navigator(director):
 					return True
 		return False
 
-	navigator = TerrainNavigator(_ground_probe, _obstacle_probe,
-	                             getattr(director, 'bounds', None), 18.0,
-	                             baked_graph=baked_graph)
+	if baked_graph is not None:
+		try:
+			navigator = TerrainNavigator(_ground_probe, _obstacle_probe,
+			                             getattr(director, 'bounds', None), 18.0,
+			                             baked_graph=baked_graph)
+		except Exception as error:
+			_offh_ai_navigation_failure('construct_baked', error)
+			navigator = None
+	else:
+		navigator = None
+	if navigator is None:
+		try:
+			navigator = TerrainNavigator(_ground_probe, _obstacle_probe,
+			                             getattr(director, 'bounds', None), 18.0)
+		except Exception as error:
+			_offh_ai_navigation_failure('construct_runtime', error)
+			globals()['g_offh_ai_navigation_disabled'] = True
+			return None
 	globals()['g_offh_terrain_navigator'] = navigator
 	globals()['g_offh_ai_water_guard_total'] = 0
-	if baked_graph is not None:
+	if baked_graph is not None and navigator.grid.prebaked:
 		LOG_NOTE('OfflineBattle.SMART_AI using baked navigation map=%s cell=%.1fm nodes=%d' % (
 			getattr(director, 'map_name', ''), navigator.grid.cell_size,
 			sum(1 for value in baked_graph.get('heights_mm', ())
 			    if value is not None)))
 	else:
-		LOG_DEBUG('OfflineBattle.SMART_AI runtime navigation enabled cell=18m')
+		LOG_NOTE('OfflineBattle.SMART_AI using runtime navigation map=%s cell=18m' %
+		         getattr(director, 'map_name', ''))
 	return navigator
 
 
@@ -2495,6 +2535,10 @@ def _offh_battle_sweep(tag='exit'):
 		globals().pop('g_offh_ai_cover_cursor', None)
 		globals().pop('g_offh_ai_contacts_t', None)
 		globals().pop('g_offh_ai_init_error_logged', None)
+		globals().pop('g_offh_ai_navigation_disabled', None)
+		for _nav_error_key in [value for value in globals()
+		                       if value.startswith('g_offh_ai_navigation_error_')]:
+			globals().pop(_nav_error_key, None)
 		_stage = 'models'
 		try:
 			# Unregister always-update FIRST. The list is drained again later, but by
@@ -5753,6 +5797,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		globals().pop('g_offh_ai_cover_cursor', None)
 		globals().pop('g_offh_ai_contacts_t', None)
 		globals().pop('g_offh_ai_init_error_logged', None)
+		globals().pop('g_offh_ai_navigation_disabled', None)
+		for _nav_error_key in [value for value in globals()
+		                       if value.startswith('g_offh_ai_navigation_error_')]:
+			globals().pop(_nav_error_key, None)
 		_offh_seen_arena = [False]
 		_offh_seen_bw = [False]
 		
@@ -9007,7 +9055,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				try:
 					_ai_director = _offh_ai_director(player)
 					if _ai_director is not None:
-						_offh_ai_navigator(_ai_director).tick(BigWorld.time())
+						_ai_navigator = _offh_ai_navigator(_ai_director)
+						if _ai_navigator is not None:
+							try:
+								_ai_navigator.tick(BigWorld.time())
+							except Exception as _ai_nav_tick_error:
+								_offh_ai_navigation_failure('tick', _ai_nav_tick_error)
+								globals().pop('g_offh_terrain_navigator', None)
+								globals()['g_offh_ai_navigation_disabled'] = True
 						_offh_ai_refresh_contacts(
 							_ai_director, player, mock_vehicles, veh_pos,
 							loaded_models.get('td'), BigWorld.time())
@@ -9169,13 +9224,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 												                      _nav_position.z))
 										_navigator = _offh_ai_navigator(_ai_director)
 										_requested_drive_pos = drive_pos
-										drive_pos = _navigator.next_target(
-											eid, (m_veh.position.x, m_veh.position.y, m_veh.position.z),
-											drive_pos, _nav_key, BigWorld.time(), _nav_anchor,
-											_avoid_points)
-										_nav_paused = _navigator.navigation_paused(
-											(m_veh.position.x, m_veh.position.y, m_veh.position.z),
-											_requested_drive_pos, drive_pos)
+										if _navigator is not None:
+											drive_pos = _navigator.next_target(
+												eid, (m_veh.position.x, m_veh.position.y, m_veh.position.z),
+												drive_pos, _nav_key, BigWorld.time(), _nav_anchor,
+												_avoid_points)
+											_nav_paused = _navigator.navigation_paused(
+												(m_veh.position.x, m_veh.position.y, m_veh.position.z),
+												_requested_drive_pos, drive_pos)
 								except Exception as _nav_error:
 									# Fall back to the old reactive steering intent. LocalDriver still
 									# probes every candidate corridor and fails closed on probe errors.

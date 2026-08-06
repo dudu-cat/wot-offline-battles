@@ -197,7 +197,7 @@ from gui.mods.offhangar.utils import *
 from gui.mods.offhangar._constants import *
 from gui.mods.offhangar.server import *
 
-LOG_NOTE('Offline Battles source loader active; LAN settings module enabled')
+LOG_NOTE('Offline Battles source loader active; LAN settings and prebaked navigation enabled')
 
 try:
 	from gui.mods.offhangar.lan_settings import install as _install_lan_settings

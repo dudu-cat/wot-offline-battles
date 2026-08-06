@@ -665,6 +665,26 @@ class BotNavigationTest(unittest.TestCase):
         self.assertEqual((10.0, 0.0, 0.0), second)
         self.assertEqual(1, len(join_calls))
 
+    def test_navigation_failure_is_loud_and_does_not_disable_tactical_ai(self):
+        battle_source = (
+            ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
+        ).read_text()
+        reporter = battle_source[
+            battle_source.index("def _offh_ai_navigation_failure"):
+            battle_source.index("def _offh_ai_navigator")
+        ]
+        initialization = battle_source[
+            battle_source.index("_ai_navigator = _offh_ai_navigator"):
+            battle_source.index("# Registration order affects route capacity")
+        ]
+
+        self.assertIn("navigation failure stage=%s error=%s", reporter)
+        self.assertIn("LOG_ERROR(detail)", reporter)
+        self.assertIn("pushMessage", reporter)
+        self.assertIn("_offh_ai_refresh_contacts", initialization)
+        self.assertNotIn("_ai_director = None", initialization)
+        self.assertIn("if _navigator is not None:", battle_source)
+
     def test_local_driver_rejects_deep_water_and_unsafe_grades(self):
         battle_source = (
             ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
