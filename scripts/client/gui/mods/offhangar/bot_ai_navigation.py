@@ -14,6 +14,9 @@ import time
 
 
 SQRT_TWO = math.sqrt(2.0)
+BAKED_FATAL_HAZARDS = 1 | 2
+BAKED_SHALLOW_WATER = 4
+BAKED_SHALLOW_WATER_PENALTY = 4.0
 
 try:
 	_CLOCK = time.clock
@@ -143,7 +146,8 @@ class TerrainGrid(object):
 		for z in range(cell[1] - radius, cell[1] + radius + 1):
 			for x in range(cell[0] - radius, cell[0] + radius + 1):
 				index = self._baked_flat_index((x, z))
-				if index is not None and int(self._baked_hazards[index]) != 0:
+				if (index is not None and
+						int(self._baked_hazards[index]) & BAKED_FATAL_HAZARDS):
 					return True
 		return False
 
@@ -409,12 +413,17 @@ class TerrainGrid(object):
 		return float(self._baked_heights[next_index]) / 1000.0
 
 	def _penalty(self, cell, avoid_points):
+		penalty = 0.0
+		if self.prebaked:
+			index = self._baked_index(cell)
+			if (index is not None and
+					int(self._baked_hazards[index]) & BAKED_SHALLOW_WATER):
+				penalty += self.cell_size * BAKED_SHALLOW_WATER_PENALTY
 		if not avoid_points:
-			return 0.0
+			return penalty
 		point = self.point_for(cell, 0.0)
 		x = point[0]
 		z = point[2]
-		penalty = 0.0
 		for point in avoid_points:
 			dx = x - float(point[0])
 			dz = z - float(point[2])
@@ -480,10 +489,10 @@ class TerrainGrid(object):
 		start_cell = self.cell_for(start)
 		goal_cell = self.cell_for(goal)
 		if self.prebaked:
-			# The baker accepts tactical annotations up to 24 metres from the
-			# retained graph. Use the same six-cell contract at runtime.
-			start_cell = self._nearest_baked_cell(start_cell, 6)
-			goal_cell = self._nearest_baked_cell(goal_cell, 6)
+			# The server advances a tactical waypoint at 13 metres. Keep snapping
+			# within three four-metre cells so A* can never stop outside that radius.
+			start_cell = self._nearest_baked_cell(start_cell, 3)
+			goal_cell = self._nearest_baked_cell(goal_cell, 3)
 			if start_cell is None or goal_cell is None:
 				yield ()
 				return

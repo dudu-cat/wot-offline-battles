@@ -235,7 +235,7 @@ class BotAITest(unittest.TestCase):
         for team in (1, 2):
             route_ids = {route["id"] for route in tactical_map["routes"][team]}
             self.assertEqual(
-                {"banana", "hill", "rail", "center", "rear_guard"}, route_ids
+                {"banana", "hill", "rail", "rear_guard"}, route_ids
             )
             for route in tactical_map["routes"][team]:
                 for x, z, hold in route["waypoints"]:
@@ -366,6 +366,35 @@ class BotAITest(unittest.TestCase):
         self.assertEqual(first_routes, second_routes)
         self.assertGreaterEqual(len(set(first_routes)), 3)
         self.assertLess(first_routes.count("banana"), len(first_routes))
+
+    def test_director_uses_graph_validated_routes_when_supplied(self):
+        baked_routes = {
+            "1": [{
+                "id": "validated_lane",
+                "capacity": 15,
+                "risk": 0.4,
+                "role_weights": {"brawler": 1.0},
+                "waypoints": [[305.0, -290.0, False], [300.0, 300.0, True]],
+            }],
+            "2": [{
+                "id": "validated_lane",
+                "capacity": 15,
+                "risk": 0.4,
+                "role_weights": {"brawler": 1.0},
+                "waypoints": [[300.0, 300.0, False], [305.0, -290.0, True]],
+            }],
+        }
+        director = self.ai.BattleDirector(
+            "04_himmelsdorf", "baked-routes", baked_routes=baked_routes
+        )
+        agent = director.register(
+            77, 1, descriptor("heavyTank"), "Validated route bot"
+        )
+
+        self.assertEqual("validated_lane", agent["route"]["id"])
+        self.assertEqual(
+            (305.0, -290.0, False), agent["route"]["waypoints"][1]
+        )
 
     def test_unseen_enemy_is_unknown_then_becomes_last_known_without_fire(self):
         director = self.ai.BattleDirector("04_himmelsdorf", 12)

@@ -398,13 +398,47 @@ def _angle_delta(target, current):
 	return delta
 
 
+def _map_data_with_baked_routes(map_data, baked_routes):
+	"""Return tactical metadata with graph-validated locomotion waypoints."""
+	if map_data is None or not isinstance(baked_routes, dict):
+		return map_data
+	result = dict(map_data)
+	routes = {}
+	for team in (1, 2):
+		converted = []
+		values = baked_routes.get(str(team), baked_routes.get(team, ())) or ()
+		for raw in values:
+			if not isinstance(raw, dict):
+				continue
+			waypoints = []
+			for point in raw.get('waypoints', ()) or ():
+				try:
+					waypoints.append((float(point[0]), float(point[1]),
+					                  bool(point[2]) if len(point) > 2 else False))
+				except Exception:
+					continue
+			if not waypoints:
+				continue
+			route = dict(raw)
+			route['role_weights'] = dict(raw.get('role_weights', {}) or {})
+			route['waypoints'] = tuple(waypoints)
+			converted.append(route)
+		routes[team] = tuple(converted)
+	if not routes.get(1) or not routes.get(2):
+		return map_data
+	result['routes'] = routes
+	return result
+
+
 class BattleDirector(object):
 	"""Shared per-battle planner for both teams."""
 
-	def __init__(self, map_name, battle_seed, bases=None, bounds=None):
+	def __init__(self, map_name, battle_seed, bases=None, bounds=None,
+	             baked_routes=None):
 		self.map_name = bot_ai_maps.normalize_map_name(map_name)
 		self.battle_seed = stable_seed(battle_seed, self.map_name)
-		self.map_data = bot_ai_maps.get_tactical_map(self.map_name)
+		self.map_data = _map_data_with_baked_routes(
+			bot_ai_maps.get_tactical_map(self.map_name), baked_routes)
 		self.bases = dict(bases or {})
 		self.bounds = bounds
 		if self.map_data is not None:

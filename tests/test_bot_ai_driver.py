@@ -277,14 +277,38 @@ class BotAIDriverTest(unittest.TestCase):
         self.assertEqual(0.0, order["throttle"])
         self.assertNotEqual(0.0, order["turn"])
 
-    def test_neighbours_and_identity_phase_stagger_bots(self):
+    def test_commanded_hold_never_accumulates_stuck_recovery(self):
+        driver = self.module.LocalDriver(stuck_seconds=0.4, recovery_seconds=0.5)
+        orders = []
+        for unused in range(30):
+            orders.append(driver.drive(
+                103, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+                (0.0, 0.0, 4.0), (), lambda angle: True,
+                movement_intent=False,
+            ))
+
+        self.assertTrue(all(order["recovery_mode"] == "arrived" for order in orders))
+        self.assertTrue(all(order["throttle"] == 0.0 for order in orders))
+
+        moving = None
+        for unused in range(10):
+            moving = driver.drive(
+                103, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+                (0.0, 0.0, 40.0), (), lambda angle: True,
+            )
+        self.assertIn(moving["recovery_mode"], ("reverse_turn", "pivot_recovery"))
+
+    def test_non_overlapping_side_traffic_does_not_override_route(self):
         driver = self.module.LocalDriver(stuck_seconds=0.6)
-        # A close neighbour on the east makes an otherwise clear driver choose
-        # the westward candidate, proving separation is considered.
+        # A harmless vehicle beside the route is not an emergency. The moving
+        # OBB predictor will still reject this heading if the paths converge.
         crowded = driver.drive("west", (0.0, 0.0, 0.0), 0.0, 2.0, 0.1,
                                (0.0, 0.0, 40.0), [(8.0, 0.0, 0.0)],
                                lambda angle: True)
-        self.assertLess(crowded["target_yaw"], 0.0)
+        self.assertAlmostEqual(0.0, crowded["target_yaw"], places=5)
+
+    def test_identity_phase_staggers_recovery(self):
+        driver = self.module.LocalDriver(stuck_seconds=0.6)
 
         states = []
         for bot_id in ("alpha", "left"):
@@ -366,7 +390,7 @@ class BotAIDriverTest(unittest.TestCase):
 
         self.assertEqual(15, len(orders))
         self.assertTrue(all(order["throttle"] >= 0.70 for order in orders))
-        self.assertTrue(any(order["recovery_mode"] == "avoid" for order in orders))
+        self.assertTrue(all(order["recovery_mode"] in ("drive", "avoid") for order in orders))
 
     def test_walking_pace_does_not_deadlock_on_neighbour_prediction(self):
         driver = self.module.LocalDriver()

@@ -2,6 +2,7 @@
 """Load versioned navigation graphs shipped with the offline-battle mod."""
 
 import json
+import hashlib
 import os
 
 from gui.mods.offhangar.paths import mod_dir
@@ -10,6 +11,18 @@ from gui.mods.offhangar.paths import mod_dir
 FORMAT_NAME = 'offhangar-navgraph'
 FORMAT_VERSION = 1
 GAME_VERSION = '0.8.2'
+MANIFEST_FORMAT = FORMAT_NAME + '-manifest'
+STOCK_MAPS = (
+	'01_karelia', '02_malinovka', '03_campania', '04_himmelsdorf',
+	'05_prohorovka', '06_ensk', '07_lakeville', '08_ruinberg',
+	'10_hills', '11_murovanka', '13_erlenberg', '14_siegfried_line',
+	'15_komarin', '17_munchen', '18_cliff', '19_monastery',
+	'22_slough', '23_westfeld', '28_desert', '29_el_hallouf',
+	'31_airfield', '33_fjord', '34_redshire', '35_steppes',
+	'36_fishing_bay', '37_caucasus', '38_mannerheim_line',
+	'39_crimea', '42_north_america', '44_north_america',
+	'45_north_america', '47_canada_a', '51_asia',
+)
 
 
 def _short_map_name(map_name):
@@ -42,14 +55,77 @@ def _validate(graph, map_name):
 	return graph
 
 
+def _sha256(path):
+	digest = hashlib.sha256()
+	handle = open(path, 'rb')
+	try:
+		while True:
+			block = handle.read(1024 * 1024)
+			if not block:
+				break
+			digest.update(block)
+	finally:
+		handle.close()
+	return digest.hexdigest()
+
+
+def _manifest_entry(directory, map_name):
+	"""Validate the complete batch marker and return this map's record.
+
+	A missing manifest remains valid for one-file developer builds. Once a batch
+	manifest is present, however, a partial copy or a stale/tampered graph must
+	not silently drive bots with mixed navigation data.
+	"""
+	path = os.path.join(directory, 'manifest.json')
+	if not os.path.isfile(path):
+		return None
+	handle = open(path, 'r')
+	try:
+		manifest = json.load(handle)
+	finally:
+		handle.close()
+	if (not isinstance(manifest, dict) or
+			manifest.get('format') != MANIFEST_FORMAT or
+			int(manifest.get('version', -1)) != FORMAT_VERSION or
+			str(manifest.get('game_version', '')) != GAME_VERSION):
+		raise ValueError('navigation manifest is incompatible')
+	records = manifest.get('maps') or ()
+	if len(records) != len(STOCK_MAPS):
+		raise ValueError('navigation manifest is incomplete')
+	expected = set(STOCK_MAPS)
+	seen = set()
+	selected = None
+	for record in records:
+		if not isinstance(record, dict):
+			raise ValueError('navigation manifest record is invalid')
+		name = _short_map_name(record.get('map'))
+		filename = str(record.get('file') or '')
+		if (name not in expected or name in seen or
+				filename != name + '.json' or
+				len(str(record.get('sha256') or '')) != 64):
+			raise ValueError('navigation manifest record is invalid')
+		seen.add(name)
+		if not os.path.isfile(os.path.join(directory, filename)):
+			raise ValueError('navigation graph batch is incomplete')
+		if name == map_name:
+			selected = record
+	if seen != expected:
+		raise ValueError('navigation manifest is incomplete')
+	return selected
+
+
 def load_graph(map_name):
 	"""Return a validated graph, or None when this map has not been baked."""
 	short_name = _short_map_name(map_name)
 	if not short_name:
 		return None
-	path = os.path.join(mod_dir(), 'navgraphs', short_name + '.json')
+	directory = os.path.join(mod_dir(), 'navgraphs')
+	entry = _manifest_entry(directory, short_name)
+	path = os.path.join(directory, short_name + '.json')
 	if not os.path.isfile(path):
 		return None
+	if entry is not None and _sha256(path) != str(entry.get('sha256')):
+		raise ValueError('navigation graph checksum does not match manifest')
 	handle = open(path, 'r')
 	try:
 		graph = json.load(handle)

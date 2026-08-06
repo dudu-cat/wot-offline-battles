@@ -213,7 +213,14 @@ class LocalDriver(object):
 			return neighbour.get('position') or neighbour.get('pos')
 		return neighbour
 
-	def _separation_yaw(self, position, neighbours):
+	def _separation_yaw(self, position, desired_yaw, neighbours,
+			half_length, half_width):
+		"""Return an escape heading only for hulls that already overlap.
+
+		Moving OBB prediction handles impending collisions. Treating every tank
+		inside a broad radius as an emergency made harmless side-by-side traffic
+		continually override the route and visibly reconsider its steering.
+		"""
 		push_x = 0.0
 		push_z = 0.0
 		for neighbour in neighbours or ():
@@ -238,7 +245,18 @@ class LocalDriver(object):
 				continue
 			if dist < 0.05 or dist >= self.separation_radius:
 				continue
-			weight = (self.separation_radius - dist) / self.separation_radius
+			other_yaw = 0.0
+			other_length = half_length
+			other_width = half_width
+			if isinstance(neighbour, dict):
+				other_yaw = float(neighbour.get('yaw', 0.0) or 0.0)
+				other_length = float(neighbour.get('half_length', half_length) or half_length)
+				other_width = float(neighbour.get('half_width', half_width) or half_width)
+			if not self._obb_overlap(
+					position, desired_yaw, half_length + 0.20, half_width + 0.20,
+					other, other_yaw, other_length + 0.20, other_width + 0.20):
+				continue
+			weight = max(0.15, (self.separation_radius - dist) / self.separation_radius)
 			push_x += dx / dist * weight
 			push_z += dz / dist * weight
 		if abs(push_x) + abs(push_z) < 0.001:
@@ -346,7 +364,8 @@ class LocalDriver(object):
 
 	def _choose_yaw(self, state, desired_yaw, position, speed, velocity,
 				neighbours, direction_clear, half_length, half_width):
-		separation = self._separation_yaw(position, neighbours)
+		separation = self._separation_yaw(
+			position, desired_yaw, neighbours, half_length, half_width)
 		candidates = []
 		for offset in self._CANDIDATE_OFFSETS:
 			candidate = desired_yaw + offset
@@ -367,7 +386,8 @@ class LocalDriver(object):
 		return None
 
 	def drive(self, bot_id, position, yaw, speed, dt, target, neighbours,
-			direction_clear, velocity=None, half_length=3.5, half_width=1.7):
+			direction_clear, velocity=None, half_length=3.5, half_width=1.7,
+			movement_intent=True):
 		"""Return ``throttle``, ``turn``, ``target_yaw`` and ``recovery_mode``.
 
 		All timing uses supplied seconds.  ``dt`` is clamped so a paused client
@@ -381,6 +401,18 @@ class LocalDriver(object):
 		state['plan_age'] += step
 		desired_yaw = _yaw_to(position, target)
 		target_distance = _distance(position, target)
+		if not movement_intent:
+			# Cover/engagement orders intentionally stop within a tolerance. Do not
+			# reinterpret that commanded hold as a stuck tank 1.8 seconds later.
+			state['stuck_time'] = 0.0
+			state['recovery_time'] = 0.0
+			state['steering_yaw'] = None
+			return {
+				'throttle': 0.0,
+				'turn': 0.0,
+				'target_yaw': float(yaw),
+				'recovery_mode': 'arrived',
+			}
 		displacement = _distance((position[0], 0.0, position[2]),
 		                         (state['last_position'][0], 0.0,
 		                          state['last_position'][1]))
@@ -447,10 +479,10 @@ class LocalDriver(object):
 		own_half_width = max(0.3, float(half_width))
 		chosen_yaw = None
 		old_yaw = state.get('steering_yaw')
-		# Keep a recently selected steering direction for 180 ms, but revalidate
+		# Keep a recently selected steering direction for 350 ms, but revalidate
 		# both the hard terrain probe and moving OBBs every frame. This avoids a
-		# full seven-way probe when the previous safe direction still works.
-		if (old_yaw is not None and state['plan_age'] < 0.18 and
+		# visible left/right reconsideration when nearby traffic moves slightly.
+		if (old_yaw is not None and state['plan_age'] < 0.35 and
 				abs(_angle_delta(desired_yaw, old_yaw)) < 0.70 and
 				self._failure_penalty(state, old_yaw) <= 0.0 and
 				self._clear(direction_clear, old_yaw) and

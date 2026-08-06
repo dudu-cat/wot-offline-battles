@@ -205,6 +205,7 @@ class LANClientQueueTest(unittest.TestCase):
             "observing_team": 1, "target_id": 7, "target_kind": "bot", "target_team": 2,
             "position": (1, 2, 3), "health": 100, "max_health": 200,
             "class_tag": "heavyTank", "armor": 80, "visible": True,
+            "shootable_by_bot_ids": [16, 16, -1, "17", "bad"],
         }
         candidate = {
             "id": "rock", "position": (4, 5, 6), "peek_position": (7, 8, 9),
@@ -238,6 +239,7 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertTrue(self.network.publish_bot_observation(
             player, [contact] * 65, reports, raw_navigation
         ))
+        self.assertEqual([16, 17], captured[0][0][0]["shootable_by_bot_ids"])
         contacts, affordances, navigation = captured[0]
         self.assertEqual(64, len(contacts))
         self.assertEqual(16, len(affordances))
@@ -675,6 +677,7 @@ class LANClientQueueTest(unittest.TestCase):
             "x": 5.0, "y": 2.0, "z": 20.0, "yaw": 0.5,
             "aim_yaw": 0.75, "gun_pitch": -0.1, "fire_seq": 3,
             "shell_index": 1, "health": 500, "max_health": 500, "alive": True,
+            "speed": 6.0, "turn_velocity": 0.2,
         }
 
         self.network._apply_bot_state(player, state)
@@ -688,6 +691,19 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertEqual(3, bot._network_bot_fire_seq)
         self.assertEqual(1, bot._network_bot_shell_index)
         self.assertEqual(1, len(self.network._test_shot_presentations))
+        self.assertAlmostEqual(math.sin(0.5) * 6.0,
+                               bot._network_target_velocity[0], places=5)
+
+        # Promotion applies one final canonical relay snapshot before local
+        # simulation starts, including the motion state needed for continuity.
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_authority_handoff_pending = True
+        promoted = dict(state, x=9.0, speed=7.5, turn_velocity=-0.3)
+        self.network._apply_snapshot(player, {"bots": [promoted], "players": []})
+        self.assertFalse(player._offhangar_network_authority_handoff_pending)
+        self.assertEqual(9.0, bot.position.x)
+        self.assertEqual(7.5, bot._veh_velocity)
+        self.assertEqual(-0.3, bot._veh_turn_velocity)
 
     def test_snapshot_stores_revisioned_server_order_and_converts_coordinates(self):
         player = Player()

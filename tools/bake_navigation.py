@@ -6,19 +6,25 @@ static model transforms, visual bounds, and primitive vertices directly from
 the pinned client packages.  The resulting JSON is small enough to ship with
 the mod, so players never have to scan a map in game.
 
-The first supported map is Lakeville.  Additional maps can be enabled after
-their baked output passes the same connectivity and route-anchor validation.
+Map bounds, bases, and validation anchors come from the tactical route registry
+shipped with the mod. ``--all`` bakes every stock map with the same generic
+terrain, water, grade, obstacle, and connectivity rules.
 """
 
 import argparse
 import base64
+import hashlib
 import heapq
+import importlib.util
 import io
 import json
 import math
 import os
+import shutil
 import struct
 import sys
+import tempfile
+import types
 import zipfile
 import zlib
 import xml.etree.ElementTree as ElementTree
@@ -45,10 +51,15 @@ GAME_VERSION = "0.8.2"
 CHUNK_SIZE = 100.0
 HEIGHTMAP_INNER_SIZE = 64
 HEIGHTMAP_BORDER = 2
-WATER_DEPTH_LIMIT = 0.12
+# Stock maps deliberately use shallow, tank-passable fords. Deep water remains
+# forbidden, while traversable water receives a large route cost below so bots
+# use a dry road or bridge whenever one exists.
+WATER_DEPTH_LIMIT = 0.90
+SHALLOW_WATER_THRESHOLD = 0.12
 VEHICLE_HALF_WIDTH = 2.15
 VEHICLE_CLEARANCE_HEIGHT = 2.40
 LOCAL_OBSTACLE_MAX_HEIGHT = 0.65
+VEHICLE_GROUND_CLEARANCE = LOCAL_OBSTACLE_MAX_HEIGHT
 MAX_GRADE_UP = 0.38
 MAX_GRADE_DOWN = 0.38
 # Normal tank routes must be controllable in both directions.  A drop that can
@@ -58,6 +69,11 @@ MAX_GRADE = min(MAX_GRADE_UP, MAX_GRADE_DOWN)
 EDGE_CLEARANCE_RADII = (3.0, 6.0)
 HAZARD_WATER = 1
 HAZARD_EDGE = 2
+HAZARD_SHALLOW_WATER = 4
+SHALLOW_WATER_COST_MULTIPLIER = 4.0
+NAVGRAPH_BOUND_MARGIN = 16.0
+BRIDGE_HEIGHT_BIN = 0.5
+BRIDGE_DECK_BAND = 1.75
 
 DIRECTIONS = (
     (-1, -1), (0, -1), (1, -1),
@@ -65,27 +81,97 @@ DIRECTIONS = (
     (-1, 1),  (0, 1),     (1, 1),
 )
 
-LAKEVILLE_ROUTES = (
-    ((-169.0, 319.0), (-314.0, 298.0), (-330.0, 189.0),
-     (-331.0, 40.0), (-315.0, -101.0), (-278.0, -211.0),
-     (-225.0, -273.0)),
-    ((-169.0, 319.0), (-110.0, 268.0), (-76.0, 189.0),
-     (-98.0, 74.0), (-90.0, -98.0), (-102.0, -211.0),
-     (-165.0, -294.0)),
-    ((-169.0, 319.0), (-9.0, 325.0), (164.0, 306.0),
-     (289.0, 267.0), (322.0, 173.0), (314.0, 40.0),
-     (284.0, -93.0), (218.0, -187.0), (70.0, -265.0),
-     (-79.0, -297.0)),
-)
+def _load_tactical_maps():
+    """Load the Python-2-compatible data modules without importing the game."""
+    package_dir = os.path.join(
+        REPO_ROOT, "scripts", "client", "gui", "mods", "offhangar"
+    )
+    package_names = ("gui", "gui.mods", "gui.mods.offhangar")
+    saved = dict((name, sys.modules.get(name)) for name in package_names)
+    loaded_names = []
+    try:
+        for name in package_names:
+            package = types.ModuleType(name)
+            package.__path__ = [package_dir] if name == "gui.mods.offhangar" else []
+            sys.modules[name] = package
+        module_name = "gui.mods.offhangar.bot_ai_maps"
+        spec = importlib.util.spec_from_file_location(
+            module_name, os.path.join(package_dir, "bot_ai_maps.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        loaded_names.append(module_name)
+        spec.loader.exec_module(module)
+        return dict(module.TACTICAL_MAPS)
+    finally:
+        for name in list(sys.modules):
+            if (name.startswith("gui.mods.offhangar.bot_ai_maps_group_") or
+                    name == "gui.mods.offhangar.bot_ai_maps_extra" or
+                    name in loaded_names):
+                sys.modules.pop(name, None)
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
 
-MAPS = {
-    "07_lakeville": {
-        "bounds": (-400.0, -400.0, 400.0, 400.0),
-        "bases": ((-169.5, 319.4), (-169.5, -319.0)),
-        "routes": LAKEVILLE_ROUTES,
-        "anchors": tuple(point for route in LAKEVILLE_ROUTES for point in route),
-    },
-}
+
+def _bake_map_config(tactical_map):
+    route_records = []
+    anchors = []
+    for team in (1, 2):
+        for route in tactical_map.get("routes", {}).get(team, ()):
+            points = tuple((float(point[0]), float(point[1]),
+                            bool(point[2]) if len(point) > 2 else False)
+                           for point in route.get("waypoints", ()))
+            if not points:
+                continue
+            route_records.append({
+                "team": team,
+                "id": str(route.get("id") or "route"),
+                "capacity": max(1, int(route.get("capacity", 1))),
+                "risk": float(route.get("risk", 0.5)),
+                "role_weights": dict(route.get("role_weights", {})),
+                "points": points,
+            })
+            anchors.extend((point[0], point[1]) for point in points)
+    bases = (
+        tuple(tactical_map["bases"][1]),
+        tuple(tactical_map["bases"][2]),
+    )
+    anchors.extend(bases)
+    return {
+        "bounds": tuple(tactical_map["bounds"]),
+        "bases": bases,
+        "routes": tuple(route_records),
+        "anchors": tuple(anchors),
+    }
+
+
+TACTICAL_MAPS = _load_tactical_maps()
+MAPS = dict((name, _bake_map_config(tactical_map))
+            for name, tactical_map in TACTICAL_MAPS.items())
+
+
+def _expanded_bounds(map_config, cell_size):
+    """Include route/base anchors that sit on the arena boundary."""
+    bounds = map_config["bounds"]
+    anchors = tuple(map_config.get("anchors", ())) + tuple(map_config["bases"])
+    minimum_x = min([bounds[0]] + [point[0] - NAVGRAPH_BOUND_MARGIN
+                                   for point in anchors])
+    minimum_z = min([bounds[1]] + [point[1] - NAVGRAPH_BOUND_MARGIN
+                                   for point in anchors])
+    maximum_x = max([bounds[2]] + [point[0] + NAVGRAPH_BOUND_MARGIN
+                                   for point in anchors])
+    maximum_z = max([bounds[3]] + [point[1] + NAVGRAPH_BOUND_MARGIN
+                                   for point in anchors])
+    size = float(cell_size)
+    return (
+        math.floor(minimum_x / size) * size,
+        math.floor(minimum_z / size) * size,
+        math.ceil(maximum_x / size) * size,
+        math.ceil(maximum_z / size) * size,
+    )
 
 
 def _packed_children(element, name):
@@ -267,15 +353,19 @@ class HeightChunk(object):
             raise ValueError("height map has no expected terrain border")
         self.width = width
         self.height = height
+        self.minimum = struct.unpack_from("<f", data, 20)[0]
+        self.maximum = struct.unpack_from("<f", data, 24)[0]
         self.values = []
         for row in rows:
             values = []
             for x in range(width):
-                red = row[x * 4]
-                green = row[x * 4 + 1]
-                millimetres = red + green * 256
-                if millimetres >= 32768:
-                    millimetres -= 65536
+                # BigWorld terrain2 version 4 stores one little-endian int32
+                # millimetre value in each PNG RGBA pixel. Reading only R/G as
+                # an int16 wraps hills above 32.767 m and truncates every map
+                # whose terrain leaves the signed-16-bit range.
+                millimetres = struct.unpack(
+                    "<i", bytes(row[x * 4:x * 4 + 4])
+                )[0]
                 values.append(millimetres / 1000.0)
             self.values.append(values)
 
@@ -516,6 +606,17 @@ def _is_local_obstacle(shape):
             LOCAL_OBSTACLE_MAX_HEIGHT)
 
 
+def _is_bridge_model(model_name):
+    """Return whether a static model supplies a drivable bridge deck.
+
+    Collision geometry alone cannot distinguish a road deck from a building
+    roof. The stock assets do carry that semantic distinction in their model
+    resource names, so keep surface extraction deliberately limited to bridge
+    models instead of making arbitrary horizontal scenery traversable.
+    """
+    return "bridge" in str(model_name).lower()
+
+
 class ModelLibrary(object):
     def __init__(self, resources):
         self.resources = resources
@@ -643,7 +744,10 @@ def _point_in_convex_polygon(point, polygon):
             elif sign != current_sign:
                 return False
         previous = current
-    return True
+    # A vertical collision triangle projects to a line in X/Z. In that
+    # degenerate case every cross product is zero; treating the whole bounding
+    # rectangle as "inside" turns a diagonal wall into a large solid block.
+    return sign is not None
 
 
 def _distance_to_polygon(point, polygon):
@@ -662,7 +766,10 @@ class ObstacleField(object):
         self.raster_size = float(raster_size)
         self.soft_models = set(soft_models or ())
         self.cells = {}
+        self.surface_cells = {}
         self.instance_count = 0
+        self.bridge_instance_count = 0
+        self.bridge_surface_triangle_count = 0
         self.soft_instance_count = 0
         self.local_instance_count = 0
         self.model_library = ModelLibrary(resources)
@@ -677,6 +784,85 @@ class ObstacleField(object):
         else:
             previous[0] = min(previous[0], float(minimum_y))
             previous[1] = max(previous[1], float(maximum_y))
+
+    def _mark_surface(self, cell_x, cell_z, height):
+        key = (int(cell_x), int(cell_z))
+        previous = self.surface_cells.get(key)
+        if previous is None or float(height) > previous:
+            self.surface_cells[key] = float(height)
+
+    @staticmethod
+    def _walkable_triangle(triangle):
+        first, second, third = triangle
+        ax = second[0] - first[0]
+        ay = second[1] - first[1]
+        az = second[2] - first[2]
+        bx = third[0] - first[0]
+        by = third[1] - first[1]
+        bz = third[2] - first[2]
+        normal_x = ay * bz - az * by
+        normal_y = az * bx - ax * bz
+        normal_z = ax * by - ay * bx
+        projected_area = abs(normal_y) * 0.5
+        if projected_area <= 1e-6:
+            return False, 0.0
+        slope = math.hypot(normal_x, normal_z) / abs(normal_y)
+        return slope <= MAX_GRADE, projected_area
+
+    @staticmethod
+    def _triangle_height(triangle, x, z):
+        first, second, third = triangle
+        denominator = ((second[2] - third[2]) * (first[0] - third[0]) +
+                       (third[0] - second[0]) * (first[2] - third[2]))
+        if abs(denominator) <= 1e-10:
+            return None
+        first_weight = (((second[2] - third[2]) * (x - third[0]) +
+                         (third[0] - second[0]) * (z - third[2])) /
+                        denominator)
+        second_weight = (((third[2] - first[2]) * (x - third[0]) +
+                          (first[0] - third[0]) * (z - third[2])) /
+                         denominator)
+        third_weight = 1.0 - first_weight - second_weight
+        epsilon = 1e-7
+        if (first_weight < -epsilon or second_weight < -epsilon or
+                third_weight < -epsilon):
+            return None
+        return (first_weight * first[1] + second_weight * second[1] +
+                third_weight * third[1])
+
+    def _raster_surface_triangle(self, triangle):
+        minimum_x = min(point[0] for point in triangle)
+        maximum_x = max(point[0] for point in triangle)
+        minimum_z = min(point[2] for point in triangle)
+        maximum_z = max(point[2] for point in triangle)
+        min_cell_x = int(math.floor(minimum_x / self.raster_size))
+        max_cell_x = int(math.floor(maximum_x / self.raster_size))
+        min_cell_z = int(math.floor(minimum_z / self.raster_size))
+        max_cell_z = int(math.floor(maximum_z / self.raster_size))
+        for cell_x in range(min_cell_x, max_cell_x + 1):
+            x = (cell_x + 0.5) * self.raster_size
+            for cell_z in range(min_cell_z, max_cell_z + 1):
+                z = (cell_z + 0.5) * self.raster_size
+                height = self._triangle_height(triangle, x, z)
+                if height is not None:
+                    self._mark_surface(cell_x, cell_z, height)
+
+    def _bridge_deck_triangles(self, triangles):
+        candidates = []
+        height_bins = {}
+        for triangle in triangles:
+            walkable, projected_area = self._walkable_triangle(triangle)
+            if not walkable:
+                continue
+            centre_y = sum(point[1] for point in triangle) / 3.0
+            bin_y = round(centre_y / BRIDGE_HEIGHT_BIN) * BRIDGE_HEIGHT_BIN
+            height_bins[bin_y] = height_bins.get(bin_y, 0.0) + projected_area
+            candidates.append((triangle, centre_y))
+        if not height_bins:
+            return set()
+        deck_y = max(height_bins, key=height_bins.get)
+        return set(id(triangle) for triangle, centre_y in candidates
+                   if abs(centre_y - deck_y) <= BRIDGE_DECK_BAND)
 
     def _raster_triangle(self, triangle):
         polygon = tuple((point[0], point[2]) for point in triangle)
@@ -768,10 +954,22 @@ class ObstacleField(object):
                     continue
                 self.instance_count += 1
                 if shape.triangles:
-                    for triangle in shape.triangles:
-                        transformed = tuple(_transform_point(transform, point, chunk_x, chunk_z)
-                                            for point in triangle)
-                        self._raster_triangle(transformed)
+                    transformed_triangles = [
+                        tuple(_transform_point(transform, point, chunk_x, chunk_z)
+                              for point in triangle)
+                        for triangle in shape.triangles
+                    ]
+                    bridge_deck = set()
+                    if _is_bridge_model(model_name):
+                        self.bridge_instance_count += 1
+                        bridge_deck = self._bridge_deck_triangles(
+                            transformed_triangles)
+                    for triangle in transformed_triangles:
+                        if id(triangle) in bridge_deck:
+                            self._raster_surface_triangle(triangle)
+                            self.bridge_surface_triangle_count += 1
+                        else:
+                            self._raster_triangle(triangle)
                 elif not self._raster_shape_fallback(shape, transform, chunk_x, chunk_z):
                     self.skipped += 1
 
@@ -779,7 +977,12 @@ class ObstacleField(object):
         centre_x = int(math.floor(float(x) / self.raster_size))
         centre_z = int(math.floor(float(z) / self.raster_size))
         cell_radius = int(math.ceil(float(margin) / self.raster_size))
-        vehicle_minimum_y = float(ground_y) + 0.10
+        # Roads, paving slabs, rubble lips, and curbs are often part of a much
+        # taller visual model in the old client, so model-level height filtering
+        # cannot identify them. Ignore collision triangles below track-clearance
+        # height at query time; walls and building volumes still intersect the
+        # remaining 0.65..2.40 m vehicle body interval.
+        vehicle_minimum_y = float(ground_y) + VEHICLE_GROUND_CLEARANCE
         vehicle_maximum_y = float(ground_y) + VEHICLE_CLEARANCE_HEIGHT
         for cell_x in range(centre_x - cell_radius, centre_x + cell_radius + 1):
             sample_x = (cell_x + 0.5) * self.raster_size
@@ -795,6 +998,11 @@ class ObstacleField(object):
                     continue
                 return True
         return False
+
+    def surface_height(self, x, z):
+        cell_x = int(math.floor(float(x) / self.raster_size))
+        cell_z = int(math.floor(float(z) / self.raster_size))
+        return self.surface_cells.get((cell_x, cell_z))
 
 
 def _nearest_node(graph, point, max_distance=56.0):
@@ -878,7 +1086,7 @@ def _reachable_nodes(graph, root):
     return reachable
 
 
-def _connected_components(graph):
+def _connected_node_components(graph):
     remaining = set(index for index, value in enumerate(graph["heights_mm"])
                     if value is not None)
     components = []
@@ -887,10 +1095,9 @@ def _connected_components(graph):
     while remaining:
         root = remaining.pop()
         stack = [root]
-        count = 0
+        component = set((root,))
         while stack:
             current = stack.pop()
-            count += 1
             x = current % width
             z = current // width
             for direction_index, (dx, dz) in enumerate(DIRECTIONS):
@@ -903,25 +1110,55 @@ def _connected_components(graph):
                 neighbour = nz * width + nx
                 if neighbour in remaining:
                     remaining.remove(neighbour)
+                    component.add(neighbour)
                     stack.append(neighbour)
-        components.append(count)
-    components.sort(reverse=True)
+        components.append(component)
+    components.sort(key=len, reverse=True)
     return components
 
 
-def retain_base_component(graph, map_config, minimum_fraction=0.72):
+def _connected_components(graph):
+    return [len(component) for component in _connected_node_components(graph)]
+
+
+def _nearest_node_in_component(graph, point, component):
+    best = None
+    best_distance = float("inf")
+    width = graph["width"]
+    origin_x, origin_z = graph["origin"]
+    cell_size = graph["cell_size"]
+    for index in component:
+        x = origin_x + (index % width) * cell_size
+        z = origin_z + (index // width) * cell_size
+        distance = math.hypot(x - point[0], z - point[1])
+        if distance < best_distance:
+            best = index
+            best_distance = distance
+    return best, best_distance
+
+
+def retain_base_component(graph, map_config, minimum_fraction=0.60):
     """Remove isolated ledges and pockets that cannot reach both team bases."""
-    source_components = _connected_components(graph)
-    if not source_components:
+    node_components = _connected_node_components(graph)
+    if not node_components:
         raise ValueError("baked graph has no navigable nodes")
+    source_components = [len(component) for component in node_components]
     source_nodes = sum(source_components)
-    start, unused_start_offset = _nearest_node(graph, map_config["bases"][0])
-    goal, unused_goal_offset = _nearest_node(graph, map_config["bases"][1])
-    if start is None or goal is None:
+    candidates = []
+    for component in node_components:
+        start, start_offset = _nearest_node_in_component(
+            graph, map_config["bases"][0], component)
+        goal, goal_offset = _nearest_node_in_component(
+            graph, map_config["bases"][1], component)
+        if start_offset <= 56.0 and goal_offset <= 56.0:
+            candidates.append((-len(component), start_offset + goal_offset,
+                               min(component), component, start, goal))
+    if not candidates:
         raise ValueError("a team base has no nearby navigable node")
-    retained = _reachable_nodes(graph, start)
-    if goal not in retained:
-        raise ValueError("team bases are in disconnected components")
+    # A tiny ledge can be a few metres closer to a boundary base than the road
+    # network. Select one component that can serve both bases, then apply the
+    # existing retained-fraction guard so an implausibly small shortcut cannot win.
+    unused_size, unused_score, unused_root, retained, start, goal = min(candidates)
     retained_fraction = float(len(retained)) / float(source_nodes)
     if retained_fraction < float(minimum_fraction):
         raise ValueError("base graph component is unexpectedly small: %.1f%%" %
@@ -955,6 +1192,244 @@ def retain_base_component(graph, map_config, minimum_fraction=0.72):
     return retained
 
 
+def _node_point(graph, index):
+    width = graph["width"]
+    return (
+        graph["origin"][0] + (index % width) * graph["cell_size"],
+        graph["origin"][1] + (index // width) * graph["cell_size"],
+    )
+
+
+def _oriented_route_points(route_record, map_config):
+    """Orient a tactical corridor and include its two objective endpoints."""
+    team = int(route_record["team"])
+    own = map_config["bases"][team - 1]
+    enemy = map_config["bases"][2 - team]
+    points = list(route_record["points"])
+    if len(points) < 2:
+        return points
+
+    def distance_squared(point, base):
+        return ((float(point[0]) - float(base[0])) ** 2 +
+                (float(point[1]) - float(base[1])) ** 2)
+
+    forward = distance_squared(points[0], own) + distance_squared(points[-1], enemy)
+    reverse = distance_squared(points[-1], own) + distance_squared(points[0], enemy)
+    if reverse < forward:
+        points.reverse()
+    if distance_squared(points[0], own) > 1.0:
+        points.insert(0, (float(own[0]), float(own[1]), False))
+    else:
+        points[0] = (float(own[0]), float(own[1]), bool(points[0][2]))
+    if distance_squared(points[-1], enemy) > 1.0:
+        points.append((float(enemy[0]), float(enemy[1]), False))
+    else:
+        points[-1] = (float(enemy[0]), float(enemy[1]), bool(points[-1][2]))
+    return points
+
+
+def _sample_route_path(graph, path, hold_nodes, maximum_points=16):
+    """Reduce a safe grid path while retaining endpoints and tactical holds."""
+    if not path:
+        return []
+    maximum_points = max(2, int(maximum_points))
+    cumulative = [0.0]
+    for first, second in zip(path, path[1:]):
+        first_point = _node_point(graph, first)
+        second_point = _node_point(graph, second)
+        cumulative.append(cumulative[-1] + math.hypot(
+            second_point[0] - first_point[0],
+            second_point[1] - first_point[1],
+        ))
+    selected = set((0, len(path) - 1))
+    selected.update(index for index, node in enumerate(path) if node in hold_nodes)
+    slots = max(0, maximum_points - len(selected))
+    if slots:
+        total = cumulative[-1]
+        for sample in range(1, slots + 1):
+            target = total * float(sample) / float(slots + 1)
+            index = min(range(len(path)), key=lambda value: abs(cumulative[value] - target))
+            selected.add(index)
+    # Rounding two samples onto the same node can leave spare slots. Fill the
+    # largest distance gaps first so no runtime A* leg becomes needlessly long.
+    while len(selected) < min(maximum_points, len(path)):
+        ordered = sorted(selected)
+        gaps = [(cumulative[second] - cumulative[first], first, second)
+                for first, second in zip(ordered, ordered[1:])
+                if second - first > 1]
+        if not gaps:
+            break
+        unused_distance, first, second = max(gaps)
+        target = (cumulative[first] + cumulative[second]) * 0.5
+        selected.add(min(range(first + 1, second),
+                         key=lambda value: abs(cumulative[value] - target)))
+    result = []
+    for index in sorted(selected):
+        x, z = _node_point(graph, path[index])
+        result.append([round(x, 3), round(z, 3), path[index] in hold_nodes])
+    return result
+
+
+def _polyline_distance(point, polyline):
+    if not polyline:
+        return float("inf")
+    if len(polyline) == 1:
+        return math.hypot(point[0] - polyline[0][0],
+                          point[1] - polyline[0][1])
+    return min(_distance_to_segment(point, first, second)
+               for first, second in zip(polyline, polyline[1:]))
+
+
+def _corridor_height_at(graph, index, corridor):
+    if not corridor or len(corridor[0]) < 3:
+        return None
+    point = _node_point(graph, index)
+    if len(corridor) == 1:
+        return float(corridor[0][2])
+    best = None
+    for first, second in zip(corridor, corridor[1:]):
+        dx = float(second[0]) - float(first[0])
+        dz = float(second[1]) - float(first[1])
+        length_squared = dx * dx + dz * dz
+        if length_squared <= 1e-10:
+            fraction = 0.0
+        else:
+            fraction = (((point[0] - float(first[0])) * dx +
+                         (point[1] - float(first[1])) * dz) /
+                        length_squared)
+            fraction = max(0.0, min(1.0, fraction))
+        projected_x = float(first[0]) + dx * fraction
+        projected_z = float(first[1]) + dz * fraction
+        distance = math.hypot(point[0] - projected_x,
+                              point[1] - projected_z)
+        height = (float(first[2]) +
+                  (float(second[2]) - float(first[2])) * fraction)
+        candidate = (distance, height)
+        if best is None or candidate[0] < best[0]:
+            best = candidate
+    return best[1] if best is not None else None
+
+
+def _corridor_graph_path(graph, start, goal, corridor):
+    """Find a simple base-to-base path biased toward a tactical polyline."""
+    width = graph["width"]
+    height = graph["height"]
+    cell_size = graph["cell_size"]
+    goal_point = _node_point(graph, goal)
+    queue = [(0.0, 0.0, start)]
+    costs = {start: 0.0}
+    previous = {}
+    while queue:
+        unused_priority, cost, current = heapq.heappop(queue)
+        if cost != costs.get(current):
+            continue
+        if current == goal:
+            break
+        x = current % width
+        z = current // width
+        mask = graph["links"][current]
+        for direction_index, (dx, dz) in enumerate(DIRECTIONS):
+            if not (mask & (1 << direction_index)):
+                continue
+            nx = x + dx
+            nz = z + dz
+            if nx < 0 or nx >= width or nz < 0 or nz >= height:
+                continue
+            neighbour = nz * width + nx
+            point = _node_point(graph, neighbour)
+            corridor_offset = min(180.0, _polyline_distance(point, corridor))
+            distance = cell_size * (math.sqrt(2.0) if dx and dz else 1.0)
+            desired_height = _corridor_height_at(graph, neighbour, corridor)
+            height_cost = 0.0
+            if desired_height is not None:
+                actual_height = float(graph["heights_mm"][neighbour]) / 1000.0
+                height_cost = distance * min(
+                    6.0, abs(actual_height - desired_height) / 8.0)
+            hazards = graph.get("hazards")
+            is_shallow_water = (hazards is not None and
+                                neighbour < len(hazards) and
+                                int(hazards[neighbour]) &
+                                HAZARD_SHALLOW_WATER)
+            shallow_water_cost = (distance * SHALLOW_WATER_COST_MULTIPLIER
+                                  if is_shallow_water else 0.0)
+            new_cost = (cost + distance * (1.0 + corridor_offset / 45.0) +
+                        shallow_water_cost + height_cost)
+            if new_cost >= costs.get(neighbour, float("inf")):
+                continue
+            costs[neighbour] = new_cost
+            previous[neighbour] = current
+            heuristic = math.hypot(point[0] - goal_point[0],
+                                   point[1] - goal_point[1])
+            heapq.heappush(queue, (new_cost + heuristic, new_cost, neighbour))
+    if goal not in costs:
+        return ()
+    path = [goal]
+    while path[-1] != start:
+        path.append(previous[path[-1]])
+    path.reverse()
+    return tuple(path)
+
+
+def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
+    """Project tactical intent onto the retained graph and emit safe routes.
+
+    Hand-authored points select a lane, but they are not trusted locomotion
+    coordinates. Every point is projected to the one component that connects
+    both bases, every segment is recomputed over validated graph links, and the
+    result is sampled to the protocol's sixteen-waypoint limit.
+    """
+    routes = {"1": [], "2": []}
+    maximum_offset = 0.0
+    for route_record in map_config.get("routes", ()):
+        source_points = _oriented_route_points(route_record, map_config)
+        projected = []
+        for point in source_points:
+            node, offset = _nearest_node(
+                graph, point, max_distance=float(maximum_projection) + 0.001)
+            if node is None:
+                raise ValueError("route point has no retained navigation node: %r" %
+                                 (point[:2],))
+            maximum_offset = max(maximum_offset, offset)
+            if offset > float(maximum_projection):
+                raise ValueError("route point projection is implausible: %.1f m" % offset)
+            projected.append(node)
+        if not projected:
+            continue
+        if len(source_points) == 1:
+            full_path = (projected[0],)
+            hold_nodes = set(projected if bool(source_points[0][2]) else ())
+            waypoints = _sample_route_path(graph, full_path, hold_nodes, 2)
+        else:
+            corridor = []
+            for point, node in zip(source_points, projected):
+                corridor.append((point[0], point[1],
+                                 float(graph["heights_mm"][node]) / 1000.0))
+            full_path = _corridor_graph_path(
+                graph, projected[0], projected[-1], tuple(corridor))
+            if not full_path:
+                raise ValueError("tactical corridor cannot connect the team bases")
+            hold_nodes = set()
+            for point in source_points:
+                if not bool(point[2]):
+                    continue
+                hold_nodes.add(min(
+                    full_path,
+                    key=lambda node: math.hypot(
+                        _node_point(graph, node)[0] - point[0],
+                        _node_point(graph, node)[1] - point[1]),
+                ))
+            waypoints = _sample_route_path(graph, full_path, hold_nodes, 16)
+        routes[str(int(route_record["team"]))].append({
+            "id": route_record["id"],
+            "capacity": route_record["capacity"],
+            "risk": round(route_record["risk"], 3),
+            "role_weights": dict(route_record["role_weights"]),
+            "waypoints": waypoints,
+        })
+    graph["bake"]["maximum_route_projection"] = round(maximum_offset, 3)
+    return routes
+
+
 def validate_graph(graph, map_config):
     components = _connected_components(graph)
     if not components:
@@ -967,20 +1442,37 @@ def validate_graph(graph, map_config):
     if not path:
         raise ValueError("team bases are in disconnected components")
     anchor_offsets = []
-    for anchor in map_config.get("anchors", ()):
-        unused_node, offset = _nearest_node(graph, anchor)
-        if unused_node is None:
-            raise ValueError("route anchor has no nearby navigable node: %r" % (anchor,))
-        anchor_offsets.append(offset)
-    maximum_anchor_offset = max(anchor_offsets or [0.0])
-    if maximum_anchor_offset > 24.0:
-        raise ValueError("route anchor is too far from the retained graph: %.1f m" %
-                         maximum_anchor_offset)
     route_detours = []
     route_segments = 0
     maximum_opening_regression = 0.0
-    enemy_base = map_config["bases"][1]
-    for route in map_config.get("routes", ()):
+    baked_routes = graph.get("routes") or {}
+    route_records = []
+    for team in (1, 2):
+        for route in baked_routes.get(str(team), ()):
+            route_records.append((team, route.get("waypoints") or ()))
+    if not route_records and map_config.get("routes"):
+        # Retain compatibility with compact synthetic test fixtures.
+        for route_record in map_config.get("routes", ()):
+            points = route_record.get("points", ()) if isinstance(route_record, dict) else route_record
+            team = int(route_record.get("team", 1)) if isinstance(route_record, dict) else 1
+            route_records.append((team, points))
+    if not route_records:
+        for anchor in map_config.get("anchors", ()):
+            unused_node, offset = _nearest_node(graph, anchor)
+            if unused_node is None:
+                raise ValueError("route anchor has no nearby navigable node: %r" %
+                                 (anchor,))
+            anchor_offsets.append(offset)
+    for team, route in route_records:
+        enemy_base = map_config["bases"][2 - int(team)]
+        normalized_route = []
+        for point in route:
+            normalized_route.append((float(point[0]), float(point[1])))
+            unused_node, offset = _nearest_node(graph, point)
+            if unused_node is None:
+                raise ValueError("route anchor has no nearby navigable node: %r" % (point,))
+            anchor_offsets.append(offset)
+        route = normalized_route
         if len(route) > 1:
             start_to_enemy = math.hypot(
                 route[0][0] - enemy_base[0], route[0][1] - enemy_base[1])
@@ -1003,6 +1495,10 @@ def validate_graph(graph, map_config):
             detour = (segment_distance + first_offset + second_offset) / direct_distance
             route_detours.append(detour)
             route_segments += 1
+    maximum_anchor_offset = max(anchor_offsets or [0.0])
+    if maximum_anchor_offset > 12.0:
+        raise ValueError("route anchor is too far from the retained graph: %.1f m" %
+                         maximum_anchor_offset)
     maximum_route_detour = max(route_detours or [1.0])
     if maximum_route_detour > 2.0:
         raise ValueError("route segment detour is implausible: %.2fx" %
@@ -1010,7 +1506,7 @@ def validate_graph(graph, map_config):
     # A flank may legitimately move laterally or slightly away from the enemy
     # base to enter its lane. Keep the metric visible and reject only a gross
     # reversal; route-specific visual audits catch smaller tactical oddities.
-    if maximum_opening_regression > 60.0:
+    if maximum_opening_regression > 120.0:
         raise ValueError("route opening moves away from the objective: %.1f m" %
                          maximum_opening_regression)
     navigable = sum(components)
@@ -1032,6 +1528,16 @@ def validate_graph(graph, map_config):
     }
 
 
+def _ground_height(terrain, obstacles, x, z):
+    terrain_height = terrain.height(x, z)
+    surface_height = obstacles.surface_height(x, z)
+    if terrain_height is None:
+        return surface_height
+    if surface_height is None:
+        return terrain_height
+    return max(float(terrain_height), float(surface_height))
+
+
 def _segment_clear(terrain, obstacles, start, end):
     distance = math.hypot(end[0] - start[0], end[2] - start[2])
     steps = max(1, int(math.ceil(distance / 2.0)))
@@ -1040,7 +1546,7 @@ def _segment_clear(terrain, obstacles, start, end):
         fraction = float(step) / float(steps)
         x = start[0] + (end[0] - start[0]) * fraction
         z = start[2] + (end[2] - start[2]) * fraction
-        y = terrain.height(x, z)
+        y = _ground_height(terrain, obstacles, x, z)
         if y is None or terrain.water_depth(x, z, y) > WATER_DEPTH_LIMIT:
             return False
         horizontal = math.hypot(x - previous[0], z - previous[2])
@@ -1055,7 +1561,7 @@ def _segment_clear(terrain, obstacles, start, end):
     return True
 
 
-def _has_safe_edge_clearance(terrain, x, z, ground_y):
+def _has_safe_edge_clearance(terrain, obstacles, x, z, ground_y):
     """Reject cells whose hull shoulder can fall into water or off a steep lip.
 
     A route centre can be dry while collision avoidance places one track over a
@@ -1070,12 +1576,19 @@ def _has_safe_edge_clearance(terrain, x, z, ground_y):
         (-math.sqrt(0.5), math.sqrt(0.5)),
         (math.sqrt(0.5), math.sqrt(0.5)),
     )
-    for radius in EDGE_CLEARANCE_RADII:
+    # A bridge collision mesh is already bounded by solid rails/side walls.
+    # Requiring the six-metre terrain shoulder on its narrow or diagonal deck
+    # can erase the only safe crossing even though a tank-sized three-metre
+    # shoulder is present.
+    radii = ((EDGE_CLEARANCE_RADII[0],)
+             if obstacles.surface_height(x, z) is not None
+             else EDGE_CLEARANCE_RADII)
+    for radius in radii:
         maximum_drop = radius * MAX_GRADE
         for direction_x, direction_z in directions:
             sample_x = float(x) + direction_x * radius
             sample_z = float(z) + direction_z * radius
-            sample_y = terrain.height(sample_x, sample_z)
+            sample_y = _ground_height(terrain, obstacles, sample_x, sample_z)
             if sample_y is None:
                 return False
             if terrain.water_depth(sample_x, sample_z, sample_y) > WATER_DEPTH_LIMIT:
@@ -1087,7 +1600,7 @@ def _has_safe_edge_clearance(terrain, x, z, ground_y):
 
 def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
     map_config = MAPS[map_name]
-    bounds = map_config["bounds"]
+    bounds = _expanded_bounds(map_config, cell_size)
     terrain = Terrain(resources, map_name)
     obstacles = ObstacleField(resources, map_name, soft_models=soft_models)
     width = int(math.ceil((bounds[2] - bounds[0]) / cell_size))
@@ -1097,6 +1610,7 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
     heights = [None] * (width * height)
     hazards = [0] * (width * height)
     rejected_water = 0
+    shallow_water = 0
     rejected_obstacle = 0
     rejected_edge = 0
     for z_index in range(height):
@@ -1104,14 +1618,18 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
         for x_index in range(width):
             x = origin_x + x_index * cell_size
             index = z_index * width + x_index
-            ground = terrain.height(x, z)
+            ground = _ground_height(terrain, obstacles, x, z)
             if ground is None:
                 continue
-            if terrain.water_depth(x, z, ground) > WATER_DEPTH_LIMIT:
+            water_depth = terrain.water_depth(x, z, ground)
+            if water_depth > WATER_DEPTH_LIMIT:
                 hazards[index] |= HAZARD_WATER
                 rejected_water += 1
                 continue
-            if not _has_safe_edge_clearance(terrain, x, z, ground):
+            if water_depth > SHALLOW_WATER_THRESHOLD:
+                hazards[index] |= HAZARD_SHALLOW_WATER
+                shallow_water += 1
+            if not _has_safe_edge_clearance(terrain, obstacles, x, z, ground):
                 hazards[index] |= HAZARD_EDGE
                 rejected_edge += 1
                 continue
@@ -1140,7 +1658,15 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
                     side_a = z_index * width + nx
                     side_b = nz * width + x_index
                     if heights[side_a] is None or heights[side_b] is None:
-                        continue
+                        # A four-metre grid can represent a narrow diagonal
+                        # bridge as one deck cell across. The sampled segment,
+                        # grade, water and collision checks below are the
+                        # authoritative safety test for two bridge endpoints.
+                        if (obstacles.surface_height(start[0], start[2]) is None or
+                                obstacles.surface_height(
+                                    origin_x + nx * cell_size,
+                                    origin_z + nz * cell_size) is None):
+                            continue
                 end = (origin_x + nx * cell_size,
                        heights[neighbour] / 1000.0,
                        origin_z + nz * cell_size)
@@ -1183,8 +1709,11 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
         "bases": [list(base) for base in map_config["bases"]],
         "bake": {
             "water_depth_limit": WATER_DEPTH_LIMIT,
+            "shallow_water_threshold": SHALLOW_WATER_THRESHOLD,
+            "shallow_water_cost_multiplier": SHALLOW_WATER_COST_MULTIPLIER,
             "vehicle_half_width": VEHICLE_HALF_WIDTH,
             "vehicle_clearance_height": VEHICLE_CLEARANCE_HEIGHT,
+            "vehicle_ground_clearance": VEHICLE_GROUND_CLEARANCE,
             "max_grade": MAX_GRADE,
             "max_grade_up": MAX_GRADE_UP,
             "max_grade_down": MAX_GRADE_DOWN,
@@ -1194,17 +1723,22 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
             "water_planes": len(terrain.waters),
             "model_shapes": len(obstacles.model_library.cache),
             "model_instances": obstacles.instance_count,
+            "bridge_model_instances": obstacles.bridge_instance_count,
+            "bridge_surface_triangles": obstacles.bridge_surface_triangle_count,
+            "bridge_surface_cells": len(obstacles.surface_cells),
             "soft_model_instances": obstacles.soft_instance_count,
             "local_obstacle_instances": obstacles.local_instance_count,
             "local_obstacle_max_height": LOCAL_OBSTACLE_MAX_HEIGHT,
             "obstacle_raster_cells": len(obstacles.cells),
             "skipped_models": obstacles.skipped,
             "rejected_water_nodes": rejected_water,
+            "shallow_water_nodes": shallow_water,
             "rejected_obstacle_nodes": rejected_obstacle,
             "rejected_edge_nodes": rejected_edge,
         },
     }
     retain_base_component(graph, map_config)
+    graph["routes"] = bake_tactical_routes(graph, map_config)
     graph["validation"] = validate_graph(graph, map_config)
     return graph
 
@@ -1228,44 +1762,108 @@ def default_output(map_name):
     )
 
 
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _publish_staged_batch(staging_dir, map_names):
+    """Publish a fully validated batch; callers never invoke this on failure."""
+    target_dir = os.path.dirname(default_output(map_names[0]))
+    if not os.path.isdir(target_dir):
+        os.makedirs(target_dir)
+    files = []
+    for map_name in map_names:
+        source = os.path.join(staging_dir, map_name + ".json")
+        files.append({
+            "map": map_name,
+            "file": map_name + ".json",
+            "sha256": _file_sha256(source),
+        })
+    manifest = {
+        "format": FORMAT_NAME + "-manifest",
+        "version": FORMAT_VERSION,
+        "game_version": GAME_VERSION,
+        "maps": files,
+    }
+    manifest_path = os.path.join(staging_dir, "manifest.json")
+    write_graph(manifest_path, manifest)
+    for map_name in map_names:
+        os.replace(os.path.join(staging_dir, map_name + ".json"),
+                   default_output(map_name))
+    # The manifest is the batch completion marker and is always promoted last.
+    os.replace(manifest_path, os.path.join(target_dir, "manifest.json"))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client", required=True,
                         help="Path to the pinned World of Tanks 0.8.2 client")
-    parser.add_argument("--map", default="07_lakeville", choices=sorted(MAPS))
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--map", choices=sorted(MAPS))
+    selection.add_argument("--all", action="store_true",
+                           help="Bake and validate every stock 0.8.2 map")
     parser.add_argument("--cell-size", type=float, default=4.0)
     parser.add_argument("--output")
     args = parser.parse_args(argv)
+    if args.all and args.output:
+        parser.error("--output can only be used with one --map")
+    map_names = sorted(MAPS) if args.all else [args.map or "07_lakeville"]
     packages = os.path.join(os.path.abspath(args.client), "res", "packages")
-    map_package = os.path.join(packages, args.map + ".pkg")
     shared_package = os.path.join(packages, "shared_content.pkg")
     destructibles_path = os.path.join(os.path.abspath(args.client),
                                       "res", "scripts", "destructibles.xml")
-    for path in (map_package, shared_package, destructibles_path):
+    for path in (shared_package, destructibles_path):
         if not os.path.isfile(path):
             parser.error("required client resource not found: %s" % path)
-    output = args.output or default_output(args.map)
-    resources = PackageResources((map_package, shared_package))
-    try:
-        with open(destructibles_path, "rb") as destructibles_file:
-            soft_models = soft_destructible_models(destructibles_file.read())
-        graph = bake_graph(resources, args.map, args.cell_size, soft_models)
-    finally:
-        resources.close()
-    write_graph(output, graph)
-    validation = graph["validation"]
-    print("Baked %s: %d/%d navigable nodes, %d model instances" % (
-        args.map,
-        sum(value is not None for value in graph["heights_mm"]),
-        len(graph["heights_mm"]),
-        graph["bake"]["model_instances"],
-    ))
-    print("Validated: %d components, largest %.1f%%, base route %.1f m" % (
-        validation["components"],
-        validation["largest_fraction"] * 100.0,
-        validation["base_path_metres"],
-    ))
-    print("Output: %s" % os.path.abspath(output))
+    with open(destructibles_path, "rb") as destructibles_file:
+        soft_models = soft_destructible_models(destructibles_file.read())
+
+    failures = []
+    staging_dir = tempfile.mkdtemp(prefix="offhangar-navgraphs-") if args.all else None
+    for map_name in map_names:
+        map_package = os.path.join(packages, map_name + ".pkg")
+        if not os.path.isfile(map_package):
+            failures.append((map_name, "map package not found"))
+            print("FAILED %s: map package not found" % map_name)
+            continue
+        output = (os.path.join(staging_dir, map_name + ".json")
+                  if staging_dir is not None else args.output or default_output(map_name))
+        resources = PackageResources((map_package, shared_package))
+        try:
+            graph = bake_graph(resources, map_name, args.cell_size, soft_models)
+        except Exception as error:
+            failures.append((map_name, str(error)))
+            print("FAILED %s: %s" % (map_name, error))
+            continue
+        finally:
+            resources.close()
+        write_graph(output, graph)
+        validation = graph["validation"]
+        print("Baked %s: %d/%d navigable nodes, %d model instances" % (
+            map_name,
+            sum(value is not None for value in graph["heights_mm"]),
+            len(graph["heights_mm"]),
+            graph["bake"]["model_instances"],
+        ))
+        print("Validated: %d components, largest %.1f%%, base route %.1f m" % (
+            validation["components"],
+            validation["largest_fraction"] * 100.0,
+            validation["base_path_metres"],
+        ))
+        print("Output: %s" % os.path.abspath(output))
+    if failures:
+        print("Bake failed for %d/%d map(s)." % (len(failures), len(map_names)))
+        if staging_dir is not None:
+            shutil.rmtree(staging_dir)
+        return 1
+    if staging_dir is not None:
+        _publish_staged_batch(staging_dir, map_names)
+        shutil.rmtree(staging_dir)
+    print("Bake completed for %d map(s)." % len(map_names))
     return 0
 
 

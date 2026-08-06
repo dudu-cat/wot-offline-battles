@@ -32,6 +32,10 @@ MAX_CONTACTS_PER_TEAM = 32
 COVER_TTL_SECONDS = 8.0
 MAX_COVER_REPORTS = 16
 MAX_COVER_CANDIDATES = 12
+TARGET_LEASE_SECONDS = 2.0
+TARGET_SWITCH_MARGIN = 3.0
+ROUTE_REBALANCE_SECONDS = 4.0
+ROUTE_LEASE_SECONDS = 6.0
 
 
 def _number(value, default=0.0):
@@ -77,6 +81,7 @@ class BotPlanner(object):
         self._affordances = {}
         self._cover_states = {}
         self._cover_reservations = set()
+        self._target_assignments = {}
 
     def reset(self):
         self.revision = 0
@@ -90,6 +95,7 @@ class BotPlanner(object):
         self._affordances = {}
         self._cover_states = {}
         self._cover_reservations = set()
+        self._target_assignments = {}
 
     def report_contacts(self, contacts, known_targets, now):
         """Store only authority-reported observations after identity checks.
@@ -238,7 +244,7 @@ class BotPlanner(object):
             team_bots = sorted((bot for bot in bots if bot["team"] == team),
                                key=lambda value: value["id"])
             self._rebalance_routes(team, team_bots, contacts[team], now)
-            assignments = self._assign_targets(team_bots, contacts[team])
+            assignments = self._assign_targets(team_bots, contacts[team], now)
             for index, bot in enumerate(team_bots):
                 orders.append(self._order_for(
                     bot, index, len(team_bots), assignments.get(bot["id"]),
@@ -346,6 +352,9 @@ class BotPlanner(object):
         for bot_id in list(self._route_assignments):
             if bot_id not in live_bots:
                 del self._route_assignments[bot_id]
+        for bot_id in list(self._target_assignments):
+            if bot_id not in live_bots:
+                del self._target_assignments[bot_id]
         for bot_id in list(self._engage_anchors):
             if bot_id not in live_bots:
                 del self._engage_anchors[bot_id]
@@ -423,7 +432,7 @@ class BotPlanner(object):
                                      desired * 1.5 + mobility * 210.0))
         return distance
 
-    def _assign_targets(self, bots, contacts):
+    def _assign_targets(self, bots, contacts, now):
         """Assign only locally shootable contacts, with a hard focus cap.
 
         Team spotting is shared intelligence, not proof that every tank has a
@@ -437,6 +446,7 @@ class BotPlanner(object):
         reservations = {}
         assigned = {}
         candidates = []
+        by_bot = {}
         for bot in bots:
             bx = _number(bot["state"].get("x"))
             bz = _number(bot["state"].get("z"))
@@ -454,7 +464,44 @@ class BotPlanner(object):
                 score = 0.0
                 score += contact["health"] / float(max(1, contact["max_health"])) * 28.0
                 score += distance * 0.018
-                candidates.append((score, bot["id"], contact["id"], bot, contact))
+                candidate = (score, bot["id"], contact["id"], bot, contact)
+                candidates.append(candidate)
+                by_bot.setdefault(bot["id"], []).append(candidate)
+
+        # Preserve a valid target through small score changes. Without this,
+        # sub-metre motion between two similar enemies flips the order every
+        # server tick and repeatedly cancels the client's private A* search.
+        for bot in bots:
+            bot_candidates = sorted(by_bot.get(bot["id"], ()))
+            if not bot_candidates:
+                self._target_assignments.pop(bot["id"], None)
+                continue
+            previous = self._target_assignments.get(bot["id"])
+            if not isinstance(previous, dict):
+                continue
+            previous_candidate = None
+            for candidate in bot_candidates:
+                contact = candidate[4]
+                key = (contact.get("target_kind"), contact["id"])
+                if key == previous.get("target"):
+                    previous_candidate = candidate
+                    break
+            if previous_candidate is None:
+                self._target_assignments.pop(bot["id"], None)
+                continue
+            best_score = bot_candidates[0][0]
+            lease_expired = _number(now) >= _number(previous.get("until"))
+            if (lease_expired and
+                    previous_candidate[0] > best_score + TARGET_SWITCH_MARGIN):
+                continue
+            contact = previous_candidate[4]
+            key = (contact.get("target_kind"), contact["id"])
+            if reservations.get(key, 0) >= self._desired_focus(contact):
+                continue
+            reservations[key] = reservations.get(key, 0) + 1
+            assigned[bot["id"]] = contact
+            if lease_expired:
+                previous["until"] = _number(now) + TARGET_LEASE_SECONDS
         for unused_score, unused_bot_id, unused_target_id, bot, contact in sorted(candidates):
             if bot["id"] in assigned:
                 continue
@@ -463,6 +510,13 @@ class BotPlanner(object):
                 continue
             reservations[key] = reservations.get(key, 0) + 1
             assigned[bot["id"]] = contact
+            self._target_assignments[bot["id"]] = {
+                "target": key,
+                "until": _number(now) + TARGET_LEASE_SECONDS,
+            }
+        for bot in bots:
+            if bot["id"] not in assigned:
+                self._target_assignments.pop(bot["id"], None)
         return assigned
 
     @staticmethod
@@ -519,7 +573,7 @@ class BotPlanner(object):
             return
         if _number(now) < _number(self._next_route_rebalance.get(team)):
             return
-        self._next_route_rebalance[team] = _number(now) + 4.0
+        self._next_route_rebalance[team] = _number(now) + ROUTE_REBALANCE_SECONDS
         pressure = dict((route_id, 0.0) for route_id in catalog)
         for contact in contacts:
             route_id = self._nearest_route(contact, catalog)
@@ -543,6 +597,16 @@ class BotPlanner(object):
                            pressure[route_id] - counts[route_id] * 0.45)
         if pressure[target_route] - counts[target_route] * 0.45 <= 0.0:
             return
+        # Re-evaluation happens before a temporary assignment expires. Renew
+        # the same pressured route in place so its waypoint index survives;
+        # only a real route change clears progress below.
+        for bot in bots:
+            assignment = self._route_assignments.get(bot["id"])
+            route = assignment.get("route") if isinstance(assignment, dict) else None
+            if (isinstance(route, dict) and
+                    str(route.get("id") or "") == target_route and
+                    _number(assignment.get("until")) > 0.0):
+                assignment["until"] = _number(now) + ROUTE_LEASE_SECONDS
         candidates = []
         for bot in bots:
             assignment = self._route_assignments.get(bot["id"], {})
@@ -565,7 +629,8 @@ class BotPlanner(object):
             return
         donor = max(candidates)[2]
         self._route_assignments[donor["id"]] = {
-            "route": catalog[target_route], "until": _number(now) + 4.0,
+            "route": catalog[target_route],
+            "until": _number(now) + ROUTE_LEASE_SECONDS,
         }
         self._route_states.pop(donor["id"], None)
 

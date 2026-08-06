@@ -108,13 +108,14 @@ class BotNavigationTest(unittest.TestCase):
         self.assertFalse(grid.near_baked_navigation((22.0, 0.0, 20.0), 1))
 
     def test_prebaked_hazard_mask_does_not_confuse_obstacles_with_cliffs(self):
-        graph = self.baked_graph(3, 1, blocked=((1, 0),))
-        graph["hazards"] = [0, 0, 2]
+        graph = self.baked_graph(3, 1)
+        graph["hazards"] = [0, 4, 2]
         grid = self.navigation.TerrainGrid(lambda *args: None, baked_graph=graph)
 
         self.assertFalse(grid.baked_hazard_near((10.0, 0.0, 20.0)))
         self.assertFalse(grid.baked_hazard_near((14.0, 0.0, 20.0)))
         self.assertTrue(grid.baked_hazard_near((18.0, 0.0, 20.0)))
+        self.assertGreater(grid._penalty((1, 0), None), 0.0)
 
     def test_shipped_lakeville_graph_connects_every_route_both_ways(self):
         graph_path = (
@@ -761,7 +762,7 @@ class BotNavigationTest(unittest.TestCase):
         ).read_text()
 
         self.assertIn(
-            "_OFFH_AI_WATER_AVOID_DEPTH = 0.12",
+            "_OFFH_AI_WATER_AVOID_DEPTH = 0.90",
             battle_source,
         )
         water_helper = battle_source[

@@ -123,7 +123,7 @@ def _safe_import_offhangar():
 	              'bot_ai_maps_extra',
 	              'bot_ai_maps', 'bot_ai', 'prebaked_navigation',
 	              'bot_ai_navigation', 'bot_ai_cover',
-	              'bot_ai_driver',
+	              'bot_ai_driver', 'spectator_minimap',
 	              'state', 'session_guards', 'offline_battle_stack', 'offline_battle',
 	              'data', 'command_router', 'command_handlers', 'server',
 	              'destructibles_authority', 'pen_indicator', 'lan_settings', 'lan_waiting_room',

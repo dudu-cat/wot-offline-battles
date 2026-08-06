@@ -96,8 +96,9 @@ BOT AI reports=t1:2,t2:3 accepted=5 contacts=t1:2/2,t2:3/3 targets=t1:8,t2:9 fir
 is visible/remembered state accepted by the server, `targets` is the number of
 bots with a combat target, and `fire` is the number currently authorized to
 shoot. `nav=baked` is direct proof that the shipped graph is active; `runtime`
-means this map is still using live terrain probes. `nav_total` is cumulative
-while `nav_active`, `aim` and `driver` are
+means a developer build fell back to live terrain probes because its graph was
+missing or rejected. Every stock map in the complete package should report
+`baked`. `nav_total` is cumulative while `nav_active`, `aim` and `driver` are
 current samples. `tick_age` reveals a stalled path scheduler. A healthy order
 pipeline has matching `orders` server/client/acked revisions and `loaded:29`;
 `wait` counts bots deliberately holding while an order body is being recovered.
@@ -108,9 +109,10 @@ client debug logging.
 
 Long terrain routes use bounded weighted-A* continuations instead of one large
 search per bot. Moving tanks are handled by the local driver and are not baked
-into the shared static path cache. Water deeper than 12 cm is a hard navigation
-boundary for routes, local steering, cover and peek positions; this deliberately
-forgoes shallow fords to keep autonomous tanks out of rivers and harbours.
+into the shared static path cache. Water deeper than 90 cm is a hard navigation
+boundary. Water from 12 cm through 90 cm is marked as a high-cost shallow ford,
+so a bot uses a required ford but strongly prefers a dry route. Runtime steering,
+cover and peek safety use the same deep-water limit.
 
 If a snapshot cannot be delivered, the server prints `SEND DROP` with the
 player and socket error before removing that connection. An unexpected tick

@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import sys
 import tempfile
@@ -77,6 +78,88 @@ class PrebakedNavigationLoaderTest(unittest.TestCase):
             graph_path.write_text(json.dumps(invalid))
             with self.assertRaises(ValueError):
                 loader.load_graph("07_lakeville")
+
+    def test_complete_manifest_rejects_a_tampered_graph(self):
+        with tempfile.TemporaryDirectory() as directory:
+            navgraphs = Path(directory) / "navgraphs"
+            navgraphs.mkdir()
+            graph_path = navgraphs / "07_lakeville.json"
+            payload = json.dumps(self.graph(), sort_keys=True).encode("utf-8")
+            graph_path.write_bytes(payload)
+            manifest = {
+                "format": "offhangar-navgraph-manifest",
+                "version": 1,
+                "game_version": "0.8.2",
+                "maps": [{
+                    "map": "07_lakeville",
+                    "file": "07_lakeville.json",
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }],
+            }
+            (navgraphs / "manifest.json").write_text(json.dumps(manifest))
+            loader = load_navigation_loader(directory)
+            loader.STOCK_MAPS = ("07_lakeville",)
+
+            self.assertEqual(
+                "07_lakeville", loader.load_graph("07_lakeville")["map"]
+            )
+            graph_path.write_bytes(payload + b"\n")
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                loader.load_graph("07_lakeville")
+
+    def test_shipped_bundle_contains_every_validated_stock_map(self):
+        mod_directory = ROOT / "scripts/client/gui/mods/offhangar"
+        loader = load_navigation_loader(mod_directory)
+        manifest = json.loads(
+            (mod_directory / "navgraphs/manifest.json").read_text()
+        )
+        self.assertEqual(set(loader.STOCK_MAPS), {
+            record["map"] for record in manifest["maps"]
+        })
+
+        loaded = {}
+        for map_name in loader.STOCK_MAPS:
+            graph = loader.load_graph(map_name)
+            loaded[map_name] = graph
+            self.assertEqual(1, graph["validation"]["components"], map_name)
+            self.assertEqual(1.0, graph["validation"]["largest_fraction"], map_name)
+            for team in ("1", "2"):
+                self.assertTrue(graph["routes"][team], (map_name, team))
+                for route in graph["routes"][team]:
+                    self.assertLessEqual(len(route["waypoints"]), 16)
+                    for x, z, unused_hold in route["waypoints"]:
+                        cell_x = int(round(
+                            (x - graph["origin"][0]) / graph["cell_size"]
+                        ))
+                        cell_z = int(round(
+                            (z - graph["origin"][1]) / graph["cell_size"]
+                        ))
+                        index = cell_z * graph["width"] + cell_x
+                        self.assertIsNotNone(
+                            graph["heights_mm"][index],
+                            (map_name, team, route["id"], x, z),
+                        )
+
+        himmelsdorf = loaded["04_himmelsdorf"]
+        routes = {route["id"]: route for route in himmelsdorf["routes"]["1"]}
+        self.assertEqual({"rail", "banana", "hill", "rear_guard"}, set(routes))
+
+        def route_heights(route):
+            result = []
+            for x, z, unused_hold in route["waypoints"]:
+                cell_x = int(round(
+                    (x - himmelsdorf["origin"][0]) / himmelsdorf["cell_size"]
+                ))
+                cell_z = int(round(
+                    (z - himmelsdorf["origin"][1]) / himmelsdorf["cell_size"]
+                ))
+                index = cell_z * himmelsdorf["width"] + cell_x
+                result.append(himmelsdorf["heights_mm"][index] / 1000.0)
+            return result
+
+        self.assertLess(min(point[0] for point in routes["rail"]["waypoints"]), -200)
+        self.assertLess(max(route_heights(routes["banana"])), 10.0)
+        self.assertGreater(max(route_heights(routes["hill"])), 40.0)
 
 
 if __name__ == "__main__":

@@ -423,8 +423,15 @@ class LANClient(object):
 		changed = authority_id != self.bot_authority_id
 		self.bot_authority_id = authority_id
 		self.player._offhangar_network_authority_id = authority_id
+		was_authority = bool(getattr(
+			self.player, '_offhangar_network_is_authority', False))
 		self.player._offhangar_network_is_authority = (
 			authority_id is not None and authority_id == self.player_id)
+		if self.player._offhangar_network_is_authority and not was_authority:
+			# The next canonical snapshot must be applied once before this client
+			# begins simulating. Otherwise a relay promotes its interpolated pose and
+			# zero local speed instead of the server's final authority state.
+			self.player._offhangar_network_authority_handoff_pending = True
 		if changed and self.phase == 'battle':
 			role = 'simulation authority' if self.player._offhangar_network_is_authority else 'relay client'
 			LOG_NOTE('LAN bot authority=%s; local role=%s' % (authority_id, role))
@@ -1095,6 +1102,21 @@ def publish_bot_observation(player, contacts, affordances=None, navigation=None)
 				'armor': max(0.0, _finite_float(raw.get('armor'))),
 				'visible': _protocol_bool(raw.get('visible'), True),
 			}
+			# Team spotting and local firing lanes are separate facts. Always send
+			# the current client's bounded list, including [] when no bot can shoot;
+			# omission is reserved for genuinely older protocol-v5 packages.
+			shootable = []
+			seen_bot_ids = set()
+			for raw_bot_id in (raw.get('shootable_by_bot_ids') or ())[:64]:
+				try:
+					bot_id = int(raw_bot_id)
+				except Exception:
+					continue
+				if bot_id <= 0 or bot_id in seen_bot_ids:
+					continue
+				seen_bot_ids.add(bot_id)
+				shootable.append(bot_id)
+			item['shootable_by_bot_ids'] = shootable
 			payload.append(item)
 		except Exception:
 			continue
@@ -1318,6 +1340,9 @@ def publish_authoritative_bots(player, mocks):
 				'x': server_pos[0], 'y': server_pos[1], 'z': server_pos[2],
 				'yaw': server_yaw, 'aim_yaw': server_aim_yaw,
 				'gun_pitch': _finite_float(getattr(mock, '_gun_pitch', 0.0)),
+				'speed': _finite_float(getattr(mock, '_veh_velocity', 0.0)),
+				'turn_velocity': _finite_float(
+					getattr(mock, '_veh_turn_velocity', 0.0)),
 				'fire_seq': int(getattr(mock, '_network_bot_fire_seq', 0) or 0),
 				'shell_index': int(getattr(mock, '_network_bot_shell_index', 0) or 0),
 				'health': max(0, int(getattr(mock, 'health', 0) or 0)),
@@ -1782,14 +1807,18 @@ def _apply_remote_transform(player, mock, world, yaw):
 
 
 def _queue_network_transform(player, mock, world, hull_yaw, aim_yaw,
-		gun_pitch, snap=False):
+		gun_pitch, snap=False, longitudinal_speed=None, turn_velocity=None):
 	"""Queue a 30 Hz pose; the battle frame loop renders between packets."""
 	if mock is None or world is None:
 		return
 	now = time.time()
 	previous_target = getattr(mock, '_network_target_position', None)
 	previous_time = float(getattr(mock, '_network_target_time', 0.0) or 0.0)
-	if previous_target is not None and previous_time > 0.0 and now > previous_time:
+	if longitudinal_speed is not None:
+		speed = max(-80.0, min(80.0, _finite_float(longitudinal_speed, 0.0)))
+		mock._network_target_velocity = (
+			math.sin(hull_yaw) * speed, 0.0, math.cos(hull_yaw) * speed)
+	elif previous_target is not None and previous_time > 0.0 and now > previous_time:
 		delta = max(0.01, min(now - previous_time, 0.25))
 		vx = (world.x - previous_target.x) / delta
 		vy = (world.y - previous_target.y) / delta
@@ -1807,6 +1836,9 @@ def _queue_network_transform(player, mock, world, hull_yaw, aim_yaw,
 	mock._network_target_yaw = hull_yaw
 	mock._network_target_aim_yaw = aim_yaw
 	mock._network_target_gun_pitch = gun_pitch
+	if turn_velocity is not None:
+		mock._network_target_turn_velocity = max(
+			-10.0, min(10.0, _finite_float(turn_velocity, 0.0)))
 	mock._network_target_time = now
 	if snap or not getattr(mock, '_network_smoothing_ready', False):
 		_apply_remote_transform(player, mock, world, hull_yaw)
@@ -1851,7 +1883,11 @@ def advance_network_smoothing(player, mocks, frame_dt):
 			if target is None or current is None:
 				continue
 			vx, vy, vz = getattr(mock, '_network_target_velocity', (0.0, 0.0, 0.0))
-			predict = max(0.0, min(now - float(getattr(mock, '_network_target_time', now)), 0.05))
+			# Explicit authority velocity makes prediction useful even when the
+			# authority renders below 30 FPS. Keep the LAN horizon bounded so a lost
+			# packet cannot make a tank coast indefinitely.
+			predict = max(0.0, min(
+				now - float(getattr(mock, '_network_target_time', now)), 0.12))
 			px = target.x + vx * predict
 			py = target.y + vy * predict
 			pz = target.z + vz * predict
@@ -1985,13 +2021,14 @@ def _apply_remote_state(player, state):
 		pass
 
 
-def _apply_bot_state(player, state):
+def _apply_bot_state(player, state, force_authority_pose=False):
 	mock = _find_bot(state.get('id'))
 	if mock is None:
 		return
 	try:
 		target_alive = bool(state.get('alive', True))
-		if not network_is_authority(player):
+		is_authority = network_is_authority(player)
+		if not is_authority or force_authority_pose:
 			previous_fire = int(getattr(mock, '_network_seen_fire_seq', 0) or 0)
 			fire_seq = int(state.get('fire_seq', previous_fire) or 0)
 			death_locked = bool(getattr(mock, '_network_death_notified', False))
@@ -2002,8 +2039,14 @@ def _apply_bot_state(player, state):
 			if not death_locked:
 				_queue_network_transform(player, mock, world, world_yaw, world_aim_yaw,
 					_finite_float(state.get('gun_pitch'), getattr(mock, '_gun_pitch', 0.0)),
-					not target_alive)
-			if fire_seq > previous_fire:
+					force_authority_pose or not target_alive,
+					state.get('speed'), state.get('turn_velocity'))
+			if force_authority_pose:
+				mock._veh_velocity = max(-80.0, min(
+					80.0, _finite_float(state.get('speed'), 0.0)))
+				mock._veh_turn_velocity = max(-10.0, min(
+					10.0, _finite_float(state.get('turn_velocity'), 0.0)))
+			if not is_authority and fire_seq > previous_fire:
 				try:
 					import sys
 					offline = sys.modules.get('gui.mods.offhangar.offline_battle')
@@ -2019,7 +2062,7 @@ def _apply_bot_state(player, state):
 			mock._network_bot_shell_index = int(state.get('shell_index', 0) or 0)
 		_push_mock_health(player, mock, state.get('health', mock.health),
 			state.get('max_health', mock.maxHealth), target_alive)
-		if not network_is_authority(player):
+		if not is_authority:
 			update_remote_spotting(player, mock)
 	except Exception:
 		LOG_ERROR('LAN bot state apply failed:', state.get('id'))
@@ -2031,8 +2074,12 @@ def _apply_snapshot(player, message):
 			_apply_local_state(player, state)
 		else:
 			_apply_remote_state(player, state)
+	handoff = bool(getattr(
+		player, '_offhangar_network_authority_handoff_pending', False))
 	for state in message.get('bots') or []:
-		_apply_bot_state(player, state)
+		_apply_bot_state(player, state, handoff)
+	if handoff and message.get('bots'):
+		player._offhangar_network_authority_handoff_pending = False
 	rules = message.get('rules')
 	if rules is not None:
 		callback = getattr(player, '_offhangar_apply_network_rules_state', None)

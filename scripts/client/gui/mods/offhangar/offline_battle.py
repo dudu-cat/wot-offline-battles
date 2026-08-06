@@ -657,10 +657,11 @@ def _offh_water_depth(x, y, z):
 	return 20.0 - _w
 
 
-# Bot navigation treats water as a hard boundary. This is intentionally much
-# stricter than the player drowning threshold: giving up shallow fords is safer
-# than letting momentum carry an autonomous tank over a river or harbour edge.
-_OFFH_AI_WATER_AVOID_DEPTH = 0.12
+# Stock maps include shallow fords as intentional tank routes.  The prebaked
+# graph strongly prefers dry ground and still rejects water deeper than this;
+# local steering uses the same limit so it can follow a validated ford without
+# fighting the rollback guard on every frame.
+_OFFH_AI_WATER_AVOID_DEPTH = 0.90
 
 
 def _offh_ai_probe_reject(vehicle, reason):
@@ -1693,8 +1694,17 @@ def _offh_ai_director(player):
 			seed = client.round_id
 	except Exception:
 		pass
+	baked_graph = globals().get('g_offh_baked_navigation_graph')
+	if baked_graph is None:
+		try:
+			from gui.mods.offhangar.prebaked_navigation import load_graph
+			baked_graph = load_graph(map_name)
+			globals()['g_offh_baked_navigation_graph'] = baked_graph
+		except Exception as error:
+			_offh_ai_navigation_failure('load', error)
 	director = BattleDirector(map_name, seed, bases,
-	                          globals().get('g_offline_bounds'))
+	                          globals().get('g_offline_bounds'),
+	                          (baked_graph or {}).get('routes'))
 	globals()['g_offh_bot_director'] = director
 	LOG_DEBUG('OfflineBattle.SMART_AI map=%s seed=%s tactical=%s' % (
 		director.map_name, str(seed), str(director.map_data is not None)))
@@ -1733,12 +1743,14 @@ def _offh_ai_navigator(director):
 		return None
 	import BigWorld, Math, math
 	from gui.mods.offhangar.bot_ai_navigation import TerrainNavigator
-	baked_graph = None
-	try:
-		from gui.mods.offhangar.prebaked_navigation import load_graph
-		baked_graph = load_graph(getattr(director, 'map_name', ''))
-	except Exception as error:
-		_offh_ai_navigation_failure('load', error)
+	baked_graph = globals().get('g_offh_baked_navigation_graph')
+	if baked_graph is None:
+		try:
+			from gui.mods.offhangar.prebaked_navigation import load_graph
+			baked_graph = load_graph(getattr(director, 'map_name', ''))
+			globals()['g_offh_baked_navigation_graph'] = baked_graph
+		except Exception as error:
+			_offh_ai_navigation_failure('load', error)
 
 	def _ground_probe(x, z, hint_y):
 		# Stay on the current terrain layer. A long top-down ray can select a
@@ -2321,7 +2333,13 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 				if distance_sq <= view_range * view_range:
 					candidates.append((distance_sq, observer))
 			candidates.sort(key=lambda item: item[0])
-			for distance_sq, observer in candidates[:3]:
+			confirmed_los = False
+			for candidate_index, (distance_sq, observer) in enumerate(candidates):
+				# Three probes are the steady-state budget. If all three are blocked,
+				# continue only until one farther observer proves a real lane instead
+				# of permanently declaring the target invisible.
+				if candidate_index >= 3 and confirmed_los:
+					break
 				proximity_visible = distance_sq <= 2500.0
 				has_los = _offh_ai_has_los(
 					observer['position'], target['position'])
@@ -2332,6 +2350,7 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 					# may grant this observer a target assignment.
 					if not has_los:
 						continue
+					confirmed_los = True
 					if observer.get('target_kind') == 'bot':
 						observer_entity_id = int(observer['id'])
 						if observer_entity_id not in shootable_by_entity_ids:
@@ -2576,6 +2595,7 @@ def _offh_battle_sweep(tag='exit'):
 		globals()['g_offh_exhaust_owners'] = []
 		globals().pop('g_offh_bot_director', None)
 		globals().pop('g_offh_terrain_navigator', None)
+		globals().pop('g_offh_baked_navigation_graph', None)
 		globals().pop('g_offh_local_driver', None)
 		globals().pop('g_offh_ai_hull_dims', None)
 		globals().pop('g_offh_ai_local_covers', None)
@@ -5838,6 +5858,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		_offh_my_gen = [globals()['g_offh_battle_gen']]
 		globals().pop('g_offh_bot_director', None)
 		globals().pop('g_offh_terrain_navigator', None)
+		globals().pop('g_offh_baked_navigation_graph', None)
 		globals().pop('g_offh_local_driver', None)
 		globals().pop('g_offh_ai_hull_dims', None)
 		globals().pop('g_offh_ai_local_covers', None)
@@ -9386,7 +9407,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_driver_neighbours,
 								lambda _driver_yaw: _offh_ai_direction_clear(
 									m_veh, _driver_yaw),
-								_own_velocity, _own_half_length, _own_half_width)
+								_own_velocity, _own_half_length, _own_half_width,
+								not (_ai_throttle_override is not None and
+								     float(_ai_throttle_override) <= 0.0))
 							throttle = float(_driver_order.get('throttle', 0.0))
 							turn_dir = float(_driver_order.get('turn', 0.0))
 							target_yaw = float(_driver_order.get('target_yaw', _raw_target_yaw))
@@ -11268,6 +11291,20 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									if _bw2 is not None:
 										if hasattr(_bw2, 'onPostmortemVehicleChanged'):
 											_bw2.onPostmortemVehicleChanged(_aid)
+										# Stock 0.8.2 moves both the player and camera minimap
+										# markers in Minimap.__resetCamera('postmortem'). That
+										# method requires a real BigWorld entity; use the same
+										# matrices directly for offline mock vehicles.
+										try:
+											from gui.mods.offhangar.spectator_minimap import follow_mock_vehicle
+											follow_mock_vehicle(
+												getattr(_bw2, 'minimap', None),
+												getattr(_pl_s, 'playerVehicleID', -1), _aid,
+												getattr(_amock, 'matrix', None),
+												_pl_s.getOwnVehicleMatrix(),
+												getattr(BigWorld.camera(), 'invViewMatrix', None), Math)
+										except Exception as _sme:
+											LOG_DEBUG('Spectator minimap bind error:', str(_sme))
 										# switchToVehicle() waits for a real BigWorld.entity (offline mocks never
 										# are) so it resets HP to 0 forever - feed the mock's max HP straight in.
 										_dp = getattr(_bw2, 'damagePanel', None)

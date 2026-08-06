@@ -169,6 +169,9 @@ class BattleState:
         self.max_players = max(1, min(int(max_players), 64))
         self.players: Dict[int, Player] = {}
         self.next_id = 1
+        # Keep teams balanced, but do not permanently pin the room creator to
+        # team 1 (and therefore to the same physical spawn on every map).
+        self.next_balanced_team = random.choice((1, 2))
         self.tick = 0
         self.lock = threading.RLock()
         self.running = True
@@ -257,12 +260,25 @@ class BattleState:
             })
         return old, self.bot_authority_id
 
-    def _spawn_for(self, player_id, team):
+    def _spawn_for(self, slot, team):
         # Coordinates are intentionally simple and are also sent to clients.
         # The client maps these onto the same local battle space.
         # Keep the synthetic arena small; clients map it onto the loaded map.
-        slot = (player_id - 1) // 2
         return self._spawn_x_for(slot), self._spawn_z_for(team), (0.0 if team == 1 else math.pi)
+
+    def _assign_team_and_slot(self):
+        counts = {1: 0, 2: 0}
+        for player in self.players.values():
+            if player.connected and player.team in counts:
+                counts[player.team] += 1
+        if counts[1] < counts[2]:
+            team = 1
+        elif counts[2] < counts[1]:
+            team = 2
+        else:
+            team = self.next_balanced_team
+            self.next_balanced_team = 1 if team == 2 else 2
+        return team, counts[team]
 
     @staticmethod
     def _spawn_x_for(slot):
@@ -295,9 +311,8 @@ class BattleState:
                 return None, "full"
             player_id = self.next_id
             self.next_id += 1
-            team = 1 if player_id % 2 else 2
-            slot = (player_id - 1) // 2
-            x, z, yaw = self._spawn_for(player_id, team)
+            team, slot = self._assign_team_and_slot()
+            x, z, yaw = self._spawn_for(slot, team)
             player = Player(
                 player_id=player_id,
                 conn=conn,
@@ -328,6 +343,7 @@ class BattleState:
                 self.phase = "waiting"
                 self.round_id += 1
                 self.next_id = 1
+                self.next_balanced_team = random.choice((1, 2))
                 self.tick = 0
                 self.map_name = self._choose_map()
                 self.bot_roster = self._new_bot_roster()
@@ -684,6 +700,9 @@ class BattleState:
             "yaw": round(yaw, 5),
             "aim_yaw": round(_finite_float(raw.get("aim_yaw"), yaw), 5),
             "gun_pitch": round(_clamp(_finite_float(raw.get("gun_pitch")), -1.2, 1.2), 5),
+            "speed": round(_clamp(_finite_float(raw.get("speed")), -80.0, 80.0), 4),
+            "turn_velocity": round(_clamp(
+                _finite_float(raw.get("turn_velocity")), -10.0, 10.0), 5),
             "fire_seq": fire_seq,
             "shell_index": max(0, min(int(_finite_float(raw.get("shell_index"), 0)), 9)),
             "health": reported_health,

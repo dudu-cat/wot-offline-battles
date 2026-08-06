@@ -47,6 +47,9 @@ class WaitingRoomTest(unittest.TestCase):
     def setUp(self):
         state = BattleState(map_name="04_himmelsdorf", max_players=30)
         self.state = state
+        # Most integration assertions use a stable team order. A separate test
+        # below exercises the randomized first-player side explicitly.
+        self.state.next_balanced_team = 1
         self.server = ThreadedTCPServer(("127.0.0.1", 0), ClientHandler)
         self.server.game_server = type("GameServer", (), {"state": state})()
         self.thread = threading.Thread(target=self.server.serve_forever)
@@ -81,6 +84,17 @@ class WaitingRoomTest(unittest.TestCase):
         self.assertEqual("04_himmelsdorf", welcome["map"])
         self.assertEqual(welcome["map"], started["map"])
         self.assertEqual(1, len(started["players"]))
+
+    def test_first_player_side_can_start_on_team_two_and_remains_balanced(self):
+        self.state.next_balanced_team = 2
+        first = self.connect("NorthOrSouth")
+        first_welcome = first.receive_type("welcome")
+        first.receive_type("roster")
+        second = self.connect("BalancedPeer")
+        second_welcome = second.receive_type("welcome")
+
+        self.assertEqual((2, 0), (first_welcome["team"], first_welcome["slot"]))
+        self.assertEqual((1, 0), (second_welcome["team"], second_welcome["slot"]))
 
     def test_start_request_selects_and_validates_the_map(self):
         client = self.connect("MapPicker")
@@ -295,10 +309,14 @@ class WaitingRoomTest(unittest.TestCase):
         self.assertEqual(880, first_welcome["max_health"])
         self.assertEqual((1, 2), (first_welcome["team"], second_welcome["team"]))
         self.assertEqual((0, 0), (first_welcome["slot"], second_welcome["slot"]))
-        self.assertEqual((1, 1), (third_welcome["team"], third_welcome["slot"]))
+        self.assertIn(third_welcome["team"], (1, 2))
+        self.assertEqual(1, third_welcome["slot"])
         third_state = [player for player in third_roster["players"] if player["id"] == 3][0]
         self.assertEqual(12.0, third_state["spawn_x"])
-        self.assertEqual(-35.0, third_state["spawn_z"])
+        self.assertEqual(
+            -35.0 if third_welcome["team"] == 1 else 35.0,
+            third_state["spawn_z"],
+        )
 
     def test_client_resolved_shot_and_hit_are_broadcast(self):
         first = self.connect("Alpha")

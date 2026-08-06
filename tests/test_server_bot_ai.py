@@ -320,6 +320,31 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertTrue(all(order["target_id"] is None
                             for order in orders if order not in assigned))
 
+    def test_similar_targets_do_not_flip_on_submetre_position_jitter(self):
+        planner = BotPlanner()
+        bot = {
+            "id": 1, "team": 1, "slot": 0, "profile": {}, "route": {},
+            "state": {"x": -0.2, "z": 0.0},
+        }
+        contacts = [
+            {"id": 10, "target_kind": "human", "visible": True,
+             "position": {"x": -40.0, "z": 100.0}, "health": 1000,
+             "max_health": 1000, "shootable_by_bot_ids": [1]},
+            {"id": 11, "target_kind": "human", "visible": True,
+             "position": {"x": 40.0, "z": 100.0}, "health": 1000,
+             "max_health": 1000, "shootable_by_bot_ids": [1]},
+        ]
+
+        first = planner._assign_targets([bot], contacts, 1.0)[1]["id"]
+        bot["state"]["x"] = 0.2
+        second = planner._assign_targets([bot], contacts, 3.1)[1]["id"]
+
+        self.assertEqual(first, second)
+
+        contacts[0 if first == 10 else 1]["shootable_by_bot_ids"] = []
+        switched = planner._assign_targets([bot], contacts, 3.2)[1]["id"]
+        self.assertNotEqual(first, switched)
+
     def test_close_visible_threat_holds_to_fight_without_cover(self):
         planner = BotPlanner()
         manifest = _manifest()
@@ -901,6 +926,35 @@ class ServerBotPlannerTests(unittest.TestCase):
         recovered = planner.build_orders(changed_manifest, states, players, 2.0)
         recovered_one = next(value for value in recovered["orders"] if value["id"] == 1)
         self.assertEqual("left", recovered_one["route_id"])
+
+    def test_same_pressured_route_renews_without_losing_waypoint_state(self):
+        planner = BotPlanner()
+        profile = {"roles": {"support": 0.9, "flanker": 0.8, "brawler": 0.1}}
+        left = {"id": "left", "waypoints": [{"x": -80, "z": 0}]}
+        right = {"id": "right", "waypoints": [{"x": 80, "z": 0}]}
+        bots = [
+            {"id": 1, "team": 1, "slot": 0, "profile": profile,
+             "route": left, "state": {"x": -80, "z": 0}},
+            {"id": 2, "team": 1, "slot": 1, "profile": profile,
+             "route": left, "state": {"x": -70, "z": 0}},
+            {"id": 3, "team": 1, "slot": 2, "profile": profile,
+             "route": right, "state": {"x": 80, "z": 0}},
+        ]
+        contacts = [{
+            "id": 99, "position": {"x": 80, "z": 20},
+            "health": 1000, "max_health": 1000,
+        }]
+
+        planner._rebalance_routes(1, bots, contacts, 1.0)
+        donor = next(bot_id for bot_id, assignment in planner._route_assignments.items()
+                     if assignment["route"]["id"] == "right" and bot_id != 3)
+        route_state = {"route_id": "right", "index": 1, "hold_until": 0.0}
+        planner._route_states[donor] = route_state
+
+        planner._rebalance_routes(1, bots, contacts, 5.01)
+
+        self.assertIs(route_state, planner._route_states[donor])
+        self.assertGreater(planner._route_assignments[donor]["until"], 5.01)
 
 if __name__ == "__main__":
     unittest.main()
