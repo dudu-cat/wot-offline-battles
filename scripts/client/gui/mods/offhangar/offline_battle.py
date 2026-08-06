@@ -938,15 +938,14 @@ def _offh_knock_out_everything(mock, is_player):
 			try: _panel.updateHealth(_hp)
 			except Exception: pass
 		try:
-			import BigWorld as _bwr
 			# Spread over the whole post-mortem: WG's DamagePanel._updateSelf ticks every
 			# 30 ms and calls onVehicleDestroyed() the moment the vehicle reads as dead,
 			# which greys the panel. Re-push past that point so the red module icons are
 			# what remains on screen.
-			_bwr.callback(0.1, _reassert)
-			_bwr.callback(0.5, _reassert)
-			_bwr.callback(1.5, _reassert)
-			_bwr.callback(3.0, _reassert)
+			_offh_battle_callback(0.1, _reassert)
+			_offh_battle_callback(0.5, _reassert)
+			_offh_battle_callback(1.5, _reassert)
+			_offh_battle_callback(3.0, _reassert)
 		except Exception:
 			pass
 	except Exception:
@@ -1230,6 +1229,190 @@ def _offh_del_model(m):
 			pass
 	except:
 		pass
+
+
+def _offh_load_hit_testers(type_descriptor):
+	"""Load and remember the unique BSP testers used by this battle.
+
+	Retail Vehicle.onEnterWorld adds every loaded tester to PlayerAvatar.hitTesters,
+	then PlayerAvatar.onLeaveWorld releases that set exactly once. Offline tanks are
+	not Vehicle entities, so reproduce that ownership explicitly.
+	"""
+	loaded = globals().setdefault('g_offh_loaded_hit_testers', {})
+	new_count = 0
+	if type_descriptor is None:
+		return new_count
+	for hit_tester in type_descriptor.getHitTesters():
+		if hit_tester is None:
+			continue
+		key = id(hit_tester)
+		if key in loaded:
+			continue
+		try:
+			hit_tester.loadBspModel()
+		except Exception:
+			continue
+		# Match retail Vehicle.onEnterWorld: ownership begins only after the native
+		# load succeeds, so a failed acquisition is never released on exit.
+		loaded[key] = hit_tester
+		new_count += 1
+	return new_count
+
+
+def _offh_release_hit_testers():
+	"""Retail-equivalent release of the battle's unique vehicle BSP testers."""
+	loaded = globals().pop('g_offh_loaded_hit_testers', {}) or {}
+	released = 0
+	failed = 0
+	for hit_tester in list(loaded.values()):
+		try:
+			hit_tester.releaseBspModel()
+			released += 1
+		except Exception:
+			failed += 1
+	return released, failed
+
+
+def _offh_detach_stickers(source, seen=None):
+	"""Detach VehicleStickers before dropping their Python containers.
+
+	The stock appearance calls detachStickers while the component nodes still
+	exist. Clearing our lists/dicts first leaves the native WGStickerModel attached
+	to a model that is about to be deleted.
+	"""
+	if seen is None:
+		seen = {}
+	if source is None:
+		return 0
+	if isinstance(source, dict):
+		values = list(source.values())
+	elif isinstance(source, (list, tuple, set)):
+		values = list(source)
+	else:
+		values = [source]
+	detached = 0
+	for value in values:
+		sticker = value
+		if isinstance(value, (list, tuple)) and value:
+			sticker = value[0]
+		if sticker is None or not hasattr(sticker, 'detachStickers'):
+			continue
+		key = id(sticker)
+		if key in seen:
+			continue
+		seen[key] = True
+		try:
+			sticker.detachStickers()
+			detached += 1
+		except Exception:
+			pass
+	return detached
+
+
+def _offh_battle_entity_ids(*sources):
+	"""Collect owned battle entities from every engine container, deduplicated."""
+	entity_ids = {}
+	for source in sources:
+		if source is None:
+			continue
+		try:
+			items = list(source.items())
+		except Exception:
+			continue
+		for entity_id, entity in items:
+			try:
+				if entity.__class__.__name__ in ('OfflineEntity', 'AreaDestructibles'):
+					entity_ids[entity_id] = True
+			except Exception:
+				pass
+	return list(entity_ids.keys())
+
+
+def _offh_battle_callback(delay, callback):
+	"""Schedule a battle-owned callback that the sweep can cancel safely."""
+	import BigWorld
+	callbacks = globals().setdefault('g_offh_battle_callbacks', {})
+	generation = globals().get('g_offh_battle_gen', 0)
+	holder = [None]
+	def _run():
+		callback_id = holder[0]
+		if callback_id is not None:
+			callbacks.pop(callback_id, None)
+		if globals().get('g_offh_battle_gen', 0) != generation:
+			return
+		return callback()
+	callback_id = BigWorld.callback(delay, _run)
+	holder[0] = callback_id
+	callbacks[callback_id] = True
+	return callback_id
+
+
+_OFFH_PLAYER_BATTLE_ATTRS = (
+	'vehicleTypeDescriptor', 'getVehicleAttached', 'getOwnVehicleMatrix',
+	'getOwnVehiclePosition', 'handleKey', 'handleMouseEvent', 'leaveArena',
+	'setGUIVisible', 'getAutorotation', 'enableOwnVehicleAutorotation',
+	'positionControl', 'gunRotator', 'getOwnVehicleSpeeds', 'autoAim',
+	'newFakeModel', 'inputHandler', 'onSpaceLoaded',
+	'getOwnVehicleShotDispersionAngle', 'onEquipmentButtonPressed',
+	'onDamageIconButtonPressed', 'shoot', 'terrainEffects',
+	'_autoaim_target', '_outlined_bot',
+)
+
+
+def _offh_capture_player_battle_attrs(player):
+	"""Snapshot instance attributes replaced by the synthetic PlayerAvatar."""
+	if player is None or getattr(player, '_offh_player_attr_restore', None) is not None:
+		return 0
+	state = []
+	try:
+		instance_dict = player.__dict__
+	except Exception:
+		instance_dict = None
+	for name in _OFFH_PLAYER_BATTLE_ATTRS:
+		if isinstance(instance_dict, dict):
+			existed = name in instance_dict
+			value = instance_dict.get(name)
+		else:
+			try:
+				value = getattr(player, name)
+				existed = True
+			except Exception:
+				value = None
+				existed = False
+		state.append((name, existed, value))
+	player._offh_player_attr_restore = state
+	return len(state)
+
+
+def _offh_restore_player_battle_attrs(player):
+	"""Remove battle closures from the persistent account and restore originals."""
+	if player is None:
+		return 0, 0
+	state = getattr(player, '_offh_player_attr_restore', None)
+	if state is None:
+		return 0, 0
+	try:
+		del player._offh_player_attr_restore
+	except Exception:
+		try: player._offh_player_attr_restore = None
+		except Exception: pass
+	restored = 0
+	failed = 0
+	for name, existed, value in state:
+		try:
+			if existed:
+				setattr(player, name, value)
+			else:
+				try:
+					current_dict = player.__dict__
+				except Exception:
+					current_dict = None
+				if not isinstance(current_dict, dict) or name in current_dict:
+					delattr(player, name)
+			restored += 1
+		except Exception:
+			failed += 1
+	return restored, failed
 
 
 def _offh_proc_mem_mb():
@@ -1615,37 +1798,6 @@ except Exception:
 	pass
 
 
-def _offh_bot_pool(cand, tier, max_unique=None):
-	"""Return a SMALL, STABLE set of bot vehicle descriptors for this tier,
-	cached across battles in g_offh_bot_pool. Bots otherwise pick ~30 fresh
-	RANDOM tanks every battle; the process-wide vehicle texture cache never
-	frees, so unlimited variety made the hangar baseline RAM climb battle by
-	battle until the next map load OOM-crashed the 32-bit client (native
-	0xC0000005 read@0x14). Reusing a fixed pool loads those textures ONCE.
-	Variety is tunable via config 'bot_variety' (0 = old unlimited)."""
-	if not cand:
-		return cand
-	if max_unique is None:
-		try:
-			from _constants import CONFIG_OPTIONS as _CFG_BV
-			max_unique = int(_CFG_BV.get('bot_variety', 8))
-		except Exception:
-			max_unique = 8
-	if max_unique <= 0:
-		return cand
-	pool = globals().setdefault('g_offh_bot_pool', {})
-	key = int(tier)
-	if key not in pool:
-		import random as _r
-		n = min(max_unique, len(cand))
-		try:
-			from gui.mods.offhangar.bot_ai import select_vehicle_variety_pool
-			pool[key] = select_vehicle_variety_pool(cand, tier, n, _r)
-		except Exception:
-			pool[key] = [_r.choice(cand) for _x in range(n)]
-	return pool[key]
-
-
 def _offh_veh_excluded(v):
 	"""Bots skip removed/hidden tanks: WG tags pulled vehicles 'secret' (e.g.
 	usa:T23, removed from the 0.8.2 tree). Data-driven so any future removed
@@ -1951,7 +2103,7 @@ def _offh_update_sixth_sense(player, visible_to_enemy, now):
 					battle.showSixthSenseIndicator(True)
 			except Exception as error:
 				LOG_DEBUG('Sixth Sense presentation failed: %s' % str(error))
-		BigWorld.callback(3.0, _show_sixth_sense)
+		_offh_battle_callback(3.0, _show_sixth_sense)
 	except Exception as error:
 		LOG_DEBUG('Sixth Sense scheduling failed: %s' % str(error))
 
@@ -2693,6 +2845,11 @@ def _offh_battle_sweep(tag='exit'):
 	# v2: staged + ALWAYS logs one line, failures log stage+traceback.
 	import BigWorld
 	global g_offline_models, g_offline_enemies
+	# Invalidate asynchronous visual callbacks immediately. Waiting for the next
+	# battle to bump this value lets a late resource callback recreate a model in
+	# the hangar after the sweep has already deleted everything.
+	globals()['g_offh_battle_gen'] = (
+		(globals().get('g_offh_battle_gen', 0) or 0) + 1)
 	try:
 		import gui.mods.offhangar.logging as _swlog
 	except Exception:
@@ -2713,15 +2870,92 @@ def _offh_battle_sweep(tag='exit'):
 	_stage = 'init'
 	_n_models = 0
 	_n_mocks = 0
+	_n_stickers = 0
+	_n_hit_testers = 0
+	_n_hit_tester_failures = 0
+	_n_callbacks = 0
+	_n_entities = 0
+	_n_entity_candidates = 0
+	_n_player_attrs = 0
+	_n_player_attr_failures = 0
+	_n_arena_delegates = 0
 	_fail = None
 	_mem_before = _offh_proc_mem_mb()
 	try:
 		_n_models = len(g_offline_models or [])
 		_mvd = globals().get('G_MOCK_VEHICLES', {}) or {}
 		_n_mocks = len(_mvd)
+		_stage = 'network'
+		if tag != 'start':
+			try:
+				from gui.mods.offhangar.network_battle import stop_for_player as _stop_network_battle
+				_stop_network_battle(BigWorld.player())
+			except Exception:
+				pass
+		_stage = 'callbacks'
+		for _callback_key in ('g_offh_aih_callback_id',
+				'g_offh_capture_callback_id', 'g_offh_auto_spawn_callback_id'):
+			_callback_id = globals().pop(_callback_key, None)
+			if _callback_id is not None:
+				try:
+					BigWorld.cancelCallback(_callback_id)
+					_n_callbacks += 1
+				except Exception: pass
+		_battle_callbacks = globals().pop('g_offh_battle_callbacks', {}) or {}
+		for _callback_id in list(_battle_callbacks.keys()):
+			try:
+				BigWorld.cancelCallback(_callback_id)
+				_n_callbacks += 1
+			except Exception: pass
+		_stage = 'targets'
+		try:
+			_target_player = BigWorld.player()
+			_outlined_bot = getattr(_target_player, '_outlined_bot', None)
+			if (_outlined_bot is not None and
+					getattr(_outlined_bot, 'bw_entity', None) is not None):
+				try: BigWorld.wgDelEdgeDetectEntity(_outlined_bot.bw_entity)
+				except Exception: pass
+			# Drop direct mock references before their native models/entities are
+			# detached below. The original values (normally absent) are restored
+			# by _offh_restore_player_battle_attrs later in the sweep.
+			_target_player._outlined_bot = None
+			_target_player._autoaim_target = None
+		except Exception:
+			pass
 		_stage = 'mocks'
+		_sticker_seen = {}
+		_battle_window = None
+		try:
+			from gui import WindowsManager as _swwm
+			_battle_window = getattr(_swwm.g_windowsManager, 'battleWindow', None)
+		except Exception:
+			pass
 		for _m in list(_mvd.values()):
 			try:
+				# Vehicle.stopVisual parity: remove GUI ownership and detach every
+				# native visual child while the vehicle models still exist.
+				try:
+					_marker = getattr(_m, 'marker', None)
+					_marker_manager = getattr(_battle_window, 'vMarkersManager', None)
+					if _marker is not None and _marker != -1 and _marker_manager is not None:
+						_marker_manager.destroyMarker(_marker)
+						_m.marker = -1
+				except Exception:
+					pass
+				try:
+					_minimap = getattr(_battle_window, 'minimap', None)
+					if _minimap is not None:
+						_minimap.notifyVehicleStop(getattr(_m, 'id', 0))
+				except Exception:
+					pass
+				try:
+					_n_stickers += _offh_detach_stickers(
+						getattr(_m, '_sticker_map', None), _sticker_seen)
+					_m._sticker_map = {}
+				except Exception:
+					pass
+				try: _stop_fire_effect(_m, died=True)
+				except Exception: pass
 				# Detach the engine-exhaust Pixie systems (native particles):
 				# unreleased they leak past the battle into the hangar.
 				try: _stop_engine_exhaust(_m)
@@ -2735,11 +2969,35 @@ def _offh_battle_sweep(tag='exit'):
 					except Exception:
 						pass
 				try:
+					_filter = getattr(_m, 'filter', None)
+					if _filter is not None:
+						try: _filter.vehicleCollisionCallback = None
+						except Exception: pass
+						try: _filter.isLaggingStateChangedCallback = None
+						except Exception: pass
+				except Exception:
+					pass
+				try:
+					_appearance = getattr(_m, 'appearance', None)
+					_on_model_changed = getattr(_appearance, 'onModelChanged', None)
+					if _on_model_changed is not None and hasattr(_on_model_changed, 'clear'):
+						_on_model_changed.clear()
+					_m.appearance = None
+				except Exception:
+					pass
+				try:
 					if getattr(_m, 'bw_entity', None) is not None:
 						_m.bw_entity.model = None
 						_m.bw_entity = None
 				except Exception:
 					pass
+				try: _m._collision_obstacle = None
+				except Exception: pass
+				for _visual_attr in ('_gun_recoil', '_swinging', '_fashion',
+						'_crashed_track_fashion', '_hull_model', '_turret_model',
+						'_gun_model'):
+					try: setattr(_m, _visual_attr, None)
+					except Exception: pass
 				try:
 					# entity-owned chassis: ent.model=None above already released it;
 					# delModel on it always raised (pending!) 'Not added as a global
@@ -2749,9 +3007,49 @@ def _offh_battle_sweep(tag='exit'):
 					pass
 			except Exception:
 				pass
+		try:
+			_pl_visual = BigWorld.player()
+			if _pl_visual is not None:
+				_n_stickers += _offh_detach_stickers(
+					getattr(_pl_visual, '_offhangar_stickers', None), _sticker_seen)
+				_n_stickers += _offh_detach_stickers(
+					getattr(_pl_visual, '_offhangar_sticker_map', None), _sticker_seen)
+				_pl_visual._offhangar_stickers = []
+				_pl_visual._offhangar_sticker_map = {}
+				_pl_visual._offhangar_gun_recoil = None
+		except Exception:
+			pass
+		_stage = 'input'
+		try:
+			_input_player = BigWorld.player()
+			_input_handler = getattr(_input_player, 'inputHandler', None)
+			if _input_handler is not None:
+				try: _input_handler.stop()
+				except Exception:
+					try:
+						_input_handler._AvatarInputHandler__isStarted = False
+						for _control in getattr(
+								_input_handler, '_AvatarInputHandler__ctrls', {}).values():
+							try: _control.destroy()
+							except Exception: pass
+					except Exception: pass
+				try:
+					import game as _input_game
+					_resetter = getattr(
+						_input_handler, '_AvatarInputHandler__onRecreateDevice', None)
+					if _resetter is not None and _resetter in _input_game.g_guiResetters:
+						_input_game.g_guiResetters.remove(_resetter)
+				except Exception: pass
+				try: _input_player.inputHandler = None
+				except Exception: pass
+		except Exception:
+			pass
 		_stage = 'mockdict'
 		globals()['G_MOCK_VEHICLES'] = {}
 		globals()['g_offh_exhaust_owners'] = []
+		globals()['g_capture_tick_ref'] = None
+		globals()['g_aih_tick_ref'] = None
+		globals().pop('g_offline_formation_slot', None)
 		globals().pop('g_offh_bot_director', None)
 		globals().pop('g_offh_terrain_navigator', None)
 		globals().pop('g_offh_baked_navigation_graph', None)
@@ -2787,6 +3085,19 @@ def _offh_battle_sweep(tag='exit'):
 				_offh_del_model(_gm)
 		except:
 			pass
+		_stage = 'hit_testers'
+		try:
+			_n_hit_testers, _n_hit_tester_failures = _offh_release_hit_testers()
+		except Exception:
+			pass
+		try:
+			# PlayerAvatar.onLeaveWorld performs this after releasing hit testers.
+			# It is a no-op in the shipped 0.8.2 Cache implementation, but retain
+			# the call so the offline lifecycle matches the original contract.
+			from items import vehicles as _sweep_vehicles
+			_sweep_vehicles.g_cache.clearPrereqs()
+		except Exception:
+			pass
 		_stage = 'enemies'
 		try:
 			g_offline_enemies = []
@@ -2802,6 +3113,7 @@ def _offh_battle_sweep(tag='exit'):
 					_es[_k] = None
 				except Exception:
 					pass
+		globals()['g_offh_engine_state'] = None
 		_stage = 'voicenotif'
 		# Crew-voice engine: destroy per battle, on EVERY exit path. The
 		# instances live on persistent objects (account / module-global AIH);
@@ -3030,12 +3342,11 @@ def _offh_battle_sweep(tag='exit'):
 		# NOTE: ResMgr.purge(mapPath) was tried here and MEASURED freeing ~0 MB
 		# across battles - it only drops DataSection descriptors (KB), not the
 		# loaded chunk textures/geometry (MB) that the async chunk ejection from
-		# clearSpace above owns. Removed as dead weight. The residual per-battle
-		# baseline climb (405->654->766 MB) is the process-wide vehicle texture
-		# cache (~30 RANDOM tanks/battle, each cached and never released); a
-		# GLOBAL ResMgr.purge would free it but froze the engine on the next
-		# tank load, so it stays. Bot spawn is capped (max_total_bots) so a
-		# single battle cannot pile enough tanks to OOM on its own.
+		# clearSpace above owns. Removed as dead weight. Earlier measurements
+		# attributed the residual climb to a process-wide vehicle texture cache,
+		# but those runs also omitted retail's hit-tester release and visual-child
+		# teardown. Re-measure after this lifecycle-complete sweep before imposing
+		# any artificial vehicle-name limit.
 		# clearSpace PARKS leaving entities in an engine-side cache instead
 		# of destroying them: 30 OfflineEntity + the AreaDestructibles chunk
 		# entities pile up there EVERY battle, pinning their resources.
@@ -3047,28 +3358,20 @@ def _offh_battle_sweep(tag='exit'):
 			# Iterate the real dict (the wrapper delegates .items() to it and
 			# excludes injected mocks); the class filter below keeps hangar/
 			# account ghosts safe.
-			_ce = getattr(BigWorld, 'cachedEntities', None)
-			if callable(_ce):
-				_ce = _ce()
-			if not _ce:
-				_ce = getattr(BigWorld, 'entities', None)
+			_cached_entities = getattr(BigWorld, 'cachedEntities', None)
+			if callable(_cached_entities):
+				_cached_entities = _cached_entities()
+			_world_entities = getattr(BigWorld, 'entities', None)
 			_pid = 0
 			try:
 				_pid = getattr(BigWorld.player(), 'id', 0) or 0
 			except:
 				pass
-			_cids = []
-			try:
-				# only OUR battle entity types - never touch hangar/account ghosts
-				for _k2, _v2 in list(_ce.items()):
-					try:
-						if _v2.__class__.__name__ in ('OfflineEntity', 'AreaDestructibles'):
-							_cids.append(_k2)
-					except:
-						pass
-			except:
-				pass
+			# cachedEntities and entities are separate stores in this client. Scan both:
+			# a single unrelated cached entity must not hide live OfflineEntity bots.
+			_cids = _offh_battle_entity_ids(_cached_entities, _world_entities)
 			_ndest = 0
+			_n_entity_candidates = len(_cids)
 			for _cid in _cids:
 				if not _cid or _cid == _pid:
 					continue
@@ -3078,6 +3381,7 @@ def _offh_battle_sweep(tag='exit'):
 					_ndest += 1
 				except:
 					pass
+			_n_entities = _ndest
 			if _swlog is not None:
 				try:
 					_swlog.LOG_DEBUG('sweep: destroyed %d/%d battle entities (OfflineEntity+AreaDestructibles)' % (_ndest, len(_cids)))
@@ -3106,10 +3410,60 @@ def _offh_battle_sweep(tag='exit'):
 			else:
 				_dst = getattr(_dam, '_state', None)
 				if isinstance(_dst, dict):
-					_dst['spaceID'] = None
-					_dst['chunks'] = {}
-					_dst['entities'] = set()
+						_dst['spaceID'] = None
+						_dst['chunks'] = {}
+						_dst['entities'] = set()
 		except:
+			pass
+		_stage = 'arena'
+		try:
+			_arena_player = BigWorld.player()
+			_arena = getattr(_arena_player, '_offhangar_arena', None)
+			if _arena is not None:
+				_event_stubs = getattr(_arena, '_event_stubs', {}) or {}
+				for _event in list(_event_stubs.values()):
+					_delegates = getattr(_event, 'delegates', None)
+					if isinstance(_delegates, list):
+						_n_arena_delegates += len(_delegates)
+						del _delegates[:]
+				_event_stubs.clear()
+				try: delattr(_arena, 'onVehicleKilled')
+				except Exception: pass
+				try: delattr(_arena, 'collideWithSpaceBB')
+				except Exception: pass
+				try: _arena._offh_kill_wrapped = False
+				except Exception: pass
+				try: _arena.statistics.clear()
+				except Exception: pass
+				if tag != 'start':
+					try: _arena.vehicles.clear()
+					except Exception: pass
+					try: _arena.extraData = {}
+					except Exception: pass
+			if tag != 'start' and _arena_player is not None:
+				for _battle_attr in ('_offhangar_battle_ctx', '_offhangar_battle_stats',
+						'_offhangar_mock_veh', '_offh_spec_mp', '_offh_spec_want'):
+					try: setattr(_arena_player, _battle_attr, None)
+					except Exception: pass
+			if _arena_player is not None:
+				for _battle_closure in ('_offhangar_apply_network_rules_state',
+						'_offhangar_apply_network_battle_result',
+						'_offhangar_network_spawn_remote',
+						'_offhangar_network_formation'):
+					try: setattr(_arena_player, _battle_closure, None)
+					except Exception: pass
+				try:
+					_original_stats = getattr(_arena_player, '_offhangar_orig_stats', None)
+					if _original_stats is not None:
+						_arena_player.stats = _original_stats
+				except Exception: pass
+		except Exception:
+			pass
+		_stage = 'player_attrs'
+		try:
+			_n_player_attrs, _n_player_attr_failures = (
+				_offh_restore_player_battle_attrs(BigWorld.player()))
+		except Exception:
 			pass
 		# ResMgr.purge is UNSAFE here: DataSections are PROCESS-wide shared
 		# (items.vehicles g_cache holds refs for the whole session); purging
@@ -3154,12 +3508,49 @@ def _offh_battle_sweep(tag='exit'):
 		except Exception:
 			_fail = 'trace unavailable'
 	_mem_after = _offh_proc_mem_mb()
+	_residual_models = len(globals().get('g_offline_models', []) or [])
+	_residual_mocks = len(globals().get('G_MOCK_VEHICLES', {}) or {})
+	_residual_hit_testers = len(globals().get('g_offh_loaded_hit_testers', {}) or {})
+	_residual_callbacks = len(globals().get('g_offh_battle_callbacks', {}) or {})
+	_residual_player_attrs = 0
+	_residual_arena_delegates = 0
+	try:
+		_residual_player = BigWorld.player()
+		_residual_player_attrs = len(
+			getattr(_residual_player, '_offh_player_attr_restore', None) or [])
+		_residual_arena = getattr(_residual_player, '_offhangar_arena', None)
+		for _residual_event in list(
+				(getattr(_residual_arena, '_event_stubs', {}) or {}).values()):
+			_residual_arena_delegates += len(
+				getattr(_residual_event, 'delegates', None) or [])
+	except Exception:
+		_residual_player_attrs = -1
+		_residual_arena_delegates = -1
+	_pending_space = int(globals().get('g_offh_pending_release', 0) or 0)
+	_mapped_space = int(globals().get('g_offh_mapped_space', 0) or 0)
+	_residual_entities = 0
+	try:
+		_residual_source = getattr(BigWorld, 'entities', None)
+		for _residual_id, _residual_entity in list(_residual_source.items()):
+			try:
+				if _residual_entity.__class__.__name__ in ('OfflineEntity', 'AreaDestructibles'):
+					_residual_entities += 1
+			except Exception:
+				pass
+	except Exception:
+		_residual_entities = -1
 	if _swlog is not None:
 		try:
 			if _fail is not None:
 				_swlog.LOG_DEBUG('OfflineBattle.sweep(%s) FAILED at stage %s: %s' % (tag, _stage, _fail))
-			_swlog.LOG_DEBUG('OfflineBattle.sweep(%s): freed models=%d mocks=%d stage=%s | rss %d->%d virt %d->%d commit %d->%d MB (freed rss %d virt %d) [virt = 32-bit ~2GB wall]' % (
-				tag, _n_models, _n_mocks, _stage,
+			_swlog.LOG_DEBUG('OfflineBattle.sweep(%s): freed models=%d mocks=%d stickers=%d hitBSP=%d hitBSP_fail=%d callbacks=%d entities=%d/%d playerAttrs=%d attr_fail=%d arenaDelegates=%d stage=%s | residual models=%d mocks=%d hitBSP=%d callbacks=%d entities=%d playerAttrs=%d arenaDelegates=%d pendingSpace=%d mappedSpace=%d | rss %d->%d virt %d->%d commit %d->%d MB (freed rss %d virt %d) [virt = 32-bit ~2GB wall]' % (
+				tag, _n_models, _n_mocks, _n_stickers, _n_hit_testers,
+				_n_hit_tester_failures, _n_callbacks, _n_entities,
+				_n_entity_candidates, _n_player_attrs, _n_player_attr_failures,
+				_n_arena_delegates, _stage, _residual_models, _residual_mocks,
+				_residual_hit_testers, _residual_callbacks, _residual_entities,
+				_residual_player_attrs, _residual_arena_delegates, _pending_space,
+				_mapped_space,
 				_mem_before[0], _mem_after[0], _mem_before[1], _mem_after[1], _mem_before[2], _mem_after[2],
 				_mem_before[0] - _mem_after[0], _mem_before[1] - _mem_after[1]))
 		except Exception:
@@ -3599,7 +3990,8 @@ def _stop_fire_effect(mock, died=False):
 			return
 		effects.detachFrom(data, 'fire')
 		effects.attachTo(hull, data, 'noEmission')
-		BigWorld.callback(fx['noEmissionTime'], lambda: effects.detachAllFrom(data))
+		_offh_battle_callback(
+			fx['noEmissionTime'], lambda: effects.detachAllFrom(data))
 	except Exception:
 		pass
 
@@ -4334,6 +4726,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				LOG_DEBUG('Sweep(start) FAILED:', _swtb2.format_exc())
 			except Exception:
 				pass
+		# One battle = one generation. Establish it before any asynchronous model,
+		# camera or spawn callback is scheduled so every callback can reject a
+			# completed battle instead of recreating visuals in the hangar.
+			globals()['g_offh_battle_gen'] = (
+				(globals().get('g_offh_battle_gen', 0) or 0) + 1)
+			_offh_my_gen = [globals()['g_offh_battle_gen']]
+			_offh_capture_player_battle_attrs(player)
 		# The sweep destroys the projectile mover on battle exit (it owns
 		# the shell models) - recreate it per battle or tracers are gone
 		# from the second battle on. The __calcTrajectory patch lives on
@@ -4367,7 +4766,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			# hangar load -> map RAM truly returned -> variety WITHOUT fragmentation.
 			_prev = globals().get('g_offh_pending_release', 0) or 0
 			if _prev:
-				globals()['g_offh_pending_release'] = 0
 				# That space still has its geometry MAPPED at this point: the mapped_*
 				# globals are only overwritten after the new space exists, two lines
 				# below. Releasing a space whose mapping is still registered is what
@@ -4387,15 +4785,20 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				try:
 					if hasattr(BigWorld, 'releaseSpace'):
 						BigWorld.releaseSpace(_prev)
-						len('')
-				except Exception:
-					pass
+						globals()['g_offh_pending_release'] = 0
+						LOG_DEBUG('OfflineBattle.released prev space %s' % _prev)
+					else:
+						LOG_DEBUG('OfflineBattle.release prev unavailable space=%s' % _prev)
+				except Exception, _e_release:
+					# Keep the id pending so a later battle can retry and the sweep
+					# summary cannot falsely report that this native space is gone.
+					LOG_DEBUG('OfflineBattle.release prev FAILED space=%s error=%s' %
+						(_prev, _e_release))
 				try:
 					import gc as _gcp
 					_gcp.collect(); _gcp.collect()
 				except Exception:
 					pass
-				LOG_DEBUG('OfflineBattle.released prev space', _prev)
 			# The log ends right here on the second battle - 'released prev space'
 			# prints, 'dedicated space' never does - so the crash is in one of the
 			# next three calls, not in the release. One line each to name which.
@@ -4868,7 +5271,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			_add_attempts = [0]
 			
 			
-			def _add_models_when_ready():
+			def _add_models_when_ready(_model_gen=_offh_my_gen[0]):
+				if globals().get('g_offh_battle_gen', 0) != _model_gen:
+					return
 				_add_attempts[0] += 1
 				try:
 					chassis = _models_to_add.get('chassis')
@@ -4951,25 +5356,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 															if fashion is None: fashion = p_mdl.wg_baseFashion = BigWorld.WGBaseFashion()
 															fashion.setCamouflage(tex, excl, tiling, colors[0], colors[1], colors[2], colors[3], weights)
 									
-									import VehicleStickers
-									emblemPositions = (
-										('hull', hull, td.hull['emblemSlots']),
-										('gun' if td.turret['showEmblemsOnGun'] else 'turret', gun if td.turret['showEmblemsOnGun'] else turret, td.turret['emblemSlots']),
-										('turret' if td.turret['showEmblemsOnGun'] else 'gun', turret if td.turret['showEmblemsOnGun'] else gun, [])
-									)
-									if not hasattr(player, '_offhangar_stickers'): player._offhangar_stickers = []
-									for cName, p_mdl, slots in emblemPositions:
-										if p_mdl is not None:
-											stickers = VehicleStickers.VehicleStickers(td, slots, cName == 'hull', None)
-											try:
-												stickers.attachStickers(p_mdl, p_mdl.node(''), False)
-											except Exception:
-												stickers.attachStickers(p_mdl, p_mdl.root, False)
-											player._offhangar_stickers.append(stickers)
 								except Exception as e:
 									import traceback
-									import traceback
-
 									LOG_DEBUG('OfflineBattle.customization error:', str(e), traceback.format_exc())
 
 								# Attach gun to turret node 'HP_gunJoint'
@@ -5033,9 +5421,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					import traceback
 					LOG_DEBUG('OfflineBattle._add_models_when_ready ERROR:', traceback.format_exc())
 					if _add_attempts[0] < 10:
-						BigWorld.callback(0.3, _add_models_when_ready)
-			
-			BigWorld.callback(0.2, _add_models_when_ready)
+						_offh_battle_callback(0.3, _add_models_when_ready)
+
+			_offh_battle_callback(0.2, _add_models_when_ready)
 			
 			# Set temporary compoundModel so camera logic doesn't fail
 			root_model = loaded_models['chassis'] if loaded_models['chassis'] is not None else loaded_models['hull']
@@ -5043,8 +5431,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			ma.compoundModel = root_model
 
 		try:
-			for hitTester in td.getHitTesters():
-				hitTester.loadBspModel()
+			_offh_load_hit_testers(td)
 		except Exception as e:
 			LOG_DEBUG("Error loading hitTesters for player:", str(e))
 
@@ -5239,10 +5626,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		except Exception as _xe:
 			globals()['g_offh_internal_xray'] = None
 			LOG_DEBUG('X-ray overlay unavailable:', str(_xe))
-		# The sticker list lives on the persistent account entity; without this
-		# reset it grew by ~6 VehicleStickers objects every battle.
-		try: player._offhangar_stickers = []
-		except Exception: pass
+		# Belt for an interrupted prior sweep: detach native sticker models before
+		# resetting the persistent account containers.
+		try:
+			_offh_detach_stickers(getattr(player, '_offhangar_stickers', None))
+			_offh_detach_stickers(getattr(player, '_offhangar_sticker_map', None))
+			player._offhangar_stickers = []
+			player._offhangar_sticker_map = {}
+		except Exception:
+			pass
 
 		# Wrap once and resolve the mock registry at call time: re-wrapping every
 		# battle nested the previous wrapper in _orig_entity, so each battle's
@@ -5603,7 +5995,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_offh_battle_sweep('quit')
 			except:
 				pass
-			try: player._offhangar_stickers = []
+			try:
+				_offh_detach_stickers(getattr(player, '_offhangar_stickers', None))
+				player._offhangar_stickers = []
+				player._offhangar_sticker_map = {}
 			except Exception: pass
 			try:
 				import SoundGroups as _SG
@@ -6003,11 +6398,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			_phys_specificFriction, _phys_brakeDecel, _phys_trackCenter))
 		_battle_finished = [False]
 		_exit_done = [False]  # once-guard shared by ALL exit paths (leaveArena / death / K)
-		# One battle = one generation: loops of an older battle see the bump
-		# and stop instead of stacking up (every stale loop pins its whole
-		# battle graph -> the 32-bit client runs out of memory on start #3).
-		globals()['g_offh_battle_gen'] = (globals().get('g_offh_battle_gen', 0) or 0) + 1
-		_offh_my_gen = [globals()['g_offh_battle_gen']]
+		# The generation was established before model loading. Per-frame loops
+		# capture the same value and stop when the next battle bumps it.
 		globals().pop('g_offh_bot_director', None)
 		globals().pop('g_offh_terrain_navigator', None)
 		globals().pop('g_offh_baked_navigation_graph', None)
@@ -6198,7 +6590,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				except Exception:
 					import traceback
 					LOG_DEBUG('battle end error:', traceback.format_exc())
-			BigWorld.callback(5.0, _end_now)
+			_offh_battle_callback(5.0, _end_now)
 		
 		def _offh_check_battle_end():
 			'''Team wipe and timer expiry. Base capture handles itself further down.'''
@@ -6502,15 +6894,23 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					if _cok and _offh_seen_arena[0] and (_cpl is None or getattr(_cpl, 'arena', None) is None):
 						_cok = False
 					if _cok:
-						_cbw.callback(1.0, _capture_tick)
+						globals()['g_offh_capture_callback_id'] = _cbw.callback(
+							1.0, _capture_tick)
 				except Exception:
 					pass
 					
 		g_capture_tick_ref = _capture_tick
-		BigWorld.callback(5.0, _capture_tick)
+		globals()['g_offh_capture_callback_id'] = BigWorld.callback(
+			5.0, _capture_tick)
 		
 		global g_aih_tick_ref
 		def _aih_tick():
+			# A cancelled callback can already be executing. Reject stale work before
+			# touching BigWorld.player(), and never let its exception path resurrect
+			# this zero-delay loop after the battle generation changes.
+			if (_battle_finished[0] or
+					globals().get('g_offh_battle_gen', 0) != _offh_my_gen[0]):
+				return
 			try:
 				import BigWorld, Math, Keys, math
 				player = BigWorld.player()
@@ -10731,7 +11131,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 															def remove_fba(f=fba):
 																try: BigWorld.removeFlashBangAnimation(f)
 																except: pass
-															BigWorld.callback(1.4, remove_fba)
+															_offh_battle_callback(1.4, remove_fba)
 													except Exception as e:
 														LOG_DEBUG('HitDir calc err:', e)
 														
@@ -10952,7 +11352,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 																	_old_ch_ref = _old_ch
 																	def _swap_destroyed_model_bot(_d_ch=_d_ch, _d_hu=_d_hu, _d_tu=_d_tu, _d_gu=_d_gu, _old_ch_ref=_old_ch_ref, _old_pos=_old_pos, _old_yaw=_old_yaw, m_veh=hit_veh):
 																		if not getattr(_d_ch, 'loaded', True) or not getattr(_d_hu, 'loaded', True) or not getattr(_d_tu, 'loaded', True) or not getattr(_d_gu, 'loaded', True):
-																			BigWorld.callback(0.1, _swap_destroyed_model_bot)
+																			_offh_battle_callback(0.1, _swap_destroyed_model_bot)
 																			return
 																		try: _old_ch_ref.visible = False
 																		except: pass
@@ -11014,7 +11414,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 																		except: pass
 																		try: _add_model(_d_ch)
 																		except: pass
-																	BigWorld.callback(0.1, _swap_destroyed_model_bot)
+																	_offh_battle_callback(0.1, _swap_destroyed_model_bot)
 																except Exception as e:
 																	LOG_DEBUG('Swap bot destroyed model error:', e)
 																
@@ -11079,7 +11479,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						# The arcade switch above is not the only thing that can clobber the chain
 						# (control-mode enable() calls g_postProcessing.enable for its own preset),
 						# so re-assert once the postmortem camera has settled.
-						try: BigWorld.callback(0.5, _offh_postmortem_grading)
+						try: _offh_battle_callback(0.5, _offh_postmortem_grading)
 						except Exception: pass
 						player._offh_spec_idx = 0
 						# dead -> hide the aim crosshair / gun marker
@@ -11162,7 +11562,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									
 									def _attach_when_ready():
 										if not getattr(_d_ch, 'loaded', True) or not getattr(_d_hu, 'loaded', True) or not getattr(_d_tu, 'loaded', True) or not getattr(_d_gu, 'loaded', True):
-											BigWorld.callback(0.1, _attach_when_ready)
+											_offh_battle_callback(0.1, _attach_when_ready)
 											return
 										try: BigWorld.delModel(_d_hu)
 										except: pass
@@ -11213,7 +11613,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									import traceback
 									LOG_DEBUG('Player model swap failed:', traceback.format_exc())
 							
-							BigWorld.callback(0.1, _swap_player_destroyed)
+							_offh_battle_callback(0.1, _swap_player_destroyed)
 						except Exception as _e: LOG_DEBUG('Player death model err:', str(_e))
 						
 						# Exit battle in 5 seconds - use game.fini() which is the proper hook
@@ -11521,13 +11921,20 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							except Exception: pass
 				except Exception:
 					pass
-				BigWorld.callback(0.0, _aih_tick)
+				if (not _battle_finished[0] and
+						globals().get('g_offh_battle_gen', 0) == _offh_my_gen[0]):
+					globals()['g_offh_aih_callback_id'] = BigWorld.callback(
+						0.0, _aih_tick)
 			except Exception as e:
 				import traceback
 				LOG_DEBUG('AIH_TICK CRASH:', traceback.format_exc())
-				BigWorld.callback(0.0, _aih_tick)
+				if (not _battle_finished[0] and
+						globals().get('g_offh_battle_gen', 0) == _offh_my_gen[0]):
+					globals()['g_offh_aih_callback_id'] = BigWorld.callback(
+						0.0, _aih_tick)
 			return
-		BigWorld.callback(0.0, _aih_tick)
+		globals()['g_offh_aih_callback_id'] = BigWorld.callback(
+			0.0, _aih_tick)
 
 		# Patch SniperCamera.__cameraUpdate to sync camera source position every frame
 		try:
@@ -11621,9 +12028,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			except Exception as e:
 				import traceback
 				LOG_DEBUG('OfflineBattle.force_camera ERROR:', traceback.format_exc())
-		BigWorld.callback(0.1, _force_camera_to_model)
-		BigWorld.callback(0.5, _force_camera_to_model)
-		BigWorld.callback(1.0, _force_camera_to_model)
+		_offh_battle_callback(0.1, _force_camera_to_model)
+		_offh_battle_callback(0.5, _force_camera_to_model)
+		_offh_battle_callback(1.0, _force_camera_to_model)
 
 
 		from gui import WindowsManager
@@ -13164,7 +13571,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									LOG_DEBUG('Auto shell switch UI error:', str(_ase))
 							except Exception as _ase:
 								LOG_DEBUG('Auto shell switch error:', str(_ase))
-						BigWorld.callback(0.0, _offh_auto_next_shell)
+						_offh_battle_callback(0.0, _offh_auto_next_shell)
 
 					try:
 						player._Avatar__shotWaitingTimerID = None
@@ -13633,7 +14040,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_add_model(_d_gu)
 									def _attach_when_ready():
 										if not getattr(_d_ch, 'loaded', True) or not getattr(_d_hu, 'loaded', True) or not getattr(_d_tu, 'loaded', True) or not getattr(_d_gu, 'loaded', True):
-											BigWorld.callback(0.1, _attach_when_ready)
+											_offh_battle_callback(0.1, _attach_when_ready)
 											return
 										try: BigWorld.delModel(_d_hu)
 										except: pass
@@ -13706,7 +14113,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										except: pass
 										LOG_DEBUG('Destroyed model swapped OK')
 									_attach_when_ready()
-								BigWorld.callback(0.0, _swap_destroyed_model)
+								_offh_battle_callback(0.0, _swap_destroyed_model)
 							except Exception as _de:
 								LOG_DEBUG('Destroyed model swap error:', str(_de))
 					
@@ -14277,8 +14684,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							return True
 
 						try:
-							for hitTester in td.getHitTesters():
-								hitTester.loadBspModel()
+							_offh_load_hit_testers(td)
 						except Exception as e:
 							LOG_DEBUG("Error loading hitTesters for bot:", str(e))
 						
@@ -14294,7 +14700,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 
 						# Load visual models
 
-						def _on_bot_models_loaded(resourceRefs, bot_display_name=_bot_display_name):
+						def _on_bot_models_loaded(resourceRefs, bot_display_name=_bot_display_name,
+								_bot_gen=_offh_my_gen[0]):
+							if globals().get('g_offh_battle_gen', 0) != _bot_gen:
+								return
 							def _network_spawn_complete():
 								if _network_server_id is not None:
 									try:
@@ -14377,6 +14786,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_eid = BigWorld.createEntity('OfflineEntity', _offh_bspace(), 0, e_mock.position, (0, 0, e_mock.yaw), dict())
 							e_mock.bw_entity = None
 							def _assign_model_when_ready(eid, model_to_add, retries=10, _e_mock=e_mock):
+								if globals().get('g_offh_battle_gen', 0) != _bot_gen:
+									return
 								if not getattr(_e_mock, 'isAlive', True) or getattr(_e_mock, '_wreck_done', False):
 									return  # bot died meanwhile: never re-add the intact model over the wreck
 								ent = BigWorld.entity(eid)
@@ -14394,7 +14805,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									except: pass
 									_e_mock.bw_entity = ent
 								elif retries > 0:
-									BigWorld.callback(0.1, lambda: _assign_model_when_ready(eid, model_to_add, retries - 1, _e_mock))
+									_offh_battle_callback(0.1, lambda: _assign_model_when_ready(eid, model_to_add, retries - 1, _e_mock))
 								else:
 									try:
 										_model_visible = bool(getattr(_e_mock, '_spot_visible', True))
@@ -14453,13 +14864,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# Scrolling-track animation for the bot (original fashion system);
 							# attached slightly delayed so the model is in the world first
 							def _attach_bot_fashion(_bch=ch, _btd=td, _bm=e_mock):
+								if globals().get('g_offh_battle_gen', 0) != _bot_gen:
+									return
 								# The ghost-fix delays the world-add (entity retries); a fashion
 								# attached to a not-yet-inWorld model stays inert -> static tracks.
 								# Wait for inWorld like the player path does.
 								if not getattr(_bch, 'inWorld', False):
 									_bm._fash_tries = (getattr(_bm, '_fash_tries', 0) or 0) + 1
 									if _bm._fash_tries < 20 and getattr(_bm, 'isAlive', True):
-										BigWorld.callback(0.5, lambda: _attach_bot_fashion(_bch, _btd, _bm))
+										_offh_battle_callback(0.5, lambda: _attach_bot_fashion(_bch, _btd, _bm))
 									return
 								try:
 									_bf = BigWorld.WGVehicleFashion()
@@ -14508,7 +14921,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										_bm._tco = 1.5
 								except Exception as _bfe:
 									LOG_DEBUG('Bot track fashion failed:', str(_bfe))
-							BigWorld.callback(1.5, _attach_bot_fashion)
+							_offh_battle_callback(1.5, _attach_bot_fashion)
 							try:
 								e_mock._collision_obstacle = BigWorld.PyModelObstacle(
 									td.hull['models']['undamaged'],
@@ -14559,6 +14972,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# NEGATIVE signal at spawn time, before anything has been added.
 							def _verify_bot_visible(_vch=ch, _vm=e_mock, _vid=e_id):
 								try:
+									if globals().get('g_offh_battle_gen', 0) != _bot_gen:
+										return
 									if not getattr(_vm, 'isAlive', False) or getattr(_vm, '_wreck_done', False):
 										return
 									if getattr(_vch, 'inWorld', False):
@@ -14568,7 +14983,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								except Exception as _vbe:
 									LOG_DEBUG('bot visibility check err:', str(_vbe))
 							try:
-								BigWorld.callback(2.0, _verify_bot_visible)
+								_offh_battle_callback(2.0, _verify_bot_visible)
 							except Exception:
 								pass
 							import weakref
@@ -14684,7 +15099,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			except Exception:
 				pass
 
-			def _auto_spawn_teams():
+			def _auto_spawn_teams(_spawn_gen=_offh_my_gen[0]):
+				if globals().get('g_offh_battle_gen', 0) != _spawn_gen:
+					return
 				import BigWorld, Keys, Math, math
 				try:
 					_pl = BigWorld.player()
@@ -14808,8 +15225,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								if int(_profile['level']) not in _match_tiers:
 									_match_tiers.append(int(_profile['level']))
 						_match_tiers = tuple(sorted(set(_match_tiers)))
-						_match_pool = list(_offh_bot_pool(
-							_band_candidates, _player_profile['level']) or ())
+						_match_pool = list(_band_candidates)
 						# A LAN player outside the authority's normal three-tier band is
 						# still a legal selected vehicle. Make that profile available as a
 						# compensating bot on the opposite team rather than hiding the skew.
@@ -14895,11 +15311,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								return 1
 							_picked = list(_balanced_bot_templates.get(_t, ()) or ())
 							if len(_picked) != _count and _cand:
-								# Limit to a small STABLE per-tier pool reused across
-								# battles so bot tank TEXTURES cache once instead of
-								# loading ~30 fresh random tanks each battle (the leak
-								# that climbed the baseline until map-load OOM).
-								_pool = _offh_bot_pool(_cand, _tier)
+								_pool = _cand
 								# One artillery slot per team, including LAN humans. AT-SPG is
 								# an exact, separate tank-destroyer tag and does not consume it.
 								_human_spgs = 0
@@ -14957,7 +15369,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						elif _is_network:
 							_manifest = getattr(_pl, '_offhangar_network_bot_manifest', None) or []
 							if not _manifest:
-								BigWorld.callback(0.25, _auto_spawn_teams)
+								_offh_battle_callback(0.25, _auto_spawn_teams)
 								return
 							_jobs = []
 							for _entry in _manifest:
@@ -14979,6 +15391,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						if _k < len(_t2): _jobs.append(_t2[_k])
 					
 					def _spawn_next(_rest):
+						if globals().get('g_offh_battle_gen', 0) != _offh_my_gen[0]:
+							return
 						if _battle_finished[0] or not _rest:
 							return
 						_t, _slot, _bid, _x, _z, _yw, _vn, _bn = _rest[0]
@@ -15062,7 +15476,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_p2._forced_spawn_bot_slot = None
 						except Exception as _se:
 							LOG_DEBUG('AUTO-SPAWN error:', str(_se))
-						BigWorld.callback(0.3, lambda: _spawn_next(_rest[1:]))
+						_offh_battle_callback(0.3, lambda: _spawn_next(_rest[1:]))
 					
 					LOG_DEBUG('AUTO-SPAWN: placing %d bots (%d per team incl. player)' % (len(_jobs), _n_per_team))
 					# fresh occupancy list per battle - a stale one would nudge every new spawn
@@ -15073,66 +15487,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					import traceback
 					LOG_DEBUG('AUTO-SPAWN failed:', traceback.format_exc())
 			
-			def _preload_bot_pool():
-				# EXPERIMENTAL feature (config 'preload_bots'; may be unstable / change).
-				# FPS: warm the bot pool's MODEL + BSP caches during the LOADING
-				# screen so the later staggered auto-spawn is a cache hit instead
-				# of decoding ~8 tank model-sets + BSP collision on the main thread
-				# while the player is already driving (the FPS drop at bot spawns).
-				# The pool is deterministic (g_offh_bot_pool[tier]) so we know
-				# exactly which vehicles the bots will use. Safe: worst case a
-				# redundant background load. Gated by config 'preload_bots'.
-				try:
-					from items import vehicles as _pv
-					import nations as _pn
-					from gui.mods.offhangar.bot_ai import vehicle_in_battle_tier_band
-					_ptier = loaded_models['td'].type.level
-					_pcand = []
-					for _pnat in _pn.AVAILABLE_NAMES:
-						_pnid = _pn.INDICES[_pnat]
-						for _pvh in _pv.g_list.getList(_pnid).itervalues():
-							if vehicle_in_battle_tier_band(_ptier, _pvh['level']) and not _offh_veh_excluded(_pvh):
-								_pcand.append(_pvh)
-					_ppool = _offh_bot_pool(_pcand, _ptier)
-					if not _ppool:
-						return
-					_pnoop = lambda *a, **k: None
-					_pwarm = 0
-					for _pentry in _ppool:
-						try:
-							_ptd = _pv.VehicleDescr(typeName=_pentry['name'])
-						except Exception:
-							continue
-						try:
-							for _pht in _ptd.getHitTesters():
-								_pht.loadBspModel()
-						except Exception:
-							pass
-						try:
-							BigWorld.loadResourceListBG((
-								_ptd.chassis['models']['undamaged'],
-								_ptd.hull['models']['undamaged'],
-								_ptd.turret['models']['undamaged'],
-								_ptd.gun['models']['undamaged'],
-							), _pnoop)
-							_pwarm += 1
-						except Exception:
-							pass
-					LOG_DEBUG('AUTO-SPAWN preload: warmed %d/%d bot vehicles (tier %s)' % (_pwarm, len(_ppool), _ptier))
-				except Exception:
-					import traceback
-					LOG_DEBUG('AUTO-SPAWN preload failed:', traceback.format_exc())
-			try:
-				from _constants import CONFIG_OPTIONS as _CFG_PLB
-				if bool(_CFG_PLB.get('preload_bots', True)) and int(_CFG_PLB.get('bots_per_team', 15)) > 0:
-					_preload_bot_pool()
-			except Exception:
-				pass
 			try:
 				from _constants import CONFIG_OPTIONS as _CFG_AS
 				if int(_CFG_AS.get('bots_per_team', 15)) > 0:
 					# Give the terrain chunks time to stream in before lining up the teams
-					BigWorld.callback(float(_CFG_AS.get('auto_spawn_delay_seconds', 10.0)), _auto_spawn_teams)
+					globals()['g_offh_auto_spawn_callback_id'] = BigWorld.callback(
+						float(_CFG_AS.get('auto_spawn_delay_seconds', 10.0)),
+						_auto_spawn_teams)
 			except Exception:
 				import traceback
 				LOG_DEBUG('AUTO-SPAWN schedule failed:', traceback.format_exc())
@@ -15217,7 +15578,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# updates individual frags after this event cannot overwrite the HUD.
 							_offh_refresh_team_score(_pl)
 							try:
-								BigWorld.callback(0.0, lambda _score_player=_pl:
+								_offh_battle_callback(0.0, lambda _score_player=_pl:
 									_offh_refresh_team_score(_score_player))
 							except Exception:
 								pass
@@ -15317,7 +15678,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										def _fire_wreck_swap(_d_ch=_d_ch, _d_hu=_d_hu, _d_tu=_d_tu, _d_gu=_d_gu, _old_ch=_old_ch, _old_pos=_old_pos, _old_yaw=_old_yaw, _mv=_mv):
 											import BigWorld, Math
 											if not getattr(_d_ch, 'loaded', True) or not getattr(_d_hu, 'loaded', True) or not getattr(_d_tu, 'loaded', True) or not getattr(_d_gu, 'loaded', True):
-												BigWorld.callback(0.1, _fire_wreck_swap)
+												_offh_battle_callback(0.1, _fire_wreck_swap)
 												return
 											try: _old_ch.visible = False
 											except Exception: pass
@@ -15387,7 +15748,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 												_mv._chassis_model = _d_ch
 											except Exception:
 												pass
-										BigWorld.callback(0.1, _fire_wreck_swap)
+										_offh_battle_callback(0.1, _fire_wreck_swap)
 							except Exception:
 								pass
 					player.arena.onVehicleKilled = _KillEventWrapper(getattr(player.arena, 'onVehicleKilled', None))
@@ -15399,8 +15760,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				LOG_DEBUG('OfflineBattle: kill wrapper failed:', traceback.format_exc())
 			
 			from Account import Account
-			if not hasattr(Account, 'shoot'):
-				Account.shoot = _mock_shoot
+			# shoot is a per-battle closure and is already installed on the player
+			# instance above. Never put it on the persistent Account class: doing so
+			# pins the first battle's gun state, mocks and models for the process.
 			if not hasattr(Account, 'autoAim'):
 				Account.autoAim = lambda self, targetID: None
 			if not hasattr(Account, 'isGuiVisible'):
@@ -15677,13 +16039,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								LOG_DEBUG('Do error:', traceback.format_exc())
 							return
 
-						BigWorld.callback(0.1, _do)
+						_offh_battle_callback(0.1, _do)
 						
 					except Exception:
 						LOG_CURRENT_EXCEPTION()
 				from _constants import CONFIG_OPTIONS
 				loading_time = float(CONFIG_OPTIONS.get('loading_screen_time_seconds', 5.0))
-				BigWorld.callback(loading_time, _finish_battle_load)
+				_offh_battle_callback(loading_time, _finish_battle_load)
 
 		except Exception:
 			LOG_CURRENT_EXCEPTION()

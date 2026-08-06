@@ -1127,7 +1127,7 @@ class LANClientQueueTest(unittest.TestCase):
         wrapper = source[source.index("class _KillEventWrapper(object):"):]
         wrapper = wrapper[:8000]
         self.assertIn("_offh_refresh_team_score(_pl)", wrapper)
-        self.assertIn("BigWorld.callback(0.0", wrapper)
+        self.assertIn("_offh_battle_callback(0.0", wrapper)
 
     def test_initial_spawn_uses_the_actual_lan_team(self):
         source = (ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py").read_text()

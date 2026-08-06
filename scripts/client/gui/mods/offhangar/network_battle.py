@@ -916,6 +916,12 @@ def stop_for_player(player):
 		player._offhangar_network_bot_orders = {}
 		player._offhangar_network_bot_order_revision = 0
 		player._offhangar_network_result_applied = False
+		# These are per-battle closures installed by offline_battle. Keeping them
+		# on the persistent account pins the finished battle's models and mocks.
+		player._offhangar_apply_network_rules_state = None
+		player._offhangar_apply_network_battle_result = None
+		player._offhangar_network_spawn_remote = None
+		player._offhangar_network_formation = None
 
 
 def _server_pose_from_world(player, world_x, world_y, world_z, world_yaw):
