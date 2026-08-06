@@ -6,9 +6,10 @@ static model transforms, visual bounds, and primitive vertices directly from
 the pinned client packages.  The resulting JSON is small enough to ship with
 the mod, so players never have to scan a map in game.
 
-Map bounds, bases, and validation anchors come from the tactical route registry
-shipped with the mod. ``--all`` bakes every stock map with the same generic
-terrain, water, grade, obstacle, and connectivity rules.
+Map bounds and validation anchors come from the tactical route registry shipped
+with the mod. Its bases are checked against the pinned client's standard-battle
+arena definitions before baking. ``--all`` bakes every stock map with the same
+generic terrain, water, grade, obstacle, and connectivity rules.
 """
 
 import argparse
@@ -57,6 +58,7 @@ HEIGHTMAP_BORDER = 2
 WATER_DEPTH_LIMIT = 0.90
 SHALLOW_WATER_THRESHOLD = 0.12
 VEHICLE_HALF_WIDTH = 2.15
+BRIDGE_OBSTACLE_MARGIN = 1.0
 VEHICLE_CLEARANCE_HEIGHT = 2.40
 LOCAL_OBSTACLE_MAX_HEIGHT = 0.65
 VEHICLE_GROUND_CLEARANCE = LOCAL_OBSTACLE_MAX_HEIGHT
@@ -72,8 +74,8 @@ HAZARD_EDGE = 2
 HAZARD_SHALLOW_WATER = 4
 SHALLOW_WATER_COST_MULTIPLIER = 4.0
 NAVGRAPH_BOUND_MARGIN = 16.0
-BRIDGE_HEIGHT_BIN = 0.5
-BRIDGE_DECK_BAND = 1.75
+MAX_ROUTE_DETOUR = 2.0
+MAX_ROUTE_TURN = math.radians(150.0)
 
 DIRECTIONS = (
     (-1, -1), (0, -1), (1, -1),
@@ -209,6 +211,76 @@ def _packed_integer(value, default=None):
     if value.value_type != TYPE_INTEGER:
         raise ValueError("Packed XML value is not an integer")
     return int(value.value)
+
+
+def _packed_vector2(value):
+    """Decode the Vector2 or historical text form used by arena definitions."""
+    if value.value_type == TYPE_VECTOR:
+        vector = _packed_vector(value)
+        if len(vector) < 2:
+            raise ValueError("Packed XML vector has fewer than two coordinates")
+        return float(vector[0]), float(vector[1])
+    if value.value_type == TYPE_STRING:
+        parts = _packed_text(value).split()
+        if len(parts) < 2:
+            raise ValueError("Packed XML position has fewer than two coordinates")
+        return float(parts[0]), float(parts[1])
+    raise ValueError("Packed XML position is neither a vector nor text")
+
+
+def ctf_bases_from_arena_data(data):
+    """Read the two standard-battle base positions from packed arena XML."""
+    root = read_packed_xml(data)
+    gameplay = _packed_child(root, "gameplayTypes")
+    if gameplay.value_type != TYPE_ELEMENT:
+        raise ValueError("arena gameplayTypes is not an element")
+    ctf = _packed_child(gameplay.value, "ctf")
+    if ctf.value_type != TYPE_ELEMENT:
+        raise ValueError("arena ctf gameplay type is not an element")
+    positions = _packed_child(ctf.value, "teamBasePositions")
+    if positions.value_type != TYPE_ELEMENT:
+        raise ValueError("ctf teamBasePositions is not an element")
+    bases = []
+    for team in (1, 2):
+        team_value = _packed_child(positions.value, "team%d" % team)
+        if team_value.value_type != TYPE_ELEMENT:
+            raise ValueError("ctf team%d base list is not an element" % team)
+        candidates = [value for name, value in team_value.value.children
+                      if name.startswith(b"position")]
+        if not candidates:
+            raise ValueError("ctf team%d has no base position" % team)
+        bases.append(_packed_vector2(candidates[0]))
+    return tuple(bases)
+
+
+def read_client_ctf_bases(client_root, map_name):
+    path = os.path.join(
+        os.path.abspath(client_root), "res", "scripts", "arena_defs",
+        map_name + ".xml",
+    )
+    if not os.path.isfile(path):
+        raise ValueError("arena definition not found: %s" % path)
+    with open(path, "rb") as arena_file:
+        return ctf_bases_from_arena_data(arena_file.read())
+
+
+def validate_tactical_bases(map_name, map_config, actual_bases, tolerance=1.0):
+    """Reject route metadata from another gameplay type or swapped teams."""
+    expected_bases = tuple(map_config["bases"])
+    if len(actual_bases) != 2 or len(expected_bases) != 2:
+        raise ValueError("%s must define exactly two ctf bases" % map_name)
+    for team, (expected, actual) in enumerate(
+            zip(expected_bases, actual_bases), 1):
+        offset = math.hypot(float(expected[0]) - float(actual[0]),
+                            float(expected[1]) - float(actual[1]))
+        if offset > float(tolerance):
+            raise ValueError(
+                "%s tactical team%d base differs from arena ctf by %.1f m "
+                "(tactical=(%.1f, %.1f), ctf=(%.1f, %.1f))" % (
+                    map_name, team, offset,
+                    expected[0], expected[1], actual[0], actual[1],
+                )
+            )
 
 
 def _signed_hex16(value):
@@ -848,21 +920,19 @@ class ObstacleField(object):
                     self._mark_surface(cell_x, cell_z, height)
 
     def _bridge_deck_triangles(self, triangles):
-        candidates = []
-        height_bins = {}
+        # A bridge model contains both the level deck and its drivable approach
+        # ramps. Selecting only triangles near the dominant deck height leaves
+        # a short gap at each bank, so the resulting graph contains an isolated
+        # deck that tanks can never enter. The resource name already provides
+        # the bridge semantic boundary; within it every tank-grade surface is
+        # road, and _mark_surface keeps the highest surface where they overlap.
+        candidates = set()
         for triangle in triangles:
-            walkable, projected_area = self._walkable_triangle(triangle)
+            walkable, unused_projected_area = self._walkable_triangle(triangle)
             if not walkable:
                 continue
-            centre_y = sum(point[1] for point in triangle) / 3.0
-            bin_y = round(centre_y / BRIDGE_HEIGHT_BIN) * BRIDGE_HEIGHT_BIN
-            height_bins[bin_y] = height_bins.get(bin_y, 0.0) + projected_area
-            candidates.append((triangle, centre_y))
-        if not height_bins:
-            return set()
-        deck_y = max(height_bins, key=height_bins.get)
-        return set(id(triangle) for triangle, centre_y in candidates
-                   if abs(centre_y - deck_y) <= BRIDGE_DECK_BAND)
+            candidates.add(id(triangle))
+        return candidates
 
     def _raster_triangle(self, triangle):
         polygon = tuple((point[0], point[2]) for point in triangle)
@@ -1228,7 +1298,8 @@ def _oriented_route_points(route_record, map_config):
     return points
 
 
-def _sample_route_path(graph, path, hold_nodes, maximum_points=16):
+def _sample_route_path(graph, path, hold_nodes, maximum_points=16,
+                       required_nodes=()):
     """Reduce a safe grid path while retaining endpoints and tactical holds."""
     if not path:
         return []
@@ -1243,26 +1314,52 @@ def _sample_route_path(graph, path, hold_nodes, maximum_points=16):
         ))
     selected = set((0, len(path) - 1))
     selected.update(index for index, node in enumerate(path) if node in hold_nodes)
-    slots = max(0, maximum_points - len(selected))
-    if slots:
-        total = cumulative[-1]
-        for sample in range(1, slots + 1):
-            target = total * float(sample) / float(slots + 1)
-            index = min(range(len(path)), key=lambda value: abs(cumulative[value] - target))
-            selected.add(index)
-    # Rounding two samples onto the same node can leave spare slots. Fill the
-    # largest distance gaps first so no runtime A* leg becomes needlessly long.
+    selected.update(index for index, node in enumerate(path)
+                    if node in required_nodes)
+    if len(selected) > maximum_points:
+        raise ValueError("tactical route has more required gates than protocol slots")
+    # Preserve bends before filling long straight gaps. Uniform arc-length
+    # sampling can put two waypoints on opposite sides of a tight obstacle and
+    # make their direct separation tiny even though the graph leg loops around
+    # it. Greedily split the highest-detour gap at its geometric apex first.
     while len(selected) < min(maximum_points, len(path)):
         ordered = sorted(selected)
-        gaps = [(cumulative[second] - cumulative[first], first, second)
-                for first, second in zip(ordered, ordered[1:])
-                if second - first > 1]
+        gaps = []
+        for first, second in zip(ordered, ordered[1:]):
+            if second - first <= 1:
+                continue
+            first_point = _node_point(graph, path[first])
+            second_point = _node_point(graph, path[second])
+            path_distance = cumulative[second] - cumulative[first]
+            direct = max(
+                graph["cell_size"],
+                math.hypot(second_point[0] - first_point[0],
+                           second_point[1] - first_point[1]),
+            )
+            ratio = path_distance / direct
+            # Curved gaps above 1.25x outrank all straight gaps. Once the
+            # polyline represents every bend, distribute remaining samples by
+            # travelled distance.
+            priority = ratio if ratio > 1.25 else 1.0
+            gaps.append((priority, path_distance, first, second))
         if not gaps:
             break
-        unused_distance, first, second = max(gaps)
-        target = (cumulative[first] + cumulative[second]) * 0.5
-        selected.add(min(range(first + 1, second),
-                         key=lambda value: abs(cumulative[value] - target)))
+        unused_priority, unused_distance, first, second = max(gaps)
+        first_point = _node_point(graph, path[first])
+        second_point = _node_point(graph, path[second])
+        candidates = range(first + 1, second)
+        index = max(
+            candidates,
+            key=lambda value: _distance_to_segment(
+                _node_point(graph, path[value]), first_point, second_point),
+        )
+        if _distance_to_segment(
+                _node_point(graph, path[index]), first_point,
+                second_point) < graph["cell_size"] * 0.25:
+            target = (cumulative[first] + cumulative[second]) * 0.5
+            index = min(candidates,
+                        key=lambda value: abs(cumulative[value] - target))
+        selected.add(index)
     result = []
     for index in sorted(selected):
         x, z = _node_point(graph, path[index])
@@ -1370,6 +1467,78 @@ def _corridor_graph_path(graph, start, goal, corridor):
     return tuple(path)
 
 
+def _route_maximum_detour(graph, waypoints):
+    maximum = 1.0
+    for first, second in zip(waypoints, waypoints[1:]):
+        first_node, first_offset = _nearest_node(graph, first)
+        second_node, second_offset = _nearest_node(graph, second)
+        if first_node is None or second_node is None:
+            return float("inf")
+        path, distance = _graph_path(graph, first_node, second_node)
+        if not path:
+            return float("inf")
+        direct = max(
+            graph["cell_size"],
+            math.hypot(second[0] - first[0], second[1] - first[1]),
+        )
+        maximum = max(
+            maximum, (distance + first_offset + second_offset) / direct
+        )
+    return maximum
+
+
+def _route_geometry_issue(waypoints):
+    """Return why a sampled route loops back on itself, or ``None``."""
+    points = [(float(point[0]), float(point[1])) for point in waypoints]
+    for first, second, third in zip(points, points[1:], points[2:]):
+        first_heading = math.atan2(second[1] - first[1],
+                                   second[0] - first[0])
+        second_heading = math.atan2(third[1] - second[1],
+                                    third[0] - second[0])
+        turn = abs(second_heading - first_heading)
+        if turn > math.pi:
+            turn = math.pi * 2.0 - turn
+        if turn >= MAX_ROUTE_TURN:
+            return "hairpin %.1f degrees" % math.degrees(turn)
+
+    def orientation(first, second, third):
+        return ((second[0] - first[0]) * (third[1] - first[1]) -
+                (second[1] - first[1]) * (third[0] - first[0]))
+
+    def on_segment(first, second, point):
+        epsilon = 1e-7
+        return (abs(orientation(first, second, point)) <= epsilon and
+                min(first[0], second[0]) - epsilon <= point[0] <=
+                max(first[0], second[0]) + epsilon and
+                min(first[1], second[1]) - epsilon <= point[1] <=
+                max(first[1], second[1]) + epsilon)
+
+    def intersects(first, second, third, fourth):
+        first_side = orientation(first, second, third)
+        second_side = orientation(first, second, fourth)
+        third_side = orientation(third, fourth, first)
+        fourth_side = orientation(third, fourth, second)
+        if (((first_side > 0.0 and second_side < 0.0) or
+             (first_side < 0.0 and second_side > 0.0)) and
+                ((third_side > 0.0 and fourth_side < 0.0) or
+                 (third_side < 0.0 and fourth_side > 0.0))):
+            return True
+        return (on_segment(first, second, third) or
+                on_segment(first, second, fourth) or
+                on_segment(third, fourth, first) or
+                on_segment(third, fourth, second))
+
+    segments = list(zip(points, points[1:]))
+    for first_index, first in enumerate(segments):
+        for second_index in range(first_index + 2, len(segments)):
+            if intersects(first[0], first[1],
+                          segments[second_index][0],
+                          segments[second_index][1]):
+                return "self-intersection at segments %d/%d" % (
+                    first_index, second_index)
+    return None
+
+
 def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
     """Project tactical intent onto the retained graph and emit safe routes.
 
@@ -1380,6 +1549,8 @@ def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
     """
     routes = {"1": [], "2": []}
     maximum_offset = 0.0
+    soft_fallbacks = []
+    soft_fallback_causes = {}
     for route_record in map_config.get("routes", ()):
         source_points = _oriented_route_points(route_record, map_config)
         projected = []
@@ -1404,10 +1575,41 @@ def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
             for point, node in zip(source_points, projected):
                 corridor.append((point[0], point[1],
                                  float(graph["heights_mm"][node]) / 1000.0))
-            full_path = _corridor_graph_path(
-                graph, projected[0], projected[-1], tuple(corridor))
-            if not full_path:
-                raise ValueError("tactical corridor cannot connect the team bases")
+            # One representative hold point is the tactical lane gate;
+            # ordinary points and remaining holds shape the corridor around it.
+            # Making every sketch point mandatory turns a harmless point behind
+            # one building into a U-turn, while making all points soft lets a
+            # hill route collapse onto the direct city road. The hold farthest
+            # from the base line best preserves the route's distinguishing lane.
+            gate_indexes = [0]
+            hold_indexes = [index for index, point in enumerate(source_points)
+                            if bool(point[2]) and index not in
+                            (0, len(source_points) - 1)]
+            if hold_indexes:
+                base_line = (source_points[0], source_points[-1])
+                gate_indexes.append(max(
+                    hold_indexes,
+                    key=lambda index: _distance_to_segment(
+                        source_points[index], base_line[0], base_line[1]),
+                ))
+            gate_indexes.append(len(source_points) - 1)
+            gate_indexes = sorted(set(gate_indexes))
+            full_path = []
+            for gate_number, (start_index, goal_index) in enumerate(
+                    zip(gate_indexes, gate_indexes[1:])):
+                segment = _corridor_graph_path(
+                    graph, projected[start_index], projected[goal_index],
+                    tuple(corridor[start_index:goal_index + 1]))
+                if not segment:
+                    raise ValueError(
+                        "tactical corridor cannot connect route gate %d" %
+                        gate_number
+                    )
+                if full_path and segment[0] == full_path[-1]:
+                    full_path.extend(segment[1:])
+                else:
+                    full_path.extend(segment)
+            full_path = tuple(full_path)
             hold_nodes = set()
             for point in source_points:
                 if not bool(point[2]):
@@ -1418,7 +1620,40 @@ def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
                         _node_point(graph, node)[0] - point[0],
                         _node_point(graph, node)[1] - point[1]),
                 ))
-            waypoints = _sample_route_path(graph, full_path, hold_nodes, 16)
+            waypoints = _sample_route_path(
+                graph, full_path, hold_nodes, 16,
+                set(projected[index] for index in gate_indexes)
+            )
+            detour = _route_maximum_detour(graph, waypoints)
+            geometry_issue = _route_geometry_issue(waypoints)
+            if detour > MAX_ROUTE_DETOUR or geometry_issue is not None:
+                # Some old hand sketches place their most lateral hold just
+                # behind an impassable ridge. Preserve the entire sketch as a
+                # soft corridor instead of forcing a multi-hundred-metre U-turn.
+                full_path = _corridor_graph_path(
+                    graph, projected[0], projected[-1], tuple(corridor))
+                if not full_path:
+                    raise ValueError("soft tactical corridor cannot connect the team bases")
+                # Once a hard gate proved geometrically unsafe, do not re-add
+                # nearby hold nodes as mandatory samples. They do not alter the
+                # graph path, but can make the 16-point protocol polyline double
+                # back around the same obstacle and reintroduce the hairpin.
+                hold_nodes = set()
+                waypoints = _sample_route_path(
+                    graph, full_path, hold_nodes, 16,
+                    (projected[0], projected[-1]),
+                )
+                route_key = "%d:%s" % (
+                    int(route_record["team"]), route_record["id"])
+                soft_issue = _route_geometry_issue(waypoints)
+                if soft_issue is not None:
+                    raise ValueError(
+                        "soft tactical corridor has invalid geometry: %s" %
+                        soft_issue
+                    )
+                soft_fallbacks.append(route_key)
+                soft_fallback_causes[route_key] = (
+                    geometry_issue or "detour %.2fx" % detour)
         routes[str(int(route_record["team"]))].append({
             "id": route_record["id"],
             "capacity": route_record["capacity"],
@@ -1427,6 +1662,8 @@ def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
             "waypoints": waypoints,
         })
     graph["bake"]["maximum_route_projection"] = round(maximum_offset, 3)
+    graph["bake"]["soft_route_fallbacks"] = soft_fallbacks
+    graph["bake"]["soft_route_fallback_causes"] = soft_fallback_causes
     return routes
 
 
@@ -1500,7 +1737,7 @@ def validate_graph(graph, map_config):
         raise ValueError("route anchor is too far from the retained graph: %.1f m" %
                          maximum_anchor_offset)
     maximum_route_detour = max(route_detours or [1.0])
-    if maximum_route_detour > 2.0:
+    if maximum_route_detour > MAX_ROUTE_DETOUR:
         raise ValueError("route segment detour is implausible: %.2fx" %
                          maximum_route_detour)
     # A flank may legitimately move laterally or slightly away from the enemy
@@ -1555,7 +1792,10 @@ def _segment_clear(terrain, obstacles, start, end):
             if (delta > horizontal * MAX_GRADE_UP or
                     delta < -horizontal * MAX_GRADE_DOWN):
                 return False
-        if obstacles.blocked(x, z, y):
+        obstacle_margin = (BRIDGE_OBSTACLE_MARGIN
+                           if obstacles.surface_height(x, z) is not None
+                           else VEHICLE_HALF_WIDTH)
+        if obstacles.blocked(x, z, y, margin=obstacle_margin):
             return False
         previous = (x, y, z)
     return True
@@ -1576,13 +1816,25 @@ def _has_safe_edge_clearance(terrain, obstacles, x, z, ground_y):
         (-math.sqrt(0.5), math.sqrt(0.5)),
         (math.sqrt(0.5), math.sqrt(0.5)),
     )
-    # A bridge collision mesh is already bounded by solid rails/side walls.
-    # Requiring the six-metre terrain shoulder on its narrow or diagonal deck
-    # can erase the only safe crossing even though a tank-sized three-metre
-    # shoulder is present.
-    radii = ((EDGE_CLEARANCE_RADII[0],)
-             if obstacles.surface_height(x, z) is not None
-             else EDGE_CLEARANCE_RADII)
+    # A bridge surface exists only where a decoded collision-mesh deck exists.
+    # Use a one-metre shoulder here: the ordinary 3/6 m terrain erosion would
+    # erase a narrow diagonal bridge, while accepting the centre cell alone can
+    # place a route on the outer lip of the deck. At an approach ramp, ordinary
+    # dry terrain may safely supply the missing shoulder.
+    if obstacles.surface_height(x, z) is not None:
+        maximum_drop = BRIDGE_OBSTACLE_MARGIN * MAX_GRADE
+        for direction_x, direction_z in directions:
+            sample_x = float(x) + direction_x * BRIDGE_OBSTACLE_MARGIN
+            sample_z = float(z) + direction_z * BRIDGE_OBSTACLE_MARGIN
+            sample_y = _ground_height(terrain, obstacles, sample_x, sample_z)
+            if sample_y is None:
+                return False
+            if terrain.water_depth(sample_x, sample_z, sample_y) > WATER_DEPTH_LIMIT:
+                return False
+            if float(ground_y) - float(sample_y) > maximum_drop:
+                return False
+        return True
+    radii = EDGE_CLEARANCE_RADII
     for radius in radii:
         maximum_drop = radius * MAX_GRADE
         for direction_x, direction_z in directions:
@@ -1633,7 +1885,10 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
                 hazards[index] |= HAZARD_EDGE
                 rejected_edge += 1
                 continue
-            if obstacles.blocked(x, z, ground):
+            obstacle_margin = (BRIDGE_OBSTACLE_MARGIN
+                               if obstacles.surface_height(x, z) is not None
+                               else VEHICLE_HALF_WIDTH)
+            if obstacles.blocked(x, z, ground, margin=obstacle_margin):
                 rejected_obstacle += 1
                 continue
             heights[index] = int(round(ground * 1000.0))
@@ -1712,6 +1967,7 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
             "shallow_water_threshold": SHALLOW_WATER_THRESHOLD,
             "shallow_water_cost_multiplier": SHALLOW_WATER_COST_MULTIPLIER,
             "vehicle_half_width": VEHICLE_HALF_WIDTH,
+            "bridge_obstacle_margin": BRIDGE_OBSTACLE_MARGIN,
             "vehicle_clearance_height": VEHICLE_CLEARANCE_HEIGHT,
             "vehicle_ground_clearance": VEHICLE_GROUND_CLEARANCE,
             "max_grade": MAX_GRADE,
@@ -1825,6 +2081,13 @@ def main(argv=None):
     failures = []
     staging_dir = tempfile.mkdtemp(prefix="offhangar-navgraphs-") if args.all else None
     for map_name in map_names:
+        try:
+            actual_bases = read_client_ctf_bases(args.client, map_name)
+            validate_tactical_bases(map_name, MAPS[map_name], actual_bases)
+        except Exception as error:
+            failures.append((map_name, str(error)))
+            print("FAILED %s: %s" % (map_name, error))
+            continue
         map_package = os.path.join(packages, map_name + ".pkg")
         if not os.path.isfile(map_package):
             failures.append((map_name, "map package not found"))

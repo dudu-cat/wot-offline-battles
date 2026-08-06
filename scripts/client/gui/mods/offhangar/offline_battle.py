@@ -4434,29 +4434,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							except Exception:
 								pass
 						LOG_DEBUG('OfflineBattle.spawnPoints (ctf xml):', g_offline_spawns)
-						# NOTE: 0.8.2 ctf arena_defs carry NO teamSpawnPoints - only teamBasePositions.
-						# (Verified by decoding the packed 04_himmelsdorf.xml: ctf has teamBasePositions
-						# only, while domination's teamSpawnPoints sit ~350 m away and its team1 point is
-						# beside ctf team2's base.) The server places vehicles in retail, so there is no
-						# authentic per-vehicle list to read here: the line-up around the base flag below
-						# IS the correct approach. Do not 'fix' this by borrowing another gameplay type.
-						# AUTHORITATIVE: ArenaType parsed teamSpawnPoints itself (readVector2s('position')
-						# under teamSpawnPoints/teamN) and exposes it via __getattr__. The hand-parse above
-						# came back empty on every map (python.log: 'spawnPoints: {1: [], 2: []}'), which
-						# dropped every spawn onto the base-flag fallback instead of the real spawn points.
-						try:
-							_at_sp = getattr(at, 'teamSpawnPoints', None)
-							if _at_sp:
-								for _ti in (1, 2):
-									_lst = _at_sp[_ti - 1] if len(_at_sp) >= _ti else None
-									if not _lst: continue
-									_acc = []
-									for _pv in _lst:
-										try: _acc.append((float(_pv.x), float(_pv.y)))
-										except Exception: pass
-									if _acc: g_offline_spawns[_ti] = _acc
-						except Exception as _spe:
-							LOG_DEBUG('ArenaType spawn read error:', str(_spe))
+						# Only spawn points nested under the selected ctf gameplay type are
+						# safe to use. ArenaType.teamSpawnPoints can expose a different mode's
+						# points (Himmelsdorf exposes domination here), which put standard-battle
+						# vehicles on roofs at the opposite edge. Most stock ctf definitions have
+						# no explicit spawn list, so the formation around the ctf base is expected.
 						LOG_DEBUG('OfflineBattle.spawnPoints (final):', g_offline_spawns)
 						# Map bounds (arena_defs boundingBox: bottomLeft/upperRight as Vector2) - used to
 						# reject off-map spawn candidates (the 'spawned left outside the map' bug).

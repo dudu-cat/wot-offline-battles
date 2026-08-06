@@ -439,11 +439,14 @@ class BattleDirector(object):
 		self.battle_seed = stable_seed(battle_seed, self.map_name)
 		self.map_data = _map_data_with_baked_routes(
 			bot_ai_maps.get_tactical_map(self.map_name), baked_routes)
-		self.bases = dict(bases or {})
+		self.bases = {}
 		self.bounds = bounds
 		if self.map_data is not None:
 			self.bases.update(self.map_data.get('bases', {}))
 			self.bounds = self.map_data.get('bounds', self.bounds)
+		# The live arena definition is authoritative. Static tactical data only
+		# supplies a fallback for tests or incomplete legacy DataSections.
+		self.bases.update(dict(bases or {}))
 		self.agents = {}
 		self.contacts = {1: {}, 2: {}}
 		self.route_usage = {}

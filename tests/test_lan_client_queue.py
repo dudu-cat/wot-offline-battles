@@ -1134,6 +1134,7 @@ class LANClientQueueTest(unittest.TestCase):
 
         self.assertIn("_player_spawn_team = int(getattr(player, '_offhangar_team', 1) or 1)", source)
         self.assertIn("gp['teamSpawnPoints/team%d' % _player_spawn_team]", source)
+        self.assertNotIn("getattr(at, 'teamSpawnPoints'", source)
         self.assertIn("get(_player_spawn_team, [])", source)
         self.assertIn("g_offline_bases.get(_player_spawn_team, [])", source)
         self.assertIn("send_local_hit(player", source)

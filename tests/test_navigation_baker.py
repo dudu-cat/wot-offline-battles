@@ -153,6 +153,46 @@ class NavigationBakerTest(unittest.TestCase):
             Terrain(drop=True), Surfaces(), 0.0, 0.0, 0.0
         ))
 
+    def test_bridge_deck_uses_collision_rails_instead_of_water_erosion(self):
+        class Terrain:
+            @staticmethod
+            def height(x, z):
+                return 0.0
+
+            @staticmethod
+            def water_depth(x, z, ground):
+                return 0.0 if ground >= 2.0 else 10.0
+
+        class Surfaces:
+            @staticmethod
+            def surface_height(x, z):
+                return 2.0
+
+        self.assertTrue(self.baker._has_safe_edge_clearance(
+            Terrain(), Surfaces(), 0.0, 0.0, 2.0
+        ))
+
+    def test_bridge_deck_rejects_a_surface_cell_without_a_safe_shoulder(self):
+        class Terrain:
+            @staticmethod
+            def height(x, z):
+                return 0.0
+
+            @staticmethod
+            def water_depth(x, z, ground):
+                return 0.0 if ground >= 2.0 else 10.0
+
+        class Surfaces:
+            @staticmethod
+            def surface_height(x, z):
+                if abs(x) < 0.1 and abs(z) < 0.1:
+                    return 2.0
+                return None
+
+        self.assertFalse(self.baker._has_safe_edge_clearance(
+            Terrain(), Surfaces(), 0.0, 0.0, 2.0
+        ))
+
     def test_bridge_resource_name_is_the_surface_semantic_boundary(self):
         self.assertTrue(self.baker._is_bridge_model(
             "content/Environment/env035_Bridge/normal/lod0/deck.model"
@@ -173,6 +213,49 @@ class NavigationBakerTest(unittest.TestCase):
 
         self.assertEqual(
             2.5, self.baker._ground_height(Terrain(), field, 0.5, 0.5)
+        )
+
+    def test_bridge_surface_keeps_walkable_approach_ramps(self):
+        field = object.__new__(self.baker.ObstacleField)
+        deck = ((0.0, 3.0, 0.0), (4.0, 3.0, 0.0), (0.0, 3.0, 4.0))
+        ramp = ((0.0, 0.0, 0.0), (4.0, 0.8, 0.0), (0.0, 0.0, 4.0))
+        wall = ((0.0, 0.0, 0.0), (0.0, 4.0, 0.0), (0.0, 0.0, 4.0))
+
+        selected = field._bridge_deck_triangles((deck, ramp, wall))
+
+        self.assertIn(id(deck), selected)
+        self.assertIn(id(ramp), selected)
+        self.assertNotIn(id(wall), selected)
+
+    def test_bridge_segment_uses_the_narrow_collision_rail_margin(self):
+        class Terrain:
+            @staticmethod
+            def height(x, z):
+                return 0.0
+
+            @staticmethod
+            def water_depth(x, z, ground):
+                return 0.0
+
+        class Surfaces:
+            def __init__(self):
+                self.margins = []
+
+            @staticmethod
+            def surface_height(x, z):
+                return 0.0
+
+            def blocked(self, x, z, ground, margin):
+                self.margins.append(margin)
+                return False
+
+        surfaces = Surfaces()
+
+        self.assertTrue(self.baker._segment_clear(
+            Terrain(), surfaces, (0.0, 0.0, 0.0), (4.0, 0.0, 0.0)
+        ))
+        self.assertEqual(
+            {self.baker.BRIDGE_OBSTACLE_MARGIN}, set(surfaces.margins)
         )
 
     def test_low_obstacle_is_owned_by_local_tank_locomotion(self):
@@ -218,6 +301,54 @@ class NavigationBakerTest(unittest.TestCase):
         self.assertLessEqual(bounds[1], -322.4)
         self.assertEqual(0.0, bounds[1] % 4.0)
 
+    def test_reads_vector_and_text_ctf_bases_from_packed_arena_xml(self):
+        probe_spec = importlib.util.spec_from_file_location(
+            "packed_xml_test_helpers", ROOT / "tools/build_navmesh_probe.py"
+        )
+        probe = importlib.util.module_from_spec(probe_spec)
+        probe_spec.loader.exec_module(probe)
+
+        def element(children):
+            return probe.PackedValue(
+                probe.TYPE_ELEMENT, probe.PackedElement(children=children)
+            )
+
+        vector = probe.PackedValue(
+            probe.TYPE_VECTOR, struct.pack("<2f", -47.5, -302.6)
+        )
+        text_position = probe.PackedValue(probe.TYPE_STRING, b"17.1 300.0")
+        root = probe.PackedElement(children=[
+            (b"gameplayTypes", element([
+                (b"ctf", element([
+                    (b"teamBasePositions", element([
+                        (b"team1", element([(b"position1", vector)])),
+                        (b"team2", element([(b"position1", text_position)])),
+                    ])),
+                ])),
+            ])),
+        ])
+
+        bases = self.baker.ctf_bases_from_arena_data(
+            probe.write_packed_xml(root)
+        )
+
+        self.assertAlmostEqual(-47.5, bases[0][0], places=3)
+        self.assertAlmostEqual(-302.6, bases[0][1], places=3)
+        self.assertEqual((17.1, 300.0), bases[1])
+
+    def test_tactical_base_validation_rejects_swapped_or_other_mode_data(self):
+        config = {"bases": ((-47.5, -302.6), (17.1, 300.0))}
+
+        self.baker.validate_tactical_bases(
+            "04_himmelsdorf", config,
+            ((-47.5, -302.6), (17.1, 300.0)),
+        )
+        with self.assertRaisesRegex(ValueError, "tactical team1 base differs"):
+            self.baker.validate_tactical_bases(
+                "04_himmelsdorf", config,
+                ((305.2, -306.4), (300.7, 300.9)),
+            )
+
     def test_route_anchor_beyond_server_arrival_radius_is_rejected(self):
         graph = {
             "width": 4, "height": 1, "cell_size": 4.0,
@@ -232,6 +363,77 @@ class NavigationBakerTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "route anchor is too far"):
             self.baker.validate_graph(graph, config)
+
+    def test_tactical_route_must_pass_through_representative_hold_gate(self):
+        width = 5
+        height = 5
+        links = []
+        for z in range(height):
+            for x in range(width):
+                mask = 0
+                for index, (dx, dz) in enumerate(self.baker.DIRECTIONS):
+                    if 0 <= x + dx < width and 0 <= z + dz < height:
+                        mask |= 1 << index
+                links.append(mask)
+        graph = {
+            "width": width, "height": height, "cell_size": 4.0,
+            "origin": [0.0, 0.0], "heights_mm": [0] * (width * height),
+            "links": links, "bake": {},
+        }
+        config = {
+            "bases": ((0.0, 0.0), (16.0, 16.0)),
+            "routes": ({
+                "team": 1, "id": "perimeter", "capacity": 1,
+                "risk": 0.5, "role_weights": {},
+                "points": ((0.0, 0.0, False),
+                           (0.0, 16.0, True),
+                           (16.0, 16.0, False)),
+            },),
+        }
+
+        routes = self.baker.bake_tactical_routes(graph, config)
+
+        self.assertIn([0.0, 16.0, True], routes["1"][0]["waypoints"])
+
+    def test_route_geometry_rejects_hairpins_and_self_intersections(self):
+        self.assertIsNone(self.baker._route_geometry_issue(
+            ((0.0, 0.0, False), (8.0, 0.0, False),
+             (16.0, 8.0, False))
+        ))
+        self.assertIn("hairpin", self.baker._route_geometry_issue(
+            ((0.0, 0.0, False), (8.0, 0.0, False),
+             (1.0, 1.0, False))
+        ))
+        self.assertIn("self-intersection", self.baker._route_geometry_issue(
+            ((0.0, 0.0, False), (8.0, 8.0, False),
+             (0.0, 8.0, False), (8.0, 0.0, False))
+        ))
+
+    def test_route_sampling_preserves_a_tight_path_bend(self):
+        graph = {
+            "width": 5, "height": 3, "cell_size": 4.0,
+            "origin": [0.0, 0.0], "heights_mm": [0] * 15,
+        }
+        path = (0, 5, 10, 11, 12, 13, 14, 9, 4)
+
+        sampled = self.baker._sample_route_path(
+            graph, path, set(), maximum_points=3
+        )
+
+        self.assertTrue(any(point[1] == 8.0 for point in sampled[1:-1]))
+
+    def test_shipped_routes_have_safe_sampled_geometry(self):
+        graph_dir = ROOT / "scripts/client/gui/mods/offhangar/navgraphs"
+        for graph_path in sorted(graph_dir.glob("*.json")):
+            if graph_path.name == "manifest.json":
+                continue
+            graph = json.loads(graph_path.read_text())
+            for team in ("1", "2"):
+                for route in graph["routes"][team]:
+                    self.assertIsNone(
+                        self.baker._route_geometry_issue(route["waypoints"]),
+                        (graph["map"], team, route["id"]),
+                    )
 
     def test_batch_publish_writes_a_checksum_manifest_after_all_graphs(self):
         with tempfile.TemporaryDirectory() as directory:

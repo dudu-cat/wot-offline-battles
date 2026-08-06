@@ -73,6 +73,19 @@ class BotAITest(unittest.TestCase):
 
         self.assertEqual({6, 7, 8}, allowed)
 
+    def test_live_ctf_bases_override_static_tactical_fallbacks(self):
+        live = {1: (-47.5, -302.6), 2: (17.1, 300.0)}
+
+        director = self.ai.BattleDirector(
+            "04_himmelsdorf", "live-bases", bases=live
+        )
+        unknown = self.ai.BattleDirector(
+            "custom_map", "live-bases", bases=live
+        )
+
+        self.assertEqual(live, director.bases)
+        self.assertEqual(live, unknown.bases)
+
     def test_lineup_limits_exact_spg_but_not_tank_destroyers(self):
         vehicles = [
             {"name": "spg-a", "tags": {"SPG"}},

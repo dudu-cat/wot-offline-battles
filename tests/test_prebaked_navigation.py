@@ -140,6 +140,25 @@ class PrebakedNavigationLoaderTest(unittest.TestCase):
                             (map_name, team, route["id"], x, z),
                         )
 
+        corrected_ctf_bases = {
+            "01_karelia": ((397.6, 402.6), (-401.3, -399.9)),
+            "04_himmelsdorf": ((-47.5, -302.6), (17.1, 300.0)),
+            "15_komarin": ((-280.772, -192.392), (282.752, 167.894)),
+            "23_westfeld": ((-300.1, -339.6), (339.4, 299.8)),
+            "28_desert": ((373.4855, -178.9612), (-405.0387, 137.5266)),
+            "29_el_hallouf": ((299.256, 319.406), (-338.5832, -319.3074)),
+        }
+        for map_name, expected in corrected_ctf_bases.items():
+            for actual_base, expected_base in zip(
+                    loaded[map_name]["bases"], expected):
+                self.assertAlmostEqual(expected_base[0], actual_base[0], places=3)
+                self.assertAlmostEqual(expected_base[1], actual_base[1], places=3)
+
+        komarin = loaded["15_komarin"]
+        self.assertGreaterEqual(komarin["bake"]["bridge_surface_triangles"], 200)
+        self.assertLess(komarin["bake"]["pruned_nodes"], 100)
+        self.assertLess(komarin["validation"]["base_path_metres"], 1100.0)
+
         himmelsdorf = loaded["04_himmelsdorf"]
         routes = {route["id"]: route for route in himmelsdorf["routes"]["1"]}
         self.assertEqual({"rail", "banana", "hill", "rear_guard"}, set(routes))
