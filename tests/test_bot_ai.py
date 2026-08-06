@@ -203,6 +203,26 @@ class BotAITest(unittest.TestCase):
                 )
                 self.assertGreaterEqual(order["route_index"], 1)
 
+    def test_spawn_skips_short_route_connector_behind_formation(self):
+        director = self.ai.BattleDirector("07_lakeville", "spawn-connector")
+        agent = director.register(
+            91, 1, descriptor("mediumTank"), "Connector bot"
+        )
+        agent["route"] = {
+            "waypoints": (
+                (0.0, 20.0, False),
+                (0.0, 2.0, False),
+                (0.0, -12.0, False),
+                (0.0, -90.0, False),
+            )
+        }
+        agent["route_started"] = False
+
+        target = director._route_position(agent, (0.0, 0.0, 0.0), 0.0)
+
+        self.assertEqual((0.0, 0.0, -90.0), target)
+        self.assertEqual(3, agent["waypoint_index"])
+
     def test_python26_source_loader_orders_ai_dependencies_before_battle(self):
         bootstrap = (
             ROOT / "scripts/client/gui/mods/mod_offhangar.py"
@@ -211,6 +231,7 @@ class BotAITest(unittest.TestCase):
         maps_index = bootstrap.index("'bot_ai_maps',")
         ai_index = bootstrap.index("'bot_ai',")
         prebaked_index = bootstrap.index("'prebaked_navigation'")
+        feedback_index = bootstrap.index("'battle_feedback'")
         navigation_index = bootstrap.index("'bot_ai_navigation'")
         cover_index = bootstrap.index("'bot_ai_cover'")
         driver_index = bootstrap.index("'bot_ai_driver'")
@@ -218,6 +239,7 @@ class BotAITest(unittest.TestCase):
 
         self.assertLess(group_index, maps_index)
         self.assertLess(maps_index, ai_index)
+        self.assertLess(feedback_index, battle_index)
         self.assertLess(ai_index, prebaked_index)
         self.assertLess(prebaked_index, navigation_index)
         self.assertLess(navigation_index, cover_index)

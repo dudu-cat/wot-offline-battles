@@ -694,6 +694,13 @@ class BattleDirector(object):
 			# it, so entering battle must continue to the first tactical point.
 			if nearest == 0 and len(waypoints) > 1:
 				nearest = 1
+			# Baked routes may contain one or two short connectors around the flag.
+			# A formation slot can already be beyond them, making the nearest connector
+			# sit behind the hull. Let A* join the first meaningful route anchor.
+			while (nearest + 1 < len(waypoints) and
+					_distance_2d(position, (float(waypoints[nearest][0]),
+					position[1], float(waypoints[nearest][1]))) < 30.0):
+				nearest += 1
 			agent['waypoint_index'] = nearest
 			agent['route_started'] = True
 		index = min(int(agent.get('waypoint_index', 0)), len(waypoints) - 1)

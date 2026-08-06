@@ -1,0 +1,38 @@
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BATTLE = ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
+NETWORK = ROOT / "scripts/client/gui/mods/offhangar/network_battle.py"
+
+
+class OfflineBattleFeedbackIntegrationTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.battle_source = BATTLE.read_text()
+        cls.network_source = NETWORK.read_text()
+
+    def test_stock_sixth_sense_and_scout_message_paths_are_used(self):
+        self.assertIn("battle.showSixthSenseIndicator(True)", self.battle_source)
+        self.assertIn("'SPOTTED': 'ENEMY_SPOTTED'", self.battle_source)
+        self.assertIn("panel.showMessage(message_type", self.battle_source)
+
+    def test_result_screen_uses_observed_feedback_values(self):
+        self.assertIn("_offh_feedback_results.result_values(", self.battle_source)
+        self.assertIn("'damageDealt': total_dmg_dealt", self.battle_source)
+        self.assertIn("'damageAssisted': (_feedback_values", self.battle_source)
+
+    def test_lan_events_feed_the_same_local_statistics(self):
+        self.assertGreaterEqual(
+            self.network_source.count("record_network_combat_stats"), 3
+        )
+        self.assertIn("record_network_spot_assist", self.network_source)
+
+    def test_spawn_hides_components_and_uses_baked_ground_layer(self):
+        self.assertIn("for _loaded_component in (ch, hu, tu, gu):", self.battle_source)
+        self.assertIn("nearest_ground_point(_spawn_graph, _x, _z, 3)", self.battle_source)
+
+
+if __name__ == "__main__":
+    unittest.main()

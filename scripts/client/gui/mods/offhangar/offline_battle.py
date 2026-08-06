@@ -1798,6 +1798,162 @@ def _offh_ai_navigator(director):
 					return True
 		return False
 
+
+def _offh_stats_for(player=None):
+	try:
+		if player is None:
+			import BigWorld
+			player = BigWorld.player()
+		return getattr(player, '_offhangar_battle_stats', None)
+	except Exception:
+		return None
+
+
+def _offh_scout_event(player, event_name, target_id):
+	"""Use the stock 0.8.2 personal-message path for spotting feedback."""
+	try:
+		from constants import SCOUT_EVENT_TYPE
+		event_type = getattr(SCOUT_EVENT_TYPE, str(event_name))
+		handler = getattr(player, 'onScoutEvent', None)
+		if callable(handler):
+			handler(event_type, int(target_id))
+			return True
+		# Offline battles retain the Account entity rather than receiving a real
+		# Avatar. Reproduce Avatar.onScoutEvent's stock 0.8.2 presentation path.
+		message_types = {
+			'SPOTTED': 'ENEMY_SPOTTED',
+			'HIT_ASSIST': 'ENEMY_SPOTTED_HIT',
+			'KILL_ASSIST': 'ENEMY_SPOTTED_KILLED',
+		}
+		message_type = message_types.get(str(event_name))
+		if message_type is None:
+			return False
+		from gui import WindowsManager
+		battle = getattr(WindowsManager.g_windowsManager, 'battleWindow', None)
+		panel = getattr(battle, 'pMsgsPanel', None) if battle is not None else None
+		if panel is None:
+			return False
+		name = 'Enemy'
+		try:
+			name = player.arena.vehicles.get(int(target_id), {}).get('name', name)
+		except Exception:
+			pass
+		panel.showMessage(message_type, {'entity': name}, (('entity', int(target_id)),))
+		return True
+	except Exception as error:
+		LOG_DEBUG('Scout event presentation failed: %s' % str(error))
+		return False
+
+
+def _offh_record_direct_spot(player, target_mock, now):
+	try:
+		target_mock._offh_spotted_by_player_until = float(now) + 5.0
+		from gui.mods.offhangar import battle_feedback
+		if battle_feedback.record_spotted(
+				_offh_stats_for(player), getattr(target_mock, 'id', -1)):
+			_offh_scout_event(player, 'SPOTTED', getattr(target_mock, 'id', -1))
+	except Exception as error:
+		LOG_DEBUG('Direct spotting feedback failed: %s' % str(error))
+
+
+def _offh_record_spot_assist(player, target_mock, damage, dead=False):
+	try:
+		import BigWorld
+		if (float(getattr(target_mock, '_offh_spotted_by_player_until', 0.0) or 0.0) <
+				BigWorld.time() or _offh_is_ally(target_mock)):
+			return False
+		damage = max(0, int(damage or 0))
+		if damage <= 0:
+			return False
+		from gui.mods.offhangar import battle_feedback
+		battle_feedback.record_assist(
+			_offh_stats_for(player), getattr(target_mock, 'id', -1), damage, dead)
+		_offh_scout_event(
+			player, 'KILL_ASSIST' if dead else 'HIT_ASSIST',
+			getattr(target_mock, 'id', -1))
+		return True
+	except Exception as error:
+		LOG_DEBUG('Spotting assist feedback failed: %s' % str(error))
+		return False
+
+
+def record_network_combat_stats(player, attacker_is_local, target_is_local,
+		target_mock, damage, shot_result=2, dead=False):
+	"""Record one server-accepted LAN hit exactly once on the local client."""
+	try:
+		from gui.mods.offhangar import battle_feedback
+		stats = _offh_stats_for(player)
+		if attacker_is_local and target_mock is not None and not _offh_is_ally(target_mock):
+			battle_feedback.record_outgoing_hit(
+				stats, getattr(target_mock, 'id', -1), damage, shot_result, dead)
+		elif target_is_local:
+			battle_feedback.record_incoming_hit(stats, damage)
+	except Exception as error:
+		LOG_DEBUG('LAN combat statistics failed: %s' % str(error))
+
+
+def record_network_spot_assist(player, target_mock, damage, dead=False):
+	return _offh_record_spot_assist(player, target_mock, damage, dead)
+
+
+def _offh_has_sixth_sense(player):
+	cached = getattr(player, '_offhangar_has_sixth_sense', None)
+	if cached is not None:
+		return bool(cached)
+	found = False
+	try:
+		from CurrentVehicle import g_currentVehicle
+		item = getattr(g_currentVehicle, 'item', None)
+		for entry in (getattr(item, 'crew', ()) or ()):
+			tankman = entry[1] if isinstance(entry, tuple) and len(entry) == 2 else entry
+			if tankman is None:
+				continue
+			skills = getattr(tankman, 'skills', None)
+			if skills is None:
+				skills = getattr(getattr(tankman, 'descriptor', None), 'skills', ())
+			for skill in (skills or ()):
+				name = str(getattr(skill, 'name', skill)).lower()
+				if 'sixthsense' in name:
+					found = True
+					break
+			if found:
+				break
+	except Exception:
+		found = False
+	player._offhangar_has_sixth_sense = bool(found)
+	return bool(found)
+
+
+def _offh_update_sixth_sense(player, visible_to_enemy, now):
+	"""Schedule the native indicator on a new enemy observation."""
+	try:
+		import BigWorld
+		now = float(now)
+		was_observed = now < float(
+			getattr(player, '_offhangar_observed_until', 0.0) or 0.0)
+		if not visible_to_enemy:
+			return
+		player._offhangar_observed_until = now + 5.0
+		if was_observed or not _offh_has_sixth_sense(player):
+			return
+		generation = globals().get('g_offh_battle_gen', 0)
+		def _show_sixth_sense(_player=player, _generation=generation):
+			try:
+				if (BigWorld.player() is not _player or
+						globals().get('g_offh_battle_gen', 0) != _generation or
+						getattr(getattr(_player, 'arena', None), 'period', 0) != 3 or
+						getattr(_player, '_is_dead', False)):
+					return
+				from gui import WindowsManager
+				battle = getattr(WindowsManager.g_windowsManager, 'battleWindow', None)
+				if battle is not None and hasattr(battle, 'showSixthSenseIndicator'):
+					battle.showSixthSenseIndicator(True)
+			except Exception as error:
+				LOG_DEBUG('Sixth Sense presentation failed: %s' % str(error))
+		BigWorld.callback(3.0, _show_sixth_sense)
+	except Exception as error:
+		LOG_DEBUG('Sixth Sense scheduling failed: %s' % str(error))
+
 	if baked_graph is not None:
 		try:
 			navigator = TerrainNavigator(_ground_probe, _obstacle_probe,
@@ -2363,6 +2519,8 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 						observer_id = int(observer['server_id'])
 						if observer_id not in shootable_by_bot_ids:
 							shootable_by_bot_ids.append(observer_id)
+		if target['id'] == player_id:
+			_offh_update_sixth_sense(player, bool(visible), now)
 		# A confirmed destruction is shared immediately; an unseen living target
 		# only changes an existing contact to last-known state.
 		director.update_contact(
@@ -5033,6 +5191,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			global G_OFFHANGAR_SHOTS_FIRED
 			G_OFFHANGAR_SHOTS_FIRED = 0
 			player = BigWorld.player()
+			from gui.mods.offhangar import battle_feedback
+			player._offhangar_battle_stats = battle_feedback.new_stats(BigWorld.time())
+			player._offhangar_shots_fired = 0
+			player._offhangar_has_sixth_sense = None
+			player._offhangar_observed_until = 0.0
 			if hasattr(player, 'arena') and player.arena is not None:
 				p_id = getattr(player, 'playerVehicleID', -1)
 				if hasattr(player.arena, 'vehicles') and type(player.arena.vehicles) is dict:
@@ -5655,6 +5818,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		turret_yaw  = [0.0]   # relative to hull
 		gun_pitch   = [0.0]   # gun elevation
 		veh_pos = [spawn_pos.x, spawn_pos.y, spawn_pos.z]
+		try:
+			from gui.mods.offhangar import battle_feedback as _offh_feedback_start
+			_offh_feedback_start.record_position(
+				_offh_stats_for(player), (veh_pos[0], veh_pos[1], veh_pos[2]))
+		except Exception:
+			pass
 		turret_matrix = Math.Matrix()
 		turret_matrix.setTranslate(Math.Vector3(spawn_pos.x, spawn_pos.y + 2.0, spawn_pos.z))
 		turret_matrix_local = Math.Matrix()
@@ -6166,6 +6335,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					player.arena.periodLength = 900
 					player.arena.periodEndTime = BigWorld.serverTime() + 900
 					player.arena.onPeriodChange(3, player.arena.periodEndTime, 900, {})
+					try:
+						from gui.mods.offhangar import battle_feedback as _offh_feedback_live
+						_offh_feedback_live.mark_started(
+							_offh_stats_for(player), BigWorld.time())
+					except Exception:
+						pass
 				try:
 					from gui.mods.offhangar._constants import CONFIG_OPTIONS as _CAP_CFG
 					if bool(_CAP_CFG.get('network_mode', False)) and not getattr(player, '_offhangar_network_fallback_local', False):
@@ -6202,8 +6377,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					if not bases: continue
 					
 					invading_team = 2 if base_team == 1 else 1
-					
+
 					invaders_count = 0
+					_player_invading = False
 					for invader in vehs_by_team[invading_team]:
 						for base_pos in bases:
 							import BigWorld
@@ -6219,6 +6395,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							__offlog.LOG_DEBUG('LOUD: Distance to base', base_team, 'is', dx*dx + dz*dz, 'pos:', inv_x, inv_z, 'base:', base_pos.x, base_pos.z)
 							if dx*dx + dz*dz <= 2500.0: # 50m radius
 								invaders_count += 1
+								if invader == BigWorld.player():
+									_player_invading = True
 								break
 					
 					defenders_count = 0
@@ -6256,6 +6434,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					
 					if invaders_count > 0 and defenders_count == 0:
 						state['points'] = min(100, state['points'] + min(invaders_count, 3))
+						if _player_invading and state['points'] > old_points:
+							try:
+								from gui.mods.offhangar import battle_feedback as _offh_feedback_capture
+								_offh_feedback_capture.record_capture(
+									_offh_stats_for(player), state['points'] - old_points)
+							except Exception:
+								pass
 					elif invaders_count == 0:
 						state['points'] = 0
 					state['stopped'] = defenders_count > 0
@@ -8340,7 +8525,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						_veh_vert_vel[0] = 0.0
 						_veh_airborne[0] = False
 						mock_veh.position = Math.Vector3(veh_pos[0], veh_pos[1], veh_pos[2])
-				# Smooth pitch/roll so bumps and landings don't snap the hull instantly
+				try:
+					from gui.mods.offhangar import battle_feedback as _offh_feedback_move
+					_offh_feedback_move.record_position(
+						_offh_stats_for(player), (veh_pos[0], veh_pos[1], veh_pos[2]))
+				except Exception:
+					pass
+			# Smooth pitch/roll so bumps and landings don't snap the hull instantly
 				_pr_blend = min(1.0, dt * 8.0)
 				_pr_p0 = getattr(mock_veh, 'pitch', 0.0)
 				_pr_r0 = getattr(mock_veh, 'roll', 0.0)
@@ -8415,6 +8606,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# Equipment & Crew Modifiers
 							has_rammer, has_egld, has_vents, has_vstab, has_rations = False, False, False, False, False
 							has_bia, has_snapshot, has_smooth_ride = True, False, False
+							has_sixth_sense = False
 							
 							# Hardcode consumables if none found or to guarantee they exist in offline mode
 							_gun_state['consumables'] = [
@@ -8508,6 +8700,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											if 'brotherhood' not in tman_skills: has_bia = False
 											if 'smoothturret' in tman_skills or 'snapshot' in tman_skills: has_snapshot = True
 											if 'smoothdriving' in tman_skills or 'smoothride' in tman_skills: has_smooth_ride = True
+											if any('sixthsense' in _skill for _skill in tman_skills): has_sixth_sense = True
 										except Exception as ce:
 											import debug_utils
 											debug_utils.LOG_DEBUG('Crew member parsing error:', str(ce))
@@ -8516,6 +8709,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								import debug_utils
 								debug_utils.LOG_DEBUG('Equipment/Crew parsing error:', str(e))
 								has_bia = False
+							player._offhangar_has_sixth_sense = bool(has_sixth_sense)
 							
 							# Calculate crew multiplier (Base 100% crew + Commander 10% bonus)
 							crew_skill, commander_skill = 100.0, 100.0
@@ -9914,6 +10108,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 												(veh_pos[0], veh_pos[1], veh_pos[2]),
 												(m_veh.position.x, m_veh.position.y,
 												 m_veh.position.z))
+										_player_seen = bool(_seen)
 										if not _seen:
 											# Team vision: living allied bots relay spots to the player (radio).
 											# Cheap distance pass over all allies, then ONE ray to the nearest.
@@ -9968,6 +10163,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 													 _tvb.position.z),
 													(m_veh.position.x, m_veh.position.y,
 													 m_veh.position.z))
+										if _player_seen:
+											_offh_record_direct_spot(player, m_veh, BigWorld.time())
 										if _seen:
 											m_veh._spot_until = BigWorld.time() + 5.0  # spot memory
 										# Re-apply the model state on every check (idempotent): a
@@ -10539,6 +10736,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 														
 													_he_bp = _offh_is_he(_shot)
 													_pen_bp = (not auto_bounce) and pierce_rng >= eff_armor
+													_player_hp_before = max(0, int(getattr(player_mock, 'health', 0) or 0))
 													if auto_bounce or not (_pen_bp or _he_bp):
 														LOG_DEBUG('BOT RICOCHET!')
 														try:
@@ -10583,6 +10781,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 														if int(dmg) > 0:
 															LOG_DEBUG('MODULE TEST: bot shell dealt %d hull damage, suppressed' % int(dmg))
 													else:
+														try:
+															from gui.mods.offhangar import battle_feedback as _offh_feedback_received
+															_offh_feedback_received.record_incoming_hit(
+																_offh_stats_for(player), min(_player_hp_before, max(0, int(dmg or 0))))
+														except Exception:
+															pass
 														player_mock.health -= int(dmg)
 														try:
 															_offh_hit_sound('/hits/hits/tank_hit_armor_crit')
@@ -10686,9 +10890,17 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 															except Exception as ex:
 																import traceback
 																LOG_DEBUG("BOT MODULE DAMAGE ERROR:", traceback.format_exc() if 'traceback' in globals() else str(ex))
+															_bot_hp_before = max(0, int(getattr(hit_veh, 'health', 0) or 0))
 															hit_veh.health -= _dmg
+															_bot_actual_damage = min(_bot_hp_before, max(0, int(_dmg or 0)))
 															hit_veh.damage_from_bots = (getattr(hit_veh, 'damage_from_bots', 0) or 0) + _dmg
 															hit_veh.last_killer_id = m_veh.id
+															try:
+																if (_offh_is_ally(m_veh) and not _offh_is_ally(hit_veh)):
+																	_offh_record_spot_assist(player, hit_veh,
+																		_bot_actual_damage, hit_veh.health <= 0)
+															except Exception:
+																pass
 															try:
 																player.arena.onVehicleStatisticsUpdate(hit_veh.id)
 																from gui import WindowsManager
@@ -12495,8 +12707,30 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					if attacker_id == _pvid_s:
 						_sm.damage_from_player = (getattr(_sm, 'damage_from_player', 0) or 0) + _act
 						_sm.hits_from_player = (getattr(_sm, 'hits_from_player', 0) or 0) + 1
+						try:
+							if not _offh_is_ally(_sm):
+								from gui.mods.offhangar import battle_feedback as _offh_feedback_he
+								_offh_feedback_he.record_outgoing_hit(
+									_offh_stats_for(_pl), _sid2, _act, 2,
+									_sm.health <= 0, False, True)
+						except Exception:
+							pass
 					else:
 						_sm.damage_from_bots = (getattr(_sm, 'damage_from_bots', 0) or 0) + _act
+						try:
+							_attacker_mock = (globals().get('G_MOCK_VEHICLES', {}) or {}).get(attacker_id)
+							if (_attacker_mock is not None and _offh_is_ally(_attacker_mock) and
+									not _offh_is_ally(_sm)):
+								_offh_record_spot_assist(_pl, _sm, _act, _sm.health <= 0)
+						except Exception:
+							pass
+					if _sid2 == _pvid_s:
+						try:
+							from gui.mods.offhangar import battle_feedback as _offh_feedback_received_he
+							_offh_feedback_received_he.record_incoming_hit(
+								_offh_stats_for(_pl), _act)
+						except Exception:
+							pass
 					_sm.last_killer_id = attacker_id
 					LOG_DEBUG('HE SPLASH: target=%s dist=%.1fm/%.1fm armor=%.0f dmg=%d hp=%d' % (
 						_sid2, _dd, _R, _nom_s, _sd, max(0, _sm.health)))
@@ -12848,6 +13082,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						
 					player = BigWorld.player()
 					player._offhangar_shots_fired = getattr(player, '_offhangar_shots_fired', 0) + 1
+					globals()['G_OFFHANGAR_SHOTS_FIRED'] = int(
+						globals().get('G_OFFHANGAR_SHOTS_FIRED', 0) or 0) + 1
+					try:
+						from gui.mods.offhangar import battle_feedback as _offh_feedback_shot
+						_offh_feedback_shot.record_shot(_offh_stats_for(player))
+					except Exception:
+						pass
 					try:
 						from gui.mods.offhangar._constants import CONFIG_OPTIONS as _NET_FIRE_CFG
 						if bool(_NET_FIRE_CFG.get('network_mode', False)) and not getattr(player, '_offhangar_network_fallback_local', False):
@@ -13205,6 +13446,17 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						except Exception as ex:
 							import traceback
 							LOG_DEBUG("MODULE DAMAGE ERROR:", traceback.format_exc())
+						try:
+							if not _offh_is_ally(enemy_mock):
+								from gui.mods.offhangar import battle_feedback as _offh_feedback_hit
+								_tracked_damage = min(
+									max(0, int(dmg or 0)), max(0, int(enemy_mock.health or 0)))
+								_offh_feedback_hit.record_outgoing_hit(
+									_offh_stats_for(player), enemy_mock.id, _tracked_damage,
+									_hit_res, _tracked_damage >= int(enemy_mock.health or 0),
+									True, bool(_shell is not None and _offh_is_he(_shots[_sidx])))
+						except Exception as _stats_error:
+							LOG_DEBUG('Local hit statistics failed:', str(_stats_error))
 						if dmg > 0:
 
 							actual_dmg = min(dmg, max(0, enemy_mock.health))
@@ -13802,6 +14054,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									p_health = getattr(getattr(player, 'vehicle', None), 'health', p_max_health)
 									
 									_player_mock = globals().get('G_MOCK_VEHICLES', {}).get(getattr(player, 'playerVehicleID', -1))
+									if _player_mock is not None:
+										p_health = max(0, int(getattr(_player_mock, 'health', p_health) or 0))
 									_p_killer_id = getattr(_player_mock, 'last_killer_id', 255) if p_health <= 0 else 0
 									
 									total_dmg_dealt = 0
@@ -13875,23 +14129,46 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										if _dmg_from_player > 0 or bot_team != p_team:
 											personal_details[vid] = {'spotted': 1 if bot_team != p_team else 0, 'killed': 1 if player_killed_this else 0, 'hits': _hits_from_player, 'he_hits': 0, 'pierced': _hits_from_player, 'damageDealt': _dmg_from_player, 'damageAssisted': 0, 'crits': 1 if player_killed_this else 0, 'fire': 0}
 											
+									_feedback_values = None
+									try:
+										from gui.mods.offhangar import battle_feedback as _offh_feedback_results
+										if _offh_stats_for(player) is not None:
+											_feedback_values = _offh_feedback_results.result_values(
+												_offh_stats_for(player), BigWorld.time())
+									except Exception as _feedback_error:
+										LOG_DEBUG('Battle feedback result build failed:', str(_feedback_error))
+									if _feedback_values is not None:
+										total_dmg_dealt = _feedback_values['damageDealt']
+										total_hits = _feedback_values['hits']
+										total_frags = _feedback_values['kills']
+										personal_details = _feedback_values['details']
+
 									vehicles_dict[v_id]['damageDealt'] = total_dmg_dealt
-									vehicles_dict[v_id]['kills'] = 0 # Will be populated by the loop below
+									vehicles_dict[v_id]['kills'] = total_frags
 									vehicles_dict[v_id]['hits'] = total_hits
-									vehicles_dict[v_id]['pierced'] = total_hits
-									vehicles_dict[v_id]['shots'] = max(10, total_hits + 2)
-									vehicles_dict[v_id]['spotted'] = len(personal_details)
-									vehicles_dict[v_id]['damaged'] = len(personal_details)
+									vehicles_dict[v_id]['pierced'] = (_feedback_values['pierced'] if _feedback_values is not None else total_hits)
+									vehicles_dict[v_id]['shots'] = (_feedback_values['shots'] if _feedback_values is not None else globals().get('G_OFFHANGAR_SHOTS_FIRED', total_hits))
+									vehicles_dict[v_id]['he_hits'] = (_feedback_values['he_hits'] if _feedback_values is not None else 0)
+									vehicles_dict[v_id]['damageAssisted'] = (_feedback_values['damageAssisted'] if _feedback_values is not None else 0)
+									vehicles_dict[v_id]['damageReceived'] = (_feedback_values['damageReceived'] if _feedback_values is not None else max(0, p_max_health - p_health))
+									vehicles_dict[v_id]['shotsReceived'] = (_feedback_values['shotsReceived'] if _feedback_values is not None else 0)
+									vehicles_dict[v_id]['spotted'] = (_feedback_values['spotted'] if _feedback_values is not None else len(personal_details))
+									vehicles_dict[v_id]['damaged'] = (_feedback_values['damaged'] if _feedback_values is not None else len(personal_details))
+									vehicles_dict[v_id]['capturePoints'] = (_feedback_values['capturePoints'] if _feedback_values is not None else 0)
+									vehicles_dict[v_id]['mileage'] = (_feedback_values['mileage'] if _feedback_values is not None else 0)
+									vehicles_dict[v_id]['lifeTime'] = (_feedback_values['lifeTime'] if _feedback_values is not None else 0)
 									
 									for v_iter_id, v_iter_data in vehicles_dict.items():
 										k_id = v_iter_data.get('killerID', 0)
 										if k_id and k_id in vehicles_dict and k_id != v_iter_id:
 											vehicles_dict[k_id]['kills'] = vehicles_dict[k_id].get('kills', 0) + 1
+									if _feedback_values is not None:
+										vehicles_dict[v_id]['kills'] = total_frags
 									
 									mock_res = {
 										'arenaUniqueID': mock_arena_id,
-										'personal': {'health': p_health, 'credits': 10000, 'xp': 1000, 'shots': globals().get('G_OFFHANGAR_SHOTS_FIRED', max(0, total_hits)), 'hits': total_hits, 'he_hits': 0, 'pierced': total_hits, 'damageDealt': total_dmg_dealt, 'damageAssisted': 0, 'damageReceived': 0, 'shotsReceived': 0, 'spotted': len(personal_details), 'damaged': len(personal_details), 'kills': total_frags, 'tdamageDealt': 0, 'tkills': 0, 'isTeamKiller': False, 'capturePoints': 0, 'droppedCapturePoints': 0, 'mileage': 100, 'lifeTime': 300, 'killerID': _p_killer_id, 'achievements': [], 'repair': 0, 'freeXP': 50, 'details': personal_details, 'accountDBID': p_dbid, 'team': p_team, 'typeCompDescr': p_cd, 'gold': 0, 'xpPenalty': 0, 'creditsPenalty': 0, 'creditsContributionIn': 0, 'creditsContributionOut': 0, 'tmenXP': 0, 'eventCredits': 0, 'eventGold': 0, 'eventXP': 0, 'eventFreeXP': 0, 'eventTMenXP': 0, 'autoRepairCost': 0, 'autoLoadCost': (0, 0), 'autoEquipCost': (0, 0), 'isPremium': True, 'premiumXPFactor10': 15, 'premiumCreditsFactor10': 15, 'dailyXPFactor10': 10, 'aogasFactor10': 10, 'markOfMastery': 0, 'dossierPopUps': []},
-										'common': {'arenaTypeID': getattr(player.arena, 'arenaTypeID', 1), 'arenaCreateTime': __import__('time').time(), 'winnerTeam': p_team if allied > enemy else (0 if allied==enemy else (3-p_team)), 'finishReason': 1, 'duration': 300, 'bonusType': 1, 'guiType': 1, 'vehLockMode': 0},
+										'personal': {'health': p_health, 'credits': 10000, 'xp': 1000, 'shots': (_feedback_values['shots'] if _feedback_values is not None else globals().get('G_OFFHANGAR_SHOTS_FIRED', max(0, total_hits))), 'hits': total_hits, 'he_hits': (_feedback_values['he_hits'] if _feedback_values is not None else 0), 'pierced': (_feedback_values['pierced'] if _feedback_values is not None else total_hits), 'damageDealt': total_dmg_dealt, 'damageAssisted': (_feedback_values['damageAssisted'] if _feedback_values is not None else 0), 'damageReceived': (_feedback_values['damageReceived'] if _feedback_values is not None else max(0, p_max_health - p_health)), 'shotsReceived': (_feedback_values['shotsReceived'] if _feedback_values is not None else 0), 'spotted': (_feedback_values['spotted'] if _feedback_values is not None else len(personal_details)), 'damaged': (_feedback_values['damaged'] if _feedback_values is not None else len(personal_details)), 'kills': total_frags, 'tdamageDealt': 0, 'tkills': 0, 'isTeamKiller': False, 'capturePoints': (_feedback_values['capturePoints'] if _feedback_values is not None else 0), 'droppedCapturePoints': (_feedback_values['droppedCapturePoints'] if _feedback_values is not None else 0), 'mileage': (_feedback_values['mileage'] if _feedback_values is not None else 0), 'lifeTime': (_feedback_values['lifeTime'] if _feedback_values is not None else 0), 'killerID': _p_killer_id, 'achievements': [], 'repair': 0, 'freeXP': 50, 'details': personal_details, 'accountDBID': p_dbid, 'team': p_team, 'typeCompDescr': p_cd, 'gold': 0, 'xpPenalty': 0, 'creditsPenalty': 0, 'creditsContributionIn': 0, 'creditsContributionOut': 0, 'tmenXP': 0, 'eventCredits': 0, 'eventGold': 0, 'eventXP': 0, 'eventFreeXP': 0, 'eventTMenXP': 0, 'autoRepairCost': 0, 'autoLoadCost': (0, 0), 'autoEquipCost': (0, 0), 'isPremium': True, 'premiumXPFactor10': 15, 'premiumCreditsFactor10': 15, 'dailyXPFactor10': 10, 'aogasFactor10': 10, 'markOfMastery': 0, 'dossierPopUps': []},
+										'common': {'arenaTypeID': getattr(player.arena, 'arenaTypeID', 1), 'arenaCreateTime': __import__('time').time() - (_feedback_values['lifeTime'] if _feedback_values is not None else 0), 'winnerTeam': p_team if allied > enemy else (0 if allied==enemy else (3-p_team)), 'finishReason': 1, 'duration': (_feedback_values['lifeTime'] if _feedback_values is not None else 0), 'bonusType': 1, 'guiType': 1, 'vehLockMode': 0},
 										'players': players_dict,
 										'vehicles': vehicles_dict
 									}
@@ -14034,6 +14311,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								LOG_DEBUG('Bot model unpack error (bot will not spawn):', str(e))
 								_network_spawn_complete()
 								return
+							# Loaded component models exist at the world origin until they are
+							# attached. Hide all four immediately so a staggered spawn cannot flash
+							# a complete tank at the map centre for one rendered frame.
+							for _loaded_component in (ch, hu, tu, gu):
+								try:
+									_loaded_component.visible = False
+									_loaded_component.visibleAttachments = False
+								except Exception:
+									pass
 							e_mock = _MockVeh()
 							e_mock.id = e_id
 							e_mock.position = target_pos
@@ -14109,6 +14395,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								elif retries > 0:
 									BigWorld.callback(0.1, lambda: _assign_model_when_ready(eid, model_to_add, retries - 1, _e_mock))
 								else:
+									try:
+										_model_visible = bool(getattr(_e_mock, '_spot_visible', True))
+										model_to_add.visible = _model_visible
+										model_to_add.visibleAttachments = _model_visible
+									except Exception:
+										pass
 									_add_model(model_to_add)
 							# world-add moved BELOW mock registration: a failure in between
 							# must not leave a ghost model in the world
@@ -14120,6 +14412,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							e_mock._t_node.attach(tu)
 							e_mock._g_node = tu.node('HP_gunJoint', g_mat)
 							e_mock._g_node.attach(gu)
+							# Children are now safely parented under the hidden chassis. Their own
+							# visibility can stay enabled; spotting toggles the chassis tree.
+							for _attached_component in (hu, tu, gu):
+								try:
+									_attached_component.visible = True
+									_attached_component.visibleAttachments = True
+								except Exception:
+									pass
 							e_mock._gun_recoil = _setup_gun_recoil(gu, td)
 							e_mock._swinging = _setup_swinging(ch, td)
 							e_mock.model = ch
@@ -14614,20 +14914,38 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								# straight at the arena edge behind the base and its buildings.
 								_x += _mnu.sin(_yw) * 11.0
 								_z += _mnu.cos(_yw) * 11.0
-							# Roof-safe ground probe: while something substantially lower sits below the
-							# hit (roof / balcony / bridge), keep going down. Same walk the player uses.
+							# The prebaked graph identifies the drivable terrain layer at this X/Z.
+							# Probe narrowly around that height to retain the collision surface without
+							# ever selecting a roof above it or a cellar below it.
 							_gy = None
 							try:
-								_from_y = 1000.0
-								for _ri in range(4):
-									_gc = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(_x, _from_y, _z), Math.Vector3(_x, -1000.0, _z), 128)
-									if _gc is None: break
-									_gy = _gc[0].y
-									_gc2 = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(_x, _gy - 0.4, _z), Math.Vector3(_x, -1000.0, _z), 128)
-									if _gc2 is None or (_gy - _gc2[0].y) < 2.5: break
-									_from_y = _gy - 0.4
+								from gui.mods.offhangar.prebaked_navigation import load_graph, nearest_ground_point
+								_spawn_graph = globals().get('g_offh_baked_navigation_graph')
+								if _spawn_graph is None:
+									_spawn_graph = load_graph(globals().get('g_offh_battle_mapname', ''))
+								_ground_hint = nearest_ground_point(_spawn_graph, _x, _z, 3)
+								if _ground_hint is not None:
+									_baked_y = float(_ground_hint[1])
+									_gc = BigWorld.wg_collideSegment(
+										_offh_bspace(), Math.Vector3(_x, _baked_y + 3.0, _z),
+										Math.Vector3(_x, _baked_y - 3.0, _z), 128)
+									_gy = _gc[0].y if _gc is not None else _baked_y
 							except Exception:
 								pass
+							# Developer/custom maps may not ship a graph. Preserve the old collision
+							# walk as a compatibility fallback, but stock maps never need to guess.
+							if _gy is None:
+								try:
+									_from_y = 1000.0
+									for _ri in range(4):
+										_gc = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(_x, _from_y, _z), Math.Vector3(_x, -1000.0, _z), 128)
+										if _gc is None: break
+										_gy = _gc[0].y
+										_gc2 = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(_x, _gy - 0.4, _z), Math.Vector3(_x, -1000.0, _z), 128)
+										if _gc2 is None or (_gy - _gc2[0].y) < 2.5: break
+										_from_y = _gy - 0.4
+								except Exception:
+									pass
 							if _gy is None:
 								try:
 									_gy = float(veh_pos[1])

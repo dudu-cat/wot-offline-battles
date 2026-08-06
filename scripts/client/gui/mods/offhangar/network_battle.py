@@ -2026,6 +2026,7 @@ def _apply_bot_state(player, state, force_authority_pose=False):
 	if mock is None:
 		return
 	try:
+		old_health = max(0, int(getattr(mock, 'health', 0) or 0))
 		target_alive = bool(state.get('alive', True))
 		is_authority = network_is_authority(player)
 		if not is_authority or force_authority_pose:
@@ -2063,6 +2064,16 @@ def _apply_bot_state(player, state, force_authority_pose=False):
 		_push_mock_health(player, mock, state.get('health', mock.health),
 			state.get('max_health', mock.maxHealth), target_alive)
 		if not is_authority:
+			new_health = max(0, int(getattr(mock, 'health', 0) or 0))
+			if old_health > new_health:
+				try:
+					import sys
+					offline = sys.modules.get('gui.mods.offhangar.offline_battle')
+					record_assist = getattr(offline, 'record_network_spot_assist', None) if offline is not None else None
+					if callable(record_assist):
+						record_assist(player, mock, old_health - new_health, not target_alive)
+				except Exception:
+					LOG_ERROR('LAN spotting-assist statistics failed:', state.get('id'))
 			update_remote_spotting(player, mock)
 	except Exception:
 		LOG_ERROR('LAN bot state apply failed:', state.get('id'))
@@ -2159,6 +2170,15 @@ def _handle_events(player, events):
 							bool(event.get('dead', False)))
 				except Exception:
 					LOG_ERROR('LAN hit presentation failed')
+				try:
+					record_stats = getattr(offline, 'record_network_combat_stats', None) if offline is not None else None
+					if callable(record_stats):
+						record_stats(player,
+							attacker_server_id == getattr(player, '_offhangar_network_id', None),
+							is_local, mock, event.get('damage', 0),
+							event.get('shot_result', 2), bool(event.get('dead', False)))
+				except Exception:
+					LOG_ERROR('LAN hit statistics failed')
 				server_health = int(event.get('health', getattr(mock, 'health', 0)) or 0)
 				if is_local:
 					previous = getattr(player, '_offhangar_network_server_health', None)
@@ -2208,6 +2228,15 @@ def _handle_events(player, events):
 							bool(event.get('dead', False)))
 				except Exception:
 					LOG_ERROR('LAN bot hit presentation failed')
+				try:
+					record_stats = getattr(offline, 'record_network_combat_stats', None) if offline is not None else None
+					if callable(record_stats):
+						record_stats(player,
+							attacker_server_id == getattr(player, '_offhangar_network_id', None),
+							False, mock, event.get('damage', 0),
+							event.get('shot_result', 2), bool(event.get('dead', False)))
+				except Exception:
+					LOG_ERROR('LAN bot-hit statistics failed')
 				_push_mock_health(player, mock, event.get('health', mock.health),
 					mock.maxHealth, not bool(event.get('dead', False)),
 					_local_entity_id_for_server(player, attacker_server_id), False)
@@ -2227,6 +2256,14 @@ def _handle_events(player, events):
 							is_local, False, bool(event.get('dead', False)))
 				except Exception:
 					LOG_ERROR('LAN bot-human hit presentation failed')
+				try:
+					record_stats = getattr(offline, 'record_network_combat_stats', None) if offline is not None else None
+					if callable(record_stats):
+						record_stats(player, False, is_local, target_mock,
+							event.get('damage', 0), event.get('shot_result', 2),
+							bool(event.get('dead', False)))
+				except Exception:
+					LOG_ERROR('LAN bot-human statistics failed')
 				_push_mock_health(player, target_mock, event.get('health', target_mock.health),
 					target_mock.maxHealth, not bool(event.get('dead', False)),
 					getattr(attacker_mock, 'id', -1), is_local)

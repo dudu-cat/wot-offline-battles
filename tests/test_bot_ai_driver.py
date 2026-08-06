@@ -392,6 +392,18 @@ class BotAIDriverTest(unittest.TestCase):
         self.assertTrue(all(order["throttle"] >= 0.70 for order in orders))
         self.assertTrue(all(order["recovery_mode"] in ("drive", "avoid") for order in orders))
 
+    def test_target_behind_hull_pivots_before_driving(self):
+        driver = self.module.LocalDriver()
+
+        order = driver.drive(
+            99, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+            (0.0, 0.0, -100.0), (), lambda angle: True,
+            None, 3.5, 1.7,
+        )
+
+        self.assertEqual(0.0, order["throttle"])
+        self.assertGreater(abs(order["turn"]), 0.9)
+
     def test_walking_pace_does_not_deadlock_on_neighbour_prediction(self):
         driver = self.module.LocalDriver()
         clear = driver._prediction_clear(

@@ -132,3 +132,48 @@ def load_graph(map_name):
 	finally:
 		handle.close()
 	return _validate(graph, short_name)
+
+
+def nearest_ground_point(graph, x, z, max_radius=3):
+	"""Return the nearest baked-safe cell centre and its ground height."""
+	if not isinstance(graph, dict):
+		return None
+	try:
+		width = int(graph.get('width', 0))
+		height = int(graph.get('height', 0))
+		cell_size = float(graph.get('cell_size', 0.0))
+		origin = graph.get('origin') or ()
+		heights = graph.get('heights_mm') or ()
+		hazards = graph.get('hazards') or (0,) * (width * height)
+		if (width <= 0 or height <= 0 or cell_size <= 0.0 or
+				len(origin) != 2 or len(heights) != width * height):
+			return None
+		cx = int(round((float(x) - float(origin[0])) / cell_size))
+		cz = int(round((float(z) - float(origin[1])) / cell_size))
+	except Exception:
+		return None
+	best = None
+	best_distance = None
+	radius_limit = max(0, int(max_radius))
+	for radius in range(radius_limit + 1):
+		for row in range(cz - radius, cz + radius + 1):
+			for column in range(cx - radius, cx + radius + 1):
+				if radius and max(abs(column - cx), abs(row - cz)) != radius:
+					continue
+				if column < 0 or column >= width or row < 0 or row >= height:
+					continue
+				index = row * width + column
+				value = heights[index]
+				if value is None or int(hazards[index]) & 3:
+					continue
+				distance = (column - cx) ** 2 + (row - cz) ** 2
+				if best_distance is None or distance < best_distance:
+					best_distance = distance
+					best = (
+						float(origin[0]) + column * cell_size,
+						float(value) / 1000.0,
+						float(origin[1]) + row * cell_size,
+					)
+		if best is not None:
+			return best
+	return None

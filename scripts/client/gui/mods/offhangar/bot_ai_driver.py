@@ -521,11 +521,14 @@ class LocalDriver(object):
 		if float(speed) < -0.05:
 			turn = -turn
 		throttle = 1.0
-		if abs(delta) > 1.0:
-			# 0.35 cannot overcome the steering resistance in the shared vehicle
-			# physics: the tank settles below walking speed and traces a tiny circle
-			# around its spawn.  Keep enough drive to make a real clearing arc.
-			throttle = 0.72
+		if abs(delta) > 2.15:
+			# A target behind the hull is a pivot, not a clearing arc. Driving while
+			# applying full steering makes the whole formation draw a circle at spawn.
+			throttle = 0.0
+		elif abs(delta) > 1.0:
+			# Keep enough drive to clear nearby hulls without making the turn radius
+			# so large that the tank leaves its baked corridor.
+			throttle = 0.55
 		elif abs(delta) > 0.55:
 			throttle = 0.78
 		return {

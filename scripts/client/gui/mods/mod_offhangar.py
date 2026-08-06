@@ -121,7 +121,7 @@ def _safe_import_offhangar():
 	submodules = ['paths', 'utils', 'logging', '_constants', 'physics', 'physics_monitor',
 	              'bot_ai_maps_group_a', 'bot_ai_maps_group_b', 'bot_ai_maps_group_c',
 	              'bot_ai_maps_extra',
-	              'bot_ai_maps', 'bot_ai', 'prebaked_navigation',
+	              'bot_ai_maps', 'bot_ai', 'prebaked_navigation', 'battle_feedback',
 	              'bot_ai_navigation', 'bot_ai_cover',
 	              'bot_ai_driver', 'spectator_minimap',
 	              'state', 'session_guards', 'offline_battle_stack', 'offline_battle',

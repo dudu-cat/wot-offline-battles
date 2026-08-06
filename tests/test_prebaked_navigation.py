@@ -107,6 +107,17 @@ class PrebakedNavigationLoaderTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "checksum"):
                 loader.load_graph("07_lakeville")
 
+    def test_nearest_ground_point_uses_safe_baked_height(self):
+        loader = load_navigation_loader("/unused")
+        graph = self.graph()
+        graph["heights_mm"] = [1250, -3200]
+        graph["hazards"] = [0, 1]
+
+        self.assertEqual(
+            (0.0, 1.25, 0.0),
+            loader.nearest_ground_point(graph, 3.9, 0.0, 1),
+        )
+
     def test_shipped_bundle_contains_every_validated_stock_map(self):
         mod_directory = ROOT / "scripts/client/gui/mods/offhangar"
         loader = load_navigation_loader(mod_directory)
