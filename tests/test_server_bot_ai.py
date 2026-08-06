@@ -225,9 +225,13 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(1, accepted)
         result = planner.build_orders(_manifest(), _states(), players, 1.0)
         team_one = [order for order in result["orders"] if order["team"] == 1]
-        self.assertEqual(99, team_one[0]["target_id"])
-        self.assertEqual({"x": 40.0, "y": 0.0, "z": 30.0}, team_one[0]["aim_position"])
-        self.assertTrue(team_one[0]["fire_allowed"])
+        targeted = [order for order in team_one if order["target_id"] == 99]
+        self.assertEqual(1, len(targeted))
+        self.assertEqual(
+            {"x": 40.0, "y": 0.0, "z": 30.0},
+            targeted[0]["aim_position"],
+        )
+        self.assertTrue(targeted[0]["fire_allowed"])
 
     def test_distant_contact_does_not_pull_every_bot_off_its_route(self):
         planner = BotPlanner()
@@ -269,6 +273,52 @@ class ServerBotPlannerTests(unittest.TestCase):
 
         self.assertEqual(99, orders[1]["target_id"])
         self.assertIsNone(orders[2]["target_id"])
+
+    def test_team_spot_without_local_los_does_not_interrupt_routes(self):
+        planner = BotPlanner()
+        players = [{"id": 99, "team": 2, "alive": True}]
+        planner.report_contacts([{
+            "observing_team": 1, "target_kind": "human", "target_id": 99,
+            "target_team": 2, "visible": True,
+            "shootable_by_bot_ids": [],
+            "x": 0, "y": 0, "z": 40, "health": 1000,
+            "max_health": 1000,
+        }], planner.known_targets(_states(), players), 1.0)
+
+        orders = [order for order in planner.build_orders(
+            _manifest(), _states(), players, 1.0)["orders"]
+                  if order["team"] == 1]
+
+        self.assertEqual({"route"}, {order["combat_mode"] for order in orders})
+        self.assertTrue(all(order["target_id"] is None for order in orders))
+        self.assertTrue(all(not order["fire_allowed"] for order in orders))
+
+    def test_local_los_and_focus_quota_hard_limit_target_assignments(self):
+        planner = BotPlanner()
+        manifest = [
+            {"id": bot_id, "team": 1, "slot": bot_id, "health": 1000}
+            for bot_id in range(1, 6)
+        ] + [{"id": 9, "team": 2, "slot": 0, "health": 1000}]
+        states = [
+            {"id": bot_id, "team": 1, "alive": True, "x": bot_id * 5, "z": 0}
+            for bot_id in range(1, 6)
+        ] + [{"id": 9, "team": 2, "alive": True, "x": 0, "z": 80}]
+        planner.report_contacts([{
+            "observing_team": 1, "target_kind": "bot", "target_id": 9,
+            "target_team": 2, "visible": True,
+            "shootable_by_bot_ids": [1, 2, 3, 4, 5],
+            "x": 0, "y": 0, "z": 80, "health": 1000,
+            "max_health": 1000, "class_tag": "heavyTank",
+        }], planner.known_targets(states, []), 1.0)
+
+        orders = [order for order in planner.build_orders(
+            manifest, states, [], 1.0)["orders"] if order["team"] == 1]
+        assigned = [order for order in orders if order["target_id"] == 9]
+
+        self.assertEqual(2, len(assigned))
+        self.assertTrue(all(order["fire_allowed"] for order in assigned))
+        self.assertTrue(all(order["target_id"] is None
+                            for order in orders if order not in assigned))
 
     def test_close_visible_threat_holds_to_fight_without_cover(self):
         planner = BotPlanner()

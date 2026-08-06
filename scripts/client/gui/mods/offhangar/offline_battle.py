@@ -791,14 +791,19 @@ def _offh_ai_dry_rollback(vehicle):
 
 
 def _offh_ai_baked_pose_safe(position, shoulder_cells=1):
-	'''Whether a realised pose remains close to the shipped safe graph.'''
+	'''Whether a realised pose avoids shipped water/cliff hazard cells.
+
+	A missing navigation node may be an ordinary building footprint. Treating
+	every such hole as a cliff made the final rollback fight bots beside city
+	walls on every frame. The baked hazard mask keeps those meanings separate.
+	'''
 	try:
 		navigator = globals().get('g_offh_terrain_navigator')
 		if navigator is None or not navigator.grid.prebaked:
 			return True
-		return bool(navigator.grid.near_baked_navigation(
+		return not bool(navigator.grid.baked_hazard_near(
 			(float(position[0]), float(position[1]), float(position[2])),
-			int(shoulder_cells)))
+			0))
 	except Exception:
 		# Existing water and local terrain probes remain fail-closed. Do not
 		# immobilise every bot if only this optional shipped-graph guard breaks.
@@ -2302,6 +2307,8 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 	for target in entries.values():
 		observing_team = 2 if target['team'] == 1 else 1
 		visible = False
+		shootable_by_bot_ids = []
+		shootable_by_entity_ids = []
 		if target['alive']:
 			candidates = []
 			for observer in living:
@@ -2315,17 +2322,36 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 					candidates.append((distance_sq, observer))
 			candidates.sort(key=lambda item: item[0])
 			for distance_sq, observer in candidates[:3]:
-				if distance_sq <= 2500.0 or _offh_ai_has_los(
-						observer['position'], target['position']):
+				proximity_visible = distance_sq <= 2500.0
+				has_los = _offh_ai_has_los(
+					observer['position'], target['position'])
+				if proximity_visible or has_los:
 					visible = True
-					break
+					# Proximity spotting may reveal a tank through a building, but it
+					# is not a firing lane. Only a real collision-free sight segment
+					# may grant this observer a target assignment.
+					if not has_los:
+						continue
+					if observer.get('target_kind') == 'bot':
+						observer_entity_id = int(observer['id'])
+						if observer_entity_id not in shootable_by_entity_ids:
+							shootable_by_entity_ids.append(observer_entity_id)
+					# Team spotting updates the shared blackboard, but only this
+					# observer has proved a local firing lane.  Send network bot
+					# ids so the server cannot turn every hull toward one red dot.
+					if (observer.get('target_kind') == 'bot' and
+							observer.get('server_id') is not None):
+						observer_id = int(observer['server_id'])
+						if observer_id not in shootable_by_bot_ids:
+							shootable_by_bot_ids.append(observer_id)
 		# A confirmed destruction is shared immediately; an unseen living target
 		# only changes an existing contact to last-known state.
 		director.update_contact(
 			observing_team, target['id'], target['team'], target['position'],
 			target['health'], target['max_health'], target['class_tag'],
 			visible or not target['alive'], now,
-			target.get('armor', 0.0), target.get('speed', 0.0))
+			target.get('armor', 0.0), target.get('speed', 0.0),
+			shootable_by_entity_ids)
 		if target.get('server_id') is not None:
 			network_contacts.append({
 				'observing_team': observing_team,
@@ -2338,6 +2364,7 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 				'class_tag': target['class_tag'],
 				'armor': float(target.get('armor', 0.0)),
 				'visible': bool(visible or not target['alive']),
+				'shootable_by_bot_ids': shootable_by_bot_ids,
 			})
 	cover_reports = []
 	try:
@@ -9794,9 +9821,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									          m_veh._ypr_c[4], m_veh._ypr_c[5])
 							else:
 								_offh_ai_remember_dry_pose(m_veh)
-							# The baked graph is eroded away from cliffs and water. Local avoidance,
-							# tank impulses and lateral slide can still move the rendered hull, so
-							# validate the realised pose after all of those effects too.
+							# The baked hazard mask marks water and cliff shoulders separately from
+							# ordinary obstacle holes. Local avoidance, impulses and lateral slide
+							# may enter a true hazard, but driving beside a building must not trigger
+							# this final rollback on every frame.
 							if (getattr(m_veh, '_offh_ai_tick_nav_safe', False) and
 									not _offh_ai_baked_pose_safe((m_veh.position.x,
 										m_veh.position.y, m_veh.position.z))):

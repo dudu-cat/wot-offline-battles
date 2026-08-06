@@ -49,6 +49,8 @@ class TerrainGrid(object):
 		self._baked_height = 0
 		self._baked_heights = ()
 		self._baked_links = ()
+		self._baked_hazards = ()
+		self._baked_max_grade = 0.30
 		if baked_graph is not None:
 			self._install_baked_graph(baked_graph)
 		self.max_grade_up = float(max_grade_up)
@@ -70,9 +72,11 @@ class TerrainGrid(object):
 		height = int(graph.get('height', 0))
 		heights = graph.get('heights_mm') or ()
 		links = graph.get('links') or ()
+		hazards = graph.get('hazards')
 		origin = graph.get('origin') or ()
 		if (width <= 0 or height <= 0 or len(origin) != 2 or
-				len(heights) != width * height or len(links) != width * height):
+				len(heights) != width * height or len(links) != width * height or
+				(hazards is not None and len(hazards) != width * height)):
 			raise ValueError('invalid baked navigation graph')
 		self.cell_size = max(1.0, float(graph.get('cell_size', 0.0)))
 		self._baked_origin = (float(origin[0]), float(origin[1]))
@@ -80,6 +84,9 @@ class TerrainGrid(object):
 		self._baked_height = height
 		self._baked_heights = heights
 		self._baked_links = links
+		self._baked_hazards = hazards if hazards is not None else (0,) * (width * height)
+		bake = graph.get('bake') if isinstance(graph.get('bake'), dict) else {}
+		self._baked_max_grade = max(0.05, float(bake.get('max_grade', 0.30)))
 		self.bounds = tuple(graph.get('bounds') or self.bounds or ()) or None
 		self.prebaked = True
 
@@ -106,6 +113,14 @@ class TerrainGrid(object):
 			return None
 		return index
 
+	def _baked_flat_index(self, cell):
+		if not self.prebaked:
+			return None
+		x, z = cell
+		if x < 0 or x >= self._baked_width or z < 0 or z >= self._baked_height:
+			return None
+		return z * self._baked_width + x
+
 	def _baked_cell_height(self, cell):
 		index = self._baked_index(cell)
 		if index is None:
@@ -118,6 +133,19 @@ class TerrainGrid(object):
 			return True
 		return self._nearest_baked_cell(
 			self.cell_for(point), max(0, int(max_radius))) is not None
+
+	def baked_hazard_near(self, point, max_radius=0):
+		'''Return whether a pose is in shipped water/cliff risk, not an obstacle.'''
+		if not self.prebaked or not self._baked_hazards:
+			return False
+		cell = self.cell_for(point)
+		radius = max(0, int(max_radius))
+		for z in range(cell[1] - radius, cell[1] + radius + 1):
+			for x in range(cell[0] - radius, cell[0] + radius + 1):
+				index = self._baked_flat_index((x, z))
+				if index is not None and int(self._baked_hazards[index]) != 0:
+					return True
+		return False
 
 	def _nearest_baked_cell(self, cell, max_radius):
 		if self._baked_index(cell) is not None:
@@ -324,8 +352,10 @@ class TerrainGrid(object):
 				clear = False
 				break
 			delta = y - previous[1]
-			if (delta > horizontal * self.max_grade_up or
-			        delta < -horizontal * self.max_grade_down):
+			# Ordinary route segments must be controllable in reverse too. A
+			# physically possible slide is not a valid tank-navigation shortcut.
+			reversible_grade = min(self.max_grade_up, self.max_grade_down)
+			if abs(delta) > horizontal * reversible_grade:
 				clear = False
 				break
 			current = (x, y, z)
@@ -464,7 +494,7 @@ class TerrainGrid(object):
 				start_y = float(start[1])
 		frontier = []
 		sequence = 0
-		heapq.heappush(frontier, (0.0, sequence, start_cell))
+		heapq.heappush(frontier, (0.0, sequence, start_cell, 0.0))
 		came_from = {}
 		cost_so_far = {start_cell: 0.0}
 		heights = {start_cell: start_y}
@@ -475,7 +505,12 @@ class TerrainGrid(object):
 			(start_cell[1] - goal_cell[1]) ** 2)
 		expansions = 0
 		while frontier and expansions < int(max_expansions):
-			_unused_priority, _unused_sequence, current = heapq.heappop(frontier)
+			_unused_priority, _unused_sequence, current, queued_cost = heapq.heappop(frontier)
+			# A better route may have reached this cell after an older heap entry
+			# was queued. Expanding stale entries repeatedly exhausted the bounded
+			# search on risk-weighted maps even though every destination was linked.
+			if queued_cost != cost_so_far.get(current):
+				continue
 			expansions += 1
 			goal_distance = math.sqrt(
 				(current[0] - goal_cell[0]) ** 2 +
@@ -500,8 +535,18 @@ class TerrainGrid(object):
 					               (current[0], current[1] + offset_z)) is None):
 						continue
 				run = self.cell_size * length_scale
-				slope = abs(next_y - current_y) / max(run, 0.1)
-				new_cost = (cost_so_far[current] + run * (1.0 + slope * 3.0) +
+				delta_y = next_y - current_y
+				slope = abs(delta_y) / max(run, 0.1)
+				grade_limit = (self._baked_max_grade if self.prebaked else
+				               min(self.max_grade_up, self.max_grade_down))
+				slope_ratio = slope / max(0.05, grade_limit)
+				# Risk rises non-linearly near the controllable-grade limit.  A
+				# downhill edge costs a little more because braking and lateral
+				# slide leave less recovery room than climbing the same surface.
+				slope_cost = run * slope_ratio * slope_ratio * 6.0
+				if delta_y < 0.0:
+					slope_cost *= 1.25
+				new_cost = (cost_so_far[current] + run + slope_cost +
 				            self._penalty(next_cell, avoid_points) +
 				            self._failed_edge_penalty(current, next_cell, now))
 				if next_cell not in cost_so_far or new_cost < cost_so_far[next_cell]:
@@ -516,7 +561,7 @@ class TerrainGrid(object):
 					             self.heuristic_weight)
 					sequence += 1
 					heapq.heappush(frontier,
-					               (new_cost + heuristic, sequence, next_cell))
+					               (new_cost + heuristic, sequence, next_cell, new_cost))
 			yield None
 		if reached is None:
 			# Sparse strategic anchors are hand placed on a minimap. A point a few

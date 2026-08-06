@@ -48,8 +48,16 @@ HEIGHTMAP_BORDER = 2
 WATER_DEPTH_LIMIT = 0.12
 VEHICLE_HALF_WIDTH = 2.15
 VEHICLE_CLEARANCE_HEIGHT = 2.40
-MAX_GRADE = 0.38
+LOCAL_OBSTACLE_MAX_HEIGHT = 0.65
+MAX_GRADE_UP = 0.38
+MAX_GRADE_DOWN = 0.38
+# Normal tank routes must be controllable in both directions.  A drop that can
+# be slid down but not climbed back up is an emergency transition, not a route
+# shortcut, so the retained graph uses the stricter directional limit.
+MAX_GRADE = min(MAX_GRADE_UP, MAX_GRADE_DOWN)
 EDGE_CLEARANCE_RADII = (3.0, 6.0)
+HAZARD_WATER = 1
+HAZARD_EDGE = 2
 
 DIRECTIONS = (
     (-1, -1), (0, -1), (1, -1),
@@ -57,20 +65,25 @@ DIRECTIONS = (
     (-1, 1),  (0, 1),     (1, 1),
 )
 
+LAKEVILLE_ROUTES = (
+    ((-169.0, 319.0), (-314.0, 298.0), (-330.0, 189.0),
+     (-331.0, 40.0), (-315.0, -101.0), (-278.0, -211.0),
+     (-225.0, -273.0)),
+    ((-169.0, 319.0), (-110.0, 268.0), (-76.0, 189.0),
+     (-98.0, 74.0), (-90.0, -98.0), (-102.0, -211.0),
+     (-165.0, -294.0)),
+    ((-169.0, 319.0), (-9.0, 325.0), (164.0, 306.0),
+     (289.0, 267.0), (322.0, 173.0), (314.0, 40.0),
+     (284.0, -93.0), (218.0, -187.0), (70.0, -265.0),
+     (-79.0, -297.0)),
+)
+
 MAPS = {
     "07_lakeville": {
         "bounds": (-400.0, -400.0, 400.0, 400.0),
         "bases": ((-169.5, 319.4), (-169.5, -319.0)),
-        "anchors": (
-            (-169.0, 319.0), (-258.0, 350.0), (-314.0, 298.0),
-            (-330.0, 189.0), (-331.0, 40.0), (-315.0, -101.0),
-            (-278.0, -211.0), (-225.0, -273.0),
-            (-110.0, 268.0), (-76.0, 189.0), (-81.0, 56.0),
-            (-77.0, -101.0), (-102.0, -211.0), (-165.0, -294.0),
-            (-9.0, 325.0), (164.0, 306.0), (289.0, 267.0),
-            (322.0, 173.0), (314.0, 40.0), (284.0, -93.0),
-            (218.0, -187.0), (70.0, -265.0), (-79.0, -297.0),
-        ),
+        "routes": LAKEVILLE_ROUTES,
+        "anchors": tuple(point for route in LAKEVILLE_ROUTES for point in route),
     },
 }
 
@@ -498,6 +511,11 @@ class ModelShape(object):
         self.source = source
 
 
+def _is_local_obstacle(shape):
+    return (float(shape.maximum[1]) - float(shape.minimum[1]) <=
+            LOCAL_OBSTACLE_MAX_HEIGHT)
+
+
 class ModelLibrary(object):
     def __init__(self, resources):
         self.resources = resources
@@ -646,6 +664,7 @@ class ObstacleField(object):
         self.cells = {}
         self.instance_count = 0
         self.soft_instance_count = 0
+        self.local_instance_count = 0
         self.model_library = ModelLibrary(resources)
         self.skipped = 0
         self._load()
@@ -739,6 +758,13 @@ class ObstacleField(object):
                     shape = self.model_library.load(model_name)
                 except (KeyError, ValueError, struct.error, zipfile.BadZipFile):
                     self.skipped += 1
+                    continue
+                # Curbs, low borders and similar props belong to locomotion,
+                # not the strategic graph. A tank can cross them and their
+                # tilted world AABB otherwise erases an entire four-metre road
+                # cell. Explicit destructibles were already skipped above.
+                if _is_local_obstacle(shape):
+                    self.local_instance_count += 1
                     continue
                 self.instance_count += 1
                 if shape.triangles:
@@ -950,6 +976,43 @@ def validate_graph(graph, map_config):
     if maximum_anchor_offset > 24.0:
         raise ValueError("route anchor is too far from the retained graph: %.1f m" %
                          maximum_anchor_offset)
+    route_detours = []
+    route_segments = 0
+    maximum_opening_regression = 0.0
+    enemy_base = map_config["bases"][1]
+    for route in map_config.get("routes", ()):
+        if len(route) > 1:
+            start_to_enemy = math.hypot(
+                route[0][0] - enemy_base[0], route[0][1] - enemy_base[1])
+            next_to_enemy = math.hypot(
+                route[1][0] - enemy_base[0], route[1][1] - enemy_base[1])
+            maximum_opening_regression = max(
+                maximum_opening_regression, next_to_enemy - start_to_enemy)
+        for first, second in zip(route, route[1:]):
+            first_node, first_offset = _nearest_node(graph, first)
+            second_node, second_offset = _nearest_node(graph, second)
+            segment_path, segment_distance = _graph_path(
+                graph, first_node, second_node)
+            if not segment_path:
+                raise ValueError("route segment is disconnected: %r -> %r" %
+                                 (first, second))
+            direct_distance = max(
+                graph["cell_size"],
+                math.hypot(second[0] - first[0], second[1] - first[1]),
+            )
+            detour = (segment_distance + first_offset + second_offset) / direct_distance
+            route_detours.append(detour)
+            route_segments += 1
+    maximum_route_detour = max(route_detours or [1.0])
+    if maximum_route_detour > 2.0:
+        raise ValueError("route segment detour is implausible: %.2fx" %
+                         maximum_route_detour)
+    # A flank may legitimately move laterally or slightly away from the enemy
+    # base to enter its lane. Keep the metric visible and reject only a gross
+    # reversal; route-specific visual audits catch smaller tactical oddities.
+    if maximum_opening_regression > 60.0:
+        raise ValueError("route opening moves away from the objective: %.1f m" %
+                         maximum_opening_regression)
     navigable = sum(components)
     largest_fraction = float(components[0]) / float(navigable)
     if largest_fraction < 0.72:
@@ -963,6 +1026,9 @@ def validate_graph(graph, map_config):
         "base_path_nodes": len(path),
         "base_path_metres": round(distance, 3),
         "maximum_anchor_offset": round(maximum_anchor_offset, 3),
+        "route_segments": route_segments,
+        "maximum_route_detour": round(maximum_route_detour, 3),
+        "maximum_opening_regression": round(maximum_opening_regression, 3),
     }
 
 
@@ -978,8 +1044,11 @@ def _segment_clear(terrain, obstacles, start, end):
         if y is None or terrain.water_depth(x, z, y) > WATER_DEPTH_LIMIT:
             return False
         horizontal = math.hypot(x - previous[0], z - previous[2])
-        if horizontal > 0.0 and abs(y - previous[1]) > horizontal * MAX_GRADE:
-            return False
+        if horizontal > 0.0:
+            delta = y - previous[1]
+            if (delta > horizontal * MAX_GRADE_UP or
+                    delta < -horizontal * MAX_GRADE_DOWN):
+                return False
         if obstacles.blocked(x, z, y):
             return False
         previous = (x, y, z)
@@ -1026,6 +1095,7 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
     origin_x = bounds[0] + cell_size * 0.5
     origin_z = bounds[1] + cell_size * 0.5
     heights = [None] * (width * height)
+    hazards = [0] * (width * height)
     rejected_water = 0
     rejected_obstacle = 0
     rejected_edge = 0
@@ -1038,9 +1108,11 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
             if ground is None:
                 continue
             if terrain.water_depth(x, z, ground) > WATER_DEPTH_LIMIT:
+                hazards[index] |= HAZARD_WATER
                 rejected_water += 1
                 continue
             if not _has_safe_edge_clearance(terrain, x, z, ground):
+                hazards[index] |= HAZARD_EDGE
                 rejected_edge += 1
                 continue
             if obstacles.blocked(x, z, ground):
@@ -1074,6 +1146,23 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
                        origin_z + nz * cell_size)
                 if _segment_clear(terrain, obstacles, start, end):
                     links[index] |= 1 << direction_index
+    # ``links`` are stored per source node and therefore support one-way edges.
+    # Ordinary tanks must not intentionally use a one-way fall, though: retain
+    # an edge only when the reverse traversal was independently validated too.
+    reverse_directions = dict((direction, index)
+                              for index, direction in enumerate(DIRECTIONS))
+    for z_index in range(height):
+        for x_index in range(width):
+            index = z_index * width + x_index
+            mask = links[index]
+            for direction_index, (dx, dz) in enumerate(DIRECTIONS):
+                if not (mask & (1 << direction_index)):
+                    continue
+                neighbour = (z_index + dz) * width + (x_index + dx)
+                reverse_index = reverse_directions[(-dx, -dz)]
+                if not (links[neighbour] & (1 << reverse_index)):
+                    mask &= ~(1 << direction_index)
+            links[index] = mask
     graph = {
         "format": FORMAT_NAME,
         "version": FORMAT_VERSION,
@@ -1087,18 +1176,27 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
         "directions": [list(direction) for direction in DIRECTIONS],
         "heights_mm": heights,
         "links": links,
+        # Hazard cells are distinct from ordinary non-navigable obstacle cells.
+        # Runtime rollback may reject water/cliff entry without treating every
+        # building footprint as a fatal map edge.
+        "hazards": hazards,
         "bases": [list(base) for base in map_config["bases"]],
         "bake": {
             "water_depth_limit": WATER_DEPTH_LIMIT,
             "vehicle_half_width": VEHICLE_HALF_WIDTH,
             "vehicle_clearance_height": VEHICLE_CLEARANCE_HEIGHT,
             "max_grade": MAX_GRADE,
+            "max_grade_up": MAX_GRADE_UP,
+            "max_grade_down": MAX_GRADE_DOWN,
+            "reversible_links": True,
             "edge_clearance_radii": list(EDGE_CLEARANCE_RADII),
             "terrain_chunks": len(terrain.chunks),
             "water_planes": len(terrain.waters),
             "model_shapes": len(obstacles.model_library.cache),
             "model_instances": obstacles.instance_count,
             "soft_model_instances": obstacles.soft_instance_count,
+            "local_obstacle_instances": obstacles.local_instance_count,
+            "local_obstacle_max_height": LOCAL_OBSTACLE_MAX_HEIGHT,
             "obstacle_raster_cells": len(obstacles.cells),
             "skipped_models": obstacles.skipped,
             "rejected_water_nodes": rejected_water,

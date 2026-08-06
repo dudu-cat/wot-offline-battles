@@ -113,6 +113,15 @@ class NavigationBakerTest(unittest.TestCase):
             Terrain(drop=True), 0.0, 0.0, 0.0
         ))
 
+    def test_low_obstacle_is_owned_by_local_tank_locomotion(self):
+        low = self.baker.ModelShape((), (), (0.0, 0.0, 0.0),
+                                    (10.0, 0.4, 1.0), "curb")
+        wall = self.baker.ModelShape((), (), (0.0, 0.0, 0.0),
+                                     (10.0, 2.0, 1.0), "wall")
+
+        self.assertTrue(self.baker._is_local_obstacle(low))
+        self.assertFalse(self.baker._is_local_obstacle(wall))
+
 
 if __name__ == "__main__":
     unittest.main()

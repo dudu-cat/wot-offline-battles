@@ -458,8 +458,12 @@ class BotAITest(unittest.TestCase):
             for bot_id in range(801, 805)
         ]
 
-        self.assertEqual({901, 902}, set(assignments))
-        self.assertLessEqual(max(assignments.count(901), assignments.count(902)), 3)
+        assigned = [target_id for target_id in assignments
+                    if target_id is not None]
+        self.assertEqual({901, 902}, set(assigned))
+        self.assertEqual(2, assignments.count(None))
+        self.assertEqual(1, assigned.count(901))
+        self.assertEqual(1, assigned.count(902))
 
     def test_mobile_vehicle_uses_force_aware_flanking_position(self):
         director = self.ai.BattleDirector("04_himmelsdorf", "flank")

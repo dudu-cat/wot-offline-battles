@@ -498,7 +498,7 @@ class BattleDirector(object):
 
 	def update_contact(self, observing_team, target_id, target_team, position,
 	                   health, max_health, class_tag, visible, now,
-	                   armor=0.0, speed=0.0):
+	                   armor=0.0, speed=0.0, shootable_by_ids=None):
 		observing_team = int(observing_team)
 		if observing_team == int(target_team):
 			return
@@ -516,9 +516,12 @@ class BattleDirector(object):
 				'speed': max(0.0, _number(speed, 0.0)),
 				'visible': True,
 				'last_seen': _number(now),
+				'shootable_by_ids': (tuple(int(value) for value in shootable_by_ids)
+				                     if shootable_by_ids is not None else None),
 			}
 		elif contact is not None:
 			contact['visible'] = False
+			contact['shootable_by_ids'] = ()
 
 	def _known_contacts(self, team, now):
 		known = []
@@ -597,6 +600,20 @@ class BattleDirector(object):
 			distance = _distance_2d(position, contact['position'])
 			age = max(0.0, _number(now) - _number(contact.get('last_seen')))
 			visible = bool(contact.get('visible'))
+			shootable_by_ids = contact.get('shootable_by_ids')
+			if (visible and shootable_by_ids is not None and
+					int(agent['id']) not in shootable_by_ids):
+				continue
+			focus = self._focus_count(agent['team'], contact['id'])
+			desired_focus = self._desired_focus(contact)
+			if (focus >= desired_focus and contact['id'] != agent.get('target_id')):
+				continue
+			roles = profile.get('roles', {})
+			mobility = max(_number(roles.get('scout')), _number(roles.get('flanker')))
+			engagement_range = max(340.0, min(
+				560.0, profile['desired_range'] * 2.0 + mobility * 300.0))
+			if distance > engagement_range:
+				continue
 			health_fraction = contact['health'] / max(contact['max_health'], 1.0)
 			dx = contact['position'][0] - position[0]
 			dz = contact['position'][2] - position[2]
@@ -607,8 +624,6 @@ class BattleDirector(object):
 			score += (1.0 - health_fraction) * 38.0
 			score -= range_error * (14.0 - personality['aggression'] * 5.0)
 			score -= turn_cost * 12.0
-			focus = self._focus_count(agent['team'], contact['id'])
-			desired_focus = self._desired_focus(contact)
 			if focus < desired_focus:
 				score += focus * personality['teamwork'] * 4.0
 			else:

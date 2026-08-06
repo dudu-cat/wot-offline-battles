@@ -137,12 +137,33 @@ class BotPlanner(object):
                     "max_health": max(1, _integer(raw.get("max_health"), 1)),
                     "class_tag": str(raw.get("class_tag") or "unknown")[:24],
                     "armor": max(0.0, _number(raw.get("armor"), 0.0)),
+                    # ``None`` preserves protocol-v5 compatibility with an older
+                    # authority client.  A current client always sends the list,
+                    # including an empty one when the target is only team-spotted.
+                    "shootable_by_bot_ids": self._bot_id_list(
+                        raw.get("shootable_by_bot_ids"))
+                        if "shootable_by_bot_ids" in raw else None,
                 }
                 accepted += 1
             elif previous is not None:
                 previous["visible"] = False
+                previous["shootable_by_bot_ids"] = []
                 accepted += 1
         return accepted
+
+    @staticmethod
+    def _bot_id_list(raw):
+        if not isinstance(raw, (list, tuple)):
+            return []
+        result = []
+        seen = set()
+        for value in raw[:MAX_CONTACTS_PER_TEAM]:
+            bot_id = _integer(value)
+            if bot_id <= 0 or bot_id in seen:
+                continue
+            seen.add(bot_id)
+            result.append(bot_id)
+        return result
 
     def report_affordances(self, reports, known_bots, known_targets, now):
         """Store client-probed cover geometry after identity validation.
@@ -403,40 +424,45 @@ class BotPlanner(object):
         return distance
 
     def _assign_targets(self, bots, contacts):
-        """Reserve targets per bot instead of issuing one team-wide dog-pile."""
+        """Assign only locally shootable contacts, with a hard focus cap.
+
+        Team spotting is shared intelligence, not proof that every tank has a
+        firing lane.  The authority client reports the bot ids whose own LOS
+        probe succeeded.  Older protocol-v5 clients omit that field and retain
+        their legacy behaviour so mixed packages fail compatibly rather than
+        silently disabling combat.
+        """
         if not bots or not contacts:
             return {}
         reservations = {}
         assigned = {}
-        for bot in sorted(bots, key=lambda value: value["id"]):
+        candidates = []
+        for bot in bots:
             bx = _number(bot["state"].get("x"))
             bz = _number(bot["state"].get("z"))
-            best = None
-            best_score = None
             for contact in contacts:
-                key = (contact.get("target_kind"), contact["id"])
-                reserved = reservations.get(key, 0)
-                desired = self._desired_focus(contact)
+                observers = contact.get("shootable_by_bot_ids")
+                locally_shootable = (contact.get("visible") and
+                                     (observers is None or bot["id"] in observers))
+                if not locally_shootable:
+                    continue
                 distance = math.hypot(
                     contact["position"]["x"] - bx,
                     contact["position"]["z"] - bz)
                 if distance > self._engagement_range(bot, contact):
                     continue
-                score = (0.0 if contact.get("visible") else 42.0)
+                score = 0.0
                 score += contact["health"] / float(max(1, contact["max_health"])) * 28.0
                 score += distance * 0.018
-                if reserved >= desired:
-                    score += (reserved - desired + 1) * 32.0
-                else:
-                    score -= reserved * 3.0
-                candidate = (score, contact["id"], contact)
-                if best_score is None or candidate[:2] < best_score:
-                    best_score = candidate[:2]
-                    best = contact
-            if best is not None:
-                key = (best.get("target_kind"), best["id"])
-                reservations[key] = reservations.get(key, 0) + 1
-                assigned[bot["id"]] = best
+                candidates.append((score, bot["id"], contact["id"], bot, contact))
+        for unused_score, unused_bot_id, unused_target_id, bot, contact in sorted(candidates):
+            if bot["id"] in assigned:
+                continue
+            key = (contact.get("target_kind"), contact["id"])
+            if reservations.get(key, 0) >= self._desired_focus(contact):
+                continue
+            reservations[key] = reservations.get(key, 0) + 1
+            assigned[bot["id"]] = contact
         return assigned
 
     @staticmethod
@@ -776,7 +802,10 @@ class BotPlanner(object):
         order["target_kind"] = focus.get("target_kind")
         order["aim_position"] = dict(focus["position"])
         order["face_position"] = dict(focus["position"])
-        order["fire_allowed"] = bool(focus.get("visible"))
+        observers = focus.get("shootable_by_bot_ids")
+        locally_shootable = bool(focus.get("visible") and
+                                 (observers is None or bot["id"] in observers))
+        order["fire_allowed"] = locally_shootable
         order["shell_index"] = self._shell_index(profile, focus, personality)
         bx = _number(bot["state"].get("x"))
         bz = _number(bot["state"].get("z"))
@@ -786,12 +815,20 @@ class BotPlanner(object):
         roles = profile.get("roles") if isinstance(profile.get("roles"), dict) else {}
         far_limit = desired_range * (1.08 + personality["caution"] * 0.18)
         close_limit = desired_range * (0.48 + personality["aggression"] * 0.10)
-        if not focus.get("visible"):
+        if not locally_shootable:
             self._engage_anchors.pop(bot["id"], None)
             self._cover_states.pop(bot["id"], None)
-            order["combat_mode"] = "investigate"
-            order["move_position"] = dict(focus["position"])
-            order["throttle_override"] = 0.65
+            # This branch is retained for a legacy order already in flight. New
+            # assignments require local LOS, so a team-only red dot cannot turn
+            # the hull, stop a casemate vehicle, or start a cover manoeuvre.
+            order["target_id"] = None
+            order.pop("target_kind", None)
+            order["aim_position"] = dict(move)
+            order["face_position"] = dict(move)
+            order["fire_allowed"] = False
+            order["combat_mode"] = "hold" if holding else "route"
+            order["move_position"] = dict(move)
+            order["throttle_override"] = 0.0 if holding else 0.75
         elif distance > far_limit:
             self._engage_anchors.pop(bot["id"], None)
             self._cover_states.pop(bot["id"], None)

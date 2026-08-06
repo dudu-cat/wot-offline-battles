@@ -107,6 +107,15 @@ class BotNavigationTest(unittest.TestCase):
         self.assertTrue(grid.near_baked_navigation((18.0, 0.0, 20.0), 1))
         self.assertFalse(grid.near_baked_navigation((22.0, 0.0, 20.0), 1))
 
+    def test_prebaked_hazard_mask_does_not_confuse_obstacles_with_cliffs(self):
+        graph = self.baked_graph(3, 1, blocked=((1, 0),))
+        graph["hazards"] = [0, 0, 2]
+        grid = self.navigation.TerrainGrid(lambda *args: None, baked_graph=graph)
+
+        self.assertFalse(grid.baked_hazard_near((10.0, 0.0, 20.0)))
+        self.assertFalse(grid.baked_hazard_near((14.0, 0.0, 20.0)))
+        self.assertTrue(grid.baked_hazard_near((18.0, 0.0, 20.0)))
+
     def test_shipped_lakeville_graph_connects_every_route_both_ways(self):
         graph_path = (
             ROOT / "scripts/client/gui/mods/offhangar/navgraphs/07_lakeville.json"
@@ -144,8 +153,15 @@ class BotNavigationTest(unittest.TestCase):
                         grid.plan(start, goal, max_expansions=4096),
                         (team, route["id"], start, goal),
                     )
+                    path = grid.plan(start, goal, max_expansions=4096)
+                    self.assertLessEqual(
+                        math.hypot(path[-1][0] - goal[0],
+                                   path[-1][2] - goal[2]),
+                        12.0,
+                        (team, route["id"], start, goal, path[-1]),
+                    )
 
-        self.assertEqual(50, segment_count)
+        self.assertEqual(48, segment_count)
         self.assertEqual([], probe_calls)
 
     def test_astar_routes_around_an_unsupported_ravine(self):
@@ -228,6 +244,30 @@ class BotNavigationTest(unittest.TestCase):
         self.assertEqual((), grid.plan(
             (-15.0, 0.0, 0.0), (15.0, 0.0, 0.0)
         ))
+
+    def test_astar_only_queues_cost_improvements(self):
+        grid = self.navigation.TerrainGrid(
+            lambda x, z, hint: 0.0,
+            bounds=(0.0, 0.0, 2.0, 2.0),
+            cell_size=1.0,
+        )
+        real_push = self.navigation.heapq.heappush
+        pushed_cells = []
+
+        def recording_push(frontier, value):
+            pushed_cells.append(value[2])
+            return real_push(frontier, value)
+
+        self.navigation.heapq.heappush = recording_push
+        try:
+            path = grid.plan((0.0, 0.0, 0.0), (2.0, 0.0, 2.0),
+                             max_expansions=20)
+        finally:
+            self.navigation.heapq.heappush = real_push
+
+        self.assertEqual((2.0, 0.0, 2.0), path[-1])
+        self.assertEqual(9, len(pushed_cells))
+        self.assertEqual(9, len(set(pushed_cells)))
 
     def test_expansion_limit_returns_supported_partial_progress(self):
         def ground(x, z, hint):
@@ -698,6 +738,23 @@ class BotNavigationTest(unittest.TestCase):
         self.assertNotIn("_ai_director = None", initialization)
         self.assertIn("if _navigator is not None:", battle_source)
 
+    def test_proximity_spotting_does_not_grant_a_firing_lane_through_cover(self):
+        battle_source = (
+            ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
+        ).read_text()
+        contacts = battle_source[
+            battle_source.index("def _offh_ai_refresh_contacts"):
+            battle_source.index("def _offh_battle_sweep")
+        ]
+
+        self.assertIn("proximity_visible = distance_sq <= 2500.0", contacts)
+        self.assertIn("if proximity_visible or has_los:", contacts)
+        self.assertIn("if not has_los:\n\t\t\t\t\t\tcontinue", contacts)
+        self.assertGreater(
+            contacts.index("shootable_by_bot_ids.append"),
+            contacts.index("if not has_los:"),
+        )
+
     def test_local_driver_rejects_deep_water_and_unsafe_grades(self):
         battle_source = (
             ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
@@ -761,7 +818,7 @@ class BotNavigationTest(unittest.TestCase):
             battle_source.index("publish_authoritative_bots", final_guard),
         )
         edge_guard = battle_source.index(
-            "# The baked graph is eroded away from cliffs and water."
+            "# The baked hazard mask marks water and cliff shoulders separately"
         )
         self.assertGreater(edge_guard, final_guard)
         self.assertLess(
