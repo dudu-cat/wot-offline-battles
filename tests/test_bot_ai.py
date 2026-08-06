@@ -301,6 +301,54 @@ class BotAITest(unittest.TestCase):
                     route["id"] for route in tactical_map["routes"][1]
                 })
 
+    def test_tactical_routes_have_no_hairpins_or_self_intersections(self):
+        def orientation(first, second, third):
+            return ((second[0] - first[0]) * (third[1] - first[1]) -
+                    (second[1] - first[1]) * (third[0] - first[0]))
+
+        def intersects(first, second, third, fourth):
+            return (
+                orientation(first, second, third) *
+                orientation(first, second, fourth) < 0.0 and
+                orientation(third, fourth, first) *
+                orientation(third, fourth, second) < 0.0
+            )
+
+        for map_name, tactical_map in self.maps.TACTICAL_MAPS.items():
+            for team in (1, 2):
+                for route in tactical_map["routes"][team]:
+                    points = [(float(point[0]), float(point[1]))
+                              for point in route["waypoints"]]
+                    context = (map_name, team, route["id"])
+                    for first, second in zip(points, points[1:]):
+                        self.assertGreater(
+                            math.hypot(second[0] - first[0],
+                                       second[1] - first[1]),
+                            1.0,
+                            context,
+                        )
+                    for first, second, third in zip(
+                            points, points[1:], points[2:]):
+                        first_heading = math.atan2(
+                            second[1] - first[1], second[0] - first[0])
+                        second_heading = math.atan2(
+                            third[1] - second[1], third[0] - second[0])
+                        turn = abs(self.ai._angle_delta(
+                            second_heading, first_heading))
+                        self.assertLess(turn, math.pi * 0.5, context)
+                    segments = list(zip(points, points[1:]))
+                    for first_index, first_segment in enumerate(segments):
+                        for second_index in range(
+                                first_index + 2, len(segments)):
+                            self.assertFalse(
+                                intersects(
+                                    first_segment[0], first_segment[1],
+                                    segments[second_index][0],
+                                    segments[second_index][1],
+                                ),
+                                context + (first_index, second_index),
+                            )
+
     def test_route_assignment_is_deterministic_and_capacity_aware(self):
         heavy = descriptor("heavyTank", speed=9.0, armor=160.0)
         first = self.ai.BattleDirector("04_himmelsdorf", "round-9")
