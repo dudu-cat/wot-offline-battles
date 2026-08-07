@@ -278,6 +278,48 @@ class TerrainGrid(object):
 			              self._failed_edge_penalty(key[0], key[1], now))
 		return penalty
 
+	def _baked_segment_cells(self, start, end):
+		"""Return graph cells crossed by a straight segment, start included."""
+		if not self.prebaked:
+			return ()
+		start_cell = self._nearest_baked_cell(self.cell_for(start), 2)
+		end_cell = self.cell_for(end)
+		if start_cell is None or self._baked_index(end_cell) is None:
+			return ()
+		x, z = start_cell
+		target_x, target_z = end_cell
+		cells = [(x, z)]
+		dx = abs(target_x - x)
+		dz = abs(target_z - z)
+		step_x = 1 if x < target_x else -1
+		step_z = 1 if z < target_z else -1
+		error = dx - dz
+		while x != target_x or z != target_z:
+			double_error = error * 2
+			if double_error > -dz:
+				error -= dz
+				x += step_x
+			if double_error < dx:
+				error += dx
+				z += step_z
+			cells.append((x, z))
+		return tuple(cells)
+
+	def segment_has_baked_hazard(self, start, end, hazard_mask):
+		"""Check cells entered by a shortcut without trapping a tank at its start."""
+		if not self.prebaked:
+			return False
+		cells = self._baked_segment_cells(start, end)
+		if not cells:
+			return True
+		# Exclude the start cell so a tank already on a shallow ford may leave it.
+		for cell in cells[1:]:
+			index = self._baked_index(cell)
+			if (index is None or
+					int(self._baked_hazards[index]) & int(hazard_mask)):
+				return True
+		return False
+
 	def path_has_penalty(self, path, now):
 		for index in range(len(path) - 1):
 			if self.segment_penalty(path[index], path[index + 1], now) > 0.0:
@@ -308,29 +350,13 @@ class TerrainGrid(object):
 		if distance < 0.25:
 			return True
 		if self.prebaked:
-			start_cell = self._nearest_baked_cell(self.cell_for(start), 2)
-			end_cell = self.cell_for(end)
-			if start_cell is None or self._baked_index(end_cell) is None:
+			cells = self._baked_segment_cells(start, end)
+			if not cells:
 				return False
-			if start_cell == end_cell:
+			if len(cells) == 1:
 				return True
-			x, z = start_cell
-			target_x, target_z = end_cell
-			dx = abs(target_x - x)
-			dz = abs(target_z - z)
-			step_x = 1 if x < target_x else -1
-			step_z = 1 if z < target_z else -1
-			error = dx - dz
-			while x != target_x or z != target_z:
-				old_cell = (x, z)
-				double_error = error * 2
-				if double_error > -dz:
-					error -= dz
-					x += step_x
-				if double_error < dx:
-					error += dx
-					z += step_z
-				if self._baked_edge_height(old_cell, (x, z)) is None:
+			for old_cell, cell in zip(cells, cells[1:]):
+				if self._baked_edge_height(old_cell, cell) is None:
 					return False
 			return True
 		start_key = self._point_key(start)
@@ -463,6 +489,8 @@ class TerrainGrid(object):
 					continue
 				candidate = (x, y, z)
 				if (self.segment_penalty(current, candidate, now) > 0.0 or
+						self.segment_has_baked_hazard(
+							current, candidate, BAKED_SHALLOW_WATER) or
 						not self.segment_clear(current, candidate)):
 					continue
 				cell = self.cell_for(candidate)
@@ -614,6 +642,8 @@ class TerrainGrid(object):
 			furthest = min(len(path) - 1, index + 6)
 			while furthest > index + 1:
 				if (self.segment_penalty(path[index], path[furthest], now) <= 0.0 and
+						not self.segment_has_baked_hazard(
+							path[index], path[furthest], BAKED_SHALLOW_WATER) and
 						self.segment_clear(path[index], path[furthest])):
 					break
 				furthest -= 1
@@ -865,6 +895,8 @@ class TerrainNavigator(object):
 			# Most annotated segments are already open roads. Avoid invoking A*
 			# when one continuous support/collision check proves the direct link.
 			if (self.grid.segment_penalty(start, goal, now) <= 0.0 and
+					not self.grid.segment_has_baked_hazard(
+						start, goal, BAKED_SHALLOW_WATER) and
 					self.grid.segment_clear(start, goal)):
 				path = (tuple(start), tuple(goal))
 				self.paths[key] = path

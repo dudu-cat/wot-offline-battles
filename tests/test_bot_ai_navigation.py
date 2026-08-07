@@ -117,6 +117,40 @@ class BotNavigationTest(unittest.TestCase):
         self.assertTrue(grid.baked_hazard_near((18.0, 0.0, 20.0)))
         self.assertGreater(grid._penalty((1, 0), None), 0.0)
 
+    def test_prebaked_shortcuts_do_not_cut_across_shallow_water(self):
+        graph = self.baked_graph(5, 3)
+        graph["hazards"] = [
+            0, 4, 4, 4, 0,
+            0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+        ]
+        navigator = self.navigation.TerrainNavigator(
+            lambda *args: None, baked_graph=graph
+        )
+        start = (10.0, 0.0, 20.0)
+        goal = (26.0, 0.0, 20.0)
+
+        _, path = navigator._path(
+            ("route", 1, "dry-detour"), start, goal, 1.0, None
+        )
+
+        self.assertTrue(path)
+        self.assertGreater(max(point[2] for point in path), 20.0)
+        for first, second in zip(path, path[1:]):
+            self.assertFalse(navigator.grid.segment_has_baked_hazard(
+                first, second, self.navigation.BAKED_SHALLOW_WATER
+            ))
+
+    def test_prebaked_hazard_check_allows_a_tank_to_leave_shallow_water(self):
+        graph = self.baked_graph(3, 1)
+        graph["hazards"] = [4, 0, 0]
+        grid = self.navigation.TerrainGrid(lambda *args: None, baked_graph=graph)
+
+        self.assertFalse(grid.segment_has_baked_hazard(
+            (10.0, 0.0, 20.0), (18.0, 0.0, 20.0),
+            self.navigation.BAKED_SHALLOW_WATER,
+        ))
+
     def test_shipped_lakeville_graph_connects_every_route_both_ways(self):
         graph_path = (
             ROOT / "scripts/client/gui/mods/offhangar/navgraphs/07_lakeville.json"
