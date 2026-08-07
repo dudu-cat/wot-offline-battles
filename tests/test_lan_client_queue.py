@@ -118,6 +118,47 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertAlmostEqual(1.0 / 30.0, self.network.BOT_STATE_INTERVAL)
         self.assertAlmostEqual(1.0 / 60.0, self.network.POLL_INTERVAL)
 
+    def test_worker_sends_hello_before_exposing_connected_socket(self):
+        player = Player()
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "china:Ch01_Type59"
+        )
+        sent = []
+
+        class FakeSocket:
+            def setsockopt(self, *args):
+                pass
+
+            def settimeout(self, timeout):
+                pass
+
+            def connect(self, address):
+                pass
+
+            def sendall(self, payload):
+                self_outer.assertFalse(client.connected)
+                sent.append(self_outer.network.json.loads(payload.decode("utf-8")))
+
+            def recv(self, size):
+                return b""
+
+            def close(self):
+                pass
+
+        self_outer = self
+        fake = FakeSocket()
+        original_socket = self.network.socket.socket
+        self.network.socket.socket = lambda *args: fake
+        client.running = True
+        try:
+            client._worker()
+        finally:
+            self.network.socket.socket = original_socket
+
+        self.assertEqual("hello", sent[0]["type"])
+        self.assertEqual(5, sent[0]["protocol"])
+        self.assertEqual("china:Ch01_Type59", sent[0]["vehicle"])
+
     def test_start_button_does_not_replace_battle_join(self):
         player = Player()
 
@@ -1068,6 +1109,41 @@ class LANClientQueueTest(unittest.TestCase):
 
         self.assertGreaterEqual(client.rtt_ms, 30.0)
         self.assertLess(client.rtt_ms, 200.0)
+
+    def test_pong_uses_network_receive_time_not_delayed_main_thread_time(self):
+        player = Player()
+        client = self.network.LANClient(player, "127.0.0.1", 28782, "Alpha", "ussr:T-34")
+
+        client._handle_message({
+            "type": "pong", "client_time": 10.0,
+            "_client_received_time": 10.025,
+        })
+
+        self.assertAlmostEqual(25.0, client.rtt_ms, places=3)
+
+    def test_shared_bot_death_uses_relayed_bot_killer(self):
+        player = Player()
+        player._offhangar_network_is_authority = True
+        victim = types.SimpleNamespace(
+            id=1016, _network_bot_id=16, health=500, maxHealth=500,
+            isAlive=True,
+        )
+        killer = types.SimpleNamespace(id=1003, _network_bot_id=3)
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            victim.id: victim, killer.id: killer,
+        }
+        pushed = []
+        original_push = self.network._push_mock_health
+        self.network._push_mock_health = lambda *args: pushed.append(args)
+        try:
+            self.network._apply_bot_state(player, {
+                "id": 16, "health": 0, "max_health": 500,
+                "alive": False, "killer_bot_id": 3,
+            })
+        finally:
+            self.network._push_mock_health = original_push
+
+        self.assertEqual(1003, pushed[0][5])
 
     def test_remote_enemy_uses_local_spotting_instead_of_always_visible(self):
         vector3 = sys.modules["Math"].Vector3

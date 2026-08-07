@@ -212,14 +212,21 @@ class LANClient(object):
 				pass
 			sock.settimeout(0.5)
 			self.sock = sock
-			self.connected = True
-			self._send({
+			# The server requires hello to be the first wire message.  Do not expose
+			# the socket to the main-thread poller before that message is sent: its
+			# initial ping could otherwise win the race and be rejected as a protocol
+			# mismatch.
+			hello = {
 				'type': 'hello',
 				'protocol': PROTOCOL_VERSION,
 				'name': self.name,
 				'vehicle': self.vehicle,
 				'max_health': self.max_health,
-			})
+			}
+			payload = (json.dumps(hello, separators=(',', ':')) + '\n').encode('utf-8')
+			with self._send_lock:
+				sock.sendall(payload)
+			self.connected = True
 			LOG_NOTE('LAN hello sent (protocol %s)' % PROTOCOL_VERSION)
 			while self.running:
 				try:
@@ -230,7 +237,8 @@ class LANClient(object):
 					if self.connected and not self._stop_requested:
 						self._last_error = 'server closed the connection'
 					break
-				self._last_receive = time.time()
+				received_time = time.time()
+				self._last_receive = received_time
 				try:
 					self._recv_buffer += chunk.decode('utf-8')
 				except UnicodeError:
@@ -246,6 +254,10 @@ class LANClient(object):
 						message = json.loads(line)
 					except (TypeError, ValueError):
 						continue
+					if isinstance(message, dict) and message.get('type') == 'pong':
+						# RTT ends when the network thread receives the pong, not when a busy
+						# BigWorld frame eventually drains the main-thread message queue.
+						message['_client_received_time'] = received_time
 					with self._pending_lock:
 						self._pending.append(message)
 		except Exception as error:
@@ -664,7 +676,9 @@ class LANClient(object):
 		elif kind == 'pong':
 			client_time = _finite_float(message.get('client_time'), 0.0)
 			if client_time > 0.0:
-				sample = max(0.0, (time.time() - client_time) * 1000.0)
+				received_time = _finite_float(
+					message.get('_client_received_time'), time.time())
+				sample = max(0.0, (received_time - client_time) * 1000.0)
 				self.rtt_ms = sample if self.rtt_ms is None else self.rtt_ms * 0.75 + sample * 0.25
 		elif kind == 'error':
 			self._last_error = message.get('message') or message.get('code') or 'server error'
@@ -1328,6 +1342,12 @@ def publish_authoritative_bots(player, mocks):
 	"""Send canonical bot pose, gun, shot and HP state at 30 Hz."""
 	if not network_is_authority(player):
 		return False
+	entity_to_bot = {}
+	for candidate in (mocks or {}).values():
+		candidate_bot_id = getattr(candidate, '_network_bot_id', None)
+		candidate_entity_id = getattr(candidate, 'id', None)
+		if candidate_bot_id is not None and candidate_entity_id is not None:
+			entity_to_bot[candidate_entity_id] = int(candidate_bot_id)
 	states = []
 	for mock in (mocks or {}).values():
 		bot_id = getattr(mock, '_network_bot_id', None)
@@ -1335,6 +1355,8 @@ def publish_authoritative_bots(player, mocks):
 			continue
 		try:
 			pos = mock.position
+			killer_bot_id = entity_to_bot.get(
+				getattr(mock, 'last_killer_id', None), 0)
 			yaw = _finite_float(getattr(mock, 'yaw', 0.0))
 			server_pos, server_yaw = _server_pose_from_world(
 				player, pos.x, pos.y, pos.z, yaw)
@@ -1352,6 +1374,7 @@ def publish_authoritative_bots(player, mocks):
 				'fire_seq': int(getattr(mock, '_network_bot_fire_seq', 0) or 0),
 				'shell_index': int(getattr(mock, '_network_bot_shell_index', 0) or 0),
 				'health': max(0, int(getattr(mock, 'health', 0) or 0)),
+				'killer_bot_id': int(killer_bot_id or 0),
 				'alive': bool(getattr(mock, 'isAlive', False)) and int(getattr(mock, 'health', 0) or 0) > 0,
 			})
 		except Exception:
@@ -2081,8 +2104,14 @@ def _apply_bot_state(player, state, force_authority_pose=False):
 			mock._network_bot_fire_seq = max(
 				int(getattr(mock, '_network_bot_fire_seq', 0) or 0), fire_seq)
 			mock._network_bot_shell_index = int(state.get('shell_index', 0) or 0)
+		killer_id = -1
+		killer_bot_id = state.get('killer_bot_id')
+		if killer_bot_id not in (None, 0, '0'):
+			killer_mock = _find_bot(killer_bot_id)
+			if killer_mock is not None:
+				killer_id = getattr(killer_mock, 'id', -1)
 		_push_mock_health(player, mock, state.get('health', mock.health),
-			state.get('max_health', mock.maxHealth), target_alive)
+			state.get('max_health', mock.maxHealth), target_alive, killer_id)
 		if not is_authority:
 			new_health = max(0, int(getattr(mock, 'health', 0) or 0))
 			if old_health > new_health:

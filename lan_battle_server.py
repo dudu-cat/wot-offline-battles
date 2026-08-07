@@ -686,6 +686,12 @@ class BattleState:
             fire_seq = 0
         if previous is not None:
             fire_seq = max(fire_seq, int(previous.get("fire_seq", 0)))
+        try:
+            killer_bot_id = max(0, min(int(raw.get("killer_bot_id", 0)), 30))
+        except (TypeError, ValueError):
+            killer_bot_id = 0
+        if previous is not None and not killer_bot_id:
+            killer_bot_id = int(previous.get("killer_bot_id", 0) or 0)
         yaw = _finite_float(raw.get("yaw"), 0.0)
         return {
             "id": int(identity["id"]),
@@ -707,6 +713,7 @@ class BattleState:
             "shell_index": max(0, min(int(_finite_float(raw.get("shell_index"), 0)), 9)),
             "health": reported_health,
             "max_health": max_health,
+            "killer_bot_id": killer_bot_id,
             "alive": bool(raw.get("alive", reported_health > 0)) and reported_health > 0,
         }
 
@@ -1196,7 +1203,12 @@ class ClientHandler(socketserver.BaseRequestHandler):
             if (not isinstance(hello, dict) or hello.get("type") != "hello" or
                     int(hello.get("protocol", -1)) != PROTOCOL_VERSION):
                 self._send_raw(conn, {"type": "error", "code": "protocol", "message": "protocol mismatch"})
-                _server_log("Rejected %s:%d: protocol mismatch" % self.client_address)
+                received_type = hello.get("type") if isinstance(hello, dict) else type(hello).__name__
+                received_protocol = hello.get("protocol") if isinstance(hello, dict) else None
+                _server_log(
+                    "Rejected %s:%d: protocol mismatch type=%r protocol=%r expected=%d" % (
+                        self.client_address[0], self.client_address[1], received_type,
+                        received_protocol, PROTOCOL_VERSION))
                 return
             player, join_error = server.state.add_player(conn, self.client_address, hello)
             if player is None:

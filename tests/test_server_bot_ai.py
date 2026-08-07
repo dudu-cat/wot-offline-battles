@@ -50,6 +50,17 @@ def _cover_candidate(candidate_id="rock", x=-8.0, z=-12.0):
 
 
 class ServerBotPlannerTests(unittest.TestCase):
+    def test_bot_state_preserves_relayed_killer_identity(self):
+        identity = {
+            "id": 16, "team": 2, "slot": 0, "name": "Victim",
+            "vehicle": "ussr:T-34", "max_health": 500,
+        }
+        state = BattleState._sanitize_bot_state({
+            "health": 0, "alive": False, "killer_bot_id": 3,
+        }, identity, None)
+
+        self.assertEqual(3, state["killer_bot_id"])
+
     def test_navigation_fallback_diagnostics_are_bounded_and_rate_limited(self):
         state = BattleState(map_name="04_himmelsdorf")
         state.phase = "battle"
