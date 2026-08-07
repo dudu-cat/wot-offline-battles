@@ -156,7 +156,12 @@ class BotAIDriverTest(unittest.TestCase):
         ).read_text()
 
         hull_aim = source.index(".combat_hull_aim(")
-        physics_turn = source.index("_PHY.traverse_step(", hull_aim)
+        direct_turn = source.find("_PHY.traverse_step(", hull_aim)
+        profiled_turn = source.find(
+            "'kinematics', _PHY.traverse_step,", hull_aim
+        )
+        physics_turn = max(direct_turn, profiled_turn)
+        self.assertGreaterEqual(physics_turn, 0)
         self.assertLess(hull_aim, physics_turn)
         self.assertIn("if _battle_active and hasattr(m_veh, '_t_mat'):", source)
         self.assertIn("_ai_gun_aligned = _offh_ai_driver().gun_aligned(", source)

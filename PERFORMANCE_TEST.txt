@@ -1,0 +1,60 @@
+WORLD OF TANKS 0.8.2 BOT PERFORMANCE TEST
+==========================================
+
+Purpose
+-------
+
+This temporary diagnostic build samples one render frame in four and writes
+one aggregate PERF line to python.log every five seconds. It does not require
+any server changes or debug mode.
+
+Install
+-------
+
+1. Close the game.
+2. Delete the existing res_mods/0.8.2 directory.
+3. Copy the supplied 0.8.2 directory into res_mods.
+4. Start the LAN server normally, then start the client.
+
+Test
+----
+
+Play one battle for at least 30 seconds after all bots appear. A useful sample
+contains both the countdown and at least 20 seconds of normal movement.
+
+If two clients are available, collect python.log from both machines. The PERF
+line identifies the client as role=authority or role=replica. This comparison
+separates local bot simulation cost from rendering and network interpolation.
+
+Send the complete python.log, or only lines containing:
+
+    [OFFHANGAR] [NOTE] PERF
+
+Metric guide
+------------
+
+callback          Total sampled offline-battle callback time.
+bot_loop          Total bot update-loop time.
+driver            Local steering, including direction probes.
+direction         Terrain, water, and obstacle corridor probes.
+physics           Movement integration, terrain, and collision work.
+kinematics        Pure speed and hull-turn calculations.
+pose_water        Hull-footprint water safety checks.
+terrain_support   Ground support under the hull.
+terrain_tilt      Pitch and roll sampling.
+tree_scan         Destructible-tree proximity checks.
+wall_collision    Static horizontal collision checks.
+tank_collision    Vehicle-to-vehicle collision resolution.
+contacts          Tactical contact refresh.
+visibility        Spotting and marker/minimap visibility updates.
+los               Static line-of-sight probes.
+nav_tick          Navigation-grid maintenance.
+nav_target        Local route target selection.
+network_smoothing Remote state interpolation.
+network_publish   Authority state publication.
+
+Times are milliseconds per sampled frame. The value after '/' is the average
+call count per sampled frame. Some stages are intentionally nested: driver
+includes direction, and physics includes terrain and collision work. Do not
+add the stage times together; use callback as the total.
+

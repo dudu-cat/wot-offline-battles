@@ -6,6 +6,141 @@ from debug_utils import LOG_DEBUG, LOG_CURRENT_EXCEPTION
 
 _g_destr_authority = None
 
+# Temporary low-overhead battle profiler.  It samples one render callback in
+# four, then writes one aggregate NOTE every five seconds.  Sampling matters on
+# this Python 2.6 client: timing every tiny operation would become part of the
+# performance problem we are trying to measure.
+_OFFH_PERF_SAMPLE_EVERY = 4
+_OFFH_PERF_REPORT_SECONDS = 5.0
+
+
+def _offh_perf_clock():
+	try:
+		return time.clock()
+	except Exception:
+		try:
+			return time.perf_counter()
+		except Exception:
+			return time.time()
+
+
+def _offh_perf_state():
+	state = globals().get('g_offh_perf_state')
+	generation = int(globals().get('g_offh_battle_gen', 0) or 0)
+	if state is None or int(state.get('generation', -1)) != generation:
+		state = {
+			'generation': generation,
+			'wall_start': time.time(),
+			'frames': 0,
+			'frame_seconds': 0.0,
+			'sample_frames': 0,
+			'active': False,
+			'times': {},
+			'calls': {},
+		}
+		globals()['g_offh_perf_state'] = state
+	return state
+
+
+def _offh_perf_frame_begin(bot_count):
+	state = _offh_perf_state()
+	state['frames'] += 1
+	state['bot_count'] = int(bot_count or 0)
+	state['active'] = (state['frames'] % _OFFH_PERF_SAMPLE_EVERY) == 0
+	if not state['active']:
+		return None
+	state['sample_frames'] += 1
+	return _offh_perf_clock()
+
+
+def _offh_perf_start():
+	state = globals().get('g_offh_perf_state')
+	if state is None or not state.get('active', False):
+		return None
+	return _offh_perf_clock()
+
+
+def _offh_perf_stop(name, started, calls=1):
+	if started is None:
+		return
+	state = globals().get('g_offh_perf_state')
+	if state is None or not state.get('active', False):
+		return
+	elapsed = max(0.0, _offh_perf_clock() - started)
+	times = state['times']
+	counts = state['calls']
+	times[name] = float(times.get(name, 0.0) or 0.0) + elapsed
+	counts[name] = int(counts.get(name, 0) or 0) + int(calls or 0)
+
+
+def _offh_perf_call(name, callback, *args):
+	started = _offh_perf_start()
+	try:
+		return callback(*args)
+	finally:
+		_offh_perf_stop(name, started)
+
+
+def _offh_perf_role(player):
+	try:
+		client = getattr(player, '_offhangar_network_client', None)
+		if client is None or not getattr(client, 'ready', False):
+			return 'offline'
+		from gui.mods.offhangar.network_battle import network_is_authority
+		return 'authority' if network_is_authority(player) else 'replica'
+	except Exception:
+		return 'unknown'
+
+
+def _offh_perf_frame_end(started, frame_dt, player):
+	state = _offh_perf_state()
+	try:
+		state['frame_seconds'] += max(0.0, min(float(frame_dt), 0.5))
+	except Exception:
+		pass
+	_offh_perf_stop('callback', started)
+	state['active'] = False
+	now = time.time()
+	wall = max(0.001, now - float(state.get('wall_start', now)))
+	if wall < _OFFH_PERF_REPORT_SECONDS:
+		return
+	samples = max(1, int(state.get('sample_frames', 0) or 0))
+	frames = max(1, int(state.get('frames', 0) or 0))
+	frame_ms = 1000.0 * float(state.get('frame_seconds', 0.0) or 0.0) / frames
+	times = state.get('times', {}) or {}
+	calls = state.get('calls', {}) or {}
+	callback_ms = 1000.0 * float(times.get('callback', 0.0) or 0.0) / samples
+	callback_share = 100.0 * callback_ms / max(0.1, frame_ms)
+	ordered = ('network_smoothing', 'ai_setup', 'contacts', 'nav_tick',
+	           'nav_target', 'bot_loop', 'driver', 'direction', 'physics',
+	           'kinematics',
+	           'pose_water', 'terrain_support', 'terrain_tilt', 'tree_scan',
+	           'wall_collision',
+	           'tank_collision', 'visibility', 'los', 'network_publish')
+	parts = []
+	for name in ordered:
+		elapsed = float(times.get(name, 0.0) or 0.0)
+		count = int(calls.get(name, 0) or 0)
+		if elapsed <= 0.0 and count <= 0:
+			continue
+		parts.append('%s=%.2fms/%.1fc' % (
+			name, 1000.0 * elapsed / samples, float(count) / samples))
+	try:
+		from gui.mods.offhangar.logging import LOG_NOTE as _perf_log
+		_perf_log('PERF window=%.1fs role=%s bots=%d fps=%.1f frame=%.2fms '
+		          'callback=%.2fms(%.0f%%) samples=%d %s' % (
+			wall, _offh_perf_role(player), int(state.get('bot_count', 0) or 0),
+			float(frames) / wall, frame_ms, callback_ms, callback_share,
+			samples, ' '.join(parts)))
+	except Exception:
+		pass
+	state['wall_start'] = now
+	state['frames'] = 0
+	state['frame_seconds'] = 0.0
+	state['sample_frames'] = 0
+	state['times'] = {}
+	state['calls'] = {}
+
 def _get_destr_authority():
 	"""offhangar.destructibles_authority, with the same execfile fallback
 	the package bootstrap uses (the module ships without a .pyc)."""
@@ -682,6 +817,7 @@ def _offh_ai_pose_water_depth(vehicle, position=None, yaw=None):
 	slide and ballistic drift can move a hull somewhere else, so the final realised
 	pose needs an independent footprint check.  A fine pose cache keeps the five
 	terrain + water probes off frames where a slow tank has barely moved.'''
+	_perf_started = _offh_perf_start()
 	try:
 		import BigWorld, Math, math
 		if position is None:
@@ -738,6 +874,8 @@ def _offh_ai_pose_water_depth(vehicle, position=None, yaw=None):
 	except Exception:
 		_offh_ai_probe_reject(vehicle, 'error')
 		return -1.0
+	finally:
+		_offh_perf_stop('pose_water', _perf_started)
 
 
 def _offh_ai_baked_pose_safe(position, shoulder_cells=1):
@@ -2190,6 +2328,7 @@ def _offh_ai_hull_dims(descriptor):
 
 def _offh_ai_direction_clear(vehicle, absolute_yaw):
 	"""Probe one hull-width movement corridor for the engine-free driver."""
+	_perf_started = _offh_perf_start()
 	try:
 		import BigWorld, Math, math
 		velocity = float(getattr(vehicle, '_veh_velocity', 0.0) or 0.0)
@@ -2315,6 +2454,8 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 		return True
 	except Exception:
 		return _offh_ai_probe_reject(vehicle, 'error')
+	finally:
+		_offh_perf_stop('direction', _perf_started)
 
 
 def _offh_ai_class_tag(mock, descriptor):
@@ -2350,6 +2491,8 @@ def _offh_ai_view_range(descriptor):
 
 def _offh_ai_has_los(observer_position, target_position):
 	"""Static LOS between hulls, excluding both vehicle collision volumes."""
+	_perf_started = _offh_perf_start()
+	_result = False
 	try:
 		import BigWorld, Math
 		from gui.mods.offhangar.bot_ai import trimmed_sight_segment
@@ -2357,16 +2500,20 @@ def _offh_ai_has_los(observer_position, target_position):
 			segment = trimmed_sight_segment(
 				observer_position, target_position, target_height=height)
 			if segment is None:
-				return True
+				_result = True
+				break
 			if not segment:
 				continue
 			start = Math.Vector3(*segment[0])
 			end = Math.Vector3(*segment[1])
 			if BigWorld.wg_collideSegment(_offh_bspace(), start, end, 128) is None:
-				return True
+				_result = True
+				break
 	except Exception:
 		pass
-	return False
+	finally:
+		_offh_perf_stop('los', _perf_started)
+	return _result
 
 
 def _offh_ai_clear_shot(shooter_position, target_position):
@@ -7001,6 +7148,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				if dt <= 0.0 or dt > 0.5:
 					dt = 0.016 # fallback to 60fps
 				_frame_dt = dt # real per-frame delta (dt is reused by the bot section below)
+				_perf_frame_started = _offh_perf_frame_begin(len(mock_vehicles or {}))
 
 				# --- One-time spawn correction once the terrain has streamed in ---
 				# The initial spawn runs before the space is loaded (all ground rays
@@ -9728,7 +9876,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				dt = _frame_dt # real frame delta: bot speed/reload no longer depends on FPS
 				try:
 					from gui.mods.offhangar.network_battle import advance_network_smoothing
-					advance_network_smoothing(player, mock_vehicles, dt)
+					_offh_perf_call('network_smoothing', advance_network_smoothing,
+					                player, mock_vehicles, dt)
 				except Exception:
 					pass
 				_ai_director = None
@@ -9738,14 +9887,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						_ai_navigator = _offh_ai_navigator(_ai_director)
 						if _ai_navigator is not None:
 							try:
-								_ai_navigator.tick(BigWorld.time())
+								_offh_perf_call('nav_tick', _ai_navigator.tick, BigWorld.time())
 							except Exception as _ai_nav_tick_error:
 								_offh_ai_navigation_failure('tick', _ai_nav_tick_error)
 								globals().pop('g_offh_terrain_navigator', None)
 								globals()['g_offh_ai_navigation_disabled'] = True
-						_offh_ai_refresh_contacts(
-							_ai_director, player, mock_vehicles, veh_pos,
-							loaded_models.get('td'), BigWorld.time())
+						_offh_perf_call('contacts', _offh_ai_refresh_contacts,
+						                _ai_director, player, mock_vehicles, veh_pos,
+						                loaded_models.get('td'), BigWorld.time())
 						# Registration order affects route capacity. Sort by entity id so
 						# an authority failover reconstructs the same assignments.
 						for _ai_eid in sorted(mock_vehicles.keys()):
@@ -9768,6 +9917,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						LOG_DEBUG('OfflineBattle.SMART_AI disabled after init error:',
 						          str(_ai_init_error))
 					_ai_director = None
+				_perf_bot_loop = _offh_perf_start()
 				for eid, m_veh in mock_vehicles.iteritems():
 					if eid != getattr(player, 'playerVehicleID', -1) and getattr(m_veh, 'isAlive', False):
 						try:
@@ -9905,10 +10055,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										_navigator = _offh_ai_navigator(_ai_director)
 										_requested_drive_pos = drive_pos
 										if _navigator is not None:
-											drive_pos = _navigator.next_target(
-												eid, (m_veh.position.x, m_veh.position.y, m_veh.position.z),
-												drive_pos, _nav_key, BigWorld.time(), _nav_anchor,
-												_avoid_points)
+											drive_pos = _offh_perf_call(
+											'nav_target', _navigator.next_target, eid,
+											(m_veh.position.x, m_veh.position.y, m_veh.position.z),
+											drive_pos, _nav_key, BigWorld.time(), _nav_anchor,
+											_avoid_points)
 											_nav_paused = _navigator.navigation_paused(
 												(m_veh.position.x, m_veh.position.y, m_veh.position.z),
 												_requested_drive_pos, drive_pos)
@@ -10010,8 +10161,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								math.sin(float(m_veh.yaw)) * float(m_veh._veh_velocity),
 								0.0,
 								math.cos(float(m_veh.yaw)) * float(m_veh._veh_velocity))
-							_driver_order = _offh_ai_driver().drive(
-								eid,
+							_driver_order = _offh_perf_call(
+									'driver', _offh_ai_driver().drive, eid,
 								(float(m_veh.position.x), float(m_veh.position.y),
 								 float(m_veh.position.z)),
 								float(m_veh.yaw), float(m_veh._veh_velocity), float(dt),
@@ -10055,6 +10206,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										turn_dir, throttle, _driver_mode,
 										_ai_target_id is not None))
 
+							_perf_physics = _offh_perf_start()
 							# IMMOBILIZATION CHECK
 							_dev_hp = getattr(m_veh, 'devices_hp', None)
 							# is_tracked = locked tracks (handbrake below), a dead engine only coasts.
@@ -10160,8 +10312,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									if _bd > 0.35: _bd = 0.35
 									elif _bd < -0.35: _bd = -0.35
 									m_veh._dp_v = _bprev + _bd * 0.6
-							m_veh._veh_velocity = _PHY.longitudinal_step(
-								_bphys, cur_vel, throttle, turn_dir != 0,
+							m_veh._veh_velocity = _offh_perf_call(
+								'kinematics', _PHY.longitudinal_step, _bphys, cur_vel,
+								throttle, turn_dir != 0,
 								getattr(m_veh, '_dp_v', 0.0) or 0.0, dt,
 								getattr(m_veh, '_airborne', False), 0, _b_locked)
 							
@@ -10235,12 +10388,18 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								m_veh._cw_fc = (getattr(m_veh, '_cw_fc', 0) or 0) + 1
 								if abs(m_veh._veh_velocity) > 0.5:
 									try:
-										_fell_trees_near(_offh_bspace(), m_veh.position, m_veh.yaw, m_veh._veh_velocity, _td)
+										_offh_perf_call('tree_scan', _fell_trees_near,
+										                _offh_bspace(), m_veh.position, m_veh.yaw,
+										                m_veh._veh_velocity, _td)
 									except: pass
 								# perf: wall scan alternates frames per bot (<0.5 m travel between checks)
 								if abs(m_veh._veh_velocity) > 0.5 and ((m_veh._cw_fc + eid) & 1) == 0:
 									try:
-										_hit_wall = _check_horizontal_collision(_offh_bspace(), m_veh.position, m_veh.yaw, m_veh._veh_velocity, _td, getattr(m_veh, '_airborne', False), dt)
+										_hit_wall = _offh_perf_call(
+											'wall_collision', _check_horizontal_collision,
+											_offh_bspace(), m_veh.position, m_veh.yaw,
+											m_veh._veh_velocity, _td,
+											getattr(m_veh, '_airborne', False), dt)
 									except: pass
 								_bnx = m_veh.position.x + math.sin(m_veh.yaw) * m_veh._veh_velocity * dt
 								_bnz = m_veh.position.z + math.cos(m_veh.yaw) * m_veh._veh_velocity * dt
@@ -10255,7 +10414,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								try:
 									_bsvx = math.sin(m_veh.yaw) * m_veh._veh_velocity + (getattr(m_veh, '_push_x', 0.0) or 0.0)
 									_bsvz = math.cos(m_veh.yaw) * m_veh._veh_velocity + (getattr(m_veh, '_push_z', 0.0) or 0.0)
-									_btr = _tank_resolve(eid, m_veh.position.x, m_veh.position.z, m_veh.yaw, _td, 1.0 / max(bot_mass, 1.0), _bsvx, _bsvz, m_veh.position.y)
+									_btr = _offh_perf_call(
+										'tank_collision', _tank_resolve, eid,
+										m_veh.position.x, m_veh.position.z, m_veh.yaw, _td,
+										1.0 / max(bot_mass, 1.0), _bsvx, _bsvz,
+										m_veh.position.y)
 									# Forward impulse share hits the bot's drive speed too (see player)
 									_bfimp = _btr[2] * math.sin(m_veh.yaw) + _btr[3] * math.cos(m_veh.yaw)
 									_bfabs = 0.0
@@ -10270,7 +10433,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								except: pass
 							
 							# ROTATION: physics.traverse_step (same law as the player)
-							m_veh._veh_turn_velocity = _PHY.traverse_step(_bphys, m_veh._veh_turn_velocity, turn_dir, m_veh._veh_velocity, dt)
+							m_veh._veh_turn_velocity = _offh_perf_call(
+								'kinematics', _PHY.traverse_step, _bphys,
+								m_veh._veh_turn_velocity, turn_dir,
+								m_veh._veh_velocity, dt)
 							try:
 								_btf = _module_factor(m_veh, 'traverse')
 								if _btf < 1.0:
@@ -10291,7 +10457,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										_bhl = max(1.5, abs(_td.hull['hitTester'].bbox[1][2]))
 								except Exception:
 									pass
-								_bsup = _terrain_support(_offh_bspace(), m_veh.position.x, m_veh.position.y, m_veh.position.z, m_veh.yaw, _bhl)
+								_bsup = _offh_perf_call(
+									'terrain_support', _terrain_support, _offh_bspace(),
+									m_veh.position.x, m_veh.position.y, m_veh.position.z,
+									m_veh.yaw, _bhl)
 								_bc_y = _bsup[1]        # ground under the hull centre (chassis origin)
 								_bg_y = _bc_y if _bc_y is not None else _bsup[0]  # rest on centre, not float
 								if _bg_y is not None:
@@ -10339,7 +10508,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# the pitch/roll smoothing below hides the halved sample rate
 							m_veh._ypr_fc = (getattr(m_veh, '_ypr_fc', 0) or 0) + 1
 							if getattr(m_veh, '_ypr_c', None) is None or ((m_veh._ypr_fc + eid) & (1 if getattr(m_veh, '_spot_visible', True) else 3)) == 0:
-								m_veh._ypr_c = _get_terrain_ypr(_offh_bspace(), m_veh.position, m_veh.yaw)
+									m_veh._ypr_c = _offh_perf_call(
+										'terrain_tilt', _get_terrain_ypr, _offh_bspace(),
+										m_veh.position, m_veh.yaw)
 							_b_ypr = (m_veh.yaw, m_veh._ypr_c[1], m_veh._ypr_c[2], m_veh._ypr_c[3], m_veh._ypr_c[4], m_veh._ypr_c[5])
 							# --- Slope slide (bot): same WG law + cross-heading projection as player ---
 							_bss = getattr(m_veh, '_slide_spd', 0.0) or 0.0
@@ -10447,7 +10618,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											eid, target_yaw, 5.0)
 									except Exception:
 										pass
-									m_veh._ypr_c = _get_terrain_ypr(
+									m_veh._ypr_c = _offh_perf_call(
+										'terrain_tilt', _get_terrain_ypr,
 										_offh_bspace(), m_veh.position, m_veh.yaw)
 									_b_ypr = (m_veh.yaw, m_veh._ypr_c[1],
 									          m_veh._ypr_c[2], m_veh._ypr_c[3],
@@ -10480,7 +10652,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										_offh_ai_driver().remember_failure(eid, target_yaw, 5.0)
 									except Exception:
 										pass
-									m_veh._ypr_c = _get_terrain_ypr(
+									m_veh._ypr_c = _offh_perf_call(
+										'terrain_tilt', _get_terrain_ypr,
 										_offh_bspace(), m_veh.position, m_veh.yaw)
 									_b_ypr = (m_veh.yaw, m_veh._ypr_c[1],
 									          m_veh._ypr_c[2], m_veh._ypr_c[3],
@@ -10495,6 +10668,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							
 							m_veh.matrix.setRotateYPR(_b_ypr)
 							m_veh.matrix.translation = m_veh.position
+							_offh_perf_stop('physics', _perf_physics)
+							_perf_visibility = _offh_perf_start()
 							# --- Spotting: unspotted ENEMY tanks are hidden like the real game.
 							# Simulation keeps running; only rendering/markers/minimap are culled.
 							try:
@@ -10739,6 +10914,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											pass
 							except Exception:
 								pass
+							_offh_perf_stop('visibility', _perf_visibility)
 							# Track scroll (bot): y=left, z=right, traverse via turn rate
 							try:
 								_bfa = getattr(m_veh, '_fashion', None)
@@ -11482,10 +11658,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						except Exception as e:
 							import traceback
 							LOG_DEBUG('Bot AI Exception:', traceback.format_exc())
-							
+
+				_offh_perf_stop('bot_loop', _perf_bot_loop)
 				try:
 					from gui.mods.offhangar.network_battle import publish_authoritative_bots
-					publish_authoritative_bots(player, mock_vehicles)
+					_offh_perf_call('network_publish', publish_authoritative_bots,
+					                player, mock_vehicles)
 				except Exception:
 					pass
 
@@ -11952,6 +12130,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							except Exception: pass
 				except Exception:
 					pass
+				_offh_perf_frame_end(_perf_frame_started, _frame_dt, player)
 				if (not _battle_finished[0] and
 						globals().get('g_offh_battle_gen', 0) == _offh_my_gen[0]):
 					globals()['g_offh_aih_callback_id'] = BigWorld.callback(
