@@ -6852,8 +6852,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			pass
 		
 		def _capture_tick():
-			import gui.mods.offhangar.logging as __offlog
-			__offlog.LOG_DEBUG('LOUD: Capture tick started running!')
 			try:
 				if _battle_finished[0]: return
 				import BigWorld
@@ -6948,8 +6946,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								inv_z = invader.position.z
 							dx = inv_x - base_pos.x
 							dz = inv_z - base_pos.z
-							import gui.mods.offhangar.logging as __offlog
-							__offlog.LOG_DEBUG('LOUD: Distance to base', base_team, 'is', dx*dx + dz*dz, 'pos:', inv_x, inv_z, 'base:', base_pos.x, base_pos.z)
 							if dx*dx + dz*dz <= 2500.0: # 50m radius
 								invaders_count += 1
 								if invader == BigWorld.player():

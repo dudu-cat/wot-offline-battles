@@ -120,6 +120,21 @@ exception prints `BATTLE TICK ERROR (server remains running)` and does not kill
 the server's battle loop silently. Either line is actionable evidence to include
 with the client `python.log` when reporting a frozen ping/lag indicator.
 
+During a battle each client also writes one compact transport summary every
+five seconds:
+
+```text
+LAN NET window=5.0s chunks=... messages=... snapshots=... bot_updates=... max_socket_gap=... max_snapshot_gap=... max_bot_gap=... max_queue_age=... max_pending=... rtt=...
+```
+
+`max_socket_gap` is measured by the socket thread and exposes a real delivery
+pause. `max_queue_age` means data had already reached the machine but the game
+thread applied it late. `snapshots` is the server delivery rate, while
+`bot_updates` is how often the elected authority actually supplied a new bot
+pose. These fields distinguish LAN trouble, a delayed server stream, an
+overloaded authority client, and a blocked local game thread without enabling
+per-packet logging.
+
 In battle, opposing LAN humans use the same local 50 m proximity spot,
 view-range/terrain line-of-sight check, allied vision and five-second spot
 memory as NPC opponents. Allied humans remain visible. When a human dies, the

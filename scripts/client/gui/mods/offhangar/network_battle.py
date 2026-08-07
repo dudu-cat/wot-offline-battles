@@ -180,6 +180,20 @@ class LANClient(object):
 		self._last_receive = 0.0
 		self._last_snapshot = 0.0
 		self.rtt_ms = None
+		self._diag_window_start = time.time()
+		self._diag_chunks = 0
+		self._diag_messages = 0
+		self._diag_snapshots = 0
+		self._diag_bot_updates = 0
+		self._diag_last_chunk = 0.0
+		self._diag_last_snapshot = 0.0
+		self._diag_last_bot_update = 0.0
+		self._diag_last_bot_revision = -1
+		self._diag_max_socket_gap = 0.0
+		self._diag_max_snapshot_gap = 0.0
+		self._diag_max_bot_update_gap = 0.0
+		self._diag_max_queue_age = 0.0
+		self._diag_max_pending = 0
 		self.bot_authority_id = None
 		self.bot_order_revision = 0
 		self.bot_orders = {}
@@ -239,6 +253,14 @@ class LANClient(object):
 					break
 				received_time = time.time()
 				self._last_receive = received_time
+				with self._pending_lock:
+					self._diag_chunks += 1
+					previous_receive = self._diag_last_chunk
+					if previous_receive > 0.0:
+						self._diag_max_socket_gap = max(
+							self._diag_max_socket_gap,
+							received_time - previous_receive)
+					self._diag_last_chunk = received_time
 				try:
 					self._recv_buffer += chunk.decode('utf-8')
 				except UnicodeError:
@@ -254,12 +276,35 @@ class LANClient(object):
 						message = json.loads(line)
 					except (TypeError, ValueError):
 						continue
-					if isinstance(message, dict) and message.get('type') == 'pong':
-						# RTT ends when the network thread receives the pong, not when a busy
-						# BigWorld frame eventually drains the main-thread message queue.
+					if isinstance(message, dict):
+						# This private timestamp lets RTT and diagnostics distinguish actual
+						# socket delay from a busy BigWorld game thread draining the queue late.
 						message['_client_received_time'] = received_time
 					with self._pending_lock:
 						self._pending.append(message)
+						self._diag_messages += 1
+						if isinstance(message, dict) and message.get('type') == 'snapshot':
+							if self._diag_last_snapshot > 0.0:
+								self._diag_max_snapshot_gap = max(
+									self._diag_max_snapshot_gap,
+									received_time - self._diag_last_snapshot)
+							self._diag_last_snapshot = received_time
+							self._diag_snapshots += 1
+							try:
+								bot_revision = int(message.get('bot_state_revision', -1))
+							except (TypeError, ValueError):
+								bot_revision = -1
+							if (bot_revision >= 0 and
+									bot_revision != self._diag_last_bot_revision):
+								if self._diag_last_bot_update > 0.0:
+									self._diag_max_bot_update_gap = max(
+										self._diag_max_bot_update_gap,
+										received_time - self._diag_last_bot_update)
+								self._diag_last_bot_update = received_time
+								self._diag_last_bot_revision = bot_revision
+								self._diag_bot_updates += 1
+						self._diag_max_pending = max(
+							self._diag_max_pending, len(self._pending))
 		except Exception as error:
 			if not self._stop_requested:
 				self._last_error = str(error)
@@ -507,6 +552,55 @@ class LANClient(object):
 		except Exception:
 			self._poll_scheduled = False
 
+	def _reset_transport_diagnostics(self, now=None):
+		now = time.time() if now is None else float(now)
+		with self._pending_lock:
+			self._diag_window_start = now
+			self._diag_chunks = 0
+			self._diag_messages = 0
+			self._diag_snapshots = 0
+			self._diag_bot_updates = 0
+			self._diag_last_chunk = 0.0
+			self._diag_last_snapshot = 0.0
+			self._diag_last_bot_update = 0.0
+			self._diag_last_bot_revision = -1
+			self._diag_max_socket_gap = 0.0
+			self._diag_max_snapshot_gap = 0.0
+			self._diag_max_bot_update_gap = 0.0
+			self._diag_max_queue_age = 0.0
+			self._diag_max_pending = 0
+
+	def _transport_diagnostic_snapshot(self, now=None, minimum_window=5.0):
+		"""Return one bounded transport summary and reset its rolling counters."""
+		now = time.time() if now is None else float(now)
+		with self._pending_lock:
+			window = max(0.0, now - self._diag_window_start)
+			if window < float(minimum_window):
+				return None
+			result = {
+				'window': window,
+				'chunks': self._diag_chunks,
+				'messages': self._diag_messages,
+				'snapshots': self._diag_snapshots,
+				'bot_updates': self._diag_bot_updates,
+				'max_socket_gap': self._diag_max_socket_gap,
+				'max_snapshot_gap': self._diag_max_snapshot_gap,
+				'max_bot_update_gap': self._diag_max_bot_update_gap,
+				'max_queue_age': self._diag_max_queue_age,
+				'max_pending': self._diag_max_pending,
+			}
+			self._diag_window_start = now
+			self._diag_chunks = 0
+			self._diag_messages = 0
+			self._diag_snapshots = 0
+			self._diag_bot_updates = 0
+			self._diag_max_socket_gap = 0.0
+			self._diag_max_snapshot_gap = 0.0
+			self._diag_max_bot_update_gap = 0.0
+			self._diag_max_queue_age = 0.0
+			self._diag_max_pending = len(self._pending)
+			return result
+
 	def _poll(self):
 		self._poll_scheduled = False
 		now = time.time()
@@ -519,6 +613,12 @@ class LANClient(object):
 			if self._pending:
 				messages = self._pending
 				self._pending = []
+			for message in messages:
+				if isinstance(message, dict):
+					received_time = _finite_float(
+						message.get('_client_received_time'), now)
+					self._diag_max_queue_age = max(
+						self._diag_max_queue_age, now - received_time)
 		# Snapshots are level-triggered.  If the game thread was busy loading a
 		# remote tank, applying every stale 30 Hz snapshot would create an
 		# unbounded queue and make the visual state increasingly lag behind.
@@ -557,6 +657,25 @@ class LANClient(object):
 				self._handle_message(message)
 			except Exception:
 				LOG_ERROR('LAN client message error:', repr(message))
+		if self.phase == 'battle':
+			diagnostic = self._transport_diagnostic_snapshot(now)
+			if diagnostic is not None:
+				window = max(0.001, diagnostic['window'])
+				LOG_NOTE(
+					'LAN NET window=%.1fs chunks=%.1f/s messages=%.1f/s snapshots=%.1f/s '
+					'bot_updates=%.1f/s max_socket_gap=%dms max_snapshot_gap=%dms '
+					'max_bot_gap=%dms max_queue_age=%dms '
+					'max_pending=%d rtt=%s' % (
+						diagnostic['window'], diagnostic['chunks'] / window,
+						diagnostic['messages'] / window,
+						diagnostic['snapshots'] / window,
+						diagnostic['bot_updates'] / window,
+						int(round(diagnostic['max_socket_gap'] * 1000.0)),
+						int(round(diagnostic['max_snapshot_gap'] * 1000.0)),
+						int(round(diagnostic['max_bot_update_gap'] * 1000.0)),
+						int(round(diagnostic['max_queue_age'] * 1000.0)),
+						diagnostic['max_pending'],
+						'pending' if self.rtt_ms is None else '%dms' % int(round(self.rtt_ms))))
 		if self._last_error and not self._error_notified:
 			self._error_notified = True
 			_system_message('LAN connection error: %s' % self._last_error, 'error')
@@ -627,6 +746,7 @@ class LANClient(object):
 				return
 			self.battle_started = True
 			self.phase = 'battle'
+			self._reset_transport_diagnostics()
 			self.map_name = message.get('map') or self.map_name
 			self.round_id = message.get('round_id', self.round_id)
 			self.player._offhangar_network_map_name = self.map_name

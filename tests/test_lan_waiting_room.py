@@ -198,6 +198,7 @@ class WaitingRoomTest(unittest.TestCase):
         snapshot = second.receive_type("snapshot")
         shared_bot = snapshot["bots"][0]
         self.assertEqual(first_welcome["player_id"], snapshot["bot_authority_id"])
+        self.assertGreater(snapshot["bot_state_revision"], 0)
         self.assertEqual("germany:PzIV", shared_bot["vehicle"])
         self.assertEqual(4.0, shared_bot["x"])
         self.assertEqual(375, shared_bot["health"])

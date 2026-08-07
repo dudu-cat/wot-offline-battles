@@ -181,6 +181,7 @@ class BattleState:
         self.bot_authority_id = None
         self.bot_manifest = []
         self.bot_states = {}
+        self.bot_state_revision = 0
         self.bot_planner = BotPlanner()
         self.bot_orders = {"revision": 0, "orders": []}
         self.bot_reported_hits = set()
@@ -350,6 +351,7 @@ class BattleState:
                 self.bot_authority_id = None
                 self.bot_manifest = []
                 self.bot_states = {}
+                self.bot_state_revision = 0
                 self.bot_planner.reset()
                 self.bot_orders = {"revision": 0, "orders": []}
                 self.bot_reported_hits = set()
@@ -748,6 +750,8 @@ class BattleState:
                         "shell_index": int(updated.get("shell_index", 0)),
                     })
                 changed = True
+            if changed:
+                self.bot_state_revision += 1
             return changed
 
     def report_bot_hit(self, player_id, message):
@@ -1024,6 +1028,7 @@ class BattleState:
                 "bot_authority_id": self.bot_authority_id,
                 "players": [self._public_player(p) for p in self.players.values() if p.connected],
                 "bots": [self.bot_states[key] for key in sorted(self.bot_states)],
+                "bot_state_revision": self.bot_state_revision,
                 "bot_order_revision": self.bot_orders["revision"],
                 "rules": self.rules_state,
                 "battle_result": self.battle_result,

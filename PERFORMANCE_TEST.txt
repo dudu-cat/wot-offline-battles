@@ -29,6 +29,7 @@ separates local bot simulation cost from rendering and network interpolation.
 Send the complete python.log, or only lines containing:
 
     [OFFHANGAR] [NOTE] PERF
+    [OFFHANGAR] [NOTE] LAN NET
 
 Metric guide
 ------------
@@ -53,8 +54,12 @@ nav_target        Local route target selection.
 network_smoothing Remote state interpolation.
 network_publish   Authority state publication.
 
+LAN NET separates transport and scheduling stalls. max_socket_gap is a real
+receive pause; max_queue_age means the packet arrived but the game thread was
+late applying it. snapshots is the server stream rate, and bot_updates is the
+authority's actual new-pose rate.
+
 Times are milliseconds per sampled frame. The value after '/' is the average
 call count per sampled frame. Some stages are intentionally nested: driver
 includes direction, and physics includes terrain and collision work. Do not
 add the stage times together; use callback as the total.
-

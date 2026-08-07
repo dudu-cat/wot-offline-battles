@@ -74,6 +74,12 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         self.assertIn("PERF window=%.1fs role=%s bots=%d fps=%.1f", source)
         self.assertIn("_OFFH_PERF_REPORT_SECONDS = 5.0", source)
 
+    def test_capture_rules_do_not_log_every_vehicle_distance_tick(self):
+        source = SOURCE.read_text()
+
+        self.assertNotIn("LOUD: Capture tick started running!", source)
+        self.assertNotIn("LOUD: Distance to base", source)
+
     def test_profiler_emits_one_compact_note_after_five_seconds(self):
         fake_time = FakeTime()
         profiler = load_profiler(fake_time)

@@ -1121,6 +1121,32 @@ class LANClientQueueTest(unittest.TestCase):
 
         self.assertAlmostEqual(25.0, client.rtt_ms, places=3)
 
+    def test_transport_diagnostics_report_socket_and_game_queue_delays_separately(self):
+        player = Player()
+        client = self.network.LANClient(player, "127.0.0.1", 28782, "Alpha", "ussr:T-34")
+        client._diag_window_start = 10.0
+        client._diag_chunks = 50
+        client._diag_messages = 120
+        client._diag_snapshots = 95
+        client._diag_bot_updates = 62
+        client._diag_max_socket_gap = 0.08
+        client._diag_max_snapshot_gap = 0.12
+        client._diag_max_bot_update_gap = 0.19
+        client._diag_max_queue_age = 0.9
+        client._diag_max_pending = 17
+
+        diagnostic = client._transport_diagnostic_snapshot(now=15.0)
+
+        self.assertEqual(50, diagnostic["chunks"])
+        self.assertEqual(95, diagnostic["snapshots"])
+        self.assertEqual(62, diagnostic["bot_updates"])
+        self.assertAlmostEqual(0.08, diagnostic["max_socket_gap"])
+        self.assertAlmostEqual(0.19, diagnostic["max_bot_update_gap"])
+        self.assertAlmostEqual(0.9, diagnostic["max_queue_age"])
+        self.assertEqual(17, diagnostic["max_pending"])
+        self.assertEqual(0, client._diag_chunks)
+        self.assertIsNone(client._transport_diagnostic_snapshot(now=16.0))
+
     def test_shared_bot_death_uses_relayed_bot_killer(self):
         player = Player()
         player._offhangar_network_is_authority = True
