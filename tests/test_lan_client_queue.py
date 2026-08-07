@@ -156,7 +156,7 @@ class LANClientQueueTest(unittest.TestCase):
             self.network.socket.socket = original_socket
 
         self.assertEqual("hello", sent[0]["type"])
-        self.assertEqual(5, sent[0]["protocol"])
+        self.assertEqual(self.network.PROTOCOL_VERSION, sent[0]["protocol"])
         self.assertEqual("china:Ch01_Type59", sent[0]["vehicle"])
 
     def test_start_button_does_not_replace_battle_join(self):
@@ -1153,6 +1153,43 @@ class LANClientQueueTest(unittest.TestCase):
         })
 
         self.assertAlmostEqual(25.0, client.rtt_ms, places=3)
+
+    def test_server_timing_uses_network_receive_time_and_half_rtt(self):
+        player = Player()
+        client = self.network.LANClient(player, "127.0.0.1", 28782, "Alpha", "ussr:T-34")
+        client.rtt_ms = 40.0
+
+        loaded = client._load_server_timing({
+            "_client_received_time": 100.0,
+            "timing": {
+                "phase": "prebattle",
+                "start_in_ms": 25000,
+                "remaining_ms": 900000,
+                "duration_ms": 900000,
+            },
+        })
+
+        self.assertTrue(loaded)
+        self.assertAlmostEqual(124.98, client.combat_deadline, places=3)
+        self.assertAlmostEqual(1024.98, client.combat_end_deadline, places=3)
+        self.assertEqual(client.combat_deadline, player._offhangar_network_combat_deadline)
+
+    def test_battle_snapshot_corrects_the_shared_end_deadline(self):
+        player = Player()
+        client = self.network.LANClient(player, "127.0.0.1", 28782, "Alpha", "ussr:T-34")
+
+        client._load_server_timing({
+            "_client_received_time": 200.0,
+            "timing": {
+                "phase": "battle",
+                "start_in_ms": 0,
+                "remaining_ms": 750000,
+                "duration_ms": 900000,
+            },
+        })
+
+        self.assertEqual("battle", player._offhangar_network_combat_phase)
+        self.assertAlmostEqual(950.0, player._offhangar_network_combat_end_deadline)
 
     def test_transport_diagnostics_report_socket_and_game_queue_delays_separately(self):
         player = Player()

@@ -29,8 +29,10 @@ from typing import Dict, List, Optional, Tuple
 from server_bot_ai import BotPlanner
 
 
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 TICK_HZ = 30.0
+PREBATTLE_COUNTDOWN_SECONDS = 30.0
+BATTLE_DURATION_SECONDS = 900.0
 MAX_LINE_BYTES = 256 * 1024
 DEFAULT_MAP = "server_random"
 MAP_POOL = (
@@ -179,6 +181,8 @@ class BattleState:
         self.running = True
         self.phase = "waiting"
         self.round_id = 1
+        self.combat_start_at = None
+        self.combat_end_at = None
         self.bot_roster = self._new_bot_roster()
         self.bot_authority_id = None
         self.bot_manifest = []
@@ -345,6 +349,8 @@ class BattleState:
             if not self.players and self.phase == "battle":
                 self.phase = "waiting"
                 self.round_id += 1
+                self.combat_start_at = None
+                self.combat_end_at = None
                 self.next_id = 1
                 self.next_balanced_team = random.choice((1, 2))
                 self.tick = 0
@@ -410,6 +416,9 @@ class BattleState:
                 self.map_name = requested_map
             connected = [p for p in self.players.values() if p.connected]
             self.phase = "battle"
+            timing_now = time.monotonic()
+            self.combat_start_at = timing_now + PREBATTLE_COUNTDOWN_SECONDS
+            self.combat_end_at = self.combat_start_at + BATTLE_DURATION_SECONDS
             self._elect_bot_authority()
             return {
                 "type": "battle_start",
@@ -418,6 +427,7 @@ class BattleState:
                 "map": self.map_name,
                 "requested_by": player_id,
                 "delay": 0.75,
+                "timing": self._timing_payload(timing_now),
                 "players": [self._public_player(p) for p in connected],
                 "bots": list(self.bot_roster),
                 "bot_authority_id": self.bot_authority_id,
@@ -441,6 +451,7 @@ class BattleState:
                 "requested_by": 0,
                 "delay": 0.75,
                 "late_join": True,
+                "timing": self._timing_payload(),
                 "players": [self._public_player(p) for p in connected],
                 "bots": list(self.bot_roster),
                 "bot_authority_id": self.bot_authority_id,
@@ -450,6 +461,31 @@ class BattleState:
                 "rules": self.rules_state,
                 "battle_result": self.battle_result,
             }
+
+    def _timing_payload(self, now=None):
+        """Return server-authoritative phase time as relative milliseconds."""
+        if now is None:
+            now = time.monotonic()
+        if self.combat_start_at is None or self.combat_end_at is None:
+            return {
+                "phase": "loading",
+                "start_in_ms": 0,
+                "remaining_ms": int(BATTLE_DURATION_SECONDS * 1000.0),
+                "duration_ms": int(BATTLE_DURATION_SECONDS * 1000.0),
+            }
+        if self.battle_result is not None or now >= self.combat_end_at:
+            phase = "finished"
+        elif now < self.combat_start_at:
+            phase = "prebattle"
+        else:
+            phase = "battle"
+        return {
+            "phase": phase,
+            "start_in_ms": max(0, int((self.combat_start_at - now) * 1000.0)),
+            "remaining_ms": max(0, int((self.combat_end_at - max(
+                now, self.combat_start_at)) * 1000.0)),
+            "duration_ms": int(BATTLE_DURATION_SECONDS * 1000.0),
+        }
 
     def acknowledge_bot_orders(self, player_id, message):
         """Record application-level delivery, not merely a successful TCP write."""
@@ -1065,6 +1101,7 @@ class BattleState:
                 "bot_order_revision": self.bot_orders["revision"],
                 "rules": self.rules_state,
                 "battle_result": self.battle_result,
+                "timing": self._timing_payload(now),
             }
             recipients = list(self.players.values())
             authority = self.players.get(self.bot_authority_id)
@@ -1372,11 +1409,13 @@ class ClientHandler(socketserver.BaseRequestHandler):
                             })
                             _server_log("START denied for id=%d: %s" % (player.player_id, start_error))
                         else:
-                            _server_log("BATTLE START round=%d map=%s players=%d requested_by=%s" % (
+                            _server_log("BATTLE START round=%d map=%s players=%d requested_by=%s countdown=%.0fs duration=%.0fs" % (
                                 start_message["round_id"],
                                 start_message["map"],
                                 len(start_message["players"]),
                                 player.name,
+                                PREBATTLE_COUNTDOWN_SECONDS,
+                                BATTLE_DURATION_SECONDS,
                             ))
                             server.state.broadcast(start_message)
                     elif message.get("type") == "ping":

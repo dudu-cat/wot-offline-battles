@@ -71,7 +71,7 @@ With normal logging settings, each client writes these milestones to
 ```text
 LAN connecting to 192.168.1.20:28782
 LAN TCP connected to 192.168.1.20:28782
-LAN hello sent (protocol 5)
+LAN hello sent (protocol 6)
 LAN welcome id=1 name=Player-158 vehicle=china:Type_59 team=1 slot=0 map=... phase=waiting
 LAN JOIN confirmed; queue screen is now server-backed
 LAN queue UI updated: 2 connected player(s)
@@ -166,8 +166,12 @@ map list; the clicked waiting-room selection is authoritative for the round.
 ## Current protocol boundary
 
 The server speaks a small newline-delimited JSON protocol, not the original
-Wargaming/BigWorld server protocol. Protocol v5 has one waiting room per server
-process and a server-authoritative `battle_start` barrier. It synchronizes
+Wargaming/BigWorld server protocol. Protocol v6 has one waiting room per server
+process and a server-authoritative `battle_start` barrier. The server fixes one
+30-second combat deadline and continuously includes remaining battle time in
+the 30 Hz snapshots. Each client stays on its loading page until its local tank
+resources are ready, then joins the remaining shared countdown instead of
+starting a new local timer. It synchronizes
 player identity, selected vehicle, opposing team, position, hull/turret aim,
 shell selection, firing, impact outcome, health and death.
 The firing client reuses the existing 0.8.2 map collision, shell and armor

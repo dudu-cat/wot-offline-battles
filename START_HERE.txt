@@ -53,7 +53,7 @@ JOIN THE SAME LAN BATTLE
 5. Confirm one JOIN line per client in the server window.
 6. In the waiting room, choose a map and click START BATTLE.
 
-Every client and the server must come from this same protocol-5 package.
+Every client and the server must come from this same protocol-6 package.
 
 
 IF SOMETHING DOES NOT LOAD

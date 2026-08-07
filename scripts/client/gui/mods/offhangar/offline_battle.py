@@ -1523,7 +1523,9 @@ _OFFH_PLAYER_BATTLE_ATTRS = (
 	'onDamageIconButtonPressed', 'shoot', 'terrainEffects',
 	'_autoaim_target', '_outlined_bot',
 	'_offh_vehicle_descriptors', '_offh_auto_spawn_expected',
-	'_offh_auto_spawn_completed',
+	'_offh_auto_spawn_completed', '_offh_auto_spawn_prepared',
+	'_offh_sticker_warmup_queue', '_offh_sticker_warmup_active',
+	'_offh_loading_wait_logged', '_offh_loading_ready_logged',
 )
 
 
@@ -4629,41 +4631,94 @@ def play_network_hit_feedback(player, attacker_mock, target_mock, hit_pos,
 		return False
 
 
-def _target_sticker_map(target_mock):
+def _offh_prepare_sticker_component(target_mock, component_name):
+	"""Create one native damage-sticker attachment for a completed bot model."""
+	if target_mock is None or getattr(target_mock, 'typeDescriptor', None) is None:
+		return False
+	sticker_map = getattr(target_mock, '_sticker_map', None)
+	if not isinstance(sticker_map, dict):
+		sticker_map = {}
+		target_mock._sticker_map = sticker_map
+	if component_name in sticker_map:
+		return True
+	try:
+		if component_name == 'hull':
+			component_model = getattr(target_mock, '_hull_model', None)
+			chassis_model = getattr(target_mock, '_chassis_model', None)
+			component_node = chassis_model.node('V') if chassis_model is not None else None
+		elif component_name == 'turret':
+			component_model = getattr(target_mock, '_turret_model', None)
+			component_node = getattr(target_mock, '_t_node', None)
+		elif component_name == 'gun':
+			component_model = getattr(target_mock, '_gun_model', None)
+			component_node = getattr(target_mock, '_g_node', None)
+		else:
+			return False
+		if component_model is None or component_node is None:
+			return False
+		import VehicleStickers
+		stickers = VehicleStickers.VehicleStickers(
+			target_mock.typeDescriptor, [], component_name == 'hull', None)
+		stickers.attachStickers(component_model, component_node, False)
+		sticker_map[component_name] = (stickers, component_model, component_node)
+		return True
+	except Exception as error:
+		LOG_DEBUG('Bot sticker component setup error:', component_name, str(error))
+		return False
+
+
+def _offh_queue_sticker_warmup(player, target_mock):
+	"""Spread native sticker creation across loading/countdown frames."""
+	if player is None or target_mock is None:
+		return False
+	if getattr(target_mock, '_sticker_warmup_queued', False):
+		return True
+	target_mock._sticker_warmup_queued = True
+	queue = getattr(player, '_offh_sticker_warmup_queue', None)
+	if queue is None:
+		queue = []
+		player._offh_sticker_warmup_queue = queue
+	for component_name in ('hull', 'turret', 'gun'):
+		queue.append((target_mock, component_name))
+	if getattr(player, '_offh_sticker_warmup_active', False):
+		return True
+	player._offh_sticker_warmup_active = True
+
+	def _drain_one():
+		items = getattr(player, '_offh_sticker_warmup_queue', None) or []
+		if items:
+			target, component = items.pop(0)
+			_offh_prepare_sticker_component(target, component)
+			if not any(item[0] is target for item in items):
+				prepared = getattr(target, '_sticker_map', None) or {}
+				target._sticker_setup_done = all(
+					name in prepared for name in ('hull', 'turret', 'gun'))
+		if items:
+			# One native object per callback avoids the old multi-second main-thread
+			# cliff while still finishing well before a normal countdown expires.
+			_offh_battle_callback(0.03, _drain_one)
+			return
+		player._offh_sticker_warmup_active = False
+
+	_offh_battle_callback(0.0, _drain_one)
+	return True
+
+
+def _target_sticker_map(target_mock, component_name=None):
 	"""Resolve the per-component VehicleStickers map for ANY hit target,
 	uniformly for bots and the player, so decals work the same everywhere."""
 	m = getattr(target_mock, '_sticker_map', None)
-	if m:
+	if m and (component_name is None or component_name in m):
 		return m
-	# Creating three native VehicleStickers objects for every bot during model
-	# attachment caused long startup stalls. A decal is only needed after the
-	# first impact, so construct this bot's map lazily at that point.
+	# Normal battles create these incrementally during loading/countdown. Keep a
+	# one-component fallback for manually spawned bots or an unusually slow load.
 	if (target_mock is not None and
 			not getattr(target_mock, '_sticker_setup_done', False) and
 			getattr(target_mock, 'typeDescriptor', None) is not None):
-		target_mock._sticker_setup_done = True
-		try:
-			import VehicleStickers
-			setup = (
-				('hull', getattr(target_mock, '_hull_model', None),
-					getattr(target_mock, '_chassis_model', None).node('V')),
-				('turret', getattr(target_mock, '_turret_model', None),
-					getattr(target_mock, '_t_node', None)),
-				('gun', getattr(target_mock, '_gun_model', None),
-					getattr(target_mock, '_g_node', None)),
-			)
-			target_mock._sticker_map = {}
-			for comp_name, comp_model, comp_node in setup:
-				if comp_model is None or comp_node is None:
-					continue
-				stickers = VehicleStickers.VehicleStickers(
-					target_mock.typeDescriptor, [], comp_name == 'hull', None)
-				stickers.attachStickers(comp_model, comp_node, False)
-				target_mock._sticker_map[comp_name] = (
-					stickers, comp_model, comp_node)
-			m = target_mock._sticker_map
-		except Exception:
-			target_mock._sticker_map = {}
+		components = (component_name,) if component_name else ('hull', 'turret', 'gun')
+		for fallback_component in components:
+			_offh_prepare_sticker_component(target_mock, fallback_component)
+		m = getattr(target_mock, '_sticker_map', None)
 		if m:
 			return m
 	# The player's own tank keeps its sticker map on the player object.
@@ -6952,10 +7007,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				# Period progression is local presentation, but battle rules below are
 				# calculated only by the elected LAN authority.
 				if getattr(player.arena, 'period', 0) == 2 and BigWorld.serverTime() >= getattr(player.arena, 'periodEndTime', 0):
+					_remaining = _offh_server_battle_remaining(player, 900.0)
 					player.arena.period = 3
-					player.arena.periodLength = 900
-					player.arena.periodEndTime = BigWorld.serverTime() + 900
-					player.arena.onPeriodChange(3, player.arena.periodEndTime, 900, {})
+					player.arena.periodLength = _remaining
+					player.arena.periodEndTime = BigWorld.serverTime() + _remaining
+					player.arena.onPeriodChange(3, player.arena.periodEndTime, _remaining, {})
 					try:
 						from gui.mods.offhangar import battle_feedback as _offh_feedback_live
 						_offh_feedback_live.mark_started(
@@ -7041,10 +7097,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					if getattr(player.arena, 'period', 0) == 2 and BigWorld.serverTime() >= getattr(player.arena, 'periodEndTime', 0):
 						import gui.mods.offhangar.logging as __offlog
 						__offlog.LOG_DEBUG('LOUD: TRANSITION TO BATTLE PERIOD')
+						_remaining = _offh_server_battle_remaining(player, 900.0)
 						player.arena.period = 3
-						player.arena.periodLength = 900
-						player.arena.periodEndTime = BigWorld.serverTime() + 900
-						player.arena.onPeriodChange(3, player.arena.periodEndTime, 900, {}) # dict, not int: UI handlers call has_key() on it
+						player.arena.periodLength = _remaining
+						player.arena.periodEndTime = BigWorld.serverTime() + _remaining
+						player.arena.onPeriodChange(3, player.arena.periodEndTime, _remaining, {}) # dict, not int: UI handlers call has_key() on it
 
 					
 					import debug_utils
@@ -11367,7 +11424,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 														# Persistent shell-hole decal on the player's tank
 														_p_td = loaded_models.get('td')
 														_cn = _comp_name_from_hits(_p_td, hit_col[3] if len(hit_col) > 3 else [])
-														_add_impact_decal(_target_sticker_map(player_mock), _cn, _wpos, dir_v, _hit_res)
+														_add_impact_decal(_target_sticker_map(player_mock, _cn), _cn, _wpos, dir_v, _hit_res)
 													except Exception:
 														pass
 
@@ -11526,7 +11583,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 															_wpos = start_p + dir_v.scale(hit_col[0])
 															_play_vehicle_hit_effect(_shot['shell'], _wpos, dir_v, _hit_res, target_mock=hit_veh)
 															_cn = _comp_name_from_hits(getattr(hit_veh, 'typeDescriptor', None), hit_col[3] if len(hit_col) > 3 else [])
-															_add_impact_decal(_target_sticker_map(hit_veh), _cn, _wpos, dir_v, _hit_res)
+															_add_impact_decal(_target_sticker_map(hit_veh, _cn), _cn, _wpos, dir_v, _hit_res)
 														except Exception:
 															pass
 
@@ -14060,7 +14117,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_wpos = start_pos + dir_vec.scale(enemy_hit_info[0])
 									_play_vehicle_hit_effect(_shell, _wpos, dir_vec, _hit_res, target_mock=enemy_mock)
 									_cn = _comp_name_from_hits(getattr(enemy_mock, 'typeDescriptor', None), enemy_hit_info[3] if len(enemy_hit_info) > 3 else [])
-									_add_impact_decal(_target_sticker_map(enemy_mock), _cn, _wpos, dir_vec, _hit_res)
+									_add_impact_decal(_target_sticker_map(enemy_mock, _cn), _cn, _wpos, dir_vec, _hit_res)
 								except Exception:
 									pass
 							else:
@@ -15076,7 +15133,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										getattr(player, '_offhangar_network_pending_remote_ids', {}).pop(_network_server_id, None)
 									except Exception:
 										pass
-								if _network_bot_id is not None:
+								if _network_bot_slot is not None:
 									try:
 										player._offh_auto_spawn_completed = int(getattr(
 											player, '_offh_auto_spawn_completed', 0) or 0) + 1
@@ -15228,10 +15285,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							e_mock._t_mat = t_mat
 							# was a local only, so the barrel could never be elevated
 							e_mock._g_mat = g_mat
-							# Damage stickers are initialized lazily by _target_sticker_map on
-							# this bot's first impact instead of creating 3 native objects now.
+							# Build native damage-sticker objects one component per loading/countdown
+							# callback. First combat impact should only add a decal, not initialize
+							# three native attachments and visibly stall the frame.
 							e_mock._sticker_map = {}
 							e_mock._sticker_setup_done = False
+							_offh_queue_sticker_warmup(player, e_mock)
 							# Scrolling-track animation for the bot (original fashion system);
 							# attached slightly delayed so the model is in the world first
 							def _attach_bot_fashion(_bch=ch, _btd=td, _bm=e_mock):
@@ -15375,7 +15434,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									minimap.notifyVehicleStart(e_mock.id)
 							except Exception as e:
 								LOG_DEBUG('GUI Add error:', str(e))
-							if _network_bot_id is not None:
+							if _network_bot_slot is not None:
 								_offh_record_spawn_timing(player,
 									_spawn_requested_at - _spawn_entered_at,
 									_spawn_build_started - _spawn_requested_at,
@@ -15729,12 +15788,17 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						if _is_network and network_is_authority(_pl):
 							_manifest_jobs = []
 							from items import vehicles as _manifest_vehicles
+							_manifest_descriptors = {}
 							for _jt, _jslot, _jbid, _jx, _jz, _jyw, _jvn, _jname in _jobs:
 								if _jbid is None or not _jvn:
 									continue
-								_jtd = _manifest_vehicles.VehicleDescr(typeName=_jvn)
+								_jtd = _manifest_descriptors.get(_jvn)
+								if _jtd is None:
+									_jtd = _manifest_vehicles.VehicleDescr(typeName=_jvn)
+									_manifest_descriptors[_jvn] = _jtd
 								_manifest_jobs.append((_jbid, _jt, _jslot, _jvn, _jname,
 									_jtd.maxHealth, _jx, _jz, _jyw))
+							_pl._offh_vehicle_descriptors = _manifest_descriptors
 							publish_bot_manifest(_pl, _manifest_jobs)
 						elif _is_network:
 							_manifest = getattr(_pl, '_offhangar_network_bot_manifest', None) or []
@@ -15751,7 +15815,37 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					except Exception:
 						import traceback
 						LOG_DEBUG('LAN bot manifest setup failed:', traceback.format_exc())
-					
+
+					# Parse the exact shared lineup and acquire its collision resources before
+					# model callbacks begin. The authority used to do most of this while
+					# publishing the manifest, while replicas paid it one visible bot at a
+					# time; every client now follows the same per-battle preparation path.
+					try:
+						from items import vehicles as _lineup_vehicles
+						_lineup_started = time.time()
+						_lineup_descriptors = getattr(_pl, '_offh_vehicle_descriptors', None) or {}
+						_hit_tester_count = 0
+						_lineup_vehicle_names = [_lineup_job[6] for _lineup_job in _jobs]
+						for _lineup_human in (getattr(_pl, '_offhangar_network_roster', None) or []):
+							_lineup_vehicle_names.append(_lineup_human.get('vehicle'))
+						for _lineup_vehicle in _lineup_vehicle_names:
+							if not _lineup_vehicle:
+								continue
+							_lineup_vehicle = str(_lineup_vehicle)
+							_lineup_td = _lineup_descriptors.get(_lineup_vehicle)
+							if _lineup_td is None:
+								_lineup_td = _lineup_vehicles.VehicleDescr(typeName=_lineup_vehicle)
+								_lineup_descriptors[_lineup_vehicle] = _lineup_td
+							_hit_tester_count += _offh_load_hit_testers(_lineup_td)
+						_pl._offh_vehicle_descriptors = _lineup_descriptors
+						from gui.mods.offhangar.logging import LOG_NOTE as _LINEUP_NOTE
+						_LINEUP_NOTE('LAN lineup prepared: bots=%d unique_types=%d hit_testers=%d elapsed_ms=%d' % (
+							len(_jobs), len(_lineup_descriptors), _hit_tester_count,
+							int((time.time() - _lineup_started) * 1000.0)))
+					except Exception:
+						import traceback
+						LOG_DEBUG('LAN lineup preparation failed:', traceback.format_exc())
+
 					# Interleave the teams so both sides build up evenly
 					_t1 = [_j for _j in _jobs if _j[0] == 1]
 					_t2 = [_j for _j in _jobs if _j[0] == 2]
@@ -15762,6 +15856,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					try:
 						_pl._offh_auto_spawn_expected = len(_jobs)
 						_pl._offh_auto_spawn_completed = 0
+						_pl._offh_auto_spawn_prepared = True
 					except Exception:
 						pass
 					
@@ -16250,6 +16345,18 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				
 				def _finish_battle_load():
 					try:
+						if _network_mode_enabled() and not _offh_local_lineup_ready(player):
+							if not getattr(player, '_offh_loading_wait_logged', False):
+								player._offh_loading_wait_logged = True
+								from gui.mods.offhangar.logging import LOG_NOTE as _LOAD_NOTE
+								_LOAD_NOTE('LAN loading screen waiting for local bot resources')
+							_offh_battle_callback(0.1, _finish_battle_load)
+							return
+						if (getattr(player, '_offh_loading_wait_logged', False) and
+								not getattr(player, '_offh_loading_ready_logged', False)):
+							player._offh_loading_ready_logged = True
+							from gui.mods.offhangar.logging import LOG_NOTE as _READY_NOTE
+							_READY_NOTE('LAN local bot resources ready; opening battle view')
 						try:
 							import SoundGroups as _SG
 							if getattr(_SG, 'g_instance', None) is not None:
@@ -16332,14 +16439,27 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								if hasattr(player.arena, 'onPeriodChange'):
 									_battle_duration = 900
 
-									# RESTORE PREBATTLE: original-style countdown - nobody moves
-									# or shoots until it reaches 0 (see the period<3 guards)
+									# LAN clients join the one server countdown at whatever value remains
+									# after their own loading time. Offline mode keeps the configured local
+									# countdown. Movement/shooting remain gated by period < 3.
 									from _constants import CONFIG_OPTIONS as _CFG_PB
 									_pb_len = float(_CFG_PB.get('prebattle_countdown_seconds', 30.0))
-									player.arena.period = 2
-									player.arena.periodLength = _pb_len
-									player.arena.periodEndTime = BigWorld.serverTime() + _pb_len
-									player.arena.onPeriodChange(2, player.arena.periodEndTime, _pb_len, {})
+									_server_deadline = getattr(player, '_offhangar_network_combat_deadline', None)
+									if _network_mode_enabled() and _server_deadline is not None:
+										_pb_len = max(0.0, float(_server_deadline) - time.time())
+										from gui.mods.offhangar.logging import LOG_NOTE as _TIMING_NOTE
+										_TIMING_NOTE('LAN server countdown joined with %.1f second(s) remaining' % _pb_len)
+									if _pb_len > 0.05:
+										player.arena.period = 2
+										player.arena.periodLength = _pb_len
+										player.arena.periodEndTime = BigWorld.serverTime() + _pb_len
+										player.arena.onPeriodChange(2, player.arena.periodEndTime, _pb_len, {})
+									else:
+										_battle_duration = _offh_server_battle_remaining(player, _battle_duration)
+										player.arena.period = 3
+										player.arena.periodLength = _battle_duration
+										player.arena.periodEndTime = BigWorld.serverTime() + _battle_duration
+										player.arena.onPeriodChange(3, player.arena.periodEndTime, _battle_duration, {})
 									try:
 										import MusicController as _MC
 										_MC.g_musicController.play(_MC.MUSIC_EVENT_NONE)
@@ -16438,6 +16558,33 @@ def _network_mode_enabled():
 		return bool(CONFIG_OPTIONS.get('network_mode', False))
 	except Exception:
 		return False
+
+
+def _offh_server_battle_remaining(player, fallback=900.0):
+	"""Use the server's projected end deadline when LAN timing is available."""
+	try:
+		if _network_mode_enabled():
+			deadline = getattr(player, '_offhangar_network_combat_end_deadline', None)
+			if deadline is not None:
+				return max(0.1, float(deadline) - time.time())
+	except Exception:
+		pass
+	return max(0.1, float(fallback))
+
+
+def _offh_local_lineup_ready(player):
+	"""True after this client has built every shared bot and damage attachment."""
+	if player is None or not getattr(player, '_offh_auto_spawn_prepared', False):
+		return False
+	expected = int(getattr(player, '_offh_auto_spawn_expected', 0) or 0)
+	completed = int(getattr(player, '_offh_auto_spawn_completed', 0) or 0)
+	if completed < expected:
+		return False
+	if getattr(player, '_offhangar_network_pending_remote_ids', None):
+		return False
+	if getattr(player, '_offh_sticker_warmup_active', False):
+		return False
+	return not bool(getattr(player, '_offh_sticker_warmup_queue', None))
 
 
 def _show_waiting_queue(player):

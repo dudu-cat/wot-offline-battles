@@ -19,7 +19,7 @@ import BigWorld
 from gui.mods.offhangar.logging import LOG_DEBUG, LOG_ERROR, LOG_NOTE
 
 
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 POLL_INTERVAL = 1.0 / 60.0
 INPUT_INTERVAL = 1.0 / 30.0
 BOT_STATE_INTERVAL = 1.0 / 30.0
@@ -167,6 +167,9 @@ class LANClient(object):
 		self.waiting_count = 0
 		self.start_requested = False
 		self.battle_started = False
+		self.combat_deadline = None
+		self.combat_end_deadline = None
+		self.combat_duration = 900.0
 		self._send_lock = threading.Lock()
 		self._pending_lock = threading.Lock()
 		self._pending = []
@@ -682,6 +685,45 @@ class LANClient(object):
 		if self.running:
 			self._schedule_poll()
 
+	def _load_server_timing(self, message):
+		"""Project server-relative battle timing onto this client's receive clock."""
+		timing = message.get('timing') if isinstance(message, dict) else None
+		if not isinstance(timing, dict):
+			return False
+		received = _finite_float(message.get('_client_received_time'), time.time())
+		# Relative server time avoids requiring synchronized Windows/macOS clocks.
+		# Half the smoothed RTT approximates the packet's one-way transit time.
+		one_way = 0.0
+		if self.rtt_ms is not None:
+			one_way = max(0.0, min(0.25, float(self.rtt_ms) / 2000.0))
+		phase = str(timing.get('phase') or 'loading')
+		start_in = max(0.0, _finite_float(timing.get('start_in_ms'), 0.0) / 1000.0)
+		remaining = max(0.0, _finite_float(timing.get('remaining_ms'), 0.0) / 1000.0)
+		duration = max(1.0, _finite_float(timing.get('duration_ms'), 900000.0) / 1000.0)
+		if phase == 'prebattle':
+			projected_start = received + start_in - one_way
+			if self.combat_deadline is None or abs(self.combat_deadline - projected_start) > 0.25:
+				self.combat_deadline = projected_start
+			else:
+				self.combat_deadline = self.combat_deadline * 0.8 + projected_start * 0.2
+			projected_end = self.combat_deadline + duration
+		elif phase == 'battle':
+			if self.combat_deadline is None:
+				self.combat_deadline = received - one_way
+			projected_end = received + remaining - one_way
+		else:
+			projected_end = received - one_way
+		self.combat_duration = duration
+		if self.combat_end_deadline is None or abs(self.combat_end_deadline - projected_end) > 0.25:
+			self.combat_end_deadline = projected_end
+		else:
+			self.combat_end_deadline = self.combat_end_deadline * 0.8 + projected_end * 0.2
+		self.player._offhangar_network_combat_phase = phase
+		self.player._offhangar_network_combat_deadline = self.combat_deadline
+		self.player._offhangar_network_combat_end_deadline = self.combat_end_deadline
+		self.player._offhangar_network_combat_duration = self.combat_duration
+		return True
+
 	def _handle_message(self, message):
 		kind = message.get('type') if isinstance(message, dict) else None
 		if kind == 'welcome':
@@ -742,6 +784,7 @@ class LANClient(object):
 				LOG_NOTE('LAN waiting room: %d player(s); choose a map and click START BATTLE' % count)
 		elif kind == 'battle_start':
 			self._load_bot_orders(message)
+			self._load_server_timing(message)
 			if self.battle_started:
 				return
 			self.battle_started = True
@@ -786,6 +829,7 @@ class LANClient(object):
 				pass
 		elif kind == 'snapshot':
 			self._last_snapshot = time.time()
+			self._load_server_timing(message)
 			self._set_authority(message.get('bot_authority_id'))
 			self._load_bot_orders(message)
 			self.player._offhangar_network_snapshot = message
@@ -1000,6 +1044,10 @@ def start_for_player(player):
 	player._offhangar_network_is_authority = False
 	player._offhangar_network_bot_manifest = []
 	player._offhangar_network_result_applied = False
+	player._offhangar_network_combat_phase = 'loading'
+	player._offhangar_network_combat_deadline = None
+	player._offhangar_network_combat_end_deadline = None
+	player._offhangar_network_combat_duration = 900.0
 	client.start()
 	return client
 
@@ -1047,6 +1095,9 @@ def stop_for_player(player):
 		player._offhangar_network_authority_id = None
 		player._offhangar_network_is_authority = False
 		player._offhangar_network_bot_manifest = []
+		player._offhangar_network_combat_phase = None
+		player._offhangar_network_combat_deadline = None
+		player._offhangar_network_combat_end_deadline = None
 		player._offhangar_network_bot_orders = {}
 		player._offhangar_network_bot_order_revision = 0
 		player._offhangar_network_result_applied = False

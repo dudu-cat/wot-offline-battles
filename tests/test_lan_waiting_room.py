@@ -84,6 +84,16 @@ class WaitingRoomTest(unittest.TestCase):
         self.assertEqual("04_himmelsdorf", welcome["map"])
         self.assertEqual(welcome["map"], started["map"])
         self.assertEqual(1, len(started["players"]))
+        self.assertEqual("prebattle", started["timing"]["phase"])
+        self.assertGreaterEqual(started["timing"]["start_in_ms"], 29000)
+        self.assertEqual(900000, started["timing"]["duration_ms"])
+
+        self.state.tick_once(1.0 / TICK_HZ)
+        snapshot = client.receive_type("snapshot")
+        self.assertEqual("prebattle", snapshot["timing"]["phase"])
+        self.assertLessEqual(
+            snapshot["timing"]["start_in_ms"], started["timing"]["start_in_ms"]
+        )
 
     def test_first_player_side_can_start_on_team_two_and_remains_balanced(self):
         self.state.next_balanced_team = 2
@@ -291,6 +301,9 @@ class WaitingRoomTest(unittest.TestCase):
         self.assertEqual(first_welcome["map"], first_start["map"])
         self.assertEqual(first_start["map"], late_start["map"])
         self.assertEqual(2, len(late_start["players"]))
+        self.assertLessEqual(
+            late_start["timing"]["start_in_ms"], first_start["timing"]["start_in_ms"]
+        )
 
     def test_default_names_are_unique_and_vehicle_identity_is_preserved(self):
         first = self.connect("Defaultplayer")
