@@ -6638,6 +6638,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		# ONE source of physics laws + parameters for player AND bots:
 		# gui.mods.offhangar.physics (see its module docstring for units).
 		from gui.mods.offhangar import physics as _PHY
+		from gui.mods.offhangar import vehicle_collision as _VC
 		# Live tuning: config.json "physics_tuning" overrides the WG constants
 		# (cohesion, power, brake, slide thresholds...) - restart, no recompile.
 		# MUST run before derive_params so the new values reach the params.
@@ -6676,6 +6677,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		_phys_gravity        = _PHY.GRAVITY
 		_phys_brakeDecel     = _pparams['brakeDecel']
 		_phys_trackCenter    = _pparams['trackCenter']
+		# Collision contacts and reciprocal responses live for one rendered frame.
+		# A pair may be encountered first from either vehicle, but is solved once.
+		_tank_pair_seen = {}
+		_tank_pair_pending = {}
 		LOG_DEBUG('OfflineBattle.PHYSICS: mass=%.0f, power=%.0fW, fwd=%.1f m/s, bwd=%.1f m/s, rot=%.1f deg/s, terrain=(%.2f,%.2f,%.2f), friction=%.4f, brake=%.2f m/s2, halfGauge=%.2f' % (
 			_phys_mass, _phys_enginePowerW, _phys_speedFwd, _phys_speedBwd,
 			math.degrees(_phys_chassisRotSpd), _phys_terrainResist[0], _phys_terrainResist[1], _phys_terrainResist[2],
@@ -7267,6 +7272,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					dt = 0.016 # fallback to 60fps
 				_frame_dt = dt # real per-frame delta (dt is reused by the bot section below)
 				_perf_frame_started = _offh_perf_frame_begin(len(mock_vehicles or {}))
+				_tank_pair_seen.clear()
+				_tank_pair_pending.clear()
 
 				# --- One-time spawn correction once the terrain has streamed in ---
 				# The initial spawn runs before the space is loaded (all ground rays
@@ -7718,67 +7725,31 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					except Exception as e:
 						LOG_DEBUG('Collision damage error:', str(e))
 
-				def _tank_hull_dims(td):
-					# (half_width, front_len, back_len) from the hull hit-tester bbox.
-					# Cached per descriptor: this sits inside the per-frame tank-pair loop.
-					_c = globals().setdefault('g_offh_dims', {})
-					_k = id(td)
-					_v = _c.get(_k)
-					if _v is not None:
-						return _v
-					hw = 1.5; hlf = 3.5; hlb = 3.5
-					try:
-						if td is not None and hasattr(td, 'hull') and 'hitTester' in td.hull:
-							bbox = td.hull['hitTester'].bbox
-							hw = max(abs(bbox[0][0]), abs(bbox[1][0]))
-							hlb = abs(bbox[0][2])
-							hlf = abs(bbox[1][2])
-					except: pass
-					_v = (hw, hlf, hlb)
-					_c[_k] = _v
-					return _v
-
-				def _tank_circles(x, z, yaw, td):
-					# Approximate the rectangular hull by a chain of circles along the
-					# forward axis (circle radius = hull half-width). Cheap tank-vs-tank.
-					import math
-					hw, hlf, hlb = _tank_hull_dims(td)
-					r = hw if hw > 0.8 else 0.8
-					fx = math.sin(yaw); fz = math.cos(yaw)
-					start = -hlb + r
-					end = hlf - r
-					out = []
-					if end <= start:
-						out.append((x, z, r))
-						return out
-					n = int((end - start) / (r * 1.5))
-					if n < 1: n = 1
-					step = (end - start) / n
-					i = 0
-					while i <= n:
-						o = start + step * i
-						out.append((x + fx * o, z + fz * o, r))
-						i += 1
-					return out
-
 				def _tank_resolve(self_id, x, z, yaw, td, inv_self, svx, svz, y=None):
-					# Velocity-relative impulse (e=0) + Baumgarte push-apart vs every
-					# other living tank. (svx, svz) = self's world velocity. Returns
-					# (corr_x, corr_z, dvx, dvz): positional correction + velocity
-					# impulse for self's push velocity. Movement is NEVER blocked ->
-					# no deadlock; inverse-mass weighting shoves the lighter tank aside.
+					# Chassis OBB contact + inelastic impulse. Retail 0.8.2 sizes the
+					# rigid body from chassis['hitTester'], while the old reconstruction
+					# used the narrower hull and a chain of circles. That let tracks and
+					# corners visibly overlap. Each unordered pair is solved once per
+					# frame; the reciprocal response is queued for the other local body.
 					import BigWorld, math
 					_mv = globals().get('G_MOCK_VEHICLES', {}) or {}
 					_plobj = BigWorld.player()
 					_pid = getattr(_plobj, 'playerVehicleID', -1)
-					my_c = _tank_circles(x, z, yaw, td)
-					corr_x = 0.0; corr_z = 0.0; dvx = 0.0; dvz = 0.0
-					_SLOP = 0.02; _PCT = 0.4
+					_pending = _tank_pair_pending.pop(self_id, None)
+					if _pending is None:
+						corr_x = 0.0; corr_z = 0.0; dvx = 0.0; dvz = 0.0
+					else:
+						corr_x, corr_z, dvx, dvz = _pending
+					my_shape = _VC.chassis_shape(td)
+					my_radius = math.sqrt(my_shape[0] * my_shape[0] + my_shape[1] * my_shape[1])
 					for oid, ov in _mv.items():
 						if oid == self_id or ov is None:
 							continue
+						_pair = (min(self_id, oid), max(self_id, oid))
+						if _pair in _tank_pair_seen:
+							continue
 						if oid == _pid:
-							ox = veh_pos[0]; oz = veh_pos[2]; oyaw = veh_yaw[0]; otd = loaded_models.get('td'); inv_o = 1.0 / max(_phys_mass, 1.0)
+							ox = veh_pos[0]; oz = veh_pos[2]; oyaw = veh_yaw[0]; otd = loaded_models.get('td'); mass_o = max(_phys_mass, 1.0); inv_o = 1.0 / mass_o
 							oy = veh_pos[1]
 							ovx = math.sin(oyaw) * _veh_velocity[0] + (getattr(_plobj, '_push_x', 0.0) or 0.0)
 							ovz = math.cos(oyaw) * _veh_velocity[0] + (getattr(_plobj, '_push_z', 0.0) or 0.0)
@@ -7786,59 +7757,72 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							op = getattr(ov, 'position', None)
 							if op is None:
 								continue
-							ox = op.x; oz = op.z; oyaw = getattr(ov, 'yaw', 0.0); otd = getattr(ov, 'typeDescriptor', None); inv_o = 1.0 / 25000.0
+							ox = op.x; oz = op.z; oyaw = getattr(ov, 'yaw', 0.0); otd = getattr(ov, 'typeDescriptor', None)
+							_oparams = getattr(ov, '_phys_params', None)
+							if _oparams is None:
+								_oparams = _PHY.derive_params(otd)
+								ov._phys_params = _oparams
+							mass_o = max(float(_oparams.get('mass', 25000.0)), 1.0)
+							inv_o = 1.0 / mass_o
 							oy = op.y
 							_ovv = getattr(ov, '_veh_velocity', 0.0) or 0.0
 							ovx = math.sin(oyaw) * _ovv + (getattr(ov, '_push_x', 0.0) or 0.0)
 							ovz = math.cos(oyaw) * _ovv + (getattr(ov, '_push_z', 0.0) or 0.0)
-						# Height gate: the circles are 2D, so a hull FALLING past a tank
-						# (cliff drop next to it) collided in x/z despite metres of air
-						# between them - phantom rams and corrections mid-flight, and a
-						# flipped push normal on touchdown that ejected the hull through
-						# the other tank ('glitched through after the fall').
-						if y is not None and abs(y - oy) > 3.0:
+						# Network replicas are observations, not locally simulated bodies.
+						# Correct the local vehicle against them without moving a snapshot
+						# that the smoother would immediately put back (visible jitter).
+						if getattr(ov, '_network_remote', False):
+							inv_o = 0.0
+						elif getattr(ov, '_network_shared_bot', False):
+							try:
+								from gui.mods.offhangar.network_battle import network_is_authority
+								if not network_is_authority(_plobj):
+									inv_o = 0.0
+							except Exception:
+								inv_o = 0.0
+						o_shape = _VC.chassis_shape(otd)
+						if not _VC.vertical_overlap(y, my_shape, oy, o_shape):
 							continue
 						dcx = x - ox; dcz = z - oz
-						if dcx * dcx + dcz * dcz > 144.0:
+						o_radius = math.sqrt(o_shape[0] * o_shape[0] + o_shape[1] * o_shape[1])
+						_max_dist = my_radius + o_radius + 0.25
+						if dcx * dcx + dcz * dcz > _max_dist * _max_dist:
 							continue
-						_isum = inv_self + inv_o
-						if _isum <= 0.0:
+						_contact = _VC.obb_contact(x, z, yaw, my_shape, ox, oz, oyaw, o_shape)
+						if _contact is None:
 							continue
-						_best = 0.0; _bnx = 0.0; _bnz = 0.0
-						_ocl = _tank_circles(ox, oz, oyaw, otd)  # hoisted: was rebuilt per self-circle
-						for _cc in my_c:
-							for _oc in _ocl:
-								ddx = _cc[0] - _oc[0]; ddz = _cc[1] - _oc[1]
-								rr = _cc[2] + _oc[2]
-								_d2 = ddx * ddx + ddz * ddz
-								if _d2 < rr * rr and _d2 > 1e-06:
-									_dist = math.sqrt(_d2)
-									_pen = rr - _dist
-									if _pen > _best:
-										_best = _pen; _bnx = ddx / _dist; _bnz = ddz / _dist
-						if _best > 0.0:
-							_corr = max(_best - _SLOP, 0.0) / _isum * _PCT * inv_self
-							corr_x += _bnx * _corr; corr_z += _bnz * _corr
-							_vn = (svx - ovx) * _bnx + (svz - ovz) * _bnz
-							if _vn < 0.0:
-								_j = -_vn / _isum
-								dvx += _j * inv_self * _bnx; dvz += _j * inv_self * _bnz
-								# Ram damage (ported): approach speed beyond 3.5 m/s hurts both hulls
-								if _vn < -3.5:
-									_now = BigWorld.time()
-									_rcd = globals().setdefault('g_offh_ram_cd', {})
-									_rkey = (min(self_id, oid), max(self_id, oid))
-									if _now - _rcd.get(_rkey, 0.0) > 0.75:
-										_rcd[_rkey] = _now
-										_rel = -_vn
-										# physics.ram_damage: mass-ratio weighted, same law everywhere
-										_dmo, _dms = _PHY.ram_damage(_rel, 1.0 / max(inv_self, 1e-09), 1.0 / max(inv_o, 1e-09))
-										_rsv = _mv.get(self_id)
-										if _dmo > 0:
-											_collision_damage(ov, _dmo, self_id)
-										if _dms > 0 and _rsv is not None:
-											_collision_damage(_rsv, _dms, oid)
-										LOG_DEBUG('RAM:', self_id, '<->', oid, 'rel=%.1f' % _rel, 'dmg', _dmo, _dms)
+						_tank_pair_seen[_pair] = True
+						_response = _VC.pair_response(
+							_contact, inv_self, inv_o, (svx, svz), (ovx, ovz))
+						corr_x += _response[0]; corr_z += _response[1]
+						dvx += _response[2]; dvz += _response[3]
+						if inv_o > 0.0:
+							_old_pending = _tank_pair_pending.get(oid)
+							if _old_pending is None:
+								_tank_pair_pending[oid] = _response[4:8]
+							else:
+								_tank_pair_pending[oid] = tuple(
+									_old_pending[_pi] + _response[4 + _pi] for _pi in range(4))
+						_vn = ((svx - ovx) * _contact[0] +
+						       (svz - ovz) * _contact[1])
+						if _vn < 0.0:
+							# Ram damage (ported): approach speed beyond 3.5 m/s hurts both hulls
+							if _vn < -3.5:
+								_now = BigWorld.time()
+								_rcd = globals().setdefault('g_offh_ram_cd', {})
+								_rkey = (min(self_id, oid), max(self_id, oid))
+								if _now - _rcd.get(_rkey, 0.0) > 0.75:
+									_rcd[_rkey] = _now
+									_rel = -_vn
+									# physics.ram_damage uses real descriptor masses even when the
+									# other body is a locally static network snapshot.
+									_dmo, _dms = _PHY.ram_damage(_rel, 1.0 / max(inv_self, 1e-09), mass_o)
+									_rsv = _mv.get(self_id)
+									if _dmo > 0:
+										_collision_damage(ov, _dmo, self_id)
+									if _dms > 0 and _rsv is not None:
+										_collision_damage(_rsv, _dms, oid)
+									LOG_DEBUG('RAM:', self_id, '<->', oid, 'rel=%.1f' % _rel, 'dmg', _dmo, _dms)
 					return (corr_x, corr_z, dvx, dvz)
 
 				def _drive_pitch(spaceID, x, z, yaw, y):
@@ -10500,8 +10484,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									if p: p.value = cur_speed / bot_speedFwd
 							except Exception as _e: pass
 							
-							# COLLISION - always checked when moving
-							if m_veh._veh_velocity != 0.0:
+							# Static tanks still participate: a moving neighbour may have queued
+							# their reciprocal correction earlier in this frame. Wall/tree probes
+							# below remain speed-gated, so this adds only the cheap OBB pass.
+							if getattr(m_veh, 'isAlive', False):
 								_hit_wall = False
 								m_veh._cw_fc = (getattr(m_veh, '_cw_fc', 0) or 0) + 1
 								if abs(m_veh._veh_velocity) > 0.5:

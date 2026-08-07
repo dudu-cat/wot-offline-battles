@@ -118,7 +118,7 @@ def _safe_import_offhangar():
 	#   paths/utils <- logging ; paths <- _constants ; paths/logging <- state ;
 	#   offline_battle_stack <- offline_battle ; data/router/battle/session guards
 	#   <- command_handlers ; command_router <- server
-	submodules = ['paths', 'utils', 'logging', '_constants', 'physics', 'physics_monitor',
+	submodules = ['paths', 'utils', 'logging', '_constants', 'physics', 'vehicle_collision', 'physics_monitor',
 	              'bot_ai_maps_group_a', 'bot_ai_maps_group_b', 'bot_ai_maps_group_c',
 	              'bot_ai_maps_extra',
 	              'bot_ai_maps', 'bot_ai', 'prebaked_navigation', 'battle_feedback',
