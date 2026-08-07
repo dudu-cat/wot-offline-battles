@@ -169,9 +169,11 @@ The server speaks a small newline-delimited JSON protocol, not the original
 Wargaming/BigWorld server protocol. Protocol v6 has one waiting room per server
 process and a server-authoritative `battle_start` barrier. The server fixes one
 30-second combat deadline and continuously includes remaining battle time in
-the 30 Hz snapshots. Each client stays on its loading page until its local tank
-resources are ready, then joins the remaining shared countdown instead of
-starting a new local timer. It synchronizes
+the 30 Hz snapshots. Each client closes the normal loading page on its own and
+joins the remaining shared countdown instead of starting a new local timer.
+The exact lineup descriptors and collision resources are prepared behind that
+loading page; native bot entities are then staged while the countdown is
+visible, without holding the client on `Awaiting players`. It synchronizes
 player identity, selected vehicle, opposing team, position, hull/turret aim,
 shell selection, firing, impact outcome, health and death.
 The firing client reuses the existing 0.8.2 map collision, shell and armor

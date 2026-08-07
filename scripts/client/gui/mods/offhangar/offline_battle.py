@@ -1523,9 +1523,8 @@ _OFFH_PLAYER_BATTLE_ATTRS = (
 	'onDamageIconButtonPressed', 'shoot', 'terrainEffects',
 	'_autoaim_target', '_outlined_bot',
 	'_offh_vehicle_descriptors', '_offh_auto_spawn_expected',
-	'_offh_auto_spawn_completed', '_offh_auto_spawn_prepared',
+	'_offh_auto_spawn_completed',
 	'_offh_sticker_warmup_queue', '_offh_sticker_warmup_active',
-	'_offh_loading_wait_logged', '_offh_loading_ready_logged',
 )
 
 
@@ -15528,7 +15527,16 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			except Exception:
 				pass
 
-			def _auto_spawn_teams(_spawn_gen=_offh_my_gen[0]):
+			try:
+				from _constants import CONFIG_OPTIONS as _CFG_AS_EARLY
+				_auto_spawn_delay = max(0.0, float(
+					_CFG_AS_EARLY.get('auto_spawn_delay_seconds', 10.0)))
+			except Exception:
+				_auto_spawn_delay = 10.0
+			_auto_spawn_not_before = time.time() + _auto_spawn_delay
+
+			def _auto_spawn_teams(_spawn_gen=_offh_my_gen[0],
+					_spawn_not_before=_auto_spawn_not_before):
 				if globals().get('g_offh_battle_gen', 0) != _spawn_gen:
 					return
 				import BigWorld, Keys, Math, math
@@ -15540,6 +15548,17 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					_n_per_team = int(_CFG.get('bots_per_team', 15))
 					if _n_per_team <= 0:
 						return
+					# Replicas can be called before the authority has published the shared
+					# lineup. Retry cheaply instead of rebuilding a throw-away local match.
+					try:
+						from gui.mods.offhangar.network_battle import network_is_authority
+						if (bool(_CFG.get('network_mode', False)) and
+								not network_is_authority(_pl) and
+								not (getattr(_pl, '_offhangar_network_bot_manifest', None) or [])):
+							_offh_battle_callback(0.25, _auto_spawn_teams)
+							return
+					except Exception:
+						pass
 					_spawns = dict(globals().get('g_offline_spawns', {}) or {})
 					_bases = globals().get('g_offline_bases', {}) or {}
 					_p_team = getattr(_pl, '_offhangar_team', 1) or 1
@@ -15856,7 +15875,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					try:
 						_pl._offh_auto_spawn_expected = len(_jobs)
 						_pl._offh_auto_spawn_completed = 0
-						_pl._offh_auto_spawn_prepared = True
 					except Exception:
 						pass
 					
@@ -15948,11 +15966,27 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							LOG_DEBUG('AUTO-SPAWN error:', str(_se))
 						_offh_battle_callback(0.3, lambda: _spawn_next(_rest[1:]))
 					
-					LOG_DEBUG('AUTO-SPAWN: placing %d bots (%d per team incl. player)' % (len(_jobs), _n_per_team))
-					# fresh occupancy list per battle - a stale one would nudge every new spawn
-					try: BigWorld.player()._offh_spawn_taken = []
-					except Exception: pass
-					_spawn_next(_jobs)
+					def _begin_bot_placement(_prepared_jobs):
+						if (globals().get('g_offh_battle_gen', 0) != _offh_my_gen[0] or
+								_battle_finished[0]):
+							return
+						LOG_DEBUG('AUTO-SPAWN: placing %d bots (%d per team incl. player)' % (
+							len(_prepared_jobs), _n_per_team))
+						# Fresh occupancy list per battle - a stale one would nudge every new spawn.
+						try: BigWorld.player()._offh_spawn_taken = []
+						except Exception: pass
+						_spawn_next(_prepared_jobs)
+
+					# Descriptor and collision-resource preparation runs immediately behind
+					# the normal loading page. Native entities still wait for the original
+					# terrain-streaming deadline and are then staged during the countdown.
+					_place_delay = max(0.0, _spawn_not_before - time.time())
+					if _place_delay > 0.01:
+						LOG_DEBUG('AUTO-SPAWN: lineup ready; model placement starts in %.1fs' % _place_delay)
+						_offh_battle_callback(_place_delay,
+							lambda _prepared_jobs=list(_jobs): _begin_bot_placement(_prepared_jobs))
+					else:
+						_begin_bot_placement(_jobs)
 				except Exception:
 					import traceback
 					LOG_DEBUG('AUTO-SPAWN failed:', traceback.format_exc())
@@ -15960,10 +15994,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			try:
 				from _constants import CONFIG_OPTIONS as _CFG_AS
 				if int(_CFG_AS.get('bots_per_team', 15)) > 0:
-					# Give the terrain chunks time to stream in before lining up the teams
+					# Choose and parse the exact lineup while the normal loading page is up.
+					# _auto_spawn_teams keeps actual entity placement behind the configured
+					# terrain-streaming delay.
 					globals()['g_offh_auto_spawn_callback_id'] = BigWorld.callback(
-						float(_CFG_AS.get('auto_spawn_delay_seconds', 10.0)),
-						_auto_spawn_teams)
+						0.25, _auto_spawn_teams)
 			except Exception:
 				import traceback
 				LOG_DEBUG('AUTO-SPAWN schedule failed:', traceback.format_exc())
@@ -16345,18 +16380,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				
 				def _finish_battle_load():
 					try:
-						if _network_mode_enabled() and not _offh_local_lineup_ready(player):
-							if not getattr(player, '_offh_loading_wait_logged', False):
-								player._offh_loading_wait_logged = True
-								from gui.mods.offhangar.logging import LOG_NOTE as _LOAD_NOTE
-								_LOAD_NOTE('LAN loading screen waiting for local bot resources')
-							_offh_battle_callback(0.1, _finish_battle_load)
-							return
-						if (getattr(player, '_offh_loading_wait_logged', False) and
-								not getattr(player, '_offh_loading_ready_logged', False)):
-							player._offh_loading_ready_logged = True
-							from gui.mods.offhangar.logging import LOG_NOTE as _READY_NOTE
-							_READY_NOTE('LAN local bot resources ready; opening battle view')
 						try:
 							import SoundGroups as _SG
 							if getattr(_SG, 'g_instance', None) is not None:
@@ -16570,21 +16593,6 @@ def _offh_server_battle_remaining(player, fallback=900.0):
 	except Exception:
 		pass
 	return max(0.1, float(fallback))
-
-
-def _offh_local_lineup_ready(player):
-	"""True after this client has built every shared bot and damage attachment."""
-	if player is None or not getattr(player, '_offh_auto_spawn_prepared', False):
-		return False
-	expected = int(getattr(player, '_offh_auto_spawn_expected', 0) or 0)
-	completed = int(getattr(player, '_offh_auto_spawn_completed', 0) or 0)
-	if completed < expected:
-		return False
-	if getattr(player, '_offhangar_network_pending_remote_ids', None):
-		return False
-	if getattr(player, '_offh_sticker_warmup_active', False):
-		return False
-	return not bool(getattr(player, '_offh_sticker_warmup_queue', None))
 
 
 def _show_waiting_queue(player):

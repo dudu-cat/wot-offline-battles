@@ -44,8 +44,13 @@ class OfflineBattleFeedbackIntegrationTest(unittest.TestCase):
         self.assertIn("_offhangar_network_combat_deadline", self.battle_source)
         self.assertIn("_offh_server_battle_remaining(player, 900.0)", self.battle_source)
         self.assertIn("self._load_server_timing(message)", self.network_source)
-        self.assertIn("not _offh_local_lineup_ready(player)", self.battle_source)
-        self.assertIn("loading screen waiting for local bot resources", self.battle_source)
+
+    def test_lan_prepares_lineup_behind_loading_page_without_gating_countdown(self):
+        self.assertIn("_auto_spawn_not_before = time.time() + _auto_spawn_delay", self.battle_source)
+        self.assertIn("0.25, _auto_spawn_teams", self.battle_source)
+        self.assertIn("_place_delay = max(0.0, _spawn_not_before - time.time())", self.battle_source)
+        self.assertNotIn("_offh_local_lineup_ready", self.battle_source)
+        self.assertNotIn("loading screen waiting for local bot resources", self.battle_source)
 
     def test_forced_lineup_vehicle_skips_random_candidate_scan(self):
         forced = self.battle_source.index("if _fv:")
