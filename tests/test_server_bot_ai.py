@@ -60,6 +60,59 @@ class ServerBotPlannerTests(unittest.TestCase):
         }, identity, None)
 
         self.assertEqual(3, state["killer_bot_id"])
+        self.assertEqual("bot", state["killer_kind"])
+        self.assertEqual(3, state["killer_id"])
+
+    def test_human_killer_identity_survives_later_authority_state(self):
+        identity = {
+            "id": 16, "team": 2, "slot": 0, "name": "Victim",
+            "vehicle": "ussr:T-34", "max_health": 500,
+        }
+        previous = BattleState._sanitize_bot_state({
+            "health": 0, "alive": False,
+            "killer_kind": "human", "killer_id": 7,
+        }, identity, None)
+        state = BattleState._sanitize_bot_state({
+            "health": 0, "alive": False,
+        }, identity, previous)
+
+        self.assertEqual("human", state["killer_kind"])
+        self.assertEqual(7, state["killer_id"])
+
+    def test_lethal_human_bot_hit_sets_snapshot_killer(self):
+        state = BattleState()
+        state.phase = "battle"
+        attacker = Player(7, None, ("127.0.0.1", 1), team=1, fire_seq=4)
+        state.players[7] = attacker
+        state.bot_states[16] = {
+            "id": 16, "team": 2, "health": 100, "alive": True,
+            "x": 0.0, "y": 0.0, "z": 0.0,
+        }
+
+        self.assertTrue(state.report_bot_hit(7, {
+            "target": 16, "shot_seq": 4, "damage": 100,
+        }))
+        self.assertEqual("human", state.bot_states[16]["killer_kind"])
+        self.assertEqual(7, state.bot_states[16]["killer_id"])
+
+    def test_bot_killer_can_complete_an_earlier_unknown_health_death(self):
+        state = BattleState()
+        state.phase = "battle"
+        state.bot_authority_id = 7
+        authority = Player(7, None, ("127.0.0.1", 1), team=1)
+        victim = Player(8, None, ("127.0.0.1", 2), team=2,
+                        health=0, max_health=100, alive=False)
+        state.players = {7: authority, 8: victim}
+        state.bot_states[16] = {
+            "id": 16, "team": 1, "health": 100, "alive": True,
+        }
+
+        self.assertTrue(state.report_bot_human_hit(7, {
+            "attacker_bot": 16, "target": 8, "shot_seq": 1,
+            "damage": 100,
+        }))
+        self.assertEqual("bot", victim.killer_kind)
+        self.assertEqual(16, victim.killer_id)
 
     def test_navigation_fallback_diagnostics_are_bounded_and_rate_limited(self):
         state = BattleState(map_name="04_himmelsdorf")

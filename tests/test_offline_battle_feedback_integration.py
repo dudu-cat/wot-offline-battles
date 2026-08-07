@@ -33,6 +33,17 @@ class OfflineBattleFeedbackIntegrationTest(unittest.TestCase):
         self.assertIn("for _loaded_component in (ch, hu, tu, gu):", self.battle_source)
         self.assertIn("nearest_ground_point(_spawn_graph, _x, _z, 3)", self.battle_source)
 
+    def test_bot_spawn_defers_cosmetic_stickers_and_batches_roster_refresh(self):
+        self.assertIn("_sticker_setup_done = False", self.battle_source)
+        self.assertIn("Creating three native VehicleStickers objects", self.battle_source)
+        self.assertIn("_offh_auto_spawn_completed >= int(getattr(", self.battle_source)
+
+    def test_forced_lineup_vehicle_skips_random_candidate_scan(self):
+        forced = self.battle_source.index("if _fv:")
+        candidate_scan = self.battle_source.index("for nation in nations.AVAILABLE_NAMES", forced)
+        fallback = self.battle_source.rfind("else:", forced, candidate_scan)
+        self.assertGreater(fallback, forced)
+
 
 if __name__ == "__main__":
     unittest.main()

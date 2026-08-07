@@ -604,6 +604,8 @@ class LANClientQueueTest(unittest.TestCase):
             "health": 0,
             "max_health": 880,
             "alive": False,
+            "killer_kind": "human",
+            "killer_id": 1,
             "x": 0.0,
             "y": 0.0,
             "z": 0.0,
@@ -614,6 +616,37 @@ class LANClientQueueTest(unittest.TestCase):
         self.network._apply_remote_state(player, state)
 
         self.assertEqual(0, mock.health)
+        self.assertEqual(1, len(deaths))
+        self.assertEqual(1, deaths[0][1])
+
+    def test_unknown_snapshot_death_waits_for_following_killer_event(self):
+        player = Player()
+        deaths = []
+        player.arena = types.SimpleNamespace(
+            onVehicleKilled=lambda *args: deaths.append(args)
+        )
+        mock = types.SimpleNamespace(
+            id=1001, health=100, maxHealth=880, isAlive=True,
+            publicInfo={"isAlive": True},
+        )
+        callbacks = []
+        bigworld = sys.modules["BigWorld"]
+        original_callback = bigworld.callback
+        bigworld.callback = lambda delay, callback: callbacks.append(callback)
+        try:
+            self.network._push_mock_health(
+                player, mock, 0, 880, False, -1, False
+            )
+            self.assertEqual([], deaths)
+            self.network._push_mock_health(
+                player, mock, 0, 880, False, 1003, False
+            )
+            self.assertEqual(1, len(deaths))
+            self.assertEqual(1003, deaths[0][1])
+            callbacks[0]()
+        finally:
+            bigworld.callback = original_callback
+
         self.assertEqual(1, len(deaths))
 
     def test_remote_snapshot_moves_the_render_model_and_aim_matrices(self):
@@ -1170,6 +1203,30 @@ class LANClientQueueTest(unittest.TestCase):
             self.network._push_mock_health = original_push
 
         self.assertEqual(1003, pushed[0][5])
+
+    def test_shared_bot_death_resolves_relayed_human_killer(self):
+        player = Player()
+        player._offhangar_network_id = 7
+        player.playerVehicleID = 77
+        victim = types.SimpleNamespace(
+            id=1016, _network_bot_id=16, health=500, maxHealth=500,
+            isAlive=True,
+        )
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            victim.id: victim,
+        }
+        pushed = []
+        original_push = self.network._push_mock_health
+        self.network._push_mock_health = lambda *args: pushed.append(args)
+        try:
+            self.network._apply_bot_state(player, {
+                "id": 16, "health": 0, "max_health": 500,
+                "alive": False, "killer_kind": "human", "killer_id": 7,
+            })
+        finally:
+            self.network._push_mock_health = original_push
+
+        self.assertEqual(77, pushed[0][5])
 
     def test_remote_enemy_uses_local_spotting_instead_of_always_visible(self):
         vector3 = sys.modules["Math"].Vector3

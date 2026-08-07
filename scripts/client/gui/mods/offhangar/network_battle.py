@@ -1495,6 +1495,8 @@ def publish_authoritative_bots(player, mocks):
 				'shell_index': int(getattr(mock, '_network_bot_shell_index', 0) or 0),
 				'health': max(0, int(getattr(mock, 'health', 0) or 0)),
 				'killer_bot_id': int(killer_bot_id or 0),
+				'killer_kind': 'bot' if killer_bot_id else '',
+				'killer_id': int(killer_bot_id or 0),
 				'alive': bool(getattr(mock, 'isAlive', False)) and int(getattr(mock, 'health', 0) or 0) > 0,
 			})
 		except Exception:
@@ -1720,6 +1722,26 @@ def _local_entity_id_for_server(player, server_id):
 	return getattr(mock, 'id', -1) if mock is not None else -1
 
 
+def _local_killer_id_from_state(player, state):
+	"""Resolve the server's stable killer identity into this client's entity id."""
+	kind = str(state.get('killer_kind') or '')
+	try:
+		killer_id = int(state.get('killer_id', 0) or 0)
+	except (TypeError, ValueError):
+		killer_id = 0
+	if kind == 'human' and killer_id:
+		return _local_entity_id_for_server(player, killer_id)
+	if kind == 'bot' and killer_id:
+		mock = _find_bot(killer_id)
+		return getattr(mock, 'id', -1) if mock is not None else -1
+	# Protocol-5 compatibility with servers that only relay bot killers.
+	legacy_bot_id = state.get('killer_bot_id')
+	if legacy_bot_id not in (None, 0, '0'):
+		mock = _find_bot(legacy_bot_id)
+		return getattr(mock, 'id', -1) if mock is not None else -1
+	return -1
+
+
 def _set_remote_spot_visibility(player, mock, visible):
 	"""Keep a remote human's model, marker and minimap state in lockstep."""
 	if mock is None:
@@ -1845,6 +1867,25 @@ def update_remote_spotting(player, mock, force=False):
 	return _set_remote_spot_visibility(player, mock, visible)
 
 
+def _notify_network_death(player, mock, killer_id=-1):
+	if mock is None or getattr(mock, '_network_death_notified', False):
+		return False
+	if killer_id in (None, -1):
+		killer_id = getattr(mock, 'last_killer_id', -1)
+	if killer_id is None:
+		killer_id = -1
+	mock._network_death_pending = False
+	mock._network_death_notified = True
+	try:
+		player.arena.onVehicleKilled(mock.id, killer_id, 0)
+	except Exception:
+		try:
+			mock.isAlive = False
+		except Exception:
+			pass
+	return True
+
+
 def _push_mock_health(player, mock, health, max_health, alive, killer_id=-1, is_local=False):
 	if mock is None:
 		return
@@ -1856,7 +1897,7 @@ def _push_mock_health(player, mock, health, max_health, alive, killer_id=-1, is_
 		health = max_health
 	mock.health = health
 	mock.maxHealth = max_health
-	if old_health != health and killer_id not in (None, -1):
+	if killer_id not in (None, -1):
 		try:
 			mock.last_killer_id = killer_id
 		except Exception:
@@ -1890,14 +1931,17 @@ def _push_mock_health(player, mock, health, max_health, alive, killer_id=-1, is_
 	if not alive or health <= 0:
 		mock.health = 0
 		if not getattr(mock, '_network_death_notified', False):
-			mock._network_death_notified = True
-			try:
-				player.arena.onVehicleKilled(mock.id, killer_id, 0)
-			except Exception:
+			if killer_id not in (None, -1):
+				_notify_network_death(player, mock, killer_id)
+			elif not getattr(mock, '_network_death_pending', False):
+				# Snapshots and combat events are separate messages. The server sends the
+				# snapshot first, so leave one short window for the following event to
+				# supply its killer instead of permanently posting "lost in battle".
+				mock._network_death_pending = True
 				try:
-					mock.isAlive = False
+					BigWorld.callback(0.5, lambda: _notify_network_death(player, mock, -1))
 				except Exception:
-					pass
+					_notify_network_death(player, mock, -1)
 	elif not old_alive:
 		try:
 			mock.isAlive = True
@@ -2101,7 +2145,7 @@ def _apply_local_state(player, state):
 		target_health = 0
 	_push_mock_health(player, mock, target_health,
 		state.get('max_health', getattr(mock, 'maxHealth', 1)),
-		bool(state.get('alive', True)), -1, True)
+		bool(state.get('alive', True)), _local_killer_id_from_state(player, state), True)
 
 
 def _apply_remote_state(player, state):
@@ -2179,7 +2223,8 @@ def _apply_remote_state(player, state):
 				_finite_float(state.get('gun_pitch'), getattr(mock, '_gun_pitch', 0.0)),
 				not target_alive)
 		_push_mock_health(player, mock, state.get('health', mock.health),
-			state.get('max_health', mock.maxHealth), target_alive)
+			state.get('max_health', mock.maxHealth), target_alive,
+			_local_killer_id_from_state(player, state))
 	except Exception:
 		pass
 
@@ -2224,12 +2269,7 @@ def _apply_bot_state(player, state, force_authority_pose=False):
 			mock._network_bot_fire_seq = max(
 				int(getattr(mock, '_network_bot_fire_seq', 0) or 0), fire_seq)
 			mock._network_bot_shell_index = int(state.get('shell_index', 0) or 0)
-		killer_id = -1
-		killer_bot_id = state.get('killer_bot_id')
-		if killer_bot_id not in (None, 0, '0'):
-			killer_mock = _find_bot(killer_bot_id)
-			if killer_mock is not None:
-				killer_id = getattr(killer_mock, 'id', -1)
+		killer_id = _local_killer_id_from_state(player, state)
 		_push_mock_health(player, mock, state.get('health', mock.health),
 			state.get('max_health', mock.maxHealth), target_alive, killer_id)
 		if not is_authority:

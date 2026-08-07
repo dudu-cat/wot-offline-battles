@@ -131,6 +131,8 @@ class Player:
     health: int = 1000
     max_health: int = 1000
     alive: bool = True
+    killer_kind: str = ""
+    killer_id: int = 0
     client_position: bool = False
     connected: bool = True
     bot_order_revision_sent: int = -1
@@ -694,6 +696,24 @@ class BattleState:
             killer_bot_id = 0
         if previous is not None and not killer_bot_id:
             killer_bot_id = int(previous.get("killer_bot_id", 0) or 0)
+        killer_kind = str(raw.get("killer_kind") or "")
+        try:
+            killer_id = max(0, int(raw.get("killer_id", 0) or 0))
+        except (TypeError, ValueError):
+            killer_id = 0
+        if killer_kind not in ("bot", "human") or not killer_id:
+            if killer_bot_id:
+                killer_kind = "bot"
+                killer_id = killer_bot_id
+            else:
+                killer_kind = ""
+                killer_id = 0
+        if previous is not None and not killer_id:
+            previous_kind = str(previous.get("killer_kind") or "")
+            previous_id = int(previous.get("killer_id", 0) or 0)
+            if previous_kind in ("bot", "human") and previous_id:
+                killer_kind = previous_kind
+                killer_id = previous_id
         yaw = _finite_float(raw.get("yaw"), 0.0)
         return {
             "id": int(identity["id"]),
@@ -716,6 +736,8 @@ class BattleState:
             "health": reported_health,
             "max_health": max_health,
             "killer_bot_id": killer_bot_id,
+            "killer_kind": killer_kind,
+            "killer_id": killer_id,
             "alive": bool(raw.get("alive", reported_health > 0)) and reported_health > 0,
         }
 
@@ -775,6 +797,10 @@ class BattleState:
             applied = min(damage, int(state.get("health", 0)))
             state["health"] -= applied
             state["alive"] = state["health"] > 0
+            if not state["alive"]:
+                state["killer_kind"] = "human"
+                state["killer_id"] = player_id
+                state["killer_bot_id"] = 0
             self.pending_events.append({
                 "kind": "bot_hit", "attacker": player_id, "target_bot": bot_id,
                 "shot_seq": shot_seq, "shell_index": attacker.shell_index,
@@ -800,18 +826,23 @@ class BattleState:
                 return False
             bot = self.bot_states.get(bot_id)
             target = self.players.get(target_id)
-            if bot is None or not bot.get("alive") or target is None or not target.alive:
+            if bot is None or not bot.get("alive") or target is None:
                 return False
             if bot.get("team") == target.team:
                 return False
             hit_key = (bot_id, shot_seq, target_id)
             if shot_seq <= 0 or hit_key in self.bot_reported_hits:
                 return False
+            if not target.alive and target.killer_id:
+                return False
             self.bot_reported_hits.add(hit_key)
             damage = max(0, min(int(_finite_float(message.get("damage"), 0)), 5000))
             applied = min(damage, target.health)
             target.health -= applied
             target.alive = target.health > 0
+            if not target.alive:
+                target.killer_kind = "bot"
+                target.killer_id = bot_id
             self.pending_events.append({
                 "kind": "bot_human_hit", "attacker_bot": bot_id, "target": target_id,
                 "shot_seq": shot_seq, "shot_result": max(0, min(int(_finite_float(message.get("shot_result"), 2)), 2)),
@@ -967,6 +998,8 @@ class BattleState:
             target.health -= applied_damage
             if target.health == 0:
                 target.alive = False
+                target.killer_kind = "human"
+                target.killer_id = attacker.player_id
             try:
                 shot_result = max(0, min(int(message.get("shot_result", 2)), 2))
             except (TypeError, ValueError):
@@ -1178,6 +1211,8 @@ class BattleState:
             "health": player.health,
             "max_health": player.max_health,
             "alive": player.alive,
+            "killer_kind": player.killer_kind,
+            "killer_id": player.killer_id,
         }
 
     def broadcast(self, message):

@@ -141,6 +141,39 @@ def _offh_perf_frame_end(started, frame_dt, player):
 	state['times'] = {}
 	state['calls'] = {}
 
+
+def _offh_record_spawn_timing(player, prepare_seconds, wait_seconds, build_seconds):
+	"""Report compact aggregate spawn costs without logging every vehicle."""
+	generation = int(globals().get('g_offh_battle_gen', 0) or 0)
+	state = globals().get('g_offh_spawn_timing')
+	if state is None or int(state.get('generation', -1)) != generation:
+		state = {'generation': generation, 'count': 0, 'prepare': 0.0,
+			'wait': 0.0, 'build': 0.0, 'max_prepare': 0.0,
+			'max_wait': 0.0, 'max_build': 0.0}
+		globals()['g_offh_spawn_timing'] = state
+	state['count'] += 1
+	state['prepare'] += max(0.0, float(prepare_seconds or 0.0))
+	state['wait'] += max(0.0, float(wait_seconds or 0.0))
+	state['build'] += max(0.0, float(build_seconds or 0.0))
+	state['max_prepare'] = max(state['max_prepare'], float(prepare_seconds or 0.0))
+	state['max_wait'] = max(state['max_wait'], float(wait_seconds or 0.0))
+	state['max_build'] = max(state['max_build'], float(build_seconds or 0.0))
+	expected = int(getattr(player, '_offh_auto_spawn_expected', 0) or 0)
+	if state['count'] % 5 != 0 and (not expected or state['count'] < expected):
+		return
+	try:
+		from gui.mods.offhangar.logging import LOG_NOTE as _spawn_log
+		count = max(1, state['count'])
+		_spawn_log('SPAWN PERF ready=%d/%s prepare=%.0fms(avg)/%.0fms(max) '
+			'load_wait=%.0fms(avg)/%.0fms(max) '
+			'build=%.0fms(avg)/%.0fms(max)' % (
+			state['count'], expected or '?', 1000.0 * state['prepare'] / count,
+			1000.0 * state['max_prepare'], 1000.0 * state['wait'] / count,
+			1000.0 * state['max_wait'], 1000.0 * state['build'] / count,
+			1000.0 * state['max_build']))
+	except Exception:
+		pass
+
 def _get_destr_authority():
 	"""offhangar.destructibles_authority, with the same execfile fallback
 	the package bootstrap uses (the module ships without a .pyc)."""
@@ -1489,6 +1522,8 @@ _OFFH_PLAYER_BATTLE_ATTRS = (
 	'getOwnVehicleShotDispersionAngle', 'onEquipmentButtonPressed',
 	'onDamageIconButtonPressed', 'shoot', 'terrainEffects',
 	'_autoaim_target', '_outlined_bot',
+	'_offh_vehicle_descriptors', '_offh_auto_spawn_expected',
+	'_offh_auto_spawn_completed',
 )
 
 
@@ -4600,6 +4635,37 @@ def _target_sticker_map(target_mock):
 	m = getattr(target_mock, '_sticker_map', None)
 	if m:
 		return m
+	# Creating three native VehicleStickers objects for every bot during model
+	# attachment caused long startup stalls. A decal is only needed after the
+	# first impact, so construct this bot's map lazily at that point.
+	if (target_mock is not None and
+			not getattr(target_mock, '_sticker_setup_done', False) and
+			getattr(target_mock, 'typeDescriptor', None) is not None):
+		target_mock._sticker_setup_done = True
+		try:
+			import VehicleStickers
+			setup = (
+				('hull', getattr(target_mock, '_hull_model', None),
+					getattr(target_mock, '_chassis_model', None).node('V')),
+				('turret', getattr(target_mock, '_turret_model', None),
+					getattr(target_mock, '_t_node', None)),
+				('gun', getattr(target_mock, '_gun_model', None),
+					getattr(target_mock, '_g_node', None)),
+			)
+			target_mock._sticker_map = {}
+			for comp_name, comp_model, comp_node in setup:
+				if comp_model is None or comp_node is None:
+					continue
+				stickers = VehicleStickers.VehicleStickers(
+					target_mock.typeDescriptor, [], comp_name == 'hull', None)
+				stickers.attachStickers(comp_model, comp_node, False)
+				target_mock._sticker_map[comp_name] = (
+					stickers, comp_model, comp_node)
+			m = target_mock._sticker_map
+		except Exception:
+			target_mock._sticker_map = {}
+		if m:
+			return m
 	# The player's own tank keeps its sticker map on the player object.
 	try:
 		import BigWorld
@@ -14900,6 +14966,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 
 				if event.isKeyDown() and event.key in (Keys.KEY_O, Keys.KEY_P, Keys.KEY_L):
 					try:
+						_spawn_entered_at = time.time()
 						player = BigWorld.player()
 						start_pos, dir_vec = player.gunRotator._VehicleGunRotator__getCurShotPosition()
 						dir_vec.normalise()
@@ -14934,22 +15001,30 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							try:
 								import random
 								from items import vehicles
-								import nations
-								from gui.mods.offhangar.bot_ai import vehicle_in_battle_tier_band
-								cur_tier = loaded_models['td'].type.level
-								candidates = []
-								for nation in nations.AVAILABLE_NAMES:
-									nationID = nations.INDICES[nation]
-									for v in vehicles.g_list.getList(nationID).itervalues():
-										if vehicle_in_battle_tier_band(cur_tier, v['level']) and not _offh_veh_excluded(v):
-											candidates.append(v['name'])
-								LOG_DEBUG('KEY P pressed! cur_tier=%d candidates=%d' % (cur_tier, len(candidates)))
-								if candidates:
-									chosen = random.choice(candidates)
-									# Auto-spawner pre-picks vehicles (sorted by class for the line-up)
-									_fv = getattr(player, '_forced_spawn_vehname', None)
-									if _fv: chosen = _fv
-									td = vehicles.VehicleDescr(typeName=chosen)
+								_fv = getattr(player, '_forced_spawn_vehname', None)
+								if _fv:
+									chosen = _fv
+								else:
+									import nations
+									from gui.mods.offhangar.bot_ai import vehicle_in_battle_tier_band
+									cur_tier = loaded_models['td'].type.level
+									candidates = []
+									for nation in nations.AVAILABLE_NAMES:
+										nationID = nations.INDICES[nation]
+										for v in vehicles.g_list.getList(nationID).itervalues():
+											if vehicle_in_battle_tier_band(cur_tier, v['level']) and not _offh_veh_excluded(v):
+												candidates.append(v['name'])
+									LOG_DEBUG('KEY P pressed! cur_tier=%d candidates=%d' % (cur_tier, len(candidates)))
+									chosen = random.choice(candidates) if candidates else None
+								if chosen:
+									descriptors = getattr(player, '_offh_vehicle_descriptors', None)
+									if descriptors is None:
+										descriptors = {}
+										player._offh_vehicle_descriptors = descriptors
+									td = descriptors.get(chosen)
+									if td is None:
+										td = vehicles.VehicleDescr(typeName=chosen)
+										descriptors[chosen] = td
 									bot_name = ('Ally ' if bot_team == (getattr(player, '_offhangar_team', 1) or 1) else 'Enemy ') + chosen.split(':')[-1] + ' ' + str(_spawn_count[0])
 							except Exception as e:
 								import traceback
@@ -14989,14 +15064,35 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 
 						# Load visual models
 
+						_spawn_requested_at = time.time()
 						def _on_bot_models_loaded(resourceRefs, bot_display_name=_bot_display_name,
 								_bot_gen=_offh_my_gen[0]):
 							if globals().get('g_offh_battle_gen', 0) != _bot_gen:
 								return
+							_spawn_build_started = time.time()
 							def _network_spawn_complete():
 								if _network_server_id is not None:
 									try:
 										getattr(player, '_offhangar_network_pending_remote_ids', {}).pop(_network_server_id, None)
+									except Exception:
+										pass
+								if _network_bot_id is not None:
+									try:
+										player._offh_auto_spawn_completed = int(getattr(
+											player, '_offh_auto_spawn_completed', 0) or 0) + 1
+										if player._offh_auto_spawn_completed >= int(getattr(
+												player, '_offh_auto_spawn_expected', 0) or 0):
+											def _refresh_complete_lineup():
+												try:
+													from gui import WindowsManager as _spawn_wm
+													battle = getattr(_spawn_wm.g_windowsManager,
+														'battleWindow', None)
+													if battle is not None and hasattr(
+														battle, '_Battle__updatePlayers'):
+														battle._Battle__updatePlayers()
+												except Exception:
+													pass
+											_offh_battle_callback(0.0, _refresh_complete_lineup)
 									except Exception:
 										pass
 							try:
@@ -15132,24 +15228,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							e_mock._t_mat = t_mat
 							# was a local only, so the barrel could never be elevated
 							e_mock._g_mat = g_mat
-							# Per-component VehicleStickers so shell-hole decals can land
-							# on this bot (bots have no stickers otherwise). Empty emblem
-							# slots - we only want the damage-sticker model.
-							try:
-								import VehicleStickers
-								e_mock._sticker_map = {}
-								_bot_sticker_setup = (
-									('hull', hu, ch.node('V')),
-									('turret', tu, e_mock._t_node),
-									('gun', gu, e_mock._g_node),
-								)
-								for _cn, _cm, _cnode in _bot_sticker_setup:
-									if _cm is not None and _cnode is not None:
-										_st = VehicleStickers.VehicleStickers(td, [], _cn == 'hull', None)
-										_st.attachStickers(_cm, _cnode, False)
-										e_mock._sticker_map[_cn] = (_st, _cm, _cnode)
-							except Exception as _se:
-								LOG_DEBUG('Bot sticker setup error:', str(_se))
+							# Damage stickers are initialized lazily by _target_sticker_map on
+							# this bot's first impact instead of creating 3 native objects now.
+							e_mock._sticker_map = {}
+							e_mock._sticker_setup_done = False
 							# Scrolling-track animation for the bot (original fashion system);
 							# attached slightly delayed so the model is in the world first
 							def _attach_bot_fashion(_bch=ch, _btd=td, _bm=e_mock):
@@ -15284,12 +15366,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								player.arena.onVehicleAdded(e_id)
 							except: pass
 							try:
-								bw = getattr(WindowsManager.g_windowsManager, 'battleWindow', None)
-								if bw and hasattr(bw, '_Battle__updatePlayers'):
-									bw._Battle__updatePlayers()
-							except: pass
-							
-							try:
 								if (getattr(e_mock, '_spot_visible', True) and
 										hasattr(WindowsManager.g_windowsManager.battleWindow, 'vMarkersManager')):
 									e_mock.marker = WindowsManager.g_windowsManager.battleWindow.vMarkersManager.createMarker(e_mock.proxy)
@@ -15299,6 +15375,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									minimap.notifyVehicleStart(e_mock.id)
 							except Exception as e:
 								LOG_DEBUG('GUI Add error:', str(e))
+							if _network_bot_id is not None:
+								_offh_record_spawn_timing(player,
+									_spawn_requested_at - _spawn_entered_at,
+									_spawn_build_started - _spawn_requested_at,
+									time.time() - _spawn_build_started)
 							LOG_DEBUG('Enemy Clone Spawned at:', target_pos)
 						
 						BigWorld.loadResourceListBG((
@@ -15678,6 +15759,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					for _k in range(max(len(_t1), len(_t2))):
 						if _k < len(_t1): _jobs.append(_t1[_k])
 						if _k < len(_t2): _jobs.append(_t2[_k])
+					try:
+						_pl._offh_auto_spawn_expected = len(_jobs)
+						_pl._offh_auto_spawn_completed = 0
+					except Exception:
+						pass
 					
 					def _spawn_next(_rest):
 						if globals().get('g_offh_battle_gen', 0) != _offh_my_gen[0]:
