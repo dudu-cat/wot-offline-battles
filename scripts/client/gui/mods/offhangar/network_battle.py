@@ -1897,6 +1897,20 @@ def advance_network_smoothing(player, mocks, frame_dt):
 			px = target.x + vx * predict
 			py = target.y + vy * predict
 			pz = target.z + vz * predict
+			if is_bot and predict > 0.0:
+				# Prediction is presentation only. Never extrapolate a shared bot from
+				# its last authoritative safe pose across a baked water/cliff cell; the
+				# next zero-speed guard packet would otherwise make it rubber-band back.
+				# If the authority itself has already fallen, its target pose still wins
+				# and the physical consequence remains visible on every client.
+				try:
+					import sys
+					offline = sys.modules.get('gui.mods.offhangar.offline_battle')
+					pose_safe = getattr(offline, '_offh_ai_baked_pose_safe', None)
+					if callable(pose_safe) and not pose_safe((px, py, pz)):
+						px, py, pz = target.x, target.y, target.z
+				except Exception:
+					pass
 			dx, dy, dz = px - current.x, py - current.y, pz - current.z
 			distance_sq = dx * dx + dy * dy + dz * dz
 			if distance_sq > 625.0:

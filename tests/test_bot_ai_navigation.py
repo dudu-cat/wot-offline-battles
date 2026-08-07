@@ -784,8 +784,8 @@ class BotNavigationTest(unittest.TestCase):
         )
         self.assertIn("drive_pos = _requested_drive_pos", battle_source)
         self.assertIn("def _offh_ai_pose_water_depth", battle_source)
-        self.assertIn("def _offh_ai_dry_rollback", battle_source)
-        self.assertIn("if distance >= 3.0:", battle_source)
+        self.assertNotIn("def _offh_ai_dry_rollback", battle_source)
+        self.assertNotIn("_offh_ai_dry_history", battle_source)
         self.assertIn("m_veh._offh_ai_driver_mode = 'water_guard'", battle_source)
         self.assertIn("def _offh_ai_baked_pose_safe", battle_source)
         self.assertIn("m_veh._offh_ai_driver_mode = 'edge_guard'", battle_source)
@@ -810,6 +810,16 @@ class BotNavigationTest(unittest.TestCase):
             leading_tabs("# Final realised-pose water guard."),
         )
         final_guard = battle_source.index("# Final realised-pose water guard.")
+        final_guard_end = battle_source.index(
+            "# The baked hazard mask marks water and cliff shoulders separately",
+            final_guard,
+        )
+        water_guard = battle_source[final_guard:final_guard_end]
+        self.assertIn(
+            "_dry_anchor = getattr(m_veh, '_offh_ai_tick_dry_pose', None)",
+            water_guard,
+        )
+        self.assertNotIn("dry_rollback", water_guard)
         self.assertLess(
             final_guard,
             battle_source.index("m_veh.matrix.setRotateYPR", final_guard),

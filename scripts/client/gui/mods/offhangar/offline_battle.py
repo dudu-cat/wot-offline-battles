@@ -740,57 +740,6 @@ def _offh_ai_pose_water_depth(vehicle, position=None, yaw=None):
 		return -1.0
 
 
-def _offh_ai_remember_dry_pose(vehicle, now=None):
-	'''Keep a short dry trail so a water veto can retreat beyond a one-way lip.'''
-	try:
-		import BigWorld, math
-		if now is None:
-			now = BigWorld.time()
-		position = vehicle.position
-		pose = (float(now), float(position.x), float(position.y), float(position.z))
-		history = getattr(vehicle, '_offh_ai_dry_history', None)
-		if history is None:
-			history = []
-			vehicle._offh_ai_dry_history = history
-		if history:
-			last = history[-1]
-			distance = math.sqrt((pose[1] - last[1]) ** 2 +
-			                     (pose[3] - last[3]) ** 2)
-			if distance < 0.8 and pose[0] - last[0] < 0.8:
-				vehicle._offh_ai_dry_anchor = pose[1:]
-				return
-		history.append(pose)
-		if len(history) > 12:
-			del history[:-12]
-		vehicle._offh_ai_dry_anchor = pose[1:]
-	except Exception:
-		pass
-
-
-def _offh_ai_dry_rollback(vehicle):
-	'''Return and retain a dry pose at least 3 m behind the wet realised pose.'''
-	try:
-		import math
-		position = vehicle.position
-		history = getattr(vehicle, '_offh_ai_dry_history', None) or []
-		chosen_index = None
-		for index in range(len(history) - 1, -1, -1):
-			pose = history[index]
-			distance = math.sqrt((float(position.x) - pose[1]) ** 2 +
-			                     (float(position.z) - pose[3]) ** 2)
-			if distance >= 3.0:
-				chosen_index = index
-				break
-		if chosen_index is not None:
-			pose = history[chosen_index]
-			del history[chosen_index + 1:]
-			vehicle._offh_ai_dry_anchor = pose[1:]
-			return pose[1:]
-	except Exception:
-		pass
-	return getattr(vehicle, '_offh_ai_dry_anchor', None)
-
-
 def _offh_ai_baked_pose_safe(position, shoulder_cells=1):
 	'''Whether a realised pose avoids shipped water/cliff hazard cells.
 
@@ -6395,7 +6344,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			'reloadTime': 0.0,
 			'dispersion': 0.1,
 			'initialized': False,
-			'shot_index': 0
+			'shot_index': 0,
+			# Stock 0.8.2 cruise modes: -2/-1/0/1/2/3 represent reverse
+			# 100/50, off, and forward 25/50/100 percent.
+			'cruise_mode': 0,
+			'cruise_last_key': None,
+			'cruise_last_time': -1.0,
+			'cruise_press_count': 0
 		}
 
 		_engine_state = {'init': False, 'snd1': None, 'snd2': None}
@@ -7947,6 +7902,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				if getattr(player, '_is_dead', False) is True:
 					throttle = 0
 					steer = 0
+					if int(_gun_state.get('cruise_mode', 0) or 0) != 0:
+						_set_cruise_mode(0)
 				else:
 					# Honor Controls->Movement rebinds from the settings screen: the
 					# raw W/A/S/D polls ignored CommandMapping, so rebinding movement
@@ -7960,8 +7917,20 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						_k_rgt = _cmg.get('CMD_ROTATE_RIGHT') or Keys.KEY_D
 					except Exception:
 						_k_fwd, _k_bwd, _k_lft, _k_rgt = Keys.KEY_W, Keys.KEY_S, Keys.KEY_A, Keys.KEY_D
-					if BigWorld.isKeyDown(_k_fwd): throttle = 1
-					elif BigWorld.isKeyDown(_k_bwd): throttle = -1
+					_manual_forward = BigWorld.isKeyDown(_k_fwd)
+					_manual_backward = BigWorld.isKeyDown(_k_bwd)
+					if _manual_forward or _manual_backward:
+						if int(_gun_state.get('cruise_mode', 0) or 0) != 0:
+							_set_cruise_mode(0)
+					if _manual_forward:
+						throttle = 1
+					elif _manual_backward:
+						throttle = -1
+					else:
+						throttle = {
+							1: 0.25, 2: 0.50, 3: 1.0,
+							-1: -0.50, -2: -1.0,
+						}.get(int(_gun_state.get('cruise_mode', 0) or 0), 0.0)
 
 					if BigWorld.isKeyDown(_k_lft): steer = -1
 					elif BigWorld.isKeyDown(_k_rgt): steer = 1
@@ -8595,7 +8564,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								# Target lost from view -> release the lock (like online):
 								# the barrel silently tracking an invisible tank both
 								# reveals it and looks broken.
-								player._autoaim_target = None
+								_set_autoaim_target(None, 'target_lost')
+								_aat = None
+							elif _aat is not None and getattr(_aat, 'health', 0) <= 0:
+								# Retail silently clears a lock when the locked vehicle dies.
+								_set_autoaim_target(None, '')
 								_aat = None
 							if _aat is not None and getattr(_aat, 'health', 0) > 0:
 								t_pos = Math.Vector3(_aat.position)
@@ -10172,7 +10145,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									float(m_veh.position.z))
 								m_veh._offh_ai_tick_nav_safe = _offh_ai_baked_pose_safe(
 									m_veh._offh_ai_tick_dry_pose)
-								_offh_ai_remember_dry_pose(m_veh)
 							else:
 								m_veh._offh_ai_tick_dry_pose = None
 								m_veh._offh_ai_tick_nav_safe = False
@@ -10449,12 +10421,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# slide: none of those paths may push an autonomous hull over a wet bank.
 							_pose_water = _offh_ai_pose_water_depth(m_veh)
 							if _pose_water > _OFFH_AI_WATER_AVOID_DEPTH:
-								# Normal case: cancel this frame's motion before it is rendered or
-								# published. The older trail is only for a pose that was already wet
-								# when this frame began (streaming/probe edge case).
+								# Cancel only motion performed during THIS simulation tick, before it
+								# is rendered or published. Never rewind to an older dry-history pose:
+								# that made a tank visibly teleport several metres back uphill after
+								# it had already crossed a one-way bank.
 								_dry_anchor = getattr(m_veh, '_offh_ai_tick_dry_pose', None)
-								if _dry_anchor is None:
-									_dry_anchor = _offh_ai_dry_rollback(m_veh)
 								if _dry_anchor is not None:
 									m_veh.position = Math.Vector3(
 										_dry_anchor[0], _dry_anchor[1], _dry_anchor[2])
@@ -10481,8 +10452,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_b_ypr = (m_veh.yaw, m_veh._ypr_c[1],
 									          m_veh._ypr_c[2], m_veh._ypr_c[3],
 									          m_veh._ypr_c[4], m_veh._ypr_c[5])
-							else:
-								_offh_ai_remember_dry_pose(m_veh)
 							# The baked hazard mask marks water and cliff shoulders separately from
 							# ordinary obstacle holes. Local avoidance, impulses and lateral slide
 							# may enter a true hazard, but driving beside a building must not trigger
@@ -14294,6 +14263,108 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					return Math.Vector3(want_pos.x, float(veh_pos[1]), want_pos.z)
 				except Exception:
 					return Math.Vector3(want_pos)
+			def _set_cruise_mode(mode):
+				'''Apply the stock 0.8.2 cruise value and refresh its HUD arrows.'''
+				try:
+					mode = max(-2, min(3, int(mode)))
+				except Exception:
+					mode = 0
+				_gun_state['cruise_mode'] = mode
+				try:
+					from gui import WindowsManager as _CruiseWM
+					_battle = getattr(_CruiseWM.g_windowsManager, 'battleWindow', None)
+					_panel = getattr(_battle, 'damagePanel', None) if _battle is not None else None
+					if _panel is not None:
+						_panel.setCruiseMode(mode)
+				except Exception as _cruise_ui_error:
+					LOG_DEBUG('Cruise panel update failed:', str(_cruise_ui_error))
+
+			def _handle_cruise_key(event):
+				'''Mirror PlayerAvatar.handleKey's R/F cruise state machine.'''
+				try:
+					import CommandMapping as _CruiseMapping
+					_mapping = _CruiseMapping.g_instance
+					_key = event.key
+					_is_forward = _mapping.isFired(
+						_CruiseMapping.CMD_INCREMENT_CRUISE_MODE, _key)
+					_is_backward = _mapping.isFired(
+						_CruiseMapping.CMD_DECREMENT_CRUISE_MODE, _key)
+					_is_manual = _mapping.isFiredList((
+						_CruiseMapping.CMD_MOVE_FORWARD,
+						getattr(_CruiseMapping, 'CMD_MOVE_FORWARD_SPEC', -1),
+						_CruiseMapping.CMD_MOVE_BACKWARD), _key)
+					if _is_manual and event.isKeyDown():
+						if int(_gun_state.get('cruise_mode', 0) or 0) != 0:
+							_set_cruise_mode(0)
+						return False
+					if not _is_forward and not _is_backward:
+						return False
+					# Consume both edges. Only key-down changes the mode.
+					if not event.isKeyDown() or getattr(player, '_is_dead', False):
+						return True
+					_now = BigWorld.time()
+					_last_key = _gun_state.get('cruise_last_key')
+					_last_time = float(_gun_state.get('cruise_last_time', -1.0))
+					if _key == _last_key and _last_time >= 0.0 and _now - _last_time < 0.35:
+						_count = int(_gun_state.get('cruise_press_count', 0) or 0) + 1
+					else:
+						_count = 1
+					_gun_state['cruise_last_key'] = _key
+					_gun_state['cruise_last_time'] = _now
+					_gun_state['cruise_press_count'] = _count
+					_double_press = (_count == 2)
+					_mode = int(_gun_state.get('cruise_mode', 0) or 0)
+					if _is_forward:
+						_mode = 3 if _double_press else min(3, _mode + 1)
+					else:
+						_mode = -2 if _double_press else max(-2, _mode - 1)
+					_set_cruise_mode(_mode)
+					return True
+				except Exception as _cruise_key_error:
+					LOG_DEBUG('Cruise key handling failed:', str(_cruise_key_error))
+					return False
+
+			def _play_autoaim_sound(event_name):
+				'''Use a live per-battle notification queue, rebuilding a swept one.'''
+				try:
+					_notifications = getattr(player, 'soundNotifications', None)
+					_queues = (getattr(
+						_notifications, '_IngameSoundNotifications__soundQueues', None)
+						if _notifications is not None else None)
+					if _notifications is None or _queues is None:
+						from gui.IngameSoundNotifications import IngameSoundNotifications
+						_notifications = IngameSoundNotifications()
+						_notifications.start()
+						player.soundNotifications = _notifications
+					_notifications.play(event_name)
+					return True
+				except Exception as _autoaim_sound_error:
+					LOG_DEBUG('Autoaim sound error:', str(_autoaim_sound_error))
+					return False
+
+			def _set_autoaim_target(target, sound_name=None):
+				'''Apply the same aiming-mode and sound transitions as PlayerAvatar.'''
+				previous = getattr(player, '_autoaim_target', None)
+				if previous is target:
+					return False
+				player._autoaim_target = target
+				try:
+					from constants import AIMING_MODE as _AutoAimMode
+					g_offline_aih.setAimingMode(
+						target is not None, _AutoAimMode.TARGET_LOCK)
+				except Exception as _autoaim_mode_error:
+					LOG_DEBUG('Autoaim aiming-mode update failed:', str(_autoaim_mode_error))
+				try:
+					player.gunRotator.clientMode = (target is None)
+				except Exception:
+					pass
+				if sound_name is None:
+					sound_name = 'target_captured' if target is not None else 'target_unlocked'
+				if sound_name:
+					_play_autoaim_sound(sound_name)
+				LOG_DEBUG('Autoaim state changed:', previous, '->', target)
+				return True
+
 			_orig_handleKeyEvent = g_offline_aih.handleKeyEvent
 			_spawn_count = [0]
 			def _mock_handleKeyEvent(event):
@@ -14326,45 +14397,26 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							return
 					except Exception:
 						pass
-				
+
+				if _handle_cruise_key(event):
+					return True
+
 				if event.key == Keys.KEY_RIGHTMOUSE:
 					if event.isKeyDown():
 						_gun_state['rmb_down'] = True
 						bot = getattr(player, '_outlined_bot', None)
 						prev_target = getattr(player, '_autoaim_target', None)
+						curr_target = None
 						if bot is not None:
 							team = getattr(bot, '_bot_team', 2)
 							player_team = getattr(player, '_offhangar_team', 1)
 							if team != player_team and getattr(bot, 'health', 0) > 0:
 								if prev_target == bot:
-									player._autoaim_target = None
+									curr_target = None
 								else:
-									player._autoaim_target = bot
-							else:
-								player._autoaim_target = None
-						else:
-							player._autoaim_target = None
-							
-						curr_target = getattr(player, '_autoaim_target', None)
+									curr_target = bot
 						if prev_target != curr_target:
-							import debug_utils
-							debug_utils.LOG_DEBUG('Autoaim state changed:', prev_target, '->', curr_target)
-							try:
-								sound_str = 'target_captured' if curr_target is not None else 'target_unlocked'
-								if hasattr(player, 'soundNotifications') and player.soundNotifications is not None:
-									player.soundNotifications.play(sound_str)
-								else:
-									if not hasattr(g_offline_aih, '_snd_notif'):
-										try:
-											from gui.IngameSoundNotifications import IngameSoundNotifications
-											g_offline_aih._snd_notif = IngameSoundNotifications()
-											g_offline_aih._snd_notif.start()
-										except: pass
-									if hasattr(g_offline_aih, '_snd_notif'):
-										g_offline_aih._snd_notif.play(sound_str)
-										debug_utils.LOG_DEBUG('Played sound via IngameSoundNotifications')
-							except Exception as e:
-								debug_utils.LOG_DEBUG('Sound error:', str(e))
+							_set_autoaim_target(curr_target)
 						
 						if getattr(player, '_autoaim_target', None) is None:
 							_gun_state['locked_local_yaw'] = turret_yaw[0]

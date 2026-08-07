@@ -1004,6 +1004,42 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertGreater(model.position.x, 2.0)
         self.assertLess(model.position.x, 13.0)
 
+    def test_remote_bot_prediction_does_not_cross_a_baked_hazard(self):
+        class Matrix:
+            def setRotateYPR(self, rotation):
+                self.rotation = rotation
+
+        vector3 = sys.modules["Math"].Vector3
+        player = Player()
+        player._offhangar_network_id = 1
+        model = types.SimpleNamespace(position=vector3(4, 1, 0), yaw=0.0)
+        mock = types.SimpleNamespace(
+            id=1016, _network_shared_bot=True,
+            health=880, maxHealth=880, isAlive=True,
+            publicInfo={"isAlive": True},
+            position=vector3(4, 1, 0), yaw=0.0, pitch=0.0, roll=0.0,
+            matrix=Matrix(), _t_mat=Matrix(), _g_mat=Matrix(),
+            model=model, _chassis_model=model, bw_entity=None,
+            _network_target_position=vector3(4, 1, 0),
+            _network_target_velocity=(20.0, 0.0, 0.0),
+            _network_target_time=self.network.time.time() - 0.1,
+            _network_target_yaw=0.0,
+            _network_target_aim_yaw=0.0,
+            _network_target_gun_pitch=0.0,
+        )
+        offline = sys.modules["gui.mods.offhangar.offline_battle"]
+        old_pose_safe = getattr(offline, "_offh_ai_baked_pose_safe", None)
+        self.addCleanup(
+            lambda: setattr(offline, "_offh_ai_baked_pose_safe", old_pose_safe)
+        )
+        offline._offh_ai_baked_pose_safe = lambda pose: pose[0] < 5.0
+
+        self.assertTrue(self.network.advance_network_smoothing(
+            player, {1016: mock}, 1.0 / 60.0
+        ))
+
+        self.assertEqual(4.0, model.position.x)
+
     def test_snapshot_applies_shared_rules_and_result_once(self):
         player = Player()
         rules = []
