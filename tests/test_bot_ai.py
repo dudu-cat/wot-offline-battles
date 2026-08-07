@@ -342,6 +342,26 @@ class BotAITest(unittest.TestCase):
         self.assertEqual((0.0, 0.0, -90.0), target)
         self.assertEqual(3, agent["waypoint_index"])
 
+    def test_route_hold_metadata_does_not_pause_local_director(self):
+        director = self.ai.BattleDirector("07_lakeville", "no-route-holds")
+        agent = director.register(
+            92, 1, descriptor("mediumTank"), "Continuous traveller"
+        )
+        agent["route"] = {
+            "waypoints": (
+                (0.0, -40.0, False),
+                (0.0, -20.0, True),
+                (0.0, 80.0, False),
+            )
+        }
+        agent["route_started"] = True
+        agent["waypoint_index"] = 1
+
+        target = director._route_position(agent, (0.0, 0.0, -20.0), 3.0)
+
+        self.assertEqual((0.0, 0.0, 80.0), target)
+        self.assertEqual(2, agent["waypoint_index"])
+
     def test_python26_source_loader_orders_ai_dependencies_before_battle(self):
         bootstrap = (
             ROOT / "scripts/client/gui/mods/mod_offhangar.py"

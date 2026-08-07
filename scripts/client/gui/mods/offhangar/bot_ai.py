@@ -739,7 +739,6 @@ class BattleDirector(object):
 			'seed': seed,
 			'route': None,
 			'waypoint_index': 0,
-			'hold_started': None,
 			'target_id': None,
 			'last_order': None,
 			'position': None,
@@ -972,16 +971,6 @@ class BattleDirector(object):
 		waypoint = waypoints[index]
 		world = (float(waypoint[0]), float(position[1]), float(waypoint[1]))
 		if _distance_2d(position, world) <= 13.0:
-			hold = bool(waypoint[2]) if len(waypoint) > 2 else False
-			if hold:
-				if agent.get('hold_started') is None:
-					agent['hold_started'] = _number(now)
-				hold_time = (6.0 + agent['personality']['patience'] * 8.0 -
-				             agent['personality']['aggression'] * 3.0 +
-				             agent['personality']['hold_jitter'])
-				if _number(now) - agent['hold_started'] < max(2.5, hold_time):
-					return tuple(position)
-			agent['hold_started'] = None
 			if index + 1 < len(waypoints):
 				agent['waypoint_index'] = index + 1
 				waypoint = waypoints[index + 1]

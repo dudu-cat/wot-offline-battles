@@ -647,7 +647,7 @@ class BotPlanner(object):
             direction = 1.0 if bot["team"] == 1 else -1.0
             point = {"x": round(side * 115.0, 3), "y": 0.0,
                      "z": round(direction * 18.0, 3)}
-            return route_id, 0, point, point, False
+            return route_id, 0, point, point
         route_id = str(route.get("id") or "uploaded_route")
         state = self._route_states.get(bot["id"])
         if state is None or state.get("route_id") != route_id:
@@ -662,26 +662,21 @@ class BotPlanner(object):
             # and visit its own base before it may advance toward the enemy flag.
             if nearest == 0 and len(waypoints) > 1:
                 index = 1
-            state = {"index": index, "hold_until": 0.0,
-                     "route_id": route_id}
+            state = {"index": index, "route_id": route_id}
             self._route_states[bot["id"]] = state
         index = min(max(0, _integer(state.get("index"))), len(waypoints) - 1)
         point = _point(waypoints[index])
         bx = _number(bot["state"].get("x"))
         bz = _number(bot["state"].get("z"))
         reached = math.hypot(point["x"] - bx, point["z"] - bz) <= 13.0
-        holding = False
-        if reached and bool(waypoints[index].get("hold", False)):
-            if _number(state.get("hold_until")) <= 0.0:
-                state["hold_until"] = _number(now) + 4.0 + self._personality(bot["id"])["patience"] * 5.0
-            holding = _number(now) < _number(state["hold_until"])
-        if reached and not holding and index + 1 < len(waypoints):
+        # Macro points describe the lane, not parking places.  Tanks keep
+        # advancing until combat, safety or the final destination stops them.
+        if reached and index + 1 < len(waypoints):
             index += 1
             state["index"] = index
-            state["hold_until"] = 0.0
             point = _point(waypoints[index])
         anchor = _point(waypoints[max(0, index - 1)])
-        return route_id, index, point, anchor, holding
+        return route_id, index, point, anchor
 
     @staticmethod
     def _flank_point(bot, contact, desired_range):
@@ -835,7 +830,7 @@ class BotPlanner(object):
         return True
 
     def _order_for(self, bot, index, count, focus, contacts, now):
-        route_id, route_index, move, route_anchor, holding = self._route(bot, now)
+        route_id, route_index, move, route_anchor = self._route(bot, now)
         profile = dict(bot["profile"])
         desired_range = max(10.0, _number(profile.get("desired_range"), 180.0))
         fire_range = max(desired_range, _number(profile.get("fire_range"), 500.0))
@@ -848,8 +843,10 @@ class BotPlanner(object):
             "face_position": None,
             "move_position": move,
             "fire_allowed": False,
-            "combat_mode": "hold" if holding else "route",
-            "throttle_override": 0.0 if holding else 0.75,
+            "combat_mode": "route",
+            # The local driver owns safety and steering.  A normal route must
+            # not replace its full throttle with a server-side cruise limit.
+            "throttle_override": None,
             "desired_range": round(desired_range, 3),
             "fire_range": round(fire_range, 3),
             "route_id": route_id,
@@ -891,9 +888,9 @@ class BotPlanner(object):
             order["aim_position"] = dict(move)
             order["face_position"] = dict(move)
             order["fire_allowed"] = False
-            order["combat_mode"] = "hold" if holding else "route"
+            order["combat_mode"] = "route"
             order["move_position"] = dict(move)
-            order["throttle_override"] = 0.0 if holding else 0.75
+            order["throttle_override"] = None
         elif distance > far_limit:
             self._engage_anchors.pop(bot["id"], None)
             self._cover_states.pop(bot["id"], None)

@@ -525,12 +525,6 @@ class LocalDriver(object):
 			# A target behind the hull is a pivot, not a clearing arc. Driving while
 			# applying full steering makes the whole formation draw a circle at spawn.
 			throttle = 0.0
-		elif abs(delta) > 1.0:
-			# Keep enough drive to clear nearby hulls without making the turn radius
-			# so large that the tank leaves its baked corridor.
-			throttle = 0.55
-		elif abs(delta) > 0.55:
-			throttle = 0.78
 		return {
 			'throttle': throttle,
 			'turn': turn,

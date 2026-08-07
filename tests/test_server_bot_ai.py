@@ -436,13 +436,9 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertIsNone(expired_order["target_id"])
         self.assertEqual("route", expired_order["combat_mode"])
 
-    def test_visible_enemy_overrides_a_route_hold(self):
+    def test_route_hold_metadata_does_not_pause_travel(self):
         planner = BotPlanner()
         manifest = _manifest()
-        manifest[0]["profile"] = {
-            "dominant_role": "brawler", "desired_range": 40.0,
-            "fire_range": 500.0, "roles": {"brawler": 1.0},
-        }
         manifest[0]["route"] = {
             "id": "held_lane", "waypoints": [
                 {"x": 0, "y": 0, "z": -40},
@@ -450,19 +446,14 @@ class ServerBotPlannerTests(unittest.TestCase):
                 {"x": 0, "y": 0, "z": 200},
             ],
         }
-        planner.report_contacts([{
-            "observing_team": 1, "target_kind": "bot", "target_id": 3,
-            "target_team": 2, "visible": True,
-            "x": 0, "y": 0, "z": 20, "health": 1000,
-            "max_health": 1000,
-        }], planner.known_targets(_states(), []), 1.0)
 
         result = planner.build_orders(manifest, _states(), [], 1.0)
         order = next(value for value in result["orders"] if value["id"] == 1)
 
-        self.assertEqual(3, order["target_id"])
-        self.assertTrue(order["fire_allowed"])
-        self.assertNotEqual("hold", order["combat_mode"])
+        self.assertEqual(2, order["route_index"])
+        self.assertEqual({"x": 0.0, "y": 0.0, "z": 200.0}, order["move_position"])
+        self.assertEqual("route", order["combat_mode"])
+        self.assertIsNone(order["throttle_override"])
 
     def test_distant_mobile_bot_approaches_before_attempting_a_flank(self):
         planner = BotPlanner()
@@ -948,7 +939,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         planner._rebalance_routes(1, bots, contacts, 1.0)
         donor = next(bot_id for bot_id, assignment in planner._route_assignments.items()
                      if assignment["route"]["id"] == "right" and bot_id != 3)
-        route_state = {"route_id": "right", "index": 1, "hold_until": 0.0}
+        route_state = {"route_id": "right", "index": 1}
         planner._route_states[donor] = route_state
 
         planner._rebalance_routes(1, bots, contacts, 5.01)

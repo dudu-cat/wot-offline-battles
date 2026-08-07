@@ -171,6 +171,20 @@ class BotAIDriverTest(unittest.TestCase):
         self.assertAlmostEqual(0.0, order["turn"], places=5)
         self.assertAlmostEqual(0.0, order["target_yaw"], places=5)
 
+    def test_normal_route_turn_keeps_full_throttle(self):
+        driver = self.module.LocalDriver()
+        target_yaw = 0.9
+        order = driver.drive(
+            2, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+            (math.sin(target_yaw) * 50.0, 0.0,
+             math.cos(target_yaw) * 50.0),
+            (), lambda angle: True,
+        )
+
+        self.assertEqual("drive", order["recovery_mode"])
+        self.assertEqual(1.0, order["throttle"])
+        self.assertGreater(order["turn"], 0.9)
+
     def test_reverse_steering_yaws_opposite_to_forward_steering(self):
         physics = load_physics()
         params = {
