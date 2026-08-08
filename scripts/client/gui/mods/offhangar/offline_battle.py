@@ -3538,6 +3538,17 @@ def _offh_battle_sweep(tag='exit'):
 				_stop_network_battle(BigWorld.player())
 			except Exception:
 				pass
+		_stage = 'music'
+		try:
+			import MusicController as _sweep_music
+			_music_controller = getattr(_sweep_music, 'g_musicController', None)
+			if (_music_controller is not None and
+					getattr(_music_controller, '_offh_arena_lifecycle', False)):
+				_music_controller.onLeaveArena()
+				_music_controller._offh_arena_lifecycle = False
+				_music_controller.stop()
+		except Exception:
+			pass
 		_stage = 'callbacks'
 		for _callback_key in ('g_offh_aih_callback_id',
 				'g_offh_capture_callback_id', 'g_offh_auto_spawn_callback_id'):
@@ -16677,8 +16688,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				try:
 					import SoundGroups as _SG
 					if getattr(_SG, 'g_instance', None) is not None:
-						_SG.g_instance.setVolume('music', 1.0)
-						_SG.g_instance.setVolume('ambient', 1.0)
+						# Preserve the user's sliders exactly as retail Avatar startup does.
+						_SG.g_instance.applyPreferences()
 				except Exception: pass
 				
 				# 1) Okamžitě zastavit staré FMOD sound eventy
@@ -16739,6 +16750,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				# New battle: drop the cached sound objects, the arena (and its tracks) changed.
 				globals()['g_offh_arena_snd'] = {}
 				_mc.play(_MC.MUSIC_EVENT_COMBAT_LOADING)
+				# Match Avatar.__onInitStepCompleted: subscribe once so BATTLE starts
+				# both the arena combat event and its map ambience. The synthetic player
+				# is an Account, so the private sound resolver above supplies the same
+				# arena events that MusicController normally gets from PlayerAvatar.
+				if not getattr(_mc, '_offh_arena_lifecycle', False):
+					_mc.onEnterArena()
+					_mc._offh_arena_lifecycle = True
+					LOG_DEBUG('OfflineBattle.music: original arena lifecycle active')
 				LOG_DEBUG('OfflineBattle.sounds.battle_start', 'COMBAT_LOADING OK')
 			except Exception as _se:
 				LOG_DEBUG('OfflineBattle.sounds.battle_start error', _se)
@@ -16857,11 +16876,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										player.arena.periodLength = _battle_duration
 										player.arena.periodEndTime = BigWorld.serverTime() + _battle_duration
 										player.arena.onPeriodChange(3, player.arena.periodEndTime, _battle_duration, {})
-									try:
-										import MusicController as _MC
-										_MC.g_musicController.play(_MC.MUSIC_EVENT_NONE)
-									except: pass
-									
 								if hasattr(player.arena, 'onNewVehicleListReceived'):
 									player.arena.onNewVehicleListReceived()
 								if hasattr(player.arena, 'onVehicleAdded'):
