@@ -405,6 +405,10 @@ class LANClient(object):
 		self._last_bot_state = now
 		return self._send({'type': 'bot_state', 'bots': bots[:30]})
 
+	def bot_states_due(self):
+		"""Return whether building the next authoritative snapshot is useful."""
+		return time.time() - self._last_bot_state >= BOT_STATE_INTERVAL
+
 	def send_bot_observation(self, contacts, affordances=None, navigation=None):
 		now = time.time()
 		if now - self._last_bot_observation < 0.45:
@@ -1109,12 +1113,12 @@ def stop_for_player(player):
 		player._offhangar_network_formation = None
 
 
-def _server_pose_from_world(player, world_x, world_y, world_z, world_yaw):
-	"""Convert the loaded map coordinates back into the shared server frame."""
+def _server_pose_frame(player):
+	"""Return the fixed world-to-server axes for the current battle."""
 	try:
 		formation = getattr(player, '_offhangar_network_formation', None)
 		if formation is None:
-			return (world_x, world_y, world_z), world_yaw
+			return None
 		base1 = formation(1, 0)
 		base2 = formation(2, 0)
 		b1x, b1z = float(base1[0]), float(base1[1])
@@ -1123,15 +1127,32 @@ def _server_pose_from_world(player, world_x, world_y, world_z, world_yaw):
 		length = math.sqrt(dx * dx + dz * dz) or 1.0
 		axis_x, axis_z = dx / length, dz / length
 		right_x, right_z = axis_z, -axis_x
+		return (b1x, b1z, axis_x, axis_z, right_x, right_z,
+		        math.atan2(dx, dz))
+	except Exception:
+		return None
+
+
+def _server_pose_with_frame(frame, world_x, world_y, world_z, world_yaw):
+	"""Convert one pose using axes shared by every snapshot body."""
+	try:
+		if frame is None:
+			return (world_x, world_y, world_z), world_yaw
+		b1x, b1z, axis_x, axis_z, right_x, right_z, axis_yaw = frame
 		world_dx = float(world_x) - b1x
 		world_dz = float(world_z) - b1z
 		travel = world_dx * axis_x + world_dz * axis_z
 		lateral = world_dx * right_x + world_dz * right_z
-		axis_yaw = math.atan2(dx, dz)
 		return ((lateral, _finite_float(world_y), travel),
 			_finite_float(world_yaw) - axis_yaw)
 	except Exception:
 		return None, _finite_float(world_yaw)
+
+
+def _server_pose_from_world(player, world_x, world_y, world_z, world_yaw):
+	"""Convert the loaded map coordinates back into the shared server frame."""
+	return _server_pose_with_frame(
+		_server_pose_frame(player), world_x, world_y, world_z, world_yaw)
 
 
 def send_local_input(player, forward, turn, aim_yaw, gun_pitch,
@@ -1513,6 +1534,12 @@ def publish_authoritative_bots(player, mocks):
 	"""Send canonical bot pose, gun, shot and HP state at 30 Hz."""
 	if not network_is_authority(player):
 		return False
+	client = getattr(player, '_offhangar_network_client', None)
+	if client is None or not client.bot_states_due():
+		# Avoid walking every mock and converting every pose on render frames which
+		# the 30 Hz transport will reject anyway.
+		return False
+	server_frame = _server_pose_frame(player)
 	entity_to_bot = {}
 	for candidate in (mocks or {}).values():
 		candidate_bot_id = getattr(candidate, '_network_bot_id', None)
@@ -1529,11 +1556,13 @@ def publish_authoritative_bots(player, mocks):
 			killer_bot_id = entity_to_bot.get(
 				getattr(mock, 'last_killer_id', None), 0)
 			yaw = _finite_float(getattr(mock, 'yaw', 0.0))
-			server_pos, server_yaw = _server_pose_from_world(
-				player, pos.x, pos.y, pos.z, yaw)
-			unused_pos, server_aim_yaw = _server_pose_from_world(
-				player, pos.x, pos.y, pos.z,
-				yaw + _finite_float(getattr(mock, '_turret_yaw', 0.0)))
+			server_pos, server_yaw = _server_pose_with_frame(
+				server_frame, pos.x, pos.y, pos.z, yaw)
+			# Position and hull yaw already established the server-frame rotation.
+			# Relative turret yaw is frame invariant, so a second formation lookup and
+			# coordinate conversion per bot is unnecessary.
+			server_aim_yaw = server_yaw + _finite_float(
+				getattr(mock, '_turret_yaw', 0.0))
 			states.append({
 				'id': int(bot_id),
 				'x': server_pos[0], 'y': server_pos[1], 'z': server_pos[2],
@@ -1552,7 +1581,6 @@ def publish_authoritative_bots(player, mocks):
 			})
 		except Exception:
 			continue
-	client = getattr(player, '_offhangar_network_client', None)
 	return client.send_bot_states(states) if states else False
 
 

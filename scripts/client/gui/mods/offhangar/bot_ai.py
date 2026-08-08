@@ -940,7 +940,7 @@ class BattleDirector(object):
 		agent['target_id'] = best.get('id') if best is not None else None
 		return best
 
-	def _route_position(self, agent, position, now):
+	def _route_position(self, agent, position, now, hull_yaw=None):
 		route = agent.get('route')
 		if route is None:
 			enemy_base = self.bases.get(2 if agent['team'] == 1 else 1)
@@ -965,8 +965,22 @@ class BattleDirector(object):
 					_distance_2d(position, (float(waypoints[nearest][0]),
 					position[1], float(waypoints[nearest][1]))) < 30.0):
 				nearest += 1
+			# A deployed formation can be closer to a connector that it has already
+			# passed than to the next lane point.  Joining that connector makes every
+			# hull turn back toward its own flag before it may leave spawn.  Only skip
+			# a genuinely rear-facing point and preserve lateral lane openings.
+			if hull_yaw is not None:
+				while nearest + 1 < len(waypoints):
+					waypoint = waypoints[nearest]
+					bearing = math.atan2(float(waypoint[0]) - float(position[0]),
+					                     float(waypoint[1]) - float(position[2]))
+					if abs(_angle_delta(bearing, float(hull_yaw))) <= 1.75:
+						break
+					nearest += 1
 			agent['waypoint_index'] = nearest
 			agent['route_started'] = True
+			agent['route_join_anchor'] = tuple(position)
+			agent['route_join_index'] = nearest
 		index = min(int(agent.get('waypoint_index', 0)), len(waypoints) - 1)
 		waypoint = waypoints[index]
 		world = (float(waypoint[0]), float(position[1]), float(waypoint[1]))
@@ -994,7 +1008,13 @@ class BattleDirector(object):
 		waypoints = route.get('waypoints', ()) if route is not None else ()
 		if not waypoints:
 			return tuple(position)
-		index = max(0, min(int(agent.get('waypoint_index', 0)) - 1,
+		index = max(0, min(int(agent.get('waypoint_index', 0)),
+		                   len(waypoints) - 1))
+		if int(agent.get('route_join_index', -1)) == index:
+			anchor = agent.get('route_join_anchor')
+			if anchor is not None:
+				return tuple(anchor)
+		index = max(0, min(index - 1,
 		                   len(waypoints) - 1))
 		waypoint = waypoints[index]
 		return (float(waypoint[0]), float(position[1]), float(waypoint[1]))
@@ -1027,7 +1047,7 @@ class BattleDirector(object):
 		agent['health_fraction'] = (
 			_number(health, 1.0) / max(_number(max_health, 1.0), 1.0))
 		contact = self._choose_contact(agent, position, hull_yaw, now)
-		route_position = self._route_position(agent, position, now)
+		route_position = self._route_position(agent, position, now, hull_yaw)
 		profile = agent['profile']
 		personality = agent['personality']
 		order = {

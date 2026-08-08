@@ -662,7 +662,27 @@ class BotPlanner(object):
             # and visit its own base before it may advance toward the enemy flag.
             if nearest == 0 and len(waypoints) > 1:
                 index = 1
-            state = {"index": index, "route_id": route_id}
+            while (index + 1 < len(waypoints) and
+                   math.hypot(_number(waypoints[index].get("x")) - bx,
+                              _number(waypoints[index].get("z")) - bz) < 30.0):
+                index += 1
+            # Bot snapshots carry hull yaw in the same shared frame as uploaded
+            # routes. Skip only a truly rear-facing connector; a side road remains a
+            # valid lane opening and must not be flattened into the next macro point.
+            yaw = _number(bot["state"].get("yaw"))
+            while index + 1 < len(waypoints):
+                point = waypoints[index]
+                bearing = math.atan2(_number(point.get("x")) - bx,
+                                     _number(point.get("z")) - bz)
+                delta = (bearing - yaw + math.pi) % (math.pi * 2.0) - math.pi
+                if abs(delta) <= 1.75:
+                    break
+                index += 1
+            state = {"index": index, "route_id": route_id,
+                     "join_index": index,
+                     "join_anchor": {"x": bx,
+                                     "y": _number(bot["state"].get("y")),
+                                     "z": bz}}
             self._route_states[bot["id"]] = state
         index = min(max(0, _integer(state.get("index"))), len(waypoints) - 1)
         point = _point(waypoints[index])
@@ -675,7 +695,10 @@ class BotPlanner(object):
             index += 1
             state["index"] = index
             point = _point(waypoints[index])
-        anchor = _point(waypoints[max(0, index - 1)])
+        if state.get("join_index") == index and isinstance(state.get("join_anchor"), dict):
+            anchor = _point(state["join_anchor"])
+        else:
+            anchor = _point(waypoints[max(0, index - 1)])
         return route_id, index, point, anchor
 
     @staticmethod

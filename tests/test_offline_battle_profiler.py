@@ -56,6 +56,7 @@ class OfflineBattleProfilerTests(unittest.TestCase):
             "nav_tick",
             "nav_target",
             "bot_loop",
+            "traffic_snapshot",
             "driver",
             "direction",
             "physics",

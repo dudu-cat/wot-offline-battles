@@ -190,6 +190,16 @@ class BotAIDriverTest(unittest.TestCase):
         self.assertEqual(1.0, order["throttle"])
         self.assertGreater(order["turn"], 0.9)
 
+    def test_right_angle_route_turn_pivots_before_driving(self):
+        driver = self.module.LocalDriver()
+        order = driver.drive(
+            202, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+            (50.0, 0.0, 0.0), (), lambda angle: True,
+        )
+
+        self.assertEqual(0.0, order["throttle"])
+        self.assertGreater(order["turn"], 0.9)
+
     def test_reverse_steering_yaws_opposite_to_forward_steering(self):
         physics = load_physics()
         params = {

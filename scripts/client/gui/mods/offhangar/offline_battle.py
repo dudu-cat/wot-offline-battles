@@ -2345,7 +2345,7 @@ def _offh_ai_driver():
 
 
 def _offh_ai_hull_dims(descriptor):
-	"""Return conservative OBB half length/width from the native hull tester."""
+	"""Return OBB half length/width from the native chassis collision body."""
 	cache = globals().setdefault('g_offh_ai_hull_dims', {})
 	key = id(descriptor)
 	if key in cache:
@@ -2353,9 +2353,10 @@ def _offh_ai_hull_dims(descriptor):
 	half_length = 3.5
 	half_width = 1.7
 	try:
-		bbox = descriptor.hull['hitTester'].bbox
-		half_width = max(0.8, abs(float(bbox[0][0])), abs(float(bbox[1][0])))
-		half_length = max(1.5, abs(float(bbox[0][2])), abs(float(bbox[1][2])))
+		from gui.mods.offhangar.vehicle_collision import chassis_shape
+		shape = chassis_shape(descriptor)
+		half_width = float(shape[0])
+		half_length = float(shape[1])
 	except Exception:
 		pass
 	cache[key] = (half_length, half_width)
@@ -10019,6 +10020,40 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						LOG_DEBUG('OfflineBattle.SMART_AI disabled after init error:',
 						          str(_ai_init_error))
 					_ai_director = None
+				# Capture moving bodies once per rendered frame. The old inner loops read
+				# every model, descriptor and velocity again for every bot (roughly 29x29
+				# Python object walks) before doing the same 24 m distance filter.
+				_perf_traffic = _offh_perf_start()
+				_driver_frame = {}
+				_nav_frame = {}
+				for _frame_eid, _frame_vehicle in mock_vehicles.iteritems():
+					if (_frame_vehicle is None or
+					        not getattr(_frame_vehicle, 'isAlive', False)):
+						continue
+					try:
+						_frame_position = (
+							float(_frame_vehicle.position.x),
+							float(_frame_vehicle.position.y),
+							float(_frame_vehicle.position.z))
+						_frame_yaw = float(_frame_vehicle.yaw)
+						_frame_speed = float(
+							getattr(_frame_vehicle, '_veh_velocity', 0.0) or 0.0)
+						_frame_td = getattr(_frame_vehicle, 'typeDescriptor', None)
+						_frame_half_length, _frame_half_width = _offh_ai_hull_dims(
+							_frame_td)
+						_driver_frame[_frame_eid] = {
+							'position': _frame_position,
+							'yaw': _frame_yaw,
+							'velocity': (
+								math.sin(_frame_yaw) * _frame_speed, 0.0,
+								math.cos(_frame_yaw) * _frame_speed),
+							'half_length': _frame_half_length,
+							'half_width': _frame_half_width,
+						}
+						_nav_frame[_frame_eid] = _frame_position
+					except Exception:
+						continue
+				_offh_perf_stop('traffic_snapshot', _perf_traffic)
 				_perf_bot_loop = _offh_perf_start()
 				for eid, m_veh in mock_vehicles.iteritems():
 					if eid != getattr(player, 'playerVehicleID', -1) and getattr(m_veh, 'isAlive', False):
@@ -10145,15 +10180,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											_nav_key = ('local', int(eid), _nav_mode,
 											            _ai_order.get('target_id'))
 											_nav_anchor = None
-										_avoid_points = []
-										for _nav_eid, _nav_vehicle in mock_vehicles.iteritems():
-											if (_nav_eid == eid or _nav_vehicle is None or
-											        not getattr(_nav_vehicle, 'isAlive', False)):
-												continue
-											_nav_position = getattr(_nav_vehicle, 'position', None)
-											if _nav_position is not None:
-												_avoid_points.append((_nav_position.x, _nav_position.y,
-												                      _nav_position.z))
+										_avoid_points = [
+											_nav_position for _nav_eid, _nav_position in
+											_nav_frame.iteritems() if _nav_eid != eid]
 										_navigator = _offh_ai_navigator(_ai_director)
 										_requested_drive_pos = drive_pos
 										if _navigator is not None:
@@ -10230,34 +10259,19 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# timing, traffic separation, steering hysteresis and alternating
 							# recovery live in one testable state machine.
 							_driver_neighbours = []
-							for _driver_eid, _driver_vehicle in mock_vehicles.iteritems():
-								if (_driver_eid == eid or _driver_vehicle is None or
-								        not getattr(_driver_vehicle, 'isAlive', False)):
+							for _driver_eid, _driver_body in _driver_frame.iteritems():
+								if _driver_eid == eid:
 									continue
-								_driver_dx = float(_driver_vehicle.position.x) - float(m_veh.position.x)
-								_driver_dy = float(_driver_vehicle.position.y) - float(m_veh.position.y)
-								_driver_dz = float(_driver_vehicle.position.z) - float(m_veh.position.z)
+								_driver_position = _driver_body['position']
+								_driver_dx = _driver_position[0] - float(m_veh.position.x)
+								_driver_dy = _driver_position[1] - float(m_veh.position.y)
+								_driver_dz = _driver_position[2] - float(m_veh.position.z)
 								# Local OBB prediction has no value for distant or vertically
 								# separated vehicles. Filter before descriptor and dict work.
 								if (abs(_driver_dy) > 5.0 or
 								        _driver_dx * _driver_dx + _driver_dz * _driver_dz > 576.0):
 									continue
-								_driver_td = getattr(_driver_vehicle, 'typeDescriptor', None)
-								_driver_half_length, _driver_half_width = _offh_ai_hull_dims(_driver_td)
-								_driver_speed = float(getattr(_driver_vehicle, '_veh_velocity', 0.0) or 0.0)
-								_driver_neighbours.append({
-									'position': (
-										float(_driver_vehicle.position.x),
-										float(_driver_vehicle.position.y),
-										float(_driver_vehicle.position.z)),
-									'yaw': float(_driver_vehicle.yaw),
-									'velocity': (
-										math.sin(float(_driver_vehicle.yaw)) * _driver_speed,
-										0.0,
-										math.cos(float(_driver_vehicle.yaw)) * _driver_speed),
-									'half_length': _driver_half_length,
-									'half_width': _driver_half_width,
-								})
+								_driver_neighbours.append(_driver_body)
 							_own_half_length, _own_half_width = _offh_ai_hull_dims(_td)
 							_own_velocity = (
 								math.sin(float(m_veh.yaw)) * float(m_veh._veh_velocity),

@@ -342,6 +342,31 @@ class BotAITest(unittest.TestCase):
         self.assertEqual((0.0, 0.0, -90.0), target)
         self.assertEqual(3, agent["waypoint_index"])
 
+    def test_spawn_skips_rear_connector_and_anchors_navigation_at_hull(self):
+        director = self.ai.BattleDirector("07_lakeville", "forward-join")
+        agent = director.register(
+            93, 1, descriptor("mediumTank"), "Forward join bot"
+        )
+        agent["route"] = {
+            "waypoints": (
+                (0.0, -40.0, False),
+                (0.0, -65.0, False),
+                (40.0, 40.0, False),
+            )
+        }
+        agent["route_started"] = False
+
+        target = director._route_position(
+            agent, (0.0, 0.0, -20.0), 0.0, 0.0
+        )
+
+        self.assertEqual((40.0, 0.0, 40.0), target)
+        self.assertEqual(2, agent["waypoint_index"])
+        self.assertEqual(
+            (0.0, 0.0, -20.0),
+            director._route_anchor(agent, (0.0, 0.0, -20.0)),
+        )
+
     def test_route_hold_metadata_does_not_pause_local_director(self):
         director = self.ai.BattleDirector("07_lakeville", "no-route-holds")
         agent = director.register(

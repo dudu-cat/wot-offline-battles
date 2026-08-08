@@ -36,6 +36,7 @@ Metric guide
 
 callback          Total sampled offline-battle callback time.
 bot_loop          Total bot update-loop time.
+traffic_snapshot  Once-per-frame vehicle data shared by navigation and steering.
 driver            Local steering, including direction probes.
 direction         Terrain, water, and obstacle corridor probes.
 physics           Movement integration, terrain, and collision work.

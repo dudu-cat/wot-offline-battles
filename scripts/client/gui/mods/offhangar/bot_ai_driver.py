@@ -520,14 +520,17 @@ class LocalDriver(object):
 		# so the realised yaw still converges on chosen_yaw while it brakes to drive.
 		if float(speed) < -0.05:
 			turn = -turn
+		avoiding = abs(_angle_delta(chosen_yaw, desired_yaw)) > 0.05
 		throttle = 1.0
-		if abs(delta) > 2.15:
-			# A target behind the hull is a pivot, not a clearing arc. Driving while
-			# applying full steering makes the whole formation draw a circle at spawn.
+		if abs(delta) > 1.35 and not avoiding:
+			# A target more than about 77 degrees off the bow is a pivot, not a
+			# clearing arc. Driving while applying full steering makes a deployed
+			# formation draw a loop before it can enter its lane. Separation remains
+			# allowed to move an overlapping hull sideways out of a dense spawn.
 			throttle = 0.0
 		return {
 			'throttle': throttle,
 			'turn': turn,
 			'target_yaw': chosen_yaw,
-			'recovery_mode': 'avoid' if abs(_angle_delta(chosen_yaw, desired_yaw)) > 0.05 else 'drive',
+			'recovery_mode': 'avoid' if avoiding else 'drive',
 		}

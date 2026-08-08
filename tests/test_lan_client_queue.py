@@ -118,6 +118,52 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertAlmostEqual(1.0 / 30.0, self.network.BOT_STATE_INTERVAL)
         self.assertAlmostEqual(1.0 / 60.0, self.network.POLL_INTERVAL)
 
+    def test_bot_snapshot_due_check_skips_rejected_render_frames(self):
+        client = self.network.LANClient(
+            Player(), "127.0.0.1", 28782, "Alpha", "china:Ch01_Type59"
+        )
+        client._last_bot_state = self.network.time.time()
+
+        self.assertFalse(client.bot_states_due())
+
+    def test_authority_snapshot_reuses_one_server_coordinate_frame(self):
+        calls = []
+        sent = []
+        player = Player()
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_formation = lambda team, slot: (
+            calls.append((team, slot)) or
+            ((0.0, 0.0, 0.0) if team == 1 else (100.0, 0.0, 3.14))
+        )
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True,
+            phase="battle",
+            bot_states_due=lambda: True,
+            send_bot_states=lambda states: sent.extend(states) or True,
+        )
+        mocks = {}
+        for index in range(3):
+            mocks[index] = types.SimpleNamespace(
+                id=index,
+                _network_bot_id=index + 1,
+                position=types.SimpleNamespace(x=float(index), y=0.0, z=10.0),
+                yaw=0.0,
+                _turret_yaw=0.1,
+                _gun_pitch=0.0,
+                _veh_velocity=0.0,
+                _veh_turn_velocity=0.0,
+                _network_bot_fire_seq=0,
+                _network_bot_shell_index=0,
+                health=100,
+                isAlive=True,
+                last_killer_id=None,
+            )
+
+        self.assertTrue(self.network.publish_authoritative_bots(player, mocks))
+        self.assertEqual([(1, 0), (2, 0)], calls)
+        self.assertEqual(3, len(sent))
+        self.assertAlmostEqual(sent[0]["yaw"] + 0.1, sent[0]["aim_yaw"])
+
     def test_worker_sends_hello_before_exposing_connected_socket(self):
         player = Player()
         client = self.network.LANClient(
