@@ -2282,6 +2282,13 @@ def _offh_update_sixth_sense(player, visible_to_enemy, now):
 		player._offhangar_observed_until = now + 5.0
 		if was_observed or not _offh_has_sixth_sense(player):
 			return
+		delay = 3.0
+		try:
+			from items import tankmen
+			delay = float(tankmen.getSkillsConfig().get(
+				'commander_sixthSense', {}).get('delay', delay) or delay)
+		except Exception:
+			pass
 		generation = globals().get('g_offh_battle_gen', 0)
 		def _show_sixth_sense(_player=player, _generation=generation):
 			try:
@@ -2296,7 +2303,7 @@ def _offh_update_sixth_sense(player, visible_to_enemy, now):
 					battle.showSixthSenseIndicator(True)
 			except Exception as error:
 				LOG_DEBUG('Sixth Sense presentation failed: %s' % str(error))
-		_offh_battle_callback(3.0, _show_sixth_sense)
+		_offh_battle_callback(delay, _show_sixth_sense)
 	except Exception as error:
 		LOG_DEBUG('Sixth Sense scheduling failed: %s' % str(error))
 
@@ -2513,17 +2520,428 @@ def _offh_ai_class_tag(mock, descriptor):
 	return class_tag
 
 
-def _offh_ai_view_range(descriptor):
-	radius = 400.0
+def _offh_spot_get(container, key, default=None):
 	try:
-		turret = descriptor.turret
-		if hasattr(turret, 'get'):
-			radius = float(turret.get('circularVisionRadius', radius))
-		else:
-			radius = float(getattr(turret, 'circularVisionRadius', radius))
+		if hasattr(container, 'get'):
+			return container.get(key, default)
+		return getattr(container, key, default)
+	except Exception:
+		return default
+
+
+def _offh_spot_component_name(id_map, component_id):
+	try:
+		for name, value in id_map.iteritems():
+			if int(value) == int(component_id):
+				return str(name)
 	except Exception:
 		pass
-	return max(50.0, min(445.0, radius))
+	return None
+
+
+def _offh_spot_resource_profile(descriptor):
+	"""Read the 0.8.2 fields retained in resources, with explicit fallbacks.
+
+	The release client strips the server-owned base invisibility values from most
+	vehicle XML.  We still consume them when present (development/server data),
+	then fall back by vehicle class instead of pretending the missing value is an
+	exact per-vehicle coefficient.
+	"""
+	from gui.mods.offhangar import spotting
+	type_name = str(_offh_spot_get(
+		getattr(descriptor, 'type', None), 'name', 'unknown:unknown'))
+	turret_id = _offh_spot_get(getattr(descriptor, 'turret', None), 'id', (0, 0))
+	gun_id = _offh_spot_get(getattr(descriptor, 'gun', None), 'id', (0, 0))
+	camouflages = getattr(descriptor, 'camouflages', ()) or ()
+	key = (type_name, tuple(turret_id or (0, 0)), tuple(gun_id or (0, 0)),
+	       repr(camouflages))
+	cache = globals().setdefault('g_offh_spot_resource_profiles', {})
+	if key in cache:
+		return cache[key]
+	tags = getattr(getattr(descriptor, 'type', None), 'tags', ()) or ()
+	moving, still = spotting.class_camouflage(tags)
+	exact_base = False
+	turret_factor = float(_offh_spot_get(
+		getattr(descriptor, 'turret', None), 'invisibilityFactor', 1.0) or 1.0)
+	shot_factor = float(_offh_spot_get(
+		getattr(descriptor, 'gun', None), 'invisibilityFactorAtShot', 0.25) or 0.25)
+	try:
+		import ResMgr, nations
+		from items import vehicles
+		nation_id = int(getattr(descriptor.type, 'id', (0, 0))[0])
+		nation_name = nations.AVAILABLE_NAMES[nation_id]
+		vehicle_name = type_name.split(':', 1)[-1].lower()
+		vehicle_path = '%s%s/%s.xml' % (
+			vehicles._VEHICLE_TYPE_XML_PATH, nation_name, vehicle_name)
+		section = ResMgr.openSection(vehicle_path)
+		if section is not None and section.has_key('invisibility'):
+			moving = float(section.readFloat('invisibility/moving', moving))
+			still = float(section.readFloat('invisibility/still', still))
+			exact_base = True
+		turret_name = _offh_spot_component_name(
+			vehicles.g_cache.turretIDs(nation_id), turret_id[1])
+		gun_name = _offh_spot_component_name(
+			vehicles.g_cache.gunIDs(nation_id), gun_id[1])
+		turret_section = None
+		if section is not None and turret_name:
+			turret_section = section['turrets0/%s' % turret_name]
+			if (turret_section is not None and
+					turret_section.has_key('invisibilityFactor')):
+				turret_factor = float(turret_section.readFloat(
+					'invisibilityFactor', turret_factor))
+		local_gun = None
+		if turret_section is not None and gun_name:
+			local_gun = turret_section['guns/%s' % gun_name]
+		if local_gun is not None and local_gun.has_key('invisibilityFactorAtShot'):
+			shot_factor = float(local_gun.readFloat(
+				'invisibilityFactorAtShot', shot_factor))
+		elif gun_name:
+			guns = ResMgr.openSection('%s%s/components/guns.xml' % (
+				vehicles._VEHICLE_TYPE_XML_PATH, nation_name))
+			shared_gun = guns['shared/%s' % gun_name] if guns is not None else None
+			if (shared_gun is not None and
+					shared_gun.has_key('invisibilityFactorAtShot')):
+				shot_factor = float(shared_gun.readFloat(
+					'invisibilityFactorAtShot', shot_factor))
+	except Exception:
+		pass
+	paint_factor = 1.0
+	try:
+		from items import vehicles
+		customization = vehicles.g_cache.customization(descriptor.type.id[0])
+		for camo in camouflages:
+			if camo is None or camo[0] is None:
+				continue
+			camo_descr = customization['camouflages'].get(camo[0])
+			if camo_descr is not None:
+				paint_factor = max(paint_factor, float(
+					camo_descr.get('invisibilityFactor', 1.0) or 1.0))
+	except Exception:
+		pass
+	profile = {
+		'moving': moving,
+		'still': still,
+		'exact_base': exact_base,
+		'turret_factor': max(0.0, turret_factor),
+		'shot_factor': max(0.0, min(1.0, shot_factor)),
+		'paint_factor': max(1.0, paint_factor),
+	}
+	if not exact_base and not globals().get('g_offh_spot_fallback_logged', False):
+		globals()['g_offh_spot_fallback_logged'] = True
+		LOG_NOTE('SPOTTING: release resources omit per-vehicle base camouflage; '
+		         'using class fallback values')
+	cache[key] = profile
+	return profile
+
+
+def _offh_spot_device_profile(descriptor):
+	result = {'vision_factor': 1.0, 'binocular_factor': 1.0,
+	          'binocular_delay': 3.0, 'camouflage_net_factor': 1.0,
+	          'camouflage_net_delay': 3.0}
+	try:
+		result['vision_factor'] = float(
+			descriptor.miscAttrs.get('circularVisionRadiusFactor', 1.0) or 1.0)
+	except Exception:
+		pass
+	for device in (getattr(descriptor, 'optionalDevices', ()) or ()):
+		if device is None:
+			continue
+		name = str(getattr(device, 'name', '') or '').lower()
+		factor = float(getattr(device, 'factor', 1.0) or 1.0)
+		if 'stereoscope' in name:
+			result['binocular_factor'] = max(result['binocular_factor'], factor)
+			result['binocular_delay'] = float(getattr(
+				device, 'activateWhenStillSec', 3.0) or 3.0)
+		elif 'camouflagenet' in name:
+			result['camouflage_net_factor'] = max(
+				result['camouflage_net_factor'], factor)
+			result['camouflage_net_delay'] = float(getattr(
+				device, 'activateWhenStillSec', 3.0) or 3.0)
+	return result
+
+
+def _offh_spot_skill(tankman, wanted):
+	for skill in (getattr(tankman, 'skills', ()) or ()):
+		name = str(getattr(skill, 'name', skill) or '').lower()
+		if name != wanted.lower():
+			continue
+		if not bool(getattr(skill, 'isActive', True)):
+			return 0.0
+		return float(getattr(skill, 'level', 100.0) or 0.0)
+	return 0.0
+
+
+def _offh_spot_player_crew(player):
+	generation = int(globals().get('g_offh_battle_gen', 0) or 0)
+	cached = globals().get('g_offh_spot_player_crew')
+	if cached is not None and cached.get('generation') == generation:
+		return cached
+	result = {'generation': generation, 'commander_level': 100.0,
+	          'recon_level': 0.0, 'situational_level': 0.0,
+	          'camouflage_level': 0.0}
+	try:
+		from CurrentVehicle import g_currentVehicle
+		item = getattr(g_currentVehicle, 'item', None)
+		crew = [entry[1] if isinstance(entry, tuple) and len(entry) == 2 else entry
+		        for entry in (getattr(item, 'crew', ()) or ())]
+		crew = [tankman for tankman in crew if tankman is not None]
+		camo_levels = []
+		for tankman in crew:
+			role = str(getattr(getattr(tankman, 'descriptor', None), 'role', '') or '')
+			if role == 'commander':
+				try:
+					result['commander_level'] = float(tankman.realRoleLevel[0])
+				except Exception:
+					result['commander_level'] = float(
+						getattr(tankman, 'roleLevel', 100.0) or 100.0)
+			# Combined-role crew members may carry either skill even when their
+			# primary descriptor role is Commander rather than Radio Operator.
+			result['recon_level'] = max(result['recon_level'], _offh_spot_skill(
+				tankman, 'commander_eagleEye'))
+			result['situational_level'] = max(
+				result['situational_level'], _offh_spot_skill(
+					tankman, 'radioman_finder'))
+			camo_levels.append(_offh_spot_skill(tankman, 'camouflage'))
+		if camo_levels:
+			result['camouflage_level'] = sum(camo_levels) / float(len(camo_levels))
+	except Exception:
+		pass
+	globals()['g_offh_spot_player_crew'] = result
+	return result
+
+
+def _offh_spot_is_local_player(player, vehicle):
+	return (vehicle is not None and int(getattr(vehicle, 'id', -1)) ==
+	        int(getattr(player, 'playerVehicleID', -2)))
+
+
+def _offh_spot_loadout(player, vehicle, descriptor):
+	result = _offh_spot_device_profile(descriptor)
+	crew_device_bonus = 0.0
+	try:
+		crew_device_bonus = float(
+			descriptor.miscAttrs.get('crewLevelIncrease', 0.0) or 0.0)
+	except Exception:
+		pass
+	result.update({'commander_level': 100.0 + crew_device_bonus, 'recon_level': 0.0,
+	               'situational_level': 0.0, 'camouflage_level': 0.0})
+	if _offh_spot_is_local_player(player, vehicle):
+		result.update(_offh_spot_player_crew(player))
+		# 0.8.2 Tankman.realRoleLevel reports the ventilation bonus in its
+		# breakdown but omits it from the returned level; the descriptor owns it.
+		result['commander_level'] += crew_device_bonus
+	return result
+
+
+def _offh_spot_motion(vehicle, now):
+	from gui.mods.offhangar import spotting
+	if vehicle is None:
+		return False, spotting.STILL_DEVICE_DELAY_SECONDS
+	speed = abs(float(getattr(vehicle, '_veh_velocity', 0.0) or 0.0))
+	moving = speed > spotting.MOVING_SPEED_EPSILON
+	if moving:
+		vehicle._offh_spot_still_since = float(now)
+	elif not hasattr(vehicle, '_offh_spot_still_since'):
+		vehicle._offh_spot_still_since = float(now)
+	still_for = 0.0 if moving else max(
+		0.0, float(now) - float(vehicle._offh_spot_still_since))
+	return moving, still_for
+
+
+def _offh_spot_damage_vision_factor(vehicle, descriptor):
+	"""Read crew/module vision penalties without depending on battle closures."""
+	if vehicle is None:
+		return 1.0
+	factor = 1.0
+	try:
+		from gui.mods.offhangar import device_damage
+		impaired = getattr(vehicle, '_crew_impaired', None) or ()
+		factor *= float(device_damage.crew_stat_factor(impaired, 'vision'))
+		factor *= float(device_damage.module_stat_factor(
+			getattr(vehicle, 'devices_hp', None),
+			getattr(vehicle, '_destroyed_devices', None), descriptor, 'vision'))
+		return float(device_damage.clamp_vision_factor(factor))
+	except Exception:
+		return max(0.5, min(1.0, factor))
+
+
+def _offh_ai_view_range(descriptor, vehicle=None, player=None, now=None):
+	from gui.mods.offhangar import spotting
+	radius = float(_offh_spot_get(
+		getattr(descriptor, 'turret', None), 'circularVisionRadius', 400.0) or 400.0)
+	loadout = _offh_spot_loadout(player, vehicle, descriptor) if player is not None else {
+		'commander_level': 100.0, 'vision_factor': 1.0,
+		'recon_level': 0.0, 'situational_level': 0.0,
+		'binocular_factor': 1.0, 'binocular_delay': 3.0}
+	still_active = False
+	if vehicle is not None and now is not None:
+		_unused_moving, still_for = _offh_spot_motion(vehicle, now)
+		still_active = still_for >= float(loadout.get(
+			'binocular_delay', spotting.STILL_DEVICE_DELAY_SECONDS) or
+			spotting.STILL_DEVICE_DELAY_SECONDS)
+	vision_factor = float(loadout.get('vision_factor', 1.0) or 1.0)
+	vision_factor *= _offh_spot_damage_vision_factor(vehicle, descriptor)
+	return spotting.effective_view_range(
+		radius, loadout.get('commander_level', 100.0), vision_factor,
+		loadout.get('recon_level', 0.0),
+		loadout.get('situational_level', 0.0),
+		loadout.get('binocular_factor', 1.0), still_active)
+
+
+def _offh_spot_camouflage(player, vehicle, descriptor, now):
+	from gui.mods.offhangar import spotting
+	profile = _offh_spot_resource_profile(descriptor)
+	loadout = _offh_spot_loadout(player, vehicle, descriptor)
+	moving, still_for = _offh_spot_motion(vehicle, now)
+	fired_recently = (float(now) - float(
+		getattr(vehicle, '_offh_spot_last_shot', -999.0) or -999.0) <
+		spotting.SHOT_CAMOUFLAGE_SECONDS)
+	return spotting.effective_camouflage(
+		profile['moving'], profile['still'], moving,
+		loadout.get('camouflage_level', 0.0), profile['turret_factor'],
+		profile['paint_factor'], loadout.get('camouflage_net_factor', 1.0),
+		still_for >= float(loadout.get(
+			'camouflage_net_delay', spotting.STILL_DEVICE_DELAY_SECONDS) or
+			spotting.STILL_DEVICE_DELAY_SECONDS),
+		profile['shot_factor'], fired_recently, 0.0)
+
+
+def _offh_spot_detection_range(player, observer, target, now):
+	from gui.mods.offhangar import spotting
+	view_range = observer.get('_spot_view_range')
+	if view_range is None:
+		view_range = _offh_ai_view_range(
+			observer['descriptor'], observer.get('vehicle'), player, now)
+	camouflage = target.get('_spot_camouflage')
+	if camouflage is None:
+		camouflage = _offh_spot_camouflage(
+			player, target.get('vehicle'), target['descriptor'], now)
+	return spotting.detection_distance(view_range, camouflage)
+
+
+def _offh_spot_visible_for_player(player, target_vehicle, now=None):
+	"""Evaluate one target once and share the result with render/network code."""
+	try:
+		import BigWorld
+		if now is None:
+			now = float(BigWorld.time())
+	except Exception:
+		if now is None:
+			now = time.time()
+	now = float(now)
+	if target_vehicle is None or getattr(target_vehicle, 'position', None) is None:
+		return False
+	player_team = int(getattr(player, '_offhangar_team',
+		getattr(player, '_offhangar_network_team', 1)) or 1)
+	return _offh_spot_visible_to_team(
+		player, target_vehicle, player_team, now, True)
+
+
+def _offh_spot_visible_to_team(player, target_vehicle, observing_team, now,
+			record_player_spot=False):
+	"""Evaluate whether one team currently observes a vehicle."""
+	if target_vehicle is None or getattr(target_vehicle, 'position', None) is None:
+		return False
+	observing_team = int(observing_team or 1)
+	target_info = getattr(target_vehicle, 'publicInfo', None) or {}
+	target_team = int(getattr(
+		target_vehicle, '_bot_team', target_info.get('team', 2)) or 2)
+	if target_team == observing_team:
+		return True
+	if (now - float(getattr(target_vehicle, '_offh_spot_eval_time', -999.0) or -999.0)
+			< 0.45 and int(getattr(
+				target_vehicle, '_offh_spot_eval_team', 0) or 0) == observing_team):
+		return now < float(getattr(target_vehicle, '_spot_until', 0.0) or 0.0)
+	mocks = globals().get('G_MOCK_VEHICLES', {}) or {}
+	player_id = int(getattr(player, 'playerVehicleID', -1))
+	local = mocks.get(player_id)
+	if local is None:
+		return False
+	try:
+		local._veh_velocity = float(player.getOwnVehicleSpeeds()[0])
+	except Exception:
+		pass
+	target_descriptor = getattr(target_vehicle, 'typeDescriptor', None)
+	if target_descriptor is None:
+		return False
+	target = {
+		'id': int(getattr(target_vehicle, 'id', -1)),
+		'team': target_team,
+		'position': (float(target_vehicle.position.x),
+		             float(target_vehicle.position.y),
+		             float(target_vehicle.position.z)),
+		'descriptor': target_descriptor,
+		'vehicle': target_vehicle,
+	}
+	target['_spot_camouflage'] = _offh_spot_camouflage(
+		player, target_vehicle, target_descriptor, now)
+	candidates = []
+	for observer_vehicle in mocks.values():
+		if (observer_vehicle is target_vehicle or
+				not bool(getattr(observer_vehicle, 'isAlive', True)) or
+				getattr(observer_vehicle, 'position', None) is None):
+			continue
+		observer_info = getattr(observer_vehicle, 'publicInfo', None) or {}
+		observer_team = int(getattr(
+			observer_vehicle, '_bot_team', observer_info.get('team', 2)) or 2)
+		if observer_team != observing_team:
+			continue
+		descriptor = getattr(observer_vehicle, 'typeDescriptor', None)
+		if descriptor is None:
+			continue
+		position = (float(observer_vehicle.position.x),
+		            float(observer_vehicle.position.y),
+		            float(observer_vehicle.position.z))
+		observer = {
+			'id': int(getattr(observer_vehicle, 'id', -1)),
+			'team': observer_team,
+			'position': position,
+			'descriptor': descriptor,
+			'vehicle': observer_vehicle,
+		}
+		observer['_spot_view_range'] = _offh_ai_view_range(
+			descriptor, observer_vehicle, player, now)
+		dx = target['position'][0] - position[0]
+		dz = target['position'][2] - position[2]
+		distance_sq = dx * dx + dz * dz
+		spot_range = _offh_spot_detection_range(player, observer, target, now)
+		if distance_sq <= spot_range * spot_range:
+			candidates.append((distance_sq, observer))
+	candidates.sort(key=lambda item: item[0])
+	seen = False
+	for distance_sq, observer in candidates[:3]:
+		if (distance_sq <= 2500.0 or
+				_offh_ai_has_los(observer['position'], target['position'])):
+			seen = True
+			if record_player_spot and observer['id'] == player_id:
+				_offh_record_direct_spot(player, target_vehicle, now)
+			break
+	target_vehicle._offh_spot_eval_time = now
+	target_vehicle._offh_spot_eval_team = observing_team
+	target_vehicle._offh_spot_eval_seen = seen
+	if seen:
+		from gui.mods.offhangar import spotting
+		target_vehicle._spot_until = now + spotting.SPOT_MEMORY_SECONDS
+	return now < float(getattr(target_vehicle, '_spot_until', 0.0) or 0.0)
+
+
+def _offh_spot_refresh_sixth_sense(player, now):
+	"""Run enemy observation on replicas where no local AI director exists."""
+	now = float(now)
+	if now < float(getattr(player, '_offhangar_sixth_check_next', 0.0) or 0.0):
+		return
+	player._offhangar_sixth_check_next = now + 0.5
+	mocks = globals().get('G_MOCK_VEHICLES', {}) or {}
+	local = mocks.get(int(getattr(player, 'playerVehicleID', -1)))
+	if (local is None or not bool(getattr(local, 'isAlive', True)) or
+			int(getattr(local, 'health', 0) or 0) <= 0):
+		return
+	player_team = int(getattr(player, '_offhangar_team',
+		getattr(player, '_offhangar_network_team', 1)) or 1)
+	enemy_team = 2 if player_team == 1 else 1
+	visible = _offh_spot_visible_to_team(
+		player, local, enemy_team, now, False)
+	_offh_update_sixth_sense(player, bool(visible), now)
 
 
 def _offh_ai_has_los(observer_position, target_position):
@@ -2780,6 +3198,10 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 	entries = {}
 	player_id = getattr(player, 'playerVehicleID', -1)
 	player_mock = mock_vehicles.get(player_id)
+	try:
+		player_mock._veh_velocity = float(player.getOwnVehicleSpeeds()[0])
+	except Exception:
+		pass
 	player_health = getattr(player_mock, 'health', getattr(player, 'health', 1))
 	player_max_health = getattr(player_mock, 'maxHealth', max(1, player_health))
 	from gui.mods.offhangar.bot_ai import build_vehicle_profile
@@ -2796,6 +3218,7 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 		'server_id': getattr(player, '_offhangar_network_id', None),
 		'target_kind': 'human',
 		'descriptor': player_descriptor,
+		'vehicle': player_mock,
 		'alive': bool((player_health or 0) > 0 and not getattr(player, '_is_dead', False)),
 	}
 	for entity_id, mock in mock_vehicles.iteritems():
@@ -2824,9 +3247,18 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 			'server_id': server_id,
 			'target_kind': target_kind,
 			'descriptor': descriptor,
+			'vehicle': mock,
 			'alive': bool(getattr(mock, 'isAlive', False) and health > 0),
 		}
 	living = [entry for entry in entries.values() if entry['alive']]
+	# Equipment, crew and camouflage are invariant across this 2 Hz refresh.
+	# Compute each vehicle once instead of repeating them for every observer-target
+	# pair (30 x 30 in a full room).
+	for entry in living:
+		entry['_spot_view_range'] = _offh_ai_view_range(
+			entry['descriptor'], entry.get('vehicle'), player, now)
+		entry['_spot_camouflage'] = _offh_spot_camouflage(
+			player, entry.get('vehicle'), entry['descriptor'], now)
 	network_contacts = []
 	for target in entries.values():
 		observing_team = 2 if target['team'] == 1 else 1
@@ -2841,28 +3273,27 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 				dx = target['position'][0] - observer['position'][0]
 				dz = target['position'][2] - observer['position'][2]
 				distance_sq = dx * dx + dz * dz
-				view_range = _offh_ai_view_range(observer['descriptor'])
-				if distance_sq <= view_range * view_range:
+				spot_range = _offh_spot_detection_range(
+					player, observer, target, now)
+				if distance_sq <= spot_range * spot_range:
 					candidates.append((distance_sq, observer))
 			candidates.sort(key=lambda item: item[0])
-			confirmed_los = False
-			for candidate_index, (distance_sq, observer) in enumerate(candidates):
-				# Three probes are the steady-state budget. If all three are blocked,
-				# continue only until one farther observer proves a real lane instead
-				# of permanently declaring the target invisible.
-				if candidate_index >= 3 and confirmed_los:
-					break
+			for distance_sq, observer in candidates[:3]:
 				proximity_visible = distance_sq <= 2500.0
 				has_los = _offh_ai_has_los(
 					observer['position'], target['position'])
 				if proximity_visible or has_los:
 					visible = True
+					if (observer['id'] == player_id and
+							target['team'] != observer['team'] and
+							target.get('vehicle') is not None):
+						_offh_record_direct_spot(
+							player, target['vehicle'], now)
 					# Proximity spotting may reveal a tank through a building, but it
 					# is not a firing lane. Only a real collision-free sight segment
 					# may grant this observer a target assignment.
 					if not has_los:
 						continue
-					confirmed_los = True
 					if observer.get('target_kind') == 'bot':
 						observer_entity_id = int(observer['id'])
 						if observer_entity_id not in shootable_by_entity_ids:
@@ -2877,6 +3308,18 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 							shootable_by_bot_ids.append(observer_id)
 		if target['id'] == player_id:
 			_offh_update_sixth_sense(player, bool(visible), now)
+		target_vehicle = target.get('vehicle')
+		if target_vehicle is not None:
+			try:
+				target_vehicle._offh_spot_eval_time = float(now)
+				target_vehicle._offh_spot_eval_team = int(observing_team)
+				target_vehicle._offh_spot_eval_seen = bool(visible)
+				if visible:
+					from gui.mods.offhangar import spotting
+					target_vehicle._spot_until = (
+						float(now) + spotting.SPOT_MEMORY_SECONDS)
+			except Exception:
+				pass
 		# A confirmed destruction is shared immediately; an unseen living target
 		# only changes an existing contact to last-known state.
 		director.update_contact(
@@ -3261,6 +3704,9 @@ def _offh_battle_sweep(tag='exit'):
 		globals().pop('g_offh_ai_local_covers', None)
 		globals().pop('g_offh_ai_cover_cursor', None)
 		globals().pop('g_offh_ai_contacts_t', None)
+		globals().pop('g_offh_spot_resource_profiles', None)
+		globals().pop('g_offh_spot_player_crew', None)
+		globals().pop('g_offh_spot_fallback_logged', None)
 		globals().pop('g_offh_ai_init_error_logged', None)
 		globals().pop('g_offh_ai_navigation_disabled', None)
 		for _nav_error_key in [value for value in globals()
@@ -4493,6 +4939,7 @@ def play_network_remote_shot(attacker_mock, start_pos, aim_yaw, gun_pitch, shell
 		from items import vehicles
 		if attacker_mock is None:
 			return False
+		attacker_mock._offh_spot_last_shot = float(BigWorld.time())
 		td = getattr(attacker_mock, 'typeDescriptor', None)
 		gun_model = getattr(attacker_mock, '_gun_model', None)
 		if td is None or gun_model is None:
@@ -5863,6 +6310,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			player._offhangar_shots_fired = 0
 			player._offhangar_has_sixth_sense = None
 			player._offhangar_observed_until = 0.0
+			player._offhangar_sixth_check_next = 0.0
 			if hasattr(player, 'arena') and player.arena is not None:
 				p_id = getattr(player, 'playerVehicleID', -1)
 				if hasattr(player.arena, 'vehicles') and type(player.arena.vehicles) is dict:
@@ -6698,6 +7146,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		globals().pop('g_offh_ai_local_covers', None)
 		globals().pop('g_offh_ai_cover_cursor', None)
 		globals().pop('g_offh_ai_contacts_t', None)
+		globals().pop('g_offh_spot_resource_profiles', None)
+		globals().pop('g_offh_spot_player_crew', None)
+		globals().pop('g_offh_spot_fallback_logged', None)
 		globals().pop('g_offh_ai_init_error_logged', None)
 		globals().pop('g_offh_ai_navigation_disabled', None)
 		for _nav_error_key in [value for value in globals()
@@ -10020,6 +10471,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						LOG_DEBUG('OfflineBattle.SMART_AI disabled after init error:',
 						          str(_ai_init_error))
 					_ai_director = None
+				if _ai_director is None:
+					try:
+						_offh_perf_call('spotting_player',
+						                _offh_spot_refresh_sixth_sense,
+						                player, BigWorld.time())
+					except Exception:
+						pass
 				# Capture moving bodies once per rendered frame. The old inner loops read
 				# every model, descriptor and velocity again for every bot (roughly 29x29
 				# Python object walks) before doing the same 24 m distance filter.
@@ -10803,95 +11261,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									m_veh._spot_chk = (getattr(m_veh, '_spot_chk', 9.0) or 9.0) + dt
 									if m_veh._spot_chk >= 0.5:
 										m_veh._spot_chk = (eid % 10) * 0.05  # stagger re-checks across bots
-										_svr = globals().get('g_offh_viewrange', 0.0)
-										if not _svr:
-											try:
-												_svr = float(loaded_models['td'].turret.get('circularVisionRadius', 400.0))
-											except Exception:
-												_svr = 400.0
-											globals()['g_offh_viewrange'] = _svr
-										# Damaged optics and a downed commander/radioman cut the range.
-										# Only the BASE radius stays cached; the factors are read on every
-										# check, so view range follows the crew and the module state
-										# instead of freezing at what the tank was worth on spawn.
-										try:
-											_pm_vis = mock_vehicles.get(getattr(player, 'playerVehicleID', -1))
-											if _pm_vis is not None:
-												from gui.mods.offhangar import device_damage as _DDv
-												_svr = _svr * _DDv.clamp_vision_factor(
-													_crew_factor(_pm_vis, 'vision') * _module_factor(_pm_vis, 'vision'))
-										except Exception:
-											pass
-										_sdx = m_veh.position.x - veh_pos[0]
-										_sdz = m_veh.position.z - veh_pos[2]
-										_sd2 = _sdx * _sdx + _sdz * _sdz
-										_seen = False
-										if _sd2 <= 2500.0:
-											_seen = True  # 50 m proximity spot
-										elif _sd2 <= _svr * _svr:
-											_seen = _offh_ai_has_los(
-												(veh_pos[0], veh_pos[1], veh_pos[2]),
-												(m_veh.position.x, m_veh.position.y,
-												 m_veh.position.z))
-										_player_seen = bool(_seen)
-										if not _seen:
-											# Team vision: living allied bots relay spots to the player (radio).
-											# Cheap distance pass over all allies, then ONE ray to the nearest.
-											_tvb = None
-											_tvd = 1e18
-											_tpid = getattr(player, 'playerVehicleID', -1)
-											# The relay runs over the RADIO, so an ally outside comms range
-											# reports nothing. A damaged set shortens the range, a destroyed
-											# one shortens it further (device_damage 'signal'). Without a
-											# radio distance on the descriptor the gate stays open.
-											# ONLY gate when the radio is actually hurt. Gating on an intact
-											# set made every ally beyond the nominal signal range stop
-											# relaying, which on a big map silently removed most of the
-											# team vision the player had before - and that reads as the
-											# old "enemies are invisible" bug, not as a radio mechanic.
-											_radio_r2 = None
-											try:
-												_pm_rad = mock_vehicles.get(_tpid)
-												_sig = _module_factor(_pm_rad, 'signal')
-												if _sig < 1.0:
-													_rd = float(loaded_models['td'].radio.get('distance', 0.0) or 0.0)
-													if _rd > 0.0:
-														_rd = _rd * _sig
-														_radio_r2 = _rd * _rd
-											except Exception:
-												_radio_r2 = None
-											for _tvm in (globals().get('G_MOCK_VEHICLES', {}) or {}).values():
-												if _tvm is m_veh or getattr(_tvm, 'id', -1) == _tpid:
-													continue
-												if not getattr(_tvm, 'isAlive', True):
-													continue
-												if (getattr(_tvm, '_bot_team', 2) or 2) != (getattr(player, '_offhangar_team', 1) or 1):
-													continue
-												if _radio_r2 is not None:
-													_rdx = _tvm.position.x - veh_pos[0]
-													_rdz = _tvm.position.z - veh_pos[2]
-													if (_rdx * _rdx + _rdz * _rdz) > _radio_r2:
-														continue      # out of radio range: no relay
-												_tdx = m_veh.position.x - _tvm.position.x
-												_tdz = m_veh.position.z - _tvm.position.z
-												_td2 = _tdx * _tdx + _tdz * _tdz
-												if _td2 <= 2500.0:
-													_seen = True  # 50 m proximity spot by an ally
-													_tvb = None
-													break
-												if _td2 <= _svr * _svr and _td2 < _tvd:
-													_tvd = _td2
-													_tvb = _tvm
-											if (not _seen) and _tvb is not None:
-												_seen = _offh_ai_has_los(
-													(_tvb.position.x, _tvb.position.y,
-													 _tvb.position.z),
-													(m_veh.position.x, m_veh.position.y,
-													 m_veh.position.z))
-										if _player_seen:
-											_offh_record_direct_spot(player, m_veh, BigWorld.time())
-										if _seen:
-											m_veh._spot_until = BigWorld.time() + 5.0  # spot memory
 										# Re-apply the model state on every check (idempotent): a
 										# show that failed or raced the async model load left the
 										# bot invisible-while-spotted FOREVER (the change-only flip
@@ -11282,6 +11651,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_ai_shot_clear = bool(getattr(m_veh, '_offh_ai_los_clear', False))
 							if _ai_ready_to_fire and _ai_shot_clear:
 								m_veh._ai_shoot_timer = 0
+								m_veh._offh_spot_last_shot = float(BigWorld.time())
 								m_veh._network_bot_fire_seq = int(getattr(m_veh, '_network_bot_fire_seq', 0) or 0) + 1
 								m_veh._network_bot_shell_index = _ai_shell_index
 								if m_veh._ai_clip_size > 1:
@@ -13817,6 +14187,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						BigWorld.player().gunRotator.dispersionAngle = _gun_state['dispersion']
 						
 					player = BigWorld.player()
+					try:
+						_player_mock._offh_spot_last_shot = float(BigWorld.time())
+					except Exception:
+						pass
 					player._offhangar_shots_fired = getattr(player, '_offhangar_shots_fired', 0) + 1
 					globals()['G_OFFHANGAR_SHOTS_FIRED'] = int(
 						globals().get('G_OFFHANGAR_SHOTS_FIRED', 0) or 0) + 1

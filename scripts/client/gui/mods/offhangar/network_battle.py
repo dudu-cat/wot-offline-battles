@@ -1859,12 +1859,7 @@ def _set_remote_spot_visibility(player, mock, visible):
 
 
 def update_remote_spotting(player, mock, force=False):
-	"""Apply the offline battle's local spotting rules to one LAN human.
-
-	LAN humans do not run bot driving AI, but opposing humans still need the same
-	50 m proximity spot, view-range/static-LOS check, team vision and five-second
-	spot memory used by locally simulated opponents.
-	"""
+	"""Apply the shared 0.8.2 spotting result to one LAN vehicle."""
 	if player is None or mock is None:
 		return False
 	alive = bool(getattr(mock, 'isAlive', True)) and int(getattr(mock, 'health', 0) or 0) > 0
@@ -1885,64 +1880,25 @@ def update_remote_spotting(player, mock, force=False):
 		visible = now < float(getattr(mock, '_spot_until', 0.0) or 0.0)
 		return _set_remote_spot_visibility(player, mock, visible)
 	mock._network_spot_next = now + 0.5
-	local = _local_mock(player)
-	if local is None or getattr(local, 'position', None) is None or getattr(mock, 'position', None) is None:
-		return _set_remote_spot_visibility(player, mock, False)
-
-	view_range = 400.0
-	try:
-		view_range = float(local.typeDescriptor.turret.get('circularVisionRadius', 400.0))
-	except Exception:
-		pass
+	visible = False
 	try:
 		import sys
 		offline = sys.modules.get('gui.mods.offhangar.offline_battle')
-		crew_factor = getattr(offline, '_crew_factor', None) if offline is not None else None
-		module_factor = getattr(offline, '_module_factor', None) if offline is not None else None
-		if callable(crew_factor) and callable(module_factor):
-			view_range *= float(crew_factor(local, 'vision')) * float(module_factor(local, 'vision'))
+		evaluate = getattr(offline, '_offh_spot_visible_for_player', None)
+		if callable(evaluate):
+			visible = bool(evaluate(player, mock, now))
+		else:
+			# Source-loader safety net: proximity spotting must still work if the
+			# shared battle adapter failed to load. Normal installs never use this.
+			local = _local_mock(player)
+			if local is not None:
+				dx = float(mock.position.x) - float(local.position.x)
+				dz = float(mock.position.z) - float(local.position.z)
+				visible = dx * dx + dz * dz <= 2500.0
+				if visible:
+					mock._spot_until = now + 5.0
 	except Exception:
-		pass
-	view_range = max(50.0, view_range)
-
-	def _has_line_of_sight(observer, target, turret_sample=False):
-		dx = target.position.x - observer.position.x
-		dz = target.position.z - observer.position.z
-		distance_sq = dx * dx + dz * dz
-		if distance_sq <= 2500.0:
-			return True
-		if distance_sq > view_range * view_range:
-			return False
-		try:
-			import Math, sys
-			offline = sys.modules.get('gui.mods.offhangar.offline_battle')
-			space_getter = getattr(offline, '_offh_bspace', None) if offline is not None else None
-			space_id = space_getter() if callable(space_getter) else getattr(player, 'spaceID', 0)
-			start = Math.Vector3(observer.position.x, observer.position.y + 2.5, observer.position.z)
-			end = Math.Vector3(target.position.x, target.position.y + 1.5, target.position.z)
-			if BigWorld.wg_collideSegment(space_id, start, end, 128) is None:
-				return True
-			if turret_sample:
-				end = Math.Vector3(target.position.x, target.position.y + 2.2, target.position.z)
-				return BigWorld.wg_collideSegment(space_id, start, end, 128) is None
-		except Exception:
-			pass
-		return False
-
-	seen = _has_line_of_sight(local, mock, True)
-	if not seen:
-		# Team vision: any living allied local bot or LAN human can relay the spot.
-		for ally in (_offline_mocks() or {}).values():
-			if ally is local or ally is mock or not bool(getattr(ally, 'isAlive', True)):
-				continue
-			ally_team = int(getattr(ally, '_bot_team',
-				(getattr(ally, 'publicInfo', None) or {}).get('team', 2)) or 2)
-			if ally_team == player_team and _has_line_of_sight(ally, mock, False):
-				seen = True
-				break
-	if seen:
-		mock._spot_until = now + 5.0
-	visible = now < float(getattr(mock, '_spot_until', 0.0) or 0.0)
+		visible = False
 	return _set_remote_spot_visibility(player, mock, visible)
 
 
