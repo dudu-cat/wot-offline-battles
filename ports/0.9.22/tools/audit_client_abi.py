@@ -89,6 +89,11 @@ EXPECTED_ABI = {
     'scripts/common/items/components/legacy_stuff.pyc': {
         'NoLegacyStuff.get': ('self', 'k', 'd'),
         'NoLegacyStuff.__getitem__': ('self', 'item'),
+        'NoLegacyStuff.__contains__': ('self', 'item'),
+        'NoLegacyStuff.__iter__': ('self',),
+        'NoLegacyStuff.keys': ('self',),
+        'NoLegacyStuff.values': ('self',),
+        'NoLegacyStuff.items': ('self',),
     },
     'scripts/common/items/components/shared_components.pyc': {
         'DeviceHealth.__init__': (
@@ -604,6 +609,11 @@ EXPECTED_CODE_LITERALS = {
     'scripts/common/items/components/legacy_stuff.pyc': {
         'NoLegacyStuff.get': ('Operation is not allowed',),
         'NoLegacyStuff.__getitem__': ('Operation is not allowed',),
+        'NoLegacyStuff.__contains__': ('Operation is not allowed',),
+        'NoLegacyStuff.__iter__': ('Operation is not allowed',),
+        'NoLegacyStuff.keys': ('Operation is not supported',),
+        'NoLegacyStuff.values': ('Operation is not supported',),
+        'NoLegacyStuff.items': ('Operation is not supported',),
     },
     'scripts/client/Avatar.pyc': {
         'PlayerAvatar.__onSetOwnVehicleAuxPhysicsData': (
@@ -660,6 +670,11 @@ EXPECTED_CODE_NAMES = {
     'scripts/common/items/components/legacy_stuff.pyc': {
         'NoLegacyStuff.get': ('AssertionError',),
         'NoLegacyStuff.__getitem__': ('AssertionError',),
+        'NoLegacyStuff.__contains__': ('AssertionError',),
+        'NoLegacyStuff.__iter__': ('AssertionError',),
+        'NoLegacyStuff.keys': ('AssertionError',),
+        'NoLegacyStuff.values': ('AssertionError',),
+        'NoLegacyStuff.items': ('AssertionError',),
     },
     'scripts/common/items/components/shared_components.pyc': {
         'DeviceHealth.__init__': ('maxHealth', 'maxRegenHealth'),

@@ -150,8 +150,12 @@ class GunState(object):
         gun = descriptor.gun
         target_dispersion = self.base_dispersion
         try:
-            move_factor, rotation_factor = \
-                descriptor.chassis['shotDispersionFactors']
+            chassis_factors = _field(
+                descriptor.chassis, 'shotDispersionFactors')
+            if chassis_factors is None:
+                raise RuntimeError(
+                    '#1513 chassis shot dispersion factors are unavailable')
+            move_factor, rotation_factor = chassis_factors
             gun_factors = _field(gun, 'shotDispersionFactors', {}) or {}
             turret_factor = _field(gun_factors, 'turretRotation', 0.0)
             move_term = float(move_speed) * float(move_factor)
@@ -161,10 +165,9 @@ class GunState(object):
                 1.0 + move_term * move_term +
                 rotation_term * rotation_term +
                 turret_term * turret_term)
-        except Exception:
-            target_dispersion += (
-                abs(float(move_speed)) * 0.015 +
-                abs(float(rotation_speed)) * 0.015)
+        except (AttributeError, IndexError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                '#1513 shot dispersion descriptor is invalid: %s' % error)
         target_dispersion *= max(0.0, float(dispersion_factor))
         aiming_time = self.aim_time * max(0.0, float(aim_time_factor))
         if self.dispersion > target_dispersion:

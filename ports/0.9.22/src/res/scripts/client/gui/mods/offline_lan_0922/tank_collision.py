@@ -14,7 +14,7 @@ mapping with these fields::
         'shape': (half_width, half_length, lower_y, upper_y),
     }
 
-The retail body is sized from ``chassis['hitTester'].bbox`` and extended
+The retail body is sized from the native chassis ``hitTester.bbox`` and extended
 vertically to contain the mounted hull. ``resolve_tank`` uses yaw-aware OBB SAT
 and returns positional correction, the e=0 velocity impulse, ram events, and an
 updated cooldown mapping. Movement is never vetoed: existing spawn overlap is
@@ -80,17 +80,19 @@ def _coord(value, index, default=0.0):
 
 
 def _value(container, name, default=None):
-    try:
+    if isinstance(container, dict):
         return container.get(name, default)
-    except AttributeError:
-        return getattr(container, name, default)
+    return getattr(container, name, default)
 
 
 def _bbox(component):
-    try:
-        return _value(component, 'hitTester').bbox
-    except Exception:
-        return None
+    hit_tester = _value(component, 'hitTester')
+    if hit_tester is None:
+        raise RuntimeError('#1513 component hit tester is unavailable')
+    bbox = getattr(hit_tester, 'bbox', None)
+    if bbox is None:
+        raise RuntimeError('#1513 component hit tester bbox is unavailable')
+    return bbox
 
 
 def chassis_shape(type_descriptor):
@@ -106,11 +108,11 @@ def chassis_shape(type_descriptor):
     cached = _SHAPE_CACHE.get(cache_key)
     if cached is not None and cached[0] is type_descriptor:
         return cached[1]
+    chassis = _value(type_descriptor, 'chassis')
+    if chassis is None:
+        raise RuntimeError('#1513 chassis descriptor is unavailable')
     try:
-        chassis = _value(type_descriptor, 'chassis')
         chassis_box = _bbox(chassis)
-        if chassis_box is None:
-            return DEFAULT_SHAPE
         # #1513's HitTester.bbox carries a third derived value after min/max;
         # index it exactly as both retail physics_shared and current 0.8.2 do.
         minimum = chassis_box[0]
@@ -122,22 +124,24 @@ def chassis_shape(type_descriptor):
         lower_y = _coord(minimum, 1, DEFAULT_SHAPE[2])
         upper_y = _coord(maximum, 1, DEFAULT_SHAPE[3])
 
-        try:
-            hull_box = _bbox(_value(type_descriptor, 'hull'))
-            hull_position = _value(chassis, 'hullPosition')
-            if hull_box is not None and hull_position is not None:
-                upper_y = max(
-                    upper_y,
-                    _coord(hull_position, 1) + _coord(hull_box[1], 1))
-        except Exception:
-            pass
+        hull = _value(type_descriptor, 'hull')
+        if hull is None:
+            raise RuntimeError('#1513 hull descriptor is unavailable')
+        hull_box = _bbox(hull)
+        hull_position = _value(chassis, 'hullPosition')
+        if hull_position is None:
+            raise RuntimeError('#1513 chassis hull position is unavailable')
+        upper_y = max(
+            upper_y,
+            _coord(hull_position, 1) + _coord(hull_box[1], 1))
         shape = (half_width, half_length, lower_y, upper_y)
         # Retain the descriptor so CPython cannot reuse its id for another
         # vehicle descriptor while this long-running client is alive.
         _SHAPE_CACHE[cache_key] = (type_descriptor, shape)
         return shape
-    except Exception:
-        return DEFAULT_SHAPE
+    except (AttributeError, IndexError, TypeError, ValueError) as error:
+        raise RuntimeError('#1513 vehicle collision descriptor is invalid: %s' %
+                           error)
 
 
 def vertical_overlap(y_a, shape_a, y_b, shape_b, slop=0.02):

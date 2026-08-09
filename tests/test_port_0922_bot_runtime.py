@@ -99,6 +99,30 @@ class _FixedAdapter(_Adapter):
         return self.decide(state, clear)
 
 
+class _Strict1513Component(object):
+    """Attribute-only stand-in for #1513's ``NoLegacyStuff`` mixin."""
+
+    def __init__(self, **values):
+        self.__dict__.update(values)
+
+    def _forbidden(self, *unused_args, **unused_kwargs):
+        raise AssertionError('Operation is not allowed')
+
+    get = _forbidden
+    __contains__ = _forbidden
+    __getitem__ = _forbidden
+    __iter__ = _forbidden
+    items = _forbidden
+    keys = _forbidden
+    values = _forbidden
+
+
+class _HitTester1513(object):
+    def __init__(self, minimum, maximum):
+        # Exact #1513 bbox exposes min, max and a third derived value.
+        self.bbox = (minimum, maximum, None)
+
+
 def _combat_descriptor(reload_time=0.5, clip=(2, 0.2),
                        turret_yaw_limits=(-math.pi, math.pi),
                        turret_speed=10.0, gun_speed=10.0,
@@ -109,15 +133,27 @@ def _combat_descriptor(reload_time=0.5, clip=(2, 0.2),
         pitchLimits={'absolute': (-0.35, 0.15)}, rotationSpeed=gun_speed,
         shotDispersionAngle=dispersion,
         maxHealth=54, maxRegenHealth=27)
+    chassis = _Strict1513Component(
+        hitTester=_HitTester1513(
+            (-1.5, -0.8, -3.5), (1.5, 0.8, 3.5)),
+        hullPosition=(0.0, 0.6, 0.0), rotationSpeed=0.75,
+        shotDispersionFactors=(0.14, 0.14),
+        maxHealth=170, maxRegenHealth=130)
+    hull = _Strict1513Component(
+        hitTester=_HitTester1513(
+            (-1.7, -0.2, -3.5), (1.7, 1.4, 3.5)),
+        turretPositions=((0.0, 1.0, 0.0),))
     return types.SimpleNamespace(
         gun=gun, turret={'rotationSpeed': turret_speed,
                          'circularVisionRadius': 445.0},
-        physics={'speedLimits': (14.0, 7.0)}, hull={}, maxHealth=1000)
+        physics={'speedLimits': (14.0, 7.0)}, chassis=chassis,
+        hull=hull, maxHealth=1000)
 
 
 def _critical_descriptor():
     descriptor = _combat_descriptor()
-    descriptor.chassis = {'maxHealth': 170, 'maxRegenHealth': 130}
+    descriptor.chassis.maxHealth = 170
+    descriptor.chassis.maxRegenHealth = 130
     descriptor.fuelTank = {'maxHealth': 100, 'maxRegenHealth': 40}
     descriptor.miscAttrs = {}
     return descriptor
@@ -1336,8 +1372,8 @@ class BotRuntimeTests(unittest.TestCase):
     def test_overlapping_bots_are_separated_without_spawn_deadlock(self):
         descriptor = _combat_descriptor()
         descriptor.physics['weight'] = 25000.0
-        descriptor.hull['hitTester'] = types.SimpleNamespace(
-            bbox=((-1.5, -1.0, -3.5), (1.5, 1.0, 3.5)))
+        descriptor.hull.hitTester = _HitTester1513(
+            (-1.5, -1.0, -3.5), (1.5, 1.0, 3.5))
         runtime = self.module.BotRuntime(
             1, descriptor_resolver=lambda unused: descriptor,
             adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
@@ -1366,8 +1402,8 @@ class BotRuntimeTests(unittest.TestCase):
     def test_tank_separation_does_not_push_bots_through_world_geometry(self):
         descriptor = _combat_descriptor()
         descriptor.physics['weight'] = 25000.0
-        descriptor.hull['hitTester'] = types.SimpleNamespace(
-            bbox=((-1.5, -1.0, -3.5), (1.5, 1.0, 3.5)))
+        descriptor.hull.hitTester = _HitTester1513(
+            (-1.5, -1.0, -3.5), (1.5, 1.0, 3.5))
         runtime = self.module.BotRuntime(
             1, descriptor_resolver=lambda unused: descriptor,
             adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
@@ -1395,8 +1431,8 @@ class BotRuntimeTests(unittest.TestCase):
     def test_ram_report_follows_pose_and_is_cooldown_gated(self):
         descriptor = _combat_descriptor()
         descriptor.physics['weight'] = 25000.0
-        descriptor.hull['hitTester'] = types.SimpleNamespace(
-            bbox=((-1.5, -1.0, -3.5), (1.5, 1.0, 3.5)))
+        descriptor.hull.hitTester = _HitTester1513(
+            (-1.5, -1.0, -3.5), (1.5, 1.0, 3.5))
         runtime = self.module.BotRuntime(
             1, descriptor_resolver=lambda unused: descriptor,
             adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
@@ -2032,14 +2068,9 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(0.0, state['vertical_speed'])
 
     def test_driver_receives_native_hull_dimensions_and_velocity(self):
-        hit_tester = types.SimpleNamespace(
-            bbox=((-2.1, -1.0, -4.2), (2.3, 1.0, 3.8)))
-        descriptor = {
-            'hull': {'hitTester': hit_tester},
-            'physics': {'speedLimits': (14.0, 7.0)},
-            'gun': {'shotDispersionAngle': 0.03, 'shots': (),
-                    'reloadTime': 0.5},
-        }
+        descriptor = _combat_descriptor()
+        descriptor.hull.hitTester = _HitTester1513(
+            (-2.1, -1.0, -4.2), (2.3, 1.0, 3.8))
         self.runtime.descriptor_resolver = lambda unused: descriptor
         self.start['bots'].append(
             {'id': 12, 'team': 2, 'slot': 1, 'name': 'Wingman'})

@@ -5,7 +5,7 @@ This review is pinned to the Chinese HD client whose `version.xml` reports
 CPython 2.7 bytecode magic `03 f3 0d 0a`; the embedded build identifies itself
 as Python 2.7.7.
 
-The goal of version 0.3.45 is a complete playable vertical path, not another
+The goal of version 0.3.46 is a complete playable vertical path, not another
 login-only probe: local Account -> stock Lobby/join/map selection -> native map and
 Avatar -> native local Vehicle plus remote presentations -> local movement/aim/fire -> synchronized
 humans and bots -> damage/death/result -> cleanup -> a second round.

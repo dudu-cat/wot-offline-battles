@@ -158,6 +158,30 @@ class _Model(object):
             position.x, position.y + 1.5, position.z))
 
 
+class _Strict1513Component(object):
+    """Attribute-only stand-in for #1513's ``NoLegacyStuff`` mixin."""
+
+    def __init__(self, **values):
+        self.__dict__.update(values)
+
+    def _forbidden(self, *unused_args, **unused_kwargs):
+        raise AssertionError('Operation is not allowed')
+
+    get = _forbidden
+    __contains__ = _forbidden
+    __getitem__ = _forbidden
+    __iter__ = _forbidden
+    items = _forbidden
+    keys = _forbidden
+    values = _forbidden
+
+
+class _HitTester1513(object):
+    def __init__(self, minimum, maximum):
+        # Exact #1513 bbox exposes min, max and a third derived value.
+        self.bbox = (minimum, maximum, None)
+
+
 class _Descriptor(object):
     def __init__(self, name='ussr:R11_MS-1'):
         self.name = name
@@ -181,14 +205,20 @@ class _Descriptor(object):
         self.radio = types.SimpleNamespace(distance=400.0)
         self.physics = {'speedLimits': (14.0, 7.0)}
         self.type = types.SimpleNamespace(name=name, tags=('lightTank',))
-        self.hull = {}
-        self.chassis = {
-            'itemTypeName': 'vehicleChassis',
-            'hullPosition': _Vector(),
-            'shotDispersionFactors': (0.14, 0.14)}
-        self.hull = {
-            'itemTypeName': 'vehicleHull',
-            'turretPositions': (_Vector(),)}
+        self.chassis = _Strict1513Component(
+            itemTypeName='vehicleChassis',
+            hitTester=_HitTester1513(
+                _Vector(-1.5, -0.8, -3.5),
+                _Vector(1.5, 0.8, 3.5)),
+            hullPosition=_Vector(0.0, 0.6, 0.0),
+            rotationSpeed=0.75,
+            shotDispersionFactors=(0.14, 0.14))
+        self.hull = _Strict1513Component(
+            itemTypeName='vehicleHull',
+            hitTester=_HitTester1513(
+                _Vector(-1.7, -0.2, -3.5),
+                _Vector(1.7, 1.4, 3.5)),
+            turretPositions=(_Vector(),))
         self.maxHealth = 500
         self.activeGunShotIndex = 0
 
@@ -1041,8 +1071,8 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         hit_tester = types.SimpleNamespace(
             localHitTest=mock.Mock(return_value=[
                 (20.0, None, 1.0, 7)]))
-        descriptor.hull['hitTester'] = hit_tester
-        descriptor.hull['materials'] = {7: material}
+        descriptor.hull.hitTester = hit_tester
+        descriptor.hull.materials = {7: material}
         vehicle = _Vehicle(
             11, descriptor, _Vector(0.0, 0.0, 0.0),
             (0.0, 0.0, 0.0), {'health': 500})
@@ -1071,10 +1101,10 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
             localHitTest=mock.Mock(return_value=[
                 (4.0, None, 0.8, 3)]))
         descriptor.gun.materials = {3: gun_material}
-        descriptor.hull['hitTester'] = types.SimpleNamespace(
+        descriptor.hull.hitTester = types.SimpleNamespace(
             localHitTest=mock.Mock(return_value=[
                 (12.0, None, 0.9, 7)]))
-        descriptor.hull['materials'] = {7: hull_material}
+        descriptor.hull.materials = {7: hull_material}
         vehicle = RemoteVehicle(
             1000, descriptor, {
                 'publicInfo': {'team': 2, 'name': 'Bot'},
@@ -1106,8 +1136,8 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         hit_tester = types.SimpleNamespace(
             localHitTest=mock.Mock(return_value=[
                 (10.0, None, 1.0, 7)]))
-        descriptor.hull['hitTester'] = hit_tester
-        descriptor.hull['materials'] = {
+        descriptor.hull.hitTester = hit_tester
+        descriptor.hull.materials = {
             7: types.SimpleNamespace(armor=75.0)}
         vehicle = _Vehicle(
             11, descriptor, _Vector(), (0.0, 0.0, 0.0),
@@ -1252,7 +1282,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
                 entity.appearance.recoil()
 
         descriptor = _Descriptor()
-        descriptor.hull['models'] = {'undamaged': 'hull.model'}
+        descriptor.hull.models = {'undamaged': 'hull.model'}
         descriptor.turret.models = {'undamaged': 'turret.model'}
         shoot_extra = ShootExtra()
         descriptor.extrasDict = {'shoot': shoot_extra}
@@ -4731,7 +4761,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._avatar = runtime.bigworld.avatar
         descriptor = _Descriptor()
         # #1513 converts XML 0.14 to per-m/s and per-rad/s runtime values.
-        descriptor.chassis['shotDispersionFactors'] = (0.504, 8.02)
+        descriptor.chassis.shotDispersionFactors = (0.504, 8.02)
         entity = _Vehicle(10, descriptor, _Vector(), (0, 0, 0),
                           {'health': 500})
         runtime.bigworld.entities[10] = entity

@@ -46,6 +46,24 @@ class _HitTester(object):
         self.bbox = (minimum, maximum, None)
 
 
+class _Strict1513Component(object):
+    """Attribute-only stand-in for #1513's ``NoLegacyStuff`` mixin."""
+
+    def __init__(self, **values):
+        self.__dict__.update(values)
+
+    def _forbidden(self, *unused_args, **unused_kwargs):
+        raise AssertionError('Operation is not allowed')
+
+    get = _forbidden
+    __contains__ = _forbidden
+    __getitem__ = _forbidden
+    __iter__ = _forbidden
+    items = _forbidden
+    keys = _forbidden
+    values = _forbidden
+
+
 class _Descriptor(object):
 
     def __init__(self):
@@ -91,6 +109,22 @@ class TankCollisionTests(unittest.TestCase):
 
     def test_shape_uses_chassis_bbox_and_mounted_hull_height(self):
         shape = tank_collision.chassis_shape(_Descriptor())
+
+        self.assertEqual((1.7, 3.2, -0.6, 2.2), shape)
+
+    def test_shape_reads_native_1513_components_as_attributes(self):
+        descriptor = _Strict1513Component(
+            chassis=_Strict1513Component(
+                hitTester=_HitTester(
+                    _Vector(-1.7, -0.6, -3.2),
+                    _Vector(1.7, 0.8, 3.2)),
+                hullPosition=_Vector(0.0, 0.7, 0.0)),
+            hull=_Strict1513Component(
+                hitTester=_HitTester(
+                    _Vector(-1.2, -0.2, -2.0),
+                    _Vector(1.2, 1.5, 2.0))))
+
+        shape = tank_collision.chassis_shape(descriptor)
 
         self.assertEqual((1.7, 3.2, -0.6, 2.2), shape)
 

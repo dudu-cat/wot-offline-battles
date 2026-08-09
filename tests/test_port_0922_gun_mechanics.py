@@ -12,6 +12,24 @@ sys.path.insert(0, str(CLIENT_SCRIPTS))
 from gui.mods.offline_lan_0922.gun_mechanics import GunState
 
 
+class _Strict1513Component(object):
+    """Attribute-only stand-in for #1513's ``NoLegacyStuff`` mixin."""
+
+    def __init__(self, **values):
+        self.__dict__.update(values)
+
+    def _forbidden(self, *unused_args, **unused_kwargs):
+        raise AssertionError('Operation is not allowed')
+
+    get = _forbidden
+    __contains__ = _forbidden
+    __getitem__ = _forbidden
+    __iter__ = _forbidden
+    items = _forbidden
+    keys = _forbidden
+    values = _forbidden
+
+
 class _Vector(object):
     def __init__(self, x, y, z):
         self.x, self.y, self.z = float(x), float(y), float(z)
@@ -38,6 +56,22 @@ def _descriptor(max_ammo=100, clip=(3, 1.0)):
 
 
 class GunMechanicsParityTests(unittest.TestCase):
+
+    def test_dispersion_reads_native_1513_chassis_attributes(self):
+        descriptor = _descriptor()
+        descriptor.chassis = _Strict1513Component(
+            shotDispersionFactors=(0.2, 0.4))
+        state = GunState(descriptor)
+
+        state.tick(
+            0.1, True, 2.0, 3.0, 4.0, descriptor)
+
+        target = state.base_dispersion * math.sqrt(
+            1.0 + (2.0 * 0.2) ** 2 + (3.0 * 0.4) ** 2 +
+            (4.0 * 0.3) ** 2)
+        expected = state.base_dispersion + (
+            target - state.base_dispersion) * 0.2
+        self.assertAlmostEqual(expected, state.dispersion)
 
     def test_descriptor_state_preserves_082_fallback_ammo_and_crew_factor(self):
         state = GunState(_descriptor())

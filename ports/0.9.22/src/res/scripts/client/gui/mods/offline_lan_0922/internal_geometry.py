@@ -10,18 +10,9 @@ _PROBE_CACHE_LIMIT = 256
 def _value(value, key, default=None):
 	if value is None:
 		return default
-	try:
+	if isinstance(value, dict):
 		return value.get(key, default)
-	except Exception:
-		pass
-	try:
-		return value[key]
-	except Exception:
-		pass
-	try:
-		return getattr(value, key)
-	except Exception:
-		return default
+	return getattr(value, key, default)
 
 
 def _number(value, default=0.0):

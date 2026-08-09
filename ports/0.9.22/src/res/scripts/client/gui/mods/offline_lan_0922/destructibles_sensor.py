@@ -7,6 +7,29 @@ Only their former closure dependencies are supplied at module scope.
 
 _event_sink = None
 
+
+def _descriptor_value(value, name, default=None):
+	"""Read copied mappings or native #1513 component attributes."""
+	if isinstance(value, dict):
+		return value.get(name, default)
+	return getattr(value, name, default)
+
+
+def _vehicle_hull_bbox(type_descriptor):
+	"""Return the native hull bbox without touching disabled LegacyStuff APIs."""
+	if type_descriptor is None:
+		return None
+	hull = _descriptor_value(type_descriptor, 'hull')
+	if hull is None:
+		raise RuntimeError('#1513 vehicle hull descriptor is unavailable')
+	hit_tester = _descriptor_value(hull, 'hitTester')
+	if hit_tester is None:
+		raise RuntimeError('#1513 hull hit tester is unavailable')
+	bbox = getattr(hit_tester, 'bbox', None)
+	if bbox is None:
+		raise RuntimeError('#1513 hull hit tester bbox is unavailable')
+	return bbox
+
 def LOG_DEBUG(*unused_args):
 	# The user requested no trace-heavy battle logging.
 	pass
@@ -90,7 +113,8 @@ def _try_destroy_destructible(spaceID, matInfo, yaw, vel,
 
 	# Data-driven vegetation gate: soft vegetation (bush/shrub/fern)
 	# ships with health <= 5; real fallable trees start at 10.
-	if desc['type'] in (AreaDestructibles.DESTR_TYPE_TREE,
+	typ = desc['type']
+	if typ in (AreaDestructibles.DESTR_TYPE_TREE,
 			AreaDestructibles.DESTR_TYPE_FALLING_ATOM):
 		_hp_gate = desc.get('health', 0)
 		if _hp_gate < 10 or _hp_gate > 1000:
@@ -98,7 +122,6 @@ def _try_destroy_destructible(spaceID, matInfo, yaw, vel,
 	# All bookkeeping (chunk bootstrap, dedup, encoding) lives in
 	# the authority - this path is now just a contact sensor.
 	_auth = _get_destr_authority()
-	typ = desc['type']
 	# STRUCTURE (buildings) now falls through to the module-destroy path.
 	if _auth.is_destroyed(chunkID, itemIndex, matKind):
 		return True
@@ -166,14 +189,14 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 				Math.Vector3(pos.x + sin_y * _pf, pos.y,
 					pos.z + cos_y * _pf)))
 		hw = 1.6; hl_f = 3.6; hl_b = 3.6
-		try:
-			if td is not None and hasattr(td, 'hull') and 'hitTester' in td.hull:
-				bbox = td.hull['hitTester'].bbox
+		bbox = _vehicle_hull_bbox(td)
+		if bbox is not None:
+			try:
 				hw = max(abs(bbox[0][0]), abs(bbox[1][0]))
 				hl_b = abs(bbox[0][2])
 				hl_f = abs(bbox[1][2])
-		except (AttributeError, KeyError, TypeError, IndexError):
-			pass
+			except (AttributeError, KeyError, TypeError, IndexError):
+				raise RuntimeError('#1513 hull hit tester bbox is invalid')
 		for cid in cids:
 			trees = _st['chunks'].get(cid)
 			if trees is None:
@@ -189,13 +212,14 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 						desc = AreaDestructibles.g_cache.getDescByFilename(_dfn[_ti])
 						if desc is None:
 							continue
-						if desc['type'] not in (AreaDestructibles.DESTR_TYPE_TREE, AreaDestructibles.DESTR_TYPE_FALLING_ATOM, AreaDestructibles.DESTR_TYPE_FRAGILE):
+						typ = desc['type']
+						if typ not in (AreaDestructibles.DESTR_TYPE_TREE, AreaDestructibles.DESTR_TYPE_FALLING_ATOM, AreaDestructibles.DESTR_TYPE_FRAGILE):
 							continue
 						# Data-driven vegetation gate: destructibles.xml gives
 						# soft vegetation (bushes/shrubs/ferns/weeds) health<=5
 						# (or -2); real fallable trees start at health 10.
 						# ChristmasTree sentinels use 40000 = unrammable.
-						if desc['type'] != AreaDestructibles.DESTR_TYPE_FRAGILE:
+						if typ != AreaDestructibles.DESTR_TYPE_FRAGILE:
 							_hp_gate = desc.get('health', 0)
 							if _hp_gate < 10 or _hp_gate > 1000:
 								continue
@@ -206,7 +230,7 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 						trees.append((
 							_ti, _cm_t.x + _m.translation.x,
 							_cm_t.y + _m.translation.y,
-							_cm_t.z + _m.translation.z, desc['type'],
+							_cm_t.z + _m.translation.z, typ,
 							_dfn[_ti], desc.get('health', 0),
 							desc.get('mass', 0)))
 					except Exception:

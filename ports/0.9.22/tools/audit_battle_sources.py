@@ -51,8 +51,8 @@ PORT_FILES = {
     'gun_mechanics.py': '082_inline_law_adapter',
     'lan_client.py': '082_protocol_adapter',
     'lan_session.py': '082_queue_adapter',
-    'internal_geometry.py': 'exact_082',
-    'internal_hit_layouts.py': '082_import_adapter',
+    'internal_geometry.py': '082_law_plus_1513_descriptor_adapter',
+    'internal_hit_layouts.py': '082_import_plus_1513_descriptor_adapter',
     'internal_layout_profiles.py': 'exact_082',
     'internal_layout_store.py': '082_import_adapter',
     'map_catalog.py': '1513_arena_api',
@@ -92,14 +92,14 @@ PINNED_PORT_SHA256 = {
     'ai/maps_group_a.py': '35a7d8b34c1c78f889bbe30d54d7898fd581259769d1aa13112eda3f32afcc7f',
     'ai/maps_group_b.py': '152aae3d25921998b9436c3fbe2210d6f640c92220cf1729504fd59ce7b952d1',
     'ai/navigation.py': '2a14c8d344d499527678ba66b2e1136710ad537ac7b557a22902def4318a3f1e',
-    'ai/planner.py': 'ef049470e70e6437eb9646ca3edab05dc4517b081b6630ee5707ac3eac4d0cb1',
+    'ai/planner.py': 'ea3be8d32cde1659fe2656ffbb31d2ebcf933d8d48ecc284931689963304d528',
     'bot_runtime.py': '669271ee375394ab4160dec33ce24379dfad95c57eb50701412cfb7ecf82185c',
     'entities/remote_vehicle.py': '868e16c8016bfd753fa9c705c046cca827c9765c69ea35b5e5a77d11d4bf12ae',
-    'tank_collision.py': '2f0b9b8987b4401d430e84512e5fdbf84351b4245e2589907d597a8508197b2d',
-    'vehicle_physics.py': '9beab9b11f8c349d55979c7a753f33b48262b1add28f63f3d754a8495c20e676',
+    'tank_collision.py': '4a987001157fb87b4f7636815d433e5c0f4250ca22db8b37ccfd76227fabad89',
+    'vehicle_physics.py': 'e35bbb57611f0708191a1b04ab660379e4ec3d893bad9df816ee442597472441',
     'destructibles_authority.py': 'e9a98d3bd3f30186407142a13cf8f1b035ac9f0c21ff02f46c76b9233b9943ea',
-    'destructibles_sensor.py': 'e8693423ead03c98f799a52a322556ece32413bc7df7fa52bb7a10027a8655eb',
-    'world_collision.py': 'd213de8f3110c9ad3ddaa5ea515b797ee98d9eed8005a01c2f8f7b103b36e1ab',
+    'destructibles_sensor.py': '3bff54f6fba81ab27411369acf89d709f96f5e23d880b453a110e680fcd34193',
+    'world_collision.py': '16275955d344c4e1254de93fd8e73c777e322af00b10fa714b62c8e117c53cd8',
 }
 PINNED_SERVER_SHA256 = {
     'server_bot_ai.py': '7b5724987c50497a9f0aa878e8cc103b14c0e9e1fdf3c489a78562ec114e625a',
@@ -226,6 +226,34 @@ def _normalise_internal_imports(value):
         'gui.mods.offline_lan_0922', 'gui.mods.offhangar')
 
 
+def _normalise_internal_descriptor_access(value):
+    """Undo the reviewed native-component seam before 0.8.2 comparison."""
+    adapted = (
+        "def _value(value, key, default=None):\n"
+        "\tif value is None:\n"
+        "\t\treturn default\n"
+        "\tif isinstance(value, dict):\n"
+        "\t\treturn value.get(key, default)\n"
+        "\treturn getattr(value, key, default)\n")
+    original = (
+        "def _value(value, key, default=None):\n"
+        "\tif value is None:\n"
+        "\t\treturn default\n"
+        "\ttry:\n"
+        "\t\treturn value.get(key, default)\n"
+        "\texcept Exception:\n"
+        "\t\tpass\n"
+        "\ttry:\n"
+        "\t\treturn value[key]\n"
+        "\texcept Exception:\n"
+        "\t\tpass\n"
+        "\ttry:\n"
+        "\t\treturn getattr(value, key)\n"
+        "\texcept Exception:\n"
+        "\t\treturn default\n")
+    return value.replace(adapted, original, 1)
+
+
 def _normalise_1513_descriptor_access(value):
     """Undo only the reviewed #1513 attribute adapters before comparison."""
     replacements = (
@@ -238,6 +266,12 @@ def _normalise_1513_descriptor_access(value):
         ("_eng2 is not None", "_eng2 is not None and hasattr(_eng2, 'get')"),
         ("_descriptor_value(_eng2, 'fireStartingChance', 0.15)",
          "_eng2.get('fireStartingChance', 0.15)"),
+        ("_descriptor_value(td.chassis, 'hullPosition')",
+         "td.chassis['hullPosition']"),
+        ("_descriptor_value(td.hull, 'turretPositions')",
+         "td.hull['turretPositions']"),
+        ("_descriptor_value(td.hull, 'hitTester')",
+         "td.hull['hitTester']"),
     )
     for adapted, original in replacements:
         value = value.replace(adapted, original)
@@ -367,9 +401,12 @@ def audit(repo_root):
             errors.append('0.8.2 module lacks a written disposition: %s' %
                           source_name)
     for port_name, original_name in sorted(EXACT_COPIES.items()):
-        if _normalise_newlines(_text(os.path.join(package, port_name))) != \
-                _normalise_newlines(_text(
-                    os.path.join(original, original_name))):
+        port_value = _normalise_newlines(
+            _text(os.path.join(package, port_name)))
+        if port_name == 'internal_geometry.py':
+            port_value = _normalise_internal_descriptor_access(port_value)
+        if port_value != _normalise_newlines(_text(
+                os.path.join(original, original_name))):
             errors.append('%s diverged from 0.8.2 %s' %
                           (port_name, original_name))
     for port_name, original_name in sorted(WHITESPACE_COPIES.items()):
@@ -391,9 +428,11 @@ def audit(repo_root):
             ('internal_layout_store.py', 'internal_layout_store.py')):
         port_value = _normalise_internal_imports(
             _text(os.path.join(package, port_name)))
+        if port_name == 'internal_hit_layouts.py':
+            port_value = _normalise_internal_descriptor_access(port_value)
         if port_value != _text(os.path.join(original, original_name)):
-            errors.append('%s has more than the documented package import change' %
-                          port_name)
+            errors.append('%s has more than the documented import/descriptor '
+                          'adaptations' % port_name)
     battle_runtime = _text(os.path.join(package, 'battle_runtime.py'))
     for required in ('combat_rules.damage',
                      'combat_rules.resolve_hull_hit',
@@ -877,6 +916,60 @@ def audit(repo_root):
         if required not in world_collision:
             errors.append('world_collision.py omits copied/version-local '
                           'wall boundary: %s' % required)
+    strict_descriptor_contracts = (
+        (_text(os.path.join(package, 'internal_geometry.py')),
+         ('if isinstance(value, dict)',
+          'return getattr(value, key, default)'),
+         ('return value[key]',),
+         'internal_geometry.py'),
+        (_text(os.path.join(package, 'internal_hit_layouts.py')),
+         ('if isinstance(value, dict)',
+          'return getattr(value, key, default)'),
+         ('return value[key]',),
+         'internal_hit_layouts.py'),
+        (destructibles_sensor,
+         ('def _descriptor_value', 'if isinstance(value, dict)',
+          'return getattr(value, name, default)',
+          'def _vehicle_hull_bbox'),
+         ("'hitTester' in td.hull", "td.hull['hitTester']"),
+         'destructibles_sensor.py'),
+        (world_collision,
+         ('_vehicle_hull_bbox(td)',),
+         ("'hitTester' in td.hull", "td.hull['hitTester']"),
+         'world_collision.py'),
+        (_text(os.path.join(package, 'tank_collision.py')),
+         ('if isinstance(container, dict)',
+          'return getattr(container, name, default)'),
+         ('return container.get(name, default)\n\texcept AttributeError',),
+        'tank_collision.py'),
+        (gun_mechanics,
+         ('chassis_factors = _field(',
+          "descriptor.chassis, 'shotDispersionFactors')"),
+         ("descriptor.chassis['shotDispersionFactors']",),
+         'gun_mechanics.py'),
+        (_text(os.path.join(package, 'vehicle_physics.py')),
+         ("isinstance(ch, dict)",
+          "getattr(ch, 'rotationSpeed', None)"),
+         ("'rotationSpeed' in ch", "ch['rotationSpeed']"),
+         'vehicle_physics.py'),
+        (critical_damage,
+         ("_descriptor_value(td.chassis, 'hullPosition')",
+          "_descriptor_value(td.hull, 'turretPositions')[0]",
+          "_descriptor_value(td.hull, 'hitTester').bbox"),
+         ("td.chassis['hullPosition']", "td.hull['turretPositions']",
+          "td.hull['hitTester']"),
+         'critical_damage.py'),
+    )
+    for source, required_items, forbidden_items, source_name in \
+            strict_descriptor_contracts:
+        for required in required_items:
+            if required not in source:
+                errors.append('%s omits strict #1513 attribute access: %s' %
+                              (source_name, required))
+        for forbidden in forbidden_items:
+            if forbidden in source:
+                errors.append('%s uses forbidden #1513 mapping access: %s' %
+                              (source_name, forbidden))
     for required in ('world_collision.check_horizontal_collision',
                      'shot_world_distance', "'maxDistance', 5000.0",
                      "event.get('shot_yaw')",

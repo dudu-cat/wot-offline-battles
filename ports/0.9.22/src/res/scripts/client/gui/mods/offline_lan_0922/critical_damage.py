@@ -136,9 +136,9 @@ def _offh_interior_zone(target_mock, all_hits, start_pos, end_pos=None, td=None)
 				_inv.invert()
 				_lp = _inv.applyPoint(_wp)
 				# Vehicle origin sits on the chassis; the hull model is offset from it.
-				_hp = td.chassis['hullPosition']
-				_ring = td.hull['turretPositions'][0]
-				_bb = td.hull['hitTester'].bbox
+				_hp = _descriptor_value(td.chassis, 'hullPosition')
+				_ring = _descriptor_value(td.hull, 'turretPositions')[0]
+				_bb = _descriptor_value(td.hull, 'hitTester').bbox
 				_hw = max(abs(float(_bb[0].x)), abs(float(_bb[1].x)))
 				from gui.mods.offline_lan_0922 import device_damage as _DDz
 				return _DDz.interior_zone(float(_lp.x) - float(_hp.x),

@@ -2,7 +2,7 @@
 """Dedented 0.8.2 horizontal world-collision law."""
 
 from gui.mods.offline_lan_0922.destructibles_sensor import (
-	_try_destroy_destructible, _try_destroy_solid_hit)
+	_try_destroy_destructible, _try_destroy_solid_hit, _vehicle_hull_bbox)
 
 
 def check_horizontal_collision(bigworld, math_module, *args):
@@ -33,14 +33,14 @@ def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None, airborne=False,
 		hl_front = 3.5
 		hl_back = 3.5
 
-		if td and hasattr(td, 'hull') and 'hitTester' in td.hull:
+		bbox = _vehicle_hull_bbox(td)
+		if bbox is not None:
 			try:
-				bbox = td.hull['hitTester'].bbox
 				hw = max(abs(bbox[0][0]), abs(bbox[1][0])) - 0.1
 				hl_back = abs(bbox[0][2])
 				hl_front = abs(bbox[1][2])
 			except (AttributeError, KeyError, TypeError, IndexError):
-				pass
+				raise RuntimeError('#1513 hull hit tester bbox is invalid')
 
 		# Look-ahead beyond the hull. The old flat +2.0 m made an invisible
 		# wall 2 m before every obstacle, and DURING A FALL it saw the cliff

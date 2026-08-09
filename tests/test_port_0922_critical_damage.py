@@ -33,9 +33,37 @@ class _Strict1513Component(object):
 
     def __init__(self, **values):
         self.__dict__.update(values)
+        self.mapping_calls = 0
 
-    def get(self, *unused_args, **unused_kwargs):
+    def _forbidden(self, *unused_args, **unused_kwargs):
+        self.mapping_calls += 1
         raise AssertionError('Operation is not allowed')
+
+    get = _forbidden
+    __contains__ = _forbidden
+    __getitem__ = _forbidden
+    __iter__ = _forbidden
+    items = _forbidden
+    keys = _forbidden
+    values = _forbidden
+
+
+class _Point(object):
+
+    def __init__(self, x, y, z):
+        self.x, self.y, self.z = float(x), float(y), float(z)
+
+
+class _IdentityMatrix(object):
+
+    def __init__(self, unused_value):
+        pass
+
+    def invert(self):
+        pass
+
+    def applyPoint(self, value):
+        return value
 
 
 def _strict_1513_descriptor():
@@ -123,6 +151,81 @@ class CriticalDamageTests(unittest.TestCase):
             0.12,
             critical_damage._descriptor_value(
                 component, 'fireStartingChance'))
+
+    def test_interior_zone_reads_native_1513_geometry_attributes(self):
+        descriptor = _Strict1513Component(
+            chassis=_Strict1513Component(
+                hullPosition=_Point(0.0, 0.0, 0.0)),
+            hull=_Strict1513Component(
+                turretPositions=(_Point(0.0, 0.0, 2.0),),
+                hitTester=types.SimpleNamespace(bbox=(
+                    _Point(-2.0, -1.0, -3.0),
+                    _Point(2.0, 1.0, 3.0), None))))
+        material = types.SimpleNamespace(
+            vehicleDamageFactor=1.0, armor=20.0)
+        component = _Strict1513Component(itemTypeName='vehicleHull')
+        target = types.SimpleNamespace(
+            typeDescriptor=descriptor, matrix=object())
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Point
+        math_module.Matrix = _IdentityMatrix
+
+        with mock.patch.dict(sys.modules, {'Math': math_module}):
+            zone = critical_damage._offh_interior_zone(
+                target, ((4.0, 1.0, material, component),),
+                _Point(0.0, 0.0, 0.0), _Point(0.0, 0.0, 10.0),
+                descriptor)
+
+        self.assertEqual('hullFront', zone)
+
+    def test_internal_layout_build_never_probes_native_mapping_api(self):
+        from gui.mods.offline_lan_0922 import internal_geometry
+        from gui.mods.offline_lan_0922 import internal_hit_layouts
+
+        components = []
+
+        def component(name, **values):
+            defaults = {
+                'name': name,
+                'id': 1,
+                'compactDescr': 1,
+                'models': None,
+                'materials': {},
+                'hitTester': types.SimpleNamespace(bbox=(
+                    (-1.5, -0.5, -2.5),
+                    (1.5, 1.5, 2.5), None)),
+                'weight': 100.0,
+            }
+            defaults.update(values)
+            value = _Strict1513Component(**defaults)
+            components.append(value)
+            return value
+
+        descriptor = _Strict1513Component(
+            type=types.SimpleNamespace(
+                name='ussr:MS-1',
+                crewRoles=(
+                    ('commander', 'gunner', 'radioman', 'loader'),
+                    ('driver',))),
+            chassis=component('chassis'),
+            hull=component('hull'),
+            turret=component('turret', yawLimits=(-3.14, 3.14)),
+            gun=component('gun', maxAmmo=30, shots=()),
+            engine=component('engine', weight=120.0),
+            fuelTank=component('fuelTank', weight=40.0),
+            radio=component('radio', weight=15.0))
+        components.append(descriptor)
+
+        internal_hit_layouts._LAYOUT_CACHE.clear()
+        internal_geometry._PROBE_CACHE.clear()
+        self.addCleanup(internal_hit_layouts._LAYOUT_CACHE.clear)
+        self.addCleanup(internal_geometry._PROBE_CACHE.clear)
+        layout = critical_damage._offh_internal_layout(descriptor)
+
+        self.assertIsNotNone(layout)
+        self.assertEqual(('ussr', 'ms1'), layout['profile_key'])
+        self.assertGreater(len(layout['targets']), 0)
+        self.assertEqual(0, sum(value.mapping_calls for value in components))
 
     def test_external_track_uses_copied_082_crit_loop(self):
         vehicle = types.SimpleNamespace(

@@ -293,12 +293,18 @@ def derive_params(td):
 		pass
 	try:
 		ch = getattr(td, 'chassis', None)
-		if ch is not None and 'rotationSpeed' in ch:
-			raw = float(ch['rotationSpeed'])
+		if ch is not None:
+			raw_value = (ch.get('rotationSpeed') if isinstance(ch, dict)
+			             else getattr(ch, 'rotationSpeed', None))
+			if raw_value is None:
+				raise RuntimeError(
+					'#1513 chassis rotation speed is unavailable')
+			raw = float(raw_value)
 			# reader stores radians; tolerate a raw-degrees dump
 			p['rotSpd'] = math.radians(raw) if raw > 6.3 else raw
-	except Exception:
-		pass
+	except (AttributeError, TypeError, ValueError) as error:
+		raise RuntimeError(
+			'#1513 chassis rotation speed is invalid: %s' % error)
 	return p
 
 

@@ -434,22 +434,15 @@ def route_toward_enemy(route, team, bases):
 
 
 def _mapping_get(value, key, default=None):
-	try:
-		if hasattr(value, 'get'):
-			return value.get(key, default)
-		return value[key]
-	except Exception:
-		return default
+	if not isinstance(value, dict):
+		raise TypeError('Expected a plain mapping')
+	return value.get(key, default)
 
 
 def _attribute_or_key(value, key, default=None):
-	try:
-		result = getattr(value, key)
-		if result is not None:
-			return result
-	except Exception:
-		pass
-	return _mapping_get(value, key, default)
+	if isinstance(value, dict):
+		return value.get(key, default)
+	return getattr(value, key, default)
 
 
 def stable_seed(*parts):
@@ -500,7 +493,9 @@ def _forward_speed(descriptor):
 
 
 def _primary_armor(component):
-	armor = _mapping_get(component or {}, 'primaryArmor', 0.0)
+	if component is None:
+		component = {}
+	armor = _attribute_or_key(component, 'primaryArmor', 0.0)
 	if isinstance(armor, (tuple, list)):
 		return max([_number(item, 0.0) for item in armor] or [0.0])
 	return _number(armor, 0.0)
@@ -517,23 +512,29 @@ def _middle_value(value, default=0.0):
 
 def _shell_profiles(descriptor):
 	"""Extract the small shell summary needed by the tactical planner."""
-	gun = _attribute_or_key(descriptor, 'gun', {}) or {}
-	shots = _mapping_get(gun, 'shots', ()) or ()
+	gun = _attribute_or_key(descriptor, 'gun', {})
+	if gun is None:
+		gun = {}
+	shots = _attribute_or_key(gun, 'shots', ()) or ()
 	result = []
 	try:
 		iterator = enumerate(shots)
 	except Exception:
 		iterator = ()
 	for index, shot in iterator:
-		shell = _mapping_get(shot, 'shell', {}) or {}
-		kind = _mapping_get(shell, 'kind', '') or ''
+		shell = _attribute_or_key(shot, 'shell', {})
+		if shell is None:
+			shell = {}
+		kind = _attribute_or_key(shell, 'kind', '') or ''
 		result.append({
 			'index': int(index),
 			'kind': str(kind),
 			'penetration': _middle_value(
-				_mapping_get(shell, 'piercingPower', 0.0), 0.0),
-			'damage': _middle_value(_mapping_get(shell, 'damage', 0.0), 0.0),
-			'speed': _number(_mapping_get(shot, 'speed', 0.0), 0.0),
+				_attribute_or_key(shell, 'piercingPower', 0.0), 0.0),
+			'damage': _middle_value(
+				_attribute_or_key(shell, 'damage', 0.0), 0.0),
+			'speed': _number(
+				_attribute_or_key(shot, 'speed', 0.0), 0.0),
 		})
 	return tuple(result)
 
@@ -561,8 +562,8 @@ def build_vehicle_profile(descriptor):
 	}
 	roles = dict(role_defaults[class_tag])
 	speed = _forward_speed(descriptor)
-	hull = _attribute_or_key(descriptor, 'hull', {}) or {}
-	turret = _attribute_or_key(descriptor, 'turret', {}) or {}
+	hull = _attribute_or_key(descriptor, 'hull', {})
+	turret = _attribute_or_key(descriptor, 'turret', {})
 	armor = max(_primary_armor(hull), _primary_armor(turret))
 
 	if speed >= 15.0:

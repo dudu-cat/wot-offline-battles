@@ -13,12 +13,36 @@ sys.path.insert(0, str(CLIENT_SCRIPTS))
 from gui.mods.offline_lan_0922.ai import cover, maps
 from gui.mods.offline_lan_0922.ai.adapter import BotAdapter
 from gui.mods.offline_lan_0922.ai.driver import LocalDriver
-from gui.mods.offline_lan_0922.ai.planner import BattleDirector
+from gui.mods.offline_lan_0922.ai.planner import (
+    BattleDirector, build_vehicle_profile,
+)
 from gui.mods.offline_lan_0922.ai.navigation import (
     BAKED_SHALLOW_WATER, TerrainGrid, TerrainNavigator,
 )
 from gui.mods.offline_lan_0922 import prebaked_navigation
 from lan_battle_server import MAP_POOL
+
+
+class _StrictNoLegacyStuff(object):
+    """Expose attributes while rejecting every mapping-style access path."""
+    def __init__(self, **attributes):
+        self.__dict__.update(attributes)
+
+    @staticmethod
+    def _forbidden(*unused_args, **unused_kwargs):
+        raise AssertionError('Operation is not allowed')
+
+    get = _forbidden
+    keys = _forbidden
+    items = _forbidden
+    values = _forbidden
+    iterkeys = _forbidden
+    iteritems = _forbidden
+    itervalues = _forbidden
+    __getitem__ = _forbidden
+    __contains__ = _forbidden
+    __iter__ = _forbidden
+    __len__ = _forbidden
 
 
 class BotAiPortTests(unittest.TestCase):
@@ -112,6 +136,42 @@ class BotAiPortTests(unittest.TestCase):
         self.assertEqual(1, order['bot_id'])
         self.assertIn('throttle', order)
         self.assertIsInstance(order['move_position'], tuple)
+
+    def test_vehicle_profile_reads_native_1513_components_as_attributes(self):
+        descriptor = _StrictNoLegacyStuff(
+            type=_StrictNoLegacyStuff(
+                name='Strict heavy', tags=('heavyTank',)),
+            physics={'speedLimits': (18.0, 7.0)},
+            hull=_StrictNoLegacyStuff(primaryArmor=(110.0, 135.0, 95.0)),
+            turret=_StrictNoLegacyStuff(primaryArmor=180.0),
+            gun=_StrictNoLegacyStuff(shots=(
+                _StrictNoLegacyStuff(
+                    speed=900.0,
+                    shell=_StrictNoLegacyStuff(
+                        kind='ARMOR_PIERCING',
+                        piercingPower=(150.0, 170.0),
+                        damage=(300.0, 340.0))),
+                _StrictNoLegacyStuff(
+                    speed=640.0,
+                    shell=_StrictNoLegacyStuff(
+                        kind='HIGH_EXPLOSIVE',
+                        piercingPower=(42.0, 58.0),
+                        damage=(410.0, 450.0))),
+            )),
+        )
+
+        profile = build_vehicle_profile(descriptor)
+
+        self.assertEqual('heavyTank', profile['class_tag'])
+        self.assertEqual('Strict heavy', profile['vehicle_name'])
+        self.assertEqual(18.0, profile['speed'])
+        self.assertEqual(180.0, profile['armor'])
+        self.assertEqual((
+            {'index': 0, 'kind': 'ARMOR_PIERCING',
+             'penetration': 160.0, 'damage': 320.0, 'speed': 900.0},
+            {'index': 1, 'kind': 'HIGH_EXPLOSIVE',
+             'penetration': 50.0, 'damage': 430.0, 'speed': 640.0},
+        ), profile['shells'])
 
     def test_adapter_preserves_face_and_commanded_hold_semantics(self):
         descriptor = {'type': {'name': 'MS-1', 'tags': ('mediumTank',)},

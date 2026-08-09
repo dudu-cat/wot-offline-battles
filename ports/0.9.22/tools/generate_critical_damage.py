@@ -338,6 +338,23 @@ def tick_repair(vehicle, dt, repair_skill=100.0, has_big_kit=False):
     return _payload(before, after, descriptor, 'repair')
 
 
+def _restore_fuel_regen_cap(vehicle):
+    """Keep the copied fire-out law available to engine-free authorities."""
+    descriptor = getattr(vehicle, 'typeDescriptor', None)
+    devices = getattr(vehicle, 'devices_hp', None)
+    if devices is None:
+        return False
+    name = 'fuelTankHealth'
+    cap = _device_damage.device_regen_hp(descriptor, name)
+    if cap is None or devices.get(name, cap) >= cap:
+        return False
+    devices[name] = cap
+    destroyed = getattr(vehicle, '_destroyed_devices', None)
+    if destroyed is not None:
+        destroyed.discard(name)
+    return True
+
+
 def tick_fire(vehicle, dt, now=None, module_test_mode=False):
     """Advance the copied 0.8.2 fire duration and one-second HP tick."""
     if vehicle is None or dt is None or dt <= 0.0:
@@ -362,6 +379,11 @@ def tick_fire(vehicle, dt, now=None, module_test_mode=False):
         # Keep the source ordering: the frame that extinguishes may also
         # complete the final one-second burn tick below.
         _offh_extinguish(vehicle, False, 'burnt out')
+        # ``_offh_extinguish`` is a copied presentation helper and imports
+        # BigWorld before resolving the descriptor.  The authority simulator is
+        # intentionally engine-free, so complete the same fuel-tank transition
+        # through the pure descriptor seam as part of this public tick contract.
+        _restore_fuel_regen_cap(vehicle)
     timer = float(getattr(vehicle, '_fire_timer', 0.0) or 0.0) + float(dt)
     damage = 0
     if timer >= 1.0:
@@ -536,6 +558,15 @@ def generate(repo_root):
         block = block.replace(
             "_eng2.get('fireStartingChance', 0.15)",
             "_descriptor_value(_eng2, 'fireStartingChance', 0.15)")
+        block = block.replace(
+            "td.chassis['hullPosition']",
+            "_descriptor_value(td.chassis, 'hullPosition')")
+        block = block.replace(
+            "td.hull['turretPositions']",
+            "_descriptor_value(td.hull, 'turretPositions')")
+        block = block.replace(
+            "td.hull['hitTester']",
+            "_descriptor_value(td.hull, 'hitTester')")
         # A firing client may calculate a critical proposal, but native battle
         # presentation is committed only after the server-relayed event.  Keep
         # the copied law while suppressing its legacy UI callbacks on the

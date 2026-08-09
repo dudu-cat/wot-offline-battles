@@ -28,6 +28,24 @@ class _Vector(object):
         self.x, self.y, self.z = float(x), float(y), float(z)
 
 
+class _Strict1513Component(object):
+    """Attribute-only stand-in for #1513's ``NoLegacyStuff`` mixin."""
+
+    def __init__(self, **values):
+        self.__dict__.update(values)
+
+    def _forbidden(self, *unused_args, **unused_kwargs):
+        raise AssertionError('Operation is not allowed')
+
+    get = _forbidden
+    __contains__ = _forbidden
+    __getitem__ = _forbidden
+    __iter__ = _forbidden
+    items = _forbidden
+    keys = _forbidden
+    values = _forbidden
+
+
 class _Manager(object):
     def __init__(self):
         self.space_id = None
@@ -282,6 +300,11 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
 
     def test_proximity_failure_is_retryable_and_uses_object_world_position(self):
         descriptor = {'type': 1, 'health': 10, 'mass': 20}
+        type_descriptor = _Strict1513Component(
+            hull=_Strict1513Component(
+                hitTester=types.SimpleNamespace(bbox=(
+                    (-1.6, -1.0, -3.6),
+                    (1.6, 1.0, 3.6), None))))
         manager = _Manager()
         manager.space_id = 1
         area = types.ModuleType('AreaDestructibles')
@@ -325,13 +348,15 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             with self.assertRaisesRegex(
                     RuntimeError, 'native proximity destroy'):
                 destructibles_sensor._fell_trees_near(
-                    1, _Vector(102, 8, 200), 0.0, 6.0)
+                    1, _Vector(102, 8, 200), 0.0, 6.0,
+                    type_descriptor)
             self.assertNotIn(
                 (22, 0),
                 destructibles_sensor.g_offh_tree_state['felled'])
 
             destructibles_sensor._fell_trees_near(
-                1, _Vector(102, 8, 200), 0.0, 6.0)
+                1, _Vector(102, 8, 200), 0.0, 6.0,
+                type_descriptor)
 
         object_position = calls[-1][-1]
         self.assertEqual((102.0, 8.0, 204.0),

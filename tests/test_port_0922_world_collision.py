@@ -44,7 +44,51 @@ class _Vector(object):
             self.z /= length
 
 
+class _Strict1513Component(object):
+    """Attribute-only stand-in for #1513's ``NoLegacyStuff`` mixin."""
+
+    def __init__(self, **values):
+        self.__dict__.update(values)
+
+    def _forbidden(self, *unused_args, **unused_kwargs):
+        raise AssertionError('Operation is not allowed')
+
+    get = _forbidden
+    __contains__ = _forbidden
+    __getitem__ = _forbidden
+    __iter__ = _forbidden
+    items = _forbidden
+    keys = _forbidden
+    values = _forbidden
+
+
 class WorldCollisionTests(unittest.TestCase):
+
+    def test_native_1513_hull_uses_attributes_without_mapping_protocol(self):
+        horizontal_calls = []
+
+        def collide(unused_space, start, end, unused_mask):
+            if abs(start.y - end.y) > 10.0:
+                return (_Vector(start.x, 0.0, start.z),)
+            horizontal_calls.append((start, end))
+            return None
+
+        bigworld = types.SimpleNamespace(
+            wg_collideSegment=collide,
+            wg_getMatInfoNearPoint=lambda *unused: None)
+        math_module = types.SimpleNamespace(Vector3=_Vector)
+        descriptor = _Strict1513Component(
+            hull=_Strict1513Component(
+                hitTester=types.SimpleNamespace(bbox=(
+                    (-1.8, -0.8, -3.4),
+                    (1.8, 1.0, 3.4), None))))
+
+        blocked = world_collision.check_horizontal_collision(
+            bigworld, math_module, 1, _Vector(), 0.0, 5.0,
+            descriptor, False, 0.04)
+
+        self.assertFalse(blocked)
+        self.assertTrue(horizontal_calls)
 
     def test_level_street_still_runs_wall_rays(self):
         calls = []
