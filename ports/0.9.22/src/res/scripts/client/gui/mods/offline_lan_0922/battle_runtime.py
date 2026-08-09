@@ -41,11 +41,8 @@ _SHOT_EVENT_KINDS = ('shot', 'bot_shot')
 _COMBAT_EVENT_KINDS = (
     'health', 'hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit')
 # The stock #1513 descriptor converts XML movement bloom to per-m/s and
-# per-rad/s factors. At light-tank road speed that legitimately grows the
-# reticle to roughly eight times its stationary size. Keep the native formula
-# and one shared HUD/shot angle, but use an offline-friendly motion coefficient
-# so full-speed play remains aimable.
-OFFLINE_DISPERSION_MOTION_SCALE = 0.25
+# per-rad/s factors. Feed those raw factors to PlayerAvatar unchanged: the
+# native gun rotator owns the one dispersion state shared by HUD and shots.
 
 # Exact #1513 ``Avatar._MOVEMENT_FLAGS`` values.  PlayerAvatar owns the R/F
 # state machine and native cruise HUD; the local server only has to preserve
@@ -2234,9 +2231,6 @@ class BattleRuntime(object):
                 rotation_factor = 0.0
             turret_factor = _number(
                 _field(gun_factors, 'turretRotation', 0.0), 0.0)
-            movement_factor *= OFFLINE_DISPERSION_MOTION_SCALE
-            rotation_factor *= OFFLINE_DISPERSION_MOTION_SCALE
-            turret_factor *= OFFLINE_DISPERSION_MOTION_SCALE
             base_dispersion = _number(
                 _field(gun, 'shotDispersionAngle', 0.0), 0.0)
             if base_dispersion <= 0.0:
@@ -3395,6 +3389,13 @@ class BattleRuntime(object):
                     self._resolve_bot_fire(outgoing)
             if self._battle_live:
                 self._update_spotting(now)
+                validate_lock = getattr(
+                    self._runtime.compatibility,
+                    'validate_target_lock', None)
+                if not callable(validate_lock):
+                    raise RuntimeError(
+                        '#1513 target-lock lifecycle boundary is unavailable')
+                validate_lock(self._avatar)
         except Exception as error:
             self._fail(error)
             return
@@ -3434,6 +3435,42 @@ class BattleRuntime(object):
         if math.isnan(angle) or math.isinf(angle) or angle < 0.0:
             raise RuntimeError('#1513 gun rotator dispersion angle is invalid')
         return angle
+
+    def _apply_native_shot_bloom(self):
+        """Enter #1513's own post-shot convergence state exactly once.
+
+        In a retail battle the cell-owned shot confirmation advances the
+        Avatar aiming state.  Our trusted local cell confirms the same shot,
+        so invoke the pinned producer with ``withShot=1``.  Subsequent native
+        gun-rotator ticks use ``withShot=0`` and perform the stock exponential
+        convergence; no parallel reticle state is written here.
+        """
+        gun_rotator = getattr(self._avatar, 'gunRotator', None)
+        if gun_rotator is None:
+            raise RuntimeError('#1513 gun rotator is unavailable for bloom')
+        try:
+            turret_speed = float(gun_rotator.turretRotationSpeed)
+        except (AttributeError, TypeError, ValueError):
+            raise RuntimeError(
+                '#1513 turret rotation speed is unavailable for bloom')
+        producer = getattr(
+            self._avatar, 'getOwnVehicleShotDispersionAngle', None)
+        if not callable(producer):
+            raise RuntimeError('#1513 dispersion producer is unavailable')
+        angles = producer(turret_speed, 1)
+        if not isinstance(angles, list) or len(angles) != 2:
+            raise RuntimeError(
+                '#1513 shot-bloom producer returned an invalid shape')
+        for value in angles:
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    '#1513 shot-bloom producer returned a non-number')
+            if math.isnan(value) or math.isinf(value) or value < 0.0:
+                raise RuntimeError(
+                    '#1513 shot-bloom producer returned an invalid angle')
+        return angles
 
     def _sync_local_server_marker(self):
         """Echo the trusted client marker into #1513's server-aim channel.
@@ -3514,6 +3551,12 @@ class BattleRuntime(object):
         if not callable(add_edge):
             raise RuntimeError('#1513 edge-detect add boundary is unavailable')
         add_edge(vehicle.bw_entity, color, 0, False)
+        set_candidate = getattr(
+            self._runtime.compatibility, 'set_target_lock_candidate', None)
+        if not callable(set_candidate):
+            raise RuntimeError(
+                '#1513 target-lock candidate boundary is unavailable')
+        set_candidate(vehicle)
         self._outlined_engine_id = nearest_id
 
     def _clear_target_outline(self):
@@ -3522,6 +3565,12 @@ class BattleRuntime(object):
         vehicle = (self._remote_factory.get(self._outlined_engine_id)
                    if self._remote_factory is not None else None)
         self._outlined_engine_id = None
+        set_candidate = getattr(
+            self._runtime.compatibility, 'set_target_lock_candidate', None)
+        if not callable(set_candidate):
+            raise RuntimeError(
+                '#1513 target-lock candidate boundary is unavailable')
+        set_candidate(None)
         if vehicle is None or vehicle.bw_entity is None:
             return
         remove_edge = getattr(
@@ -4929,6 +4978,7 @@ class BattleRuntime(object):
             shell_index, position, yaw, aim_yaw, gun_pitch)
         if not shot_seq:
             return False
+        self._apply_native_shot_bloom()
         local_record = self._records.get(
             'player:%s' % self.client.player_id)
         if local_record is not None:

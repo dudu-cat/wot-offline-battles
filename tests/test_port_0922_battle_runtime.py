@@ -15,10 +15,9 @@ CLIENT_SCRIPTS = ROOT / 'ports' / '0.9.22' / 'src' / 'res' / 'scripts' / 'client
 sys.path.insert(0, str(CLIENT_SCRIPTS))
 
 from gui.mods.offline_lan_0922.battle_runtime import (
-    BattleRuntime, OFFLINE_DISPERSION_MOTION_SCALE, _LANInputSender,
-    _engine_rotation,
+    BattleRuntime, _LANInputSender, _engine_rotation,
     _selected_vehicle_has_sixth_sense)
-from gui.mods.offline_lan_0922 import critical_damage
+from gui.mods.offline_lan_0922 import critical_damage, gun_mechanics
 from gui.mods.offline_lan_0922.entities.remote_vehicle import \
     RemoteVehicle, RemoteVehicleFactory, _RemoteFilter, \
     collide_vehicle_at_matrix
@@ -169,6 +168,7 @@ class _Descriptor(object):
             shell=shell, piercingPower=(1000.0, 800.0),
             maxDistance=500.0)
         self.gun = types.SimpleNamespace(
+            itemTypeName='vehicleGun',
             pitchLimits={'absolute': (-0.2, 0.4)}, shots=[shot],
             maxAmmo=40, clip=(1,), reloadTime=1.5, rotationSpeed=1.0,
             aimingTime=1.0, burst=(1, 0.1),
@@ -176,15 +176,19 @@ class _Descriptor(object):
             shotDispersionFactors={
                 'afterShot': 4.0, 'turretRotation': 0.1})
         self.turret = types.SimpleNamespace(
+            itemTypeName='vehicleTurret',
             circularVisionRadius=330.0, rotationSpeed=1.0)
         self.radio = types.SimpleNamespace(distance=400.0)
         self.physics = {'speedLimits': (14.0, 7.0)}
         self.type = types.SimpleNamespace(name=name, tags=('lightTank',))
         self.hull = {}
         self.chassis = {
+            'itemTypeName': 'vehicleChassis',
             'hullPosition': _Vector(),
             'shotDispersionFactors': (0.14, 0.14)}
-        self.hull = {'turretPositions': (_Vector(),)}
+        self.hull = {
+            'itemTypeName': 'vehicleHull',
+            'turretPositions': (_Vector(),)}
         self.maxHealth = 500
         self.activeGunShotIndex = 0
 
@@ -354,6 +358,7 @@ class _Avatar(object):
         self.damage_info = []
         self.hit_directions = []
         self.shot_results = []
+        self.dispersion_queries = []
         self.battle_events = []
         self.misc_statuses = []
         self.filter = object()
@@ -367,6 +372,8 @@ class _Avatar(object):
         self.visual_starts = []
         self.visual_stops = []
         self.gunRotator = types.SimpleNamespace(
+            dispersionAngle=0.25,
+            turretRotationSpeed=0.5,
             getCurShotPosition=lambda: (
                 _Vector(0.0, 2.0, 0.0), _Vector(0.0, 0.0, 1.0)))
         self.terrainEffects = types.SimpleNamespace(addNew=mock.Mock())
@@ -376,6 +383,7 @@ class _Avatar(object):
 
     def getOwnVehicleShotDispersionAngle(self, turret_rotation_speed,
                                          with_shot=0):
+        self.dispersion_queries.append((turret_rotation_speed, with_shot))
         return [0.25, 0.125]
 
     def set_playerVehicleID(self, previous):
@@ -479,12 +487,22 @@ class _Compatibility(object):
         self.network_client = None
         self.pose_overlays = {}
         self.control_mode_listener = None
+        self.target_lock_candidate = None
+        self.target_lock_validations = []
 
     def set_battle_network_client(self, client):
         self.network_client = client
 
     def set_control_mode_listener(self, listener):
         self.control_mode_listener = listener
+
+    def set_target_lock_candidate(self, vehicle):
+        self.target_lock_candidate = vehicle
+        return True
+
+    def validate_target_lock(self, avatar):
+        self.target_lock_validations.append(avatar)
+        return False
 
     def native_vehicle_attribute(self, vehicle, name):
         return getattr(vehicle, name)
@@ -1007,9 +1025,49 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual(1, len(collisions))
         self.assertEqual(20.0, collisions[0].dist)
         self.assertIs(material, collisions[0].matInfo)
+        self.assertEqual('vehicleHull', collisions[0].compName)
+        self.assertEqual(4, len(collisions[0]))
         local_start, local_end = hit_tester.localHitTest.call_args[0]
         self.assertEqual(-20.0, local_start.z)
         self.assertEqual(80.0, local_end.z)
+
+    def test_remote_collision_preserves_ext_shape_across_ticks_and_skip_gun(self):
+        descriptor = _Descriptor()
+        gun_material = types.SimpleNamespace(armor=25.0)
+        hull_material = types.SimpleNamespace(armor=75.0)
+        descriptor.gun.hitTester = types.SimpleNamespace(
+            localHitTest=mock.Mock(return_value=[
+                (4.0, None, 0.8, 3)]))
+        descriptor.gun.materials = {3: gun_material}
+        descriptor.hull['hitTester'] = types.SimpleNamespace(
+            localHitTest=mock.Mock(return_value=[
+                (12.0, None, 0.9, 7)]))
+        descriptor.hull['materials'] = {7: hull_material}
+        vehicle = RemoteVehicle(
+            1000, descriptor, {
+                'publicInfo': {'team': 2, 'name': 'Bot'},
+                'health': 500, 'isCrewActive': True,
+                'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0),
+            types.SimpleNamespace(Vector3=_Vector, Matrix=_Matrix))
+        start = _Vector(0.0, 1.0, -20.0)
+        end = _Vector(0.0, 1.0, 80.0)
+
+        for unused_tick in range(5):
+            collisions = vehicle.collideSegmentExt(start, end)
+            self.assertEqual(
+                ['vehicleGun', 'vehicleHull'],
+                [collision.compName for collision in collisions])
+            self.assertTrue(all(len(collision) == 4
+                                for collision in collisions))
+            self.assertEqual(
+                [gun_material, hull_material],
+                [collision.matInfo for collision in collisions])
+
+        nearest = vehicle.collideSegment(start, end, skipGun=True)
+        self.assertEqual(12.0, nearest.dist)
+        self.assertEqual(0.9, nearest.hitAngleCos)
+        self.assertEqual(75.0, nearest.armor)
 
     def test_pose_collider_rotates_ray_with_visible_hull_yaw(self):
         descriptor = _Descriptor()
@@ -1099,7 +1157,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertFalse(remote_filter.segmentMayHitEntity(
             _Vector(-30.0, 50.0, 0.0), _Vector(30.0, 50.0, 0.0), False))
 
-    def test_remote_collision_returns_exact_1513_named_tuple(self):
+    def test_remote_collision_returns_exact_1513_nearest_tuple(self):
         vehicle = RemoteVehicle(
             1000, _Descriptor(), {
                 'publicInfo': {'team': 2, 'name': 'Bot'},
@@ -1110,7 +1168,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         material = types.SimpleNamespace(armor=120.0)
         collision = types.SimpleNamespace(
             dist=0.25, hitAngleCos=0.75, matInfo=material,
-            compDescr=types.SimpleNamespace(itemTypeName='vehicleHull'))
+            compName='vehicleHull')
         vehicle.collideSegmentExt = lambda start, end: [collision]
 
         result = vehicle.collideSegment(_Vector(), _Vector(1.0, 0.0, 0.0))
@@ -3691,6 +3749,114 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertFalse(battle.shoot(0.0, 0.0))
         self.assertFalse(any(kind == 'fire' for kind, unused in client.sent))
 
+    def test_accepted_shot_enters_native_1513_bloom_once(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        descriptor = _Descriptor()
+        entity = _Vehicle(
+            10, descriptor, _Vector(0, 0, 0), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle.client = client
+        battle.state = 'running'
+        battle._battle_live = True
+        battle._avatar = runtime.bigworld.avatar
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._gun_state = gun_mechanics.GunState(descriptor)
+        battle._gun_state.reload_time = 0.0
+        battle._gun_state.clip = 1
+        battle._publish_ammo_state = mock.Mock()
+        battle._publish_reload_event = mock.Mock()
+        battle._resolve_hit = mock.Mock()
+
+        self.assertTrue(battle.shoot(0.2, -0.1))
+
+        self.assertEqual([(0.5, 1)], battle._avatar.dispersion_queries)
+        battle._resolve_hit.assert_called_once_with(
+            1, 0.2, -0.1, 0, 0.25)
+
+    def test_accepted_shot_seeds_stateful_native_convergence(self):
+        class StockLikeDispersion(object):
+            def __init__(self):
+                self.factor = 1.0
+                self.calls = []
+
+            def __call__(self, turret_speed, with_shot=0):
+                self.calls.append((turret_speed, with_shot))
+                if with_shot == 1:
+                    self.factor = math.sqrt(self.factor ** 2 + 4.0 ** 2)
+                else:
+                    self.factor = 1.0 + (self.factor - 1.0) * 0.75
+                return [0.1 * self.factor,
+                        0.1 * (math.sqrt(17.0) if with_shot else 1.0)]
+
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        descriptor = _Descriptor()
+        entity = _Vehicle(
+            10, descriptor, _Vector(0, 0, 0), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        producer = StockLikeDispersion()
+        runtime.bigworld.avatar.getOwnVehicleShotDispersionAngle = producer
+        battle.client = client
+        battle.state = 'running'
+        battle._battle_live = True
+        battle._avatar = runtime.bigworld.avatar
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._gun_state = gun_mechanics.GunState(descriptor)
+        battle._gun_state.reload_time = 0.0
+        battle._gun_state.clip = 1
+        battle._publish_ammo_state = mock.Mock()
+        battle._publish_reload_event = mock.Mock()
+        battle._resolve_hit = mock.Mock()
+
+        self.assertTrue(battle.shoot(0.2, -0.1))
+        shot_angle = producer.factor
+        first_tick = producer(0.5, 0)[0]
+        second_tick = producer(0.5, 0)[0]
+
+        self.assertEqual((0.5, 1), producer.calls[0])
+        self.assertGreater(shot_angle, 1.0)
+        self.assertGreater(0.1 * shot_angle, first_tick)
+        self.assertGreater(first_tick, second_tick)
+        self.assertGreater(second_tick, 0.1)
+
+    def test_rejected_shot_does_not_enter_native_1513_bloom(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        client.send_fire = mock.Mock(return_value=0)
+        descriptor = _Descriptor()
+        entity = _Vehicle(
+            10, descriptor, _Vector(0, 0, 0), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle.client = client
+        battle.state = 'running'
+        battle._battle_live = True
+        battle._avatar = runtime.bigworld.avatar
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._gun_state = gun_mechanics.GunState(descriptor)
+        battle._gun_state.reload_time = 0.0
+        battle._gun_state.clip = 1
+
+        self.assertFalse(battle.shoot(0.2, -0.1))
+        self.assertEqual([], battle._avatar.dispersion_queries)
+
+    def test_native_shot_bloom_rejects_non_1513_result_shape(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._avatar.getOwnVehicleShotDispersionAngle = (
+            lambda unused_speed, unused_with_shot: (0.25, 0.125))
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'invalid shape'):
+            battle._apply_native_shot_bloom()
+
     def test_server_shot_event_confirms_local_after_mailbox_returns(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -4062,12 +4228,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         targeting = runtime.bigworld.avatar.targeting
         crew_multiplier = 1.0 / (0.5 + 0.005 * 110.0)
         self.assertAlmostEqual(crew_multiplier, targeting[4])
-        self.assertEqual(0.1 * OFFLINE_DISPERSION_MOTION_SCALE,
-                         targeting[5])
-        self.assertEqual(0.14 * OFFLINE_DISPERSION_MOTION_SCALE,
-                         targeting[6])
-        self.assertEqual(0.14 * OFFLINE_DISPERSION_MOTION_SCALE,
-                         targeting[7])
+        self.assertEqual(0.1, targeting[5])
+        self.assertEqual(0.14, targeting[6])
+        self.assertEqual(0.14, targeting[7])
         self.assertAlmostEqual(crew_multiplier, targeting[8])
 
     def test_damaged_turret_rotator_scales_native_traverse_speed(self):
@@ -4093,7 +4256,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             descriptor.turret.rotationSpeed * 0.5,
             runtime.bigworld.avatar.targeting[2])
 
-    def test_parsed_1513_light_tank_bloom_stays_usable_at_road_speed(self):
+    def test_parsed_1513_light_tank_bloom_uses_raw_descriptor_factor(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle.state = 'running'
@@ -4112,9 +4275,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
         movement_factor = targeting[6]
         full_speed_multiplier = math.sqrt(
             1.0 + (16.67 * movement_factor) ** 2)
+        self.assertAlmostEqual(0.504, movement_factor)
         self.assertAlmostEqual(
-            0.504 * OFFLINE_DISPERSION_MOTION_SCALE, movement_factor)
-        self.assertLess(full_speed_multiplier, 2.5)
+            math.sqrt(1.0 + (16.67 * 0.504) ** 2),
+            full_speed_multiplier)
 
     def test_ammo_tick_does_not_restart_native_gun_rotator_each_frame(self):
         runtime = _runtime()
@@ -4242,7 +4406,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
                           {'health': 500})
         target.collideSegmentExt = lambda start, end: [types.SimpleNamespace(
             dist=20.0, hitAngleCos=1.0,
-            matInfo=types.SimpleNamespace(armor=10.0))]
+            matInfo=types.SimpleNamespace(armor=10.0),
+            compName='vehicleHull')]
         runtime.bigworld.entities.update({10: source, 11: target})
         battle._server = types.SimpleNamespace(vehicle_id=10)
         battle._records = {
@@ -4315,7 +4480,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             armor=20.0, vehicleDamageFactor=1.0,
             chanceToHitByExplosion=1.0)
         splash.collideSegmentExt = lambda start, end: [types.SimpleNamespace(
-            dist=1.0, hitAngleCos=1.0, matInfo=material)]
+            dist=1.0, hitAngleCos=1.0, matInfo=material,
+            compName='vehicleHull')]
         runtime.bigworld.entities.update({
             10: source, 11: direct, 12: splash, 13: far})
         direct_record = {
@@ -4918,7 +5084,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
                           {'health': 500})
         collision = types.SimpleNamespace(
             dist=20.0, hitAngleCos=1.0,
-            matInfo=types.SimpleNamespace(armor=10.0))
+            matInfo=types.SimpleNamespace(armor=10.0),
+            compName='vehicleHull')
         target.collideSegmentExt = lambda start, end: [collision]
         runtime.bigworld.entities.update({10: source, 11: target})
         battle._records = {
@@ -4956,7 +5123,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         segments = []
         collision = types.SimpleNamespace(
             dist=20.0, hitAngleCos=1.0,
-            matInfo=types.SimpleNamespace(armor=10.0))
+            matInfo=types.SimpleNamespace(armor=10.0),
+            compName='vehicleHull')
 
         def collide(start, end):
             segments.append((start, end))
@@ -4997,7 +5165,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         collision = types.SimpleNamespace(
             dist=20.0, hitAngleCos=1.0,
             matInfo=types.SimpleNamespace(
-                armor=10.0, vehicleDamageFactor=1.0))
+                armor=10.0, vehicleDamageFactor=1.0),
+            compName='vehicleHull')
         target.collideSegmentExt = mock.Mock(side_effect=AssertionError(
             'native collision uses the stale retail vehicle filter'))
         runtime.bigworld.entities.update({10: source, 11: target})

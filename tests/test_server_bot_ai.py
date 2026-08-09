@@ -882,6 +882,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         planner.build_orders(_manifest(), _states(), players, 0.0)
         accepted = planner.report_contacts([
             {"observing_team": 1, "target_id": 99, "visible": True,
+             "shootable_by_bot_ids": [1],
              "x": 40, "y": 0, "z": 30, "health": 200, "max_health": 1000},
         ], planner.known_targets(_states(), players), 1.0)
         self.assertEqual(1, accepted)
@@ -912,6 +913,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         planner.report_contacts([{
             "observing_team": 1, "target_kind": "human", "target_id": 99,
             "target_team": 2, "visible": True, "x": 0, "y": 0, "z": 20,
+            "shootable_by_bot_ids": [1],
             "health": 800, "max_health": 800,
         }], planner.known_targets(_states(), players), 1.0)
 
@@ -925,6 +927,113 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(first["revision"], second["revision"])
         self.assertEqual(first_order["move_position"], second_order["move_position"])
 
+    def test_point_blank_threat_preempts_a_distant_target_lease(self):
+        planner = BotPlanner()
+        bot = {
+            "id": 1, "team": 1, "slot": 0, "profile": {}, "route": {},
+            "state": {"x": 0.0, "z": 0.0},
+        }
+        distant = {
+            "id": 10, "target_kind": "bot", "visible": True,
+            "position": {"x": 0.0, "z": 220.0}, "health": 100,
+            "max_health": 1000, "shootable_by_bot_ids": [1],
+        }
+        close = {
+            "id": 11, "target_kind": "human", "visible": True,
+            "position": {"x": 0.0, "z": -20.0}, "health": 1000,
+            "max_health": 1000, "shootable_by_bot_ids": [1],
+        }
+
+        first = planner._assign_targets([bot], [distant], 1.0)[1]["id"]
+        switched = planner._assign_targets(
+            [bot], [distant, close], 1.1)[1]["id"]
+
+        self.assertEqual(10, first)
+        self.assertEqual(11, switched)
+
+    def test_point_blank_defence_remains_armed_for_two_minutes(self):
+        planner = BotPlanner()
+        support = {
+            "dominant_role": "support", "desired_range": 100.0,
+            "fire_range": 500.0, "roles": {"support": 1.0},
+        }
+        route = {
+            "id": "fallback", "waypoints": [
+                {"x": 0, "y": 0, "z": -120},
+                {"x": 0, "y": 0, "z": 300},
+            ],
+        }
+        positions = ((-12.0, -20.0), (0.0, -20.0),
+                     (12.0, -20.0), (24.0, -20.0))
+        bot_ids = (1, 2, 4, 5)
+        manifest = [
+            {"id": bot_id, "team": 1, "slot": index,
+             "health": 1000, "profile": support, "route": route}
+            for index, bot_id in enumerate(bot_ids)
+        ] + [{"id": 3, "team": 2, "slot": 0, "health": 100}]
+        states = [
+            {"id": bot_id, "team": 1, "alive": True,
+             "x": position[0], "z": position[1]}
+            for bot_id, position in zip(bot_ids, positions)
+        ] + [{"id": 3, "team": 2, "alive": True,
+              "x": 0.0, "z": 10.0}]
+        known = planner.known_targets(states, [])
+
+        for frame in range(600):
+            now = 1.0 + frame * 0.2
+            self.assertEqual(1, planner.report_contacts([{
+                "observing_team": 1, "target_kind": "bot",
+                "target_id": 3, "target_team": 2, "visible": True,
+                "shootable_by_bot_ids": list(bot_ids),
+                "x": 0.0, "y": 0.0, "z": 10.0,
+                "health": 100, "max_health": 1000,
+            }], known, now))
+            orders = planner.build_orders(
+                manifest, states, [], now)["orders"]
+            defenders = [value for value in orders
+                         if value["team"] == 1]
+            self.assertEqual(set(bot_ids), {
+                value["id"] for value in defenders
+                if value["target_id"] == 3})
+            self.assertTrue(all(value["fire_allowed"]
+                                for value in defenders))
+            self.assertNotIn(
+                "jiggle_forward",
+                {value["combat_mode"] for value in defenders})
+            self.assertNotIn(
+                "jiggle_back",
+                {value["combat_mode"] for value in defenders})
+
+    def test_close_visible_threat_makes_ranged_bot_withdraw_while_firing(self):
+        planner = BotPlanner()
+        manifest = _manifest()
+        manifest[0]["profile"] = {
+            "dominant_role": "support", "desired_range": 200.0,
+            "fire_range": 500.0, "roles": {"support": 1.0},
+        }
+        manifest[0]["route"] = {
+            "id": "support_lane", "waypoints": [
+                {"x": 0, "y": 0, "z": -120},
+                {"x": 0, "y": 0, "z": 300},
+            ],
+        }
+        states = _states()
+        planner.report_contacts([{
+            "observing_team": 1, "target_kind": "bot", "target_id": 3,
+            "target_team": 2, "visible": True,
+            "shootable_by_bot_ids": [1],
+            "x": 0, "y": 0, "z": 20, "health": 1000,
+            "max_health": 1000,
+        }], planner.known_targets(states, []), 1.0)
+
+        order = next(value for value in planner.build_orders(
+            manifest, states, [], 1.0)["orders"] if value["id"] == 1)
+
+        self.assertEqual("withdraw", order["combat_mode"])
+        self.assertEqual(3, order["target_id"])
+        self.assertTrue(order["fire_allowed"])
+        self.assertIsNone(order["throttle_override"])
+
     def test_human_and_bot_with_same_numeric_id_are_distinct_contacts(self):
         planner = BotPlanner()
         states = _states() + [{"id": 99, "team": 2, "alive": True, "x": 50, "z": 50}]
@@ -933,9 +1042,11 @@ class ServerBotPlannerTests(unittest.TestCase):
 
         accepted = planner.report_contacts([
             {"observing_team": 1, "target_kind": "human", "target_id": 99,
-             "target_team": 2, "x": 10, "z": 10},
+             "target_team": 2, "visible": True,
+             "shootable_by_bot_ids": [1], "x": 10, "z": 10},
             {"observing_team": 1, "target_kind": "bot", "target_id": 99,
-             "target_team": 2, "x": 100, "z": 100},
+             "target_team": 2, "visible": True,
+             "shootable_by_bot_ids": [1], "x": 100, "z": 100},
         ], known, 1.0)
 
         self.assertEqual(2, accepted)
@@ -1017,6 +1128,7 @@ class ServerBotPlannerTests(unittest.TestCase):
             "target_id": 99,
             "target_team": 2,
             "visible": True,
+            "shootable_by_bot_ids": [1],
             "x": 0.0,
             "y": 0.0,
             "z": 20.0,
@@ -1081,6 +1193,12 @@ class ServerBotPlannerTests(unittest.TestCase):
 
         self.assertEqual(0, planner.report_contacts({"not": "a list"}, known_targets, 1.0))
         self.assertEqual(0, planner.report_contacts(["not a mapping"], known_targets, 1.0))
+        self.assertEqual(0, planner.report_contacts([{
+            "observing_team": 1, "target_kind": "human",
+            "target_id": 99, "target_team": 2, "visible": True,
+            "x": 0, "y": 0, "z": 20,
+        }], known_targets, 1.0))
+        self.assertEqual([], planner._prune_contacts(known_targets, 1.0)[1])
         self.assertEqual(0, planner.report_affordances({"not": "a list"}, known_bots, known_targets, 1.0))
         self.assertEqual(0, planner.report_affordances([{
             "bot_id": 1, "target_kind": "human", "target_id": 99,
@@ -1207,7 +1325,8 @@ class ServerBotPlannerTests(unittest.TestCase):
         known_bots = planner.known_bots(_manifest(), _states())
         planner.report_contacts([{
             "observing_team": 1, "target_kind": "human", "target_id": 99,
-            "target_team": 2, "visible": True, "x": 0, "z": 20,
+            "target_team": 2, "visible": True,
+            "shootable_by_bot_ids": [1], "x": 0, "z": 20,
         }], known_targets, 1.0)
 
         far = _cover_candidate(x=800.0, z=800.0)
@@ -1227,7 +1346,8 @@ class ServerBotPlannerTests(unittest.TestCase):
         known_targets = planner.known_targets(_states(), players)
         planner.report_contacts([{
             "observing_team": 1, "target_kind": "human", "target_id": 99,
-            "target_team": 2, "visible": True, "x": 0, "z": 20,
+            "target_team": 2, "visible": True,
+            "shootable_by_bot_ids": [1], "x": 0, "z": 20,
         }], known_targets, 1.0)
         known_bots = planner.known_bots(manifest, _states())
         planner.report_affordances([{
@@ -1252,7 +1372,8 @@ class ServerBotPlannerTests(unittest.TestCase):
         known_targets = planner.known_targets(_states(), players)
         planner.report_contacts([{
             "observing_team": 1, "target_kind": "human", "target_id": 99,
-            "target_team": 2, "visible": True, "x": 0, "z": 20,
+            "target_team": 2, "visible": True,
+            "shootable_by_bot_ids": [1], "x": 0, "z": 20,
         }], known_targets, 1.0)
         planner.report_affordances([{
             "bot_id": 1, "target_kind": "human", "target_id": 99,
@@ -1280,7 +1401,8 @@ class ServerBotPlannerTests(unittest.TestCase):
         known_targets = planner.known_targets(_states(), players)
         planner.report_contacts([{
             "observing_team": 1, "target_kind": "human", "target_id": 99,
-            "target_team": 2, "visible": True, "x": 0, "z": 20,
+            "target_team": 2, "visible": True,
+            "shootable_by_bot_ids": [1, 2], "x": 0, "z": 20,
         }], known_targets, 1.0)
         reports = [{
             "bot_id": bot_id, "target_kind": "human", "target_id": 99,
@@ -1294,7 +1416,8 @@ class ServerBotPlannerTests(unittest.TestCase):
         known_targets = planner.known_targets(_states(), players)
         planner.report_contacts([{
             "observing_team": 1, "target_kind": "human", "target_id": 99,
-            "target_team": 2, "visible": True, "x": 0, "z": 20,
+            "target_team": 2, "visible": True,
+            "shootable_by_bot_ids": [1, 2], "x": 0, "z": 20,
         }], known_targets, 1.0)
         planner.report_affordances(reports, planner.known_bots(manifest, _states()),
                                    known_targets, 1.0)
@@ -1366,6 +1489,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         planner.report_contacts([{
             "observing_team": 1, "target_kind": "human", "target_id": 99,
             "target_team": 2, "visible": True, "x": 80, "y": 0, "z": 70,
+            "shootable_by_bot_ids": [1, 2, 4],
             "health": 1000, "max_health": 1000,
         }], planner.known_targets(states, players), 1.0)
 

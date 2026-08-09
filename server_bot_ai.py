@@ -34,6 +34,9 @@ MAX_COVER_REPORTS = 16
 MAX_COVER_CANDIDATES = 12
 TARGET_LEASE_SECONDS = 2.0
 TARGET_SWITCH_MARGIN = 3.0
+CLOSE_THREAT_DISTANCE = 50.0
+CLOSE_THREAT_SCORE_BONUS = 100.0
+CLOSE_THREAT_FOCUS_LIMIT = 4
 ROUTE_REBALANCE_SECONDS = 4.0
 ROUTE_LEASE_SECONDS = 6.0
 
@@ -110,6 +113,15 @@ class BotPlanner(object):
         for raw in contacts[:MAX_CONTACTS_PER_TEAM * 2]:
             if not isinstance(raw, dict):
                 continue
+            # This package does not support mixed authority-client builds.
+            # Missing or malformed per-bot firing-lane evidence must not fall
+            # back to the old "every bot can shoot" interpretation.
+            if ("shootable_by_bot_ids" not in raw or
+                    not isinstance(raw.get("shootable_by_bot_ids"),
+                                   (list, tuple)) or
+                    "visible" not in raw or
+                    not isinstance(raw.get("visible"), bool)):
+                continue
             observing_team = _integer(raw.get("observing_team"))
             target_id = _integer(raw.get("target_id"))
             target_kind = str(raw.get("target_kind") or "")
@@ -143,12 +155,8 @@ class BotPlanner(object):
                     "max_health": max(1, _integer(raw.get("max_health"), 1)),
                     "class_tag": str(raw.get("class_tag") or "unknown")[:24],
                     "armor": max(0.0, _number(raw.get("armor"), 0.0)),
-                    # ``None`` preserves protocol-v5 compatibility with an older
-                    # authority client.  A current client always sends the list,
-                    # including an empty one when the target is only team-spotted.
                     "shootable_by_bot_ids": self._bot_id_list(
-                        raw.get("shootable_by_bot_ids"))
-                        if "shootable_by_bot_ids" in raw else None,
+                        raw.get("shootable_by_bot_ids")),
                 }
                 accepted += 1
             elif previous is not None:
@@ -417,6 +425,14 @@ class BotPlanner(object):
         return 1
 
     @staticmethod
+    def _focus_limit(contact, distance):
+        """Let nearby tanks defend themselves without pulling a whole flank."""
+        limit = BotPlanner._desired_focus(contact)
+        if distance <= CLOSE_THREAT_DISTANCE:
+            return max(limit, CLOSE_THREAT_FOCUS_LIMIT)
+        return limit
+
+    @staticmethod
     def _engagement_range(bot, contact):
         """Keep nearby combat primary without pulling an entire team off-route."""
         profile = bot.get("profile") if isinstance(bot.get("profile"), dict) else {}
@@ -437,9 +453,8 @@ class BotPlanner(object):
 
         Team spotting is shared intelligence, not proof that every tank has a
         firing lane.  The authority client reports the bot ids whose own LOS
-        probe succeeded.  Older protocol-v5 clients omit that field and retain
-        their legacy behaviour so mixed packages fail compatibly rather than
-        silently disabling combat.
+        probe succeeded.  This release rejects contacts without that evidence;
+        mixed authority-client builds are not supported.
         """
         if not bots or not contacts:
             return {}
@@ -453,7 +468,7 @@ class BotPlanner(object):
             for contact in contacts:
                 observers = contact.get("shootable_by_bot_ids")
                 locally_shootable = (contact.get("visible") and
-                                     (observers is None or bot["id"] in observers))
+                                     bot["id"] in (observers or ()))
                 if not locally_shootable:
                     continue
                 distance = math.hypot(
@@ -464,7 +479,13 @@ class BotPlanner(object):
                 score = 0.0
                 score += contact["health"] / float(max(1, contact["max_health"])) * 28.0
                 score += distance * 0.018
-                candidate = (score, bot["id"], contact["id"], bot, contact)
+                if distance <= CLOSE_THREAT_DISTANCE:
+                    # A point-blank enemy is an immediate self-defence problem,
+                    # even while a previous long-range target still owns a
+                    # short lease.
+                    score -= CLOSE_THREAT_SCORE_BONUS
+                candidate = (
+                    score, bot["id"], contact["id"], bot, contact, distance)
                 candidates.append(candidate)
                 by_bot.setdefault(bot["id"], []).append(candidate)
 
@@ -491,22 +512,35 @@ class BotPlanner(object):
                 continue
             best_score = bot_candidates[0][0]
             lease_expired = _number(now) >= _number(previous.get("until"))
+            best_candidate = bot_candidates[0]
+            best_key = (best_candidate[4].get("target_kind"),
+                        best_candidate[4]["id"])
+            close_override = (
+                best_key != previous.get("target") and
+                best_candidate[5] <= CLOSE_THREAT_DISTANCE and
+                previous_candidate[5] > CLOSE_THREAT_DISTANCE
+            )
+            if close_override:
+                continue
             if (lease_expired and
                     previous_candidate[0] > best_score + TARGET_SWITCH_MARGIN):
                 continue
             contact = previous_candidate[4]
             key = (contact.get("target_kind"), contact["id"])
-            if reservations.get(key, 0) >= self._desired_focus(contact):
+            if reservations.get(key, 0) >= self._focus_limit(
+                    contact, previous_candidate[5]):
                 continue
             reservations[key] = reservations.get(key, 0) + 1
             assigned[bot["id"]] = contact
             if lease_expired:
                 previous["until"] = _number(now) + TARGET_LEASE_SECONDS
-        for unused_score, unused_bot_id, unused_target_id, bot, contact in sorted(candidates):
+        for (unused_score, unused_bot_id, unused_target_id, bot, contact,
+             distance) in sorted(candidates):
             if bot["id"] in assigned:
                 continue
             key = (contact.get("target_kind"), contact["id"])
-            if reservations.get(key, 0) >= self._desired_focus(contact):
+            if reservations.get(key, 0) >= self._focus_limit(
+                    contact, distance):
                 continue
             reservations[key] = reservations.get(key, 0) + 1
             assigned[bot["id"]] = contact
@@ -889,7 +923,7 @@ class BotPlanner(object):
         order["face_position"] = dict(focus["position"])
         observers = focus.get("shootable_by_bot_ids")
         locally_shootable = bool(focus.get("visible") and
-                                 (observers is None or bot["id"] in observers))
+                                 bot["id"] in (observers or ()))
         order["fire_allowed"] = locally_shootable
         order["shell_index"] = self._shell_index(profile, focus, personality)
         bx = _number(bot["state"].get("x"))
@@ -923,6 +957,16 @@ class BotPlanner(object):
         elif (distance <= fire_range * 1.15 and
               self._apply_cover_order(order, bot, focus, personality, now)):
             self._engage_anchors.pop(bot["id"], None)
+        elif distance < close_limit and dominant != "brawler":
+            # A support or ranged vehicle that has been rushed should keep
+            # aiming and firing while opening the distance. This must precede
+            # the general firing-envelope hold below: close_limit is always
+            # inside that envelope, so placing it later makes it unreachable.
+            self._engage_anchors.pop(bot["id"], None)
+            self._cover_states.pop(bot["id"], None)
+            order["combat_mode"] = "withdraw"
+            order["move_position"] = dict(route_anchor)
+            order["throttle_override"] = None
         elif distance <= min(fire_range, max(150.0, desired_range * 1.35)):
             # A visible enemy inside an effective firing envelope interrupts
             # route travel immediately when no client-probed cover manoeuvre is
@@ -939,12 +983,6 @@ class BotPlanner(object):
                 self._engage_anchors[bot["id"]] = anchor_state
             order["move_position"] = dict(anchor_state["position"])
             order["throttle_override"] = 0.0
-        elif distance < close_limit and dominant != "brawler":
-            self._engage_anchors.pop(bot["id"], None)
-            self._cover_states.pop(bot["id"], None)
-            order["combat_mode"] = "withdraw"
-            order["move_position"] = dict(route_anchor)
-            order["throttle_override"] = None
         elif roles.get("flanker", 0.0) >= 0.68 and personality["initiative"] > 0.42:
             self._engage_anchors.pop(bot["id"], None)
             order["combat_mode"] = "flank"
@@ -961,12 +999,11 @@ class BotPlanner(object):
                 }
                 self._engage_anchors[bot["id"]] = anchor_state
             order["move_position"] = dict(anchor_state["position"])
-            if dominant in ("brawler", "support") and personality["jiggle"] > 0.62:
-                phase = (_number(now) + bot["id"] * 0.071) % 3.2
-                order["throttle_override"] = 0.38 if phase < 1.55 else -0.30
-                order["combat_mode"] = "jiggle_forward" if phase < 1.55 else "jiggle_back"
-            else:
-                order["throttle_override"] = 0.0
+            # Only the geometry-backed cover state machine may order a peek.
+            # Periodic open-ground jiggle looked like a stuck-physics
+            # oscillation and could reverse a tank toward an unprobed cliff or
+            # traffic queue.
+            order["throttle_override"] = 0.0
         return order
 
     @staticmethod

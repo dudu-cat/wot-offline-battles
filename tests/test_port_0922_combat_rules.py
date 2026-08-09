@@ -69,8 +69,12 @@ class CombatRulesTests(unittest.TestCase):
         track = types.SimpleNamespace(armor=20.0, vehicleDamageFactor=0.0)
         hull = types.SimpleNamespace(armor=100.0, vehicleDamageFactor=1.0)
         collisions = (
-            types.SimpleNamespace(dist=5.0, hitAngleCos=0.5, matInfo=track),
-            types.SimpleNamespace(dist=5.2, hitAngleCos=1.0, matInfo=hull),
+            types.SimpleNamespace(
+                dist=5.0, hitAngleCos=0.5, matInfo=track,
+                compName='vehicleChassis'),
+            types.SimpleNamespace(
+                dist=5.2, hitAngleCos=1.0, matInfo=hull,
+                compName='vehicleHull'),
         )
 
         result = combat_rules.resolve_hull_hit(
@@ -80,6 +84,14 @@ class CombatRulesTests(unittest.TestCase):
         self.assertEqual(1, result[0])
         self.assertEqual(40.0, result[3])
 
+    def test_collision_adapter_rejects_incomplete_1513_result(self):
+        collision = types.SimpleNamespace(
+            dist=5.0, hitAngleCos=1.0,
+            matInfo=types.SimpleNamespace(armor=100.0))
+
+        with self.assertRaises(AttributeError):
+            combat_rules.collision_layers((collision,))
+
     def test_heat_stops_on_first_spaced_plate(self):
         track = types.SimpleNamespace(armor=20.0, vehicleDamageFactor=0.0)
         hull = types.SimpleNamespace(armor=20.0, vehicleDamageFactor=1.0)
@@ -88,9 +100,11 @@ class CombatRulesTests(unittest.TestCase):
             _shot(kind='HOLLOW_CHARGE', piercing=(400.0, 400.0)),
             50.0, (
                 types.SimpleNamespace(
-                    dist=5.0, hitAngleCos=1.0, matInfo=track),
+                    dist=5.0, hitAngleCos=1.0, matInfo=track,
+                    compName='vehicleChassis'),
                 types.SimpleNamespace(
-                    dist=5.2, hitAngleCos=1.0, matInfo=hull),
+                    dist=5.2, hitAngleCos=1.0, matInfo=hull,
+                    compName='vehicleHull'),
             ), random_uniform=lambda unused_low, unused_high: 1.0)
 
         self.assertIsNone(result)
@@ -100,8 +114,12 @@ class CombatRulesTests(unittest.TestCase):
         hull = types.SimpleNamespace(armor=75.0, vehicleDamageFactor=1.0)
 
         armor = combat_rules.he_nominal_armor((
-            types.SimpleNamespace(dist=2.0, hitAngleCos=1.0, matInfo=track),
-            types.SimpleNamespace(dist=2.5, hitAngleCos=0.5, matInfo=hull),
+            types.SimpleNamespace(
+                dist=2.0, hitAngleCos=1.0, matInfo=track,
+                compName='vehicleChassis'),
+            types.SimpleNamespace(
+                dist=2.5, hitAngleCos=0.5, matInfo=hull,
+                compName='vehicleHull'),
         ))
 
         self.assertEqual(75.0, armor)

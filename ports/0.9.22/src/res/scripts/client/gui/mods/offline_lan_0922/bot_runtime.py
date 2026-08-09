@@ -309,6 +309,18 @@ class _BotGunState(object):
 
     def __init__(self, descriptor, fire_seq=0):
         gun = _value(descriptor, 'gun', {}) or {}
+        raw_dispersion = _value(gun, 'shotDispersionAngle')
+        try:
+            self.fully_aimed_dispersion = float(raw_dispersion)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                'installed gun shotDispersionAngle is unavailable')
+        if (isinstance(raw_dispersion, bool) or
+                math.isnan(self.fully_aimed_dispersion) or
+                math.isinf(self.fully_aimed_dispersion) or
+                self.fully_aimed_dispersion <= 0.0):
+            raise ValueError(
+                'installed gun shotDispersionAngle must be positive')
         self.reload_full = max(
             0.01, _number(_value(gun, 'reloadTime', 3.0), 3.0))
         self.clip_size = 1
@@ -375,7 +387,17 @@ class _BotGunState(object):
         return max(0.0, duration - self.elapsed)
 
 
-def _dispersed_barrel_angles(bot_id, round_id, fire_seq, yaw, pitch):
+def _effective_shot_dispersion(gun_state, state, descriptor):
+    """Return installed fully-aimed dispersion with current critical malus."""
+    value = (float(gun_state.fully_aimed_dispersion) *
+             _critical_factor(state, descriptor, 'dispersion'))
+    if math.isnan(value) or math.isinf(value) or value <= 0.0:
+        raise ValueError('effective bot shot dispersion must be positive')
+    return value
+
+
+def _dispersed_barrel_angles(bot_id, round_id, fire_seq, yaw, pitch,
+                             dispersion_angle):
     """Return the actual physical shot ray used by the battle resolver.
 
     The 0.8.2 presentation uses negative pitch for a raised barrel.  Protocol
@@ -388,7 +410,14 @@ def _dispersed_barrel_angles(bot_id, round_id, fire_seq, yaw, pitch):
             (int(bot_id) & 0xffff) * 9176 +
             (int(fire_seq) & 0x7fffffff) * 6113) & 0x7fffffff
     generator = random.Random(seed)
-    sigma = 0.03 / 3.0
+    try:
+        dispersion_angle = float(dispersion_angle)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('bot shot dispersion is unavailable')
+    if (math.isnan(dispersion_angle) or math.isinf(dispersion_angle) or
+            dispersion_angle <= 0.0):
+        raise ValueError('bot shot dispersion must be positive')
+    sigma = dispersion_angle / 3.0
     direction[0] += generator.gauss(0.0, sigma)
     direction[1] += generator.gauss(0.0, sigma)
     direction[2] += generator.gauss(0.0, sigma)
@@ -401,6 +430,50 @@ def _dispersed_barrel_angles(bot_id, round_id, fire_seq, yaw, pitch):
                            direction[2] * direction[2])
     return (math.atan2(direction[0], direction[2]),
             math.atan2(direction[1], max(1e-9, horizontal)))
+
+
+def _overlay_live_target_pose(command, target):
+    """Replace a low-rate team-spotted order with the current target pose.
+
+    ``fire_allowed`` is the server's team-spot plus per-bot firing-lane
+    decision.  The authority's local visibility probe is deliberately not a
+    second gate here: one ally may spot a target that another ally has the
+    clear barrel lane to shoot.  The actual lane is probed again immediately
+    before firing.
+    """
+    result = dict(command)
+    if not result.get('fire_allowed'):
+        return result
+    if target is None:
+        result['fire_allowed'] = False
+        return result
+    if not isinstance(target, dict):
+        raise ValueError('canonical live target must be a record')
+    for name in ('alive', 'visible'):
+        if name not in target or not isinstance(target[name], bool):
+            raise ValueError(
+                'canonical live target %s flag is invalid' % name)
+    if not target['alive']:
+        result['fire_allowed'] = False
+        return result
+    if 'position' not in target:
+        raise ValueError('canonical live target position is unavailable')
+    raw_position = target['position']
+    if (not isinstance(raw_position, (list, tuple)) or
+            len(raw_position) != 3 or
+            any(isinstance(value, bool) for value in raw_position)):
+        raise ValueError('canonical live target position is invalid')
+    try:
+        position = tuple(float(raw_position[index]) for index in range(3))
+    except (TypeError, ValueError, OverflowError, IndexError):
+        raise ValueError('canonical live target position is invalid')
+    if any(math.isnan(value) or math.isinf(value) for value in position):
+        raise ValueError('canonical live target position must be finite')
+    result['aim_position'] = position
+    result['face_position'] = position
+    if result.get('combat_mode') == 'advance_contact':
+        result['move_position'] = position
+    return result
 
 
 class BotRuntime(object):
@@ -1637,10 +1710,7 @@ class BotRuntime(object):
         cached = self._shot_los_cache.get(key)
         if cached is not None and _number(now) - cached[0] < 0.20:
             return cached[1]
-        try:
-            value = bool(self.firing_lane_probe(source, target))
-        except Exception:
-            value = False
+        value = bool(self.firing_lane_probe(source, target))
         self._shot_los_cache[key] = (_number(now), value)
         if len(self._shot_los_cache) > 1024:
             oldest = sorted(self._shot_los_cache.items(),
@@ -1649,13 +1719,14 @@ class BotRuntime(object):
                 self._shot_los_cache.pop(old_key, None)
         return value
 
-    def _fire(self, state, gun_state, reload_factor):
+    def _fire(self, state, gun_state, reload_factor, descriptor):
         if not gun_state.fire(reload_factor):
             return False
         state['fire_seq'] += 1
         state['shot_yaw'], state['shot_pitch'] = _dispersed_barrel_angles(
             state['id'], self.round_id, state['fire_seq'],
-            state['aim_yaw'], state['gun_pitch'])
+            state['aim_yaw'], state['gun_pitch'],
+            _effective_shot_dispersion(gun_state, state, descriptor))
         state['clip'] = gun_state.clip
         state['reload_time'] = gun_state.remaining(reload_factor)
         state['reload_duration'] = (
@@ -1673,6 +1744,7 @@ class BotRuntime(object):
         step = min(self._accumulator, 0.2)
         self._accumulator = 0.0
         players = list(players or [])
+        collect_observation = _number(now) >= self._next_observation
         neighbours = list(neighbours or []) + self._player_neighbours(players)
         traffic_bodies, traffic_index = self._traffic_snapshot(neighbours)
         observations = {}
@@ -1691,29 +1763,48 @@ class BotRuntime(object):
             tick_safe[state['id']] = prebaked_navigation.pose_is_safe(
                 self.baked_graph, position, shoulder_cells=0)
             contacts, targets = self._contacts_for(state, players, now)
-            for target in contacts:
-                key = (int(state.get('team', 0)), target.get('kind'),
-                       int(target.get('network_id', 0)))
-                previous = observations.get(key)
-                profile = target.get('profile')
-                profile = profile if isinstance(profile, dict) else {}
-                observations[key] = {
-                    'observing_team': key[0], 'target_kind': key[1],
-                    'target_id': key[2],
-                    'target_team': int(target.get('team', 0)),
-                    'visible': bool(target.get('visible')) or bool(
-                        previous and previous.get('visible')),
-                    'x': _number(target.get('x')),
-                    'y': _number(target.get('y')),
-                    'z': _number(target.get('z')),
-                    'health': max(0, int(_number(target.get('health'), 1))),
-                    'max_health': max(
-                        1, int(_number(target.get('max_health'), 1))),
-                    'class_tag': target.get(
-                        'class_tag', profile.get('class_tag', 'unknown')),
-                    'armor': max(0.0, _number(
-                        target.get('armor', profile.get('armor', 0.0)))),
-                }
+            if collect_observation:
+                for target in contacts:
+                    key = (int(state.get('team', 0)), target.get('kind'),
+                           int(target.get('network_id', 0)))
+                    previous = observations.get(key)
+                    profile = target.get('profile')
+                    profile = profile if isinstance(profile, dict) else {}
+                    if ('visible' not in target or
+                            not isinstance(target['visible'], bool)):
+                        raise ValueError(
+                            'canonical contact visible flag is invalid')
+                    target_visible = target['visible']
+                    shootable = list(
+                        previous['shootable_by_bot_ids']
+                        if previous is not None else ())
+                    if (self._shot_clear(state, target, now) and
+                            state['id'] not in shootable):
+                        shootable.append(int(state['id']))
+                    observations[key] = {
+                        'observing_team': key[0], 'target_kind': key[1],
+                        'target_id': key[2],
+                        'target_team': int(target.get('team', 0)),
+                        'visible': target_visible or bool(
+                            previous and previous.get('visible')),
+                        # Current clients always publish this field. An empty
+                        # list means team-spotted without a local firing lane;
+                        # the server rejects omission rather than guessing.
+                        'shootable_by_bot_ids': sorted(shootable),
+                        'x': _number(target.get('x')),
+                        'y': _number(target.get('y')),
+                        'z': _number(target.get('z')),
+                        'health': max(
+                            0, int(_number(target.get('health'), 1))),
+                        'max_health': max(
+                            1, int(_number(target.get('max_health'), 1))),
+                        'class_tag': target.get(
+                            'class_tag', profile.get(
+                                'class_tag', 'unknown')),
+                        'armor': max(0.0, _number(
+                            target.get(
+                                'armor', profile.get('armor', 0.0)))),
+                    }
             server_order = self._server_orders.get(state['id'])
             decide_with_order = getattr(self.adapter, 'decide_with_order', None)
             cache_key = (('server', self._order_revision)
@@ -1752,6 +1843,9 @@ class BotRuntime(object):
                             server_order.get('target_id') is not None):
                         server_order['target_id'] = self._human_planner_id(
                             server_order.get('target_id'))
+                    server_order = _overlay_live_target_pose(
+                        server_order,
+                        targets.get(server_order.get('target_id')))
                     command = decide_with_order(
                         decision_state, server_order,
                         lambda yaw: self._clear(
@@ -1767,6 +1861,7 @@ class BotRuntime(object):
                         decision_cache is None),
                     _number(now), dict(command))
             target = targets.get(command.get('target_id'))
+            command = _overlay_live_target_pose(command, target)
             state['target_kind'] = (
                 target.get('kind') if target is not None else None)
             state['target_id'] = (
@@ -1884,12 +1979,12 @@ class BotRuntime(object):
                         (fire_range <= 0.0 or
                          _distance(_position(state), target['position']) < fire_range))
             if (command['fire_allowed'] and target is not None and
-                    target.get('visible') and in_range and
+                    in_range and
                     'gunHealth' not in destroyed_devices and
                     state.get('gun_aligned') and
                     gun_state.ready(reload_factor) and
                     self._shot_clear(state, target, now)):
-                self._fire(state, gun_state, reload_factor)
+                self._fire(state, gun_state, reload_factor, descriptor)
             mode = command.get('combat_mode')
             if (target is not None and target.get('visible') and
                     callable(self.cover_probe) and
@@ -1939,7 +2034,7 @@ class BotRuntime(object):
         # The server validates ram proximity against its latest authority pose.
         # Publish state first, then the cooldown-gated damage reports.
         outgoing.extend(ram_reports)
-        if _number(now) >= self._next_observation:
+        if collect_observation:
             self._next_observation = _number(now) + OBSERVATION_SECONDS
             outgoing.append({
                 'type': 'bot_observation',

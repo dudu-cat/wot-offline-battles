@@ -139,6 +139,40 @@ class BotAiPortTests(unittest.TestCase):
         self.assertGreater(order['turn'], 0.0)
         self.assertAlmostEqual(math.atan2(20.0, 40.0), order['target_yaw'])
 
+    def test_local_director_does_not_jiggle_without_confirmed_cover(self):
+        descriptor = {
+            'type': {'name': 'heavy', 'tags': ('heavyTank',)},
+            'physics': {'speedLimits': (12.0,)},
+            'hull': {'primaryArmor': 180.0},
+            'turret': {'primaryArmor': 180.0,
+                       'circularVisionRadius': 400.0},
+            'gun': {'shots': ()},
+        }
+        director = BattleDirector('04_himmelsdorf', 45)
+        agent = director.register(401, 1, descriptor, 'Jiggler')
+        agent['personality'].update({
+            'caution': 0.2, 'patience': 0.2,
+            'aggression': 0.3, 'jiggle': 0.95,
+        })
+        position = (185.0, 0.0, -82.0)
+        target = (185.0, 0.0, -22.0)
+        modes = set()
+        throttle_values = set()
+
+        for tick in range(600):
+            now = tick * 0.2
+            director.update_contact(
+                1, 402, 2, target, 1000, 1000,
+                'heavyTank', True, now)
+            order = director.order_for(
+                401, position, 0.0, 1000, 1000, now)
+            modes.add(order['combat_mode'])
+            throttle_values.add(order['throttle_override'])
+
+        self.assertNotIn('jiggle_forward', modes)
+        self.assertNotIn('jiggle_back', modes)
+        self.assertEqual({None}, throttle_values)
+
     def test_navigation_accepts_caller_probes(self):
         grid = TerrainGrid(lambda x, z, hint_y: 0.0,
                            bounds=(-50, -50, 50, 50))

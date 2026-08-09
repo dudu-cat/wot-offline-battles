@@ -1125,39 +1125,9 @@ class BattleDirector(object):
 					order['combat_mode'] = 'flank'
 				else:
 					order['move_position'] = tuple(position)
-				# Some armoured turreted drivers habitually rock their hull while
-				# holding an angle. The stable phase offset keeps this individual
-				# and prevents a whole team from moving in lockstep.
-				jiggle_capable = (
-					profile['class_tag'] not in ('AT-SPG', 'SPG') and
-					profile['dominant_role'] in ('brawler', 'support') and
-					profile['armor'] >= 80.0)
-				if (jiggle_capable and personality['jiggle'] > 0.56 and
-				        order['move_position'] == tuple(position) and
-				        distance < profile['desired_range'] * 1.35):
-					jiggle_cycle = 2.4 + (1.0 - personality['jiggle']) * 1.8
-					jiggle_phase = (
-						_number(now) + (agent['seed'] % 83) * 0.043) % jiggle_cycle
-					if jiggle_phase < jiggle_cycle * 0.46:
-						order['throttle_override'] = 0.42
-						order['combat_mode'] = 'jiggle_forward'
-					else:
-						order['throttle_override'] = -0.34
-						order['combat_mode'] = 'jiggle_back'
-				# Patient, cautious line tanks alternate between a short exposure
-				# window and the previous route anchor. The phase offset is stable,
-				# so a team does not pop out and reverse in one synchronized wave.
-				peek_capable = profile['dominant_role'] in ('brawler', 'support')
-				peek_preference = personality['patience'] + personality['caution']
-				if (peek_capable and peek_preference > 0.95 and
-				        distance < profile['desired_range'] * 1.35):
-					cycle = 8.0 + personality['patience'] * 5.0
-					exposed = 3.0 + personality['aggression'] * 2.5
-					phase = (_number(now) + (agent['seed'] % 97) * 0.071) % cycle
-					if phase > exposed:
-						order['move_position'] = self._fallback_position(agent, position)
-						order['throttle_override'] = None
-						order['combat_mode'] = 'withdraw'
+				# Do not manufacture a periodic forward/back manoeuvre in open
+				# ground. Peeking belongs to the geometry-backed cover adapter;
+				# without confirmed cover this order holds, aims and fires.
 			else:
 				# Last-known positions inform movement but never authorize a shot.
 				order['combat_mode'] = 'investigate'

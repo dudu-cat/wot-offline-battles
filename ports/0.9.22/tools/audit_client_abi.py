@@ -243,6 +243,7 @@ EXPECTED_ABI = {
         'PlayerAvatar.__setIsOnArena': ('self', 'onArena'),
         'PlayerAvatar.__onInitStepCompleted': ('self',),
         'PlayerAvatar.moveVehicle': ('self', 'flags', 'isKeyDown'),
+        'PlayerAvatar.autoAim': ('self', 'target'),
         'PlayerAvatar.targetFocus': ('self', 'entity'),
         'PlayerAvatar.shoot': ('self', 'isRepeat'),
         'PlayerAvatar.cancelWaitingForShot': ('self',),
@@ -693,6 +694,14 @@ EXPECTED_CODE_NAMES = {
             'gunRotator', 'setShotPosition'),
         'PlayerAvatar.getOwnVehicleShotDispersionAngle': (
             'getOwnVehicleSpeeds', 'shotDispersionAngle'),
+        'PlayerAvatar.autoAim': (
+            'isinstance', 'Vehicle', '_PlayerAvatar__autoAimVehID',
+            'publicInfo', 'team', 'isAlive', 'cell', 'autoAim',
+            'setAimingMode', 'TARGET_LOCK', 'clientMode', 'onLockTarget',
+            'TARGET_LOCKED', 'TARGET_UNLOCKED',
+            '_PlayerAvatar__aimingInfo', 'BigWorld', 'time',
+            'shotDispersionAngle', 'dispersionAngle', 'activateTrigger',
+            'deactivateTrigger', 'AUTO_AIM_AT_VEHICLE'),
         'PlayerAvatar.targetFocus': (
             '_PlayerAvatar__vehicles', 'guiSessionProvider',
             'setTargetInFocus', 'drawEdge'),
@@ -724,7 +733,17 @@ EXPECTED_CODE_NAMES = {
             'BigWorld', 'player', 'getOwnVehicleSpeeds', 'speedInfo',
             'value', 'SPEED', 'MAX_SPEED'),
     },
+    'scripts/client/AvatarInputHandler/control_modes.pyc': {
+        'ArcadeControlMode.handleKeyEvent': (
+            'CMD_CM_LOCK_TARGET', 'BigWorld', 'target', 'autoAim',
+            'CMD_CM_LOCK_TARGET_OFF'),
+        'SniperControlMode.handleKeyEvent': (
+            'CMD_CM_LOCK_TARGET', 'BigWorld', 'target', 'autoAim',
+            'CMD_CM_LOCK_TARGET_OFF'),
+    },
     'scripts/client/Vehicle.pyc': {
+        'Vehicle.__collideSegment': (
+            'SegmentCollisionResultExt', 'itemTypeName'),
         'Vehicle.__startWGPhysics': ('filter', 'syncGunAngles', 'speedInfo'),
         'Vehicle.getSpeed': ('_Vehicle__speedInfo', 'value'),
         'Vehicle.getServerGunAngles': (
@@ -744,6 +763,12 @@ EXPECTED_CODE_NAMES = {
         'Vehicle.collideSegmentExt': (
             '_Vehicle__collideSegment',),
         'Vehicle.drawEdge': ('appearance', 'highlighter', 'highlight'),
+    },
+    'scripts/client/AvatarInputHandler/gun_marker_ctrl.pyc': {
+        '_CrosshairShotResults._getAllCollisionDetails': (
+            'collideSegmentExt',),
+        '_CrosshairShotResults.getShotResult': (
+            'dist', 'hitAngleCos', 'matInfo', 'compName'),
     },
     'scripts/client/ProjectileMover.pyc': {
         # The native method name is a dynamic getattr string literal, while

@@ -297,6 +297,7 @@ class OfflineCompatibility(object):
         self._original_avatar_prereqs_loaded = None
         self._original_avatar_aux_physics = None
         self._original_avatar_get_speeds = None
+        self._original_avatar_auto_aim = None
         self._original_control_mode_changed = None
         self._original_consistent_link_own_vehicle = None
         self._original_steady_relink_sources = None
@@ -317,6 +318,7 @@ class OfflineCompatibility(object):
         self._original_connect = None
         self._original_disconnect = None
         self._original_server_time = None
+        self._original_target = None
         self._original_debug_update = None
         self._account_init_wrapper = None
         self._account_getattribute_wrapper = None
@@ -332,6 +334,7 @@ class OfflineCompatibility(object):
         self._avatar_prereqs_loaded_wrapper = None
         self._avatar_aux_physics_wrapper = None
         self._avatar_get_speeds_wrapper = None
+        self._avatar_auto_aim_wrapper = None
         self._control_mode_changed_wrapper = None
         self._consistent_link_own_vehicle_wrapper = None
         self._steady_relink_sources_wrapper = None
@@ -352,11 +355,13 @@ class OfflineCompatibility(object):
         self._connect_wrapper = None
         self._disconnect_wrapper = None
         self._server_time_wrapper = None
+        self._target_wrapper = None
         self._debug_update_wrapper = None
         self._battle_server_time_origin = None
         self._battle_clock_origin = None
         self._vehicle_property_overlays = {}
         self._control_mode_listener = None
+        self._target_lock_candidate = None
 
     def install(self):
         if self._installed:
@@ -428,6 +433,10 @@ class OfflineCompatibility(object):
         self._original_avatar_get_speeds = avatar_type.__dict__.get(
             'getOwnVehicleSpeeds',
             getattr(avatar_type, 'getOwnVehicleSpeeds', None))
+        self._original_avatar_auto_aim = avatar_type.__dict__.get(
+            'autoAim', getattr(avatar_type, 'autoAim', None))
+        if self._original_avatar_auto_aim is None:
+            raise RuntimeError('#1513 Avatar.autoAim is unavailable')
         self._original_avatar_aux_physics = avatar_type.__dict__.get(
             '_PlayerAvatar__onSetOwnVehicleAuxPhysicsData',
             getattr(
@@ -534,6 +543,9 @@ class OfflineCompatibility(object):
         self._original_connect = runtime.bigworld.connect
         self._original_disconnect = runtime.bigworld.disconnect
         self._original_server_time = runtime.bigworld.serverTime
+        self._original_target = getattr(runtime.bigworld, 'target', None)
+        if not callable(self._original_target):
+            raise RuntimeError('#1513 BigWorld.target is unavailable')
         if debug_panel_type is not None:
             self._original_debug_update = debug_panel_type.__dict__.get(
                 'updateDebugInfo',
@@ -972,6 +984,56 @@ class OfflineCompatibility(object):
             return compatibility._original_avatar_get_speeds(
                 avatar, get_instantaneous)
 
+        def avatar_auto_aim(avatar, target):
+            """Admit the private remote Vehicle to the stock lock lifecycle.
+
+            ``BigWorld.target()`` cannot return our Python gameplay adapter:
+            its rendered owner is an ``OfflineEntity``.  The battle runtime
+            therefore publishes the vehicle selected by the same precise ray
+            that owns the outline.  Once admitted, keep #1513's native state,
+            aiming mode, gun-rotator mode and sound notification sequence.
+            """
+            if not compatibility._battle_active:
+                return compatibility._original_avatar_auto_aim(
+                    avatar, target)
+            current_id = compatibility._original_avatar_getattribute(
+                avatar, '_PlayerAvatar__autoAimVehID')
+            candidate = compatibility._target_lock_candidate
+            if (candidate is not None and
+                    target is getattr(candidate, 'bw_entity', None)):
+                target = candidate
+            if not bool(getattr(
+                    target, '_offlineLANPresentation', False)):
+                return compatibility._original_avatar_auto_aim(
+                    avatar, target)
+
+            alive = getattr(target, 'isAlive')
+            alive = alive() if callable(alive) else bool(alive)
+            rejected = (
+                int(getattr(target, 'id')) == int(current_id) or
+                int(getattr(target, 'team')) == int(getattr(avatar, 'team')) or
+                not alive)
+            if rejected:
+                if current_id:
+                    # Let stock #1513 own the full unlock transition,
+                    # including its aimingInfo convergence timestamp/factor.
+                    return compatibility._original_avatar_auto_aim(
+                        avatar, None)
+                return None
+
+            vehicle_id = int(target.id)
+            setattr(avatar, '_PlayerAvatar__autoAimVehID', vehicle_id)
+            avatar.cell.autoAim(vehicle_id)
+            aiming_mode = runtime.constants.AIMING_MODE.TARGET_LOCK
+            avatar.inputHandler.setAimingMode(True, aiming_mode)
+            avatar.gunRotator.clientMode = False
+            aim_sound = runtime.avatar_module.AimSound
+            avatar.onLockTarget(aim_sound.TARGET_LOCKED, True)
+            runtime.avatar_module.TriggersManager.g_manager.activateTrigger(
+                runtime.avatar_module.TRIGGER_TYPE.AUTO_AIM_AT_VEHICLE,
+                vehicleId=vehicle_id)
+            return None
+
         def vehicle_leave_world(vehicle):
             original = compatibility._original_vehicle_leave_world
             if not compatibility._battle_active:
@@ -1286,6 +1348,22 @@ class OfflineCompatibility(object):
                         pass
             return compatibility._original_server_time()
 
+        def target():
+            """Expose only the exact outlined visual to native input code.
+
+            #1513's arcade and sniper lock commands call
+            ``avatar.autoAim(BigWorld.target())`` while the explicit lock-off
+            command calls ``avatar.autoAim(None)``.  Preserve that distinction:
+            only replace an empty engine target lookup here, never reinterpret
+            a literal ``None`` inside ``Avatar.autoAim``.
+            """
+            current = compatibility._original_target()
+            candidate = compatibility._target_lock_candidate
+            if (current is None and compatibility._battle_active and
+                    candidate is not None):
+                return candidate.bw_entity
+            return current
+
         def debug_update(panel, ping, fps, isLaggingNow, fpsReplay=-1):
             """Render LAN transport health during a client-only battle.
 
@@ -1326,6 +1404,7 @@ class OfflineCompatibility(object):
         self._avatar_prereqs_loaded_wrapper = avatar_prereqs_loaded
         self._avatar_aux_physics_wrapper = avatar_aux_physics
         self._avatar_get_speeds_wrapper = avatar_get_speeds
+        self._avatar_auto_aim_wrapper = avatar_auto_aim
         self._control_mode_changed_wrapper = control_mode_changed
         self._consistent_link_own_vehicle_wrapper = \
             consistent_link_own_vehicle
@@ -1342,6 +1421,7 @@ class OfflineCompatibility(object):
         self._connect_wrapper = connect
         self._disconnect_wrapper = disconnect
         self._server_time_wrapper = server_time
+        self._target_wrapper = target
         self._debug_update_wrapper = debug_update
         try:
             self._install_host()
@@ -1369,6 +1449,7 @@ class OfflineCompatibility(object):
                     avatar_aux_physics)
             if self._original_avatar_get_speeds is not None:
                 avatar_type.getOwnVehicleSpeeds = avatar_get_speeds
+            avatar_type.autoAim = avatar_auto_aim
             input_handler_type.onControlModeChanged = control_mode_changed
             consistent_matrices_type._ConsistentMatrices__linkOwnVehicle = \
                 consistent_link_own_vehicle
@@ -1395,6 +1476,7 @@ class OfflineCompatibility(object):
             runtime.bigworld.connect = connect
             runtime.bigworld.disconnect = disconnect
             runtime.bigworld.serverTime = server_time
+            runtime.bigworld.target = target
             if self._original_debug_update is not None:
                 debug_panel_type.updateDebugInfo = debug_update
             self._installed = True
@@ -1494,6 +1576,10 @@ class OfflineCompatibility(object):
                 self._avatar_get_speeds_wrapper):
             avatar_type.getOwnVehicleSpeeds = (
                 self._original_avatar_get_speeds)
+        if (self._original_avatar_auto_aim is not None and
+                avatar_type.__dict__.get('autoAim') is
+                self._avatar_auto_aim_wrapper):
+            avatar_type.autoAim = self._original_avatar_auto_aim
         if (input_handler_type is not None and
                 self._original_control_mode_changed is not None and
                 input_handler_type.__dict__.get('onControlModeChanged') is
@@ -1566,6 +1652,8 @@ class OfflineCompatibility(object):
             runtime.bigworld.disconnect = self._original_disconnect
         if runtime.bigworld.serverTime is self._server_time_wrapper:
             runtime.bigworld.serverTime = self._original_server_time
+        if runtime.bigworld.target is self._target_wrapper:
+            runtime.bigworld.target = self._original_target
         if (debug_panel_type is not None and
                 self._original_debug_update is not None and
                 debug_panel_type.__dict__.get('updateDebugInfo') is
@@ -1595,6 +1683,7 @@ class OfflineCompatibility(object):
         self._battle_clock_origin = None
         self._vehicle_property_overlays = {}
         self._control_mode_listener = None
+        self._target_lock_candidate = None
         self._installed = False
 
     def connect(self, show_lobby=False, account_context=None):
@@ -1794,6 +1883,7 @@ class OfflineCompatibility(object):
         self.install()
         self._battle_active = True
         self._vehicle_property_overlays = {}
+        self._target_lock_candidate = None
         self._native_battle = True
         self._battle_gui_type = gui_type
         self._battle_bonus_type = bonus_type
@@ -1817,6 +1907,38 @@ class OfflineCompatibility(object):
             raise TypeError('control-mode listener must be callable')
         self.install()
         self._control_mode_listener = listener
+
+    def set_target_lock_candidate(self, vehicle):
+        """Publish the exact synthetic Vehicle under the native crosshair."""
+        if vehicle is not None:
+            if not self._battle_active:
+                raise RuntimeError('target-lock candidate requires a battle')
+            if not bool(getattr(
+                    vehicle, '_offlineLANPresentation', False)):
+                raise TypeError('target-lock candidate is not a remote Vehicle')
+            if getattr(vehicle, 'bw_entity', None) is None:
+                raise ValueError(
+                    'target-lock candidate has no visual entity')
+        self._target_lock_candidate = vehicle
+        return True
+
+    def validate_target_lock(self, avatar):
+        """Release a stock lock when its private remote target leaves AOI."""
+        if not self._battle_active:
+            return False
+        current_id = self._original_avatar_getattribute(
+            avatar, '_PlayerAvatar__autoAimVehID')
+        if not current_id:
+            return False
+        target = self._runtime.bigworld.entity(current_id)
+        if target is not None:
+            alive = getattr(target, 'isAlive')
+            alive = alive() if callable(alive) else bool(alive)
+            if alive and bool(getattr(target, '_spot_visible', True)):
+                return False
+        # Stock owns target-lost state cleanup and convergence bookkeeping.
+        self._original_avatar_auto_aim(avatar, None)
+        return True
 
     def set_vehicle_pose_overlay(self, vehicle, position, yaw, matrix,
                                  speed=0.0, turn_speed=0.0):
@@ -2013,6 +2135,7 @@ class OfflineCompatibility(object):
             self._battle_player_name = 'OfflinePlayer'
             self._battle_player_team = 1
             self._battle_network_client = None
+            self._target_lock_candidate = None
             self._battle_server_time_origin = None
             self._battle_clock_origin = None
             self._vehicle_property_overlays = {}

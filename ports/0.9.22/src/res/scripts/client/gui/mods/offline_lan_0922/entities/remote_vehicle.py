@@ -14,11 +14,25 @@ import math
 import weakref
 from collections import namedtuple
 
+try:
+    _STRING_TYPES = (basestring,)
+except NameError:
+    _STRING_TYPES = (str,)
+
 
 # Exact value contract returned by #1513 ``Vehicle.collideSegment``.  The
 # stock ProjectileMover uses both tuple indexing and these named fields.
 _SegmentCollisionResult = namedtuple(
     'SegmentCollisionResult', ('dist', 'hitAngleCos', 'armor'))
+
+# Exact value contract returned by #1513 ``Vehicle.collideSegmentExt``.
+# ``AvatarInputHandler.gun_marker_ctrl`` reads all four named fields on every
+# gun-rotator tick.  A Python object carrying the component descriptor under a
+# private adapter name is not equivalent: the missing ``compName`` aborts the
+# native tick and freezes mouse aim, dispersion and target-lock feedback.
+_SegmentCollisionResultExt = namedtuple(
+    'SegmentCollisionResultExt',
+    ('dist', 'hitAngleCos', 'matInfo', 'compName'))
 
 
 class _AliveFlag(object):
@@ -349,15 +363,6 @@ class _RemoteFilter(object):
                 offset_z * offset_z <= self._BROAD_PHASE_RADIUS_SQUARED)
 
 
-class RemoteCollision(object):
-
-    def __init__(self, dist, hit_angle_cos, material, component):
-        self.dist = float(dist)
-        self.hitAngleCos = float(hit_angle_cos)
-        self.matInfo = material
-        self.compDescr = component
-
-
 def _component_value(component, name, default=None):
     if isinstance(component, dict):
         return component.get(name, default)
@@ -436,8 +441,12 @@ def collide_vehicle_at_matrix(vehicle, vehicle_matrix, start_point,
                 continue
             materials = _component_value(component, 'materials', {}) or {}
             material = materials.get(material_kind)
-            hits.append(RemoteCollision(
-                dist, angle_cos, material, component))
+            component_name = _component_value(component, 'itemTypeName')
+            if not isinstance(component_name, _STRING_TYPES):
+                raise RuntimeError(
+                    '#1513 collision component has no itemTypeName')
+            hits.append(_SegmentCollisionResultExt(
+                float(dist), float(angle_cos), material, component_name))
     hits.sort(key=lambda item: item.dist)
     return hits
 
@@ -652,8 +661,8 @@ class RemoteVehicle(object):
     def collideSegment(self, start_point, end_point, skipGun=False):
         hits = self.collideSegmentExt(start_point, end_point)
         if skipGun:
-            hits = [item for item in hits if _component_value(
-                item.compDescr, 'itemTypeName') != 'vehicleGun']
+            hits = [item for item in hits
+                    if item.compName != 'vehicleGun']
         if not hits:
             return None
         closest = hits[0]

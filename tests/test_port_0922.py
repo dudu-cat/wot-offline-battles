@@ -233,7 +233,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.41</version></root>')
+            '<version>0.3.42</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -805,6 +805,7 @@ class _CompatBigWorld(object):
         self._callbacks = []
         self.entities = {}
         self._player = None
+        self._target = None
         self._next_entity = 1
         self._now = 100.0
 
@@ -816,6 +817,9 @@ class _CompatBigWorld(object):
         # clock samples, so this value remains frozen until the compatibility
         # layer supplies the scoped offline battle clock.
         return 500.0
+
+    def target(self):
+        return self._target
 
     def connect(self, server, login_params, progress):
         self.operations.append(('original_connect', server))
@@ -1368,6 +1372,8 @@ class OfflineCompatibilityTests(unittest.TestCase):
                 operations.append(('original_avatar_init',))
                 self._ClientChat__chatActionCallbacks = {}
                 self._PlayerAvatar__initProgress = 0
+                self._PlayerAvatar__autoAimVehID = 0
+                self._PlayerAvatar__aimingInfo = [0.0, 1.0]
                 self.consistentMatrices = ConsistentMatrices()
                 self._PlayerAvatar__consistentMatrices = \
                     self.consistentMatrices
@@ -1419,6 +1425,36 @@ class OfflineCompatibilityTests(unittest.TestCase):
 
             def getOwnVehicleSpeeds(self, get_instantaneous=False):
                 return (0.0, 0.0)
+
+            def autoAim(self, target):
+                operations.append(('original_avatar_auto_aim', target))
+                if target is None or not isinstance(target, Vehicle):
+                    vehicle_id = 0
+                elif target.id == self._PlayerAvatar__autoAimVehID:
+                    vehicle_id = 0
+                elif target.publicInfo['team'] == self.team:
+                    vehicle_id = 0
+                elif not target.isAlive():
+                    vehicle_id = 0
+                else:
+                    vehicle_id = target.id
+                if self._PlayerAvatar__autoAimVehID == vehicle_id:
+                    return None
+                self._PlayerAvatar__autoAimVehID = vehicle_id
+                self.cell.autoAim(vehicle_id)
+                aiming_mode = 'target-lock'
+                if vehicle_id:
+                    self.inputHandler.setAimingMode(True, aiming_mode)
+                    self.gunRotator.clientMode = False
+                else:
+                    self.inputHandler.setAimingMode(False, aiming_mode)
+                    self.gunRotator.clientMode = True
+                    self._PlayerAvatar__aimingInfo[0] = bigworld.time()
+                    minimum = self.vehicleTypeDescriptor.gun.\
+                        shotDispersionAngle
+                    self._PlayerAvatar__aimingInfo[1] = (
+                        self.gunRotator.dispersionAngle / minimum)
+                return None
 
             def getVehicleAttached(self):
                 return bigworld.entity(getattr(self, 'playerVehicleID', 0))
@@ -1523,8 +1559,19 @@ class OfflineCompatibilityTests(unittest.TestCase):
         account_module = types.SimpleNamespace(
             PlayerAccount=PlayerAccount,
             _CLIENT_SERVER_VERSION=('requiredVersion_92200', '0.9.22'))
+        trigger_manager = types.SimpleNamespace(
+            activateTrigger=lambda trigger, **kwargs: operations.append(
+                ('trigger_activate', trigger, kwargs)),
+            deactivateTrigger=lambda trigger: operations.append(
+                ('trigger_deactivate', trigger)))
         avatar_module = types.SimpleNamespace(
-            PlayerAvatar=PlayerAvatar, AvatarObserver=AvatarObserver)
+            PlayerAvatar=PlayerAvatar, AvatarObserver=AvatarObserver,
+            AimSound=types.SimpleNamespace(
+                TARGET_LOCKED='target_locked',
+                TARGET_UNLOCKED='target_unlocked'),
+            TriggersManager=types.SimpleNamespace(g_manager=trigger_manager),
+            TRIGGER_TYPE=types.SimpleNamespace(
+                AUTO_AIM_AT_VEHICLE='auto_aim_at_vehicle'))
         bigworld.account_type = PlayerAccount
         manager = _CompatConnectionManager(bigworld, statuses, operations)
         player_events = types.SimpleNamespace(
@@ -1552,6 +1599,8 @@ class OfflineCompatibilityTests(unittest.TestCase):
             steady_vehicle_matrix=types.SimpleNamespace(
                 SteadyVehicleMatrixCalculator=
                 SteadyVehicleMatrixCalculator),
+            constants=types.SimpleNamespace(
+                AIMING_MODE=types.SimpleNamespace(TARGET_LOCK='target-lock')),
             math=types.SimpleNamespace(Vector3=_Vector3),
             vehicle_module=types.SimpleNamespace(Vehicle=Vehicle),
             vehicle_gun_rotator=types.SimpleNamespace(
@@ -1735,6 +1784,144 @@ class OfflineCompatibilityTests(unittest.TestCase):
 
         compatibility.fini()
         self.assertEqual((0.0, 0.0), avatar.getOwnVehicleSpeeds())
+
+    def test_remote_autoaim_admits_exact_outline_candidate_and_switches(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        original_auto_aim = \
+            runtime.avatar_module.PlayerAvatar.__dict__['autoAim']
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.team = 1
+        avatar.cell = types.SimpleNamespace(autoAim=mock.Mock())
+        avatar.inputHandler = types.SimpleNamespace(
+            setAimingMode=mock.Mock())
+        avatar.gunRotator = types.SimpleNamespace(
+            clientMode=True, dispersionAngle=0.24)
+        avatar.vehicleTypeDescriptor = types.SimpleNamespace(
+            gun=types.SimpleNamespace(shotDispersionAngle=0.08))
+        avatar.onLockTarget = mock.Mock()
+        runtime.bigworld.entity = runtime.bigworld.entities.get
+        first_visual = object()
+        second_visual = object()
+        first = types.SimpleNamespace(
+            _offlineLANPresentation=True, bw_entity=first_visual,
+            id=1000, team=2, _spot_visible=True,
+            isAlive=lambda: True)
+        second = types.SimpleNamespace(
+            _offlineLANPresentation=True, bw_entity=second_visual,
+            id=1001, team=2, _spot_visible=True,
+            isAlive=lambda: True)
+        runtime.bigworld.entities.update({1000: first, 1001: second})
+
+        compatibility.set_target_lock_candidate(first)
+        self.assertIs(first_visual, runtime.bigworld.target())
+        avatar.autoAim(runtime.bigworld.target())
+        self.assertEqual(1000, avatar._PlayerAvatar__autoAimVehID)
+        avatar.cell.autoAim.assert_called_once_with(1000)
+        avatar.inputHandler.setAimingMode.assert_called_once_with(
+            True, 'target-lock')
+        self.assertFalse(avatar.gunRotator.clientMode)
+        avatar.onLockTarget.assert_called_once_with('target_locked', True)
+        self.assertIn(
+            ('trigger_activate', 'auto_aim_at_vehicle',
+             {'vehicleId': 1000}), operations)
+
+        compatibility.set_target_lock_candidate(second)
+        self.assertIs(second_visual, runtime.bigworld.target())
+        avatar.autoAim(runtime.bigworld.target())
+        self.assertEqual(1001, avatar._PlayerAvatar__autoAimVehID)
+        self.assertEqual(
+            [mock.call(1000), mock.call(1001)],
+            avatar.cell.autoAim.call_args_list)
+
+        # The explicit native lock-off path passes literal None and must take
+        # the complete stock unlock path, including convergence bookkeeping.
+        avatar.autoAim(None)
+        self.assertEqual(0, avatar._PlayerAvatar__autoAimVehID)
+        self.assertEqual(100.0, avatar._PlayerAvatar__aimingInfo[0])
+        self.assertEqual(3.0, avatar._PlayerAvatar__aimingInfo[1])
+        self.assertIn(('original_avatar_auto_aim', None), operations)
+        avatar.autoAim(None)
+        self.assertEqual(0, avatar._PlayerAvatar__autoAimVehID)
+        self.assertEqual(
+            [mock.call(1000), mock.call(1001), mock.call(0)],
+            avatar.cell.autoAim.call_args_list)
+
+        compatibility.fini()
+        self.assertIs(
+            original_auto_aim,
+            runtime.avatar_module.PlayerAvatar.__dict__['autoAim'])
+
+    def test_remote_autoaim_delegates_unrelated_native_vehicle(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.team = 1
+        avatar.cell = types.SimpleNamespace(autoAim=mock.Mock())
+        avatar.inputHandler = types.SimpleNamespace(
+            setAimingMode=mock.Mock())
+        avatar.gunRotator = types.SimpleNamespace(
+            clientMode=True, dispersionAngle=0.24)
+        avatar.vehicleTypeDescriptor = types.SimpleNamespace(
+            gun=types.SimpleNamespace(shotDispersionAngle=0.08))
+        avatar.onLockTarget = mock.Mock()
+        outlined = types.SimpleNamespace(
+            _offlineLANPresentation=True, bw_entity=object(),
+            id=1000, team=2, isAlive=lambda: True)
+        native = runtime.vehicle_module.Vehicle()
+        native.id = 77
+        native.publicInfo = {'team': 2}
+        native.isAlive = lambda: True
+
+        compatibility.set_target_lock_candidate(outlined)
+        runtime.bigworld._target = native
+        self.assertIs(native, runtime.bigworld.target())
+        avatar.autoAim(runtime.bigworld.target())
+
+        self.assertEqual(77, avatar._PlayerAvatar__autoAimVehID)
+        self.assertIn(('original_avatar_auto_aim', native), operations)
+        compatibility.fini()
+
+    def test_remote_autoaim_unlocks_through_stock_when_target_is_lost(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.team = 1
+        avatar.cell = types.SimpleNamespace(autoAim=mock.Mock())
+        avatar.inputHandler = types.SimpleNamespace(
+            setAimingMode=mock.Mock())
+        avatar.gunRotator = types.SimpleNamespace(
+            clientMode=True, dispersionAngle=0.24)
+        avatar.vehicleTypeDescriptor = types.SimpleNamespace(
+            gun=types.SimpleNamespace(shotDispersionAngle=0.08))
+        avatar.onLockTarget = mock.Mock()
+        runtime.bigworld.entity = runtime.bigworld.entities.get
+        target = types.SimpleNamespace(
+            _offlineLANPresentation=True, bw_entity=object(),
+            id=1000, team=2, _spot_visible=True,
+            isAlive=lambda: True)
+        runtime.bigworld.entities[1000] = target
+        compatibility.set_target_lock_candidate(target)
+        avatar.autoAim(runtime.bigworld.target())
+
+        self.assertFalse(compatibility.validate_target_lock(avatar))
+        target._spot_visible = False
+        self.assertTrue(compatibility.validate_target_lock(avatar))
+
+        self.assertEqual(0, avatar._PlayerAvatar__autoAimVehID)
+        self.assertEqual(100.0, avatar._PlayerAvatar__aimingInfo[0])
+        self.assertEqual(3.0, avatar._PlayerAvatar__aimingInfo[1])
+        self.assertEqual(
+            ('original_avatar_auto_aim', None),
+            [item for item in operations
+             if item[0] == 'original_avatar_auto_aim'][-1])
+        compatibility.fini()
 
     def test_fixed_turret_aim_reads_copied_pose_without_replacing_filter(self):
         compatibility_module = _load_port_source('compat')
@@ -3354,7 +3541,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.41'
+        package.PORT_VERSION = '0.3.42'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []

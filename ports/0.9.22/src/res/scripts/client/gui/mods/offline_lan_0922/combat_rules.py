@@ -280,21 +280,14 @@ def legacy_shot(shot):
 def collision_layers(collisions):
     result = []
     for collision in collisions or ():
-        try:
-            distance = getattr(collision, 'dist')
-            angle = getattr(collision, 'hitAngleCos')
-            material = getattr(collision, 'matInfo')
-            component = getattr(collision, 'compDescr', None)
-        except Exception:
-            try:
-                distance, angle, material = collision[:3]
-                component = collision[3] if len(collision) > 3 else None
-            except Exception:
-                continue
+        distance = getattr(collision, 'dist')
+        angle = getattr(collision, 'hitAngleCos')
+        material = getattr(collision, 'matInfo')
+        component = getattr(collision, 'compName')
         try:
             result.append((float(distance), float(angle), material, component))
         except (TypeError, ValueError):
-            continue
+            raise TypeError('#1513 collision contains a non-numeric field')
     return sorted(result, key=lambda item: item[0])
 
 

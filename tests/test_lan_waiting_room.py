@@ -992,9 +992,11 @@ class WaitingRoomTest(unittest.TestCase):
         first.send({"type": "bot_manifest", "bots": manifest})
         first.send({"type": "bot_state", "bots": bot_states(manifest)})
         first.send({"type": "bot_observation", "contacts": [{
-            "observing_team": 2, "target_id": first_welcome["player_id"], "target_team": 1,
+            "observing_team": 2, "target_kind": "human",
+            "target_id": first_welcome["player_id"], "target_team": 1,
             "visible": True, "x": 17.0, "y": 2.0, "z": -31.0,
             "health": 880, "max_health": 880, "class_tag": "mediumTank",
+            "shootable_by_bot_ids": [identity["id"]],
         }]})
         time.sleep(0.05)
         self.state.tick_once(0.05)

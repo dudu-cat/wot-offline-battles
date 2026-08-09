@@ -91,15 +91,15 @@ PINNED_PORT_SHA256 = {
     'ai/maps_group_a.py': '35a7d8b34c1c78f889bbe30d54d7898fd581259769d1aa13112eda3f32afcc7f',
     'ai/maps_group_b.py': '152aae3d25921998b9436c3fbe2210d6f640c92220cf1729504fd59ce7b952d1',
     'ai/navigation.py': '2a0bac86694100d94ae3e383e9ce2cc4cc1fa3f1c05b52d78fa3b9dc009565b9',
-    'ai/planner.py': '5bea9f55a6b23e3f4f24ad5a337eb2e7e92acd72a6482496ab98a40eff90f453',
-    'bot_runtime.py': '8bc74bdba5f29cd719ed88b7c934a59ffc928acae3f8bc4fd061c166e7858b8b',
-    'entities/remote_vehicle.py': 'f35b0b7a45179ed5032fcb9503e032f1b4cc7774be8dd5d0709a3add2550ad2f',
+    'ai/planner.py': 'ef049470e70e6437eb9646ca3edab05dc4517b081b6630ee5707ac3eac4d0cb1',
+    'bot_runtime.py': '073e4248018c459ce74ae6cd3ee7aec9666783bf7aaadb4c6dd8f5de39d3c945',
+    'entities/remote_vehicle.py': '868e16c8016bfd753fa9c705c046cca827c9765c69ea35b5e5a77d11d4bf12ae',
     'tank_collision.py': '2f0b9b8987b4401d430e84512e5fdbf84351b4245e2589907d597a8508197b2d',
     'vehicle_physics.py': '9beab9b11f8c349d55979c7a753f33b48262b1add28f63f3d754a8495c20e676',
     'world_collision.py': '6def0448c6c79b324b822ae79b397775815c5e4d66709963a5ff52fb38608de1',
 }
 PINNED_SERVER_SHA256 = {
-    'server_bot_ai.py': '95248c44d57564a3220305342241233237c103865ea9ce684b5cefe5f0c918e9',
+    'server_bot_ai.py': '09cba11c3a7164a43d7785c8ce4b0b721070a246ea68bdf66930994c125264cc',
 }
 
 # Every Python file in the working 0.8.2 offhangar tree is classified here.
@@ -516,7 +516,8 @@ def audit(repo_root):
                      'ProjectileMover', 'setupTurretRotations',
                      'assembleRecoil', 'extrasDict',
                      'self.model.matrix = self.matrix',
-                     '_SegmentCollisionResult'):
+                     '_SegmentCollisionResult',
+                     '_SegmentCollisionResultExt', 'compName'):
         if required not in remote_vehicle:
             errors.append('remote_vehicle.py omits copied carrier boundary: '
                           '%s' % required)
