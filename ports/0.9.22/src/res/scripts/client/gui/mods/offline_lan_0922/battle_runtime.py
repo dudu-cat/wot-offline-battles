@@ -954,6 +954,26 @@ class BattleRuntime(object):
     def _synchronise_player_identity(self, expected_vehicle_id):
         """Refresh ArenaDP before marker plugins cache the local vehicle id."""
         expected_vehicle_id = int(expected_vehicle_id)
+        if expected_vehicle_id <= 0:
+            raise RuntimeError('#1513 player vehicle identity is invalid')
+        get_player = getattr(self._runtime.bigworld, 'player', None)
+        if not callable(get_player):
+            raise RuntimeError('#1513 BigWorld player API is unavailable')
+        current_player = get_player()
+        if current_player is not self._avatar:
+            raise RuntimeError(
+                '#1513 BigWorld player changed before ArenaDP refresh')
+        avatar_vehicle_id = int(getattr(current_player, 'playerVehicleID', 0))
+        if avatar_vehicle_id != expected_vehicle_id:
+            raise RuntimeError(
+                '#1513 Avatar player identity mismatch before ArenaDP '
+                'refresh: expected=%s avatar=%s' % (
+                    expected_vehicle_id, avatar_vehicle_id))
+        avatar_team = int(getattr(current_player, 'team', 0))
+        if avatar_team not in (1, 2):
+            raise RuntimeError(
+                '#1513 Avatar team is invalid before ArenaDP refresh: '
+                'team=%s' % avatar_team)
         provider = getattr(self._avatar, 'guiSessionProvider', None)
         get_arena_dp = getattr(provider, 'getArenaDP', None)
         if not callable(get_arena_dp):
@@ -964,14 +984,19 @@ class BattleRuntime(object):
             arena_dp, 'getPlayerVehicleID', None)
         if not callable(required) or not callable(get_player_vehicle_id):
             raise RuntimeError('#1513 ArenaDP player identity API is unavailable')
-        refreshed_vehicle_id = int(get_player_vehicle_id(True))
+        # #1513 initializes ArenaDP before the local Vehicle exists, so its
+        # cached player id is the integer 0.  getPlayerVehicleID(True) only
+        # refreshes a None cache and therefore cannot repair that state.
+        # isRequiredDataExists() is the stock boundary which treats 0 as
+        # incomplete and re-reads the already-validated Avatar identity.
+        if not required():
+            raise RuntimeError('#1513 ArenaDP player identity is incomplete')
+        refreshed_vehicle_id = int(get_player_vehicle_id(False))
         if refreshed_vehicle_id != expected_vehicle_id:
             raise RuntimeError(
                 '#1513 ArenaDP player identity refresh mismatch: '
                 'expected=%s arenaDP=%s' % (
                     expected_vehicle_id, refreshed_vehicle_id))
-        if not required():
-            raise RuntimeError('#1513 ArenaDP player identity is incomplete')
         return self._assert_player_identity(expected_vehicle_id)
 
     def _assert_player_identity(self, expected_vehicle_id):

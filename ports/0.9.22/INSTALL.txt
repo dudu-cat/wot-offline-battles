@@ -1,4 +1,4 @@
-World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.44
+World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.45
 ================================================================
 
 This folder is directly mergeable into the frozen Chinese HD client root.
@@ -17,7 +17,7 @@ client pins an empty server room to one build; a legacy 0.8.2 client cannot join
 that room because its map and coordinate contracts are different. Use another
 server port for a simultaneous 0.8.2 room.
 
-Version 0.3.44 retains the local gun/shot, collision, spotting and foliage
+Version 0.3.45 retains the local gun/shot, collision, spotting and foliage
 fixes. It installs one live pose before native input startup for camera, gun,
 sniper and minimap consumers; hides unspotted/dead private entities from native
 aiming and projectile lookup; restores RPM presentation; and renders admitted
@@ -29,11 +29,13 @@ updates use the private authority registry without widening the native AOI.
 Bot collision now uses the
 measured 0.8.2 spatial broadphase;
 planning is staggered near 10 Hz while physics, gun and network publication
-remain at 30 Hz. Version 0.3.44 also gives every Bot its own spawn-route join,
+remain at 30 Hz. Version 0.3.45 also gives every Bot its own spawn-route join,
 keeps visible enemies as approach targets even before a firing lane opens,
 uses per-Bot firing evidence for actual shots, restores player/Bot contact
 destruction for trees and fragile props, and separates shot/fire/ram feedback
-from friendly collision damage. Do not mix it with an older 0.9.22 wotmod.
+from friendly collision damage. It refreshes #1513's initial zero ArenaDP
+player-id cache before battle markers start. Do not mix it with an older
+0.9.22 wotmod.
 
 Install
 -------
@@ -48,7 +50,7 @@ Install
 3. Copy this folder's `mods` directory into the game root.
 4. Confirm this file exists:
 
-       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.44.wotmod
+       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.45.wotmod
 
 5. This copy-ready package includes:
 
@@ -116,7 +118,7 @@ Troubleshooting
 ---------------
 
 - `unsupported compression type`: an older or incorrectly compressed wotmod
-  is still present. Keep only the 0.3.44 package; its members use Store method.
+  is still present. Keep only the 0.3.45 package; its members use Store method.
 - No connection in the server terminal: check `config.json`, the host LAN IP,
   virtual-machine network mode and TCP 28782 firewall access. A failed attempt
   automatically opens the native endpoint editor; Battle! can reopen it.

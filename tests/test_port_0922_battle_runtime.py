@@ -288,10 +288,16 @@ class _ArenaDataProvider(object):
         self.refreshes = 0
 
     def isRequiredDataExists(self):
+        if self.player_vehicle_id > 0:
+            return True
+        self.refreshes += 1
+        self.player_vehicle_id = int(self.avatar.playerVehicleID)
         return self.player_vehicle_id > 0
 
     def getPlayerVehicleID(self, forceUpdate=True):
-        if forceUpdate:
+        # Exact #1513 only force-refreshes a None cache. ArenaDP is created
+        # before the local Vehicle and therefore normally holds integer 0.
+        if forceUpdate and self.player_vehicle_id is None:
             self.refreshes += 1
             self.player_vehicle_id = int(self.avatar.playerVehicleID)
         return self.player_vehicle_id
@@ -360,6 +366,7 @@ class _Avatar(object):
         self._offlineLANInitComplete = True
         self._offlineLANPlayerReady = True
         self.spaceID = 7
+        self.team = 1
         self.playerVehicleID = 0
         self.isGunLocked = True
         self.ownVehicleAuxPhysicsData = 0
@@ -2123,6 +2130,56 @@ class BattleRuntimeContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'refresh mismatch'):
             battle._synchronise_player_identity(10)
 
+    def test_player_identity_sync_refreshes_exact_1513_zero_cache(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._avatar.playerVehicleID = 10
+        arena_dp = battle._avatar.arena_dp
+
+        self.assertEqual(0, arena_dp.getPlayerVehicleID(True))
+        self.assertEqual(0, arena_dp.refreshes)
+        self.assertTrue(battle._synchronise_player_identity(10))
+        self.assertEqual(10, arena_dp.getPlayerVehicleID(False))
+        self.assertEqual(1, arena_dp.refreshes)
+
+    def test_player_identity_sync_requires_current_bound_avatar(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._avatar.playerVehicleID = 10
+        arena_dp = battle._avatar.arena_dp
+        runtime.bigworld.avatar = _Avatar()
+        runtime.bigworld.avatar.playerVehicleID = 10
+
+        with self.assertRaisesRegex(RuntimeError, 'BigWorld player changed'):
+            battle._synchronise_player_identity(10)
+        self.assertEqual(0, arena_dp.refreshes)
+
+    def test_player_identity_sync_requires_avatar_id_before_arena_refresh(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._avatar.playerVehicleID = 9
+        arena_dp = battle._avatar.arena_dp
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'Avatar player identity mismatch'):
+            battle._synchronise_player_identity(10)
+        self.assertEqual(0, arena_dp.refreshes)
+
+    def test_player_identity_sync_requires_team_before_arena_refresh(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._avatar.playerVehicleID = 10
+        battle._avatar.team = 0
+        arena_dp = battle._avatar.arena_dp
+
+        with self.assertRaisesRegex(RuntimeError, 'Avatar team is invalid'):
+            battle._synchronise_player_identity(10)
+        self.assertEqual(0, arena_dp.refreshes)
+
     def test_local_feedback_rejects_player_identity_drift(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -2822,7 +2879,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
         battle._avatar.playerVehicleID = 10
-        battle._avatar.arena_dp.getPlayerVehicleID(True)
+        battle._avatar.arena_dp.isRequiredDataExists()
         target = {
             'engine_id': 11, 'local': False, 'kind': 'bot',
             'network_id': 2, 'state': {'team': 2}}
@@ -2854,7 +2911,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._avatar = runtime.bigworld.avatar
         battle._binding = mock.Mock()
         battle._avatar.playerVehicleID = 10
-        battle._avatar.arena_dp.getPlayerVehicleID(True)
+        battle._avatar.arena_dp.isRequiredDataExists()
         attacker = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
                             {'health': 500})
         ally = _Vehicle(11, _Descriptor(), _Vector(0, 0, 1), (0, 0, 0),
@@ -2887,7 +2944,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
         battle._avatar.playerVehicleID = 10
-        battle._avatar.arena_dp.getPlayerVehicleID(True)
+        battle._avatar.arena_dp.isRequiredDataExists()
         attacker = {
             'engine_id': 10, 'local': True, 'kind': 'player',
             'network_id': 1, 'state': {'team': 1}}
@@ -2912,7 +2969,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
         battle._avatar.playerVehicleID = 10
-        battle._avatar.arena_dp.getPlayerVehicleID(True)
+        battle._avatar.arena_dp.isRequiredDataExists()
         attacker = {
             'engine_id': 10, 'local': True, 'kind': 'player',
             'network_id': 1, 'state': {'team': 1}}
@@ -2954,7 +3011,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
         battle._avatar.playerVehicleID = 10
-        battle._avatar.arena_dp.getPlayerVehicleID(True)
+        battle._avatar.arena_dp.isRequiredDataExists()
         attacker = {
             'engine_id': 10, 'local': True, 'kind': 'player',
             'network_id': 1, 'state': {'team': 1}}
@@ -4985,7 +5042,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'presentation': True},
         }
         battle._avatar.playerVehicleID = 10
-        battle._avatar.arena_dp.getPlayerVehicleID(True)
+        battle._avatar.arena_dp.isRequiredDataExists()
 
         self.assertTrue(battle._apply_combat_event({
             'kind': 'bot_hit', 'attacker': 1, 'target_bot': 2,
