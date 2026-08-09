@@ -810,7 +810,8 @@ class TerrainNavigator(object):
 			try:
 				path_key = key[0]
 				owned = (isinstance(path_key, tuple) and len(path_key) > 1 and
-				         path_key[0] in ('local', 'join', 'recovery', 'continue') and
+				         path_key[0] in (
+				             'local', 'route_join', 'join', 'recovery', 'continue') and
 				         int(path_key[1]) == bot_id)
 			except Exception:
 				owned = False

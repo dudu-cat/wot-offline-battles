@@ -31,7 +31,7 @@ jobs:
       - name: Validate 0.9.22 wotmod package
         run: >-
           python ports/0.9.22/tools/validate_wotmod.py
-          ports/0.9.22/dist/org.peng.offline_lan_0922_0.3.43.wotmod
+          ports/0.9.22/dist/org.peng.offline_lan_0922_0.3.44.wotmod
       - uses: actions/upload-artifact@v4
         with:
           name: wot-0.9.22-lan-client

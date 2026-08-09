@@ -256,6 +256,22 @@ class BotAiPortTests(unittest.TestCase):
             ('prune', 2.1), ('trim', None),
         ], calls)
 
+    def test_superseded_route_join_search_is_cancelled_for_its_bot(self):
+        navigator = TerrainNavigator(lambda *unused: 0.0)
+        route_join = (('route_join', 11, 2, 'forest', 1), (4, 5))
+        other_bot = (('route_join', 12, 2, 'forest', 1), (4, 5))
+        navigator.searches[route_join] = object()
+        navigator.searches[other_bot] = object()
+        navigator.search_times[route_join] = 1.0
+        navigator.search_times[other_bot] = 1.0
+
+        navigator._cancel_bot_searches(11)
+
+        self.assertNotIn(route_join, navigator.searches)
+        self.assertNotIn(route_join, navigator.search_times)
+        self.assertIn(other_bot, navigator.searches)
+        self.assertIn(other_bot, navigator.search_times)
+
     def test_graph_validation_rejects_incomplete_battle_contract(self):
         graph = {
             'format': 'offline-lan-0922-navgraph', 'version': 2,

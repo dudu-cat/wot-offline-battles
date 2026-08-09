@@ -156,10 +156,48 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(0, state.players[1].health)
         self.assertEqual(2, state.bot_authority_id)
         self.assertIsNone(state.battle_result)
+        leave_event = next(
+            event for event in state.pending_events
+            if event.get("source") == "player_left")
+        self.assertIsNone(leave_event["attack_reason"])
+        self.assertEqual(0, leave_event["death_reason"])
         self.assertTrue(any(
             event.get("kind") == "authority" and
             event.get("player_id") == 2
             for event in state.pending_events))
+
+    def test_combat_wire_contract_is_explicit_for_every_source(self):
+        valid = (
+            {"kind": "bot_hit", "attacker": 1, "target_bot": 2,
+             "health": 400, "dead": False, "source": "shot",
+             "attack_reason": 0, "death_reason": 0},
+            {"kind": "bot_bot_hit", "attacker_bot": 1, "target_bot": 2,
+             "health": 0, "dead": True, "source": "fire",
+             "attack_reason": 1, "death_reason": 1},
+            {"kind": "bot_human_hit", "attacker_bot": 1, "target": 2,
+             "health": 300, "dead": False, "source": "ram",
+             "attack_reason": 2, "death_reason": 0},
+            {"kind": "health", "target": 2, "health": 300,
+             "dead": False, "source": "client_simulation",
+             "attack_reason": 3, "death_reason": 0},
+            {"kind": "health", "target": 2, "health": 0,
+             "dead": True, "source": "player_left",
+             "attack_reason": None, "death_reason": 0},
+        )
+        for event in valid:
+            self.assertTrue(BattleState._validate_combat_event_for_wire(
+                event))
+
+        invalid = dict(valid[0])
+        invalid.pop("source")
+        with self.assertRaisesRegex(RuntimeError, "no source"):
+            BattleState._validate_combat_event_for_wire(invalid)
+        invalid = dict(valid[4], attack_reason=0)
+        with self.assertRaisesRegex(RuntimeError, "non-attack cause"):
+            BattleState._validate_combat_event_for_wire(invalid)
+        invalid = dict(valid[2], source="shot")
+        with self.assertRaisesRegex(RuntimeError, "does not match source"):
+            BattleState._validate_combat_event_for_wire(invalid)
 
     def test_last_round_participant_leave_finishes_draw_and_reset_revives(self):
         state = self._started_state(players=1)
@@ -430,6 +468,8 @@ class ServerBotPlannerTests(unittest.TestCase):
         event = [value for value in state.pending_events
                  if value.get("source") == "fire"][-1]
         self.assertEqual(25, event["damage"])
+        self.assertEqual(1, event["attack_reason"])
+        self.assertEqual(1, event["death_reason"])
 
     def test_bot_ignition_gets_frag_on_final_burnout_tick(self):
         state = self._started_state(players=1)
@@ -622,6 +662,9 @@ class ServerBotPlannerTests(unittest.TestCase):
             "attacker_bot": 11, "target": 2, "shot_seq": 3,
             "damage": 100, "shot_result": 2}))
         self.assertEqual(900, state.players[2].health)
+        self.assertEqual(0, state.pending_events[-1]["attack_reason"])
+        self.assertEqual(0, state.pending_events[-1]["death_reason"])
+        self.assertEqual("shot", state.pending_events[-1]["source"])
 
     def test_authority_bot_can_damage_enemy_bot_once_per_fire_sequence(self):
         state = BattleState(map_name="04_himmelsdorf")
@@ -642,6 +685,9 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(825, state.bot_states[12]["health"])
         self.assertFalse(state.report_bot_hit(1, report))
         self.assertEqual("bot_bot_hit", state.pending_events[-1]["kind"])
+        self.assertEqual(0, state.pending_events[-1]["attack_reason"])
+        self.assertEqual(0, state.pending_events[-1]["death_reason"])
+        self.assertEqual("shot", state.pending_events[-1]["source"])
 
     def test_one_human_shell_cannot_damage_bot_and_human_targets(self):
         state = BattleState(map_name="04_himmelsdorf")
@@ -753,6 +799,10 @@ class ServerBotPlannerTests(unittest.TestCase):
         ram_events = [event for event in state.pending_events
                       if event.get("source") == "ram"]
         self.assertEqual(2, len(ram_events))
+        self.assertEqual({2}, {
+            event["attack_reason"] for event in ram_events})
+        self.assertEqual({0}, {
+            event["death_reason"] for event in ram_events})
         self.assertFalse(state.report_bot_ram(1, report))
         self.assertFalse(state.report_bot_ram(2, dict(report, ram_seq=2)))
         self.assertEqual(480, state.bot_states[11]["health"])
@@ -890,6 +940,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         team_one = [order for order in result["orders"] if order["team"] == 1]
         targeted = [order for order in team_one if order["target_id"] == 99]
         self.assertEqual(1, len(targeted))
+        self.assertEqual(1, targeted[0]["id"])
         self.assertEqual({"x": 40.0, "y": 0.0, "z": 30.0}, targeted[0]["aim_position"])
         self.assertTrue(targeted[0]["fire_allowed"])
 
@@ -950,6 +1001,40 @@ class ServerBotPlannerTests(unittest.TestCase):
 
         self.assertEqual(10, first)
         self.assertEqual(11, switched)
+
+    def test_visible_blocked_human_is_pursued_but_not_fired_at(self):
+        planner = BotPlanner()
+        manifest = _manifest()
+        states = _states()
+        human = [{"id": 99, "team": 2, "alive": True}]
+        known = planner.known_targets(states, human)
+        blocked = {
+            "observing_team": 1, "target_kind": "human", "target_id": 99,
+            "target_team": 2, "visible": True,
+            "shootable_by_bot_ids": [],
+            "x": 0.0, "y": 0.0, "z": 25.0,
+            "health": 1000, "max_health": 1000,
+        }
+
+        self.assertEqual(1, planner.report_contacts([blocked], known, 1.0))
+        blocked_order = next(value for value in planner.build_orders(
+            manifest, states, human, 1.0)["orders"] if value["id"] == 1)
+
+        self.assertEqual(99, blocked_order["target_id"])
+        self.assertEqual("human", blocked_order["target_kind"])
+        self.assertEqual("advance_contact", blocked_order["combat_mode"])
+        self.assertEqual(
+            {"x": 0.0, "y": 0.0, "z": 25.0},
+            blocked_order["move_position"])
+        self.assertFalse(blocked_order["fire_allowed"])
+
+        clear = dict(blocked, shootable_by_bot_ids=[1])
+        self.assertEqual(1, planner.report_contacts([clear], known, 1.2))
+        clear_order = next(value for value in planner.build_orders(
+            manifest, states, human, 1.2)["orders"] if value["id"] == 1)
+
+        self.assertEqual(99, clear_order["target_id"])
+        self.assertTrue(clear_order["fire_allowed"])
 
     def test_point_blank_defence_remains_armed_for_two_minutes(self):
         planner = BotPlanner()
@@ -1053,6 +1138,39 @@ class ServerBotPlannerTests(unittest.TestCase):
         contacts = planner._prune_contacts(known, 1.0)[1]
         self.assertEqual({"human", "bot"}, {value["target_kind"] for value in contacts})
 
+    def test_equal_human_and_bot_ids_have_a_scalar_target_sort_order(self):
+        planner = BotPlanner()
+        manifest = [{
+            "id": 7, "team": 1, "slot": 0, "health": 1000,
+            "profile": {},
+        }, {
+            "id": 3, "team": 2, "slot": 0, "health": 1000,
+            "profile": {},
+        }]
+        states = [
+            {"id": 7, "team": 1, "alive": True, "x": 0, "z": 0},
+            {"id": 3, "team": 2, "alive": True, "x": 0, "z": 20},
+        ]
+        players = [{"id": 3, "team": 2, "alive": True}]
+        known = planner.known_targets(states, players)
+        self.assertEqual(2, planner.report_contacts([
+            {"observing_team": 1, "target_kind": "human", "target_id": 3,
+             "target_team": 2, "visible": True,
+             "shootable_by_bot_ids": [7], "x": 0, "y": 0, "z": 20,
+             "health": 1000, "max_health": 1000},
+            {"observing_team": 1, "target_kind": "bot", "target_id": 3,
+             "target_team": 2, "visible": True,
+             "shootable_by_bot_ids": [7], "x": 0, "y": 0, "z": 20,
+             "health": 1000, "max_health": 1000},
+        ], known, 1.0))
+
+        order = next(value for value in planner.build_orders(
+            manifest, states, players, 1.0)["orders"]
+                     if value["id"] == 7)
+
+        self.assertEqual(3, order["target_id"])
+        self.assertEqual("bot", order["target_kind"])
+
     def test_uploaded_route_advances_after_reaching_waypoint(self):
         planner = BotPlanner()
         manifest = _manifest()
@@ -1071,6 +1189,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(1, order["route_index"])
         self.assertEqual({"x": 60.0, "y": 0.0, "z": -20.0}, order["move_position"])
         self.assertEqual({"x": 0.0, "y": 0.0, "z": -20.0}, order["route_anchor"])
+        self.assertTrue(order["route_join"])
 
     def test_deployed_bot_skips_a_rear_facing_route_connector(self):
         planner = BotPlanner()

@@ -39,7 +39,8 @@ def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None, airborne=False,
 				hw = max(abs(bbox[0][0]), abs(bbox[1][0])) - 0.1
 				hl_back = abs(bbox[0][2])
 				hl_front = abs(bbox[1][2])
-			except: pass
+			except (AttributeError, KeyError, TypeError, IndexError):
+				pass
 
 		# Look-ahead beyond the hull. The old flat +2.0 m made an invisible
 		# wall 2 m before every obstacle, and DURING A FALL it saw the cliff
@@ -90,7 +91,8 @@ def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None, airborne=False,
 			if (_smooth and _first_y is not None and _prev_y is not None and
 					_prev_y - _first_y > 0.15):
 				return False
-		except: pass
+		except Exception:
+			raise
 
 		for offset_x in (-hw, 0, hw):
 			sx = pos.x + cos_y * offset_x
@@ -101,18 +103,16 @@ def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None, airborne=False,
 			x2 = sx + sin_y * front_margin
 			z2 = sz + cos_y * front_margin
 			
-			# Nezávislý scan na stromy a ploty před tankem
-			try:
-				if offset_x != 0:
-					raise StopIteration  # perf: look-ahead only on centre column
+			# Independent centre-lane scan for trees and fences.  A native
+			# destructible failure is a hard movement failure, never permission to
+			# pass through an object that is still visually intact.
+			if offset_x == 0:
 				seg_start = Math.Vector3(sx, pos.y + 0.5, sz)
 				seg_stop = Math.Vector3(x2, pos.y + 0.5, z2)
 				matInfo = BigWorld.wg_getMatInfoNearPoint(spaceID, seg_start, seg_stop, seg_stop, lambda *a: False)
 				if matInfo:
-					if _try_destroy_destructible(spaceID, matInfo, yaw, vel):
-						# Pokud jsme rozbili strom/plot, můžeme ignorovat pevnou kolizi, která na něj případně navazuje (nebo i když žádná není)
-						pass
-			except: pass
+					_try_destroy_destructible(
+						spaceID, matInfo, yaw, vel)
 			
 			# Spodní paprsek pro pevnou geometrii (0.6m nad zemí)
 			start_bot = Math.Vector3(x1, pos.y + 0.6, z1)
@@ -146,6 +146,8 @@ def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None, airborne=False,
 							# Low object (<1.1m): only the bottom ray caught it. Crush it if
 							# it's a destructible (fence / small prop) so the tank drives
 							# THROUGH, not over it. Non-destructibles (low rocks) stay drivable.
-							_try_destroy_solid_hit(spaceID, start_bot, col_bot[0], yaw, vel)
-	except: pass
+							_try_destroy_solid_hit(
+								spaceID, start_bot, col_bot[0], yaw, vel)
+	except Exception:
+		raise
 	return False

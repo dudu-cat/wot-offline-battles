@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Expose the 0.8.2 AreaDestructibles surface on pinned #1513.
 
-The copied authority module deliberately stays byte-for-byte identical to the
-0.8.2 implementation.  #1513 moved the encoders and damage-type constants to
+The authority module retains the 0.8.2 law with explicit #1513 ABI fixes.
+#1513 moved the encoders and damage-type constants to
 ``DestructiblesCache``; this adapter restores only those moved names.
 """
 
@@ -27,6 +27,7 @@ def install(area_module=None, cache_module=None):
         'chunkIDFromPosition': DestructiblesCache.chunkIDFromPosition,
         'encodeFallenTree': DestructiblesCache.encodeFallenTree,
         'encodeFallenColumn': DestructiblesCache.encodeFallenColumn,
+        'encodeFragile': DestructiblesCache.encodeFragile,
         'encodeDestructibleModule':
             DestructiblesCache.encodeDestructibleModule,
     }

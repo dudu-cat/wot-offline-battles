@@ -532,6 +532,11 @@ class WaitingRoomTest(unittest.TestCase):
 
         malformed = dict(report, item_index=-1)
         self.assertFalse(state.report_destructible(1, malformed))
+        malformed = dict(report)
+        del malformed["is_shot"]
+        self.assertFalse(state.report_destructible(1, malformed))
+        self.assertFalse(state.report_destructible(
+            1, dict(report, is_shot=1)))
         state._reset_round()
         self.assertEqual({}, state.destructibles)
         self.assertEqual(0, state.destructible_revision)
@@ -1289,6 +1294,15 @@ class WaitingRoomTest(unittest.TestCase):
         self.assertEqual(2, len([
             event for event in state.pending_events
             if event.get("kind") == "hit"]))
+        self.assertEqual({0}, {
+            event["attack_reason"] for event in state.pending_events
+            if event.get("kind") == "hit"})
+        self.assertEqual({0}, {
+            event["death_reason"] for event in state.pending_events
+            if event.get("kind") == "hit"})
+        self.assertEqual({"shot"}, {
+            event["source"] for event in state.pending_events
+            if event.get("kind") == "hit"})
 
     def test_he_splash_may_damage_its_firing_vehicle_once(self):
         state = BattleState(map_name="04_himmelsdorf", max_players=30)
@@ -1449,6 +1463,12 @@ class WaitingRoomTest(unittest.TestCase):
             "reported_reason": 5}))
         self.assertEqual("", state.players[2].death_attacker_kind)
         self.assertEqual(0, state.players[2].death_attacker_id)
+        health_event = next(
+            event for event in state.pending_events
+            if event.get("kind") == "health" and event.get("target") == 2)
+        self.assertEqual(5, health_event["attack_reason"])
+        self.assertEqual(5, health_event["death_reason"])
+        self.assertEqual("client_simulation", health_event["source"])
 
     def test_self_splash_death_does_not_award_a_frag(self):
         state = BattleState(map_name="04_himmelsdorf", max_players=30)
@@ -1528,7 +1548,9 @@ class WaitingRoomTest(unittest.TestCase):
         first.receive_type("roster")
         self.state.phase = "battle"
         self.state.tick = int(PREBATTLE_SECONDS * TICK_HZ)
-        first.send({"type": "input", "reported_health": 700})
+        first.send({
+            "type": "input", "reported_health": 700,
+            "reported_reason": 1})
         time.sleep(0.05)
         self.state.tick_once(0.05)
 
@@ -1536,6 +1558,9 @@ class WaitingRoomTest(unittest.TestCase):
         health = [event for event in event_message["events"] if event["kind"] == "health"][0]
         self.assertEqual(180, health["damage"])
         self.assertEqual(700, health["health"])
+        self.assertEqual(1, health["attack_reason"])
+        self.assertEqual(0, health["death_reason"])
+        self.assertEqual("client_simulation", health["source"])
 
     def test_local_critical_and_drowning_metadata_are_durable(self):
         first = self.connect("Alpha")

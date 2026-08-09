@@ -435,14 +435,13 @@ def _dispersed_barrel_angles(bot_id, round_id, fire_seq, yaw, pitch,
 def _overlay_live_target_pose(command, target):
     """Replace a low-rate team-spotted order with the current target pose.
 
-    ``fire_allowed`` is the server's team-spot plus per-bot firing-lane
-    decision.  The authority's local visibility probe is deliberately not a
-    second gate here: one ally may spot a target that another ally has the
-    clear barrel lane to shoot.  The actual lane is probed again immediately
-    before firing.
+    A visible-but-occluded contact still needs a current approach goal. The
+    authority's local visibility probe is deliberately not a second fire gate
+    here: one ally may spot a target that another ally has the clear barrel
+    lane to shoot. The actual lane is probed again immediately before firing.
     """
     result = dict(command)
-    if not result.get('fire_allowed'):
+    if result.get('target_id') is None:
         return result
     if target is None:
         result['fire_allowed'] = False
@@ -1482,9 +1481,22 @@ class BotRuntime(object):
         mode = strategic.get('combat_mode', 'route')
         route_index = int(_number(strategic.get('route_index'), 0))
         if mode in ('route', 'advance', 'hold'):
-            path_key = ('route', int(self.states[bot_id].get('team', 0)),
-                        strategic.get('route_id', 'direct'), route_index)
-            anchor = strategic.get('route_anchor') if route_index > 0 else None
+            anchor = (strategic.get('route_anchor')
+                      if bool(strategic.get('route_join')) else None)
+            if anchor is not None:
+                # A route's first shared path used to be cached from whichever
+                # spawn slot requested it first. Every following tank then
+                # converged onto that one hull's egress line. Keep the strategic
+                # destination shared, but join it from each real slot through a
+                # bot-scoped terrain path. Later route segments remain shared.
+                path_key = (
+                    'route_join', int(bot_id),
+                    int(self.states[bot_id].get('team', 0)),
+                    strategic.get('route_id', 'direct'), route_index)
+            else:
+                path_key = (
+                    'route', int(self.states[bot_id].get('team', 0)),
+                    strategic.get('route_id', 'direct'), route_index)
         else:
             path_key = ('local', int(bot_id), mode,
                         strategic.get('target_id'))

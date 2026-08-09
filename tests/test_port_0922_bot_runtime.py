@@ -1627,8 +1627,51 @@ class BotRuntimeTests(unittest.TestCase):
         order = self.adapters[0].server_orders[-1]
         self.assertEqual(self.module.HUMAN_TARGET_ID_BASE + 2,
                          order['target_id'])
+        self.assertEqual((5.0, 0.0, 5.0), order['aim_position'])
+        self.assertEqual((5.0, 0.0, 5.0), order['face_position'])
         self.assertEqual('human', self.runtime.states[11]['target_kind'])
         self.assertEqual(2, self.runtime.states[11]['target_id'])
+
+    def test_spawn_route_join_paths_are_scoped_to_each_bot(self):
+        calls = []
+
+        class Navigator(object):
+            def next_target(self, bot_id, position, goal, path_key, now,
+                            anchor, avoid):
+                calls.append((bot_id, path_key, anchor))
+                return goal
+
+        runtime = self.module.BotRuntime(1)
+        runtime.navigator = Navigator()
+        runtime.states = {
+            11: {'team': 2},
+            12: {'team': 2},
+        }
+        strategic = {
+            'combat_mode': 'route', 'route_id': 'forest', 'route_index': 1,
+            'route_join': True,
+        }
+        runtime._navigation_target(
+            11, (-12.0, 0.0, 0.0), (0.0, 0.0, 80.0),
+            dict(strategic, route_anchor=(-12.0, 0.0, 0.0)),
+            {'now': 1.0, 'neighbours': ()})
+        runtime._navigation_target(
+            12, (12.0, 0.0, 0.0), (0.0, 0.0, 80.0),
+            dict(strategic, route_anchor=(12.0, 0.0, 0.0)),
+            {'now': 1.0, 'neighbours': ()})
+
+        self.assertEqual(('route_join', 11, 2, 'forest', 1), calls[0][1])
+        self.assertEqual(('route_join', 12, 2, 'forest', 1), calls[1][1])
+        self.assertNotEqual(calls[0][1], calls[1][1])
+        self.assertNotEqual(calls[0][2], calls[1][2])
+
+        runtime._navigation_target(
+            11, (0.0, 0.0, 40.0), (0.0, 0.0, 80.0),
+            dict(strategic, route_join=False,
+                 route_anchor=(0.0, 0.0, 20.0)),
+            {'now': 2.0, 'neighbours': ()})
+        self.assertEqual(('route', 2, 'forest', 1), calls[2][1])
+        self.assertIsNone(calls[2][2])
 
     def test_json_route_anchor_is_normalized_before_terrain_navigation(self):
         runtime = self.module.BotRuntime(
@@ -1646,6 +1689,7 @@ class BotRuntimeTests(unittest.TestCase):
             'bot_orders': [{
                 'id': 11, 'team': 2,
                 'route_id': 'server_route', 'route_index': 1,
+                'route_join': True,
                 # Keep y first so the unfixed tuple(dict) path reproduces the
                 # exact legacy-client error: could not convert string to float: y.
                 'route_anchor': {'y': 0.0, 'x': 0.0, 'z': 0.0},
@@ -1740,7 +1784,8 @@ class BotRuntimeTests(unittest.TestCase):
         orders = dict((order['id'], order) for order in
                       planner.build_orders(
                           manifest, bot_states, [enemy], 1.0)['orders'])
-        self.assertIsNone(orders[11]['target_id'])
+        self.assertEqual(2, orders[11]['target_id'])
+        self.assertEqual('advance_contact', orders[11]['combat_mode'])
         self.assertFalse(orders[11]['fire_allowed'])
         self.assertEqual(2, orders[12]['target_id'])
         self.assertEqual('human', orders[12]['target_kind'])
@@ -1796,7 +1841,11 @@ class BotRuntimeTests(unittest.TestCase):
             [contact], planner.known_targets(bot_states, [enemy]), 1.0))
         orders = planner.build_orders(
             manifest, bot_states, [enemy], 1.0)['orders']
-        self.assertTrue(all(order['target_id'] is None for order in orders))
+        self.assertTrue(all(order['target_id'] == 2 for order in orders))
+        self.assertTrue(all(order['target_kind'] == 'human'
+                            for order in orders))
+        self.assertTrue(all(order['combat_mode'] == 'advance_contact'
+                            for order in orders))
         self.assertTrue(all(not order['fire_allowed'] for order in orders))
 
     def test_full_roster_observation_and_server_planner_stay_live_for_two_minutes(self):
@@ -1859,6 +1908,7 @@ class BotRuntimeTests(unittest.TestCase):
                 ((contact['target_kind'], contact['target_id']), contact)
                 for contact in contacts)
             targeted = 0
+            firing = 0
             for order in orders:
                 if order['target_id'] is None:
                     self.assertFalse(order['fire_allowed'])
@@ -1866,10 +1916,17 @@ class BotRuntimeTests(unittest.TestCase):
                 targeted += 1
                 contact = contact_by_target[
                     (order['target_kind'], order['target_id'])]
-                self.assertIn(order['id'],
-                              contact['shootable_by_bot_ids'])
-                self.assertTrue(order['fire_allowed'])
-            self.assertEqual(2, targeted)
+                if order['fire_allowed']:
+                    firing += 1
+                    self.assertIn(order['id'],
+                                  contact['shootable_by_bot_ids'])
+                else:
+                    self.assertNotIn(order['id'],
+                                     contact['shootable_by_bot_ids'])
+                    self.assertEqual(
+                        'advance_contact', order['combat_mode'])
+            self.assertEqual(29, targeted)
+            self.assertEqual(2, firing)
 
         self.assertTrue(observation_times)
         self.assertLessEqual(observation_times[0], 1.04)

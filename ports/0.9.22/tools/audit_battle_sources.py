@@ -37,9 +37,10 @@ PORT_FILES = {
     'critical_damage.py': '082_generated_closure_adapter',
     'compat.py': '1513_lifecycle_adapter',
     'config.py': '082_config_adapter',
-    'destructibles_authority.py': 'exact_082',
+    'destructibles_authority.py':
+        '082_law_plus_1513_transaction_and_fragile_abi_adapter',
     'destructibles_compat.py': '1513_destructibles_api_adapter',
-    'destructibles_sensor.py': '082_closure_adapter',
+    'destructibles_sensor.py': '082_contact_law_plus_strict_1513_adapter',
     'device_damage.py': '082_law_plus_1513_descriptor_adapter',
     'entities/__init__.py': 'package_adapter',
     'entities/avatar_server.py': '1513_avatar_api',
@@ -65,7 +66,7 @@ PORT_FILES = {
     'tank_collision.py': '082_current_collision_and_spatial_index_port',
     'user_config.py': '1513_path_adapter',
     'vehicle_physics.py': '082_latest_calibrated_law_port',
-    'world_collision.py': '082_closure_adapter',
+    'world_collision.py': '082_law_plus_strict_destructible_adapter',
 }
 
 # The #1513 battle also depends on two Python 3 service modules outside the
@@ -90,16 +91,18 @@ PINNED_PORT_SHA256 = {
     'ai/maps.py': 'c55424c653e92f238284de4851583d346e2666fffa4a9edbd3a59a693595bdfe',
     'ai/maps_group_a.py': '35a7d8b34c1c78f889bbe30d54d7898fd581259769d1aa13112eda3f32afcc7f',
     'ai/maps_group_b.py': '152aae3d25921998b9436c3fbe2210d6f640c92220cf1729504fd59ce7b952d1',
-    'ai/navigation.py': '2a0bac86694100d94ae3e383e9ce2cc4cc1fa3f1c05b52d78fa3b9dc009565b9',
+    'ai/navigation.py': '2a14c8d344d499527678ba66b2e1136710ad537ac7b557a22902def4318a3f1e',
     'ai/planner.py': 'ef049470e70e6437eb9646ca3edab05dc4517b081b6630ee5707ac3eac4d0cb1',
-    'bot_runtime.py': '073e4248018c459ce74ae6cd3ee7aec9666783bf7aaadb4c6dd8f5de39d3c945',
+    'bot_runtime.py': '669271ee375394ab4160dec33ce24379dfad95c57eb50701412cfb7ecf82185c',
     'entities/remote_vehicle.py': '868e16c8016bfd753fa9c705c046cca827c9765c69ea35b5e5a77d11d4bf12ae',
     'tank_collision.py': '2f0b9b8987b4401d430e84512e5fdbf84351b4245e2589907d597a8508197b2d',
     'vehicle_physics.py': '9beab9b11f8c349d55979c7a753f33b48262b1add28f63f3d754a8495c20e676',
-    'world_collision.py': '6def0448c6c79b324b822ae79b397775815c5e4d66709963a5ff52fb38608de1',
+    'destructibles_authority.py': 'e9a98d3bd3f30186407142a13cf8f1b035ac9f0c21ff02f46c76b9233b9943ea',
+    'destructibles_sensor.py': 'e8693423ead03c98f799a52a322556ece32413bc7df7fa52bb7a10027a8655eb',
+    'world_collision.py': 'd213de8f3110c9ad3ddaa5ea515b797ee98d9eed8005a01c2f8f7b103b36e1ab',
 }
 PINNED_SERVER_SHA256 = {
-    'server_bot_ai.py': '09cba11c3a7164a43d7785c8ce4b0b721070a246ea68bdf66930994c125264cc',
+    'server_bot_ai.py': '7b5724987c50497a9f0aa878e8cc103b14c0e9e1fdf3c489a78562ec114e625a',
 }
 
 # Every Python file in the working 0.8.2 offhangar tree is classified here.
@@ -151,7 +154,6 @@ remove_shift.py test_matrix.py
 
 EXACT_COPIES = {
     'ai/cover.py': 'bot_ai_cover.py',
-    'destructibles_authority.py': 'destructibles_authority.py',
     'internal_geometry.py': 'internal_geometry.py',
     'internal_layout_profiles.py': 'internal_layout_profiles.py',
 }
@@ -813,6 +815,7 @@ def audit(repo_root):
         package, 'destructibles_compat.py'))
     for required in ('DestructiblesCache.encodeFallenTree',
                      'DestructiblesCache.encodeFallenColumn',
+                     'DestructiblesCache.encodeFragile',
                      'DestructiblesCache.encodeDestructibleModule',
                      'DestructiblesCache.chunkIDFromPosition',
                      'DESTR_TYPE_FALLING_ATOM', 'DESTR_TYPE_STRUCTURE'):
@@ -825,71 +828,45 @@ def audit(repo_root):
                       'destructibles API adapter')
     destructibles_sensor = _text(os.path.join(
         package, 'destructibles_sensor.py'))
-    copied_fell = _function_at_any_indent(
-        destructibles_sensor, '_fell_trees_near')
-    if copied_fell is not None:
-        copied_fell = copied_fell.replace(
-            '\n\timport BigWorld\n\timport Math', '')
-    copied_try = _function_at_any_indent(
-        destructibles_sensor, '_try_destroy_destructible')
-    if copied_try is not None:
-        copied_try = copied_try.replace(
-            'def _try_destroy_destructible(spaceID, matInfo, yaw, vel,\n'
-            '\t\tisShotDamage=False):',
-            'def _try_destroy_destructible(spaceID, matInfo, yaw, vel):')
-        copied_try = copied_try.replace(
-            '\t\t\t_destr_ok = _auth.destroy_module(\n'
-            '\t\t\t\tspaceID, chunkID, itemIndex, matKind, hitPt, '
-            'isShotDamage)',
-            '\t\t\t_destr_ok = _auth.destroy_module(spaceID, chunkID, '
-            'itemIndex, matKind, hitPt, False)')
-        report_block = (
-            '\n\t\t\t_publish_destroyed(\n'
-            "\t\t\t\t('tree' if typ == AreaDestructibles.DESTR_TYPE_TREE "
-            'else\n'
-            "\t\t\t\t 'column' if typ == "
-            'AreaDestructibles.DESTR_TYPE_FALLING_ATOM else\n'
-            "\t\t\t\t 'fragile' if typ == "
-            'AreaDestructibles.DESTR_TYPE_FRAGILE else\n'
-            "\t\t\t\t 'module'),\n"
-            '\t\t\t\tchunkID, itemIndex, hitPt, yaw, vel,\n'
-            '\t\t\t\tmatKind if typ == '
-            'AreaDestructibles.DESTR_TYPE_STRUCTURE else None,\n'
-            '\t\t\t\tisShotDamage)')
-        copied_try = copied_try.replace(report_block, '')
-    if copied_try != _function_at_any_indent(
-            original_battle, '_try_destroy_destructible'):
-        errors.append('destructibles_sensor.py changed copied 0.8.2 '
-                      'function outside the LAN report seam: '
-                      '_try_destroy_destructible')
-    if _function_at_any_indent(
-            destructibles_sensor, '_try_destroy_solid_hit') != \
-            _function_at_any_indent(
-                original_battle, '_try_destroy_solid_hit'):
+    destructibles_authority = _text(os.path.join(
+        package, 'destructibles_authority.py'))
+    for required in ('AreaDestructibles.encodeFragile(',
+                     'bool(syncWithProjectile)',
+                     'destructible controller rollback is unsafe',
+                     "c[prop].append(destrData)",
+                     "c['keys'].add(dedupKey)"):
+        if required not in destructibles_authority:
+            errors.append(
+                'destructibles_authority.py omits strict #1513 boundary: %s' %
+                required)
+    if ('Fragiles take the RAW item index' in destructibles_authority or
+            destructibles_authority.find("c['keys'].add(dedupKey)") <
+            destructibles_authority.find(
+                'orderDestructibleDestroy(')):
         errors.append(
-            'destructibles_sensor.py changed copied 0.8.2 function: '
-            '_try_destroy_solid_hit')
-    fell_report_block = (
-        '\n\t\t\t\t\t_publish_destroyed(\n'
-        "\t\t\t\t\t\t('fragile' if _ttyp == "
-        'AreaDestructibles.DESTR_TYPE_FRAGILE\n'
-        "\t\t\t\t\t\t else 'tree' if _ttyp == "
-        'AreaDestructibles.DESTR_TYPE_TREE\n'
-        "\t\t\t\t\t\t else 'column'),\n"
-        '\t\t\t\t\t\tcid, _ti, pos, fall_yaw, vel)')
-    if copied_fell is not None:
-        copied_fell = copied_fell.replace(fell_report_block, '')
-    if copied_fell != _function_at_any_indent(
-            original_battle, '_fell_trees_near'):
-        errors.append('destructibles_sensor.py changed copied 0.8.2 '
-                      'function outside the LAN report seam: '
-                      '_fell_trees_near')
+            'destructibles_authority.py commits before native #1513 destroy')
+    copied_fell = _function_at_any_indent(
+        destructibles_sensor, '_fell_trees_near') or ''
+    copied_try = _function_at_any_indent(
+        destructibles_sensor, '_try_destroy_destructible') or ''
+    copied_solid = _function_at_any_indent(
+        destructibles_sensor, '_try_destroy_solid_hit') or ''
     for required in ('def set_event_sink', 'def _publish_destroyed',
-                     "'destructible_kind'", 'shot_yaw, 12.0, True'):
+                     "'destructible_kind'", 'shot_yaw, 12.0, True',
+                     'if not _destr_ok:', 'if not _ok:',
+                     '_object_pos = Math.Vector3(_tx, _ty, _tz)',
+                     'native destructible destroy was not accepted'):
         if required not in destructibles_sensor:
             errors.append(
-                'destructibles_sensor.py omits LAN destruction seam: %s' %
+                'destructibles_sensor.py omits strict #1513 seam: %s' %
                 required)
+    if ('LOG_DEBUG(\'Destr Exception:' in copied_try or
+            'except Exception as e:' in copied_try or
+            'except Exception:\n\t\tpass' in copied_solid or
+            copied_fell.rfind("_st['felled'].add(_key)") <
+            copied_fell.rfind('_publish_destroyed(')):
+        errors.append(
+            'destructibles_sensor.py retains a silent or premature success')
     world_collision = _text(os.path.join(package, 'world_collision.py'))
     for required in (
             'def _check_horizontal_collision',

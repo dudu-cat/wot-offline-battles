@@ -929,6 +929,7 @@ class BattleRuntime(object):
                 'period': 'battle',
             }
             vehicle_id = self._server.addVehicleToArena(snapshot)
+            self._synchronise_player_identity(vehicle_id)
             self._invalidate_native_arena_info()
             local_key = 'player:%s' % self.client.player_id
             self._records[local_key] = {
@@ -949,6 +950,52 @@ class BattleRuntime(object):
         if not callable(invalidate):
             raise RuntimeError('native arena-load controller is unavailable')
         invalidate()
+
+    def _synchronise_player_identity(self, expected_vehicle_id):
+        """Refresh ArenaDP before marker plugins cache the local vehicle id."""
+        expected_vehicle_id = int(expected_vehicle_id)
+        provider = getattr(self._avatar, 'guiSessionProvider', None)
+        get_arena_dp = getattr(provider, 'getArenaDP', None)
+        if not callable(get_arena_dp):
+            raise RuntimeError('#1513 ArenaDP provider is unavailable')
+        arena_dp = get_arena_dp()
+        required = getattr(arena_dp, 'isRequiredDataExists', None)
+        get_player_vehicle_id = getattr(
+            arena_dp, 'getPlayerVehicleID', None)
+        if not callable(required) or not callable(get_player_vehicle_id):
+            raise RuntimeError('#1513 ArenaDP player identity API is unavailable')
+        refreshed_vehicle_id = int(get_player_vehicle_id(True))
+        if refreshed_vehicle_id != expected_vehicle_id:
+            raise RuntimeError(
+                '#1513 ArenaDP player identity refresh mismatch: '
+                'expected=%s arenaDP=%s' % (
+                    expected_vehicle_id, refreshed_vehicle_id))
+        if not required():
+            raise RuntimeError('#1513 ArenaDP player identity is incomplete')
+        return self._assert_player_identity(expected_vehicle_id)
+
+    def _assert_player_identity(self, expected_vehicle_id):
+        """Reject any drift that would relabel player damage as ally damage."""
+        expected_vehicle_id = int(expected_vehicle_id)
+        avatar_vehicle_id = int(getattr(self._avatar, 'playerVehicleID', 0))
+        provider = getattr(self._avatar, 'guiSessionProvider', None)
+        get_arena_dp = getattr(provider, 'getArenaDP', None)
+        if not callable(get_arena_dp):
+            raise RuntimeError('#1513 ArenaDP provider is unavailable')
+        arena_dp = get_arena_dp()
+        get_player_vehicle_id = getattr(
+            arena_dp, 'getPlayerVehicleID', None)
+        if not callable(get_player_vehicle_id):
+            raise RuntimeError('#1513 ArenaDP player identity API is unavailable')
+        arena_vehicle_id = int(get_player_vehicle_id(False))
+        if (avatar_vehicle_id != expected_vehicle_id or
+                arena_vehicle_id != expected_vehicle_id):
+            raise RuntimeError(
+                '#1513 player identity mismatch: expected=%s avatar=%s '
+                'arenaDP=%s' % (
+                    expected_vehicle_id, avatar_vehicle_id,
+                    arena_vehicle_id))
+        return True
 
     def _wait_for_client_ready(self):
         if self.state != 'loading_entities':
@@ -1017,6 +1064,7 @@ class BattleRuntime(object):
                 direction_probe=self._direction_probe,
                 vehicle_selector=self._select_bot_vehicle,
                 visibility_probe=self._bot_visibility,
+                firing_lane_probe=self._bot_firing_lane,
                 spawn_resolver=self._formation_pose,
                 ground_probe=self._navigation_ground,
                 physics_ground_probe=self._ground_y,
@@ -2442,6 +2490,8 @@ class BattleRuntime(object):
     def _combat_event_state(self, event, state, target_key):
         if 'health' not in event:
             raise RuntimeError('ordered combat event has no health')
+        if 'death_reason' not in event:
+            raise RuntimeError('ordered combat event has no death_reason')
         state = dict(state or {})
         health = max(0, int(event.get('health', 0)))
         state['health'] = health
@@ -2450,10 +2500,15 @@ class BattleRuntime(object):
             state['display_health'] = max(
                 0, int(event.get('display_health', health)))
         try:
-            state['death_reason'] = max(
-                0, int(event.get('death_reason', 0)))
+            death_reason = int(event['death_reason'])
         except (TypeError, ValueError):
-            state['death_reason'] = 0
+            raise RuntimeError('ordered combat event has invalid death_reason')
+        if death_reason < 0:
+            raise RuntimeError('ordered combat event has invalid death_reason')
+        if state['alive'] and death_reason != 0:
+            raise RuntimeError(
+                'nonfatal combat event has nonzero death_reason')
+        state['death_reason'] = death_reason
         attacker_key = self._event_entity_key(event, 'attacker')
         if attacker_key is not None:
             attacker_kind, attacker_id = attacker_key.split(':', 1)
@@ -2488,6 +2543,7 @@ class BattleRuntime(object):
         if kind in _SHOT_EVENT_KINDS:
             self._merge_shot_event_state(event)
         elif kind in _COMBAT_EVENT_KINDS:
+            self._validate_combat_event_contract(event)
             self._merge_combat_event_state(event)
         elif kind not in (
                 'authority', 'bot_manifest', 'vehicle_statistics',
@@ -2639,6 +2695,10 @@ class BattleRuntime(object):
         if kind == 'module' and mat_kind is None:
             raise RuntimeError(
                 'canonical destructible module has no material')
+        is_shot = event.get('is_shot')
+        if not isinstance(is_shot, bool):
+            raise RuntimeError(
+                'canonical destructible shot flag is invalid')
         if destructibles_authority.is_destroyed(
                 chunk_id, item_index, mat_kind):
             return False
@@ -2652,11 +2712,10 @@ class BattleRuntime(object):
                 space_id, chunk_id, item_index, fall_yaw, speed, position)
         elif kind == 'fragile':
             applied = destructibles_authority.destroy_fragile(
-                space_id, chunk_id, item_index, position)
+                space_id, chunk_id, item_index, position, is_shot)
         else:
             applied = destructibles_authority.destroy_module(
-                space_id, chunk_id, item_index, mat_kind, position,
-                bool(event.get('is_shot', False)))
+                space_id, chunk_id, item_index, mat_kind, position, is_shot)
         if (not applied and not destructibles_authority.is_destroyed(
                 chunk_id, item_index, mat_kind)):
             raise RuntimeError(
@@ -2710,7 +2769,7 @@ class BattleRuntime(object):
     def _present_combat_hit(self, event, target_record, attacker_record,
                             attacker_id):
         """Port the mature 0.8.2 hit feedback through exact #1513 APIs."""
-        if (event.get('source') == 'ram' or
+        if (self._combat_event_source(event) != 'shot' or
                 event.get('kind') not in (
                     'hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit')):
             return False
@@ -2764,8 +2823,94 @@ class BattleRuntime(object):
             showFlashBang=bool(target_record.get('local')))
         return True
 
+    @staticmethod
+    def _combat_record_team(record):
+        state = record.get('state') or {}
+        if 'team' not in state:
+            raise RuntimeError('combat feedback record has no team')
+        try:
+            team = int(state['team'])
+        except (TypeError, ValueError):
+            raise RuntimeError('combat feedback record has invalid team')
+        if team <= 0:
+            raise RuntimeError('combat feedback record has invalid team')
+        return team
+
+    @staticmethod
+    def _combat_event_source(event):
+        if 'source' not in event:
+            raise RuntimeError('ordered combat event has no source')
+        source = event['source']
+        if source not in (
+                'shot', 'fire', 'ram', 'client_simulation',
+                'player_left'):
+            raise RuntimeError(
+                'ordered combat event has invalid source: %s' % source)
+        return source
+
+    def _combat_attack_reason(self, event):
+        source = self._combat_event_source(event)
+        if source == 'player_left':
+            if ('attack_reason' not in event or
+                    event['attack_reason'] is not None):
+                raise RuntimeError(
+                    'player_left event must have null attack_reason')
+            if ('death_reason' not in event or
+                    event['death_reason'] != 0):
+                raise RuntimeError(
+                    'player_left event must have zero death_reason')
+            if ('attacker' in event or 'attacker_bot' in event):
+                raise RuntimeError(
+                    'player_left event must not have an attacker')
+            return None
+        if 'attack_reason' not in event:
+            raise RuntimeError('ordered combat event has no attack_reason')
+        try:
+            reason_id = int(event['attack_reason'])
+        except (TypeError, ValueError):
+            raise RuntimeError('ordered combat event has invalid attack_reason')
+        if reason_id < 0:
+            raise RuntimeError('ordered combat event has invalid attack_reason')
+        expected = {
+            'shot': self._attack_reason('SHOT', 0),
+            'fire': self._attack_reason('FIRE', 1),
+            'ram': self._attack_reason('RAM', 2),
+        }
+        if source == 'client_simulation':
+            return reason_id
+        if reason_id != expected[source]:
+            raise RuntimeError(
+                'ordered combat event attack_reason does not match source: '
+                '%s != %s' % (reason_id, expected[source]))
+        return reason_id
+
+    def _validate_combat_event_contract(self, event):
+        source = self._combat_event_source(event)
+        attack_reason = self._combat_attack_reason(event)
+        kind = event.get('kind')
+        valid_kinds = {
+            'shot': ('hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit'),
+            'fire': ('bot_hit', 'bot_human_hit', 'bot_bot_hit'),
+            'ram': ('bot_hit', 'bot_human_hit', 'bot_bot_hit'),
+            'client_simulation': ('health',),
+            'player_left': ('health',),
+        }
+        if kind not in valid_kinds[source]:
+            raise RuntimeError(
+                'ordered combat event source %s does not allow kind %s' %
+                (source, kind))
+        attacker_key = self._event_entity_key(event, 'attacker')
+        if source in ('shot', 'fire', 'ram') and attacker_key is None:
+            raise RuntimeError(
+                'ordered %s combat event has no attacker' % source)
+        if source in ('client_simulation', 'player_left') and \
+                attacker_key is not None:
+            raise RuntimeError(
+                'ordered %s combat event must not have an attacker' % source)
+        return source, attack_reason
+
     def _present_combat_feedback(self, event, target_record,
-                                 attacker_record):
+                                 attacker_record, reason_id=None):
         """Feed accepted server combat through stock #1513 feedback RPCs."""
         feedback_common = getattr(
             self._runtime, 'battle_feedback_common', None)
@@ -2773,11 +2918,17 @@ class BattleRuntime(object):
         if event_types is None:
             raise RuntimeError('#1513 battle feedback constants are unavailable')
         damage = max(0, int(event.get('damage', 0) or 0))
-        reason_id = max(0, int(event.get('death_reason', 0) or 0))
+        if reason_id is None:
+            reason_id = self._combat_attack_reason(event)
         critical = event.get('critical')
         critical_count = len((critical or {}).get('events') or ())
-        output = []
         if attacker_record.get('local'):
+            self._assert_player_identity(attacker_record['engine_id'])
+        target_team = self._combat_record_team(target_record)
+        attacker_team = self._combat_record_team(attacker_record)
+        enemy = target_team != attacker_team
+        output = []
+        if attacker_record.get('local') and enemy:
             target_id = int(target_record['engine_id'])
             if damage > 0:
                 output.append({
@@ -2795,8 +2946,12 @@ class BattleRuntime(object):
                 output.append({
                     'eventType': int(event_types.KILL),
                     'targetID': target_id, 'count': 1, 'details': 0})
-            if event.get('kind') in (
-                    'hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit'):
+        if attacker_record.get('local'):
+            target_id = int(target_record['engine_id'])
+            if (self._combat_event_source(event) == 'shot' and
+                    event.get('kind') in (
+                        'hit', 'bot_hit', 'bot_human_hit',
+                        'bot_bot_hit')):
                 flags_type = getattr(
                     self._runtime.constants, 'VEHICLE_HIT_FLAGS', None)
                 if flags_type is None:
@@ -2820,7 +2975,7 @@ class BattleRuntime(object):
                     raise RuntimeError(
                         '#1513 shot-result feedback boundary is unavailable')
                 callback([(flags << 32) | target_id])
-        if target_record.get('local'):
+        if target_record.get('local') and enemy:
             attacker_id = int(attacker_record['engine_id'])
             if damage > 0:
                 output.append({
@@ -2843,6 +2998,7 @@ class BattleRuntime(object):
         return bool(output)
 
     def _apply_combat_event(self, event, update_state=True):
+        source, attack_reason = self._validate_combat_event_contract(event)
         target_key = self._event_entity_key(event, 'target')
         if target_key is None:
             raise RuntimeError('ordered combat event has no target')
@@ -2883,15 +3039,13 @@ class BattleRuntime(object):
             entity.last_killer_id = int(attacker_id or 0)
         if record.get('local') and attacker is not None:
             self._local_last_attacker = (attacker_kind, int(attacker))
+        if source == 'player_left' and attacker_record is not None:
+            raise RuntimeError('player_left event has an attacker')
         if attacker_record is not None:
             self._present_combat_hit(
                 event, record, attacker_record, attacker_id)
             self._present_combat_feedback(
-                event, record, attacker_record)
-        try:
-            reason_id = max(0, int(event.get('death_reason', 0)))
-        except (TypeError, ValueError):
-            reason_id = 0
+                event, record, attacker_record, attack_reason)
         critical = event.get('critical')
         if isinstance(critical, dict):
             canonical = self._critical_state(critical)
@@ -2905,9 +3059,10 @@ class BattleRuntime(object):
         if 'display_health' in event:
             state['display_health'] = max(
                 0, int(event.get('display_health', state['health'])))
-        state['death_reason'] = reason_id
+        death_reason = int(event['death_reason'])
         self._apply_health(
-            record, state, attacker_id, reason_id, force_cause=True)
+            record, state, attacker_id, death_reason, force_cause=True,
+            attack_reason_id=(0 if attack_reason is None else attack_reason))
         if not update_state:
             record['state'] = latest_state
         return True
@@ -4067,6 +4222,10 @@ class BattleRuntime(object):
             handbrake)
 
         if abs(self._local_speed) > 0.0001 and dt > 0.0:
+            if self._destructibles is not None:
+                self._destructibles._fell_trees_near(
+                    self._avatar.spaceID, self._vector(position), yaw,
+                    self._local_speed, entity.typeDescriptor)
             if self._motion_is_clear(
                     entity, position, yaw, self._local_speed, dt):
                 position = (
@@ -4147,6 +4306,15 @@ class BattleRuntime(object):
             position = self._vector((
                 x, y, z))
             yaw = _number(state.get('yaw'))
+            if self._destructibles is not None:
+                entity = self._server_entity(record['engine_id'])
+                descriptor = getattr(entity, 'typeDescriptor', None)
+                if descriptor is None:
+                    raise RuntimeError(
+                        'authority bot destructible descriptor is unavailable')
+                self._destructibles._fell_trees_near(
+                    self._avatar.spaceID, position, yaw,
+                    _number(state.get('speed')), descriptor)
             self._binding.set_vehicle_pose(
                 record['engine_id'], position, _engine_rotation(yaw))
             self._binding.update_vehicle_aim(
@@ -4168,6 +4336,33 @@ class BattleRuntime(object):
         if hit is None:
             return True
         return (hit[0] - start).length + 1.5 >= (end - start).length
+
+    def _bot_firing_lane(self, source, target):
+        """Probe static space between, rather than inside, two vehicle hulls."""
+        source_position = _xyz(source)
+        target_position = target.get('position') or _xyz(target)
+        dx = target_position[0] - source_position[0]
+        dz = target_position[2] - source_position[2]
+        distance = math.sqrt(dx * dx + dz * dz)
+        # Keep a short but real world segment between close hulls. Treating the
+        # absence of the default eight-metre middle section as clear let tanks
+        # on opposite sides of a thin wall enter engage/hold and fire forever.
+        clearance = min(4.0, max(0.0, (distance - 0.75) * 0.5))
+        for target_height in (1.5, 2.2):
+            segment = bot_planner.trimmed_sight_segment(
+                source_position, target_position, 2.5, target_height,
+                clearance, clearance)
+            if segment is None:
+                return False
+            if not segment:
+                return False
+            start, end = segment
+            hit = self._runtime.bigworld.wg_collideSegment(
+                self._avatar.spaceID,
+                self._vector(start), self._vector(end), 128)
+            if hit is None:
+                return True
+        return False
 
     def _send_bot_message(self, message):
         kind = message.get('type')
@@ -4778,18 +4973,26 @@ class BattleRuntime(object):
         record['visual_started'] = False
         return True
 
-    def _apply_health(self, record, state, attacker_id=0, reason_id=0,
-                      force_cause=False):
+    def _apply_health(self, record, state, attacker_id=0, reason_id=None,
+                      force_cause=False, attack_reason_id=None):
         if 'health' not in state:
             return
         health = max(0, int(state.get('health', 0)))
-        if not reason_id:
+        if reason_id is None:
             reason_id = max(0, int(state.get('death_reason', 0) or 0))
+        else:
+            reason_id = max(0, int(reason_id))
+        if attack_reason_id is None:
+            attack_reason_id = reason_id
+        else:
+            attack_reason_id = max(0, int(attack_reason_id))
         engine_id = record['engine_id']
         display_health = max(
             0, int(state.get('display_health', health) or 0))
         crew_active = bool(state.get('alive', health > 0)) and health > 0
-        signature = (health, display_health, crew_active, int(reason_id))
+        signature = (
+            health, display_health, crew_active, int(reason_id),
+            int(attack_reason_id))
         previous_signature = self._last_health.get(engine_id)
         durable_changed = previous_signature != signature
         if not durable_changed and not force_cause:
@@ -4834,7 +5037,8 @@ class BattleRuntime(object):
         entity.health = native_health
         health_changed = getattr(entity, 'onHealthChanged', None)
         if callable(health_changed):
-            health_changed(native_health, int(attacker_id), int(reason_id))
+            health_changed(
+                native_health, int(attacker_id), int(attack_reason_id))
         else:
             notifier = getattr(entity, 'set_health', None)
             if callable(notifier):
@@ -4847,7 +5051,7 @@ class BattleRuntime(object):
                     '#1513 remote vehicle health presenter is unavailable')
             present_health(
                 False, engine_id, native_health,
-                int(attacker_id), int(reason_id))
+                int(attacker_id), int(attack_reason_id))
         previous_crew_active = getattr(entity, 'isCrewActive', crew_active)
         entity.isCrewActive = crew_active
         if previous_crew_active != crew_active:

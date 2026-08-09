@@ -37,6 +37,7 @@ TARGET_SWITCH_MARGIN = 3.0
 CLOSE_THREAT_DISTANCE = 50.0
 CLOSE_THREAT_SCORE_BONUS = 100.0
 CLOSE_THREAT_FOCUS_LIMIT = 4
+SHOOTABLE_TARGET_SCORE_BONUS = 200.0
 ROUTE_REBALANCE_SECONDS = 4.0
 ROUTE_LEASE_SECONDS = 6.0
 
@@ -449,12 +450,12 @@ class BotPlanner(object):
         return distance
 
     def _assign_targets(self, bots, contacts, now):
-        """Assign only locally shootable contacts, with a hard focus cap.
+        """Assign visible contacts while keeping a hard focus cap.
 
-        Team spotting is shared intelligence, not proof that every tank has a
-        firing lane.  The authority client reports the bot ids whose own LOS
-        probe succeeded.  This release rejects contacts without that evidence;
-        mixed authority-client builds are not supported.
+        Team spotting is enough to make a tank react and seek a firing lane. It
+        is not enough to fire: ``shootable_by_bot_ids`` remains the per-bot
+        barrel-lane authority used by :meth:`_order_for` and is checked again by
+        the authority client immediately before a shot.
         """
         if not bots or not contacts:
             return {}
@@ -466,10 +467,7 @@ class BotPlanner(object):
             bx = _number(bot["state"].get("x"))
             bz = _number(bot["state"].get("z"))
             for contact in contacts:
-                observers = contact.get("shootable_by_bot_ids")
-                locally_shootable = (contact.get("visible") and
-                                     bot["id"] in (observers or ()))
-                if not locally_shootable:
+                if not contact.get("visible"):
                     continue
                 distance = math.hypot(
                     contact["position"]["x"] - bx,
@@ -484,8 +482,15 @@ class BotPlanner(object):
                     # even while a previous long-range target still owns a
                     # short lease.
                     score -= CLOSE_THREAT_SCORE_BONUS
-                candidate = (
-                    score, bot["id"], contact["id"], bot, contact, distance)
+                if bot["id"] in contact.get("shootable_by_bot_ids", ()):
+                    # When the focus cap is smaller than the team, reserve the
+                    # slot for a tank that can actually shoot. Other visible
+                    # tanks may still pursue the contact when capacity remains.
+                    score -= SHOOTABLE_TARGET_SCORE_BONUS
+                sort_key = (
+                    score, bot["id"], str(contact.get("target_kind") or ""),
+                    contact["id"], distance)
+                candidate = (sort_key, bot, contact, distance)
                 candidates.append(candidate)
                 by_bot.setdefault(bot["id"], []).append(candidate)
 
@@ -493,7 +498,8 @@ class BotPlanner(object):
         # sub-metre motion between two similar enemies flips the order every
         # server tick and repeatedly cancels the client's private A* search.
         for bot in bots:
-            bot_candidates = sorted(by_bot.get(bot["id"], ()))
+            bot_candidates = sorted(
+                by_bot.get(bot["id"], ()), key=lambda value: value[0])
             if not bot_candidates:
                 self._target_assignments.pop(bot["id"], None)
                 continue
@@ -502,7 +508,7 @@ class BotPlanner(object):
                 continue
             previous_candidate = None
             for candidate in bot_candidates:
-                contact = candidate[4]
+                contact = candidate[2]
                 key = (contact.get("target_kind"), contact["id"])
                 if key == previous.get("target"):
                     previous_candidate = candidate
@@ -510,32 +516,33 @@ class BotPlanner(object):
             if previous_candidate is None:
                 self._target_assignments.pop(bot["id"], None)
                 continue
-            best_score = bot_candidates[0][0]
+            best_score = bot_candidates[0][0][0]
             lease_expired = _number(now) >= _number(previous.get("until"))
             best_candidate = bot_candidates[0]
-            best_key = (best_candidate[4].get("target_kind"),
-                        best_candidate[4]["id"])
+            best_key = (best_candidate[2].get("target_kind"),
+                        best_candidate[2]["id"])
             close_override = (
                 best_key != previous.get("target") and
-                best_candidate[5] <= CLOSE_THREAT_DISTANCE and
-                previous_candidate[5] > CLOSE_THREAT_DISTANCE
+                best_candidate[3] <= CLOSE_THREAT_DISTANCE and
+                previous_candidate[3] > CLOSE_THREAT_DISTANCE
             )
             if close_override:
                 continue
             if (lease_expired and
-                    previous_candidate[0] > best_score + TARGET_SWITCH_MARGIN):
+                    previous_candidate[0][0] >
+                    best_score + TARGET_SWITCH_MARGIN):
                 continue
-            contact = previous_candidate[4]
+            contact = previous_candidate[2]
             key = (contact.get("target_kind"), contact["id"])
             if reservations.get(key, 0) >= self._focus_limit(
-                    contact, previous_candidate[5]):
+                    contact, previous_candidate[3]):
                 continue
             reservations[key] = reservations.get(key, 0) + 1
             assigned[bot["id"]] = contact
             if lease_expired:
                 previous["until"] = _number(now) + TARGET_LEASE_SECONDS
-        for (unused_score, unused_bot_id, unused_target_id, bot, contact,
-             distance) in sorted(candidates):
+        for (unused_sort_key, bot, contact, distance) in sorted(
+                candidates, key=lambda value: value[0]):
             if bot["id"] in assigned:
                 continue
             key = (contact.get("target_kind"), contact["id"])
@@ -681,7 +688,7 @@ class BotPlanner(object):
             direction = 1.0 if bot["team"] == 1 else -1.0
             point = {"x": round(side * 115.0, 3), "y": 0.0,
                      "z": round(direction * 18.0, 3)}
-            return route_id, 0, point, point
+            return route_id, 0, point, point, False
         route_id = str(route.get("id") or "uploaded_route")
         state = self._route_states.get(bot["id"])
         if state is None or state.get("route_id") != route_id:
@@ -729,11 +736,13 @@ class BotPlanner(object):
             index += 1
             state["index"] = index
             point = _point(waypoints[index])
-        if state.get("join_index") == index and isinstance(state.get("join_anchor"), dict):
+        route_join = (state.get("join_index") == index and
+                      isinstance(state.get("join_anchor"), dict))
+        if route_join:
             anchor = _point(state["join_anchor"])
         else:
             anchor = _point(waypoints[max(0, index - 1)])
-        return route_id, index, point, anchor
+        return route_id, index, point, anchor, route_join
 
     @staticmethod
     def _flank_point(bot, contact, desired_range):
@@ -887,7 +896,7 @@ class BotPlanner(object):
         return True
 
     def _order_for(self, bot, index, count, focus, contacts, now):
-        route_id, route_index, move, route_anchor = self._route(bot, now)
+        route_id, route_index, move, route_anchor, route_join = self._route(bot, now)
         profile = dict(bot["profile"])
         desired_range = max(10.0, _number(profile.get("desired_range"), 180.0))
         fire_range = max(desired_range, _number(profile.get("fire_range"), 500.0))
@@ -909,6 +918,7 @@ class BotPlanner(object):
             "route_id": route_id,
             "route_index": route_index,
             "route_anchor": dict(route_anchor),
+            "route_join": bool(route_join),
             "personality": personality,
             "profile": profile,
             "shell_index": 0,
@@ -937,17 +947,14 @@ class BotPlanner(object):
         if not locally_shootable:
             self._engage_anchors.pop(bot["id"], None)
             self._cover_states.pop(bot["id"], None)
-            # This branch is retained for a legacy order already in flight. New
-            # assignments require local LOS, so a team-only red dot cannot turn
-            # the hull, stop a casemate vehicle, or start a cover manoeuvre.
-            order["target_id"] = None
-            order.pop("target_kind", None)
-            order["aim_position"] = dict(move)
-            order["face_position"] = dict(move)
+            # A wall, tree, ridge or friendly hull can temporarily block the
+            # barrel without making the enemy cease to exist. Retain the target
+            # lease and let the copied local navigator find a lane. Fire remains
+            # strictly disabled until this bot is reported shootable.
             order["fire_allowed"] = False
-            order["combat_mode"] = "route"
-            order["move_position"] = dict(move)
-            order["throttle_override"] = None
+            order["combat_mode"] = "advance_contact"
+            order["move_position"] = dict(focus["position"])
+            order["throttle_override"] = 0.72
         elif distance > far_limit:
             self._engage_anchors.pop(bot["id"], None)
             self._cover_states.pop(bot["id"], None)

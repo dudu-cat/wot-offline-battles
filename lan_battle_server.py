@@ -116,6 +116,17 @@ ROUND_SCOPED_MESSAGE_TYPES = frozenset((
     "battle_result", "leave_battle", "battle_ready",
 ))
 DESTRUCTIBLE_KINDS = frozenset(("tree", "column", "fragile", "module"))
+COMBAT_EVENT_KINDS = frozenset((
+    "health", "hit", "bot_hit", "bot_human_hit", "bot_bot_hit",
+))
+COMBAT_SOURCE_KINDS = {
+    "shot": frozenset((
+        "hit", "bot_hit", "bot_human_hit", "bot_bot_hit")),
+    "fire": frozenset(("bot_hit", "bot_human_hit", "bot_bot_hit")),
+    "ram": frozenset(("bot_hit", "bot_human_hit", "bot_bot_hit")),
+    "client_simulation": frozenset(("health",)),
+    "player_left": frozenset(("health",)),
+}
 CRITICAL_DEVICE_NAMES = frozenset((
     "engineHealth", "ammoBayHealth", "fuelTankHealth", "radioHealth",
     "leftTrackHealth", "rightTrackHealth", "gunHealth",
@@ -433,6 +444,55 @@ class BattleState:
                     parsed_round == self.round_id)
         except (TypeError, ValueError, OverflowError):
             return False
+
+    @staticmethod
+    def _validate_combat_event_for_wire(event):
+        """Reject incomplete cause metadata before any combat event ships."""
+        kind = event.get("kind")
+        if kind not in COMBAT_EVENT_KINDS:
+            return True
+        if "source" not in event:
+            raise RuntimeError("combat event has no source")
+        source = event["source"]
+        if source not in COMBAT_SOURCE_KINDS:
+            raise RuntimeError("combat event has invalid source: %s" % source)
+        if kind not in COMBAT_SOURCE_KINDS[source]:
+            raise RuntimeError(
+                "combat source %s does not allow kind %s" % (source, kind))
+        if "death_reason" not in event:
+            raise RuntimeError("combat event has no death_reason")
+        death_reason = event["death_reason"]
+        if (isinstance(death_reason, bool) or
+                not isinstance(death_reason, int) or death_reason < 0):
+            raise RuntimeError("combat event has invalid death_reason")
+        if not event.get("dead", False) and death_reason != 0:
+            raise RuntimeError(
+                "nonfatal combat event has nonzero death_reason")
+        has_attacker = "attacker" in event or "attacker_bot" in event
+        if "attacker" in event and "attacker_bot" in event:
+            raise RuntimeError("combat event has ambiguous attacker")
+        if source == "player_left":
+            if (event.get("attack_reason", object()) is not None or
+                    has_attacker):
+                raise RuntimeError(
+                    "player_left event must be an explicit non-attack cause")
+            return True
+        if "attack_reason" not in event:
+            raise RuntimeError("combat event has no attack_reason")
+        attack_reason = event["attack_reason"]
+        if (isinstance(attack_reason, bool) or
+                not isinstance(attack_reason, int) or attack_reason < 0):
+            raise RuntimeError("combat event has invalid attack_reason")
+        if source in ("shot", "fire", "ram"):
+            expected = {"shot": 0, "fire": 1, "ram": 2}[source]
+            if not has_attacker or attack_reason != expected:
+                raise RuntimeError(
+                    "combat event attacker/cause does not match source %s" %
+                    source)
+        elif has_attacker:
+            raise RuntimeError(
+                "client_simulation event must not have an attacker")
+        return True
 
     @staticmethod
     def _new_bot_roster(occupied_slots=None):
@@ -897,6 +957,9 @@ class BattleState:
                 return None
         if kind == "module" and mat_kind is None:
             return None
+        is_shot = message.get("is_shot")
+        if not isinstance(is_shot, bool):
+            return None
         if not _has_finite_fields(
                 message, ("x", "y", "z", "fall_yaw", "speed")):
             return None
@@ -916,7 +979,7 @@ class BattleState:
                 -math.pi * 4.0, math.pi * 4.0), 6),
             "speed": round(_clamp(_finite_float(message.get("speed")),
                                   -200.0, 200.0), 3),
-            "is_shot": bool(message.get("is_shot", False)),
+            "is_shot": is_shot,
         }
         if mat_kind is not None:
             event["mat_kind"] = mat_kind
@@ -970,6 +1033,8 @@ class BattleState:
                 "damage": previous_health,
                 "health": 0,
                 "dead": True,
+                "attack_reason": None,
+                "death_reason": 0,
                 "source": "player_left",
             })
             if player_id == self.bot_authority_id:
@@ -1496,7 +1561,8 @@ class BattleState:
                              else "bot_hit"),
                     "target_bot": victim["id"],
                     "damage": damage, "health": 0, "dead": True,
-                    "death_reason": 1, "source": "fire",
+                    "attack_reason": 1, "death_reason": 1,
+                    "source": "fire",
                 }
                 event["attacker_bot" if attacker_kind == "bot"
                       else "attacker"] = int(attacker_id)
@@ -1612,6 +1678,8 @@ class BattleState:
                 "shot_seq": shot_seq, "shell_index": shell_index,
                 "shot_result": max(0, min(int(_finite_float(message.get("shot_result"), 2)), 2)),
                 "damage": applied, "health": state["health"], "dead": not state["alive"],
+                "attack_reason": 0, "death_reason": 0,
+                "source": "shot",
                 "splash": splash,
                 "world_pose": True,
                 "x": round(_clamp(_finite_float(message.get("x"), state["x"]), -2000.0, 2000.0), 4),
@@ -1719,6 +1787,8 @@ class BattleState:
                     bot.get("shell_index"), 0)), 9)),
                 "shot_result": max(0, min(int(_finite_float(message.get("shot_result"), 2)), 2)),
                 "damage": applied, "health": target.health, "dead": not target.alive,
+                "attack_reason": 0, "death_reason": 0,
+                "source": "shot",
                 "splash": splash,
                 "world_pose": True,
                 "x": round(_clamp(_finite_float(message.get("x"), target.x), -2000.0, 2000.0), 4),
@@ -1822,6 +1892,7 @@ class BattleState:
                          else "bot_hit"),
                 "target_bot": bot_id, "damage": applied_bot,
                 "health": bot["health"], "dead": not bot["alive"],
+                "attack_reason": reason,
                 "death_reason": bot["death_reason"], "source": "ram",
             }
             if target_kind == "bot":
@@ -1845,6 +1916,7 @@ class BattleState:
                     "target_bot": target_id, "damage": applied_target,
                     "health": target["health"],
                     "dead": not target["alive"],
+                    "attack_reason": reason,
                     "death_reason": target["death_reason"], "source": "ram",
                 }
                 target_team = int(target.get("team", 0))
@@ -1858,6 +1930,7 @@ class BattleState:
                     "kind": "bot_human_hit", "attacker_bot": bot_id,
                     "target": target_id, "damage": applied_target,
                     "health": target.health, "dead": not target.alive,
+                    "attack_reason": reason,
                     "death_reason": target.death_reason, "source": "ram",
                 }
                 target_team = target.team
@@ -2168,7 +2241,8 @@ class BattleState:
             "health": player.health,
             "dead": not player.alive,
             "source": "client_simulation",
-            "death_reason": player.death_reason if not player.alive else reason,
+            "attack_reason": reason,
+            "death_reason": player.death_reason if not player.alive else 0,
             "display_health": (player.display_health
                                if not player.alive else player.health),
         }
@@ -2290,6 +2364,9 @@ class BattleState:
                 "damage": applied_damage,
                 "health": target.health,
                 "dead": not target.alive,
+                "attack_reason": 0,
+                "death_reason": 0,
+                "source": "shot",
                 "splash": splash,
                 "world_pose": True,
                 "x": round(_clamp(_finite_float(message.get("x"), target.x), -2000.0, 2000.0), 4),
@@ -2526,6 +2603,7 @@ class BattleState:
                     time.monotonic())
             events = []
             for ordinal, pending in enumerate(self.pending_events):
+                self._validate_combat_event_for_wire(pending)
                 event = dict(pending)
                 event["event_id"] = "%d:%d:%d" % (
                     self.round_id, self.tick, ordinal)

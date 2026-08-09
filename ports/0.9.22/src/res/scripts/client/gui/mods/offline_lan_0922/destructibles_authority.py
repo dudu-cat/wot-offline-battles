@@ -27,6 +27,13 @@ _PROP_BY_KIND = {
 	'module': 'destroyedModules',
 }
 
+_PREV_BY_PROP = {
+	'fallenTrees': '_AreaDestructibles__prevFallenTrees',
+	'fallenColumns': '_AreaDestructibles__prevFallenColumns',
+	'destroyedFragiles': '_AreaDestructibles__prevDestroyedFragiles',
+	'destroyedModules': '_AreaDestructibles__prevDestroyedModules',
+}
+
 
 def _log(*args):
 	try:
@@ -86,7 +93,7 @@ def _ensure_chunk(spaceID, chunkID, pos):
 	import AreaDestructibles
 	mgr = AreaDestructibles.g_destructiblesManager
 	if mgr is None:
-		return None
+		raise RuntimeError('destructibles manager is unavailable')
 	# Keep the manager's space in sync with the CURRENT battle. Starting only
 	# when None left a STALE spaceID after battle 1: mgr kept the previous,
 	# now-RELEASED space, so the engine's __launchFallEffect later called
@@ -95,68 +102,88 @@ def _ensure_chunk(spaceID, chunkID, pos):
 	# the tree/column fall (seen on a later-battle Fjords). startSpace() does
 	# clear() first, so re-starting on a space change is safe and fires once.
 	_cur_sid = int(spaceID) if spaceID is not None else None
-	try:
-		_mgr_sid = mgr.getSpaceID()
-	except Exception:
-		_mgr_sid = None
+	_mgr_sid = mgr.getSpaceID()
 	if _cur_sid is not None and _mgr_sid != _cur_sid:
 		mgr.startSpace(_cur_sid)
 	if chunkID not in _state['entities']:
-		_state['entities'].add(chunkID)
 		c = _chunk(chunkID)
-		try:
-			BigWorld.createEntity('AreaDestructibles', spaceID, 0, Math.Vector3(pos[0], pos[1], pos[2]), (0.0, 0.0, 0.0), {
-				'fallenTrees': list(c['fallenTrees']),
-				'fallenColumns': list(c['fallenColumns']),
-				'destroyedFragiles': list(c['destroyedFragiles']),
-				'destroyedModules': list(c['destroyedModules']),
-			})
-		except Exception:
-			_log('DestrAuth: createEntity failed for chunk', chunkID)
-	try:
-		if not mgr.isChunkLoaded(chunkID):
-			fnames = BigWorld.wg_getChunkDestrFilenames(spaceID, chunkID)
-			if fnames is not None:
-				mgr.onChunkLoad(chunkID, len(fnames))
-	except Exception:
-		_log('DestrAuth: onChunkLoad failed for chunk', chunkID)
+		entityID = BigWorld.createEntity('AreaDestructibles', spaceID, 0, Math.Vector3(pos[0], pos[1], pos[2]), (0.0, 0.0, 0.0), {
+			'fallenTrees': list(c['fallenTrees']),
+			'fallenColumns': list(c['fallenColumns']),
+			'destroyedFragiles': list(c['destroyedFragiles']),
+			'destroyedModules': list(c['destroyedModules']),
+		})
+		if entityID is None or int(entityID) <= 0:
+			raise RuntimeError(
+				'AreaDestructibles entity was not created for chunk %s' %
+				chunkID)
+		# createEntity may complete asynchronously, but a failed call must remain
+		# retryable instead of permanently poisoning this chunk.
+		_state['entities'].add(chunkID)
+	if not mgr.isChunkLoaded(chunkID):
+		fnames = BigWorld.wg_getChunkDestrFilenames(spaceID, chunkID)
+		if fnames is not None:
+			mgr.onChunkLoad(chunkID, len(fnames))
 	return mgr.getController(chunkID)
 
 
-def _apply(spaceID, chunkID, pos, kind, destrData, dedupKey):
+def _apply(spaceID, chunkID, pos, kind, destrData, dedupKey,
+		syncWithProjectile=False):
 	import AreaDestructibles
 	_reset_if_new_space(spaceID)
 	c = _chunk(chunkID)
 	if dedupKey in c['keys']:
 		return False
 	ctrl = _ensure_chunk(spaceID, chunkID, pos)
-	c['keys'].add(dedupKey)
 	prop = _PROP_BY_KIND[kind]
-	c[prop].append(destrData)
 	if ctrl is not None:
 		# Server-style push: update the entity property and fire its
 		# set_ callback; the entity diffs vs its prev-set and animates
 		# only the new entry.
+		values = getattr(ctrl, prop)
+		length = len(values)
+		prevName = _PREV_BY_PROP[prop]
+		previous = getattr(ctrl, prevName)
+		values.append(destrData)
 		try:
-			getattr(ctrl, prop).append(destrData)
 			getattr(ctrl, 'set_' + prop)(None)
-			return True
 		except Exception:
-			_log('DestrAuth: property push failed, direct order fallback', chunkID, kind)
-	# Controller still spawning: order directly - the manager queues it
-	# per chunk until onChunkLoad and animates on flush.
-	dmgTypes = {
-		'tree': AreaDestructibles._DAMAGE_TYPE_TREE,
-		'column': AreaDestructibles._DAMAGE_TYPE_COLUMN,
-		'fragile': AreaDestructibles._DAMAGE_TYPE_FRAGILE,
-		'module': AreaDestructibles._DAMAGE_TYPE_MODULE,
-	}
-	try:
-		AreaDestructibles.g_destructiblesManager.orderDestructibleDestroy(chunkID, dmgTypes[kind], destrData, True)
-		return True
-	except Exception:
-		_log('DestrAuth: direct order failed', chunkID, kind)
-	return False
+			# A failed setter may not leave the replicated property claiming that
+			# native geometry changed.  Roll back only our own tail append; any
+			# other mutation means the controller contract is already corrupted.
+			if (len(values) != length + 1 or
+					values[-1] != destrData):
+				raise RuntimeError(
+					'destructible controller rollback is unsafe: '
+					'chunk=%s kind=%s' % (chunkID, kind))
+			try:
+				del values[-1]
+				setattr(ctrl, prevName, previous)
+			except Exception:
+				raise RuntimeError(
+					'destructible controller rollback failed: '
+					'chunk=%s kind=%s' % (chunkID, kind))
+			raise
+	else:
+		# Controller still spawning: order directly - the manager queues it
+		# per chunk until onChunkLoad and animates on flush.  #1513's fifth
+		# argument synchronises shot destruction with the projectile explosion;
+		# contact damage always passes False.
+		dmgTypes = {
+			'tree': AreaDestructibles._DAMAGE_TYPE_TREE,
+			'column': AreaDestructibles._DAMAGE_TYPE_COLUMN,
+			'fragile': AreaDestructibles._DAMAGE_TYPE_FRAGILE,
+			'module': AreaDestructibles._DAMAGE_TYPE_MODULE,
+		}
+		AreaDestructibles.g_destructiblesManager.orderDestructibleDestroy(
+			chunkID, dmgTypes[kind], destrData, True,
+			bool(syncWithProjectile))
+	# The native operation is irreversible.  Commit the replay/dedup ledger only
+	# after it has accepted the destroy; otherwise a transient ABI/engine failure
+	# would make every later canonical replay look like a successful duplicate.
+	c[prop].append(destrData)
+	c['keys'].add(dedupKey)
+	return True
 
 
 def destroy_tree(spaceID, chunkID, itemIndex, fallYaw, speed, pos):
@@ -166,12 +193,10 @@ def destroy_tree(spaceID, chunkID, itemIndex, fallYaw, speed, pos):
 	# 'argument 1 must be set to an int'. Coerce here.
 	chunkID = int(chunkID); itemIndex = int(itemIndex)
 	pitch = math.pi / 2.0
-	try:
-		pc = BigWorld.wg_getDestructibleFallPitchConstr(spaceID, chunkID, itemIndex, fallYaw)
-		if pc is not None and pc[0] is not None:
-			pitch = pc[0]
-	except Exception:
-		pass
+	pc = BigWorld.wg_getDestructibleFallPitchConstr(
+		spaceID, chunkID, itemIndex, fallYaw)
+	if pc is not None and pc[0] is not None:
+		pitch = pc[0]
 	speed = max(1, min(3, int(abs(speed))))
 	data = AreaDestructibles.encodeFallenTree(itemIndex, fallYaw, pitch, speed)
 	return _apply(spaceID, chunkID, pos, 'tree', data, (itemIndex, None))
@@ -185,10 +210,12 @@ def destroy_column(spaceID, chunkID, itemIndex, fallYaw, speed, pos):
 	return _apply(spaceID, chunkID, pos, 'column', data, (itemIndex, None))
 
 
-def destroy_fragile(spaceID, chunkID, itemIndex, pos):
-	# Fragiles take the RAW item index: __destroyFragile does no decode.
+def destroy_fragile(spaceID, chunkID, itemIndex, pos, isShotDamage=False):
+	import AreaDestructibles
 	chunkID = int(chunkID); itemIndex = int(itemIndex)
-	return _apply(spaceID, chunkID, pos, 'fragile', itemIndex, (itemIndex, None))
+	data = AreaDestructibles.encodeFragile(itemIndex, isShotDamage)
+	return _apply(spaceID, chunkID, pos, 'fragile', data,
+		(itemIndex, None), isShotDamage)
 
 
 def destroy_module(spaceID, chunkID, itemIndex, matKind, pos, isShotDamage=False):
@@ -197,4 +224,5 @@ def destroy_module(spaceID, chunkID, itemIndex, matKind, pos, isShotDamage=False
 	if matKind is not None:
 		matKind = int(matKind)
 	data = AreaDestructibles.encodeDestructibleModule(itemIndex, matKind, isShotDamage)
-	return _apply(spaceID, chunkID, pos, 'module', data, (itemIndex, matKind))
+	return _apply(spaceID, chunkID, pos, 'module', data,
+		(itemIndex, matKind), isShotDamage)

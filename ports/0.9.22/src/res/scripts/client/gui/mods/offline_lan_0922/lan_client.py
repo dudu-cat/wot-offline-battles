@@ -371,7 +371,9 @@ class LANClient(object):
             return False
         chunk_id = _exact_int(event.get('chunk_id'))
         item_index = _exact_int(event.get('item_index'))
-        if chunk_id is None or item_index is None:
+        is_shot = event.get('is_shot')
+        if (chunk_id is None or item_index is None or
+                not isinstance(is_shot, bool)):
             return False
         message = {
             'type': 'destructible', 'round_id': self.round_id,
@@ -382,7 +384,7 @@ class LANClient(object):
             'z': _finite_float(event.get('z')),
             'fall_yaw': _finite_float(event.get('fall_yaw')),
             'speed': _finite_float(event.get('speed')),
-            'is_shot': bool(event.get('is_shot', False)),
+            'is_shot': is_shot,
         }
         if event.get('mat_kind') is not None:
             mat_kind = _exact_int(event.get('mat_kind'))

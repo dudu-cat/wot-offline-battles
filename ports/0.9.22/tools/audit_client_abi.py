@@ -131,6 +131,17 @@ EXPECTED_ABI = {
         'BattleFeedbackAdaptor.stopVehicleVisual': (
             'self', 'vehicleID', 'isPlayerVehicle'),
     },
+    'scripts/client/gui/battle_control/battle_session.pyc': {
+        'BattleSessionProvider.getArenaDP': ('self',),
+    },
+    'scripts/client/gui/battle_control/arena_info/arena_dp.pyc': {
+        'ArenaDataProvider.isRequiredDataExists': ('self',),
+        'ArenaDataProvider.getPlayerVehicleID': ('self', 'forceUpdate'),
+    },
+    'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
+    'plugins.pyc': {
+        'VehicleMarkerPlugin.start': ('self',),
+    },
     'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
     'markers.pyc': {
         'VehicleMarker.attach': ('self', 'vProxy'),
@@ -373,6 +384,8 @@ EXPECTED_ABI = {
             'destrIndex', 'fallYaw', 'fallPitchConstr', 'fallSpeed'),
         'encodeDestructibleModule': (
             'destrID', 'matKind', 'isShotDamage'),
+        'encodeFragile': ('destrID', 'isShotDamage'),
+        'decodeFragile': ('data',),
     },
     'scripts/client/vehicle_systems/CompoundAppearance.pyc': {
         'CompoundAppearance.__linkCompound': ('self',),
@@ -832,6 +845,23 @@ EXPECTED_CODE_NAMES = {
         'BattleFeedbackAdaptor.stopVehicleVisual': (
             'onVehicleMarkerRemoved', 'onMinimapVehicleRemoved'),
     },
+    'scripts/client/gui/battle_control/battle_session.pyc': {
+        'BattleSessionProvider.getArenaDP': (
+            '_BattleSessionProvider__arenaDP',),
+    },
+    'scripts/client/gui/battle_control/arena_info/arena_dp.pyc': {
+        'ArenaDataProvider.isRequiredDataExists': (
+            '_ArenaDataProvider__checkRequiredData',),
+        'ArenaDataProvider.getPlayerVehicleID': (
+            '_ArenaDataProvider__playerVehicleID',
+            '_ArenaDataProvider__tryToGetRequiredData'),
+    },
+    'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
+    'plugins.pyc': {
+        'VehicleMarkerPlugin.start': (
+            'getArenaDP', 'getPlayerVehicleID',
+            '_VehicleMarkerPlugin__playerVehicleID'),
+    },
     'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
     'markers.pyc': {
         'VehicleMarker.attach': ('appearance', 'onModelChanged'),
@@ -926,6 +956,8 @@ EXPECTED_CODE_NAMES = {
         'encodeFallenColumn': ('int', 'PI', 'PI_2'),
         'encodeFallenTree': ('int', 'PI', 'PI_2'),
         'encodeDestructibleModule': ('int',),
+        'encodeFragile': ('int',),
+        'decodeFragile': ('bool',),
     },
     'scripts/client/vehicle_systems/CompoundAppearance.pyc': {
         'CompoundAppearance.__linkCompound': (

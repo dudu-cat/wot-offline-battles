@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,6 +89,26 @@ class WorldCollisionTests(unittest.TestCase):
 
         self.assertFalse(blocked)
         self.assertEqual([], horizontal_calls)
+
+    def test_native_destructible_failure_is_not_silently_passable(self):
+        def collide(unused_space, start, end, unused_mask):
+            if abs(start.y - end.y) > 10.0:
+                return (_Vector(start.x, 0.0, start.z),)
+            return (_Vector(start.x, start.y,
+                            start.z + (end.z - start.z) * 0.5),)
+
+        bigworld = types.SimpleNamespace(
+            wg_collideSegment=collide,
+            wg_getMatInfoNearPoint=lambda *unused: None)
+        math_module = types.SimpleNamespace(Vector3=_Vector)
+
+        with mock.patch.object(
+                world_collision, '_try_destroy_solid_hit',
+                side_effect=RuntimeError('native destroy failed')):
+            with self.assertRaisesRegex(RuntimeError, 'native destroy failed'):
+                world_collision.check_horizontal_collision(
+                    bigworld, math_module, 1, _Vector(), 0.0, 5.0,
+                    None, False, 0.04)
 
 
 if __name__ == '__main__':

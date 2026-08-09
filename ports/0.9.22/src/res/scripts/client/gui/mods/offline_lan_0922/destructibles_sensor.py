@@ -62,72 +62,73 @@ def reset(spaceID=None):
 
 def _try_destroy_destructible(spaceID, matInfo, yaw, vel,
 		isShotDamage=False):
-	import AreaDestructibles, BigWorld, constants
-	try:
-		if not hasattr(AreaDestructibles, 'g_destructiblesManager') or not AreaDestructibles.g_destructiblesManager:
+	import AreaDestructibles
+	if (not hasattr(AreaDestructibles, 'g_destructiblesManager') or
+			not AreaDestructibles.g_destructiblesManager):
+		raise RuntimeError('destructibles manager is unavailable')
+
+	hitPt, surfNormal, chunkID, itemIndex, matKind, fname = matInfo
+	_dseen = globals().setdefault('g_offh_destr_seen', set())
+	_dkey = (matKind, fname)
+	if _dkey not in _dseen:
+		_dseen.add(_dkey)
+		LOG_DEBUG('Destr hit: matKind=', matKind, 'fname=', repr(fname),
+			'chunk=', chunkID, 'idx=', itemIndex)
+	# Widened band: the strict 71-100 range rejected spawn barriers/props at
+	# matKind 102. getDescByFilename below is the real filter, so a wider band
+	# only lets more candidates reach the authoritative desc check.
+	if matKind < 71 or matKind > 130:
+		return False
+	desc = AreaDestructibles.g_cache.getDescByFilename(fname)
+	if not desc:
+		_dnd = globals().setdefault('g_offh_destr_nodesc', set())
+		if _dkey not in _dnd:
+			_dnd.add(_dkey)
+			LOG_DEBUG('Destr no desc: matKind=', matKind,
+				'fname=', repr(fname), 'chunk=', chunkID, 'idx=', itemIndex)
+		return False
+
+	# Data-driven vegetation gate: soft vegetation (bush/shrub/fern)
+	# ships with health <= 5; real fallable trees start at 10.
+	if desc['type'] in (AreaDestructibles.DESTR_TYPE_TREE,
+			AreaDestructibles.DESTR_TYPE_FALLING_ATOM):
+		_hp_gate = desc.get('health', 0)
+		if _hp_gate < 10 or _hp_gate > 1000:
 			return False
-			
-		hitPt, surfNormal, chunkID, itemIndex, matKind, fname = matInfo
-		_dseen = globals().setdefault('g_offh_destr_seen', set())
-		_dkey = (matKind, fname)
-		if _dkey not in _dseen:
-			_dseen.add(_dkey); LOG_DEBUG('Destr hit: matKind=', matKind, 'fname=', repr(fname), 'chunk=', chunkID, 'idx=', itemIndex)
-		# Widened band: the strict 71-100 range rejected spawn barriers/props at
-		# matKind 102. getDescByFilename below is the real filter, so a wider band
-		# only lets more candidates reach the authoritative desc check.
-		if matKind < 71 or matKind > 130:
-			return False
-		desc = AreaDestructibles.g_cache.getDescByFilename(fname)
-		if not desc:
-			_dnd = globals().setdefault('g_offh_destr_nodesc', set())
-			if _dkey not in _dnd:
-				_dnd.add(_dkey); LOG_DEBUG('Destr no desc: matKind=', matKind, 'fname=', repr(fname), 'chunk=', chunkID, 'idx=', itemIndex)
-			return False
-		
-		# Data-driven vegetation gate: soft vegetation (bush/shrub/fern)
-		# ships with health <= 5; real fallable trees start at 10.
-		if desc['type'] in (AreaDestructibles.DESTR_TYPE_TREE, AreaDestructibles.DESTR_TYPE_FALLING_ATOM):
-			_hp_gate = desc.get('health', 0)
-			if _hp_gate < 10 or _hp_gate > 1000:
-				return False
-		# All bookkeeping (chunk bootstrap, dedup, encoding) lives in
-		# the authority - this path is now just a contact sensor.
-		_auth = _get_destr_authority()
-		
-		typ = desc['type']
-		# STRUCTURE (buildings) now falls through to the module-destroy
-		# path: online, small buildings crumble module by module as the
-		# tank pushes through. Requires the working effects pipeline
-		# (terrainEffects + real fake_model), else it raises mid-destroy.
-		if _auth.is_destroyed(chunkID, itemIndex, matKind):
-			LOG_DEBUG('Destr: already broken')
-			return True
-			
-		if typ == AreaDestructibles.DESTR_TYPE_TREE:
-			_destr_ok = _auth.destroy_tree(spaceID, chunkID, itemIndex, yaw, vel, hitPt)
-		elif typ == AreaDestructibles.DESTR_TYPE_FALLING_ATOM:
-			_destr_ok = _auth.destroy_column(spaceID, chunkID, itemIndex, yaw, vel, hitPt)
-		elif typ == AreaDestructibles.DESTR_TYPE_FRAGILE:
-			_destr_ok = _auth.destroy_fragile(spaceID, chunkID, itemIndex, hitPt)
-		else:
-			# STRUCTURE: buildings crumble module by module
-			_destr_ok = _auth.destroy_module(
-				spaceID, chunkID, itemIndex, matKind, hitPt, isShotDamage)
-			
-		if _destr_ok:
-			_publish_destroyed(
-				('tree' if typ == AreaDestructibles.DESTR_TYPE_TREE else
-				 'column' if typ == AreaDestructibles.DESTR_TYPE_FALLING_ATOM else
-				 'fragile' if typ == AreaDestructibles.DESTR_TYPE_FRAGILE else
-				 'module'),
-				chunkID, itemIndex, hitPt, yaw, vel,
-				matKind if typ == AreaDestructibles.DESTR_TYPE_STRUCTURE else None,
-				isShotDamage)
-			LOG_DEBUG('Destr SUCCESS!', typ)
+	# All bookkeeping (chunk bootstrap, dedup, encoding) lives in
+	# the authority - this path is now just a contact sensor.
+	_auth = _get_destr_authority()
+	typ = desc['type']
+	# STRUCTURE (buildings) now falls through to the module-destroy path.
+	if _auth.is_destroyed(chunkID, itemIndex, matKind):
 		return True
-	except Exception as e:
-		LOG_DEBUG('Destr Exception:', str(e))
-	return False
+
+	if typ == AreaDestructibles.DESTR_TYPE_TREE:
+		_destr_ok = _auth.destroy_tree(
+			spaceID, chunkID, itemIndex, yaw, vel, hitPt)
+	elif typ == AreaDestructibles.DESTR_TYPE_FALLING_ATOM:
+		_destr_ok = _auth.destroy_column(
+			spaceID, chunkID, itemIndex, yaw, vel, hitPt)
+	elif typ == AreaDestructibles.DESTR_TYPE_FRAGILE:
+		_destr_ok = _auth.destroy_fragile(
+			spaceID, chunkID, itemIndex, hitPt, isShotDamage)
+	else:
+		_destr_ok = _auth.destroy_module(
+			spaceID, chunkID, itemIndex, matKind, hitPt, isShotDamage)
+	if not _destr_ok:
+		raise RuntimeError(
+			'native destructible destroy was not accepted: chunk=%s item=%s' %
+			(chunkID, itemIndex))
+
+	_publish_destroyed(
+		('tree' if typ == AreaDestructibles.DESTR_TYPE_TREE else
+		 'column' if typ == AreaDestructibles.DESTR_TYPE_FALLING_ATOM else
+		 'fragile' if typ == AreaDestructibles.DESTR_TYPE_FRAGILE else
+		 'module'),
+		chunkID, itemIndex, hitPt, yaw, vel,
+		matKind if typ == AreaDestructibles.DESTR_TYPE_STRUCTURE else None,
+		isShotDamage)
+	return True
 
 
 def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
@@ -145,8 +146,8 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 			return
 		mgr = getattr(AreaDestructibles, 'g_destructiblesManager', None)
 		if not mgr:
-			return
-		if mgr.getSpaceID() is None:
+			raise RuntimeError('destructibles manager is unavailable')
+		if mgr.getSpaceID() != spaceID:
 			mgr.startSpace(spaceID)
 		_st = globals().setdefault('g_offh_tree_state', {'chunks': {}, 'felled': set(), 'spaceID': None})
 		if _st.get('spaceID') != spaceID:
@@ -161,10 +162,9 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 		cos_y = math.cos(yaw); sin_y = math.sin(yaw)
 		cids = set()
 		for _pf in (0.0, 6.0 if vel >= 0 else -6.0):
-			try:
-				cids.add(AreaDestructibles.chunkIDFromPosition(Math.Vector3(pos.x + sin_y * _pf, pos.y, pos.z + cos_y * _pf)))
-			except Exception:
-				pass
+			cids.add(AreaDestructibles.chunkIDFromPosition(
+				Math.Vector3(pos.x + sin_y * _pf, pos.y,
+					pos.z + cos_y * _pf)))
 		hw = 1.6; hl_f = 3.6; hl_b = 3.6
 		try:
 			if td is not None and hasattr(td, 'hull') and 'hitTester' in td.hull:
@@ -172,24 +172,16 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 				hw = max(abs(bbox[0][0]), abs(bbox[1][0]))
 				hl_b = abs(bbox[0][2])
 				hl_f = abs(bbox[1][2])
-		except Exception:
+		except (AttributeError, KeyError, TypeError, IndexError):
 			pass
 		for cid in cids:
 			trees = _st['chunks'].get(cid)
 			if trees is None:
-				_dfn = None
-				try:
-					_dfn = BigWorld.wg_getChunkDestrFilenames(spaceID, cid)
-				except Exception:
-					pass
+				_dfn = BigWorld.wg_getChunkDestrFilenames(spaceID, cid)
 				if _dfn is None:
 					continue # chunk not streamed in yet; retry next tick
 				trees = []
-				_cm_t = None
-				try:
-					_cm_t = BigWorld.wg_getChunkMatrix(spaceID, cid).translation
-				except Exception:
-					pass
+				_cm_t = BigWorld.wg_getChunkMatrix(spaceID, cid).translation
 				if _cm_t is None:
 					continue
 				for _ti in xrange(len(_dfn)):
@@ -211,17 +203,23 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 						# chunk translation + destructible translation
 						# (see AreaDestructibles.__launchEffect)
 						_m = Math.Matrix(BigWorld.wg_getDestructibleMatrix(spaceID, cid, _ti))
-						trees.append((_ti, _cm_t.x + _m.translation.x, _cm_t.z + _m.translation.z, desc['type'], _dfn[_ti], desc.get('health', 0), desc.get('mass', 0)))
+						trees.append((
+							_ti, _cm_t.x + _m.translation.x,
+							_cm_t.y + _m.translation.y,
+							_cm_t.z + _m.translation.z, desc['type'],
+							_dfn[_ti], desc.get('health', 0),
+							desc.get('mass', 0)))
 					except Exception:
-						continue
+						raise
 				_st['chunks'][cid] = trees
 				LOG_DEBUG('DestrTree: chunk registry', cid, len(trees), 'trees/poles')
 				if trees:
-					LOG_DEBUG('DestrTree: sample world pos', trees[0][1], trees[0][2], 'tank at', pos.x, pos.z)
+					LOG_DEBUG('DestrTree: sample world pos', trees[0][1],
+						trees[0][3], 'tank at', pos.x, pos.z)
 			if not trees:
 				continue
 			reach_f = hl_f + 0.8 + min(abs(vel) * 0.25, 1.2)
-			for (_ti, _tx, _tz, _ttyp, _tfn, _thp, _tmass) in trees:
+			for (_ti, _tx, _ty, _tz, _ttyp, _tfn, _thp, _tmass) in trees:
 				dx = _tx - pos.x; dz = _tz - pos.z
 				if dx * dx + dz * dz > 64.0:
 					continue
@@ -236,27 +234,37 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 				_key = (cid, _ti)
 				if _key in _st['felled']:
 					continue
-				_st['felled'].add(_key)
 				fall_yaw = yaw if vel >= 0 else (yaw + math.pi)
 				_auth = _get_destr_authority()
+				if _auth.is_destroyed(cid, _ti):
+					_st['felled'].add(_key)
+					continue
+				_object_pos = Math.Vector3(_tx, _ty, _tz)
 				if _ttyp == AreaDestructibles.DESTR_TYPE_FRAGILE:
 					# Haybales, barrels, wire fences: collision skins often
 					# resolve to no item in the probes; crush by proximity.
-					_ok = _auth.destroy_fragile(spaceID, cid, _ti, pos)
+					_ok = _auth.destroy_fragile(
+						spaceID, cid, _ti, _object_pos, False)
 				elif _ttyp == AreaDestructibles.DESTR_TYPE_TREE:
-					_ok = _auth.destroy_tree(spaceID, cid, _ti, fall_yaw, vel, pos)
+					_ok = _auth.destroy_tree(
+						spaceID, cid, _ti, fall_yaw, vel, _object_pos)
 				else:
-					_ok = _auth.destroy_column(spaceID, cid, _ti, fall_yaw, vel, pos)
-				if _ok:
-					_publish_destroyed(
-						('fragile' if _ttyp == AreaDestructibles.DESTR_TYPE_FRAGILE
-						 else 'tree' if _ttyp == AreaDestructibles.DESTR_TYPE_TREE
-						 else 'column'),
-						cid, _ti, pos, fall_yaw, vel)
-					LOG_DEBUG('DestrTree: FELLED', cid, _ti, 'type', _ttyp, 'hp', _thp, 'mass', _tmass, _tfn)
+					_ok = _auth.destroy_column(
+						spaceID, cid, _ti, fall_yaw, vel, _object_pos)
+				if not _ok:
+					raise RuntimeError(
+						'native proximity destroy was not accepted: '
+						'chunk=%s item=%s' % (cid, _ti))
+				_publish_destroyed(
+					('fragile' if _ttyp == AreaDestructibles.DESTR_TYPE_FRAGILE
+					 else 'tree' if _ttyp == AreaDestructibles.DESTR_TYPE_TREE
+					 else 'column'),
+					cid, _ti, _object_pos, fall_yaw, vel)
+				_st['felled'].add(_key)
+				LOG_DEBUG('DestrTree: FELLED', cid, _ti, 'type', _ttyp,
+					'hp', _thp, 'mass', _tmass, _tfn)
 	except Exception:
-		import traceback
-		LOG_DEBUG('DestrTree error:', traceback.format_exc())
+		raise
 
 
 def _try_destroy_solid_hit(spaceID, seg_start, hit_pt, yaw, vel):
@@ -280,7 +288,7 @@ def _try_destroy_solid_hit(spaceID, seg_start, hit_pt, yaw, vel):
 		if _mi is not None:
 			return _try_destroy_destructible(spaceID, _mi, yaw, vel)
 	except Exception:
-		pass
+		raise
 	return False
 
 
@@ -294,14 +302,10 @@ def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec):
 		return world_dist
 	world_dist = (world_collision[0] - start_pos).length
 	shot_yaw = math.atan2(dir_vec.x, dir_vec.z)
-	mat_info = None
-	try:
-		mat_info = bigworld.wg_getMatInfoNearPoint(
-			spaceID, start_pos,
-			world_collision[0] + dir_vec.scale(0.3),
-			world_collision[0], lambda *unused: False)
-	except Exception:
-		mat_info = None
+	mat_info = bigworld.wg_getMatInfoNearPoint(
+		spaceID, start_pos,
+		world_collision[0] + dir_vec.scale(0.3),
+		world_collision[0], lambda *unused: False)
 	if (mat_info is not None and
 			_try_destroy_destructible(
 				spaceID, mat_info, shot_yaw, 12.0, True)):

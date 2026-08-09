@@ -9,13 +9,13 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.43` replaces the old compatibility slice. It is a server-backed
+Version `0.3.44` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, the copied tactical-bot stack and repeatable rounds. The removed `vertical_slice.py`
 runtime is not packaged as a fallback.
 
-`0.3.43` installs one copied pose before native input startup and feeds that
+`0.3.44` installs one copied pose before native input startup and feeds that
 same provider to attached, own, camera, gun, sniper and minimap consumers. It
 gates native entity lookup by spotted/alive state, uses visible-pose descriptor
 collision for incoming fire, restores the native RPM channel, and presents
@@ -35,6 +35,15 @@ temporary profiler output: one spatial broadphase and one traffic snapshot are
 shared across each bot tick, expensive planning/steering is staggered near
 10 Hz while motion, gun and publication remain at 30 Hz, and navigation work
 uses a bounded search slice with once-per-second cache housekeeping.
+This release also separates shared spotting from each Bot's current firing
+lane: occluded Bots approach the contact, while focus slots prefer vehicles
+that can actually shoot. Spawn-to-route joins are Bot-scoped rather than
+reusing the first tank's egress path. Player and authority-Bot motion run the
+retained tree, column and fragile contact sensor before publishing a pose, and
+native destruction is committed only after #1513 accepts it. Combat events
+carry an explicit shot, fire, ram or non-attack cause; the marker receives the
+verified local vehicle identity, and friendly ramming no longer emits a
+projectile-hit or enemy-efficiency notification.
 
 The battle foundation now reuses the proven 0.8.2 behavior instead of a
 separate simplified implementation: the native countdown receives an advancing
@@ -357,8 +366,8 @@ python3 tools/bake_foliage_0922.py \
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.43.wotmod
-org.peng.offline_lan_0922_0.3.43.wotmod.sha256
+org.peng.offline_lan_0922_0.3.44.wotmod
+org.peng.offline_lan_0922_0.3.44.wotmod.sha256
 WoT-0.9.22-LAN-Client-<release hash>/
 WoT-0.9.22-LAN-Client-<release hash>.zip
 ```

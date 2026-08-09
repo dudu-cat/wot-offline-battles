@@ -99,6 +99,14 @@ class LanProtocolTests(unittest.TestCase):
         self.assertFalse(self.client.send_destructible({
             'destructible_kind': 'unknown', 'chunk_id': 1,
             'item_index': 2}))
+        self.assertFalse(self.client.send_destructible({
+            'destructible_kind': 'tree', 'chunk_id': 1,
+            'item_index': 2, 'x': 0, 'y': 0, 'z': 0,
+            'fall_yaw': 0, 'speed': 0}))
+        self.assertFalse(self.client.send_destructible({
+            'destructible_kind': 'tree', 'chunk_id': 1,
+            'item_index': 2, 'x': 0, 'y': 0, 'z': 0,
+            'fall_yaw': 0, 'speed': 0, 'is_shot': 0}))
 
     def test_input_carries_local_fire_or_drowning_state(self):
         critical = {
