@@ -103,7 +103,7 @@ def chassis_shape(type_descriptor):
     correct contacts between vehicles on different vertical levels.
     """
     if type_descriptor is None:
-        return DEFAULT_SHAPE
+        raise RuntimeError('#1513 vehicle descriptor is unavailable')
     cache_key = id(type_descriptor)
     cached = _SHAPE_CACHE.get(cache_key)
     if cached is not None and cached[0] is type_descriptor:
@@ -142,6 +142,16 @@ def chassis_shape(type_descriptor):
     except (AttributeError, IndexError, TypeError, ValueError) as error:
         raise RuntimeError('#1513 vehicle collision descriptor is invalid: %s' %
                            error)
+
+
+def forget_chassis_shape(type_descriptor):
+    """Release one descriptor-derived shape at its BSP owner boundary."""
+    cache_key = id(type_descriptor)
+    cached = _SHAPE_CACHE.get(cache_key)
+    if cached is None or cached[0] is not type_descriptor:
+        return False
+    del _SHAPE_CACHE[cache_key]
+    return True
 
 
 def vertical_overlap(y_a, shape_a, y_b, shape_b, slop=0.02):

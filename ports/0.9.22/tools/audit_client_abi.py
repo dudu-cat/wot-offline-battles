@@ -82,9 +82,19 @@ EXPECTED_ABI = {
     'scripts/common/items/vehicles.pyc': {
         'VehicleDescr': ('compactDescr', 'typeID', 'typeName'),
         'getDefaultAmmoForGun': ('gunDescr',),
+        'VehicleDescriptor.getHitTesters': ('self',),
         'Cache.equipments': ('self',),
         'Cache.customization20': ('self',),
         'VehicleList.getList': ('self', 'nationID'),
+    },
+    'scripts/common/ModelHitTester.pyc': {
+        'ModelHitTester.__init__': ('self', 'dataSection'),
+        'ModelHitTester.isBspModelLoaded': ('self',),
+        'ModelHitTester.loadBspModel': ('self',),
+        'ModelHitTester.releaseBspModel': ('self',),
+    },
+    'scripts/common/physics_shared.pyc': {
+        'configurePhysicsMode': ('cfg', 'typeDesc', 'gravityFactor'),
     },
     'scripts/common/items/components/legacy_stuff.pyc': {
         'NoLegacyStuff.get': ('self', 'k', 'd'),
@@ -393,6 +403,7 @@ EXPECTED_ABI = {
         'decodeFragile': ('data',),
     },
     'scripts/client/vehicle_systems/CompoundAppearance.pyc': {
+        'CompoundAppearance.start': ('self', 'prereqs'),
         'CompoundAppearance.__linkCompound': ('self',),
         'CompoundAppearance.__onModelsRefresh': (
             'self', 'modelState', 'resourceList'),
@@ -667,6 +678,20 @@ EXPECTED_CODE_LITERALS = {
 # string payload literals cannot express.  They are the exact #1513 APIs the
 # offline Account preservation and native lobby-ready gate depend on.
 EXPECTED_CODE_NAMES = {
+    'scripts/common/ModelHitTester.pyc': {
+        'ModelHitTester.__init__': ('bbox',),
+        'ModelHitTester.loadBspModel': (
+            'WGBspCollisionModel', 'setModelName', 'getBoundingBox', 'bbox'),
+        'ModelHitTester.releaseBspModel': ('bbox',),
+    },
+    'scripts/common/items/vehicles.pyc': {
+        'VehicleDescriptor.getHitTesters': (
+            'chassis', 'hull', 'turrets', 'hitTester', 'append'),
+    },
+    'scripts/common/physics_shared.pyc': {
+        'configurePhysicsMode': (
+            'chassis', 'hull', 'hitTester', 'bbox', 'hullPosition'),
+    },
     'scripts/common/items/components/legacy_stuff.pyc': {
         'NoLegacyStuff.get': ('AssertionError',),
         'NoLegacyStuff.__getitem__': ('AssertionError',),
@@ -975,6 +1000,7 @@ EXPECTED_CODE_NAMES = {
         'decodeFragile': ('bool',),
     },
     'scripts/client/vehicle_systems/CompoundAppearance.pyc': {
+        'CompoundAppearance.start': ('getHitTesters', 'loadBspModel'),
         'CompoundAppearance.__linkCompound': (
             '_CompoundAppearance__vehicle',
             '_CompoundAppearance__compoundModel', 'model', 'matrix'),
@@ -1301,6 +1327,9 @@ EXPECTED_UNPACK_WIDTHS = {
     'scripts/client_common/ClientArena.pyc': {
         'ClientArena.__onBasePointsUpdate': 6,
         'ClientArena.__onBaseCaptured': 2,
+    },
+    'scripts/common/physics_shared.pyc': {
+        'configurePhysicsMode': 3,
     },
 }
 

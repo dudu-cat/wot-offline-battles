@@ -72,20 +72,9 @@ def _view_range(descriptor):
 
 
 def _hull_dimensions(descriptor):
-    """Copy 0.8.2 conservative OBB half dimensions from the hull tester."""
-    half_length = 3.5
-    half_width = 1.7
-    try:
-        hull = _value(descriptor, 'hull', {}) or {}
-        hit_tester = _value(hull, 'hitTester')
-        bbox = hit_tester.bbox
-        half_width = max(0.8, abs(float(bbox[0][0])),
-                         abs(float(bbox[1][0])))
-        half_length = max(1.5, abs(float(bbox[0][2])),
-                          abs(float(bbox[1][2])))
-    except (AttributeError, KeyError, TypeError, ValueError, IndexError):
-        pass
-    return half_length, half_width
+    """Derive AI avoidance dimensions from the admitted collision body."""
+    shape = tank_collision.chassis_shape(descriptor)
+    return shape[1], shape[0]
 
 
 def _collision_shape(descriptor):

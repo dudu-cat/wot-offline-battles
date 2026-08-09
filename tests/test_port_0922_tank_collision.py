@@ -46,6 +46,16 @@ class _HitTester(object):
         self.bbox = (minimum, maximum, None)
 
 
+class _UnloadedHitTester(object):
+
+    def __init__(self):
+        self.bbox = None
+        self.load_calls = 0
+
+    def loadBspModel(self):
+        self.load_calls += 1
+
+
 class _Strict1513Component(object):
     """Attribute-only stand-in for #1513's ``NoLegacyStuff`` mixin."""
 
@@ -127,6 +137,22 @@ class TankCollisionTests(unittest.TestCase):
         shape = tank_collision.chassis_shape(descriptor)
 
         self.assertEqual((1.7, 3.2, -0.6, 2.2), shape)
+
+    def test_shape_requires_owner_to_load_bbox_before_geometry_read(self):
+        tester = _UnloadedHitTester()
+        descriptor = _Strict1513Component(
+            chassis=_Strict1513Component(hitTester=tester),
+            hull=_Strict1513Component(hitTester=tester))
+
+        with self.assertRaisesRegex(RuntimeError, 'bbox is unavailable'):
+            tank_collision.chassis_shape(descriptor)
+
+        self.assertEqual(0, tester.load_calls)
+
+    def test_shape_rejects_missing_descriptor_instead_of_default_body(self):
+        with self.assertRaisesRegex(
+                RuntimeError, 'vehicle descriptor is unavailable'):
+            tank_collision.chassis_shape(None)
 
     def test_axis_aligned_obb_reports_smallest_translation(self):
         shape = (1.5, 3.0, -0.5, 2.0)

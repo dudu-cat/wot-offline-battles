@@ -17,7 +17,8 @@ sys.path.insert(0, str(CLIENT_SCRIPTS))
 from gui.mods.offline_lan_0922.battle_runtime import (
     BattleRuntime, _LANInputSender, _engine_rotation,
     _selected_vehicle_has_sixth_sense)
-from gui.mods.offline_lan_0922 import critical_damage, gun_mechanics
+from gui.mods.offline_lan_0922 import critical_damage, gun_mechanics, \
+    tank_collision
 from gui.mods.offline_lan_0922.entities.remote_vehicle import \
     RemoteVehicle, RemoteVehicleFactory, _RemoteFilter, \
     collide_vehicle_at_matrix
@@ -177,13 +178,28 @@ class _Strict1513Component(object):
 
 
 class _HitTester1513(object):
-    def __init__(self, minimum, maximum):
-        # Exact #1513 bbox exposes min, max and a third derived value.
-        self.bbox = (minimum, maximum, None)
+    def __init__(self, minimum, maximum, loaded=True):
+        self._bounds = (minimum, maximum, None)
+        self.bbox = self._bounds if loaded else None
+        self.load_calls = 0
+        self.release_calls = 0
+
+    def loadBspModel(self):
+        self.load_calls += 1
+        if self.bbox is None:
+            self.bbox = self._bounds
+
+    def releaseBspModel(self):
+        self.release_calls += 1
+        if hasattr(self, 'bbox'):
+            del self.bbox
+
+    def localHitTest(self, unused_start, unused_end):
+        return ()
 
 
 class _Descriptor(object):
-    def __init__(self, name='ussr:R11_MS-1'):
+    def __init__(self, name='ussr:R11_MS-1', loaded=True):
         self.name = name
         shell = types.SimpleNamespace(
             compactDescr=101, damage=(100.0,), caliber=37.0,
@@ -198,10 +214,16 @@ class _Descriptor(object):
             aimingTime=1.0, burst=(1, 0.1),
             shotDispersionAngle=0.0037,
             shotDispersionFactors={
-                'afterShot': 4.0, 'turretRotation': 0.1})
+                'afterShot': 4.0, 'turretRotation': 0.1},
+            hitTester=_HitTester1513(
+                _Vector(-0.2, -0.2, -0.5),
+                _Vector(0.2, 0.2, 2.0), loaded))
         self.turret = types.SimpleNamespace(
             itemTypeName='vehicleTurret',
-            circularVisionRadius=330.0, rotationSpeed=1.0)
+            circularVisionRadius=330.0, rotationSpeed=1.0,
+            hitTester=_HitTester1513(
+                _Vector(-1.0, -0.4, -1.0),
+                _Vector(1.0, 0.8, 1.0), loaded))
         self.radio = types.SimpleNamespace(distance=400.0)
         self.physics = {'speedLimits': (14.0, 7.0)}
         self.type = types.SimpleNamespace(name=name, tags=('lightTank',))
@@ -209,7 +231,7 @@ class _Descriptor(object):
             itemTypeName='vehicleChassis',
             hitTester=_HitTester1513(
                 _Vector(-1.5, -0.8, -3.5),
-                _Vector(1.5, 0.8, 3.5)),
+                _Vector(1.5, 0.8, 3.5), loaded),
             hullPosition=_Vector(0.0, 0.6, 0.0),
             rotationSpeed=0.75,
             shotDispersionFactors=(0.14, 0.14))
@@ -217,7 +239,7 @@ class _Descriptor(object):
             itemTypeName='vehicleHull',
             hitTester=_HitTester1513(
                 _Vector(-1.7, -0.2, -3.5),
-                _Vector(1.7, 1.4, 3.5)),
+                _Vector(1.7, 1.4, 3.5), loaded),
             turretPositions=(_Vector(),))
         self.maxHealth = 500
         self.activeGunShotIndex = 0
@@ -226,12 +248,14 @@ class _Descriptor(object):
         return self.name
 
     def getHitTesters(self):
-        return ()
+        return (self.chassis.hitTester, self.hull.hitTester,
+                self.turret.hitTester, self.gun.hitTester)
 
 
 class _VehicleDescr(object):
     def __new__(cls, typeName=None, compactDescr=None):
-        return _Descriptor(typeName or compactDescr or 'ussr:R11_MS-1')
+        return _Descriptor(
+            typeName or compactDescr or 'ussr:R11_MS-1', loaded=False)
 
 
 class _Vehicle(object):
@@ -854,6 +878,11 @@ class _BigWorld(object):
         bridge = self.compatibility.bridge
         if bridge is not None:
             bridge.prepareVehicleEnter(entity)
+            # Exact #1513 CompoundAppearance.start owns the native Vehicle's
+            # descriptor lifecycle and loads every BSP tester before the
+            # entity becomes usable by frame-level collision consumers.
+            for tester in entity.typeDescriptor.getHitTesters():
+                tester.loadBspModel()
             bridge.acceptVehicleEnter(entity.id)
             bridge.setClientReady()
             bridge.completeVehicleEnter(entity.id)
@@ -1534,6 +1563,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
     def test_factory_releases_each_unique_hit_tester_once(self):
         runtime = _runtime()
         tester = types.SimpleNamespace(
+            bbox=((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), None),
             loadBspModel=mock.Mock(), releaseBspModel=mock.Mock())
         descriptor = _Descriptor()
         descriptor.getHitTesters = lambda: (tester, tester)
@@ -1552,11 +1582,96 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         tester.loadBspModel.assert_called_once_with()
         tester.releaseBspModel.assert_called_once_with()
 
+    def test_prepare_descriptor_owns_bbox_lifecycle_before_shape_read(self):
+        runtime = _runtime()
+        descriptor = _Descriptor('ussr:R11_MS-1', loaded=False)
+        testers = descriptor.getHitTesters()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+
+        self.assertTrue(all(tester.bbox is None for tester in testers))
+
+        self.assertIs(descriptor, factory.prepare_descriptor(descriptor))
+        self.assertEqual(
+            (1.5, 3.5, -0.8, 2.0),
+            tank_collision.chassis_shape(descriptor))
+        factory.prepare_descriptor(descriptor)
+
+        self.assertEqual([1, 1, 1, 1], [
+            tester.load_calls for tester in testers])
+        factory.destroy_all()
+        self.assertTrue(all(
+            not hasattr(tester, 'bbox') for tester in testers))
+        self.assertEqual([1, 1, 1, 1], [
+            tester.release_calls for tester in testers])
+        self.assertNotIn(id(descriptor), tank_collision._SHAPE_CACHE)
+
+    def test_factory_cleanup_forgets_only_owned_descriptor_shapes(self):
+        runtime = _runtime()
+        first = _Descriptor('ussr:R11_MS-1', loaded=False)
+        second = _Descriptor('ussr:R04_T-34', loaded=False)
+        self.addCleanup(tank_collision._SHAPE_CACHE.pop, id(second), None)
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+
+        factory.prepare_descriptor(first)
+        tank_collision.chassis_shape(first)
+        tank_collision._SHAPE_CACHE[id(second)] = (
+            second, (1.0, 2.0, -0.5, 1.5))
+
+        factory.destroy_all()
+
+        self.assertNotIn(id(first), tank_collision._SHAPE_CACHE)
+        self.assertIs(
+            second, tank_collision._SHAPE_CACHE[id(second)][0])
+
+    def test_factory_and_stock_share_idempotent_hit_tester_lifecycle(self):
+        runtime = _runtime()
+        tester = _HitTester1513(
+            _Vector(-1.0, -1.0, -1.0),
+            _Vector(1.0, 1.0, 1.0), loaded=False)
+        planning = _Descriptor('ussr:R11_MS-1', loaded=False)
+        native = _Descriptor('ussr:R11_MS-1', loaded=False)
+        planning.getHitTesters = lambda: (tester,)
+        native.getHitTesters = lambda: (tester,)
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+
+        factory.prepare_descriptor(planning)
+        for shared in native.getHitTesters():
+            shared.loadBspModel()
+        factory.destroy_all()
+        for shared in native.getHitTesters():
+            shared.releaseBspModel()
+
+        self.assertFalse(hasattr(tester, 'bbox'))
+        self.assertEqual(2, tester.load_calls)
+        self.assertEqual(2, tester.release_calls)
+
+    def test_prepare_descriptor_rejects_tester_without_loaded_bbox(self):
+        runtime = _runtime()
+        tester = types.SimpleNamespace(
+            bbox=None, loadBspModel=mock.Mock(),
+            releaseBspModel=mock.Mock())
+        descriptor = _Descriptor()
+        descriptor.getHitTesters = lambda: (tester,)
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+
+        with self.assertRaisesRegex(RuntimeError, 'bbox did not load'):
+            factory.prepare_descriptor(descriptor)
+
+        tester.loadBspModel.assert_called_once_with()
+        tester.releaseBspModel.assert_called_once_with()
+        self.assertEqual({}, factory._hit_testers)
+        factory.destroy_all()
+
     def test_destroy_all_restores_every_owner_after_one_destroy_fails(self):
         runtime = _runtime()
         original_entity = runtime.bigworld.entity
         original_entities = runtime.bigworld.entities
         tester = types.SimpleNamespace(
+            bbox=((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), None),
             loadBspModel=mock.Mock(), releaseBspModel=mock.Mock())
         descriptor = _Descriptor()
         descriptor.getHitTesters = lambda: (tester,)
@@ -2288,6 +2403,24 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.bigworld.now += 0.02
         battle._frame()
         self.assertIn('bot:12', battle._records)
+
+        # VehicleDescr returns unloaded #1513 testers in this full startup
+        # fixture. The resolver must admit every bot descriptor before
+        # BotRuntime reads its collision dimensions, not merely make an
+        # isolated factory unit test pass.
+        bot_descriptors = tuple(battle._bots._descriptors.values())
+        self.assertEqual(2, len(bot_descriptors))
+        for descriptor in bot_descriptors:
+            self.assertTrue(all(
+                tester.bbox is not None
+                for tester in descriptor.getHitTesters()))
+            self.assertEqual(
+                (1.5, 3.5, -0.8, 2.0),
+                tank_collision.chassis_shape(descriptor))
+
+        battle.stop(show_login=False)
+        for descriptor in bot_descriptors:
+            self.assertNotIn(id(descriptor), tank_collision._SHAPE_CACHE)
 
     def test_human_readiness_starts_countdown_while_bots_materialize(self):
         runtime = _runtime()
@@ -4531,6 +4664,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'publicInfo': {'compDescr': 'ussr:R11_MS-1'},
             'health': 500}
         battle._remote_factory = mock.Mock()
+        battle._remote_factory.prepare_descriptor.side_effect = (
+            lambda descriptor: descriptor)
         battle._remote_factory.create.return_value = 1000
         battle._remote_factory.error.return_value = None
         battle._remote_factory.is_ready.return_value = False

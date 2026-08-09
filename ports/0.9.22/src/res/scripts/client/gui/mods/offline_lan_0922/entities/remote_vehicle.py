@@ -14,6 +14,8 @@ import math
 import weakref
 from collections import namedtuple
 
+from gui.mods.offline_lan_0922 import tank_collision
+
 try:
     _STRING_TYPES = (basestring,)
 except NameError:
@@ -767,6 +769,7 @@ class RemoteVehicleFactory(object):
         self._entity_wrapper = None
         self._entities_wrapper = None
         self._hit_testers = {}
+        self._descriptors = {}
         self._shot_presenter = _RemoteShotPresenter(
             bigworld, math_module, model_assembler)
         self.install()
@@ -801,6 +804,51 @@ class RemoteVehicleFactory(object):
                     self._original_entity(entity_id) is None):
                 return entity_id
 
+    def prepare_descriptor(self, descriptor):
+        """Own the BSP testers before any #1513 bbox consumer runs."""
+        get_hit_testers = getattr(descriptor, 'getHitTesters', None)
+        if not callable(get_hit_testers):
+            raise RuntimeError(
+                '#1513 vehicle descriptor hit testers are unavailable')
+        for tester in get_hit_testers():
+            if tester is None:
+                raise RuntimeError('#1513 vehicle hit tester is unavailable')
+            key = id(tester)
+            owned = self._hit_testers.get(key)
+            if owned is tester:
+                continue
+            if owned is not None:
+                raise RuntimeError('#1513 vehicle hit tester identity collided')
+            load = getattr(tester, 'loadBspModel', None)
+            release = getattr(tester, 'releaseBspModel', None)
+            if not callable(load) or not callable(release):
+                raise RuntimeError(
+                    '#1513 vehicle hit tester lifecycle is unavailable')
+            try:
+                load()
+            except Exception as error:
+                try:
+                    release()
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        '#1513 vehicle hit tester BSP load failed: %s; '
+                        'cleanup failed: %s' % (error, cleanup_error))
+                raise RuntimeError(
+                    '#1513 vehicle hit tester BSP load failed: %s' % error)
+            if getattr(tester, 'bbox', None) is None:
+                try:
+                    release()
+                finally:
+                    raise RuntimeError(
+                        '#1513 vehicle hit tester bbox did not load')
+            self._hit_testers[key] = tester
+        key = id(descriptor)
+        owned = self._descriptors.get(key)
+        if owned is not None and owned is not descriptor:
+            raise RuntimeError('#1513 vehicle descriptor identity collided')
+        self._descriptors[key] = descriptor
+        return descriptor
+
     def create(self, descriptor, properties, position, rotation):
         entity_id = self._allocate_id()
         vehicle = Vehicle(
@@ -808,11 +856,7 @@ class RemoteVehicleFactory(object):
             self._shot_presenter)
         self._vehicles[entity_id] = vehicle
         try:
-            for tester in descriptor.getHitTesters():
-                if tester is None or id(tester) in self._hit_testers:
-                    continue
-                tester.loadBspModel()
-                self._hit_testers[id(tester)] = tester
+            self.prepare_descriptor(descriptor)
             assembler = self._model_assembler.prepareCompoundAssembler(
                 descriptor, 'undamaged', self._space_id, False)
             self._bigworld.loadResourceListBG(
@@ -921,6 +965,13 @@ class RemoteVehicleFactory(object):
             except Exception as error:
                 if first_error is None:
                     first_error = error
+        for descriptor in tuple(self._descriptors.values()):
+            try:
+                tank_collision.forget_chassis_shape(descriptor)
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        self._descriptors = {}
         for tester in tuple(self._hit_testers.values()):
             try:
                 tester.releaseBspModel()

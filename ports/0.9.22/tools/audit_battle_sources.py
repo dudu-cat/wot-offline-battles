@@ -93,9 +93,9 @@ PINNED_PORT_SHA256 = {
     'ai/maps_group_b.py': '152aae3d25921998b9436c3fbe2210d6f640c92220cf1729504fd59ce7b952d1',
     'ai/navigation.py': '2a14c8d344d499527678ba66b2e1136710ad537ac7b557a22902def4318a3f1e',
     'ai/planner.py': 'ea3be8d32cde1659fe2656ffbb31d2ebcf933d8d48ecc284931689963304d528',
-    'bot_runtime.py': '669271ee375394ab4160dec33ce24379dfad95c57eb50701412cfb7ecf82185c',
-    'entities/remote_vehicle.py': '868e16c8016bfd753fa9c705c046cca827c9765c69ea35b5e5a77d11d4bf12ae',
-    'tank_collision.py': '4a987001157fb87b4f7636815d433e5c0f4250ca22db8b37ccfd76227fabad89',
+    'bot_runtime.py': 'e1384f96b7c3f545c9e1c1f9cf3260cd0a8a3a754b9e72e4adaf02e3ac82a23d',
+    'entities/remote_vehicle.py': '7a978301827cfecd3d183bae0d0172b828d17a12594e4ca01db7ee203cb85e56',
+    'tank_collision.py': 'e5eaa7f69f88f22a5896f7b5b34031aea278083817c088cbf144de05cdc6d041',
     'vehicle_physics.py': 'e35bbb57611f0708191a1b04ab660379e4ec3d893bad9df816ee442597472441',
     'destructibles_authority.py': 'e9a98d3bd3f30186407142a13cf8f1b035ac9f0c21ff02f46c76b9233b9943ea',
     'destructibles_sensor.py': '3bff54f6fba81ab27411369acf89d709f96f5e23d880b453a110e680fcd34193',
@@ -458,6 +458,7 @@ def audit(repo_root):
         errors.append('battle_runtime.py hard-codes a replacement bot lineup')
     for required in ('_spawn_cache', '_formation_pose',
                      'notifyInputKeysDown', 'RemoteVehicleFactory',
+                     'self._remote_factory.prepare_descriptor(descriptor)',
                      'native_motion=False', 'set_vehicle_pose',
                      'set_vehicle_pose_overlay', '_update_local_presentation',
                      'self._local_model.matrix = self._local_matrix',
@@ -522,6 +523,15 @@ def audit(repo_root):
                      'handoff_canonical_reset'):
         if required not in bot_runtime:
             errors.append('bot_runtime.py does not reuse %s' % required)
+    hull_dimensions = _function_at_any_indent(
+        bot_runtime, '_hull_dimensions') or ''
+    if 'tank_collision.chassis_shape(descriptor)' not in hull_dimensions:
+        errors.append('bot_runtime.py does not derive AI dimensions from '
+                      'the admitted #1513 collision body')
+    for forbidden in ('half_length = 3.5', 'half_width = 1.7'):
+        if forbidden in hull_dimensions:
+            errors.append('bot_runtime.py retains silent collision geometry '
+                          'fallback: %s' % forbidden)
     for forbidden in ('maximum_turn = 0.85', "'affordances': []"):
         if forbidden in bot_runtime:
             errors.append('bot_runtime.py retains replacement law: %s' %
@@ -551,6 +561,10 @@ def audit(repo_root):
     remote_vehicle = _text(os.path.join(
         package, 'entities', 'remote_vehicle.py'))
     for required in ('class RemoteVehicle', 'class RemoteVehicleFactory',
+                     'def prepare_descriptor', 'loadBspModel',
+                     'releaseBspModel', "getattr(tester, 'bbox', None)",
+                     'self._descriptors',
+                     'tank_collision.forget_chassis_shape(descriptor)',
                      "'OfflineEntity'", 'prepareCompoundAssembler',
                      'loadResourceListBG', 'def set_pose',
                      'def collideSegmentExt', 'collide_vehicle_at_matrix',
@@ -970,6 +984,15 @@ def audit(repo_root):
             if forbidden in source:
                 errors.append('%s uses forbidden #1513 mapping access: %s' %
                               (source_name, forbidden))
+    tank_collision = _text(os.path.join(package, 'tank_collision.py'))
+    if 'def forget_chassis_shape(type_descriptor)' not in tank_collision:
+        errors.append('tank_collision.py omits descriptor-scoped shape '
+                      'cache cleanup')
+    if re.search(
+            r'if\s+type_descriptor\s+is\s+None\s*:\s*return\s+DEFAULT_SHAPE',
+            tank_collision):
+        errors.append('tank_collision.py silently substitutes a default body '
+                      'for a missing #1513 descriptor')
     for required in ('world_collision.check_horizontal_collision',
                      'shot_world_distance', "'maxDistance', 5000.0",
                      "event.get('shot_yaw')",

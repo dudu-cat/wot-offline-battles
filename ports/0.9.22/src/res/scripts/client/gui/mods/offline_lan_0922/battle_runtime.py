@@ -896,6 +896,7 @@ class BattleRuntime(object):
             self._remote_factory = RemoteVehicleFactory(
                 self._runtime.bigworld, self._runtime.math,
                 self._runtime.model_assembler, self._avatar.spaceID)
+            self._remote_factory.prepare_descriptor(descriptor)
             builder = EntityPropertyBuilder(
                 BigWorldVehicleBinding.PROPERTY_NAMES)
             self._sender = _LANInputSender(self)
@@ -1474,10 +1475,15 @@ class BattleRuntime(object):
 
     def _resolve_descriptor(self, vehicle_name):
         try:
-            return self._runtime.vehicles.VehicleDescr(typeName=vehicle_name)
+            descriptor = self._runtime.vehicles.VehicleDescr(
+                typeName=vehicle_name)
         except Exception:
-            return self._runtime.vehicles.VehicleDescr(
+            descriptor = self._runtime.vehicles.VehicleDescr(
                 typeName=self._config['vehicle'])
+        if self._remote_factory is None:
+            raise RuntimeError(
+                '#1513 vehicle descriptor geometry owner is unavailable')
+        return self._remote_factory.prepare_descriptor(descriptor)
 
     def _select_bot_vehicle(self, raw):
         requested = raw.get('vehicle')

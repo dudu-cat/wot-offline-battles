@@ -2067,9 +2067,9 @@ class BotRuntimeTests(unittest.TestCase):
                          (state['x'], state['y'], state['z']))
         self.assertEqual(0.0, state['vertical_speed'])
 
-    def test_driver_receives_native_hull_dimensions_and_velocity(self):
+    def test_driver_receives_native_collision_dimensions_and_velocity(self):
         descriptor = _combat_descriptor()
-        descriptor.hull.hitTester = _HitTester1513(
+        descriptor.chassis.hitTester = _HitTester1513(
             (-2.1, -1.0, -4.2), (2.3, 1.0, 3.8))
         self.runtime.descriptor_resolver = lambda unused: descriptor
         self.start['bots'].append(
