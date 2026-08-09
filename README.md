@@ -165,8 +165,9 @@ by Wargaming. World of Tanks and related names are trademarks of their
 respective owners. You must supply your own lawfully obtained 0.8.2 client and
 remain responsible for complying with its terms and the laws that apply to you.
 
-No open-source license has been selected for this repository. Public visibility
-does not by itself grant permission to redistribute or reuse its contents.
+Project code is distributed under the GNU General Public License version 3;
+see `LICENSE` and `THIRD_PARTY_NOTICES.md`. That license does not grant rights
+to the World of Tanks client, assets, trademarks or other Wargaming property.
 
 Debug logging is OFF by default. Turn on  debug_logging  in your config.json if
 you want the mod to write diagnostics into python.log.

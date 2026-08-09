@@ -5,10 +5,16 @@ This review is pinned to the Chinese HD client whose `version.xml` reports
 CPython 2.7 bytecode magic `03 f3 0d 0a`; the embedded build identifies itself
 as Python 2.7.7.
 
-The goal of version 0.3.14 is a complete playable vertical path, not another
+The goal of version 0.3.41 is a complete playable vertical path, not another
 login-only probe: local Account -> stock Lobby/join/map selection -> native map and
-Avatar -> native Vehicle entities -> local movement/aim/fire -> synchronized
+Avatar -> native local Vehicle plus remote presentations -> local movement/aim/fire -> synchronized
 humans and bots -> damage/death/result -> cleanup -> a second round.
+
+The stock `BigWorld.entity`/`entities` facade is an AOI surface, not the LAN
+authority registry. Unspotted or dead synthetic vehicles remain private there;
+only the injected pose/aim resolver reads them for simulation. Native visual
+startup, local Avatar binding, drive and readiness continue through the stock
+facade, so an internal update cannot accidentally reveal an enemy.
 
 The local Account inventory is derived from the pinned client's initialized
 vehicle catalogue. Only definitions that can produce a complete stock vehicle,
@@ -290,9 +296,11 @@ perform the cell-server attachment needed for postmortem spectator switching,
 so the exact switch mailbox rejects the request without falsely updating only
 the HUD.
 
-Vehicle creation uses all properties from the local `Vehicle.def`, the exact
-18-item compressed `VEHICLE_ADDED` tuple, native descriptors and native entity
-creation. Exact bytecode shows that `Vehicle.prerequisites()` builds appearance
+Local Vehicle creation is gated by the complete pinned `Vehicle.def` SHA-256
+`e585c59235ebb2cfbb7857645878ed095360a8efe5df666c055e59a74e6a55c5`,
+uses all of its client properties, and publishes the exact
+18-item compressed `VEHICLE_ADDED` tuple, native descriptors and native local
+entity creation. Exact bytecode shows that `Vehicle.prerequisites()` builds appearance
 resources asynchronously: the id returned from client-only `createEntity` can
 exist before `BigWorld.entity(id)` is available. The bridge therefore separates
 metadata from readiness. Immediately after Avatar creation it creates the local
@@ -344,10 +352,10 @@ refresh, auxiliary track/RPM updates and filter identity outside the scoped
 stacks remain stock. Every scope is removed in `finally`, including when the
 original handler raises; normal online execution delegates untouched.
 
-Remote Vehicles use the same readiness gate. Their newest health and pose are
-coalesced while prerequisites load. A remote removal before world entry leaves
-a round-owned tombstone; if the native callback arrives late, the materialized
-entity is destroyed instead of becoming an untracked tank. Map loading and
+Remote presentations have a separate readiness gate. Their newest health and
+pose are coalesced while the #1513 compound assembler loads. A removal drops
+the synthetic identity immediately; its late resource callback observes the
+missing identity and cannot create an untracked visual. Map loading and local
 Vehicle readiness have independent timeouts, and callback handles carry
 generation tokens so an uncancellable callback from an earlier attempt cannot
 clear a newer round's handle. Two false cross-version assumptions were removed
@@ -360,14 +368,67 @@ during review:
   state uses the native `VEHICLE_KILLED` update and full cleanup uses the
   arena teardown.
 
-Local input drives the real Vehicle entity with bounded kinematic motion,
-client ground/water/slope/obstacle queries and native own-vehicle/HUD updates.
-Remote snapshots are smoothed, while a local echoed pose only corrects drift
-larger than five metres instead of rewinding the player's tank at network
-frequency.
+Local input follows the exact stock path: `PlayerAvatar.moveVehicle` calls
+`WGVehicleFilter.notifyInputKeysDown` and the explicit Avatar mailbox receives
+the same flags. The client-created Vehicle has no retail game-server transform
+stream, so its installed `WGVehiclePhysics` cannot be the authoritative pose
+source. The copied 0.8.2 longitudinal, traverse, terrain and collision
+integrator owns the player pose and publishes it through the exact #1513
+`Vehicle.model.matrix`, `ConsistentMatrices.__setTarget`,
+`PlayerAvatar.getOwnVehicleSpeeds` and `PlayerAvatar.updateOwnVehiclePosition`
+boundaries. The exact consumer audit proves that both `_SpeedStateHandler` and
+stock shot-dispersion calculation read `getOwnVehicleSpeeds`; overriding only
+`Vehicle.getSpeed` leaves the speedometer and movement bloom at zero. This is one pose owner,
+not a second integrator layered over native server motion. The adapter now
+leaves `PlayerAvatar.getOwnVehicleShotDispersionAngle` untouched: #1513 owns
+the visible movement/traverse/turret/shot bloom, with all three motion
+coefficients scaled to 25% so a fast light tank remains usable offline. The
+trusted local shot samples the same read-only
+`VehicleGunRotator.dispersionAngle` before firing, so the smaller HUD circle is
+also the actual shot cone. The copied matrix is installed before the native
+input handler starts and linked into both the attached and own
+`ConsistentMatrices` sources; rebinding only
+`_PlayerAvatar__ownVehicleStabMProv` leaves camera-direction and minimap
+consumers at the spawn translation. During arcade/sniper changes the adapter
+supplies the copied source before the new control's `enable()` and
+`focusOnPos()` calculations run. The post-transition listener only verifies
+that identity and raises on a stale provider. The exact fixed-turret gun path
+receives the same pose through a caller-scoped filter proxy, without replacing
+the native `WGVehicleFilter` object.
+Remote humans and
+bots are different:
+retail `WGVehicleFilter` expects game-server pose samples after its input state,
+and the offline connection has no such stream. The adapter therefore restores
+the 0.8.2 carrier boundary: a Python gameplay vehicle owns authoritative
+pose/health/collision and a separate `OfflineEntity` owns the rendered model.
+The only version-specific substitution is #1513's verified
+`prepareCompoundAssembler` resource path. This restores the map-base formation
+and copied bot integrator without feeding a second physics owner.
+`BigWorld.Entity.teleport` remains forbidden; #1513 rejects it for an in-world
+client Vehicle as `Operation is not allowed`.
+
+The player-visible spotting path now copies the 0.8.2 50-metre proximity,
+two-height static LOS, allied observer relay and five-second memory law. Enemy
+compound models and their stock marker/minimap visuals cross one visibility
+boundary, so an unspotted vehicle cannot remain visible in only one UI layer.
+Authority Bot snapshots also retain the 0.8.2 no-rewind rule: the client that
+integrates a Bot never reapplies its older server echo pose, while other
+clients continue to interpolate those canonical snapshots.
+
+Reload presentation follows #1513's event contract rather than its simulation
+tick. The runtime sends `updateVehicleGunReloadTime` once when a reload starts
+and once when it completes; the stock HUD derives the continuous remaining
+time from `BigWorld.timeExact()`. Re-sending a decreasing value every 100 ms
+restarted the client interpolation on each tick and produced a stepped
+countdown.
 
 The runtime publishes the exact `PREBATTLE` period tuple before enabling the
-round and changes to `BATTLE` only after the countdown. The authority's first
+round and changes to `BATTLE` only after the countdown. `battle_live` is queued
+as the tick-zero wire barrier and the tick thread publishes it before advancing
+or emitting a snapshot. The client rejects an older timing tick, records the
+receive time in the network thread, and projects the deadline on a monotonic
+clock with half the measured RTT; main-thread stalls and wall-clock corrections
+therefore cannot rewind the period. The authority's first
 canonical bot manifest creates local bots without a server round trip, while
 all bot `createEntity` calls are staggered during that countdown. Pose-less
 `battle_start.bots` reservations are never inserted into `SnapshotSync`; doing
@@ -386,12 +447,29 @@ then cancels the local Avatar's shot-wait callback; zero is not a single-shot
 sentinel and leaves the native firing extra unbounded. Remote events use the
 same finite presentation without claiming prediction.
 
+Critical-hit calculation follows the same proposal/commit boundary. The
+firing client runs the copied 0.8.2 device law against an explicit detached
+snapshot of the target descriptor, pose, collision components and critical
+state. That calculation cannot change the live target or invoke native kill
+and damage-panel callbacks. The proposal carries the target's exact base/ack
+token and its pre-critical hull damage separately. If the target was repaired,
+extinguished or otherwise revised before the report arrives, the server keeps
+the ordinary hull damage and shot feedback but rejects the stale module state
+and any obsolete ammo-rack damage amplification explicitly. A monotonic server
+event is delivered before the snapshot containing its new HP/critical state;
+the client presents stock shot results and battle events, then installs the
+accepted revision exactly once.
+Repair reports remain pending until the server acknowledges their proposal
+revision, so a successful socket write or an older snapshot cannot rewind the
+HUD state.
+
 The stock debug controller reads `BigWorld.statPing()` and
 `statLagDetected()`, which report the unavailable retail transport in this
 client-only battle. A scoped, identity-safe `DebugPanel.updateDebugInfo`
 wrapper substitutes only the attached LAN client's measured RTT and connection
 state while the offline battle is active, and restores the stock method during
-shutdown.
+shutdown. The hello frame is sent atomically before `connected` becomes visible
+to the poller, so a ping can never precede the required first protocol frame.
 
 Server health is applied through the entity's health callback and the native
 Avatar vehicle-health path. Crossing zero publishes `VEHICLE_KILLED`; a dead
@@ -413,7 +491,8 @@ The elected authority client runs tactical bots using standard-map annotations,
 vehicle roles, persistent randomized personalities, bounded line-of-sight
 caching and local avoidance of terrain, water, steep slopes, obstacles and
 nearby vehicles. The Python server remains canonical for room phase, HP, shot
-events, elimination and the three-second round reset. The next waiting roster
+events, elimination, capture, timeout and the copied five-second result
+interval. The next waiting roster
 is a synchronization barrier: the previous battle runtime is destroyed before
 either the map picker or a queued next battle can cross the native Lobby/Hangar
 readiness gate. Per-round phase is monotonic, so a delayed same-round waiting
@@ -423,9 +502,37 @@ be reordered across that barrier.
 The pure-data server planner emits revisioned global `bot_orders`, which the
 0.9.22 authority now uses for macro targets after reporting bounded visibility
 observations. BigWorld terrain, collision, water and slope probes remain local,
-and the client planner is a fallback when no server order is available.
-Base-capture rules are not part of 0.3.14; standard battles currently end by
-elimination.
+and the client planner is a fallback when no server order is available. The
+server copies the 0.8.2 standard-mode capture law: a 50-metre radius, one
+update per second, at most three capture points per update, defender stop,
+empty-base reset and victory at 100 points. Standard battles end by
+elimination, capture or the server-owned 15-minute timeout.
+
+This source wiring is not the same as final bot-behavior acceptance. The
+finalized 0.8.2 spawn-congestion/OBB, reverse-steering and baked-route changes
+are migrated as source-derived changes; real-client acceptance still has to
+check them against #1513 terrain and presentation timing.
+
+## Known deterministic parity gaps
+
+The source audit deliberately keeps the following differences visible:
+
+- the offline garage publishes stock configurations with empty optional-device
+  slots. The player gun uses the copied 100% crew plus commander baseline and
+  critical penalties, but passive optional-device, food and crew-perk modifiers
+  are not wired;
+- the server publishes terminal winner/reason/base team plus live frags and the
+  human team-killer flag, but not the complete 0.8.2
+  `personal`/`players`/`vehicles` battle-result record;
+- bot drowning, bot destructible contact and artillery trajectory behavior
+  remain open. The server also trusts authority-client bot gun timing and rays
+  rather than independently validating ammunition and reload legality.
+
+The local player path does include server-relayed critical state, fire,
+drowning, exact fall/landing attribution, small repair/medkit/extinguisher
+activation, native frag/team-killer updates, durable killer/reason metadata,
+and server-deduplicated destructible results for collision and shots.
+`BATTLE_SOURCE_AUDIT.md` is the authoritative per-file accounting.
 
 ## Reference implementations reviewed
 

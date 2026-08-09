@@ -149,6 +149,7 @@ class BootstrapLifecycleTests(unittest.TestCase):
             modifications={12004: types.SimpleNamespace(compactDescr=12004)},
             styles={12005: types.SimpleNamespace(compactDescr=12005)})
         crew_type_ids = []
+        crew_skill_masks = []
         vehicles = types.SimpleNamespace(
             VehicleDescr=vehicle_descr,
             getDefaultAmmoForGun=lambda gun: [gun.compactDescr + 10000, 20],
@@ -161,8 +162,9 @@ class BootstrapLifecycleTests(unittest.TestCase):
                 customization20=lambda: customization))
 
         def generate_tankmen(nation_id, vehicle_type_id, roles,
-                             *unused_args):
+                             is_premium, role_level, skills_mask, is_preview):
             crew_type_ids.append((nation_id, vehicle_type_id))
+            crew_skill_masks.append(skills_mask)
             if (nation_id, vehicle_type_id) == (1, 8):
                 raise ValueError('unloadable crew definition')
             return [
@@ -179,8 +181,12 @@ class BootstrapLifecycleTests(unittest.TestCase):
 
         tankmen = types.SimpleNamespace(
             MAX_SKILL_LEVEL=100,
+            getSkillsMask=lambda skills: (
+                1 << 18 if tuple(skills) ==
+                ('commander_sixthSense',) else 0),
             generateTankmen=generate_tankmen,
-            TankmanDescr=tankman_descr)
+            TankmanDescr=tankman_descr,
+            generatedSkillMasks=crew_skill_masks)
         items = types.ModuleType('items')
         items.ITEM_TYPE_INDICES = {
             'vehicle': 1, 'vehicleChassis': 2, 'vehicleTurret': 3,
@@ -272,6 +278,9 @@ class BootstrapLifecycleTests(unittest.TestCase):
                 set(runtime_vehicles.attemptedTypeIDs)))
         self.assertTrue({(1, 8), (1, 9)}.issubset(
                         set(runtime_vehicles.crewTypeIDs)))
+        self.assertEqual(
+            {1 << 18},
+            set(modules['items'].tankmen.generatedSkillMasks))
         self.assertTrue(
             {(2, 1), (2, 2), (2, 3)}.isdisjoint(
                 set(runtime_vehicles.crewTypeIDs)))

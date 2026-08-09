@@ -2,9 +2,11 @@ import json
 import threading
 import time
 import unittest
+from unittest import mock
 
 from lan_battle_server import (
-    BattleState, CLIENT_BUILD_0922, ClientHandler, Player, PROTOCOL_VERSION,
+    BattleState, CLIENT_BUILD_082, CLIENT_BUILD_0922, ClientHandler, Player,
+    PROTOCOL_VERSION,
 )
 from server_bot_ai import BotPlanner
 
@@ -71,7 +73,7 @@ class ServerBotPlannerTests(unittest.TestCase):
 
         self.assertEqual(len(MAP_POOL), len(set(MAP_POOL)))
         self.assertEqual(33, len(MAP_POOL_082))
-        self.assertEqual(42, len(MAP_POOL_0922))
+        self.assertEqual(41, len(MAP_POOL_0922))
         self.assertEqual({
             "03_campania", "15_komarin", "39_crimea",
             "42_north_america", "51_asia",
@@ -81,7 +83,6 @@ class ServerBotPlannerTests(unittest.TestCase):
             "83_kharkiv", "84_winter", "86_himmelsdorf_winter",
             "92_stalingrad", "95_lost_city", "100_thepit", "101_dday",
             "103_ruinberg_winter", "112_eiffel_tower_ctf", "114_czech",
-            "217_er_alaska",
         }, set(MAP_POOL_0922) - set(MAP_POOL_082))
         with self.assertRaises(ValueError):
             BattleState(map_name="not_a_standard_map")
@@ -101,6 +102,21 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(len(state.bot_roster), len(state.bot_manifest))
         self.assertEqual({value["id"] for value in state.bot_roster},
                          set(state.bot_states))
+
+    def test_manifest_rejects_overlong_route_without_truncation(self):
+        state = self._started_state(players=1)
+        manifest = _wire_manifest(state)
+        manifest[0]['route'] = {
+            'id': 'too-long',
+            'waypoints': [
+                {'x': value, 'y': 0.0, 'z': value, 'hold': False}
+                for value in range(17)
+            ],
+        }
+
+        self.assertFalse(state.update_bot_manifest(1, {'bots': manifest}))
+        self.assertEqual([], state.bot_manifest)
+        self.assertIsNone(state.bot_manifest_authority_id)
 
     def test_empty_full_human_manifest_rejects_injected_bot_atomically(self):
         state = self._started_state(players=30)
@@ -248,6 +264,231 @@ class ServerBotPlannerTests(unittest.TestCase):
             (value["attacker_bot"], value["shot_seq"])
             for value in shots])
 
+    def test_modern_bot_state_requires_explicit_combat_publication_fields(self):
+        state = self._started_state(players=1)
+        state.client_build = CLIENT_BUILD_0922
+        state.tick = 100000
+        self.assertTrue(state.update_bot_manifest(
+            1, {"bots": _wire_manifest(state)}))
+        states = _wire_states(state)
+        for value in states:
+            value.update({"critical": {}, "combat_base_revision": 0,
+                          "combat_seq": 0,
+                          "combat_fire_elapsed": 0.0,
+                          "combat_fire_timer": 0.0})
+        for missing in ("combat_seq", "combat_fire_elapsed",
+                        "combat_fire_timer", "critical"):
+            incomplete = [dict(value) for value in states]
+            incomplete[0].pop(missing)
+            self.assertFalse(state.update_bot_states(
+                1, {"bots": incomplete}), missing)
+        malformed = [dict(value) for value in states]
+        malformed[0]["critical"] = []
+        self.assertFalse(state.update_bot_states(1, {"bots": malformed}))
+        inactive_clock = [dict(value) for value in states]
+        inactive_clock[0]["combat_fire_elapsed"] = 0.2
+        self.assertFalse(state.update_bot_states(
+            1, {"bots": inactive_clock}))
+        self.assertTrue(state.update_bot_states(1, {"bots": states}))
+
+    def test_legacy_bot_state_contract_does_not_require_modern_revisions(self):
+        state = self._started_state(players=1)
+        state.client_build = CLIENT_BUILD_082
+        self.assertTrue(state.update_bot_manifest(
+            1, {"bots": _wire_manifest(state)}))
+        states = _wire_states(state)
+        for value in states:
+            for name in ("combat_revision", "combat_base_revision",
+                         "combat_ack_seq", "combat_seq", "critical",
+                         "combat_fire_elapsed", "combat_fire_timer"):
+                value.pop(name, None)
+
+        self.assertTrue(state.update_bot_states(1, {"bots": states}))
+
+    def test_modern_bot_external_hit_preserves_accepted_publication_prefix(self):
+        state = self._started_state(players=1)
+        state.client_build = CLIENT_BUILD_0922
+        state.tick = 100000
+        self.assertTrue(state.update_bot_manifest(
+            1, {"bots": _wire_manifest(state)}))
+        states = _wire_states(state)
+        first_id = states[0]["id"]
+        second_id = states[1]["id"]
+        for value in states:
+            value.update({"critical": {}, "combat_base_revision": 0,
+                          "combat_seq": 0,
+                          "combat_fire_elapsed": 0.0,
+                          "combat_fire_timer": 0.0})
+        states[0].update(health=450, combat_seq=1)
+        self.assertTrue(state.update_bot_states(1, {"bots": states}))
+        self.assertEqual((1, 0, 1), (
+            state.bot_states[first_id]["combat_revision"],
+            state.bot_states[first_id]["combat_base_revision"],
+            state.bot_states[first_id]["combat_ack_seq"]))
+
+        state.players[1].fire_seq = 2
+        self.assertTrue(state.report_bot_hit(1, {
+            "target": first_id, "shot_seq": 1, "damage": 100}))
+        self.assertEqual((350, 2, 2, 1), (
+            state.bot_states[first_id]["health"],
+            state.bot_states[first_id]["combat_revision"],
+            state.bot_states[first_id]["combat_base_revision"],
+            state.bot_states[first_id]["combat_ack_seq"]))
+
+        self.assertTrue(state.report_bot_hit(1, {
+            "target": second_id, "shot_seq": 2, "damage": 150}))
+        self.assertEqual((350, 1, 1, 0), (
+            state.bot_states[second_id]["health"],
+            state.bot_states[second_id]["combat_revision"],
+            state.bot_states[second_id]["combat_base_revision"],
+            state.bot_states[second_id]["combat_ack_seq"]))
+
+    def test_modern_bot_fire_clock_is_canonical_across_authority_handoff(self):
+        state = self._started_state(players=2)
+        state.client_build = CLIENT_BUILD_0922
+        state.tick = 100000
+        manifest = _wire_manifest(state)
+        self.assertTrue(state.update_bot_manifest(1, {"bots": manifest}))
+        states = _wire_states(state)
+        burning = {
+            "devices": [{
+                "name": "fuelTankHealth", "hp": 0.0,
+                "max_hp": 100.0, "state": "destroyed"}],
+            "destroyed": ["fuelTankHealth"], "crew_ko": [],
+            "fire": True, "ammo_rack_death": False, "events": [],
+        }
+        for value in states:
+            value.update({"critical": {}, "combat_base_revision": 0,
+                          "combat_seq": 0,
+                          "combat_fire_elapsed": 0.0,
+                          "combat_fire_timer": 0.0})
+        states[0].update(
+            critical=burning, health=300, combat_seq=1,
+            combat_fire_elapsed=4.4, combat_fire_timer=0.4)
+        self.assertTrue(state.update_bot_states(1, {"bots": states}))
+        bot_id = states[0]["id"]
+
+        state.remove_player(1)
+        self.assertTrue(state.update_bot_manifest(2, {"bots": manifest}))
+
+        self.assertEqual(2, state.bot_authority_id)
+        canonical = state.bot_states[bot_id]
+        self.assertEqual(4.4, canonical["combat_fire_elapsed"])
+        self.assertEqual(0.4, canonical["combat_fire_timer"])
+        self.assertTrue(canonical["critical"]["fire"])
+
+    def test_player_ignition_gets_frag_on_final_burnout_tick(self):
+        state = self._started_state(players=1)
+        state.client_build = CLIENT_BUILD_0922
+        state.tick = 100000
+        self.assertTrue(state.update_bot_manifest(
+            1, {"bots": _wire_manifest(state)}))
+        target = next(value for value in state.bot_states.values()
+                      if value["team"] != state.players[1].team)
+        target["health"] = 25
+        target["display_health"] = 25
+        state.players[1].fire_seq = 1
+        burning = {
+            "devices": [{
+                "name": "fuelTankHealth", "hp": 0.0,
+                "max_hp": 100.0, "state": "destroyed"}],
+            "destroyed": ["fuelTankHealth"], "crew_ko": [],
+            "fire": True, "ammo_rack_death": False,
+            "events": [{"kind": "fire", "state": True,
+                        "cause": "shot"}],
+        }
+        self.assertTrue(state.report_bot_hit(1, {
+            "target": target["id"], "shot_seq": 1,
+            "damage": 0, "hull_damage": 0,
+            "critical_target_base_revision":
+                target["combat_base_revision"],
+            "critical_target_ack_seq": target["combat_ack_seq"],
+            "critical": burning}))
+
+        states = _wire_states(state)
+        for value in states:
+            value["combat_seq"] = value["combat_ack_seq"]
+        publication = next(value for value in states
+                           if value["id"] == target["id"])
+        burnt_out = {
+            "devices": [{
+                "name": "fuelTankHealth", "hp": 40.0,
+                "max_hp": 100.0, "state": "critical"}],
+            "destroyed": [], "crew_ko": [], "fire": False,
+            "ammo_rack_death": False, "events": [],
+        }
+        publication.update(
+            health=0, alive=False, critical=burnt_out,
+            combat_seq=publication["combat_ack_seq"] + 1,
+            combat_fire_elapsed=0.0, combat_fire_timer=0.0)
+        self.assertTrue(state.update_bot_states(1, {"bots": states}))
+
+        dead = state.bot_states[target["id"]]
+        self.assertEqual(1, state.players[1].frags)
+        self.assertEqual("player", dead["death_attacker_kind"])
+        self.assertEqual(1, dead["death_attacker_id"])
+        event = [value for value in state.pending_events
+                 if value.get("source") == "fire"][-1]
+        self.assertEqual(25, event["damage"])
+
+    def test_bot_ignition_gets_frag_on_final_burnout_tick(self):
+        state = self._started_state(players=1)
+        state.client_build = CLIENT_BUILD_0922
+        state.tick = 100000
+        self.assertTrue(state.update_bot_manifest(
+            1, {"bots": _wire_manifest(state)}))
+        attacker = next(value for value in state.bot_states.values()
+                        if value["team"] == state.players[1].team)
+        target = next(value for value in state.bot_states.values()
+                      if value["team"] != attacker["team"])
+        target["health"] = 25
+        target["display_health"] = 25
+        initial = _wire_states(state)
+        for value in initial:
+            value["combat_seq"] = value["combat_ack_seq"]
+        next(value for value in initial
+             if value["id"] == attacker["id"])["fire_seq"] = 1
+        self.assertTrue(state.update_bot_states(1, {"bots": initial}))
+        burning = {
+            "devices": [{
+                "name": "fuelTankHealth", "hp": 0.0,
+                "max_hp": 100.0, "state": "destroyed"}],
+            "destroyed": ["fuelTankHealth"], "crew_ko": [],
+            "fire": True, "ammo_rack_death": False,
+            "events": [{"kind": "fire", "state": True,
+                        "cause": "shot"}],
+        }
+        self.assertTrue(state.report_bot_hit(1, {
+            "attacker_bot": attacker["id"], "target": target["id"],
+            "shot_seq": 1, "damage": 0, "hull_damage": 0,
+            "critical_target_base_revision":
+                target["combat_base_revision"],
+            "critical_target_ack_seq": target["combat_ack_seq"],
+            "critical": burning}))
+
+        states = _wire_states(state)
+        for value in states:
+            value["combat_seq"] = value["combat_ack_seq"]
+        publication = next(value for value in states
+                           if value["id"] == target["id"])
+        burnt_out = {
+            "devices": [{
+                "name": "fuelTankHealth", "hp": 40.0,
+                "max_hp": 100.0, "state": "critical"}],
+            "destroyed": [], "crew_ko": [], "fire": False,
+            "ammo_rack_death": False, "events": [],
+        }
+        publication.update(
+            health=0, alive=False, critical=burnt_out,
+            combat_seq=publication["combat_ack_seq"] + 1,
+            combat_fire_elapsed=0.0, combat_fire_timer=0.0)
+        self.assertTrue(state.update_bot_states(1, {"bots": states}))
+
+        self.assertEqual(1, state.bot_states[attacker["id"]]["frags"])
+        dead = state.bot_states[target["id"]]
+        self.assertEqual("bot", dead["death_attacker_kind"])
+        self.assertEqual(attacker["id"], dead["death_attacker_id"])
+
     def test_authority_failover_preserves_bot_fire_sequence_without_replay(self):
         state = self._started_state(players=2)
         manifest = _wire_manifest(state)
@@ -331,6 +572,12 @@ class ServerBotPlannerTests(unittest.TestCase):
             health=100, max_health=500, alive=True)
         player.fire_seq = 9
         player.client_position = True
+        player.critical = {
+            "devices": [], "destroyed": ["fuelTankHealth"],
+            "crew_ko": [], "fire": True,
+            "ammo_rack_death": False, "events": []}
+        player.death_reason = 5
+        player.display_health = 100
         state.players[1] = player
         state.phase = "battle"
         self.assertTrue(state._finish_battle(1, "team_eliminated"))
@@ -344,6 +591,9 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertTrue(player.alive)
         self.assertEqual(0, player.fire_seq)
         self.assertFalse(player.client_position)
+        self.assertEqual({}, player.critical)
+        self.assertEqual(0, player.death_reason)
+        self.assertIsNone(player.display_health)
         self.assertEqual([], state.bot_manifest)
         self.assertEqual({}, state.bot_states)
         self.assertEqual("roster", connection.messages[-1]["type"])
@@ -474,6 +724,81 @@ class ServerBotPlannerTests(unittest.TestCase):
             event.get("kind") == "battle_result"
             for event in state.pending_events))
 
+    def test_authority_ram_applies_both_mass_weighted_damage_sides_once(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        state.bot_authority_id = 1
+        state.bot_manifest_authority_id = 1
+        state.players[1] = Player(
+            1, object(), ("127.0.0.1", 0), team=1)
+        state.players[2] = Player(
+            2, object(), ("127.0.0.1", 0), team=2,
+            x=1.0, z=0.0, health=1000, max_health=1000)
+        state.bot_manifest = [{
+            "id": 11, "team": 1, "slot": 1, "name": "RamBot",
+            "vehicle": "ussr:R11_MS-1", "max_health": 500}]
+        state.bot_roster = list(state.bot_manifest)
+        state.bot_states[11] = {
+            "id": 11, "team": 1, "alive": True, "health": 500,
+            "max_health": 500, "fire_seq": 0, "shell_index": 0,
+            "x": 0.0, "y": 0.0, "z": 0.0}
+        report = {
+            "bot_id": 11, "target_kind": "human", "target_id": 2,
+            "ram_seq": 1, "damage_to_bot": 20,
+            "damage_to_target": 80}
+
+        self.assertTrue(state.report_bot_ram(1, report))
+        self.assertEqual(480, state.bot_states[11]["health"])
+        self.assertEqual(920, state.players[2].health)
+        ram_events = [event for event in state.pending_events
+                      if event.get("source") == "ram"]
+        self.assertEqual(2, len(ram_events))
+        self.assertFalse(state.report_bot_ram(1, report))
+        self.assertFalse(state.report_bot_ram(2, dict(report, ram_seq=2)))
+        self.assertEqual(480, state.bot_states[11]["health"])
+        self.assertEqual(920, state.players[2].health)
+
+    def test_ram_pair_cooldown_survives_authority_failover(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        state.bot_authority_id = 1
+        state.bot_manifest_authority_id = 1
+        state.players[1] = Player(
+            1, object(), ("127.0.0.1", 1), team=1)
+        state.players[2] = Player(
+            2, object(), ("127.0.0.1", 2), team=1)
+        state.players[3] = Player(
+            3, object(), ("127.0.0.1", 3), team=2,
+            x=1.0, z=0.0, health=1000, max_health=1000)
+        state.bot_manifest = [{
+            "id": 11, "team": 1, "slot": 1, "name": "RamBot",
+            "vehicle": "ussr:R11_MS-1", "max_health": 500}]
+        state.bot_states[11] = {
+            "id": 11, "team": 1, "alive": True, "health": 500,
+            "max_health": 500, "fire_seq": 0, "shell_index": 0,
+            "x": 0.0, "y": 0.0, "z": 0.0}
+        report = {
+            "round_id": state.round_id,
+            "bot_id": 11, "target_kind": "human", "target_id": 3,
+            "ram_seq": 1, "damage_to_bot": 20,
+            "damage_to_target": 80}
+
+        with mock.patch('lan_battle_server.time.monotonic',
+                        side_effect=(10.0, 10.25, 10.8)):
+            self.assertTrue(state.report_bot_ram(1, report))
+            state.bot_authority_id = 2
+            state.bot_manifest_authority_id = 2
+            self.assertFalse(state.report_bot_ram(
+                2, dict(report, ram_seq=2)))
+            self.assertTrue(state.report_bot_ram(
+                2, dict(report, ram_seq=3)))
+
+        self.assertEqual(460, state.bot_states[11]["health"])
+        self.assertEqual(840, state.players[3].health)
+        ram_events = [event for event in state.pending_events
+                      if event.get("source") == "ram"]
+        self.assertEqual(4, len(ram_events))
+
     def test_bot_state_fire_edge_creates_visual_shot_event(self):
         state = BattleState(map_name="04_himmelsdorf")
         state.phase = "battle"
@@ -491,8 +816,11 @@ class ServerBotPlannerTests(unittest.TestCase):
 
         self.assertTrue(state.update_bot_states(1, {"bots": [{
             "id": 11, "x": 0, "y": 0, "z": 1, "yaw": 0,
-            "health": 1000, "alive": True, "fire_seq": 1}]}))
+            "health": 1000, "alive": True, "fire_seq": 1,
+            "shot_yaw": 1.25, "shot_pitch": 0.15}]}))
         self.assertEqual("bot_shot", state.pending_events[-1]["kind"])
+        self.assertEqual(1.25, state.pending_events[-1]["shot_yaw"])
+        self.assertEqual(0.15, state.pending_events[-1]["shot_pitch"])
 
     def test_dead_bot_cannot_emit_late_visual_shot_edge(self):
         state = BattleState(map_name="04_himmelsdorf")
@@ -524,7 +852,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         second = planner.build_orders(_manifest(), _states(), [], 0.1)
         self.assertEqual(1, first["revision"])
         self.assertEqual(first, second)
-        self.assertEqual({"advance"}, {order["combat_mode"] for order in first["orders"]})
+        self.assertEqual({"route"}, {order["combat_mode"] for order in first["orders"]})
 
     def test_unchanged_orders_are_omitted_from_following_snapshots(self):
         class CaptureConnection(object):
@@ -559,9 +887,10 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(1, accepted)
         result = planner.build_orders(_manifest(), _states(), players, 1.0)
         team_one = [order for order in result["orders"] if order["team"] == 1]
-        self.assertEqual(99, team_one[0]["target_id"])
-        self.assertEqual({"x": 40.0, "y": 0.0, "z": 30.0}, team_one[0]["aim_position"])
-        self.assertTrue(team_one[0]["fire_allowed"])
+        targeted = [order for order in team_one if order["target_id"] == 99]
+        self.assertEqual(1, len(targeted))
+        self.assertEqual({"x": 40.0, "y": 0.0, "z": 30.0}, targeted[0]["aim_position"])
+        self.assertTrue(targeted[0]["fire_allowed"])
 
     def test_unreported_player_and_stale_contact_do_not_leak_target(self):
         planner = BotPlanner()
@@ -630,6 +959,52 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual("heavy_city", order["route_id"])
         self.assertEqual(1, order["route_index"])
         self.assertEqual({"x": 60.0, "y": 0.0, "z": -20.0}, order["move_position"])
+        self.assertEqual({"x": 0.0, "y": 0.0, "z": -20.0}, order["route_anchor"])
+
+    def test_deployed_bot_skips_a_rear_facing_route_connector(self):
+        planner = BotPlanner()
+        manifest = _manifest()
+        manifest[0]["route"] = {
+            "id": "rear_connector",
+            "waypoints": [
+                {"x": 0, "y": 0, "z": -40},
+                {"x": 0, "y": 0, "z": -65},
+                {"x": 40, "y": 0, "z": 40},
+            ],
+        }
+        states = _states()
+        states[0] = dict(states[0], x=0, z=-20, yaw=0.0)
+
+        result = planner.build_orders(manifest, states, [], 0.0)
+        order = next(value for value in result["orders"] if value["id"] == 1)
+
+        self.assertEqual(2, order["route_index"])
+        self.assertEqual(
+            {"x": 40.0, "y": 0.0, "z": 40.0}, order["move_position"])
+        self.assertEqual(
+            {"x": 0.0, "y": 0.0, "z": -20.0}, order["route_anchor"])
+
+    def test_route_hold_metadata_does_not_pause_travel(self):
+        planner = BotPlanner()
+        manifest = _manifest()
+        manifest[0]['route'] = {
+            'id': 'held_lane',
+            'waypoints': [
+                {'x': 0, 'y': 0, 'z': -40},
+                {'x': 0, 'y': 0, 'z': -20, 'hold': True},
+                {'x': 0, 'y': 0, 'z': 200},
+            ],
+        }
+
+        result = planner.build_orders(manifest, _states(), [], 1.0)
+        order = next(value for value in result['orders']
+                     if value['id'] == 1)
+
+        self.assertEqual(2, order['route_index'])
+        self.assertEqual(
+            {'x': 0.0, 'y': 0.0, 'z': 200.0}, order['move_position'])
+        self.assertEqual('route', order['combat_mode'])
+        self.assertIsNone(order['throttle_override'])
 
     def test_client_probed_cover_drives_a_hold_peek_return_cycle(self):
         planner = BotPlanner()
@@ -659,7 +1034,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         approach = planner.build_orders(manifest, _states(), players, 1.0)
         approach_order = next(value for value in approach["orders"] if value["id"] == 1)
         self.assertEqual("take_cover", approach_order["combat_mode"])
-        self.assertFalse(approach_order["fire_allowed"])
+        self.assertTrue(approach_order["fire_allowed"])
 
         at_cover = _states()
         at_cover[0] = dict(at_cover[0], x=-8.0, z=-12.0)
@@ -670,7 +1045,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         peek = planner.build_orders(manifest, at_cover, players, 3.0)
         peek_order = next(value for value in peek["orders"] if value["id"] == 1)
         self.assertEqual("cover_peek", peek_order["combat_mode"])
-        self.assertFalse(peek_order["fire_allowed"])
+        self.assertTrue(peek_order["fire_allowed"])
 
         at_peek = _states()
         at_peek[0] = dict(at_peek[0], x=-2.0, z=-10.0)
@@ -682,7 +1057,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         returning = planner.build_orders(manifest, at_peek, players, 5.5)
         returning_order = next(value for value in returning["orders"] if value["id"] == 1)
         self.assertEqual("cover_return", returning_order["combat_mode"])
-        self.assertFalse(returning_order["fire_allowed"])
+        self.assertTrue(returning_order["fire_allowed"])
 
     def test_cover_report_requires_an_existing_team_contact(self):
         planner = BotPlanner()

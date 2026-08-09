@@ -82,8 +82,98 @@ EXPECTED_ABI = {
     'scripts/common/items/vehicles.pyc': {
         'VehicleDescr': ('compactDescr', 'typeID', 'typeName'),
         'getDefaultAmmoForGun': ('gunDescr',),
+        'Cache.equipments': ('self',),
         'Cache.customization20': ('self',),
         'VehicleList.getList': ('self', 'nationID'),
+    },
+    'scripts/common/items/components/legacy_stuff.pyc': {
+        'NoLegacyStuff.get': ('self', 'k', 'd'),
+        'NoLegacyStuff.__getitem__': ('self', 'item'),
+    },
+    'scripts/common/items/components/shared_components.pyc': {
+        'DeviceHealth.__init__': (
+            'self', 'maxHealth', 'repairCost', 'maxRegenHealth'),
+    },
+    'scripts/common/items/vehicle_items.pyc': {
+        'InstallableItem.maxHealth': ('self',),
+        'InstallableItem.maxRegenHealth': ('self',),
+        'Engine.__init__': (
+            'self', 'typeID', 'componentID', 'componentName',
+            'compactDescr', 'level'),
+    },
+    'scripts/client/vehicle_systems/model_assembler.pyc': {
+        'prepareCompoundAssembler': (
+            'vehicleDesc', 'modelStateName', 'spaceID',
+            'isTurretDetached'),
+        'setupTurretRotations': ('appearance',),
+        'assembleRecoil': ('appearance', 'lodLink'),
+    },
+    'scripts/client/OfflineEntity.pyc': {
+        'OfflineEntity.__init__': ('self',),
+        'OfflineEntity.prerequisites': ('self',),
+        'OfflineEntity.onEnterWorld': ('self', 'prereqs'),
+        'OfflineEntity.onLeaveWorld': ('self',),
+        'OfflineEntity.collideSegment': (
+            'self', 'startPoint', 'endPoint', 'skipGun'),
+    },
+    'scripts/client/ProjectileMover.pyc': {
+        'segmentMayHitEntity': ('entity', 'startPoint', 'endPoint'),
+        'collideEntities': (
+            'startPoint', 'endPoint', 'entities', 'skipGun'),
+        'getCollidableEntities': ('exceptIDs', 'startPoint', 'endPoint'),
+    },
+    'scripts/client/helpers/EffectsList.pyc': {
+        '_ShotSoundEffectDesc.create': ('self', 'model', 'list', 'args'),
+    },
+    'scripts/client/gui/battle_control/controllers/feedback_adaptor.pyc': {
+        'BattleFeedbackAdaptor.startVehicleVisual': (
+            'self', 'vProxy', 'isImmediate'),
+        'BattleFeedbackAdaptor.stopVehicleVisual': (
+            'self', 'vehicleID', 'isPlayerVehicle'),
+    },
+    'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
+    'markers.pyc': {
+        'VehicleMarker.attach': ('self', 'vProxy'),
+        'VehicleMarker.fetchMatrixProvider': ('cls', 'vProxy'),
+        'VehicleMarker.getHealth': ('self',),
+        'VehicleMarker.isAlive': ('self',),
+    },
+    'scripts/client/AvatarPositionControl.pyc': {
+        'ConsistentMatrices.__setTarget': ('self', 'matrix', 'asStatic'),
+        'ConsistentMatrices.__linkOwnVehicle': ('self', 'vehicle'),
+    },
+    'scripts/client/AvatarInputHandler/DynamicCameras/ArcadeCamera.pyc': {
+        'ArcadeCamera.create': (
+            'self', 'pivotPos', 'onChangeControlMode', 'postmortemMode'),
+        'ArcadeCamera.enable': (
+            'self', 'preferredPos', 'closesDist', 'postmortemParams',
+            'turretYaw', 'gunPitch'),
+        'ArcadeCamera.__setVehicleMProv': ('self', 'vehicleMProv'),
+        'ArcadeCamera.__getVehicleMProv': ('self',),
+    },
+    'scripts/client/AvatarInputHandler/AimingSystems/'
+    'ArcadeAimingSystem.pyc': {
+        'ArcadeAimingSystem.__setVehicleMProv': ('self', 'value'),
+        'ArcadeAimingSystem.enable': (
+            'self', 'targetPos', 'turretYaw', 'gunPitch'),
+        'ArcadeAimingSystem.focusOnPos': ('self', 'preferredPos'),
+    },
+    'scripts/client/AvatarInputHandler/AimingSystems/'
+    'SniperAimingSystem.pyc': {
+        'SniperAimingSystem.enable': (
+            'self', 'targetPos', 'playerGunMatFunction'),
+        'SniperAimingSystem.focusOnPos': ('self', 'preferredPos'),
+        'SniperAimingSystem.__worldYawPitchToTurret': (
+            'self', 'worldYaw', 'worldPitch'),
+    },
+    'scripts/client/AvatarInputHandler/AimingSystems/'
+    'steady_vehicle_matrix.pyc': {
+        'SteadyVehicleMatrixCalculator.relinkSources': ('self',),
+    },
+    'scripts/client/gui/battle_control/matrix_factory.pyc': {
+        'makeArcadeCameraMatrix': (),
+        'makeAttachedVehicleMatrix': (),
+        'makeOwnVehicleMatrix': (),
     },
     'scripts/common/items/VehicleDescrCrew.pyc': {
         'VehicleDescrCrew.__init__': (
@@ -153,10 +243,14 @@ EXPECTED_ABI = {
         'PlayerAvatar.__setIsOnArena': ('self', 'onArena'),
         'PlayerAvatar.__onInitStepCompleted': ('self',),
         'PlayerAvatar.moveVehicle': ('self', 'flags', 'isKeyDown'),
+        'PlayerAvatar.targetFocus': ('self', 'entity'),
         'PlayerAvatar.shoot': ('self', 'isRepeat'),
         'PlayerAvatar.cancelWaitingForShot': ('self',),
         'PlayerAvatar.__showTimedOutShooting': ('self',),
         'PlayerAvatar.vehicle_onEnterWorld': ('self', 'vehicle'),
+        'PlayerAvatar.__startVehicleVisual': ('self', 'vehicle'),
+        'PlayerAvatar.getOwnVehicleMatrix': ('self',),
+        'PlayerAvatar.getOwnVehicleStabilisedMatrix': ('self',),
         'PlayerAvatar.updateVehicleHealth': (
             'self', 'vehicleID', 'health', 'deathReasonID', 'isCrewActive',
             'isRespawn'),
@@ -165,35 +259,123 @@ EXPECTED_ABI = {
         'PlayerAvatar.updateVehicleAmmo': (
             'self', 'vehicleID', 'compactDescr', 'quantity',
             'quantityInClip', 'timeRemaining'),
+        'PlayerAvatar.__processVehicleEquipments': (
+            'self', 'vehicleID', 'compactDescr', 'quantity',
+            'stage', 'timeRemaining'),
         'PlayerAvatar.updateVehicleSetting': (
             'self', 'vehicleID', 'code', 'value'),
+        'PlayerAvatar.updateVehicleMiscStatus': (
+            'self', 'vehicleID', 'code', 'intArg', 'floatArgs'),
+        'PlayerAvatar.updateVehicleDestroyTimer': (
+            'self', 'code', 'period', 'warnLvl'),
+        'PlayerAvatar.showVehicleDamageInfo': (
+            'self', 'vehicleID', 'damageIndex', 'extraIndex', 'entityID',
+            'equipmentID'),
+        'PlayerAvatar.showOwnVehicleHitDirection': (
+            'self', 'hitDirYaw', 'attackerID', 'damage', 'crits',
+            'isBlocked', 'isShellHE', 'damagedID'),
         'PlayerAvatar.updateOwnVehiclePosition': (
             'self', 'position', 'direction', 'speed', 'rspeed'),
+        'PlayerAvatar.getOwnVehicleSpeeds': (
+            'self', 'getInstantaneous'),
         'PlayerAvatar.updateTargetingInfo': (
             'self', 'turretYaw', 'gunPitch', 'maxTurretRotationSpeed',
             'maxGunRotationSpeed', 'shotDispMultiplierFactor',
             'gunShotDispersionFactorsTurretRotation',
             'chassisShotDispersionFactorsMovement',
             'chassisShotDispersionFactorsRotation', 'aimingTime'),
+        'PlayerAvatar.updateGunMarker': (
+            'self', 'vehicleID', 'shotPos', 'shotVec', 'dispersionAngle'),
+        'PlayerAvatar.getOwnVehicleShotDispersionAngle': (
+            'self', 'turretRotationSpeed', 'withShot'),
         'PlayerAvatar.syncVehicleAttrs': ('self', 'attrs'),
         'PlayerAvatar.updateArena': ('self', 'updateType', 'argStr'),
         'PlayerAvatar.onRoundFinished': ('self', 'winnerTeam', 'reason'),
     },
+    'scripts/client/AvatarInputHandler/__init__.pyc': {
+        'AvatarInputHandler.onControlModeChanged': (
+            'self', 'eMode', '**args'),
+        'AvatarInputHandler.__onArenaStarted': (
+            'self', 'period', '*args'),
+    },
     'scripts/client/Vehicle.pyc': {
         'Vehicle.__init__': ('self',),
         'Vehicle.__startWGPhysics': ('self',),
+        'Vehicle.getSpeed': ('self',),
+        'Vehicle.onPushed': ('self', 'x', 'z'),
         'Vehicle.prerequisites': ('self', 'respawnCompactDescr'),
         'Vehicle.onEnterWorld': ('self', 'prereqs'),
         'Vehicle.onLeaveWorld': ('self',),
         'Vehicle.showShooting': ('self', 'burstCount', 'isPredictedShot'),
+        'Vehicle.showAmmoBayEffect': (
+            'self', 'mode', 'fireballVolume', 'projectedTurretSpeed'),
         'Vehicle.set_health': ('self', 'prev'),
         'Vehicle.set_isCrewActive': ('self', 'prev'),
         'Vehicle.set_gunAnglesPacked': ('self', 'prev'),
+        'Vehicle.getServerGunAngles': ('self',),
         'Vehicle.getAimParams': ('self',),
+        'Vehicle.collideSegmentExt': ('self', 'startPoint', 'endPoint'),
+        'Vehicle.drawEdge': ('self', 'forceSimpleEdge'),
+        'Vehicle.onHealthChanged': (
+            'self', 'newHealth', 'attackerID', 'attackReasonID'),
+    },
+    'scripts/client/VehicleGunRotator.pyc': {
+        'VehicleGunRotator.update': (
+            'self', 'turretYaw', 'gunPitch', 'maxTurretRotationSpeed',
+            'maxGunRotationSpeed'),
+        'VehicleGunRotator.setShotPosition': (
+            'self', 'vehicleID', 'shotPos', 'shotVec',
+            'dispersionAngle', 'forceValueRefresh'),
+        'VehicleGunRotator.__syncWithServerTurretYaw': (
+            'self', 'turretYaw'),
+        'VehicleGunRotator.__trackPointOnServer': (
+            'self', 'shotPoint'),
+        'VehicleGunRotator.getAvatarOwnVehicleStabilisedMatrix': ('self',),
+        'VehicleGunRotator.getCurShotPosition': ('self',),
+        'VehicleGunRotator.__getShotPosition': (
+            'self', 'turretYaw', 'gunPitch'),
+        'VehicleGunRotator.__rotate': ('self', 'shotPoint', 'timeDiff'),
+    },
+    'scripts/client/AreaDestructibles.pyc': {
+        'init': (),
+        'clear': (),
+        'AreaDestructibles.set_fallenTrees': ('self', 'prev'),
+        'AreaDestructibles.set_fallenColumns': ('self', 'prev'),
+        'AreaDestructibles.set_destroyedFragiles': ('self', 'prev'),
+        'AreaDestructibles.set_destroyedModules': ('self', 'prev'),
+        'DestructiblesManager.startSpace': ('self', 'spaceID'),
+        'DestructiblesManager.getSpaceID': ('self',),
+        'DestructiblesManager.getController': ('self', 'chunkID'),
+        'DestructiblesManager.onChunkLoad': (
+            'self', 'chunkID', 'numDestructibles'),
+        'DestructiblesManager.isChunkLoaded': ('self', 'chunkID'),
+        'DestructiblesManager.orderDestructibleDestroy': (
+            'self', 'chunkID', 'dmgType', 'destrData',
+            'isNeedAnimation', 'syncWithProjectile'),
+    },
+    'scripts/common/DestructiblesCache.pyc': {
+        'encodeFallenColumn': ('destrIndex', 'fallYaw', 'fallSpeed'),
+        'encodeFallenTree': (
+            'destrIndex', 'fallYaw', 'fallPitchConstr', 'fallSpeed'),
+        'encodeDestructibleModule': (
+            'destrID', 'matKind', 'isShotDamage'),
     },
     'scripts/client/vehicle_systems/CompoundAppearance.pyc': {
+        'CompoundAppearance.__linkCompound': ('self',),
         'CompoundAppearance.__onModelsRefresh': (
             'self', 'modelState', 'resourceList'),
+        'CompoundAppearance.setupGunMatrixTargets': ('self', 'target'),
+        'CompoundAppearance.changeVisibility': ('self', 'modelVisible'),
+        'CompoundAppearance.deactivate': ('self', 'stopEffects'),
+    },
+    'scripts/client/gui/battle_control/controllers/consumables/'
+    'equipment_ctrl.pyc': {
+        '_ExpandedItem.getActivationCode': (
+            'self', 'entityName', 'avatar'),
+        '_ExtinguisherItem.getActivationCode': (
+            'self', 'entityName', 'avatar'),
+        'EquipmentsController.setEquipment': (
+            'self', 'intCD', 'quantity', 'stage', 'timeRemaining'),
     },
     'scripts/client/OfflineMapCreator.pyc': {
         'OfflineMapCreator.create': ('self', 'mapName'),
@@ -230,6 +412,13 @@ EXPECTED_ABI = {
     'scripts/client/gui/battle_control/controllers/arena_load_ctrl.pyc': {
         'ArenaLoadController.invalidateArenaInfo': ('self',),
         'ArenaLoadController.arenaLoadCompleted': ('self',),
+    },
+    'scripts/client/gui/battle_control/controllers/period_ctrl.pyc': {
+        'ArenaPeriodController._calculate': ('self',),
+        'ArenaPeriodController.__tick': ('self',),
+    },
+    'scripts/client/gui/battle_control/controllers/vehicle_state_ctrl.pyc': {
+        '_SpeedStateHandler._invalidate': ('self', 'vehicle'),
     },
     'scripts/client/gui/battle_control/controllers/repositories.pyc': {
         'SharedControllersLocator.arenaLoad': ('self',),
@@ -293,12 +482,41 @@ EXPECTED_ABI = {
         'TrainingWindowMeta.as_setDataS': ('self', 'info', 'mapsData'),
     },
     'scripts/client_common/ClientArena.pyc': {
+        'ClientArena.__init__': (
+            'self', 'arenaUniqueID', 'arenaTypeID', 'arenaBonusType',
+            'arenaGuiType', 'arenaExtraData', 'weatherPresetID'),
         'ClientArena.update': ('self', 'updateType', 'argStr'),
+        'ClientArena.__onBasePointsUpdate': ('self', 'argStr'),
+        'ClientArena.__onBaseCaptured': ('self', 'argStr'),
         'ClientArena.__onVehicleListUpdate': ('self', 'argStr'),
         'ClientArena.__onVehicleAddedUpdate': ('self', 'argStr'),
         'ClientArena.__onPeriodInfoUpdate': ('self', 'argStr'),
         'ClientArena.__onVehicleKilled': ('self', 'argStr'),
+        'ClientArena.__onVehicleStatisticsUpdate': ('self', 'argStr'),
+        'ClientArena.__vehicleStatisticsAsDict': ('self', 'stats'),
+        'ClientArena.__onTeamKiller': ('self', 'argStr'),
         'ClientArena.__onAvatarReady': ('self', 'argStr'),
+    },
+    'scripts/client/gui/battle_control/arena_info/listeners.pyc': {
+        'ArenaTeamBasesListener.__arena_onTeamBasePointsUpdate': (
+            'self', 'team', 'baseID', 'points', 'timeLeft',
+            'invadersCnt', 'capturingStopped'),
+        'ArenaTeamBasesListener.__arena_onTeamBaseCaptured': (
+            'self', 'team', 'baseID'),
+    },
+    'scripts/client/gui/battle_control/arena_info/interfaces.pyc': {
+        'ITeamsBasesController.invalidateTeamBasePoints': (
+            'self', 'baseTeam', 'baseID', 'points', 'timeLeft',
+            'invadersCnt', 'capturingStopped'),
+        'ITeamsBasesController.invalidateTeamBaseCaptured': (
+            'self', 'baseTeam', 'baseID'),
+    },
+    'scripts/client/gui/battle_control/controllers/team_bases_ctrl.pyc': {
+        'BattleTeamsBasesController.invalidateTeamBasePoints': (
+            'self', 'baseTeam', 'baseID', 'points', 'timeLeft',
+            'invadersCnt', 'capturingStopped'),
+        'BattleTeamsBasesController.invalidateTeamBaseCaptured': (
+            'self', 'baseTeam', 'baseID'),
     },
     'scripts/client/gui/game_control/RefSystem.pyc': {
         '_getRefSysCfg': ('itemsCache',),
@@ -356,12 +574,23 @@ EXPECTED_ABI = {
 # These literals are direct string subscripts or native-method names in exact
 # #1513 consumers. Producer contract tests verify dictionary payload shapes.
 EXPECTED_CODE_LITERALS = {
+    'scripts/common/items/components/legacy_stuff.pyc': {
+        'NoLegacyStuff.get': ('Operation is not allowed',),
+        'NoLegacyStuff.__getitem__': ('Operation is not allowed',),
+    },
     'scripts/client/Avatar.pyc': {
         'PlayerAvatar.__onSetOwnVehicleAuxPhysicsData': (
             'syncStabilisedYPR',),
     },
     'scripts/client/Vehicle.pyc': {
         'Vehicle.set_gunAnglesPacked': ('syncGunAngles',),
+    },
+    'scripts/client/ProjectileMover.pyc': {
+        'segmentMayHitEntity': ('segmentMayHitEntity',),
+    },
+    'scripts/client_common/ClientArena.pyc': {
+        'ClientArena.__vehicleStatisticsAsDict': ('frags',),
+        'ClientArena.__onTeamKiller': ('isTeamKiller',),
     },
     'scripts/client_common/ClientChat.pyc': {
         'ClientChat.__dataTimeProcessor': ('time', 'sentTime'),
@@ -401,6 +630,25 @@ EXPECTED_CODE_LITERALS = {
 # string payload literals cannot express.  They are the exact #1513 APIs the
 # offline Account preservation and native lobby-ready gate depend on.
 EXPECTED_CODE_NAMES = {
+    'scripts/common/items/components/legacy_stuff.pyc': {
+        'NoLegacyStuff.get': ('AssertionError',),
+        'NoLegacyStuff.__getitem__': ('AssertionError',),
+    },
+    'scripts/common/items/components/shared_components.pyc': {
+        'DeviceHealth.__init__': ('maxHealth', 'maxRegenHealth'),
+    },
+    'scripts/common/items/vehicle_items.pyc': {
+        'InstallableItem.maxHealth': ('healthParams', 'maxHealth'),
+        'InstallableItem.maxRegenHealth': (
+            'healthParams', 'maxRegenHealth'),
+        'Engine.__init__': ('fireStartingChance',),
+    },
+    'scripts/client/vehicle_systems/model_assembler.pyc': {
+        'setupTurretRotations': (
+            'compoundModel', 'node', 'turretMatrix', 'gunMatrix'),
+        'assembleRecoil': (
+            'compoundModel', 'node', 'gunRecoil', 'createGunAnimator'),
+    },
     'scripts/client/Account.pyc': {
         'PlayerAccount.onBecomePlayer': ('BigWorld', 'clearAllSpaces'),
         'PlayerAccount.onBecomeNonPlayer': (
@@ -419,12 +667,35 @@ EXPECTED_CODE_NAMES = {
         'PlayerAvatar.vehicle_onEnterWorld': (
             'playerVehicleID', 'VEHICLE_ENTERED',
             '_PlayerAvatar__onInitStepCompleted'),
+        'PlayerAvatar.__startVehicleVisual': (
+            '_PlayerAvatar__ownVehicleStabMProv', 'target',
+            'stabilisedMatrix', 'matrix'),
+        'PlayerAvatar.getOwnVehicleMatrix': (
+            'getObservedVehicleMatrix', '_PlayerAvatar__ownVehicleMProv'),
+        'PlayerAvatar.getOwnVehicleStabilisedMatrix': (
+            '_PlayerAvatar__ownVehicleStabMProv',),
         'PlayerAvatar.__onInitStepCompleted': ('setClientReady',),
         'PlayerAvatar.__onArenaPeriodChange': (
             '_PlayerAvatar__setIsOnArena', 'ARENA_PERIOD', 'BATTLE'),
         'PlayerAvatar.__setIsOnArena': (
             'moveVehicle', 'makeVehicleMovementCommandByKeys'),
-        'PlayerAvatar.moveVehicle': ('base', 'vehicle_moveWith'),
+        'PlayerAvatar.moveVehicle': (
+            'filter', 'notifyInputKeysDown', 'base', 'vehicle_moveWith'),
+        'PlayerAvatar.getOwnVehicleSpeeds': (
+            'BigWorld', 'entity', 'playerVehicleID', 'speedInfo', 'value'),
+        'PlayerAvatar.__onSetOwnVehicleAuxPhysicsData': (
+            'unpackAuxVehiclePhysicsData', 'guiSessionProvider',
+            'invalidateVehicleState', 'VEHICLE_VIEW_STATE', 'RPM'),
+        'PlayerAvatar.showOwnVehicleHitDirection': (
+            '_PlayerAvatar__isVehicleAlive', 'guiSessionProvider',
+            'addHitDirection'),
+        'PlayerAvatar.updateGunMarker': (
+            'gunRotator', 'setShotPosition'),
+        'PlayerAvatar.getOwnVehicleShotDispersionAngle': (
+            'getOwnVehicleSpeeds', 'shotDispersionAngle'),
+        'PlayerAvatar.targetFocus': (
+            '_PlayerAvatar__vehicles', 'guiSessionProvider',
+            'setTargetInFocus', 'drawEdge'),
         'PlayerAvatar.shoot': (
             'base', 'vehicle_shoot', '_PlayerAvatar__startWaitingForShot'),
         'PlayerAvatar.__showTimedOutShooting': (
@@ -432,20 +703,226 @@ EXPECTED_CODE_NAMES = {
         'PlayerAvatar.cancelWaitingForShot': (
             'BigWorld', 'cancelCallback', 'setAimingMode',
             'targetLastShotPoint'),
+        'PlayerAvatar.updateVehicleMiscStatus': (
+            'VEHICLE_MISC_STATUS', 'VEHICLE_DROWN_WARNING',
+            'updateVehicleDestroyTimer'),
+        'PlayerAvatar.updateVehicleDestroyTimer': (
+            'DROWN_WARNING_LEVEL', 'DANGER', 'CAUTION',
+            'guiSessionProvider', 'invalidateVehicleState'),
+        'PlayerAvatar.__processVehicleEquipments': (
+            'vehicles', 'getItemByCompactDescr', 'guiSessionProvider',
+            'equipments', 'setEquipment'),
+    },
+    'scripts/client/gui/battle_control/controllers/period_ctrl.pyc': {
+        'ArenaPeriodController._calculate': (
+            '_endTime', 'BigWorld', 'serverTime'),
+        'ArenaPeriodController.__tick': (
+            '_calculate', '_updateCountdown'),
+    },
+    'scripts/client/gui/battle_control/controllers/vehicle_state_ctrl.pyc': {
+        '_SpeedStateHandler._invalidate': (
+            'BigWorld', 'player', 'getOwnVehicleSpeeds', 'speedInfo',
+            'value', 'SPEED', 'MAX_SPEED'),
     },
     'scripts/client/Vehicle.pyc': {
         'Vehicle.__startWGPhysics': ('filter', 'syncGunAngles', 'speedInfo'),
+        'Vehicle.getSpeed': ('_Vehicle__speedInfo', 'value'),
+        'Vehicle.getServerGunAngles': (
+            'decodeGunAngles', 'gunAnglesPacked', 'typeDescriptor'),
+        'Vehicle.onPushed': ('filter', 'setPosition'),
         'Vehicle.prerequisites': (
             'typeDescriptor', 'appearance_cache', 'createAppearance'),
         'Vehicle.onEnterWorld': (
             'vehicle_onEnterWorld', 'sendStateToOwnClient'),
+        'Vehicle.onLeaveWorld': (
+            '_Vehicle__stopExtras', 'BigWorld', 'player',
+            'vehicle_onLeaveWorld', 'isStarted'),
         'Vehicle.showShooting': (
             'typeDescriptor', 'extrasDict', 'stopFor', 'startFor',
             'isPlayerVehicle', 'cancelWaitingForShot'),
+        'Vehicle.showAmmoBayEffect': ('appearance', 'showAmmoBayEffect'),
+        'Vehicle.collideSegmentExt': (
+            '_Vehicle__collideSegment',),
+        'Vehicle.drawEdge': ('appearance', 'highlighter', 'highlight'),
+    },
+    'scripts/client/ProjectileMover.pyc': {
+        # The native method name is a dynamic getattr string literal, while
+        # ``filter`` and ``getattr`` are the actual CPython name-table entries.
+        'segmentMayHitEntity': ('getattr', 'filter'),
+        'collideEntities': (
+            'collideSegment', 'EntityCollisionData',
+            'hitAngleCos', 'armor'),
+        'getCollidableEntities': (
+            'arena', 'vehicles', 'entity', 'isStarted',
+            'segmentMayHitEntity'),
+    },
+    'scripts/client/helpers/EffectsList.pyc': {
+        '_ShotSoundEffectDesc.create': (
+            'isAlive', 'isStarted', 'appearance', 'engineAudition',
+            'getSoundObject', 'play', 'setRTPC'),
+    },
+    'scripts/client/gui/battle_control/controllers/feedback_adaptor.pyc': {
+        'BattleFeedbackAdaptor.startVehicleVisual': (
+            'id', 'getVehicleInfo', 'isObserver', 'team',
+            'isPlayerVehicle'),
+        'BattleFeedbackAdaptor.startVehicleVisual.__addVehicleToUI': (
+            'onVehicleMarkerAdded', 'onMinimapVehicleAdded', 'isAlive'),
+        'BattleFeedbackAdaptor.stopVehicleVisual': (
+            'onVehicleMarkerRemoved', 'onMinimapVehicleRemoved'),
+    },
+    'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
+    'markers.pyc': {
+        'VehicleMarker.attach': ('appearance', 'onModelChanged'),
+        'VehicleMarker.fetchMatrixProvider': ('model', 'node'),
+        'VehicleMarker.getHealth': ('health',),
+        'VehicleMarker.isAlive': ('isAlive',),
+    },
+    'scripts/client/AvatarPositionControl.pyc': {
+        'ConsistentMatrices.__setTarget': (
+            '_ConsistentMatrices__attachedVehicleMatrix', 'target',
+            'onVehicleMatrixBindingChanged'),
+        'ConsistentMatrices.__linkOwnVehicle': (
+            'filter', 'WGVehicleFilter',
+            '_ConsistentMatrices__ownVehicleMProv', 'target',
+            'bodyMatrix', 'matrix'),
+    },
+    'scripts/client/AvatarInputHandler/DynamicCameras/ArcadeCamera.pyc': {
+        'ArcadeCamera.create': (
+            'getTargetMProv', 'BigWorld', 'player', 'matrix',
+            '_ArcadeCamera__aimingSystem'),
+        'ArcadeCamera.enable': (
+            'getVehicleAttached', 'getOwnVehicleMatrix', 'vehicleMProv',
+            '_ArcadeCamera__aimingSystem', 'enable'),
+        'ArcadeCamera.__setVehicleMProv': (
+            '_ArcadeCamera__refineVehicleMProv',
+            '_ArcadeCamera__setupCameraProviders', 'vehicleMProv'),
+        'ArcadeCamera.__getVehicleMProv': (
+            '_ArcadeCamera__aimingSystem', 'vehicleMProv', 'source'),
+    },
+    'scripts/client/AvatarInputHandler/AimingSystems/'
+    'ArcadeAimingSystem.pyc': {
+        'ArcadeAimingSystem.__setVehicleMProv': (
+            '_ArcadeAimingSystem__vehicleMProv',
+            '_ArcadeAimingSystem__cursor', 'base'),
+        'ArcadeAimingSystem.enable': (
+            'focusOnPos', '_ArcadeAimingSystem__adjustFocus'),
+        'ArcadeAimingSystem.focusOnPos': (
+            '_ArcadeAimingSystem__vehicleMProv',
+            '_ArcadeAimingSystem__cursor',
+            '_ArcadeAimingSystem__getLookToAimMatrix'),
+    },
+    'scripts/client/AvatarInputHandler/AimingSystems/'
+    'SniperAimingSystem.pyc': {
+        'SniperAimingSystem.enable': (
+            'steadyVehicleMatrixCalculator', 'outputMProv', 'focusOnPos'),
+        'SniperAimingSystem.focusOnPos': (
+            '_SniperAimingSystem__getPlayerGunMat',
+            '_SniperAimingSystem__worldYaw',
+            '_SniperAimingSystem__worldPitch',
+            '_SniperAimingSystem__worldYawPitchToTurret'),
+        'SniperAimingSystem.__worldYawPitchToTurret': (
+            '_SniperAimingSystem__vehicleMProv',),
+    },
+    'scripts/client/AvatarInputHandler/AimingSystems/'
+    'steady_vehicle_matrix.pyc': {
+        'SteadyVehicleMatrixCalculator.relinkSources': (
+            'BigWorld', 'player', 'getVehicleAttached', 'filter',
+            'groundPlacingMatrixFiltered', 'stabilisedMatrix',
+            '_SteadyVehicleMatrixCalculator__outputMProv', 'rotationSrc',
+            'translationSrc',
+            '_SteadyVehicleMatrixCalculator__stabilisedMProv', 'target'),
+    },
+    'scripts/client/gui/battle_control/matrix_factory.pyc': {
+        'makeArcadeCameraMatrix': (
+            'getOwnVehicleMatrix', 'translationSrc', 'camera',
+            'invViewMatrix', 'rotationSrc'),
+        'makeAttachedVehicleMatrix': (
+            'consistentMatrices', 'attachedVehicleMatrix'),
+        'makeOwnVehicleMatrix': (
+            'consistentMatrices', 'ownVehicleMatrix'),
+    },
+    'scripts/client/gui/battle_control/controllers/consumables/'
+    'equipment_ctrl.pyc': {
+        '_ExpandedItem.getActivationCode': (
+            'isEntityRequired', 'makeExtraName', 'index'),
+        '_ExtinguisherItem.getActivationCode': ('id',),
+    },
+    'scripts/client/AreaDestructibles.pyc': {
+        'AreaDestructibles.set_fallenTrees': (
+            'orderDestructibleDestroy', 'DESTR_TYPE_TREE'),
+        'AreaDestructibles.set_fallenColumns': (
+            'orderDestructibleDestroy', 'DESTR_TYPE_FALLING_ATOM'),
+        'AreaDestructibles.set_destroyedFragiles': (
+            'decodeFragile', 'DESTR_TYPE_FRAGILE'),
+        'AreaDestructibles.set_destroyedModules': (
+            'decodeDestructibleModule', 'DESTR_TYPE_STRUCTURE'),
+        'DestructiblesManager.orderDestructibleDestroy': (
+            'DESTR_TYPE_FRAGILE', 'DESTR_TYPE_STRUCTURE',
+            'decodeFragile', 'decodeDestructibleModule'),
+    },
+    'scripts/common/DestructiblesCache.pyc': {
+        'encodeFallenColumn': ('int', 'PI', 'PI_2'),
+        'encodeFallenTree': ('int', 'PI', 'PI_2'),
+        'encodeDestructibleModule': ('int',),
     },
     'scripts/client/vehicle_systems/CompoundAppearance.pyc': {
+        'CompoundAppearance.__linkCompound': (
+            '_CompoundAppearance__vehicle',
+            '_CompoundAppearance__compoundModel', 'model', 'matrix'),
         'CompoundAppearance.__onModelsRefresh': (
             '_CompoundAppearance__filter', 'syncGunAngles'),
+        'CompoundAppearance.setupGunMatrixTargets': (
+            '_CompoundAppearance__filter', 'turretMatrix', 'gunMatrix',
+            'target'),
+        'CompoundAppearance.changeVisibility': (
+            'compoundModel', 'visible', 'showStickers',
+            '_CompoundAppearance__crashedTracksCtrl', 'setVisible'),
+        'CompoundAppearance.deactivate': (
+            'BigWorld', 'player', 'inputHandler',
+            'removeVehicleFromCameraCollider', 'arena',
+            'onPeriodChange', 'onCameraChanged'),
+    },
+    'scripts/client/VehicleGunRotator.pyc': {
+        'VehicleGunRotator.update': (
+            '_VehicleGunRotator__avatar',
+            'getOwnVehicleShotDispersionAngle',
+            '_VehicleGunRotator__dispersionAngles'),
+        'VehicleGunRotator.setShotPosition': (
+            '_VehicleGunRotator__dispersionAngles',),
+        'VehicleGunRotator.__syncWithServerTurretYaw': (
+            '_VehicleGunRotator__avatar', 'vehicle',
+            'getServerGunAngles', 'LatencyInfo'),
+        'VehicleGunRotator.__trackPointOnServer': (
+            '_VehicleGunRotator__avatar', 'playerVehicleID',
+            'trackRelativePointWithGun'),
+        'VehicleGunRotator.getAvatarOwnVehicleStabilisedMatrix': (
+            '_VehicleGunRotator__avatar',
+            'getOwnVehicleStabilisedMatrix',
+            '_VehicleGunRotator__getTurretStaticYaw', 'filter',
+            'interpolateStabilisedMatrix', 'BigWorld', 'time'),
+        'VehicleGunRotator.getCurShotPosition': (
+            '_VehicleGunRotator__getShotPosition',),
+        'VehicleGunRotator.__getShotPosition': (
+            'getAvatarOwnVehicleStabilisedMatrix', 'applyPoint',
+            'applyVector'),
+        'VehicleGunRotator.__rotate': (
+            'getAvatarOwnVehicleStabilisedMatrix', 'getShotAngles',
+            '_VehicleGunRotator__updateTurretMatrix',
+            '_VehicleGunRotator__updateGunMatrix'),
+    },
+    'scripts/client_common/ClientArena.pyc': {
+        'ClientArena.__init__': (
+            'EventManager', 'onTeamBasePointsUpdate',
+            'onTeamBaseCaptured'),
+        'ClientArena.__onBasePointsUpdate': (
+            'cPickle', 'loads', 'onTeamBasePointsUpdate'),
+        'ClientArena.__onBaseCaptured': (
+            'cPickle', 'loads', 'onTeamBaseCaptured'),
+        'ClientArena.__onVehicleStatisticsUpdate': (
+            '_ClientArena__vehicleStatisticsAsDict', 'cPickle', 'loads',
+            'zlib', 'decompress', 'onVehicleStatisticsUpdate'),
+        'ClientArena.__onTeamKiller': (
+            'cPickle', 'loads', 'onTeamKiller'),
     },
     'scripts/client_common/ClientChat.pyc': {
         'ClientChat.__init__': ('_ClientChat__chatActionCallbacks',),
@@ -596,10 +1073,59 @@ EXPECTED_GLOBALS = {
 
 
 EXPECTED_CLASS_CONSTANTS = {
+    'scripts/client/Avatar.pyc': {
+        '_MOVEMENT_FLAGS': {
+            'FORWARD': 1,
+            'BACKWARD': 2,
+            'ROTATE_LEFT': 4,
+            'ROTATE_RIGHT': 8,
+            'CRUISE_CONTROL50': 16,
+            'CRUISE_CONTROL25': 32,
+            'BLOCK_TRACKS': 64,
+        },
+    },
     'scripts/common/constants.pyc': {
         'ARENA_PERIOD': {
             'PREBATTLE': 2,
             'BATTLE': 3,
+        },
+        'DROWN_WARNING_LEVEL': {
+            'SAFE': 0,
+            'CAUTION': 1,
+            'DANGER': 2,
+        },
+        'VEHICLE_MISC_STATUS': {
+            'VEHICLE_DROWN_WARNING': 4,
+        },
+        'ATTACK_REASON': {
+            'SHOT': 'shot',
+            'FIRE': 'fire',
+            'RAM': 'ramming',
+            'WORLD_COLLISION': 'world_collision',
+            'DEATH_ZONE': 'death_zone',
+            'DROWNING': 'drowning',
+        },
+        'VEHICLE_SETTING': {
+            'CURRENT_SHELLS': 0,
+            'NEXT_SHELLS': 1,
+            'AUTOROTATION_ENABLED': 2,
+            'SIEGE_MODE_ENABLED': 3,
+            'ACTIVATE_EQUIPMENT': 16,
+            'RELOAD_PARTIAL_CLIP': 17,
+        },
+        'AMMOBAY_DESTRUCTION_MODE': {
+            'POWDER_BURN_OFF': 0,
+            'POWDER_EXPLOSION': 1,
+            'HE_DETONATION': 2,
+        },
+        'ARENA_UPDATE': {
+            'VEHICLE_ADDED': 2,
+            'PERIOD': 3,
+            'STATISTICS': 4,
+            'VEHICLE_STATISTICS': 5,
+            'VEHICLE_KILLED': 6,
+            'AVATAR_READY': 7,
+            'TEAM_KILLER': 10,
         },
     },
     'scripts/client/gui/app_loader/settings.pyc': {
@@ -634,6 +1160,47 @@ EXPECTED_FILTER_SYNC_CALLS = frozenset((
     ('scripts/client/vehicle_systems/CompoundAppearance.pyc',
      'CompoundAppearance.__onModelsRefresh', 'syncGunAngles'),
 ))
+
+
+# A method signature cannot reveal that an exposed value is getter-only.
+# The #1513 gun rotator creates this property with property(getter), and a
+# direct assignment terminates the offline startup with "can't set attribute".
+EXPECTED_READ_ONLY_PROPERTIES = {
+    'scripts/client/VehicleGunRotator.pyc': {
+        'VehicleGunRotator': ('dispersionAngle',),
+    },
+}
+
+
+# The pinned producer returns a mutable two-element list, and the consumer
+# later updates element zero in place.  Returning a tuple from an adapter
+# passes signature checks but fails deterministically in setShotPosition().
+EXPECTED_LIST_RETURNS = {
+    'scripts/client/Avatar.pyc': {
+        'PlayerAvatar.getOwnVehicleShotDispersionAngle': 2,
+    },
+}
+
+EXPECTED_SUBSCRIPT_MUTATIONS = {
+    'scripts/client/VehicleGunRotator.pyc': {
+        'VehicleGunRotator.setShotPosition': (
+            '_VehicleGunRotator__dispersionAngles', 0),
+    },
+}
+
+EXPECTED_UNPACK_WIDTHS = {
+    'scripts/client_common/ClientArena.pyc': {
+        'ClientArena.__onBasePointsUpdate': 6,
+        'ClientArena.__onBaseCaptured': 2,
+    },
+}
+
+EXPECTED_CALL_WIDTHS = {
+    'scripts/client_common/ClientArena.pyc': {
+        'ClientArena.__onBasePointsUpdate': 6,
+        'ClientArena.__onBaseCaptured': 2,
+    },
+}
 
 
 def _signature(code):
@@ -692,6 +1259,96 @@ def _module_constant_globals(code):
     return result
 
 
+def _instructions(code):
+    result = []
+    bytecode = code.co_code
+    index = 0
+    extended = 0
+    while index < len(bytecode):
+        offset = index
+        operation = ord(bytecode[index])
+        index += 1
+        argument = None
+        if operation >= opcode.HAVE_ARGUMENT:
+            argument = (ord(bytecode[index]) |
+                        (ord(bytecode[index + 1]) << 8) |
+                        extended)
+            index += 2
+            if operation == opcode.EXTENDED_ARG:
+                extended = argument << 16
+            else:
+                extended = 0
+        value = None
+        if argument is not None:
+            if operation in opcode.hasconst:
+                value = code.co_consts[argument]
+            elif operation in opcode.hasname:
+                value = code.co_names[argument]
+        result.append({
+            'offset': offset,
+            'opname': opcode.opname[operation],
+            'argument': argument,
+            'value': value,
+        })
+    return result
+
+
+def _is_read_only_property(class_code, property_name):
+    instructions = _instructions(class_code)
+    for index, instruction in enumerate(instructions):
+        if (instruction['opname'] != 'STORE_NAME' or
+                instruction['value'] != property_name or index < 4):
+            continue
+        window = instructions[index - 4:index + 1]
+        if ([item['opname'] for item in window] == [
+                'LOAD_NAME', 'LOAD_CONST', 'MAKE_FUNCTION',
+                'CALL_FUNCTION', 'STORE_NAME'] and
+                window[0]['value'] == 'property' and
+                isinstance(window[1]['value'], types.CodeType) and
+                window[3]['argument'] == 1):
+            return True
+    return False
+
+
+def _returns_list(code, width):
+    instructions = _instructions(code)
+    for index, instruction in enumerate(instructions[:-1]):
+        if (instruction['opname'] == 'BUILD_LIST' and
+                instruction['argument'] == width and
+                instructions[index + 1]['opname'] == 'RETURN_VALUE'):
+            return True
+    return False
+
+
+def _mutates_subscript(code, attribute_name, index_value):
+    instructions = _instructions(code)
+    for index, instruction in enumerate(instructions):
+        if (instruction['opname'] != 'LOAD_ATTR' or
+                instruction['value'] != attribute_name):
+            continue
+        window = instructions[index:index + 4]
+        if (len(window) >= 3 and
+                window[1]['opname'] == 'LOAD_CONST' and
+                window[1]['value'] == index_value and
+                window[2]['opname'] == 'STORE_SUBSCR'):
+            return True
+    return False
+
+
+def _unpacks_width(code, width):
+    return any(
+        instruction['opname'] == 'UNPACK_SEQUENCE' and
+        instruction['argument'] == width
+        for instruction in _instructions(code))
+
+
+def _calls_width(code, width):
+    return any(
+        instruction['opname'] == 'CALL_FUNCTION' and
+        instruction['argument'] == width
+        for instruction in _instructions(code))
+
+
 def _read_module_contract(archive, member):
     payload = archive.read(member)
     if payload[:4] != '\x03\xf3\r\n':
@@ -738,12 +1395,22 @@ def audit(client_root):
     checked_globals = []
     checked_class_constants = []
     checked_filter_sync_calls = []
+    checked_read_only_properties = []
+    checked_list_returns = []
+    checked_subscript_mutations = []
+    checked_unpack_widths = []
+    checked_call_widths = []
     errors = []
     with zipfile.ZipFile(package_path, 'r') as archive:
         names = set(archive.namelist())
         members = (set(EXPECTED_ABI) | set(EXPECTED_CODE_LITERALS) |
                    set(EXPECTED_CODE_NAMES) | set(EXPECTED_GLOBALS) |
-                   set(EXPECTED_CLASS_CONSTANTS))
+                   set(EXPECTED_CLASS_CONSTANTS) |
+                   set(EXPECTED_READ_ONLY_PROPERTIES) |
+                   set(EXPECTED_LIST_RETURNS) |
+                   set(EXPECTED_SUBSCRIPT_MUTATIONS) |
+                   set(EXPECTED_UNPACK_WIDTHS) |
+                   set(EXPECTED_CALL_WIDTHS))
         for member in sorted(members):
             if member not in names:
                 errors.append('missing bytecode member: %s' % member)
@@ -825,6 +1492,78 @@ def audit(client_root):
                         checked_class_constants.append(
                             '%s:%s.%s=%r' %
                             (member, class_name, name, expected_value))
+            for class_name, properties in sorted(
+                    EXPECTED_READ_ONLY_PROPERTIES.get(member, {}).items()):
+                class_code = code_objects.get(class_name)
+                if class_code is None:
+                    errors.append(
+                        '%s: missing class body %s for properties' %
+                        (member, class_name))
+                    continue
+                for property_name in properties:
+                    if not _is_read_only_property(
+                            class_code, property_name):
+                        errors.append(
+                            '%s: %s.%s is not the expected getter-only '
+                            'property' %
+                            (member, class_name, property_name))
+                    else:
+                        checked_read_only_properties.append(
+                            '%s:%s.%s' %
+                            (member, class_name, property_name))
+            for name, width in sorted(
+                    EXPECTED_LIST_RETURNS.get(member, {}).items()):
+                code = code_objects.get(name)
+                if code is None:
+                    errors.append('%s: missing %s for list return' %
+                                  (member, name))
+                elif not _returns_list(code, width):
+                    errors.append(
+                        '%s: %s does not return a %d-element list' %
+                        (member, name, width))
+                else:
+                    checked_list_returns.append(
+                        '%s:%s:list[%d]' % (member, name, width))
+            for name, mutation in sorted(
+                    EXPECTED_SUBSCRIPT_MUTATIONS.get(member, {}).items()):
+                code = code_objects.get(name)
+                attribute_name, index_value = mutation
+                if code is None:
+                    errors.append('%s: missing %s for subscript mutation' %
+                                  (member, name))
+                elif not _mutates_subscript(
+                        code, attribute_name, index_value):
+                    errors.append(
+                        '%s: %s does not mutate %s[%r]' %
+                        (member, name, attribute_name, index_value))
+                else:
+                    checked_subscript_mutations.append(
+                        '%s:%s:%s[%r]' %
+                        (member, name, attribute_name, index_value))
+            for name, width in sorted(
+                    EXPECTED_UNPACK_WIDTHS.get(member, {}).items()):
+                code = code_objects.get(name)
+                if code is None:
+                    errors.append('%s: missing %s for unpack width' %
+                                  (member, name))
+                elif not _unpacks_width(code, width):
+                    errors.append('%s: %s does not unpack %d values' %
+                                  (member, name, width))
+                else:
+                    checked_unpack_widths.append(
+                        '%s:%s:unpack[%d]' % (member, name, width))
+            for name, width in sorted(
+                    EXPECTED_CALL_WIDTHS.get(member, {}).items()):
+                code = code_objects.get(name)
+                if code is None:
+                    errors.append('%s: missing %s for call width' %
+                                  (member, name))
+                elif not _calls_width(code, width):
+                    errors.append('%s: %s does not call with %d values' %
+                                  (member, name, width))
+                else:
+                    checked_call_widths.append(
+                        '%s:%s:call[%d]' % (member, name, width))
         actual_filter_sync_calls = _find_filter_sync_calls(archive)
         missing_filter_calls = (
             EXPECTED_FILTER_SYNC_CALLS - actual_filter_sync_calls)
@@ -849,12 +1588,23 @@ def audit(client_root):
         'checkedConstantGlobals': len(checked_globals),
         'checkedClassConstants': len(checked_class_constants),
         'checkedFilterSyncCalls': len(checked_filter_sync_calls),
+        'checkedReadOnlyProperties': len(
+            checked_read_only_properties),
+        'checkedListReturns': len(checked_list_returns),
+        'checkedSubscriptMutations': len(checked_subscript_mutations),
+        'checkedUnpackWidths': len(checked_unpack_widths),
+        'checkedCallWidths': len(checked_call_widths),
         'contracts': checked,
         'consumerLiterals': checked_literals,
         'codeNames': checked_names,
         'constantGlobals': checked_globals,
         'classConstants': checked_class_constants,
         'filterSyncCalls': checked_filter_sync_calls,
+        'readOnlyProperties': checked_read_only_properties,
+        'listReturns': checked_list_returns,
+        'subscriptMutations': checked_subscript_mutations,
+        'unpackWidths': checked_unpack_widths,
+        'callWidths': checked_call_widths,
     }
 
 

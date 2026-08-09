@@ -109,6 +109,7 @@ class _BattleRuntime(object):
         self.restore_accounts = []
         self.snapshots = []
         self.events = []
+        self.rosters = []
 
     def start(self, config, message=None, lan_client=None,
               on_local_leave=None):
@@ -123,6 +124,9 @@ class _BattleRuntime(object):
 
     def on_events(self, message):
         self.events.append(message)
+
+    def on_roster(self, message):
+        self.rosters.append(message)
 
     def stop(self, show_login=True, restore_account=True):
         self.stopped.append(show_login)
@@ -817,6 +821,47 @@ class LANSessionTests(unittest.TestCase):
         self.emit('battle_start', second)
         self.assertEqual(2, len(self.battle_runtime.started))
 
+    def test_departed_round_ignores_same_round_runtime_messages_until_waiting_reset(self):
+        start = {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]}
+        self.emit('battle_start', start)
+        self.battle_runtime.on_battle_live = mock.Mock()
+
+        self.assertTrue(
+            self.battle_runtime.started[0]['on_local_leave']())
+
+        # LANClient applies the transport phase before notifying LANSession.
+        # A current phase=battle roster still cannot reclaim the stopped Avatar.
+        self.client.phase = 'battle'
+        self.emit('roster', {
+            'phase': 'battle', 'round_id': 7,
+            'bot_authority_id': 'p2', 'players': start['players']})
+        self.emit('battle_live', {'round_id': 7})
+        self.emit('snapshot', {'round_id': 7, 'server_tick': 1})
+        self.emit('events', {
+            'round_id': 7, 'server_tick': 1, 'events': []})
+        self.emit('battle_start', start)
+
+        self.assertEqual(1, len(self.battle_runtime.started))
+        self.assertEqual([], self.battle_runtime.rosters)
+        self.battle_runtime.on_battle_live.assert_not_called()
+        self.assertEqual([], self.battle_runtime.snapshots)
+        self.assertEqual([], self.battle_runtime.events)
+        self.assertFalse(self.session._battle_started)
+        self.assertIsNone(self.session._active_round_id)
+        self.assertEqual(7, self.session._departed_round_id)
+        self.assertEqual('awaiting_round_end', self.session.state)
+
+        self.client.phase = 'waiting'
+        self.emit('roster', {
+            'phase': 'waiting', 'round_id': 8,
+            'map_pool': ['05_prohorovka']})
+
+        self.assertIsNone(self.session._departed_round_id)
+        self.assertEqual('waiting', self.session.state)
+
     def test_synchronous_runtime_failure_keeps_lan_until_server_reset(self):
         start = {
             'round_id': 7, 'map': '01_karelia', 'players': [{
@@ -1169,6 +1214,24 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual('battle', self.session.state)
         self.assertTrue(self.session._battle_started)
         self.assertEqual([], self.battle_runtime.stopped)
+        self.assertEqual(1, len(self.battle_runtime.rosters))
+
+    def test_loading_phase_roster_forwards_authority_failover(self):
+        start = {
+            'round_id': 7, 'map': '01_karelia',
+            'bot_authority_id': 'p2',
+            'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]}
+        self.emit('battle_start', start)
+        roster = {
+            'phase': 'loading', 'round_id': 7,
+            'bot_authority_id': 'p1', 'players': start['players']}
+
+        self.emit('roster', roster)
+
+        self.assertEqual('battle', self.session.state)
+        self.assertEqual([roster], self.battle_runtime.rosters)
 
     def test_late_start_denied_cannot_demote_active_battle(self):
         start = {'round_id': 7, 'map': '01_karelia', 'players': [{

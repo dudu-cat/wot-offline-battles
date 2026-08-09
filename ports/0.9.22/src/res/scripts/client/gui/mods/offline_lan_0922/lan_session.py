@@ -641,6 +641,14 @@ class LANSession(object):
         self._map_pool = list(_message_value(
             message, 'map_pool', getattr(self.client, 'map_pool', [])) or [])
         phase = _message_value(message, 'phase', getattr(self.client, 'phase', None))
+        round_id = _message_value(
+            message, 'round_id', getattr(self.client, 'round_id', None))
+        if (phase in ('loading', 'battle') and self._battle_started and
+                round_id == self._active_round_id and
+                self._battle_runtime is not None):
+            on_roster = getattr(self._battle_runtime, 'on_roster', None)
+            if callable(on_roster):
+                on_roster(message)
         if phase == 'waiting':
             returning_from_round = (
                 self._battle_started or self._active_round_id is not None or
@@ -697,8 +705,6 @@ class LANSession(object):
             # Disconnect/failover roster updates are broadcast during a live
             # round.  They update membership but must not demote the active
             # local battle back to an awaiting state.
-            round_id = _message_value(
-                message, 'round_id', getattr(self.client, 'round_id', None))
             if (self._departed_round_id is not None and
                     round_id == self._departed_round_id):
                 self.state = 'awaiting_round_end'
@@ -967,6 +973,13 @@ class LANSession(object):
             self._sync_waiting_surface()
         elif kind == 'battle_start':
             self._start_battle(message)
+        elif kind == 'battle_live':
+            round_id = _message_value(message, 'round_id')
+            if (not self._battle_started or
+                    round_id != self._active_round_id or
+                    self._battle_runtime is None):
+                return
+            self._battle_runtime.on_battle_live(message)
         elif kind == 'battle_failed':
             self._on_battle_failed(message)
         elif kind == 'snapshot':

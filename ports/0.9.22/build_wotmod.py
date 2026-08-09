@@ -10,9 +10,39 @@ import tempfile
 import zipfile
 
 
+_SCHEMA_ROOT = os.path.join(
+    os.path.dirname(__file__), 'src', 'res', 'scripts', 'client', 'gui',
+    'mods', 'offline_lan_0922')
+if _SCHEMA_ROOT not in sys.path:
+    sys.path.insert(0, _SCHEMA_ROOT)
+import navigation_graph_schema as _navigation_schema
+
+
 MOD_ID = 'org.peng.offline_lan_0922'
-MOD_VERSION = '0.3.14'
+MOD_VERSION = '0.3.41'
 PYTHON_MAGIC = '\x03\xf3\r\n'
+FOLIAGE_FORMAT = 'offline-lan-0922-foliage'
+FOLIAGE_VERSION = 1
+FOLIAGE_MANIFEST_FORMAT = FOLIAGE_FORMAT + '-manifest'
+PROJECT_ROOT = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), '..', '..'))
+LEGAL_FILES = (
+    'LICENSE',
+    'THIRD_PARTY_NOTICES.md',
+    os.path.join('licenses', 'Boost-1.0.txt'),
+)
+
+
+def _copy_legal_files(destination_root):
+    for relative_path in LEGAL_FILES:
+        source = os.path.join(PROJECT_ROOT, relative_path)
+        if not os.path.isfile(source):
+            raise SystemExit('required legal file is missing: %s' % relative_path)
+        destination = os.path.join(destination_root, relative_path)
+        parent = os.path.dirname(destination)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent)
+        shutil.copy2(source, destination)
 
 
 def _remove_stale_bytecode(root):
@@ -86,10 +116,14 @@ def _release_config():
         'startupTimeoutSeconds': 30.0,
         'prebattleCountdownSeconds': 15.0,
         'battleDurationSeconds': 900.0,
+        'physics_tuning': {},
+        'he_tuning': {},
+        'perfect_accuracy': False,
     }
 
 
-def _write_client_overlay(dist_root, package_path, checksum_path, digest):
+def _write_client_overlay(dist_root, package_path, checksum_path, digest,
+                          graph_source=None, foliage_source=None):
     release_config = _release_config()
     release_seed = '%s\n%s:%s' % (
         digest, release_config['host'], release_config['port'])
@@ -108,8 +142,17 @@ def _write_client_overlay(dist_root, package_path, checksum_path, digest):
         payload = json.dumps(
             release_config, indent=2, sort_keys=True) + '\n'
         stream.write(payload.encode('utf-8'))
+    graph_source = graph_source or os.path.join(
+        os.path.dirname(__file__), 'navgraphs')
+    _validate_navigation_graphs(graph_source)
+    shutil.copytree(graph_source, os.path.join(config_root, 'navgraphs'))
+    foliage_source = foliage_source or os.path.join(
+        os.path.dirname(__file__), 'foliage')
+    _validate_foliage(foliage_source)
+    shutil.copytree(foliage_source, os.path.join(config_root, 'foliage'))
     shutil.copy2(os.path.join(os.path.dirname(__file__), 'INSTALL.txt'),
                  overlay_root)
+    _copy_legal_files(overlay_root)
     zip_path = os.path.join(
         dist_root,
         release_name + '.zip')
@@ -117,6 +160,124 @@ def _write_client_overlay(dist_root, package_path, checksum_path, digest):
     print('client endpoint=%s:%s' % (
         release_config['host'], release_config['port']))
     return overlay_root, zip_path
+
+
+def _validate_navigation_graphs(graph_root):
+    manifest_path = os.path.join(graph_root, 'manifest.json')
+    if not os.path.isfile(manifest_path):
+        raise SystemExit('complete #1513 navigation graph batch is missing')
+    with open(manifest_path, 'rb') as stream:
+        manifest = json.load(stream)
+    records = manifest.get('maps') if isinstance(manifest, dict) else None
+    try:
+        version = int(manifest.get('version', -1))
+    except (AttributeError, TypeError, ValueError):
+        version = -1
+    expected_maps = set(_navigation_schema.SUPPORTED_MAPS)
+    if (not isinstance(manifest, dict) or
+            manifest.get('format') != _navigation_schema.MANIFEST_FORMAT or
+            version != _navigation_schema.FORMAT_VERSION or
+            manifest.get('game_version') != _navigation_schema.GAME_VERSION or
+            not isinstance(records, list) or
+            len(records) != len(expected_maps)):
+        raise SystemExit('complete #1513 navigation graph manifest is invalid')
+    seen = set()
+    expected_files = set(name + '.json' for name in expected_maps)
+    for record in records:
+        if not isinstance(record, dict):
+            raise SystemExit(
+                'complete #1513 navigation graph batch is invalid')
+        name = str(record.get('map') or '')
+        filename = str(record.get('file') or '')
+        expected_hash = str(record.get('sha256') or '')
+        path = os.path.join(graph_root, filename)
+        valid_hash = (
+            len(expected_hash) == 64 and
+            all(character in '0123456789abcdef'
+                for character in expected_hash))
+        if (name not in expected_maps or name in seen or
+                filename != name + '.json' or not valid_hash or
+                not os.path.isfile(path)):
+            raise SystemExit('complete #1513 navigation graph batch is invalid')
+        with open(path, 'rb') as stream:
+            payload = stream.read()
+        actual_hash = hashlib.sha256(payload).hexdigest()
+        if actual_hash != expected_hash:
+            raise SystemExit('navigation graph checksum mismatch: %s' % name)
+        try:
+            graph = json.loads(payload.decode('utf-8'))
+            _navigation_schema.validate_graph(graph, name)
+        except (TypeError, ValueError) as error:
+            raise SystemExit(
+                'navigation graph is invalid for %s: %s' % (name, error))
+        seen.add(name)
+    actual_files = set(
+        filename for filename in os.listdir(graph_root)
+        if filename.endswith('.json') and filename != 'manifest.json')
+    if seen != expected_maps or actual_files != expected_files:
+        raise SystemExit('complete #1513 navigation graph batch is invalid')
+
+
+def _validate_foliage(foliage_root):
+    """Reject partial, stale or tampered #1513 concealment data."""
+    manifest_path = os.path.join(foliage_root, 'manifest.json')
+    if not os.path.isfile(manifest_path):
+        raise SystemExit('complete #1513 foliage batch is missing')
+    with open(manifest_path, 'rb') as stream:
+        manifest = json.load(stream)
+    records = manifest.get('maps') if isinstance(manifest, dict) else None
+    try:
+        version = int(manifest.get('version', -1))
+    except (AttributeError, TypeError, ValueError):
+        version = -1
+    expected_maps = set(_navigation_schema.SUPPORTED_MAPS)
+    if (not isinstance(manifest, dict) or
+            manifest.get('format') != FOLIAGE_MANIFEST_FORMAT or
+            version != FOLIAGE_VERSION or
+            manifest.get('game_version') != _navigation_schema.GAME_VERSION or
+            not isinstance(records, list) or
+            len(records) != len(expected_maps)):
+        raise SystemExit('complete #1513 foliage manifest is invalid')
+    seen = set()
+    expected_files = set(name + '.json' for name in expected_maps)
+    for record in records:
+        if not isinstance(record, dict):
+            raise SystemExit('complete #1513 foliage batch is invalid')
+        name = str(record.get('map') or '')
+        filename = str(record.get('file') or '')
+        expected_hash = str(record.get('sha256') or '')
+        path = os.path.join(foliage_root, filename)
+        if (name not in expected_maps or name in seen or
+                filename != name + '.json' or
+                len(expected_hash) != 64 or not os.path.isfile(path)):
+            raise SystemExit('complete #1513 foliage batch is invalid')
+        with open(path, 'rb') as stream:
+            payload = stream.read()
+        if hashlib.sha256(payload).hexdigest() != expected_hash:
+            raise SystemExit('foliage checksum mismatch: %s' % name)
+        try:
+            data = json.loads(payload.decode('utf-8'))
+            instances = data.get('instances')
+            cells = data.get('cells')
+            if (data.get('format') != FOLIAGE_FORMAT or
+                    int(data.get('version', -1)) != FOLIAGE_VERSION or
+                    data.get('game_version') != _navigation_schema.GAME_VERSION or
+                    data.get('map') != name or
+                    float(data.get('cell_size', 0.0)) <= 0.0 or
+                    not isinstance(instances, list) or not instances or
+                    not isinstance(cells, dict) or
+                    any(not isinstance(row, list) or len(row) != 10
+                        for row in instances)):
+                raise ValueError('invalid foliage data')
+        except (AttributeError, TypeError, ValueError) as error:
+            raise SystemExit(
+                'foliage data is invalid for %s: %s' % (name, error))
+        seen.add(name)
+    actual_files = set(
+        filename for filename in os.listdir(foliage_root)
+        if filename.endswith('.json') and filename != 'manifest.json')
+    if seen != expected_maps or actual_files != expected_files:
+        raise SystemExit('complete #1513 foliage batch is invalid')
 
 
 def _remove_stale_outputs(dist_root):
@@ -169,6 +330,7 @@ def build():
         staging_root = os.path.join(staging_parent, 'package')
         shutil.copytree(source_root, staging_root)
         shutil.copy2(os.path.join(port_root, 'meta.xml'), staging_root)
+        _copy_legal_files(staging_root)
         _remove_stale_bytecode(staging_root)
         # A random temporary build path in code.co_filename changes every PYC
         # and defeats the content-hash release name.  Compile against a stable

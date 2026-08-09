@@ -109,6 +109,7 @@ class AvatarServerBridge(object):
 
     def __init__(self, avatar, entity_binding, property_builder, lan_sender,
                  account_commands=None, on_ready=None, on_leave=None,
+                 on_vehicle_enter=None,
                  initial_period='battle', initial_period_seconds=0.0):
         self._avatar = avatar
         self._binding = entity_binding
@@ -117,6 +118,7 @@ class AvatarServerBridge(object):
         self._account_commands = tuple(account_commands or ())
         self._on_ready = on_ready
         self._on_leave = on_leave
+        self._on_vehicle_enter = on_vehicle_enter
         self._initial_period = initial_period
         self._initial_period_seconds = max(
             0.0, float(initial_period_seconds))
@@ -134,6 +136,18 @@ class AvatarServerBridge(object):
         self._client_context = ''
         self._destroyed = False
         self._leave_requested = False
+
+    def prepareVehicleEnter(self, vehicle):
+        """Install client-server pose state before stock local entry runs."""
+        if self._destroyed:
+            return False
+        vehicle_id = int(vehicle.id)
+        if self._vehicle_id is not None and vehicle_id != self._vehicle_id:
+            return False
+        if not callable(self._on_vehicle_enter):
+            return True
+        self._on_vehicle_enter(vehicle)
+        return True
 
     @property
     def vehicle_id(self):
@@ -369,12 +383,21 @@ class AvatarServerBridge(object):
         self._avatar.syncVehicleAttrs(dict(attrs))
 
     def vehicle_moveWith(self, flags):
-        self._send_input('move', {'flags': int(flags)})
+        flags = int(flags)
+        movement_dir = 1 if flags & 1 else (-1 if flags & 2 else 0)
+        rotation_dir = 1 if flags & 8 else (-1 if flags & 4 else 0)
+        self._send_input('move', {'flags': flags})
+        self._binding.drive_vehicle(
+            self._vehicle_id, movement_dir, rotation_dir)
 
     def setCruiseControlMode(self, mode):
         self._send_input('cruise', {'mode': int(mode)})
 
     def vehicle_changeSetting(self, code, value):
+        handler = getattr(
+            self._lan_sender, 'change_vehicle_setting', None)
+        if callable(handler):
+            handler(self._vehicle_id, code, value)
         updater = getattr(self._avatar, 'updateVehicleSetting', None)
         if updater is None:
             raise AttributeError('Avatar.updateVehicleSetting')

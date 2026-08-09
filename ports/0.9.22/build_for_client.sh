@@ -8,6 +8,7 @@ fi
 
 port_root="$(cd "$(dirname "$0")" && pwd)"
 python3 "$port_root/tools/inspect_client.py" "$1"
+python3 "$port_root/tools/audit_battle_sources.py" "$port_root/../.."
 
 if command -v python2.7 >/dev/null 2>&1; then
   python2.7 "$port_root/tools/audit_embedded_types.py"
@@ -40,4 +41,4 @@ else
 fi
 
 python3 "$port_root/tools/validate_wotmod.py" \
-  "$port_root/dist/org.peng.offline_lan_0922_0.3.14.wotmod"
+  "$port_root/dist/org.peng.offline_lan_0922_0.3.41.wotmod"

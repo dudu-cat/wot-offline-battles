@@ -55,10 +55,12 @@ class SnapshotSync(object):
     binding.  No import in this module has an engine side effect.
     """
 
-    def __init__(self, local_player_id=None, on_event=None, clock=None):
+    def __init__(self, local_player_id=None, on_event=None, clock=None,
+                 pose_safe=None):
         self.local_player_id = local_player_id
         self.on_event = on_event
         self._clock = clock
+        self._pose_safe = pose_safe
         self.round_id = None
         self._last_sequence = None
         self._last_order_revision = None
@@ -225,6 +227,16 @@ class SnapshotSync(object):
             desired['x'] += velocity[0] * predict
             desired['y'] += velocity[1] * predict
             desired['z'] += velocity[2] * predict
+            if (record['kind'] == 'bot' and predict > 0.0 and
+                    self._pose_safe is not None and
+                    not self._pose_safe((desired['x'], desired['y'],
+                                         desired['z']))):
+                # Prediction is presentation only. Never extrapolate a shared
+                # bot from its last authoritative safe pose across a baked
+                # water/cliff cell. If the authority itself has already
+                # fallen, ``target`` still wins and the consequence remains
+                # visible rather than being rewound to an older safe pose.
+                desired = dict(target)
             current = record['current']
             dx, dy, dz = (desired['x'] - current['x'], desired['y'] - current['y'], desired['z'] - current['z'])
             if dx * dx + dy * dy + dz * dz > SNAP_DISTANCE * SNAP_DISTANCE:

@@ -38,16 +38,81 @@ def _load_port_source(name):
     return module
 
 
-def _write_fake_executable(path, machine=0x014C):
-    payload = bytearray(128)
+def _valid_navigation_graph(map_name):
+    formations = {
+        '1': [[float(slot % 5) * 12.0, 0.0,
+               -100.0 + float(slot // 5) * 12.0, 0.0]
+              for slot in range(15)],
+        '2': [[float(slot % 5) * 12.0, 0.0,
+               100.0 - float(slot // 5) * 12.0, 3.14159]
+              for slot in range(15)],
+    }
+    return {
+        'format': 'offline-lan-0922-navgraph',
+        'version': 2,
+        'game_version': '0.9.22.0.1-cn-1513',
+        'map': map_name,
+        'width': 2,
+        'height': 1,
+        'cell_size': 4.0,
+        'origin': [0.0, 0.0],
+        'bounds': [0.0, 0.0, 4.0, 0.0],
+        'heights_mm': [0, 0],
+        'links': [16, 8],
+        'hazards': [0, 0],
+        'spawn_anchors': [[0.0, 0.0], [4.0, 0.0]],
+        'objective_bases': [[4.0, 0.0], [0.0, 0.0]],
+        'spawn_formations': formations,
+        'routes': {
+            '1': [{'id': 'lane', 'waypoints': [
+                [0.0, 0.0, False], [4.0, 0.0, False]]}],
+            '2': [{'id': 'lane', 'waypoints': [
+                [4.0, 0.0, False], [0.0, 0.0, False]]}],
+        },
+    }
+
+
+def _write_navigation_batch(graphs, map_names, graph_factory):
+    records = []
+    for name in map_names:
+        payload = (json.dumps(
+            graph_factory(name), sort_keys=True) + '\n').encode('utf-8')
+        filename = name + '.json'
+        (graphs / filename).write_bytes(payload)
+        records.append({
+            'map': name,
+            'file': filename,
+            'sha256': hashlib.sha256(payload).hexdigest(),
+        })
+    (graphs / 'manifest.json').write_text(json.dumps({
+        'format': 'offline-lan-0922-navgraph-manifest',
+        'version': 2,
+        'game_version': '0.9.22.0.1-cn-1513',
+        'maps': records,
+    }), encoding='utf-8')
+
+
+def _write_fake_executable(path, machine=0x014C,
+                           include_native_vehicle_input=True):
+    payload = bytearray(1024)
     payload[0:2] = b'MZ'
     payload[0x3C:0x40] = struct.pack('<I', 0x60)
     payload[0x60:0x64] = b'PE\0\0'
     payload[0x64:0x66] = struct.pack('<H', machine)
+    methods = [b'PyWGVehicleFilter\0']
+    if include_native_vehicle_input:
+        methods.extend((
+            b'notifyInputKeysDown\0', b'setVehiclePhysics\0',
+            b'getVehiclePhysics\0', b'setTracksSpeed\0',
+            b'syncGunAngles\0'))
+    methods.append(b'PyWGTurretFilter\0')
+    table = b''.join(methods)
+    payload[0x100:0x100 + len(table)] = table
     path.write_bytes(payload)
 
 
-def _write_fake_client(root, inspector, build='1513', changed_entity=False):
+def _write_fake_client(root, inspector, build='1513', changed_entity=False,
+                       changed_vehicle=False):
     (root / 'res' / 'packages').mkdir(parents=True)
     _write_fake_executable(root / 'WorldOfTanks.exe')
     (root / 'version.xml').write_text(
@@ -69,6 +134,9 @@ def _write_fake_client(root, inspector, build='1513', changed_entity=False):
             if (changed_entity and member ==
                     'scripts/entity_defs/interfaces/AvatarObserver.def'):
                 payload = b'changed'
+            if (changed_vehicle and member ==
+                    'scripts/entity_defs/Vehicle.def'):
+                payload = b'changed-vehicle-schema'
             archive.writestr(member, payload)
     inspector.PINNED_ENTITY_DEFINITION_SHA256 = {
         member: hashlib.sha256(entity_payload).hexdigest()
@@ -94,6 +162,10 @@ class ClientInspectorTests(unittest.TestCase):
         self.assertEqual('1513', report['build'])
         self.assertEqual('./mods/0.9.22.0.1', report['wotmodPath'])
         self.assertEqual('x86', report['architecture'])
+        self.assertIn('notifyInputKeysDown',
+                      report['nativeVehicleFilter']['requiredMethods'])
+        self.assertEqual(['set', 'setPosition'],
+                         report['nativeVehicleFilter']['absentPoseMethods'])
         runtimes = {
             value['runtime'] for value in report['bytecode'].values()
         }
@@ -113,6 +185,19 @@ class ClientInspectorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'build must be #1513'):
                 inspector.inspect_client(root)
 
+    def test_rejects_client_without_native_vehicle_input_boundary(self):
+        inspector = _load_tool('inspect_client')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_fake_client(root, inspector)
+            _write_fake_executable(
+                root / 'WorldOfTanks.exe',
+                include_native_vehicle_input=False)
+
+            with self.assertRaisesRegex(
+                    ValueError, 'PyWGVehicleFilter methods are missing'):
+                inspector.inspect_client(root)
+
     def test_rejects_changed_avatar_entity_definition(self):
         inspector = _load_tool('inspect_client')
         with tempfile.TemporaryDirectory() as directory:
@@ -121,6 +206,16 @@ class ClientInspectorTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                     ValueError, 'entity definition differs'):
+                inspector.inspect_client(root)
+
+    def test_rejects_changed_vehicle_entity_definition(self):
+        inspector = _load_tool('inspect_client')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_fake_client(root, inspector, changed_vehicle=True)
+
+            with self.assertRaisesRegex(
+                    ValueError, 'entity definition differs.*Vehicle.def'):
                 inspector.inspect_client(root)
 
 
@@ -138,7 +233,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.14</version></root>')
+            '<version>0.3.41</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -232,6 +327,23 @@ class PortSourceTests(unittest.TestCase):
         for path in source_root.rglob('*.py'):
             compile(path.read_text(encoding='utf-8'), str(path), 'exec')
 
+    def test_vehicle_force_law_uses_drive_intent_for_reverse_steering(self):
+        physics = _load_port_source('vehicle_physics')
+        params = {
+            'speedFwd': 20.0,
+            'rotSpd': 1.0,
+            'terrainResist': (1.0, 1.0, 1.0),
+        }
+        forward = physics.traverse_step(
+            params, 0.0, 1, 5.0, 0.1)
+        reverse = physics.traverse_step(
+            params, 0.0, 1, 5.0, 0.1, drive_intent=-1.0)
+        backward_slide = physics.traverse_step(
+            params, 0.0, 1, -5.0, 0.1, drive_intent=1.0)
+        self.assertGreater(forward, 0.0)
+        self.assertLess(reverse, 0.0)
+        self.assertGreater(backward_slide, 0.0)
+
     def test_packager_removes_python_3_cache_before_python_2_compile(self):
         packager_path = PORT_ROOT / 'build_wotmod.py'
         spec = importlib.util.spec_from_file_location(
@@ -290,20 +402,95 @@ class PortSourceTests(unittest.TestCase):
             root = Path(directory)
             package = root / 'mod.wotmod'
             checksum = root / 'mod.wotmod.sha256'
+            graphs = root / 'navgraphs'
+            graphs.mkdir()
+            _write_navigation_batch(
+                graphs, packager._navigation_schema.SUPPORTED_MAPS,
+                _valid_navigation_graph)
             package.write_bytes(b'mod')
             checksum.write_text('checksum\n', encoding='ascii')
             with mock.patch.dict(os.environ, {
                     'OFFLINE_LAN_RELEASE_HOST': '192.168.1.164',
                     'OFFLINE_LAN_RELEASE_PORT': '28782'}):
                 overlay, archive = packager._write_client_overlay(
-                    str(root), str(package), str(checksum), 'a' * 64)
+                    str(root), str(package), str(checksum), 'a' * 64,
+                    str(graphs))
 
             config_path = (Path(overlay) / 'mods' / 'configs' /
                            'offline_lan_0922' / 'config.json')
             config = json.loads(config_path.read_text(encoding='utf-8'))
             self.assertEqual('192.168.1.164', config['host'])
             self.assertEqual(28782, config['port'])
+            self.assertTrue((config_path.parent / 'navgraphs' /
+                             'manifest.json').is_file())
+            self.assertTrue((config_path.parent / 'foliage' /
+                             'manifest.json').is_file())
             self.assertTrue(Path(archive).is_file())
+
+    def test_navigation_release_gate_rejects_wrong_41_map_names(self):
+        packager_path = PORT_ROOT / 'build_wotmod.py'
+        spec = importlib.util.spec_from_file_location(
+            'build_wotmod_wrong_graph_names_test', packager_path)
+        packager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packager)
+        with tempfile.TemporaryDirectory() as directory:
+            graphs = Path(directory)
+            _write_navigation_batch(
+                graphs, ['map%02d' % index for index in range(41)],
+                _valid_navigation_graph)
+
+            with self.assertRaisesRegex(SystemExit, 'batch is invalid'):
+                packager._validate_navigation_graphs(str(graphs))
+
+    def test_navigation_release_gate_rejects_empty_graph_payload(self):
+        packager_path = PORT_ROOT / 'build_wotmod.py'
+        spec = importlib.util.spec_from_file_location(
+            'build_wotmod_empty_graph_test', packager_path)
+        packager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packager)
+        first = packager._navigation_schema.SUPPORTED_MAPS[0]
+
+        def graph_factory(name):
+            return {} if name == first else _valid_navigation_graph(name)
+
+        with tempfile.TemporaryDirectory() as directory:
+            graphs = Path(directory)
+            _write_navigation_batch(
+                graphs, packager._navigation_schema.SUPPORTED_MAPS,
+                graph_factory)
+
+            with self.assertRaisesRegex(
+                    SystemExit, 'navigation graph is invalid'):
+                packager._validate_navigation_graphs(str(graphs))
+
+    def test_navigation_batch_refuses_partial_existing_output(self):
+        batch = _load_tool('bake_all_navigation_0922')
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'navgraphs'
+            output.mkdir()
+            (output / '01_karelia.json').write_text(
+                '{}\n', encoding='utf-8')
+
+            with self.assertRaisesRegex(
+                    ValueError, 'output set is incomplete or extra'):
+                batch.bake_all(str(Path(directory) / 'client'), str(output))
+
+    def test_navigation_batch_manifest_has_exact_supported_map_order(self):
+        batch = _load_tool('bake_all_navigation_0922')
+        with tempfile.TemporaryDirectory() as directory:
+            digests = {
+                name: hashlib.sha256(name.encode('ascii')).hexdigest()
+                for name in batch.schema.SUPPORTED_MAPS
+            }
+            batch._write_manifest(directory, digests)
+            manifest = json.loads(
+                (Path(directory) / 'manifest.json').read_text(
+                    encoding='utf-8'))
+
+        self.assertEqual(
+            list(batch.schema.SUPPORTED_MAPS),
+            [record['map'] for record in manifest['maps']])
+        self.assertEqual(batch.schema.MANIFEST_FORMAT, manifest['format'])
 
 class PortConfigTests(unittest.TestCase):
     def test_writes_default_and_reads_override(self):
@@ -313,6 +500,7 @@ class PortConfigTests(unittest.TestCase):
             config = config_module.load(path)
             self.assertTrue(config['enabled'])
             self.assertEqual('127.0.0.1', config['host'])
+            self.assertEqual({}, config['physics_tuning'])
             self.assertTrue(Path(path).is_file())
             Path(path).write_text(
                 '{"enabled": false, "host": "192.168.1.20"}',
@@ -578,6 +766,20 @@ class _CompatEvent(object):
         self.operations.append((self.name,) + args)
 
 
+class _CompatSubscriptionEvent(object):
+    def __init__(self, operations, name):
+        self.operations = operations
+        self.name = name
+
+    def __iadd__(self, callback):
+        self.operations.append((self.name + '_add', callback))
+        return self
+
+    def __isub__(self, callback):
+        self.operations.append((self.name + '_remove', callback))
+        return self
+
+
 class _CompatChatManager(object):
     def __init__(self, operations):
         self.operations = operations
@@ -604,6 +806,16 @@ class _CompatBigWorld(object):
         self.entities = {}
         self._player = None
         self._next_entity = 1
+        self._now = 100.0
+
+    def time(self):
+        return self._now
+
+    def serverTime(self):
+        # A client-only BigWorld connection does not receive retail server
+        # clock samples, so this value remains frozen until the compatibility
+        # layer supplies the scoped offline battle clock.
+        return 500.0
 
     def connect(self, server, login_params, progress):
         self.operations.append(('original_connect', server))
@@ -749,6 +961,12 @@ class _CompatAvatarFilter(object):
     def setInterpolationType(self, *args):
         return None
 
+    def set(self, time_value, space_id, entity_id, position, rotation,
+            error):
+        self.operations.append((
+            'avatar_filter_set', time_value, space_id, entity_id,
+            position, rotation, error))
+
 
 class _Hosts(object):
     def __init__(self, existing=None, fail=False):
@@ -762,6 +980,25 @@ class _Hosts(object):
 
 
 class OfflineCompatibilityTests(unittest.TestCase):
+    def test_offline_battle_server_time_advances_and_restores(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        original = runtime.bigworld.__class__.__dict__['serverTime']
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+
+        compatibility.install()
+        self.assertEqual(500.0, runtime.bigworld.serverTime())
+        compatibility.configure_battle()
+        self.assertEqual(500.0, runtime.bigworld.serverTime())
+
+        runtime.bigworld._now += 4.25
+        self.assertEqual(504.25, runtime.bigworld.serverTime())
+
+        compatibility.deactivate_map()
+        self.assertEqual(500.0, runtime.bigworld.serverTime())
+        compatibility.fini()
+        self.assertIs(original, runtime.bigworld.__class__.serverTime)
+
     def test_offline_battle_debug_panel_uses_lan_transport_health(self):
         compatibility_module = _load_port_source('compat')
         runtime, operations = self._runtime()
@@ -833,6 +1070,9 @@ class OfflineCompatibilityTests(unittest.TestCase):
         avatar = runtime.avatar_module.PlayerAvatar()
 
         class Server(object):
+            def prepareVehicleEnter(self, vehicle):
+                operations.append(('prepare_vehicle_enter', vehicle.id))
+
             def acceptVehicleEnter(self, vehicle_id):
                 operations.append(('accept_vehicle_enter', vehicle_id))
 
@@ -843,10 +1083,48 @@ class OfflineCompatibilityTests(unittest.TestCase):
         avatar.vehicle_onEnterWorld(types.SimpleNamespace(id=91))
 
         names = [item[0] for item in operations]
+        self.assertLess(names.index('prepare_vehicle_enter'),
+                        names.index('accept_vehicle_enter'))
         self.assertLess(names.index('accept_vehicle_enter'),
                         names.index('original_avatar_vehicle_enter'))
         self.assertLess(names.index('original_avatar_vehicle_enter'),
                         names.index('complete_vehicle_enter'))
+        compatibility.fini()
+
+    def test_compatibility_does_not_replace_stock_vehicle_filters(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.spaceID = 7
+
+        class Server(object):
+            vehicle_id = 10
+
+            def acceptVehicleEnter(self, vehicle_id):
+                return vehicle_id == self.vehicle_id
+
+            def completeVehicleEnter(self, vehicle_id):
+                return True
+
+        avatar.fakeServer = Server()
+        original_filter = object()
+        local = types.SimpleNamespace(
+            id=10, filter=original_filter,
+            position=_Vector3(0.0, 0.0, 0.0), yaw=0.25)
+        remote = types.SimpleNamespace(
+            id=11, filter=object(),
+            position=_Vector3(1.0, 2.0, 3.0), yaw=-0.5)
+
+        avatar.vehicle_onEnterWorld(local)
+        avatar.vehicle_onEnterWorld(remote)
+
+        self.assertIs(original_filter, local.filter)
+        self.assertIs(original_filter, local.filter)
+        self.assertNotIsInstance(remote.filter, _CompatAvatarFilter)
+        self.assertFalse(any(item[0] == 'avatar_filter_set'
+                             for item in operations))
         compatibility.fini()
 
     def test_vehicle_accept_failure_is_latched_before_stock_handler(self):
@@ -891,6 +1169,84 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertNotIn(
             'destroy', runtime.sound_groups_module.g_instance.__dict__)
         self.assertIs(zombie, runtime.bigworld.player())
+
+    def test_control_mode_listener_runs_after_completed_native_transition(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        handler_type = runtime.avatar_input_handler.AvatarInputHandler
+        original = handler_type.__dict__['onControlModeChanged']
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        listener = mock.Mock()
+
+        compatibility.set_control_mode_listener(listener)
+        handler = handler_type()
+        result = handler.onControlModeChanged('sniper', source='wheel')
+
+        self.assertEqual('changed', result)
+        self.assertIn(
+            ('control_mode', 'sniper', {'source': 'wheel'}), operations)
+        listener.assert_called_once_with(handler, 'sniper')
+
+        compatibility.fini()
+        self.assertIs(original, handler_type.__dict__['onControlModeChanged'])
+
+    def test_live_pose_owns_minimap_and_pretransition_aiming_sources(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.playerVehicleID = 91
+        avatar.inputHandler = \
+            runtime.avatar_input_handler.AvatarInputHandler()
+        vehicle = runtime.vehicle_module.Vehicle()
+        vehicle.matrix = 'native-matrix'
+        vehicle.filter = types.SimpleNamespace(
+            bodyMatrix='native-body-matrix',
+            stabilisedMatrix='native-stabilised-matrix')
+        runtime.bigworld.entities[91] = vehicle
+        runtime.bigworld.entity = runtime.bigworld.entities.get
+        runtime.bigworld._player = avatar
+
+        live_matrix = object()
+        compatibility.set_vehicle_pose_overlay(
+            vehicle, 'live-position', 0.75, live_matrix, 8.0, 0.2)
+        compatibility.bind_vehicle_pose_sources(avatar, vehicle)
+
+        own = avatar.consistentMatrices.\
+            _ConsistentMatrices__ownVehicleMProv
+        attached = avatar.consistentMatrices.\
+            _ConsistentMatrices__attachedVehicleMatrix
+        calculator = avatar.inputHandler.steadyVehicleMatrixCalculator
+        output = calculator.\
+            _SteadyVehicleMatrixCalculator__outputMProv
+        steady = calculator.\
+            _SteadyVehicleMatrixCalculator__stabilisedMProv
+        self.assertIs(live_matrix, own.target)
+        self.assertIs(live_matrix, attached.target)
+        self.assertIs(live_matrix, output.rotationSrc)
+        self.assertIs(live_matrix, output.translationSrc)
+        self.assertIs(live_matrix, steady.target)
+
+        avatar.inputHandler.onControlModeChanged('sniper', source='wheel')
+        self.assertIs(live_matrix, output.rotationSrc)
+        self.assertIs(live_matrix, output.translationSrc)
+        self.assertIs(live_matrix, steady.target)
+        self.assertIn(
+            ('control_mode', 'sniper', {'source': 'wheel'}), operations)
+
+        self.assertTrue(compatibility.clear_vehicle_pose_overlay(vehicle))
+        compatibility.restore_vehicle_pose_sources(
+            avatar, vehicle, 'native-matrix', 'native-stabilised-matrix')
+        self.assertEqual('native-body-matrix', own.target)
+        self.assertEqual('native-matrix', attached.target)
+        self.assertEqual(
+            'native-stabilised-matrix',
+            avatar._PlayerAvatar__ownVehicleStabMProv.target)
+        self.assertEqual('native-stabilised-matrix', output.rotationSrc)
+        self.assertEqual('native-stabilised-matrix', output.translationSrc)
+        self.assertEqual('native-stabilised-matrix', steady.target)
+        compatibility.fini()
 
     def _runtime(self, existing_hosts=None, host_failure=False):
         operations = []
@@ -946,6 +1302,50 @@ class OfflineCompatibilityTests(unittest.TestCase):
                 operations.append(('avatar_observer_enter_world',
                                    avatar.filter))
 
+        class MatrixProvider(object):
+            def __init__(self):
+                self.target = None
+                self.rotationSrc = None
+                self.translationSrc = None
+
+        class ConsistentMatrices(object):
+            def __init__(self):
+                self._ConsistentMatrices__attachedVehicleMatrix = \
+                    MatrixProvider()
+                self._ConsistentMatrices__ownVehicleMProv = MatrixProvider()
+
+            def __setTarget(self, matrix, as_static=True):
+                unused_as_static = as_static
+                self._ConsistentMatrices__attachedVehicleMatrix.target = \
+                    matrix
+
+            def __linkOwnVehicle(self, vehicle):
+                vehicle_filter = getattr(vehicle, 'filter', None)
+                self._ConsistentMatrices__ownVehicleMProv.target = getattr(
+                    vehicle_filter, 'bodyMatrix', vehicle.matrix)
+
+        class SteadyVehicleMatrixCalculator(object):
+            def __init__(self):
+                self._SteadyVehicleMatrixCalculator__outputMProv = \
+                    MatrixProvider()
+                self._SteadyVehicleMatrixCalculator__stabilisedMProv = \
+                    MatrixProvider()
+
+            def relinkSources(self):
+                player = bigworld.player()
+                vehicle = (player.getVehicleAttached()
+                           if player is not None else None)
+                matrix = getattr(
+                    getattr(vehicle, 'filter', None),
+                    'stabilisedMatrix', 'native-steady-matrix')
+                output = self.\
+                    _SteadyVehicleMatrixCalculator__outputMProv
+                stabilised = self.\
+                    _SteadyVehicleMatrixCalculator__stabilisedMProv
+                output.rotationSrc = matrix
+                output.translationSrc = matrix
+                stabilised.target = matrix
+
         class PlayerAvatar(object):
             def __setattr__(self, name, value):
                 if (name in ('name', 'clientCtx') and
@@ -968,7 +1368,13 @@ class OfflineCompatibilityTests(unittest.TestCase):
                 operations.append(('original_avatar_init',))
                 self._ClientChat__chatActionCallbacks = {}
                 self._PlayerAvatar__initProgress = 0
-                self._PlayerAvatar__consistentMatrices = object()
+                self.consistentMatrices = ConsistentMatrices()
+                self._PlayerAvatar__consistentMatrices = \
+                    self.consistentMatrices
+                self._PlayerAvatar__ownVehicleStabMProv = MatrixProvider()
+                self.arena = types.SimpleNamespace(
+                    onPeriodChange=_CompatSubscriptionEvent(
+                        operations, 'arena_period'))
 
             def onEnterWorld(self, prereqs):
                 unused = self._PlayerAvatar__initProgress
@@ -1007,7 +1413,36 @@ class OfflineCompatibilityTests(unittest.TestCase):
                 operations.append(('original_avatar_vehicle_enter',
                                    vehicle.id))
 
+            def vehicle_onLeaveWorld(self, vehicle):
+                operations.append(('original_avatar_vehicle_leave',
+                                   vehicle.id))
+
+            def getOwnVehicleSpeeds(self, get_instantaneous=False):
+                return (0.0, 0.0)
+
+            def getVehicleAttached(self):
+                return bigworld.entity(getattr(self, 'playerVehicleID', 0))
+
         class Vehicle(object):
+            def __setattr__(self, name, value):
+                if (name in ('health', 'isCrewActive') and
+                        getattr(self, 'reject_server_properties', False)):
+                    raise RuntimeError('Operation is not allowed')
+                object.__setattr__(self, name, value)
+
+            def __stopExtras(self):
+                operations.append(('vehicle_stop_extras',))
+
+            def stopVisual(self, show_stipple=False):
+                operations.append(('vehicle_stop_visual', show_stipple))
+                self.isStarted = False
+
+            def onLeaveWorld(self):
+                self._Vehicle__stopExtras()
+                bigworld.player().vehicle_onLeaveWorld(self)
+                if self.isStarted:
+                    raise AssertionError('Vehicle remained started')
+
             def __startWGPhysics(self):
                 operations.extend((
                     ('vehicle_physics_init',),
@@ -1035,9 +1470,14 @@ class OfflineCompatibilityTests(unittest.TestCase):
             def _readFilterFromHelper(self):
                 return self.filter
 
+            def getSpeed(self):
+                return getattr(self, 'native_speed', 0.0)
+
         class CompoundAppearance(object):
             def __init__(self, vehicle_filter):
                 self._CompoundAppearance__filter = vehicle_filter
+                self._arena_callback = lambda *unused: None
+                self._camera_callback = lambda *unused: None
 
             def __onModelsRefresh(self, model_state, resource_list):
                 operations.append(
@@ -1054,6 +1494,32 @@ class OfflineCompatibilityTests(unittest.TestCase):
             def _readFilterDuringRefresh(self):
                 return self._CompoundAppearance__filter
 
+            def deactivate(self, stopEffects=True):
+                operations.append(('compound_deactivate', stopEffects))
+                bigworld.player().inputHandler.removeVehicleFromCameraCollider(
+                    self)
+                bigworld.player().arena.onPeriodChange -= self._arena_callback
+                bigworld.player().inputHandler.onCameraChanged -= \
+                    self._camera_callback
+                if getattr(self, 'fail_deactivate', False):
+                    raise RuntimeError('compound deactivate failed')
+
+        class AvatarInputHandler(object):
+            def __init__(self):
+                self._AvatarInputHandler__ctrlModeName = None
+                self.steadyVehicleMatrixCalculator = \
+                    SteadyVehicleMatrixCalculator()
+
+            def onControlModeChanged(self, eMode, **args):
+                self.steadyVehicleMatrixCalculator.relinkSources()
+                operations.append(('control_mode', eMode, args))
+                self._AvatarInputHandler__ctrlModeName = eMode
+                return 'changed'
+
+        class VehicleGunRotator(object):
+            def getAvatarOwnVehicleStabilisedMatrix(self, vehicle):
+                return vehicle.filter.interpolateStabilisedMatrix(123.0)
+
         account_module = types.SimpleNamespace(
             PlayerAccount=PlayerAccount,
             _CLIENT_SERVER_VERSION=('requiredVersion_92200', '0.9.22'))
@@ -1067,6 +1533,10 @@ class OfflineCompatibilityTests(unittest.TestCase):
         runtime = types.SimpleNamespace(
             account_module=account_module,
             avatar_module=avatar_module,
+            avatar_input_handler=types.SimpleNamespace(
+                AvatarInputHandler=AvatarInputHandler),
+            avatar_position_control=types.SimpleNamespace(
+                ConsistentMatrices=ConsistentMatrices),
             bigworld=bigworld,
             chat_manager=chat_manager,
             compound_appearance_module=types.SimpleNamespace(
@@ -1079,8 +1549,13 @@ class OfflineCompatibilityTests(unittest.TestCase):
             prb_loader=_PrbLoader(operations),
             sound_groups_module=types.SimpleNamespace(
                 g_instance=sound_groups),
+            steady_vehicle_matrix=types.SimpleNamespace(
+                SteadyVehicleMatrixCalculator=
+                SteadyVehicleMatrixCalculator),
             math=types.SimpleNamespace(Vector3=_Vector3),
-            vehicle_module=types.SimpleNamespace(Vehicle=Vehicle))
+            vehicle_module=types.SimpleNamespace(Vehicle=Vehicle),
+            vehicle_gun_rotator=types.SimpleNamespace(
+                VehicleGunRotator=VehicleGunRotator))
         return runtime, operations
 
     def test_connects_account_in_native_event_order_and_disconnects_once(self):
@@ -1180,6 +1655,116 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertEqual(original_connect, runtime.bigworld.connect)
         self.assertEqual(original_disconnect, runtime.bigworld.disconnect)
         self.assertEqual([], runtime.predefined_hosts._hosts)
+
+    def test_offline_vehicle_health_uses_python_overlay_not_server_property(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+        vehicle = runtime.vehicle_module.Vehicle()
+        vehicle.health = 500
+        vehicle.isCrewActive = True
+        vehicle.reject_server_properties = True
+
+        compatibility.configure_battle()
+        vehicle.health = 375
+        vehicle.isCrewActive = False
+
+        self.assertEqual(375, vehicle.health)
+        self.assertFalse(vehicle.isCrewActive)
+        compatibility.deactivate_map()
+        self.assertEqual(500, vehicle.health)
+        self.assertTrue(vehicle.isCrewActive)
+        compatibility.fini()
+
+    def test_offline_vehicle_pose_overlay_preserves_native_entity_transform(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+        vehicle = runtime.vehicle_module.Vehicle()
+        vehicle.position = 'native-position'
+        vehicle.yaw = 0.25
+        vehicle.matrix = 'native-matrix'
+        vehicle.native_speed = 2.0
+
+        compatibility.configure_battle()
+        compatibility.set_vehicle_pose_overlay(
+            vehicle, 'copied-position', 1.5, 'copied-matrix', 7.5, 0.25)
+
+        self.assertEqual('copied-position', vehicle.position)
+        self.assertEqual(1.5, vehicle.yaw)
+        self.assertEqual('copied-matrix', vehicle.matrix)
+        self.assertEqual(7.5, vehicle.getSpeed())
+        self.assertEqual(
+            'native-position',
+            compatibility.native_vehicle_attribute(vehicle, 'position'))
+        self.assertEqual(
+            'native-matrix',
+            compatibility.native_vehicle_attribute(vehicle, 'matrix'))
+
+        vehicle.position = 'next-copied-position'
+        self.assertEqual('next-copied-position', vehicle.position)
+        self.assertEqual(
+            'native-position',
+            compatibility.native_vehicle_attribute(vehicle, 'position'))
+        self.assertTrue(compatibility.clear_vehicle_pose_overlay(vehicle))
+        self.assertEqual('native-position', vehicle.position)
+        self.assertEqual('native-matrix', vehicle.matrix)
+        self.assertEqual(2.0, vehicle.getSpeed())
+        compatibility.fini()
+
+    def test_offline_avatar_speed_boundary_uses_copied_pose_overlay(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.playerVehicleID = 91
+        vehicle = runtime.vehicle_module.Vehicle()
+        runtime.bigworld.entities[91] = vehicle
+        runtime.bigworld.entity = runtime.bigworld.entities.get
+
+        compatibility.configure_battle()
+        compatibility.set_vehicle_pose_overlay(
+            vehicle, 'position', 0.0, 'matrix', 8.25, -0.4)
+
+        self.assertEqual((8.25, -0.4), avatar.getOwnVehicleSpeeds())
+        self.assertEqual(
+            (8.25, -0.4), avatar.getOwnVehicleSpeeds(True))
+
+        compatibility.fini()
+        self.assertEqual((0.0, 0.0), avatar.getOwnVehicleSpeeds())
+
+    def test_fixed_turret_aim_reads_copied_pose_without_replacing_filter(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+
+        class VehicleFilter(object):
+            def interpolateStabilisedMatrix(self, timestamp):
+                return 'native-stabilised-%s' % timestamp
+
+        vehicle = runtime.vehicle_module.Vehicle()
+        vehicle.filter = VehicleFilter()
+        rotator = runtime.vehicle_gun_rotator.VehicleGunRotator()
+
+        self.assertEqual(
+            'native-stabilised-123.0',
+            rotator.getAvatarOwnVehicleStabilisedMatrix(vehicle))
+        compatibility.configure_battle()
+        compatibility.set_vehicle_pose_overlay(
+            vehicle, 'copied-position', 1.5, 'copied-matrix', 7.5, 0.25)
+
+        self.assertEqual(
+            'copied-matrix',
+            rotator.getAvatarOwnVehicleStabilisedMatrix(vehicle))
+        self.assertIs(vehicle.filter, vehicle.__dict__['filter'])
+        self.assertEqual(
+            'native-stabilised-123.0',
+            vehicle.filter.interpolateStabilisedMatrix(123.0))
+        compatibility.fini()
 
     def test_offline_vehicle_physics_skips_only_initial_native_gun_sync(self):
         compatibility_module = _load_port_source('compat')
@@ -1346,6 +1931,113 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertIs(original, appearance_type.__dict__[method_name])
         self.assertIs(
             original_getattribute, appearance_type.__getattribute__)
+
+    def test_offline_appearance_teardown_survives_destroyed_input_handler(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        appearance_type = (
+            runtime.compound_appearance_module.CompoundAppearance)
+        original = appearance_type.__dict__['deactivate']
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.inputHandler = None
+        runtime.bigworld._player = avatar
+        appearance = appearance_type(object())
+
+        appearance.deactivate(False)
+
+        self.assertIn(('compound_deactivate', False), operations)
+        self.assertIsNone(avatar.inputHandler)
+        compatibility.fini()
+        self.assertIs(original, appearance_type.__dict__['deactivate'])
+
+    def test_offline_appearance_teardown_survives_cleared_player_entity(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        appearance_type = (
+            runtime.compound_appearance_module.CompoundAppearance)
+        original = appearance_type.__dict__['deactivate']
+        original_player = runtime.bigworld.__class__.__dict__['player']
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        runtime.bigworld._player = None
+        appearance = appearance_type(object())
+
+        appearance.deactivate(False)
+
+        self.assertIn(('compound_deactivate', False), operations)
+        self.assertNotIn('player', runtime.bigworld.__dict__)
+        self.assertIs(original_player,
+                      runtime.bigworld.__class__.__dict__['player'])
+        self.assertIsNone(runtime.bigworld.player())
+        compatibility.fini()
+        self.assertIs(original, appearance_type.__dict__['deactivate'])
+
+    def test_offline_appearance_teardown_restores_player_after_failure(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        appearance_type = (
+            runtime.compound_appearance_module.CompoundAppearance)
+        original_player = runtime.bigworld.__class__.__dict__['player']
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        runtime.bigworld._player = None
+        appearance = appearance_type(object())
+        appearance.fail_deactivate = True
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'compound deactivate failed'):
+            appearance.deactivate(False)
+
+        self.assertNotIn('player', runtime.bigworld.__dict__)
+        self.assertIs(original_player,
+                      runtime.bigworld.__class__.__dict__['player'])
+        self.assertIsNone(runtime.bigworld.player())
+        compatibility.fini()
+
+    def test_offline_vehicle_leave_survives_cleared_player_entity(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        vehicle_type = runtime.vehicle_module.Vehicle
+        original = vehicle_type.__dict__['onLeaveWorld']
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        vehicle = vehicle_type()
+        vehicle.id = 91
+        vehicle.isStarted = True
+        runtime.bigworld._player = None
+
+        vehicle.onLeaveWorld()
+
+        self.assertIn(('vehicle_stop_extras',), operations)
+        self.assertIn(('vehicle_stop_visual', False), operations)
+        self.assertFalse(vehicle.isStarted)
+        compatibility.fini()
+        self.assertIs(original, vehicle_type.__dict__['onLeaveWorld'])
+
+    def test_fini_preserves_late_third_party_teardown_wrappers(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        vehicle_type = runtime.vehicle_module.Vehicle
+        appearance_type = (
+            runtime.compound_appearance_module.CompoundAppearance)
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+
+        def late_vehicle(vehicle):
+            return None
+
+        def late_appearance(appearance, stopEffects=True):
+            return None
+
+        vehicle_type.onLeaveWorld = late_vehicle
+        appearance_type.deactivate = late_appearance
+        compatibility.fini()
+
+        self.assertIs(late_vehicle, vehicle_type.__dict__['onLeaveWorld'])
+        self.assertIs(late_appearance,
+                      appearance_type.__dict__['deactivate'])
 
     def test_offline_aux_physics_skips_only_native_stabilised_sync(self):
         compatibility_module = _load_port_source('compat')
@@ -2385,7 +3077,8 @@ class LANClientTests(unittest.TestCase):
             'players': [{'id': 2, 'name': 'NewHost'}]})
         stale_start = {
             'type': 'battle_start', 'protocol': 5, 'round_id': 3,
-            'state_revision': 5, 'map': '01_karelia',
+            'state_revision': 5, 'phase': 'loading',
+            'map': '01_karelia',
             'host_player_id': 1,
             'bot_authority_id': 1,
             'players': [{'id': 1, 'name': 'OldHost'},
@@ -2661,7 +3354,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.14'
+        package.PORT_VERSION = '0.3.41'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []

@@ -25,11 +25,15 @@ DEFAULT_CONFIG = {
     'startupTimeoutSeconds': 30.0,
     'prebattleCountdownSeconds': 15.0,
     'battleDurationSeconds': 900.0,
+    'physics_tuning': {},
+    'he_tuning': {},
+    'perfect_accuracy': False,
 }
 
 
 def _copy_defaults():
-    return dict((key, value[:] if isinstance(value, list) else value)
+    return dict((key, (value[:] if isinstance(value, list) else
+                       dict(value) if isinstance(value, dict) else value))
                 for key, value in DEFAULT_CONFIG.items())
 
 
@@ -108,4 +112,10 @@ def load(path=CONFIG_PATH):
         raise ValueError('host must be a non-empty string')
     if not isinstance(config.get('name'), string_types) or not config['name']:
         raise ValueError('name must be a non-empty string')
+    if not isinstance(config.get('physics_tuning'), dict):
+        raise ValueError('physics_tuning must be an object')
+    if not isinstance(config.get('he_tuning'), dict):
+        raise ValueError('he_tuning must be an object')
+    if not isinstance(config.get('perfect_accuracy'), bool):
+        raise ValueError('perfect_accuracy must be true or false')
     return config

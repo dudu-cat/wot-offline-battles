@@ -18,6 +18,8 @@ from gui.mods.offline_lan_0922.ai import maps as bot_ai_maps
 CONTACT_MEMORY_SECONDS = 7.0
 TARGET_HYSTERESIS_BONUS = 18.0
 LOCAL_FORCE_RADIUS = 185.0
+BATTLE_TIER_RADIUS = 1
+MATCH_CLASSES = ('heavyTank', 'mediumTank', 'AT-SPG', 'lightTank', 'SPG')
 
 
 def _number(value, default=0.0):
@@ -28,6 +30,407 @@ def _number(value, default=0.0):
 		return result
 	except Exception:
 		return float(default)
+
+
+def vehicle_in_battle_tier_band(player_tier, candidate_tier):
+	"""Keep one battle within a three-tier band, e.g. VI-VIII for tier VII."""
+	try:
+		return abs(int(candidate_tier) - int(player_tier)) <= BATTLE_TIER_RADIUS
+	except Exception:
+		return False
+
+
+def select_bot_lineup(pool, count, spg_limit=1, fallback_candidates=()):
+	"""Fill a team while enforcing an exact SPG cap.
+
+	``AT-SPG`` is a tank destroyer in the legacy tags and does not consume the
+	artillery slot.  Human artillery is accounted for by the caller through a
+	reduced ``spg_limit``.
+	"""
+	count = max(0, int(count))
+	spg_limit = max(0, int(spg_limit))
+	pool = list(pool or ())
+	if not pool or count <= 0:
+		return []
+	regular = []
+	seen = set()
+	for candidate in pool + list(fallback_candidates or ()):
+		try:
+			tags = candidate['tags']
+			name = candidate['name']
+		except Exception:
+			continue
+		if 'SPG' in tags or name in seen:
+			continue
+		seen.add(name)
+		regular.append(candidate)
+	result = []
+	spg_count = 0
+	regular_index = 0
+	for index in range(count):
+		candidate = pool[index % len(pool)]
+		try:
+			is_spg = 'SPG' in candidate['tags']
+		except Exception:
+			is_spg = False
+		if is_spg and spg_count >= spg_limit:
+			if not regular:
+				continue
+			candidate = regular[regular_index % len(regular)]
+			regular_index += 1
+			is_spg = False
+		if is_spg:
+			spg_count += 1
+		result.append(candidate)
+	return result
+
+
+def vehicle_match_class(candidate):
+	"""Return the exact legacy matchmaking class for a vehicle record."""
+	try:
+		tags = candidate['tags']
+	except Exception:
+		tags = ()
+	for class_tag in MATCH_CLASSES:
+		if class_tag in tags:
+			return class_tag
+	return 'mediumTank'
+
+
+def choose_match_tiers(player_tier, mode_roll, side_roll=0.5,
+		available_tiers=()):
+	"""Choose a one-, two-, or three-tier battle that includes the player."""
+	try:
+		player_tier = max(1, min(10, int(player_tier)))
+	except Exception:
+		player_tier = 1
+	available = set()
+	for value in (available_tiers or range(1, 11)):
+		try:
+			value = int(value)
+		except Exception:
+			continue
+		if 1 <= value <= 10:
+			available.add(value)
+	available.add(player_tier)
+	lower = player_tier - 1 if player_tier - 1 in available else None
+	upper = player_tier + 1 if player_tier + 1 in available else None
+	try:
+		mode_roll = float(mode_roll)
+		side_roll = float(side_roll)
+	except Exception:
+		mode_roll = side_roll = 0.5
+	if mode_roll < 0.28 or (lower is None and upper is None):
+		return (player_tier,)
+	if mode_roll < 0.72 or lower is None or upper is None:
+		if lower is not None and upper is not None:
+			other = lower if side_roll < 0.5 else upper
+		elif lower is not None:
+			other = lower
+		else:
+			other = upper
+		return tuple(sorted((player_tier, other)))
+	return (lower, player_tier, upper)
+
+
+def select_vehicle_variety_pool(candidates, player_tier, max_unique,
+		rng=None):
+	"""Build a small texture-safe pool while preserving tiers and classes."""
+	rng = rng or random
+	max_unique = max(0, int(max_unique))
+	if max_unique <= 0:
+		return list(candidates or ())
+	unique = []
+	seen = set()
+	for candidate in (candidates or ()):
+		try:
+			name = str(candidate['name'])
+		except Exception:
+			continue
+		if name in seen:
+			continue
+		seen.add(name)
+		unique.append(candidate)
+	try:
+		rng.shuffle(unique)
+	except Exception:
+		random.shuffle(unique)
+	selected = []
+	selected_names = set()
+
+	def _take(options):
+		for candidate in options:
+			name = str(candidate['name'])
+			if name not in selected_names:
+				selected.append(candidate)
+				selected_names.add(name)
+				return True
+		return False
+
+	# Prefer one of each role at the selected tier, then fill any missing role
+	# from a neighbouring tier. This keeps single-tier matches tactically varied.
+	for class_tag in MATCH_CLASSES:
+		if len(selected) >= max_unique:
+			break
+		exact = [candidate for candidate in unique
+			if int(candidate.get('level', 0) or 0) == int(player_tier) and
+			vehicle_match_class(candidate) == class_tag]
+		if not _take(exact):
+			_take([candidate for candidate in unique
+				if vehicle_match_class(candidate) == class_tag])
+	# Make every available tier representable before using the remaining slots.
+	levels = sorted(set(int(candidate.get('level', 0) or 0)
+		for candidate in unique))
+	for level in levels:
+		if len(selected) >= max_unique:
+			break
+		if any(int(candidate.get('level', 0) or 0) == level
+				for candidate in selected):
+			continue
+		_take([candidate for candidate in unique
+			if int(candidate.get('level', 0) or 0) == level])
+	for candidate in unique:
+		if len(selected) >= max_unique:
+			break
+		_take((candidate,))
+	return selected
+
+
+def shared_human_requirements(team_profiles):
+	"""Return the per-profile maxima that a mirrored team template must hold."""
+	representatives = {}
+	required_counts = {}
+	for profiles in (team_profiles or {}).values():
+		team_counts = {}
+		for profile in (profiles or ()):
+			try:
+				key = (int(profile.get('level', 0) or 0),
+					vehicle_match_class(profile))
+			except Exception:
+				continue
+			team_counts[key] = team_counts.get(key, 0) + 1
+			representatives.setdefault(key, profile)
+		for key, count in team_counts.items():
+			required_counts[key] = max(required_counts.get(key, 0), count)
+	result = []
+	for key in sorted(required_counts):
+		for unused in range(required_counts[key]):
+			result.append(representatives[key])
+	return result
+
+
+def build_match_template(pool, team_size, player_candidate, allowed_tiers,
+		rng=None, required_profiles=()):
+	"""Return one tier/class template that both teams can independently fill."""
+	rng = rng or random
+	team_size = max(1, int(team_size))
+	allowed = tuple(sorted(set(int(value) for value in allowed_tiers)))
+	if not allowed:
+		allowed = (int(player_candidate.get('level', 1) or 1),)
+	player_tier = int(player_candidate.get('level', allowed[0]) or allowed[0])
+	player_class = vehicle_match_class(player_candidate)
+	usable = [candidate for candidate in (pool or ())
+		if int(candidate.get('level', 0) or 0) in allowed]
+	if not usable:
+		usable = [player_candidate]
+	required = list(required_profiles or ())
+	if not required:
+		required = [player_candidate]
+	required = required[:team_size]
+
+	tier_slots = []
+	while len(tier_slots) < team_size:
+		for level in allowed:
+			if len(tier_slots) >= team_size:
+				break
+			tier_slots.append(level)
+	try:
+		rng.shuffle(tier_slots)
+	except Exception:
+		random.shuffle(tier_slots)
+
+	regular_classes = ('heavyTank', 'mediumTank', 'AT-SPG', 'lightTank')
+	class_slots = []
+	while len(class_slots) < team_size:
+		for class_tag in regular_classes:
+			if len(class_slots) >= team_size:
+				break
+			class_slots.append(class_tag)
+	has_spg = any(vehicle_match_class(candidate) == 'SPG' for candidate in usable)
+	required_spgs = sum(vehicle_match_class(profile) == 'SPG'
+		for profile in required)
+	try:
+		include_spg = has_spg and (required_spgs > 0 or rng.random() < 0.65)
+	except Exception:
+		include_spg = required_spgs > 0
+	if include_spg:
+		class_slots[-1] = 'SPG'
+	try:
+		rng.shuffle(class_slots)
+	except Exception:
+		random.shuffle(class_slots)
+
+	result = []
+	usage = {}
+	spg_count = 0
+	# Reserve an exact tier/class slot for every human profile needed by either
+	# team. If one side lacks that human, its bot lineup fills the same slot.
+	for profile in required:
+		desired_tier = int(profile.get('level', player_tier) or player_tier)
+		desired_class = vehicle_match_class(profile)
+		choices = [candidate for candidate in usable
+			if int(candidate.get('level', 0) or 0) == desired_tier and
+			vehicle_match_class(candidate) == desired_class]
+		candidate = choices[0] if choices else profile
+		result.append(candidate)
+		name = str(candidate.get('name', ''))
+		usage[name] = usage.get(name, 0) + 1
+		if desired_class == 'SPG':
+			spg_count += 1
+		if desired_tier in tier_slots:
+			tier_slots.remove(desired_tier)
+		elif tier_slots:
+			tier_slots.pop()
+		if desired_class in class_slots:
+			class_slots.remove(desired_class)
+		elif class_slots:
+			class_slots.pop()
+
+	for index in range(len(result), team_size):
+		desired_tier = tier_slots.pop() if tier_slots else player_tier
+		desired_class = class_slots.pop() if class_slots else player_class
+		choices = [candidate for candidate in usable
+			if int(candidate.get('level', 0) or 0) == desired_tier and
+			vehicle_match_class(candidate) == desired_class]
+		if not choices:
+			choices = [candidate for candidate in usable
+				if int(candidate.get('level', 0) or 0) == desired_tier]
+		if not choices:
+			choices = list(usable)
+		if spg_count >= 1:
+			regular = [candidate for candidate in choices
+				if vehicle_match_class(candidate) != 'SPG']
+			if regular:
+				choices = regular
+		try:
+			rng.shuffle(choices)
+		except Exception:
+			random.shuffle(choices)
+		candidate = min(choices, key=lambda value:
+			usage.get(str(value.get('name', '')), 0))
+		name = str(candidate.get('name', ''))
+		usage[name] = usage.get(name, 0) + 1
+		if vehicle_match_class(candidate) == 'SPG':
+			spg_count += 1
+		result.append(candidate)
+	return result
+
+
+def remaining_match_template(template, human_profiles):
+	"""Remove the closest template slot for each human already on a team."""
+	remaining = list(template or ())
+	for human in (human_profiles or ()):
+		if not remaining:
+			break
+		human_tier = int(human.get('level', 0) or 0)
+		human_class = vehicle_match_class(human)
+		best_index = 0
+		best_score = None
+		for index, candidate in enumerate(remaining):
+			candidate_tier = int(candidate.get('level', 0) or 0)
+			candidate_class = vehicle_match_class(candidate)
+			score = abs(candidate_tier - human_tier) * 3
+			if candidate_class != human_class:
+				score += 8
+			if best_score is None or score < best_score:
+				best_score = score
+				best_index = index
+		remaining.pop(best_index)
+	return remaining
+
+
+def bot_initially_visible(bot_team, player_team, spotting_enabled):
+	"""Hide an enemy model before its first spotting update can run."""
+	try:
+		return (not bool(spotting_enabled) or
+			int(bot_team) == int(player_team))
+	except Exception:
+		return not bool(spotting_enabled)
+
+
+def entity_visible_to_minimap(entity):
+	"""Expose a mock entity to the minimap only after its first spot."""
+	return bool(getattr(entity, '_spot_visible', True))
+
+
+def trimmed_sight_segment(observer, target, observer_height=2.5,
+		target_height=1.5, start_clearance=4.0, end_clearance=4.0):
+	"""Return a world ray that excludes the two vehicle hull volumes.
+
+	The legacy battle creates a ``PyModelObstacle`` for every mock vehicle.  A
+	world ray from centre to centre can therefore hit its shooter immediately or
+	the intended target at the far end and report a blocked lane.  Static-world
+	LOS only needs the part *between* the vehicles.  Very close vehicles have no
+	meaningful middle segment and are considered mutually exposed by returning
+	``None``.
+	"""
+	try:
+		ox = float(observer[0]); oy = float(observer[1]); oz = float(observer[2])
+		tx = float(target[0]); ty = float(target[1]); tz = float(target[2])
+		dx = tx - ox
+		dz = tz - oz
+		distance = math.sqrt(dx * dx + dz * dz)
+		start_clearance = max(0.0, float(start_clearance))
+		end_clearance = max(0.0, float(end_clearance))
+		if distance <= start_clearance + end_clearance + 0.5:
+			return None
+		unit_x = dx / distance
+		unit_z = dz / distance
+		return (
+			(ox + unit_x * start_clearance, oy + float(observer_height),
+			 oz + unit_z * start_clearance),
+			(tx - unit_x * end_clearance, ty + float(target_height),
+			 tz - unit_z * end_clearance),
+		)
+	except Exception:
+		return ()
+
+
+def route_toward_enemy(route, team, bases):
+	"""Orient a multi-point route from the own flag to the enemy flag."""
+	result = dict(route or {})
+	result['role_weights'] = dict(result.get('role_weights', {}) or {})
+	points = list(result.get('waypoints', ()) or ())
+	if len(points) < 2:
+		result['waypoints'] = tuple(points)
+		return result
+	try:
+		own = bases.get(int(team))
+		enemy = bases.get(3 - int(team))
+		if own is None or enemy is None:
+			result['waypoints'] = tuple(points)
+			return result
+		def _distance(point, base):
+			return ((float(point[0]) - float(base[0])) ** 2 +
+				(float(point[1]) - float(base[1])) ** 2)
+		forward = _distance(points[0], own) + _distance(points[-1], enemy)
+		reverse = _distance(points[-1], own) + _distance(points[0], enemy)
+		if reverse < forward:
+			points.reverse()
+		own_point = (float(own[0]), float(own[1]), 0)
+		enemy_point = (float(enemy[0]), float(enemy[1]), 0)
+		if _distance(points[0], own) > 1.0:
+			points.insert(0, own_point)
+		else:
+			points[0] = own_point
+		if _distance(points[-1], enemy) > 1.0:
+			points.append(enemy_point)
+		else:
+			points[-1] = enemy_point
+	except Exception:
+		pass
+	result['waypoints'] = tuple(points)
+	return result
 
 
 def _mapping_get(value, key, default=None):
@@ -260,18 +663,63 @@ def _angle_delta(target, current):
 	return delta
 
 
+def _map_data_with_baked_routes(map_data, baked_routes):
+	"""Return tactical metadata with graph-validated locomotion waypoints."""
+	if map_data is None or not isinstance(baked_routes, dict):
+		return map_data
+	result = dict(map_data)
+	routes = {}
+	for team in (1, 2):
+		converted = []
+		values = baked_routes.get(str(team), baked_routes.get(team, ())) or ()
+		for raw in values:
+			if not isinstance(raw, dict):
+				continue
+			waypoints = []
+			for point in raw.get('waypoints', ()) or ():
+				try:
+					waypoints.append((float(point[0]), float(point[1]),
+					                  bool(point[2]) if len(point) > 2 else False))
+				except Exception:
+					continue
+			if not waypoints:
+				continue
+			route = dict(raw)
+			route['role_weights'] = dict(raw.get('role_weights', {}) or {})
+			route['waypoints'] = tuple(waypoints)
+			converted.append(route)
+		routes[team] = tuple(converted)
+	if not routes.get(1) or not routes.get(2):
+		return map_data
+	result['routes'] = routes
+	# Baked routes already carry their team orientation and graph-validated
+	# endpoints.  They must not be passed through the legacy static-base
+	# orientation helper, which may insert two unvalidated points and exceed the
+	# 16-waypoint LAN protocol boundary.
+	result['_routes_are_baked'] = True
+	return result
+
+
 class BattleDirector(object):
 	"""Shared per-battle planner for both teams."""
 
-	def __init__(self, map_name, battle_seed, bases=None, bounds=None):
+	def __init__(self, map_name, battle_seed, bases=None, bounds=None,
+	             baked_routes=None):
 		self.map_name = bot_ai_maps.normalize_map_name(map_name)
 		self.battle_seed = stable_seed(battle_seed, self.map_name)
-		self.map_data = bot_ai_maps.get_tactical_map(self.map_name)
-		self.bases = dict(bases or {})
+		self.map_data = _map_data_with_baked_routes(
+			bot_ai_maps.get_tactical_map(self.map_name), baked_routes)
+		self._routes_are_baked = bool(
+			self.map_data is not None and
+			self.map_data.get('_routes_are_baked', False))
+		self.bases = {}
 		self.bounds = bounds
 		if self.map_data is not None:
 			self.bases.update(self.map_data.get('bases', {}))
 			self.bounds = self.map_data.get('bounds', self.bounds)
+		# The live arena definition is authoritative. Static tactical data only
+		# supplies a fallback for tests or incomplete legacy DataSections.
+		self.bases.update(dict(bases or {}))
 		self.agents = {}
 		self.contacts = {1: {}, 2: {}}
 		self.route_usage = {}
@@ -299,7 +747,6 @@ class BattleDirector(object):
 			'seed': seed,
 			'route': None,
 			'waypoint_index': 0,
-			'hold_started': None,
 			'target_id': None,
 			'last_order': None,
 			'position': None,
@@ -318,6 +765,17 @@ class BattleDirector(object):
 		routes = self._routes_for(agent['team'])
 		if not routes:
 			return None
+		# Capacities are a lane distribution contract, not a soft preference.
+		# Without this gate a strongly specialised lineup can all choose the same
+		# corridor even though the map advertises several viable approaches.
+		open_routes = []
+		for route in routes:
+			key = (agent['team'], route.get('id'))
+			capacity = max(1, int(route.get('capacity', 1)))
+			if int(self.route_usage.get(key, 0)) < capacity:
+				open_routes.append(route)
+		if open_routes:
+			routes = tuple(open_routes)
 		profile = agent['profile']
 		personality = agent['personality']
 		best = None
@@ -344,11 +802,20 @@ class BattleDirector(object):
 		if best is not None:
 			key = (agent['team'], best.get('id'))
 			self.route_usage[key] = int(self.route_usage.get(key, 0)) + 1
-		return best
+			if self._routes_are_baked:
+				result = dict(best)
+				result['role_weights'] = dict(
+					best.get('role_weights', {}) or {})
+				result['waypoints'] = tuple(
+					tuple(point) for point in
+					best.get('waypoints', ()) or ())
+				return result
+			return route_toward_enemy(best, agent['team'], self.bases)
+		return None
 
 	def update_contact(self, observing_team, target_id, target_team, position,
 	                   health, max_health, class_tag, visible, now,
-	                   armor=0.0, speed=0.0):
+	                   armor=0.0, speed=0.0, shootable_by_ids=None):
 		observing_team = int(observing_team)
 		if observing_team == int(target_team):
 			return
@@ -366,9 +833,12 @@ class BattleDirector(object):
 				'speed': max(0.0, _number(speed, 0.0)),
 				'visible': True,
 				'last_seen': _number(now),
+				'shootable_by_ids': (tuple(int(value) for value in shootable_by_ids)
+				                     if shootable_by_ids is not None else None),
 			}
 		elif contact is not None:
 			contact['visible'] = False
+			contact['shootable_by_ids'] = ()
 
 	def _known_contacts(self, team, now):
 		known = []
@@ -447,6 +917,20 @@ class BattleDirector(object):
 			distance = _distance_2d(position, contact['position'])
 			age = max(0.0, _number(now) - _number(contact.get('last_seen')))
 			visible = bool(contact.get('visible'))
+			shootable_by_ids = contact.get('shootable_by_ids')
+			if (visible and shootable_by_ids is not None and
+					int(agent['id']) not in shootable_by_ids):
+				continue
+			focus = self._focus_count(agent['team'], contact['id'])
+			desired_focus = self._desired_focus(contact)
+			if (focus >= desired_focus and contact['id'] != agent.get('target_id')):
+				continue
+			roles = profile.get('roles', {})
+			mobility = max(_number(roles.get('scout')), _number(roles.get('flanker')))
+			engagement_range = max(340.0, min(
+				560.0, profile['desired_range'] * 2.0 + mobility * 300.0))
+			if distance > engagement_range:
+				continue
 			health_fraction = contact['health'] / max(contact['max_health'], 1.0)
 			dx = contact['position'][0] - position[0]
 			dz = contact['position'][2] - position[2]
@@ -457,8 +941,6 @@ class BattleDirector(object):
 			score += (1.0 - health_fraction) * 38.0
 			score -= range_error * (14.0 - personality['aggression'] * 5.0)
 			score -= turn_cost * 12.0
-			focus = self._focus_count(agent['team'], contact['id'])
-			desired_focus = self._desired_focus(contact)
 			if focus < desired_focus:
 				score += focus * personality['teamwork'] * 4.0
 			else:
@@ -474,7 +956,7 @@ class BattleDirector(object):
 		agent['target_id'] = best.get('id') if best is not None else None
 		return best
 
-	def _route_position(self, agent, position, now):
+	def _route_position(self, agent, position, now, hull_yaw=None):
 		route = agent.get('route')
 		if route is None:
 			enemy_base = self.bases.get(2 if agent['team'] == 1 else 1)
@@ -484,20 +966,42 @@ class BattleDirector(object):
 		waypoints = route.get('waypoints', ())
 		if not waypoints:
 			return tuple(position)
+		if not agent.get('route_started', False):
+			nearest = min(range(len(waypoints)), key=lambda value:
+				_distance_2d(position, (float(waypoints[value][0]),
+					position[1], float(waypoints[value][1]))))
+			# Point zero is the own flag. The formation is deployed in front of
+			# it, so entering battle must continue to the first tactical point.
+			if nearest == 0 and len(waypoints) > 1:
+				nearest = 1
+			# Baked routes may contain one or two short connectors around the flag.
+			# A formation slot can already be beyond them, making the nearest connector
+			# sit behind the hull. Let A* join the first meaningful route anchor.
+			while (nearest + 1 < len(waypoints) and
+					_distance_2d(position, (float(waypoints[nearest][0]),
+					position[1], float(waypoints[nearest][1]))) < 30.0):
+				nearest += 1
+			# A deployed formation can be closer to a connector that it has already
+			# passed than to the next lane point. Joining that connector makes every
+			# hull turn back toward its own flag before it may leave spawn. Only skip
+			# a genuinely rear-facing point and preserve lateral lane openings.
+			if hull_yaw is not None:
+				while nearest + 1 < len(waypoints):
+					waypoint = waypoints[nearest]
+					bearing = math.atan2(
+						float(waypoint[0]) - float(position[0]),
+						float(waypoint[1]) - float(position[2]))
+					if abs(_angle_delta(bearing, float(hull_yaw))) <= 1.75:
+						break
+					nearest += 1
+			agent['waypoint_index'] = nearest
+			agent['route_started'] = True
+			agent['route_join_anchor'] = tuple(position)
+			agent['route_join_index'] = nearest
 		index = min(int(agent.get('waypoint_index', 0)), len(waypoints) - 1)
 		waypoint = waypoints[index]
 		world = (float(waypoint[0]), float(position[1]), float(waypoint[1]))
 		if _distance_2d(position, world) <= 13.0:
-			hold = bool(waypoint[2]) if len(waypoint) > 2 else False
-			if hold:
-				if agent.get('hold_started') is None:
-					agent['hold_started'] = _number(now)
-				hold_time = (6.0 + agent['personality']['patience'] * 8.0 -
-				             agent['personality']['aggression'] * 3.0 +
-				             agent['personality']['hold_jitter'])
-				if _number(now) - agent['hold_started'] < max(2.5, hold_time):
-					return tuple(position)
-			agent['hold_started'] = None
 			if index + 1 < len(waypoints):
 				agent['waypoint_index'] = index + 1
 				waypoint = waypoints[index + 1]
@@ -521,7 +1025,13 @@ class BattleDirector(object):
 		waypoints = route.get('waypoints', ()) if route is not None else ()
 		if not waypoints:
 			return tuple(position)
-		index = max(0, min(int(agent.get('waypoint_index', 0)) - 1,
+		index = max(0, min(int(agent.get('waypoint_index', 0)),
+		                   len(waypoints) - 1))
+		if int(agent.get('route_join_index', -1)) == index:
+			anchor = agent.get('route_join_anchor')
+			if anchor is not None:
+				return tuple(anchor)
+		index = max(0, min(index - 1,
 		                   len(waypoints) - 1))
 		waypoint = waypoints[index]
 		return (float(waypoint[0]), float(position[1]), float(waypoint[1]))
@@ -554,7 +1064,7 @@ class BattleDirector(object):
 		agent['health_fraction'] = (
 			_number(health, 1.0) / max(_number(max_health, 1.0), 1.0))
 		contact = self._choose_contact(agent, position, hull_yaw, now)
-		route_position = self._route_position(agent, position, now)
+		route_position = self._route_position(agent, position, now, hull_yaw)
 		profile = agent['profile']
 		personality = agent['personality']
 		order = {
@@ -596,14 +1106,9 @@ class BattleDirector(object):
 				        profile['dominant_role'] != 'brawler'):
 					order['move_position'] = self._fallback_position(agent, position)
 					order['combat_mode'] = 'withdraw'
-				elif (profile['roles'].get('flanker', 0.0) >= 0.68 and
-				      distance < profile['fire_range'] * 1.15 and
-				      force_balance >= -0.35 and personality['initiative'] > 0.38):
-					order['move_position'] = self._flank_position(
-						agent, position, contact['position'])
-					order['combat_mode'] = 'flank'
 				elif distance > profile['desired_range'] * far_ratio:
 					order['move_position'] = contact['position']
+					order['combat_mode'] = 'advance_contact'
 				elif distance < profile['desired_range'] * close_ratio:
 					# Use the route as a known-safe fallback instead of reversing into
 					# arbitrary geometry. Brawlers with high aggression are less eager.
@@ -612,6 +1117,12 @@ class BattleDirector(object):
 						order['combat_mode'] = 'withdraw'
 					else:
 						order['move_position'] = tuple(position)
+				elif (profile['roles'].get('flanker', 0.0) >= 0.68 and
+				      distance < profile['fire_range'] * 1.15 and
+				      force_balance >= -0.35 and personality['initiative'] > 0.38):
+					order['move_position'] = self._flank_position(
+						agent, position, contact['position'])
+					order['combat_mode'] = 'flank'
 				else:
 					order['move_position'] = tuple(position)
 				# Some armoured turreted drivers habitually rock their hull while

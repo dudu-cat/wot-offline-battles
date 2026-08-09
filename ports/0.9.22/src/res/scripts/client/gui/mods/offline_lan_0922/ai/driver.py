@@ -38,6 +38,74 @@ def _identity_phase(bot_id):
 	return float(value % 997) / 997.0
 
 
+def _component_value(component, name, default=None):
+	if component is None:
+		return default
+	if isinstance(component, dict):
+		return component.get(name, default)
+	return getattr(component, name, default)
+
+
+def gun_yaw_limits(descriptor):
+	"""Return installed gun yaw limits in radians plus a limited-arc flag."""
+	gun = _component_value(descriptor, 'gun')
+	turret = _component_value(descriptor, 'turret')
+	limits = _component_value(gun, 'turretYawLimits')
+	if limits is None:
+		limits = _component_value(turret, 'yawLimits')
+	minimum = -math.pi
+	maximum = math.pi
+	try:
+		minimum = float(limits[0])
+		maximum = float(limits[1])
+		if abs(minimum) > math.pi + 0.1 or abs(maximum) > math.pi + 0.1:
+			minimum = math.radians(minimum)
+			maximum = math.radians(maximum)
+	except Exception:
+		minimum = -math.pi
+		maximum = math.pi
+	limited = not (minimum <= -math.pi + 0.1 and maximum >= math.pi - 0.1)
+	return minimum, maximum, limited
+
+
+def combat_hull_aim(hull_yaw, target_yaw, minimum_yaw, maximum_yaw,
+		turn, throttle, recovery_mode, has_target=True):
+	"""Turn a limited-traverse hull until its gun can physically bear."""
+	if not has_target or recovery_mode in ('avoid', 'blocked', 'reverse_turn',
+			'pivot_recovery'):
+		return float(turn), float(throttle), False
+	limited = not (float(minimum_yaw) <= -math.pi + 0.1 and
+	               float(maximum_yaw) >= math.pi - 0.1)
+	if not limited:
+		return float(turn), float(throttle), False
+	relative = _angle_delta(target_yaw, hull_yaw)
+	if float(minimum_yaw) + 0.04 <= relative <= float(maximum_yaw) - 0.04:
+		return float(turn), float(throttle), False
+	# Rotate before the physics step. The former post-physics velocity write was
+	# overwritten by LocalDriver on the next frame and never moved the hull.
+	hull_delta = _angle_delta(target_yaw, hull_yaw)
+	aim_turn = max(-1.0, min(1.0, hull_delta / 0.58))
+	return aim_turn, 0.0, True
+
+
+def gun_aligned(target_yaw, hull_yaw, turret_yaw, desired_pitch, gun_pitch,
+		yaw_tolerance=0.06, pitch_tolerance=0.04):
+	"""Require both rendered traverse and elevation to settle before firing."""
+	abs_yaw = float(hull_yaw) + float(turret_yaw)
+	yaw_error = abs(_angle_delta(target_yaw, abs_yaw))
+	pitch_error = abs(float(desired_pitch) - float(gun_pitch))
+	return (yaw_error <= float(yaw_tolerance) and
+	        pitch_error <= float(pitch_tolerance))
+
+
+def barrel_direction(yaw, pitch):
+	"""Unit direction for BigWorld's negative-pitch-is-up convention."""
+	horizontal = math.cos(float(pitch))
+	return (math.sin(float(yaw)) * horizontal,
+	        -math.sin(float(pitch)),
+	        math.cos(float(yaw)) * horizontal)
+
+
 class LocalDriver(object):
 	"""Stateful local steering, keyed only by bot id.
 
@@ -45,7 +113,12 @@ class LocalDriver(object):
 	segment in that direction is drivable.  It may raise; a failed probe is
 	treated as blocked.
 	"""
-	_CANDIDATE_OFFSETS = (0.0, 0.42, -0.42, 0.78, -0.78, 1.18, -1.18)
+	_CANDIDATE_OFFSETS = (
+		0.0, 0.42, -0.42, 0.78, -0.78, 1.18, -1.18, 1.55, -1.55)
+	gun_yaw_limits = staticmethod(gun_yaw_limits)
+	combat_hull_aim = staticmethod(combat_hull_aim)
+	gun_aligned = staticmethod(gun_aligned)
+	barrel_direction = staticmethod(barrel_direction)
 
 	def __init__(self, stuck_seconds=1.8, recovery_seconds=0.85,
 			separation_radius=12.0, failure_ttl=2.0):
@@ -54,6 +127,22 @@ class LocalDriver(object):
 		self.separation_radius = max(2.0, float(separation_radius))
 		self.failure_ttl = max(0.25, float(failure_ttl))
 		self.states = {}
+
+	@staticmethod
+	def resolve_order_positions(position, aim_position, move_position, face_position):
+		"""Resolve optional tactical targets without mistaking travel for a hold."""
+		stop_without_route = aim_position is None and move_position is None
+		if stop_without_route:
+			aim_position = position
+		elif aim_position is None:
+			# Server route orders intentionally omit an aim target until an enemy is
+			# spotted.  Use the route target for facing, but do not apply idle braking.
+			aim_position = move_position
+		if move_position is None:
+			move_position = aim_position
+		if face_position is None:
+			face_position = move_position
+		return aim_position, move_position, face_position, stop_without_route
 
 	def forget(self, bot_id):
 		self.states.pop(bot_id, None)
@@ -118,7 +207,14 @@ class LocalDriver(object):
 			return neighbour.get('position') or neighbour.get('pos')
 		return neighbour
 
-	def _separation_yaw(self, position, neighbours):
+	def _separation_yaw(self, position, desired_yaw, neighbours,
+			half_length, half_width):
+		"""Return an escape heading only for hulls that already overlap.
+
+		Moving OBB prediction handles impending collisions. Treating every tank
+		inside a broad radius as an emergency made harmless side-by-side traffic
+		continually override the route and visibly reconsider its steering.
+		"""
 		push_x = 0.0
 		push_z = 0.0
 		for neighbour in neighbours or ():
@@ -143,7 +239,18 @@ class LocalDriver(object):
 				continue
 			if dist < 0.05 or dist >= self.separation_radius:
 				continue
-			weight = (self.separation_radius - dist) / self.separation_radius
+			other_yaw = 0.0
+			other_length = half_length
+			other_width = half_width
+			if isinstance(neighbour, dict):
+				other_yaw = float(neighbour.get('yaw', 0.0) or 0.0)
+				other_length = float(neighbour.get('half_length', half_length) or half_length)
+				other_width = float(neighbour.get('half_width', half_width) or half_width)
+			if not self._obb_overlap(
+					position, desired_yaw, half_length + 0.20, half_width + 0.20,
+					other, other_yaw, other_length + 0.20, other_width + 0.20):
+				continue
+			weight = max(0.15, (self.separation_radius - dist) / self.separation_radius)
 			push_x += dx / dist * weight
 			push_z += dz / dist * weight
 		if abs(push_x) + abs(push_z) < 0.001:
@@ -194,6 +301,13 @@ class LocalDriver(object):
 				neighbours, half_length, half_width):
 		"""Reject a locally clear ray if its next 1.2s overlaps another OBB."""
 		own_speed = max(0.0, abs(float(speed)))
+		# At walking pace there is not enough velocity for an OBB extrapolation
+		# to be useful.  In a dense line-up it instead predicts every neighbour's
+		# acceleration against a nearly stationary hull and vetoes all exits.
+		# Separation steering and the physical tank resolver remain active; resume
+		# predictive collision avoidance once the bot has actually got moving.
+		if own_speed < 1.25:
+			return True
 		desired_vx = math.sin(candidate_yaw) * own_speed
 		desired_vz = math.cos(candidate_yaw) * own_speed
 		actual_vx, actual_vz = self._velocity(velocity)
@@ -224,6 +338,14 @@ class LocalDriver(object):
 				other_length = float(neighbour.get('half_length', half_length) or half_length)
 				other_width = float(neighbour.get('half_width', half_width) or half_width)
 			other_vx, other_vz = self._velocity(other_velocity)
+			# Spawn formations can place two hull boxes slightly inside each other.
+			# Treating that existing overlap as a future collision rejects every
+			# steering candidate, so all bots stop and enter the recovery turn loop.
+			# Separation steering already handles this case; predictive vetoes resume
+			# as soon as the hulls have moved apart.
+			if self._obb_overlap(position, candidate_yaw, half_length, half_width,
+					other, other_yaw, other_length, other_width):
+				continue
 			for horizon in (0.35, 0.75, 1.20):
 				own = (float(position[0]) + own_vx * horizon, 0.0,
 				       float(position[2]) + own_vz * horizon)
@@ -236,7 +358,8 @@ class LocalDriver(object):
 
 	def _choose_yaw(self, state, desired_yaw, position, speed, velocity,
 				neighbours, direction_clear, half_length, half_width):
-		separation = self._separation_yaw(position, neighbours)
+		separation = self._separation_yaw(
+			position, desired_yaw, neighbours, half_length, half_width)
 		candidates = []
 		for offset in self._CANDIDATE_OFFSETS:
 			candidate = desired_yaw + offset
@@ -257,7 +380,8 @@ class LocalDriver(object):
 		return None
 
 	def drive(self, bot_id, position, yaw, speed, dt, target, neighbours,
-			direction_clear, velocity=None, half_length=3.5, half_width=1.7):
+			direction_clear, velocity=None, half_length=3.5, half_width=1.7,
+			movement_intent=True):
 		"""Return ``throttle``, ``turn``, ``target_yaw`` and ``recovery_mode``.
 
 		All timing uses supplied seconds.  ``dt`` is clamped so a paused client
@@ -270,10 +394,35 @@ class LocalDriver(object):
 		state['steering_age'] += step
 		state['plan_age'] += step
 		desired_yaw = _yaw_to(position, target)
+		target_distance = _distance(position, target)
+		if not movement_intent:
+			# Cover/engagement orders intentionally stop within a tolerance. Do not
+			# reinterpret that commanded hold as a stuck tank 1.8 seconds later.
+			state['stuck_time'] = 0.0
+			state['recovery_time'] = 0.0
+			state['steering_yaw'] = None
+			return {
+				'throttle': 0.0,
+				'turn': 0.0,
+				'target_yaw': float(yaw),
+				'recovery_mode': 'arrived',
+			}
 		displacement = _distance((position[0], 0.0, position[2]),
 		                         (state['last_position'][0], 0.0,
 		                          state['last_position'][1]))
 		state['last_position'] = (float(position[0]), float(position[2]))
+		if target_distance <= 1.5:
+			# Reaching a waypoint is a stop, not a request to drive north: atan2(0, 0)
+			# is zero and previously produced full throttle until the next order tick.
+			state['stuck_time'] = 0.0
+			state['recovery_time'] = 0.0
+			state['steering_yaw'] = None
+			return {
+				'throttle': 0.0,
+				'turn': 0.0,
+				'target_yaw': float(yaw),
+				'recovery_mode': 'arrived',
+			}
 
 		# A low reported speed alone is not enough: waiting at a hold point should
 		# not trigger recovery.  Both physical displacement and velocity must fail.
@@ -297,12 +446,24 @@ class LocalDriver(object):
 
 		if state['recovery_time'] > 0.0:
 			# Alternate the turn direction each recovery so a bot does not grind a
-			# wall forever.  Phase makes adjacent ids leave a traffic jam apart.
+			# wall forever.  Phase makes adjacent ids leave a traffic jam apart. Never
+			# reverse blindly: at a cliff or shoreline the space behind the hull can be
+			# the unsafe side that caused the stall in the first place.
 			direction = 1.0 if ((state['recovery_count'] + int(state['phase'] * 10)) % 2) else -1.0
 			recovery_yaw = float(yaw) + direction * 0.85
+			if not self._clear(direction_clear, float(yaw) + math.pi):
+				return {
+					'throttle': 0.0,
+					'turn': direction,
+					'target_yaw': recovery_yaw,
+					'recovery_mode': 'pivot_recovery',
+				}
+			# Reverse recovery is an explicit reverse command. The traverse law flips
+			# steering from that command immediately, not from signed velocity.
+			recovery_turn = -direction
 			return {
 				'throttle': -0.72,
-				'turn': direction,
+				'turn': recovery_turn,
 				'target_yaw': recovery_yaw,
 				'recovery_mode': 'reverse_turn',
 			}
@@ -311,11 +472,14 @@ class LocalDriver(object):
 		own_half_width = max(0.3, float(half_width))
 		chosen_yaw = None
 		old_yaw = state.get('steering_yaw')
-		# Keep a recently selected steering direction for 180 ms, but revalidate
-		# both the hard terrain probe and moving OBBs every frame. This avoids a
-		# full seven-way probe when the previous safe direction still works.
-		if (old_yaw is not None and state['plan_age'] < 0.18 and
-				abs(_angle_delta(desired_yaw, old_yaw)) < 0.70 and
+		# Keep a clear avoidance branch long enough for the hull to pass the wall,
+		# while retaining the shorter cadence for an unobstructed route heading.
+		# Replanning a symmetric left/right choice every few frames made bots wag
+		# in front of flat walls without committing to either exit.
+		hold_seconds = (1.20 if old_yaw is not None and
+			abs(_angle_delta(desired_yaw, old_yaw)) > 0.05 else 0.35)
+		if (old_yaw is not None and state['plan_age'] < hold_seconds and
+				abs(_angle_delta(desired_yaw, old_yaw)) < 2.15 and
 				self._failure_penalty(state, old_yaw) <= 0.0 and
 				self._clear(direction_clear, old_yaw) and
 				self._prediction_clear(position, old_yaw, speed, velocity,
@@ -347,14 +511,19 @@ class LocalDriver(object):
 
 		delta = _angle_delta(chosen_yaw, yaw)
 		turn = max(-1.0, min(1.0, delta / 0.58))
+		# This branch commands forward drive. Signed speed can still be negative
+		# while braking a recovery or sliding downhill; steering remains forward.
+		avoiding = abs(_angle_delta(chosen_yaw, desired_yaw)) > 0.05
 		throttle = 1.0
-		if abs(delta) > 1.0:
-			throttle = 0.35
-		elif abs(delta) > 0.55:
-			throttle = 0.62
+		if abs(delta) > 1.35 and not avoiding:
+			# A target more than about 77 degrees off the bow is a pivot, not a
+			# clearing arc. Driving while applying full steering makes a deployed
+			# formation draw a loop before it can enter its lane. Separation remains
+			# allowed to move an overlapping hull sideways out of a dense spawn.
+			throttle = 0.0
 		return {
 			'throttle': throttle,
 			'turn': turn,
 			'target_yaw': chosen_yaw,
-			'recovery_mode': 'avoid' if abs(_angle_delta(chosen_yaw, desired_yaw)) > 0.05 else 'drive',
+			'recovery_mode': 'avoid' if avoiding else 'drive',
 		}

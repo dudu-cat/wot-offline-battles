@@ -19,7 +19,8 @@ def _load():
 class Maps0922ExtraTests(unittest.TestCase):
     def test_all_new_arena_defs_have_coarse_two_team_routes(self):
         maps = _load().TACTICAL_MAPS_0922_EXTRA
-        self.assertEqual(14, len(maps))
+        self.assertEqual(13, len(maps))
+        self.assertNotIn('217_er_alaska', maps)
         for name, data in maps.items():
             self.assertEqual(name, data['name'])
             self.assertEqual('coarse-minimap-bounds', data['annotation_confidence'])
@@ -28,3 +29,14 @@ class Maps0922ExtraTests(unittest.TestCase):
             self.assertGreaterEqual(len(data['routes'][2]), 3)
             for route in data['routes'][1] + data['routes'][2]:
                 self.assertGreaterEqual(len(route['waypoints']), 3)
+
+    def test_dday_routes_follow_the_packed_ctf_north_south_axis(self):
+        data = _load().TACTICAL_MAPS_0922_EXTRA['101_dday']
+        self.assertEqual({1: (150.0, -403.0), 2: (150.0, 400.0)},
+                         data['bases'])
+        for route in data['routes'][1]:
+            self.assertEqual((150, -403, 0), route['waypoints'][0])
+            self.assertEqual((150, 400, 0), route['waypoints'][-1])
+        for route in data['routes'][2]:
+            self.assertEqual((150, 400, 0), route['waypoints'][0])
+            self.assertEqual((150, -403, 0), route['waypoints'][-1])

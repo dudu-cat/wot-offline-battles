@@ -35,6 +35,8 @@ PINNED_ENTITY_DEFINITION_SHA256 = {
         '20892cd23c5fe285927e599a197ba99436032207c5c071aa726febc42b59274d',
     'scripts/entity_defs/Avatar.def':
         'ddbfb9fb94b574ba5133ff272eab81ad798eea535e4a64d37865cff5b8b91831',
+    'scripts/entity_defs/Vehicle.def':
+        'e585c59235ebb2cfbb7857645878ed095360a8efe5df666c055e59a74e6a55c5',
     'scripts/entity_defs/interfaces/AvatarObserver.def':
         'fbf32f5462d959648f60757288a49a63cd194df0a77618a703d96d8096a456d8',
 }
@@ -56,6 +58,11 @@ TARGET_BUILD = '1513'
 TARGET_WOTMOD_PATH = './mods/0.9.22.0.1'
 TARGET_RESMODS_PATH = './res_mods/0.9.22.0.1'
 PE_MACHINE_I386 = 0x014C
+WG_FILTER_REQUIRED_METHODS = (
+    'notifyInputKeysDown', 'setVehiclePhysics', 'getVehiclePhysics',
+    'setTracksSpeed', 'syncGunAngles',
+)
+WG_FILTER_FORBIDDEN_POSE_METHODS = ('set', 'setPosition')
 
 
 def _text(element):
@@ -78,6 +85,35 @@ def _read_pe_machine(path):
         if len(machine_raw) != 2:
             raise ValueError('WorldOfTanks.exe has a truncated COFF header')
         return int.from_bytes(machine_raw, 'little')
+
+
+def _inspect_wg_vehicle_filter(path):
+    """Read the pinned native Python method table without loading the EXE."""
+    payload = path.read_bytes()
+    start = payload.find(b'PyWGVehicleFilter\0')
+    if start < 0:
+        raise ValueError(
+            'WorldOfTanks.exe has no PyWGVehicleFilter method table')
+    end = payload.find(b'PyWGTurretFilter\0', start)
+    if end < 0 or end - start > 0x4000:
+        raise ValueError(
+            'WorldOfTanks.exe has an unbounded PyWGVehicleFilter method table')
+    table = payload[start:end]
+    missing = [name for name in WG_FILTER_REQUIRED_METHODS
+               if (name.encode('ascii') + b'\0') not in table]
+    present_forbidden = [name for name in WG_FILTER_FORBIDDEN_POSE_METHODS
+                         if (name.encode('ascii') + b'\0') in table]
+    if missing:
+        raise ValueError('PyWGVehicleFilter methods are missing: %s' %
+                         ', '.join(missing))
+    if present_forbidden:
+        raise ValueError('unexpected PyWGVehicleFilter pose methods: %s' %
+                         ', '.join(present_forbidden))
+    return {
+        'tableOffset': '0x%x' % start,
+        'requiredMethods': list(WG_FILTER_REQUIRED_METHODS),
+        'absentPoseMethods': list(WG_FILTER_FORBIDDEN_POSE_METHODS),
+    }
 
 
 def inspect_client(client_root):
@@ -141,6 +177,7 @@ def inspect_client(client_root):
                     missing_assets.append('%s:%s' % (package_name, member))
 
     machine = _read_pe_machine(executable_path)
+    native_vehicle_filter = _inspect_wg_vehicle_filter(executable_path)
     errors = []
     if version_match.group(1) != TARGET_VERSION:
         errors.append('version must be %s' % TARGET_VERSION)
@@ -177,6 +214,7 @@ def inspect_client(client_root):
         'resModsPath': res_mod_path,
         'peMachine': '0x%04x' % machine,
         'architecture': 'x86',
+        'nativeVehicleFilter': native_vehicle_filter,
         'battleProbeAssets': '01_karelia + ussr:R11_MS-1',
         'entityDefinitionSha256': entity_definition_hashes,
         'scriptsPackageBytes': archive_path.stat().st_size,

@@ -1,4 +1,4 @@
-World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.14
+World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.41
 ================================================================
 
 This folder is directly mergeable into the frozen Chinese HD client root.
@@ -17,6 +17,20 @@ client pins an empty server room to one build; a legacy 0.8.2 client cannot join
 that room because its map and coordinate contracts are different. Use another
 server port for a simultaneous 0.8.2 room.
 
+Version 0.3.41 retains the local gun/shot, collision, spotting and foliage
+fixes. It installs one live pose before native input startup for camera, gun,
+sniper and minimap consumers; hides unspotted/dead private entities from native
+aiming and projectile lookup; restores RPM presentation; and renders admitted
+hit direction, health, shot-result and battle-event feedback. Critical hits are
+calculated on detached state and committed only through revisioned server
+events. Their ordered journal waits for staged Vehicles before native
+presentation and also prevents snapshot repair rewind. Hidden bot pose and aim
+updates use the private authority registry without widening the native AOI.
+Bot collision now uses the
+measured 0.8.2 spatial broadphase;
+planning is staggered near 10 Hz while physics, gun and network publication
+remain at 30 Hz. Do not mix it with an older 0.9.22 wotmod.
+
 Install
 -------
 
@@ -30,7 +44,7 @@ Install
 3. Copy this folder's `mods` directory into the game root.
 4. Confirm this file exists:
 
-       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.14.wotmod
+       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.41.wotmod
 
 5. This copy-ready package includes:
 
@@ -38,6 +52,8 @@ Install
 
    It is preconfigured for the server address shown in that file. You can also
    change the address in the native LAN settings window described below.
+   The same config directory contains validated `navgraphs` and `foliage`
+   batches for all 41 supported maps; keep both directories intact.
 
 Start the server
 ----------------
@@ -77,12 +93,17 @@ Start a battle
    Closing the host picker leaves it closed; the host clicks Battle! to reopen
    it.
 8. The server starts the selected map and fills both teams to 15 vehicles.
-   The stock 15-second prebattle countdown runs while bot Vehicles are loaded;
-   movement and shooting unlock only when it reaches battle. The battle debug
-   panel then shows the LAN socket RTT rather than retail-server ping.
+   The shared 15-second prebattle countdown runs after every human vehicle has
+   loaded and the authority has published the bot line-up. Bots continue to
+   appear during that countdown, matching the 0.8.2 battle flow. Player
+   movement and shooting unlock only when it reaches battle. The server sends
+   one ordered tick-zero barrier before snapshots; each client projects its
+   relative timing from the network receive timestamp on a monotonic clock.
+   The battle debug panel then shows the LAN socket RTT rather than
+   retail-server ping.
 
 After a team is eliminated, the battle freezes and returns all connected
-players to the waiting room after three seconds. The current host receives the
+players to the waiting room after five seconds. The current host receives the
 map picker again. If the host leaves while waiting, ownership and the picker
 move to the lowest connected player id. New connections are rejected while a
 round is active and may join after the room returns to waiting.
@@ -91,7 +112,7 @@ Troubleshooting
 ---------------
 
 - `unsupported compression type`: an older or incorrectly compressed wotmod
-  is still present. Keep only the 0.3.14 package; its members use Store method.
+  is still present. Keep only the 0.3.41 package; its members use Store method.
 - No connection in the server terminal: check `config.json`, the host LAN IP,
   virtual-machine network mode and TCP 28782 firewall access. A failed attempt
   automatically opens the native endpoint editor; Battle! can reopen it.
@@ -102,13 +123,31 @@ Troubleshooting
 Current boundary
 ----------------
 
-The release uses native map, Avatar, Vehicle, HUD and collision resources, but
-local driving is bounded kinematic movement rather than retail server physics.
+The release uses native map, Avatar, Vehicle, HUD and collision resources.
+Player input follows stock #1513 `PlayerAvatar.moveVehicle` and
+`WGVehicleFilter.notifyInputKeysDown`; because no retail server supplies the
+resulting transform stream, the copied 0.8.2 integrator owns the canonical
+pose and feeds the native camera, gun, minimap and HUD consumers. Remote
+vehicles restore the mature 0.8.2 split: a Python gameplay identity owns
+pose/health/collision while a separate `OfflineEntity` owns the #1513 compound
+model. The LAN layer applies authoritative poses to that presentation and does
+not call the forbidden client-side `Entity.teleport` operation.
 Bots run on one elected client; the Python server owns shared HP, shot events,
-elimination and round reset. Base capture and non-standard modes are not
-implemented. The offline garage contains every complete standard-battle vehicle
+frags, human team-killer state, elimination, standard base capture, the
+15-minute timeout and round reset. Non-standard modes are not implemented.
+The bot stack uses the finalized 0.8.2 planner, local driver, reverse-steering
+recovery and server macro coordinator. Its #1513 navigation batch is baked
+from the real terrain, static collision and water resources for all 41
+supported standard maps; player and bot formation slots use the same safe
+spawn anchors and ground heights. Human player spotting applies the shared
+50/500-metre bounds, exact #1513 moving/still vehicle camouflage, shot penalty,
+allied relay, five-second memory and pair-specific foliage cover to enemy
+models, markers and minimap entries. Detailed post-battle statistics are not
+produced. The offline garage contains every complete standard-battle vehicle
 definition loadable by this client, with its stock configuration, full crew and
-default ammunition. Alternate module purchases and persistent garage mutations
-are not implemented. The account starts with 100,000,000 credits, 100,000,000
+default ammunition. Small repair kits, small medkits and hand extinguishers work
+through the stock battle equipment controls. Passive optional-device/skill
+modifiers, alternate module purchases and persistent garage mutations are not
+implemented. The account starts with 100,000,000 credits, 100,000,000
 free XP, 1,000,000 gold, 2,000 garage slots and 2,000 barracks berths. Do not
 install this mod into a current or online client.

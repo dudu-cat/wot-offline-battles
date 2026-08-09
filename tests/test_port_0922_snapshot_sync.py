@@ -74,6 +74,56 @@ class SnapshotSyncTests(unittest.TestCase):
         self.assertTrue(events[0]['snap'])
         self.assertEqual(40.0, events[0]['pose']['x'])
 
+    def test_remote_bot_prediction_does_not_cross_a_baked_hazard(self):
+        sync = self.module.SnapshotSync(
+            1, clock=lambda: self.now[0],
+            pose_safe=lambda pose: pose[0] < 5.0)
+        bot = player(7, 4.0)
+        sync.manifest({'round_id': 1, 'bots': [bot]})
+        sync.snapshot({'round_id': 1, 'server_tick': 1, 'bots': [bot]})
+        self.now[0] = 0.1
+        moved = player(7, 4.8)
+        sync.snapshot({'round_id': 1, 'server_tick': 2, 'bots': [moved]})
+
+        event = sync.advance(0.15)[0]
+
+        self.assertLessEqual(event['pose']['x'], 4.8)
+
+    def test_authoritative_fallen_bot_pose_is_not_rewound(self):
+        sync = self.module.SnapshotSync(
+            1, clock=lambda: self.now[0],
+            pose_safe=lambda pose: pose[0] < 5.0)
+        initial = player(7, 4.0)
+        fallen = player(7, 6.0)
+        fallen['y'] = -8.0
+        sync.manifest({'round_id': 1, 'bots': [initial]})
+        sync.snapshot({'round_id': 1, 'server_tick': 1,
+                       'bots': [initial]})
+        self.now[0] = 0.1
+        sync.snapshot({'round_id': 1, 'server_tick': 2,
+                       'bots': [fallen]})
+
+        event = sync.advance(0.1)[0]
+
+        self.assertGreater(event['pose']['x'], initial['x'])
+        self.assertLess(event['pose']['y'], initial['y'])
+
+    def test_pose_safety_error_is_not_silently_ignored(self):
+        def fail(unused_pose):
+            raise ValueError('broken graph')
+
+        sync = self.module.SnapshotSync(
+            1, clock=lambda: self.now[0], pose_safe=fail)
+        first = player(7, 1.0)
+        second = player(7, 2.0)
+        sync.manifest({'round_id': 1, 'bots': [first]})
+        sync.snapshot({'round_id': 1, 'server_tick': 1, 'bots': [first]})
+        self.now[0] = 0.1
+        sync.snapshot({'round_id': 1, 'server_tick': 2, 'bots': [second]})
+
+        with self.assertRaisesRegex(ValueError, 'broken graph'):
+            sync.advance(0.15)
+
     def test_remote_angles_take_short_path_across_pi_and_aim_is_smoothed(self):
         initial = player(2)
         initial.update(yaw=math.pi - 0.05, aim_yaw=math.pi - 0.10,

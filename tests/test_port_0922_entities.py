@@ -52,10 +52,12 @@ def _snapshot(**overrides):
 
 
 class _ArenaUpdate(object):
-    VEHICLE_ADDED = 1
-    AVATAR_READY = 3
-    PERIOD = 4
-    VEHICLE_KILLED = 5
+    VEHICLE_ADDED = 2
+    PERIOD = 3
+    VEHICLE_STATISTICS = 5
+    VEHICLE_KILLED = 6
+    AVATAR_READY = 7
+    TEAM_KILLER = 10
 
 
 class _ArenaPeriod(object):
@@ -89,19 +91,50 @@ class _EntityDescriptor(object):
         pitchLimits = {'absolute': (-1, 1)}
 
 
+class _EntityFilter(object):
+    def __init__(self):
+        self.inputs = []
+        self.poses = []
+
+    def notifyInputKeysDown(self, movement_dir, rotation_dir):
+        self.inputs.append((movement_dir, rotation_dir))
+
+    def set(self, time_value, space_id, entity_id, position, rotation, error):
+        self.poses.append((
+            time_value, space_id, entity_id, position, rotation, error))
+
+
 class _Entity(object):
     typeDescriptor = _EntityDescriptor()
 
     def __init__(self):
         self.teleports = []
+        self.matrix = object()
+        self.filter = _EntityFilter()
         self.gunAnglesPacked = 0
         self.isStarted = True
+        self._offlineLANAuthoritativePose = True
 
     def teleport(self, position, rotation):
         self.teleports.append((position, rotation))
 
     def set_gunAnglesPacked(self, previous):
         self.previous_gun_angles = previous
+
+
+class _Presentation(_Entity):
+    _offlineLANPresentation = True
+
+    def __init__(self):
+        super().__init__()
+        self.poses = []
+        self.aims = []
+
+    def set_pose(self, position, rotation):
+        self.poses.append((position, rotation))
+
+    def set_aim(self, hull_yaw, aim_yaw, gun_pitch):
+        self.aims.append((hull_yaw, aim_yaw, gun_pitch))
 
 
 class _BigWorld(object):
@@ -114,11 +147,17 @@ class _BigWorld(object):
         self.created.append((kind, space_id, flags, position, rotation, properties))
         return 91
 
+    def time(self):
+        return 12.5
+
     def destroyEntity(self, entity_id):
         self.destroyed.append(entity_id)
 
     def entity(self, entity_id):
         return self.entity_value if entity_id == 91 else None
+
+    def time(self):
+        return 99.0
 
     def serverTime(self):
         return 100.0
@@ -135,6 +174,14 @@ class _Avatar(object):
         self.updates = []
         self.synced = []
         self.changed = 0
+        self.visual_starts = []
+        self.visual_stops = []
+        self.guiSessionProvider = types.SimpleNamespace(
+            startVehicleVisual=lambda proxy, immediate:
+            self.visual_starts.append((proxy, immediate)),
+            stopVehicleVisual=lambda entity_id, is_player:
+            self.visual_stops.append((entity_id, is_player)))
+        self.consistentMatrices = _ConsistentMatrices()
 
     def updateArena(self, update_type, payload):
         self.updates.append((update_type, payload))
@@ -144,6 +191,14 @@ class _Avatar(object):
 
     def onVehicleChanged(self):
         self.changed += 1
+
+
+class _ConsistentMatrices(object):
+    def __init__(self):
+        self.targets = []
+
+    def _ConsistentMatrices__setTarget(self, matrix, as_static):
+        self.targets.append((matrix, as_static))
 
 
 class _VehicleDescr(object):
@@ -164,6 +219,23 @@ class _VehicleDescr(object):
 
 
 class BigWorldBindingTests(unittest.TestCase):
+    def test_local_vehicle_binds_stock_attached_matrix_for_minimap(self):
+        module = _binding_module()
+        bigworld = _BigWorld()
+        avatar = _Avatar()
+        avatar.playerVehicleID = 91
+        binding = module.BigWorldVehicleBinding(
+            bigworld, avatar, _Constants, _VehicleDescr,
+            lambda yaw, pitch, limits: 321,
+            outfit_provider=lambda descriptor: '')
+
+        binding.avatar_vehicle_entered()
+
+        self.assertEqual(1, avatar.changed)
+        self.assertEqual(
+            [(bigworld.entity_value.matrix, False)],
+            avatar.consistentMatrices.targets)
+
     def test_json_unicode_names_are_encoded_for_bigworld_string(self):
         module = _binding_module()
 
@@ -213,38 +285,91 @@ class BigWorldBindingTests(unittest.TestCase):
             properties, (1, 2, 3), (0, 0, 0)))
         snapshot = _snapshot(properties=properties)
         binding.arena_vehicle_added(91, snapshot)
+        bigworld.entity_value.proxy = 'vehicle-proxy'
+        binding.start_vehicle_visual(91, True)
         binding.avatar_select_vehicle(91)
         binding.avatar_vehicle_entered()
         binding.avatar_client_ready()
         binding.avatar_ready()
         binding.arena_period('battle')
-        binding.update_vehicle(91, (4, 5, 6), (0, 1, 0))
+        binding.drive_vehicle(91, 0.8, -0.5)
         binding.update_vehicle_aim(91, 3.1, -3.1, 0.2)
         binding.send_vehicle_input(91, {'throttle': 1})
+        binding.arena_vehicle_statistics(91, 2)
+        binding.arena_team_killer(91)
         binding.arena_vehicle_killed(91, 23, 7)
         binding.arena_vehicle_removed(91)
+        binding.stop_vehicle_visual(91, False)
         binding.destroy_entity(91)
 
         self.assertEqual('Vehicle', bigworld.created[0][0])
         self.assertEqual(91, avatar.playerVehicleID)
         self.assertEqual(1, avatar.changed)
         self.assertEqual([{'circularVisionRadius': 445}], avatar.synced)
-        self.assertEqual([((4, 5, 6), (0, 1, 0))],
-                         bigworld.entity_value.teleports)
+        self.assertEqual([(1, -1)], bigworld.entity_value.filter.inputs)
+        self.assertEqual([('vehicle-proxy', True)], avatar.visual_starts)
+        self.assertEqual([(91, False)], avatar.visual_stops)
+        self.assertEqual([], bigworld.entity_value.teleports)
         self.assertEqual(321, bigworld.entity_value.gunAnglesPacked)
         self.assertEqual(0, bigworld.entity_value.previous_gun_angles)
         self.assertEqual([(91, {'throttle': 1})], sent)
-        self.assertEqual([1, 3, 4, 5],
+        self.assertEqual([2, 7, 3, 5, 10, 6],
                          [item[0] for item in avatar.updates])
         vehicle_added = pickle.loads(zlib.decompress(avatar.updates[0][1]))
         self.assertEqual(18, len(vehicle_added))
         self.assertEqual([91, '17', 'Alpha', 1], vehicle_added[:4])
+        self.assertTrue(vehicle_added[5])
+        self.assertEqual(91, vehicle_added[7])
         self.assertEqual(91, pickle.loads(avatar.updates[1][1]))
         self.assertEqual((5, 0, 0, []),
                          pickle.loads(zlib.decompress(avatar.updates[2][1])))
+        self.assertEqual((91, 2),
+                         pickle.loads(zlib.decompress(avatar.updates[3][1])))
+        self.assertEqual(91, pickle.loads(avatar.updates[4][1]))
         self.assertEqual((91, 23, 0, 7),
-                         pickle.loads(avatar.updates[3][1]))
+                         pickle.loads(avatar.updates[5][1]))
         self.assertEqual([91], bigworld.destroyed)
+
+    def test_remote_pose_and_aim_use_authoritative_presentation(self):
+        module = _binding_module()
+        bigworld = _BigWorld()
+        bigworld.entity_value = _Presentation()
+        binding = module.BigWorldVehicleBinding(
+            bigworld, _Avatar(), _Constants, _VehicleDescr,
+            lambda yaw, pitch, limits: 321,
+            outfit_provider=lambda descriptor: 'verified')
+
+        binding.set_vehicle_pose(91, (4, 5, 6), (0, 0, 0.75))
+        binding.update_vehicle_aim(91, 0.75, 0.9, -0.1)
+
+        self.assertEqual([((4, 5, 6), (0, 0, 0.75))],
+                         bigworld.entity_value.poses)
+        self.assertEqual([(0.75, 0.9, -0.1)],
+                         bigworld.entity_value.aims)
+
+    def test_hidden_remote_pose_uses_private_authority_without_widening_aoi(self):
+        module = _binding_module()
+        bigworld = _BigWorld()
+        hidden = _Presentation()
+        hidden.proxy = 'hidden-proxy'
+        binding = module.BigWorldVehicleBinding(
+            bigworld, _Avatar(), _Constants, _VehicleDescr,
+            lambda yaw, pitch, limits: 321,
+            outfit_provider=lambda descriptor: 'verified',
+            authority_entity_resolver=(
+                lambda entity_id: hidden if entity_id == 1000 else
+                bigworld.entity(entity_id)))
+
+        self.assertIsNone(bigworld.entity(1000))
+        binding.set_vehicle_pose(1000, (4, 5, 6), (0, 0, 0.75))
+        binding.update_vehicle_aim(1000, 0.75, 0.9, -0.1)
+
+        self.assertEqual([((4, 5, 6), (0, 0, 0.75))], hidden.poses)
+        self.assertEqual([(0.75, 0.9, -0.1)], hidden.aims)
+        self.assertFalse(binding.is_vehicle_ready(1000))
+        with self.assertRaisesRegex(module.CapabilityError,
+                                    'Vehicle entity 1000 is unavailable'):
+            binding.start_vehicle_visual(1000, True)
 
     def test_prebattle_period_carries_native_countdown_deadline(self):
         module = _binding_module()
@@ -298,8 +423,9 @@ class BigWorldBindingTests(unittest.TestCase):
         module = _binding_module()
         constants = types.SimpleNamespace(
             ARENA_UPDATE=types.SimpleNamespace(
-                VEHICLE_ADDED=1, VEHICLE_KILLED=2,
-                AVATAR_READY=3, PERIOD=4),
+                VEHICLE_ADDED=2, VEHICLE_STATISTICS=5,
+                VEHICLE_KILLED=6, AVATAR_READY=7,
+                TEAM_KILLER=10, PERIOD=3),
             ARENA_PERIOD=_ArenaPeriod,
             VEHICLE_PHYSICS_MODE=_PhysicsMode,
             VEHICLE_SIEGE_STATE=_SiegeState)
@@ -364,6 +490,10 @@ class _BridgeBinding(object):
 
     def arena_vehicle_removed(self, vehicle_id):
         self.events.append(('removed', vehicle_id))
+
+    def drive_vehicle(self, vehicle_id, movement_dir, rotation_dir):
+        self.events.append(
+            ('drive', vehicle_id, movement_dir, rotation_dir))
 
     def destroy_entity(self, vehicle_id):
         self.events.append(('destroy', vehicle_id))
@@ -454,6 +584,19 @@ class _Sender(object):
 
 
 class AvatarServerBridgeTests(unittest.TestCase):
+    def test_vehicle_pose_is_prepared_before_native_enter_barrier(self):
+        module = _avatar_bridge_module()
+        prepared = []
+        vehicle = types.SimpleNamespace(id=91)
+        bridge = module.AvatarServerBridge(
+            _BridgeAvatar(), _BridgeBinding(),
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            _Sender(), on_vehicle_enter=prepared.append)
+
+        self.assertTrue(bridge.prepareVehicleEnter(vehicle))
+        self.assertEqual([vehicle], prepared)
+
     def test_deferred_server_replays_synchronous_native_ready_barrier(self):
         module = _avatar_bridge_module()
         deferred = module.DeferredAvatarServer()
@@ -515,9 +658,10 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertTrue(bridge.destroy())
 
         self.assertEqual(['create', 'added', 'select', 'entered',
-                          'client_ready', 'avatar_ready', 'period', 'removed',
-                          'destroy'],
+                          'client_ready', 'avatar_ready', 'period', 'drive',
+                          'removed', 'destroy'],
                          [event[0] for event in binding.events])
+        self.assertIn(('drive', 91, 1, -1), binding.events)
         self.assertEqual([(91, 'move', {'flags': 7}),
                           (91, 'track_relative', {'point': (1, 2, 3)}),
                           (91, 'shoot', {}),
@@ -554,6 +698,33 @@ class AvatarServerBridgeTests(unittest.TestCase):
 
         self.assertTrue(bridge.flushClientReady())
         self.assertEqual([(91, 'move', {'flags': 0})], sender.events)
+
+    def test_native_cruise_bits_reach_sender_without_changing_filter_direction(self):
+        module = _avatar_bridge_module()
+        binding = _BridgeBinding()
+        sender = _Sender()
+        bridge = module.AvatarServerBridge(
+            _BridgeAvatar(), binding,
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            sender)
+        self.assertEqual(91, bridge.addVehicleToArena(_snapshot()))
+        self.assertTrue(bridge.acceptVehicleEnter(91))
+        self.assertTrue(bridge.setClientReady())
+        self.assertTrue(bridge.completeVehicleEnter(91))
+        self.assertTrue(bridge.flushClientReady())
+
+        bridge.vehicle_moveWith(1 | 32)
+        bridge.vehicle_moveWith(2 | 16)
+
+        self.assertEqual([
+            (91, 'move', {'flags': 33}),
+            (91, 'move', {'flags': 18}),
+        ], sender.events)
+        self.assertEqual([
+            ('drive', 91, 1, 0),
+            ('drive', 91, -1, 0),
+        ], [event for event in binding.events if event[0] == 'drive'])
 
     def test_reentrant_vehicle_enter_fails_closed_before_registration(self):
         module = _avatar_bridge_module()

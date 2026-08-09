@@ -6,6 +6,8 @@ movement command, and optional fire intent.  The caller remains responsible
 for visibility, collision probes, and applying commands to any client entity.
 """
 
+import math
+
 from gui.mods.offline_lan_0922.ai.driver import LocalDriver
 from gui.mods.offline_lan_0922.ai.planner import BattleDirector
 
@@ -31,9 +33,12 @@ def _contact(value):
 class BotAdapter(object):
     """Owns pure planner/driver state for one map and battle seed."""
 
-    def __init__(self, map_name, battle_seed, bases=None, bounds=None):
-        self.director = BattleDirector(map_name, battle_seed, bases, bounds)
+    def __init__(self, map_name, battle_seed, bases=None, bounds=None,
+                 navigation_target=None, baked_routes=None):
+        self.director = BattleDirector(map_name, battle_seed, bases, bounds,
+                                      baked_routes=baked_routes)
         self.driver = LocalDriver()
+        self.navigation_target = navigation_target
 
     def register(self, bot_id, team, descriptor, display_name='Bot'):
         return self.director.register(bot_id, team, descriptor, display_name)
@@ -80,29 +85,76 @@ class BotAdapter(object):
 
     def _drive_order(self, bot_id, state, position, strategic,
                      direction_clear):
-        target = _position(strategic.get('move_position'), position)
+        aim_position = strategic.get('aim_position')
+        move_position = strategic.get('move_position')
+        face_position = strategic.get('face_position')
+        if aim_position is not None:
+            aim_position = _position(aim_position, position)
+        if move_position is not None:
+            move_position = _position(move_position, position)
+        if face_position is not None:
+            face_position = _position(face_position, position)
+        aim_position, move_position, face_position, unused_stop = (
+            self.driver.resolve_order_positions(
+                position, aim_position, move_position, face_position))
+        target = move_position
+        if callable(self.navigation_target):
+            target = _position(self.navigation_target(
+                bot_id, position, target, strategic, state), target)
+        throttle_override = strategic.get('throttle_override')
+        movement_intent = not (
+            throttle_override is not None and
+            float(throttle_override) <= 0.0)
         local = self.driver.drive(
             bot_id, position, float(state.get('yaw', 0.0)),
             float(state.get('speed', 0.0)), float(state.get('dt', 0.0)),
             target, state.get('neighbours', ()), direction_clear,
-            velocity=state.get('velocity'))
+            velocity=state.get('velocity'),
+            half_length=float(state.get('half_length', 3.5)),
+            half_width=float(state.get('half_width', 1.7)),
+            movement_intent=movement_intent)
+        # Preserve the mature face-position intent which is separate from the
+        # gun target.  At a route/cover stop it gives armoured turreted tanks
+        # their stable 12-30 degree hull angle while the turret keeps tracking
+        # ``aim_position``.  Local recovery directions still outrank it.
+        recovery_mode = local.get('recovery_mode', 'drive')
+        target_yaw = float(local['target_yaw'])
+        turn = float(local['turn'])
+        dx = float(face_position[0]) - float(position[0])
+        dz = float(face_position[2]) - float(position[2])
+        if (recovery_mode == 'arrived' and
+                dx * dx + dz * dz > 0.01):
+            target_yaw = math.atan2(dx, dz)
+            difference = target_yaw - float(state.get('yaw', 0.0))
+            while difference > math.pi:
+                difference -= 2.0 * math.pi
+            while difference < -math.pi:
+                difference += 2.0 * math.pi
+            turn = max(-1.0, min(1.0, difference / 0.58))
         result = {
             'bot_id': bot_id,
             'target_id': strategic.get('target_id'),
-            'aim_position': _position(
-                strategic.get('aim_position'), target),
+            'aim_position': aim_position,
+            'face_position': face_position,
             'fire_range': float(strategic.get('fire_range', 0.0)),
             'move_position': target,
             'combat_mode': strategic.get('combat_mode', 'route'),
             'fire_allowed': bool(strategic.get('fire_allowed', False)),
             'shell_index': int(strategic.get('shell_index', 0)),
             'throttle': float(local['throttle']),
-            'turn': float(local['turn']),
-            'target_yaw': float(local['target_yaw']),
-            'recovery_mode': local['recovery_mode'],
+            'turn': turn,
+            'target_yaw': target_yaw,
+            'recovery_mode': recovery_mode,
+            'movement_intent': movement_intent,
         }
-        throttle_override = strategic.get('throttle_override')
-        if throttle_override is not None:
+        difference = target_yaw - float(state.get('yaw', 0.0))
+        while difference > math.pi:
+            difference -= 2.0 * math.pi
+        while difference < -math.pi:
+            difference += 2.0 * math.pi
+        if (throttle_override is not None and
+                recovery_mode in ('drive', 'arrived') and
+                abs(difference) < 0.65):
             result['throttle'] = max(
                 -1.0, min(1.0, float(throttle_override)))
         return result

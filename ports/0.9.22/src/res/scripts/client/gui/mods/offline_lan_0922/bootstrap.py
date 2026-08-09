@@ -64,9 +64,13 @@ def _selected_vehicle(config):
                         descriptor.type.tags):
                     raise ValueError(
                         'vehicle type is not available in standard battles')
+                # generateTankmen filters this mask through each crew role;
+                # only the commander receives the offline Sixth Sense perk.
+                skills_mask = tankmen.getSkillsMask(
+                    ('commander_sixthSense',))
                 crew_compact_descrs = list(tankmen.generateTankmen(
                     nation_id, vehicle_type_id, descriptor.type.crewRoles,
-                    False, tankmen.MAX_SKILL_LEVEL, 0, False))
+                    False, tankmen.MAX_SKILL_LEVEL, skills_mask, False))
                 if (not crew_compact_descrs or
                         len(crew_compact_descrs) !=
                         len(descriptor.type.crewRoles)):

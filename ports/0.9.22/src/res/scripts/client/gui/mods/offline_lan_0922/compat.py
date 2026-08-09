@@ -75,11 +75,15 @@ def _load_runtime():
     import Account
     import Avatar
     import AvatarInputHandler
+    import AvatarPositionControl
     import BigWorld
     import ChatManager
     import Math
     import SoundGroups
     import Vehicle
+    import VehicleGunRotator
+    import AvatarInputHandler.AimingSystems.steady_vehicle_matrix as \
+        SteadyVehicleMatrix
     import vehicle_systems.CompoundAppearance as CompoundAppearanceModule
     import constants
     from OfflineMapCreator import g_offlineMapCreator
@@ -98,6 +102,7 @@ def _load_runtime():
     runtime.account_module = Account
     runtime.avatar_module = Avatar
     runtime.avatar_input_handler = AvatarInputHandler
+    runtime.avatar_position_control = AvatarPositionControl
     runtime.bigworld = BigWorld
     runtime.chat_manager = ChatManager.chatManager
     runtime.compound_appearance_module = CompoundAppearanceModule
@@ -111,7 +116,9 @@ def _load_runtime():
     runtime.predefined_hosts = g_preDefinedHosts
     runtime.prb_loader = g_prbLoader
     runtime.sound_groups_module = SoundGroups
+    runtime.steady_vehicle_matrix = SteadyVehicleMatrix
     runtime.vehicle_module = Vehicle
+    runtime.vehicle_gun_rotator = VehicleGunRotator
     return runtime
 
 
@@ -200,13 +207,37 @@ class _OfflineInputHandler(object):
         return False
 
 
+class _OfflineCameraColliderHandler(object):
+    """Late #1513 appearance teardown after AvatarInputHandler.stop()."""
+
+    def __init__(self):
+        self.onCameraChanged = _OfflineEventSink()
+
+    def addVehicleToCameraCollider(self, vehicle):
+        return None
+
+    def removeVehicleFromCameraCollider(self, vehicle):
+        return None
+
+
+class _OfflineEventSink(object):
+    """Minimal Event surface used by exact #1513 native teardown."""
+
+    def __iadd__(self, callback):
+        return self
+
+    def __isub__(self, callback):
+        return self
+
+
 class _OfflineVehicleFilterSyncProxy(object):
     """Delegate WGVehicleFilter except for unsafe retail-only syncs."""
 
-    __slots__ = ('_vehicle_filter',)
+    __slots__ = ('_vehicle_filter', '_pose_matrix')
 
-    def __init__(self, vehicle_filter):
+    def __init__(self, vehicle_filter, pose_matrix=None):
         self._vehicle_filter = vehicle_filter
+        self._pose_matrix = pose_matrix
 
     def __getattr__(self, name):
         return getattr(self._vehicle_filter, name)
@@ -223,6 +254,12 @@ class _OfflineVehicleFilterSyncProxy(object):
         # chain.  Keep the stock handler, including track and RPM updates, but
         # omit only this native sync while that exact handler is running.
         return None
+
+    def interpolateStabilisedMatrix(self, timestamp):
+        """Expose the canonical copied pose to the fixed-turret aim path."""
+        if self._pose_matrix is not None:
+            return self._pose_matrix
+        return self._vehicle_filter.interpolateStabilisedMatrix(timestamp)
 
 
 class OfflineCompatibility(object):
@@ -255,19 +292,31 @@ class OfflineCompatibility(object):
         self._original_avatar_enter_world = None
         self._original_avatar_leave_world = None
         self._original_avatar_vehicle_enter = None
+        self._avatar_vehicle_enter_code = None
+        self._avatar_start_vehicle_visual_code = None
         self._original_avatar_prereqs_loaded = None
         self._original_avatar_aux_physics = None
+        self._original_avatar_get_speeds = None
+        self._original_control_mode_changed = None
+        self._original_consistent_link_own_vehicle = None
+        self._original_steady_relink_sources = None
         self._avatar_aux_physics_code = None
         self._original_vehicle_getattribute = None
+        self._original_vehicle_setattr = None
+        self._original_vehicle_get_speed = None
+        self._original_vehicle_leave_world = None
         self._original_vehicle_start_wg_physics = None
         self._vehicle_start_wg_physics_code = None
         self._original_vehicle_set_gun_angles = None
         self._vehicle_set_gun_angles_code = None
+        self._gun_rotator_stabilised_code = None
         self._original_compound_getattribute = None
+        self._original_compound_deactivate = None
         self._original_compound_models_refresh = None
         self._compound_models_refresh_code = None
         self._original_connect = None
         self._original_disconnect = None
+        self._original_server_time = None
         self._original_debug_update = None
         self._account_init_wrapper = None
         self._account_getattribute_wrapper = None
@@ -282,18 +331,32 @@ class OfflineCompatibility(object):
         self._avatar_vehicle_enter_wrapper = None
         self._avatar_prereqs_loaded_wrapper = None
         self._avatar_aux_physics_wrapper = None
+        self._avatar_get_speeds_wrapper = None
+        self._control_mode_changed_wrapper = None
+        self._consistent_link_own_vehicle_wrapper = None
+        self._steady_relink_sources_wrapper = None
         self._vehicle_getattribute_wrapper = None
+        self._vehicle_setattr_wrapper = None
+        self._vehicle_get_speed_wrapper = None
+        self._vehicle_leave_world_wrapper = None
         self._vehicle_start_wg_physics_wrapper = None
         self._vehicle_set_gun_angles_wrapper = None
         self._compound_getattribute_wrapper = None
+        self._compound_deactivate_wrapper = None
         self._compound_models_refresh_wrapper = None
         self._vehicle_starting_wg_physics = None
         self._vehicle_syncing_gun_angles = None
         self._avatar_syncing_aux_physics = None
+        self._avatar_entering_vehicle = None
         self._compound_refreshing_models = None
         self._connect_wrapper = None
         self._disconnect_wrapper = None
+        self._server_time_wrapper = None
         self._debug_update_wrapper = None
+        self._battle_server_time_origin = None
+        self._battle_clock_origin = None
+        self._vehicle_property_overlays = {}
+        self._control_mode_listener = None
 
     def install(self):
         if self._installed:
@@ -311,6 +374,18 @@ class OfflineCompatibility(object):
             getattr(runtime, 'compound_appearance_module', None),
             'CompoundAppearance', None)
         debug_panel_type = getattr(runtime, 'debug_panel_type', None)
+        input_handler_type = getattr(
+            getattr(runtime, 'avatar_input_handler', None),
+            'AvatarInputHandler', None)
+        consistent_matrices_type = getattr(
+            getattr(runtime, 'avatar_position_control', None),
+            'ConsistentMatrices', None)
+        steady_matrix_type = getattr(
+            getattr(runtime, 'steady_vehicle_matrix', None),
+            'SteadyVehicleMatrixCalculator', None)
+        gun_rotator_type = getattr(
+            getattr(runtime, 'vehicle_gun_rotator', None),
+            'VehicleGunRotator', None)
         self._original_account_init = account_type.__dict__.get(
             '__init__', account_type.__init__)
         self._original_account_getattribute = account_type.__dict__.get(
@@ -336,8 +411,23 @@ class OfflineCompatibility(object):
         self._original_avatar_vehicle_enter = avatar_type.__dict__.get(
             'vehicle_onEnterWorld',
             getattr(avatar_type, 'vehicle_onEnterWorld', None))
+        if self._original_avatar_vehicle_enter is not None:
+            self._avatar_vehicle_enter_code = getattr(
+                self._original_avatar_vehicle_enter,
+                'func_code', getattr(
+                    self._original_avatar_vehicle_enter, '__code__', None))
+        avatar_start_visual = avatar_type.__dict__.get(
+            '_PlayerAvatar__startVehicleVisual', getattr(
+                avatar_type, '_PlayerAvatar__startVehicleVisual', None))
+        if avatar_start_visual is not None:
+            self._avatar_start_vehicle_visual_code = getattr(
+                avatar_start_visual, 'func_code', getattr(
+                    avatar_start_visual, '__code__', None))
         self._original_avatar_prereqs_loaded = avatar_type.__dict__.get(
             'onPrereqsLoaded', getattr(avatar_type, 'onPrereqsLoaded', None))
+        self._original_avatar_get_speeds = avatar_type.__dict__.get(
+            'getOwnVehicleSpeeds',
+            getattr(avatar_type, 'getOwnVehicleSpeeds', None))
         self._original_avatar_aux_physics = avatar_type.__dict__.get(
             '_PlayerAvatar__onSetOwnVehicleAuxPhysicsData',
             getattr(
@@ -348,9 +438,60 @@ class OfflineCompatibility(object):
                 self._original_avatar_aux_physics,
                 'func_code', getattr(
                     self._original_avatar_aux_physics, '__code__', None))
+        if input_handler_type is None:
+            raise RuntimeError('#1513 AvatarInputHandler is unavailable')
+        self._original_control_mode_changed = (
+            input_handler_type.__dict__.get(
+                'onControlModeChanged',
+                getattr(input_handler_type, 'onControlModeChanged', None)))
+        if self._original_control_mode_changed is None:
+            raise RuntimeError(
+                '#1513 control-mode transition boundary is unavailable')
+        if consistent_matrices_type is None:
+            raise RuntimeError('#1513 ConsistentMatrices is unavailable')
+        if steady_matrix_type is None:
+            raise RuntimeError(
+                '#1513 steady vehicle matrix calculator is unavailable')
+        self._original_consistent_link_own_vehicle = (
+            consistent_matrices_type.__dict__.get(
+                '_ConsistentMatrices__linkOwnVehicle',
+                getattr(
+                    consistent_matrices_type,
+                    '_ConsistentMatrices__linkOwnVehicle', None)))
+        self._original_steady_relink_sources = (
+            steady_matrix_type.__dict__.get(
+                'relinkSources',
+                getattr(steady_matrix_type, 'relinkSources', None)))
+        if self._original_consistent_link_own_vehicle is None:
+            raise RuntimeError(
+                '#1513 own-vehicle matrix link boundary is unavailable')
+        if self._original_steady_relink_sources is None:
+            raise RuntimeError(
+                '#1513 steady matrix relink boundary is unavailable')
+        if gun_rotator_type is None:
+            raise RuntimeError('#1513 VehicleGunRotator is unavailable')
+        gun_rotator_stabilised = getattr(
+            gun_rotator_type, 'getAvatarOwnVehicleStabilisedMatrix', None)
+        if gun_rotator_stabilised is None:
+            raise RuntimeError(
+                '#1513 fixed-turret stabilised matrix boundary is unavailable')
+        self._gun_rotator_stabilised_code = getattr(
+            gun_rotator_stabilised, 'func_code', getattr(
+                gun_rotator_stabilised, '__code__', None))
+        if self._gun_rotator_stabilised_code is None:
+            raise RuntimeError(
+                '#1513 fixed-turret stabilised matrix code is unavailable')
         if vehicle_type is not None:
             self._original_vehicle_getattribute = vehicle_type.__dict__.get(
                 '__getattribute__', vehicle_type.__getattribute__)
+            self._original_vehicle_setattr = vehicle_type.__dict__.get(
+                '__setattr__', vehicle_type.__setattr__)
+            self._original_vehicle_get_speed = vehicle_type.__dict__.get(
+                'getSpeed', getattr(vehicle_type, 'getSpeed', None))
+            self._original_vehicle_leave_world = (
+                vehicle_type.__dict__.get(
+                    'onLeaveWorld',
+                    getattr(vehicle_type, 'onLeaveWorld', None)))
             self._original_vehicle_start_wg_physics = (
                 vehicle_type.__dict__.get(
                     '_Vehicle__startWGPhysics',
@@ -375,6 +516,9 @@ class OfflineCompatibility(object):
             self._original_compound_getattribute = (
                 compound_type.__dict__.get(
                     '__getattribute__', compound_type.__getattribute__))
+            self._original_compound_deactivate = (
+                compound_type.__dict__.get(
+                    'deactivate', getattr(compound_type, 'deactivate', None)))
             self._original_compound_models_refresh = (
                 compound_type.__dict__.get(
                     '_CompoundAppearance__onModelsRefresh',
@@ -389,6 +533,7 @@ class OfflineCompatibility(object):
                         '__code__', None))
         self._original_connect = runtime.bigworld.connect
         self._original_disconnect = runtime.bigworld.disconnect
+        self._original_server_time = runtime.bigworld.serverTime
         if debug_panel_type is not None:
             self._original_debug_update = debug_panel_type.__dict__.get(
                 'updateDebugInfo',
@@ -459,6 +604,69 @@ class OfflineCompatibility(object):
                 avatar.filter = runtime.bigworld.AvatarFilter()
                 avatar.filter.enableLagDetection(True)
                 setattr(avatar, _OFFLINE_INIT_COMPLETE, True)
+
+        def control_mode_changed(handler, eMode, **args):
+            result = compatibility._original_control_mode_changed(
+                handler, eMode, **args)
+            listener = compatibility._control_mode_listener
+            if listener is not None:
+                current = getattr(
+                    handler, '_AvatarInputHandler__ctrlModeName', None)
+                if current == eMode:
+                    listener(handler, eMode)
+            return result
+
+        def consistent_link_own_vehicle(matrices, vehicle):
+            overlay = compatibility._vehicle_property_overlays.get(
+                id(vehicle))
+            if (compatibility._battle_active and overlay is not None and
+                    overlay.get('_pose_active')):
+                provider = getattr(
+                    matrices, '_ConsistentMatrices__ownVehicleMProv', None)
+                if provider is None:
+                    raise RuntimeError(
+                        '#1513 own-vehicle matrix provider is unavailable')
+                provider.target = overlay['matrix']
+                if provider.target is not overlay['matrix']:
+                    raise RuntimeError(
+                        '#1513 own-vehicle matrix rejected live pose')
+                return None
+            return compatibility._original_consistent_link_own_vehicle(
+                matrices, vehicle)
+
+        def steady_relink_sources(calculator):
+            if compatibility._battle_active:
+                try:
+                    player = runtime.bigworld.player()
+                except ReferenceError:
+                    player = None
+                vehicle = (player.getVehicleAttached()
+                           if player is not None else None)
+                overlay = compatibility._vehicle_property_overlays.get(
+                    id(vehicle)) if vehicle is not None else None
+                if overlay is not None and overlay.get('_pose_active'):
+                    matrix = overlay['matrix']
+                    output = getattr(
+                        calculator,
+                        '_SteadyVehicleMatrixCalculator__outputMProv', None)
+                    stabilised = getattr(
+                        calculator,
+                        '_SteadyVehicleMatrixCalculator__stabilisedMProv',
+                        None)
+                    if output is None or stabilised is None:
+                        raise RuntimeError(
+                            '#1513 steady vehicle providers are unavailable')
+                    output.rotationSrc = matrix
+                    output.translationSrc = matrix
+                    stabilised.target = matrix
+                    if (output.rotationSrc is not matrix or
+                            output.translationSrc is not matrix or
+                            stabilised.target is not matrix):
+                        raise RuntimeError(
+                            '#1513 steady vehicle providers rejected live '
+                            'pose')
+                    return None
+            return compatibility._original_steady_relink_sources(calculator)
 
         def avatar_become_player(avatar):
             if not compatibility._fake_connected:
@@ -598,9 +806,12 @@ class OfflineCompatibility(object):
                         avatar, 'fakeServer')
                 except AttributeError:
                     server = None
+                prepare = getattr(server, 'prepareVehicleEnter', None)
                 accept = getattr(server, 'acceptVehicleEnter', None)
                 if callable(accept):
                     try:
+                        if callable(prepare):
+                            prepare(vehicle)
                         accept(vehicle.id)
                     except Exception as error:
                         fail = getattr(server, 'failVehicleEnter', None)
@@ -608,6 +819,8 @@ class OfflineCompatibility(object):
                             fail(vehicle.id, error)
                         raise
             try:
+                previous_entering = compatibility._avatar_entering_vehicle
+                compatibility._avatar_entering_vehicle = vehicle
                 if compatibility._original_avatar_vehicle_enter is not None:
                     result = compatibility._original_avatar_vehicle_enter(
                         avatar, vehicle)
@@ -618,6 +831,8 @@ class OfflineCompatibility(object):
                 if callable(fail):
                     fail(vehicle.id, error)
                 raise
+            finally:
+                compatibility._avatar_entering_vehicle = previous_entering
             complete = getattr(server, 'completeVehicleEnter', None)
             if callable(complete):
                 complete(vehicle.id)
@@ -651,10 +866,19 @@ class OfflineCompatibility(object):
                 compatibility._avatar_syncing_aux_physics = outer_avatar
 
         def vehicle_getattribute(vehicle, name):
+            if (compatibility._battle_active and
+                    name in ('health', 'isCrewActive',
+                             'position', 'yaw', 'matrix')):
+                overlay = compatibility._vehicle_property_overlays.get(
+                    id(vehicle))
+                if overlay is not None and name in overlay:
+                    return overlay[name]
             caller_code = None
             if (compatibility._vehicle_starting_wg_physics is not None or
                     compatibility._vehicle_syncing_gun_angles is not None or
-                    compatibility._avatar_syncing_aux_physics is not None):
+                    compatibility._avatar_syncing_aux_physics is not None or
+                    compatibility._avatar_entering_vehicle is not None or
+                    name == 'filter'):
                 try:
                     caller_code = sys._getframe(1).f_code
                 except (AttributeError, ValueError):
@@ -669,13 +893,27 @@ class OfflineCompatibility(object):
             if compatibility._avatar_syncing_aux_physics is not None:
                 direct_avatar_aux_sync = (
                     caller_code is compatibility._avatar_aux_physics_code)
+            direct_avatar_pose_init = (
+                compatibility._avatar_entering_vehicle is vehicle and
+                caller_code in (
+                    compatibility._avatar_vehicle_enter_code,
+                    compatibility._avatar_start_vehicle_visual_code))
+            overlay = compatibility._vehicle_property_overlays.get(
+                id(vehicle))
+            direct_fixed_turret_pose = (
+                caller_code is compatibility._gun_rotator_stabilised_code and
+                overlay is not None and overlay.get('_pose_active'))
             if (name == 'filter' and compatibility._battle_active and
                     (direct_start_filter or direct_gun_sync or
-                     direct_avatar_aux_sync)):
+                     direct_avatar_aux_sync or direct_avatar_pose_init or
+                     direct_fixed_turret_pose)):
                 vehicle_filter = (
                     compatibility._original_vehicle_getattribute(
                         vehicle, name))
-                return _OfflineVehicleFilterSyncProxy(vehicle_filter)
+                pose_matrix = (overlay['matrix']
+                               if direct_fixed_turret_pose else None)
+                return _OfflineVehicleFilterSyncProxy(
+                    vehicle_filter, pose_matrix)
             if name == 'cell' and compatibility._battle_active:
                 try:
                     return compatibility._original_vehicle_getattribute(
@@ -689,6 +927,81 @@ class OfflineCompatibility(object):
                         except AttributeError:
                             pass
             return compatibility._original_vehicle_getattribute(vehicle, name)
+
+        def vehicle_setattr(vehicle, name, value):
+            if (compatibility._battle_active and
+                    name in ('health', 'isCrewActive')):
+                compatibility._vehicle_property_overlays.setdefault(
+                    id(vehicle), {})[name] = value
+                return None
+            if (compatibility._battle_active and
+                    name in ('position', 'yaw', 'matrix')):
+                overlay = compatibility._vehicle_property_overlays.get(
+                    id(vehicle))
+                if overlay is not None and overlay.get('_pose_active'):
+                    overlay[name] = value
+                    return None
+            return compatibility._original_vehicle_setattr(
+                vehicle, name, value)
+
+        def vehicle_get_speed(vehicle):
+            if compatibility._battle_active:
+                overlay = compatibility._vehicle_property_overlays.get(
+                    id(vehicle))
+                if (overlay is not None and
+                        overlay.get('_pose_active') and
+                        'speed' in overlay):
+                    return overlay['speed']
+            return compatibility._original_vehicle_get_speed(vehicle)
+
+        def avatar_get_speeds(avatar, get_instantaneous=False):
+            """Expose copied local physics to stock speed/dispersion users."""
+            if compatibility._battle_active:
+                try:
+                    vehicle_id = compatibility._original_avatar_getattribute(
+                        avatar, 'playerVehicleID')
+                    vehicle = runtime.bigworld.entity(vehicle_id)
+                    overlay = compatibility._vehicle_property_overlays.get(
+                        id(vehicle))
+                except (AttributeError, ReferenceError, TypeError):
+                    overlay = None
+                if (overlay is not None and overlay.get('_pose_active') and
+                        'speed' in overlay and 'turn_speed' in overlay):
+                    return (float(overlay['speed']),
+                            float(overlay['turn_speed']))
+            return compatibility._original_avatar_get_speeds(
+                avatar, get_instantaneous)
+
+        def vehicle_leave_world(vehicle):
+            original = compatibility._original_vehicle_leave_world
+            if not compatibility._battle_active:
+                return original(vehicle)
+            try:
+                player = runtime.bigworld.player()
+            except ReferenceError:
+                player = None
+            callback = getattr(player, 'vehicle_onLeaveWorld', None)
+            if callable(callback):
+                return original(vehicle)
+
+            # PlayerAvatar.onBecomeNonPlayer normally stopped every Vehicle
+            # before the engine clears its PyEntities.  Exact #1513 then calls
+            # Vehicle.onLeaveWorld after BigWorld.player() has already become
+            # None, although the stock method dereferences it unconditionally.
+            # Finish only the two remaining Vehicle-owned stages here.
+            stop_extras = getattr(vehicle, '_Vehicle__stopExtras', None)
+            if callable(stop_extras):
+                stop_extras()
+            if bool(getattr(vehicle, 'isStarted', False)):
+                stop_visual = getattr(vehicle, 'stopVisual', None)
+                if not callable(stop_visual):
+                    raise RuntimeError(
+                        'retired offline Vehicle cannot stop its visual')
+                stop_visual(False)
+            if bool(getattr(vehicle, 'isStarted', False)):
+                raise RuntimeError(
+                    'retired offline Vehicle remained visually started')
+            return None
 
         def vehicle_start_wg_physics(vehicle):
             original = compatibility._original_vehicle_start_wg_physics
@@ -733,6 +1046,63 @@ class OfflineCompatibility(object):
                 if caller_code is compatibility._compound_models_refresh_code:
                     return _OfflineVehicleFilterSyncProxy(value)
             return value
+
+        def compound_deactivate(appearance, stopEffects=True):
+            original = compatibility._original_compound_deactivate
+            if not compatibility._battle_active:
+                return original(appearance, stopEffects)
+            try:
+                player = runtime.bigworld.player()
+            except ReferenceError:
+                player = None
+            handler = None
+            if player is not None:
+                try:
+                    handler = getattr(player, 'inputHandler', None)
+                except ReferenceError:
+                    handler = None
+            if handler is not None:
+                return original(appearance, stopEffects)
+
+            # PlayerAvatar.__destroyGUI clears inputHandler before its later
+            # Vehicle.stopVisual loop.  CompoundAppearance.deactivate still
+            # calls removeVehicleFromCameraCollider in that window.  Supply a
+            # no-op collider owner for exactly this native call and restore
+            # the original object/function even if another teardown stage
+            # raises.
+            fallback = _OfflineCameraColliderHandler()
+            if player is not None:
+                try:
+                    player.inputHandler = fallback
+                except Exception:
+                    return original(appearance, stopEffects)
+                try:
+                    return original(appearance, stopEffects)
+                finally:
+                    if getattr(player, 'inputHandler', None) is fallback:
+                        player.inputHandler = None
+
+            bigworld_dict = getattr(runtime.bigworld, '__dict__', {})
+            had_player = 'player' in bigworld_dict
+            raw_player = bigworld_dict.get('player')
+            original_player = runtime.bigworld.player
+            surrogate_arena = type('_OfflineArenaOwner', (object,), {
+                'onPeriodChange': _OfflineEventSink()})()
+            surrogate = type('_OfflineColliderOwner', (object,), {
+                'inputHandler': fallback, 'arena': surrogate_arena})()
+
+            def collider_owner(*unused_args, **unused_kwargs):
+                return surrogate
+
+            runtime.bigworld.player = collider_owner
+            try:
+                return original(appearance, stopEffects)
+            finally:
+                if runtime.bigworld.player is collider_owner:
+                    if had_player:
+                        runtime.bigworld.player = raw_player
+                    else:
+                        delattr(runtime.bigworld, 'player')
 
         def compound_models_refresh(appearance, model_state, resource_list):
             original = compatibility._original_compound_models_refresh
@@ -892,6 +1262,30 @@ class OfflineCompatibility(object):
                 raise first_error
             return None
 
+        def server_time():
+            """Advance the native battle clock on the client-only connection.
+
+            The retail server owns ``BigWorld.serverTime()``.  It remains
+            frozen on our fake connection, while #1513's stock period
+            controller subtracts it from ``periodEndTime`` once per second.
+            Reuse the 0.8.2 offline clock law, scoped to an active LAN battle,
+            and preserve the original epoch so every native deadline remains
+            in one coordinate system.
+            """
+            if (compatibility._battle_active and
+                    compatibility._battle_server_time_origin is not None and
+                    compatibility._battle_clock_origin is not None):
+                clock = getattr(runtime.bigworld, 'time', None)
+                if callable(clock):
+                    try:
+                        elapsed = (float(clock()) -
+                                   compatibility._battle_clock_origin)
+                        return (compatibility._battle_server_time_origin +
+                                max(0.0, elapsed))
+                    except Exception:
+                        pass
+            return compatibility._original_server_time()
+
         def debug_update(panel, ping, fps, isLaggingNow, fpsReplay=-1):
             """Render LAN transport health during a client-only battle.
 
@@ -931,13 +1325,23 @@ class OfflineCompatibility(object):
         self._avatar_vehicle_enter_wrapper = avatar_vehicle_enter
         self._avatar_prereqs_loaded_wrapper = avatar_prereqs_loaded
         self._avatar_aux_physics_wrapper = avatar_aux_physics
+        self._avatar_get_speeds_wrapper = avatar_get_speeds
+        self._control_mode_changed_wrapper = control_mode_changed
+        self._consistent_link_own_vehicle_wrapper = \
+            consistent_link_own_vehicle
+        self._steady_relink_sources_wrapper = steady_relink_sources
         self._vehicle_getattribute_wrapper = vehicle_getattribute
+        self._vehicle_setattr_wrapper = vehicle_setattr
+        self._vehicle_get_speed_wrapper = vehicle_get_speed
+        self._vehicle_leave_world_wrapper = vehicle_leave_world
         self._vehicle_start_wg_physics_wrapper = vehicle_start_wg_physics
         self._vehicle_set_gun_angles_wrapper = vehicle_set_gun_angles
         self._compound_getattribute_wrapper = compound_getattribute
+        self._compound_deactivate_wrapper = compound_deactivate
         self._compound_models_refresh_wrapper = compound_models_refresh
         self._connect_wrapper = connect
         self._disconnect_wrapper = disconnect
+        self._server_time_wrapper = server_time
         self._debug_update_wrapper = debug_update
         try:
             self._install_host()
@@ -963,8 +1367,19 @@ class OfflineCompatibility(object):
             if self._original_avatar_aux_physics is not None:
                 avatar_type._PlayerAvatar__onSetOwnVehicleAuxPhysicsData = (
                     avatar_aux_physics)
+            if self._original_avatar_get_speeds is not None:
+                avatar_type.getOwnVehicleSpeeds = avatar_get_speeds
+            input_handler_type.onControlModeChanged = control_mode_changed
+            consistent_matrices_type._ConsistentMatrices__linkOwnVehicle = \
+                consistent_link_own_vehicle
+            steady_matrix_type.relinkSources = steady_relink_sources
             if vehicle_type is not None:
                 vehicle_type.__getattribute__ = vehicle_getattribute
+                vehicle_type.__setattr__ = vehicle_setattr
+                if self._original_vehicle_get_speed is not None:
+                    vehicle_type.getSpeed = vehicle_get_speed
+                if self._original_vehicle_leave_world is not None:
+                    vehicle_type.onLeaveWorld = vehicle_leave_world
                 if self._original_vehicle_start_wg_physics is not None:
                     vehicle_type._Vehicle__startWGPhysics = (
                         vehicle_start_wg_physics)
@@ -972,11 +1387,14 @@ class OfflineCompatibility(object):
                     vehicle_type.set_gunAnglesPacked = vehicle_set_gun_angles
             if compound_type is not None:
                 compound_type.__getattribute__ = compound_getattribute
+                if self._original_compound_deactivate is not None:
+                    compound_type.deactivate = compound_deactivate
                 if self._original_compound_models_refresh is not None:
                     compound_type._CompoundAppearance__onModelsRefresh = (
                         compound_models_refresh)
             runtime.bigworld.connect = connect
             runtime.bigworld.disconnect = disconnect
+            runtime.bigworld.serverTime = server_time
             if self._original_debug_update is not None:
                 debug_panel_type.updateDebugInfo = debug_update
             self._installed = True
@@ -1008,6 +1426,15 @@ class OfflineCompatibility(object):
             getattr(runtime, 'compound_appearance_module', None),
             'CompoundAppearance', None)
         debug_panel_type = getattr(runtime, 'debug_panel_type', None)
+        input_handler_type = getattr(
+            getattr(runtime, 'avatar_input_handler', None),
+            'AvatarInputHandler', None)
+        consistent_matrices_type = getattr(
+            getattr(runtime, 'avatar_position_control', None),
+            'ConsistentMatrices', None)
+        steady_matrix_type = getattr(
+            getattr(runtime, 'steady_vehicle_matrix', None),
+            'SteadyVehicleMatrixCalculator', None)
         if (account_type.__dict__.get('__init__') is
                 self._account_init_wrapper):
             account_type.__init__ = self._original_account_init
@@ -1062,6 +1489,30 @@ class OfflineCompatibility(object):
                 self._avatar_aux_physics_wrapper):
             avatar_type._PlayerAvatar__onSetOwnVehicleAuxPhysicsData = (
                 self._original_avatar_aux_physics)
+        if (self._original_avatar_get_speeds is not None and
+                avatar_type.__dict__.get('getOwnVehicleSpeeds') is
+                self._avatar_get_speeds_wrapper):
+            avatar_type.getOwnVehicleSpeeds = (
+                self._original_avatar_get_speeds)
+        if (input_handler_type is not None and
+                self._original_control_mode_changed is not None and
+                input_handler_type.__dict__.get('onControlModeChanged') is
+                self._control_mode_changed_wrapper):
+            input_handler_type.onControlModeChanged = (
+                self._original_control_mode_changed)
+        if (consistent_matrices_type is not None and
+                self._original_consistent_link_own_vehicle is not None and
+                consistent_matrices_type.__dict__.get(
+                    '_ConsistentMatrices__linkOwnVehicle') is
+                self._consistent_link_own_vehicle_wrapper):
+            consistent_matrices_type._ConsistentMatrices__linkOwnVehicle = (
+                self._original_consistent_link_own_vehicle)
+        if (steady_matrix_type is not None and
+                self._original_steady_relink_sources is not None and
+                steady_matrix_type.__dict__.get('relinkSources') is
+                self._steady_relink_sources_wrapper):
+            steady_matrix_type.relinkSources = (
+                self._original_steady_relink_sources)
         if (vehicle_type is not None and
                 self._original_vehicle_start_wg_physics is not None and
                 vehicle_type.__dict__.get('_Vehicle__startWGPhysics') is
@@ -1069,9 +1520,23 @@ class OfflineCompatibility(object):
             vehicle_type._Vehicle__startWGPhysics = (
                 self._original_vehicle_start_wg_physics)
         if (vehicle_type is not None and
+                self._original_vehicle_leave_world is not None and
+                vehicle_type.__dict__.get('onLeaveWorld') is
+                self._vehicle_leave_world_wrapper):
+            vehicle_type.onLeaveWorld = self._original_vehicle_leave_world
+        if (vehicle_type is not None and
                 vehicle_type.__dict__.get('__getattribute__') is
                 self._vehicle_getattribute_wrapper):
             vehicle_type.__getattribute__ = self._original_vehicle_getattribute
+        if (vehicle_type is not None and
+                vehicle_type.__dict__.get('__setattr__') is
+                self._vehicle_setattr_wrapper):
+            vehicle_type.__setattr__ = self._original_vehicle_setattr
+        if (vehicle_type is not None and
+                self._original_vehicle_get_speed is not None and
+                vehicle_type.__dict__.get('getSpeed') is
+                self._vehicle_get_speed_wrapper):
+            vehicle_type.getSpeed = self._original_vehicle_get_speed
         if (vehicle_type is not None and
                 self._original_vehicle_set_gun_angles is not None and
                 vehicle_type.__dict__.get('set_gunAnglesPacked') is
@@ -1086,6 +1551,11 @@ class OfflineCompatibility(object):
             compound_type._CompoundAppearance__onModelsRefresh = (
                 self._original_compound_models_refresh)
         if (compound_type is not None and
+                self._original_compound_deactivate is not None and
+                compound_type.__dict__.get('deactivate') is
+                self._compound_deactivate_wrapper):
+            compound_type.deactivate = self._original_compound_deactivate
+        if (compound_type is not None and
                 compound_type.__dict__.get('__getattribute__') is
                 self._compound_getattribute_wrapper):
             compound_type.__getattribute__ = (
@@ -1094,6 +1564,8 @@ class OfflineCompatibility(object):
             runtime.bigworld.connect = self._original_connect
         if runtime.bigworld.disconnect is self._disconnect_wrapper:
             runtime.bigworld.disconnect = self._original_disconnect
+        if runtime.bigworld.serverTime is self._server_time_wrapper:
+            runtime.bigworld.serverTime = self._original_server_time
         if (debug_panel_type is not None and
                 self._original_debug_update is not None and
                 debug_panel_type.__dict__.get('updateDebugInfo') is
@@ -1110,11 +1582,19 @@ class OfflineCompatibility(object):
         self._vehicle_start_wg_physics_code = None
         self._vehicle_syncing_gun_angles = None
         self._vehicle_set_gun_angles_code = None
+        self._gun_rotator_stabilised_code = None
         self._avatar_syncing_aux_physics = None
         self._avatar_aux_physics_code = None
+        self._avatar_entering_vehicle = None
+        self._avatar_vehicle_enter_code = None
+        self._avatar_start_vehicle_visual_code = None
         self._compound_refreshing_models = None
         self._compound_models_refresh_code = None
         self._battle_network_client = None
+        self._battle_server_time_origin = None
+        self._battle_clock_origin = None
+        self._vehicle_property_overlays = {}
+        self._control_mode_listener = None
         self._installed = False
 
     def connect(self, show_lobby=False, account_context=None):
@@ -1313,6 +1793,7 @@ class OfflineCompatibility(object):
                 raise ValueError('Avatar team must be 1 or 2')
         self.install()
         self._battle_active = True
+        self._vehicle_property_overlays = {}
         self._native_battle = True
         self._battle_gui_type = gui_type
         self._battle_bonus_type = bonus_type
@@ -1320,12 +1801,138 @@ class OfflineCompatibility(object):
             self._battle_player_name = player_name
         if player_team is not None:
             self._battle_player_team = player_team
+        self._battle_server_time_origin = float(
+            self._original_server_time())
+        self._battle_clock_origin = float(self._runtime.bigworld.time())
         self.activate_map()
 
     def set_battle_network_client(self, client):
         """Attach the LAN transport whose RTT should drive the battle HUD."""
         self.install()
         self._battle_network_client = client
+
+    def set_control_mode_listener(self, listener):
+        """Publish exact #1513 control-mode transitions to the battle owner."""
+        if listener is not None and not callable(listener):
+            raise TypeError('control-mode listener must be callable')
+        self.install()
+        self._control_mode_listener = listener
+
+    def set_vehicle_pose_overlay(self, vehicle, position, yaw, matrix,
+                                 speed=0.0, turn_speed=0.0):
+        """Publish one copied-physics pose through the stock Vehicle API.
+
+        #1513's client-only ``Vehicle`` has no retail cell stream, so its
+        native entity transform never advances.  The copied 0.8.2 integrator
+        owns the pose; this narrow overlay lets stock camera, gun and
+        collision consumers read that same pose without mutating the native
+        BigWorld entity or calling the forbidden ``teleport`` operation.
+        """
+        if not self._battle_active:
+            raise RuntimeError('vehicle pose overlay requires a battle')
+        overlay = self._vehicle_property_overlays.setdefault(id(vehicle), {})
+        overlay['_pose_active'] = True
+        overlay['position'] = position
+        overlay['yaw'] = float(yaw)
+        overlay['matrix'] = matrix
+        overlay['speed'] = float(speed)
+        overlay['turn_speed'] = float(turn_speed)
+        return True
+
+    def bind_vehicle_pose_sources(self, avatar, vehicle):
+        """Bind every stock #1513 pose provider to one live matrix.
+
+        Python ``Vehicle.__getattribute__`` is not a complete server-state
+        boundary: native matrix providers bypass it.  Bind the exact sources
+        consumed by the minimap, camera, aiming systems and gun rotator only
+        after the copied-physics overlay has established its canonical pose.
+        """
+        overlay = self._vehicle_property_overlays.get(id(vehicle))
+        if (not self._battle_active or overlay is None or
+                not overlay.get('_pose_active')):
+            raise RuntimeError('player pose source requires a live overlay')
+        matrix = overlay['matrix']
+        matrices = getattr(avatar, 'consistentMatrices', None)
+        if matrices is None:
+            raise RuntimeError('#1513 ConsistentMatrices is unavailable')
+        link = getattr(
+            matrices, '_ConsistentMatrices__linkOwnVehicle', None)
+        attached = getattr(matrices, '_ConsistentMatrices__setTarget', None)
+        if not callable(link) or not callable(attached):
+            raise RuntimeError(
+                '#1513 vehicle matrix binding methods are unavailable')
+        link(vehicle)
+        attached(matrix, False)
+
+        stabilised = getattr(
+            avatar, '_PlayerAvatar__ownVehicleStabMProv', None)
+        if stabilised is None:
+            raise RuntimeError(
+                '#1513 player stabilised matrix provider is unavailable')
+        stabilised.target = matrix
+        if stabilised.target is not matrix:
+            raise RuntimeError(
+                '#1513 player stabilised matrix rejected live pose')
+
+        handler = getattr(avatar, 'inputHandler', None)
+        calculator = getattr(
+            handler, 'steadyVehicleMatrixCalculator', None)
+        relink = getattr(calculator, 'relinkSources', None)
+        if not callable(relink):
+            raise RuntimeError(
+                '#1513 steady vehicle matrix relink is unavailable')
+        relink()
+        return True
+
+    def restore_vehicle_pose_sources(self, avatar, vehicle, native_matrix,
+                                     native_stabilised_matrix):
+        """Restore the stock providers after the live overlay is cleared."""
+        if self._vehicle_property_overlays.get(id(vehicle), {}).get(
+                '_pose_active'):
+            raise RuntimeError(
+                'player pose overlay must be cleared before source restore')
+        matrices = getattr(avatar, 'consistentMatrices', None)
+        if matrices is None:
+            raise RuntimeError('#1513 ConsistentMatrices is unavailable')
+        attached = getattr(matrices, '_ConsistentMatrices__setTarget', None)
+        if not callable(attached):
+            raise RuntimeError(
+                '#1513 attached vehicle matrix boundary is unavailable')
+        self._original_consistent_link_own_vehicle(matrices, vehicle)
+        attached(native_matrix, False)
+
+        stabilised = getattr(
+            avatar, '_PlayerAvatar__ownVehicleStabMProv', None)
+        if stabilised is None:
+            raise RuntimeError(
+                '#1513 player stabilised matrix provider is unavailable')
+        stabilised.target = native_stabilised_matrix
+
+        handler = getattr(avatar, 'inputHandler', None)
+        calculator = getattr(
+            handler, 'steadyVehicleMatrixCalculator', None)
+        if calculator is None:
+            raise RuntimeError(
+                '#1513 steady vehicle matrix calculator is unavailable')
+        self._original_steady_relink_sources(calculator)
+        return True
+
+    def clear_vehicle_pose_overlay(self, vehicle):
+        overlay = self._vehicle_property_overlays.get(id(vehicle))
+        if overlay is None:
+            return False
+        for name in ('_pose_active', 'position', 'yaw', 'matrix',
+                     'speed', 'turn_speed'):
+            overlay.pop(name, None)
+        if not overlay:
+            self._vehicle_property_overlays.pop(id(vehicle), None)
+        return True
+
+    def native_vehicle_attribute(self, vehicle, name):
+        """Read a native Vehicle member while a pose overlay is installed."""
+        if self._original_vehicle_getattribute is None:
+            raise RuntimeError('native Vehicle attribute boundary is unavailable')
+        return self._original_vehicle_getattribute(vehicle, name)
 
     def attach_avatar_server(self, avatar, server):
         proxy = getattr(avatar, 'fakeServer', None)
@@ -1406,6 +2013,9 @@ class OfflineCompatibility(object):
             self._battle_player_name = 'OfflinePlayer'
             self._battle_player_team = 1
             self._battle_network_client = None
+            self._battle_server_time_origin = None
+            self._battle_clock_origin = None
+            self._vehicle_property_overlays = {}
 
     def disconnect(self):
         if self._runtime is None:

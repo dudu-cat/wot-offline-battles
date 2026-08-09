@@ -1,0 +1,212 @@
+{
+  "format": "offline-lan-0922-navgraph-manifest",
+  "game_version": "0.9.22.0.1-cn-1513",
+  "maps": [
+    {
+      "file": "01_karelia.json",
+      "map": "01_karelia",
+      "sha256": "ba083c051ea3ba8f24e7b8d80aa6328e1917a8690c5aa2a3e35022c1cdcf0517"
+    },
+    {
+      "file": "02_malinovka.json",
+      "map": "02_malinovka",
+      "sha256": "8770d5cb9921e13fa21dfed8c6d79e1d55bae98fd614c225a63544487694b1cc"
+    },
+    {
+      "file": "04_himmelsdorf.json",
+      "map": "04_himmelsdorf",
+      "sha256": "c226a2ad850bc9b58f7938fd0eb280083386ba688c40cc1cd521c684a610c48a"
+    },
+    {
+      "file": "05_prohorovka.json",
+      "map": "05_prohorovka",
+      "sha256": "5b8c6ee74007d73800da23dea00e899e4d2529cd93ba1f2e1ad159df3219868b"
+    },
+    {
+      "file": "06_ensk.json",
+      "map": "06_ensk",
+      "sha256": "e2e00a0973de33feb5aa952925f036c5434d561f1208b5308c425f5384548586"
+    },
+    {
+      "file": "07_lakeville.json",
+      "map": "07_lakeville",
+      "sha256": "18c02afc144cfb7a8ea58c94295f1f89e3038d5082e5d328f6d005605ea099b6"
+    },
+    {
+      "file": "08_ruinberg.json",
+      "map": "08_ruinberg",
+      "sha256": "dcd5e767c38e1087e99a130087a17cc1eb51e0e1544b14096de91f78cd6f6e8a"
+    },
+    {
+      "file": "10_hills.json",
+      "map": "10_hills",
+      "sha256": "c12ceb77015d877ca74efb8362639c8a9323fdafb8ce84c948fb882fd96caa65"
+    },
+    {
+      "file": "11_murovanka.json",
+      "map": "11_murovanka",
+      "sha256": "98b93dd8afa2e11f79490dd0742103899397efe097ed69138a08065c15ab86f2"
+    },
+    {
+      "file": "13_erlenberg.json",
+      "map": "13_erlenberg",
+      "sha256": "9a1f5b76aafa963f64214d0d86567215dd8045d8733c3677a889a0067452ac14"
+    },
+    {
+      "file": "14_siegfried_line.json",
+      "map": "14_siegfried_line",
+      "sha256": "770b466e64fe112be6931d3dc7ea83a3861bc8be8196cb40efd431a263bbfd80"
+    },
+    {
+      "file": "17_munchen.json",
+      "map": "17_munchen",
+      "sha256": "3be1f3cef75947792b020d8d6f1faa9a7cb5a36bcf1537a5e9bdb3297d9123ad"
+    },
+    {
+      "file": "18_cliff.json",
+      "map": "18_cliff",
+      "sha256": "bc3319c822e83b0ebb8319f0e33173328579cf38d420d3cf47c81b50b1580964"
+    },
+    {
+      "file": "19_monastery.json",
+      "map": "19_monastery",
+      "sha256": "76700125226afc7287bf2e4a497c1243068b5e867f969aad21fa67184dbd82a0"
+    },
+    {
+      "file": "22_slough.json",
+      "map": "22_slough",
+      "sha256": "d5325dbc51a976e53a75948d4a2186d24dce4cacb7963f51e210f4384e32aa6a"
+    },
+    {
+      "file": "23_westfeld.json",
+      "map": "23_westfeld",
+      "sha256": "409ced4e35a32b6ec217a4abe39498d52b677e7b3c390405a94000eab12fd693"
+    },
+    {
+      "file": "28_desert.json",
+      "map": "28_desert",
+      "sha256": "52fe5b909a7b0b3275b494e093bb806d0de899bd2e6f62ba985e220197976d84"
+    },
+    {
+      "file": "29_el_hallouf.json",
+      "map": "29_el_hallouf",
+      "sha256": "1170bdd336dfb684de979d076d617ac26398414254a8f8fcf058d9d42ff4c5e8"
+    },
+    {
+      "file": "31_airfield.json",
+      "map": "31_airfield",
+      "sha256": "eb53957684a8be53d6055f533269818e451d209e9d365980ebac71559f59a3dc"
+    },
+    {
+      "file": "33_fjord.json",
+      "map": "33_fjord",
+      "sha256": "58ebc8ce17881497411c3c89ee8cb7618ed5c4f87ac515d64a0efa55010d57dc"
+    },
+    {
+      "file": "34_redshire.json",
+      "map": "34_redshire",
+      "sha256": "023e1b79c118428298ab8d2f520295f77ba4da0c28dc6c5f4e9fa51c2b79fc07"
+    },
+    {
+      "file": "35_steppes.json",
+      "map": "35_steppes",
+      "sha256": "6044794a1b76ff6954428c54e6a7cf1acc245e84ace0892be25a278b5778451b"
+    },
+    {
+      "file": "36_fishing_bay.json",
+      "map": "36_fishing_bay",
+      "sha256": "9f1ecb7931529a803549e9d512b4a636ca0fde5568c1bac70bab0f54d8177873"
+    },
+    {
+      "file": "37_caucasus.json",
+      "map": "37_caucasus",
+      "sha256": "92b9d0afcee5df7af04597cd2a4ae3342fc8a380b12f07e8fd945681aad83150"
+    },
+    {
+      "file": "38_mannerheim_line.json",
+      "map": "38_mannerheim_line",
+      "sha256": "09e6071360508bcb8fea3cc11a63cd5d4a3ed92a9fcf4af137066a4295ca61dd"
+    },
+    {
+      "file": "44_north_america.json",
+      "map": "44_north_america",
+      "sha256": "e864af1970a822ed72e969211bbff017ce02a3cbcec0113f24d61192bb731ded"
+    },
+    {
+      "file": "45_north_america.json",
+      "map": "45_north_america",
+      "sha256": "7774f1e39a346b23c8d18e3d576489c8a05bdd4b04b44b43b2c8e26e0ed59221"
+    },
+    {
+      "file": "47_canada_a.json",
+      "map": "47_canada_a",
+      "sha256": "a8d18c4775fe6259bfc234b24685ca4aee01938fdfca506ef2d7c59d15e66169"
+    },
+    {
+      "file": "59_asia_great_wall.json",
+      "map": "59_asia_great_wall",
+      "sha256": "88dd74fdf2a3dcdeb189f7fac8e7df4d68b210ce6ba7d3b1a9424ac1099923b2"
+    },
+    {
+      "file": "63_tundra.json",
+      "map": "63_tundra",
+      "sha256": "800fb532f7a3632f872b98cf35a38c199145b07b36fd76fa9b1034bcad5cfda3"
+    },
+    {
+      "file": "73_asia_korea.json",
+      "map": "73_asia_korea",
+      "sha256": "b5595ae1ec1799bdac65e35450330119ad83ded45633f5fe04aec8a15138f3fa"
+    },
+    {
+      "file": "83_kharkiv.json",
+      "map": "83_kharkiv",
+      "sha256": "7d54530f0ec0928547fdf04cd763fd19be6a4f21596344e188a49a6fb7ac7397"
+    },
+    {
+      "file": "84_winter.json",
+      "map": "84_winter",
+      "sha256": "a8acb7d9769d663d25c5d15ff21f9c0c8fbaeb532df942ae050c42dfa777f7da"
+    },
+    {
+      "file": "86_himmelsdorf_winter.json",
+      "map": "86_himmelsdorf_winter",
+      "sha256": "d5dbadd8041b3ddeacf564ef2a2932754500afac8d1679ef9624987917c6f454"
+    },
+    {
+      "file": "92_stalingrad.json",
+      "map": "92_stalingrad",
+      "sha256": "24a746743741bd712a1c7a97278c5905c20e860e3fdd1843d533e9cb13816f3c"
+    },
+    {
+      "file": "95_lost_city.json",
+      "map": "95_lost_city",
+      "sha256": "24cdb74a3fd421cd0e53f52718c4f612818a4bc876e9f4fdab86a2601920d358"
+    },
+    {
+      "file": "100_thepit.json",
+      "map": "100_thepit",
+      "sha256": "f0d044e656a9d36c4681421ae532f77a06d00bdd57e2eec02f4fda7ea7c194a2"
+    },
+    {
+      "file": "101_dday.json",
+      "map": "101_dday",
+      "sha256": "bd5b867249fd3faf8a098b2ea1c5dca755cd9f9e15d88958efc34c82c251ad94"
+    },
+    {
+      "file": "103_ruinberg_winter.json",
+      "map": "103_ruinberg_winter",
+      "sha256": "ebdee4ae6ee7fc0c677ca0ff59212784a771f8786a590c416e027b4c805c3b3a"
+    },
+    {
+      "file": "112_eiffel_tower_ctf.json",
+      "map": "112_eiffel_tower_ctf",
+      "sha256": "99d7cf9d1fec54d2df7cdefc58584240e13ec1ae4367de6ab235bf9710040f0c"
+    },
+    {
+      "file": "114_czech.json",
+      "map": "114_czech",
+      "sha256": "eb0fcc2fc13e2f88e950610435979f3ed29c3cc9c387ec53af976a118e21280b"
+    }
+  ],
+  "version": 2
+}
