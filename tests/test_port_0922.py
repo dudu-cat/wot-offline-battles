@@ -233,7 +233,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.42</version></root>')
+            '<version>0.3.43</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -326,6 +326,13 @@ class PortSourceTests(unittest.TestCase):
         source_root = PORT_ROOT / 'src'
         for path in source_root.rglob('*.py'):
             compile(path.read_text(encoding='utf-8'), str(path), 'exec')
+
+    def test_compatibility_never_replaces_native_bigworld_target(self):
+        source = (
+            PORT_ROOT / 'src' / 'res' / 'scripts' / 'client' / 'gui' /
+            'mods' / 'offline_lan_0922' / 'compat.py').read_text(
+                encoding='utf-8')
+        self.assertNotRegex(source, r'\bbigworld\.target\s*=')
 
     def test_vehicle_force_law_uses_drive_intent_for_reverse_steering(self):
         physics = _load_port_source('vehicle_physics')
@@ -796,6 +803,35 @@ class _CompatChatManager(object):
         self.operations.append(('chat_proxy', player))
 
 
+class _CompatTargetController(object):
+    """Callable #1513 TargetMatrix surface, not a plain Python function."""
+
+    def __init__(self, owner, operations):
+        self._owner = owner
+        self._operations = operations
+        self.source = None
+        self.maxDistance = 0.0
+        self.selectionFovDegrees = 0.0
+        self.deselectionFovDegrees = 0.0
+        self.skeletonCheckEnabled = False
+        self.isEnabled = False
+        self.exclude = None
+
+    @property
+    def entity(self):
+        return self._owner._target
+
+    def __call__(self):
+        return self._owner._target
+
+    def caps(self, *args):
+        self._operations.append(('target_caps', args))
+
+    def clear(self):
+        self._operations.append(('target_clear',))
+        self._owner._target = None
+
+
 class _CompatBigWorld(object):
     _MISSING = object()
 
@@ -806,6 +842,7 @@ class _CompatBigWorld(object):
         self.entities = {}
         self._player = None
         self._target = None
+        self.target = _CompatTargetController(self, operations)
         self._next_entity = 1
         self._now = 100.0
 
@@ -817,9 +854,6 @@ class _CompatBigWorld(object):
         # clock samples, so this value remains frozen until the compatibility
         # layer supplies the scoped offline battle clock.
         return 500.0
-
-    def target(self):
-        return self._target
 
     def connect(self, server, login_params, progress):
         self.operations.append(('original_connect', server))
@@ -845,6 +879,12 @@ class _CompatBigWorld(object):
 
     def AvatarFilter(self):
         return _CompatAvatarFilter(self.operations)
+
+    def MouseTargettingMatrix(self):
+        return object()
+
+    def MouseTargetingMatrix(self):
+        return object()
 
     def player(self, value=_MISSING):
         if value is not self._MISSING:
@@ -1285,6 +1325,12 @@ class OfflineCompatibilityTests(unittest.TestCase):
             def onBecomePlayer(self):
                 operations.append(('original_account_become_player',))
                 bigworld.clearAllSpaces()
+                target = bigworld.target
+                target.source = bigworld.MouseTargetingMatrix()
+                target.maxDistance = 700.0
+                target.skeletonCheckEnabled = True
+                target.caps()
+                target.isEnabled = True
                 chat_manager.switchPlayerProxy(self)
 
             def onBecomeNonPlayer(self):
@@ -1395,9 +1441,11 @@ class OfflineCompatibilityTests(unittest.TestCase):
                 chat_manager.switchPlayerProxy(self)
                 self.filter = bigworld.AvatarFilter()
                 self.arena = types.SimpleNamespace(arenaType=object())
+                bigworld.target.caps(1)
 
             def onBecomeNonPlayer(self):
                 operations.append(('original_avatar_become_non_player',))
+                bigworld.target.clear()
                 chat_manager.switchPlayerProxy(None)
 
             def onPrereqsLoaded(self, resource_names, resource_refs):
@@ -1552,6 +1600,62 @@ class OfflineCompatibilityTests(unittest.TestCase):
                 self._AvatarInputHandler__ctrlModeName = eMode
                 return 'changed'
 
+        class CommandMappingInstance(object):
+            def __init__(self):
+                self.overrides = {}
+
+            def isFired(self, command, key):
+                commands = self.overrides.get(key)
+                if commands is not None:
+                    return command in commands
+                return command == key
+
+        class CommandMapping(object):
+            CMD_CM_FREE_CAMERA = 'free-camera'
+            CMD_CM_LOCK_TARGET = 'lock-target'
+            CMD_CM_LOCK_TARGET_OFF = 'lock-target-off'
+            g_instance = CommandMappingInstance()
+
+        class ArcadeControlMode(object):
+            def handleKeyEvent(self, isDown, key, mods, event):
+                if getattr(self, 'raise_event', False):
+                    raise RuntimeError('control-mode input failed')
+                if getattr(self, 'consume_event', False):
+                    return True
+                is_free = CommandMapping.g_instance.isFired(
+                    CommandMapping.CMD_CM_FREE_CAMERA, key)
+                is_lock = (isDown and CommandMapping.g_instance.isFired(
+                    CommandMapping.CMD_CM_LOCK_TARGET, key))
+                if is_free:
+                    pass
+                if is_lock:
+                    bigworld.player().autoAim(bigworld.target())
+                if (isDown and CommandMapping.g_instance.isFired(
+                        CommandMapping.CMD_CM_LOCK_TARGET_OFF, key)):
+                    bigworld.player().autoAim(None)
+                    return True
+                return False
+
+        class SniperControlMode(ArcadeControlMode):
+            def handleKeyEvent(self, isDown, key, mods, event):
+                if getattr(self, 'raise_event', False):
+                    raise RuntimeError('control-mode input failed')
+                if getattr(self, 'consume_event', False):
+                    return True
+                is_free = CommandMapping.g_instance.isFired(
+                    CommandMapping.CMD_CM_FREE_CAMERA, key)
+                is_lock = (isDown and CommandMapping.g_instance.isFired(
+                    CommandMapping.CMD_CM_LOCK_TARGET, key))
+                if is_free:
+                    pass
+                if is_lock:
+                    bigworld.player().autoAim(bigworld.target())
+                if (isDown and CommandMapping.g_instance.isFired(
+                        CommandMapping.CMD_CM_LOCK_TARGET_OFF, key)):
+                    bigworld.player().autoAim(None)
+                    return True
+                return False
+
         class VehicleGunRotator(object):
             def getAvatarOwnVehicleStabilisedMatrix(self, vehicle):
                 return vehicle.filter.interpolateStabilisedMatrix(123.0)
@@ -1582,6 +1686,10 @@ class OfflineCompatibilityTests(unittest.TestCase):
             avatar_module=avatar_module,
             avatar_input_handler=types.SimpleNamespace(
                 AvatarInputHandler=AvatarInputHandler),
+            control_modes=types.SimpleNamespace(
+                ArcadeControlMode=ArcadeControlMode,
+                SniperControlMode=SniperControlMode,
+                CommandMapping=CommandMapping),
             avatar_position_control=types.SimpleNamespace(
                 ConsistentMatrices=ConsistentMatrices),
             bigworld=bigworld,
@@ -1623,10 +1731,12 @@ class OfflineCompatibilityTests(unittest.TestCase):
         original_connect = runtime.bigworld.connect
         original_disconnect = runtime.bigworld.disconnect
         original_clear_all_spaces = runtime.bigworld.clearAllSpaces
+        original_target = runtime.bigworld.target
         compatibility = compatibility_module.OfflineCompatibility(runtime)
 
         compatibility.connect(show_lobby=True)
 
+        self.assertIs(original_target, runtime.bigworld.target)
         self.assertTrue(compatibility.is_ready())
         account = runtime.bigworld.player()
         self.assertTrue(account.isOffline)
@@ -1668,6 +1778,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
         original_filter_factory = runtime.bigworld.AvatarFilter
         runtime.avatar_module.AvatarObserver.onEnterWorld(avatar)
         avatar.onBecomePlayer()
+        self.assertIs(original_target, runtime.bigworld.target)
         self.assertIs(first_filter, avatar.filter)
         observer_events = [item for item in operations
                            if item[0] == 'avatar_observer_enter_world']
@@ -1685,6 +1796,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertFalse(runtime.offline_map_creator.active)
 
         compatibility.fini()
+        self.assertIs(original_target, runtime.bigworld.target)
         self.assertIs(
             original_init,
             runtime.account_module.PlayerAccount.__dict__['__init__'])
@@ -1803,6 +1915,9 @@ class OfflineCompatibilityTests(unittest.TestCase):
             gun=types.SimpleNamespace(shotDispersionAngle=0.08))
         avatar.onLockTarget = mock.Mock()
         runtime.bigworld.entity = runtime.bigworld.entities.get
+        runtime.bigworld._player = avatar
+        arcade = runtime.control_modes.ArcadeControlMode()
+        sniper = runtime.control_modes.SniperControlMode()
         first_visual = object()
         second_visual = object()
         first = types.SimpleNamespace(
@@ -1816,8 +1931,8 @@ class OfflineCompatibilityTests(unittest.TestCase):
         runtime.bigworld.entities.update({1000: first, 1001: second})
 
         compatibility.set_target_lock_candidate(first)
-        self.assertIs(first_visual, runtime.bigworld.target())
-        avatar.autoAim(runtime.bigworld.target())
+        self.assertIsNone(runtime.bigworld.target())
+        arcade.handleKeyEvent(True, 'lock-target', 0, None)
         self.assertEqual(1000, avatar._PlayerAvatar__autoAimVehID)
         avatar.cell.autoAim.assert_called_once_with(1000)
         avatar.inputHandler.setAimingMode.assert_called_once_with(
@@ -1829,8 +1944,8 @@ class OfflineCompatibilityTests(unittest.TestCase):
              {'vehicleId': 1000}), operations)
 
         compatibility.set_target_lock_candidate(second)
-        self.assertIs(second_visual, runtime.bigworld.target())
-        avatar.autoAim(runtime.bigworld.target())
+        self.assertIsNone(runtime.bigworld.target())
+        sniper.handleKeyEvent(True, 'lock-target', 0, None)
         self.assertEqual(1001, avatar._PlayerAvatar__autoAimVehID)
         self.assertEqual(
             [mock.call(1000), mock.call(1001)],
@@ -1838,7 +1953,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
 
         # The explicit native lock-off path passes literal None and must take
         # the complete stock unlock path, including convergence bookkeeping.
-        avatar.autoAim(None)
+        arcade.handleKeyEvent(True, 'lock-target-off', 0, None)
         self.assertEqual(0, avatar._PlayerAvatar__autoAimVehID)
         self.assertEqual(100.0, avatar._PlayerAvatar__aimingInfo[0])
         self.assertEqual(3.0, avatar._PlayerAvatar__aimingInfo[1])
@@ -1853,6 +1968,96 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertIs(
             original_auto_aim,
             runtime.avatar_module.PlayerAvatar.__dict__['autoAim'])
+
+    def test_target_lock_input_scope_clears_on_consume_and_failure(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        original_target = runtime.bigworld.target
+        original_arcade = runtime.control_modes.ArcadeControlMode.\
+            __dict__['handleKeyEvent']
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.team = 1
+        avatar.cell = types.SimpleNamespace(autoAim=mock.Mock())
+        avatar.inputHandler = types.SimpleNamespace(
+            setAimingMode=mock.Mock())
+        avatar.gunRotator = types.SimpleNamespace(
+            clientMode=True, dispersionAngle=0.24)
+        avatar.vehicleTypeDescriptor = types.SimpleNamespace(
+            gun=types.SimpleNamespace(shotDispersionAngle=0.08))
+        avatar.onLockTarget = mock.Mock()
+        runtime.bigworld._player = avatar
+        target = types.SimpleNamespace(
+            _offlineLANPresentation=True, bw_entity=object(),
+            id=1000, team=2, _spot_visible=True,
+            isAlive=lambda: True)
+        compatibility.set_target_lock_candidate(target)
+
+        consumed = runtime.control_modes.ArcadeControlMode()
+        consumed.consume_event = True
+        self.assertTrue(
+            consumed.handleKeyEvent(True, 'lock-target', 0, None))
+        self.assertFalse(compatibility._target_lock_input_pending)
+        self.assertIsNone(compatibility._target_lock_input_avatar)
+        self.assertEqual(0, avatar._PlayerAvatar__autoAimVehID)
+
+        failed = runtime.control_modes.ArcadeControlMode()
+        failed.raise_event = True
+        with self.assertRaisesRegex(
+                RuntimeError, 'control-mode input failed'):
+            failed.handleKeyEvent(True, 'lock-target', 0, None)
+        self.assertFalse(compatibility._target_lock_input_pending)
+        self.assertIsNone(compatibility._target_lock_input_avatar)
+        self.assertIs(original_target, runtime.bigworld.target)
+
+        commands = runtime.control_modes.CommandMapping
+        commands.g_instance.overrides['lock-and-off'] = {
+            commands.CMD_CM_LOCK_TARGET,
+            commands.CMD_CM_LOCK_TARGET_OFF,
+        }
+        avatar.cell.autoAim.reset_mock()
+        runtime.control_modes.ArcadeControlMode().handleKeyEvent(
+            True, 'lock-and-off', 0, None)
+        self.assertEqual(0, avatar._PlayerAvatar__autoAimVehID)
+        self.assertEqual(
+            [mock.call(1000), mock.call(0)],
+            avatar.cell.autoAim.call_args_list)
+
+        commands.g_instance.overrides['free-lock-and-off'] = {
+            commands.CMD_CM_FREE_CAMERA,
+            commands.CMD_CM_LOCK_TARGET,
+            commands.CMD_CM_LOCK_TARGET_OFF,
+        }
+        avatar.cell.autoAim.reset_mock()
+        runtime.control_modes.SniperControlMode().handleKeyEvent(
+            True, 'free-lock-and-off', 0, None)
+        self.assertEqual(0, avatar._PlayerAvatar__autoAimVehID)
+        self.assertEqual(
+            [mock.call(1000), mock.call(0)],
+            avatar.cell.autoAim.call_args_list)
+
+        compatibility.fini()
+        self.assertIs(original_target, runtime.bigworld.target)
+        self.assertIs(
+            original_arcade,
+            runtime.control_modes.ArcadeControlMode.__dict__[
+                'handleKeyEvent'])
+
+    def test_target_lock_wrapper_is_inert_outside_battle(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+        control = runtime.control_modes.ArcadeControlMode()
+        control.consume_event = True
+        runtime.control_modes.CommandMapping.g_instance = None
+
+        self.assertTrue(
+            control.handleKeyEvent(True, 'lock-target', 0, None))
+        self.assertFalse(compatibility._target_lock_input_pending)
+        self.assertIsNone(compatibility._target_lock_input_avatar)
+        compatibility.fini()
 
     def test_remote_autoaim_delegates_unrelated_native_vehicle(self):
         compatibility_module = _load_port_source('compat')
@@ -1902,13 +2107,15 @@ class OfflineCompatibilityTests(unittest.TestCase):
             gun=types.SimpleNamespace(shotDispersionAngle=0.08))
         avatar.onLockTarget = mock.Mock()
         runtime.bigworld.entity = runtime.bigworld.entities.get
+        runtime.bigworld._player = avatar
+        arcade = runtime.control_modes.ArcadeControlMode()
         target = types.SimpleNamespace(
             _offlineLANPresentation=True, bw_entity=object(),
             id=1000, team=2, _spot_visible=True,
             isAlive=lambda: True)
         runtime.bigworld.entities[1000] = target
         compatibility.set_target_lock_candidate(target)
-        avatar.autoAim(runtime.bigworld.target())
+        arcade.handleKeyEvent(True, 'lock-target', 0, None)
 
         self.assertFalse(compatibility.validate_target_lock(avatar))
         target._spot_visible = False
@@ -2713,9 +2920,11 @@ class OfflineCompatibilityTests(unittest.TestCase):
     def test_account_avatar_account_handoff_detaches_chat_before_each_clear(self):
         compatibility_module = _load_port_source('compat')
         runtime, operations = self._runtime()
+        original_target = runtime.bigworld.target
         compatibility = compatibility_module.OfflineCompatibility(runtime)
         compatibility.connect(show_lobby=True)
         first_account = runtime.bigworld.player()
+        self.assertIs(original_target, runtime.bigworld.target)
 
         self.assertTrue(compatibility.retire_current_player())
         self.assertIsNone(runtime.chat_manager.playerProxy)
@@ -2727,6 +2936,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
         runtime.bigworld._player = avatar
         avatar.onBecomePlayer()
         self.assertIs(avatar, runtime.chat_manager.playerProxy)
+        self.assertIs(original_target, runtime.bigworld.target)
 
         self.assertTrue(compatibility.retire_current_player())
         self.assertFalse(compatibility.retire_current_player())
@@ -2734,13 +2944,36 @@ class OfflineCompatibilityTests(unittest.TestCase):
         runtime.bigworld.clearAllSpaces()
         self.assertEqual({}, avatar.__dict__)
 
+        compatibility.deactivate_map()
         replacement = compatibility.restore_lobby_account()
         self.assertIs(replacement, runtime.chat_manager.playerProxy)
         self.assertIsNot(first_account, replacement)
+        self.assertIs(original_target, runtime.bigworld.target)
+        self.assertIsNone(compatibility._target_lock_candidate)
+        self.assertFalse(compatibility._target_lock_input_pending)
+
+        self.assertTrue(compatibility.retire_current_player())
+        runtime.bigworld.clearAllSpaces()
+        compatibility.configure_battle()
+        second_avatar = runtime.avatar_module.PlayerAvatar()
+        runtime.bigworld._player = second_avatar
+        second_avatar.onBecomePlayer()
+        self.assertIs(second_avatar, runtime.chat_manager.playerProxy)
+        self.assertIs(original_target, runtime.bigworld.target)
+
+        self.assertTrue(compatibility.retire_current_player())
+        runtime.bigworld.clearAllSpaces()
+        compatibility.deactivate_map()
+        final_account = compatibility.restore_lobby_account()
+        self.assertIs(final_account, runtime.chat_manager.playerProxy)
+        self.assertIsNot(replacement, final_account)
+        self.assertIs(original_target, runtime.bigworld.target)
+        self.assertIsNone(compatibility._target_lock_candidate)
+        self.assertFalse(compatibility._target_lock_input_pending)
         names = [item[0] for item in operations]
-        self.assertEqual(2, names.count('original_account_become_player'))
-        self.assertEqual(1, names.count('original_account_become_non_player'))
-        self.assertEqual(1, names.count('original_avatar_become_non_player'))
+        self.assertEqual(3, names.count('original_account_become_player'))
+        self.assertEqual(2, names.count('original_account_become_non_player'))
+        self.assertEqual(2, names.count('original_avatar_become_non_player'))
 
     def test_account_promotion_restores_clear_all_spaces_after_failure(self):
         compatibility_module = _load_port_source('compat')
@@ -2973,6 +3206,10 @@ class OfflineCompatibilityTests(unittest.TestCase):
             avatar_type.__dict__['onLeaveWorld'],
             vehicle_type.__getattribute__,
             vehicle_type.__dict__['_Vehicle__startWGPhysics'],
+            runtime.control_modes.ArcadeControlMode.__dict__[
+                'handleKeyEvent'],
+            runtime.control_modes.SniperControlMode.__dict__[
+                'handleKeyEvent'],
             runtime.bigworld.connect,
             runtime.bigworld.disconnect,
         )
@@ -3002,13 +3239,21 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertIs(
             originals[7],
             vehicle_type.__dict__['_Vehicle__startWGPhysics'])
-        self.assertIs(originals[8].__func__,
+        self.assertIs(
+            originals[8],
+            runtime.control_modes.ArcadeControlMode.__dict__[
+                'handleKeyEvent'])
+        self.assertIs(
+            originals[9],
+            runtime.control_modes.SniperControlMode.__dict__[
+                'handleKeyEvent'])
+        self.assertIs(originals[10].__func__,
                       runtime.bigworld.connect.__func__)
-        self.assertIs(originals[8].__self__,
+        self.assertIs(originals[10].__self__,
                       runtime.bigworld.connect.__self__)
-        self.assertIs(originals[9].__func__,
+        self.assertIs(originals[11].__func__,
                       runtime.bigworld.disconnect.__func__)
-        self.assertIs(originals[9].__self__,
+        self.assertIs(originals[11].__self__,
                       runtime.bigworld.disconnect.__self__)
 
     def test_lobby_restore_does_not_replace_an_existing_player(self):
@@ -3068,9 +3313,19 @@ class OfflineCompatibilityTests(unittest.TestCase):
         def later_avatar_leave(avatar):
             return 'later-leave'
 
+        def later_arcade(control, isDown, key, mods, event):
+            return 'later-arcade'
+
+        def later_sniper(control, isDown, key, mods, event):
+            return 'later-sniper'
+
         runtime.account_module.PlayerAccount.__init__ = later_account_init
         runtime.avatar_module.PlayerAvatar.onEnterWorld = later_avatar_enter
         runtime.avatar_module.PlayerAvatar.onLeaveWorld = later_avatar_leave
+        runtime.control_modes.ArcadeControlMode.handleKeyEvent = \
+            later_arcade
+        runtime.control_modes.SniperControlMode.handleKeyEvent = \
+            later_sniper
         runtime.bigworld.connect = later_connect
         compatibility.fini()
 
@@ -3083,6 +3338,14 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertIs(
             later_avatar_leave,
             runtime.avatar_module.PlayerAvatar.__dict__['onLeaveWorld'])
+        self.assertIs(
+            later_arcade,
+            runtime.control_modes.ArcadeControlMode.__dict__[
+                'handleKeyEvent'])
+        self.assertIs(
+            later_sniper,
+            runtime.control_modes.SniperControlMode.__dict__[
+                'handleKeyEvent'])
         self.assertIs(later_connect, runtime.bigworld.connect)
 
 
@@ -3541,7 +3804,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.42'
+        package.PORT_VERSION = '0.3.43'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []

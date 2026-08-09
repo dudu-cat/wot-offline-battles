@@ -1,4 +1,4 @@
-World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.42
+World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.43
 ================================================================
 
 This folder is directly mergeable into the frozen Chinese HD client root.
@@ -17,7 +17,7 @@ client pins an empty server room to one build; a legacy 0.8.2 client cannot join
 that room because its map and coordinate contracts are different. Use another
 server port for a simultaneous 0.8.2 room.
 
-Version 0.3.42 retains the local gun/shot, collision, spotting and foliage
+Version 0.3.43 retains the local gun/shot, collision, spotting and foliage
 fixes. It installs one live pose before native input startup for camera, gun,
 sniper and minimap consumers; hides unspotted/dead private entities from native
 aiming and projectile lookup; restores RPM presentation; and renders admitted
@@ -44,7 +44,7 @@ Install
 3. Copy this folder's `mods` directory into the game root.
 4. Confirm this file exists:
 
-       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.42.wotmod
+       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.43.wotmod
 
 5. This copy-ready package includes:
 
@@ -112,7 +112,7 @@ Troubleshooting
 ---------------
 
 - `unsupported compression type`: an older or incorrectly compressed wotmod
-  is still present. Keep only the 0.3.42 package; its members use Store method.
+  is still present. Keep only the 0.3.43 package; its members use Store method.
 - No connection in the server terminal: check `config.json`, the host LAN IP,
   virtual-machine network mode and TCP 28782 firewall access. A failed attempt
   automatically opens the native endpoint editor; Battle! can reopen it.

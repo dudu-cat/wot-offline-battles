@@ -75,6 +75,7 @@ def _load_runtime():
     import Account
     import Avatar
     import AvatarInputHandler
+    import AvatarInputHandler.control_modes as ControlModes
     import AvatarPositionControl
     import BigWorld
     import ChatManager
@@ -102,6 +103,7 @@ def _load_runtime():
     runtime.account_module = Account
     runtime.avatar_module = Avatar
     runtime.avatar_input_handler = AvatarInputHandler
+    runtime.control_modes = ControlModes
     runtime.avatar_position_control = AvatarPositionControl
     runtime.bigworld = BigWorld
     runtime.chat_manager = ChatManager.chatManager
@@ -298,6 +300,10 @@ class OfflineCompatibility(object):
         self._original_avatar_aux_physics = None
         self._original_avatar_get_speeds = None
         self._original_avatar_auto_aim = None
+        self._original_arcade_handle_key_event = None
+        self._original_sniper_handle_key_event = None
+        self._arcade_handle_key_event_code = None
+        self._sniper_handle_key_event_code = None
         self._original_control_mode_changed = None
         self._original_consistent_link_own_vehicle = None
         self._original_steady_relink_sources = None
@@ -335,6 +341,8 @@ class OfflineCompatibility(object):
         self._avatar_aux_physics_wrapper = None
         self._avatar_get_speeds_wrapper = None
         self._avatar_auto_aim_wrapper = None
+        self._arcade_handle_key_event_wrapper = None
+        self._sniper_handle_key_event_wrapper = None
         self._control_mode_changed_wrapper = None
         self._consistent_link_own_vehicle_wrapper = None
         self._steady_relink_sources_wrapper = None
@@ -355,13 +363,14 @@ class OfflineCompatibility(object):
         self._connect_wrapper = None
         self._disconnect_wrapper = None
         self._server_time_wrapper = None
-        self._target_wrapper = None
         self._debug_update_wrapper = None
         self._battle_server_time_origin = None
         self._battle_clock_origin = None
         self._vehicle_property_overlays = {}
         self._control_mode_listener = None
         self._target_lock_candidate = None
+        self._target_lock_input_pending = False
+        self._target_lock_input_avatar = None
 
     def install(self):
         if self._installed:
@@ -382,6 +391,12 @@ class OfflineCompatibility(object):
         input_handler_type = getattr(
             getattr(runtime, 'avatar_input_handler', None),
             'AvatarInputHandler', None)
+        arcade_control_type = getattr(
+            getattr(runtime, 'control_modes', None),
+            'ArcadeControlMode', None)
+        sniper_control_type = getattr(
+            getattr(runtime, 'control_modes', None),
+            'SniperControlMode', None)
         consistent_matrices_type = getattr(
             getattr(runtime, 'avatar_position_control', None),
             'ConsistentMatrices', None)
@@ -437,6 +452,30 @@ class OfflineCompatibility(object):
             'autoAim', getattr(avatar_type, 'autoAim', None))
         if self._original_avatar_auto_aim is None:
             raise RuntimeError('#1513 Avatar.autoAim is unavailable')
+        if arcade_control_type is None or sniper_control_type is None:
+            raise RuntimeError('#1513 target-lock control modes are unavailable')
+        self._original_arcade_handle_key_event = (
+            arcade_control_type.__dict__.get(
+                'handleKeyEvent',
+                getattr(arcade_control_type, 'handleKeyEvent', None)))
+        self._original_sniper_handle_key_event = (
+            sniper_control_type.__dict__.get(
+                'handleKeyEvent',
+                getattr(sniper_control_type, 'handleKeyEvent', None)))
+        if (self._original_arcade_handle_key_event is None or
+                self._original_sniper_handle_key_event is None):
+            raise RuntimeError(
+                '#1513 target-lock input boundary is unavailable')
+        self._arcade_handle_key_event_code = getattr(
+            self._original_arcade_handle_key_event, 'func_code', getattr(
+                self._original_arcade_handle_key_event, '__code__', None))
+        self._sniper_handle_key_event_code = getattr(
+            self._original_sniper_handle_key_event, 'func_code', getattr(
+                self._original_sniper_handle_key_event, '__code__', None))
+        if (self._arcade_handle_key_event_code is None or
+                self._sniper_handle_key_event_code is None):
+            raise RuntimeError(
+                '#1513 target-lock input code boundary is unavailable')
         self._original_avatar_aux_physics = avatar_type.__dict__.get(
             '_PlayerAvatar__onSetOwnVehicleAuxPhysicsData',
             getattr(
@@ -999,6 +1038,18 @@ class OfflineCompatibility(object):
             current_id = compatibility._original_avatar_getattribute(
                 avatar, '_PlayerAvatar__autoAimVehID')
             candidate = compatibility._target_lock_candidate
+            caller_code = sys._getframe(1).f_code
+            is_lock_input = (
+                compatibility._target_lock_input_pending and
+                avatar is compatibility._target_lock_input_avatar and
+                caller_code in (
+                    compatibility._arcade_handle_key_event_code,
+                    compatibility._sniper_handle_key_event_code))
+            if is_lock_input:
+                compatibility._target_lock_input_pending = False
+                compatibility._target_lock_input_avatar = None
+                if target is None and candidate is not None:
+                    target = candidate
             if (candidate is not None and
                     target is getattr(candidate, 'bw_entity', None)):
                 target = candidate
@@ -1033,6 +1084,39 @@ class OfflineCompatibility(object):
                 runtime.avatar_module.TRIGGER_TYPE.AUTO_AIM_AT_VEHICLE,
                 vehicleId=vehicle_id)
             return None
+
+        def handle_target_lock_input(original, control, is_down, key, mods,
+                                     event):
+            if not compatibility._battle_active:
+                return original(control, is_down, key, mods, event)
+            command_mapping = runtime.control_modes.CommandMapping
+            is_lock_input = (
+                bool(is_down) and
+                command_mapping.g_instance.isFired(
+                    command_mapping.CMD_CM_LOCK_TARGET, key))
+            if (is_lock_input and
+                    compatibility._target_lock_input_pending):
+                raise RuntimeError('nested target-lock input is not allowed')
+            if is_lock_input:
+                compatibility._target_lock_input_pending = True
+                compatibility._target_lock_input_avatar = \
+                    runtime.bigworld.player()
+            try:
+                return original(control, is_down, key, mods, event)
+            finally:
+                if is_lock_input:
+                    compatibility._target_lock_input_pending = False
+                    compatibility._target_lock_input_avatar = None
+
+        def arcade_handle_key_event(control, is_down, key, mods, event):
+            return handle_target_lock_input(
+                compatibility._original_arcade_handle_key_event,
+                control, is_down, key, mods, event)
+
+        def sniper_handle_key_event(control, is_down, key, mods, event):
+            return handle_target_lock_input(
+                compatibility._original_sniper_handle_key_event,
+                control, is_down, key, mods, event)
 
         def vehicle_leave_world(vehicle):
             original = compatibility._original_vehicle_leave_world
@@ -1348,22 +1432,6 @@ class OfflineCompatibility(object):
                         pass
             return compatibility._original_server_time()
 
-        def target():
-            """Expose only the exact outlined visual to native input code.
-
-            #1513's arcade and sniper lock commands call
-            ``avatar.autoAim(BigWorld.target())`` while the explicit lock-off
-            command calls ``avatar.autoAim(None)``.  Preserve that distinction:
-            only replace an empty engine target lookup here, never reinterpret
-            a literal ``None`` inside ``Avatar.autoAim``.
-            """
-            current = compatibility._original_target()
-            candidate = compatibility._target_lock_candidate
-            if (current is None and compatibility._battle_active and
-                    candidate is not None):
-                return candidate.bw_entity
-            return current
-
         def debug_update(panel, ping, fps, isLaggingNow, fpsReplay=-1):
             """Render LAN transport health during a client-only battle.
 
@@ -1405,6 +1473,8 @@ class OfflineCompatibility(object):
         self._avatar_aux_physics_wrapper = avatar_aux_physics
         self._avatar_get_speeds_wrapper = avatar_get_speeds
         self._avatar_auto_aim_wrapper = avatar_auto_aim
+        self._arcade_handle_key_event_wrapper = arcade_handle_key_event
+        self._sniper_handle_key_event_wrapper = sniper_handle_key_event
         self._control_mode_changed_wrapper = control_mode_changed
         self._consistent_link_own_vehicle_wrapper = \
             consistent_link_own_vehicle
@@ -1421,7 +1491,6 @@ class OfflineCompatibility(object):
         self._connect_wrapper = connect
         self._disconnect_wrapper = disconnect
         self._server_time_wrapper = server_time
-        self._target_wrapper = target
         self._debug_update_wrapper = debug_update
         try:
             self._install_host()
@@ -1450,6 +1519,8 @@ class OfflineCompatibility(object):
             if self._original_avatar_get_speeds is not None:
                 avatar_type.getOwnVehicleSpeeds = avatar_get_speeds
             avatar_type.autoAim = avatar_auto_aim
+            arcade_control_type.handleKeyEvent = arcade_handle_key_event
+            sniper_control_type.handleKeyEvent = sniper_handle_key_event
             input_handler_type.onControlModeChanged = control_mode_changed
             consistent_matrices_type._ConsistentMatrices__linkOwnVehicle = \
                 consistent_link_own_vehicle
@@ -1476,7 +1547,6 @@ class OfflineCompatibility(object):
             runtime.bigworld.connect = connect
             runtime.bigworld.disconnect = disconnect
             runtime.bigworld.serverTime = server_time
-            runtime.bigworld.target = target
             if self._original_debug_update is not None:
                 debug_panel_type.updateDebugInfo = debug_update
             self._installed = True
@@ -1511,6 +1581,12 @@ class OfflineCompatibility(object):
         input_handler_type = getattr(
             getattr(runtime, 'avatar_input_handler', None),
             'AvatarInputHandler', None)
+        arcade_control_type = getattr(
+            getattr(runtime, 'control_modes', None),
+            'ArcadeControlMode', None)
+        sniper_control_type = getattr(
+            getattr(runtime, 'control_modes', None),
+            'SniperControlMode', None)
         consistent_matrices_type = getattr(
             getattr(runtime, 'avatar_position_control', None),
             'ConsistentMatrices', None)
@@ -1580,6 +1656,18 @@ class OfflineCompatibility(object):
                 avatar_type.__dict__.get('autoAim') is
                 self._avatar_auto_aim_wrapper):
             avatar_type.autoAim = self._original_avatar_auto_aim
+        if (arcade_control_type is not None and
+                self._original_arcade_handle_key_event is not None and
+                arcade_control_type.__dict__.get('handleKeyEvent') is
+                self._arcade_handle_key_event_wrapper):
+            arcade_control_type.handleKeyEvent = \
+                self._original_arcade_handle_key_event
+        if (sniper_control_type is not None and
+                self._original_sniper_handle_key_event is not None and
+                sniper_control_type.__dict__.get('handleKeyEvent') is
+                self._sniper_handle_key_event_wrapper):
+            sniper_control_type.handleKeyEvent = \
+                self._original_sniper_handle_key_event
         if (input_handler_type is not None and
                 self._original_control_mode_changed is not None and
                 input_handler_type.__dict__.get('onControlModeChanged') is
@@ -1652,8 +1740,6 @@ class OfflineCompatibility(object):
             runtime.bigworld.disconnect = self._original_disconnect
         if runtime.bigworld.serverTime is self._server_time_wrapper:
             runtime.bigworld.serverTime = self._original_server_time
-        if runtime.bigworld.target is self._target_wrapper:
-            runtime.bigworld.target = self._original_target
         if (debug_panel_type is not None and
                 self._original_debug_update is not None and
                 debug_panel_type.__dict__.get('updateDebugInfo') is
@@ -1684,6 +1770,8 @@ class OfflineCompatibility(object):
         self._vehicle_property_overlays = {}
         self._control_mode_listener = None
         self._target_lock_candidate = None
+        self._target_lock_input_pending = False
+        self._target_lock_input_avatar = None
         self._installed = False
 
     def connect(self, show_lobby=False, account_context=None):
@@ -2136,6 +2224,8 @@ class OfflineCompatibility(object):
             self._battle_player_team = 1
             self._battle_network_client = None
             self._target_lock_candidate = None
+            self._target_lock_input_pending = False
+            self._target_lock_input_avatar = None
             self._battle_server_time_origin = None
             self._battle_clock_origin = None
             self._vehicle_property_overlays = {}

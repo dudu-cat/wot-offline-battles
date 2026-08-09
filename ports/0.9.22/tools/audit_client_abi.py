@@ -298,6 +298,19 @@ EXPECTED_ABI = {
             'self', 'eMode', '**args'),
         'AvatarInputHandler.__onArenaStarted': (
             'self', 'period', '*args'),
+        '_Targeting.__init__': ('self',),
+        '_Targeting.getTargetEntity': ('self',),
+        '_Targeting.enable': ('self', 'flag'),
+        '_Targeting.onRecreateDevice': ('self',),
+    },
+    'scripts/client/AvatarInputHandler/control_modes.pyc': {
+        'ArcadeControlMode.handleKeyEvent': (
+            'self', 'isDown', 'key', 'mods', 'event'),
+        'SniperControlMode.handleKeyEvent': (
+            'self', 'isDown', 'key', 'mods', 'event'),
+    },
+    'scripts/client/CommandMapping.pyc': {
+        'CommandMapping.isFired': ('self', 'command', 'key'),
     },
     'scripts/client/Vehicle.pyc': {
         'Vehicle.__init__': ('self',),
@@ -651,7 +664,10 @@ EXPECTED_CODE_NAMES = {
             'compoundModel', 'node', 'gunRecoil', 'createGunAnimator'),
     },
     'scripts/client/Account.pyc': {
-        'PlayerAccount.onBecomePlayer': ('BigWorld', 'clearAllSpaces'),
+        'PlayerAccount.onBecomePlayer': (
+            'BigWorld', 'clearAllSpaces', 'MouseTargetingMatrix',
+            'target', 'source', 'maxDistance', 'skeletonCheckEnabled',
+            'caps', 'isEnabled'),
         'PlayerAccount.onBecomeNonPlayer': (
             'chatManager', 'switchPlayerProxy', 'events',
             'onAccountBecomeNonPlayer'),
@@ -660,8 +676,11 @@ EXPECTED_CODE_NAMES = {
         'PlayerAvatar.__init__': (
             'Account', 'g_accountRepository', 'intUserSettings',
             'prebattleInvitations'),
+        'PlayerAvatar.onBecomePlayer': (
+            'BigWorld', 'target', 'caps'),
         'PlayerAvatar.onBecomeNonPlayer': (
-            'chatManager', 'switchPlayerProxy', 'g_playerEvents',
+            'BigWorld', 'target', 'clear', 'chatManager',
+            'switchPlayerProxy', 'g_playerEvents',
             'onAvatarBecomeNonPlayer'),
         'PlayerAvatar.set_playerVehicleID': (
             'BigWorld', 'entity', 'inWorld'),
@@ -740,6 +759,24 @@ EXPECTED_CODE_NAMES = {
         'SniperControlMode.handleKeyEvent': (
             'CMD_CM_LOCK_TARGET', 'BigWorld', 'target', 'autoAim',
             'CMD_CM_LOCK_TARGET_OFF'),
+    },
+    'scripts/client/AvatarInputHandler/__init__.pyc': {
+        '_Targeting.__init__': (
+            'BigWorld', 'target', 'selectionFovDegrees',
+            'deselectionFovDegrees', 'maxDistance',
+            'skeletonCheckEnabled', 'isEnabled',
+            'MouseTargettingMatrix'),
+        '_Targeting.getTargetEntity': (
+            'BigWorld', 'target', 'entity'),
+        '_Targeting.enable': (
+            'BigWorld', 'target', 'isEnabled', 'source', 'clear'),
+        '_Targeting.onRecreateDevice': (
+            'BigWorld', 'target', 'isEnabled', 'clear'),
+    },
+    'scripts/client/CommandMapping.pyc': {
+        'CommandMapping.isFired': (
+            '_CommandMapping__mapping', 'get', 'BigWorld',
+            'isKeyDown'),
     },
     'scripts/client/Vehicle.pyc': {
         'Vehicle.__collideSegment': (
