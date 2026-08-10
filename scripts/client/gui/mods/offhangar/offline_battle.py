@@ -16,9 +16,6 @@ _OFFH_AI_ORDER_REFRESHES_PER_FRAME = 10
 _OFFH_AI_NAV_REFRESHES_PER_FRAME = 6
 _OFFH_AI_DRIVER_REFRESHES_PER_FRAME = 6
 _OFFH_AI_TREE_REFRESHES_PER_FRAME = 6
-_OFFH_AI_SIMULATION_UPDATES_PER_FRAME = 10
-_OFFH_AI_PREBATTLE_UPDATES_PER_FRAME = 5
-_OFFH_AI_MAX_SIMULATION_DT = 0.25
 _OFFH_AI_CONTACT_TARGETS_PER_FRAME = 2
 _OFFH_AI_COVER_CANDIDATES_PER_FRAME = 1
 _OFFH_AI_ARTILLERY_CHORDS_PER_FRAME = 4
@@ -72,41 +69,15 @@ def _offh_ai_budget_ids(entity_ids, frame_index, quota, salt=0):
 	return _offh_ai_budget_from_ordered(ordered, frame_index, quota, salt)
 
 
-def _offh_ai_simulation_quota(entity_count, frame_dt, battle_active=True):
-	"""Target a stable simulation cadence while hard-capping one callback."""
-	entity_count = max(0, int(entity_count or 0))
-	if not entity_count:
-		return 0
-	frame_dt = max(1.0 / 120.0, min(0.25, float(frame_dt or 0.0)))
-	target_hz = 15.0 if battle_active else 8.0
-	desired = int(entity_count * target_hz * frame_dt + 0.999999)
-	maximum = (_OFFH_AI_SIMULATION_UPDATES_PER_FRAME if battle_active else
-	           _OFFH_AI_PREBATTLE_UPDATES_PER_FRAME)
-	minimum = 3 if battle_active else 2
-	return min(entity_count, maximum, max(minimum, desired))
-
-
-def _offh_ai_simulation_step(previous_elapsed, frame_dt, selected):
-	"""Accumulate skipped render time and consume it on the next selected slice."""
-	elapsed = min(
-		_OFFH_AI_MAX_SIMULATION_DT,
-		max(0.0, float(previous_elapsed or 0.0)) +
-		max(0.0, float(frame_dt or 0.0)))
-	if not selected:
-		return elapsed, 0.0
-	return 0.0, max(1.0 / 120.0, elapsed)
-
-
-def _offh_ai_frame_budget_plan(entity_ids, frame_dt=(1.0 / 30.0),
-		battle_active=True):
+def _offh_ai_frame_budget_plan(entity_ids, frame_dt=(1.0 / 30.0)):
 	"""Bound expensive decisions per rendered frame, independent of wall time.
 
 	Wall-clock-only TTLs collapse when FPS drops: every cache expires before the
 	next frame and all 29 bots refresh together.  This plan preserves the desired
 	per-bot cadence at healthy FPS while guaranteeing a finite recovery workload
-	on a slow frame. Native terrain/collision physics uses the same fair scheduler;
-	each selected bot consumes its accumulated elapsed time, so reducing callback
-	work does not permanently reduce tank speed.
+	on a slow frame. Physics and canonical pose commits are deliberately not
+	budgeted here: every live local bot must move continuously on every render
+	callback.
 	"""
 	generation = int(globals().get('g_offh_battle_gen', 0) or 0)
 	state = globals().get('g_offh_ai_frame_budget')
@@ -120,8 +91,6 @@ def _offh_ai_frame_budget_plan(entity_ids, frame_dt=(1.0 / 30.0),
 	ordered = sorted(set(int(value) for value in (entity_ids or ())))
 	count = len(ordered)
 	frame_dt = max(1.0 / 120.0, min(0.25, float(frame_dt or 0.0)))
-	simulation_quota = _offh_ai_simulation_quota(
-		count, frame_dt, battle_active)
 	def _horizon(quota):
 		quota = max(1, int(quota))
 		frames = max(1, (count + quota - 1) // quota)
@@ -135,12 +104,9 @@ def _offh_ai_frame_budget_plan(entity_ids, frame_dt=(1.0 / 30.0),
 			ordered, frame_index, _OFFH_AI_DRIVER_REFRESHES_PER_FRAME, 23),
 		'tree': _offh_ai_budget_from_ordered(
 			ordered, frame_index, _OFFH_AI_TREE_REFRESHES_PER_FRAME, 7),
-		'simulation': _offh_ai_budget_from_ordered(
-			ordered, frame_index, simulation_quota, 19),
 		'order_horizon': _horizon(_OFFH_AI_ORDER_REFRESHES_PER_FRAME),
 		'nav_horizon': _horizon(_OFFH_AI_NAV_REFRESHES_PER_FRAME),
 		'driver_horizon': _horizon(_OFFH_AI_DRIVER_REFRESHES_PER_FRAME),
-		'simulation_horizon': _horizon(max(1, simulation_quota)),
 	}
 
 
@@ -255,7 +221,7 @@ def _offh_perf_frame_end(started, frame_dt, player):
 	           'artillery_arc', 'artillery_rays',
 	           'nav_tick', 'ai_order', 'order_refresh',
 		           'order_deferred', 'nav_server', 'nav_target', 'nav_refresh', 'nav_deferred',
-	           'bot_loop', 'simulation_updates', 'simulation_deferred',
+	           'bot_loop',
 	           'driver', 'driver_refresh', 'driver_deferred',
 	           'direction', 'direction_baked', 'direction_exact', 'physics',
 	           'physics_state', 'physics_motion', 'physics_ground',
@@ -930,7 +896,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.21-test (2026-08-10) sliced-physics-ctf-visibility'
+_OFFH_BUILD = '1.8.22-test (2026-08-10) continuous-motion-ctf-visibility'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -9258,6 +9224,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_perf_frame_started = _offh_perf_frame_begin(len(mock_vehicles or {}))
 				_perf_player_loop = _offh_perf_start()
 				_tank_pair_seen.clear()
+				_tank_pair_pending.clear()
 
 				# --- One-time spawn correction once the terrain has streamed in ---
 				# The initial spawn runs before the space is loaded (all ground rays
@@ -12174,22 +12141,18 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_collision_spatial[0] = _VC.build_spatial_index(
 					_collision_bodies, _collision_cell_size)
 				_offh_perf_stop('traffic_snapshot', _perf_traffic)
-				_frame_battle_active = (getattr(
-					getattr(player, 'arena', None), 'period', 3) == 3)
-				_ai_frame_budget = _offh_ai_frame_budget_plan(
-					_local_ai_ids, dt, _frame_battle_active)
+				_ai_frame_budget = _offh_ai_frame_budget_plan(_local_ai_ids, dt)
 				_order_refresh_ids = _ai_frame_budget['order']
 				_nav_refresh_ids = _ai_frame_budget['nav']
 				_driver_refresh_ids = _ai_frame_budget['driver']
 				_tree_refresh_ids = _ai_frame_budget['tree']
-				_simulation_ids = _ai_frame_budget['simulation']
 				_order_refresh_horizon = _ai_frame_budget['order_horizon']
 				_nav_refresh_horizon = _ai_frame_budget['nav_horizon']
 				_driver_refresh_horizon = _ai_frame_budget['driver_horizon']
 				_perf_bot_loop = _offh_perf_start()
-				# Stable entity order keeps the round-robin and collision responses
-				# deterministic. Reciprocal tank corrections survive until that bot's
-				# next simulation slice instead of being discarded at the frame boundary.
+				# Stable entity order also makes every bot-bot collision pair flow from
+				# the lower id to the higher id, whose queued reciprocal correction is
+				# therefore consumed later in this same frame.
 				for eid in sorted(mock_vehicles):
 					m_veh = mock_vehicles[eid]
 					if eid != getattr(player, 'playerVehicleID', -1) and getattr(m_veh, 'isAlive', False):
@@ -12216,21 +12179,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										continue
 								except Exception:
 									continue
-							# Native terrain, world collision and canonical pose commits all run on
-							# BigWorld's main thread. Spread them across callbacks instead of making
-							# every render frame pay for all 29 bots. The selected bot advances by
-							# its accumulated wall time, and the wall query sweeps that full travel
-							# distance, preserving speed and preventing tunnelling through geometry.
-							_simulation_pending, _simulation_dt = (
-								_offh_ai_simulation_step(
-									getattr(m_veh, '_offh_ai_simulation_elapsed', 0.0),
-									_frame_dt, eid in _simulation_ids))
-							m_veh._offh_ai_simulation_elapsed = _simulation_pending
-							if _simulation_dt <= 0.0:
-								_offh_perf_count('simulation_deferred')
-								continue
-							dt = _simulation_dt
-							_offh_perf_count('simulation_updates')
 							my_team = getattr(m_veh, '_bot_team', m_veh.publicInfo.get('team', 2) if getattr(m_veh, 'publicInfo', None) is not None else 2)
 							_td = getattr(m_veh, 'typeDescriptor', None) or loaded_models.get('td')
 							target_pos = None

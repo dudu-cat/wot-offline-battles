@@ -92,11 +92,9 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         self.assertTrue(all(len(plan["nav"]) <= 6 for plan in plans))
         self.assertTrue(all(len(plan["driver"]) <= 6 for plan in plans))
         self.assertTrue(all(len(plan["tree"]) <= 6 for plan in plans))
-        self.assertTrue(all(len(plan["simulation"]) <= 10 for plan in plans))
         self.assertTrue(all(plan["order_horizon"] > 0.0 for plan in plans))
         self.assertTrue(all(plan["nav_horizon"] > 0.0 for plan in plans))
         self.assertTrue(all(plan["driver_horizon"] > 0.0 for plan in plans))
-        self.assertTrue(all(plan["simulation_horizon"] > 0.0 for plan in plans))
         self.assertEqual(set(bot_ids), set().union(*(
             plan["order"] for plan in plans)))
         self.assertEqual(set(bot_ids), set().union(*(
@@ -105,40 +103,6 @@ class OfflineBattleProfilerTests(unittest.TestCase):
             plan["driver"] for plan in plans)))
         self.assertEqual(set(bot_ids), set().union(*(
             plan["tree"] for plan in plans)))
-        self.assertEqual(set(bot_ids), set().union(*(
-            plan["simulation"] for plan in plans)))
-
-    def test_simulation_quota_targets_cadence_and_caps_slow_frames(self):
-        profiler = load_profiler(FakeTime())
-        quota = profiler["_offh_ai_simulation_quota"]
-
-        self.assertEqual(8, quota(29, 1.0 / 60.0, True))
-        self.assertEqual(10, quota(29, 1.0 / 30.0, True))
-        self.assertEqual(10, quota(29, 0.20, True))
-        self.assertEqual(4, quota(29, 1.0 / 60.0, False))
-        self.assertEqual(5, quota(29, 0.20, False))
-
-    def test_simulation_slices_preserve_elapsed_time_at_healthy_fps(self):
-        profiler = load_profiler(FakeTime())
-        profiler["g_offh_battle_gen"] = 27
-        bot_ids = list(range(1, 30))
-        pending = {bot_id: 0.0 for bot_id in bot_ids}
-        advanced = {bot_id: 0.0 for bot_id in bot_ids}
-        frame_dt = 1.0 / 60.0
-
-        for unused_frame in range(180):
-            selected = profiler["_offh_ai_frame_budget_plan"](
-                bot_ids, frame_dt, True)["simulation"]
-            for bot_id in bot_ids:
-                pending[bot_id], step = profiler["_offh_ai_simulation_step"](
-                    pending[bot_id], frame_dt, bot_id in selected
-                )
-                advanced[bot_id] += step
-
-        for bot_id in bot_ids:
-            self.assertAlmostEqual(
-                3.0, advanced[bot_id] + pending[bot_id], places=6
-            )
 
     def test_frame_budget_resets_with_battle_generation(self):
         profiler = load_profiler(FakeTime())
@@ -205,8 +169,6 @@ class OfflineBattleProfilerTests(unittest.TestCase):
             "nav_refresh",
             "nav_deferred",
             "bot_loop",
-            "simulation_updates",
-            "simulation_deferred",
             "traffic_snapshot",
             "driver",
             "driver_refresh",
@@ -286,7 +248,7 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         self.assertIn("_offh_perf_count('collision_candidates', len(_candidate_ids))", source)
         self.assertIn("_candidate_ids = _VC.nearby_ids", source)
 
-    def test_ai_planning_and_native_physics_are_fairly_rate_limited(self):
+    def test_ai_planning_is_rate_limited_but_motion_stays_per_frame(self):
         source = SOURCE.read_text()
 
         self.assertIn("_offh_ai_order_cache", source)
@@ -301,11 +263,10 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         self.assertIn("_order_refresh_horizon", source)
         self.assertIn("_nav_refresh_horizon", source)
         self.assertIn("_driver_refresh_horizon", source)
-        self.assertIn("_simulation_ids = _ai_frame_budget['simulation']", source)
-        self.assertIn("_offh_ai_simulation_elapsed", source)
-        self.assertIn("_offh_ai_simulation_step(", source)
-        self.assertIn("if _simulation_dt <= 0.0:", source)
-        self.assertNotIn("_tank_pair_pending.clear()", source)
+        self.assertNotIn("_offh_ai_simulation_elapsed", source)
+        self.assertNotIn("if _simulation_dt <= 0.0:", source)
+        self.assertIn("_tank_pair_pending.clear()", source)
+        self.assertIn("every live local bot must move continuously", source)
         self.assertIn("_perf_physics = _offh_perf_start()", source)
         self.assertIn("_PHY.longitudinal_step", source)
 
