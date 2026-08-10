@@ -78,6 +78,68 @@ def nearby_ids(index, x, z):
 	return tuple(result)
 
 
+def unique_candidate_map(index, bodies, solver_ids):
+	"""Assign each nearby unordered body pair to one local solver.
+
+	The collision resolver still performs the exact vertical, radius and OBB
+	tests against live poses.  This helper only removes the duplicate broad-phase
+	enumeration that otherwise happens when both vehicles visit the same pair in
+	their per-frame loops.  A pair with one non-local body is assigned to its local
+	solver; local/local pairs are assigned to the lower stable entity id.
+	"""
+	if not index or not bodies:
+		return {}
+	local = set(solver_ids or ())
+	if not local:
+		return {}
+	result = dict((body_id, []) for body_id in local if body_id in bodies)
+	try:
+		unused_size, buckets = index
+		bucket_keys = sorted(buckets.keys())
+	except Exception:
+		return {}
+
+	def _assign(first_id, second_id):
+		if (first_id == second_id or first_id not in bodies or
+				second_id not in bodies):
+			return
+		first_local = first_id in local
+		second_local = second_id in local
+		if first_local and second_local:
+			try:
+				solver_id = min(first_id, second_id)
+			except Exception:
+				solver_id = first_id if repr(first_id) < repr(second_id) else second_id
+			candidate_id = second_id if solver_id == first_id else first_id
+		elif first_local:
+			solver_id = first_id
+			candidate_id = second_id
+		elif second_local:
+			solver_id = second_id
+			candidate_id = first_id
+		else:
+			return
+		result.setdefault(solver_id, []).append(candidate_id)
+
+	# Same-cell combinations plus four forward neighbouring cells cover the
+	# complete 3x3 query square exactly once, without one nearby_ids allocation
+	# per vehicle and without a per-frame seen-pair set.
+	forward_neighbours = ((0, 1), (1, -1), (1, 0), (1, 1))
+	for cell_x, cell_z in bucket_keys:
+		current = sorted(buckets.get((cell_x, cell_z), ()))
+		for first_index in range(len(current)):
+			for second_index in range(first_index + 1, len(current)):
+				_assign(current[first_index], current[second_index])
+		for offset_x, offset_z in forward_neighbours:
+			other = sorted(buckets.get(
+				(cell_x + offset_x, cell_z + offset_z), ()))
+			for first_id in current:
+				for second_id in other:
+					_assign(first_id, second_id)
+	return dict((body_id, tuple(candidate_ids))
+	            for body_id, candidate_ids in result.items())
+
+
 def _coord(value, index, default=0.0):
 	try:
 		return float(value[index])

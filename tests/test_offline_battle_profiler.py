@@ -246,7 +246,8 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         self.assertIn("_collision_cell_size = _collision_max_radius * 2.0 + 4.0", source)
         self.assertIn("_collision_bodies.get(oid)", source)
         self.assertIn("_offh_perf_count('collision_candidates', len(_candidate_ids))", source)
-        self.assertIn("_candidate_ids = _VC.nearby_ids", source)
+        self.assertIn("_candidate_ids = (_VC.nearby_ids", source)
+        self.assertIn("_VC.unique_candidate_map(", source)
 
     def test_ai_planning_is_rate_limited_but_motion_stays_per_frame(self):
         source = SOURCE.read_text()
@@ -406,6 +407,7 @@ class OfflineBattleProfilerTests(unittest.TestCase):
     def test_bot_collision_checks_each_unordered_pair_once_in_stable_order(self):
         source = SOURCE.read_text()
         self.assertIn("for eid in sorted(mock_vehicles):", source)
+        self.assertIn("_VC.unique_candidate_map(", source)
         start = source.index("def _tank_resolve")
         pair = source[start:source.index("def _drive_pitch", start)]
         self.assertEqual(1, pair.count("_tank_pair_seen[_pair] = True"))
@@ -413,6 +415,19 @@ class OfflineBattleProfilerTests(unittest.TestCase):
             pair.index("_tank_pair_seen[_pair] = True"),
             pair.index("_VC.vertical_overlap"),
         )
+
+    def test_player_loop_reports_non_overlapping_major_stages(self):
+        source = SOURCE.read_text()
+
+        for stage in (
+            "player_setup",
+            "player_physics",
+            "player_aim",
+            "player_pose",
+            "player_gun",
+            "player_effects",
+        ):
+            self.assertIn("_offh_perf_stop('%s'" % stage, source)
 
     def test_native_bot_audio_and_exhaust_updates_are_rate_limited(self):
         source = SOURCE.read_text()

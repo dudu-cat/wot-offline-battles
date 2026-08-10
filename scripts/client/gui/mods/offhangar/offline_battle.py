@@ -216,7 +216,9 @@ def _offh_perf_frame_end(started, frame_dt, player):
 	calls = state.get('calls', {}) or {}
 	callback_ms = 1000.0 * float(times.get('callback', 0.0) or 0.0) / samples
 	callback_share = 100.0 * callback_ms / max(0.1, frame_ms)
-	ordered = ('player_loop', 'network_smoothing', 'ai_setup', 'contacts',
+	ordered = ('player_loop', 'player_setup', 'player_physics', 'player_aim',
+	           'player_pose', 'player_gun', 'player_effects',
+	           'network_smoothing', 'ai_setup', 'contacts',
 	           'contact_build', 'contact_targets', 'contact_foliage', 'contact_cover',
 	           'artillery_arc', 'artillery_rays',
 	           'nav_tick', 'ai_order', 'order_refresh',
@@ -896,7 +898,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.22-test (2026-08-10) continuous-motion-ctf-visibility'
+_OFFH_BUILD = '1.8.23-test (2026-08-10) frame-cache-unique-collision'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -8614,6 +8616,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		# in the line-up below, so the surrounding nine cells cannot miss a pair.
 		_collision_spatial = [None]
 		_collision_frame = [None]
+		_collision_candidates = [None]
 		LOG_DEBUG('OfflineBattle.PHYSICS: mass=%.0f, power=%.0fW, fwd=%.1f m/s, bwd=%.1f m/s, rot=%.1f deg/s, terrain=(%.2f,%.2f,%.2f), friction=%.4f, brake=%.2f m/s2, halfGauge=%.2f' % (
 			_phys_mass, _phys_enginePowerW, _phys_speedFwd, _phys_speedBwd,
 			math.degrees(_phys_chassisRotSpd), _phys_terrainResist[0], _phys_terrainResist[1], _phys_terrainResist[2],
@@ -9223,6 +9226,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_frame_dt = dt # real per-frame delta (dt is reused by the bot section below)
 				_perf_frame_started = _offh_perf_frame_begin(len(mock_vehicles or {}))
 				_perf_player_loop = _offh_perf_start()
+				_perf_player_setup = _offh_perf_start()
 				_tank_pair_seen.clear()
 				_tank_pair_pending.clear()
 
@@ -9690,8 +9694,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						my_shape = _VC.chassis_shape(td)
 						my_radius = math.sqrt(
 							my_shape[0] * my_shape[0] + my_shape[1] * my_shape[1])
-					_candidate_ids = _VC.nearby_ids(
-						_collision_spatial[0], x, z) if _collision_spatial[0] else _mv.keys()
+					_candidate_ids = None
+					_candidate_map = _collision_candidates[0]
+					if _candidate_map is not None:
+						_candidate_ids = _candidate_map.get(self_id)
+					if _candidate_ids is None:
+						_candidate_ids = (_VC.nearby_ids(
+							_collision_spatial[0], x, z)
+							if _collision_spatial[0] else _mv.keys())
 					_offh_perf_count('collision_candidates', len(_candidate_ids))
 					for oid in _candidate_ids:
 						ov = _mv.get(oid)
@@ -10129,6 +10139,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						loaded_models['_fashion_done'] = True
 						LOG_DEBUG('Track fashion failed:', str(_fe))
 
+				_offh_perf_stop('player_setup', _perf_player_setup)
+				_perf_player_physics = _offh_perf_start()
 				# --- WoT-style Hull Physics ---
 				# Determine input direction
 				throttle = 0
@@ -10679,6 +10691,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						except Exception: pass
 				except Exception: pass
 
+				_offh_perf_stop('player_physics', _perf_player_physics)
+				_perf_player_aim = _offh_perf_start()
 				# --- Turret & Gun Mouse Aiming ---
 				# Safe default: the aiming code below only assigns 'mat' on its happy
 				# path; without this the gun-marker block crashes every frame.
@@ -11058,6 +11072,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					LOG_DEBUG('OfflineBattle.aim error:', str(e))
 
 
+				_offh_perf_stop('player_aim', _perf_player_aim)
+				_perf_player_pose = _offh_perf_start()
 				# --- Update mock vehicle and camera matrix ---
 				mock_veh.position = Math.Vector3(veh_pos[0], veh_pos[1], veh_pos[2])
 				mock_veh.yaw   = veh_yaw[0]
@@ -11267,6 +11283,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										
 						
 
+				_offh_perf_stop('player_pose', _perf_player_pose)
+				_perf_player_gun = _offh_perf_start()
 				# --- Update Gun Mechanics (Dispersion & Reload) ---
 				if not _gun_state['initialized']:
 					td = loaded_models.get('td')
@@ -11909,6 +11927,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				tm_local.setRotateYPR((turret_yaw[0], gun_pitch[0], 0))
 				turret_matrix_local.set(tm_local)
 
+				_offh_perf_stop('player_gun', _perf_player_gun)
+				_perf_player_effects = _offh_perf_start()
 				# --- PLAYER FIRE LOGIC ---
 				try:
 					_player_mock = mock_vehicles.get(getattr(player, 'playerVehicleID', -1))
@@ -11972,6 +11992,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								except: pass
 				except: pass
 
+				_offh_perf_stop('player_effects', _perf_player_effects)
 				_offh_perf_stop('player_loop', _perf_player_loop)
 				# --- BOT AI (Advanced Physics) ---
 				import math, random
@@ -12111,22 +12132,38 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_frame_velocity = (
 								math.sin(_frame_yaw) * _frame_speed, 0.0,
 								math.cos(_frame_yaw) * _frame_speed)
-							_driver_frame[_frame_eid] = {
-								'position': _frame_position,
-								'yaw': _frame_yaw,
-								'velocity': _frame_velocity,
-								'half_length': _frame_half_length,
-								'half_width': _frame_half_width,
-							}
+							_driver_body = getattr(
+								_frame_vehicle, '_offh_driver_frame_body', None)
+							if _driver_body is None:
+								_driver_body = {
+									'position': _frame_position,
+									'yaw': _frame_yaw,
+									'velocity': _frame_velocity,
+									'half_length': _frame_half_length,
+									'half_width': _frame_half_width,
+								}
+								_frame_vehicle._offh_driver_frame_body = _driver_body
+							else:
+								_driver_body['position'] = _frame_position
+								_driver_body['yaw'] = _frame_yaw
+								_driver_body['velocity'] = _frame_velocity
+							_driver_frame[_frame_eid] = _driver_body
 							if (_frame_eid != getattr(player, 'playerVehicleID', -1) and
 									not getattr(_frame_vehicle, '_network_remote', False)):
 								_local_ai_ids.append(int(_frame_eid))
-						_collision_bodies[_frame_eid] = {
-							'position': _frame_position,
-							'shape': _frame_shape,
-							'radius': _frame_radius,
-							'inv_mass': _frame_inv_mass,
-						}
+						_collision_body = getattr(
+							_frame_vehicle, '_offh_collision_frame_body', None)
+						if _collision_body is None:
+							_collision_body = {
+								'position': _frame_position,
+								'shape': _frame_shape,
+								'radius': _frame_radius,
+								'inv_mass': _frame_inv_mass,
+							}
+							_frame_vehicle._offh_collision_frame_body = _collision_body
+						else:
+							_collision_body['position'] = _frame_position
+						_collision_bodies[_frame_eid] = _collision_body
 						_collision_max_radius = max(
 							_collision_max_radius, _frame_radius)
 						if not _is_network_replica:
@@ -12140,6 +12177,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_collision_frame[0] = _collision_bodies
 				_collision_spatial[0] = _VC.build_spatial_index(
 					_collision_bodies, _collision_cell_size)
+				_collision_candidates[0] = _VC.unique_candidate_map(
+					_collision_spatial[0], _collision_bodies, _local_ai_ids)
 				_offh_perf_stop('traffic_snapshot', _perf_traffic)
 				_ai_frame_budget = _offh_ai_frame_budget_plan(_local_ai_ids, dt)
 				_order_refresh_ids = _ai_frame_budget['order']

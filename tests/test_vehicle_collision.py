@@ -171,6 +171,57 @@ class VehicleCollisionTests(unittest.TestCase):
 
         self.assertEqual({10, 11}, set(self.collision.nearby_ids(index, -0.1, -0.1)))
 
+    def test_unique_candidate_map_assigns_each_pair_once_to_a_local_solver(self):
+        bodies = {
+            1: {"position": (0.0, 0.0, 0.0)},
+            2: {"position": (2.0, 0.0, 0.0)},
+            3: {"position": (4.0, 0.0, 0.0)},
+            9: {"position": (80.0, 0.0, 80.0)},
+        }
+        index = self.collision.build_spatial_index(bodies, 24.0)
+
+        candidates = self.collision.unique_candidate_map(index, bodies, (2, 3))
+
+        self.assertEqual((1, 3), candidates[2])
+        self.assertEqual((1,), candidates[3])
+        pairs = set()
+        for solver_id, candidate_ids in candidates.items():
+            for candidate_id in candidate_ids:
+                pair = tuple(sorted((solver_id, candidate_id)))
+                self.assertNotIn(pair, pairs)
+                pairs.add(pair)
+        self.assertEqual({(1, 2), (1, 3), (2, 3)}, pairs)
+
+    def test_unique_candidate_map_keeps_local_remote_pair_on_local_solver(self):
+        bodies = {
+            10: {"position": (0.0, 0.0, 0.0)},
+            11: {"position": (1.0, 0.0, 0.0)},
+        }
+        index = self.collision.build_spatial_index(bodies, 24.0)
+
+        candidates = self.collision.unique_candidate_map(index, bodies, (11,))
+
+        self.assertEqual({11: (10,)}, candidates)
+
+    def test_unique_candidate_map_covers_all_eight_neighbouring_cells(self):
+        bodies = {1: {"position": (1.0, 0.0, 1.0)}}
+        body_id = 2
+        for cell_z in (-1, 0, 1):
+            for cell_x in (-1, 0, 1):
+                if cell_x == 0 and cell_z == 0:
+                    continue
+                bodies[body_id] = {
+                    "position": (cell_x * 24.0 + 1.0, 0.0, cell_z * 24.0 + 1.0)
+                }
+                body_id += 1
+        bodies[99] = {"position": (49.0, 0.0, 49.0)}
+        index = self.collision.build_spatial_index(bodies, 24.0)
+
+        candidates = self.collision.unique_candidate_map(index, bodies, (1,))
+
+        self.assertEqual(set(range(2, 10)), set(candidates[1]))
+        self.assertNotIn(99, candidates[1])
+
 
 if __name__ == "__main__":
     unittest.main()
