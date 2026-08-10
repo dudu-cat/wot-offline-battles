@@ -41,7 +41,7 @@ LAN SERVER (only one machine needs this)
 
 The expected startup line is similar to:
 
-   LAN battle server listening on 0.0.0.0:28782 (... protocol=8, build=1.8.23-test-20260810)
+   LAN battle server listening on 0.0.0.0:28782 (... protocol=8, build=1.8.24-test-20260810)
 
 
 JOIN THE SAME LAN BATTLE
@@ -54,7 +54,7 @@ JOIN THE SAME LAN BATTLE
 5. Confirm one JOIN line per client in the server window.
 6. In the waiting room, choose a map and click START BATTLE.
 
-Every client and the server must come from this same protocol-8/build-1.8.23 package.
+Every client and the server must come from this same protocol-8/build-1.8.24 package.
 
 
 IF SOMETHING DOES NOT LOAD

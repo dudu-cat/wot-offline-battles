@@ -212,7 +212,11 @@ class WaitingRoomTest(unittest.TestCase):
         })
         first.send({
             "type": "rules_state",
-            "rules": {"bases": {"1": {"points": 42}, "2": {"points": 0}}},
+            "rules": {"bases": {
+                "1": {"points": 42, "contributors": {"human:1": 42},
+                      "cursor": 3},
+                "2": {"points": 0},
+            }},
         })
         second.send({"type": "battle_result", "winner": 1, "reason": "invalid"})
         first.send({
@@ -235,6 +239,11 @@ class WaitingRoomTest(unittest.TestCase):
         )
         self.assertEqual(830, authority_player["health"])
         self.assertEqual(42, snapshot["rules"]["bases"]["1"]["points"])
+        self.assertEqual(
+            {"human:1": 42},
+            snapshot["rules"]["bases"]["1"]["contributors"],
+        )
+        self.assertEqual(3, snapshot["rules"]["bases"]["1"]["cursor"])
         self.assertEqual(2, snapshot["battle_result"]["winner"])
         self.assertEqual(1, snapshot["battle_result"]["base_team"])
 
@@ -375,6 +384,7 @@ class WaitingRoomTest(unittest.TestCase):
             "shot_seq": 1,
             "damage": 125,
             "shot_result": 2,
+            "critical": True,
             "x": 0.0,
             "y": 1.0,
             "z": 70.0,
@@ -394,6 +404,8 @@ class WaitingRoomTest(unittest.TestCase):
         self.assertEqual(1, shot["shell_index"])
         self.assertEqual(2, hit["shot_result"])
         self.assertEqual(125, hit["damage"])
+        self.assertTrue(hit["critical"])
+        self.assertTrue(hit["capture_reset"])
         self.assertEqual(755, target["health"])
         self.assertEqual(1, len([
             event for event in event_message["events"] if event["kind"] == "hit"
@@ -412,6 +424,7 @@ class WaitingRoomTest(unittest.TestCase):
         health = [event for event in event_message["events"] if event["kind"] == "health"][0]
         self.assertEqual(180, health["damage"])
         self.assertEqual(700, health["health"])
+        self.assertTrue(health["capture_reset"])
 
     def test_dead_player_pose_is_frozen_at_the_wreck_position(self):
         client = self.connect("Alpha")

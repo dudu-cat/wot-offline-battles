@@ -21,7 +21,7 @@ from gui.mods.offhangar import vehicle_pose
 
 
 PROTOCOL_VERSION = 8
-CLIENT_BUILD = '1.8.23-test-20260810'
+CLIENT_BUILD = '1.8.24-test-20260810'
 POLL_INTERVAL = 1.0 / 60.0
 INPUT_INTERVAL = 1.0 / 30.0
 BOT_STATE_INTERVAL = 1.0 / 30.0
@@ -479,7 +479,7 @@ class LANClient(object):
 		return self._fire_seq
 
 	def send_hit(self, target_id, shot_seq, damage, shot_result, shell_index,
-			impact_position=None):
+			impact_position=None, critical=False):
 		message = {
 			'type': 'hit_report',
 			'target': int(target_id),
@@ -487,6 +487,7 @@ class LANClient(object):
 			'damage': max(0, int(damage or 0)),
 			'shot_result': max(0, min(int(shot_result or 0), 2)),
 			'shell_index': max(0, min(int(shell_index or 0), 9)),
+			'critical': bool(critical),
 		}
 		if impact_position is not None:
 			message['x'] = _finite_float(impact_position[0])
@@ -544,13 +545,14 @@ class LANClient(object):
 		})
 
 	def send_bot_hit(self, target_id, shot_seq, damage, shot_result,
-			impact_position=None):
+			impact_position=None, critical=False):
 		message = {
 			'type': 'bot_hit_report',
 			'target': int(target_id),
 			'shot_seq': int(shot_seq),
 			'damage': max(0, int(damage or 0)),
 			'shot_result': max(0, min(int(shot_result or 0), 2)),
+			'critical': bool(critical),
 		}
 		if impact_position is not None:
 			message['x'] = _finite_float(impact_position[0])
@@ -559,7 +561,7 @@ class LANClient(object):
 		return self._send(message)
 
 	def send_bot_human_hit(self, bot_id, target_id, shot_seq, damage,
-			shot_result, impact_position=None):
+			shot_result, impact_position=None, critical=False):
 		message = {
 			'type': 'bot_human_hit',
 			'attacker_bot': int(bot_id),
@@ -567,6 +569,7 @@ class LANClient(object):
 			'shot_seq': int(shot_seq or 0),
 			'damage': max(0, int(damage or 0)),
 			'shot_result': max(0, min(int(shot_result or 0), 2)),
+			'critical': bool(critical),
 		}
 		if impact_position is not None:
 			message['x'] = _finite_float(impact_position[0])
@@ -1347,7 +1350,7 @@ def send_local_fire(player, shell_index=0, aim_yaw=None, gun_pitch=None,
 
 
 def send_local_hit(player, target_id, shot_seq, damage, shot_result,
-		shell_index=0, impact_position=None):
+		shell_index=0, impact_position=None, critical=False):
 	client = getattr(player, '_offhangar_network_client', None) if player is not None else None
 	if client is None or not client.ready or shot_seq is None or target_id is None:
 		return False
@@ -1359,7 +1362,7 @@ def send_local_hit(player, target_id, shot_seq, damage, shot_result,
 		except Exception:
 			server_impact = None
 	return client.send_hit(target_id, shot_seq, damage, shot_result,
-		shell_index, server_impact)
+		shell_index, server_impact, critical)
 
 
 def network_is_authority(player):
@@ -1820,7 +1823,7 @@ def publish_authoritative_bots(player, mocks):
 
 
 def send_local_bot_hit(player, bot_id, shot_seq, damage, shot_result,
-		impact_position=None):
+		impact_position=None, critical=False):
 	client = getattr(player, '_offhangar_network_client', None) if player is not None else None
 	if client is None or not client.ready or bot_id is None or shot_seq is None:
 		return False
@@ -1831,11 +1834,12 @@ def send_local_bot_hit(player, bot_id, shot_seq, damage, shot_result,
 				impact_position.x, impact_position.y, impact_position.z, 0.0)
 		except Exception:
 			pass
-	return client.send_bot_hit(bot_id, shot_seq, damage, shot_result, server_impact)
+	return client.send_bot_hit(
+		bot_id, shot_seq, damage, shot_result, server_impact, critical)
 
 
 def send_authoritative_bot_human_hit(player, bot_id, target_id, shot_seq,
-		damage, shot_result, impact_position=None):
+		damage, shot_result, impact_position=None, critical=False):
 	if not network_is_authority(player) or target_id is None:
 		return False
 	server_impact = None
@@ -1846,7 +1850,7 @@ def send_authoritative_bot_human_hit(player, bot_id, target_id, shot_seq,
 		except Exception:
 			pass
 	return player._offhangar_network_client.send_bot_human_hit(
-		bot_id, target_id, shot_seq, damage, shot_result, server_impact)
+		bot_id, target_id, shot_seq, damage, shot_result, server_impact, critical)
 
 
 def send_authoritative_rules(player, bases):
@@ -1855,9 +1859,19 @@ def send_authoritative_rules(player, bases):
 	rules = {'bases': {}}
 	for team in (1, 2):
 		state = bases.get(team, {}) if bases is not None else {}
+		contributors = {}
+		for vehicle_id, points in (state.get('contributors') or {}).items():
+			try:
+				points = max(0, min(int(points or 0), 100))
+			except Exception:
+				continue
+			if points:
+				contributors[str(vehicle_id)[:64]] = points
 		rules['bases'][str(team)] = {
 			'points': max(0, min(int(state.get('points', 0) or 0), 100)),
 			'stopped': bool(state.get('stopped', False)),
+			'contributors': contributors,
+			'cursor': max(0, int(state.get('cursor', 0) or 0)),
 		}
 	return player._offhangar_network_client.send_rules(rules)
 
@@ -2741,6 +2755,24 @@ def _apply_snapshot(player, message):
 			callback(result)
 
 
+def _apply_capture_reset_event(player, target_mock, event, attacker=None):
+	if target_mock is None:
+		return
+	damage = max(0, int(event.get('damage', 0) or 0))
+	critical = bool(event.get('critical', False))
+	if not bool(event.get('capture_reset', damage > 0 or critical)):
+		return
+	try:
+		import sys
+		offline = sys.modules.get('gui.mods.offhangar.offline_battle')
+		callback = getattr(offline, 'apply_network_capture_damage', None) if offline is not None else None
+		if callable(callback):
+			callback(player, target_mock, attacker, damage, critical,
+				'LAN %s' % str(event.get('kind') or 'hit'))
+	except Exception:
+		LOG_ERROR('LAN capture reset event failed:', event.get('kind'))
+
+
 def _handle_events(player, events):
 	for event in events:
 		kind = event.get('kind')
@@ -2826,6 +2858,8 @@ def _handle_events(player, events):
 				_push_mock_health(player, mock, health,
 					getattr(mock, 'maxHealth', max(1, health)),
 					not bool(event.get('dead', False)), attacker_id, is_local)
+				_apply_capture_reset_event(
+					player, mock, event, attacker_server_id)
 		elif kind == 'health':
 			target_id = event.get('target')
 			server_health = int(event.get('health', 0) or 0)
@@ -2838,12 +2872,14 @@ def _handle_events(player, events):
 						min(int(getattr(mock, 'health', server_health) or 0), server_health),
 						getattr(mock, 'maxHealth', max(1, server_health)),
 						not bool(event.get('dead', False)), -1, True)
+					_apply_capture_reset_event(player, mock, event)
 			else:
 				mock = _find_mock(player, target_id)
 				if mock is not None:
 					_push_mock_health(player, mock, server_health,
 						getattr(mock, 'maxHealth', max(1, server_health)),
 						not bool(event.get('dead', False)), -1, False)
+					_apply_capture_reset_event(player, mock, event)
 		elif kind == 'bot_hit':
 			mock = _find_bot(event.get('target_bot'))
 			attacker_server_id = event.get('attacker')
@@ -2874,6 +2910,8 @@ def _handle_events(player, events):
 				_push_mock_health(player, mock, event.get('health', mock.health),
 					mock.maxHealth, not bool(event.get('dead', False)),
 					_local_entity_id_for_server(player, attacker_server_id), False)
+				_apply_capture_reset_event(
+					player, mock, event, attacker_server_id)
 		elif kind == 'bot_human_hit':
 			target_id = event.get('target')
 			is_local = target_id == getattr(player, '_offhangar_network_id', None)
@@ -2904,3 +2942,5 @@ def _handle_events(player, events):
 				_push_mock_health(player, target_mock, event.get('health', target_mock.health),
 					target_mock.maxHealth, not bool(event.get('dead', False)),
 					getattr(attacker_mock, 'id', -1), is_local)
+				_apply_capture_reset_event(
+					player, target_mock, event, attacker_mock)

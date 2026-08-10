@@ -127,6 +127,13 @@ def record_capture(stats, points=1):
 			100, int(stats.get('capture_points', 0)) + max(0, int(points or 0)))
 
 
+def record_dropped_capture(stats, points=1):
+	if stats is not None:
+		stats['dropped_capture_points'] = min(
+			100, int(stats.get('dropped_capture_points', 0)) +
+			max(0, int(points or 0)))
+
+
 def record_position(stats, position):
 	if stats is None or position is None:
 		return

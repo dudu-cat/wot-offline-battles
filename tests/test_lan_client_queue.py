@@ -134,6 +134,38 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertAlmostEqual(1.0 / 30.0, self.network.BOT_STATE_INTERVAL)
         self.assertAlmostEqual(1.0 / 60.0, self.network.POLL_INTERVAL)
 
+    def test_capture_reset_bridge_accepts_hull_or_module_damage(self):
+        calls = []
+        offline = sys.modules["gui.mods.offhangar.offline_battle"]
+        previous = getattr(offline, "apply_network_capture_damage", None)
+        offline.apply_network_capture_damage = lambda *args: calls.append(args)
+        try:
+            player = Player()
+            target = types.SimpleNamespace(id=7)
+            self.network._apply_capture_reset_event(
+                player, target, {"kind": "hit", "damage": 0}, 3
+            )
+            self.network._apply_capture_reset_event(
+                player, target,
+                {"kind": "hit", "damage": 0, "critical": True,
+                 "capture_reset": True},
+                3,
+            )
+            self.network._apply_capture_reset_event(
+                player, target,
+                {"kind": "hit", "damage": 25, "capture_reset": True},
+                3,
+            )
+        finally:
+            if previous is None:
+                del offline.apply_network_capture_damage
+            else:
+                offline.apply_network_capture_damage = previous
+
+        self.assertEqual(2, len(calls))
+        self.assertEqual((0, True), (calls[0][3], calls[0][4]))
+        self.assertEqual((25, False), (calls[1][3], calls[1][4]))
+
     def test_bot_snapshot_due_check_skips_rejected_render_frames(self):
         client = self.network.LANClient(
             Player(), "127.0.0.1", 28782, "Alpha", "china:Ch01_Type59"

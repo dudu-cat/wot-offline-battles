@@ -898,7 +898,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.23-test (2026-08-10) frame-cache-unique-collision'
+_OFFH_BUILD = '1.8.24-test (2026-08-10) capture-reset-ledger'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -2674,6 +2674,121 @@ def _offh_stats_for(player=None):
 		return getattr(player, '_offhangar_battle_stats', None)
 	except Exception:
 		return None
+
+
+def _offh_capture_vehicle_key(vehicle, player=None):
+	"""Return the authority-stable identity used by capture accounting."""
+	if vehicle is None:
+		return None
+	try:
+		if player is None:
+			import BigWorld
+			player = BigWorld.player()
+	except Exception:
+		player = None
+	if vehicle is player:
+		server_id = getattr(player, '_offhangar_network_id', None)
+		if server_id is not None:
+			return 'human:%s' % server_id
+		return 'vehicle:%s' % getattr(player, 'playerVehicleID', -1)
+	server_id = getattr(vehicle, '_network_server_id', None)
+	if server_id is not None:
+		return 'human:%s' % server_id
+	bot_id = getattr(vehicle, '_network_bot_id', None)
+	if bot_id is not None:
+		return 'bot:%s' % bot_id
+	vehicle_id = getattr(vehicle, 'id', vehicle)
+	if player is not None and vehicle_id == getattr(player, 'playerVehicleID', None):
+		server_id = getattr(player, '_offhangar_network_id', None)
+		if server_id is not None:
+			return 'human:%s' % server_id
+	return 'vehicle:%s' % vehicle_id
+
+
+def _offh_capture_is_authority(player):
+	client = getattr(player, '_offhangar_network_client', None)
+	if client is None or not getattr(client, 'ready', False) or getattr(client, 'phase', None) != 'battle':
+		return True
+	try:
+		from gui.mods.offhangar.network_battle import network_is_authority
+		return network_is_authority(player)
+	except Exception:
+		return False
+
+
+def _offh_capture_attacker_is_local(player, attacker):
+	if attacker is None:
+		return False
+	if attacker is player:
+		return True
+	values = (
+		getattr(player, 'playerVehicleID', None),
+		getattr(player, '_offhangar_network_id', None),
+	)
+	if attacker in values:
+		return True
+	return (getattr(attacker, 'id', None) in values or
+		getattr(attacker, '_network_server_id', None) in values)
+
+
+def _offh_drop_capture_for_vehicle(vehicle, attacker_id=None, reason='damage'):
+	"""Drop only this capturer's contribution after real HP/module damage."""
+	try:
+		import BigWorld
+		player = BigWorld.player()
+		if player is None or not _offh_capture_is_authority(player):
+			return 0
+		states = globals().get('g_base_capture')
+		if not isinstance(states, dict):
+			return 0
+		vehicle_key = _offh_capture_vehicle_key(vehicle, player)
+		if vehicle_key is None:
+			return 0
+		from gui.mods.offhangar import capture_rules
+		dropped_total = 0
+		changed = []
+		for base_team in (1, 2):
+			state = states.get(base_team)
+			dropped = capture_rules.drop_vehicle(state, vehicle_key)
+			if dropped:
+				dropped_total += dropped
+				changed.append((base_team, state))
+		for base_team, state in changed:
+			try:
+				player.arena.onTeamBasePointsUpdate(
+					base_team, 0, int(state.get('points', 0) or 0),
+					bool(state.get('stopped', False)))
+			except Exception:
+				pass
+		if dropped_total <= 0:
+			return 0
+		if _offh_capture_attacker_is_local(player, attacker_id):
+			try:
+				from gui.mods.offhangar import battle_feedback
+				battle_feedback.record_dropped_capture(
+					_offh_stats_for(player), dropped_total)
+			except Exception:
+				pass
+		try:
+			from gui.mods.offhangar.network_battle import send_authoritative_rules
+			send_authoritative_rules(player, states)
+		except Exception:
+			pass
+		LOG_NOTE('CAPTURE RESET vehicle=%s dropped=%d reason=%s' % (
+			vehicle_key, dropped_total, str(reason or 'damage')))
+		return dropped_total
+	except Exception as error:
+		LOG_DEBUG('Capture reset failed: %s' % str(error))
+		return 0
+
+
+def apply_network_capture_damage(player, target_mock, attacker_id=None,
+		damage=0, critical=False, reason='network hit'):
+	"""Network event bridge used by the elected capture authority."""
+	if max(0, int(damage or 0)) <= 0 and not bool(critical):
+		return 0
+	return _offh_drop_capture_for_vehicle(
+		target_mock, attacker_id, reason)
 
 
 def _offh_scout_event(player, event_name, target_id):
@@ -8652,7 +8767,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		_offh_seen_bw = [False]
 		
 		global g_base_capture
-		g_base_capture = {1: {'points': 0}, 2: {'points': 0}}
+		from gui.mods.offhangar import capture_rules as _capture_rules_init
+		g_base_capture = {
+			1: _capture_rules_init.new_state(),
+			2: _capture_rules_init.new_state(),
+		}
 		globals().pop('G_OFFH_FORCED_WINNER', None)  # stale capture-win flag from a crashed exit
 		globals().pop('g_offh_capture_won', None)
 		globals().pop('g_offh_battle_over', None)
@@ -8892,14 +9011,31 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		def _apply_network_rules(_rules):
 			try:
 				_pl = BigWorld.player()
+				try:
+					from gui.mods.offhangar.network_battle import network_is_authority
+					if network_is_authority(_pl):
+						return
+				except Exception:
+					pass
 				for _team in (1, 2):
 					_raw = (_rules.get('bases') or {}).get(str(_team), {}) or {}
 					_points = max(0, min(int(_raw.get('points', 0) or 0), 100))
 					_stopped = bool(_raw.get('stopped', False))
+					_contributors = {}
+					for _vehicle_key, _vehicle_points in (_raw.get('contributors') or {}).items():
+						try:
+							_vehicle_points = max(0, min(int(_vehicle_points or 0), 100))
+						except Exception:
+							continue
+						if _vehicle_points:
+							_contributors[str(_vehicle_key)] = _vehicle_points
 					_old = int(g_base_capture[_team].get('points', 0) or 0)
 					_old_stopped = bool(g_base_capture[_team].get('stopped', False))
 					g_base_capture[_team]['points'] = _points
 					g_base_capture[_team]['stopped'] = _stopped
+					g_base_capture[_team]['contributors'] = _contributors
+					g_base_capture[_team]['cursor'] = max(
+						0, int(_raw.get('cursor', 0) or 0))
 					if _pl is not None and (_old != _points or _old_stopped != _stopped):
 						_pl.arena.onTeamBasePointsUpdate(_team, 0, _points, _stopped)
 			except Exception as _nre:
@@ -9019,8 +9155,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					
 					invading_team = 2 if base_team == 1 else 1
 
-					invaders_count = 0
-					_player_invading = False
+					invader_keys = []
+					_player_capture_key = _offh_capture_vehicle_key(player, player)
 					for invader in vehs_by_team[invading_team]:
 						_invader_xz = _capture_xz(invader)
 						if _invader_xz is None:
@@ -9030,10 +9166,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							dx = inv_x - base_pos.x
 							dz = inv_z - base_pos.z
 							if dx*dx + dz*dz <= 2500.0: # 50m radius
-								invaders_count += 1
-								if invader == BigWorld.player():
-									_player_invading = True
+								_invader_key = _offh_capture_vehicle_key(invader, player)
+								if _invader_key is not None:
+									invader_keys.append(_invader_key)
 								break
+					invaders_count = len(invader_keys)
 					
 					defenders_count = 0
 					for defender in vehs_by_team[base_team]:
@@ -9049,7 +9186,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								break
 					
 					state = g_base_capture[base_team]
-					old_points = state['points']
+					old_points = int(state.get('points', 0) or 0)
+					old_stopped = bool(state.get('stopped', False))
 					if base_team != _player_team:
 						_player_xz = _capture_xz(player)
 						if _player_xz is not None:
@@ -9084,22 +9222,24 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					if state['points'] != old_points or invaders_count > 0:
 						debug_utils.LOG_DEBUG('Capture tick: team', base_team, 'invaders:', invaders_count, 'defenders:', defenders_count, 'points:', state['points'], 'serverTime:', BigWorld.serverTime())
 					
-					if invaders_count > 0 and defenders_count == 0:
-						state['points'] = min(100, state['points'] + min(invaders_count, 3))
-						if _player_invading and state['points'] > old_points:
-							try:
-								from gui.mods.offhangar import battle_feedback as _offh_feedback_capture
-								_offh_feedback_capture.record_capture(
-									_offh_stats_for(player), state['points'] - old_points)
-							except Exception:
-								pass
-					elif invaders_count == 0:
-						state['points'] = 0
-					state['stopped'] = defenders_count > 0
+					from gui.mods.offhangar import capture_rules as _capture_rules_tick
+					_capture_result = _capture_rules_tick.advance(
+						state, invader_keys, defenders_count > 0)
+					_player_gain = int(_capture_result.get('gained', {}).get(
+						_player_capture_key, 0) or 0)
+					if _player_gain > 0:
+						try:
+							from gui.mods.offhangar import battle_feedback as _offh_feedback_capture
+							_offh_feedback_capture.record_capture(
+								_offh_stats_for(player), _player_gain)
+						except Exception:
+							pass
 						
 					# Removed old hack
 						
-					if state['points'] != old_points or invaders_count > 0:
+					if (state['points'] != old_points or
+							bool(state.get('stopped', False)) != old_stopped or
+							invaders_count > 0):
 						import gui.mods.offhangar.logging as __offlog
 						__offlog.LOG_DEBUG('LOUD: PERIOD:', getattr(player.arena, 'period', None), 'SERVERTIME:', BigWorld.serverTime(), 'PERIODENDTIME:', getattr(player.arena, 'periodEndTime', None))
 						__offlog.LOG_DEBUG('Capture UI updating points! base:', base_team, 'points:', state['points'], 'invaders:', invaders_count)
@@ -9120,7 +9260,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						except Exception as e:
 							__offlog.LOG_DEBUG('LOUD: UI HOOK INIT ERROR:', e)
 						try:
-							player.arena.onTeamBasePointsUpdate(base_team, 0, state['points'], defenders_count > 0)
+							player.arena.onTeamBasePointsUpdate(
+								base_team, 0, state['points'],
+								bool(state.get('stopped', False)))
 						except Exception as e:
 							__offlog.LOG_DEBUG('LOUD: Capture UI Error:', e)
 					
@@ -9619,7 +9761,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					try:
 						if getattr(victim, 'health', 0) <= 0:
 							return
-						victim.health = max(0, int(getattr(victim, 'health', 0)) - int(dmg))
+						_hp_before_collision = max(0, int(getattr(victim, 'health', 0) or 0))
+						victim.health = max(0, _hp_before_collision - int(dmg))
+						if victim.health < _hp_before_collision:
+							_offh_drop_capture_for_vehicle(
+								victim, attacker_id, 'collision damage')
 						victim.last_killer_id = attacker_id
 						v_id = getattr(victim, 'id', -1)
 						is_player_victim = (v_id == getattr(player, 'playerVehicleID', -1))
@@ -11962,6 +12108,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# test mode; only the HP drain is held back.
 							if not _offh_module_test_mode():
 								_player_mock.health -= fire_dmg
+								_offh_drop_capture_for_vehicle(
+									_player_mock,
+									getattr(_player_mock, 'last_killer_id', None),
+									'fire damage')
 							
 							try:
 								import gui.WindowsManager
@@ -12802,6 +12952,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									m_veh._fire_timer -= 1.0
 									fire_dmg = max(1, int(m_veh.maxHealth * 0.05)) # 5% max HP per sec
 									m_veh.health -= fire_dmg
+									_offh_drop_capture_for_vehicle(
+										m_veh, getattr(m_veh, 'last_killer_id', None),
+										'fire damage')
 									
 									try:
 										import BigWorld
@@ -15448,6 +15601,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					_was = getattr(_sm, 'health', 0) or 0
 					_act = _sd if _sd < _was else _was
 					_sm.health = _was - _sd
+					if _act > 0:
+						_offh_drop_capture_for_vehicle(
+							_sm, attacker_id, 'HE splash damage')
 					if attacker_id == _pvid_s:
 						_sm.damage_from_player = (getattr(_sm, 'damage_from_player', 0) or 0) + _act
 						_sm.hits_from_player = (getattr(_sm, 'hits_from_player', 0) or 0) + 1
@@ -15525,6 +15681,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				the two separate XML values encode.'''
 				import BigWorld, Math, random
 				from gui.mods.offhangar import device_damage as _device_damage
+				_critical_applied = False
+				try:
+					target_mock._offh_last_strike_critical = False
+				except Exception:
+					pass
 				try:
 					from _constants import CONFIG_OPTIONS as _MDCFG
 				except Exception:
@@ -15679,6 +15840,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							if _crew_on and random.random() < _device_damage.saving_throw(h_mat, _name, by_explosion):
 								if _knock_out_crew(target_mock, _name[:-6], is_player_target):
 									_crew_hit = True
+									_critical_applied = True
 									target_mock.last_sound = 'armor_pierced_crit_by_player' if is_player_attacker else 'armor_pierced_crit'
 							continue
 						# INCLUSION list: only real, modelled devices are scored. The old exclusion
@@ -15692,11 +15854,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						if max_hp is None:
 							max_hp = 100
 						current_hp = target_mock.devices_hp.get(_name, max_hp)
+						_previous_device_hp = current_hp
 						current_hp -= _shell_dmg
 						# Clamp at 0 so auto-repair does not have to climb out of a deficit.
 						if current_hp < 0:
 							current_hp = 0
 						target_mock.devices_hp[_name] = current_hp
+						if current_hp < _previous_device_hp:
+							_critical_applied = True
 						target_mock.last_sound = 'armor_pierced_crit_by_player' if is_player_attacker else 'armor_pierced_crit'
 						_push_device_ui(target_mock, is_player_target, _name, current_hp, max_hp)
 						if 'ammo' in _name.lower() and current_hp <= 0 and is_player_target and _offh_module_test_mode():
@@ -15767,6 +15932,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					if _blocked:
 						LOG_DEBUG('CRIT GATE: %d device hit(s) behind the stopping plate ignored (no penetration)' % _blocked)
 				finally:
+					if _critical_applied:
+						try:
+							target_mock._offh_last_strike_critical = True
+							_offh_drop_capture_for_vehicle(
+								target_mock, attacker_id, 'module or crew damage')
+						except Exception:
+							pass
 					if _own_burst:
 						_pending_voice = _OFFH_VOICE_BURST[0] or []
 						_OFFH_VOICE_BURST[0] = None
@@ -15917,7 +16089,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								player, getattr(_attacker, '_network_bot_id', None),
 								getattr(player, '_offhangar_network_id', None),
 								_fire_seq,
-								int(dmg), 2, _hit_world)
+								int(dmg), 2, _hit_world,
+								bool(getattr(
+									player_mock, '_offh_last_strike_critical', False)))
 							if _network_damage_deferred:
 								LOG_DEBUG('LAN bot-human hit reported: bot=%s target=%s damage=%s' % (
 									getattr(_attacker, '_network_bot_id', None),
@@ -15931,7 +16105,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_offh_stats_for(player), min(_player_hp_before, max(0, int(dmg or 0))))
 							except Exception:
 								pass
+							_player_hp_before_apply = max(0, int(player_mock.health or 0))
 							player_mock.health = max(0, player_mock.health - int(dmg))
+							if player_mock.health < _player_hp_before_apply:
+								_offh_drop_capture_for_vehicle(
+									player_mock, _attacker.id, 'shell damage')
 							if hasattr(player, 'vehicle') and player.vehicle:
 								player.vehicle.health = player_mock.health
 							try:
@@ -16027,6 +16205,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_bot_hp_before = max(0, int(getattr(hit_veh, 'health', 0) or 0))
 							hit_veh.health -= _dmg
 							_bot_actual_damage = min(_bot_hp_before, max(0, int(_dmg or 0)))
+							if _bot_actual_damage > 0:
+								_offh_drop_capture_for_vehicle(
+									hit_veh, _attacker.id, 'shell damage')
 							hit_veh.damage_from_bots = (getattr(hit_veh, 'damage_from_bots', 0) or 0) + _dmg
 							hit_veh.last_killer_id = _attacker.id
 							try:
@@ -16366,6 +16547,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 
 					actual_dmg = min(dmg, max(0, enemy_mock.health))
 					enemy_mock.health -= dmg
+					if actual_dmg > 0:
+						_offh_drop_capture_for_vehicle(
+							enemy_mock, getattr(player, 'playerVehicleID', -1),
+							'shell damage')
 					enemy_mock.damage_from_player = (getattr(enemy_mock, 'damage_from_player', 0) or 0) + actual_dmg
 					enemy_mock.hits_from_player = (getattr(enemy_mock, 'hits_from_player', 0) or 0) + 1
 					LOG_DEBUG('HIT! Damage:', dmg, 'Enemy HP:', enemy_mock.health)

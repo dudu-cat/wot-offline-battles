@@ -27,6 +27,7 @@ class BattleFeedbackTest(unittest.TestCase):
         self.module.record_spotted(self.stats, 42)
         self.module.record_assist(self.stats, 43, 88)
         self.module.record_capture(self.stats, 3)
+        self.module.record_dropped_capture(self.stats, 2)
 
         result = self.module.result_values(self.stats, 75.0)
 
@@ -39,6 +40,7 @@ class BattleFeedbackTest(unittest.TestCase):
         self.assertEqual(1, result["spotted"])
         self.assertEqual(1, result["kills"])
         self.assertEqual(3, result["capturePoints"])
+        self.assertEqual(2, result["droppedCapturePoints"])
         self.assertEqual(55, result["lifeTime"])
 
     def test_spotting_and_kills_are_idempotent_per_target(self):

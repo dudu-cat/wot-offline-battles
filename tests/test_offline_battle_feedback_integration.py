@@ -5,6 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BATTLE = ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
 NETWORK = ROOT / "scripts/client/gui/mods/offhangar/network_battle.py"
+LOADER = ROOT / "scripts/client/gui/mods/mod_offhangar.py"
 PEN_INDICATOR = ROOT / "scripts/client/gui/mods/offhangar/pen_indicator.py"
 PROJECTILE_RUNTIME = (
     ROOT / "scripts/client/gui/mods/offhangar/projectile_runtime.py"
@@ -16,6 +17,7 @@ class OfflineBattleFeedbackIntegrationTest(unittest.TestCase):
     def setUpClass(cls):
         cls.battle_source = BATTLE.read_text()
         cls.network_source = NETWORK.read_text()
+        cls.loader_source = LOADER.read_text()
         cls.pen_indicator_source = PEN_INDICATOR.read_text()
         cls.projectile_source = PROJECTILE_RUNTIME.read_text()
 
@@ -51,6 +53,14 @@ class OfflineBattleFeedbackIntegrationTest(unittest.TestCase):
             self.network_source.count("record_network_combat_stats"), 3
         )
         self.assertIn("record_network_spot_assist", self.network_source)
+
+    def test_capture_progress_is_owned_per_vehicle_and_reset_by_real_damage(self):
+        self.assertIn("'capture_rules'", self.loader_source)
+        self.assertIn("_capture_rules_tick.advance(", self.battle_source)
+        self.assertIn("def _offh_drop_capture_for_vehicle(", self.battle_source)
+        self.assertIn("'module or crew damage'", self.battle_source)
+        self.assertIn("apply_network_capture_damage", self.network_source)
+        self.assertIn("'critical': bool(critical)", self.network_source)
 
     def test_bot_hit_callback_resolves_player_in_its_own_scope(self):
         callback = self.battle_source.index(

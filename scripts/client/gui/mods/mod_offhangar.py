@@ -123,6 +123,7 @@ def _safe_import_offhangar():
 	              'bot_ai_maps_group_a', 'bot_ai_maps_group_b', 'bot_ai_maps_group_c',
 	              'bot_ai_maps_extra',
 	              'bot_ai_maps', 'bot_ai', 'prebaked_navigation', 'battle_feedback',
+	              'capture_rules',
 	              'vehicle_camouflage', 'spotting', 'foliage', 'prebaked_foliage',
 	              'bot_ai_navigation', 'bot_ai_cover',
 	              'bot_ai_driver', 'spectator_minimap',

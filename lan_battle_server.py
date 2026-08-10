@@ -31,7 +31,7 @@ from server_bot_navigation import BotPathResolver
 
 
 PROTOCOL_VERSION = 8
-CLIENT_BUILD = "1.8.23-test-20260810"
+CLIENT_BUILD = "1.8.24-test-20260810"
 TICK_HZ = 30.0
 PREBATTLE_COUNTDOWN_SECONDS = 30.0
 BATTLE_DURATION_SECONDS = 900.0
@@ -217,8 +217,10 @@ class BattleState:
                        "veto_obstacle": 0, "veto_error": 0},
         }
         self.next_bot_ai_log = 0.0
-        self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
-                                      "2": {"points": 0, "stopped": False}}}
+        self.rules_state = {"bases": {
+            "1": {"points": 0, "stopped": False, "contributors": {}, "cursor": 0},
+            "2": {"points": 0, "stopped": False, "contributors": {}, "cursor": 0},
+        }}
         self.battle_result = None
         self.pending_events = []
 
@@ -394,8 +396,10 @@ class BattleState:
                                "veto_obstacle": 0, "veto_error": 0},
                 }
                 self.next_bot_ai_log = 0.0
-                self.rules_state = {"bases": {"1": {"points": 0, "stopped": False},
-                                               "2": {"points": 0, "stopped": False}}}
+                self.rules_state = {"bases": {
+                    "1": {"points": 0, "stopped": False, "contributors": {}, "cursor": 0},
+                    "2": {"points": 0, "stopped": False, "contributors": {}, "cursor": 0},
+                }}
                 self.battle_result = None
                 reset = True
             return player, reset
@@ -864,6 +868,7 @@ class BattleState:
             attacker.reported_hits.add(hit_key)
             damage = max(0, min(int(_finite_float(message.get("damage"), 0)), 5000))
             applied = min(damage, int(state.get("health", 0)))
+            critical = bool(message.get("critical", False))
             state["health"] -= applied
             state["alive"] = state["health"] > 0
             if not state["alive"]:
@@ -875,6 +880,7 @@ class BattleState:
                 "shot_seq": shot_seq, "shell_index": attacker.shell_index,
                 "shot_result": max(0, min(int(_finite_float(message.get("shot_result"), 2)), 2)),
                 "damage": applied, "health": state["health"], "dead": not state["alive"],
+                "critical": critical, "capture_reset": bool(applied > 0 or critical),
                 "world_pose": True,
                 "x": round(_clamp(_finite_float(message.get("x"), state["x"]), -2000.0, 2000.0), 4),
                 "y": round(_clamp(_finite_float(message.get("y"), state["y"] + 1.0), -1000.0, 1000.0), 4),
@@ -910,6 +916,7 @@ class BattleState:
             self.bot_reported_hits.add(hit_key)
             damage = max(0, min(int(_finite_float(message.get("damage"), 0)), 5000))
             applied = min(damage, target.health)
+            critical = bool(message.get("critical", False))
             target.health -= applied
             target.alive = target.health > 0
             if not target.alive:
@@ -919,6 +926,7 @@ class BattleState:
                 "kind": "bot_human_hit", "attacker_bot": bot_id, "target": target_id,
                 "shot_seq": shot_seq, "shot_result": max(0, min(int(_finite_float(message.get("shot_result"), 2)), 2)),
                 "damage": applied, "health": target.health, "dead": not target.alive,
+                "critical": critical, "capture_reset": bool(applied > 0 or critical),
                 "world_pose": True,
                 "x": round(_clamp(_finite_float(message.get("x"), target.x), -2000.0, 2000.0), 4),
                 "y": round(_clamp(_finite_float(message.get("y"), target.y + 1.0), -1000.0, 1000.0), 4),
@@ -941,9 +949,21 @@ class BattleState:
                 raw = incoming.get(str(team), incoming.get(team, {})) or {}
                 if not isinstance(raw, dict):
                     raw = {}
+                contributors = {}
+                incoming_contributors = raw.get("contributors") or {}
+                if isinstance(incoming_contributors, dict):
+                    for vehicle_id, points in list(incoming_contributors.items())[:64]:
+                        try:
+                            points = max(0, min(int(_finite_float(points, 0)), 100))
+                        except (TypeError, ValueError):
+                            continue
+                        if points:
+                            contributors[str(vehicle_id)[:64]] = points
                 bases[str(team)] = {
                     "points": max(0, min(int(_finite_float(raw.get("points"), 0)), 100)),
                     "stopped": bool(raw.get("stopped", False)),
+                    "contributors": contributors,
+                    "cursor": max(0, min(int(_finite_float(raw.get("cursor"), 0)), 100000)),
                 }
             self.rules_state = {"bases": bases}
             return True
@@ -1034,6 +1054,7 @@ class BattleState:
             "damage": damage,
             "health": player.health,
             "dead": not player.alive,
+            "capture_reset": damage > 0,
             "source": "client_simulation",
         })
 
@@ -1079,6 +1100,7 @@ class BattleState:
                 shot_result = max(0, min(int(message.get("shot_result", 2)), 2))
             except (TypeError, ValueError):
                 shot_result = 2
+            critical = bool(message.get("critical", False))
             event = {
                 "kind": "hit",
                 "attacker": attacker.player_id,
@@ -1089,6 +1111,8 @@ class BattleState:
                 "damage": applied_damage,
                 "health": target.health,
                 "dead": not target.alive,
+                "critical": critical,
+                "capture_reset": bool(applied_damage > 0 or critical),
                 "world_pose": True,
                 "x": round(_clamp(_finite_float(message.get("x"), target.x), -2000.0, 2000.0), 4),
                 "y": round(_clamp(_finite_float(message.get("y"), target.y + 1.0), -1000.0, 1000.0), 4),

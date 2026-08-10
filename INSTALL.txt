@@ -25,7 +25,7 @@ Start the included server
 -------------------------
 
 Replace every older client package and lan_battle_server.py with the files in
-THIS package. Protocol 8 and client build 1.8.23 are intentionally incompatible
+THIS package. Protocol 8 and client build 1.8.24 are intentionally incompatible
 with older client/server builds, so every player and the server must use this
 same package.
 
