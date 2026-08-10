@@ -13,6 +13,31 @@ _SHAPE_CACHE = {}
 SPATIAL_CELL_SIZE = 24.0
 
 
+def drivable_rising_profile(heights, segment_length, maximum_gradient=1.28,
+		minimum_rise=0.15):
+	"""Return whether ground samples describe a gradual uphill.
+
+	A flat profile is deliberately not a hill: callers use this result to
+	distinguish climbable terrain from a solid obstacle intersecting a horizontal
+	hull sweep.  Rejecting one abrupt upward step keeps rocks, walls and wagon
+	decks in the solid-collision path.
+	"""
+	try:
+		values = [float(value) for value in heights]
+		if len(values) < 2:
+			return False
+		segment = max(0.001, float(segment_length))
+		if values[-1] - values[0] <= max(0.0, float(minimum_rise)):
+			return False
+		maximum_step = segment * max(0.0, float(maximum_gradient))
+		for index in range(1, len(values)):
+			if values[index] - values[index - 1] > maximum_step:
+				return False
+		return True
+	except Exception:
+		return False
+
+
 def build_spatial_index(bodies, cell_size=SPATIAL_CELL_SIZE):
 	"""Bucket body ids by x/z so callers avoid a full all-pairs scan.
 

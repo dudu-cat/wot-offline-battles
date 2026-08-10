@@ -21,7 +21,7 @@ from gui.mods.offhangar import vehicle_pose
 
 
 PROTOCOL_VERSION = 8
-CLIENT_BUILD = '1.8.19-test-20260810'
+CLIENT_BUILD = '1.8.20-test-20260810'
 POLL_INTERVAL = 1.0 / 60.0
 INPUT_INTERVAL = 1.0 / 30.0
 BOT_STATE_INTERVAL = 1.0 / 30.0

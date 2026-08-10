@@ -215,7 +215,7 @@ def _offh_perf_frame_end(started, frame_dt, player):
 	callback_ms = 1000.0 * float(times.get('callback', 0.0) or 0.0) / samples
 	callback_share = 100.0 * callback_ms / max(0.1, frame_ms)
 	ordered = ('player_loop', 'network_smoothing', 'ai_setup', 'contacts',
-	           'contact_build', 'contact_targets', 'contact_cover',
+	           'contact_build', 'contact_targets', 'contact_foliage', 'contact_cover',
 	           'artillery_arc', 'artillery_rays',
 	           'nav_tick', 'ai_order', 'order_refresh',
 		           'order_deferred', 'nav_server', 'nav_target', 'nav_refresh', 'nav_deferred',
@@ -229,7 +229,7 @@ def _offh_perf_frame_end(started, frame_dt, player):
 	           'driver_arrived',
 	           'traffic_snapshot', 'pose_water', 'terrain_support', 'terrain_tilt',
 	           'tree_scan', 'tree_deferred',
-	           'wall_collision',
+	           'wall_collision', 'wall_fast', 'wall_exact',
 	           'tank_collision', 'collision_candidates',
 	           'pose_commit', 'visibility', 'los', 'network_publish', 'post_bot')
 	parts = []
@@ -893,7 +893,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.19-test (2026-08-10) server-navigation-offload'
+_OFFH_BUILD = '1.8.20-test (2026-08-10) swept-collision-performance'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -4312,7 +4312,7 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 		if target['alive']:
 			target['_spot_camouflage'] = _offh_spot_camouflage(
 				player, target.get('vehicle'), target['descriptor'], now)
-			candidates = []
+			observer_distances = []
 			for observer in living:
 				if observer['team'] != observing_team:
 					continue
@@ -4321,15 +4321,30 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 				distance_sq = dx * dx + dz * dz
 				if distance_sq > 250000.0:
 					continue
+				observer_distances.append((distance_sq, observer))
+			observer_distances.sort(key=lambda item: item[0])
+			candidates = []
+			from gui.mods.offhangar import spotting as _contact_spotting
+			for distance_sq, observer in observer_distances:
 				if distance_sq <= 2500.0:
 					candidates.append((distance_sq, observer))
 				else:
+					# Foliage can only increase camouflage, so the foliage-free range is
+					# an exact upper bound.  Sort first and run the expensive prebaked
+					# foliage query only for observers that can enter the closest three.
+					base_range = _contact_spotting.detection_distance(
+						observer.get('_spot_view_range', 400.0),
+						target.get('_spot_camouflage', 0.0))
+					if distance_sq > base_range * base_range:
+						continue
+					_offh_perf_count('contact_foliage')
 					spot_range = _offh_spot_detection_range(
 						player, observer, target, now)
 					if distance_sq <= spot_range * spot_range:
 						candidates.append((distance_sq, observer))
-			candidates.sort(key=lambda item: item[0])
-			for distance_sq, observer in candidates[:3]:
+				if len(candidates) >= 3:
+					break
+			for distance_sq, observer in candidates:
 				proximity_visible = distance_sq <= 2500.0
 				has_los = _offh_ai_has_los(
 					observer['position'], target['position'])
@@ -9820,106 +9835,124 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						# the wall and trickled down instead of flying a ballistic arc.
 						# Grounded: just enough to not tunnel at speed. Airborne: only the
 						# distance actually travelled this tick - contact stops, proximity not.
-						if airborne:
-							_ahead = abs(vel) * dt + 0.2
-						else:
-							_ahead = min(1.2, max(0.4, abs(vel) * dt * 2.0))
+						# Sweep through the complete movement integrated this frame.  A fixed
+						# 1.2 m cap was only safe at high FPS and could tunnel through thin
+						# geometry after a slow frame.
+						_ahead = max(0.4, abs(vel) * max(0.0, dt) + 0.2)
 						back_margin = -0.5 if vel > 0 else 0.5
 						front_margin = (hl_front + _ahead) if vel > 0 else -(hl_back + _ahead)
 						
 						cos_y = math.cos(yaw)
 						sin_y = math.sin(yaw)
 
-						# DRIVABLE-SLOPE GUARD: a rising HILL is not a wall. Sample the ground under
-						# the hull and at the hull front along the heading; if it rises as a climbable
-						# slope (avg gradient below ~52 deg) the hull CLIMBS it - report no collision.
-						# Wall-stopping on steep hills slammed the model speed 60->9 km/h (the oversteer).
+						# Always retain the exact lower-hull swept test. It spans the previous
+						# pose to the complete candidate motion, so reducing expensive follow-up
+						# work cannot let a fast hull tunnel through a thin wall.
+						_bottom_hits = []
+						_target_len = (abs(back_margin) +
+							(hl_front if vel > 0 else hl_back) + _ahead)
+						for offset_x in (-hw, 0, hw):
+							sx = pos.x + cos_y * offset_x
+							sz = pos.z - sin_y * offset_x
+
+							x1 = sx + sin_y * back_margin
+							z1 = sz + cos_y * back_margin
+							x2 = sx + sin_y * front_margin
+							z2 = sz + cos_y * front_margin
+
+							start_bot = Math.Vector3(x1, pos.y + 0.6, z1)
+							end_bot = Math.Vector3(x2, pos.y + 0.6, z2)
+							_offh_perf_count('physics_rays')
+							col_bot = BigWorld.wg_collideSegment(spaceID, start_bot, end_bot, 128)
+							if col_bot is not None:
+								d_bot = (col_bot[0] - start_bot).length
+								if d_bot < _target_len:
+									_bottom_hits.append((
+										offset_x, sx, sz, x2, z2, start_bot, end_bot,
+										col_bot, d_bot))
+
+						if not _bottom_hits:
+							_offh_perf_count('wall_fast')
+							return False
+						_offh_perf_count('wall_exact')
+
+						# A lower sweep also intersects ordinary uphill ground. Classify a
+						# candidate with vertical samples only after a hit exists. Flat ground
+						# is not a hill and must never hide a genuine wall at the same height.
 						try:
 							_fw = 1.0 if vel >= 0 else -1.0
 							_look = (hl_front if vel > 0 else hl_back) + _ahead
-							# Walk the ground along the heading in small steps. A drivable HILL rises
-							# gradually at EVERY step -> climb it (no collision). A big rock / step /
-							# wall SPIKES one step (rises more than a climbable amount over its short
-							# length) -> leave it to the ray wall-check so the hull is BLOCKED.
 							_seg_n = 6
 							_seg = _look / _seg_n
-							_smooth = True
-							_prev_y = None
+							_ground_heights = []
 							for _si in range(_seg_n + 1):
 								_dd = _seg * _si
 								_px = pos.x + sin_y * _dd * _fw
 								_pz = pos.z + cos_y * _dd * _fw
 								_offh_perf_count('physics_rays')
-								_gg = BigWorld.wg_collideSegment(spaceID, Math.Vector3(_px, pos.y + 12.0, _pz), Math.Vector3(_px, pos.y - 5.0, _pz), 128)
+								_gg = BigWorld.wg_collideSegment(
+									spaceID, Math.Vector3(_px, pos.y + 12.0, _pz),
+									Math.Vector3(_px, pos.y - 5.0, _pz), 128)
 								if _gg is None:
-									_smooth = False
+									_ground_heights = []
 									break
-								if _prev_y is not None and (_gg[0].y - _prev_y) > _seg * 1.28:
-									_smooth = False   # step rises steeper than ~52 deg = rock/step, not a hill
-									break
-								_prev_y = _gg[0].y
-							if _smooth:
+								_ground_heights.append(_gg[0].y)
+							if (_ground_heights and
+									_VC.drivable_rising_profile(_ground_heights, _seg)):
 								return False
 						except: pass
 
-						for offset_x in (-hw, 0, hw):
-							sx = pos.x + cos_y * offset_x
-							sz = pos.z - sin_y * offset_x
-							
-							x1 = sx + sin_y * back_margin
-							z1 = sz + cos_y * back_margin
-							x2 = sx + sin_y * front_margin
-							z2 = sz + cos_y * front_margin
-							
-							# Nezávislý scan na stromy a ploty před tankem
-							try:
-								if offset_x != 0:
-									raise StopIteration  # perf: look-ahead only on centre column
-								seg_start = Math.Vector3(sx, pos.y + 0.5, sz)
-								seg_stop = Math.Vector3(x2, pos.y + 0.5, z2)
-								matInfo = BigWorld.wg_getMatInfoNearPoint(spaceID, seg_start, seg_stop, seg_stop, lambda *a: False)
-								if matInfo:
-									if _try_destroy_destructible(spaceID, matInfo, yaw, vel):
-										# Pokud jsme rozbili strom/plot, můžeme ignorovat pevnou kolizi, která na něj případně navazuje (nebo i když žádná není)
-										pass
-							except: pass
-							
-							# Spodní paprsek pro pevnou geometrii (0.6m nad zemí)
-							start_bot = Math.Vector3(x1, pos.y + 0.6, z1)
-							end_bot = Math.Vector3(x2, pos.y + 0.6, z2)
+						for (offset_x, sx, sz, x2, z2, start_bot, end_bot,
+								col_bot, d_bot) in _bottom_hits:
+							# Retain the original centre-column destructible probe, but only
+							# after an exact solid candidate exists.
+							if offset_x == 0:
+								try:
+									seg_start = Math.Vector3(sx, pos.y + 0.5, sz)
+									seg_stop = Math.Vector3(x2, pos.y + 0.5, z2)
+									matInfo = BigWorld.wg_getMatInfoNearPoint(
+										spaceID, seg_start, seg_stop, seg_stop,
+										lambda *a: False)
+									if matInfo:
+										_try_destroy_destructible(
+											spaceID, matInfo, yaw, vel)
+								except: pass
+
+							start_top = Math.Vector3(start_bot.x, pos.y + 1.6, start_bot.z)
+							end_top = Math.Vector3(end_bot.x, pos.y + 1.6, end_bot.z)
 							_offh_perf_count('physics_rays')
-							col_bot = BigWorld.wg_collideSegment(spaceID, start_bot, end_bot, 128)
-							
-							if col_bot is not None:
-								d_bot = (col_bot[0] - start_bot).length
-								target_len = abs(back_margin) + (hl_front if vel > 0 else hl_back) + _ahead
-								if d_bot < target_len:
-									# Něco jsme trefili, zkontrolujeme horní paprsek (1.6m nad zemí)
-									start_top = Math.Vector3(x1, pos.y + 1.6, z1)
-									end_top = Math.Vector3(x2, pos.y + 1.6, z2)
-									_offh_perf_count('physics_rays')
-									col_top = BigWorld.wg_collideSegment(spaceID, start_top, end_top, 128)
-									
-									if col_top is not None:
-										d_top = (col_top[0] - start_top).length
-										if (d_top - d_bot) < 0.5:
-											if _try_destroy_solid_hit(spaceID, start_bot, col_bot[0], yaw, vel): pass
-											else: return True
+							col_top = BigWorld.wg_collideSegment(
+								spaceID, start_top, end_top, 128)
+
+							if col_top is not None:
+								d_top = (col_top[0] - start_top).length
+								if (d_top - d_bot) < 0.5:
+									if _try_destroy_solid_hit(
+											spaceID, start_bot, col_bot[0], yaw, vel):
+										pass
 									else:
-										start_mid = Math.Vector3(x1, pos.y + 1.1, z1)
-										end_mid = Math.Vector3(x2, pos.y + 1.1, z2)
-										_offh_perf_count('physics_rays')
-										col_mid = BigWorld.wg_collideSegment(spaceID, start_mid, end_mid, 128)
-										if col_mid is not None:
-											d_mid = (col_mid[0] - start_mid).length
-											if (d_mid - d_bot) < 0.25:
-												if _try_destroy_solid_hit(spaceID, start_bot, col_bot[0], yaw, vel): pass
-												else: return True
-										else:
-											# Low object (<1.1m): only the bottom ray caught it. Crush it if
-											# it's a destructible (fence / small prop) so the tank drives
-											# THROUGH, not over it. Non-destructibles (low rocks) stay drivable.
-											_try_destroy_solid_hit(spaceID, start_bot, col_bot[0], yaw, vel)
+										return True
+								else:
+									start_mid = Math.Vector3(
+										start_bot.x, pos.y + 1.1, start_bot.z)
+									end_mid = Math.Vector3(
+										end_bot.x, pos.y + 1.1, end_bot.z)
+									_offh_perf_count('physics_rays')
+									col_mid = BigWorld.wg_collideSegment(
+										spaceID, start_mid, end_mid, 128)
+									if col_mid is not None:
+										d_mid = (col_mid[0] - start_mid).length
+										if (d_mid - d_bot) < 0.25:
+											if _try_destroy_solid_hit(
+													spaceID, start_bot, col_bot[0], yaw, vel):
+												pass
+											else:
+												return True
+							else:
+								# Low objects remain drivable, while any destructible skin is
+								# crushed before the hull advances through it.
+								_try_destroy_solid_hit(
+									spaceID, start_bot, col_bot[0], yaw, vel)
 					except: pass
 					return False
 
@@ -12802,7 +12835,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# below remain speed-gated, so this adds only the cheap OBB pass.
 							if getattr(m_veh, 'isAlive', False):
 								_hit_wall = False
-								m_veh._cw_fc = (getattr(m_veh, '_cw_fc', 0) or 0) + 1
 								# Tree/fence enumeration is presentation-side contact work, not
 								# motion integration.  At the fastest 0.8.2 tanks a 150 ms scan
 								# interval advances less than the probe's 6 m look-ahead, so no
@@ -12821,8 +12853,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									except: pass
 								elif abs(m_veh._veh_velocity) > 0.5 and _tree_scan_due:
 									_offh_perf_count('tree_deferred')
-								# perf: wall scan alternates frames per bot (<0.5 m travel between checks)
-								if abs(m_veh._veh_velocity) > 0.5 and ((m_veh._cw_fc + eid) & 1) == 0:
+								# The three-ray swept broad phase is mandatory every movement frame.
+								# Expensive slope/material classification runs only after those rays hit.
+								if abs(m_veh._veh_velocity) > 0.5:
 									try:
 										_hit_wall = _offh_perf_call(
 											'wall_collision', _check_horizontal_collision,

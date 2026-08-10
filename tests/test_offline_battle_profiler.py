@@ -156,6 +156,7 @@ class OfflineBattleProfilerTests(unittest.TestCase):
             "contacts",
             "contact_build",
             "contact_targets",
+            "contact_foliage",
             "contact_cover",
             "artillery_arc",
             "artillery_rays",
@@ -188,6 +189,8 @@ class OfflineBattleProfilerTests(unittest.TestCase):
             "tree_scan",
             "tree_deferred",
             "wall_collision",
+            "wall_fast",
+            "wall_exact",
             "tank_collision",
             "collision_candidates",
             "pose_commit",
@@ -277,6 +280,34 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         self.assertIn("float(now) - last_cover >= 0.10", contact)
         self.assertIn("offset_index", contact)
         self.assertIn("bot_observation_due", contact)
+
+    def test_contact_foliage_is_evaluated_after_cheap_distance_ordering(self):
+        source = SOURCE.read_text()
+        contact_start = source.index("def _offh_ai_refresh_contacts")
+        contact_end = source.index("def _offh_battle_sweep", contact_start)
+        contact = source[contact_start:contact_end]
+
+        distance_sort = contact.index("observer_distances.sort")
+        foliage_query = contact.index("_offh_spot_detection_range(", distance_sort)
+        closest_three = contact.index("if len(candidates) >= 3:", foliage_query)
+        self.assertLess(distance_sort, foliage_query)
+        self.assertLess(foliage_query, closest_three)
+
+    def test_wall_sweep_precedes_expensive_slope_classification(self):
+        source = SOURCE.read_text()
+        wall_start = source.index("def _check_horizontal_collision")
+        wall_end = source.index("def _offh_land_impact", wall_start)
+        wall = source[wall_start:wall_end]
+
+        lower_sweep = wall.index("_bottom_hits = []")
+        fast_return = wall.index("_offh_perf_count('wall_fast')", lower_sweep)
+        slope_profile = wall.index("_VC.drivable_rising_profile", fast_return)
+        self.assertLess(lower_sweep, fast_return)
+        self.assertLess(fast_return, slope_profile)
+        self.assertIn(
+            "_ahead = max(0.4, abs(vel) * max(0.0, dt) + 0.2)", wall
+        )
+        self.assertNotIn("_cw_fc", source)
 
     def test_network_replica_skips_authority_ai_but_keeps_collision_bodies(self):
         source = SOURCE.read_text()

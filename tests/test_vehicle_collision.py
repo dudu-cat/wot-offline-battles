@@ -103,6 +103,28 @@ class VehicleCollisionTests(unittest.TestCase):
             self.collision.support_rise_is_obstacle(0.0, None, 0.65)
         )
 
+    def test_only_gradual_uphill_profiles_bypass_wall_collision(self):
+        self.assertFalse(
+            self.collision.drivable_rising_profile(
+                [4.0, 4.0, 4.0, 4.0], 0.75
+            )
+        )
+        self.assertFalse(
+            self.collision.drivable_rising_profile(
+                [4.5, 4.3, 4.1, 3.9], 0.75
+            )
+        )
+        self.assertTrue(
+            self.collision.drivable_rising_profile(
+                [4.0, 4.3, 4.7, 5.1], 0.75
+            )
+        )
+        self.assertFalse(
+            self.collision.drivable_rising_profile(
+                [4.0, 4.2, 5.5, 5.7], 0.75
+            )
+        )
+
     def test_equal_mass_pair_separates_and_stops_closing_velocity(self):
         response = self.collision.pair_response(
             (-1.0, 0.0, 0.5), 1.0, 1.0,

@@ -55,10 +55,13 @@ terrain_support   Ground support under the hull.
 terrain_tilt      Pitch and roll sampling.
 tree_scan         Destructible-tree proximity checks.
 wall_collision    Static horizontal collision checks.
+wall_fast         Swept wall checks rejected without expensive follow-up.
+wall_exact        Swept wall hits that required slope/material classification.
 tank_collision    Vehicle-to-vehicle collision resolution.
 contacts          Tactical contact refresh.
 contact_build     Vehicle/contact snapshot construction.
 contact_targets   The bounded target slice evaluated this frame.
+contact_foliage   Exact foliage queries after distance-only rejection.
 contact_cover     One bounded tactical cover candidate evaluation.
 artillery_arc     Deferred curved-path obstruction work.
 artillery_rays    Native SPG path chords; hard-capped at four per frame.
