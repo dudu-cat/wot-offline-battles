@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / 'ports' / '0.9.22' / 'tools' / 'bake_foliage_0922.py'
 DATA_ROOT = ROOT / 'ports' / '0.9.22' / 'foliage'
 

@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 TOOLS = ROOT / 'ports' / '0.9.22' / 'tools'
 sys.path.insert(0, str(TOOLS))
 

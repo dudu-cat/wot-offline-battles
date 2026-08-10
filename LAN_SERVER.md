@@ -1,18 +1,23 @@
 # LAN battle server
 
-This repository contains the shared Python 3 server for the 0.8.2 offline
-client and the pinned Chinese 0.9.22.0.1 `#1513` port. A server-backed battle
-works with one connected player. The server owns the room, teams and slots,
-canonical health, deaths, accepted shot events and round phase. Clients retain
-the proprietary map queries, entity presentation and collision/armor work.
+This repository contains version-matched Python 3 LAN server entries for the
+0.8.2 offline client and the pinned Chinese 0.9.22.0.1 `#1513` port. A
+server-backed battle works with one connected player. The server owns the room,
+teams and slots, canonical health, deaths, accepted shot events and round
+phase. Clients retain the proprietary map queries, entity presentation and
+collision/armor work.
 
 ## Start the server
 
-Run this on the machine that hosts the battle:
+For the 0.9.22 port, run its version-local server on the machine that hosts the
+battle:
 
 ```bash
-python3 lan_battle_server.py --host 0.0.0.0 --port 28782 --map server_random
+python3 ports/0.9.22/server/lan_battle_server.py --host 0.0.0.0 --port 28782 --map server_random
 ```
+
+The legacy 0.8.2 entry remains `python3 lan_battle_server.py ...`. Keep each
+client on the server entry from the same version checkpoint.
 
 `server_random` gives the room an initial random map.
 `--map 04_himmelsdorf` changes that initial selection. In 0.8.2, a waiting
@@ -220,7 +225,8 @@ seconds; base capture is not implemented there.
 
 ### Bot planner portability boundary
 
-`server_bot_ai.py` and the cover scorer it shares with the client are
+`ports/0.9.22/server/server_bot_ai.py` and the cover scorer it shares with the
+port client are
 intentionally pure data: neither imports BigWorld or touches a client runtime.
 Their inputs and outputs are JSON-compatible dictionaries carried by protocol
 v5:

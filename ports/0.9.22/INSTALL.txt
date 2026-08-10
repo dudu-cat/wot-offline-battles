@@ -9,7 +9,8 @@ If you received the ZIP form, extract its contents directly into the game
 root. The archive itself contains `mods` and `INSTALL.txt`; it does not add an
 extra wrapper directory.
 
-Use `lan_battle_server.py` from the same repository checkpoint as this package.
+Use `ports/0.9.22/server/lan_battle_server.py` from the same repository
+checkpoint as this package.
 The v5 message schema is round-scoped and stricter than older v5 packages, so
 mixing an old client and new server (or the reverse) is unsupported.
 This #1513 client identifies its build during the LAN handshake. The first
@@ -74,7 +75,7 @@ Start the server
 
 From the repository on the Mac host, run:
 
-    python3 lan_battle_server.py --host 0.0.0.0 --port 28782 --map server_random
+    python3 ports/0.9.22/server/lan_battle_server.py --host 0.0.0.0 --port 28782 --map server_random
 
 Allow inbound TCP port 28782 through the host firewall when another computer
 or virtual machine connects.

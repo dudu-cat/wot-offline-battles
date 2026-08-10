@@ -15,10 +15,16 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-      - name: Run test suite
+      - name: Run 0.8.2 and shared test suite
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python -m unittest discover -s tests -p "test_*.py" -v
+      - name: Run 0.9.22 port test suite
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: >-
+          python -m unittest discover -s ports/0.9.22/tests
+          -p "test_*.py" -v
       - name: Check Python 2.6 client syntax
         run: >-
           docker run --rm -v "$PWD:/work" -w /work zinainfra/python26

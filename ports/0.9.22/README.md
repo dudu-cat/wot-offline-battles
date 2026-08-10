@@ -135,8 +135,8 @@ overwrite the next round.
 
 ## User flow
 
-1. Start `lan_battle_server.py`. One client is sufficient for an offline round;
-   additional clients can join the same waiting room over LAN.
+1. Start `server/lan_battle_server.py`. One client is sufficient for an
+   offline round; additional clients can join the same waiting room over LAN.
 2. Start the frozen client. After the native intro/login state finishes its
    destructive cleanup, the mod creates its local Account and enters Lobby.
 3. Select the tank you want to use, then click the garage's native **Battle!**
@@ -226,9 +226,9 @@ Small repair kits, small medkits and hand extinguishers are exposed through the
 exact #1513 activation-code path during battle.
 
 Protocol v5 messages are now strictly round-scoped. Keep the client package
-and `lan_battle_server.py` from the same checkout; this client rejects an older
-server before entering the waiting room when its welcome lacks the build or
-room-host contract.
+and `server/lan_battle_server.py` from the same checkout; this client rejects
+an older server before entering the waiting room when its welcome lacks the
+build or room-host contract.
 The #1513 client also declares `wot-0.9.22.0.1-cn-1513` in its handshake. The
 server pins each non-empty room to one client build and its exact map pool,
 preventing 0.8.2 synthetic coordinates from being mixed with 0.9.22 world
@@ -305,6 +305,16 @@ time, one-second tick phase and igniter identity survive authority transfer, so
 the ten-second burnout neither restarts nor loses its final-kill attribution.
 
 ## Build
+
+The complete #1513 source checkpoint lives below this directory: `src/` is the
+client, `server/` is the Python 3 LAN service, `tests/` is the port-only test
+suite, and `tools/` contains the build and compatibility audits. Changes for
+the #1513 service belong in `server/`; the repository-root server entry is the
+legacy 0.8.2 line. From the repository root, run the port tests with:
+
+```bash
+python3 -m unittest discover -s ports/0.9.22/tests -p 'test_*.py' -v
+```
 
 The per-module 0.8.2/#1513 provenance and permitted differences are recorded
 in [`BATTLE_SOURCE_AUDIT.md`](BATTLE_SOURCE_AUDIT.md). The release build runs

@@ -4,7 +4,7 @@ import sys
 import types
 import unittest
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 BASE = ROOT / 'ports' / '0.9.22' / 'src' / 'res' / 'scripts' / 'client' / 'gui' / 'mods' / 'offline_lan_0922' / 'ai'
 
 def _load():

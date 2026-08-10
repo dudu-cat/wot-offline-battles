@@ -70,11 +70,12 @@ PORT_FILES = {
 }
 
 # The #1513 battle also depends on two Python 3 service modules outside the
-# wotmod.  They are part of the same provenance gate because they own shared
-# room/rule/macro state, not deployment-only infrastructure.
+# wotmod. They live with the port and are part of the same provenance gate
+# because they own shared room/rule/macro state, not deployment-only
+# infrastructure.
 SERVER_FILES = {
-    'lan_battle_server.py': '082_protocol_and_shared_law_adapter',
-    'server_bot_ai.py': '082_current_server_macro_planner',
+    'server/lan_battle_server.py': '082_protocol_and_shared_law_adapter',
+    'server/server_bot_ai.py': '082_current_server_macro_planner',
 }
 
 # The working 0.8.2 implementation was finalized in a separate release
@@ -102,7 +103,8 @@ PINNED_PORT_SHA256 = {
     'world_collision.py': '693982f14420952ffb035b380af862e16a07959ab006df3f9d8f4ace62f4b9af',
 }
 PINNED_SERVER_SHA256 = {
-    'server_bot_ai.py': '7b5724987c50497a9f0aa878e8cc103b14c0e9e1fdf3c489a78562ec114e625a',
+    'server/lan_battle_server.py': '151af2f2ae839aa1017e3bd83fd01fb0dda62c03de9883330c9e38683935025a',
+    'server/server_bot_ai.py': 'fc4b697c450053e6202fe9cedf9ddbd181ea82f423c4a8dc1de1722ee770ff4b',
 }
 
 # Every Python file in the working 0.8.2 offhangar tree is classified here.
@@ -351,6 +353,7 @@ def _function_at_any_indent(value, name):
 
 def audit(repo_root):
     repo_root = os.path.abspath(repo_root)
+    port_root = os.path.join(repo_root, 'ports', '0.9.22')
     package = os.path.join(
         repo_root, 'ports', '0.9.22', 'src', 'res', 'scripts', 'client',
         'gui', 'mods', 'offline_lan_0922')
@@ -390,7 +393,7 @@ def audit(repo_root):
             errors.append('port module lacks a written explanation: %s' %
                           port_name)
     for server_name in sorted(SERVER_FILES):
-        if not os.path.isfile(os.path.join(repo_root, server_name)):
+        if not os.path.isfile(os.path.join(port_root, server_name)):
             errors.append('documented battle service is missing: %s' %
                           server_name)
         if '`%s`' % server_name not in audit_document:
@@ -420,7 +423,7 @@ def audit(repo_root):
             errors.append('%s diverged from reviewed final 0.8.2 port %s' %
                           (port_name, FINAL_082_BASELINE[:7]))
     for server_name, expected in sorted(PINNED_SERVER_SHA256.items()):
-        if _sha256(os.path.join(repo_root, server_name)) != expected:
+        if _sha256(os.path.join(port_root, server_name)) != expected:
             errors.append('%s diverged from reviewed final 0.8.2 service %s' %
                           (server_name, FINAL_082_BASELINE[:7]))
     for port_name, original_name in (
@@ -1033,7 +1036,8 @@ def audit(repo_root):
     if (hello_send < 0 or connected_publish < 0 or
             hello_send > connected_publish):
         errors.append('lan_client.py exposes connected before hello is sent')
-    server = _text(os.path.join(repo_root, 'lan_battle_server.py'))
+    server = _text(os.path.join(
+        port_root, 'server', 'lan_battle_server.py'))
     for required in ('def mark_battle_ready', 'def _update_capture',
                      'def loading_snapshot', 'capture_bases',
                      'def _timing_payload', 'self.pending_live_message',
@@ -1060,13 +1064,16 @@ def audit(repo_root):
         if required not in server:
             errors.append('lan_battle_server.py omits authority handoff law: '
                           '%s' % required)
-    server_planner = _text(os.path.join(repo_root, 'server_bot_ai.py'))
+    server_planner = _text(os.path.join(
+        port_root, 'server', 'server_bot_ai.py'))
     for required in ('class BotPlanner', 'def report_contacts',
                      'def report_affordances', 'def build_orders',
                      'score_candidates'):
         if required not in server_planner:
             errors.append('server_bot_ai.py omits documented macro boundary: %s' %
                           required)
+    if 'scripts.client.gui.mods.offhangar' in server_planner:
+        errors.append('server/server_bot_ai.py imports the 0.8.2 source tree')
     config = _text(os.path.join(package, 'config.py'))
     if "'prebattleCountdownSeconds': 15.0" not in config:
         errors.append('config.py default diverges from 0.8.2 countdown')

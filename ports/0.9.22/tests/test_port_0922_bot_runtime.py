@@ -5,11 +5,14 @@ import sys
 import types
 import unittest
 
+ROOT = Path(__file__).resolve().parents[3]
+PORT_ROOT = ROOT / 'ports' / '0.9.22'
+sys.path.insert(0, str(PORT_ROOT / 'server'))
+
 from lan_battle_server import BattleState, CLIENT_BUILD_0922, Player
 from server_bot_ai import BotPlanner
 
-ROOT = Path(__file__).resolve().parents[1]
-PACKAGE_ROOT = ROOT / 'ports' / '0.9.22' / 'src' / 'res' / 'scripts' / 'client' / 'gui' / 'mods' / 'offline_lan_0922'
+PACKAGE_ROOT = PORT_ROOT / 'src' / 'res' / 'scripts' / 'client' / 'gui' / 'mods' / 'offline_lan_0922'
 
 
 def _graph(map_name='01_karelia', waypoint_count=2):

@@ -8,7 +8,7 @@ from unittest import mock
 import zlib
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 RUNTIME_PATH = (ROOT / 'ports' / '0.9.22' / 'src' / 'res' / 'scripts' /
                 'client' / 'gui' / 'mods' / 'offline_lan_0922' /
                 'entities' / 'runtime.py')

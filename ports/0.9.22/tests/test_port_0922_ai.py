@@ -6,8 +6,10 @@ import os
 import unittest
 
 
-ROOT = Path(__file__).resolve().parents[1]
-CLIENT_SCRIPTS = ROOT / 'ports' / '0.9.22' / 'src' / 'res' / 'scripts' / 'client'
+ROOT = Path(__file__).resolve().parents[3]
+PORT_ROOT = ROOT / 'ports' / '0.9.22'
+CLIENT_SCRIPTS = PORT_ROOT / 'src' / 'res' / 'scripts' / 'client'
+sys.path.insert(0, str(PORT_ROOT / 'server'))
 sys.path.insert(0, str(CLIENT_SCRIPTS))
 
 from gui.mods.offline_lan_0922.ai import cover, maps
