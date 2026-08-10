@@ -829,7 +829,8 @@ class _BigWorld(object):
     def wg_getMatInfoNearPoint(self, unused_space_id, unused_start,
                                unused_end, unused_hit_point,
                                unused_filter):
-        return None
+        return (False, unused_hit_point, unused_hit_point,
+                0, '', 0, 0)
 
     def callback(self, delay, function):
         if self.pending_entities and not self.defer_vehicle_entry:

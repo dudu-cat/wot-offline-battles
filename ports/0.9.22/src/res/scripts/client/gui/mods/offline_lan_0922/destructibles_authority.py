@@ -195,8 +195,13 @@ def destroy_tree(spaceID, chunkID, itemIndex, fallYaw, speed, pos):
 	pitch = math.pi / 2.0
 	pc = BigWorld.wg_getDestructibleFallPitchConstr(
 		spaceID, chunkID, itemIndex, fallYaw)
-	if pc is not None and pc[0] is not None:
-		pitch = pc[0]
+	try:
+		pitchConstr, _collisionFlags = pc
+	except (TypeError, ValueError):
+		raise RuntimeError(
+			'#1513 destructible fall-pitch payload must contain 2 items')
+	if pitchConstr is not None:
+		pitch = pitchConstr
 	speed = max(1, min(3, int(abs(speed))))
 	data = AreaDestructibles.encodeFallenTree(itemIndex, fallYaw, pitch, speed)
 	return _apply(spaceID, chunkID, pos, 'tree', data, (itemIndex, None))

@@ -110,9 +110,8 @@ def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None, airborne=False,
 				seg_start = Math.Vector3(sx, pos.y + 0.5, sz)
 				seg_stop = Math.Vector3(x2, pos.y + 0.5, z2)
 				matInfo = BigWorld.wg_getMatInfoNearPoint(spaceID, seg_start, seg_stop, seg_stop, lambda *a: False)
-				if matInfo:
-					_try_destroy_destructible(
-						spaceID, matInfo, yaw, vel)
+				_try_destroy_destructible(
+					spaceID, matInfo, yaw, vel)
 			
 			# Spodní paprsek pro pevnou geometrii (0.6m nad zemí)
 			start_bot = Math.Vector3(x1, pos.y + 0.6, z1)

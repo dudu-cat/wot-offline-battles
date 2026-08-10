@@ -27,6 +27,35 @@ class _Vector(object):
             x, y, z = x
         self.x, self.y, self.z = float(x), float(y), float(z)
 
+    def __add__(self, other):
+        return _Vector(self.x + other.x, self.y + other.y,
+                       self.z + other.z)
+
+    def __sub__(self, other):
+        return _Vector(self.x - other.x, self.y - other.y,
+                       self.z - other.z)
+
+    @property
+    def length(self):
+        return (self.x * self.x + self.y * self.y +
+                self.z * self.z) ** 0.5
+
+    def normalise(self):
+        length = self.length
+        if length:
+            self.x /= length
+            self.y /= length
+            self.z /= length
+
+    def scale(self, value):
+        return _Vector(self.x * value, self.y * value, self.z * value)
+
+
+def _mat_info_1513(collided=False, point=None, normal=None, mat_kind=0,
+                   filename='', chunk_id=0, item_index=0):
+    return (bool(collided), point or _Vector(), normal or _Vector(),
+            int(mat_kind), filename, int(chunk_id), int(item_index))
+
 
 class _Strict1513Component(object):
     """Attribute-only stand-in for #1513's ``NoLegacyStuff`` mixin."""
@@ -87,7 +116,7 @@ def _authority_environment(manager):
     bigworld = types.SimpleNamespace(
         createEntity=lambda *unused: 900,
         wg_getChunkDestrFilenames=lambda *unused: (),
-        wg_getDestructibleFallPitchConstr=lambda *unused: None)
+        wg_getDestructibleFallPitchConstr=lambda *unused: (None, 0))
     math_module = types.SimpleNamespace(Vector3=_Vector)
     destructibles_authority.BigWorld = bigworld
     destructibles_authority.Math = math_module
@@ -293,10 +322,111 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                     destructibles_sensor, '_get_destr_authority',
                     return_value=authority):
             with self.assertRaisesRegex(
-                    RuntimeError, 'native destructible destroy'):
+                RuntimeError, 'native destructible destroy'):
                 destructibles_sensor._try_destroy_destructible(
-                    1, ((0, 0, 0), None, 22, 37, 75, 'fence'),
+                    1, _mat_info_1513(
+                        True, _Vector(), _Vector(0, 1, 0), 75,
+                        'fence', 22, 37),
                     0.0, 6.0)
+
+    def test_exact_1513_hit_preserves_chunk_and_item_order(self):
+        area = types.ModuleType('AreaDestructibles')
+        area.g_destructiblesManager = object()
+        area.DESTR_TYPE_TREE = 1
+        area.DESTR_TYPE_FALLING_ATOM = 2
+        area.DESTR_TYPE_FRAGILE = 3
+        area.DESTR_TYPE_STRUCTURE = 4
+        area.g_cache = types.SimpleNamespace(
+            getDescByFilename=lambda filename: (
+                {'type': 3, 'health': 1} if filename == 'fence' else None))
+        calls = []
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda *unused: False,
+            destroy_fragile=lambda *args: calls.append(args) or True)
+        destructibles_sensor.set_event_sink(lambda unused: True)
+        hit_point = _Vector(10, 2, 20)
+
+        with mock.patch.dict(sys.modules, {'AreaDestructibles': area}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority):
+            self.assertTrue(destructibles_sensor._try_destroy_destructible(
+                1, _mat_info_1513(
+                    True, hit_point, _Vector(0, 1, 0), 75,
+                    'fence', 22, 37),
+                0.25, 6.0, True))
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual((1, 22, 37), calls[0][:3])
+        self.assertIs(hit_point, calls[0][3])
+        self.assertTrue(calls[0][4])
+
+    def test_exact_1513_miss_does_not_touch_destructibles_runtime(self):
+        with mock.patch.dict(sys.modules, {'AreaDestructibles': None}):
+            self.assertFalse(destructibles_sensor._try_destroy_destructible(
+                1, _mat_info_1513(False), 0.0, 6.0))
+
+    def test_material_hit_payload_rejects_legacy_or_unknown_width(self):
+        for payload in (
+                (_Vector(), _Vector(), 22, 37, 75, 'fence'),
+                (True, _Vector(), _Vector(), 75, 'fence', 22, 37,
+                 'extra')):
+            with self.assertRaisesRegex(
+                    RuntimeError, 'must contain 7 items'):
+                destructibles_sensor._try_destroy_destructible(
+                    1, payload, 0.0, 6.0)
+
+        with self.assertRaisesRegex(RuntimeError, 'must be a tuple'):
+            destructibles_sensor._try_destroy_destructible(
+                1, list(_mat_info_1513(False)), 0.0, 6.0)
+
+        payload = list(_mat_info_1513(False))
+        payload[0] = 0
+        with self.assertRaisesRegex(RuntimeError, 'collided flag must be bool'):
+            destructibles_sensor._try_destroy_destructible(
+                1, tuple(payload), 0.0, 6.0)
+
+    def test_solid_probe_uses_1513_miss_sentinel(self):
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_getMatInfoNearPoint = (
+            lambda *unused: _mat_info_1513(False))
+
+        with mock.patch.dict(sys.modules, {'BigWorld': bigworld}):
+            self.assertFalse(destructibles_sensor._try_destroy_solid_hit(
+                1, _Vector(), _Vector(0, 0, 2), 0.0, 6.0))
+
+    def test_shot_probe_uses_1513_miss_sentinel(self):
+        start = _Vector()
+        impact = _Vector(0, 0, 5)
+        calls = []
+
+        def collide(*unused):
+            calls.append(unused)
+            return (impact,)
+
+        bigworld = types.SimpleNamespace(
+            wg_collideSegment=collide,
+            wg_getMatInfoNearPoint=(
+                lambda *unused: _mat_info_1513(False)))
+
+        distance = destructibles_sensor.shot_world_distance(
+            bigworld, 1, start, _Vector(0, 0, 20), _Vector(0, 0, 1))
+
+        self.assertEqual(5.0, distance)
+        self.assertEqual(1, len(calls))
+
+    def test_fall_pitch_payload_is_strictly_two_items(self):
+        manager = _Manager()
+        area = _authority_environment(manager)
+        with mock.patch.dict(sys.modules, {'AreaDestructibles': area}):
+            for payload in (None, (None,), (None, 0, 'extra')):
+                destructibles_authority.BigWorld.wg_getDestructibleFallPitchConstr = (
+                    lambda *unused, **unused_kwargs: payload)
+                with self.assertRaisesRegex(
+                        RuntimeError,
+                        'fall-pitch payload must contain 2 items'):
+                    destructibles_authority.destroy_tree(
+                        1, 22, 37, 0.0, 6.0, (10.0, 2.0, 20.0))
 
     def test_proximity_failure_is_retryable_and_uses_object_world_position(self):
         descriptor = {'type': 1, 'health': 10, 'mass': 20}

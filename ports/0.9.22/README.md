@@ -9,13 +9,13 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.47` replaces the old compatibility slice. It is a server-backed
+Version `0.3.48` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, the copied tactical-bot stack and repeatable rounds. The removed `vertical_slice.py`
 runtime is not packaged as a fallback.
 
-`0.3.47` installs one copied pose before native input startup and feeds that
+`0.3.48` installs one copied pose before native input startup and feeds that
 same provider to attached, own, camera, gun, sniper and minimap consumers. It
 gates native entity lookup by spotted/alive state, uses visible-pose descriptor
 collision for incoming fire, restores the native RPM channel, and presents
@@ -47,7 +47,9 @@ native destruction is committed only after #1513 accepts it. Combat events
 carry an explicit shot, fire, ram or non-attack cause; the marker receives the
 verified local vehicle identity after #1513 refreshes its initial zero ArenaDP
 cache, and friendly ramming no longer emits a projectile-hit or enemy-efficiency
-notification.
+notification. The #1513 material probe is decoded at one strict seven-field
+boundary, including its explicit no-hit flag, before the copied 0.8.2 contact
+law sees the result.
 
 The battle foundation now reuses the proven 0.8.2 behavior instead of a
 separate simplified implementation: the native countdown receives an advancing
@@ -370,8 +372,8 @@ python3 tools/bake_foliage_0922.py \
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.47.wotmod
-org.peng.offline_lan_0922_0.3.47.wotmod.sha256
+org.peng.offline_lan_0922_0.3.48.wotmod
+org.peng.offline_lan_0922_0.3.48.wotmod.sha256
 WoT-0.9.22-LAN-Client-<release hash>/
 WoT-0.9.22-LAN-Client-<release hash>.zip
 ```

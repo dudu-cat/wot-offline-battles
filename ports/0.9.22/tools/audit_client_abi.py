@@ -392,6 +392,15 @@ EXPECTED_ABI = {
         'DestructiblesManager.orderDestructibleDestroy': (
             'self', 'chunkID', 'dmgType', 'destrData',
             'isNeedAnimation', 'syncWithProjectile'),
+        'DestructiblesManager.__destroyDestructible': (
+            'self', 'chunkID', 'dmgType', 'destData',
+            'isNeedAnimation', 'explosionInfo'),
+    },
+    'scripts/client/helpers/EffectMaterialCalculation.pyc': {
+        'calcSurfaceMaterialNearPoint': (
+            'point', 'normal', 'spaceID', 'defaultEffectMaterial'),
+        'isDestructibleBroken': (
+            'chunkID', 'itemIndex', 'matKind', 'itemFilename'),
     },
     'scripts/common/DestructiblesCache.pyc': {
         'encodeFallenColumn': ('destrIndex', 'fallYaw', 'fallSpeed'),
@@ -991,6 +1000,13 @@ EXPECTED_CODE_NAMES = {
         'DestructiblesManager.orderDestructibleDestroy': (
             'DESTR_TYPE_FRAGILE', 'DESTR_TYPE_STRUCTURE',
             'decodeFragile', 'decodeDestructibleModule'),
+        'DestructiblesManager.__destroyDestructible': (
+            'wg_getDestructibleFallPitchConstr',),
+    },
+    'scripts/client/helpers/EffectMaterialCalculation.pyc': {
+        'calcSurfaceMaterialNearPoint': (
+            'BigWorld', 'wg_getMatInfoNearPoint',
+            'isDestructibleBroken'),
     },
     'scripts/common/DestructiblesCache.pyc': {
         'encodeFallenColumn': ('int', 'PI', 'PI_2'),
@@ -1331,12 +1347,21 @@ EXPECTED_UNPACK_WIDTHS = {
     'scripts/common/physics_shared.pyc': {
         'configurePhysicsMode': 3,
     },
+    'scripts/client/helpers/EffectMaterialCalculation.pyc': {
+        'calcSurfaceMaterialNearPoint': 7,
+    },
+    'scripts/client/AreaDestructibles.pyc': {
+        'DestructiblesManager.__destroyDestructible': 2,
+    },
 }
 
 EXPECTED_CALL_WIDTHS = {
     'scripts/client_common/ClientArena.pyc': {
         'ClientArena.__onBasePointsUpdate': 6,
         'ClientArena.__onBaseCaptured': 2,
+    },
+    'scripts/client/helpers/EffectMaterialCalculation.pyc': {
+        'calcSurfaceMaterialNearPoint': 5,
     },
 }
 

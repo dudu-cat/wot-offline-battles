@@ -97,9 +97,9 @@ PINNED_PORT_SHA256 = {
     'entities/remote_vehicle.py': '7a978301827cfecd3d183bae0d0172b828d17a12594e4ca01db7ee203cb85e56',
     'tank_collision.py': 'e5eaa7f69f88f22a5896f7b5b34031aea278083817c088cbf144de05cdc6d041',
     'vehicle_physics.py': 'e35bbb57611f0708191a1b04ab660379e4ec3d893bad9df816ee442597472441',
-    'destructibles_authority.py': 'e9a98d3bd3f30186407142a13cf8f1b035ac9f0c21ff02f46c76b9233b9943ea',
-    'destructibles_sensor.py': '3bff54f6fba81ab27411369acf89d709f96f5e23d880b453a110e680fcd34193',
-    'world_collision.py': '16275955d344c4e1254de93fd8e73c777e322af00b10fa714b62c8e117c53cd8',
+    'destructibles_authority.py': '14e7b22f114080cf4f1034b0bdc9ea8b5848ee6056247b74b5c95f12fd3b1d50',
+    'destructibles_sensor.py': 'a4f5a97f562d152413b22a7a00c6f930dc9eeb861463f5cb10c4a4acc20d47d6',
+    'world_collision.py': '693982f14420952ffb035b380af862e16a07959ab006df3f9d8f4ace62f4b9af',
 }
 PINNED_SERVER_SHA256 = {
     'server_bot_ai.py': '7b5724987c50497a9f0aa878e8cc103b14c0e9e1fdf3c489a78562ec114e625a',
@@ -885,6 +885,8 @@ def audit(repo_root):
         package, 'destructibles_authority.py'))
     for required in ('AreaDestructibles.encodeFragile(',
                      'bool(syncWithProjectile)',
+                     'pitchConstr, _collisionFlags = pc',
+                     '#1513 destructible fall-pitch payload must contain 2 items',
                      'destructible controller rollback is unsafe',
                      "c[prop].append(destrData)",
                      "c['keys'].add(dedupKey)"):
@@ -893,6 +895,7 @@ def audit(repo_root):
                 'destructibles_authority.py omits strict #1513 boundary: %s' %
                 required)
     if ('Fragiles take the RAW item index' in destructibles_authority or
+            'if pc is not None' in destructibles_authority or
             destructibles_authority.find("c['keys'].add(dedupKey)") <
             destructibles_authority.find(
                 'orderDestructibleDestroy(')):
@@ -905,6 +908,9 @@ def audit(repo_root):
     copied_solid = _function_at_any_indent(
         destructibles_sensor, '_try_destroy_solid_hit') or ''
     for required in ('def set_event_sink', 'def _publish_destroyed',
+                     'def _decode_mat_info_1513',
+                     '(collided, hitPt, surfNormal, matKind, fname,',
+                     'chunkID, itemIndex) = payload',
                      "'destructible_kind'", 'shot_yaw, 12.0, True',
                      'if not _destr_ok:', 'if not _ok:',
                      '_object_pos = Math.Vector3(_tx, _ty, _tz)',
@@ -920,6 +926,14 @@ def audit(repo_root):
             copied_fell.rfind('_publish_destroyed(')):
         errors.append(
             'destructibles_sensor.py retains a silent or premature success')
+    for forbidden in (
+            'hitPt, surfNormal, chunkID, itemIndex, matKind, fname = matInfo',
+            'if _mi is not None:',
+            'mat_info is not None and'):
+        if forbidden in destructibles_sensor:
+            errors.append(
+                'destructibles_sensor.py retains the 0.8.2 material-hit ABI: '
+                '%s' % forbidden)
     world_collision = _text(os.path.join(package, 'world_collision.py'))
     for required in (
             'def _check_horizontal_collision',
@@ -930,6 +944,9 @@ def audit(repo_root):
         if required not in world_collision:
             errors.append('world_collision.py omits copied/version-local '
                           'wall boundary: %s' % required)
+    if 'if matInfo:' in world_collision:
+        errors.append(
+            'world_collision.py treats the truthy #1513 miss payload as a hit')
     strict_descriptor_contracts = (
         (_text(os.path.join(package, 'internal_geometry.py')),
          ('if isinstance(value, dict)',

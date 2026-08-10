@@ -8,6 +8,32 @@ Only their former closure dependencies are supplied at module scope.
 _event_sink = None
 
 
+def _decode_mat_info_1513(payload):
+	"""Translate the pinned #1513 material-hit ABI to the 0.8.2 law.
+
+	The older engine returned six values and used ``None`` for a miss.  #1513
+	always returns seven values and carries the hit/miss bit in element zero.
+	Keeping that translation here lets the copied contact law retain its mature
+	internal field order without guessing at the native tuple shape.
+	"""
+	if not isinstance(payload, tuple):
+		raise RuntimeError(
+			'#1513 wg_getMatInfoNearPoint payload must be a tuple')
+	width = len(payload)
+	if width != 7:
+		raise RuntimeError(
+			'#1513 wg_getMatInfoNearPoint payload must contain 7 items; got %d' %
+			width)
+	(collided, hitPt, surfNormal, matKind, fname,
+	 chunkID, itemIndex) = payload
+	if type(collided) is not bool:
+		raise RuntimeError(
+			'#1513 wg_getMatInfoNearPoint collided flag must be bool')
+	if not collided:
+		return None
+	return hitPt, surfNormal, chunkID, itemIndex, matKind, fname
+
+
 def _descriptor_value(value, name, default=None):
 	"""Read copied mappings or native #1513 component attributes."""
 	if isinstance(value, dict):
@@ -85,12 +111,15 @@ def reset(spaceID=None):
 
 def _try_destroy_destructible(spaceID, matInfo, yaw, vel,
 		isShotDamage=False):
+	decoded = _decode_mat_info_1513(matInfo)
+	if decoded is None:
+		return False
 	import AreaDestructibles
 	if (not hasattr(AreaDestructibles, 'g_destructiblesManager') or
 			not AreaDestructibles.g_destructiblesManager):
 		raise RuntimeError('destructibles manager is unavailable')
 
-	hitPt, surfNormal, chunkID, itemIndex, matKind, fname = matInfo
+	hitPt, surfNormal, chunkID, itemIndex, matKind, fname = decoded
 	_dseen = globals().setdefault('g_offh_destr_seen', set())
 	_dkey = (matKind, fname)
 	if _dkey not in _dseen:
@@ -309,8 +338,7 @@ def _try_destroy_solid_hit(spaceID, seg_start, hit_pt, yaw, vel):
 		_seg_a = hit_pt + _dirv.scale(3.0)
 		_seg_b = hit_pt - _dirv.scale(2.0)
 		_mi = BigWorld.wg_getMatInfoNearPoint(spaceID, _seg_a, _seg_b, hit_pt, lambda *a: False)
-		if _mi is not None:
-			return _try_destroy_destructible(spaceID, _mi, yaw, vel)
+		return _try_destroy_destructible(spaceID, _mi, yaw, vel)
 	except Exception:
 		raise
 	return False
@@ -330,9 +358,8 @@ def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec):
 		spaceID, start_pos,
 		world_collision[0] + dir_vec.scale(0.3),
 		world_collision[0], lambda *unused: False)
-	if (mat_info is not None and
-			_try_destroy_destructible(
-				spaceID, mat_info, shot_yaw, 12.0, True)):
+	if _try_destroy_destructible(
+			spaceID, mat_info, shot_yaw, 12.0, True):
 		# Destructible broken by the shell: re-cast past the debris.
 		second = bigworld.wg_collideSegment(
 			spaceID, world_collision[0] + dir_vec.scale(0.6),

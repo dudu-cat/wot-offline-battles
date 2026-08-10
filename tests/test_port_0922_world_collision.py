@@ -62,6 +62,10 @@ class _Strict1513Component(object):
     values = _forbidden
 
 
+def _miss_mat_info_1513(*unused):
+    return False, _Vector(), _Vector(), 0, '', 0, 0
+
+
 class WorldCollisionTests(unittest.TestCase):
 
     def test_native_1513_hull_uses_attributes_without_mapping_protocol(self):
@@ -75,7 +79,7 @@ class WorldCollisionTests(unittest.TestCase):
 
         bigworld = types.SimpleNamespace(
             wg_collideSegment=collide,
-            wg_getMatInfoNearPoint=lambda *unused: None)
+            wg_getMatInfoNearPoint=_miss_mat_info_1513)
         math_module = types.SimpleNamespace(Vector3=_Vector)
         descriptor = _Strict1513Component(
             hull=_Strict1513Component(
@@ -102,7 +106,7 @@ class WorldCollisionTests(unittest.TestCase):
 
         bigworld = types.SimpleNamespace(
             wg_collideSegment=collide,
-            wg_getMatInfoNearPoint=lambda *unused: None)
+            wg_getMatInfoNearPoint=_miss_mat_info_1513)
         math_module = types.SimpleNamespace(Vector3=_Vector)
 
         blocked = world_collision.check_horizontal_collision(
@@ -124,7 +128,7 @@ class WorldCollisionTests(unittest.TestCase):
 
         bigworld = types.SimpleNamespace(
             wg_collideSegment=collide,
-            wg_getMatInfoNearPoint=lambda *unused: None)
+            wg_getMatInfoNearPoint=_miss_mat_info_1513)
         math_module = types.SimpleNamespace(Vector3=_Vector)
 
         blocked = world_collision.check_horizontal_collision(
@@ -143,7 +147,7 @@ class WorldCollisionTests(unittest.TestCase):
 
         bigworld = types.SimpleNamespace(
             wg_collideSegment=collide,
-            wg_getMatInfoNearPoint=lambda *unused: None)
+            wg_getMatInfoNearPoint=_miss_mat_info_1513)
         math_module = types.SimpleNamespace(Vector3=_Vector)
 
         with mock.patch.object(
