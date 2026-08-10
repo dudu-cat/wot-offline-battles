@@ -118,11 +118,14 @@ def _safe_import_offhangar():
 	#   paths/utils <- logging ; paths <- _constants ; paths/logging <- state ;
 	#   offline_battle_stack <- offline_battle ; data/router/battle/session guards
 	#   <- command_handlers ; command_router <- server
-	submodules = ['paths', 'utils', 'logging', '_constants', 'physics', 'physics_monitor',
+	submodules = ['paths', 'utils', 'logging', '_constants', 'physics', 'vehicle_collision', 'vehicle_pose', 'physics_monitor',
+	              'projectile_runtime',
 	              'bot_ai_maps_group_a', 'bot_ai_maps_group_b', 'bot_ai_maps_group_c',
 	              'bot_ai_maps_extra',
-	              'bot_ai_maps', 'bot_ai', 'bot_ai_navigation', 'bot_ai_cover',
-	              'bot_ai_driver',
+	              'bot_ai_maps', 'bot_ai', 'prebaked_navigation', 'battle_feedback',
+	              'vehicle_camouflage', 'spotting', 'foliage', 'prebaked_foliage',
+	              'bot_ai_navigation', 'bot_ai_cover',
+	              'bot_ai_driver', 'spectator_minimap',
 	              'state', 'session_guards', 'offline_battle_stack', 'offline_battle',
 	              'data', 'command_router', 'command_handlers', 'server',
 	              'destructibles_authority', 'pen_indicator', 'lan_settings', 'lan_waiting_room',
@@ -196,7 +199,7 @@ from gui.mods.offhangar.utils import *
 from gui.mods.offhangar._constants import *
 from gui.mods.offhangar.server import *
 
-LOG_NOTE('Offline Battles source loader active; LAN settings module enabled')
+LOG_NOTE('Offline Battles source loader active; LAN settings, prebaked navigation and foliage enabled')
 
 try:
 	from gui.mods.offhangar.lan_settings import install as _install_lan_settings
@@ -276,6 +279,21 @@ class _OfflineArenaStub(object):
 				try: delegate(*args, **kwargs)
 				except Exception as e:
 					LOG_DEBUG('EventStub Delegate Error', e)
+
+	def __setattr__(self, name, value):
+		# ``arena.onFoo += handler`` is a read-modify-write operation.  Python
+		# therefore writes the EventStub returned by __getattr__ back onto the
+		# arena after __iadd__.  If that becomes a normal instance attribute it
+		# escapes _event_stubs, so the persistent offline arena retains one new
+		# set of battle UI handlers (and all 30 vehicles they close over) every
+		# round.  Keep dynamic events in the registry on both the read and write
+		# sides so one cleanup path owns every delegate.
+		if name.startswith('on') and isinstance(value, self._EventStub):
+			events = self.__dict__.get('_event_stubs')
+			if events is not None:
+				events[name] = value
+				return
+		object.__setattr__(self, name, value)
 
 	def __init__(self):
 		self.vehicles = {}

@@ -6,8 +6,8 @@ map. Himmelsdorf was traced against the original ``04_himmelsdorf.pkg``
 minimap and its packed arena definition:
 
 * bounds: (-300, -300) -> (400, 400)
-* team 1 base: south, approximately (305, -306)
-* team 2 base: north, approximately (301, 301)
+* team 1 ctf base: south, approximately (-48, -303)
+* team 2 ctf base: north, approximately (17, 300)
 
 The routes are intentionally sparse macro waypoints. The existing multi-ray
 driver remains responsible for local obstacle avoidance between them.
@@ -18,8 +18,8 @@ HIMMELSDORF = {
 	'name': '04_himmelsdorf',
 	'bounds': (-300.0, -300.0, 400.0, 400.0),
 	'bases': {
-		1: (305.2, -306.4),
-		2: (300.7, 300.9),
+		1: (-47.5, -302.6),
+		2: (17.1, 300.0),
 	},
 	'routes': {
 		1: (
@@ -32,10 +32,12 @@ HIMMELSDORF = {
 					'sniper': 0.10, 'scout': 0.18, 'artillery': 0.00,
 				},
 				'waypoints': (
-					(300.0, -260.0, 0), (235.0, -220.0, 0),
-					(205.0, -150.0, 0), (185.0, -82.0, 1),
-					(178.0, 18.0, 1), (195.0, 112.0, 1),
-					(225.0, 218.0, 1), (278.0, 274.0, 0),
+					(-47.5, -300.0, 0), (70.0, -220.0, 0),
+					(165.0, -135.0, 0), (195.0, -80.0, 1),
+					(190.0, 90.0, 0), (225.0, 195.0, 0),
+					(220.0, 250.0, 0), (175.0, 285.0, 0),
+					(70.0, 315.0, 0),
+					(17.1, 300.0, 0),
 				),
 			},
 			{
@@ -47,10 +49,11 @@ HIMMELSDORF = {
 					'sniper': 0.18, 'scout': 0.72, 'artillery': 0.00,
 				},
 				'waypoints': (
-					(320.0, -260.0, 0), (346.0, -205.0, 0),
-					(365.0, -125.0, 0), (368.0, -42.0, 1),
-					(354.0, 52.0, 1), (335.0, 133.0, 1),
-					(320.0, 205.0, 1), (307.0, 265.0, 0),
+					(70.0, -280.0, 0), (250.0, -260.0, 0),
+					(365.0, -70.0, 1),
+					(365.0, 20.0, 1), (355.0, 100.0, 1),
+					(350.0, 180.0, 1), (250.0, 270.0, 0),
+					(170.0, 275.0, 0), (17.1, 300.0, 0),
 				),
 			},
 			{
@@ -62,27 +65,11 @@ HIMMELSDORF = {
 					'sniper': 1.00, 'scout': 0.88, 'artillery': 0.12,
 				},
 				'waypoints': (
-					(275.0, -264.0, 0), (170.0, -254.0, 0),
-					(42.0, -254.0, 0), (-92.0, -248.0, 0),
-					(-205.0, -220.0, 0), (-238.0, -142.0, 1),
-					(-248.0, -42.0, 1), (-250.0, 68.0, 1),
-					(-242.0, 184.0, 1), (-215.0, 276.0, 0),
-				),
-			},
-			{
-				'id': 'center',
-				'capacity': 3,
-				'risk': 0.55,
-				'role_weights': {
-					'brawler': 0.52, 'support': 1.00, 'flanker': 0.66,
-					'sniper': 0.58, 'scout': 0.48, 'artillery': 0.00,
-				},
-				'waypoints': (
-					(272.0, -258.0, 0), (190.0, -232.0, 0),
-					(108.0, -205.0, 0), (60.0, -143.0, 1),
-					(48.0, -70.0, 1), (50.0, 8.0, 1),
-					(65.0, 86.0, 1), (104.0, 174.0, 1),
-					(176.0, 244.0, 0),
+					(-120.0, -260.0, 0), (-210.0, -210.0, 0),
+					(-250.0, -100.0, 1),
+					(-250.0, 20.0, 1), (-235.0, 140.0, 1),
+					(-190.0, 230.0, 0), (-80.0, 285.0, 0),
+					(17.1, 300.0, 0),
 				),
 			},
 			{
@@ -93,7 +80,7 @@ HIMMELSDORF = {
 					'brawler': 0.00, 'support': 0.18, 'flanker': 0.00,
 					'sniper': 0.28, 'scout': 0.00, 'artillery': 1.00,
 				},
-				'waypoints': ((278.0, -270.0, 1),),
+				'waypoints': ((-80.0, -270.0, 1),),
 			},
 		),
 		2: (),
@@ -109,13 +96,13 @@ def _reverse_route(route):
 	return result
 
 
-# All four fighting corridors are bidirectional on this version of the map.
+# All three fighting corridors are bidirectional on this version of the map.
 # The rear guard is anchored separately because each base needs its own cover.
 _north_routes = []
 for _route in HIMMELSDORF['routes'][1]:
 	if _route['id'] == 'rear_guard':
 		_north = _reverse_route(_route)
-		_north['waypoints'] = ((280.0, 278.0, 1),)
+		_north['waypoints'] = ((45.0, 270.0, 1),)
 	else:
 		_north = _reverse_route(_route)
 	_north_routes.append(_north)

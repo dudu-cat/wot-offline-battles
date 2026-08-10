@@ -1,0 +1,4 @@
+Release: v1.0.1
+Game client: World of Tanks 0.8.2 (Windows)
+LAN protocol: 6
+Source commit: see the annotated v1.0.1 Git tag target

@@ -1,53 +1,34 @@
-# LAN battle server
+# LAN battle MVP
 
-This repository contains version-matched Python 3 LAN server entries for the
-0.8.2 offline client and the pinned Chinese 0.9.22.0.1 `#1513` port. A
-server-backed battle works with one connected player. The server owns the room,
-teams and slots, canonical health, deaths, accepted shot events and round
-phase. Clients retain the proprietary map queries, entity presentation and
-collision/armor work.
+This repository contains an optional LAN battle path for the 0.8.2 offline client.
+The normal offline mode remains available. The server-backed path also works
+with one connected player and reuses the existing garage, map loading, tank
+models, HUD and local driving code. A separate Python 3 process owns the shared
+roster, health, deaths, battle rules, global bot orders, static navigation-graph
+pathfinding and the relay for human/bot movement, firing and client-resolved
+armor impacts.
+
+The 0.9.22 port is self-contained under `ports/0.9.22`; use its
+version-local client, server, tests and [README](ports/0.9.22/README.md).
+Do not mix either port's client package or server protocol with the other.
 
 ## Start the server
 
-For the 0.9.22 port, run its version-local server on the machine that hosts the
-battle:
+Run this on the machine that hosts the battle:
 
 ```bash
-python3 ports/0.9.22/server/lan_battle_server.py --host 0.0.0.0 --port 28782 --map server_random
+python3 lan_battle_server.py --host 0.0.0.0 --port 28782
 ```
 
-The legacy 0.8.2 entry remains `python3 lan_battle_server.py ...`. Keep each
-client on the server entry from the same version checkpoint.
-
-`server_random` gives the room an initial random map.
-`--map 04_himmelsdorf` changes that initial selection. In 0.8.2, a waiting
-player can replace it through the custom queue panel. In 0.9.22, only the
-elected room host can replace it through the native map picker.
+With no `--map` argument, the server chooses the map initially highlighted in
+the waiting room. `--map 04_himmelsdorf` changes that initial selection; any
+waiting player can still choose another stock map before clicking start.
 
 Allow TCP port `28782` through the host firewall if clients are on another
 machine. Use the host machine's LAN address, for example `192.168.1.20`, in
 the client configuration.
 
-## Install a client
-
-### World of Tanks 0.9.22.0.1 #1513
-
-Use the hash-named folder built under `ports/0.9.22/dist/`, or the corresponding
-copy-ready deliverable. Close the game, remove older
-`org.peng.offline_lan_0922_*.wotmod` files, and merge its `mods` directory into
-the client root. Configure `mods/configs/offline_lan_0922/config.json` with the
-server's LAN address. Click the stock **Battle!** button to connect and join
-the waiting room. If the client is still connecting or retrying, click
-**Battle!** again to open the native settings window explicitly and edit the
-endpoint. The first accepted player becomes room host and receives that window
-as a local map picker. Later players remain in the garage; once the room is
-waiting, only the host selects the map and uses the window's primary action.
-See `ports/0.9.22/INSTALL.txt` for details.
-
-The 0.9.22 port always uses this server when enabled, including for one player.
-It does not have an old-AI or local-only fallback.
-
-### World of Tanks 0.8.2
+## Enable the client path
 
 Close the game and refresh each Windows client from this repository:
 
@@ -68,31 +49,6 @@ module runs inside the embedded Python 2 runtime shipped with the 0.8.2 client.
 
 ## Enter one battle together
 
-### World of Tanks 0.9.22.0.1 #1513
-
-1. Start the server and leave its terminal visible.
-2. Set every client's `mods/configs/offline_lan_0922/config.json` to the same
-   server IP and port.
-3. Click **Battle!** on every client. Each click joins the shared LAN waiting
-   room; it does not contact retail matchmaking or create a retail training
-   room.
-4. If a client is still connecting or retrying, click **Battle!** again to
-   open the native settings window and edit its endpoint. This pre-welcome
-   surface does not grant room-host authority.
-5. Confirm that the server printed one `JOIN` line for every client.
-6. The first waiting player is the room host and receives the native
-   training-settings map picker. Guests remain in the garage and wait.
-7. The host chooses a standard map and uses the picker's primary action. The
-   server prints `BATTLE START` and broadcasts that map and roster to every
-   waiting client. A single connected player may also start.
-
-If the waiting host disconnects, the server transfers ownership to the lowest
-connected player id and that client receives the picker. Guests cannot change
-the selected map or start the round. Closing the host picker leaves it closed;
-the host can reopen it by clicking **Battle!** again.
-
-### World of Tanks 0.8.2
-
 1. Start the server and leave its terminal visible.
 2. On every client, enable LAN mode with the same server IP and port.
 3. Click `Battle!` on every client. The queue screen opens only after the
@@ -107,21 +63,20 @@ the host can reopen it by clicking **Battle!** again.
 
 The start button appears after the server accepts the client and sends the
 `welcome` message.
-A connection made after `BATTLE START` is rejected until the round returns to
-the waiting room. This keeps the manifest at exactly 15 occupied human or bot
-slots per team.
+A client that connects after `BATTLE START` receives a `LATE JOIN` message and
+enters the current round on the same map.
 
 There is no independent client-side LAN countdown. A failed LAN connection
 does not silently fall back to a local random battle. Use the queue screen's
 cancel button to leave the waiting room.
 
-With normal 0.8.2 logging settings, each client writes these milestones to
+With normal logging settings, each client writes these milestones to
 `python.log`:
 
 ```text
 LAN connecting to 192.168.1.20:28782
 LAN TCP connected to 192.168.1.20:28782
-LAN hello sent (protocol 5)
+LAN hello sent (protocol 8, build 1.8.19-test-20260810)
 LAN welcome id=1 name=Player-158 vehicle=china:Type_59 team=1 slot=0 map=... phase=waiting
 LAN JOIN confirmed; queue screen is now server-backed
 LAN queue UI updated: 2 connected player(s)
@@ -129,15 +84,72 @@ LAN waiting room: 2 player(s); choose a map and click START BATTLE
 LAN BATTLE START received: map=... players=2 delay=0.75
 LAN bot authority: player_id=1 local=True
 LAN bot manifest received: 30 bot(s)
+LAN server-baked navigation waypoints active
 ```
 
 If the server prints no `TCP connection` line, the problem is before the
-protocol. For 0.9.22, verify that the client clicked **Battle!** and that its
-`config.json` contains the correct IP and port; clicking **Battle!** again while
-it retries opens the native endpoint editor. For 0.8.2, verify that LAN mode is
-ON. For either version, also check Parallels network mode and the server
-firewall. If the server prints a TCP connection followed by `protocol
-mismatch`, the client and server packages are from different builds.
+protocol: verify LAN mode is ON, the configured IP, Parallels network mode and
+the server firewall. If it prints a TCP connection followed by `protocol
+mismatch` or `client build mismatch`, replace the complete `0.8.2` folder on
+every PC and use the server from the same package.
+
+During a battle the server prints one compact bot-AI line every three seconds:
+
+```text
+BOT AI reports=t1:2,t2:3 accepted=5 contacts=t1:2/2,t2:3/3 targets=t1:8,t2:9 fire=t1:5,t2:6 modes=engage:17,route:12 nav=baked,cell:4000mm,nodes:16808 nav_total=direct:20,local:4,reactive:3 recovered:9 nav_active=direct:2,local:1,reactive:0 astar=pending:5,oldest:420ms,tick_age:0ms,done:41,failed:2 orders=server:18,client:18,loaded:29,acked:18 aim=targeted:17,aligned:6,traversing:11,limited:7,alive:29 driver=moving:24,drive:20,avoid:4,blocked:0,recovery:1,arrived:4,wait:0 safety=water:2/0,edge:5/1,veto:w0,t1,o0,e0
+BOT NAV active=True map=07_lakeville nodes=... plans=... direct=... cache=... complete=... partial=... pending=... failed=0 budget=.../...ms oldest=...ms avg=...ms max=...ms paths=...
+```
+
+`reports` is the authority client's current visible-contact count, `contacts`
+is visible/remembered state accepted by the server, `targets` is the number of
+bots with a combat target, and `fire` is the number currently authorized to
+shoot. `nav=baked` is direct proof that the shipped graph is active; `runtime`
+means a developer build fell back to live terrain probes because its graph was
+missing or rejected. Every stock map in the complete package should report
+`baked`. `nav_total` is cumulative while `nav_active`, `aim` and `driver` are
+current samples. `tick_age` reveals a stalled path scheduler. A healthy order
+pipeline has matching `orders` server/client/acked revisions and `loaded:29`;
+`wait` counts bots deliberately holding while an order body is being recovered.
+`safety` counts water rollbacks and baked-edge rollbacks as total/current.
+`BOT NAV active=True` proves that long static A* paths are being resolved by the
+Python 3 server rather than the 0.8.2 render thread. A cold search is advanced
+fairly across server ticks under a six-millisecond total budget; `pending` and
+`oldest` expose queue pressure without allowing one difficult route to stall
+networking. `partial` is safe forward progress that is automatically continued
+until the real order destination is reached. `failed=0` is expected for the
+shipped 33-map graph set; a non-zero value activates an explicit per-bot client
+fallback instead of reusing a stale waypoint.
+Each actual client-simulated shot also prints `BOT FIRE`. This separates
+spotting, delivery, navigation and client execution without enabling verbose
+client debug logging.
+
+Long terrain routes use bounded weighted-A* continuations instead of one large
+search per bot. Moving tanks are handled by the local driver and are not baked
+into the shared static path cache. Water deeper than 90 cm is a hard navigation
+boundary. Water from 12 cm through 90 cm is marked as a high-cost shallow ford,
+so a bot uses a required ford but strongly prefers a dry route. Runtime steering,
+cover and peek safety use the same deep-water limit.
+
+If a snapshot cannot be delivered, the server prints `SEND DROP` with the
+player and socket error before removing that connection. An unexpected tick
+exception prints `BATTLE TICK ERROR (server remains running)` and does not kill
+the server's battle loop silently. Either line is actionable evidence to include
+with the client `python.log` when reporting a frozen ping/lag indicator.
+
+During a battle each client also writes one compact transport summary every
+five seconds:
+
+```text
+LAN NET window=5.0s chunks=... messages=... snapshots=... bot_updates=... max_socket_gap=... max_snapshot_gap=... max_bot_gap=... max_queue_age=... max_pending=... rtt=...
+```
+
+`max_socket_gap` is measured by the socket thread and exposes a real delivery
+pause. `max_queue_age` means data had already reached the machine but the game
+thread applied it late. `snapshots` is the server delivery rate, while
+`bot_updates` is how often the elected authority actually supplied a new bot
+pose. These fields distinguish LAN trouble, a delayed server stream, an
+overloaded authority client, and a blocked local game thread without enabling
+per-packet logging.
 
 In battle, opposing LAN humans use the same local 50 m proximity spot,
 view-range/terrain line-of-sight check, allied vision and five-second spot
@@ -170,21 +182,18 @@ map list; the clicked waiting-room selection is authoritative for the round.
 ## Current protocol boundary
 
 The server speaks a small newline-delimited JSON protocol, not the original
-Wargaming/BigWorld server protocol. Protocol v5 has one waiting room per server
-process and a server-authoritative `battle_start` barrier. The first client in
-an empty room pins that room to either the legacy `wot-0.8.2` profile or the
-exact `wot-0.9.22.0.1-cn-1513` profile. Existing 0.8.2 packages send no
-`client_build` field and remain supported; the 0.9.22 package declares its
-build explicitly. A different build is rejected until the room is empty. This
-is required because the two clients use different coordinate frames, vehicle
-names and installed map sets. The server advertises and validates the pinned
-build's map pool (33 maps for 0.8.2, 42 for 0.9.22), so neither client can select
-a map resource it does not have. Run a second server process on another port if
-both builds must host rooms simultaneously. It synchronizes
+Wargaming/BigWorld server protocol. Protocol v8 has one waiting room per server
+process and a server-authoritative `battle_start` barrier. The server fixes one
+30-second combat deadline and continuously includes remaining battle time in
+the 30 Hz snapshots. Each client closes the normal loading page on its own and
+joins the remaining shared countdown instead of starting a new local timer.
+The exact lineup descriptors and collision resources are prepared behind that
+loading page; native bot entities are then staged while the countdown is
+visible, without holding the client on `Awaiting players`. It synchronizes
 player identity, selected vehicle, opposing team, position, hull/turret aim,
 shell selection, firing, impact outcome, health and death.
-The firing client reuses its local map collision, shell and armor calculation
-and reports that result; the server validates and owns the shared
+The firing client reuses the existing 0.8.2 map collision, shell and armor
+calculation and reports that result; the server validates and owns the shared
 HP result. Damage caused by local bots, fire, drowning and collisions is
 reported downward by the affected client so other players see the resulting
 health and death state. Generic
@@ -201,12 +210,19 @@ contacts observed through client-side range and terrain line-of-sight checks.
 The server retains last-known contacts, reserves targets across the team,
 advances uploaded routes, shifts at most one adaptable tank toward a pressured
 lane, chooses combat mode and shell, and emits monotonic revisioned bot orders.
+Order bodies use an application-level acknowledgement and bounded retransmit;
+the client keeps its last executable revision and requests a resync rather than
+clearing every bot to an accidental local hold when a busy frame coalesces
+snapshots.
 For nearby visible contacts the authority also probes a bounded fan of
 drivable, dry, low-slope cover and peek points. The server validates those
 points against the bot's shared pose, scores them by role/personality, reserves
 them across the team, and controls the approach/hold/peek/return cycle. The
-authority client executes those orders with its real map collision, local
-driver, armor and shell systems, then publishes canonical pose/fire/HP state.
+server resolves each movement order through the shipped static navigation
+graph with resumable, per-tick-budgeted weighted A* and includes a short
+canonical waypoint in every snapshot. The authority client
+executes that waypoint with the real map collision, local driver, armor and
+shell systems, then publishes canonical pose/fire/HP state.
 Every client therefore renders the same population and combat result. If the
 authority disconnects, the server elects the next player, preserves canonical
 bot/HP/rules state, and clears the departed client's short-lived contacts and
@@ -215,21 +231,16 @@ authority publishes
 base-capture progress, capture interruption and the final winner/reason for
 capture, team elimination or timer expiry. The server remains the shared
 source of truth for HP and the final battle result.
-
-The 0.9.22 authority now reports bounded visibility observations and consumes
-the server planner's revisioned global `bot_orders` as macro targets. It still
-owns BigWorld terrain queries and local collision/water/slope avoidance, and
-falls back to its local planner when no server order is available. Its standard
-battles end by team elimination and reset to the waiting room after three
-seconds; base capture is not implemented there.
+The top HUD score is recomputed from the same canonical alive/dead roster after
+every death, including shells, fire, collisions and drowning, rather than from
+client-local frag side effects.
 
 ### Bot planner portability boundary
 
-`ports/0.9.22/server/server_bot_ai.py` and the cover scorer it shares with the
-port client are
-intentionally pure data: neither imports BigWorld or touches a client runtime.
+`server_bot_ai.py`, `server_bot_navigation.py` and the data-only navigation
+graph reader shared with the client are intentionally independent of BigWorld.
 Their inputs and outputs are JSON-compatible dictionaries carried by protocol
-v5:
+v8:
 
 - `bot_manifest`: identity, team, vehicle profile, shell profiles and sparse
   route waypoints;
@@ -241,6 +252,8 @@ v5:
   combat mode, throttle override and shell index, guarded by
   `bot_order_revision`. A snapshot includes the order list only when that
   revision is new for its recipient.
+- snapshot navigation fields: `nav_source`, `nav_order_revision` and a short
+  canonical `nav_x/nav_y/nav_z` waypoint resolved from the static graph.
 
 This boundary is suitable for replacing the Python server planner with Go
 without moving proprietary map queries or BigWorld entity control off the
@@ -257,7 +270,7 @@ retail server's authoritative physics, complete cross-client module/crew
 state, reconnection recovery, anti-cheat, NAT traversal or internet-safe
 authentication. Keep it on a trusted LAN while testing.
 
-## Disable or roll back 0.8.2
+## Disable or roll back
 
 Set `network_mode` back to `false` to return to the original offline path. The
 Git baseline before the LAN changes is:

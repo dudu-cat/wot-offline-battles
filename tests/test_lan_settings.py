@@ -11,6 +11,19 @@ SETTINGS_PATH = ROOT / "scripts/client/gui/mods/offhangar/lan_settings.py"
 
 def load_settings_module():
     roots = []
+    cursor_calls = []
+
+    class MouseCursor:
+        def __init__(self):
+            self._visible = False
+
+        @property
+        def visible(self):
+            return self._visible
+
+        @visible.setter
+        def visible(self, value):
+            self._visible = bool(value)
 
     class Component:
         def __init__(self, texture=None):
@@ -29,6 +42,8 @@ def load_settings_module():
     gui_engine.Text = Component
     gui_engine.addRoot = lambda component: roots.append(component)
     gui_engine.reSort = lambda: None
+    mouse_cursor = MouseCursor()
+    gui_engine.mcursor = lambda: mouse_cursor
     sys.modules["GUI"] = gui_engine
 
     player = types.SimpleNamespace(isOffline=True, _offhangar_network_client=None)
@@ -38,6 +53,17 @@ def load_settings_module():
     bigworld.setCursor = lambda cursor: None
     bigworld.dcursor = lambda: object()
     sys.modules["BigWorld"] = bigworld
+
+    keys = types.ModuleType("Keys")
+    keys.KEY_F11 = 87
+    keys.KEY_LEFTMOUSE = 256
+    keys.KEY_ESCAPE = 1
+    keys.KEY_TAB = 15
+    keys.KEY_BACKSPACE = 14
+    keys.KEY_SPACE = 57
+    keys.KEY_RETURN = 28
+    keys.KEY_1 = 2
+    sys.modules["Keys"] = keys
 
     for name in ("gui", "gui.mods", "gui.mods.offhangar"):
         package = types.ModuleType(name)
@@ -58,9 +84,8 @@ def load_settings_module():
     logging.LOG_ERROR = lambda *args: None
     sys.modules[logging.__name__] = logging
 
-    cursor_calls = []
     cursor = types.ModuleType("gui.Cursor")
-    cursor.showCursor = lambda visible: cursor_calls.append(visible)
+    cursor.showCursor = lambda visible: cursor_calls.append(bool(visible))
     sys.modules[cursor.__name__] = cursor
 
     notices = []
@@ -98,6 +123,7 @@ class LANSettingsTest(unittest.TestCase):
         self.assertEqual("PIXEL", self.settings._panel.widthMode)
         self.assertEqual((720, 360), (self.settings._panel.width, self.settings._panel.height))
         self.assertEqual([self.settings._panel], self.roots)
+        self.assertTrue(self.settings._panel.focus)
         self.assertTrue(
             all(control.parent is self.settings._panel for control in self.settings._controls.values())
         )
@@ -127,6 +153,27 @@ class LANSettingsTest(unittest.TestCase):
         self.assertTrue(all(not control.visible for control in self.settings._controls.values()))
         self.assertTrue(all(not label.visible for label in self.settings._labels.values()))
 
+    def test_garage_entry_shows_a_native_cursor_only_while_hovered(self):
+        self.assertTrue(self.settings._make_entry())
+        script = self.settings._entry_panel.script
+
+        script.handleMouseEnterEvent(self.settings._entry_panel)
+        self.assertEqual([True], self.cursor_calls)
+
+        script.handleMouseLeaveEvent(self.settings._entry_panel)
+        self.assertEqual([True, False], self.cursor_calls)
+
+    def test_clicking_hovered_entry_transfers_one_cursor_lease_to_panel(self):
+        self.assertTrue(self.settings._make_entry())
+        script = self.settings._entry_panel.script
+
+        script.handleMouseEnterEvent(self.settings._entry_panel)
+        script.handleMouseClickEvent(self.settings._entry_panel)
+
+        self.assertEqual([True], self.cursor_calls)
+        self.settings.close()
+        self.assertEqual([True, False], self.cursor_calls)
+
     def test_clicking_a_field_makes_the_first_typed_digit_replace_it(self):
         self.settings.open()
         self.settings._controls["host"].script.handleMouseClickEvent(
@@ -153,6 +200,26 @@ class LANSettingsTest(unittest.TestCase):
         message, level = self.notices[-1]
         self.assertIn(b"Invalid IP", message)
         self.assertEqual("error", level)
+
+    def test_active_panel_only_consumes_keyboard_actions_it_handles(self):
+        class Event:
+            def __init__(self, key, down=True):
+                self.key = key
+                self.down = down
+
+            def isKeyDown(self):
+                return self.down
+
+        self.settings.open()
+
+        # BigWorld reports mouse buttons through the same global key callback.
+        # They must continue to GUI.Simple so its click script can run.
+        self.assertFalse(self.settings.handle_key_event(Event(256, True)))
+        self.assertFalse(self.settings.handle_key_event(Event(256, False)))
+        self.assertFalse(self.settings.handle_key_event(Event(9999, True)))
+
+        self.assertTrue(self.settings.handle_key_event(Event(15, True)))
+        self.assertEqual(1, self.settings._field)
 
 
 if __name__ == "__main__":

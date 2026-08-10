@@ -17,9 +17,11 @@ import time
 import BigWorld
 
 from gui.mods.offhangar.logging import LOG_DEBUG, LOG_ERROR, LOG_NOTE
+from gui.mods.offhangar import vehicle_pose
 
 
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 8
+CLIENT_BUILD = '1.8.19-test-20260810'
 POLL_INTERVAL = 1.0 / 60.0
 INPUT_INTERVAL = 1.0 / 30.0
 BOT_STATE_INTERVAL = 1.0 / 30.0
@@ -87,6 +89,13 @@ def _finite_float(value, fallback=0.0):
 	except Exception:
 		pass
 	return value
+
+
+def _network_perf_clock():
+	try:
+		return time.clock()
+	except Exception:
+		return time.time()
 
 
 def _safe_text(value, limit=80):
@@ -167,7 +176,21 @@ class LANClient(object):
 		self.waiting_count = 0
 		self.start_requested = False
 		self.battle_started = False
+		self.combat_deadline = None
+		self.combat_end_deadline = None
+		self.combat_duration = 900.0
 		self._send_lock = threading.Lock()
+		# Wire encoding and sendall used to run on BigWorld's render thread.
+		# A full 30-bot snapshot can take several milliseconds to JSON-encode and
+		# occasionally much longer when the socket back-pressures, directly turning
+		# keyboard polling into a 10 FPS affair on the authority client.  Keep a
+		# tiny ordered/coalescing queue here and let a dedicated sender own that work.
+		self._outbound_lock = threading.Lock()
+		self._outbound_event = threading.Event()
+		self._outbound_reliable = []
+		self._outbound_latest = {}
+		self._outbound_seq = 0
+		self._sender_thread = None
 		self._pending_lock = threading.Lock()
 		self._pending = []
 		self._recv_buffer = ''
@@ -180,9 +203,28 @@ class LANClient(object):
 		self._last_receive = 0.0
 		self._last_snapshot = 0.0
 		self.rtt_ms = None
+		self._diag_window_start = time.time()
+		self._diag_chunks = 0
+		self._diag_messages = 0
+		self._diag_snapshots = 0
+		self._diag_bot_updates = 0
+		self._diag_last_chunk = 0.0
+		self._diag_last_snapshot = 0.0
+		self._diag_last_bot_update = 0.0
+		self._diag_last_bot_revision = -1
+		self._diag_max_socket_gap = 0.0
+		self._diag_max_snapshot_gap = 0.0
+		self._diag_max_bot_update_gap = 0.0
+		self._diag_max_queue_age = 0.0
+		self._diag_max_pending = 0
+		self._diag_poll_seconds = 0.0
+		self._diag_poll_calls = 0
+		self._diag_snapshot_apply_seconds = 0.0
+		self._diag_snapshot_apply_calls = 0
 		self.bot_authority_id = None
 		self.bot_order_revision = 0
 		self.bot_orders = {}
+		self._last_order_resync = 0.0
 		self._last_error = None
 		self._error_notified = False
 		self._stop_requested = False
@@ -211,15 +253,28 @@ class LANClient(object):
 				pass
 			sock.settimeout(0.5)
 			self.sock = sock
-			self.connected = True
-			self._send({
+			# The server requires hello to be the first wire message.  Do not expose
+			# the socket to the main-thread poller before that message is sent: its
+			# initial ping could otherwise win the race and be rejected as a protocol
+			# mismatch.
+			hello = {
 				'type': 'hello',
 				'protocol': PROTOCOL_VERSION,
+				'client_build': CLIENT_BUILD,
 				'name': self.name,
 				'vehicle': self.vehicle,
 				'max_health': self.max_health,
-			})
-			LOG_NOTE('LAN hello sent (protocol %s)' % PROTOCOL_VERSION)
+			}
+			payload = (json.dumps(hello, separators=(',', ':')) + '\n').encode('utf-8')
+			with self._send_lock:
+				sock.sendall(payload)
+			self.connected = True
+			self._sender_thread = threading.Thread(
+				target=self._sender_worker, name='offhangar-lan-sender')
+			self._sender_thread.setDaemon(True)
+			self._sender_thread.start()
+			LOG_NOTE('LAN hello sent (protocol %s, build %s)' % (
+				PROTOCOL_VERSION, CLIENT_BUILD))
 			while self.running:
 				try:
 					chunk = sock.recv(8192)
@@ -229,7 +284,16 @@ class LANClient(object):
 					if self.connected and not self._stop_requested:
 						self._last_error = 'server closed the connection'
 					break
-				self._last_receive = time.time()
+				received_time = time.time()
+				self._last_receive = received_time
+				with self._pending_lock:
+					self._diag_chunks += 1
+					previous_receive = self._diag_last_chunk
+					if previous_receive > 0.0:
+						self._diag_max_socket_gap = max(
+							self._diag_max_socket_gap,
+							received_time - previous_receive)
+					self._diag_last_chunk = received_time
 				try:
 					self._recv_buffer += chunk.decode('utf-8')
 				except UnicodeError:
@@ -245,8 +309,35 @@ class LANClient(object):
 						message = json.loads(line)
 					except (TypeError, ValueError):
 						continue
+					if isinstance(message, dict):
+						# This private timestamp lets RTT and diagnostics distinguish actual
+						# socket delay from a busy BigWorld game thread draining the queue late.
+						message['_client_received_time'] = received_time
 					with self._pending_lock:
 						self._pending.append(message)
+						self._diag_messages += 1
+						if isinstance(message, dict) and message.get('type') == 'snapshot':
+							if self._diag_last_snapshot > 0.0:
+								self._diag_max_snapshot_gap = max(
+									self._diag_max_snapshot_gap,
+									received_time - self._diag_last_snapshot)
+							self._diag_last_snapshot = received_time
+							self._diag_snapshots += 1
+							try:
+								bot_revision = int(message.get('bot_state_revision', -1))
+							except (TypeError, ValueError):
+								bot_revision = -1
+							if (bot_revision >= 0 and
+									bot_revision != self._diag_last_bot_revision):
+								if self._diag_last_bot_update > 0.0:
+									self._diag_max_bot_update_gap = max(
+										self._diag_max_bot_update_gap,
+										received_time - self._diag_last_bot_update)
+								self._diag_last_bot_update = received_time
+								self._diag_last_bot_revision = bot_revision
+								self._diag_bot_updates += 1
+						self._diag_max_pending = max(
+							self._diag_max_pending, len(self._pending))
 		except Exception as error:
 			if not self._stop_requested:
 				self._last_error = str(error)
@@ -254,21 +345,90 @@ class LANClient(object):
 		finally:
 			self.connected = False
 			self.running = False
+			self._outbound_event.set()
 			try:
 				if self.sock is not None:
 					self.sock.close()
 			except Exception:
 				pass
 
-	def _send(self, message):
+	def _send_wire(self, message):
+		"""Encode and write one message from the sender thread."""
 		if not self.connected or self.sock is None:
 			return False
 		try:
 			payload = (json.dumps(message, separators=(',', ':')) + '\n').encode('utf-8')
 			if len(payload) > MAX_MESSAGE_BYTES:
-				return False
+				self._last_error = 'client message exceeded wire limit'
+				LOG_ERROR('LAN outbound message dropped: type=%s bytes=%d limit=%d' % (
+					str(message.get('type', '?')), len(payload), MAX_MESSAGE_BYTES))
+				return None
 			with self._send_lock:
 				self.sock.sendall(payload)
+			return True
+		except Exception as error:
+			self._last_error = str(error)
+			return False
+
+	def _dequeue_outbound(self):
+		"""Pop the oldest logical message while preserving coalesced ordering."""
+		with self._outbound_lock:
+			reliable = self._outbound_reliable[0] if self._outbound_reliable else None
+			latest_key = None
+			latest = None
+			for key, item in self._outbound_latest.items():
+				if latest is None or item[0] < latest[0]:
+					latest_key, latest = key, item
+			if reliable is None and latest is None:
+				return None
+			if latest is None or (reliable is not None and reliable[0] <= latest[0]):
+				return self._outbound_reliable.pop(0)[1]
+			del self._outbound_latest[latest_key]
+			return latest[1]
+
+	def _sender_worker(self):
+		while self.running or self._outbound_reliable or self._outbound_latest:
+			message = self._dequeue_outbound()
+			if message is None:
+				self._outbound_event.clear()
+				# Close the enqueue/clear race: an enqueue between dequeue and clear
+				# must wake us instead of sleeping until the next unrelated packet.
+				with self._outbound_lock:
+					pending = bool(self._outbound_reliable or self._outbound_latest)
+				if pending:
+					self._outbound_event.set()
+					continue
+				self._outbound_event.wait(0.1)
+				continue
+			if self._send_wire(message) is False:
+				if not self._stop_requested:
+					self.running = False
+				break
+
+	def _send(self, message, coalesce_key=None):
+		"""Queue a message without blocking BigWorld's render/input thread.
+
+		Level-triggered input, bot-state and observation packets replace an older
+		unsent packet of the same kind.  Sequence numbers keep that replacement in
+		the right order relative to reliable fire/hit/control messages.
+		"""
+		if not self.connected or self.sock is None:
+			return False
+		try:
+			# Preserve the old synchronous rejection for obviously impossible text
+			# messages without serializing every 30 Hz state packet on BigWorld's
+			# render thread. Production packet builders bound all nested collections.
+			for value in message.values():
+				if isinstance(value, _TEXT_TYPES) and len(value) >= MAX_MESSAGE_BYTES:
+					return False
+			with self._outbound_lock:
+				self._outbound_seq += 1
+				item = (self._outbound_seq, message)
+				if coalesce_key is None:
+					self._outbound_reliable.append(item)
+				else:
+					self._outbound_latest[coalesce_key] = item
+			self._outbound_event.set()
 			return True
 		except Exception as error:
 			self._last_error = str(error)
@@ -295,7 +455,7 @@ class LANClient(object):
 			message['yaw'] = _finite_float(yaw)
 		if reported_health is not None:
 			message['reported_health'] = max(0, int(reported_health))
-		self._send(message)
+		self._send(message, 'input')
 
 	def send_fire(self, shell_index=0, position=None, yaw=None, aim_yaw=None,
 			gun_pitch=None):
@@ -334,28 +494,54 @@ class LANClient(object):
 			message['z'] = _finite_float(impact_position[2])
 		return self._send(message)
 
-	def send_bot_manifest(self, bots):
-		return self._send({'type': 'bot_manifest', 'bots': bots[:30]})
+	def send_bot_manifest(self, bots, map_frame=None):
+		message = {'type': 'bot_manifest', 'bots': bots[:30]}
+		if map_frame is not None:
+			message['map_frame'] = map_frame
+		return self._send(message)
 
 	def send_bot_states(self, bots):
 		now = time.time()
 		if now - self._last_bot_state < BOT_STATE_INTERVAL:
 			return False
 		self._last_bot_state = now
-		return self._send({'type': 'bot_state', 'bots': bots[:30]})
+		return self._send({'type': 'bot_state', 'bots': bots[:30]}, 'bot_state')
 
-	def send_bot_observation(self, contacts, affordances=None):
+	def bot_states_due(self):
+		"""Return whether building the next authoritative snapshot is useful."""
+		return time.time() - self._last_bot_state >= BOT_STATE_INTERVAL
+
+	def send_bot_observation(self, contacts, affordances=None, navigation=None):
 		now = time.time()
 		if now - self._last_bot_observation < 0.45:
 			return False
-		sent = self._send({
+		message = {
 			'type': 'bot_observation',
 			'contacts': contacts[:64],
 			'affordances': (affordances or ())[:16],
-		})
+		}
+		if navigation is not None:
+			message['navigation'] = navigation
+		sent = self._send(message)
 		if sent:
 			self._last_bot_observation = now
 		return sent
+
+	def bot_observation_due(self):
+		"""Avoid rebuilding a full telemetry payload while its send is throttled."""
+		return time.time() - self._last_bot_observation >= 0.45
+
+	def request_bot_orders(self):
+		"""Rate-limited application-level recovery for a missing bot order."""
+		now = time.time()
+		if now - self._last_order_resync < 0.5:
+			return False
+		self._last_order_resync = now
+		return self._send({
+			'type': 'bot_order_resync',
+			'revision': int(self.bot_order_revision or 0),
+			'loaded': len(self.bot_orders or {}),
+		})
 
 	def send_bot_hit(self, target_id, shot_seq, damage, shot_result,
 			impact_position=None):
@@ -407,12 +593,44 @@ class LANClient(object):
 		changed = authority_id != self.bot_authority_id
 		self.bot_authority_id = authority_id
 		self.player._offhangar_network_authority_id = authority_id
+		was_authority = bool(getattr(
+			self.player, '_offhangar_network_is_authority', False))
 		self.player._offhangar_network_is_authority = (
 			authority_id is not None and authority_id == self.player_id)
+		if self.player._offhangar_network_is_authority and not was_authority:
+			# The next canonical snapshot must be applied once before this client
+			# begins simulating. Otherwise a relay promotes its interpolated pose and
+			# zero local speed instead of the server's final authority state.
+			self.player._offhangar_network_authority_handoff_pending = True
 		if changed and self.phase == 'battle':
 			role = 'simulation authority' if self.player._offhangar_network_is_authority else 'relay client'
 			LOG_NOTE('LAN bot authority=%s; local role=%s' % (authority_id, role))
 			_system_message('LAN battle authority: player %s (%s).' % (authority_id, role))
+
+	def _load_bot_orders(self, message):
+		"""Apply a complete revision body and acknowledge game-thread delivery."""
+		if not isinstance(message, dict) or 'bot_orders' not in message:
+			return False
+		try:
+			revision = int(message.get('bot_order_revision', 0) or 0)
+		except (TypeError, ValueError):
+			return False
+		if revision < self.bot_order_revision:
+			return False
+		if (revision > self.bot_order_revision or
+				(revision == 0 and not self.bot_orders)):
+			orders = {}
+			for order in message.get('bot_orders') or ():
+				try:
+					orders[int(order.get('id'))] = order
+				except Exception:
+					continue
+			self.bot_order_revision = revision
+			self.bot_orders = orders
+			self.player._offhangar_network_bot_order_revision = revision
+			self.player._offhangar_network_bot_orders = orders
+		self._send({'type': 'bot_order_ack', 'revision': revision})
+		return True
 
 	def request_start(self, map_name=None):
 		if not self.ready or self.phase != 'waiting':
@@ -430,8 +648,14 @@ class LANClient(object):
 
 	def stop(self):
 		self._stop_requested = True
+		# Best effort, synchronously, before stopping the sender and closing the
+		# socket.  Enqueuing after running=False can legitimately lose the leave.
+		try:
+			self._send_wire({'type': 'leave'})
+		except Exception:
+			pass
 		self.running = False
-		self._send({'type': 'leave'})
+		self._outbound_event.set()
 		try:
 			if self.sock is not None:
 				self.sock.close()
@@ -447,7 +671,69 @@ class LANClient(object):
 		except Exception:
 			self._poll_scheduled = False
 
+	def _reset_transport_diagnostics(self, now=None):
+		now = time.time() if now is None else float(now)
+		with self._pending_lock:
+			self._diag_window_start = now
+			self._diag_chunks = 0
+			self._diag_messages = 0
+			self._diag_snapshots = 0
+			self._diag_bot_updates = 0
+			self._diag_last_chunk = 0.0
+			self._diag_last_snapshot = 0.0
+			self._diag_last_bot_update = 0.0
+			self._diag_last_bot_revision = -1
+			self._diag_max_socket_gap = 0.0
+			self._diag_max_snapshot_gap = 0.0
+			self._diag_max_bot_update_gap = 0.0
+			self._diag_max_queue_age = 0.0
+			self._diag_max_pending = 0
+			self._diag_poll_seconds = 0.0
+			self._diag_poll_calls = 0
+			self._diag_snapshot_apply_seconds = 0.0
+			self._diag_snapshot_apply_calls = 0
+
+	def _transport_diagnostic_snapshot(self, now=None, minimum_window=5.0):
+		"""Return one bounded transport summary and reset its rolling counters."""
+		now = time.time() if now is None else float(now)
+		with self._pending_lock:
+			window = max(0.0, now - self._diag_window_start)
+			if window < float(minimum_window):
+				return None
+			result = {
+				'window': window,
+				'chunks': self._diag_chunks,
+				'messages': self._diag_messages,
+				'snapshots': self._diag_snapshots,
+				'bot_updates': self._diag_bot_updates,
+				'max_socket_gap': self._diag_max_socket_gap,
+				'max_snapshot_gap': self._diag_max_snapshot_gap,
+				'max_bot_update_gap': self._diag_max_bot_update_gap,
+				'max_queue_age': self._diag_max_queue_age,
+				'max_pending': self._diag_max_pending,
+				'poll_seconds': self._diag_poll_seconds,
+				'poll_calls': self._diag_poll_calls,
+				'snapshot_apply_seconds': self._diag_snapshot_apply_seconds,
+				'snapshot_apply_calls': self._diag_snapshot_apply_calls,
+			}
+			self._diag_window_start = now
+			self._diag_chunks = 0
+			self._diag_messages = 0
+			self._diag_snapshots = 0
+			self._diag_bot_updates = 0
+			self._diag_max_socket_gap = 0.0
+			self._diag_max_snapshot_gap = 0.0
+			self._diag_max_bot_update_gap = 0.0
+			self._diag_max_queue_age = 0.0
+			self._diag_max_pending = len(self._pending)
+			self._diag_poll_seconds = 0.0
+			self._diag_poll_calls = 0
+			self._diag_snapshot_apply_seconds = 0.0
+			self._diag_snapshot_apply_calls = 0
+			return result
+
 	def _poll(self):
+		poll_started = _network_perf_clock()
 		self._poll_scheduled = False
 		now = time.time()
 		if self.connected and now - self._last_ping >= PING_INTERVAL:
@@ -459,29 +745,132 @@ class LANClient(object):
 			if self._pending:
 				messages = self._pending
 				self._pending = []
+			for message in messages:
+				if isinstance(message, dict):
+					received_time = _finite_float(
+						message.get('_client_received_time'), now)
+					self._diag_max_queue_age = max(
+						self._diag_max_queue_age, now - received_time)
 		# Snapshots are level-triggered.  If the game thread was busy loading a
 		# remote tank, applying every stale 30 Hz snapshot would create an
 		# unbounded queue and make the visual state increasingly lag behind.
 		latest_snapshot = None
+		order_payloads = {}
 		coalesced = []
 		for message in messages:
 			if isinstance(message, dict) and message.get('type') == 'snapshot':
+				if 'bot_orders' in message:
+					try:
+						order_revision = int(message.get('bot_order_revision', 0) or 0)
+					except (TypeError, ValueError):
+						order_revision = 0
+					order_payloads[order_revision] = message.get('bot_orders') or []
 				latest_snapshot = message
 			else:
 				coalesced.append(message)
 		if latest_snapshot is not None:
+			# The server sends an order body only once per revision, while snapshots
+			# are coalesced to the newest state on the game thread. Preserve the body
+			# from an earlier snapshot of the same revision; otherwise a busy frame
+			# keeps the new revision number but silently clears every bot order.
+			try:
+				latest_revision = int(
+					latest_snapshot.get('bot_order_revision', 0) or 0)
+			except (TypeError, ValueError):
+				latest_revision = 0
+			if ('bot_orders' not in latest_snapshot and
+					latest_revision in order_payloads):
+				latest_snapshot = dict(latest_snapshot)
+				latest_snapshot['bot_orders'] = order_payloads[latest_revision]
 			coalesced.append(latest_snapshot)
 		messages = coalesced
 		for message in messages:
+			message_kind = (message.get('type')
+			                if isinstance(message, dict) else None)
+			message_started = (_network_perf_clock()
+			                   if message_kind == 'snapshot' else None)
 			try:
 				self._handle_message(message)
 			except Exception:
 				LOG_ERROR('LAN client message error:', repr(message))
+			if message_started is not None:
+				with self._pending_lock:
+					self._diag_snapshot_apply_seconds += max(
+						0.0, _network_perf_clock() - message_started)
+					self._diag_snapshot_apply_calls += 1
+		with self._pending_lock:
+			self._diag_poll_seconds += max(
+				0.0, _network_perf_clock() - poll_started)
+			self._diag_poll_calls += 1
+		if self.phase == 'battle':
+			diagnostic = self._transport_diagnostic_snapshot(now)
+			if diagnostic is not None:
+				window = max(0.001, diagnostic['window'])
+				LOG_NOTE(
+					'LAN NET window=%.1fs chunks=%.1f/s messages=%.1f/s snapshots=%.1f/s '
+					'bot_updates=%.1f/s max_socket_gap=%dms max_snapshot_gap=%dms '
+					'max_bot_gap=%dms max_queue_age=%dms '
+					'max_pending=%d poll=%.2fms/%dc snapshot_apply=%.2fms/%dc rtt=%s' % (
+						diagnostic['window'], diagnostic['chunks'] / window,
+						diagnostic['messages'] / window,
+						diagnostic['snapshots'] / window,
+						diagnostic['bot_updates'] / window,
+						int(round(diagnostic['max_socket_gap'] * 1000.0)),
+						int(round(diagnostic['max_snapshot_gap'] * 1000.0)),
+						int(round(diagnostic['max_bot_update_gap'] * 1000.0)),
+						int(round(diagnostic['max_queue_age'] * 1000.0)),
+						diagnostic['max_pending'],
+						(1000.0 * diagnostic['poll_seconds'] /
+						 max(1, diagnostic['poll_calls'])),
+						diagnostic['poll_calls'],
+						(1000.0 * diagnostic['snapshot_apply_seconds'] /
+						 max(1, diagnostic['snapshot_apply_calls'])),
+						diagnostic['snapshot_apply_calls'],
+						'pending' if self.rtt_ms is None else '%dms' % int(round(self.rtt_ms))))
 		if self._last_error and not self._error_notified:
 			self._error_notified = True
 			_system_message('LAN connection error: %s' % self._last_error, 'error')
 		if self.running:
 			self._schedule_poll()
+
+	def _load_server_timing(self, message):
+		"""Project server-relative battle timing onto this client's receive clock."""
+		timing = message.get('timing') if isinstance(message, dict) else None
+		if not isinstance(timing, dict):
+			return False
+		received = _finite_float(message.get('_client_received_time'), time.time())
+		# Relative server time avoids requiring synchronized Windows/macOS clocks.
+		# Half the smoothed RTT approximates the packet's one-way transit time.
+		one_way = 0.0
+		if self.rtt_ms is not None:
+			one_way = max(0.0, min(0.25, float(self.rtt_ms) / 2000.0))
+		phase = str(timing.get('phase') or 'loading')
+		start_in = max(0.0, _finite_float(timing.get('start_in_ms'), 0.0) / 1000.0)
+		remaining = max(0.0, _finite_float(timing.get('remaining_ms'), 0.0) / 1000.0)
+		duration = max(1.0, _finite_float(timing.get('duration_ms'), 900000.0) / 1000.0)
+		if phase == 'prebattle':
+			projected_start = received + start_in - one_way
+			if self.combat_deadline is None or abs(self.combat_deadline - projected_start) > 0.25:
+				self.combat_deadline = projected_start
+			else:
+				self.combat_deadline = self.combat_deadline * 0.8 + projected_start * 0.2
+			projected_end = self.combat_deadline + duration
+		elif phase == 'battle':
+			if self.combat_deadline is None:
+				self.combat_deadline = received - one_way
+			projected_end = received + remaining - one_way
+		else:
+			projected_end = received - one_way
+		self.combat_duration = duration
+		if self.combat_end_deadline is None or abs(self.combat_end_deadline - projected_end) > 0.25:
+			self.combat_end_deadline = projected_end
+		else:
+			self.combat_end_deadline = self.combat_end_deadline * 0.8 + projected_end * 0.2
+		self.player._offhangar_network_combat_phase = phase
+		self.player._offhangar_network_combat_deadline = self.combat_deadline
+		self.player._offhangar_network_combat_end_deadline = self.combat_end_deadline
+		self.player._offhangar_network_combat_duration = self.combat_duration
+		return True
 
 	def _handle_message(self, message):
 		kind = message.get('type') if isinstance(message, dict) else None
@@ -542,10 +931,13 @@ class LANClient(object):
 				self.player._offhangar_network_roster_count = count
 				LOG_NOTE('LAN waiting room: %d player(s); choose a map and click START BATTLE' % count)
 		elif kind == 'battle_start':
+			self._load_bot_orders(message)
+			self._load_server_timing(message)
 			if self.battle_started:
 				return
 			self.battle_started = True
 			self.phase = 'battle'
+			self._reset_transport_diagnostics()
 			self.map_name = message.get('map') or self.map_name
 			self.round_id = message.get('round_id', self.round_id)
 			self.player._offhangar_network_map_name = self.map_name
@@ -585,22 +977,9 @@ class LANClient(object):
 				pass
 		elif kind == 'snapshot':
 			self._last_snapshot = time.time()
+			self._load_server_timing(message)
 			self._set_authority(message.get('bot_authority_id'))
-			try:
-				revision = int(message.get('bot_order_revision', 0) or 0)
-			except (TypeError, ValueError):
-				revision = 0
-			if revision > self.bot_order_revision or (revision == 0 and not self.bot_orders):
-				orders = {}
-				for order in message.get('bot_orders') or ():
-					try:
-						orders[int(order.get('id'))] = order
-					except Exception:
-						continue
-				self.bot_order_revision = revision
-				self.bot_orders = orders
-				self.player._offhangar_network_bot_order_revision = revision
-				self.player._offhangar_network_bot_orders = orders
+			self._load_bot_orders(message)
 			self.player._offhangar_network_snapshot = message
 			_apply_snapshot(self.player, message)
 		elif kind == 'events':
@@ -609,7 +988,9 @@ class LANClient(object):
 		elif kind == 'pong':
 			client_time = _finite_float(message.get('client_time'), 0.0)
 			if client_time > 0.0:
-				sample = max(0.0, (time.time() - client_time) * 1000.0)
+				received_time = _finite_float(
+					message.get('_client_received_time'), time.time())
+				sample = max(0.0, (received_time - client_time) * 1000.0)
 				self.rtt_ms = sample if self.rtt_ms is None else self.rtt_ms * 0.75 + sample * 0.25
 		elif kind == 'error':
 			self._last_error = message.get('message') or message.get('code') or 'server error'
@@ -810,7 +1191,16 @@ def start_for_player(player):
 	player._offhangar_network_authority_id = None
 	player._offhangar_network_is_authority = False
 	player._offhangar_network_bot_manifest = []
+	player._offhangar_network_bot_snapshots_deferred = False
+	player._offhangar_network_bot_defer_logged = False
+	player._offhangar_network_server_navigation_at = 0.0
+	player._offhangar_network_server_navigation_complete = False
+	player._offhangar_network_server_navigation_logged = False
 	player._offhangar_network_result_applied = False
+	player._offhangar_network_combat_phase = 'loading'
+	player._offhangar_network_combat_deadline = None
+	player._offhangar_network_combat_end_deadline = None
+	player._offhangar_network_combat_duration = 900.0
 	client.start()
 	return client
 
@@ -858,34 +1248,58 @@ def stop_for_player(player):
 		player._offhangar_network_authority_id = None
 		player._offhangar_network_is_authority = False
 		player._offhangar_network_bot_manifest = []
+		player._offhangar_network_bot_snapshots_deferred = False
+		player._offhangar_network_bot_defer_logged = False
+		player._offhangar_network_server_navigation_at = 0.0
+		player._offhangar_network_server_navigation_complete = False
+		player._offhangar_network_server_navigation_logged = False
+		player._offhangar_network_combat_phase = None
+		player._offhangar_network_combat_deadline = None
+		player._offhangar_network_combat_end_deadline = None
 		player._offhangar_network_bot_orders = {}
 		player._offhangar_network_bot_order_revision = 0
 		player._offhangar_network_result_applied = False
+		# These are per-battle closures installed by offline_battle. Keeping them
+		# on the persistent account pins the finished battle's models and mocks.
+		player._offhangar_apply_network_rules_state = None
+		player._offhangar_apply_network_battle_result = None
+		player._offhangar_network_spawn_remote = None
+		player._offhangar_network_formation = None
+		player._offhangar_network_world_frame_cache = None
+	globals().pop('_g_network_mock_indexes', None)
 
 
-def _server_pose_from_world(player, world_x, world_y, world_z, world_yaw):
-	"""Convert the loaded map coordinates back into the shared server frame."""
+def _server_pose_frame(player):
+	"""Return the fixed world-to-server axes for the current battle."""
 	try:
-		formation = getattr(player, '_offhangar_network_formation', None)
-		if formation is None:
+		frame = _network_world_frame(player)
+		if frame is None:
+			return None
+		return frame[1:8]
+	except Exception:
+		return None
+
+
+def _server_pose_with_frame(frame, world_x, world_y, world_z, world_yaw):
+	"""Convert one pose using axes shared by every snapshot body."""
+	try:
+		if frame is None:
 			return (world_x, world_y, world_z), world_yaw
-		base1 = formation(1, 0)
-		base2 = formation(2, 0)
-		b1x, b1z = float(base1[0]), float(base1[1])
-		b2x, b2z = float(base2[0]), float(base2[1])
-		dx, dz = b2x - b1x, b2z - b1z
-		length = math.sqrt(dx * dx + dz * dz) or 1.0
-		axis_x, axis_z = dx / length, dz / length
-		right_x, right_z = axis_z, -axis_x
+		b1x, b1z, axis_x, axis_z, right_x, right_z, axis_yaw = frame
 		world_dx = float(world_x) - b1x
 		world_dz = float(world_z) - b1z
 		travel = world_dx * axis_x + world_dz * axis_z
 		lateral = world_dx * right_x + world_dz * right_z
-		axis_yaw = math.atan2(dx, dz)
 		return ((lateral, _finite_float(world_y), travel),
 			_finite_float(world_yaw) - axis_yaw)
 	except Exception:
 		return None, _finite_float(world_yaw)
+
+
+def _server_pose_from_world(player, world_x, world_y, world_z, world_yaw):
+	"""Convert the loaded map coordinates back into the shared server frame."""
+	return _server_pose_with_frame(
+		_server_pose_frame(player), world_x, world_y, world_z, world_yaw)
 
 
 def send_local_input(player, forward, turn, aim_yaw, gun_pitch,
@@ -954,6 +1368,18 @@ def network_is_authority(player):
 		getattr(player, '_offhangar_network_is_authority', False))
 
 
+def _replica_lineup_loading(player):
+	"""Return whether this relay is still constructing the shared bot lineup."""
+	if player is None or network_is_authority(player):
+		return False
+	try:
+		expected = int(getattr(player, '_offh_auto_spawn_expected', 0) or 0)
+		completed = int(getattr(player, '_offh_auto_spawn_completed', 0) or 0)
+		return expected > 0 and completed < expected
+	except (TypeError, ValueError):
+		return False
+
+
 def publish_bot_manifest(player, jobs):
 	"""Publish the authority-selected lineup before any client creates bots."""
 	if not network_is_authority(player):
@@ -978,12 +1404,16 @@ def publish_bot_manifest(player, jobs):
 				director_getter = getattr(offline, '_offh_ai_director', None)
 				director = director_getter(player) if callable(director_getter) else None
 				if director is not None:
+					import Math
 					agent = director.register_profile(bot_id, team, profile, name)
 					route = agent.get('route') or {}
 					waypoints = []
 					for point in route.get('waypoints', ()):
+						grounded = _ground_world_point(
+							Math.Vector3(float(point[0]), 0.0, float(point[1])))
+						world_y = float(grounded.y) if grounded is not None else 0.0
 						shared, unused_yaw = _server_pose_from_world(
-							player, point[0], 0.0, point[1], 0.0)
+							player, point[0], world_y, point[1], 0.0)
 						waypoints.append({
 							'x': shared[0], 'y': shared[1], 'z': shared[2],
 							'hold': bool(point[2]) if len(point) > 2 else False,
@@ -1011,10 +1441,20 @@ def publish_bot_manifest(player, jobs):
 	if not manifest:
 		return False
 	player._offhangar_network_bot_manifest = manifest
-	return client.send_bot_manifest(manifest)
+	map_frame = None
+	try:
+		frame = _server_pose_frame(player)
+		if frame is not None:
+			map_frame = {
+				'origin': [round(float(frame[0]), 4), round(float(frame[1]), 4)],
+				'axis': [round(float(frame[2]), 7), round(float(frame[3]), 7)],
+			}
+	except Exception:
+		map_frame = None
+	return client.send_bot_manifest(manifest, map_frame)
 
 
-def publish_bot_observation(player, contacts, affordances=None):
+def publish_bot_observation(player, contacts, affordances=None, navigation=None):
 	"""Send the authority's team-visibility report to the global planner."""
 	if not network_is_authority(player):
 		return False
@@ -1043,6 +1483,21 @@ def publish_bot_observation(player, contacts, affordances=None):
 				'armor': max(0.0, _finite_float(raw.get('armor'))),
 				'visible': _protocol_bool(raw.get('visible'), True),
 			}
+			# Team spotting and local firing lanes are separate facts. Always send
+			# the current client's bounded list, including [] when no bot can shoot;
+			# omission is reserved for genuinely older protocol-v5 packages.
+			shootable = []
+			seen_bot_ids = set()
+			for raw_bot_id in (raw.get('shootable_by_bot_ids') or ())[:64]:
+				try:
+					bot_id = int(raw_bot_id)
+				except Exception:
+					continue
+				if bot_id <= 0 or bot_id in seen_bot_ids:
+					continue
+				seen_bot_ids.add(bot_id)
+				shootable.append(bot_id)
+			item['shootable_by_bot_ids'] = shootable
 			payload.append(item)
 		except Exception:
 			continue
@@ -1097,7 +1552,128 @@ def publish_bot_observation(player, contacts, affordances=None):
 				shared_affordances.append(item)
 		except Exception:
 			continue
-	return client.send_bot_observation(payload, shared_affordances)
+	shared_navigation = None
+	if isinstance(navigation, dict):
+		shared_navigation = {
+			'graph': {'source': 'none', 'cell_mm': 0, 'nodes': 0},
+			'total': {}, 'active': {}, 'recovered': 0, 'search': {}}
+		raw_graph = navigation.get('graph')
+		if isinstance(raw_graph, dict):
+			source = str(raw_graph.get('source') or 'none')
+			if source not in ('baked', 'runtime'):
+				source = 'none'
+			shared_navigation['graph']['source'] = source
+			for name, maximum in (('cell_mm', 100000), ('nodes', 100000)):
+				try:
+					value = int(raw_graph.get(name, 0) or 0)
+				except Exception:
+					value = 0
+				shared_navigation['graph'][name] = max(0, min(value, maximum))
+		for group in ('total', 'active'):
+			raw_group = navigation.get(group)
+			if not isinstance(raw_group, dict):
+				continue
+			for name in ('safe_direct', 'safe_local', 'reactive'):
+				try:
+					value = int(raw_group.get(name, 0) or 0)
+				except Exception:
+					value = 0
+				shared_navigation[group][name] = max(0, min(value, 100000))
+		try:
+			value = int(navigation.get('recovered', 0) or 0)
+		except Exception:
+			value = 0
+		shared_navigation['recovered'] = max(0, min(value, 100000))
+		raw_search = navigation.get('search')
+		if isinstance(raw_search, dict):
+			for name in ('pending', 'completed', 'failed', 'oldest_ms',
+					'tick_age_ms'):
+				try:
+					value = int(raw_search.get(name, 0) or 0)
+				except Exception:
+					value = 0
+				shared_navigation['search'][name] = max(0, min(value, 3600000))
+		raw_orders = navigation.get('orders')
+		if isinstance(raw_orders, dict):
+			shared_navigation['orders'] = {}
+			for name, maximum in (('revision', 1000000000), ('loaded', 30)):
+				try:
+					value = int(raw_orders.get(name, 0) or 0)
+				except Exception:
+					value = 0
+				shared_navigation['orders'][name] = max(0, min(value, maximum))
+		raw_aim = navigation.get('aim')
+		if isinstance(raw_aim, dict):
+			shared_navigation['aim'] = {}
+			for name in ('alive', 'targeted', 'aligned', 'traversing', 'limited'):
+				try:
+					value = int(raw_aim.get(name, 0) or 0)
+				except Exception:
+					value = 0
+				shared_navigation['aim'][name] = max(0, min(value, 30))
+		raw_driver = navigation.get('driver')
+		if isinstance(raw_driver, dict):
+			shared_navigation['driver'] = {}
+			for name in ('moving', 'drive', 'avoid', 'blocked', 'recovery', 'arrived',
+					'server_wait', 'water_guard', 'full', 'cruise', 'slow'):
+				try:
+					value = int(raw_driver.get(name, 0) or 0)
+				except Exception:
+					value = 0
+				shared_navigation['driver'][name] = max(0, min(value, 30))
+			try:
+				value = int(raw_driver.get('speed_pct', 0) or 0)
+			except Exception:
+				value = 0
+			shared_navigation['driver']['speed_pct'] = max(0, min(value, 200))
+		raw_safety = navigation.get('safety')
+		if isinstance(raw_safety, dict):
+			shared_navigation['safety'] = {}
+			for name in ('water_guard_total', 'water_guard_active',
+					'edge_guard_total', 'edge_guard_active', 'veto_water',
+					'veto_terrain', 'veto_obstacle', 'veto_error'):
+				try:
+					value = int(raw_safety.get(name, 0) or 0)
+				except Exception:
+					value = 0
+				maximum = 100000 if name.endswith('_total') else 30
+				shared_navigation['safety'][name] = max(0, min(value, maximum))
+	return client.send_bot_observation(
+		payload, shared_affordances, shared_navigation)
+
+
+def _moving_target_velocity(target):
+	"""Return the freshest world-space target velocity available locally."""
+	try:
+		if getattr(target, '_network_remote', False):
+			value = getattr(target, '_network_target_velocity', None)
+			if value is not None:
+				return (float(value[0]), float(value[1]), float(value[2]))
+	except Exception:
+		pass
+	try:
+		speed = _finite_float(getattr(target, '_veh_velocity', 0.0))
+		yaw = _finite_float(getattr(target, 'yaw', 0.0))
+		return (math.sin(yaw) * speed, 0.0, math.cos(yaw) * speed)
+	except Exception:
+		return (0.0, 0.0, 0.0)
+
+
+def _bot_projectile_speed(mock):
+	"""Read the installed shell speed without assuming descriptor wrappers."""
+	try:
+		descriptor = getattr(mock, 'typeDescriptor', None)
+		gun = getattr(descriptor, 'gun', None)
+		shots = gun.get('shots', ()) if hasattr(gun, 'get') else gun['shots']
+		if not shots:
+			return 0.0
+		index = max(0, min(int(getattr(
+			mock, '_network_bot_shell_index', 0) or 0), len(shots) - 1))
+		shot = shots[index]
+		speed = shot.get('speed', 0.0) if hasattr(shot, 'get') else shot['speed']
+		return max(0.0, float(speed))
+	except Exception:
+		return 0.0
 
 
 def authoritative_bot_order(player, mock):
@@ -1112,15 +1688,80 @@ def authoritative_bot_order(player, mock):
 		return None
 	raw = client.bot_orders.get(int(bot_id))
 	if raw is None:
+		try:
+			client.request_bot_orders()
+		except Exception:
+			pass
 		return None
-	order = dict(raw)
-	for key in ('aim_position', 'face_position', 'move_position', 'route_anchor'):
-		point = raw.get(key)
-		if not isinstance(point, dict):
-			continue
-		world = _world_from_server(player, dict(point, world_pose=True))
-		if world is not None:
-			order[key] = (float(world.x), float(world.y), float(world.z))
+	# Strategic orders are immutable for one server revision. Converting four
+	# coordinates for every bot at 10 Hz cost several milliseconds on this 2012
+	# Python client, even when the server had sent no new order. Cache only the
+	# frame conversion; the live target pose below remains refreshed on every call.
+	revision = int(getattr(client, 'bot_order_revision', 0) or 0)
+	cache_key = (revision, id(raw))
+	cached = getattr(mock, '_offh_network_world_order_cache', None)
+	if (isinstance(cached, tuple) and len(cached) == 2 and
+			cached[0] == cache_key):
+		base_order = cached[1]
+	else:
+		base_order = dict(raw)
+		for key in ('aim_position', 'face_position', 'move_position', 'route_anchor'):
+			point = raw.get(key)
+			if not isinstance(point, dict):
+				continue
+			world = _world_from_server(player, dict(point, world_pose=True))
+			if world is not None:
+				base_order[key] = (
+					float(world.x), float(world.y), float(world.z))
+		mock._offh_network_world_order_cache = (cache_key, base_order)
+	order = dict(base_order)
+	# The server selects who the bot may engage; the authority client owns the
+	# rendered simulation and therefore has the freshest exact pose. Aim a
+	# currently visible target at its live local mock, as the original offline AI
+	# did, instead of at the last 2 Hz contact-report coordinate. Last-known
+	# investigate orders retain the server coordinate and cannot see through fog.
+	if bool(raw.get('fire_allowed')) and raw.get('target_id') is not None:
+		target = None
+		try:
+			target_id = int(raw.get('target_id'))
+			if raw.get('target_kind') == 'human':
+				if target_id == getattr(player, '_offhangar_network_id', None):
+					target = _local_mock(player)
+				else:
+					target = _find_mock(player, target_id)
+			elif raw.get('target_kind') == 'bot':
+				target = _find_bot(target_id)
+		except Exception:
+			target = None
+		if (target is not None and getattr(target, 'isAlive', True) and
+				getattr(target, 'health', 1) > 0):
+			try:
+				position = target.position
+				live_position = (
+					float(position.x), float(position.y), float(position.z))
+				aim_position = live_position
+				target_velocity = _moving_target_velocity(target)
+				try:
+					if str(order.get('combat_mode') or '') != 'artillery_fire':
+						from gui.mods.offhangar import bot_ai_driver
+						shooter = mock.position
+						aim_position = bot_ai_driver.intercept_point(
+							(float(shooter.x), float(shooter.y), float(shooter.z)),
+							live_position, target_velocity,
+							_bot_projectile_speed(mock), 1.5)
+				except Exception:
+					aim_position = live_position
+				order['aim_position'] = aim_position
+				order['face_position'] = live_position
+				order['target_velocity'] = target_velocity
+				if order.get('combat_mode') == 'advance_contact':
+					order['move_position'] = live_position
+			except Exception:
+				order['fire_allowed'] = False
+		else:
+			# A visible order is permission to attempt a shot, but only the authority
+			# client can prove the rendered target still exists at a live pose.
+			order['fire_allowed'] = False
 	return order
 
 
@@ -1128,6 +1769,18 @@ def publish_authoritative_bots(player, mocks):
 	"""Send canonical bot pose, gun, shot and HP state at 30 Hz."""
 	if not network_is_authority(player):
 		return False
+	client = getattr(player, '_offhangar_network_client', None)
+	if client is None or not client.bot_states_due():
+		# Avoid walking every mock and converting every pose on render frames which
+		# the 30 Hz transport will reject anyway.
+		return False
+	server_frame = _server_pose_frame(player)
+	entity_to_bot = {}
+	for candidate in (mocks or {}).values():
+		candidate_bot_id = getattr(candidate, '_network_bot_id', None)
+		candidate_entity_id = getattr(candidate, 'id', None)
+		if candidate_bot_id is not None and candidate_entity_id is not None:
+			entity_to_bot[candidate_entity_id] = int(candidate_bot_id)
 	states = []
 	for mock in (mocks or {}).values():
 		bot_id = getattr(mock, '_network_bot_id', None)
@@ -1135,25 +1788,34 @@ def publish_authoritative_bots(player, mocks):
 			continue
 		try:
 			pos = mock.position
+			killer_bot_id = entity_to_bot.get(
+				getattr(mock, 'last_killer_id', None), 0)
 			yaw = _finite_float(getattr(mock, 'yaw', 0.0))
-			server_pos, server_yaw = _server_pose_from_world(
-				player, pos.x, pos.y, pos.z, yaw)
-			unused_pos, server_aim_yaw = _server_pose_from_world(
-				player, pos.x, pos.y, pos.z,
-				yaw + _finite_float(getattr(mock, '_turret_yaw', 0.0)))
+			server_pos, server_yaw = _server_pose_with_frame(
+				server_frame, pos.x, pos.y, pos.z, yaw)
+			# Position and hull yaw already established the server-frame rotation.
+			# Relative turret yaw is frame invariant, so a second formation lookup and
+			# coordinate conversion per bot is unnecessary.
+			server_aim_yaw = server_yaw + _finite_float(
+				getattr(mock, '_turret_yaw', 0.0))
 			states.append({
 				'id': int(bot_id),
 				'x': server_pos[0], 'y': server_pos[1], 'z': server_pos[2],
 				'yaw': server_yaw, 'aim_yaw': server_aim_yaw,
 				'gun_pitch': _finite_float(getattr(mock, '_gun_pitch', 0.0)),
+				'speed': _finite_float(getattr(mock, '_veh_velocity', 0.0)),
+				'turn_velocity': _finite_float(
+					getattr(mock, '_veh_turn_velocity', 0.0)),
 				'fire_seq': int(getattr(mock, '_network_bot_fire_seq', 0) or 0),
 				'shell_index': int(getattr(mock, '_network_bot_shell_index', 0) or 0),
 				'health': max(0, int(getattr(mock, 'health', 0) or 0)),
+				'killer_bot_id': int(killer_bot_id or 0),
+				'killer_kind': 'bot' if killer_bot_id else '',
+				'killer_id': int(killer_bot_id or 0),
 				'alive': bool(getattr(mock, 'isAlive', False)) and int(getattr(mock, 'health', 0) or 0) > 0,
 			})
 		except Exception:
 			continue
-	client = getattr(player, '_offhangar_network_client', None)
 	return client.send_bot_states(states) if states else False
 
 
@@ -1236,26 +1898,42 @@ def install_network_hud_metrics():
 		return False
 
 
-def _world_from_server(player, state):
-	"""Map the server's small synthetic arena onto the loaded WoT map.
+def _network_world_frame(player):
+	"""Cache the immutable server-to-map basis for one battle formation."""
+	formation = getattr(player, '_offhangar_network_formation', None)
+	if formation is None:
+		return None
+	cache_key = id(formation)
+	cached = getattr(player, '_offhangar_network_world_frame_cache', None)
+	if isinstance(cached, tuple) and len(cached) == 9 and cached[0] == cache_key:
+		return cached
+	base1 = formation(1, 0)
+	base2 = formation(2, 0)
+	b1x, b1z = float(base1[0]), float(base1[1])
+	b2x, b2z = float(base2[0]), float(base2[1])
+	dx, dz = b2x - b1x, b2z - b1z
+	length = math.sqrt(dx * dx + dz * dz) or 1.0
+	axis_x, axis_z = dx / length, dz / length
+	right_x, right_z = axis_z, -axis_x
+	frame = (cache_key, b1x, b1z, axis_x, axis_z,
+	         right_x, right_z, math.atan2(dx, dz), formation)
+	player._offhangar_network_world_frame_cache = frame
+	return frame
 
-	The server deliberately does not know the proprietary map coordinates.  The
-	client already parsed both team anchors, so it converts the shared x/z frame
-	into the current map's real coordinates here.
+
+def _world_from_server(player, state):
+	"""Map canonical server coordinates onto the locally loaded WoT map.
+
+	The elected authority supplies the map-frame basis used by the server-side
+	static navigator.  Every client applies that same canonical x/z frame to its
+	local map coordinates here; BigWorld terrain and entity queries remain local.
 	"""
 	try:
 		import Math
-		formation = getattr(player, '_offhangar_network_formation', None)
-		if formation is None:
+		frame = _network_world_frame(player)
+		if frame is None:
 			return Math.Vector3(_finite_float(state.get('x')), _finite_float(state.get('y')), _finite_float(state.get('z')))
-		base1 = formation(1, 0)
-		base2 = formation(2, 0)
-		b1x, b1z = float(base1[0]), float(base1[1])
-		b2x, b2z = float(base2[0]), float(base2[1])
-		dx, dz = b2x - b1x, b2z - b1z
-		length = math.sqrt(dx * dx + dz * dz) or 1.0
-		axis_x, axis_z = dx / length, dz / length
-		right_x, right_z = axis_z, -axis_x
+		unused_key, b1x, b1z, axis_x, axis_z, right_x, right_z, unused_yaw, formation = frame
 		if bool(state.get('world_pose', False)):
 			x = b1x + axis_x * _finite_float(state.get('z')) + right_x * _finite_float(state.get('x'))
 			z = b1z + axis_z * _finite_float(state.get('z')) + right_z * _finite_float(state.get('x'))
@@ -1309,44 +1987,60 @@ def _ground_world_point(point):
 	return point
 
 
-def _find_mock(player, server_id):
+def _network_mock_indexes():
+	"""Build O(1) server-id indexes once for the current mock collection."""
 	try:
 		import sys
 		module = sys.modules.get('gui.mods.offhangar.offline_battle')
 		mocks = getattr(module, 'G_MOCK_VEHICLES', {}) if module is not None else {}
+		generation = int(getattr(module, 'g_offh_battle_gen', 0) or 0)
+		key = (generation, id(mocks), len(mocks or {}))
+		cached = globals().get('_g_network_mock_indexes')
+		if isinstance(cached, tuple) and len(cached) == 3 and cached[0] == key:
+			return cached[1], cached[2]
+		players = {}
+		bots = {}
 		for mock in (mocks or {}).values():
-			if getattr(mock, '_network_server_id', None) == server_id:
+			server_id = getattr(mock, '_network_server_id', None)
+			bot_id = getattr(mock, '_network_bot_id', None)
+			if server_id is not None:
+				players[server_id] = mock
+			if bot_id is not None:
 				try:
-					getattr(player, '_offhangar_network_pending_remote_ids', {}).pop(server_id, None)
-				except Exception:
+					bots[int(bot_id)] = mock
+				except (TypeError, ValueError):
 					pass
-				return mock
+		globals()['_g_network_mock_indexes'] = (key, players, bots)
+		return players, bots
 	except Exception:
-		pass
-	return None
+		return {}, {}
+
+
+def _find_mock(player, server_id):
+	mock = _network_mock_indexes()[0].get(server_id)
+	if mock is not None:
+		try:
+			getattr(player, '_offhangar_network_pending_remote_ids', {}).pop(
+				server_id, None)
+		except Exception:
+			pass
+	return mock
 
 
 def _find_bot(bot_id):
 	try:
-		bot_id = int(bot_id)
+		return _network_mock_indexes()[1].get(int(bot_id))
 	except (TypeError, ValueError):
 		return None
-	for mock in (_offline_mocks() or {}).values():
-		if getattr(mock, '_network_bot_id', None) == bot_id:
-			return mock
-	return None
 
 
 def _world_yaw_from_server(player, state):
 	"""Convert the server's synthetic yaw into the loaded map's yaw frame."""
 	try:
-		formation = getattr(player, '_offhangar_network_formation', None)
-		if formation is None:
+		frame = _network_world_frame(player)
+		if frame is None:
 			return _finite_float(state.get('yaw'))
-		base1 = formation(1, 0)
-		base2 = formation(2, 0)
-		axis_yaw = math.atan2(float(base2[0]) - float(base1[0]), float(base2[1]) - float(base1[1]))
-		return _finite_float(state.get('yaw')) + axis_yaw
+		return _finite_float(state.get('yaw')) + frame[7]
 	except Exception:
 		return _finite_float(state.get('yaw'))
 
@@ -1374,12 +2068,35 @@ def _local_entity_id_for_server(player, server_id):
 	return getattr(mock, 'id', -1) if mock is not None else -1
 
 
+def _local_killer_id_from_state(player, state):
+	"""Resolve the server's stable killer identity into this client's entity id."""
+	kind = str(state.get('killer_kind') or '')
+	try:
+		killer_id = int(state.get('killer_id', 0) or 0)
+	except (TypeError, ValueError):
+		killer_id = 0
+	if kind == 'human' and killer_id:
+		return _local_entity_id_for_server(player, killer_id)
+	if kind == 'bot' and killer_id:
+		mock = _find_bot(killer_id)
+		return getattr(mock, 'id', -1) if mock is not None else -1
+	# Protocol-5 compatibility with servers that only relay bot killers.
+	legacy_bot_id = state.get('killer_bot_id')
+	if legacy_bot_id not in (None, 0, '0'):
+		mock = _find_bot(legacy_bot_id)
+		return getattr(mock, 'id', -1) if mock is not None else -1
+	return -1
+
+
 def _set_remote_spot_visibility(player, mock, visible):
 	"""Keep a remote human's model, marker and minimap state in lockstep."""
 	if mock is None:
 		return False
 	visible = bool(visible)
 	previous = bool(getattr(mock, '_spot_visible', False))
+	if (previous == visible and
+			getattr(mock, '_network_visibility_committed', False)):
+		return visible
 	mock._spot_visible = visible
 	model = getattr(mock, '_chassis_model', None) or getattr(mock, 'model', None)
 	if model is not None and getattr(mock, 'health', 0) > 0:
@@ -1408,16 +2125,39 @@ def _set_remote_spot_visibility(player, mock, visible):
 					minimap.notifyVehicleStop(mock.id)
 	except Exception:
 		pass
+	if previous != visible and getattr(mock, '_network_remote', False):
+		try:
+			local = _local_mock(player)
+			distance = -1.0
+			if local is not None:
+				dx = float(mock.position.x) - float(local.position.x)
+				dz = float(mock.position.z) - float(local.position.z)
+				distance = math.sqrt(dx * dx + dz * dz)
+			LOG_NOTE('LAN remote human visibility server_id=%s visible=%s distance=%.1fm' % (
+				str(getattr(mock, '_network_server_id', '?')),
+				str(bool(visible)), distance))
+		except Exception:
+			pass
+	mock._network_visibility_committed = True
+	return visible
+
+
+def _remote_proximity_visibility(player, mock, now):
+	"""Preserve the stock 50 m proximity rule if the shared adapter is unavailable."""
+	local = _local_mock(player)
+	if local is None or getattr(local, 'position', None) is None:
+		return False
+	dx = float(mock.position.x) - float(local.position.x)
+	dz = float(mock.position.z) - float(local.position.z)
+	visible = dx * dx + dz * dz <= 2500.0
+	if visible:
+		mock._spot_until = max(
+			float(getattr(mock, '_spot_until', 0.0) or 0.0), float(now) + 5.0)
 	return visible
 
 
 def update_remote_spotting(player, mock, force=False):
-	"""Apply the offline battle's local spotting rules to one LAN human.
-
-	LAN humans do not run bot driving AI, but opposing humans still need the same
-	50 m proximity spot, view-range/static-LOS check, team vision and five-second
-	spot memory used by locally simulated opponents.
-	"""
+	"""Apply the shared 0.8.2 spotting result to one LAN vehicle."""
 	if player is None or mock is None:
 		return False
 	alive = bool(getattr(mock, 'isAlive', True)) and int(getattr(mock, 'health', 0) or 0) > 0
@@ -1436,81 +2176,68 @@ def update_remote_spotting(player, mock, force=False):
 	next_check = float(getattr(mock, '_network_spot_next', 0.0) or 0.0)
 	if not force and now < next_check:
 		visible = now < float(getattr(mock, '_spot_until', 0.0) or 0.0)
-		return _set_remote_spot_visibility(player, mock, visible)
+		if not getattr(mock, '_network_visibility_committed', False):
+			return _set_remote_spot_visibility(player, mock, visible)
+		return visible
 	mock._network_spot_next = now + 0.5
-	local = _local_mock(player)
-	if local is None or getattr(local, 'position', None) is None or getattr(mock, 'position', None) is None:
-		return _set_remote_spot_visibility(player, mock, False)
-
-	view_range = 400.0
-	try:
-		view_range = float(local.typeDescriptor.turret.get('circularVisionRadius', 400.0))
-	except Exception:
-		pass
+	visible = False
 	try:
 		import sys
 		offline = sys.modules.get('gui.mods.offhangar.offline_battle')
-		crew_factor = getattr(offline, '_crew_factor', None) if offline is not None else None
-		module_factor = getattr(offline, '_module_factor', None) if offline is not None else None
-		if callable(crew_factor) and callable(module_factor):
-			view_range *= float(crew_factor(local, 'vision')) * float(module_factor(local, 'vision'))
-	except Exception:
-		pass
-	view_range = max(50.0, view_range)
+		evaluate = getattr(offline, '_offh_spot_visible_for_player', None)
+		if callable(evaluate):
+			visible = bool(evaluate(player, mock, now))
+		else:
+			# Source-loader safety net: proximity spotting must still work if the
+			# shared battle adapter failed to load. Normal installs never use this.
+			visible = _remote_proximity_visibility(player, mock, now)
+	except Exception as error:
+		# A spotting data bug must not make a nearby LAN player permanently
+		# invisible. Log the first failure with its actual cause and retain only the
+		# native 50 m proximity guarantee until the next successful shared pass.
+		if not getattr(mock, '_network_spot_error_logged', False):
+			mock._network_spot_error_logged = True
+			LOG_ERROR('LAN remote spotting failed server_id=%s: %s' % (
+				str(getattr(mock, '_network_server_id', '?')), str(error)))
+		visible = _remote_proximity_visibility(player, mock, now)
+	return _set_remote_spot_visibility(player, mock, visible)
 
-	def _has_line_of_sight(observer, target, turret_sample=False):
-		dx = target.position.x - observer.position.x
-		dz = target.position.z - observer.position.z
-		distance_sq = dx * dx + dz * dz
-		if distance_sq <= 2500.0:
-			return True
-		if distance_sq > view_range * view_range:
-			return False
+
+def _notify_network_death(player, mock, killer_id=-1):
+	if mock is None or getattr(mock, '_network_death_notified', False):
+		return False
+	if killer_id in (None, -1):
+		killer_id = getattr(mock, 'last_killer_id', -1)
+	if killer_id is None:
+		killer_id = -1
+	mock._network_death_pending = False
+	mock._network_death_notified = True
+	try:
+		player.arena.onVehicleKilled(mock.id, killer_id, 0)
+	except Exception:
 		try:
-			import Math, sys
-			offline = sys.modules.get('gui.mods.offhangar.offline_battle')
-			space_getter = getattr(offline, '_offh_bspace', None) if offline is not None else None
-			space_id = space_getter() if callable(space_getter) else getattr(player, 'spaceID', 0)
-			start = Math.Vector3(observer.position.x, observer.position.y + 2.5, observer.position.z)
-			end = Math.Vector3(target.position.x, target.position.y + 1.5, target.position.z)
-			if BigWorld.wg_collideSegment(space_id, start, end, 128) is None:
-				return True
-			if turret_sample:
-				end = Math.Vector3(target.position.x, target.position.y + 2.2, target.position.z)
-				return BigWorld.wg_collideSegment(space_id, start, end, 128) is None
+			mock.isAlive = False
 		except Exception:
 			pass
-		return False
-
-	seen = _has_line_of_sight(local, mock, True)
-	if not seen:
-		# Team vision: any living allied local bot or LAN human can relay the spot.
-		for ally in (_offline_mocks() or {}).values():
-			if ally is local or ally is mock or not bool(getattr(ally, 'isAlive', True)):
-				continue
-			ally_team = int(getattr(ally, '_bot_team',
-				(getattr(ally, 'publicInfo', None) or {}).get('team', 2)) or 2)
-			if ally_team == player_team and _has_line_of_sight(ally, mock, False):
-				seen = True
-				break
-	if seen:
-		mock._spot_until = now + 5.0
-	visible = now < float(getattr(mock, '_spot_until', 0.0) or 0.0)
-	return _set_remote_spot_visibility(player, mock, visible)
+	return True
 
 
 def _push_mock_health(player, mock, health, max_health, alive, killer_id=-1, is_local=False):
 	if mock is None:
 		return
 	old_health = int(getattr(mock, 'health', health) or 0)
+	old_max_health = int(getattr(mock, 'maxHealth', max_health) or 1)
 	old_alive = bool(getattr(mock, 'isAlive', old_health > 0))
 	health = max(0, int(health or 0))
 	max_health = max(1, int(max_health or getattr(mock, 'maxHealth', 1) or 1))
 	if health > max_health:
 		health = max_health
+	if (old_health == health and old_max_health == max_health and
+			old_alive == bool(alive) and killer_id in (None, -1)):
+		return
 	mock.health = health
 	mock.maxHealth = max_health
-	if old_health != health and killer_id not in (None, -1):
+	if killer_id not in (None, -1):
 		try:
 			mock.last_killer_id = killer_id
 		except Exception:
@@ -1544,14 +2271,17 @@ def _push_mock_health(player, mock, health, max_health, alive, killer_id=-1, is_
 	if not alive or health <= 0:
 		mock.health = 0
 		if not getattr(mock, '_network_death_notified', False):
-			mock._network_death_notified = True
-			try:
-				player.arena.onVehicleKilled(mock.id, killer_id, 0)
-			except Exception:
+			if killer_id not in (None, -1):
+				_notify_network_death(player, mock, killer_id)
+			elif not getattr(mock, '_network_death_pending', False):
+				# Snapshots and combat events are separate messages. The server sends the
+				# snapshot first, so leave one short window for the following event to
+				# supply its killer instead of permanently posting "lost in battle".
+				mock._network_death_pending = True
 				try:
-					mock.isAlive = False
+					BigWorld.callback(0.5, lambda: _notify_network_death(player, mock, -1))
 				except Exception:
-					pass
+					_notify_network_death(player, mock, -1)
 	elif not old_alive:
 		try:
 			mock.isAlive = True
@@ -1559,65 +2289,51 @@ def _push_mock_health(player, mock, health, max_health, alive, killer_id=-1, is_
 			pass
 
 
-def _apply_remote_transform(player, mock, world, yaw):
-	"""Move both the mock state and the BigWorld model driven by it."""
+def _remote_pose_space_id():
+	try:
+		import sys
+		offline = sys.modules.get('gui.mods.offhangar.offline_battle')
+		space_getter = (getattr(offline, '_offh_bspace', None)
+		                if offline is not None else None)
+		if callable(space_getter):
+			return space_getter()
+	except Exception:
+		pass
+	return None
+
+
+def _apply_remote_transform(player, mock, world, yaw, sync_filter=True,
+		timestamp=None, space_id=None):
+	"""Commit one remote pose through the shared native-facing adapter."""
 	if mock is None or world is None:
 		return
-	mock.position = world
-	mock.yaw = yaw
 	pitch = float(getattr(mock, 'pitch', 0.0) or 0.0)
 	roll = float(getattr(mock, 'roll', 0.0) or 0.0)
-	matrix = getattr(mock, 'matrix', None)
-	if matrix is not None:
-		try:
-			matrix.setRotateYPR((yaw, pitch, roll))
-			matrix.translation = world
-		except Exception:
-			pass
-
-	# Remote mocks used to retain the local player's AvatarFilter. Updating that
-	# object moved no remote model (and risked perturbing the local one). Drive the
-	# filter owned by the remote BigWorld entity, exactly as the bot loop does.
-	entity = getattr(mock, 'bw_entity', None)
-	entity_filter = getattr(entity, 'filter', None) if entity is not None else None
-	if entity_filter is not None:
-		try:
-			import sys
-			offline = sys.modules.get('gui.mods.offhangar.offline_battle')
-			space_getter = getattr(offline, '_offh_bspace', None) if offline is not None else None
-			if callable(space_getter):
-				entity_filter.set(BigWorld.time(), space_getter(), entity.id,
-					world, (roll, pitch, yaw), 0)
-			mock.filter = entity_filter
-		except Exception:
-			pass
-
-	chassis = getattr(mock, '_chassis_model', None) or getattr(mock, 'model', None)
-	if chassis is not None:
-		# Set the root immediately so the first snapshot fixes a sky-high async
-		# spawn even before the entity/filter or Servo has finished attaching.
-		try:
-			chassis.position = world
-			chassis.yaw = yaw
-		except Exception:
-			pass
-		if matrix is not None and not getattr(mock, '_servo_added', False):
-			try:
-				chassis.addMotor(BigWorld.Servo(matrix))
-				mock._servo_added = True
-			except Exception:
-				pass
+	if sync_filter and space_id is None:
+		space_id = _remote_pose_space_id()
+	if sync_filter and timestamp is None:
+		timestamp = BigWorld.time()
+	needs_servo = not bool(getattr(mock, '_servo_added', False))
+	vehicle_pose.commit_pose(
+		mock, world, yaw, pitch, roll, space_id=space_id,
+		timestamp=timestamp, sync_filter=sync_filter,
+		attach_servo=needs_servo, prime_model=needs_servo)
 
 
 def _queue_network_transform(player, mock, world, hull_yaw, aim_yaw,
-		gun_pitch, snap=False):
+		gun_pitch, snap=False, longitudinal_speed=None, turn_velocity=None,
+		sample_time=None):
 	"""Queue a 30 Hz pose; the battle frame loop renders between packets."""
 	if mock is None or world is None:
 		return
-	now = time.time()
+	now = time.time() if sample_time is None else float(sample_time)
 	previous_target = getattr(mock, '_network_target_position', None)
 	previous_time = float(getattr(mock, '_network_target_time', 0.0) or 0.0)
-	if previous_target is not None and previous_time > 0.0 and now > previous_time:
+	if longitudinal_speed is not None:
+		speed = max(-80.0, min(80.0, _finite_float(longitudinal_speed, 0.0)))
+		mock._network_target_velocity = (
+			math.sin(hull_yaw) * speed, 0.0, math.cos(hull_yaw) * speed)
+	elif previous_target is not None and previous_time > 0.0 and now > previous_time:
 		delta = max(0.01, min(now - previous_time, 0.25))
 		vx = (world.x - previous_target.x) / delta
 		vy = (world.y - previous_target.y) / delta
@@ -1635,6 +2351,9 @@ def _queue_network_transform(player, mock, world, hull_yaw, aim_yaw,
 	mock._network_target_yaw = hull_yaw
 	mock._network_target_aim_yaw = aim_yaw
 	mock._network_target_gun_pitch = gun_pitch
+	if turn_velocity is not None:
+		mock._network_target_turn_velocity = max(
+			-10.0, min(10.0, _finite_float(turn_velocity, 0.0)))
 	mock._network_target_time = now
 	if snap or not getattr(mock, '_network_smoothing_ready', False):
 		_apply_remote_transform(player, mock, world, hull_yaw)
@@ -1667,10 +2386,27 @@ def advance_network_smoothing(player, mocks, frame_dt):
 		dt = max(0.001, min(_finite_float(frame_dt, 0.016), 0.1))
 		alpha = 1.0 - math.exp(-20.0 * dt)
 		now = time.time()
+		is_authority = network_is_authority(player)
+		lineup_loading = _replica_lineup_loading(player)
+		space_id = _remote_pose_space_id()
+		pose_timestamp = BigWorld.time()
+		pose_safe = None
+		try:
+			import sys
+			offline = sys.modules.get('gui.mods.offhangar.offline_battle')
+			pose_safe = (getattr(offline, '_offh_ai_baked_pose_safe', None)
+			             if offline is not None else None)
+		except Exception:
+			pass
 		for mock in (mocks or {}).values():
 			is_human = bool(getattr(mock, '_network_remote', False))
 			is_bot = bool(getattr(mock, '_network_shared_bot', False))
-			if not is_human and not (is_bot and not network_is_authority(player)):
+			if not is_human and not (is_bot and not is_authority):
+				continue
+			if is_bot and lineup_loading:
+				# Entity creation owns the model until the complete lineup exists. Applying
+				# 30 Hz transforms to each partially constructed relay model made native
+				# model submission and the next spawn callback starve one another.
 				continue
 			if getattr(mock, '_network_death_notified', False) or not getattr(mock, 'isAlive', True):
 				continue
@@ -1679,36 +2415,71 @@ def advance_network_smoothing(player, mocks, frame_dt):
 			if target is None or current is None:
 				continue
 			vx, vy, vz = getattr(mock, '_network_target_velocity', (0.0, 0.0, 0.0))
-			predict = max(0.0, min(now - float(getattr(mock, '_network_target_time', now)), 0.05))
+			# Explicit authority velocity makes prediction useful even when the
+			# authority renders below 30 FPS. Keep the LAN horizon bounded so a lost
+			# packet cannot make a tank coast indefinitely.
+			predict = max(0.0, min(
+				now - float(getattr(mock, '_network_target_time', now)), 0.12))
 			px = target.x + vx * predict
 			py = target.y + vy * predict
 			pz = target.z + vz * predict
+			if is_bot and predict > 0.0 and callable(pose_safe):
+				# Prediction is presentation only. Never extrapolate a shared bot from
+				# its last authoritative safe pose across a baked water/cliff cell; the
+				# next zero-speed guard packet would otherwise make it rubber-band back.
+				# If the authority itself has already fallen, its target pose still wins
+				# and the physical consequence remains visible on every client.
+				try:
+					if not pose_safe((px, py, pz)):
+						px, py, pz = target.x, target.y, target.z
+				except Exception:
+					pass
 			dx, dy, dz = px - current.x, py - current.y, pz - current.z
 			distance_sq = dx * dx + dy * dy + dz * dz
+			target_yaw = _finite_float(getattr(mock, '_network_target_yaw', mock.yaw))
 			if distance_sq > 625.0:
 				world = Math.Vector3(px, py, pz)
-				yaw = _finite_float(getattr(mock, '_network_target_yaw', mock.yaw))
+				yaw = target_yaw
+			elif distance_sq <= 0.0004:
+				# Finish the exponential tail once it is below two centimetres. Without
+				# this, stationary tanks still rewrote three native matrices forever.
+				world = Math.Vector3(px, py, pz)
+				yaw = target_yaw
 			else:
 				world = Math.Vector3(current.x + dx * alpha,
 					current.y + dy * alpha, current.z + dz * alpha)
-				yaw = mock.yaw + _short_angle_delta(
-					_finite_float(getattr(mock, '_network_target_yaw', mock.yaw)), mock.yaw) * alpha
-			_apply_remote_transform(player, mock, world, yaw)
+				yaw = mock.yaw + _short_angle_delta(target_yaw, mock.yaw) * alpha
+			pose_changed = (
+				distance_sq > 0.000001 or
+				abs(_short_angle_delta(yaw, mock.yaw)) > 0.00001)
+			filter_due = now >= float(getattr(
+				mock, '_network_filter_sync_at', 0.0) or 0.0)
+			if filter_due:
+				mock._network_filter_sync_at = now + (1.0 / 30.0)
+			if pose_changed or filter_due:
+				_apply_remote_transform(
+					player, mock, world, yaw, filter_due,
+					pose_timestamp, space_id)
 			target_aim = _finite_float(getattr(mock, '_network_target_aim_yaw', yaw))
 			desired_turret = _short_angle_delta(target_aim, yaw)
 			current_turret = _finite_float(getattr(mock, '_turret_yaw', desired_turret))
-			mock._turret_yaw = current_turret + _short_angle_delta(desired_turret, current_turret) * alpha
+			new_turret = current_turret + _short_angle_delta(
+				desired_turret, current_turret) * alpha
 			current_pitch = _finite_float(getattr(mock, '_gun_pitch', 0.0))
 			target_pitch = _finite_float(getattr(mock, '_network_target_gun_pitch', current_pitch))
-			mock._gun_pitch = current_pitch + (target_pitch - current_pitch) * alpha
-			try:
-				mock._t_mat.setRotateYPR((mock._turret_yaw, 0, 0))
-			except Exception:
-				pass
-			try:
-				mock._g_mat.setRotateYPR((0, mock._gun_pitch, 0))
-			except Exception:
-				pass
+			new_pitch = current_pitch + (target_pitch - current_pitch) * alpha
+			if abs(new_turret - current_turret) > 0.00001:
+				mock._turret_yaw = new_turret
+				try:
+					mock._t_mat.setRotateYPR((new_turret, 0, 0))
+				except Exception:
+					pass
+			if abs(new_pitch - current_pitch) > 0.00001:
+				mock._gun_pitch = new_pitch
+				try:
+					mock._g_mat.setRotateYPR((0, new_pitch, 0))
+				except Exception:
+					pass
 		return True
 	except Exception:
 		return False
@@ -1730,7 +2501,7 @@ def _apply_local_state(player, state):
 		target_health = 0
 	_push_mock_health(player, mock, target_health,
 		state.get('max_health', getattr(mock, 'maxHealth', 1)),
-		bool(state.get('alive', True)), -1, True)
+		bool(state.get('alive', True)), _local_killer_id_from_state(player, state), True)
 
 
 def _apply_remote_state(player, state):
@@ -1808,18 +2579,61 @@ def _apply_remote_state(player, state):
 				_finite_float(state.get('gun_pitch'), getattr(mock, '_gun_pitch', 0.0)),
 				not target_alive)
 		_push_mock_health(player, mock, state.get('health', mock.health),
-			state.get('max_health', mock.maxHealth), target_alive)
+			state.get('max_health', mock.maxHealth), target_alive,
+			_local_killer_id_from_state(player, state))
+		# Remote-human visibility used to depend on the separate 2 Hz bot/contact
+		# pass. If model loading stalled that pass during countdown, this entity
+		# could retain its initial hidden state for the rest of the battle. Every
+		# authoritative player snapshot now refreshes the shared spotting adapter;
+		# its own 0.5 s gate keeps this cheap at the 30 Hz transport rate.
+		force_spot = not bool(getattr(mock, '_network_spot_initialized', False))
+		update_remote_spotting(player, mock, force_spot)
+		mock._network_spot_initialized = True
 	except Exception:
 		pass
 
 
-def _apply_bot_state(player, state):
-	mock = _find_bot(state.get('id'))
+def _apply_bot_state(player, state, force_authority_pose=False, mock=None,
+		sample_time=None):
+	if mock is None:
+		mock = _find_bot(state.get('id'))
 	if mock is None:
 		return
 	try:
+		# Static A* is resolved by the Python 3 server over the shipped graph.  This
+		# short waypoint is advisory: the authority's LocalDriver still performs the
+		# exact BigWorld corridor, destructible-object, water and tank checks before
+		# committing motion.  Replica clients retain it only for a possible failover.
+		nav_source = str(state.get('nav_source') or '')
+		if nav_source in ('server_baked', 'server_hold'):
+			nav_state = {
+				'world_pose': True,
+				'x': state.get('nav_x'), 'y': state.get('nav_y'),
+				'z': state.get('nav_z'),
+			}
+			nav_world = _world_from_server(player, nav_state)
+			if nav_world is not None:
+				mock._network_navigation_target = (
+					float(nav_world.x), float(nav_world.y), float(nav_world.z))
+				mock._network_navigation_source = nav_source
+				mock._network_navigation_revision = int(
+					state.get('nav_order_revision', 0) or 0)
+				mock._network_navigation_time = float(sample_time or time.time())
+				player._offhangar_network_server_navigation_at = float(
+					sample_time or time.time())
+				if not getattr(player, '_offhangar_network_server_navigation_logged', False):
+					player._offhangar_network_server_navigation_logged = True
+					LOG_NOTE('LAN server-baked navigation waypoints active')
+		elif nav_source == 'client_fallback':
+			mock._network_navigation_target = None
+			mock._network_navigation_source = nav_source
+			mock._network_navigation_revision = int(
+				state.get('nav_order_revision', 0) or 0)
+			mock._network_navigation_time = float(sample_time or time.time())
+		old_health = max(0, int(getattr(mock, 'health', 0) or 0))
 		target_alive = bool(state.get('alive', True))
-		if not network_is_authority(player):
+		is_authority = network_is_authority(player)
+		if not is_authority or force_authority_pose:
 			previous_fire = int(getattr(mock, '_network_seen_fire_seq', 0) or 0)
 			fire_seq = int(state.get('fire_seq', previous_fire) or 0)
 			death_locked = bool(getattr(mock, '_network_death_notified', False))
@@ -1830,8 +2644,14 @@ def _apply_bot_state(player, state):
 			if not death_locked:
 				_queue_network_transform(player, mock, world, world_yaw, world_aim_yaw,
 					_finite_float(state.get('gun_pitch'), getattr(mock, '_gun_pitch', 0.0)),
-					not target_alive)
-			if fire_seq > previous_fire:
+					force_authority_pose or not target_alive,
+					state.get('speed'), state.get('turn_velocity'), sample_time)
+			if force_authority_pose:
+				mock._veh_velocity = max(-80.0, min(
+					80.0, _finite_float(state.get('speed'), 0.0)))
+				mock._veh_turn_velocity = max(-10.0, min(
+					10.0, _finite_float(state.get('turn_velocity'), 0.0)))
+			if not is_authority and fire_seq > previous_fire:
 				try:
 					import sys
 					offline = sys.modules.get('gui.mods.offhangar.offline_battle')
@@ -1845,22 +2665,66 @@ def _apply_bot_state(player, state):
 			mock._network_bot_fire_seq = max(
 				int(getattr(mock, '_network_bot_fire_seq', 0) or 0), fire_seq)
 			mock._network_bot_shell_index = int(state.get('shell_index', 0) or 0)
+		killer_id = _local_killer_id_from_state(player, state)
 		_push_mock_health(player, mock, state.get('health', mock.health),
-			state.get('max_health', mock.maxHealth), target_alive)
-		if not network_is_authority(player):
+			state.get('max_health', mock.maxHealth), target_alive, killer_id)
+		if not is_authority:
+			new_health = max(0, int(getattr(mock, 'health', 0) or 0))
+			if old_health > new_health:
+				try:
+					import sys
+					offline = sys.modules.get('gui.mods.offhangar.offline_battle')
+					record_assist = getattr(offline, 'record_network_spot_assist', None) if offline is not None else None
+					if callable(record_assist):
+						record_assist(player, mock, old_health - new_health, not target_alive)
+				except Exception:
+					LOG_ERROR('LAN spotting-assist statistics failed:', state.get('id'))
 			update_remote_spotting(player, mock)
 	except Exception:
 		LOG_ERROR('LAN bot state apply failed:', state.get('id'))
 
 
 def _apply_snapshot(player, message):
+	snapshot_time = time.time()
 	for state in message.get('players') or []:
 		if state.get('id') == getattr(player, '_offhangar_network_id', None):
 			_apply_local_state(player, state)
 		else:
 			_apply_remote_state(player, state)
-	for state in message.get('bots') or []:
-		_apply_bot_state(player, state)
+	handoff = bool(getattr(
+		player, '_offhangar_network_authority_handoff_pending', False))
+	bot_states = message.get('bots') or []
+	# One failed server path must reactivate the client navigator for that bot.
+	# Using only the latest successful waypoint timestamp made 28 successful bots
+	# mask one ``client_fallback`` forever.
+	alive_bot_states = [state for state in bot_states
+		if bool(state.get('alive', True))]
+	player._offhangar_network_server_navigation_complete = bool(
+		alive_bot_states and all(str(state.get('nav_source') or '') in
+			('server_baked', 'server_hold') for state in alive_bot_states))
+	defer_bot_states = bool(bot_states and _replica_lineup_loading(player))
+	if defer_bot_states:
+		# Snapshots are already level-triggered and coalesced by LANClient._poll.
+		# Player state, timer and rules continue below, while bot transforms wait for
+		# the complete native lineup. The first 30 Hz snapshot after completion is the
+		# canonical newest state, so replaying stale intermediate poses is unnecessary.
+		player._offhangar_network_bot_snapshots_deferred = True
+		if not getattr(player, '_offhangar_network_bot_defer_logged', False):
+			player._offhangar_network_bot_defer_logged = True
+			LOG_NOTE('LAN replica bot snapshots deferred until lineup is ready')
+	else:
+		if getattr(player, '_offhangar_network_bot_snapshots_deferred', False):
+			player._offhangar_network_bot_snapshots_deferred = False
+			LOG_NOTE('LAN replica bot snapshots resumed with complete lineup')
+		bot_index = _network_mock_indexes()[1]
+		for state in bot_states:
+			try:
+				indexed_mock = bot_index.get(int(state.get('id')))
+			except (TypeError, ValueError):
+				indexed_mock = None
+			_apply_bot_state(player, state, handoff, indexed_mock, snapshot_time)
+		if handoff and bot_states:
+			player._offhangar_network_authority_handoff_pending = False
 	rules = message.get('rules')
 	if rules is not None:
 		callback = getattr(player, '_offhangar_apply_network_rules_state', None)
@@ -1940,6 +2804,15 @@ def _handle_events(player, events):
 							bool(event.get('dead', False)))
 				except Exception:
 					LOG_ERROR('LAN hit presentation failed')
+				try:
+					record_stats = getattr(offline, 'record_network_combat_stats', None) if offline is not None else None
+					if callable(record_stats):
+						record_stats(player,
+							attacker_server_id == getattr(player, '_offhangar_network_id', None),
+							is_local, mock, event.get('damage', 0),
+							event.get('shot_result', 2), bool(event.get('dead', False)))
+				except Exception:
+					LOG_ERROR('LAN hit statistics failed')
 				server_health = int(event.get('health', getattr(mock, 'health', 0)) or 0)
 				if is_local:
 					previous = getattr(player, '_offhangar_network_server_health', None)
@@ -1989,12 +2862,22 @@ def _handle_events(player, events):
 							bool(event.get('dead', False)))
 				except Exception:
 					LOG_ERROR('LAN bot hit presentation failed')
+				try:
+					record_stats = getattr(offline, 'record_network_combat_stats', None) if offline is not None else None
+					if callable(record_stats):
+						record_stats(player,
+							attacker_server_id == getattr(player, '_offhangar_network_id', None),
+							False, mock, event.get('damage', 0),
+							event.get('shot_result', 2), bool(event.get('dead', False)))
+				except Exception:
+					LOG_ERROR('LAN bot-hit statistics failed')
 				_push_mock_health(player, mock, event.get('health', mock.health),
 					mock.maxHealth, not bool(event.get('dead', False)),
 					_local_entity_id_for_server(player, attacker_server_id), False)
 		elif kind == 'bot_human_hit':
 			target_id = event.get('target')
 			is_local = target_id == getattr(player, '_offhangar_network_id', None)
+			authority_simulated = network_is_authority(player)
 			target_mock = _local_mock(player) if is_local else _find_mock(player, target_id)
 			attacker_mock = _find_bot(event.get('attacker_bot'))
 			if target_mock is not None:
@@ -2002,12 +2885,22 @@ def _handle_events(player, events):
 					import sys
 					offline = sys.modules.get('gui.mods.offhangar.offline_battle')
 					present = getattr(offline, 'play_network_hit_feedback', None) if offline is not None else None
-					if callable(present):
+					# The authority already rendered the projectile impact while resolving
+					# the hit. Other clients replay it from the canonical server event.
+					if callable(present) and not authority_simulated:
 						present(player, attacker_mock, target_mock, _world_from_server(player, event),
 							event.get('shot_result', 2), event.get('damage', 0), 0,
 							is_local, False, bool(event.get('dead', False)))
 				except Exception:
 					LOG_ERROR('LAN bot-human hit presentation failed')
+				try:
+					record_stats = getattr(offline, 'record_network_combat_stats', None) if offline is not None else None
+					if callable(record_stats):
+						record_stats(player, False, is_local, target_mock,
+							event.get('damage', 0), event.get('shot_result', 2),
+							bool(event.get('dead', False)))
+				except Exception:
+					LOG_ERROR('LAN bot-human statistics failed')
 				_push_mock_health(player, target_mock, event.get('health', target_mock.health),
 					target_mock.maxHealth, not bool(event.get('dead', False)),
 					getattr(attacker_mock, 'id', -1), is_local)

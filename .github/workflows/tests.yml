@@ -26,9 +26,13 @@ jobs:
           python -m unittest discover -s ports/0.9.22/tests
           -p "test_*.py" -v
       - name: Check Python 2.6 client syntax
-        run: >-
-          docker run --rm -v "$PWD:/work" -w /work zinainfra/python26
-          -m compileall -q scripts/client/gui/mods
+        run: |
+          docker run --rm --entrypoint /bin/sh -v "$PWD:/work:ro" zinainfra/python26 -c '
+            cp -R /work/scripts /tmp/scripts
+            for source in $(find /tmp/scripts/client/gui/mods -name "*.py" -type f); do
+              python2.6 -m py_compile "$source" || exit 1
+            done
+          '
       - name: Build Python 2.7 0.9.22 LAN client
         run: >-
           docker run --rm --platform linux/amd64 -v "$PWD:/work"

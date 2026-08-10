@@ -29,6 +29,179 @@ def _distance(first, second):
 	return math.sqrt(dx * dx + dz * dz)
 
 
+def intercept_point(shooter_position, target_position, target_velocity,
+		projectile_speed, max_lead_time=1.5):
+	"""Return the constant-velocity projectile intercept point.
+
+	The caller still applies gun traverse, dispersion and line-of-fire checks.  A
+	non-positive shell speed or an impossible intercept falls back to the current
+	target pose, bounded by ``max_lead_time`` so stale network velocity cannot make
+	a bot aim implausibly far ahead.
+	"""
+	try:
+		shooter = tuple(float(value) for value in shooter_position[:3])
+		target = tuple(float(value) for value in target_position[:3])
+		velocity = tuple(float(value) for value in target_velocity[:3])
+		speed = float(projectile_speed)
+		maximum = max(0.0, float(max_lead_time))
+	except Exception:
+		return target_position
+	if speed <= 1.0 or maximum <= 0.0:
+		return target
+	rx = target[0] - shooter[0]
+	ry = target[1] - shooter[1]
+	rz = target[2] - shooter[2]
+	vx, vy, vz = velocity
+	a = vx * vx + vy * vy + vz * vz - speed * speed
+	b = 2.0 * (rx * vx + ry * vy + rz * vz)
+	c = rx * rx + ry * ry + rz * rz
+	lead_time = None
+	if c <= 1e-08:
+		lead_time = 0.0
+	elif abs(a) <= 1e-08:
+		if abs(b) > 1e-08:
+			candidate = -c / b
+			if candidate > 0.0:
+				lead_time = candidate
+	else:
+		discriminant = b * b - 4.0 * a * c
+		if discriminant >= 0.0:
+			root = math.sqrt(discriminant)
+			first = (-b - root) / (2.0 * a)
+			second = (-b + root) / (2.0 * a)
+			positive = [value for value in (first, second) if value > 0.0]
+			if positive:
+				lead_time = min(positive)
+	if lead_time is None:
+		# No exact solution (for example a target outrunning a very slow shell).
+		# The distance/speed estimate is still a useful bounded visual lead.
+		lead_time = math.sqrt(c) / speed
+	lead_time = max(0.0, min(float(lead_time), maximum))
+	return (target[0] + vx * lead_time,
+	        target[1] + vy * lead_time,
+	        target[2] + vz * lead_time)
+
+
+def ballistic_solutions(shooter_position, target_position, projectile_speed,
+		gravity, minimum_pitch=-math.pi * 0.5, maximum_pitch=math.pi * 0.5):
+	"""Return physically valid ``(pitch, flight_time)`` solutions.
+
+	BigWorld uses negative gun pitch for elevation.  Results are ordered by
+	flight time, which makes the ordinary low arc the default while retaining a
+	second high arc when the installed gun can actually elevate far enough.
+	"""
+	try:
+		shooter = tuple(float(value) for value in shooter_position[:3])
+		target = tuple(float(value) for value in target_position[:3])
+		speed = float(projectile_speed)
+		acceleration = abs(float(gravity))
+		minimum = float(minimum_pitch)
+		maximum = float(maximum_pitch)
+	except Exception:
+		return ()
+	if speed <= 1.0 or acceleration <= 0.01:
+		return ()
+	dx = target[0] - shooter[0]
+	dz = target[2] - shooter[2]
+	distance = math.sqrt(dx * dx + dz * dz)
+	if distance <= 0.1:
+		return ()
+	dy = target[1] - shooter[1]
+	speed_sq = speed * speed
+	discriminant = (speed_sq * speed_sq - acceleration *
+		(acceleration * distance * distance + 2.0 * dy * speed_sq))
+	if discriminant < 0.0:
+		return ()
+	root = math.sqrt(max(0.0, discriminant))
+	result = []
+	for numerator in (speed_sq - root, speed_sq + root):
+		elevation = math.atan(numerator / (acceleration * distance))
+		pitch = -elevation
+		if pitch < minimum - 0.0001 or pitch > maximum + 0.0001:
+			continue
+		horizontal_speed = speed * math.cos(elevation)
+		if horizontal_speed <= 0.01:
+			continue
+		flight_time = distance / horizontal_speed
+		if flight_time <= 0.0 or flight_time > 30.0:
+			continue
+		value = (pitch, flight_time)
+		if not result or abs(value[0] - result[-1][0]) > 0.00001:
+			result.append(value)
+	result.sort(key=lambda value: value[1])
+	return tuple(result)
+
+
+def ballistic_intercept(shooter_position, target_position, target_velocity,
+		projectile_speed, gravity, minimum_pitch=-math.pi * 0.5,
+		maximum_pitch=math.pi * 0.5, prefer_high=False,
+		max_lead_time=12.0):
+	"""Iteratively lead a moving target using the shell's real parabola.
+
+	Returns ``(aim_point, pitch, flight_time)`` or ``None``.  Four fixed-point
+	iterations are enough for tank velocities while remaining deterministic and
+	cheap enough for the legacy client.
+	"""
+	try:
+		target = tuple(float(value) for value in target_position[:3])
+		velocity = tuple(float(value) for value in target_velocity[:3])
+		maximum_time = max(0.0, float(max_lead_time))
+	except Exception:
+		return None
+	aim = target
+	solution = None
+	for unused in range(4):
+		solutions = ballistic_solutions(
+			shooter_position, aim, projectile_speed, gravity,
+			minimum_pitch, maximum_pitch)
+		if not solutions:
+			return None
+		solution = solutions[-1] if prefer_high else solutions[0]
+		flight_time = min(solution[1], maximum_time) if maximum_time else 0.0
+		aim = (target[0] + velocity[0] * flight_time,
+		       target[1] + velocity[1] * flight_time,
+		       target[2] + velocity[2] * flight_time)
+	if solution is None:
+		return None
+	# Re-solve once for the final lead point so pitch and flight time describe the
+	# exact coordinate returned to the turret controller.
+	solutions = ballistic_solutions(
+		shooter_position, aim, projectile_speed, gravity,
+		minimum_pitch, maximum_pitch)
+	if not solutions:
+		return None
+	solution = solutions[-1] if prefer_high else solutions[0]
+	return (aim, solution[0], solution[1])
+
+
+def ballistic_position(start_position, yaw, pitch, projectile_speed, gravity,
+		flight_time):
+	"""Return one point on the rendered shell parabola."""
+	start = tuple(float(value) for value in start_position[:3])
+	time = max(0.0, float(flight_time))
+	horizontal = math.cos(float(pitch)) * float(projectile_speed)
+	velocity_x = math.sin(float(yaw)) * horizontal
+	velocity_y = -math.sin(float(pitch)) * float(projectile_speed)
+	velocity_z = math.cos(float(yaw)) * horizontal
+	return (start[0] + velocity_x * time,
+	        start[1] + velocity_y * time - 0.5 * abs(float(gravity)) * time * time,
+	        start[2] + velocity_z * time)
+
+
+def ballistic_path(start_position, yaw, pitch, projectile_speed, gravity,
+		flight_time, maximum_step=0.12):
+	"""Sample the exact parabola densely enough for collision chords."""
+	duration = max(0.0, float(flight_time))
+	if duration <= 0.0:
+		return (tuple(start_position[:3]),)
+	step = max(0.02, min(0.25, float(maximum_step)))
+	count = max(1, int(math.ceil(duration / step)))
+	return tuple(ballistic_position(
+		start_position, yaw, pitch, projectile_speed, gravity,
+		duration * float(index) / float(count))
+		for index in range(count + 1))
+
+
 def _identity_phase(bot_id):
 	"""Stable 0..1 value without Python's randomized string hash."""
 	text = str(bot_id)
@@ -38,6 +211,80 @@ def _identity_phase(bot_id):
 	return float(value % 997) / 997.0
 
 
+def _component_value(component, name, default=None):
+	if component is None:
+		return default
+	try:
+		if hasattr(component, 'get'):
+			return component.get(name, default)
+	except Exception:
+		pass
+	try:
+		return getattr(component, name)
+	except Exception:
+		return default
+
+
+def gun_yaw_limits(descriptor):
+	"""Return installed gun yaw limits in radians plus a limited-arc flag."""
+	gun = _component_value(descriptor, 'gun')
+	turret = _component_value(descriptor, 'turret')
+	limits = _component_value(gun, 'turretYawLimits')
+	if limits is None:
+		limits = _component_value(turret, 'yawLimits')
+	minimum = -math.pi
+	maximum = math.pi
+	try:
+		minimum = float(limits[0])
+		maximum = float(limits[1])
+		if abs(minimum) > math.pi + 0.1 or abs(maximum) > math.pi + 0.1:
+			minimum = math.radians(minimum)
+			maximum = math.radians(maximum)
+	except Exception:
+		minimum = -math.pi
+		maximum = math.pi
+	limited = not (minimum <= -math.pi + 0.1 and maximum >= math.pi - 0.1)
+	return minimum, maximum, limited
+
+
+def combat_hull_aim(hull_yaw, target_yaw, minimum_yaw, maximum_yaw,
+		turn, throttle, recovery_mode, has_target=True):
+	"""Turn a limited-traverse hull until its gun can physically bear."""
+	if not has_target or recovery_mode in ('avoid', 'blocked', 'reverse_turn',
+			'pivot_recovery'):
+		return float(turn), float(throttle), False
+	limited = not (float(minimum_yaw) <= -math.pi + 0.1 and
+	               float(maximum_yaw) >= math.pi - 0.1)
+	if not limited:
+		return float(turn), float(throttle), False
+	relative = _angle_delta(target_yaw, hull_yaw)
+	if float(minimum_yaw) + 0.04 <= relative <= float(maximum_yaw) - 0.04:
+		return float(turn), float(throttle), False
+	# Rotate before the physics step. The former post-physics velocity write was
+	# overwritten by LocalDriver on the next frame and never moved the hull.
+	hull_delta = _angle_delta(target_yaw, hull_yaw)
+	aim_turn = max(-1.0, min(1.0, hull_delta / 0.58))
+	return aim_turn, 0.0, True
+
+
+def gun_aligned(target_yaw, hull_yaw, turret_yaw, desired_pitch, gun_pitch,
+		yaw_tolerance=0.06, pitch_tolerance=0.04):
+	"""Require both rendered traverse and elevation to settle before firing."""
+	abs_yaw = float(hull_yaw) + float(turret_yaw)
+	yaw_error = abs(_angle_delta(target_yaw, abs_yaw))
+	pitch_error = abs(float(desired_pitch) - float(gun_pitch))
+	return (yaw_error <= float(yaw_tolerance) and
+	        pitch_error <= float(pitch_tolerance))
+
+
+def barrel_direction(yaw, pitch):
+	"""Unit direction for BigWorld's negative-pitch-is-up convention."""
+	horizontal = math.cos(float(pitch))
+	return (math.sin(float(yaw)) * horizontal,
+	        -math.sin(float(pitch)),
+	        math.cos(float(yaw)) * horizontal)
+
+
 class LocalDriver(object):
 	"""Stateful local steering, keyed only by bot id.
 
@@ -45,7 +292,17 @@ class LocalDriver(object):
 	segment in that direction is drivable.  It may raise; a failed probe is
 	treated as blocked.
 	"""
-	_CANDIDATE_OFFSETS = (0.0, 0.42, -0.42, 0.78, -0.78, 1.18, -1.18)
+	_CANDIDATE_OFFSETS = (
+		0.0, 0.42, -0.42, 0.78, -0.78, 1.18, -1.18, 1.55, -1.55)
+	gun_yaw_limits = staticmethod(gun_yaw_limits)
+	combat_hull_aim = staticmethod(combat_hull_aim)
+	gun_aligned = staticmethod(gun_aligned)
+	barrel_direction = staticmethod(barrel_direction)
+	intercept_point = staticmethod(intercept_point)
+	ballistic_solutions = staticmethod(ballistic_solutions)
+	ballistic_intercept = staticmethod(ballistic_intercept)
+	ballistic_position = staticmethod(ballistic_position)
+	ballistic_path = staticmethod(ballistic_path)
 
 	def __init__(self, stuck_seconds=1.8, recovery_seconds=0.85,
 			separation_radius=12.0, failure_ttl=2.0):
@@ -54,6 +311,22 @@ class LocalDriver(object):
 		self.separation_radius = max(2.0, float(separation_radius))
 		self.failure_ttl = max(0.25, float(failure_ttl))
 		self.states = {}
+
+	@staticmethod
+	def resolve_order_positions(position, aim_position, move_position, face_position):
+		"""Resolve optional tactical targets without mistaking travel for a hold."""
+		stop_without_route = aim_position is None and move_position is None
+		if stop_without_route:
+			aim_position = position
+		elif aim_position is None:
+			# Server route orders intentionally omit an aim target until an enemy is
+			# spotted.  Use the route target for facing, but do not apply idle braking.
+			aim_position = move_position
+		if move_position is None:
+			move_position = aim_position
+		if face_position is None:
+			face_position = move_position
+		return aim_position, move_position, face_position, stop_without_route
 
 	def forget(self, bot_id):
 		self.states.pop(bot_id, None)
@@ -73,6 +346,9 @@ class LocalDriver(object):
 				'phase': phase,
 				'clock': 0.0,
 				'failed_yaws': {},
+				'escape_side': 0.0,
+				'escape_side_until': 0.0,
+				'last_desired_yaw': None,
 			}
 			self.states[bot_id] = state
 		return state
@@ -91,7 +367,21 @@ class LocalDriver(object):
 			return
 		if ttl is None:
 			ttl = self.failure_ttl
-		state['failed_yaws'][self._yaw_key(yaw)] = state['clock'] + max(0.1, float(ttl))
+		ttl = max(0.1, float(ttl))
+		state['failed_yaws'][self._yaw_key(yaw)] = state['clock'] + ttl
+		desired = state.get('last_desired_yaw')
+		offset = _angle_delta(yaw, desired) if desired is not None else 0.0
+		if abs(offset) >= 0.10:
+			side = 1.0 if offset > 0.0 else -1.0
+		else:
+			# Adjacent ids choose opposite initial sides, then retain that side while
+			# widening the escape angle. This prevents left/right wall grinding and
+			# also helps two touching hulls stop mirroring each other.
+			side = 1.0 if (int(state['phase'] * 997.0 + 0.5) & 1) else -1.0
+		state['escape_side'] = side
+		state['escape_side_until'] = state['clock'] + min(2.0, max(0.8, ttl))
+		state['steering_yaw'] = None
+		state['plan_age'] = 999.0
 
 	def _failure_penalty(self, state, yaw):
 		key = self._yaw_key(yaw)
@@ -118,7 +408,14 @@ class LocalDriver(object):
 			return neighbour.get('position') or neighbour.get('pos')
 		return neighbour
 
-	def _separation_yaw(self, position, neighbours):
+	def _separation_yaw(self, position, desired_yaw, neighbours,
+			half_length, half_width):
+		"""Return an escape heading only for hulls that already overlap.
+
+		Moving OBB prediction handles impending collisions. Treating every tank
+		inside a broad radius as an emergency made harmless side-by-side traffic
+		continually override the route and visibly reconsider its steering.
+		"""
 		push_x = 0.0
 		push_z = 0.0
 		for neighbour in neighbours or ():
@@ -143,7 +440,18 @@ class LocalDriver(object):
 				continue
 			if dist < 0.05 or dist >= self.separation_radius:
 				continue
-			weight = (self.separation_radius - dist) / self.separation_radius
+			other_yaw = 0.0
+			other_length = half_length
+			other_width = half_width
+			if isinstance(neighbour, dict):
+				other_yaw = float(neighbour.get('yaw', 0.0) or 0.0)
+				other_length = float(neighbour.get('half_length', half_length) or half_length)
+				other_width = float(neighbour.get('half_width', half_width) or half_width)
+			if not self._obb_overlap(
+					position, desired_yaw, half_length + 0.20, half_width + 0.20,
+					other, other_yaw, other_length + 0.20, other_width + 0.20):
+				continue
+			weight = max(0.15, (self.separation_radius - dist) / self.separation_radius)
 			push_x += dx / dist * weight
 			push_z += dz / dist * weight
 		if abs(push_x) + abs(push_z) < 0.001:
@@ -194,6 +502,13 @@ class LocalDriver(object):
 				neighbours, half_length, half_width):
 		"""Reject a locally clear ray if its next 1.2s overlaps another OBB."""
 		own_speed = max(0.0, abs(float(speed)))
+		# At walking pace there is not enough velocity for an OBB extrapolation
+		# to be useful.  In a dense line-up it instead predicts every neighbour's
+		# acceleration against a nearly stationary hull and vetoes all exits.
+		# Separation steering and the physical tank resolver remain active; resume
+		# predictive collision avoidance once the bot has actually got moving.
+		if own_speed < 1.25:
+			return True
 		desired_vx = math.sin(candidate_yaw) * own_speed
 		desired_vz = math.cos(candidate_yaw) * own_speed
 		actual_vx, actual_vz = self._velocity(velocity)
@@ -224,6 +539,14 @@ class LocalDriver(object):
 				other_length = float(neighbour.get('half_length', half_length) or half_length)
 				other_width = float(neighbour.get('half_width', half_width) or half_width)
 			other_vx, other_vz = self._velocity(other_velocity)
+			# Spawn formations can place two hull boxes slightly inside each other.
+			# Treating that existing overlap as a future collision rejects every
+			# steering candidate, so all bots stop and enter the recovery turn loop.
+			# Separation steering already handles this case; predictive vetoes resume
+			# as soon as the hulls have moved apart.
+			if self._obb_overlap(position, candidate_yaw, half_length, half_width,
+					other, other_yaw, other_length, other_width):
+				continue
 			for horizon in (0.35, 0.75, 1.20):
 				own = (float(position[0]) + own_vx * horizon, 0.0,
 				       float(position[2]) + own_vz * horizon)
@@ -236,11 +559,18 @@ class LocalDriver(object):
 
 	def _choose_yaw(self, state, desired_yaw, position, speed, velocity,
 				neighbours, direction_clear, half_length, half_width):
-		separation = self._separation_yaw(position, neighbours)
+		separation = self._separation_yaw(
+			position, desired_yaw, neighbours, half_length, half_width)
 		candidates = []
 		for offset in self._CANDIDATE_OFFSETS:
 			candidate = desired_yaw + offset
 			score = abs(offset) + self._failure_penalty(state, candidate)
+			if (state.get('escape_side_until', 0.0) > state['clock'] and
+					float(offset) * float(state.get('escape_side', 0.0)) < -0.01):
+				# Continue around the selected side of a broad obstacle before trying
+				# the opposite side. The bias is finite, so an exhausted side still
+				# falls back to the other candidate fan.
+				score += 1.25
 			if separation is not None:
 				# When bodies overlap, separation outranks route alignment; otherwise
 				# two tanks can choose the same narrow opening forever.
@@ -257,7 +587,8 @@ class LocalDriver(object):
 		return None
 
 	def drive(self, bot_id, position, yaw, speed, dt, target, neighbours,
-			direction_clear, velocity=None, half_length=3.5, half_width=1.7):
+			direction_clear, velocity=None, half_length=3.5, half_width=1.7,
+			movement_intent=True):
 		"""Return ``throttle``, ``turn``, ``target_yaw`` and ``recovery_mode``.
 
 		All timing uses supplied seconds.  ``dt`` is clamped so a paused client
@@ -270,10 +601,36 @@ class LocalDriver(object):
 		state['steering_age'] += step
 		state['plan_age'] += step
 		desired_yaw = _yaw_to(position, target)
+		state['last_desired_yaw'] = desired_yaw
+		target_distance = _distance(position, target)
+		if not movement_intent:
+			# Cover/engagement orders intentionally stop within a tolerance. Do not
+			# reinterpret that commanded hold as a stuck tank 1.8 seconds later.
+			state['stuck_time'] = 0.0
+			state['recovery_time'] = 0.0
+			state['steering_yaw'] = None
+			return {
+				'throttle': 0.0,
+				'turn': 0.0,
+				'target_yaw': float(yaw),
+				'recovery_mode': 'arrived',
+			}
 		displacement = _distance((position[0], 0.0, position[2]),
 		                         (state['last_position'][0], 0.0,
 		                          state['last_position'][1]))
 		state['last_position'] = (float(position[0]), float(position[2]))
+		if target_distance <= 1.5:
+			# Reaching a waypoint is a stop, not a request to drive north: atan2(0, 0)
+			# is zero and previously produced full throttle until the next order tick.
+			state['stuck_time'] = 0.0
+			state['recovery_time'] = 0.0
+			state['steering_yaw'] = None
+			return {
+				'throttle': 0.0,
+				'turn': 0.0,
+				'target_yaw': float(yaw),
+				'recovery_mode': 'arrived',
+			}
 
 		# A low reported speed alone is not enough: waiting at a hold point should
 		# not trigger recovery.  Both physical displacement and velocity must fail.
@@ -297,12 +654,25 @@ class LocalDriver(object):
 
 		if state['recovery_time'] > 0.0:
 			# Alternate the turn direction each recovery so a bot does not grind a
-			# wall forever.  Phase makes adjacent ids leave a traffic jam apart.
+			# wall forever.  Phase makes adjacent ids leave a traffic jam apart. Never
+			# reverse blindly: at a cliff or shoreline the space behind the hull can be
+			# the unsafe side that caused the stall in the first place.
 			direction = 1.0 if ((state['recovery_count'] + int(state['phase'] * 10)) % 2) else -1.0
 			recovery_yaw = float(yaw) + direction * 0.85
+			if not self._clear(direction_clear, float(yaw) + math.pi):
+				return {
+					'throttle': 0.0,
+					'turn': direction,
+					'target_yaw': recovery_yaw,
+					'recovery_mode': 'pivot_recovery',
+				}
+			# Reverse recovery is an explicit reverse command. physics.traverse_step
+			# flips steering from that command immediately (not from signed velocity),
+			# so invert the target-yaw command for the entire recovery manoeuvre.
+			recovery_turn = -direction
 			return {
 				'throttle': -0.72,
-				'turn': direction,
+				'turn': recovery_turn,
 				'target_yaw': recovery_yaw,
 				'recovery_mode': 'reverse_turn',
 			}
@@ -311,10 +681,10 @@ class LocalDriver(object):
 		own_half_width = max(0.3, float(half_width))
 		chosen_yaw = None
 		old_yaw = state.get('steering_yaw')
-		# Keep a recently selected steering direction for 180 ms, but revalidate
+		# Keep a recently selected steering direction for 350 ms, but revalidate
 		# both the hard terrain probe and moving OBBs every frame. This avoids a
-		# full seven-way probe when the previous safe direction still works.
-		if (old_yaw is not None and state['plan_age'] < 0.18 and
+		# visible left/right reconsideration when nearby traffic moves slightly.
+		if (old_yaw is not None and state['plan_age'] < 0.35 and
 				abs(_angle_delta(desired_yaw, old_yaw)) < 0.70 and
 				self._failure_penalty(state, old_yaw) <= 0.0 and
 				self._clear(direction_clear, old_yaw) and
@@ -347,14 +717,28 @@ class LocalDriver(object):
 
 		delta = _angle_delta(chosen_yaw, yaw)
 		turn = max(-1.0, min(1.0, delta / 0.58))
+		# This branch always commands forward drive. Signed speed can still be
+		# negative while braking a recovery or sliding downhill, but steering must
+		# retain its forward response until the command itself becomes reverse.
+		avoiding = abs(_angle_delta(chosen_yaw, desired_yaw)) > 0.05
 		throttle = 1.0
-		if abs(delta) > 1.0:
-			throttle = 0.35
-		elif abs(delta) > 0.55:
-			throttle = 0.62
+		climb_grade = ((float(target[1]) - float(position[1])) /
+		               max(0.1, target_distance))
+		if climb_grade > 0.10 and abs(delta) > 0.30 and not avoiding:
+			# A graph edge may be climbable head-on but not when the hull cuts onto
+			# it diagonally.  Align at the foot of a meaningful ascent before asking
+			# for drive torque; this is a steering constraint, not a map-specific
+			# forbidden zone or a lower throttle cap.
+			throttle = 0.0
+		elif abs(delta) > 1.35 and not avoiding:
+			# A target more than about 77 degrees off the bow is a pivot, not a
+			# clearing arc. Driving while applying full steering makes a deployed
+			# formation draw a loop before it can enter its lane. Separation remains
+			# allowed to move an overlapping hull sideways out of a dense spawn.
+			throttle = 0.0
 		return {
 			'throttle': throttle,
 			'turn': turn,
 			'target_yaw': chosen_yaw,
-			'recovery_mode': 'avoid' if abs(_angle_delta(chosen_yaw, desired_yaw)) > 0.05 else 'drive',
+			'recovery_mode': 'avoid' if avoiding else 'drive',
 		}

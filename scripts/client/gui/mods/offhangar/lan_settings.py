@@ -30,6 +30,7 @@ _diagnostic_logged = False
 _entry_panel = None
 _entry_text = None
 _entry_script = None
+_entry_hovered = False
 _entry_poll_scheduled = False
 _game_key_hook_installed = False
 
@@ -99,40 +100,47 @@ def _notify(message, level='information'):
 		return False
 
 
+def _set_native_cursor_visible(visible):
+	"""Use the stock lobby cursor owner for native GUI layered above Scaleform.
+
+	Calling ``GUI.mcursor`` directly bypasses gui.Cursor's ownership counter. On
+	some Windows/Parallels combinations that leaves the host busy/resize pointer
+	visible above the game. The stock helper is the path used by the working
+	waiting-room overlay and restores the direct-input cursor on release.
+	"""
+	try:
+		from gui.Cursor import showCursor
+		showCursor(bool(visible))
+		return True
+	except Exception:
+		try:
+			import BigWorld, GUI
+			if visible:
+				BigWorld.setCursor(GUI.mcursor())
+				GUI.mcursor().visible = True
+			else:
+				GUI.mcursor().visible = False
+				BigWorld.setCursor(BigWorld.dcursor())
+			return True
+		except Exception:
+			return False
+
+
 def _acquire_cursor():
 	global _cursor_acquired
 	if _cursor_acquired:
 		return
-	try:
-		# gui.Cursor.showCursor is the exact reference-counted API used by the
-		# 0.8.2 client. It switches BigWorld to GUI.mcursor and makes it visible.
-		from gui.Cursor import showCursor
-		showCursor(True)
+	if _set_native_cursor_visible(True):
 		_cursor_acquired = True
-	except Exception:
-		try:
-			import BigWorld, GUI
-			BigWorld.setCursor(GUI.mcursor())
-			GUI.mcursor().visible = True
-			_cursor_acquired = True
-		except Exception:
-			_log_error('LAN settings could not show the mouse cursor')
+	else:
+		_log_error('LAN settings could not show the mouse cursor')
 
 
 def _release_cursor():
 	global _cursor_acquired
 	if not _cursor_acquired:
 		return
-	try:
-		from gui.Cursor import showCursor
-		showCursor(False)
-	except Exception:
-		try:
-			import BigWorld, GUI
-			GUI.mcursor().visible = False
-			BigWorld.setCursor(BigWorld.dcursor())
-		except Exception:
-			pass
+	_set_native_cursor_visible(False)
 	_cursor_acquired = False
 
 
@@ -163,9 +171,16 @@ class _EntryScript(object):
 		return True
 
 	def handleMouseEnterEvent(self, component):
+		global _entry_hovered
+		_entry_hovered = True
+		_acquire_cursor()
 		return True
 
 	def handleMouseLeaveEvent(self, component):
+		global _entry_hovered
+		_entry_hovered = False
+		if not _active:
+			_release_cursor()
 		return True
 
 	def handleMouseButtonEvent(self, component, event):
@@ -259,12 +274,16 @@ def _refresh_entry():
 
 
 def _set_entry_visible(value):
+	global _entry_hovered
 	if _entry_panel is not None:
 		_safe_set(_entry_panel, 'visible', bool(value))
 	if _entry_text is not None:
 		_safe_set(_entry_text, 'visible', bool(value))
 	if value:
 		_refresh_entry()
+	elif _entry_hovered and not _active:
+		_entry_hovered = False
+		_release_cursor()
 
 
 def _make_entry():
@@ -564,6 +583,7 @@ def _refresh():
 	_safe_set(_panel, 'visible', True)
 	_set_controls_visible(True)
 	_paint_controls()
+	_acquire_cursor()
 
 
 def open():
@@ -577,6 +597,8 @@ def open():
 		return False
 	_active = True
 	_acquire_cursor()
+	# Match the working waiting-room overlay: the parent window owns focus and
+	# its GUI.Simple children own the individual mouse targets.
 	_safe_set(_panel, 'focus', True)
 	_set_entry_visible(False)
 	_refresh()
@@ -585,8 +607,9 @@ def open():
 
 
 def close():
-	global _active
+	global _active, _entry_hovered
 	_active = False
+	_entry_hovered = False
 	if _panel is not None:
 		_safe_set(_panel, 'visible', False)
 		_safe_set(_panel, 'focus', False)
@@ -750,7 +773,10 @@ def handle_key_event(event):
 			close()
 			return False
 		if not _is_down(event):
-			return True
+			# Mouse buttons also arrive here as key-up events in 0.8.2.  Only
+			# consume the keyboard actions handled below; otherwise the native GUI
+			# controls never receive their click.
+			return False
 		if key == _key(Keys, 'KEY_ESCAPE'):
 			close()
 			return True
@@ -779,7 +805,9 @@ def handle_key_event(event):
 			_status = ''
 			_refresh()
 			return True
-		return True
+		# Do not swallow mouse buttons or unrelated lobby shortcuts while the
+		# panel is open.  GUI.Simple dispatches its click after this global hook.
+		return False
 	except Exception:
 		try:
 			import traceback

@@ -1,5 +1,7 @@
-World of Tanks 0.8.2 LAN package (protocol 5)
-=================================================
+World of Tanks 0.8.2 Offline/LAN v1.0.1 (protocol 8)
+=====================================================
+
+Read START_HERE.txt for the shortest installation and startup path.
 
 Client installation (repeat on every Windows machine)
 ------------------------------------------------------
@@ -23,10 +25,13 @@ Start the included server
 -------------------------
 
 Replace every older client package and lan_battle_server.py with the files in
-THIS package. Protocol 5 is intentionally incompatible with older client/server
-builds, so every player and the server must use this same package.
+THIS package. Protocol 8 and client build 1.8.19 are intentionally incompatible
+with older client/server builds, so every player and the server must use this
+same package.
 
-On the one machine that has Python 3, open a terminal in this package folder:
+Install Python 3 from https://www.python.org/downloads/ on the one machine that
+will host LAN battles. Then double-click RUN_SERVER.bat on Windows or
+RUN_SERVER.command on macOS. The equivalent terminal command is:
 
     python3 lan_battle_server.py --host 0.0.0.0 --port 28782
 
@@ -48,10 +53,13 @@ Bots in this build
 
 - Standard base-capture battles are supported; assault and encounter variants
   are intentionally outside this build.
-- All 33 stock maps have macro tactical routes.
-- Terrain-aware A* connects strategic anchors while local feelers avoid cliffs,
-  deep water, hard obstacles, nearby tanks and congestion.
+- All 33 stock maps ship with validated tactical routes and prebaked terrain
+  navigation graphs.
+- Bounded weighted A* follows those graphs while local feelers avoid cliffs,
+  deep water, hard obstacles, nearby tanks and congestion. Shallow fords are
+  allowed only at an explicit extra path cost.
 - Vehicle roles cover brawling, support, flanking, sniping, scouting and SPGs.
+- Each team has at most one SPG, including any SPG selected by a LAN player.
 - Bots have stable individual aggression, caution, teamwork and driving habits.
 - Combat behavior includes limited spotting information, target memory, hull
   angling, peek-and-withdraw timing and occasional forward/backward jiggling.
@@ -61,9 +69,10 @@ Bots in this build
 LAN synchronization
 -------------------
 
-- The server owns global target reservations, route progression and revisioned
-  bot orders. One elected client supplies limited spotting observations and
-  executes map collision, local steering, shell/armor and battle-rule work.
+- The server owns global target reservations, route progression, revisioned bot
+  orders and static weighted-A* paths over the shipped navigation graphs. One
+  elected client supplies limited spotting observations and executes exact map
+  collision, local steering, shell/armor and battle-rule work.
 - Every client receives shared bot identity, movement, aiming, firing, HP,
   deaths, wreck positions, capture progress and the final battle result.
 - If the authority disconnects, the server elects another connected client.
@@ -74,8 +83,9 @@ Current boundary
 ----------------
 
 This is a trusted-LAN implementation, not the original retail BigWorld server.
-The elected client still owns map collision, bot AI and client physics. Hidden
-AI state is not preserved perfectly across authority failover, and complete
+The elected client still owns native map collision, short-range steering,
+combat execution and client physics. Hidden runtime state is not preserved
+perfectly across authority failover, and complete
 module/crew synchronization, reconnection recovery, anti-cheat, NAT traversal
 and internet-safe authentication are outside this build. See LAN_SERVER.md for
 detailed diagnostics and the protocol boundary.

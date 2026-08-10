@@ -51,6 +51,13 @@ class OfflineEnqueueLifecycleTest(unittest.TestCase):
         self.assertEqual(["enqueue", "schedule"], [item[0] for item in steps])
         self.assertFalse(player._offhangar_queue_pending)
 
+    def test_first_click_is_not_discarded_during_recent_account_boot(self):
+        begin, player, callbacks, unused_steps = load_begin_queue()
+        player._offline_boot_time = 99.9
+
+        self.assertTrue(begin(player, 17, "CMD_ENQUEUE_RANDOM"))
+        self.assertEqual(1, len(callbacks))
+
     def test_cancelled_generation_cannot_boot_from_stale_callback(self):
         begin, player, callbacks, steps = load_begin_queue()
 

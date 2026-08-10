@@ -43,7 +43,7 @@ COHESION = 1.3                 # WG: physics.brakeFriction (brake/hold grip)
 # lower values refuse slopes the map designers built to be drivable (Dragon Ridge
 # became near-unplayable at 0.43 = 19.6 deg). Raise drive_traction in config to
 # climb steeper.
-DRIVE_TRACTION = 0.46
+DRIVE_TRACTION = 0.54
 # Track-slip drag when rolling UP a grade past SLIP_THRESHOLD_TAN: extra
 # deceleration = SLIP_DRAG * (tan(grade) - SLIP_THRESHOLD_TAN) * g. Bleeds the
 # 'coast up a mountain on momentum' - real tracks slip and stop dead.
@@ -58,8 +58,8 @@ DRIVE_TRACTION = 0.46
 # SLIP_DRAG shapes the ramp above the threshold. 20.0 was a cliff (20 m/s^2 by
 # 28 deg) that killed every partial climb; 10.0 stays progressive - ~0.9 m/s^2 at
 # 26 deg (a near-limit slope still feels dynamic), 11.9 at 30 deg, 27 at 35 deg.
-SLIP_THRESHOLD_TAN = 0.40   # 21.8 deg: just above the 21.0 deg effective climb limit
-SLIP_DRAG = 14.0
+SLIP_THRESHOLD_TAN = 0.48   # 25.6 deg: just above the 24.8 deg effective climb limit
+SLIP_DRAG = 10.0
 FORWARD_FRICTION = 0.07        # WG: physics.forwardFriction (rolling)
 # WG scales enginePower by GRAVITY_FACTOR_SCALED (0.00125) against masses in
 # tons (WEIGHT_SCALE 0.001): net effect, drive power acts 1.25x its SI value.
@@ -108,7 +108,7 @@ SLIDE_DRAG = 1.5
 # the tracks perch only up to ~atan(SLIDE_HOLD_TAN); steeper ground slides off.
 # Gentler than the brake COHESION (~52 deg) so a tank cannot cling to steep
 # banks/cliffs. Deceleration (braking/coast) still uses the full COHESION grip.
-SLIDE_HOLD_TAN = 0.44   # 23.7 deg static perch - must exceed the 21.0 deg climb limit, else a hull slides off the very slope it just drove up
+SLIDE_HOLD_TAN = 0.50   # 26.6 deg static perch - must exceed the 24.8 deg climb limit, else a hull slides off the very slope it just drove up
 # Kinetic (slipping) track drag while the hull slides BACK down a grade it could
 # not climb - lower than the static hold so it does not hang mid-slope; it bleeds
 # down to the foot at a controlled speed. Lower = slides faster/further.
@@ -309,11 +309,11 @@ def engine_force(p, v, throttle, slope_pitch=0.0):
 
 	Drive force can never exceed the DRIVE TRACTION on the current slope:
 	fmax = DRIVE_TRACTION * m * g * cos(theta) = drive traction x normal force.
-	DRIVE_TRACTION (~0.75) is the track-vs-ground grip for PULLING, distinct
+	DRIVE_TRACTION (0.54) is the track-vs-ground grip for PULLING, distinct
 	from and lower than the brake/hold COHESION (1.3): a tank can lock its
 	tracks and hold a slope it cannot power UP. This makes the climb limit
-	emergent AND realistic (~atan(0.75) ~= 35 deg): steeper than that the
-	grip-limited drive can't beat m*g*sin(theta), the hull stalls - it does NOT
+	emergent at the stock ~25 deg boundary after rolling resistance: beyond it the
+	grip-limited drive can't beat m*g*sin(theta), so the hull stalls - it does NOT
 	climb 40-50 deg walls the way a cohesion(1.3) cap wrongly allowed.'''
 	if throttle == 0:
 		return 0.0
@@ -504,18 +504,27 @@ def longitudinal_step(p, v, throttle, steering, slope_pitch, dt,
 	return nv
 
 
-def traverse_step(p, omega, steer_dir, v, dt, terrainIdx=0):
+def traverse_step(p, omega, steer_dir, v, dt, terrainIdx=0, drive_intent=0.0):
 	'''One integration step of hull rotation speed (rad/s). WG 0.8.2: driving
 	speed does NOT slow the traverse (SPEED_AFFECT_ROT_DECREASE = 0.0) and the
 	rate ramps to full in ANG_ACCELERATION_TIME (50 ms). Medium/soft ground
 	scales by the terrain-resistance ratio (the sim couples the limit to
-	terrainResistance).'''
+	terrainResistance).
+
+	Steering sign follows the explicit drive command, never signed velocity.
+	A tank sliding backwards while W/forward is held must retain forward
+	steering; S or reverse cruise flips steering immediately, even while the
+	hull still has forward momentum. Neutral rolling keeps the forward sign.'''
 	speed_ratio = abs(v) / max(p['speedFwd'], 0.1)
 	rot_mod = 1.0 / (1.0 + speed_ratio * SPEED_AFFECT_ROT_DECREASE)
 	ter_mod = p['terrainResist'][0] / p['terrainResist'][terrainIdx]
 	max_rot = p['rotSpd'] * rot_mod * ter_mod
 
-	target = steer_dir * max_rot
+	# A tracked vehicle yaws the opposite way for the same steering input while
+	# intentionally reversing. Velocity is not intent: gravity or a collision can
+	# push the hull backwards while the driver is still commanding forward.
+	intent_sign = -1.0 if drive_intent < 0.0 else 1.0
+	target = steer_dir * intent_sign * max_rot
 	diff = target - omega
 	ramp = max_rot / ANG_ACCELERATION_TIME
 	if abs(diff) < ramp * dt:

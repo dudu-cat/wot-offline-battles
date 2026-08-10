@@ -8,6 +8,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NETWORK_PATH = ROOT / "scripts/client/gui/mods/offhangar/network_battle.py"
+VEHICLE_POSE_PATH = ROOT / "scripts/client/gui/mods/offhangar/vehicle_pose.py"
+BOT_AI_DRIVER_PATH = ROOT / "scripts/client/gui/mods/offhangar/bot_ai_driver.py"
 
 
 def load_network_module():
@@ -44,6 +46,20 @@ def load_network_module():
     logging_module.LOG_ERROR = lambda *args: None
     logging_module.LOG_NOTE = lambda *args: None
     sys.modules[logging_module.__name__] = logging_module
+
+    pose_spec = importlib.util.spec_from_file_location(
+        "gui.mods.offhangar.vehicle_pose", VEHICLE_POSE_PATH
+    )
+    pose_module = importlib.util.module_from_spec(pose_spec)
+    sys.modules[pose_spec.name] = pose_module
+    pose_spec.loader.exec_module(pose_module)
+
+    driver_spec = importlib.util.spec_from_file_location(
+        "gui.mods.offhangar.bot_ai_driver", BOT_AI_DRIVER_PATH
+    )
+    driver_module = importlib.util.module_from_spec(driver_spec)
+    sys.modules[driver_spec.name] = driver_module
+    driver_spec.loader.exec_module(driver_module)
 
     notices = []
     system_messages = types.ModuleType("gui.SystemMessages")
@@ -118,6 +134,94 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertAlmostEqual(1.0 / 30.0, self.network.BOT_STATE_INTERVAL)
         self.assertAlmostEqual(1.0 / 60.0, self.network.POLL_INTERVAL)
 
+    def test_bot_snapshot_due_check_skips_rejected_render_frames(self):
+        client = self.network.LANClient(
+            Player(), "127.0.0.1", 28782, "Alpha", "china:Ch01_Type59"
+        )
+        client._last_bot_state = self.network.time.time()
+
+        self.assertFalse(client.bot_states_due())
+
+    def test_authority_snapshot_reuses_one_server_coordinate_frame(self):
+        calls = []
+        sent = []
+        player = Player()
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_formation = lambda team, slot: (
+            calls.append((team, slot)) or
+            ((0.0, 0.0, 0.0) if team == 1 else (100.0, 0.0, 3.14))
+        )
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True,
+            phase="battle",
+            bot_states_due=lambda: True,
+            send_bot_states=lambda states: sent.extend(states) or True,
+        )
+        mocks = {}
+        for index in range(3):
+            mocks[index] = types.SimpleNamespace(
+                id=index,
+                _network_bot_id=index + 1,
+                position=types.SimpleNamespace(x=float(index), y=0.0, z=10.0),
+                yaw=0.0,
+                _turret_yaw=0.1,
+                _gun_pitch=0.0,
+                _veh_velocity=0.0,
+                _veh_turn_velocity=0.0,
+                _network_bot_fire_seq=0,
+                _network_bot_shell_index=0,
+                health=100,
+                isAlive=True,
+                last_killer_id=None,
+            )
+
+        self.assertTrue(self.network.publish_authoritative_bots(player, mocks))
+        self.assertEqual([(1, 0), (2, 0)], calls)
+        self.assertEqual(3, len(sent))
+        self.assertAlmostEqual(sent[0]["yaw"] + 0.1, sent[0]["aim_yaw"])
+
+    def test_worker_sends_hello_before_exposing_connected_socket(self):
+        player = Player()
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "china:Ch01_Type59"
+        )
+        sent = []
+
+        class FakeSocket:
+            def setsockopt(self, *args):
+                pass
+
+            def settimeout(self, timeout):
+                pass
+
+            def connect(self, address):
+                pass
+
+            def sendall(self, payload):
+                self_outer.assertFalse(client.connected)
+                sent.append(self_outer.network.json.loads(payload.decode("utf-8")))
+
+            def recv(self, size):
+                return b""
+
+            def close(self):
+                pass
+
+        self_outer = self
+        fake = FakeSocket()
+        original_socket = self.network.socket.socket
+        self.network.socket.socket = lambda *args: fake
+        client.running = True
+        try:
+            client._worker()
+        finally:
+            self.network.socket.socket = original_socket
+
+        self.assertEqual("hello", sent[0]["type"])
+        self.assertEqual(self.network.PROTOCOL_VERSION, sent[0]["protocol"])
+        self.assertEqual(self.network.CLIENT_BUILD, sent[0]["client_build"])
+        self.assertEqual("china:Ch01_Type59", sent[0]["vehicle"])
+
     def test_start_button_does_not_replace_battle_join(self):
         player = Player()
 
@@ -162,14 +266,20 @@ class LANClientQueueTest(unittest.TestCase):
             "candidates": [{"id": "rock"}],
         }]
 
+        navigation = {
+            "total": {"safe_direct": 2, "safe_local": 3, "reactive": 1},
+            "active": {"safe_direct": 0, "safe_local": 1, "reactive": 1},
+            "recovered": 4,
+        }
         self.assertTrue(client.send_bot_observation(
             [{"observing_team": 1, "target_id": 7, "target_kind": "bot",
-              "target_team": 2, "position": (0, 0, 1)}], affordances
+              "target_team": 2, "position": (0, 0, 1)}], affordances, navigation
         ))
 
         self.assertEqual("bot_observation", sent[-1]["type"])
         self.assertEqual(affordances, sent[-1]["affordances"])
         self.assertEqual(1, len(sent[-1]["contacts"]))
+        self.assertEqual(navigation, sent[-1]["navigation"])
 
     def test_observation_failed_send_does_not_consume_throttle_window(self):
         player = Player()
@@ -186,19 +296,35 @@ class LANClientQueueTest(unittest.TestCase):
         finally:
             self.network.time.time = old_time
 
+    def test_observation_due_avoids_rebuilding_throttled_payloads(self):
+        player = Player()
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        old_time = self.network.time.time
+        self.network.time.time = lambda: 10.0
+        try:
+            client._last_bot_observation = 9.70
+            self.assertFalse(client.bot_observation_due())
+            client._last_bot_observation = 9.50
+            self.assertTrue(client.bot_observation_due())
+        finally:
+            self.network.time.time = old_time
+
     def test_publish_observation_caps_before_conversion_and_whitelists_candidates(self):
         player = Player()
         captured = []
         player._offhangar_network_is_authority = True
         player._offhangar_network_client = types.SimpleNamespace(
             ready=True, phase="battle",
-            send_bot_observation=lambda contacts, affordances: captured.append(
-                (contacts, affordances)) or True,
+            send_bot_observation=lambda contacts, affordances, navigation: captured.append(
+                (contacts, affordances, navigation)) or True,
         )
         contact = {
             "observing_team": 1, "target_id": 7, "target_kind": "bot", "target_team": 2,
             "position": (1, 2, 3), "health": 100, "max_health": 200,
             "class_tag": "heavyTank", "armor": 80, "visible": True,
+            "shootable_by_bot_ids": [16, 16, -1, "17", "bad"],
         }
         candidate = {
             "id": "rock", "position": (4, 5, 6), "peek_position": (7, 8, 9),
@@ -209,12 +335,61 @@ class LANClientQueueTest(unittest.TestCase):
         reports = [{"bot_id": index, "target_id": 7, "target_kind": "bot",
                     "candidates": [candidate] * 13} for index in range(20)]
 
-        self.assertTrue(self.network.publish_bot_observation(player, [contact] * 65, reports))
-        contacts, affordances = captured[0]
+        raw_navigation = {
+            "graph": {"source": "baked", "cell_mm": 4000, "nodes": 16808,
+                      "ignored": 999},
+            "total": {"safe_direct": 2, "safe_local": 3, "reactive": -5,
+                      "ignored": 999},
+            "active": {"safe_direct": 0, "safe_local": 1, "reactive": 2},
+            "recovered": 4,
+            "search": {"pending": 13, "completed": 4, "failed": 2,
+                       "oldest_ms": 12345, "ignored": 999},
+            "aim": {"alive": 29, "targeted": 15, "aligned": 4,
+                    "traversing": 11, "limited": 7, "ignored": 999},
+            "driver": {"moving": 9, "drive": 8, "avoid": 3,
+                       "blocked": 6, "recovery": 7, "arrived": 5,
+                       "water_guard": 2, "full": 12, "cruise": 10,
+                       "speed_pct": 341, "slow": 3, "ignored": 999},
+            "safety": {"water_guard_total": 100005, "water_guard_active": 2,
+                       "edge_guard_total": 17, "edge_guard_active": 1,
+                       "veto_water": 4, "veto_terrain": 3,
+                       "veto_obstacle": 2, "veto_error": 1,
+                       "ignored": 999},
+        }
+        self.assertTrue(self.network.publish_bot_observation(
+            player, [contact] * 65, reports, raw_navigation
+        ))
+        self.assertEqual([16, 17], captured[0][0][0]["shootable_by_bot_ids"])
+        contacts, affordances, navigation = captured[0]
         self.assertEqual(64, len(contacts))
         self.assertEqual(16, len(affordances))
         self.assertEqual(12, len(affordances[0]["candidates"]))
         self.assertNotIn("not_json", affordances[0]["candidates"][0])
+        self.assertEqual(0, navigation["total"]["reactive"])
+        self.assertEqual(3, navigation["total"]["safe_local"])
+        self.assertNotIn("ignored", navigation["total"])
+        self.assertEqual(4, navigation["recovered"])
+        self.assertEqual("baked", navigation["graph"]["source"])
+        self.assertEqual(16808, navigation["graph"]["nodes"])
+        self.assertNotIn("ignored", navigation["graph"])
+        self.assertEqual(13, navigation["search"]["pending"])
+        self.assertEqual(12345, navigation["search"]["oldest_ms"])
+        self.assertNotIn("ignored", navigation["search"])
+        self.assertEqual(15, navigation["aim"]["targeted"])
+        self.assertEqual(11, navigation["aim"]["traversing"])
+        self.assertNotIn("ignored", navigation["aim"])
+        self.assertEqual(9, navigation["driver"]["moving"])
+        self.assertEqual(6, navigation["driver"]["blocked"])
+        self.assertEqual(2, navigation["driver"]["water_guard"])
+        self.assertEqual(12, navigation["driver"]["full"])
+        self.assertEqual(10, navigation["driver"]["cruise"])
+        self.assertEqual(200, navigation["driver"]["speed_pct"])
+        self.assertEqual(3, navigation["driver"]["slow"])
+        self.assertNotIn("ignored", navigation["driver"])
+        self.assertEqual(100000, navigation["safety"]["water_guard_total"])
+        self.assertEqual(17, navigation["safety"]["edge_guard_total"])
+        self.assertEqual(4, navigation["safety"]["veto_water"])
+        self.assertNotIn("ignored", navigation["safety"])
 
         captured[:] = []
         malformed_contact = dict(contact, position={"x": 1})
@@ -231,12 +406,13 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertTrue(self.network.publish_bot_observation(
             player, [malformed_contact, strict_contact], strict_report
         ))
-        contacts, affordances = captured[0]
+        contacts, affordances, navigation = captured[0]
         self.assertEqual(1, len(contacts))
         self.assertFalse(contacts[0]["visible"])
         self.assertEqual(1, len(affordances[0]["candidates"]))
         self.assertFalse(affordances[0]["candidates"][0]["peek_feasible"])
         self.assertFalse(affordances[0]["candidates"][0]["escape_feasible"])
+        self.assertIsNone(navigation)
 
     def test_send_rejects_client_message_over_server_limit(self):
         player = Player()
@@ -244,6 +420,20 @@ class LANClientQueueTest(unittest.TestCase):
         client.connected = True
         client.sock = types.SimpleNamespace(sendall=lambda payload: None)
         self.assertFalse(client._send({"type": "oversized", "data": "x" * self.network.MAX_MESSAGE_BYTES}))
+
+    def test_outbound_queue_coalesces_state_without_reordering_reliable_events(self):
+        player = Player()
+        client = self.network.LANClient(player, "127.0.0.1", 28782, "Alpha", "ussr:T-34")
+        client.connected = True
+        client.sock = types.SimpleNamespace(sendall=lambda payload: None)
+
+        self.assertTrue(client._send({"type": "input", "x": 1}, "input"))
+        self.assertTrue(client._send({"type": "hit_report", "shot_seq": 2}))
+        self.assertTrue(client._send({"type": "input", "x": 3}, "input"))
+
+        self.assertEqual("hit_report", client._dequeue_outbound()["type"])
+        self.assertEqual(3, client._dequeue_outbound()["x"])
+        self.assertIsNone(client._dequeue_outbound())
 
     def test_roster_updates_native_queue_payload(self):
         install_vehicle_descriptors({
@@ -391,6 +581,39 @@ class LANClientQueueTest(unittest.TestCase):
         })
         self.assertEqual((100.0, 0.0, 0.0), (remote.x, remote.y, remote.z))
 
+    def test_world_pose_basis_is_computed_once_per_battle_formation(self):
+        calls = []
+        player = Player()
+
+        def formation(team, slot):
+            calls.append((team, slot))
+            return (0.0, 0.0, 0.0) if team == 1 else (100.0, 0.0, 3.14)
+
+        player._offhangar_network_formation = formation
+        state = {"world_pose": True, "x": 4.0, "y": 0.0, "z": 20.0}
+
+        self.network._world_from_server(player, state)
+        self.network._world_from_server(player, state)
+        self.network._world_yaw_from_server(player, {"yaw": 0.5})
+
+        self.assertEqual([(1, 0), (2, 0)], calls)
+
+    def test_mock_indexes_refresh_when_a_staged_bot_is_added(self):
+        offline = sys.modules["gui.mods.offhangar.offline_battle"]
+        offline.g_offh_battle_gen = 42
+        first = types.SimpleNamespace(
+            _network_bot_id=1, _network_server_id=None
+        )
+        second = types.SimpleNamespace(
+            _network_bot_id=2, _network_server_id=None
+        )
+        offline.G_MOCK_VEHICLES = {1001: first}
+        self.network.__dict__.pop("_g_network_mock_indexes", None)
+
+        self.assertIs(first, self.network._find_bot(1))
+        offline.G_MOCK_VEHICLES[1002] = second
+        self.assertIs(second, self.network._find_bot(2))
+
     def test_remote_spawn_is_deduplicated_while_models_load(self):
         sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {}
         player = Player()
@@ -511,6 +734,8 @@ class LANClientQueueTest(unittest.TestCase):
             "health": 0,
             "max_health": 880,
             "alive": False,
+            "killer_kind": "human",
+            "killer_id": 1,
             "x": 0.0,
             "y": 0.0,
             "z": 0.0,
@@ -521,6 +746,37 @@ class LANClientQueueTest(unittest.TestCase):
         self.network._apply_remote_state(player, state)
 
         self.assertEqual(0, mock.health)
+        self.assertEqual(1, len(deaths))
+        self.assertEqual(1, deaths[0][1])
+
+    def test_unknown_snapshot_death_waits_for_following_killer_event(self):
+        player = Player()
+        deaths = []
+        player.arena = types.SimpleNamespace(
+            onVehicleKilled=lambda *args: deaths.append(args)
+        )
+        mock = types.SimpleNamespace(
+            id=1001, health=100, maxHealth=880, isAlive=True,
+            publicInfo={"isAlive": True},
+        )
+        callbacks = []
+        bigworld = sys.modules["BigWorld"]
+        original_callback = bigworld.callback
+        bigworld.callback = lambda delay, callback: callbacks.append(callback)
+        try:
+            self.network._push_mock_health(
+                player, mock, 0, 880, False, -1, False
+            )
+            self.assertEqual([], deaths)
+            self.network._push_mock_health(
+                player, mock, 0, 880, False, 1003, False
+            )
+            self.assertEqual(1, len(deaths))
+            self.assertEqual(1003, deaths[0][1])
+            callbacks[0]()
+        finally:
+            bigworld.callback = original_callback
+
         self.assertEqual(1, len(deaths))
 
     def test_remote_snapshot_moves_the_render_model_and_aim_matrices(self):
@@ -625,10 +881,13 @@ class LANClientQueueTest(unittest.TestCase):
             "x": 5.0, "y": 2.0, "z": 20.0, "yaw": 0.5,
             "aim_yaw": 0.75, "gun_pitch": -0.1, "fire_seq": 3,
             "shell_index": 1, "health": 500, "max_health": 500, "alive": True,
+            "speed": 6.0, "turn_velocity": 0.2,
+            "nav_source": "server_baked", "nav_order_revision": 12,
+            "nav_x": 7.0, "nav_y": 3.0, "nav_z": 24.0,
         }
 
-        self.network._apply_bot_state(player, state)
-        self.network._apply_bot_state(player, state)
+        self.network._apply_bot_state(player, state, sample_time=123.5)
+        self.network._apply_bot_state(player, state, sample_time=123.5)
 
         self.assertEqual((5.0, 2.0, 20.0), (
             model.position.x, model.position.y, model.position.z,
@@ -638,6 +897,67 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertEqual(3, bot._network_bot_fire_seq)
         self.assertEqual(1, bot._network_bot_shell_index)
         self.assertEqual(1, len(self.network._test_shot_presentations))
+        self.assertAlmostEqual(math.sin(0.5) * 6.0,
+                               bot._network_target_velocity[0], places=5)
+        self.assertEqual((7.0, 3.0, 24.0), bot._network_navigation_target)
+        self.assertEqual("server_baked", bot._network_navigation_source)
+        self.assertEqual(12, bot._network_navigation_revision)
+        self.assertEqual(123.5, bot._network_navigation_time)
+        self.assertEqual(123.5, player._offhangar_network_server_navigation_at)
+
+        # Promotion applies one final canonical relay snapshot before local
+        # simulation starts, including the motion state needed for continuity.
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_authority_handoff_pending = True
+        promoted = dict(state, x=9.0, speed=7.5, turn_velocity=-0.3)
+        self.network._apply_snapshot(player, {"bots": [promoted], "players": []})
+        self.assertFalse(player._offhangar_network_authority_handoff_pending)
+        self.assertEqual(9.0, bot.position.x)
+        self.assertEqual(7.5, bot._veh_velocity)
+        self.assertEqual(-0.3, bot._veh_turn_velocity)
+
+    def test_snapshot_requires_complete_server_navigation_before_suppressing_fallback(self):
+        player = Player()
+        player._offhangar_network_authority_handoff_pending = False
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_formation = lambda team, slot: (
+            (0.0, 0.0, 0.0) if team == 1 else (0.0, 100.0, math.pi)
+        )
+        player._offhangar_apply_network_rules_state = None
+        player._offhangar_apply_network_battle_result = None
+
+        self.network._apply_snapshot(player, {"bots": [
+            {"id": 1, "nav_source": "server_baked"},
+            {"id": 2, "nav_source": "client_fallback"},
+        ]})
+        self.assertFalse(player._offhangar_network_server_navigation_complete)
+
+        self.network._apply_snapshot(player, {"bots": [
+            {"id": 1, "nav_source": "server_baked"},
+            {"id": 2, "nav_source": "server_hold"},
+        ]})
+        self.assertTrue(player._offhangar_network_server_navigation_complete)
+
+    def test_dead_bot_does_not_reactivate_local_navigation(self):
+        player = Player()
+        player._offhangar_network_authority_handoff_pending = False
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_formation = lambda team, slot: (
+            (0.0, 0.0, 0.0) if team == 1 else (0.0, 100.0, math.pi)
+        )
+        player._offhangar_apply_network_rules_state = None
+        player._offhangar_apply_network_battle_result = None
+        player._offhangar_network_server_navigation_complete = False
+
+        self.network._apply_snapshot(player, {
+            "players": [],
+            "bots": [
+                {"id": 1, "alive": True, "nav_source": "server_baked"},
+                {"id": 2, "alive": False},
+            ],
+        })
+
+        self.assertTrue(player._offhangar_network_server_navigation_complete)
 
     def test_snapshot_stores_revisioned_server_order_and_converts_coordinates(self):
         player = Player()
@@ -664,11 +984,23 @@ class LANClientQueueTest(unittest.TestCase):
         })
 
         mock = types.SimpleNamespace(_network_bot_id=16)
-        order = self.network.authoritative_bot_order(player, mock)
+        conversions = []
+        original_world_from_server = self.network._world_from_server
+        def counting_world_from_server(current_player, state):
+            conversions.append(state)
+            return original_world_from_server(current_player, state)
+        self.network._world_from_server = counting_world_from_server
+        try:
+            order = self.network.authoritative_bot_order(player, mock)
+            cached_order = self.network.authoritative_bot_order(player, mock)
+        finally:
+            self.network._world_from_server = original_world_from_server
         self.assertEqual(7, client.bot_order_revision)
         self.assertEqual(2, order["target_id"])
         self.assertEqual((5.0, 2.0, 20.0), order["move_position"])
         self.assertEqual((-4.0, 1.0, 80.0), order["aim_position"])
+        self.assertEqual(order, cached_order)
+        self.assertEqual(2, len(conversions))
 
         client._handle_message({
             "type": "snapshot", "bot_authority_id": 1,
@@ -676,6 +1008,187 @@ class LANClientQueueTest(unittest.TestCase):
             "bot_orders": [{"id": 16, "target_id": 999}],
         })
         self.assertEqual(2, client.bot_orders[16]["target_id"])
+
+    def test_visible_server_target_aims_at_its_live_authority_pose(self):
+        player = Player()
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_id = 2
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True, phase="battle",
+            bot_orders={16: {
+                "id": 16, "target_id": 2, "target_kind": "human",
+                "fire_allowed": True,
+                "combat_mode": "advance_contact",
+                "aim_position": {"x": -4.0, "y": 1.0, "z": 80.0},
+                "face_position": {"x": -4.0, "y": 1.0, "z": 80.0},
+                "move_position": {"x": -4.0, "y": 1.0, "z": 80.0},
+            }}
+        )
+        bot = types.SimpleNamespace(_network_bot_id=16)
+        local_target = types.SimpleNamespace(
+            isAlive=True, health=880,
+            position=types.SimpleNamespace(x=12.0, y=3.0, z=-7.0),
+        )
+        original_local_mock = self.network._local_mock
+        self.network._local_mock = lambda unused_player: local_target
+        try:
+            order = self.network.authoritative_bot_order(player, bot)
+        finally:
+            self.network._local_mock = original_local_mock
+
+        self.assertEqual((12.0, 3.0, -7.0), order["aim_position"])
+        self.assertEqual(order["aim_position"], order["face_position"])
+        self.assertEqual(order["aim_position"], order["move_position"])
+
+    def test_visible_moving_target_uses_shell_speed_for_lead(self):
+        vector3 = sys.modules["Math"].Vector3
+        player = Player()
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_id = 2
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True, phase="battle",
+            bot_orders={16: {
+                "id": 16, "target_id": 2, "target_kind": "human",
+                "fire_allowed": True, "combat_mode": "advance_contact",
+                "aim_position": {"x": 0.0, "y": 0.0, "z": 100.0},
+                "face_position": {"x": 0.0, "y": 0.0, "z": 100.0},
+                "move_position": {"x": 0.0, "y": 0.0, "z": 100.0},
+            }},
+        )
+        bot = types.SimpleNamespace(
+            _network_bot_id=16,
+            _network_bot_shell_index=0,
+            position=vector3(0.0, 0.0, 0.0),
+            typeDescriptor=types.SimpleNamespace(
+                gun={"shots": [{"speed": 100.0}]}
+            ),
+        )
+        target = types.SimpleNamespace(
+            isAlive=True, health=880,
+            position=vector3(0.0, 0.0, 100.0),
+            _veh_velocity=20.0, yaw=math.pi / 2.0,
+        )
+        original_local_mock = self.network._local_mock
+        self.network._local_mock = lambda unused_player: target
+        try:
+            order = self.network.authoritative_bot_order(player, bot)
+        finally:
+            self.network._local_mock = original_local_mock
+
+        self.assertGreater(order["aim_position"][0], 20.0)
+        self.assertEqual((0.0, 0.0, 100.0), order["face_position"])
+        self.assertEqual((0.0, 0.0, 100.0), order["move_position"])
+
+    def test_authority_does_not_replay_its_own_bot_human_impact(self):
+        self.network._test_hit_presentations[:] = []
+        player = Player()
+        player._offhangar_network_id = 1
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_server_health = 880
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True, phase="battle"
+        )
+        player.playerVehicleID = 1
+        player.arena = types.SimpleNamespace(onVehicleKilled=lambda *args: None)
+        local = types.SimpleNamespace(
+            id=1, health=880, maxHealth=880, isAlive=True,
+            publicInfo={"isAlive": True},
+        )
+        bot = types.SimpleNamespace(
+            id=1016, _network_bot_id=16, health=500, isAlive=True,
+        )
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            1: local, 1016: bot,
+        }
+
+        self.network._handle_events(player, [{
+            "kind": "bot_human_hit", "attacker_bot": 16, "target": 1,
+            "shot_seq": 4, "shot_result": 2, "damage": 180,
+            "health": 700, "dead": False,
+        }])
+
+        self.assertEqual(700, local.health)
+        self.assertEqual([], self.network._test_hit_presentations)
+
+    def test_visible_order_fails_closed_when_live_target_is_missing(self):
+        player = Player()
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_id = 2
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True, phase="battle",
+            bot_orders={16: {
+                "id": 16, "target_id": 999, "target_kind": "human",
+                "fire_allowed": True,
+                "aim_position": {"x": -4.0, "y": 1.0, "z": 80.0},
+            }},
+        )
+
+        order = self.network.authoritative_bot_order(
+            player, types.SimpleNamespace(_network_bot_id=16)
+        )
+
+        self.assertFalse(order["fire_allowed"])
+
+    def test_battle_start_loads_and_acknowledges_initial_orders(self):
+        player = Player()
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        sent = []
+        client._send = lambda message: sent.append(message) or True
+
+        client._handle_message({
+            "type": "battle_start", "map": "04_himmelsdorf", "round_id": 3,
+            "players": [], "bots": [], "bot_manifest": [],
+            "bot_authority_id": 1, "bot_order_revision": 6,
+            "bot_orders": [{"id": 16, "target_id": 2}],
+        })
+
+        self.assertEqual(6, client.bot_order_revision)
+        self.assertEqual(2, client.bot_orders[16]["target_id"])
+        self.assertIn({"type": "bot_order_ack", "revision": 6}, sent)
+
+    def test_published_route_waypoints_include_probed_ground_height(self):
+        player = Player()
+        player._offhangar_network_is_authority = True
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        client.ready = True
+        client.phase = "battle"
+        player._offhangar_network_client = client
+        captured = []
+        client.send_bot_manifest = lambda manifest, map_frame=None: captured.extend(manifest) or True
+        director = types.SimpleNamespace(register_profile=lambda *args: {
+            "route": {"id": "ridge", "waypoints": [(10.0, 20.0, False)]}
+        })
+        offline = sys.modules["gui.mods.offhangar.offline_battle"]
+        old_director = getattr(offline, "_offh_ai_director", None)
+        old_space = getattr(offline, "_offh_bspace", None)
+        old_collide = sys.modules["BigWorld"].wg_collideSegment
+        vector3 = sys.modules["Math"].Vector3
+        offline._offh_ai_director = lambda unused: director
+        offline._offh_bspace = lambda: 1
+        sys.modules["BigWorld"].wg_collideSegment = (
+            lambda space, start, end, flags: (vector3(start.x, 42.0, start.z),)
+        )
+        try:
+            result = self.network.publish_bot_manifest(player, [
+                (1, 1, 0, "ussr:T-34", "Bot", 1000, 0.0, 0.0, 0.0)
+            ])
+        finally:
+            sys.modules["BigWorld"].wg_collideSegment = old_collide
+            if old_director is None:
+                del offline._offh_ai_director
+            else:
+                offline._offh_ai_director = old_director
+            if old_space is None:
+                del offline._offh_bspace
+            else:
+                offline._offh_bspace = old_space
+
+        self.assertTrue(result)
+        self.assertEqual(42.0, captured[0]["route"]["waypoints"][0]["y"])
 
     def test_snapshot_same_revision_does_not_replace_orders_but_initial_zero_does(self):
         player = Player()
@@ -690,6 +1203,107 @@ class LANClientQueueTest(unittest.TestCase):
             "bot_order_revision": 0, "bot_orders": [{"id": 16, "target_id": 999}],
         })
         self.assertEqual(2, client.bot_orders[16]["target_id"])
+
+    def test_snapshot_coalescing_preserves_order_body_for_latest_revision(self):
+        player = Player()
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        player._offhangar_network_client = client
+        with client._pending_lock:
+            client._pending = [
+                {
+                    "type": "snapshot", "bot_authority_id": 1,
+                    "players": [], "bots": [], "bot_order_revision": 12,
+                    "bot_orders": [{"id": 16, "target_id": 2}],
+                },
+                {
+                    "type": "snapshot", "bot_authority_id": 1,
+                    "players": [], "bots": [], "bot_order_revision": 12,
+                    "server_tick": 101,
+                },
+            ]
+
+        client._poll()
+
+        self.assertEqual(12, client.bot_order_revision)
+        self.assertEqual(2, client.bot_orders[16]["target_id"])
+        self.assertEqual(101, player._offhangar_network_snapshot["server_tick"])
+
+    def test_revision_without_order_body_keeps_last_executable_orders(self):
+        player = Player()
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        client.bot_order_revision = 7
+        client.bot_orders = {16: {"id": 16, "target_id": 2}}
+
+        client._handle_message({
+            "type": "snapshot", "bot_authority_id": 1,
+            "players": [], "bots": [], "bot_order_revision": 8,
+        })
+
+        self.assertEqual(7, client.bot_order_revision)
+        self.assertEqual(2, client.bot_orders[16]["target_id"])
+
+    def test_cross_revision_coalesce_recovers_from_server_retransmit(self):
+        player = Player()
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        player._offhangar_network_client = client
+        client.bot_order_revision = 7
+        client.bot_orders = {16: {"id": 16, "target_id": 2}}
+        sent = []
+        client._send = lambda message: sent.append(message) or True
+        with client._pending_lock:
+            client._pending = [
+                {
+                    "type": "snapshot", "bot_authority_id": 1,
+                    "players": [], "bots": [], "bot_order_revision": 8,
+                    "bot_orders": [{"id": 16, "target_id": 3}],
+                },
+                {
+                    "type": "snapshot", "bot_authority_id": 1,
+                    "players": [], "bots": [], "bot_order_revision": 9,
+                    "server_tick": 102,
+                },
+            ]
+
+        client._poll()
+        self.assertEqual(7, client.bot_order_revision)
+        self.assertEqual(2, client.bot_orders[16]["target_id"])
+
+        client._handle_message({
+            "type": "snapshot", "bot_authority_id": 1,
+            "players": [], "bots": [], "bot_order_revision": 9,
+            "bot_orders": [{"id": 16, "target_id": 4}],
+        })
+        self.assertEqual(9, client.bot_order_revision)
+        self.assertEqual(4, client.bot_orders[16]["target_id"])
+        self.assertIn({"type": "bot_order_ack", "revision": 9}, sent)
+
+    def test_missing_bot_order_requests_rate_limited_resync(self):
+        player = Player()
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_id = 1
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        client.ready = True
+        client.phase = "battle"
+        client.player_id = 1
+        player._offhangar_network_client = client
+        sent = []
+        client._send = lambda message: sent.append(message) or True
+        bot = types.SimpleNamespace(_network_bot_id=16)
+
+        self.assertIsNone(self.network.authoritative_bot_order(player, bot))
+        self.assertIsNone(self.network.authoritative_bot_order(player, bot))
+
+        requests = [message for message in sent
+                    if message.get("type") == "bot_order_resync"]
+        self.assertEqual(1, len(requests))
 
     def test_remote_pose_is_interpolated_between_thirty_hz_snapshots(self):
         class Matrix:
@@ -726,6 +1340,86 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertGreater(model.position.x, 2.0)
         self.assertLess(model.position.x, 13.0)
 
+    def test_render_smoothing_rate_limits_native_filter_commits(self):
+        class Matrix:
+            def setRotateYPR(self, rotation):
+                self.rotation = rotation
+
+        vector3 = sys.modules["Math"].Vector3
+        player = Player()
+        player._offhangar_network_id = 1
+        model = types.SimpleNamespace(position=vector3(0, 1, 0), yaw=0.0)
+        mock = types.SimpleNamespace(
+            id=1016, _network_shared_bot=True,
+            health=880, maxHealth=880, isAlive=True,
+            publicInfo={"isAlive": True},
+            position=vector3(0, 1, 0), yaw=0.0, pitch=0.0, roll=0.0,
+            matrix=Matrix(), _t_mat=Matrix(), _g_mat=Matrix(),
+            model=model, _chassis_model=model, bw_entity=None,
+            _network_target_position=vector3(10, 1, 0),
+            _network_target_velocity=(0.0, 0.0, 0.0),
+            _network_target_time=self.network.time.time(),
+            _network_target_yaw=0.0,
+            _network_target_aim_yaw=0.0,
+            _network_target_gun_pitch=0.0,
+            _network_filter_sync_at=self.network.time.time() + 1.0,
+        )
+        calls = []
+        original = self.network.vehicle_pose.commit_pose
+        self.addCleanup(
+            lambda: setattr(self.network.vehicle_pose, "commit_pose", original)
+        )
+        self.network.vehicle_pose.commit_pose = (
+            lambda *args, **kwargs: calls.append(kwargs) or True
+        )
+
+        self.assertTrue(self.network.advance_network_smoothing(
+            player, {1016: mock}, 1.0 / 60.0
+        ))
+        self.assertFalse(calls[-1]["sync_filter"])
+
+        mock._network_filter_sync_at = 0.0
+        self.assertTrue(self.network.advance_network_smoothing(
+            player, {1016: mock}, 1.0 / 60.0
+        ))
+        self.assertTrue(calls[-1]["sync_filter"])
+
+    def test_remote_bot_prediction_does_not_cross_a_baked_hazard(self):
+        class Matrix:
+            def setRotateYPR(self, rotation):
+                self.rotation = rotation
+
+        vector3 = sys.modules["Math"].Vector3
+        player = Player()
+        player._offhangar_network_id = 1
+        model = types.SimpleNamespace(position=vector3(4, 1, 0), yaw=0.0)
+        mock = types.SimpleNamespace(
+            id=1016, _network_shared_bot=True,
+            health=880, maxHealth=880, isAlive=True,
+            publicInfo={"isAlive": True},
+            position=vector3(4, 1, 0), yaw=0.0, pitch=0.0, roll=0.0,
+            matrix=Matrix(), _t_mat=Matrix(), _g_mat=Matrix(),
+            model=model, _chassis_model=model, bw_entity=None,
+            _network_target_position=vector3(4, 1, 0),
+            _network_target_velocity=(20.0, 0.0, 0.0),
+            _network_target_time=self.network.time.time() - 0.1,
+            _network_target_yaw=0.0,
+            _network_target_aim_yaw=0.0,
+            _network_target_gun_pitch=0.0,
+        )
+        offline = sys.modules["gui.mods.offhangar.offline_battle"]
+        old_pose_safe = getattr(offline, "_offh_ai_baked_pose_safe", None)
+        self.addCleanup(
+            lambda: setattr(offline, "_offh_ai_baked_pose_safe", old_pose_safe)
+        )
+        offline._offh_ai_baked_pose_safe = lambda pose: pose[0] < 5.0
+
+        self.assertTrue(self.network.advance_network_smoothing(
+            player, {1016: mock}, 1.0 / 60.0
+        ))
+
+        self.assertEqual(4.0, model.position.x)
+
     def test_snapshot_applies_shared_rules_and_result_once(self):
         player = Player()
         rules = []
@@ -754,6 +1448,128 @@ class LANClientQueueTest(unittest.TestCase):
 
         self.assertGreaterEqual(client.rtt_ms, 30.0)
         self.assertLess(client.rtt_ms, 200.0)
+
+    def test_pong_uses_network_receive_time_not_delayed_main_thread_time(self):
+        player = Player()
+        client = self.network.LANClient(player, "127.0.0.1", 28782, "Alpha", "ussr:T-34")
+
+        client._handle_message({
+            "type": "pong", "client_time": 10.0,
+            "_client_received_time": 10.025,
+        })
+
+        self.assertAlmostEqual(25.0, client.rtt_ms, places=3)
+
+    def test_server_timing_uses_network_receive_time_and_half_rtt(self):
+        player = Player()
+        client = self.network.LANClient(player, "127.0.0.1", 28782, "Alpha", "ussr:T-34")
+        client.rtt_ms = 40.0
+
+        loaded = client._load_server_timing({
+            "_client_received_time": 100.0,
+            "timing": {
+                "phase": "prebattle",
+                "start_in_ms": 25000,
+                "remaining_ms": 900000,
+                "duration_ms": 900000,
+            },
+        })
+
+        self.assertTrue(loaded)
+        self.assertAlmostEqual(124.98, client.combat_deadline, places=3)
+        self.assertAlmostEqual(1024.98, client.combat_end_deadline, places=3)
+        self.assertEqual(client.combat_deadline, player._offhangar_network_combat_deadline)
+
+    def test_battle_snapshot_corrects_the_shared_end_deadline(self):
+        player = Player()
+        client = self.network.LANClient(player, "127.0.0.1", 28782, "Alpha", "ussr:T-34")
+
+        client._load_server_timing({
+            "_client_received_time": 200.0,
+            "timing": {
+                "phase": "battle",
+                "start_in_ms": 0,
+                "remaining_ms": 750000,
+                "duration_ms": 900000,
+            },
+        })
+
+        self.assertEqual("battle", player._offhangar_network_combat_phase)
+        self.assertAlmostEqual(950.0, player._offhangar_network_combat_end_deadline)
+
+    def test_transport_diagnostics_report_socket_and_game_queue_delays_separately(self):
+        player = Player()
+        client = self.network.LANClient(player, "127.0.0.1", 28782, "Alpha", "ussr:T-34")
+        client._diag_window_start = 10.0
+        client._diag_chunks = 50
+        client._diag_messages = 120
+        client._diag_snapshots = 95
+        client._diag_bot_updates = 62
+        client._diag_max_socket_gap = 0.08
+        client._diag_max_snapshot_gap = 0.12
+        client._diag_max_bot_update_gap = 0.19
+        client._diag_max_queue_age = 0.9
+        client._diag_max_pending = 17
+
+        diagnostic = client._transport_diagnostic_snapshot(now=15.0)
+
+        self.assertEqual(50, diagnostic["chunks"])
+        self.assertEqual(95, diagnostic["snapshots"])
+        self.assertEqual(62, diagnostic["bot_updates"])
+        self.assertAlmostEqual(0.08, diagnostic["max_socket_gap"])
+        self.assertAlmostEqual(0.19, diagnostic["max_bot_update_gap"])
+        self.assertAlmostEqual(0.9, diagnostic["max_queue_age"])
+        self.assertEqual(17, diagnostic["max_pending"])
+        self.assertEqual(0, client._diag_chunks)
+        self.assertIsNone(client._transport_diagnostic_snapshot(now=16.0))
+
+    def test_shared_bot_death_uses_relayed_bot_killer(self):
+        player = Player()
+        player._offhangar_network_is_authority = True
+        victim = types.SimpleNamespace(
+            id=1016, _network_bot_id=16, health=500, maxHealth=500,
+            isAlive=True,
+        )
+        killer = types.SimpleNamespace(id=1003, _network_bot_id=3)
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            victim.id: victim, killer.id: killer,
+        }
+        pushed = []
+        original_push = self.network._push_mock_health
+        self.network._push_mock_health = lambda *args: pushed.append(args)
+        try:
+            self.network._apply_bot_state(player, {
+                "id": 16, "health": 0, "max_health": 500,
+                "alive": False, "killer_bot_id": 3,
+            })
+        finally:
+            self.network._push_mock_health = original_push
+
+        self.assertEqual(1003, pushed[0][5])
+
+    def test_shared_bot_death_resolves_relayed_human_killer(self):
+        player = Player()
+        player._offhangar_network_id = 7
+        player.playerVehicleID = 77
+        victim = types.SimpleNamespace(
+            id=1016, _network_bot_id=16, health=500, maxHealth=500,
+            isAlive=True,
+        )
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            victim.id: victim,
+        }
+        pushed = []
+        original_push = self.network._push_mock_health
+        self.network._push_mock_health = lambda *args: pushed.append(args)
+        try:
+            self.network._apply_bot_state(player, {
+                "id": 16, "health": 0, "max_health": 500,
+                "alive": False, "killer_kind": "human", "killer_id": 7,
+            })
+        finally:
+            self.network._push_mock_health = original_push
+
+        self.assertEqual(77, pushed[0][5])
 
     def test_remote_enemy_uses_local_spotting_instead_of_always_visible(self):
         vector3 = sys.modules["Math"].Vector3
@@ -791,6 +1607,94 @@ class LANClientQueueTest(unittest.TestCase):
 
         remote.position = vector3(0, 0, 40)
         self.assertTrue(self.network.update_remote_spotting(player, remote, True))
+        self.assertTrue(model.visible)
+
+    def test_remote_human_spotting_refreshes_on_spawn_and_snapshots(self):
+        network_source = NETWORK_PATH.read_text()
+        apply_start = network_source.index("def _apply_remote_state")
+        apply_end = network_source.index("def _apply_bot_state", apply_start)
+        apply_source = network_source[apply_start:apply_end]
+        battle_source = (
+            ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
+        ).read_text()
+        spawn_start = battle_source.index("mock_vehicles[e_id] = e_mock")
+        spawn_source = battle_source[spawn_start:spawn_start + 1800]
+
+        self.assertIn("update_remote_spotting(player, mock, force_spot)", apply_source)
+        self.assertIn("mock._network_spot_initialized = True", apply_source)
+        self.assertIn("update_remote_spotting(player, e_mock, True)", spawn_source)
+        self.assertIn("LAN remote human ready", spawn_source)
+        self.assertIn("LAN remote human visibility", network_source)
+
+    def test_replica_defers_bot_snapshots_until_native_lineup_is_complete(self):
+        player = Player()
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True, phase="battle"
+        )
+        player._offhangar_network_is_authority = False
+        player._offh_auto_spawn_expected = 28
+        player._offh_auto_spawn_completed = 5
+        applied = []
+        remote_applied = []
+        original_apply = self.network._apply_bot_state
+        original_remote = self.network._apply_remote_state
+        original_indexes = self.network._network_mock_indexes
+        self.network._apply_bot_state = lambda *args: applied.append(args)
+        self.network._apply_remote_state = lambda *args: remote_applied.append(args)
+        self.network._network_mock_indexes = lambda: ({}, {})
+        try:
+            self.network._apply_snapshot(
+                player,
+                {"players": [{"id": 2}], "bots": [{"id": 1}]},
+            )
+            self.assertEqual([], applied)
+            self.assertEqual(1, len(remote_applied))
+            self.assertTrue(player._offhangar_network_bot_snapshots_deferred)
+
+            player._offh_auto_spawn_completed = 28
+            self.network._apply_snapshot(
+                player, {"players": [], "bots": [{"id": 1}]}
+            )
+        finally:
+            self.network._apply_bot_state = original_apply
+            self.network._apply_remote_state = original_remote
+            self.network._network_mock_indexes = original_indexes
+
+        self.assertEqual(1, len(applied))
+        self.assertFalse(player._offhangar_network_bot_snapshots_deferred)
+
+    def test_spotting_exception_keeps_native_fifty_metre_proximity_rule(self):
+        vector3 = sys.modules["Math"].Vector3
+        player = Player()
+        player.playerVehicleID = 1
+        player._offhangar_team = 1
+        local = types.SimpleNamespace(
+            id=1, position=vector3(0, 0, 0), isAlive=True,
+            publicInfo={"team": 1},
+        )
+        model = types.SimpleNamespace(visible=False, visibleAttachments=False)
+        remote = types.SimpleNamespace(
+            id=1001, position=vector3(0, 0, 40), isAlive=True,
+            health=880, _bot_team=2, _chassis_model=model, model=model,
+            publicInfo={"team": 2}, marker=None, proxy=None,
+            _network_server_id=2,
+        )
+        offline = sys.modules["gui.mods.offhangar.offline_battle"]
+        offline.G_MOCK_VEHICLES = {1: local, 1001: remote}
+        previous = getattr(offline, "_offh_spot_visible_for_player", None)
+        offline._offh_spot_visible_for_player = lambda *args: (_ for _ in ()).throw(
+            TypeError("broken spotting state")
+        )
+        try:
+            self.assertTrue(
+                self.network.update_remote_spotting(player, remote, True)
+            )
+        finally:
+            if previous is None:
+                del offline._offh_spot_visible_for_player
+            else:
+                offline._offh_spot_visible_for_player = previous
+
         self.assertTrue(model.visible)
 
     def test_dead_remote_snapshots_do_not_move_the_wreck_anchor(self):
@@ -837,15 +1741,37 @@ class LANClientQueueTest(unittest.TestCase):
 
         self.assertNotIn("vehs_by_team[1].append(player)", source)
         self.assertIn("vehs_by_team[_player_team].append(player)", source)
+        self.assertIn("def _capture_xz(entity):", source)
+        self.assertIn("position = getattr(_pm, 'position', None)", source)
+        self.assertIn("LAN capture check base_team=%d", source)
+        self.assertIn("LAN capture tick failed", source)
+        self.assertIn("'tactical_fallback'", source)
         self.assertIn("send_authoritative_rules(player, g_base_capture)", source)
         self.assertIn("send_authoritative_result", source)
         self.assertIn("if not network_is_authority(player):", source)
+
+    def test_bot_observation_failures_are_visible_once_per_battle(self):
+        source = (ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py").read_text()
+
+        self.assertIn("g_offh_observation_error_gen", source)
+        self.assertIn("LAN bot observation publish failed", source)
+
+    def test_every_death_refreshes_the_team_score_from_alive_state(self):
+        source = (ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py").read_text()
+
+        self.assertIn("def _offh_refresh_team_score(player):", source)
+        self.assertIn("correlation.updateFrags(enemy_losses, allied_losses)", source)
+        wrapper = source[source.index("class _KillEventWrapper(object):"):]
+        wrapper = wrapper[:8000]
+        self.assertIn("_offh_refresh_team_score(_pl)", wrapper)
+        self.assertIn("_offh_battle_callback(0.0", wrapper)
 
     def test_initial_spawn_uses_the_actual_lan_team(self):
         source = (ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py").read_text()
 
         self.assertIn("_player_spawn_team = int(getattr(player, '_offhangar_team', 1) or 1)", source)
         self.assertIn("gp['teamSpawnPoints/team%d' % _player_spawn_team]", source)
+        self.assertNotIn("getattr(at, 'teamSpawnPoints'", source)
         self.assertIn("get(_player_spawn_team, [])", source)
         self.assertIn("g_offline_bases.get(_player_spawn_team, [])", source)
         self.assertIn("send_local_hit(player", source)
