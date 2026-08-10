@@ -34,8 +34,15 @@ MAX_COVER_REPORTS = 16
 MAX_COVER_CANDIDATES = 12
 TARGET_LEASE_SECONDS = 2.0
 TARGET_SWITCH_MARGIN = 3.0
+CLOSE_THREAT_DISTANCE = 50.0
+CLOSE_THREAT_SCORE_BONUS = 100.0
+CLOSE_THREAT_FOCUS_LIMIT = 4
 ROUTE_REBALANCE_SECONDS = 4.0
 ROUTE_LEASE_SECONDS = 6.0
+ARTILLERY_ENGAGEMENT_RANGE = 1200.0
+ARTILLERY_BLOCKED_RELOCATE_SECONDS = 12.0
+ARTILLERY_IDLE_RELOCATE_SECONDS = 65.0
+ARTILLERY_ARRIVAL_RADIUS = 9.0
 
 
 def _number(value, default=0.0):
@@ -82,6 +89,7 @@ class BotPlanner(object):
         self._cover_states = {}
         self._cover_reservations = set()
         self._target_assignments = {}
+        self._artillery_states = {}
 
     def reset(self):
         self.revision = 0
@@ -96,6 +104,7 @@ class BotPlanner(object):
         self._cover_states = {}
         self._cover_reservations = set()
         self._target_assignments = {}
+        self._artillery_states = {}
 
     def report_contacts(self, contacts, known_targets, now):
         """Store only authority-reported observations after identity checks.
@@ -358,6 +367,9 @@ class BotPlanner(object):
         for bot_id in list(self._engage_anchors):
             if bot_id not in live_bots:
                 del self._engage_anchors[bot_id]
+        for bot_id in list(self._artillery_states):
+            if bot_id not in live_bots:
+                del self._artillery_states[bot_id]
         for bot_id, report in list(self._affordances.items()):
             bot = live_bots.get(bot_id)
             target_key = report.get("target") if isinstance(report, dict) else None
@@ -417,11 +429,22 @@ class BotPlanner(object):
         return 1
 
     @staticmethod
+    def _focus_limit(contact, distance):
+        """Let nearby tanks defend themselves without pulling a whole flank."""
+        limit = BotPlanner._desired_focus(contact)
+        if distance <= CLOSE_THREAT_DISTANCE:
+            return max(limit, CLOSE_THREAT_FOCUS_LIMIT)
+        return limit
+
+    @staticmethod
     def _engagement_range(bot, contact):
         """Keep nearby combat primary without pulling an entire team off-route."""
         profile = bot.get("profile") if isinstance(bot.get("profile"), dict) else {}
         roles = profile.get("roles") if isinstance(profile.get("roles"), dict) else {}
         desired = max(40.0, _number(profile.get("desired_range"), 180.0))
+        if str(profile.get("class_tag") or "") == "SPG":
+            return max(ARTILLERY_ENGAGEMENT_RANGE,
+                       _number(profile.get("fire_range"), 0.0))
         mobility = max(_number(roles.get("scout")),
                        _number(roles.get("flanker")))
         if contact.get("visible"):
@@ -464,7 +487,11 @@ class BotPlanner(object):
                 score = 0.0
                 score += contact["health"] / float(max(1, contact["max_health"])) * 28.0
                 score += distance * 0.018
-                candidate = (score, bot["id"], contact["id"], bot, contact)
+                if distance <= CLOSE_THREAT_DISTANCE:
+                    # A point-blank enemy is an immediate self-defence problem, even
+                    # while a previous long-range target still owns a short lease.
+                    score -= CLOSE_THREAT_SCORE_BONUS
+                candidate = (score, bot["id"], contact["id"], bot, contact, distance)
                 candidates.append(candidate)
                 by_bot.setdefault(bot["id"], []).append(candidate)
 
@@ -491,22 +518,33 @@ class BotPlanner(object):
                 continue
             best_score = bot_candidates[0][0]
             lease_expired = _number(now) >= _number(previous.get("until"))
+            best_candidate = bot_candidates[0]
+            best_key = (best_candidate[4].get("target_kind"),
+                        best_candidate[4]["id"])
+            close_override = (
+                best_key != previous.get("target") and
+                best_candidate[5] <= CLOSE_THREAT_DISTANCE and
+                previous_candidate[5] > CLOSE_THREAT_DISTANCE
+            )
+            if close_override:
+                continue
             if (lease_expired and
                     previous_candidate[0] > best_score + TARGET_SWITCH_MARGIN):
                 continue
             contact = previous_candidate[4]
             key = (contact.get("target_kind"), contact["id"])
-            if reservations.get(key, 0) >= self._desired_focus(contact):
+            if reservations.get(key, 0) >= self._focus_limit(
+                    contact, previous_candidate[5]):
                 continue
             reservations[key] = reservations.get(key, 0) + 1
             assigned[bot["id"]] = contact
             if lease_expired:
                 previous["until"] = _number(now) + TARGET_LEASE_SECONDS
-        for unused_score, unused_bot_id, unused_target_id, bot, contact in sorted(candidates):
+        for unused_score, unused_bot_id, unused_target_id, bot, contact, distance in sorted(candidates):
             if bot["id"] in assigned:
                 continue
             key = (contact.get("target_kind"), contact["id"])
-            if reservations.get(key, 0) >= self._desired_focus(contact):
+            if reservations.get(key, 0) >= self._focus_limit(contact, distance):
                 continue
             reservations[key] = reservations.get(key, 0) + 1
             assigned[bot["id"]] = contact
@@ -615,6 +653,8 @@ class BotPlanner(object):
                 current = bot.get("route") or {}
             current_id = str(current.get("id") or "")
             if current_id == target_route or counts.get(current_id, 0) <= 1:
+                continue
+            if str(bot.get("profile", {}).get("class_tag") or "") == "SPG":
                 continue
             roles = bot.get("profile", {}).get("roles") or {}
             mobility = max(_number(roles.get("support")),
@@ -836,7 +876,7 @@ class BotPlanner(object):
         if phase == "approach":
             order["combat_mode"] = "take_cover"
             order["move_position"] = dict(cover)
-            order["throttle_override"] = 0.72
+            order["throttle_override"] = None
         elif phase == "hold":
             order["combat_mode"] = "cover_hold"
             order["move_position"] = dict(cover)
@@ -844,13 +884,114 @@ class BotPlanner(object):
         elif phase == "peek":
             order["combat_mode"] = "cover_peek"
             order["move_position"] = dict(peek)
-            order["throttle_override"] = 0.56 if peek_distance > 4.5 else 0.0
+            order["throttle_override"] = None if peek_distance > 4.5 else 0.0
             order["fire_allowed"] = can_fire
         else:
             order["combat_mode"] = "cover_return"
             order["move_position"] = dict(cover)
             order["throttle_override"] = None
         return True
+
+    @staticmethod
+    def _artillery_emplacements(bot, home=None):
+        """Return rear, annotated positions without inventing map geometry."""
+        state = bot.get("state") if isinstance(bot.get("state"), dict) else {}
+        home = _point(home if isinstance(home, dict) else state)
+        candidates = [home]
+        route = bot.get("route") if isinstance(bot.get("route"), dict) else {}
+        waypoints = route.get("waypoints") if isinstance(route.get("waypoints"), list) else []
+        for raw in waypoints[:3]:
+            point = _point(raw)
+            distance = math.hypot(point["x"] - home["x"],
+                                  point["z"] - home["z"])
+            if distance > 220.0:
+                continue
+            if all(math.hypot(point["x"] - old["x"],
+                              point["z"] - old["z"]) > 12.0
+                   for old in candidates):
+                candidates.append(point)
+        return candidates
+
+    def _artillery_order(self, order, bot, focus, contacts, now):
+        """Hold a rear firing point and relocate only when its arc is unhelpful.
+
+        The authority client is the geometry oracle: an SPG appears in a
+        contact's shootable list only when its real ballistic arc is clear.
+        Therefore a visible contact with no assigned focus means this firing
+        point is blocked, not that the artillery should drive to the front.
+        """
+        bot_id = bot["id"]
+        current = _point(bot.get("state"))
+        state = self._artillery_states.get(bot_id)
+        if state is None:
+            home = dict(current)
+            state = {
+                "index": 0,
+                "position": dict(home),
+                "candidates": self._artillery_emplacements(bot, home),
+                "next_relocate": _number(now) + ARTILLERY_IDLE_RELOCATE_SECONDS,
+            }
+            self._artillery_states[bot_id] = state
+        candidates = state.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            candidates = [dict(current)]
+            state["candidates"] = candidates
+
+        if focus is not None:
+            order["target_id"] = focus["id"]
+            order["target_kind"] = focus.get("target_kind")
+            order["aim_position"] = dict(focus["position"])
+            order["face_position"] = dict(focus["position"])
+            observers = focus.get("shootable_by_bot_ids")
+            order["fire_allowed"] = bool(
+                focus.get("visible") and
+                (observers is None or bot_id in observers))
+            order["shell_index"] = self._shell_index(
+                order["profile"], focus, order["personality"])
+            if order["fire_allowed"]:
+                # A newly acquired clear arc is a better emplacement than the
+                # scheduled destination. Stop here, settle the gun and shoot.
+                state["position"] = dict(current)
+                state["next_relocate"] = (
+                    _number(now) + ARTILLERY_IDLE_RELOCATE_SECONDS)
+                order["move_position"] = dict(current)
+                order["route_anchor"] = dict(current)
+                order["throttle_override"] = 0.0
+                order["combat_mode"] = "artillery_fire"
+                return order
+
+        visible_contacts = [value for value in contacts
+                            if value.get("visible")]
+        interval = (ARTILLERY_BLOCKED_RELOCATE_SECONDS
+                    if visible_contacts else ARTILLERY_IDLE_RELOCATE_SECONDS)
+        if visible_contacts:
+            state["next_relocate"] = min(
+                _number(state.get("next_relocate"), now + interval),
+                _number(now) + ARTILLERY_BLOCKED_RELOCATE_SECONDS)
+        if (_number(now) >= _number(state.get("next_relocate")) and
+                len(candidates) > 1):
+            state["index"] = (int(state.get("index", 0)) + 1) % len(candidates)
+            state["position"] = dict(candidates[state["index"]])
+            state["next_relocate"] = _number(now) + interval
+
+        destination = _point(state.get("position"))
+        distance = math.hypot(destination["x"] - current["x"],
+                              destination["z"] - current["z"])
+        order["move_position"] = destination
+        order["route_anchor"] = dict(current)
+        order["fire_allowed"] = False
+        if focus is None:
+            order["target_id"] = None
+            order.pop("target_kind", None)
+            order["aim_position"] = destination
+            order["face_position"] = destination
+        if distance > ARTILLERY_ARRIVAL_RADIUS:
+            order["combat_mode"] = "artillery_relocate"
+            order["throttle_override"] = None
+        else:
+            order["combat_mode"] = "artillery_hold"
+            order["throttle_override"] = 0.0
+        return order
 
     def _order_for(self, bot, index, count, focus, contacts, now):
         route_id, route_index, move, route_anchor = self._route(bot, now)
@@ -879,6 +1020,8 @@ class BotPlanner(object):
             "profile": profile,
             "shell_index": 0,
         }
+        if str(profile.get("class_tag") or "") == "SPG":
+            return self._artillery_order(order, bot, focus, contacts, now)
         if focus is None:
             self._engage_anchors.pop(bot["id"], None)
             self._cover_states.pop(bot["id"], None)
@@ -919,10 +1062,20 @@ class BotPlanner(object):
             self._cover_states.pop(bot["id"], None)
             order["combat_mode"] = "advance_contact"
             order["move_position"] = dict(focus["position"])
-            order["throttle_override"] = 0.72
+            order["throttle_override"] = None
         elif (distance <= fire_range * 1.15 and
               self._apply_cover_order(order, bot, focus, personality, now)):
             self._engage_anchors.pop(bot["id"], None)
+        elif distance < close_limit and dominant != "brawler":
+            # A support or ranged vehicle that has been rushed should keep
+            # aiming and firing while opening the distance. This must precede
+            # the general firing-envelope hold below: close_limit is always
+            # inside that envelope, so placing it later makes it unreachable.
+            self._engage_anchors.pop(bot["id"], None)
+            self._cover_states.pop(bot["id"], None)
+            order["combat_mode"] = "withdraw"
+            order["move_position"] = dict(route_anchor)
+            order["throttle_override"] = None
         elif distance <= min(fire_range, max(150.0, desired_range * 1.35)):
             # A visible enemy inside an effective firing envelope interrupts
             # route travel immediately when no client-probed cover manoeuvre is
@@ -939,17 +1092,11 @@ class BotPlanner(object):
                 self._engage_anchors[bot["id"]] = anchor_state
             order["move_position"] = dict(anchor_state["position"])
             order["throttle_override"] = 0.0
-        elif distance < close_limit and dominant != "brawler":
-            self._engage_anchors.pop(bot["id"], None)
-            self._cover_states.pop(bot["id"], None)
-            order["combat_mode"] = "withdraw"
-            order["move_position"] = dict(route_anchor)
-            order["throttle_override"] = None
         elif roles.get("flanker", 0.0) >= 0.68 and personality["initiative"] > 0.42:
             self._engage_anchors.pop(bot["id"], None)
             order["combat_mode"] = "flank"
             order["move_position"] = self._flank_point(bot, focus, desired_range)
-            order["throttle_override"] = 0.78
+            order["throttle_override"] = None
         else:
             order["combat_mode"] = "engage"
             target_key = (focus.get("target_kind"), focus["id"])
@@ -961,12 +1108,10 @@ class BotPlanner(object):
                 }
                 self._engage_anchors[bot["id"]] = anchor_state
             order["move_position"] = dict(anchor_state["position"])
-            if dominant in ("brawler", "support") and personality["jiggle"] > 0.62:
-                phase = (_number(now) + bot["id"] * 0.071) % 3.2
-                order["throttle_override"] = 0.38 if phase < 1.55 else -0.30
-                order["combat_mode"] = "jiggle_forward" if phase < 1.55 else "jiggle_back"
-            else:
-                order["throttle_override"] = 0.0
+            # Only the geometry-backed cover state machine may order a peek.
+            # Periodic open-ground jiggle looked like a stuck-physics oscillation
+            # and could reverse a tank toward an unprobed cliff or traffic queue.
+            order["throttle_override"] = 0.0
         return order
 
     @staticmethod

@@ -88,11 +88,8 @@ def build_coll_data(mocks, player_id, player_team, start_pos, dir_vec,
         # swept over an invisible enemy (user report + video).
         if not getattr(m, '_spot_visible', True):
             continue
-        # Keep the stored position in step with the model before testing.
-        try:
-            m.position = m.model.position
-        except Exception:
-            pass
+        # The committed mock pose is authoritative. The Servo-driven render model
+        # may lag it by a frame and must never write back into gameplay state.
         # Broad-phase: perpendicular distance of the bot centre to the aim ray.
         try:
             p = m.position

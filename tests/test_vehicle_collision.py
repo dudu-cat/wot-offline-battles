@@ -89,6 +89,20 @@ class VehicleCollisionTests(unittest.TestCase):
             self.collision.vertical_overlap(0.0, self.shape, 1.0, self.shape)
         )
 
+    def test_high_support_is_an_obstacle_instead_of_a_vertical_snap(self):
+        self.assertTrue(
+            self.collision.support_rise_is_obstacle(0.0, 1.4, 0.65)
+        )
+        self.assertTrue(
+            self.collision.support_rise_is_obstacle(0.0, 1.4, 2.5)
+        )
+        self.assertFalse(
+            self.collision.support_rise_is_obstacle(0.0, 0.55, 0.65)
+        )
+        self.assertFalse(
+            self.collision.support_rise_is_obstacle(0.0, None, 0.65)
+        )
+
     def test_equal_mass_pair_separates_and_stops_closing_velocity(self):
         response = self.collision.pair_response(
             (-1.0, 0.0, 0.5), 1.0, 1.0,
@@ -110,6 +124,30 @@ class VehicleCollisionTests(unittest.TestCase):
 
         self.assertAlmostEqual(0.15, response[0])
         self.assertAlmostEqual(-0.45, response[4])
+
+    def test_spatial_index_returns_only_neighbouring_cells(self):
+        bodies = {
+            1: {"position": (1.0, 0.0, 1.0)},
+            2: {"position": (25.0, 0.0, 1.0)},
+            3: {"position": (-23.0, 0.0, -23.0)},
+            4: {"position": (80.0, 0.0, 80.0)},
+        }
+
+        index = self.collision.build_spatial_index(bodies, 24.0)
+
+        self.assertEqual({1, 2, 3}, set(self.collision.nearby_ids(index, 0.0, 0.0)))
+        self.assertNotIn(4, self.collision.nearby_ids(index, 0.0, 0.0))
+
+    def test_spatial_index_handles_negative_cell_boundaries(self):
+        bodies = {
+            10: {"position": (-0.1, 0.0, -0.1)},
+            11: {"position": (-24.1, 0.0, -24.1)},
+            12: {"position": (48.1, 0.0, 48.1)},
+        }
+
+        index = self.collision.build_spatial_index(bodies, 24.0)
+
+        self.assertEqual({10, 11}, set(self.collision.nearby_ids(index, -0.1, -0.1)))
 
 
 if __name__ == "__main__":

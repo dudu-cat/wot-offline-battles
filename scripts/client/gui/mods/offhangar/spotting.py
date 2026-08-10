@@ -13,19 +13,7 @@ SPOT_MEMORY_SECONDS = 5.0
 SIXTH_SENSE_DELAY_SECONDS = 3.0
 STILL_DEVICE_DELAY_SECONDS = 3.0
 MOVING_SPEED_EPSILON = 0.5
-SHOT_CAMOUFLAGE_SECONDS = 5.0
-
-# The release client omits the server-owned base invisibility coefficients.
-# These conservative nominal values preserve the characteristic class ordering
-# until a value is available from an unstripped descriptor/resource.
-CLASS_CAMOUFLAGE = {
-	'lightTank': (0.18, 0.18),
-	'mediumTank': (0.11, 0.14),
-	'heavyTank': (0.045, 0.075),
-	'AT-SPG': (0.12, 0.20),
-	'SPG': (0.08, 0.13),
-}
-
+SHOT_CAMOUFLAGE_SECONDS = 0.75
 
 def clamp(value, minimum, maximum):
 	return max(float(minimum), min(float(maximum), float(value)))
@@ -51,8 +39,13 @@ def effective_view_range(base_range, commander_level=100.0,
 
 
 def crew_camouflage_factor(skill_level):
-	"""Old-style multiplicative contribution of the common Camouflage skill."""
-	return 1.0 + 0.00375 * clamp(skill_level, 0.0, 100.0)
+	"""Scale a raw invisibility coefficient by the common Camouflage skill.
+
+	The stored coefficient represents the fully trained value.  A crew without
+	the skill receives 4/7 of it; training supplies the remaining 3/7 linearly.
+	This is also the convention used by the imported 0.9.17.1 data snapshot.
+	"""
+	return 4.0 / 7.0 + 3.0 / 7.0 * clamp(skill_level, 0.0, 100.0) / 100.0
 
 
 def effective_camouflage(moving_base, still_base, moving=False,
@@ -92,10 +85,3 @@ def is_detected(distance, view_range, camouflage, has_line_of_sight=True):
 		return True
 	return bool(has_line_of_sight and
 	            distance <= detection_distance(view_range, camouflage))
-
-
-def class_camouflage(tags):
-	for class_tag in ('lightTank', 'mediumTank', 'heavyTank', 'AT-SPG', 'SPG'):
-		if class_tag in (tags or ()):
-			return CLASS_CAMOUFLAGE[class_tag]
-	return CLASS_CAMOUFLAGE['mediumTank']

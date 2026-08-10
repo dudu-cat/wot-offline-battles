@@ -2,6 +2,7 @@ import importlib.util
 import json
 import struct
 import tempfile
+import types
 import unittest
 import zlib
 from pathlib import Path
@@ -48,6 +49,40 @@ class NavigationBakerTest(unittest.TestCase):
 
         self.assertAlmostEqual(-6.482, chunk.values[0][0], places=3)
         self.assertAlmostEqual(-6.482, chunk.sample(50.0, 50.0), places=3)
+
+    def test_soft_destructibles_include_module_based_structures(self):
+        def text(value):
+            return types.SimpleNamespace(
+                value_type=self.baker.TYPE_STRING,
+                value=value.encode("utf-8"),
+            )
+
+        def element(children):
+            return types.SimpleNamespace(
+                value_type=self.baker.TYPE_ELEMENT,
+                value=types.SimpleNamespace(children=children),
+            )
+
+        categories = []
+        for category, filename in (
+            ("fragiles", "fence.model"),
+            ("fallingAtoms", "pole.model"),
+            ("structures", "house.model"),
+            ("trees", "tree.spt"),
+        ):
+            entry = element([(b"filename", text(filename))])
+            categories.append((category.encode("ascii"), element([(b"entry", entry)])))
+        root = types.SimpleNamespace(children=categories)
+        original = self.baker.read_packed_xml
+        self.baker.read_packed_xml = lambda unused: root
+        try:
+            models = self.baker.soft_destructible_models(b"fixture")
+        finally:
+            self.baker.read_packed_xml = original
+
+        self.assertEqual(
+            {"fence.model", "pole.model", "house.model"}, models
+        )
 
     def test_height_chunk_uses_all_four_png_bytes_above_int16_range(self):
         height = 205231
@@ -123,6 +158,53 @@ class NavigationBakerTest(unittest.TestCase):
 
         self.assertEqual({1, 2, 3}, retained)
         self.assertIsNone(graph["heights_mm"][0])
+
+    def test_tactical_routes_project_away_from_a_dry_island_in_shallow_water(self):
+        # The centre node is dry but can only be reached through shallow water.
+        # It must not attract a tactical waypoint when both bases share a dry lane.
+        graph = {
+            "width": 5,
+            "height": 5,
+            "cell_size": 4.0,
+            "origin": [0.0, 0.0],
+            "heights_mm": [0] * 25,
+            "hazards": [0] * 25,
+            "links": [0] * 25,
+            "bake": {},
+        }
+        for index in (6, 7, 8, 11, 13, 16, 17, 18):
+            graph["hazards"][index] = self.baker.HAZARD_SHALLOW_WATER
+        directions = self.baker.DIRECTIONS
+        for z in range(5):
+            for x in range(5):
+                index = z * 5 + x
+                for direction_index, (dx, dz) in enumerate(directions):
+                    nx, nz = x + dx, z + dz
+                    if 0 <= nx < 5 and 0 <= nz < 3:
+                        graph["links"][index] |= 1 << direction_index
+        config = {
+            "bases": ((0.0, 0.0), (16.0, 0.0)),
+            "dry_only": True,
+            "routes": ({
+                "team": 1,
+                "id": "island-trap",
+                "capacity": 2,
+                "risk": 0.5,
+                "role_weights": {},
+                "points": ((0.0, 0.0, False), (8.0, 8.0, True),
+                           (16.0, 0.0, False)),
+            },),
+        }
+
+        routes = self.baker.bake_tactical_routes(graph, config)
+
+        self.assertTrue(graph["bake"]["dry_only_routes"])
+        points = routes["1"][0]["waypoints"]
+        self.assertNotIn([8.0, 8.0, True], points)
+        for x, z, unused_hold in points:
+            index = int(round(z / 4.0)) * 5 + int(round(x / 4.0))
+            self.assertFalse(graph["hazards"][index] &
+                             self.baker.HAZARD_SHALLOW_WATER)
 
     def test_edge_clearance_rejects_water_and_one_way_drops(self):
         class Terrain:
@@ -394,6 +476,38 @@ class NavigationBakerTest(unittest.TestCase):
         routes = self.baker.bake_tactical_routes(graph, config)
 
         self.assertIn([0.0, 16.0, True], routes["1"][0]["waypoints"])
+
+    def test_terminal_tactical_route_stops_at_its_hold_position(self):
+        width = 5
+        height = 3
+        links = []
+        for z in range(height):
+            for x in range(width):
+                mask = 0
+                for index, (dx, dz) in enumerate(self.baker.DIRECTIONS):
+                    if 0 <= x + dx < width and 0 <= z + dz < height:
+                        mask |= 1 << index
+                links.append(mask)
+        graph = {
+            "width": width, "height": height, "cell_size": 4.0,
+            "origin": [0.0, 0.0], "heights_mm": [0] * (width * height),
+            "links": links, "bake": {},
+        }
+        config = {
+            "bases": ((0.0, 0.0), (16.0, 0.0)),
+            "routes": ({
+                "team": 1, "id": "hill_hold", "capacity": 1,
+                "risk": 0.5, "role_weights": {}, "terminal_hold": True,
+                "points": ((0.0, 0.0, False), (8.0, 8.0, True)),
+            },),
+        }
+
+        routes = self.baker.bake_tactical_routes(graph, config)
+
+        route = routes["1"][0]
+        self.assertTrue(route["terminal_hold"])
+        self.assertEqual([8.0, 8.0, True], route["waypoints"][-1])
+        self.assertNotIn([16.0, 0.0, False], route["waypoints"])
 
     def test_route_geometry_rejects_hairpins_and_self_intersections(self):
         self.assertIsNone(self.baker._route_geometry_issue(

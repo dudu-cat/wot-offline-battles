@@ -32,7 +32,8 @@ LAN SERVER (only one machine needs this)
 
    On Windows, enable "Add python.exe to PATH" in the Python installer.
 
-2. Keep lan_battle_server.py and server_bot_ai.py together in this folder.
+2. Keep lan_battle_server.py, server_bot_ai.py and server_bot_navigation.py
+   together in this folder.
 3. Windows: double-click RUN_SERVER.bat.
    macOS: double-click RUN_SERVER.command, or run it from Terminal.
 4. Allow TCP port 28782 through the server machine's firewall if prompted.
@@ -40,7 +41,7 @@ LAN SERVER (only one machine needs this)
 
 The expected startup line is similar to:
 
-   LAN battle server listening on 0.0.0.0:28782
+   LAN battle server listening on 0.0.0.0:28782 (... protocol=8, build=1.8.19-test-20260810)
 
 
 JOIN THE SAME LAN BATTLE
@@ -53,7 +54,7 @@ JOIN THE SAME LAN BATTLE
 5. Confirm one JOIN line per client in the server window.
 6. In the waiting room, choose a map and click START BATTLE.
 
-Every client and the server must come from this same protocol-6 package.
+Every client and the server must come from this same protocol-8/build-1.8.19 package.
 
 
 IF SOMETHING DOES NOT LOAD

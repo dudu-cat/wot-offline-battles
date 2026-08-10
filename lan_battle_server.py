@@ -27,9 +27,11 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from server_bot_ai import BotPlanner
+from server_bot_navigation import BotPathResolver
 
 
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 8
+CLIENT_BUILD = "1.8.19-test-20260810"
 TICK_HZ = 30.0
 PREBATTLE_COUNTDOWN_SECONDS = 30.0
 BATTLE_DURATION_SECONDS = 900.0
@@ -189,6 +191,9 @@ class BattleState:
         self.bot_states = {}
         self.bot_state_revision = 0
         self.bot_planner = BotPlanner()
+        self.bot_navigation = BotPathResolver()
+        self.bot_navigation_targets = {}
+        self.bot_navigation_frame = None
         self.bot_orders = {"revision": 0, "orders": []}
         self.bot_reported_hits = set()
         self.bot_observation_stats = {1: 0, 2: 0, "accepted": 0}
@@ -204,7 +209,8 @@ class BattleState:
                     "traversing": 0, "limited": 0},
             "driver": {"moving": 0, "drive": 0, "avoid": 0,
                        "blocked": 0, "recovery": 0, "arrived": 0,
-                       "server_wait": 0, "water_guard": 0},
+                       "server_wait": 0, "water_guard": 0, "full": 0,
+                       "cruise": 0, "speed_pct": 0, "slow": 0},
             "safety": {"water_guard_total": 0, "water_guard_active": 0,
                        "edge_guard_total": 0, "edge_guard_active": 0,
                        "veto_water": 0, "veto_terrain": 0,
@@ -255,7 +261,8 @@ class BattleState:
                         "traversing": 0, "limited": 0},
                 "driver": {"moving": 0, "drive": 0, "avoid": 0,
                            "blocked": 0, "recovery": 0, "arrived": 0,
-                           "server_wait": 0, "water_guard": 0},
+                           "server_wait": 0, "water_guard": 0, "full": 0,
+                           "cruise": 0, "speed_pct": 0, "slow": 0},
                 "safety": {"water_guard_total": 0, "water_guard_active": 0,
                            "edge_guard_total": 0, "edge_guard_active": 0,
                            "veto_water": 0, "veto_terrain": 0,
@@ -361,6 +368,9 @@ class BattleState:
                 self.bot_states = {}
                 self.bot_state_revision = 0
                 self.bot_planner.reset()
+                self.bot_navigation.reset()
+                self.bot_navigation_targets = {}
+                self.bot_navigation_frame = None
                 self.bot_orders = {"revision": 0, "orders": []}
                 self.bot_reported_hits = set()
                 self.bot_observation_stats = {1: 0, 2: 0, "accepted": 0}
@@ -376,7 +386,8 @@ class BattleState:
                             "traversing": 0, "limited": 0},
                     "driver": {"moving": 0, "drive": 0, "avoid": 0,
                                "blocked": 0, "recovery": 0, "arrived": 0,
-                               "server_wait": 0, "water_guard": 0},
+                               "server_wait": 0, "water_guard": 0, "full": 0,
+                               "cruise": 0, "speed_pct": 0, "slow": 0},
                     "safety": {"water_guard_total": 0, "water_guard_active": 0,
                                "edge_guard_total": 0, "edge_guard_active": 0,
                                "veto_water": 0, "veto_terrain": 0,
@@ -562,6 +573,23 @@ class BattleState:
             self.bot_manifest = manifest
             if not self.bot_states:
                 self.bot_states = states
+            self.bot_navigation_frame = BotPathResolver.sanitize_frame(
+                message.get("map_frame"))
+            try:
+                changed = self.bot_navigation.configure(
+                    self.map_name, self.bot_navigation_frame)
+                if changed:
+                    details = self.bot_navigation.diagnostics()
+                    _server_log(
+                        "BOT NAV loaded map=%s nodes=%d install=%.1fms context=%s source=%s" % (
+                            details["map"], details["nodes"],
+                            details["install_ms"], details["context"],
+                            self.bot_navigation.graph_path))
+            except Exception as error:
+                self.bot_navigation.reset()
+                self.bot_navigation_targets = {}
+                _server_log("BOT NAV unavailable map=%s error=%s" % (
+                    self.map_name, error))
             self.pending_events.append({"kind": "bot_manifest", "bots": list(manifest)})
             return True
 
@@ -698,9 +726,12 @@ class BattleState:
                     raw_driver = {}
                 navigation["driver"] = {}
                 for name in ("moving", "drive", "avoid", "blocked", "recovery",
-                             "arrived", "server_wait", "water_guard"):
+                             "arrived", "server_wait", "water_guard", "full",
+                             "cruise", "slow"):
                     navigation["driver"][name] = max(0, min(
                         int(_finite_float(raw_driver.get(name), 0)), 30))
+                navigation["driver"]["speed_pct"] = max(0, min(
+                    int(_finite_float(raw_driver.get("speed_pct"), 0)), 200))
                 raw_safety = raw_navigation.get("safety")
                 if not isinstance(raw_safety, dict):
                     raw_safety = {}
@@ -816,7 +847,9 @@ class BattleState:
         """Apply a human shot against a server-owned bot HP record."""
         with self.lock:
             attacker = self.players.get(player_id)
-            if self.phase != "battle" or attacker is None or not attacker.alive:
+            # A shell fired while alive remains authoritative after its shooter
+            # is destroyed.  fire_seq still proves it was emitted before death.
+            if self.phase != "battle" or attacker is None or not attacker.connected:
                 return False
             try:
                 shot_seq = int(message.get("shot_seq", 0))
@@ -862,12 +895,15 @@ class BattleState:
                 return False
             bot = self.bot_states.get(bot_id)
             target = self.players.get(target_id)
-            if bot is None or not bot.get("alive") or target is None:
+            # The bot can die while an earlier shell is still travelling.  Its
+            # published fire_seq is the immutable launch proof for that shell.
+            if bot is None or target is None:
                 return False
             if bot.get("team") == target.team:
                 return False
             hit_key = (bot_id, shot_seq, target_id)
-            if shot_seq <= 0 or hit_key in self.bot_reported_hits:
+            if (shot_seq <= 0 or shot_seq > int(bot.get("fire_seq", 0)) or
+                    hit_key in self.bot_reported_hits):
                 return False
             if not target.alive and target.killer_id:
                 return False
@@ -982,7 +1018,7 @@ class BattleState:
 
         Human-versus-human damage uses report_hit() below.  The victim client
         remains authoritative for local simulation damage that the standalone
-        server cannot reproduce because it has no proprietary map or bot data.
+        server cannot reproduce without BigWorld collision and vehicle state.
         Health reports may only move downward during a round.
         """
         health = max(0, min(int(_finite_float(reported_health, player.health)), player.max_health))
@@ -1010,7 +1046,10 @@ class BattleState:
         """
         with self.lock:
             attacker = self.players.get(player_id)
-            if self.phase != "battle" or attacker is None or not attacker.connected or not attacker.alive:
+            # Do not cancel a legitimate in-flight round when its shooter dies.
+            # update_input cannot advance fire_seq for a dead player, so the
+            # existing sequence bound remains the anti-forgery gate.
+            if self.phase != "battle" or attacker is None or not attacker.connected:
                 return False
             try:
                 shot_seq = int(message.get("shot_seq", 0))
@@ -1081,14 +1120,26 @@ class BattleState:
                 self.bot_manifest, list(self.bot_states.values()),
                 [self._public_player(p) for p in self.players.values() if p.connected],
                 now)
+            self.bot_navigation_targets = self.bot_navigation.resolve(
+                self.bot_orders.get("orders"), list(self.bot_states.values()),
+                self.bot_orders.get("revision", 0), now)
             ai_debug = None
             if self.bot_manifest and now >= self.next_bot_ai_log:
                 self.next_bot_ai_log = now + 3.0
                 ai_debug = self.bot_planner.debug_summary(now)
                 ai_debug["reported"] = dict(self.bot_observation_stats)
                 ai_debug["navigation"] = dict(self.bot_navigation_stats)
+                ai_debug["server_navigation"] = self.bot_navigation.diagnostics()
             events = self.pending_events
             self.pending_events = []
+            snapshot_bots = []
+            for key in sorted(self.bot_states):
+                state = self.bot_states[key]
+                navigation_target = self.bot_navigation_targets.get(key)
+                if navigation_target:
+                    state = dict(state)
+                    state.update(navigation_target)
+                snapshot_bots.append(state)
             snapshot = {
                 "type": "snapshot",
                 "protocol": PROTOCOL_VERSION,
@@ -1096,7 +1147,7 @@ class BattleState:
                 "map": self.map_name,
                 "bot_authority_id": self.bot_authority_id,
                 "players": [self._public_player(p) for p in self.players.values() if p.connected],
-                "bots": [self.bot_states[key] for key in sorted(self.bot_states)],
+                "bots": snapshot_bots,
                 "bot_state_revision": self.bot_state_revision,
                 "bot_order_revision": self.bot_orders["revision"],
                 "rules": self.rules_state,
@@ -1111,6 +1162,7 @@ class BattleState:
             teams = ai_debug["teams"]
             reports = ai_debug["reported"]
             navigation = ai_debug["navigation"]
+            server_navigation = ai_debug["server_navigation"]
             mode_counts = {}
             for team in (1, 2):
                 for mode, count in teams[team]["modes"].items():
@@ -1126,7 +1178,7 @@ class BattleState:
                 "astar=pending:%d,oldest:%dms,tick_age:%dms,done:%d,failed:%d "
                 "orders=server:%d,client:%d,loaded:%d,acked:%d "
                 "aim=targeted:%d,aligned:%d,traversing:%d,limited:%d,alive:%d "
-                "driver=moving:%d,drive:%d,avoid:%d,blocked:%d,recovery:%d,arrived:%d,wait:%d "
+                "driver=moving:%d,drive:%d,avoid:%d,blocked:%d,recovery:%d,arrived:%d,wait:%d,full:%d,cruise:%d,speed:%d%%,slow:%d "
                 "safety=water:%d/%d,edge:%d/%d,veto:w%d,t%d,o%d,e%d" % (
                     reports.get(1, 0), reports.get(2, 0), reports.get("accepted", 0),
                     teams[1]["visible"], teams[1]["contacts"],
@@ -1164,6 +1216,10 @@ class BattleState:
                     navigation.get("driver", {}).get("recovery", 0),
                     navigation.get("driver", {}).get("arrived", 0),
                     navigation.get("driver", {}).get("server_wait", 0),
+                    navigation.get("driver", {}).get("full", 0),
+                    navigation.get("driver", {}).get("cruise", 0),
+                    navigation.get("driver", {}).get("speed_pct", 0),
+                    navigation.get("driver", {}).get("slow", 0),
                     navigation.get("safety", {}).get("water_guard_total", 0),
                     navigation.get("safety", {}).get("water_guard_active", 0),
                     navigation.get("safety", {}).get("edge_guard_total", 0),
@@ -1172,6 +1228,26 @@ class BattleState:
                     navigation.get("safety", {}).get("veto_terrain", 0),
                     navigation.get("safety", {}).get("veto_obstacle", 0),
                     navigation.get("safety", {}).get("veto_error", 0)))
+            _server_log(
+                "BOT NAV active=%s map=%s nodes=%d plans=%d direct=%d cache=%d "
+                "complete=%d partial=%d pending=%d failed=%d budget=%.3f/%.3fms "
+                "oldest=%.0fms avg=%.3fms max=%.3fms paths=%d" % (
+                    server_navigation.get("active", False),
+                    server_navigation.get("map", "none"),
+                    server_navigation.get("nodes", 0),
+                    server_navigation.get("plans", 0),
+                    server_navigation.get("direct", 0),
+                    server_navigation.get("cache_hits", 0),
+                    server_navigation.get("completed", 0),
+                    server_navigation.get("partials", 0),
+                    server_navigation.get("pending", 0),
+                    server_navigation.get("failures", 0),
+                    server_navigation.get("budget_ms", 0.0),
+                    server_navigation.get("max_budget_ms", 0.0),
+                    server_navigation.get("oldest_ms", 0.0),
+                    server_navigation.get("avg_plan_ms", 0.0),
+                    server_navigation.get("max_plan_ms", 0.0),
+                    server_navigation.get("paths", 0)))
         failed_recipients = []
         for player in recipients:
             outgoing = snapshot
@@ -1287,13 +1363,25 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         self.client_address[0], self.client_address[1], received_type,
                         received_protocol, PROTOCOL_VERSION))
                 return
+            received_build = str(hello.get("client_build", ""))
+            if received_build != CLIENT_BUILD:
+                self._send_raw(conn, {
+                    "type": "error",
+                    "code": "build",
+                    "message": "client build mismatch; install %s on every PC" % CLIENT_BUILD,
+                })
+                _server_log(
+                    "Rejected %s:%d: client build mismatch received=%r expected=%r" % (
+                        self.client_address[0], self.client_address[1],
+                        received_build, CLIENT_BUILD))
+                return
             player, join_error = server.state.add_player(conn, self.client_address, hello)
             if player is None:
                 message = "server is full"
                 self._send_raw(conn, {"type": "error", "code": join_error, "message": message})
                 _server_log("Rejected %s:%d: %s" % (self.client_address[0], self.client_address[1], message))
                 return
-            _server_log("JOIN id=%d name=%s vehicle=%s max_hp=%d team=%d address=%s:%d phase=%s players=%d" % (
+            _server_log("JOIN id=%d name=%s vehicle=%s max_hp=%d team=%d address=%s:%d phase=%s players=%d build=%s" % (
                 player.player_id,
                 player.name,
                 player.vehicle,
@@ -1303,10 +1391,12 @@ class ClientHandler(socketserver.BaseRequestHandler):
                 self.client_address[1],
                 server.state.phase,
                 len(server.state.players),
+                received_build,
             ))
             player.send({
                 "type": "welcome",
                 "protocol": PROTOCOL_VERSION,
+                "client_build": CLIENT_BUILD,
                 "player_id": player.player_id,
                 "name": player.name,
                 "vehicle": player.vehicle,
@@ -1483,8 +1573,8 @@ def run_server(host, port, map_name, max_players):
 
     thread = threading.Thread(target=tick_loop, name="battle-tick", daemon=True)
     thread.start()
-    _server_log("LAN battle server listening on %s:%d (map=%s, max_players=%d)" % (
-        host, port, state.map_name, max_players))
+    _server_log("LAN battle server listening on %s:%d (map=%s, max_players=%d, protocol=%d, build=%s)" % (
+        host, port, state.map_name, max_players, PROTOCOL_VERSION, CLIENT_BUILD))
     _server_log("Ready: clients click Battle! to join, choose a map, then click START BATTLE")
     try:
         tcp_server.serve_forever(poll_interval=0.5)

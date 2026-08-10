@@ -25,6 +25,19 @@ class MusicLifecycleTests(unittest.TestCase):
             "g_musicController.play(_MC.MUSIC_EVENT_NONE)", self.source
         )
 
+    def test_combat_music_starts_only_from_stock_arena_period_lifecycle(self):
+        self.assertNotIn(
+            "g_musicController.play(_MC.MUSIC_EVENT_COMBAT)", self.source
+        )
+        self.assertIn("player.arena.onPeriodChange(3,", self.source)
+
+    def test_music_controller_is_not_class_wrapped_for_debug_logging(self):
+        self.assertNotIn("_MC.MusicController.play =", self.source)
+        self.assertNotIn("_orig_stopMusic", self.source)
+
+    def test_battle_sweep_releases_cached_fmod_arena_events(self):
+        self.assertIn("globals().pop('g_offh_arena_snd', None)", self.source)
+
     def test_music_startup_preserves_user_volume_preferences(self):
         self.assertIn("_SG.g_instance.applyPreferences()", self.source)
         self.assertNotIn("setVolume('music', 1.0)", self.source)

@@ -160,9 +160,9 @@ def build_offline_battle_context(player, selected_veh_inv_id, cmdName=''):
 			_mtries += 1
 	globals()['_g_offh_last_map'] = _pick[1]
 	map_id, map_name = _pick
-	# Network clients must load the same map before they can exchange world
-	# coordinates.  The server deliberately does not need proprietary map
-	# coordinates; all clients use this shared configured geometry name.
+	# Network clients must load the same map before they can exchange canonical
+	# coordinates. The authority later supplies the shared map-frame basis used
+	# by server-side static navigation; BigWorld terrain queries remain local.
 	try:
 		from gui.mods.offhangar._constants import CONFIG_OPTIONS as _NET_CFG
 		if bool(_NET_CFG.get('network_mode', False)):

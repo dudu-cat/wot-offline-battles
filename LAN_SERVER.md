@@ -4,8 +4,9 @@ This repository contains an optional LAN battle path for the 0.8.2 offline clien
 The normal offline mode remains available. The server-backed path also works
 with one connected player and reuses the existing garage, map loading, tank
 models, HUD and local driving code. A separate Python 3 process owns the shared
-roster, health, deaths, battle rules, global bot orders and the relay for
-human/bot movement, firing and client-resolved armor impacts.
+roster, health, deaths, battle rules, global bot orders, static navigation-graph
+pathfinding and the relay for human/bot movement, firing and client-resolved
+armor impacts.
 
 ## Start the server
 
@@ -71,7 +72,7 @@ With normal logging settings, each client writes these milestones to
 ```text
 LAN connecting to 192.168.1.20:28782
 LAN TCP connected to 192.168.1.20:28782
-LAN hello sent (protocol 6)
+LAN hello sent (protocol 8, build 1.8.19-test-20260810)
 LAN welcome id=1 name=Player-158 vehicle=china:Type_59 team=1 slot=0 map=... phase=waiting
 LAN JOIN confirmed; queue screen is now server-backed
 LAN queue UI updated: 2 connected player(s)
@@ -79,17 +80,20 @@ LAN waiting room: 2 player(s); choose a map and click START BATTLE
 LAN BATTLE START received: map=... players=2 delay=0.75
 LAN bot authority: player_id=1 local=True
 LAN bot manifest received: 30 bot(s)
+LAN server-baked navigation waypoints active
 ```
 
 If the server prints no `TCP connection` line, the problem is before the
 protocol: verify LAN mode is ON, the configured IP, Parallels network mode and
 the server firewall. If it prints a TCP connection followed by `protocol
-mismatch`, the client and server packages are from different builds.
+mismatch` or `client build mismatch`, replace the complete `0.8.2` folder on
+every PC and use the server from the same package.
 
 During a battle the server prints one compact bot-AI line every three seconds:
 
 ```text
 BOT AI reports=t1:2,t2:3 accepted=5 contacts=t1:2/2,t2:3/3 targets=t1:8,t2:9 fire=t1:5,t2:6 modes=engage:17,route:12 nav=baked,cell:4000mm,nodes:16808 nav_total=direct:20,local:4,reactive:3 recovered:9 nav_active=direct:2,local:1,reactive:0 astar=pending:5,oldest:420ms,tick_age:0ms,done:41,failed:2 orders=server:18,client:18,loaded:29,acked:18 aim=targeted:17,aligned:6,traversing:11,limited:7,alive:29 driver=moving:24,drive:20,avoid:4,blocked:0,recovery:1,arrived:4,wait:0 safety=water:2/0,edge:5/1,veto:w0,t1,o0,e0
+BOT NAV active=True map=07_lakeville nodes=... plans=... direct=... cache=... complete=... partial=... pending=... failed=0 budget=.../...ms oldest=...ms avg=...ms max=...ms paths=...
 ```
 
 `reports` is the authority client's current visible-contact count, `contacts`
@@ -103,6 +107,14 @@ current samples. `tick_age` reveals a stalled path scheduler. A healthy order
 pipeline has matching `orders` server/client/acked revisions and `loaded:29`;
 `wait` counts bots deliberately holding while an order body is being recovered.
 `safety` counts water rollbacks and baked-edge rollbacks as total/current.
+`BOT NAV active=True` proves that long static A* paths are being resolved by the
+Python 3 server rather than the 0.8.2 render thread. A cold search is advanced
+fairly across server ticks under a six-millisecond total budget; `pending` and
+`oldest` expose queue pressure without allowing one difficult route to stall
+networking. `partial` is safe forward progress that is automatically continued
+until the real order destination is reached. `failed=0` is expected for the
+shipped 33-map graph set; a non-zero value activates an explicit per-bot client
+fallback instead of reusing a stale waypoint.
 Each actual client-simulated shot also prints `BOT FIRE`. This separates
 spotting, delivery, navigation and client execution without enabling verbose
 client debug logging.
@@ -166,7 +178,7 @@ map list; the clicked waiting-room selection is authoritative for the round.
 ## Current protocol boundary
 
 The server speaks a small newline-delimited JSON protocol, not the original
-Wargaming/BigWorld server protocol. Protocol v6 has one waiting room per server
+Wargaming/BigWorld server protocol. Protocol v8 has one waiting room per server
 process and a server-authoritative `battle_start` barrier. The server fixes one
 30-second combat deadline and continuously includes remaining battle time in
 the 30 Hz snapshots. Each client closes the normal loading page on its own and
@@ -202,8 +214,11 @@ For nearby visible contacts the authority also probes a bounded fan of
 drivable, dry, low-slope cover and peek points. The server validates those
 points against the bot's shared pose, scores them by role/personality, reserves
 them across the team, and controls the approach/hold/peek/return cycle. The
-authority client executes those orders with the real map collision, local
-driver, armor and shell systems, then publishes canonical pose/fire/HP state.
+server resolves each movement order through the shipped static navigation
+graph with resumable, per-tick-budgeted weighted A* and includes a short
+canonical waypoint in every snapshot. The authority client
+executes that waypoint with the real map collision, local driver, armor and
+shell systems, then publishes canonical pose/fire/HP state.
 Every client therefore renders the same population and combat result. If the
 authority disconnects, the server elects the next player, preserves canonical
 bot/HP/rules state, and clears the departed client's short-lived contacts and
@@ -218,10 +233,10 @@ client-local frag side effects.
 
 ### Bot planner portability boundary
 
-`server_bot_ai.py` and the cover scorer it shares with the client are
-intentionally pure data: neither imports BigWorld or touches a client runtime.
+`server_bot_ai.py`, `server_bot_navigation.py` and the data-only navigation
+graph reader shared with the client are intentionally independent of BigWorld.
 Their inputs and outputs are JSON-compatible dictionaries carried by protocol
-v5:
+v8:
 
 - `bot_manifest`: identity, team, vehicle profile, shell profiles and sparse
   route waypoints;
@@ -233,6 +248,8 @@ v5:
   combat mode, throttle override and shell index, guarded by
   `bot_order_revision`. A snapshot includes the order list only when that
   revision is new for its recipient.
+- snapshot navigation fields: `nav_source`, `nav_order_revision` and a short
+  canonical `nav_x/nav_y/nav_z` waypoint resolved from the static graph.
 
 This boundary is suitable for replacing the Python server planner with Go
 without moving proprietary map queries or BigWorld entity control off the

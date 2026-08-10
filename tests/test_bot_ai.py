@@ -66,6 +66,29 @@ class BotAITest(unittest.TestCase):
         }
         self.assertGreaterEqual(len(personalities), 10)
 
+    def test_register_does_not_rebuild_an_existing_vehicle_profile(self):
+        director = self.ai.BattleDirector("04_himmelsdorf", "profile-cache")
+        original = self.ai.build_vehicle_profile
+        calls = []
+
+        def tracked(value):
+            calls.append(value)
+            return original(value)
+
+        self.ai.build_vehicle_profile = tracked
+        try:
+            first = director.register(
+                101, 1, descriptor("heavyTank"), "Cached Bot"
+            )
+            second = director.register(
+                101, 1, descriptor("lightTank"), "Ignored Change"
+            )
+        finally:
+            self.ai.build_vehicle_profile = original
+
+        self.assertIs(first, second)
+        self.assertEqual(1, len(calls))
+
     def test_matchmaking_uses_a_three_tier_band(self):
         allowed = {
             tier for tier in range(1, 11)
@@ -293,7 +316,7 @@ class BotAITest(unittest.TestCase):
         self.assertTrue(-130 < lane_x["lake_road"] < -40)
         self.assertGreater(lane_x["east_town"], 260)
 
-    def test_routes_start_at_own_flag_and_finish_at_enemy_flag(self):
+    def test_routes_start_at_own_flag_and_finish_at_their_objective(self):
         for map_name, tactical_map in self.maps.TACTICAL_MAPS.items():
             for team in (1, 2):
                 own = tactical_map["bases"][team]
@@ -305,9 +328,16 @@ class BotAITest(unittest.TestCase):
                     if len(points) < 2:
                         continue
                     self.assertEqual((float(own[0]), float(own[1]), 0), points[0])
-                    self.assertEqual(
-                        (float(enemy[0]), float(enemy[1]), 0), points[-1]
-                    )
+                    if source_route.get("terminal_hold"):
+                        self.assertTrue(points[-1][2], (map_name, team,
+                                                       source_route["id"]))
+                        self.assertNotEqual(
+                            (float(enemy[0]), float(enemy[1]), 0), points[-1]
+                        )
+                    else:
+                        self.assertEqual(
+                            (float(enemy[0]), float(enemy[1]), 0), points[-1]
+                        )
 
                 director = self.ai.BattleDirector(map_name, "flag-goal")
                 agent = director.register(
@@ -321,6 +351,56 @@ class BotAITest(unittest.TestCase):
                     0.0, 1000, 1000, 0.0,
                 )
                 self.assertGreaterEqual(order["route_index"], 1)
+
+    def test_reviewed_map_routes_keep_their_distinct_tactical_lanes(self):
+        campania = self.maps.get_tactical_map("03_campania")
+        for team in (1, 2):
+            routes = {route["id"]: route for route in campania["routes"][team]}
+            self.assertTrue(routes["west_hill"]["terminal_hold"])
+            self.assertTrue(routes["east_hill"]["terminal_hold"])
+            self.assertLess(min(point[0] for point in
+                                routes["west_hill"]["waypoints"]), -125.0)
+            self.assertGreater(max(point[0] for point in
+                                   routes["east_hill"]["waypoints"]), 145.0)
+
+        komarin = self.maps.get_tactical_map("15_komarin")
+        for team in (1, 2):
+            middle = next(route for route in komarin["routes"][team]
+                          if route["id"] == "inner_field")
+            self.assertTrue(middle["terminal_hold"])
+            terminal = middle["waypoints"][-1]
+            self.assertLess(abs(terminal[0]), 50.0)
+            self.assertLess(abs(terminal[1]), 160.0)
+
+        slough = self.maps.get_tactical_map("22_slough")
+        lower = next(route for route in slough["routes"][1]
+                     if route["id"] == "east_ridge")
+        self.assertLess(min(point[1] for point in lower["waypoints"]), -430.0)
+        self.assertTrue(any(point[0] >= 380.0 and point[1] <= -160.0
+                            for point in lower["waypoints"]))
+
+        westfield = self.maps.get_tactical_map("23_westfeld")
+        north = next(route for route in westfield["routes"][1]
+                     if route["id"] == "north_ridge")
+        self.assertGreater(max(point[1] for point in north["waypoints"]), 440.0)
+        for team in (1, 2):
+            central = next(route for route in westfield["routes"][team]
+                           if route["id"] == "central_village")
+            self.assertTrue(central["terminal_hold"])
+            self.assertEqual(1, sum(bool(point[2]) for point in
+                                    central["waypoints"]))
+            terminal = central["waypoints"][-1]
+            self.assertGreater(terminal[1], 120.0)
+            self.assertLess(terminal[1], 240.0)
+
+        el_hallouf = self.maps.get_tactical_map("29_el_hallouf")
+        for team in (1, 2):
+            right_road = next(route for route in el_hallouf["routes"][team]
+                              if route["id"] == "south_valley")
+            self.assertTrue(right_road["terminal_hold"])
+            terminal = right_road["waypoints"][-1]
+            self.assertGreater(terminal[0], 250.0)
+            self.assertGreater(terminal[1], 90.0)
 
     def test_spawn_skips_short_route_connector_behind_formation(self):
         director = self.ai.BattleDirector("07_lakeville", "spawn-connector")
@@ -398,6 +478,7 @@ class BotAITest(unittest.TestCase):
         feedback_index = bootstrap.index("'battle_feedback'")
         spotting_index = bootstrap.index("'spotting'")
         collision_index = bootstrap.index("'vehicle_collision'")
+        pose_index = bootstrap.index("'vehicle_pose'")
         navigation_index = bootstrap.index("'bot_ai_navigation'")
         cover_index = bootstrap.index("'bot_ai_cover'")
         driver_index = bootstrap.index("'bot_ai_driver'")
@@ -408,6 +489,7 @@ class BotAITest(unittest.TestCase):
         self.assertLess(feedback_index, battle_index)
         self.assertLess(spotting_index, battle_index)
         self.assertLess(collision_index, battle_index)
+        self.assertLess(pose_index, battle_index)
         self.assertLess(ai_index, prebaked_index)
         self.assertLess(prebaked_index, navigation_index)
         self.assertLess(navigation_index, cover_index)
@@ -430,6 +512,27 @@ class BotAITest(unittest.TestCase):
         self.assertEqual("sniper", tank_destroyer["dominant_role"])
         self.assertLess(heavy["desired_range"], light["desired_range"])
         self.assertLess(light["desired_range"], tank_destroyer["desired_range"])
+
+    def test_artillery_profile_keeps_real_shell_ballistics_and_long_range(self):
+        vehicle = descriptor("SPG", speed=12.0, armor=30.0)
+        vehicle.gun = {
+            "shots": ({
+                "speed": 320.0,
+                "gravity": 55.0,
+                "shell": {
+                    "kind": "HIGH_EXPLOSIVE",
+                    "piercingPower": (48.0, 42.0),
+                    "damage": (530.0, 530.0),
+                },
+            },),
+        }
+
+        profile = self.ai.build_vehicle_profile(vehicle)
+
+        self.assertEqual("SPG", profile["class_tag"])
+        self.assertEqual(1200.0, profile["fire_range"])
+        self.assertEqual(320.0, profile["shells"][0]["speed"])
+        self.assertEqual(55.0, profile["shells"][0]["gravity"])
 
     def test_himmelsdorf_routes_are_bounded_and_bidirectional(self):
         tactical_map = self.maps.get_tactical_map("spaces/04_himmelsdorf")
@@ -629,7 +732,7 @@ class BotAITest(unittest.TestCase):
         self.assertIsNone(expired["target_id"])
         self.assertFalse(expired["fire_allowed"])
 
-    def test_armoured_bot_angles_and_patient_bot_cycles_back_to_cover(self):
+    def test_armoured_bot_angles_without_inventing_unprobed_cover(self):
         director = self.ai.BattleDirector("04_himmelsdorf", 33)
         agent = director.register(
             301, 1, descriptor("heavyTank", armor=180.0), "Patient"
@@ -656,7 +759,7 @@ class BotAITest(unittest.TestCase):
             angled = order["face_position"]
 
         self.assertIn("engage", modes)
-        self.assertIn("withdraw", modes)
+        self.assertNotIn("withdraw", modes)
         self.assertNotEqual(target, angled)
         direct_bearing = math.atan2(target[0] - position[0], target[2] - position[2])
         angled_bearing = math.atan2(
@@ -664,7 +767,7 @@ class BotAITest(unittest.TestCase):
         )
         self.assertGreater(abs(angled_bearing - direct_bearing), math.radians(10.0))
 
-    def test_jiggle_is_an_individual_armoured_driver_habit(self):
+    def test_armoured_driver_does_not_jiggle_without_confirmed_cover(self):
         director = self.ai.BattleDirector("04_himmelsdorf", 45)
         agent = director.register(
             401, 1, descriptor("heavyTank", armor=180.0), "Jiggler"
@@ -689,10 +792,9 @@ class BotAITest(unittest.TestCase):
             modes.add(order["combat_mode"])
             throttle_values.add(order["throttle_override"])
 
-        self.assertIn("jiggle_forward", modes)
-        self.assertIn("jiggle_back", modes)
-        self.assertTrue(any(value is not None and value > 0 for value in throttle_values))
-        self.assertTrue(any(value is not None and value < 0 for value in throttle_values))
+        self.assertNotIn("jiggle_forward", modes)
+        self.assertNotIn("jiggle_back", modes)
+        self.assertEqual({None}, throttle_values)
 
         light_director = self.ai.BattleDirector("04_himmelsdorf", 45)
         light_agent = light_director.register(

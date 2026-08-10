@@ -14,8 +14,9 @@ def _weights(brawler, support, flanker, sniper, scout, artillery):
 	}
 
 
-def _route(route_id, capacity, risk, weights, waypoints):
-	return {
+def _route(route_id, capacity, risk, weights, waypoints,
+		terminal_hold=False):
+	result = {
 		'id': route_id,
 		'capacity': capacity,
 		'risk': risk,
@@ -23,6 +24,9 @@ def _route(route_id, capacity, risk, weights, waypoints):
 		'hold': waypoints[-1],
 		'waypoints': tuple(waypoints),
 	}
+	if terminal_hold:
+		result['terminal_hold'] = True
+	return result
 
 
 def _reverse_routes(routes):
@@ -37,26 +41,45 @@ def _reverse_routes(routes):
 	return tuple(result)
 
 
-def _map(name, bounds, base1, base2, routes):
+def _map(name, bounds, base1, base2, routes, dry_only=False, routes2=None):
+	team1 = tuple(routes)
+	team2 = (tuple(routes2) if routes2 is not None else
+	         _reverse_routes(team1))
 	return {
 		'name': name,
 		'bounds': bounds,
 		'bases': {1: base1, 2: base2},
-		'routes': {1: tuple(routes), 2: _reverse_routes(routes)},
+		'routes': {1: team1, 2: team2},
+		'dry_only': bool(dry_only),
 	}
 
 
-# 15_komarin: two northern approaches share the upper crossing while the
-# southern route uses the lower bridge. The centre island has no through road.
-KOMARIN = _map('15_komarin', (-400.0, -400.0, 400.0, 400.0),
-	(-280.772, -192.392), (282.752, 167.894), (
+# 15_komarin: north and south are through lanes.  The centre is a contested
+# position reached from different bridge approaches, not another perimeter
+# route forced all the way to the opposite flag.
+_KOMARIN_TEAM1 = (
 		_route('north_field', 4, 0.54, _weights(.50, .82, .55, .70, .38, .08),
 			((-281, -192, 0), (-330, -60, 0), (-315, 80, 0), (-220, 210, 1), (-60, 290, 1), (110, 285, 1), (235, 230, 0), (283, 168, 0))),
 		_route('inner_field', 4, 0.68, _weights(.72, .42, .90, .16, .72, .00),
-			((-281, -192, 0), (-220, -80, 0), (-160, 60, 0), (-100, 180, 1), (20, 250, 1), (150, 300, 1), (280, 240, 0), (283, 168, 0))),
+			((-281, -192, 0), (-300, -70, 0), (-275, 60, 0),
+			 (-220, 115, 0), (-150, 122, 0), (-70, 122, 0),
+			 (20, 118, 1)), True),
 		_route('south_field', 3, 0.82, _weights(.92, .75, .30, .10, .15, .00),
 			((-281, -192, 0), (-315, -285, 0), (-270, -345, 0), (-150, -360, 1), (0, -330, 1), (160, -275, 1), (260, -120, 0), (283, 168, 0))),
-	))
+)
+_KOMARIN_TEAM2 = (
+	_reverse_routes((_KOMARIN_TEAM1[0],))[0],
+	_route('inner_field', 4, 0.68, _weights(.72, .42, .90, .16, .72, .00),
+		((283, 168, 0), (275, 60, 0), (230, -20, 0),
+		 (180, -80, 0), (100, -114, 0), (20, -130, 0),
+		 (-40, -145, 1)), True),
+	_reverse_routes((_KOMARIN_TEAM1[2],))[0],
+)
+KOMARIN = _map('15_komarin', (-400.0, -400.0, 400.0, 400.0),
+	(-280.772, -192.392), (282.752, 167.894), _KOMARIN_TEAM1,
+	dry_only=True, routes2=_KOMARIN_TEAM2)
+del _KOMARIN_TEAM1
+del _KOMARIN_TEAM2
 
 
 MUNCHEN = _map('17_munchen', (-300.0, -300.0, 300.0, 300.0),
@@ -64,7 +87,7 @@ MUNCHEN = _map('17_munchen', (-300.0, -300.0, 300.0, 300.0),
 		_route('west_streets', 5, 0.61, _weights(.90, .65, .30, .12, .22, .00),
 			((-80, -190, 0), (-155, -165, 0), (-210, -85, 1), (-210, 10, 1), (-165, 105, 1), (-55, 195, 0))),
 		_route('east_rail', 4, 0.48, _weights(.25, .72, .65, 1.00, .62, .12),
-			((-55, -190, 0), (20, -155, 0), (125, -115, 0), (180, -20, 1), (165, 85, 1), (100, 180, 0))),
+			((-84, -202, 0), (35, -225, 0), (140, -208, 0), (205, -100, 0), (267, 8, 1), (264, 133, 0), (190, 225, 0), (65, 221, 0))),
 		_route('center_blocks', 3, 0.78, _weights(.75, 1.00, .42, .22, .30, .00),
 			((-80, -175, 0), (-60, -105, 1), (-35, -40, 1), (-5, 35, 1), (30, 105, 1), (60, 185, 0))),
 	))
@@ -77,7 +100,7 @@ CLIFF = _map('18_cliff', (-500.0, -500.0, 500.0, 500.0),
 		_route('central_road', 5, 0.73, _weights(.92, .70, .35, .15, .22, .00),
 			((-280, -420, 0), (-245, -285, 0), (-190, -135, 1), (-145, 20, 1), (-175, 170, 1), (-240, 385, 0))),
 		_route('east_ridge', 3, 0.76, _weights(.32, .68, 1.00, .66, .90, .00),
-			((-270, -420, 0), (-105, -335, 0), (75, -245, 1), (175, -70, 1), (100, 125, 1), (-120, 340, 0))),
+			((-287, -437, 0), (-100, -346, 0), (77, -212, 0), (260, -90, 0), (313, 96, 1), (120, 205, 0), (-73, 313, 0), (-252, 435, 0))),
 	))
 
 
@@ -99,19 +122,42 @@ SLOUGH = _map('22_slough', (-500.0, -500.0, 500.0, 500.0),
 		_route('middle_low', 5, 0.72, _weights(.95, .76, .36, .15, .22, .00),
 			((-385, -405, 0), (-285, -285, 0), (-150, -135, 1), (0, 10, 1), (145, 155, 1), (350, 400, 0))),
 		_route('east_ridge', 3, 0.69, _weights(.35, .65, 1.00, .70, .94, .00),
-			((-380, -405, 0), (-210, -345, 0), (5, -240, 1), (205, -45, 1), (320, 180, 1), (360, 395, 0))),
+			((-404, -424, 0), (-342, -416, 0), (-242, -434, 0),
+			 (-66, -424, 0), (258, -315, 1), (326, -266, 0),
+			 (390, -166, 0), (390, 0, 0), (330, 170, 0),
+			 (332, 298, 0), (383, 423, 0))),
 	))
 
 
-WESTFELD = _map('23_westfeld', (-500.0, -500.0, 500.0, 500.0),
-	(-300.1, -339.6), (339.4, 299.8), (
+_WESTFELD_TEAM1 = (
 		_route('north_ridge', 3, 0.67, _weights(.34, .75, 1.00, .82, .82, .00),
-			((-300, -340, 0), (-360, -250, 0), (-400, -100, 0), (-310, 40, 1), (-210, 140, 1), (0, 260, 1), (180, 310, 0), (339, 300, 0))),
+			((-300, -340, 0), (-377, -186, 0), (-356, -20, 0),
+			 (-281, 135, 0), (-164, 258, 0), (-50, 308, 0),
+			 (0, 400, 0), (150, 450, 1), (280, 420, 0),
+			 (339, 300, 0))),
+		# The village sits on two shelves separated by a steep transition.
+		# Each team advances to its own fighting entrance instead of following
+		# a base-to-base polyline that doubles back across the cliff.
 		_route('central_village', 5, 0.75, _weights(.95, .72, .34, .12, .20, .00),
-			((-300, -340, 0), (-220, -280, 0), (-130, -190, 0), (-40, -95, 1), (60, 10, 1), (160, 110, 1), (250, 210, 0), (339, 300, 0))),
+			((-300, -340, 0), (-220, -280, 0), (-130, -190, 0),
+			 (-40, -95, 0), (60, 10, 0), (90, 100, 0),
+			 (90, 202, 0), (78, 226, 1)), True),
 		_route('east_fields', 4, 0.50, _weights(.45, .88, .58, 1.00, .46, .16),
-			((-300, -340, 0), (-170, -370, 0), (0, -350, 0), (140, -270, 1), (250, -140, 1), (320, 20, 1), (330, 160, 0), (339, 300, 0))),
-	))
+			((-300, -340, 0), (-110, -415, 0), (90, -449, 0), (291, -417, 0), (419, -288, 0), (446, -87, 1), (424, 114, 0), (339, 300, 0))),
+)
+_WESTFELD_TEAM2 = (
+	_reverse_routes((_WESTFELD_TEAM1[0],))[0],
+	_route('central_village', 5, 0.75,
+		_weights(.95, .72, .34, .12, .20, .00),
+		((339, 300, 0), (262, 234, 0), (230, 146, 0),
+		 (174, 130, 1)), True),
+	_reverse_routes((_WESTFELD_TEAM1[2],))[0],
+)
+WESTFELD = _map('23_westfeld', (-500.0, -500.0, 500.0, 500.0),
+	(-300.1, -339.6), (339.4, 299.8), _WESTFELD_TEAM1,
+	routes2=_WESTFELD_TEAM2)
+del _WESTFELD_TEAM1
+del _WESTFELD_TEAM2
 
 
 DESERT = _map('28_desert', (-500.0, -500.0, 500.0, 500.0),
@@ -125,25 +171,41 @@ DESERT = _map('28_desert', (-500.0, -500.0, 500.0, 500.0),
 	))
 
 
-EL_HALLOUF = _map('29_el_hallouf', (-500.0, -500.0, 500.0, 500.0),
-	(299.256, 319.406), (-338.5832, -319.3074), (
+_EL_HALLOUF_TEAM1 = (
+		# The eastern road is a hill fight.  It is not a second copy of the
+		# central bowl route, so each team approaches a separate side of the
+		# ridge and holds there for contact.
 		_route('south_valley', 5, 0.70, _weights(.94, .78, .38, .16, .20, .00),
-			((-270, -380, 0), (-130, -405, 0), (25, -355, 1), (165, -220, 1), (285, -30, 1), (410, 270, 0))),
+			((299, 319, 0), (350, 230, 0), (370, 102, 1)), True),
 		_route('central_bowl', 4, 0.77, _weights(.76, .92, .48, .36, .42, .00),
-			((-270, -380, 0), (-205, -245, 0), (-105, -105, 1), (25, 10, 1), (175, 105, 1), (410, 270, 0))),
+			((299, 319, 0), (170, 180, 0), (75, 35, 0), (-25, -90, 1), (-155, -225, 0), (-339, -319, 0))),
 		_route('north_ridge', 3, 0.65, _weights(.30, .70, 1.00, .92, .88, .00),
-			((-270, -375, 0), (-320, -195, 0), (-100, 155, 1), (135, 245, 1), (410, 275, 0))),
-	))
+			((299, 319, 0), (100, 370, 0), (-150, 350, 0), (-380, 300, 0), (-450, 100, 1), (-420, -150, 0), (-339, -319, 0))),
+)
+_EL_HALLOUF_TEAM2 = (
+	_route('south_valley', 5, 0.70,
+		_weights(.94, .78, .38, .16, .20, .00),
+		((-339, -319, 0), (-220, -300, 0), (-80, -250, 0),
+		 (50, -150, 0), (100, 0, 0), (200, 120, 0),
+		 (266, 190, 1)), True),
+	_reverse_routes((_EL_HALLOUF_TEAM1[1],))[0],
+	_reverse_routes((_EL_HALLOUF_TEAM1[2],))[0],
+)
+EL_HALLOUF = _map('29_el_hallouf', (-500.0, -500.0, 500.0, 500.0),
+	(299.256, 319.406), (-338.5832, -319.3074), _EL_HALLOUF_TEAM1,
+	routes2=_EL_HALLOUF_TEAM2)
+del _EL_HALLOUF_TEAM1
+del _EL_HALLOUF_TEAM2
 
 
 FJORD = _map('33_fjord', (-500.0, -500.0, 500.0, 500.0),
 	(399.1, -42.1), (-381.3, 111.4), (
 		_route('north_ridge', 3, 0.66, _weights(.32, .70, 1.00, .88, .86, .00),
-			((380, -35, 0), (275, 85, 0), (145, 190, 1), (-20, 230, 1), (-205, 185, 1), (-365, 110, 0))),
+			((399, -42, 0), (400, 145, 0), (418, 343, 0), (250, 405, 0), (70, 389, 1), (-115, 404, 0), (-287, 287, 0), (-381, 111, 0))),
 		_route('middle_village', 5, 0.80, _weights(.96, .78, .32, .14, .18, .00),
-			((380, -40, 0), (250, -20, 0), (105, 15, 1), (-35, 40, 1), (-180, 75, 1), (-365, 110, 0))),
+			((399, -42, 0), (186, -39, 0), (22, 95, 0), (-120, 170, 1), (-226, 231, 0), (-326, 138, 0), (-381, 111, 0))),
 		_route('south_coast', 4, 0.55, _weights(.46, .88, .62, 1.00, .42, .14),
-			((380, -50, 0), (250, -155, 0), (85, -210, 1), (-95, -160, 1), (-255, -20, 1), (-365, 105, 0))),
+			((399, -42, 0), (260, -130, 0), (80, -130, 0), (0, -230, 0), (-80, -350, 0), (-150, -350, 1), (-190, -230, 0), (-240, -80, 0), (-381, 111, 0))),
 	))
 
 

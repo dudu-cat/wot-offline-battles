@@ -1,12 +1,15 @@
 import importlib.util
+import types
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "scripts/client/gui/mods/offhangar/spotting.py"
+CAMOUFLAGE_DATA = ROOT / "scripts/client/gui/mods/offhangar/vehicle_camouflage.py"
 BATTLE = ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
 NETWORK = ROOT / "scripts/client/gui/mods/offhangar/network_battle.py"
+ENTRY = ROOT / "scripts/client/gui/mods/mod_offhangar.py"
 
 
 def load_spotting():
@@ -16,10 +19,20 @@ def load_spotting():
     return module
 
 
+def load_camouflage_data():
+    spec = importlib.util.spec_from_file_location(
+        "offhangar_vehicle_camouflage", CAMOUFLAGE_DATA
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class SpottingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.spotting = load_spotting()
+        cls.camouflage_data = load_camouflage_data()
 
     def test_100_percent_commander_preserves_nominal_view_range(self):
         self.assertAlmostEqual(
@@ -86,12 +99,36 @@ class SpottingTests(unittest.TestCase):
         self.assertGreater(still, moving)
         self.assertGreater(moving, fired)
 
-    def test_class_fallback_keeps_expected_concealment_order(self):
-        light = self.spotting.class_camouflage({"lightTank"})
-        heavy = self.spotting.class_camouflage({"heavyTank"})
-        destroyer = self.spotting.class_camouflage({"AT-SPG"})
-        self.assertGreater(light[0], heavy[0])
-        self.assertGreater(destroyer[1], destroyer[0])
+    def test_vehicle_camouflage_is_per_vehicle_not_per_class(self):
+        type62 = self.camouflage_data.camouflage_for_vehicle(
+            "china:Ch02_Type62"
+        )
+        amx_1390 = self.camouflage_data.camouflage_for_vehicle(
+            "france:AMX_13_90"
+        )
+        self.assertIsNotNone(type62)
+        self.assertIsNotNone(amx_1390)
+        self.assertNotEqual(type62, amx_1390)
+        self.assertEqual(
+            self.camouflage_data.DATA_COVERED_VEHICLES,
+            len(self.camouflage_data.VEHICLE_CAMOUFLAGE),
+        )
+
+    def test_missing_camouflage_data_is_not_replaced_by_a_class_average(self):
+        battle = BATTLE.read_text()
+        spotting = SOURCE.read_text()
+        self.assertIn("raise ValueError(message)", battle)
+        self.assertIn("missing per-vehicle camouflage data", battle)
+        self.assertNotIn("class-fallback", battle)
+        self.assertNotIn("CLASS_CAMOUFLAGE", spotting)
+
+    def test_raw_camouflage_has_nonzero_baseline_without_crew_skill(self):
+        self.assertAlmostEqual(
+            4.0 / 7.0, self.spotting.crew_camouflage_factor(0.0), places=6
+        )
+        self.assertAlmostEqual(
+            1.0, self.spotting.crew_camouflage_factor(100.0), places=6
+        )
 
     def test_battle_ai_render_and_network_share_one_spotting_path(self):
         battle = BATTLE.read_text()
@@ -102,6 +139,16 @@ class SpottingTests(unittest.TestCase):
         self.assertIn("_offh_spot_refresh_sixth_sense", battle)
         self.assertIn("spotting_player", battle)
         self.assertNotIn("g_offh_viewrange", battle)
+
+    def test_foliage_is_pair_specific_and_native_probe_is_removed(self):
+        battle = BATTLE.read_text()
+        entry = ENTRY.read_text()
+        self.assertIn("foliage_map.camouflage_bonus(", battle)
+        self.assertIn("observer['position'], target['position']", battle)
+        self.assertIn("load_foliage(map_name)", battle)
+        self.assertNotIn("wg_visibilityCollideSegment", battle)
+        self.assertNotIn("VISIBILITY_PROBE", battle)
+        self.assertIn("'foliage', 'prebaked_foliage'", entry)
 
     def test_combined_role_crew_can_supply_both_view_skills(self):
         battle = BATTLE.read_text()
@@ -121,6 +168,31 @@ class SpottingTests(unittest.TestCase):
         self.assertGreaterEqual(
             battle.count("_offh_spot_last_shot = float(BigWorld.time())"), 3
         )
+
+    def test_new_mock_with_none_still_timestamp_does_not_abort_spotting(self):
+        battle = BATTLE.read_text()
+        start = battle.index("def _offh_spot_motion(vehicle, now):")
+        end = battle.index("\ndef _offh_spot_damage_vision_factor", start)
+        function_source = battle[start:end].replace(
+            "\tfrom gui.mods.offhangar import spotting\n", ""
+        )
+        namespace = {
+            "spotting": types.SimpleNamespace(
+                STILL_DEVICE_DELAY_SECONDS=3.0,
+                MOVING_SPEED_EPSILON=0.1,
+            )
+        }
+        exec(function_source, namespace)
+        vehicle = types.SimpleNamespace(
+            _veh_velocity=0.0,
+            _offh_spot_still_since=None,
+        )
+
+        moving, still_for = namespace["_offh_spot_motion"](vehicle, 100.0)
+
+        self.assertFalse(moving)
+        self.assertEqual(0.0, still_for)
+        self.assertEqual(100.0, vehicle._offh_spot_still_since)
 
 
 if __name__ == "__main__":

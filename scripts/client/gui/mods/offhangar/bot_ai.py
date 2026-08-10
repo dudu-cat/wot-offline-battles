@@ -397,7 +397,7 @@ def trimmed_sight_segment(observer, target, observer_height=2.5,
 
 
 def route_toward_enemy(route, team, bases):
-	"""Orient a multi-point route from the own flag to the enemy flag."""
+	"""Orient a route from its own flag toward its tactical objective."""
 	result = dict(route or {})
 	result['role_weights'] = dict(result.get('role_weights', {}) or {})
 	points = list(result.get('waypoints', ()) or ())
@@ -413,20 +413,29 @@ def route_toward_enemy(route, team, bases):
 		def _distance(point, base):
 			return ((float(point[0]) - float(base[0])) ** 2 +
 				(float(point[1]) - float(base[1])) ** 2)
-		forward = _distance(points[0], own) + _distance(points[-1], enemy)
-		reverse = _distance(points[-1], own) + _distance(points[0], enemy)
+		terminal_hold = bool(result.get('terminal_hold', False))
+		if terminal_hold:
+			forward = _distance(points[0], own)
+			reverse = _distance(points[-1], own)
+		else:
+			forward = _distance(points[0], own) + _distance(points[-1], enemy)
+			reverse = _distance(points[-1], own) + _distance(points[0], enemy)
 		if reverse < forward:
 			points.reverse()
 		own_point = (float(own[0]), float(own[1]), 0)
-		enemy_point = (float(enemy[0]), float(enemy[1]), 0)
 		if _distance(points[0], own) > 1.0:
 			points.insert(0, own_point)
 		else:
 			points[0] = own_point
-		if _distance(points[-1], enemy) > 1.0:
-			points.append(enemy_point)
+		if terminal_hold:
+			last = points[-1]
+			points[-1] = (float(last[0]), float(last[1]), 1)
 		else:
-			points[-1] = enemy_point
+			enemy_point = (float(enemy[0]), float(enemy[1]), 0)
+			if _distance(points[-1], enemy) > 1.0:
+				points.append(enemy_point)
+			else:
+				points[-1] = enemy_point
 	except Exception:
 		pass
 	result['waypoints'] = tuple(points)
@@ -534,6 +543,7 @@ def _shell_profiles(descriptor):
 				_mapping_get(shell, 'piercingPower', 0.0), 0.0),
 			'damage': _middle_value(_mapping_get(shell, 'damage', 0.0), 0.0),
 			'speed': _number(_mapping_get(shot, 'speed', 0.0), 0.0),
+			'gravity': abs(_number(_mapping_get(shot, 'gravity', 0.0), 0.0)),
 		})
 	return tuple(result)
 
@@ -579,7 +589,7 @@ def build_vehicle_profile(descriptor):
 		'mediumTank': (135.0, 340.0),
 		'lightTank': (175.0, 320.0),
 		'AT-SPG': (255.0, 450.0),
-		'SPG': (340.0, 120.0),  # no indirect-fire controller yet
+		'SPG': (520.0, 1200.0),
 	}
 	desired_range, fire_range = desired_ranges[class_tag]
 	if armor >= 120.0 and class_tag == 'AT-SPG':
@@ -717,6 +727,12 @@ class BattleDirector(object):
 		self.route_usage = {}
 
 	def register(self, bot_id, team, descriptor, display_name='Bot'):
+		# Descriptor parsing is immutable and materially expensive on Python 2.6.
+		# The render callback may see an already registered vehicle many times; avoid
+		# rebuilding its tactical profile before register_profile can return it.
+		existing = self.agents.get(int(bot_id))
+		if existing is not None:
+			return existing
 		return self.register_profile(
 			bot_id, team, build_vehicle_profile(descriptor), display_name)
 
@@ -911,8 +927,11 @@ class BattleDirector(object):
 				continue
 			roles = profile.get('roles', {})
 			mobility = max(_number(roles.get('scout')), _number(roles.get('flanker')))
-			engagement_range = max(340.0, min(
-				560.0, profile['desired_range'] * 2.0 + mobility * 300.0))
+			if profile.get('class_tag') == 'SPG':
+				engagement_range = max(1200.0, profile.get('fire_range', 0.0))
+			else:
+				engagement_range = max(340.0, min(
+					560.0, profile['desired_range'] * 2.0 + mobility * 300.0))
 			if distance > engagement_range:
 				continue
 			health_fraction = contact['health'] / max(contact['max_health'], 1.0)
@@ -1068,6 +1087,25 @@ class BattleDirector(object):
 			'shell_index': 0,
 			'force_balance': 0.0,
 		}
+		if profile.get('class_tag') == 'SPG':
+			home = agent.get('artillery_home')
+			if home is None:
+				home = tuple(position)
+				agent['artillery_home'] = home
+			order['move_position'] = tuple(position)
+			order['route_anchor'] = tuple(position)
+			order['throttle_override'] = 0.0
+			order['combat_mode'] = 'artillery_hold'
+			if contact is not None and contact.get('visible'):
+				order['target_id'] = contact['id']
+				order['aim_position'] = contact['position']
+				order['face_position'] = contact['position']
+				order['fire_allowed'] = True
+				order['shell_index'] = select_shell_index(
+					profile, contact, personality)
+				order['combat_mode'] = 'artillery_fire'
+			agent['last_order'] = order
+			return order
 		if contact is not None:
 			distance = _distance_2d(position, contact['position'])
 			contact['distance'] = distance
@@ -1108,39 +1146,9 @@ class BattleDirector(object):
 					order['combat_mode'] = 'flank'
 				else:
 					order['move_position'] = tuple(position)
-				# Some armoured turreted drivers habitually rock their hull while
-				# holding an angle. The stable phase offset keeps this individual
-				# and prevents a whole team from moving in lockstep.
-				jiggle_capable = (
-					profile['class_tag'] not in ('AT-SPG', 'SPG') and
-					profile['dominant_role'] in ('brawler', 'support') and
-					profile['armor'] >= 80.0)
-				if (jiggle_capable and personality['jiggle'] > 0.56 and
-				        order['move_position'] == tuple(position) and
-				        distance < profile['desired_range'] * 1.35):
-					jiggle_cycle = 2.4 + (1.0 - personality['jiggle']) * 1.8
-					jiggle_phase = (
-						_number(now) + (agent['seed'] % 83) * 0.043) % jiggle_cycle
-					if jiggle_phase < jiggle_cycle * 0.46:
-						order['throttle_override'] = 0.42
-						order['combat_mode'] = 'jiggle_forward'
-					else:
-						order['throttle_override'] = -0.34
-						order['combat_mode'] = 'jiggle_back'
-				# Patient, cautious line tanks alternate between a short exposure
-				# window and the previous route anchor. The phase offset is stable,
-				# so a team does not pop out and reverse in one synchronized wave.
-				peek_capable = profile['dominant_role'] in ('brawler', 'support')
-				peek_preference = personality['patience'] + personality['caution']
-				if (peek_capable and peek_preference > 0.95 and
-				        distance < profile['desired_range'] * 1.35):
-					cycle = 8.0 + personality['patience'] * 5.0
-					exposed = 3.0 + personality['aggression'] * 2.5
-					phase = (_number(now) + (agent['seed'] % 97) * 0.071) % cycle
-					if phase > exposed:
-						order['move_position'] = self._fallback_position(agent, position)
-						order['throttle_override'] = None
-						order['combat_mode'] = 'withdraw'
+				# Do not manufacture a periodic forward/back manoeuvre in open
+				# ground. Peeking belongs to the geometry-backed cover adapter; without
+				# confirmed cover this order holds, aims and fires from its current pose.
 			else:
 				# Last-known positions inform movement but never authorize a shot.
 				order['combat_mode'] = 'investigate'

@@ -10,6 +10,47 @@ import math
 
 DEFAULT_SHAPE = (1.5, 3.5, -0.8, 2.0)
 _SHAPE_CACHE = {}
+SPATIAL_CELL_SIZE = 24.0
+
+
+def build_spatial_index(bodies, cell_size=SPATIAL_CELL_SIZE):
+	"""Bucket body ids by x/z so callers avoid a full all-pairs scan.
+
+	``bodies`` is the per-frame immutable snapshot used by both local steering
+	and collision broad phase. A 24 m cell is wider than any 0.8.2 tank body and
+	also matches the driver's prediction radius, so the surrounding nine cells
+	are a complete candidate set for both consumers.
+	"""
+	size = max(1.0, float(cell_size))
+	buckets = {}
+	for body_id, body in (bodies or {}).items():
+		try:
+			position = body.get('position') if isinstance(body, dict) else body
+			x = _coord(position, 0)
+			z = _coord(position, 2)
+			key = (int(math.floor(x / size)), int(math.floor(z / size)))
+			buckets.setdefault(key, []).append(body_id)
+		except Exception:
+			continue
+	return size, buckets
+
+
+def nearby_ids(index, x, z):
+	"""Return ids in the query cell and its eight neighbours."""
+	if not index:
+		return ()
+	try:
+		size, buckets = index
+		cell_x = int(math.floor(float(x) / float(size)))
+		cell_z = int(math.floor(float(z) / float(size)))
+	except Exception:
+		return ()
+	result = []
+	for offset_z in (-1, 0, 1):
+		for offset_x in (-1, 0, 1):
+			result.extend(buckets.get(
+				(cell_x + offset_x, cell_z + offset_z), ()))
+	return tuple(result)
 
 
 def _coord(value, index, default=0.0):
@@ -76,6 +117,29 @@ def vertical_overlap(y_a, shape_a, y_b, shape_b, slop=0.02):
 	b_low = y_b + shape_b[2]
 	b_high = y_b + shape_b[3]
 	return min(a_high, b_high) - max(a_low, b_low) > slop
+
+
+def support_rise_is_obstacle(body_y, support_y, maximum_climb, slop=0.02,
+		maximum_step=0.85):
+	"""Whether a newly sampled support is a step, not drivable ground.
+
+	A vertical support ray can hit the deck of a rail wagon, a low roof or the
+	top of a large prop after the hull has moved partly inside it.  Snapping the
+	chassis origin to that height effectively teleports the tank onto the object.
+	Only rises that fit the distance this physics tick can actually climb may be
+	used as ground support; larger rises must be handled as horizontal obstacles.
+	The correction distance grows with frame time, but a low frame rate must not
+	turn a vertical wagon side into a drivable step, so it also has a hard cap.
+	"""
+	if body_y is None or support_y is None:
+		return False
+	try:
+		rise = float(support_y) - float(body_y)
+		limit = min(max(0.0, float(maximum_climb)),
+			max(0.0, float(maximum_step))) + max(0.0, float(slop))
+		return rise > limit
+	except Exception:
+		return False
 
 
 def _axes(yaw):

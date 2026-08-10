@@ -29,6 +29,179 @@ def _distance(first, second):
 	return math.sqrt(dx * dx + dz * dz)
 
 
+def intercept_point(shooter_position, target_position, target_velocity,
+		projectile_speed, max_lead_time=1.5):
+	"""Return the constant-velocity projectile intercept point.
+
+	The caller still applies gun traverse, dispersion and line-of-fire checks.  A
+	non-positive shell speed or an impossible intercept falls back to the current
+	target pose, bounded by ``max_lead_time`` so stale network velocity cannot make
+	a bot aim implausibly far ahead.
+	"""
+	try:
+		shooter = tuple(float(value) for value in shooter_position[:3])
+		target = tuple(float(value) for value in target_position[:3])
+		velocity = tuple(float(value) for value in target_velocity[:3])
+		speed = float(projectile_speed)
+		maximum = max(0.0, float(max_lead_time))
+	except Exception:
+		return target_position
+	if speed <= 1.0 or maximum <= 0.0:
+		return target
+	rx = target[0] - shooter[0]
+	ry = target[1] - shooter[1]
+	rz = target[2] - shooter[2]
+	vx, vy, vz = velocity
+	a = vx * vx + vy * vy + vz * vz - speed * speed
+	b = 2.0 * (rx * vx + ry * vy + rz * vz)
+	c = rx * rx + ry * ry + rz * rz
+	lead_time = None
+	if c <= 1e-08:
+		lead_time = 0.0
+	elif abs(a) <= 1e-08:
+		if abs(b) > 1e-08:
+			candidate = -c / b
+			if candidate > 0.0:
+				lead_time = candidate
+	else:
+		discriminant = b * b - 4.0 * a * c
+		if discriminant >= 0.0:
+			root = math.sqrt(discriminant)
+			first = (-b - root) / (2.0 * a)
+			second = (-b + root) / (2.0 * a)
+			positive = [value for value in (first, second) if value > 0.0]
+			if positive:
+				lead_time = min(positive)
+	if lead_time is None:
+		# No exact solution (for example a target outrunning a very slow shell).
+		# The distance/speed estimate is still a useful bounded visual lead.
+		lead_time = math.sqrt(c) / speed
+	lead_time = max(0.0, min(float(lead_time), maximum))
+	return (target[0] + vx * lead_time,
+	        target[1] + vy * lead_time,
+	        target[2] + vz * lead_time)
+
+
+def ballistic_solutions(shooter_position, target_position, projectile_speed,
+		gravity, minimum_pitch=-math.pi * 0.5, maximum_pitch=math.pi * 0.5):
+	"""Return physically valid ``(pitch, flight_time)`` solutions.
+
+	BigWorld uses negative gun pitch for elevation.  Results are ordered by
+	flight time, which makes the ordinary low arc the default while retaining a
+	second high arc when the installed gun can actually elevate far enough.
+	"""
+	try:
+		shooter = tuple(float(value) for value in shooter_position[:3])
+		target = tuple(float(value) for value in target_position[:3])
+		speed = float(projectile_speed)
+		acceleration = abs(float(gravity))
+		minimum = float(minimum_pitch)
+		maximum = float(maximum_pitch)
+	except Exception:
+		return ()
+	if speed <= 1.0 or acceleration <= 0.01:
+		return ()
+	dx = target[0] - shooter[0]
+	dz = target[2] - shooter[2]
+	distance = math.sqrt(dx * dx + dz * dz)
+	if distance <= 0.1:
+		return ()
+	dy = target[1] - shooter[1]
+	speed_sq = speed * speed
+	discriminant = (speed_sq * speed_sq - acceleration *
+		(acceleration * distance * distance + 2.0 * dy * speed_sq))
+	if discriminant < 0.0:
+		return ()
+	root = math.sqrt(max(0.0, discriminant))
+	result = []
+	for numerator in (speed_sq - root, speed_sq + root):
+		elevation = math.atan(numerator / (acceleration * distance))
+		pitch = -elevation
+		if pitch < minimum - 0.0001 or pitch > maximum + 0.0001:
+			continue
+		horizontal_speed = speed * math.cos(elevation)
+		if horizontal_speed <= 0.01:
+			continue
+		flight_time = distance / horizontal_speed
+		if flight_time <= 0.0 or flight_time > 30.0:
+			continue
+		value = (pitch, flight_time)
+		if not result or abs(value[0] - result[-1][0]) > 0.00001:
+			result.append(value)
+	result.sort(key=lambda value: value[1])
+	return tuple(result)
+
+
+def ballistic_intercept(shooter_position, target_position, target_velocity,
+		projectile_speed, gravity, minimum_pitch=-math.pi * 0.5,
+		maximum_pitch=math.pi * 0.5, prefer_high=False,
+		max_lead_time=12.0):
+	"""Iteratively lead a moving target using the shell's real parabola.
+
+	Returns ``(aim_point, pitch, flight_time)`` or ``None``.  Four fixed-point
+	iterations are enough for tank velocities while remaining deterministic and
+	cheap enough for the legacy client.
+	"""
+	try:
+		target = tuple(float(value) for value in target_position[:3])
+		velocity = tuple(float(value) for value in target_velocity[:3])
+		maximum_time = max(0.0, float(max_lead_time))
+	except Exception:
+		return None
+	aim = target
+	solution = None
+	for unused in range(4):
+		solutions = ballistic_solutions(
+			shooter_position, aim, projectile_speed, gravity,
+			minimum_pitch, maximum_pitch)
+		if not solutions:
+			return None
+		solution = solutions[-1] if prefer_high else solutions[0]
+		flight_time = min(solution[1], maximum_time) if maximum_time else 0.0
+		aim = (target[0] + velocity[0] * flight_time,
+		       target[1] + velocity[1] * flight_time,
+		       target[2] + velocity[2] * flight_time)
+	if solution is None:
+		return None
+	# Re-solve once for the final lead point so pitch and flight time describe the
+	# exact coordinate returned to the turret controller.
+	solutions = ballistic_solutions(
+		shooter_position, aim, projectile_speed, gravity,
+		minimum_pitch, maximum_pitch)
+	if not solutions:
+		return None
+	solution = solutions[-1] if prefer_high else solutions[0]
+	return (aim, solution[0], solution[1])
+
+
+def ballistic_position(start_position, yaw, pitch, projectile_speed, gravity,
+		flight_time):
+	"""Return one point on the rendered shell parabola."""
+	start = tuple(float(value) for value in start_position[:3])
+	time = max(0.0, float(flight_time))
+	horizontal = math.cos(float(pitch)) * float(projectile_speed)
+	velocity_x = math.sin(float(yaw)) * horizontal
+	velocity_y = -math.sin(float(pitch)) * float(projectile_speed)
+	velocity_z = math.cos(float(yaw)) * horizontal
+	return (start[0] + velocity_x * time,
+	        start[1] + velocity_y * time - 0.5 * abs(float(gravity)) * time * time,
+	        start[2] + velocity_z * time)
+
+
+def ballistic_path(start_position, yaw, pitch, projectile_speed, gravity,
+		flight_time, maximum_step=0.12):
+	"""Sample the exact parabola densely enough for collision chords."""
+	duration = max(0.0, float(flight_time))
+	if duration <= 0.0:
+		return (tuple(start_position[:3]),)
+	step = max(0.02, min(0.25, float(maximum_step)))
+	count = max(1, int(math.ceil(duration / step)))
+	return tuple(ballistic_position(
+		start_position, yaw, pitch, projectile_speed, gravity,
+		duration * float(index) / float(count))
+		for index in range(count + 1))
+
+
 def _identity_phase(bot_id):
 	"""Stable 0..1 value without Python's randomized string hash."""
 	text = str(bot_id)
@@ -125,6 +298,11 @@ class LocalDriver(object):
 	combat_hull_aim = staticmethod(combat_hull_aim)
 	gun_aligned = staticmethod(gun_aligned)
 	barrel_direction = staticmethod(barrel_direction)
+	intercept_point = staticmethod(intercept_point)
+	ballistic_solutions = staticmethod(ballistic_solutions)
+	ballistic_intercept = staticmethod(ballistic_intercept)
+	ballistic_position = staticmethod(ballistic_position)
+	ballistic_path = staticmethod(ballistic_path)
 
 	def __init__(self, stuck_seconds=1.8, recovery_seconds=0.85,
 			separation_radius=12.0, failure_ttl=2.0):
@@ -168,6 +346,9 @@ class LocalDriver(object):
 				'phase': phase,
 				'clock': 0.0,
 				'failed_yaws': {},
+				'escape_side': 0.0,
+				'escape_side_until': 0.0,
+				'last_desired_yaw': None,
 			}
 			self.states[bot_id] = state
 		return state
@@ -186,7 +367,21 @@ class LocalDriver(object):
 			return
 		if ttl is None:
 			ttl = self.failure_ttl
-		state['failed_yaws'][self._yaw_key(yaw)] = state['clock'] + max(0.1, float(ttl))
+		ttl = max(0.1, float(ttl))
+		state['failed_yaws'][self._yaw_key(yaw)] = state['clock'] + ttl
+		desired = state.get('last_desired_yaw')
+		offset = _angle_delta(yaw, desired) if desired is not None else 0.0
+		if abs(offset) >= 0.10:
+			side = 1.0 if offset > 0.0 else -1.0
+		else:
+			# Adjacent ids choose opposite initial sides, then retain that side while
+			# widening the escape angle. This prevents left/right wall grinding and
+			# also helps two touching hulls stop mirroring each other.
+			side = 1.0 if (int(state['phase'] * 997.0 + 0.5) & 1) else -1.0
+		state['escape_side'] = side
+		state['escape_side_until'] = state['clock'] + min(2.0, max(0.8, ttl))
+		state['steering_yaw'] = None
+		state['plan_age'] = 999.0
 
 	def _failure_penalty(self, state, yaw):
 		key = self._yaw_key(yaw)
@@ -370,6 +565,12 @@ class LocalDriver(object):
 		for offset in self._CANDIDATE_OFFSETS:
 			candidate = desired_yaw + offset
 			score = abs(offset) + self._failure_penalty(state, candidate)
+			if (state.get('escape_side_until', 0.0) > state['clock'] and
+					float(offset) * float(state.get('escape_side', 0.0)) < -0.01):
+				# Continue around the selected side of a broad obstacle before trying
+				# the opposite side. The bias is finite, so an exhausted side still
+				# falls back to the other candidate fan.
+				score += 1.25
 			if separation is not None:
 				# When bodies overlap, separation outranks route alignment; otherwise
 				# two tanks can choose the same narrow opening forever.
@@ -400,6 +601,7 @@ class LocalDriver(object):
 		state['steering_age'] += step
 		state['plan_age'] += step
 		desired_yaw = _yaw_to(position, target)
+		state['last_desired_yaw'] = desired_yaw
 		target_distance = _distance(position, target)
 		if not movement_intent:
 			# Cover/engagement orders intentionally stop within a tolerance. Do not
@@ -464,10 +666,10 @@ class LocalDriver(object):
 					'target_yaw': recovery_yaw,
 					'recovery_mode': 'pivot_recovery',
 				}
-			# physics.traverse_step reverses the steering response once the tracks
-			# are moving backwards.  Invert the command as well so the resulting hull
-			# yaw still turns toward recovery_yaw instead of back into the blockage.
-			recovery_turn = -direction if float(speed) < -0.05 else direction
+			# Reverse recovery is an explicit reverse command. physics.traverse_step
+			# flips steering from that command immediately (not from signed velocity),
+			# so invert the target-yaw command for the entire recovery manoeuvre.
+			recovery_turn = -direction
 			return {
 				'throttle': -0.72,
 				'turn': recovery_turn,
@@ -515,14 +717,20 @@ class LocalDriver(object):
 
 		delta = _angle_delta(chosen_yaw, yaw)
 		turn = max(-1.0, min(1.0, delta / 0.58))
-		# This is a target-yaw controller, not a raw keyboard input.  If recovery
-		# has left the hull rolling backwards, compensate for reverse track steering
-		# so the realised yaw still converges on chosen_yaw while it brakes to drive.
-		if float(speed) < -0.05:
-			turn = -turn
+		# This branch always commands forward drive. Signed speed can still be
+		# negative while braking a recovery or sliding downhill, but steering must
+		# retain its forward response until the command itself becomes reverse.
 		avoiding = abs(_angle_delta(chosen_yaw, desired_yaw)) > 0.05
 		throttle = 1.0
-		if abs(delta) > 1.35 and not avoiding:
+		climb_grade = ((float(target[1]) - float(position[1])) /
+		               max(0.1, target_distance))
+		if climb_grade > 0.10 and abs(delta) > 0.30 and not avoiding:
+			# A graph edge may be climbable head-on but not when the hull cuts onto
+			# it diagonally.  Align at the foot of a meaningful ascent before asking
+			# for drive torque; this is a steering constraint, not a map-specific
+			# forbidden zone or a lower throttle cap.
+			throttle = 0.0
+		elif abs(delta) > 1.35 and not avoiding:
 			# A target more than about 77 degrees off the bow is a pivot, not a
 			# clearing arc. Driving while applying full steering makes a deployed
 			# formation draw a loop before it can enter its lane. Separation remains

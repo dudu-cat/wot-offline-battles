@@ -1,4 +1,4 @@
-World of Tanks 0.8.2 Offline/LAN v1.0.1 (protocol 6)
+World of Tanks 0.8.2 Offline/LAN v1.0.1 (protocol 8)
 =====================================================
 
 Read START_HERE.txt for the shortest installation and startup path.
@@ -25,8 +25,9 @@ Start the included server
 -------------------------
 
 Replace every older client package and lan_battle_server.py with the files in
-THIS package. Protocol 6 is intentionally incompatible with older client/server
-builds, so every player and the server must use this same package.
+THIS package. Protocol 8 and client build 1.8.19 are intentionally incompatible
+with older client/server builds, so every player and the server must use this
+same package.
 
 Install Python 3 from https://www.python.org/downloads/ on the one machine that
 will host LAN battles. Then double-click RUN_SERVER.bat on Windows or
@@ -68,9 +69,10 @@ Bots in this build
 LAN synchronization
 -------------------
 
-- The server owns global target reservations, route progression and revisioned
-  bot orders. One elected client supplies limited spotting observations and
-  executes map collision, local steering, shell/armor and battle-rule work.
+- The server owns global target reservations, route progression, revisioned bot
+  orders and static weighted-A* paths over the shipped navigation graphs. One
+  elected client supplies limited spotting observations and executes exact map
+  collision, local steering, shell/armor and battle-rule work.
 - Every client receives shared bot identity, movement, aiming, firing, HP,
   deaths, wreck positions, capture progress and the final battle result.
 - If the authority disconnects, the server elects another connected client.
@@ -81,8 +83,9 @@ Current boundary
 ----------------
 
 This is a trusted-LAN implementation, not the original retail BigWorld server.
-The elected client still owns map collision, bot AI and client physics. Hidden
-AI state is not preserved perfectly across authority failover, and complete
+The elected client still owns native map collision, short-range steering,
+combat execution and client physics. Hidden runtime state is not preserved
+perfectly across authority failover, and complete
 module/crew synchronization, reconnection recovery, anti-cheat, NAT traversal
 and internet-safe authentication are outside this build. See LAN_SERVER.md for
 detailed diagnostics and the protocol boundary.

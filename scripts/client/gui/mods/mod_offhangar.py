@@ -118,11 +118,12 @@ def _safe_import_offhangar():
 	#   paths/utils <- logging ; paths <- _constants ; paths/logging <- state ;
 	#   offline_battle_stack <- offline_battle ; data/router/battle/session guards
 	#   <- command_handlers ; command_router <- server
-	submodules = ['paths', 'utils', 'logging', '_constants', 'physics', 'vehicle_collision', 'physics_monitor',
+	submodules = ['paths', 'utils', 'logging', '_constants', 'physics', 'vehicle_collision', 'vehicle_pose', 'physics_monitor',
+	              'projectile_runtime',
 	              'bot_ai_maps_group_a', 'bot_ai_maps_group_b', 'bot_ai_maps_group_c',
 	              'bot_ai_maps_extra',
 	              'bot_ai_maps', 'bot_ai', 'prebaked_navigation', 'battle_feedback',
-	              'spotting',
+	              'vehicle_camouflage', 'spotting', 'foliage', 'prebaked_foliage',
 	              'bot_ai_navigation', 'bot_ai_cover',
 	              'bot_ai_driver', 'spectator_minimap',
 	              'state', 'session_guards', 'offline_battle_stack', 'offline_battle',
@@ -198,7 +199,7 @@ from gui.mods.offhangar.utils import *
 from gui.mods.offhangar._constants import *
 from gui.mods.offhangar.server import *
 
-LOG_NOTE('Offline Battles source loader active; LAN settings and prebaked navigation enabled')
+LOG_NOTE('Offline Battles source loader active; LAN settings, prebaked navigation and foliage enabled')
 
 try:
 	from gui.mods.offhangar.lan_settings import install as _install_lan_settings

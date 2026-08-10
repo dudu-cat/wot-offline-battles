@@ -84,6 +84,51 @@ class BotNavigationTest(unittest.TestCase):
         self.assertEqual([], probe_calls)
         self.assertEqual((0, 0), grid.cell_for((10.0, 0.0, 20.0)))
 
+    def test_compact_prebaked_astar_matches_the_legacy_search_rules(self):
+        graph = self.baked_graph(9, 7, blocked=((4, 0), (4, 1), (4, 2)))
+        graph["heights_mm"] = [
+            None if value is None else ((index * 37) % 900)
+            for index, value in enumerate(graph["heights_mm"])
+        ]
+        graph["hazards"] = [
+            4 if index in (21, 22, 23) else 0
+            for index in range(9 * 7)
+        ]
+        grid = self.navigation.TerrainGrid(
+            lambda *args: None, baked_graph=graph
+        )
+        start = (10.0, 0.0, 20.0)
+        goal = (42.0, 0.0, 44.0)
+
+        reference = self.navigation._TerrainSearch(grid._plan_steps(
+            start, goal, None, 4096, 1.0
+        ))
+        while not reference.done:
+            reference.step(256)
+        compact = grid.plan(start, goal, max_expansions=4096, now=1.0)
+
+        self.assertEqual(reference.result, compact)
+        self.assertEqual(9 * 7 * 8, len(grid._baked_edge_costs))
+
+    def test_compact_prebaked_search_does_not_use_tuple_edge_lookup(self):
+        graph = self.baked_graph(12, 5, blocked=((5, 0), (5, 1)))
+        grid = self.navigation.TerrainGrid(
+            lambda *args: None, baked_graph=graph
+        )
+        grid._smooth = lambda path, now=0.0: path
+
+        def forbidden_edge_lookup(*args):
+            raise AssertionError("compact A* must use precomputed edge costs")
+
+        grid._baked_edge_height = forbidden_edge_lookup
+        path = grid.plan(
+            (10.0, 0.0, 20.0), (54.0, 0.0, 36.0),
+            max_expansions=4096,
+        )
+
+        self.assertTrue(path)
+        self.assertEqual((54.0, 0.0, 36.0), path[-1])
+
     def test_prebaked_navigator_uses_larger_cheap_search_budget(self):
         navigator = self.navigation.TerrainNavigator(
             lambda *args: None, baked_graph=self.baked_graph(3, 3)
@@ -91,13 +136,54 @@ class BotNavigationTest(unittest.TestCase):
 
         self.assertTrue(navigator.grid.prebaked)
         self.assertEqual(4.0, navigator.grid.cell_size)
-        self.assertEqual(768, navigator.search_budget_per_frame)
+        self.assertEqual(384, navigator.search_budget_per_frame)
+        self.assertEqual(16, navigator.search_budget_per_path)
+        self.assertEqual(0.0025, navigator.search_time_budget)
         self.assertEqual(4096, navigator.search_max_expansions)
 
         diagnostics = navigator.fallback_diagnostics()
         self.assertEqual("baked", diagnostics["graph"]["source"])
         self.assertEqual(4000, diagnostics["graph"]["cell_mm"])
         self.assertEqual(9, diagnostics["graph"]["nodes"])
+
+    def test_navigation_housekeeping_runs_at_one_hertz(self):
+        navigator = self.navigation.TerrainNavigator(
+            lambda *args: None, baked_graph=self.baked_graph(3, 3)
+        )
+        calls = []
+        navigator.grid.prune_failed_edges = lambda now: calls.append(
+            ("prune", now)
+        )
+        navigator.grid.trim_caches = lambda: calls.append(("trim", None))
+
+        navigator.tick(1.0)
+        navigator.tick(1.1)
+        navigator.tick(1.9)
+        navigator.tick(2.0)
+
+        self.assertEqual(
+            [("prune", 1.0), ("trim", None),
+             ("prune", 2.0), ("trim", None)],
+            calls,
+        )
+
+    def test_housekeeping_bounds_direct_path_cache_without_pending_searches(self):
+        navigator = self.navigation.TerrainNavigator(
+            lambda *args: 0.0, cell_size=10.0
+        )
+        for index in range(100):
+            key = (("direct", index), (index, 0))
+            navigator.paths[key] = ((0.0, 0.0, 0.0),
+                                    (float(index), 0.0, 0.0))
+            navigator.path_times[key] = float(index)
+
+        self.assertFalse(navigator.searches)
+        navigator.tick(100.0)
+
+        self.assertEqual(80, len(navigator.paths))
+        self.assertEqual(set(navigator.paths), set(navigator.path_times))
+        self.assertNotIn((("direct", 0), (0, 0)), navigator.paths)
+        self.assertIn((("direct", 99), (99, 0)), navigator.paths)
 
     def test_prebaked_corridor_allows_one_cell_shoulder_only(self):
         graph = self.baked_graph(5, 1, blocked=((2, 0), (3, 0), (4, 0)))
@@ -107,6 +193,45 @@ class BotNavigationTest(unittest.TestCase):
         self.assertTrue(grid.near_baked_navigation((18.0, 0.0, 20.0), 1))
         self.assertFalse(grid.near_baked_navigation((22.0, 0.0, 20.0), 1))
 
+    def test_baked_open_corridor_requires_a_wide_linked_halo(self):
+        graph = self.baked_graph(9, 5)
+        grid = self.navigation.TerrainGrid(lambda *args: None, baked_graph=graph)
+
+        self.assertTrue(grid.baked_open_corridor(
+            (14.0, 0.0, 28.0), (38.0, 0.0, 28.0), 1
+        ))
+
+        blocked_graph = self.baked_graph(9, 5, blocked=((4, 1),))
+        blocked_grid = self.navigation.TerrainGrid(
+            lambda *args: None, baked_graph=blocked_graph
+        )
+        self.assertFalse(blocked_grid.baked_open_corridor(
+            (14.0, 0.0, 28.0), (38.0, 0.0, 28.0), 1
+        ))
+
+    def test_baked_open_corridor_falls_back_on_hazards_and_tight_routes(self):
+        graph = self.baked_graph(
+            7, 3,
+            blocked=tuple((x, z) for x in range(7) for z in (0, 2)),
+        )
+        graph["hazards"] = [0] * 21
+        grid = self.navigation.TerrainGrid(lambda *args: None, baked_graph=graph)
+
+        self.assertFalse(grid.baked_open_corridor(
+            (10.0, 0.0, 24.0), (34.0, 0.0, 24.0), 1
+        ))
+
+        open_graph = self.baked_graph(7, 3)
+        open_graph["bake"] = {"dry_only_routes": True}
+        open_graph["hazards"] = [0] * 21
+        open_graph["hazards"][10] = self.navigation.BAKED_SHALLOW_WATER
+        hazard_grid = self.navigation.TerrainGrid(
+            lambda *args: None, baked_graph=open_graph
+        )
+        self.assertFalse(hazard_grid.baked_open_corridor(
+            (10.0, 0.0, 24.0), (34.0, 0.0, 24.0), 1
+        ))
+
     def test_prebaked_hazard_mask_does_not_confuse_obstacles_with_cliffs(self):
         graph = self.baked_graph(3, 1)
         graph["hazards"] = [0, 4, 2]
@@ -114,6 +239,7 @@ class BotNavigationTest(unittest.TestCase):
 
         self.assertFalse(grid.baked_hazard_near((10.0, 0.0, 20.0)))
         self.assertFalse(grid.baked_hazard_near((14.0, 0.0, 20.0)))
+        self.assertTrue(grid.baked_hazard_near((14.0, 0.0, 20.0), 1))
         self.assertTrue(grid.baked_hazard_near((18.0, 0.0, 20.0)))
         self.assertGreater(grid._penalty((1, 0), None), 0.0)
 
@@ -140,6 +266,27 @@ class BotNavigationTest(unittest.TestCase):
             self.assertFalse(navigator.grid.segment_has_baked_hazard(
                 first, second, self.navigation.BAKED_SHALLOW_WATER
             ))
+
+    def test_dry_connected_graph_treats_shallow_water_as_non_navigable(self):
+        graph = self.baked_graph(5, 3)
+        graph["hazards"] = [
+            0, 4, 4, 4, 0,
+            0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+        ]
+        graph["bake"] = {"dry_only_routes": True}
+        grid = self.navigation.TerrainGrid(
+            lambda *args: None, baked_graph=graph
+        )
+
+        path = grid.plan(
+            (10.0, 0.0, 20.0), (26.0, 0.0, 20.0),
+            max_expansions=100,
+        )
+
+        self.assertTrue(path)
+        self.assertGreater(max(point[2] for point in path), 20.0)
+        self.assertTrue(grid.baked_hazard_near((14.0, 0.0, 20.0)))
 
     def test_prebaked_hazard_check_allows_a_tank_to_leave_shallow_water(self):
         graph = self.baked_graph(3, 1)
@@ -198,6 +345,31 @@ class BotNavigationTest(unittest.TestCase):
 
         self.assertEqual(48, segment_count)
         self.assertEqual([], probe_calls)
+
+    def test_shipped_komarin_inner_route_never_enters_shallow_water(self):
+        import json
+        graph_path = (
+            ROOT / "scripts/client/gui/mods/offhangar/navgraphs/15_komarin.json"
+        )
+        graph = json.loads(graph_path.read_text())
+        grid = self.navigation.TerrainGrid(
+            lambda *args: None, baked_graph=graph
+        )
+
+        self.assertTrue(graph["bake"]["dry_only_routes"])
+        for team in ("1", "2"):
+            route = next(
+                value for value in graph["routes"][team]
+                if value["id"] == "inner_field"
+            )
+            points = [(x, 0.0, z) for x, z, unused_hold in route["waypoints"]]
+            for start, goal in zip(points, points[1:]):
+                path = grid.plan(start, goal, max_expansions=4096)
+                self.assertTrue(path, (team, start, goal))
+                for first, second in zip(path, path[1:]):
+                    self.assertFalse(grid.segment_has_baked_hazard(
+                        first, second, self.navigation.BAKED_SHALLOW_WATER
+                    ))
 
     def test_astar_routes_around_an_unsupported_ravine(self):
         def ground(x, z, hint):
@@ -599,6 +771,23 @@ class BotNavigationTest(unittest.TestCase):
         navigator.tick(1.01)
         self.assertEqual(2, search.steps)
 
+    def test_tick_housekeeping_runs_only_once_for_a_shared_frame_timestamp(self):
+        navigator = self.navigation.TerrainNavigator(
+            lambda x, z, hint: 0.0, cell_size=10.0
+        )
+        pruned = []
+        trimmed = []
+        navigator.grid.prune_failed_edges = pruned.append
+        navigator.grid.trim_caches = lambda: trimmed.append(True)
+
+        navigator.tick(1.0)
+        navigator.tick(1.0)
+        navigator.tick(1.0)
+        navigator.tick(1.01)
+
+        self.assertEqual([1.0], pruned)
+        self.assertEqual(1, len(trimmed))
+
     def test_moving_contact_keeps_a_short_lived_stable_planning_goal(self):
         navigator = self.navigation.TerrainNavigator(
             lambda x, z, hint: 0.0,
@@ -773,6 +962,24 @@ class BotNavigationTest(unittest.TestCase):
         self.assertNotIn("_ai_director = None", initialization)
         self.assertIn("if _navigator is not None:", battle_source)
 
+    def test_navigator_constructs_and_returns_before_unrelated_helpers(self):
+        battle_source = (
+            ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
+        ).read_text()
+        navigator = battle_source[
+            battle_source.index("def _offh_ai_navigator"):
+            battle_source.index("def _offh_stats_for")
+        ]
+        sixth_sense = battle_source[
+            battle_source.index("def _offh_update_sixth_sense"):
+            battle_source.index("def _offh_ai_driver")
+        ]
+
+        self.assertIn("navigator = TerrainNavigator(", navigator)
+        self.assertIn("globals()['g_offh_terrain_navigator'] = navigator", navigator)
+        self.assertIn("return navigator", navigator)
+        self.assertNotIn("navigator = TerrainNavigator(", sixth_sense)
+
     def test_proximity_spotting_does_not_grant_a_firing_lane_through_cover(self):
         battle_source = (
             ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
@@ -821,7 +1028,8 @@ class BotNavigationTest(unittest.TestCase):
         self.assertNotIn("def _offh_ai_dry_rollback", battle_source)
         self.assertNotIn("_offh_ai_dry_history", battle_source)
         self.assertIn("m_veh._offh_ai_driver_mode = 'water_guard'", battle_source)
-        self.assertIn("def _offh_ai_baked_pose_safe", battle_source)
+        self.assertIn("def _offh_ai_baked_pose_safe(position, shoulder_cells=0)",
+                      battle_source)
         self.assertIn("m_veh._offh_ai_driver_mode = 'edge_guard'", battle_source)
         self.assertGreater(
             battle_source.index("# Final realised-pose water guard."),
@@ -854,9 +1062,10 @@ class BotNavigationTest(unittest.TestCase):
             water_guard,
         )
         self.assertNotIn("dry_rollback", water_guard)
+        pose_commit = battle_source.index("_VP.commit_pose", final_guard)
         self.assertLess(
             final_guard,
-            battle_source.index("m_veh.matrix.setRotateYPR", final_guard),
+            pose_commit,
         )
         self.assertLess(
             final_guard,
@@ -868,7 +1077,15 @@ class BotNavigationTest(unittest.TestCase):
         self.assertGreater(edge_guard, final_guard)
         self.assertLess(
             edge_guard,
-            battle_source.index("m_veh.matrix.setRotateYPR", edge_guard),
+            pose_commit,
+        )
+
+        # A baked node already owns 3 m and 6 m shoulder clearance. The final
+        # realised-pose guard must reject only the cell the hull centre entered;
+        # a second one-cell halo blocks valid routes beside cliffs and water.
+        self.assertIn(
+            "not _offh_ai_baked_pose_safe((m_veh.position.x,",
+            battle_source[edge_guard:pose_commit],
         )
 
     def test_astar_jobs_are_bounded_and_ignore_transient_vehicle_penalties(self):
@@ -951,6 +1168,41 @@ class BotNavigationTest(unittest.TestCase):
             )
         grid.prune_failed_edges(2.0)
         self.assertLessEqual(len(grid._failed_edges), 128)
+
+    def test_smoothing_keeps_a_turning_setup_point_before_a_steep_climb(self):
+        grid = self.navigation.TerrainGrid(
+            lambda x, z, hint: 0.0, cell_size=10.0
+        )
+        grid.segment_clear = lambda start, end: True
+        grid.segment_penalty = lambda start, end, now: 0.0
+        path = (
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 10.0),
+            (10.0, 3.0, 10.0),
+            (20.0, 3.0, 10.0),
+        )
+
+        smoothed = grid._smooth(path)
+
+        self.assertIn((0.0, 0.0, 10.0), smoothed)
+        self.assertFalse(grid.shortcut_preserves_climb_approach(path, 0, 2))
+
+    def test_smoothing_still_compacts_a_flat_corner_and_straight_climb(self):
+        grid = self.navigation.TerrainGrid(
+            lambda x, z, hint: 0.0, cell_size=10.0
+        )
+        grid.segment_clear = lambda start, end: True
+        grid.segment_penalty = lambda start, end, now: 0.0
+        flat = ((0.0, 0.0, 0.0), (0.0, 0.0, 10.0),
+                (10.0, 0.0, 10.0))
+        straight_climb = ((0.0, 0.0, 0.0), (0.0, 0.0, 10.0),
+                          (0.0, 3.0, 20.0))
+
+        self.assertEqual((flat[0], flat[-1]), grid._smooth(flat))
+        self.assertEqual(
+            (straight_climb[0], straight_climb[-1]),
+            grid._smooth(straight_climb),
+        )
 
 
 if __name__ == "__main__":

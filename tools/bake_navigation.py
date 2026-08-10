@@ -134,6 +134,7 @@ def _bake_map_config(tactical_map):
                 "capacity": max(1, int(route.get("capacity", 1))),
                 "risk": float(route.get("risk", 0.5)),
                 "role_weights": dict(route.get("role_weights", {})),
+                "terminal_hold": bool(route.get("terminal_hold", False)),
                 "points": points,
             })
             anchors.extend((point[0], point[1]) for point in points)
@@ -147,6 +148,7 @@ def _bake_map_config(tactical_map):
         "bases": bases,
         "routes": tuple(route_records),
         "anchors": tuple(anchors),
+        "dry_only": bool(tactical_map.get("dry_only", False)),
     }
 
 
@@ -335,7 +337,11 @@ def soft_destructible_models(data):
     """Return models a tank can push through instead of routing around."""
     root = read_packed_xml(data)
     result = set()
-    for category_name in ("fragiles", "fallingAtoms"):
+    # Structures are the module-based crushable houses from
+    # destructibles.xml, not arbitrary static map buildings. Keeping them in
+    # the obstacle raster made A* route around spawn villages even though the
+    # runtime collision path correctly destroys them on contact.
+    for category_name in ("fragiles", "fallingAtoms", "structures"):
         category_value = _packed_child(root, category_name, False)
         if category_value is None or category_value.value_type != TYPE_ELEMENT:
             continue
@@ -1093,7 +1099,10 @@ def _nearest_node(graph, point, max_distance=56.0):
     return best, best_distance
 
 
-def _graph_path(graph, start, goal):
+def _graph_path(graph, start, goal, allowed_nodes=None):
+    if (allowed_nodes is not None and
+            (start not in allowed_nodes or goal not in allowed_nodes)):
+        return (), float("inf")
     width = graph["width"]
     height = graph["height"]
     cell_size = graph["cell_size"]
@@ -1118,6 +1127,8 @@ def _graph_path(graph, start, goal):
             if nx < 0 or nx >= width or nz < 0 or nz >= height:
                 continue
             neighbour = nz * width + nx
+            if allowed_nodes is not None and neighbour not in allowed_nodes:
+                continue
             new_cost = cost + cell_size * (math.sqrt(2.0) if dx and dz else 1.0)
             if new_cost < costs.get(neighbour, float("inf")):
                 costs[neighbour] = new_cost
@@ -1132,7 +1143,10 @@ def _graph_path(graph, start, goal):
     return tuple(path), costs[goal]
 
 
-def _reachable_nodes(graph, root):
+def _reachable_nodes(graph, root, forbidden_hazards=0):
+    hazards = graph.get("hazards") or [0] * len(graph["heights_mm"])
+    if int(hazards[root]) & int(forbidden_hazards):
+        return set()
     reachable = set((root,))
     stack = [root]
     width = graph["width"]
@@ -1150,6 +1164,7 @@ def _reachable_nodes(graph, root):
                 continue
             neighbour = nz * width + nx
             if (graph["heights_mm"][neighbour] is not None and
+                    not int(hazards[neighbour]) & int(forbidden_hazards) and
                     neighbour not in reachable):
                 reachable.add(neighbour)
                 stack.append(neighbour)
@@ -1271,7 +1286,7 @@ def _node_point(graph, index):
 
 
 def _oriented_route_points(route_record, map_config):
-    """Orient a tactical corridor and include its two objective endpoints."""
+    """Orient a tactical corridor and include its objective endpoints."""
     team = int(route_record["team"])
     own = map_config["bases"][team - 1]
     enemy = map_config["bases"][2 - team]
@@ -1283,15 +1298,24 @@ def _oriented_route_points(route_record, map_config):
         return ((float(point[0]) - float(base[0])) ** 2 +
                 (float(point[1]) - float(base[1])) ** 2)
 
-    forward = distance_squared(points[0], own) + distance_squared(points[-1], enemy)
-    reverse = distance_squared(points[-1], own) + distance_squared(points[0], enemy)
+    terminal_hold = bool(route_record.get("terminal_hold", False))
+    if terminal_hold:
+        forward = distance_squared(points[0], own)
+        reverse = distance_squared(points[-1], own)
+    else:
+        forward = (distance_squared(points[0], own) +
+                   distance_squared(points[-1], enemy))
+        reverse = (distance_squared(points[-1], own) +
+                   distance_squared(points[0], enemy))
     if reverse < forward:
         points.reverse()
     if distance_squared(points[0], own) > 1.0:
         points.insert(0, (float(own[0]), float(own[1]), False))
     else:
         points[0] = (float(own[0]), float(own[1]), bool(points[0][2]))
-    if distance_squared(points[-1], enemy) > 1.0:
+    if terminal_hold:
+        points[-1] = (float(points[-1][0]), float(points[-1][1]), True)
+    elif distance_squared(points[-1], enemy) > 1.0:
         points.append((float(enemy[0]), float(enemy[1]), False))
     else:
         points[-1] = (float(enemy[0]), float(enemy[1]), bool(points[-1][2]))
@@ -1407,8 +1431,11 @@ def _corridor_height_at(graph, index, corridor):
     return best[1] if best is not None else None
 
 
-def _corridor_graph_path(graph, start, goal, corridor):
+def _corridor_graph_path(graph, start, goal, corridor, allowed_nodes=None):
     """Find a simple base-to-base path biased toward a tactical polyline."""
+    if (allowed_nodes is not None and
+            (start not in allowed_nodes or goal not in allowed_nodes)):
+        return ()
     width = graph["width"]
     height = graph["height"]
     cell_size = graph["cell_size"]
@@ -1433,6 +1460,8 @@ def _corridor_graph_path(graph, start, goal, corridor):
             if nx < 0 or nx >= width or nz < 0 or nz >= height:
                 continue
             neighbour = nz * width + nx
+            if allowed_nodes is not None and neighbour not in allowed_nodes:
+                continue
             point = _node_point(graph, neighbour)
             corridor_offset = min(180.0, _polyline_distance(point, corridor))
             distance = cell_size * (math.sqrt(2.0) if dx and dz else 1.0)
@@ -1467,14 +1496,15 @@ def _corridor_graph_path(graph, start, goal, corridor):
     return tuple(path)
 
 
-def _route_maximum_detour(graph, waypoints):
+def _route_maximum_detour(graph, waypoints, allowed_nodes=None):
     maximum = 1.0
     for first, second in zip(waypoints, waypoints[1:]):
         first_node, first_offset = _nearest_node(graph, first)
         second_node, second_offset = _nearest_node(graph, second)
         if first_node is None or second_node is None:
             return float("inf")
-        path, distance = _graph_path(graph, first_node, second_node)
+        path, distance = _graph_path(
+            graph, first_node, second_node, allowed_nodes=allowed_nodes)
         if not path:
             return float("inf")
         direct = max(
@@ -1551,12 +1581,43 @@ def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
     maximum_offset = 0.0
     soft_fallbacks = []
     soft_fallback_causes = {}
+    dry_route_nodes = None
+    if bool(map_config.get("dry_only", False)):
+        all_dry_nodes = set(
+            index for index, height in enumerate(graph["heights_mm"])
+            if height is not None and
+            not int((graph.get("hazards") or
+                     [0] * len(graph["heights_mm"]))[index]) &
+            HAZARD_SHALLOW_WATER
+        )
+        dry_start, dry_start_offset = _nearest_node_in_component(
+            graph, map_config["bases"][0], all_dry_nodes)
+        dry_goal, dry_goal_offset = _nearest_node_in_component(
+            graph, map_config["bases"][1], all_dry_nodes)
+        if (dry_start is not None and dry_goal is not None and
+                dry_start_offset <= 56.0 and dry_goal_offset <= 56.0):
+            reachable = _reachable_nodes(
+                graph, dry_start, HAZARD_SHALLOW_WATER)
+            if dry_goal in reachable:
+                dry_route_nodes = reachable
+        if dry_route_nodes is None:
+            raise ValueError(
+                "dry-only tactical map has no dry route between team bases")
+    if dry_route_nodes is not None:
+        graph["bake"]["dry_only_routes"] = True
+    else:
+        graph["bake"].pop("dry_only_routes", None)
     for route_record in map_config.get("routes", ()):
         source_points = _oriented_route_points(route_record, map_config)
         projected = []
         for point in source_points:
-            node, offset = _nearest_node(
-                graph, point, max_distance=float(maximum_projection) + 0.001)
+            if dry_route_nodes is not None:
+                node, offset = _nearest_node_in_component(
+                    graph, point, dry_route_nodes)
+            else:
+                node, offset = _nearest_node(
+                    graph, point,
+                    max_distance=float(maximum_projection) + 0.001)
             if node is None:
                 raise ValueError("route point has no retained navigation node: %r" %
                                  (point[:2],))
@@ -1599,7 +1660,8 @@ def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
                     zip(gate_indexes, gate_indexes[1:])):
                 segment = _corridor_graph_path(
                     graph, projected[start_index], projected[goal_index],
-                    tuple(corridor[start_index:goal_index + 1]))
+                    tuple(corridor[start_index:goal_index + 1]),
+                    allowed_nodes=dry_route_nodes)
                 if not segment:
                     raise ValueError(
                         "tactical corridor cannot connect route gate %d" %
@@ -1611,8 +1673,16 @@ def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
                     full_path.extend(segment)
             full_path = tuple(full_path)
             hold_nodes = set()
-            for point in source_points:
+            for point_index, point in enumerate(source_points):
                 if not bool(point[2]):
+                    continue
+                # A terminal tactical objective must stay attached to the
+                # projected endpoint.  Looking for the globally nearest path
+                # node can select the preceding sample when two grid nodes are
+                # equally close, leaving the actual terminal unmarked.
+                if (route_record.get("terminal_hold", False) and
+                        point_index == len(source_points) - 1):
+                    hold_nodes.add(projected[-1])
                     continue
                 hold_nodes.add(min(
                     full_path,
@@ -1624,16 +1694,18 @@ def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
                 graph, full_path, hold_nodes, 16,
                 set(projected[index] for index in gate_indexes)
             )
-            detour = _route_maximum_detour(graph, waypoints)
+            detour = _route_maximum_detour(
+                graph, waypoints, allowed_nodes=dry_route_nodes)
             geometry_issue = _route_geometry_issue(waypoints)
             if detour > MAX_ROUTE_DETOUR or geometry_issue is not None:
                 # Some old hand sketches place their most lateral hold just
                 # behind an impassable ridge. Preserve the entire sketch as a
                 # soft corridor instead of forcing a multi-hundred-metre U-turn.
                 full_path = _corridor_graph_path(
-                    graph, projected[0], projected[-1], tuple(corridor))
+                    graph, projected[0], projected[-1], tuple(corridor),
+                    allowed_nodes=dry_route_nodes)
                 if not full_path:
-                    raise ValueError("soft tactical corridor cannot connect the team bases")
+                    raise ValueError("soft tactical corridor cannot connect its objectives")
                 # Once a hard gate proved geometrically unsafe, do not re-add
                 # nearby hold nodes as mandatory samples. They do not alter the
                 # graph path, but can make the 16-point protocol polyline double
@@ -1654,11 +1726,14 @@ def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
                 soft_fallbacks.append(route_key)
                 soft_fallback_causes[route_key] = (
                     geometry_issue or "detour %.2fx" % detour)
+            if route_record.get("terminal_hold", False) and waypoints:
+                waypoints[-1][2] = True
         routes[str(int(route_record["team"]))].append({
             "id": route_record["id"],
             "capacity": route_record["capacity"],
             "risk": round(route_record["risk"], 3),
             "role_weights": dict(route_record["role_weights"]),
+            "terminal_hold": bool(route_record.get("terminal_hold", False)),
             "waypoints": waypoints,
         })
     graph["bake"]["maximum_route_projection"] = round(maximum_offset, 3)

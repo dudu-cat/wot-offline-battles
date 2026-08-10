@@ -29,6 +29,23 @@ class BotAIDriverTest(unittest.TestCase):
     def setUp(self):
         self.module = load_driver()
 
+    def test_intercept_point_leads_a_crossing_target(self):
+        point = self.module.intercept_point(
+            (0.0, 0.0, 0.0), (0.0, 0.0, 100.0),
+            (20.0, 0.0, 0.0), 100.0,
+        )
+
+        self.assertGreater(point[0], 20.0)
+        self.assertAlmostEqual(100.0, point[2])
+
+    def test_intercept_point_does_not_move_a_stationary_target(self):
+        point = self.module.intercept_point(
+            (0.0, 0.0, 0.0), (12.0, 3.0, 80.0),
+            (0.0, 0.0, 0.0), 900.0,
+        )
+
+        self.assertEqual((12.0, 3.0, 80.0), point)
+
     def test_route_without_spotted_target_does_not_become_idle_hold(self):
         driver = self.module.LocalDriver()
         current = (0.0, 0.0, 0.0)
@@ -200,7 +217,7 @@ class BotAIDriverTest(unittest.TestCase):
         self.assertEqual(0.0, order["throttle"])
         self.assertGreater(order["turn"], 0.9)
 
-    def test_reverse_steering_yaws_opposite_to_forward_steering(self):
+    def test_reverse_command_yaws_opposite_to_forward_command(self):
         physics = load_physics()
         params = {
             "speedFwd": 12.0,
@@ -208,8 +225,10 @@ class BotAIDriverTest(unittest.TestCase):
             "terrainResist": (1.0, 1.0, 1.0),
         }
 
-        forward = physics.traverse_step(params, 0.0, -1.0, 2.0, 0.1)
-        reverse = physics.traverse_step(params, 0.0, -1.0, -2.0, 0.1)
+        forward = physics.traverse_step(
+            params, 0.0, -1.0, -2.0, 0.1, drive_intent=1.0)
+        reverse = physics.traverse_step(
+            params, 0.0, -1.0, 2.0, 0.1, drive_intent=-1.0)
 
         self.assertLess(forward, 0.0)
         self.assertGreater(reverse, 0.0)
@@ -232,7 +251,7 @@ class BotAIDriverTest(unittest.TestCase):
         self.assertEqual("reverse_turn", order["recovery_mode"])
         self.assertLess(order["turn"] * order["target_yaw"], 0.0)
 
-    def test_target_yaw_controller_compensates_while_rolling_backwards(self):
+    def test_forward_target_yaw_does_not_flip_while_rolling_backwards(self):
         driver = self.module.LocalDriver()
         order = driver.drive(
             304, (0.0, 0.0, 0.0), 0.0, -2.0, 0.1,
@@ -240,7 +259,7 @@ class BotAIDriverTest(unittest.TestCase):
         )
 
         self.assertGreater(order["target_yaw"], 0.0)
-        self.assertLess(order["turn"], 0.0)
+        self.assertGreater(order["turn"], 0.0)
 
     def test_reaching_a_target_never_turns_zero_vector_into_full_throttle(self):
         driver = self.module.LocalDriver()
@@ -454,6 +473,44 @@ class BotAIDriverTest(unittest.TestCase):
                                 (0.0, 0.0, 40.0), (), lambda angle: True)
         self.assertEqual("avoid", diverted["recovery_mode"])
         self.assertNotAlmostEqual(0.0, diverted["target_yaw"], places=3)
+
+    def test_repeated_obstacle_failures_keep_widening_on_one_side(self):
+        driver = self.module.LocalDriver(failure_ttl=5.0)
+        first = driver.drive(
+            17, (0.0, 0.0, 0.0), 0.0, 2.0, 0.1,
+            (0.0, 0.0, 50.0), (), lambda angle: True,
+        )
+        driver.remember_failure(17, first["target_yaw"], ttl=5.0)
+        second = driver.drive(
+            17, (0.0, 0.0, 0.0), 0.0, 2.0, 0.1,
+            (0.0, 0.0, 50.0), (), lambda angle: True,
+        )
+        driver.remember_failure(17, second["target_yaw"], ttl=5.0)
+        third = driver.drive(
+            17, (0.0, 0.0, 0.0), 0.0, 2.0, 0.1,
+            (0.0, 0.0, 50.0), (), lambda angle: True,
+        )
+
+        self.assertEqual("avoid", second["recovery_mode"])
+        self.assertEqual("avoid", third["recovery_mode"])
+        self.assertGreater(second["target_yaw"] * third["target_yaw"], 0.0)
+        self.assertGreater(abs(third["target_yaw"]), abs(second["target_yaw"]))
+
+    def test_adjacent_bots_choose_opposite_initial_escape_sides(self):
+        driver = self.module.LocalDriver(failure_ttl=5.0)
+        escaped = []
+        for bot_id in (20, 21):
+            straight = driver.drive(
+                bot_id, (0.0, 0.0, 0.0), 0.0, 2.0, 0.1,
+                (0.0, 0.0, 50.0), (), lambda angle: True,
+            )
+            driver.remember_failure(bot_id, straight["target_yaw"], ttl=5.0)
+            escaped.append(driver.drive(
+                bot_id, (0.0, 0.0, 0.0), 0.0, 2.0, 0.1,
+                (0.0, 0.0, 50.0), (), lambda angle: True,
+            )["target_yaw"])
+
+        self.assertLess(escaped[0] * escaped[1], 0.0)
         driver.drive(55, (0.0, 0.0, 1.0), 0.0, 2.0, 0.35,
                      (0.0, 0.0, 40.0), (), lambda angle: True)
         expired = driver.drive(55, (0.0, 0.0, 2.0), 0.0, 2.0, 0.35,
@@ -495,6 +552,74 @@ class BotAIDriverTest(unittest.TestCase):
             driver.drive(71, (float(unused), 0.0, 0.0), 0.0, 3.0, 0.1,
                          (0.0, 0.0, 100.0), (), lambda angle: True)
         self.assertLessEqual(len(driver.states[71]["failed_yaws"]), 32)
+
+    def test_ballistic_solution_lands_on_the_requested_point(self):
+        solutions = self.module.ballistic_solutions(
+            (0.0, 2.0, 0.0), (100.0, 2.0, 0.0),
+            100.0, 10.0, -1.56, 0.2,
+        )
+
+        self.assertEqual(2, len(solutions))
+        pitch, flight_time = solutions[0]
+        point = self.module.ballistic_position(
+            (0.0, 2.0, 0.0), 3.141592653589793 * 0.5,
+            pitch, 100.0, 10.0, flight_time,
+        )
+        self.assertAlmostEqual(100.0, point[0], places=5)
+        self.assertAlmostEqual(2.0, point[1], places=5)
+        self.assertAlmostEqual(0.0, point[2], places=5)
+        self.assertLess(solutions[0][1], solutions[1][1])
+
+    def test_ballistic_intercept_leads_a_moving_tank(self):
+        solution = self.module.ballistic_intercept(
+            (0.0, 2.0, 0.0), (0.0, 2.0, 300.0),
+            (12.0, 0.0, 0.0), 300.0, 30.0,
+            -1.4, 0.2,
+        )
+
+        self.assertIsNotNone(solution)
+        aim, pitch, flight_time = solution
+        yaw = math.atan2(aim[0], aim[2])
+        arrival = self.module.ballistic_position(
+            (0.0, 2.0, 0.0), yaw, pitch, 300.0, 30.0, flight_time,
+        )
+        moving_target_at_arrival = (
+            12.0 * flight_time, 2.0, 300.0,
+        )
+
+        self.assertGreater(aim[0], 10.0)
+        self.assertGreater(flight_time, 0.9)
+        for actual, expected in zip(arrival, moving_target_at_arrival):
+            self.assertAlmostEqual(expected, actual, places=4)
+
+    def test_ballistic_path_is_curved_not_a_straight_damage_ray(self):
+        pitch, flight_time = self.module.ballistic_solutions(
+            (0.0, 0.0, 0.0), (0.0, 0.0, 100.0),
+            100.0, 10.0, -1.56, 0.2,
+        )[0]
+        path = self.module.ballistic_path(
+            (0.0, 0.0, 0.0), 0.0, pitch, 100.0, 10.0,
+            flight_time, 0.1,
+        )
+
+        self.assertGreater(max(point[1] for point in path), 1.0)
+        self.assertAlmostEqual(100.0, path[-1][2], places=5)
+        self.assertAlmostEqual(0.0, path[-1][1], places=5)
+
+    def test_uphill_turn_aligns_before_applying_drive_torque(self):
+        driver = self.module.LocalDriver()
+        uphill = driver.drive(
+            120, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+            (20.0, 6.0, 20.0), (), lambda angle: True,
+        )
+        flat = driver.drive(
+            121, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+            (20.0, 0.0, 20.0), (), lambda angle: True,
+        )
+
+        self.assertEqual(0.0, uphill["throttle"])
+        self.assertGreater(abs(uphill["turn"]), 0.9)
+        self.assertEqual(1.0, flat["throttle"])
 
 
 if __name__ == "__main__":

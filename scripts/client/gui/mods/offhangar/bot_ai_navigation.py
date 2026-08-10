@@ -11,6 +11,7 @@ probes so it can be tested outside the legacy client.
 import heapq
 import math
 import time
+from array import array
 
 
 SQRT_TWO = math.sqrt(2.0)
@@ -38,6 +39,11 @@ class TerrainGrid(object):
 		(-1, 0, 1.0),                         (1, 0, 1.0),
 		(-1, 1, SQRT_TWO),  (0, 1, 1.0),  (1, 1, SQRT_TWO),
 	)
+	_DIRECTION_INDEX = {
+		(-1, -1): 0, (0, -1): 1, (1, -1): 2,
+		(-1, 0): 3, (1, 0): 4,
+		(-1, 1): 5, (0, 1): 6, (1, 1): 7,
+	}
 
 	def __init__(self, ground_probe, obstacle_probe=None, bounds=None,
 			cell_size=18.0, max_grade_up=0.48, max_grade_down=0.38,
@@ -53,7 +59,11 @@ class TerrainGrid(object):
 		self._baked_heights = ()
 		self._baked_links = ()
 		self._baked_hazards = ()
+		self._baked_valid = bytearray()
+		self._baked_neighbour_deltas = ()
+		self._baked_edge_costs = array('d')
 		self._baked_max_grade = 0.30
+		self._avoid_shallow_water = False
 		if baked_graph is not None:
 			self._install_baked_graph(baked_graph)
 		self.max_grade_up = float(max_grade_up)
@@ -86,12 +96,77 @@ class TerrainGrid(object):
 		self._baked_width = width
 		self._baked_height = height
 		self._baked_heights = heights
-		self._baked_links = links
 		self._baked_hazards = hazards if hazards is not None else (0,) * (width * height)
 		bake = graph.get('bake') if isinstance(graph.get('bake'), dict) else {}
 		self._baked_max_grade = max(0.05, float(bake.get('max_grade', 0.30)))
+		self._avoid_shallow_water = bool(bake.get('dry_only_routes', False))
+		self._build_compact_baked_graph(links)
 		self.bounds = tuple(graph.get('bounds') or self.bounds or ()) or None
 		self.prebaked = True
+
+	def _build_compact_baked_graph(self, source_links):
+		"""Precompute scalar edge costs for the render-thread path search.
+
+		The shipped graph is static for the whole battle.  Rebuilding tuple cells,
+		looking up the direction bit and recalculating slope risk for every A*
+		expansion made those cheap links surprisingly expensive in Python 2.6.
+		Keep the JSON format unchanged, but install a compact byte mask plus one
+		double edge cost per direction.  Dynamic failed-edge penalties remain a
+		small overlay applied by the search itself.
+		"""
+		width = self._baked_width
+		height = self._baked_height
+		count = width * height
+		valid = bytearray(count)
+		for index in range(count):
+			if self._baked_heights[index] is None:
+				continue
+			if (self._avoid_shallow_water and
+					int(self._baked_hazards[index]) & BAKED_SHALLOW_WATER):
+				continue
+			valid[index] = 1
+		self._baked_valid = valid
+		self._baked_neighbour_deltas = (
+			-width - 1, -width, -width + 1, -1,
+			1, width - 1, width, width + 1)
+		compact_links = bytearray(count)
+		edge_costs = array('d', [0.0]) * (count * len(self._NEIGHBOURS))
+		for index in range(count):
+			if not valid[index]:
+				continue
+			x = index % width
+			z = index // width
+			current_y = float(self._baked_heights[index]) / 1000.0
+			mask = int(source_links[index])
+			filtered_mask = 0
+			for direction_index, neighbour in enumerate(self._NEIGHBOURS):
+				if not (mask & (1 << direction_index)):
+					continue
+				next_x = x + neighbour[0]
+				next_z = z + neighbour[1]
+				if (next_x < 0 or next_x >= width or
+						next_z < 0 or next_z >= height):
+					continue
+				next_index = index + self._baked_neighbour_deltas[direction_index]
+				if not valid[next_index]:
+					continue
+				run = self.cell_size * neighbour[2]
+				delta_y = (float(self._baked_heights[next_index]) / 1000.0 -
+				           current_y)
+				slope = abs(delta_y) / max(run, 0.1)
+				slope_ratio = slope / max(0.05, self._baked_max_grade)
+				slope_cost = run * slope_ratio * slope_ratio * 6.0
+				if delta_y < 0.0:
+					slope_cost *= 1.25
+				hazard_cost = 0.0
+				if int(self._baked_hazards[next_index]) & BAKED_SHALLOW_WATER:
+					hazard_cost = self.cell_size * BAKED_SHALLOW_WATER_PENALTY
+				edge_costs[index * 8 + direction_index] = (
+					run + slope_cost + hazard_cost)
+				filtered_mask |= 1 << direction_index
+			compact_links[index] = filtered_mask
+		self._baked_links = compact_links
+		self._baked_edge_costs = edge_costs
 
 	def cell_for(self, point):
 		origin_x, origin_z = self._baked_origin if self.prebaked else (0.0, 0.0)
@@ -112,7 +187,7 @@ class TerrainGrid(object):
 		if x < 0 or x >= self._baked_width or z < 0 or z >= self._baked_height:
 			return None
 		index = z * self._baked_width + x
-		if self._baked_heights[index] is None:
+		if not self._baked_valid[index]:
 			return None
 		return index
 
@@ -146,8 +221,11 @@ class TerrainGrid(object):
 		for z in range(cell[1] - radius, cell[1] + radius + 1):
 			for x in range(cell[0] - radius, cell[0] + radius + 1):
 				index = self._baked_flat_index((x, z))
+				mask = BAKED_FATAL_HAZARDS
+				if self._avoid_shallow_water:
+					mask |= BAKED_SHALLOW_WATER
 				if (index is not None and
-						int(self._baked_hazards[index]) & BAKED_FATAL_HAZARDS):
+						int(self._baked_hazards[index]) & mask):
 					return True
 		return False
 
@@ -320,6 +398,46 @@ class TerrainGrid(object):
 				return True
 		return False
 
+	def baked_open_corridor(self, start, end, clearance_cells=1):
+		"""Prove that a short drive lies inside a wide, static baked corridor.
+
+		This is deliberately stricter than :meth:`segment_clear`.  It is used only
+		as a fast affirmative answer for the runtime steering feeler: every crossed
+		edge must be linked and every neighbouring cell within ``clearance_cells``
+		must also be navigable and free of shipped water/cliff hazards.  A narrow
+		road, bridge, obstacle edge, invalid start, or missing graph returns False so
+		the caller can fall back to exact BigWorld collision rays.
+		"""
+		if not self.prebaked:
+			return False
+		start_cell = self.cell_for(start)
+		if self._baked_index(start_cell) is None:
+			return False
+		cells = self._baked_segment_cells(start, end)
+		if not cells:
+			return False
+		for old_cell, cell in zip(cells, cells[1:]):
+			if self._baked_edge_height(old_cell, cell) is None:
+				return False
+		radius = max(0, int(clearance_cells))
+		hazard_mask = BAKED_FATAL_HAZARDS
+		if self._avoid_shallow_water:
+			hazard_mask |= BAKED_SHALLOW_WATER
+		checked = set()
+		for cell in cells:
+			for z in range(cell[1] - radius, cell[1] + radius + 1):
+				for x in range(cell[0] - radius, cell[0] + radius + 1):
+					neighbour = (x, z)
+					if neighbour in checked:
+						continue
+					checked.add(neighbour)
+					index = self._baked_index(neighbour)
+					if index is None:
+						return False
+					if int(self._baked_hazards[index]) & hazard_mask:
+						return False
+		return True
+
 	def path_has_penalty(self, path, now):
 		for index in range(len(path) - 1):
 			if self.segment_penalty(path[index], path[index + 1], now) > 0.0:
@@ -402,6 +520,45 @@ class TerrainGrid(object):
 		self._segment_cache[(end_key, start_key)] = bool(clear)
 		return clear
 
+	@staticmethod
+	def shortcut_preserves_climb_approach(path, start_index, end_index,
+			minimum_grade=0.10, minimum_turn=0.30):
+		"""Keep the setup point before a steep path changes direction.
+
+		A collision-free chord is not always a controllable tank manoeuvre.  If a
+		climb begins immediately after a bend, skipping the bend point makes the
+		hull meet the slope diagonally and waste several recovery cycles.  Ordinary
+		flat corners and straight climbs remain eligible for smoothing.
+		"""
+		if end_index - start_index < 2:
+			return True
+		for index in range(start_index + 1, end_index):
+			before = path[index - 1]
+			pivot = path[index]
+			after = path[index + 1]
+			out_dx = float(after[0]) - float(pivot[0])
+			out_dz = float(after[2]) - float(pivot[2])
+			out_run = math.sqrt(out_dx * out_dx + out_dz * out_dz)
+			if out_run <= 0.1:
+				continue
+			grade = (float(after[1]) - float(pivot[1])) / out_run
+			if grade <= float(minimum_grade):
+				continue
+			in_dx = float(pivot[0]) - float(before[0])
+			in_dz = float(pivot[2]) - float(before[2])
+			if abs(in_dx) + abs(in_dz) <= 0.1:
+				continue
+			incoming = math.atan2(in_dx, in_dz)
+			outgoing = math.atan2(out_dx, out_dz)
+			turn = outgoing - incoming
+			while turn > math.pi:
+				turn -= math.pi * 2.0
+			while turn < -math.pi:
+				turn += math.pi * 2.0
+			if abs(turn) > float(minimum_turn):
+				return False
+		return True
+
 	def _edge(self, cell, height, next_cell):
 		if self.prebaked:
 			return self._baked_edge_height(cell, next_cell)
@@ -428,11 +585,7 @@ class TerrainGrid(object):
 			return None
 		dx = next_cell[0] - cell[0]
 		dz = next_cell[1] - cell[1]
-		direction_index = None
-		for candidate, neighbour in enumerate(self._NEIGHBOURS):
-			if neighbour[0] == dx and neighbour[1] == dz:
-				direction_index = candidate
-				break
+		direction_index = self._DIRECTION_INDEX.get((dx, dz))
 		if (direction_index is None or
 				not (int(self._baked_links[index]) & (1 << direction_index))):
 			return None
@@ -445,8 +598,12 @@ class TerrainGrid(object):
 			if (index is not None and
 					int(self._baked_hazards[index]) & BAKED_SHALLOW_WATER):
 				penalty += self.cell_size * BAKED_SHALLOW_WATER_PENALTY
+		return penalty + self._avoid_penalty(cell, avoid_points)
+
+	def _avoid_penalty(self, cell, avoid_points):
 		if not avoid_points:
-			return penalty
+			return 0.0
+		penalty = 0.0
 		point = self.point_for(cell, 0.0)
 		x = point[0]
 		z = point[2]
@@ -510,8 +667,102 @@ class TerrainGrid(object):
 
 	def begin_plan(self, start, goal, avoid_points=None, max_expansions=1600,
 			now=0.0):
-		return _TerrainSearch(self._plan_steps(
-			start, goal, avoid_points, max_expansions, now))
+		if self.prebaked:
+			generator = self._plan_steps_baked(
+				start, goal, avoid_points, max_expansions, now)
+		else:
+			generator = self._plan_steps(
+				start, goal, avoid_points, max_expansions, now)
+		return _TerrainSearch(generator)
+
+	def _plan_steps_baked(self, start, goal, avoid_points, max_expansions, now):
+		"""Run the shipped graph with flat integer node identifiers."""
+		start_cell = self._nearest_baked_cell(self.cell_for(start), 3)
+		goal_cell = self._nearest_baked_cell(self.cell_for(goal), 3)
+		if start_cell is None or goal_cell is None:
+			yield ()
+			return
+		width = self._baked_width
+		start_index = start_cell[1] * width + start_cell[0]
+		goal_index = goal_cell[1] * width + goal_cell[0]
+		frontier = []
+		sequence = 0
+		heapq.heappush(frontier, (0.0, sequence, start_index, 0.0))
+		came_from = {}
+		cost_so_far = {start_index: 0.0}
+		reached = None
+		closest = start_index
+		closest_distance = math.sqrt(
+			(start_cell[0] - goal_cell[0]) ** 2 +
+			(start_cell[1] - goal_cell[1]) ** 2)
+		expansions = 0
+		while frontier and expansions < int(max_expansions):
+			_unused_priority, _unused_sequence, current, queued_cost = heapq.heappop(frontier)
+			if queued_cost != cost_so_far.get(current):
+				continue
+			expansions += 1
+			current_x = current % width
+			current_z = current // width
+			goal_distance = math.sqrt(
+				(current_x - goal_cell[0]) ** 2 +
+				(current_z - goal_cell[1]) ** 2)
+			if goal_distance < closest_distance:
+				closest = current
+				closest_distance = goal_distance
+			if current == goal_index:
+				reached = current
+				break
+			mask = int(self._baked_links[current])
+			base_cost = cost_so_far[current]
+			for direction_index, neighbour in enumerate(self._NEIGHBOURS):
+				if not (mask & (1 << direction_index)):
+					continue
+				next_index = current + self._baked_neighbour_deltas[direction_index]
+				next_x = current_x + neighbour[0]
+				next_z = current_z + neighbour[1]
+				new_cost = (base_cost +
+				            self._baked_edge_costs[current * 8 + direction_index])
+				if avoid_points:
+					new_cost += self._avoid_penalty((next_x, next_z), avoid_points)
+				if self._failed_edges:
+					new_cost += self._failed_edge_penalty(
+						(current_x, current_z), (next_x, next_z), now)
+				if (next_index not in cost_so_far or
+						new_cost < cost_so_far[next_index]):
+					cost_so_far[next_index] = new_cost
+					came_from[next_index] = current
+					dx = next_x - goal_cell[0]
+					dz = next_z - goal_cell[1]
+					heuristic = (math.sqrt(dx * dx + dz * dz) * self.cell_size *
+					             self.heuristic_weight)
+					sequence += 1
+					heapq.heappush(frontier, (
+						new_cost + heuristic, sequence, next_index, new_cost))
+			yield None
+		if reached is None:
+			if closest_distance <= 3.0:
+				reached = closest
+			elif frontier and closest != start_index:
+				reached = closest
+			else:
+				yield ()
+				return
+		indices = [reached]
+		while indices[-1] != start_index:
+			indices.append(came_from[indices[-1]])
+		indices.reverse()
+		path = []
+		for index in indices:
+			cell = (index % width, index // width)
+			path.append(self.point_for(
+				cell, float(self._baked_heights[index]) / 1000.0))
+		goal_y = self._ground(float(goal[0]), float(goal[2]), path[-1][1])
+		goal_point = (float(goal[0]),
+		              goal_y if goal_y is not None else path[-1][1],
+		              float(goal[2]))
+		if self.segment_clear(path[-1], goal_point):
+			path.append(goal_point)
+		yield self._smooth(tuple(path), now)
 
 	def _plan_steps(self, start, goal, avoid_points, max_expansions, now):
 		start_cell = self.cell_for(start)
@@ -641,7 +892,9 @@ class TerrainGrid(object):
 		while index < len(path) - 1:
 			furthest = min(len(path) - 1, index + 6)
 			while furthest > index + 1:
-				if (self.segment_penalty(path[index], path[furthest], now) <= 0.0 and
+				if (self.shortcut_preserves_climb_approach(
+						path, index, furthest) and
+						self.segment_penalty(path[index], path[furthest], now) <= 0.0 and
 						not self.segment_has_baked_hazard(
 							path[index], path[furthest], BAKED_SHALLOW_WATER) and
 						self.segment_clear(path[index], path[furthest])):
@@ -691,6 +944,7 @@ class TerrainNavigator(object):
 		self.search_times = {}
 		self.bot_states = {}
 		self.search_frame_time = None
+		self.housekeeping_time = None
 		self.search_next_key = None
 		self.search_budget_per_frame = 128
 		self.search_budget_per_path = 4
@@ -700,11 +954,14 @@ class TerrainNavigator(object):
 		# continuation search starts after the bot reaches that safe endpoint.
 		self.search_max_expansions = 128
 		if self.grid.prebaked:
-			# Static link lookups are cheap; spend a few milliseconds completing a
-			# useful route instead of returning 128-node partial paths forever.
-			self.search_budget_per_frame = 768
-			self.search_budget_per_path = 32
-			self.search_time_budget = 0.006
+			# Static link lookups are cheap, but this work still runs inside the old
+			# Python 2.6 render thread.  A six millisecond allowance per rendered
+			# frame consumed most of the frame once all 29 bots had private contact
+			# paths.  Keep fair resumable progress, while bounding the render-thread
+			# slice; safe reactive steering remains active while a job is pending.
+			self.search_budget_per_frame = 384
+			self.search_budget_per_path = 16
+			self.search_time_budget = 0.0025
 			self.search_max_expansions = 4096
 		self.search_completed = 0
 		self.search_failed = 0
@@ -868,9 +1125,19 @@ class TerrainNavigator(object):
 
 	def tick(self, now):
 		"""Advance shared path jobs once per rendered frame, even when bots hold."""
+		if (self.search_frame_time is not None and
+				abs(float(now) - self.search_frame_time) < 0.000001):
+			return
 		self._advance_searches(now)
-		self.grid.prune_failed_edges(now)
-		self.grid.trim_caches()
+		# Expiry and size housekeeping does not need render-frame cadence.  The
+		# former full dict walks became visible once route/contact searches filled
+		# their caches, even on frames where A* itself had no useful work.
+		if (self.housekeeping_time is None or
+				float(now) - float(self.housekeeping_time) >= 1.0):
+			self.housekeeping_time = float(now)
+			self._trim_cache(now)
+			self.grid.prune_failed_edges(now)
+			self.grid.trim_caches()
 
 	def _path(self, path_key, start, goal, now, avoid_points):
 		key = self._cache_key(path_key, goal)
@@ -1057,7 +1324,9 @@ class TerrainNavigator(object):
 		# Look ahead only while every skipped piece is continuously supported.
 		lookahead = index
 		for candidate in range(index + 1, min(len(path), index + 3)):
-			if (self.grid.segment_penalty(current, path[candidate], now) <= 0.0 and
+			if (self.grid.shortcut_preserves_climb_approach(
+					path, index, candidate) and
+					self.grid.segment_penalty(current, path[candidate], now) <= 0.0 and
 					self.grid.segment_clear(current, path[candidate])):
 				lookahead = candidate
 			else:

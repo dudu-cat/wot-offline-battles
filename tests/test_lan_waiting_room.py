@@ -5,18 +5,21 @@ import time
 import unittest
 
 from lan_battle_server import (
-    BattleState, ClientHandler, PROTOCOL_VERSION, TICK_HZ, ThreadedTCPServer,
+    BattleState, CLIENT_BUILD, ClientHandler, PROTOCOL_VERSION, TICK_HZ,
+    ThreadedTCPServer,
 )
 
 
 class WireClient:
-    def __init__(self, port, name, vehicle="ussr:T-34", max_health=880):
+    def __init__(self, port, name, vehicle="ussr:T-34", max_health=880,
+                 client_build=CLIENT_BUILD):
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=2)
         self.sock.settimeout(2)
         self.buffer = b""
         self.send({
             "type": "hello",
             "protocol": PROTOCOL_VERSION,
+            "client_build": client_build,
             "name": name,
             "vehicle": vehicle,
             "max_health": max_health,
@@ -64,6 +67,20 @@ class WaitingRoomTest(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+
+    def test_server_rejects_a_stale_client_build_before_join(self):
+        stale = WireClient(
+            self.server.server_address[1], "OldClient",
+            client_build="1.8.16-test-20260809",
+        )
+        try:
+            error = stale.receive_type("error")
+        finally:
+            stale.close()
+
+        self.assertEqual("build", error["code"])
+        self.assertIn(CLIENT_BUILD, error["message"])
+        self.assertEqual({}, self.state.players)
 
     def connect(self, name):
         client = WireClient(self.port, name)
