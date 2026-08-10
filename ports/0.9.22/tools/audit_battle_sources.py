@@ -85,6 +85,9 @@ SERVER_FILES = {
 # 2026-08-08 release-worktree delta measured on the legacy client. This makes
 # subsequent drift fail deterministically instead of silently comparing
 # against the older source left in this repository's main checkout.
+# ``bot_runtime.py`` additionally contains the documented #1513-only seam
+# that presents copied poses each render frame but forms LAN publications at
+# the nominal 30 Hz protocol cadence so strict combat sequences are not lost.
 FINAL_082_BASELINE = '7e3a1b2969e839b8e00acab0a0e3bc39f8bcc48c'
 PINNED_PORT_SHA256 = {
     'ai/adapter.py': '7abfd2af9a9e1f39a5fe7143ef729af4431430b06f3a6d0bac4e669449ea00f4',
@@ -94,7 +97,7 @@ PINNED_PORT_SHA256 = {
     'ai/maps_group_b.py': '152aae3d25921998b9436c3fbe2210d6f640c92220cf1729504fd59ce7b952d1',
     'ai/navigation.py': '2a14c8d344d499527678ba66b2e1136710ad537ac7b557a22902def4318a3f1e',
     'ai/planner.py': 'ea3be8d32cde1659fe2656ffbb31d2ebcf933d8d48ecc284931689963304d528',
-    'bot_runtime.py': 'e1384f96b7c3f545c9e1c1f9cf3260cd0a8a3a754b9e72e4adaf02e3ac82a23d',
+    'bot_runtime.py': '9d53890a9f4a2cb7b07a115486558015ffa034e5c4bfc44ed1788f08a8c57163',
     'entities/remote_vehicle.py': '7a978301827cfecd3d183bae0d0172b828d17a12594e4ca01db7ee203cb85e56',
     'tank_collision.py': 'e5eaa7f69f88f22a5896f7b5b34031aea278083817c088cbf144de05cdc6d041',
     'vehicle_physics.py': 'e35bbb57611f0708191a1b04ab660379e4ec3d893bad9df816ee442597472441',
@@ -465,6 +468,7 @@ def audit(repo_root):
                      'native_motion=False', 'set_vehicle_pose',
                      'set_vehicle_pose_overlay', '_update_local_presentation',
                      'self._local_model.matrix = self._local_matrix',
+                     'FRAME_SECONDS = 0.0', 'presentation_states()',
                      '_update_spotting', 'spot_until',
                      'event.pop(\'pose\', None)'):
         if required not in battle_runtime:
@@ -523,7 +527,8 @@ def audit(repo_root):
                      "'combat_base_revision'", "'combat_ack_seq'",
                      "'combat_fire_elapsed'", "'combat_fire_timer'",
                      "'authority_handoff_pending'",
-                     'handoff_canonical_reset'):
+                     'handoff_canonical_reset', 'PUBLICATION_SECONDS',
+                     'def presentation_states'):
         if required not in bot_runtime:
             errors.append('bot_runtime.py does not reuse %s' % required)
     hull_dimensions = _function_at_any_indent(

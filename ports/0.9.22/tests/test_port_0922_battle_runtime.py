@@ -15,7 +15,7 @@ CLIENT_SCRIPTS = ROOT / 'ports' / '0.9.22' / 'src' / 'res' / 'scripts' / 'client
 sys.path.insert(0, str(CLIENT_SCRIPTS))
 
 from gui.mods.offline_lan_0922.battle_runtime import (
-    BattleRuntime, _LANInputSender, _engine_rotation,
+    BattleRuntime, FRAME_SECONDS, _LANInputSender, _engine_rotation,
     _selected_vehicle_has_sixth_sense)
 from gui.mods.offline_lan_0922 import critical_damage, gun_mechanics, \
     tank_collision
@@ -566,6 +566,7 @@ class _Compatibility(object):
         self.network_client = None
         self.pose_overlays = {}
         self.control_mode_listener = None
+        self.marker_player_vehicle_id = 0
         self.target_lock_candidate = None
         self.target_lock_validations = []
 
@@ -574,6 +575,15 @@ class _Compatibility(object):
 
     def set_control_mode_listener(self, listener):
         self.control_mode_listener = listener
+
+    def synchronise_vehicle_marker_identity(self, vehicle_id):
+        self.marker_player_vehicle_id = int(vehicle_id)
+        return True
+
+    def assert_vehicle_marker_identity(self, vehicle_id):
+        if self.marker_player_vehicle_id != int(vehicle_id):
+            raise RuntimeError('vehicle-marker player identity mismatch')
+        return True
 
     def set_target_lock_candidate(self, vehicle):
         self.target_lock_candidate = vehicle
@@ -1059,7 +1069,8 @@ def _runtime():
         arena_cache={1: arena}, bigworld=bigworld,
         avatar_input_handler=types.SimpleNamespace(
             _CTRL_MODE=types.SimpleNamespace(
-                ARCADE='arcade', SNIPER='sniper')),
+                ARCADE='arcade', SNIPER='sniper',
+                POSTMORTEM='postmortem')),
         app_loader=app_loader,
         compatibility=compatibility, constants=constants,
         battle_feedback_common=types.SimpleNamespace(
@@ -2288,6 +2299,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(battle._synchronise_player_identity(10))
         self.assertEqual(10, arena_dp.getPlayerVehicleID(False))
         self.assertEqual(1, arena_dp.refreshes)
+        self.assertEqual(
+            10, runtime.compatibility.marker_player_vehicle_id)
 
     def test_player_identity_sync_requires_current_bound_avatar(self):
         runtime = _runtime()
@@ -2340,6 +2353,27 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'network_id': 2, 'state': {'team': 2}}
 
         with self.assertRaisesRegex(RuntimeError, 'identity mismatch'):
+            battle._present_combat_feedback({
+                'kind': 'bot_hit', 'damage': 50, 'shot_result': 2,
+                'dead': False, 'attack_reason': 0, 'death_reason': 0,
+                'source': 'shot'}, target, attacker)
+
+    def test_local_feedback_rejects_vehicle_marker_identity_drift(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._avatar.playerVehicleID = 10
+        battle._synchronise_player_identity(10)
+        runtime.compatibility.marker_player_vehicle_id = 9
+        attacker = {
+            'engine_id': 10, 'local': True, 'kind': 'player',
+            'network_id': 1, 'state': {'team': 1}}
+        target = {
+            'engine_id': 11, 'local': False, 'kind': 'bot',
+            'network_id': 2, 'state': {'team': 2}}
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'vehicle-marker player identity mismatch'):
             battle._present_combat_feedback({
                 'kind': 'bot_hit', 'damage': 50, 'shot_result': 2,
                 'dead': False, 'attack_reason': 0, 'death_reason': 0,
@@ -3043,7 +3077,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
         battle._avatar.playerVehicleID = 10
-        battle._avatar.arena_dp.isRequiredDataExists()
+        battle._synchronise_player_identity(10)
         target = {
             'engine_id': 11, 'local': False, 'kind': 'bot',
             'network_id': 2, 'state': {'team': 2}}
@@ -3075,7 +3109,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._avatar = runtime.bigworld.avatar
         battle._binding = mock.Mock()
         battle._avatar.playerVehicleID = 10
-        battle._avatar.arena_dp.isRequiredDataExists()
+        battle._synchronise_player_identity(10)
         attacker = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
                             {'health': 500})
         ally = _Vehicle(11, _Descriptor(), _Vector(0, 0, 1), (0, 0, 0),
@@ -3108,7 +3142,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
         battle._avatar.playerVehicleID = 10
-        battle._avatar.arena_dp.isRequiredDataExists()
+        battle._synchronise_player_identity(10)
         attacker = {
             'engine_id': 10, 'local': True, 'kind': 'player',
             'network_id': 1, 'state': {'team': 1}}
@@ -3133,7 +3167,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
         battle._avatar.playerVehicleID = 10
-        battle._avatar.arena_dp.isRequiredDataExists()
+        battle._synchronise_player_identity(10)
         attacker = {
             'engine_id': 10, 'local': True, 'kind': 'player',
             'network_id': 1, 'state': {'team': 1}}
@@ -3175,7 +3209,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
         battle._avatar.playerVehicleID = 10
-        battle._avatar.arena_dp.isRequiredDataExists()
+        battle._synchronise_player_identity(10)
         attacker = {
             'engine_id': 10, 'local': True, 'kind': 'player',
             'network_id': 1, 'state': {'team': 1}}
@@ -3540,6 +3574,91 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(runtime.bigworld.avatar.positions)
         self.assertTrue(client.sent)
 
+    def test_battle_frame_requests_the_next_render_frame(self):
+        self.assertEqual(0.0, FRAME_SECONDS)
+
+    def test_authority_pose_is_presented_without_a_network_publication(self):
+        runtime = _runtime()
+        runtime.bigworld.now = 1.0
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._battle_live = True
+        battle._last_frame_time = 0.98
+        battle._avatar = runtime.bigworld.avatar
+        battle._last_snapshot = {'players': []}
+        state = {
+            'id': 17, 'x': 7.0, 'y': 2.0, 'z': 9.0,
+            'yaw': 0.75, 'aim_yaw': 0.9, 'gun_pitch': -0.1,
+        }
+        battle._bots = types.SimpleNamespace(
+            update=mock.Mock(return_value=[]),
+            presentation_states=mock.Mock(return_value=(state,)))
+        battle._flush_pending_bot_create = mock.Mock()
+        battle._flush_pending_entities = mock.Mock()
+        battle._drain_event_journal = mock.Mock()
+        battle._maybe_send_battle_ready = mock.Mock()
+        battle._tick_critical_states = mock.Mock()
+        battle._tick_drowning = mock.Mock()
+        battle._drive_local = mock.Mock()
+        battle._update_target_outline = mock.Mock()
+        battle._apply_authority_bot_poses = mock.Mock()
+        battle._update_spotting = mock.Mock()
+        battle._schedule = mock.Mock()
+
+        battle._frame()
+
+        update_args, update_kwargs = battle._bots.update.call_args
+        self.assertAlmostEqual(0.02, update_args[0])
+        self.assertEqual(1.0, update_args[1])
+        self.assertEqual({'players': []}, update_kwargs)
+        battle._bots.presentation_states.assert_called_once_with()
+        battle._apply_authority_bot_poses.assert_called_once_with((state,))
+        battle._schedule.assert_called_once_with(0.0, battle._frame)
+
+    def test_local_compound_matrix_is_rebound_only_after_refresh(self):
+        class CountingModel(object):
+            def __init__(self, matrix):
+                self._matrix = matrix
+                self.assignments = []
+
+            @property
+            def matrix(self):
+                return self._matrix
+
+            @matrix.setter
+            def matrix(self, value):
+                self._matrix = value
+                self.assignments.append(value)
+
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(10, _Descriptor(), _Vector(2, 3, 4),
+                          (0, 0, 0), {'health': 500})
+        entity.model = CountingModel(entity.matrix)
+        entity.appearance.compoundModel = entity.model
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._local_position = (2.0, 3.0, 4.0)
+        battle._local_descriptor = entity.typeDescriptor
+
+        battle._attach_local_presentation()
+        attach_count = len(entity.model.assignments)
+        battle._local_position = (3.0, 3.0, 5.0)
+        battle._update_local_presentation(entity)
+
+        self.assertEqual(attach_count, len(entity.model.assignments))
+        self.assertIs(battle._local_matrix, entity.model.matrix)
+        refreshed = _Matrix()
+        entity.model.matrix = refreshed
+        refresh_count = len(entity.model.assignments)
+
+        battle._update_local_presentation(entity)
+
+        self.assertEqual(refresh_count + 1, len(entity.model.assignments))
+        self.assertIs(battle._local_matrix, entity.model.matrix)
+
     def test_local_motion_notifies_destructibles_before_collision_probe(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -3735,6 +3854,51 @@ class BattleRuntimeContractTests(unittest.TestCase):
         output.translationSrc = battle._local_matrix
         stabilised.target = battle._local_matrix
         self.assertTrue(battle._on_control_mode_changed(handler, 'sniper'))
+
+    def test_postmortem_transition_checks_attached_camera_not_steady_aiming(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._avatar = runtime.bigworld.avatar
+        battle._local_matrix = _Matrix()
+        attached = types.SimpleNamespace(target=battle._local_matrix)
+        battle._avatar.consistentMatrices = types.SimpleNamespace(
+            attachedVehicleMatrix=attached)
+        handler = battle._avatar.inputHandler
+        calculator = handler.steadyVehicleMatrixCalculator
+        calculator._SteadyVehicleMatrixCalculator__outputMProv.\
+            rotationSrc = object()
+        calculator._SteadyVehicleMatrixCalculator__outputMProv.\
+            translationSrc = object()
+        calculator._SteadyVehicleMatrixCalculator__stabilisedMProv.target = \
+            object()
+        camera = types.SimpleNamespace(vehicleMProv=attached)
+        handler._AvatarInputHandler__curCtrl = types.SimpleNamespace(
+            _PostMortemControlMode__cam=camera)
+        handler._AvatarInputHandler__ctrlModeName = 'postmortem'
+
+        self.assertTrue(battle._on_control_mode_changed(
+            handler, 'postmortem'))
+
+        camera.vehicleMProv = object()
+        with self.assertRaisesRegex(
+                RuntimeError,
+                'postmortem camera captured a stale vehicle pose'):
+            battle._on_control_mode_changed(handler, 'postmortem')
+
+        camera.vehicleMProv = attached
+        attached.target = object()
+        with self.assertRaisesRegex(
+                RuntimeError,
+                'postmortem attached provider captured a stale vehicle '
+                'pose'):
+            battle._on_control_mode_changed(handler, 'postmortem')
+
+        del attached.target
+        with self.assertRaisesRegex(
+                RuntimeError,
+                'attached vehicle matrix target is unavailable'):
+            battle._on_control_mode_changed(handler, 'postmortem')
 
     def test_local_rpm_uses_native_vehicle_state_channel(self):
         runtime = _runtime()
@@ -5208,7 +5372,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'presentation': True},
         }
         battle._avatar.playerVehicleID = 10
-        battle._avatar.arena_dp.isRequiredDataExists()
+        battle._synchronise_player_identity(10)
 
         self.assertTrue(battle._apply_combat_event({
             'kind': 'bot_hit', 'attacker': 1, 'target_bot': 2,

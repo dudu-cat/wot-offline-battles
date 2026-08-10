@@ -91,6 +91,8 @@ def _load_runtime():
     from PlayerEvents import g_playerEvents
     from connection_mgr import LOGIN_STATUS
     from gui.Scaleform.daapi.view.battle.shared.debug_panel import DebugPanel
+    from gui.Scaleform.daapi.view.battle.shared.markers2d.plugins import \
+        VehicleMarkerPlugin
     from gui.prb_control.dispatcher import g_prbLoader
     from helpers import dependency
     from predefined_hosts import g_preDefinedHosts
@@ -120,6 +122,7 @@ def _load_runtime():
     runtime.sound_groups_module = SoundGroups
     runtime.steady_vehicle_matrix = SteadyVehicleMatrix
     runtime.vehicle_module = Vehicle
+    runtime.vehicle_marker_plugin_type = VehicleMarkerPlugin
     runtime.vehicle_gun_rotator = VehicleGunRotator
     return runtime
 
@@ -311,6 +314,8 @@ class OfflineCompatibility(object):
         self._original_vehicle_getattribute = None
         self._original_vehicle_setattr = None
         self._original_vehicle_get_speed = None
+        self._original_vehicle_marker_start = None
+        self._original_vehicle_marker_stop = None
         self._original_vehicle_leave_world = None
         self._original_vehicle_start_wg_physics = None
         self._vehicle_start_wg_physics_code = None
@@ -349,6 +354,8 @@ class OfflineCompatibility(object):
         self._vehicle_getattribute_wrapper = None
         self._vehicle_setattr_wrapper = None
         self._vehicle_get_speed_wrapper = None
+        self._vehicle_marker_start_wrapper = None
+        self._vehicle_marker_stop_wrapper = None
         self._vehicle_leave_world_wrapper = None
         self._vehicle_start_wg_physics_wrapper = None
         self._vehicle_set_gun_angles_wrapper = None
@@ -367,6 +374,8 @@ class OfflineCompatibility(object):
         self._battle_server_time_origin = None
         self._battle_clock_origin = None
         self._vehicle_property_overlays = {}
+        self._vehicle_marker_plugins = {}
+        self._battle_player_vehicle_id = 0
         self._control_mode_listener = None
         self._target_lock_candidate = None
         self._target_lock_input_pending = False
@@ -384,6 +393,8 @@ class OfflineCompatibility(object):
         avatar_type = runtime.avatar_module.PlayerAvatar
         vehicle_type = getattr(
             getattr(runtime, 'vehicle_module', None), 'Vehicle', None)
+        vehicle_marker_type = getattr(
+            runtime, 'vehicle_marker_plugin_type', None)
         compound_type = getattr(
             getattr(runtime, 'compound_appearance_module', None),
             'CompoundAppearance', None)
@@ -560,6 +571,18 @@ class OfflineCompatibility(object):
                     'func_code', getattr(
                         self._original_vehicle_set_gun_angles,
                         '__code__', None))
+        if vehicle_marker_type is None:
+            raise RuntimeError('#1513 vehicle-marker plugin is unavailable')
+        self._original_vehicle_marker_start = \
+            vehicle_marker_type.__dict__.get(
+                'start', getattr(vehicle_marker_type, 'start', None))
+        self._original_vehicle_marker_stop = \
+            vehicle_marker_type.__dict__.get(
+                'stop', getattr(vehicle_marker_type, 'stop', None))
+        if (not callable(self._original_vehicle_marker_start) or
+                not callable(self._original_vehicle_marker_stop)):
+            raise RuntimeError(
+                '#1513 vehicle-marker lifecycle is unavailable')
         if compound_type is not None:
             self._original_compound_getattribute = (
                 compound_type.__dict__.get(
@@ -666,6 +689,30 @@ class OfflineCompatibility(object):
                 if current == eMode:
                     listener(handler, eMode)
             return result
+
+        def vehicle_marker_start(plugin):
+            result = compatibility._original_vehicle_marker_start(plugin)
+            try:
+                cached = getattr(
+                    plugin, '_VehicleMarkerPlugin__playerVehicleID')
+            except AttributeError:
+                raise RuntimeError(
+                    '#1513 vehicle-marker player identity cache is missing')
+            expected = compatibility._battle_player_vehicle_id
+            if expected:
+                if cached != expected:
+                    raise RuntimeError(
+                        '#1513 vehicle-marker plugin captured a stale '
+                        'player identity: expected=%s cached=%s' %
+                        (expected, cached))
+            compatibility._vehicle_marker_plugins[id(plugin)] = plugin
+            return result
+
+        def vehicle_marker_stop(plugin):
+            try:
+                return compatibility._original_vehicle_marker_stop(plugin)
+            finally:
+                compatibility._vehicle_marker_plugins.pop(id(plugin), None)
 
         def consistent_link_own_vehicle(matrices, vehicle):
             overlay = compatibility._vehicle_property_overlays.get(
@@ -1476,6 +1523,8 @@ class OfflineCompatibility(object):
         self._arcade_handle_key_event_wrapper = arcade_handle_key_event
         self._sniper_handle_key_event_wrapper = sniper_handle_key_event
         self._control_mode_changed_wrapper = control_mode_changed
+        self._vehicle_marker_start_wrapper = vehicle_marker_start
+        self._vehicle_marker_stop_wrapper = vehicle_marker_stop
         self._consistent_link_own_vehicle_wrapper = \
             consistent_link_own_vehicle
         self._steady_relink_sources_wrapper = steady_relink_sources
@@ -1522,6 +1571,8 @@ class OfflineCompatibility(object):
             arcade_control_type.handleKeyEvent = arcade_handle_key_event
             sniper_control_type.handleKeyEvent = sniper_handle_key_event
             input_handler_type.onControlModeChanged = control_mode_changed
+            vehicle_marker_type.start = vehicle_marker_start
+            vehicle_marker_type.stop = vehicle_marker_stop
             consistent_matrices_type._ConsistentMatrices__linkOwnVehicle = \
                 consistent_link_own_vehicle
             steady_matrix_type.relinkSources = steady_relink_sources
@@ -1574,6 +1625,8 @@ class OfflineCompatibility(object):
         avatar_type = runtime.avatar_module.PlayerAvatar
         vehicle_type = getattr(
             getattr(runtime, 'vehicle_module', None), 'Vehicle', None)
+        vehicle_marker_type = getattr(
+            runtime, 'vehicle_marker_plugin_type', None)
         compound_type = getattr(
             getattr(runtime, 'compound_appearance_module', None),
             'CompoundAppearance', None)
@@ -1674,6 +1727,16 @@ class OfflineCompatibility(object):
                 self._control_mode_changed_wrapper):
             input_handler_type.onControlModeChanged = (
                 self._original_control_mode_changed)
+        if (vehicle_marker_type is not None and
+                self._original_vehicle_marker_start is not None and
+                vehicle_marker_type.__dict__.get('start') is
+                self._vehicle_marker_start_wrapper):
+            vehicle_marker_type.start = self._original_vehicle_marker_start
+        if (vehicle_marker_type is not None and
+                self._original_vehicle_marker_stop is not None and
+                vehicle_marker_type.__dict__.get('stop') is
+                self._vehicle_marker_stop_wrapper):
+            vehicle_marker_type.stop = self._original_vehicle_marker_stop
         if (consistent_matrices_type is not None and
                 self._original_consistent_link_own_vehicle is not None and
                 consistent_matrices_type.__dict__.get(
@@ -1768,6 +1831,8 @@ class OfflineCompatibility(object):
         self._battle_server_time_origin = None
         self._battle_clock_origin = None
         self._vehicle_property_overlays = {}
+        self._vehicle_marker_plugins = {}
+        self._battle_player_vehicle_id = 0
         self._control_mode_listener = None
         self._target_lock_candidate = None
         self._target_lock_input_pending = False
@@ -1971,6 +2036,7 @@ class OfflineCompatibility(object):
         self.install()
         self._battle_active = True
         self._vehicle_property_overlays = {}
+        self._battle_player_vehicle_id = 0
         self._target_lock_candidate = None
         self._native_battle = True
         self._battle_gui_type = gui_type
@@ -1983,6 +2049,57 @@ class OfflineCompatibility(object):
             self._original_server_time())
         self._battle_clock_origin = float(self._runtime.bigworld.time())
         self.activate_map()
+
+    def synchronise_vehicle_marker_identity(self, expected_vehicle_id):
+        """Refresh the stock marker cache after the local Vehicle exists.
+
+        Exact #1513 starts ``VehicleMarkerPlugin`` while the Avatar still has
+        ``playerVehicleID == 0`` and copies that value into a private cache.
+        Neither ArenaDP invalidation nor later health events refresh it.  Keep
+        the stock damage classification intact and update only that cached
+        server identity at the same boundary that validates Avatar/ArenaDP.
+        """
+        if not self._battle_active:
+            raise RuntimeError(
+                '#1513 vehicle-marker identity requires an active battle')
+        expected_vehicle_id = int(expected_vehicle_id)
+        if expected_vehicle_id <= 0:
+            raise RuntimeError('#1513 vehicle-marker identity is invalid')
+        plugins = tuple(self._vehicle_marker_plugins.values())
+        for plugin in plugins:
+            try:
+                getattr(plugin, '_VehicleMarkerPlugin__playerVehicleID')
+            except AttributeError:
+                raise RuntimeError(
+                    '#1513 vehicle-marker player identity cache is missing')
+        self._battle_player_vehicle_id = expected_vehicle_id
+        for plugin in plugins:
+            setattr(
+                plugin, '_VehicleMarkerPlugin__playerVehicleID',
+                expected_vehicle_id)
+        return self.assert_vehicle_marker_identity(expected_vehicle_id)
+
+    def assert_vehicle_marker_identity(self, expected_vehicle_id):
+        """Reject a marker cache that would relabel player hits as ally hits."""
+        expected_vehicle_id = int(expected_vehicle_id)
+        if self._battle_player_vehicle_id != expected_vehicle_id:
+            raise RuntimeError(
+                '#1513 vehicle-marker player identity mismatch: '
+                'expected=%s runtime=%s' %
+                (expected_vehicle_id, self._battle_player_vehicle_id))
+        for plugin in tuple(self._vehicle_marker_plugins.values()):
+            try:
+                cached = getattr(
+                    plugin, '_VehicleMarkerPlugin__playerVehicleID')
+            except AttributeError:
+                raise RuntimeError(
+                    '#1513 vehicle-marker player identity cache is missing')
+            if cached != expected_vehicle_id:
+                raise RuntimeError(
+                    '#1513 vehicle-marker player identity mismatch: '
+                    'expected=%s cached=%s' %
+                    (expected_vehicle_id, cached))
+        return True
 
     def set_battle_network_client(self, client):
         """Attach the LAN transport whose RTT should drive the battle HUD."""
@@ -2229,6 +2346,7 @@ class OfflineCompatibility(object):
             self._battle_server_time_origin = None
             self._battle_clock_origin = None
             self._vehicle_property_overlays = {}
+            self._battle_player_vehicle_id = 0
 
     def disconnect(self):
         if self._runtime is None:

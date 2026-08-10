@@ -156,6 +156,7 @@ EXPECTED_ABI = {
     'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
     'plugins.pyc': {
         'VehicleMarkerPlugin.start': ('self',),
+        'VehicleMarkerPlugin.stop': ('self',),
     },
     'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
     'markers.pyc': {
@@ -322,6 +323,8 @@ EXPECTED_ABI = {
     'scripts/client/AvatarInputHandler/__init__.pyc': {
         'AvatarInputHandler.onControlModeChanged': (
             'self', 'eMode', '**args'),
+        'AvatarInputHandler.activatePostmortem': (
+            'self', 'isRespawn'),
         'AvatarInputHandler.__onArenaStarted': (
             'self', 'period', '*args'),
         '_Targeting.__init__': ('self',),
@@ -334,6 +337,7 @@ EXPECTED_ABI = {
             'self', 'isDown', 'key', 'mods', 'event'),
         'SniperControlMode.handleKeyEvent': (
             'self', 'isDown', 'key', 'mods', 'event'),
+        'PostMortemControlMode.enable': ('self', '**args'),
     },
     'scripts/client/CommandMapping.pyc': {
         'CommandMapping.isFired': ('self', 'command', 'key'),
@@ -821,8 +825,13 @@ EXPECTED_CODE_NAMES = {
         'SniperControlMode.handleKeyEvent': (
             'CMD_CM_LOCK_TARGET', 'BigWorld', 'target', 'autoAim',
             'CMD_CM_LOCK_TARGET_OFF'),
+        'PostMortemControlMode.enable': (
+            '_PostMortemControlMode__cam', 'consistentMatrices',
+            'attachedVehicleMatrix', 'vehicleMProv'),
     },
     'scripts/client/AvatarInputHandler/__init__.pyc': {
+        'AvatarInputHandler.activatePostmortem': (
+            '_CTRL_MODE', 'POSTMORTEM', 'onControlModeChanged'),
         '_Targeting.__init__': (
             'BigWorld', 'target', 'selectionFovDegrees',
             'deselectionFovDegrees', 'maxDistance',
@@ -910,6 +919,9 @@ EXPECTED_CODE_NAMES = {
         'VehicleMarkerPlugin.start': (
             'getArenaDP', 'getPlayerVehicleID',
             '_VehicleMarkerPlugin__playerVehicleID'),
+        'VehicleMarkerPlugin.__getVehicleDamageType': (
+            'vehicleID', '_VehicleMarkerPlugin__playerVehicleID',
+            'DAMAGE_TYPE', 'FROM_PLAYER', 'FROM_ALLY'),
     },
     'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
     'markers.pyc': {
@@ -1365,6 +1377,15 @@ EXPECTED_CALL_WIDTHS = {
     },
 }
 
+EXPECTED_EQUALITY_BRANCHES = {
+    'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
+    'plugins.pyc': {
+        'VehicleMarkerPlugin.__getVehicleDamageType': (
+            'vehicleID', '_VehicleMarkerPlugin__playerVehicleID',
+            'FROM_PLAYER', 'FROM_ALLY'),
+    },
+}
+
 
 def _signature(code):
     values = list(code.co_varnames[:code.co_argcount])
@@ -1512,6 +1533,44 @@ def _calls_width(code, width):
         for instruction in _instructions(code))
 
 
+def _has_equality_return_branches(code, left_attribute, right_attribute,
+                                  true_result, false_result):
+    """Pin an attribute equality whose true/false paths return named values."""
+    instructions = _instructions(code)
+    offsets = dict(
+        (instruction['offset'], index)
+        for index, instruction in enumerate(instructions))
+    for index, instruction in enumerate(instructions):
+        if (instruction['opname'] != 'COMPARE_OP' or
+                instruction['argument'] != 2 or index < 2 or
+                index + 1 >= len(instructions)):
+            continue
+        before = instructions[max(0, index - 8):index]
+        names = [item['value'] for item in before
+                 if item['opname'] == 'LOAD_ATTR']
+        if (left_attribute not in names or right_attribute not in names):
+            continue
+        branch = instructions[index + 1]
+        if branch['opname'] != 'POP_JUMP_IF_FALSE':
+            continue
+        false_index = offsets.get(branch['argument'])
+        if false_index is None:
+            continue
+        true_path = instructions[index + 2:false_index]
+        false_path = instructions[false_index:]
+        true_names = set(item['value'] for item in true_path
+                         if item['opname'] == 'LOAD_ATTR')
+        false_names = set(item['value'] for item in false_path
+                          if item['opname'] == 'LOAD_ATTR')
+        if (true_result in true_names and false_result in false_names and
+                any(item['opname'] == 'RETURN_VALUE'
+                    for item in true_path) and
+                any(item['opname'] == 'RETURN_VALUE'
+                    for item in false_path)):
+            return True
+    return False
+
+
 def _read_module_contract(archive, member):
     payload = archive.read(member)
     if payload[:4] != '\x03\xf3\r\n':
@@ -1563,6 +1622,7 @@ def audit(client_root):
     checked_subscript_mutations = []
     checked_unpack_widths = []
     checked_call_widths = []
+    checked_equality_branches = []
     errors = []
     with zipfile.ZipFile(package_path, 'r') as archive:
         names = set(archive.namelist())
@@ -1573,7 +1633,8 @@ def audit(client_root):
                    set(EXPECTED_LIST_RETURNS) |
                    set(EXPECTED_SUBSCRIPT_MUTATIONS) |
                    set(EXPECTED_UNPACK_WIDTHS) |
-                   set(EXPECTED_CALL_WIDTHS))
+                   set(EXPECTED_CALL_WIDTHS) |
+                   set(EXPECTED_EQUALITY_BRANCHES))
         for member in sorted(members):
             if member not in names:
                 errors.append('missing bytecode member: %s' % member)
@@ -1727,6 +1788,21 @@ def audit(client_root):
                 else:
                     checked_call_widths.append(
                         '%s:%s:call[%d]' % (member, name, width))
+            for name, branch in sorted(
+                    EXPECTED_EQUALITY_BRANCHES.get(member, {}).items()):
+                code = code_objects.get(name)
+                if code is None:
+                    errors.append('%s: missing %s for equality branch' %
+                                  (member, name))
+                elif not _has_equality_return_branches(code, *branch):
+                    errors.append(
+                        '%s: %s does not compare %s == %s and return '
+                        '%s/%s on its branches' %
+                        ((member, name) + branch))
+                else:
+                    checked_equality_branches.append(
+                        '%s:%s:%s==%s:%s/%s' %
+                        ((member, name) + branch))
         actual_filter_sync_calls = _find_filter_sync_calls(archive)
         missing_filter_calls = (
             EXPECTED_FILTER_SYNC_CALLS - actual_filter_sync_calls)
@@ -1757,6 +1833,7 @@ def audit(client_root):
         'checkedSubscriptMutations': len(checked_subscript_mutations),
         'checkedUnpackWidths': len(checked_unpack_widths),
         'checkedCallWidths': len(checked_call_widths),
+        'checkedEqualityBranches': len(checked_equality_branches),
         'contracts': checked,
         'consumerLiterals': checked_literals,
         'codeNames': checked_names,
@@ -1768,6 +1845,7 @@ def audit(client_root):
         'subscriptMutations': checked_subscript_mutations,
         'unpackWidths': checked_unpack_widths,
         'callWidths': checked_call_widths,
+        'equalityBranches': checked_equality_branches,
     }
 
 

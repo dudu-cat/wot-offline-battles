@@ -16,8 +16,8 @@ from gui.mods.offline_lan_0922 import tank_collision
 from gui.mods.offline_lan_0922 import vehicle_physics
 
 
-TICK_SECONDS = 1.0 / 30.0
 OBSERVATION_SECONDS = 0.20
+PUBLICATION_SECONDS = 1.0 / 30.0
 HUMAN_TARGET_ID_BASE = 1000000
 VISIBILITY_MIN_SECONDS = 0.18
 VISIBILITY_JITTER_SECONDS = 0.018
@@ -521,6 +521,8 @@ class BotRuntime(object):
         self._server_orders = {}
         self._order_revision = -1
         self._next_observation = 0.0
+        self._next_publication = 0.0
+        self._pending_ram_reports = []
         self._cover_cursor = 0
         self._decision_cache = {}
         self._combat_sync = {}
@@ -662,6 +664,8 @@ class BotRuntime(object):
             self._server_orders = {}
             self._order_revision = -1
             self._next_observation = 0.0
+            self._next_publication = 0.0
+            self._pending_ram_reports = []
             self._cover_cursor = 0
             self._decision_cache = {}
             self._combat_sync = {}
@@ -679,6 +683,8 @@ class BotRuntime(object):
         if previous_authority != self.authority_id:
             self._visibility_cache = {}
             self._decision_cache = {}
+            self._pending_ram_reports = []
+            self._next_publication = 0.0
             if self.is_authority():
                 self._manifest_sent = False
         if authority_handoff:
@@ -775,6 +781,8 @@ class BotRuntime(object):
             })
             gun_state = self._gun_states[bot_id]
             state = self.states[bot_id]
+            if authority_handoff:
+                self._apply_authority_takeover_motion(state, raw)
             sync = self._combat_sync_state(state)
             if authority_handoff:
                 sync['authority_handoff_pending'] = True
@@ -821,6 +829,49 @@ class BotRuntime(object):
         state['combat_ack_seq'] = sync['acked_seq']
         state['combat_seq'] = sync['next_seq']
         return sync
+
+    def _apply_authority_takeover_motion(self, state, raw):
+        """Rebase one resumed authority on the server's canonical pose.
+
+        ``apply_snapshot`` deliberately never rewinds an active authority's
+        locally integrated pose.  The same rule cannot apply after authority
+        was lost: on handback the merged manifest is the only canonical pose
+        boundary, and retaining the old local state rewinds the battle to the
+        point where this client stopped simulating.  Copy only pose, aim and
+        motion here; combat continues through the existing revision/ack
+        reconciliation below.
+        """
+        yaw = _number(raw.get('yaw'), state.get('yaw'))
+        aim_yaw = _number(raw.get('aim_yaw'), yaw)
+        gun_pitch = _number(raw.get('gun_pitch'), 0.0)
+        state['x'] = _number(raw.get('x'), state.get('x'))
+        state['y'] = _number(raw.get('y'), state.get('y'))
+        state['z'] = _number(raw.get('z'), state.get('z'))
+        state['yaw'] = yaw
+        state['aim_yaw'] = aim_yaw
+        state['turret_yaw'] = _angle_delta(aim_yaw, yaw)
+        state['gun_pitch'] = gun_pitch
+        state['desired_gun_pitch'] = gun_pitch
+        state['gun_aligned'] = False
+        state['hull_aiming'] = False
+        # Current LAN snapshots carry intent but not a velocity magnitude.
+        # Resume from rest unless a later protocol explicitly supplies one;
+        # stale pre-handoff momentum is not server-canonical state.
+        state['speed'] = _number(raw.get('speed'), 0.0)
+        movement = _number(raw.get('movement_dir'))
+        rotation = _number(raw.get('rotation_dir'))
+        state['movement_dir'] = (
+            1 if movement > 0.01 else (-1 if movement < -0.01 else 0))
+        state['rotation_dir'] = (
+            1 if rotation > 0.01 else (-1 if rotation < -0.01 else 0))
+        state['push_x'] = 0.0
+        state['push_z'] = 0.0
+        state['vertical_speed'] = 0.0
+        state['airborne'] = False
+        state['grounded_once'] = False
+        state['last_drive_pitch'] = 0.0
+        self._turn_speeds[int(state['id'])] = 0.0
+        return True
 
     def _mark_combat_publication(self, state):
         sync = self._combat_sync_state(state)
@@ -1739,13 +1790,31 @@ class BotRuntime(object):
         if (not self.is_authority() or self.adapter is None or
                 self.finished):
             return []
+        # Match the mature 0.8.2 split: copied bot physics and presentation
+        # advance once per rendered frame, while one canonical combat/pose
+        # publication is formed at no more than 30 Hz.  Accumulating render
+        # deltas until 1/30 s made the authority client's visible bots move in
+        # discrete steps; dropping already-formed messages in LANClient would
+        # instead create gaps in the strict combat proposal sequence.
         self._accumulator += max(0.0, _number(dt))
-        if self._accumulator < TICK_SECONDS:
+        if self._accumulator <= 0.0:
             return []
         step = min(self._accumulator, 0.2)
         self._accumulator = 0.0
+        now = _number(now)
+        publish = now >= self._next_publication
+        if publish:
+            if self._next_publication <= 0.0:
+                self._next_publication = now
+            # Advance the nominal clock rather than restarting it from a late
+            # rendered frame.  At 40 FPS a restart would quantise 30 Hz down
+            # to 20 Hz (one publication every other frame).  Carrying the
+            # deadline preserves the requested average cadence while still
+            # forming at most one proposal in any render callback.
+            while self._next_publication <= now:
+                self._next_publication += PUBLICATION_SECONDS
         players = list(players or [])
-        collect_observation = _number(now) >= self._next_observation
+        collect_observation = publish and now >= self._next_observation
         neighbours = list(neighbours or []) + self._player_neighbours(players)
         traffic_bodies, traffic_index = self._traffic_snapshot(neighbours)
         observations = {}
@@ -1987,7 +2056,8 @@ class BotRuntime(object):
                     self._shot_clear(state, target, now)):
                 self._fire(state, gun_state, reload_factor, descriptor)
             mode = command.get('combat_mode')
-            if (target is not None and target.get('visible') and
+            if (collect_observation and
+                    target is not None and target.get('visible') and
                     callable(self.cover_probe) and
                     (mode in ('take_cover', 'cover_hold', 'cover_peek',
                               'cover_return') or
@@ -2022,19 +2092,24 @@ class BotRuntime(object):
                         'target_kind': target.get('kind', 'human'),
                         'candidates': list(candidates),
                     })
-        ram_reports = self._resolve_tank_contacts(players, now, step)
+        self._pending_ram_reports.extend(
+            self._resolve_tank_contacts(players, now, step))
         for state in self._ordered_states():
             if state.get('alive', True):
                 self._update_vertical_motion(state, step)
                 self._guard_realised_pose(
                     state, tick_poses[state['id']], tick_safe[state['id']],
                     attempted_yaws.get(state['id'], state.get('yaw', 0.0)))
-            self._mark_combat_publication(state)
+            if publish:
+                self._mark_combat_publication(state)
+        if not publish:
+            return []
         outgoing = [{'type': 'bot_state', 'bots': [dict(state)
                                                    for state in self._ordered_states()]}]
         # The server validates ram proximity against its latest authority pose.
         # Publish state first, then the cooldown-gated damage reports.
-        outgoing.extend(ram_reports)
+        outgoing.extend(self._pending_ram_reports)
+        self._pending_ram_reports = []
         if collect_observation:
             self._next_observation = _number(now) + OBSERVATION_SECONDS
             outgoing.append({
@@ -2044,3 +2119,9 @@ class BotRuntime(object):
                 'affordances': affordances,
             })
         return outgoing
+
+    def presentation_states(self):
+        """Return current authority poses without forming a LAN proposal."""
+        if not self.is_authority() or self.adapter is None or self.finished:
+            return ()
+        return tuple(dict(state) for state in self._ordered_states())

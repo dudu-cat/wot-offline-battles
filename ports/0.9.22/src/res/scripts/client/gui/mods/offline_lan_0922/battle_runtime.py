@@ -28,7 +28,11 @@ from gui.mods.offline_lan_0922 import (
     vehicle_physics, world_collision)
 
 
-FRAME_SECONDS = 1.0 / 60.0
+# BigWorld callbacks run on rendered frames.  The mature 0.8.2 battle asks for
+# the next frame explicitly; a positive 60 Hz delay can skip rendered frames
+# and makes copied local physics, authority bots and remote interpolation step
+# even while the renderer itself reports a healthy frame rate.
+FRAME_SECONDS = 0.0
 AMMO_SECONDS = 0.10
 NETWORK_INPUT_SECONDS = 1.0 / 30.0
 RPM_PRESENTATION_SECONDS = 0.10
@@ -998,6 +1002,8 @@ class BattleRuntime(object):
                 '#1513 ArenaDP player identity refresh mismatch: '
                 'expected=%s arenaDP=%s' % (
                     expected_vehicle_id, refreshed_vehicle_id))
+        self._runtime.compatibility.synchronise_vehicle_marker_identity(
+            expected_vehicle_id)
         return self._assert_player_identity(expected_vehicle_id)
 
     def _assert_player_identity(self, expected_vehicle_id):
@@ -1021,6 +1027,8 @@ class BattleRuntime(object):
                 'arenaDP=%s' % (
                     expected_vehicle_id, avatar_vehicle_id,
                     arena_vehicle_id))
+        self._runtime.compatibility.assert_vehicle_marker_identity(
+            expected_vehicle_id)
         return True
 
     def _wait_for_client_ready(self):
@@ -1254,10 +1262,55 @@ class BattleRuntime(object):
         return self._bind_local_control_sources(handler, current)
 
     def _on_control_mode_changed(self, handler, mode):
-        """Verify the new control captured the canonical pose before enable."""
+        """Verify the new control captured its canonical pose."""
         if self.state != 'running' or self._local_matrix is None:
             return False
+        modes = getattr(self._runtime.avatar_input_handler, '_CTRL_MODE', None)
+        if modes is None:
+            raise RuntimeError('#1513 control-mode constants are unavailable')
+        if mode == modes.POSTMORTEM:
+            return self._assert_postmortem_control_sources(handler)
         return self._assert_local_control_sources(handler, mode)
+
+    def _assert_postmortem_control_sources(self, handler):
+        """Verify the stock death camera follows the attached pose provider.
+
+        Exact #1513 first relinks the steady aiming calculator, then disables
+        the live control and enables ``PostMortemControlMode``.  The latter
+        deliberately captures ``consistentMatrices.attachedVehicleMatrix``;
+        it does not consume the steady aiming providers.  Once the destroyed
+        vehicle is no longer returned by ``getVehicleAttached()``, the stock
+        steady relink may therefore point at identity without invalidating
+        the postmortem camera.  Keep this transition strict by checking the
+        provider that #1513 actually captures and its copied live target.
+        """
+        matrices = getattr(self._avatar, 'consistentMatrices', None)
+        attached = getattr(matrices, 'attachedVehicleMatrix', None)
+        if attached is None:
+            raise RuntimeError(
+                '#1513 attached vehicle matrix provider is unavailable')
+        try:
+            attached_target = attached.target
+        except AttributeError:
+            raise RuntimeError(
+                '#1513 attached vehicle matrix target is unavailable')
+        if attached_target is not self._local_matrix:
+            raise RuntimeError(
+                '#1513 postmortem attached provider captured a stale '
+                'vehicle pose')
+        control = getattr(handler, '_AvatarInputHandler__curCtrl', None)
+        camera = getattr(control, '_PostMortemControlMode__cam', None)
+        if camera is None:
+            raise RuntimeError('#1513 postmortem camera is unavailable')
+        try:
+            camera_matrix = camera.vehicleMProv
+        except AttributeError:
+            raise RuntimeError(
+                '#1513 postmortem camera has no vehicle matrix provider')
+        if camera_matrix is not attached:
+            raise RuntimeError(
+                '#1513 postmortem camera captured a stale vehicle pose')
+        return True
 
     def _assert_local_control_sources(self, handler, mode):
         """Reject a camera transition that captured a stale native filter."""
@@ -2080,10 +2133,14 @@ class BattleRuntime(object):
         self._local_matrix.setRotateYPR((
             self._local_yaw, self._local_pitch, self._local_roll))
         self._local_matrix.translation = position
-        # CompoundAppearance may refresh after Vehicle.onEnterWorld. Reassert
-        # the exact #1513 model provider so a late refresh cannot put the
-        # rendered tank back on the unmoving native server filter.
-        self._local_model.matrix = self._local_matrix
+        # CompoundAppearance may refresh after Vehicle.onEnterWorld. Rebind
+        # only when that refresh actually replaced the provider.  The mature
+        # 0.8.2 presentation binds one persistent matrix and mutates it in
+        # place; calling the native PyCompoundModel setter every render frame
+        # needlessly relinks the compound hierarchy and produces visible
+        # stepping despite a healthy renderer frame rate.
+        if self._local_model.matrix is not self._local_matrix:
+            self._local_model.matrix = self._local_matrix
         self._runtime.compatibility.set_vehicle_pose_overlay(
             entity, position, self._local_yaw, self._local_matrix,
             self._local_speed, self._local_turn_speed)
@@ -3566,10 +3623,20 @@ class BattleRuntime(object):
                 self._update_target_outline(now)
             if self._battle_live and self._bots is not None:
                 players = (self._last_snapshot or {}).get('players', [])
-                for outgoing in self._bots.update(dt, now, players=players):
-                    if outgoing.get('type') == 'bot_state':
-                        self._apply_authority_bot_poses(
-                            outgoing.get('bots') or ())
+                outgoing_messages = self._bots.update(
+                    dt, now, players=players)
+                presentation_states = getattr(
+                    self._bots, 'presentation_states', None)
+                if not callable(presentation_states):
+                    raise RuntimeError(
+                        'authority bot presentation boundary is unavailable')
+                # Authority poses are a render-frame surface.  LAN bot_state
+                # is deliberately only a 30 Hz protocol publication; tying
+                # the native filters to that message recreates visible steps
+                # and also tempts transport code to drop strict combat_seq
+                # proposals after they have already been formed.
+                self._apply_authority_bot_poses(presentation_states())
+                for outgoing in outgoing_messages:
                     self._observe_local_vehicle(outgoing, now)
                     self._send_bot_message(outgoing)
                     self._resolve_bot_fire(outgoing)

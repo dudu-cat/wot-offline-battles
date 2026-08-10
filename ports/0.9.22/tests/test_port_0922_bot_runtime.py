@@ -308,15 +308,20 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertIs(second_graph, runtime.baked_graph)
         self.assertEqual('02_malinovka', runtime._navigation_map_name)
 
-    def test_30hz_state_updates_pose_input_and_fire_sequence(self):
+    def test_render_frames_update_pose_before_30hz_network_throttle(self):
         self.runtime.descriptor_resolver = lambda unused: _combat_descriptor(
             reload_time=0.45, clip=(1,))
         self.runtime.battle_start(self.start)
-        self.assertEqual([], self.runtime.update(.02, 1.0))
-        result = self.runtime.update(.02, 1.02, players=[{
+        first = self.runtime.update(.02, 1.0)
+        first_pose = self.runtime.presentation_states()[0]
+        second = self.runtime.update(.02, 1.02, players=[{
             'id': 2, 'team': 1, 'alive': True,
             'x': 5, 'y': 0, 'z': 5}])
-        self.assertEqual(0, result[0]['bots'][0]['fire_seq'])
+        second_pose = self.runtime.presentation_states()[0]
+        self.assertEqual('bot_state', first[0]['type'])
+        self.assertEqual([], second)
+        self.assertNotEqual(first_pose['z'], second_pose['z'])
+        self.assertEqual(0, second_pose['fire_seq'])
         player = [{'id': 2, 'team': 1, 'alive': True,
                    'x': 5, 'y': 0, 'z': 5}]
         self.runtime.update(.20, 1.22, players=player)
@@ -416,6 +421,94 @@ class BotRuntimeTests(unittest.TestCase):
              for bot_id, state in runtime.states.items()},
             {bot_id: state['fire_seq']
              for bot_id, state in server.bot_states.items()})
+
+    def test_render_rate_presentation_and_publication_sequence_are_separate(self):
+        command = {
+            'target_yaw': 0.0, 'throttle': 1.0, 'turn': 0.0,
+            'shell_index': 0, 'fire_allowed': False, 'target_id': None,
+            'fire_range': 0.0, 'combat_mode': 'route',
+            'aim_position': (0.0, 0.0, 200.0),
+            'face_position': (0.0, 0.0, 200.0),
+            'move_position': (0.0, 0.0, 200.0),
+            'recovery_mode': 'drive', 'movement_intent': True,
+        }
+        burning = _critical_payload({
+            'name': 'fuelTankHealth', 'hp': 0.0, 'max_hp': 100.0,
+            'state': 'destroyed'}, destroyed=['fuelTankHealth'], fire=True)
+
+        for fps in (40, 60, 120):
+            with self.subTest(fps=fps):
+                runtime = self.module.BotRuntime(
+                    1,
+                    descriptor_resolver=lambda unused: _critical_descriptor(),
+                    adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                        command),
+                    direction_probe=lambda *unused: {
+                        'clear': True, 'slope': 0.0},
+                    ground_probe=lambda *unused: 0.0,
+                    physics_ground_probe=lambda *unused: 0.0,
+                    spawn_resolver=_spawn_resolver,
+                    baked_graph=_graph())
+                roster = [dict(self.start['bots'][0])]
+                start = dict(self.start, bots=roster)
+                manifest = runtime.battle_start(start)[0]
+                runtime.states[11]['critical'] = dict(burning)
+
+                server = BattleState(map_name='04_himmelsdorf')
+                server.client_build = CLIENT_BUILD_0922
+                server.phase = 'battle'
+                server.tick = 100000
+                server.players[1] = Player(
+                    1, object(), ('127.0.0.1', 1), team=1, slot=0)
+                server.bot_authority_id = 1
+                server.bot_roster = list(roster)
+                self.assertTrue(server.update_bot_manifest(1, {
+                    'round_id': server.round_id,
+                    'bots': manifest['bots'],
+                }))
+
+                dt = 1.0 / float(fps)
+                previous_pose = None
+                changed_frames = 0
+                publications = 0
+                last_ack = 0
+                for frame in range(fps * 2):
+                    now = 10.0 + (frame + 1) * dt
+                    outgoing = runtime.update(dt, now)
+                    pose = runtime.presentation_states()[0]
+                    current_pose = (pose['x'], pose['y'], pose['z'],
+                                    pose['yaw'])
+                    if previous_pose is not None:
+                        self.assertNotEqual(previous_pose, current_pose)
+                        changed_frames += 1
+                    previous_pose = current_pose
+
+                    publications_now = [
+                        message for message in outgoing
+                        if message.get('type') == 'bot_state']
+                    self.assertLessEqual(len(publications_now), 1)
+                    for publication in publications_now:
+                        publications += 1
+                        published = publication['bots'][0]
+                        self.assertEqual(last_ack + 1,
+                                         published['combat_seq'])
+                        self.assertTrue(server.update_bot_states(1, {
+                            'round_id': server.round_id,
+                            'bots': publication['bots'],
+                        }))
+                        canonical = server.bot_states[11]
+                        self.assertEqual(published['combat_seq'],
+                                         canonical['combat_ack_seq'])
+                        last_ack = canonical['combat_ack_seq']
+                        runtime.apply_snapshot({
+                            'server_tick': frame,
+                            'bots': [dict(canonical)],
+                        })
+
+                self.assertEqual(fps * 2 - 1, changed_frames)
+                self.assertGreaterEqual(publications, 59)
+                self.assertLessEqual(publications, 61)
+                self.assertEqual(publications, last_ack)
 
     def test_reverse_recovery_uses_driver_turn_sign_not_target_bearing(self):
         command = {
@@ -1647,6 +1740,56 @@ class BotRuntimeTests(unittest.TestCase):
         resumed = self.runtime.battle_start(self.start)
 
         self.assertEqual('bot_manifest', resumed[0]['type'])
+
+    def test_authority_handback_rebases_canonical_pose_aim_and_motion(self):
+        self.runtime.battle_start(self.start)
+        state = self.runtime.states[11]
+        sync = self.runtime._combat_sync[11]
+        state.update({
+            'x': 50.0, 'y': 1.0, 'z': 60.0, 'yaw': 2.5,
+            'aim_yaw': 2.7, 'turret_yaw': 0.2, 'gun_pitch': -0.1,
+            'desired_gun_pitch': -0.1, 'gun_aligned': True,
+            'hull_aiming': True, 'speed': 8.0,
+            'movement_dir': 1, 'rotation_dir': -1,
+            'push_x': 3.0, 'push_z': -2.0,
+            'vertical_speed': -4.0, 'airborne': True,
+            'grounded_once': True, 'last_drive_pitch': 0.3,
+            'health': 777,
+        })
+        self.runtime._turn_speeds[11] = 0.8
+        self.assertEqual([], self.runtime.battle_start(dict(
+            self.start, bot_authority_id=2)))
+        takeover = dict(
+            self.start['bots'][0], x=200.0, y=4.0, z=300.0,
+            yaw=1.0, aim_yaw=1.4, gun_pitch=-0.25,
+            movement_dir=-1, rotation_dir=1, health=900,
+            max_health=1000, alive=True)
+
+        resumed = self.runtime.battle_start(dict(
+            self.start, bot_manifest=[takeover]))
+
+        state = self.runtime.states[11]
+        self.assertEqual((200.0, 4.0, 300.0, 1.0), (
+            state['x'], state['y'], state['z'], state['yaw']))
+        self.assertAlmostEqual(1.4, state['aim_yaw'])
+        self.assertAlmostEqual(0.4, state['turret_yaw'])
+        self.assertEqual((-0.25, -0.25), (
+            state['gun_pitch'], state['desired_gun_pitch']))
+        self.assertEqual((0.0, -1, 1), (
+            state['speed'], state['movement_dir'], state['rotation_dir']))
+        self.assertEqual((0.0, 0.0, 0.0, False, False, 0.0), (
+            state['push_x'], state['push_z'], state['vertical_speed'],
+            state['airborne'], state['grounded_once'],
+            state['last_drive_pitch']))
+        self.assertFalse(state['gun_aligned'])
+        self.assertFalse(state['hull_aiming'])
+        self.assertEqual(0.0, self.runtime._turn_speeds[11])
+        self.assertEqual(777, state['health'])
+        self.assertIs(sync, self.runtime._combat_sync[11])
+        self.assertTrue(sync['authority_handoff_pending'])
+        self.assertEqual((200.0, 4.0, 300.0, 1.0), (
+            resumed[0]['bots'][0]['x'], resumed[0]['bots'][0]['y'],
+            resumed[0]['bots'][0]['z'], resumed[0]['bots'][0]['yaw']))
 
     def test_server_macro_order_drives_local_adapter_with_human_id_mapping(self):
         self.runtime.battle_start(self.start)

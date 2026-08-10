@@ -233,7 +233,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.48</version></root>')
+            '<version>0.3.49</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -1234,6 +1234,84 @@ class OfflineCompatibilityTests(unittest.TestCase):
         compatibility.fini()
         self.assertIs(original, handler_type.__dict__['onControlModeChanged'])
 
+    def test_marker_cache_refreshes_when_local_vehicle_identity_arrives(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        marker_type = runtime.vehicle_marker_plugin_type
+        original_start = marker_type.__dict__['start']
+        original_stop = marker_type.__dict__['stop']
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+
+        arena_dp = types.SimpleNamespace(
+            player_vehicle_id=0,
+            getPlayerVehicleID=lambda: arena_dp.player_vehicle_id)
+        plugin = marker_type(arena_dp)
+        plugin.start()
+        self.assertEqual(
+            0, plugin._VehicleMarkerPlugin__playerVehicleID)
+        self.assertEqual('from-ally', plugin.getVehicleDamageType(91))
+
+        arena_dp.player_vehicle_id = 91
+        self.assertTrue(
+            compatibility.synchronise_vehicle_marker_identity(91))
+        self.assertEqual(
+            91, plugin._VehicleMarkerPlugin__playerVehicleID)
+        self.assertEqual('from-player', plugin.getVehicleDamageType(91))
+        self.assertTrue(compatibility.assert_vehicle_marker_identity(91))
+
+        old_plugin = weakref.ref(plugin)
+        plugin.stop()
+        self.assertEqual({}, compatibility._vehicle_marker_plugins)
+        del plugin
+        gc.collect()
+        self.assertIsNone(old_plugin())
+
+        compatibility.deactivate_map()
+        compatibility.configure_battle()
+        next_arena_dp = types.SimpleNamespace(
+            player_vehicle_id=92,
+            getPlayerVehicleID=lambda: next_arena_dp.player_vehicle_id)
+        self.assertTrue(
+            compatibility.synchronise_vehicle_marker_identity(92))
+        next_plugin = marker_type(next_arena_dp)
+        next_plugin.start()
+        self.assertEqual(
+            92, next_plugin._VehicleMarkerPlugin__playerVehicleID)
+        self.assertEqual(
+            'from-player', next_plugin.getVehicleDamageType(92))
+        self.assertEqual(
+            [next_plugin],
+            list(compatibility._vehicle_marker_plugins.values()))
+        next_plugin.stop()
+        self.assertEqual({}, compatibility._vehicle_marker_plugins)
+        self.assertEqual(
+            [('vehicle_marker_start',), ('vehicle_marker_stop',),
+             ('vehicle_marker_start',), ('vehicle_marker_stop',)],
+            [item for item in operations
+             if item[0].startswith('vehicle_marker_')])
+        compatibility.fini()
+        self.assertIs(original_start, marker_type.__dict__['start'])
+        self.assertIs(original_stop, marker_type.__dict__['stop'])
+
+    def test_marker_identity_sync_rejects_a_missing_native_cache(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        arena_dp = types.SimpleNamespace(getPlayerVehicleID=lambda: 0)
+        plugin = runtime.vehicle_marker_plugin_type(arena_dp)
+        plugin.start()
+        del plugin._VehicleMarkerPlugin__playerVehicleID
+
+        with self.assertRaisesRegex(RuntimeError, 'cache is missing'):
+            compatibility.synchronise_vehicle_marker_identity(91)
+
+        self.assertFalse(hasattr(
+            plugin, '_VehicleMarkerPlugin__playerVehicleID'))
+        plugin.stop()
+        compatibility.fini()
+
     def test_live_pose_owns_minimap_and_pretransition_aiming_sources(self):
         compatibility_module = _load_port_source('compat')
         runtime, operations = self._runtime()
@@ -1660,6 +1738,25 @@ class OfflineCompatibilityTests(unittest.TestCase):
             def getAvatarOwnVehicleStabilisedMatrix(self, vehicle):
                 return vehicle.filter.interpolateStabilisedMatrix(123.0)
 
+        class VehicleMarkerPlugin(object):
+            def __init__(self, arena_dp):
+                self.arena_dp = arena_dp
+                self._VehicleMarkerPlugin__playerVehicleID = 0
+
+            def start(self):
+                self._VehicleMarkerPlugin__playerVehicleID = \
+                    self.arena_dp.getPlayerVehicleID()
+                operations.append(('vehicle_marker_start',))
+
+            def stop(self):
+                operations.append(('vehicle_marker_stop',))
+
+            def getVehicleDamageType(self, attacker_id):
+                if (attacker_id ==
+                        self._VehicleMarkerPlugin__playerVehicleID):
+                    return 'from-player'
+                return 'from-ally'
+
         account_module = types.SimpleNamespace(
             PlayerAccount=PlayerAccount,
             _CLIENT_SERVER_VERSION=('requiredVersion_92200', '0.9.22'))
@@ -1711,6 +1808,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
                 AIMING_MODE=types.SimpleNamespace(TARGET_LOCK='target-lock')),
             math=types.SimpleNamespace(Vector3=_Vector3),
             vehicle_module=types.SimpleNamespace(Vehicle=Vehicle),
+            vehicle_marker_plugin_type=VehicleMarkerPlugin,
             vehicle_gun_rotator=types.SimpleNamespace(
                 VehicleGunRotator=VehicleGunRotator))
         return runtime, operations
@@ -3804,7 +3902,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.48'
+        package.PORT_VERSION = '0.3.49'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []
