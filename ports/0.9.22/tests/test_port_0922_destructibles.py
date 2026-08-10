@@ -53,8 +53,9 @@ class _Vector(object):
 
 def _mat_info_1513(collided=False, point=None, normal=None, mat_kind=0,
                    filename='', chunk_id=0, item_index=0):
+    """Build the exact native #1513 seven-item material payload."""
     return (bool(collided), point or _Vector(), normal or _Vector(),
-            int(mat_kind), filename, int(chunk_id), int(item_index))
+            int(mat_kind), filename, int(item_index), int(chunk_id))
 
 
 class _Strict1513Component(object):
@@ -361,6 +362,39 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertIs(hit_point, calls[0][3])
         self.assertTrue(calls[0][4])
 
+    def test_exact_1513_structure_hit_preserves_chunk_and_item_order(self):
+        area = types.ModuleType('AreaDestructibles')
+        area.g_destructiblesManager = object()
+        area.DESTR_TYPE_TREE = 1
+        area.DESTR_TYPE_FALLING_ATOM = 2
+        area.DESTR_TYPE_FRAGILE = 3
+        area.DESTR_TYPE_STRUCTURE = 4
+        area.g_cache = types.SimpleNamespace(
+            getDescByFilename=lambda filename: (
+                {'type': 4, 'modules': {73: {'health': 19}}}
+                if filename == 'structure-wall' else None))
+        calls = []
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda *unused: False,
+            destroy_module=lambda *args: calls.append(args) or True)
+        destructibles_sensor.set_event_sink(lambda unused: True)
+        hit_point = _Vector(10, 2, 20)
+
+        with mock.patch.dict(sys.modules, {'AreaDestructibles': area}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority):
+            self.assertTrue(destructibles_sensor._try_destroy_destructible(
+                1, _mat_info_1513(
+                    True, hit_point, _Vector(0, 1, 0), 73,
+                    'structure-wall', 22, 37),
+                0.25, 6.0, False))
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual((1, 22, 37, 73), calls[0][:4])
+        self.assertIs(hit_point, calls[0][4])
+        self.assertFalse(calls[0][5])
+
     def test_exact_1513_miss_does_not_touch_destructibles_runtime(self):
         with mock.patch.dict(sys.modules, {'AreaDestructibles': None}):
             self.assertFalse(destructibles_sensor._try_destroy_destructible(
@@ -393,7 +427,39 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
 
         with mock.patch.dict(sys.modules, {'BigWorld': bigworld}):
             self.assertFalse(destructibles_sensor._try_destroy_solid_hit(
-                1, _Vector(), _Vector(0, 0, 2), 0.0, 6.0))
+                1, _Vector(0, 0, 2), _Vector(0, 0, -1), 0.0, 6.0))
+
+    def test_solid_probe_uses_native_1513_surface_normal(self):
+        bigworld = types.ModuleType('BigWorld')
+        calls = []
+
+        def material_probe(unused_space, start, stop, point, unused_cb):
+            calls.append((start, stop, point))
+            return _mat_info_1513(False)
+
+        bigworld.wg_getMatInfoNearPoint = material_probe
+        hit_point = _Vector(10, 2, 20)
+
+        with mock.patch.dict(sys.modules, {'BigWorld': bigworld}):
+            self.assertFalse(destructibles_sensor._try_destroy_solid_hit(
+                1, hit_point, _Vector(1, 0, 0), 0.0, 6.0))
+
+        self.assertEqual(1, len(calls))
+        start, stop, point = calls[0]
+        self.assertEqual((7.0, 2.0, 20.0), (start.x, start.y, start.z))
+        self.assertEqual((12.0, 2.0, 20.0), (stop.x, stop.y, stop.z))
+        self.assertIs(hit_point, point)
+
+    def test_solid_probe_rejects_missing_surface_normal(self):
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_getMatInfoNearPoint = (
+            lambda *unused: _mat_info_1513(False))
+
+        with mock.patch.dict(sys.modules, {'BigWorld': bigworld}):
+            with self.assertRaisesRegex(
+                    RuntimeError, 'surface normal is invalid'):
+                destructibles_sensor._try_destroy_solid_hit(
+                    1, _Vector(), _Vector(), 0.0, 6.0)
 
     def test_shot_probe_uses_1513_miss_sentinel(self):
         start = _Vector()

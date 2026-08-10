@@ -93,6 +93,8 @@ def _load_runtime():
     from gui.Scaleform.daapi.view.battle.shared.debug_panel import DebugPanel
     from gui.Scaleform.daapi.view.battle.shared.markers2d.plugins import \
         VehicleMarkerPlugin
+    from gui.Scaleform.daapi.view.battle.shared.markers2d import settings as \
+        VehicleMarkerSettings
     from gui.prb_control.dispatcher import g_prbLoader
     from helpers import dependency
     from predefined_hosts import g_preDefinedHosts
@@ -123,6 +125,7 @@ def _load_runtime():
     runtime.steady_vehicle_matrix = SteadyVehicleMatrix
     runtime.vehicle_module = Vehicle
     runtime.vehicle_marker_plugin_type = VehicleMarkerPlugin
+    runtime.vehicle_marker_damage_type = VehicleMarkerSettings.DAMAGE_TYPE
     runtime.vehicle_gun_rotator = VehicleGunRotator
     return runtime
 
@@ -690,21 +693,77 @@ class OfflineCompatibility(object):
                     listener(handler, eMode)
             return result
 
+        def rollback_vehicle_marker_start(plugin, primary_error):
+            failures = []
+            provider = getattr(plugin, 'sessionProvider', None)
+            remove_arena_ctrl = getattr(provider, 'removeArenaCtrl', None)
+            if not callable(remove_arena_ctrl):
+                failures.append('removeArenaCtrl is unavailable')
+            else:
+                try:
+                    remove_arena_ctrl(plugin)
+                except Exception as error:
+                    failures.append('removeArenaCtrl failed: %s' % error)
+            try:
+                compatibility._original_vehicle_marker_stop(plugin)
+            except Exception as error:
+                failures.append('native stop failed: %s' % error)
+            finally:
+                compatibility._vehicle_marker_plugins.pop(
+                    id(plugin), None)
+            if failures:
+                raise RuntimeError(
+                    '%s; vehicle-marker start rollback failed: %s' % (
+                        primary_error, '; '.join(failures)))
+
         def vehicle_marker_start(plugin):
-            result = compatibility._original_vehicle_marker_start(plugin)
+            expected = compatibility._battle_player_vehicle_id
+            if expected:
+                provider = getattr(plugin, 'sessionProvider', None)
+                get_arena_dp = getattr(provider, 'getArenaDP', None)
+                if not callable(get_arena_dp):
+                    raise RuntimeError(
+                        '#1513 vehicle-marker ArenaDP provider is unavailable')
+                arena_dp = get_arena_dp()
+                required = getattr(
+                    arena_dp, 'isRequiredDataExists', None)
+                get_player_vehicle_id = getattr(
+                    arena_dp, 'getPlayerVehicleID', None)
+                if not callable(required) or not callable(
+                        get_player_vehicle_id):
+                    raise RuntimeError(
+                        '#1513 vehicle-marker player identity API is '
+                        'unavailable')
+                if not required():
+                    raise RuntimeError(
+                        '#1513 vehicle-marker ArenaDP identity is incomplete '
+                        'before start')
+                arena_vehicle_id = int(get_player_vehicle_id(False))
+                if arena_vehicle_id != expected:
+                    raise RuntimeError(
+                        '#1513 vehicle-marker ArenaDP identity mismatch '
+                        'before start: expected=%s arenaDP=%s' % (
+                            expected, arena_vehicle_id))
+            try:
+                result = compatibility._original_vehicle_marker_start(plugin)
+            except Exception as error:
+                rollback_vehicle_marker_start(plugin, error)
+                raise
             try:
                 cached = getattr(
                     plugin, '_VehicleMarkerPlugin__playerVehicleID')
             except AttributeError:
-                raise RuntimeError(
+                error = RuntimeError(
                     '#1513 vehicle-marker player identity cache is missing')
-            expected = compatibility._battle_player_vehicle_id
-            if expected:
-                if cached != expected:
-                    raise RuntimeError(
-                        '#1513 vehicle-marker plugin captured a stale '
-                        'player identity: expected=%s cached=%s' %
-                        (expected, cached))
+                rollback_vehicle_marker_start(plugin, error)
+                raise error
+            if expected and cached != expected:
+                error = RuntimeError(
+                    '#1513 vehicle-marker plugin captured a stale '
+                    'player identity: expected=%s cached=%s' %
+                    (expected, cached))
+                rollback_vehicle_marker_start(plugin, error)
+                raise error
             compatibility._vehicle_marker_plugins[id(plugin)] = plugin
             return result
 
@@ -2099,6 +2158,80 @@ class OfflineCompatibility(object):
                     '#1513 vehicle-marker player identity mismatch: '
                     'expected=%s cached=%s' %
                     (expected_vehicle_id, cached))
+        return True
+
+    def assert_vehicle_marker_damage_type(self, avatar,
+                                          expected_vehicle_id):
+        """Run the active stock plugin's exact attacker classifier."""
+        expected_vehicle_id = int(expected_vehicle_id)
+        self.assert_vehicle_marker_identity(expected_vehicle_id)
+        plugins = tuple(self._vehicle_marker_plugins.values())
+        if not plugins:
+            raise RuntimeError(
+                '#1513 active vehicle-marker plugin is unavailable')
+        provider = getattr(avatar, 'guiSessionProvider', None)
+        present_health = getattr(provider, 'setVehicleHealth', None)
+        if not callable(present_health):
+            raise RuntimeError(
+                '#1513 remote vehicle health presenter is unavailable')
+        get_arena_dp = getattr(provider, 'getArenaDP', None)
+        if not callable(get_arena_dp):
+            raise RuntimeError('#1513 ArenaDP provider is unavailable')
+        arena_dp = get_arena_dp()
+        get_vehicle_info = getattr(arena_dp, 'getVehicleInfo', None)
+        if not callable(get_vehicle_info):
+            raise RuntimeError('#1513 ArenaDP vehicle-info API is unavailable')
+        attacker_info = get_vehicle_info(expected_vehicle_id)
+        try:
+            attacker_vehicle_id = int(attacker_info.vehicleID)
+        except (AttributeError, TypeError, ValueError):
+            raise RuntimeError(
+                '#1513 ArenaDP attacker vehicle info is invalid')
+        if attacker_vehicle_id != expected_vehicle_id:
+            raise RuntimeError(
+                '#1513 ArenaDP attacker identity mismatch: '
+                'expected=%s arenaDP=%s' % (
+                    expected_vehicle_id, attacker_vehicle_id))
+        shared_repo = getattr(
+            provider, '_BattleSessionProvider__sharedRepo', None)
+        feedback = getattr(shared_repo, 'feedback', None)
+        if feedback is None:
+            raise RuntimeError(
+                '#1513 active battle feedback adaptor is unavailable')
+        feedback_arena_dp = getattr(
+            feedback, '_BattleFeedbackAdaptor__arenaDP', None)
+        if feedback_arena_dp is not arena_dp:
+            raise RuntimeError(
+                '#1513 battle feedback ArenaDP mismatch')
+        damage_types = getattr(
+            self._runtime, 'vehicle_marker_damage_type', None)
+        expected_type = getattr(damage_types, 'FROM_PLAYER', None)
+        if expected_type is None:
+            raise RuntimeError(
+                '#1513 vehicle-marker FROM_PLAYER type is unavailable')
+        for plugin in plugins:
+            plugin_provider = getattr(plugin, 'sessionProvider', None)
+            if plugin_provider is not provider:
+                raise RuntimeError(
+                    '#1513 active vehicle-marker provider mismatch')
+            plugin_get_arena_dp = getattr(
+                plugin_provider, 'getArenaDP', None)
+            if (not callable(plugin_get_arena_dp) or
+                    plugin_get_arena_dp() is not arena_dp):
+                raise RuntimeError(
+                    '#1513 active vehicle-marker ArenaDP mismatch')
+            classifier = getattr(
+                plugin,
+                '_VehicleMarkerPlugin__getVehicleDamageType', None)
+            if not callable(classifier):
+                raise RuntimeError(
+                    '#1513 vehicle-marker damage classifier is unavailable')
+            actual_type = classifier(attacker_info)
+            if actual_type != expected_type:
+                raise RuntimeError(
+                    '#1513 vehicle-marker damage classification mismatch: '
+                    'expected=%s actual=%s attacker=%s' % (
+                        expected_type, actual_type, attacker_vehicle_id))
         return True
 
     def set_battle_network_client(self, client):

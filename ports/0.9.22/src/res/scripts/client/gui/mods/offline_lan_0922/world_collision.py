@@ -130,7 +130,7 @@ def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None, airborne=False,
 					if col_top is not None:
 						d_top = (col_top[0] - start_top).length
 						if (d_top - d_bot) < 0.5:
-							if _try_destroy_solid_hit(spaceID, start_bot, col_bot[0], yaw, vel): pass
+							if _try_destroy_solid_hit(spaceID, col_bot[0], col_bot[1], yaw, vel): pass
 							else: return True
 					else:
 						start_mid = Math.Vector3(x1, pos.y + 1.1, z1)
@@ -139,14 +139,14 @@ def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None, airborne=False,
 						if col_mid is not None:
 							d_mid = (col_mid[0] - start_mid).length
 							if (d_mid - d_bot) < 0.25:
-								if _try_destroy_solid_hit(spaceID, start_bot, col_bot[0], yaw, vel): pass
+								if _try_destroy_solid_hit(spaceID, col_bot[0], col_bot[1], yaw, vel): pass
 								else: return True
 						else:
 							# Low object (<1.1m): only the bottom ray caught it. Crush it if
 							# it's a destructible (fence / small prop) so the tank drives
 							# THROUGH, not over it. Non-destructibles (low rocks) stay drivable.
 							_try_destroy_solid_hit(
-								spaceID, start_bot, col_bot[0], yaw, vel)
+								spaceID, col_bot[0], col_bot[1], yaw, vel)
 	except Exception:
 		raise
 	return False

@@ -15,6 +15,7 @@ graph would silently route tanks through buildings, bridges or water.
 """
 
 import argparse
+import hashlib
 import importlib.util
 import io
 import json
@@ -31,10 +32,28 @@ from space_bin_0922 import (CompiledSpace, CompiledSpaceError,
 
 GAME_VERSION = '0.9.22.0.1-cn-1513'
 VENDOR_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vendor')
-_DOWNLOADS_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-LEGACY_BAKER = os.path.join(_DOWNLOADS_ROOT, 'WoT-0.8.2-release-v1.0.1-worktree',
-                            'tools', 'bake_navigation.py')
+LEGACY_BAKER_COMMIT = 'f5b0173c296cd36753a5866ba5e6f2119e3edb25'
+LEGACY_BAKER_SHA256 = (
+    '7ea6081f8d3814679d9064838102470950bfa7a7f5b9528d8165af91bdf94727')
+LEGACY_BASELINE_ROOT = os.path.join(
+    VENDOR_ROOT, 'offline_lan_082_f5b0173')
+LEGACY_BAKER = os.path.join(
+    LEGACY_BASELINE_ROOT, 'tools', 'bake_navigation.py')
+LEGACY_BASELINE_SHA256 = {
+    'tools/bake_navigation.py': LEGACY_BAKER_SHA256,
+    'tools/build_navmesh_probe.py': (
+        'f3ad40738c5b162afdb017c01e0af8adfea54774f92ead71f2f638993af9a3af'),
+    'scripts/client/gui/mods/offhangar/bot_ai_maps.py': (
+        '13abd89f40a33e01a347df00c4447ebde09457c0c09f8efc92391d9684a9e016'),
+    'scripts/client/gui/mods/offhangar/bot_ai_maps_extra.py': (
+        'efee5742e227298fd47156bc3a02d62f2cf47e75f2df82311b5975a58e0fec86'),
+    'scripts/client/gui/mods/offhangar/bot_ai_maps_group_a.py': (
+        'dc03f590c79a606d84b365af4ce292d3bbb7b3c46ab514d39ff991b2b1151244'),
+    'scripts/client/gui/mods/offhangar/bot_ai_maps_group_b.py': (
+        'ec6db32b412885581791ad8ad888cb2df55ca6489a8eddc9dfb6a4a4ec663f4a'),
+    'scripts/client/gui/mods/offhangar/bot_ai_maps_group_c.py': (
+        'f6b71578f032a0fa1e442ebf7fc241a23d76171c8ea72cbde5ca728591e4d9e0'),
+}
 
 
 def decode_scene_indices(space_data):
@@ -90,6 +109,19 @@ def _vector2(value):
         if len(fields) >= 2:
             return float(fields[0]), float(fields[1])
     raise ValueError('base position is neither vector nor text')
+
+
+def _vector3(value):
+    if value.value_type == TYPE_VECTOR:
+        if len(value.value) != 12:
+            raise ValueError('invalid packed XML three-vector')
+        result = struct.unpack('<3f', value.value)
+        return tuple(float(item) for item in result)
+    if value.value_type == TYPE_STRING:
+        fields = value.value.decode('utf-8').split()
+        if len(fields) == 3:
+            return tuple(float(item) for item in fields)
+    raise ValueError('value is not a three-vector')
 
 
 def ctf_bases(arena_data):
@@ -245,18 +277,31 @@ def require_safe_bake(client_root, map_name):
 
 
 def _legacy_baker():
-    """Load the proven 0.8.2 graph/raster implementation without copying it.
+    """Load the exact proven 0.8.2 graph/raster implementation.
 
     The target adapter deliberately supplies only #1513 resource readers.  All
     clearance, grade, reversible-link and base-connectivity invariants remain
-    the mature baker's code rather than a second reimplementation.
+    commit f5b0173's mature code rather than following a mutable worktree.
     """
+    for relative_path, expected_digest in LEGACY_BASELINE_SHA256.items():
+        path = os.path.join(LEGACY_BASELINE_ROOT, *relative_path.split('/'))
+        with open(path, 'rb') as stream:
+            digest = hashlib.sha256(stream.read()).hexdigest()
+        if digest != expected_digest:
+            raise ValueError(
+                'vendored 0.8.2 navigation baseline does not match %s: %s' %
+                (LEGACY_BAKER_COMMIT, relative_path))
     spec = importlib.util.spec_from_file_location('_offline_lan_082_baker',
                                                   LEGACY_BAKER)
     if spec is None or spec.loader is None:
         raise ValueError('mature 0.8.2 baker not found: %s' % LEGACY_BAKER)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    previous_bytecode_policy = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous_bytecode_policy
     return module
 
 
@@ -858,14 +903,183 @@ def expand_stationary_routes(graph, routes, bases, legacy):
     return routes
 
 
-SPAWN_COLUMNS = (0, -1, 1, -2, 2)
-SPAWN_ROW_DEPTHS = (20.0, 36.0, 52.0)
+SPAWN_SLOTS_PER_TEAM = 15
+# This is the mature 0.8.2 retail-like formation law: a wide, shallow line
+# deployed toward the map interior.  The former five-column, three-row block
+# put its rear row 52 m from the flag and made the nearest open *centre* node
+# look safe even when a long chassis extended into an edge building.
+SPAWN_COLUMNS = (0, -1, 1, -2, 2, -3, 3, -4, 4)
+SPAWN_ROW_DEPTHS = (20.0, 32.0)
 SPAWN_LATERAL_SPACING = 14.0
 SPAWN_MAXIMUM_PROJECTION = 32.0
 SPAWN_MINIMUM_SPACING = 10.5
 
 
-def bake_spawn_formations(graph, anchors, map_name):
+def representative_vehicle_chassis_envelope(client_root):
+    """Measure a conservative chassis OBB from the pinned #1513 resources.
+
+    BattleRuntime admits every non-secret vehicle in the current battle tier
+    band.  A map bake therefore cannot assume the selected player vehicle or a
+    hand-picked medium tank.  The collision-client chassis bounds are the same
+    authored bodies loaded by ``ModelHitTester``; combining the widest and the
+    longest stock bodies gives one conservative rectangle for every possible
+    line-up without teaching the runtime to move a slot.
+    """
+    packages = os.path.join(os.path.abspath(client_root), 'res', 'packages')
+    package_names = sorted(
+        name for name in os.listdir(packages)
+        if (name.startswith('vehicles_level_') and name.endswith('.pkg') and
+            not name.endswith('_hd.pkg')))
+    if not package_names:
+        raise UnsafeBakeInputError(
+            'pinned client has no standard vehicle resource packages')
+    seen = set()
+    maximum_width = None
+    maximum_length = None
+    for package_name in package_names:
+        package_path = os.path.join(packages, package_name)
+        with zipfile.ZipFile(package_path, 'r') as package:
+            for resource_name in package.namelist():
+                if (not resource_name.endswith(
+                        '/collision_client/Chassis.visual_processed') or
+                        resource_name in seen):
+                    continue
+                seen.add(resource_name)
+                root = read_packed_xml(package.read(resource_name))
+                bounds = _child(root, 'boundingBox')
+                if bounds.value_type != TYPE_ELEMENT:
+                    raise UnsafeBakeInputError(
+                        '%s has no collision-client chassis bounds' %
+                        resource_name)
+                minimum = _vector3(_child(bounds.value, 'min'))
+                maximum = _vector3(_child(bounds.value, 'max'))
+                half_width = max(abs(minimum[0]), abs(maximum[0]))
+                half_length = max(abs(minimum[2]), abs(maximum[2]))
+                if (not math.isfinite(half_width) or
+                        not math.isfinite(half_length) or
+                        half_width <= 0.0 or half_length <= 0.0):
+                    raise UnsafeBakeInputError(
+                        '%s has invalid collision-client chassis bounds' %
+                        resource_name)
+                record = (half_width, resource_name)
+                if maximum_width is None or record[0] > maximum_width[0]:
+                    maximum_width = record
+                record = (half_length, resource_name)
+                if maximum_length is None or record[0] > maximum_length[0]:
+                    maximum_length = record
+    if not seen or maximum_width is None or maximum_length is None:
+        raise UnsafeBakeInputError(
+            'pinned client has no collision-client chassis bounds')
+    return {
+        'half_width': float(maximum_width[0]),
+        'half_length': float(maximum_length[0]),
+        'width_source': maximum_width[1],
+        'length_source': maximum_length[1],
+        'resources_scanned': len(seen),
+        'source': '#1513 collision_client chassis visual boundingBox',
+    }
+
+
+def spawn_obstacle_obb_blocked(obstacles, x, z, ground_y, yaw, half_width,
+                               half_length, legacy):
+    """Return whether an oriented maximum chassis overlaps compiled BSP."""
+    half_width = float(half_width)
+    half_length = float(half_length)
+    if half_width <= 0.0 or half_length <= 0.0:
+        raise ValueError('spawn chassis envelope is empty')
+    sine, cosine = math.sin(float(yaw)), math.cos(float(yaw))
+    extent_x = abs(sine) * half_length + abs(cosine) * half_width
+    extent_z = abs(cosine) * half_length + abs(sine) * half_width
+    cell_radius = float(obstacles.raster_size) * math.sqrt(2.0) * 0.5
+    minimum_cell_x = int(math.floor(
+        (float(x) - extent_x - cell_radius) / obstacles.raster_size))
+    maximum_cell_x = int(math.floor(
+        (float(x) + extent_x + cell_radius) / obstacles.raster_size))
+    minimum_cell_z = int(math.floor(
+        (float(z) - extent_z - cell_radius) / obstacles.raster_size))
+    maximum_cell_z = int(math.floor(
+        (float(z) + extent_z + cell_radius) / obstacles.raster_size))
+    vehicle_minimum_y = (float(ground_y) +
+                         float(legacy.VEHICLE_GROUND_CLEARANCE))
+    vehicle_maximum_y = (float(ground_y) +
+                         float(legacy.VEHICLE_CLEARANCE_HEIGHT))
+    for cell_x in range(minimum_cell_x, maximum_cell_x + 1):
+        sample_x = (cell_x + 0.5) * obstacles.raster_size
+        delta_x = sample_x - float(x)
+        for cell_z in range(minimum_cell_z, maximum_cell_z + 1):
+            interval = obstacles.cells.get((cell_x, cell_z))
+            if interval is None:
+                continue
+            if (interval[1] < vehicle_minimum_y or
+                    interval[0] > vehicle_maximum_y):
+                continue
+            sample_z = (cell_z + 0.5) * obstacles.raster_size
+            delta_z = sample_z - float(z)
+            forward = delta_x * sine + delta_z * cosine
+            lateral = delta_x * cosine - delta_z * sine
+            outside_forward = max(0.0, abs(forward) - half_length)
+            outside_lateral = max(0.0, abs(lateral) - half_width)
+            if math.hypot(outside_forward, outside_lateral) <= cell_radius:
+                return True
+    return False
+
+
+def spawn_obbs_overlap(first, second, half_width, half_length):
+    """Use a 2-D separating-axis test for two maximum spawn chassis."""
+    first_yaw = float(first[3])
+    second_yaw = float(second[3])
+    first_forward = (math.sin(first_yaw), math.cos(first_yaw))
+    first_right = (math.cos(first_yaw), -math.sin(first_yaw))
+    second_forward = (math.sin(second_yaw), math.cos(second_yaw))
+    second_right = (math.cos(second_yaw), -math.sin(second_yaw))
+    delta = (float(second[0]) - float(first[0]),
+             float(second[2]) - float(first[2]))
+    half_width = float(half_width)
+    half_length = float(half_length)
+    for axis in (first_forward, first_right, second_forward, second_right):
+        centre_distance = abs(delta[0] * axis[0] + delta[1] * axis[1])
+        first_radius = (
+            half_length * abs(first_forward[0] * axis[0] +
+                              first_forward[1] * axis[1]) +
+            half_width * abs(first_right[0] * axis[0] +
+                             first_right[1] * axis[1]))
+        second_radius = (
+            half_length * abs(second_forward[0] * axis[0] +
+                              second_forward[1] * axis[1]) +
+            half_width * abs(second_right[0] * axis[0] +
+                             second_right[1] * axis[1]))
+        if centre_distance >= first_radius + second_radius:
+            return False
+    return True
+
+
+def spawn_clearance_failures(formations, obstacles, vehicle_envelope,
+                             legacy):
+    """Audit all published slots against BSP and every other maximum OBB."""
+    half_width = float(vehicle_envelope['half_width'])
+    half_length = float(vehicle_envelope['half_length'])
+    failures = []
+    records = []
+    for team in (1, 2):
+        for slot, pose in enumerate(formations[str(team)]):
+            record = (team, slot, pose)
+            records.append(record)
+            if spawn_obstacle_obb_blocked(
+                    obstacles, pose[0], pose[2], pose[1], pose[3],
+                    half_width, half_length, legacy):
+                failures.append(('compiled_bsp', team, slot))
+    for index, first in enumerate(records):
+        for second in records[index + 1:]:
+            if spawn_obbs_overlap(
+                    first[2], second[2], half_width, half_length):
+                failures.append((
+                    'vehicle_obb', first[0], first[1],
+                    second[0], second[1]))
+    return failures
+
+
+def bake_spawn_formations(graph, anchors, map_name, obstacles,
+                          vehicle_envelope, legacy):
     """Emit two complete formations or reject the entire map bake.
 
     The runtime is intentionally not allowed to invent, project or nudge a
@@ -876,6 +1090,8 @@ def bake_spawn_formations(graph, anchors, map_name):
     if len(anchors) != 2:
         raise UnsafeBakeInputError('%s: two CTF spawn anchors are required' %
                                    map_name)
+    half_width = float(vehicle_envelope['half_width'])
+    half_length = float(vehicle_envelope['half_length'])
     origin_x, origin_z = graph['origin']
     width = int(graph['width'])
     cell_size = float(graph['cell_size'])
@@ -911,6 +1127,8 @@ def bake_spawn_formations(graph, anchors, map_name):
         selected = []
         for row_depth in SPAWN_ROW_DEPTHS:
             for column in SPAWN_COLUMNS:
+                if len(selected) >= SPAWN_SLOTS_PER_TEAM:
+                    break
                 lateral = float(column) * SPAWN_LATERAL_SPACING
                 desired_x = (float(anchor_x) + math.sin(yaw) * row_depth +
                              math.cos(yaw) * lateral)
@@ -935,6 +1153,15 @@ def bake_spawn_formations(graph, anchors, map_name):
                             candidate[3] - other[3]) < SPAWN_MINIMUM_SPACING
                            for other in selected):
                         continue
+                    pose = (candidate[1], candidate[2], candidate[3], yaw)
+                    if spawn_obstacle_obb_blocked(
+                            obstacles, pose[0], pose[2], pose[1], pose[3],
+                            half_width, half_length, legacy):
+                        continue
+                    if any(spawn_obbs_overlap(
+                            pose, (other[1], other[2], other[3], yaw),
+                            half_width, half_length) for other in selected):
+                        continue
                     chosen = candidate
                     chosen_projection = projection
                     break
@@ -951,6 +1178,12 @@ def bake_spawn_formations(graph, anchors, map_name):
                     round(chosen[1], 4), round(chosen[2], 4),
                     round(chosen[3], 4), round(yaw, 6),
                 ])
+            if len(selected) >= SPAWN_SLOTS_PER_TEAM:
+                break
+        if len(selected) != SPAWN_SLOTS_PER_TEAM:
+            raise UnsafeBakeInputError(
+                '%s: team %d formation has only %d validated slots' %
+                (map_name, team, len(selected)))
 
     same_team_distances = []
     other_team_distances = []
@@ -971,12 +1204,27 @@ def bake_spawn_formations(graph, anchors, map_name):
         raise UnsafeBakeInputError(
             '%s: opposing spawn formations are only %.2f m apart' %
             (map_name, minimum_team_separation))
+    clearance_failures = spawn_clearance_failures(
+        formations, obstacles, vehicle_envelope, legacy)
+    if clearance_failures:
+        raise UnsafeBakeInputError(
+            '%s: baked spawn OBB clearance failed: %r' %
+            (map_name, clearance_failures))
     return formations, {
-        'spawn_slots_per_team': 15,
+        'spawn_slots_per_team': SPAWN_SLOTS_PER_TEAM,
         'spawn_minimum_spacing_metres': round(minimum_spacing, 3),
         'spawn_minimum_team_separation_metres': round(
             minimum_team_separation, 3),
         'spawn_maximum_projection_metres': round(max(projections), 3),
+        'spawn_compiled_bsp_obb_clearance': True,
+        'spawn_pairwise_obb_clearance': True,
+        'spawn_vehicle_half_width_metres': round(half_width, 6),
+        'spawn_vehicle_half_length_metres': round(half_length, 6),
+        'spawn_vehicle_bounds_source': vehicle_envelope['source'],
+        'spawn_vehicle_width_source': vehicle_envelope['width_source'],
+        'spawn_vehicle_length_source': vehicle_envelope['length_source'],
+        'spawn_vehicle_resources_scanned': int(
+            vehicle_envelope['resources_scanned']),
     }
 
 
@@ -1156,6 +1404,8 @@ def bake_map_graph(client_root, map_name, output=None, cell_size=4.0):
 
         terrain = TargetTerrain()
         obstacles = TargetObstacles()
+        vehicle_envelope = representative_vehicle_chassis_envelope(
+            client_root)
         bases = tuple(tuple(point) for point in inspection['ctf_bases'])
         stock_spawns = tuple(tuple(team) for team in inspection['ctf_spawn_points'])
         navigation_starts = tuple((team[0] if team else bases[index])
@@ -1281,7 +1531,8 @@ def bake_map_graph(client_root, map_name, output=None, cell_size=4.0):
                 graph['bake']['directed_spawn_ingress'] = True
                 graph['bake']['reversible_links_except_spawn_ingress'] = True
             formations, formation_validation = bake_spawn_formations(
-                graph, spawn_anchors, map_name)
+                graph, spawn_anchors, map_name, obstacles,
+                vehicle_envelope, legacy)
             graph['spawn_formations'] = formations
             graph['spawn_formation_source'] = (
                 'ctf teamSpawnPoints plus validated 15-slot layout'

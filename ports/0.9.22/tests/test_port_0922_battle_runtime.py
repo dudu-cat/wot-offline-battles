@@ -356,6 +356,10 @@ class _ArenaDataProvider(object):
             self.player_vehicle_id = int(self.avatar.playerVehicleID)
         return self.player_vehicle_id
 
+    def getVehicleInfo(self, vehicle_id):
+        return types.SimpleNamespace(
+            vehicleID=int(vehicle_id), team=self.avatar.team)
+
 
 class _InputHandler(object):
     def __init__(self):
@@ -567,6 +571,7 @@ class _Compatibility(object):
         self.pose_overlays = {}
         self.control_mode_listener = None
         self.marker_player_vehicle_id = 0
+        self.marker_damage_assertions = []
         self.target_lock_candidate = None
         self.target_lock_validations = []
 
@@ -583,6 +588,15 @@ class _Compatibility(object):
     def assert_vehicle_marker_identity(self, vehicle_id):
         if self.marker_player_vehicle_id != int(vehicle_id):
             raise RuntimeError('vehicle-marker player identity mismatch')
+        return True
+
+    def assert_vehicle_marker_damage_type(self, avatar, vehicle_id):
+        self.assert_vehicle_marker_identity(vehicle_id)
+        info = avatar.guiSessionProvider.getArenaDP().getVehicleInfo(
+            int(vehicle_id))
+        if int(info.vehicleID) != int(vehicle_id):
+            raise RuntimeError('ArenaDP attacker identity mismatch')
+        self.marker_damage_assertions.append((avatar, int(vehicle_id)))
         return True
 
     def set_target_lock_candidate(self, vehicle):
@@ -826,6 +840,7 @@ class _BigWorld(object):
         self.created_offline_entities = []
         self.edge_adds = []
         self.edge_removes = []
+        self.space_visibility_masks = {7: 0xffffffff}
 
     def player(self):
         return self.avatar
@@ -924,6 +939,15 @@ class _BigWorld(object):
     def setWatcher(self, name, enabled):
         self.operations.append(('watcher', name, enabled))
 
+    def wg_getSpaceItemsVisibilityMask(self, space_id):
+        return self.space_visibility_masks[int(space_id)]
+
+    def wg_setSpaceItemsVisibilityMask(self, space_id, mask):
+        space_id = int(space_id)
+        mask = int(mask)
+        self.space_visibility_masks[space_id] = mask
+        self.operations.append(('space_visibility', space_id, mask))
+
     def clearAllSpaces(self):
         self.clearEntitiesAndSpaces()
 
@@ -1019,7 +1043,7 @@ def _runtime():
         FINISH_REASON=types.SimpleNamespace(
             UNKNOWN=0, EXTERMINATION=1, BASE=2, TIMEOUT=3))
     arena = types.SimpleNamespace(
-        geometryName='01_karelia', gameplayName='ctf')
+        geometryName='01_karelia', gameplayName='ctf', gameplayID=0)
     width = 61
     graph_template = {
         'format': 'offline-lan-0922-navgraph', 'version': 2,
@@ -1066,12 +1090,16 @@ def _runtime():
         account_commands=types.SimpleNamespace(
             CMD_GET_AVATAR_SYNC=1, CMD_ADD_INT_USER_SETTINGS=2,
             CMD_DEL_INT_USER_SETTINGS=3),
-        arena_cache={1: arena}, bigworld=bigworld,
+        arena_cache={1: arena},
+        arena_visibility_mask=lambda gameplay_id: 1 << int(gameplay_id),
+        bigworld=bigworld,
         avatar_input_handler=types.SimpleNamespace(
             _CTRL_MODE=types.SimpleNamespace(
                 ARCADE='arcade', SNIPER='sniper',
                 POSTMORTEM='postmortem')),
         app_loader=app_loader,
+        client_visibility_flags=types.SimpleNamespace(
+            CLIENT_MASK=0xfff00000, SERVER_MASK=0x000fffff),
         compatibility=compatibility, constants=constants,
         battle_feedback_common=types.SimpleNamespace(
             BATTLE_EVENT_TYPE=types.SimpleNamespace(
@@ -2043,7 +2071,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             [('account_retire',), ('hangar_destroy',),
              ('clear_entities_spaces',),
              ('map_create', '01_karelia'),
-             ('watcher', 'Visibility/GUI', True)],
+             ('watcher', 'Visibility/GUI', True),
+             ('space_visibility', 7, 0xfff00001)],
             runtime.bigworld.operations)
         self.assertEqual(0, runtime.offline_map_creator.viewer_camera_calls)
         self.assertFalse(hasattr(runtime.app_loader, '__dict__'))
@@ -2053,6 +2082,37 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         runtime.app_loader.showBattlePage()
         type(runtime.app_loader).battle_page_calls.assert_called_once_with()
+
+    def test_native_map_selects_only_ctf_server_visibility_bit(self):
+        class _UnsignedMask(int):
+            def __int__(self):
+                raise OverflowError('32-bit Python cannot narrow this mask')
+
+        runtime = _runtime()
+        runtime.client_visibility_flags.CLIENT_MASK = _UnsignedMask(
+            0xfff00000)
+        runtime.client_visibility_flags.SERVER_MASK = _UnsignedMask(
+            0x000fffff)
+        runtime.bigworld.space_visibility_masks[7] = _UnsignedMask(
+            0x812abcde)
+        battle = BattleRuntime(runtime)
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
+
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, start, _Client()))
+
+        self.assertEqual(
+            0x81200001,
+            runtime.bigworld.wg_getSpaceItemsVisibilityMask(7))
+        self.assertEqual(
+            ('space_visibility', 7, 0x81200001),
+            runtime.bigworld.operations[-1])
 
     def test_incomplete_hangar_fails_before_native_clear(self):
         runtime = _runtime()
@@ -4297,6 +4357,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._records = {
             'bot:17': {'engine_id': 11, 'kind': 'bot', 'network_id': 17,
                        'ready': True, 'tombstone': False}}
+        battle._bot_destructible_samples[17] = (
+            runtime.bigworld.now, (7.0, 2.0, 9.0))
 
         def set_vehicle_pose(*unused_args):
             battle._destructibles._fell_trees_near.assert_called_once()
@@ -4314,6 +4376,92 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(0.75, call[2])
         self.assertEqual(6.5, call[3])
         self.assertIs(descriptor, call[4])
+
+    def test_authority_bot_destructible_budget_is_render_rate_independent(self):
+        totals = {}
+        for fps in (40, 60, 120):
+            with self.subTest(fps=fps):
+                runtime = _runtime()
+                battle = BattleRuntime(runtime)
+                battle._avatar = runtime.bigworld.avatar
+                battle._binding = mock.Mock()
+                battle._destructibles = mock.Mock()
+                descriptor = _Descriptor()
+                entity = _Vehicle(
+                    11, descriptor, _Vector(), (0, 0, 0), {'health': 500})
+                battle._server_entity = mock.Mock(return_value=entity)
+                battle._records = dict(
+                    ('bot:%d' % bot_id, {
+                        'engine_id': 1000 + bot_id, 'kind': 'bot',
+                        'network_id': bot_id, 'ready': True,
+                        'tombstone': False,
+                    })
+                    for bot_id in range(11, 40))
+                dt = 1.0 / float(fps)
+                later_counts = []
+                for frame in range(fps * 2):
+                    runtime.bigworld.now = 10.0 + (frame + 1) * dt
+                    before = battle._destructibles._fell_trees_near.call_count
+                    states = tuple({
+                        'id': bot_id, 'alive': True,
+                        'x': float((bot_id - 11) * 12), 'y': 0.0,
+                        'z': -100.0 + 14.0 * (frame + 1) * dt,
+                        'yaw': 0.0, 'speed': 14.0,
+                        'aim_yaw': 0.0, 'gun_pitch': 0.0,
+                    } for bot_id in range(11, 40))
+                    self.assertTrue(
+                        battle._apply_authority_bot_poses(states))
+                    count = (
+                        battle._destructibles._fell_trees_near.call_count -
+                        before)
+                    if frame == 0:
+                        self.assertEqual(0, count)
+                    else:
+                        later_counts.append(count)
+
+                self.assertEqual(
+                    fps * 2 * 29,
+                    battle._binding.set_vehicle_pose.call_count)
+                self.assertLess(max(later_counts), 29)
+                totals[fps] = (
+                    battle._destructibles._fell_trees_near.call_count)
+
+        self.assertLessEqual(
+            max(totals.values()) - min(totals.values()), 29 * 2)
+
+    def test_authority_bot_destructible_budget_resamples_after_three_metres(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        battle._destructibles = mock.Mock()
+        descriptor = _Descriptor()
+        entity = _Vehicle(
+            11, descriptor, _Vector(), (0, 0, 0), {'health': 500})
+        battle._server_entity = mock.Mock(return_value=entity)
+        battle._records = {
+            'bot:17': {'engine_id': 11, 'kind': 'bot', 'network_id': 17,
+                       'ready': True, 'tombstone': False}}
+
+        runtime.bigworld.now = 10.0
+        self.assertTrue(battle._apply_authority_bot_poses([{
+            'id': 17, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': 0.0, 'speed': 35.0,
+            'aim_yaw': 0.0, 'gun_pitch': 0.0}]))
+        runtime.bigworld.now = 10.001
+        self.assertTrue(battle._apply_authority_bot_poses([{
+            'id': 17, 'x': 0.0, 'y': 0.0, 'z': 2.99,
+            'yaw': 0.0, 'speed': 35.0,
+            'aim_yaw': 0.0, 'gun_pitch': 0.0}]))
+        self.assertEqual(
+            0, battle._destructibles._fell_trees_near.call_count)
+        runtime.bigworld.now = 10.002
+        self.assertTrue(battle._apply_authority_bot_poses([{
+            'id': 17, 'x': 0.0, 'y': 0.0, 'z': 3.01,
+            'yaw': 0.0, 'speed': 35.0,
+            'aim_yaw': 0.0, 'gun_pitch': 0.0}]))
+        self.assertEqual(
+            1, battle._destructibles._fell_trees_near.call_count)
 
     def test_canonical_fragile_preserves_shot_damage_bit(self):
         runtime = _runtime()

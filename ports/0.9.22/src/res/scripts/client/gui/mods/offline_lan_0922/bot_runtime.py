@@ -22,6 +22,13 @@ HUMAN_TARGET_ID_BASE = 1000000
 VISIBILITY_MIN_SECONDS = 0.18
 VISIBILITY_JITTER_SECONDS = 0.018
 DECISION_SECONDS = 0.0975
+# The #1513 production probe owns a 15 m low-speed / 20 m high-speed,
+# three-lane corridor.  A cached sample may only be reused while the hull stays
+# well inside the 2.2 m outer lanes.  The time bound also limits maximum copied
+# travel to 35 m/s * 0.0975 s = 3.4125 m before a mandatory new native probe.
+MOTION_PROBE_SECONDS = DECISION_SECONDS
+MOTION_PROBE_LATERAL_BUDGET = 1.0
+MOTION_PROBE_FORWARD_BUDGET = 3.5
 FIRE_DURATION_SECONDS = 10.0
 FIRE_TICK_SECONDS = 1.0
 
@@ -35,6 +42,14 @@ def _cache_deadline(now, entity_id, interval, salt=0, stagger=False):
     phase = (((abs(int(entity_id)) * 17 + int(salt) * 11) % 29) /
              29.0) * interval
     return deadline + phase
+
+
+def _motion_probe_deadline(now, entity_id, initial=False):
+    """Stagger first rechecks without ever exceeding the safety interval."""
+    if not initial:
+        return float(now) + MOTION_PROBE_SECONDS
+    phase = (((abs(int(entity_id)) * 17 + 7 * 11) % 29) + 1) / 29.0
+    return float(now) + MOTION_PROBE_SECONDS * (0.5 + phase * 0.5)
 
 
 def _number(value, default=0.0):
@@ -525,6 +540,7 @@ class BotRuntime(object):
         self._pending_ram_reports = []
         self._cover_cursor = 0
         self._decision_cache = {}
+        self._motion_probe_cache = {}
         self._combat_sync = {}
         self._server_tick = -1
 
@@ -625,6 +641,11 @@ class BotRuntime(object):
 
     def _clear(self, position, yaw, speed=0.0):
         """Treat collision, excessive slope and water as a failed local ray."""
+        return self._probe_is_clear(
+            self._probe_direction(position, yaw, speed))
+
+    def _probe_direction(self, position, yaw, speed=0.0):
+        """Return one canonical direction sample for planning and physics."""
         try:
             try:
                 result = self.direction_probe(position, yaw, speed)
@@ -632,7 +653,12 @@ class BotRuntime(object):
                 # Keep the engine-free two-argument test/probe contract usable.
                 result = self.direction_probe(position, yaw)
         except Exception:
-            return False
+            return {'clear': False, 'collision': True,
+                    'water': False, 'slope': 0.0}
+        return result
+
+    @staticmethod
+    def _probe_is_clear(result):
         if isinstance(result, dict):
             if not result.get('clear', True) or result.get('collision', False):
                 return False
@@ -668,6 +694,7 @@ class BotRuntime(object):
             self._pending_ram_reports = []
             self._cover_cursor = 0
             self._decision_cache = {}
+            self._motion_probe_cache = {}
             self._combat_sync = {}
             self._server_tick = -1
         self._apply_orders(message)
@@ -683,6 +710,7 @@ class BotRuntime(object):
         if previous_authority != self.authority_id:
             self._visibility_cache = {}
             self._decision_cache = {}
+            self._motion_probe_cache = {}
             self._pending_ram_reports = []
             self._next_publication = 0.0
             if self.is_authority():
@@ -1247,6 +1275,7 @@ class BotRuntime(object):
             accepted[bot_id] = order
         if revision != self._order_revision or accepted != self._server_orders:
             self._decision_cache = {}
+            self._motion_probe_cache = {}
         self._server_orders = accepted
         self._order_revision = revision
         return True
@@ -1346,6 +1375,51 @@ class BotRuntime(object):
             lookup[int(bot_id)] = target
             contacts.append(target)
         return contacts, lookup
+
+    def _refresh_target_poses(self, targets, players):
+        """Overlay current poses without repeating spotting or planning probes."""
+        live_players = {}
+        for raw in players or ():
+            if not isinstance(raw, dict) or raw.get('id') is None:
+                continue
+            live_players[self._human_planner_id(raw['id'])] = raw
+        refreshed = {}
+        for planner_id, cached in (targets or {}).items():
+            target = dict(cached)
+            if target.get('kind') == 'human':
+                live = live_players.get(planner_id)
+            else:
+                live = self.states.get(int(target.get(
+                    'network_id', planner_id)))
+            if live is not None:
+                target['position'] = _position(live)
+                for name in ('alive', 'health', 'max_health', 'team',
+                             'x', 'y', 'z', 'yaw', 'speed'):
+                    if name in live:
+                        target[name] = live[name]
+            refreshed[planner_id] = target
+        return refreshed
+
+    @staticmethod
+    def _motion_probe_reusable(cached, position, travel_yaw, speed, now):
+        """Prove that a cached hull corridor still contains this motion ray."""
+        if not isinstance(cached, dict) or now >= cached.get('deadline', 0.0):
+            return False
+        sample_position = cached.get('position')
+        if not isinstance(sample_position, (list, tuple)) or len(sample_position) != 3:
+            return False
+        sample_yaw = _number(cached.get('yaw'))
+        dx = _number(position[0]) - _number(sample_position[0])
+        dz = _number(position[2]) - _number(sample_position[2])
+        sine, cosine = math.sin(sample_yaw), math.cos(sample_yaw)
+        forward = dx * sine + dz * cosine
+        lateral = abs(dx * cosine - dz * sine)
+        lookahead = 20.0 if abs(_number(speed)) > 5.0 else 15.0
+        heading_drift = lookahead * abs(math.sin(
+            _angle_delta(travel_yaw, sample_yaw)))
+        return bool(
+            -0.1 <= forward <= MOTION_PROBE_FORWARD_BUDGET and
+            lateral + heading_drift <= MOTION_PROBE_LATERAL_BUDGET)
 
     def _neighbours_for(self, source, supplied, spatial_index=None,
                         traffic_bodies=None):
@@ -1816,7 +1890,11 @@ class BotRuntime(object):
         players = list(players or [])
         collect_observation = publish and now >= self._next_observation
         neighbours = list(neighbours or []) + self._player_neighbours(players)
-        traffic_bodies, traffic_index = self._traffic_snapshot(neighbours)
+        # Native terrain and visibility probes run on BigWorld's render thread.
+        # Build the traffic view lazily, only when a staggered decision is due;
+        # render-only frames integrate the last accepted command and pose.
+        traffic_bodies = None
+        traffic_index = None
         observations = {}
         cover_jobs = []
         tick_poses = {}
@@ -1832,59 +1910,43 @@ class BotRuntime(object):
             tick_poses[state['id']] = position
             tick_safe[state['id']] = prebaked_navigation.pose_is_safe(
                 self.baked_graph, position, shoulder_cells=0)
-            contacts, targets = self._contacts_for(state, players, now)
-            if collect_observation:
-                for target in contacts:
-                    key = (int(state.get('team', 0)), target.get('kind'),
-                           int(target.get('network_id', 0)))
-                    previous = observations.get(key)
-                    profile = target.get('profile')
-                    profile = profile if isinstance(profile, dict) else {}
-                    if ('visible' not in target or
-                            not isinstance(target['visible'], bool)):
-                        raise ValueError(
-                            'canonical contact visible flag is invalid')
-                    target_visible = target['visible']
-                    shootable = list(
-                        previous['shootable_by_bot_ids']
-                        if previous is not None else ())
-                    if (self._shot_clear(state, target, now) and
-                            state['id'] not in shootable):
-                        shootable.append(int(state['id']))
-                    observations[key] = {
-                        'observing_team': key[0], 'target_kind': key[1],
-                        'target_id': key[2],
-                        'target_team': int(target.get('team', 0)),
-                        'visible': target_visible or bool(
-                            previous and previous.get('visible')),
-                        # Current clients always publish this field. An empty
-                        # list means team-spotted without a local firing lane;
-                        # the server rejects omission rather than guessing.
-                        'shootable_by_bot_ids': sorted(shootable),
-                        'x': _number(target.get('x')),
-                        'y': _number(target.get('y')),
-                        'z': _number(target.get('z')),
-                        'health': max(
-                            0, int(_number(target.get('health'), 1))),
-                        'max_health': max(
-                            1, int(_number(target.get('max_health'), 1))),
-                        'class_tag': target.get(
-                            'class_tag', profile.get(
-                                'class_tag', 'unknown')),
-                        'armor': max(0.0, _number(
-                            target.get(
-                                'armor', profile.get('armor', 0.0)))),
-                    }
             server_order = self._server_orders.get(state['id'])
             decide_with_order = getattr(self.adapter, 'decide_with_order', None)
             cache_key = (('server', self._order_revision)
                          if server_order is not None else ('local',))
             decision_cache = self._decision_cache.get(state['id'])
-            if (decision_cache is not None and
-                    decision_cache[0] == cache_key and
-                    _number(now) < decision_cache[1]):
+            decision_due = not (
+                decision_cache is not None and
+                decision_cache[0] == cache_key and
+                _number(now) < decision_cache[1])
+            probe_samples = {}
+
+            def sample_direction(sample_yaw):
+                # A planner can ask about the same heading that physics consumes
+                # later in this tick.  One raw probe owns both answers.
+                normalised = ((float(sample_yaw) + math.pi) %
+                              (2.0 * math.pi) - math.pi)
+                key = round(normalised, 4)
+                if key not in probe_samples:
+                    probe_samples[key] = self._probe_direction(
+                        position, sample_yaw, state.get('speed', 0.0))
+                return probe_samples[key]
+
+            def sample_clear(sample_yaw):
+                return self._probe_is_clear(sample_direction(sample_yaw))
+
+            if not decision_due:
+                if len(decision_cache) < 6:
+                    raise RuntimeError(
+                        'cached bot perception is unavailable')
                 command = dict(decision_cache[3])
+                contacts = decision_cache[4]
+                targets = decision_cache[5]
             else:
+                contacts, targets = self._contacts_for(state, players, now)
+                if traffic_bodies is None:
+                    traffic_bodies, traffic_index = self._traffic_snapshot(
+                        neighbours)
                 decision_step = step
                 if decision_cache is not None:
                     decision_step = max(
@@ -1918,18 +1980,63 @@ class BotRuntime(object):
                         targets.get(server_order.get('target_id')))
                     command = decide_with_order(
                         decision_state, server_order,
-                        lambda yaw: self._clear(
-                            position, yaw, state.get('speed', 0.0)))
+                        sample_clear)
                 else:
                     command = self.adapter.decide(
-                        decision_state, lambda yaw: self._clear(
-                            position, yaw, state.get('speed', 0.0)))
+                        decision_state, sample_clear)
                 self._decision_cache[state['id']] = (
                     cache_key,
                     _cache_deadline(
                         now, state['id'], DECISION_SECONDS, 3,
                         decision_cache is None),
-                    _number(now), dict(command))
+                    _number(now), dict(command), contacts, targets)
+            # Perception and strategic choice stay on the fixed decision
+            # cadence, but aim/collision consumers must see the current pose of
+            # an already-known target on every rendered frame.
+            targets = self._refresh_target_poses(targets, players)
+            if collect_observation:
+                for observed_target in contacts:
+                    key = (int(state.get('team', 0)),
+                           observed_target.get('kind'),
+                           int(observed_target.get('network_id', 0)))
+                    previous = observations.get(key)
+                    profile = observed_target.get('profile')
+                    profile = profile if isinstance(profile, dict) else {}
+                    if ('visible' not in observed_target or
+                            not isinstance(observed_target['visible'], bool)):
+                        raise ValueError(
+                            'canonical contact visible flag is invalid')
+                    target_visible = observed_target['visible']
+                    shootable = list(
+                        previous['shootable_by_bot_ids']
+                        if previous is not None else ())
+                    if (self._shot_clear(state, observed_target, now) and
+                            state['id'] not in shootable):
+                        shootable.append(int(state['id']))
+                    observations[key] = {
+                        'observing_team': key[0], 'target_kind': key[1],
+                        'target_id': key[2],
+                        'target_team': int(observed_target.get('team', 0)),
+                        'visible': target_visible or bool(
+                            previous and previous.get('visible')),
+                        # Current clients always publish this field. An empty
+                        # list means team-spotted without a local firing lane;
+                        # the server rejects omission rather than guessing.
+                        'shootable_by_bot_ids': sorted(shootable),
+                        'x': _number(observed_target.get('x')),
+                        'y': _number(observed_target.get('y')),
+                        'z': _number(observed_target.get('z')),
+                        'health': max(0, int(_number(
+                            observed_target.get('health'), 1))),
+                        'max_health': max(1, int(_number(
+                            observed_target.get('max_health'), 1))),
+                        'class_tag': observed_target.get(
+                            'class_tag', profile.get(
+                                'class_tag', 'unknown')),
+                        'armor': max(0.0, _number(
+                            observed_target.get(
+                                'armor', profile.get('armor', 0.0)))),
+                    }
             target = targets.get(command.get('target_id'))
             command = _overlay_live_target_pose(command, target)
             state['target_kind'] = (
@@ -1968,11 +2075,23 @@ class BotRuntime(object):
             travel_yaw = (state['yaw'] if throttle >= 0.0
                           else state['yaw'] + math.pi)
             attempted_yaws[state['id']] = travel_yaw
+            cached_motion_probe = self._motion_probe_cache.get(state['id'])
+            if not self._motion_probe_reusable(
+                    cached_motion_probe, position, travel_yaw,
+                    state.get('speed', 0.0), now):
+                motion_probe = sample_direction(travel_yaw)
+                self._motion_probe_cache[state['id']] = {
+                    'result': motion_probe,
+                    'position': position,
+                    'yaw': travel_yaw,
+                    'deadline': _motion_probe_deadline(
+                        now, state['id'], cached_motion_probe is None),
+                }
+            else:
+                motion_probe = cached_motion_probe['result']
             path_clear = (True if (abs(throttle) <= 0.01 or
                                    state.get('airborne', False)) else
-                          self._clear(
-                              position, travel_yaw,
-                              state.get('speed', 0.0)))
+                          self._probe_is_clear(motion_probe))
             if not path_clear:
                 throttle = 0.0
                 driver = getattr(self.adapter, 'driver', None)
@@ -1993,17 +2112,11 @@ class BotRuntime(object):
                 if params is None:
                     params = vehicle_physics.derive_params({})
                     self._physics_params[state['id']] = params
-                try:
-                    try:
-                        slope_probe = self.direction_probe(
-                            position, state['yaw'], state.get('speed', 0.0))
-                    except TypeError:
-                        slope_probe = self.direction_probe(
-                            position, state['yaw'])
-                except Exception:
-                    slope_probe = {}
-                slope = (_number(slope_probe.get('slope'))
-                         if isinstance(slope_probe, dict) else 0.0)
+                # The selected corridor's ground sample is also the copied
+                # physics slope.  A second native probe here used to double the
+                # render-thread work for every moving bot.
+                slope = (_number(motion_probe.get('slope'))
+                         if isinstance(motion_probe, dict) else 0.0)
                 slope_pitch = -math.atan(slope)
                 turn_speed = vehicle_physics.traverse_step(
                     params, self._turn_speeds.get(state['id'], 0.0),

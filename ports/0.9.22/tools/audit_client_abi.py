@@ -19,6 +19,9 @@ import zipfile
 
 
 EXPECTED_ABI = {
+    'scripts/common/ArenaType.pyc': {
+        'getVisibilityMask': ('gameplayID',),
+    },
     'scripts/client/Account.pyc': {
         'PlayerAccount.__init__': ('self',),
         'PlayerAccount.onBecomePlayer': ('self',),
@@ -145,9 +148,20 @@ EXPECTED_ABI = {
             'self', 'vProxy', 'isImmediate'),
         'BattleFeedbackAdaptor.stopVehicleVisual': (
             'self', 'vehicleID', 'isPlayerVehicle'),
+        'BattleFeedbackAdaptor.setVehicleNewHealth': (
+            'self', 'vehicleID', 'newHealth', 'attackerID',
+            'attackReasonID'),
+        'BattleFeedbackAdaptor._setVehicleHealthChanged': (
+            'self', 'vehicleID', 'newHealth', 'attackerID',
+            'attackReasonID'),
     },
     'scripts/client/gui/battle_control/battle_session.pyc': {
         'BattleSessionProvider.getArenaDP': ('self',),
+        'BattleSessionProvider.addArenaCtrl': ('self', 'controller'),
+        'BattleSessionProvider.removeArenaCtrl': ('self', 'controller'),
+        'BattleSessionProvider.setVehicleHealth': (
+            'self', 'isPlayerVehicle', 'vehicleID', 'newHealth',
+            'attackerID', 'attackReasonID'),
     },
     'scripts/client/gui/battle_control/arena_info/arena_dp.pyc': {
         'ArenaDataProvider.isRequiredDataExists': ('self',),
@@ -155,8 +169,14 @@ EXPECTED_ABI = {
     },
     'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
     'plugins.pyc': {
+        'VehicleMarkerPlugin.__init__': ('self', 'parentObj', 'clazz'),
+        'VehicleMarkerPlugin.init': ('self', '*args'),
         'VehicleMarkerPlugin.start': ('self',),
         'VehicleMarkerPlugin.stop': ('self',),
+        'VehicleMarkerPlugin.__onVehicleFeedbackReceived': (
+            'self', 'eventID', 'vehicleID', 'value'),
+        'VehicleMarkerPlugin.__updateVehicleHealth': (
+            'self', 'handle', 'newHealth', 'aInfo', 'attackReasonID'),
     },
     'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
     'markers.pyc': {
@@ -246,6 +266,8 @@ EXPECTED_ABI = {
             'self', 'modulesData', 'vehicle', 'slotType', 'slotId'),
     },
     'scripts/client/Avatar.pyc': {
+        'ClientVisibilityFlags.updateSpaceVisibility': (
+            'spaceID', 'clientVisibilityFlags'),
         'PlayerAvatar.__init__': ('self',),
         'PlayerAvatar.onBecomePlayer': ('self',),
         'PlayerAvatar.onBecomeNonPlayer': ('self',),
@@ -643,6 +665,10 @@ EXPECTED_CODE_LITERALS = {
         'PlayerAvatar.__onSetOwnVehicleAuxPhysicsData': (
             'syncStabilisedYPR',),
     },
+    'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
+    'plugins.pyc': {
+        'VehicleMarkerPlugin.__updateVehicleHealth': ('updateHealth',),
+    },
     'scripts/client/Vehicle.pyc': {
         'Vehicle.set_gunAnglesPacked': ('syncGunAngles',),
     },
@@ -739,6 +765,10 @@ EXPECTED_CODE_NAMES = {
             'onAccountBecomeNonPlayer'),
     },
     'scripts/client/Avatar.pyc': {
+        'ClientVisibilityFlags.updateSpaceVisibility': (
+            'BigWorld', 'wg_getSpaceItemsVisibilityMask',
+            'ClientVisibilityFlags', 'SERVER_MASK',
+            'wg_setSpaceItemsVisibilityMask'),
         'PlayerAvatar.__init__': (
             'Account', 'g_accountRepository', 'intUserSettings',
             'prebattleInvitations'),
@@ -902,10 +932,22 @@ EXPECTED_CODE_NAMES = {
             'onVehicleMarkerAdded', 'onMinimapVehicleAdded', 'isAlive'),
         'BattleFeedbackAdaptor.stopVehicleVisual': (
             'onVehicleMarkerRemoved', 'onMinimapVehicleRemoved'),
+        'BattleFeedbackAdaptor.setVehicleNewHealth': (
+            '_setVehicleHealthChanged',),
+        'BattleFeedbackAdaptor._setVehicleHealthChanged': (
+            '_BattleFeedbackAdaptor__arenaDP', 'getVehicleInfo',
+            'onVehicleFeedbackReceived', '_FET', 'VEHICLE_HEALTH'),
     },
     'scripts/client/gui/battle_control/battle_session.pyc': {
         'BattleSessionProvider.getArenaDP': (
             '_BattleSessionProvider__arenaDP',),
+        'BattleSessionProvider.addArenaCtrl': (
+            '_BattleSessionProvider__arenaListeners', 'addController'),
+        'BattleSessionProvider.removeArenaCtrl': (
+            '_BattleSessionProvider__arenaListeners', 'removeController'),
+        'BattleSessionProvider.setVehicleHealth': (
+            '_BattleSessionProvider__sharedRepo', 'feedback',
+            'setVehicleNewHealth'),
     },
     'scripts/client/gui/battle_control/arena_info/arena_dp.pyc': {
         'ArenaDataProvider.isRequiredDataExists': (
@@ -916,9 +958,20 @@ EXPECTED_CODE_NAMES = {
     },
     'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
     'plugins.pyc': {
+        'VehicleMarkerPlugin.init': (
+            'sessionProvider', 'shared', 'feedback',
+            'onVehicleFeedbackReceived',
+            '_VehicleMarkerPlugin__onVehicleFeedbackReceived'),
         'VehicleMarkerPlugin.start': (
             'getArenaDP', 'getPlayerVehicleID',
-            '_VehicleMarkerPlugin__playerVehicleID'),
+            '_VehicleMarkerPlugin__playerVehicleID', 'addArenaCtrl'),
+        'VehicleMarkerPlugin.stop': ('_markers', 'destroy'),
+        'VehicleMarkerPlugin.__onVehicleFeedbackReceived': (
+            '_EVENT_ID', 'VEHICLE_HEALTH',
+            '_VehicleMarkerPlugin__updateVehicleHealth'),
+        'VehicleMarkerPlugin.__updateVehicleHealth': (
+            '_invokeMarker', '_VehicleMarkerPlugin__getVehicleDamageType',
+            'ATTACK_REASONS'),
         'VehicleMarkerPlugin.__getVehicleDamageType': (
             'vehicleID', '_VehicleMarkerPlugin__playerVehicleID',
             'DAMAGE_TYPE', 'FROM_PLAYER', 'FROM_ALLY'),
@@ -1237,6 +1290,10 @@ EXPECTED_GLOBALS = {
 
 EXPECTED_CLASS_CONSTANTS = {
     'scripts/client/Avatar.pyc': {
+        'ClientVisibilityFlags': {
+            'CLIENT_MASK': 4293918720,
+            'SERVER_MASK': 1048575,
+        },
         '_MOVEMENT_FLAGS': {
             'FORWARD': 1,
             'BACKWARD': 2,
@@ -1296,6 +1353,16 @@ EXPECTED_CLASS_CONSTANTS = {
             'LOBBY': 4,
             'BATTLE_LOADING': 5,
             'BATTLE': 6,
+        },
+    },
+    'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
+    'settings.pyc': {
+        'DAMAGE_TYPE': {
+            'FROM_UNKNOWN': 0,
+            'FROM_ALLY': 1,
+            'FROM_ENEMY': 2,
+            'FROM_SQUAD': 3,
+            'FROM_PLAYER': 4,
         },
     },
     'scripts/client/gui/shared/events.pyc': {
@@ -1368,12 +1435,36 @@ EXPECTED_UNPACK_WIDTHS = {
 }
 
 EXPECTED_CALL_WIDTHS = {
+    'scripts/client/gui/battle_control/battle_session.pyc': {
+        'BattleSessionProvider.setVehicleHealth': 4,
+    },
+    'scripts/client/gui/battle_control/controllers/feedback_adaptor.pyc': {
+        'BattleFeedbackAdaptor.setVehicleNewHealth': 4,
+        'BattleFeedbackAdaptor._setVehicleHealthChanged': 3,
+    },
+    'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
+    'plugins.pyc': {
+        'VehicleMarkerPlugin.__updateVehicleHealth': 5,
+    },
     'scripts/client_common/ClientArena.pyc': {
         'ClientArena.__onBasePointsUpdate': 6,
         'ClientArena.__onBaseCaptured': 2,
     },
     'scripts/client/helpers/EffectMaterialCalculation.pyc': {
         'calcSurfaceMaterialNearPoint': 5,
+    },
+}
+
+EXPECTED_TUPLE_WIDTHS = {
+    'scripts/client/gui/battle_control/controllers/feedback_adaptor.pyc': {
+        'BattleFeedbackAdaptor._setVehicleHealthChanged': 3,
+    },
+}
+
+EXPECTED_VAR_CALL_WIDTHS = {
+    'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
+    'plugins.pyc': {
+        'VehicleMarkerPlugin.__onVehicleFeedbackReceived': 1,
     },
 }
 
@@ -1533,6 +1624,20 @@ def _calls_width(code, width):
         for instruction in _instructions(code))
 
 
+def _builds_tuple_width(code, width):
+    return any(
+        instruction['opname'] == 'BUILD_TUPLE' and
+        instruction['argument'] == width
+        for instruction in _instructions(code))
+
+
+def _calls_var_width(code, width):
+    return any(
+        instruction['opname'] == 'CALL_FUNCTION_VAR' and
+        instruction['argument'] == width
+        for instruction in _instructions(code))
+
+
 def _has_equality_return_branches(code, left_attribute, right_attribute,
                                   true_result, false_result):
     """Pin an attribute equality whose true/false paths return named values."""
@@ -1622,6 +1727,8 @@ def audit(client_root):
     checked_subscript_mutations = []
     checked_unpack_widths = []
     checked_call_widths = []
+    checked_tuple_widths = []
+    checked_var_call_widths = []
     checked_equality_branches = []
     errors = []
     with zipfile.ZipFile(package_path, 'r') as archive:
@@ -1634,6 +1741,8 @@ def audit(client_root):
                    set(EXPECTED_SUBSCRIPT_MUTATIONS) |
                    set(EXPECTED_UNPACK_WIDTHS) |
                    set(EXPECTED_CALL_WIDTHS) |
+                   set(EXPECTED_TUPLE_WIDTHS) |
+                   set(EXPECTED_VAR_CALL_WIDTHS) |
                    set(EXPECTED_EQUALITY_BRANCHES))
         for member in sorted(members):
             if member not in names:
@@ -1788,6 +1897,30 @@ def audit(client_root):
                 else:
                     checked_call_widths.append(
                         '%s:%s:call[%d]' % (member, name, width))
+            for name, width in sorted(
+                    EXPECTED_TUPLE_WIDTHS.get(member, {}).items()):
+                code = code_objects.get(name)
+                if code is None:
+                    errors.append('%s: missing %s for tuple width' %
+                                  (member, name))
+                elif not _builds_tuple_width(code, width):
+                    errors.append('%s: %s does not build a %d-value tuple' %
+                                  (member, name, width))
+                else:
+                    checked_tuple_widths.append(
+                        '%s:%s:tuple[%d]' % (member, name, width))
+            for name, width in sorted(
+                    EXPECTED_VAR_CALL_WIDTHS.get(member, {}).items()):
+                code = code_objects.get(name)
+                if code is None:
+                    errors.append('%s: missing %s for var-call width' %
+                                  (member, name))
+                elif not _calls_var_width(code, width):
+                    errors.append('%s: %s does not var-call with %d values' %
+                                  (member, name, width))
+                else:
+                    checked_var_call_widths.append(
+                        '%s:%s:var-call[%d]' % (member, name, width))
             for name, branch in sorted(
                     EXPECTED_EQUALITY_BRANCHES.get(member, {}).items()):
                 code = code_objects.get(name)
@@ -1833,6 +1966,8 @@ def audit(client_root):
         'checkedSubscriptMutations': len(checked_subscript_mutations),
         'checkedUnpackWidths': len(checked_unpack_widths),
         'checkedCallWidths': len(checked_call_widths),
+        'checkedTupleWidths': len(checked_tuple_widths),
+        'checkedVarCallWidths': len(checked_var_call_widths),
         'checkedEqualityBranches': len(checked_equality_branches),
         'contracts': checked,
         'consumerLiterals': checked_literals,
@@ -1845,6 +1980,8 @@ def audit(client_root):
         'subscriptMutations': checked_subscript_mutations,
         'unpackWidths': checked_unpack_widths,
         'callWidths': checked_call_widths,
+        'tupleWidths': checked_tuple_widths,
+        'varCallWidths': checked_var_call_widths,
         'equalityBranches': checked_equality_branches,
     }
 

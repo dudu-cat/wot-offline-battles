@@ -97,17 +97,17 @@ PINNED_PORT_SHA256 = {
     'ai/maps_group_b.py': '152aae3d25921998b9436c3fbe2210d6f640c92220cf1729504fd59ce7b952d1',
     'ai/navigation.py': '2a14c8d344d499527678ba66b2e1136710ad537ac7b557a22902def4318a3f1e',
     'ai/planner.py': 'ea3be8d32cde1659fe2656ffbb31d2ebcf933d8d48ecc284931689963304d528',
-    'bot_runtime.py': '9d53890a9f4a2cb7b07a115486558015ffa034e5c4bfc44ed1788f08a8c57163',
+    'bot_runtime.py': '01de31b620e7b6826ce78fde8c08dd7056fa77636db6ce7ba7d17aef8a1daf05',
     'entities/remote_vehicle.py': '7a978301827cfecd3d183bae0d0172b828d17a12594e4ca01db7ee203cb85e56',
     'tank_collision.py': 'e5eaa7f69f88f22a5896f7b5b34031aea278083817c088cbf144de05cdc6d041',
     'vehicle_physics.py': 'e35bbb57611f0708191a1b04ab660379e4ec3d893bad9df816ee442597472441',
     'destructibles_authority.py': '14e7b22f114080cf4f1034b0bdc9ea8b5848ee6056247b74b5c95f12fd3b1d50',
-    'destructibles_sensor.py': 'a4f5a97f562d152413b22a7a00c6f930dc9eeb861463f5cb10c4a4acc20d47d6',
-    'world_collision.py': '693982f14420952ffb035b380af862e16a07959ab006df3f9d8f4ace62f4b9af',
+    'destructibles_sensor.py': '0818483ea9d271a9ec8454d1496b6dfc26a70804be3abe67f46bdd494edaa8bd',
+    'world_collision.py': '7cca8f390d108d768067b47fd56837a3b1ae280317cc0db924dd6a8c7f8bc89c',
 }
 PINNED_SERVER_SHA256 = {
     'server/lan_battle_server.py': '151af2f2ae839aa1017e3bd83fd01fb0dda62c03de9883330c9e38683935025a',
-    'server/server_bot_ai.py': 'fc4b697c450053e6202fe9cedf9ddbd181ea82f423c4a8dc1de1722ee770ff4b',
+    'server/server_bot_ai.py': '161561cc295f9b1459a13150669f3529c26944dd43ef325c4b4f66e0b8eba5d6',
 }
 
 # Every Python file in the working 0.8.2 offhangar tree is classified here.
@@ -918,7 +918,9 @@ def audit(repo_root):
     for required in ('def set_event_sink', 'def _publish_destroyed',
                      'def _decode_mat_info_1513',
                      '(collided, hitPt, surfNormal, matKind, fname,',
-                     'chunkID, itemIndex) = payload',
+                     'itemIndex, chunkID) = payload',
+                     'return hitPt, surfNormal, chunkID, itemIndex, '
+                     'matKind, fname',
                      "'destructible_kind'", 'shot_yaw, 12.0, True',
                      'if not _destr_ok:', 'if not _ok:',
                      '_object_pos = Math.Vector3(_tx, _ty, _tz)',

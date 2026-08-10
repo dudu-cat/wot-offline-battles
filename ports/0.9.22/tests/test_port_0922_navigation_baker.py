@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import shutil
 import struct
@@ -7,6 +8,7 @@ import tempfile
 import types
 import math
 import unittest
+import zipfile
 from pathlib import Path
 
 
@@ -25,6 +27,7 @@ def load_module(name):
 
 space = load_module('space_bin_0922')
 baker = load_module('bake_navigation_0922')
+packed = load_module('packed_xml')
 
 
 def section(name, version, offset, size, rows=0):
@@ -45,6 +48,96 @@ def compiled_space(sections):
 
 
 class CompiledSpace0922Test(unittest.TestCase):
+
+    def test_mature_navigation_baker_is_pinned_inside_the_port(self):
+        path = Path(baker.LEGACY_BAKER)
+        self.assertTrue(path.is_file())
+        self.assertEqual(
+            Path(baker.LEGACY_BASELINE_ROOT) / 'tools' /
+            'bake_navigation.py', path)
+        self.assertEqual(
+            baker.LEGACY_BAKER_SHA256,
+            hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual(
+            'f5b0173c296cd36753a5866ba5e6f2119e3edb25',
+            baker.LEGACY_BAKER_COMMIT)
+        self.assertEqual(7, len(baker.LEGACY_BASELINE_SHA256))
+        baseline_root = Path(baker.LEGACY_BASELINE_ROOT)
+        self.assertEqual(
+            set(baker.LEGACY_BASELINE_SHA256),
+            {str(path.relative_to(baseline_root))
+             for path in baseline_root.rglob('*') if path.is_file()})
+        for relative_path, digest in baker.LEGACY_BASELINE_SHA256.items():
+            baseline_path = baseline_root / Path(relative_path)
+            self.assertEqual(
+                digest, hashlib.sha256(baseline_path.read_bytes()).hexdigest())
+
+    @staticmethod
+    def _vehicle_chassis_visual(minimum, maximum):
+        bounds = packed.PackedElement(children=[
+            (b'min', packed.PackedValue(
+                packed.TYPE_VECTOR, struct.pack('<3f', *minimum))),
+            (b'max', packed.PackedValue(
+                packed.TYPE_VECTOR, struct.pack('<3f', *maximum))),
+        ])
+        root = packed.PackedElement(children=[
+            (b'boundingBox', packed.PackedValue(
+                packed.TYPE_ELEMENT, bounds)),
+        ])
+        return packed.write_packed_xml(root)
+
+    def test_vehicle_spawn_envelope_is_measured_from_pinned_chassis_bounds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            packages = Path(temporary) / 'res' / 'packages'
+            packages.mkdir(parents=True)
+            with zipfile.ZipFile(packages / 'vehicles_level_06.pkg', 'w') as archive:
+                archive.writestr(
+                    'vehicles/british/Long/collision_client/'
+                    'Chassis.visual_processed',
+                    self._vehicle_chassis_visual(
+                        (-1.4, 0.0, -5.46), (1.4, 1.6, 4.7)))
+            with zipfile.ZipFile(packages / 'vehicles_level_07.pkg', 'w') as archive:
+                archive.writestr(
+                    'vehicles/japan/Wide/collision_client/'
+                    'Chassis.visual_processed',
+                    self._vehicle_chassis_visual(
+                        (-2.24, 0.0, -4.9), (2.24, 1.7, 4.6)))
+            # HD render packages do not own the collision-client body and must
+            # not change the deterministic standard-resource measurement.
+            with zipfile.ZipFile(
+                    packages / 'vehicles_level_10_hd.pkg', 'w') as archive:
+                archive.writestr('ignored', b'')
+
+            envelope = baker.representative_vehicle_chassis_envelope(
+                temporary)
+
+        self.assertAlmostEqual(2.24, envelope['half_width'], places=5)
+        self.assertAlmostEqual(5.46, envelope['half_length'], places=5)
+        self.assertIn('/Wide/', envelope['width_source'])
+        self.assertIn('/Long/', envelope['length_source'])
+        self.assertEqual(2, envelope['resources_scanned'])
+
+    def test_spawn_clearance_uses_yaw_oriented_maximum_chassis_obb(self):
+        obstacles = types.SimpleNamespace(
+            raster_size=1.0, cells={(0, 4): [0.65, 2.4]})
+        legacy = types.SimpleNamespace(
+            VEHICLE_GROUND_CLEARANCE=0.65,
+            VEHICLE_CLEARANCE_HEIGHT=2.4)
+
+        self.assertTrue(baker.spawn_obstacle_obb_blocked(
+            obstacles, 0.0, 0.0, 0.0, 0.0, 2.24, 5.46, legacy))
+        self.assertFalse(baker.spawn_obstacle_obb_blocked(
+            obstacles, 0.0, 0.0, 0.0, math.pi / 2.0,
+            2.24, 5.46, legacy))
+
+    def test_spawn_clearance_rejects_overlapping_maximum_chassis_obbs(self):
+        first = (0.0, 0.0, 0.0, 0.0)
+        self.assertTrue(baker.spawn_obbs_overlap(
+            first, (0.0, 0.0, 10.0, 0.0), 2.24, 5.46))
+        self.assertFalse(baker.spawn_obbs_overlap(
+            first, (0.0, 0.0, 12.0, 0.0), 2.24, 5.46))
+        self.assertFalse(baker.spawn_obbs_overlap(
+            first, (14.0, 0.0, 0.0, 0.0), 2.24, 5.46))
 
     def test_real_ensk_graph_loads_with_0922_loader(self):
         graph = ROOT / 'ports' / '0.9.22' / 'navgraphs' / '06_ensk.json'
@@ -234,6 +327,26 @@ class CompiledSpace0922Test(unittest.TestCase):
                     validation['spawn_minimum_team_separation_metres'], 80.0)
                 self.assertLessEqual(
                     validation['spawn_maximum_projection_metres'], 32.0)
+                self.assertIs(
+                    True, validation['spawn_compiled_bsp_obb_clearance'])
+                self.assertIs(
+                    True, validation['spawn_pairwise_obb_clearance'])
+                self.assertAlmostEqual(
+                    2.239622,
+                    validation['spawn_vehicle_half_width_metres'], places=6)
+                self.assertAlmostEqual(
+                    5.462265,
+                    validation['spawn_vehicle_half_length_metres'], places=6)
+                self.assertEqual(
+                    534, validation['spawn_vehicle_resources_scanned'])
+                self.assertEqual(
+                    'vehicles/japan/J24_Mi_To_130_tons/collision_client/'
+                    'Chassis.visual_processed',
+                    validation['spawn_vehicle_width_source'])
+                self.assertEqual(
+                    'vehicles/british/GB63_TOG_II/collision_client/'
+                    'Chassis.visual_processed',
+                    validation['spawn_vehicle_length_source'])
                 self.assertNotIn(
                     'fallback', data['spawn_formation_source'].lower())
 

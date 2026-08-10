@@ -11,7 +11,7 @@ CLIENT_SCRIPTS = (
     ROOT / 'ports' / '0.9.22' / 'src' / 'res' / 'scripts' / 'client')
 sys.path.insert(0, str(CLIENT_SCRIPTS))
 
-from gui.mods.offline_lan_0922 import world_collision
+from gui.mods.offline_lan_0922 import destructibles_sensor, world_collision
 
 
 class _Vector(object):
@@ -102,7 +102,8 @@ class WorldCollisionTests(unittest.TestCase):
             if abs(start.y - end.y) > 10.0:
                 return (_Vector(start.x, 0.0, start.z),)
             return (_Vector(start.x, start.y,
-                            start.z + (end.z - start.z) * 0.5),)
+                            start.z + (end.z - start.z) * 0.5),
+                    _Vector(0.0, 0.0, -1.0), 0)
 
         bigworld = types.SimpleNamespace(
             wg_collideSegment=collide,
@@ -143,7 +144,8 @@ class WorldCollisionTests(unittest.TestCase):
             if abs(start.y - end.y) > 10.0:
                 return (_Vector(start.x, 0.0, start.z),)
             return (_Vector(start.x, start.y,
-                            start.z + (end.z - start.z) * 0.5),)
+                            start.z + (end.z - start.z) * 0.5),
+                    _Vector(0.0, 0.0, -1.0), 0)
 
         bigworld = types.SimpleNamespace(
             wg_collideSegment=collide,
@@ -157,6 +159,109 @@ class WorldCollisionTests(unittest.TestCase):
                 world_collision.check_horizontal_collision(
                     bigworld, math_module, 1, _Vector(), 0.0, 5.0,
                     None, False, 0.04)
+
+    def test_solid_contact_forwards_native_surface_normal(self):
+        surface_normal = _Vector(1.0, 0.0, 0.0)
+
+        def collide(unused_space, start, end, unused_mask):
+            if abs(start.y - end.y) > 10.0:
+                return (_Vector(start.x, 0.0, start.z),)
+            return (_Vector(start.x, start.y,
+                            start.z + (end.z - start.z) * 0.5),
+                    surface_normal, 75)
+
+        bigworld = types.SimpleNamespace(
+            wg_collideSegment=collide,
+            wg_getMatInfoNearPoint=_miss_mat_info_1513)
+        math_module = types.SimpleNamespace(Vector3=_Vector)
+        contacts = []
+
+        def destroy(unused_space, hit_point, normal, unused_yaw,
+                    unused_velocity):
+            contacts.append((hit_point, normal))
+            return True
+
+        with mock.patch.object(
+                world_collision, '_try_destroy_solid_hit',
+                side_effect=destroy):
+            blocked = world_collision.check_horizontal_collision(
+                bigworld, math_module, 1, _Vector(), 0.0, 5.0,
+                None, False, 0.04)
+
+        self.assertFalse(blocked)
+        self.assertTrue(contacts)
+        self.assertTrue(all(normal is surface_normal
+                            for unused_point, normal in contacts))
+
+    def test_ruinberg_fragile_truck_contact_reaches_native_authority(self):
+        """Connect the exact #1513 collision and material-hit boundaries."""
+        truck_filename = (
+            'content/Environment/env419_OldGTruck/normal/lod0/'
+            'env418_OldGMercedes_01.model')
+        surface_normal = _Vector(1.0, 0.0, 0.0)
+        material_calls = []
+        destroyed = set()
+        authority_calls = []
+
+        def collide(unused_space, start, end, unused_mask):
+            if abs(start.y - end.y) > 10.0:
+                return (_Vector(start.x, 0.0, start.z),)
+            return (_Vector(start.x, start.y,
+                            start.z + (end.z - start.z) * 0.5),
+                    surface_normal, 112)
+
+        def material_probe(unused_space, start, stop, point, unused_cb):
+            material_calls.append((start, stop, point))
+            # The independent centre-lane scan does not own a collision point.
+            # Only the stock point-normal*3 / point+normal*2 probe identifies
+            # this compiled type-2 Ruinberg prop.
+            if (abs((point.x - start.x) - 3.0) < 0.001 and
+                    abs((stop.x - point.x) - 2.0) < 0.001):
+                return (True, point, surface_normal, 73, truck_filename,
+                        37, 22)
+            return _miss_mat_info_1513()
+
+        bigworld = types.SimpleNamespace(
+            wg_collideSegment=collide,
+            wg_getMatInfoNearPoint=material_probe)
+        math_module = types.SimpleNamespace(Vector3=_Vector)
+        area = types.ModuleType('AreaDestructibles')
+        area.g_destructiblesManager = object()
+        area.DESTR_TYPE_TREE = 1
+        area.DESTR_TYPE_FALLING_ATOM = 2
+        area.DESTR_TYPE_FRAGILE = 3
+        area.DESTR_TYPE_STRUCTURE = 4
+        area.g_cache = types.SimpleNamespace(
+            getDescByFilename=lambda filename: (
+                {'type': area.DESTR_TYPE_FRAGILE, 'health': 19}
+                if filename == truck_filename else None))
+
+        def destroy_fragile(*args):
+            authority_calls.append(args)
+            destroyed.add((args[1], args[2]))
+            return True
+
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda chunk_id, item_index, *unused: (
+                (chunk_id, item_index) in destroyed),
+            destroy_fragile=destroy_fragile)
+
+        with mock.patch.dict(sys.modules, {'AreaDestructibles': area}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority), \
+                mock.patch.object(
+                    destructibles_sensor, '_event_sink',
+                    lambda unused_event: True):
+            blocked = world_collision.check_horizontal_collision(
+                bigworld, math_module, 1, _Vector(), 0.0, 5.0,
+                None, False, 0.04)
+
+        self.assertFalse(blocked)
+        self.assertTrue(material_calls)
+        self.assertEqual(1, len(authority_calls))
+        self.assertEqual((1, 22, 37), authority_calls[0][:3])
+        self.assertEqual(False, authority_calls[0][4])
 
 
 if __name__ == '__main__':

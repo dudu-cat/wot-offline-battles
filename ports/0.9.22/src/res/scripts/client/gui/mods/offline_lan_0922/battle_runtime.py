@@ -36,6 +36,12 @@ FRAME_SECONDS = 0.0
 AMMO_SECONDS = 0.10
 NETWORK_INPUT_SECONDS = 1.0 / 30.0
 RPM_PRESENTATION_SECONDS = 0.10
+# Bot tree/column enumeration is a proximity sensor, not presentation work.
+# The sensor looks 6 m ahead plus the admitted hull extent, while copied bot
+# speed is capped at 35 m/s.  Recheck within 0.10 s or 3 m of realised travel,
+# whichever comes first, so no moving hull can skip the contact volume.
+BOT_DESTRUCTIBLE_SECONDS = 0.10
+BOT_DESTRUCTIBLE_TRAVEL_METRES = 3.0
 CRITICAL_REPAIR_NETWORK_SECONDS = 1.0
 STANDARD_GAMEPLAY = 'ctf'
 PREBATTLE_SECONDS = 15.0
@@ -140,6 +146,7 @@ def _load_runtime():
     import constants
     import game
     import nations
+    from Avatar import ClientVisibilityFlags
     from OfflineMapCreator import g_offlineMapCreator
     from gun_rotation_shared import encodeGunAngles
     from gui.app_loader import g_appLoader
@@ -159,7 +166,9 @@ def _load_runtime():
     runtime.avatar_input_handler = AvatarInputHandler
     runtime.app_loader = g_appLoader
     runtime.arena_cache = ArenaType.g_cache
+    runtime.arena_visibility_mask = ArenaType.getVisibilityMask
     runtime.bigworld = BigWorld
+    runtime.client_visibility_flags = ClientVisibilityFlags
     runtime.battle_feedback_common = BattleFeedbackCommon
     runtime.compatibility = g_compatibility
     runtime.constants = constants
@@ -320,6 +329,7 @@ class BattleRuntime(object):
         self._client_ready_received = False
         self._local_descriptor = None
         self._bot_fire_seen = {}
+        self._bot_destructible_samples = {}
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
         self._local_push_x = 0.0
@@ -425,6 +435,7 @@ class BattleRuntime(object):
         self._client_ready_received = False
         self._local_descriptor = None
         self._bot_fire_seen = {}
+        self._bot_destructible_samples = {}
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
         self._local_push_x = 0.0
@@ -540,6 +551,7 @@ class BattleRuntime(object):
             self._avatar = self._runtime.bigworld.player()
             if self._avatar is None:
                 raise RuntimeError('stock OfflineMapCreator created no Avatar')
+            self._configure_standard_space_visibility()
             if not getattr(
                     self._avatar, '_offlineLANInitComplete', False):
                 raise RuntimeError(
@@ -802,6 +814,46 @@ class BattleRuntime(object):
                     STANDARD_GAMEPLAY):
                 return arena_type
         return None
+
+    def _configure_standard_space_visibility(self):
+        """Install the selected gameplay bit normally supplied by the server."""
+        bigworld = self._runtime.bigworld
+        get_mask = getattr(
+            bigworld, 'wg_getSpaceItemsVisibilityMask', None)
+        set_mask = getattr(
+            bigworld, 'wg_setSpaceItemsVisibilityMask', None)
+        visibility = getattr(
+            self._runtime, 'client_visibility_flags', None)
+        gameplay_mask = getattr(
+            self._runtime, 'arena_visibility_mask', None)
+        if (not callable(get_mask) or not callable(set_mask) or
+                visibility is None or not callable(gameplay_mask)):
+            raise RuntimeError(
+                '#1513 space visibility boundary is unavailable')
+        try:
+            # These are unsigned 32-bit masks.  CLIENT_MASK is a Python long
+            # in the 32-bit #1513 client and cannot be narrowed through int().
+            client_bits = visibility.CLIENT_MASK
+            server_bits = visibility.SERVER_MASK
+            gameplay_id = int(self._arena_type.gameplayID)
+            selected_bit = gameplay_mask(gameplay_id)
+            existing = get_mask(self._avatar.spaceID)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            raise RuntimeError(
+                '#1513 space visibility contract is invalid')
+        if (client_bits & server_bits or
+                (client_bits | server_bits) != 0xffffffff or
+                selected_bit <= 0 or selected_bit & (selected_bit - 1) or
+                selected_bit & ~server_bits):
+            raise RuntimeError(
+                '#1513 gameplay visibility mask is invalid')
+        expected = (existing & client_bits) | selected_bit
+        set_mask(self._avatar.spaceID, expected)
+        actual = get_mask(self._avatar.spaceID)
+        if actual != expected:
+            raise RuntimeError(
+                '#1513 gameplay visibility mask was not applied')
+        return expected
 
     def _clock(self):
         function = getattr(self._runtime.bigworld, 'time', None)
@@ -3015,6 +3067,15 @@ class BattleRuntime(object):
         target_team = self._combat_record_team(target_record)
         attacker_team = self._combat_record_team(attacker_record)
         enemy = target_team != attacker_team
+        if attacker_record.get('local') and enemy:
+            assert_damage_type = getattr(
+                self._runtime.compatibility,
+                'assert_vehicle_marker_damage_type', None)
+            if not callable(assert_damage_type):
+                raise RuntimeError(
+                    '#1513 vehicle-marker damage boundary is unavailable')
+            assert_damage_type(
+                self._avatar, int(attacker_record['engine_id']))
         output = []
         if attacker_record.get('local') and enemy:
             target_id = int(target_record['engine_id'])
@@ -4389,9 +4450,39 @@ class BattleRuntime(object):
             self._input_accumulator = 0.0
             self._sender.send_current()
 
+    def _bot_destructible_scan_due(self, state, now):
+        """Rate-limit proximity enumeration without skipping hull travel."""
+        bot_id = int(state['id'])
+        if abs(_number(state.get('speed'))) < 1.0:
+            self._bot_destructible_samples.pop(bot_id, None)
+            return False
+        position = (_number(state.get('x')), _number(state.get('y')),
+                    _number(state.get('z')))
+        previous = self._bot_destructible_samples.get(bot_id)
+        if previous is not None:
+            deadline, sampled_position = previous
+            if (float(now) < float(deadline) and
+                    _distance_2d(position, sampled_position) <
+                    BOT_DESTRUCTIBLE_TRAVEL_METRES):
+                return False
+            deadline = float(now) + BOT_DESTRUCTIBLE_SECONDS
+        else:
+            # Schedule the first enumeration instead of making all 29 bots
+            # scan on the materialisation frame.  The 6 m forward sensor and
+            # 3 m travel trigger keep the hull inside its contact volume while
+            # this phase elapses.  The +1 caps the largest phase at 0.10 s.
+            phase = (((abs(bot_id) * 17 + 5 * 11) % 29) + 1) / 29.0
+            deadline = float(now) + BOT_DESTRUCTIBLE_SECONDS * phase
+            self._bot_destructible_samples[bot_id] = (
+                deadline, position)
+            return False
+        self._bot_destructible_samples[bot_id] = (deadline, position)
+        return True
+
     def _apply_authority_bot_poses(self, states):
         """Present copied 0.8.2 bot poses through the remote filter."""
         applied = False
+        now = self._clock()
         for state in states:
             if not isinstance(state, dict) or state.get('id') is None:
                 continue
@@ -4404,7 +4495,8 @@ class BattleRuntime(object):
             position = self._vector((
                 x, y, z))
             yaw = _number(state.get('yaw'))
-            if self._destructibles is not None:
+            if (self._destructibles is not None and
+                    self._bot_destructible_scan_due(state, now)):
                 entity = self._server_entity(record['engine_id'])
                 descriptor = getattr(entity, 'typeDescriptor', None)
                 if descriptor is None:
@@ -5649,6 +5741,7 @@ class BattleRuntime(object):
         self._local_descriptor = None
         self._vehicle_ready_deadline = 0.0
         self._bot_fire_seen = {}
+        self._bot_destructible_samples = {}
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
         self._local_push_x = 0.0

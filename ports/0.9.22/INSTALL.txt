@@ -1,4 +1,4 @@
-World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.49
+World of Tanks 0.9.22.0.1 #1513 LAN/offline package 0.3.50
 ================================================================
 
 This folder is directly mergeable into the frozen Chinese HD client root.
@@ -18,7 +18,7 @@ client pins an empty server room to one build; a legacy 0.8.2 client cannot join
 that room because its map and coordinate contracts are different. Use another
 server port for a simultaneous 0.8.2 room.
 
-Version 0.3.49 retains the local gun/shot, collision, spotting and foliage
+Version 0.3.50 retains the local gun/shot, collision, spotting and foliage
 fixes. It installs one live pose before native input startup for camera, gun,
 sniper and minimap consumers; hides unspotted/dead private entities from native
 aiming and projectile lookup; restores RPM presentation; and renders admitted
@@ -31,7 +31,7 @@ Bot collision now uses the
 measured 0.8.2 spatial broadphase;
 planning is staggered near 10 Hz while physics, gun and local presentation
 advance every rendered frame; canonical network publication remains capped at
-30 Hz. Version 0.3.49 also gives every Bot its own spawn-route join,
+30 Hz. Version 0.3.50 also gives every Bot its own spawn-route join,
 keeps visible enemies as approach targets even before a firing lane opens,
 uses per-Bot firing evidence for actual shots, restores player/Bot contact
 destruction for trees and fragile props, and separates shot/fire/ram feedback
@@ -47,6 +47,11 @@ and owns each synthetic descriptor's BSP hit testers before Bot geometry is
 read, rejecting an unloaded bbox instead of substituting a default tank body.
 It decodes the pinned #1513 seven-field material-hit result, including its
 explicit no-hit flag, before applying the copied 0.8.2 destructible contact law.
+All 41 spawn formations are validated against compiled map BSP with the
+largest #1513 chassis footprint. Standard battles expose only the selected CTF
+space objects, Bot sensing no longer scales with render FPS, solid-contact
+destruction preserves the native item/chunk order, and marker startup rolls
+back partial subscriptions instead of retaining a zero player identity.
 Do not mix it with an older
 0.9.22 wotmod.
 
@@ -63,7 +68,7 @@ Install
 3. Copy this folder's `mods` directory into the game root.
 4. Confirm this file exists:
 
-       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.49.wotmod
+       <game root>\mods\0.9.22.0.1\org.peng.offline_lan_0922_0.3.50.wotmod
 
 5. This copy-ready package includes:
 
@@ -131,7 +136,7 @@ Troubleshooting
 ---------------
 
 - `unsupported compression type`: an older or incorrectly compressed wotmod
-  is still present. Keep only the 0.3.49 package; its members use Store method.
+  is still present. Keep only the 0.3.50 package; its members use Store method.
 - No connection in the server terminal: check `config.json`, the host LAN IP,
   virtual-machine network mode and TCP 28782 firewall access. A failed attempt
   automatically opens the native endpoint editor; Battle! can reopen it.

@@ -510,6 +510,107 @@ class BotRuntimeTests(unittest.TestCase):
                 self.assertLessEqual(publications, 61)
                 self.assertEqual(publications, last_ack)
 
+    def test_29_bot_sensing_budget_is_render_rate_independent(self):
+        command = {
+            'target_yaw': 0.0, 'throttle': 1.0, 'turn': 0.0,
+            'shell_index': 0, 'fire_allowed': False, 'target_id': None,
+            'fire_range': 0.0, 'combat_mode': 'route',
+            'aim_position': (0.0, 0.0, 200.0),
+            'face_position': (0.0, 0.0, 200.0),
+            'move_position': (0.0, 0.0, 200.0),
+            'recovery_mode': 'drive', 'movement_intent': True,
+        }
+        roster = [
+            {'id': 11 + index,
+             'team': 1 if index < 14 else 2,
+             'slot': index if index < 14 else index - 14,
+             'name': 'Mover-%d' % index}
+            for index in range(29)
+        ]
+        probe_totals = {}
+        for fps in (40, 60, 120):
+            with self.subTest(fps=fps):
+                frame_number = [0]
+                probe_frames = []
+
+                def direction_probe(*unused):
+                    probe_frames.append(frame_number[0])
+                    return {'clear': True, 'slope': 0.0}
+
+                runtime = self.module.BotRuntime(
+                    1, descriptor_resolver=lambda unused: _combat_descriptor(),
+                    adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                        command),
+                    direction_probe=direction_probe,
+                    ground_probe=lambda *unused: 0.0,
+                    physics_ground_probe=lambda *unused: 0.0,
+                    spawn_resolver=_spawn_resolver, baked_graph=_graph())
+                runtime.battle_start(dict(self.start, bots=roster))
+                previous = None
+                changed = 0
+                publications = []
+                dt = 1.0 / float(fps)
+                for frame in range(fps * 2):
+                    frame_number[0] = frame
+                    outgoing = runtime.update(
+                        dt, 10.0 + (frame + 1) * dt)
+                    poses = tuple(
+                        (state['id'], state['x'], state['y'], state['z'],
+                         state['yaw'])
+                        for state in runtime.presentation_states())
+                    if previous is not None:
+                        self.assertTrue(all(
+                            poses[index] != previous[index]
+                            for index in range(29)))
+                        changed += 29
+                    previous = poses
+                    publications.extend(
+                        message for message in outgoing
+                        if message.get('type') == 'bot_state')
+
+                self.assertEqual(29 * (fps * 2 - 1), changed)
+                self.assertGreaterEqual(len(publications), 59)
+                self.assertLessEqual(len(publications), 61)
+                self.assertTrue(all(
+                    len(message['bots']) == 29
+                    for message in publications))
+                # Planner clear(state.yaw) and copied physics consume one raw
+                # sample when they select the same heading in the same frame.
+                self.assertEqual(29, probe_frames.count(0))
+                later_counts = [probe_frames.count(frame)
+                                for frame in range(1, fps * 2)]
+                self.assertLess(max(later_counts), 29)
+                maximum_per_bot = (
+                    4 + 2 * int(math.ceil(
+                        2.0 / self.module.DECISION_SECONDS)))
+                self.assertLessEqual(
+                    len(probe_frames), 29 * maximum_per_bot)
+                probe_totals[fps] = len(probe_frames)
+
+        # More render callbacks integrate more poses, not more native sensing.
+        self.assertLessEqual(
+            max(probe_totals.values()) - min(probe_totals.values()), 29 * 4)
+
+    def test_cached_motion_probe_has_explicit_corridor_safety_bounds(self):
+        cached = {
+            'result': {'clear': True, 'slope': 0.0},
+            'position': (0.0, 0.0, 0.0), 'yaw': 0.0,
+            'deadline': 1.0975,
+        }
+        reusable = self.module.BotRuntime._motion_probe_reusable
+
+        self.assertTrue(reusable(
+            cached, (0.0, 0.0, 3.4), 0.0, 35.0, 1.09))
+        self.assertFalse(reusable(
+            cached, (0.0, 0.0, 3.51), 0.0, 35.0, 1.09))
+        self.assertFalse(reusable(
+            cached, (1.01, 0.0, 0.0), 0.0, 0.0, 1.09))
+        self.assertFalse(reusable(
+            cached, (0.0, 0.0, 0.0),
+            math.asin(1.01 / 15.0), 0.0, 1.09))
+        self.assertFalse(reusable(
+            cached, (0.0, 0.0, 0.0), 0.0, 0.0, 1.0975))
+
     def test_reverse_recovery_uses_driver_turn_sign_not_target_bearing(self):
         command = {
             'target_yaw': 1.0, 'throttle': -0.72, 'turn': -1.0,
@@ -1985,6 +2086,75 @@ class BotRuntimeTests(unittest.TestCase):
             runtime.update(.06, 1.21 + index * .21, players=[enemy])
         self.assertEqual(0, runtime.states[11]['fire_seq'])
         self.assertGreater(runtime.states[12]['fire_seq'], 0)
+
+    def test_close_support_order_holds_limited_traverse_bot_until_reload_fires(self):
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(
+                reload_time=8.0, clip=(1,),
+                turret_yaw_limits=(-0.1, 0.1)),
+            direction_probe=lambda *unused: {
+                'clear': True, 'slope': 0.0},
+            visibility_probe=lambda *unused: True,
+            firing_lane_probe=lambda *unused: True,
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        profile = {
+            'dominant_role': 'support', 'desired_range': 200.0,
+            'fire_range': 500.0, 'roles': {'support': 1.0},
+        }
+        manifest = runtime.battle_start(dict(self.start, bots=[{
+            'id': 11, 'team': 1, 'slot': 0, 'name': 'Limited TD',
+            'profile': profile,
+        }]))[0]['bots']
+        state = runtime.states[11]
+        state.update(x=0.0, y=0.0, z=0.0, yaw=0.0,
+                     aim_yaw=0.0, speed=0.0)
+        manifest[0]['route'] = {
+            'id': 'support_lane', 'waypoints': [
+                {'x': 0.0, 'y': 0.0, 'z': -120.0},
+                {'x': 0.0, 'y': 0.0, 'z': 300.0},
+            ],
+        }
+        enemy = {
+            'id': 2, 'team': 2, 'alive': True,
+            'x': 0.0, 'y': 0.0, 'z': 20.0,
+            'health': 1000, 'max_health': 1000,
+        }
+        planner = BotPlanner()
+        bot_states = [dict(state)]
+        self.assertEqual(1, planner.report_contacts([{
+            'observing_team': 1, 'target_kind': 'human',
+            'target_id': 2, 'target_team': 2,
+            'visible': True, 'shootable_by_bot_ids': [11],
+            'x': 0.0, 'y': 0.0, 'z': 20.0,
+            'health': 1000, 'max_health': 1000,
+        }], planner.known_targets(bot_states, [enemy]), 1.0))
+        payload = planner.build_orders(
+            manifest, bot_states, [enemy], 1.0)
+        order = payload['orders'][0]
+
+        self.assertEqual('engage', order['combat_mode'])
+        self.assertEqual(0.0, order['throttle_override'])
+        self.assertEqual({'x': 0.0, 'y': 0.0, 'z': 0.0},
+                         order['move_position'])
+        runtime.apply_snapshot({
+            'bot_order_revision': payload['revision'],
+            'bot_orders': payload['orders'], 'bots': [],
+        })
+
+        yaws = []
+        turns = []
+        for frame in range(750):
+            runtime.update(0.02, 1.0 + frame * 0.02,
+                           players=[enemy])
+            yaws.append(runtime.states[11]['yaw'])
+            turns.append(runtime.states[11]['rotation_dir'])
+
+        self.assertEqual({0}, set(turns))
+        self.assertLess(max(abs(value) for value in yaws), 0.001)
+        self.assertTrue(runtime.states[11]['gun_aligned'])
+        self.assertGreaterEqual(runtime.states[11]['fire_seq'], 1)
 
     def test_proximity_spot_through_wall_publishes_explicit_unshootable_list(self):
         runtime = self.module.BotRuntime(

@@ -233,7 +233,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.49</version></root>')
+            '<version>0.3.50</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -1245,7 +1245,10 @@ class OfflineCompatibilityTests(unittest.TestCase):
 
         arena_dp = types.SimpleNamespace(
             player_vehicle_id=0,
-            getPlayerVehicleID=lambda: arena_dp.player_vehicle_id)
+            getPlayerVehicleID=lambda: arena_dp.player_vehicle_id,
+            isRequiredDataExists=lambda: True,
+            getVehicleInfo=lambda vehicle_id: types.SimpleNamespace(
+                vehicleID=int(vehicle_id), team=1))
         plugin = marker_type(arena_dp)
         plugin.start()
         self.assertEqual(
@@ -1259,10 +1262,15 @@ class OfflineCompatibilityTests(unittest.TestCase):
             91, plugin._VehicleMarkerPlugin__playerVehicleID)
         self.assertEqual('from-player', plugin.getVehicleDamageType(91))
         self.assertTrue(compatibility.assert_vehicle_marker_identity(91))
+        avatar = types.SimpleNamespace(
+            guiSessionProvider=plugin.sessionProvider)
+        self.assertTrue(compatibility.assert_vehicle_marker_damage_type(
+            avatar, 91))
 
         old_plugin = weakref.ref(plugin)
         plugin.stop()
         self.assertEqual({}, compatibility._vehicle_marker_plugins)
+        del avatar
         del plugin
         gc.collect()
         self.assertIsNone(old_plugin())
@@ -1271,7 +1279,11 @@ class OfflineCompatibilityTests(unittest.TestCase):
         compatibility.configure_battle()
         next_arena_dp = types.SimpleNamespace(
             player_vehicle_id=92,
-            getPlayerVehicleID=lambda: next_arena_dp.player_vehicle_id)
+            getPlayerVehicleID=lambda force=False:
+                next_arena_dp.player_vehicle_id,
+            isRequiredDataExists=lambda: True,
+            getVehicleInfo=lambda vehicle_id: types.SimpleNamespace(
+                vehicleID=int(vehicle_id), team=1))
         self.assertTrue(
             compatibility.synchronise_vehicle_marker_identity(92))
         next_plugin = marker_type(next_arena_dp)
@@ -1293,6 +1305,280 @@ class OfflineCompatibilityTests(unittest.TestCase):
         compatibility.fini()
         self.assertIs(original_start, marker_type.__dict__['start'])
         self.assertIs(original_stop, marker_type.__dict__['stop'])
+
+    def test_active_marker_provider_chain_classifies_local_hit_from_player(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        arena_dp = types.SimpleNamespace(
+            player_vehicle_id=91,
+            getPlayerVehicleID=lambda force=False: arena_dp.player_vehicle_id,
+            isRequiredDataExists=lambda: True,
+            getVehicleInfo=lambda vehicle_id: types.SimpleNamespace(
+                vehicleID=int(vehicle_id), team=1))
+        plugin = runtime.vehicle_marker_plugin_type(arena_dp)
+        plugin.start()
+        emitted = []
+
+        class FeedbackAdaptor(object):
+            def __init__(self):
+                setattr(self, '_BattleFeedbackAdaptor__arenaDP', arena_dp)
+
+            def setVehicleNewHealth(self, vehicle_id, health,
+                                    attacker_id, reason_id):
+                self._setVehicleHealthChanged(
+                    vehicle_id, health, attacker_id, reason_id)
+
+            def _setVehicleHealthChanged(self, vehicle_id, health,
+                                         attacker_id, reason_id):
+                attacker_info = (arena_dp.getVehicleInfo(attacker_id)
+                                 if attacker_id else None)
+                value = (health, attacker_info, reason_id)
+                emitted.append(('vehicle-health', vehicle_id, value))
+                handler = getattr(
+                    plugin,
+                    '_VehicleMarkerPlugin__onVehicleFeedbackReceived')
+                handler('vehicle-health', vehicle_id, value)
+
+        class SessionProvider(object):
+            def __init__(self, feedback):
+                self.feedback = feedback
+                setattr(
+                    self, '_BattleSessionProvider__sharedRepo',
+                    types.SimpleNamespace(feedback=feedback))
+
+            def getArenaDP(self):
+                return arena_dp
+
+            def setVehicleHealth(self, is_player, vehicle_id, health,
+                                 attacker_id, reason_id):
+                if not is_player:
+                    self.feedback.setVehicleNewHealth(
+                        vehicle_id, health, attacker_id, reason_id)
+
+        provider = SessionProvider(FeedbackAdaptor())
+        plugin.sessionProvider = provider
+        avatar = types.SimpleNamespace(guiSessionProvider=provider)
+
+        self.assertTrue(
+            compatibility.synchronise_vehicle_marker_identity(91))
+        self.assertEqual(
+            [plugin],
+            list(compatibility._vehicle_marker_plugins.values()))
+        self.assertTrue(compatibility.assert_vehicle_marker_damage_type(
+            avatar, 91))
+        provider.setVehicleHealth(False, 2001, 450, 91, 0)
+
+        self.assertEqual(1, len(emitted))
+        self.assertEqual('vehicle-health', emitted[0][0])
+        self.assertEqual(2001, emitted[0][1])
+        self.assertEqual(450, emitted[0][2][0])
+        self.assertEqual(91, emitted[0][2][1].vehicleID)
+        self.assertEqual(0, emitted[0][2][2])
+        self.assertEqual([
+            (2001, 'updateHealth', 450,
+             runtime.vehicle_marker_damage_type.FROM_PLAYER, 'shot')],
+            plugin.marker_updates)
+        plugin.stop()
+        compatibility.fini()
+
+    def test_late_marker_start_rolls_back_stale_native_cache(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        marker_type = runtime.vehicle_marker_plugin_type
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        arena_dp = types.SimpleNamespace(
+            player_vehicle_id=91,
+            getPlayerVehicleID=lambda force=False: arena_dp.player_vehicle_id,
+            isRequiredDataExists=lambda: True,
+            getVehicleInfo=lambda vehicle_id: types.SimpleNamespace(
+                vehicleID=int(vehicle_id), team=1))
+        self.assertTrue(
+            compatibility.synchronise_vehicle_marker_identity(91))
+        original_start = compatibility._original_vehicle_marker_start
+
+        def stale_native_start(plugin):
+            result = original_start(plugin)
+            plugin._VehicleMarkerPlugin__playerVehicleID = 0
+            return result
+
+        compatibility._original_vehicle_marker_start = stale_native_start
+        plugin = marker_type(arena_dp)
+        provider = plugin.sessionProvider
+        plugin._markers[1] = object()
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'captured a stale player identity'):
+            plugin.start()
+
+        self.assertEqual({}, compatibility._vehicle_marker_plugins)
+        self.assertNotIn(plugin, provider.arena_controllers)
+        self.assertEqual({}, plugin._markers)
+        self.assertEqual(
+            [('vehicle_marker_start',), ('vehicle_marker_stop',)],
+            [item for item in operations
+             if item[0].startswith('vehicle_marker_')])
+        compatibility.fini()
+
+    def test_partial_native_marker_start_rolls_back_and_preserves_error(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        marker_type = runtime.vehicle_marker_plugin_type
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        arena_dp = types.SimpleNamespace(
+            player_vehicle_id=91,
+            getPlayerVehicleID=lambda force=False: arena_dp.player_vehicle_id,
+            isRequiredDataExists=lambda: True,
+            getVehicleInfo=lambda vehicle_id: types.SimpleNamespace(
+                vehicleID=int(vehicle_id), team=1))
+        self.assertTrue(
+            compatibility.synchronise_vehicle_marker_identity(91))
+        plugin = marker_type(arena_dp)
+        provider = plugin.sessionProvider
+
+        def partial_native_start(target):
+            target.sessionProvider.addArenaCtrl(target)
+            target._markers[1] = object()
+            raise ValueError('native marker start failed')
+
+        compatibility._original_vehicle_marker_start = partial_native_start
+
+        with self.assertRaisesRegex(ValueError, 'native marker start failed'):
+            plugin.start()
+
+        self.assertNotIn(plugin, provider.arena_controllers)
+        self.assertEqual({}, plugin._markers)
+        self.assertEqual({}, compatibility._vehicle_marker_plugins)
+        self.assertEqual(
+            [('vehicle_marker_stop',)],
+            [item for item in operations
+             if item[0].startswith('vehicle_marker_')])
+        compatibility.fini()
+
+    def test_late_marker_start_refreshes_arena_before_native_start(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        marker_type = runtime.vehicle_marker_plugin_type
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        refreshes = []
+        arena_dp = types.SimpleNamespace(player_vehicle_id=0)
+
+        def required():
+            refreshes.append(arena_dp.player_vehicle_id)
+            arena_dp.player_vehicle_id = 91
+            return True
+
+        arena_dp.isRequiredDataExists = required
+        arena_dp.getPlayerVehicleID = (
+            lambda force=False: arena_dp.player_vehicle_id)
+        arena_dp.getVehicleInfo = (
+            lambda vehicle_id: types.SimpleNamespace(
+                vehicleID=int(vehicle_id), team=1))
+        self.assertTrue(
+            compatibility.synchronise_vehicle_marker_identity(91))
+
+        plugin = marker_type(arena_dp)
+        plugin.start()
+
+        self.assertEqual([0], refreshes)
+        self.assertEqual(
+            91, plugin._VehicleMarkerPlugin__playerVehicleID)
+        self.assertEqual('from-player', plugin.getVehicleDamageType(91))
+        self.assertEqual(
+            [plugin],
+            list(compatibility._vehicle_marker_plugins.values()))
+        self.assertEqual(
+            [('vehicle_marker_start',)],
+            [item for item in operations
+             if item[0].startswith('vehicle_marker_')])
+        plugin.stop()
+        compatibility.fini()
+
+    def test_late_marker_start_rejects_stale_arena_before_native_start(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        marker_type = runtime.vehicle_marker_plugin_type
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        self.assertTrue(
+            compatibility.synchronise_vehicle_marker_identity(91))
+        arena_dp = types.SimpleNamespace(
+            player_vehicle_id=0,
+            getPlayerVehicleID=lambda force=False: arena_dp.player_vehicle_id,
+            isRequiredDataExists=lambda: False,
+            getVehicleInfo=lambda vehicle_id: types.SimpleNamespace(
+                vehicleID=int(vehicle_id), team=1))
+        plugin = marker_type(arena_dp)
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'ArenaDP identity is incomplete before start'):
+            plugin.start()
+
+        self.assertEqual({}, compatibility._vehicle_marker_plugins)
+        self.assertEqual(
+            [], [item for item in operations
+                 if item[0].startswith('vehicle_marker_')])
+        compatibility.fini()
+
+    def test_marker_damage_boundary_rejects_no_active_plugin(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        arena_dp = types.SimpleNamespace(
+            getVehicleInfo=lambda vehicle_id: types.SimpleNamespace(
+                vehicleID=int(vehicle_id), team=1))
+        avatar = types.SimpleNamespace(
+            guiSessionProvider=types.SimpleNamespace(
+                getArenaDP=lambda: arena_dp))
+        self.assertTrue(
+            compatibility.synchronise_vehicle_marker_identity(91))
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'active vehicle-marker plugin'):
+            compatibility.assert_vehicle_marker_damage_type(avatar, 91)
+
+        compatibility.fini()
+
+    def test_respawnable_marker_super_lifecycle_registers_real_instance(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        arena_dp = types.SimpleNamespace(
+            player_vehicle_id=91,
+            getPlayerVehicleID=lambda force=False: arena_dp.player_vehicle_id,
+            isRequiredDataExists=lambda: True,
+            getVehicleInfo=lambda vehicle_id: types.SimpleNamespace(
+                vehicleID=int(vehicle_id), team=1))
+
+        class RespawnableVehicleMarkerPlugin(
+                runtime.vehicle_marker_plugin_type):
+            def start(self):
+                return super(RespawnableVehicleMarkerPlugin, self).start()
+
+            def stop(self):
+                return super(RespawnableVehicleMarkerPlugin, self).stop()
+
+        plugin = RespawnableVehicleMarkerPlugin(arena_dp)
+        plugin.start()
+        self.assertEqual(
+            [plugin],
+            list(compatibility._vehicle_marker_plugins.values()))
+        self.assertTrue(
+            compatibility.synchronise_vehicle_marker_identity(91))
+        avatar = types.SimpleNamespace(
+            guiSessionProvider=plugin.sessionProvider)
+        self.assertTrue(compatibility.assert_vehicle_marker_damage_type(
+            avatar, 91))
+
+        plugin.stop()
+        self.assertEqual({}, compatibility._vehicle_marker_plugins)
+        compatibility.fini()
 
     def test_marker_identity_sync_rejects_a_missing_native_cache(self):
         compatibility_module = _load_port_source('compat')
@@ -1738,24 +2024,66 @@ class OfflineCompatibilityTests(unittest.TestCase):
             def getAvatarOwnVehicleStabilisedMatrix(self, vehicle):
                 return vehicle.filter.interpolateStabilisedMatrix(123.0)
 
+        marker_damage_types = types.SimpleNamespace(
+            FROM_UNKNOWN='from-unknown', FROM_PLAYER='from-player',
+            FROM_SQUAD='from-squad', FROM_ALLY='from-ally',
+            FROM_ENEMY='from-enemy')
+        marker_attack_reasons = ('shot', 'fire', 'ramming')
+
         class VehicleMarkerPlugin(object):
             def __init__(self, arena_dp):
                 self.arena_dp = arena_dp
+                self._markers = {}
+                self.marker_updates = []
+                feedback = types.SimpleNamespace()
+                setattr(
+                    feedback, '_BattleFeedbackAdaptor__arenaDP',
+                    self.arena_dp)
+                self.sessionProvider = types.SimpleNamespace(
+                    getArenaDP=lambda: self.arena_dp,
+                    setVehicleHealth=lambda *unused: None,
+                    arena_controllers=weakref.WeakSet())
+                self.sessionProvider.addArenaCtrl = lambda controller: \
+                    self.sessionProvider.arena_controllers.add(controller)
+                self.sessionProvider.removeArenaCtrl = lambda controller: \
+                    self.sessionProvider.arena_controllers.discard(controller)
+                setattr(
+                    self.sessionProvider,
+                    '_BattleSessionProvider__sharedRepo',
+                    types.SimpleNamespace(feedback=feedback))
                 self._VehicleMarkerPlugin__playerVehicleID = 0
 
             def start(self):
                 self._VehicleMarkerPlugin__playerVehicleID = \
                     self.arena_dp.getPlayerVehicleID()
+                self.sessionProvider.addArenaCtrl(self)
                 operations.append(('vehicle_marker_start',))
 
             def stop(self):
+                self._markers.clear()
                 operations.append(('vehicle_marker_stop',))
 
-            def getVehicleDamageType(self, attacker_id):
-                if (attacker_id ==
+            def __getVehicleDamageType(self, attacker_info):
+                if (attacker_info.vehicleID ==
                         self._VehicleMarkerPlugin__playerVehicleID):
-                    return 'from-player'
-                return 'from-ally'
+                    return marker_damage_types.FROM_PLAYER
+                return marker_damage_types.FROM_ALLY
+
+            def getVehicleDamageType(self, attacker_id):
+                return self.__getVehicleDamageType(types.SimpleNamespace(
+                    vehicleID=int(attacker_id), team=1))
+
+            def __updateVehicleHealth(self, handle, new_health,
+                                      attacker_info, reason_id):
+                self.marker_updates.append((
+                    handle, 'updateHealth', new_health,
+                    self.__getVehicleDamageType(attacker_info),
+                    marker_attack_reasons[reason_id]))
+
+            def __onVehicleFeedbackReceived(self, event_id, vehicle_id,
+                                            value):
+                if event_id == 'vehicle-health':
+                    self.__updateVehicleHealth(vehicle_id, *value)
 
         account_module = types.SimpleNamespace(
             PlayerAccount=PlayerAccount,
@@ -1809,6 +2137,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
             math=types.SimpleNamespace(Vector3=_Vector3),
             vehicle_module=types.SimpleNamespace(Vehicle=Vehicle),
             vehicle_marker_plugin_type=VehicleMarkerPlugin,
+            vehicle_marker_damage_type=marker_damage_types,
             vehicle_gun_rotator=types.SimpleNamespace(
                 VehicleGunRotator=VehicleGunRotator))
         return runtime, operations
@@ -3902,7 +4231,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.49'
+        package.PORT_VERSION = '0.3.50'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []

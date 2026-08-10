@@ -13,6 +13,8 @@ def _decode_mat_info_1513(payload):
 
 	The older engine returned six values and used ``None`` for a miss.  #1513
 	always returns seven values and carries the hit/miss bit in element zero.
+	Its native tail is ``(itemIndex, chunkID)``; the canonical copied law below
+	still consumes ``(chunkID, itemIndex)``.
 	Keeping that translation here lets the copied contact law retain its mature
 	internal field order without guessing at the native tuple shape.
 	"""
@@ -25,7 +27,7 @@ def _decode_mat_info_1513(payload):
 			'#1513 wg_getMatInfoNearPoint payload must contain 7 items; got %d' %
 			width)
 	(collided, hitPt, surfNormal, matKind, fname,
-	 chunkID, itemIndex) = payload
+	 itemIndex, chunkID) = payload
 	if type(collided) is not bool:
 		raise RuntimeError(
 			'#1513 wg_getMatInfoNearPoint collided flag must be bool')
@@ -320,23 +322,22 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 		raise
 
 
-def _try_destroy_solid_hit(spaceID, seg_start, hit_pt, yaw, vel):
-	# wg_collideSegment returns no material info: probe the hit point for a
-	# destructible (fence/wall segment) before treating it as solid
+def _try_destroy_solid_hit(spaceID, hit_pt, surf_normal, yaw, vel):
+	# wg_collideSegment does not return the descriptor filename needed by the
+	# copied contact law, so probe the hit point for a destructible before
+	# treating it as solid.  Its second result item is the #1513 surface normal;
+	# the stock material calculator probes across that normal, not along the
+	# incoming movement.
 	import BigWorld
 	try:
-		# Probe along the SURFACE NORMAL like Vehicle.onStaticCollision: the
-		# forward probe grazed the solid collision skin (matKind 101/109, empty
-		# fname); crossing the surface perpendicular resolves the destructible
-		# mesh's real chunk/index/fname. dir points into the surface; normal = -dir,
-		# so segStart = point - normal*3 = point + dir*3, segStop = point - dir*2.
-		_dirv = hit_pt - seg_start
-		if _dirv.length > 0.001:
-			_dirv.normalise()
-		else:
-			return False
-		_seg_a = hit_pt + _dirv.scale(3.0)
-		_seg_b = hit_pt - _dirv.scale(2.0)
+		_normal = type(surf_normal)(
+			surf_normal.x, surf_normal.y, surf_normal.z)
+		if _normal.length <= 0.001:
+			raise RuntimeError(
+				'#1513 static collision surface normal is invalid')
+		_normal.normalise()
+		_seg_a = hit_pt - _normal.scale(3.0)
+		_seg_b = hit_pt + _normal.scale(2.0)
 		_mi = BigWorld.wg_getMatInfoNearPoint(spaceID, _seg_a, _seg_b, hit_pt, lambda *a: False)
 		return _try_destroy_destructible(spaceID, _mi, yaw, vel)
 	except Exception:
