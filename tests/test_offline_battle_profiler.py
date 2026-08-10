@@ -248,6 +248,18 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         self.assertIn("_offh_perf_count('collision_candidates', len(_candidate_ids))", source)
         self.assertIn("_candidate_ids = (_VC.nearby_ids", source)
         self.assertIn("_VC.unique_candidate_map(", source)
+        self.assertIn("_bot_collision_ids = _collision_candidates[0].get(eid)", source)
+        self.assertIn("_bot_collision_ids == ()", source)
+        self.assertIn("eid not in _tank_pair_pending", source)
+        self.assertIn("_offh_perf_count('tank_collision_empty')", source)
+
+    def test_static_gun_yaw_limits_are_cached_per_vehicle(self):
+        source = SOURCE.read_text()
+
+        self.assertIn("m_veh, '_offh_ai_gun_yaw_limits', None", source)
+        self.assertIn(
+            "m_veh._offh_ai_gun_yaw_limits = _bot_gun_yaw_limits", source
+        )
 
     def test_ai_planning_is_rate_limited_but_motion_stays_per_frame(self):
         source = SOURCE.read_text()
@@ -285,6 +297,23 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         self.assertIn("float(now) - last_cover >= 0.10", contact)
         self.assertIn("offset_index", contact)
         self.assertIn("bot_observation_due", contact)
+        self.assertIn("_OFFH_AI_CONTACT_FULL_INTERVAL = 3.0", source)
+        self.assertIn("network_contact_dirty.add(_contact_key)", contact)
+        self.assertIn("network_contact_dirty.discard(_contact_key)", contact)
+        self.assertIn("_OFFH_AI_DIAGNOSTICS_INTERVAL = 3.0", source)
+        self.assertIn("if _diagnostics_due else None", contact)
+
+    def test_bot_frame_reuses_stable_engine_context_without_slicing_motion(self):
+        source = SOURCE.read_text()
+
+        self.assertIn("_ai_space_id = _offh_bspace()", source)
+        self.assertIn("_ai_driver = _offh_ai_driver()", source)
+        self.assertIn(
+            "m_veh, _driver_yaw, _ai_now, _ai_space_id", source
+        )
+        self.assertIn(
+            "every live local bot must move continuously", source
+        )
 
     def test_contact_foliage_is_evaluated_after_cheap_distance_ordering(self):
         source = SOURCE.read_text()
@@ -297,6 +326,8 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         closest_three = contact.index("if len(candidates) >= 3:", foliage_query)
         self.assertLess(distance_sort, foliage_query)
         self.assertLess(foliage_query, closest_three)
+        self.assertNotIn("for entry in living:\n\t\tentry['_spot_view_range']", contact)
+        self.assertIn("observer['_spot_view_range'] = _view_range", contact)
 
     def test_wall_sweep_precedes_expensive_slope_classification(self):
         source = SOURCE.read_text()

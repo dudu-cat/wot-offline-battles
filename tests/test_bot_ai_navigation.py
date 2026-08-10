@@ -237,11 +237,22 @@ class BotNavigationTest(unittest.TestCase):
         graph["hazards"] = [0, 4, 2]
         grid = self.navigation.TerrainGrid(lambda *args: None, baked_graph=graph)
 
+        self.assertEqual(bytearray((0, 1, 1)), grid._baked_hazard_near_one)
         self.assertFalse(grid.baked_hazard_near((10.0, 0.0, 20.0)))
         self.assertFalse(grid.baked_hazard_near((14.0, 0.0, 20.0)))
         self.assertTrue(grid.baked_hazard_near((14.0, 0.0, 20.0), 1))
         self.assertTrue(grid.baked_hazard_near((18.0, 0.0, 20.0)))
         self.assertGreater(grid._penalty((1, 0), None), 0.0)
+
+    def test_dry_graph_precomputes_the_same_one_cell_shallow_water_halo(self):
+        graph = self.baked_graph(3, 1)
+        graph["bake"] = {"dry_only_routes": True}
+        graph["hazards"] = [4, 0, 0]
+        grid = self.navigation.TerrainGrid(lambda *args: None, baked_graph=graph)
+
+        self.assertEqual(bytearray((1, 1, 0)), grid._baked_hazard_near_one)
+        self.assertTrue(grid.baked_hazard_near((14.0, 0.0, 20.0), 1))
+        self.assertFalse(grid.baked_hazard_near((18.0, 0.0, 20.0), 1))
 
     def test_prebaked_shortcuts_do_not_cut_across_shallow_water(self):
         graph = self.baked_graph(5, 3)

@@ -59,6 +59,8 @@ class TerrainGrid(object):
 		self._baked_heights = ()
 		self._baked_links = ()
 		self._baked_hazards = ()
+		self._baked_node_count = 0
+		self._baked_hazard_near_one = bytearray()
 		self._baked_valid = bytearray()
 		self._baked_neighbour_deltas = ()
 		self._baked_edge_costs = array('d')
@@ -118,14 +120,35 @@ class TerrainGrid(object):
 		height = self._baked_height
 		count = width * height
 		valid = bytearray(count)
+		node_count = 0
 		for index in range(count):
 			if self._baked_heights[index] is None:
 				continue
+			node_count += 1
 			if (self._avoid_shallow_water and
 					int(self._baked_hazards[index]) & BAKED_SHALLOW_WATER):
 				continue
 			valid[index] = 1
+		self._baked_node_count = node_count
 		self._baked_valid = valid
+		# Water and cliff data never changes during a battle. Dilate the fatal mask
+		# by one cell once while installing the graph instead of scanning a 3x3
+		# neighbourhood twice for every simulated tank on every rendered frame.
+		# This is the exact same predicate as baked_hazard_near(..., 1).
+		hazard_mask = BAKED_FATAL_HAZARDS
+		if self._avoid_shallow_water:
+			hazard_mask |= BAKED_SHALLOW_WATER
+		hazard_near_one = bytearray(count)
+		for index in range(count):
+			if not (int(self._baked_hazards[index]) & hazard_mask):
+				continue
+			x = index % width
+			z = index // width
+			for near_z in range(max(0, z - 1), min(height, z + 2)):
+				base = near_z * width
+				for near_x in range(max(0, x - 1), min(width, x + 2)):
+					hazard_near_one[base + near_x] = 1
+		self._baked_hazard_near_one = hazard_near_one
 		self._baked_neighbour_deltas = (
 			-width - 1, -width, -width + 1, -1,
 			1, width - 1, width, width + 1)
@@ -218,6 +241,11 @@ class TerrainGrid(object):
 			return False
 		cell = self.cell_for(point)
 		radius = max(0, int(max_radius))
+		flat_index = self._baked_flat_index(cell)
+		if flat_index is None:
+			return False
+		if radius == 1 and self._baked_hazard_near_one:
+			return bool(self._baked_hazard_near_one[flat_index])
 		for z in range(cell[1] - radius, cell[1] + radius + 1):
 			for x in range(cell[0] - radius, cell[0] + radius + 1):
 				index = self._baked_flat_index((x, z))
@@ -996,8 +1024,8 @@ class TerrainNavigator(object):
 			'graph': {
 				'source': 'baked' if self.grid.prebaked else 'runtime',
 				'cell_mm': int(round(self.grid.cell_size * 1000.0)),
-				'nodes': (sum(1 for value in self.grid._baked_heights
-				              if value is not None) if self.grid.prebaked else 0),
+				'nodes': (int(self.grid._baked_node_count)
+				          if self.grid.prebaked else 0),
 			},
 			'total': dict(self.fallback_totals),
 			'active': active,

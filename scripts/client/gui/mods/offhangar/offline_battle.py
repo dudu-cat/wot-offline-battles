@@ -19,6 +19,8 @@ _OFFH_AI_TREE_REFRESHES_PER_FRAME = 6
 _OFFH_AI_CONTACT_TARGETS_PER_FRAME = 2
 _OFFH_AI_COVER_CANDIDATES_PER_FRAME = 1
 _OFFH_AI_ARTILLERY_CHORDS_PER_FRAME = 4
+_OFFH_AI_CONTACT_FULL_INTERVAL = 3.0
+_OFFH_AI_DIAGNOSTICS_INTERVAL = 3.0
 _OFFH_AI_COVER_OFFSETS = (
 	(0.0, 0.0), (14.0, 0.0),
 	(10.0, 13.0), (10.0, -13.0),
@@ -220,6 +222,7 @@ def _offh_perf_frame_end(started, frame_dt, player):
 	           'player_pose', 'player_gun', 'player_effects',
 	           'network_smoothing', 'ai_setup', 'contacts',
 	           'contact_build', 'contact_targets', 'contact_foliage', 'contact_cover',
+	           'contact_payload', 'contact_diagnostics', 'contact_publish',
 	           'artillery_arc', 'artillery_rays',
 	           'nav_tick', 'ai_order', 'order_refresh',
 		           'order_deferred', 'nav_server', 'nav_target', 'nav_refresh', 'nav_deferred',
@@ -235,7 +238,7 @@ def _offh_perf_frame_end(started, frame_dt, player):
 	           'traffic_snapshot', 'pose_water', 'terrain_support', 'terrain_tilt',
 	           'tree_scan', 'tree_deferred',
 	           'wall_collision', 'wall_fast', 'wall_exact',
-	           'tank_collision', 'collision_candidates',
+	           'tank_collision', 'tank_collision_empty', 'collision_candidates',
 	           'pose_commit', 'visibility', 'los', 'network_publish', 'post_bot')
 	parts = []
 	for name in ordered:
@@ -898,7 +901,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.24-test (2026-08-10) capture-reset-ledger'
+_OFFH_BUILD = '1.8.25-test (2026-08-10) authority-frame-fast-paths'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -3029,14 +3032,15 @@ def _offh_ai_corridor_segment_clear(space_id, start, end):
 		return False
 
 
-def _offh_ai_direction_clear(vehicle, absolute_yaw):
+def _offh_ai_direction_clear(vehicle, absolute_yaw, now=None, space_id=None):
 	"""Probe one hull-width movement corridor for the engine-free driver."""
 	_perf_started = _offh_perf_start()
 	try:
 		import BigWorld, Math, math
 		velocity = float(getattr(vehicle, '_veh_velocity', 0.0) or 0.0)
 		speed = abs(velocity)
-		_now = float(BigWorld.time())
+		_now = float(BigWorld.time() if now is None else now)
+		_space_id = _offh_bspace() if space_id is None else space_id
 		_cache_key = (
 			int(math.floor(float(vehicle.position.x) * 2.0 + 0.5)),
 			int(math.floor(float(vehicle.position.y) * 2.0 + 0.5)),
@@ -3133,7 +3137,7 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 			probe_up = max(4.5, run * 0.52)
 			probe_down = max(5.0, run * 0.45)
 			ground = BigWorld.wg_collideSegment(
-				_offh_bspace(), Math.Vector3(x, previous_y + probe_up, z),
+				_space_id, Math.Vector3(x, previous_y + probe_up, z),
 				Math.Vector3(x, previous_y - probe_down, z), 128)
 			if ground is None:
 				return _cached_result(_offh_ai_probe_reject(vehicle, 'terrain'))
@@ -3176,7 +3180,7 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 				mx = float(vehicle.position.x) + math.sin(motion_yaw) * probe_distance
 				mz = float(vehicle.position.z) + math.cos(motion_yaw) * probe_distance
 				motion_ground = BigWorld.wg_collideSegment(
-					_offh_bspace(), Math.Vector3(mx, motion_y + 6.0, mz),
+					_space_id, Math.Vector3(mx, motion_y + 6.0, mz),
 					Math.Vector3(mx, motion_y - 8.0, mz), 128)
 				if motion_ground is None:
 					return _cached_result(_offh_ai_probe_reject(vehicle, 'terrain'))
@@ -3193,7 +3197,7 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 			z = (float(vehicle.position.z) + cosine * lookahead +
 			     lateral_z * offset)
 			ground = BigWorld.wg_collideSegment(
-				_offh_bspace(), Math.Vector3(x, previous_y + 6.0, z),
+				_space_id, Math.Vector3(x, previous_y + 6.0, z),
 				Math.Vector3(x, previous_y - 12.0, z), 128)
 			if ground is None:
 				return _cached_result(_offh_ai_probe_reject(vehicle, 'terrain'))
@@ -3215,7 +3219,7 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 				end = Math.Vector3(
 					final_x + lateral_x * offset, previous_y + height,
 					final_z + lateral_z * offset)
-				if _offh_ai_corridor_segment_clear(_offh_bspace(), start, end):
+				if _offh_ai_corridor_segment_clear(_space_id, start, end):
 					continue
 				piece_clear = True
 				last_distance, last_y = ground_profile[0]
@@ -3229,7 +3233,7 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw):
 						piece_y + height,
 						float(vehicle.position.z) + cosine * piece_distance + lateral_z * offset)
 					if not _offh_ai_corridor_segment_clear(
-							_offh_bspace(), piece_start, piece_end):
+							_space_id, piece_start, piece_end):
 						piece_clear = False
 						break
 					last_distance, last_y = piece_distance, piece_y
@@ -3656,8 +3660,9 @@ def _offh_spot_detection_range(player, observer, target, now):
 	from gui.mods.offhangar import spotting
 	view_range = observer.get('_spot_view_range')
 	if view_range is None:
-		view_range = _offh_ai_view_range(
+		view_range = _offh_ai_cached_view_range(
 			observer['descriptor'], observer.get('vehicle'), player, now)
+		observer['_spot_view_range'] = view_range
 	camouflage = target.get('_spot_camouflage')
 	if camouflage is None:
 		camouflage = _offh_spot_camouflage(
@@ -4398,19 +4403,22 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 			'alive': bool(getattr(mock, 'isAlive', False) and health > 0),
 		}
 	living = [entry for entry in entries.values() if entry['alive']]
-	# Observer view range is shared by both targets in this frame. Target
-	# camouflage is evaluated lazily below so we do not update 30 tanks merely to
-	# inspect two of them.
-	for entry in living:
-		entry['_spot_view_range'] = _offh_ai_cached_view_range(
-			entry['descriptor'], entry.get('vehicle'), player, now)
+	# View range and target camouflage are evaluated lazily below. Only two
+	# targets are sliced into a frame, and a 50 m proximity spot needs neither;
+	# pre-touching every vehicle here performed 30 cache reads for no result.
 	generation = int(globals().get('g_offh_battle_gen', 0) or 0)
 	contact_cache = globals().get('g_offh_ai_network_contacts')
 	if (contact_cache is None or
 			int(contact_cache.get('generation', -1)) != generation):
-		contact_cache = {'generation': generation, 'contacts': {}}
+		contact_cache = {
+			'generation': generation, 'contacts': {}, 'dirty': set(),
+			'last_full': -999.0,
+		}
 		globals()['g_offh_ai_network_contacts'] = contact_cache
+	contact_cache.setdefault('dirty', set())
+	contact_cache.setdefault('last_full', -999.0)
 	network_contact_cache = contact_cache['contacts']
+	network_contact_dirty = contact_cache['dirty']
 	artillery_by_team = {1: [], 2: []}
 	for entry in living:
 		if entry.get('class_tag') == 'SPG':
@@ -4452,8 +4460,13 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 					# Foliage can only increase camouflage, so the foliage-free range is
 					# an exact upper bound.  Sort first and run the expensive prebaked
 					# foliage query only for observers that can enter the closest three.
+					_view_range = observer.get('_spot_view_range')
+					if _view_range is None:
+						_view_range = _offh_ai_cached_view_range(
+							observer['descriptor'], observer.get('vehicle'), player, now)
+						observer['_spot_view_range'] = _view_range
 					base_range = _contact_spotting.detection_distance(
-						observer.get('_spot_view_range', 400.0),
+						_view_range,
 						target.get('_spot_camouflage', 0.0))
 					if distance_sq > base_range * base_range:
 						continue
@@ -4560,9 +4573,11 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 				'visible': bool(visible or not target['alive']),
 				'shootable_by_bot_ids': shootable_by_bot_ids,
 			}
-			network_contact_cache[(
+			_contact_key = (
 				int(observing_team), str(target.get('target_kind', 'human')),
-				int(target['server_id']))] = _network_contact
+				int(target['server_id']))
+			network_contact_cache[_contact_key] = _network_contact
+			network_contact_dirty.add(_contact_key)
 	_offh_perf_stop('contact_targets', _perf_contact_targets, len(targets))
 	cover_cache = globals().get('g_offh_ai_cover_reports')
 	if (cover_cache is None or
@@ -4590,13 +4605,22 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 			agent = director.agents.get(int(entity_id))
 			order = agent.get('last_order') if agent is not None else None
 			vehicle = mock_vehicles.get(entity_id)
-			try:
-				from gui.mods.offhangar.network_battle import authoritative_bot_order
-				network_order = authoritative_bot_order(player, vehicle)
-				if network_order is not None:
-					order = network_order
-			except Exception:
-				pass
+			# The main bot loop already materialises the authoritative order and keeps
+			# it live at 75-160 ms cadence. Reuse that exact object for the 10 Hz cover
+			# scan instead of converting the same server coordinates a second time for
+			# every bot. A cold cache still falls back to the canonical reader.
+			cached_order = getattr(vehicle, '_offh_ai_order_cache', None)
+			if (isinstance(cached_order, tuple) and len(cached_order) == 3 and
+					isinstance(cached_order[2], dict)):
+				order = cached_order[2]
+			else:
+				try:
+					from gui.mods.offhangar.network_battle import authoritative_bot_order
+					network_order = authoritative_bot_order(player, vehicle)
+					if network_order is not None:
+						order = network_order
+				except Exception:
+					pass
 			mode = order.get('combat_mode') if order else None
 			cover_modes = ('take_cover', 'cover_hold', 'cover_peek', 'cover_return')
 			if (not order or
@@ -4674,18 +4698,33 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 			return
 	except Exception:
 		pass
-	# Observation transport is throttled to roughly 2 Hz. Build and sort the
-	# payload only when this frame will actually publish it; the old order paid
-	# this allocation cost on every render callback and discarded most results.
-	network_contacts = list(network_contact_cache.values())
-	network_contacts.sort(key=lambda value: (
-		int(value.get('observing_team', 0)),
-		str(value.get('target_kind', '')),
-		int(value.get('target_id', 0))))
+	# Observation transport is throttled to roughly 2 Hz. Send newly evaluated
+	# contacts as a delta, with a complete refresh well inside the server's 8 s
+	# contact TTL. The server already stores contacts by identity, so converting
+	# and serialising all 30 stale cache entries every 450 ms added no gameplay
+	# information and starved this legacy client's render/network callback.
+	_perf_contact_payload = _offh_perf_start()
+	_full_contact_refresh = (
+		float(now) - float(contact_cache.get('last_full', -999.0)) >=
+		_OFFH_AI_CONTACT_FULL_INTERVAL)
+	if _full_contact_refresh:
+		_contact_keys = sorted(network_contact_cache.keys())
+	else:
+		_contact_keys = sorted(
+			key for key in network_contact_dirty if key in network_contact_cache)
+	network_contacts = [network_contact_cache[key] for key in _contact_keys]
 	cover_reports.sort(key=lambda value: int(value.get('bot_id', 0)))
+	_offh_perf_stop(
+		'contact_payload', _perf_contact_payload, len(network_contacts))
 	try:
 		from gui.mods.offhangar.network_battle import publish_bot_observation
-		_navigator = globals().get('g_offh_terrain_navigator')
+		_diagnostics_due = (
+			float(now) - float(globals().get(
+				'g_offh_ai_diagnostics_t', -999.0) or -999.0) >=
+			_OFFH_AI_DIAGNOSTICS_INTERVAL)
+		_navigator = (globals().get('g_offh_terrain_navigator')
+		              if _diagnostics_due else None)
+		_perf_contact_diagnostics = _offh_perf_start()
 		_active_bot_ids = [entry['id'] for entry in living
 		                   if entry['id'] != player_id]
 		_navigation = (_navigator.fallback_diagnostics(_active_bot_ids, now)
@@ -4759,8 +4798,18 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 					_driver_speed_pct_total / float(_driver['cruise'])))
 			_navigation['driver'] = _driver
 			_navigation['safety'] = _safety
-		publish_bot_observation(
+		_offh_perf_stop('contact_diagnostics', _perf_contact_diagnostics)
+		_perf_contact_publish = _offh_perf_start()
+		_published = publish_bot_observation(
 			player, network_contacts, cover_reports, _navigation)
+		_offh_perf_stop('contact_publish', _perf_contact_publish)
+		if _published:
+			for _contact_key in _contact_keys:
+				network_contact_dirty.discard(_contact_key)
+			if _full_contact_refresh:
+				contact_cache['last_full'] = float(now)
+			if _diagnostics_due:
+				globals()['g_offh_ai_diagnostics_t'] = float(now)
 	except Exception as error:
 		# This telemetry also carries the server's contact/driver diagnostics.
 		# Silencing its failure left the server reporting all-zero AI state even
@@ -5017,6 +5066,7 @@ def _offh_battle_sweep(tag='exit'):
 		globals().pop('g_offh_ai_network_contacts', None)
 		globals().pop('g_offh_ai_frame_budget', None)
 		globals().pop('g_offh_ai_contacts_t', None)
+		globals().pop('g_offh_ai_diagnostics_t', None)
 		globals().pop('g_offh_spot_resource_profiles', None)
 		globals().pop('g_offh_spot_player_crew', None)
 		globals().pop('g_offh_spot_fallback_logged', None)
@@ -8755,6 +8805,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		globals().pop('g_offh_ai_network_contacts', None)
 		globals().pop('g_offh_ai_frame_budget', None)
 		globals().pop('g_offh_ai_contacts_t', None)
+		globals().pop('g_offh_ai_diagnostics_t', None)
 		globals().pop('g_offh_spot_resource_profiles', None)
 		globals().pop('g_offh_spot_player_crew', None)
 		globals().pop('g_offh_spot_fallback_logged', None)
@@ -12168,6 +12219,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				# for every bot made tiny microsecond differences bypass that guard and
 				# advanced the A* budget up to 30 times in one frame.
 				_ai_now = BigWorld.time()
+				_ai_space_id = _offh_bspace()
+				_ai_driver = _offh_ai_driver()
+				_player_vehicle_id = getattr(player, 'playerVehicleID', -1)
+				_player_team = int(getattr(player, '_offhangar_team', 1) or 1)
+				_battle_active = (
+					getattr(getattr(player, 'arena', None), 'period', 3) == 3)
 				# Validate and materialise the shipped foliage index during the loading /
 				# countdown period. The old lazy path loaded it only after the first
 				# observer-target pair happened to need a >50 m concealment calculation,
@@ -12201,7 +12258,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						_perf_ai_setup = _offh_perf_start()
 						for _ai_eid in sorted(mock_vehicles.keys()):
 							_ai_mock = mock_vehicles.get(_ai_eid)
-							if (_ai_eid == getattr(player, 'playerVehicleID', -1) or
+							if (_ai_eid == _player_vehicle_id or
 							        _ai_mock is None or
 							        not getattr(_ai_mock, 'isAlive', False) or
 							        getattr(_ai_mock, '_network_remote', False)):
@@ -12298,7 +12355,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_driver_body['yaw'] = _frame_yaw
 								_driver_body['velocity'] = _frame_velocity
 							_driver_frame[_frame_eid] = _driver_body
-							if (_frame_eid != getattr(player, 'playerVehicleID', -1) and
+							if (_frame_eid != _player_vehicle_id and
 									not getattr(_frame_vehicle, '_network_remote', False)):
 								_local_ai_ids.append(int(_frame_eid))
 						_collision_body = getattr(
@@ -12344,7 +12401,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				# therefore consumed later in this same frame.
 				for eid in sorted(mock_vehicles):
 					m_veh = mock_vehicles[eid]
-					if eid != getattr(player, 'playerVehicleID', -1) and getattr(m_veh, 'isAlive', False):
+					if eid != _player_vehicle_id and getattr(m_veh, 'isAlive', False):
 						try:
 							if (_is_network_replica and
 									(getattr(m_veh, '_network_remote', False) or
@@ -12495,7 +12552,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_current_bot_pos = (
 								m_veh.position.x, m_veh.position.y, m_veh.position.z)
 							target_pos, drive_pos, face_pos, _stop_without_route = (
-								_offh_ai_driver().resolve_order_positions(
+									_ai_driver.resolve_order_positions(
 									_current_bot_pos, target_pos, drive_pos, face_pos))
 							if _stop_without_route:
 								# Only an order without both aim and movement is an idle hold.
@@ -12715,16 +12772,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_bphys = _PHY.derive_params(_td)
 								m_veh._phys_params = _bphys
 							bot_mass = _bphys['mass']
-							bot_enginePowerW = _bphys['powerW']
 							bot_speedFwd = _bphys['speedFwd']
-							bot_speedBwd = _bphys['speedBwd']
-							bot_terrainCoeff = _bphys['terrainResist'][0]
-							bot_specificFriction = _bphys['specificFriction']
-							bot_chassisRotSpd = _bphys['rotSpd']
-							_battle_active = (getattr(
-								getattr(player, 'arena', None), 'period', 3) == 3)
+							_bot_gun_yaw_limits = getattr(
+								m_veh, '_offh_ai_gun_yaw_limits', None)
+							if _bot_gun_yaw_limits is None:
+								_bot_gun_yaw_limits = _ai_driver.gun_yaw_limits(_td)
+								m_veh._offh_ai_gun_yaw_limits = _bot_gun_yaw_limits
 							_bot_gun_min_yaw, _bot_gun_max_yaw, _has_limited_traverse = (
-								_offh_ai_driver().gun_yaw_limits(_td))
+								_bot_gun_yaw_limits)
 							m_veh._offh_ai_targeted = _ai_target_id is not None
 							m_veh._offh_ai_aligned = False
 							m_veh._offh_ai_traversing = False
@@ -12833,14 +12888,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_driver_dt = max(float(dt), min(
 										0.35, float(_ai_now) - float(_driver_cache[2])))
 								_driver_order = _offh_perf_call(
-									'driver', _offh_ai_driver().drive, eid,
+									'driver', _ai_driver.drive, eid,
 									(float(m_veh.position.x), float(m_veh.position.y),
 									 float(m_veh.position.z)),
 									float(m_veh.yaw), float(m_veh._veh_velocity), _driver_dt,
 									(float(drive_pos[0]), float(drive_pos[1]), float(drive_pos[2])),
 									_driver_neighbours,
 									lambda _driver_yaw: _offh_ai_direction_clear(
-										m_veh, _driver_yaw),
+										m_veh, _driver_yaw, _ai_now, _ai_space_id),
 									_own_velocity, _own_half_length, _own_half_width,
 									_driver_intent)
 								# A clear-road steering answer remains valid longer than an
@@ -12904,7 +12959,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								throttle = float(_ai_throttle_override)
 							if _battle_active:
 								turn_dir, throttle, _ai_hull_aiming = (
-									_offh_ai_driver().combat_hull_aim(
+									_ai_driver.combat_hull_aim(
 										m_veh.yaw, _aim_target_yaw,
 										_bot_gun_min_yaw, _bot_gun_max_yaw,
 										turn_dir, throttle, _driver_mode,
@@ -12941,7 +12996,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								try:
 									from gui.mods.offhangar import device_damage as _DDf2
 									_fs2 = getattr(m_veh, '_fire_started', None)
-									if _fs2 is not None and (BigWorld.time() - _fs2) >= _DDf2.FIRE_DURATION_SECONDS:
+									if _fs2 is not None and (_ai_now - _fs2) >= _DDf2.FIRE_DURATION_SECONDS:
 										_offh_extinguish(m_veh, False, 'burnt out')
 								except Exception:
 									pass
@@ -13020,8 +13075,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								m_veh._offh_ai_tick_dry_pose = (
 									float(m_veh.position.x), float(m_veh.position.y),
 									float(m_veh.position.z))
-								m_veh._offh_ai_tick_nav_safe = _offh_ai_baked_pose_safe(
-									m_veh._offh_ai_tick_dry_pose)
+								# A clear one-cell halo necessarily proves the centre cell safe.
+								# Avoid a second lookup for the common inland case.
+								m_veh._offh_ai_tick_nav_safe = (
+									True if _initial_hazard is False else
+									_offh_ai_baked_pose_safe(m_veh._offh_ai_tick_dry_pose))
 							else:
 								m_veh._offh_ai_tick_dry_pose = None
 								m_veh._offh_ai_tick_nav_safe = False
@@ -13030,7 +13088,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								m_veh._dp_acc = (getattr(m_veh, '_dp_acc', 9.0) or 9.0) + dt
 								if m_veh._dp_acc >= 0.15:
 									m_veh._dp_acc = 0.0
-									_braw = _drive_pitch(_offh_bspace(), m_veh.position.x, m_veh.position.z, m_veh.yaw, m_veh.position.y)
+									_braw = _drive_pitch(_ai_space_id, m_veh.position.x, m_veh.position.z, m_veh.yaw, m_veh.position.y)
 									# smooth probe spikes (same reason as the player)
 									_bprev = getattr(m_veh, '_dp_v', _braw) or 0.0
 									_bd = _braw - _bprev
@@ -13069,7 +13127,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										getattr(m_veh, '_offh_next_tree_scan', None) is None)
 									try:
 										_offh_perf_call('tree_scan', _fell_trees_near,
-												_offh_bspace(), m_veh.position, m_veh.yaw,
+												_ai_space_id, m_veh.position, m_veh.yaw,
 												m_veh._veh_velocity, _td)
 									except: pass
 								elif abs(m_veh._veh_velocity) > 0.5 and _tree_scan_due:
@@ -13080,7 +13138,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									try:
 										_hit_wall = _offh_perf_call(
 											'wall_collision', _check_horizontal_collision,
-											_offh_bspace(), m_veh.position, m_veh.yaw,
+											_ai_space_id, m_veh.position, m_veh.yaw,
 											m_veh._veh_velocity, _td,
 											getattr(m_veh, '_airborne', False), dt)
 									except: pass
@@ -13096,7 +13154,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										# the generic stuck timer while the hull grinds the obstacle.
 										m_veh._offh_ai_driver_mode = 'blocked'
 										_offh_ai_probe_reject(m_veh, 'obstacle')
-										_offh_ai_driver().remember_failure(
+										_ai_driver.remember_failure(
 											eid, target_yaw, 5.0)
 								else:
 									m_veh.position = Math.Vector3(_bnx, m_veh.position.y, _bnz)
@@ -13104,18 +13162,29 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								try:
 									_bsvx = math.sin(m_veh.yaw) * m_veh._veh_velocity + (getattr(m_veh, '_push_x', 0.0) or 0.0)
 									_bsvz = math.cos(m_veh.yaw) * m_veh._veh_velocity + (getattr(m_veh, '_push_z', 0.0) or 0.0)
-									_btr = _offh_perf_call(
-										'tank_collision', _tank_resolve, eid,
-										m_veh.position.x, m_veh.position.z, m_veh.yaw, _td,
-										1.0 / max(bot_mass, 1.0), _bsvx, _bsvz,
-										m_veh.position.y)
+									_bot_collision_ids = None
+									if _collision_candidates[0] is not None:
+										_bot_collision_ids = _collision_candidates[0].get(eid)
+									# The broad phase proves that most bots have no nearby body.
+									# Preserve a queued reciprocal correction even when this bot
+									# owns no pair itself; otherwise skip the complete resolver.
+									if (_bot_collision_ids == () and
+											eid not in _tank_pair_pending):
+										_offh_perf_count('tank_collision_empty')
+										_btr = (0.0, 0.0, 0.0, 0.0)
+									else:
+										_btr = _offh_perf_call(
+											'tank_collision', _tank_resolve, eid,
+											m_veh.position.x, m_veh.position.z, m_veh.yaw, _td,
+											1.0 / max(bot_mass, 1.0), _bsvx, _bsvz,
+											m_veh.position.y)
 									if abs(_btr[0]) + abs(_btr[1]) > 0.01:
 										# Re-evaluate immediately after another hull displaced this bot.
 										# A short failed-heading memory gives touching bots deterministic,
 										# opposite escape sides without treating traffic as a static wall.
 										m_veh._offh_ai_driver_cache = None
 										m_veh._offh_ai_driver_mode = 'avoid'
-										_offh_ai_driver().remember_failure(
+										_ai_driver.remember_failure(
 											eid, target_yaw, 0.8)
 									# Forward impulse share hits the bot's drive speed too (see player)
 									_bfimp = _btr[2] * math.sin(m_veh.yaw) + _btr[3] * math.cos(m_veh.yaw)
@@ -13158,7 +13227,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								except Exception:
 									pass
 								_bsup = _offh_perf_call(
-									'terrain_support', _terrain_support, _offh_bspace(),
+									'terrain_support', _terrain_support, _ai_space_id,
 									m_veh.position.x, m_veh.position.y, m_veh.position.z,
 									m_veh.yaw, _bhl)
 								_bc_y = _bsup[1]        # ground under the hull centre (chassis origin)
@@ -13188,7 +13257,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										m_veh._offh_ai_driver_mode = 'obstacle_rise'
 										_offh_ai_probe_reject(m_veh, 'obstacle')
 										try:
-											_offh_ai_driver().remember_failure(eid, target_yaw, 5.0)
+											_ai_driver.remember_failure(eid, target_yaw, 5.0)
 										except Exception:
 											pass
 									elif m_veh.position.y <= _bg_y or (_bcom_gap <= _b_snap and not getattr(m_veh, '_airborne', False)):
@@ -13230,7 +13299,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							m_veh._ypr_fc = (getattr(m_veh, '_ypr_fc', 0) or 0) + 1
 							if getattr(m_veh, '_ypr_c', None) is None or ((m_veh._ypr_fc + eid) & (1 if getattr(m_veh, '_spot_visible', True) else 3)) == 0:
 									m_veh._ypr_c = _offh_perf_call(
-										'terrain_tilt', _get_terrain_ypr, _offh_bspace(),
+									'terrain_tilt', _get_terrain_ypr, _ai_space_id,
 										m_veh.position, m_veh.yaw)
 							_b_ypr = (m_veh.yaw, m_veh._ypr_c[1], m_veh._ypr_c[2], m_veh._ypr_c[3], m_veh._ypr_c[4], m_veh._ypr_c[5])
 							# --- Slope slide (bot): same WG law + cross-heading projection as player ---
@@ -13274,14 +13343,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											m_veh._air_lat_vz = 0.0
 											_offh_ai_probe_reject(m_veh, 'water')
 											try:
-												_offh_ai_driver().remember_failure(eid, target_yaw, 5.0)
+												_ai_driver.remember_failure(eid, target_yaw, 5.0)
 											except Exception:
 												pass
 										if not _slide_blocked_by_water:
 											try:
 												_offh_perf_count('physics_rays')
 												_forecast_hit = BigWorld.wg_collideSegment(
-													_offh_bspace(),
+													_ai_space_id,
 													Math.Vector3(_slide_probe.x,
 													             m_veh.position.y + 8.0,
 													             _slide_probe.z),
@@ -13302,7 +13371,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										_slb_z = m_veh.position.z + _bsl_dz * _bss * dt
 										try:
 											_offh_perf_count('physics_rays')
-											_slb_c = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(_slb_x, m_veh.position.y + 8.0, _slb_z), Math.Vector3(_slb_x, m_veh.position.y - 30.0, _slb_z), 128)
+											_slb_c = BigWorld.wg_collideSegment(_ai_space_id, Math.Vector3(_slb_x, m_veh.position.y + 8.0, _slb_z), Math.Vector3(_slb_x, m_veh.position.y - 30.0, _slb_z), 128)
 										except Exception:
 											_slb_c = None
 										if (not _slide_blocked_by_water and _slb_c is not None and
@@ -13338,17 +13407,17 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									m_veh._push_x = 0.0
 									m_veh._push_z = 0.0
 									m_veh._offh_ai_driver_mode = 'water_guard'
-									m_veh._offh_ai_water_guard_until = BigWorld.time() + 1.0
+									m_veh._offh_ai_water_guard_until = _ai_now + 1.0
 									globals()['g_offh_ai_water_guard_total'] = int(
 										globals().get('g_offh_ai_water_guard_total', 0) or 0) + 1
 									try:
-										_offh_ai_driver().remember_failure(
+										_ai_driver.remember_failure(
 											eid, target_yaw, 5.0)
 									except Exception:
 										pass
 									m_veh._ypr_c = _offh_perf_call(
 										'terrain_tilt', _get_terrain_ypr,
-										_offh_bspace(), m_veh.position, m_veh.yaw)
+										_ai_space_id, m_veh.position, m_veh.yaw)
 									_b_ypr = (m_veh.yaw, m_veh._ypr_c[1],
 									          m_veh._ypr_c[2], m_veh._ypr_c[3],
 									          m_veh._ypr_c[4], m_veh._ypr_c[5])
@@ -13357,6 +13426,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# may enter a true hazard, but driving beside a building must not trigger
 							# this final rollback on every frame.
 							if (getattr(m_veh, '_offh_ai_tick_nav_safe', False) and
+									_final_hazard is not False and
 									not _offh_ai_baked_pose_safe((m_veh.position.x,
 										m_veh.position.y, m_veh.position.z))):
 								_edge_anchor = getattr(m_veh, '_offh_ai_tick_dry_pose', None)
@@ -13373,16 +13443,16 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									m_veh._push_x = 0.0
 									m_veh._push_z = 0.0
 									m_veh._offh_ai_driver_mode = 'edge_guard'
-									m_veh._offh_ai_edge_guard_until = BigWorld.time() + 1.0
+									m_veh._offh_ai_edge_guard_until = _ai_now + 1.0
 									globals()['g_offh_ai_edge_guard_total'] = int(
 										globals().get('g_offh_ai_edge_guard_total', 0) or 0) + 1
 									try:
-										_offh_ai_driver().remember_failure(eid, target_yaw, 5.0)
+										_ai_driver.remember_failure(eid, target_yaw, 5.0)
 									except Exception:
 										pass
 									m_veh._ypr_c = _offh_perf_call(
 										'terrain_tilt', _get_terrain_ypr,
-										_offh_bspace(), m_veh.position, m_veh.yaw)
+										_ai_space_id, m_veh.position, m_veh.yaw)
 									_b_ypr = (m_veh.yaw, m_veh._ypr_c[1],
 									          m_veh._ypr_c[2], m_veh._ypr_c[3],
 									          m_veh._ypr_c[4], m_veh._ypr_c[5])
@@ -13398,7 +13468,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_offh_perf_call(
 								'pose_commit', _VP.commit_pose, m_veh,
 								m_veh.position, m_veh.yaw, m_veh.pitch, m_veh.roll,
-								_offh_bspace(), _ai_now,
+								_ai_space_id, _ai_now,
 								bool(getattr(m_veh, '_spot_visible', True)), True, False)
 							_offh_perf_stop('physics', _perf_physics)
 							_perf_visibility = _offh_perf_start()
@@ -13413,7 +13483,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									except Exception:
 										_sen = True
 									globals()['g_offh_spotting'] = _sen
-								if _sen and getattr(m_veh, 'isAlive', True) and getattr(m_veh, '_bot_team', 2) != (getattr(player, '_offhangar_team', 1) or 1):
+								if _sen and getattr(m_veh, 'isAlive', True) and getattr(m_veh, '_bot_team', 2) != _player_team:
 									m_veh._spot_chk = (getattr(m_veh, '_spot_chk', 9.0) or 9.0) + dt
 									if m_veh._spot_chk >= 0.5:
 										m_veh._spot_chk = (eid % 10) * 0.05  # stagger re-checks across bots
@@ -13425,7 +13495,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										_schk = getattr(m_veh, '_chassis_model', None)
 										if _schk is not None:
 											# spot memory alone kept DEAD bots marked and shown - gate on alive too
-											_svchk = BigWorld.time() < (getattr(m_veh, '_spot_until', 0.0) or 0.0) and (getattr(m_veh, 'health', 0) or 0) > 0
+											_svchk = _ai_now < (getattr(m_veh, '_spot_until', 0.0) or 0.0) and (getattr(m_veh, 'health', 0) or 0) > 0
 											try:
 												_schk.visible = _svchk
 												_schk.visibleAttachments = _svchk
@@ -13517,11 +13587,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 													m_veh._dbg_vis = _svchk
 													LOG_DEBUG('VIS id=%s want=%s got=%s spotUntil=%.1f now=%.1f hp=%s marker=%s' % (
 														eid, _svchk, getattr(_schk, "visible", "?"),
-														(getattr(m_veh, '_spot_until', 0.0) or 0.0), BigWorld.time(),
+															(getattr(m_veh, '_spot_until', 0.0) or 0.0), _ai_now,
 														getattr(m_veh, 'health', '?'), getattr(m_veh, 'marker', None)))
 											except Exception:
 												pass
-									_svis = BigWorld.time() < ((getattr(m_veh, '_spot_until', 0.0) or 0.0)) and (getattr(m_veh, 'health', 0) or 0) > 0
+									_svis = _ai_now < ((getattr(m_veh, '_spot_until', 0.0) or 0.0)) and (getattr(m_veh, 'health', 0) or 0) > 0
 									if _svis != getattr(m_veh, '_spot_visible', True):
 										m_veh._spot_visible = _svis
 										_sch = getattr(m_veh, '_chassis_model', None)
@@ -13573,7 +13643,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# which matches the reports - single tanks, permanently, no trigger. Enemies
 							# are left alone here; the spotting block owns them.
 							try:
-								if (getattr(m_veh, '_bot_team', 2) or 2) == (getattr(player, '_offhangar_team', 1) or 1):
+								if (getattr(m_veh, '_bot_team', 2) or 2) == _player_team:
 									_avm = getattr(m_veh, '_chassis_model', None)
 									_aal = (getattr(m_veh, 'health', 0) or 0) > 0
 									if _avm is not None and _aal and not getattr(_avm, "visible", True):
