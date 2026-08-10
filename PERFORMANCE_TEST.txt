@@ -37,6 +37,8 @@ Metric guide
 callback          Total sampled offline-battle callback time.
 player_loop       Player controls, camera, projectiles, and player physics.
 bot_loop          Total bot update-loop time.
+simulation_updates Bots that ran native terrain/collision physics this frame.
+simulation_deferred Bots whose accumulated step was fairly deferred.
 post_bot          Death and spectator UI work after the bot loop.
 traffic_snapshot  Once-per-frame vehicle data shared by navigation and steering.
 driver            Local steering, including direction probes.
@@ -73,9 +75,11 @@ nav_server        Bot route targets supplied by the Python 3 server.
 network_smoothing Remote state interpolation.
 network_publish   Authority state publication.
 
-Refresh/deferred counters show how many order, navigation, driver, and tree
-jobs actually ran versus reused a cached result. They are call counts, not
-milliseconds.
+Refresh/deferred counters show how many order, navigation, driver, tree, and
+simulation jobs actually ran versus reused or deferred work. They are call
+counts, not milliseconds. During a 15-versus-15 active battle,
+simulation_updates must remain at or below 10 per sampled render callback;
+every bot consumes its accumulated elapsed time on its next slice.
 
 Expected result for protocol 8
 ------------------------------

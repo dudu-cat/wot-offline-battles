@@ -16,6 +16,9 @@ _OFFH_AI_ORDER_REFRESHES_PER_FRAME = 10
 _OFFH_AI_NAV_REFRESHES_PER_FRAME = 6
 _OFFH_AI_DRIVER_REFRESHES_PER_FRAME = 6
 _OFFH_AI_TREE_REFRESHES_PER_FRAME = 6
+_OFFH_AI_SIMULATION_UPDATES_PER_FRAME = 10
+_OFFH_AI_PREBATTLE_UPDATES_PER_FRAME = 5
+_OFFH_AI_MAX_SIMULATION_DT = 0.25
 _OFFH_AI_CONTACT_TARGETS_PER_FRAME = 2
 _OFFH_AI_COVER_CANDIDATES_PER_FRAME = 1
 _OFFH_AI_ARTILLERY_CHORDS_PER_FRAME = 4
@@ -69,13 +72,41 @@ def _offh_ai_budget_ids(entity_ids, frame_index, quota, salt=0):
 	return _offh_ai_budget_from_ordered(ordered, frame_index, quota, salt)
 
 
-def _offh_ai_frame_budget_plan(entity_ids, frame_dt=(1.0 / 30.0)):
+def _offh_ai_simulation_quota(entity_count, frame_dt, battle_active=True):
+	"""Target a stable simulation cadence while hard-capping one callback."""
+	entity_count = max(0, int(entity_count or 0))
+	if not entity_count:
+		return 0
+	frame_dt = max(1.0 / 120.0, min(0.25, float(frame_dt or 0.0)))
+	target_hz = 15.0 if battle_active else 8.0
+	desired = int(entity_count * target_hz * frame_dt + 0.999999)
+	maximum = (_OFFH_AI_SIMULATION_UPDATES_PER_FRAME if battle_active else
+	           _OFFH_AI_PREBATTLE_UPDATES_PER_FRAME)
+	minimum = 3 if battle_active else 2
+	return min(entity_count, maximum, max(minimum, desired))
+
+
+def _offh_ai_simulation_step(previous_elapsed, frame_dt, selected):
+	"""Accumulate skipped render time and consume it on the next selected slice."""
+	elapsed = min(
+		_OFFH_AI_MAX_SIMULATION_DT,
+		max(0.0, float(previous_elapsed or 0.0)) +
+		max(0.0, float(frame_dt or 0.0)))
+	if not selected:
+		return elapsed, 0.0
+	return 0.0, max(1.0 / 120.0, elapsed)
+
+
+def _offh_ai_frame_budget_plan(entity_ids, frame_dt=(1.0 / 30.0),
+		battle_active=True):
 	"""Bound expensive decisions per rendered frame, independent of wall time.
 
 	Wall-clock-only TTLs collapse when FPS drops: every cache expires before the
 	next frame and all 29 bots refresh together.  This plan preserves the desired
 	per-bot cadence at healthy FPS while guaranteeing a finite recovery workload
-	on a slow frame.  Physics and pose commits are deliberately not budgeted here.
+	on a slow frame. Native terrain/collision physics uses the same fair scheduler;
+	each selected bot consumes its accumulated elapsed time, so reducing callback
+	work does not permanently reduce tank speed.
 	"""
 	generation = int(globals().get('g_offh_battle_gen', 0) or 0)
 	state = globals().get('g_offh_ai_frame_budget')
@@ -89,6 +120,8 @@ def _offh_ai_frame_budget_plan(entity_ids, frame_dt=(1.0 / 30.0)):
 	ordered = sorted(set(int(value) for value in (entity_ids or ())))
 	count = len(ordered)
 	frame_dt = max(1.0 / 120.0, min(0.25, float(frame_dt or 0.0)))
+	simulation_quota = _offh_ai_simulation_quota(
+		count, frame_dt, battle_active)
 	def _horizon(quota):
 		quota = max(1, int(quota))
 		frames = max(1, (count + quota - 1) // quota)
@@ -102,9 +135,12 @@ def _offh_ai_frame_budget_plan(entity_ids, frame_dt=(1.0 / 30.0)):
 			ordered, frame_index, _OFFH_AI_DRIVER_REFRESHES_PER_FRAME, 23),
 		'tree': _offh_ai_budget_from_ordered(
 			ordered, frame_index, _OFFH_AI_TREE_REFRESHES_PER_FRAME, 7),
+		'simulation': _offh_ai_budget_from_ordered(
+			ordered, frame_index, simulation_quota, 19),
 		'order_horizon': _horizon(_OFFH_AI_ORDER_REFRESHES_PER_FRAME),
 		'nav_horizon': _horizon(_OFFH_AI_NAV_REFRESHES_PER_FRAME),
 		'driver_horizon': _horizon(_OFFH_AI_DRIVER_REFRESHES_PER_FRAME),
+		'simulation_horizon': _horizon(max(1, simulation_quota)),
 	}
 
 
@@ -219,7 +255,8 @@ def _offh_perf_frame_end(started, frame_dt, player):
 	           'artillery_arc', 'artillery_rays',
 	           'nav_tick', 'ai_order', 'order_refresh',
 		           'order_deferred', 'nav_server', 'nav_target', 'nav_refresh', 'nav_deferred',
-	           'bot_loop', 'driver', 'driver_refresh', 'driver_deferred',
+	           'bot_loop', 'simulation_updates', 'simulation_deferred',
+	           'driver', 'driver_refresh', 'driver_deferred',
 	           'direction', 'direction_baked', 'direction_exact', 'physics',
 	           'physics_state', 'physics_motion', 'physics_ground',
 	           'physics_safety', 'physics_rays',
@@ -893,7 +930,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.20-test (2026-08-10) swept-collision-performance'
+_OFFH_BUILD = '1.8.21-test (2026-08-10) sliced-physics-ctf-visibility'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -6594,114 +6631,105 @@ OFFLINE_BATTLE_ENABLED = True
 
 
 
+def _offh_arena_type_matches(arena_type, map_name, gameplay_name):
+	"""Require both geometry and gameplay; one geometry can own several modes."""
+	if arena_type is None:
+		return False
+	try:
+		geometry = str(getattr(arena_type, 'geometryName', '') or '')
+		wanted = str(map_name or '')
+		geometry = geometry.replace('\\', '/').split('/')[-1]
+		wanted = wanted.replace('\\', '/').split('/')[-1]
+		geometry_matches = (
+			geometry == wanted or
+			(bool(geometry) and wanted.endswith('_' + geometry)) or
+			(bool(wanted) and geometry.endswith('_' + wanted)))
+		return (geometry_matches and
+		        str(getattr(arena_type, 'gameplayName', '') or '') ==
+		        str(gameplay_name or ''))
+	except Exception:
+		return False
+
+
+def _offh_arena_cache_get(cache, key):
+	for getter in (
+		lambda: cache.get(key),
+		lambda: cache[key],
+		lambda: cache.getArenaType(key) if hasattr(cache, 'getArenaType') else None,
+		lambda: cache.getByID(key) if hasattr(cache, 'getByID') else None,
+		lambda: cache.getById(key) if hasattr(cache, 'getById') else None,
+	):
+		try:
+			arena_type = getter()
+			if arena_type is not None:
+				return arena_type
+		except Exception:
+			continue
+	return None
+
+
+def _offh_arena_cache_values(cache):
+	try:
+		if hasattr(cache, 'itervalues'):
+			return list(cache.itervalues())
+		if hasattr(cache, 'values'):
+			return list(cache.values())
+	except Exception:
+		pass
+	return []
+
+
 def _resolve_real_arena_type(map_id, map_name, gameplay_name):
-	"""
-	Try to resolve a real ArenaType object from the client's cache.
-	This provides minimap + other per-map metadata needed by battle GUI.
-	"""
+	"""Resolve the exact geometry/gameplay pair from the retail ArenaType cache."""
 	try:
 		try:
 			import ArenaType as ArenaTypeModule
 		except ImportError:
-			# 0.8.2 ships it as `common/arenatype.pyc`
+			# 0.8.2 ships it as ``common/arenatype.pyc``.
 			try:
 				from common import arenatype as ArenaTypeModule
 			except ImportError:
 				import arenatype as ArenaTypeModule
 		cache = getattr(ArenaTypeModule, 'g_cache', None)
-		# Lazy init on some builds: cache can start as None.
-		for init_name in ('init', '_init', 'initialize'):
-			init_fn = getattr(ArenaTypeModule, init_name, None)
+		# A fresh client can expose the empty cache before the account flow calls init.
+		if not cache:
+			init_fn = getattr(ArenaTypeModule, 'init', None)
 			if callable(init_fn):
-				try:
-					init_fn()
-					cache = getattr(ArenaTypeModule, 'g_cache', None)
-				except Exception:
-					LOG_CURRENT_EXCEPTION()
-			if cache is not None:
-				break
-
+				init_fn()
+				cache = getattr(ArenaTypeModule, 'g_cache', None)
 		if cache is None:
-			LOG_DEBUG('OfflineBattle.arenaType.cacheMissing', map_name, 'module', getattr(ArenaTypeModule, '__name__', '?'))
+			LOG_DEBUG('OfflineBattle.arenaType.cacheMissing', map_name,
+			          'module', getattr(ArenaTypeModule, '__name__', '?'))
 			return None
 
-		# Some builds provide module-level getters instead of direct cache access.
-		for fn_name in ('getArenaType', 'getByGeometryName', 'getByName', 'getArenaTypeByName'):
-			fn = getattr(ArenaTypeModule, fn_name, None)
-			if callable(fn):
-				for key in (map_name, map_id):
-					try:
-						at = fn(key)
-						if at is not None:
-							try:
-								at.geometryName = map_name
-								at.gameplayName = gameplay_name
-							except Exception:
-								pass
-							return at
-					except Exception:
-						continue
+		gameplay_id = int(ArenaTypeModule.getGameplayIDForName(gameplay_name))
+		# Retail 0.8.2 keys g_cache by (gameplayID << 16) | geometryID.
+		arena_type_id = (gameplay_id << 16) | (int(map_id) & 0xffff)
+		arena_type = _offh_arena_cache_get(cache, arena_type_id)
+		if _offh_arena_type_matches(arena_type, map_name, gameplay_name):
+			return arena_type
 
-		def _try_get(key):
-			for getter in (
-				lambda: cache.get(key),
-				lambda: cache[key],
-				lambda: cache.getArenaType(key) if hasattr(cache, 'getArenaType') else None,
-				lambda: cache.getByID(key) if hasattr(cache, 'getByID') else None,
-				lambda: cache.getById(key) if hasattr(cache, 'getById') else None,
-			):
+		# Keep compatibility with cache wrappers, but never accept the first mode
+		# that merely shares this geometry. Mutating that object into "ctf" leaves
+		# its assault/encounter bases and control point intact on the minimap.
+		for fn_name in ('getArenaType', 'getByGeometryName', 'getByName',
+		                'getArenaTypeByName'):
+			fn = getattr(ArenaTypeModule, fn_name, None)
+			if not callable(fn):
+				continue
+			for key in (arena_type_id, map_name, map_id):
 				try:
-					at = getter()
-					if at is not None:
-						return at
+					arena_type = fn(key)
 				except Exception:
 					continue
-			return None
+				if _offh_arena_type_matches(
+						arena_type, map_name, gameplay_name):
+					return arena_type
 
-		# g_cache can be a mapping-like object; try the common access patterns.
-		at = _try_get(map_name)
-		# If stack provided short name like "himmelsdorf", try to match "04_himmelsdorf".
-		if at is None and map_name and '_' not in map_name:
-			try:
-				keys = cache.keys() if hasattr(cache, 'keys') else []
-				for k in keys:
-					try:
-						if isinstance(k, basestring) and (k == map_name or k.endswith('_' + map_name)):
-							at = _try_get(k)
-							if at is not None:
-								map_name = k
-								break
-					except Exception:
-						continue
-			except Exception:
-				LOG_CURRENT_EXCEPTION()
-		if at is not None:
-			try:
-				at.geometryName = map_name
-				at.gameplayName = gameplay_name
-			except Exception:
-				pass
-			return at
-
-		# 0.8.2: g_cache can be a dict keyed by arenaTypeID (int), with geometryName stored on values.
-		try:
-			if isinstance(cache, dict):
-				for k, v in cache.iteritems():
-					try:
-						geom = getattr(v, 'geometryName', None) or ''
-						if not isinstance(geom, basestring):
-							continue
-						geom_base = geom.split('/')[-1]
-						if geom_base == map_name or map_name.endswith(geom_base) or geom_base.endswith(map_name):
-							try:
-								v.gameplayName = gameplay_name
-							except Exception:
-								pass
-							return v
-					except Exception:
-						continue
-		except Exception:
-			LOG_CURRENT_EXCEPTION()
+		for arena_type in _offh_arena_cache_values(cache):
+			if _offh_arena_type_matches(
+					arena_type, map_name, gameplay_name):
+				return arena_type
 
 		# Diagnostics: log cache shape so we can implement the correct lookup for 0.8.2.
 		try:
@@ -6737,6 +6765,34 @@ def _resolve_real_arena_type(map_id, map_name, gameplay_name):
 	except Exception:
 		LOG_CURRENT_EXCEPTION()
 	return None
+
+
+def _offh_apply_space_visibility_mask(space_id, arena_type, gameplay_name):
+	"""Select the map UDO visibility bit normally supplied by the server."""
+	try:
+		import BigWorld
+		try:
+			import ArenaType as ArenaTypeModule
+		except ImportError:
+			try:
+				from common import arenatype as ArenaTypeModule
+			except ImportError:
+				import arenatype as ArenaTypeModule
+		setter = getattr(BigWorld, 'wg_setSpaceItemsVisibilityMask', None)
+		if not callable(setter):
+			raise RuntimeError('wg_setSpaceItemsVisibilityMask is unavailable')
+		gameplay_id = getattr(arena_type, 'gameplayID', None)
+		if gameplay_id is None:
+			gameplay_id = ArenaTypeModule.getGameplayIDForName(gameplay_name)
+		gameplay_id = int(gameplay_id)
+		visibility_mask = int(ArenaTypeModule.getVisibilityMask(gameplay_id))
+		setter(int(space_id), visibility_mask)
+		LOG_NOTE('LAN space visibility gameplay=%s id=%d mask=0x%x' % (
+			gameplay_name, gameplay_id, visibility_mask))
+		return True
+	except Exception as error:
+		LOG_ERROR('LAN space visibility setup failed: %s' % str(error))
+		return False
 
 
 def _queue_type_randoms():
@@ -6924,6 +6980,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				globals()['g_offh_mapped_space'] = space_id
 				globals()['g_offh_mapped_name'] = map_name
 				LOG_DEBUG('OfflineBattle.mappedGeometry', map_name, 'space', space_id)
+		# Chunk UDOs carry one visibility bit per gameplay mode. The retail server
+		# selects the active bit immediately after mapping the arena. Without it,
+		# Malinovka (and every multi-mode map) renders CTF, assault and encounter
+		# flags/circles together even when the battle itself is standard CTF.
+		_offh_apply_space_visibility_mask(
+			space_id, getattr(getattr(player, 'arena', None), 'arenaType', None),
+			'ctf')
 		globals()['g_offh_battle_space'] = space_id
 		globals()['g_offh_battle_mapping'] = _offh_mh
 		globals()['g_offh_battle_mapname'] = map_name
@@ -9195,7 +9258,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_perf_frame_started = _offh_perf_frame_begin(len(mock_vehicles or {}))
 				_perf_player_loop = _offh_perf_start()
 				_tank_pair_seen.clear()
-				_tank_pair_pending.clear()
 
 				# --- One-time spawn correction once the terrain has streamed in ---
 				# The initial spawn runs before the space is loaded (all ground rays
@@ -12112,18 +12174,22 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_collision_spatial[0] = _VC.build_spatial_index(
 					_collision_bodies, _collision_cell_size)
 				_offh_perf_stop('traffic_snapshot', _perf_traffic)
-				_ai_frame_budget = _offh_ai_frame_budget_plan(_local_ai_ids, dt)
+				_frame_battle_active = (getattr(
+					getattr(player, 'arena', None), 'period', 3) == 3)
+				_ai_frame_budget = _offh_ai_frame_budget_plan(
+					_local_ai_ids, dt, _frame_battle_active)
 				_order_refresh_ids = _ai_frame_budget['order']
 				_nav_refresh_ids = _ai_frame_budget['nav']
 				_driver_refresh_ids = _ai_frame_budget['driver']
 				_tree_refresh_ids = _ai_frame_budget['tree']
+				_simulation_ids = _ai_frame_budget['simulation']
 				_order_refresh_horizon = _ai_frame_budget['order_horizon']
 				_nav_refresh_horizon = _ai_frame_budget['nav_horizon']
 				_driver_refresh_horizon = _ai_frame_budget['driver_horizon']
 				_perf_bot_loop = _offh_perf_start()
-				# Stable entity order also makes every bot-bot collision pair flow from
-				# the lower id to the higher id, whose queued reciprocal correction is
-				# therefore consumed later in this same frame.
+				# Stable entity order keeps the round-robin and collision responses
+				# deterministic. Reciprocal tank corrections survive until that bot's
+				# next simulation slice instead of being discarded at the frame boundary.
 				for eid in sorted(mock_vehicles):
 					m_veh = mock_vehicles[eid]
 					if eid != getattr(player, 'playerVehicleID', -1) and getattr(m_veh, 'isAlive', False):
@@ -12150,6 +12216,21 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										continue
 								except Exception:
 									continue
+							# Native terrain, world collision and canonical pose commits all run on
+							# BigWorld's main thread. Spread them across callbacks instead of making
+							# every render frame pay for all 29 bots. The selected bot advances by
+							# its accumulated wall time, and the wall query sweeps that full travel
+							# distance, preserving speed and preventing tunnelling through geometry.
+							_simulation_pending, _simulation_dt = (
+								_offh_ai_simulation_step(
+									getattr(m_veh, '_offh_ai_simulation_elapsed', 0.0),
+									_frame_dt, eid in _simulation_ids))
+							m_veh._offh_ai_simulation_elapsed = _simulation_pending
+							if _simulation_dt <= 0.0:
+								_offh_perf_count('simulation_deferred')
+								continue
+							dt = _simulation_dt
+							_offh_perf_count('simulation_updates')
 							my_team = getattr(m_veh, '_bot_team', m_veh.publicInfo.get('team', 2) if getattr(m_veh, 'publicInfo', None) is not None else 2)
 							_td = getattr(m_veh, 'typeDescriptor', None) or loaded_models.get('td')
 							target_pos = None
