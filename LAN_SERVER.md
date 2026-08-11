@@ -76,7 +76,7 @@ With normal logging settings, each client writes these milestones to
 ```text
 LAN connecting to 192.168.1.20:28782
 LAN TCP connected to 192.168.1.20:28782
-LAN hello sent (protocol 8, build 1.8.25-test-20260810)
+LAN hello sent (protocol 8, build 1.8.26-test-20260810)
 LAN welcome id=1 name=Player-158 vehicle=china:Type_59 team=1 slot=0 map=... phase=waiting
 LAN JOIN confirmed; queue screen is now server-backed
 LAN queue UI updated: 2 connected player(s)
@@ -122,6 +122,18 @@ fallback instead of reusing a stale waypoint.
 Each actual client-simulated shot also prints `BOT FIRE`. This separates
 spotting, delivery, navigation and client execution without enabling verbose
 client debug logging.
+
+The server also prints one process/tick profile every five seconds while a
+battle is active:
+
+```text
+SERVER PERF cpu_core=2.8% tick=30.0Hz avg=0.92ms p95=1.31ms max=2.40ms overruns=0 late_max=0.00ms stage=move:0.02,plan:0.18,nav:0.61,snapshot:0.01,diag:0.01,dispatch:0.07,events:0.00ms wire=encode:0.03,socket:0.02ms messages=30.0/s data=18.0KiB/s
+```
+
+`cpu_core` is Python process CPU relative to one core, not whole-machine CPU.
+The server has a 33.3 ms budget at 30 Hz. Sustained `p95` below that budget and
+`overruns=0` rule out a saturated server tick; `wire.socket` exposes a slow
+client or blocked network send separately from planner/navigation cost.
 
 Long terrain routes use bounded weighted-A* continuations instead of one large
 search per bot. Moving tanks are handled by the local driver and are not baked

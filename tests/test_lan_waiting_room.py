@@ -6,7 +6,7 @@ import unittest
 
 from lan_battle_server import (
     BattleState, CLIENT_BUILD, ClientHandler, PROTOCOL_VERSION, TICK_HZ,
-    ThreadedTCPServer,
+    ThreadedTCPServer, _ServerPerfWindow,
 )
 
 
@@ -89,6 +89,37 @@ class WaitingRoomTest(unittest.TestCase):
 
     def test_server_snapshots_run_at_thirty_hz(self):
         self.assertEqual(30.0, TICK_HZ)
+
+    def test_server_perf_window_reports_tick_cpu_and_stage_costs(self):
+        window = _ServerPerfWindow(started_at=10.0, process_started_at=3.0)
+        window.add({
+            "planner_seconds": 0.002,
+            "navigation_seconds": 0.004,
+            "encode_seconds": 0.001,
+            "socket_seconds": 0.0005,
+            "messages": 2,
+            "bytes": 4096,
+        }, elapsed_seconds=0.010, late_seconds=0.0, interval_seconds=1.0 / 30.0)
+        window.add({
+            "planner_seconds": 0.004,
+            "navigation_seconds": 0.006,
+            "encode_seconds": 0.001,
+            "socket_seconds": 0.0005,
+            "messages": 2,
+            "bytes": 4096,
+        }, elapsed_seconds=0.040, late_seconds=0.007, interval_seconds=1.0 / 30.0)
+
+        summary = window.summary(now=15.0, process_now=4.0)
+
+        self.assertEqual(2, summary["ticks"])
+        self.assertAlmostEqual(20.0, summary["cpu_percent"])
+        self.assertAlmostEqual(25.0, summary["tick_avg_ms"])
+        self.assertAlmostEqual(40.0, summary["tick_p95_ms"])
+        self.assertEqual(1, summary["overruns"])
+        self.assertAlmostEqual(3.0, summary["stage_ms"]["planner"])
+        self.assertAlmostEqual(5.0, summary["stage_ms"]["navigation"])
+        self.assertAlmostEqual(0.8, summary["messages_per_second"])
+        self.assertAlmostEqual(1.6, summary["kilobytes_per_second"])
 
     def test_one_player_can_start_from_clickable_panel_request(self):
         client = self.connect("Solo")

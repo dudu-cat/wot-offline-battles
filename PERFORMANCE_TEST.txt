@@ -49,6 +49,10 @@ physics_motion    Acceleration, wall checks, tank collision, and hull turn.
 physics_ground    Ground support, tilt, fall, and slope-slide handling.
 physics_safety    Final water/cliff rollback guards.
 physics_rays      Native terrain/wall rays issued by the physics stages.
+drive_pitch_reuse Previous-frame grounded pitch reused behind pose fences.
+drive_pitch_exact Bridge-aware fore/aft pitch probes that still ran.
+tilt_support_reuse
+                  Same-frame terrain support reused for hull fore/aft tilt.
 kinematics        Pure speed and hull-turn calculations.
 pose_water        Hull-footprint water safety checks.
 terrain_support   Ground support under the hull.
@@ -98,6 +102,15 @@ The server terminal must also report `BOT NAV active=True`, `failed=0`, and a
 maximum search budget near 6 ms or lower. A short non-zero `pending` count
 during the opening second is expected; an `oldest` value that keeps growing is
 not.
+
+Build 1.8.26 also prints one `SERVER PERF` line every five seconds during a
+battle. `cpu_core` is process CPU as a percentage of one core; `avg`, `p95`
+and `max` are complete server-tick times. `stage` separates movement, planning,
+navigation, snapshots, diagnostics and dispatch, while `wire` separates JSON
+encoding from socket writes. A healthy 30 Hz server remains well below the
+33.3 ms tick budget with `overruns=0`; high client ping alongside a healthy
+server line points to client scheduling/render starvation rather than a busy
+server process.
 
 LAN NET separates transport and scheduling stalls. max_socket_gap is a real
 receive pause; max_queue_age means the packet arrived but the game thread was

@@ -31,8 +31,9 @@ from server_bot_navigation import BotPathResolver
 
 
 PROTOCOL_VERSION = 8
-CLIENT_BUILD = "1.8.25-test-20260810"
+CLIENT_BUILD = "1.8.26-test-20260810"
 TICK_HZ = 30.0
+SERVER_PERF_LOG_SECONDS = 5.0
 PREBATTLE_COUNTDOWN_SECONDS = 30.0
 BATTLE_DURATION_SECONDS = 900.0
 MAX_LINE_BYTES = 256 * 1024
@@ -112,6 +113,77 @@ def _safe_vehicle(value, fallback):
     return value[:64] or fallback
 
 
+def _percentile(values, fraction):
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = int(math.ceil((len(ordered) - 1) * float(fraction)))
+    return float(ordered[max(0, min(index, len(ordered) - 1))])
+
+
+class _ServerPerfWindow:
+    """Low-frequency process and battle-tick diagnostics."""
+
+    STAGES = (
+        "movement", "planner", "navigation", "snapshot", "diagnostics",
+        "recipients", "events", "encode", "socket",
+    )
+
+    def __init__(self, started_at=None, process_started_at=None):
+        self.reset(started_at, process_started_at)
+
+    def reset(self, started_at=None, process_started_at=None):
+        self.started_at = time.monotonic() if started_at is None else float(started_at)
+        self.process_started_at = (
+            time.process_time() if process_started_at is None else float(process_started_at))
+        self.tick_ms = []
+        self.late_ms = []
+        self.overruns = 0
+        self.messages = 0
+        self.bytes = 0
+        self.stage_seconds = dict((name, 0.0) for name in self.STAGES)
+
+    def add(self, metrics, elapsed_seconds, late_seconds, interval_seconds):
+        if metrics is None:
+            return
+        self.tick_ms.append(max(0.0, float(elapsed_seconds)) * 1000.0)
+        self.late_ms.append(max(0.0, float(late_seconds)) * 1000.0)
+        if elapsed_seconds > interval_seconds:
+            self.overruns += 1
+        for name in self.STAGES:
+            self.stage_seconds[name] += float(metrics.get(name + "_seconds", 0.0))
+        self.messages += int(metrics.get("messages", 0))
+        self.bytes += int(metrics.get("bytes", 0))
+
+    def ready(self, now):
+        return bool(self.tick_ms and now - self.started_at >= SERVER_PERF_LOG_SECONDS)
+
+    def summary(self, now=None, process_now=None):
+        now = time.monotonic() if now is None else float(now)
+        process_now = time.process_time() if process_now is None else float(process_now)
+        wall_seconds = max(0.001, now - self.started_at)
+        ticks = len(self.tick_ms)
+        cpu_percent = max(
+            0.0, (process_now - self.process_started_at) * 100.0 / wall_seconds)
+        stage_ms = dict(
+            (name, self.stage_seconds[name] * 1000.0 / max(1, ticks))
+            for name in self.STAGES)
+        return {
+            "wall_seconds": wall_seconds,
+            "ticks": ticks,
+            "tick_hz": ticks / wall_seconds,
+            "cpu_percent": cpu_percent,
+            "tick_avg_ms": sum(self.tick_ms) / max(1, ticks),
+            "tick_p95_ms": _percentile(self.tick_ms, 0.95),
+            "tick_max_ms": max(self.tick_ms or [0.0]),
+            "late_max_ms": max(self.late_ms or [0.0]),
+            "overruns": self.overruns,
+            "messages_per_second": self.messages / wall_seconds,
+            "kilobytes_per_second": self.bytes / wall_seconds / 1024.0,
+            "stage_ms": stage_ms,
+        }
+
+
 @dataclass
 class Player:
     player_id: int
@@ -145,16 +217,24 @@ class Player:
     last_send_error: str = ""
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def send(self, message):
+    def send(self, message, perf=None):
         if not self.connected:
             return False
+        encode_started = time.perf_counter()
         payload = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
+        if perf is not None:
+            perf["encode_seconds"] += time.perf_counter() - encode_started
+            perf["messages"] += 1
+            perf["bytes"] += len(payload)
         if len(payload) > MAX_LINE_BYTES:
             self.last_send_error = "outbound message exceeds %d bytes" % MAX_LINE_BYTES
             return False
         try:
+            socket_started = time.perf_counter()
             with self.send_lock:
                 self.conn.sendall(payload)
+            if perf is not None:
+                perf["socket_seconds"] += time.perf_counter() - socket_started
             if "bot_orders" in message:
                 try:
                     self.bot_order_revision_sent = int(message.get("bot_order_revision", -1))
@@ -163,6 +243,8 @@ class Player:
                     pass
             return True
         except (BrokenPipeError, ConnectionError, OSError) as error:
+            if perf is not None:
+                perf["socket_seconds"] += time.perf_counter() - socket_started
             self.last_send_error = "%s: %s" % (type(error).__name__, error)
             self.connected = False
             return False
@@ -1133,20 +1215,30 @@ class BattleState:
             player.z = _clamp(player.z, -220.0, 220.0)
 
     def tick_once(self, dt):
+        metrics = dict((name + "_seconds", 0.0) for name in _ServerPerfWindow.STAGES)
+        metrics["messages"] = 0
+        metrics["bytes"] = 0
         with self.lock:
             if self.phase != "battle":
                 return
             self.tick += 1
+            stage_started = time.perf_counter()
             for player in list(self.players.values()):
                 self._apply_movement(player, dt)
+            metrics["movement_seconds"] = time.perf_counter() - stage_started
             now = time.monotonic()
+            stage_started = time.perf_counter()
             self.bot_orders = self.bot_planner.build_orders(
                 self.bot_manifest, list(self.bot_states.values()),
                 [self._public_player(p) for p in self.players.values() if p.connected],
                 now)
+            metrics["planner_seconds"] = time.perf_counter() - stage_started
+            stage_started = time.perf_counter()
             self.bot_navigation_targets = self.bot_navigation.resolve(
                 self.bot_orders.get("orders"), list(self.bot_states.values()),
                 self.bot_orders.get("revision", 0), now)
+            metrics["navigation_seconds"] = time.perf_counter() - stage_started
+            stage_started = time.perf_counter()
             ai_debug = None
             if self.bot_manifest and now >= self.next_bot_ai_log:
                 self.next_bot_ai_log = now + 3.0
@@ -1154,6 +1246,8 @@ class BattleState:
                 ai_debug["reported"] = dict(self.bot_observation_stats)
                 ai_debug["navigation"] = dict(self.bot_navigation_stats)
                 ai_debug["server_navigation"] = self.bot_navigation.diagnostics()
+            metrics["diagnostics_seconds"] = time.perf_counter() - stage_started
+            stage_started = time.perf_counter()
             events = self.pending_events
             self.pending_events = []
             snapshot_bots = []
@@ -1182,6 +1276,8 @@ class BattleState:
             authority = self.players.get(self.bot_authority_id)
             authority_order_ack = (
                 int(authority.bot_order_revision_ack) if authority is not None else -1)
+            metrics["snapshot_seconds"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
         if ai_debug is not None:
             teams = ai_debug["teams"]
             reports = ai_debug["reported"]
@@ -1272,6 +1368,8 @@ class BattleState:
                     server_navigation.get("avg_plan_ms", 0.0),
                     server_navigation.get("max_plan_ms", 0.0),
                     server_navigation.get("paths", 0)))
+        metrics["diagnostics_seconds"] += time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
         failed_recipients = []
         for player in recipients:
             outgoing = snapshot
@@ -1283,7 +1381,7 @@ class BattleState:
             if needs_order_body:
                 outgoing = dict(snapshot)
                 outgoing["bot_orders"] = list(self.bot_orders["orders"])
-            if not player.send(outgoing):
+            if not player.send(outgoing, metrics):
                 failed_recipients.append(player)
         for player in failed_recipients:
             removed, reset = self.remove_player(player.player_id)
@@ -1297,6 +1395,8 @@ class BattleState:
                     self.round_id, self.map_name))
         if failed_recipients:
             self.broadcast(self.lobby_message())
+        metrics["recipients_seconds"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
         if events:
             for event in events:
                 if event.get("kind") == "shot":
@@ -1324,7 +1424,10 @@ class BattleState:
                 elif event.get("kind") == "battle_result":
                     _server_log("BATTLE RESULT winner=%s reason=%s base_team=%s" % (
                         event.get("winner"), event.get("reason"), event.get("base_team")))
-            self.broadcast({"type": "events", "server_tick": self.tick, "events": events})
+            self.broadcast(
+                {"type": "events", "server_tick": self.tick, "events": events}, metrics)
+        metrics["events_seconds"] = time.perf_counter() - stage_started
+        return metrics
 
     @staticmethod
     def _public_player(player):
@@ -1352,11 +1455,11 @@ class BattleState:
             "killer_id": player.killer_id,
         }
 
-    def broadcast(self, message):
+    def broadcast(self, message, perf=None):
         with self.lock:
             players = list(self.players.values())
         for player in players:
-            if not player.send(message):
+            if not player.send(message, perf):
                 self.remove_player(player.player_id)
 
 
@@ -1579,17 +1682,54 @@ def run_server(host, port, map_name, max_players):
         interval = 1.0 / TICK_HZ
         next_tick = time.monotonic()
         next_error_log = 0.0
+        perf_window = _ServerPerfWindow()
+        perf_active = False
         while state.running:
             next_tick += interval
+            tick_started = time.monotonic()
+            process_started = time.process_time()
+            metrics = None
             try:
-                state.tick_once(min(interval, 0.1))
+                metrics = state.tick_once(min(interval, 0.1))
             except Exception:
                 now = time.monotonic()
                 if now >= next_error_log:
                     next_error_log = now + 2.0
                     _server_log("BATTLE TICK ERROR (server remains running):\n%s" % (
                         traceback.format_exc().rstrip()))
-            delay = next_tick - time.monotonic()
+            tick_finished = time.monotonic()
+            if metrics is None:
+                if perf_active:
+                    perf_window.reset(tick_finished, time.process_time())
+                perf_active = False
+            else:
+                if not perf_active:
+                    perf_window.reset(tick_started, process_started)
+                    perf_active = True
+                perf_window.add(
+                    metrics, tick_finished - tick_started,
+                    max(0.0, tick_finished - next_tick), interval)
+                if perf_window.ready(tick_finished):
+                    process_finished = time.process_time()
+                    summary = perf_window.summary(tick_finished, process_finished)
+                    stages = summary["stage_ms"]
+                    _server_log(
+                        "SERVER PERF cpu_core=%.1f%% tick=%.1fHz avg=%.2fms p95=%.2fms "
+                        "max=%.2fms overruns=%d late_max=%.2fms "
+                        "stage=move:%.2f,plan:%.2f,nav:%.2f,snapshot:%.2f,diag:%.2f,dispatch:%.2f,events:%.2fms "
+                        "wire=encode:%.2f,socket:%.2fms messages=%.1f/s data=%.1fKiB/s" % (
+                            summary["cpu_percent"], summary["tick_hz"],
+                            summary["tick_avg_ms"], summary["tick_p95_ms"],
+                            summary["tick_max_ms"], summary["overruns"],
+                            summary["late_max_ms"], stages["movement"],
+                            stages["planner"], stages["navigation"],
+                            stages["snapshot"], stages["diagnostics"],
+                            stages["recipients"], stages["events"],
+                            stages["encode"], stages["socket"],
+                            summary["messages_per_second"],
+                            summary["kilobytes_per_second"]))
+                    perf_window.reset(tick_finished, process_finished)
+            delay = next_tick - tick_finished
             if delay > 0:
                 time.sleep(delay)
             else:

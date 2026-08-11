@@ -1,5 +1,5 @@
 Release: v1.0.1
 Game client: World of Tanks 0.8.2 (Windows)
 LAN protocol: 8
-Client build: 1.8.25-test-20260810
+Client build: 1.8.26-test-20260810
 Source commit: see the package TEST_NOTES.txt

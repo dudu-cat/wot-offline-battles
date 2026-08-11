@@ -231,6 +231,7 @@ def _offh_perf_frame_end(started, frame_dt, player):
 	           'direction', 'direction_baked', 'direction_exact', 'physics',
 	           'physics_state', 'physics_motion', 'physics_ground',
 	           'physics_safety', 'physics_rays',
+	           'drive_pitch_reuse', 'drive_pitch_exact', 'tilt_support_reuse',
 	           'bot_effects', 'kinematics', 'bot_audio',
 	           'nav_paused', 'tactic_route', 'tactic_hold', 'tactic_manoeuvre',
 	           'driver_drive', 'driver_avoid', 'driver_wait', 'driver_recovery',
@@ -901,7 +902,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.25-test (2026-08-10) authority-frame-fast-paths'
+_OFFH_BUILD = '1.8.26-test (2026-08-10) terrain-sample-reuse'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -9482,7 +9483,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					_mock_vehicles = globals().get('G_MOCK_VEHICLES', {})
 					debug_utils.LOG_DEBUG('AIH_TICK keys:', _mock_vehicles.keys())
 					
-				def _get_terrain_ypr(spaceID, pos, yaw, length=5.0, width=3.0):
+				def _get_terrain_ypr(spaceID, pos, yaw, length=5.0, width=3.0,
+						support=None, support_span=None):
 					import math, BigWorld, Math
 					cos_y = math.cos(yaw)
 					sin_y = math.sin(yaw)
@@ -9503,6 +9505,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					
 					def get_y(x, z):
 						try:
+							_offh_perf_count('physics_rays')
 							# Ray from well above: the old +1.5 start sat BELOW steep uphill
 							# ground so the hull stayed flat. Accept ground within a hull-height
 							# window; reject walls/roofs far above and holes/cliffs far below.
@@ -9512,13 +9515,34 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						except: pass
 						return pos.y
 					
-					_offh_perf_count('physics_rays', 4)
-					fy = get_y(fx, fz)
-					by = get_y(bx, bz)
+					# Terrain support already sampled the same fore/aft footprint this
+					# frame. Reuse those exact hits for pitch and spend engine rays only
+					# on the left/right footprint. Invalid or differently scaled support
+					# fails closed to the original four-ray path.
+					fy = None
+					by = None
+					_fore_span = float(length)
+					try:
+						_sf = support[2]
+						_sb = support[3]
+						_ss = max(0.5, float(support_span))
+						if (_sf is not None and _sb is not None and
+								-14.0 < (_sf - pos.y) < 6.0 and
+								-14.0 < (_sb - pos.y) < 6.0):
+							fy = _sf
+							by = _sb
+							_fore_span = _ss * 2.0
+							_offh_perf_count('tilt_support_reuse')
+					except Exception:
+						pass
+					if fy is None or by is None:
+						fy = get_y(fx, fz)
+						by = get_y(bx, bz)
+						_fore_span = float(length)
 					ry = get_y(rx, rz)
 					ly = get_y(lx, lz)
-					
-					pitch = -math.atan2(fy - by, length)
+
+					pitch = -math.atan2(fy - by, _fore_span)
 					roll = math.atan2(ry - ly, width)
 
 					# Suspension + tip guard. The hull tilts toward the true downhill but
@@ -9543,7 +9567,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					slide_z = 0.0
 					slope = 0.0
 					try:
-						grad_f = (by - fy) / length   # + = downhill toward hull front
+						grad_f = (by - fy) / _fore_span   # + = downhill toward hull front
 						grad_l = (ly - ry) / width    # + = downhill toward hull right
 						slope = math.sqrt(grad_f * grad_f + grad_l * grad_l)
 						if slope > 0.001:
@@ -9560,7 +9584,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					return (yaw, pitch, roll, slide_x, slide_z, slope, _spread)
 
 				def _terrain_support(spaceID, px, py, pz, yaw, hl=2.5):
-					# Returns (supportMax, centreY):
+					# Returns (supportMax, centreY, frontY, backY):
 					#   supportMax = HIGHEST ground under the fore-aft track footprint
 					#     (front/centre/back). A grounded tracked hull rests on the
 					#     highest ground it touches, belly hanging - use this for the
@@ -9575,6 +9599,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					_sy = math.sin(yaw); _cy = math.cos(yaw)
 					best = None
 					centre = None
+					front = None
+					back = None
 					_offh_perf_count('physics_rays', 3)
 					for _d in (hl, 0.0, -hl):
 						_x = px + _sy * _d
@@ -9589,7 +9615,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								best = _yv
 							if _d == 0.0:
 								centre = _yv
-					return (best, centre)
+							elif _d > 0.0:
+								front = _yv
+							else:
+								back = _yv
+					return (best, centre, front, back)
 
 				def _try_destroy_destructible(spaceID, matInfo, yaw, vel):
 					import AreaDestructibles, BigWorld, constants
@@ -9996,6 +10026,31 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									LOG_DEBUG('RAM:', self_id, '<->', oid, 'rel=%.1f' % _rel, 'dmg', _dmo, _dms)
 					return (corr_x, corr_z, dvx, dvz)
 
+				def _support_drive_pitch(y, support, half_span):
+					# Convert terrain_support's fore/aft samples to the exact pitch law
+					# used by _drive_pitch. None means the support cannot safely replace
+					# the original bridge-aware probes.
+					import math
+					try:
+						fy = support[2]
+						by = support[3]
+						L = max(0.5, float(half_span))
+					except Exception:
+						return None
+					if fy is None or by is None:
+						return None
+					_WALL_RISE = L * 1.43
+					_fd = fy - y
+					if _fd > _WALL_RISE: _fd = _WALL_RISE
+					elif _fd < -_WALL_RISE: _fd = -_WALL_RISE
+					_bd = by - y
+					if _bd > _WALL_RISE: _bd = _WALL_RISE
+					elif _bd < -_WALL_RISE: _bd = -_WALL_RISE
+					p = -math.atan2(_fd - _bd, 2.0 * L)
+					if p > 0.96: p = 0.96
+					if p < -0.96: p = -0.96
+					return p
+
 				def _drive_pitch(spaceID, x, z, yaw, y):
 					# Fore/aft GROUND slope under the hull (nose-up = negative, BigWorld
 					# convention) for the drive/slide physics. Sampled close to the hull
@@ -10008,8 +10063,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					import math, BigWorld, Math
 					fx = math.sin(yaw); fz = math.cos(yaw)
 					L = 2.0
-					_WALL_RISE = L * 1.43   # ~55 deg over L: real steep slopes register
-					                        # (so they slide); only near-vertical walls clamp
 					def _gy(px, pz):
 						# Skip geometry ABOVE the hull. The probe starts 15 m up so an uphill sample
 						# ahead is still caught, but that also made it hit a BRIDGE DECK when driving
@@ -10035,20 +10088,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						return None
 					fy = _gy(x + fx * L, z + fz * L)
 					by = _gy(x - fx * L, z - fz * L)
-					if fy is None or by is None:
-						return 0.0
-					# Clamp each side's height delta to the drivable band: a wall ahead
-					# (huge rise) or a cliff (huge drop) must not tilt the physics.
-					_fd = fy - y
-					if _fd > _WALL_RISE: _fd = _WALL_RISE
-					elif _fd < -_WALL_RISE: _fd = -_WALL_RISE
-					_bd = by - y
-					if _bd > _WALL_RISE: _bd = _WALL_RISE
-					elif _bd < -_WALL_RISE: _bd = -_WALL_RISE
-					p = -math.atan2(_fd - _bd, 2.0 * L)
-					if p > 0.96: p = 0.96      # ~55 deg: real slopes keep full gravity/slide
-					if p < -0.96: p = -0.96
-					return p
+					p = _support_drive_pitch(y, (None, None, fy, by), L)
+					return 0.0 if p is None else p
 
 				def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None, airborne=False, dt=0.04):
 					import math, BigWorld, Math
@@ -13088,7 +13129,29 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								m_veh._dp_acc = (getattr(m_veh, '_dp_acc', 9.0) or 9.0) + dt
 								if m_veh._dp_acc >= 0.15:
 									m_veh._dp_acc = 0.0
-									_braw = _drive_pitch(_ai_space_id, m_veh.position.x, m_veh.position.z, m_veh.yaw, m_veh.position.y)
+									# The previous frame's terrain-support footprint was sampled at
+									# this same canonical pose. Reuse it when no later slide, rollback
+									# or collision displaced the hull; otherwise retain the original
+									# bridge-aware probes. This removes duplicate engine rays without
+									# changing the pitch cadence or accepting stale terrain.
+									_braw = None
+									_bsp = getattr(m_veh, '_offh_drive_support', None)
+									if _bsp is not None:
+										_bdx = float(m_veh.position.x) - float(_bsp[0])
+										_bdy = float(m_veh.position.y) - float(_bsp[1])
+										_bdz = float(m_veh.position.z) - float(_bsp[2])
+										_bda = float(m_veh.yaw) - float(_bsp[3])
+										while _bda > math.pi: _bda -= 2.0 * math.pi
+										while _bda < -math.pi: _bda += 2.0 * math.pi
+										if (_bdx * _bdx + _bdz * _bdz <= 0.16 and
+												abs(_bdy) <= 0.40 and abs(_bda) <= 0.10):
+											_braw = float(_bsp[4])
+											_offh_perf_count('drive_pitch_reuse')
+									if _braw is None:
+										_braw = _drive_pitch(
+											_ai_space_id, m_veh.position.x, m_veh.position.z,
+											m_veh.yaw, m_veh.position.y)
+										_offh_perf_count('drive_pitch_exact')
 									# smooth probe spikes (same reason as the player)
 									_bprev = getattr(m_veh, '_dp_v', _braw) or 0.0
 									_bd = _braw - _bprev
@@ -13218,6 +13281,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_offh_perf_stop('physics_motion', _perf_physics_motion)
 							_perf_physics_ground = _offh_perf_start()
 							# TERRAIN SNAP (ray starts just above the hull so bridges overhead are ignored)
+							_bsup = None
+							_bsup_rejected = False
 							try:
 								# Highest ground under the fore-aft footprint (same law as the player)
 								_bhl = 2.5
@@ -13239,6 +13304,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_bland_y = _bg_y if _bc_y is None else _bc_y
 									if _VC.support_rise_is_obstacle(
 											m_veh.position.y, _bc_y, _b_climb):
+										_bsup_rejected = True
 										# The centre support ray hit the top of a wagon, roof or large
 										# prop after horizontal integration moved the hull partly inside
 										# it.  Never pop the tank vertically onto that surface.  Restore
@@ -13292,15 +13358,33 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											_bfall_i += 1
 										m_veh._vert_vel = _bvv
 										m_veh.position = Math.Vector3(m_veh.position.x, _by, m_veh.position.z)
-							except: pass
-							
-							# perf: 4-ray tilt sampling alternates frames per bot; yaw stays live,
+							except:
+								_bsup = None
+							# Cache only support that still belongs to the realised grounded
+							# pose. A later slide/rollback is detected by the pose fence above.
+							if (_bsup is not None and not _bsup_rejected and
+									not getattr(m_veh, '_airborne', False)):
+								_bsupport_pitch = _support_drive_pitch(
+									m_veh.position.y, _bsup, _bhl)
+								if _bsupport_pitch is not None:
+									m_veh._offh_drive_support = (
+										float(m_veh.position.x), float(m_veh.position.y),
+										float(m_veh.position.z), float(m_veh.yaw),
+										float(_bsupport_pitch))
+								else:
+									m_veh._offh_drive_support = None
+							else:
+								m_veh._offh_drive_support = None
+
+							# Tilt sampling alternates frames per bot; fore/aft support from
+							# this frame removes two of its four engine rays when valid.
 							# the pitch/roll smoothing below hides the halved sample rate
 							m_veh._ypr_fc = (getattr(m_veh, '_ypr_fc', 0) or 0) + 1
 							if getattr(m_veh, '_ypr_c', None) is None or ((m_veh._ypr_fc + eid) & (1 if getattr(m_veh, '_spot_visible', True) else 3)) == 0:
 									m_veh._ypr_c = _offh_perf_call(
 									'terrain_tilt', _get_terrain_ypr, _ai_space_id,
-										m_veh.position, m_veh.yaw)
+										m_veh.position, m_veh.yaw, 5.0, 3.0,
+										_bsup if not _bsup_rejected else None, _bhl)
 							_b_ypr = (m_veh.yaw, m_veh._ypr_c[1], m_veh._ypr_c[2], m_veh._ypr_c[3], m_veh._ypr_c[4], m_veh._ypr_c[5])
 							# --- Slope slide (bot): same WG law + cross-heading projection as player ---
 							_bss = getattr(m_veh, '_slide_spd', 0.0) or 0.0

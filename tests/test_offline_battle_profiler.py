@@ -180,6 +180,9 @@ class OfflineBattleProfilerTests(unittest.TestCase):
             "physics_ground",
             "physics_safety",
             "physics_rays",
+            "drive_pitch_reuse",
+            "drive_pitch_exact",
+            "tilt_support_reuse",
             "bot_effects",
             "kinematics",
             "bot_audio",
@@ -201,6 +204,19 @@ class OfflineBattleProfilerTests(unittest.TestCase):
             self.assertIn("'%s'" % stage, source)
         self.assertIn("PERF window=%.1fs role=%s bots=%d fps=%.1f", source)
         self.assertIn("_OFFH_PERF_REPORT_SECONDS = 5.0", source)
+
+    def test_bot_ground_samples_are_reused_only_behind_pose_fences(self):
+        source = SOURCE.read_text()
+
+        self.assertIn("return (best, centre, front, back)", source)
+        self.assertIn("def _support_drive_pitch(y, support, half_span):", source)
+        self.assertIn("m_veh._offh_drive_support = (", source)
+        self.assertIn("_bdx * _bdx + _bdz * _bdz <= 0.16", source)
+        self.assertIn("abs(_bdy) <= 0.40 and abs(_bda) <= 0.10", source)
+        self.assertIn("if _braw is None:", source)
+        self.assertIn("_braw = _drive_pitch(", source)
+        self.assertIn("_bsup if not _bsup_rejected else None, _bhl", source)
+        self.assertIn("_offh_perf_count('tilt_support_reuse')", source)
 
     def test_driver_mode_diagnostics_are_refreshed_after_server_wait(self):
         source = SOURCE.read_text()
