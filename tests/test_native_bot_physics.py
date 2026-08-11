@@ -68,7 +68,7 @@ class VehicleFilter(object):
         self.triangles = []
         self.input = None
         self.physics = None
-        self.placingCompensationMatrix = object()
+        self.placingCompensationMatrix = Matrix()
         self.physicsInfo = object()
         self.movementInfo = object()
         self.owner = None
@@ -78,6 +78,7 @@ class VehicleFilter(object):
 
     def setVehiclePhysics(self, physics):
         self.physics = physics
+        physics.vehicle_filter = self
         self.contacts_at_attach = (
             physics.allowTracksContacts,
             physics.allowCarcassContacts,
@@ -126,6 +127,9 @@ class VehiclePhysics(object):
         self._allow_carcass_contacts = False
         self.static_history = []
         self.drive_history = []
+        self.gotTracksContact = False
+        self.gotCarcassContact = False
+        self.isFrozenDuringFrame = False
 
     @property
     def staticMode(self):
@@ -178,6 +182,35 @@ class VehiclePhysics(object):
         self.bounds = (minimum, maximum)
 
 
+class DynamicsSimulator(object):
+    instances = []
+    produce_contacts = True
+
+    def __init__(self):
+        self.numSubsteps = 1
+        self.numIterations = 10
+        self.frictionRatio = 1.0
+        self.restitution = 0.5
+        self.allowedPenetration = 0.01
+        self.midSolvingIterations = 4
+        self.calls = []
+        self.fail_update = False
+        self.mutate_before_failure = False
+        DynamicsSimulator.instances.append(self)
+
+    def update(self, dt, vehicles, bodies):
+        self.calls.append((float(dt), tuple(vehicles), tuple(bodies)))
+        if self.fail_update:
+            if self.mutate_before_failure:
+                for physics in vehicles:
+                    physics.vehicle_filter.owner.matrix.translation.x += 100.0
+            raise RuntimeError("simulator update failed")
+        for physics in vehicles:
+            physics.gotTracksContact = bool(self.produce_contacts)
+            physics.gotCarcassContact = bool(self.produce_contacts)
+            physics.isFrozenDuringFrame = bool(physics.isFrozen)
+
+
 class Entity(object):
     def __init__(self, entity_id):
         self.id = entity_id
@@ -218,11 +251,14 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.reject_post_attach_seed = False
         self.defer_post_attach_seed = False
         self.deferred_seed = None
+        DynamicsSimulator.instances = []
+        DynamicsSimulator.produce_contacts = True
 
         bigworld = types.ModuleType("BigWorld")
         bigworld.time = lambda: self.now
         bigworld.WGVehicleFilter2 = VehicleFilter
         bigworld.WGVehiclePhysics2 = VehiclePhysics
+        bigworld.WGDynamicsSimulator = DynamicsSimulator
         bigworld.AvatarFilter = AvatarFilter
         bigworld.Servo = lambda provider: ("servo", provider)
         self.ground_supported = True
@@ -283,6 +319,12 @@ class NativeBotPhysicsTest(unittest.TestCase):
 
         physics_shared = types.ModuleType("physics_shared")
         physics_shared.initVehiclePhysics = lambda physics, descriptor: None
+        physics_shared.NUM_SUBSTEPS = 2
+        physics_shared.NUM_ITERATIONS = 10
+        physics_shared.FRICTION_RATIO = 1.0
+        physics_shared.RESTITUTION = 0.5
+        physics_shared.ALLOWED_PENETRATION = 0.01
+        physics_shared.MID_SOLVING_ITERATIONS = 4
 
         arena_type = types.ModuleType("ArenaType")
         arena_type.getVisibilityMask = lambda unused_gameplay: 3
@@ -386,6 +428,14 @@ class NativeBotPhysicsTest(unittest.TestCase):
         sys.modules.clear()
         sys.modules.update(self.saved_modules)
 
+    def simulate(self, mocks=None, dt=0.02, timestamp=None):
+        if mocks is None:
+            mocks = {self.mock.id: self.mock}
+        if timestamp is None:
+            self.now += dt
+            timestamp = self.now
+        return self.native.simulate_frame(mocks, dt, timestamp)
+
     def activate(self, throttle=1, turn=1):
         self.assertTrue(self.native.prepare(
             self.player, self.mock, self.descriptor, 7, self.now
@@ -394,6 +444,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.assertTrue(self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7, self.now
         )["staging"])
+        self.assertEqual(1, self.simulate())
         self.now += self.native.WARMUP_SECONDS + 0.01
         return self.native.step(
             self.player, self.mock, self.descriptor,
@@ -416,6 +467,170 @@ class NativeBotPhysicsTest(unittest.TestCase):
             "NATIVE_BOT_PHYSICS drive active" in message and
             "signals=9 frozen=False" in message
             for level, message in self.logs if level == "note"
+        ))
+
+    def test_shared_dynamics_simulator_batches_bodies_once_in_id_order(self):
+        other, other_entity = self.make_mock(10, 902, 20.0)
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.assertTrue(self.native.prepare(
+            self.player, other, self.descriptor, 7, self.now
+        ))
+        attach_at = self.now + self.native.SEED_CHECK_SECONDS + 0.01
+        self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, attach_at
+        )
+        self.native.step(
+            self.player, other, self.descriptor, 0, 0, 7, attach_at + 0.01
+        )
+
+        mocks = {self.mock.id: self.mock, other.id: other}
+        solve_at = attach_at + 0.02
+        self.assertEqual(2, self.native.simulate_frame(
+            mocks, 0.02, solve_at
+        ))
+        self.assertEqual(0, self.native.simulate_frame(
+            mocks, 0.02, solve_at
+        ))
+
+        self.assertEqual(1, len(DynamicsSimulator.instances))
+        simulator = DynamicsSimulator.instances[0]
+        self.assertEqual(2, simulator.numSubsteps)
+        self.assertEqual(10, simulator.numIterations)
+        self.assertEqual(1.0, simulator.frictionRatio)
+        self.assertEqual(0.5, simulator.restitution)
+        self.assertEqual(0.01, simulator.allowedPenetration)
+        self.assertEqual(4, simulator.midSolvingIterations)
+        self.assertEqual(1, len(simulator.calls))
+        self.assertEqual((
+            other_entity.wgPhysics, self.entity.wgPhysics,
+        ), simulator.calls[0][1])
+        self.assertEqual((), simulator.calls[0][2])
+
+    def test_warmup_without_batch_simulation_falls_back(self):
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+        self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+        self.now += self.native.WARMUP_SECONDS + 0.01
+
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual("failed", getattr(
+            self.mock, self.native.STATE_ATTR
+        )["phase"])
+        self.assertIsInstance(self.entity.filter, AvatarFilter)
+        self.assertTrue(any(
+            "dynamics simulator did not advance" in message
+            for level, message in self.logs if level == "error"
+        ))
+
+    def test_warmup_does_not_require_unreliable_contact_output_flags(self):
+        DynamicsSimulator.produce_contacts = False
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+        self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+        self.assertEqual(1, self.simulate())
+        self.now += self.native.WARMUP_SECONDS + 0.01
+
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual("active", getattr(
+            self.mock, self.native.STATE_ATTR
+        )["phase"])
+
+    def test_warmup_rejects_a_finite_pose_buried_below_real_support(self):
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+        self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+        self.assertEqual(1, self.simulate())
+        self.entity.matrix.translation.y = 2.2
+        self.now += self.native.WARMUP_SECONDS + 0.01
+
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual("failed", getattr(
+            self.mock, self.native.STATE_ATTR
+        )["phase"])
+        self.assertIsInstance(self.entity.filter, AvatarFilter)
+        self.assertTrue(any(
+            "sank below ground support" in message
+            for level, message in self.logs if level == "error"
+        ))
+
+    def test_batch_failure_faults_live_bodies_and_latches_the_battle(self):
+        self.assertIsNotNone(self.activate())
+        simulator = DynamicsSimulator.instances[0]
+        simulator.fail_update = True
+        simulator.mutate_before_failure = True
+        state = getattr(self.mock, self.native.STATE_ATTR)
+        validated_pose = state["last_pose"]
+
+        self.assertEqual(0, self.native.simulate_frame(
+            {self.mock.id: self.mock}, 0.02, self.now + 0.02
+        ))
+
+        self.assertEqual("faulted", state["phase"])
+        self.assertEqual(validated_pose, state["last_pose"])
+        self.assertTrue(self.entity.wgPhysics.staticMode)
+        self.assertEqual(0, self.entity.wgPhysics.movementSignals)
+        other, unused_entity = self.make_mock(12, 902, 20.0)
+        self.assertFalse(self.native.prepare(
+            self.player, other, self.descriptor, 7, self.now + 0.03
+        ))
+
+    def test_batch_failure_rejects_an_existing_seed_wait_body_before_attach(self):
+        other, other_entity = self.make_mock(12, 902, 20.0)
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.assertTrue(self.native.prepare(
+            self.player, other, self.descriptor, 7, self.now
+        ))
+        attach_at = self.now + self.native.SEED_CHECK_SECONDS + 0.01
+        self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, attach_at
+        )
+        simulator = DynamicsSimulator()
+        simulator.fail_update = True
+        self.native._DYNAMICS_SIMULATOR[0] = simulator
+        self.assertEqual(0, self.native.simulate_frame(
+            {self.mock.id: self.mock, other.id: other},
+            0.02, attach_at + 0.02,
+        ))
+
+        result = self.native.step(
+            self.player, other, self.descriptor, 0, 0, 7, attach_at + 0.03
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual("failed", getattr(
+            other, self.native.STATE_ATTR
+        )["phase"])
+        self.assertIsNone(other_entity.wgPhysics)
+        self.assertFalse(any(
+            event[0] == "setVehiclePhysics" for event in other_entity.events
         ))
 
     def test_missing_real_ground_support_falls_back_before_native_attach(self):
@@ -695,6 +910,11 @@ class NativeBotPhysicsTest(unittest.TestCase):
         )
         self.assertIn("tracks_contact=True allow_tracks=True", diagnostic)
         self.assertIn("carcass_contact=True allow_carcass=True", diagnostic)
+        self.assertIn(
+            "seed_y=3.000 entity_y=3.000 body_y=3.000 "
+            "placing_y=0.000 root_motors=1",
+            diagnostic,
+        )
         self.assertIn("left_contacts=4 right_contacts=5", diagnostic)
         self.assertIn("force=(1.000,2.000,3.000)", diagnostic)
         self.assertIn("torque=(4.000,5.000,6.000)", diagnostic)
@@ -914,6 +1134,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.assertTrue(self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7, self.now
         )["staging"])
+        self.assertEqual(1, self.simulate())
         self.entity.filter.bodyMatrix.translation = Vector3(400, 0, 400)
         self.now += self.native.WARMUP_SECONDS + 0.01
 
@@ -937,6 +1158,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7, self.now
         )
+        self.assertEqual(1, self.simulate())
         self.entity.matrix.translation.x += 3.0
         self.now += self.native.WARMUP_SECONDS + 0.01
 
@@ -965,6 +1187,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7, self.now
         )
+        self.assertEqual(1, self.simulate())
         self.entity.matrix.yaw += self.native.POSE_YAW_TOLERANCE + 0.01
         self.now += self.native.WARMUP_SECONDS + 0.01
 
@@ -1020,6 +1243,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7, self.now
         )
+        self.assertEqual(1, self.simulate())
         self.entity.matrix.translation.x = float("nan")
         self.now += self.native.WARMUP_SECONDS + 0.01
 
@@ -1386,6 +1610,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.assertLess(names.index("delMotor"),
                         names.index("setVehiclePhysics"))
         motors_after_attach = list(self.mock._chassis_model.motors)
+        self.assertEqual(1, self.simulate())
         self.now += self.native.WARMUP_SECONDS + 0.01
         self.assertIsNotNone(self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7, self.now
@@ -1551,6 +1776,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
         )["staging"])
         second_physics = self.entity.wgPhysics
         second_physics.isFrozen = True
+        self.assertEqual(1, self.simulate())
         self.now += self.native.WARMUP_SECONDS + 0.01
         self.assertIsNotNone(self.native.step(
             self.player, self.mock, self.descriptor, -1, -1, 7, self.now
@@ -1648,6 +1874,11 @@ class NativeBotPhysicsTest(unittest.TestCase):
                 attach_at + index * 0.001
             )["staging"])
 
+        lineup = {mock.id: mock for mock in mocks}
+        self.assertEqual(29, self.native.simulate_frame(
+            lineup, 0.02, attach_at + 0.030
+        ))
+
         activate_at = attach_at + 0.028 + self.native.WARMUP_SECONDS + 0.01
         for mock in mocks:
             self.assertIsNotNone(self.native.step(
@@ -1686,6 +1917,10 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.native.step(
             self.player, other, self.descriptor, 0, 0, 7, attach_at + 0.01
         )
+        self.assertEqual(2, self.native.simulate_frame(
+            {self.mock.id: self.mock, other.id: other},
+            0.02, attach_at + 0.02,
+        ))
         first_active_at = attach_at + self.native.WARMUP_SECONDS + 0.02
         self.assertIsNotNone(self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7,
@@ -1723,6 +1958,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7, self.now
         )
+        self.assertEqual(1, self.simulate())
 
         def reject_input(unused_movement, unused_rotation):
             raise RuntimeError("input readback failed")
@@ -1787,6 +2023,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7, self.now
         )
+        self.assertEqual(1, self.simulate())
 
         self.assertTrue(self.native.bind_fashion(self.mock, fashion))
         self.assertIs(movement, fashion.movementInfo)
@@ -1921,6 +2158,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
         ordered = source.index("ordered = (")
         report = source.index("parts = []", ordered)
 
+        self.assertIn("'native_simulation'", source[ordered:report])
         self.assertIn("'native_physics'", source[ordered:report])
 
     def test_client_only_native_path_avoids_server_connection_clock(self):

@@ -229,7 +229,8 @@ def _offh_perf_frame_end(started, frame_dt, player):
 	           'bot_loop',
 	           'driver', 'driver_refresh', 'driver_deferred',
 		           'direction', 'direction_baked', 'direction_exact', 'physics',
-		           'physics_state', 'native_physics', 'physics_motion', 'physics_ground',
+		           'physics_state', 'native_simulation', 'native_physics',
+		           'physics_motion', 'physics_ground',
 	           'physics_safety', 'physics_rays',
 	           'drive_pitch_reuse', 'drive_pitch_exact', 'tilt_support_reuse',
 	           'bot_effects', 'kinematics', 'bot_audio',
@@ -388,6 +389,17 @@ def _add_model(m):
 	g_offline_models.append(m)
 	import BigWorld
 	BigWorld.addModel(m)
+
+
+def _offh_assign_entity_model_root(entity, model):
+	"""Mirror VehicleAppearance's single root-motor handoff."""
+	entity.model = model
+	try:
+		default_motor = model.motors[0]
+	except IndexError:
+		return model
+	model.delMotor(default_motor)
+	return model
 
 
 def _offh_cursor_shown():
@@ -903,7 +915,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.37-native-experimental (2026-08-11)'
+_OFFH_BUILD = '1.8.38-native-experimental (2026-08-11)'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -12505,6 +12517,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_order_refresh_horizon = _ai_frame_budget['order_horizon']
 				_nav_refresh_horizon = _ai_frame_budget['nav_horizon']
 				_driver_refresh_horizon = _ai_frame_budget['driver_horizon']
+				if _native_body_manager_frame is not None:
+					_offh_perf_call(
+						'native_simulation',
+						_native_body_manager_frame.simulate_frame,
+						mock_vehicles, dt, _ai_now)
 				_perf_bot_loop = _offh_perf_start()
 				# Stable entity order also makes every bot-bot collision pair flow from
 				# the lower id to the higher id, whose queued reciprocal correction is
@@ -18244,7 +18261,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									return  # bot died meanwhile: never re-add the intact model over the wreck
 								ent = BigWorld.entity(eid)
 								if ent:
-									ent.model = model_to_add  # Outline needs it!
+									# Entity assignment installs its own default root motor. Retail
+									# VehicleAppearance removes it before adding Servo(vehicle.matrix);
+									# keeping both makes the chassis visibly twist between two owners.
+									_offh_assign_entity_model_root(ent, model_to_add)
 									try:
 										_model_visible = bool(getattr(_e_mock, '_spot_visible', True))
 										model_to_add.visible = _model_visible

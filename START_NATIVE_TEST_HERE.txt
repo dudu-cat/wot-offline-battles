@@ -1,4 +1,4 @@
-WORLD OF TANKS 0.8.2 NATIVE BOT PHYSICS EXPERIMENT 1.8.37
+WORLD OF TANKS 0.8.2 NATIVE BOT PHYSICS EXPERIMENT 1.8.38
 ==========================================================
 
 This is a separate experimental build. It keeps the retail 0.8.2 rigid-body
@@ -15,16 +15,14 @@ Install
 Do not merge individual files. The package must not leave an old
 mod_offhangar.pyc behind.
 
-What changed in 1.8.37
+What changed in 1.8.38
 ----------------------
 
-- Native bot bodies explicitly enable the retail track/suspension and carcass
-  contact gates before attachment. This restores track force, ground support,
-  wall contact and body collision instead of relying on uninitialized flags.
-- Stock-map spawns retain the prebaked drivable terrain layer when a narrow
-  collision confirmation ray is still streaming, rather than walking down to a
-  cellar or lower collision layer.
-- Drive diagnostics now include both track and carcass contact state.
+- All 29 native bot bodies now run in one shared retail dynamics batch each
+  frame, including terrain, suspension, forces and bot-to-bot contacts.
+- A bot cannot activate after sinking below the real ground under its spawn.
+- The stock default model motor is removed before the native pose Servo is
+  installed, so two root owners cannot twist a vehicle at spawn.
 
 Test
 ----

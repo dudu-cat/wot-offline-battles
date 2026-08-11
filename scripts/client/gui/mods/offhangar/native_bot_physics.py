@@ -25,6 +25,7 @@ from gui.mods.offhangar.logging import LOG_ERROR, LOG_NOTE
 STATE_ATTR = '_offh_native_bot_physics_state'
 SEED_CHECK_SECONDS = 0.10
 WARMUP_SECONDS = 0.35
+DYNAMICS_MAX_DT = 0.10
 FILTER_HEARTBEAT_SECONDS = 0.10
 HEARTBEAT_PAUSE_CANARY_ID = 1000
 HEARTBEAT_ON_CANARY_ID = 1001
@@ -32,6 +33,7 @@ HEARTBEAT_CANARY_PAUSE_SECONDS = 3.0
 GROUND_SUPPORT_RAY_UP = 3.0
 GROUND_SUPPORT_RAY_DOWN = 12.0
 GROUND_SUPPORT_TOLERANCE = 3.0
+WARMUP_SUPPORT_SINK_TOLERANCE = 0.35
 POSE_POSITION_TOLERANCE = 2.0
 POSE_YAW_TOLERANCE = 0.35
 CORRECTION_POSITION_TOLERANCE = 0.10
@@ -61,6 +63,11 @@ _LAST_ATTACH_TIME = [None]
 _STARTUP_SUMMARY_LOGGED = [False]
 _DRIVE_LOGGED = [False]
 _HEARTBEAT_LOGGED = [False]
+_DYNAMICS_SIMULATOR = [None]
+_LAST_SIMULATION_AT = [None]
+_SIMULATION_FAILED = [False]
+_SIMULATION_LOGGED = [False]
+_SIMULATION_DT_CLAMP_LOGGED = [False]
 
 
 def _now():
@@ -245,6 +252,13 @@ def _entity_pose(state):
 	return _matrix_pose(state.get('entity_provider'))
 
 
+def _frame_pose(state, timestamp):
+	"""Return the pose produced by this frame's shared native solve."""
+	if state.get('frame_pose_at') == timestamp:
+		return state.get('frame_pose')
+	return _entity_pose(state)
+
+
 def _speed(vehicle_filter, name, default):
 	try:
 		value = float(getattr(vehicle_filter, name))
@@ -306,6 +320,25 @@ def _diagnostic_attr(owner, name):
 		return str(value)
 	except Exception:
 		return 'unprintable'
+
+
+def _diagnostic_pose_y(provider):
+	pose = _matrix_pose(provider)
+	return 'invalid' if pose is None else '%.3f' % float(pose[1])
+
+
+def _diagnostic_seed_y(state):
+	position = _point_tuple(state.get('seed_position'))
+	return 'invalid' if position is None else '%.3f' % float(position[1])
+
+
+def _diagnostic_motor_count(mock):
+	chassis = (getattr(mock, '_chassis_model', None) or
+		getattr(mock, 'model', None))
+	try:
+		return str(len(chassis.motors))
+	except Exception:
+		return 'unknown'
 
 
 def _is_heartbeat_canary(mock):
@@ -375,6 +408,7 @@ def _maybe_log_drive_diagnostic(mock, state, when, signals_before,
 		'normal_engine_power=%s engine_power_mode=%s frozen=%s '
 		'frozen_during_frame=%s static_mode=%s tracks_contact=%s allow_tracks=%s '
 		'carcass_contact=%s allow_carcass=%s ground_type=%s '
+		'seed_y=%s entity_y=%s body_y=%s placing_y=%s root_motors=%s '
 		'left_contacts=%s right_contacts=%s force=%s '
 		'torque=%s speed=%s longitudinal_speed=%s angular_speed=%s' % (
 			getattr(mock, 'id', '?'),
@@ -395,6 +429,12 @@ def _maybe_log_drive_diagnostic(mock, state, when, signals_before,
 			_diagnostic_attr(physics, 'gotCarcassContact'),
 			_diagnostic_attr(physics, 'allowCarcassContacts'),
 			_diagnostic_attr(physics, 'groundType'),
+			_diagnostic_seed_y(state),
+			_diagnostic_pose_y(state.get('entity_provider')),
+			_diagnostic_pose_y(getattr(vehicle_filter, 'bodyMatrix', None)),
+			_diagnostic_pose_y(getattr(
+				vehicle_filter, 'placingCompensationMatrix', None)),
+			_diagnostic_motor_count(mock),
 			_diagnostic_attr(vehicle_filter, 'numLeftTrackContacts'),
 			_diagnostic_attr(vehicle_filter, 'numRightTrackContacts'),
 			_diagnostic_attr(physics, 'forceApplied'),
@@ -523,7 +563,7 @@ def _restore_avatar_filter(mock):
 		pass
 
 
-def _fail(mock, state, reason):
+def _fail(mock, state, reason, preserve_pose=False):
 	was_live = state.get('phase') == 'active'
 	was_active = state.get('phase') in ('active', 'faulted')
 	try:
@@ -558,10 +598,11 @@ def _fail(mock, state, reason):
 		# Filter::input acknowledges a network sample, not a synchronous rigid-body
 		# teleport. Freeze the current native root instead of publishing an
 		# unverified reseed as the canonical pose.
-		pose = _entity_pose(state)
-		if pose is not None:
-			state['last_pose'] = pose
-			state['last_pose_at'] = _now()
+		if not preserve_pose:
+			pose = _entity_pose(state)
+			if pose is not None:
+				state['last_pose'] = pose
+				state['last_pose_at'] = _now()
 		state['pending_correction'] = None
 		state['freeze_reseed'] = False
 		state['phase'] = 'faulted'
@@ -581,10 +622,11 @@ def _fail(mock, state, reason):
 			# would let the caller start Python motion beside it, so retain the native
 			# references and freeze the last verified pose until normal cleanup retries
 			# the detach.
-			pose = _entity_pose(state)
-			if pose is not None:
-				state['last_pose'] = pose
-				state['last_pose_at'] = _now()
+			if not preserve_pose:
+				pose = _entity_pose(state)
+				if pose is not None:
+					state['last_pose'] = pose
+					state['last_pose_at'] = _now()
 			state['pending_correction'] = None
 			state['pending_fashion'] = None
 			state['freeze_reseed'] = False
@@ -597,6 +639,8 @@ def _fail(mock, state, reason):
 			state['phase'] = 'failed'
 			_restore_avatar_filter(mock)
 		_COUNTERS['startup_failed'] += 1
+	state['frame_pose'] = None
+	state['frame_pose_at'] = None
 	_COUNTERS['failed'] += 1
 	LOG_ERROR('NATIVE_BOT_PHYSICS FAIL id=%s phase=%s freeze_reseed=%s reason=%s' % (
 		getattr(mock, 'id', '?'), state.get('phase'),
@@ -651,6 +695,107 @@ def owns_filter(mock):
 		state.get('phase') in (
 			'seed_wait', 'warmup', 'active', 'faulted') and
 		state.get('filter') is not None)
+
+
+def _create_dynamics_simulator():
+	"""Create the one retail batch solver owned by this battle."""
+	import physics_shared
+	simulator = BigWorld.WGDynamicsSimulator()
+	settings = (
+		('numSubsteps', int(getattr(physics_shared, 'NUM_SUBSTEPS', 2))),
+		('numIterations', int(getattr(physics_shared, 'NUM_ITERATIONS', 10))),
+		('frictionRatio', float(getattr(
+			physics_shared, 'FRICTION_RATIO', 1.0))),
+		('restitution', float(getattr(physics_shared, 'RESTITUTION', 0.5))),
+		('allowedPenetration', float(getattr(
+			physics_shared, 'ALLOWED_PENETRATION', 0.01))),
+		('midSolvingIterations', int(getattr(
+			physics_shared, 'MID_SOLVING_ITERATIONS', 4))),
+	)
+	for name, value in settings:
+		setattr(simulator, name, value)
+		actual = getattr(simulator, name)
+		if abs(float(actual) - float(value)) > 0.000001:
+			raise RuntimeError(
+				'native dynamics setting readback mismatch %s=%s expected=%s' % (
+					name, str(actual), str(value)))
+	return simulator
+
+
+def simulate_frame(mocks, dt, timestamp=None):
+	"""Advance every native bot in one stable retail solver batch.
+
+	The 0.8.2 engine does not schedule client-created WGVehiclePhysics2 bodies.
+	WGDynamicsSimulator.update owns frame reset, terrain/track/carcass contacts,
+	bot-to-bot pairs, force solving and integration. Calling it per vehicle would
+	reset the batch repeatedly and lose native pair contacts, so the battle loop
+	must call this function exactly once before its per-bot pose readback pass.
+	"""
+	if _SIMULATION_FAILED[0]:
+		return 0
+	when = _now() if timestamp is None else float(timestamp)
+	if not _finite(when):
+		return 0
+	previous = _LAST_SIMULATION_AT[0]
+	if previous is not None and when <= float(previous):
+		return 0
+	entries = []
+	for mock_id in sorted((mocks or {}).keys()):
+		mock = (mocks or {}).get(mock_id)
+		state = getattr(mock, STATE_ATTR, None)
+		if (not isinstance(state, dict) or state.get('physics') is None or
+				state.get('phase') not in ('warmup', 'active', 'faulted')):
+			continue
+		entries.append((mock, state))
+	if not entries:
+		return 0
+	try:
+		solver_dt = float(dt)
+		if not _finite(solver_dt) or solver_dt <= 0.0:
+			return 0
+		if solver_dt > DYNAMICS_MAX_DT:
+			if not _SIMULATION_DT_CLAMP_LOGGED[0]:
+				_SIMULATION_DT_CLAMP_LOGGED[0] = True
+				LOG_ERROR('NATIVE_BOT_PHYSICS dynamics dt clamped '
+					'actual_ms=%d limit_ms=%d' % (
+						int(solver_dt * 1000.0 + 0.5),
+						int(DYNAMICS_MAX_DT * 1000.0 + 0.5)))
+			solver_dt = DYNAMICS_MAX_DT
+		if _DYNAMICS_SIMULATOR[0] is None:
+			_DYNAMICS_SIMULATOR[0] = _create_dynamics_simulator()
+		physics = tuple(state['physics'] for mock, state in entries)
+		_DYNAMICS_SIMULATOR[0].update(solver_dt, physics, ())
+	except Exception as error:
+		_SIMULATION_FAILED[0] = True
+		_DYNAMICS_SIMULATOR[0] = None
+		for mock, state in entries:
+			if state.get('phase') in ('warmup', 'active'):
+				_fail(mock, state, RuntimeError(
+					'native batch simulation failed: %s' % str(error)), True)
+		return 0
+	_LAST_SIMULATION_AT[0] = when
+	valid_count = 0
+	for mock, state in entries:
+		if state.get('phase') not in ('warmup', 'active', 'faulted'):
+			continue
+		state['simulated_frames'] = int(
+			state.get('simulated_frames', 0) or 0) + 1
+		pose = _entity_pose(state)
+		if pose is None:
+			_fail(mock, state,
+				RuntimeError('native batch simulation returned an invalid pose'))
+			continue
+		state['frame_pose'] = pose
+		state['frame_pose_at'] = when
+		valid_count += 1
+	if valid_count and not _SIMULATION_LOGGED[0]:
+		_SIMULATION_LOGGED[0] = True
+		LOG_NOTE('NATIVE_BOT_PHYSICS dynamics active bodies=%d '
+			'substeps=%s iterations=%s' % (
+				valid_count,
+				str(getattr(_DYNAMICS_SIMULATOR[0], 'numSubsteps', '?')),
+				str(getattr(_DYNAMICS_SIMULATOR[0], 'numIterations', '?'))))
+	return valid_count
 
 
 def _attach_physics(player, mock, descriptor, state):
@@ -783,7 +928,7 @@ def _restore_python_model_provider(mock, state):
 def prepare(player, mock, descriptor, space_id, timestamp=None):
 	"""Attach one staged native body to an already bound OfflineEntity."""
 	if (not _eligible_mock(mock) or descriptor is None or
-			not enabled_for(player)):
+			not enabled_for(player) or _SIMULATION_FAILED[0]):
 		return False
 	old_state = getattr(mock, STATE_ATTR, None)
 	if isinstance(old_state, dict):
@@ -825,6 +970,9 @@ def prepare(player, mock, descriptor, space_id, timestamp=None):
 		'last_filter_input_at': None,
 		'last_pose': None,
 		'last_pose_at': 0.0,
+		'frame_pose': None,
+		'frame_pose_at': None,
+		'simulated_frames': 0,
 		'pending_correction': None,
 		'queued_correction': None,
 		'pending_fashion': None,
@@ -845,6 +993,7 @@ def prepare(player, mock, descriptor, space_id, timestamp=None):
 		'seed_check_at': 0.0,
 		'seed_position': None,
 		'seed_yaw': 0.0,
+		'ground_support': None,
 		'space_id': int(space_id),
 		'vehicle_name': str(_descriptor_value(descriptor, 'name', '?') or '?'),
 	}
@@ -1023,6 +1172,11 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 		return None
 	if state.get('phase') == 'faulted':
 		return _frozen_result(state)
+	if _SIMULATION_FAILED[0]:
+		_fail(mock, state, 'native batch simulation is unavailable', True)
+		if state.get('phase') == 'faulted':
+			return _frozen_result(state)
+		return None
 	when = _now() if timestamp is None else float(timestamp)
 	newly_activated = False
 	try:
@@ -1041,9 +1195,11 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 					CORRECTION_YAW_TOLERANCE):
 				raise RuntimeError(_pose_mismatch_reason(
 					'model_handoff', state, pose))
-			if _ground_support(state) is None:
+			support = _ground_support(state)
+			if support is None:
 				raise RuntimeError(
 					'native ground support is unavailable at the seed pose')
+			state['ground_support'] = support
 			# Stock VehicleAppearance binds Servo(vehicle.matrix) before advanced
 			# physics is attached. Swap only after the seed has read back, then keep
 			# this provider for the complete dynamic lifetime so activation cannot
@@ -1059,11 +1215,23 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 		if state.get('phase') == 'warmup':
 			if when < float(state.get('activate_at', 0.0)):
 				return _staged_result(state)
-			pose = _entity_pose(state)
+			if int(state.get('simulated_frames', 0) or 0) <= 0:
+				raise RuntimeError(
+					'native dynamics simulator did not advance during warmup')
+			pose = _frame_pose(state, when)
 			if not _pose_matches(
 					state.get('seed_position'), state.get('seed_yaw'), pose):
 				raise RuntimeError(_pose_mismatch_reason(
 					'warmup', state, pose))
+			support = _point_tuple(state.get('ground_support'))
+			if (support is None or
+					float(pose[1]) <
+					float(support[1]) - WARMUP_SUPPORT_SINK_TOLERANCE):
+				raise RuntimeError(
+					'native body sank below ground support during warmup '
+					'support_y=%.3f actual_y=%.3f tolerance=%.3f' % (
+						float(support[1]), float(pose[1]),
+						WARMUP_SUPPORT_SINK_TOLERANCE))
 			if bool(getattr(state.get('physics'), 'staticMode', True)):
 				raise RuntimeError(
 					'native wiring invariant failed: physics became static')
@@ -1132,7 +1300,7 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 			mock, state, when, signals_before, expected_signals,
 			signals_repaired)
 
-		pose = _entity_pose(state)
+		pose = _frame_pose(state, when)
 		if pose is None:
 			raise RuntimeError('entity matrix returned an invalid pose')
 		pending = state.get('pending_correction')
@@ -1368,6 +1536,8 @@ def stop_mock(mock, restore_filter=False):
 	state['pending_correction'] = None
 	state['queued_correction'] = None
 	state['pending_fashion'] = None
+	state['frame_pose'] = None
+	state['frame_pose_at'] = None
 	state['phase'] = 'stopped'
 	if previous_phase in ('preparing', 'seed_wait', 'warmup', 'active'):
 		if previous_phase == 'active' and state.get('counted_active'):
@@ -1394,6 +1564,11 @@ def stop_all(mocks):
 	_STARTUP_SUMMARY_LOGGED[0] = False
 	_DRIVE_LOGGED[0] = False
 	_HEARTBEAT_LOGGED[0] = False
+	_DYNAMICS_SIMULATOR[0] = None
+	_LAST_SIMULATION_AT[0] = None
+	_SIMULATION_FAILED[0] = False
+	_SIMULATION_LOGGED[0] = False
+	_SIMULATION_DT_CLAMP_LOGGED[0] = False
 	try:
 		import OfflineEntity
 		if not OfflineEntity.restore_native_destructible_callback_adapter():

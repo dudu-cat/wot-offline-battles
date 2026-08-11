@@ -64,6 +64,56 @@ class OfflineBattleControlTests(unittest.TestCase):
         self.assertIn("self.matrix.setRotateY(spawn_dir.z)", startup)
         self.assertIn("self.yaw = spawn_dir.z", startup)
 
+    def test_bot_model_removes_entity_default_motor_before_pose_servo(self):
+        source = self.source
+        helper_start = source.index("def _offh_assign_entity_model_root")
+        helper_end = source.index("\n\ndef _offh_cursor_shown", helper_start)
+        namespace = {}
+        exec(source[helper_start:helper_end], namespace)
+
+        events = []
+        default_motor = object()
+
+        class Model(object):
+            def __init__(self):
+                self.motors = []
+
+            def delMotor(self, motor):
+                events.append(("delete", motor))
+                self.motors.remove(motor)
+
+        class Entity(object):
+            @property
+            def model(self):
+                return self._model
+
+            @model.setter
+            def model(self, model):
+                events.append(("assign", model))
+                self._model = model
+                model.motors.insert(0, default_motor)
+
+        entity = Entity()
+        model = Model()
+        namespace["_offh_assign_entity_model_root"](entity, model)
+
+        self.assertEqual([
+            ("assign", model), ("delete", default_motor)
+        ], events)
+        self.assertEqual([], model.motors)
+
+        spawn_start = source.index("def _assign_model_when_ready")
+        spawn_end = source.index("elif retries > 0:", spawn_start)
+        spawn = source[spawn_start:spawn_end]
+        self.assertLess(
+            spawn.index("_offh_assign_entity_model_root"),
+            spawn.index("_prepare_native_bot_physics"),
+        )
+        self.assertLess(
+            spawn.index("_offh_assign_entity_model_root"),
+            spawn.index("_VP.commit_pose"),
+        )
+
     def test_autoaim_uses_stock_aiming_mode_and_notification_events(self):
         source = self.source
         helper_start = source.index("def _play_autoaim_sound(event_name):")
