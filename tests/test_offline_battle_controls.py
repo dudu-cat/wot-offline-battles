@@ -98,17 +98,58 @@ class OfflineBattleControlTests(unittest.TestCase):
 
     def test_prebattle_camera_motion_does_not_bloom_the_reticle(self):
         source = self.source
+        state_start = source.index("# --- GUN MECHANICS STATE ---")
+        state_end = source.index("_engine_state =", state_start)
+        state = source[state_start:state_end]
         dispersion_start = source.index(
             "# Real dispersion model (Avatar.getOwnVehicleShotDispersionAngle):"
         )
         dispersion_end = source.index("# 2. Reload logic", dispersion_start)
         dispersion = source[dispersion_start:dispersion_end]
+        period_start = source.rindex(
+            "_period_g = getattr(getattr(player, 'arena', None), 'period', 3)",
+            0,
+            dispersion_start,
+        )
+        period_setup = source[period_start:dispersion_start]
+        marker_start = source.index("# UPDATE CROSSHAIR", dispersion_end)
+        marker_end = source.index("# Synchronize ammo UI", marker_start)
+        marker = source[marker_start:marker_end]
 
+        self.assertIn("'prebattle_marker_seeded': False", state)
+        self.assertIn("'marker_in_prebattle': False", state)
+        self.assertIn("_in_prebattle_g = _period_g < 3", period_setup)
+        self.assertIn(
+            "if _period_g == 3 or (_in_prebattle_g and not "
+            "_gun_state.get('marker_in_prebattle', False)):",
+            period_setup,
+        )
+        self.assertIn(
+            "_gun_state['prebattle_marker_seeded'] = False",
+            period_setup,
+        )
+        self.assertIn(
+            "_gun_state['marker_in_prebattle'] = _in_prebattle_g",
+            period_setup,
+        )
         self.assertIn("if _period_g == 3:", dispersion)
         self.assertIn("_mv = 0.0", dispersion)
         self.assertIn("_rv = 0.0", dispersion)
         self.assertIn("_tv = 0.0", dispersion)
         self.assertEqual(2, dispersion.count("if _period_g == 3:"))
+        self.assertIn(
+            "_refresh_gun_marker = _period_g == 3 or not "
+            "_gun_state.get('prebattle_marker_seeded', False)",
+            marker,
+        )
+        self.assertIn("if _refresh_gun_marker:", marker)
+        self.assertEqual(2, marker.count("if _refresh_gun_marker:"))
+        self.assertIn("_gun_state['prebattle_marker_seeded'] = True", marker)
+        self.assertIn("dist_m = (gun_target_pos - math_gun_world).length", marker)
+        self.assertIn(
+            "size_m = _gun_state['dispersion'] * dist_m * 2.0",
+            marker,
+        )
 
 
 if __name__ == "__main__":

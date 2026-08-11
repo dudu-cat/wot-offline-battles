@@ -26,6 +26,12 @@ STATE_ATTR = '_offh_native_bot_physics_state'
 SEED_CHECK_SECONDS = 0.10
 WARMUP_SECONDS = 0.35
 FILTER_HEARTBEAT_SECONDS = 0.10
+HEARTBEAT_PAUSE_CANARY_ID = 1000
+HEARTBEAT_ON_CANARY_ID = 1001
+HEARTBEAT_CANARY_PAUSE_SECONDS = 3.0
+GROUND_SUPPORT_RAY_UP = 3.0
+GROUND_SUPPORT_RAY_DOWN = 12.0
+GROUND_SUPPORT_TOLERANCE = 3.0
 POSE_POSITION_TOLERANCE = 2.0
 POSE_YAW_TOLERANCE = 0.35
 CORRECTION_POSITION_TOLERANCE = 0.10
@@ -245,6 +251,154 @@ def _speed(vehicle_filter, name, default):
 		return value if _finite(value) else float(default)
 	except Exception:
 		return float(default)
+
+
+def _ground_support(state):
+	"""Return the real static support under the staged world-space root."""
+	position = _point_tuple(state.get('seed_position'))
+	if position is None:
+		return None
+	try:
+		hit = BigWorld.wg_collideSegment(
+			int(state.get('space_id', 0)),
+			Math.Vector3(position[0], position[1] + GROUND_SUPPORT_RAY_UP,
+				position[2]),
+			Math.Vector3(position[0], position[1] - GROUND_SUPPORT_RAY_DOWN,
+				position[2]),
+			128)
+	except Exception:
+		return None
+	if hit is None:
+		return None
+	try:
+		support = _point_tuple(hit[0])
+	except Exception:
+		support = None
+	if support is None:
+		return None
+	if abs(float(support[1]) - float(position[1])) > GROUND_SUPPORT_TOLERANCE:
+		return None
+	return support
+
+
+def _safe_int_attr(owner, name, default=None):
+	try:
+		return int(getattr(owner, name))
+	except Exception:
+		return default
+
+
+def _diagnostic_attr(owner, name):
+	try:
+		value = getattr(owner, name)
+	except Exception:
+		return 'unavailable'
+	if value is None:
+		return 'None'
+	if value is True:
+		return 'True'
+	if value is False:
+		return 'False'
+	point = _point_tuple(value)
+	if point is not None:
+		return '(%.3f,%.3f,%.3f)' % point
+	try:
+		return str(value)
+	except Exception:
+		return 'unprintable'
+
+
+def _is_heartbeat_canary(mock):
+	return _safe_int_attr(mock, 'id', -1) in (
+		HEARTBEAT_PAUSE_CANARY_ID, HEARTBEAT_ON_CANARY_ID)
+
+
+def _log_heartbeat_canary(mock, state):
+	if not _is_heartbeat_canary(mock) or state.get('heartbeat_canary_logged'):
+		return
+	state['heartbeat_canary_logged'] = True
+	LOG_NOTE('NATIVE_BOT_PHYSICS heartbeat_canary id=%s heartbeat=on '
+		'pause_window_ms=%d' % (
+			getattr(mock, 'id', '?'),
+			int(float(state.get('heartbeat_pause_window', 0.0)) * 1000.0)))
+
+
+def _arm_heartbeat_pause(mock, state, when, signals):
+	if (not signals or _safe_int_attr(mock, 'id', -1) !=
+			HEARTBEAT_PAUSE_CANARY_ID or
+			state.get('heartbeat_pause_started_at') is not None):
+		return
+	window = float(state.get('heartbeat_pause_window', 0.0) or 0.0)
+	state['heartbeat_pause_started_at'] = float(when)
+	state['heartbeat_pause_until'] = float(when) + window
+	LOG_NOTE('NATIVE_BOT_PHYSICS heartbeat_canary id=%s heartbeat=paused '
+		'pause_elapsed_ms=0 pause_window_ms=%d' % (
+			getattr(mock, 'id', '?'), int(window * 1000.0)))
+
+
+def _heartbeat_status(state, when):
+	window = float(state.get('heartbeat_pause_window', 0.0) or 0.0)
+	started_at = state.get('heartbeat_pause_started_at')
+	until = state.get('heartbeat_pause_until')
+	if started_at is None:
+		return ('on', 0, int(window * 1000.0 + 0.5))
+	if (started_at is not None and until is not None and
+			float(when) < float(until)):
+		elapsed = max(0.0, float(when) - float(started_at))
+		return ('paused', int(elapsed * 1000.0 + 0.5),
+			int(window * 1000.0 + 0.5))
+	return ('on', int(window * 1000.0 + 0.5),
+		int(window * 1000.0 + 0.5))
+
+
+def _arm_drive_diagnostic(mock, state, when, signals):
+	if (not signals or not _is_heartbeat_canary(mock) or
+			state.get('drive_diagnostic_at') is not None):
+		return
+	state['drive_diagnostic_at'] = float(when)
+
+
+def _maybe_log_drive_diagnostic(mock, state, when, signals_before,
+		expected_signals, signals_repaired):
+	armed_at = state.get('drive_diagnostic_at')
+	if (armed_at is None or state.get('drive_diagnostic_logged') or
+			float(when) <= float(armed_at) or not expected_signals):
+		return
+	physics = state.get('physics')
+	vehicle_filter = state.get('filter')
+	heartbeat, pause_elapsed_ms, pause_window_ms = _heartbeat_status(
+		state, when)
+	state['drive_diagnostic_logged'] = True
+	LOG_NOTE('NATIVE_BOT_PHYSICS drive_diagnostic id=%s heartbeat=%s '
+		'pause_elapsed_ms=%d pause_window_ms=%d signals_before=%s '
+		'signals=%s repaired=%s engine_power=%s '
+		'normal_engine_power=%s engine_power_mode=%s frozen=%s '
+		'frozen_during_frame=%s static_mode=%s tracks_contact=%s allow_tracks=%s '
+		'ground_type=%s left_contacts=%s right_contacts=%s force=%s '
+		'torque=%s speed=%s longitudinal_speed=%s angular_speed=%s' % (
+			getattr(mock, 'id', '?'),
+			heartbeat,
+			pause_elapsed_ms,
+			pause_window_ms,
+			str(signals_before),
+			_diagnostic_attr(physics, 'movementSignals'),
+			str(bool(signals_repaired)),
+			_diagnostic_attr(physics, 'enginePower'),
+			_diagnostic_attr(physics, 'normalEnginePower'),
+			_diagnostic_attr(physics, 'enginePowerMode'),
+			_diagnostic_attr(physics, 'isFrozen'),
+			_diagnostic_attr(physics, 'isFrozenDuringFrame'),
+			_diagnostic_attr(physics, 'staticMode'),
+			_diagnostic_attr(physics, 'gotTracksContact'),
+			_diagnostic_attr(physics, 'allowTracksContacts'),
+			_diagnostic_attr(physics, 'groundType'),
+			_diagnostic_attr(vehicle_filter, 'numLeftTrackContacts'),
+			_diagnostic_attr(vehicle_filter, 'numRightTrackContacts'),
+			_diagnostic_attr(physics, 'forceApplied'),
+			_diagnostic_attr(physics, 'torqueApplied'),
+			_diagnostic_attr(physics, 'speed'),
+			_diagnostic_attr(vehicle_filter, 'longitudinalSpeed'),
+			_diagnostic_attr(vehicle_filter, 'angularSpeed')))
 
 
 def _pose_delta(expected_position, expected_yaw, actual):
@@ -667,6 +821,15 @@ def prepare(player, mock, descriptor, space_id, timestamp=None):
 		'max_speed': max(1.0, max_speed),
 		'activate_at': 0.0,
 		'next_heartbeat_at': 0.0,
+		'heartbeat_pause_window': (
+			HEARTBEAT_CANARY_PAUSE_SECONDS
+			if _safe_int_attr(mock, 'id', -1) == HEARTBEAT_PAUSE_CANARY_ID
+			else 0.0),
+		'heartbeat_pause_started_at': None,
+		'heartbeat_pause_until': None,
+		'heartbeat_canary_logged': False,
+		'drive_diagnostic_at': None,
+		'drive_diagnostic_logged': False,
 		'seed_check_at': 0.0,
 		'seed_position': None,
 		'seed_yaw': 0.0,
@@ -810,6 +973,9 @@ def _submit_queued_correction(state, when):
 
 def _heartbeat_filter(mock, state, pose, when):
 	"""Feed the native post-physics pose back as a fresh retail sample."""
+	pause_until = state.get('heartbeat_pause_until')
+	if pause_until is not None and float(when) < float(pause_until):
+		return False
 	if when < float(state.get('next_heartbeat_at', 0.0) or 0.0):
 		return False
 	if not _submit_filter_sample(
@@ -863,6 +1029,9 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 					CORRECTION_YAW_TOLERANCE):
 				raise RuntimeError(_pose_mismatch_reason(
 					'model_handoff', state, pose))
+			if _ground_support(state) is None:
+				raise RuntimeError(
+					'native ground support is unavailable at the seed pose')
 			# Stock VehicleAppearance binds Servo(vehicle.matrix) before advanced
 			# physics is attached. Swap only after the seed has read back, then keep
 			# this provider for the complete dynamic lifetime so activation cannot
@@ -901,6 +1070,7 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 			state['counted_active'] = True
 			state['phase'] = 'active'
 			state['next_heartbeat_at'] = when + FILTER_HEARTBEAT_SECONDS
+			_log_heartbeat_canary(mock, state)
 			# Native ownership begins with the Servo swap, but do not report this body
 			# active until its first complete input/readback sample is validated below.
 			newly_activated = True
@@ -921,7 +1091,17 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 		rotation = _input_sign(turn) if active and not safety_hold else 0
 		keys = (movement, rotation)
 		physics = state.get('physics')
+		expected_signals = _movement_signals(movement, rotation)
+		signals_before = _safe_int_attr(physics, 'movementSignals')
+		signals_repaired = (state.get('last_input') == keys and
+			signals_before is not None and
+			signals_before != expected_signals)
 		needs_drive_update = state.get('last_input') != keys
+		if (signals_before is not None and
+				signals_before != expected_signals):
+			# Keep the native movement owner authoritative if an engine-side path
+			# rewrites the bit field between rendered frames.
+			needs_drive_update = True
 		if (not needs_drive_update and keys != (0, 0) and physics is not None and
 				bool(getattr(physics, 'isFrozen', False))):
 			# A blocked bot may fall asleep while its high-level command is
@@ -929,11 +1109,16 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 			needs_drive_update = True
 		if needs_drive_update:
 			signals = _set_drive_input(state, movement, rotation)
+			_arm_heartbeat_pause(mock, state, when, signals)
+			_arm_drive_diagnostic(mock, state, when, signals)
 			if signals and not _DRIVE_LOGGED[0]:
 				_DRIVE_LOGGED[0] = True
 				LOG_NOTE('NATIVE_BOT_PHYSICS drive active id=%s signals=%d frozen=%s' % (
 					getattr(mock, 'id', '?'), signals,
 					str(bool(getattr(state.get('physics'), 'isFrozen', True)))))
+		_maybe_log_drive_diagnostic(
+			mock, state, when, signals_before, expected_signals,
+			signals_repaired)
 
 		pose = _entity_pose(state)
 		if pose is None:

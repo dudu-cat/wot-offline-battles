@@ -903,7 +903,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.35-native-experimental (2026-08-11)'
+_OFFH_BUILD = '1.8.36-native-experimental (2026-08-11)'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -8707,6 +8707,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			'dispersion': 0.1,
 			'initialized': False,
 			'shot_index': 0,
+			'prebattle_marker_seeded': False,
+			'marker_in_prebattle': False,
 			# Stock 0.8.2 cruise modes: -2/-1/0/1/2/3 represent reverse
 			# 100/50, off, and forward 25/50/100 percent.
 			'cruise_mode': 0,
@@ -11825,6 +11827,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						dt = cur_time - _gun_state['last_time']
 						_gun_state['last_time'] = cur_time
 						_period_g = getattr(getattr(player, 'arena', None), 'period', 3)
+						# Retail stops its gun rotator during countdown. Seed the fully
+						# aimed marker once there, then resume per-frame updates in battle.
+						_in_prebattle_g = _period_g < 3
+						if _period_g == 3 or (_in_prebattle_g and not _gun_state.get('marker_in_prebattle', False)):
+							_gun_state['prebattle_marker_seeded'] = False
+						_gun_state['marker_in_prebattle'] = _in_prebattle_g
 
 						# Real dispersion model (Avatar.getOwnVehicleShotDispersionAngle):
 						#   ideal = base * sqrt(1 + (v*chassisMove)^2 + (vR*chassisRot)^2
@@ -12075,6 +12083,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						# UPDATE CROSSHAIR
 						# dead/spectating -> skip the dynamic gun-marker (dispersion reticle) refresh;
 						# leaving it on re-shows it every frame + fights the post-mortem hide below.
+						_refresh_gun_marker = _period_g == 3 or not _gun_state.get('prebattle_marker_seeded', False)
 						if hasattr(g_offline_aih, 'ctrl') and not getattr(player, '_is_dead', False):
 							try:
 								if hasattr(player, 'gunRotator'):
@@ -12122,13 +12131,17 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											_pen_start, _pen_dir, _pen_wd)
 								except Exception as _pie:
 									LOG_DEBUG('OfflineBattle pen-colldata error:', str(_pie))
-								g_offline_aih.ctrl.updateGunMarker(gun_target_pos, gun_dir, size_m, 0.0, _pen_coll)
+								if _refresh_gun_marker:
+									g_offline_aih.ctrl.updateGunMarker(gun_target_pos, gun_dir, size_m, 0.0, _pen_coll)
 							except Exception as e:
 								LOG_DEBUG('OfflineBattle updateGunMarker error:', str(e), 'pos:', true_gun_pos, 'dir:', gun_dir)
-							try:
-								g_offline_aih.ctrl.updateGunMarker2(gun_target_pos, gun_dir, size_m, 0.0, _pen_coll)
-							except Exception as e:
-								pass
+							if _refresh_gun_marker:
+								try:
+									g_offline_aih.ctrl.updateGunMarker2(gun_target_pos, gun_dir, size_m, 0.0, _pen_coll)
+								except Exception as e:
+									pass
+								if _period_g != 3:
+									_gun_state['prebattle_marker_seeded'] = True
 								
 							if _gun_state.get('tick_counter', 0) % 60 == 0:
 								import debug_utils
@@ -19061,7 +19074,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_gc = BigWorld.wg_collideSegment(
 										_offh_bspace(), Math.Vector3(_x, _baked_y + 3.0, _z),
 										Math.Vector3(_x, _baked_y - 3.0, _z), 128)
-									_gy = _gc[0].y if _gc is not None else _baked_y
+									# A baked height is only a search hint. If the narrow ray misses,
+									# keep looking for a real collision surface below instead of
+									# attaching a rigid body over an unloaded or absent terrain tile.
+									if _gc is not None:
+										_gy = _gc[0].y
 							except Exception:
 								pass
 							# Developer/custom maps may not ship a graph. Preserve the old collision

@@ -429,6 +429,127 @@ class ServerBotPlannerTests(unittest.TestCase):
             metrics["snapshot_order_bytes"],
         )
 
+    def test_recipient_snapshots_fit_budget_and_full_pose_fences_authority(self):
+        class CaptureConnection(object):
+            def __init__(self):
+                self.messages = []
+
+            def sendall(self, payload):
+                self.messages.append(json.loads(payload.decode("utf-8")))
+
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        state.next_bot_ai_log = float("inf")
+        manifest = []
+        states = {}
+        for index in range(29):
+            bot_id = index + 1
+            identity = {
+                "id": bot_id,
+                "team": 1 if bot_id <= 15 else 2,
+                "slot": index % 15,
+                "name": "Snapshot-Bot-%02d" % bot_id,
+                "vehicle": "germany:VK3001P",
+                "max_health": 1000,
+            }
+            raw = {
+                "id": bot_id,
+                "x": 300.0 + index * 4.125,
+                "y": 8.125 + index * 0.01,
+                "z": 220.0 + index * 3.375,
+                "yaw": -2.2547,
+                "aim_yaw": -2.1254,
+                "gun_pitch": -0.12345,
+                "speed": 12.5,
+                "turn_velocity": 0.25,
+                "fire_seq": index,
+                "shell_index": index % 3,
+                "health": 1000,
+                "alive": True,
+            }
+            if bot_id == 29:
+                raw.update({
+                    "health": 0, "alive": False,
+                    "killer_kind": "human", "killer_id": 7,
+                })
+            manifest.append(identity)
+            states[bot_id] = BattleState._sanitize_bot_state(
+                raw, identity, None)
+        state.bot_manifest = manifest
+        state.bot_states = states
+        state.bot_planner.build_orders = lambda manifest, states, players, now: {
+            "revision": 4, "orders": [],
+        }
+        state.bot_navigation.resolve = lambda orders, states, revision, now: dict(
+            (entry["id"], {
+                "nav_source": "server_baked",
+                "nav_order_revision": revision,
+                "nav_context_id": "0123456789abcdef",
+                "nav_x": entry["x"] + 5.0,
+                "nav_y": entry["y"],
+                "nav_z": entry["z"] + 10.0,
+            }) for entry in states if entry.get("alive", True)
+        )
+        authority_connection = CaptureConnection()
+        replica_connection = CaptureConnection()
+        authority = Player(1, authority_connection, ("127.0.0.1", 1))
+        replica = Player(2, replica_connection, ("127.0.0.1", 2))
+        authority.bot_order_revision_ack = 4
+        state.players = {1: authority, 2: replica}
+        state.bot_authority_id = 1
+
+        state.tick_once(1.0 / 30.0)
+
+        authority_snapshot = authority_connection.messages[-1]
+        replica_snapshot = replica_connection.messages[-1]
+        self.assertEqual("authority", authority_snapshot["bot_snapshot_mode"])
+        self.assertEqual("replica", replica_snapshot["bot_snapshot_mode"])
+        self.assertNotIn("x", authority_snapshot["bots"][0])
+        self.assertIn("nav_x", authority_snapshot["bots"][0])
+        self.assertIn("x", replica_snapshot["bots"][0])
+        self.assertNotIn("nav_x", replica_snapshot["bots"][0])
+        self.assertNotIn("name", replica_snapshot["bots"][0])
+        self.assertEqual("human", authority_snapshot["bots"][-1]["killer_kind"])
+        self.assertEqual(7, replica_snapshot["bots"][-1]["killer_id"])
+
+        def wire_size(message):
+            return len((json.dumps(
+                message, separators=(",", ":")) + "\n").encode("utf-8"))
+
+        authority_bytes = wire_size(authority_snapshot)
+        replica_bytes = wire_size(replica_snapshot)
+        self.assertLess(authority_bytes, 6 * 1024)
+        self.assertLess(replica_bytes, 9 * 1024)
+
+        authority.bot_snapshot_full_pending = True
+        state.tick_once(1.0 / 30.0)
+        full_snapshot = authority_connection.messages[-1]
+        self.assertEqual("full", full_snapshot["bot_snapshot_mode"])
+        self.assertIn("name", full_snapshot["bots"][0])
+        self.assertIn("x", full_snapshot["bots"][0])
+        self.assertIn("nav_x", full_snapshot["bots"][0])
+        self.assertGreater(wire_size(full_snapshot), replica_bytes)
+        self.assertLess(wire_size(full_snapshot), 18 * 1024)
+
+        canonical = dict(state.bot_states[1])
+        self.assertTrue(state.update_bot_states(1, {"bots": [canonical]}))
+        self.assertFalse(authority.bot_snapshot_full_pending)
+        state.tick_once(1.0 / 30.0)
+        self.assertEqual(
+            "authority", authority_connection.messages[-1]["bot_snapshot_mode"])
+        self.assertEqual("Snapshot-Bot-01", state.bot_states[1]["name"])
+
+    def test_initial_authority_does_not_request_a_relay_handoff(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        player = Player(1, object(), ("127.0.0.1", 1))
+        state.players = {1: player}
+
+        message, error = state.request_start(1, "04_himmelsdorf")
+
+        self.assertIsNone(error)
+        self.assertEqual(1, message["bot_authority_id"])
+        self.assertFalse(player.bot_snapshot_full_pending)
+
     def test_promoted_authority_ack_is_reset_and_latest_body_is_sent(self):
         class CaptureConnection(object):
             def __init__(self):
@@ -465,12 +586,14 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(2, state.bot_authority_id)
         self.assertEqual(-1, second.bot_order_revision_ack)
         self.assertEqual(-1, second.bot_order_revision_sent)
+        self.assertTrue(second.bot_snapshot_full_pending)
         state.tick_once(0.05)
         snapshot = next(
             message for message in reversed(second_connection.messages)
             if message.get("type") == "snapshot"
         )
         self.assertEqual(9, snapshot["bot_order_revision"])
+        self.assertEqual("full", snapshot["bot_snapshot_mode"])
         self.assertEqual([1], [value["id"] for value in snapshot["bot_orders"]])
 
     def test_unchanged_orders_are_omitted_from_following_snapshots(self):

@@ -31,7 +31,7 @@ from server_bot_navigation import BotPathResolver
 
 
 PROTOCOL_VERSION = 8
-CLIENT_BUILD = "1.8.35-native-experimental-20260811"
+CLIENT_BUILD = "1.8.36-native-experimental-20260811"
 TICK_HZ = 30.0
 SERVER_PERF_LOG_SECONDS = 5.0
 PREBATTLE_COUNTDOWN_SECONDS = 30.0
@@ -43,6 +43,17 @@ BOT_ORDER_WIRE_FIELDS = (
     "id", "target_id", "target_kind", "aim_position", "face_position",
     "move_position", "fire_allowed", "combat_mode", "throttle_override",
     "fire_range", "route_id", "route_index", "route_anchor", "shell_index",
+)
+BOT_AUTHORITY_SNAPSHOT_FIELDS = (
+    "id", "health", "alive", "nav_source", "nav_order_revision",
+    "nav_x", "nav_y", "nav_z",
+)
+BOT_REPLICA_SNAPSHOT_FIELDS = (
+    "id", "world_pose", "x", "y", "z", "yaw", "aim_yaw", "gun_pitch",
+    "speed", "turn_velocity", "fire_seq", "shell_index", "health", "alive",
+)
+BOT_KILLER_SNAPSHOT_FIELDS = (
+    "killer_bot_id", "killer_kind", "killer_id",
 )
 DEFAULT_MAP = "server_random"
 MAP_POOL = (
@@ -131,6 +142,17 @@ def _percentile(values, fraction):
 def _wire_bot_order(order):
     """Project one planner order onto fields executed by the authority client."""
     return dict((key, order[key]) for key in BOT_ORDER_WIRE_FIELDS if key in order)
+
+
+def _wire_bot_state(state, fields):
+    """Project rich canonical state onto one recipient's steady-state needs."""
+    result = dict((key, state[key]) for key in fields if key in state)
+    if any(state.get(key) not in (None, "", 0, "0")
+           for key in BOT_KILLER_SNAPSHOT_FIELDS):
+        for key in BOT_KILLER_SNAPSHOT_FIELDS:
+            if key in state:
+                result[key] = state[key]
+    return result
 
 
 class _ServerPerfWindow:
@@ -240,6 +262,7 @@ class Player:
     bot_order_revision_sent: int = -1
     bot_order_revision_ack: int = -1
     bot_order_sent_at: float = 0.0
+    bot_snapshot_full_pending: bool = False
     last_send_error: str = ""
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     outbound_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -522,6 +545,10 @@ class BattleState:
                 authority.bot_order_revision_ack = -1
                 authority.bot_order_revision_sent = -1
                 authority.bot_order_sent_at = 0.0
+                # A relay promoted to authority must apply one complete canonical
+                # pose before it starts publishing locally simulated bot state.
+                # Its first accepted bot-state report proves that handoff happened.
+                authority.bot_snapshot_full_pending = old is not None
             self.bot_planner.clear_observations()
             self.bot_navigation_stats = {
                 "graph": {"source": "none", "cell_mm": 0, "nodes": 0},
@@ -1174,7 +1201,7 @@ class BattleState:
             if self.phase != "battle" or player_id != self.bot_authority_id or not self.bot_manifest:
                 return False
             identities = {entry["id"]: entry for entry in self.bot_manifest}
-            changed = False
+            accepted = False
             incoming = message.get("bots") or []
             if not isinstance(incoming, (list, tuple)):
                 return False
@@ -1191,6 +1218,7 @@ class BattleState:
                 previous = self.bot_states.get(bot_id)
                 updated = self._sanitize_bot_state(raw, identity, previous)
                 self.bot_states[bot_id] = updated
+                accepted = True
                 if (previous is not None and
                         int(updated.get("fire_seq", 0)) > int(previous.get("fire_seq", 0))):
                     self.pending_events.append({
@@ -1199,10 +1227,12 @@ class BattleState:
                         "shot_seq": int(updated["fire_seq"]),
                         "shell_index": int(updated.get("shell_index", 0)),
                     })
-                changed = True
-            if changed:
+            if accepted:
                 self.bot_state_revision += 1
-            return changed
+                authority = self.players.get(player_id)
+                if authority is not None:
+                    authority.bot_snapshot_full_pending = False
+            return accepted
 
     def report_bot_hit(self, player_id, message):
         """Apply a human shot against a server-owned bot HP record."""
@@ -1552,6 +1582,14 @@ class BattleState:
                 "battle_result": self.battle_result,
                 "timing": self._timing_payload(now),
             }
+            authority_snapshot_bots = [
+                _wire_bot_state(state, BOT_AUTHORITY_SNAPSHOT_FIELDS)
+                for state in snapshot_bots
+            ]
+            replica_snapshot_bots = [
+                _wire_bot_state(state, BOT_REPLICA_SNAPSHOT_FIELDS)
+                for state in snapshot_bots
+            ]
             recipients = list(self.players.values())
             authority = self.players.get(self.bot_authority_id)
             authority_order_ack = (
@@ -1700,7 +1738,16 @@ class BattleState:
         for player in recipients:
             if id(player) in failed_objects:
                 continue
-            outgoing = snapshot
+            outgoing = dict(snapshot)
+            if player is dispatch_authority:
+                if player.bot_snapshot_full_pending:
+                    outgoing["bot_snapshot_mode"] = "full"
+                else:
+                    outgoing["bot_snapshot_mode"] = "authority"
+                    outgoing["bots"] = authority_snapshot_bots
+            else:
+                outgoing["bot_snapshot_mode"] = "replica"
+                outgoing["bots"] = replica_snapshot_bots
             revision = dispatch_order_revision
             needs_order_body = (
                 player is dispatch_authority and
@@ -1708,7 +1755,7 @@ class BattleState:
                 (player.bot_order_revision_sent != revision or
                  now - player.bot_order_sent_at >= 0.25))
             if needs_order_body:
-                outgoing = dict(snapshot)
+                outgoing = dict(outgoing)
                 outgoing["bot_orders"] = dispatch_order_body
             if not player.send(
                     outgoing, metrics,

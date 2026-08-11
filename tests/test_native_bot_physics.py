@@ -199,6 +199,16 @@ class NativeBotPhysicsTest(unittest.TestCase):
         bigworld.WGVehiclePhysics2 = VehiclePhysics
         bigworld.AvatarFilter = AvatarFilter
         bigworld.Servo = lambda provider: ("servo", provider)
+        self.ground_supported = True
+        self.ground_probe_calls = []
+
+        def collide_segment(space_id, start, end, mask):
+            self.ground_probe_calls.append((space_id, start, end, mask))
+            if not self.ground_supported:
+                return None
+            return (Vector3(start.x, 3.0, start.z),)
+
+        bigworld.wg_collideSegment = collide_segment
         self.bigworld = bigworld
 
         math_module = types.ModuleType("Math")
@@ -350,7 +360,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
         sys.modules.clear()
         sys.modules.update(self.saved_modules)
 
-    def activate(self):
+    def activate(self, throttle=1, turn=1):
         self.assertTrue(self.native.prepare(
             self.player, self.mock, self.descriptor, 7, self.now
         ))
@@ -360,7 +370,8 @@ class NativeBotPhysicsTest(unittest.TestCase):
         )["staging"])
         self.now += self.native.WARMUP_SECONDS + 0.01
         return self.native.step(
-            self.player, self.mock, self.descriptor, 1, 1, 7, self.now
+            self.player, self.mock, self.descriptor,
+            throttle, turn, 7, self.now
         )
 
     def test_authority_body_stages_then_returns_native_pose(self):
@@ -379,6 +390,28 @@ class NativeBotPhysicsTest(unittest.TestCase):
             "NATIVE_BOT_PHYSICS drive active" in message and
             "signals=9 frozen=False" in message
             for level, message in self.logs if level == "note"
+        ))
+
+    def test_missing_real_ground_support_falls_back_before_native_attach(self):
+        self.ground_supported = False
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+
+        self.assertIsNone(result)
+        state = getattr(self.mock, self.native.STATE_ATTR)
+        self.assertEqual("failed", state["phase"])
+        self.assertIsNone(self.entity.wgPhysics)
+        self.assertIsInstance(self.entity.filter, AvatarFilter)
+        self.assertEqual([self.old_servo], self.mock._chassis_model.motors)
+        self.assertTrue(any(
+            "native ground support is unavailable" in message
+            for level, message in self.logs if level == "error"
         ))
 
     def test_drive_signs_map_to_retail_physics_signal_bits(self):
@@ -412,6 +445,27 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.assertFalse(physics.isFrozen)
         self.assertEqual(9, physics.movementSignals)
         self.assertEqual((1, 1), self.entity.filter.input)
+        self.assertEqual([
+            ("signals", 9),
+            ("frozen", False),
+            ("keys", (1, 1)),
+        ], physics.drive_history)
+
+    def test_unchanged_drive_repairs_cross_frame_signal_overwrite(self):
+        self.assertIsNotNone(self.activate())
+        physics = self.entity.wgPhysics
+        physics._movement_signals = 0
+        physics._is_frozen = True
+        physics.drive_history = []
+
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 1, 1, 7,
+            self.now + 0.05,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(9, physics.movementSignals)
+        self.assertFalse(physics.isFrozen)
         self.assertEqual([
             ("signals", 9),
             ("frozen", False),
@@ -474,6 +528,148 @@ class NativeBotPhysicsTest(unittest.TestCase):
             "NATIVE_BOT_PHYSICS heartbeat active" in message
             for level, message in self.logs if level == "note"
         ))
+
+    def test_heartbeat_pause_canary_stays_fresh_during_long_countdown(self):
+        self.mock.id = self.native.HEARTBEAT_PAUSE_CANARY_ID
+        self.assertIsNotNone(self.activate(0, 0))
+        activated_at = self.now
+
+        for sample in range(1, 62):
+            self.native.step(
+                self.player, self.mock, self.descriptor, 0, 0, 7,
+                activated_at + sample * 0.11,
+            )
+
+        self.assertGreater(self.bridge_calls[-1][0] - activated_at, 6.0)
+        self.assertTrue(any(
+            "heartbeat_canary id=1000 heartbeat=on pause_window_ms=3000"
+            in message
+            for level, message in self.logs if level == "note"
+        ))
+
+    def test_heartbeat_pause_canary_resumes_after_bounded_drive_window(self):
+        self.mock.id = self.native.HEARTBEAT_PAUSE_CANARY_ID
+        self.assertIsNotNone(self.activate(0, 0))
+        drive_at = self.now + 0.01
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 0, 7, drive_at,
+        )
+        calls_before_pause = len(self.bridge_calls)
+
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 0, 7,
+            drive_at + 2.99,
+        )
+        self.assertEqual(calls_before_pause, len(self.bridge_calls))
+
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 0, 7,
+            drive_at + self.native.HEARTBEAT_CANARY_PAUSE_SECONDS + 0.01,
+        )
+
+        self.assertEqual(calls_before_pause + 1, len(self.bridge_calls))
+        self.assertTrue(any(
+            "heartbeat_canary id=1000 heartbeat=paused "
+            "pause_elapsed_ms=0 pause_window_ms=3000" in message
+            for level, message in self.logs if level == "note"
+        ))
+
+    def test_heartbeat_pause_does_not_block_safety_corrections(self):
+        self.mock.id = self.native.HEARTBEAT_PAUSE_CANARY_ID
+        self.defer_post_attach_seed = True
+        self.assertIsNotNone(self.activate(0, 0))
+        drive_at = self.now + 0.01
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 0, 7, drive_at,
+        )
+        self.assertTrue(self.native.reseed(
+            self.mock, (10.0, 3.0, -7.0), 0.7, 7,
+            drive_at + 0.01, safety=True,
+        ))
+        calls_before_correction = len(self.bridge_calls)
+
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 0, 7,
+            drive_at + 0.11,
+        )
+        self.assertEqual(calls_before_correction + 1, len(self.bridge_calls))
+        self.assertEqual((10.0, 3.0, -7.0), self.bridge_calls[-1][2])
+
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 0, 7,
+            drive_at + 0.22,
+        )
+
+        self.assertEqual(calls_before_correction + 2, len(self.bridge_calls))
+        self.assertEqual((10.0, 3.0, -7.0), self.bridge_calls[-1][2])
+
+    def test_heartbeat_on_canary_keeps_regular_samples(self):
+        self.mock.id = self.native.HEARTBEAT_ON_CANARY_ID
+        self.assertIsNotNone(self.activate())
+
+        self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7,
+            self.now + self.native.FILTER_HEARTBEAT_SECONDS + 0.01,
+        )
+
+        self.assertEqual(2, len(self.bridge_calls))
+        self.assertTrue(any(
+            "heartbeat_canary id=1001 heartbeat=on pause_window_ms=0"
+            in message
+            for level, message in self.logs if level == "note"
+        ))
+
+    def test_canary_logs_one_next_frame_drive_diagnostic_after_repair(self):
+        self.mock.id = self.native.HEARTBEAT_PAUSE_CANARY_ID
+        self.assertIsNotNone(self.activate())
+        physics = self.entity.wgPhysics
+        vehicle_filter = self.entity.filter
+        physics.normalEnginePower = 500.0
+        physics.enginePowerMode = 2
+        physics.isFrozenDuringFrame = False
+        physics.gotTracksContact = True
+        physics.allowTracksContacts = True
+        physics.groundType = 1
+        physics.forceApplied = Vector3(1.0, 2.0, 3.0)
+        physics.torqueApplied = Vector3(4.0, 5.0, 6.0)
+        physics.speed = 0.0
+        vehicle_filter.numLeftTrackContacts = 4
+        vehicle_filter.numRightTrackContacts = 5
+        physics._movement_signals = 0
+        physics._is_frozen = True
+
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 1, 7,
+            self.now + 0.05,
+        )
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 1, 7,
+            self.now + 0.06,
+        )
+
+        diagnostics = [
+            message for level, message in self.logs
+            if level == "note" and "drive_diagnostic" in message
+        ]
+        self.assertEqual(1, len(diagnostics))
+        diagnostic = diagnostics[0]
+        self.assertIn(
+            "id=1000 heartbeat=paused pause_elapsed_ms=50 "
+            "pause_window_ms=3000",
+            diagnostic,
+        )
+        self.assertIn("signals_before=0 signals=9 repaired=True", diagnostic)
+        self.assertIn("engine_power=500.0 normal_engine_power=500.0", diagnostic)
+        self.assertIn(
+            "engine_power_mode=2 frozen=False frozen_during_frame=False "
+            "static_mode=False",
+            diagnostic,
+        )
+        self.assertIn("tracks_contact=True allow_tracks=True", diagnostic)
+        self.assertIn("left_contacts=4 right_contacts=5", diagnostic)
+        self.assertIn("force=(1.000,2.000,3.000)", diagnostic)
+        self.assertIn("torque=(4.000,5.000,6.000)", diagnostic)
+        self.assertIn("speed=0.0 longitudinal_speed=8.0", diagnostic)
 
     def test_pending_correction_pauses_regular_filter_heartbeat(self):
         self.defer_post_attach_seed = True

@@ -626,9 +626,45 @@ class LANClientQueueTest(unittest.TestCase):
 
         self.network._world_from_server(player, state)
         self.network._world_from_server(player, state)
-        self.network._world_yaw_from_server(player, {"yaw": 0.5})
+        self.network._world_yaw_from_server(
+            player, {"world_pose": True, "yaw": 0.5}
+        )
 
         self.assertEqual([(1, 0), (2, 0)], calls)
+
+    def test_spawn_yaw_uses_each_formation_slot_until_world_pose_arrives(self):
+        player = Player()
+        player._offhangar_network_formation = lambda team, slot: (
+            (0.0, slot * 10.0, 0.35 + slot * 0.1)
+            if team == 1
+            else (100.0, slot * 10.0, -2.4 - slot * 0.1)
+        )
+
+        self.assertAlmostEqual(
+            0.55,
+            self.network._world_yaw_from_server(
+                player, {"team": 1, "slot": 2, "yaw": 0.0}
+            ),
+        )
+        self.assertAlmostEqual(
+            -2.25,
+            self.network._world_yaw_from_server(
+                player,
+                {"team": 2, "slot": 1, "yaw": math.pi + 0.25},
+            ),
+        )
+        self.assertAlmostEqual(
+            math.pi / 2.0 + 0.5,
+            self.network._world_yaw_from_server(
+                player,
+                {
+                    "world_pose": True,
+                    "team": 1,
+                    "slot": 2,
+                    "yaw": 0.5,
+                },
+            ),
+        )
 
     def test_mock_indexes_refresh_when_a_staged_bot_is_added(self):
         offline = sys.modules["gui.mods.offhangar.offline_battle"]
@@ -1264,6 +1300,96 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertEqual(9.0, bot.position.x)
         self.assertEqual(7.5, bot._veh_velocity)
         self.assertEqual(-0.3, bot._veh_turn_velocity)
+
+    def test_compact_authority_snapshot_cannot_clear_full_pose_handoff(self):
+        player = Player()
+        player._offhangar_network_authority_handoff_pending = True
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True, phase="battle"
+        )
+        applied = []
+        original_apply = self.network._apply_bot_state
+        original_indexes = self.network._network_mock_indexes
+        self.network._apply_bot_state = lambda *args: applied.append(args)
+        self.network._network_mock_indexes = lambda: ({}, {16: object()})
+        try:
+            self.network._apply_snapshot(player, {
+                "bot_snapshot_mode": "authority",
+                "players": [],
+                "bots": [{
+                    "id": 16, "health": 500, "alive": True,
+                    "nav_source": "server_baked", "nav_order_revision": 7,
+                    "nav_x": 1.0, "nav_y": 2.0, "nav_z": 3.0,
+                }],
+            })
+            self.assertTrue(
+                player._offhangar_network_authority_handoff_pending)
+            self.assertFalse(applied[-1][2])
+
+            self.network._apply_snapshot(player, {
+                "bot_snapshot_mode": "full",
+                "players": [],
+                "bots": [{
+                    "id": 16, "world_pose": True,
+                    "x": 4.0, "y": 2.0, "z": 8.0,
+                    "yaw": 0.25, "aim_yaw": 0.5,
+                    "gun_pitch": -0.1, "speed": 7.0,
+                    "turn_velocity": 0.2,
+                    "health": 500, "alive": True,
+                    "nav_source": "server_baked", "nav_order_revision": 7,
+                    "nav_x": 1.0, "nav_y": 2.0, "nav_z": 3.0,
+                }],
+            })
+        finally:
+            self.network._apply_bot_state = original_apply
+            self.network._network_mock_indexes = original_indexes
+
+        self.assertFalse(player._offhangar_network_authority_handoff_pending)
+        self.assertTrue(applied[-1][2])
+
+    def test_authority_does_not_publish_bot_state_before_full_handoff(self):
+        player = Player()
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_authority_handoff_pending = True
+        client = types.SimpleNamespace(
+            ready=True,
+            phase="battle",
+            bot_states_due=lambda: (_ for _ in ()).throw(
+                AssertionError("handoff must stop before state construction")),
+        )
+        player._offhangar_network_client = client
+
+        self.assertFalse(
+            self.network.publish_authoritative_bots(player, {}))
+
+    def test_only_a_promoted_client_waits_for_full_authority_handoff(self):
+        initial_player = Player()
+        initial_client = self.network.LANClient(
+            initial_player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        initial_client.player_id = 1
+
+        initial_client._set_authority(1)
+
+        self.assertTrue(initial_player._offhangar_network_is_authority)
+        self.assertFalse(
+            initial_player._offhangar_network_authority_handoff_pending
+        )
+
+        promoted_player = Player()
+        promoted_client = self.network.LANClient(
+            promoted_player, "127.0.0.1", 28782, "Bravo", "ussr:T-34"
+        )
+        promoted_client.player_id = 2
+        promoted_client._set_authority(1)
+
+        promoted_client._set_authority(2)
+
+        self.assertTrue(promoted_player._offhangar_network_is_authority)
+        self.assertTrue(
+            promoted_player._offhangar_network_authority_handoff_pending
+        )
 
     def test_authority_reuses_unchanged_bot_navigation_and_health(self):
         vector3 = sys.modules["Math"].Vector3

@@ -21,7 +21,7 @@ from gui.mods.offhangar import vehicle_pose
 
 
 PROTOCOL_VERSION = 8
-CLIENT_BUILD = '1.8.35-native-experimental-20260811'
+CLIENT_BUILD = '1.8.36-native-experimental-20260811'
 POLL_INTERVAL = 1.0 / 60.0
 INPUT_INTERVAL = 1.0 / 30.0
 BOT_STATE_INTERVAL = 1.0 / 30.0
@@ -593,18 +593,24 @@ class LANClient(object):
 			authority_id = int(authority_id) if authority_id is not None else None
 		except (TypeError, ValueError):
 			authority_id = None
-		changed = authority_id != self.bot_authority_id
+		previous_authority_id = self.bot_authority_id
+		changed = authority_id != previous_authority_id
 		self.bot_authority_id = authority_id
 		self.player._offhangar_network_authority_id = authority_id
 		was_authority = bool(getattr(
 			self.player, '_offhangar_network_is_authority', False))
 		self.player._offhangar_network_is_authority = (
 			authority_id is not None and authority_id == self.player_id)
-		if self.player._offhangar_network_is_authority and not was_authority:
+		if (self.player._offhangar_network_is_authority and not was_authority and
+				previous_authority_id is not None):
 			# The next canonical snapshot must be applied once before this client
 			# begins simulating. Otherwise a relay promotes its interpolated pose and
 			# zero local speed instead of the server's final authority state.
 			self.player._offhangar_network_authority_handoff_pending = True
+		elif self.player._offhangar_network_is_authority and not was_authority:
+			# The initial authority owns the only canonical state; there is no relay
+			# pose to hand off before it starts publishing.
+			self.player._offhangar_network_authority_handoff_pending = False
 		if changed and self.phase == 'battle':
 			role = 'simulation authority' if self.player._offhangar_network_is_authority else 'relay client'
 			LOG_NOTE('LAN bot authority=%s; local role=%s' % (authority_id, role))
@@ -1799,6 +1805,12 @@ def publish_authoritative_bots(player, mocks):
 	"""Send canonical bot pose, gun, shot and HP state at 30 Hz."""
 	if not network_is_authority(player):
 		return False
+	# The server treats the first accepted bot-state report as proof that a newly
+	# promoted authority consumed its complete canonical handoff snapshot. Do not
+	# let an early local frame clear that fence before the full pose is applied.
+	if bool(getattr(
+			player, '_offhangar_network_authority_handoff_pending', False)):
+		return False
 	client = getattr(player, '_offhangar_network_client', None)
 	if client is None or not client.bot_states_due():
 		# Avoid walking every mock and converting every pose on render frames which
@@ -2077,13 +2089,25 @@ def _find_bot(bot_id):
 
 def _world_yaw_from_server(player, state):
 	"""Convert the server's synthetic yaw into the loaded map's yaw frame."""
+	yaw = _finite_float(state.get('yaw'))
 	try:
 		frame = _network_world_frame(player)
-		if frame is None:
-			return _finite_float(state.get('yaw'))
-		return _finite_float(state.get('yaw')) + frame[7]
 	except Exception:
-		return _finite_float(state.get('yaw'))
+		frame = None
+	if not bool(state.get('world_pose', False)):
+		try:
+			formation = getattr(player, '_offhangar_network_formation', None)
+			if callable(formation):
+				team = int(state.get('team', 1) or 1)
+				slot = int(state.get('slot', 0) or 0)
+				base = formation(team, slot)
+				canonical_yaw = 0.0 if team == 1 else math.pi
+				return float(base[2]) + yaw - canonical_yaw
+		except Exception:
+			pass
+	if frame is None:
+		return yaw
+	return yaw + frame[7]
 
 
 def _offline_mocks():
@@ -2814,8 +2838,14 @@ def _apply_snapshot(player, message):
 			_apply_local_state(player, state)
 		else:
 			_apply_remote_state(player, state)
-	handoff = bool(getattr(
+	handoff_pending = bool(getattr(
 		player, '_offhangar_network_authority_handoff_pending', False))
+	# A promoted authority must consume one complete canonical relay pose before
+	# local simulation takes ownership. Compact steady-state authority snapshots
+	# deliberately omit pose, so they may refresh HP/navigation but cannot satisfy
+	# this ownership fence. Missing mode is the legacy full-snapshot contract.
+	snapshot_mode = str(message.get('bot_snapshot_mode') or 'full')
+	handoff = handoff_pending and snapshot_mode == 'full'
 	bot_states = message.get('bots') or []
 	# One failed server path must reactivate the client navigator for that bot.
 	# Using only the latest successful waypoint timestamp made 28 successful bots

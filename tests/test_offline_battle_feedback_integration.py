@@ -136,6 +136,14 @@ class OfflineBattleFeedbackIntegrationTest(unittest.TestCase):
     def test_spawn_hides_components_and_uses_baked_ground_layer(self):
         self.assertIn("for _loaded_component in (ch, hu, tu, gu):", self.battle_source)
         self.assertIn("nearest_ground_point(_spawn_graph, _x, _z, 3)", self.battle_source)
+        self.assertIn(
+            "if _gc is not None:\n\t\t\t\t\t\t\t\t\t\t_gy = _gc[0].y",
+            self.battle_source,
+        )
+        self.assertNotIn(
+            "_gy = _gc[0].y if _gc is not None else _baked_y",
+            self.battle_source,
+        )
 
     def test_bot_pose_is_committed_before_native_consumers_are_registered(self):
         commit = self.battle_source.index("_VP.commit_pose(e_mock, e_mock.position")

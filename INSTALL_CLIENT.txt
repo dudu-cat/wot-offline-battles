@@ -1,8 +1,8 @@
 World of Tanks 0.8.2 experimental native bot physics
 =====================================================
 
-This package does not contain the game client. It supports only the verified
-Windows 0.8.2 executable listed in START_NATIVE_TEST_HERE.txt.
+This package does not contain the game client. It supports only its
+version-pinned Windows 0.8.2 executable; the bridge checks this automatically.
 
 
 Install the client files
@@ -25,15 +25,14 @@ LAN settings and the nickname survive this complete replacement.
 Run offline
 -----------
 
-No external server is required. Select a tank, click Battle!, and read
-START_NATIVE_TEST_HERE.txt before evaluating movement or performance.
+No external server is required. Select a tank and click Battle!.
 
 
 Run over LAN
 ------------
 
 Replace the client folder on every PC. Run the server from this same package;
-older build-1.8.26 servers deliberately reject this experimental client.
+older builds deliberately reject this experimental client.
 Only the authority client creates native bot rigid bodies. Replica clients keep
 the existing snapshot and smoothing path.
 

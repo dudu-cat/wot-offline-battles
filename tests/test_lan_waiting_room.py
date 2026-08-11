@@ -272,10 +272,14 @@ class WaitingRoomTest(unittest.TestCase):
         self.state.tick_once(0.05)
 
         snapshot = second.receive_type("snapshot")
+        while snapshot.get("bot_state_revision", 0) <= 0:
+            snapshot = second.receive_type("snapshot")
         shared_bot = snapshot["bots"][0]
         self.assertEqual(first_welcome["player_id"], snapshot["bot_authority_id"])
         self.assertGreater(snapshot["bot_state_revision"], 0)
-        self.assertEqual("germany:PzIV", shared_bot["vehicle"])
+        self.assertEqual("replica", snapshot["bot_snapshot_mode"])
+        self.assertNotIn("vehicle", shared_bot)
+        self.assertEqual("germany:PzIV", self.state.bot_manifest[0]["vehicle"])
         self.assertEqual(4.0, shared_bot["x"])
         self.assertEqual(375, shared_bot["health"])
         authority_player = next(
