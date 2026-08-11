@@ -1,0 +1,63 @@
+Native vehicle filter input bridge probe 1.8.29
+================================================
+
+This diagnostic build leaves production bot movement unchanged. Pressing F6
+once during a live battle on the bot-authority client tries four isolated
+native pose-seeding paths on one invisible temporary OfflineEntity. Native
+drive starts only after the complete x/y/z/yaw pose remains valid after
+WGVehiclePhysics2 is attached. Every failed temporary entity is destroyed
+before the next candidate is created.
+
+The fourth candidate is a 14.5 KiB x86 Python extension pinned to exactly one
+WorldOfTanks.exe. It calls the retail WGVehicleFilter2 Filter::input virtual
+method without patching executable code or vtables. It refuses a mismatched
+executable in both Python and native code.
+
+
+Static evidence
+---------------
+
+Verified WorldOfTanks.exe:
+
+    SHA-256: 8b3fe162117d2bc40aef2209a0cadbafe5ef4e9479410c12cd6ac6efde6deabd
+    PE timestamp: 0x50b8eccf (30 November 2012)
+    Image base: 0x00400000
+    SizeOfImage: 0x0140f000
+    ASLR: disabled
+
+Verified native interfaces in that image:
+
+    WGVehicleFilter2 Python type RVA: 0x00d77fc8
+    WGVehicleFilter2 vtable RVA: 0x00b67698
+    Filter::input RVA: 0x0050a350
+    Py_InitModule4 RVA: 0x00019800
+    PyArg_ParseTuple RVA: 0x0001d580
+
+The shipped bridge is PE32 x86, exports only
+initoffhangar_native_seed, imports no Python DLL, and has SHA-256:
+
+    73d53d24f99aba8d081bbd4f2c419b9edacbde11dc4a59acaac8593982481df8
+
+
+Automated acceptance evidence
+-----------------------------
+
+- 475 Python regression tests passed.
+- Every client mod source passed CPython 2.6 compilation.
+- The executable and bridge passed tools/audit_native_filter_bridge.py.
+- The bridge loader fails closed on an executable hash mismatch.
+- The probe tests cover native bridge success, bridge rejection, missing native
+  physics, and cleanup after all candidates fail.
+- The package contains only the two required legacy .pyc entry points:
+  CameraNode.pyc and OfflineEntity.pyc.
+
+Native Windows/BigWorld acceptance still requires the F6 runtime check in
+START_PROBE_HERE.txt. Passing static tests does not prove native vehicle motion
+or rendering in the 2012 client.
+
+
+Source checkpoints
+------------------
+
+    Native bridge implementation: 97295718726c7ca17919a4b2a7ca026e8464444d
+    Server backpressure baseline: a18cf38

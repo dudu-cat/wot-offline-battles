@@ -1,0 +1,35 @@
+World of Tanks 0.8.2 native filter bridge probe
+================================================
+
+This package does not contain the game client. Use it only with the verified
+Windows 0.8.2 client described in START_PROBE_HERE.txt.
+
+
+Install the client files
+------------------------
+
+1. Close World of Tanks.
+2. Open the game folder, then open res_mods.
+3. Delete or move aside the complete old res_mods\0.8.2 folder.
+4. Copy this package's complete 0.8.2 folder into res_mods.
+
+The final entry file must be:
+
+    <game folder>\res_mods\0.8.2\scripts\client\gui\mods\mod_offhangar.py
+
+Do not merge individual files into an old 0.8.2 folder. The source loader
+deliberately avoids stale mod bytecode, but a complete replacement is the only
+supported installation method.
+
+
+Run the capability probe
+------------------------
+
+1. Start an offline or LAN battle on the bot-authority client.
+2. Wait until the battle countdown has ended.
+3. Press F6 once and wait up to eight seconds.
+4. Read START_PROBE_HERE.txt for the exact PASS criteria.
+
+Production bot movement is unchanged in this package unless F6 is pressed.
+No server update is required; LAN protocol 8 and client build
+1.8.26-test-20260810 are unchanged.
