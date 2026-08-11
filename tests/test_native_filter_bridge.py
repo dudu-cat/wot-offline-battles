@@ -104,6 +104,44 @@ class NativeFilterBridgeTest(unittest.TestCase):
             for unused_level, message in self.logs
         ))
 
+    def test_nonfinite_seed_is_rejected_before_native_code(self):
+        calls = self.install_native_module()
+        native = sys.modules["gui.mods.offhangar.offhangar_native_seed"]
+        self.bridge.load = lambda: native
+
+        self.assertFalse(self.bridge.seed_filter(
+            object(), float("nan"), 2, (4, 5, 6), (0, 0, 0.7)
+        ))
+        self.assertFalse(self.bridge.seed_filter(
+            object(), 1.0, 2, (float("inf"), 5, 6), (0, 0, 0.7)
+        ))
+        self.assertFalse(self.bridge.seed_filter(
+            object(), 1.0, 2, (4, 5, 6), (0, 0, float("-inf"))
+        ))
+
+        self.assertEqual([], calls)
+        self.assertEqual(3, sum(
+            "seed rejected: non-finite" in message
+            for unused_level, message in self.logs
+        ))
+
+    def test_out_of_range_seed_is_rejected_before_float32_cast(self):
+        calls = self.install_native_module()
+        native = sys.modules["gui.mods.offhangar.offhangar_native_seed"]
+        self.bridge.load = lambda: native
+
+        self.assertFalse(self.bridge.seed_filter(
+            object(), 1.0, 2, (1e100, 5, 6), (0, 0, 0.7)
+        ))
+        self.assertFalse(self.bridge.seed_filter(
+            object(), 1.0, 2, (12001.0, 5, 6), (0, 0, 0.7)
+        ))
+
+        self.assertEqual([], calls)
+        errors = [message for level, message in self.logs if level == "error"]
+        self.assertTrue(any("exceeds float32 range" in message for message in errors))
+        self.assertTrue(any("exceeds world bounds" in message for message in errors))
+
 
 if __name__ == "__main__":
     unittest.main()

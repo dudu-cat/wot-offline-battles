@@ -902,7 +902,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.32-native-experimental (2026-08-11)'
+_OFFH_BUILD = '1.8.33-native-experimental (2026-08-11)'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -13166,9 +13166,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									0.0, 0.0, 0.0)
 
 								# The local player is still a Python-owned body.  Consume its
-								# bounded reciprocal separation and reseed this native filter so
-								# player-versus-bot contact remains two-sided without simulating
-								# native bot-versus-bot collision twice.
+								# bounded reciprocal separation and submit it to the native filter.
+								# The Entity-matrix readback confirms the correction on a later tick;
+								# the requested point is never published as an applied rigid-body pose.
 								_native_pair = _tank_pair_pending.pop(eid, None)
 								if _native_pair is not None:
 									_native_corr_x = float(_native_pair[0])
@@ -13181,12 +13181,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											m_veh.position.x + _native_corr_x,
 											m_veh.position.y,
 											m_veh.position.z + _native_corr_z)
-										if _native_body_manager.reseed(
-												m_veh, _native_corrected, m_veh.yaw,
-												_ai_space_id, _ai_now):
-											m_veh.position = _native_corrected
+										_native_body_manager.reseed(
+											m_veh, _native_corrected, m_veh.yaw,
+											_ai_space_id, _ai_now)
 
-								# Keep the existing one-tick dry-pose contract around water and
+								# Keep the existing dry-pose target around water and
 								# baked cliff shoulders. Native contact resolves terrain, but it
 								# does not own this bot's tactical no-drowning rule.
 								_native_final_hazard = _offh_ai_baked_hazard_near((
@@ -13202,16 +13201,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								if (_native_water > _OFFH_AI_WATER_AVOID_DEPTH or
 										(_native_was_safe and not _native_now_safe)):
 									_native_body_manager.hold(m_veh)
-									_native_guard_reset = _native_body_manager.reseed(
+									_native_body_manager.reseed(
 										m_veh, _native_previous_pose[:3],
-										_native_previous_pose[3], _ai_space_id, _ai_now)
-									if _native_guard_reset:
-										m_veh.position = Math.Vector3(
-											_native_previous_pose[0], _native_previous_pose[1],
-											_native_previous_pose[2])
-										m_veh.yaw = _native_previous_pose[3]
-										m_veh.pitch = _native_previous_pose[4]
-										m_veh.roll = _native_previous_pose[5]
+										_native_previous_pose[3], _ai_space_id, _ai_now,
+										safety=True)
 									m_veh._veh_velocity = 0.0
 									m_veh._veh_turn_velocity = 0.0
 									m_veh._offh_ai_driver_mode = 'native_guard'

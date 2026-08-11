@@ -133,6 +133,7 @@ class NativeVehiclePhysicsProbeTest(unittest.TestCase):
         self.messages = []
         self.entities = {}
         self.destroyed = []
+        self.destroyed_started = []
         self.physics_init_calls = []
         self.initial_filter_valid = True
         self.bridge_available = True
@@ -161,6 +162,9 @@ class NativeVehiclePhysicsProbeTest(unittest.TestCase):
 
         def destroy_entity(entity_id):
             self.destroyed.append(entity_id)
+            self.destroyed_started.append(bool(getattr(
+                self.entities.get(entity_id), "isStarted", False
+            )))
             self.entities.pop(entity_id, None)
 
         bigworld.destroyEntity = destroy_entity
@@ -276,6 +280,7 @@ class NativeVehiclePhysicsProbeTest(unittest.TestCase):
         self.assertEqual("retail_order", state["candidate"])
         self.assertEqual(1, len(self.physics_init_calls))
         self.assertEqual([900], self.destroyed)
+        self.assertEqual([False], self.destroyed_started)
         self.assertTrue(any(
             "NATIVE_PHYSICS_PROBE PASS" in message
             for unused_level, message in self.logs

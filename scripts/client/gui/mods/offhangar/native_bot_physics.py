@@ -25,20 +25,29 @@ from gui.mods.offhangar.logging import LOG_ERROR, LOG_NOTE
 STATE_ATTR = '_offh_native_bot_physics_state'
 SEED_CHECK_SECONDS = 0.10
 WARMUP_SECONDS = 0.35
-SETTLE_SECONDS = 0.10
 POSE_POSITION_TOLERANCE = 2.0
 POSE_YAW_TOLERANCE = 0.35
+CORRECTION_POSITION_TOLERANCE = 0.10
+CORRECTION_YAW_TOLERANCE = 0.05
+CORRECTION_ACK_SECONDS = 0.75
 MAX_FRAME_DISPLACEMENT = 12.0
 MAX_SAMPLE_GAP_SECONDS = 2.0
 DISPLACEMENT_SPEED_FACTOR = 1.75
 MAX_ABS_COORDINATE = 12000.0
 
 _COUNTERS = {
+	'attempted': 0,
 	'prepared': 0,
+	'activated': 0,
 	'active': 0,
+	'startup_failed': 0,
+	'runtime_failed': 0,
+	'stopped': 0,
 	'failed': 0,
+	'expected': 0,
 }
 _LAST_ATTACH_TIME = [None]
+_STARTUP_SUMMARY_LOGGED = [False]
 
 
 def _now():
@@ -177,8 +186,7 @@ def _configure_filter(vehicle_filter, descriptor):
 			(p3[0], 0.0, p3[1]))
 
 
-def _filter_pose(vehicle_filter):
-	provider = getattr(vehicle_filter, 'bodyMatrix', None)
+def _matrix_pose(provider):
 	if provider is None:
 		return None
 	try:
@@ -216,6 +224,14 @@ def _filter_pose(vehicle_filter):
 	return values
 
 
+def _filter_pose(vehicle_filter):
+	return _matrix_pose(getattr(vehicle_filter, 'bodyMatrix', None))
+
+
+def _entity_pose(state):
+	return _matrix_pose(state.get('entity_provider'))
+
+
 def _speed(vehicle_filter, name, default):
 	try:
 		value = float(getattr(vehicle_filter, name))
@@ -224,13 +240,87 @@ def _speed(vehicle_filter, name, default):
 		return float(default)
 
 
-def _pose_matches(expected_position, expected_yaw, actual):
+def _pose_delta(expected_position, expected_yaw, actual):
 	if actual is None:
-		return False
-	distance = _distance(expected_position, actual[:3])
-	if distance is None or distance > POSE_POSITION_TOLERANCE:
-		return False
-	return abs(_normalise_angle(actual[3] - float(expected_yaw))) <= POSE_YAW_TOLERANCE
+		return None
+	expected = _point_tuple(expected_position)
+	if expected is None:
+		return None
+	dx = float(actual[0]) - expected[0]
+	dy = float(actual[1]) - expected[1]
+	dz = float(actual[2]) - expected[2]
+	distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+	yaw_delta = abs(_normalise_angle(actual[3] - float(expected_yaw)))
+	return (dx, dy, dz, distance, yaw_delta)
+
+
+def _pose_matches(expected_position, expected_yaw, actual):
+	delta = _pose_delta(expected_position, expected_yaw, actual)
+	return (delta is not None and
+		delta[3] <= POSE_POSITION_TOLERANCE and
+		delta[4] <= POSE_YAW_TOLERANCE)
+
+
+def _pose_text(pose):
+	if pose is None:
+		return 'invalid'
+	return '(%.3f,%.3f,%.3f yaw=%.4f pitch=%.4f roll=%.4f)' % (
+		pose[0], pose[1], pose[2], pose[3], pose[4], pose[5])
+
+
+def _pose_mismatch_reason(stage, state, actual, expected_position=None,
+		expected_yaw=None):
+	if expected_position is None:
+		expected_position = state.get('seed_position')
+	if expected_yaw is None:
+		expected_yaw = float(state.get('seed_yaw', 0.0) or 0.0)
+	else:
+		expected_yaw = float(expected_yaw)
+	delta = _pose_delta(expected_position, expected_yaw, actual)
+	if delta is None:
+		delta_text = 'delta=invalid distance=invalid yaw_delta=invalid'
+	else:
+		delta_text = ('delta=(%.3f,%.3f,%.3f) distance=%.3f '
+			'yaw_delta=%.4f') % delta
+	expected = _point_tuple(expected_position)
+	if expected is None:
+		expected_text = 'invalid'
+	else:
+		expected_text = '(%.3f,%.3f,%.3f yaw=%.4f)' % (
+			expected[0], expected[1], expected[2], expected_yaw)
+	return ('native root pose mismatch stage=%s vehicle=%s expected=%s '
+		'actual=%s %s body=%s') % (
+		stage, state.get('vehicle_name', '?'), expected_text,
+		_pose_text(actual), delta_text,
+		_pose_text(_filter_pose(state.get('filter'))))
+
+
+def _expected_body_count(player):
+	try:
+		manifest = getattr(player, '_offhangar_network_bot_manifest', None)
+		if manifest:
+			return len(manifest)
+	except Exception:
+		pass
+	# Stock 15-versus-15 offline battles contain one local player and 29 bots.
+	return 29
+
+
+def _maybe_log_startup_complete():
+	if _STARTUP_SUMMARY_LOGGED[0]:
+		return
+	expected = int(_COUNTERS.get('expected', 0) or 0)
+	completed = (int(_COUNTERS['active']) + int(_COUNTERS['startup_failed']) +
+		int(_COUNTERS['runtime_failed']) + int(_COUNTERS['stopped']))
+	if (expected <= 0 or _COUNTERS['attempted'] < expected or
+			completed < _COUNTERS['attempted']):
+		return
+	_STARTUP_SUMMARY_LOGGED[0] = True
+	LOG_NOTE('NATIVE_BOT_PHYSICS startup_complete expected=%d attempted=%d '
+		'prepared=%d active=%d failed=%d stopped=%d' % (
+		expected, _COUNTERS['attempted'], _COUNTERS['prepared'],
+		_COUNTERS['active'], _COUNTERS['failed'],
+		_COUNTERS['stopped']))
 
 
 def _clear_callbacks(physics):
@@ -268,6 +358,7 @@ def _restore_avatar_filter(mock):
 
 
 def _fail(mock, state, reason):
+	was_live = state.get('phase') == 'active'
 	was_active = state.get('phase') in ('active', 'faulted')
 	try:
 		vehicle_filter = state.get('filter')
@@ -291,33 +382,34 @@ def _fail(mock, state, reason):
 			state['physics'].staticMode = True
 		except Exception:
 			pass
-		# bodyMatrix may already contain the sample that tripped validation.
-		# Best-effort reseed the now-static body to the last accepted pose so the
-		# native root model, collision body and Python compatibility mirror remain
-		# together. Failure stays fail-closed and is made explicit in the log.
-		freeze_reseed = False
-		pose = state.get('last_pose')
-		entity = getattr(mock, 'bw_entity', None)
-		if pose is not None and len(pose) >= 6 and entity is not None:
-			try:
-				from gui.mods.offhangar import native_filter_bridge
-				freeze_reseed = native_filter_bridge.seed_filter(
-					state.get('filter'), _now(),
-					int(state.get('space_id', 0)), pose[:3],
-					(pose[5], pose[4], pose[3]))
-			except Exception:
-				freeze_reseed = False
-		state['freeze_reseed'] = bool(freeze_reseed)
+		# Filter::input acknowledges a network sample, not a synchronous rigid-body
+		# teleport. Freeze the current native root instead of publishing an
+		# unverified reseed as the canonical pose.
+		pose = _entity_pose(state)
+		if pose is not None:
+			state['last_pose'] = pose
+			state['last_pose_at'] = _now()
+		state['pending_correction'] = None
+		state['freeze_reseed'] = False
 		state['phase'] = 'faulted'
+		if was_live:
+			if state.get('counted_active'):
+				_COUNTERS['active'] = max(0, _COUNTERS['active'] - 1)
+				state['counted_active'] = False
+			_COUNTERS['runtime_failed'] += 1
 	else:
 		state['physics'] = None
 		state['filter'] = None
+		state['entity_provider'] = None
+		state['pending_fashion'] = None
 		state['phase'] = 'failed'
 		_restore_avatar_filter(mock)
+		_COUNTERS['startup_failed'] += 1
 	_COUNTERS['failed'] += 1
 	LOG_ERROR('NATIVE_BOT_PHYSICS FAIL id=%s phase=%s freeze_reseed=%s reason=%s' % (
 		getattr(mock, 'id', '?'), state.get('phase'),
 		str(state.get('freeze_reseed', 'n/a')), str(reason)))
+	_maybe_log_startup_complete()
 	return False
 
 
@@ -365,7 +457,7 @@ def owns_filter(mock):
 	state = getattr(mock, STATE_ATTR, None)
 	return (isinstance(state, dict) and
 		state.get('phase') in (
-			'seed_wait', 'warmup', 'settle', 'active', 'faulted') and
+			'seed_wait', 'warmup', 'active', 'faulted') and
 		state.get('filter') is not None)
 
 
@@ -406,10 +498,6 @@ def _attach_physics(player, mock, descriptor, state):
 	entity.wgPhysics = physics
 	mock.filter = state['filter']
 	state['physics'] = physics
-	# The proxy is held at the exact seed while providers are wired.  Letting
-	# this body move before the model switches from the Python Servo would create
-	# two visible/physical poses for several frames.
-	physics.staticMode = True
 	state['base_engine_power'] = base_power
 	state['last_input'] = (0, 0)
 
@@ -421,15 +509,8 @@ def _activate_model_provider(mock, state):
 	entity = getattr(mock, 'bw_entity', None)
 	if chassis is None or entity is None:
 		return False
-	provider = getattr(entity, 'matrix', None)
+	provider = state.get('entity_provider')
 	if provider is None:
-		return False
-	try:
-		# VehicleAppearance.__setupModels marks the entity provider this way
-		# before installing its Servo.  It prevents the attached root model from
-		# feeding its own transform back into the entity/filter chain.
-		provider.notModel = True
-	except Exception:
 		return False
 	old_servo = getattr(mock, '_pose_servo', None)
 	servo = None
@@ -463,6 +544,17 @@ def prepare(player, mock, descriptor, space_id, timestamp=None):
 	old_state = getattr(mock, STATE_ATTR, None)
 	if isinstance(old_state, dict):
 		if old_state.get('phase') == 'stopped':
+			# A failed Servo detach deliberately keeps the only retry reference in the
+			# stopped state. Do not discard it or attach a second root motion owner.
+			if old_state.get('native_servo') is not None:
+				stop_mock(mock, False)
+				if old_state.get('native_servo') is not None:
+					if not old_state.get('reuse_blocked_logged'):
+						old_state['reuse_blocked_logged'] = True
+						LOG_ERROR('NATIVE_BOT_PHYSICS reuse blocked id=%s '
+							'reason=native Servo is still attached' % (
+								getattr(mock, 'id', '?')))
+					return False
 			# A delayed callback or a deliberately reused mock must build a new
 			# filter/physics pair; a stopped state owns no usable native objects.
 			try:
@@ -471,6 +563,9 @@ def prepare(player, mock, descriptor, space_id, timestamp=None):
 				setattr(mock, STATE_ATTR, None)
 		else:
 			return old_state.get('phase') != 'failed'
+	_COUNTERS['attempted'] += 1
+	if not _COUNTERS['expected']:
+		_COUNTERS['expected'] = _expected_body_count(player)
 	try:
 		max_speed = abs(float(_descriptor_value(
 			_descriptor_value(descriptor, 'physics', {}),
@@ -481,16 +576,20 @@ def prepare(player, mock, descriptor, space_id, timestamp=None):
 		'phase': 'preparing',
 		'filter': None,
 		'physics': None,
+		'entity_provider': None,
 		'last_input': None,
 		'last_pose': None,
 		'last_pose_at': 0.0,
+		'pending_correction': None,
+		'pending_fashion': None,
+		'counted_active': False,
 		'max_speed': max(1.0, max_speed),
 		'activate_at': 0.0,
-		'settle_at': 0.0,
 		'seed_check_at': 0.0,
 		'seed_position': None,
 		'seed_yaw': 0.0,
 		'space_id': int(space_id),
+		'vehicle_name': str(_descriptor_value(descriptor, 'name', '?') or '?'),
 	}
 	setattr(mock, STATE_ATTR, state)
 	try:
@@ -507,6 +606,14 @@ def prepare(player, mock, descriptor, space_id, timestamp=None):
 		entity.filter = vehicle_filter
 		_configure_filter(vehicle_filter, descriptor)
 		state['filter'] = vehicle_filter
+		provider = getattr(entity, 'matrix', None)
+		if provider is None:
+			raise RuntimeError('OfflineEntity matrix provider is unavailable')
+		# Stock VehicleAppearance sets this before advanced physics is attached.
+		# It prevents the root model from feeding its own transform back into the
+		# Entity/filter chain while the native body is staged out of sight.
+		provider.notModel = True
+		state['entity_provider'] = provider
 
 		from gui.mods.offhangar import native_filter_bridge
 		if not native_filter_bridge.seed_filter(
@@ -534,25 +641,6 @@ def prepare(player, mock, descriptor, space_id, timestamp=None):
 		return True
 	except Exception as error:
 		return _fail(mock, state, error)
-
-
-def _seed_current(mock, state, space_id, timestamp):
-	position = _point_tuple(getattr(mock, 'position', None))
-	if position is None:
-		return False
-	yaw = float(getattr(mock, 'yaw', 0.0) or 0.0)
-	from gui.mods.offhangar import native_filter_bridge
-	if not native_filter_bridge.seed_filter(
-			state['filter'], timestamp, int(space_id),
-			position, (0.0, 0.0, yaw)):
-		return False
-	state['seed_position'] = position
-	state['seed_yaw'] = yaw
-	state['last_pose'] = position + (
-		yaw, float(getattr(mock, 'pitch', 0.0) or 0.0),
-		float(getattr(mock, 'roll', 0.0) or 0.0))
-	state['last_pose_at'] = float(timestamp)
-	return True
 
 
 def _input_sign(value):
@@ -587,6 +675,7 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 	if state.get('phase') == 'faulted':
 		return _frozen_result(state)
 	when = _now() if timestamp is None else float(timestamp)
+	newly_activated = False
 	try:
 		if state.get('phase') == 'seed_wait':
 			if when < float(state.get('seed_check_at', 0.0)):
@@ -596,10 +685,11 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 			# countdown spike.
 			if _LAST_ATTACH_TIME[0] == when:
 				return _staged_result(state)
+			pose = _entity_pose(state)
 			if not _pose_matches(
-					state.get('seed_position'), state.get('seed_yaw'),
-					_filter_pose(state['filter'])):
-				raise RuntimeError('filter pose mismatch after staged seed')
+					state.get('seed_position'), state.get('seed_yaw'), pose):
+				raise RuntimeError(_pose_mismatch_reason(
+					'seed_wait', state, pose))
 			_attach_physics(player, mock, descriptor, state)
 			_LAST_ATTACH_TIME[0] = when
 			state['phase'] = 'warmup'
@@ -609,46 +699,70 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 		if state.get('phase') == 'warmup':
 			if when < float(state.get('activate_at', 0.0)):
 				return _staged_result(state)
-			if not _seed_current(mock, state, space_id, when):
-				raise RuntimeError('activation seed was rejected')
-			state['filter'].notifyInputKeysDown(0, 0)
-			state['last_input'] = (0, 0)
-			state['phase'] = 'settle'
-			state['settle_at'] = when + SETTLE_SECONDS
-			return _staged_result(state)
-
-		if state.get('phase') == 'settle':
-			if when < float(state.get('settle_at', 0.0)):
-				return _staged_result(state)
-			pose = _filter_pose(state['filter'])
+			pose = _entity_pose(state)
 			if not _pose_matches(
 					state.get('seed_position'), state.get('seed_yaw'), pose):
-				raise RuntimeError('native body moved away during activation')
+				raise RuntimeError(_pose_mismatch_reason(
+					'warmup', state, pose))
+			if bool(getattr(state.get('physics'), 'staticMode', True)):
+				raise RuntimeError(
+					'native wiring invariant failed: physics became static')
+			entity = getattr(mock, 'bw_entity', None)
+			if (entity is None or getattr(entity, 'wgPhysics', None) is not
+					state.get('physics') or getattr(mock, 'filter', None) is not
+					state.get('filter') or bool(getattr(entity, 'isStarted', False))):
+				raise RuntimeError(
+					'native wiring invariant failed: owner references changed')
 			if not _activate_model_provider(mock, state):
 				raise RuntimeError('native entity matrix could not own the model')
-			state['physics'].staticMode = False
-			state['phase'] = 'active'
 			state['last_pose'] = pose
 			state['last_pose_at'] = when
+			_COUNTERS['activated'] += 1
 			_COUNTERS['active'] += 1
-			if _COUNTERS['active'] in (1, 5, 15, 29):
-				LOG_NOTE('NATIVE_BOT_PHYSICS active=%d prepared=%d failed=%d' % (
-					_COUNTERS['active'], _COUNTERS['prepared'],
-					_COUNTERS['failed']))
+			state['counted_active'] = True
+			state['phase'] = 'active'
+			# Native ownership begins with the Servo swap, but do not report this body
+			# active until its first complete input/readback sample is validated below.
+			newly_activated = True
 
 		if state.get('phase') != 'active':
 			return None
 
-		movement = _input_sign(throttle) if active else 0
-		rotation = _input_sign(turn) if active else 0
+		pending = state.get('pending_correction')
+		safety_hold = (isinstance(pending, dict) and
+			bool(pending.get('safety', False)))
+		movement = _input_sign(throttle) if active and not safety_hold else 0
+		rotation = _input_sign(turn) if active and not safety_hold else 0
 		keys = (movement, rotation)
 		if state.get('last_input') != keys:
 			state['filter'].notifyInputKeysDown(movement, rotation)
 			state['last_input'] = keys
 
-		pose = _filter_pose(state['filter'])
+		pose = _entity_pose(state)
 		if pose is None:
-			raise RuntimeError('bodyMatrix returned an invalid pose')
+			raise RuntimeError('entity matrix returned an invalid pose')
+		pending = state.get('pending_correction')
+		if isinstance(pending, dict):
+			delta = _pose_delta(
+				pending.get('position'), pending.get('yaw'), pose)
+			if (delta is not None and
+					delta[3] <= CORRECTION_POSITION_TOLERANCE and
+					delta[4] <= CORRECTION_YAW_TOLERANCE):
+				state['pending_correction'] = None
+			elif when - float(pending.get('submitted_at', when)) >= CORRECTION_ACK_SECONDS:
+				if not pending.get('timeout_logged'):
+					pending['timeout_logged'] = True
+					LOG_ERROR('NATIVE_BOT_PHYSICS correction_unconfirmed id=%s safety=%s %s' % (
+						getattr(mock, 'id', '?'), str(bool(pending.get('safety', False))),
+						_pose_mismatch_reason(
+							'correction_ack', state, pose,
+							pending.get('position'), pending.get('yaw'))))
+				# Contact separation is advisory and may be blocked by a real rigid-body
+				# contact, so release it after one diagnostic. A safety correction keeps
+				# its first known-safe target and zero-input hold until readback confirms
+				# it; a later hazardous frame must not replace that target.
+				if not bool(pending.get('safety', False)):
+					state['pending_correction'] = None
 		previous = state.get('last_pose')
 		frame_distance = _distance(previous, pose) if previous is not None else 0.0
 		last_pose_at = float(state.get('last_pose_at', when) or when)
@@ -664,6 +778,17 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 					max_displacement, sample_gap))
 		state['last_pose'] = pose
 		state['last_pose_at'] = when
+		if newly_activated:
+			fashion = state.get('pending_fashion')
+			if fashion is not None:
+				_bind_fashion_providers(mock, state, fashion)
+				state['pending_fashion'] = None
+			if (_COUNTERS['activated'] in (1, 5, 15, 29) or
+					_COUNTERS['activated'] == _COUNTERS['expected']):
+				LOG_NOTE('NATIVE_BOT_PHYSICS active=%d prepared=%d failed=%d' % (
+					_COUNTERS['active'], _COUNTERS['prepared'],
+					_COUNTERS['failed']))
+			_maybe_log_startup_complete()
 		return {
 			'position': pose[:3],
 			'yaw': pose[3],
@@ -684,8 +809,8 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 		return None
 
 
-def reseed(mock, position, yaw, space_id, timestamp=None):
-	"""Apply one bounded authoritative correction to an active native body."""
+def reseed(mock, position, yaw, space_id, timestamp=None, safety=False):
+	"""Submit one correction and confirm it from a later Entity-matrix tick."""
 	state = getattr(mock, STATE_ATTR, None)
 	if not isinstance(state, dict) or state.get('phase') != 'active':
 		return False
@@ -694,15 +819,24 @@ def reseed(mock, position, yaw, space_id, timestamp=None):
 	if point is None:
 		return False
 	try:
+		# Preserve the first unacknowledged safety target. Repeated hazard/contact
+		# callbacks must not refresh its timeout or claim a newer pose as applied.
+		pending = state.get('pending_correction')
+		if isinstance(pending, dict):
+			if not safety or bool(pending.get('safety', False)):
+				return True
 		from gui.mods.offhangar import native_filter_bridge
 		if not native_filter_bridge.seed_filter(
 				state['filter'], when, int(space_id),
 				point, (0.0, 0.0, float(yaw))):
 			raise RuntimeError('Filter::input correction was rejected')
-		state['last_pose'] = point + (
-			float(yaw), float(getattr(mock, 'pitch', 0.0) or 0.0),
-			float(getattr(mock, 'roll', 0.0) or 0.0))
-		state['last_pose_at'] = when
+		state['pending_correction'] = {
+			'position': point,
+			'yaw': float(yaw),
+			'submitted_at': when,
+			'safety': bool(safety),
+			'timeout_logged': False,
+		}
 		state['space_id'] = int(space_id)
 		return True
 	except Exception as error:
@@ -724,12 +858,7 @@ def hold(mock):
 		return False
 
 
-def bind_fashion(mock, fashion):
-	"""Bind the retail rigid-body placement compensation when available."""
-	state = getattr(mock, STATE_ATTR, None)
-	if (not isinstance(state, dict) or fashion is None or
-			state.get('filter') is None):
-		return False
+def _bind_fashion_providers(mock, state, fashion):
 	try:
 		fashion.placingCompensationMatrix = (
 			state['filter'].placingCompensationMatrix)
@@ -744,10 +873,26 @@ def bind_fashion(mock, fashion):
 		return False
 
 
+def bind_fashion(mock, fashion):
+	"""Bind retail placement providers only after native ownership is active."""
+	state = getattr(mock, STATE_ATTR, None)
+	if (not isinstance(state, dict) or fashion is None or
+			state.get('filter') is None or state.get('phase') not in (
+				'seed_wait', 'warmup', 'active')):
+		return False
+	if state.get('phase') != 'active':
+		# The visual fashion can exist during staggered startup, but retaining native
+		# providers here would keep a failed filter/physics pair alive after fallback.
+		state['pending_fashion'] = fashion
+		return True
+	return _bind_fashion_providers(mock, state, fashion)
+
+
 def stop_mock(mock, restore_filter=False):
 	state = getattr(mock, STATE_ATTR, None)
 	if not isinstance(state, dict):
 		return False
+	previous_phase = state.get('phase')
 	try:
 		vehicle_filter = state.get('filter')
 		if vehicle_filter is not None:
@@ -764,18 +909,22 @@ def stop_mock(mock, restore_filter=False):
 	native_servo = state.get('native_servo')
 	chassis = (getattr(mock, '_chassis_model', None) or
 		getattr(mock, 'model', None))
+	servo_detached = native_servo is None
 	if native_servo is not None:
 		if chassis is not None:
 			try:
 				chassis.delMotor(native_servo)
-			except Exception:
-				pass
-	state['native_servo'] = None
-	try:
-		mock._native_pose_servo = None
-		mock._servo_added = False
-	except Exception:
-		pass
+				servo_detached = True
+			except Exception as error:
+				LOG_ERROR('NATIVE_BOT_PHYSICS servo detach failed id=%s error=%s' % (
+					getattr(mock, 'id', '?'), str(error)))
+	if servo_detached:
+		state['native_servo'] = None
+		try:
+			mock._native_pose_servo = None
+			mock._servo_added = False
+		except Exception:
+			pass
 	# WGVehicleFashion keeps all three native filter providers alive. Detach it
 	# with the retail delattr pattern before dropping the filter/physics refs.
 	if getattr(mock, '_fashion', None) is not None:
@@ -803,7 +952,15 @@ def stop_mock(mock, restore_filter=False):
 			pass
 	state['filter'] = None
 	state['physics'] = None
+	state['entity_provider'] = None
+	state['pending_fashion'] = None
 	state['phase'] = 'stopped'
+	if previous_phase in ('preparing', 'seed_wait', 'warmup', 'active'):
+		if previous_phase == 'active' and state.get('counted_active'):
+			_COUNTERS['active'] = max(0, _COUNTERS['active'] - 1)
+			state['counted_active'] = False
+		_COUNTERS['stopped'] += 1
+		_maybe_log_startup_complete()
 	if restore_filter:
 		_restore_avatar_filter(mock)
 	return True
@@ -820,6 +977,7 @@ def stop_all(mocks):
 	for name in _COUNTERS:
 		_COUNTERS[name] = 0
 	_LAST_ATTACH_TIME[0] = None
+	_STARTUP_SUMMARY_LOGGED[0] = False
 	try:
 		import OfflineEntity
 		if not OfflineEntity.restore_native_destructible_callback_adapter():

@@ -547,7 +547,10 @@ def maybe_run(player, descriptor, position, yaw, space_id,
 				raise RuntimeError(
 					'temporary OfflineEntity has no engine-created filter')
 			entity.typeDescriptor = descriptor
-			entity.isStarted = True
+			# Client-only OfflineEntity never enters the retail Vehicle UI lifecycle.
+			# A fake playerVehicleID may collide with this engine entity ID, and stock
+			# cameras then dereference appearance fields that the probe does not own.
+			entity.isStarted = False
 			entity.isPlayer = False
 			state['entity'] = entity
 			LOG_NOTE(
