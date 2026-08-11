@@ -69,15 +69,20 @@ def load():
 		return None
 
 
-def seed_filter(vehicle_filter, timestamp, space_id, entity_id,
-		position, direction):
-	"""Inject one filter input; callers must validate the resulting matrix."""
+def seed_filter(vehicle_filter, timestamp, space_id, position, direction):
+	"""Inject one world-space filter input for an unmounted vehicle.
+
+	The third integer in the native ``Filter::input`` contract is the ID of the
+	vehicle carrying this entity, not this entity's own ID. Offline tanks are in
+	world space, so it must be zero. Passing the entity's own ID makes the engine
+	attach the entity to itself and recurse until the main-thread stack is full.
+	"""
 	bridge = load()
 	if bridge is None:
 		return False
 	try:
 		bridge.seed_filter(
-			vehicle_filter, float(timestamp), int(space_id), int(entity_id),
+			vehicle_filter, float(timestamp), int(space_id), 0,
 			float(position[0]), float(position[1]), float(position[2]),
 			float(direction[0]), float(direction[1]), float(direction[2]))
 		return True

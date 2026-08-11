@@ -138,9 +138,9 @@ class NativeBotPhysicsTest(unittest.TestCase):
 
         bridge = types.ModuleType("gui.mods.offhangar.native_filter_bridge")
 
-        def seed_filter(vehicle_filter, timestamp, space_id, entity_id,
-                        position, direction):
-            self.bridge_calls.append((timestamp, space_id, entity_id))
+        def seed_filter(vehicle_filter, timestamp, space_id, position,
+                        direction):
+            self.bridge_calls.append((timestamp, space_id))
             if not self.bridge_ok:
                 return False
             vehicle_filter.bodyMatrix.translation = Vector3(position)

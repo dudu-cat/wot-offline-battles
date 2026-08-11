@@ -198,11 +198,11 @@ class NativeVehiclePhysicsProbeTest(unittest.TestCase):
             "gui.mods.offhangar.native_filter_bridge"
         )
 
-        def seed_filter(vehicle_filter, timestamp, space_id, entity_id,
-                        position, direction):
+        def seed_filter(vehicle_filter, timestamp, space_id, position,
+                        direction):
             position_tuple = (position.x, position.y, position.z)
             self.bridge_calls.append((
-                vehicle_filter, timestamp, space_id, entity_id,
+                vehicle_filter, timestamp, space_id,
                 position_tuple, tuple(direction),
             ))
             if not self.bridge_available:

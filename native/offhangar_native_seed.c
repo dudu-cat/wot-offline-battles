@@ -183,7 +183,7 @@ static PyObject *seed_filter(PyObject *unused_self, PyObject *args)
 	double pitch;
 	double yaw;
 	int space_id;
-	int entity_id;
+	int vehicle_id;
 	Vec3 position;
 	Vec3 position_error;
 	Vec3 direction;
@@ -195,7 +195,7 @@ static PyObject *seed_filter(PyObject *unused_self, PyObject *args)
 	parse_tuple = (PyArgParseTupleFn)(
 		g_image_base + RVA_PY_ARG_PARSE_TUPLE);
 	if (!parse_tuple(args, "Odiidddddd:seed_filter", &filter_object,
-			&timestamp, &space_id, &entity_id, &x, &y, &z,
+			&timestamp, &space_id, &vehicle_id, &x, &y, &z,
 			&roll, &pitch, &yaw)) {
 		return 0;
 	}
@@ -232,7 +232,7 @@ static PyObject *seed_filter(PyObject *unused_self, PyObject *args)
 	direction.x = (float)roll;
 	direction.y = (float)pitch;
 	direction.z = (float)yaw;
-	input(filter_native, timestamp, space_id, entity_id,
+	input(filter_native, timestamp, space_id, vehicle_id,
 		&position, &position_error, &direction);
 
 	/* Return the exact filter object as an owned Python reference. */

@@ -303,7 +303,7 @@ def _fail(mock, state, reason):
 				from gui.mods.offhangar import native_filter_bridge
 				freeze_reseed = native_filter_bridge.seed_filter(
 					state.get('filter'), _now(),
-					int(state.get('space_id', 0)), int(entity.id), pose[:3],
+					int(state.get('space_id', 0)), pose[:3],
 					(pose[5], pose[4], pose[3]))
 			except Exception:
 				freeze_reseed = False
@@ -510,7 +510,7 @@ def prepare(player, mock, descriptor, space_id, timestamp=None):
 
 		from gui.mods.offhangar import native_filter_bridge
 		if not native_filter_bridge.seed_filter(
-				vehicle_filter, when, int(space_id), int(entity.id), position,
+				vehicle_filter, when, int(space_id), position,
 				(0.0, 0.0, yaw)):
 			raise RuntimeError('Filter::input seed was rejected')
 		entity.typeDescriptor = descriptor
@@ -544,7 +544,6 @@ def _seed_current(mock, state, space_id, timestamp):
 	from gui.mods.offhangar import native_filter_bridge
 	if not native_filter_bridge.seed_filter(
 			state['filter'], timestamp, int(space_id),
-			int(getattr(getattr(mock, 'bw_entity', None), 'id', 0)),
 			position, (0.0, 0.0, yaw)):
 		return False
 	state['seed_position'] = position
@@ -698,7 +697,6 @@ def reseed(mock, position, yaw, space_id, timestamp=None):
 		from gui.mods.offhangar import native_filter_bridge
 		if not native_filter_bridge.seed_filter(
 				state['filter'], when, int(space_id),
-				int(getattr(getattr(mock, 'bw_entity', None), 'id', 0)),
 				point, (0.0, 0.0, float(yaw))):
 			raise RuntimeError('Filter::input correction was rejected')
 		state['last_pose'] = point + (

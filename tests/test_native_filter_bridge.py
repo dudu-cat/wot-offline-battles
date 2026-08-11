@@ -55,17 +55,17 @@ class NativeFilterBridgeTest(unittest.TestCase):
         vehicle_filter = object()
 
         self.assertTrue(self.bridge.seed_filter(
-            vehicle_filter, 123.5, 7, 42,
+            vehicle_filter, 123.5, 7,
             (1.0, 2.0, 3.0), (0.1, 0.2, 0.3),
         ))
         self.assertTrue(self.bridge.seed_filter(
-            vehicle_filter, 124.5, 7, 42,
+            vehicle_filter, 124.5, 7,
             (4.0, 5.0, 6.0), (0.0, 0.0, 0.4),
         ))
 
         self.assertEqual(["WorldOfTanks.exe"], hash_calls)
         self.assertEqual(2, len(calls))
-        self.assertEqual((vehicle_filter, 123.5, 7, 42,
+        self.assertEqual((vehicle_filter, 123.5, 7, 0,
                           1.0, 2.0, 3.0, 0.1, 0.2, 0.3), calls[0])
         self.assertEqual(1, sum(
             "NATIVE_FILTER_BRIDGE loaded" in message
@@ -97,7 +97,7 @@ class NativeFilterBridgeTest(unittest.TestCase):
 
         native.seed_filter = fail
         self.assertFalse(self.bridge.seed_filter(
-            object(), 1.0, 2, 3, (4, 5, 6), (0, 0, 0.7)
+            object(), 1.0, 2, (4, 5, 6), (0, 0, 0.7)
         ))
         self.assertTrue(any(
             "seed failed: seed refused" in message
