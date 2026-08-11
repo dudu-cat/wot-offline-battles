@@ -902,7 +902,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.26-test (2026-08-10) terrain-sample-reuse'
+_OFFH_BUILD = '1.8.27-probe (2026-08-11) native-vehicle-physics'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -4882,6 +4882,11 @@ def _offh_battle_sweep(tag='exit'):
 				_stop_network_battle(BigWorld.player())
 			except Exception:
 				pass
+		try:
+			from gui.mods.offhangar.native_vehicle_physics_probe import cancel as _cancel_native_physics_probe
+			_cancel_native_physics_probe(BigWorld.player())
+		except Exception:
+			pass
 		_stage = 'music'
 		try:
 			import MusicController as _sweep_music
@@ -12266,6 +12271,23 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_player_team = int(getattr(player, '_offhangar_team', 1) or 1)
 				_battle_active = (
 					getattr(getattr(player, 'arena', None), 'period', 3) == 3)
+				# F6 runs one invisible, isolated retail-physics capability probe.
+				# It never replaces a production bot; the result is used only to decide
+				# whether a later build may safely move bot integration into C++.
+				if _battle_active and not _is_network_replica:
+					try:
+						from gui.mods.offhangar import native_vehicle_physics_probe as _native_physics_probe
+						if _native_physics_probe.is_requested():
+							_native_physics_probe.maybe_run(
+								player, loaded_models.get('td'),
+								Math.Vector3(veh_pos[0], veh_pos[1], veh_pos[2]),
+								veh_yaw[0], _ai_space_id, _offh_my_gen[0])
+					except Exception as _native_probe_tick_error:
+						if not globals().get('g_offh_native_probe_tick_error', False):
+							globals()['g_offh_native_probe_tick_error'] = True
+							LOG_ERROR(
+								'NATIVE_PHYSICS_PROBE tick failed: %s' %
+								str(_native_probe_tick_error))
 				# Validate and materialise the shipped foliage index during the loading /
 				# countdown period. The old lazy path loaded it only after the first
 				# observer-target pair happened to need a >50 m concealment calculation,
@@ -17440,6 +17462,18 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			def _mock_handleKeyEvent(event):
 				import BigWorld, Keys, Math
 				player = BigWorld.player()
+				# Diagnostic-only native physics capability probe. F6 is otherwise
+				# untouched by the offline battle implementation.
+				if (event.isKeyDown() and
+						event.key == getattr(Keys, 'KEY_F6', 64)):
+					try:
+						from gui.mods.offhangar.native_vehicle_physics_probe import request as _request_native_physics_probe
+						_request_native_physics_probe()
+						return True
+					except Exception as _native_probe_key_error:
+						LOG_ERROR(
+							'NATIVE_PHYSICS_PROBE request failed: %s' %
+							str(_native_probe_key_error))
 				# X-ray overlay first, and only when it was actually armed by config.
 				# It claims F8/F9/F10 and returns True for those, so nothing else in
 				# this handler sees them; every other key falls straight through.

@@ -16,6 +16,8 @@ import BigWorld
 class OfflineEntity(BigWorld.Entity):
     isStarted = False
     appearance = None
+    typeDescriptor = None
+    wgPhysics = None
 
     def __init__(self):
         pass
@@ -27,4 +29,18 @@ class OfflineEntity(BigWorld.Entity):
         pass
 
     def onLeaveWorld(self):
+        pass
+
+    # WGVehiclePhysics2 normally owns a retail Vehicle and may dispatch these
+    # callbacks while resolving static geometry. OfflineEntity is also used by
+    # the opt-in native-physics capability probe; no-op handlers keep that probe
+    # isolated from gameplay damage and destructible state.
+    def onStaticCollision(self, energy, point, normal, miscFlags):
+        pass
+
+    def _isDestructibleMayBeBroken(self, chunkID, itemIndex, matKind,
+            itemFilename, itemScale, vehicleSpeed):
+        return False
+
+    def showVehicleCollisionEffect(self, position):
         pass
