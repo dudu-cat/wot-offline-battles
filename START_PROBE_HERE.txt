@@ -9,6 +9,11 @@ This is an opt-in diagnostic build based on LAN protocol 8 and client build
 invisible temporary vehicle through its native WGVehicleFilter2 and
 WGVehiclePhysics2 stack.
 
+This revision follows the retail 0.8.2 native initialization path: the engine
+creates the temporary Entity with a DumbFilter, then Entity.filter transfers
+that authoritative pose into a newly assigned WGVehicleFilter2. It does not
+call the unavailable WGVehicleFilter2.set() method.
+
 The probe does not replace bot movement and remains completely inactive until
 F6 is pressed during a live battle. Its result will decide whether a later
 performance build can move terrain, suspension, slope and wall work out of the
@@ -39,10 +44,11 @@ Run the probe
 
        NATIVE_PHYSICS_PROBE
 
-A successful run contains ARM, create, filter, physics, drive, PASS and CLEANUP
-lines. PASS must report a finite distance of at least 0.50 m. Track-contact and
-speed values may be unavailable on this client; native body movement is the
-required capability.
+A successful run contains ARM, create, filter, filter_transfer, physics, drive,
+PASS and CLEANUP lines. filter_transfer must report a small finite delta, and
+PASS must report a finite distance of at least 0.50 m. Track-contact and speed
+values may be unavailable on this client; native body movement is the required
+capability.
 
 
 Safety and limitations
@@ -57,4 +63,4 @@ Safety and limitations
 
 Expected build line near the start of python.log:
 
-    OfflineBattle BUILD 1.8.27-probe (2026-08-11) native-vehicle-physics
+    OfflineBattle BUILD 1.8.28-probe (2026-08-11) native-filter-transfer

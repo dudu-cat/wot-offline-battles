@@ -2,11 +2,13 @@
 """Opt-in runtime probe for the retail 0.8.2 vehicle physics stack.
 
 Press F6 during a live offline/LAN battle to create one invisible temporary
-``OfflineEntity``.  The probe binds the same ``WGVehicleFilter2`` and
-``WGVehiclePhysics2`` objects used by retail ``Vehicle.startVisual()``, sends a
-short forward input, records the native body transform, then destroys the
-entity.  It never owns a real bot and therefore cannot silently change the
-production simulation path.
+``OfflineEntity``.  The probe replaces the entity's engine-created
+``DumbFilter`` with the same ``WGVehicleFilter2`` used by retail
+``Vehicle.startVisual()``.  The native ``Entity.filter`` setter transfers the
+authoritative pose between those filters before ``WGVehiclePhysics2`` is
+attached.  The probe then sends a short forward input, records the native body
+transform, and destroys the entity.  It never owns a real bot and therefore
+cannot silently change the production simulation path.
 """
 
 import math
@@ -25,6 +27,7 @@ SETTLE_SECONDS = 0.35
 DRIVE_SECONDS = 2.0
 CLEANUP_DELAY = 0.20
 MIN_PASS_DISTANCE = 0.50
+FILTER_TRANSFER_TOLERANCE = 6.0
 
 _STATE_ATTR = '_offh_native_vehicle_physics_probe_state'
 _REQUEST_SERIAL = [0]
@@ -81,6 +84,28 @@ def _point_text(value):
 	if point is None:
 		return '<unavailable>'
 	return '(%.2f, %.2f, %.2f)' % point
+
+
+def _type_name(value):
+	if value is None:
+		return '<none>'
+	try:
+		return str(type(value).__name__)
+	except Exception:
+		try:
+			return str(value.__class__.__name__)
+		except Exception:
+			return '<unknown>'
+
+
+def _flat_distance(first, second):
+	first = _point_tuple(first)
+	second = _point_tuple(second)
+	if first is None or second is None:
+		return None
+	dx = second[0] - first[0]
+	dz = second[2] - first[2]
+	return math.sqrt(dx * dx + dz * dz)
 
 
 def request():
@@ -267,7 +292,6 @@ def _destroy_entity(state):
 	entity_id = state.get('entity_id')
 	state['entity'] = None
 	state['filter'] = None
-	state['base_filter'] = None
 	state['physics'] = None
 	if entity_id is not None:
 		try:
@@ -351,7 +375,6 @@ def maybe_run(player, descriptor, position, yaw, space_id,
 			'entity_id': None,
 			'entity': None,
 			'filter': None,
-			'base_filter': None,
 			'physics': None,
 		}
 		setattr(player, _STATE_ATTR, state)
@@ -390,22 +413,46 @@ def maybe_run(player, descriptor, position, yaw, space_id,
 					raise RuntimeError('temporary OfflineEntity did not bind')
 				state['next_at'] = _now() + 0.05
 				return False
-			LOG_NOTE('NATIVE_PHYSICS_PROBE STAGE filter entity=%d' % entity.id)
+			source_filter = getattr(entity, 'filter', None)
+			if source_filter is None:
+				raise RuntimeError(
+					'temporary OfflineEntity has no engine-created filter')
+			source_filter_type = _type_name(source_filter)
+			LOG_NOTE(
+				'NATIVE_PHYSICS_PROBE STAGE filter entity=%d source=%s '
+				'entity_pos=%s' % (
+					entity.id, source_filter_type,
+					_point_text(getattr(entity, 'position', None))))
 			entity.typeDescriptor = descriptor
 			entity.isStarted = True
 			entity.isPlayer = False
-			# Match retail VehicleAppearance.start(): construct WGVehicleFilter2
-			# directly, then feed it the initial authoritative pose through the
-			# inherited AvatarFilter input surface.
+			# Match retail VehicleAppearance.start() exactly. WorldOfTanks.exe
+			# creates every Entity with a DumbFilter. Its native filter setter
+			# reads the old filter state, attaches the replacement, then writes
+			# that timestamped pose into the replacement. WGVehicleFilter2 does
+			# not expose a Python ``set`` method in the pinned 0.8.2 client.
 			vehicle_filter = BigWorld.WGVehicleFilter2()
-			vehicle_filter.set(
-				_now(), int(space_id), entity.id, state['position'],
-				(0.0, 0.0, state['yaw']), 0)
 			_configure_filter(vehicle_filter, descriptor)
 			entity.filter = vehicle_filter
 			state['entity'] = entity
-			state['base_filter'] = None
 			state['filter'] = vehicle_filter
+			# Validate the replacement filter itself. Falling back to
+			# ``entity.position`` here would hide a failed native transfer.
+			inherited_position = _filter_position(vehicle_filter, None)
+			transfer_distance = _flat_distance(
+				state['position'], inherited_position)
+			if transfer_distance is None:
+				raise RuntimeError(
+					'native filter transfer produced no body position')
+			LOG_NOTE(
+				'NATIVE_PHYSICS_PROBE STAGE filter_transfer source=%s '
+				'expected=%s inherited=%s delta=%.2fm' % (
+					source_filter_type, _point_text(state['position']),
+					_point_text(inherited_position), transfer_distance))
+			if transfer_distance > FILTER_TRANSFER_TOLERANCE:
+				raise RuntimeError(
+					'native filter transfer moved %.2fm (limit %.2fm)' % (
+						transfer_distance, FILTER_TRANSFER_TOLERANCE))
 			state['phase'] = 'physics'
 			state['next_at'] = _now()
 			return False

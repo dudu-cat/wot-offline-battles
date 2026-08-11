@@ -26,12 +26,8 @@ class Matrix(object):
         self.translation = getattr(source, "translation", Vector3(0, 0, 0))
 
 
-class AvatarFilter(object):
-    def __init__(self):
-        self.position = Vector3(0, 0, 0)
-
-    def set(self, unused_time, unused_space, unused_id, position,
-            unused_rotation, unused_flags):
+class DumbFilter(object):
+    def __init__(self, position):
         self.position = Vector3(position.x, position.y, position.z)
 
 
@@ -46,12 +42,6 @@ class VehicleFilter(object):
         self.speedInfo = types.SimpleNamespace(value=[0.0])
         self.triangles = []
         self.physics = None
-
-    def set(self, unused_time, unused_space, unused_id, position,
-            unused_rotation, unused_flags):
-        self.bodyMatrix.translation = Vector3(
-            position.x, position.y, position.z
-        )
 
     def addTriangle(self, first, second, third):
         self.triangles.append((first, second, third))
@@ -82,6 +72,21 @@ class Entity(object):
     def __init__(self, entity_id, position):
         self.id = entity_id
         self.position = position
+        self._filter = DumbFilter(position)
+
+    @property
+    def filter(self):
+        return self._filter
+
+    @filter.setter
+    def filter(self, replacement):
+        # The retail Entity.filter setter transfers the timestamped pose from
+        # the engine-created DumbFilter before attaching the replacement.
+        old_position = self._filter.position
+        replacement.bodyMatrix.translation = Vector3(
+            old_position.x, old_position.y, old_position.z
+        )
+        self._filter = replacement
 
 
 class NativeVehiclePhysicsProbeTest(unittest.TestCase):
@@ -115,7 +120,6 @@ class NativeVehiclePhysicsProbeTest(unittest.TestCase):
         bigworld.destroyEntity = lambda entity_id: (
             self.destroyed.append(entity_id), self.entities.pop(entity_id, None)
         )
-        bigworld.AvatarFilter = AvatarFilter
         bigworld.WGVehicleFilter2 = VehicleFilter
         bigworld.WGVehiclePhysics2 = VehiclePhysics
 
@@ -204,6 +208,11 @@ class NativeVehiclePhysicsProbeTest(unittest.TestCase):
             "NATIVE_PHYSICS_PROBE PASS" in message
             for unused_level, message in self.logs
         ))
+        self.assertTrue(any(
+            "filter_transfer source=DumbFilter" in message
+            for unused_level, message in self.logs
+        ))
+        self.assertFalse(hasattr(VehicleFilter(), "set"))
         self.assertEqual("information", self.messages[-1][1])
         self.assertFalse(self.probe.is_requested())
 
