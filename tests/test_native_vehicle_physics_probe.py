@@ -87,7 +87,7 @@ class VehicleFilter(AvatarFilter):
         self.physics = physics
 
     def syncGunAngles(self, unused_yaw, unused_pitch):
-        pass
+        raise AssertionError("offline native probes must not call syncGunAngles")
 
     def notifyInputKeysDown(self, movement, unused_rotation):
         if movement > 0:
@@ -353,6 +353,11 @@ class NativeVehiclePhysicsProbeTest(unittest.TestCase):
         probe_index = source.index("'native_vehicle_physics_probe'")
         battle_index = source.index("'offline_battle'", probe_index)
         self.assertLess(probe_index, battle_index)
+
+    def test_client_only_probe_avoids_server_connection_clock(self):
+        source = PROBE_PATH.read_text(encoding="utf-8")
+
+        self.assertNotIn("state['filter'].syncGunAngles(", source)
 
     def test_missing_native_physics_fails_closed_and_keeps_no_bot_state(self):
         del sys.modules["BigWorld"].WGVehiclePhysics2

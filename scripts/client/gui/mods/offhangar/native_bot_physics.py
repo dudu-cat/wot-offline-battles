@@ -390,7 +390,10 @@ def _attach_physics(player, mock, descriptor, state):
 	_clear_callbacks(physics)
 	physics.visibilityMask = _visibility_mask(player)
 	state['filter'].setVehiclePhysics(physics)
-	state['filter'].syncGunAngles(0.0, 0.0)
+	# Do not call WGVehicleFilter2.syncGunAngles here.  Its native 0.8.2
+	# implementation reads EntityManager's retail ServerConnection clock, which
+	# is deliberately absent for client-only OfflineEntity instances. Bot turret
+	# and gun angles remain owned by the existing Python combat/model path.
 	state['filter'].notifyInputKeysDown(0, 0)
 	entity.typeDescriptor = descriptor
 	# Keep OfflineEntity outside the retail Vehicle UI lifecycle. Engine entity

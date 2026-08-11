@@ -902,7 +902,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.30-native-experimental (2026-08-11)'
+_OFFH_BUILD = '1.8.31-native-experimental (2026-08-11)'
 
 
 def _offh_hit_sound(path, min_gap=0.10):

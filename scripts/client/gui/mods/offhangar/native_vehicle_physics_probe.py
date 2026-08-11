@@ -457,7 +457,8 @@ def _attach_physics(state, descriptor, player):
 			pass
 	physics.visibilityMask = _visibility_mask(player)
 	state['filter'].setVehiclePhysics(physics)
-	state['filter'].syncGunAngles(0.0, 0.0)
+	# syncGunAngles uses the retail ServerConnection clock in 0.8.2. The probe's
+	# client-only OfflineEntity has no connection, and its gun angles are unused.
 	state['entity'].wgPhysics = physics
 	state['physics'] = physics
 	state['phase'] = 'physics_wait'

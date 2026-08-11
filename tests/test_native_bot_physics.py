@@ -63,7 +63,7 @@ class VehicleFilter(object):
         self.physics = physics
 
     def syncGunAngles(self, unused_yaw, unused_pitch):
-        pass
+        raise AssertionError("offline native bots must not call syncGunAngles")
 
     def notifyInputKeysDown(self, movement, rotation):
         self.input = (movement, rotation)
@@ -567,6 +567,11 @@ class NativeBotPhysicsTest(unittest.TestCase):
         report = source.index("parts = []", ordered)
 
         self.assertIn("'native_physics'", source[ordered:report])
+
+    def test_client_only_native_path_avoids_server_connection_clock(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+
+        self.assertNotIn("state['filter'].syncGunAngles(", source)
 
 
 if __name__ == "__main__":
