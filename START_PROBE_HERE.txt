@@ -9,10 +9,12 @@ This is an opt-in diagnostic build based on LAN protocol 8 and client build
 invisible temporary vehicle through its native WGVehicleFilter2 and
 WGVehiclePhysics2 stack.
 
-This revision follows the retail 0.8.2 native initialization path: the engine
-creates the temporary Entity with a DumbFilter, then Entity.filter transfers
-that authoritative pose into a newly assigned WGVehicleFilter2. It does not
-call the unavailable WGVehicleFilter2.set() method.
+This revision first records all three pose-seeding paths exposed by the pinned
+Python API. If those paths cannot preserve the complete x/y/z/yaw pose, it uses
+a tiny version-locked native bridge for the same Filter::input virtual method
+that receives timestamped server movement in the retail client. The bridge
+does not patch code or vtables and refuses every WorldOfTanks.exe except the
+verified 30 November 2012 executable.
 
 The probe does not replace bot movement and remains completely inactive until
 F6 is pressed during a live battle. Its result will decide whether a later
@@ -39,15 +41,22 @@ Run the probe
 1. Start an offline or LAN battle on the bot-authority client.
 2. Wait until the battle countdown has ended and the tanks can move.
 3. Press F6 once.
-4. Wait about four seconds for a green or red system notification.
+4. Wait up to eight seconds for a green or red system notification.
 5. Close the game normally and send the python.log lines containing:
 
        NATIVE_PHYSICS_PROBE
 
-A successful run contains ARM, create, filter, filter_transfer, physics, drive,
-PASS and CLEANUP lines. filter_transfer must report a small finite delta, and
-PASS must report a finite distance of at least 0.50 m. Track-contact and speed
-values may be unavailable on this client; native body movement is the required
+A successful bridge run contains CANDIDATE FAIL for retail_order, avatar_copy
+and legacy_set_position, followed by:
+
+       NATIVE_FILTER_BRIDGE loaded
+       NATIVE_PHYSICS_PROBE PASS candidate=native_bridge
+       NATIVE_PHYSICS_PROBE CLEANUP
+
+The PASS line must report a finite distance of at least 0.50 m. Every POSE line
+for the accepted candidate must report valid=True after seeding and after
+physics attachment. Track-contact and speed values may be unavailable on this
+client; native body movement at the requested x/y/z/yaw is the required
 capability.
 
 
@@ -58,9 +67,12 @@ Safety and limitations
 - The temporary entity has no model and cannot fire, spot, capture or damage.
 - The probe looks for a short clear corridor near the player's current pose.
 - If no safe corridor exists, it fails without changing bot simulation.
+- This package does not yet move production bots through the native bridge.
+- The native module is pinned to WorldOfTanks.exe SHA-256
+  8b3fe162117d2bc40aef2209a0cadbafe5ef4e9479410c12cd6ac6efde6deabd.
 - The Python harness cannot prove this native path works; the Windows 0.8.2
   runtime result is the acceptance boundary.
 
 Expected build line near the start of python.log:
 
-    OfflineBattle BUILD 1.8.28-probe (2026-08-11) native-filter-transfer
+    OfflineBattle BUILD 1.8.29-probe (2026-08-11) native-filter-input-bridge

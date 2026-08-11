@@ -1,4 +1,5 @@
 import importlib.util
+import math
 import sys
 import types
 import unittest
@@ -23,17 +24,53 @@ class Vector3(object):
 
 class Matrix(object):
     def __init__(self, source=None):
-        self.translation = getattr(source, "translation", Vector3(0, 0, 0))
+        source = source or types.SimpleNamespace()
+        point = getattr(source, "translation", Vector3(0, 0, 0))
+        self.translation = Vector3(point.x, point.y, point.z)
+        self.yaw = float(getattr(source, "yaw", 0.0))
+
+    def applyVector(self, vector):
+        return Vector3(
+            vector.x * math.cos(self.yaw) + vector.z * math.sin(self.yaw),
+            vector.y,
+            -vector.x * math.sin(self.yaw) + vector.z * math.cos(self.yaw),
+        )
 
 
 class DumbFilter(object):
-    def __init__(self, position):
-        self.position = Vector3(position.x, position.y, position.z)
-
-
-class VehicleFilter(object):
-    def __init__(self):
+    def __init__(self, position, yaw, valid):
         self.bodyMatrix = Matrix()
+        self.export_valid = bool(valid)
+        if self.export_valid:
+            self.bodyMatrix.translation = Vector3(
+                position.x, position.y, position.z
+            )
+            self.bodyMatrix.yaw = float(yaw)
+
+
+class AvatarFilter(object):
+    def __init__(self, source=None):
+        if source is not None and not isinstance(source, AvatarFilter):
+            raise TypeError("expected AvatarFilter")
+        self.bodyMatrix = Matrix(
+            source.bodyMatrix if source is not None else None
+        )
+        self.export_valid = bool(
+            source is not None and getattr(source, "export_valid", False)
+        )
+
+
+class LegacyVehicleFilter(AvatarFilter):
+    def setPosition(self, x, z):
+        # The pinned ABI only accepts x/z. It cannot establish full y/yaw.
+        self.bodyMatrix.translation = Vector3(x, 0.0, z)
+        self.bodyMatrix.yaw = 0.0
+        self.export_valid = True
+
+
+class VehicleFilter(AvatarFilter):
+    def __init__(self, source=None):
+        AvatarFilter.__init__(self, source)
         self.longitudinalSpeed = 0.0
         self.strafeSpeed = 0.0
         self.angularSpeed = 0.0
@@ -69,10 +106,10 @@ class VehiclePhysics(object):
 
 
 class Entity(object):
-    def __init__(self, entity_id, position):
+    def __init__(self, entity_id, position, yaw, initial_filter_valid):
         self.id = entity_id
         self.position = position
-        self._filter = DumbFilter(position)
+        self._filter = DumbFilter(position, yaw, initial_filter_valid)
 
     @property
     def filter(self):
@@ -80,12 +117,11 @@ class Entity(object):
 
     @filter.setter
     def filter(self, replacement):
-        # The retail Entity.filter setter transfers the timestamped pose from
-        # the engine-created DumbFilter before attaching the replacement.
-        old_position = self._filter.position
-        replacement.bodyMatrix.translation = Vector3(
-            old_position.x, old_position.y, old_position.z
-        )
+        # Entity.filter only migrates a pose when the old filter can export a
+        # timestamped state. A fresh client-created DumbFilter cannot.
+        if getattr(self._filter, "export_valid", False):
+            replacement.bodyMatrix = Matrix(self._filter.bodyMatrix)
+            replacement.export_valid = True
         self._filter = replacement
 
 
@@ -98,6 +134,9 @@ class NativeVehiclePhysicsProbeTest(unittest.TestCase):
         self.entities = {}
         self.destroyed = []
         self.physics_init_calls = []
+        self.initial_filter_valid = True
+        self.bridge_available = True
+        self.bridge_calls = []
 
         bigworld = types.ModuleType("BigWorld")
         bigworld.Entity = object
@@ -109,17 +148,24 @@ class NativeVehiclePhysicsProbeTest(unittest.TestCase):
             return None
 
         def create_entity(unused_type, unused_space, unused_vehicle_id,
-                          position, unused_direction, unused_properties):
-            entity_id = 900 + len(self.entities)
-            self.entities[entity_id] = Entity(entity_id, position)
+                          position, direction, unused_properties):
+            entity_id = 900 + len(self.destroyed) + len(self.entities)
+            self.entities[entity_id] = Entity(
+                entity_id, position, direction[2], self.initial_filter_valid
+            )
             return entity_id
 
         bigworld.wg_collideSegment = collide
         bigworld.createEntity = create_entity
         bigworld.entity = lambda entity_id: self.entities.get(entity_id)
-        bigworld.destroyEntity = lambda entity_id: (
-            self.destroyed.append(entity_id), self.entities.pop(entity_id, None)
-        )
+
+        def destroy_entity(entity_id):
+            self.destroyed.append(entity_id)
+            self.entities.pop(entity_id, None)
+
+        bigworld.destroyEntity = destroy_entity
+        bigworld.AvatarFilter = AvatarFilter
+        bigworld.WGVehicleFilter = LegacyVehicleFilter
         bigworld.WGVehicleFilter2 = VehicleFilter
         bigworld.WGVehiclePhysics2 = VehiclePhysics
 
@@ -147,6 +193,28 @@ class NativeVehiclePhysicsProbeTest(unittest.TestCase):
 
         for name in ("gui", "gui.mods", "gui.mods.offhangar"):
             sys.modules[name] = types.ModuleType(name)
+
+        native_bridge = types.ModuleType(
+            "gui.mods.offhangar.native_filter_bridge"
+        )
+
+        def seed_filter(vehicle_filter, timestamp, space_id, entity_id,
+                        position, direction):
+            position_tuple = (position.x, position.y, position.z)
+            self.bridge_calls.append((
+                vehicle_filter, timestamp, space_id, entity_id,
+                position_tuple, tuple(direction),
+            ))
+            if not self.bridge_available:
+                return False
+            vehicle_filter.bodyMatrix.translation = Vector3(position_tuple)
+            vehicle_filter.bodyMatrix.yaw = float(direction[2])
+            vehicle_filter.export_valid = True
+            return True
+
+        native_bridge.seed_filter = seed_filter
+        sys.modules["gui.mods.offhangar.native_filter_bridge"] = native_bridge
+        sys.modules["gui.mods.offhangar"].native_filter_bridge = native_bridge
         sys.modules["BigWorld"] = bigworld
         sys.modules["Math"] = math_module
         sys.modules["physics_shared"] = physics_shared
@@ -188,20 +256,24 @@ class NativeVehiclePhysicsProbeTest(unittest.TestCase):
             self.player, self.descriptor, self.position, 0.0, 7, 11
         )
 
+    def run_until_done(self, max_steps=100):
+        saw_pass = False
+        for unused in range(max_steps):
+            saw_pass = self.advance_probe() or saw_pass
+            state = getattr(self.player, self.probe._STATE_ATTR, None)
+            if (state is not None and state.get("phase") == "done" and
+                    not self.probe.is_requested()):
+                return state, saw_pass
+            self.now += 1.0
+        self.fail("probe did not finish")
+
     def test_f6_request_runs_staged_retail_physics_and_cleans_up(self):
         self.probe.request()
-        self.assertFalse(self.advance_probe())
-        self.now += self.probe.INITIAL_DELAY
-        self.assertFalse(self.advance_probe())  # create
-        self.assertFalse(self.advance_probe())  # bind entity/filter
-        self.assertFalse(self.advance_probe())  # bind physics
-        self.now += self.probe.SETTLE_SECONDS
-        self.assertFalse(self.advance_probe())  # begin forward input
-        self.now += self.probe.DRIVE_SECONDS
-        self.assertTrue(self.advance_probe())   # observe PASS
-        self.now += self.probe.CLEANUP_DELAY
-        self.assertTrue(self.advance_probe())   # destroy temporary entity
+        state, saw_pass = self.run_until_done()
 
+        self.assertTrue(saw_pass)
+        self.assertTrue(state["passed"])
+        self.assertEqual("retail_order", state["candidate"])
         self.assertEqual(1, len(self.physics_init_calls))
         self.assertEqual([900], self.destroyed)
         self.assertTrue(any(
@@ -209,16 +281,67 @@ class NativeVehiclePhysicsProbeTest(unittest.TestCase):
             for unused_level, message in self.logs
         ))
         self.assertTrue(any(
-            "filter_transfer source=DumbFilter" in message
+            "stage=T6_physics_callback" in message and "valid=True" in message
             for unused_level, message in self.logs
         ))
         self.assertFalse(hasattr(VehicleFilter(), "set"))
         self.assertEqual("information", self.messages[-1][1])
-        self.assertFalse(self.probe.is_requested())
 
-        # A completed request must not silently run again in a later battle.
         self.assertFalse(self.advance_probe())
         self.assertEqual([900], self.destroyed)
+
+    def test_real_client_created_semantics_use_native_bridge_and_pass(self):
+        self.initial_filter_valid = False
+        self.probe.request()
+        state, saw_pass = self.run_until_done()
+
+        self.assertTrue(saw_pass)
+        self.assertTrue(state["passed"])
+        self.assertEqual("native_bridge", state["candidate"])
+        self.assertEqual(4, len(self.destroyed))
+        self.assertEqual(2, len(self.physics_init_calls))
+        self.assertEqual(3, len(state["candidate_failures"]))
+        self.assertEqual(1, len(self.bridge_calls))
+        self.assertEqual(7, self.bridge_calls[0][2])
+        self.assertTrue(any(
+            "CANDIDATE FAIL candidate=retail_order" in message
+            for unused_level, message in self.logs
+        ))
+        self.assertTrue(any(
+            "CANDIDATE FAIL candidate=avatar_copy" in message
+            for unused_level, message in self.logs
+        ))
+        self.assertTrue(any(
+            "CANDIDATE FAIL candidate=legacy_set_position" in message
+            for unused_level, message in self.logs
+        ))
+        self.assertTrue(any(
+            "candidate=native_bridge" in message and "PASS" in message
+            for unused_level, message in self.logs
+        ))
+        self.assertEqual("information", self.messages[-1][1])
+
+    def test_native_bridge_failure_exhausts_candidates_and_fails_closed(self):
+        self.initial_filter_valid = False
+        self.bridge_available = False
+        self.probe.request()
+        state, saw_pass = self.run_until_done()
+
+        self.assertFalse(saw_pass)
+        self.assertFalse(state["passed"])
+        self.assertEqual(4, len(self.destroyed))
+        self.assertEqual(1, len(self.physics_init_calls))
+        self.assertEqual(4, len(state["candidate_failures"]))
+        self.assertEqual(1, len(self.bridge_calls))
+        self.assertTrue(any(
+            "CANDIDATE FAIL candidate=native_bridge" in message
+            for unused_level, message in self.logs
+        ))
+        self.assertTrue(any(
+            "stage=pose_seed" in message
+            for unused_level, message in self.logs
+        ))
+        self.assertEqual("error", self.messages[-1][1])
 
     def test_probe_is_inert_until_explicitly_requested(self):
         self.assertFalse(self.advance_probe())
@@ -234,20 +357,14 @@ class NativeVehiclePhysicsProbeTest(unittest.TestCase):
     def test_missing_native_physics_fails_closed_and_keeps_no_bot_state(self):
         del sys.modules["BigWorld"].WGVehiclePhysics2
         self.probe.request()
-        self.assertFalse(self.advance_probe())
-        self.now += self.probe.INITIAL_DELAY
-        self.assertFalse(self.advance_probe())
-        self.assertFalse(self.advance_probe())
-        self.assertFalse(self.advance_probe())
+        state, saw_pass = self.run_until_done()
 
-        state = getattr(self.player, self.probe._STATE_ATTR)
-        self.assertEqual("cleanup", state["phase"])
+        self.assertFalse(saw_pass)
+        self.assertFalse(state["passed"])
         self.assertTrue(any(
-            "NATIVE_PHYSICS_PROBE FAIL stage=physics" in message
+            "NATIVE_PHYSICS_PROBE FAIL stage=physics_attach" in message
             for unused_level, message in self.logs
         ))
-        self.now += self.probe.CLEANUP_DELAY
-        self.assertFalse(self.advance_probe())
         self.assertEqual([900], self.destroyed)
 
 

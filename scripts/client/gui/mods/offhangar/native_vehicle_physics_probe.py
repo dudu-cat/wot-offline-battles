@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
-"""Opt-in runtime probe for the retail 0.8.2 vehicle physics stack.
+"""Fail-closed probe for the retail 0.8.2 vehicle physics stack.
 
-Press F6 during a live offline/LAN battle to create one invisible temporary
-``OfflineEntity``.  The probe replaces the entity's engine-created
-``DumbFilter`` with the same ``WGVehicleFilter2`` used by retail
-``Vehicle.startVisual()``.  The native ``Entity.filter`` setter transfers the
-authoritative pose between those filters before ``WGVehiclePhysics2`` is
-attached.  The probe then sends a short forward input, records the native body
-transform, and destroys the entity.  It never owns a real bot and therefore
-cannot silently change the production simulation path.
+Press F6 during a live offline/LAN battle.  One temporary ``OfflineEntity``
+is used at a time while the probe tries four pose-seeding paths:
+
+* retail ``WGVehicleFilter2`` assignment order;
+* ``AvatarFilter`` attachment followed by the documented copy constructor;
+* legacy ``WGVehicleFilter.setPosition(x, z)`` followed by that copy path.
+* a version-locked native bridge to ``Filter::input``.
+
+Every stage records the native ``bodyMatrix`` position and yaw.  Native drive
+is enabled only when the complete pose remains correct after physics is
+attached.  A failed candidate is destroyed before the next one is created, so
+an origin filter can never become a moving ghost in the battle.
 """
 
 import math
@@ -23,12 +27,20 @@ from gui.mods.offhangar.logging import LOG_ERROR, LOG_NOTE
 
 INITIAL_DELAY = 0.40
 ENTITY_WAIT_SECONDS = 2.0
-SETTLE_SECONDS = 0.35
+STAGE_WAIT_SECONDS = 0.08
+PHYSICS_SETTLE_SECONDS = 0.35
 DRIVE_SECONDS = 2.0
 CLEANUP_DELAY = 0.20
 MIN_PASS_DISTANCE = 0.50
-FILTER_TRANSFER_TOLERANCE = 6.0
+POSE_POSITION_TOLERANCE = 2.0
+POSE_YAW_TOLERANCE = 0.35
 
+_CANDIDATES = (
+	'retail_order',
+	'avatar_copy',
+	'legacy_set_position',
+	'native_bridge',
+)
 _STATE_ATTR = '_offh_native_vehicle_physics_probe_state'
 _REQUEST_SERIAL = [0]
 _ACTIVE_SERIAL = [0]
@@ -98,14 +110,24 @@ def _type_name(value):
 			return '<unknown>'
 
 
-def _flat_distance(first, second):
+def _normalise_angle(value):
+	value = float(value)
+	while value > math.pi:
+		value -= math.pi * 2.0
+	while value < -math.pi:
+		value += math.pi * 2.0
+	return value
+
+
+def _distance_3d(first, second):
 	first = _point_tuple(first)
 	second = _point_tuple(second)
 	if first is None or second is None:
 		return None
 	dx = second[0] - first[0]
+	dy = second[1] - first[1]
 	dz = second[2] - first[2]
-	return math.sqrt(dx * dx + dz * dz)
+	return math.sqrt(dx * dx + dy * dy + dz * dz)
 
 
 def request():
@@ -157,6 +179,15 @@ def _corridor_clear(space_id, start, end, start_y, end_y):
 	return True
 
 
+def _probe_yaw(player_yaw):
+	# A deliberately non-zero target catches legacy x/z-only seeding.  Avoid a
+	# rare player heading that would cancel the first offset back to zero.
+	value = _normalise_angle(float(player_yaw) + 0.67)
+	if abs(value) < 0.40:
+		value = _normalise_angle(value + 0.91)
+	return value
+
+
 def _select_probe_pose(space_id, origin, yaw):
 	"""Find a short clear patch away from the player without map assumptions."""
 	origin = _point_tuple(origin)
@@ -166,8 +197,6 @@ def _select_probe_pose(space_id, origin, yaw):
 	forward_z = math.cos(float(yaw))
 	right_x = math.cos(float(yaw))
 	right_z = -math.sin(float(yaw))
-	# Keep the temporary body away from the spawn crowd. The ordering favours
-	# behind/side patches, then falls back to open ground in front.
 	offsets = (
 		(-38.0, -20.0), (38.0, -20.0),
 		(-48.0, 0.0), (48.0, 0.0),
@@ -244,23 +273,53 @@ def _visibility_mask(player):
 		return int(ArenaType.getVisibilityMask(
 			int(getattr(player, 'arenaTypeID', 0)) >> 16))
 	except Exception:
-		# Standard/CTF is bit zero in the pinned 0.8.2 client.
 		return 1
 
 
-def _filter_position(vehicle_filter, entity):
+def _filter_pose(vehicle_filter):
 	provider = getattr(vehicle_filter, 'bodyMatrix', None)
-	if provider is not None:
-		point = _point_tuple(getattr(provider, 'translation', None))
-		if point is not None:
-			return point
+	if provider is None:
+		return None, None
+	try:
+		matrix = Math.Matrix(provider)
+	except Exception:
+		matrix = provider
+	position = _point_tuple(getattr(matrix, 'translation', None))
+	if position is None:
+		position = _point_tuple(getattr(provider, 'translation', None))
+	yaw = None
+	try:
+		yaw = float(matrix.yaw)
+	except Exception:
 		try:
-			point = _point_tuple(Math.Matrix(provider).translation)
-			if point is not None:
-				return point
+			forward = matrix.applyVector(Math.Vector3(0.0, 0.0, 1.0))
+			yaw = math.atan2(float(forward.x), float(forward.z))
 		except Exception:
 			pass
-	return _point_tuple(getattr(entity, 'position', None))
+	return position, yaw
+
+
+def _pose_record(state, label, vehicle_filter):
+	position, yaw = _filter_pose(vehicle_filter)
+	position_delta = _distance_3d(state.get('position'), position)
+	yaw_delta = None
+	if yaw is not None:
+		yaw_delta = abs(_normalise_angle(yaw - float(state.get('yaw', 0.0))))
+	valid = (position_delta is not None and yaw_delta is not None and
+			_finite(position_delta) and _finite(yaw_delta) and
+			position_delta <= POSE_POSITION_TOLERANCE and
+			yaw_delta <= POSE_YAW_TOLERANCE)
+	LOG_NOTE(
+		'NATIVE_PHYSICS_PROBE POSE candidate=%s stage=%s expected=%s/%.3f '
+		'actual=%s/%s delta=%s/%s valid=%s' % (
+			state.get('candidate'), label, _point_text(state.get('position')),
+			float(state.get('yaw', 0.0)), _point_text(position),
+			'<unavailable>' if yaw is None else '%.3f' % yaw,
+			'<unavailable>' if position_delta is None else
+				'%.2fm' % position_delta,
+			'<unavailable>' if yaw_delta is None else '%.3frad' % yaw_delta,
+			valid))
+	return valid
 
 
 def _speed_snapshot(vehicle_filter):
@@ -291,6 +350,7 @@ def _contact_snapshot(vehicle_filter):
 def _destroy_entity(state):
 	entity_id = state.get('entity_id')
 	state['entity'] = None
+	state['source_filter'] = None
 	state['filter'] = None
 	state['physics'] = None
 	if entity_id is not None:
@@ -338,6 +398,72 @@ def _fail(state, stage, error):
 	_finish(state, False, 'stage=%s error=%s' % (stage, str(error)))
 
 
+def _next_candidate(state, reason):
+	name = state.get('candidate', '<none>')
+	state.setdefault('candidate_failures', []).append(
+		'%s:%s' % (name, str(reason)))
+	LOG_NOTE(
+		'NATIVE_PHYSICS_PROBE CANDIDATE FAIL candidate=%s reason=%s' % (
+			name, str(reason)))
+	_stop_native_input(state)
+	_destroy_entity(state)
+	state['candidate_index'] = int(state.get('candidate_index', 0)) + 1
+	if state['candidate_index'] >= len(_CANDIDATES):
+		_finish(
+			state, False,
+			'stage=pose_seed candidates=%s' %
+			';'.join(state.get('candidate_failures', [])))
+		return
+	state['candidate'] = _CANDIDATES[state['candidate_index']]
+	state['phase'] = 'create_candidate'
+	state['next_at'] = _now() + STAGE_WAIT_SECONDS
+
+
+def _create_candidate(state, space_id):
+	LOG_NOTE(
+		'NATIVE_PHYSICS_PROBE CANDIDATE START candidate=%s pos=%s yaw=%.3f' % (
+			state['candidate'], _point_text(state['position']), state['yaw']))
+	entity_id = BigWorld.createEntity(
+		'OfflineEntity', int(space_id), 0, state['position'],
+		(0.0, 0.0, state['yaw']), dict())
+	state['entity_id'] = int(entity_id)
+	state['phase'] = 'wait_entity'
+	state['deadline'] = _now() + ENTITY_WAIT_SECONDS
+	state['next_at'] = _now()
+
+
+def _attach_physics(state, descriptor, player):
+	state['phase'] = 'physics_attach'
+	LOG_NOTE(
+		'NATIVE_PHYSICS_PROBE STAGE physics candidate=%s' %
+		state.get('candidate'))
+	import physics_shared
+	physics = BigWorld.WGVehiclePhysics2()
+	physics_shared.initVehiclePhysics(physics, descriptor)
+	physics.setArenaBounds((-10000, -10000), (10000, 10000))
+	physics.enginePower = float(
+		_descriptor_value(
+			_descriptor_value(descriptor, 'physics', {}),
+			'enginePower', 0.0)) / 1000.0
+	physics.owner = weakref.ref(state['entity'])
+	physics.staticMode = False
+	physics.movementSignals = 0
+	for name in ('damageDestructibleCb',
+			'destructibleHealthRequestCb', 'onRammingCb',
+			'onBecameFrozenCb', 'onStaticDamageCb'):
+		try:
+			setattr(physics, name, None)
+		except Exception:
+			pass
+	physics.visibilityMask = _visibility_mask(player)
+	state['filter'].setVehiclePhysics(physics)
+	state['filter'].syncGunAngles(0.0, 0.0)
+	state['entity'].wgPhysics = physics
+	state['physics'] = physics
+	state['phase'] = 'physics_wait'
+	state['next_at'] = _now() + PHYSICS_SETTLE_SECONDS
+
+
 def cancel(player):
 	"""Stop and destroy a live probe before the battle resource sweep."""
 	state = getattr(player, _STATE_ATTR, None) if player is not None else None
@@ -374,13 +500,18 @@ def maybe_run(player, descriptor, position, yaw, space_id,
 			'next_at': _now() + INITIAL_DELAY,
 			'entity_id': None,
 			'entity': None,
+			'source_filter': None,
 			'filter': None,
 			'physics': None,
+			'candidate_index': 0,
+			'candidate': _CANDIDATES[0],
+			'candidate_failures': [],
+			'space_id': int(space_id),
 		}
 		setattr(player, _STATE_ATTR, state)
 		LOG_NOTE(
-			'NATIVE_PHYSICS_PROBE ARM token=%d generation=%d' % (
-				token, state['generation']))
+			'NATIVE_PHYSICS_PROBE ARM token=%d generation=%d candidates=%s' % (
+				token, state['generation'], ','.join(_CANDIDATES)))
 		return False
 
 	if state.get('phase') == 'done' or _now() < float(
@@ -390,20 +521,17 @@ def maybe_run(player, descriptor, position, yaw, space_id,
 	phase = state.get('phase')
 	try:
 		if phase == 'prepare':
+			probe_yaw = _probe_yaw(yaw)
 			probe_position, probe_yaw = _select_probe_pose(
-				space_id, position, yaw)
-			LOG_NOTE(
-				'NATIVE_PHYSICS_PROBE STAGE create pos=%s yaw=%.3f' % (
-					_point_text(probe_position), probe_yaw))
-			entity_id = BigWorld.createEntity(
-				'OfflineEntity', int(space_id), 0, probe_position,
-				(0.0, 0.0, probe_yaw), dict())
-			state['entity_id'] = int(entity_id)
+				space_id, position, probe_yaw)
 			state['position'] = probe_position
 			state['yaw'] = probe_yaw
-			state['phase'] = 'wait_entity'
-			state['deadline'] = _now() + ENTITY_WAIT_SECONDS
+			state['phase'] = 'create_candidate'
 			state['next_at'] = _now()
+			return False
+
+		if phase == 'create_candidate':
+			_create_candidate(state, space_id)
 			return False
 
 		if phase == 'wait_entity':
@@ -413,90 +541,168 @@ def maybe_run(player, descriptor, position, yaw, space_id,
 					raise RuntimeError('temporary OfflineEntity did not bind')
 				state['next_at'] = _now() + 0.05
 				return False
-			source_filter = getattr(entity, 'filter', None)
-			if source_filter is None:
+			original_filter = getattr(entity, 'filter', None)
+			if original_filter is None:
 				raise RuntimeError(
 					'temporary OfflineEntity has no engine-created filter')
-			source_filter_type = _type_name(source_filter)
-			LOG_NOTE(
-				'NATIVE_PHYSICS_PROBE STAGE filter entity=%d source=%s '
-				'entity_pos=%s' % (
-					entity.id, source_filter_type,
-					_point_text(getattr(entity, 'position', None))))
 			entity.typeDescriptor = descriptor
 			entity.isStarted = True
 			entity.isPlayer = False
-			# Match retail VehicleAppearance.start() exactly. WorldOfTanks.exe
-			# creates every Entity with a DumbFilter. Its native filter setter
-			# reads the old filter state, attaches the replacement, then writes
-			# that timestamped pose into the replacement. WGVehicleFilter2 does
-			# not expose a Python ``set`` method in the pinned 0.8.2 client.
-			vehicle_filter = BigWorld.WGVehicleFilter2()
-			_configure_filter(vehicle_filter, descriptor)
-			entity.filter = vehicle_filter
 			state['entity'] = entity
-			state['filter'] = vehicle_filter
-			# Validate the replacement filter itself. Falling back to
-			# ``entity.position`` here would hide a failed native transfer.
-			inherited_position = _filter_position(vehicle_filter, None)
-			transfer_distance = _flat_distance(
-				state['position'], inherited_position)
-			if transfer_distance is None:
-				raise RuntimeError(
-					'native filter transfer produced no body position')
 			LOG_NOTE(
-				'NATIVE_PHYSICS_PROBE STAGE filter_transfer source=%s '
-				'expected=%s inherited=%s delta=%.2fm' % (
-					source_filter_type, _point_text(state['position']),
-					_point_text(inherited_position), transfer_distance))
-			if transfer_distance > FILTER_TRANSFER_TOLERANCE:
-				raise RuntimeError(
-					'native filter transfer moved %.2fm (limit %.2fm)' % (
-						transfer_distance, FILTER_TRANSFER_TOLERANCE))
-			state['phase'] = 'physics'
-			state['next_at'] = _now()
-			return False
+				'NATIVE_PHYSICS_PROBE STAGE bind candidate=%s entity=%d '
+				'source=%s entity_pos=%s' % (
+					state['candidate'], entity.id, _type_name(original_filter),
+					_point_text(getattr(entity, 'position', None))))
 
-		if phase == 'physics':
-			LOG_NOTE('NATIVE_PHYSICS_PROBE STAGE physics')
-			import physics_shared
-			physics = BigWorld.WGVehiclePhysics2()
-			physics_shared.initVehiclePhysics(physics, descriptor)
-			physics.setArenaBounds((-10000, -10000), (10000, 10000))
-			physics.enginePower = float(
-				_descriptor_value(
-					_descriptor_value(descriptor, 'physics', {}),
-					'enginePower', 0.0)) / 1000.0
-			physics.owner = weakref.ref(state['entity'])
-			physics.staticMode = False
-			physics.movementSignals = 0
-			for name in ('damageDestructibleCb',
-					'destructibleHealthRequestCb', 'onRammingCb',
-					'onBecameFrozenCb', 'onStaticDamageCb'):
+			if state['candidate'] == 'retail_order':
+				vehicle_filter = BigWorld.WGVehicleFilter2()
+				# Retail assigns first, then configures VehicleAppearance fields.
+				entity.filter = vehicle_filter
+				_configure_filter(vehicle_filter, descriptor)
+				state['filter'] = vehicle_filter
+				_pose_record(state, 'T0_assign', vehicle_filter)
+				state['phase'] = 'retail_wait_1'
+				state['next_at'] = _now() + STAGE_WAIT_SECONDS
+				return False
+
+			if state['candidate'] == 'avatar_copy':
 				try:
-					setattr(physics, name, None)
-				except Exception:
-					pass
-			physics.visibilityMask = _visibility_mask(player)
-			state['filter'].setVehiclePhysics(physics)
-			state['filter'].syncGunAngles(0.0, 0.0)
-			state['entity'].wgPhysics = physics
-			state['physics'] = physics
-			state['phase'] = 'settle'
-			state['next_at'] = _now() + SETTLE_SECONDS
+					BigWorld.AvatarFilter(original_filter)
+					LOG_NOTE(
+						'NATIVE_PHYSICS_PROBE ABI unexpected: '
+						'AvatarFilter accepted %s' % _type_name(original_filter))
+				except Exception as error:
+					LOG_NOTE(
+						'NATIVE_PHYSICS_PROBE ABI expected rejection: '
+						'AvatarFilter(%s) error=%s' % (
+							_type_name(original_filter), str(error)))
+				seed = BigWorld.AvatarFilter()
+				entity.filter = seed
+				state['source_filter'] = seed
+				_pose_record(state, 'T0_avatar_assign', seed)
+				state['phase'] = 'avatar_seed_wait_1'
+				state['next_at'] = _now() + STAGE_WAIT_SECONDS
+				return False
+
+			if state['candidate'] == 'legacy_set_position':
+				seed = BigWorld.WGVehicleFilter()
+				entity.filter = seed
+				state['source_filter'] = seed
+				seed.setPosition(
+					float(state['position'].x), float(state['position'].z))
+				_pose_record(state, 'T0_legacy_setPosition', seed)
+				state['phase'] = 'legacy_seed_wait_1'
+				state['next_at'] = _now() + STAGE_WAIT_SECONDS
+				return False
+
+			if state['candidate'] == 'native_bridge':
+				vehicle_filter = BigWorld.WGVehicleFilter2()
+				entity.filter = vehicle_filter
+				_configure_filter(vehicle_filter, descriptor)
+				state['filter'] = vehicle_filter
+				_pose_record(state, 'T0_native_before_seed', vehicle_filter)
+				from gui.mods.offhangar import native_filter_bridge
+				if not native_filter_bridge.seed_filter(
+						vehicle_filter, _now(), state['space_id'], entity.id,
+						state['position'], (0.0, 0.0, state['yaw'])):
+					_next_candidate(state, 'native Filter::input bridge rejected seed')
+					return False
+				_pose_record(state, 'T1_native_seed_return', vehicle_filter)
+				state['phase'] = 'native_seed_wait_1'
+				state['next_at'] = _now() + STAGE_WAIT_SECONDS
+				return False
+
+			raise RuntimeError('unknown candidate %r' % state['candidate'])
+
+		if phase == 'retail_wait_1':
+			_pose_record(state, 'T1_callback', state['filter'])
+			state['phase'] = 'retail_wait_2'
+			state['next_at'] = _now() + STAGE_WAIT_SECONDS
 			return False
 
-		if phase == 'settle':
-			initial = _filter_position(state['filter'], state['entity'])
+		if phase == 'retail_wait_2':
+			_pose_record(state, 'T2_callback', state['filter'])
+			_attach_physics(state, descriptor, player)
+			return False
+
+		if phase == 'avatar_seed_wait_1':
+			_pose_record(state, 'T1_avatar_callback', state['source_filter'])
+			state['phase'] = 'avatar_seed_wait_2'
+			state['next_at'] = _now() + STAGE_WAIT_SECONDS
+			return False
+
+		if phase == 'avatar_seed_wait_2':
+			_pose_record(state, 'T2_avatar_callback', state['source_filter'])
+			vehicle_filter = BigWorld.WGVehicleFilter2(state['source_filter'])
+			state['entity'].filter = vehicle_filter
+			_configure_filter(vehicle_filter, descriptor)
+			state['filter'] = vehicle_filter
+			_pose_record(state, 'T3_copy_assign', vehicle_filter)
+			state['phase'] = 'copy_wait_1'
+			state['next_at'] = _now() + STAGE_WAIT_SECONDS
+			return False
+
+		if phase == 'legacy_seed_wait_1':
+			_pose_record(state, 'T1_legacy_callback', state['source_filter'])
+			state['phase'] = 'legacy_seed_wait_2'
+			state['next_at'] = _now() + STAGE_WAIT_SECONDS
+			return False
+
+		if phase == 'legacy_seed_wait_2':
+			_pose_record(state, 'T2_legacy_callback', state['source_filter'])
+			vehicle_filter = BigWorld.WGVehicleFilter2(state['source_filter'])
+			state['entity'].filter = vehicle_filter
+			_configure_filter(vehicle_filter, descriptor)
+			state['filter'] = vehicle_filter
+			_pose_record(state, 'T3_copy_assign', vehicle_filter)
+			state['phase'] = 'copy_wait_1'
+			state['next_at'] = _now() + STAGE_WAIT_SECONDS
+			return False
+
+		if phase == 'copy_wait_1':
+			_pose_record(state, 'T4_copy_callback', state['filter'])
+			state['phase'] = 'copy_wait_2'
+			state['next_at'] = _now() + STAGE_WAIT_SECONDS
+			return False
+
+		if phase == 'copy_wait_2':
+			if not _pose_record(state, 'T5_copy_callback', state['filter']):
+				_next_candidate(state, 'complete pose unavailable after copy')
+				return False
+			_attach_physics(state, descriptor, player)
+			return False
+
+		if phase == 'native_seed_wait_1':
+			_pose_record(state, 'T2_native_callback', state['filter'])
+			state['phase'] = 'native_seed_wait_2'
+			state['next_at'] = _now() + STAGE_WAIT_SECONDS
+			return False
+
+		if phase == 'native_seed_wait_2':
+			if not _pose_record(
+					state, 'T3_native_callback', state['filter']):
+				_next_candidate(
+					state, 'complete pose unavailable after native seed')
+				return False
+			_attach_physics(state, descriptor, player)
+			return False
+
+		if phase == 'physics_wait':
+			if not _pose_record(state, 'T6_physics_callback', state['filter']):
+				_next_candidate(state, 'complete pose unavailable after physics')
+				return False
+			initial, unused_yaw = _filter_pose(state['filter'])
 			if initial is None:
 				raise RuntimeError('native body matrix has no position')
 			state['initial'] = initial
 			state['initial_speed'] = _speed_snapshot(state['filter'])
 			state['initial_contacts'] = _contact_snapshot(state['filter'])
 			LOG_NOTE(
-				'NATIVE_PHYSICS_PROBE STAGE drive initial=%s speed=%s contacts=%s' % (
-					_point_text(initial), state['initial_speed'],
-					state['initial_contacts']))
+				'NATIVE_PHYSICS_PROBE STAGE drive candidate=%s initial=%s '
+				'speed=%s contacts=%s' % (
+					state['candidate'], _point_text(initial),
+					state['initial_speed'], state['initial_contacts']))
 			state['filter'].notifyInputKeysDown(1, 0)
 			state['phase'] = 'drive'
 			state['next_at'] = _now() + DRIVE_SECONDS
@@ -504,20 +710,18 @@ def maybe_run(player, descriptor, position, yaw, space_id,
 
 		if phase == 'drive':
 			state['filter'].notifyInputKeysDown(0, 0)
-			final = _filter_position(state['filter'], state['entity'])
+			final, unused_yaw = _filter_pose(state['filter'])
 			if final is None:
 				raise RuntimeError('native body matrix lost its position')
 			initial = state['initial']
-			dx = final[0] - initial[0]
-			dz = final[2] - initial[2]
-			distance = math.sqrt(dx * dx + dz * dz)
+			distance = _distance_3d(initial, final)
 			speeds = _speed_snapshot(state['filter'])
 			contacts = _contact_snapshot(state['filter'])
 			detail = (
-				'distance=%.2fm initial=%s final=%s speed0=%s speed1=%s '
-				'contacts0=%s contacts1=%s' % (
-					distance, _point_text(initial), _point_text(final),
-					state.get('initial_speed'), speeds,
+				'candidate=%s distance=%.2fm initial=%s final=%s '
+				'speed0=%s speed1=%s contacts0=%s contacts1=%s' % (
+					state['candidate'], distance, _point_text(initial),
+					_point_text(final), state.get('initial_speed'), speeds,
 					state.get('initial_contacts'), contacts))
 			passed = (_finite(distance) and distance >= MIN_PASS_DISTANCE and
 					all(_finite(value) for value in final))
@@ -536,5 +740,5 @@ def maybe_run(player, descriptor, position, yaw, space_id,
 
 		raise RuntimeError('unknown probe phase %r' % phase)
 	except Exception as error:
-		_fail(state, phase, error)
+		_fail(state, state.get('phase', phase), error)
 		return False
