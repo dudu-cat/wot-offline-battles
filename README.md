@@ -27,6 +27,9 @@ runtime boundary.
 > [!IMPORTANT]
 > This project targets the original Windows 0.8.2 client and its embedded
 > Python 2.6 runtime. It does not provide the game client or a standalone game.
+> The `experiment/native-vehicle-physics` branch is a separately packaged,
+> version-locked native bot-physics experiment. Read
+> `START_NATIVE_TEST_HERE.txt` before installing that branch.
 
 Play World of Tanks 0.8.2 offline: no login, no server. You go straight to the
 hangar, pick a tank and fight bots on the real maps.
@@ -55,10 +58,11 @@ does not switch back to the legacy chase logic.
 
 Install
 -------
-For the downloadable v1.0.1 release, open `START_HERE.txt`: close the game,
-delete or move aside the old `res_mods\0.8.2`, then drag the package's complete
-`0.8.2` folder into the game's `res_mods` folder. The release also includes
-double-clickable Windows and macOS LAN-server launchers.
+For the native 1.8.30 experiment, read `START_NATIVE_TEST_HERE.txt` and then
+open `START_HERE.txt`: close the game, delete or move aside the old
+`res_mods\0.8.2`, then drag the package's complete `0.8.2` folder into the
+game's `res_mods` folder. The package also includes double-clickable Windows
+and macOS LAN-server launchers.
 
 For a source checkout, the Windows refresh helper is:
 

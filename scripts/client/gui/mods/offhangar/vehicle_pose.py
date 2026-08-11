@@ -76,7 +76,9 @@ def commit_pose(mock, position, yaw=None, pitch=None, roll=None,
 		if attach_servo and not getattr(mock, '_servo_added', False):
 			try:
 				import BigWorld
-				chassis.addMotor(BigWorld.Servo(matrix))
+				servo = BigWorld.Servo(matrix)
+				chassis.addMotor(servo)
+				mock._pose_servo = servo
 				mock._servo_added = True
 			except Exception:
 				pass

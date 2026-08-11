@@ -228,8 +228,8 @@ def _offh_perf_frame_end(started, frame_dt, player):
 		           'order_deferred', 'nav_server', 'nav_target', 'nav_refresh', 'nav_deferred',
 	           'bot_loop',
 	           'driver', 'driver_refresh', 'driver_deferred',
-	           'direction', 'direction_baked', 'direction_exact', 'physics',
-	           'physics_state', 'physics_motion', 'physics_ground',
+		           'direction', 'direction_baked', 'direction_exact', 'physics',
+		           'physics_state', 'native_physics', 'physics_motion', 'physics_ground',
 	           'physics_safety', 'physics_rays',
 	           'drive_pitch_reuse', 'drive_pitch_exact', 'tilt_support_reuse',
 	           'bot_effects', 'kinematics', 'bot_audio',
@@ -902,7 +902,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.29-probe (2026-08-11) native-filter-input-bridge'
+_OFFH_BUILD = '1.8.30-native-experimental (2026-08-11)'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -4937,6 +4937,11 @@ def _offh_battle_sweep(tag='exit'):
 			_battle_window = getattr(_swwm.g_windowsManager, 'battleWindow', None)
 		except Exception:
 			pass
+		try:
+			from gui.mods.offhangar.native_bot_physics import stop_all as _stop_native_bot_physics
+			_stop_native_bot_physics(_mvd)
+		except Exception:
+			pass
 		for _m in list(_mvd.values()):
 			try:
 				# Vehicle.stopVisual parity: remove GUI ownership and detach every
@@ -4999,6 +5004,8 @@ def _offh_battle_sweep(tag='exit'):
 				except Exception:
 					pass
 				try: _m._collision_obstacle = None
+				except Exception: pass
+				try: _m._offh_install_collision_obstacle = None
 				except Exception: pass
 				for _visual_attr in ('_gun_recoil', '_swinging', '_fashion',
 						'_crashed_track_fashion', '_hull_model', '_turret_model',
@@ -13115,94 +13122,106 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							else:
 								m_veh._offh_ai_full_throttle_seconds = 0.0
 
-							# ACCELERATION & MOVEMENT: physics.longitudinal_step - identical
-							# law to the player (engine curve, grip-limited brake, coast
-							# auto-brake, slope, clamps). Forward travel uses full throttle;
-							# only explicit holds, pivots, damage and reverse recovery reduce
-							# it. Slope probe stays rate-limited (~7x/s per bot).
 							_offh_perf_stop('physics_state', _perf_physics_state)
-							_perf_physics_motion = _offh_perf_start()
-							bot_gravity = _PHY.GRAVITY
-							# Seed the rollback point before any commanded movement, tank impulse,
-							# airborne drift or slope slide can move this hull during the tick.
-							# The shipped graph already separates dry road cells from water and
-							# cliff shoulders.  Five exact engine probes are still mandatory near a
-							# hazard (and when data is unavailable), but add no safety on inland cells.
-							_initial_hazard = _offh_ai_baked_hazard_near((
-								m_veh.position.x, m_veh.position.y, m_veh.position.z), 1)
-							_initial_water = (-1.0 if _initial_hazard is False else
-							                  _offh_ai_pose_water_depth(m_veh))
-							if _initial_water <= _OFFH_AI_WATER_AVOID_DEPTH:
-								# Transaction start: this exact dry pose is restored before the
-								# matrix/network state is committed if any later motion becomes wet.
-								m_veh._offh_ai_tick_dry_pose = (
-									float(m_veh.position.x), float(m_veh.position.y),
-									float(m_veh.position.z))
-								# A clear one-cell halo necessarily proves the centre cell safe.
-								# Avoid a second lookup for the common inland case.
-								m_veh._offh_ai_tick_nav_safe = (
-									True if _initial_hazard is False else
-									_offh_ai_baked_pose_safe(m_veh._offh_ai_tick_dry_pose))
-							else:
-								m_veh._offh_ai_tick_dry_pose = None
-								m_veh._offh_ai_tick_nav_safe = False
-							cur_vel = m_veh._veh_velocity
-							if not getattr(m_veh, '_airborne', False) and (throttle != 0 or abs(cur_vel) > 0.01):
-								m_veh._dp_acc = (getattr(m_veh, '_dp_acc', 9.0) or 9.0) + dt
-								if m_veh._dp_acc >= 0.15:
-									m_veh._dp_acc = 0.0
-									# The previous frame's terrain-support footprint was sampled at
-									# this same canonical pose. Reuse it when no later slide, rollback
-									# or collision displaced the hull; otherwise retain the original
-									# bridge-aware probes. This removes duplicate engine rays without
-									# changing the pitch cadence or accepting stale terrain.
-									_braw = None
-									_bsp = getattr(m_veh, '_offh_drive_support', None)
-									if _bsp is not None:
-										_bdx = float(m_veh.position.x) - float(_bsp[0])
-										_bdy = float(m_veh.position.y) - float(_bsp[1])
-										_bdz = float(m_veh.position.z) - float(_bsp[2])
-										_bda = float(m_veh.yaw) - float(_bsp[3])
-										while _bda > math.pi: _bda -= 2.0 * math.pi
-										while _bda < -math.pi: _bda += 2.0 * math.pi
-										if (_bdx * _bdx + _bdz * _bdz <= 0.16 and
-												abs(_bdy) <= 0.40 and abs(_bda) <= 0.10):
-											_braw = float(_bsp[4])
-											_offh_perf_count('drive_pitch_reuse')
-									if _braw is None:
-										_braw = _drive_pitch(
-											_ai_space_id, m_veh.position.x, m_veh.position.z,
-											m_veh.yaw, m_veh.position.y)
-										_offh_perf_count('drive_pitch_exact')
-									# smooth probe spikes (same reason as the player)
-									_bprev = getattr(m_veh, '_dp_v', _braw) or 0.0
-									_bd = _braw - _bprev
-									if _bd > 0.35: _bd = 0.35
-									elif _bd < -0.35: _bd = -0.35
-									m_veh._dp_v = _bprev + _bd * 0.6
-							m_veh._veh_velocity = _offh_perf_call(
-								'kinematics', _PHY.longitudinal_step, _bphys, cur_vel,
-								throttle, turn_dir != 0,
-								getattr(m_veh, '_dp_v', 0.0) or 0.0, dt,
-								getattr(m_veh, '_airborne', False), 0, _b_locked)
-							
+							_native_previous_pose = (
+								float(m_veh.position.x), float(m_veh.position.y),
+								float(m_veh.position.z), float(m_veh.yaw),
+								float(getattr(m_veh, 'pitch', 0.0) or 0.0),
+								float(getattr(m_veh, 'roll', 0.0) or 0.0))
+							_native_body_pose = None
+							_native_filter_owned = False
+							_native_body_manager = None
 							try:
-								_offh_perf_call(
-									'bot_audio', _sync_bot_motion_sounds, m_veh, _td,
-									(veh_pos[0], veh_pos[1], veh_pos[2]), bot_speedFwd,
-									throttle, dt)
-							except Exception:
-								pass
-							
-							# Static tanks still participate: a moving neighbour may have queued
-							# their reciprocal correction earlier in this frame. Wall/tree probes
-							# below remain speed-gated, so this adds only the cheap OBB pass.
-							if getattr(m_veh, 'isAlive', False):
-								_hit_wall = False
-								# Tree/fence enumeration is presentation-side contact work, not
-								# motion integration.  At the fastest 0.8.2 tanks a 150 ms scan
-								# interval advances less than the probe's 6 m look-ahead, so no
-								# contact can be skipped while avoiding 20-29 chunk walks/frame.
+								from gui.mods.offhangar import native_bot_physics as _native_body_manager
+								_native_body_pose = _offh_perf_call(
+									'native_physics', _native_body_manager.step,
+									player, m_veh, _td, throttle, turn_dir,
+									_ai_space_id, _ai_now, _battle_active)
+								_native_filter_owned = _native_body_manager.owns_filter(m_veh)
+							except Exception as _native_body_error:
+								if not getattr(m_veh, '_offh_native_error_logged', False):
+									m_veh._offh_native_error_logged = True
+									LOG_ERROR('NATIVE_BOT_PHYSICS tick error id=%s error=%s' % (
+										eid, str(_native_body_error)))
+
+							if _native_body_pose is not None:
+								# Strategy, pathing and combat stay unchanged.  Only the retail
+								# rigid body supplies the canonical hull pose and speeds.
+								_native_position = _native_body_pose['position']
+								m_veh.position = Math.Vector3(
+									_native_position[0], _native_position[1],
+									_native_position[2])
+								m_veh.yaw = float(_native_body_pose['yaw'])
+								m_veh.pitch = float(_native_body_pose['pitch'])
+								m_veh.roll = float(_native_body_pose['roll'])
+								m_veh._veh_velocity = float(_native_body_pose['velocity'])
+								m_veh._veh_turn_velocity = float(
+									_native_body_pose['turn_velocity'])
+								m_veh._airborne = False
+								m_veh._vert_vel = 0.0
+								m_veh._slide_spd = 0.0
+								m_veh._push_x = 0.0
+								m_veh._push_z = 0.0
+								_b_ypr = (m_veh.yaw, m_veh.pitch, m_veh.roll,
+									0.0, 0.0, 0.0)
+
+								# The local player is still a Python-owned body.  Consume its
+								# bounded reciprocal separation and reseed this native filter so
+								# player-versus-bot contact remains two-sided without simulating
+								# native bot-versus-bot collision twice.
+								_native_pair = _tank_pair_pending.pop(eid, None)
+								if _native_pair is not None:
+									_native_corr_x = float(_native_pair[0])
+									_native_corr_z = float(_native_pair[1])
+									_native_corr_len = math.sqrt(
+										_native_corr_x * _native_corr_x +
+										_native_corr_z * _native_corr_z)
+									if 0.001 < _native_corr_len <= 2.0:
+										_native_corrected = Math.Vector3(
+											m_veh.position.x + _native_corr_x,
+											m_veh.position.y,
+											m_veh.position.z + _native_corr_z)
+										if _native_body_manager.reseed(
+												m_veh, _native_corrected, m_veh.yaw,
+												_ai_space_id, _ai_now):
+											m_veh.position = _native_corrected
+
+								# Keep the existing one-tick dry-pose contract around water and
+								# baked cliff shoulders. Native contact resolves terrain, but it
+								# does not own this bot's tactical no-drowning rule.
+								_native_final_hazard = _offh_ai_baked_hazard_near((
+									m_veh.position.x, m_veh.position.y, m_veh.position.z), 1)
+								_native_water = (-1.0 if _native_final_hazard is False else
+									_offh_ai_pose_water_depth(m_veh))
+								_native_was_safe = _offh_ai_baked_pose_safe(
+									_native_previous_pose[:3])
+								_native_now_safe = (
+									True if _native_final_hazard is False else
+									_offh_ai_baked_pose_safe((m_veh.position.x,
+										m_veh.position.y, m_veh.position.z)))
+								if (_native_water > _OFFH_AI_WATER_AVOID_DEPTH or
+										(_native_was_safe and not _native_now_safe)):
+									_native_body_manager.hold(m_veh)
+									_native_guard_reset = _native_body_manager.reseed(
+										m_veh, _native_previous_pose[:3],
+										_native_previous_pose[3], _ai_space_id, _ai_now)
+									if _native_guard_reset:
+										m_veh.position = Math.Vector3(
+											_native_previous_pose[0], _native_previous_pose[1],
+											_native_previous_pose[2])
+										m_veh.yaw = _native_previous_pose[3]
+										m_veh.pitch = _native_previous_pose[4]
+										m_veh.roll = _native_previous_pose[5]
+									m_veh._veh_velocity = 0.0
+									m_veh._veh_turn_velocity = 0.0
+									m_veh._offh_ai_driver_mode = 'native_guard'
+									_b_ypr = (m_veh.yaw, m_veh.pitch, m_veh.roll,
+										0.0, 0.0, 0.0)
+									try:
+										_ai_driver.remember_failure(eid, target_yaw, 5.0)
+									except Exception:
+										pass
+
 								_tree_scan_due = float(_ai_now) >= float(getattr(
 									m_veh, '_offh_next_tree_scan', 0.0) or 0.0)
 								if (abs(m_veh._veh_velocity) > 0.5 and _tree_scan_due and
@@ -13212,357 +13231,462 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										getattr(m_veh, '_offh_next_tree_scan', None) is None)
 									try:
 										_offh_perf_call('tree_scan', _fell_trees_near,
-												_ai_space_id, m_veh.position, m_veh.yaw,
-												m_veh._veh_velocity, _td)
-									except: pass
-								elif abs(m_veh._veh_velocity) > 0.5 and _tree_scan_due:
-									_offh_perf_count('tree_deferred')
-								# The three-ray swept broad phase is mandatory every movement frame.
-								# Expensive slope/material classification runs only after those rays hit.
-								if abs(m_veh._veh_velocity) > 0.5:
-									try:
-										_hit_wall = _offh_perf_call(
-											'wall_collision', _check_horizontal_collision,
 											_ai_space_id, m_veh.position, m_veh.yaw,
-											m_veh._veh_velocity, _td,
-											getattr(m_veh, '_airborne', False), dt)
-									except: pass
-								_bnx = m_veh.position.x + math.sin(m_veh.yaw) * m_veh._veh_velocity * dt
-								_bnz = m_veh.position.z + math.cos(m_veh.yaw) * m_veh._veh_velocity * dt
-								if _hit_wall:
-									# Airborne: a wall must not brake the fall - keep momentum,
-									# just don't advance into it. Grounded: bleed forward drive.
-									if not getattr(m_veh, '_airborne', False):
-										m_veh._veh_velocity *= 0.2
-										# A realised wall hit is stronger evidence than the speculative
-										# corridor probe. Feed it back immediately instead of waiting for
-										# the generic stuck timer while the hull grinds the obstacle.
-										m_veh._offh_ai_driver_mode = 'blocked'
-										_offh_ai_probe_reject(m_veh, 'obstacle')
-										_ai_driver.remember_failure(
-											eid, target_yaw, 5.0)
-								else:
-									m_veh.position = Math.Vector3(_bnx, m_veh.position.y, _bnz)
-								# Tank-vs-tank: velocity-relative impulse (e=0) + Baumgarte push-apart
+											m_veh._veh_velocity, _td)
+									except Exception:
+										pass
 								try:
-									_bsvx = math.sin(m_veh.yaw) * m_veh._veh_velocity + (getattr(m_veh, '_push_x', 0.0) or 0.0)
-									_bsvz = math.cos(m_veh.yaw) * m_veh._veh_velocity + (getattr(m_veh, '_push_z', 0.0) or 0.0)
-									_bot_collision_ids = None
-									if _collision_candidates[0] is not None:
-										_bot_collision_ids = _collision_candidates[0].get(eid)
-									# The broad phase proves that most bots have no nearby body.
-									# Preserve a queued reciprocal correction even when this bot
-									# owns no pair itself; otherwise skip the complete resolver.
-									if (_bot_collision_ids == () and
-											eid not in _tank_pair_pending):
-										_offh_perf_count('tank_collision_empty')
-										_btr = (0.0, 0.0, 0.0, 0.0)
-									else:
-										_btr = _offh_perf_call(
-											'tank_collision', _tank_resolve, eid,
-											m_veh.position.x, m_veh.position.z, m_veh.yaw, _td,
-											1.0 / max(bot_mass, 1.0), _bsvx, _bsvz,
-											m_veh.position.y)
-									if abs(_btr[0]) + abs(_btr[1]) > 0.01:
-										# Re-evaluate immediately after another hull displaced this bot.
-										# A short failed-heading memory gives touching bots deterministic,
-										# opposite escape sides without treating traffic as a static wall.
-										m_veh._offh_ai_driver_cache = None
-										m_veh._offh_ai_driver_mode = 'avoid'
-										_ai_driver.remember_failure(
-											eid, target_yaw, 0.8)
-									# Forward impulse share hits the bot's drive speed too (see player)
-									_bfimp = _btr[2] * math.sin(m_veh.yaw) + _btr[3] * math.cos(m_veh.yaw)
-									_bfabs = 0.0
-									if _bfimp * m_veh._veh_velocity < 0.0:
-										_bfabs = -m_veh._veh_velocity if abs(_bfimp) >= abs(m_veh._veh_velocity) else _bfimp
-										m_veh._veh_velocity += _bfabs
-									_bpx = (getattr(m_veh, '_push_x', 0.0) or 0.0) + _btr[2] - _bfabs * math.sin(m_veh.yaw)
-									_bpz = (getattr(m_veh, '_push_z', 0.0) or 0.0) + _btr[3] - _bfabs * math.cos(m_veh.yaw)
-									m_veh.position = Math.Vector3(m_veh.position.x + _btr[0] + _bpx * dt, m_veh.position.y, m_veh.position.z + _btr[1] + _bpz * dt)
-									m_veh._push_x = _bpx * 0.90
-									m_veh._push_z = _bpz * 0.90
-								except: pass
-							
-							# ROTATION: physics.traverse_step (same law as the player)
-							m_veh._veh_turn_velocity = _offh_perf_call(
-								'kinematics', _PHY.traverse_step, _bphys,
-								m_veh._veh_turn_velocity, turn_dir,
-								m_veh._veh_velocity, dt, 0, throttle)
-							try:
-								_btf = _module_factor(m_veh, 'traverse')
-								if _btf < 1.0:
-									m_veh._veh_turn_velocity = m_veh._veh_turn_velocity * _btf
-							except Exception: pass
-							
-							if m_veh._veh_turn_velocity != 0.0:
-								m_veh.yaw += m_veh._veh_turn_velocity * dt
-								while m_veh.yaw > math.pi: m_veh.yaw -= 2*math.pi
-								while m_veh.yaw < -math.pi: m_veh.yaw += 2*math.pi
-
-							_offh_perf_stop('physics_motion', _perf_physics_motion)
-							_perf_physics_ground = _offh_perf_start()
-							# TERRAIN SNAP (ray starts just above the hull so bridges overhead are ignored)
-							_bsup = None
-							_bsup_rejected = False
-							try:
-								# Highest ground under the fore-aft footprint (same law as the player)
-								_bhl = 2.5
-								try:
-									if _td is not None and hasattr(_td, 'hull') and 'hitTester' in _td.hull:
-										_bhl = max(1.5, abs(_td.hull['hitTester'].bbox[1][2]))
+									_offh_perf_call(
+										'bot_audio', _sync_bot_motion_sounds, m_veh, _td,
+										(veh_pos[0], veh_pos[1], veh_pos[2]), bot_speedFwd,
+										throttle, dt)
 								except Exception:
 									pass
-								_bsup = _offh_perf_call(
-									'terrain_support', _terrain_support, _ai_space_id,
-									m_veh.position.x, m_veh.position.y, m_veh.position.z,
-									m_veh.yaw, _bhl)
-								_bc_y = _bsup[1]        # ground under the hull centre (chassis origin)
-								_bg_y = _bc_y if _bc_y is not None else _bsup[0]  # rest on centre, not float
-								if _bg_y is not None:
-									_b_snap = max(0.8, min(2.5, abs(m_veh._veh_velocity) * dt * 2.0 + 0.6))
-									_b_climb = max(0.6, abs(m_veh._veh_velocity) * dt * 2.5)
-									_bcom_gap = _b_snap if _bc_y is None else (m_veh.position.y - _bc_y)
-									_bland_y = _bg_y if _bc_y is None else _bc_y
-									if _VC.support_rise_is_obstacle(
-											m_veh.position.y, _bc_y, _b_climb):
-										_bsup_rejected = True
-										# The centre support ray hit the top of a wagon, roof or large
-										# prop after horizontal integration moved the hull partly inside
-										# it.  Never pop the tank vertically onto that surface.  Restore
-										# only this frame's pose and invalidate the selected heading so
-										# LocalDriver performs its normal reverse/turn recovery.
-										_rise_anchor = getattr(m_veh, '_offh_ai_tick_dry_pose', None)
-										if _rise_anchor is not None:
-											m_veh.position = Math.Vector3(
-												_rise_anchor[0], _rise_anchor[1], _rise_anchor[2])
-										m_veh._veh_velocity = 0.0
-										m_veh._veh_turn_velocity = 0.0
-										m_veh._push_x = 0.0
-										m_veh._push_z = 0.0
-										m_veh._vert_vel = 0.0
-										m_veh._airborne = False
-										m_veh._offh_ai_driver_mode = 'obstacle_rise'
-										_offh_ai_probe_reject(m_veh, 'obstacle')
-										try:
-											_ai_driver.remember_failure(eid, target_yaw, 5.0)
-										except Exception:
-											pass
-									elif m_veh.position.y <= _bg_y or (_bcom_gap <= _b_snap and not getattr(m_veh, '_airborne', False)):
-										# Soft ground-follow: below snaps up hard, above eases down (cap 0.12 m)
-										if m_veh.position.y < _bg_y:
-											_brise = _bg_y - m_veh.position.y
-											_bfy = m_veh.position.y + (_brise if _brise <= _b_climb else _b_climb)
-										else:
-											_bfy = m_veh.position.y + (_bg_y - m_veh.position.y) * min(1.0, dt * 15.0)
-											if _bfy > _bg_y + 0.12:
-												_bfy = _bg_y + 0.12
-										m_veh.position = Math.Vector3(m_veh.position.x, _bfy, m_veh.position.z)
-										m_veh._vert_vel = 0.0
-										m_veh._airborne = False
-									else:
-										m_veh._airborne = True
-										_bvv = (getattr(m_veh, '_vert_vel', 0.0) or 0.0)
-										_bfall_n = 1
-										if abs(_bvv * dt) > 0.5:
-											_bfall_n = min(8, int(abs(_bvv * dt) / 0.5) + 1)
-										_bfall_sdt = dt / _bfall_n
-										_by = m_veh.position.y
-										_bfall_i = 0
-										while _bfall_i < _bfall_n:
-											_bvv -= bot_gravity * _bfall_sdt
-											_by += _bvv * _bfall_sdt
-											if _bland_y is not None and _by <= _bland_y:
-												_by = _bland_y
-												_bvv = 0.0
-												m_veh._airborne = False
-												break
-											_bfall_i += 1
-										m_veh._vert_vel = _bvv
-										m_veh.position = Math.Vector3(m_veh.position.x, _by, m_veh.position.z)
-							except:
-								_bsup = None
-							# Cache only support that still belongs to the realised grounded
-							# pose. A later slide/rollback is detected by the pose fence above.
-							if (_bsup is not None and not _bsup_rejected and
-									not getattr(m_veh, '_airborne', False)):
-								_bsupport_pitch = _support_drive_pitch(
-									m_veh.position.y, _bsup, _bhl)
-								if _bsupport_pitch is not None:
-									m_veh._offh_drive_support = (
+							else:
+								# Compatibility fallback: retain the complete established Python
+								# movement, terrain, collision and safety implementation.
+								_perf_physics_motion = _offh_perf_start()
+								bot_gravity = _PHY.GRAVITY
+								# Seed the rollback point before any commanded movement, tank impulse,
+								# airborne drift or slope slide can move this hull during the tick.
+								# The shipped graph already separates dry road cells from water and
+								# cliff shoulders.  Five exact engine probes are still mandatory near a
+								# hazard (and when data is unavailable), but add no safety on inland cells.
+								_initial_hazard = _offh_ai_baked_hazard_near((
+									m_veh.position.x, m_veh.position.y, m_veh.position.z), 1)
+								_initial_water = (-1.0 if _initial_hazard is False else
+								                  _offh_ai_pose_water_depth(m_veh))
+								if _initial_water <= _OFFH_AI_WATER_AVOID_DEPTH:
+									# Transaction start: this exact dry pose is restored before the
+									# matrix/network state is committed if any later motion becomes wet.
+									m_veh._offh_ai_tick_dry_pose = (
 										float(m_veh.position.x), float(m_veh.position.y),
-										float(m_veh.position.z), float(m_veh.yaw),
-										float(_bsupport_pitch))
+										float(m_veh.position.z))
+									# A clear one-cell halo necessarily proves the centre cell safe.
+									# Avoid a second lookup for the common inland case.
+									m_veh._offh_ai_tick_nav_safe = (
+										True if _initial_hazard is False else
+										_offh_ai_baked_pose_safe(m_veh._offh_ai_tick_dry_pose))
 								else:
-									m_veh._offh_drive_support = None
-							else:
-								m_veh._offh_drive_support = None
+									m_veh._offh_ai_tick_dry_pose = None
+									m_veh._offh_ai_tick_nav_safe = False
+								cur_vel = m_veh._veh_velocity
+								if not getattr(m_veh, '_airborne', False) and (throttle != 0 or abs(cur_vel) > 0.01):
+									m_veh._dp_acc = (getattr(m_veh, '_dp_acc', 9.0) or 9.0) + dt
+									if m_veh._dp_acc >= 0.15:
+										m_veh._dp_acc = 0.0
+										# The previous frame's terrain-support footprint was sampled at
+										# this same canonical pose. Reuse it when no later slide, rollback
+										# or collision displaced the hull; otherwise retain the original
+										# bridge-aware probes. This removes duplicate engine rays without
+										# changing the pitch cadence or accepting stale terrain.
+										_braw = None
+										_bsp = getattr(m_veh, '_offh_drive_support', None)
+										if _bsp is not None:
+											_bdx = float(m_veh.position.x) - float(_bsp[0])
+											_bdy = float(m_veh.position.y) - float(_bsp[1])
+											_bdz = float(m_veh.position.z) - float(_bsp[2])
+											_bda = float(m_veh.yaw) - float(_bsp[3])
+											while _bda > math.pi: _bda -= 2.0 * math.pi
+											while _bda < -math.pi: _bda += 2.0 * math.pi
+											if (_bdx * _bdx + _bdz * _bdz <= 0.16 and
+													abs(_bdy) <= 0.40 and abs(_bda) <= 0.10):
+												_braw = float(_bsp[4])
+												_offh_perf_count('drive_pitch_reuse')
+										if _braw is None:
+											_braw = _drive_pitch(
+												_ai_space_id, m_veh.position.x, m_veh.position.z,
+												m_veh.yaw, m_veh.position.y)
+											_offh_perf_count('drive_pitch_exact')
+										# smooth probe spikes (same reason as the player)
+										_bprev = getattr(m_veh, '_dp_v', _braw) or 0.0
+										_bd = _braw - _bprev
+										if _bd > 0.35: _bd = 0.35
+										elif _bd < -0.35: _bd = -0.35
+										m_veh._dp_v = _bprev + _bd * 0.6
+								m_veh._veh_velocity = _offh_perf_call(
+									'kinematics', _PHY.longitudinal_step, _bphys, cur_vel,
+									throttle, turn_dir != 0,
+									getattr(m_veh, '_dp_v', 0.0) or 0.0, dt,
+									getattr(m_veh, '_airborne', False), 0, _b_locked)
 
-							# Tilt sampling alternates frames per bot; fore/aft support from
-							# this frame removes two of its four engine rays when valid.
-							# the pitch/roll smoothing below hides the halved sample rate
-							m_veh._ypr_fc = (getattr(m_veh, '_ypr_fc', 0) or 0) + 1
-							if getattr(m_veh, '_ypr_c', None) is None or ((m_veh._ypr_fc + eid) & (1 if getattr(m_veh, '_spot_visible', True) else 3)) == 0:
-									m_veh._ypr_c = _offh_perf_call(
-									'terrain_tilt', _get_terrain_ypr, _ai_space_id,
-										m_veh.position, m_veh.yaw, 5.0, 3.0,
-										_bsup if not _bsup_rejected else None, _bhl)
-							_b_ypr = (m_veh.yaw, m_veh._ypr_c[1], m_veh._ypr_c[2], m_veh._ypr_c[3], m_veh._ypr_c[4], m_veh._ypr_c[5])
-							# --- Slope slide (bot): same WG law + cross-heading projection as player ---
-							_bss = getattr(m_veh, '_slide_spd', 0.0) or 0.0
-							if getattr(m_veh, '_airborne', False):
-								_bss = 0.0   # airborne = pure ballistic fall, no slide
-							else:
-								_bss = _PHY.slope_slide_speed(_bss, _b_ypr[5], dt)
-							m_veh._slide_spd = _bss
-							_bcross_x = math.cos(m_veh.yaw); _bcross_z = -math.sin(m_veh.yaw)
-							_bsl_dot = _b_ypr[3] * _bcross_x + _b_ypr[4] * _bcross_z
-							_bsl_dx = _bcross_x * _bsl_dot; _bsl_dz = _bcross_z * _bsl_dot
-							if getattr(m_veh, '_airborne', False):
-								# carry the frozen lateral drift through the fall (see player)
-								_balx = getattr(m_veh, '_air_lat_vx', 0.0) or 0.0
-								_balz = getattr(m_veh, '_air_lat_vz', 0.0) or 0.0
-								if abs(_balx) > 1e-04 or abs(_balz) > 1e-04:
-									m_veh.position = Math.Vector3(m_veh.position.x + _balx * dt, m_veh.position.y, m_veh.position.z + _balz * dt)
-									m_veh._air_lat_vx = _balx * 0.995
-									m_veh._air_lat_vz = _balz * 0.995
-							else:
-								m_veh._air_lat_vx = _bsl_dx * _bss
-								m_veh._air_lat_vz = _bsl_dz * _bss
-								if not getattr(m_veh, '_airborne', False) and _bss > 0.01 and (abs(_bsl_dx) > 1e-04 or abs(_bsl_dz) > 1e-04):
-									_slb_len = math.sqrt(_bsl_dx * _bsl_dx + _bsl_dz * _bsl_dz)
-									_slide_blocked_by_water = False
-									if _slb_len > 1e-04:
-										# Look ahead along the gravity-driven path, not the commanded
-										# heading. This catches a tank sliding sideways toward a one-way
-										# shoreline lip before the current frame actually crosses it.
-										_slide_forecast = max(3.0, min(8.0, _bss * _slb_len * 1.5))
-										_slide_probe = Math.Vector3(
-											m_veh.position.x + _bsl_dx / _slb_len * _slide_forecast,
-											m_veh.position.y,
-											m_veh.position.z + _bsl_dz / _slb_len * _slide_forecast)
-										if _offh_ai_pose_water_depth(
-												m_veh, _slide_probe, m_veh.yaw) > _OFFH_AI_WATER_AVOID_DEPTH:
-											_slide_blocked_by_water = True
-											m_veh._slide_spd = 0.0
-											m_veh._air_lat_vx = 0.0
-											m_veh._air_lat_vz = 0.0
-											_offh_ai_probe_reject(m_veh, 'water')
+								try:
+									_offh_perf_call(
+										'bot_audio', _sync_bot_motion_sounds, m_veh, _td,
+										(veh_pos[0], veh_pos[1], veh_pos[2]), bot_speedFwd,
+										throttle, dt)
+								except Exception:
+									pass
+
+								# Static tanks still participate: a moving neighbour may have queued
+								# their reciprocal correction earlier in this frame. Wall/tree probes
+								# below remain speed-gated, so this adds only the cheap OBB pass.
+								if getattr(m_veh, 'isAlive', False):
+									_hit_wall = False
+									# Tree/fence enumeration is presentation-side contact work, not
+									# motion integration.  At the fastest 0.8.2 tanks a 150 ms scan
+									# interval advances less than the probe's 6 m look-ahead, so no
+									# contact can be skipped while avoiding 20-29 chunk walks/frame.
+									_tree_scan_due = float(_ai_now) >= float(getattr(
+										m_veh, '_offh_next_tree_scan', 0.0) or 0.0)
+									if (abs(m_veh._veh_velocity) > 0.5 and _tree_scan_due and
+											eid in _tree_refresh_ids):
+										m_veh._offh_next_tree_scan = _offh_ai_cache_deadline(
+											_ai_now, eid, 0.150, 5,
+											getattr(m_veh, '_offh_next_tree_scan', None) is None)
+										try:
+											_offh_perf_call('tree_scan', _fell_trees_near,
+													_ai_space_id, m_veh.position, m_veh.yaw,
+													m_veh._veh_velocity, _td)
+										except: pass
+									elif abs(m_veh._veh_velocity) > 0.5 and _tree_scan_due:
+										_offh_perf_count('tree_deferred')
+									# The three-ray swept broad phase is mandatory every movement frame.
+									# Expensive slope/material classification runs only after those rays hit.
+									if abs(m_veh._veh_velocity) > 0.5:
+										try:
+											_hit_wall = _offh_perf_call(
+												'wall_collision', _check_horizontal_collision,
+												_ai_space_id, m_veh.position, m_veh.yaw,
+												m_veh._veh_velocity, _td,
+												getattr(m_veh, '_airborne', False), dt)
+										except: pass
+									_bnx = m_veh.position.x + math.sin(m_veh.yaw) * m_veh._veh_velocity * dt
+									_bnz = m_veh.position.z + math.cos(m_veh.yaw) * m_veh._veh_velocity * dt
+									if _hit_wall:
+										# Airborne: a wall must not brake the fall - keep momentum,
+										# just don't advance into it. Grounded: bleed forward drive.
+										if not getattr(m_veh, '_airborne', False):
+											m_veh._veh_velocity *= 0.2
+											# A realised wall hit is stronger evidence than the speculative
+											# corridor probe. Feed it back immediately instead of waiting for
+											# the generic stuck timer while the hull grinds the obstacle.
+											m_veh._offh_ai_driver_mode = 'blocked'
+											_offh_ai_probe_reject(m_veh, 'obstacle')
+											_ai_driver.remember_failure(
+												eid, target_yaw, 5.0)
+									else:
+										m_veh.position = Math.Vector3(_bnx, m_veh.position.y, _bnz)
+									# Tank-vs-tank: velocity-relative impulse (e=0) + Baumgarte push-apart
+									try:
+										_bsvx = math.sin(m_veh.yaw) * m_veh._veh_velocity + (getattr(m_veh, '_push_x', 0.0) or 0.0)
+										_bsvz = math.cos(m_veh.yaw) * m_veh._veh_velocity + (getattr(m_veh, '_push_z', 0.0) or 0.0)
+										_bot_collision_ids = None
+										if _collision_candidates[0] is not None:
+											_bot_collision_ids = _collision_candidates[0].get(eid)
+										# The broad phase proves that most bots have no nearby body.
+										# Preserve a queued reciprocal correction even when this bot
+										# owns no pair itself; otherwise skip the complete resolver.
+										if (_bot_collision_ids == () and
+												eid not in _tank_pair_pending):
+											_offh_perf_count('tank_collision_empty')
+											_btr = (0.0, 0.0, 0.0, 0.0)
+										else:
+											_btr = _offh_perf_call(
+												'tank_collision', _tank_resolve, eid,
+												m_veh.position.x, m_veh.position.z, m_veh.yaw, _td,
+												1.0 / max(bot_mass, 1.0), _bsvx, _bsvz,
+												m_veh.position.y)
+										if abs(_btr[0]) + abs(_btr[1]) > 0.01:
+											# Re-evaluate immediately after another hull displaced this bot.
+											# A short failed-heading memory gives touching bots deterministic,
+											# opposite escape sides without treating traffic as a static wall.
+											m_veh._offh_ai_driver_cache = None
+											m_veh._offh_ai_driver_mode = 'avoid'
+											_ai_driver.remember_failure(
+												eid, target_yaw, 0.8)
+										# Forward impulse share hits the bot's drive speed too (see player)
+										_bfimp = _btr[2] * math.sin(m_veh.yaw) + _btr[3] * math.cos(m_veh.yaw)
+										_bfabs = 0.0
+										if _bfimp * m_veh._veh_velocity < 0.0:
+											_bfabs = -m_veh._veh_velocity if abs(_bfimp) >= abs(m_veh._veh_velocity) else _bfimp
+											m_veh._veh_velocity += _bfabs
+										_bpx = (getattr(m_veh, '_push_x', 0.0) or 0.0) + _btr[2] - _bfabs * math.sin(m_veh.yaw)
+										_bpz = (getattr(m_veh, '_push_z', 0.0) or 0.0) + _btr[3] - _bfabs * math.cos(m_veh.yaw)
+										m_veh.position = Math.Vector3(m_veh.position.x + _btr[0] + _bpx * dt, m_veh.position.y, m_veh.position.z + _btr[1] + _bpz * dt)
+										m_veh._push_x = _bpx * 0.90
+										m_veh._push_z = _bpz * 0.90
+									except: pass
+
+								# ROTATION: physics.traverse_step (same law as the player)
+								m_veh._veh_turn_velocity = _offh_perf_call(
+									'kinematics', _PHY.traverse_step, _bphys,
+									m_veh._veh_turn_velocity, turn_dir,
+									m_veh._veh_velocity, dt, 0, throttle)
+								try:
+									_btf = _module_factor(m_veh, 'traverse')
+									if _btf < 1.0:
+										m_veh._veh_turn_velocity = m_veh._veh_turn_velocity * _btf
+								except Exception: pass
+
+								if m_veh._veh_turn_velocity != 0.0:
+									m_veh.yaw += m_veh._veh_turn_velocity * dt
+									while m_veh.yaw > math.pi: m_veh.yaw -= 2*math.pi
+									while m_veh.yaw < -math.pi: m_veh.yaw += 2*math.pi
+
+								_offh_perf_stop('physics_motion', _perf_physics_motion)
+								_perf_physics_ground = _offh_perf_start()
+								# TERRAIN SNAP (ray starts just above the hull so bridges overhead are ignored)
+								_bsup = None
+								_bsup_rejected = False
+								try:
+									# Highest ground under the fore-aft footprint (same law as the player)
+									_bhl = 2.5
+									try:
+										if _td is not None and hasattr(_td, 'hull') and 'hitTester' in _td.hull:
+											_bhl = max(1.5, abs(_td.hull['hitTester'].bbox[1][2]))
+									except Exception:
+										pass
+									_bsup = _offh_perf_call(
+										'terrain_support', _terrain_support, _ai_space_id,
+										m_veh.position.x, m_veh.position.y, m_veh.position.z,
+										m_veh.yaw, _bhl)
+									_bc_y = _bsup[1]        # ground under the hull centre (chassis origin)
+									_bg_y = _bc_y if _bc_y is not None else _bsup[0]  # rest on centre, not float
+									if _bg_y is not None:
+										_b_snap = max(0.8, min(2.5, abs(m_veh._veh_velocity) * dt * 2.0 + 0.6))
+										_b_climb = max(0.6, abs(m_veh._veh_velocity) * dt * 2.5)
+										_bcom_gap = _b_snap if _bc_y is None else (m_veh.position.y - _bc_y)
+										_bland_y = _bg_y if _bc_y is None else _bc_y
+										if _VC.support_rise_is_obstacle(
+												m_veh.position.y, _bc_y, _b_climb):
+											_bsup_rejected = True
+											# The centre support ray hit the top of a wagon, roof or large
+											# prop after horizontal integration moved the hull partly inside
+											# it.  Never pop the tank vertically onto that surface.  Restore
+											# only this frame's pose and invalidate the selected heading so
+											# LocalDriver performs its normal reverse/turn recovery.
+											_rise_anchor = getattr(m_veh, '_offh_ai_tick_dry_pose', None)
+											if _rise_anchor is not None:
+												m_veh.position = Math.Vector3(
+													_rise_anchor[0], _rise_anchor[1], _rise_anchor[2])
+											m_veh._veh_velocity = 0.0
+											m_veh._veh_turn_velocity = 0.0
+											m_veh._push_x = 0.0
+											m_veh._push_z = 0.0
+											m_veh._vert_vel = 0.0
+											m_veh._airborne = False
+											m_veh._offh_ai_driver_mode = 'obstacle_rise'
+											_offh_ai_probe_reject(m_veh, 'obstacle')
 											try:
 												_ai_driver.remember_failure(eid, target_yaw, 5.0)
 											except Exception:
 												pass
-										if not _slide_blocked_by_water:
-											try:
-												_offh_perf_count('physics_rays')
-												_forecast_hit = BigWorld.wg_collideSegment(
-													_ai_space_id,
-													Math.Vector3(_slide_probe.x,
-													             m_veh.position.y + 8.0,
-													             _slide_probe.z),
-													Math.Vector3(_slide_probe.x,
-													             m_veh.position.y - 30.0,
-													             _slide_probe.z), 128)
-											except Exception:
-												_forecast_hit = None
-											if (_forecast_hit is None or
-													m_veh.position.y - _forecast_hit[0].y >
-													_slide_forecast * 0.38):
+										elif m_veh.position.y <= _bg_y or (_bcom_gap <= _b_snap and not getattr(m_veh, '_airborne', False)):
+											# Soft ground-follow: below snaps up hard, above eases down (cap 0.12 m)
+											if m_veh.position.y < _bg_y:
+												_brise = _bg_y - m_veh.position.y
+												_bfy = m_veh.position.y + (_brise if _brise <= _b_climb else _b_climb)
+											else:
+												_bfy = m_veh.position.y + (_bg_y - m_veh.position.y) * min(1.0, dt * 15.0)
+												if _bfy > _bg_y + 0.12:
+													_bfy = _bg_y + 0.12
+											m_veh.position = Math.Vector3(m_veh.position.x, _bfy, m_veh.position.z)
+											m_veh._vert_vel = 0.0
+											m_veh._airborne = False
+										else:
+											m_veh._airborne = True
+											_bvv = (getattr(m_veh, '_vert_vel', 0.0) or 0.0)
+											_bfall_n = 1
+											if abs(_bvv * dt) > 0.5:
+												_bfall_n = min(8, int(abs(_bvv * dt) / 0.5) + 1)
+											_bfall_sdt = dt / _bfall_n
+											_by = m_veh.position.y
+											_bfall_i = 0
+											while _bfall_i < _bfall_n:
+												_bvv -= bot_gravity * _bfall_sdt
+												_by += _bvv * _bfall_sdt
+												if _bland_y is not None and _by <= _bland_y:
+													_by = _bland_y
+													_bvv = 0.0
+													m_veh._airborne = False
+													break
+												_bfall_i += 1
+											m_veh._vert_vel = _bvv
+											m_veh.position = Math.Vector3(m_veh.position.x, _by, m_veh.position.z)
+								except:
+									_bsup = None
+								# Cache only support that still belongs to the realised grounded
+								# pose. A later slide/rollback is detected by the pose fence above.
+								if (_bsup is not None and not _bsup_rejected and
+										not getattr(m_veh, '_airborne', False)):
+									_bsupport_pitch = _support_drive_pitch(
+										m_veh.position.y, _bsup, _bhl)
+									if _bsupport_pitch is not None:
+										m_veh._offh_drive_support = (
+											float(m_veh.position.x), float(m_veh.position.y),
+											float(m_veh.position.z), float(m_veh.yaw),
+											float(_bsupport_pitch))
+									else:
+										m_veh._offh_drive_support = None
+								else:
+									m_veh._offh_drive_support = None
+
+								# Tilt sampling alternates frames per bot; fore/aft support from
+								# this frame removes two of its four engine rays when valid.
+								# the pitch/roll smoothing below hides the halved sample rate
+								m_veh._ypr_fc = (getattr(m_veh, '_ypr_fc', 0) or 0) + 1
+								if getattr(m_veh, '_ypr_c', None) is None or ((m_veh._ypr_fc + eid) & (1 if getattr(m_veh, '_spot_visible', True) else 3)) == 0:
+										m_veh._ypr_c = _offh_perf_call(
+										'terrain_tilt', _get_terrain_ypr, _ai_space_id,
+											m_veh.position, m_veh.yaw, 5.0, 3.0,
+											_bsup if not _bsup_rejected else None, _bhl)
+								_b_ypr = (m_veh.yaw, m_veh._ypr_c[1], m_veh._ypr_c[2], m_veh._ypr_c[3], m_veh._ypr_c[4], m_veh._ypr_c[5])
+								# --- Slope slide (bot): same WG law + cross-heading projection as player ---
+								_bss = getattr(m_veh, '_slide_spd', 0.0) or 0.0
+								if getattr(m_veh, '_airborne', False):
+									_bss = 0.0   # airborne = pure ballistic fall, no slide
+								else:
+									_bss = _PHY.slope_slide_speed(_bss, _b_ypr[5], dt)
+								m_veh._slide_spd = _bss
+								_bcross_x = math.cos(m_veh.yaw); _bcross_z = -math.sin(m_veh.yaw)
+								_bsl_dot = _b_ypr[3] * _bcross_x + _b_ypr[4] * _bcross_z
+								_bsl_dx = _bcross_x * _bsl_dot; _bsl_dz = _bcross_z * _bsl_dot
+								if getattr(m_veh, '_airborne', False):
+									# carry the frozen lateral drift through the fall (see player)
+									_balx = getattr(m_veh, '_air_lat_vx', 0.0) or 0.0
+									_balz = getattr(m_veh, '_air_lat_vz', 0.0) or 0.0
+									if abs(_balx) > 1e-04 or abs(_balz) > 1e-04:
+										m_veh.position = Math.Vector3(m_veh.position.x + _balx * dt, m_veh.position.y, m_veh.position.z + _balz * dt)
+										m_veh._air_lat_vx = _balx * 0.995
+										m_veh._air_lat_vz = _balz * 0.995
+								else:
+									m_veh._air_lat_vx = _bsl_dx * _bss
+									m_veh._air_lat_vz = _bsl_dz * _bss
+									if not getattr(m_veh, '_airborne', False) and _bss > 0.01 and (abs(_bsl_dx) > 1e-04 or abs(_bsl_dz) > 1e-04):
+										_slb_len = math.sqrt(_bsl_dx * _bsl_dx + _bsl_dz * _bsl_dz)
+										_slide_blocked_by_water = False
+										if _slb_len > 1e-04:
+											# Look ahead along the gravity-driven path, not the commanded
+											# heading. This catches a tank sliding sideways toward a one-way
+											# shoreline lip before the current frame actually crosses it.
+											_slide_forecast = max(3.0, min(8.0, _bss * _slb_len * 1.5))
+											_slide_probe = Math.Vector3(
+												m_veh.position.x + _bsl_dx / _slb_len * _slide_forecast,
+												m_veh.position.y,
+												m_veh.position.z + _bsl_dz / _slb_len * _slide_forecast)
+											if _offh_ai_pose_water_depth(
+													m_veh, _slide_probe, m_veh.yaw) > _OFFH_AI_WATER_AVOID_DEPTH:
 												_slide_blocked_by_water = True
 												m_veh._slide_spd = 0.0
 												m_veh._air_lat_vx = 0.0
 												m_veh._air_lat_vz = 0.0
-												_offh_ai_probe_reject(m_veh, 'terrain')
-										_slb_x = m_veh.position.x + _bsl_dx * _bss * dt
-										_slb_z = m_veh.position.z + _bsl_dz * _bss * dt
+												_offh_ai_probe_reject(m_veh, 'water')
+												try:
+													_ai_driver.remember_failure(eid, target_yaw, 5.0)
+												except Exception:
+													pass
+											if not _slide_blocked_by_water:
+												try:
+													_offh_perf_count('physics_rays')
+													_forecast_hit = BigWorld.wg_collideSegment(
+														_ai_space_id,
+														Math.Vector3(_slide_probe.x,
+														             m_veh.position.y + 8.0,
+														             _slide_probe.z),
+														Math.Vector3(_slide_probe.x,
+														             m_veh.position.y - 30.0,
+														             _slide_probe.z), 128)
+												except Exception:
+													_forecast_hit = None
+												if (_forecast_hit is None or
+														m_veh.position.y - _forecast_hit[0].y >
+														_slide_forecast * 0.38):
+													_slide_blocked_by_water = True
+													m_veh._slide_spd = 0.0
+													m_veh._air_lat_vx = 0.0
+													m_veh._air_lat_vz = 0.0
+													_offh_ai_probe_reject(m_veh, 'terrain')
+											_slb_x = m_veh.position.x + _bsl_dx * _bss * dt
+											_slb_z = m_veh.position.z + _bsl_dz * _bss * dt
+											try:
+												_offh_perf_count('physics_rays')
+												_slb_c = BigWorld.wg_collideSegment(_ai_space_id, Math.Vector3(_slb_x, m_veh.position.y + 8.0, _slb_z), Math.Vector3(_slb_x, m_veh.position.y - 30.0, _slb_z), 128)
+											except Exception:
+												_slb_c = None
+											if (not _slide_blocked_by_water and _slb_c is not None and
+													(m_veh.position.y - _slb_c[0].y) < 4.0):
+												m_veh.position = Math.Vector3(_slb_x, _slb_c[0].y, _slb_z)
+												m_veh._vert_vel = 0.0
+												m_veh._airborne = False
+								_offh_perf_stop('physics_ground', _perf_physics_ground)
+								_perf_physics_safety = _offh_perf_start()
+								# Final realised-pose water guard.  This is intentionally after all
+								# horizontal drive, vehicle impulses, vertical falling and lateral slope
+								# slide: none of those paths may push an autonomous hull over a wet bank.
+								_final_hazard = _offh_ai_baked_hazard_near((
+									m_veh.position.x, m_veh.position.y, m_veh.position.z), 1)
+								_pose_water = (-1.0 if _final_hazard is False else
+								               _offh_ai_pose_water_depth(m_veh))
+								if _pose_water > _OFFH_AI_WATER_AVOID_DEPTH:
+									# Cancel only motion performed during THIS simulation tick, before it
+									# is rendered or published. Never rewind to an older dry-history pose:
+									# that made a tank visibly teleport several metres back uphill after
+									# it had already crossed a one-way bank.
+									_dry_anchor = getattr(m_veh, '_offh_ai_tick_dry_pose', None)
+									if _dry_anchor is not None:
+										m_veh.position = Math.Vector3(
+											_dry_anchor[0], _dry_anchor[1], _dry_anchor[2])
+										m_veh._veh_velocity = 0.0
+										m_veh._veh_turn_velocity = 0.0
+										m_veh._slide_spd = 0.0
+										m_veh._air_lat_vx = 0.0
+										m_veh._air_lat_vz = 0.0
+										m_veh._vert_vel = 0.0
+										m_veh._airborne = False
+										m_veh._push_x = 0.0
+										m_veh._push_z = 0.0
+										m_veh._offh_ai_driver_mode = 'water_guard'
+										m_veh._offh_ai_water_guard_until = _ai_now + 1.0
+										globals()['g_offh_ai_water_guard_total'] = int(
+											globals().get('g_offh_ai_water_guard_total', 0) or 0) + 1
 										try:
-											_offh_perf_count('physics_rays')
-											_slb_c = BigWorld.wg_collideSegment(_ai_space_id, Math.Vector3(_slb_x, m_veh.position.y + 8.0, _slb_z), Math.Vector3(_slb_x, m_veh.position.y - 30.0, _slb_z), 128)
+											_ai_driver.remember_failure(
+												eid, target_yaw, 5.0)
 										except Exception:
-											_slb_c = None
-										if (not _slide_blocked_by_water and _slb_c is not None and
-												(m_veh.position.y - _slb_c[0].y) < 4.0):
-											m_veh.position = Math.Vector3(_slb_x, _slb_c[0].y, _slb_z)
-											m_veh._vert_vel = 0.0
-											m_veh._airborne = False
-							_offh_perf_stop('physics_ground', _perf_physics_ground)
-							_perf_physics_safety = _offh_perf_start()
-							# Final realised-pose water guard.  This is intentionally after all
-							# horizontal drive, vehicle impulses, vertical falling and lateral slope
-							# slide: none of those paths may push an autonomous hull over a wet bank.
-							_final_hazard = _offh_ai_baked_hazard_near((
-								m_veh.position.x, m_veh.position.y, m_veh.position.z), 1)
-							_pose_water = (-1.0 if _final_hazard is False else
-							               _offh_ai_pose_water_depth(m_veh))
-							if _pose_water > _OFFH_AI_WATER_AVOID_DEPTH:
-								# Cancel only motion performed during THIS simulation tick, before it
-								# is rendered or published. Never rewind to an older dry-history pose:
-								# that made a tank visibly teleport several metres back uphill after
-								# it had already crossed a one-way bank.
-								_dry_anchor = getattr(m_veh, '_offh_ai_tick_dry_pose', None)
-								if _dry_anchor is not None:
-									m_veh.position = Math.Vector3(
-										_dry_anchor[0], _dry_anchor[1], _dry_anchor[2])
-									m_veh._veh_velocity = 0.0
-									m_veh._veh_turn_velocity = 0.0
-									m_veh._slide_spd = 0.0
-									m_veh._air_lat_vx = 0.0
-									m_veh._air_lat_vz = 0.0
-									m_veh._vert_vel = 0.0
-									m_veh._airborne = False
-									m_veh._push_x = 0.0
-									m_veh._push_z = 0.0
-									m_veh._offh_ai_driver_mode = 'water_guard'
-									m_veh._offh_ai_water_guard_until = _ai_now + 1.0
-									globals()['g_offh_ai_water_guard_total'] = int(
-										globals().get('g_offh_ai_water_guard_total', 0) or 0) + 1
-									try:
-										_ai_driver.remember_failure(
-											eid, target_yaw, 5.0)
-									except Exception:
-										pass
-									m_veh._ypr_c = _offh_perf_call(
-										'terrain_tilt', _get_terrain_ypr,
-										_ai_space_id, m_veh.position, m_veh.yaw)
-									_b_ypr = (m_veh.yaw, m_veh._ypr_c[1],
-									          m_veh._ypr_c[2], m_veh._ypr_c[3],
-									          m_veh._ypr_c[4], m_veh._ypr_c[5])
-							# The baked hazard mask marks water and cliff shoulders separately from
-							# ordinary obstacle holes. Local avoidance, impulses and lateral slide
-							# may enter a true hazard, but driving beside a building must not trigger
-							# this final rollback on every frame.
-							if (getattr(m_veh, '_offh_ai_tick_nav_safe', False) and
-									_final_hazard is not False and
-									not _offh_ai_baked_pose_safe((m_veh.position.x,
-										m_veh.position.y, m_veh.position.z))):
-								_edge_anchor = getattr(m_veh, '_offh_ai_tick_dry_pose', None)
-								if _edge_anchor is not None:
-									m_veh.position = Math.Vector3(
-										_edge_anchor[0], _edge_anchor[1], _edge_anchor[2])
-									m_veh._veh_velocity = 0.0
-									m_veh._veh_turn_velocity = 0.0
-									m_veh._slide_spd = 0.0
-									m_veh._air_lat_vx = 0.0
-									m_veh._air_lat_vz = 0.0
-									m_veh._vert_vel = 0.0
-									m_veh._airborne = False
-									m_veh._push_x = 0.0
-									m_veh._push_z = 0.0
-									m_veh._offh_ai_driver_mode = 'edge_guard'
-									m_veh._offh_ai_edge_guard_until = _ai_now + 1.0
-									globals()['g_offh_ai_edge_guard_total'] = int(
-										globals().get('g_offh_ai_edge_guard_total', 0) or 0) + 1
-									try:
-										_ai_driver.remember_failure(eid, target_yaw, 5.0)
-									except Exception:
-										pass
-									m_veh._ypr_c = _offh_perf_call(
-										'terrain_tilt', _get_terrain_ypr,
-										_ai_space_id, m_veh.position, m_veh.yaw)
-									_b_ypr = (m_veh.yaw, m_veh._ypr_c[1],
-									          m_veh._ypr_c[2], m_veh._ypr_c[3],
-									          m_veh._ypr_c[4], m_veh._ypr_c[5])
-							_offh_perf_stop('physics_safety', _perf_physics_safety)
+											pass
+										m_veh._ypr_c = _offh_perf_call(
+											'terrain_tilt', _get_terrain_ypr,
+											_ai_space_id, m_veh.position, m_veh.yaw)
+										_b_ypr = (m_veh.yaw, m_veh._ypr_c[1],
+										          m_veh._ypr_c[2], m_veh._ypr_c[3],
+										          m_veh._ypr_c[4], m_veh._ypr_c[5])
+								# The baked hazard mask marks water and cliff shoulders separately from
+								# ordinary obstacle holes. Local avoidance, impulses and lateral slide
+								# may enter a true hazard, but driving beside a building must not trigger
+								# this final rollback on every frame.
+								if (getattr(m_veh, '_offh_ai_tick_nav_safe', False) and
+										_final_hazard is not False and
+										not _offh_ai_baked_pose_safe((m_veh.position.x,
+											m_veh.position.y, m_veh.position.z))):
+									_edge_anchor = getattr(m_veh, '_offh_ai_tick_dry_pose', None)
+									if _edge_anchor is not None:
+										m_veh.position = Math.Vector3(
+											_edge_anchor[0], _edge_anchor[1], _edge_anchor[2])
+										m_veh._veh_velocity = 0.0
+										m_veh._veh_turn_velocity = 0.0
+										m_veh._slide_spd = 0.0
+										m_veh._air_lat_vx = 0.0
+										m_veh._air_lat_vz = 0.0
+										m_veh._vert_vel = 0.0
+										m_veh._airborne = False
+										m_veh._push_x = 0.0
+										m_veh._push_z = 0.0
+										m_veh._offh_ai_driver_mode = 'edge_guard'
+										m_veh._offh_ai_edge_guard_until = _ai_now + 1.0
+										globals()['g_offh_ai_edge_guard_total'] = int(
+											globals().get('g_offh_ai_edge_guard_total', 0) or 0) + 1
+										try:
+											_ai_driver.remember_failure(eid, target_yaw, 5.0)
+										except Exception:
+											pass
+										m_veh._ypr_c = _offh_perf_call(
+											'terrain_tilt', _get_terrain_ypr,
+											_ai_space_id, m_veh.position, m_veh.yaw)
+										_b_ypr = (m_veh.yaw, m_veh._ypr_c[1],
+										          m_veh._ypr_c[2], m_veh._ypr_c[3],
+										          m_veh._ypr_c[4], m_veh._ypr_c[5])
+								_offh_perf_stop('physics_safety', _perf_physics_safety)
 							# Smooth pitch/roll so bots don't jitter on rough terrain
 							_b_blend = min(1.0, dt * 8.0)
 							_b_p0 = getattr(m_veh, 'pitch', 0.0) or 0.0
@@ -13575,7 +13699,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								'pose_commit', _VP.commit_pose, m_veh,
 								m_veh.position, m_veh.yaw, m_veh.pitch, m_veh.roll,
 								_ai_space_id, _ai_now,
-								bool(getattr(m_veh, '_spot_visible', True)), True, False)
+								(bool(getattr(m_veh, '_spot_visible', True)) and
+								 not _native_filter_owned), True, False)
 							_offh_perf_stop('physics', _perf_physics)
 							_perf_visibility = _offh_perf_start()
 							# --- Spotting: unspotted ENEMY tanks are hidden like the real game.
@@ -13737,7 +13862,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# Track scroll (bot): y=left, z=right, traverse via turn rate
 							try:
 								_bfa = getattr(m_veh, '_fashion', None)
-								if _bfa is not None:
+								if _bfa is not None and not _native_filter_owned:
 									# physics.track_scroll: same law + clamp as the player feed
 									_btls, _btrs = _PHY.track_scroll(_bphys, m_veh._veh_velocity, m_veh._veh_turn_velocity)
 									_bfa.movementInfo = Math.Vector4(0.0, _btls, _btrs, 0.0)
@@ -18057,6 +18182,23 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							except Exception:
 								pass
 							
+							def _install_live_collision_obstacle(_mock=e_mock, _descriptor=td):
+								"""Install the legacy static proxy only for Python-owned bodies."""
+								if getattr(_mock, '_collision_obstacle', None) is not None:
+									return True
+								try:
+									_mock._collision_obstacle = BigWorld.PyModelObstacle(
+										_descriptor.hull['models']['undamaged'],
+										_descriptor.turret['models']['undamaged'],
+										_mock.matrix,
+										True)
+									return True
+								except Exception as _obstacle_error:
+									LOG_DEBUG('OfflineBattle PyModelObstacle Error:', _obstacle_error)
+									return False
+							e_mock._offh_install_collision_obstacle = (
+								_install_live_collision_obstacle)
+
 							_eid = BigWorld.createEntity('OfflineEntity', _offh_bspace(), 0, e_mock.position, (0, 0, e_mock.yaw), dict())
 							e_mock.bw_entity = None
 							def _assign_model_when_ready(eid, model_to_add, retries=10, _e_mock=e_mock):
@@ -18073,17 +18215,33 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										model_to_add.visibleAttachments = _model_visible
 									except Exception:
 										pass
-									try:
-										ent.filter = BigWorld.AvatarFilter()
-										_e_mock.filter = ent.filter
-									except: pass
 									_e_mock.bw_entity = ent
+									_native_body_prepared = False
+									try:
+										from gui.mods.offhangar.native_bot_physics import prepare as _prepare_native_bot_physics
+										_native_body_prepared = _prepare_native_bot_physics(
+											player, _e_mock, td, _offh_bspace(), BigWorld.time())
+									except Exception as _native_prepare_error:
+										LOG_DEBUG('Native bot physics prepare failed:', str(_native_prepare_error))
+									if not _native_body_prepared:
+										try:
+											ent.filter = BigWorld.AvatarFilter()
+											_e_mock.filter = ent.filter
+										except: pass
 									_VP.commit_pose(
 										_e_mock, _e_mock.position, _e_mock.yaw,
 										getattr(_e_mock, 'pitch', 0.0) or 0.0,
 										getattr(_e_mock, 'roll', 0.0) or 0.0,
 										space_id=_offh_bspace(), timestamp=BigWorld.time(),
-										sync_filter=True, attach_servo=True, prime_model=True)
+										sync_filter=not _native_body_prepared,
+										attach_servo=True, prime_model=True)
+									if not _native_body_prepared:
+										_install_live_collision_obstacle()
+									else:
+										# PyModelObstacle is a second static collision shape.  Keeping
+										# it beside WGVehiclePhysics2 makes the native body collide with
+										# its own legacy proxy.
+										_e_mock._collision_obstacle = None
 								elif retries > 0:
 									_offh_battle_callback(0.1, lambda: _assign_model_when_ready(eid, model_to_add, retries - 1, _e_mock))
 								else:
@@ -18186,6 +18344,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										pass
 									_bch.wg_fashion = _bf
 									_bm._fashion = _bf
+									try:
+										from gui.mods.offhangar.native_bot_physics import bind_fashion as _bind_native_bot_fashion
+										_bind_native_bot_fashion(_bm, _bf)
+									except Exception:
+										pass
 									# see the note on the player fashion: wiring this to _trigger_shot_impulse
 									# crashes the hangar load on a filter-less mock fashion.
 									# Real half track gauge for the turn scroll split (see player feed)
@@ -18197,15 +18360,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								except Exception as _bfe:
 									LOG_DEBUG('Bot track fashion failed:', str(_bfe))
 							_offh_battle_callback(1.5, _attach_bot_fashion)
-							try:
-								e_mock._collision_obstacle = BigWorld.PyModelObstacle(
-									td.hull['models']['undamaged'],
-									td.turret['models']['undamaged'],
-									e_mock.matrix,
-									True
-								)
-							except Exception as e:
-								LOG_DEBUG('OfflineBattle PyModelObstacle Error:', e)
 							class FakeEnemyAppearance(object):
 								def __init__(self, tmat=None):
 									from Event import Event
@@ -19042,6 +19196,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							try:
 								if _mv is not None:
 									_offh_set_alive(_mv, False)
+									# Dead bots no longer enter the AI loop, so release a native
+									# body's last drive command before the wreck owns the pose.
+									# This central event covers shells, fire, ramming, drowning and
+									# LAN deaths without adding per-weapon teardown paths.
+									try:
+										from gui.mods.offhangar.native_bot_physics import stop_mock as _stop_dead_native_bot
+										_stop_dead_native_bot(_mv, False)
+									except Exception:
+										pass
 									if (getattr(_mv, 'health', None) or 0) > 0:
 										# Drowning is not damage, so remember what it had before zeroing the
 										# internal value that everything else treats as 'dead'.

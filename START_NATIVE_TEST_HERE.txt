@@ -1,0 +1,91 @@
+WORLD OF TANKS 0.8.2 FULL NATIVE BOT PHYSICS EXPERIMENT
+=======================================================
+
+Purpose
+-------
+
+This branch moves authority-side bot rigid-body integration from the Python
+render callback into the retail 0.8.2 WGVehicleFilter2/WGVehiclePhysics2 stack.
+Tactics, A*, aiming, combat, spotting, capture and LAN protocol remain in the
+existing implementation. LAN replicas remain snapshot-only.
+
+This is a full 29-bot experiment, not the earlier F6 capability probe. No key
+press is required. It is intentionally packaged separately from the stable
+client and from the safe 1.8.29 probe.
+
+
+Exact supported client
+----------------------
+
+WorldOfTanks.exe must have this SHA-256:
+
+    8b3fe162117d2bc40aef2209a0cadbafe5ef4e9479410c12cd6ac6efde6deabd
+
+The native x86 bridge refuses every other executable. It invokes only the
+version-pinned retail Filter::input entry for staged seeds and bounded
+corrections; it does not patch executable code or vtables.
+
+
+First test
+----------
+
+1. Install the complete 0.8.2 folder as described in INSTALL_CLIENT.txt.
+2. Start one offline battle before trying LAN.
+3. During the countdown, wait for all tanks to appear.
+4. Play for several minutes and then exit the battle normally.
+5. Start a second battle in the same client session.
+6. Save python.log before replacing it with another run.
+
+A successful authority startup contains:
+
+    OfflineBattle BUILD 1.8.30-native-experimental (2026-08-11)
+    NATIVE_FILTER_BRIDGE loaded
+    NATIVE_BOT_PHYSICS prepared=29
+    NATIVE_BOT_PHYSICS active=29 prepared=29 failed=0
+
+The progress rows are emitted at 1, 5, 15 and 29 bodies. They need not be
+adjacent. A LAN replica must not emit prepared/active rows.
+
+
+Full acceptance checklist
+--------------------------
+
+- Forward, reverse and pivot commands respond without delayed or stuck input.
+- Bots reach the real speed and climbing behavior of their vehicle descriptors.
+- Suspension follows uneven ground without Python pose snapping or teleporting.
+- Bots collide with walls and with each other without overlap or self-collision.
+- The player's tank and native bots block each other without large corrections.
+- Trees, fences and destructible structures can be crushed; solid buildings
+  remain solid.
+- Water/cliff tactical guards still prevent deliberate bot suicides.
+- Models, markers, minimap icons, hit boxes and wrecks stay on one pose.
+- Shooting, damage, death, capture and the battle result remain synchronized.
+- A second battle and a map change complete without a crash or ghost entity.
+- Compare authority FPS against the stable Python-physics package on the same
+  map and lineup. The experiment is useful only if behavior stays correct and
+  the authority client materially approaches the 30 FPS target.
+
+For LAN, also verify that the authority is smooth, the replica can see every
+human and bot, and the replica does not construct local native bot bodies.
+
+
+Failure behavior
+----------------
+
+Before activation, any bridge/filter/provider failure logs
+NATIVE_BOT_PHYSICS FAIL and restores the complete Python physics path for that
+bot. After a body is active, an impossible native pose freezes that one body
+until battle cleanup; it never hot-switches to a second movement owner.
+
+If the client crashes, hangs, repeatedly freezes bodies, or produces major
+pose disagreement, stop testing and keep python.log. Reinstall the previous
+stable 0.8.2 folder rather than merging files.
+
+
+Acceptance boundary
+-------------------
+
+The source passes automated tests, CPython 2.6 compilation and a pinned ABI
+audit. Those checks cannot prove that 29 native bodies are safe, correct or
+faster in the 2012 Windows/BigWorld runtime. This checklist is the required
+runtime acceptance boundary before any release decision.

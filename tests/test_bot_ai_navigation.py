@@ -1052,12 +1052,15 @@ class BotNavigationTest(unittest.TestCase):
             line = next(line for line in lines if marker in line)
             return len(line) - len(line.lstrip("\t"))
 
-        # The transaction must run for active battles too, and the final veto must
-        # run after both grounded slide and airborne drift before model/network state.
+        # The compatibility transaction remains complete under the native-body
+        # fallback branch, and its final veto still runs after grounded slide and
+        # airborne drift before model/network state.
         self.assertEqual(
-            leading_tabs("if not _battle_active:"),
+            leading_tabs("if not _battle_active:") + 1,
             leading_tabs("bot_gravity = _PHY.GRAVITY"),
         )
+        self.assertIn("m_veh._offh_ai_driver_mode = 'native_guard'",
+                      battle_source)
         self.assertEqual(
             leading_tabs("# --- Slope slide (bot):"),
             leading_tabs("# Final realised-pose water guard."),

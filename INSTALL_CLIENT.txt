@@ -1,8 +1,8 @@
-World of Tanks 0.8.2 native filter bridge probe
-================================================
+World of Tanks 0.8.2 experimental native bot physics
+=====================================================
 
-This package does not contain the game client. Use it only with the verified
-Windows 0.8.2 client described in START_PROBE_HERE.txt.
+This package does not contain the game client. It supports only the verified
+Windows 0.8.2 executable listed in START_NATIVE_TEST_HERE.txt.
 
 
 Install the client files
@@ -17,19 +17,29 @@ The final entry file must be:
 
     <game folder>\res_mods\0.8.2\scripts\client\gui\mods\mod_offhangar.py
 
-Do not merge individual files into an old 0.8.2 folder. The source loader
-deliberately avoids stale mod bytecode, but a complete replacement is the only
-supported installation method.
+Do not merge individual files into an old 0.8.2 folder. The existing
+<game folder>\offhangar_user folder is outside res_mods and remains intact, so
+LAN settings and the nickname survive this complete replacement.
 
 
-Run the capability probe
-------------------------
+Run offline
+-----------
 
-1. Start an offline or LAN battle on the bot-authority client.
-2. Wait until the battle countdown has ended.
-3. Press F6 once and wait up to eight seconds.
-4. Read START_PROBE_HERE.txt for the exact PASS criteria.
+No external server is required. Select a tank, click Battle!, and read
+START_NATIVE_TEST_HERE.txt before evaluating movement or performance.
 
-Production bot movement is unchanged in this package unless F6 is pressed.
-No server update is required; LAN protocol 8 and client build
-1.8.26-test-20260810 are unchanged.
+
+Run over LAN
+------------
+
+Replace the client folder on every PC. Run the server from this same package;
+older build-1.8.26 servers deliberately reject this experimental client.
+Only the authority client creates native bot rigid bodies. Replica clients keep
+the existing snapshot and smoothing path.
+
+
+Rollback
+--------
+
+Close the game and completely replace res_mods\0.8.2 with the previous stable
+package. Do not merge the two trees. The offhangar_user settings remain intact.
