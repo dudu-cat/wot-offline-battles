@@ -4,6 +4,7 @@
 from __future__ import print_function
 
 import hashlib
+import json
 import os
 import re
 import sys
@@ -110,9 +111,9 @@ PINNED_SERVER_SHA256 = {
     'server/server_bot_ai.py': '161561cc295f9b1459a13150669f3529c26944dd43ef325c4b4f66e0b8eba5d6',
 }
 
-# Every Python file in the working 0.8.2 offhangar tree is classified here.
-# This reverse inventory prevents a useful source module from disappearing
-# merely because the #1513 package never mentioned it.
+# Every Python file in the frozen reviewed 0.8.2 source manifest is classified
+# here. Live 0.8.2 development is intentionally not a 0.9.22 release gate;
+# importing a newer law requires a separate parity review and manifest update.
 SOURCE_FILE_CLASSES = {}
 
 
@@ -168,6 +169,14 @@ WHITESPACE_COPIES = {
     'ai/maps_group_c.py': 'bot_ai_maps_group_c.py',
 }
 
+REVIEWED_PORT_CONTRACT_FILES = set(EXACT_COPIES) | set(WHITESPACE_COPIES) | {
+    'internal_hit_layouts.py',
+    'internal_layout_store.py',
+    'combat_rules.py',
+    'device_damage.py',
+    'critical_damage.py',
+}
+
 
 def _read(path):
     with open(path, 'rb') as stream:
@@ -185,145 +194,8 @@ def _text(path):
     return value
 
 
-def _without_blank_lines(value):
-    return '\n'.join(line.rstrip() for line in value.splitlines()
-                     if line.strip())
-
-
 def _normalise_newlines(value):
     return value.replace('\r\n', '\n').replace('\r', '\n')
-
-
-def _normalise_planner(value):
-    return value.replace(
-        'from gui.mods.offline_lan_0922.ai import maps as bot_ai_maps',
-        'from gui.mods.offhangar import bot_ai_maps')
-
-
-def _normalise_maps(value):
-    replacements = (
-        ('from gui.mods.offline_lan_0922.ai import maps_group_a as '
-         'bot_ai_maps_group_a',
-         'from gui.mods.offhangar import bot_ai_maps_group_a'),
-        ('from gui.mods.offline_lan_0922.ai import maps_group_b as '
-         'bot_ai_maps_group_b',
-         'from gui.mods.offhangar import bot_ai_maps_group_b'),
-        ('from gui.mods.offline_lan_0922.ai import maps_group_c as '
-         'bot_ai_maps_group_c',
-         'from gui.mods.offhangar import bot_ai_maps_group_c'),
-        ('from gui.mods.offline_lan_0922.ai import maps_extra as '
-         'bot_ai_maps_extra',
-         'from gui.mods.offhangar import bot_ai_maps_extra'),
-    )
-    for source, target in replacements:
-        value = value.replace(source, target)
-    value = value.replace(
-        'from gui.mods.offline_lan_0922.ai import maps_0922_extra as '
-        'bot_ai_maps_0922_extra\n', '')
-    value = value.replace(
-        'TACTICAL_MAPS.update(bot_ai_maps_0922_extra.TACTICAL_MAPS_0922_EXTRA)\n',
-        '')
-    return value
-
-
-def _normalise_internal_imports(value):
-    return value.replace(
-        'gui.mods.offline_lan_0922', 'gui.mods.offhangar')
-
-
-def _normalise_internal_descriptor_access(value):
-    """Undo the reviewed native-component seam before 0.8.2 comparison."""
-    adapted = (
-        "def _value(value, key, default=None):\n"
-        "\tif value is None:\n"
-        "\t\treturn default\n"
-        "\tif isinstance(value, dict):\n"
-        "\t\treturn value.get(key, default)\n"
-        "\treturn getattr(value, key, default)\n")
-    original = (
-        "def _value(value, key, default=None):\n"
-        "\tif value is None:\n"
-        "\t\treturn default\n"
-        "\ttry:\n"
-        "\t\treturn value.get(key, default)\n"
-        "\texcept Exception:\n"
-        "\t\tpass\n"
-        "\ttry:\n"
-        "\t\treturn value[key]\n"
-        "\texcept Exception:\n"
-        "\t\tpass\n"
-        "\ttry:\n"
-        "\t\treturn getattr(value, key)\n"
-        "\texcept Exception:\n"
-        "\t\treturn default\n")
-    return value.replace(adapted, original, 1)
-
-
-def _normalise_1513_descriptor_access(value):
-    """Undo only the reviewed #1513 attribute adapters before comparison."""
-    replacements = (
-        ("_comp is not None", "_comp is not None and hasattr(_comp, 'get')"),
-        ("_descriptor_value(_comp, 'itemTypeName', '')",
-         "_comp.get('itemTypeName', '')"),
-        ("_eng is not None", "_eng is not None and hasattr(_eng, 'get')"),
-        ("_descriptor_value(_eng, 'fireStartingChance', 0.15)",
-         "_eng.get('fireStartingChance', 0.15)"),
-        ("_eng2 is not None", "_eng2 is not None and hasattr(_eng2, 'get')"),
-        ("_descriptor_value(_eng2, 'fireStartingChance', 0.15)",
-         "_eng2.get('fireStartingChance', 0.15)"),
-        ("_descriptor_value(td.chassis, 'hullPosition')",
-         "td.chassis['hullPosition']"),
-        ("_descriptor_value(td.hull, 'turretPositions')",
-         "td.hull['turretPositions']"),
-        ("_descriptor_value(td.hull, 'hitTester')",
-         "td.hull['hitTester']"),
-    )
-    for adapted, original in replacements:
-        value = value.replace(adapted, original)
-    return value
-
-
-def _normalise_critical_proposal_guards(value):
-    """Undo the reviewed detached-proposal presentation guards."""
-    replacements = (
-        ("if (not is_player_target or getattr(target_mock, "
-         "'_offline_proposal_only', False)):\n\t\treturn",
-         "if not is_player_target:\n\t\treturn"),
-        ("if (is_player_target and not getattr(target_mock, "
-         "'_offline_proposal_only', False)):\n\t\ttry:",
-         "if is_player_target:\n\t\ttry:"),
-        ("if (is_player_target and not getattr(mock, "
-         "'_offline_proposal_only', False)):\n\t\ttry:",
-         "if is_player_target:\n\t\ttry:"),
-        ("if not getattr(target_mock, '_offline_proposal_only', False):\n"
-         "\t\t\t\t\t\tBigWorld.player().arena.onVehicleKilled("
-         "target_mock.id, attacker_id, 1)",
-         "BigWorld.player().arena.onVehicleKilled(target_mock.id, "
-         "attacker_id, 1)"),
-        ("if (is_player_target and not getattr(target_mock, "
-         "'_offline_proposal_only', False) and not "
-         "getattr(target_mock, '_is_killed', False))",
-         "if is_player_target and not getattr(target_mock, "
-         "'_is_killed', False)"),
-    )
-    for adapted, original in replacements:
-        value = value.replace(adapted, original)
-    return value
-
-
-def _top_level_function(value, name):
-    """Return one function without surrounding top-level commentary."""
-    lines = _normalise_newlines(value).split('\n')
-    marker = 'def %s(' % name
-    for index, line in enumerate(lines):
-        if line.startswith(marker):
-            block = [line]
-            for following in lines[index + 1:]:
-                if following and following[0] not in (' ', '\t'):
-                    break
-                block.append(following)
-            return '\n'.join(block).rstrip()
-    return None
 
 
 def _block_at_any_indent(value, kind, name):
@@ -360,8 +232,6 @@ def audit(repo_root):
     package = os.path.join(
         repo_root, 'ports', '0.9.22', 'src', 'res', 'scripts', 'client',
         'gui', 'mods', 'offline_lan_0922')
-    original = os.path.join(
-        repo_root, 'scripts', 'client', 'gui', 'mods', 'offhangar')
     actual = set()
     for root, unused_dirs, files in os.walk(package):
         for name in files:
@@ -373,13 +243,39 @@ def audit(repo_root):
         errors.append('undocumented port module: %s' % missing)
     for stale in sorted(documented - actual):
         errors.append('documented module is missing: %s' % stale)
-    source_actual = set(
-        name for name in os.listdir(original) if name.endswith('.py'))
+    manifest_path = os.path.join(
+        port_root, 'tools', 'reviewed_082_source_manifest.json')
+    try:
+        manifest = json.loads(_text(manifest_path))
+        reviewed_source_files = manifest['source_files']
+        reviewed_port_contracts = manifest['reviewed_port_contracts']
+        reviewed_baseline = manifest['baseline_commit']
+    except (IOError, KeyError, TypeError, ValueError) as error:
+        print('ERROR: invalid reviewed 0.8.2 source manifest: %s' % error)
+        return 1
+    source_actual = set(reviewed_source_files)
     source_documented = set(SOURCE_FILE_CLASSES)
     for missing in sorted(source_actual - source_documented):
         errors.append('unclassified 0.8.2 source module: %s' % missing)
     for stale in sorted(source_documented - source_actual):
         errors.append('classified 0.8.2 source module is missing: %s' % stale)
+    if reviewed_baseline != '0a96d75978dd7160c3392e5b1089bdbc07b9bd8b':
+        errors.append('reviewed 0.8.2 source baseline is not the approved '
+                      '0.9.22 release checkpoint')
+    for source_name, digest in sorted(reviewed_source_files.items()):
+        if not re.match(r'^[0-9a-f]{64}$', digest):
+            errors.append('reviewed 0.8.2 source digest is invalid: %s' %
+                          source_name)
+    if set(reviewed_port_contracts) != REVIEWED_PORT_CONTRACT_FILES:
+        errors.append('reviewed 0.8.2 port contract inventory is incomplete')
+    for port_name, expected in sorted(reviewed_port_contracts.items()):
+        if not re.match(r'^[0-9a-f]{64}$', expected):
+            errors.append('reviewed port contract digest is invalid: %s' %
+                          port_name)
+            continue
+        if _sha256(os.path.join(package, port_name)) != expected:
+            errors.append('%s diverged from the frozen reviewed 0.8.2 '
+                          'contract' % port_name)
     audit_document = _text(os.path.join(
         repo_root, 'ports', '0.9.22', 'BATTLE_SOURCE_AUDIT.md'))
     # These are explicit non-parity boundaries, not optional prose.  Keeping
@@ -406,21 +302,6 @@ def audit(repo_root):
         if '`%s`' % source_name not in audit_document:
             errors.append('0.8.2 module lacks a written disposition: %s' %
                           source_name)
-    for port_name, original_name in sorted(EXACT_COPIES.items()):
-        port_value = _normalise_newlines(
-            _text(os.path.join(package, port_name)))
-        if port_name == 'internal_geometry.py':
-            port_value = _normalise_internal_descriptor_access(port_value)
-        if port_value != _normalise_newlines(_text(
-                os.path.join(original, original_name))):
-            errors.append('%s diverged from 0.8.2 %s' %
-                          (port_name, original_name))
-    for port_name, original_name in sorted(WHITESPACE_COPIES.items()):
-        if _without_blank_lines(_text(os.path.join(package, port_name))) != \
-                _without_blank_lines(_text(
-                    os.path.join(original, original_name))):
-            errors.append('%s has non-whitespace divergence from 0.8.2 %s' %
-                          (port_name, original_name))
     for port_name, expected in sorted(PINNED_PORT_SHA256.items()):
         if _sha256(os.path.join(package, port_name)) != expected:
             errors.append('%s diverged from reviewed final 0.8.2 port %s' %
@@ -429,16 +310,6 @@ def audit(repo_root):
         if _sha256(os.path.join(port_root, server_name)) != expected:
             errors.append('%s diverged from reviewed final 0.8.2 service %s' %
                           (server_name, FINAL_082_BASELINE[:7]))
-    for port_name, original_name in (
-            ('internal_hit_layouts.py', 'internal_hit_layouts.py'),
-            ('internal_layout_store.py', 'internal_layout_store.py')):
-        port_value = _normalise_internal_imports(
-            _text(os.path.join(package, port_name)))
-        if port_name == 'internal_hit_layouts.py':
-            port_value = _normalise_internal_descriptor_access(port_value)
-        if port_value != _text(os.path.join(original, original_name)):
-            errors.append('%s has more than the documented import/descriptor '
-                          'adaptations' % port_name)
     battle_runtime = _text(os.path.join(package, 'battle_runtime.py'))
     for required in ('combat_rules.damage',
                      'combat_rules.resolve_hull_hit',
@@ -462,6 +333,27 @@ def audit(repo_root):
         errors.append('battle_runtime.py reads #1513 penetration from shell, not shot')
     if 'BOT_VEHICLE_CANDIDATES' in battle_runtime:
         errors.append('battle_runtime.py hard-codes a replacement bot lineup')
+    for required in (
+            'space.itemsVisibilityMask = expected',
+            'actual = space.itemsVisibilityMask',
+            'lobby_boundary = self._preflight_lobby_retirement()',
+            'self._enter_battle_loading()',
+            'self._retire_lobby_entities(lobby_boundary)'):
+        if required not in battle_runtime:
+            errors.append('battle_runtime.py omits #1513 space/lobby '
+                          'lifecycle boundary: %s' % required)
+    for forbidden in ('wg_getSpaceItemsVisibilityMask',
+                      'wg_setSpaceItemsVisibilityMask'):
+        if forbidden in battle_runtime:
+            errors.append('battle_runtime.py uses inert #1513 visibility '
+                          'stub: %s' % forbidden)
+    loading_index = battle_runtime.find('self._enter_battle_loading()')
+    retirement_index = battle_runtime.find(
+        'self._retire_lobby_entities(lobby_boundary)')
+    map_index = battle_runtime.find('self._map_create_attempted = True')
+    if not (0 <= loading_index < retirement_index < map_index):
+        errors.append('battle_runtime.py does not dispose the lobby before '
+                      'Account retirement and map creation')
     for required in ('_spawn_cache', '_formation_pose',
                      'notifyInputKeysDown', 'RemoteVehicleFactory',
                      'self._remote_factory.prepare_descriptor(descriptor)',
@@ -686,38 +578,7 @@ def audit(repo_root):
                      "kind == 'HOLLOW_CHARGE'", 'def he_nominal_armor'):
         if required not in combat_rules:
             errors.append('combat_rules.py omits 0.8.2 law: %s' % required)
-    original_battle = _text(os.path.join(original, 'offline_battle.py'))
-    for name in ('_offh_resolve_hull_hit', '_offh_is_he',
-                 '_offh_he_radius', '_offh_he_hull_armor',
-                 '_offh_he_nominal_armor', '_offh_he_damage',
-                 '_offh_he_apply_tuning', '_offh_penetration'):
-        copied_function = _top_level_function(combat_rules, name)
-        if name == '_offh_he_hull_armor' and copied_function is not None:
-            copied_function = copied_function.replace(
-                "\t\t_hull = getattr(td, 'hull', None)\n"
-                "\t\tif isinstance(_hull, dict):\n"
-                "\t\t\tmats = _hull.get('materials') or {}\n"
-                "\t\telse:\n"
-                "\t\t\tmats = getattr(_hull, 'materials', None) or {}",
-                "\t\tmats = (getattr(td, 'hull', None) or {}).get('materials') or {}")
-        if copied_function != \
-                _top_level_function(original_battle, name):
-            errors.append(
-                'combat_rules.py changed copied 0.8.2 function: %s' % name)
     device_damage = _text(os.path.join(package, 'device_damage.py'))
-    original_device_damage = _text(os.path.join(
-        original, 'device_damage.py'))
-    device_functions = set(re.findall(
-        r'^def ([A-Za-z_]\w*)\(', original_device_damage, re.MULTILINE))
-    port_device_functions = set(re.findall(
-        r'^def ([A-Za-z_]\w*)\(', device_damage, re.MULTILINE))
-    if port_device_functions != device_functions | set(['_descriptor_value']):
-        errors.append('device_damage.py changes the copied function inventory')
-    for name in sorted(device_functions - set(['_misc_factor', '_raw_hp'])):
-        if _top_level_function(device_damage, name) != \
-                _top_level_function(original_device_damage, name):
-            errors.append(
-                'device_damage.py changed copied 0.8.2 function: %s' % name)
     for required in (
             'def _descriptor_value', 'if isinstance(value, dict)',
             'return getattr(value, name, default)',
@@ -729,37 +590,6 @@ def audit(repo_root):
                 'device_damage.py omits #1513 descriptor adapter: %s' %
                 required)
     critical_damage = _text(os.path.join(package, 'critical_damage.py'))
-    for kind, name in (
-            ('class', '_SynthDeviceExtra'),
-            ('class', '_SynthMaterial'),
-            ('def', '_offh_interior_zone'),
-            ('def', '_offh_voice_burst_pick'),
-            ('def', '_offh_ignite'),
-            ('def', '_offh_extinguish'),
-            ('def', '_offh_knock_out_everything'),
-            ('def', '_offh_module_test_mode'),
-            ('def', '_offh_internal_layout'),
-            ('def', '_offh_internal_ray_hits'),
-            ('def', '_device_td'),
-            ('def', '_crew_roster'),
-            ('def', '_recompute_crew_impaired'),
-            ('def', '_crew_factor'),
-            ('def', '_module_factor'),
-            ('def', '_knock_out_crew'),
-            ('def', '_dev_destroyed_set'),
-            ('def', '_module_ui_name'),
-            ('def', '_refresh_mobility_flags'),
-            ('def', '_apply_module_damage')):
-        copied = _normalise_critical_proposal_guards(
-            _normalise_1513_descriptor_access(
-                _normalise_internal_imports(
-                    _block_at_any_indent(critical_damage, kind, name) or '')))
-        original_block = _block_at_any_indent(
-            original_battle, kind, name)
-        if copied != original_block:
-            errors.append(
-                'critical_damage.py changed copied 0.8.2 %s: %s' %
-                (kind, name))
     for required in ('critical_damage.propose_direct',
                      'critical_damage.apply_payload',
                      'critical_damage.tick_repair',
@@ -1105,10 +935,11 @@ def audit(repo_root):
             print('ERROR: %s' % error)
         return 1
     print('Battle source audit passed: %d port modules documented; '
-          '%d 0.8.2 modules classified; %d exact/normalized copies verified.' %
+          '%d frozen 0.8.2 modules classified; '
+          '%d reviewed port/service hashes verified.' %
           (len(actual), len(source_actual),
-           len(EXACT_COPIES) + len(WHITESPACE_COPIES) +
-           len(PINNED_PORT_SHA256) + len(PINNED_SERVER_SHA256) + 4))
+           len(reviewed_port_contracts) + len(PINNED_PORT_SHA256) +
+           len(PINNED_SERVER_SHA256)))
     return 0
 
 

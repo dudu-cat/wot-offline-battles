@@ -9,13 +9,13 @@ HD client:
 - release entry format: `mod_*.pyc`
 - package format: Store-only ZIP-compatible `.wotmod`
 
-Version `0.3.50` replaces the old compatibility slice. It is a server-backed
+Version `0.3.51` replaces the old compatibility slice. It is a server-backed
 standard-battle implementation with a stock map picker, native Avatar and
 Vehicle entities, a playable local vehicle, LAN state, damage, 15 vehicles per
 team, the copied tactical-bot stack and repeatable rounds. The removed `vertical_slice.py`
 runtime is not packaged as a fallback.
 
-`0.3.50` installs one copied pose before native input startup and feeds that
+`0.3.51` installs one copied pose before native input startup and feeds that
 same provider to attached, own, camera, gun, sniper and minimap consumers. It
 gates native entity lookup by spotted/alive state, uses visible-pose descriptor
 collision for incoming fire, restores the native RPM channel, and presents
@@ -51,12 +51,18 @@ cache, and friendly ramming no longer emits a projectile-hit or enemy-efficiency
 notification. The #1513 material probe is decoded at one strict seven-field
 boundary, including its explicit no-hit flag, before the copied 0.8.2 contact
 law sees the result.
-Version 0.3.50 also rebakes all 41 spawn formations against compiled map BSP
+Version 0.3.51 also rebakes all 41 spawn formations against compiled map BSP
 with the largest #1513 chassis footprint, selects only the standard CTF space
 visibility bit, and keeps expensive Bot sensing off the render cadence. Solid
 contact destruction preserves the native item/chunk field order, while marker
 startup is transactional so a partially subscribed plugin cannot retain the
 initial zero player id and relabel player damage as ally damage.
+The pinned client's legacy visibility getter/setter exports are inert, so this
+release applies that CTF bit through the exact exposed
+`BigWorld.spaces[spaceID].itemsVisibilityMask` property and verifies its typed
+readback. It also enters stock BattleLoading before retiring the lobby Account;
+an early map failure therefore disposes the old Lobby view and returns through
+the legal BattleLoading-to-Lobby transition without duplicate listeners.
 
 The battle foundation now reuses the proven 0.8.2 behavior instead of a
 separate simplified implementation: the native countdown receives an advancing
@@ -389,8 +395,8 @@ python3 tools/bake_foliage_0922.py \
 Outputs are written to `dist/`:
 
 ```text
-org.peng.offline_lan_0922_0.3.50.wotmod
-org.peng.offline_lan_0922_0.3.50.wotmod.sha256
+org.peng.offline_lan_0922_0.3.51.wotmod
+org.peng.offline_lan_0922_0.3.51.wotmod.sha256
 WoT-0.9.22-LAN-Client-<release hash>/
 WoT-0.9.22-LAN-Client-<release hash>.zip
 ```

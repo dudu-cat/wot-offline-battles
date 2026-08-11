@@ -41,4 +41,4 @@ else
 fi
 
 python3 "$port_root/tools/validate_wotmod.py" \
-  "$port_root/dist/org.peng.offline_lan_0922_0.3.50.wotmod"
+  "$port_root/dist/org.peng.offline_lan_0922_0.3.51.wotmod"

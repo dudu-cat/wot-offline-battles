@@ -19,6 +19,11 @@ import zipfile
 
 
 EXPECTED_ABI = {
+    'scripts/common/OldSpaceData.pyc': {
+        'getPropertyNameForKey': ('key',),
+        'getSpaceDataFirstForKey': ('spaceID', 'key'),
+        'setSpaceData': ('spaceID', 'key', 'value'),
+    },
     'scripts/common/ArenaType.pyc': {
         'getVisibilityMask': ('gameplayID',),
     },
@@ -481,6 +486,8 @@ EXPECTED_ABI = {
         'BattleLoadingState.getSpaceID': ('self',),
         'BattleLoadingState._getNextState': ('self', 'ctx'),
         'BattleLoadingState._createBattleState': ('self',),
+        'BattleLoadingState.showGUI': (
+            'self', 'appFactory', 'appNS', 'appState'),
         'BattleState.getSpaceID': ('self',),
         'BattleState._getNextState': ('self', 'ctx'),
         'LoginState.init': ('self', 'ctx'),
@@ -652,6 +659,9 @@ EXPECTED_ABI = {
 # These literals are direct string subscripts or native-method names in exact
 # #1513 consumers. Producer contract tests verify dictionary payload shapes.
 EXPECTED_CODE_LITERALS = {
+    'scripts/common/OldSpaceData.pyc': {
+        'getPropertyNameForKey': ('itemsVisibilityMask',),
+    },
     'scripts/common/items/components/legacy_stuff.pyc': {
         'NoLegacyStuff.get': ('Operation is not allowed',),
         'NoLegacyStuff.__getitem__': ('Operation is not allowed',),
@@ -717,6 +727,12 @@ EXPECTED_CODE_LITERALS = {
 # string payload literals cannot express.  They are the exact #1513 APIs the
 # offline Account preservation and native lobby-ready gate depend on.
 EXPECTED_CODE_NAMES = {
+    'scripts/common/OldSpaceData.pyc': {
+        'getSpaceDataFirstForKey': (
+            'getattr', 'BigWorld', 'spaces', 'getPropertyNameForKey'),
+        'setSpaceData': (
+            'setattr', 'BigWorld', 'spaces', 'getPropertyNameForKey'),
+    },
     'scripts/common/ModelHitTester.pyc': {
         'ModelHitTester.__init__': ('bbox',),
         'ModelHitTester.loadBspModel': (
@@ -1161,6 +1177,7 @@ EXPECTED_CODE_NAMES = {
             '_SPACE_ID', 'BATTLE', '_doStartBattle',
             '_createBattleState', 'LOBBY', 'LobbyState'),
         'BattleLoadingState._createBattleState': ('BattleState',),
+        'BattleLoadingState.showGUI': ('destroyLobby', 'loadBattlePage'),
         'BattleState.getSpaceID': ('_SPACE_ID', 'BATTLE'),
         'BattleState._getNextState': (
             '_SPACE_ID', 'WAITING', 'WaitingState'),
@@ -1268,6 +1285,12 @@ EXPECTED_CODE_NAMES = {
     'scripts/client/gui/shared/gui_items/Vehicle.pyc': {
         'Vehicle.descriptor': ('_Vehicle__descriptor',),
     },
+}
+
+
+EXPECTED_RESOURCE_STRINGS = {
+    'scripts/space_defs/GeneralSpaceData.def': (
+        'itemsVisibilityMask', 'UINT32', 'Exposed'),
 }
 
 
@@ -1730,6 +1753,7 @@ def audit(client_root):
     checked_tuple_widths = []
     checked_var_call_widths = []
     checked_equality_branches = []
+    checked_resource_strings = []
     errors = []
     with zipfile.ZipFile(package_path, 'r') as archive:
         names = set(archive.namelist())
@@ -1936,6 +1960,19 @@ def audit(client_root):
                     checked_equality_branches.append(
                         '%s:%s:%s==%s:%s/%s' %
                         ((member, name) + branch))
+        for member, expected_strings in sorted(
+                EXPECTED_RESOURCE_STRINGS.items()):
+            if member not in names:
+                errors.append('missing resource member: %s' % member)
+                continue
+            payload = archive.read(member)
+            for value in expected_strings:
+                if value not in payload:
+                    errors.append('%s: missing resource string %r' %
+                                  (member, value))
+                else:
+                    checked_resource_strings.append(
+                        '%s:%s' % (member, value))
         actual_filter_sync_calls = _find_filter_sync_calls(archive)
         missing_filter_calls = (
             EXPECTED_FILTER_SYNC_CALLS - actual_filter_sync_calls)
@@ -1969,6 +2006,7 @@ def audit(client_root):
         'checkedTupleWidths': len(checked_tuple_widths),
         'checkedVarCallWidths': len(checked_var_call_widths),
         'checkedEqualityBranches': len(checked_equality_branches),
+        'checkedResourceStrings': len(checked_resource_strings),
         'contracts': checked,
         'consumerLiterals': checked_literals,
         'codeNames': checked_names,
@@ -1983,6 +2021,7 @@ def audit(client_root):
         'tupleWidths': checked_tuple_widths,
         'varCallWidths': checked_var_call_widths,
         'equalityBranches': checked_equality_branches,
+        'resourceStrings': checked_resource_strings,
     }
 
 

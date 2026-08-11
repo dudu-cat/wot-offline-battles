@@ -537,8 +537,10 @@ class BattleRuntime(object):
                 getattr(constants.ARENA_BONUS_TYPE, 'REGULAR', 0),
                 local_identity.get('name', self.client.name),
                 int(local_identity.get('team', self.client.team)))
-            self._retire_lobby_entities()
+            lobby_boundary = self._preflight_lobby_retirement()
             self._install_battle_gui_guard()
+            self._enter_battle_loading()
+            self._retire_lobby_entities(lobby_boundary)
             # OfflineMapCreator.create() catches some native setup failures and
             # only calls cancel(), which resets ids but does not clear the
             # partially-created Avatar or space.  Remember the attempt before
@@ -578,14 +580,8 @@ class BattleRuntime(object):
             self._fail(error)
             return False
 
-    def _retire_lobby_entities(self):
-        """Cross the same Account-to-Avatar boundary as the #1513 observer.
-
-        BigWorld cannot safely promote a client-only Avatar while the lobby
-        Account and hangar space are still alive.  The public 0.9.22 observer
-        clears them before creating its Avatar; retaining the Account here can
-        terminate the native process before Python gets a traceback.
-        """
+    def _preflight_lobby_retirement(self):
+        """Validate destructive lobby boundaries before changing GUI state."""
         clear = getattr(
             self._runtime.bigworld, 'clearEntitiesAndSpaces', None)
         if not callable(clear):
@@ -599,6 +595,17 @@ class BattleRuntime(object):
                 bool(getattr(hangar_space, 'spaceInited', False))):
             raise RuntimeError(
                 'hangar space is not ready for battle transition')
+        return clear, hangar_space
+
+    def _retire_lobby_entities(self, boundary):
+        """Cross the same Account-to-Avatar boundary as the #1513 observer.
+
+        BigWorld cannot safely promote a client-only Avatar while the lobby
+        Account and hangar space are still alive.  The public 0.9.22 observer
+        clears them before creating its Avatar; retaining the Account here can
+        terminate the native process before Python gets a traceback.
+        """
+        clear, hangar_space = boundary
         # PlayerAccount.onBecomeNonPlayer owns the complete stock transition:
         # it first detaches ChatManager and all account helpers, then its
         # personality event destroys current/preview vehicles and HangarSpace.
@@ -623,6 +630,26 @@ class BattleRuntime(object):
             player = None
         if player is not None:
             raise RuntimeError('lobby Account survived battle transition')
+
+    def _actual_gui_space_id(self):
+        """Read the accepted AppLoader state, not its optimistic context."""
+        state = getattr(
+            self._runtime.app_loader, '_AppLoader__state', None)
+        get_space_id = getattr(state, 'getSpaceID', None)
+        if not callable(get_space_id):
+            raise RuntimeError('actual battle GUI state is unavailable')
+        return get_space_id()
+
+    def _enter_battle_loading(self):
+        """Dispose the live lobby before retiring its Account owner."""
+        space_ids = self._runtime.gui_global_space_id
+        app_loader = self._runtime.app_loader
+        if self._actual_gui_space_id() != space_ids.LOBBY:
+            raise RuntimeError('battle GUI is not in the lobby state')
+        if not app_loader.showBattleLoading():
+            raise RuntimeError('battle loading GUI transition was rejected')
+        if self._actual_gui_space_id() != space_ids.BATTLE_LOADING:
+            raise RuntimeError('battle loading GUI transition did not finish')
 
     def _create_native_battle_map(self, map_name):
         """Use stock map bookkeeping without starting its viewer UI.
@@ -736,15 +763,18 @@ class BattleRuntime(object):
         battle_id = space_ids.BATTLE
 
         def actual_space_id(loader):
+            if loader is not app_loader:
+                state = getattr(loader, '_AppLoader__state', None)
+                get_state_space_id = getattr(state, 'getSpaceID', None)
+                if not callable(get_state_space_id):
+                    raise RuntimeError(
+                        'actual battle GUI state is unavailable')
+                return get_state_space_id()
             # Exact #1513 getSpaceID() returns __ctx.guiSpaceID.  changeSpace()
             # writes that requested id *before* asking the current state to
             # accept it, so a rejected transition leaves the public value
             # polluted.  The state object is the authoritative boundary.
-            state = getattr(loader, '_AppLoader__state', None)
-            get_state_space_id = getattr(state, 'getSpaceID', None)
-            if not callable(get_state_space_id):
-                raise RuntimeError('actual battle GUI state is unavailable')
-            return get_state_space_id()
+            return self._actual_gui_space_id()
 
         if actual_space_id(app_loader) != lobby_id:
             raise RuntimeError('battle GUI is not in the lobby state')
@@ -818,16 +848,13 @@ class BattleRuntime(object):
     def _configure_standard_space_visibility(self):
         """Install the selected gameplay bit normally supplied by the server."""
         bigworld = self._runtime.bigworld
-        get_mask = getattr(
-            bigworld, 'wg_getSpaceItemsVisibilityMask', None)
-        set_mask = getattr(
-            bigworld, 'wg_setSpaceItemsVisibilityMask', None)
+        spaces = getattr(bigworld, 'spaces', None)
         visibility = getattr(
             self._runtime, 'client_visibility_flags', None)
         gameplay_mask = getattr(
             self._runtime, 'arena_visibility_mask', None)
-        if (not callable(get_mask) or not callable(set_mask) or
-                visibility is None or not callable(gameplay_mask)):
+        if (spaces is None or visibility is None or
+                not callable(gameplay_mask)):
             raise RuntimeError(
                 '#1513 space visibility boundary is unavailable')
         try:
@@ -837,8 +864,9 @@ class BattleRuntime(object):
             server_bits = visibility.SERVER_MASK
             gameplay_id = int(self._arena_type.gameplayID)
             selected_bit = gameplay_mask(gameplay_id)
-            existing = get_mask(self._avatar.spaceID)
-        except (AttributeError, TypeError, ValueError, OverflowError):
+            space = spaces[self._avatar.spaceID]
+        except (AttributeError, KeyError, TypeError, ValueError,
+                OverflowError):
             raise RuntimeError(
                 '#1513 space visibility contract is invalid')
         if (client_bits & server_bits or
@@ -847,12 +875,23 @@ class BattleRuntime(object):
                 selected_bit & ~server_bits):
             raise RuntimeError(
                 '#1513 gameplay visibility mask is invalid')
-        expected = (existing & client_bits) | selected_bit
-        set_mask(self._avatar.spaceID, expected)
-        actual = get_mask(self._avatar.spaceID)
+        # PlayerAvatar.__onInitStepCompleted supplies no client visibility
+        # bits for an ordinary player.  The complete final stock mask is
+        # therefore the server-selected gameplay bit.
+        expected = selected_bit
+        try:
+            # The old wg_get/wg_set exports are inert compatibility stubs in
+            # build #1513.  OldSpaceData.pyc maps key 300 to this exact native
+            # space property for both reads and writes.
+            space.itemsVisibilityMask = expected
+            actual = space.itemsVisibilityMask
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            raise RuntimeError(
+                '#1513 gameplay visibility mask readback is invalid')
         if actual != expected:
             raise RuntimeError(
-                '#1513 gameplay visibility mask was not applied')
+                '#1513 gameplay visibility mask was not applied: '
+                'expected=0x%x actual=%r' % (expected, actual))
         return expected
 
     def _clock(self):

@@ -675,6 +675,10 @@ class _Compatibility(object):
 
     def restore_lobby_account(self):
         self.account_restored = True
+        if (self.bigworld is not None and
+                self.bigworld.player() is not None and
+                self.bigworld.player() not in self.retired_players):
+            return self.bigworld.player()
         if self.hangar_space is not None:
             self.hangar_space.inited = True
             self.hangar_space.spaceInited = True
@@ -696,7 +700,8 @@ class _AppLoader(object):
     __slots__ = (
         '__state', '__ctx', '__appFactory',
         'onGUISpaceLeft', 'onGUISpaceEntered', 'space_id',
-        'actual_space_id', 'transitions')
+        'actual_space_id', 'transitions', 'lobby_populates',
+        'lobby_disposals', 'lobby_listener_balance')
 
     battle_page_calls = mock.Mock(return_value=True)
     battle_loading_calls = mock.Mock(return_value=True)
@@ -711,6 +716,9 @@ class _AppLoader(object):
         self.space_id = 4
         self.actual_space_id = 4
         self.transitions = []
+        self.lobby_populates = 1
+        self.lobby_disposals = 0
+        self.lobby_listener_balance = 1
 
     def getSpaceID(self):
         return self.space_id
@@ -722,6 +730,8 @@ class _AppLoader(object):
         # accepts or rejects the requested transition.
         self.space_id = 5
         if result:
+            self.lobby_disposals += 1
+            self.lobby_listener_balance -= 1
             self.actual_space_id = 5
         return result
 
@@ -736,6 +746,8 @@ class _AppLoader(object):
     def showLobby(self):
         callback = type(self).lobby_callback
         self.transitions.append((self.actual_space_id, 4))
+        self.lobby_populates += 1
+        self.lobby_listener_balance += 1
         self.space_id = 4
         self.actual_space_id = 4
         if callable(callback):
@@ -784,6 +796,8 @@ class _OfflineMap(object):
             self.bigworld.avatar = _Avatar()
         if self.bigworld is not None:
             avatar = self.bigworld.avatar
+            self.bigworld.spaces[avatar.spaceID] = _SpaceData(
+                self.bigworld.operations, avatar.spaceID, 0xffffffff)
             self.bigworld.avatar.guiSessionProvider = types.SimpleNamespace(
                 shared=types.SimpleNamespace(
                     arenaLoad=_ArenaLoadController(self.app_loader)),
@@ -824,6 +838,24 @@ class _HangarSpace(object):
         self.spaceInited = False
 
 
+class _SpaceData(object):
+    def __init__(self, operations, space_id, visibility_mask):
+        self._operations = operations
+        self._space_id = int(space_id)
+        self._items_visibility_mask = int(visibility_mask)
+
+    @property
+    def itemsVisibilityMask(self):
+        return self._items_visibility_mask
+
+    @itemsVisibilityMask.setter
+    def itemsVisibilityMask(self, mask):
+        self._items_visibility_mask = int(mask)
+        self._operations.append(
+            ('space_visibility', self._space_id,
+             self._items_visibility_mask))
+
+
 class _BigWorld(object):
     def __init__(self, avatar, compatibility):
         self.avatar = avatar
@@ -840,7 +872,8 @@ class _BigWorld(object):
         self.created_offline_entities = []
         self.edge_adds = []
         self.edge_removes = []
-        self.space_visibility_masks = {7: 0xffffffff}
+        self.spaces = {7: _SpaceData(self.operations, 7, 0xffffffff)}
+        self.legacy_visibility_calls = []
 
     def player(self):
         return self.avatar
@@ -930,6 +963,7 @@ class _BigWorld(object):
         self.operations.append(('clear_entities_spaces',))
         self.entities.clear()
         self.pending_entities.clear()
+        self.spaces.clear()
         self.avatar = None
 
     def loadResourceListBG(self, assemblers, callback):
@@ -940,13 +974,14 @@ class _BigWorld(object):
         self.operations.append(('watcher', name, enabled))
 
     def wg_getSpaceItemsVisibilityMask(self, space_id):
-        return self.space_visibility_masks[int(space_id)]
+        # Exact #1513 keeps these obsolete exports as inert stubs.
+        self.legacy_visibility_calls.append(('get', int(space_id)))
+        return 0
 
     def wg_setSpaceItemsVisibilityMask(self, space_id, mask):
-        space_id = int(space_id)
-        mask = int(mask)
-        self.space_visibility_masks[space_id] = mask
-        self.operations.append(('space_visibility', space_id, mask))
+        self.legacy_visibility_calls.append(
+            ('set', int(space_id), int(mask)))
+        return False
 
     def clearAllSpaces(self):
         self.clearEntitiesAndSpaces()
@@ -2054,6 +2089,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
     def test_lobby_is_retired_before_native_map_without_viewer_camera(self):
         runtime = _runtime()
+        stale_space = runtime.bigworld.spaces[7]
         battle = BattleRuntime(runtime)
         client = _Client()
         start = {
@@ -2072,9 +2108,16 @@ class BattleRuntimeContractTests(unittest.TestCase):
              ('clear_entities_spaces',),
              ('map_create', '01_karelia'),
              ('watcher', 'Visibility/GUI', True),
-             ('space_visibility', 7, 0xfff00001)],
+             ('space_visibility', 7, 0x00000001)],
             runtime.bigworld.operations)
         self.assertEqual(0, runtime.offline_map_creator.viewer_camera_calls)
+        self.assertEqual([(4, 5)], runtime.app_loader.transitions)
+        self.assertEqual(1, runtime.app_loader.lobby_disposals)
+        self.assertEqual(1, runtime.app_loader.lobby_populates)
+        self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
+        self.assertIsNot(stale_space, runtime.bigworld.spaces[7])
+        self.assertEqual(0xffffffff, stale_space.itemsVisibilityMask)
+        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
         self.assertFalse(hasattr(runtime.app_loader, '__dict__'))
         type(runtime.app_loader).battle_page_calls.assert_not_called()
         self.assertFalse(runtime.offline_map_creator.Active())
@@ -2093,7 +2136,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             0xfff00000)
         runtime.client_visibility_flags.SERVER_MASK = _UnsignedMask(
             0x000fffff)
-        runtime.bigworld.space_visibility_masks[7] = _UnsignedMask(
+        runtime.bigworld.spaces[7]._items_visibility_mask = _UnsignedMask(
             0x812abcde)
         battle = BattleRuntime(runtime)
         start = {
@@ -2108,11 +2151,32 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'name': 'Player'}, start, _Client()))
 
         self.assertEqual(
-            0x81200001,
-            runtime.bigworld.wg_getSpaceItemsVisibilityMask(7))
+            0x00000001,
+            runtime.bigworld.spaces[7].itemsVisibilityMask)
         self.assertEqual(
-            ('space_visibility', 7, 0x81200001),
+            ('space_visibility', 7, 0x00000001),
             runtime.bigworld.operations[-1])
+
+    def test_native_map_requires_the_fresh_space_visibility_property(self):
+        runtime = _runtime()
+        original_create = runtime.offline_map_creator.create
+
+        def create_without_live_space(map_name):
+            original_create(map_name)
+            runtime.bigworld.spaces.pop(7)
+
+        runtime.offline_map_creator.create = create_without_live_space
+        battle = BattleRuntime(runtime)
+
+        self.assertFalse(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {'round_id': 1}, _Client()))
+
+        self.assertEqual('failed', battle.state)
+        self.assertIn('space visibility contract is invalid', battle.error)
+        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
+        self.assertEqual([(4, 5), (5, 4)], runtime.app_loader.transitions)
+        self.assertEqual(1, runtime.app_loader.lobby_listener_balance)
 
     def test_incomplete_hangar_fails_before_native_clear(self):
         runtime = _runtime()
@@ -2239,32 +2303,112 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual('failed', battle.state)
         self.assertFalse(battle._map_create_attempted)
 
-    def test_missing_battle_page_boundary_fails_closed_and_restores_lobby(self):
+    def test_missing_battle_page_boundary_preserves_existing_lobby(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
-        calls = []
+        account = runtime.bigworld.avatar
         type(runtime.app_loader).showBattlePage = None
         runtime.offline_map_creator.create = mock.Mock()
-
-        def destroy():
-            calls.append('destroy')
-            runtime.bigworld.avatar = None
-
-        def restore():
-            self.assertIsNone(runtime.bigworld.avatar)
-            calls.append('restore')
-
-        runtime.offline_map_creator.destroy = destroy
-        runtime.compatibility.restore_lobby_account = restore
 
         self.assertFalse(battle.start({
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, {}, _Client()))
 
         runtime.offline_map_creator.create.assert_not_called()
-        self.assertEqual(['restore'], calls)
+        self.assertIs(account, runtime.bigworld.avatar)
+        self.assertEqual([], runtime.bigworld.operations)
+        self.assertEqual([], runtime.app_loader.transitions)
+        self.assertEqual(1, runtime.app_loader.lobby_listener_balance)
+        self.assertTrue(runtime.compatibility.account_restored)
         self.assertEqual('failed', battle.state)
         self.assertFalse(battle._map_create_attempted)
+
+    def test_rejected_loading_preserves_lobby_and_next_round_can_start(self):
+        runtime = _runtime()
+        account = runtime.bigworld.avatar
+        runtime.offline_map_creator.create = mock.Mock(
+            wraps=runtime.offline_map_creator.create)
+        type(runtime.app_loader).battle_loading_calls.return_value = False
+        battle = BattleRuntime(runtime)
+
+        self.assertFalse(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {}, _Client()))
+
+        self.assertIs(account, runtime.bigworld.avatar)
+        self.assertEqual([], runtime.bigworld.operations)
+        self.assertEqual([(4, 5)], runtime.app_loader.transitions)
+        self.assertEqual(4, runtime.app_loader.actual_space_id)
+        self.assertEqual(0, runtime.app_loader.lobby_disposals)
+        self.assertEqual(1, runtime.app_loader.lobby_populates)
+        self.assertEqual(1, runtime.app_loader.lobby_listener_balance)
+        runtime.offline_map_creator.create.assert_not_called()
+
+        type(runtime.app_loader).battle_loading_calls.return_value = True
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {
+                'round_id': 2, 'map': '01_karelia',
+                'bot_authority_id': 1,
+                'players': [{
+                    'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                    'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+                'bots': []}, _Client()))
+
+        self.assertEqual([(4, 5), (4, 5)], runtime.app_loader.transitions)
+        self.assertEqual(1, runtime.app_loader.lobby_disposals)
+        self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
+
+    def test_visibility_readback_failure_restores_clean_lobby_then_retries(self):
+        class _RejectingSpaceData(_SpaceData):
+            @_SpaceData.itemsVisibilityMask.setter
+            def itemsVisibilityMask(self, mask):
+                self._operations.append(
+                    ('space_visibility_rejected', self._space_id, int(mask)))
+
+        runtime = _runtime()
+        original_create = runtime.offline_map_creator.create
+        create_count = [0]
+
+        def create_with_first_write_rejected(map_name):
+            original_create(map_name)
+            create_count[0] += 1
+            if create_count[0] == 1:
+                runtime.bigworld.spaces[7] = _RejectingSpaceData(
+                    runtime.bigworld.operations, 7, 0)
+
+        runtime.offline_map_creator.create = create_with_first_write_rejected
+        battle = BattleRuntime(runtime)
+
+        self.assertFalse(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {'round_id': 1}, _Client()))
+
+        self.assertEqual('failed', battle.state)
+        self.assertIn('visibility mask was not applied', battle.error)
+        self.assertEqual([(4, 5), (5, 4)], runtime.app_loader.transitions)
+        self.assertEqual(1, runtime.app_loader.lobby_disposals)
+        self.assertEqual(2, runtime.app_loader.lobby_populates)
+        self.assertEqual(1, runtime.app_loader.lobby_listener_balance)
+        self.assertTrue(runtime.compatibility.account_restored)
+
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {
+                'round_id': 2, 'map': '01_karelia',
+                'bot_authority_id': 1,
+                'players': [{
+                    'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                    'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+                'bots': []}, _Client()))
+
+        self.assertEqual(
+            [(4, 5), (5, 4), (4, 5)],
+            runtime.app_loader.transitions)
+        self.assertEqual(2, runtime.app_loader.lobby_disposals)
+        self.assertEqual(2, runtime.app_loader.lobby_populates)
+        self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
+        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
 
     def test_battle_page_patch_does_not_overwrite_a_newer_class_patch(self):
         runtime = _runtime()
