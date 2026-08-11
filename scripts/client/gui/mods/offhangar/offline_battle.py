@@ -903,7 +903,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.36-native-experimental (2026-08-11)'
+_OFFH_BUILD = '1.8.37-native-experimental (2026-08-11)'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -19074,11 +19074,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_gc = BigWorld.wg_collideSegment(
 										_offh_bspace(), Math.Vector3(_x, _baked_y + 3.0, _z),
 										Math.Vector3(_x, _baked_y - 3.0, _z), 128)
-									# A baked height is only a search hint. If the narrow ray misses,
-									# keep looking for a real collision surface below instead of
-									# attaching a rigid body over an unloaded or absent terrain tile.
-									if _gc is not None:
-										_gy = _gc[0].y
+									# The graph already identifies the drivable terrain layer. If its
+									# narrow confirmation ray misses while collision streams in, retain
+									# that layer; a top-down walk can select a cellar below the spawn.
+									_gy = _gc[0].y if _gc is not None else _baked_y
 							except Exception:
 								pass
 							# Developer/custom maps may not ship a graph. Preserve the old collision

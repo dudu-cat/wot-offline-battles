@@ -1,4 +1,4 @@
-WORLD OF TANKS 0.8.2 NATIVE BOT PHYSICS EXPERIMENT 1.8.36
+WORLD OF TANKS 0.8.2 NATIVE BOT PHYSICS EXPERIMENT 1.8.37
 ==========================================================
 
 This is a separate experimental build. It keeps the retail 0.8.2 rigid-body
@@ -15,20 +15,16 @@ Install
 Do not merge individual files. The package must not leave an old
 mod_offhangar.pyc behind.
 
-What changed in 1.8.36
+What changed in 1.8.37
 ----------------------
 
-- LAN snapshots now contain only the fields each recipient uses. The server
-  still runs at 30 Hz; physics, collision and damage cadence are unchanged.
-- Formation slots keep their own spawn heading instead of all bots snapping to
-  one map-wide direction.
-- The countdown aiming marker is seeded once and no longer grows when only the
-  camera moves.
-- A missed narrow ground probe falls through to a real collision search instead
-  of treating a baked navigation height as a physical surface.
-- The first two native drive canaries record one compact contact/force line.
-  This identifies why a body with a valid drive signal still remains at zero
-  speed without requiring another special probe package.
+- Native bot bodies explicitly enable the retail track/suspension and carcass
+  contact gates before attachment. This restores track force, ground support,
+  wall contact and body collision instead of relying on uninitialized flags.
+- Stock-map spawns retain the prebaked drivable terrain layer when a narrow
+  collision confirmation ray is still streaming, rather than walking down to a
+  cellar or lower collision layer.
+- Drive diagnostics now include both track and carcass contact state.
 
 Test
 ----

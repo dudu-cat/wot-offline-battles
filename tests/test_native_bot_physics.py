@@ -78,6 +78,10 @@ class VehicleFilter(object):
 
     def setVehiclePhysics(self, physics):
         self.physics = physics
+        self.contacts_at_attach = (
+            physics.allowTracksContacts,
+            physics.allowCarcassContacts,
+        )
         if self.owner is not None:
             self.owner.events.append(("setVehiclePhysics", physics))
 
@@ -116,6 +120,10 @@ class VehiclePhysics(object):
         self._movement_signals = 0
         self._is_frozen = False
         self.refuse_wake = False
+        self.refuse_tracks_contacts = False
+        self.refuse_carcass_contacts = False
+        self._allow_tracks_contacts = False
+        self._allow_carcass_contacts = False
         self.static_history = []
         self.drive_history = []
 
@@ -147,6 +155,24 @@ class VehiclePhysics(object):
         if not (self.refuse_wake and not value):
             self._is_frozen = value
         self.drive_history.append(("frozen", value))
+
+    @property
+    def allowTracksContacts(self):
+        return self._allow_tracks_contacts
+
+    @allowTracksContacts.setter
+    def allowTracksContacts(self, value):
+        if not self.refuse_tracks_contacts:
+            self._allow_tracks_contacts = bool(value)
+
+    @property
+    def allowCarcassContacts(self):
+        return self._allow_carcass_contacts
+
+    @allowCarcassContacts.setter
+    def allowCarcassContacts(self, value):
+        if not self.refuse_carcass_contacts:
+            self._allow_carcass_contacts = bool(value)
 
     def setArenaBounds(self, minimum, maximum):
         self.bounds = (minimum, maximum)
@@ -629,6 +655,8 @@ class NativeBotPhysicsTest(unittest.TestCase):
         physics.isFrozenDuringFrame = False
         physics.gotTracksContact = True
         physics.allowTracksContacts = True
+        physics.gotCarcassContact = True
+        physics.allowCarcassContacts = True
         physics.groundType = 1
         physics.forceApplied = Vector3(1.0, 2.0, 3.0)
         physics.torqueApplied = Vector3(4.0, 5.0, 6.0)
@@ -666,6 +694,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
             diagnostic,
         )
         self.assertIn("tracks_contact=True allow_tracks=True", diagnostic)
+        self.assertIn("carcass_contact=True allow_carcass=True", diagnostic)
         self.assertIn("left_contacts=4 right_contacts=5", diagnostic)
         self.assertIn("force=(1.000,2.000,3.000)", diagnostic)
         self.assertIn("torque=(4.000,5.000,6.000)", diagnostic)
@@ -812,7 +841,70 @@ class NativeBotPhysicsTest(unittest.TestCase):
             event_names.index("setVehiclePhysics"),
         )
         self.assertEqual([False], self.entity.wgPhysics.static_history)
+        self.assertEqual((True, True), self.entity.filter.contacts_at_attach)
         self.assertEqual(1, len(self.bridge_calls))
+
+    def test_track_contact_enable_readback_failure_falls_back_before_attach(self):
+        physics = VehiclePhysics()
+        physics.refuse_tracks_contacts = True
+        self.bigworld.WGVehiclePhysics2 = lambda: physics
+
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual("failed", getattr(
+            self.mock, self.native.STATE_ATTR
+        )["phase"])
+        self.assertIsNone(self.entity.wgPhysics)
+        self.assertIsInstance(self.entity.filter, AvatarFilter)
+        self.assertEqual(1, len(self.mock._chassis_model.motors))
+        self.assertIs(
+            self.mock._pose_servo, self.mock._chassis_model.motors[0]
+        )
+        self.assertIsNone(getattr(
+            self.mock, self.native.STATE_ATTR
+        )["native_servo"])
+        self.assertTrue(any(
+            "native contact enable readback mismatch" in message
+            for level, message in self.logs if level == "error"
+        ))
+
+    def test_carcass_contact_enable_readback_failure_falls_back_before_attach(self):
+        physics = VehiclePhysics()
+        physics.refuse_carcass_contacts = True
+        self.bigworld.WGVehiclePhysics2 = lambda: physics
+
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual("failed", getattr(
+            self.mock, self.native.STATE_ATTR
+        )["phase"])
+        self.assertIsNone(self.entity.wgPhysics)
+        self.assertIsInstance(self.entity.filter, AvatarFilter)
+        self.assertEqual(1, len(self.mock._chassis_model.motors))
+        self.assertIs(
+            self.mock._pose_servo, self.mock._chassis_model.motors[0]
+        )
+        self.assertIsNone(getattr(
+            self.mock, self.native.STATE_ATTR
+        )["native_servo"])
+        self.assertTrue(any(
+            "native contact enable readback mismatch" in message
+            for level, message in self.logs if level == "error"
+        ))
 
     def test_body_matrix_is_diagnostic_not_the_root_pose_owner(self):
         self.assertTrue(self.native.prepare(

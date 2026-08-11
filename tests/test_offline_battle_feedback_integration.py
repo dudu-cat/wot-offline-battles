@@ -137,10 +137,6 @@ class OfflineBattleFeedbackIntegrationTest(unittest.TestCase):
         self.assertIn("for _loaded_component in (ch, hu, tu, gu):", self.battle_source)
         self.assertIn("nearest_ground_point(_spawn_graph, _x, _z, 3)", self.battle_source)
         self.assertIn(
-            "if _gc is not None:\n\t\t\t\t\t\t\t\t\t\t_gy = _gc[0].y",
-            self.battle_source,
-        )
-        self.assertNotIn(
             "_gy = _gc[0].y if _gc is not None else _baked_y",
             self.battle_source,
         )

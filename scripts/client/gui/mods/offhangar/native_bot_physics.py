@@ -374,7 +374,8 @@ def _maybe_log_drive_diagnostic(mock, state, when, signals_before,
 		'signals=%s repaired=%s engine_power=%s '
 		'normal_engine_power=%s engine_power_mode=%s frozen=%s '
 		'frozen_during_frame=%s static_mode=%s tracks_contact=%s allow_tracks=%s '
-		'ground_type=%s left_contacts=%s right_contacts=%s force=%s '
+		'carcass_contact=%s allow_carcass=%s ground_type=%s '
+		'left_contacts=%s right_contacts=%s force=%s '
 		'torque=%s speed=%s longitudinal_speed=%s angular_speed=%s' % (
 			getattr(mock, 'id', '?'),
 			heartbeat,
@@ -391,6 +392,8 @@ def _maybe_log_drive_diagnostic(mock, state, when, signals_before,
 			_diagnostic_attr(physics, 'staticMode'),
 			_diagnostic_attr(physics, 'gotTracksContact'),
 			_diagnostic_attr(physics, 'allowTracksContacts'),
+			_diagnostic_attr(physics, 'gotCarcassContact'),
+			_diagnostic_attr(physics, 'allowCarcassContacts'),
 			_diagnostic_attr(physics, 'groundType'),
 			_diagnostic_attr(vehicle_filter, 'numLeftTrackContacts'),
 			_diagnostic_attr(vehicle_filter, 'numRightTrackContacts'),
@@ -670,6 +673,15 @@ def _attach_physics(player, mock, descriptor, state):
 	physics.movementSignals = 0
 	_clear_callbacks(physics)
 	physics.visibilityMask = _visibility_mask(player)
+	# WGVehiclePhysics2 leaves these two contact gates uninitialized in the
+	# supported 0.8.2 executable, so client-only bodies must define them before
+	# simulation. Without the track gate there is no suspension or track force;
+	# without the carcass gate hull/static-world contacts are skipped.
+	physics.allowTracksContacts = True
+	physics.allowCarcassContacts = True
+	if (not bool(getattr(physics, 'allowTracksContacts', False)) or
+			not bool(getattr(physics, 'allowCarcassContacts', False))):
+		raise RuntimeError('native contact enable readback mismatch')
 	state['filter'].setVehiclePhysics(physics)
 	# Do not call WGVehicleFilter2.syncGunAngles here.  Its native 0.8.2
 	# implementation reads EntityManager's retail ServerConnection clock, which
