@@ -96,6 +96,20 @@ class OfflineBattleControlTests(unittest.TestCase):
             mouse,
         )
 
+    def test_prebattle_camera_motion_does_not_bloom_the_reticle(self):
+        source = self.source
+        dispersion_start = source.index(
+            "# Real dispersion model (Avatar.getOwnVehicleShotDispersionAngle):"
+        )
+        dispersion_end = source.index("# 2. Reload logic", dispersion_start)
+        dispersion = source[dispersion_start:dispersion_end]
+
+        self.assertIn("if _period_g == 3:", dispersion)
+        self.assertIn("_mv = 0.0", dispersion)
+        self.assertIn("_rv = 0.0", dispersion)
+        self.assertIn("_tv = 0.0", dispersion)
+        self.assertEqual(2, dispersion.count("if _period_g == 3:"))
+
 
 if __name__ == "__main__":
     unittest.main()

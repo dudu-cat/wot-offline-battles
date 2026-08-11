@@ -86,6 +86,10 @@ class VehicleFilter(object):
 
     def notifyInputKeysDown(self, movement, rotation):
         self.input = (movement, rotation)
+        if self.physics is not None:
+            self.physics.drive_history.append((
+                "keys", (movement, rotation)
+            ))
         if movement:
             self.longitudinalSpeed = 8.0 * movement
             self.bodyMatrix.translation = Vector3(
@@ -109,7 +113,11 @@ class VehicleFilter(object):
 class VehiclePhysics(object):
     def __init__(self):
         self._static_mode = False
+        self._movement_signals = 0
+        self._is_frozen = False
+        self.refuse_wake = False
         self.static_history = []
+        self.drive_history = []
 
     @property
     def staticMode(self):
@@ -119,6 +127,26 @@ class VehiclePhysics(object):
     def staticMode(self, value):
         self._static_mode = bool(value)
         self.static_history.append(bool(value))
+
+    @property
+    def movementSignals(self):
+        return self._movement_signals
+
+    @movementSignals.setter
+    def movementSignals(self, value):
+        self._movement_signals = int(value)
+        self.drive_history.append(("signals", int(value)))
+
+    @property
+    def isFrozen(self):
+        return self._is_frozen
+
+    @isFrozen.setter
+    def isFrozen(self, value):
+        value = bool(value)
+        if not (self.refuse_wake and not value):
+            self._is_frozen = value
+        self.drive_history.append(("frozen", value))
 
     def setArenaBounds(self, minimum, maximum):
         self.bounds = (minimum, maximum)
@@ -273,6 +301,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
             _veh_velocity=0.0,
             _veh_turn_velocity=0.0,
             bw_entity=self.entity,
+            matrix=Matrix(),
             _chassis_model=Model(self.old_servo),
             _pose_servo=self.old_servo,
             _servo_added=True,
@@ -302,6 +331,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
             _veh_velocity=0.0,
             _veh_turn_velocity=0.0,
             bw_entity=entity,
+            matrix=Matrix(),
             _chassis_model=Model(old_servo),
             _pose_servo=old_servo,
             _servo_added=True,
@@ -346,7 +376,8 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.assertEqual(1, len(self.bridge_calls))
         self.assertEqual(500.0, self.entity.wgPhysics.enginePower)
         self.assertTrue(any(
-            "NATIVE_BOT_PHYSICS drive active" in message
+            "NATIVE_BOT_PHYSICS drive active" in message and
+            "signals=9 frozen=False" in message
             for level, message in self.logs if level == "note"
         ))
 
@@ -364,6 +395,64 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.assertTrue(self.native.hold(self.mock))
         self.assertEqual((0, 0), self.entity.filter.input)
         self.assertEqual(0, self.entity.wgPhysics.movementSignals)
+
+    def test_nonzero_input_wakes_a_body_frozen_during_countdown(self):
+        self.assertIsNotNone(self.activate())
+        physics = self.entity.wgPhysics
+        self.assertTrue(self.native.hold(self.mock))
+        physics.isFrozen = True
+        physics.drive_history = []
+
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 1, 1, 7,
+            self.now + 0.10,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertFalse(physics.isFrozen)
+        self.assertEqual(9, physics.movementSignals)
+        self.assertEqual((1, 1), self.entity.filter.input)
+        self.assertEqual([
+            ("signals", 9),
+            ("frozen", False),
+            ("keys", (1, 1)),
+        ], physics.drive_history)
+
+    def test_zero_input_does_not_disable_native_auto_freeze(self):
+        self.assertIsNotNone(self.activate())
+        physics = self.entity.wgPhysics
+        physics.isFrozen = True
+        physics.drive_history = []
+
+        self.assertTrue(self.native.hold(self.mock))
+
+        self.assertTrue(physics.isFrozen)
+        self.assertEqual([
+            ("signals", 0),
+            ("keys", (0, 0)),
+        ], physics.drive_history)
+
+    def test_wake_readback_failure_faults_instead_of_claiming_drive(self):
+        self.assertIsNotNone(self.activate())
+        physics = self.entity.wgPhysics
+        self.assertTrue(self.native.hold(self.mock))
+        physics.isFrozen = True
+        physics.refuse_wake = True
+
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 1, 0, 7,
+            self.now + 0.10,
+        )
+
+        self.assertTrue(result["faulted"])
+        self.assertEqual("faulted", getattr(
+            self.mock, self.native.STATE_ATTR
+        )["phase"])
+        self.assertEqual(0, physics.movementSignals)
+        self.assertTrue(any(
+            "native rigid body wake readback mismatch" in message
+            for level, message in self.logs if level == "error"
+        ))
 
     def test_active_filter_heartbeat_uses_post_physics_entity_pose(self):
         self.assertIsNotNone(self.activate())
@@ -598,6 +687,42 @@ class NativeBotPhysicsTest(unittest.TestCase):
             "yaw_delta=0.3600" in message
             for level, message in self.logs if level == "error"
         ))
+
+    def test_model_handoff_rejects_a_visible_prephysics_yaw_jump(self):
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.entity.matrix.yaw += 0.10
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+
+        self.assertIsNone(self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        ))
+
+        self.assertEqual([self.old_servo], self.mock._chassis_model.motors)
+        self.assertIs(self.old_servo, self.mock._pose_servo)
+        self.assertIsInstance(self.entity.filter, AvatarFilter)
+        self.assertTrue(any(
+            "stage=model_handoff" in message and "yaw_delta=0.1000" in message
+            for level, message in self.logs if level == "error"
+        ))
+
+    def test_model_handoff_allows_subthreshold_filter_settle(self):
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.entity.matrix.yaw += 0.04
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+
+        self.assertTrue(result["staging"])
+        self.assertIsNotNone(self.entity.wgPhysics)
+        state = getattr(self.mock, self.native.STATE_ATTR)
+        self.assertEqual([state["native_servo"]],
+                         self.mock._chassis_model.motors)
 
     def test_activation_rejects_nonfinite_root_pose(self):
         self.assertTrue(self.native.prepare(
@@ -887,6 +1012,98 @@ class NativeBotPhysicsTest(unittest.TestCase):
             "failed", getattr(self.mock, self.native.STATE_ATTR)["phase"]
         )
         self.assertIsInstance(self.entity.filter, AvatarFilter)
+        self.assertEqual(
+            [("servo", self.mock.matrix)],
+            self.mock._chassis_model.motors,
+        )
+
+    def test_startup_rollback_detach_failure_keeps_one_native_owner(self):
+        class RefuseDetachModel(Model):
+            refuse_detach = False
+
+            def delMotor(inner_self, motor):
+                if inner_self.refuse_detach:
+                    raise RuntimeError("detach refused")
+                super(RefuseDetachModel, inner_self).delMotor(motor)
+
+        model = RefuseDetachModel(self.old_servo)
+        self.mock._chassis_model = model
+        collision_installs = []
+        self.mock._offh_install_collision_obstacle = (
+            lambda: collision_installs.append(True)
+        )
+
+        def reject_adapter_after_model_handoff():
+            model.refuse_detach = True
+            return False
+
+        sys.modules[
+            "OfflineEntity"
+        ].install_native_destructible_callback_adapter = (
+            reject_adapter_after_model_handoff
+        )
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        native_filter = self.entity.filter
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+
+        state = getattr(self.mock, self.native.STATE_ATTR)
+        self.assertTrue(result["faulted"])
+        self.assertEqual("faulted", state["phase"])
+        self.assertIs(self.entity.filter, native_filter)
+        self.assertEqual([state["native_servo"]], model.motors)
+        self.assertIsNone(self.mock._pose_servo)
+        self.assertEqual([], collision_installs)
+        self.assertTrue(any(
+            "Python Servo restore failed" in message
+            for level, message in self.logs if level == "error"
+        ))
+
+        model.refuse_detach = False
+        self.assertTrue(self.native.stop_mock(self.mock))
+        self.assertEqual([], model.motors)
+        self.assertIsNone(state["native_servo"])
+
+    def test_model_provider_switches_before_dynamic_physics_and_only_once(self):
+        events = self.entity.events
+
+        class OrderedModel(Model):
+            def addMotor(inner_self, motor):
+                events.append(("addMotor", motor))
+                super(OrderedModel, inner_self).addMotor(motor)
+
+            def delMotor(inner_self, motor):
+                events.append(("delMotor", motor))
+                super(OrderedModel, inner_self).delMotor(motor)
+
+        self.mock._chassis_model = OrderedModel(self.old_servo)
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.assertEqual([self.old_servo], self.mock._chassis_model.motors)
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+
+        self.assertTrue(self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )["staging"])
+
+        names = [event[0] for event in events]
+        self.assertLess(names.index("addMotor"),
+                        names.index("setVehiclePhysics"))
+        self.assertLess(names.index("delMotor"),
+                        names.index("setVehiclePhysics"))
+        motors_after_attach = list(self.mock._chassis_model.motors)
+        self.now += self.native.WARMUP_SECONDS + 0.01
+        self.assertIsNotNone(self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        ))
+        self.assertEqual(motors_after_attach,
+                         self.mock._chassis_model.motors)
 
     def test_implausible_active_jump_freezes_without_second_pose_owner(self):
         result = self.activate()
@@ -1044,14 +1261,16 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.assertTrue(self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7, self.now
         )["staging"])
+        second_physics = self.entity.wgPhysics
+        second_physics.isFrozen = True
         self.now += self.native.WARMUP_SECONDS + 0.01
         self.assertIsNotNone(self.native.step(
             self.player, self.mock, self.descriptor, -1, -1, 7, self.now
         ))
 
-        second_physics = self.entity.wgPhysics
         self.assertIsNot(first_physics, second_physics)
         self.assertEqual(6, second_physics.movementSignals)
+        self.assertFalse(second_physics.isFrozen)
         calls_before_heartbeat = len(self.bridge_calls)
         self.now += self.native.FILTER_HEARTBEAT_SECONDS + 0.01
         self.assertIsNotNone(self.native.step(
@@ -1367,11 +1586,6 @@ class NativeBotPhysicsTest(unittest.TestCase):
             self.player, self.mock, self.descriptor, 7, self.now
         ))
         self.now += self.native.SEED_CHECK_SECONDS + 0.01
-        self.assertTrue(self.native.step(
-            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
-        )["staging"])
-        self.now += self.native.WARMUP_SECONDS + 0.01
-
         self.assertIsNone(self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7, self.now
         ))

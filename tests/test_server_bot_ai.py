@@ -13,8 +13,8 @@ import time
 import unittest
 
 from lan_battle_server import (
-    BattleState, CLIENT_BUILD, ClientHandler, Player, PROTOCOL_VERSION,
-    SERVER_SEND_BUFFER_BYTES,
+    BOT_ORDER_WIRE_FIELDS, BattleState, CLIENT_BUILD, ClientHandler, Player,
+    PROTOCOL_VERSION, SERVER_SEND_BUFFER_BYTES,
 )
 from server_bot_ai import BotPlanner
 
@@ -320,6 +320,159 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual({"route"}, {order["combat_mode"] for order in first["orders"]})
 
+    def test_wire_orders_keep_only_authority_executable_fields_within_budget(self):
+        rich_profile = {
+            "class_tag": "mediumTank",
+            "roles": {"brawler": 0.7, "support": 0.3},
+            "shells": [
+                {"kind": "ARMOR_PIERCING", "damage": 320,
+                 "penetration": 180, "speed": 900}
+                for unused_index in range(8)
+            ],
+        }
+        orders = []
+        for bot_id in range(1, 30):
+            point = {"x": float(bot_id), "y": 0.0, "z": -80.0}
+            orders.append({
+                "id": bot_id, "team": 1 if bot_id <= 15 else 2,
+                "target_id": None, "target_kind": None,
+                "aim_position": point, "face_position": point,
+                "move_position": point, "fire_allowed": False,
+                "combat_mode": "route", "throttle_override": None,
+                "desired_range": 220.0, "fire_range": 600.0,
+                "route_id": "west_ridge", "route_index": 2,
+                "route_anchor": point, "personality": {
+                    "aggression": 0.5, "caution": 0.5, "patience": 0.5,
+                },
+                "profile": rich_profile, "shell_index": 0,
+                "cover_id": "debug-only",
+            })
+        state = BattleState(map_name="04_himmelsdorf")
+        state.bot_orders = {"revision": 7, "orders": orders}
+
+        revision, body, byte_increment = state._wire_order_dispatch()
+
+        expected_keys = set(BOT_ORDER_WIRE_FIELDS)
+        self.assertEqual(7, revision)
+        self.assertEqual(29, len(body))
+        self.assertTrue(all(set(order) == expected_keys for order in body))
+        self.assertTrue(all("profile" not in order for order in body))
+        self.assertEqual(
+            len(b',"bot_orders":') + len(json.dumps(
+                body, separators=(",", ":")).encode("utf-8")),
+            byte_increment,
+        )
+        rich_bytes = len(json.dumps(
+            orders, separators=(",", ":")).encode("utf-8"))
+        self.assertLess(byte_increment, 16 * 1024)
+        self.assertLess(byte_increment * 2, rich_bytes)
+
+    def test_only_authority_receives_compact_order_body(self):
+        class CaptureConnection(object):
+            def __init__(self):
+                self.messages = []
+
+            def sendall(self, payload):
+                self.messages.append(json.loads(payload.decode("utf-8")))
+
+        rich_order = {
+            "id": 1, "team": 1, "target_id": None,
+            "aim_position": {"x": 0.0, "y": 0.0, "z": 1.0},
+            "face_position": {"x": 0.0, "y": 0.0, "z": 1.0},
+            "move_position": {"x": 0.0, "y": 0.0, "z": 1.0},
+            "fire_allowed": False, "combat_mode": "route",
+            "throttle_override": None, "desired_range": 220.0,
+            "fire_range": 600.0, "route_id": "middle",
+            "route_index": 0,
+            "route_anchor": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "personality": {"aggression": 0.5},
+            "profile": {"shells": [{"damage": 100}]},
+            "shell_index": 0,
+        }
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        first_connection = CaptureConnection()
+        second_connection = CaptureConnection()
+        state.players[1] = Player(1, first_connection, ("127.0.0.1", 1))
+        state.players[2] = Player(2, second_connection, ("127.0.0.1", 2))
+        state.bot_authority_id = 1
+        state.bot_planner.build_orders = lambda manifest, states, players, now: {
+            "revision": 3, "orders": [rich_order],
+        }
+
+        metrics = state.tick_once(0.05)
+
+        authority_snapshot = first_connection.messages[-1]
+        replica_snapshot = second_connection.messages[-1]
+        self.assertIn("bot_orders", authority_snapshot)
+        self.assertNotIn("bot_orders", replica_snapshot)
+        self.assertEqual(
+            set(BOT_ORDER_WIRE_FIELDS).intersection(rich_order),
+            set(authority_snapshot["bot_orders"][0]),
+        )
+        self.assertNotIn("profile", authority_snapshot["bot_orders"][0])
+        authority_base = dict(authority_snapshot)
+        authority_base.pop("bot_orders")
+
+        def wire_size(message):
+            return len((json.dumps(
+                message, separators=(",", ":")) + "\n").encode("utf-8"))
+
+        self.assertEqual(2, metrics["snapshot_messages"])
+        self.assertEqual(1, metrics["order_attachments"])
+        self.assertEqual(
+            wire_size(authority_base) + wire_size(replica_snapshot),
+            metrics["snapshot_base_bytes"],
+        )
+        self.assertEqual(
+            wire_size(authority_snapshot) - wire_size(authority_base),
+            metrics["snapshot_order_bytes"],
+        )
+
+    def test_promoted_authority_ack_is_reset_and_latest_body_is_sent(self):
+        class CaptureConnection(object):
+            def __init__(self):
+                self.messages = []
+
+            def sendall(self, payload):
+                self.messages.append(json.loads(payload.decode("utf-8")))
+
+        order = {
+            "id": 1, "move_position": {"x": 1.0, "y": 0.0, "z": 2.0},
+            "fire_allowed": False, "combat_mode": "route",
+            "fire_range": 500.0, "route_id": "middle", "route_index": 0,
+            "route_anchor": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "shell_index": 0,
+        }
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        first = Player(1, CaptureConnection(), ("127.0.0.1", 1))
+        second_connection = CaptureConnection()
+        second = Player(2, second_connection, ("127.0.0.1", 2))
+        state.players = {1: first, 2: second}
+        state.bot_authority_id = 1
+        state.bot_planner.build_orders = lambda manifest, states, players, now: {
+            "revision": 9, "orders": [order],
+        }
+        first.bot_order_revision_ack = 9
+        second.bot_order_revision_ack = 9
+        second.bot_order_revision_sent = 9
+
+        removed, reset = state.remove_player(1, expected_player=first)
+
+        self.assertIs(removed, first)
+        self.assertFalse(reset)
+        self.assertEqual(2, state.bot_authority_id)
+        self.assertEqual(-1, second.bot_order_revision_ack)
+        self.assertEqual(-1, second.bot_order_revision_sent)
+        state.tick_once(0.05)
+        snapshot = next(
+            message for message in reversed(second_connection.messages)
+            if message.get("type") == "snapshot"
+        )
+        self.assertEqual(9, snapshot["bot_order_revision"])
+        self.assertEqual([1], [value["id"] for value in snapshot["bot_orders"]])
+
     def test_unchanged_orders_are_omitted_from_following_snapshots(self):
         class CaptureConnection(object):
             def __init__(self):
@@ -332,6 +485,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         state.phase = "battle"
         connection = CaptureConnection()
         state.players[1] = Player(1, connection, ("127.0.0.1", 0))
+        state.bot_authority_id = 1
 
         state.tick_once(0.05)
         state.tick_once(0.05)
@@ -656,6 +810,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         connection = CaptureConnection()
         player = Player(1, connection, ("127.0.0.1", 0))
         state.players[1] = player
+        state.bot_authority_id = 1
 
         state.tick_once(0.05)
         player.bot_order_sent_at -= 1.0
@@ -680,6 +835,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         connection = CaptureConnection()
         player = Player(1, connection, ("127.0.0.1", 0))
         state.players[1] = player
+        state.bot_authority_id = 1
         state.tick_once(0.05)
         revision = state.bot_orders["revision"]
         state.acknowledge_bot_orders(1, {"revision": revision})
@@ -791,6 +947,74 @@ class ServerBotPlannerTests(unittest.TestCase):
             order["move_position"],
         )
         self.assertEqual(0.0, order["throttle_override"])
+
+    def test_artillery_live_hold_pose_does_not_churn_order_revision(self):
+        planner = BotPlanner()
+        manifest, states = _artillery_manifest_and_states()
+
+        first = planner.build_orders(manifest, states, [], 1.0)
+        second = first
+        moved_states = states
+        for step in range(1, 31):
+            moved_states = [
+                dict(states[0], x=step * 0.1, z=-100.0 + step * 0.05),
+                states[1],
+            ]
+            second = planner.build_orders(
+                manifest, moved_states, [], 1.0 + step * 0.01)
+        first_order = next(
+            order for order in first["orders"] if order["id"] == 1)
+        second_order = next(
+            order for order in second["orders"] if order["id"] == 1)
+
+        self.assertEqual("artillery_hold", first_order["combat_mode"])
+        self.assertEqual(first["revision"], second["revision"])
+        self.assertNotEqual(
+            first_order["route_anchor"], second_order["route_anchor"])
+
+        planner._artillery_states[1]["position"] = {
+            "x": 35.0, "y": 0.0, "z": -80.0,
+        }
+        relocated = planner.build_orders(manifest, moved_states, [], 1.4)
+        relocated_order = next(
+            order for order in relocated["orders"] if order["id"] == 1)
+        self.assertGreater(relocated["revision"], second["revision"])
+        self.assertEqual("artillery_relocate", relocated_order["combat_mode"])
+        self.assertEqual(
+            {"x": 35.0, "y": 0.0, "z": -80.0},
+            relocated_order["move_position"],
+        )
+
+    def test_artillery_fire_live_pose_is_not_a_semantic_order_change(self):
+        planner = BotPlanner()
+        manifest, states = _artillery_manifest_and_states()
+        report = {
+            "observing_team": 1, "target_kind": "bot", "target_id": 3,
+            "target_team": 2, "visible": True,
+            "shootable_by_bot_ids": [1],
+            "x": 0, "y": 0, "z": 650, "health": 1000,
+            "max_health": 1000, "class_tag": "heavyTank",
+        }
+        planner.report_contacts(
+            [report], planner.known_targets(states, []), 1.0)
+        first = planner.build_orders(manifest, states, [], 1.0)
+        moved_states = [dict(states[0], x=0.2, z=-99.9), states[1]]
+        second = planner.build_orders(manifest, moved_states, [], 1.1)
+        first_order = next(
+            order for order in first["orders"] if order["id"] == 1)
+        second_order = next(
+            order for order in second["orders"] if order["id"] == 1)
+
+        self.assertEqual("artillery_fire", second_order["combat_mode"])
+        self.assertEqual(first["revision"], second["revision"])
+        self.assertNotEqual(
+            first_order["move_position"], second_order["move_position"])
+
+        expired = planner.build_orders(manifest, moved_states, [], 10.1)
+        expired_order = next(
+            order for order in expired["orders"] if order["id"] == 1)
+        self.assertGreater(expired["revision"], second["revision"])
+        self.assertEqual("artillery_hold", expired_order["combat_mode"])
 
     def test_blocked_artillery_relocates_only_between_rear_route_points(self):
         planner = BotPlanner()
@@ -1000,7 +1224,11 @@ class ServerBotPlannerTests(unittest.TestCase):
         player = Player(1, connection, ("127.0.0.1", 0))
         player.start_sender()
         try:
-            self.assertTrue(player.send({"type": "snapshot", "server_tick": 1}))
+            self.assertTrue(player.send({
+                "type": "snapshot", "server_tick": 1,
+                "bot_order_revision": 7,
+                "bot_orders": [{"id": 1, "combat_mode": "route"}],
+            }))
             self.assertTrue(connection.entered.wait(1.0))
             for tick in range(2, 11):
                 self.assertTrue(player.send({
@@ -1020,8 +1248,9 @@ class ServerBotPlannerTests(unittest.TestCase):
                 self.assertEqual(48, player.outbound_coalesced)
             self.assertTrue(player.connected)
             blocked = player.outbound_diagnostics()
-            self.assertEqual("snapshot", blocked["inflight_type"])
+            self.assertEqual("snapshot_orders", blocked["inflight_type"])
             self.assertGreaterEqual(blocked["inflight_age_ms"], 0.0)
+            self.assertEqual({}, blocked["completed_messages"])
 
             connection.release.set()
             deadline = time.monotonic() + 1.0
@@ -1041,6 +1270,18 @@ class ServerBotPlannerTests(unittest.TestCase):
             completed = player.outbound_diagnostics()
             self.assertEqual("", completed["inflight_type"])
             self.assertGreater(completed["send_max_ms"], 0.0)
+            self.assertEqual({
+                "events": 1, "pong": 1, "snapshot": 1,
+                "snapshot_orders": 1,
+            }, completed["completed_messages"])
+            self.assertEqual(
+                set(completed["completed_messages"]),
+                set(completed["completed_bytes"]),
+            )
+            self.assertTrue(all(
+                byte_count > 0
+                for byte_count in completed["completed_bytes"].values()
+            ))
             self.assertTrue(player.connected)
         finally:
             connection.release.set()

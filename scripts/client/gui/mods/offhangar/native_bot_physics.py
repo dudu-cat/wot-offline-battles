@@ -261,11 +261,13 @@ def _pose_delta(expected_position, expected_yaw, actual):
 	return (dx, dy, dz, distance, yaw_delta)
 
 
-def _pose_matches(expected_position, expected_yaw, actual):
+def _pose_matches(expected_position, expected_yaw, actual,
+		position_tolerance=POSE_POSITION_TOLERANCE,
+		yaw_tolerance=POSE_YAW_TOLERANCE):
 	delta = _pose_delta(expected_position, expected_yaw, actual)
 	return (delta is not None and
-		delta[3] <= POSE_POSITION_TOLERANCE and
-		delta[4] <= POSE_YAW_TOLERANCE)
+		delta[3] <= float(position_tolerance) and
+		delta[4] <= float(yaw_tolerance))
 
 
 def _pose_text(pose):
@@ -412,12 +414,31 @@ def _fail(mock, state, reason):
 				state['counted_active'] = False
 			_COUNTERS['runtime_failed'] += 1
 	else:
-		state['physics'] = None
-		state['filter'] = None
-		state['entity_provider'] = None
-		state['pending_fashion'] = None
-		state['phase'] = 'failed'
-		_restore_avatar_filter(mock)
+		provider_restored = True
+		if state.get('native_servo') is not None:
+			provider_restored = _restore_python_model_provider(mock, state)
+		if not provider_restored:
+			LOG_ERROR('NATIVE_BOT_PHYSICS Python Servo restore failed id=%s' % (
+				getattr(mock, 'id', '?')))
+			# The native Servo is still the only attached root owner. Returning None
+			# would let the caller start Python motion beside it, so retain the native
+			# references and freeze the last verified pose until normal cleanup retries
+			# the detach.
+			pose = _entity_pose(state)
+			if pose is not None:
+				state['last_pose'] = pose
+				state['last_pose_at'] = _now()
+			state['pending_correction'] = None
+			state['pending_fashion'] = None
+			state['freeze_reseed'] = False
+			state['phase'] = 'faulted'
+		else:
+			state['physics'] = None
+			state['filter'] = None
+			state['entity_provider'] = None
+			state['pending_fashion'] = None
+			state['phase'] = 'failed'
+			_restore_avatar_filter(mock)
 		_COUNTERS['startup_failed'] += 1
 	_COUNTERS['failed'] += 1
 	LOG_ERROR('NATIVE_BOT_PHYSICS FAIL id=%s phase=%s freeze_reseed=%s reason=%s' % (
@@ -526,6 +547,8 @@ def _activate_model_provider(mock, state):
 	provider = state.get('entity_provider')
 	if provider is None:
 		return False
+	if state.get('native_servo') is not None:
+		return True
 	old_servo = getattr(mock, '_pose_servo', None)
 	servo = None
 	try:
@@ -547,6 +570,47 @@ def _activate_model_provider(mock, state):
 	mock._pose_servo = None
 	mock._servo_added = True
 	state['native_servo'] = servo
+	return True
+
+
+def _restore_python_model_provider(mock, state):
+	"""Restore the proven Python matrix Servo after a staged setup failure."""
+	chassis = (getattr(mock, '_chassis_model', None) or
+		getattr(mock, 'model', None))
+	if chassis is None:
+		return False
+	native_servo = state.get('native_servo')
+	if native_servo is None:
+		return (getattr(mock, '_pose_servo', None) is not None and
+			bool(getattr(mock, '_servo_added', False)))
+	matrix = getattr(mock, 'matrix', None)
+	if matrix is None:
+		return False
+	try:
+		# Detach first so a model that refuses all delMotor calls can never retain
+		# both the native and Python root owners. If this fails, the proven native
+		# Servo remains the only attached motor and the caller freezes it.
+		chassis.delMotor(native_servo)
+	except Exception:
+		return False
+	try:
+		fallback_servo = BigWorld.Servo(matrix)
+		chassis.addMotor(fallback_servo)
+	except Exception:
+		# Restore the native owner if the Python replacement cannot be attached.
+		# If even recovery fails, record that no Servo is attached; the caller still
+		# fails closed and never starts Python motion beside an unknown owner.
+		try:
+			chassis.addMotor(native_servo)
+		except Exception:
+			state['native_servo'] = None
+			mock._native_pose_servo = None
+			mock._servo_added = False
+		return False
+	state['native_servo'] = None
+	mock._native_pose_servo = None
+	mock._pose_servo = fallback_servo
+	mock._servo_added = True
 	return True
 
 
@@ -598,6 +662,7 @@ def prepare(player, mock, descriptor, space_id, timestamp=None):
 		'pending_correction': None,
 		'queued_correction': None,
 		'pending_fashion': None,
+		'native_servo': None,
 		'counted_active': False,
 		'max_speed': max(1.0, max_speed),
 		'activate_at': 0.0,
@@ -685,18 +750,24 @@ def _movement_signals(movement, rotation):
 
 
 def _set_drive_input(state, movement, rotation):
-	"""Apply both halves of the retail local-vehicle drive contract."""
+	"""Apply filter prediction and the offline native track-force adapter."""
 	physics = state.get('physics')
 	vehicle_filter = state.get('filter')
 	if physics is None or vehicle_filter is None:
 		raise RuntimeError('native drive objects are unavailable')
 	signals = _movement_signals(movement, rotation)
 	# notifyInputKeysDown updates WGVehicleFilter2 prediction only. Track force is
-	# gated independently by WGVehiclePhysics2.movementSignals.
+	# gated independently by WGVehiclePhysics2.movementSignals in this client-only
+	# adapter. Neither the generic setter nor notifyInputKeysDown wakes a rigid
+	# body that went to sleep during the countdown.
 	physics.movementSignals = signals
+	if signals:
+		physics.isFrozen = False
+	vehicle_filter.notifyInputKeysDown(movement, rotation)
 	if int(getattr(physics, 'movementSignals', -1)) != signals:
 		raise RuntimeError('native movementSignals readback mismatch')
-	vehicle_filter.notifyInputKeysDown(movement, rotation)
+	if signals and bool(getattr(physics, 'isFrozen', True)):
+		raise RuntimeError('native rigid body wake readback mismatch')
 	state['last_input'] = (movement, rotation)
 	return signals
 
@@ -787,9 +858,17 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 				return _staged_result(state)
 			pose = _entity_pose(state)
 			if not _pose_matches(
-					state.get('seed_position'), state.get('seed_yaw'), pose):
+					state.get('seed_position'), state.get('seed_yaw'), pose,
+					CORRECTION_POSITION_TOLERANCE,
+					CORRECTION_YAW_TOLERANCE):
 				raise RuntimeError(_pose_mismatch_reason(
-					'seed_wait', state, pose))
+					'model_handoff', state, pose))
+			# Stock VehicleAppearance binds Servo(vehicle.matrix) before advanced
+			# physics is attached. Swap only after the seed has read back, then keep
+			# this provider for the complete dynamic lifetime so activation cannot
+			# reveal a delayed root/yaw jump.
+			if not _activate_model_provider(mock, state):
+				raise RuntimeError('native entity matrix could not own the staged model')
 			_attach_physics(player, mock, descriptor, state)
 			_LAST_ATTACH_TIME[0] = when
 			state['phase'] = 'warmup'
@@ -841,12 +920,20 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 		movement = _input_sign(throttle) if active and not safety_hold else 0
 		rotation = _input_sign(turn) if active and not safety_hold else 0
 		keys = (movement, rotation)
-		if state.get('last_input') != keys:
+		physics = state.get('physics')
+		needs_drive_update = state.get('last_input') != keys
+		if (not needs_drive_update and keys != (0, 0) and physics is not None and
+				bool(getattr(physics, 'isFrozen', False))):
+			# A blocked bot may fall asleep while its high-level command is
+			# unchanged. Wake it without disabling normal zero-input auto-freeze.
+			needs_drive_update = True
+		if needs_drive_update:
 			signals = _set_drive_input(state, movement, rotation)
 			if signals and not _DRIVE_LOGGED[0]:
 				_DRIVE_LOGGED[0] = True
-				LOG_NOTE('NATIVE_BOT_PHYSICS drive active id=%s signals=%d' % (
-					getattr(mock, 'id', '?'), signals))
+				LOG_NOTE('NATIVE_BOT_PHYSICS drive active id=%s signals=%d frozen=%s' % (
+					getattr(mock, 'id', '?'), signals,
+					str(bool(getattr(state.get('physics'), 'isFrozen', True)))))
 
 		pose = _entity_pose(state)
 		if pose is None:
@@ -926,9 +1013,8 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 				getattr(mock, '_veh_turn_velocity', 0.0) or 0.0),
 		}
 	except Exception as error:
-		was_active = state.get('phase') in ('active', 'faulted')
 		_fail(mock, state, error)
-		if was_active and state.get('phase') == 'faulted':
+		if state.get('phase') == 'faulted':
 			return _frozen_result(state)
 		return None
 

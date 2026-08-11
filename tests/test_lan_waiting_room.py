@@ -99,6 +99,10 @@ class WaitingRoomTest(unittest.TestCase):
             "socket_seconds": 0.0005,
             "messages": 2,
             "bytes": 4096,
+            "snapshot_messages": 2,
+            "snapshot_base_bytes": 24000,
+            "snapshot_order_bytes": 9000,
+            "order_attachments": 1,
         }, elapsed_seconds=0.010, late_seconds=0.0, interval_seconds=1.0 / 30.0)
         window.add({
             "planner_seconds": 0.004,
@@ -107,6 +111,10 @@ class WaitingRoomTest(unittest.TestCase):
             "socket_seconds": 0.0005,
             "messages": 2,
             "bytes": 4096,
+            "snapshot_messages": 2,
+            "snapshot_base_bytes": 28000,
+            "snapshot_order_bytes": 0,
+            "order_attachments": 0,
         }, elapsed_seconds=0.040, late_seconds=0.007, interval_seconds=1.0 / 30.0)
 
         summary = window.summary(now=15.0, process_now=4.0)
@@ -120,6 +128,10 @@ class WaitingRoomTest(unittest.TestCase):
         self.assertAlmostEqual(5.0, summary["stage_ms"]["navigation"])
         self.assertAlmostEqual(0.8, summary["messages_per_second"])
         self.assertAlmostEqual(1.6, summary["kilobytes_per_second"])
+        self.assertEqual(4, summary["snapshot_messages"])
+        self.assertEqual(13000, summary["snapshot_base_bytes"])
+        self.assertEqual(9000, summary["snapshot_order_bytes"])
+        self.assertEqual(1, summary["order_attachments"])
 
     def test_one_player_can_start_from_clickable_panel_request(self):
         client = self.connect("Solo")
@@ -196,6 +208,8 @@ class WaitingRoomTest(unittest.TestCase):
         self.assertEqual(first_start["map"], second_start["map"])
         self.assertEqual(2, len(first_start["players"]))
         self.assertEqual(first_start["bots"], second_start["bots"])
+        self.assertNotIn("bot_orders", first_start)
+        self.assertNotIn("bot_orders", second_start)
         self.assertEqual(30, len(first_start["bots"]))
         self.assertEqual(30, len({bot["name"] for bot in first_start["bots"]}))
         self.assertEqual(first_welcome["player_id"], first_start["bot_authority_id"])
@@ -302,9 +316,11 @@ class WaitingRoomTest(unittest.TestCase):
         }]})
         time.sleep(0.05)
         self.state.tick_once(0.05)
-        snapshot = second.receive_type("snapshot")
-        self.assertGreater(snapshot["bot_order_revision"], 0)
-        order = snapshot["bot_orders"][0]
+        authority_snapshot = first.receive_type("snapshot")
+        replica_snapshot = second.receive_type("snapshot")
+        self.assertGreater(authority_snapshot["bot_order_revision"], 0)
+        self.assertNotIn("bot_orders", replica_snapshot)
+        order = authority_snapshot["bot_orders"][0]
         self.assertEqual(16, order["id"])
         self.assertEqual(first_welcome["player_id"], order["target_id"])
         self.assertEqual({"x": 17.0, "y": 2.0, "z": -31.0}, order["aim_position"])
@@ -355,6 +371,7 @@ class WaitingRoomTest(unittest.TestCase):
 
         self.assertEqual("battle", late_welcome["phase"])
         self.assertTrue(late_start["late_join"])
+        self.assertNotIn("bot_orders", late_start)
         self.assertEqual(first_welcome["map"], first_start["map"])
         self.assertEqual(first_start["map"], late_start["map"])
         self.assertEqual(2, len(late_start["players"]))

@@ -31,7 +31,7 @@ from server_bot_navigation import BotPathResolver
 
 
 PROTOCOL_VERSION = 8
-CLIENT_BUILD = "1.8.34-native-experimental-20260811"
+CLIENT_BUILD = "1.8.35-native-experimental-20260811"
 TICK_HZ = 30.0
 SERVER_PERF_LOG_SECONDS = 5.0
 PREBATTLE_COUNTDOWN_SECONDS = 30.0
@@ -39,6 +39,11 @@ BATTLE_DURATION_SECONDS = 900.0
 MAX_LINE_BYTES = 256 * 1024
 SERVER_IO_TIMEOUT_SECONDS = 15.0
 SERVER_SEND_BUFFER_BYTES = 128 * 1024
+BOT_ORDER_WIRE_FIELDS = (
+    "id", "target_id", "target_kind", "aim_position", "face_position",
+    "move_position", "fire_allowed", "combat_mode", "throttle_override",
+    "fire_range", "route_id", "route_index", "route_anchor", "shell_index",
+)
 DEFAULT_MAP = "server_random"
 MAP_POOL = (
     "01_karelia",
@@ -123,6 +128,11 @@ def _percentile(values, fraction):
     return float(ordered[max(0, min(index, len(ordered) - 1))])
 
 
+def _wire_bot_order(order):
+    """Project one planner order onto fields executed by the authority client."""
+    return dict((key, order[key]) for key in BOT_ORDER_WIRE_FIELDS if key in order)
+
+
 class _ServerPerfWindow:
     """Low-frequency process and battle-tick diagnostics."""
 
@@ -143,6 +153,10 @@ class _ServerPerfWindow:
         self.overruns = 0
         self.messages = 0
         self.bytes = 0
+        self.snapshot_messages = 0
+        self.snapshot_base_bytes = 0
+        self.snapshot_order_bytes = 0
+        self.order_attachments = 0
         self.stage_seconds = dict((name, 0.0) for name in self.STAGES)
 
     def add(self, metrics, elapsed_seconds, late_seconds, interval_seconds):
@@ -156,6 +170,10 @@ class _ServerPerfWindow:
             self.stage_seconds[name] += float(metrics.get(name + "_seconds", 0.0))
         self.messages += int(metrics.get("messages", 0))
         self.bytes += int(metrics.get("bytes", 0))
+        self.snapshot_messages += int(metrics.get("snapshot_messages", 0))
+        self.snapshot_base_bytes += int(metrics.get("snapshot_base_bytes", 0))
+        self.snapshot_order_bytes += int(metrics.get("snapshot_order_bytes", 0))
+        self.order_attachments += int(metrics.get("order_attachments", 0))
 
     def ready(self, now):
         return bool(self.tick_ms and now - self.started_at >= SERVER_PERF_LOG_SECONDS)
@@ -182,6 +200,12 @@ class _ServerPerfWindow:
             "overruns": self.overruns,
             "messages_per_second": self.messages / wall_seconds,
             "kilobytes_per_second": self.bytes / wall_seconds / 1024.0,
+            "snapshot_messages": self.snapshot_messages,
+            "snapshot_base_bytes": (
+                self.snapshot_base_bytes / max(1, self.snapshot_messages)),
+            "snapshot_order_bytes": (
+                self.snapshot_order_bytes / max(1, self.order_attachments)),
+            "order_attachments": self.order_attachments,
             "stage_ms": stage_ms,
         }
 
@@ -227,6 +251,8 @@ class Player:
     outbound_inflight_type: str = field(default="", init=False, repr=False)
     outbound_inflight_started: float = field(default=0.0, init=False, repr=False)
     outbound_send_max_seconds: float = field(default=0.0, init=False, repr=False)
+    outbound_completed_messages: dict = field(default_factory=dict, init=False, repr=False)
+    outbound_completed_bytes: dict = field(default_factory=dict, init=False, repr=False)
     sender_thread: Optional[threading.Thread] = field(default=None, init=False, repr=False)
     sender_started: bool = field(default=False, init=False, repr=False)
 
@@ -254,6 +280,14 @@ class Player:
             return
         self.bot_order_revision_sent = revision
         self.bot_order_sent_at = time.monotonic()
+
+    def _record_completed_send(self, message_type, payload_size):
+        with self.outbound_lock:
+            self.outbound_completed_messages[message_type] = (
+                self.outbound_completed_messages.get(message_type, 0) + 1)
+            self.outbound_completed_bytes[message_type] = (
+                self.outbound_completed_bytes.get(message_type, 0) +
+                int(payload_size))
 
     def _dequeue_outbound(self):
         with self.outbound_lock:
@@ -290,6 +324,7 @@ class Player:
             try:
                 with self.send_lock:
                     self.conn.sendall(payload)
+                self._record_completed_send(message_type, len(payload))
                 self._record_order_sent(order_revision)
             except (BrokenPipeError, ConnectionError, OSError) as error:
                 self.last_send_error = "%s: %s" % (type(error).__name__, error)
@@ -320,19 +355,39 @@ class Player:
                     max(0.0, (now - self.outbound_inflight_started) * 1000.0)
                     if self.outbound_inflight_started > 0.0 else 0.0),
                 "send_max_ms": self.outbound_send_max_seconds * 1000.0,
+                "completed_messages": dict(self.outbound_completed_messages),
+                "completed_bytes": dict(self.outbound_completed_bytes),
             }
             self.outbound_send_max_seconds = 0.0
+            self.outbound_completed_messages.clear()
+            self.outbound_completed_bytes.clear()
             return result
 
-    def send(self, message, perf=None):
+    def send(self, message, perf=None, order_payload_bytes=0):
         if not self.connected:
             return False
         encode_started = time.perf_counter()
         payload = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
+        message_type = str(message.get("type") or "unknown")
+        if message_type == "snapshot" and "bot_orders" in message:
+            message_type = "snapshot_orders"
         if perf is not None:
             perf["encode_seconds"] += time.perf_counter() - encode_started
             perf["messages"] += 1
             perf["bytes"] += len(payload)
+            if message.get("type") == "snapshot":
+                order_payload_bytes = max(
+                    0, min(int(order_payload_bytes), len(payload)))
+                perf["snapshot_messages"] = (
+                    perf.get("snapshot_messages", 0) + 1)
+                perf["snapshot_base_bytes"] = (
+                    perf.get("snapshot_base_bytes", 0) +
+                    len(payload) - order_payload_bytes)
+                perf["snapshot_order_bytes"] = (
+                    perf.get("snapshot_order_bytes", 0) + order_payload_bytes)
+                if order_payload_bytes:
+                    perf["order_attachments"] = (
+                        perf.get("order_attachments", 0) + 1)
         if len(payload) > MAX_LINE_BYTES:
             self.last_send_error = "outbound message exceeds %d bytes" % MAX_LINE_BYTES
             return False
@@ -347,7 +402,7 @@ class Player:
                 self.outbound_seq += 1
                 item = (
                     self.outbound_seq, payload, order_revision,
-                    str(message.get("type") or "unknown"),
+                    message_type,
                 )
                 if message.get("type") == "snapshot":
                     if "snapshot" in self.outbound_latest:
@@ -361,6 +416,7 @@ class Player:
             socket_started = time.perf_counter()
             with self.send_lock:
                 self.conn.sendall(payload)
+            self._record_completed_send(message_type, len(payload))
             if perf is not None:
                 perf["socket_seconds"] += time.perf_counter() - socket_started
             self._record_order_sent(order_revision)
@@ -400,6 +456,9 @@ class BattleState:
         self.bot_navigation_targets = {}
         self.bot_navigation_frame = None
         self.bot_orders = {"revision": 0, "orders": []}
+        self.bot_order_wire_revision = -1
+        self.bot_order_wire_body = []
+        self.bot_order_wire_bytes = 0
         self.bot_reported_hits = set()
         self.bot_observation_stats = {1: 0, 2: 0, "accepted": 0}
         self.bot_navigation_stats = {
@@ -455,6 +514,14 @@ class BattleState:
         old = self.bot_authority_id
         self.bot_authority_id = connected[0] if connected else None
         if old != self.bot_authority_id and self.phase == "battle":
+            authority = self.players.get(self.bot_authority_id)
+            if authority is not None:
+                # Replicas do not receive executable orders.  A promoted client
+                # may retain an ACK from an earlier authority tenure, so force
+                # delivery of the latest complete revision before it drives.
+                authority.bot_order_revision_ack = -1
+                authority.bot_order_revision_sent = -1
+                authority.bot_order_sent_at = 0.0
             self.bot_planner.clear_observations()
             self.bot_navigation_stats = {
                 "graph": {"source": "none", "cell_mm": 0, "nodes": 0},
@@ -620,6 +687,9 @@ class BattleState:
                 self.bot_navigation_targets = {}
                 self.bot_navigation_frame = None
                 self.bot_orders = {"revision": 0, "orders": []}
+                self.bot_order_wire_revision = -1
+                self.bot_order_wire_body = []
+                self.bot_order_wire_bytes = 0
                 self.bot_reported_hits = set()
                 self.bot_observation_stats = {1: 0, 2: 0, "accepted": 0}
                 self.bot_navigation_stats = {
@@ -715,7 +785,6 @@ class BattleState:
                 "bot_authority_id": self.bot_authority_id,
                 "bot_manifest": list(self.bot_manifest),
                 "bot_order_revision": self.bot_orders["revision"],
-                "bot_orders": list(self.bot_orders["orders"]),
                 "rules": self.rules_state,
                 "battle_result": self.battle_result,
             }, None
@@ -739,7 +808,6 @@ class BattleState:
                 "bot_authority_id": self.bot_authority_id,
                 "bot_manifest": list(self.bot_manifest),
                 "bot_order_revision": self.bot_orders["revision"],
-                "bot_orders": list(self.bot_orders["orders"]),
                 "rules": self.rules_state,
                 "battle_result": self.battle_result,
             }
@@ -768,6 +836,28 @@ class BattleState:
                 now, self.combat_start_at)) * 1000.0)),
             "duration_ms": int(BATTLE_DURATION_SECONDS * 1000.0),
         }
+
+    def _wire_order_dispatch(self):
+        """Return one immutable, compact authority order body per revision."""
+        revision = int(self.bot_orders.get("revision", 0))
+        if revision != self.bot_order_wire_revision:
+            body = [
+                _wire_bot_order(order)
+                for order in self.bot_orders.get("orders", ())
+            ]
+            encoded_body = json.dumps(
+                body, separators=(",", ":")).encode("utf-8")
+            self.bot_order_wire_revision = revision
+            self.bot_order_wire_body = body
+            # Adding a final compact-JSON member replaces only the original
+            # closing brace, so this is the exact snapshot byte increment.
+            self.bot_order_wire_bytes = (
+                len(b',"bot_orders":') + len(encoded_body))
+        return (
+            self.bot_order_wire_revision,
+            self.bot_order_wire_body,
+            self.bot_order_wire_bytes,
+        )
 
     def acknowledge_bot_orders(self, player_id, message):
         """Record application-level delivery, not merely a successful TCP write."""
@@ -1403,6 +1493,10 @@ class BattleState:
         metrics = dict((name + "_seconds", 0.0) for name in _ServerPerfWindow.STAGES)
         metrics["messages"] = 0
         metrics["bytes"] = 0
+        metrics["snapshot_messages"] = 0
+        metrics["snapshot_base_bytes"] = 0
+        metrics["snapshot_order_bytes"] = 0
+        metrics["order_attachments"] = 0
         with self.lock:
             if self.phase != "battle":
                 return
@@ -1462,10 +1556,11 @@ class BattleState:
             authority = self.players.get(self.bot_authority_id)
             authority_order_ack = (
                 int(authority.bot_order_revision_ack) if authority is not None else -1)
+            dispatch_authority = authority
             dispatch_round_id = self.round_id
             dispatch_server_tick = self.tick
-            dispatch_order_revision = int(self.bot_orders["revision"])
-            dispatch_order_body = list(self.bot_orders["orders"])
+            (dispatch_order_revision, dispatch_order_body,
+             dispatch_order_bytes) = self._wire_order_dispatch()
             metrics["snapshot_seconds"] = time.perf_counter() - stage_started
         stage_started = time.perf_counter()
         if ai_debug is not None:
@@ -1608,13 +1703,16 @@ class BattleState:
             outgoing = snapshot
             revision = dispatch_order_revision
             needs_order_body = (
+                player is dispatch_authority and
                 player.bot_order_revision_ack != revision and
                 (player.bot_order_revision_sent != revision or
                  now - player.bot_order_sent_at >= 0.25))
             if needs_order_body:
                 outgoing = dict(snapshot)
                 outgoing["bot_orders"] = dispatch_order_body
-            if not player.send(outgoing, metrics):
+            if not player.send(
+                    outgoing, metrics,
+                    dispatch_order_bytes if needs_order_body else 0):
                 failed_recipients.append(player)
         for player in failed_recipients:
             removed, reset = self.remove_player(
@@ -1948,13 +2046,33 @@ def run_server(host, port, map_name, max_players):
                         [item["inflight_age_ms"] for item in player_stats] or [0.0])
                     send_max = max(
                         [item["send_max_ms"] for item in player_stats] or [0.0])
+                    completed_messages = {}
+                    completed_bytes = {}
+                    for item in player_stats:
+                        for message_type, count in item["completed_messages"].items():
+                            completed_messages[message_type] = (
+                                completed_messages.get(message_type, 0) + count)
+                        for message_type, byte_count in item["completed_bytes"].items():
+                            completed_bytes[message_type] = (
+                                completed_bytes.get(message_type, 0) + byte_count)
+                    actual_text = ",".join(
+                        "%s:%.1f/s/%.1fKiB/s" % (
+                            message_type,
+                            completed_messages[message_type] /
+                            summary["wall_seconds"],
+                            completed_bytes.get(message_type, 0) /
+                            summary["wall_seconds"] / 1024.0,
+                        )
+                        for message_type in sorted(completed_messages)
+                    ) or "none"
                     _server_log(
                         "SERVER PERF cpu_core=%.1f%% tick=%.1fHz avg=%.2fms p95=%.2fms "
                         "max=%.2fms overruns=%d late_max=%.2fms "
                         "stage=move:%.2f,plan:%.2f,nav:%.2f,snapshot:%.2f,diag:%.2f,dispatch:%.2f,events:%.2fms "
                         "wire=encode:%.2f,socket:%.2fms messages=%.1f/s data=%.1fKiB/s "
+                        "snapshot=base:%.0fB,orders:%.0fB,attach:%d/%d "
                         "outbound=reliable:%d,latest:%d,coalesced:%d,"
-                        "inflight:%d,age_max:%.0fms,send_max:%.0fms" % (
+                        "inflight:%d,age_max:%.0fms,send_max:%.0fms sent=%s" % (
                             summary["cpu_percent"], summary["tick_hz"],
                             summary["tick_avg_ms"], summary["tick_p95_ms"],
                             summary["tick_max_ms"], summary["overruns"],
@@ -1965,8 +2083,12 @@ def run_server(host, port, map_name, max_players):
                             stages["encode"], stages["socket"],
                             summary["messages_per_second"],
                             summary["kilobytes_per_second"],
+                            summary["snapshot_base_bytes"],
+                            summary["snapshot_order_bytes"],
+                            summary["order_attachments"],
+                            summary["snapshot_messages"],
                             pending_reliable, pending_latest, coalesced,
-                            inflight, inflight_age_max, send_max))
+                            inflight, inflight_age_max, send_max, actual_text))
                     perf_window.reset(tick_finished, process_finished)
             delay = next_tick - tick_finished
             if delay > 0:

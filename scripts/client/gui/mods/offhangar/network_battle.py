@@ -21,7 +21,7 @@ from gui.mods.offhangar import vehicle_pose
 
 
 PROTOCOL_VERSION = 8
-CLIENT_BUILD = '1.8.34-native-experimental-20260811'
+CLIENT_BUILD = '1.8.35-native-experimental-20260811'
 POLL_INTERVAL = 1.0 / 60.0
 INPUT_INTERVAL = 1.0 / 30.0
 BOT_STATE_INTERVAL = 1.0 / 30.0
@@ -2673,39 +2673,61 @@ def _apply_bot_state(player, state, force_authority_pose=False, mock=None,
 	if mock is None:
 		return
 	try:
+		is_authority = network_is_authority(player)
+		authority_fast_path = is_authority and not force_authority_pose
 		# Static A* is resolved by the Python 3 server over the shipped graph.  This
 		# short waypoint is advisory: the authority's LocalDriver still performs the
 		# exact BigWorld corridor, destructible-object, water and tank checks before
 		# committing motion.  Replica clients retain it only for a possible failover.
 		nav_source = str(state.get('nav_source') or '')
 		if nav_source in ('server_baked', 'server_hold'):
-			nav_state = {
-				'world_pose': True,
-				'x': state.get('nav_x'), 'y': state.get('nav_y'),
-				'z': state.get('nav_z'),
-			}
-			nav_world = _world_from_server(player, nav_state)
-			if nav_world is not None:
-				mock._network_navigation_target = (
-					float(nav_world.x), float(nav_world.y), float(nav_world.z))
-				mock._network_navigation_source = nav_source
-				mock._network_navigation_revision = int(
-					state.get('nav_order_revision', 0) or 0)
+			nav_revision = int(state.get('nav_order_revision', 0) or 0)
+			nav_key = (
+				nav_source, nav_revision, state.get('nav_x'),
+				state.get('nav_y'), state.get('nav_z'))
+			nav_cache = getattr(mock, '_network_authority_navigation_cache', None)
+			nav_reused = bool(
+				authority_fast_path and isinstance(nav_cache, tuple) and
+				len(nav_cache) == 2 and nav_cache[0] == nav_key and
+				getattr(mock, '_network_navigation_source', None) == nav_source and
+				getattr(mock, '_network_navigation_revision', None) == nav_revision and
+				getattr(mock, '_network_navigation_target', None) == nav_cache[1])
+			if nav_reused:
+				# Navigation freshness is level-triggered even when the immutable
+				# server waypoint needs no second coordinate conversion.
 				mock._network_navigation_time = float(sample_time or time.time())
 				player._offhangar_network_server_navigation_at = float(
 					sample_time or time.time())
-				if not getattr(player, '_offhangar_network_server_navigation_logged', False):
-					player._offhangar_network_server_navigation_logged = True
-					LOG_NOTE('LAN server-baked navigation waypoints active')
+			else:
+				nav_state = {
+					'world_pose': True,
+					'x': state.get('nav_x'), 'y': state.get('nav_y'),
+					'z': state.get('nav_z'),
+				}
+				nav_world = _world_from_server(player, nav_state)
+				if nav_world is not None:
+					nav_target = (
+						float(nav_world.x), float(nav_world.y), float(nav_world.z))
+					mock._network_navigation_target = nav_target
+					mock._network_navigation_source = nav_source
+					mock._network_navigation_revision = nav_revision
+					mock._network_navigation_time = float(sample_time or time.time())
+					player._offhangar_network_server_navigation_at = float(
+						sample_time or time.time())
+					if is_authority:
+						mock._network_authority_navigation_cache = (
+							nav_key, nav_target)
+					if not getattr(player, '_offhangar_network_server_navigation_logged', False):
+						player._offhangar_network_server_navigation_logged = True
+						LOG_NOTE('LAN server-baked navigation waypoints active')
 		elif nav_source == 'client_fallback':
+			nav_revision = int(state.get('nav_order_revision', 0) or 0)
 			mock._network_navigation_target = None
 			mock._network_navigation_source = nav_source
-			mock._network_navigation_revision = int(
-				state.get('nav_order_revision', 0) or 0)
+			mock._network_navigation_revision = nav_revision
 			mock._network_navigation_time = float(sample_time or time.time())
 		old_health = max(0, int(getattr(mock, 'health', 0) or 0))
 		target_alive = bool(state.get('alive', True))
-		is_authority = network_is_authority(player)
 		if not is_authority or force_authority_pose:
 			previous_fire = int(getattr(mock, '_network_seen_fire_seq', 0) or 0)
 			fire_seq = int(state.get('fire_seq', previous_fire) or 0)
@@ -2738,9 +2760,35 @@ def _apply_bot_state(player, state, force_authority_pose=False, mock=None,
 			mock._network_bot_fire_seq = max(
 				int(getattr(mock, '_network_bot_fire_seq', 0) or 0), fire_seq)
 			mock._network_bot_shell_index = int(state.get('shell_index', 0) or 0)
-		killer_id = _local_killer_id_from_state(player, state)
-		_push_mock_health(player, mock, state.get('health', mock.health),
-			state.get('max_health', mock.maxHealth), target_alive, killer_id)
+		if authority_fast_path:
+			incoming_health = max(0, int(state.get('health', mock.health) or 0))
+			incoming_max_health = max(1, int(
+				state.get('max_health', mock.maxHealth) or
+				getattr(mock, 'maxHealth', 1) or 1))
+			if incoming_health > incoming_max_health:
+				incoming_health = incoming_max_health
+			incoming_alive = target_alive and incoming_health > 0
+			current_health_matches = (
+				int(getattr(mock, 'health', incoming_health) or 0) ==
+					incoming_health and
+				int(getattr(mock, 'maxHealth', incoming_max_health) or 1) ==
+					incoming_max_health and
+				bool(getattr(mock, 'isAlive', incoming_health > 0)) == incoming_alive)
+			has_killer = bool(
+				state.get('killer_kind') or
+				state.get('killer_id') not in (None, 0, '0') or
+				state.get('killer_bot_id') not in (None, 0, '0'))
+			# _push_mock_health is already idempotent for an unchanged state without a
+			# killer. Avoid its repeated identity lookup and UI imports on the authority,
+			# while every death/killer payload keeps the original complete path.
+			if not (current_health_matches and not has_killer):
+				killer_id = _local_killer_id_from_state(player, state)
+				_push_mock_health(player, mock, incoming_health,
+					incoming_max_health, incoming_alive, killer_id)
+		else:
+			killer_id = _local_killer_id_from_state(player, state)
+			_push_mock_health(player, mock, state.get('health', mock.health),
+				state.get('max_health', mock.maxHealth), target_alive, killer_id)
 		if not is_authority:
 			new_health = max(0, int(getattr(mock, 'health', 0) or 0))
 			if old_health > new_health:

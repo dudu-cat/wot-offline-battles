@@ -903,7 +903,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.34-native-experimental (2026-08-11)'
+_OFFH_BUILD = '1.8.35-native-experimental (2026-08-11)'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -11824,7 +11824,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						if 'last_time' not in _gun_state: _gun_state['last_time'] = cur_time
 						dt = cur_time - _gun_state['last_time']
 						_gun_state['last_time'] = cur_time
-						
+						_period_g = getattr(getattr(player, 'arena', None), 'period', 3)
+
 						# Real dispersion model (Avatar.getOwnVehicleShotDispersionAngle):
 						#   ideal = base * sqrt(1 + (v*chassisMove)^2 + (vR*chassisRot)^2
 						#                          + (wTurret*gunTurretRotation)^2)
@@ -11839,10 +11840,18 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_cm, _cr = _d_td.chassis['shotDispersionFactors']
 							_gdf = _d_td.gun['shotDispersionFactors'] if isinstance(_d_td.gun, dict) else _d_td.gun.shotDispersionFactors
 							_gt = _gdf['turretRotation']
-							v_speed, r_speed = player.getOwnVehicleSpeeds()
-							_mv = v_speed * _cm
-							_rv = r_speed * _cr
-							_tv = _gun_state.get('turret_speed', 0.0) * _gt
+							# Retail pre-battle controls let the player look around while the
+							# vehicle and gun remain fully aimed. Camera-driven turret motion
+							# must not bloom the reticle before period 3 begins.
+							if _period_g == 3:
+								v_speed, r_speed = player.getOwnVehicleSpeeds()
+								_mv = v_speed * _cm
+								_rv = r_speed * _cr
+								_tv = _gun_state.get('turret_speed', 0.0) * _gt
+							else:
+								_mv = 0.0
+								_rv = 0.0
+								_tv = 0.0
 							# Equipment: vStab dampens all movement bloom, snap shot the turret
 							# term, smooth ride the hull-movement term.
 							if _gun_state.get('has_vstab', False):
@@ -11853,11 +11862,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_mv *= 0.96
 							target_disp = _gun_state['base_dispersion'] * math.sqrt(1.0 + _mv * _mv + _rv * _rv + _tv * _tv)
 						except Exception:
-							try:
-								v_speed, r_speed = player.getOwnVehicleSpeeds()
-								target_disp += abs(v_speed) * 0.015 + abs(r_speed) * 0.015
-							except Exception:
-								pass
+							if _period_g == 3:
+								try:
+									v_speed, r_speed = player.getOwnVehicleSpeeds()
+									target_disp += abs(v_speed) * 0.015 + abs(r_speed) * 0.015
+								except Exception:
+									pass
 						
 						# Crew and module maluses belong on the TARGET circle, not on the current
 						# one. They used to be applied once, to _gun_state['dispersion'], at gun
@@ -11886,7 +11896,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						# battle actually starts. On the frame period turns 3 the pending reload is
 						# announced to the UI so the bar animates from full instead of appearing
 						# half-way through.
-						_period_g = getattr(getattr(player, 'arena', None), 'period', 3)
 						if _period_g != 3:
 							_gun_state['load_started'] = False
 						elif not _gun_state.get('load_started'):

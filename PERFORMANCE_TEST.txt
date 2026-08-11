@@ -111,28 +111,34 @@ maximum search budget near 6 ms or lower. A short non-zero `pending` count
 during the opening second is expected; an `oldest` value that keeps growing is
 not.
 
-Build 1.8.34 also prints one `SERVER PERF` line every five seconds during a
+Build 1.8.35 prints one `SERVER PERF` line every five seconds during a
 battle. `cpu_core` is process CPU as a percentage of one core; `avg`, `p95`
 and `max` are complete server-tick times. `stage` separates movement, planning,
 navigation, snapshots, diagnostics and dispatch, while `wire` separates JSON
 encoding from socket writes. A healthy 30 Hz server remains well below the
-33.3 ms tick budget with `overruns=0`; high client ping alongside a healthy
-server line points to client scheduling/render starvation rather than a busy
-server process.
+33.3 ms tick budget with `overruns=0`; that rules out the simulation tick
+itself, but `snapshot`, `outbound` and `sent` must still be checked for TCP
+head-of-line delay.
 
 Each accepted TCP connection also prints its actual send buffer and the
 requested 131072-byte bound. This makes accidental reintroduction of a large
 kernel backlog visible without relying on the HUD's 999 ms display clamp.
-`outbound` adds the current in-flight count, its maximum age and the longest
-completed send in the five-second window; a growing age or send_max alongside
-high RTT identifies a blocked TCP writer even when the application queue is
-already empty.
+`snapshot=base:<B>,orders:<B>,attach:<n>/<total>` separates the normal snapshot
+body from attached bot orders. `outbound` adds the current in-flight count, its
+maximum age and the longest completed send in the five-second window. `sent=`
+reports messages and KiB that actually completed sendall by type; the older
+`messages/data` values are offered/encoded work and can include snapshots later
+coalesced away. Growing age or send_max alongside high RTT identifies a blocked
+TCP writer even when the application queue is already empty.
 
 LAN NET separates transport and scheduling stalls. max_socket_gap is a real
 receive pause; max_queue_age means the packet arrived but the game thread was
 late applying it. snapshots is the server stream rate, and bot_updates is the
 authority's actual new-pose rate. poll is average main-thread LAN callback
 time; snapshot_apply is the average newest-snapshot application time.
+Authority clients reuse unchanged server-navigation coordinate conversions
+and no-op health updates; handoff and replica snapshots deliberately retain
+the complete application path.
 
 Times are milliseconds per sampled frame. The value after '/' is the average
 call count per sampled frame. Some stages are intentionally nested: driver

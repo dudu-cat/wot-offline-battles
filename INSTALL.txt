@@ -1,4 +1,4 @@
-World of Tanks 0.8.2 native bot physics experiment 1.8.34
+World of Tanks 0.8.2 native bot physics experiment 1.8.35
 =========================================================
 
 Read START_NATIVE_TEST_HERE.txt before installation, then use START_HERE.txt
@@ -28,7 +28,7 @@ Start the included server
 
 Replace every older client package and lan_battle_server.py with the files in
 THIS package. Protocol 8 and client build
-1.8.34-native-experimental-20260811 are intentionally incompatible with older
+1.8.35-native-experimental-20260811 are intentionally incompatible with older
 client/server builds, so every player and the server must use this same package.
 
 Install Python 3 from https://www.python.org/downloads/ on the one machine that

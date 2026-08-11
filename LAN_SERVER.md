@@ -76,7 +76,7 @@ With normal logging settings, each client writes these milestones to
 ```text
 LAN connecting to 192.168.1.20:28782
 LAN TCP connected to 192.168.1.20:28782
-LAN hello sent (protocol 8, build 1.8.34-native-experimental-20260811)
+LAN hello sent (protocol 8, build 1.8.35-native-experimental-20260811)
 LAN welcome id=1 name=Player-158 vehicle=china:Type_59 team=1 slot=0 map=... phase=waiting
 LAN JOIN confirmed; queue screen is now server-backed
 LAN queue UI updated: 2 connected player(s)
@@ -127,7 +127,7 @@ The server also prints one process/tick profile every five seconds while a
 battle is active:
 
 ```text
-SERVER PERF cpu_core=2.8% tick=30.0Hz avg=0.92ms p95=1.31ms max=2.40ms overruns=0 late_max=0.00ms stage=move:0.02,plan:0.18,nav:0.61,snapshot:0.01,diag:0.01,dispatch:0.07,events:0.00ms wire=encode:0.03,socket:0.00ms messages=30.0/s data=18.0KiB/s outbound=reliable:0,latest:1,coalesced:0,inflight:0,age_max:0ms,send_max:1ms
+SERVER PERF cpu_core=2.8% tick=30.0Hz avg=0.92ms p95=1.31ms max=2.40ms overruns=0 late_max=0.00ms stage=move:0.02,plan:0.18,nav:0.61,snapshot:0.01,diag:0.01,dispatch:0.07,events:0.00ms wire=encode:0.03,socket:0.00ms messages=30.0/s data=421.9KiB/s snapshot=base:14400B,orders:0B,attach:0/150 outbound=reliable:0,latest:1,coalesced:0,inflight:0,age_max:0ms,send_max:1ms sent=snapshot:30.0/s/421.9KiB/s
 ```
 
 `cpu_core` is Python process CPU relative to one core, not whole-machine CPU.
@@ -135,6 +135,10 @@ The server has a 33.3 ms budget at 30 Hz. Sustained `p95` below that budget and
 `overruns=0` rule out a saturated server tick. Battle socket writes use the
 asynchronous sender, so backpressure appears in `outbound` in-flight age and
 `send_max` rather than the tick's normally zero `wire.socket` value.
+`snapshot` separates the average base body from the compact order increment
+and reports how often that increment was attached. `messages/data` count
+offered encoded work; `sent` counts only successful sendall completions by
+message type, so coalesced snapshots no longer masquerade as wire bandwidth.
 
 Long terrain routes use bounded weighted-A* continuations instead of one large
 search per bot. Moving tanks are handled by the local driver and are not baked
@@ -270,10 +274,11 @@ v8:
   `target_kind` and shared coordinates, plus bounded client-probed cover and
   peek affordances for visible contacts;
 - `bot_state`: the latest authority-executed bot pose, health and fire state;
-- `bot_orders`: route index, movement/aim points, target and cover reservation,
-  combat mode, throttle override and shell index, guarded by
-  `bot_order_revision`. A snapshot includes the order list only when that
-  revision is new for its recipient.
+- `bot_orders`: route index, movement/aim points, target identity, combat mode,
+  throttle override and shell index, guarded by `bot_order_revision`. The rich
+  planner body remains server-local; only executable fields are projected onto
+  the wire, and only the elected authority receives that list when its
+  acknowledged revision is stale. Replicas consume canonical bot snapshots.
 - snapshot navigation fields: `nav_source`, `nav_order_revision` and a short
   canonical `nav_x/nav_y/nav_z` waypoint resolved from the static graph.
 

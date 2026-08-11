@@ -9,22 +9,29 @@ render callback into the retail 0.8.2 WGVehicleFilter2/WGVehiclePhysics2 stack.
 Tactics, A*, aiming, combat, spotting, capture and LAN protocol remain in the
 existing implementation. LAN replicas remain snapshot-only.
 
-Version 1.8.34 completes the retail native drive contract by writing both the
-WGVehicleFilter2 key state and WGVehiclePhysics2 movementSignals. It also feeds
-the confirmed post-physics Entity pose back to Filter::input every 100 ms so a
-client-only vehicle does not enter the retail six-second stale-sample path.
-Corrections are coalesced to one sample per real engine tick; an unconfirmed
-safety hold refreshes only its original safe target. The server bounds its TCP
-send buffer to 128 KiB to limit stale snapshot head-of-line backlog, and reports
-the actual buffer plus in-flight send age. The client tracks server-owned HP
-deltas so event/snapshot arrival order cannot apply one hit twice. Snapshots,
-events and bot-order coalescing are fenced by round so delayed first-battle
-traffic cannot mutate a second battle. Native-owned bodies are excluded from
-the Python collision-solver candidate map while the shared spatial index
-remains available for player/native contacts. Pristine vehicles bypass an
-otherwise redundant module-damage helper, and direct-fire tanks skip a BSP ray
-whose result was overwritten later in the same callback. Collision, terrain,
-spotting and native physics cadence are unchanged.
+Version 1.8.35 fixes the runtime failures exposed by the first complete native
+test. A rigid body that slept through the countdown is explicitly awakened on
+its first non-zero drive command, and both movementSignals and isFrozen are
+read back before success is logged. The root model now switches to the retail
+Entity matrix after a strict seed readback and before dynamic physics attaches,
+so activation cannot reveal a delayed Servo/yaw jump. Pre-battle camera and
+turret motion no longer blooms the player's aiming circle.
+
+The LAN server now excludes live SPG pose from the semantic order revision,
+projects planner orders onto the fields the authority actually executes, and
+sends that body only to the authority. This removes the repeated full-order
+payload that kept pong and damage events behind large TCP snapshots. SERVER
+PERF reports base/order snapshot bytes and actual completed sends by message
+type so remaining head-of-line delay is measurable rather than inferred from
+the 999 ms HUD clamp. Repeated authority snapshots reuse unchanged navigation
+coordinate and health work; replica and authority-handoff snapshots retain the
+complete path. Collision, terrain, spotting, physics and snapshot cadence are
+unchanged.
+
+Version 1.8.34 introduced the native movementSignals adapter, the 100 ms
+post-physics Filter::input heartbeat, bounded TCP send buffer, round fencing,
+server-owned HP accounting, collision-owner filtering and initial equivalent
+callback optimizations.
 
 Version 1.8.33 aligned staged bot startup with the retail 0.8.2 vehicle path.
 It seeds once before physics attachment, keeps WGVehiclePhysics2 dynamic, and
@@ -63,10 +70,10 @@ First test
 
 A successful authority startup contains:
 
-    OfflineBattle BUILD 1.8.34-native-experimental (2026-08-11)
+    OfflineBattle BUILD 1.8.35-native-experimental (2026-08-11)
     NATIVE_FILTER_BRIDGE loaded
     NATIVE_BOT_PHYSICS prepared=29
-    NATIVE_BOT_PHYSICS drive active
+    NATIVE_BOT_PHYSICS drive active ... frozen=False
     NATIVE_BOT_PHYSICS heartbeat active
     NATIVE_BOT_PHYSICS active=29 prepared=29 failed=0
     NATIVE_BOT_PHYSICS startup_complete expected=29 attempted=29 prepared=29 active=29 failed=0 stopped=0
@@ -98,9 +105,9 @@ Full acceptance checklist
 
 For LAN, also verify that the authority is smooth, the replica can see every
 human and bot, and the replica does not construct local native bot bodies. The
-server logs each connection's actual `sndbuf` and `requested=131072B`; send the
-line plus the `outbound` in-flight/age/send_max fields with the matching
-client/server logs if ping remains high.
+server logs each connection's actual `sndbuf` and `requested=131072B`; send
+that line plus `snapshot=base/orders/attach`, `outbound` age/send_max, and
+`sent=` fields with the matching client/server logs if ping remains high.
 
 
 Failure behavior

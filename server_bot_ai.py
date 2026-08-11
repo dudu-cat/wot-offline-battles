@@ -263,6 +263,18 @@ class BotPlanner(object):
         signature_orders = []
         for order in orders:
             signature = dict(order)
+            mode = str(signature.get("combat_mode") or "")
+            if mode in ("artillery_hold", "artillery_relocate",
+                        "artillery_fire"):
+                # Artillery anchors describe the hull's latest reported pose,
+                # not a new tactical command.  Including them made two parked
+                # SPGs publish a complete 29-bot order revision every authority
+                # frame even though their emplacement and mode were unchanged.
+                signature.pop("route_anchor", None)
+                if mode == "artillery_fire":
+                    # A firing SPG is explicitly held at zero throttle and the
+                    # authority resolves its live rendered pose locally.
+                    signature.pop("move_position", None)
             if (signature.get("target_id") is not None and
                     bool(signature.get("fire_allowed"))):
                 # The authority client resolves a visible target's rendered live

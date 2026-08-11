@@ -1265,6 +1265,203 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertEqual(7.5, bot._veh_velocity)
         self.assertEqual(-0.3, bot._veh_turn_velocity)
 
+    def test_authority_reuses_unchanged_bot_navigation_and_health(self):
+        vector3 = sys.modules["Math"].Vector3
+        player = Player()
+        player._offhangar_network_id = 1
+        player.playerVehicleID = 7
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True, phase="battle"
+        )
+        player._offhangar_network_formation = lambda team, slot: (
+            (0.0, 0.0, 0.0) if team == 1 else (0.0, 100.0, math.pi)
+        )
+        player.arena = types.SimpleNamespace(onVehicleKilled=lambda *args: None)
+        bot = types.SimpleNamespace(
+            id=1016, _network_bot_id=16, health=500, maxHealth=500,
+            isAlive=True, publicInfo={"isAlive": True},
+            position=vector3(0, 0, 0), yaw=0.0, pitch=0.0, roll=0.0,
+        )
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            bot.id: bot,
+        }
+        state = {
+            "id": 16, "health": 500, "max_health": 500, "alive": True,
+            "nav_source": "server_baked", "nav_order_revision": 12,
+            "nav_x": 7.0, "nav_y": 3.0, "nav_z": 24.0,
+        }
+        conversions = []
+        health_pushes = []
+        original_world = self.network._world_from_server
+        original_push = self.network._push_mock_health
+        self.network._world_from_server = lambda target, value: (
+            conversions.append(dict(value)) or
+            vector3(value.get("x"), value.get("y"), value.get("z"))
+        )
+        self.network._push_mock_health = lambda *args: (
+            health_pushes.append(args) or original_push(*args)
+        )
+        try:
+            self.network._apply_bot_state(player, state, sample_time=100.0)
+            self.network._apply_bot_state(player, state, sample_time=101.0)
+            self.assertEqual(1, len(conversions))
+            self.assertEqual(0, len(health_pushes))
+            self.assertEqual(101.0, bot._network_navigation_time)
+            self.assertEqual(
+                101.0, player._offhangar_network_server_navigation_at
+            )
+
+            moved_waypoint = dict(state, nav_x=8.0)
+            self.network._apply_bot_state(
+                player, moved_waypoint, sample_time=102.0
+            )
+            self.assertEqual(2, len(conversions))
+
+            bot.health = 450
+            self.network._apply_bot_state(
+                player, moved_waypoint, sample_time=103.0
+            )
+            self.assertEqual(1, len(health_pushes))
+            self.assertEqual(500, bot.health)
+        finally:
+            self.network._world_from_server = original_world
+            self.network._push_mock_health = original_push
+
+    def test_authority_health_changes_and_handoff_bypass_snapshot_cache(self):
+        vector3 = sys.modules["Math"].Vector3
+        deaths = []
+        player = Player()
+        player._offhangar_network_id = 1
+        player.playerVehicleID = 7
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True, phase="battle"
+        )
+        player._offhangar_network_formation = lambda team, slot: (
+            (0.0, 0.0, 0.0) if team == 1 else (0.0, 100.0, math.pi)
+        )
+        bot = types.SimpleNamespace(
+            id=1016, _network_bot_id=16, health=500, maxHealth=500,
+            isAlive=True, publicInfo={"isAlive": True},
+            position=vector3(0, 0, 0), yaw=0.0, pitch=0.0, roll=0.0,
+        )
+        killer = types.SimpleNamespace(id=1002, _network_bot_id=2)
+
+        def on_killed(vehicle_id, killer_id, reason):
+            deaths.append((vehicle_id, killer_id, reason))
+            bot.isAlive = False
+
+        player.arena = types.SimpleNamespace(onVehicleKilled=on_killed)
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            bot.id: bot, killer.id: killer,
+        }
+        alive = {
+            "id": 16, "health": 500, "max_health": 500, "alive": True,
+            "nav_source": "server_baked", "nav_order_revision": 12,
+            "nav_x": 7.0, "nav_y": 3.0, "nav_z": 24.0,
+            "x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0,
+            "aim_yaw": 0.0, "gun_pitch": 0.0,
+        }
+        pushes = []
+        transforms = []
+        original_world = self.network._world_from_server
+        original_push = self.network._push_mock_health
+        original_queue = self.network._queue_network_transform
+        self.network._world_from_server = lambda target, value: vector3(
+            value.get("x", 0.0), value.get("y", 0.0), value.get("z", 0.0)
+        )
+        self.network._push_mock_health = lambda *args: (
+            pushes.append(args) or original_push(*args)
+        )
+        self.network._queue_network_transform = lambda *args: transforms.append(args)
+        try:
+            self.network._apply_bot_state(player, alive, sample_time=100.0)
+            self.network._apply_bot_state(player, alive, sample_time=101.0)
+            self.assertEqual(0, len(pushes))
+
+            dead = dict(
+                alive, health=0, alive=False,
+                killer_kind="human", killer_id=1,
+            )
+            self.network._apply_bot_state(player, dead, sample_time=102.0)
+            self.network._apply_bot_state(player, dead, sample_time=103.0)
+            self.assertEqual(2, len(pushes))
+            self.assertEqual([(1016, 7, 0)], deaths)
+
+            changed_killer = dict(dead, killer_kind="bot", killer_id=2)
+            self.network._apply_bot_state(
+                player, changed_killer, sample_time=104.0
+            )
+            self.assertEqual(3, len(pushes))
+            self.assertEqual(killer.id, bot.last_killer_id)
+
+            bot.health = 500
+            bot.isAlive = True
+            bot.publicInfo["isAlive"] = True
+            bot._network_death_notified = False
+            self.network._apply_bot_state(
+                player, alive, True, bot, 105.0
+            )
+            self.network._apply_bot_state(
+                player, alive, True, bot, 106.0
+            )
+            self.assertEqual(5, len(pushes))
+            self.assertEqual(2, len(transforms))
+        finally:
+            self.network._world_from_server = original_world
+            self.network._push_mock_health = original_push
+            self.network._queue_network_transform = original_queue
+
+    def test_replica_never_uses_authority_bot_snapshot_cache(self):
+        vector3 = sys.modules["Math"].Vector3
+        player = Player()
+        player._offhangar_network_id = 1
+        player._offhangar_network_is_authority = False
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True, phase="battle"
+        )
+        player._offhangar_network_formation = lambda team, slot: (
+            (0.0, 0.0, 0.0) if team == 1 else (0.0, 100.0, math.pi)
+        )
+        bot = types.SimpleNamespace(
+            id=1016, _network_bot_id=16, health=500, maxHealth=500,
+            isAlive=True, publicInfo={"isAlive": True},
+            position=vector3(0, 0, 0), yaw=0.0, pitch=0.0, roll=0.0,
+        )
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            bot.id: bot,
+        }
+        state = {
+            "id": 16, "health": 500, "max_health": 500, "alive": True,
+            "nav_source": "server_baked", "nav_order_revision": 12,
+            "nav_x": 7.0, "nav_y": 3.0, "nav_z": 24.0,
+            "x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0,
+            "aim_yaw": 0.0, "gun_pitch": 0.0,
+        }
+        conversions = []
+        pushes = []
+        original_world = self.network._world_from_server
+        original_push = self.network._push_mock_health
+        original_queue = self.network._queue_network_transform
+        self.network._world_from_server = lambda target, value: (
+            conversions.append(dict(value)) or
+            vector3(value.get("x", 0.0), value.get("y", 0.0), value.get("z", 0.0))
+        )
+        self.network._push_mock_health = lambda *args: pushes.append(args)
+        self.network._queue_network_transform = lambda *args: None
+        try:
+            self.network._apply_bot_state(player, state, sample_time=100.0)
+            self.network._apply_bot_state(player, state, sample_time=101.0)
+        finally:
+            self.network._world_from_server = original_world
+            self.network._push_mock_health = original_push
+            self.network._queue_network_transform = original_queue
+
+        # Each replica apply converts both its navigation and rendered poses.
+        self.assertEqual(4, len(conversions))
+        self.assertEqual(2, len(pushes))
+
     def test_snapshot_requires_complete_server_navigation_before_suppressing_fallback(self):
         player = Player()
         player._offhangar_network_authority_handoff_pending = False
