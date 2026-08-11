@@ -37,6 +37,8 @@ SERVER_PERF_LOG_SECONDS = 5.0
 PREBATTLE_COUNTDOWN_SECONDS = 30.0
 BATTLE_DURATION_SECONDS = 900.0
 MAX_LINE_BYTES = 256 * 1024
+SERVER_IO_TIMEOUT_SECONDS = 15.0
+SERVER_SEND_BUFFER_BYTES = 1024 * 1024
 DEFAULT_MAP = "server_random"
 MAP_POOL = (
     "01_karelia",
@@ -216,6 +218,89 @@ class Player:
     bot_order_sent_at: float = 0.0
     last_send_error: str = ""
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    outbound_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    outbound_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    outbound_reliable: list = field(default_factory=list, repr=False)
+    outbound_latest: dict = field(default_factory=dict, repr=False)
+    outbound_seq: int = field(default=0, init=False, repr=False)
+    outbound_coalesced: int = field(default=0, init=False, repr=False)
+    sender_thread: Optional[threading.Thread] = field(default=None, init=False, repr=False)
+    sender_started: bool = field(default=False, init=False, repr=False)
+
+    def start_sender(self):
+        """Move socket writes off the simulation tick and coalesce snapshots."""
+        if self.sender_started:
+            return
+        self.sender_started = True
+        self.sender_thread = threading.Thread(
+            target=self._sender_worker,
+            name="wot-lan-sender-%d" % self.player_id,
+            daemon=True,
+        )
+        self.sender_thread.start()
+
+    def stop_sender(self):
+        self.connected = False
+        with self.outbound_lock:
+            self.outbound_reliable[:] = []
+            self.outbound_latest.clear()
+        self.outbound_event.set()
+
+    def _record_order_sent(self, revision):
+        if revision is None:
+            return
+        self.bot_order_revision_sent = revision
+        self.bot_order_sent_at = time.monotonic()
+
+    def _dequeue_outbound(self):
+        with self.outbound_lock:
+            reliable = self.outbound_reliable[0] if self.outbound_reliable else None
+            latest_key = None
+            latest = None
+            for key, item in self.outbound_latest.items():
+                if latest is None or item[0] < latest[0]:
+                    latest_key, latest = key, item
+            if reliable is None and latest is None:
+                return None
+            if latest is None or (reliable is not None and reliable[0] <= latest[0]):
+                return self.outbound_reliable.pop(0)
+            del self.outbound_latest[latest_key]
+            return latest
+
+    def _sender_worker(self):
+        while self.connected:
+            item = self._dequeue_outbound()
+            if item is None:
+                self.outbound_event.clear()
+                with self.outbound_lock:
+                    pending = bool(self.outbound_reliable or self.outbound_latest)
+                if pending:
+                    self.outbound_event.set()
+                    continue
+                self.outbound_event.wait(0.1)
+                continue
+            unused_seq, payload, order_revision = item
+            try:
+                with self.send_lock:
+                    self.conn.sendall(payload)
+                self._record_order_sent(order_revision)
+            except (BrokenPipeError, ConnectionError, OSError) as error:
+                self.last_send_error = "%s: %s" % (type(error).__name__, error)
+                self.connected = False
+                break
+        with self.outbound_lock:
+            self.outbound_reliable[:] = []
+            self.outbound_latest.clear()
+        self.outbound_event.set()
+
+    def outbound_diagnostics(self):
+        """Return a cheap, consistent snapshot for the five-second perf log."""
+        with self.outbound_lock:
+            return {
+                "pending_reliable": len(self.outbound_reliable),
+                "pending_latest": len(self.outbound_latest),
+                "coalesced": self.outbound_coalesced,
+            }
 
     def send(self, message, perf=None):
         if not self.connected:
@@ -229,18 +314,31 @@ class Player:
         if len(payload) > MAX_LINE_BYTES:
             self.last_send_error = "outbound message exceeds %d bytes" % MAX_LINE_BYTES
             return False
+        order_revision = None
+        if "bot_orders" in message:
+            try:
+                order_revision = int(message.get("bot_order_revision", -1))
+            except (TypeError, ValueError):
+                pass
+        if self.sender_started:
+            with self.outbound_lock:
+                self.outbound_seq += 1
+                item = (self.outbound_seq, payload, order_revision)
+                if message.get("type") == "snapshot":
+                    if "snapshot" in self.outbound_latest:
+                        self.outbound_coalesced += 1
+                    self.outbound_latest["snapshot"] = item
+                else:
+                    self.outbound_reliable.append(item)
+            self.outbound_event.set()
+            return True
         try:
             socket_started = time.perf_counter()
             with self.send_lock:
                 self.conn.sendall(payload)
             if perf is not None:
                 perf["socket_seconds"] += time.perf_counter() - socket_started
-            if "bot_orders" in message:
-                try:
-                    self.bot_order_revision_sent = int(message.get("bot_order_revision", -1))
-                    self.bot_order_sent_at = time.monotonic()
-                except (TypeError, ValueError):
-                    pass
+            self._record_order_sent(order_revision)
             return True
         except (BrokenPipeError, ConnectionError, OSError) as error:
             if perf is not None:
@@ -427,13 +525,14 @@ class BattleState:
                 max_health=max(1, min(int(_finite_float(hello.get("max_health"), 1000)), 100000)),
             )
             self.players[player_id] = player
+            player.start_sender()
             return player, None
 
     def remove_player(self, player_id):
         with self.lock:
             player = self.players.pop(player_id, None)
             if player is not None:
-                player.connected = False
+                player.stop_sender()
             if player_id == self.bot_authority_id:
                 self._elect_bot_authority()
             reset = False
@@ -1468,6 +1567,14 @@ class ClientHandler(socketserver.BaseRequestHandler):
         server = self.server.game_server
         conn = self.request
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        try:
+            # Loading 29 vehicle models can pause the 0.8.2 receive thread for
+            # several seconds. Keep enough kernel headroom for the one in-flight
+            # snapshot while the application queue coalesces newer snapshots.
+            conn.setsockopt(
+                socket.SOL_SOCKET, socket.SO_SNDBUF, SERVER_SEND_BUFFER_BYTES)
+        except OSError:
+            pass
         conn.settimeout(10.0)
         player = None
         buffer = b""
@@ -1546,10 +1653,11 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     current_battle["round_id"],
                     current_battle["map"],
                 ))
-            # A half-second write timeout could evict a healthy old client during
-            # one expensive render/GC spike. Two seconds remains bounded below the
-            # HUD's lag threshold while tolerating short receive-buffer stalls.
-            conn.settimeout(2.0)
+            # This timeout applies to both recv and the dedicated sender thread.
+            # Snapshot coalescing bounds application memory and avoids stale-state
+            # buildup; the longer deadline only protects a healthy client during
+            # its observed 4-6 second synchronous model-loading pause.
+            conn.settimeout(SERVER_IO_TIMEOUT_SECONDS)
             while True:
                 try:
                     chunk = conn.recv(4096)
@@ -1713,11 +1821,22 @@ def run_server(host, port, map_name, max_players):
                     process_finished = time.process_time()
                     summary = perf_window.summary(tick_finished, process_finished)
                     stages = summary["stage_ms"]
+                    with state.lock:
+                        player_stats = [
+                            player.outbound_diagnostics()
+                            for player in state.players.values()
+                        ]
+                    pending_reliable = sum(
+                        item["pending_reliable"] for item in player_stats)
+                    pending_latest = sum(
+                        item["pending_latest"] for item in player_stats)
+                    coalesced = sum(item["coalesced"] for item in player_stats)
                     _server_log(
                         "SERVER PERF cpu_core=%.1f%% tick=%.1fHz avg=%.2fms p95=%.2fms "
                         "max=%.2fms overruns=%d late_max=%.2fms "
                         "stage=move:%.2f,plan:%.2f,nav:%.2f,snapshot:%.2f,diag:%.2f,dispatch:%.2f,events:%.2fms "
-                        "wire=encode:%.2f,socket:%.2fms messages=%.1f/s data=%.1fKiB/s" % (
+                        "wire=encode:%.2f,socket:%.2fms messages=%.1f/s data=%.1fKiB/s "
+                        "outbound=reliable:%d,latest:%d,coalesced:%d" % (
                             summary["cpu_percent"], summary["tick_hz"],
                             summary["tick_avg_ms"], summary["tick_p95_ms"],
                             summary["tick_max_ms"], summary["overruns"],
@@ -1727,7 +1846,8 @@ def run_server(host, port, map_name, max_players):
                             stages["recipients"], stages["events"],
                             stages["encode"], stages["socket"],
                             summary["messages_per_second"],
-                            summary["kilobytes_per_second"]))
+                            summary["kilobytes_per_second"],
+                            pending_reliable, pending_latest, coalesced))
                     perf_window.reset(tick_finished, process_finished)
             delay = next_tick - tick_finished
             if delay > 0:

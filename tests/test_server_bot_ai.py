@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 from lan_battle_server import (
@@ -675,6 +677,47 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertIn("SEND DROP id=1", output.getvalue())
         self.assertIn("ROOM RESET", output.getvalue())
 
+    def test_async_sender_coalesces_snapshots_while_receiver_is_paused(self):
+        class PausedConnection(object):
+            def __init__(self):
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.sent = []
+
+            def sendall(self, payload):
+                self.entered.set()
+                if not self.release.wait(2.0):
+                    raise TimeoutError("test receiver remained paused")
+                self.sent.append(json.loads(payload.decode("utf-8")))
+
+        connection = PausedConnection()
+        player = Player(1, connection, ("127.0.0.1", 0))
+        player.start_sender()
+        try:
+            self.assertTrue(player.send({"type": "snapshot", "server_tick": 1}))
+            self.assertTrue(connection.entered.wait(1.0))
+            for tick in range(2, 51):
+                self.assertTrue(player.send({
+                    "type": "snapshot", "server_tick": tick,
+                }))
+            with player.outbound_lock:
+                self.assertEqual(1, len(player.outbound_latest))
+                self.assertFalse(player.outbound_reliable)
+                self.assertEqual(48, player.outbound_coalesced)
+            self.assertTrue(player.connected)
+
+            connection.release.set()
+            deadline = time.monotonic() + 1.0
+            while len(connection.sent) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual([1, 50], [
+                message["server_tick"] for message in connection.sent
+            ])
+            self.assertTrue(player.connected)
+        finally:
+            connection.release.set()
+            player.stop_sender()
+
     def test_visible_enemy_overrides_route_until_contact_expires(self):
         planner = BotPlanner()
         manifest = _manifest()
@@ -977,6 +1020,7 @@ class ServerBotPlannerTests(unittest.TestCase):
                     b'{"type":"leave"}\n',
                 ]
                 self.messages = []
+                self.pong_sent = threading.Event()
 
             def setsockopt(self, *unused):
                 pass
@@ -985,10 +1029,15 @@ class ServerBotPlannerTests(unittest.TestCase):
                 pass
 
             def recv(self, unused_size):
+                if self.chunks and self.chunks[0] == b'{"type":"leave"}\n':
+                    self.pong_sent.wait(1.0)
                 return self.chunks.pop(0) if self.chunks else b""
 
             def sendall(self, payload):
-                self.messages.append(json.loads(payload.decode("utf-8")))
+                message = json.loads(payload.decode("utf-8"))
+                self.messages.append(message)
+                if message.get("type") == "pong":
+                    self.pong_sent.set()
 
             def close(self):
                 pass
