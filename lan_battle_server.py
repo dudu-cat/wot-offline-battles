@@ -31,14 +31,14 @@ from server_bot_navigation import BotPathResolver
 
 
 PROTOCOL_VERSION = 8
-CLIENT_BUILD = "1.8.33-native-experimental-20260811"
+CLIENT_BUILD = "1.8.34-native-experimental-20260811"
 TICK_HZ = 30.0
 SERVER_PERF_LOG_SECONDS = 5.0
 PREBATTLE_COUNTDOWN_SECONDS = 30.0
 BATTLE_DURATION_SECONDS = 900.0
 MAX_LINE_BYTES = 256 * 1024
 SERVER_IO_TIMEOUT_SECONDS = 15.0
-SERVER_SEND_BUFFER_BYTES = 1024 * 1024
+SERVER_SEND_BUFFER_BYTES = 128 * 1024
 DEFAULT_MAP = "server_random"
 MAP_POOL = (
     "01_karelia",
@@ -224,6 +224,9 @@ class Player:
     outbound_latest: dict = field(default_factory=dict, repr=False)
     outbound_seq: int = field(default=0, init=False, repr=False)
     outbound_coalesced: int = field(default=0, init=False, repr=False)
+    outbound_inflight_type: str = field(default="", init=False, repr=False)
+    outbound_inflight_started: float = field(default=0.0, init=False, repr=False)
+    outbound_send_max_seconds: float = field(default=0.0, init=False, repr=False)
     sender_thread: Optional[threading.Thread] = field(default=None, init=False, repr=False)
     sender_started: bool = field(default=False, init=False, repr=False)
 
@@ -279,7 +282,11 @@ class Player:
                     continue
                 self.outbound_event.wait(0.1)
                 continue
-            unused_seq, payload, order_revision = item
+            unused_seq, payload, order_revision, message_type = item
+            send_started = time.monotonic()
+            with self.outbound_lock:
+                self.outbound_inflight_type = message_type
+                self.outbound_inflight_started = send_started
             try:
                 with self.send_lock:
                     self.conn.sendall(payload)
@@ -288,6 +295,13 @@ class Player:
                 self.last_send_error = "%s: %s" % (type(error).__name__, error)
                 self.connected = False
                 break
+            finally:
+                elapsed = time.monotonic() - send_started
+                with self.outbound_lock:
+                    self.outbound_send_max_seconds = max(
+                        self.outbound_send_max_seconds, elapsed)
+                    self.outbound_inflight_type = ""
+                    self.outbound_inflight_started = 0.0
         with self.outbound_lock:
             self.outbound_reliable[:] = []
             self.outbound_latest.clear()
@@ -296,11 +310,19 @@ class Player:
     def outbound_diagnostics(self):
         """Return a cheap, consistent snapshot for the five-second perf log."""
         with self.outbound_lock:
-            return {
+            now = time.monotonic()
+            result = {
                 "pending_reliable": len(self.outbound_reliable),
                 "pending_latest": len(self.outbound_latest),
                 "coalesced": self.outbound_coalesced,
+                "inflight_type": self.outbound_inflight_type,
+                "inflight_age_ms": (
+                    max(0.0, (now - self.outbound_inflight_started) * 1000.0)
+                    if self.outbound_inflight_started > 0.0 else 0.0),
+                "send_max_ms": self.outbound_send_max_seconds * 1000.0,
             }
+            self.outbound_send_max_seconds = 0.0
+            return result
 
     def send(self, message, perf=None):
         if not self.connected:
@@ -323,7 +345,10 @@ class Player:
         if self.sender_started:
             with self.outbound_lock:
                 self.outbound_seq += 1
-                item = (self.outbound_seq, payload, order_revision)
+                item = (
+                    self.outbound_seq, payload, order_revision,
+                    str(message.get("type") or "unknown"),
+                )
                 if message.get("type") == "snapshot":
                     if "snapshot" in self.outbound_latest:
                         self.outbound_coalesced += 1
@@ -504,7 +529,7 @@ class BattleState:
     def add_player(self, conn, address, hello):
         with self.lock:
             if len(self.players) >= self.max_players:
-                return None, "full"
+                return None, "full", None
             player_id = self.next_id
             self.next_id += 1
             team, slot = self._assign_team_and_slot()
@@ -526,10 +551,50 @@ class BattleState:
             )
             self.players[player_id] = player
             player.start_sender()
-            return player, None
+            welcome = {
+                "type": "welcome",
+                "protocol": PROTOCOL_VERSION,
+                "client_build": CLIENT_BUILD,
+                "player_id": player.player_id,
+                "name": player.name,
+                "vehicle": player.vehicle,
+                "team": player.team,
+                "slot": player.slot,
+                "max_health": player.max_health,
+                "map": self.map_name,
+                "map_pool": list(MAP_POOL),
+                "phase": self.phase,
+                "round_id": self.round_id,
+                "spawn": {
+                    "x": player.x, "y": player.y,
+                    "z": player.z, "yaw": player.yaw,
+                },
+                "bot_authority_id": self.bot_authority_id,
+            }
+            if not player.send(welcome):
+                self.remove_player(player.player_id, expected_player=player)
+                return None, "send_failed", None
+            # Publish the exact room and current-battle state before releasing
+            # the lock. A tick or concurrent start can only enqueue after this
+            # connection's welcome/roster/battle bootstrap sequence.
+            self.broadcast_lobby()
+            if self.players.get(player.player_id) is not player:
+                return None, "send_failed", None
+            current_battle = self.current_battle_message()
+            if current_battle is not None and not player.send(current_battle):
+                self.remove_player(player.player_id, expected_player=player)
+                self.broadcast_lobby()
+                return None, "send_failed", None
+            return player, None, current_battle
 
-    def remove_player(self, player_id):
+    def remove_player(self, player_id, expected_player=None):
         with self.lock:
+            player = self.players.get(player_id)
+            # Player ids restart at one after a room reset. A delayed sender or
+            # handler from the previous round must never remove the new object
+            # that reused its numeric id.
+            if expected_player is not None and player is not expected_player:
+                return None, False
             player = self.players.pop(player_id, None)
             if player is not None:
                 player.stop_sender()
@@ -582,6 +647,7 @@ class BattleState:
                     "2": {"points": 0, "stopped": False, "contributors": {}, "cursor": 0},
                 }}
                 self.battle_result = None
+                self.pending_events = []
                 reset = True
             return player, reset
 
@@ -597,6 +663,26 @@ class BattleState:
                 "bot_authority_id": self.bot_authority_id,
                 "players": [self._public_player(p) for p in self.players.values() if p.connected],
             }
+
+    def broadcast_lobby(self):
+        """Queue one internally consistent roster for the current players."""
+        with self.lock:
+            while True:
+                message = self.lobby_message()
+                players = list(self.players.values())
+                failed = []
+                for player in players:
+                    if not player.send(message):
+                        failed.append(player)
+                if not failed:
+                    return
+                removed_any = False
+                for player in failed:
+                    removed, unused_reset = self.remove_player(
+                        player.player_id, expected_player=player)
+                    removed_any = removed_any or removed is not None
+                if not removed_any:
+                    return
 
     def request_start(self, player_id, requested_map=None):
         with self.lock:
@@ -1360,6 +1446,7 @@ class BattleState:
             snapshot = {
                 "type": "snapshot",
                 "protocol": PROTOCOL_VERSION,
+                "round_id": self.round_id,
                 "server_tick": self.tick,
                 "map": self.map_name,
                 "bot_authority_id": self.bot_authority_id,
@@ -1375,6 +1462,10 @@ class BattleState:
             authority = self.players.get(self.bot_authority_id)
             authority_order_ack = (
                 int(authority.bot_order_revision_ack) if authority is not None else -1)
+            dispatch_round_id = self.round_id
+            dispatch_server_tick = self.tick
+            dispatch_order_revision = int(self.bot_orders["revision"])
+            dispatch_order_body = list(self.bot_orders["orders"])
             metrics["snapshot_seconds"] = time.perf_counter() - stage_started
         stage_started = time.perf_counter()
         if ai_debug is not None:
@@ -1468,34 +1559,12 @@ class BattleState:
                     server_navigation.get("max_plan_ms", 0.0),
                     server_navigation.get("paths", 0)))
         metrics["diagnostics_seconds"] += time.perf_counter() - stage_started
+        # Reliable events are the causal acknowledgement for health and combat
+        # changes already reflected in this tick's level-triggered snapshot. Queue
+        # them first so a receive poll can never apply the snapshot delta before a
+        # client-simulated health acknowledgement and subtract the same loss twice.
         stage_started = time.perf_counter()
         failed_recipients = []
-        for player in recipients:
-            outgoing = snapshot
-            revision = int(self.bot_orders["revision"])
-            needs_order_body = (
-                player.bot_order_revision_ack != revision and
-                (player.bot_order_revision_sent != revision or
-                 now - player.bot_order_sent_at >= 0.25))
-            if needs_order_body:
-                outgoing = dict(snapshot)
-                outgoing["bot_orders"] = list(self.bot_orders["orders"])
-            if not player.send(outgoing, metrics):
-                failed_recipients.append(player)
-        for player in failed_recipients:
-            removed, reset = self.remove_player(player.player_id)
-            if removed is not None:
-                _server_log(
-                    "SEND DROP id=%d name=%s remaining=%d error=%s" % (
-                        removed.player_id, removed.name, len(self.players),
-                        removed.last_send_error or "unknown send failure"))
-            if reset:
-                _server_log("ROOM RESET round=%d map=%s after send failure" % (
-                    self.round_id, self.map_name))
-        if failed_recipients:
-            self.broadcast(self.lobby_message())
-        metrics["recipients_seconds"] = time.perf_counter() - stage_started
-        stage_started = time.perf_counter()
         if events:
             for event in events:
                 if event.get("kind") == "shot":
@@ -1523,9 +1592,44 @@ class BattleState:
                 elif event.get("kind") == "battle_result":
                     _server_log("BATTLE RESULT winner=%s reason=%s base_team=%s" % (
                         event.get("winner"), event.get("reason"), event.get("base_team")))
-            self.broadcast(
-                {"type": "events", "server_tick": self.tick, "events": events}, metrics)
+            event_message = {
+                "type": "events", "round_id": dispatch_round_id,
+                "server_tick": dispatch_server_tick, "events": events,
+            }
+            for player in recipients:
+                if not player.send(event_message, metrics):
+                    failed_recipients.append(player)
         metrics["events_seconds"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
+        failed_objects = set(id(player) for player in failed_recipients)
+        for player in recipients:
+            if id(player) in failed_objects:
+                continue
+            outgoing = snapshot
+            revision = dispatch_order_revision
+            needs_order_body = (
+                player.bot_order_revision_ack != revision and
+                (player.bot_order_revision_sent != revision or
+                 now - player.bot_order_sent_at >= 0.25))
+            if needs_order_body:
+                outgoing = dict(snapshot)
+                outgoing["bot_orders"] = dispatch_order_body
+            if not player.send(outgoing, metrics):
+                failed_recipients.append(player)
+        for player in failed_recipients:
+            removed, reset = self.remove_player(
+                player.player_id, expected_player=player)
+            if removed is not None:
+                _server_log(
+                    "SEND DROP id=%d name=%s remaining=%d error=%s" % (
+                        removed.player_id, removed.name, len(self.players),
+                        removed.last_send_error or "unknown send failure"))
+            if reset:
+                _server_log("ROOM RESET round=%d map=%s after send failure" % (
+                    self.round_id, self.map_name))
+        if failed_recipients:
+            self.broadcast_lobby()
+        metrics["recipients_seconds"] = time.perf_counter() - stage_started
         return metrics
 
     @staticmethod
@@ -1559,7 +1663,7 @@ class BattleState:
             players = list(self.players.values())
         for player in players:
             if not player.send(message, perf):
-                self.remove_player(player.player_id)
+                self.remove_player(player.player_id, expected_player=player)
 
 
 class ClientHandler(socketserver.BaseRequestHandler):
@@ -1568,17 +1672,27 @@ class ClientHandler(socketserver.BaseRequestHandler):
         conn = self.request
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         try:
-            # Loading 29 vehicle models can pause the 0.8.2 receive thread for
-            # several seconds. Keep enough kernel headroom for the one in-flight
-            # snapshot while the application queue coalesces newer snapshots.
+            # Bound kernel head-of-line backlog for reliable pong/combat messages.
+            # During a client loading pause the sender may still block on one
+            # in-flight write, while the application queue keeps only the newest
+            # snapshot until the receive thread resumes.
             conn.setsockopt(
                 socket.SOL_SOCKET, socket.SO_SNDBUF, SERVER_SEND_BUFFER_BYTES)
         except OSError:
             pass
+        try:
+            actual_send_buffer = int(conn.getsockopt(
+                socket.SOL_SOCKET, socket.SO_SNDBUF))
+        except (AttributeError, OSError, TypeError, ValueError):
+            actual_send_buffer = None
         conn.settimeout(10.0)
         player = None
         buffer = b""
-        _server_log("TCP connection from %s:%d" % self.client_address)
+        _server_log(
+            "TCP connection from %s:%d sndbuf=%s requested=%dB" % (
+                self.client_address[0], self.client_address[1],
+                "%dB" % actual_send_buffer if actual_send_buffer is not None else "unknown",
+                SERVER_SEND_BUFFER_BYTES))
         try:
             while b"\n" not in buffer and len(buffer) < MAX_LINE_BYTES:
                 chunk = conn.recv(4096)
@@ -1609,9 +1723,11 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         self.client_address[0], self.client_address[1],
                         received_build, CLIENT_BUILD))
                 return
-            player, join_error = server.state.add_player(conn, self.client_address, hello)
+            player, join_error, current_battle = server.state.add_player(
+                conn, self.client_address, hello)
             if player is None:
-                message = "server is full"
+                message = ("server is full" if join_error == "full" else
+                           "connection bootstrap failed")
                 self._send_raw(conn, {"type": "error", "code": join_error, "message": message})
                 _server_log("Rejected %s:%d: %s" % (self.client_address[0], self.client_address[1], message))
                 return
@@ -1627,27 +1743,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                 len(server.state.players),
                 received_build,
             ))
-            player.send({
-                "type": "welcome",
-                "protocol": PROTOCOL_VERSION,
-                "client_build": CLIENT_BUILD,
-                "player_id": player.player_id,
-                "name": player.name,
-                "vehicle": player.vehicle,
-                "team": player.team,
-                "slot": player.slot,
-                "max_health": player.max_health,
-                "map": server.state.map_name,
-                "map_pool": list(MAP_POOL),
-                "phase": server.state.phase,
-                "round_id": server.state.round_id,
-                "spawn": {"x": player.x, "y": player.y, "z": player.z, "yaw": player.yaw},
-                "bot_authority_id": server.state.bot_authority_id,
-            })
-            server.state.broadcast(server.state.lobby_message())
-            current_battle = server.state.current_battle_message()
             if current_battle is not None:
-                player.send(current_battle)
                 _server_log("LATE JOIN id=%d round=%d map=%s" % (
                     player.player_id,
                     current_battle["round_id"],
@@ -1679,78 +1775,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     message = json.loads(line.decode("utf-8"))
                     if not isinstance(message, dict):
                         continue
-                    if message.get("type") == "input":
-                        server.state.update_input(player.player_id, message)
-                    elif message.get("type") == "hit_report":
-                        if not server.state.report_hit(player.player_id, message):
-                            _server_log("HIT REPORT rejected attacker=%d target=%s seq=%s" % (
-                                player.player_id, message.get("target"), message.get("shot_seq")))
-                    elif message.get("type") == "bot_manifest":
-                        if server.state.update_bot_manifest(player.player_id, message):
-                            routed = sum(1 for entry in server.state.bot_manifest
-                                         if entry.get("route", {}).get("waypoints"))
-                            lanes = {}
-                            for entry in server.state.bot_manifest:
-                                route_id = str(entry.get("route", {}).get("id") or "none")
-                                key = "t%d:%s" % (int(entry.get("team", 0)), route_id)
-                                lanes[key] = lanes.get(key, 0) + 1
-                            lane_text = ",".join("%s=%d" % item
-                                                     for item in sorted(lanes.items()))
-                            _server_log("BOT MANIFEST authority=%d bots=%d routes=%d lanes=%s" % (
-                                player.player_id, len(server.state.bot_manifest), routed,
-                                lane_text or "none"))
-                        else:
-                            _server_log("BOT MANIFEST rejected sender=%d" % player.player_id)
-                    elif message.get("type") == "bot_state":
-                        server.state.update_bot_states(player.player_id, message)
-                    elif message.get("type") == "bot_observation":
-                        server.state.update_bot_observation(player.player_id, message)
-                    elif message.get("type") == "bot_order_ack":
-                        server.state.acknowledge_bot_orders(player.player_id, message)
-                    elif message.get("type") == "bot_order_resync":
-                        if server.state.request_bot_order_resync(player.player_id):
-                            _server_log("BOT ORDERS RESYNC player_id=%d" % player.player_id)
-                    elif message.get("type") == "bot_hit_report":
-                        if not server.state.report_bot_hit(player.player_id, message):
-                            _server_log("BOT HIT rejected attacker=%d target=%s seq=%s" % (
-                                player.player_id, message.get("target"), message.get("shot_seq")))
-                    elif message.get("type") == "bot_human_hit":
-                        if not server.state.report_bot_human_hit(player.player_id, message):
-                            _server_log("BOT HUMAN HIT rejected authority=%d target=%s" % (
-                                player.player_id, message.get("target")))
-                    elif message.get("type") == "rules_state":
-                        server.state.update_rules(player.player_id, message)
-                    elif message.get("type") == "battle_result":
-                        if not server.state.report_battle_result(player.player_id, message):
-                            _server_log("BATTLE RESULT rejected sender=%d" % player.player_id)
-                    elif message.get("type") == "start_battle":
-                        start_message, start_error = server.state.request_start(
-                            player.player_id, message.get("map"))
-                        if start_message is None:
-                            player.send({
-                                "type": "start_denied",
-                                "code": start_error,
-                                "players": len(server.state.players),
-                            })
-                            _server_log("START denied for id=%d: %s" % (player.player_id, start_error))
-                        else:
-                            _server_log("BATTLE START round=%d map=%s players=%d requested_by=%s countdown=%.0fs duration=%.0fs" % (
-                                start_message["round_id"],
-                                start_message["map"],
-                                len(start_message["players"]),
-                                player.name,
-                                PREBATTLE_COUNTDOWN_SECONDS,
-                                BATTLE_DURATION_SECONDS,
-                            ))
-                            server.state.broadcast(start_message)
-                    elif message.get("type") == "ping":
-                        player.send({
-                            "type": "pong",
-                            "seq": message.get("seq"),
-                            "client_time": message.get("client_time"),
-                            "server_time": time.time(),
-                        })
-                    elif message.get("type") == "leave":
+                    if not self._dispatch_player_message(server, player, message):
                         return
         except (ValueError, UnicodeError, json.JSONDecodeError) as error:
             _server_log("Invalid message from %s:%d: %s" % (self.client_address[0], self.client_address[1], error))
@@ -1758,17 +1783,103 @@ class ClientHandler(socketserver.BaseRequestHandler):
             _server_log("Connection error from %s:%d: %s" % (self.client_address[0], self.client_address[1], error))
         finally:
             if player is not None:
-                removed, reset = server.state.remove_player(player.player_id)
+                removed, reset = server.state.remove_player(
+                    player.player_id, expected_player=player)
                 if removed is not None:
                     _server_log("LEAVE id=%d name=%s remaining=%d" % (
                         removed.player_id, removed.name, len(server.state.players)))
                 if reset:
                     _server_log("ROOM RESET round=%d map=%s" % (server.state.round_id, server.state.map_name))
-                server.state.broadcast(server.state.lobby_message())
+                if removed is not None:
+                    server.state.broadcast_lobby()
             try:
                 conn.close()
             except OSError:
                 pass
+
+    @staticmethod
+    def _dispatch_player_message(server, player, message):
+        """Dispatch only while this exact connection owns its numeric id."""
+        state = server.state
+        with state.lock:
+            if state.players.get(player.player_id) is not player:
+                return False
+            message_type = message.get("type")
+            if message_type == "input":
+                state.update_input(player.player_id, message)
+            elif message_type == "hit_report":
+                if not state.report_hit(player.player_id, message):
+                    _server_log("HIT REPORT rejected attacker=%d target=%s seq=%s" % (
+                        player.player_id, message.get("target"), message.get("shot_seq")))
+            elif message_type == "bot_manifest":
+                if state.update_bot_manifest(player.player_id, message):
+                    routed = sum(1 for entry in state.bot_manifest
+                                 if entry.get("route", {}).get("waypoints"))
+                    lanes = {}
+                    for entry in state.bot_manifest:
+                        route_id = str(entry.get("route", {}).get("id") or "none")
+                        key = "t%d:%s" % (int(entry.get("team", 0)), route_id)
+                        lanes[key] = lanes.get(key, 0) + 1
+                    lane_text = ",".join("%s=%d" % item
+                                             for item in sorted(lanes.items()))
+                    _server_log("BOT MANIFEST authority=%d bots=%d routes=%d lanes=%s" % (
+                        player.player_id, len(state.bot_manifest), routed,
+                        lane_text or "none"))
+                else:
+                    _server_log("BOT MANIFEST rejected sender=%d" % player.player_id)
+            elif message_type == "bot_state":
+                state.update_bot_states(player.player_id, message)
+            elif message_type == "bot_observation":
+                state.update_bot_observation(player.player_id, message)
+            elif message_type == "bot_order_ack":
+                state.acknowledge_bot_orders(player.player_id, message)
+            elif message_type == "bot_order_resync":
+                if state.request_bot_order_resync(player.player_id):
+                    _server_log("BOT ORDERS RESYNC player_id=%d" % player.player_id)
+            elif message_type == "bot_hit_report":
+                if not state.report_bot_hit(player.player_id, message):
+                    _server_log("BOT HIT rejected attacker=%d target=%s seq=%s" % (
+                        player.player_id, message.get("target"), message.get("shot_seq")))
+            elif message_type == "bot_human_hit":
+                if not state.report_bot_human_hit(player.player_id, message):
+                    _server_log("BOT HUMAN HIT rejected authority=%d target=%s" % (
+                        player.player_id, message.get("target")))
+            elif message_type == "rules_state":
+                state.update_rules(player.player_id, message)
+            elif message_type == "battle_result":
+                if not state.report_battle_result(player.player_id, message):
+                    _server_log("BATTLE RESULT rejected sender=%d" % player.player_id)
+            elif message_type == "start_battle":
+                start_message, start_error = state.request_start(
+                    player.player_id, message.get("map"))
+                if start_message is None:
+                    player.send({
+                        "type": "start_denied",
+                        "code": start_error,
+                        "players": len(state.players),
+                    })
+                    _server_log("START denied for id=%d: %s" % (
+                        player.player_id, start_error))
+                else:
+                    _server_log("BATTLE START round=%d map=%s players=%d requested_by=%s countdown=%.0fs duration=%.0fs" % (
+                        start_message["round_id"],
+                        start_message["map"],
+                        len(start_message["players"]),
+                        player.name,
+                        PREBATTLE_COUNTDOWN_SECONDS,
+                        BATTLE_DURATION_SECONDS,
+                    ))
+                    state.broadcast(start_message)
+            elif message_type == "ping":
+                player.send({
+                    "type": "pong",
+                    "seq": message.get("seq"),
+                    "client_time": message.get("client_time"),
+                    "server_time": time.time(),
+                })
+            elif message_type == "leave":
+                return False
+            return True
 
     @staticmethod
     def _send_raw(conn, message):
@@ -1831,12 +1942,19 @@ def run_server(host, port, map_name, max_players):
                     pending_latest = sum(
                         item["pending_latest"] for item in player_stats)
                     coalesced = sum(item["coalesced"] for item in player_stats)
+                    inflight = sum(
+                        1 for item in player_stats if item["inflight_type"])
+                    inflight_age_max = max(
+                        [item["inflight_age_ms"] for item in player_stats] or [0.0])
+                    send_max = max(
+                        [item["send_max_ms"] for item in player_stats] or [0.0])
                     _server_log(
                         "SERVER PERF cpu_core=%.1f%% tick=%.1fHz avg=%.2fms p95=%.2fms "
                         "max=%.2fms overruns=%d late_max=%.2fms "
                         "stage=move:%.2f,plan:%.2f,nav:%.2f,snapshot:%.2f,diag:%.2f,dispatch:%.2f,events:%.2fms "
                         "wire=encode:%.2f,socket:%.2fms messages=%.1f/s data=%.1fKiB/s "
-                        "outbound=reliable:%d,latest:%d,coalesced:%d" % (
+                        "outbound=reliable:%d,latest:%d,coalesced:%d,"
+                        "inflight:%d,age_max:%.0fms,send_max:%.0fms" % (
                             summary["cpu_percent"], summary["tick_hz"],
                             summary["tick_avg_ms"], summary["tick_p95_ms"],
                             summary["tick_max_ms"], summary["overruns"],
@@ -1847,7 +1965,8 @@ def run_server(host, port, map_name, max_players):
                             stages["encode"], stages["socket"],
                             summary["messages_per_second"],
                             summary["kilobytes_per_second"],
-                            pending_reliable, pending_latest, coalesced))
+                            pending_reliable, pending_latest, coalesced,
+                            inflight, inflight_age_max, send_max))
                     perf_window.reset(tick_finished, process_finished)
             delay = next_tick - tick_finished
             if delay > 0:

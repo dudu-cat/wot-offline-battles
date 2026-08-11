@@ -4,6 +4,7 @@ import io
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,7 @@ import unittest
 
 from lan_battle_server import (
     BattleState, CLIENT_BUILD, ClientHandler, Player, PROTOCOL_VERSION,
+    SERVER_SEND_BUFFER_BYTES,
 )
 from server_bot_ai import BotPlanner
 
@@ -336,6 +338,310 @@ class ServerBotPlannerTests(unittest.TestCase):
 
         self.assertIn("bot_orders", connection.messages[0])
         self.assertNotIn("bot_orders", connection.messages[1])
+
+    def test_health_ack_event_is_sent_before_its_canonical_snapshot(self):
+        class CaptureConnection(object):
+            def __init__(self):
+                self.messages = []
+
+            def sendall(self, payload):
+                self.messages.append(json.loads(payload.decode("utf-8")))
+
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        connection = CaptureConnection()
+        player = Player(
+            1, connection, ("127.0.0.1", 0), health=880, max_health=880,
+        )
+        state.players[1] = player
+        state._apply_reported_health(player, 800)
+
+        state.tick_once(0.05)
+
+        self.assertEqual(["events", "snapshot"], [
+            message["type"] for message in connection.messages
+        ])
+        self.assertEqual("client_simulation", connection.messages[0]["events"][0]["source"])
+        self.assertEqual(state.round_id, connection.messages[0]["round_id"])
+        self.assertEqual(800, connection.messages[1]["players"][0]["health"])
+        self.assertEqual(state.round_id, connection.messages[1]["round_id"])
+
+    def test_room_reset_cannot_deliver_old_round_events_to_reused_player_id(self):
+        class CaptureConnection(object):
+            def __init__(self):
+                self.messages = []
+
+            def sendall(self, payload):
+                self.messages.append(json.loads(payload.decode("utf-8")))
+
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        state.players[1] = Player(
+            1, None, ("127.0.0.1", 0), health=0, max_health=880,
+            alive=False,
+        )
+        state.pending_events = [{
+            "kind": "health", "target": 1, "damage": 880,
+            "health": 0, "dead": True, "source": "old_round",
+        }]
+
+        removed, reset = state.remove_player(1)
+
+        self.assertIsNotNone(removed)
+        self.assertTrue(reset)
+        self.assertEqual([], state.pending_events)
+        self.assertEqual(2, state.round_id)
+
+        connection = CaptureConnection()
+        state.players[1] = Player(
+            1, connection, ("127.0.0.1", 0), health=880, max_health=880,
+        )
+        start, error = state.request_start(1, "04_himmelsdorf")
+        self.assertIsNone(error)
+        self.assertEqual(2, start["round_id"])
+        state.tick_once(0.05)
+
+        events = [event for message in connection.messages
+                  if message.get("type") == "events"
+                  for event in message.get("events", [])]
+        self.assertFalse(any(event.get("kind") == "health" for event in events))
+        snapshot = next(message for message in connection.messages
+                        if message.get("type") == "snapshot")
+        self.assertEqual(880, snapshot["players"][0]["health"])
+
+    def test_inflight_old_round_dispatch_cannot_target_or_remove_reused_id(self):
+        import lan_battle_server as server_module
+
+        class CaptureConnection(object):
+            def __init__(self):
+                self.messages = []
+
+            def sendall(self, payload):
+                self.messages.append(json.loads(payload.decode("utf-8")))
+
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        old_connection = CaptureConnection()
+        old_player = Player(
+            1, old_connection, ("127.0.0.1", 1),
+            health=0, max_health=880, alive=False,
+        )
+        state.players[1] = old_player
+        state.pending_events = [{
+            "kind": "health", "target": 1, "damage": 880,
+            "health": 0, "dead": True, "source": "old_round",
+        }]
+        new_connection = CaptureConnection()
+        swapped = []
+        original_log = server_module._server_log
+
+        def swap_round_after_capture(message):
+            if swapped or not message.startswith("HEALTH target=1"):
+                return
+            removed, reset = state.remove_player(
+                1, expected_player=old_player)
+            self.assertIs(removed, old_player)
+            self.assertTrue(reset)
+            new_player = Player(
+                1, new_connection, ("127.0.0.1", 2),
+                health=880, max_health=880,
+            )
+            state.players[1] = new_player
+            swapped.append(new_player)
+
+        server_module._server_log = swap_round_after_capture
+        try:
+            state.tick_once(0.05)
+        finally:
+            server_module._server_log = original_log
+
+        self.assertEqual(1, len(swapped))
+        self.assertIs(swapped[0], state.players.get(1))
+        self.assertEqual(2, state.round_id)
+        self.assertFalse(any(
+            message.get("type") in ("events", "snapshot")
+            for message in new_connection.messages
+        ))
+        self.assertTrue(all(
+            message.get("round_id") == 2
+            for message in new_connection.messages
+        ))
+
+    def test_old_handler_cannot_dispatch_input_or_start_to_reused_player_id(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        state.round_id = 2
+        old_player = Player(
+            1, None, ("127.0.0.1", 1), x=1.0, z=1.0,
+        )
+        new_player = Player(
+            1, None, ("127.0.0.1", 2), x=2.0, z=2.0,
+        )
+        state.players[1] = new_player
+        server = type("GameServer", (), {"state": state})()
+
+        self.assertFalse(ClientHandler._dispatch_player_message(
+            server, old_player, {
+                "type": "input", "x": 99.0, "z": 98.0,
+                "reported_health": 0,
+            },
+        ))
+        self.assertFalse(ClientHandler._dispatch_player_message(
+            server, old_player, {
+                "type": "start_battle", "map": "04_himmelsdorf",
+            },
+        ))
+
+        self.assertEqual((2.0, 2.0), (new_player.x, new_player.z))
+        self.assertEqual(1000, new_player.health)
+        self.assertEqual("waiting", state.phase)
+        self.assertEqual([], state.pending_events)
+        self.assertEqual(2, state.round_id)
+
+    def test_lobby_broadcast_is_atomic_with_battle_start(self):
+        class CaptureConnection(object):
+            def __init__(self):
+                self.messages = []
+
+            def sendall(self, payload):
+                self.messages.append(json.loads(payload.decode("utf-8")))
+
+        state = BattleState(map_name="04_himmelsdorf")
+        connection = CaptureConnection()
+        state.players[1] = Player(1, connection, ("127.0.0.1", 1))
+        lobby_entered = threading.Event()
+        release_lobby = threading.Event()
+        start_finished = threading.Event()
+        original_lobby_message = state.lobby_message
+
+        def paused_lobby_message():
+            lobby_entered.set()
+            release_lobby.wait(2.0)
+            return original_lobby_message()
+
+        def start_battle():
+            start_message, error = state.request_start(1, "04_himmelsdorf")
+            if error is None:
+                state.broadcast(start_message)
+            start_finished.set()
+
+        state.lobby_message = paused_lobby_message
+        lobby_thread = threading.Thread(target=state.broadcast_lobby)
+        start_thread = threading.Thread(target=start_battle)
+        try:
+            lobby_thread.start()
+            self.assertTrue(lobby_entered.wait(1.0))
+            start_thread.start()
+            time.sleep(0.02)
+            self.assertFalse(start_finished.is_set())
+            release_lobby.set()
+            lobby_thread.join(1.0)
+            start_thread.join(1.0)
+        finally:
+            release_lobby.set()
+            state.lobby_message = original_lobby_message
+
+        self.assertFalse(lobby_thread.is_alive())
+        self.assertFalse(start_thread.is_alive())
+        self.assertEqual(["roster", "battle_start"], [
+            message["type"] for message in connection.messages
+        ])
+        self.assertEqual("waiting", connection.messages[0]["phase"])
+        self.assertEqual(1, connection.messages[1]["round_id"])
+
+    def test_lobby_broadcast_republishes_after_send_failure(self):
+        class CaptureConnection(object):
+            def __init__(self, fail=False):
+                self.fail = fail
+                self.messages = []
+
+            def sendall(self, payload):
+                if self.fail:
+                    raise OSError("closed")
+                self.messages.append(json.loads(payload.decode("utf-8")))
+
+        state = BattleState(map_name="04_himmelsdorf")
+        good_connection = CaptureConnection()
+        state.players[1] = Player(
+            1, good_connection, ("127.0.0.1", 1), name="Good")
+        state.players[2] = Player(
+            2, CaptureConnection(fail=True), ("127.0.0.1", 2), name="Gone")
+
+        state.broadcast_lobby()
+
+        self.assertEqual([1], list(state.players))
+        self.assertEqual([2, 1], [
+            len(message["players"]) for message in good_connection.messages
+        ])
+        self.assertEqual("Good", good_connection.messages[-1]["players"][0]["name"])
+
+    def test_late_join_bootstrap_precedes_snapshot(self):
+        class CaptureConnection(object):
+            def __init__(self):
+                self.messages = []
+                self.lock = threading.Lock()
+
+            def sendall(self, payload):
+                message = json.loads(payload.decode("utf-8"))
+                with self.lock:
+                    self.messages.append(message)
+
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        connection = CaptureConnection()
+
+        player, error, current_battle = state.add_player(
+            connection, ("127.0.0.1", 1), {
+                "name": "Late", "vehicle": "ussr:T-34", "max_health": 880,
+            })
+        self.assertIsNone(error)
+        self.assertIsNotNone(current_battle)
+        state.tick_once(0.05)
+
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            with connection.lock:
+                kinds = [message["type"] for message in connection.messages]
+            if "snapshot" in kinds:
+                break
+            time.sleep(0.01)
+        self.assertEqual("welcome", kinds[0])
+        self.assertLess(kinds.index("roster"), kinds.index("battle_start"))
+        self.assertLess(kinds.index("battle_start"), kinds.index("snapshot"))
+        state.remove_player(player.player_id, expected_player=player)
+
+    def test_immediate_start_cannot_overtake_welcome(self):
+        class CaptureConnection(object):
+            def __init__(self):
+                self.messages = []
+                self.lock = threading.Lock()
+
+            def sendall(self, payload):
+                message = json.loads(payload.decode("utf-8"))
+                with self.lock:
+                    self.messages.append(message)
+
+        state = BattleState(map_name="04_himmelsdorf")
+        connection = CaptureConnection()
+        player, error, current_battle = state.add_player(
+            connection, ("127.0.0.1", 1), {
+                "name": "Starter", "vehicle": "ussr:T-34", "max_health": 880,
+            })
+        self.assertIsNone(error)
+        self.assertIsNone(current_battle)
+        start_message, error = state.request_start(1, "04_himmelsdorf")
+        self.assertIsNone(error)
+        state.broadcast(start_message)
+
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            with connection.lock:
+                kinds = [message["type"] for message in connection.messages]
+            if "battle_start" in kinds:
+                break
+            time.sleep(0.01)
+        self.assertEqual("welcome", kinds[0])
+        self.assertLess(kinds.index("roster"), kinds.index("battle_start"))
+        state.remove_player(player.player_id, expected_player=player)
 
     def test_unacknowledged_orders_are_retried_then_stop_after_ack(self):
         class CaptureConnection(object):
@@ -677,7 +983,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertIn("SEND DROP id=1", output.getvalue())
         self.assertIn("ROOM RESET", output.getvalue())
 
-    def test_async_sender_coalesces_snapshots_while_receiver_is_paused(self):
+    def test_async_sender_coalesces_snapshots_and_preserves_reliable_order(self):
         class PausedConnection(object):
             def __init__(self):
                 self.entered = threading.Event()
@@ -696,23 +1002,45 @@ class ServerBotPlannerTests(unittest.TestCase):
         try:
             self.assertTrue(player.send({"type": "snapshot", "server_tick": 1}))
             self.assertTrue(connection.entered.wait(1.0))
-            for tick in range(2, 51):
+            for tick in range(2, 11):
+                self.assertTrue(player.send({
+                    "type": "snapshot", "server_tick": tick,
+                }))
+            self.assertTrue(player.send({"type": "pong", "seq": 7}))
+            self.assertTrue(player.send({
+                "type": "events", "events": [{"kind": "bot_hit"}],
+            }))
+            for tick in range(11, 51):
                 self.assertTrue(player.send({
                     "type": "snapshot", "server_tick": tick,
                 }))
             with player.outbound_lock:
                 self.assertEqual(1, len(player.outbound_latest))
-                self.assertFalse(player.outbound_reliable)
+                self.assertEqual(2, len(player.outbound_reliable))
                 self.assertEqual(48, player.outbound_coalesced)
             self.assertTrue(player.connected)
+            blocked = player.outbound_diagnostics()
+            self.assertEqual("snapshot", blocked["inflight_type"])
+            self.assertGreaterEqual(blocked["inflight_age_ms"], 0.0)
 
             connection.release.set()
             deadline = time.monotonic() + 1.0
-            while len(connection.sent) < 2 and time.monotonic() < deadline:
+            while time.monotonic() < deadline:
+                with player.outbound_lock:
+                    inflight_type = player.outbound_inflight_type
+                if len(connection.sent) >= 4 and not inflight_type:
+                    break
                 time.sleep(0.01)
+            self.assertEqual(["snapshot", "pong", "events", "snapshot"], [
+                message["type"] for message in connection.sent
+            ])
             self.assertEqual([1, 50], [
                 message["server_tick"] for message in connection.sent
+                if message["type"] == "snapshot"
             ])
+            completed = player.outbound_diagnostics()
+            self.assertEqual("", completed["inflight_type"])
+            self.assertGreater(completed["send_max_ms"], 0.0)
             self.assertTrue(player.connected)
         finally:
             connection.release.set()
@@ -1021,9 +1349,16 @@ class ServerBotPlannerTests(unittest.TestCase):
                 ]
                 self.messages = []
                 self.pong_sent = threading.Event()
+                self.send_buffer = None
 
-            def setsockopt(self, *unused):
-                pass
+            def setsockopt(self, level, option, value):
+                if level == socket.SOL_SOCKET and option == socket.SO_SNDBUF:
+                    self.send_buffer = value
+
+            def getsockopt(self, level, option):
+                if level == socket.SOL_SOCKET and option == socket.SO_SNDBUF:
+                    return self.send_buffer
+                return 0
 
             def settimeout(self, *unused):
                 pass
@@ -1048,11 +1383,20 @@ class ServerBotPlannerTests(unittest.TestCase):
             "game_server": type("GameServer", (), {"state": state})(),
         })()
 
-        ClientHandler(connection, ("127.0.0.1", 12345), server)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            ClientHandler(connection, ("127.0.0.1", 12345), server)
 
         pong = [message for message in connection.messages
                 if message.get("type") == "pong"]
         self.assertEqual(9, pong[0]["seq"])
+        self.assertEqual(128 * 1024, SERVER_SEND_BUFFER_BYTES)
+        self.assertEqual(SERVER_SEND_BUFFER_BYTES, connection.send_buffer)
+        self.assertIn(
+            "sndbuf=%dB requested=%dB" % (
+                SERVER_SEND_BUFFER_BYTES, SERVER_SEND_BUFFER_BYTES),
+            output.getvalue(),
+        )
 
     def test_malformed_bot_collections_are_rejected_without_state_change(self):
         state = BattleState(map_name="04_himmelsdorf")

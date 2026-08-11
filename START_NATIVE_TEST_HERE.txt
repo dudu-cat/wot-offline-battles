@@ -9,15 +9,27 @@ render callback into the retail 0.8.2 WGVehicleFilter2/WGVehiclePhysics2 stack.
 Tactics, A*, aiming, combat, spotting, capture and LAN protocol remain in the
 existing implementation. LAN replicas remain snapshot-only.
 
-Version 1.8.33 aligns staged bot startup with the retail 0.8.2 vehicle path. It
-seeds once before physics attachment, marks the Entity root matrix as notModel,
-keeps WGVehiclePhysics2 dynamic, and validates/publishes the post-physics
-Entity matrix used by the root model. The pre-physics filter bodyMatrix remains
-in diagnostics but is no longer mistaken for the canonical model/network pose.
-Corrections are published only after a later Entity-matrix readback confirms
-them. An unconfirmed contact correction is logged and released without claiming
-the target was applied; an unconfirmed safety correction preserves its first
-known-safe target and keeps zero drive input until readback confirms it.
+Version 1.8.34 completes the retail native drive contract by writing both the
+WGVehicleFilter2 key state and WGVehiclePhysics2 movementSignals. It also feeds
+the confirmed post-physics Entity pose back to Filter::input every 100 ms so a
+client-only vehicle does not enter the retail six-second stale-sample path.
+Corrections are coalesced to one sample per real engine tick; an unconfirmed
+safety hold refreshes only its original safe target. The server bounds its TCP
+send buffer to 128 KiB to limit stale snapshot head-of-line backlog, and reports
+the actual buffer plus in-flight send age. The client tracks server-owned HP
+deltas so event/snapshot arrival order cannot apply one hit twice. Snapshots,
+events and bot-order coalescing are fenced by round so delayed first-battle
+traffic cannot mutate a second battle. Native-owned bodies are excluded from
+the Python collision-solver candidate map while the shared spatial index
+remains available for player/native contacts. Pristine vehicles bypass an
+otherwise redundant module-damage helper, and direct-fire tanks skip a BSP ray
+whose result was overwritten later in the same callback. Collision, terrain,
+spotting and native physics cadence are unchanged.
+
+Version 1.8.33 aligned staged bot startup with the retail 0.8.2 vehicle path.
+It seeds once before physics attachment, keeps WGVehiclePhysics2 dynamic, and
+publishes the post-physics Entity matrix used by the root model. Corrections
+are published only after a later Entity-matrix readback confirms them.
 
 Version 1.8.32 fixed the world-space Filter::input vehicleID contract. Version
 1.8.31 had removed the offline-unsafe ServerConnection syncGunAngles call.
@@ -51,9 +63,11 @@ First test
 
 A successful authority startup contains:
 
-    OfflineBattle BUILD 1.8.33-native-experimental (2026-08-11)
+    OfflineBattle BUILD 1.8.34-native-experimental (2026-08-11)
     NATIVE_FILTER_BRIDGE loaded
     NATIVE_BOT_PHYSICS prepared=29
+    NATIVE_BOT_PHYSICS drive active
+    NATIVE_BOT_PHYSICS heartbeat active
     NATIVE_BOT_PHYSICS active=29 prepared=29 failed=0
     NATIVE_BOT_PHYSICS startup_complete expected=29 attempted=29 prepared=29 active=29 failed=0 stopped=0
 
@@ -64,7 +78,8 @@ adjacent. A LAN replica must not emit prepared/active rows.
 Full acceptance checklist
 --------------------------
 
-- Forward, reverse and pivot commands respond without delayed or stuck input.
+- Forward, reverse and pivot commands respond without delayed or stuck input,
+  and native bots remain mobile for at least 15 seconds after activation.
 - Bots reach the real speed and climbing behavior of their vehicle descriptors.
 - Suspension follows uneven ground without Python pose snapping or teleporting.
 - Bots collide with walls and with each other without overlap or self-collision.
@@ -74,13 +89,18 @@ Full acceptance checklist
 - Water/cliff tactical guards still prevent deliberate bot suicides.
 - Models, markers, minimap icons, hit boxes and wrecks stay on one pose.
 - Shooting, damage, death, capture and the battle result remain synchronized.
+- LAN ping leaves the 999 ms clamp during normal play, and HP changes arrive
+  with the impact rather than about one second later.
 - A second battle and a map change complete without a crash or ghost entity.
 - Compare authority FPS against the stable Python-physics package on the same
   map and lineup. The experiment is useful only if behavior stays correct and
   the authority client materially approaches the 30 FPS target.
 
 For LAN, also verify that the authority is smooth, the replica can see every
-human and bot, and the replica does not construct local native bot bodies.
+human and bot, and the replica does not construct local native bot bodies. The
+server logs each connection's actual `sndbuf` and `requested=131072B`; send the
+line plus the `outbound` in-flight/age/send_max fields with the matching
+client/server logs if ping remains high.
 
 
 Failure behavior
@@ -93,7 +113,8 @@ deltas, distance, yaw delta and diagnostic bodyMatrix. The startup_complete row
 reports one terminal result for the full lineup. After a body is active, an
 impossible pose freezes that one body until battle cleanup. Unconfirmed contact
 corrections are diagnostic only; safety corrections retain their original safe
-target and hold input. The body never hot-switches to a second movement owner.
+target, hold input and keep that target's sample stream fresh. The body never
+hot-switches to a second movement owner.
 
 If the client crashes, hangs, repeatedly freezes bodies, or produces major
 pose disagreement, stop testing and keep python.log. Reinstall the previous

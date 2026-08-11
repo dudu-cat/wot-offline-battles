@@ -58,7 +58,7 @@ does not switch back to the legacy chase logic.
 
 Install
 -------
-For the native 1.8.33 experiment, read `START_NATIVE_TEST_HERE.txt` and then
+For the native 1.8.34 experiment, read `START_NATIVE_TEST_HERE.txt` and then
 open `START_HERE.txt`: close the game, delete or move aside the old
 `res_mods\0.8.2`, then drag the package's complete `0.8.2` folder into the
 game's `res_mods` folder. The package also includes double-clickable Windows
@@ -122,7 +122,7 @@ server roster. The server terminal prints one `JOIN` line per client. Use the
 clickable waiting-room panel to choose a map and click `START BATTLE`; the server
 broadcasts one start with that map to every client. LAN mode never starts a
 local random-map timer while it is waiting or after a failed connection. A
-client that connects after the round starts waits until the next round.
+client that connects after the round starts joins the current round.
 
 The first client in the battle is elected as map-simulation/rules authority.
 It uploads vehicle profiles, standard-battle route anchors and limited spotting

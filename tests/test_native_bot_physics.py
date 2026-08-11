@@ -194,7 +194,9 @@ class NativeBotPhysicsTest(unittest.TestCase):
 
         def seed_filter(vehicle_filter, timestamp, space_id, position,
                         direction):
-            self.bridge_calls.append((timestamp, space_id))
+            self.bridge_calls.append((
+                timestamp, space_id, tuple(position), tuple(direction)
+            ))
             if not self.bridge_ok:
                 return False
             if self.reject_post_attach_seed and vehicle_filter.physics is not None:
@@ -337,11 +339,182 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.assertTrue(self.native.is_active(self.mock))
         self.assertFalse(self.entity.isStarted)
         self.assertEqual((1, 1), self.entity.filter.input)
+        self.assertEqual(9, self.entity.wgPhysics.movementSignals)
         self.assertEqual(8.0, result["velocity"])
         self.assertEqual(0.2, result["turn_velocity"])
         self.assertAlmostEqual(-7.0, result["position"][2])
         self.assertEqual(1, len(self.bridge_calls))
         self.assertEqual(500.0, self.entity.wgPhysics.enginePower)
+        self.assertTrue(any(
+            "NATIVE_BOT_PHYSICS drive active" in message
+            for level, message in self.logs if level == "note"
+        ))
+
+    def test_drive_signs_map_to_retail_physics_signal_bits(self):
+        self.assertIsNotNone(self.activate())
+
+        self.native.step(
+            self.player, self.mock, self.descriptor, -1, -1, 7,
+            self.now + 0.10,
+        )
+
+        self.assertEqual((-1, -1), self.entity.filter.input)
+        self.assertEqual(6, self.entity.wgPhysics.movementSignals)
+
+        self.assertTrue(self.native.hold(self.mock))
+        self.assertEqual((0, 0), self.entity.filter.input)
+        self.assertEqual(0, self.entity.wgPhysics.movementSignals)
+
+    def test_active_filter_heartbeat_uses_post_physics_entity_pose(self):
+        self.assertIsNotNone(self.activate())
+        self.entity.matrix.translation = Vector3(14.0, 4.0, -6.0)
+        self.entity.matrix.yaw = 0.8
+        self.entity.matrix.pitch = 0.2
+        self.entity.matrix.roll = -0.1
+
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7,
+            self.now + self.native.FILTER_HEARTBEAT_SECONDS + 0.01,
+        )
+
+        self.assertEqual((14.0, 4.0, -6.0), result["position"])
+        self.assertEqual(2, len(self.bridge_calls))
+        self.assertEqual((14.0, 4.0, -6.0), self.bridge_calls[-1][2])
+        self.assertEqual((-0.1, 0.2, 0.8), self.bridge_calls[-1][3])
+        self.assertTrue(any(
+            "NATIVE_BOT_PHYSICS heartbeat active" in message
+            for level, message in self.logs if level == "note"
+        ))
+
+    def test_pending_correction_pauses_regular_filter_heartbeat(self):
+        self.defer_post_attach_seed = True
+        self.assertIsNotNone(self.activate())
+        self.assertTrue(self.native.reseed(
+            self.mock, (13.0, 3.0, -7.0), 0.7, 7,
+            self.now + 0.01,
+        ))
+        self.assertEqual(1, len(self.bridge_calls))
+
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 0, 7,
+            self.now + self.native.FILTER_HEARTBEAT_SECONDS + 0.20,
+        )
+        correction_call_count = len(self.bridge_calls)
+        self.assertEqual(2, correction_call_count)
+
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 0, 7,
+            self.now + self.native.FILTER_HEARTBEAT_SECONDS + 0.40,
+        )
+
+        self.assertEqual(correction_call_count, len(self.bridge_calls))
+
+    def test_filter_heartbeat_stays_fresh_beyond_retail_stale_window(self):
+        self.assertIsNotNone(self.activate())
+        activated_at = self.now
+
+        for sample in range(1, 62):
+            self.native.step(
+                self.player, self.mock, self.descriptor, 0, 0, 7,
+                activated_at + sample * 0.11,
+            )
+
+        heartbeat_times = [call[0] for call in self.bridge_calls[1:]]
+        self.assertGreater(heartbeat_times[-1] - activated_at, 6.0)
+        self.assertTrue(all(
+            later - earlier < 0.20
+            for earlier, later in zip(heartbeat_times, heartbeat_times[1:])
+        ))
+        self.assertTrue(self.native.is_active(self.mock))
+
+    def test_same_frame_inputs_coalesce_to_one_next_frame_safety_sample(self):
+        self.defer_post_attach_seed = True
+        self.assertIsNotNone(self.activate())
+        frame_time = self.now + self.native.FILTER_HEARTBEAT_SECONDS + 0.01
+        self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, frame_time,
+        )
+        frame_call_count = len(self.bridge_calls)
+        self.assertTrue(self.native.reseed(
+            self.mock, (13.0, 3.0, -7.0), 0.7, 7, frame_time,
+        ))
+        self.assertTrue(self.native.reseed(
+            self.mock, (12.0, 3.0, -7.0), 0.7, 7, frame_time,
+            safety=True,
+        ))
+
+        self.assertEqual(frame_call_count, len(self.bridge_calls))
+        state = getattr(self.mock, self.native.STATE_ATTR)
+        self.assertIsNone(state["pending_correction"])
+        self.assertTrue(state["queued_correction"]["safety"])
+        self.assertEqual(
+            (12.0, 3.0, -7.0),
+            state["queued_correction"]["position"],
+        )
+        self.assertEqual(0, self.entity.wgPhysics.movementSignals)
+
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 1, 7, frame_time,
+        )
+        self.assertEqual(frame_call_count, len(self.bridge_calls))
+        self.assertIsNotNone(state["queued_correction"])
+
+        next_frame = frame_time + 0.05
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 1, 7, next_frame,
+        )
+
+        self.assertEqual(frame_call_count + 1, len(self.bridge_calls))
+        self.assertEqual((12.0, 3.0, -7.0), self.bridge_calls[-1][2])
+        self.assertEqual((0.0, 0.0, 0.7), self.bridge_calls[-1][3])
+        self.assertLess(self.bridge_calls[-2][0], self.bridge_calls[-1][0])
+        self.assertIsNone(state["queued_correction"])
+        self.assertTrue(state["pending_correction"]["safety"])
+        self.assertEqual(next_frame, state["pending_correction"]["submitted_at"])
+        self.assertEqual((0, 0), self.entity.filter.input)
+
+    def test_submitted_contact_is_replaced_by_safety_on_next_real_tick(self):
+        self.defer_post_attach_seed = True
+        self.assertIsNotNone(self.activate())
+        state = getattr(self.mock, self.native.STATE_ATTR)
+        contact_time = self.now + 0.20
+        self.assertTrue(self.native.reseed(
+            self.mock, (13.0, 3.0, -7.0), 0.7, 7,
+            self.now + 0.01,
+        ))
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 0, 7,
+            contact_time,
+        )
+        contact = state["pending_correction"]
+        self.assertFalse(contact["safety"])
+        call_count = len(self.bridge_calls)
+
+        self.assertTrue(self.native.reseed(
+            self.mock, (10.0, 3.0, -7.0), 0.7, 7,
+            contact_time, safety=True,
+        ))
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 1, 7,
+            contact_time,
+        )
+        self.assertEqual(call_count, len(self.bridge_calls))
+        self.assertIs(contact, state["pending_correction"])
+        self.assertTrue(state["queued_correction"]["safety"])
+        self.assertEqual(0, self.entity.wgPhysics.movementSignals)
+
+        safety_time = contact_time + 0.05
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 1, 7,
+            safety_time,
+        )
+        self.assertEqual(call_count + 1, len(self.bridge_calls))
+        self.assertIsNone(state["queued_correction"])
+        self.assertTrue(state["pending_correction"]["safety"])
+        self.assertEqual((10.0, 3.0, -7.0),
+                         state["pending_correction"]["position"])
+        self.assertEqual(safety_time,
+                         state["pending_correction"]["submitted_at"])
 
     def test_retail_order_seeds_once_and_stays_dynamic_through_activation(self):
         self.reject_post_attach_seed = True
@@ -456,20 +629,28 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.assertTrue(self.native.reseed(
             self.mock, target, 0.7, 7, self.now + 0.01
         ))
-        first_submitted = state["pending_correction"]["submitted_at"]
+        queued = state["queued_correction"]
+        self.assertIsNone(state["pending_correction"])
         self.assertEqual(old_pose, state["last_pose"])
         self.assertTrue(self.native.reseed(
             self.mock, (14.0, 3.0, -7.0), 0.7, 7, self.now + 0.02
         ))
-        self.assertEqual(first_submitted,
-                         state["pending_correction"]["submitted_at"])
-        self.assertEqual(2, len(self.bridge_calls))
+        self.assertIs(queued, state["queued_correction"])
+        self.assertEqual(1, len(self.bridge_calls))
 
         self.assertIsNotNone(self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7,
             self.now + 0.20
         ))
+        first_submitted = state["pending_correction"]["submitted_at"]
+        self.assertEqual(self.now + 0.20, first_submitted)
+        self.assertEqual(2, len(self.bridge_calls))
         self.assertIsNotNone(state["pending_correction"])
+        self.assertTrue(self.native.reseed(
+            self.mock, (14.0, 3.0, -7.0), 0.7, 7, self.now + 0.21
+        ))
+        self.assertEqual(first_submitted,
+                         state["pending_correction"]["submitted_at"])
         self.apply_deferred_seed()
         result = self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7,
@@ -487,9 +668,14 @@ class NativeBotPhysicsTest(unittest.TestCase):
             self.mock, (13.0, 3.0, -7.0), 0.7, 7, self.now + 0.01
         ))
 
+        self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7,
+            self.now + 0.20
+        )
+
         result = self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7,
-            self.now + 0.80
+            self.now + 1.00
         )
 
         self.assertNotIn("faulted", result)
@@ -513,30 +699,37 @@ class NativeBotPhysicsTest(unittest.TestCase):
             self.mock, (10.0, 3.0, -7.0), 0.7, 7, self.now + 0.02,
             safety=True,
         ))
-        safety_target = state["pending_correction"]
-        self.assertTrue(safety_target["safety"])
-        self.assertEqual((10.0, 3.0, -7.0), safety_target["position"])
-        self.assertEqual(3, len(self.bridge_calls))
+        queued_target = state["queued_correction"]
+        self.assertTrue(queued_target["safety"])
+        self.assertEqual((10.0, 3.0, -7.0), queued_target["position"])
+        self.assertEqual(1, len(self.bridge_calls))
+        self.assertEqual(0, self.entity.wgPhysics.movementSignals)
 
         self.assertTrue(self.native.reseed(
             self.mock, (11.0, 3.0, -7.0), 0.7, 7, self.now + 0.03,
             safety=True,
         ))
-        self.assertIs(safety_target, state["pending_correction"])
-        self.assertEqual(3, len(self.bridge_calls))
+        self.assertIs(queued_target, state["queued_correction"])
+        self.assertEqual(1, len(self.bridge_calls))
 
         self.native.step(
             self.player, self.mock, self.descriptor, 1, 1, 7,
             self.now + 0.20
         )
+        safety_target = state["pending_correction"]
+        submitted_at = safety_target["submitted_at"]
+        self.assertTrue(safety_target["safety"])
+        self.assertEqual((10.0, 3.0, -7.0), safety_target["position"])
+        self.assertEqual(2, len(self.bridge_calls))
         self.assertEqual((0, 0), self.entity.filter.input)
 
         self.native.step(
             self.player, self.mock, self.descriptor, 1, 1, 7,
-            self.now + 0.80
+            self.now + 1.00
         )
         self.assertIs(safety_target, state["pending_correction"])
         self.assertTrue(safety_target["timeout_logged"])
+        self.assertEqual(submitted_at, safety_target["submitted_at"])
         self.assertEqual((0, 0), self.entity.filter.input)
         self.assertTrue(self.native.reseed(
             self.mock, (50.0, 3.0, -7.0), 0.7, 7, self.now + 0.81,
@@ -550,6 +743,64 @@ class NativeBotPhysicsTest(unittest.TestCase):
             self.entity.matrix.translation.y,
             self.entity.matrix.translation.z,
         ))
+
+    def test_unconfirmed_safety_target_stays_fresh_beyond_stale_window(self):
+        self.defer_post_attach_seed = True
+        self.assertIsNotNone(self.activate())
+        state = getattr(self.mock, self.native.STATE_ATTR)
+        target = (10.0, 3.0, -7.0)
+        self.assertTrue(self.native.reseed(
+            self.mock, target, 0.7, 7, self.now + 0.01, safety=True,
+        ))
+        submitted_at = self.now + 0.11
+        self.native.step(
+            self.player, self.mock, self.descriptor, 1, 1, 7,
+            submitted_at,
+        )
+        pending = state["pending_correction"]
+        self.assertEqual(submitted_at, pending["submitted_at"])
+
+        for sample in range(1, 62):
+            self.native.step(
+                self.player, self.mock, self.descriptor, 1, 1, 7,
+                submitted_at + sample * 0.11,
+            )
+
+        safety_calls = self.bridge_calls[1:]
+        self.assertGreater(safety_calls[-1][0] - submitted_at, 6.0)
+        self.assertTrue(all(call[2] == target for call in safety_calls))
+        self.assertTrue(all(call[3] == (0.0, 0.0, 0.7)
+                            for call in safety_calls))
+        self.assertTrue(all(
+            0.0 < later[0] - earlier[0] < 0.20
+            for earlier, later in zip(safety_calls, safety_calls[1:])
+        ))
+        self.assertIs(pending, state["pending_correction"])
+        self.assertEqual(submitted_at, pending["submitted_at"])
+        self.assertTrue(pending["timeout_logged"])
+        self.assertEqual((0, 0), self.entity.filter.input)
+        self.assertEqual(0, self.entity.wgPhysics.movementSignals)
+
+    def test_queued_filter_input_failure_freezes_and_clears_corrections(self):
+        self.assertIsNotNone(self.activate())
+        state = getattr(self.mock, self.native.STATE_ATTR)
+        self.assertTrue(self.native.reseed(
+            self.mock, (13.0, 3.0, -7.0), 0.7, 7,
+            self.now + 0.01,
+        ))
+        self.bridge_ok = False
+
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 1, 0, 7,
+            self.now + 0.20,
+        )
+
+        self.assertTrue(result["faulted"])
+        self.assertEqual("faulted", state["phase"])
+        self.assertIsNone(state["queued_correction"])
+        self.assertIsNone(state["pending_correction"])
+        self.assertEqual(0, self.entity.wgPhysics.movementSignals)
+        self.assertTrue(self.entity.wgPhysics.staticMode)
 
     def test_staged_body_never_enters_retail_vehicle_ui_lifecycle(self):
         self.assertTrue(self.native.prepare(
@@ -654,6 +905,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
             "faulted", getattr(self.mock, self.native.STATE_ATTR)["phase"]
         )
         self.assertTrue(self.entity.wgPhysics.staticMode)
+        self.assertEqual(0, self.entity.wgPhysics.movementSignals)
         self.assertFalse(getattr(
             self.mock, self.native.STATE_ATTR
         )["freeze_reseed"])
@@ -692,6 +944,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
             self.mock, self.native.STATE_ATTR
         )["phase"])
         self.assertIsNone(physics.damageDestructibleCb)
+        self.assertEqual(0, physics.movementSignals)
         self.assertEqual([], self.mock._chassis_model.motors)
         self.assertFalse(hasattr(self.mock._chassis_model, "wg_fashion"))
         self.assertIsNone(self.mock._fashion)
@@ -775,6 +1028,36 @@ class NativeBotPhysicsTest(unittest.TestCase):
         new_state = getattr(self.mock, self.native.STATE_ATTR)
         self.assertIsNot(old_state, new_state)
         self.assertEqual("seed_wait", new_state["phase"])
+
+    def test_stop_all_then_next_battle_restarts_drive_and_heartbeat(self):
+        self.assertIsNotNone(self.activate())
+        first_physics = self.entity.wgPhysics
+
+        self.assertEqual(1, self.native.stop_all({self.mock.id: self.mock}))
+        self.assertEqual(0, first_physics.movementSignals)
+
+        self.now += 1.0
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+        self.assertTrue(self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )["staging"])
+        self.now += self.native.WARMUP_SECONDS + 0.01
+        self.assertIsNotNone(self.native.step(
+            self.player, self.mock, self.descriptor, -1, -1, 7, self.now
+        ))
+
+        second_physics = self.entity.wgPhysics
+        self.assertIsNot(first_physics, second_physics)
+        self.assertEqual(6, second_physics.movementSignals)
+        calls_before_heartbeat = len(self.bridge_calls)
+        self.now += self.native.FILTER_HEARTBEAT_SECONDS + 0.01
+        self.assertIsNotNone(self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        ))
+        self.assertEqual(calls_before_heartbeat + 1, len(self.bridge_calls))
 
     def test_preactive_stop_completes_startup_with_an_explicit_stopped_count(self):
         self.player._offhangar_network_bot_manifest = [object()]

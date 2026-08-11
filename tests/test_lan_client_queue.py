@@ -706,6 +706,323 @@ class LANClientQueueTest(unittest.TestCase):
 
         self.assertEqual(780, mock.health)
 
+    def test_bot_human_event_before_snapshot_does_not_double_apply_damage(self):
+        player = Player()
+        player._offhangar_network_id = 1
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_server_health = 880
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True, phase="battle"
+        )
+        player.playerVehicleID = 1
+        player.arena = types.SimpleNamespace(onVehicleKilled=lambda *args: None)
+        local = types.SimpleNamespace(
+            id=1, health=880, maxHealth=880, isAlive=True,
+            publicInfo={"isAlive": True},
+        )
+        bot = types.SimpleNamespace(
+            id=1016, _network_bot_id=16, health=500, isAlive=True,
+        )
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            1: local, 1016: bot,
+        }
+
+        self.network._handle_events(player, [{
+            "kind": "bot_human_hit", "attacker_bot": 16, "target": 1,
+            "shot_seq": 4, "shot_result": 2, "damage": 125,
+            "health": 755, "dead": False,
+        }])
+        self.network._apply_snapshot(player, {"players": [{
+            "id": 1, "health": 755, "max_health": 880, "alive": True,
+        }]})
+
+        self.assertEqual(755, local.health)
+        self.assertEqual(755, player._offhangar_network_server_health)
+
+    def test_bot_human_snapshot_before_event_does_not_double_apply_damage(self):
+        player = Player()
+        player._offhangar_network_id = 1
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_server_health = 880
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True, phase="battle"
+        )
+        player.playerVehicleID = 1
+        player.arena = types.SimpleNamespace(onVehicleKilled=lambda *args: None)
+        local = types.SimpleNamespace(
+            id=1, health=880, maxHealth=880, isAlive=True,
+            publicInfo={"isAlive": True},
+        )
+        bot = types.SimpleNamespace(
+            id=1016, _network_bot_id=16, health=500, isAlive=True,
+        )
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            1: local, 1016: bot,
+        }
+
+        self.network._apply_snapshot(player, {"players": [{
+            "id": 1, "health": 755, "max_health": 880, "alive": True,
+        }]})
+        self.network._handle_events(player, [{
+            "kind": "bot_human_hit", "attacker_bot": 16, "target": 1,
+            "shot_seq": 4, "shot_result": 2, "damage": 125,
+            "health": 755, "dead": False,
+        }])
+
+        self.assertEqual(755, local.health)
+        self.assertEqual(755, player._offhangar_network_server_health)
+
+    def test_cumulative_bot_events_after_newer_snapshot_do_not_rewind_health(self):
+        player = Player()
+        player._offhangar_network_id = 1
+        player._offhangar_network_is_authority = True
+        player._offhangar_network_server_health = 880
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True, phase="battle"
+        )
+        player.playerVehicleID = 1
+        player.arena = types.SimpleNamespace(onVehicleKilled=lambda *args: None)
+        local = types.SimpleNamespace(
+            id=1, health=880, maxHealth=880, isAlive=True,
+            publicInfo={"isAlive": True},
+        )
+        bot = types.SimpleNamespace(
+            id=1016, _network_bot_id=16, health=500, isAlive=True,
+        )
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            1: local, 1016: bot,
+        }
+        events = [
+            {
+                "kind": "bot_human_hit", "attacker_bot": 16,
+                "target": 1, "shot_seq": 4, "shot_result": 2,
+                "damage": 125, "health": 755, "dead": False,
+            },
+            {
+                "kind": "bot_human_hit", "attacker_bot": 16,
+                "target": 1, "shot_seq": 5, "shot_result": 2,
+                "damage": 125, "health": 630, "dead": False,
+            },
+        ]
+
+        self.network._apply_snapshot(player, {"players": [{
+            "id": 1, "health": 630, "max_health": 880, "alive": True,
+        }]})
+        self.network._handle_events(player, events)
+
+        self.assertEqual(630, local.health)
+        self.assertEqual(630, player._offhangar_network_server_health)
+
+    def test_stale_health_events_cannot_rewind_lethal_snapshot(self):
+        player = Player()
+        player._offhangar_network_id = 1
+        player._offhangar_network_server_health = 880
+        player.playerVehicleID = 1
+        player.arena = types.SimpleNamespace(onVehicleKilled=lambda *args: None)
+        local = types.SimpleNamespace(
+            id=1, health=880, maxHealth=880, isAlive=True,
+            publicInfo={"isAlive": True},
+        )
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            1: local,
+        }
+
+        self.network._apply_snapshot(player, {"players": [{
+            "id": 1, "health": 0, "max_health": 880, "alive": False,
+        }]})
+        self.network._handle_events(player, [
+            {
+                "kind": "health", "target": 1, "damage": 100,
+                "health": 100, "dead": False,
+            },
+            {
+                "kind": "hit", "attacker": 2, "target": 1,
+                "damage": 100, "health": 100, "dead": False,
+            },
+        ])
+
+        self.assertEqual(0, local.health)
+        self.assertFalse(local.publicInfo["isAlive"])
+        self.assertEqual(0, player._offhangar_network_server_health)
+
+    def test_local_damage_ack_event_prevents_snapshot_double_application(self):
+        player = Player()
+        player._offhangar_network_id = 1
+        player._offhangar_network_health_round_id = 7
+        player._offhangar_network_server_health = 880
+        player.playerVehicleID = 1
+        player.arena = types.SimpleNamespace(onVehicleKilled=lambda *args: None)
+        local = types.SimpleNamespace(
+            id=1, health=800, maxHealth=880, isAlive=True,
+            publicInfo={"isAlive": True},
+        )
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            1: local,
+        }
+
+        self.network._handle_events(player, [{
+            "kind": "health", "target": 1, "damage": 80,
+            "health": 800, "dead": False,
+            "source": "client_simulation",
+        }])
+        self.network._apply_snapshot(player, {
+            "round_id": 7,
+            "players": [{
+                "id": 1, "health": 800, "max_health": 880,
+                "alive": True,
+            }],
+        })
+
+        self.assertEqual(800, local.health)
+        self.assertEqual(800, player._offhangar_network_server_health)
+
+    def test_new_round_resets_monotonic_local_health_baseline(self):
+        player = Player()
+        player._offhangar_network_id = 1
+        player._offhangar_network_health_round_id = 1
+        player._offhangar_network_server_health = 0
+        player.playerVehicleID = 1
+        player.arena = types.SimpleNamespace(onVehicleKilled=lambda *args: None)
+        local = types.SimpleNamespace(
+            id=1, health=880, maxHealth=880, isAlive=True,
+            publicInfo={"isAlive": True},
+        )
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            1: local,
+        }
+
+        self.network._apply_snapshot(player, {
+            "round_id": 2,
+            "players": [{
+                "id": 1, "health": 880, "max_health": 880,
+                "alive": True,
+            }],
+        })
+        self.network._apply_snapshot(player, {
+            "round_id": 2,
+            "players": [{
+                "id": 1, "health": 755, "max_health": 880,
+                "alive": True,
+            }],
+        })
+
+        self.assertEqual(755, local.health)
+        self.assertEqual(755, player._offhangar_network_server_health)
+        self.assertEqual(2, player._offhangar_network_health_round_id)
+
+    def test_stale_round_snapshot_cannot_damage_current_round_player(self):
+        player = Player()
+        player._offhangar_network_id = 1
+        player._offhangar_network_health_round_id = 2
+        player._offhangar_network_server_health = 880
+        player.playerVehicleID = 1
+        player.arena = types.SimpleNamespace(onVehicleKilled=lambda *args: None)
+        local = types.SimpleNamespace(
+            id=1, health=880, maxHealth=880, isAlive=True,
+            publicInfo={"isAlive": True},
+        )
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            1: local,
+        }
+
+        self.network._apply_snapshot(player, {
+            "round_id": 1,
+            "players": [{
+                "id": 1, "health": 0, "max_health": 880,
+                "alive": False,
+            }],
+        })
+
+        self.assertEqual(880, local.health)
+        self.assertTrue(local.publicInfo["isAlive"])
+        self.assertEqual(880, player._offhangar_network_server_health)
+        self.assertEqual(2, player._offhangar_network_health_round_id)
+
+    def test_stale_round_messages_are_rejected_before_any_client_side_effect(self):
+        player = Player()
+        player._offhangar_network_id = 1
+        player._offhangar_network_health_round_id = 2
+        player._offhangar_network_server_health = 880
+        player._offhangar_network_authority_id = 77
+        player._offhangar_network_snapshot = {"round_id": 2, "server_tick": 10}
+        player._offhangar_network_events = [{"kind": "current_round"}]
+        player.playerVehicleID = 1
+        player.arena = types.SimpleNamespace(onVehicleKilled=lambda *args: None)
+        local = types.SimpleNamespace(
+            id=1, health=880, maxHealth=880, isAlive=True,
+            publicInfo={"isAlive": True},
+        )
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            1: local,
+        }
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        client.round_id = 2
+        client.battle_started = True
+        client._last_snapshot = 50.0
+        client.bot_authority_id = 77
+        client.bot_order_revision = 88
+        client.bot_orders = {16: {"id": 16, "target_id": 2}}
+        client.combat_duration = 321.0
+
+        client._handle_message({
+            "type": "battle_start", "round_id": 1,
+            "bot_order_revision": 99,
+            "bot_orders": [{"id": 16, "target_id": 999}],
+            "timing": {"phase": "finished", "duration_ms": 1000},
+        })
+        client._handle_message({
+            "type": "snapshot", "round_id": 1, "server_tick": 999,
+            "bot_authority_id": 3, "bot_order_revision": 99,
+            "bot_orders": [{"id": 16, "target_id": 999}],
+            "timing": {"phase": "finished", "duration_ms": 1000},
+            "players": [{
+                "id": 1, "health": 0, "max_health": 880,
+                "alive": False,
+            }],
+        })
+        client._handle_message({
+            "type": "events", "round_id": 1, "server_tick": 999,
+            "events": [{
+                "kind": "health", "target": 1, "damage": 880,
+                "health": 0, "dead": True,
+            }],
+        })
+
+        self.assertEqual(50.0, client._last_snapshot)
+        self.assertEqual(77, client.bot_authority_id)
+        self.assertEqual(88, client.bot_order_revision)
+        self.assertEqual(2, client.bot_orders[16]["target_id"])
+        self.assertEqual(321.0, client.combat_duration)
+        self.assertEqual(2, player._offhangar_network_snapshot["round_id"])
+        self.assertEqual([{"kind": "current_round"}],
+                         player._offhangar_network_events)
+        self.assertEqual(880, local.health)
+        self.assertEqual(880, player._offhangar_network_server_health)
+
+    def test_local_input_reports_only_unacknowledged_local_damage(self):
+        player = Player()
+        player._offhangar_network_server_health = 700
+        player.playerVehicleID = 1
+        mock = types.SimpleNamespace(health=700)
+        sys.modules["gui.mods.offhangar.offline_battle"].G_MOCK_VEHICLES = {
+            1: mock,
+        }
+        sent = []
+        player._offhangar_network_client = types.SimpleNamespace(
+            ready=True,
+            max_health=880,
+            send_input=lambda *args, **kwargs: sent.append((args, kwargs)),
+        )
+
+        self.network.send_local_input(player, 0.0, 0.0, 0.0, 0.0)
+        self.assertIsNone(sent[-1][1]["reported_health"])
+
+        mock.health = 650
+        self.network.send_local_input(player, 0.0, 0.0, 0.0, 0.0)
+        self.assertEqual(650, sent[-1][1]["reported_health"])
+
     def test_remote_shot_and_local_hit_use_offline_battle_effects(self):
         self.network._test_shot_presentations[:] = []
         self.network._test_hit_presentations[:] = []
@@ -1140,6 +1457,7 @@ class LANClientQueueTest(unittest.TestCase):
         }])
 
         self.assertEqual(700, local.health)
+        self.assertEqual(700, player._offhangar_network_server_health)
         self.assertEqual([], self.network._test_hit_presentations)
 
     def test_visible_order_fails_closed_when_live_target_is_missing(self):
@@ -1261,6 +1579,34 @@ class LANClientQueueTest(unittest.TestCase):
         self.assertEqual(12, client.bot_order_revision)
         self.assertEqual(2, client.bot_orders[16]["target_id"])
         self.assertEqual(101, player._offhangar_network_snapshot["server_tick"])
+
+    def test_snapshot_coalescing_never_carries_orders_across_rounds(self):
+        player = Player()
+        player._offhangar_network_health_round_id = 2
+        client = self.network.LANClient(
+            player, "127.0.0.1", 28782, "Alpha", "ussr:T-34"
+        )
+        player._offhangar_network_client = client
+        with client._pending_lock:
+            client._pending = [
+                {
+                    "type": "snapshot", "round_id": 1,
+                    "bot_authority_id": 1, "players": [], "bots": [],
+                    "bot_order_revision": 0,
+                    "bot_orders": [{"id": 16, "target_id": 999}],
+                },
+                {
+                    "type": "snapshot", "round_id": 2,
+                    "bot_authority_id": 1, "players": [], "bots": [],
+                    "bot_order_revision": 0, "server_tick": 101,
+                },
+            ]
+
+        client._poll()
+
+        self.assertEqual({}, client.bot_orders)
+        self.assertNotIn("bot_orders", player._offhangar_network_snapshot)
+        self.assertEqual(2, player._offhangar_network_snapshot["round_id"])
 
     def test_revision_without_order_body_keeps_last_executable_orders(self):
         player = Player()

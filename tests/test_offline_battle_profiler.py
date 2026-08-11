@@ -1,5 +1,6 @@
 import unittest
 import sys
+import textwrap
 import types
 from pathlib import Path
 from unittest import mock
@@ -30,7 +31,106 @@ def load_profiler(fake_time):
     return namespace
 
 
+def load_module_factor(device_td):
+    source = SOURCE.read_text()
+    start = source.index("\t\t\tdef _module_factor")
+    end = source.index("\n\t\t\tdef _knock_out_crew", start)
+    namespace = {"_device_td": device_td}
+    exec(textwrap.dedent(source[start:end]), namespace)
+    return namespace["_module_factor"]
+
+
+def device_damage_modules(module_stat_factor):
+    gui = types.ModuleType("gui")
+    mods = types.ModuleType("gui.mods")
+    offhangar = types.ModuleType("gui.mods.offhangar")
+    device_damage = types.ModuleType("gui.mods.offhangar.device_damage")
+    device_damage.module_stat_factor = module_stat_factor
+    gui.mods = mods
+    mods.offhangar = offhangar
+    offhangar.device_damage = device_damage
+    return {
+        "gui": gui,
+        "gui.mods": mods,
+        "gui.mods.offhangar": offhangar,
+        "gui.mods.offhangar.device_damage": device_damage,
+    }
+
+
 class OfflineBattleProfilerTests(unittest.TestCase):
+    def test_direct_fire_skips_the_overwritten_pre_marker_ray(self):
+        source = SOURCE.read_text()
+        start = source.index("# Calculate exact terrain intersection for the green marker")
+        end = source.index("# UPDATE CROSSHAIR", start)
+        gun_marker = source[start:end]
+        first_ray = gun_marker.index(
+            "BigWorld.wg_collideSegment(_offh_bspace(), true_gun_pos")
+        final_ray = gun_marker.index(
+            "BigWorld.wg_collideSegment(_offh_bspace(), math_gun_world")
+
+        self.assertLess(gun_marker.index("if is_arty:"), first_ray)
+        self.assertLess(first_ray, gun_marker.index("if not is_arty:"))
+        self.assertLess(gun_marker.index("if not is_arty:"), final_ray)
+        self.assertEqual(2, gun_marker.count("BigWorld.wg_collideSegment"))
+
+    def test_module_factor_pristine_fast_path_skips_damage_helper(self):
+        device_td = mock.Mock(side_effect=AssertionError("descriptor lookup"))
+        module_stat_factor = mock.Mock(side_effect=AssertionError("damage helper"))
+        factor = load_module_factor(device_td)
+        vehicle = types.SimpleNamespace(
+            devices_hp={},
+            _destroyed_devices=set(),
+        )
+
+        with mock.patch.dict(
+            sys.modules, device_damage_modules(module_stat_factor)
+        ):
+            result = factor(vehicle, "mobility")
+
+        self.assertEqual(1.0, result)
+        module_stat_factor.assert_not_called()
+        device_td.assert_not_called()
+
+    def test_module_factor_damaged_and_destroyed_paths_still_delegate(self):
+        descriptor = object()
+        device_td = mock.Mock(return_value=descriptor)
+        module_stat_factor = mock.Mock(side_effect=[0.5, 0.0])
+        factor = load_module_factor(device_td)
+        damaged_hp = {"engineHealth": 40.0}
+        damaged_destroyed = set()
+        destroyed_hp = {}
+        destroyed_devices = set(["engineHealth"])
+        damaged = types.SimpleNamespace(
+            devices_hp=damaged_hp,
+            _destroyed_devices=damaged_destroyed,
+        )
+        destroyed = types.SimpleNamespace(
+            devices_hp=destroyed_hp,
+            _destroyed_devices=destroyed_devices,
+        )
+
+        with mock.patch.dict(
+            sys.modules, device_damage_modules(module_stat_factor)
+        ):
+            damaged_factor = factor(damaged, "mobility")
+            destroyed_factor = factor(destroyed, "mobility")
+
+        self.assertEqual(0.5, damaged_factor)
+        self.assertEqual(0.0, destroyed_factor)
+        self.assertEqual(
+            [
+                mock.call(
+                    damaged_hp, damaged_destroyed, descriptor, "mobility"
+                ),
+                mock.call(
+                    destroyed_hp, destroyed_devices, descriptor, "mobility"
+                ),
+            ],
+            module_stat_factor.call_args_list,
+        )
+        self.assertEqual([mock.call(damaged), mock.call(destroyed)],
+                         device_td.call_args_list)
+
     def test_retail_model_fetch_aggregates_four_parallel_components_once(self):
         profiler = load_profiler(FakeTime())
         fetches = []
@@ -264,6 +364,9 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         self.assertIn("_offh_perf_count('collision_candidates', len(_candidate_ids))", source)
         self.assertIn("_candidate_ids = (_VC.nearby_ids", source)
         self.assertIn("_VC.unique_candidate_map(", source)
+        self.assertIn("_python_collision_ids = []", source)
+        self.assertIn("_python_collision_ids.append(int(_frame_eid))", source)
+        self.assertIn("\n\t\t\t\t\t_python_collision_ids)", source)
         self.assertIn("_bot_collision_ids = _collision_candidates[0].get(eid)", source)
         self.assertIn("_bot_collision_ids == ()", source)
         self.assertIn("eid not in _tank_pair_pending", source)

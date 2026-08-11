@@ -236,7 +236,8 @@ def _offh_perf_frame_end(started, frame_dt, player):
 	           'nav_paused', 'tactic_route', 'tactic_hold', 'tactic_manoeuvre',
 	           'driver_drive', 'driver_avoid', 'driver_wait', 'driver_recovery',
 	           'driver_arrived',
-	           'traffic_snapshot', 'pose_water', 'terrain_support', 'terrain_tilt',
+	           'traffic_snapshot', 'traffic_index', 'traffic_candidates',
+	           'pose_water', 'terrain_support', 'terrain_tilt',
 	           'tree_scan', 'tree_deferred',
 	           'wall_collision', 'wall_fast', 'wall_exact',
 	           'tank_collision', 'tank_collision_empty', 'collision_candidates',
@@ -902,7 +903,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.33-native-experimental (2026-08-11)'
+_OFFH_BUILD = '1.8.34-native-experimental (2026-08-11)'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -11986,10 +11987,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						# Calculate exact terrain intersection for the green marker (perfectly simulates server)
 						_end_gun = true_gun_pos + gun_dir.scale(10000.0)
 						_col_gun = None
-						try:
-							_col_gun = BigWorld.wg_collideSegment(_offh_bspace(), true_gun_pos, _end_gun, 128)
-						except Exception:
-							pass
+						if is_arty:
+							try:
+								_col_gun = BigWorld.wg_collideSegment(_offh_bspace(), true_gun_pos, _end_gun, 128)
+							except Exception:
+								pass
 						gun_target_pos = _col_gun[0] if _col_gun is not None else _end_gun
 						
 						if hasattr(player, 'gunRotator') and len(player.gunRotator.markerInfo) >= 2:
@@ -12370,6 +12372,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_collision_bodies = {}
 				_collision_max_radius = 4.0
 				_local_ai_ids = []
+				_python_collision_ids = []
+				_native_body_manager_frame = None
+				if not _is_network_replica:
+					try:
+						from gui.mods.offhangar import native_bot_physics as _native_body_manager_frame
+					except Exception:
+						_native_body_manager_frame = None
 				for _frame_eid, _frame_vehicle in mock_vehicles.iteritems():
 					if (_frame_vehicle is None or
 					        not getattr(_frame_vehicle, 'isAlive', False)):
@@ -12428,6 +12437,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							if (_frame_eid != _player_vehicle_id and
 									not getattr(_frame_vehicle, '_network_remote', False)):
 								_local_ai_ids.append(int(_frame_eid))
+								if (_native_body_manager_frame is None or
+										not _native_body_manager_frame.owns_filter(
+											_frame_vehicle)):
+									_python_collision_ids.append(int(_frame_eid))
 						_collision_body = getattr(
 							_frame_vehicle, '_offh_collision_frame_body', None)
 						if _collision_body is None:
@@ -12447,6 +12460,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_nav_frame[_frame_eid] = _frame_position
 					except Exception:
 						continue
+				_perf_traffic_index = _offh_perf_start()
 				_traffic_spatial[0] = _VC.build_spatial_index(_driver_frame)
 				# Two maximum hull radii plus four metres of per-frame motion slop
 				# guarantees that a colliding pair lies in the same or an adjacent cell.
@@ -12454,8 +12468,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_collision_frame[0] = _collision_bodies
 				_collision_spatial[0] = _VC.build_spatial_index(
 					_collision_bodies, _collision_cell_size)
+				_offh_perf_stop('traffic_index', _perf_traffic_index)
+				_perf_traffic_candidates = _offh_perf_start()
 				_collision_candidates[0] = _VC.unique_candidate_map(
-					_collision_spatial[0], _collision_bodies, _local_ai_ids)
+					_collision_spatial[0], _collision_bodies,
+					_python_collision_ids)
+				_offh_perf_stop('traffic_candidates', _perf_traffic_candidates)
 				_offh_perf_stop('traffic_snapshot', _perf_traffic)
 				_ai_frame_budget = _offh_ai_frame_budget_plan(_local_ai_ids, dt)
 				_order_refresh_ids = _ai_frame_budget['order']
@@ -13130,14 +13148,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								float(getattr(m_veh, 'roll', 0.0) or 0.0))
 							_native_body_pose = None
 							_native_filter_owned = False
-							_native_body_manager = None
+							_native_body_manager = _native_body_manager_frame
 							try:
-								from gui.mods.offhangar import native_bot_physics as _native_body_manager
-								_native_body_pose = _offh_perf_call(
-									'native_physics', _native_body_manager.step,
-									player, m_veh, _td, throttle, turn_dir,
-									_ai_space_id, _ai_now, _battle_active)
-								_native_filter_owned = _native_body_manager.owns_filter(m_veh)
+								if _native_body_manager is not None:
+									_native_body_pose = _offh_perf_call(
+										'native_physics', _native_body_manager.step,
+										player, m_veh, _td, throttle, turn_dir,
+										_ai_space_id, _ai_now, _battle_active)
+									_native_filter_owned = _native_body_manager.owns_filter(m_veh)
 							except Exception as _native_body_error:
 								if not getattr(m_veh, '_offh_native_error_logged', False):
 									m_veh._offh_native_error_logged = True
@@ -15298,9 +15316,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				if mock is None:
 					return 1.0
 				try:
+					devices_hp = getattr(mock, 'devices_hp', None)
+					destroyed_devices = getattr(mock, '_destroyed_devices', None)
+					if not devices_hp and not destroyed_devices:
+						return 1.0
 					from gui.mods.offhangar import device_damage as _DDm
-					return _DDm.module_stat_factor(getattr(mock, 'devices_hp', None),
-					                              getattr(mock, '_destroyed_devices', None),
+					return _DDm.module_stat_factor(devices_hp, destroyed_devices,
 					                              _device_td(mock), stat)
 				except Exception:
 					return 1.0

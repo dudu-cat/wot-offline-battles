@@ -63,8 +63,8 @@ module runs inside the embedded Python 2 runtime shipped with the 0.8.2 client.
 
 The start button appears after the server accepts the client and sends the
 `welcome` message.
-A client that connects after `BATTLE START` receives a `LATE JOIN` message and
-enters the current round on the same map.
+A client that connects after `BATTLE START` receives a late-join `battle_start`
+message and enters the current round on the same map. The server logs `LATE JOIN`.
 
 There is no independent client-side LAN countdown. A failed LAN connection
 does not silently fall back to a local random battle. Use the queue screen's
@@ -76,7 +76,7 @@ With normal logging settings, each client writes these milestones to
 ```text
 LAN connecting to 192.168.1.20:28782
 LAN TCP connected to 192.168.1.20:28782
-LAN hello sent (protocol 8, build 1.8.33-native-experimental-20260811)
+LAN hello sent (protocol 8, build 1.8.34-native-experimental-20260811)
 LAN welcome id=1 name=Player-158 vehicle=china:Type_59 team=1 slot=0 map=... phase=waiting
 LAN JOIN confirmed; queue screen is now server-backed
 LAN queue UI updated: 2 connected player(s)
@@ -127,13 +127,14 @@ The server also prints one process/tick profile every five seconds while a
 battle is active:
 
 ```text
-SERVER PERF cpu_core=2.8% tick=30.0Hz avg=0.92ms p95=1.31ms max=2.40ms overruns=0 late_max=0.00ms stage=move:0.02,plan:0.18,nav:0.61,snapshot:0.01,diag:0.01,dispatch:0.07,events:0.00ms wire=encode:0.03,socket:0.02ms messages=30.0/s data=18.0KiB/s
+SERVER PERF cpu_core=2.8% tick=30.0Hz avg=0.92ms p95=1.31ms max=2.40ms overruns=0 late_max=0.00ms stage=move:0.02,plan:0.18,nav:0.61,snapshot:0.01,diag:0.01,dispatch:0.07,events:0.00ms wire=encode:0.03,socket:0.00ms messages=30.0/s data=18.0KiB/s outbound=reliable:0,latest:1,coalesced:0,inflight:0,age_max:0ms,send_max:1ms
 ```
 
 `cpu_core` is Python process CPU relative to one core, not whole-machine CPU.
 The server has a 33.3 ms budget at 30 Hz. Sustained `p95` below that budget and
-`overruns=0` rule out a saturated server tick; `wire.socket` exposes a slow
-client or blocked network send separately from planner/navigation cost.
+`overruns=0` rule out a saturated server tick. Battle socket writes use the
+asynchronous sender, so backpressure appears in `outbound` in-flight age and
+`send_max` rather than the tick's normally zero `wire.socket` value.
 
 Long terrain routes use bounded weighted-A* continuations instead of one large
 search per bot. Moving tanks are handled by the local driver and are not baked
@@ -175,6 +176,15 @@ exponential interpolation and up to 50 ms of bounded velocity prediction.
 Corrections larger than 25 metres snap immediately. The stock battle HUD's
 ping and connection indicator are fed by the measured LAN round-trip time and
 snapshot freshness instead of fixed placeholder values.
+
+Reliable combat events are queued before the same tick's canonical snapshot,
+so client-simulated fire, collision or water damage is acknowledged before
+that HP can appear in a snapshot. Snapshots and events both carry `round_id`;
+the client rejects an older round before applying timing, authority, bot
+orders, HP or presentation side effects. Roster contents and recipients are
+captured atomically, and every inbound command remains tied to the exact
+connection object that owns its numeric player id, so a delayed old handler
+cannot mutate or relabel a later round after ids are reused.
 
 If you prefer to prepare a config file manually, use these values:
 

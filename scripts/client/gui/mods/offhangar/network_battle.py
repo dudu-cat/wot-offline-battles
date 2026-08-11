@@ -21,7 +21,7 @@ from gui.mods.offhangar import vehicle_pose
 
 
 PROTOCOL_VERSION = 8
-CLIENT_BUILD = '1.8.33-native-experimental-20260811'
+CLIENT_BUILD = '1.8.34-native-experimental-20260811'
 POLL_INTERVAL = 1.0 / 60.0
 INPUT_INTERVAL = 1.0 / 30.0
 BOT_STATE_INTERVAL = 1.0 / 30.0
@@ -767,7 +767,8 @@ class LANClient(object):
 						order_revision = int(message.get('bot_order_revision', 0) or 0)
 					except (TypeError, ValueError):
 						order_revision = 0
-					order_payloads[order_revision] = message.get('bot_orders') or []
+					order_key = (message.get('round_id'), order_revision)
+					order_payloads[order_key] = message.get('bot_orders') or []
 				latest_snapshot = message
 			else:
 				coalesced.append(message)
@@ -781,10 +782,12 @@ class LANClient(object):
 					latest_snapshot.get('bot_order_revision', 0) or 0)
 			except (TypeError, ValueError):
 				latest_revision = 0
+			latest_order_key = (
+				latest_snapshot.get('round_id'), latest_revision)
 			if ('bot_orders' not in latest_snapshot and
-					latest_revision in order_payloads):
+					latest_order_key in order_payloads):
 				latest_snapshot = dict(latest_snapshot)
-				latest_snapshot['bot_orders'] = order_payloads[latest_revision]
+				latest_snapshot['bot_orders'] = order_payloads[latest_order_key]
 			coalesced.append(latest_snapshot)
 		messages = coalesced
 		for message in messages:
@@ -934,6 +937,9 @@ class LANClient(object):
 				self.player._offhangar_network_roster_count = count
 				LOG_NOTE('LAN waiting room: %d player(s); choose a map and click START BATTLE' % count)
 		elif kind == 'battle_start':
+			if not _fence_local_health_round(
+					self.player, message.get('round_id')):
+				return
 			self._load_bot_orders(message)
 			self._load_server_timing(message)
 			if self.battle_started:
@@ -943,6 +949,8 @@ class LANClient(object):
 			self._reset_transport_diagnostics()
 			self.map_name = message.get('map') or self.map_name
 			self.round_id = message.get('round_id', self.round_id)
+			self.player._offhangar_network_health_round_id = self.round_id
+			self.player._offhangar_network_server_health = None
 			self.player._offhangar_network_map_name = self.map_name
 			self.player._offhangar_network_roster = message.get('players') or []
 			self.player._offhangar_network_bot_roster = message.get('bots') or []
@@ -979,6 +987,9 @@ class LANClient(object):
 			except Exception:
 				pass
 		elif kind == 'snapshot':
+			if not _fence_local_health_round(
+					self.player, message.get('round_id')):
+				return
 			self._last_snapshot = time.time()
 			self._load_server_timing(message)
 			self._set_authority(message.get('bot_authority_id'))
@@ -986,6 +997,9 @@ class LANClient(object):
 			self.player._offhangar_network_snapshot = message
 			_apply_snapshot(self.player, message)
 		elif kind == 'events':
+			if not _fence_local_health_round(
+					self.player, message.get('round_id')):
+				return
 			self.player._offhangar_network_events = message.get('events') or []
 			_handle_events(self.player, message.get('events') or [])
 		elif kind == 'pong':
@@ -1191,6 +1205,7 @@ def start_for_player(player):
 	player._offhangar_network_events = []
 	player._offhangar_network_pending_remote_ids = {}
 	player._offhangar_network_server_health = None
+	player._offhangar_network_health_round_id = None
 	player._offhangar_network_authority_id = None
 	player._offhangar_network_is_authority = False
 	player._offhangar_network_bot_manifest = []
@@ -1248,6 +1263,7 @@ def stop_for_player(player):
 		player._offhangar_network_events = []
 		player._offhangar_network_pending_remote_ids = {}
 		player._offhangar_network_server_health = None
+		player._offhangar_network_health_round_id = None
 		player._offhangar_network_authority_id = None
 		player._offhangar_network_is_authority = False
 		player._offhangar_network_bot_manifest = []
@@ -1321,7 +1337,18 @@ def send_local_input(player, forward, turn, aim_yaw, gun_pitch,
 		try:
 			mock = _local_mock(player)
 			if mock is not None:
-				reported_health = int(getattr(mock, 'health', client.max_health) or 0)
+				local_health = int(getattr(mock, 'health', client.max_health) or 0)
+				server_health = getattr(
+					player, '_offhangar_network_server_health', None)
+				if server_health is None:
+					server_health = int(client.max_health)
+				else:
+					server_health = int(server_health)
+				# Canonical hit/snapshot updates already belong to the server. Only
+				# report a strictly lower local value caused by fire, drowning or a
+				# collision that the standalone server cannot simulate itself.
+				if local_health < server_health:
+					reported_health = local_health
 		except Exception:
 			pass
 		client.send_input(forward, turn, server_aim_yaw, gun_pitch,
@@ -2246,8 +2273,9 @@ def _push_mock_health(player, mock, health, max_health, alive, killer_id=-1, is_
 	max_health = max(1, int(max_health or getattr(mock, 'maxHealth', 1) or 1))
 	if health > max_health:
 		health = max_health
+	alive = bool(alive) and health > 0
 	if (old_health == health and old_max_health == max_health and
-			old_alive == bool(alive) and killer_id in (None, -1)):
+			old_alive == alive and killer_id in (None, -1)):
 		return
 	mock.health = health
 	mock.maxHealth = max_health
@@ -2257,7 +2285,7 @@ def _push_mock_health(player, mock, health, max_health, alive, killer_id=-1, is_
 		except Exception:
 			pass
 	if getattr(mock, 'publicInfo', None) is not None:
-		mock.publicInfo['isAlive'] = bool(alive)
+		mock.publicInfo['isAlive'] = alive
 	try:
 		from gui import WindowsManager
 		battle = getattr(WindowsManager.g_windowsManager, 'battleWindow', None)
@@ -2499,18 +2527,49 @@ def advance_network_smoothing(player, mocks, frame_dt):
 		return False
 
 
+def _advance_local_server_health(player, server_health):
+	"""Advance the round's server HP baseline without accepting stale increases."""
+	server_health = max(0, int(server_health))
+	previous = getattr(player, '_offhangar_network_server_health', None)
+	if previous is None:
+		player._offhangar_network_server_health = server_health
+		return None
+	previous = max(0, int(previous))
+	if server_health >= previous:
+		return 0
+	player._offhangar_network_server_health = server_health
+	return previous - server_health
+
+
+def _fence_local_health_round(player, round_id):
+	"""Reset newer-round HP accounting and reject stale-round snapshots."""
+	if round_id is None:
+		return True
+	try:
+		round_id = int(round_id)
+	except Exception:
+		return True
+	current = getattr(player, '_offhangar_network_health_round_id', None)
+	if current is not None and round_id < int(current):
+		return False
+	if current is None or round_id > int(current):
+		player._offhangar_network_health_round_id = round_id
+		player._offhangar_network_server_health = None
+	return True
+
+
 def _apply_local_state(player, state):
 	mock = _local_mock(player)
 	if mock is None:
 		return
 	server_health = int(state.get('health', getattr(mock, 'health', 0)) or 0)
-	previous = getattr(player, '_offhangar_network_server_health', None)
-	player._offhangar_network_server_health = server_health
-	if previous is None:
-		target_health = min(int(getattr(mock, 'health', server_health) or 0), server_health)
+	delta = _advance_local_server_health(player, server_health)
+	if delta is None:
+		target_health = min(
+			int(getattr(mock, 'health', server_health) or 0), server_health)
 	else:
-		delta = max(0, int(previous) - server_health)
-		target_health = max(0, int(getattr(mock, 'health', server_health) or 0) - delta)
+		target_health = max(0,
+			int(getattr(mock, 'health', server_health) or 0) - delta)
 	if not bool(state.get('alive', True)):
 		target_health = 0
 	_push_mock_health(player, mock, target_health,
@@ -2699,6 +2758,8 @@ def _apply_bot_state(player, state, force_authority_pose=False, mock=None,
 
 
 def _apply_snapshot(player, message):
+	if not _fence_local_health_round(player, message.get('round_id')):
+		return
 	snapshot_time = time.time()
 	for state in message.get('players') or []:
 		if state.get('id') == getattr(player, '_offhangar_network_id', None):
@@ -2847,12 +2908,12 @@ def _handle_events(player, events):
 					LOG_ERROR('LAN hit statistics failed')
 				server_health = int(event.get('health', getattr(mock, 'health', 0)) or 0)
 				if is_local:
-					previous = getattr(player, '_offhangar_network_server_health', None)
-					if previous is None:
+					delta = _advance_local_server_health(player, server_health)
+					if delta is None:
 						health = max(0, int(getattr(mock, 'health', 0) or 0) - int(event.get('damage', 0) or 0))
 					else:
-						health = max(0, int(getattr(mock, 'health', 0) or 0) - max(0, int(previous) - server_health))
-					player._offhangar_network_server_health = server_health
+						health = max(0,
+							int(getattr(mock, 'health', 0) or 0) - delta)
 				else:
 					health = server_health
 				_push_mock_health(player, mock, health,
@@ -2865,11 +2926,14 @@ def _handle_events(player, events):
 			server_health = int(event.get('health', 0) or 0)
 			if target_id == getattr(player, '_offhangar_network_id', None):
 				# The local simulation already applied this damage and its effects.
-				player._offhangar_network_server_health = server_health
+				_advance_local_server_health(player, server_health)
+				canonical_health = int(getattr(
+					player, '_offhangar_network_server_health', server_health) or 0)
 				mock = _local_mock(player)
 				if mock is not None:
 					_push_mock_health(player, mock,
-						min(int(getattr(mock, 'health', server_health) or 0), server_health),
+						min(int(getattr(mock, 'health', canonical_health) or 0),
+							canonical_health),
 						getattr(mock, 'maxHealth', max(1, server_health)),
 						not bool(event.get('dead', False)), -1, True)
 					_apply_capture_reset_event(player, mock, event)
@@ -2939,7 +3003,21 @@ def _handle_events(player, events):
 							bool(event.get('dead', False)))
 				except Exception:
 					LOG_ERROR('LAN bot-human statistics failed')
-				_push_mock_health(player, target_mock, event.get('health', target_mock.health),
+				server_health = int(event.get(
+					'health', getattr(target_mock, 'health', 0)) or 0)
+				if is_local:
+					delta = _advance_local_server_health(player, server_health)
+					if delta is None:
+						health = max(0,
+							int(getattr(target_mock, 'health', 0) or 0) -
+							int(event.get('damage', 0) or 0))
+					else:
+						health = max(0,
+							int(getattr(target_mock, 'health', server_health) or 0) -
+							delta)
+				else:
+					health = server_health
+				_push_mock_health(player, target_mock, health,
 					target_mock.maxHealth, not bool(event.get('dead', False)),
 					getattr(attacker_mock, 'id', -1), is_local)
 				_apply_capture_reset_event(
