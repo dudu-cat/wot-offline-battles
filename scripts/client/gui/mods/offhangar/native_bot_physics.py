@@ -35,6 +35,8 @@ GROUND_SUPPORT_RAY_DOWN = 12.0
 GROUND_SUPPORT_TOLERANCE = 3.0
 WARMUP_SUPPORT_SINK_TOLERANCE = 0.35
 WARMUP_MIN_UP_Y = 0.70710678
+WARMUP_POSITION_TOLERANCE = 0.35
+WARMUP_YAW_TOLERANCE = 0.05
 POSE_POSITION_TOLERANCE = 2.0
 POSE_YAW_TOLERANCE = 0.35
 CORRECTION_POSITION_TOLERANCE = 0.10
@@ -501,6 +503,30 @@ def _warmup_upright_reason(mock, state, pose):
 		int(state.get('simulated_frames', 0) or 0))
 
 
+def _warmup_pose_reason(mock, state, pose):
+	"""Return why a hidden native body is unsafe to reveal, if any."""
+	if pose is None or _pose_delta(
+			state.get('seed_position'), state.get('seed_yaw'), pose) is None:
+		return _pose_mismatch_reason('warmup', state, pose)
+	upright_reason = _warmup_upright_reason(mock, state, pose)
+	if upright_reason is not None:
+		return upright_reason
+	support = _point_tuple(state.get('ground_support'))
+	if (support is None or pose is None or
+			float(pose[1]) <
+			float(support[1]) - WARMUP_SUPPORT_SINK_TOLERANCE):
+		actual_y = 'invalid' if pose is None else '%.3f' % float(pose[1])
+		support_y = 'invalid' if support is None else '%.3f' % support[1]
+		return ('native body sank below ground support during warmup '
+			'support_y=%s actual_y=%s tolerance=%.3f') % (
+				support_y, actual_y, WARMUP_SUPPORT_SINK_TOLERANCE)
+	if not _pose_matches(
+			state.get('seed_position'), state.get('seed_yaw'), pose,
+			WARMUP_POSITION_TOLERANCE, WARMUP_YAW_TOLERANCE):
+		return _pose_mismatch_reason('warmup', state, pose)
+	return None
+
+
 def _pose_text(pose):
 	if pose is None:
 		return 'invalid'
@@ -820,9 +846,9 @@ def simulate_frame(mocks, dt, timestamp=None):
 				RuntimeError('native batch simulation returned an invalid pose'))
 			continue
 		if state.get('phase') == 'warmup':
-			upright_reason = _warmup_upright_reason(mock, state, pose)
-			if upright_reason is not None:
-				_fail(mock, state, RuntimeError(upright_reason))
+			warmup_reason = _warmup_pose_reason(mock, state, pose)
+			if warmup_reason is not None:
+				_fail(mock, state, RuntimeError(warmup_reason))
 				continue
 		state['frame_pose'] = pose
 		state['frame_pose_at'] = when
@@ -909,20 +935,23 @@ def _activate_model_provider(mock, state):
 		return True
 	old_servo = getattr(mock, '_pose_servo', None)
 	servo = None
+	old_detached = False
 	try:
-		# Create and attach the replacement first.  If detaching the old Servo
-		# fails, remove the replacement again and leave the proven Python path
-		# intact so the caller can fail before native activation.
+		# Create the replacement object first, but never attach two root motors.
+		# Detach the proven Python Servo, attach the native one, and restore the
+		# old owner if the second operation fails.
 		servo = BigWorld.Servo(provider)
-		chassis.addMotor(servo)
 		if old_servo is not None:
 			chassis.delMotor(old_servo)
+			old_detached = True
+		chassis.addMotor(servo)
 	except Exception:
-		if servo is not None:
+		if old_detached:
 			try:
-				chassis.delMotor(servo)
+				chassis.addMotor(old_servo)
 			except Exception:
-				pass
+				mock._pose_servo = None
+				mock._servo_added = False
 		return False
 	mock._native_pose_servo = servo
 	mock._pose_servo = None
@@ -1247,12 +1276,10 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 				raise RuntimeError(
 					'native ground support is unavailable at the seed pose')
 			state['ground_support'] = support
-			# Stock VehicleAppearance binds Servo(vehicle.matrix) before advanced
-			# physics is attached. Swap only after the seed has read back, then keep
-			# this provider for the complete dynamic lifetime so activation cannot
-			# reveal a delayed root/yaw jump.
-			if not _activate_model_provider(mock, state):
-				raise RuntimeError('native entity matrix could not own the staged model')
+			# Keep the proven Python Servo visible while the native body settles in
+			# the background. A client-created rigid body can remain stable for the
+			# short minimum warmup and tip later in the countdown; revealing it here
+			# exposes that invalid pose before the battle starts.
 			_attach_physics(player, mock, descriptor, state)
 			_LAST_ATTACH_TIME[0] = when
 			state['phase'] = 'warmup'
@@ -1266,22 +1293,9 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 				raise RuntimeError(
 					'native dynamics simulator did not advance during warmup')
 			pose = _frame_pose(state, when)
-			if not _pose_matches(
-					state.get('seed_position'), state.get('seed_yaw'), pose):
-				raise RuntimeError(_pose_mismatch_reason(
-					'warmup', state, pose))
-			upright_reason = _warmup_upright_reason(mock, state, pose)
-			if upright_reason is not None:
-				raise RuntimeError(upright_reason)
-			support = _point_tuple(state.get('ground_support'))
-			if (support is None or
-					float(pose[1]) <
-					float(support[1]) - WARMUP_SUPPORT_SINK_TOLERANCE):
-				raise RuntimeError(
-					'native body sank below ground support during warmup '
-					'support_y=%.3f actual_y=%.3f tolerance=%.3f' % (
-						float(support[1]), float(pose[1]),
-						WARMUP_SUPPORT_SINK_TOLERANCE))
+			warmup_reason = _warmup_pose_reason(mock, state, pose)
+			if warmup_reason is not None:
+				raise RuntimeError(warmup_reason)
 			if bool(getattr(state.get('physics'), 'staticMode', True)):
 				raise RuntimeError(
 					'native wiring invariant failed: physics became static')
@@ -1291,6 +1305,10 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 					state.get('filter') or bool(getattr(entity, 'isStarted', False))):
 				raise RuntimeError(
 					'native wiring invariant failed: owner references changed')
+			# Continue validating the hidden body for the entire countdown. Only the
+			# first active battle frame may transfer the visible model owner.
+			if not active:
+				return _staged_result(state)
 			if not _activate_model_provider(mock, state):
 				raise RuntimeError('native entity matrix could not own the model')
 			state['last_pose'] = pose

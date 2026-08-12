@@ -1,4 +1,4 @@
-WORLD OF TANKS 0.8.2 NATIVE BOT PHYSICS EXPERIMENT 1.8.39
+WORLD OF TANKS 0.8.2 NATIVE BOT PHYSICS EXPERIMENT 1.8.40
 ==========================================================
 
 This is a separate experimental build. It keeps the retail 0.8.2 rigid-body
@@ -15,15 +15,14 @@ Install
 Do not merge individual files. The package must not leave an old
 mod_offhangar.pyc behind.
 
-What changed in 1.8.39
+What changed in 1.8.40
 ----------------------
 
-- Native bot bodies now use the matching server hull-mass, suspension and
-  roller setup required by the shared dynamics solver.
-- The client prediction setup is restored immediately after each bot is built,
-  so the local player's retail physics is not changed.
-- A bot that tips past 45 degrees during startup is rejected instead of being
-  reported active while lying on its side or buried in the ground.
+- Native bodies remain hidden for the complete countdown while the stable
+  Python spawn pose stays visible.
+- A body that sinks, tips or drifts during the countdown falls back before it
+  can take ownership of the visible model.
+- A stable native body takes ownership only on the first active battle frame.
 
 Test
 ----

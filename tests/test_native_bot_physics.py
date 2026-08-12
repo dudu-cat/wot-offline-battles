@@ -747,6 +747,87 @@ class NativeBotPhysicsTest(unittest.TestCase):
             for level, message in self.logs if level == "error"
         ))
 
+    def test_countdown_keeps_hidden_native_body_on_python_servo(self):
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+        self.assertTrue(self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7,
+            self.now, active=False,
+        )["staging"])
+
+        for unused_index in range(80):
+            self.assertEqual(1, self.simulate(dt=0.10))
+            result = self.native.step(
+                self.player, self.mock, self.descriptor, 0, 0, 7,
+                self.now, active=False,
+            )
+            self.assertTrue(result["staging"])
+
+        state = getattr(self.mock, self.native.STATE_ATTR)
+        self.assertEqual("warmup", state["phase"])
+        self.assertIsNone(state["native_servo"])
+        self.assertEqual([self.old_servo], self.mock._chassis_model.motors)
+        self.assertIs(self.old_servo, self.mock._pose_servo)
+
+    def test_late_countdown_tilt_falls_back_before_model_handoff(self):
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+        self.assertTrue(self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7,
+            self.now, active=False,
+        )["staging"])
+        self.assertEqual(1, self.simulate())
+        self.now += self.native.WARMUP_SECONDS + 1.0
+        self.assertTrue(self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7,
+            self.now, active=False,
+        )["staging"])
+
+        self.entity.matrix.pitch = math.radians(80.0)
+        self.assertEqual(0, self.simulate(dt=0.02))
+
+        state = getattr(self.mock, self.native.STATE_ATTR)
+        self.assertEqual("failed", state["phase"])
+        self.assertIsInstance(self.entity.filter, AvatarFilter)
+        self.assertIsNone(self.entity.wgPhysics)
+        self.assertIsNone(state["native_servo"])
+        self.assertEqual([self.old_servo], self.mock._chassis_model.motors)
+        self.assertIs(self.old_servo, self.mock._pose_servo)
+
+    def test_first_battle_frame_performs_the_only_model_handoff(self):
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+        self.assertTrue(self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7,
+            self.now, active=False,
+        )["staging"])
+        self.assertEqual(1, self.simulate())
+        self.now += self.native.WARMUP_SECONDS + 0.01
+        self.assertTrue(self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7,
+            self.now, active=False,
+        )["staging"])
+        state = getattr(self.mock, self.native.STATE_ATTR)
+        self.assertEqual([self.old_servo], self.mock._chassis_model.motors)
+
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 1, 0, 7,
+            self.now + 0.01, active=True,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual("active", state["phase"])
+        self.assertEqual([state["native_servo"]],
+                         self.mock._chassis_model.motors)
+        self.assertIsNone(self.mock._pose_servo)
+        self.assertEqual(1, self.native._COUNTERS["active"])
+
     def test_batch_failure_faults_live_bodies_and_latches_the_battle(self):
         self.assertIsNotNone(self.activate())
         simulator = DynamicsSimulator.instances[0]
@@ -1401,8 +1482,8 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.assertTrue(result["staging"])
         self.assertIsNotNone(self.entity.wgPhysics)
         state = getattr(self.mock, self.native.STATE_ATTR)
-        self.assertEqual([state["native_servo"]],
-                         self.mock._chassis_model.motors)
+        self.assertIsNone(state["native_servo"])
+        self.assertEqual([self.old_servo], self.mock._chassis_model.motors)
 
     def test_activation_rejects_nonfinite_root_pose(self):
         self.assertTrue(self.native.prepare(
@@ -1693,12 +1774,10 @@ class NativeBotPhysicsTest(unittest.TestCase):
             "failed", getattr(self.mock, self.native.STATE_ATTR)["phase"]
         )
         self.assertIsInstance(self.entity.filter, AvatarFilter)
-        self.assertEqual(
-            [("servo", self.mock.matrix)],
-            self.mock._chassis_model.motors,
-        )
+        self.assertEqual([self.old_servo], self.mock._chassis_model.motors)
+        self.assertIs(self.old_servo, self.mock._pose_servo)
 
-    def test_startup_rollback_detach_failure_keeps_one_native_owner(self):
+    def test_activation_swap_detach_failure_keeps_python_owner(self):
         class RefuseDetachModel(Model):
             refuse_detach = False
 
@@ -1714,43 +1793,31 @@ class NativeBotPhysicsTest(unittest.TestCase):
             lambda: collision_installs.append(True)
         )
 
-        def reject_adapter_after_model_handoff():
-            model.refuse_detach = True
-            return False
-
-        sys.modules[
-            "OfflineEntity"
-        ].install_native_destructible_callback_adapter = (
-            reject_adapter_after_model_handoff
-        )
         self.assertTrue(self.native.prepare(
             self.player, self.mock, self.descriptor, 7, self.now
         ))
-        native_filter = self.entity.filter
         self.now += self.native.SEED_CHECK_SECONDS + 0.01
+        self.assertTrue(self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )["staging"])
+        self.assertEqual(1, self.simulate())
+        model.refuse_detach = True
+        self.now += self.native.WARMUP_SECONDS + 0.01
 
         result = self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7, self.now
         )
 
         state = getattr(self.mock, self.native.STATE_ATTR)
-        self.assertTrue(result["faulted"])
-        self.assertEqual("faulted", state["phase"])
-        self.assertIs(self.entity.filter, native_filter)
-        self.assertEqual([state["native_servo"]], model.motors)
-        self.assertIsNone(self.mock._pose_servo)
-        self.assertEqual([], collision_installs)
-        self.assertTrue(any(
-            "Python Servo restore failed" in message
-            for level, message in self.logs if level == "error"
-        ))
-
-        model.refuse_detach = False
-        self.assertTrue(self.native.stop_mock(self.mock))
-        self.assertEqual([], model.motors)
+        self.assertIsNone(result)
+        self.assertEqual("failed", state["phase"])
+        self.assertIsInstance(self.entity.filter, AvatarFilter)
+        self.assertEqual([self.old_servo], model.motors)
+        self.assertIs(self.old_servo, self.mock._pose_servo)
         self.assertIsNone(state["native_servo"])
+        self.assertEqual([True], collision_installs)
 
-    def test_model_provider_switches_before_dynamic_physics_and_only_once(self):
+    def test_model_provider_switches_after_hidden_warmup_and_only_once(self):
         events = self.entity.events
 
         class OrderedModel(Model):
@@ -1774,17 +1841,20 @@ class NativeBotPhysicsTest(unittest.TestCase):
         )["staging"])
 
         names = [event[0] for event in events]
-        self.assertLess(names.index("addMotor"),
-                        names.index("setVehiclePhysics"))
-        self.assertLess(names.index("delMotor"),
-                        names.index("setVehiclePhysics"))
-        motors_after_attach = list(self.mock._chassis_model.motors)
+        self.assertNotIn("addMotor", names)
+        self.assertNotIn("delMotor", names)
+        self.assertEqual([self.old_servo], self.mock._chassis_model.motors)
         self.assertEqual(1, self.simulate())
         self.now += self.native.WARMUP_SECONDS + 0.01
         self.assertIsNotNone(self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7, self.now
         ))
-        self.assertEqual(motors_after_attach,
+        names = [event[0] for event in events]
+        self.assertLess(names.index("setVehiclePhysics"),
+                        names.index("delMotor"))
+        self.assertLess(names.index("delMotor"), names.index("addMotor"))
+        state = getattr(self.mock, self.native.STATE_ATTR)
+        self.assertEqual([state["native_servo"]],
                          self.mock._chassis_model.motors)
 
     def test_implausible_active_jump_freezes_without_second_pose_owner(self):
@@ -2280,6 +2350,11 @@ class NativeBotPhysicsTest(unittest.TestCase):
             self.player, self.mock, self.descriptor, 7, self.now
         ))
         self.now += self.native.SEED_CHECK_SECONDS + 0.01
+        self.assertTrue(self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )["staging"])
+        self.assertEqual(1, self.simulate())
+        self.now += self.native.WARMUP_SECONDS + 0.01
         self.assertIsNone(self.native.step(
             self.player, self.mock, self.descriptor, 0, 0, 7, self.now
         ))
