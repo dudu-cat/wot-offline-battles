@@ -371,6 +371,10 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         self.assertIn("_bot_collision_ids == ()", source)
         self.assertIn("eid not in _tank_pair_pending", source)
         self.assertIn("_offh_perf_count('tank_collision_empty')", source)
+        self.assertIn("'native_owner': _native_collision_owner", source)
+        self.assertIn("_o_body.get('native_owner', False)", source)
+        self.assertNotIn("_native_body_manager.reseed(", source)
+        self.assertIn("_native_body_manager.guard_fault(", source)
 
     def test_static_gun_yaw_limits_are_cached_per_vehicle(self):
         source = SOURCE.read_text()

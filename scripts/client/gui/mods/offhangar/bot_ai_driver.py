@@ -311,6 +311,9 @@ class LocalDriver(object):
 		self.separation_radius = max(2.0, float(separation_radius))
 		self.failure_ttl = max(0.25, float(failure_ttl))
 		self.states = {}
+		# Standalone callers are active by default. The battle loop explicitly
+		# supplies the countdown phase before asking this driver for an order.
+		self._battle_active = True
 
 	@staticmethod
 	def resolve_order_positions(position, aim_position, move_position, face_position):
@@ -330,6 +333,13 @@ class LocalDriver(object):
 
 	def forget(self, bot_id):
 		self.states.pop(bot_id, None)
+
+	def set_battle_active(self, active):
+		"""Reset stale steering history when the battle becomes active."""
+		active = bool(active)
+		if active and not self._battle_active:
+			self.states.clear()
+		self._battle_active = active
 
 	def _state(self, bot_id, position):
 		state = self.states.get(bot_id)
@@ -600,6 +610,7 @@ class LocalDriver(object):
 		self._prune_failures(state)
 		state['steering_age'] += step
 		state['plan_age'] += step
+		movement_intent = bool(movement_intent) and self._battle_active
 		desired_yaw = _yaw_to(position, target)
 		state['last_desired_yaw'] = desired_yaw
 		target_distance = _distance(position, target)

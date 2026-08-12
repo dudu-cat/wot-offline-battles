@@ -1,4 +1,4 @@
-WORLD OF TANKS 0.8.2 NATIVE BOT PHYSICS EXPERIMENT 1.8.40
+WORLD OF TANKS 0.8.2 NATIVE BOT PHYSICS EXPERIMENT 1.8.41
 ==========================================================
 
 This is a separate experimental build. It keeps the retail 0.8.2 rigid-body
@@ -15,14 +15,17 @@ Install
 Do not merge individual files. The package must not leave an old
 mod_offhangar.pyc behind.
 
-What changed in 1.8.40
+What changed in 1.8.41
 ----------------------
 
-- Native bodies remain hidden for the complete countdown while the stable
-  Python spawn pose stays visible.
-- A body that sinks, tips or drifts during the countdown falls back before it
-  can take ownership of the visible model.
-- A stable native body takes ownership only on the first active battle frame.
+- Countdown steering no longer accumulates stuck/recovery state, so battle
+  start does not send the whole line-up into an immediate pivot or reverse.
+- Bot pose and speed now come from the same completed native solve. The old
+  zero-valued filter speed and self-fed pose heartbeat are no longer used.
+- A native model is revealed only after a solve has crossed the engine filter
+  tick and remained stable for the full countdown.
+- Player/native contact moves only the Python-owned player side. Water or cliff
+  protection freezes a native body instead of claiming an unverified teleport.
 
 Test
 ----

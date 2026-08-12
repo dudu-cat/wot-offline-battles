@@ -172,6 +172,16 @@ class BotAIDriverTest(unittest.TestCase):
             ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
         ).read_text()
 
+        phase = source.index("_battle_active = (")
+        reset = source.index("_ai_driver.set_battle_active(_battle_active)", phase)
+        intent = source.index(
+            "_driver_intent = bool(_battle_active) and not (", reset
+        )
+        drive = source.index("'driver', _ai_driver.drive", intent)
+        self.assertLess(phase, reset)
+        self.assertLess(reset, intent)
+        self.assertLess(intent, drive)
+
         hull_aim = source.index(".combat_hull_aim(")
         direct_turn = source.find("_PHY.traverse_step(", hull_aim)
         profiled_turn = source.find(
@@ -345,6 +355,46 @@ class BotAIDriverTest(unittest.TestCase):
                 (0.0, 0.0, 40.0), (), lambda angle: True,
             )
         self.assertIn(moving["recovery_mode"], ("reverse_turn", "pivot_recovery"))
+
+    def test_battle_activation_discards_countdown_recovery_once(self):
+        driver = self.module.LocalDriver(stuck_seconds=0.4, recovery_seconds=0.5)
+        order = None
+        for unused in range(10):
+            order = driver.drive(
+                104, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+                (0.0, 0.0, 40.0), (), lambda angle: True,
+            )
+            if order["recovery_mode"] in ("reverse_turn", "pivot_recovery"):
+                break
+
+        self.assertIn(order["recovery_mode"], ("reverse_turn", "pivot_recovery"))
+        contaminated = driver.states[104]
+        self.assertGreater(contaminated["recovery_time"], 0.0)
+
+        driver.set_battle_active(False)
+        countdown = []
+        for unused in range(30):
+            countdown.append(driver.drive(
+                105, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+                (0.0, 0.0, 40.0), (), lambda angle: True,
+            ))
+        self.assertTrue(all(
+            result["recovery_mode"] == "arrived" for result in countdown
+        ))
+        self.assertEqual(0.0, driver.states[105]["stuck_time"])
+        self.assertEqual(0.0, driver.states[105]["recovery_time"])
+
+        driver.set_battle_active(True)
+        self.assertEqual({}, driver.states)
+        active = driver.drive(
+            104, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+            (0.0, 0.0, 40.0), (), lambda angle: True,
+        )
+        self.assertEqual("drive", active["recovery_mode"])
+
+        active_state = driver.states[104]
+        driver.set_battle_active(True)
+        self.assertIs(active_state, driver.states[104])
 
     def test_non_overlapping_side_traffic_does_not_override_route(self):
         driver = self.module.LocalDriver(stuck_seconds=0.6)

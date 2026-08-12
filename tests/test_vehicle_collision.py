@@ -147,6 +147,18 @@ class VehicleCollisionTests(unittest.TestCase):
         self.assertAlmostEqual(0.15, response[0])
         self.assertAlmostEqual(-0.45, response[4])
 
+    def test_dynamic_body_resolves_fully_against_native_static_owner(self):
+        response = self.collision.pair_response(
+            (1.0, 0.0, 0.6), 1.0 / 25.0, 0.0,
+            (-3.0, 0.0), (0.0, 0.0),
+            slop=0.0, percent=1.0,
+        )
+
+        self.assertAlmostEqual(0.6, response[0])
+        self.assertAlmostEqual(0.0, response[4])
+        self.assertAlmostEqual(3.0, response[2])
+        self.assertAlmostEqual(0.0, response[6])
+
     def test_spatial_index_returns_only_neighbouring_cells(self):
         bodies = {
             1: {"position": (1.0, 0.0, 1.0)},

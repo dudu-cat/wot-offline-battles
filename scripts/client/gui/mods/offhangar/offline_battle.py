@@ -915,7 +915,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.40-native-experimental (2026-08-11)'
+_OFFH_BUILD = '1.8.41-native-experimental (2026-08-12)'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -10006,6 +10006,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									inv_o = 0.0
 							except Exception:
 								inv_o = 0.0
+						elif (_o_body is not None and
+								_o_body.get('native_owner', False)):
+							# Python collision cannot teleport an attached WGVehiclePhysics2
+							# body. Resolve the complete hybrid contact on the Python-owned
+							# participant instead of queuing a reciprocal fake correction.
+							inv_o = 0.0
 						o_shape = (_o_body['shape'] if _o_body is not None else
 						           _VC.chassis_shape(otd))
 						if not _VC.vertical_overlap(y, my_shape, oy, o_shape):
@@ -12314,6 +12320,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_player_team = int(getattr(player, '_offhangar_team', 1) or 1)
 				_battle_active = (
 					getattr(getattr(player, 'arena', None), 'period', 3) == 3)
+				_ai_driver.set_battle_active(_battle_active)
 				# F6 runs one invisible, isolated retail-physics capability probe.
 				# It never replaces a production bot; the result is used only to decide
 				# whether a later build may safely move bot integration into C++.
@@ -12477,16 +12484,22 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_python_collision_ids.append(int(_frame_eid))
 						_collision_body = getattr(
 							_frame_vehicle, '_offh_collision_frame_body', None)
+						_native_collision_owner = bool(
+							_frame_eid != _player_vehicle_id and
+							_native_body_manager_frame is not None and
+							_native_body_manager_frame.owns_filter(_frame_vehicle))
 						if _collision_body is None:
 							_collision_body = {
 								'position': _frame_position,
 								'shape': _frame_shape,
 								'radius': _frame_radius,
 								'inv_mass': _frame_inv_mass,
+								'native_owner': _native_collision_owner,
 							}
 							_frame_vehicle._offh_collision_frame_body = _collision_body
 						else:
 							_collision_body['position'] = _frame_position
+							_collision_body['native_owner'] = _native_collision_owner
 						_collision_bodies[_frame_eid] = _collision_body
 						_collision_max_radius = max(
 							_collision_max_radius, _frame_radius)
@@ -12933,7 +12946,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# Pure local driver: the engine supplies terrain/collision probes;
 							# timing, traffic separation, steering hysteresis and alternating
 							# recovery live in one testable state machine.
-							_driver_intent = not (
+							_driver_intent = bool(_battle_active) and not (
 								_ai_throttle_override is not None and
 								float(_ai_throttle_override) <= 0.0)
 							_driver_key = (
@@ -13222,29 +13235,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_b_ypr = (m_veh.yaw, m_veh.pitch, m_veh.roll,
 									0.0, 0.0, 0.0)
 
-								# The local player is still a Python-owned body.  Consume its
-								# bounded reciprocal separation and submit it to the native filter.
-								# The Entity-matrix readback confirms the correction on a later tick;
-								# the requested point is never published as an applied rigid-body pose.
-								_native_pair = _tank_pair_pending.pop(eid, None)
-								if _native_pair is not None:
-									_native_corr_x = float(_native_pair[0])
-									_native_corr_z = float(_native_pair[1])
-									_native_corr_len = math.sqrt(
-										_native_corr_x * _native_corr_x +
-										_native_corr_z * _native_corr_z)
-									if 0.001 < _native_corr_len <= 2.0:
-										_native_corrected = Math.Vector3(
-											m_veh.position.x + _native_corr_x,
-											m_veh.position.y,
-											m_veh.position.z + _native_corr_z)
-										_native_body_manager.reseed(
-											m_veh, _native_corrected, m_veh.yaw,
-											_ai_space_id, _ai_now)
-
-								# Keep the existing dry-pose target around water and
-								# baked cliff shoulders. Native contact resolves terrain, but it
-								# does not own this bot's tactical no-drowning rule.
+								# Native contact resolves terrain, but it does not own this bot's
+								# tactical no-drowning rule. WGVehicleFilter2.input cannot teleport
+								# an attached rigid body, so a realised hazard must fail closed at
+								# the current native pose instead of claiming a rollback.
 								_native_final_hazard = _offh_ai_baked_hazard_near((
 									m_veh.position.x, m_veh.position.y, m_veh.position.z), 1)
 								_native_water = (-1.0 if _native_final_hazard is False else
@@ -13257,11 +13251,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										m_veh.position.y, m_veh.position.z)))
 								if (_native_water > _OFFH_AI_WATER_AVOID_DEPTH or
 										(_native_was_safe and not _native_now_safe)):
-									_native_body_manager.hold(m_veh)
-									_native_body_manager.reseed(
-										m_veh, _native_previous_pose[:3],
-										_native_previous_pose[3], _ai_space_id, _ai_now,
-										safety=True)
+									_native_body_manager.guard_fault(
+										m_veh, 'realised water/cliff hazard')
 									m_veh._veh_velocity = 0.0
 									m_veh._veh_turn_velocity = 0.0
 									m_veh._offh_ai_driver_mode = 'native_guard'

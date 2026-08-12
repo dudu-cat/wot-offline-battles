@@ -26,10 +26,7 @@ STATE_ATTR = '_offh_native_bot_physics_state'
 SEED_CHECK_SECONDS = 0.10
 WARMUP_SECONDS = 0.35
 DYNAMICS_MAX_DT = 0.10
-FILTER_HEARTBEAT_SECONDS = 0.10
-HEARTBEAT_PAUSE_CANARY_ID = 1000
-HEARTBEAT_ON_CANARY_ID = 1001
-HEARTBEAT_CANARY_PAUSE_SECONDS = 3.0
+DRIVE_DIAGNOSTIC_IDS = (1000, 1001)
 GROUND_SUPPORT_RAY_UP = 3.0
 GROUND_SUPPORT_RAY_DOWN = 12.0
 GROUND_SUPPORT_TOLERANCE = 3.0
@@ -37,11 +34,10 @@ WARMUP_SUPPORT_SINK_TOLERANCE = 0.35
 WARMUP_MIN_UP_Y = 0.70710678
 WARMUP_POSITION_TOLERANCE = 0.35
 WARMUP_YAW_TOLERANCE = 0.05
+SEED_POSITION_TOLERANCE = 0.10
+SEED_YAW_TOLERANCE = 0.05
 POSE_POSITION_TOLERANCE = 2.0
 POSE_YAW_TOLERANCE = 0.35
-CORRECTION_POSITION_TOLERANCE = 0.10
-CORRECTION_YAW_TOLERANCE = 0.05
-CORRECTION_ACK_SECONDS = 0.75
 MAX_FRAME_DISPLACEMENT = 12.0
 MAX_SAMPLE_GAP_SECONDS = 2.0
 DISPLACEMENT_SPEED_FACTOR = 1.75
@@ -65,7 +61,6 @@ _COUNTERS = {
 _LAST_ATTACH_TIME = [None]
 _STARTUP_SUMMARY_LOGGED = [False]
 _DRIVE_LOGGED = [False]
-_HEARTBEAT_LOGGED = [False]
 _DYNAMICS_SIMULATOR = [None]
 _LAST_SIMULATION_AT = [None]
 _SIMULATION_FAILED = [False]
@@ -256,18 +251,20 @@ def _entity_pose(state):
 
 
 def _frame_pose(state, timestamp):
-	"""Return the pose produced by this frame's shared native solve."""
+	"""Return the previous native solve published by this engine filter tick."""
 	if state.get('frame_pose_at') == timestamp:
 		return state.get('frame_pose')
 	return _entity_pose(state)
 
 
-def _speed(vehicle_filter, name, default):
+def _physics_speed(physics, name):
 	try:
-		value = float(getattr(vehicle_filter, name))
-		return value if _finite(value) else float(default)
+		value = float(getattr(physics, name))
 	except Exception:
-		return float(default)
+		raise RuntimeError('native physics %s is unavailable' % name)
+	if not _finite(value):
+		raise RuntimeError('native physics %s is invalid' % name)
+	return value
 
 
 def _ground_support(state):
@@ -344,51 +341,9 @@ def _diagnostic_motor_count(mock):
 		return 'unknown'
 
 
-def _is_heartbeat_canary(mock):
-	return _safe_int_attr(mock, 'id', -1) in (
-		HEARTBEAT_PAUSE_CANARY_ID, HEARTBEAT_ON_CANARY_ID)
-
-
-def _log_heartbeat_canary(mock, state):
-	if not _is_heartbeat_canary(mock) or state.get('heartbeat_canary_logged'):
-		return
-	state['heartbeat_canary_logged'] = True
-	LOG_NOTE('NATIVE_BOT_PHYSICS heartbeat_canary id=%s heartbeat=on '
-		'pause_window_ms=%d' % (
-			getattr(mock, 'id', '?'),
-			int(float(state.get('heartbeat_pause_window', 0.0)) * 1000.0)))
-
-
-def _arm_heartbeat_pause(mock, state, when, signals):
-	if (not signals or _safe_int_attr(mock, 'id', -1) !=
-			HEARTBEAT_PAUSE_CANARY_ID or
-			state.get('heartbeat_pause_started_at') is not None):
-		return
-	window = float(state.get('heartbeat_pause_window', 0.0) or 0.0)
-	state['heartbeat_pause_started_at'] = float(when)
-	state['heartbeat_pause_until'] = float(when) + window
-	LOG_NOTE('NATIVE_BOT_PHYSICS heartbeat_canary id=%s heartbeat=paused '
-		'pause_elapsed_ms=0 pause_window_ms=%d' % (
-			getattr(mock, 'id', '?'), int(window * 1000.0)))
-
-
-def _heartbeat_status(state, when):
-	window = float(state.get('heartbeat_pause_window', 0.0) or 0.0)
-	started_at = state.get('heartbeat_pause_started_at')
-	until = state.get('heartbeat_pause_until')
-	if started_at is None:
-		return ('on', 0, int(window * 1000.0 + 0.5))
-	if (started_at is not None and until is not None and
-			float(when) < float(until)):
-		elapsed = max(0.0, float(when) - float(started_at))
-		return ('paused', int(elapsed * 1000.0 + 0.5),
-			int(window * 1000.0 + 0.5))
-	return ('on', int(window * 1000.0 + 0.5),
-		int(window * 1000.0 + 0.5))
-
-
 def _arm_drive_diagnostic(mock, state, when, signals):
-	if (not signals or not _is_heartbeat_canary(mock) or
+	if (not signals or _safe_int_attr(mock, 'id', -1) not in
+			DRIVE_DIAGNOSTIC_IDS or
 			state.get('drive_diagnostic_at') is not None):
 		return
 	state['drive_diagnostic_at'] = float(when)
@@ -398,26 +353,20 @@ def _maybe_log_drive_diagnostic(mock, state, when, signals_before,
 		expected_signals, signals_repaired):
 	armed_at = state.get('drive_diagnostic_at')
 	if (armed_at is None or state.get('drive_diagnostic_logged') or
-			float(when) <= float(armed_at) or not expected_signals):
+		float(when) <= float(armed_at) or not expected_signals):
 		return
 	physics = state.get('physics')
 	vehicle_filter = state.get('filter')
-	heartbeat, pause_elapsed_ms, pause_window_ms = _heartbeat_status(
-		state, when)
 	state['drive_diagnostic_logged'] = True
-	LOG_NOTE('NATIVE_BOT_PHYSICS drive_diagnostic id=%s heartbeat=%s '
-		'pause_elapsed_ms=%d pause_window_ms=%d signals_before=%s '
+	LOG_NOTE('NATIVE_BOT_PHYSICS drive_diagnostic id=%s signals_before=%s '
 		'signals=%s repaired=%s engine_power=%s '
 		'normal_engine_power=%s engine_power_mode=%s frozen=%s '
 		'frozen_during_frame=%s static_mode=%s tracks_contact=%s allow_tracks=%s '
 		'carcass_contact=%s allow_carcass=%s ground_type=%s '
 		'seed_y=%s entity_y=%s body_y=%s placing_y=%s root_motors=%s '
 		'left_contacts=%s right_contacts=%s force=%s '
-		'torque=%s speed=%s longitudinal_speed=%s angular_speed=%s' % (
+		'torque=%s speed=%s rspeed=%s longitudinal_speed=%s angular_speed=%s' % (
 			getattr(mock, 'id', '?'),
-			heartbeat,
-			pause_elapsed_ms,
-			pause_window_ms,
 			str(signals_before),
 			_diagnostic_attr(physics, 'movementSignals'),
 			str(bool(signals_repaired)),
@@ -443,6 +392,7 @@ def _maybe_log_drive_diagnostic(mock, state, when, signals_before,
 			_diagnostic_attr(physics, 'forceApplied'),
 			_diagnostic_attr(physics, 'torqueApplied'),
 			_diagnostic_attr(physics, 'speed'),
+			_diagnostic_attr(physics, 'rspeed'),
 			_diagnostic_attr(vehicle_filter, 'longitudinalSpeed'),
 			_diagnostic_attr(vehicle_filter, 'angularSpeed')))
 
@@ -646,7 +596,6 @@ def _fail(mock, state, reason, preserve_pose=False):
 		pass
 	_clear_callbacks(state.get('physics'))
 	state['reason'] = str(reason)
-	state['queued_correction'] = None
 	if was_active:
 		# Never hot-swap a live native body back to Python. Freeze at the last
 		# validated pose, keep one motion owner, and release it during the normal
@@ -663,8 +612,6 @@ def _fail(mock, state, reason, preserve_pose=False):
 			if pose is not None:
 				state['last_pose'] = pose
 				state['last_pose_at'] = _now()
-		state['pending_correction'] = None
-		state['freeze_reseed'] = False
 		state['phase'] = 'faulted'
 		if was_live:
 			if state.get('counted_active'):
@@ -687,9 +634,7 @@ def _fail(mock, state, reason, preserve_pose=False):
 				if pose is not None:
 					state['last_pose'] = pose
 					state['last_pose_at'] = _now()
-			state['pending_correction'] = None
 			state['pending_fashion'] = None
-			state['freeze_reseed'] = False
 			state['phase'] = 'faulted'
 		else:
 			state['physics'] = None
@@ -701,12 +646,25 @@ def _fail(mock, state, reason, preserve_pose=False):
 		_COUNTERS['startup_failed'] += 1
 	state['frame_pose'] = None
 	state['frame_pose_at'] = None
+	state['frame_output_generation'] = -1
 	_COUNTERS['failed'] += 1
-	LOG_ERROR('NATIVE_BOT_PHYSICS FAIL id=%s phase=%s freeze_reseed=%s reason=%s' % (
-		getattr(mock, 'id', '?'), state.get('phase'),
-		str(state.get('freeze_reseed', 'n/a')), str(reason)))
+	LOG_ERROR('NATIVE_BOT_PHYSICS FAIL id=%s phase=%s reason=%s' % (
+		getattr(mock, 'id', '?'), state.get('phase'), str(reason)))
 	_maybe_log_startup_complete()
 	return False
+
+
+def guard_fault(mock, reason):
+	"""Freeze one active native owner without submitting a filter sample."""
+	state = getattr(mock, STATE_ATTR, None)
+	if not isinstance(state, dict) or state.get('phase') != 'active':
+		return False
+	pose = _entity_pose(state)
+	if pose is not None:
+		state['last_pose'] = pose
+		state['last_pose_at'] = _now()
+	_fail(mock, state, 'native guard fault: %s' % str(reason), True)
+	return state.get('phase') == 'faulted'
 
 
 def _frozen_result(state):
@@ -783,13 +741,14 @@ def _create_dynamics_simulator():
 
 
 def simulate_frame(mocks, dt, timestamp=None):
-	"""Advance every native bot in one stable retail solver batch.
+	"""Capture filter output, then advance every bot in one retail batch.
 
 	The 0.8.2 engine does not schedule client-created WGVehiclePhysics2 bodies.
 	WGDynamicsSimulator.update owns frame reset, terrain/track/carcass contacts,
 	bot-to-bot pairs, force solving and integration. Calling it per vehicle would
-	reset the batch repeatedly and lose native pair contacts, so the battle loop
-	must call this function exactly once before its per-bot pose readback pass.
+	reset the batch repeatedly and lose native pair contacts. WGVehicleFilter2
+	publishes an integrated body on the following engine filter tick, so capture
+	that completed previous solve before advancing the next shared batch.
 	"""
 	if _SIMULATION_FAILED[0]:
 		return 0
@@ -809,6 +768,38 @@ def simulate_frame(mocks, dt, timestamp=None):
 		entries.append((mock, state))
 	if not entries:
 		return 0
+	solve_entries = []
+	for mock, state in entries:
+		if state.get('phase') == 'faulted':
+			# A faulted body remains in the shared batch as a static collision
+			# obstacle, but the property that caused the fault may stay unreadable.
+			# Never re-run live pose/speed validation or count the same fault again.
+			pose = state.get('last_pose')
+			if pose is None or len(pose) < 6:
+				continue
+			solve_entries.append((
+				mock, state, int(state.get('simulated_frames', 0) or 0),
+				pose, 0.0, 0.0))
+			continue
+		try:
+			pose = _entity_pose(state)
+			if pose is None:
+				raise RuntimeError(
+					'native filter tick returned an invalid pose')
+			output_generation = int(
+				state.get('simulated_frames', 0) or 0)
+			if state.get('phase') == 'warmup' and output_generation > 0:
+				warmup_reason = _warmup_pose_reason(mock, state, pose)
+				if warmup_reason is not None:
+					raise RuntimeError(warmup_reason)
+			solve_entries.append((
+				mock, state, output_generation, pose,
+				_physics_speed(state['physics'], 'speed'),
+				_physics_speed(state['physics'], 'rspeed')))
+		except Exception as error:
+			_fail(mock, state, error)
+	if not solve_entries:
+		return 0
 	try:
 		solver_dt = float(dt)
 		if not _finite(solver_dt) or solver_dt <= 0.0:
@@ -823,35 +814,30 @@ def simulate_frame(mocks, dt, timestamp=None):
 			solver_dt = DYNAMICS_MAX_DT
 		if _DYNAMICS_SIMULATOR[0] is None:
 			_DYNAMICS_SIMULATOR[0] = _create_dynamics_simulator()
-		physics = tuple(state['physics'] for mock, state in entries)
+		physics = tuple(
+			state['physics']
+			for mock, state, output_generation, pose, speed, turn_speed
+			in solve_entries)
 		_DYNAMICS_SIMULATOR[0].update(solver_dt, physics, ())
 	except Exception as error:
 		_SIMULATION_FAILED[0] = True
 		_DYNAMICS_SIMULATOR[0] = None
-		for mock, state in entries:
+		for mock, state, output_generation, pose, speed, turn_speed in solve_entries:
 			if state.get('phase') in ('warmup', 'active'):
 				_fail(mock, state, RuntimeError(
 					'native batch simulation failed: %s' % str(error)), True)
 		return 0
 	_LAST_SIMULATION_AT[0] = when
 	valid_count = 0
-	for mock, state in entries:
+	for mock, state, output_generation, pose, speed, turn_speed in solve_entries:
 		if state.get('phase') not in ('warmup', 'active', 'faulted'):
 			continue
-		state['simulated_frames'] = int(
-			state.get('simulated_frames', 0) or 0) + 1
-		pose = _entity_pose(state)
-		if pose is None:
-			_fail(mock, state,
-				RuntimeError('native batch simulation returned an invalid pose'))
-			continue
-		if state.get('phase') == 'warmup':
-			warmup_reason = _warmup_pose_reason(mock, state, pose)
-			if warmup_reason is not None:
-				_fail(mock, state, RuntimeError(warmup_reason))
-				continue
+		state['simulated_frames'] = output_generation + 1
 		state['frame_pose'] = pose
 		state['frame_pose_at'] = when
+		state['frame_output_generation'] = output_generation
+		state['frame_speed'] = speed
+		state['frame_turn_speed'] = turn_speed
 		valid_count += 1
 	if valid_count and not _SIMULATION_LOGGED[0]:
 		_SIMULATION_LOGGED[0] = True
@@ -1043,27 +1029,19 @@ def prepare(player, mock, descriptor, space_id, timestamp=None):
 		'physics': None,
 		'entity_provider': None,
 		'last_input': None,
-		'last_filter_input_at': None,
 		'last_pose': None,
 		'last_pose_at': 0.0,
 		'frame_pose': None,
 		'frame_pose_at': None,
+		'frame_output_generation': -1,
+		'frame_speed': 0.0,
+		'frame_turn_speed': 0.0,
 		'simulated_frames': 0,
-		'pending_correction': None,
-		'queued_correction': None,
 		'pending_fashion': None,
 		'native_servo': None,
 		'counted_active': False,
 		'max_speed': max(1.0, max_speed),
 		'activate_at': 0.0,
-		'next_heartbeat_at': 0.0,
-		'heartbeat_pause_window': (
-			HEARTBEAT_CANARY_PAUSE_SECONDS
-			if _safe_int_attr(mock, 'id', -1) == HEARTBEAT_PAUSE_CANARY_ID
-			else 0.0),
-		'heartbeat_pause_started_at': None,
-		'heartbeat_pause_until': None,
-		'heartbeat_canary_logged': False,
 		'drive_diagnostic_at': None,
 		'drive_diagnostic_logged': False,
 		'seed_check_at': 0.0,
@@ -1102,7 +1080,6 @@ def prepare(player, mock, descriptor, space_id, timestamp=None):
 				vehicle_filter, when, int(space_id), position,
 				(0.0, 0.0, yaw)):
 			raise RuntimeError('Filter::input seed was rejected')
-		state['last_filter_input_at'] = when
 		entity.typeDescriptor = descriptor
 		# See _attach_physics: this flag belongs to the stock Vehicle appearance
 		# lifecycle, not WGVehicleFilter2/WGVehiclePhysics2 ownership.
@@ -1172,60 +1149,6 @@ def _set_drive_input(state, movement, rotation):
 	return signals
 
 
-def _submit_filter_sample(state, when, position, direction, reason):
-	"""Submit at most one sample for a real, strictly newer engine timestamp."""
-	when = float(when)
-	previous = state.get('last_filter_input_at')
-	if previous is not None and when <= float(previous):
-		return False
-	from gui.mods.offhangar import native_filter_bridge
-	if not native_filter_bridge.seed_filter(
-			state['filter'], when, int(state.get('space_id', 0)),
-			position, direction):
-		raise RuntimeError('Filter::input %s was rejected' % reason)
-	state['last_filter_input_at'] = when
-	state['next_heartbeat_at'] = when + FILTER_HEARTBEAT_SECONDS
-	return True
-
-
-def _submit_queued_correction(state, when):
-	queued = state.get('queued_correction')
-	if not isinstance(queued, dict):
-		return False
-	state['space_id'] = int(queued.get('space_id', state.get('space_id', 0)))
-	if not _submit_filter_sample(
-			state, when, queued.get('position'),
-			(0.0, 0.0, float(queued.get('yaw', 0.0))), 'correction'):
-		return False
-	state['pending_correction'] = {
-		'position': queued.get('position'),
-		'yaw': float(queued.get('yaw', 0.0)),
-		'submitted_at': float(when),
-		'safety': bool(queued.get('safety', False)),
-		'timeout_logged': False,
-	}
-	state['queued_correction'] = None
-	return True
-
-
-def _heartbeat_filter(mock, state, pose, when):
-	"""Feed the native post-physics pose back as a fresh retail sample."""
-	pause_until = state.get('heartbeat_pause_until')
-	if pause_until is not None and float(when) < float(pause_until):
-		return False
-	if when < float(state.get('next_heartbeat_at', 0.0) or 0.0):
-		return False
-	if not _submit_filter_sample(
-			state, when, pose[:3], (pose[5], pose[4], pose[3]),
-			'heartbeat'):
-		return False
-	if not _HEARTBEAT_LOGGED[0]:
-		_HEARTBEAT_LOGGED[0] = True
-		LOG_NOTE('NATIVE_BOT_PHYSICS heartbeat active id=%s interval_ms=%d' % (
-			getattr(mock, 'id', '?'), int(FILTER_HEARTBEAT_SECONDS * 1000.0)))
-	return True
-
-
 def step(player, mock, descriptor, throttle, turn, space_id,
 		timestamp=None, active=True):
 	"""Advance staged ownership and return a canonical native pose sample.
@@ -1267,8 +1190,8 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 			pose = _entity_pose(state)
 			if not _pose_matches(
 					state.get('seed_position'), state.get('seed_yaw'), pose,
-					CORRECTION_POSITION_TOLERANCE,
-					CORRECTION_YAW_TOLERANCE):
+					SEED_POSITION_TOLERANCE,
+					SEED_YAW_TOLERANCE):
 				raise RuntimeError(_pose_mismatch_reason(
 					'model_handoff', state, pose))
 			support = _ground_support(state)
@@ -1292,6 +1215,10 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 			if int(state.get('simulated_frames', 0) or 0) <= 0:
 				raise RuntimeError(
 					'native dynamics simulator did not advance during warmup')
+			if int(state.get('frame_output_generation', -1)) <= 0:
+				# The first solve still shares a callback with the pre-solve seed
+				# capture. Wait for the following engine filter tick to publish it.
+				return _staged_result(state)
 			pose = _frame_pose(state, when)
 			warmup_reason = _warmup_pose_reason(mock, state, pose)
 			if warmup_reason is not None:
@@ -1317,8 +1244,6 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 			_COUNTERS['active'] += 1
 			state['counted_active'] = True
 			state['phase'] = 'active'
-			state['next_heartbeat_at'] = when + FILTER_HEARTBEAT_SECONDS
-			_log_heartbeat_canary(mock, state)
 			# Native ownership begins with the Servo swap, but do not report this body
 			# active until its first complete input/readback sample is validated below.
 			newly_activated = True
@@ -1326,17 +1251,8 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 		if state.get('phase') != 'active':
 			return None
 
-		# Corrections are queued by the caller after this bot's step. Submit only
-		# the final request on the next real engine timestamp; manufacturing tiny
-		# timestamp increments makes the retail filter infer impossible velocity.
-		input_submitted = _submit_queued_correction(state, when)
-		pending = state.get('pending_correction')
-		queued = state.get('queued_correction')
-		safety_hold = ((isinstance(pending, dict) and
-			bool(pending.get('safety', False))) or
-			(isinstance(queued, dict) and bool(queued.get('safety', False))))
-		movement = _input_sign(throttle) if active and not safety_hold else 0
-		rotation = _input_sign(turn) if active and not safety_hold else 0
+		movement = _input_sign(throttle) if active else 0
+		rotation = _input_sign(turn) if active else 0
 		keys = (movement, rotation)
 		physics = state.get('physics')
 		expected_signals = _movement_signals(movement, rotation)
@@ -1357,7 +1273,6 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 			needs_drive_update = True
 		if needs_drive_update:
 			signals = _set_drive_input(state, movement, rotation)
-			_arm_heartbeat_pause(mock, state, when, signals)
 			_arm_drive_diagnostic(mock, state, when, signals)
 			if signals and not _DRIVE_LOGGED[0]:
 				_DRIVE_LOGGED[0] = True
@@ -1371,28 +1286,6 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 		pose = _frame_pose(state, when)
 		if pose is None:
 			raise RuntimeError('entity matrix returned an invalid pose')
-		pending = state.get('pending_correction')
-		if isinstance(pending, dict):
-			delta = _pose_delta(
-				pending.get('position'), pending.get('yaw'), pose)
-			if (delta is not None and
-					delta[3] <= CORRECTION_POSITION_TOLERANCE and
-					delta[4] <= CORRECTION_YAW_TOLERANCE):
-				state['pending_correction'] = None
-			elif when - float(pending.get('submitted_at', when)) >= CORRECTION_ACK_SECONDS:
-				if not pending.get('timeout_logged'):
-					pending['timeout_logged'] = True
-					LOG_ERROR('NATIVE_BOT_PHYSICS correction_unconfirmed id=%s safety=%s %s' % (
-						getattr(mock, 'id', '?'), str(bool(pending.get('safety', False))),
-						_pose_mismatch_reason(
-							'correction_ack', state, pose,
-							pending.get('position'), pending.get('yaw'))))
-				# Contact separation is advisory and may be blocked by a real rigid-body
-				# contact, so release it after one diagnostic. A safety correction keeps
-				# its first known-safe target and zero-input hold until readback confirms
-				# it; a later hazardous frame must not replace that target.
-				if not bool(pending.get('safety', False)):
-					state['pending_correction'] = None
 		previous = state.get('last_pose')
 		frame_distance = _distance(previous, pose) if previous is not None else 0.0
 		last_pose_at = float(state.get('last_pose_at', when) or when)
@@ -1408,20 +1301,6 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 					max_displacement, sample_gap))
 		state['last_pose'] = pose
 		state['last_pose_at'] = when
-		pending = state.get('pending_correction')
-		queued = state.get('queued_correction')
-		if (not input_submitted and isinstance(pending, dict) and
-				bool(pending.get('safety', False)) and
-				when >= float(state.get('next_heartbeat_at', 0.0) or 0.0)):
-			# A safety target may remain blocked by terrain indefinitely. Keep the
-			# retail filter sample stream fresh without replacing the first known-safe
-			# target or restarting its acknowledgement timer.
-			input_submitted = _submit_filter_sample(
-				state, when, pending.get('position'),
-				(0.0, 0.0, float(pending.get('yaw', 0.0))),
-				'safety correction retry')
-		elif (not input_submitted and pending is None and queued is None):
-			_heartbeat_filter(mock, state, pose, when)
 		if newly_activated:
 			fashion = state.get('pending_fashion')
 			if fashion is not None:
@@ -1438,54 +1317,14 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 			'yaw': pose[3],
 			'pitch': pose[4],
 			'roll': pose[5],
-			'velocity': _speed(
-				state['filter'], 'longitudinalSpeed',
-				getattr(mock, '_veh_velocity', 0.0) or 0.0),
-			'turn_velocity': _speed(
-				state['filter'], 'angularSpeed',
-				getattr(mock, '_veh_turn_velocity', 0.0) or 0.0),
+			'velocity': float(state.get('frame_speed', 0.0) or 0.0),
+			'turn_velocity': float(state.get('frame_turn_speed', 0.0) or 0.0),
 		}
 	except Exception as error:
 		_fail(mock, state, error)
 		if state.get('phase') == 'faulted':
 			return _frozen_result(state)
 		return None
-
-
-def reseed(mock, position, yaw, space_id, timestamp=None, safety=False):
-	"""Queue one correction for the next real Entity/filter engine tick."""
-	state = getattr(mock, STATE_ATTR, None)
-	if not isinstance(state, dict) or state.get('phase') != 'active':
-		return False
-	when = _now() if timestamp is None else float(timestamp)
-	point = _point_tuple(position)
-	if point is None or not _finite(yaw):
-		return False
-	try:
-		if safety and state.get('last_input') != (0, 0):
-			_set_drive_input(state, 0, 0)
-		# Preserve the first unacknowledged safety target. Repeated hazard/contact
-		# callbacks must not refresh its timeout or claim a newer pose as applied.
-		pending = state.get('pending_correction')
-		queued = state.get('queued_correction')
-		if ((isinstance(pending, dict) and
-				bool(pending.get('safety', False))) or
-				(isinstance(queued, dict) and bool(queued.get('safety', False)))):
-			return True
-		if not safety and (isinstance(pending, dict) or
-				isinstance(queued, dict)):
-			return True
-		state['queued_correction'] = {
-			'position': point,
-			'yaw': float(yaw),
-			'requested_at': when,
-			'space_id': int(space_id),
-			'safety': bool(safety),
-		}
-		return True
-	except Exception as error:
-		_fail(mock, state, 'reseed failed: %s' % str(error))
-		return False
 
 
 def hold(mock):
@@ -1601,11 +1440,10 @@ def stop_mock(mock, restore_filter=False):
 	state['filter'] = None
 	state['physics'] = None
 	state['entity_provider'] = None
-	state['pending_correction'] = None
-	state['queued_correction'] = None
 	state['pending_fashion'] = None
 	state['frame_pose'] = None
 	state['frame_pose_at'] = None
+	state['frame_output_generation'] = -1
 	state['phase'] = 'stopped'
 	if previous_phase in ('preparing', 'seed_wait', 'warmup', 'active'):
 		if previous_phase == 'active' and state.get('counted_active'):
@@ -1631,7 +1469,6 @@ def stop_all(mocks):
 	_LAST_ATTACH_TIME[0] = None
 	_STARTUP_SUMMARY_LOGGED[0] = False
 	_DRIVE_LOGGED[0] = False
-	_HEARTBEAT_LOGGED[0] = False
 	_DYNAMICS_SIMULATOR[0] = None
 	_LAST_SIMULATION_AT[0] = None
 	_SIMULATION_FAILED[0] = False
