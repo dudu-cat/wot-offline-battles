@@ -318,13 +318,23 @@ class NativeBotPhysicsTest(unittest.TestCase):
         bridge.seed_filter = seed_filter
 
         physics_shared = types.ModuleType("physics_shared")
-        physics_shared.initVehiclePhysics = lambda physics, descriptor: None
+        physics_shared.IS_CLIENT = True
+        physics_shared.ROLLER_MODE = False
+
+        def init_vehicle_physics(physics, descriptor):
+            physics.enginePower = (
+                float(descriptor.physics["enginePower"]) * 0.00125
+            )
+            physics.normalEnginePower = physics.enginePower
+
+        physics_shared.initVehiclePhysics = init_vehicle_physics
         physics_shared.NUM_SUBSTEPS = 2
         physics_shared.NUM_ITERATIONS = 10
         physics_shared.FRICTION_RATIO = 1.0
         physics_shared.RESTITUTION = 0.5
         physics_shared.ALLOWED_PENETRATION = 0.01
         physics_shared.MID_SOLVING_ITERATIONS = 4
+        self.physics_shared = physics_shared
 
         arena_type = types.ModuleType("ArenaType")
         arena_type.getVisibilityMask = lambda unused_gameplay: 3
@@ -462,11 +472,95 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.assertEqual(0.2, result["turn_velocity"])
         self.assertAlmostEqual(-7.0, result["position"][2])
         self.assertEqual(1, len(self.bridge_calls))
-        self.assertEqual(500.0, self.entity.wgPhysics.enginePower)
+        self.assertEqual(625.0, self.entity.wgPhysics.enginePower)
         self.assertTrue(any(
             "NATIVE_BOT_PHYSICS drive active" in message and
             "signals=9 frozen=False" in message
             for level, message in self.logs if level == "note"
+        ))
+
+    def test_batch_initialization_uses_server_hull_spring_contract(self):
+        calls = []
+
+        def init_vehicle_physics(physics, descriptor):
+            full_mass = 48.0
+            suspension_mass = 8.0
+            clearance = 0.5
+            compression = 0.25
+            tracks_penetration = 0.1
+            if self.physics_shared.IS_CLIENT:
+                hull_mass = full_mass
+                spring_length = clearance / compression
+            else:
+                hull_mass = full_mass - suspension_mass
+                spring_length = (
+                    clearance + tracks_penetration
+                ) / compression
+            physics.hullMass = hull_mass
+            physics.springLength = spring_length
+            physics.rollerMode = self.physics_shared.ROLLER_MODE
+            physics.enginePower = (
+                float(descriptor.physics["enginePower"]) * 0.00125
+            )
+            physics.normalEnginePower = physics.enginePower
+            calls.append((
+                self.physics_shared.IS_CLIENT,
+                self.physics_shared.ROLLER_MODE,
+                hull_mass,
+                spring_length,
+            ))
+
+        self.physics_shared.initVehiclePhysics = init_vehicle_physics
+
+        result = self.activate()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(1, len(calls))
+        self.assertEqual((False, True, 40.0), calls[0][:3])
+        self.assertAlmostEqual(2.4, calls[0][3])
+        self.assertIs(True, self.entity.wgPhysics.rollerMode)
+        self.assertEqual(40.0, self.entity.wgPhysics.hullMass)
+        self.assertAlmostEqual(2.4, self.entity.wgPhysics.springLength)
+        self.assertEqual(625.0, self.entity.wgPhysics.enginePower)
+        self.assertEqual(
+            625.0,
+            getattr(self.mock, self.native.STATE_ATTR)["base_engine_power"],
+        )
+        self.assertIs(True, self.physics_shared.IS_CLIENT)
+        self.assertIs(False, self.physics_shared.ROLLER_MODE)
+
+    def test_batch_initialization_restores_globals_after_exception(self):
+        calls = []
+
+        def fail_init(unused_physics, unused_descriptor):
+            calls.append((
+                self.physics_shared.IS_CLIENT,
+                self.physics_shared.ROLLER_MODE,
+            ))
+            raise RuntimeError("server physics init failed")
+
+        self.physics_shared.initVehiclePhysics = fail_init
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual([(False, True)], calls)
+        self.assertIs(True, self.physics_shared.IS_CLIENT)
+        self.assertIs(False, self.physics_shared.ROLLER_MODE)
+        self.assertEqual(
+            "failed", getattr(self.mock, self.native.STATE_ATTR)["phase"]
+        )
+        self.assertIsNone(self.entity.wgPhysics)
+        self.assertIsInstance(self.entity.filter, AvatarFilter)
+        self.assertTrue(any(
+            "server physics init failed" in message
+            for level, message in self.logs if level == "error"
         ))
 
     def test_shared_dynamics_simulator_batches_bodies_once_in_id_order(self):
@@ -576,6 +670,80 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.assertIsInstance(self.entity.filter, AvatarFilter)
         self.assertTrue(any(
             "sank below ground support" in message
+            for level, message in self.logs if level == "error"
+        ))
+
+    def test_warmup_rejects_a_root_tilted_past_forty_five_degrees(self):
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+        self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+        self.assertEqual(1, self.simulate())
+        self.entity.matrix.pitch = math.radians(45.1)
+        self.now += self.native.WARMUP_SECONDS + 0.01
+
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual("failed", getattr(
+            self.mock, self.native.STATE_ATTR
+        )["phase"])
+        self.assertIsInstance(self.entity.filter, AvatarFilter)
+        self.assertTrue(any(
+            "lost an upright spawn pose" in message and
+            "tilt_deg=45.1" in message and "simulated_frames=1" in message
+            for level, message in self.logs if level == "error"
+        ))
+
+    def test_warmup_accepts_combined_tilt_below_forty_five_degrees(self):
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+        self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+        self.assertEqual(1, self.simulate())
+        self.entity.matrix.pitch = math.radians(25.0)
+        self.entity.matrix.roll = math.radians(25.0)
+        self.now += self.native.WARMUP_SECONDS + 0.01
+
+        result = self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual("active", getattr(
+            self.mock, self.native.STATE_ATTR
+        )["phase"])
+
+    def test_warmup_tilt_is_rejected_on_the_first_bad_solver_frame(self):
+        self.assertTrue(self.native.prepare(
+            self.player, self.mock, self.descriptor, 7, self.now
+        ))
+        self.now += self.native.SEED_CHECK_SECONDS + 0.01
+        self.native.step(
+            self.player, self.mock, self.descriptor, 0, 0, 7, self.now
+        )
+        self.entity.matrix.roll = math.radians(80.0)
+
+        result = self.simulate()
+
+        state = getattr(self.mock, self.native.STATE_ATTR)
+        self.assertEqual(0, result)
+        self.assertEqual("failed", state["phase"])
+        self.assertIsInstance(self.entity.filter, AvatarFilter)
+        self.assertIsNone(self.entity.wgPhysics)
+        self.assertEqual([self.mock._pose_servo],
+                         self.mock._chassis_model.motors)
+        self.assertTrue(any(
+            "lost an upright spawn pose" in message and
+            "tilt_deg=80.0" in message
             for level, message in self.logs if level == "error"
         ))
 
@@ -865,6 +1033,7 @@ class NativeBotPhysicsTest(unittest.TestCase):
         self.assertIsNotNone(self.activate())
         physics = self.entity.wgPhysics
         vehicle_filter = self.entity.filter
+        physics.enginePower = 500.0
         physics.normalEnginePower = 500.0
         physics.enginePowerMode = 2
         physics.isFrozenDuringFrame = False

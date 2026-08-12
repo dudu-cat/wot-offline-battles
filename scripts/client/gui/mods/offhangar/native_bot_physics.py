@@ -34,6 +34,7 @@ GROUND_SUPPORT_RAY_UP = 3.0
 GROUND_SUPPORT_RAY_DOWN = 12.0
 GROUND_SUPPORT_TOLERANCE = 3.0
 WARMUP_SUPPORT_SINK_TOLERANCE = 0.35
+WARMUP_MIN_UP_Y = 0.70710678
 POSE_POSITION_TOLERANCE = 2.0
 POSE_YAW_TOLERANCE = 0.35
 CORRECTION_POSITION_TOLERANCE = 0.10
@@ -467,6 +468,39 @@ def _pose_matches(expected_position, expected_yaw, actual,
 		delta[4] <= float(yaw_tolerance))
 
 
+def _upright_pose(pose):
+	"""Return the root up-axis Y and total tilt for a finite YPR pose."""
+	if pose is None or len(pose) < 6:
+		return None
+	try:
+		up_y = math.cos(float(pose[4])) * math.cos(float(pose[5]))
+	except Exception:
+		return None
+	if not _finite(up_y):
+		return None
+	up_y = max(-1.0, min(1.0, up_y))
+	return (up_y, math.degrees(math.acos(up_y)))
+
+
+def _warmup_upright_reason(mock, state, pose):
+	upright = _upright_pose(pose)
+	if upright is not None and upright[0] >= WARMUP_MIN_UP_Y:
+		return None
+	up_y = 'invalid' if upright is None else '%.4f' % upright[0]
+	tilt = 'invalid' if upright is None else '%.1f' % upright[1]
+	support = _point_tuple(state.get('ground_support'))
+	support_y = 'invalid' if support is None else '%.3f' % support[1]
+	vehicle_filter = state.get('filter')
+	return ('native body lost an upright spawn pose vehicle=%s pose=%s '
+		'up_y=%s tilt_deg=%s support_y=%s left_contacts=%s '
+		'right_contacts=%s simulated_frames=%d') % (
+		state.get('vehicle_name', '?'), _pose_text(pose), up_y, tilt,
+		support_y,
+		_diagnostic_attr(vehicle_filter, 'numLeftTrackContacts'),
+		_diagnostic_attr(vehicle_filter, 'numRightTrackContacts'),
+		int(state.get('simulated_frames', 0) or 0))
+
+
 def _pose_text(pose):
 	if pose is None:
 		return 'invalid'
@@ -785,6 +819,11 @@ def simulate_frame(mocks, dt, timestamp=None):
 			_fail(mock, state,
 				RuntimeError('native batch simulation returned an invalid pose'))
 			continue
+		if state.get('phase') == 'warmup':
+			upright_reason = _warmup_upright_reason(mock, state, pose)
+			if upright_reason is not None:
+				_fail(mock, state, RuntimeError(upright_reason))
+				continue
 		state['frame_pose'] = pose
 		state['frame_pose_at'] = when
 		valid_count += 1
@@ -807,12 +846,20 @@ def _attach_physics(player, mock, descriptor, state):
 		raise RuntimeError('native destructible callback adapter was rejected')
 	import physics_shared
 	physics = BigWorld.WGVehiclePhysics2()
-	physics_shared.initVehiclePhysics(physics, descriptor)
+	old_is_client = physics_shared.IS_CLIENT
+	old_roller_mode = physics_shared.ROLLER_MODE
+	try:
+		# WGDynamicsSimulator is the retail server-style vehicle solver. Its
+		# suspension contract needs the non-client hull and roller setup even
+		# though this client owns the simulation locally.
+		physics_shared.IS_CLIENT = False
+		physics_shared.ROLLER_MODE = True
+		physics_shared.initVehiclePhysics(physics, descriptor)
+	finally:
+		physics_shared.IS_CLIENT = old_is_client
+		physics_shared.ROLLER_MODE = old_roller_mode
 	physics.setArenaBounds((-10000, -10000), (10000, 10000))
-	base_power = float(_descriptor_value(
-		_descriptor_value(descriptor, 'physics', {}),
-		'enginePower', 0.0)) / 1000.0
-	physics.enginePower = base_power
+	base_power = float(physics.enginePower)
 	physics.owner = weakref.ref(entity)
 	physics.staticMode = False
 	physics.movementSignals = 0
@@ -1223,6 +1270,9 @@ def step(player, mock, descriptor, throttle, turn, space_id,
 					state.get('seed_position'), state.get('seed_yaw'), pose):
 				raise RuntimeError(_pose_mismatch_reason(
 					'warmup', state, pose))
+			upright_reason = _warmup_upright_reason(mock, state, pose)
+			if upright_reason is not None:
+				raise RuntimeError(upright_reason)
 			support = _point_tuple(state.get('ground_support'))
 			if (support is None or
 					float(pose[1]) <

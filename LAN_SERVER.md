@@ -76,7 +76,7 @@ With normal logging settings, each client writes these milestones to
 ```text
 LAN connecting to 192.168.1.20:28782
 LAN TCP connected to 192.168.1.20:28782
-LAN hello sent (protocol 8, build 1.8.38-native-experimental-20260811)
+LAN hello sent (protocol 8, build 1.8.39-native-experimental-20260811)
 LAN welcome id=1 name=Player-158 vehicle=china:Type_59 team=1 slot=0 map=... phase=waiting
 LAN JOIN confirmed; queue screen is now server-backed
 LAN queue UI updated: 2 connected player(s)
