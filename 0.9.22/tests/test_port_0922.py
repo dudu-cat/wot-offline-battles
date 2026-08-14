@@ -352,7 +352,11 @@ class PortSourceTests(unittest.TestCase):
             'org.peng.offline_lan_0922_%s.wotmod' % version, install)
         self.assertIn(
             'org.peng.offline_lan_0922_%s.wotmod' % version, port_readme)
-        self.assertIn('Release `%s`' % version, root_readme)
+        normalized_root_readme = ' '.join(root_readme.split())
+        self.assertIn('pre-release test candidate', normalized_root_readme)
+        self.assertIn(
+            'A formal release will follow validation on two Windows PCs.',
+            normalized_root_readme)
 
     def test_port_sources_are_python_2_compatible_syntax(self):
         source_root = PORT_ROOT / 'src'

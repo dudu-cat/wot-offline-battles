@@ -19,26 +19,53 @@ original BigWorld server.
 
 ## What makes this repository different
 
-The 0.8.2 port extends the offline-hangar and early battle work descended from
-[`mod_offhangar_legacy`](https://github.com/SigmaTel71/mod_offhangar_legacy).
-The 0.9.22 port uses
-[`wot-offline-server`](https://github.com/the-tuxedo-cat/wot-offline-server)
-as a limited map-picker and entity-lifecycle reference. Compared with those
-projects, this repository adds:
+The two credited reference projects are much narrower at the revisions used
+here. [`mod_offhangar_legacy`](https://github.com/SigmaTel71/mod_offhangar_legacy/tree/312534823dab535457f8578d9eae6cf3c549944e)
+describes itself as a partially functional offline hangar: it bypasses login
+and supplies enough account data to inspect vehicles, but does not implement an
+arena or combat. [`wot-offline-server`](https://github.com/the-tuxedo-cat/wot-offline-server/tree/c0bc550c46deac980194b7b860ee8781d53ec97b)
+is an unfinished map-and-vehicle sandbox: it can load a map, an Avatar and one
+hard-coded test vehicle, while firing only plays an effect and its aiming
+handlers are stubs.
 
-- **An end-to-end battle implementation.** Both ports implement 15-versus-15
-  standard-battle flows with movement, aiming, firing, damage, base capture,
-  battle results and repeated rounds.
-- **Two separate, version-locked ports.** The 0.8.2 and 0.9.22 clients have
-  different embedded Python runtimes and native contracts; each has its own
-  implementation rather than sharing transplanted bytecode.
-- **Tactical bots and trusted-LAN play.** Bots use vehicle roles, shared
-  contacts, terrain-aware navigation and combat positioning. The 0.8.2 port
-  includes validated routes and prebaked navigation data for all 33 stock maps
-  and can also run without a server. Both ports coordinate shared LAN battles.
+This repository carries those foundations into a much higher-fidelity
+reconstruction of a standard World of Tanks battle:
 
-See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for exact project
-lineage and licensing.
+- **The original client remains the game engine.** Each version-locked port
+  drives the stock BigWorld maps, Avatar/Vehicle lifecycle, vehicle
+  descriptors, gun, reticle, camera, collision, destructibles and HUD. The two
+  ports are audited against their exact embedded Python runtimes and native
+  contracts instead of sharing transplanted bytecode or replacing the client
+  with a detached simulator.
+- **Combat follows same-era tank mechanics, not simple hitpoint trading.** A
+  round includes 15-versus-15 spawning, countdown, movement and gun limits,
+  ammunition and reloads, elapsed shell flight with gravity and moving-target
+  sweeps, dispersion, range-dependent penetration, normalization, ricochet,
+  overmatch, spaced armour, HE splash, ramming, module and crew damage, fires
+  and repairs. Spotting accounts for view range, camouflage, movement, firing,
+  foliage, line of sight and last-known positions. Capture, elimination and
+  timeout produce a shared result, followed by clean repeated-round state.
+- **Bots fight the map and battle state, not just the nearest target.** Vehicle
+  class and statistics shape stable roles and personalities. Map geometry,
+  terrain, water, traffic, firing lanes, team strength and shared contacts feed
+  route, cover, target and ammunition decisions. Bots can defend, flank, angle,
+  peek, withdraw, stage artillery and use ballistic SPG arcs. The repository
+  ships map-specific navigation and foliage data for all 33 supported 0.8.2
+  maps and all 41 supported 0.9.22 maps.
+- **A LAN match is one shared battle, not a collection of moving vehicles.**
+  The trusted-LAN coordinator synchronizes lineups, countdown, tactical orders,
+  projectiles, HP and critical damage, destructibles, capture, results and
+  round transitions. Round and revision fencing rejects stale or duplicate
+  combat state, while authority failover preserves the match if the active bot
+  controller disconnects.
+
+This is a reconstruction from the frozen clients and same-era mechanics, not a
+source-identical reimplementation of Wargaming's retail server. It implements
+standard battles only; LAN play assumes trusted clients and uses a coordinator,
+not a full or adversarial retail server. The pre-release candidate still awaits
+final validation on two Windows PCs. See
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for exact project lineage and
+licensing.
 
 ## Installation
 
