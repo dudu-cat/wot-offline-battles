@@ -655,7 +655,7 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         )
 
     def test_native_hazard_escape_still_uses_local_driver_direction_probe(self):
-        from tests.test_bot_ai_driver import load_driver
+        from test_bot_ai_driver import load_driver
 
         escape_target = load_native_hazard_escape_target()
         driver = load_driver().LocalDriver()

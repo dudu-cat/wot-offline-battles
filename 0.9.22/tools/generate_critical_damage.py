@@ -526,7 +526,7 @@ def extract_block(source, kind, name):
 
 def generate(repo_root):
     repo_root = Path(repo_root).resolve()
-    source_path = (repo_root / 'scripts/client/gui/mods/offhangar' /
+    source_path = (repo_root / '0.8.2/scripts/client/gui/mods/offhangar' /
                    'offline_battle.py')
     target_path = (repo_root / '0.9.22/src/res/scripts/client/gui/mods' /
                    'offline_lan_0922/critical_damage.py')

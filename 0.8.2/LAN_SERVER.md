@@ -8,19 +8,6 @@ roster, health, deaths, battle rules, global bot orders, static navigation-graph
 pathfinding and the relay for human/bot movement, firing and client-resolved
 armor impacts.
 
-The 0.9.22 port is self-contained under `0.9.22`; use its
-version-local client, server, tests and [README](0.9.22/README.md).
-Do not mix either port's client package or server protocol with the other.
-
-For 0.9.22, double-click `WoT-0.9.22-LAN-Server.exe` from the Windows server
-download, or run `python3 0.9.22/server/lan_battle_server.py` with no arguments.
-Both forms listen on `0.0.0.0:28782` and use the `server_random` map policy.
-The 0.9.22 client defaults to `127.0.0.1:28782`; an address changed in its
-in-game LAN window is saved to
-`mods/configs/offline_lan_0922/server_endpoint.json` and is not replaced by a
-later release overlay. The remainder of this document describes the separate
-0.8.2 LAN implementation.
-
 ## Start the server
 
 Run this on the machine that hosts the battle:

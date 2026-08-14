@@ -14,7 +14,7 @@ NAVGRAPHS = ROOT / '0.9.22' / 'navgraphs'
 
 
 def load_tool(name):
-    path = ROOT / 'tools' / (name + '.py')
+    path = ROOT / '0.8.2' / 'tools' / (name + '.py')
     spec = importlib.util.spec_from_file_location('route_review_' + name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

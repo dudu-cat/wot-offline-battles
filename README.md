@@ -217,12 +217,14 @@ frame-pacing acceptance; the visible hitch is not claimed fixed.
 
 ## World of Tanks 0.8.2
 
+The complete version-local overview is in [`0.8.2/README.md`](0.8.2/README.md).
+
 > [!IMPORTANT]
 > This project targets the original Windows 0.8.2 client and its embedded
 > Python 2.6 runtime. It does not provide the game client or a standalone game.
-> The `experiment/native-vehicle-physics` branch is a separately packaged,
-> version-locked native bot-physics experiment. Read
-> `START_NATIVE_TEST_HERE.txt` before installing that branch.
+> The version-locked native bot-physics release lives under `0.8.2/`, in
+> parallel with the separate `0.9.22/` port. Read
+> `0.8.2/START_NATIVE_TEST_HERE.txt` before installing it.
 
 Play World of Tanks 0.8.2 offline: no login, no server. You go straight to the
 hangar, pick a tank and fight bots on the real maps.
@@ -251,8 +253,8 @@ does not switch back to the legacy chase logic.
 
 Install
 -------
-For the native 1.8.57 experiment, read `START_NATIVE_TEST_HERE.txt` and then
-open `START_HERE.txt`: close the game, delete or move aside the old
+For the native 1.8.57 experiment, read `0.8.2/START_NATIVE_TEST_HERE.txt` and
+then open `0.8.2/START_HERE.txt`: close the game, delete or move aside the old
 `res_mods\0.8.2`, then drag the package's complete `0.8.2` folder into the
 game's `res_mods` folder. The package also includes double-clickable Windows
 and macOS LAN-server launchers.
@@ -261,13 +263,13 @@ For a source checkout, the Windows refresh helper is:
 
 Close the game first. On Windows, the simplest update is:
 
-    refresh_client.bat "C:\Games\World_of_Tanks_0.8.2"
+    0.8.2\refresh_client.bat "C:\Games\World_of_Tanks_0.8.2"
 
 The batch file copies the client files and removes one stale entry bytecode
 file that otherwise hides updated source code in this old client.
 
-For manual installation, this zip starts at  scripts/  and  gui/ .
-Extract it INTO:  <WoT 0.8.2 game root>/res_mods/0.8.2/
+For manual installation from a source checkout, copy `0.8.2/scripts/` and
+`0.8.2/gui/` into:  <WoT 0.8.2 game root>/res_mods/0.8.2/
 so the files land at:  res_mods/0.8.2/scripts/client/gui/mods/mod_offhangar.py
 
 When updating an existing installation, also delete:
@@ -308,14 +310,15 @@ LAN setup (0.8.2)
 For the optional LAN mode, click the visible `LAN SETTINGS` entry in the
 upper-right of the offline hangar. If mouse input is unavailable, `F11` remains
 a fallback. Enter the server IP and TCP port, toggle LAN battle, and press
-`Enter` to save. Start `lan_battle_server.py`, then click `Battle!` on every
-client to join its single waiting room. The queue screen opens only after the
-server accepts the connection, and its displayed player total follows the real
-server roster. The server terminal prints one `JOIN` line per client. Use the
-clickable waiting-room panel to choose a map and click `START BATTLE`; the server
-broadcasts one start with that map to every client. LAN mode never starts a
-local random-map timer while it is waiting or after a failed connection. A
-client that connects after the round starts joins the current round.
+`Enter` to save. Start `0.8.2/lan_battle_server.py`, then click `Battle!` on
+every client to join its single waiting room. The queue screen opens only
+after the server accepts the connection, and its displayed player total
+follows the real server roster. The server terminal prints one `JOIN` line per
+client. Use the clickable waiting-room panel to choose a map and click `START
+BATTLE`; the server broadcasts one start with that map to every client. LAN
+mode never starts a local random-map timer while it is waiting or after a
+failed connection. A client that connects after the round starts joins the
+current round.
 
 The first client in the battle is elected as map-simulation/rules authority.
 It uploads vehicle profiles, standard-battle route anchors and limited spotting
@@ -335,7 +338,8 @@ placeholders.
 
 Only the server process needs an external Python 3 installation; the client
 mod uses the Python 2 runtime already embedded in the 0.8.2 client. See
-LAN_SERVER.md for the server command, diagnostics and Parallels network notes.
+`0.8.2/LAN_SERVER.md` for the server command, diagnostics and Parallels
+network notes.
 
 
 In battle

@@ -36,7 +36,7 @@ class ReleaseLayoutTests(unittest.TestCase):
         retired_path = '/'.join(('ports', '0.9.22'))
         paths = (
             ROOT / 'README.md',
-            ROOT / 'LAN_SERVER.md',
+            ROOT / '0.8.2' / 'LAN_SERVER.md',
             ROOT / 'THIRD_PARTY_NOTICES.md',
             ROOT / '.github' / 'workflows' / 'tests.yml',
             PORT_ROOT / 'README.md',

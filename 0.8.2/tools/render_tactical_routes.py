@@ -21,6 +21,9 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 
+VERSION_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_NAVGRAPH_DIR = (
+    VERSION_ROOT / "scripts/client/gui/mods/offhangar/navgraphs")
 PALETTE = (
     (55, 145, 255),
     (255, 150, 35),
@@ -380,7 +383,7 @@ def main():
     parser.add_argument("--client-root", type=Path, required=True,
                         help="World of Tanks client directory")
     parser.add_argument("--navgraph-dir", type=Path,
-                        default=Path("scripts/client/gui/mods/offhangar/navgraphs"))
+                        default=DEFAULT_NAVGRAPH_DIR)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--size", type=int, default=1000)
     parser.add_argument("--clean", action="store_true")

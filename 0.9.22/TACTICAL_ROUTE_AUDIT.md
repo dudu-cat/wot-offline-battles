@@ -132,7 +132,7 @@ The final candidate is rendered separately so neither annotation batch nor the
 Round 2 output is overwritten:
 
 ```sh
-python3 tools/render_tactical_routes.py \
+python3 0.8.2/tools/render_tactical_routes.py \
   --client-root "/path/to/World_of_Tanks_0.09.22.00.01_CH_1513_HD" \
   --navgraph-dir 0.9.22/navgraphs \
   --output-dir "/path/to/WoT-0.9.22-Tactical-Routes-Review-Round4-All" \

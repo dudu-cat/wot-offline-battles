@@ -18,6 +18,7 @@ jobs:
       - name: Install pinned test dependencies
         run: python -m pip install Pillow==12.3.0
       - name: Run 0.8.2 and shared test suite
+        working-directory: 0.8.2
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python -m unittest discover -s tests -p "test_*.py" -v
@@ -30,11 +31,16 @@ jobs:
       - name: Check Python 2.6 client syntax
         run: |
           docker run --rm --entrypoint /bin/sh -v "$PWD:/work:ro" zinainfra/python26 -c '
-            cp -R /work/scripts /tmp/scripts
+            cp -R /work/0.8.2/scripts /tmp/scripts
             for source in $(find /tmp/scripts/client/gui/mods -name "*.py" -type f); do
               python2.6 -m py_compile "$source" || exit 1
             done
           '
+      - name: Audit 0.8.2 replacement package
+        run: >-
+          python 0.8.2/tools/package_native_experiment.py
+          --output-dir "$RUNNER_TEMP/wot-082"
+          --version 1.8.57
       - name: Audit 0.9.22 battle source provenance
         run: python 0.9.22/tools/audit_battle_sources.py
       - name: Build Python 2.7 0.9.22 LAN client

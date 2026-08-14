@@ -13,24 +13,25 @@ import tempfile
 import zipfile
 
 
-ROOT = Path(__file__).resolve().parents[1]
-TOP_LEVEL_FILES = (
+VERSION_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = VERSION_ROOT.parent
+VERSION_TOP_LEVEL_FILES = (
     "INSTALL.txt",
     "INSTALL_CLIENT.txt",
     "LAN_SERVER.md",
-    "LICENSE",
     "PERFORMANCE_TEST.txt",
     "README.md",
     "RUN_SERVER.bat",
     "RUN_SERVER.command",
     "START_HERE.txt",
     "START_NATIVE_TEST_HERE.txt",
-    "THIRD_PARTY_NOTICES.md",
     "VERSION.txt",
     "lan_battle_server.py",
     "server_bot_ai.py",
     "server_bot_navigation.py",
 )
+SHARED_TOP_LEVEL_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md")
+TOP_LEVEL_FILES = VERSION_TOP_LEVEL_FILES + SHARED_TOP_LEVEL_FILES
 PAYLOAD_PREFIXES = ("gui/", "scripts/")
 REQUIRED_PYC = {
     "0.8.2/scripts/client/CameraNode.pyc",
@@ -41,9 +42,29 @@ EXPECTED_TOP_LEVEL = set(TOP_LEVEL_FILES) | {
 }
 
 
-def _tracked_files(*prefixes: str) -> list[str]:
+def _tracked_version_files(*prefixes: str) -> list[str]:
+    version_prefix = VERSION_ROOT.relative_to(PROJECT_ROOT).as_posix() + "/"
+    project_prefixes = [version_prefix + prefix for prefix in prefixes]
     output = subprocess.check_output(
-        ["git", "ls-files", "--", *prefixes], cwd=str(ROOT), text=True
+        ["git", "ls-files", "--", *project_prefixes],
+        cwd=str(PROJECT_ROOT),
+        text=True,
+    )
+    tracked = []
+    for line in output.splitlines():
+        if not line:
+            continue
+        if not line.startswith(version_prefix):
+            raise RuntimeError("tracked file escaped version root: %s" % line)
+        tracked.append(line[len(version_prefix):])
+    return tracked
+
+
+def _tracked_project_files(*prefixes: str) -> list[str]:
+    output = subprocess.check_output(
+        ["git", "ls-files", "--", *prefixes],
+        cwd=str(PROJECT_ROOT),
+        text=True,
     )
     return [line for line in output.splitlines() if line]
 
@@ -122,7 +143,7 @@ def _assigned_string(path: Path, name: str) -> str:
 
 def _audit_identity(version: str) -> None:
     expected = "%s-native-experimental-20260814" % version
-    version_text = (ROOT / "VERSION.txt").read_text(encoding="utf-8")
+    version_text = (VERSION_ROOT / "VERSION.txt").read_text(encoding="utf-8")
     required_lines = (
         "Package: native bot physics experiment %s" % version,
         "LAN protocol: 8",
@@ -132,12 +153,13 @@ def _audit_identity(version: str) -> None:
     for line in required_lines:
         if line not in version_text.splitlines():
             raise RuntimeError("VERSION.txt identity mismatch: %s" % line)
-    server_build = _assigned_string(ROOT / "lan_battle_server.py", "CLIENT_BUILD")
+    server_build = _assigned_string(
+        VERSION_ROOT / "lan_battle_server.py", "CLIENT_BUILD")
     client_build = _assigned_string(
-        ROOT / "scripts/client/gui/mods/offhangar/network_battle.py",
+        VERSION_ROOT / "scripts/client/gui/mods/offhangar/network_battle.py",
         "CLIENT_BUILD")
     offline_build = _assigned_string(
-        ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py",
+        VERSION_ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py",
         "_OFFH_BUILD")
     if server_build != expected or client_build != expected:
         raise RuntimeError(
@@ -162,12 +184,14 @@ def build(output_dir: Path, version: str) -> tuple[Path, Path]:
     with tempfile.TemporaryDirectory(prefix="offh-native-package-") as temp:
         wrapper = Path(temp) / stem
         payload = wrapper / "0.8.2"
-        for relative in _tracked_files(*PAYLOAD_PREFIXES):
-            _copy(ROOT / relative, payload / relative)
-        for relative in TOP_LEVEL_FILES:
-            _copy(ROOT / relative, wrapper / relative)
-        for relative in _tracked_files("licenses"):
-            _copy(ROOT / relative, wrapper / relative)
+        for relative in _tracked_version_files(*PAYLOAD_PREFIXES):
+            _copy(VERSION_ROOT / relative, payload / relative)
+        for relative in VERSION_TOP_LEVEL_FILES:
+            _copy(VERSION_ROOT / relative, wrapper / relative)
+        for relative in SHARED_TOP_LEVEL_FILES:
+            _copy(PROJECT_ROOT / relative, wrapper / relative)
+        for relative in _tracked_project_files("licenses"):
+            _copy(PROJECT_ROOT / relative, wrapper / relative)
         _write_checksums(wrapper)
 
         shutil.copytree(wrapper, destination)
