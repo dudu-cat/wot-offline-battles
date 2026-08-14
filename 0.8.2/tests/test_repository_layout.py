@@ -1,4 +1,6 @@
 from pathlib import Path
+import runpy
+import tempfile
 import unittest
 
 
@@ -21,6 +23,21 @@ class RepositoryLayoutTests(unittest.TestCase):
         for name in ('LICENSE', 'THIRD_PARTY_NOTICES.md', 'licenses'):
             self.assertTrue((PROJECT_ROOT / name).exists(), name)
             self.assertFalse((VERSION_ROOT / name).exists(), name)
+
+    def test_packager_reads_identity_from_python_2_source(self):
+        packager = runpy.run_path(
+            str(VERSION_ROOT / 'tools' / 'package_native_experiment.py'))
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'legacy.py'
+            source.write_text(
+                "BUILD_ID = 'legacy-build'\n"
+                "try:\n"
+                "    pass\n"
+                "except Exception, error:\n"
+                "    pass\n",
+                encoding='utf-8')
+            self.assertEqual(
+                'legacy-build', packager['_assigned_string'](source, 'BUILD_ID'))
 
 
 if __name__ == '__main__':

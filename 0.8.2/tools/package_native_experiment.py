@@ -130,14 +130,14 @@ def _audit_entries(names: list[str], wrapper: str) -> None:
 
 
 def _assigned_string(path: Path, name: str) -> str:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == name:
-                    value = ast.literal_eval(node.value)
-                    if isinstance(value, str):
-                        return value
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line != line.lstrip():
+            continue
+        target, separator, expression = line.partition("=")
+        if separator and target.strip() == name:
+            value = ast.literal_eval(expression.strip())
+            if isinstance(value, str):
+                return value
     raise RuntimeError("%s has no string assignment for %s" % (path, name))
 
 
