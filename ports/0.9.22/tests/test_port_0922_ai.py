@@ -12,7 +12,7 @@ CLIENT_SCRIPTS = PORT_ROOT / 'src' / 'res' / 'scripts' / 'client'
 sys.path.insert(0, str(PORT_ROOT / 'server'))
 sys.path.insert(0, str(CLIENT_SCRIPTS))
 
-from gui.mods.offline_lan_0922.ai import cover, maps
+from gui.mods.offline_lan_0922.ai import cover, maps, reviewed_routes_20260811
 from gui.mods.offline_lan_0922.ai.adapter import BotAdapter
 from gui.mods.offline_lan_0922.ai.driver import LocalDriver
 from gui.mods.offline_lan_0922.ai.planner import (
@@ -112,6 +112,78 @@ class BotAiPortTests(unittest.TestCase):
         self.assertEqual('01_karelia', karelia['name'])
         self.assertTrue(karelia['routes'][1])
         self.assertTrue(karelia['routes'][2])
+
+    def test_installs_all_user_reviewed_route_batches(self):
+        reviewed = set(reviewed_routes_20260811.REVIEWED_ROUTE_POINTS)
+        accepted = set(reviewed_routes_20260811.ACCEPTED_UNCHANGED_MAPS)
+        self.assertEqual(38, len(reviewed))
+        self.assertEqual(113, sum(
+            len(routes) for routes in
+            reviewed_routes_20260811.REVIEWED_ROUTE_POINTS.values()))
+        self.assertEqual(
+            {'34_redshire', '95_lost_city', '100_thepit'}, accepted)
+        self.assertFalse(reviewed & accepted)
+
+        original_maps = {'04_himmelsdorf': maps.HIMMELSDORF}
+        for collection in (
+                maps.bot_ai_maps_group_a.TACTICAL_MAPS_GROUP_A,
+                maps.bot_ai_maps_group_b.TACTICAL_MAPS_GROUP_B,
+                maps.bot_ai_maps_group_c.TACTICAL_MAPS_GROUP_C,
+                maps.bot_ai_maps_extra.TACTICAL_MAPS_EXTRA,
+                maps.bot_ai_maps_0922_extra.TACTICAL_MAPS_0922_EXTRA):
+            original_maps.update(collection)
+        for map_name in reviewed:
+            self.assertIsNot(
+                original_maps[map_name], maps.TACTICAL_MAPS[map_name],
+                map_name)
+        graph_maps = set(
+            path.stem for path in (PORT_ROOT / 'navgraphs').glob('*.json')
+            if path.name != 'manifest.json')
+        self.assertEqual(graph_maps, reviewed | accepted)
+        for map_name in accepted:
+            self.assertIs(
+                original_maps[map_name], maps.TACTICAL_MAPS[map_name],
+                map_name)
+
+        ensk = maps.TACTICAL_MAPS['06_ensk']
+        for team in (1, 2):
+            self.assertEqual(
+                ['west_city', 'east_field'],
+                [route['id'] for route in ensk['routes'][team]])
+            self.assertEqual(
+                [7, 7],
+                [route['capacity'] for route in ensk['routes'][team]])
+
+    def test_reviewed_route_geometry_is_bidirectional_and_single_gated(self):
+        for map_name, reviewed_routes in sorted(
+                reviewed_routes_20260811.REVIEWED_ROUTE_POINTS.items()):
+            tactical = maps.TACTICAL_MAPS[map_name]
+            team_routes = {}
+            for team in (1, 2):
+                team_routes[team] = dict(
+                    (route['id'], route)
+                    for route in tactical['routes'][team])
+            with self.subTest(map=map_name):
+                self.assertTrue(set(reviewed_routes).issubset(team_routes[1]))
+                self.assertEqual(set(team_routes[1]), set(team_routes[2]))
+                for route_id in reviewed_routes:
+                    team_one = team_routes[1][route_id]['waypoints']
+                    team_two = team_routes[2][route_id]['waypoints']
+                    self.assertEqual(1, sum(
+                        int(bool(point[2])) for point in team_one))
+                    self.assertEqual(tuple(reversed(team_one)), team_two)
+                    for key in ('capacity', 'risk', 'role_weights'):
+                        self.assertEqual(
+                            team_routes[1][route_id][key],
+                            team_routes[2][route_id][key])
+
+        himmelsdorf = maps.TACTICAL_MAPS['04_himmelsdorf']
+        rear_one = next(route for route in himmelsdorf['routes'][1]
+                        if route['id'] == 'rear_guard')
+        rear_two = next(route for route in himmelsdorf['routes'][2]
+                        if route['id'] == 'rear_guard')
+        self.assertEqual(((-80.0, -270.0, 1),), rear_one['waypoints'])
+        self.assertEqual(((45.0, 270.0, 1),), rear_two['waypoints'])
 
     def test_cover_contract_is_plain_data_and_deterministic(self):
         result = cover.score_candidates([{
@@ -318,6 +390,26 @@ class BotAiPortTests(unittest.TestCase):
             ('prune', 2.1), ('trim', None),
         ], calls)
 
+    def test_empty_failed_edge_table_skips_route_segment_scans(self):
+        grid = TerrainGrid(lambda *unused: 0.0)
+
+        def unexpected_scan(*unused):
+            raise AssertionError('empty failed-edge table scanned a route')
+
+        grid._edge_keys_for_segment = unexpected_scan
+        self.assertEqual(0.0, grid.segment_penalty(
+            (0.0, 0.0, 0.0), (20.0, 0.0, 0.0), 1.0))
+        self.assertFalse(grid.path_has_penalty((
+            (0.0, 0.0, 0.0), (20.0, 0.0, 0.0)), 1.0))
+
+        edge = ((0, 0), (1, 0))
+        grid._failed_edges[edge] = (10.0, 7.0)
+        grid._edge_keys_for_segment = lambda *unused: (edge,)
+        self.assertEqual(7.0, grid.segment_penalty(
+            (0.0, 0.0, 0.0), (4.0, 0.0, 0.0), 1.0))
+        self.assertTrue(grid.path_has_penalty((
+            (0.0, 0.0, 0.0), (4.0, 0.0, 0.0)), 1.0))
+
     def test_superseded_route_join_search_is_cancelled_for_its_bot(self):
         navigator = TerrainNavigator(lambda *unused: 0.0)
         route_join = (('route_join', 11, 2, 'forest', 1), (4, 5))
@@ -447,6 +539,57 @@ class BotAiPortTests(unittest.TestCase):
         self.assertEqual(1.0, order['throttle'])
         self.assertGreater(order['turn'], 0.9)
 
+    def test_brief_traffic_wait_does_not_trigger_reverse_recovery(self):
+        driver = LocalDriver()
+        order = None
+        for unused in range(10):
+            order = driver.drive(
+                130, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+                (0.0, 0.0, 50.0), (), lambda unused_yaw: True)
+            driver.wait_for_traffic(130)
+
+        state = driver.states[130]
+        self.assertEqual('drive', order['recovery_mode'])
+        self.assertEqual((0.0, 0.0), (
+            state['stuck_time'], state['recovery_time']))
+
+    def test_continuous_traffic_wait_eventually_allows_recovery(self):
+        driver = LocalDriver()
+        recovery = None
+        for unused in range(80):
+            order = driver.drive(
+                131, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+                (0.0, 0.0, 50.0), (), lambda unused_yaw: True)
+            if order['recovery_mode'] in (
+                    'reverse_turn', 'pivot_recovery'):
+                recovery = order
+                break
+            driver.wait_for_traffic(131)
+
+        self.assertIsNotNone(recovery)
+        self.assertGreater(
+            driver.states[131]['traffic_wait_time'], 1.5)
+
+    def test_moving_between_traffic_waits_renews_the_brief_lease(self):
+        driver = LocalDriver()
+        for unused in range(10):
+            driver.drive(
+                132, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+                (0.0, 0.0, 50.0), (), lambda unused_yaw: True)
+            driver.wait_for_traffic(132)
+
+        driver.drive(
+            132, (1.0, 0.0, 0.0), 0.0, 2.0, 0.1,
+            (0.0, 0.0, 50.0), (), lambda unused_yaw: True)
+        order = driver.drive(
+            132, (1.2, 0.0, 0.0), 0.0, 2.0, 0.1,
+            (0.0, 0.0, 50.0), (), lambda unused_yaw: True)
+        driver.wait_for_traffic(132)
+
+        state = driver.states[132]
+        self.assertEqual('drive', order['recovery_mode'])
+        self.assertAlmostEqual(0.1, state['traffic_wait_time'])
+
     def test_wall_avoidance_commits_to_one_clear_branch(self):
         driver = LocalDriver()
 
@@ -465,6 +608,55 @@ class BotAiPortTests(unittest.TestCase):
         self.assertEqual('avoid', first['recovery_mode'])
         self.assertAlmostEqual(
             first['target_yaw'], second['target_yaw'], places=6)
+
+    def test_repeated_obstacle_failures_widen_on_one_side(self):
+        driver = LocalDriver(failure_ttl=5.0)
+        first = driver.drive(
+            17, (0.0, 0.0, 0.0), 0.0, 2.0, 0.1,
+            (0.0, 0.0, 50.0), (), lambda unused_yaw: True)
+        driver.remember_failure(17, first['target_yaw'], ttl=5.0)
+        second = driver.drive(
+            17, (0.0, 0.0, 0.0), 0.0, 2.0, 0.1,
+            (0.0, 0.0, 50.0), (), lambda unused_yaw: True)
+        driver.remember_failure(17, second['target_yaw'], ttl=5.0)
+        third = driver.drive(
+            17, (0.0, 0.0, 0.0), 0.0, 2.0, 0.1,
+            (0.0, 0.0, 50.0), (), lambda unused_yaw: True)
+
+        self.assertEqual('avoid', second['recovery_mode'])
+        self.assertEqual('avoid', third['recovery_mode'])
+        self.assertGreater(second['target_yaw'] * third['target_yaw'], 0.0)
+        self.assertGreater(abs(third['target_yaw']),
+                           abs(second['target_yaw']))
+
+    def test_adjacent_bots_choose_opposite_initial_escape_sides(self):
+        driver = LocalDriver(failure_ttl=5.0)
+        escaped = []
+        for bot_id in (20, 21):
+            straight = driver.drive(
+                bot_id, (0.0, 0.0, 0.0), 0.0, 2.0, 0.1,
+                (0.0, 0.0, 50.0), (), lambda unused_yaw: True)
+            driver.remember_failure(
+                bot_id, straight['target_yaw'], ttl=5.0)
+            escaped.append(driver.drive(
+                bot_id, (0.0, 0.0, 0.0), 0.0, 2.0, 0.1,
+                (0.0, 0.0, 50.0), (),
+                lambda unused_yaw: True)['target_yaw'])
+
+        self.assertLess(escaped[0] * escaped[1], 0.0)
+
+    def test_uphill_turn_aligns_before_applying_drive_torque(self):
+        driver = LocalDriver()
+        uphill = driver.drive(
+            120, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+            (20.0, 6.0, 20.0), (), lambda unused_yaw: True)
+        flat = driver.drive(
+            121, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
+            (20.0, 0.0, 20.0), (), lambda unused_yaw: True)
+
+        self.assertEqual(0.0, uphill['throttle'])
+        self.assertGreater(abs(uphill['turn']), 0.9)
+        self.assertEqual(1.0, flat['throttle'])
 
 
 if __name__ == '__main__':

@@ -83,6 +83,9 @@ def _load_runtime():
     import SoundGroups
     import Vehicle
     import VehicleGunRotator
+    from AvatarInputHandler.DynamicCameras import AccelerationSmoother
+    from AvatarInputHandler.DynamicCameras.ArcadeCamera import ArcadeCamera
+    from AvatarInputHandler.DynamicCameras.SniperCamera import SniperCamera
     import AvatarInputHandler.AimingSystems.steady_vehicle_matrix as \
         SteadyVehicleMatrix
     import vehicle_systems.CompoundAppearance as CompoundAppearanceModule
@@ -109,6 +112,8 @@ def _load_runtime():
     runtime.avatar_input_handler = AvatarInputHandler
     runtime.control_modes = ControlModes
     runtime.avatar_position_control = AvatarPositionControl
+    runtime.acceleration_smoother_type = AccelerationSmoother
+    runtime.arcade_camera_type = ArcadeCamera
     runtime.bigworld = BigWorld
     runtime.chat_manager = ChatManager.chatManager
     runtime.compound_appearance_module = CompoundAppearanceModule
@@ -122,6 +127,7 @@ def _load_runtime():
     runtime.predefined_hosts = g_preDefinedHosts
     runtime.prb_loader = g_prbLoader
     runtime.sound_groups_module = SoundGroups
+    runtime.sniper_camera_type = SniperCamera
     runtime.steady_vehicle_matrix = SteadyVehicleMatrix
     runtime.vehicle_module = Vehicle
     runtime.vehicle_marker_plugin_type = VehicleMarkerPlugin
@@ -241,11 +247,15 @@ class _OfflineEventSink(object):
 class _OfflineVehicleFilterSyncProxy(object):
     """Delegate WGVehicleFilter except for unsafe retail-only syncs."""
 
-    __slots__ = ('_vehicle_filter', '_pose_matrix')
+    __slots__ = (
+        '_vehicle_filter', '_pose_matrix', '_velocity', '_acceleration')
 
-    def __init__(self, vehicle_filter, pose_matrix=None):
+    def __init__(self, vehicle_filter, pose_matrix=None, velocity=None,
+                 acceleration=None):
         self._vehicle_filter = vehicle_filter
         self._pose_matrix = pose_matrix
+        self._velocity = velocity
+        self._acceleration = acceleration
 
     def __getattr__(self, name):
         return getattr(self._vehicle_filter, name)
@@ -262,6 +272,18 @@ class _OfflineVehicleFilterSyncProxy(object):
         # chain.  Keep the stock handler, including track and RPM updates, but
         # omit only this native sync while that exact handler is running.
         return None
+
+    @property
+    def velocity(self):
+        if self._velocity is not None:
+            return self._velocity
+        return self._vehicle_filter.velocity
+
+    @property
+    def acceleration(self):
+        if self._acceleration is not None:
+            return self._acceleration
+        return self._vehicle_filter.acceleration
 
     def interpolateStabilisedMatrix(self, timestamp):
         """Expose the canonical copied pose to the fixed-turret aim path."""
@@ -325,6 +347,9 @@ class OfflineCompatibility(object):
         self._original_vehicle_set_gun_angles = None
         self._vehicle_set_gun_angles_code = None
         self._gun_rotator_stabilised_code = None
+        self._camera_acceleration_update_code = None
+        self._arcade_oscillator_acceleration_code = None
+        self._sniper_oscillator_acceleration_code = None
         self._original_compound_getattribute = None
         self._original_compound_deactivate = None
         self._original_compound_models_refresh = None
@@ -420,6 +445,10 @@ class OfflineCompatibility(object):
         gun_rotator_type = getattr(
             getattr(runtime, 'vehicle_gun_rotator', None),
             'VehicleGunRotator', None)
+        acceleration_smoother_type = getattr(
+            runtime, 'acceleration_smoother_type', None)
+        arcade_camera_type = getattr(runtime, 'arcade_camera_type', None)
+        sniper_camera_type = getattr(runtime, 'sniper_camera_type', None)
         self._original_account_init = account_type.__dict__.get(
             '__init__', account_type.__init__)
         self._original_account_getattribute = account_type.__dict__.get(
@@ -543,6 +572,32 @@ class OfflineCompatibility(object):
         if self._gun_rotator_stabilised_code is None:
             raise RuntimeError(
                 '#1513 fixed-turret stabilised matrix code is unavailable')
+        if (acceleration_smoother_type is None or
+                arcade_camera_type is None or sniper_camera_type is None):
+            raise RuntimeError('#1513 dynamic-camera motion ABI is unavailable')
+        camera_acceleration_update = acceleration_smoother_type.__dict__.get(
+            'update', getattr(acceleration_smoother_type, 'update', None))
+        arcade_oscillator_acceleration = arcade_camera_type.__dict__.get(
+            '_ArcadeCamera__calcCurOscillatorAcceleration', getattr(
+                arcade_camera_type,
+                '_ArcadeCamera__calcCurOscillatorAcceleration', None))
+        sniper_oscillator_acceleration = sniper_camera_type.__dict__.get(
+            '_SniperCamera__calcCurOscillatorAcceleration', getattr(
+                sniper_camera_type,
+                '_SniperCamera__calcCurOscillatorAcceleration', None))
+        camera_motion_methods = (
+            camera_acceleration_update, arcade_oscillator_acceleration,
+            sniper_oscillator_acceleration)
+        if not all(callable(method) for method in camera_motion_methods):
+            raise RuntimeError('#1513 dynamic-camera motion methods are unavailable')
+        camera_motion_codes = tuple(
+            getattr(method, 'func_code', getattr(method, '__code__', None))
+            for method in camera_motion_methods)
+        if any(code is None for code in camera_motion_codes):
+            raise RuntimeError('#1513 dynamic-camera motion code is unavailable')
+        (self._camera_acceleration_update_code,
+         self._arcade_oscillator_acceleration_code,
+         self._sniper_oscillator_acceleration_code) = camera_motion_codes
         if vehicle_type is not None:
             self._original_vehicle_getattribute = vehicle_type.__dict__.get(
                 '__getattribute__', vehicle_type.__getattribute__)
@@ -953,6 +1008,31 @@ class OfflineCompatibility(object):
                         avatar, 'fakeServer')
                 except AttributeError:
                     pass
+            if name == 'vehicle' and compatibility._battle_active:
+                try:
+                    caller_code = sys._getframe(1).f_code
+                except (AttributeError, ValueError):
+                    caller_code = None
+                if (caller_code is
+                        compatibility._sniper_oscillator_acceleration_code):
+                    try:
+                        vehicle_id = \
+                            compatibility._original_avatar_getattribute(
+                                avatar, 'playerVehicleID')
+                        vehicle = runtime.bigworld.entity(vehicle_id)
+                        overlay = compatibility._vehicle_property_overlays.get(
+                            id(vehicle))
+                    except (AttributeError, ReferenceError, TypeError):
+                        vehicle = None
+                        overlay = None
+                    if (vehicle is not None and overlay is not None and
+                            overlay.get('_pose_active')):
+                        # Exact SniperCamera reads ``player().vehicle`` while
+                        # the client-only Avatar has no engine attachment.
+                        # Expose the selected local Vehicle only to that one
+                        # direct motion calculation; all other callers retain
+                        # the truthful empty attachment.
+                        return vehicle
             return compatibility._original_avatar_getattribute(avatar, name)
 
         def avatar_vehicle_enter(avatar, vehicle):
@@ -1060,17 +1140,27 @@ class OfflineCompatibility(object):
             direct_fixed_turret_pose = (
                 caller_code is compatibility._gun_rotator_stabilised_code and
                 overlay is not None and overlay.get('_pose_active'))
+            direct_camera_motion = (
+                caller_code in (
+                    compatibility._camera_acceleration_update_code,
+                    compatibility._arcade_oscillator_acceleration_code,
+                    compatibility._sniper_oscillator_acceleration_code) and
+                overlay is not None and overlay.get('_pose_active'))
             if (name == 'filter' and compatibility._battle_active and
                     (direct_start_filter or direct_gun_sync or
                      direct_avatar_aux_sync or direct_avatar_pose_init or
-                     direct_fixed_turret_pose)):
+                     direct_fixed_turret_pose or direct_camera_motion)):
                 vehicle_filter = (
                     compatibility._original_vehicle_getattribute(
                         vehicle, name))
                 pose_matrix = (overlay['matrix']
                                if direct_fixed_turret_pose else None)
+                velocity = (overlay.get('velocity')
+                            if direct_camera_motion else None)
+                acceleration = (overlay.get('acceleration')
+                                if direct_camera_motion else None)
                 return _OfflineVehicleFilterSyncProxy(
-                    vehicle_filter, pose_matrix)
+                    vehicle_filter, pose_matrix, velocity, acceleration)
             if name == 'cell' and compatibility._battle_active:
                 try:
                     return compatibility._original_vehicle_getattribute(
@@ -1879,6 +1969,9 @@ class OfflineCompatibility(object):
         self._vehicle_syncing_gun_angles = None
         self._vehicle_set_gun_angles_code = None
         self._gun_rotator_stabilised_code = None
+        self._camera_acceleration_update_code = None
+        self._arcade_oscillator_acceleration_code = None
+        self._sniper_oscillator_acceleration_code = None
         self._avatar_syncing_aux_physics = None
         self._avatar_aux_physics_code = None
         self._avatar_entering_vehicle = None
@@ -2192,17 +2285,11 @@ class OfflineCompatibility(object):
                 '#1513 ArenaDP attacker identity mismatch: '
                 'expected=%s arenaDP=%s' % (
                     expected_vehicle_id, attacker_vehicle_id))
-        shared_repo = getattr(
-            provider, '_BattleSessionProvider__sharedRepo', None)
+        shared_repo = getattr(provider, 'shared', None)
         feedback = getattr(shared_repo, 'feedback', None)
         if feedback is None:
             raise RuntimeError(
                 '#1513 active battle feedback adaptor is unavailable')
-        feedback_arena_dp = getattr(
-            feedback, '_BattleFeedbackAdaptor__arenaDP', None)
-        if feedback_arena_dp is not arena_dp:
-            raise RuntimeError(
-                '#1513 battle feedback ArenaDP mismatch')
         damage_types = getattr(
             self._runtime, 'vehicle_marker_damage_type', None)
         expected_type = getattr(damage_types, 'FROM_PLAYER', None)
@@ -2279,7 +2366,8 @@ class OfflineCompatibility(object):
         return True
 
     def set_vehicle_pose_overlay(self, vehicle, position, yaw, matrix,
-                                 speed=0.0, turn_speed=0.0):
+                                 speed=0.0, turn_speed=0.0, velocity=None,
+                                 acceleration=None):
         """Publish one copied-physics pose through the stock Vehicle API.
 
         #1513's client-only ``Vehicle`` has no retail cell stream, so its
@@ -2297,6 +2385,10 @@ class OfflineCompatibility(object):
         overlay['matrix'] = matrix
         overlay['speed'] = float(speed)
         overlay['turn_speed'] = float(turn_speed)
+        if velocity is not None:
+            overlay['velocity'] = velocity
+        if acceleration is not None:
+            overlay['acceleration'] = acceleration
         return True
 
     def bind_vehicle_pose_sources(self, avatar, vehicle):
@@ -2382,7 +2474,7 @@ class OfflineCompatibility(object):
         if overlay is None:
             return False
         for name in ('_pose_active', 'position', 'yaw', 'matrix',
-                     'speed', 'turn_speed'):
+                     'speed', 'turn_speed', 'velocity', 'acceleration'):
             overlay.pop(name, None)
         if not overlay:
             self._vehicle_property_overlays.pop(id(vehicle), None)

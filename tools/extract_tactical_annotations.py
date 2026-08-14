@@ -3,10 +3,13 @@
 
 The reviewer draws opaque red lines over images produced by
 ``render_tactical_routes.py``.  This tool compares each reviewed image with its
-unannotated original, follows the red ink from one CTF base to the other, and
-writes both machine-readable candidate polylines and a visual verification
-overlay.  It deliberately does not edit tactical map data: the extracted lines
-are evidence for a human-reviewed route change, not trusted navigation input.
+unannotated original, follows the red ink from one route spawn anchor to the
+other, and writes both machine-readable candidate polylines and a visual
+verification overlay.  It deliberately does not edit tactical map data: the
+extracted lines are evidence for a human-reviewed route change, not trusted
+navigation input.
+Only routes connecting the two spawn anchors are extracted automatically;
+local terminal or rear-guard routes are listed for manual review.
 """
 
 from __future__ import annotations
@@ -25,7 +28,8 @@ from PIL import Image, ImageDraw, ImageFont
 HEADER = 84
 SCALE = 4
 MAX_INK_DISTANCE = 8
-PATH_COLOURS = ((0, 255, 255), (255, 80, 255), (255, 240, 40))
+PATH_COLOURS = ((0, 255, 255), (255, 80, 255), (255, 240, 40),
+                (130, 120, 255))
 
 
 def _font(size: int):
@@ -86,17 +90,20 @@ def _distance_from_ink(ink, width, height):
     return distance
 
 
-def _base_pixels(graph, size):
+def _anchor_pixels(graph, size):
     bounds = [float(value) for value in graph["bounds"]]
-    bases = graph.get("bases") or ()
-    if isinstance(bases, dict):
-        bases = (bases.get("1"), bases.get("2"))
+    anchors = graph.get("spawn_anchors")
+    if (not isinstance(anchors, (list, tuple)) or len(anchors) != 2 or
+            any(not isinstance(point, (list, tuple)) or len(point) < 2
+                for point in anchors)):
+        raise ValueError("spawn_anchors requires exactly two x/z points")
     left, bottom, right, top = bounds
     result = []
-    for base in bases[:2]:
+    extent = size - 1
+    for anchor in anchors:
         result.append((
-            (float(base[0]) - left) / (right - left) * size,
-            (top - float(base[1])) / (top - bottom) * size,
+            (float(anchor[0]) - left) / (right - left) * extent,
+            (top - float(anchor[1])) / (top - bottom) * extent,
         ))
     return tuple(result)
 
@@ -193,7 +200,7 @@ def _rdp(points, epsilon):
     return _rdp(points[:split + 1], epsilon)[:-1] + _rdp(points[split:], epsilon)
 
 
-def _smooth_and_simplify(path, base_pixels):
+def _smooth_and_simplify(path, anchor_pixels):
     pixels = [(x * SCALE + SCALE * 0.5,
                y * SCALE + SCALE * 0.5) for x, y in path]
     smoothed = []
@@ -207,8 +214,8 @@ def _smooth_and_simplify(path, base_pixels):
     while len(simplified) > 14:
         epsilon += 2.0
         simplified = _rdp(smoothed, epsilon)
-    simplified[0] = base_pixels[0]
-    simplified[-1] = base_pixels[1]
+    simplified[0] = anchor_pixels[0]
+    simplified[-1] = anchor_pixels[1]
     return simplified
 
 
@@ -226,14 +233,30 @@ def _polyline_distance(candidate, existing):
 def _existing_routes(graph, size):
     bounds = [float(value) for value in graph["bounds"]]
     left, bottom, right, top = bounds
+    extent = size - 1
     result = []
     for route in (graph.get("routes") or {}).get("1", ()):
         points = []
         for point in route.get("waypoints", ()):
-            points.append(((float(point[0]) - left) / (right - left) * size,
-                           (top - float(point[1])) / (top - bottom) * size))
+            points.append(((float(point[0]) - left) / (right - left) * extent,
+                           (top - float(point[1])) / (top - bottom) * extent))
         result.append((str(route.get("id") or "route"), points))
     return result
+
+
+def _split_through_routes(existing, anchors, tolerance=32.0):
+    through = []
+    manual = []
+    for route_id, points in existing:
+        if (len(points) >= 2 and
+                math.hypot(points[0][0] - anchors[0][0],
+                           points[0][1] - anchors[0][1]) <= tolerance and
+                math.hypot(points[-1][0] - anchors[1][0],
+                           points[-1][1] - anchors[1][1]) <= tolerance):
+            through.append((route_id, points))
+        else:
+            manual.append(route_id)
+    return through, manual
 
 
 def _assign_ids(candidates, existing):
@@ -261,10 +284,11 @@ def _assign_ids(candidates, existing):
     return assigned
 
 
-def _world_points(points, graph):
+def _world_points(points, graph, size):
     left, bottom, right, top = [float(value) for value in graph["bounds"]]
-    return [[round(left + x / 1000.0 * (right - left), 1),
-             round(top - y / 1000.0 * (top - bottom), 1)]
+    extent = max(1.0, float(size - 1))
+    return [[round(left + x / extent * (right - left), 1),
+             round(top - y / extent * (top - bottom), 1)]
             for x, y in points]
 
 
@@ -287,14 +311,20 @@ def _draw_overlay(background, assigned, output):
 def extract_map(reviewed_path, original_path, graph_path, output_dir):
     reviewed = Image.open(reviewed_path).convert("RGB")
     original = Image.open(original_path).convert("RGB")
-    if reviewed.size != original.size or reviewed.width != 1000:
+    if (reviewed.size != original.size or
+            reviewed.height - reviewed.width != HEADER or
+            reviewed.width % SCALE):
         raise ValueError("route review image geometry mismatch")
     graph = json.loads(graph_path.read_text())
+    anchors = _anchor_pixels(graph, reviewed.width)
+    existing = _existing_routes(graph, reviewed.width)
+    extractable, manual_routes = _split_through_routes(existing, anchors)
     ink = _red_annotation_mask(reviewed, original)
     result = {
         "map": _map_stem(reviewed_path),
         "reviewed": reviewed_path.name,
         "red_pixels_downsampled": len(ink),
+        "manual_review_routes": manual_routes,
         "routes": [],
     }
     if len(ink) < 120:
@@ -302,23 +332,22 @@ def extract_map(reviewed_path, original_path, graph_path, output_dir):
     width = reviewed.width // SCALE
     height = (reviewed.height - HEADER) // SCALE
     distance = _distance_from_ink(ink, width, height)
-    bases = _base_pixels(graph, reviewed.width)
-    starts = tuple((point[0] / SCALE, point[1] / SCALE) for point in bases)
+    starts = tuple((point[0] / SCALE, point[1] / SCALE) for point in anchors)
     diversity = [0.0] * (width * height)
     raw_paths = []
-    for unused_index in range(min(3, len(_existing_routes(graph, reviewed.width)))):
+    for unused_index in range(len(extractable)):
         path = _astar(width, height, distance, starts[0], starts[1], diversity)
         if not path:
             break
         raw_paths.append(path)
         _add_diversity_penalty(diversity, width, height, path)
-    candidates = [_smooth_and_simplify(path, bases) for path in raw_paths]
-    assigned = _assign_ids(candidates, _existing_routes(graph, reviewed.width))
+    candidates = [_smooth_and_simplify(path, anchors) for path in raw_paths]
+    assigned = _assign_ids(candidates, extractable)
     for route_id, points in assigned:
         result["routes"].append({
             "id": route_id,
             "pixels": [[round(x, 1), round(y + HEADER, 1)] for x, y in points],
-            "world": _world_points(points, graph),
+            "world": _world_points(points, graph, reviewed.width),
         })
     if assigned:
         # Keep the reviewer's red ink unobscured in its source image.  Draw the

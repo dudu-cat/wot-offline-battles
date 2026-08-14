@@ -34,9 +34,9 @@ TARGET_SWITCH_MARGIN = 3.0
 CLOSE_THREAT_DISTANCE = 50.0
 CLOSE_THREAT_SCORE_BONUS = 100.0
 CLOSE_THREAT_FOCUS_LIMIT = 4
-SHOOTABLE_TARGET_SCORE_BONUS = 200.0
 ROUTE_REBALANCE_SECONDS = 4.0
 ROUTE_LEASE_SECONDS = 6.0
+MAX_BASE_DEFENDERS = 3
 
 
 def _number(value, default=0.0):
@@ -83,6 +83,8 @@ class BotPlanner(object):
         self._cover_states = {}
         self._cover_reservations = set()
         self._target_assignments = {}
+        self._base_defense = {1: {}, 2: {}}
+        self._artillery_anchors = {}
 
     def reset(self):
         self.revision = 0
@@ -97,8 +99,11 @@ class BotPlanner(object):
         self._cover_states = {}
         self._cover_reservations = set()
         self._target_assignments = {}
+        self._base_defense = {1: {}, 2: {}}
+        self._artillery_anchors = {}
 
-    def report_contacts(self, contacts, known_targets, now):
+    def report_contacts(self, contacts, known_targets, now,
+                        accepted_visibility=None):
         """Store only authority-reported observations after identity checks.
 
         ``known_targets`` maps an id to ``{"team": int, "alive": bool}``.
@@ -157,10 +162,26 @@ class BotPlanner(object):
                         raw.get("shootable_by_bot_ids")),
                 }
                 accepted += 1
+                if accepted_visibility is not None:
+                    accepted_visibility.append({
+                        "observing_team": observing_team,
+                        "target_kind": target_kind,
+                        "target_id": target_id,
+                        "target_team": _integer(target.get("team")),
+                        "visible": True,
+                    })
             elif previous is not None:
                 previous["visible"] = False
                 previous["shootable_by_bot_ids"] = []
                 accepted += 1
+                if accepted_visibility is not None:
+                    accepted_visibility.append({
+                        "observing_team": observing_team,
+                        "target_kind": target_kind,
+                        "target_id": target_id,
+                        "target_team": _integer(target.get("team")),
+                        "visible": False,
+                    })
         return accepted
 
     @staticmethod
@@ -239,22 +260,36 @@ class BotPlanner(object):
             accepted += 1
         return accepted
 
-    def build_orders(self, manifest, bot_states, players, now):
+    def build_orders(self, manifest, bot_states, players, now,
+                     defense=None):
         known_targets = self.known_targets(bot_states, players)
         contacts = self._prune_contacts(known_targets, now)
         bots = self._alive_bots(manifest, bot_states)
         self._prune_tactical_state(bots, known_targets, now)
+        defenders = self._update_base_defense(
+            bots, contacts, defense, now)
         self._cover_reservations = set()
+        team_axes = dict((team, self._team_base_axis(team, bots))
+                         for team in (1, 2))
         orders = []
         for team in (1, 2):
             team_bots = sorted((bot for bot in bots if bot["team"] == team),
                                key=lambda value: value["id"])
-            self._rebalance_routes(team, team_bots, contacts[team], now)
+            team_axis = team_axes[team]
+            protected_ids = set(defenders.get(team, {}))
+            self._rebalance_routes(
+                team, team_bots, contacts[team], now, protected_ids)
             assignments = self._assign_targets(team_bots, contacts[team], now)
+            assignments = self._prioritize_base_invaders(
+                team, team_bots, contacts[team], assignments,
+                defenders.get(team, {}), defense)
             for index, bot in enumerate(team_bots):
-                orders.append(self._order_for(
+                order = self._order_for(
                     bot, index, len(team_bots), assignments.get(bot["id"]),
-                    contacts[team], now))
+                    contacts[team], now,
+                    defenders.get(team, {}).get(bot["id"]), team_axis)
+                base = defenders.get(team, {}).get(bot["id"])
+                orders.append(order)
         orders.sort(key=lambda value: value["id"])
         payload = {"orders": orders}
         signature_orders = []
@@ -364,6 +399,9 @@ class BotPlanner(object):
         for bot_id in list(self._engage_anchors):
             if bot_id not in live_bots:
                 del self._engage_anchors[bot_id]
+        for bot_id in list(self._artillery_anchors):
+            if bot_id not in live_bots:
+                del self._artillery_anchors[bot_id]
         for bot_id, report in list(self._affordances.items()):
             bot = live_bots.get(bot_id)
             target_key = report.get("target") if isinstance(report, dict) else None
@@ -414,6 +452,254 @@ class BotPlanner(object):
         return result
 
     @staticmethod
+    def _base_defense_eligible(bot):
+        state = bot.get("state") if isinstance(bot.get("state"), dict) else {}
+        if not bool(state.get("world_pose", True)):
+            return False
+        critical = state.get("critical")
+        critical = critical if isinstance(critical, dict) else {}
+        destroyed = set(str(value) for value in
+                        (critical.get("destroyed") or ()))
+        return not destroyed.intersection((
+            "engineHealth", "leftTrackHealth", "rightTrackHealth"))
+
+    @staticmethod
+    def _defense_points(raw, team):
+        if not isinstance(raw, dict):
+            return []
+        values = raw.get(str(team), raw.get(team))
+        if not isinstance(values, (list, tuple)):
+            return []
+        result = []
+        for index, value in enumerate(values[:4]):
+            if not isinstance(value, dict):
+                continue
+            point = _point(value)
+            result.append({
+                "id": str(value.get("id") or "%d:%d" % (team, index)),
+                "point": point,
+            })
+        return result
+
+    @staticmethod
+    def _defense_eta(bot, point, contacts, deadline):
+        state = bot["state"]
+        distance = math.hypot(
+            point["x"] - _number(state.get("x")),
+            point["z"] - _number(state.get("z")))
+        speed = _number(bot.get("profile", {}).get("speed"))
+        cruise = _clamp(speed * 0.65, 4.0, 22.0)
+        eta = 3.0 + distance * 1.30 / cruise
+        diversion = 0.0
+        for contact in contacts or ():
+            if (not contact.get("visible") or
+                    bot["id"] not in contact.get(
+                        "shootable_by_bot_ids", ())):
+                continue
+            contact_distance = math.hypot(
+                contact["position"]["x"] - _number(state.get("x")),
+                contact["position"]["z"] - _number(state.get("z")))
+            if contact_distance <= 50.0:
+                diversion = max(diversion, 12.0)
+            elif contact_distance <= 150.0:
+                diversion = max(diversion, 4.0)
+        health = max(0.0, _number(state.get("health"), 1.0))
+        max_health = max(1.0, _number(state.get("max_health"), 1.0))
+        diversion += 6.0 * (1.0 - min(1.0, health / max_health))
+        class_tag = str(bot.get("profile", {}).get("class_tag") or "")
+        if class_tag == "SPG":
+            diversion += 8.0
+        elif class_tag == "AT-SPG":
+            diversion += 3.0
+        if eta <= deadline:
+            return (0, eta + diversion, eta, bot["id"])
+        return (1, eta - deadline, eta + diversion, bot["id"])
+
+    def _update_base_defense(self, bots, contacts, defense, now):
+        """Keep a small, stable responder group while an own base is invaded."""
+        if not isinstance(defense, dict):
+            self._base_defense = {1: {}, 2: {}}
+            return {1: {}, 2: {}}
+        defense = defense if isinstance(defense, dict) else {}
+        states = defense.get("states")
+        states = states if isinstance(states, dict) else {}
+        bases = defense.get("bases")
+        live_by_team = dict((team, [
+            bot for bot in bots
+            if bot["team"] == team and self._base_defense_eligible(bot)
+        ]) for team in (1, 2))
+        result = {1: {}, 2: {}}
+        for team in (1, 2):
+            incident = self._base_defense.setdefault(team, {})
+            responders = incident.setdefault("responders", {})
+            live = dict((bot["id"], bot) for bot in live_by_team[team])
+            for bot_id in list(responders):
+                if bot_id not in live:
+                    del responders[bot_id]
+            raw_state = states.get(str(team), states.get(team, {}))
+            raw_state = raw_state if isinstance(raw_state, dict) else {}
+            invaders = max(0, _integer(raw_state.get("invaders")))
+            points = self._defense_points(bases, team)
+            reserve_limit = (1 if len(live) == 1 else
+                             max(0, len(live) - 1))
+            if len(responders) > reserve_limit:
+                deadline = max(
+                    0.0, _number(raw_state.get("time_left")) - 2.0)
+                ranked = sorted(
+                    responders, key=lambda bot_id: self._defense_eta(
+                        live[bot_id], responders[bot_id]["point"],
+                        contacts.get(team, ()), deadline))
+                keep = set(ranked[:reserve_limit])
+                for bot_id in list(responders):
+                    if bot_id not in keep:
+                        del responders[bot_id]
+
+            if invaders <= 0:
+                if not responders:
+                    incident["clear_since"] = None
+                    incident["need"] = 0
+                    continue
+                clear_since = incident.get("clear_since")
+                if clear_since is None:
+                    incident["clear_since"] = _number(now)
+                elif _number(now) - _number(clear_since) >= 3.0:
+                    responders.clear()
+                    incident["clear_since"] = None
+                    incident["need"] = 0
+                    continue
+            else:
+                incident["clear_since"] = None
+                desired = min(MAX_BASE_DEFENDERS, max(1, invaders))
+                if len(live) > 1:
+                    desired = min(desired, len(live) - 1)
+                elif live:
+                    desired = 1
+                else:
+                    desired = 0
+                incident["need"] = max(
+                    _integer(incident.get("need")), desired)
+
+                point_by_id = dict((value["id"], value) for value in points)
+                for bot_id, record in list(responders.items()):
+                    if record.get("base_id") in point_by_id:
+                        continue
+                    if not points:
+                        del responders[bot_id]
+                        continue
+                    bot = live[bot_id]
+                    selected = min(points, key=lambda value: (
+                        math.hypot(
+                            value["point"]["x"] - _number(
+                                bot["state"].get("x")),
+                            value["point"]["z"] - _number(
+                                bot["state"].get("z"))),
+                        value["id"]))
+                    responders[bot_id] = {
+                        "base_id": selected["id"],
+                        "point": dict(selected["point"]),
+                    }
+
+                missing = max(0, min(_integer(incident.get("need")),
+                                     reserve_limit) - len(responders))
+                if missing and points:
+                    deadline = max(
+                        0.0, _number(raw_state.get("time_left")) - 2.0)
+                    candidates = []
+                    for bot in live.values():
+                        if bot["id"] in responders:
+                            continue
+                        selected = min(points, key=lambda value: (
+                            math.hypot(
+                                value["point"]["x"] - _number(
+                                    bot["state"].get("x")),
+                                value["point"]["z"] - _number(
+                                    bot["state"].get("z"))),
+                            value["id"]))
+                        key = self._defense_eta(
+                            bot, selected["point"], contacts.get(team, ()),
+                            deadline)
+                        candidates.append((key, bot["id"], selected))
+                    for unused_key, bot_id, selected in sorted(
+                            candidates)[:missing]:
+                        responders[bot_id] = {
+                            "base_id": selected["id"],
+                            "point": dict(selected["point"]),
+                        }
+            result[team] = dict(responders)
+        return result
+
+    def _apply_base_defense_order(self, order, bot, base):
+        self._engage_anchors.pop(bot["id"], None)
+        self._cover_states.pop(bot["id"], None)
+        order["combat_mode"] = "base_defense"
+        order["defense_base_id"] = str(base["base_id"])
+        order["move_position"] = dict(base["point"])
+        order["throttle_override"] = None
+        order["route_join"] = False
+        if order.get("target_id") is None:
+            order["face_position"] = dict(base["point"])
+
+    def _prioritize_base_invaders(self, team, bots, contacts, assignments,
+                                  defenders, defense):
+        if not defenders or not isinstance(defense, dict):
+            return assignments
+        contributor_map = defense.get("contributors")
+        contributor_map = (contributor_map
+                           if isinstance(contributor_map, dict) else {})
+        raw = contributor_map.get(str(team), contributor_map.get(team, ()))
+        contributor_keys = set()
+        if isinstance(raw, (list, tuple)):
+            for value in raw:
+                if not isinstance(value, dict):
+                    continue
+                kind = str(value.get("kind") or "")
+                vehicle_id = _integer(value.get("id"))
+                if kind in ("human", "bot") and vehicle_id > 0:
+                    contributor_keys.add((kind, vehicle_id))
+        if not contributor_keys:
+            return assignments
+        result = dict(assignments)
+        bot_by_id = dict((bot["id"], bot) for bot in bots)
+        reservations = {}
+        for bot_id in sorted(defenders):
+            bot = bot_by_id.get(bot_id)
+            if bot is None:
+                continue
+            bx = _number(bot["state"].get("x"))
+            bz = _number(bot["state"].get("z"))
+            choices = []
+            for contact in contacts:
+                key = (str(contact.get("target_kind") or ""),
+                       _integer(contact.get("id")))
+                if (key not in contributor_keys or
+                        not contact.get("visible") or
+                        bot_id not in contact.get(
+                            "shootable_by_bot_ids", ())):
+                    continue
+                distance = math.hypot(
+                    contact["position"]["x"] - bx,
+                    contact["position"]["z"] - bz)
+                health_fraction = (
+                    _number(contact.get("health"), 1.0) /
+                    max(1.0, _number(contact.get("max_health"), 1.0)))
+                choices.append((
+                    reservations.get(key, 0), health_fraction, distance,
+                    key[0], key[1], contact))
+            if not choices:
+                continue
+            selected = min(choices)
+            contact = selected[-1]
+            key = (str(contact.get("target_kind") or ""),
+                   _integer(contact.get("id")))
+            reservations[key] = reservations.get(key, 0) + 1
+            result[bot_id] = contact
+            self._target_assignments[bot_id] = {
+                "target": key,
+                "until": 0.0,
+            }
+        return result
+
+    @staticmethod
     def _desired_focus(contact):
         remaining = max(0, _integer(contact.get("health")))
         if remaining >= 1800:
@@ -436,6 +722,14 @@ class BotPlanner(object):
         profile = bot.get("profile") if isinstance(bot.get("profile"), dict) else {}
         roles = profile.get("roles") if isinstance(profile.get("roles"), dict) else {}
         desired = max(40.0, _number(profile.get("desired_range"), 180.0))
+        if str(profile.get("class_tag") or "") == "SPG":
+            # The authority client puts an SPG id in shootable_by_bot_ids only
+            # after a pitch-valid, obstacle-free ballistic path is complete.
+            # Do not discard that stronger proof through the old 560 m direct
+            # fire envelope.
+            return max(
+                desired,
+                min(2500.0, _number(profile.get("fire_range"), 1250.0)))
         mobility = max(_number(roles.get("scout")),
                        _number(roles.get("flanker")))
         if contact.get("visible"):
@@ -447,12 +741,12 @@ class BotPlanner(object):
         return distance
 
     def _assign_targets(self, bots, contacts, now):
-        """Assign visible contacts while keeping a hard focus cap.
+        """Assign only locally shootable contacts, with a hard focus cap.
 
-        Team spotting is enough to make a tank react and seek a firing lane. It
-        is not enough to fire: ``shootable_by_bot_ids`` remains the per-bot
-        barrel-lane authority used by :meth:`_order_for` and is checked again by
-        the authority client immediately before a shot.
+        Team spotting is shared intelligence, not proof that every tank has a
+        firing lane. The authority client reports the bot ids whose own static
+        ray succeeded, so a shared red dot cannot pull the rest of a flank off
+        its route.
         """
         if not bots or not contacts:
             return {}
@@ -464,7 +758,9 @@ class BotPlanner(object):
             bx = _number(bot["state"].get("x"))
             bz = _number(bot["state"].get("z"))
             for contact in contacts:
-                if not contact.get("visible"):
+                if (not contact.get("visible") or
+                        bot["id"] not in contact.get(
+                            "shootable_by_bot_ids", ())):
                     continue
                 distance = math.hypot(
                     contact["position"]["x"] - bx,
@@ -479,11 +775,6 @@ class BotPlanner(object):
                     # even while a previous long-range target still owns a
                     # short lease.
                     score -= CLOSE_THREAT_SCORE_BONUS
-                if bot["id"] in contact.get("shootable_by_bot_ids", ()):
-                    # When the focus cap is smaller than the team, reserve the
-                    # slot for a tank that can actually shoot. Other visible
-                    # tanks may still pursue the contact when capacity remains.
-                    score -= SHOOTABLE_TARGET_SCORE_BONUS
                 sort_key = (
                     score, bot["id"], str(contact.get("target_kind") or ""),
                     contact["id"], distance)
@@ -568,6 +859,143 @@ class BotPlanner(object):
         return result
 
     @staticmethod
+    def _team_base_axis(team, bots):
+        """Infer one direction-neutral own/enemy axis from uploaded routes.
+
+        Baked routes start at their team's own base, so the opposing team's
+        route starts provide the cleanest enemy-base endpoint. If no opposing
+        bot exists, the farthest own-route endpoint is the conservative fallback
+        because a local rear-guard route may end near its own base. The
+        calculation is invariant under map rotation and reflection.
+        """
+        starts = {1: [], 2: []}
+        own_ends = []
+        for bot in bots:
+            route = bot.get("route") if isinstance(bot.get("route"), dict) else {}
+            waypoints = route.get("waypoints")
+            if not isinstance(waypoints, list) or len(waypoints) < 2:
+                continue
+            bot_team = _integer(bot.get("team"))
+            if bot_team not in (1, 2):
+                continue
+            starts[bot_team].append(_point(waypoints[0]))
+            if bot_team == team:
+                own_ends.append(_point(waypoints[-1]))
+        own_starts = starts.get(team, ())
+        if not own_starts or not own_ends:
+            return None
+        own = {
+            "x": round(sum(value["x"] for value in own_starts) /
+                       len(own_starts), 3),
+            "y": round(sum(value["y"] for value in own_starts) /
+                       len(own_starts), 3),
+            "z": round(sum(value["z"] for value in own_starts) /
+                       len(own_starts), 3),
+        }
+        enemy_starts = starts.get(3 - team, ())
+        if enemy_starts:
+            enemy_ends = enemy_starts
+        else:
+            distances = [math.hypot(value["x"] - own["x"],
+                                    value["z"] - own["z"])
+                         for value in own_ends]
+            farthest = max(distances)
+            # Average equally distant through-route endpoints instead of
+            # breaking a geometric tie with ids or world-axis signs.
+            threshold = max(1.0, farthest * 0.02)
+            enemy_ends = [value for value, distance in
+                          zip(own_ends, distances)
+                          if farthest - distance <= threshold]
+        enemy = {
+            "x": round(sum(value["x"] for value in enemy_ends) /
+                       len(enemy_ends), 3),
+            "y": round(sum(value["y"] for value in enemy_ends) /
+                       len(enemy_ends), 3),
+            "z": round(sum(value["z"] for value in enemy_ends) /
+                       len(enemy_ends), 3),
+        }
+        if math.hypot(enemy["x"] - own["x"],
+                      enemy["z"] - own["z"]) < 1.0:
+            return None
+        return own, enemy
+
+    def _artillery_anchor(self, bot, team_axis):
+        """Choose a stable rear staging point from this SPG's safe route.
+
+        The server has graph-validated macro points but no static visibility or
+        shell-arc probe. Select only by distance from the own base and progress
+        on the own/enemy axis; ``hold`` annotations are deliberately not treated
+        as proof that a point is an artillery position.
+        """
+        route = bot.get("route") if isinstance(bot.get("route"), dict) else {}
+        waypoints = route.get("waypoints")
+        route_signature = (
+            str(route.get("id") or ""),
+            tuple((_number(value.get("x")), _number(value.get("y")),
+                   _number(value.get("z")))
+                  for value in waypoints)
+            if isinstance(waypoints, list) else (),
+        )
+        cached = self._artillery_anchors.get(bot["id"])
+        if (isinstance(cached, dict) and
+                cached.get("route_signature") == route_signature):
+            return {
+                "point": dict(cached["point"]),
+                "face": dict(cached["face"]),
+                "index": cached["index"],
+            }
+        if not isinstance(waypoints, list) or not waypoints:
+            position = _point(bot.get("state"))
+            result = {
+                "point": position,
+                "face": position,
+                "index": 0,
+            }
+            self._artillery_anchors[bot["id"]] = dict(
+                result, route_signature=route_signature)
+            return result
+        points = [_point(value) for value in waypoints]
+        if team_axis is None:
+            own = points[0]
+            enemy = points[-1]
+        else:
+            own, enemy = team_axis
+        axis_x = enemy["x"] - own["x"]
+        axis_z = enemy["z"] - own["z"]
+        axis_length = math.hypot(axis_x, axis_z)
+        if axis_length < 1.0:
+            own = points[0]
+            enemy = points[-1]
+            axis_x = enemy["x"] - own["x"]
+            axis_z = enemy["z"] - own["z"]
+            axis_length = max(1.0, math.hypot(axis_x, axis_z))
+        axis_squared = axis_length * axis_length
+        desired_radius = _clamp(axis_length * 0.16, 35.0, 120.0)
+        candidates = []
+        for point_index, point in enumerate(points):
+            offset_x = point["x"] - own["x"]
+            offset_z = point["z"] - own["z"]
+            radius = math.hypot(offset_x, offset_z)
+            progress = (offset_x * axis_x + offset_z * axis_z) / axis_squared
+            outside_rear = max(0.0, progress - 0.30,
+                               -0.12 - progress)
+            base_overlap = max(0.0, desired_radius * 0.35 - radius)
+            score = (outside_rear * axis_length * 8.0 +
+                     base_overlap * 5.0 +
+                     abs(radius - desired_radius) +
+                     abs(progress - 0.12) * axis_length * 0.20)
+            candidates.append((score, point_index, point))
+        unused_score, point_index, point = min(candidates)
+        result = {
+            "point": dict(point),
+            "face": dict(enemy),
+            "index": point_index,
+        }
+        self._artillery_anchors[bot["id"]] = dict(
+            result, route_signature=route_signature)
+        return result
+
+    @staticmethod
     def _nearest_route(contact, catalog):
         best = None
         best_key = None
@@ -586,7 +1014,8 @@ class BotPlanner(object):
                 best = route_id
         return best
 
-    def _rebalance_routes(self, team, bots, contacts, now):
+    def _rebalance_routes(self, team, bots, contacts, now,
+                          protected_ids=()):
         """Move at most one adaptable tank toward a pressured route every 4s."""
         catalog = self._route_catalog(bots)
         for bot in bots:
@@ -647,6 +1076,10 @@ class BotPlanner(object):
                 assignment["until"] = _number(now) + ROUTE_LEASE_SECONDS
         candidates = []
         for bot in bots:
+            if bot["id"] in protected_ids:
+                continue
+            if str(bot.get("profile", {}).get("class_tag") or "") == "SPG":
+                continue
             assignment = self._route_assignments.get(bot["id"], {})
             current = assignment.get("route") if isinstance(assignment, dict) else None
             if not isinstance(current, dict):
@@ -758,27 +1191,97 @@ class BotPlanner(object):
         })
 
     @staticmethod
-    def _shell_index(profile, contact, personality):
+    def _shell_index(profile, contact, personality, state=None):
+        """Plan the next round: standard first, HE soft, premium hard.
+
+        Descriptor order supplies the standard baseline. A later non-HE round
+        is treated as premium only when it has materially higher penetration;
+        store prices are not part of the stable LAN profile. Depleted rounds
+        are never requested.
+        """
         shells = profile.get("shells") if isinstance(profile.get("shells"), list) else []
         if not shells:
             return 0
-        armor = max(0.0, _number(contact.get("armor")))
-        best = None
+        remaining = ((state or {}).get("ammo_remaining")
+                     if isinstance(state, dict) else None)
+        if not isinstance(remaining, (list, tuple)):
+            remaining = None
+        available = []
         for shell in shells:
-            penetration = max(0.0, _number(shell.get("penetration")))
-            damage = max(0.0, _number(shell.get("damage")))
+            index = max(0, _integer(shell.get("index")))
+            if (remaining is not None and
+                    (index >= len(remaining) or
+                     _integer(remaining[index]) <= 0)):
+                continue
+            available.append(shell)
+        if not available:
+            return max(0, _integer((state or {}).get("shell_index", 0)))
+        armor = max(0.0, _number(contact.get("armor")))
+        health = max(0.0, _number(contact.get("health")))
+        non_he = []
+        high_explosive = []
+        for shell in available:
             kind = str(shell.get("kind") or "").lower()
-            explosive = "explosive" in kind and "hollow" not in kind
-            score = (42.0 if penetration >= armor * 1.08 else -abs(penetration - armor) * 0.4)
-            score += damage * 0.04
-            if explosive and contact.get("health", 0) <= damage * (0.72 + personality["aggression"] * 0.18):
-                score += 55.0
-            elif explosive:
-                score -= 25.0
-            candidate = (score, -_integer(shell.get("index")), shell)
-            if best is None or candidate[:2] > best[:2]:
-                best = candidate
-        return max(0, _integer(best[2].get("index"))) if best is not None else 0
+            is_he = ("high_explosive" in kind or
+                     ("explosive" in kind and
+                      "armor_piercing" not in kind))
+            (high_explosive if is_he else non_he).append(shell)
+        baseline = min(
+            non_he, key=lambda shell: _integer(shell.get("index"))) \
+            if non_he else None
+        baseline_penetration = max(
+            0.0, _number((baseline or {}).get("penetration")))
+        standard = []
+        premium = []
+        for shell in non_he:
+            penetration = max(0.0, _number(shell.get("penetration")))
+            if (shell is not baseline and baseline_penetration > 0.0 and
+                    penetration >= baseline_penetration * 1.03):
+                premium.append(shell)
+            else:
+                standard.append(shell)
+
+        def best_penetration(values):
+            return max(values, key=lambda shell: (
+                _number(shell.get("penetration")),
+                _number(shell.get("damage")),
+                -_integer(shell.get("index")))) if values else None
+
+        normal = best_penetration(standard)
+        gold = best_penetration(premium)
+        explosive = max(high_explosive, key=lambda shell: (
+            _number(shell.get("damage")),
+            _number(shell.get("penetration")),
+            -_integer(shell.get("index")))) if high_explosive else None
+        if armor <= 0.0:
+            if normal is not None:
+                return max(0, _integer(normal.get("index")))
+            if gold is not None:
+                return max(0, _integer(gold.get("index")))
+            return max(0, _integer(explosive.get("index"))) \
+                if explosive is not None else 0
+        if explosive is not None:
+            he_penetration = max(
+                0.0, _number(explosive.get("penetration")))
+            he_damage = max(0.0, _number(explosive.get("damage")))
+            fragile = armor <= he_penetration * 0.90
+            finisher = (health > 0.0 and
+                        health <= he_damage * (
+                            0.72 + personality["aggression"] * 0.18) and
+                        armor <= he_penetration * 1.10)
+            if fragile or finisher:
+                return max(0, _integer(explosive.get("index")))
+        if normal is not None:
+            normal_penetration = max(
+                0.0, _number(normal.get("penetration")))
+            if gold is not None and normal_penetration < armor * 1.05:
+                return max(0, _integer(gold.get("index")))
+            return max(0, _integer(normal.get("index")))
+        if gold is not None:
+            return max(0, _integer(gold.get("index")))
+        if explosive is not None:
+            return max(0, _integer(explosive.get("index")))
+        return max(0, _integer(available[0].get("index")))
 
     def _cover_candidate(self, bot, focus, personality, now):
         report = self._affordances.get(bot["id"])
@@ -892,7 +1395,27 @@ class BotPlanner(object):
             order["throttle_override"] = None
         return True
 
-    def _order_for(self, bot, index, count, focus, contacts, now):
+    def _apply_artillery_order(self, order, bot, team_axis):
+        self._engage_anchors.pop(bot["id"], None)
+        self._cover_states.pop(bot["id"], None)
+        anchor = self._artillery_anchor(bot, team_axis)
+        point = anchor["point"]
+        state = bot.get("state") if isinstance(bot.get("state"), dict) else {}
+        distance = math.hypot(point["x"] - _number(state.get("x")),
+                              point["z"] - _number(state.get("z")))
+        arrived = distance <= 15.0
+        order["combat_mode"] = (
+            "artillery_hold" if arrived else "artillery_deploy")
+        order["move_position"] = dict(point)
+        order["route_index"] = anchor["index"]
+        order["route_anchor"] = dict(point)
+        order["route_join"] = False
+        order["throttle_override"] = 0.0 if arrived else None
+        if order.get("target_id") is None:
+            order["face_position"] = dict(anchor["face"])
+
+    def _order_for(self, bot, index, count, focus, contacts, now,
+                   travel_override=None, team_axis=None):
         route_id, route_index, move, route_anchor, route_join = self._route(bot, now)
         profile = dict(bot["profile"])
         desired_range = max(10.0, _number(profile.get("desired_range"), 180.0))
@@ -923,6 +1446,11 @@ class BotPlanner(object):
         if focus is None:
             self._engage_anchors.pop(bot["id"], None)
             self._cover_states.pop(bot["id"], None)
+            if travel_override is not None:
+                self._apply_base_defense_order(
+                    order, bot, travel_override)
+            elif str(profile.get("class_tag") or "") == "SPG":
+                self._apply_artillery_order(order, bot, team_axis)
             return order
         order["target_id"] = focus["id"]
         order["target_kind"] = focus.get("target_kind")
@@ -932,7 +1460,14 @@ class BotPlanner(object):
         locally_shootable = bool(focus.get("visible") and
                                  bot["id"] in (observers or ()))
         order["fire_allowed"] = locally_shootable
-        order["shell_index"] = self._shell_index(profile, focus, personality)
+        order["shell_index"] = self._shell_index(
+            profile, focus, personality, bot.get("state"))
+        if travel_override is not None:
+            self._apply_base_defense_order(order, bot, travel_override)
+            return order
+        if str(profile.get("class_tag") or "") == "SPG":
+            self._apply_artillery_order(order, bot, team_axis)
+            return order
         bx = _number(bot["state"].get("x"))
         bz = _number(bot["state"].get("z"))
         distance = math.hypot(focus["position"]["x"] - bx,
@@ -944,14 +1479,17 @@ class BotPlanner(object):
         if not locally_shootable:
             self._engage_anchors.pop(bot["id"], None)
             self._cover_states.pop(bot["id"], None)
-            # A wall, tree, ridge or friendly hull can temporarily block the
-            # barrel without making the enemy cease to exist. Retain the target
-            # lease and let the copied local navigator find a lane. Fire remains
-            # strictly disabled until this bot is reported shootable.
+            # This branch only handles a leased order whose later observation
+            # lost its local lane. Resume the route instead of turning shared
+            # team visibility into an unbounded convergence order.
+            order["target_id"] = None
+            order.pop("target_kind", None)
+            order["aim_position"] = dict(move)
+            order["face_position"] = dict(move)
             order["fire_allowed"] = False
-            order["combat_mode"] = "advance_contact"
-            order["move_position"] = dict(focus["position"])
-            order["throttle_override"] = 0.72
+            order["combat_mode"] = "route"
+            order["move_position"] = dict(move)
+            order["throttle_override"] = None
         elif distance > far_limit:
             self._engage_anchors.pop(bot["id"], None)
             self._cover_states.pop(bot["id"], None)
@@ -961,6 +1499,15 @@ class BotPlanner(object):
         elif (distance <= fire_range * 1.15 and
               self._apply_cover_order(order, bot, focus, personality, now)):
             self._engage_anchors.pop(bot["id"], None)
+        elif distance < close_limit and dominant != "brawler":
+            # This must precede the general firing-envelope hold below because
+            # close_limit is always inside that envelope. Keep firing while a
+            # ranged vehicle opens space along its already validated route.
+            self._engage_anchors.pop(bot["id"], None)
+            self._cover_states.pop(bot["id"], None)
+            order["combat_mode"] = "withdraw"
+            order["move_position"] = dict(route_anchor)
+            order["throttle_override"] = None
         elif distance <= min(fire_range, max(150.0, desired_range * 1.35)):
             # A visible enemy inside an effective firing envelope interrupts
             # route travel immediately when no client-probed cover manoeuvre is
@@ -977,12 +1524,6 @@ class BotPlanner(object):
                 self._engage_anchors[bot["id"]] = anchor_state
             order["move_position"] = dict(anchor_state["position"])
             order["throttle_override"] = 0.0
-        elif distance < close_limit and dominant != "brawler":
-            self._engage_anchors.pop(bot["id"], None)
-            self._cover_states.pop(bot["id"], None)
-            order["combat_mode"] = "withdraw"
-            order["move_position"] = dict(route_anchor)
-            order["throttle_override"] = None
         elif roles.get("flanker", 0.0) >= 0.68 and personality["initiative"] > 0.42:
             self._engage_anchors.pop(bot["id"], None)
             order["combat_mode"] = "flank"

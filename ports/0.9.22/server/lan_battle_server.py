@@ -111,9 +111,24 @@ BOT_CALLSIGNS = (
 ROUND_SCOPED_MESSAGE_TYPES = frozenset((
     "start_battle", "input", "hit_report", "bot_manifest", "bot_state",
     "bot_observation", "bot_hit_report", "bot_human_hit", "bot_ram_report",
+    "projectile_launch", "projectile_progress", "projectile_resolve",
     "rules_state", "destructible",
     "battle_result", "leave_battle", "battle_ready",
 ))
+# The elected #1513 authority uses the same bounded in-process manager.  The
+# server must never admit more durable launches than a takeover client can
+# restore and simulate.
+PROJECTILE_MAX_ACTIVE = 128
+PROJECTILE_MAX_PER_SHOOTER = 32
+PROJECTILE_MAX_ID = 2147483647
+PROJECTILE_MAX_PROGRESS_BATCH = 30
+PROJECTILE_MAX_SPLASH_TARGETS = 30
+PROJECTILE_MAX_DESTRUCTIBLES = 64
+PROJECTILE_MAX_LIFETIME_MS = 20000
+PROJECTILE_MAX_GRAVITY = 500.0
+PROJECTILE_CLOCK_LEEWAY_MS = 250
+PROJECTILE_TOLERANCE = 0.001
+PROJECTILE_CAPABILITY = "projectile_ledger_v1"
 DESTRUCTIBLE_KINDS = frozenset(("tree", "column", "fragile", "module"))
 COMBAT_EVENT_KINDS = frozenset((
     "health", "hit", "bot_hit", "bot_human_hit", "bot_bot_hit",
@@ -143,6 +158,27 @@ CRITICAL_CAUSES = frozenset((
 def _server_log(message):
     stamp = time.strftime("%H:%M:%S")
     print("[%s] %s" % (stamp, message), flush=True)
+
+
+def _bot_combat_log_message(event, players, bot_states):
+    """Format one bot combat line with its real cause and both teams."""
+    attacker_id = event.get("attacker", event.get("attacker_bot"))
+    target_id = event.get("target", event.get("target_bot"))
+    attacker = (players.get(attacker_id) if "attacker" in event else
+                bot_states.get(attacker_id))
+    target = (players.get(target_id) if "target" in event else
+              bot_states.get(target_id))
+    attacker_team = (attacker.team if hasattr(attacker, "team") else
+                     attacker.get("team") if isinstance(attacker, dict) else
+                     None)
+    target_team = (target.team if hasattr(target, "team") else
+                   target.get("team") if isinstance(target, dict) else None)
+    return (
+        "BOT COMBAT kind=%s source=%s attacker=%s attacker_team=%s "
+        "target=%s target_team=%s damage=%s health=%s dead=%s" % (
+            event.get("kind"), event.get("source"), attacker_id,
+            attacker_team, target_id, target_team, event.get("damage"),
+            event.get("health"), event.get("dead")))
 
 
 def _finite_float(value, default=0.0):
@@ -197,6 +233,38 @@ def _critical_proposal_admission(message, expected_base_revision,
 
 def _clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def _exact_int(value, low=None, high=None):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("expected integer")
+    if low is not None and value < low:
+        raise ValueError("integer below lower bound")
+    if high is not None and value > high:
+        raise ValueError("integer above upper bound")
+    return value
+
+
+def _bounded_float(value, low, high, inclusive_low=True):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("expected finite number")
+    value = float(value)
+    if (not math.isfinite(value) or value > high or
+            (value < low if inclusive_low else value <= low)):
+        raise ValueError("number outside bounds")
+    return value
+
+
+def _bounded_vector(value, lows, highs):
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError("expected three-vector")
+    return [round(_bounded_float(component, lows[index], highs[index]), 6)
+            for index, component in enumerate(value)]
+
+
+def _message_fingerprint(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True)
 
 
 def _safe_name(value, fallback):
@@ -310,6 +378,50 @@ def _critical_discrete_state(value):
     )
 
 
+def _critical_damage_transition(previous, current):
+    """Return whether a critical payload contains new module/crew damage."""
+    if not isinstance(current, dict):
+        return False
+    for event in current.get("events") or ():
+        if not isinstance(event, dict) or event.get("cause") == "repair":
+            continue
+        kind = event.get("kind")
+        state = event.get("state")
+        if ((kind == "device" and state in ("critical", "destroyed")) or
+                (kind == "crew" and state == "destroyed") or
+                (kind == "fire" and bool(state)) or
+                (kind == "ammo_rack" and state == "destroyed")):
+            return True
+
+    previous = previous if isinstance(previous, dict) else {}
+    old_devices = {
+        str(record.get("name")): float(record.get("hp", 0.0))
+        for record in previous.get("devices") or ()
+        if isinstance(record, dict) and record.get("name") is not None
+    }
+    for record in current.get("devices") or ():
+        if not isinstance(record, dict) or record.get("name") is None:
+            continue
+        name = str(record.get("name"))
+        hp = _finite_float(record.get("hp"))
+        old_hp = old_devices.get(name)
+        if old_hp is not None and hp < old_hp - 0.0001:
+            return True
+        if (old_hp is None and hp + 0.0001 <
+                _finite_float(record.get("max_hp"), hp)):
+            return True
+    if (set(current.get("destroyed") or ()) -
+            set(previous.get("destroyed") or ())):
+        return True
+    if (set(current.get("crew_ko") or ()) -
+            set(previous.get("crew_ko") or ())):
+        return True
+    return ((bool(current.get("fire")) and
+             not bool(previous.get("fire"))) or
+            (bool(current.get("ammo_rack_death")) and
+             not bool(previous.get("ammo_rack_death"))))
+
+
 @dataclass
 class Player:
     player_id: int
@@ -350,6 +462,7 @@ class Player:
     bot_order_revision_sent: int = -1
     destructible_revision_sent: int = -1
     battle_ready_round: int = 0
+    capabilities: Tuple[str, ...] = field(default_factory=tuple)
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def send(self, message):
@@ -395,6 +508,7 @@ class BattleState:
         self.host_player_id = None
         self.bot_roster = self._new_bot_roster()
         self.bot_authority_id = None
+        self.authority_epoch = 0
         self.bot_manifest_authority_id = None
         self.bot_manifest = []
         self.bot_states = {}
@@ -414,8 +528,22 @@ class BattleState:
         self.pending_events = []
         self.pending_live_message = None
         self.capture_bases = {}
+        self.capture_threat_bases = {1: [], 2: []}
+        self.capture_contributors = {1: {}, 2: {}}
+        self.capture_cursors = {1: 0, 2: 0}
         self.destructibles = {}
         self.destructible_revision = 0
+        self.projectiles = {}
+        self.projectile_tombstones = {}
+        self.projectile_revision = 0
+        self.bot_pending_projectile_launches = set()
+        self.last_bot_state_reject = ""
+        self.last_bot_state_reject_code = ""
+        self.last_bot_hit_reject = ""
+        self.last_bot_hit_reject_code = ""
+        self.last_bot_human_hit_reject = ""
+        self.last_bot_human_hit_reject_code = ""
+        self._logged_protocol_reject_codes = {}
 
     def _choose_map(self, map_pool=None):
         map_pool = MAP_POOL if map_pool is None else tuple(map_pool)
@@ -428,6 +556,37 @@ class BattleState:
 
     def _active_map_pool(self):
         return CLIENT_MAP_POOLS.get(self.client_build, MAP_POOL)
+
+    def _server_time_ms(self):
+        return max(0, int(round(float(self.tick) * 1000.0 / TICK_HZ)))
+
+    def _projectile_snapshot(self):
+        result = []
+        for projectile_id in sorted(self.projectiles):
+            record = self.projectiles[projectile_id]
+            result.append({
+                "projectile_id": record["projectile_id"],
+                "shooter_kind": record["shooter_kind"],
+                "shooter_id": record["shooter_id"],
+                "source_vehicle": record["source_vehicle"],
+                "shot_seq": record["shot_seq"],
+                "shell_index": record["shell_index"],
+                "team": record["team"],
+                "origin": list(record["origin"]),
+                "velocity": list(record["velocity"]),
+                "gravity": record["gravity"],
+                "max_distance": record["max_distance"],
+                "max_time_ms": record["max_time_ms"],
+                "is_he": record["is_he"],
+                "splash_radius": record["splash_radius"],
+                "penetration_factor": record["penetration_factor"],
+                "launch_server_time_ms": record["launch_server_time_ms"],
+                "checked_through_ms": record["checked_through_ms"],
+                "checked_distance": record["checked_distance"],
+                "piercing_loss": record["piercing_loss"],
+                "authority_epoch": self.authority_epoch,
+            })
+        return result
 
     def _message_round_matches(self, message):
         """Fence round-aware clients while accepting 0.8.2 payloads."""
@@ -443,6 +602,27 @@ class BattleState:
                     parsed_round == self.round_id)
         except (TypeError, ValueError, OverflowError):
             return False
+
+    def _set_protocol_reject(self, kind, code, detail):
+        """Record one exact rejection without changing protocol semantics."""
+        setattr(self, "last_%s_reject_code" % kind, str(code))
+        setattr(self, "last_%s_reject" % kind, str(detail))
+        return False
+
+    def _clear_protocol_reject(self, kind):
+        setattr(self, "last_%s_reject_code" % kind, "")
+        setattr(self, "last_%s_reject" % kind, "")
+
+    def should_log_protocol_reject(self, kind, accepted):
+        """Log only the first rejection in one continuous reason cascade."""
+        if accepted:
+            self._logged_protocol_reject_codes.pop(kind, None)
+            return False
+        code = getattr(self, "last_%s_reject_code" % kind, "unknown")
+        if self._logged_protocol_reject_codes.get(kind) == code:
+            return False
+        self._logged_protocol_reject_codes[kind] = code
+        return True
 
     @staticmethod
     def _validate_combat_event_for_wire(event):
@@ -522,14 +702,21 @@ class BattleState:
         old = self.bot_authority_id
         self.bot_authority_id = connected[0] if connected else None
         if (old != self.bot_authority_id and
+                self.client_build == CLIENT_BUILD_0922):
+            self.authority_epoch += 1
+            self.bot_pending_projectile_launches.clear()
+        if (old != self.bot_authority_id and
                 self.phase in ("loading", "battle")):
             self.bot_manifest_authority_id = None
             self.bot_planner.clear_observations()
-            self.pending_events.append({
+            event = {
                 "kind": "authority",
                 "player_id": self.bot_authority_id,
                 "round_id": self.round_id,
-            })
+            }
+            if self.client_build == CLIENT_BUILD_0922:
+                event["authority_epoch"] = self.authority_epoch
+            self.pending_events.append(event)
         return old, self.bot_authority_id
 
     def _elect_room_host(self):
@@ -577,6 +764,19 @@ class BattleState:
             if (not isinstance(client_build, str) or
                     client_build not in CLIENT_MAP_POOLS):
                 return None, "unsupported_client_build"
+            capabilities = ()
+            if client_build == CLIENT_BUILD_0922:
+                raw_capabilities = hello.get("capabilities", ())
+                if (not isinstance(raw_capabilities, list) or
+                        len(raw_capabilities) > 32 or
+                        any(not isinstance(value, str) or not value or
+                            len(value) > 64
+                            for value in raw_capabilities) or
+                        len(set(raw_capabilities)) != len(raw_capabilities)):
+                    return None, "unsupported_capabilities"
+                capabilities = tuple(raw_capabilities)
+                if PROJECTILE_CAPABILITY not in capabilities:
+                    return None, "unsupported_capabilities"
             if (self.client_build is not None and
                     client_build != self.client_build):
                 return None, "incompatible_client_build"
@@ -621,6 +821,7 @@ class BattleState:
                 aim_yaw=yaw,
                 health=max(1, min(int(_finite_float(hello.get("max_health"), 1000)), 100000)),
                 max_health=max(1, min(int(_finite_float(hello.get("max_health"), 1000)), 100000)),
+                capabilities=capabilities,
             )
             self.players[player_id] = player
             if self.host_player_id is None:
@@ -698,6 +899,7 @@ class BattleState:
         self.next_id = max([player.player_id for player in self.players.values()] or [0]) + 1
         self.bot_roster = self._new_bot_roster()
         self.bot_authority_id = None
+        self.authority_epoch = 0
         self.bot_manifest_authority_id = None
         self.bot_manifest = []
         self.bot_states = {}
@@ -717,14 +919,28 @@ class BattleState:
         self.pending_events = []
         self.pending_live_message = None
         self.capture_bases = {}
+        self.capture_threat_bases = {1: [], 2: []}
+        self.capture_contributors = {1: {}, 2: {}}
+        self.capture_cursors = {1: 0, 2: 0}
         self.destructibles = {}
         self.destructible_revision = 0
+        self.projectiles = {}
+        self.projectile_tombstones = {}
+        self.projectile_revision = 0
+        self.bot_pending_projectile_launches = set()
+        self.last_bot_state_reject = ""
+        self.last_bot_state_reject_code = ""
+        self.last_bot_hit_reject = ""
+        self.last_bot_hit_reject_code = ""
+        self.last_bot_human_hit_reject = ""
+        self.last_bot_human_hit_reject_code = ""
+        self._logged_protocol_reject_codes = {}
         self._elect_room_host()
         self.state_revision += 1
 
     def lobby_message(self):
         with self.lock:
-            return {
+            message = {
                 "type": "roster",
                 "protocol": PROTOCOL_VERSION,
                 "client_build": self.client_build,
@@ -737,6 +953,9 @@ class BattleState:
                 "bot_authority_id": self.bot_authority_id,
                 "players": [self._public_player(p) for p in self.players.values() if p.connected],
             }
+            if self.client_build == CLIENT_BUILD_0922:
+                message["authority_epoch"] = self.authority_epoch
+            return message
 
     def request_start(self, player_id, requested_map=None):
         with self.lock:
@@ -748,6 +967,11 @@ class BattleState:
             if (self.client_build == CLIENT_BUILD_0922 and
                     player_id != self.host_player_id):
                 return None, "host_only"
+            if (self.client_build == CLIENT_BUILD_0922 and any(
+                    PROJECTILE_CAPABILITY not in participant.capabilities
+                    for participant in self.players.values()
+                    if participant.connected)):
+                return None, "missing_projectile_capability"
             if requested_map not in (None, ""):
                 requested_map = str(requested_map)
                 if requested_map not in self._active_map_pool():
@@ -763,7 +987,7 @@ class BattleState:
                           else "battle")
             self._elect_bot_authority()
             self.state_revision += 1
-            return {
+            start_message = {
                 "type": "battle_start",
                 "protocol": PROTOCOL_VERSION,
                 "client_build": self.client_build,
@@ -784,7 +1008,13 @@ class BattleState:
                 "battle_result": self.battle_result,
                 "destructible_revision": self.destructible_revision,
                 "destructibles": list(self.destructibles.values()),
-            }, None
+            }
+            if self.client_build == CLIENT_BUILD_0922:
+                start_message.update({
+                    "authority_epoch": self.authority_epoch,
+                    "server_time_ms": self._server_time_ms(),
+                })
+            return start_message, None
 
     def _activate_battle_if_ready(self):
         if self.phase != "loading":
@@ -809,6 +1039,9 @@ class BattleState:
             "round_id": self.round_id,
             "server_tick": self.tick,
             "state_revision": self.state_revision,
+            "bot_authority_id": self.bot_authority_id,
+            "authority_epoch": self.authority_epoch,
+            "server_time_ms": self._server_time_ms(),
             "countdown_seconds": PREBATTLE_SECONDS,
             "battle_duration_seconds": BATTLE_DURATION_SECONDS,
             "timing": self._timing_payload(),
@@ -906,7 +1139,7 @@ class BattleState:
             if (self.phase != "loading" or
                     self.bot_manifest_authority_id != self.bot_authority_id):
                 return None
-            return {
+            message = {
                 "type": "snapshot",
                 "protocol": PROTOCOL_VERSION,
                 "client_build": self.client_build,
@@ -914,9 +1147,13 @@ class BattleState:
                 "round_id": self.round_id,
                 "map": self.map_name,
                 "bot_authority_id": self.bot_authority_id,
+                "authority_epoch": self.authority_epoch,
+                "server_time_ms": self._server_time_ms(),
                 "players": [self._public_player(p) for p in self.players.values()
                             if p.connected and p.participating],
                 "bots": [self.bot_states[key] for key in sorted(self.bot_states)],
+                "projectile_revision": self.projectile_revision,
+                "projectiles": self._projectile_snapshot(),
                 "bot_manifest": list(self.bot_manifest),
                 "bot_order_revision": self.bot_orders["revision"],
                 "rules": self.rules_state,
@@ -1008,6 +1245,53 @@ class BattleState:
             self.pending_events.append(dict(event))
             return True
 
+    @staticmethod
+    def _destructible_key(event):
+        return (event["destructible_kind"], event["chunk_id"],
+                event["item_index"], event.get("mat_kind"))
+
+    def _normalize_projectile_destructibles(self, receipts):
+        """Validate one bounded embedded shot-destruction transaction."""
+        if (not isinstance(receipts, list) or
+                len(receipts) > PROJECTILE_MAX_DESTRUCTIBLES):
+            raise ValueError("invalid projectile destructible batch")
+        normalized = []
+        seen = set()
+        for raw in receipts:
+            allowed = {
+                "destructible_kind", "chunk_id", "item_index", "x", "y",
+                "z", "fall_yaw", "speed", "is_shot", "mat_kind",
+            }
+            required = allowed - {"mat_kind"}
+            if (not isinstance(raw, dict) or set(raw) - allowed or
+                    not required.issubset(raw)):
+                raise ValueError("invalid projectile destructible shape")
+            event = self._sanitize_destructible(raw)
+            if event is None or event.get("is_shot") is not True:
+                raise ValueError("invalid projectile destructible receipt")
+            key = self._destructible_key(event)
+            if key in seen:
+                raise ValueError("duplicate projectile destructible receipt")
+            seen.add(key)
+            normalized.append(event)
+        return normalized
+
+    def _commit_projectile_destructibles(self, player_id, receipts):
+        """Commit only prevalidated receipts; this helper cannot reject."""
+        changed = 0
+        for event in receipts:
+            key = self._destructible_key(event)
+            if key in self.destructibles:
+                continue
+            self.destructible_revision += 1
+            stored = dict(event)
+            stored["revision"] = self.destructible_revision
+            stored["reported_by"] = int(player_id)
+            self.destructibles[key] = stored
+            self.pending_events.append(dict(stored))
+            changed += 1
+        return changed
+
     def leave_battle(self, player_id, message):
         """Retire a client from one round while keeping its lobby socket."""
         with self.lock:
@@ -1093,6 +1377,14 @@ class BattleState:
                 "destructible_revision": self.destructible_revision,
                 "destructibles": list(self.destructibles.values()),
             }
+            if self.client_build == CLIENT_BUILD_0922:
+                message.update({
+                    "authority_epoch": self.authority_epoch,
+                    "server_time_ms": self._server_time_ms(),
+                    "projectile_revision": self.projectile_revision,
+                    "projectiles": self._projectile_snapshot(),
+                })
+            return message
 
     def update_bot_manifest(self, player_id, message):
         """Accept the canonical bot lineup from the elected simulation client."""
@@ -1221,6 +1513,53 @@ class BattleState:
             })
         return route
 
+    @staticmethod
+    def _sanitize_bot_ammo(raw, identity, previous):
+        """Validate an optional atomic finite-ammunition snapshot."""
+        has_inventory = "ammo_remaining" in raw
+        has_next = "next_shell_index" in raw
+        has_pending = "ammo_reload_pending" in raw
+        if not has_inventory and not has_next and not has_pending:
+            return {
+                "remaining": list((previous or {}).get(
+                    "ammo_remaining", [])),
+                "next": int((previous or {}).get(
+                    "next_shell_index", raw.get("shell_index", 0))),
+                "pending": bool((previous or {}).get(
+                    "ammo_reload_pending", False)),
+            }
+        if (not has_inventory or not has_next or not has_pending or
+                "shell_index" not in raw):
+            raise ValueError("bot ammunition snapshot is incomplete")
+        shells = ((identity.get("profile") or {}).get("shells") or [])
+        remaining = raw.get("ammo_remaining")
+        if not isinstance(remaining, (list, tuple)):
+            raise ValueError("bot ammunition inventory shape is invalid")
+        # Production manifests carry descriptor shell summaries. Engine-free
+        # harnesses and legacy adapters may omit them; the atomic inventory is
+        # still self-sizing and bounded, so preserve it without inventing a
+        # shell catalogue on the server.
+        shell_count = len(shells) if shells else len(remaining)
+        if (shell_count <= 0 or shell_count > 5 or
+                len(remaining) != shell_count):
+            raise ValueError("bot ammunition inventory shape is invalid")
+        parsed = [_exact_int(value, 0, 1000) for value in remaining]
+        if sum(parsed) > 1000:
+            raise ValueError("bot ammunition inventory exceeds capacity")
+        loaded = _exact_int(raw.get("shell_index"), 0, shell_count - 1)
+        planned = _exact_int(
+            raw.get("next_shell_index"), 0, shell_count - 1)
+        pending = raw.get("ammo_reload_pending")
+        if not isinstance(pending, bool):
+            raise ValueError("bot ammunition reload state is invalid")
+        total = sum(parsed)
+        if total > 0 and parsed[planned] <= 0:
+            raise ValueError("bot planned ammunition is exhausted")
+        if total > 0 and not pending and parsed[loaded] <= 0:
+            raise ValueError("bot loaded ammunition is exhausted")
+        return {"remaining": parsed, "next": planned, "loaded": loaded,
+                "pending": pending}
+
     def update_bot_observation(self, player_id, message):
         """Accept authority observations; never derive contacts from snapshots."""
         with self.lock:
@@ -1236,12 +1575,22 @@ class BattleState:
             players = [self._public_player(p) for p in self.players.values() if p.connected]
             known_targets = self.bot_planner.known_targets(list(self.bot_states.values()), players)
             now = time.monotonic()
+            accepted_visibility = []
             accepted_contacts = self.bot_planner.report_contacts(
-                message.get("contacts"), known_targets, now)
+                message.get("contacts"), known_targets, now,
+                accepted_visibility=accepted_visibility)
             known_bots = self.bot_planner.known_bots(
                 self.bot_manifest, list(self.bot_states.values()))
             accepted_affordances = self.bot_planner.report_affordances(
                 message.get("affordances"), known_bots, known_targets, now)
+            if (self.client_build == CLIENT_BUILD_0922 and
+                    accepted_visibility):
+                return {
+                    "type": "bot_observation",
+                    "protocol": PROTOCOL_VERSION,
+                    "round_id": self.round_id,
+                    "contacts": accepted_visibility,
+                }
             return accepted_contacts > 0 or accepted_affordances > 0
 
     @staticmethod
@@ -1259,13 +1608,16 @@ class BattleState:
         yaw = _finite_float(raw.get("yaw"), 0.0)
         movement = _finite_float(raw.get("movement_dir"), 0.0)
         rotation = _finite_float(raw.get("rotation_dir"), 0.0)
+        ammunition = BattleState._sanitize_bot_ammo(
+            raw, identity, previous)
         result = {
             "id": int(identity["id"]),
             "team": int(identity["team"]),
             "slot": int(identity["slot"]),
             "name": identity["name"],
             "vehicle": identity.get("vehicle", "ussr:R11_MS-1"),
-            "world_pose": True,
+            "world_pose": bool(raw.get(
+                "world_pose", (previous or {}).get("world_pose", True))),
             "x": round(_clamp(_finite_float(raw.get("x")), -2000.0, 2000.0), 4),
             "y": round(_clamp(_finite_float(raw.get("y")), -1000.0, 1000.0), 4),
             "z": round(_clamp(_finite_float(raw.get("z")), -2000.0, 2000.0), 4),
@@ -1277,7 +1629,12 @@ class BattleState:
             "rotation_dir": (1 if rotation > 0.01 else
                              (-1 if rotation < -0.01 else 0)),
             "fire_seq": fire_seq,
-            "shell_index": max(0, min(int(_finite_float(raw.get("shell_index"), 0)), 9)),
+            "shell_index": ammunition.get(
+                "loaded", max(0, min(int(_finite_float(
+                    raw.get("shell_index"), 0)), 9))),
+            "next_shell_index": ammunition["next"],
+            "ammo_remaining": ammunition["remaining"],
+            "ammo_reload_pending": ammunition["pending"],
             "health": reported_health,
             "max_health": max_health,
             "alive": bool(raw.get("alive", reported_health > 0)) and reported_health > 0,
@@ -1335,6 +1692,56 @@ class BattleState:
         result["display_health"] = max(0, min(int(_finite_float(
             raw.get("display_health"), reported_health)), max_health))
         return result
+
+    @staticmethod
+    def _validate_bot_ammo_transition(previous, current):
+        """Require conserved inventory and explicit reload-boundary state."""
+        if previous is None:
+            return True
+        before = previous.get("ammo_remaining") or []
+        after = current.get("ammo_remaining") or []
+        if not before and not after:
+            return True
+        if len(before) != len(after) or not before:
+            raise ValueError("bot ammunition contract appeared mid-round")
+        fire_delta = (int(current.get("fire_seq", 0)) -
+                      int(previous.get("fire_seq", 0)))
+        if fire_delta not in (0, 1):
+            raise ValueError("bot ammunition fire delta is invalid")
+        loaded = int(current.get("shell_index", 0))
+        previous_loaded = int(previous.get("shell_index", 0))
+        previous_next = int(previous.get(
+            "next_shell_index", previous_loaded))
+        next_shell = int(current.get("next_shell_index", loaded))
+        previous_pending = bool(previous.get(
+            "ammo_reload_pending", False))
+        pending = bool(current.get("ammo_reload_pending", False))
+        expected = list(before)
+        if fire_delta:
+            if not pending:
+                raise ValueError("bot shot did not enter reload state")
+            expected_loaded = (previous_next if previous_pending else
+                               previous_loaded)
+            if loaded != expected_loaded:
+                raise ValueError("bot loaded shell changed while firing")
+            if loaded >= len(expected) or expected[loaded] <= 0:
+                raise ValueError("bot fired an exhausted shell")
+            expected[loaded] -= 1
+        elif not previous_pending:
+            if pending:
+                raise ValueError("bot reload started without a shot")
+            if loaded != previous_loaded:
+                raise ValueError("bot loaded shell changed outside reload")
+        elif pending:
+            if loaded != previous_loaded:
+                raise ValueError("bot loaded shell changed before reload")
+            if next_shell != previous_next:
+                raise ValueError("bot planned shell changed before reload")
+        elif loaded != previous_next:
+            raise ValueError("bot loaded shell skipped its planned boundary")
+        if list(after) != expected:
+            raise ValueError("bot ammunition inventory is not conserved")
+        return True
 
     @staticmethod
     def _bot_combat_signature(state):
@@ -1451,21 +1858,49 @@ class BattleState:
 
     def update_bot_states(self, player_id, message):
         with self.lock:
-            if (not self._message_round_matches(message) or
-                    not self._combat_accepting() or
-                    self.battle_result is not None or
-                    player_id != self.bot_authority_id or
-                    player_id != self.bot_manifest_authority_id or
-                    not self.bot_manifest):
-                return False
+            self._clear_protocol_reject("bot_state")
+            if not self._message_round_matches(message):
+                return self._set_protocol_reject(
+                    "bot_state", "round",
+                    "round=%s server_round=%s" % (
+                        message.get("round_id") if isinstance(message, dict)
+                        else None, self.round_id))
+            if not self._combat_accepting():
+                return self._set_protocol_reject(
+                    "bot_state", "combat_closed",
+                    "phase=%s tick=%s" % (self.phase, self.tick))
+            if self.battle_result is not None:
+                return self._set_protocol_reject(
+                    "bot_state", "battle_finished", "battle_result=set")
+            if player_id != self.bot_authority_id:
+                return self._set_protocol_reject(
+                    "bot_state", "authority",
+                    "sender=%s authority=%s" % (
+                        player_id, self.bot_authority_id))
+            if player_id != self.bot_manifest_authority_id:
+                return self._set_protocol_reject(
+                    "bot_state", "manifest_authority",
+                    "sender=%s manifest_authority=%s" % (
+                        player_id, self.bot_manifest_authority_id))
+            if not self.bot_manifest:
+                return self._set_protocol_reject(
+                    "bot_state", "manifest_missing", "manifest=empty")
             identities = {entry["id"]: entry for entry in self.bot_manifest}
             incoming = message.get("bots") or []
             if (not isinstance(incoming, (list, tuple)) or
                     len(incoming) != len(identities)):
-                return False
+                return self._set_protocol_reject(
+                    "bot_state", "batch_shape",
+                    "incoming_type=%s incoming_count=%s expected_count=%s" % (
+                        type(incoming).__name__,
+                        len(incoming) if isinstance(
+                            incoming, (list, tuple)) else None,
+                        len(identities)))
             next_states = {}
             shot_events = []
+            pending_projectile_launches = set()
             fire_deaths = []
+            capture_resets = set()
             seen = set()
             required = ("id", "x", "y", "z", "yaw", "health",
                         "alive", "fire_seq")
@@ -1476,23 +1911,38 @@ class BattleState:
                             raw, ("id", "x", "y", "z", "yaw",
                                   "health", "fire_seq")) or
                         not isinstance(raw.get("alive"), bool)):
-                    return False
+                    return self._set_protocol_reject(
+                        "bot_state", "bot_shape",
+                        "bot=%s required_or_finite_fields_invalid" % (
+                            raw.get("id") if isinstance(raw, dict)
+                            else None))
                 try:
                     bot_id = int(raw.get("id"))
                 except (TypeError, ValueError):
-                    return False
+                    return self._set_protocol_reject(
+                        "bot_state", "bot_id", "bot=%s" % raw.get("id"))
                 identity = identities.get(bot_id)
                 if identity is None or bot_id in seen:
-                    return False
+                    return self._set_protocol_reject(
+                        "bot_state", "bot_identity",
+                        "bot=%s known=%s duplicate=%s" % (
+                            bot_id, identity is not None, bot_id in seen))
                 seen.add(bot_id)
                 try:
                     fire_seq = int(raw.get("fire_seq"))
                 except (TypeError, ValueError):
-                    return False
+                    return self._set_protocol_reject(
+                        "bot_state", "fire_seq",
+                        "bot=%s client_fire=%s" % (
+                            bot_id, raw.get("fire_seq")))
                 if (fire_seq < 0 or float(raw.get("fire_seq")) != fire_seq or
                         bool(raw.get("alive")) !=
                         (int(float(raw.get("health"))) > 0)):
-                    return False
+                    return self._set_protocol_reject(
+                        "bot_state", "fire_or_alive",
+                        "bot=%s client_fire=%s health=%s alive=%s" % (
+                            bot_id, raw.get("fire_seq"), raw.get("health"),
+                            raw.get("alive")))
                 previous = self.bot_states.get(bot_id)
                 try:
                     current = self._sanitize_bot_state(
@@ -1500,11 +1950,32 @@ class BattleState:
                     if self.client_build == CLIENT_BUILD_0922:
                         self._reconcile_modern_bot_combat(
                             raw, previous, current)
-                except ValueError:
-                    return False
+                except ValueError as error:
+                    return self._set_protocol_reject(
+                        "bot_state", "combat_contract",
+                        ("bot=%s client_fire=%s server_fire=%s "
+                         "client_base=%s server_base=%s client_seq=%s "
+                         "server_ack=%s reason=%s") % (
+                            bot_id, raw.get("fire_seq"),
+                            (previous or {}).get("fire_seq", 0),
+                            raw.get("combat_base_revision"),
+                            (previous or {}).get(
+                                "combat_base_revision", 0),
+                            raw.get("combat_seq"),
+                            (previous or {}).get("combat_ack_seq", 0),
+                            error))
                 previous_fire = int((previous or {}).get("fire_seq", 0))
                 if current["fire_seq"] > previous_fire + 1:
-                    return False
+                    return self._set_protocol_reject(
+                        "bot_state", "fire_gap",
+                        "bot=%s client_fire=%s server_fire=%s" % (
+                            bot_id, current["fire_seq"], previous_fire))
+                try:
+                    self._validate_bot_ammo_transition(previous, current)
+                except ValueError as error:
+                    return self._set_protocol_reject(
+                        "bot_state", "ammo_contract",
+                        "bot=%s reason=%s" % (bot_id, error))
                 next_states[bot_id] = current
                 previous_fire_active = bool(
                     (previous or {}).get("critical") and
@@ -1513,6 +1984,12 @@ class BattleState:
                     int(current.get("max_health", 0)) * 0.05))
                 previous_health = int((previous or {}).get("health", 0))
                 current_health = int(current.get("health", 0))
+                if (previous is not None and
+                        (current_health < previous_health or
+                         _critical_damage_transition(
+                             previous.get("critical"),
+                             current.get("critical")))):
+                    capture_resets.add(bot_id)
                 if (previous is not None and previous.get("alive") and
                         not current.get("alive") and
                         previous_fire_active and
@@ -1538,19 +2015,29 @@ class BattleState:
                 if (current["alive"] and
                         (previous is None or previous.get("alive")) and
                         current["fire_seq"] > previous_fire):
-                    shot_event = {
-                        "kind": "bot_shot", "attacker_bot": bot_id,
-                        "shot_seq": current["fire_seq"],
-                        "shell_index": current["shell_index"],
-                    }
-                    if ("shot_yaw" in current and
-                            "shot_pitch" in current):
-                        shot_event["shot_yaw"] = current["shot_yaw"]
-                        shot_event["shot_pitch"] = current["shot_pitch"]
-                    shot_events.append(shot_event)
+                    if self.client_build == CLIENT_BUILD_0922:
+                        pending_projectile_launches.add(
+                            (bot_id, current["fire_seq"]))
+                    else:
+                        shot_event = {
+                            "kind": "bot_shot", "attacker_bot": bot_id,
+                            "shot_seq": current["fire_seq"],
+                            "shell_index": current["shell_index"],
+                        }
+                        if ("shot_yaw" in current and
+                                "shot_pitch" in current):
+                            shot_event["shot_yaw"] = current["shot_yaw"]
+                            shot_event["shot_pitch"] = current["shot_pitch"]
+                        shot_events.append(shot_event)
             if seen != set(identities):
-                return False
+                return self._set_protocol_reject(
+                    "bot_state", "batch_members",
+                    "missing=%s" % sorted(set(identities) - seen))
             self.bot_states = next_states
+            self.bot_pending_projectile_launches.update(
+                pending_projectile_launches)
+            for bot_id in capture_resets:
+                self._drop_capture_for_vehicle("bot", bot_id)
             for attacker_kind, attacker_id, victim, damage in fire_deaths:
                 self._record_frag(
                     attacker_kind, attacker_id, victim["team"],
@@ -1570,56 +2057,776 @@ class BattleState:
             self._maybe_finish_battle()
             return True
 
+    @staticmethod
+    def _projectile_message_fits(message):
+        try:
+            payload = json.dumps(
+                message, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=True)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return len(payload.encode("utf-8")) + 1 <= MAX_LINE_BYTES
+
+    @staticmethod
+    def _projectile_id(round_id, shooter_kind, shooter_id, shot_seq):
+        prefix = "p" if shooter_kind == "player" else "b"
+        return "%d:%s:%d:%d" % (
+            int(round_id), prefix, int(shooter_id), int(shot_seq))
+
+    def _projectile_authority_matches(self, player_id, message):
+        try:
+            epoch = _exact_int(
+                message.get("authority_epoch"), 0, PROJECTILE_MAX_ID)
+        except ValueError:
+            return False
+        return (player_id == self.bot_authority_id and
+                epoch == self.authority_epoch)
+
+    def launch_projectile(self, player_id, message):
+        """Atomically admit one #1513 shot into the round projectile ledger."""
+        with self.lock:
+            if (self.client_build != CLIENT_BUILD_0922 or
+                    not self._message_round_matches(message) or
+                    not self._combat_accepting() or
+                    self.battle_result is not None or
+                    not self._projectile_message_fits(message)):
+                return False
+            allowed = {
+                "type", "round_id", "shooter_kind", "shooter_id",
+                "shot_seq", "shell_index", "origin", "velocity",
+                "gravity", "max_distance", "max_time_ms", "is_he",
+                "splash_radius", "penetration_factor", "authority_epoch",
+            }
+            if set(message) - allowed:
+                return False
+            try:
+                shooter_kind = str(message.get("shooter_kind"))
+                if shooter_kind not in ("player", "bot"):
+                    raise ValueError("invalid shooter kind")
+                shooter_id = _exact_int(
+                    message.get("shooter_id"), 1, PROJECTILE_MAX_ID)
+                shot_seq = _exact_int(
+                    message.get("shot_seq"), 1, PROJECTILE_MAX_ID)
+                shell_index = _exact_int(message.get("shell_index"), 0, 9)
+                origin = _bounded_vector(
+                    message.get("origin"), (-5000.0, -1000.0, -5000.0),
+                    (5000.0, 3000.0, 5000.0))
+                velocity = _bounded_vector(
+                    message.get("velocity"), (-3000.0, -3000.0, -3000.0),
+                    (3000.0, 3000.0, 3000.0))
+                speed = math.sqrt(sum(component * component
+                                      for component in velocity))
+                if speed <= 0.001 or speed > 3000.0:
+                    raise ValueError("invalid launch speed")
+                gravity = round(_bounded_float(
+                    message.get("gravity"), 0.0,
+                    PROJECTILE_MAX_GRAVITY, False), 6)
+                max_distance = round(_bounded_float(
+                    message.get("max_distance"), 0.0, 10000.0, False), 6)
+                max_time_ms = _exact_int(
+                    message.get("max_time_ms"), 1,
+                    PROJECTILE_MAX_LIFETIME_MS)
+                if not isinstance(message.get("is_he"), bool):
+                    raise ValueError("invalid HE flag")
+                is_he = message["is_he"]
+                splash_radius = round(_bounded_float(
+                    message.get("splash_radius"), 0.0, 100.0), 6)
+                penetration_factor = round(_bounded_float(
+                    message.get("penetration_factor"), 0.0, 100.0), 6)
+                if not is_he and splash_radius != 0.0:
+                    raise ValueError("AP projectile cannot have splash")
+            except (TypeError, ValueError, OverflowError):
+                return False
+
+            projectile_id = self._projectile_id(
+                self.round_id, shooter_kind, shooter_id, shot_seq)
+            normalized = {
+                "shooter_kind": shooter_kind, "shooter_id": shooter_id,
+                "shot_seq": shot_seq, "shell_index": shell_index,
+                "origin": origin, "velocity": velocity,
+                "gravity": gravity, "max_distance": max_distance,
+                "max_time_ms": max_time_ms, "is_he": is_he,
+                "splash_radius": splash_radius,
+                "penetration_factor": penetration_factor,
+            }
+            launch_fingerprint = _message_fingerprint(normalized)
+            if shooter_kind == "player":
+                shooter = self.players.get(shooter_id)
+                if (shooter_id != player_id or shooter is None or
+                        not shooter.connected):
+                    return False
+            else:
+                if not self._projectile_authority_matches(player_id, message):
+                    return False
+                shooter = self.bot_states.get(shooter_id)
+            active = self.projectiles.get(projectile_id)
+            if active is not None:
+                return active["launch_fingerprint"] == launch_fingerprint
+            terminal = self.projectile_tombstones.get(projectile_id)
+            if terminal is not None:
+                return terminal["launch_fingerprint"] == launch_fingerprint
+
+            if len(self.projectiles) >= PROJECTILE_MAX_ACTIVE:
+                return False
+            shooter_active = sum(
+                1 for record in self.projectiles.values()
+                if (record["shooter_kind"] == shooter_kind and
+                    record["shooter_id"] == shooter_id))
+            if shooter_active >= PROJECTILE_MAX_PER_SHOOTER:
+                return False
+
+            if shooter_kind == "player":
+                if (not shooter.participating or
+                        not shooter.alive or shot_seq != shooter.fire_seq + 1):
+                    return False
+                team = shooter.team
+                source_vehicle = shooter.vehicle
+            else:
+                launch_edge = (shooter_id, shot_seq)
+                if (shooter is None or not shooter.get("alive") or
+                        shell_index != int(shooter.get("shell_index", 0)) or
+                        launch_edge not in
+                        self.bot_pending_projectile_launches or
+                        shot_seq != int(shooter.get("fire_seq", 0))):
+                    return False
+                team = int(shooter.get("team", 0))
+                if team not in (1, 2):
+                    return False
+                source_vehicle = str(shooter.get("vehicle", ""))
+            if not source_vehicle or len(source_vehicle) > 128:
+                return False
+
+            launch_server_time_ms = self._server_time_ms()
+            record = dict(normalized)
+            record.update({
+                "projectile_id": projectile_id,
+                "source_vehicle": source_vehicle,
+                "team": int(team),
+                "launch_server_time_ms": launch_server_time_ms,
+                "checked_through_ms": 0,
+                "checked_distance": 0.0,
+                "piercing_loss": 0.0,
+                "launch_fingerprint": launch_fingerprint,
+                "last_progress_fingerprint": None,
+            })
+            self.projectiles[projectile_id] = record
+            if shooter_kind == "player":
+                shooter.fire_seq = shot_seq
+                shooter.shell_index = shell_index
+            else:
+                self.bot_pending_projectile_launches.discard(
+                    (shooter_id, shot_seq))
+            self.projectile_revision += 1
+
+            horizontal = math.hypot(velocity[0], velocity[2])
+            shot_yaw = math.atan2(velocity[0], velocity[2])
+            # Canonical launch events publish physical vector elevation:
+            # positive is upward.  Rendered gun pitch uses the opposite sign,
+            # but RemoteVehicle explicitly adapts between the two contracts.
+            shot_pitch = math.atan2(velocity[1], horizontal)
+            event = {
+                "kind": "shot" if shooter_kind == "player" else "bot_shot",
+                "projectile_id": projectile_id,
+                "shot_seq": shot_seq,
+                "shell_index": shell_index,
+                "origin": list(origin),
+                "velocity": list(velocity),
+                "gravity": gravity,
+                "maxDistance": max_distance,
+                "max_time_ms": max_time_ms,
+                "is_he": is_he,
+                "splash_radius": splash_radius,
+                "penetration_factor": penetration_factor,
+                "launch_server_time_ms": launch_server_time_ms,
+                "shooter_kind": shooter_kind,
+                "shooter_id": shooter_id,
+                "source_vehicle": source_vehicle,
+                "authority_epoch": self.authority_epoch,
+                "shot_yaw": round(
+                    ((shot_yaw + math.pi) % (2.0 * math.pi)) - math.pi, 6),
+                "shot_pitch": round(_clamp(shot_pitch, -math.pi, math.pi), 6),
+            }
+            event["attacker" if shooter_kind == "player"
+                  else "attacker_bot"] = shooter_id
+            self.pending_events.append(event)
+            return True
+
+    def _normalize_projectile_cursor(self, raw, record):
+        allowed = {
+            "projectile_id", "base_checked_ms", "checked_through_ms",
+            "checked_distance", "piercing_loss", "penetration_factor",
+            "destructibles",
+        }
+        if not isinstance(raw, dict) or set(raw) != allowed:
+            raise ValueError("invalid cursor shape")
+        projectile_id = raw.get("projectile_id")
+        if (not isinstance(projectile_id, str) or not projectile_id or
+                len(projectile_id) > 96 or
+                projectile_id != record["projectile_id"]):
+            raise ValueError("invalid projectile id")
+        base_checked_ms = _exact_int(raw.get("base_checked_ms"), 0)
+        checked_through_ms = _exact_int(
+            raw.get("checked_through_ms"), base_checked_ms,
+            record["max_time_ms"])
+        checked_distance = round(_bounded_float(
+            raw.get("checked_distance"), record["checked_distance"],
+            record["max_distance"] + PROJECTILE_TOLERANCE), 6)
+        piercing_loss = round(_bounded_float(
+            raw.get("piercing_loss"), record["piercing_loss"], 100000.0), 6)
+        penetration_factor = round(_bounded_float(
+            raw.get("penetration_factor"), 0.0, 100.0), 6)
+        if (penetration_factor >
+                record["penetration_factor"] + PROJECTILE_TOLERANCE):
+            raise ValueError("penetration factor increased")
+        destructibles = self._normalize_projectile_destructibles(
+            raw.get("destructibles"))
+        return {
+            "projectile_id": projectile_id,
+            "base_checked_ms": base_checked_ms,
+            "checked_through_ms": checked_through_ms,
+            "checked_distance": checked_distance,
+            "piercing_loss": piercing_loss,
+            "penetration_factor": penetration_factor,
+            "destructibles": destructibles,
+        }
+
+    def progress_projectiles(self, player_id, message):
+        """Advance an authority-owned batch with cursor compare-and-swap."""
+        with self.lock:
+            if (self.client_build != CLIENT_BUILD_0922 or
+                    not self._message_round_matches(message) or
+                    not self._combat_accepting() or
+                    self.battle_result is not None or
+                    not self._projectile_message_fits(message) or
+                    not self._projectile_authority_matches(
+                        player_id, message)):
+                return False
+            if set(message) != {
+                    "type", "round_id", "authority_epoch", "cursors"}:
+                return False
+            cursors = message.get("cursors")
+            if (not isinstance(cursors, list) or not cursors or
+                    len(cursors) > PROJECTILE_MAX_PROGRESS_BATCH):
+                return False
+            now_ms = self._server_time_ms()
+            proposals = []
+            seen = set()
+            receipt_count = 0
+            try:
+                for raw in cursors:
+                    projectile_id = raw.get("projectile_id") \
+                        if isinstance(raw, dict) else None
+                    if projectile_id in seen:
+                        raise ValueError("duplicate cursor")
+                    seen.add(projectile_id)
+                    record = self.projectiles.get(projectile_id)
+                    if record is None:
+                        raise ValueError("unknown projectile")
+                    cursor = self._normalize_projectile_cursor(raw, record)
+                    receipt_count += len(cursor["destructibles"])
+                    if receipt_count > PROJECTILE_MAX_DESTRUCTIBLES:
+                        raise ValueError(
+                            "too many projectile destructible receipts")
+                    fingerprint = _message_fingerprint(cursor)
+                    if cursor["base_checked_ms"] != record[
+                            "checked_through_ms"]:
+                        if record.get(
+                                "last_progress_fingerprint") == fingerprint:
+                            proposals.append((record, cursor, fingerprint, True))
+                            continue
+                        raise ValueError("cursor compare-and-swap failed")
+                    elapsed = max(
+                        0, now_ms - record["launch_server_time_ms"])
+                    if (cursor["checked_through_ms"] >
+                            elapsed + PROJECTILE_CLOCK_LEEWAY_MS):
+                        raise ValueError("cursor is ahead of server time")
+                    proposals.append((record, cursor, fingerprint, False))
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                return False
+
+            changed = False
+            destructibles = []
+            for record, cursor, fingerprint, repeated in proposals:
+                if repeated:
+                    continue
+                destructibles.extend(cursor["destructibles"])
+                record["checked_through_ms"] = cursor["checked_through_ms"]
+                record["checked_distance"] = cursor["checked_distance"]
+                record["piercing_loss"] = cursor["piercing_loss"]
+                record["penetration_factor"] = cursor["penetration_factor"]
+                record["last_progress_fingerprint"] = fingerprint
+                changed = True
+            self._commit_projectile_destructibles(
+                player_id, destructibles)
+            if changed:
+                self.projectile_revision += 1
+            return True
+
+    def _normalize_projectile_effect(self, raw, record, impact, splash):
+        allowed = {
+            "target_kind", "target_id", "damage", "shot_result",
+            "x", "y", "z", "critical",
+            "critical_target_base_revision", "critical_target_ack_seq",
+            "hull_damage",
+        }
+        required = {
+            "target_kind", "target_id", "damage", "shot_result",
+            "x", "y", "z",
+        }
+        if (not isinstance(raw, dict) or set(raw) - allowed or
+                not required.issubset(raw)):
+            raise ValueError("invalid effect shape")
+        target_kind = raw.get("target_kind")
+        if target_kind not in ("player", "bot"):
+            raise ValueError("invalid target kind")
+        target_id = _exact_int(
+            raw.get("target_id"), 1, PROJECTILE_MAX_ID)
+        damage = _exact_int(raw.get("damage"), 0, 5000)
+        shot_result = _exact_int(raw.get("shot_result"), 0, 2)
+        pose = _bounded_vector(
+            [raw.get("x"), raw.get("y"), raw.get("z")],
+            (-5000.0, -1000.0, -5000.0),
+            (5000.0, 3000.0, 5000.0))
+        target = (self.players.get(target_id) if target_kind == "player"
+                  else self.bot_states.get(target_id))
+        if target is None:
+            raise ValueError("unknown target")
+        target_team = (target.team if target_kind == "player"
+                       else int(target.get("team", 0)))
+        target_alive = (target.alive if target_kind == "player"
+                        else bool(target.get("alive")))
+        target_position = (
+            (target.x, target.y, target.z) if target_kind == "player" else
+            (float(target.get("x", 0.0)), float(target.get("y", 0.0)),
+             float(target.get("z", 0.0))))
+        if splash:
+            distance = math.sqrt(sum(
+                (target_position[index] - impact[index]) ** 2
+                for index in range(3)))
+            if distance > record["splash_radius"] + PROJECTILE_TOLERANCE:
+                raise ValueError("splash target outside blast radius")
+        elif (target_kind == record["shooter_kind"] and
+              target_id == record["shooter_id"]):
+            raise ValueError("direct self hit")
+
+        critical = _critical_payload(raw.get("critical"))
+        critical_accepted = True
+        hull_damage = None
+        if critical is not None:
+            if not {"critical_target_base_revision",
+                    "critical_target_ack_seq", "hull_damage"}.issubset(raw):
+                raise ValueError("critical tokens missing")
+            expected_base = (
+                target.critical_report_base_revision
+                if target_kind == "player" else
+                int(target.get("combat_base_revision", 0)))
+            expected_ack = (
+                target.critical_ack_seq if target_kind == "player" else
+                int(target.get("combat_ack_seq", 0)))
+            hull_damage, critical_accepted = _critical_proposal_admission(
+                raw, expected_base, expected_ack)
+        elif set(raw) & {"critical_target_base_revision",
+                         "critical_target_ack_seq", "hull_damage"}:
+            raise ValueError("critical tokens without critical payload")
+        return {
+            "target_kind": target_kind, "target_id": target_id,
+            "target": target, "target_team": target_team,
+            "target_alive": target_alive, "damage": damage,
+            "shot_result": shot_result, "pose": pose,
+            "critical": critical,
+            "critical_accepted": critical_accepted,
+            "hull_damage": hull_damage, "splash": bool(splash),
+        }
+
+    def _apply_projectile_effect(self, record, proposal):
+        target_kind = proposal["target_kind"]
+        target_id = proposal["target_id"]
+        target = proposal["target"]
+        was_alive = proposal["target_alive"]
+        critical = proposal["critical"]
+        admitted_critical = (
+            critical if proposal["critical_accepted"] and was_alive else None)
+        damage = proposal["damage"]
+        if critical is not None and not proposal["critical_accepted"]:
+            damage = proposal["hull_damage"]
+        if not was_alive:
+            damage = 0
+
+        if target_kind == "player":
+            critical_before = target.critical
+            applied = min(damage, target.health)
+            target.health -= applied
+            target.alive = target.health > 0
+            target.display_health = target.health
+            critical_commit = self._commit_external_player_critical(
+                target, admitted_critical)
+            health = target.health
+            alive = target.alive
+        else:
+            combat_before = self._bot_combat_signature(target)
+            critical_before = combat_before[2]
+            applied = min(damage, int(target.get("health", 0)))
+            target["health"] = int(target.get("health", 0)) - applied
+            target["alive"] = target["health"] > 0
+            target["display_health"] = target["health"]
+            if admitted_critical is not None:
+                target["critical"] = _critical_state(admitted_critical)
+                before_fire = bool(
+                    critical_before and critical_before.get("fire", False))
+                after_fire = bool(target["critical"].get("fire", False))
+                if not before_fire and after_fire:
+                    target["fire_attacker_kind"] = record["shooter_kind"]
+                    target["fire_attacker_id"] = record["shooter_id"]
+            self._commit_external_bot_combat(target, combat_before)
+            critical_commit = ({
+                "combat_revision": target.get("combat_revision", 0),
+                "combat_base_revision": target.get(
+                    "combat_base_revision", 0),
+                "combat_ack_seq": target.get("combat_ack_seq", 0),
+            } if critical is not None else None)
+            health = int(target["health"])
+            alive = bool(target["alive"])
+
+        if (applied > 0 or _critical_damage_transition(
+                critical_before, admitted_critical)):
+            self._drop_capture_for_vehicle(target_kind, target_id)
+        if record["shooter_kind"] == "player":
+            event_kind = "hit" if target_kind == "player" else "bot_hit"
+            attacker_key = "attacker"
+        else:
+            event_kind = ("bot_human_hit" if target_kind == "player"
+                          else "bot_bot_hit")
+            attacker_key = "attacker_bot"
+        event = {
+            "kind": event_kind,
+            attacker_key: record["shooter_id"],
+            "target" if target_kind == "player" else "target_bot": target_id,
+            "projectile_id": record["projectile_id"],
+            "shot_seq": record["shot_seq"],
+            "shell_index": record["shell_index"],
+            "shot_result": proposal["shot_result"],
+            "damage": applied, "health": health, "dead": not alive,
+            "attack_reason": 0, "death_reason": 0,
+            "source": "shot", "splash": proposal["splash"],
+            "world_pose": True,
+            "x": proposal["pose"][0], "y": proposal["pose"][1],
+            "z": proposal["pose"][2],
+        }
+        if critical is not None:
+            event["critical_accepted"] = bool(
+                proposal["critical_accepted"] and was_alive)
+            if admitted_critical is not None:
+                event["critical"] = admitted_critical
+                if critical_commit:
+                    event.update(critical_commit)
+            else:
+                event["critical_reject_reason"] = (
+                    "target_destroyed" if not was_alive else
+                    "stale_target_state")
+                if critical_commit:
+                    event.update(critical_commit)
+        self.pending_events.append(event)
+        if was_alive and not alive:
+            if target_kind == "player":
+                target.death_attacker_kind = record["shooter_kind"]
+                target.death_attacker_id = record["shooter_id"]
+            else:
+                target["death_attacker_kind"] = record["shooter_kind"]
+                target["death_attacker_id"] = record["shooter_id"]
+            self._record_frag(
+                record["shooter_kind"], record["shooter_id"],
+                proposal["target_team"], target_kind, target_id)
+
+    def resolve_projectile(self, player_id, message):
+        """Validate one whole terminal effect batch before applying any HP."""
+        with self.lock:
+            if (self.client_build != CLIENT_BUILD_0922 or
+                    not self._message_round_matches(message) or
+                    not self._combat_accepting() or
+                    not self._projectile_message_fits(message) or
+                    not self._projectile_authority_matches(
+                        player_id, message)):
+                return False
+            allowed = {
+                "type", "round_id", "authority_epoch", "projectile_id",
+                "base_checked_ms", "outcome", "resolved_time_ms",
+                "checked_distance", "piercing_loss", "penetration_factor",
+                "impact", "direct", "splash", "destructibles",
+            }
+            if set(message) != allowed:
+                return False
+            projectile_id = message.get("projectile_id")
+            if (not isinstance(projectile_id, str) or not projectile_id or
+                    len(projectile_id) > 96):
+                return False
+            request_fingerprint = _message_fingerprint(message)
+            terminal = self.projectile_tombstones.get(projectile_id)
+            if terminal is not None:
+                return terminal.get(
+                    "request_fingerprint") == request_fingerprint
+            record = self.projectiles.get(projectile_id)
+            if record is None:
+                return False
+            try:
+                base_checked_ms = _exact_int(
+                    message.get("base_checked_ms"), 0)
+                if base_checked_ms != record["checked_through_ms"]:
+                    raise ValueError("cursor compare-and-swap failed")
+                outcome = message.get("outcome")
+                if outcome not in ("impact", "miss", "expired"):
+                    raise ValueError("invalid outcome")
+                resolved_time_ms = _exact_int(
+                    message.get("resolved_time_ms"), base_checked_ms,
+                    record["max_time_ms"])
+                now_elapsed = max(
+                    0, self._server_time_ms() -
+                    record["launch_server_time_ms"])
+                if resolved_time_ms > now_elapsed + PROJECTILE_CLOCK_LEEWAY_MS:
+                    raise ValueError("resolution is ahead of server time")
+                checked_distance = round(_bounded_float(
+                    message.get("checked_distance"),
+                    record["checked_distance"],
+                    record["max_distance"] + PROJECTILE_TOLERANCE), 6)
+                piercing_loss = round(_bounded_float(
+                    message.get("piercing_loss"), record["piercing_loss"],
+                    100000.0), 6)
+                penetration_factor = round(_bounded_float(
+                    message.get("penetration_factor"), 0.0, 100.0), 6)
+                if (penetration_factor >
+                        record["penetration_factor"] + PROJECTILE_TOLERANCE):
+                    raise ValueError("penetration factor increased")
+                direct_raw = message.get("direct")
+                splash_raw = message.get("splash")
+                if not isinstance(splash_raw, list):
+                    raise ValueError("splash must be a list")
+                if len(splash_raw) > PROJECTILE_MAX_SPLASH_TARGETS:
+                    raise ValueError("too many splash targets")
+                if not record["is_he"] and splash_raw:
+                    raise ValueError("AP projectile cannot splash")
+                impact = None
+                if outcome == "impact":
+                    impact = _bounded_vector(
+                        message.get("impact"),
+                        (-5000.0, -1000.0, -5000.0),
+                        (5000.0, 3000.0, 5000.0))
+                else:
+                    if (message.get("impact") is not None or
+                            direct_raw is not None or splash_raw):
+                        raise ValueError("non-impact outcome has effects")
+                    impact = None
+                if direct_raw is not None and outcome != "impact":
+                    raise ValueError("direct effect without impact")
+                direct = (self._normalize_projectile_effect(
+                    direct_raw, record, impact, False)
+                          if direct_raw is not None else None)
+                splash = [self._normalize_projectile_effect(
+                    raw, record, impact, True) for raw in splash_raw]
+                target_keys = []
+                if direct is not None:
+                    target_keys.append((direct["target_kind"],
+                                        direct["target_id"]))
+                target_keys.extend((proposal["target_kind"],
+                                    proposal["target_id"])
+                                   for proposal in splash)
+                if len(target_keys) != len(set(target_keys)):
+                    raise ValueError("duplicate direct or splash target")
+                destructibles = self._normalize_projectile_destructibles(
+                    message.get("destructibles"))
+            except (TypeError, ValueError, OverflowError):
+                return False
+
+            impact_event = {
+                "kind": "projectile_impact",
+                "projectile_id": projectile_id,
+                "outcome": outcome,
+                "resolved_time_ms": resolved_time_ms,
+                "checked_distance": checked_distance,
+                "piercing_loss": piercing_loss,
+                "penetration_factor": penetration_factor,
+                "shooter_kind": record["shooter_kind"],
+                "shooter_id": record["shooter_id"],
+                "shot_seq": record["shot_seq"],
+            }
+            if impact is not None:
+                impact_event["impact"] = list(impact)
+            self._commit_projectile_destructibles(
+                player_id, destructibles)
+            self.pending_events.append(impact_event)
+            if direct is not None:
+                self._apply_projectile_effect(record, direct)
+            for proposal in splash:
+                self._apply_projectile_effect(record, proposal)
+            self.projectiles.pop(projectile_id, None)
+            self.projectile_tombstones[projectile_id] = {
+                "projectile_id": projectile_id,
+                "outcome": outcome,
+                "launch_fingerprint": record["launch_fingerprint"],
+                "request_fingerprint": request_fingerprint,
+            }
+            self.projectile_revision += 1
+            self._maybe_finish_battle()
+            return True
+
+    def _expire_projectiles(self):
+        if self.client_build != CLIENT_BUILD_0922:
+            return 0
+        now_ms = self._server_time_ms()
+        expired = []
+        for projectile_id, record in self.projectiles.items():
+            if now_ms >= (record["launch_server_time_ms"] +
+                          record["max_time_ms"]):
+                expired.append((projectile_id, record))
+        for projectile_id, record in expired:
+            self.projectiles.pop(projectile_id, None)
+            self.projectile_tombstones[projectile_id] = {
+                "projectile_id": projectile_id,
+                "outcome": "expired",
+                "launch_fingerprint": record["launch_fingerprint"],
+                "request_fingerprint": None,
+            }
+            self.pending_events.append({
+                "kind": "projectile_impact",
+                "projectile_id": projectile_id,
+                "outcome": "expired",
+                "resolved_time_ms": record["max_time_ms"],
+                "checked_distance": record["checked_distance"],
+                "piercing_loss": record["piercing_loss"],
+                "penetration_factor": record["penetration_factor"],
+                "shooter_kind": record["shooter_kind"],
+                "shooter_id": record["shooter_id"],
+                "shot_seq": record["shot_seq"],
+            })
+        if expired:
+            self.projectile_revision += 1
+        return len(expired)
+
+    def _prune_orphaned_bot_launch_edges(self):
+        if not self.bot_pending_projectile_launches:
+            return
+        keep = set()
+        for bot_id, shot_seq in self.bot_pending_projectile_launches:
+            state = self.bot_states.get(bot_id)
+            if (state is not None and state.get("alive") and
+                    int(state.get("fire_seq", 0)) == int(shot_seq)):
+                keep.add((bot_id, shot_seq))
+        self.bot_pending_projectile_launches = keep
+
     def report_bot_hit(self, player_id, message):
         """Apply a human or authority-owned bot shot to a bot HP record."""
         with self.lock:
-            if (not self._message_round_matches(message) or
-                    not self._combat_accepting() or
-                    self.battle_result is not None):
-                return False
+            self._clear_protocol_reject("bot_hit")
+            if self.client_build == CLIENT_BUILD_0922:
+                return self._set_protocol_reject(
+                    "bot_hit", "legacy_projectile_path",
+                    "#1513 requires projectile_resolve")
+            if not self._message_round_matches(message):
+                return self._set_protocol_reject(
+                    "bot_hit", "round",
+                    "round=%s server_round=%s" % (
+                        message.get("round_id") if isinstance(message, dict)
+                        else None, self.round_id))
+            if not self._combat_accepting():
+                return self._set_protocol_reject(
+                    "bot_hit", "combat_closed",
+                    "phase=%s tick=%s" % (self.phase, self.tick))
+            if self.battle_result is not None:
+                return self._set_protocol_reject(
+                    "bot_hit", "battle_finished", "battle_result=set")
             if not all(key in message for key in
                        ("target", "shot_seq", "damage")):
-                return False
+                return self._set_protocol_reject(
+                    "bot_hit", "message_shape",
+                    "required=target,shot_seq,damage")
             if (not _has_finite_fields(
                     message, ("target", "shot_seq", "damage")) or
                     _finite_float(message.get("damage"), -1.0) < 0.0):
-                return False
+                return self._set_protocol_reject(
+                    "bot_hit", "message_values",
+                    "target=%s seq=%s damage=%s" % (
+                        message.get("target"), message.get("shot_seq"),
+                        message.get("damage")))
             try:
                 critical = _critical_payload(message.get("critical"))
-            except ValueError:
-                return False
+            except ValueError as error:
+                return self._set_protocol_reject(
+                    "bot_hit", "critical_payload", "reason=%s" % error)
             try:
                 shot_seq = int(message.get("shot_seq", 0))
                 bot_id = int(message.get("target", 0))
             except (TypeError, ValueError):
-                return False
+                return self._set_protocol_reject(
+                    "bot_hit", "identity",
+                    "target=%s seq=%s" % (
+                        message.get("target"), message.get("shot_seq")))
             state = self.bot_states.get(bot_id)
             if state is None or not state.get("alive"):
-                return False
+                return self._set_protocol_reject(
+                    "bot_hit", "target_unavailable",
+                    "target=%s known=%s alive=%s" % (
+                        bot_id, state is not None,
+                        bool(state and state.get("alive"))))
             combat_before = self._bot_combat_signature(state)
             attacker_bot_value = message.get("attacker_bot")
             if attacker_bot_value is not None:
                 if player_id != self.bot_authority_id:
-                    return False
+                    return self._set_protocol_reject(
+                        "bot_hit", "authority",
+                        "sender=%s authority=%s" % (
+                            player_id, self.bot_authority_id))
                 if player_id != self.bot_manifest_authority_id:
-                    return False
+                    return self._set_protocol_reject(
+                        "bot_hit", "manifest_authority",
+                        "sender=%s manifest_authority=%s" % (
+                            player_id, self.bot_manifest_authority_id))
                 try:
                     attacker_bot_id = int(attacker_bot_value)
                 except (TypeError, ValueError):
-                    return False
+                    return self._set_protocol_reject(
+                        "bot_hit", "attacker_id",
+                        "attacker_bot=%s" % attacker_bot_value)
                 attacker_bot = self.bot_states.get(attacker_bot_id)
                 splash = bool(message.get("splash", False))
                 hit_key = (("bot_shot", attacker_bot_id, shot_seq,
                             "bot", bot_id) if splash else
                            ("bot_shot", attacker_bot_id, shot_seq))
-                if (attacker_bot is None or not attacker_bot.get("alive") or
-                        (attacker_bot_id == bot_id and not splash) or
-                        shot_seq <= 0 or
-                        shot_seq > int(attacker_bot.get("fire_seq", 0)) or
-                        hit_key in self.bot_reported_hits or
-                        math.hypot(state["x"] - attacker_bot["x"],
-                                   state["z"] - attacker_bot["z"]) > 5000.0):
-                    return False
+                if attacker_bot is None or not attacker_bot.get("alive"):
+                    return self._set_protocol_reject(
+                        "bot_hit", "attacker_unavailable",
+                        "attacker_bot=%s known=%s alive=%s" % (
+                            attacker_bot_id, attacker_bot is not None,
+                            bool(attacker_bot and attacker_bot.get("alive"))))
+                if attacker_bot_id == bot_id and not splash:
+                    return self._set_protocol_reject(
+                        "bot_hit", "self_hit",
+                        "attacker_bot=%s target=%s splash=false" % (
+                            attacker_bot_id, bot_id))
+                server_fire_seq = int(attacker_bot.get("fire_seq", 0))
+                if shot_seq <= 0 or shot_seq > server_fire_seq:
+                    return self._set_protocol_reject(
+                        "bot_hit", "shot_lineage",
+                        ("attacker_bot=%s target=%s client_fire=%s "
+                         "server_fire=%s client_target_base=%s "
+                         "server_target_base=%s client_target_ack=%s "
+                         "server_target_ack=%s") % (
+                            attacker_bot_id, bot_id, shot_seq,
+                            server_fire_seq,
+                            message.get("critical_target_base_revision"),
+                            state.get("combat_base_revision"),
+                            message.get("critical_target_ack_seq"),
+                            state.get("combat_ack_seq")))
+                if hit_key in self.bot_reported_hits:
+                    return self._set_protocol_reject(
+                        "bot_hit", "duplicate",
+                        "attacker_bot=%s target=%s seq=%s splash=%s" % (
+                            attacker_bot_id, bot_id, shot_seq, splash))
+                distance = math.hypot(
+                    state["x"] - attacker_bot["x"],
+                    state["z"] - attacker_bot["z"])
+                if distance > 5000.0:
+                    return self._set_protocol_reject(
+                        "bot_hit", "distance",
+                        "attacker_bot=%s target=%s distance=%.3f" % (
+                            attacker_bot_id, bot_id, distance))
                 reported_hits = self.bot_reported_hits
                 attacker_id = attacker_bot_id
                 shell_index = attacker_bot.get("shell_index", 0)
@@ -1629,10 +2836,29 @@ class BattleState:
                 splash = bool(message.get("splash", False))
                 hit_key = (("shot", shot_seq, "bot", bot_id)
                            if splash else ("shot", shot_seq))
-                if (attacker is None or not attacker.alive or shot_seq <= 0 or
-                        shot_seq > attacker.fire_seq or
-                        hit_key in attacker.reported_hits):
-                    return False
+                if attacker is None or not attacker.alive:
+                    return self._set_protocol_reject(
+                        "bot_hit", "attacker_unavailable",
+                        "attacker=%s known=%s alive=%s" % (
+                            player_id, attacker is not None,
+                            bool(attacker and attacker.alive)))
+                if shot_seq <= 0 or shot_seq > attacker.fire_seq:
+                    return self._set_protocol_reject(
+                        "bot_hit", "shot_lineage",
+                        ("attacker=%s target=%s client_fire=%s "
+                         "server_fire=%s client_target_base=%s "
+                         "server_target_base=%s client_target_ack=%s "
+                         "server_target_ack=%s") % (
+                            player_id, bot_id, shot_seq, attacker.fire_seq,
+                            message.get("critical_target_base_revision"),
+                            state.get("combat_base_revision"),
+                            message.get("critical_target_ack_seq"),
+                            state.get("combat_ack_seq")))
+                if hit_key in attacker.reported_hits:
+                    return self._set_protocol_reject(
+                        "bot_hit", "duplicate",
+                        "attacker=%s target=%s seq=%s splash=%s" % (
+                            player_id, bot_id, shot_seq, splash))
                 reported_hits = attacker.reported_hits
                 attacker_id = player_id
                 shell_index = attacker.shell_index
@@ -1648,8 +2874,16 @@ class BattleState:
                         _critical_proposal_admission(
                             message, state.get("combat_base_revision"),
                             state.get("combat_ack_seq")))
-                except ValueError:
-                    return False
+                except ValueError as error:
+                    return self._set_protocol_reject(
+                        "bot_hit", "critical_contract",
+                        ("target=%s client_base=%s server_base=%s "
+                         "client_ack=%s server_ack=%s reason=%s") % (
+                            bot_id,
+                            message.get("critical_target_base_revision"),
+                            state.get("combat_base_revision"),
+                            message.get("critical_target_ack_seq"),
+                            state.get("combat_ack_seq"), error))
             reported_hits.add(hit_key)
             damage = max(0, min(int(_finite_float(message.get("damage"), 0)), 5000))
             if modern_proposal and not critical_accepted:
@@ -1670,6 +2904,11 @@ class BattleState:
                         "bot" if event_kind == "bot_bot_hit" else "player")
                     state["fire_attacker_id"] = int(attacker_id)
             self._commit_external_bot_combat(state, combat_before)
+            capture_reset = bool(
+                applied > 0 or _critical_damage_transition(
+                    combat_before[2], admitted_critical))
+            if capture_reset:
+                self._drop_capture_for_vehicle("bot", bot_id)
             event = {
                 "kind": event_kind,
                 "attacker_bot" if event_kind == "bot_bot_hit" else "attacker": attacker_id,
@@ -1715,33 +2954,75 @@ class BattleState:
     def report_bot_human_hit(self, player_id, message):
         """Apply an authority-resolved bot shot against shared human HP."""
         with self.lock:
-            if (not self._message_round_matches(message) or
-                    not self._combat_accepting() or
-                    self.battle_result is not None or
-                    player_id != self.bot_authority_id or
-                    player_id != self.bot_manifest_authority_id):
-                return False
+            self._clear_protocol_reject("bot_human_hit")
+            if self.client_build == CLIENT_BUILD_0922:
+                return self._set_protocol_reject(
+                    "bot_human_hit", "legacy_projectile_path",
+                    "#1513 requires projectile_resolve")
+            if not self._message_round_matches(message):
+                return self._set_protocol_reject(
+                    "bot_human_hit", "round",
+                    "round=%s server_round=%s" % (
+                        message.get("round_id") if isinstance(message, dict)
+                        else None, self.round_id))
+            if not self._combat_accepting():
+                return self._set_protocol_reject(
+                    "bot_human_hit", "combat_closed",
+                    "phase=%s tick=%s" % (self.phase, self.tick))
+            if self.battle_result is not None:
+                return self._set_protocol_reject(
+                    "bot_human_hit", "battle_finished",
+                    "battle_result=set")
+            if player_id != self.bot_authority_id:
+                return self._set_protocol_reject(
+                    "bot_human_hit", "authority",
+                    "sender=%s authority=%s" % (
+                        player_id, self.bot_authority_id))
+            if player_id != self.bot_manifest_authority_id:
+                return self._set_protocol_reject(
+                    "bot_human_hit", "manifest_authority",
+                    "sender=%s manifest_authority=%s" % (
+                        player_id, self.bot_manifest_authority_id))
             if not all(key in message for key in
                        ("attacker_bot", "target", "shot_seq", "damage")):
-                return False
+                return self._set_protocol_reject(
+                    "bot_human_hit", "message_shape",
+                    "required=attacker_bot,target,shot_seq,damage")
             if (not _has_finite_fields(
                     message, ("attacker_bot", "target", "shot_seq", "damage")) or
                     _finite_float(message.get("damage"), -1.0) < 0.0):
-                return False
+                return self._set_protocol_reject(
+                    "bot_human_hit", "message_values",
+                    "attacker_bot=%s target=%s seq=%s damage=%s" % (
+                        message.get("attacker_bot"), message.get("target"),
+                        message.get("shot_seq"), message.get("damage")))
             try:
                 critical = _critical_payload(message.get("critical"))
-            except ValueError:
-                return False
+            except ValueError as error:
+                return self._set_protocol_reject(
+                    "bot_human_hit", "critical_payload",
+                    "reason=%s" % error)
             try:
                 bot_id = int(message.get("attacker_bot", 0))
                 target_id = int(message.get("target", 0))
                 shot_seq = int(message.get("shot_seq", 0))
             except (TypeError, ValueError):
-                return False
+                return self._set_protocol_reject(
+                    "bot_human_hit", "identity",
+                    "attacker_bot=%s target=%s seq=%s" % (
+                        message.get("attacker_bot"), message.get("target"),
+                        message.get("shot_seq")))
             bot = self.bot_states.get(bot_id)
             target = self.players.get(target_id)
             if bot is None or not bot.get("alive") or target is None or not target.alive:
-                return False
+                return self._set_protocol_reject(
+                    "bot_human_hit", "vehicle_unavailable",
+                    ("attacker_bot=%s known=%s alive=%s target=%s "
+                     "known=%s alive=%s") % (
+                        bot_id, bot is not None,
+                        bool(bot and bot.get("alive")), target_id,
+                        target is not None,
+                        bool(target and target.alive)))
             try:
                 bot_fire_seq = int(bot.get("fire_seq", 0))
             except (TypeError, ValueError):
@@ -1752,7 +3033,20 @@ class BattleState:
                        ("bot_shot", bot_id, shot_seq))
             if (shot_seq <= 0 or shot_seq > bot_fire_seq or
                     hit_key in self.bot_reported_hits):
-                return False
+                code = ("duplicate" if hit_key in self.bot_reported_hits
+                        else "shot_lineage")
+                return self._set_protocol_reject(
+                    "bot_human_hit", code,
+                    ("attacker_bot=%s target=%s client_fire=%s "
+                     "server_fire=%s client_target_base=%s "
+                     "server_target_base=%s client_target_ack=%s "
+                     "server_target_ack=%s duplicate=%s") % (
+                        bot_id, target_id, shot_seq, bot_fire_seq,
+                        message.get("critical_target_base_revision"),
+                        target.critical_report_base_revision,
+                        message.get("critical_target_ack_seq"),
+                        target.critical_ack_seq,
+                        hit_key in self.bot_reported_hits))
             modern_proposal = (
                 self.client_build == CLIENT_BUILD_0922 and
                 critical is not None)
@@ -1765,8 +3059,16 @@ class BattleState:
                             message,
                             target.critical_report_base_revision,
                             target.critical_ack_seq))
-                except ValueError:
-                    return False
+                except ValueError as error:
+                    return self._set_protocol_reject(
+                        "bot_human_hit", "critical_contract",
+                        ("target=%s client_base=%s server_base=%s "
+                         "client_ack=%s server_ack=%s reason=%s") % (
+                            target_id,
+                            message.get("critical_target_base_revision"),
+                            target.critical_report_base_revision,
+                            message.get("critical_target_ack_seq"),
+                            target.critical_ack_seq, error))
             self.bot_reported_hits.add(hit_key)
             damage = max(0, min(int(_finite_float(message.get("damage"), 0)), 5000))
             if modern_proposal and not critical_accepted:
@@ -1777,8 +3079,14 @@ class BattleState:
             target.display_health = target.health
             admitted_critical = (
                 critical if not modern_proposal or critical_accepted else None)
+            critical_before = target.critical
             critical_commit = self._commit_external_player_critical(
                 target, admitted_critical)
+            capture_reset = bool(
+                applied > 0 or _critical_damage_transition(
+                    critical_before, admitted_critical))
+            if capture_reset:
+                self._drop_capture_for_vehicle("player", target_id)
             event = {
                 "kind": "bot_human_hit", "attacker_bot": bot_id, "target": target_id,
                 "shot_seq": shot_seq,
@@ -1886,6 +3194,8 @@ class BattleState:
             bot["display_health"] = bot["health"]
             bot["death_reason"] = reason if not bot["alive"] else 0
             self._commit_external_bot_combat(bot, bot_combat_before)
+            if applied_bot > 0:
+                self._drop_capture_for_vehicle("bot", bot_id)
             bot_event = {
                 "kind": ("bot_bot_hit" if target_kind == "bot"
                          else "bot_hit"),
@@ -1910,6 +3220,8 @@ class BattleState:
                 target["death_reason"] = reason if not target["alive"] else 0
                 self._commit_external_bot_combat(
                     target, target_combat_before)
+                if applied_target > 0:
+                    self._drop_capture_for_vehicle("bot", target_id)
                 target_event = {
                     "kind": "bot_bot_hit", "attacker_bot": bot_id,
                     "target_bot": target_id, "damage": applied_target,
@@ -1925,6 +3237,8 @@ class BattleState:
                 target.alive = target.health > 0
                 target.display_health = target.health
                 target.death_reason = reason if not target.alive else 0
+                if applied_target > 0:
+                    self._drop_capture_for_vehicle("player", target_id)
                 target_event = {
                     "kind": "bot_human_hit", "attacker_bot": bot_id,
                     "target": target_id, "damage": applied_target,
@@ -2020,6 +3334,16 @@ class BattleState:
         for player in self.players.values():
             player.forward = 0.0
             player.turn = 0.0
+        if self.projectiles:
+            for projectile_id, record in list(self.projectiles.items()):
+                self.projectile_tombstones[projectile_id] = {
+                    "projectile_id": projectile_id,
+                    "outcome": "battle_finished",
+                    "launch_fingerprint": record["launch_fingerprint"],
+                    "request_fingerprint": None,
+                }
+            self.projectiles.clear()
+            self.projectile_revision += 1
         self.pending_events.append(dict(self.battle_result, kind="battle_result"))
         return True
 
@@ -2091,29 +3415,30 @@ class BattleState:
                     player.yaw = _finite_float(message.get("yaw"), player.yaw)
                     player.client_position = True
             try:
-                fire_seq = int(message.get("fire_seq", player.fire_seq))
-            except (TypeError, ValueError):
-                fire_seq = player.fire_seq
-            try:
                 player.shell_index = max(0, min(int(message.get("shell_index", player.shell_index)), 9))
             except (TypeError, ValueError):
                 pass
-            if (fire_seq == player.fire_seq + 1 and
-                    self._combat_accepting() and player.alive):
-                player.fire_seq = fire_seq
-                self.pending_events.append({
-                    "kind": "shot",
-                    "attacker": player.player_id,
-                    "shot_seq": player.fire_seq,
-                    "shell_index": player.shell_index,
-                    "world_pose": player.client_position,
-                    "x": round(player.x, 4),
-                    "y": round(player.y, 4),
-                    "z": round(player.z, 4),
-                    "yaw": round(player.yaw, 5),
-                    "aim_yaw": round(player.aim_yaw, 5),
-                    "gun_pitch": round(player.gun_pitch, 5),
-                })
+            if self.client_build != CLIENT_BUILD_0922:
+                try:
+                    fire_seq = int(message.get("fire_seq", player.fire_seq))
+                except (TypeError, ValueError):
+                    fire_seq = player.fire_seq
+                if (fire_seq == player.fire_seq + 1 and
+                        self._combat_accepting() and player.alive):
+                    player.fire_seq = fire_seq
+                    self.pending_events.append({
+                        "kind": "shot",
+                        "attacker": player.player_id,
+                        "shot_seq": player.fire_seq,
+                        "shell_index": player.shell_index,
+                        "world_pose": player.client_position,
+                        "x": round(player.x, 4),
+                        "y": round(player.y, 4),
+                        "z": round(player.z, 4),
+                        "yaw": round(player.yaw, 5),
+                        "aim_yaw": round(player.aim_yaw, 5),
+                        "gun_pitch": round(player.gun_pitch, 5),
+                    })
             if (("reported_health" in message or
                  "reported_critical" in message) and
                     self._combat_accepting()):
@@ -2196,11 +3521,15 @@ class BattleState:
             player.max_health))
         health = min(health, player.health)
         stored_critical = _critical_state(critical)
+        critical_before = player.critical
         old_discrete = _critical_discrete_state(player.critical)
         new_discrete = _critical_discrete_state(stored_critical)
+        critical_damage = _critical_damage_transition(
+            critical_before, critical)
         critical_event_changed = (
             stored_critical is not None and
-            (new_discrete != old_discrete or bool(critical.get("events"))))
+            (new_discrete != old_discrete or bool(critical.get("events")) or
+             critical_damage))
         critical_commit = None
         if stored_critical is not None:
             if self.client_build == CLIENT_BUILD_0922:
@@ -2222,6 +3551,9 @@ class BattleState:
         was_alive = player.alive
         damage = player.health - health
         player.health = health
+        capture_reset = bool(damage > 0 or critical_damage)
+        if capture_reset:
+            self._drop_capture_for_vehicle("player", player.player_id)
         try:
             reason = max(0, min(int(message.get("reported_reason", 0)), 255))
         except (TypeError, ValueError):
@@ -2257,24 +3589,26 @@ class BattleState:
             attacker_bot = int(message.get("reported_attacker_bot", 0))
         except (TypeError, ValueError):
             attacker_bot = 0
+        reported_attacker_kind = None
+        reported_attacker_id = 0
         if attacker_id in self.players:
-            event["attacker"] = attacker_id
+            reported_attacker_kind = "player"
+            reported_attacker_id = attacker_id
         elif attacker_bot in self.bot_states:
-            event["attacker_bot"] = attacker_bot
+            reported_attacker_kind = "bot"
+            reported_attacker_id = attacker_bot
+        # The owner may retain the last attacker so a locally simulated fatal
+        # tick can preserve the death ledger.  That attribution is ledger-only:
+        # client_simulation is an explicit non-attack wire cause and must never
+        # expose attacker fields to the server or client event validators.
         self.pending_events.append(event)
-        if was_alive and not player.alive:
-            if "attacker" in event:
-                player.death_attacker_kind = "player"
-                player.death_attacker_id = int(event["attacker"])
-                self._record_frag(
-                    "player", event["attacker"], player.team,
-                    "player", player.player_id)
-            elif "attacker_bot" in event:
-                player.death_attacker_kind = "bot"
-                player.death_attacker_id = int(event["attacker_bot"])
-                self._record_frag(
-                    "bot", event["attacker_bot"], player.team,
-                    "player", player.player_id)
+        if (was_alive and not player.alive and
+                reported_attacker_kind is not None):
+            player.death_attacker_kind = reported_attacker_kind
+            player.death_attacker_id = int(reported_attacker_id)
+            self._record_frag(
+                reported_attacker_kind, reported_attacker_id, player.team,
+                "player", player.player_id)
         self._maybe_finish_battle()
         return True
 
@@ -2287,6 +3621,8 @@ class BattleState:
         shell collision logic instead of the old fixed 100-HP cone test.
         """
         with self.lock:
+            if self.client_build == CLIENT_BUILD_0922:
+                return False
             attacker = self.players.get(player_id)
             if (not self._message_round_matches(message) or
                     not self._combat_accepting() or
@@ -2347,8 +3683,14 @@ class BattleState:
             target.display_health = target.health
             admitted_critical = (
                 critical if not modern_proposal or critical_accepted else None)
+            critical_before = target.critical
             critical_commit = self._commit_external_player_critical(
                 target, admitted_critical)
+            capture_reset = bool(
+                applied_damage > 0 or _critical_damage_transition(
+                    critical_before, admitted_critical))
+            if capture_reset:
+                self._drop_capture_for_vehicle("player", target_id)
             try:
                 shot_result = max(0, min(int(message.get("shot_result", 2)), 2))
             except (TypeError, ValueError):
@@ -2463,25 +3805,66 @@ class BattleState:
         return (get_tactical_map(self.map_name) or
                 _MAPS_0922_DATA.get(self.map_name) or {})
 
+    @staticmethod
+    def _capture_vehicle_key(kind, vehicle_id):
+        return "%s:%d" % ("human" if kind == "player" else "bot",
+                           int(vehicle_id))
+
+    def _drop_capture_for_vehicle(self, kind, vehicle_id):
+        """Drop only one damaged vehicle's accumulated capture points."""
+        if self.client_build != CLIENT_BUILD_0922:
+            return 0
+        key = self._capture_vehicle_key(kind, vehicle_id)
+        dropped_total = 0
+        for base_team in (1, 2):
+            state = self.rules_state["bases"][str(base_team)]
+            contributors = self.capture_contributors[base_team]
+            dropped_total += max(0, int(contributors.pop(key, 0) or 0))
+            state["points"] = min(100, sum(
+                max(0, int(points or 0))
+                for points in contributors.values()))
+            if not contributors:
+                self.capture_cursors[base_team] = 0
+            rate = min(max(0, int(state.get("invaders", 0))), 3)
+            state["time_left"] = (
+                float(max(0, 100 - state["points"])) / float(rate)
+                if rate > 0 else 0.0)
+        return dropped_total
+
     def _update_capture(self):
         """Copy the 0.8.2 standard-mode 50 m, 1 Hz capture law."""
         if (not self._combat_accepting() or
                 self.tick % max(1, int(round(TICK_HZ))) != 0 or
                 self.battle_result is not None):
             return False
-        bases = self.capture_bases or (self._map_rule_data().get('bases') or {})
+        # #1513 navigation graphs contain packed CTF objective positions.  Its
+        # tactical-map ``bases`` are route annotations and can be hundreds of
+        # metres from the retail capture circles, so never use them as a modern
+        # protocol fallback.
+        bases = (self.capture_bases if self.client_build == CLIENT_BUILD_0922
+                 else self.capture_bases or
+                 (self._map_rule_data().get('bases') or {}))
         if not bases:
             return False
         vehicles = {1: [], 2: []}
         for player in self.players.values():
             if (player.connected and player.participating and player.alive and
-                    player.team in vehicles):
-                vehicles[player.team].append((player.x, player.z))
+                    (self.client_build != CLIENT_BUILD_0922 or
+                     player.client_position) and player.team in vehicles):
+                vehicles[player.team].append((
+                    self._capture_vehicle_key("player", player.player_id),
+                    player.x, player.z))
         for state in self.bot_states.values():
             team = int(state.get('team', 0))
-            if state.get('alive') and team in vehicles:
-                vehicles[team].append((state['x'], state['z']))
+            if (state.get('alive') and
+                    (self.client_build != CLIENT_BUILD_0922 or
+                     state.get('world_pose')) and
+                    team in vehicles):
+                vehicles[team].append((
+                    self._capture_vehicle_key("bot", state['id']),
+                    state['x'], state['z']))
         changed = False
+        self.capture_threat_bases = {1: [], 2: []}
         for base_team in (1, 2):
             raw_base = bases.get(base_team, bases.get(str(base_team)))
             if raw_base is None:
@@ -2505,31 +3888,99 @@ class BattleState:
             if not normalized:
                 continue
             invading_team = 3 - base_team
-            invaders = sum(1 for x, z in vehicles[invading_team]
-                           if any((x - bx) ** 2 + (z - bz) ** 2 <= 2500.0
-                                  for bx, bz in normalized))
-            defenders = sum(1 for x, z in vehicles[base_team]
-                            if any((x - bx) ** 2 + (z - bz) ** 2 <= 2500.0
-                                   for bx, bz in normalized))
+            threatened = []
+            for index, (bx, bz) in enumerate(normalized):
+                if any((x - bx) ** 2 + (z - bz) ** 2 <= 2500.0
+                       for unused_key, x, z in vehicles[invading_team]):
+                    threatened.append({
+                        "id": "%d:%d" % (base_team, index),
+                        "x": round(bx, 3), "y": 0.0,
+                        "z": round(bz, 3),
+                    })
+            self.capture_threat_bases[base_team] = threatened
+            invader_keys = sorted(set(
+                key for key, x, z in vehicles[invading_team]
+                if any((x - bx) ** 2 + (z - bz) ** 2 <= 2500.0
+                       for bx, bz in normalized)))
+            defenders = sum(
+                1 for unused_key, x, z in vehicles[base_team]
+                if any((x - bx) ** 2 + (z - bz) ** 2 <= 2500.0
+                       for bx, bz in normalized))
             state = self.rules_state['bases'][str(base_team)]
             previous = dict(state)
-            if invaders > 0 and defenders == 0:
-                state['points'] = min(
-                    100, int(state.get('points', 0)) + min(invaders, 3))
-            elif invaders == 0:
-                state['points'] = 0
-            state['invaders'] = invaders
-            rate = min(invaders, 3)
+            if self.client_build != CLIENT_BUILD_0922:
+                if invader_keys and defenders == 0:
+                    state['points'] = min(
+                        100, int(state.get('points', 0)) +
+                        min(len(invader_keys), 3))
+                elif not invader_keys:
+                    state['points'] = 0
+                state['stopped'] = defenders > 0
+            else:
+                contributors = self.capture_contributors[base_team]
+                active = set(invader_keys)
+                for vehicle_id in list(contributors):
+                    if vehicle_id not in active:
+                        contributors.pop(vehicle_id, None)
+                for vehicle_id in invader_keys:
+                    contributors.setdefault(vehicle_id, 0)
+                points = min(100, sum(
+                    max(0, int(value or 0))
+                    for value in contributors.values()))
+                state['stopped'] = bool(invader_keys and defenders > 0)
+                if invader_keys and not state['stopped'] and points < 100:
+                    cursor = (self.capture_cursors[base_team] %
+                              len(invader_keys))
+                    budget = min(3, len(invader_keys), 100 - points)
+                    for offset in range(budget):
+                        vehicle_id = invader_keys[
+                            (cursor + offset) % len(invader_keys)]
+                        contributors[vehicle_id] = int(
+                            contributors.get(vehicle_id, 0) or 0) + 1
+                    self.capture_cursors[base_team] = (
+                        cursor + budget) % len(invader_keys)
+                elif not invader_keys:
+                    self.capture_cursors[base_team] = 0
+                state['points'] = min(100, sum(
+                    max(0, int(value or 0))
+                    for value in contributors.values()))
+            state['invaders'] = len(invader_keys)
+            rate = min(len(invader_keys), 3)
             state['time_left'] = (
                 float(max(0, 100 - state['points'])) / float(rate)
                 if rate > 0 else 0.0)
-            state['stopped'] = defenders > 0
             changed = changed or state != previous
             if state['points'] >= 100:
                 self._finish_battle(
                     invading_team, 'base captured', base_team)
                 break
         return changed
+
+    def _bot_defense_context(self):
+        """Return only the own-base pressure facts needed by BotPlanner."""
+        contributors = {}
+        for team in (1, 2):
+            values = []
+            for key in sorted(self.capture_contributors.get(team, {})):
+                try:
+                    kind, raw_id = str(key).split(":", 1)
+                    vehicle_id = int(raw_id)
+                except (TypeError, ValueError):
+                    continue
+                if kind not in ("human", "bot") or vehicle_id <= 0:
+                    continue
+                values.append({"kind": kind, "id": vehicle_id})
+            contributors[str(team)] = values
+        return {
+            "bases": dict((str(team), [dict(point) for point in
+                                        self.capture_threat_bases.get(
+                                            team, ())])
+                          for team in (1, 2)),
+            "states": dict((str(team), dict(
+                self.rules_state["bases"][str(team)]))
+                for team in (1, 2)),
+            "contributors": contributors,
+        }
 
     def tick_once(self, dt):
         reset_message = None
@@ -2587,6 +4038,8 @@ class BattleState:
             if self.phase != "battle":
                 return
             self.tick += 1
+            self._prune_orphaned_bot_launch_edges()
+            self._expire_projectiles()
             if (self.battle_result is None and
                     self.tick >= int(round(
                         (PREBATTLE_SECONDS + BATTLE_DURATION_SECONDS) *
@@ -2599,7 +4052,7 @@ class BattleState:
                 self.bot_orders = self.bot_planner.build_orders(
                     self.bot_manifest, list(self.bot_states.values()),
                     [self._public_player(p) for p in self.players.values() if p.connected],
-                    time.monotonic())
+                    time.monotonic(), self._bot_defense_context())
             events = []
             for ordinal, pending in enumerate(self.pending_events):
                 self._validate_combat_event_for_wire(pending)
@@ -2608,6 +4061,13 @@ class BattleState:
                     self.round_id, self.tick, ordinal)
                 events.append(event)
             self.pending_events = []
+            tick_server_time_ms = None
+            if self.client_build == CLIENT_BUILD_0922:
+                # Events and the snapshot published by one simulation tick
+                # share one current clock sample.  Reusing a prior snapshot's
+                # time would make delayed projectile tracers start at the
+                # wrong point on their authoritative trajectory.
+                tick_server_time_ms = self._server_time_ms()
             snapshot = {
                 "type": "snapshot",
                 "protocol": PROTOCOL_VERSION,
@@ -2624,7 +4084,34 @@ class BattleState:
                 "destructible_revision": self.destructible_revision,
                 "timing": self._timing_payload(),
             }
+            if self.client_build == CLIENT_BUILD_0922:
+                snapshot.update({
+                    "authority_epoch": self.authority_epoch,
+                    "server_time_ms": tick_server_time_ms,
+                    "projectile_revision": self.projectile_revision,
+                    "projectiles": self._projectile_snapshot(),
+                })
+            events_message = None
+            if events:
+                events_message = {
+                    "type": "events",
+                    "protocol": PROTOCOL_VERSION,
+                    "round_id": self.round_id,
+                    "server_tick": self.tick,
+                    "events": events,
+                }
+                if self.client_build == CLIENT_BUILD_0922:
+                    events_message.update({
+                        "authority_epoch": self.authority_epoch,
+                        "server_time_ms": tick_server_time_ms,
+                    })
             recipients = list(self.players.values())
+            bot_combat_logs = dict(
+                (event["event_id"], _bot_combat_log_message(
+                    event, self.players, self.bot_states))
+                for event in events
+                if event.get("kind") in (
+                    "bot_hit", "bot_human_hit", "bot_bot_hit"))
         if events:
             for event in events:
                 if event.get("kind") == "shot":
@@ -2639,10 +4126,7 @@ class BattleState:
                         event.get("target"), event.get("damage"), event.get("health"),
                         event.get("dead"), event.get("source")))
                 elif event.get("kind") in ("bot_hit", "bot_human_hit", "bot_bot_hit"):
-                    _server_log("BOT COMBAT kind=%s attacker=%s target=%s damage=%s health=%s dead=%s" % (
-                        event.get("kind"), event.get("attacker", event.get("attacker_bot")),
-                        event.get("target", event.get("target_bot")), event.get("damage"),
-                        event.get("health"), event.get("dead")))
+                    _server_log(bot_combat_logs[event["event_id"]])
                 elif event.get("kind") == "authority":
                     _server_log("BOT AUTHORITY player_id=%s" % event.get("player_id"))
                 elif event.get("kind") == "battle_result":
@@ -2654,9 +4138,13 @@ class BattleState:
                             event.get("destructible_kind"),
                             event.get("chunk_id"), event.get("item_index"),
                             event.get("reported_by")))
-            self.broadcast({"type": "events", "protocol": PROTOCOL_VERSION,
-                            "round_id": self.round_id,
-                            "server_tick": self.tick, "events": events})
+                elif event.get("kind") == "projectile_impact":
+                    _server_log(
+                        "PROJECTILE TERMINAL id=%s outcome=%s elapsed_ms=%s" % (
+                            event.get("projectile_id"),
+                            event.get("outcome"),
+                            event.get("resolved_time_ms")))
+            self.broadcast(events_message)
         # Ordered combat causes must reach the client before the durable state
         # they produced.  Otherwise #1513 observes the new HP/death first and
         # suppresses hit direction, attacker attribution and the fatal shot.
@@ -2726,6 +4214,22 @@ class BattleState:
             if not player.send(message):
                 self.remove_player(player.player_id)
 
+    def broadcast_bot_observation(self, message):
+        """Relay one validated modern observation to active round members."""
+        with self.lock:
+            if (self.client_build != CLIENT_BUILD_0922 or
+                    not self._message_round_matches(message) or
+                    not self._combat_accepting() or
+                    message.get("type") != "bot_observation"):
+                return False
+            players = tuple(
+                player for player in self.players.values()
+                if player.connected and player.participating)
+        for player in players:
+            if not player.send(message):
+                self.remove_player(player.player_id)
+        return True
+
     def _broadcast_current_roster_locked(self):
         """Send a roster that remains current after every observed send failure."""
         while True:
@@ -2792,6 +4296,8 @@ class BattleState:
                                 for player in connected],
                     "bots": list(self.bot_roster),
                     "bot_authority_id": self.bot_authority_id,
+                    "authority_epoch": self.authority_epoch,
+                    "server_time_ms": self._server_time_ms(),
                     "bot_manifest": list(self.bot_manifest),
                     "bot_order_revision": self.bot_orders["revision"],
                     "bot_orders": list(self.bot_orders["orders"]),
@@ -2862,7 +4368,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                 player, join_error = server.state.add_player(
                     conn, self.client_address, hello)
                 if player is not None:
-                    welcomed = player.send({
+                    welcome_message = {
                         "type": "welcome",
                         "protocol": PROTOCOL_VERSION,
                         "client_build": server.state.client_build,
@@ -2880,7 +4386,13 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         "state_revision": server.state.state_revision,
                         "spawn": {"x": player.x, "y": player.y, "z": player.z, "yaw": player.yaw},
                         "bot_authority_id": server.state.bot_authority_id,
-                    })
+                    }
+                    if server.state.client_build == CLIENT_BUILD_0922:
+                        welcome_message.update({
+                            "authority_epoch": server.state.authority_epoch,
+                            "capabilities": list(player.capabilities),
+                        })
+                    welcomed = player.send(welcome_message)
             if player is None:
                 messages = {
                     "battle_in_progress": "battle already in progress",
@@ -2888,6 +4400,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     "unsupported_client_build": "unsupported or missing client build",
                     "incompatible_client_build": "this room is using a different client build",
                     "map_not_available_for_client": "the fixed server map is unavailable in this client build",
+                    "unsupported_capabilities": "required client capabilities are missing",
                 }
                 message = messages.get(join_error, "join rejected")
                 self._send_raw(conn, {"type": "error", "code": join_error, "message": message})
@@ -2946,6 +4459,33 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         if not server.state.report_hit(player.player_id, message):
                             _server_log("HIT REPORT rejected attacker=%d target=%s seq=%s" % (
                                 player.player_id, message.get("target"), message.get("shot_seq")))
+                    elif message_type == "projectile_launch":
+                        if not server.state.launch_projectile(
+                                player.player_id, message):
+                            _server_log(
+                                "PROJECTILE LAUNCH rejected sender=%d shooter=%s:%s seq=%s" % (
+                                    player.player_id,
+                                    message.get("shooter_kind"),
+                                    message.get("shooter_id"),
+                                    message.get("shot_seq")))
+                    elif message_type == "projectile_progress":
+                        if not server.state.progress_projectiles(
+                                player.player_id, message):
+                            _server_log(
+                                "PROJECTILE PROGRESS rejected sender=%d epoch=%s count=%s" % (
+                                    player.player_id,
+                                    message.get("authority_epoch"),
+                                    len(message.get("cursors", ()))
+                                    if isinstance(message.get("cursors"), list)
+                                    else None))
+                    elif message_type == "projectile_resolve":
+                        if not server.state.resolve_projectile(
+                                player.player_id, message):
+                            _server_log(
+                                "PROJECTILE RESOLVE rejected sender=%d projectile=%s outcome=%s" % (
+                                    player.player_id,
+                                    message.get("projectile_id"),
+                                    message.get("outcome")))
                     elif message_type == "bot_manifest":
                         if server.state.update_bot_manifest(player.player_id, message):
                             _server_log("BOT MANIFEST authority=%d bots=%d" % (
@@ -2962,17 +4502,49 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         else:
                             _server_log("BOT MANIFEST rejected sender=%d" % player.player_id)
                     elif message_type == "bot_state":
-                        server.state.update_bot_states(player.player_id, message)
+                        accepted = server.state.update_bot_states(
+                            player.player_id, message)
+                        if server.state.should_log_protocol_reject(
+                                "bot_state", accepted):
+                            _server_log(
+                                "BOT STATE rejected authority=%d code=%s reason=%s" % (
+                                    player.player_id,
+                                    server.state.last_bot_state_reject_code,
+                                    server.state.last_bot_state_reject))
                     elif message_type == "bot_observation":
-                        server.state.update_bot_observation(player.player_id, message)
+                        relay = server.state.update_bot_observation(
+                            player.player_id, message)
+                        if isinstance(relay, dict):
+                            server.state.broadcast_bot_observation(relay)
                     elif message_type == "bot_hit_report":
-                        if not server.state.report_bot_hit(player.player_id, message):
-                            _server_log("BOT HIT rejected attacker=%d target=%s seq=%s" % (
-                                player.player_id, message.get("target"), message.get("shot_seq")))
+                        accepted = server.state.report_bot_hit(
+                            player.player_id, message)
+                        if server.state.should_log_protocol_reject(
+                                "bot_hit", accepted):
+                            _server_log(
+                                ("BOT HIT rejected authority=%d attacker_bot=%s "
+                                 "target=%s seq=%s code=%s reason=%s") % (
+                                    player.player_id,
+                                    message.get("attacker_bot"),
+                                    message.get("target"),
+                                    message.get("shot_seq"),
+                                    server.state.last_bot_hit_reject_code,
+                                    server.state.last_bot_hit_reject))
                     elif message_type == "bot_human_hit":
-                        if not server.state.report_bot_human_hit(player.player_id, message):
-                            _server_log("BOT HUMAN HIT rejected authority=%d target=%s" % (
-                                player.player_id, message.get("target")))
+                        accepted = server.state.report_bot_human_hit(
+                            player.player_id, message)
+                        if server.state.should_log_protocol_reject(
+                                "bot_human_hit", accepted):
+                            _server_log(
+                                ("BOT HUMAN HIT rejected authority=%d "
+                                 "attacker_bot=%s target=%s seq=%s "
+                                 "code=%s reason=%s") % (
+                                    player.player_id,
+                                    message.get("attacker_bot"),
+                                    message.get("target"),
+                                    message.get("shot_seq"),
+                                    server.state.last_bot_human_hit_reject_code,
+                                    server.state.last_bot_human_hit_reject))
                     elif message_type == "bot_ram_report":
                         if not server.state.report_bot_ram(
                                 player.player_id, message):

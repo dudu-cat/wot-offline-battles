@@ -205,6 +205,18 @@ class TankCollisionTests(unittest.TestCase):
         self.assertFalse(tank_collision.vertical_overlap(
             0.0, lower, 3.02, upper))
 
+    def test_support_rise_respects_tick_climb_hard_cap_and_slop(self):
+        self.assertFalse(tank_collision.support_rise_is_obstacle(
+            0.0, 0.66, 0.65))
+        self.assertTrue(tank_collision.support_rise_is_obstacle(
+            0.0, 0.68, 0.65))
+        self.assertFalse(tank_collision.support_rise_is_obstacle(
+            0.0, 0.86, 2.5))
+        self.assertTrue(tank_collision.support_rise_is_obstacle(
+            0.0, 0.88, 2.5))
+        self.assertFalse(tank_collision.support_rise_is_obstacle(
+            0.0, None, 0.65))
+
     def test_pair_response_returns_mass_weighted_reciprocal_correction(self):
         response = tank_collision.pair_response(
             (1.0, 0.0, 0.6), 1.0 / 60.0, 1.0 / 20.0,

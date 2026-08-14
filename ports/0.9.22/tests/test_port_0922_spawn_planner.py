@@ -19,6 +19,7 @@ def formation_graph():
         team_two.append((column * 12.0, 4.0, 400.0 - row * 14.0, 3.14159))
     return {
         'map': '06_ensk',
+        'objective_bases': ((12.5, -390.25), (18.75, 389.5)),
         'spawn_formations': {'1': team_one, '2': team_two},
     }
 
@@ -32,6 +33,9 @@ class SpawnPlannerTests(unittest.TestCase):
                          planner.pose(1, 7))
         self.assertEqual(((48.0, 4.0, 372.0), 3.14159),
                          planner.pose(2, 14))
+        self.assertEqual(
+            {1: ((12.5, -390.25),), 2: ((18.75, 389.5),)},
+            planner.bases)
 
     def test_runtime_refuses_to_invent_a_formation(self):
         with self.assertRaisesRegex(
@@ -39,6 +43,11 @@ class SpawnPlannerTests(unittest.TestCase):
             SpawnPlanner()
         with self.assertRaisesRegex(ValueError, 'spawn formations are missing'):
             SpawnPlanner(navigation_graph={'map': '06_ensk'})
+
+        graph = formation_graph()
+        del graph['objective_bases']
+        with self.assertRaisesRegex(ValueError, 'objective bases are missing'):
+            SpawnPlanner(navigation_graph=graph)
 
     def test_every_team_must_have_exactly_fifteen_slots(self):
         graph = formation_graph()

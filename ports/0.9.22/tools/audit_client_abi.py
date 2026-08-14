@@ -19,6 +19,11 @@ import zipfile
 
 
 EXPECTED_ABI = {
+    'scripts/client/game.pyc': {
+        'wg_onChunkLoad': (
+            'spaceID', 'chunkID', 'numDestructibles', 'isOutside'),
+        'wg_onChunkLoose': ('spaceID', 'chunkID', 'isOutside'),
+    },
     'scripts/common/OldSpaceData.pyc': {
         'getPropertyNameForKey': ('key',),
         'getSpaceDataFirstForKey': ('spaceID', 'key'),
@@ -149,6 +154,8 @@ EXPECTED_ABI = {
         '_ShotSoundEffectDesc.create': ('self', 'model', 'list', 'args'),
     },
     'scripts/client/gui/battle_control/controllers/feedback_adaptor.pyc': {
+        'BattleFeedbackAdaptor.__init__': ('self', 'setup'),
+        'BattleFeedbackAdaptor.handleBattleEvents': ('self', 'events'),
         'BattleFeedbackAdaptor.startVehicleVisual': (
             'self', 'vProxy', 'isImmediate'),
         'BattleFeedbackAdaptor.stopVehicleVisual': (
@@ -161,6 +168,7 @@ EXPECTED_ABI = {
             'attackReasonID'),
     },
     'scripts/client/gui/battle_control/battle_session.pyc': {
+        'BattleSessionProvider.shared': ('self',),
         'BattleSessionProvider.getArenaDP': ('self',),
         'BattleSessionProvider.addArenaCtrl': ('self', 'controller'),
         'BattleSessionProvider.removeArenaCtrl': ('self', 'controller'),
@@ -194,14 +202,34 @@ EXPECTED_ABI = {
         'ConsistentMatrices.__setTarget': ('self', 'matrix', 'asStatic'),
         'ConsistentMatrices.__linkOwnVehicle': ('self', 'vehicle'),
     },
+    'scripts/client/AvatarInputHandler/DynamicCameras/__init__.pyc': {
+        'AccelerationSmoother.update': ('self', 'vehicle', 'deltaTime'),
+    },
     'scripts/client/AvatarInputHandler/DynamicCameras/ArcadeCamera.pyc': {
         'ArcadeCamera.create': (
             'self', 'pivotPos', 'onChangeControlMode', 'postmortemMode'),
         'ArcadeCamera.enable': (
             'self', 'preferredPos', 'closesDist', 'postmortemParams',
             'turretYaw', 'gunPitch'),
+        'ArcadeCamera.__calcCurOscillatorAcceleration': (
+            'self', 'deltaTime'),
         'ArcadeCamera.__setVehicleMProv': ('self', 'vehicleMProv'),
         'ArcadeCamera.__getVehicleMProv': ('self',),
+        'ArcadeCamera.setToVehicleDirection': ('self',),
+    },
+    'scripts/common/BattleFeedbackCommon.pyc': {
+        'BATTLE_EVENT_TYPE.packVisibility': ('isVisible', 'isDirect'),
+    },
+    'scripts/client/gui/battle_control/controllers/feedback_events.pyc': {
+        'PlayerFeedbackEvent.fromDict': ('battleEventData',),
+    },
+    'scripts/client/gui/Scaleform/daapi/view/battle/shared/'
+    'ribbons_aggregator.pyc': {
+        '_EnemyDetectionRibbon.getType': ('self',),
+    },
+    'scripts/client/AvatarInputHandler/DynamicCameras/SniperCamera.pyc': {
+        'SniperCamera.__calcCurOscillatorAcceleration': (
+            'self', 'deltaTime'),
     },
     'scripts/client/AvatarInputHandler/AimingSystems/'
     'ArcadeAimingSystem.pyc': {
@@ -341,6 +369,7 @@ EXPECTED_ABI = {
             'chassisShotDispersionFactorsRotation', 'aimingTime'),
         'PlayerAvatar.updateGunMarker': (
             'self', 'vehicleID', 'shotPos', 'shotVec', 'dispersionAngle'),
+        'PlayerAvatar.onBattleEvents': ('self', 'events'),
         'PlayerAvatar.getOwnVehicleShotDispersionAngle': (
             'self', 'turretRotationSpeed', 'withShot'),
         'PlayerAvatar.syncVehicleAttrs': ('self', 'attrs'),
@@ -365,6 +394,12 @@ EXPECTED_ABI = {
         'SniperControlMode.handleKeyEvent': (
             'self', 'isDown', 'key', 'mods', 'event'),
         'PostMortemControlMode.enable': ('self', '**args'),
+        'PostMortemControlMode.curPostmortemDelay': ('self',),
+    },
+    'scripts/client/AvatarInputHandler/PostmortemDelay.pyc': {
+        'PostmortemDelay.start': ('self',),
+        'PostmortemDelay.__moveCameraTo': (
+            'self', 'vehicleID', 'sourceVehicleID'),
     },
     'scripts/client/CommandMapping.pyc': {
         'CommandMapping.isFired': ('self', 'command', 'key'),
@@ -391,6 +426,8 @@ EXPECTED_ABI = {
             'self', 'newHealth', 'attackerID', 'attackReasonID'),
     },
     'scripts/client/VehicleGunRotator.pyc': {
+        'VehicleGunRotator.start': ('self',),
+        'VehicleGunRotator.reset': ('self',),
         'VehicleGunRotator.update': (
             'self', 'turretYaw', 'gunPitch', 'maxTurretRotationSpeed',
             'maxGunRotationSpeed'),
@@ -426,6 +463,13 @@ EXPECTED_ABI = {
         'DestructiblesManager.__destroyDestructible': (
             'self', 'chunkID', 'dmgType', 'destData',
             'isNeedAnimation', 'explosionInfo'),
+        'DestructiblesManager.__getDestrInitialMatrix': (
+            'self', 'chunkID', 'destrIndex'),
+        '_DestructiblesAnimator.showFall': (
+            'self', 'spaceID', 'chunkID', 'destrIndex', 'fallDirYaw',
+            'pitchConstr', 'discreteInitSpeed', 'isNeedAnimation',
+            'initialMatrix', 'touchdownCallback'),
+        '_DestructiblesAnimator.__positionBodyModel': ('self', 'body'),
     },
     'scripts/client/helpers/EffectMaterialCalculation.pyc': {
         'calcSurfaceMaterialNearPoint': (
@@ -506,6 +550,7 @@ EXPECTED_ABI = {
         '_SpeedStateHandler._invalidate': ('self', 'vehicle'),
     },
     'scripts/client/gui/battle_control/controllers/repositories.pyc': {
+        'BattleSessionSetup.arenaDP': ('self',),
         'SharedControllersLocator.arenaLoad': ('self',),
     },
     'scripts/client/gui/battle_control/controllers/debug_ctrl.pyc': {
@@ -629,6 +674,8 @@ EXPECTED_ABI = {
         '_CurrentVehicle.item': ('self',),
     },
     'scripts/client/gui/ClientHangarSpace.pyc': {
+        'ClientHangarSpace.create': (
+            'self', 'isPremium', 'onSpaceLoadedCallback'),
         'ClientHangarSpace.getVehicleEntity': ('self',),
         '_VehicleAppearance.__startBuild': ('self', 'vDesc', 'vState'),
         '_VehicleAppearance.__onResourcesLoaded': (
@@ -685,6 +732,10 @@ EXPECTED_CODE_LITERALS = {
     'scripts/client/ProjectileMover.pyc': {
         'segmentMayHitEntity': ('segmentMayHitEntity',),
     },
+    'scripts/client/gui/battle_control/controllers/feedback_events.pyc': {
+        'PlayerFeedbackEvent.fromDict': (
+            'eventType', 'details', 'targetID', 'count'),
+    },
     'scripts/client_common/ClientArena.pyc': {
         'ClientArena.__vehicleStatisticsAsDict': ('frags',),
         'ClientArena.__onTeamKiller': ('isTeamKiller',),
@@ -727,6 +778,14 @@ EXPECTED_CODE_LITERALS = {
 # string payload literals cannot express.  They are the exact #1513 APIs the
 # offline Account preservation and native lobby-ready gate depend on.
 EXPECTED_CODE_NAMES = {
+    'scripts/client/game.pyc': {
+        'wg_onChunkLoad': (
+            'AreaDestructibles', 'g_destructiblesManager', 'getSpaceID',
+            'startSpace', 'onChunkLoad'),
+        'wg_onChunkLoose': (
+            'AreaDestructibles', 'g_destructiblesManager', 'getSpaceID',
+            'onChunkLoose'),
+    },
     'scripts/common/OldSpaceData.pyc': {
         'getSpaceDataFirstForKey': (
             'getattr', 'BigWorld', 'spaces', 'getPropertyNameForKey'),
@@ -823,6 +882,9 @@ EXPECTED_CODE_NAMES = {
             'addHitDirection'),
         'PlayerAvatar.updateGunMarker': (
             'gunRotator', 'setShotPosition'),
+        'PlayerAvatar.onBattleEvents': (
+            'guiSessionProvider', 'shared', 'feedback',
+            'handleBattleEvents'),
         'PlayerAvatar.getOwnVehicleShotDispersionAngle': (
             'getOwnVehicleSpeeds', 'shotDispersionAngle'),
         'PlayerAvatar.autoAim': (
@@ -873,7 +935,20 @@ EXPECTED_CODE_NAMES = {
             'CMD_CM_LOCK_TARGET_OFF'),
         'PostMortemControlMode.enable': (
             '_PostMortemControlMode__cam', 'consistentMatrices',
-            'attachedVehicleMatrix', 'vehicleMProv'),
+            'attachedVehicleMatrix', 'vehicleMProv', 'PostmortemDelay',
+            '_PostMortemControlMode__postmortemDelay', 'start'),
+        'PostMortemControlMode.curPostmortemDelay': (
+            '_PostMortemControlMode__postmortemDelay',),
+    },
+    'scripts/client/AvatarInputHandler/PostmortemDelay.pyc': {
+        'PostmortemDelay.start': (
+            'BigWorld', 'player', 'playerVehicleID',
+            '_PostmortemDelay__moveCameraTo'),
+        'PostmortemDelay.__moveCameraTo': (
+            'BigWorld', 'entity', 'matrix', 'player', 'playerVehicleID',
+            'inputHandler',
+            'steadyVehicleMatrixCalculator', 'outputMProv',
+            '_PostmortemDelay__setCameraSettings'),
     },
     'scripts/client/AvatarInputHandler/__init__.pyc': {
         'AvatarInputHandler.activatePostmortem': (
@@ -902,6 +977,9 @@ EXPECTED_CODE_NAMES = {
         'Vehicle.getSpeed': ('_Vehicle__speedInfo', 'value'),
         'Vehicle.getServerGunAngles': (
             'decodeGunAngles', 'gunAnglesPacked', 'typeDescriptor'),
+        'Vehicle.getAimParams': (
+            'appearance', 'turretMatrix', 'gunMatrix',
+            'Math', 'Matrix', 'yaw', 'pitch'),
         'Vehicle.onPushed': ('filter', 'setPosition'),
         'Vehicle.prerequisites': (
             'typeDescriptor', 'appearance_cache', 'createAppearance'),
@@ -941,6 +1019,13 @@ EXPECTED_CODE_NAMES = {
             'getSoundObject', 'play', 'setRTPC'),
     },
     'scripts/client/gui/battle_control/controllers/feedback_adaptor.pyc': {
+        'BattleFeedbackAdaptor.__init__': (
+            'weakref', 'proxy', 'arenaDP',
+            '_BattleFeedbackAdaptor__arenaDP'),
+        'BattleFeedbackAdaptor.handleBattleEvents': (
+            'PlayerFeedbackEvent', 'fromDict',
+            'VEHICLE_VISIBILITY_CHANGED', 'PLAYER_DETECT_ENEMY',
+            'isVisible', 'isDirect', 'onPlayerFeedbackReceived'),
         'BattleFeedbackAdaptor.startVehicleVisual': (
             'id', 'getVehicleInfo', 'isObserver', 'team',
             'isPlayerVehicle'),
@@ -955,6 +1040,8 @@ EXPECTED_CODE_NAMES = {
             'onVehicleFeedbackReceived', '_FET', 'VEHICLE_HEALTH'),
     },
     'scripts/client/gui/battle_control/battle_session.pyc': {
+        'BattleSessionProvider.shared': (
+            '_BattleSessionProvider__sharedRepo',),
         'BattleSessionProvider.getArenaDP': (
             '_BattleSessionProvider__arenaDP',),
         'BattleSessionProvider.addArenaCtrl': (
@@ -1008,6 +1095,10 @@ EXPECTED_CODE_NAMES = {
             '_ConsistentMatrices__ownVehicleMProv', 'target',
             'bodyMatrix', 'matrix'),
     },
+    'scripts/client/AvatarInputHandler/DynamicCameras/__init__.pyc': {
+        'AccelerationSmoother.update': (
+            'filter', 'velocity', 'acceleration', 'engineMode', 'matrix'),
+    },
     'scripts/client/AvatarInputHandler/DynamicCameras/ArcadeCamera.pyc': {
         'ArcadeCamera.create': (
             'getTargetMProv', 'BigWorld', 'player', 'matrix',
@@ -1015,11 +1106,34 @@ EXPECTED_CODE_NAMES = {
         'ArcadeCamera.enable': (
             'getVehicleAttached', 'getOwnVehicleMatrix', 'vehicleMProv',
             '_ArcadeCamera__aimingSystem', 'enable'),
+        'ArcadeCamera.__calcCurOscillatorAcceleration': (
+            'BigWorld', 'player', 'getVehicleAttached', 'filter', 'getattr',
+            '_ArcadeCamera__accelerationSmoother', 'update'),
         'ArcadeCamera.__setVehicleMProv': (
             '_ArcadeCamera__refineVehicleMProv',
             '_ArcadeCamera__setupCameraProviders', 'vehicleMProv'),
         'ArcadeCamera.__getVehicleMProv': (
             '_ArcadeCamera__aimingSystem', 'vehicleMProv', 'source'),
+        'ArcadeCamera.setToVehicleDirection': (
+            'getTargetMProv', 'setYawPitch', 'yaw', 'pitch'),
+    },
+    'scripts/client/gui/battle_control/controllers/feedback_events.pyc': {
+        'PlayerFeedbackEvent.fromDict': (
+            '_BATTLE_EVENT_TO_PLAYER_FEEDBACK_EVENT',
+            '_PLAYER_FEEDBACK_EXTRA_DATA_CONVERTERS'),
+    },
+    'scripts/client/gui/Scaleform/daapi/view/battle/shared/'
+    'ribbons_aggregator.pyc': {
+        '_EnemyDetectionRibbon.getType': (
+            'BATTLE_EFFICIENCY_TYPES', 'DETECTION'),
+        '_createRibbonFromPlayerFeedbackEvent': (
+            '_FEEDBACK_EVENT_TO_RIBBON_CLS_FACTORY',
+            'createFromFeedbackEvent'),
+    },
+    'scripts/client/AvatarInputHandler/DynamicCameras/SniperCamera.pyc': {
+        'SniperCamera.__calcCurOscillatorAcceleration': (
+            'BigWorld', 'player', 'vehicle', 'isAlive', 'filter', 'velocity',
+            '_SniperCamera__accelerationSmoother', 'update'),
     },
     'scripts/client/AvatarInputHandler/AimingSystems/'
     'ArcadeAimingSystem.pyc': {
@@ -1070,6 +1184,10 @@ EXPECTED_CODE_NAMES = {
         '_ExtinguisherItem.getActivationCode': ('id',),
     },
     'scripts/client/AreaDestructibles.pyc': {
+        'DestructiblesManager.onChunkLoad': (
+            '_DestructiblesManager__loadedChunkIDs',),
+        '_DestructiblesAnimator.showFall': (
+            'spaceID', 'chunkID', 'destrIndex'),
         'AreaDestructibles.set_fallenTrees': (
             'orderDestructibleDestroy', 'DESTR_TYPE_TREE'),
         'AreaDestructibles.set_fallenColumns': (
@@ -1083,6 +1201,13 @@ EXPECTED_CODE_NAMES = {
             'decodeFragile', 'decodeDestructibleModule'),
         'DestructiblesManager.__destroyDestructible': (
             'wg_getDestructibleFallPitchConstr',),
+        'DestructiblesManager.__getDestrInitialMatrix': (
+            '_DestructiblesManager__destrInitialMatrices',
+            'wg_getDestructibleMatrix', 'setdefault'),
+        '_DestructiblesAnimator.showFall': (
+            '_DestructiblesAnimator__bodies', 'append'),
+        '_DestructiblesAnimator.__positionBodyModel': (
+            'BigWorld', 'wg_setDestructibleMatrix'),
     },
     'scripts/client/helpers/EffectMaterialCalculation.pyc': {
         'calcSurfaceMaterialNearPoint': (
@@ -1115,6 +1240,16 @@ EXPECTED_CODE_NAMES = {
             'onPeriodChange', 'onCameraChanged'),
     },
     'scripts/client/VehicleGunRotator.pyc': {
+        'VehicleGunRotator.start': (
+            '_VehicleGunRotator__isStarted',
+            '_VehicleGunRotator__maxTurretRotationSpeed',
+            '_VehicleGunRotator__avatar', 'isOnArena'),
+        'VehicleGunRotator.reset': (
+            '_VehicleGunRotator__turretYaw',
+            '_VehicleGunRotator__gunPitch',
+            '_VehicleGunRotator__updateTurretMatrix',
+            '_VehicleGunRotator__updateGunMatrix',
+            '_VehicleGunRotator__isLocked'),
         'VehicleGunRotator.update': (
             '_VehicleGunRotator__avatar',
             'getOwnVehicleShotDispersionAngle',
@@ -1236,6 +1371,8 @@ EXPECTED_CODE_NAMES = {
             'showBattlePage', '_viewComponents', 'arenaLoadCompleted'),
     },
     'scripts/client/gui/battle_control/controllers/repositories.pyc': {
+        'BattleSessionSetup.arenaDP': (
+            'sessionProvider', 'getArenaDP'),
         'SharedControllersLocator.arenaLoad': (
             '_repository', 'getController', 'BATTLE_CTRL_ID',
             'ARENA_LOAD_PROGRESS'),
@@ -1261,6 +1398,10 @@ EXPECTED_CODE_NAMES = {
             'fireEvent', 'GUICommonEvent', 'LOBBY_VIEW_LOADED'),
     },
     'scripts/client/gui/ClientHangarSpace.pyc': {
+        'ClientHangarSpace.create': (
+            'BigWorld', 'createSpace',
+            'wg_setSpaceItemsVisibilityMask',
+            'addSpaceGeometryMapping'),
         '_VehicleAppearance.__startBuild': ('loadResourceListBG',),
         '_VehicleAppearance.__onResourcesLoaded': (
             '_VehicleAppearance__setupModel',),
@@ -1312,6 +1453,12 @@ EXPECTED_GLOBALS = {
 
 
 EXPECTED_CLASS_CONSTANTS = {
+    'scripts/common/BattleFeedbackCommon.pyc': {
+        'BATTLE_EVENT_TYPE': {
+            'SPOTTED': 0,
+            'TARGET_VISIBILITY': 12,
+        },
+    },
     'scripts/client/Avatar.pyc': {
         'ClientVisibilityFlags': {
             'CLIENT_MASK': 4293918720,

@@ -233,7 +233,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.3.51</version></root>')
+            '<version>0.3.76</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -321,6 +321,38 @@ class PortSourceTests(unittest.TestCase):
         self.assertTrue((
             PORT_ROOT / 'src' / 'res' / 'scripts' / 'client' / 'gui' /
             'mods' / 'mod_offline_lan_0922.py').is_file())
+
+    def test_release_version_is_consistent(self):
+        version = '0.3.76'
+        package = (
+            PORT_ROOT / 'src' / 'res' / 'scripts' / 'client' / 'gui' /
+            'mods' / 'offline_lan_0922' / '__init__.py')
+        self.assertIn("PORT_VERSION = '%s'" % version,
+                      package.read_text(encoding='utf-8'))
+        self.assertIn('<version>%s</version>' % version,
+                      (PORT_ROOT / 'meta.xml').read_text(encoding='utf-8'))
+        self.assertIn("MOD_VERSION = '%s'" % version,
+                      (PORT_ROOT / 'build_wotmod.py').read_text(
+                          encoding='utf-8'))
+        self.assertIn("version != '%s'" % version,
+                      (PORT_ROOT / 'tools' / 'validate_wotmod.py').read_text(
+                          encoding='utf-8'))
+        self.assertIn('org.peng.offline_lan_0922_%s.wotmod' % version,
+                      (PORT_ROOT / 'build_for_client.sh').read_text(
+                          encoding='utf-8'))
+        self.assertIn(
+            'org.peng.offline_lan_0922_%s.wotmod' % version,
+            (ROOT / '.github' / 'workflows' / 'tests.yml').read_text(
+                encoding='utf-8'))
+        install = (PORT_ROOT / 'INSTALL.txt').read_text(encoding='utf-8')
+        port_readme = (PORT_ROOT / 'README.md').read_text(encoding='utf-8')
+        root_readme = (ROOT / 'README.md').read_text(encoding='utf-8')
+        self.assertIn('package %s' % version, install)
+        self.assertIn(
+            'org.peng.offline_lan_0922_%s.wotmod' % version, install)
+        self.assertIn(
+            'org.peng.offline_lan_0922_%s.wotmod' % version, port_readme)
+        self.assertIn('Release `%s`' % version, root_readme)
 
     def test_port_sources_are_python_2_compatible_syntax(self):
         source_root = PORT_ROOT / 'src'
@@ -421,7 +453,9 @@ class PortSourceTests(unittest.TestCase):
                     'OFFLINE_LAN_RELEASE_PORT': '28782'}):
                 overlay, archive = packager._write_client_overlay(
                     str(root), str(package), str(checksum), 'a' * 64,
-                    str(graphs))
+                    str(graphs),
+                    str(PORT_ROOT / 'foliage'),
+                    str(PORT_ROOT / 'destructibles'))
 
             config_path = (Path(overlay) / 'mods' / 'configs' /
                            'offline_lan_0922' / 'config.json')
@@ -431,6 +465,8 @@ class PortSourceTests(unittest.TestCase):
             self.assertTrue((config_path.parent / 'navgraphs' /
                              'manifest.json').is_file())
             self.assertTrue((config_path.parent / 'foliage' /
+                             'manifest.json').is_file())
+            self.assertTrue((config_path.parent / 'destructibles' /
                              'manifest.json').is_file())
             self.assertTrue(Path(archive).is_file())
 
@@ -469,6 +505,38 @@ class PortSourceTests(unittest.TestCase):
             with self.assertRaisesRegex(
                     SystemExit, 'navigation graph is invalid'):
                 packager._validate_navigation_graphs(str(graphs))
+
+    def test_destructible_release_gate_rejects_missing_instance_locator(self):
+        packager_path = PORT_ROOT / 'build_wotmod.py'
+        spec = importlib.util.spec_from_file_location(
+            'build_wotmod_destructible_locator_test', packager_path)
+        packager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packager)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for source in (PORT_ROOT / 'destructibles').glob('*.json'):
+                (root / source.name).write_bytes(source.read_bytes())
+            target = root / '35_steppes.json'
+            data = json.loads(target.read_text(encoding='utf-8'))
+            resource = next(
+                value for value in data['resources'].values()
+                if value.get('locators'))
+            del resource['locators']
+            payload = (json.dumps(
+                data, sort_keys=True, separators=(',', ':')) +
+                '\n').encode('utf-8')
+            target.write_bytes(payload)
+            manifest = json.loads(
+                (root / 'manifest.json').read_text(encoding='utf-8'))
+            next(record for record in manifest['maps']
+                 if record['map'] == '35_steppes')['sha256'] = \
+                hashlib.sha256(payload).hexdigest()
+            (root / 'manifest.json').write_text(
+                json.dumps(manifest), encoding='utf-8')
+
+            with self.assertRaisesRegex(
+                    SystemExit, 'resource locator'):
+                packager._validate_destructibles(str(root))
 
     def test_navigation_batch_refuses_partial_existing_output(self):
         batch = _load_tool('bake_all_navigation_0922')
@@ -1311,19 +1379,29 @@ class OfflineCompatibilityTests(unittest.TestCase):
         runtime, unused_operations = self._runtime()
         compatibility = compatibility_module.OfflineCompatibility(runtime)
         compatibility.configure_battle()
-        arena_dp = types.SimpleNamespace(
-            player_vehicle_id=91,
-            getPlayerVehicleID=lambda force=False: arena_dp.player_vehicle_id,
-            isRequiredDataExists=lambda: True,
-            getVehicleInfo=lambda vehicle_id: types.SimpleNamespace(
-                vehicleID=int(vehicle_id), team=1))
+        class ArenaDP(object):
+            player_vehicle_id = 91
+
+            def getPlayerVehicleID(self, force=False):
+                return self.player_vehicle_id
+
+            def isRequiredDataExists(self):
+                return True
+
+            def getVehicleInfo(self, vehicle_id):
+                return types.SimpleNamespace(
+                    vehicleID=int(vehicle_id), team=1)
+
+        arena_dp = ArenaDP()
         plugin = runtime.vehicle_marker_plugin_type(arena_dp)
         plugin.start()
         emitted = []
 
         class FeedbackAdaptor(object):
             def __init__(self):
-                setattr(self, '_BattleFeedbackAdaptor__arenaDP', arena_dp)
+                setattr(
+                    self, '_BattleFeedbackAdaptor__arenaDP',
+                    weakref.proxy(arena_dp))
 
             def setVehicleNewHealth(self, vehicle_id, health,
                                     attacker_id, reason_id):
@@ -1332,8 +1410,11 @@ class OfflineCompatibilityTests(unittest.TestCase):
 
             def _setVehicleHealthChanged(self, vehicle_id, health,
                                          attacker_id, reason_id):
-                attacker_info = (arena_dp.getVehicleInfo(attacker_id)
-                                 if attacker_id else None)
+                feedback_arena_dp = getattr(
+                    self, '_BattleFeedbackAdaptor__arenaDP')
+                attacker_info = (
+                    feedback_arena_dp.getVehicleInfo(attacker_id)
+                    if attacker_id else None)
                 value = (health, attacker_info, reason_id)
                 emitted.append(('vehicle-health', vehicle_id, value))
                 handler = getattr(
@@ -1344,9 +1425,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
         class SessionProvider(object):
             def __init__(self, feedback):
                 self.feedback = feedback
-                setattr(
-                    self, '_BattleSessionProvider__sharedRepo',
-                    types.SimpleNamespace(feedback=feedback))
+                self.shared = types.SimpleNamespace(feedback=feedback)
 
             def getArenaDP(self):
                 return arena_dp
@@ -1380,6 +1459,32 @@ class OfflineCompatibilityTests(unittest.TestCase):
             (2001, 'updateHealth', 450,
              runtime.vehicle_marker_damage_type.FROM_PLAYER, 'shot')],
             plugin.marker_updates)
+        plugin.stop()
+        compatibility.fini()
+
+    def test_marker_damage_boundary_rejects_missing_feedback_adaptor(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        arena_dp = types.SimpleNamespace(
+            player_vehicle_id=91,
+            getPlayerVehicleID=lambda force=False: 91,
+            isRequiredDataExists=lambda: True,
+            getVehicleInfo=lambda vehicle_id: types.SimpleNamespace(
+                vehicleID=int(vehicle_id), team=1))
+        plugin = runtime.vehicle_marker_plugin_type(arena_dp)
+        plugin.start()
+        plugin.sessionProvider.shared.feedback = None
+        avatar = types.SimpleNamespace(
+            guiSessionProvider=plugin.sessionProvider)
+
+        self.assertTrue(
+            compatibility.synchronise_vehicle_marker_identity(91))
+        with self.assertRaisesRegex(
+                RuntimeError, 'battle feedback adaptor is unavailable'):
+            compatibility.assert_vehicle_marker_damage_type(avatar, 91)
+
         plugin.stop()
         compatibility.fini()
 
@@ -2020,6 +2125,38 @@ class OfflineCompatibilityTests(unittest.TestCase):
                     return True
                 return False
 
+        class AccelerationSmoother(object):
+            def update(self, vehicle, delta_time):
+                unused_delta_time = delta_time
+                return (vehicle.filter.velocity,
+                        vehicle.filter.acceleration)
+
+        class ArcadeCamera(object):
+            def __init__(self):
+                self._ArcadeCamera__accelerationSmoother = \
+                    AccelerationSmoother()
+
+            def __calcCurOscillatorAcceleration(self, delta_time):
+                vehicle = bigworld.player().getVehicleAttached()
+                velocity = vehicle.filter.velocity
+                motion = self._ArcadeCamera__accelerationSmoother.update(
+                    vehicle, delta_time)
+                return velocity, motion
+
+        class SniperCamera(object):
+            def __init__(self):
+                self._SniperCamera__accelerationSmoother = \
+                    AccelerationSmoother()
+
+            def __calcCurOscillatorAcceleration(self, delta_time):
+                vehicle = bigworld.player().vehicle
+                if vehicle is None:
+                    return None
+                velocity = vehicle.filter.velocity
+                motion = self._SniperCamera__accelerationSmoother.update(
+                    vehicle, delta_time)
+                return velocity, motion
+
         class VehicleGunRotator(object):
             def getAvatarOwnVehicleStabilisedMatrix(self, vehicle):
                 return vehicle.filter.interpolateStabilisedMatrix(123.0)
@@ -2042,15 +2179,12 @@ class OfflineCompatibilityTests(unittest.TestCase):
                 self.sessionProvider = types.SimpleNamespace(
                     getArenaDP=lambda: self.arena_dp,
                     setVehicleHealth=lambda *unused: None,
+                    shared=types.SimpleNamespace(feedback=feedback),
                     arena_controllers=weakref.WeakSet())
                 self.sessionProvider.addArenaCtrl = lambda controller: \
                     self.sessionProvider.arena_controllers.add(controller)
                 self.sessionProvider.removeArenaCtrl = lambda controller: \
                     self.sessionProvider.arena_controllers.discard(controller)
-                setattr(
-                    self.sessionProvider,
-                    '_BattleSessionProvider__sharedRepo',
-                    types.SimpleNamespace(feedback=feedback))
                 self._VehicleMarkerPlugin__playerVehicleID = 0
 
             def start(self):
@@ -2108,6 +2242,8 @@ class OfflineCompatibilityTests(unittest.TestCase):
         sound_groups = _SoundGroups(bigworld, operations)
         runtime = types.SimpleNamespace(
             account_module=account_module,
+            acceleration_smoother_type=AccelerationSmoother,
+            arcade_camera_type=ArcadeCamera,
             avatar_module=avatar_module,
             avatar_input_handler=types.SimpleNamespace(
                 AvatarInputHandler=AvatarInputHandler),
@@ -2129,6 +2265,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
             prb_loader=_PrbLoader(operations),
             sound_groups_module=types.SimpleNamespace(
                 g_instance=sound_groups),
+            sniper_camera_type=SniperCamera,
             steady_vehicle_matrix=types.SimpleNamespace(
                 SteadyVehicleMatrixCalculator=
                 SteadyVehicleMatrixCalculator),
@@ -2323,6 +2460,56 @@ class OfflineCompatibilityTests(unittest.TestCase):
 
         compatibility.fini()
         self.assertEqual((0.0, 0.0), avatar.getOwnVehicleSpeeds())
+
+    def test_dynamic_camera_reads_copied_motion_without_replacing_filter(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.playerVehicleID = 91
+        avatar.vehicle = None
+        vehicle = runtime.vehicle_module.Vehicle()
+        native_filter = types.SimpleNamespace(
+            velocity='native-velocity',
+            acceleration='native-acceleration')
+        vehicle.filter = native_filter
+        runtime.bigworld.entities[91] = vehicle
+        runtime.bigworld.entity = runtime.bigworld.entities.get
+        runtime.bigworld._player = avatar
+        smoother = runtime.acceleration_smoother_type()
+        arcade = runtime.arcade_camera_type()
+        sniper = runtime.sniper_camera_type()
+
+        self.assertEqual(
+            ('native-velocity', 'native-acceleration'),
+            smoother.update(vehicle, 0.016))
+        compatibility.configure_battle()
+        compatibility.set_vehicle_pose_overlay(
+            vehicle, 'position', 0.0, 'matrix', 8.0, 0.0,
+            'copied-velocity', 'copied-acceleration')
+
+        expected = ('copied-velocity', 'copied-acceleration')
+        self.assertEqual(expected, smoother.update(vehicle, 0.016))
+        self.assertEqual(
+            ('copied-velocity', expected),
+            arcade._ArcadeCamera__calcCurOscillatorAcceleration(0.016))
+        self.assertEqual(
+            ('copied-velocity', expected),
+            sniper._SniperCamera__calcCurOscillatorAcceleration(0.016))
+        self.assertIsNone(avatar.vehicle)
+        self.assertIs(native_filter, vehicle.filter)
+        self.assertIs(
+            native_filter,
+            compatibility.native_vehicle_attribute(vehicle, 'filter'))
+
+        self.assertTrue(compatibility.clear_vehicle_pose_overlay(vehicle))
+        self.assertEqual(
+            ('native-velocity', 'native-acceleration'),
+            smoother.update(vehicle, 0.016))
+        self.assertIsNone(
+            sniper._SniperCamera__calcCurOscillatorAcceleration(0.016))
+        compatibility.fini()
 
     def test_remote_autoaim_admits_exact_outline_candidate_and_switches(self):
         compatibility_module = _load_port_source('compat')
@@ -3812,6 +3999,15 @@ class LANClientTests(unittest.TestCase):
             bigworld=bigworld)
         return module, client, events, bigworld
 
+    @staticmethod
+    def _activate_outbound(client):
+        client.sock = _LANSocket()
+        client.running = True
+        client.connected = True
+        client._stopping = False
+        with client._outbound_lock:
+            client._outbound_accepting = True
+
     def test_start_worker_connects_and_sends_protocol_hello(self):
         module = _load_port_source('lan_client')
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -3847,13 +4043,13 @@ class LANClientTests(unittest.TestCase):
 
     def test_welcome_roster_and_server_validated_start_request(self):
         module, client, events, _ = self._client()
-        client.connected = True
-        client.running = True
-        client.sock = _LANSocket()
+        self._activate_outbound(client)
         client._handle_message({
             'type': 'welcome',
             'protocol': module.PROTOCOL_VERSION,
             'client_build': module.CLIENT_BUILD,
+            'capabilities': [module.PROJECTILE_LEDGER_CAPABILITY],
+            'authority_epoch': 1,
             'player_id': 7,
             'host_player_id': 7,
             'name': 'Player',
@@ -3877,6 +4073,7 @@ class LANClientTests(unittest.TestCase):
             'map': '01_karelia',
             'map_pool': ['01_karelia', '04_himmelsdorf'],
             'host_player_id': 7,
+            'authority_epoch': 1,
             'players': [{'id': 7}, {'id': 8}],
         })
 
@@ -3886,9 +4083,9 @@ class LANClientTests(unittest.TestCase):
         self.assertEqual(2, len(client.roster))
         self.assertFalse(client.request_start('99_missing'))
         self.assertTrue(client.request_start('04_himmelsdorf'))
-        sent = client.sock.payloads[-1].decode('utf-8')
-        self.assertIn('"type":"start_battle"', sent)
-        self.assertIn('"map":"04_himmelsdorf"', sent)
+        queued = client._outbound_queue[-1][1]
+        self.assertEqual('start_battle', queued['type'])
+        self.assertEqual('04_himmelsdorf', queued['map'])
         self.assertEqual(['welcome', 'roster'],
                          [item[0] for item in events])
 
@@ -3909,15 +4106,13 @@ class LANClientTests(unittest.TestCase):
 
     def test_older_same_round_roster_cannot_roll_back_room_host(self):
         _, client, events, _ = self._client()
-        client.running = True
-        client.connected = True
+        self._activate_outbound(client)
         client.ready = True
         client.player_id = 2
         client.round_id = 3
         client.state_revision = 4
         client.phase = 'waiting'
         client.map_pool = ['01_karelia']
-        client.sock = _LANSocket()
 
         client._handle_message({
             'type': 'roster', 'protocol': 5, 'round_id': 3,
@@ -3936,6 +4131,9 @@ class LANClientTests(unittest.TestCase):
         self.assertEqual([2], [value['id'] for value in client.roster])
         self.assertEqual(['roster'], [value[0] for value in events])
         self.assertTrue(client.request_start('01_karelia'))
+        queued = client._outbound_queue[-1][1]
+        self.assertEqual('start_battle', queued['type'])
+        self.assertEqual('01_karelia', queued['map'])
 
     def test_overtaken_battle_start_keeps_newer_roster_and_fires_once(self):
         _, client, events, _ = self._client()
@@ -4095,6 +4293,8 @@ class LANClientTests(unittest.TestCase):
         client._handle_message({
             'type': 'welcome', 'protocol': 5,
             'client_build': module.CLIENT_BUILD, 'player_id': 'bad',
+            'capabilities': [module.PROJECTILE_LEDGER_CAPABILITY],
+            'authority_epoch': 1,
             'host_player_id': 7, 'name': 'Player',
             'vehicle': 'ussr:MS-1', 'max_health': 100,
             'team': 1, 'slot': 0, 'round_id': 1,
@@ -4113,6 +4313,8 @@ class LANClientTests(unittest.TestCase):
         client._handle_message({
             'type': 'welcome', 'protocol': 5,
             'client_build': module.CLIENT_BUILD, 'player_id': 7,
+            'capabilities': [module.PROJECTILE_LEDGER_CAPABILITY],
+            'authority_epoch': 1,
             'name': 'Player', 'vehicle': 'ussr:MS-1',
             'max_health': 100, 'team': 1, 'slot': 0, 'round_id': 1,
             'state_revision': 1,
@@ -4231,7 +4433,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.3.51'
+        package.PORT_VERSION = '0.3.76'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []

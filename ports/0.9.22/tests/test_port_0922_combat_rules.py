@@ -36,6 +36,43 @@ class CombatRulesTests(unittest.TestCase):
         self.assertEqual(200.0, near[2])
         self.assertEqual(100.0, far[2])
 
+    def test_nominal_piercing_after_obstacles_has_no_random_roll(self):
+        shot = _shot(piercing=(100.0, 50.0), maximum=500.0)
+
+        self.assertEqual(
+            75.0, combat_rules.nominal_piercing_after_loss(
+                shot, 100.0, 25.0))
+        self.assertEqual(
+            0.0, combat_rules.nominal_piercing_after_loss(
+                shot, 500.0, 50.0))
+
+    def test_one_penetration_factor_is_reused_across_range_and_vehicle(self):
+        draws = []
+
+        def low_roll(low, high):
+            draws.append((low, high))
+            return 0.75
+
+        factor = combat_rules.sample_penetration_factor(low_roll)
+        self.assertEqual(0.75, factor)
+        self.assertEqual([(0.75, 1.25)], draws)
+        self.assertEqual(
+            30.0, combat_rules.sampled_piercing(
+                _shot(piercing=(40.0, 40.0)), 10.0, factor, 0.0))
+
+        hull = types.SimpleNamespace(armor=20.0, vehicleDamageFactor=1.0)
+        result = combat_rules.resolve_hull_hit(
+            _shot(piercing=(40.0, 40.0)), 10.0,
+            (types.SimpleNamespace(
+                dist=10.0, hitAngleCos=1.0, matInfo=hull,
+                compName='vehicleHull'),),
+            pierce_loss=5.0, penetration_factor=factor,
+            random_uniform=lambda unused_low, unused_high: self.fail(
+                'vehicle resolution must not draw penetration again'))
+
+        self.assertEqual(2, result[0])
+        self.assertEqual(25.0, result[2])
+
     def test_ap_ricochet_and_three_caliber_overmatch_match_082(self):
         grazing = 0.30
         ordinary = combat_rules.penetration(
@@ -83,6 +120,51 @@ class CombatRulesTests(unittest.TestCase):
 
         self.assertEqual(1, result[0])
         self.assertEqual(40.0, result[3])
+
+    def test_destructible_loss_accumulates_before_vehicle_spaced_armour(self):
+        track = types.SimpleNamespace(armor=20.0, vehicleDamageFactor=0.0)
+        hull = types.SimpleNamespace(armor=100.0, vehicleDamageFactor=1.0)
+        collisions = (
+            types.SimpleNamespace(
+                dist=5.0, hitAngleCos=1.0, matInfo=track,
+                compName='vehicleChassis'),
+            types.SimpleNamespace(
+                dist=5.2, hitAngleCos=1.0, matInfo=hull,
+                compName='vehicleHull'),
+        )
+
+        result = combat_rules.resolve_hull_hit(
+            _shot(piercing=(160.0, 160.0)), 50.0, collisions,
+            pierce_loss=50.0,
+            random_uniform=lambda unused_low, unused_high: 1.0)
+
+        self.assertEqual(1, result[0])
+        self.assertEqual(70.0, result[3])
+        self.assertEqual(90.0, result[2])
+
+    def test_destructible_penetration_loss_does_not_reduce_damage(self):
+        hull = types.SimpleNamespace(armor=50.0, vehicleDamageFactor=1.0)
+        collisions = (types.SimpleNamespace(
+            dist=5.0, hitAngleCos=1.0, matInfo=hull,
+            compName='vehicleHull'),)
+        shot = _shot(piercing=(160.0, 160.0), damage=240.0)
+        clear = combat_rules.resolve_hull_hit(
+            shot, 50.0, collisions,
+            random_uniform=lambda unused_low, unused_high: 1.0)
+        crossed = combat_rules.resolve_hull_hit(
+            shot, 50.0, collisions,
+            random_uniform=lambda unused_low, unused_high: 1.0,
+            pierce_loss=25.0)
+
+        self.assertEqual(2, clear[0])
+        self.assertEqual(2, crossed[0])
+        self.assertEqual(
+            combat_rules.damage(
+                shot, clear[0], 50.0,
+                random_uniform=lambda unused_low, unused_high: 1.0),
+            combat_rules.damage(
+                shot, crossed[0], 50.0,
+                random_uniform=lambda unused_low, unused_high: 1.0))
 
     def test_collision_adapter_rejects_incomplete_1513_result(self):
         collision = types.SimpleNamespace(

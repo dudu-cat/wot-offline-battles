@@ -1,5 +1,6 @@
 import importlib.util
 import hashlib
+import copy
 import json
 import shutil
 import struct
@@ -48,6 +49,96 @@ def compiled_space(sections):
 
 
 class CompiledSpace0922Test(unittest.TestCase):
+
+    def test_ordinary_routes_use_one_canonical_reversible_polyline(self):
+        graph = {'bake': {'soft_route_fallbacks': []}}
+        routes = {
+            '1': [
+                {'id': 'through', 'capacity': 5, 'risk': 0.6,
+                 'role_weights': {'scout': 1.0},
+                 'waypoints': [[0.0, 0.0, False],
+                               [4.0, 4.0, True],
+                               [8.0, 8.0, False]]},
+                {'id': 'rear_guard', 'capacity': 1, 'risk': 0.1,
+                 'role_weights': {'artillery': 1.0},
+                 'waypoints': [[0.0, 0.0, False],
+                               [-4.0, 0.0, True]]},
+            ],
+            '2': [
+                {'id': 'through', 'capacity': 5, 'risk': 0.6,
+                 'role_weights': {'scout': 1.0},
+                 'waypoints': [[8.0, 8.0, False],
+                               [8.0, 4.0, True],
+                               [0.0, 0.0, False]]},
+                {'id': 'rear_guard', 'capacity': 1, 'risk': 0.1,
+                 'role_weights': {'artillery': 1.0},
+                 'waypoints': [[8.0, 8.0, False],
+                               [12.0, 8.0, True]]},
+            ],
+        }
+
+        result = baker.canonicalize_reversible_routes(graph, routes)
+
+        self.assertEqual(
+            [[8.0, 8.0, False], [4.0, 4.0, True],
+             [0.0, 0.0, False]],
+            result['2'][0]['waypoints'])
+        self.assertEqual(
+            [[8.0, 8.0, False], [12.0, 8.0, True]],
+            result['2'][1]['waypoints'])
+        self.assertEqual(
+            ['through'], graph['bake']['canonical_reversible_routes'])
+
+    def test_directional_fallback_mismatch_is_rejected(self):
+        graph = {'bake': {'soft_route_fallbacks': ['1:through']}}
+        route = {'id': 'through', 'capacity': 1, 'risk': 0.5,
+                 'role_weights': {},
+                 'waypoints': [[0.0, 0.0, False],
+                               [4.0, 4.0, False]]}
+        reverse = dict(route)
+        reverse['waypoints'] = list(reversed(route['waypoints']))
+        with self.assertRaisesRegex(
+                baker.UnsafeBakeInputError,
+                'reversible tactical fallback differs'):
+            baker.canonicalize_reversible_routes(
+                graph, {'1': [route], '2': [reverse]})
+
+    def test_final_validation_rejects_a_canonical_reverse_on_one_way_links(self):
+        legacy = baker._legacy_baker()
+        graph = {
+            'cell_size': 4.0,
+            'origin': (0.0, 0.0),
+            'bounds': (0.0, 0.0, 8.0, 0.0),
+            'width': 3,
+            'height': 1,
+            'heights_mm': [0, 0, 0],
+            # East-only links let team one cross the fixture but deliberately
+            # make the same sampled corridor invalid in reverse.
+            'links': [1 << 4, 1 << 4, 0],
+            'hazards': [0, 0, 0],
+            'directions': [list(direction)
+                           for direction in legacy.DIRECTIONS],
+            'bake': {'soft_route_fallbacks': []},
+        }
+        first = {
+            'id': 'through', 'capacity': 1, 'risk': 0.5,
+            'role_weights': {},
+            'waypoints': [[0.0, 0.0, False],
+                          [4.0, 0.0, True],
+                          [8.0, 0.0, False]],
+        }
+        second = dict(first)
+        second['waypoints'] = list(reversed(first['waypoints']))
+        routes = {'1': [first], '2': [second]}
+
+        graph['routes'] = baker.canonicalize_reversible_routes(
+            graph, routes)
+
+        with self.assertRaisesRegex(
+                ValueError, 'route segment is disconnected'):
+            legacy.validate_graph(
+                graph, {'bases': ((0.0, 0.0), (8.0, 0.0)),
+                        'routes': (), 'anchors': ()})
 
     def test_mature_navigation_baker_is_pinned_inside_the_port(self):
         path = Path(baker.LEGACY_BAKER)
@@ -289,7 +380,18 @@ class CompiledSpace0922Test(unittest.TestCase):
         self.assertGreater(data['bake']['local_obstacle_instances'], 0)
         self.assertGreater(data['bake']['bridge_model_instances'], 0)
         self.assertGreater(data['bake']['bridge_surface_triangles'], 0)
-        self.assertGreaterEqual(data['bake']['retained_fraction'], 0.90)
+        # Exact BSP2 v2 decoding exposes the authored Eiffel collision that
+        # the legacy-header interpretation skipped.  Pin the resulting graph
+        # census so a return to the falsely sparse obstacle raster cannot pass
+        # behind the old 90 percent retained-node threshold.
+        self.assertEqual(29888, data['bake']['source_navigable_nodes'])
+        self.assertEqual(24418, data['bake']['retained_nodes'])
+        self.assertEqual(5470, data['bake']['pruned_nodes'])
+        self.assertEqual(384, data['bake']['source_components'])
+        self.assertEqual(287775, data['bake']['obstacle_raster_cells'])
+        self.assertEqual(0, data['bake']['skipped_models'])
+        self.assertAlmostEqual(0.81698,
+                               data['bake']['retained_fraction'], places=5)
         self.assertEqual(1, data['validation']['components'])
         self.assertEqual(90, data['validation']['route_segments'])
         self.assertLessEqual(max(data['validation']['spawn_start_reach_metres']),
@@ -349,6 +451,97 @@ class CompiledSpace0922Test(unittest.TestCase):
                     validation['spawn_vehicle_length_source'])
                 self.assertNotIn(
                     'fallback', data['spawn_formation_source'].lower())
+
+    def test_every_shipped_map_has_exact_tactical_route_contracts(self):
+        graph_root = ROOT / 'ports' / '0.9.22' / 'navgraphs'
+        paths = sorted(path for path in graph_root.glob('*.json')
+                       if path.name != 'manifest.json')
+        self.assertEqual(41, len(paths))
+        roles = {
+            'brawler', 'support', 'flanker',
+            'sniper', 'scout', 'artillery',
+        }
+        for path in paths:
+            with self.subTest(map=path.stem):
+                data = json.loads(path.read_text())
+                self.assertEqual(1, data['validation']['components'])
+                self.assertEqual(1.0, data['validation']['largest_fraction'])
+                self.assertEqual(
+                    sum(len(route['waypoints']) - 1
+                        for team in ('1', '2')
+                        for route in data['routes'][team]),
+                    data['validation']['route_segments'])
+
+                soft_routes = set(data['bake']['soft_route_fallbacks'])
+                self.assertEqual(
+                    soft_routes,
+                    set(data['bake']['soft_route_fallback_causes']))
+                self.assertTrue(all(
+                    isinstance(cause, str) and cause
+                    for cause in
+                    data['bake']['soft_route_fallback_causes'].values()))
+                team_metadata = []
+                route_keys = set()
+                for team in ('1', '2'):
+                    routes = data['routes'][team]
+                    route_ids = [route['id'] for route in routes]
+                    if path.stem == '04_himmelsdorf':
+                        self.assertEqual(
+                            {'banana', 'hill', 'rail', 'rear_guard'},
+                            set(route_ids))
+                    elif path.stem == '06_ensk':
+                        self.assertEqual(
+                            {'west_city', 'east_field'}, set(route_ids))
+                        self.assertEqual(
+                            [7, 7],
+                            [route['capacity'] for route in routes])
+                    else:
+                        self.assertEqual(3, len(routes))
+                    self.assertEqual(len(route_ids), len(set(route_ids)))
+                    own = data['spawn_anchors'][int(team) - 1]
+                    enemy = data['spawn_anchors'][2 - int(team)]
+                    metadata = []
+                    for route in routes:
+                        route_key = '%s:%s' % (team, route['id'])
+                        route_keys.add(route_key)
+                        self.assertEqual(own, route['waypoints'][0][:2])
+                        self.assertGreaterEqual(route['capacity'], 1)
+                        self.assertGreaterEqual(route['risk'], 0.0)
+                        self.assertLessEqual(route['risk'], 1.0)
+                        self.assertEqual(roles, set(route['role_weights']))
+                        self.assertTrue(all(
+                            0.0 <= value <= 1.0
+                            for value in route['role_weights'].values()))
+                        self.assertGreaterEqual(len(route['waypoints']), 2)
+                        self.assertLessEqual(len(route['waypoints']), 16)
+                        for x, z, unused_hold in route['waypoints']:
+                            column = int(round(
+                                (x - data['origin'][0]) / data['cell_size']))
+                            row = int(round(
+                                (z - data['origin'][1]) / data['cell_size']))
+                            self.assertGreaterEqual(column, 0)
+                            self.assertLess(column, data['width'])
+                            self.assertGreaterEqual(row, 0)
+                            self.assertLess(row, data['height'])
+                            index = row * data['width'] + column
+                            self.assertIsNotNone(data['heights_mm'][index])
+                            self.assertEqual(0, data['hazards'][index] & 3)
+                        if (route.get('terminal_hold', False) or
+                                route['id'] == 'rear_guard'):
+                            self.assertTrue(route['waypoints'][-1][2])
+                        else:
+                            self.assertEqual(enemy, route['waypoints'][-1][:2])
+                        metadata.append((
+                            route['id'], route['capacity'], route['risk'],
+                            route['role_weights'],
+                            bool(route.get('terminal_hold', False))))
+                    for role in roles - {'artillery'}:
+                        self.assertGreater(
+                            max(route['role_weights'][role]
+                                for route in routes), 0.0)
+                    team_metadata.append(metadata)
+                self.assertEqual(team_metadata[0], team_metadata[1])
+                self.assertTrue(soft_routes.issubset(route_keys))
 
     def test_reads_0920_bwt2_chunk_vector(self):
         settings = struct.pack('<f4i3I', 100.0, -4, 3, -4, 3, 0, 0, 0)
@@ -500,6 +693,225 @@ class CompiledSpace0922Test(unittest.TestCase):
         self.assertEqual([deck], obstacles.surfaces)
         self.assertEqual([body], obstacles.blockers)
 
+    @staticmethod
+    def _bsp2_v2(triangles, node_count=1, shared_count=0,
+                 plane_size=16, triangle_size=40, node_size=40):
+        values = [coordinate
+                  for triangle in triangles
+                  for point in triangle
+                  for coordinate in point]
+        minimum = tuple(min(point[axis]
+                            for triangle in triangles
+                            for point in triangle)
+                        if triangles else 0.0
+                        for axis in range(3))
+        maximum = tuple(max(point[axis]
+                            for triangle in triangles
+                            for point in triangle)
+                        if triangles else 0.0
+                        for axis in range(3))
+        header = struct.pack(
+            '<4I3I6f2I', 0x02505342, plane_size, triangle_size, node_size,
+            len(triangles), node_count, shared_count,
+            *(minimum + maximum + (0, 0)))
+        triangle_data = b''.join(
+            # WorldTriangle::Flags flags_, WorldTriangle::Padding padding_.
+            struct.pack('<9fHH', *values[index:index + 9], 0, 0)
+            for index in range(0, len(values), 9))
+        return (header + triangle_data + b'\x00' * (shared_count * 4) +
+                b'\x00' * (node_count * node_size))
+
+    def test_bsp2_v2_uses_exact_current_layout_not_legacy_header_counts(self):
+        triangles = [
+            ((1.0, 2.0, 3.0), (4.0, 5.0, 6.0), (7.0, 8.0, 9.0)),
+            ((-1.0, -2.0, -3.0), (-4.0, -5.0, -6.0),
+             (-7.0, -8.0, -9.0)),
+        ]
+        legacy = types.SimpleNamespace(
+            _bsp_triangles=lambda unused_section, unused_names, unused_flags:
+            self.fail('version 2 must not use the legacy parser'))
+
+        decoded = baker._bsp_triangles_0922(
+            self._bsp2_v2(triangles, node_count=3, shared_count=2), legacy)
+
+        self.assertEqual(triangles, decoded)
+
+    def test_bsp2_v2_rejects_wrong_abi_counts_and_trailing_bytes(self):
+        triangle = ((0.0, 0.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0))
+        legacy = types.SimpleNamespace(_bsp_triangles=None)
+        wrong_triangle_count = bytearray(self._bsp2_v2([triangle]))
+        struct.pack_into('<I', wrong_triangle_count, 16, 2)
+        malformed = (
+            self._bsp2_v2([triangle], plane_size=12),
+            self._bsp2_v2([triangle], node_count=0),
+            bytes(wrong_triangle_count),
+            self._bsp2_v2([triangle])[:-1],
+            self._bsp2_v2([triangle]) + b'\x00',
+        )
+
+        for section_data in malformed:
+            with self.subTest(length=len(section_data)):
+                with self.assertRaises(ValueError):
+                    baker._bsp_triangles_0922(section_data, legacy)
+
+    def test_bsp2_legacy_layout_remains_compatible(self):
+        triangle = ((0.0, 1.0, 2.0),
+                    (3.0, 4.0, 5.0),
+                    (6.0, 7.0, 8.0))
+        section_data = (struct.pack('<4I', 0x00505342, 1, 1, 0) +
+                        struct.pack('<9fI',
+                                    *(triangle[0] + triangle[1] + triangle[2] +
+                                      (0,))))
+        legacy = types.SimpleNamespace(
+            _bsp_triangles=lambda value, names, flags:
+            [('legacy', value, names, flags)])
+
+        decoded = baker._bsp_triangles_0922(section_data, legacy)
+
+        self.assertEqual([('legacy', section_data, (), {})], decoded)
+
+    def test_great_wall_4m_grid_phase_changes_only_x_and_is_recorded(self):
+        original = (-500.0, -500.0, 500.0, 500.0)
+        self.assertEqual(
+            original,
+            baker._target_expanded_bounds(
+                '59_asia_great_wall', original, 3.0, original))
+        self.assertEqual(
+            original,
+            baker._target_expanded_bounds(
+                '07_lakeville', original, 4.0, original))
+
+        phased = baker._target_expanded_bounds(
+            '59_asia_great_wall', original, 4.0, original)
+
+        self.assertEqual((-502.0, -500.0, 502.0, 500.0), phased)
+        self.assertEqual(original[1::2], phased[1::2])
+        graph = {
+            'cell_size': 4.0,
+            'bounds': list(phased),
+            'origin': [-500.0, -498.0],
+            'width': 251,
+            'height': 250,
+            'directions': [
+                [-1, -1], [0, -1], [1, -1], [-1, 0],
+                [1, 0], [-1, 1], [0, 1], [1, 1],
+            ],
+            'heights_mm': [None] * (251 * 250),
+            'hazards': [0] * (251 * 250),
+            'links': [0] * (251 * 250),
+            'bake': {},
+        }
+        def index(x, z):
+            column = int((x + 500.0) / 4.0)
+            row = int((z + 498.0) / 4.0)
+            return row * 251 + column
+        north = 1 << graph['directions'].index([0, 1])
+        south = 1 << graph['directions'].index([0, -1])
+        for z in (-150.0, -146.0, -142.0):
+            graph['heights_mm'][index(404.0, z)] = 1000
+        graph['links'][index(404.0, -150.0)] |= north
+        graph['links'][index(404.0, -146.0)] |= north | south
+        graph['links'][index(404.0, -142.0)] |= south
+        self.assertTrue(baker._record_target_grid_phase(
+            graph, '59_asia_great_wall', 4.0))
+        self.assertEqual(list(original), graph['bounds'])
+        self.assertEqual(-500.0, graph['origin'][0])
+        self.assertEqual(
+            500.0,
+            graph['origin'][0] +
+            (graph['width'] - 1) * graph['cell_size'])
+        self.assertEqual({
+            'map': '59_asia_great_wall',
+            'axis': 'x',
+            'cell_size': 4.0,
+            'original_expanded_bounds': list(original),
+            'applied_sampling_bounds': list(phased),
+            'public_gameplay_bounds': list(original),
+            'origin': [-500.0, -498.0],
+            'dimensions': [251, 250],
+            'passage_x': 404.0,
+            'passage_x_index': 226,
+            'passage_nodes': [
+                [404.0, -150.0], [404.0, -146.0], [404.0, -142.0],
+            ],
+            'reason': '#1513 gatehouse passage requires an x=404m graph centre',
+        }, graph['bake']['grid_phase_override'])
+
+    def test_great_wall_4m_grid_phase_rejects_any_contract_drift(self):
+        original = (-500.0, -500.0, 500.0, 500.0)
+        with self.assertRaises(space.UnsafeBakeInputError):
+            baker._target_expanded_bounds(
+                '59_asia_great_wall', (-499.0,) + original[1:],
+                4.0, original)
+        with self.assertRaises(space.UnsafeBakeInputError):
+            baker._target_expanded_bounds(
+                '59_asia_great_wall', original, 4.0,
+                (-504.0,) + original[1:])
+
+        valid = {
+            'cell_size': 4.0,
+            'bounds': [-502.0, -500.0, 502.0, 500.0],
+            'origin': [-500.0, -498.0],
+            'width': 251,
+            'height': 250,
+            'directions': [
+                [-1, -1], [0, -1], [1, -1], [-1, 0],
+                [1, 0], [-1, 1], [0, 1], [1, 1],
+            ],
+            'heights_mm': [None] * (251 * 250),
+            'hazards': [0] * (251 * 250),
+            'links': [0] * (251 * 250),
+            'bake': {},
+        }
+        def index(x, z):
+            column = int((x + 500.0) / 4.0)
+            row = int((z + 498.0) / 4.0)
+            return row * 251 + column
+        north = 1 << valid['directions'].index([0, 1])
+        south = 1 << valid['directions'].index([0, -1])
+        for z in (-150.0, -146.0, -142.0):
+            valid['heights_mm'][index(404.0, z)] = 1000
+        valid['links'][index(404.0, -150.0)] |= north
+        valid['links'][index(404.0, -146.0)] |= north | south
+        valid['links'][index(404.0, -142.0)] |= south
+        mutations = (
+            ('cell_size', 3.999),
+            ('bounds', [-500.0, -500.0, 500.0, 500.0]),
+            ('origin', [-498.0, -498.0]),
+            ('width', 250),
+            ('height', 251),
+            ('bake', None),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key):
+                graph = dict(valid)
+                graph[key] = value
+                with self.assertRaises(space.UnsafeBakeInputError):
+                    baker._record_target_grid_phase(
+                        graph, '59_asia_great_wall', 4.0)
+
+        passage_mutations = ('node', 'hazard', 'link', 'side')
+        for name in passage_mutations:
+            with self.subTest(passage=name):
+                graph = dict(valid)
+                graph['heights_mm'] = list(valid['heights_mm'])
+                graph['hazards'] = list(valid['hazards'])
+                graph['links'] = list(valid['links'])
+                graph['bake'] = {}
+                if name == 'node':
+                    graph['heights_mm'][index(404.0, -146.0)] = None
+                elif name == 'hazard':
+                    graph['hazards'][index(404.0, -146.0)] = 2
+                elif name == 'link':
+                    graph['links'][index(404.0, -146.0)] &= ~north
+                else:
+                    graph['heights_mm'][index(400.0, -146.0)] = 1000
+                with self.assertRaises(space.UnsafeBakeInputError):
+                    baker._record_target_grid_phase(
+                        graph, '59_asia_great_wall', 4.0)
+
     def test_bwwa_cell_ranges_are_half_open_at_exact_boundary(self):
         record = {'start_id': 0, 'end_id': 2}
         self.assertEqual([(record, 'a'), (record, 'b')],
@@ -520,6 +932,388 @@ class CompiledSpace0922Test(unittest.TestCase):
         unused_record, bounds = baker.bwwa_world_regions([record], [cell])[0]
         self.assertFalse(baker.bwwa_contains(record, cell, bounds[0], bounds[5]))
         self.assertTrue(baker.bwwa_contains(record, cell, 0.0, 0.0))
+
+    @staticmethod
+    def _lakeville_corner_graph():
+        return {
+            'origin': [-122.0, 42.0], 'cell_size': 4.0,
+            'width': 2, 'height': 2,
+            'directions': [
+                [-1, -1], [0, -1], [1, -1], [-1, 0],
+                [1, 0], [-1, 1], [0, 1], [1, 1],
+            ],
+            'heights_mm': [None, 10000, 11000, 10000],
+            'hazards': [2, 0, 0, 0],
+            'links': [0, 0, 0, 0],
+        }
+
+    @staticmethod
+    def _lakeville_corner_dependencies(segment_clear=None, ground_height=None,
+                                        water_depth=None, blocked=None,
+                                        edge_clear=None):
+        class Terrain(object):
+            def water_depth(self, x, z, ground):
+                if water_depth is None:
+                    return 0.0
+                return water_depth(x, z, ground)
+
+        class Obstacles(object):
+            def surface_height(self, unused_x, unused_z):
+                return None
+
+            def blocked(self, x, z, ground, margin):
+                if blocked is None:
+                    return False
+                return blocked(x, z, ground, margin)
+
+        legacy = types.SimpleNamespace(
+            HAZARD_EDGE=2, HAZARD_WATER=1, WATER_DEPTH_LIMIT=0.9,
+            BRIDGE_OBSTACLE_MARGIN=1.0, VEHICLE_HALF_WIDTH=2.15,
+            MAX_GRADE_UP=0.38, MAX_GRADE_DOWN=0.38,
+            _segment_clear=segment_clear or (
+                lambda unused_terrain, unused_obstacles,
+                unused_start, unused_end: True),
+            _ground_height=lambda unused_terrain, unused_obstacles, x, z:
+            ground_height(x, z) if ground_height is not None else 10.0,
+            _has_safe_edge_clearance=lambda unused_terrain, unused_obstacles,
+            x, z, ground: edge_clear(x, z, ground)
+            if edge_clear is not None else True,
+        )
+        return Terrain(), Obstacles(), legacy
+
+    def test_lakeville_corner_link_changes_only_the_proved_two_bits(self):
+        graph = self._lakeville_corner_graph()
+        segments = []
+        samples = []
+        terrain, obstacles, legacy = self._lakeville_corner_dependencies(
+            segment_clear=lambda unused_terrain, unused_obstacles, start, end:
+            segments.append((start, end)) or True,
+            edge_clear=lambda x, z, ground:
+            samples.append((x, z, ground)) or True,
+        )
+
+        added = baker.install_lakeville_narrow_corner_link(
+            graph, terrain, obstacles, legacy)
+
+        self.assertEqual(1, added)
+        self.assertEqual(2, len(segments))
+        self.assertEqual(8, len(samples))
+        for first, second in zip(samples[:4], samples[1:4]):
+            self.assertLessEqual(
+                math.hypot(second[0] - first[0],
+                           second[1] - first[1]), 2.0)
+        self.assertEqual([0, 1 << 5, 1 << 2, 0], graph['links'])
+
+    def test_lakeville_corner_link_rejects_contract_drift(self):
+        cases = ('endpoint', 'corner_hazard', 'one_way', 'water',
+                 'blocked', 'edge', 'grade')
+        for name in cases:
+            with self.subTest(name=name):
+                graph = self._lakeville_corner_graph()
+                if name == 'endpoint':
+                    graph['heights_mm'][1] = None
+                if name == 'corner_hazard':
+                    graph['hazards'][0] = 3
+                calls = []
+                terrain, obstacles, legacy = self._lakeville_corner_dependencies(
+                    segment_clear=lambda unused_terrain, unused_obstacles,
+                    start, unused_end: calls.append(start) or
+                    not (name == 'one_way' and len(calls) == 2),
+                    water_depth=lambda unused_x, unused_z, unused_ground:
+                    1.0 if name == 'water' else 0.0,
+                    blocked=lambda unused_x, unused_z, unused_ground,
+                    unused_margin: name == 'blocked',
+                    edge_clear=lambda unused_x, unused_z, unused_ground:
+                    name != 'edge',
+                    ground_height=lambda x, unused_z:
+                    x * 10.0 if name == 'grade' else 10.0,
+                )
+
+                with self.assertRaises(space.UnsafeBakeInputError):
+                    baker.install_lakeville_narrow_corner_link(
+                        graph, terrain, obstacles, legacy)
+
+                self.assertEqual([0, 0, 0, 0], graph['links'])
+
+    @staticmethod
+    def _reviewed_adapter_dependencies(height=None, water=None, blocked=None,
+                                       edge=None, surface=None,
+                                       segment_clear=None):
+        class Terrain(object):
+            def height(self, x, z):
+                return height(x, z) if height is not None else 0.0
+
+            def water_depth(self, x, z, ground):
+                return water(x, z, ground) if water is not None else 0.0
+
+        class Obstacles(object):
+            def blocked(self, x, z, ground, margin):
+                return (blocked(x, z, ground, margin)
+                        if blocked is not None else False)
+
+            def surface_height(self, x, z):
+                return surface(x, z) if surface is not None else None
+
+        terrain = Terrain()
+        obstacles = Obstacles()
+        legacy = types.SimpleNamespace(
+            HAZARD_WATER=1,
+            HAZARD_EDGE=2,
+            HAZARD_SHALLOW_WATER=4,
+            SHALLOW_WATER_THRESHOLD=0.15,
+            WATER_DEPTH_LIMIT=0.9,
+            VEHICLE_HALF_WIDTH=2.15,
+            BRIDGE_OBSTACLE_MARGIN=1.0,
+            MAX_GRADE_UP=0.38,
+            MAX_GRADE_DOWN=0.38,
+            _ground_height=lambda current_terrain, current_obstacles, x, z:
+            max(value for value in (
+                current_terrain.height(x, z),
+                current_obstacles.surface_height(x, z))
+                if value is not None),
+            _has_safe_edge_clearance=lambda unused_terrain, unused_obstacles,
+            x, z, ground: edge(x, z, ground) if edge is not None else True,
+            _segment_clear=segment_clear or (
+                lambda unused_terrain, unused_obstacles,
+                unused_start, unused_end: True),
+        )
+        return terrain, obstacles, legacy
+
+    @staticmethod
+    def _reviewed_adapter_graph(origin=(0.0, 0.0), width=3, height=3):
+        return {
+            'origin': list(origin),
+            'cell_size': 4.0,
+            'width': width,
+            'height': height,
+            'directions': [
+                [-1, -1], [0, -1], [1, -1], [-1, 0],
+                [1, 0], [-1, 1], [0, 1], [1, 1],
+            ],
+            'heights_mm': [None] * (width * height),
+            'hazards': [0] * (width * height),
+            'links': [0] * (width * height),
+        }
+
+    @staticmethod
+    def _adapter_index(graph, point):
+        column = int(round(
+            (point[0] - graph['origin'][0]) / graph['cell_size']))
+        row = int(round(
+            (point[1] - graph['origin'][1]) / graph['cell_size']))
+        return row * graph['width'] + column
+
+    def test_reviewed_narrow_corner_adds_only_the_safe_diagonal(self):
+        graph = self._reviewed_adapter_graph(width=2, height=2)
+        graph['heights_mm'][self._adapter_index(graph, (0.0, 0.0))] = 0
+        graph['heights_mm'][self._adapter_index(graph, (4.0, 4.0))] = 0
+        for point in ((4.0, 0.0), (0.0, 4.0)):
+            graph['hazards'][self._adapter_index(graph, point)] = 2
+        contract = {
+            'id': 'test_safe_diagonal',
+            'points': ((0.0, 0.0), (4.0, 4.0)),
+            'side_states': {(4.0, 0.0): 2, (0.0, 4.0): 2},
+        }
+        terrain, obstacles, legacy = self._reviewed_adapter_dependencies()
+
+        record = baker.install_reviewed_narrow_corner_link(
+            graph, terrain, obstacles, legacy, contract)
+
+        self.assertEqual('safe_diagonal', record['kind'])
+        self.assertEqual(2, record['directed_links_added'])
+        self.assertEqual([1 << 7, 0, 0, 1], graph['links'])
+        self.assertEqual([0, 2, 2, 0], graph['hazards'])
+        self.assertEqual([0, None, None, 0], graph['heights_mm'])
+
+    def test_reviewed_narrow_corner_rejects_side_cell_drift_before_mutation(self):
+        graph = self._reviewed_adapter_graph(width=2, height=2)
+        graph['heights_mm'][0] = 0
+        graph['heights_mm'][3] = 0
+        graph['hazards'][1] = 2
+        graph['hazards'][2] = 3
+        original = copy.deepcopy(graph)
+        terrain, obstacles, legacy = self._reviewed_adapter_dependencies()
+        contract = {
+            'id': 'test_safe_diagonal',
+            'points': ((0.0, 0.0), (4.0, 4.0)),
+            'side_states': {(4.0, 0.0): 2, (0.0, 4.0): 2},
+        }
+
+        with self.assertRaises(space.UnsafeBakeInputError):
+            baker.install_reviewed_narrow_corner_link(
+                graph, terrain, obstacles, legacy, contract)
+
+        self.assertEqual(original, graph)
+
+    def test_reviewed_terrain_path_revives_only_listed_edge_cell(self):
+        graph = self._reviewed_adapter_graph(width=3, height=2)
+        points = ((0.0, 4.0), (4.0, 4.0), (8.0, 4.0))
+        graph['heights_mm'][self._adapter_index(graph, points[0])] = 0
+        graph['heights_mm'][self._adapter_index(graph, points[2])] = 0
+        middle = self._adapter_index(graph, points[1])
+        graph['hazards'][middle] = 2
+        side = self._adapter_index(graph, (4.0, 0.0))
+        graph['hazards'][side] = 2
+        contract = {
+            'id': 'test_edge_path',
+            'kind': 'edge_erosion',
+            'points': points,
+            'missing_states': {(4.0, 4.0): 2},
+            'side_states': {(4.0, 0.0): 2},
+            'maximum_water_depth': 0.9,
+        }
+        terrain, obstacles, legacy = self._reviewed_adapter_dependencies(
+            edge=lambda x, unused_z, unused_ground: x != 4.0)
+
+        record = baker.install_reviewed_terrain_path(
+            graph, terrain, obstacles, legacy, contract)
+
+        self.assertEqual('edge_erosion', record['kind'])
+        self.assertEqual(1, record['revived_nodes'])
+        self.assertEqual(4, record['directed_links_added'])
+        self.assertEqual(0, graph['heights_mm'][middle])
+        self.assertEqual(0, graph['hazards'][middle])
+        self.assertIsNone(graph['heights_mm'][side])
+        self.assertEqual(2, graph['hazards'][side])
+        east = 1 << graph['directions'].index([1, 0])
+        west = 1 << graph['directions'].index([-1, 0])
+        self.assertTrue(graph['links'][self._adapter_index(
+            graph, points[0])] & east)
+        self.assertTrue(graph['links'][middle] & east)
+        self.assertTrue(graph['links'][middle] & west)
+        self.assertTrue(graph['links'][self._adapter_index(
+            graph, points[2])] & west)
+
+    def test_reviewed_ford_marks_revived_water_as_shallow_only(self):
+        graph = self._reviewed_adapter_graph(width=3, height=2)
+        points = ((0.0, 4.0), (4.0, 4.0), (8.0, 4.0))
+        graph['heights_mm'][self._adapter_index(graph, points[0])] = 0
+        graph['heights_mm'][self._adapter_index(graph, points[2])] = 0
+        middle = self._adapter_index(graph, points[1])
+        graph['hazards'][middle] = 3
+        side = self._adapter_index(graph, (4.0, 0.0))
+        graph['hazards'][side] = 1
+        contract = {
+            'id': 'test_ford',
+            'kind': 'ford',
+            'points': points,
+            'missing_states': {(4.0, 4.0): 3},
+            'side_states': {(4.0, 0.0): 1},
+            'maximum_water_depth': 1.1,
+        }
+        terrain, obstacles, legacy = self._reviewed_adapter_dependencies(
+            water=lambda x, unused_z, unused_ground:
+            1.0 if 2.0 <= x <= 6.0 else 0.0,
+            edge=lambda x, unused_z, unused_ground:
+            not (2.0 <= x <= 6.0))
+
+        record = baker.install_reviewed_terrain_path(
+            graph, terrain, obstacles, legacy, contract)
+
+        self.assertEqual(1.0, record['maximum_water_depth'])
+        self.assertEqual(4, graph['hazards'][middle])
+        self.assertIsNone(graph['heights_mm'][side])
+        self.assertEqual(1, graph['hazards'][side])
+
+    def test_reviewed_terrain_path_rejects_drift_before_mutation(self):
+        contract = {
+            'id': 'test_edge_path',
+            'kind': 'edge_erosion',
+            'points': ((0.0, 4.0), (4.0, 4.0), (8.0, 4.0)),
+            'missing_states': {(4.0, 4.0): 2},
+            'side_states': {(4.0, 0.0): 2},
+            'maximum_water_depth': 0.9,
+        }
+        for name in ('water', 'blocked', 'grade', 'side'):
+            with self.subTest(name=name):
+                graph = self._reviewed_adapter_graph(width=3, height=2)
+                graph['heights_mm'][self._adapter_index(
+                    graph, (0.0, 4.0))] = 0
+                graph['heights_mm'][self._adapter_index(
+                    graph, (8.0, 4.0))] = 0
+                graph['hazards'][self._adapter_index(
+                    graph, (4.0, 4.0))] = 2
+                graph['hazards'][self._adapter_index(
+                    graph, (4.0, 0.0))] = (3 if name == 'side' else 2)
+                original = copy.deepcopy(graph)
+                terrain, obstacles, legacy = self._reviewed_adapter_dependencies(
+                    height=(lambda x, unused_z: x)
+                    if name == 'grade' else None,
+                    water=(lambda unused_x, unused_z, unused_ground: 1.0)
+                    if name == 'water' else None,
+                    blocked=(lambda unused_x, unused_z, unused_ground,
+                             unused_margin: True)
+                    if name == 'blocked' else None,
+                    edge=lambda unused_x, unused_z, unused_ground: False,
+                )
+
+                with self.assertRaises(space.UnsafeBakeInputError):
+                    baker.install_reviewed_terrain_path(
+                        graph, terrain, obstacles, legacy, contract)
+
+                self.assertEqual(original, graph)
+
+    def test_munchen_underpass_replaces_only_the_centre_bridge_layer(self):
+        graph = self._reviewed_adapter_graph(
+            origin=(-202.0, 70.0), width=4, height=9)
+        path = (
+            (-198.0, 74.0), (-194.0, 78.0), (-194.0, 82.0),
+            (-194.0, 86.0), (-194.0, 90.0), (-194.0, 94.0),
+            (-190.0, 98.0), (-190.0, 102.0),
+        )
+        for point in (path[0], path[-2], path[-1]):
+            graph['heights_mm'][self._adapter_index(graph, point)] = 0
+        centre_decks = ((-194.0, 82.0), (-194.0, 86.0),
+                        (-194.0, 90.0))
+        side_decks = (
+            (-198.0, 82.0), (-190.0, 82.0),
+            (-198.0, 86.0), (-190.0, 86.0),
+            (-198.0, 90.0), (-190.0, 90.0),
+        )
+        east = 1 << graph['directions'].index([1, 0])
+        west = 1 << graph['directions'].index([-1, 0])
+        for point in centre_decks:
+            graph['heights_mm'][self._adapter_index(graph, point)] = 8500
+        for point in side_decks:
+            index = self._adapter_index(graph, point)
+            graph['heights_mm'][index] = 8500
+            graph['links'][index] = east if point[0] == -198.0 else west
+        terrain, obstacles, legacy = self._reviewed_adapter_dependencies(
+            surface=lambda x, z: 8.5
+            if 80.0 <= z <= 92.0 and -198.0 <= x <= -190.0 else None)
+
+        record = baker.install_munchen_underpass(
+            graph, terrain, obstacles, legacy)
+
+        self.assertEqual('underpass_layer', record['kind'])
+        self.assertEqual(3, record['replaced_upper_layer_nodes'])
+        self.assertEqual(2, record['revived_nodes'])
+        self.assertEqual(8.5, record['minimum_overhead_clearance'])
+        for point in centre_decks + ((-194.0, 78.0), (-194.0, 94.0)):
+            self.assertEqual(0, graph['heights_mm'][
+                self._adapter_index(graph, point)])
+        for point in side_decks:
+            index = self._adapter_index(graph, point)
+            self.assertEqual(8500, graph['heights_mm'][index])
+            self.assertEqual(0, graph['links'][index] &
+                             (east if point[0] == -198.0 else west))
+        for point in ((-198.0, 78.0), (-190.0, 78.0),
+                      (-198.0, 94.0), (-190.0, 94.0)):
+            self.assertIsNone(graph['heights_mm'][
+                self._adapter_index(graph, point)])
+
+    def test_reviewed_adapter_inventory_stays_map_local(self):
+        self.assertEqual(
+            {'84_winter', '92_stalingrad'},
+            set(baker._REVIEWED_NARROW_CORNER_CONTRACTS))
+        self.assertEqual(
+            {'29_el_hallouf', '45_north_america',
+             '59_asia_great_wall'},
+            set(baker._REVIEWED_TERRAIN_PATH_CONTRACTS))
+        highway = baker._REVIEWED_TERRAIN_PATH_CONTRACTS[
+            '45_north_america']
+        self.assertEqual([1.01, 1.25],
+                         [item['maximum_water_depth'] for item in highway])
 
     def test_stock_spawn_ingress_is_downhill_and_one_way(self):
         directions = ((-1, -1), (0, -1), (1, -1), (-1, 0),

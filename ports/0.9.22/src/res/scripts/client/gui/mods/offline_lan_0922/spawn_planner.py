@@ -50,6 +50,22 @@ class SpawnPlanner(object):
                     (self.map_name, team, slot)) for value in point))
             self.formations[team] = tuple(values)
         self._validate_separation()
+        objective_bases = navigation_graph.get('objective_bases')
+        if (not isinstance(objective_bases, (list, tuple)) or
+                len(objective_bases) != 2):
+            raise ValueError(
+                'objective bases are missing for map %s' % self.map_name)
+        self.bases = {}
+        for team, point in enumerate(objective_bases, 1):
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                raise ValueError(
+                    'map %s team %d objective base is invalid' %
+                    (self.map_name, team))
+            self.bases[team] = ((
+                _finite(point[0], 'map %s team %d objective base x' %
+                        (self.map_name, team)),
+                _finite(point[1], 'map %s team %d objective base z' %
+                        (self.map_name, team))),)
 
     def _validate_separation(self):
         all_slots = []
