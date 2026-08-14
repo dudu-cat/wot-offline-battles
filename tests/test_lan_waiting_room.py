@@ -397,7 +397,15 @@ class WaitingRoomTest(unittest.TestCase):
             "visible": True, "x": 17.0, "y": 2.0, "z": -31.0,
             "health": 880, "max_health": 880, "class_tag": "mediumTank",
         }]})
-        time.sleep(0.05)
+        accepted = 0
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            with self.state.lock:
+                accepted = self.state.bot_observation_stats["accepted"]
+            if accepted > 0:
+                break
+            time.sleep(0.02)
+        self.assertGreater(accepted, 0)
         self.state.tick_once(0.05)
         authority_snapshot = first.receive_type("snapshot")
         replica_snapshot = second.receive_type("snapshot")
