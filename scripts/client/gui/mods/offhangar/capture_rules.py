@@ -11,6 +11,8 @@ def new_state():
 		'points': 0,
 		'stopped': False,
 		'contributors': {},
+		'active_contributors': [],
+		'invaders': 0,
 		'cursor': 0,
 	}
 
@@ -49,6 +51,8 @@ def advance(state, invader_ids, defenders_present=False):
 		state = new_state()
 	contributors = _contributors(state)
 	active = _ordered_unique(invader_ids)
+	state['active_contributors'] = list(active)
+	state['invaders'] = len(active)
 	active_set = set(active)
 	dropped = {}
 	for vehicle_id in list(contributors.keys()):
@@ -61,7 +65,10 @@ def advance(state, invader_ids, defenders_present=False):
 		contributors.setdefault(vehicle_id, 0)
 
 	old_points = _refresh_points(state)
-	state['stopped'] = bool(active and defenders_present)
+	# Standard 0.8.2 CTF control points declare ownerStopsCapturing=false.
+	# An owner merely standing in its own circle does not pause capture; real
+	# damage resets only the damaged invader's contribution via drop_vehicle().
+	state['stopped'] = False
 	gained = {}
 	if active and not state['stopped'] and old_points < MAX_CAPTURE_POINTS:
 		cursor = int(state.get('cursor', 0) or 0) % len(active)
@@ -91,6 +98,10 @@ def drop_vehicle(state, vehicle_id):
 		return 0
 	contributors = _contributors(state)
 	dropped = max(0, int(contributors.pop(vehicle_id, 0) or 0))
+	active = [value for value in state.get('active_contributors') or ()
+		if value != vehicle_id]
+	state['active_contributors'] = active
+	state['invaders'] = len(active)
 	_refresh_points(state)
 	if not contributors:
 		state['stopped'] = False

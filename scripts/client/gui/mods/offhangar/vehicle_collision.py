@@ -11,27 +11,34 @@ import math
 DEFAULT_SHAPE = (1.5, 3.5, -0.8, 2.0)
 _SHAPE_CACHE = {}
 SPATIAL_CELL_SIZE = 24.0
+TERRAIN_PROFILE_MAXIMUM_GRADIENT = 1.28
 
 
-def drivable_rising_profile(heights, segment_length, maximum_gradient=1.28,
-		minimum_rise=0.15):
-	"""Return whether ground samples describe a gradual uphill.
+def drivable_rising_profile(heights, segment_length,
+		maximum_gradient=TERRAIN_PROFILE_MAXIMUM_GRADIENT,
+		minimum_rise=0.15, allow_flat=False):
+	"""Return whether ground samples describe a gradual terrain profile.
 
-	A flat profile is deliberately not a hill: callers use this result to
-	distinguish climbable terrain from a solid obstacle intersecting a horizontal
-	hull sweep.  Rejecting one abrupt upward step keeps rocks, walls and wagon
-	decks in the solid-collision path.
+	By default a flat profile is deliberately not a hill: generic callers use
+	this result to distinguish climbable terrain from a solid obstacle
+	intersecting a horizontal hull sweep. A caller that has separately proved the
+	whole segment contains terrain and no non-terrain geometry may set
+	``allow_flat``. Smooth descents and rounded crests are ground too. Rejecting
+	an abrupt step in either direction keeps rocks, walls and wagon decks in the
+	solid-collision path.
 	"""
 	try:
 		values = [float(value) for value in heights]
 		if len(values) < 2:
 			return False
 		segment = max(0.001, float(segment_length))
-		if values[-1] - values[0] <= max(0.0, float(minimum_rise)):
+		if (not allow_flat and
+				max(values) - min(values) <=
+				max(0.0, float(minimum_rise))):
 			return False
 		maximum_step = segment * max(0.0, float(maximum_gradient))
 		for index in range(1, len(values)):
-			if values[index] - values[index - 1] > maximum_step:
+			if abs(values[index] - values[index - 1]) > maximum_step:
 				return False
 		return True
 	except Exception:

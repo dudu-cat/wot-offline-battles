@@ -9,6 +9,9 @@ steering, so it is safe to exercise outside the BigWorld client.
 import math
 
 
+STEERING_SCALE_RADIANS = 0.58
+
+
 def _angle_delta(target, current):
 	value = float(target) - float(current)
 	while value > math.pi:
@@ -16,6 +19,17 @@ def _angle_delta(target, current):
 	while value < -math.pi:
 		value += math.pi * 2.0
 	return value
+
+
+def steering_turn(target_yaw, current_yaw):
+	"""Return the continuous forward steering request for a target heading.
+
+	Planning may be budgeted across bots, but this inexpensive feedback term must
+	be recomputed from the latest native chassis yaw every rendered frame. Reusing
+	an old turn value makes the digital track input overshoot and alternate sides.
+	"""
+	delta = _angle_delta(target_yaw, current_yaw)
+	return max(-1.0, min(1.0, delta / STEERING_SCALE_RADIANS))
 
 
 def _yaw_to(first, second):
@@ -27,6 +41,133 @@ def _distance(first, second):
 	dx = float(first[0]) - float(second[0])
 	dz = float(first[2]) - float(second[2])
 	return math.sqrt(dx * dx + dz * dz)
+
+
+def _traffic_number(value, default=0.0):
+	try:
+		value = float(value)
+	except (TypeError, ValueError):
+		return float(default)
+	if value != value or value == float('inf') or value == float('-inf'):
+		return float(default)
+	return value
+
+
+def _traffic_position(value):
+	if not isinstance(value, dict):
+		return (0.0, 0.0, 0.0)
+	position = value.get('position') or value.get('pos')
+	try:
+		return (float(position[0]), float(position[1]), float(position[2]))
+	except (TypeError, ValueError, IndexError):
+		return (0.0, 0.0, 0.0)
+
+
+def traffic_identity(entity_id, network_bot_id=None):
+	"""Use the server bot id for LAN-stable traffic right of way."""
+	if network_bot_id is not None:
+		try:
+			return int(network_bot_id)
+		except (TypeError, ValueError):
+			pass
+	try:
+		return int(entity_id)
+	except (TypeError, ValueError):
+		return 0
+
+
+def friendly_traffic_throttle(source, command, neighbours):
+	"""Return a deterministic throttle cap for nearby friendly traffic.
+
+	A follower always respects a vehicle ahead in the same lane. At a crossing
+	or merge the lower bot id has right of way, while every bot yields to a human
+	vehicle. This breaks symmetric stop/turn/reverse loops without changing the
+	chosen route or bypassing physical tank collision.
+	"""
+	throttle = max(-1.0, min(1.0,
+		_traffic_number((command or {}).get('throttle'))))
+	if throttle <= 0.01 or not isinstance(source, dict):
+		return throttle, False
+	position = _traffic_position(source)
+	source_team = int(_traffic_number(source.get('team')))
+	if source_team not in (1, 2):
+		return throttle, False
+	yaw = _traffic_number(source.get('yaw'))
+	own_speed = abs(_traffic_number(source.get('speed')))
+	own_length = max(0.5, _traffic_number(source.get('half_length'), 3.5))
+	own_width = max(0.3, _traffic_number(source.get('half_width'), 1.7))
+	sine, cosine = math.sin(yaw), math.cos(yaw)
+	target_yaw = _traffic_number((command or {}).get('target_yaw'), yaw)
+	target_sine, target_cosine = math.sin(target_yaw), math.cos(target_yaw)
+	nearest = None
+	for raw in neighbours or ():
+		if not isinstance(raw, dict):
+			continue
+		if int(_traffic_number(raw.get('team'))) != source_team:
+			continue
+		other = raw.get('position') or raw.get('pos')
+		if other is None:
+			continue
+		try:
+			dx = float(other[0]) - position[0]
+			dz = float(other[2]) - position[2]
+			if abs(float(other[1]) - position[1]) > 5.0:
+				continue
+		except (TypeError, ValueError, IndexError):
+			continue
+		forward = dx * sine + dz * cosine
+		lateral = abs(dx * cosine - dz * sine)
+		if abs(_angle_delta(target_yaw, yaw)) > 0.20:
+			target_forward = dx * target_sine + dz * target_cosine
+			target_lateral = abs(dx * target_cosine - dz * target_sine)
+			if target_forward > 0.0 and target_lateral < lateral:
+				forward = target_forward
+				lateral = target_lateral
+		other_length = max(0.5,
+			_traffic_number(raw.get('half_length'), 3.5))
+		other_width = max(0.3,
+			_traffic_number(raw.get('half_width'), 1.7))
+		corridor_yaw = target_yaw if abs(
+			_angle_delta(target_yaw, yaw)) > 0.20 else yaw
+		other_yaw = _traffic_number(raw.get('yaw'), corridor_yaw)
+		same_direction = abs(
+			_angle_delta(other_yaw, corridor_yaw)) < 0.65
+		if (not same_direction and not bool(raw.get('is_human')) and
+				raw.get('id') is not None and source.get('id') is not None):
+			try:
+				if int(raw.get('id')) > int(source.get('id')):
+					continue
+			except (TypeError, ValueError):
+				pass
+		clearance = forward - own_length - other_length
+		if (forward <= 0.0 or clearance > 9.0 or
+				lateral > own_width + other_width + 0.75):
+			continue
+		other_velocity = raw.get('velocity') or raw.get('vel')
+		try:
+			other_vx = float(other_velocity[0])
+			other_vz = float(other_velocity[2])
+		except (TypeError, ValueError, IndexError):
+			other_vx = 0.0
+			other_vz = 0.0
+		corridor_sine = math.sin(corridor_yaw)
+		corridor_cosine = math.cos(corridor_yaw)
+		other_forward = max(0.0,
+			other_vx * corridor_sine + other_vz * corridor_cosine)
+		candidate = (clearance, other_forward)
+		if nearest is None or candidate[0] < nearest[0]:
+			nearest = candidate
+	if nearest is None:
+		return throttle, False
+	clearance, leader_speed = nearest
+	safe_clearance = max(1.5, own_speed)
+	if clearance <= safe_clearance:
+		return 0.0, True
+	if own_speed > leader_speed + 0.5:
+		limited = min(throttle, max(0.0, min(
+			1.0, (clearance - safe_clearance) / 4.0)))
+		return limited, limited + 1e-9 < throttle
+	return throttle, False
 
 
 def intercept_point(shooter_position, target_position, target_velocity,
@@ -294,6 +435,7 @@ class LocalDriver(object):
 	"""
 	_CANDIDATE_OFFSETS = (
 		0.0, 0.42, -0.42, 0.78, -0.78, 1.18, -1.18, 1.55, -1.55)
+	steering_turn = staticmethod(steering_turn)
 	gun_yaw_limits = staticmethod(gun_yaw_limits)
 	combat_hull_aim = staticmethod(combat_hull_aim)
 	gun_aligned = staticmethod(gun_aligned)
@@ -303,6 +445,8 @@ class LocalDriver(object):
 	ballistic_intercept = staticmethod(ballistic_intercept)
 	ballistic_position = staticmethod(ballistic_position)
 	ballistic_path = staticmethod(ballistic_path)
+	traffic_identity = staticmethod(traffic_identity)
+	friendly_traffic_throttle = staticmethod(friendly_traffic_throttle)
 
 	def __init__(self, stuck_seconds=1.8, recovery_seconds=0.85,
 			separation_radius=12.0, failure_ttl=2.0):
@@ -333,6 +477,15 @@ class LocalDriver(object):
 
 	def forget(self, bot_id):
 		self.states.pop(bot_id, None)
+
+	def wait_for_traffic(self, bot_id):
+		"""Keep an intentional right-of-way wait out of stuck recovery."""
+		state = self.states.get(bot_id)
+		if state is None:
+			return False
+		state['stuck_time'] = 0.0
+		state['recovery_time'] = 0.0
+		return True
 
 	def set_battle_active(self, active):
 		"""Reset stale steering history when the battle becomes active."""
@@ -727,7 +880,7 @@ class LocalDriver(object):
 			state['steering_age'] = 0.0
 
 		delta = _angle_delta(chosen_yaw, yaw)
-		turn = max(-1.0, min(1.0, delta / 0.58))
+		turn = steering_turn(chosen_yaw, yaw)
 		# This branch always commands forward drive. Signed speed can still be
 		# negative while braking a recovery or sliding downhill, but steering must
 		# retain its forward response until the command itself becomes reverse.

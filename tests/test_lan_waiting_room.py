@@ -87,6 +87,69 @@ class WaitingRoomTest(unittest.TestCase):
         self.clients.append(client)
         return client
 
+    def canonical_manifest_message(self, overrides=None):
+        overrides = overrides or {}
+        occupied = set(
+            (int(player.team), int(player.slot))
+            for player in self.state.players.values() if player.connected
+        )
+        bots = []
+        for identity in self.state.bot_roster:
+            if (identity["team"], identity["slot"]) in occupied:
+                continue
+            bot = {
+                "id": identity["id"], "team": identity["team"],
+                "slot": identity["slot"], "name": identity["name"],
+                "vehicle": "ussr:T-34", "max_health": 500, "health": 500,
+                "world_pose": True, "x": float(identity["slot"] * 12),
+                "y": 0.0, "z": -100.0 if identity["team"] == 1 else 100.0,
+                "yaw": 0.0 if identity["team"] == 1 else 3.14,
+            }
+            bot.update(overrides.get(identity["id"], {}))
+            bots.append(bot)
+        return {
+            "type": "bot_manifest", "bots": bots,
+            "round_id": self.state.round_id,
+            "manifest_nonce": "test-manifest-%d" % self.state.round_id,
+            "map_frame": {"origin": [0.0, 0.0], "axis": [0.0, 1.0]},
+        }
+
+    def test_manifest_result_acknowledges_only_the_installed_canonical_set(self):
+        first = self.connect("Alpha")
+        welcome = first.receive_type("welcome")
+        first.receive_type("roster")
+        first.send({"type": "start_battle"})
+        first.receive_type("battle_start")
+
+        request = self.canonical_manifest_message()
+        first.send(request)
+        result = first.receive_type("bot_manifest_result")
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(self.state.round_id, result["round_id"])
+        self.assertEqual(request["manifest_nonce"], result["manifest_nonce"])
+        self.assertEqual(
+            sorted(bot["id"] for bot in request["bots"]), result["bot_ids"])
+
+        event_count = len(self.state.pending_events)
+        first.send(request)
+        duplicate = first.receive_type("bot_manifest_result")
+        self.assertTrue(duplicate["accepted"])
+        self.assertEqual(event_count, len(self.state.pending_events))
+
+    def test_join_after_manifest_freeze_is_rejected_without_slot_overlap(self):
+        first = self.connect("Alpha")
+        first.receive_type("welcome")
+        first.receive_type("roster")
+        first.send({"type": "start_battle"})
+        first.receive_type("battle_start")
+        first.send(self.canonical_manifest_message())
+        self.assertTrue(first.receive_type("bot_manifest_result")["accepted"])
+
+        late = self.connect("TooLate")
+        error = late.receive_type("error")
+        self.assertEqual("battle_in_progress", error["code"])
+
     def test_server_snapshots_run_at_thirty_hz(self):
         self.assertEqual(30.0, TICK_HZ)
 
@@ -225,27 +288,35 @@ class WaitingRoomTest(unittest.TestCase):
         first.send({"type": "start_battle"})
         first.receive_type("battle_start")
         second.receive_type("battle_start")
-        bot = {
-            "id": 16, "team": 2, "slot": 0, "name": "ignored",
-            "vehicle": "germany:PzIV", "max_health": 500, "health": 500,
-            "x": 0.0, "y": 0.0, "z": 100.0, "yaw": 3.14,
-        }
+        target_id = 17
+        manifest = self.canonical_manifest_message({target_id: {
+            "vehicle": "germany:PzIV",
+        }})
+        bot = next(entry for entry in manifest["bots"]
+                   if entry["id"] == target_id)
 
-        second.send({"type": "bot_manifest", "bots": [bot]})
-        first.send({"type": "bot_manifest", "bots": [bot]})
-        time.sleep(0.05)
-        self.assertEqual(1, len(self.state.bot_manifest))
+        second.send(manifest)
+        replica_manifest_result = second.receive_type("bot_manifest_result")
+        self.assertFalse(replica_manifest_result["accepted"])
+        first.send(manifest)
+        authority_manifest_result = first.receive_type("bot_manifest_result")
+        self.assertTrue(authority_manifest_result["accepted"])
+        self.assertEqual(
+            manifest["manifest_nonce"],
+            authority_manifest_result["manifest_nonce"],
+        )
+        self.assertEqual(28, len(self.state.bot_manifest))
         first.send({"type": "bot_state", "bots": [dict(
             bot, x=4.0, z=92.0, aim_yaw=3.0, gun_pitch=-0.1,
             fire_seq=2, shell_index=1,
         )]})
         first.send({"type": "input", "fire_seq": 1, "shell_index": 0})
         first.send({
-            "type": "bot_hit_report", "target": 16, "shot_seq": 1,
+            "type": "bot_hit_report", "target": target_id, "shot_seq": 1,
             "damage": 125, "shot_result": 2, "x": 4.0, "y": 1.0, "z": 92.0,
         })
         bot_human_hit = {
-            "type": "bot_human_hit", "attacker_bot": 16,
+            "type": "bot_human_hit", "attacker_bot": target_id,
             "target": first_welcome["player_id"], "shot_seq": 2,
             "damage": 50, "shot_result": 2,
         }
@@ -274,12 +345,15 @@ class WaitingRoomTest(unittest.TestCase):
         snapshot = second.receive_type("snapshot")
         while snapshot.get("bot_state_revision", 0) <= 0:
             snapshot = second.receive_type("snapshot")
-        shared_bot = snapshot["bots"][0]
+        shared_bot = next(entry for entry in snapshot["bots"]
+                          if entry["id"] == target_id)
         self.assertEqual(first_welcome["player_id"], snapshot["bot_authority_id"])
         self.assertGreater(snapshot["bot_state_revision"], 0)
         self.assertEqual("replica", snapshot["bot_snapshot_mode"])
         self.assertNotIn("vehicle", shared_bot)
-        self.assertEqual("germany:PzIV", self.state.bot_manifest[0]["vehicle"])
+        self.assertEqual("germany:PzIV", next(
+            entry for entry in self.state.bot_manifest
+            if entry["id"] == target_id)["vehicle"])
         self.assertEqual(4.0, shared_bot["x"])
         self.assertEqual(375, shared_bot["health"])
         authority_player = next(
@@ -307,11 +381,16 @@ class WaitingRoomTest(unittest.TestCase):
         first.send({"type": "start_battle"})
         first.receive_type("battle_start")
         second.receive_type("battle_start")
-        bot = {"id": 16, "team": 2, "slot": 0, "vehicle": "germany:PzIV",
-               "max_health": 500, "health": 500, "x": 0.0, "z": 100.0,
-               "profile": {"class_tag": "mediumTank", "dominant_role": "support",
-                           "roles": ["support"], "desired_range": 220, "fire_range": 600}}
-        first.send({"type": "bot_manifest", "bots": [bot]})
+        target_bot_id = 17
+        manifest = self.canonical_manifest_message({target_bot_id: {
+            "vehicle": "germany:PzIV",
+            "profile": {"class_tag": "mediumTank", "dominant_role": "support",
+                        "roles": {"support": 1.0}, "desired_range": 220,
+                        "fire_range": 600},
+        }})
+        bot = next(entry for entry in manifest["bots"]
+                   if entry["id"] == target_bot_id)
+        first.send(manifest)
         first.send({"type": "bot_state", "bots": [bot]})
         first.send({"type": "bot_observation", "contacts": [{
             "observing_team": 2, "target_id": first_welcome["player_id"], "target_team": 1,
@@ -324,8 +403,9 @@ class WaitingRoomTest(unittest.TestCase):
         replica_snapshot = second.receive_type("snapshot")
         self.assertGreater(authority_snapshot["bot_order_revision"], 0)
         self.assertNotIn("bot_orders", replica_snapshot)
-        order = authority_snapshot["bot_orders"][0]
-        self.assertEqual(16, order["id"])
+        order = next(entry for entry in authority_snapshot["bot_orders"]
+                     if entry["id"] == target_bot_id)
+        self.assertEqual(target_bot_id, order["id"])
         self.assertEqual(first_welcome["player_id"], order["target_id"])
         self.assertEqual({"x": 17.0, "y": 2.0, "z": -31.0}, order["aim_position"])
         self.assertTrue(order["fire_allowed"])
@@ -362,7 +442,58 @@ class WaitingRoomTest(unittest.TestCase):
         self.assertEqual({}, self.state.bot_planner._cover_states)
         self.assertEqual({}, self.state.bot_planner._engage_anchors)
 
-    def test_late_player_joins_the_current_battle(self):
+    def test_failover_before_manifest_does_not_request_empty_handoff(self):
+        first = self.connect("Alpha")
+        first_welcome = first.receive_type("welcome")
+        first.receive_type("roster")
+        second = self.connect("Bravo")
+        second_welcome = second.receive_type("welcome")
+        first.receive_type("roster")
+        second.receive_type("roster")
+        first.send({"type": "start_battle"})
+        first.receive_type("battle_start")
+        second.receive_type("battle_start")
+
+        self.assertEqual([], self.state.bot_manifest)
+        self.assertEqual(
+            first_welcome["player_id"], self.state.bot_authority_id
+        )
+
+        first.close()
+        deadline = time.time() + 2
+        while (time.time() < deadline and
+               self.state.bot_authority_id != second_welcome["player_id"]):
+            time.sleep(0.02)
+
+        self.assertEqual(
+            second_welcome["player_id"], self.state.bot_authority_id
+        )
+        promoted = self.state.players[second_welcome["player_id"]]
+        self.assertFalse(promoted.bot_snapshot_full_pending)
+
+        self.state.tick_once(1.0 / TICK_HZ)
+        snapshot = second.receive_type("snapshot")
+        deadline = time.time() + 2
+        while (time.time() < deadline and
+               snapshot.get("bot_authority_id") != second_welcome["player_id"]):
+            snapshot = second.receive_type("snapshot")
+        self.assertEqual(
+            second_welcome["player_id"], snapshot["bot_authority_id"]
+        )
+        self.assertEqual("authority", snapshot["bot_snapshot_mode"])
+        self.assertEqual([], snapshot["bots"])
+
+        second.send(self.canonical_manifest_message())
+        deadline = time.time() + 2
+        while time.time() < deadline and not self.state.bot_manifest:
+            time.sleep(0.02)
+
+        expected_ids = [entry["id"] for entry in
+                        self.canonical_manifest_message()["bots"]]
+        self.assertEqual(expected_ids, [
+            bot["id"] for bot in self.state.bot_manifest])
+
+    def test_late_player_is_rejected_after_battle_start(self):
         first = self.connect("Alpha")
         first_welcome = first.receive_type("welcome")
         first.receive_type("roster")
@@ -370,18 +501,10 @@ class WaitingRoomTest(unittest.TestCase):
         first_start = first.receive_type("battle_start")
 
         late = self.connect("LateBravo")
-        late_welcome = late.receive_type("welcome")
-        late_start = late.receive_type("battle_start")
+        error = late.receive_type("error")
 
-        self.assertEqual("battle", late_welcome["phase"])
-        self.assertTrue(late_start["late_join"])
-        self.assertNotIn("bot_orders", late_start)
+        self.assertEqual("battle_in_progress", error["code"])
         self.assertEqual(first_welcome["map"], first_start["map"])
-        self.assertEqual(first_start["map"], late_start["map"])
-        self.assertEqual(2, len(late_start["players"]))
-        self.assertLessEqual(
-            late_start["timing"]["start_in_ms"], first_start["timing"]["start_in_ms"]
-        )
 
     def test_default_names_are_unique_and_vehicle_identity_is_preserved(self):
         first = self.connect("Defaultplayer")

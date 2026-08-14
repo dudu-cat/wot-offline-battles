@@ -117,6 +117,34 @@ class VehiclePoseTests(unittest.TestCase):
             self.vehicle.matrix.translation.z,
         ))
 
+    def test_silent_servo_add_no_op_stays_retryable_until_readback_succeeds(self):
+        model = self.vehicle._chassis_model
+        real_add_motor = model.addMotor
+        attempts = []
+
+        def silent_no_op(motor):
+            attempts.append(motor)
+
+        model.addMotor = silent_no_op
+        result = self.pose.commit_pose(
+            self.vehicle, (1.0, 2.0, 3.0), 0.2,
+            space_id=9, prime_model=True,
+        )
+
+        self.assertFalse(result)
+        self.assertEqual([], model.motors)
+        self.assertFalse(getattr(self.vehicle, "_servo_added", False))
+        self.assertIsNone(getattr(self.vehicle, "_pose_servo", None))
+        self.assertEqual(1, len(attempts))
+
+        model.addMotor = real_add_motor
+        self.assertTrue(self.pose.commit_pose(
+            self.vehicle, (4.0, 2.0, 6.0), 0.4,
+            space_id=9, prime_model=True,
+        ))
+        self.assertEqual(1, len(model.motors))
+        self.assertIs(self.vehicle._pose_servo, model.motors[0])
+        self.assertTrue(self.vehicle._servo_added)
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,227 @@ from debug_utils import LOG_DEBUG, LOG_CURRENT_EXCEPTION
 
 _g_destr_authority = None
 
+
+def _offh_native_mode_enabled():
+	"""Keep this experimental build on one native-only movement contract."""
+	generation = int(globals().get('g_offh_battle_gen', 0) or 0)
+	latch = globals().get('g_offh_native_mode_latch')
+	if (isinstance(latch, tuple) and len(latch) == 2 and
+			int(latch[0]) == generation):
+		return True
+	# Older user configs may still contain the former opt-out. Ignoring it is
+	# deliberate: this package must expose a native failure instead of silently
+	# selecting a second Python movement implementation.
+	globals()['g_offh_native_mode_latch'] = (generation, True)
+	return True
+
+
+def _offh_network_bot_role(player):
+	"""Return a fail-closed role for shared bot simulation ownership."""
+	try:
+		from gui.mods.offhangar._constants import CONFIG_OPTIONS
+		network_enabled = bool(CONFIG_OPTIONS.get('network_mode', False))
+	except Exception:
+		network_enabled = getattr(
+			player, '_offhangar_network_client', None) is not None
+	if (not network_enabled or bool(getattr(
+			player, '_offhangar_network_fallback_local', False))):
+		return 'local'
+	client = getattr(player, '_offhangar_network_client', None)
+	if (client is None or not getattr(client, 'running', False) or
+			not getattr(client, 'connected', False) or
+			not getattr(client, 'ready', False) or
+			getattr(client, 'phase', None) != 'battle'):
+		return 'unknown'
+	if bool(getattr(
+			player, '_offhangar_network_authority_demotion_pending', False)):
+		return 'unknown'
+	try:
+		authority_id = int(client.bot_authority_id)
+		player_id = int(client.player_id)
+	except Exception:
+		return 'unknown'
+	if authority_id != player_id:
+		return 'replica'
+	if bool(getattr(
+			player, '_offhangar_network_authority_handoff_pending', False)):
+		return 'handoff'
+	return 'authority'
+
+
+def _offh_native_eligible(mock):
+	return (mock is not None and not (
+		bool(getattr(mock, '_network_remote', False)) and
+		not bool(getattr(mock, '_network_shared_bot', False))))
+
+
+def _offh_native_movement_required(player, mock, role=None):
+	"""Latch strict native movement only after this process owns the bot."""
+	if mock is None:
+		return False
+	if bool(getattr(mock, '_offh_native_movement_required', False)):
+		return True
+	if not _offh_native_mode_enabled() or not _offh_native_eligible(mock):
+		return False
+	if role is None:
+		role = _offh_network_bot_role(player)
+	if role not in ('local', 'authority'):
+		return False
+	position = getattr(mock, 'position', None)
+	try:
+		fail_pose = (
+			float(position.x), float(position.y), float(position.z),
+			float(getattr(mock, 'yaw', 0.0) or 0.0),
+			float(getattr(mock, 'pitch', 0.0) or 0.0),
+			float(getattr(mock, 'roll', 0.0) or 0.0))
+		setattr(mock, '_offh_native_fail_pose', fail_pose)
+	except Exception:
+		fail_pose = None
+	# A relay proxy may have been created before this client was promoted. Remove
+	# its legacy static shape before attaching the native rigid body.
+	try:
+		mock._collision_obstacle = None
+	except Exception:
+		pass
+	setattr(mock, '_offh_native_movement_required', True)
+	return True
+
+
+def _offh_python_movement_allowed(player, mock, role=None):
+	"""The native experiment never authorizes legacy bot kinematics."""
+	return False
+
+
+def release_native_bots_for_replica(player):
+	"""Synchronously release native owners before one demotion snapshot applies."""
+	try:
+		from gui.mods.offhangar import native_bot_physics as manager
+	except Exception:
+		return False
+	try:
+		mocks = globals().get('G_MOCK_VEHICLES', {}) or {}
+		# Release every claimed body before refreshing any relay presentation.
+		# A partial pass must not re-fashion early bots and then fail on a later
+		# native owner while the authority role is still unchanged.
+		targets = list(mocks.values())
+		try:
+			targets.sort(key=lambda item: int(getattr(item, 'id', 0) or 0))
+		except Exception:
+			pass
+		for mock in targets:
+			if not getattr(mock, '_network_shared_bot', False):
+				continue
+			claimed = bool(manager.claims_movement(mock))
+			if claimed and manager.is_prepared(mock):
+				mock._offh_native_replica_refresh_pending = True
+			if claimed and not manager.stop_mock(mock, True):
+				return False
+		for mock in targets:
+			if not bool(getattr(
+					mock, '_offh_native_replica_refresh_pending', False)):
+				continue
+			refresh_fashion = getattr(mock, '_offh_attach_bot_fashion', None)
+			if callable(refresh_fashion):
+				refresh_fashion()
+			mock._offh_native_replica_refresh_pending = False
+		# The expanded range belongs to the simulation authority. Restore it only
+		# after every native owner has been released; a partial demotion must retain
+		# collision for the bodies that are still authoritative on this client.
+		streaming_bootstrap = getattr(
+			player, '_offh_spawn_streaming_bootstrap', None)
+		if (streaming_bootstrap is not None and
+				streaming_bootstrap.stop() is not True):
+			return False
+		player._offh_spawn_streaming_bootstrap = None
+		player._offh_spawn_streaming_monitor_active = False
+		player._offhangar_native_replica_released = True
+		return True
+	except Exception as error:
+		try:
+			from gui.mods.offhangar.logging import LOG_ERROR as _release_error
+			_release_error('NATIVE_BOT_PHYSICS demotion failed: %s' % str(error))
+		except Exception:
+			pass
+		return False
+
+
+def _offh_release_native_for_wreck(mock):
+	"""Prove a dead bot released its native owner before replacing its model."""
+	if mock is None:
+		return True
+	required = bool(getattr(mock, '_offh_native_movement_required', False))
+	try:
+		from gui.mods.offhangar import native_bot_physics as manager
+	except Exception:
+		return not required
+	try:
+		if not manager.claims_movement(mock):
+			return True
+		return bool(manager.stop_mock(mock, False))
+	except Exception:
+		return False
+
+
+def _offh_wreck_release_or_retry(mock, callback):
+	"""Retry a native owner release without ever attaching a second wreck root."""
+	if _offh_release_native_for_wreck(mock):
+		try:
+			mock._offh_wreck_release_attempts = 0
+		except Exception:
+			pass
+		return True
+	attempts = int(getattr(
+		mock, '_offh_wreck_release_attempts', 0) or 0) + 1
+	try:
+		mock._offh_wreck_release_attempts = attempts
+	except Exception:
+		pass
+	if attempts < 20:
+		_offh_battle_callback(0.1, callback)
+	elif not bool(getattr(mock, '_offh_wreck_release_error_logged', False)):
+		try:
+			mock._offh_wreck_release_error_logged = True
+		except Exception:
+			pass
+		try:
+			from gui.mods.offhangar.logging import LOG_ERROR as _wreck_error
+			_wreck_error('NATIVE_BOT_PHYSICS wreck swap blocked id=%s '
+				'reason=native owner release failed' % (
+					getattr(mock, 'id', '?'),))
+		except Exception:
+			pass
+	return False
+
+
+def _stop_dead_native_bot(mock, restore_filter=False):
+	"""Compatibility name for the central kill ownership barrier."""
+	return _offh_release_native_for_wreck(mock)
+
+
+def _offh_native_failed_pose(mock):
+	"""Return an immobile current pose when the native manager is unavailable."""
+	pose = getattr(mock, '_offh_native_fail_pose', None)
+	if isinstance(pose, tuple) and len(pose) >= 6:
+		return {
+			'position': pose[:3], 'yaw': pose[3], 'pitch': pose[4],
+			'roll': pose[5], 'velocity': 0.0, 'turn_velocity': 0.0,
+			'failed': True,
+		}
+	position = getattr(mock, 'position', None)
+	try:
+		point = (float(position.x), float(position.y), float(position.z))
+	except Exception:
+		return None
+	return {
+		'position': point,
+		'yaw': float(getattr(mock, 'yaw', 0.0) or 0.0),
+		'pitch': float(getattr(mock, 'pitch', 0.0) or 0.0),
+		'roll': float(getattr(mock, 'roll', 0.0) or 0.0),
+		'velocity': 0.0,
+		'turn_velocity': 0.0,
+		'failed': True,
+	}
+
 # Temporary low-overhead battle profiler.  It samples one render callback in
 # four, then writes one aggregate NOTE every five seconds.  Sampling matters on
 # this Python 2.6 client: timing every tiny operation would become part of the
@@ -219,7 +440,8 @@ def _offh_perf_frame_end(started, frame_dt, player):
 	callback_ms = 1000.0 * float(times.get('callback', 0.0) or 0.0) / samples
 	callback_share = 100.0 * callback_ms / max(0.1, frame_ms)
 	ordered = ('player_loop', 'player_setup', 'player_physics', 'player_aim',
-	           'player_pose', 'player_gun', 'player_effects',
+	           'player_pose', 'player_gun', 'player_gun_marker',
+	           'marker_vehicle_candidates', 'player_effects',
 	           'network_smoothing', 'ai_setup', 'contacts',
 	           'contact_build', 'contact_targets', 'contact_foliage', 'contact_cover',
 	           'contact_payload', 'contact_diagnostics', 'contact_publish',
@@ -235,7 +457,8 @@ def _offh_perf_frame_end(started, frame_dt, player):
 	           'drive_pitch_reuse', 'drive_pitch_exact', 'tilt_support_reuse',
 	           'bot_effects', 'kinematics', 'bot_audio',
 	           'nav_paused', 'tactic_route', 'tactic_hold', 'tactic_manoeuvre',
-	           'driver_drive', 'driver_avoid', 'driver_wait', 'driver_recovery',
+	           'driver_drive', 'driver_avoid', 'driver_wait',
+	           'driver_traffic_wait', 'driver_recovery',
 	           'driver_arrived',
 	           'traffic_snapshot', 'traffic_index', 'traffic_candidates',
 	           'pose_water', 'terrain_support', 'terrain_tilt',
@@ -391,15 +614,41 @@ def _add_model(m):
 	BigWorld.addModel(m)
 
 
-def _offh_assign_entity_model_root(entity, model):
+def _offh_assign_entity_model_root(entity, model, handoff=None):
 	"""Mirror VehicleAppearance's single root-motor handoff."""
-	entity.model = model
+	if handoff is None:
+		handoff = {}
 	try:
-		default_motor = model.motors[0]
-	except IndexError:
-		return model
-	model.delMotor(default_motor)
-	return model
+		if not bool(handoff.get('assigned', False)):
+			entity.model = model
+			if getattr(entity, 'model', None) is not model:
+				return False
+			handoff['assigned'] = True
+			motors = list(model.motors)
+			try:
+				handoff['default_motor'] = motors[0]
+			except IndexError:
+				handoff['complete'] = True
+				return True
+		default_motor = handoff.get('default_motor')
+		if default_motor is None:
+			return bool(handoff.get('complete', False))
+		motors = list(model.motors)
+		if not any(motor is default_motor for motor in motors):
+			if motors:
+				return False
+			handoff['default_motor'] = None
+			handoff['complete'] = True
+			return True
+		model.delMotor(default_motor)
+		motors = list(model.motors)
+		if (any(motor is default_motor for motor in motors) or motors):
+			return False
+		handoff['default_motor'] = None
+		handoff['complete'] = True
+		return True
+	except Exception:
+		return False
 
 
 def _offh_cursor_shown():
@@ -481,10 +730,10 @@ def _offh_resolve_hull_hit(shot, dist_m, all_hits):
 
 def _offh_postmortem_grading():
 	'''Retail's desaturated postmortem look, forced past the quality gate.
-	
+
 	g_postProcessing.enable('postmortem') on its own is not enough on this client.
 	Two separate faults:
-	
+
 	* Every _Effect is gated by __isSupported, which needs __curQuality to be IN
 	  the effect's qualityMask range - and _fromMaskToQualityRange only ever
 	  produces 0/1/2. python.log reports "The quality = 4 was selected", so
@@ -494,7 +743,7 @@ def _offh_postmortem_grading():
 	* enable() only APPENDS to __curEffects; WG relies on the OUTGOING control
 	  mode's disable() to clear it. We switch to arcade first, so without an
 	  explicit disable() the chain came out as arcade + postmortem mixed.
-	
+
 	The chains themselves are loaded at startup - WGPostProcessing.init() calls
 	effect.create() for every mode regardless of quality - so when the supported
 	path yields nothing, push the loaded chains straight through.'''
@@ -915,18 +1164,18 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.41-native-experimental (2026-08-12)'
+_OFFH_BUILD = '1.8.56-native-experimental (2026-08-14)'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
 	'''Play a hit sound on ONE shared carrier model.
-	
+
 	The two bot-shoots-player sites used to build a fresh fake model per impact,
 	add it to the world, hang a sound on it and hold both for 3 s. Under fire from
 	several bots that is an unbounded rate of new models and events, all parked at
 	the camera - which is why the trouble showed up around the tank and only when
 	a lot was going on at once.
-	
+
 	One carrier is enough: it only positions the sound. Repeats of the SAME sound
 	are rate-limited the way IngameSoundNotifications does it with
 	minTimeBetweenEvents - several hits in one frame are one bang, not five.'''
@@ -952,7 +1201,7 @@ def _offh_hit_sound(path, min_gap=0.10):
 
 def _offh_clamp_to_arena(pt):
 	'''Pull an aim point back inside the arena bounding box - the red border.
-	
+
 	The strategic camera can be scrolled well past the edge of the map, and the
 	strategic aim point followed it. A point out there is beyond any ballistic
 	solution, and wg_getShotAngles answers an unreachable point with the maximum
@@ -990,7 +1239,7 @@ def _offh_clamp_to_arena(pt):
 
 def _offh_water_depth(x, y, z):
 	'''Metres of water standing above the hull origin at (x, y, z); -1 when dry.
-	
+
 	ONE probe for the player and for every bot. The two used to carry separate
 	copies of this call with their own state machines around it, which is exactly
 	how their drowning behaviour drifted apart. Ray from 20 m above to 5 m below,
@@ -1030,6 +1279,75 @@ def _offh_ai_probe_reject(vehicle, reason):
 	except Exception:
 		pass
 	return False
+
+
+def _offh_native_hazard_escape_target(vehicle, distance=12.0):
+	'''Return a probed-driver target through the most recent safe pose.
+
+	The target extends past the safe anchor so LocalDriver cannot mistake a
+	one-frame boundary crossing for an arrived waypoint.  It is still only an
+	intent: the existing direction_clear callback owns terrain/water validation.
+	'''
+	try:
+		import math
+		cached = getattr(
+			vehicle, '_offh_native_hazard_escape_endpoint', None)
+		if isinstance(cached, (tuple, list)) and len(cached) >= 3:
+			return (float(cached[0]), float(cached[1]), float(cached[2]))
+		current_x = float(vehicle.position.x)
+		current_y = float(vehicle.position.y)
+		current_z = float(vehicle.position.z)
+		anchor = getattr(vehicle, '_offh_native_hazard_anchor', None)
+		dx = float(anchor[0]) - current_x if anchor is not None else 0.0
+		dz = float(anchor[2]) - current_z if anchor is not None else 0.0
+		length = math.sqrt(dx * dx + dz * dz)
+		if length < 0.10:
+			entry_yaw = float(getattr(
+				vehicle, '_offh_native_hazard_entry_yaw', vehicle.yaw) or 0.0)
+			dx = -math.sin(entry_yaw)
+			dz = -math.cos(entry_yaw)
+			length = 1.0
+		# Cross the last safe root by at least one hull-scale margin. Cache the
+		# endpoint for this recovery session: recomputing anchor-current after the
+		# hull crosses the anchor reverses the direction and causes bank chatter.
+		distance = max(6.0, float(distance), length + 6.0)
+		endpoint = (current_x + dx / length * distance,
+			float(anchor[1]) if anchor is not None else current_y,
+			current_z + dz / length * distance)
+		vehicle._offh_native_hazard_escape_endpoint = endpoint
+		return endpoint
+	except Exception:
+		return None
+
+
+def _offh_native_hazard_recovery_complete(vehicle, baked_safe,
+		water_safe, now, safe_seconds=0.25, endpoint_tolerance=2.0):
+	'''Require a baked-safe, dry pose at the fixed escape endpoint for a while.'''
+	try:
+		endpoint = getattr(
+			vehicle, '_offh_native_hazard_escape_endpoint', None)
+		if (not baked_safe or not water_safe or endpoint is None or
+				len(endpoint) < 3):
+			vehicle._offh_native_hazard_safe_since = None
+			return False
+		dx = float(vehicle.position.x) - float(endpoint[0])
+		dz = float(vehicle.position.z) - float(endpoint[2])
+		tolerance = max(0.25, float(endpoint_tolerance))
+		if dx * dx + dz * dz > tolerance * tolerance:
+			vehicle._offh_native_hazard_safe_since = None
+			return False
+		now = float(now)
+		since = getattr(vehicle, '_offh_native_hazard_safe_since', None)
+		if since is None or now < float(since):
+			vehicle._offh_native_hazard_safe_since = now
+			return False
+		return now - float(since) >= max(0.0, float(safe_seconds))
+	except Exception:
+		try:
+			vehicle._offh_native_hazard_safe_since = None
+		except Exception:
+			pass
+		return False
 
 
 def _offh_ai_pose_water_depth(vehicle, position=None, yaw=None):
@@ -1142,43 +1460,52 @@ def _offh_ai_baked_open_corridor(start, end):
 		return False
 
 
-def _offh_refresh_team_score(player):
-	'''Refresh the top HUD score from canonical alive state after any death.
+def _offh_team_score(player):
+	'''Return retail team frag totals as ``(our_score, enemy_score)``.'''
+	vehicles = getattr(getattr(player, 'arena', None), 'vehicles', {}) or {}
+	statistics = getattr(getattr(player, 'arena', None), 'statistics', {}) or {}
+	player_team = int(getattr(player, '_offhangar_team',
+	                          getattr(player, 'team', 1)) or 1)
+	team_frags = {1: 0, 2: 0}
+	for vehicle_id, info in vehicles.items():
+		if not isinstance(info, dict):
+			continue
+		team = int(info.get('team', 0) or 0)
+		if team not in (1, 2):
+			continue
+		stat = statistics.get(vehicle_id)
+		if isinstance(stat, dict):
+			frags = stat.get('frags', info.get('frags', 0))
+		else:
+			frags = info.get('frags', 0)
+		try:
+			team_frags[team] += int(frags or 0)
+		except (TypeError, ValueError):
+			pass
+	return team_frags.get(player_team, 0), team_frags.get(3 - player_team, 0)
 
-	The legacy frag counter is not updated by a bare arena.onVehicleKilled event.
-	Counting destroyed enemy/ally vehicles also handles drowning and network deaths,
-	which correctly change the team score even when no tank receives an individual
-	frag credit.
+
+def _offh_refresh_team_score(player):
+	'''Refresh the top HUD score from canonical individual frag totals.
+
+	Retail 0.8.2 sums each team's statistics.frags.  A hostile kill adds one,
+	a team kill subtracts one, and an uncredited death does not change this panel.
 	'''
 	try:
-		vehicles = getattr(getattr(player, 'arena', None), 'vehicles', {}) or {}
-		player_team = int(getattr(player, '_offhangar_team',
-		                          getattr(player, 'team', 1)) or 1)
-		allied_losses = 0
-		enemy_losses = 0
-		for info in vehicles.values():
-			if not isinstance(info, dict) or bool(info.get('isAlive', True)):
-				continue
-			team = int(info.get('team', 0) or 0)
-			if team not in (1, 2):
-				continue
-			if team == player_team:
-				allied_losses += 1
-			else:
-				enemy_losses += 1
+		our_score, enemy_score = _offh_team_score(player)
 		from gui import WindowsManager
 		battle = getattr(WindowsManager.g_windowsManager, 'battleWindow', None)
 		correlation = getattr(battle, '_Battle__fragCorrelation', None)
 		if correlation is not None:
-			correlation.updateFrags(enemy_losses, allied_losses)
-		return enemy_losses, allied_losses
+			correlation.updateFrags(our_score, enemy_score)
+		return our_score, enemy_score
 	except Exception:
 		return None
 
 
 def _offh_hp_display(mock):
 	'''HP to SHOW for a mock, which is not always its .health.
-	
+
 	Drowning is not damage: the crew drowns, the hull is untouched, so a drowned
 	tank keeps the HP it had when it went under. Its internal health still goes to
 	0 because isAlive, the team-wipe check, the repair gate and the wreck swap all
@@ -1382,7 +1709,7 @@ def _offh_he_radius(shot):
 
 def _offh_he_hull_armor(td):
 	'''Thinnest STRUCTURAL plate the hull carries, from the descriptor.
-	
+
 	Used when the blast ray finds no plate at all. Returning 0 there let the
 	blast through untouched; the thinnest plate is the attacker-friendly but
 	still bounded assumption - blast looks for the weak facing.'''
@@ -1404,7 +1731,7 @@ def _offh_he_hull_armor(td):
 
 def _offh_he_nominal_armor(all_hits, td=None):
 	'''Nominal thickness of the first STRUCTURAL plate on the ray.
-	
+
 	The HE reduction uses the plate's NOMINAL thickness, not the angled effective
 	value: a sloped plate does not shrug off blast the way it deflects a solid
 	shot. Spaced plates (vehicleDamageFactor 0 - tracks, external gear) are
@@ -1431,7 +1758,7 @@ def _offh_he_nominal_armor(all_hits, td=None):
 
 def _offh_he_damage(base_damage, armor_nominal, dist_frac=0.0):
 	'''Damage an HE burst does to a hull it did NOT get through.
-	
+
 	dist_frac is 0.0 for the vehicle actually struck and rises to 1.0 at the edge
 	of explosionRadius for everything else caught in the blast. Returns 0 when the
 	plate eats the whole thing - the normal outcome against heavy armour, and the
@@ -1748,6 +2075,65 @@ def _offh_live_projectile_target_positions(vehicles, shooter_id):
 	return positions
 
 
+def _offh_player_gun_marker_vehicle_candidates(start, velocity, gravity,
+		max_time, vehicles, shooter_id, profile_candidates=False):
+	"""Return the visible vehicles inside the preview trajectory's XZ envelope.
+
+	The direct-fire preview applies gravity only on Y, so its complete XZ path is
+	a straight segment.  A vehicle farther than the existing 3-D broadphase
+	radius from that segment cannot pass the per-chord broadphase either.  Keep a
+	fail-open fallback for an unexpected lateral gravity vector or mapping type.
+	"""
+	try:
+		from gui.mods.offhangar import projectile_runtime as _projectiles
+		start_t = _offh_vec3_tuple(start)
+		velocity_t = _offh_vec3_tuple(velocity)
+		gravity_t = _offh_vec3_tuple(gravity)
+		if abs(gravity_t[0]) > 0.000000001 or abs(gravity_t[2]) > 0.000000001:
+			return vehicles
+		end_x = start_t[0] + velocity_t[0] * float(max_time)
+		end_z = start_t[2] + velocity_t[2] * float(max_time)
+		span_x = end_x - start_t[0]
+		span_z = end_z - start_t[2]
+		span_sq = span_x * span_x + span_z * span_z
+		broadphase_sq = _projectiles.PROJECTILE_BROADPHASE_RADIUS ** 2
+		try:
+			candidates = vehicles.__class__()
+		except Exception:
+			return vehicles
+		shooter_id = int(shooter_id)
+		for entity_id, vehicle in (vehicles or {}).iteritems():
+			try:
+				if int(entity_id) == shooter_id:
+					continue
+				if (not getattr(vehicle, 'isAlive', False) or
+						(getattr(vehicle, 'health', 0) or 0) <= 0 or
+						not getattr(vehicle, '_spot_visible', True)):
+					continue
+				position = getattr(vehicle, 'position', None)
+				if position is None:
+					continue
+				offset_x = float(position[0]) - start_t[0]
+				offset_z = float(position[2]) - start_t[2]
+				fraction = 0.0
+				if span_sq > 0.000000000001:
+					fraction = max(0.0, min(1.0,
+						(offset_x * span_x + offset_z * span_z) / span_sq))
+				distance_x = offset_x - span_x * fraction
+				distance_z = offset_z - span_z * fraction
+				if (distance_x * distance_x + distance_z * distance_z <=
+						broadphase_sq + 0.000001):
+					candidates[entity_id] = vehicle
+			except Exception:
+				# A malformed mock cannot participate in the existing chord query.
+				continue
+		if profile_candidates:
+			_offh_perf_count('marker_vehicle_candidates', len(candidates))
+		return candidates
+	except Exception:
+		return vehicles
+
+
 def _offh_live_projectile_world_hit(start, end):
 	"""Return the nearest static/water hit and its local chord distance."""
 	try:
@@ -1773,6 +2159,178 @@ def _offh_live_projectile_world_hit(start, end):
 		return world_hit, float(world_distance)
 	except Exception:
 		return None, 999999.0
+
+
+def _offh_projectile_chord_impact(start, end, vehicles, shooter_id,
+		previous_positions=None, current_positions=None,
+		frame_start_fraction=0.0, frame_end_fraction=1.0,
+		visible_only=False):
+	"""Return the nearest static/water or vehicle hit on one shell chord.
+
+	This is the collision contract shared by the live projectile and the gun
+	marker preview.  The caller owns trajectory generation; this function owns
+	only nearest-hit ordering.  The shooter is excluded from dynamic collision,
+	but static and water collision start at the exact gun position, as in retail.
+	"""
+	try:
+		import Math
+		from gui.mods.offhangar import projectile_runtime as _projectiles
+		start_v = Math.Vector3(start[0], start[1], start[2])
+		end_v = Math.Vector3(end[0], end[1], end[2])
+		segment = end_v - start_v
+		segment_length = segment.length
+		if segment_length <= 0.0001:
+			return None
+		direction = Math.Vector3(segment)
+		direction.normalise()
+		world_hit, world_local = _offh_live_projectile_world_hit(
+			_offh_vec3_tuple(start_v), _offh_vec3_tuple(end_v))
+		world_fraction = 999999.0
+		if world_hit is not None:
+			world_fraction = min(1.0, max(0.0, world_local / segment_length))
+
+		previous_positions = previous_positions or {}
+		current_positions = current_positions or {}
+		broadphase_sq = _projectiles.PROJECTILE_BROADPHASE_RADIUS ** 2
+		vehicle_fraction = 999999.0
+		vehicle_hit = None
+		for entity_id, vehicle in (vehicles or {}).iteritems():
+			try:
+				entity_id = int(entity_id)
+				if entity_id == int(shooter_id):
+					continue
+				if (not getattr(vehicle, 'isAlive', False) or
+						(getattr(vehicle, 'health', 0) or 0) <= 0):
+					continue
+				if visible_only and not getattr(vehicle, '_spot_visible', True):
+					continue
+				current_position = current_positions.get(entity_id)
+				if current_position is None:
+					position = getattr(vehicle, 'position', None)
+					if position is None:
+						continue
+					current_position = _offh_vec3_tuple(position)
+				previous_position = previous_positions.get(
+					entity_id, current_position)
+				adjusted_start, adjusted_end = (
+					_projectiles.compensate_segment_for_moving_target(
+						_offh_vec3_tuple(start_v), _offh_vec3_tuple(end_v),
+						previous_position, current_position,
+						frame_start_fraction, frame_end_fraction))
+				if _projectiles.point_segment_distance_sq(
+						current_position, adjusted_start,
+						adjusted_end) > broadphase_sq:
+					continue
+				adjusted_start_v = Math.Vector3(*adjusted_start)
+				adjusted_end_v = Math.Vector3(*adjusted_end)
+				adjusted_length = (
+					adjusted_end_v - adjusted_start_v).length
+				if adjusted_length <= 0.0001:
+					continue
+				collision = vehicle.collideSegment(
+					adjusted_start_v, adjusted_end_v)
+				if collision is None:
+					continue
+				fraction = float(collision[0]) / adjusted_length
+				if 0.0 <= fraction <= 1.0 and fraction < vehicle_fraction:
+					vehicle_fraction = fraction
+					vehicle_hit = (
+						vehicle, collision, adjusted_start_v, adjusted_end_v)
+			except Exception:
+				continue
+
+		if vehicle_hit is not None and vehicle_fraction <= world_fraction:
+			return {
+				'kind': 'vehicle', 'vehicle': vehicle_hit[0],
+				'collision': vehicle_hit[1], 'world_hit': None,
+				'impact_point': start_v + direction.scale(
+					segment_length * vehicle_fraction),
+				'segment_start': vehicle_hit[2],
+				'segment_end': vehicle_hit[3],
+				'direction': direction, 'fraction': vehicle_fraction,
+				'local_distance': segment_length * vehicle_fraction,
+			}
+		if world_hit is not None and world_fraction <= 1.0:
+			return {
+				'kind': 'world', 'vehicle': None, 'collision': None,
+				'world_hit': world_hit, 'impact_point': world_hit[0],
+				'segment_start': start_v, 'segment_end': end_v,
+				'direction': direction, 'fraction': world_fraction,
+				'local_distance': segment_length * world_fraction,
+			}
+	except Exception:
+		pass
+	return None
+
+
+def _offh_player_gun_marker_impact(start, velocity, gravity, vehicles,
+		shooter_id, player_team, max_time, max_distance,
+		profile_candidates=False):
+	"""Preview the same gravity trajectory and first hit as the live shell."""
+	try:
+		import Math
+		from gui.mods.offhangar import projectile_runtime as _projectiles
+		start_t = _offh_vec3_tuple(start)
+		velocity_t = _offh_vec3_tuple(velocity)
+		gravity_t = _offh_vec3_tuple(gravity)
+		max_time = max(0.05, min(20.0, float(max_time or 0.05)))
+		max_distance = max(1.0, float(max_distance or 720.0))
+		candidate_vehicles = _offh_player_gun_marker_vehicle_candidates(
+			start_t, velocity_t, gravity_t, max_time, vehicles, shooter_id,
+			profile_candidates)
+		positions = _offh_live_projectile_target_positions(
+			candidate_vehicles, shooter_id)
+		origin = Math.Vector3(*start_t)
+		travelled = 0.0
+		last_point = Math.Vector3(origin)
+		last_direction = Math.Vector3(*velocity_t)
+		if last_direction.length > 0.0001:
+			last_direction.normalise()
+		else:
+			last_direction = Math.Vector3(0.0, 0.0, 1.0)
+		for chord_start_t, chord_end_t in _projectiles.substep_boundaries(
+				0.0, max_time, _projectiles.PROJECTILE_MAX_SUBSTEP_SECONDS):
+			first = _projectiles.trajectory_position(
+				start_t, velocity_t, gravity_t, chord_start_t)
+			second = _projectiles.trajectory_position(
+				start_t, velocity_t, gravity_t, chord_end_t)
+			first_v = Math.Vector3(*first)
+			second_v = Math.Vector3(*second)
+			segment = second_v - first_v
+			segment_length = segment.length
+			if segment_length <= 0.0001:
+				continue
+			impact = _offh_projectile_chord_impact(
+				first, second, candidate_vehicles, shooter_id,
+				positions, positions, 0.0, 1.0, True)
+			last_point = second_v
+			last_direction = Math.Vector3(second_v - first_v)
+			last_direction.normalise()
+			if impact is not None:
+				coll_data = None
+				if impact['kind'] == 'vehicle':
+					from gui.mods.offhangar import pen_indicator as _peni
+					coll_data = _peni.coll_data_from_collision(
+						impact['vehicle'], impact['collision'],
+						impact['impact_point'], player_team)
+				return (
+					impact['impact_point'], impact['direction'],
+					travelled + impact['local_distance'], coll_data)
+			travelled += segment_length
+		# Retail checks every collision chord until the arena boundary, then
+		# clamps only a no-hit endpoint to maxDistance. Clipping every chord at
+		# that radius can hide a real first collision which the live shell sees.
+		no_hit_offset = last_point - origin
+		no_hit_distance = no_hit_offset.length
+		if no_hit_distance > max_distance:
+			no_hit_offset.normalise()
+			last_direction = Math.Vector3(no_hit_offset)
+			last_point = origin + no_hit_offset.scale(max_distance)
+			no_hit_distance = max_distance
+		return (
+			last_point, last_direction, no_hit_distance, None)
+	except Exception:
+		return None
 
 
 def _offh_stop_live_projectile(shot_id, impact_point):
@@ -1821,7 +2379,6 @@ def _offh_live_projectile_advance(runtime_id, state, elapsed):
 			vehicles, state['shooter_id'])
 		frame_span = max(0.00001, elapsed - last_t)
 		travelled = float(state.get('travelled', 0.0) or 0.0)
-		broadphase_sq = _projectiles.PROJECTILE_BROADPHASE_RADIUS ** 2
 
 		for chord_start_t, chord_end_t in _projectiles.substep_boundaries(
 				last_t, elapsed, _projectiles.PROJECTILE_MAX_SUBSTEP_SECONDS):
@@ -1836,65 +2393,15 @@ def _offh_live_projectile_advance(runtime_id, state, elapsed):
 			actual_direction = Math.Vector3(actual_segment)
 			actual_direction.normalise()
 
-			# The stock mover ignores the first three metres so the muzzle does not
-			# collide with its own gun/building overlap.  Match that rule here.
-			world_start = start
-			world_skip = 0.0
-			if travelled < 3.0:
-				world_skip = min(actual_length, 3.0 - travelled)
-				world_start_v = start_v + actual_direction.scale(world_skip)
-				world_start = _offh_vec3_tuple(world_start_v)
-			world_hit, world_local = _offh_live_projectile_world_hit(world_start, end)
-			world_fraction = 999999.0
-			if world_hit is not None:
-				world_fraction = min(1.0, max(0.0,
-					(world_skip + world_local) / actual_length))
-
-			vehicle_fraction = 999999.0
-			vehicle_hit = None
 			frame_start_fraction = (chord_start_t - last_t) / frame_span
 			frame_end_fraction = (chord_end_t - last_t) / frame_span
-			for entity_id, vehicle in vehicles.iteritems():
-				try:
-					if int(entity_id) == int(state['shooter_id']):
-						continue
-					if (not getattr(vehicle, 'isAlive', False) or
-							(getattr(vehicle, 'health', 0) or 0) <= 0):
-						continue
-					current_position = current_positions.get(int(entity_id))
-					if current_position is None:
-						continue
-					previous_position = previous_positions.get(
-						int(entity_id), current_position)
-					adjusted_start, adjusted_end = (
-						_projectiles.compensate_segment_for_moving_target(
-							start, end, previous_position, current_position,
-							frame_start_fraction, frame_end_fraction))
-					if _projectiles.point_segment_distance_sq(
-							current_position, adjusted_start, adjusted_end) > broadphase_sq:
-						continue
-					adjusted_start_v = Math.Vector3(*adjusted_start)
-					adjusted_end_v = Math.Vector3(*adjusted_end)
-					adjusted_length = (adjusted_end_v - adjusted_start_v).length
-					if adjusted_length <= 0.0001:
-						continue
-					collision = vehicle.collideSegment(
-						adjusted_start_v, adjusted_end_v)
-					if collision is None:
-						continue
-					fraction = float(collision[0]) / adjusted_length
-					if 0.0 <= fraction <= 1.0 and fraction < vehicle_fraction:
-						vehicle_fraction = fraction
-						vehicle_hit = (
-							vehicle, collision, adjusted_start_v, adjusted_end_v)
-				except Exception:
-					continue
-
-			if vehicle_hit is not None and vehicle_fraction <= world_fraction:
+			impact = _offh_projectile_chord_impact(
+				start, end, vehicles, state['shooter_id'],
+				previous_positions, current_positions,
+				frame_start_fraction, frame_end_fraction, False)
+			if impact is not None:
 				impact_time = chord_start_t + (
-					chord_end_t - chord_start_t) * vehicle_fraction
-				impact_point = start_v + actual_direction.scale(
-					actual_length * vehicle_fraction)
+					chord_end_t - chord_start_t) * impact['fraction']
 				tangent = Math.Vector3(
 					state['velocity'][0] + state['gravity'][0] * impact_time,
 					state['velocity'][1] + state['gravity'][1] * impact_time,
@@ -1902,35 +2409,24 @@ def _offh_live_projectile_advance(runtime_id, state, elapsed):
 				if tangent.length > 0.0001:
 					tangent.normalise()
 				else:
-					tangent = actual_direction
-				_offh_live_projectile_finish(runtime_id, state, 'vehicle', {
-					'vehicle': vehicle_hit[0], 'collision': vehicle_hit[1],
-					'impact_point': impact_point,
-					'segment_start': vehicle_hit[2], 'segment_end': vehicle_hit[3],
+					tangent = impact['direction']
+				payload = {
+					'impact_point': impact['impact_point'],
 					'direction': tangent,
-					'travel_distance': travelled + actual_length * vehicle_fraction,
+					'travel_distance': travelled + impact['local_distance'],
 					'flight_time': impact_time,
-				})
-				return False
-
-			if world_hit is not None and world_fraction <= 1.0:
-				impact_time = chord_start_t + (
-					chord_end_t - chord_start_t) * world_fraction
-				impact_point = world_hit[0]
-				tangent = Math.Vector3(
-					state['velocity'][0] + state['gravity'][0] * impact_time,
-					state['velocity'][1] + state['gravity'][1] * impact_time,
-					state['velocity'][2] + state['gravity'][2] * impact_time)
-				if tangent.length > 0.0001:
-					tangent.normalise()
+				}
+				if impact['kind'] == 'vehicle':
+					payload.update({
+						'vehicle': impact['vehicle'],
+						'collision': impact['collision'],
+						'segment_start': impact['segment_start'],
+						'segment_end': impact['segment_end'],
+					})
 				else:
-					tangent = actual_direction
-				_offh_live_projectile_finish(runtime_id, state, 'world', {
-					'world_hit': world_hit, 'impact_point': impact_point,
-					'direction': tangent,
-					'travel_distance': travelled + actual_length * world_fraction,
-					'flight_time': impact_time,
-				})
+					payload['world_hit'] = impact['world_hit']
+				_offh_live_projectile_finish(
+					runtime_id, state, impact['kind'], payload)
 				return False
 
 			travelled += actual_length
@@ -2032,6 +2528,10 @@ _OFFH_PLAYER_BATTLE_ATTRS = (
 	'_offh_lineup_model_refs', '_offh_lineup_model_pending',
 	'_offh_lineup_model_failed', '_offh_forced_model_refs',
 	'_offh_sticker_warmup_queue', '_offh_sticker_warmup_active',
+	'_offh_spawn_streaming_bootstrap',
+	'_offh_spawn_streaming_monitor_active',
+	'_offh_spawn_streaming_wait_logged',
+	'_offhangar_prepare_native_authority_streaming',
 )
 
 
@@ -2808,6 +3308,27 @@ def apply_network_capture_damage(player, target_mock, attacker_id=None,
 		target_mock, attacker_id, reason)
 
 
+def _offh_vehicle_message_label(player, vehicle_id, fallback='Unknown'):
+	"""Return the retail battle label without mutating the arena roster."""
+	try:
+		info = getattr(getattr(player, 'arena', None), 'vehicles', {}).get(
+			int(vehicle_id), {}) or {}
+		try:
+			from gui import BattleContext
+			label = BattleContext.g_battleContext.getFullPlayerName(
+				vData=info, showClan=False)
+			if label:
+				return label
+		except Exception:
+			pass
+		name = info.get('name')
+		if name:
+			return name
+	except Exception:
+		pass
+	return fallback
+
+
 def _offh_scout_event(player, event_name, target_id):
 	"""Use the stock 0.8.2 personal-message path for spotting feedback."""
 	try:
@@ -2832,11 +3353,7 @@ def _offh_scout_event(player, event_name, target_id):
 		panel = getattr(battle, 'pMsgsPanel', None) if battle is not None else None
 		if panel is None:
 			return False
-		name = 'Enemy'
-		try:
-			name = player.arena.vehicles.get(int(target_id), {}).get('name', name)
-		except Exception:
-			pass
+		name = _offh_vehicle_message_label(player, target_id, 'Enemy')
 		panel.showMessage(message_type, {'entity': name}, (('entity', int(target_id)),))
 		return True
 	except Exception as error:
@@ -2992,29 +3509,30 @@ def _offh_ai_hull_dims(descriptor):
 	return cache[key]
 
 
-def _offh_mat_info_for_segment_hit(space_id, segment_start, hit_point):
-	"""Resolve the destructible descriptor hidden behind a BSP ray hit."""
+def _offh_mat_info_for_segment_hit(space_id, hit_point, surface_normal):
+	"""Resolve one static contact with the retail point/normal material probe."""
 	try:
 		import BigWorld
-		direction = hit_point - segment_start
-		if direction.length <= 0.001:
+		normal = surface_normal.scale(1.0)
+		if normal.length <= 0.001:
 			return None
-		direction.normalise()
-		segment_a = hit_point + direction.scale(3.0)
-		segment_b = hit_point - direction.scale(2.0)
+		normal.normalise()
+		segment_a = hit_point - normal.scale(3.0)
+		segment_b = hit_point + normal.scale(2.0)
 		return BigWorld.wg_getMatInfoNearPoint(
 			space_id, segment_a, segment_b, hit_point, lambda *args: False)
 	except Exception:
 		return None
 
 
-def _offh_destructible_mat_passable(mat_info):
-	"""Return True only for data-defined objects a tank can ram through."""
+def _offh_destructible_mat_passable(mat_info, vehicle=None, vehicle_speed=0.0,
+		space_id=None):
+	"""Return True only for contacts this vehicle can actually crush."""
 	if mat_info is None:
 		return False
 	try:
 		import AreaDestructibles
-		unused_hit, unused_normal, unused_chunk, unused_index, mat_kind, filename = mat_info
+		unused_hit, unused_normal, chunk_id, item_index, mat_kind, filename = mat_info
 		if int(mat_kind) < 71 or int(mat_kind) > 130:
 			return False
 		desc = AreaDestructibles.g_cache.getDescByFilename(filename)
@@ -3026,14 +3544,23 @@ def _offh_destructible_mat_passable(mat_info):
 				AreaDestructibles.DESTR_TYPE_FALLING_ATOM):
 			health = float(desc.get('health', 0) or 0)
 			return 10.0 <= health <= 1000.0
-		return destructible_type in (
-			AreaDestructibles.DESTR_TYPE_FRAGILE,
-			AreaDestructibles.DESTR_TYPE_STRUCTURE)
+		if destructible_type == AreaDestructibles.DESTR_TYPE_FRAGILE:
+			return True
+		if destructible_type == AreaDestructibles.DESTR_TYPE_STRUCTURE:
+			if vehicle is None:
+				return False
+			if space_id is None:
+				space_id = _offh_bspace()
+			return bool(_get_destr_authority().can_crush(
+				vehicle, space_id, int(chunk_id), int(item_index),
+				int(mat_kind), filename, abs(float(vehicle_speed))))
+		return False
 	except Exception:
 		return False
 
 
-def _offh_ai_corridor_segment_clear(space_id, start, end):
+def _offh_ai_corridor_segment_clear(space_id, start, end, vehicle=None,
+		vehicle_speed=0.0):
 	"""Treat crushable scenery as road while retaining solid BSP blockers."""
 	try:
 		import BigWorld
@@ -3041,7 +3568,8 @@ def _offh_ai_corridor_segment_clear(space_id, start, end):
 		if hit is None:
 			return True
 		return _offh_destructible_mat_passable(
-			_offh_mat_info_for_segment_hit(space_id, start, hit[0]))
+			_offh_mat_info_for_segment_hit(space_id, hit[0], hit[1]),
+			vehicle, vehicle_speed, space_id)
 	except Exception:
 		return False
 
@@ -3220,8 +3748,8 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw, now=None, space_id=None):
 		# Sweep the complete supported corridor at two hull heights. A single long
 		# chord can cut through the crest of a perfectly drivable convex hill, so a
 		# hit is verified against short terrain-following pieces before it becomes an
-		# obstacle veto. Destructible houses/fences are explicitly passable here;
-		# the physical contact path still performs the actual destruction.
+		# obstacle veto. Fragiles remain locally passable; structures require the
+		# same retail mass/speed/module proof used by the physical contact path.
 		final_x = float(vehicle.position.x) + sine * lookahead
 		final_z = float(vehicle.position.z) + cosine * lookahead
 		for height in (0.9, 1.5):
@@ -3233,7 +3761,8 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw, now=None, space_id=None):
 				end = Math.Vector3(
 					final_x + lateral_x * offset, previous_y + height,
 					final_z + lateral_z * offset)
-				if _offh_ai_corridor_segment_clear(_space_id, start, end):
+				if _offh_ai_corridor_segment_clear(
+						_space_id, start, end, vehicle, speed):
 					continue
 				piece_clear = True
 				last_distance, last_y = ground_profile[0]
@@ -3247,7 +3776,7 @@ def _offh_ai_direction_clear(vehicle, absolute_yaw, now=None, space_id=None):
 						piece_y + height,
 						float(vehicle.position.z) + cosine * piece_distance + lateral_z * offset)
 					if not _offh_ai_corridor_segment_clear(
-							_space_id, piece_start, piece_end):
+							_space_id, piece_start, piece_end, vehicle, speed):
 						piece_clear = False
 						break
 					last_distance, last_y = piece_distance, piece_y
@@ -3782,10 +4311,17 @@ def _offh_spot_visible_to_team(player, target_vehicle, observing_team, now,
 		if distance_sq <= 2500.0:
 			candidates.append((distance_sq, observer))
 		else:
-			spot_range = _offh_spot_detection_range(
-				player, observer, target, now)
-			if distance_sq <= spot_range * spot_range:
+			from gui.mods.offhangar import spotting as _team_spotting
+			_foliage_bound = _team_spotting.foliage_visibility_bound(
+				distance_sq, observer['_spot_view_range'],
+				target['_spot_camouflage'], 0.60)
+			if _foliage_bound is True:
 				candidates.append((distance_sq, observer))
+			elif _foliage_bound is None:
+				spot_range = _offh_spot_detection_range(
+					player, observer, target, now)
+				if distance_sq <= spot_range * spot_range:
+					candidates.append((distance_sq, observer))
 	candidates.sort(key=lambda item: item[0])
 	seen = False
 	for distance_sq, observer in candidates[:3]:
@@ -3888,6 +4424,7 @@ def _offh_ai_artillery_pitch_limits(vehicle, target_yaw=0.0):
 
 
 def _offh_ai_artillery_target_velocity(entry):
+	import math
 	vehicle = entry.get('vehicle') if isinstance(entry, dict) else None
 	try:
 		if getattr(vehicle, '_network_remote', False):
@@ -3945,6 +4482,7 @@ def _offh_ai_artillery_world_clear(path, target_position):
 def _offh_ai_artillery_candidates(vehicle, target_position,
 		target_velocity=(0.0, 0.0, 0.0), shell_index=0):
 	'''Return the low/high real-shell trajectories without probing world BSP.'''
+	import math
 	shot = _offh_ai_artillery_shot(vehicle, shell_index)
 	if shot is None:
 		return ()
@@ -4036,6 +4574,7 @@ def _offh_ai_advance_artillery_arcs(now):
 def _offh_ai_direct_fire_solution(vehicle, target_position,
 		target_velocity=(0.0, 0.0, 0.0), shell_index=0):
 	'''Lead an ordinary gun with the same speed and gravity its tracer uses.'''
+	import math
 	shot = _offh_ai_artillery_shot(vehicle, shell_index)
 	if shot is None:
 		return None
@@ -4479,16 +5018,23 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 						_view_range = _offh_ai_cached_view_range(
 							observer['descriptor'], observer.get('vehicle'), player, now)
 						observer['_spot_view_range'] = _view_range
-					base_range = _contact_spotting.detection_distance(
-						_view_range,
-						target.get('_spot_camouflage', 0.0))
-					if distance_sq > base_range * base_range:
+					_foliage_bound = _contact_spotting.foliage_visibility_bound(
+						distance_sq, _view_range,
+						target.get('_spot_camouflage', 0.0), 0.60)
+					if _foliage_bound is False:
 						continue
-					_offh_perf_count('contact_foliage')
-					spot_range = _offh_spot_detection_range(
-						player, observer, target, now)
-					if distance_sq <= spot_range * spot_range:
+					if _foliage_bound is True:
 						candidates.append((distance_sq, observer))
+					else:
+						_perf_contact_foliage = _offh_perf_start()
+						try:
+							spot_range = _offh_spot_detection_range(
+								player, observer, target, now)
+						finally:
+							_offh_perf_stop(
+								'contact_foliage', _perf_contact_foliage)
+						if distance_sq <= spot_range * spot_range:
+							candidates.append((distance_sq, observer))
 				if len(candidates) >= 3:
 					break
 			for distance_sq, observer in candidates:
@@ -4508,6 +5054,11 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 					if not has_los:
 						continue
 					if observer.get('target_kind') == 'bot':
+						# A straight sight segment proves visibility, not a usable SPG
+						# trajectory. Artillery is granted below only after its sampled
+						# ballistic arc has completed the world-probe queue.
+						if observer.get('class_tag') == 'SPG':
+							continue
 						observer_entity_id = int(observer['id'])
 						if observer_entity_id not in shootable_by_entity_ids:
 							shootable_by_entity_ids.append(observer_entity_id)
@@ -4534,14 +5085,13 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 						int(round(target['position'][0] / 10.0)),
 						int(round(target['position'][2] / 10.0)))
 					arc_queue = _offh_ai_artillery_arc_queue()
-					ready, solution = arc_queue.result(cache_key, now)
-					if not ready and not arc_queue.is_pending(cache_key, now):
-						candidates = _offh_ai_artillery_candidates(
+					ready, solution = arc_queue.request_lazy(
+						cache_key,
+						lambda: _offh_ai_artillery_candidates(
 							vehicle, target['position'],
 							_offh_ai_artillery_target_velocity(target),
-							shell_index)
-						ready, solution = arc_queue.request(
-							cache_key, candidates, target['position'], now)
+							shell_index),
+						target['position'], now)
 					if solution is None:
 						continue
 					observer_entity_id = int(observer['id'])
@@ -4753,6 +5303,7 @@ def _offh_ai_refresh_contacts(director, player, mock_vehicles, veh_pos,
 			        'traversing': 0, 'limited': 0}
 			_driver = {'moving': 0, 'drive': 0, 'avoid': 0, 'blocked': 0,
 			           'recovery': 0, 'arrived': 0, 'server_wait': 0,
+			           'traffic_wait': 0,
 			           'water_guard': 0, 'full': 0, 'cruise': 0,
 			           'speed_pct': 0, 'slow': 0}
 			_driver_speed_pct_total = 0.0
@@ -4952,9 +5503,34 @@ def _offh_battle_sweep(tag='exit'):
 			pass
 		try:
 			from gui.mods.offhangar.native_bot_physics import stop_all as _stop_native_bot_physics
-			_stop_native_bot_physics(_mvd)
+			_native_stopped = _stop_native_bot_physics(_mvd)
+			if _native_stopped < 0:
+				# A silent/no-op engine setter can leave one native owner attached.
+				# Never continue by destroying its chassis/entity. The caller owns the
+				# continuation and retries only after every reference is still intact.
+				LOG_ERROR('NATIVE_BOT_PHYSICS battle sweep deferred '
+					'reason=owner release incomplete')
+				return False
 		except Exception:
-			pass
+			LOG_CURRENT_EXCEPTION()
+			return False
+		# Native owners must release before the far-plane hold can be restored.
+		# Otherwise remote terrain may unload while a C++ body still references it.
+		# A rejected/silent restore is retryable and keeps every mock/space intact.
+		_stage = 'streaming'
+		try:
+			_streaming_player = BigWorld.player()
+			_streaming_bootstrap = getattr(
+				_streaming_player, '_offh_spawn_streaming_bootstrap', None)
+			if (_streaming_bootstrap is not None and
+					_streaming_bootstrap.stop() is not True):
+				LOG_ERROR('SPAWN_STREAMING battle sweep deferred '
+					'reason=projection restore incomplete')
+				return False
+		except Exception:
+			LOG_CURRENT_EXCEPTION()
+			return False
+		_stage = 'mocks'
 		for _m in list(_mvd.values()):
 			try:
 				# Vehicle.stopVisual parity: remove GUI ownership and detach every
@@ -5029,6 +5605,7 @@ def _offh_battle_sweep(tag='exit'):
 					# entity-owned chassis: ent.model=None above already released it;
 					# delModel on it always raised (pending!) 'Not added as a global
 					# model' - the very bomb this sweep kept tripping over.
+					_m.model = None
 					_m._chassis_model = None
 				except Exception:
 					pass
@@ -5077,6 +5654,7 @@ def _offh_battle_sweep(tag='exit'):
 		globals()['g_capture_tick_ref'] = None
 		globals()['g_aih_tick_ref'] = None
 		globals().pop('g_offline_formation_slot', None)
+		globals().pop('g_offline_formation_pose', None)
 		globals().pop('g_offh_bot_director', None)
 		globals().pop('g_offh_terrain_navigator', None)
 		globals().pop('g_offh_baked_navigation_graph', None)
@@ -5482,6 +6060,7 @@ def _offh_battle_sweep(tag='exit'):
 			if _arena_player is not None:
 				for _battle_closure in ('_offhangar_apply_network_rules_state',
 						'_offhangar_apply_network_battle_result',
+						'_offhangar_prepare_native_authority_streaming',
 						'_offhangar_network_spawn_remote',
 						'_offhangar_network_formation'):
 					try: setattr(_arena_player, _battle_closure, None)
@@ -5593,6 +6172,36 @@ def _offh_battle_sweep(tag='exit'):
 			_offh_gc_census_line(tag)
 		except Exception:
 			pass
+	return True
+
+
+def _offh_sweep_or_retry(tag, continuation):
+	"""Run the ownership barrier before an exit/start continuation.
+
+	The normal battle callback registry is deliberately cancelled by the sweep.
+	A failed native release therefore retries through a plain BigWorld callback;
+	the caller resumes only after stop_all has proven every native owner detached.
+	"""
+	import BigWorld
+	try:
+		if _offh_battle_sweep(tag):
+			(globals().get('g_offh_sweep_retry_pending', {}) or {}).pop(tag, None)
+			return True
+	except Exception:
+		LOG_CURRENT_EXCEPTION()
+	pending = globals().setdefault('g_offh_sweep_retry_pending', {})
+	if pending.get(tag):
+		return False
+	pending[tag] = True
+	def _retry():
+		pending.pop(tag, None)
+		return continuation()
+	try:
+		BigWorld.callback(0.1, _retry)
+	except Exception:
+		pending.pop(tag, None)
+		LOG_CURRENT_EXCEPTION()
+	return False
 
 import BigWorld
 try:
@@ -7020,23 +7629,19 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 	import BigWorld
 	if player is None or not getattr(player, 'isOffline', False):
 		return
+	if not _offh_sweep_or_retry('start', lambda _cmd=cmdName:
+			_try_spawn_battle_avatar_stub(BigWorld.player(), _cmd)):
+		return
 	try:
-		# Belt: whatever exit path the last battle took, purge its
-		# leftovers (wrecks, models, FMOD events, old map) first.
-		try:
-			_offh_battle_sweep('start')
-		except:
-			try:
-				import traceback as _swtb2
-				LOG_DEBUG('Sweep(start) FAILED:', _swtb2.format_exc())
-			except Exception:
-				pass
 		# One battle = one generation. Establish it before any asynchronous model,
 		# camera or spawn callback is scheduled so every callback can reject a
 		# completed battle instead of recreating visuals in the hangar.
 		globals()['g_offh_battle_gen'] = (
 			(globals().get('g_offh_battle_gen', 0) or 0) + 1)
 		_offh_my_gen = [globals()['g_offh_battle_gen']]
+		# Freeze the movement contract for this battle. Later config/import or LAN
+		# role failures may stop native simulation, but may never enable Python.
+		_offh_native_mode_enabled()
 		_offh_capture_player_battle_attrs(player)
 		# The sweep destroys the projectile mover on battle exit (it owns
 		# the shell models) - recreate it per battle or tracers are gone
@@ -7225,12 +7830,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						except Exception as e:
 							import debug_utils
 							debug_utils.LOG_DEBUG('DUMP ERROR:', e)
-						
+
 						global g_offline_bases
 						g_offline_bases = {1: [], 2: []}
 						def _add_base(_t, _x, _z, _src):
 							'''Accept a base position only if it really is one.
-							
+
 							hasattr(section, 'asVector2') is ALWAYS true on a BigWorld DataSection -
 							those accessors exist whatever the node holds, so it is not a type test.
 							A child that is not a vector read as (0, 0) and became a base at the MAP
@@ -7256,7 +7861,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						except Exception as e:
 							debug_utils.LOG_DEBUG('teamBasePositions error:', e)
 
-						
+
 						for t_id in (1, 2):
 							bp_node = gp['teamBasePositions/team%d' % t_id]
 							if bp_node is not None:
@@ -7284,7 +7889,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											pass
 							import gui.mods.offhangar.logging as __offlog
 							__offlog.LOG_DEBUG('LOUD: g_offline_bases is now:', g_offline_bases)
-						
+
 						import debug_utils
 						debug_utils.LOG_DEBUG('Parsed bases:', g_offline_bases)
 						# The packed 0.8.2 arena XML is the primary authority.  If its
@@ -7319,7 +7924,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								map_name, ' '.join(_base_parts)))
 						except Exception:
 							pass
-						
+
 						# Collect the original spawn points of BOTH teams (for the 15v15 auto-spawn)
 						global g_offline_spawns
 						g_offline_spawns = {1: [], 2: []}
@@ -7357,20 +7962,20 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								LOG_DEBUG('OfflineBattle.mapBounds:', g_offline_bounds)
 						except Exception:
 							g_offline_bounds = None
-						
+
 						# The player can be either absolute arena team in LAN mode.  The
 						# old hard-coded team1 candidate placed every team2 client at the
 						# opposite base until a later correction happened to succeed.
 						_player_spawn_team = int(getattr(player, '_offhangar_team', 1) or 1)
 						sp = gp['teamSpawnPoints/team%d' % _player_spawn_team]
 						bp = gp['teamBasePositions/team%d' % _player_spawn_team]
-						
+
 						# Validate ALL spawn candidates with a roof/ledge check instead of
 						# blindly taking the first one. Real spawn points first (like the
 						# original game), base flag positions as fallback.
 						_found_spawn = False
 						import BigWorld
-						
+
 						def _read_vec2(val):
 							v2 = getattr(val, 'asVector2', None)
 							if v2 is None:
@@ -7379,7 +7984,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									v2 = Math.Vector2(float(parts[0]), float(parts[1]))
 								except: pass
 							return v2
-						
+
 						# Collect candidates: real ArenaType spawn points first (original game order),
 						# then the XML hand-parse, then the base flag as the last resort.
 						_spawn_cands = []
@@ -7404,7 +8009,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							for _base_candidate in (g_offline_bases.get(_player_spawn_team, []) or []):
 								_spawn_cands.append(Math.Vector2(_base_candidate.x, _base_candidate.z))
 						LOG_DEBUG('OfflineBattle.spawn candidates:', len(_spawn_cands), map_name)
-						
+
 						def _spawn_ground(x, z):
 							# Returns (y, ok): ground height + roof/ledge check
 							# (neighbouring ground must exist and be at a similar height)
@@ -7424,7 +8029,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								if c is None or abs(c[0].y - y) > 3.0:
 									return (y, False)
 							return (y, True)
-						
+
 						for vec2 in _spawn_cands:
 							_sy, _sok = _spawn_ground(vec2.x, vec2.y)
 							if _sy is not None and _sok:
@@ -7476,7 +8081,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								spawn_pos = Math.Vector3(vec2.x, 100.0, vec2.y)
 								LOG_DEBUG('OfflineBattle.spawn WARNING: no ground found for any candidate')
 							LOG_DEBUG('OfflineBattle.spawn fallback pos:', spawn_pos)
-						
+
 						# Face the enemy base instead of a fixed 180 degrees
 						try:
 							import math
@@ -7488,7 +8093,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									spawn_dir = Math.Vector3(0, 0, math.atan2(_ddx, _ddz))
 						except Exception:
 							pass
-						
+
 						# Hardcoded spawn hack removed: the candidates above are validated against
 						# roofs/ledges, so the real arena_def spawn points are safe to use directly.
 						import math
@@ -7504,7 +8109,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		veh_matrix = Math.MatrixProduct()
 		veh_matrix.a = veh_matrix_static
 		veh_matrix.b = Math.Matrix()  # identity
-		
+
 		# Chassis matrix: includes yaw + position, driven by Servo
 		# so hull/turret/gun chain stays perfectly in sync
 		chassis_m = Math.Matrix()
@@ -7567,7 +8172,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					vinfo = list(vdict.values())[0]
 				if vinfo:
 					td = vinfo.get('vehicleType')
-			
+
 			from items import vehicles
 			if type(td) is int:
 				nationID = (td >> 4) & 15
@@ -7610,13 +8215,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						LOG_DEBUG('OfflineBattle.model loaded:', part_name, modelName)
 				except Exception as e:
 					LOG_DEBUG('OfflineBattle load model error:', part_name, str(e))
-			
+
 			# BigWorld.Model() is async - the model isn't ready immediately.
 			# Use a callback to add them after they've loaded.
 			_models_to_add = dict((k, v) for k, v in loaded_models.items() if v is not None)
 			_add_attempts = [0]
-			
-			
+
+
 			def _add_models_when_ready(_model_gen=_offh_my_gen[0]):
 				if globals().get('g_offh_battle_gen', 0) != _model_gen:
 					return
@@ -7626,7 +8231,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					hull    = _models_to_add.get('hull')
 					turret  = _models_to_add.get('turret')
 					gun     = _models_to_add.get('gun')
-										
+
 					if chassis is not None:
 						chassis.position = Math.Vector3(spawn_pos)
 						chassis.yaw = 0.0
@@ -7636,7 +8241,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							LOG_DEBUG('OfflineBattle.chassis Servo attached')
 						except Exception as e:
 							LOG_DEBUG('OfflineBattle.chassis Servo error:', str(e))
-						
+
 						if hull is not None:
 							try:
 								chassis.node('V').attach(hull)
@@ -7645,7 +8250,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								LOG_DEBUG('OfflineBattle.attach hull error:', str(e))
 								hull.position = Math.Vector3(spawn_pos)
 								_add_model(hull)
-						
+
 							# Attach turret to hull node 'HP_turretJoint'
 							if turret is not None:
 								try:
@@ -7656,7 +8261,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									LOG_DEBUG('OfflineBattle: turret attached to hull.HP_turretJoint')
 								except Exception as e:
 									LOG_DEBUG('OfflineBattle.attach turret error:', str(e))
-								
+
 								# Apply Camouflage and Emblems
 								try:
 									import items.vehicles as iv
@@ -7701,7 +8306,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 															fashion = getattr(p_mdl, 'wg_baseFashion', None)
 															if fashion is None: fashion = p_mdl.wg_baseFashion = BigWorld.WGBaseFashion()
 															fashion.setCamouflage(tex, excl, tiling, colors[0], colors[1], colors[2], colors[3], weights)
-									
+
 								except Exception as e:
 									import traceback
 									LOG_DEBUG('OfflineBattle.customization error:', str(e), traceback.format_exc())
@@ -7754,7 +8359,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						hull.position = Math.Vector3(spawn_pos)
 						_add_model(hull)
 						LOG_DEBUG('OfflineBattle.addModel OK: hull (no chassis)')
-					
+
 					root_model = chassis or hull
 					ma.models = [root_model]
 					ma.compoundModel = root_model
@@ -7762,7 +8367,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 
 
 					# Engine sounds are now initialized in _step_offline_physics
-				
+
 				except Exception as e:
 					import traceback
 					LOG_DEBUG('OfflineBattle._add_models_when_ready ERROR:', traceback.format_exc())
@@ -7770,7 +8375,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						_offh_battle_callback(0.3, _add_models_when_ready)
 
 			_offh_battle_callback(0.2, _add_models_when_ready)
-			
+
 			# Set temporary compoundModel so camera logic doesn't fail
 			root_model = loaded_models['chassis'] if loaded_models['chassis'] is not None else loaded_models['hull']
 			ma.models = [root_model]
@@ -7804,7 +8409,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				self.isAlive = _OffhAliveState(True)
 				self.id = getattr(player, 'playerVehicleID', 0)
 				self.model = getattr(self.appearance, 'compoundModel', None)
-				
+
 				class _ModelsDesc(object):
 					def __getitem__(self, key):
 						if key in loaded_models and loaded_models.get(key) is not None:
@@ -7815,33 +8420,33 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				self.appearance.modelsDesc = _ModelsDesc()
 			def getAutorotation(self): return False
 			def __getattr__(self, name): return None
-			
+
 			def getComponents(self):
 				import Math
 				res = []
 				m = Math.Matrix()
 				m.setIdentity()
 				res.append((self.typeDescriptor.chassis, m))
-				
+
 				hullOffset = self.typeDescriptor.chassis['hullPosition']
 				m = Math.Matrix()
 				m.setTranslate(-hullOffset)
 				res.append((self.typeDescriptor.hull, m))
-				
+
 				if getattr(self, 'isPlayer', False):
 					tYaw = turret_matrix_local.yaw
 					gPitch = gun_matrix.pitch if 'gun_matrix' in globals() else 0.0
 				else:
 					tYaw = getattr(self, '_t_mat', m).yaw
 					gPitch = getattr(self, '_g_mat', m).pitch
-					
+
 				turretMatrix = Math.Matrix()
 				turretMatrix.setTranslate(-hullOffset - self.typeDescriptor.hull['turretPositions'][0])
 				m = Math.Matrix()
 				m.setRotateY(-tYaw)
 				turretMatrix.postMultiply(m)
 				res.append((self.typeDescriptor.turret, turretMatrix))
-				
+
 				gunMatrix = Math.Matrix()
 				gunMatrix.setTranslate(-self.typeDescriptor.turret['gunPosition'])
 				m = Math.Matrix()
@@ -7849,7 +8454,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				gunMatrix.postMultiply(m)
 				gunMatrix.preMultiply(turretMatrix)
 				res.append((self.typeDescriptor.gun, gunMatrix))
-				
+
 				return res
 
 			def collideSegment(self, startPoint, endPoint, skipGun=False):
@@ -7947,7 +8552,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						if 'frags' in p_stat: p_stat['frags'] = 0
 						player.arena.statistics[p_id] = p_stat
 		except: pass
-		
+
 		mock_veh = _MockVeh()
 
 		mock_vehicles = {getattr(BigWorld.player(), 'playerVehicleID', -1): mock_veh}
@@ -8090,6 +8695,25 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			except Exception:
 				return 0.0
 
+		def _offh_center_arcade_aim(ctrl):
+			'''Keep the arcade sight and its world ray on the screen centre.
+
+			Retail 0.8.2 deliberately offsets the arcade sight upward by 0.15 screen
+			units. Offline aiming uses that same sight ray, so changing only the Flash
+			marker would make the picture and the shot disagree. Centre both owners and
+			leave sniper/strategic modes on their stock contracts.
+			'''
+			try:
+				if ctrl is None or ctrl.__class__.__name__ != 'ArcadeControlMode':
+					return False
+				aim = ctrl.getAim()
+				camera = ctrl.camera
+				aim.offset((0.0, 0.0))
+				camera.cursorOffset((0.0, 0.0))
+				return True
+			except Exception:
+				return False
+
 		def _offh_apply_zoom_attrs(ctrl, dz):
 			# Ported: some 0.8.2 camera handlers silently reject wheel input in the
 			# offline shell. Touch camera-only zoom fields (never aiming/ballistics).
@@ -8146,29 +8770,22 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			except Exception:
 				return False
 
-		def _offh_mouse_cam_fallback(aih, args, wheel_normalized=False):
-			try:
-				ctrl = getattr(aih, 'ctrl', None)
-				if ctrl is None:
-					return False
-				cam = getattr(ctrl, 'camera', None)
-				dx, dy, dz = _offh_mouse_delta(args)
-				if not wheel_normalized:
-					dz = _offh_zoom_wheel_delta(dz)
-				handled = False
-				if cam is not None and hasattr(cam, 'update'):
-					try:
-						# clamp dz like the game's own paths (_clamp(-1, 1, dz))
-						# so one notch never jumps several zoom steps
-						cam.update(dx, dy, max(-1.0, min(1.0, dz)))
-						handled = True
-					except Exception:
-						pass
-				if abs(dz) > 0.0001 and _offh_apply_zoom_attrs(ctrl, dz):
-					handled = True
-				return handled
-			except Exception:
-				return False
+		def _offh_wrap_aih_mouse_delivery(aih, wheel_player):
+			"""Count wheel delivery at the actual stock game.py input entry."""
+			if aih is None or getattr(aih, '_offh_wheel_delivery_wrapped', False):
+				return aih
+			original = aih.handleMouseEvent
+			def _counted(dx, dy, dz):
+				try:
+					if abs(float(dz)) > 0.0001:
+						wheel_player._offh_wheel_delivery_serial = int(getattr(
+							wheel_player, '_offh_wheel_delivery_serial', 0) or 0) + 1
+				except Exception:
+					pass
+				return original(dx, dy, dz)
+			aih.handleMouseEvent = _counted
+			aih._offh_wheel_delivery_wrapped = True
+			return aih
 
 		def _mock_handleMouse(*args):
 			# Ported arty-camera fix: without this hook the wheel never reaches the
@@ -8176,23 +8793,19 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			try:
 				aih = getattr(player, 'inputHandler', None)
 				if aih is not None and hasattr(aih, 'handleMouseEvent'):
-					dx, dy, dz = _offh_mouse_delta(args)
+					dx, dy, raw_dz = _offh_mouse_delta(args)
+					dz = raw_dz
 					dz = _offh_zoom_wheel_delta(dz)
 					normalized_args = (dx, dy, dz)
 					try:
-						_ret = aih.handleMouseEvent(*normalized_args)
-						if (not _ret) and abs(_offh_mouse_delta(args)[2]) > 0.0001:
-							if _offh_mouse_cam_fallback(aih, normalized_args, True):
-								return True
-						return _ret
+						return aih.handleMouseEvent(*normalized_args)
 					except Exception:
-						if _offh_mouse_cam_fallback(aih, normalized_args, True):
-							return True
+						pass
 			except Exception:
 				pass
 			return False
 		player.handleMouseEvent = _mock_handleMouse
-		
+
 		import game
 		if not getattr(game, '_offhangar_hooked', False):
 			game._offhangar_hooked = True
@@ -8230,18 +8843,17 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			# path DID handle the wheel - double zoom in arcade, and its direct
 			# _SniperCamera__zoom writes broke the discrete 2/4/8 walk and the
 			# scroll-out exit (exact zoom == zooms[0] check in __setupZoom).
-			# Correct rule: detect whether the native path consumed this wheel
-			# event, and only if not, re-deliver dz through the camera wrapper's
-			# own update() so all stock logic (zoom walk, clamps, mode
-			# transitions) still runs:
-			#  - Arcade/Strategic apply dz SYNCHRONOUSLY to their __camDist, so
-			#    an unchanged __camDist right after the orig call means the
-			#    event was eaten. (Their __camDist also legitimately stays put
-			#    at the range ends - re-delivering there is a no-op, except the
-			#    min-end where it correctly (re)fires the mode transition.)
-			#  - Sniper stores dz in __dxdydz and applies it next frame, so a
-			#    zero stored dz right after the orig call means it was eaten;
-			#    re-deliver preserving any stored dx/dy from move events.
+			# Correct rule: record whether this exact event reached the actual
+			# AvatarInputHandler entry and, only if not, re-deliver dz through
+			# AvatarInputHandler. Camera distance is not a valid delivery signal:
+			# it legitimately remains unchanged at either zoom limit.
+			# ArcadeControlMode must own this call: its TargetPointCalculator saves
+			# the world point under the reticle, changes camera distance, then calls
+			# focusOnPos() so wheel-only zoom does not move the aim point. Calling
+			# ArcadeCamera.update() directly skips that fixed-point correction.
+			# This fallback replaces only a wheel event consumed by Flash. Do not
+			# replay SniperCamera's stored dx/dy: those belong to an earlier event
+			# (or keyboard auto-update) and would rotate the view a second time.
 			orig_game_handleMouseEvent = game.handleMouseEvent
 			def _mock_game_handleMouseEvent(event):
 				# no zoom while dead/spectating - postmortem must not sniper-zoom into the wreck.
@@ -8276,28 +8888,19 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# gated input (pause menu open / cursor detached):
 							# eaten on purpose, do not zoom
 							if cam is not None and getattr(aih, '_AvatarInputHandler__isStarted', False) and getattr(aih, '_AvatarInputHandler__detachCount', 0) >= 0:
-								dist = getattr(cam, '_ArcadeCamera__camDist', None)
-								if dist is None:
-									dist = getattr(cam, '_StrategicCamera__camDist', None)
-								pre = (aih, ctrl, cam, None if dist is None else float(dist), dz)
+								pre = (aih, ctrl, cam, p, int(getattr(
+									p, '_offh_wheel_delivery_serial', 0) or 0), dz)
 				except Exception:
 					pre = None
 				result = orig_game_handleMouseEvent(event)
 				if pre is not None:
 					try:
-						aih, ctrl, cam, dist_before, dz = pre
-						if getattr(aih, 'ctrl', None) is ctrl:
+						aih, ctrl, cam, wheel_player, serial_before, dz = pre
+						if (getattr(aih, 'ctrl', None) is ctrl and
+								int(getattr(wheel_player,
+									'_offh_wheel_delivery_serial', 0) or 0) == serial_before):
 							dzc = max(-1.0, min(1.0, dz))
-							if dist_before is not None:
-								dist_after = getattr(cam, '_ArcadeCamera__camDist', None)
-								if dist_after is None:
-									dist_after = getattr(cam, '_StrategicCamera__camDist', None)
-								if dist_after is not None and abs(float(dist_after) - dist_before) < 0.0001:
-									cam.update(0, 0, dzc)
-							else:
-								stored = getattr(cam, '_SniperCamera__dxdydz', None)
-								if stored is not None and abs(float(stored[2])) < 0.0001:
-									cam.update(float(stored[0]), float(stored[1]), dzc)
+							aih.handleMouseEvent(0.0, 0.0, dzc)
 					except Exception:
 						pass
 				return result
@@ -8338,9 +8941,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					_AIHmod.AvatarInputHandler._offh_rc_wrapped = True
 			except Exception:
 				pass
-		
+
 		def _leaveArena():
+			if _exit_done[0]:
+				return
+			if not _offh_sweep_or_retry('quit', _leaveArena):
+				return
 			_battle_finished[0] = True
+			_exit_done[0] = True
 			# Leaving the synthetic arena also leaves the LAN room.  Once the last
 			# client disconnects, the server can reset and accept the next round.
 			try:
@@ -8363,16 +8971,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			# destroyed + re-inited TWICE, the second init racing the first
 			# one's async load -> broken garage return and a leaked
 			# half-loaded hangar space per occurrence.
-			if _exit_done[0]:
-				return
-			_exit_done[0] = True
-			# ESC runs battle-teardown AND the synchronous hangar load in this
-			# ONE call. Free the whole battle (models, sounds, mocks, mapped
-			# battle space) FIRST, or g_hangarSpace.init below OOM-crashes.
-			try:
-				_offh_battle_sweep('quit')
-			except:
-				pass
+			# The ownership sweep above is the continuation gate: no hangar or model
+			# teardown below may run while a native Servo/filter still owns a bot.
 			try:
 				_offh_detach_stickers(getattr(player, '_offhangar_stickers', None))
 				player._offhangar_stickers = []
@@ -8426,17 +9026,17 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				if g_hangarSpace is not None:
 					try: g_hangarSpace.destroy()
 					except Exception: pass
-					
+
 					# Prevent showLobby from destroying the space
 					def _mock_refreshSpace(self, isPremium):
 						pass
 					g_hangarSpace.__class__.refreshSpace = _mock_refreshSpace
-					
+
 					# Force premium
 					def _mock_getSpacePath(self, isPremium):
 						return self._HangarSpace__space.getDefSpacePath(True)
 					g_hangarSpace.__class__._HangarSpace__getSpacePath = _mock_getSpacePath
-					
+
 					# Init manually
 					# WG 'no man's land' purge: hangar destroyed, nothing active, before re-init.
 					_offh_safe_purge()
@@ -8464,9 +9064,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						try: _e.showGUI(_c.OFFLINE_GUI_CTX)
 						except Exception: pass
 			except Exception: pass
-			
+
 		player.leaveArena = _leaveArena
-		
+
 		def _setGUIVisible(visible):
 			aih = getattr(player, 'inputHandler', None)
 			if aih is not None:
@@ -8476,7 +9076,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					try: aih.setGUIVisible(visible)
 					except: pass
 		player.setGUIVisible = _setGUIVisible
-		
+
 		player.getAutorotation = lambda: False
 		player.enableOwnVehicleAutorotation = lambda val: None
 
@@ -8489,14 +9089,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		class FakeStats(object):
 			def getCache(self, cb): cb(1, {})
 			def __getattr__(self, name): return lambda *a, **k: None
-			
+
 		if not hasattr(player, '_offhangar_orig_stats'):
 			player._offhangar_orig_stats = getattr(player, 'stats', None)
 		player.stats = FakeStats()
 
 		class FakeGunRotator(object):
 			def __init__(self):
-				self.markerInfo = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
+				import Math
+				self.markerInfo = (Math.Vector3(0.0, 0.0, 0.0), Math.Vector3(0.0, 1.0, 0.0), 1.0)
 				self.dispersionAngle = 0.1
 			def getShotParams(self, targetPos, *a, **kw):
 				import BigWorld, Math
@@ -8513,13 +9114,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					speed = descr.shot['speed']
 					gravity = descr.shot['gravity']
 					mat = BigWorld.player().getOwnVehicleMatrix()
-					
+
 					# Get exact required gun elevation angle to hit targetPos
 					try:
 						(shotTurretYaw, shotGunPitch) = getShotAngles(descr, mat, (0, 0), targetPos)
 					except Exception:
 						shotTurretYaw, shotGunPitch = getattr(self, '_turret_yaw', 0.0), getattr(self, '_gun_pitch', 0.0)
-					
+
 					# Clamp to limits so trajectory doesn't draw where gun can't reach
 					import math
 					try:
@@ -8529,7 +9130,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						if shotGunPitch < limits[0]: shotGunPitch = limits[0]
 						elif shotGunPitch > limits[1]: shotGunPitch = limits[1]
 					except: pass
-					
+
 					try:
 						yl = descr.gun.get('turretYawLimits', None)
 						if yl is None and descr.turret is not None:
@@ -8543,7 +9144,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							if shotTurretYaw < min_yaw: shotTurretYaw = min_yaw
 							elif shotTurretYaw > max_yaw: shotTurretYaw = max_yaw
 					except: pass
-					
+
 					# Calculate actual world space gun position and velocity vector
 					turretOffs = descr.hull['turretPositions'][0] + descr.chassis['hullPosition']
 					gunOffs = descr.turret['gunPosition']
@@ -8556,7 +9157,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					gunWorldMatrix.setRotateX(shotGunPitch)
 					gunWorldMatrix.postMultiply(turretWorldMatrix)
 					vector = gunWorldMatrix.applyVector(Math.Vector3(0, 0, speed))
-					
+
 					return (position, vector, Math.Vector3(0, -gravity, 0))
 				except Exception as e:
 					LOG_DEBUG('OfflineBattle getShotParams ERROR:', str(e))
@@ -8739,7 +9340,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 
 		_engine_state = {'init': False, 'snd1': None, 'snd2': None}
 		globals()['g_offh_engine_state'] = _engine_state
-		
+
 		_veh_velocity = [0.0]        # m/s, forward speed
 		_veh_turn_velocity = [0.0]   # rad/s, current hull rotation speed
 		_last_tick_time = [BigWorld.time()]
@@ -8749,7 +9350,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		                             # contact: the spawn drop (collide-miss fallback puts
 		                             # the hull well above ground) must land free, or the
 		                             # tank spawns damaged/dead (WZ-111 report)
-		
+
 		# === WoT-style physics parameters ===
 		import math
 		# ONE source of physics laws + parameters for player AND bots:
@@ -8844,7 +9445,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			globals().pop(_nav_error_key, None)
 		_offh_seen_arena = [False]
 		_offh_seen_bw = [False]
-		
+
 		global g_base_capture
 		from gui.mods.offhangar import capture_rules as _capture_rules_init
 		g_base_capture = {
@@ -8856,6 +9457,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		globals().pop('g_offh_battle_over', None)
 		globals().pop('g_offh_result_requested', None)
 		globals().pop('_offh_kill_msgs', None)
+		globals().pop('_offh_settled_deaths', None)
+		globals().pop('_offh_canonical_frags', None)
 		# Drop the hit-sound carrier reference. It is added with BigWorld.addModel,
 		# NOT through _add_model, so the end-of-battle sweep never saw it - carrying
 		# a model reference across a space teardown is the dangling-reference case
@@ -8865,7 +9468,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		# New battle, new queue - the old one belongs to the finished arena.
 		globals().pop('g_offh_crew_notif', None)
 		globals().pop('g_offh_roster_ready', None)
-		
+
 		global g_capture_tick_ref
 		def trigger_battle_results(winnerTeam=1):
 			import BigWorld
@@ -8875,7 +9478,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				from gui.SystemMessages import SM_TYPE, pushMessage
 				pushMessage('Offline battle finished. Returning to Hangar...'.encode('utf-8'), SM_TYPE.Information)
 			except Exception as e: pass
-			
+
 			try:
 				import MusicController
 				if hasattr(MusicController, 'g_musicController') and MusicController.g_musicController:
@@ -8893,26 +9496,26 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					try: _mc.play(evt)
 					except: pass
 			except Exception as e: pass
-			
+
 			try:
 				import battle_results_shared
 				mock_arena_id = 999
-				
+
 				v_id = getattr(player, 'playerVehicleID', 1)
 				p_max_health = getattr(getattr(player, 'vehicleTypeDescriptor', None), 'maxHealth', 1000)
 				p_health = getattr(getattr(player, 'vehicle', None), 'health', p_max_health)
-				
+
 				_player_mock = globals().get('G_MOCK_VEHICLES', {}).get(getattr(player, 'playerVehicleID', -1))
 				_p_killer_id = getattr(_player_mock, 'last_killer_id', 255) if p_health <= 0 else 0
-				
+
 				p_team = getattr(player, 'team', 1)
 				p_dbid = getattr(player, 'databaseID', 1)
 				p_name = getattr(player, 'name', 'Player')
 				p_cd = getattr(getattr(getattr(player, 'vehicleTypeDescriptor', None), 'type', None), 'compactDescr', 0)
-				
+
 				players_dict = {p_dbid: {'name': p_name, 'clanDBID': 0, 'clanAbbrev': '', 'prebattleID': 0, 'team': p_team, 'igrType': 0}}
 				vehicles_dict = {v_id: {'health': p_health, 'credits': 10000, 'xp': 1000, 'shots': 10, 'hits': 8, 'he_hits': 0, 'pierced': 8, 'damageDealt': 0, 'damageAssisted': 0, 'damageReceived': max(0, p_max_health - p_health), 'shotsReceived': 0, 'spotted': 0, 'damaged': 0, 'kills': 0, 'tdamageDealt': 0, 'tkills': 0, 'isTeamKiller': False, 'capturePoints': 0, 'droppedCapturePoints': 0, 'mileage': 100, 'lifeTime': 300, 'killerID': _p_killer_id, 'achievements': [], 'repair': 0, 'freeXP': 50, 'details': {}, 'accountDBID': p_dbid, 'team': p_team, 'typeCompDescr': p_cd, 'gold': 0}}
-				
+
 				for vid, vinfo in getattr(player.arena, 'vehicles', {}).items():
 					if vid == v_id: continue
 					bot_team = vinfo.get('team', 2)
@@ -8921,15 +9524,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					td = vinfo.get('vehicleType', None)
 					td_type = getattr(td, 'type', None)
 					bot_cd = getattr(td_type, 'compactDescr', 0)
-					
+
 					players_dict[bot_dbid] = {'name': bot_name, 'clanDBID': 0, 'clanAbbrev': '', 'prebattleID': 0, 'team': bot_team, 'igrType': 0}
-					
+
 					is_killed = not vinfo.get('isAlive', True)
 					bot_hp = getattr(td, 'maxHealth', 1000)
 					if is_killed: bot_hp = 0
-					
+
 					vehicles_dict[vid] = {'health': bot_hp, 'credits': 0, 'xp': 0, 'shots': 0, 'hits': 0, 'he_hits': 0, 'pierced': 0, 'damageDealt': 0, 'damageAssisted': 0, 'damageReceived': getattr(td, 'maxHealth', 1000) - bot_hp, 'shotsReceived': 0, 'spotted': 0, 'damaged': 0, 'kills': 0, 'tdamageDealt': 0, 'tkills': 0, 'isTeamKiller': False, 'capturePoints': 0, 'droppedCapturePoints': 0, 'mileage': 10, 'lifeTime': 300, 'killerID': v_id if is_killed else 0, 'achievements': [], 'repair': 0, 'freeXP': 0, 'details': {}, 'accountDBID': bot_dbid, 'team': bot_team, 'typeCompDescr': bot_cd, 'gold': 0}
-				
+
 				mock_res = {
 					'arenaUniqueID': mock_arena_id,
 					'personal': {'health': p_health, 'credits': 10000, 'xp': 1000, 'shots': 10, 'hits': 8, 'he_hits': 0, 'pierced': 8, 'damageDealt': 0, 'damageAssisted': 0, 'damageReceived': 0, 'shotsReceived': 0, 'spotted': 0, 'damaged': 0, 'kills': 0, 'tdamageDealt': 0, 'tkills': 0, 'isTeamKiller': False, 'capturePoints': 0, 'droppedCapturePoints': 0, 'mileage': 100, 'lifeTime': 300, 'killerID': _p_killer_id, 'achievements': [], 'repair': 0, 'freeXP': 50, 'details': {}, 'accountDBID': p_dbid, 'team': p_team, 'typeCompDescr': p_cd, 'gold': 0, 'xpPenalty': 0, 'creditsPenalty': 0, 'creditsContributionIn': 0, 'creditsContributionOut': 0, 'tmenXP': 0, 'eventCredits': 0, 'eventGold': 0, 'eventXP': 0, 'eventFreeXP': 0, 'eventTMenXP': 0, 'autoRepairCost': 0, 'autoLoadCost': (0, 0), 'autoEquipCost': (0, 0), 'isPremium': True, 'premiumXPFactor10': 15, 'premiumCreditsFactor10': 15, 'dailyXPFactor10': 10, 'aogasFactor10': 10, 'markOfMastery': 0, 'dossierPopUps': []},
@@ -8937,29 +9540,29 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					'players': players_dict,
 					'vehicles': vehicles_dict
 				}
-				
-				
-				
+
+
+
 				try:
 					from gui import WindowsManager
 					if hasattr(WindowsManager.g_windowsManager, 'showBattleResults'):
 						WindowsManager.g_windowsManager.showBattleResults(mock_arena_id)
 				except: pass
-				
+
 			except Exception as e:
 				import traceback
 				import gui.mods.offhangar.logging as __offlog
 				__offlog.LOG_DEBUG('CRITICAL ERROR IN TRIGGER BATTLE RESULTS:', e)
 				__offlog.LOG_DEBUG(traceback.format_exc())
-				
+
 			# Now clean up and leave arena!
 			# Restore original stats object which was replaced with FakeStats
 			if hasattr(player, '_offhangar_orig_stats') and player._offhangar_orig_stats is not None:
 				player.stats = player._offhangar_orig_stats
-			
+
 			_leaveArena()
 			player.onBecomeNonPlayer()
-			
+
 			# HACK: Because we triggered onBecomeNonPlayer manually but never call
 			# onBecomePlayer to avoid crashing the offline mock state, we must manually
 			# re-bind the requester modules and un-ignore them!
@@ -9024,7 +9627,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					import traceback
 					LOG_DEBUG('battle end error:', traceback.format_exc())
 			_offh_battle_callback(5.0, _end_now)
-		
+
 		def _offh_check_battle_end():
 			'''Team wipe and timer expiry. Base capture handles itself further down.'''
 			import BigWorld
@@ -9093,7 +9696,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				try:
 					from gui.mods.offhangar.network_battle import network_is_authority
 					if network_is_authority(_pl):
-						return
+						return True
 				except Exception:
 					pass
 				for _team in (1, 2):
@@ -9113,12 +9716,108 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					g_base_capture[_team]['points'] = _points
 					g_base_capture[_team]['stopped'] = _stopped
 					g_base_capture[_team]['contributors'] = _contributors
+					_active_contributors = []
+					for _vehicle_key in _raw.get('active_contributors') or ():
+						_vehicle_key = str(_vehicle_key)[:64]
+						if (_vehicle_key.startswith('human:') or
+								_vehicle_key.startswith('bot:')):
+							_active_contributors.append(_vehicle_key)
+					g_base_capture[_team]['active_contributors'] = sorted(
+						set(_active_contributors))[:30]
+					g_base_capture[_team]['invaders'] = len(
+						g_base_capture[_team]['active_contributors'])
 					g_base_capture[_team]['cursor'] = max(
 						0, int(_raw.get('cursor', 0) or 0))
 					if _pl is not None and (_old != _points or _old_stopped != _stopped):
 						_pl.arena.onTeamBasePointsUpdate(_team, 0, _points, _stopped)
+				return True
 			except Exception as _nre:
 				LOG_DEBUG('LAN rules UI apply error:', str(_nre))
+				return False
+
+		def _prepare_native_authority_streaming():
+			"""Hold a promoted authority behind live collision coverage."""
+			try:
+				_pl = BigWorld.player()
+				if _pl is None or _offh_network_bot_role(_pl) != 'handoff':
+					return False
+				_bootstrap = getattr(
+					_pl, '_offh_spawn_streaming_bootstrap', None)
+				if _bootstrap is None:
+					_manifest = list(getattr(
+						_pl, '_offhangar_network_bot_manifest', None) or ())
+					from gui.mods.offhangar.network_battle import (
+						_world_from_server, _world_yaw_from_server)
+					_jobs = []
+					for _entry in _manifest:
+						_point = _world_from_server(_pl, _entry)
+						_jobs.append((
+							int(_entry.get('team', 0) or 0),
+							int(_entry.get('slot', 0) or 0),
+							int(_entry.get('id')),
+							float(_point.x), float(_point.y), float(_point.z),
+							float(_world_yaw_from_server(_pl, _entry)),
+							str(_entry.get('vehicle')), str(_entry.get('name'))))
+
+					# A full handoff has already committed relay poses to the local
+					# mocks. Probe those current alive poses rather than their original
+					# spawn points when the complete runtime index is available.
+					_mock_source = globals().get('G_MOCK_VEHICLES')
+					if isinstance(_mock_source, dict) and _mock_source:
+						_mock_by_bot = {}
+						for _mock in _mock_source.values():
+							_bot_id = getattr(_mock, '_network_bot_id', None)
+							if _bot_id is not None:
+								_mock_by_bot[int(_bot_id)] = _mock
+						_current_jobs = []
+						for _job in _jobs:
+							_mock = _mock_by_bot.get(int(_job[2]))
+							if _mock is None:
+								return False
+							if not bool(getattr(_mock, 'isAlive', True)):
+								continue
+							_pos = getattr(_mock, 'position', None)
+							if _pos is None:
+								return False
+							_current_jobs.append((
+								_job[0], _job[1], _job[2], float(_pos.x),
+								float(_pos.y), float(_pos.z),
+								float(getattr(_mock, 'yaw', _job[6]) or 0.0),
+								_job[7], _job[8]))
+						_jobs = _current_jobs
+
+					from gui.mods.offhangar.spawn_streaming_bootstrap import (
+						SpawnStreamingBootstrap, coverage_target_from_bounds)
+					_graph = globals().get('g_offh_baked_navigation_graph')
+					_coverage_target = None
+					if isinstance(_graph, dict):
+						_coverage_target = coverage_target_from_bounds(
+							_graph.get('bounds'))
+					def _probe_handoff_support(_probe_job):
+						_hit = BigWorld.wg_collideSegment(
+							_offh_bspace(),
+							Math.Vector3(float(_probe_job[3]),
+								float(_probe_job[4]) + 3.0,
+								float(_probe_job[5])),
+							Math.Vector3(float(_probe_job[3]),
+								float(_probe_job[4]) - 12.0,
+								float(_probe_job[5])), 128)
+						return None if _hit is None else float(_hit[0].y)
+					_origin = getattr(_pl, 'position', None)
+					if _origin is None:
+						_origin = (veh_pos[0], veh_pos[1], veh_pos[2])
+					_bootstrap = SpawnStreamingBootstrap(
+						BigWorld.projection(), _jobs, _origin,
+						_probe_handoff_support, time.time(), 30.0,
+						height_tolerance=3.0,
+						coverage_target=_coverage_target)
+					_pl._offh_spawn_streaming_bootstrap = _bootstrap
+				_phase = _bootstrap.poll(time.time(), 0)
+				return _phase in ('placement_ready', 'complete')
+			except Exception as _streaming_error:
+				LOG_ERROR('Native authority streaming gate failed: %s' %
+					str(_streaming_error))
+				return False
 
 		def _apply_network_result(_result):
 			try:
@@ -9133,10 +9832,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		try:
 			BigWorld.player()._offhangar_apply_network_rules_state = _apply_network_rules
 			BigWorld.player()._offhangar_apply_network_battle_result = _apply_network_result
+			BigWorld.player()._offhangar_prepare_native_authority_streaming = _prepare_native_authority_streaming
 			BigWorld.player()._offhangar_network_result_applied = False
 		except Exception:
 			pass
-		
+
 		def _capture_tick():
 			try:
 				if _battle_finished[0]: return
@@ -9162,11 +9862,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				if _bwref is not None:
 					_offh_seen_bw[0] = True
 				elif _offh_seen_bw[0]:
-					try:
-						_offh_battle_sweep('esc')
-					except:
-						pass
-					_battle_finished[0] = True
+					_leaveArena()
 					return
 
 				# Period progression is local presentation, but battle rules below are
@@ -9227,11 +9923,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					_bt = getattr(e_mock, '_bot_team', None)
 					if _bt in vehs_by_team and getattr(e_mock, 'isAlive', False):
 						vehs_by_team[_bt].append(e_mock)
-				
+
 				# Check base distances
 				for base_team, bases in g_offline_bases.items():
 					if not bases: continue
-					
+
 					invading_team = 2 if base_team == 1 else 1
 
 					invader_keys = []
@@ -9250,7 +9946,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									invader_keys.append(_invader_key)
 								break
 					invaders_count = len(invader_keys)
-					
+
 					defenders_count = 0
 					for defender in vehs_by_team[base_team]:
 						_defender_xz = _capture_xz(defender)
@@ -9263,7 +9959,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							if dx*dx + dz*dz <= 2500.0:
 								defenders_count += 1
 								break
-					
+
 					state = g_base_capture[base_team]
 					old_points = int(state.get('points', 0) or 0)
 					old_stopped = bool(state.get('stopped', False))
@@ -9285,7 +9981,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										invaders_count, defenders_count))
 								except Exception:
 									pass
-					
+
 					# Handle transition from PREBATTLE to BATTLE
 					if getattr(player.arena, 'period', 0) == 2 and BigWorld.serverTime() >= getattr(player.arena, 'periodEndTime', 0):
 						import gui.mods.offhangar.logging as __offlog
@@ -9296,11 +9992,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						player.arena.periodEndTime = BigWorld.serverTime() + _remaining
 						player.arena.onPeriodChange(3, player.arena.periodEndTime, _remaining, {}) # dict, not int: UI handlers call has_key() on it
 
-					
+
 					import debug_utils
 					if state['points'] != old_points or invaders_count > 0:
 						debug_utils.LOG_DEBUG('Capture tick: team', base_team, 'invaders:', invaders_count, 'defenders:', defenders_count, 'points:', state['points'], 'serverTime:', BigWorld.serverTime())
-					
+
 					from gui.mods.offhangar import capture_rules as _capture_rules_tick
 					_capture_result = _capture_rules_tick.advance(
 						state, invader_keys, defenders_count > 0)
@@ -9313,9 +10009,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_offh_stats_for(player), _player_gain)
 						except Exception:
 							pass
-						
+
 					# Removed old hack
-						
+
 					if (state['points'] != old_points or
 							bool(state.get('stopped', False)) != old_stopped or
 							invaders_count > 0):
@@ -9344,7 +10040,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								bool(state.get('stopped', False)))
 						except Exception as e:
 							__offlog.LOG_DEBUG('LOUD: Capture UI Error:', e)
-					
+
 					if state['points'] >= 100 and not globals().get('g_offh_capture_won'):
 						globals()['g_offh_capture_won'] = True
 						try:
@@ -9387,11 +10083,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							1.0, _capture_tick)
 				except Exception:
 					pass
-					
+
 		g_capture_tick_ref = _capture_tick
 		globals()['g_offh_capture_callback_id'] = BigWorld.callback(
 			5.0, _capture_tick)
-		
+
 		global g_aih_tick_ref
 		def _aih_tick():
 			# A cancelled callback can already be executing. Reject stale work before
@@ -9403,7 +10099,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			try:
 				import BigWorld, Math, Keys, math
 				player = BigWorld.player()
-				
+
 				# Stop the loop if battle is over
 				if _battle_finished[0] or player is None:
 					return
@@ -9428,11 +10124,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				if _bwref is not None:
 					_offh_seen_bw[0] = True
 				elif _offh_seen_bw[0]:
-					try:
-						_offh_battle_sweep('esc')
-					except:
-						pass
-					_battle_finished[0] = True
+					_leaveArena()
 					return
 				current_time = BigWorld.time()
 				dt = current_time - _last_tick_time[0]
@@ -9462,44 +10154,50 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						_my_bl = _bases_fix.get(getattr(player, '_offhangar_team', 1) or 1) or []
 						_my_b = _my_bl[0] if _my_bl else None
 						if _my_b is not None:
-							_probe = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(_my_b.x, 800.0, _my_b.z), Math.Vector3(_my_b.x, -500.0, _my_b.z), 128)
-							if _probe is not None:
-								# Terrain is ready: take the player's line-up slot
-								_fs = globals().get('g_offline_formation_slot')
-								if _fs is not None:
-									_slot = 0
-									try:
-										from gui.mods.offhangar._constants import CONFIG_OPTIONS as _NET_SLOT_CFG
-										if bool(_NET_SLOT_CFG.get('network_mode', False)):
-											_slot = int(getattr(player, '_offhangar_network_slot', 0) or 0)
-									except Exception:
-										_slot = 0
-									_sx, _sz, _syaw = _fs(getattr(player, '_offhangar_team', 1) or 1, _slot)
-								else:
-									_sx, _sz, _syaw = _my_b.x, _my_b.z, 0.0
-								# Roof-safe ground probe: while something substantially
-								# lower exists below the hit (roof/bridge), keep going down
-								_gy = None
-								_from_y = 800.0
-								for _ri in range(4):
-									_c1 = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(_sx, _from_y, _sz), Math.Vector3(_sx, -500.0, _sz), 128)
-									if _c1 is None: break
-									_gy = _c1[0].y
-									_c2 = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(_sx, _gy - 0.4, _sz), Math.Vector3(_sx, -500.0, _sz), 128)
-									if _c2 is None or (_gy - _c2[0].y) < 2.5: break
-									_from_y = _gy - 0.4
-								if _gy is not None:
-									player._offh_spawn_fixed = True
-									veh_pos[0] = _sx
-									veh_pos[1] = _gy
-									veh_pos[2] = _sz
-									veh_yaw[0] = _syaw
-									_veh_velocity[0] = 0.0
-									_veh_turn_velocity[0] = 0.0
-									_veh_vert_vel[0] = 0.0
-									_veh_airborne[0] = False
-									_veh_fall_armed[0] = False  # teleported: next touchdown is free
-									LOG_DEBUG('OfflineBattle: spawn corrected to line-up slot:', _sx, _gy, _sz)
+							_slot = 0
+							try:
+								from gui.mods.offhangar._constants import CONFIG_OPTIONS as _NET_SLOT_CFG
+								if bool(_NET_SLOT_CFG.get('network_mode', False)):
+									_slot = int(getattr(player, '_offhangar_network_slot', 0) or 0)
+							except Exception:
+								_slot = 0
+							_fp = globals().get('g_offline_formation_pose')
+							if _fp is not None:
+								_sx, _expected_y, _sz, _syaw = _fp(
+									getattr(player, '_offhangar_team', 1) or 1, _slot)
+							else:
+								_sx, _expected_y, _sz, _syaw = (
+									_my_b.x, None, _my_b.z, 0.0)
+							_gy = None
+							if _expected_y is not None:
+								# The stock graph owns the terrain layer. Wait until that
+								# exact layer is streamed; never re-project from a roof above.
+								_c1 = BigWorld.wg_collideSegment(
+									_offh_bspace(),
+									Math.Vector3(_sx, float(_expected_y) + 3.0, _sz),
+									Math.Vector3(_sx, float(_expected_y) - 3.0, _sz), 128)
+								if (_c1 is not None and
+										abs(float(_c1[0].y) - float(_expected_y)) <= 0.35):
+									_gy = float(_c1[0].y)
+							else:
+								# Compatibility path for custom maps without a baked pose.
+								_c1 = BigWorld.wg_collideSegment(
+									_offh_bspace(), Math.Vector3(_sx, 800.0, _sz),
+									Math.Vector3(_sx, -500.0, _sz), 128)
+								if _c1 is not None:
+									_gy = float(_c1[0].y)
+							if _gy is not None:
+								player._offh_spawn_fixed = True
+								veh_pos[0] = _sx
+								veh_pos[1] = _gy
+								veh_pos[2] = _sz
+								veh_yaw[0] = _syaw
+								_veh_velocity[0] = 0.0
+								_veh_turn_velocity[0] = 0.0
+								_veh_vert_vel[0] = 0.0
+								_veh_airborne[0] = False
+								_veh_fall_armed[0] = False  # teleported: next touchdown is free
+								LOG_DEBUG('OfflineBattle: spawn corrected to line-up slot:', _sx, _gy, _sz)
 					except Exception as _sce:
 						LOG_DEBUG('Spawn correction error:', str(_sce))
 
@@ -9509,27 +10207,27 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					debug_utils.LOG_DEBUG('AIH_TICK DUMP AT START!')
 					_mock_vehicles = globals().get('G_MOCK_VEHICLES', {})
 					debug_utils.LOG_DEBUG('AIH_TICK keys:', _mock_vehicles.keys())
-					
+
 				def _get_terrain_ypr(spaceID, pos, yaw, length=5.0, width=3.0,
 						support=None, support_span=None):
 					import math, BigWorld, Math
 					cos_y = math.cos(yaw)
 					sin_y = math.sin(yaw)
-					
+
 					hl = length / 2.0
 					hw = width / 2.0
-					
+
 					# 4 body na podvozku
 					fx = pos.x + sin_y * hl
 					fz = pos.z + cos_y * hl
 					bx = pos.x - sin_y * hl
 					bz = pos.z - cos_y * hl
-					
+
 					rx = pos.x + cos_y * hw
 					rz = pos.z - sin_y * hw
 					lx = pos.x - cos_y * hw
 					lz = pos.z + sin_y * hw
-					
+
 					def get_y(x, z):
 						try:
 							_offh_perf_count('physics_rays')
@@ -9541,7 +10239,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								return c[0].y
 						except: pass
 						return pos.y
-					
+
 					# Terrain support already sampled the same fore/aft footprint this
 					# frame. Reuse those exact hits for pitch and spend engine rays only
 					# on the left/right footprint. Invalid or differently scaled support
@@ -9588,7 +10286,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						_s = _max_tilt / _tilt
 						pitch *= _s
 						roll *= _s
-					
+
 					# --- Slope gradient: unit downhill dir + magnitude (caller integrates slide) ---
 					slide_x = 0.0
 					slide_z = 0.0
@@ -9610,7 +10308,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					_spread = max(fy, by, ry, ly) - min(fy, by, ry, ly)
 					return (yaw, pitch, roll, slide_x, slide_z, slope, _spread)
 
-				def _terrain_support(spaceID, px, py, pz, yaw, hl=2.5):
+				def _terrain_support(spaceID, px, py, pz, yaw, hl=2.5,
+						maximum_y=None):
 					# Returns (supportMax, centreY, frontY, backY):
 					#   supportMax = HIGHEST ground under the fore-aft track footprint
 					#     (front/centre/back). A grounded tracked hull rests on the
@@ -9628,16 +10327,57 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					centre = None
 					front = None
 					back = None
-					_offh_perf_count('physics_rays', 3)
 					for _d in (hl, 0.0, -hl):
 						_x = px + _sy * _d
 						_z = pz + _cy * _d
-						try:
-							_c = BigWorld.wg_collideSegment(spaceID, Math.Vector3(_x, py + 2.0, _z), Math.Vector3(_x, py - 1000.0, _z), 128)
-						except Exception:
-							_c = None
-						if _c is not None:
+						_ray_start = Math.Vector3(_x, py + 2.0, _z)
+						_ray_end = Math.Vector3(_x, py - 1000.0, _z)
+						_yv = None
+						for _layer in range(4):
+							_offh_perf_count('physics_rays')
+							try:
+								_c = BigWorld.wg_collideSegment(
+									spaceID, _ray_start, _ray_end, 128)
+							except Exception:
+								_c = None
+							if _c is None:
+								break
 							_yv = _c[0].y
+							_destroyed = False
+							_above_limit = False
+							_ground_facing = False
+							try:
+								_ground_facing = float(_c[1].y) > 0.5
+							except Exception:
+								_ground_facing = False
+							try:
+								_above_limit = (maximum_y is not None and
+									float(_yv) > float(maximum_y))
+							except Exception:
+								_above_limit = False
+							try:
+								_mi = _offh_mat_info_for_segment_hit(
+									spaceID, _c[0], _c[1])
+								if _mi is not None:
+									_destroyed = bool(_get_destr_authority().is_destroyed(
+										_mi[2], _mi[3], _mi[4]))
+							except Exception:
+								_destroyed = False
+							if (not _destroyed and not _above_limit and
+									_ground_facing):
+								break
+							# Retail keeps a destroyed object's old BSP skin for about
+							# 0.2 s. A vertical ray can likewise hit an intact wagon or
+							# low roof above the maximum climbable support. Downward or
+							# vertical faces are not ground either. Continue below every
+							# rejected layer instead of inventing support.
+							_next_y = float(_yv) - 0.05
+							_yv = None
+							if _next_y <= _ray_end.y + 0.01:
+								_yv = None
+								break
+							_ray_start = Math.Vector3(_x, _next_y, _z)
+						if _yv is not None:
 							if best is None or _yv > best:
 								best = _yv
 							if _d == 0.0:
@@ -9648,12 +10388,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								back = _yv
 					return (best, centre, front, back)
 
-				def _try_destroy_destructible(spaceID, matInfo, yaw, vel):
+				def _try_destroy_destructible(crush_vehicle, spaceID, matInfo, yaw, vel):
 					import AreaDestructibles, BigWorld, constants
 					try:
 						if not hasattr(AreaDestructibles, 'g_destructiblesManager') or not AreaDestructibles.g_destructiblesManager:
 							return False
-							
+
 						hitPt, surfNormal, chunkID, itemIndex, matKind, fname = matInfo
 						_dseen = globals().setdefault('g_offh_destr_seen', set())
 						_dkey = (matKind, fname)
@@ -9670,7 +10410,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							if _dkey not in _dnd:
 								_dnd.add(_dkey); LOG_DEBUG('Destr no desc: matKind=', matKind, 'fname=', repr(fname), 'chunk=', chunkID, 'idx=', itemIndex)
 							return False
-						
+
 						# Data-driven vegetation gate: soft vegetation (bush/shrub/fern)
 						# ships with health <= 5; real fallable trees start at 10.
 						if desc['type'] in (AreaDestructibles.DESTR_TYPE_TREE, AreaDestructibles.DESTR_TYPE_FALLING_ATOM):
@@ -9680,7 +10420,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						# All bookkeeping (chunk bootstrap, dedup, encoding) lives in
 						# the authority - this path is now just a contact sensor.
 						_auth = _get_destr_authority()
-						
+
 						typ = desc['type']
 						# STRUCTURE (buildings) now falls through to the module-destroy
 						# path: online, small buildings crumble module by module as the
@@ -9689,7 +10429,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						if _auth.is_destroyed(chunkID, itemIndex, matKind):
 							LOG_DEBUG('Destr: already broken')
 							return True
-							
+						if not _auth.can_crush(
+								crush_vehicle, spaceID, chunkID, itemIndex, matKind,
+								fname, vel):
+							return False
+
 						if typ == AreaDestructibles.DESTR_TYPE_TREE:
 							_destr_ok = _auth.destroy_tree(spaceID, chunkID, itemIndex, yaw, vel, hitPt)
 						elif typ == AreaDestructibles.DESTR_TYPE_FALLING_ATOM:
@@ -9699,14 +10443,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						else:
 							# STRUCTURE: buildings crumble module by module
 							_destr_ok = _auth.destroy_module(spaceID, chunkID, itemIndex, matKind, hitPt, False)
-							
+
 						if _destr_ok:
 							LOG_DEBUG('Destr SUCCESS!', typ)
-						return True
+						return bool(_destr_ok)
 					except Exception as e:
 						LOG_DEBUG('Destr Exception:', str(e))
 					return False
-					
+
 				# The destructible effect pipeline (fall dust, decay effects) calls
 				# player.terrainEffects.addNew(); only the real battle Avatar has it.
 				# Without it __launchFallEffect raises and trees never start falling.
@@ -9725,11 +10469,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					player.newFakeModel = _offh_new_fake_model
 				except Exception:
 					LOG_CURRENT_EXCEPTION()
-				
+
 				# Export for _mock_shoot (different function scope); resolved at call time
 				loaded_models['_destr_fn'] = _try_destroy_destructible
 
-				def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
+				def _fell_trees_near(crush_vehicle, spaceID, pos, yaw, vel, td=None):
 					# Offline tree/pole felling. Online the SERVER detected tank-vs-tree
 					# contact; the client-side collision probes never return tree/column
 					# materials, so trees could never fall offline. Instead: enumerate
@@ -9794,16 +10538,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										desc = AreaDestructibles.g_cache.getDescByFilename(_dfn[_ti])
 										if desc is None:
 											continue
-										if desc['type'] not in (AreaDestructibles.DESTR_TYPE_TREE, AreaDestructibles.DESTR_TYPE_FALLING_ATOM, AreaDestructibles.DESTR_TYPE_FRAGILE):
+										if desc['type'] not in (AreaDestructibles.DESTR_TYPE_TREE, AreaDestructibles.DESTR_TYPE_FALLING_ATOM):
 											continue
 										# Data-driven vegetation gate: destructibles.xml gives
 										# soft vegetation (bushes/shrubs/ferns/weeds) health<=5
 										# (or -2); real fallable trees start at health 10.
 										# ChristmasTree sentinels use 40000 = unrammable.
-										if desc['type'] != AreaDestructibles.DESTR_TYPE_FRAGILE:
-											_hp_gate = desc.get('health', 0)
-											if _hp_gate < 10 or _hp_gate > 1000:
-												continue
+										_hp_gate = desc.get('health', 0)
+										if _hp_gate < 10 or _hp_gate > 1000:
+											continue
 										# Destructible matrices are CHUNK-LOCAL: world pos =
 										# chunk translation + destructible translation
 										# (see AreaDestructibles.__launchEffect)
@@ -9833,35 +10576,35 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_key = (cid, _ti)
 								if _key in _st['felled']:
 									continue
-								_st['felled'].add(_key)
 								fall_yaw = yaw if vel >= 0 else (yaw + math.pi)
 								_auth = _get_destr_authority()
-								if _ttyp == AreaDestructibles.DESTR_TYPE_FRAGILE:
-									# Haybales, barrels, wire fences: collision skins often
-									# resolve to no item in the probes; crush by proximity.
-									_ok = _auth.destroy_fragile(spaceID, cid, _ti, pos)
-								elif _ttyp == AreaDestructibles.DESTR_TYPE_TREE:
+								if not _auth.can_crush(
+										crush_vehicle, spaceID, cid, _ti, 0, _tfn, vel):
+									continue
+								if _ttyp == AreaDestructibles.DESTR_TYPE_TREE:
 									_ok = _auth.destroy_tree(spaceID, cid, _ti, fall_yaw, vel, pos)
 								else:
 									_ok = _auth.destroy_column(spaceID, cid, _ti, fall_yaw, vel, pos)
 								if _ok:
+									_st['felled'].add(_key)
 									LOG_DEBUG('DestrTree: FELLED', cid, _ti, 'type', _ttyp, 'hp', _thp, 'mass', _tmass, _tfn)
 					except Exception:
 						import traceback
 						LOG_DEBUG('DestrTree error:', traceback.format_exc())
-				
-				def _try_destroy_solid_hit(spaceID, seg_start, hit_pt, yaw, vel):
+
+				def _try_destroy_solid_hit(crush_vehicle, spaceID, hit_pt, surface_normal, yaw, vel):
 					# wg_collideSegment returns no material info: probe the hit point for a
-					# destructible (fence/wall segment) before treating it as solid
+					# destructible along the authored contact normal before treating it solid.
 					try:
 						_mi = _offh_mat_info_for_segment_hit(
-							spaceID, seg_start, hit_pt)
+							spaceID, hit_pt, surface_normal)
 						if _mi is not None:
-							return _try_destroy_destructible(spaceID, _mi, yaw, vel)
+							return _try_destroy_destructible(
+								crush_vehicle, spaceID, _mi, yaw, vel)
 					except Exception:
 						pass
 					return False
-				
+
 				def _collision_damage(victim, dmg, attacker_id):
 					# Ported ram-damage sink: HP, damage panel / marker feedback, kill.
 					if dmg <= 0 or victim is None:
@@ -10006,7 +10749,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									inv_o = 0.0
 							except Exception:
 								inv_o = 0.0
-						elif (_o_body is not None and
+						if (_o_body is not None and
 								_o_body.get('native_owner', False)):
 							# Python collision cannot teleport an attached WGVehiclePhysics2
 							# body. Resolve the complete hybrid contact on the Python-owned
@@ -10105,7 +10848,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						# hull cannot be ground we drive on (the drivable band over L is 2.86 m), so
 						# drop below it and probe again.
 						_from = y + 15.0
-						for _ in range(3):
+						for _ in range(4):
 							try:
 								_offh_perf_count('physics_rays')
 								c = BigWorld.wg_collideSegment(spaceID, Math.Vector3(px, _from, pz), Math.Vector3(px, y - 60.0, pz), 128)
@@ -10117,6 +10860,18 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							if _yv > y + 3.5:
 								_from = _yv - 0.5
 								continue
+							# A low fence, pole or tree in front of the hull is an obstacle,
+							# not the terrain grade.  Continue below its authored BSP skin;
+							# the horizontal sweep remains responsible for the retail crush
+							# decision, so this never makes an intact object passable.
+							try:
+								_mat_info = _offh_mat_info_for_segment_hit(
+									spaceID, c[0], c[1])
+								if _offh_destructible_mat_passable(_mat_info):
+									_from = _yv - 0.05
+									continue
+							except Exception:
+								pass
 							return _yv
 						return None
 					fy = _gy(x + fx * L, z + fz * L)
@@ -10124,9 +10879,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					p = _support_drive_pitch(y, (None, None, fy, by), L)
 					return 0.0 if p is None else p
 
-				def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None, airborne=False, dt=0.04):
+				def _check_horizontal_collision(crush_vehicle, spaceID, pos, yaw, vel,
+						td=None, airborne=False, dt=0.04, sweep_direction=None):
 					import math, BigWorld, Math
 					try:
+						_direction = vel if sweep_direction is None else sweep_direction
+						_forward = _direction > 0.0
 						hw = 1.5
 						hl_front = 3.5
 						hl_back = 3.5
@@ -10149,9 +10907,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						# 1.2 m cap was only safe at high FPS and could tunnel through thin
 						# geometry after a slow frame.
 						_ahead = max(0.4, abs(vel) * max(0.0, dt) + 0.2)
-						back_margin = -0.5 if vel > 0 else 0.5
-						front_margin = (hl_front + _ahead) if vel > 0 else -(hl_back + _ahead)
-						
+						back_margin = -0.5 if _forward else 0.5
+						front_margin = (hl_front + _ahead) if _forward else -(hl_back + _ahead)
+
 						cos_y = math.cos(yaw)
 						sin_y = math.sin(yaw)
 
@@ -10160,7 +10918,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						# work cannot let a fast hull tunnel through a thin wall.
 						_bottom_hits = []
 						_target_len = (abs(back_margin) +
-							(hl_front if vel > 0 else hl_back) + _ahead)
+							(hl_front if _forward else hl_back) + _ahead)
 						for offset_x in (-hw, 0, hw):
 							sx = pos.x + cos_y * offset_x
 							sz = pos.z - sin_y * offset_x
@@ -10186,12 +10944,157 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							return False
 						_offh_perf_count('wall_exact')
 
-						# A lower sweep also intersects ordinary uphill ground. Classify a
-						# candidate with vertical samples only after a hit exists. Flat ground
-						# is not a hill and must never hide a genuine wall at the same height.
+						# A lower sweep also intersects ordinary slopes and rounded crests.
+						# Use the stock 0.8.2 terrain callback for this exception. Re-probing an
+						# upward contact vertically is not enough: an inclined rock simply hits
+						# itself again and can self-certify as ground. Flat ground is not a terrain
+						# profile here and must never hide a genuine wall at the same height.
 						try:
-							_fw = 1.0 if vel >= 0 else -1.0
-							_look = (hl_front if vel > 0 else hl_back) + _ahead
+							def _terrain_triangle(_mat_kind, _coll_flags,
+									_item_id, _chunk_id):
+								return _coll_flags & 8
+
+							def _terrain_hit(_segment_start, _segment_end):
+								_offh_perf_count('physics_rays')
+								return BigWorld.wg_collideSegment(
+									spaceID, _segment_start, _segment_end, 128,
+									_terrain_triangle)
+
+							def _contact_matches_ground(
+									_segment_start, _segment_end, _contact):
+								try:
+									_normal_y = float(_contact[1].y)
+									if _normal_y <= 0.5:
+										return False, None, None, False, False, False
+
+									def _terrain_profile_overlimit(_terrain_contact):
+										# Match the seven-sample profile's longitudinal grade.
+										# A steep cross-slope is handled by the existing lateral
+										# slide law and must not become an invisible forward wall.
+										_terrain_normal_y = float(_terrain_contact[1].y)
+										if _terrain_normal_y <= 0.5:
+											return True
+										_normal_along_sweep = abs(
+											float(_terrain_contact[1].x) * sin_y +
+											float(_terrain_contact[1].z) * cos_y)
+										return (_normal_along_sweep >
+											_VC.TERRAIN_PROFILE_MAXIMUM_GRADIENT *
+											_terrain_normal_y)
+									# Stock TargetPointCalculator uses mask 136 for the
+									# non-terrain subset of the same mask-128 segment.
+									# This catches a coincident sloped rock and a thin wall
+									# immediately behind terrain before the 3 cm rescan step.
+									_offh_perf_count('physics_rays')
+									_solid = BigWorld.wg_collideSegment(
+										spaceID, _segment_start, _segment_end, 136)
+									if _solid is None:
+										# Mask 136 is the complete non-terrain subset of this
+										# remaining segment. No solid can be hidden behind the
+										# first terrain triangle, so repeated mask-128 terrain
+										# contacts must not consume the bounded solid budget.
+										_overlimit_terrain = _terrain_profile_overlimit(_contact)
+										return (not _overlimit_terrain, None, None, True,
+											True, _overlimit_terrain)
+									_contact_distance = (
+										_contact[0] - _segment_start).length
+									_solid_distance = (
+										_solid[0] - _segment_start).length
+									if _solid_distance > _contact_distance + 0.05:
+										_overlimit_terrain = _terrain_profile_overlimit(_contact)
+										return (True, None, None, True, False,
+											_overlimit_terrain)
+									# Near/coincident upward geometry is ambiguous from its
+									# normal alone. Query the stock terrain subset explicitly:
+									# a prop mounted on steep terrain must not erase that slope
+									# proof after its own crush delivery succeeds.
+									_terrain = _terrain_hit(_segment_start, _segment_end)
+									if _terrain is None:
+										return (False, _solid, _solid_distance, False,
+											False, False)
+									_terrain_distance = (
+										_terrain[0] - _segment_start).length
+									_overlimit_terrain = _terrain_profile_overlimit(_terrain)
+									if _solid_distance > _terrain_distance + 0.03:
+										return (True, None, None, True, False,
+											_overlimit_terrain)
+									return (False, _solid, _solid_distance, True,
+										False, _overlimit_terrain)
+								except Exception:
+									raise
+
+							# Walk every occupied lower lane to its exact endpoint. A
+							# successful crush only clears that one contact; it must not
+							# hide a second intact object farther inside the same movement
+							# sweep. Six contacts is a bounded fail-closed budget.
+							_saw_terrain_contact = False
+							_saw_overlimit_terrain = False
+							for _bottom_hit in _bottom_hits:
+								(offset_x, sx, sz, x2, z2, start_bot, end_bot,
+									col_bot, d_bot) = _bottom_hit
+								_span_x = end_bot.x - start_bot.x
+								_span_z = end_bot.z - start_bot.z
+								_span_len = math.sqrt(
+									_span_x * _span_x + _span_z * _span_z)
+								_scan_start = start_bot
+								_contact = col_bot
+								_scan_finished = False
+								for _scan_index in range(6):
+									(_matches_ground, _near_solid,
+										_near_solid_distance,
+										_contact_saw_terrain,
+										_remaining_nonterrain_clear,
+										_contact_overlimit_terrain) = _contact_matches_ground(
+										_scan_start, end_bot, _contact)
+									_progress_hit = _contact
+									if _contact_saw_terrain:
+										_saw_terrain_contact = True
+									if _contact_overlimit_terrain:
+										_saw_overlimit_terrain = True
+									if _remaining_nonterrain_clear:
+										_scan_finished = True
+										break
+									if _matches_ground:
+										pass
+									else:
+										if _near_solid is not None:
+											_progress_hit = _near_solid
+										if not _try_destroy_solid_hit(
+												crush_vehicle, spaceID, _progress_hit[0],
+												_progress_hit[1], yaw, vel):
+											return True
+									_contact_distance = (
+										_progress_hit[0] - start_bot).length
+									# Terrain triangles need a small step past the crossing to
+									# avoid returning the same surface. After an accepted solid,
+									# use only a 1 mm numeric epsilon so a second object mounted
+									# immediately behind a fragile fence cannot be skipped.
+									_advance = 0.03 if _matches_ground else 0.001
+									_next_distance = _contact_distance + _advance
+									if _next_distance >= _span_len - 0.001:
+										_scan_finished = True
+										break
+									_ratio = _next_distance / _span_len
+									_scan_start = Math.Vector3(
+										start_bot.x + _span_x * _ratio,
+										start_bot.y,
+										start_bot.z + _span_z * _ratio)
+									_offh_perf_count('physics_rays')
+									_contact = BigWorld.wg_collideSegment(
+										spaceID, _scan_start, end_bot, 128)
+									if _contact is None:
+										_scan_finished = True
+										break
+									if ((_contact[0] - start_bot).length + 0.001 <
+											_next_distance):
+										return True
+								if not _scan_finished:
+									return True
+							if _saw_overlimit_terrain:
+								return True
+							if not _saw_terrain_contact:
+								return False
+							_fw = 1.0 if _forward else -1.0
+							_look = (hl_front if _forward else hl_back) + _ahead
 							_seg_n = 6
 							_seg = _look / _seg_n
 							_ground_heights = []
@@ -10199,71 +11102,28 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_dd = _seg * _si
 								_px = pos.x + sin_y * _dd * _fw
 								_pz = pos.z + cos_y * _dd * _fw
-								_offh_perf_count('physics_rays')
-								_gg = BigWorld.wg_collideSegment(
-									spaceID, Math.Vector3(_px, pos.y + 12.0, _pz),
-									Math.Vector3(_px, pos.y - 5.0, _pz), 128)
+								_gg = _terrain_hit(
+									Math.Vector3(_px, pos.y + 12.0, _pz),
+									Math.Vector3(_px, pos.y - 5.0, _pz))
 								if _gg is None:
 									_ground_heights = []
 									break
 								_ground_heights.append(_gg[0].y)
-							if (_ground_heights and
-									_VC.drivable_rising_profile(_ground_heights, _seg)):
-								return False
-						except: pass
+							if (not _ground_heights or
+									not _VC.drivable_rising_profile(
+										_ground_heights, _seg, allow_flat=True)):
+								return True
+							return False
+						except Exception:
+							# Once an exact lower contact exists, any uncertainty in
+							# terrain classification must stay solid. Falling back to
+							# the older top/mid heuristic can hide a wall behind a slope.
+							return True
 
-						for (offset_x, sx, sz, x2, z2, start_bot, end_bot,
-								col_bot, d_bot) in _bottom_hits:
-							# Retain the original centre-column destructible probe, but only
-							# after an exact solid candidate exists.
-							if offset_x == 0:
-								try:
-									seg_start = Math.Vector3(sx, pos.y + 0.5, sz)
-									seg_stop = Math.Vector3(x2, pos.y + 0.5, z2)
-									matInfo = BigWorld.wg_getMatInfoNearPoint(
-										spaceID, seg_start, seg_stop, seg_stop,
-										lambda *a: False)
-									if matInfo:
-										_try_destroy_destructible(
-											spaceID, matInfo, yaw, vel)
-								except: pass
-
-							start_top = Math.Vector3(start_bot.x, pos.y + 1.6, start_bot.z)
-							end_top = Math.Vector3(end_bot.x, pos.y + 1.6, end_bot.z)
-							_offh_perf_count('physics_rays')
-							col_top = BigWorld.wg_collideSegment(
-								spaceID, start_top, end_top, 128)
-
-							if col_top is not None:
-								d_top = (col_top[0] - start_top).length
-								if (d_top - d_bot) < 0.5:
-									if _try_destroy_solid_hit(
-											spaceID, start_bot, col_bot[0], yaw, vel):
-										pass
-									else:
-										return True
-								else:
-									start_mid = Math.Vector3(
-										start_bot.x, pos.y + 1.1, start_bot.z)
-									end_mid = Math.Vector3(
-										end_bot.x, pos.y + 1.1, end_bot.z)
-									_offh_perf_count('physics_rays')
-									col_mid = BigWorld.wg_collideSegment(
-										spaceID, start_mid, end_mid, 128)
-									if col_mid is not None:
-										d_mid = (col_mid[0] - start_mid).length
-										if (d_mid - d_bot) < 0.25:
-											if _try_destroy_solid_hit(
-													spaceID, start_bot, col_bot[0], yaw, vel):
-												pass
-											else:
-												return True
-							else:
-								# Low objects remain drivable, while any destructible skin is
-								# crushed before the hull advances through it.
-								_try_destroy_solid_hit(
-									spaceID, start_bot, col_bot[0], yaw, vel)
-					except: pass
+					except Exception:
+						# Collision uncertainty must stay solid. Returning False here used
+						# to turn any engine/material error into a wall pass-through.
+						return True
 					return False
 
 				def _offh_land_impact(vy):
@@ -10416,7 +11276,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				# Determine input direction
 				throttle = 0
 				steer = 0
-				
+
 				# Allow WASD to move the tank even in Arty Mode, because offline edge-panning is broken
 				# and the user needs to be able to rotate the hull to bring targets into the gun arc!
 				if getattr(player, '_is_dead', False) is True:
@@ -10464,12 +11324,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 
 					if _manual_left: steer = -1
 					elif _manual_right: steer = 1
-					
+
 					# Auto-hull rotation if aiming outside limits
 					# Only auto-rotate if not manually steering
 					if steer == 0:
 						steer = _gun_state.get('auto_steer', 0)
-				
+
 				# Freeze tank movement if battle hasn't started yet (Prebattle Countdown)
 				arena = getattr(BigWorld.player(), 'arena', None)
 				if arena is not None and getattr(arena, 'period', 3) < 3:
@@ -10610,11 +11470,19 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						if p: p.value = cur_speed / max_speed
 				except:
 					pass
-				# Apply position
-				if _veh_velocity[0] != 0.0:
+				# Apply position.  Preserve a direction-only sweep while drive input is
+				# held at zero speed.  A false slope used to zero the speed and then
+				# suppress the only exact obstacle probe, permanently pinning the hull.
+				# Direction and impact speed are deliberately separate.  Even a tiny
+				# invented speed can break an extreme mass-scaled destructible, so the
+				# retail crush gate must always receive the exact realised velocity.
+				_sweep_direction = _veh_velocity[0]
+				if abs(_sweep_direction) <= 0.0001 and abs(throttle) > 0.01:
+					_sweep_direction = 1.0 if throttle > 0.0 else -1.0
+				if _sweep_direction != 0.0:
 					_p_td = loaded_models.get('td')
-					_fell_trees_near(_offh_bspace(), Math.Vector3(veh_pos[0], veh_pos[1], veh_pos[2]), veh_yaw[0], _veh_velocity[0], _p_td)
-					if _check_horizontal_collision(_offh_bspace(), Math.Vector3(veh_pos[0], veh_pos[1], veh_pos[2]), veh_yaw[0], _veh_velocity[0], _p_td, _veh_airborne[0], dt):
+					_fell_trees_near(mock_veh, _offh_bspace(), Math.Vector3(veh_pos[0], veh_pos[1], veh_pos[2]), veh_yaw[0], _veh_velocity[0], _p_td)
+					if _check_horizontal_collision(mock_veh, _offh_bspace(), Math.Vector3(veh_pos[0], veh_pos[1], veh_pos[2]), veh_yaw[0], _veh_velocity[0], _p_td, _veh_airborne[0], dt, _sweep_direction):
 						# A WALL only pushes laterally - it must NOT brake a fall. Airborne:
 						# keep momentum, just don't advance into it (slide down the face).
 						if not _veh_airborne[0]:
@@ -10625,7 +11493,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_deflected = False
 							for _da in (0.55, -0.55, 1.0, -1.0):   # ~32 then ~57 deg, both sides
 								_ty = veh_yaw[0] + _da
-								if not _check_horizontal_collision(_offh_bspace(), Math.Vector3(veh_pos[0], veh_pos[1], veh_pos[2]), _ty, _veh_velocity[0], _p_td, False, dt):
+								if not _check_horizontal_collision(mock_veh, _offh_bspace(), Math.Vector3(veh_pos[0], veh_pos[1], veh_pos[2]), _ty, _veh_velocity[0], _p_td, False, dt, _sweep_direction):
 									# First tick of wall contact loses the into-wall velocity component
 									# (~40%); continuing to grind only applies friction. Storing the realized
 									# slide speed back into v stops the model booking phantom forward progress
@@ -10678,7 +11546,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					player._push_z *= 0.90
 				except Exception:
 					pass
-				
+
 				# --- Hull Rotation: physics.traverse_step (same law as the bots) ---
 				turn_dir = steer
 				# A destroyed track (or engine) stops the hull turning as well. Gating only the
@@ -10699,7 +11567,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					if _ptf < 1.0:
 						_veh_turn_velocity[0] = _veh_turn_velocity[0] * _ptf
 				except Exception: pass
-				
+
 				if _veh_turn_velocity[0] != 0.0:
 					veh_yaw[0] += _veh_turn_velocity[0] * dt
 					while veh_yaw[0] > math.pi: veh_yaw[0] -= 2*math.pi
@@ -10729,6 +11597,24 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					if ground_y is not None:
 						snap_gap = max(0.8, min(2.5, abs(_veh_velocity[0]) * dt * 2.0 + 0.6))
 						max_climb = max(0.6, abs(_veh_velocity[0]) * dt * 2.5)
+						try:
+							from gui.mods.offhangar import vehicle_collision as _VC
+							if _VC.support_rise_is_obstacle(
+									veh_pos[1], ground_y, max_climb):
+								# The upper hit is an obstacle, not support. Probe below
+								# the exact climb limit and preserve traction only when a
+								# real lower collision surface proves the floor. A void
+								# must still transition into the normal airborne path.
+								_max_support_y = (float(veh_pos[1]) +
+									min(max(0.0, float(max_climb)), 0.85) + 0.02)
+								_sup = _terrain_support(
+									_offh_bspace(), veh_pos[0], veh_pos[1], veh_pos[2],
+									veh_yaw[0], _hl_sup, maximum_y=_max_support_y)
+								_centre_y = _sup[1]
+								ground_y = _centre_y if _centre_y is not None else _sup[0]
+						except Exception:
+							pass
+					if ground_y is not None:
 						# CoM has left the ground when the CENTRE probe drops away (or finds
 						# nothing): THEN the hull tips and falls, even if the tail still
 						# overhangs the crest. Landing height is that same centre ground.
@@ -11052,7 +11938,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					except Exception as e:
 						pass
 					# (POS-CHECK debug removed: ran every frame and referenced an undefined var)
-					
+
 					if shot_point is None:
 						cam_mat = Math.Matrix(BigWorld.camera().matrix)
 						cam_pos = cam_mat.translation
@@ -11081,12 +11967,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							pass
 
 				# 3. Calculate target yaw and pitch
-					# Vector from mathematical gun to the target					
+					# Vector from mathematical gun to the target
 					dx = shot_point.x - last_true_gun_pos.x
 					dy = shot_point.y - last_true_gun_pos.y
 					dz = shot_point.z - last_true_gun_pos.z
 					dist = math.sqrt(dx*dx + dz*dz)
-					
+
 					try:
 						if _gun_state.get('rmb_down', False) and not getattr(player, '_autoaim_target', None) and 'locked_local_yaw' in _gun_state:
 							local_target_yaw = _gun_state['locked_local_yaw']
@@ -11118,7 +12004,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						# Fallback k jednoduche trigonometrii (nepresne)
 						target_yaw = math.atan2(dx, dz)
 						local_target_yaw = target_yaw - veh_yaw[0]
-						
+
 						if is_arty:
 							try:
 								shots = td.gun['shots'] if isinstance(td.gun, dict) else getattr(td.gun, 'shots')
@@ -11138,31 +12024,31 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								target_pitch = math.atan2(-dy, dist) # direct fire fallback
 						else:
 							target_pitch = math.atan2(-dy, dist)
-					
+
 					# Normalize angleses
 					while local_target_yaw > math.pi: local_target_yaw -= 2*math.pi
 					while local_target_yaw < -math.pi: local_target_yaw += 2*math.pi
 					while turret_yaw[0] > math.pi: turret_yaw[0] -= 2*math.pi
 					while turret_yaw[0] < -math.pi: turret_yaw[0] += 2*math.pi
-					
+
 					_gun_state['auto_steer'] = 0
 					if not BigWorld.isKeyDown(Keys.KEY_RIGHTMOUSE):
 						if _gun_min_yaw is not None and _gun_max_yaw is not None:
 							# Check if aiming outside bounds
 							if local_target_yaw < _gun_min_yaw - 0.02: _gun_state['auto_steer'] = -1
 							elif local_target_yaw > _gun_max_yaw + 0.02: _gun_state['auto_steer'] = 1
-					
+
 					# Clamp to max traverse limits (for SPGs and TDs)
 					local_target_yaw = max(_gun_min_yaw, min(_gun_max_yaw, local_target_yaw))
-					
+
 					diff_yaw = local_target_yaw - turret_yaw[0]
 					if diff_yaw > math.pi: diff_yaw -= 2*math.pi
 					if diff_yaw < -math.pi: diff_yaw += 2*math.pi
-					
+
 					# Actual turret angular speed this tick (rad/s), for the real
 					# turretRotation dispersion term (was: remaining-yaw-delta hack).
 					_gun_state['turret_speed'] = min(abs(diff_yaw) / max(dt, 0.001), _turret_rot_speed)
-					
+
 					# perf: outline scan ~8x/s (was every frame over all bots)
 					player._outl_acc = (getattr(player, '_outl_acc', 9.0) or 9.0) + dt
 					try:
@@ -11170,14 +12056,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						if player._outl_acc >= 0.12 and gun_dir.length > 0.001:
 							gun_dir.normalise()
 							_mock_vehicles = globals().get('G_MOCK_VEHICLES', {})
-							
+
 							import debug_utils
 							if not hasattr(player, '_debug_dump_done_5'):
 								player._debug_dump_done_5 = True
 								debug_utils.LOG_DEBUG('AIH_TICK DUMP keys:', _mock_vehicles.keys())
 								for _k, _v in _mock_vehicles.items():
 									debug_utils.LOG_DEBUG(' - Veh', _k, getattr(_v, '_bot_team', 'N/A'))
-							
+
 							player._outl_acc = 0.0
 							closest_bot = None
 							min_dist = 9999.0
@@ -11240,7 +12126,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					except Exception as e:
 						import debug_utils
 						debug_utils.LOG_DEBUG('Outline error:', str(e))
-					
+
 					# Countdown: turret + gun frozen until the prebattle timer hits 0 (period 3)
 					if getattr(getattr(BigWorld.player(), 'arena', None), 'period', 3) < 3:
 						local_target_yaw = turret_yaw[0]; diff_yaw = 0.0; target_pitch = gun_pitch[0]
@@ -11263,7 +12149,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						turret_yaw[0] = local_target_yaw
 					else:
 						turret_yaw[0] += _t_step * (1 if diff_yaw > 0 else -1)
-						
+
 					# Update pitch
 					# Yaw-dependent pitch limits (extraPitchLimits tanks have e.g. less
 					# depression over the engine deck), same as the real VehicleGunRotator
@@ -11276,7 +12162,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							target_pitch = max(_gun_min_pitch, min(_gun_max_pitch, target_pitch))
 					except Exception:
 						target_pitch = max(_gun_min_pitch, min(_gun_max_pitch, target_pitch))
-					
+
 					diff_pitch = target_pitch - gun_pitch[0]
 					_p_step = _gun_pitch_speed * dt  # vertical aim speed from gun descriptor (rad/s)
 					if abs(diff_pitch) < _p_step:
@@ -11327,7 +12213,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							def hideIfExistFor(self, vehicle):
 								pass
 						mock_veh.appearance = FakeAppearance()
-					
+
 					# Debug log every 50 ticks (1 sec)
 					_tick_counter[0] += 1
 					if _tick_counter[0] % 50 == 0:
@@ -11338,7 +12224,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							c_ptc = 0.0
 						LOG_DEBUG('OfflineBattle.aim: cam_yaw=%.2f, veh_yaw=%.2f, loc_tgt=%.2f, tur_yaw=%.2f, cam_ptc=%.2f, gun_ptc=%.2f' % (
 							target_yaw, veh_yaw[0], local_target_yaw, turret_yaw[0], c_ptc, gun_pitch[0]))
-						
+
 				except Exception as e:
 					LOG_DEBUG('OfflineBattle.aim error:', str(e))
 
@@ -11348,7 +12234,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				# --- Update mock vehicle and camera matrix ---
 				mock_veh.position = Math.Vector3(veh_pos[0], veh_pos[1], veh_pos[2])
 				mock_veh.yaw   = veh_yaw[0]
-				
+
 				# DEBUG CHASSIS KEYS
 				try:
 					if getattr(mock_veh, '_dbg_keys_logged', None) is None:
@@ -11389,7 +12275,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							except: pass
 						mock_veh._dbg_keys_logged = True
 				except: pass
-				
+
 				# Vypočítat náklon tanku hráče podle terénu
 				_p_ypr = _get_terrain_ypr(_offh_bspace(), mock_veh.position, veh_yaw[0])
 				# --- Slope slide: physics.slope_slide_speed (WG track-cohesion hold). The
@@ -11519,15 +12405,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					if abs(_tdy) > abs(getattr(player, '_dy_tick_max', 0.0) or 0.0):
 						player._dy_tick_max = _tdy
 						player._dy_tick_src = getattr(player, '_y_snap', None) or ('air' if _veh_airborne[0] else 'follow')
-				
+
 				# Update base matrix IN PLACE so AvatarInputHandler doesn't lose the reference
 				mock_veh.matrix.setRotateYPR(_p_ypr)
 				mock_veh.matrix.translation = mock_veh.position
-				
+
 				if hasattr(mock_veh, 'filter'):
 					mock_veh.filter.position = mock_veh.position
 					mock_veh.filter.yaw = veh_yaw[0]
-					
+
 				# Update camera matrix (needs both translation AND yaw for SniperCamera offsets to work)
 				# (Arcade camera strips yaw using WGTranslationOnlyMP later)
 				new_m = Math.Matrix()
@@ -11551,8 +12437,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				# Engine sounds are handled in _step_offline_physics
 
 
-										
-						
+
+
 
 				_offh_perf_stop('player_pose', _perf_player_pose)
 				_perf_player_gun = _offh_perf_start()
@@ -11570,35 +12456,35 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_gun_state['clip_size'] = _clip[0]
 								_gun_state['clip_reload'] = _clip[1]
 							_gun_state['reload'] = td.gun.get('reloadTime', 5.0) if isinstance(td.gun, dict) else getattr(td.gun, 'reloadTime', 5.0)
-							
+
 							_gun_state['ammo'] = 45
 							if hasattr(td, 'maxAmmo'): _gun_state['ammo'] = td.maxAmmo
 							elif isinstance(td.gun, dict) and 'maxAmmo' in td.gun: _gun_state['ammo'] = td.gun['maxAmmo']
 							elif hasattr(td.gun, 'maxAmmo'): _gun_state['ammo'] = td.gun.maxAmmo
 							elif hasattr(td, 'turret') and hasattr(td.turret, 'maxAmmo'): _gun_state['ammo'] = td.turret.maxAmmo
-							
+
 							# Equipment & Crew Modifiers
 							has_rammer, has_egld, has_vents, has_vstab, has_rations = False, False, False, False, False
 							has_bia, has_snapshot, has_smooth_ride = True, False, False
 							has_sixth_sense = False
-							
+
 							# Hardcode consumables if none found or to guarantee they exist in offline mode
 							_gun_state['consumables'] = [
 								{'slot': 3, 'tag': 'repairkit', 'name': 'smallrepairkit', 'icon': '../maps/icons/artefact/smallRepairkit.png', 'used': False},
 								{'slot': 4, 'tag': 'medkit', 'name': 'smallmedkit', 'icon': '../maps/icons/artefact/smallMedkit.png', 'used': False},
 								{'slot': 5, 'tag': 'extinguisher', 'name': 'handextinguishers', 'icon': '../maps/icons/artefact/handExtinguishers.png', 'used': False}
 							]
-							
+
 							try:
 								from CurrentVehicle import g_currentVehicle
 								if g_currentVehicle and hasattr(g_currentVehicle, 'item') and g_currentVehicle.item:
 									v_item = g_currentVehicle.item
-									
+
 									try:
 										import debug_utils
 										debug_utils.LOG_DEBUG('DEBUG STATS COMP: td.gun.aimingTime=', getattr(td.gun, 'aimingTime', None), 'v_item.descriptor.gun.aimingTime=', getattr(v_item.descriptor.gun, 'aimingTime', None))
 									except: pass
-									
+
 									# Parse Equipment
 									for dev in getattr(v_item, 'optDevices', []):
 										if not dev: continue
@@ -11612,11 +12498,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										if 'stabilizer' in name: has_vstab = True
 									# Parse Consumables from g_currentVehicle if available
 									# (We already hardcoded them above, but we can override if needed)
-									
+
 									_eqs_list = list(getattr(v_item, 'eqs', []))
 									if any(_eqs_list):
 										_gun_state['consumables'] = []
-									
+
 									for idx, eq in enumerate(_eqs_list):
 										if not eq: continue
 										name = getattr(eq, 'name', '') or getattr(getattr(eq, 'descriptor', None), 'name', '') or str(eq)
@@ -11637,7 +12523,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											elif 'extinguisher' in name:
 												# automatic extinguishers are the 'auto' variant, the hand ones the default
 												icon_path = '../maps/icons/artefact/%sExtinguishers.png' % ('auto' if 'auto' in name else 'hand')
-										
+
 										import debug_utils
 										debug_utils.LOG_DEBUG('DUMP CONSUMABLE:', name, icon, icon_path)
 										tag_name = 'extinguisher' if 'extinguisher' in name else ('medkit' if 'medkit' in name else ('repairkit' if 'repair' in name else ''))
@@ -11649,7 +12535,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 												'icon': icon_path,
 												'used': False
 											})
-										
+
 									# Parse Crew Perks
 									crew = getattr(v_item, 'crew', [])
 									import debug_utils
@@ -11658,11 +12544,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									for idx, item in enumerate(crew):
 										try:
 											tman = item[1] if isinstance(item, tuple) and len(item) == 2 else item
-											
+
 											if tman is None:
 												has_bia = False
 												continue
-											
+
 											tman_skills = []
 											if hasattr(tman, 'skills'):
 												for sk in tman.skills:
@@ -11670,7 +12556,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 													tman_skills.append(str(name).lower())
 											elif hasattr(tman, 'descriptor') and hasattr(tman.descriptor, 'skills'):
 												tman_skills = [str(sk).lower() for sk in tman.descriptor.skills]
-											
+
 											if 'brotherhood' not in tman_skills: has_bia = False
 											if 'smoothturret' in tman_skills or 'snapshot' in tman_skills: has_snapshot = True
 											if 'smoothdriving' in tman_skills or 'smoothride' in tman_skills: has_smooth_ride = True
@@ -11684,7 +12570,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								debug_utils.LOG_DEBUG('Equipment/Crew parsing error:', str(e))
 								has_bia = False
 							player._offhangar_has_sixth_sense = bool(has_sixth_sense)
-							
+
 							# Calculate crew multiplier (Base 100% crew + Commander 10% bonus)
 							crew_skill, commander_skill = 100.0, 100.0
 							if has_vents:
@@ -11698,12 +12584,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								commander_skill += 10.0
 							effective_skill = crew_skill + (commander_skill * 0.1)
 							crew_mult = 1.0 / (0.5 + 0.005 * effective_skill)
-							
+
 							_gun_state['base_dispersion'] *= crew_mult
 							_gun_state['aim_time'] *= crew_mult
 							_gun_state['reload'] *= crew_mult
 							_gun_state['clip_reload'] *= crew_mult
-							
+
 							if has_rammer:
 								_gun_state['reload'] *= 0.9
 								_gun_state['clip_reload'] *= 0.9
@@ -11712,7 +12598,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_gun_state['has_vstab'] = has_vstab
 							_gun_state['has_snapshot'] = has_snapshot
 							_gun_state['has_smooth_ride'] = has_smooth_ride
-							
+
 						except Exception as e:
 							LOG_DEBUG('OfflineBattle: Gun State Init ERROR:', str(e))
 						# Empty gun at battle start, like the original: nothing is chambered and no
@@ -11734,7 +12620,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				if _gun_state['initialized']:
 					try:
 						# 1. Dispersion shrinkage
-	
+
 						if 'GUI_INIT' not in _gun_state:
 							try:
 								from gui import WindowsManager
@@ -11743,7 +12629,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									try:
 										td = loaded_models.get('td')
 										shots = td.gun['shots'] if isinstance(td.gun, dict) else getattr(td.gun, 'shots', [])
-										
+
 										# Distribute maxAmmo across available shells
 										ammo_pool = _gun_state['ammo']
 										try:
@@ -11756,23 +12642,23 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 													elif isinstance(sh, tuple) and len(sh) >= 2: v_shells.append(sh[1])
 										except:
 											v_shells = []
-											
+
 										for i, shot in enumerate(shots):
 											try: shell = shot['shell']
 											except: shell = getattr(shot, 'shell', None)
 											try: piercing_val = shot['piercingPower']
 											except: piercing_val = getattr(shot, 'piercingPower', 100)
 											if isinstance(piercing_val, (tuple, list)): piercing_val = piercing_val[0]
-											
+
 											if v_shells and i < len(v_shells):
 												qty = v_shells[i]
 											else:
 												qty = int(ammo_pool * 0.6) if i == 0 else (int(ammo_pool * 0.3) if i == 1 else int(ammo_pool * 0.1))
 												if qty == 0 and ammo_pool > 0: qty = 1
-											
+
 											_gun_state['ammo_%d' % i] = qty
 											panel.addShellSlot(i, qty, _gun_state['clip_size'], _gun_state['clip_size'], shell, piercing_val)
-											
+
 										# Find first shell with > 0 ammo
 										first_active = 0
 										for i in xrange(len(shots)):
@@ -11780,17 +12666,17 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 												first_active = i
 												break
 										_gun_state['shot_index'] = first_active
-										
+
 										# Select the first shell as active to show clip UI
 										panel.setCurrentShell(first_active)
 										panel.setShellQuantityInSlot(first_active, _gun_state['ammo_%d' % first_active], _gun_state['clip'])
 									except Exception as ex: LOG_DEBUG('SHELL SLOT FAIL:', str(ex))
-									
+
 									try:
 										import AvatarInputHandler.aims as aim
 										aim.setClipParams(_gun_state['clip_size'], 1)
 										aim.setAmmoStock(_gun_state['ammo_%d' % first_active], _gun_state['clip'], False)
-										
+
 										# Vynutit reset ukazatele zdraví v GUI!
 										from gui import WindowsManager
 										bw = getattr(WindowsManager.g_windowsManager, 'battleWindow', None)
@@ -11803,20 +12689,20 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											if hasattr(bw, 'vMarkersManager'):
 												pass # bw.vMarkersManager.updateVehicleHealth(player.playerVehicleID, _mh, 1, 0)
 									except Exception as e: pass
-									
+
 									# Add Consumables to UI
 									if not _gun_state.get('consumables_added_to_ui'):
 										_gun_state['consumables_added_to_ui'] = True
 										import debug_utils
 										debug_utils.LOG_DEBUG('ADDING CONSUMABLES TO UI:', _gun_state.get('consumables', []))
-										
+
 										class FakeEqDescr(object):
 											def __init__(self, tag, icon, name):
 												self.tags = set([tag])
 												self.icon = [icon]
 												self.userString = name
 												self.description = ''
-										
+
 										for cons in _gun_state.get('consumables', []):
 											idx = cons['slot']
 											tag = cons['tag']
@@ -11827,7 +12713,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											except Exception as e:
 												import debug_utils
 												debug_utils.LOG_DEBUG('Failed to addEquipmentSlot:', str(e))
-									
+
 									# Route Flash slot clicks and damage-panel icon clicks into the offline
 									# equipment activation: small kit -> selector, large -> repair all, and a
 									# click on a damaged module icon repairs exactly that module.
@@ -11894,7 +12780,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									target_disp += abs(v_speed) * 0.015 + abs(r_speed) * 0.015
 								except Exception:
 									pass
-						
+
 						# Crew and module maluses belong on the TARGET circle, not on the current
 						# one. They used to be applied once, to _gun_state['dispersion'], at gun
 						# init - and the convergence below then pulled that straight back down to
@@ -11949,7 +12835,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									# used to refill to the full magazine size.
 									_si_r = _gun_state.get('shot_index', 0)
 									_gun_state['clip'] = min(_gun_state['clip_size'], _gun_state.get('ammo_%d' % _si_r, 0) or 0)
-								
+
 								# Reset UI cooldown and refresh ammo count when reload finishes
 								try:
 									from gui import WindowsManager
@@ -11963,7 +12849,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										aim.setReloading(0.0, None)
 										shot_idx = _gun_state.get('shot_index', 0)
 										aim.setAmmoStock(_gun_state['ammo_%d' % shot_idx], _gun_state['clip'], True if _gun_state['clip'] == _gun_state['clip_size'] else False)
-									
+
 									try:
 										if not hasattr(BigWorld.player(), 'soundNotifications'):
 											import gui.IngameSoundNotifications as IngameSoundNotifications
@@ -11999,10 +12885,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						gunWorldMatrix.setRotateX(gun_pitch[0])
 						gunWorldMatrix.translation = gunOffs
 						gunWorldMatrix.postMultiply(turretWorldMatrix)
-						
+
 						gun_dir = gunWorldMatrix.applyToAxis(2)
 						gun_dir.normalise()
-						
+
 						if 'gun_node_matrix' in loaded_models:
 							# Store ONLY the true_gun_pos (pivot). NO rotation.
 							# SniperCamera applies its own pitch/yaw from mouse input,
@@ -12010,47 +12896,25 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_cam_m = Math.Matrix()  # identity = no rotation
 							_cam_m.translation = true_gun_pos
 							loaded_models['gun_node_matrix'].set(_cam_m)
-						
+
 						# Pass gun pos to rotator for Arty/Arcade raycasts
 						if hasattr(player, 'gunRotator'):
 							player.gunRotator._gun_pos = true_gun_pos
 							player.gunRotator._gun_dir = gun_dir
-							
+
 						is_arty = False
 						try: is_arty = 'SPG' in td.type.tags
 						except: pass
-						# Calculate exact terrain intersection for the green marker (perfectly simulates server)
-						_end_gun = true_gun_pos + gun_dir.scale(10000.0)
-						_col_gun = None
-						if is_arty:
-							try:
-								_col_gun = BigWorld.wg_collideSegment(_offh_bspace(), true_gun_pos, _end_gun, 128)
-							except Exception:
-								pass
-						gun_target_pos = _col_gun[0] if _col_gun is not None else _end_gun
-						
-						if hasattr(player, 'gunRotator') and len(player.gunRotator.markerInfo) >= 2:
-							mtp = player.gunRotator.markerInfo[0]
-							mdir = player.gunRotator.markerInfo[1]
-							
-							if isinstance(mtp, tuple) and mtp == (0.0, 0.0, 0.0):
-								pass # Offline stub, ignore
-							elif isinstance(mtp, Math.Vector3) and mtp.lengthSquared == 0.0:
-								pass # Offline stub, ignore
-							else:
-								if isinstance(mtp, tuple):
-									gun_target_pos = Math.Vector3(mtp[0], mtp[1], mtp[2])
-								else:
-									gun_target_pos = mtp
-									
-								if isinstance(mdir, tuple):
-									gun_dir = Math.Vector3(mdir[0], mdir[1], mdir[2])
-								else:
-									gun_dir = mdir
-							
+						# The final marker is resolved from the gravity trajectory below. Keep
+						# the desired world point only as a fail-closed fallback; projecting the
+						# elevated barrel axis puts the marker above the shell's real impact.
+						gun_target_pos = Math.Vector3(shot_point)
+						gun_marker_dir = Math.Vector3(gun_dir)
+						_pen_coll = None
+
 						if _tick_counter[0] % 50 == 0:
 							LOG_DEBUG('OfflineBattle.gun: target_pos=', gun_target_pos, 'dir=', gun_dir, 'pos=', true_gun_pos)
-							
+
 						# Hide vehicle in sniper mode using model.visible
 						if hasattr(g_offline_aih, 'ctrl'):
 							is_sniper = g_offline_aih.ctrl.__class__.__name__ == 'SniperControlMode'
@@ -12079,88 +12943,135 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						yaw_mat.setRotateY(turret_yaw[0])
 						math_gun_world += Math.Matrix(mat).applyVector(yaw_mat.applyVector(td.turret['gunPosition']))
 
-						_end_gun = math_gun_world + gun_dir.scale(10000.0)
-						if not is_arty:
-							_col_gun = BigWorld.wg_collideSegment(_offh_bspace(), math_gun_world, _end_gun, 128)
-							if _col_gun is not None:
-								gun_hit = _col_gun
-								dist_to_target = (shot_point - math_gun_world).length
-								if gun_hit[1] < dist_to_target:
-									dist_to_static = (gun_hit[0] - math_gun_world).length
-									if dist_to_target - dist_to_static > 1.0:
-										gun_target_pos = math_gun_world + gun_dir.scale(dist_to_target)
-									else:
-										gun_target_pos = gun_hit[0]
-								else:
-									gun_target_pos = math_gun_world + gun_dir.scale(dist_to_target)
+						# Stock VehicleGunRotator walks the shell parabola chord by chord and
+						# places the marker at the first dynamic/static hit. The gun axis is
+						# intentionally elevated to cancel drop, so a straight ray is not the
+						# impact path and appears high in arcade view.
+						_marker_distance_origin = math_gun_world
+						_marker_preview_fresh = False
+						_marker_preview_allowed = (_period_g == 3 or not
+							_gun_state.get('prebattle_marker_seeded', False))
+						try:
+							_marker_index = int(_gun_state.get('shot_index', 0) or 0)
+							try:
+								player.vehicleTypeDescriptor.activeGunShotIndex = _marker_index
+							except Exception:
+								pass
+							_marker_start = math_gun_world
+							_marker_velocity = None
+							try:
+								_marker_start, _marker_velocity = (
+									player.gunRotator._VehicleGunRotator__getCurShotPosition())
+							except Exception:
+								pass
+							_marker_distance_origin = Math.Vector3(_marker_start)
+							_marker_shots = td.gun.get('shots', [])
+							_marker_shot = (_marker_shots[_marker_index]
+								if 0 <= _marker_index < len(_marker_shots) else None)
+							_marker_speed = float(_marker_shot.get('speed', 0.0)
+								if _marker_shot is not None else 0.0)
+							if _marker_velocity is None:
+								_marker_velocity = gun_dir.scale(_marker_speed)
 							else:
-								gun_target_pos = math_gun_world + gun_dir.scale(10000.0)
-						else:
-							gun_target_pos = math_gun_world + gun_dir.scale(10000.0)
+								_marker_velocity = Math.Vector3(_marker_velocity)
+							if _marker_speed <= 0.0001:
+								_marker_speed = _marker_velocity.length
+							_marker_gravity_value = abs(float(
+								_marker_shot.get('gravity', 0.0)
+								if _marker_shot is not None else 0.0))
+							_marker_gravity = Math.Vector3(
+								0.0, -_marker_gravity_value, 0.0)
+							_marker_max_distance = float(
+								_marker_shot.get('maxDistance', 720.0)
+								if _marker_shot is not None else 720.0)
+							if _marker_max_distance <= 1.0:
+								_marker_max_distance = 720.0
+							# The desired camera point is not a trajectory boundary. If the gun
+							# cannot depress to it, stopping at its estimated flight time leaves
+							# the marker suspended above the shell's later first impact. The
+							# preview helper owns the Euclidean maxDistance boundary; this is
+							# only a hard runaway guard matching the live projectile runtime.
+							_marker_max_time = max(4.0, min(
+								20.0, 2500.0 / max(1.0, _marker_speed) + 4.0))
+							_marker_now = float(BigWorld.time())
+							_marker_preview_cached = (
+								_gun_state.get('marker_preview_index') == _marker_index and
+								_marker_now - float(_gun_state.get(
+									'marker_preview_at', -999.0)) < 0.1)
+							_marker_preview = None
+							if _marker_preview_cached:
+								_marker_preview = _gun_state.get('marker_preview')
+							if _marker_preview_allowed and not _marker_preview_cached:
+								_marker_perf = _offh_perf_start()
+								try:
+									_marker_preview = _offh_player_gun_marker_impact(
+										_marker_start, _marker_velocity, _marker_gravity,
+										globals().get('G_MOCK_VEHICLES', {}) or {},
+										getattr(player, 'playerVehicleID', -1),
+										getattr(player, 'team', getattr(
+											player, '_offhangar_team', 1)),
+										_marker_max_time, _marker_max_distance,
+										profile_candidates=(_marker_perf is not None))
+								finally:
+									_offh_perf_stop('player_gun_marker', _marker_perf)
+								_gun_state['marker_preview'] = _marker_preview
+								_gun_state['marker_preview_at'] = _marker_now
+								_gun_state['marker_preview_index'] = _marker_index
+								_marker_preview_fresh = _marker_preview is not None
+								if _marker_preview is None:
+									_last_marker_error = float(_gun_state.get(
+										'marker_preview_error_at', -999.0))
+									if _marker_now - _last_marker_error >= 1.0:
+										_gun_state['marker_preview_error_at'] = _marker_now
+										LOG_ERROR('OfflineBattle ballistic marker preview failed')
+							if _marker_preview is not None:
+								gun_target_pos = _marker_preview[0]
+								gun_marker_dir = _marker_preview[1]
+								_pen_coll = _marker_preview[3]
+						except Exception as _marker_error:
+							LOG_DEBUG('OfflineBattle ballistic marker error:',
+								str(_marker_error))
+							gun_target_pos = Math.Vector3(shot_point)
+							gun_marker_dir = gun_target_pos - math_gun_world
+							if gun_marker_dir.length > 0.0001:
+								gun_marker_dir.normalise()
+							else:
+								gun_marker_dir = Math.Vector3(gun_dir)
+							_pen_coll = None
 
 						# UPDATE CROSSHAIR
 						# dead/spectating -> skip the dynamic gun-marker (dispersion reticle) refresh;
 						# leaving it on re-shows it every frame + fights the post-mortem hide below.
-						_refresh_gun_marker = _period_g == 3 or not _gun_state.get('prebattle_marker_seeded', False)
+						_refresh_gun_marker = (_marker_preview_fresh and
+							(_period_g == 3 or not _gun_state.get(
+								'prebattle_marker_seeded', False)))
 						if hasattr(g_offline_aih, 'ctrl') and not getattr(player, '_is_dead', False):
 							try:
 								if hasattr(player, 'gunRotator'):
 									player.gunRotator.dispersionAngle = _gun_state['dispersion']
-								
-								dist_m = (gun_target_pos - math_gun_world).length
+
+								dist_m = (gun_target_pos - _marker_distance_origin).length
 								size_m = _gun_state['dispersion'] * dist_m * 2.0
-								
-								# Native penetration marker: feed collData so the stock gun
-								# marker colours itself green/orange/red by whether the loaded
-								# shell pierces the plate under the reticle. Only direct-fire
-								# modes own a _FlashGunMarker; others stay None (raycast skipped).
-								# pen_indicator is pure math (no models/effects/state) = leak-free.
-								_pen_coll = None
-								try:
-									_pen_cn = g_offline_aih.ctrl.__class__.__name__
-									if _pen_cn in ('SniperControlMode', 'ArcadeControlMode'):
-										try:
-											player.vehicleTypeDescriptor.activeGunShotIndex = _gun_state.get('shot_index', 0)
-										except Exception:
-											pass
-										# Sample armor along the ACTUAL shot ray (muzzle pos +
-										# gun dir), not the marker vectors - else the ray grazes
-										# the hull and reads a bogus near-infinite armor.
-										_pen_start = math_gun_world
-										_pen_dir = gun_dir
-										try:
-											_sp, _sd = player.gunRotator._VehicleGunRotator__getCurShotPosition()
-											_pen_start = _sp
-											_pen_dir = Math.Vector3(_sd)
-											_pen_dir.normalise()
-										except Exception:
-											pass
-										_pen_wd = None
-										try:
-											if _col_gun is not None:
-												_pen_wd = (_col_gun[0] - _pen_start).length
-										except Exception:
-											_pen_wd = None
-										from gui.mods.offhangar import pen_indicator as _peni
-										_pen_coll = _peni.build_coll_data(
-											globals().get('G_MOCK_VEHICLES', {}) or {},
-											getattr(player, 'playerVehicleID', -1),
-											getattr(player, 'team', getattr(player, '_offhangar_team', 1)),
-											_pen_start, _pen_dir, _pen_wd)
-								except Exception as _pie:
-									LOG_DEBUG('OfflineBattle pen-colldata error:', str(_pie))
+								if _refresh_gun_marker and hasattr(player, 'gunRotator'):
+									player.gunRotator.markerInfo = (
+										gun_target_pos, gun_marker_dir, size_m)
+
 								if _refresh_gun_marker:
-									g_offline_aih.ctrl.updateGunMarker(gun_target_pos, gun_dir, size_m, 0.0, _pen_coll)
+									g_offline_aih.updateGunMarker(
+										gun_target_pos, gun_marker_dir, size_m,
+										0.1, _pen_coll)
 							except Exception as e:
 								LOG_DEBUG('OfflineBattle updateGunMarker error:', str(e), 'pos:', true_gun_pos, 'dir:', gun_dir)
 							if _refresh_gun_marker:
 								try:
-									g_offline_aih.ctrl.updateGunMarker2(gun_target_pos, gun_dir, size_m, 0.0, _pen_coll)
+									g_offline_aih.updateGunMarker2(
+										gun_target_pos, gun_marker_dir, size_m,
+										0.1, _pen_coll)
 								except Exception as e:
 									pass
-								if _period_g != 3:
-									_gun_state['prebattle_marker_seeded'] = True
-								
+							if _period_g != 3:
+								_gun_state['prebattle_marker_seeded'] = True
+
 							if _gun_state.get('tick_counter', 0) % 60 == 0:
 								import debug_utils
 								try:
@@ -12170,7 +13081,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									debug_utils.LOG_DEBUG("DEBUG DIR", "tYaw:", tYaw, "gPitch:", gPitch)
 								except: pass
 							_gun_state['tick_counter'] = _gun_state.get('tick_counter', 0) + 1
-								
+
 							# Synchronize ammo UI when switching control modes
 							aim = getattr(g_offline_aih, 'aim', None)
 							if aim and aim != _gun_state.get('last_aim'):
@@ -12191,7 +13102,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					except Exception as e:
 						import traceback
 						LOG_DEBUG('OfflineBattle fatal gun error:', traceback.format_exc())
-						
+
 				# Update turret rotation (via node matrix)
 				turret_mat = loaded_models.get('turret_mat')
 				if turret_mat is not None:
@@ -12202,8 +13113,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				if gun_mat is not None:
 					gun_mat.setRotateYPR((0, gun_pitch[0], 0))
 
-				
-						
+
+
 				# --- Update turret_matrix for camera/AIH ---
 				tm = Math.Matrix()
 				tm.setRotateYPR((veh_yaw[0] + turret_yaw[0], gun_pitch[0], 0))
@@ -12214,7 +13125,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				except:
 					tm.translation = Math.Vector3(veh_pos[0], veh_pos[1] + 2.0, veh_pos[2])
 				turret_matrix.set(tm)
-				
+
 				tm_local = Math.Matrix()
 				tm_local.setRotateYPR((turret_yaw[0], gun_pitch[0], 0))
 				turret_matrix_local.set(tm_local)
@@ -12258,7 +13169,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_player_mock,
 									getattr(_player_mock, 'last_killer_id', None),
 									'fire damage')
-							
+
 							try:
 								import gui.WindowsManager
 								bw = gui.WindowsManager.g_windowsManager.battleWindow
@@ -12270,7 +13181,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										debug_utils.LOG_DEBUG("DAMAGE_PANEL_DIR: ", dir(bw.damagePanel))
 										bw.damagePanel.updateHealth(_player_mock.health)
 							except: pass
-							
+
 							if _player_mock.health <= 0:
 								_player_mock.health = 0
 								player.arena.onVehicleKilled(getattr(_player_mock, 'id', player.playerVehicleID), getattr(_player_mock, 'last_killer_id', -1), 2)
@@ -12281,7 +13192,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									if hasattr(bw, 'damagePanel'):
 										bw.damagePanel._DamagePanel__callFlash('onFireInVehicle', [False])
 								except: pass
-							
+
 							if hasattr(player, 'vehicle') and player.vehicle:
 								player.vehicle.health = _player_mock.health
 								try: player.guiSessionProvider.invalidateVehicleState(1, player.playerVehicleID, _player_mock.health, _player_mock.health)
@@ -12293,22 +13204,22 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				# --- BOT AI (Advanced Physics) ---
 				import math, random
 				dt = _frame_dt # real frame delta: bot speed/reload no longer depends on FPS
-				try:
-					from gui.mods.offhangar.network_battle import advance_network_smoothing
-					_offh_perf_call('network_smoothing', advance_network_smoothing,
-					                player, mock_vehicles, dt)
-				except Exception:
-					pass
-				_is_network_replica = False
-				try:
-					_network_client = getattr(player, '_offhangar_network_client', None)
-					if (_network_client is not None and
-							getattr(_network_client, 'ready', False) and
-							getattr(_network_client, 'phase', None) == 'battle'):
-						from gui.mods.offhangar.network_battle import network_is_authority
-						_is_network_replica = not network_is_authority(player)
-				except Exception:
-					_is_network_replica = False
+				_network_bot_role = _offh_network_bot_role(player)
+				_network_simulation_authority = (
+					_network_bot_role in ('local', 'authority'))
+				# Unknown ownership and promotion handoff are neither authority nor relay.
+				# Hold the shared lineup until a complete canonical role is known.
+				_is_network_replica = not _network_simulation_authority
+				_replica_native_manager = None
+				if _network_bot_role == 'replica':
+					release_native_bots_for_replica(player)
+				if _network_bot_role in ('local', 'authority', 'replica'):
+					try:
+						from gui.mods.offhangar.network_battle import advance_network_smoothing
+						_offh_perf_call('network_smoothing', advance_network_smoothing,
+						                player, mock_vehicles, dt)
+					except Exception:
+						pass
 				# Use one timestamp for the whole rendered frame. TerrainNavigator's
 				# scheduler is explicitly once-per-frame; calling BigWorld.time() again
 				# for every bot made tiny microsecond differences bypass that guard and
@@ -12324,7 +13235,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				# F6 runs one invisible, isolated retail-physics capability probe.
 				# It never replaces a production bot; the result is used only to decide
 				# whether a later build may safely move bot integration into C++.
-				if _battle_active and not _is_network_replica:
+				if _battle_active and _network_simulation_authority:
 					try:
 						from gui.mods.offhangar import native_vehicle_physics_probe as _native_physics_probe
 						if _native_physics_probe.is_requested():
@@ -12346,7 +13257,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					_offh_spot_foliage(player)
 				_ai_director = None
 				try:
-					if not _is_network_replica:
+					if _network_simulation_authority:
 						_ai_director = _offh_ai_director(player)
 					if _ai_director is not None:
 						_ai_navigator = _offh_ai_navigator(_ai_director)
@@ -12415,7 +13326,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_local_ai_ids = []
 				_python_collision_ids = []
 				_native_body_manager_frame = None
-				if not _is_network_replica:
+				if _network_simulation_authority:
 					try:
 						from gui.mods.offhangar import native_bot_physics as _native_body_manager_frame
 					except Exception:
@@ -12455,14 +13366,23 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						else:
 							(_frame_shape, _frame_half_width, _frame_half_length,
 							 _frame_radius, _frame_inv_mass) = _frame_collision_cache
-						if not _is_network_replica:
+						if _network_simulation_authority:
 							_frame_velocity = (
 								math.sin(_frame_yaw) * _frame_speed, 0.0,
 								math.cos(_frame_yaw) * _frame_speed)
+							_frame_traffic_id = _ai_driver.traffic_identity(
+								_frame_eid, getattr(_frame_vehicle, '_network_bot_id', None))
 							_driver_body = getattr(
 								_frame_vehicle, '_offh_driver_frame_body', None)
 							if _driver_body is None:
 								_driver_body = {
+									'id': _frame_traffic_id,
+									'team': int(_player_team if _frame_eid == _player_vehicle_id else
+										(getattr(_frame_vehicle, '_bot_team', None) or
+										 (getattr(_frame_vehicle, 'publicInfo', None) or {}).get('team', 0) or 0)),
+									'speed': _frame_speed,
+									'is_human': bool(_frame_eid == _player_vehicle_id or
+										getattr(_frame_vehicle, '_network_remote', False)),
 									'position': _frame_position,
 									'yaw': _frame_yaw,
 									'velocity': _frame_velocity,
@@ -12471,6 +13391,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								}
 								_frame_vehicle._offh_driver_frame_body = _driver_body
 							else:
+								_driver_body['id'] = _frame_traffic_id
+								_driver_body['team'] = int(
+									_player_team if _frame_eid == _player_vehicle_id else
+									(getattr(_frame_vehicle, '_bot_team', None) or
+									 (getattr(_frame_vehicle, 'publicInfo', None) or {}).get('team', 0) or 0))
+								_driver_body['speed'] = _frame_speed
+								_driver_body['is_human'] = bool(
+									_frame_eid == _player_vehicle_id or
+									getattr(_frame_vehicle, '_network_remote', False))
 								_driver_body['position'] = _frame_position
 								_driver_body['yaw'] = _frame_yaw
 								_driver_body['velocity'] = _frame_velocity
@@ -12478,16 +13407,24 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							if (_frame_eid != _player_vehicle_id and
 									not getattr(_frame_vehicle, '_network_remote', False)):
 								_local_ai_ids.append(int(_frame_eid))
-								if (_native_body_manager_frame is None or
-										not _native_body_manager_frame.owns_filter(
-											_frame_vehicle)):
+								_native_frame_required = _offh_native_movement_required(
+									player, _frame_vehicle, _network_bot_role)
+								_python_frame_allowed = _offh_python_movement_allowed(
+									player, _frame_vehicle, _network_bot_role)
+								if (_python_frame_allowed and
+									not _native_frame_required and
+									(_native_body_manager_frame is None or
+									not _native_body_manager_frame.claims_movement(
+										_frame_vehicle))):
 									_python_collision_ids.append(int(_frame_eid))
 						_collision_body = getattr(
 							_frame_vehicle, '_offh_collision_frame_body', None)
 						_native_collision_owner = bool(
-							_frame_eid != _player_vehicle_id and
-							_native_body_manager_frame is not None and
-							_native_body_manager_frame.owns_filter(_frame_vehicle))
+							_frame_eid != _player_vehicle_id and (
+							_offh_native_movement_required(
+								player, _frame_vehicle, _network_bot_role) or
+							(_native_body_manager_frame is not None and
+							_native_body_manager_frame.claims_movement(_frame_vehicle))))
 						if _collision_body is None:
 							_collision_body = {
 								'position': _frame_position,
@@ -12503,7 +13440,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						_collision_bodies[_frame_eid] = _collision_body
 						_collision_max_radius = max(
 							_collision_max_radius, _frame_radius)
-						if not _is_network_replica:
+						if _network_simulation_authority:
 							_nav_frame[_frame_eid] = _frame_position
 					except Exception:
 						continue
@@ -12543,7 +13480,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					m_veh = mock_vehicles[eid]
 					if eid != _player_vehicle_id and getattr(m_veh, 'isAlive', False):
 						try:
-							if (_is_network_replica and
+							if ((not _network_simulation_authority) and
 									(getattr(m_veh, '_network_remote', False) or
 									 getattr(m_veh, '_network_shared_bot', False))):
 								continue
@@ -12558,12 +13495,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									pass
 								continue
 							if getattr(m_veh, '_network_shared_bot', False):
-								try:
-									from gui.mods.offhangar.network_battle import network_is_authority, update_remote_spotting
-									if not network_is_authority(player):
-										update_remote_spotting(player, m_veh)
-										continue
-								except Exception:
+								if _network_bot_role != 'authority':
+									if _network_bot_role == 'replica':
+										try:
+											from gui.mods.offhangar.network_battle import update_remote_spotting
+											update_remote_spotting(player, m_veh)
+										except Exception:
+											pass
 									continue
 							my_team = getattr(m_veh, '_bot_team', m_veh.publicInfo.get('team', 2) if getattr(m_veh, 'publicInfo', None) is not None else 2)
 							_td = getattr(m_veh, 'typeDescriptor', None) or loaded_models.get('td')
@@ -12582,6 +13520,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_nav_paused = False
 							_ai_hull_aiming = False
 							_ai_server_wait = False
+							_native_hazard_recovery_pre = bool(
+								_battle_active and getattr(
+									m_veh, '_offh_native_hazard_recovering', False))
 							# INIT BOT STATES
 							if getattr(m_veh, '_veh_velocity', None) is None: m_veh._veh_velocity = 0.0
 							if getattr(m_veh, '_veh_turn_velocity', None) is None: m_veh._veh_turn_velocity = 0.0
@@ -12713,7 +13654,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										_nav_index = int(_ai_order.get('route_index', 0))
 										# LAN server route orders used the name "advance" while the
 										# local planner used "route". Both are the same strategic state.
-										if (_nav_mode in ('route', 'advance') and
+										if _nav_mode == 'base_defense':
+											_nav_key = ('local', int(eid), _nav_mode,
+												_ai_order.get('defense_base_id'))
+											_nav_anchor = None
+										elif (_nav_mode in ('route', 'advance') and
 										        _ai_target_id is None):
 											_nav_key = ('route', int(my_team),
 											            _ai_order.get('route_id', 'direct'), _nav_index)
@@ -12815,6 +13760,16 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										m_veh._offh_nav_error_logged = True
 										LOG_DEBUG('OfflineBattle.SMART_AI navigation error id=%s: %s' % (
 											str(eid), str(_nav_error)))
+							# Safety recovery outranks a tactical hold or a pending A* job. The
+							# target points back through the last proven-safe pose, but LocalDriver
+							# still validates every candidate through the ordinary terrain callback.
+							if _native_hazard_recovery_pre:
+								_native_escape_target = _offh_native_hazard_escape_target(m_veh)
+								if _native_escape_target is not None:
+									drive_pos = _native_escape_target
+									_nav_paused = False
+									_ai_throttle_override = None
+									_ai_server_wait = False
 							_is_artillery_order = (_tactical_mode == 'artillery_fire')
 							if _is_artillery_order and target_pos is not None:
 								try:
@@ -12927,7 +13882,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_desired_gun_pitch = float(
 								getattr(m_veh, '_gun_pitch', 0.0) or 0.0)
 							m_veh._offh_desired_gun_pitch = _desired_gun_pitch
-							
+
 							# VIRTUAL DRIVER
 							throttle = 0.0
 							turn_dir = 0
@@ -12946,9 +13901,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# Pure local driver: the engine supplies terrain/collision probes;
 							# timing, traffic separation, steering hysteresis and alternating
 							# recovery live in one testable state machine.
-							_driver_intent = bool(_battle_active) and not (
-								_ai_throttle_override is not None and
-								float(_ai_throttle_override) <= 0.0)
+							_driver_intent = bool(_battle_active) and (
+								_native_hazard_recovery_pre or not (
+									_ai_throttle_override is not None and
+									float(_ai_throttle_override) <= 0.0))
 							_driver_key = (
 								int(math.floor(float(drive_pos[0]) * 0.25 + 0.5)),
 								int(math.floor(float(drive_pos[2]) * 0.25 + 0.5)),
@@ -12960,11 +13916,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_driver_cache_fresh = (
 								_driver_cache_matches and
 								float(_ai_now) < float(_driver_cache[1]))
-							_driver_refresh_now = _offh_ai_refresh_due(
-								eid in _driver_refresh_ids, _driver_cache_matches,
-								_driver_cache_fresh,
-								_driver_cache[1] if _driver_cache_matches else 0.0,
-								_ai_now, _driver_refresh_horizon)
+							_driver_refresh_now = (
+								_native_hazard_recovery_pre or _offh_ai_refresh_due(
+									eid in _driver_refresh_ids, _driver_cache_matches,
+									_driver_cache_fresh,
+									_driver_cache[1] if _driver_cache_matches else 0.0,
+									_ai_now, _driver_refresh_horizon))
 							_driver_stale_reusable = (
 								isinstance(_driver_cache, tuple) and
 								len(_driver_cache) == 4 and
@@ -13066,6 +14023,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							while diff_yaw > math.pi: diff_yaw -= 2 * math.pi
 							while diff_yaw < -math.pi: diff_yaw += 2 * math.pi
 							_driver_mode = _driver_order.get('recovery_mode', 'drive')
+							if _driver_mode in ('drive', 'avoid'):
+								# Corridor planning is deliberately budgeted across the lineup, but
+								# its cached turn value is not feedback-safe. Recompute the cheap
+								# heading error from this frame's exact native root yaw so a stale
+								# full-track command cannot overshoot and reverse for several frames.
+								turn_dir = _ai_driver.steering_turn(target_yaw, m_veh.yaw)
 							if _ai_server_wait:
 								_driver_mode = 'server_wait'
 							m_veh._offh_ai_driver_mode = _driver_mode
@@ -13103,15 +14066,53 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										m_veh.yaw, _aim_target_yaw,
 										_bot_gun_min_yaw, _bot_gun_max_yaw,
 										turn_dir, throttle, _driver_mode,
-										_ai_target_id is not None))
+										_ai_target_id is not None and
+										not _native_hazard_recovery_pre))
+							_traffic_neighbours = []
+							_traffic_source = _driver_frame.get(eid)
+							if _traffic_source is not None and throttle > 0.01:
+								for _traffic_eid in _VC.nearby_ids(
+										_traffic_spatial[0], m_veh.position.x, m_veh.position.z):
+									if _traffic_eid == eid:
+										continue
+									_traffic_body = _driver_frame.get(_traffic_eid)
+									if _traffic_body is None:
+										continue
+									_traffic_position = _traffic_body['position']
+									_traffic_dx = _traffic_position[0] - float(m_veh.position.x)
+									_traffic_dy = _traffic_position[1] - float(m_veh.position.y)
+									_traffic_dz = _traffic_position[2] - float(m_veh.position.z)
+									if (abs(_traffic_dy) <= 5.0 and
+											_traffic_dx * _traffic_dx + _traffic_dz * _traffic_dz <= 576.0):
+										_traffic_neighbours.append(_traffic_body)
+								throttle, _waiting_for_traffic = (
+									_ai_driver.friendly_traffic_throttle(
+										_traffic_source, {
+											'throttle': throttle,
+											'target_yaw': target_yaw,
+										}, _traffic_neighbours))
+								if _waiting_for_traffic:
+									_ai_driver.wait_for_traffic(eid)
+									# Record the final arbitration result, not the cached driver
+									# mode that existed before deterministic right-of-way ran.
+									m_veh._offh_ai_driver_mode = 'traffic_wait'
+									_offh_perf_count('driver_traffic_wait')
 
 							_perf_physics = _offh_perf_start()
 							_perf_physics_state = _offh_perf_start()
 							# IMMOBILIZATION CHECK
 							_dev_hp = getattr(m_veh, 'devices_hp', None)
 							# is_tracked = locked tracks (handbrake below), a dead engine only coasts.
+							_network_mobility_until = float(getattr(
+								m_veh, '_network_mobility_carry_until', 0.0) or 0.0)
+							_network_mobility_locked = _network_mobility_until > time.time()
+							if (_network_mobility_until > 0.0 and
+									not _network_mobility_locked):
+								m_veh._network_mobility_carry_until = 0.0
+								m_veh._network_mobility_disabled = False
 							_b_locked = bool(getattr(m_veh, 'is_tracked', False))
-							if _b_locked or (_dev_hp is not None and _dev_hp.get('engineHealth', 1) <= 0):
+							if (_b_locked or _network_mobility_locked or
+									(_dev_hp is not None and _dev_hp.get('engineHealth', 1) <= 0)):
 								throttle = 0.0
 								turn_dir = 0.0
 								# The player path zeroed this; the bot path did not, so a tracked bot kept
@@ -13123,15 +14124,16 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_bmf = _crew_factor(m_veh, 'mobility') * _module_factor(m_veh, 'mobility')
 								if _bmf < 1.0:
 									throttle = throttle * _bmf
-								
-								# FIRE LOGIC (Damage Over Time)
-								_perf_effects = _offh_perf_start()
-								_sync_burn_and_death(m_veh, getattr(m_veh, '_hull_model', None), getattr(m_veh, 'typeDescriptor', None))
-								try:
-									_tick_module_repair(m_veh, getattr(m_veh, 'typeDescriptor', None), dt, False)
-								except Exception: pass
-								_sync_engine_exhaust(m_veh, getattr(m_veh, '_hull_model', None), getattr(m_veh, 'typeDescriptor', None), getattr(m_veh, '_veh_velocity', 0.0) or 0.0)
-								_offh_perf_stop('bot_effects', _perf_effects)
+
+							# Repair and fire state advance independently of drive input. Keeping
+							# this under ``elif throttle`` made a destroyed track permanent.
+							_perf_effects = _offh_perf_start()
+							_sync_burn_and_death(m_veh, getattr(m_veh, '_hull_model', None), getattr(m_veh, 'typeDescriptor', None))
+							try:
+								_tick_module_repair(m_veh, getattr(m_veh, 'typeDescriptor', None), dt, False)
+							except Exception: pass
+							_sync_engine_exhaust(m_veh, getattr(m_veh, '_hull_model', None), getattr(m_veh, 'typeDescriptor', None), getattr(m_veh, '_veh_velocity', 0.0) or 0.0)
+							_offh_perf_stop('bot_effects', _perf_effects)
 							if getattr(m_veh, 'is_on_fire', False) and m_veh.health > 0:
 								try:
 									from gui.mods.offhangar import device_damage as _DDf2
@@ -13150,12 +14152,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_offh_drop_capture_for_vehicle(
 										m_veh, getattr(m_veh, 'last_killer_id', None),
 										'fire damage')
-									
+
 									try:
 										import BigWorld
 										from gui import WindowsManager
 										bw = getattr(WindowsManager.g_windowsManager, 'battleWindow', None)
-										
+
 										if m_veh.health <= 0:
 											m_veh.health = 0
 											BigWorld.player().arena.onVehicleKilled(m_veh.id, (getattr(m_veh, 'last_killer_id', None) or -1), 2)
@@ -13200,9 +14202,17 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								float(getattr(m_veh, 'roll', 0.0) or 0.0))
 							_native_body_pose = None
 							_native_filter_owned = False
+							_native_movement_required = (
+								_offh_native_movement_required(
+									player, m_veh, _network_bot_role))
+							_python_movement_allowed = _offh_python_movement_allowed(
+								player, m_veh, _network_bot_role)
 							_native_body_manager = _native_body_manager_frame
 							try:
 								if _native_body_manager is not None:
+									_native_movement_required = (
+										_native_movement_required or
+										_native_body_manager.requires_native(player, m_veh))
 									_native_body_pose = _offh_perf_call(
 										'native_physics', _native_body_manager.step,
 										player, m_veh, _td, throttle, turn_dir,
@@ -13213,6 +14223,22 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									m_veh._offh_native_error_logged = True
 									LOG_ERROR('NATIVE_BOT_PHYSICS tick error id=%s error=%s' % (
 										eid, str(_native_body_error)))
+							if _native_body_pose is None and _native_movement_required:
+								if _native_body_manager is not None:
+									_native_body_pose = (
+										_native_body_manager.fail_closed_result(m_veh))
+								if _native_body_pose is None:
+									_native_body_pose = _offh_native_failed_pose(m_veh)
+								if not getattr(m_veh, '_offh_native_manager_error_logged', False):
+									m_veh._offh_native_manager_error_logged = True
+									LOG_ERROR('NATIVE_BOT_PHYSICS fail-closed id=%s '
+										'reason=native manager returned no pose' % eid)
+								if _native_body_pose is None:
+									# An invalid presentation pose is still not permission to run a
+									# second movement implementation. Hold this bot for the frame.
+									m_veh._veh_velocity = 0.0
+									m_veh._veh_turn_velocity = 0.0
+									continue
 
 							if _native_body_pose is not None:
 								# Strategy, pathing and combat stay unchanged.  Only the retail
@@ -13235,10 +14261,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_b_ypr = (m_veh.yaw, m_veh.pitch, m_veh.roll,
 									0.0, 0.0, 0.0)
 
-								# Native contact resolves terrain, but it does not own this bot's
-								# tactical no-drowning rule. WGVehicleFilter2.input cannot teleport
-								# an attached rigid body, so a realised hazard must fail closed at
-								# the current native pose instead of claiming a rollback.
+								# Native contact resolves terrain, but it does not own tactical
+								# water/cliff avoidance. A realised hazard is a driver-recovery
+								# condition, not a native wiring failure: stop input once, invalidate
+								# the cached heading, then leave the active rigid body available for
+								# the existing wet-escape/reverse/pivot controller.
 								_native_final_hazard = _offh_ai_baked_hazard_near((
 									m_veh.position.x, m_veh.position.y, m_veh.position.z), 1)
 								_native_water = (-1.0 if _native_final_hazard is False else
@@ -13249,33 +14276,72 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									True if _native_final_hazard is False else
 									_offh_ai_baked_pose_safe((m_veh.position.x,
 										m_veh.position.y, m_veh.position.z)))
-								if (_native_water > _OFFH_AI_WATER_AVOID_DEPTH or
-										(_native_was_safe and not _native_now_safe)):
-									_native_body_manager.guard_fault(
-										m_veh, 'realised water/cliff hazard')
+								_native_recovery_baked_safe = _native_now_safe
+								_native_recovery_water_safe = (
+									_native_water <= _OFFH_AI_WATER_AVOID_DEPTH)
+								_native_hazard_reason = None
+								if _native_water > _OFFH_AI_WATER_AVOID_DEPTH:
+									_native_hazard_reason = 'water'
+								elif not _native_now_safe:
+									_native_hazard_reason = 'terrain'
+								_native_hazard_recovering = bool(getattr(
+									m_veh, '_offh_native_hazard_recovering', False))
+								_native_hazard_recovery_done = False
+								if _native_hazard_recovering:
+									_native_hazard_recovery_done = (
+										_offh_native_hazard_recovery_complete(
+											m_veh, _native_recovery_baked_safe,
+											_native_recovery_water_safe, _ai_now))
+								if _native_hazard_reason is None:
+									if (_native_hazard_recovering and
+											_native_hazard_recovery_done):
+										m_veh._offh_native_hazard_recovering = False
+										m_veh._offh_native_hazard_anchor = None
+										m_veh._offh_native_hazard_entry_yaw = None
+										m_veh._offh_native_hazard_escape_endpoint = None
+										m_veh._offh_native_hazard_safe_since = None
+										_native_hazard_recovering = False
+									if not _native_hazard_recovering:
+										m_veh._offh_native_last_safe_pose = (
+											float(m_veh.position.x), float(m_veh.position.y),
+											float(m_veh.position.z))
+								elif not _native_hazard_recovering:
+									_native_safe_anchor = getattr(
+										m_veh, '_offh_native_last_safe_pose', None)
+									if _native_safe_anchor is None and _native_was_safe:
+										_native_safe_anchor = _native_previous_pose[:3]
+									m_veh._offh_native_hazard_anchor = _native_safe_anchor
+									m_veh._offh_native_hazard_entry_yaw = float(target_yaw)
+									m_veh._offh_native_hazard_escape_endpoint = None
+									m_veh._offh_native_hazard_safe_since = None
+									_native_hold_ok = False
+									if _native_body_manager is not None:
+										try:
+											_native_hold_ok = bool(
+												_native_body_manager.hold(m_veh))
+										except Exception:
+											_native_hold_ok = False
+									m_veh._offh_native_hazard_recovering = True
 									m_veh._veh_velocity = 0.0
 									m_veh._veh_turn_velocity = 0.0
 									m_veh._offh_ai_driver_mode = 'native_guard'
 									_b_ypr = (m_veh.yaw, m_veh.pitch, m_veh.roll,
 										0.0, 0.0, 0.0)
+									_offh_ai_probe_reject(
+										m_veh, _native_hazard_reason)
 									try:
 										_ai_driver.remember_failure(eid, target_yaw, 5.0)
 									except Exception:
 										pass
+									LOG_NOTE('NATIVE_BOT_PHYSICS hazard_recovery id=%s '
+										'reason=%s water=%.3f hold=%s' % (
+											eid, _native_hazard_reason, _native_water,
+											_native_hold_ok))
 
-								_tree_scan_due = float(_ai_now) >= float(getattr(
-									m_veh, '_offh_next_tree_scan', 0.0) or 0.0)
-								if (abs(m_veh._veh_velocity) > 0.5 and _tree_scan_due and
-										eid in _tree_refresh_ids):
-									m_veh._offh_next_tree_scan = _offh_ai_cache_deadline(
-										_ai_now, eid, 0.150, 5,
-										getattr(m_veh, '_offh_next_tree_scan', None) is None)
-									try:
-										_offh_perf_call('tree_scan', _fell_trees_near,
-											_ai_space_id, m_veh.position, m_veh.yaw,
-											m_veh._veh_velocity, _td)
-									except Exception:
-										pass
+								# Native destructible health and damage callbacks are the sole
+								# collision authority for this body. The legacy proximity scan
+								# remains below only for Python/player movement; running both would
+								# destroy the same tree or structure through two unrelated ledgers.
 								try:
 									_offh_perf_call(
 										'bot_audio', _sync_bot_motion_sounds, m_veh, _td,
@@ -13283,9 +14349,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										throttle, dt)
 								except Exception:
 									pass
-							else:
-								# Compatibility fallback: retain the complete established Python
-								# movement, terrain, collision and safety implementation.
+							elif _python_movement_allowed:
+								# Kept as unreachable rollback code for source-level comparison.
+								# This native-only package never authorizes this branch.
 								_perf_physics_motion = _offh_perf_start()
 								bot_gravity = _PHY.GRAVITY
 								# Seed the rollback point before any commanded movement, tank impulse,
@@ -13377,8 +14443,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											getattr(m_veh, '_offh_next_tree_scan', None) is None)
 										try:
 											_offh_perf_call('tree_scan', _fell_trees_near,
-													_ai_space_id, m_veh.position, m_veh.yaw,
-													m_veh._veh_velocity, _td)
+												m_veh, _ai_space_id, m_veh.position, m_veh.yaw,
+												m_veh._veh_velocity, _td)
 										except: pass
 									elif abs(m_veh._veh_velocity) > 0.5 and _tree_scan_due:
 										_offh_perf_count('tree_deferred')
@@ -13388,7 +14454,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										try:
 											_hit_wall = _offh_perf_call(
 												'wall_collision', _check_horizontal_collision,
-												_ai_space_id, m_veh.position, m_veh.yaw,
+												m_veh, _ai_space_id, m_veh.position, m_veh.yaw,
 												m_veh._veh_velocity, _td,
 												getattr(m_veh, '_airborne', False), dt)
 										except: pass
@@ -13728,20 +14794,41 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										          m_veh._ypr_c[2], m_veh._ypr_c[3],
 										          m_veh._ypr_c[4], m_veh._ypr_c[5])
 								_offh_perf_stop('physics_safety', _perf_physics_safety)
-							# Smooth pitch/roll so bots don't jitter on rough terrain
-							_b_blend = min(1.0, dt * 8.0)
-							_b_p0 = getattr(m_veh, 'pitch', 0.0) or 0.0
-							_b_r0 = getattr(m_veh, 'roll', 0.0) or 0.0
-							m_veh.pitch = _b_p0 + (_b_ypr[1] - _b_p0) * _b_blend
-							m_veh.roll = _b_r0 + (_b_ypr[2] - _b_r0) * _b_blend
+							else:
+								# Replica, handoff and unknown roles never receive local legacy
+								# kinematics. Their presentation is snapshot-owned or frozen.
+								m_veh._veh_velocity = 0.0
+								m_veh._veh_turn_velocity = 0.0
+								_b_ypr = (m_veh.yaw, m_veh.pitch, m_veh.roll,
+									0.0, 0.0, 0.0)
+							# Native pose is already the canonical rigid-body orientation. Legacy
+							# terrain smoothing here would split the visible/native chassis from the
+							# mock matrix used by hit tests.
+							if _native_body_pose is not None:
+								m_veh.pitch = float(_b_ypr[1])
+								m_veh.roll = float(_b_ypr[2])
+							else:
+								_b_blend = min(1.0, dt * 8.0)
+								_b_p0 = getattr(m_veh, 'pitch', 0.0) or 0.0
+								_b_r0 = getattr(m_veh, 'roll', 0.0) or 0.0
+								m_veh.pitch = _b_p0 + (_b_ypr[1] - _b_p0) * _b_blend
+								m_veh.roll = _b_r0 + (_b_ypr[2] - _b_r0) * _b_blend
 							_b_ypr = (_b_ypr[0], m_veh.pitch, m_veh.roll)
-							
+
 							_offh_perf_call(
 								'pose_commit', _VP.commit_pose, m_veh,
 								m_veh.position, m_veh.yaw, m_veh.pitch, m_veh.roll,
 								_ai_space_id, _ai_now,
 								(bool(getattr(m_veh, '_spot_visible', True)) and
-								 not _native_filter_owned), True, False)
+								 not _native_filter_owned and
+								 not _native_movement_required), True, False)
+							if (_native_body_pose is not None and
+									_native_body_manager is not None):
+								try:
+									_native_body_manager.observe_presentation(
+										m_veh, _ai_now)
+								except Exception:
+									pass
 							_offh_perf_stop('physics', _perf_physics)
 							_perf_visibility = _offh_perf_start()
 							# --- Spotting: unspotted ENEMY tanks are hidden like the real game.
@@ -13903,7 +14990,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# Track scroll (bot): y=left, z=right, traverse via turn rate
 							try:
 								_bfa = getattr(m_veh, '_fashion', None)
-								if _bfa is not None and not _native_filter_owned:
+								if (_bfa is not None and not _native_filter_owned and
+										not _native_movement_required):
 									# physics.track_scroll: same law + clamp as the player feed
 									_btls, _btrs = _PHY.track_scroll(_bphys, m_veh._veh_velocity, m_veh._veh_turn_velocity)
 									_bfa.movementInfo = Math.Vector4(0.0, _btls, _btrs, 0.0)
@@ -13982,7 +15070,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									else:
 										m_veh._drown_t = 0.0
 							except Exception: pass
-							
+
 								# Turret and gun stay in their spawn pose until the countdown ends.
 							if _battle_active and hasattr(m_veh, '_t_mat'):
 								# Věž by měla vždy mířit na hráče (cíl), nezávisle na tom, kam se vyhýbá trup
@@ -13992,7 +15080,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								# Omezit věž na limity vždy
 								if _has_limited_traverse:
 									t_yaw = max(_bot_gun_min_yaw, min(_bot_gun_max_yaw, t_yaw))
-								
+
 								if getattr(m_veh, '_turret_yaw', None) is None: m_veh._turret_yaw = 0.0
 								t_diff = t_yaw - m_veh._turret_yaw
 								m_veh._offh_ai_traversing = bool(
@@ -14015,11 +15103,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								if getattr(m_veh, '_offh_drowning', False) or getattr(m_veh, 'is_turret_locked', False):
 									rot_step = 0.0
 									t_diff = 0.0
-								
+
 								if t_diff > rot_step: m_veh._turret_yaw += rot_step
 								elif t_diff < -rot_step: m_veh._turret_yaw -= rot_step
 								else: m_veh._turret_yaw = t_yaw
-								
+
 								m_veh._t_mat.setRotateYPR((m_veh._turret_yaw, 0, 0))
 								# Barrel elevation toward the same target, slewed at the gun's own speed and
 								# clamped to its real pitchLimits. Without this bots held the gun dead level
@@ -14069,7 +15157,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										m_veh._g_mat.setRotateYPR((0, m_veh._gun_pitch, 0))
 									except Exception:
 										pass
-									
+
 							# Strelba bota na hrace
 							if getattr(getattr(player, 'arena', None), 'period', 3) != 3:
 								continue # no shooting in prebattle countdown OR afterbattle (capture won)
@@ -14094,9 +15182,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											m_veh._ai_reload_intra = float(_g['clip'][1])
 											m_veh._ai_clip = m_veh._ai_clip_size
 								except: pass
-								
+
 							m_veh._ai_shoot_timer += dt
-							
+
 							# Zjistit absolutní úhel, kam míří dělo
 							abs_gun_yaw = m_veh.yaw + getattr(m_veh, '_turret_yaw', 0.0)
 							# Gate on the bearing to the TARGET, not target_yaw: that one is
@@ -14345,25 +15433,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						try:
 							killer_id = getattr(player_mock, 'last_killer_id', -1)
 							p_id = player.playerVehicleID
-							if killer_id != -1 and killer_id in player.arena.vehicles and hasattr(player.arena, 'onVehicleKilled'):
-								player.arena.vehicles[killer_id]['frags'] = player.arena.vehicles[killer_id].get('frags', 0) + 1
-								if hasattr(player.arena, 'statistics'):
-									if killer_id not in player.arena.statistics: player.arena.statistics[killer_id] = {'frags': 0}
-									player.arena.statistics[killer_id]['frags'] = player.arena.statistics[killer_id].get('frags', 0) + 1
+							if hasattr(player.arena, 'onVehicleKilled'):
 								player.arena.onVehicleKilled(p_id, killer_id, 0)
-								player.arena.onVehicleStatisticsUpdate(killer_id)
-								
-								from gui import WindowsManager
-								bw = getattr(WindowsManager.g_windowsManager, 'battleWindow', None)
-								if bw and hasattr(bw, '_Battle__fragCorrelation'):
-									p_team = getattr(player, 'team', 1)
-									allied = sum(v.get('frags', 0) for v in player.arena.vehicles.values() if v.get('team') == p_team)
-									enemy = sum(v.get('frags', 0) for v in player.arena.vehicles.values() if v.get('team') != p_team)
-									bw._Battle__fragCorrelation.updateFrags(allied, enemy)
-									# kill feed is posted centrally in _KillEventWrapper
 						except Exception as _e:
-							LOG_DEBUG('Frag update error:', _e)
-						
+							LOG_DEBUG('Player death event error:', _e)
+
 						# Swap model - hide live models, show the destroyed ones. The block below
 						# already carries the live turret bearing and gun pitch across (_dead_tyaw /
 						# _dead_gpitch), so the pose survives either way. What must NOT survive a
@@ -14376,7 +15450,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_d_hu = BigWorld.Model(_dtd.hull['models'][_dkey])
 							_d_tu = BigWorld.Model(_dtd.turret['models'][_dkey])
 							_d_gu = BigWorld.Model(_dtd.gun['models'][_dkey])
-							
+
 							try: _dead_tyaw = turret_yaw[0]
 							except Exception: _dead_tyaw = 0.0
 							try: _dead_gpitch = gun_pitch[0]
@@ -14388,7 +15462,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_add_model(_d_hu)
 									_add_model(_d_tu)
 									_add_model(_d_gu)
-									
+
 									def _attach_when_ready():
 										if not getattr(_d_ch, 'loaded', True) or not getattr(_d_hu, 'loaded', True) or not getattr(_d_tu, 'loaded', True) or not getattr(_d_gu, 'loaded', True):
 											_offh_battle_callback(0.1, _attach_when_ready)
@@ -14399,7 +15473,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										except: pass
 										try: BigWorld.delModel(_d_gu)
 										except: pass
-										
+
 										_live_chassis = loaded_models.get('chassis') or loaded_models.get('hull')
 										if _live_chassis is not None:
 											try:
@@ -14410,7 +15484,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											except: pass
 											try: BigWorld.delModel(_live_chassis)
 											except: pass
-										
+
 										try: _d_ch.node('V').attach(_d_hu)
 										except: pass
 										# freeze turret/gun at the last aimed direction (not snapped forward)
@@ -14424,7 +15498,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											mock_veh._wreck_g_mat = _g_mat   # hold a ref: a GC'd matrix drops the node back to identity
 											_d_tu.node('HP_gunJoint', _g_mat).attach(_d_gu)
 										except: pass
-										
+
 										_d_ch.position = Math.Vector3(mock_veh.position)
 										try: _d_ch.addMotor(BigWorld.Servo(chassis_mp))
 										except: pass
@@ -14441,15 +15515,17 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								except Exception as _e:
 									import traceback
 									LOG_DEBUG('Player model swap failed:', traceback.format_exc())
-							
+
 							_offh_battle_callback(0.1, _swap_player_destroyed)
 						except Exception as _e: LOG_DEBUG('Player death model err:', str(_e))
-						
+
 						# Exit battle in 5 seconds - use game.fini() which is the proper hook
 						def _exit_battle():
 							try:
 								if _exit_done[0]:
 									LOG_DEBUG('Player death exit skipped: another exit path already ran')
+									return
+								if not _offh_sweep_or_retry('exit', _exit_battle):
 									return
 								_exit_done[0] = True
 								LOG_DEBUG('Player death: triggering exit to hangar')
@@ -14460,7 +15536,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										_SG.g_instance.enableArenaSounds(False)
 										_SG.g_instance.enableLobbySounds(True)
 								except Exception as e: LOG_DEBUG('CRITICAL ERROR IN K KEY:', e); import traceback; LOG_DEBUG(traceback.format_exc())
-								
+
 								# Kill the crew-voice engine BEFORE the hangar loads. This used
 								# to CREATE+start a fresh IngameSoundNotifications here (merge
 								# artifact): the instance lived on the persistent account, its
@@ -14476,7 +15552,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									try: del player.soundNotifications
 									except Exception: pass
 								except: pass
-								
+
 								try:
 									_aih = getattr(player, 'inputHandler', None)
 									if _aih is not None:
@@ -14495,10 +15571,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								except Exception as e:
 									import traceback
 									LOG_DEBUG('Failed to stop AIH:', traceback.format_exc())
-								
+
 								import gui.mods.offhangar._constants as _c
 								from gui import WindowsManager
-								
+
 								try:
 									if hasattr(WindowsManager.g_windowsManager, 'destroyBattle'):
 										WindowsManager.g_windowsManager.destroyBattle()
@@ -14506,7 +15582,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										WindowsManager.g_windowsManager.hideAll()
 								except Exception:
 									pass
-									
+
 								try:
 									global g_offline_models
 									# Clear FIRST: delModel's pending error raises at loop
@@ -14518,16 +15594,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									for m in _gm_list:
 										_offh_del_model(m)
 								except Exception as e: LOG_DEBUG('CRITICAL ERROR IN K KEY:', e); import traceback; LOG_DEBUG(traceback.format_exc())
-								
-								# Free everything the battle allocated BEFORE camera/draw go down:
-								# chunk unloading after delSpaceGeometryMapping only completes
-								# while the engine still draws (memlog: the sweep-first 'quit'
-								# path returned ~700 MB, this post-draw-off path returned none).
-								try:
-									_offh_battle_sweep('exit')
-								except Exception as e:
-									LOG_DEBUG('Sweep err:', str(e))
-								
+
+								# The ownership sweep ran before any teardown in this continuation.
 								try:
 									global g_projectile_mover
 									if g_projectile_mover is not None:
@@ -14538,25 +15606,25 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									BigWorld.camera(None)
 									BigWorld.worldDrawEnabled(False)
 								except Exception as e: LOG_DEBUG('CRITICAL ERROR IN K KEY:', e); import traceback; LOG_DEBUG(traceback.format_exc())
-								
+
 								try:
 									import gui.ClientHangarSpace
 									LOG_DEBUG('ClientHangarSpace module dir:', dir(gui.ClientHangarSpace))
 									LOG_DEBUG('ClientHangarSpace class dir:', dir(gui.ClientHangarSpace.ClientHangarSpace))
 								except Exception as e:
 									LOG_DEBUG('ClientHangarSpace error:', e)
-								
+
 								try:
 									BigWorld.worldDrawEnabled(True)
 								except Exception as e: LOG_DEBUG('CRITICAL ERROR IN K KEY:', e); import traceback; LOG_DEBUG(traceback.format_exc())
-									
+
 								try:
 									from gui import WindowsManager
-									
+
 									if hasattr(WindowsManager.g_windowsManager, 'showLobby'):
 										WindowsManager.g_windowsManager.showLobby()
 										LOG_DEBUG('Triggered showLobby() for full UI and camera reload!')
-										
+
 									from gui.Scaleform.utils.HangarSpace import g_hangarSpace
 									if g_hangarSpace is not None:
 										try:
@@ -14569,7 +15637,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										LOG_DEBUG('Restored HangarSpace via global instance!')
 									else:
 										LOG_DEBUG('Global g_hangarSpace is None!')
-										
+
 								except Exception as e:
 									import traceback
 									LOG_DEBUG('HangarSpace restore error:', traceback.format_exc())
@@ -14591,11 +15659,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									BigWorld.callback(3.0, _flush_stale_waiting)
 								except Exception:
 									pass
-								
+
 								try:
 									BigWorld.worldDrawEnabled(True)
 								except Exception as e: LOG_DEBUG('CRITICAL ERROR IN K KEY:', e); import traceback; LOG_DEBUG(traceback.format_exc())
-									
+
 								# Set the allow flag and trigger native exit
 								for _e in BigWorld.entities.values():
 									if _e.__class__.__name__ in ('PlayerAccount', 'Account'):
@@ -14607,7 +15675,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							except Exception as e:
 								import traceback
 								LOG_DEBUG('Player exit battle err:', traceback.format_exc())
-						
+
 						# Post-death: enter ally spectator instead of auto-exiting. The tick follows
 						# a living ally; K/ESC still leaves via the normal exit path.
 						LOG_DEBUG('OfflineBattle: player dead -> ally spectator (K to exit)')
@@ -14799,7 +15867,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		try:
 			import AvatarInputHandler.control_modes as _ctrl
 			import AvatarInputHandler.cameras as _cams2
-			
+
 			if hasattr(_ctrl.ArcadeControlMode, '_ArcadeControlMode__tick') and not hasattr(_ctrl.ArcadeControlMode, '_offhangar_patched'):
 				# Patch ArcadeControlMode.__tick
 				_orig_ctrl_tick = getattr(_ctrl.ArcadeControlMode, '_ArcadeControlMode__tick')
@@ -14809,7 +15877,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					return _orig_ctrl_tick(self_cm, *a, **kw)
 				_ctrl.ArcadeControlMode._ArcadeControlMode__tick = _safe_ctrl_tick
 				_ctrl.ArcadeControlMode._offhangar_patched = True
-				
+
 			if hasattr(_cams2, 'ArcadeCamera') and hasattr(_cams2.ArcadeCamera, '_ArcadeCamera__cameraUpdate') and not hasattr(_cams2.ArcadeCamera, '_offhangar_patched'):
 				# Patch ArcadeCamera.__cameraUpdate
 				_orig_arc_cam = getattr(_cams2.ArcadeCamera, '_ArcadeCamera__cameraUpdate')
@@ -14826,20 +15894,27 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					return _orig_arc_cam(self_ac, *a, **kw)
 				_cams2.ArcadeCamera._ArcadeCamera__cameraUpdate = _safe_arc_cam
 				_cams2.ArcadeCamera._offhangar_patched = True
-			
+
 			LOG_DEBUG('OfflineBattle.control_modes/cameras ticks patched for safe exit')
 		except Exception:
 			LOG_CURRENT_EXCEPTION()
 
 		_install_input_chain_debug()
 		g_offline_aih = AvatarInputHandler.AvatarInputHandler()
+		# game.handleMouseEvent calls player.inputHandler.handleMouseEvent directly;
+		# it does not route through player.handleMouseEvent. Count delivery at this
+		# exact instance entry so the GUI-eaten fallback cannot double-apply a wheel
+		# event which the normal game path already delivered. Increment before the
+		# stock gate: reaching a stopped/detached AIH is an intentional rejection,
+		# not permission to bypass it with a direct camera mutation.
+		_offh_wrap_aih_mouse_delivery(g_offline_aih, player)
 		player.inputHandler = g_offline_aih
 		try:
 			g_offline_aih.start()
 		except Exception as e:
 			import traceback
 			LOG_DEBUG('AvatarInputHandler.start ERROR:', traceback.format_exc())
-		
+
 		# After AIH.start(), forcibly redirect camera to our spawn position.
 		# AIH may set cam.target to (0,0,0) from a defaulted entity matrix.
 		# We override it directly using CursorCamera.
@@ -14868,23 +15943,23 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		from gui.Scaleform.Waiting import Waiting
 		try:
 			player = BigWorld.player()
-			
+
 			import gui.Scaleform.Battle
 			import Avatar
 			class _FakeAvatarMod(object):
 				PlayerAvatar = type(player)
-			
+
 			if hasattr(gui.Scaleform.Battle, 'Avatar'):
 				gui.Scaleform.Battle.orig_Avatar = gui.Scaleform.Battle.Avatar
 			gui.Scaleform.Battle.Avatar = _FakeAvatarMod
-			
+
 			if hasattr(Avatar, 'PlayerAvatar'):
 				Avatar.orig_PlayerAvatar = Avatar.PlayerAvatar
 			Avatar.PlayerAvatar = type(player)
-			
+
 			if not hasattr(player, 'denunciationsLeft'):
 				player.denunciationsLeft = 0
-				
+
 			if not hasattr(player, 'onSpaceLoaded'):
 				class _DummyEvent(object):
 					def __iadd__(self, *a, **k): return self
@@ -14892,10 +15967,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					def __call__(self, *a, **k): return True
 					def isActive(self): return True
 				player.onSpaceLoaded = _DummyEvent()
-			
+
 			if not hasattr(player, 'playerVehicleID'):
 				player.playerVehicleID = 0
-				
+
 			import types
 			if hasattr(player, 'getOwnVehicleShotDispersionAngle'):
 				# Rebind EVERY battle: the old name-based guard kept the FIRST
@@ -14909,7 +15984,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					orig = _orig_get_disp(turretRotationSpeed, withShot)
 					return (_gun_state.get('dispersion', orig[0]), orig[1])
 				player.getOwnVehicleShotDispersionAngle = types.MethodType(_mock_getOwnVehicleShotDispersionAngle, player)
-			
+
 			# VŽDY resetuj životní funkce při nové bitvě
 			player.isVehicleAlive = True
 			# Crew voices need this object to exist. Retail builds it in
@@ -14951,15 +16026,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				# TypeError: 'bool' object is not callable, killing the panel setup on
 				# every retry of its 0.05 s waiting loop.
 				_offh_set_alive(player.vehicle, True)
-				
+
 			if not hasattr(player, 'name'):
 				player.name = 'Player'
 			if not hasattr(player, 'team'):
 				player.team = 1
-			
-			
 
-			
+
+
+
 
 
 			# ---- consumables / equipment (ported) ----
@@ -14967,7 +16042,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				import BigWorld
 				_mv = globals().get('G_MOCK_VEHICLES', {}) or {}
 				return _mv.get(getattr(BigWorld.player(), 'playerVehicleID', -1))
-			
+
 			def _offh_device_ui_state(mock, td, ui_name):
 				from gui.mods.offhangar import device_damage as _DDs
 				healths = _REPAIR_UI_TO_HEALTH.get(ui_name, (ui_name + 'Health',))
@@ -14982,7 +16057,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						if mx is not None and dh[h] < mx:
 							st = 'critical'
 				return st
-			
+
 			def _offh_repair_device(mock, td, ui_name):
 				from gui.mods.offhangar import device_damage as _DDs
 				healths = _REPAIR_UI_TO_HEALTH.get(ui_name, (ui_name + 'Health',))
@@ -15012,7 +16087,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				except Exception:
 					pass
 				return repaired
-			
+
 			def _offh_activate_equipment(idx, deviceName=None):
 				import BigWorld, random
 				from gui.mods.offhangar import device_damage as _DDs
@@ -15168,13 +16243,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							try: panel.expandEquipmentSlot(idx, 'medkit', entityStates)
 							except Exception as _me: LOG_DEBUG('expandEquipmentSlot(medkit) err:', str(_me))
 					return
-			
+
 			def _offh_damage_icon(tag, deviceName=None):
 				for c in _gun_state.get('consumables', []):
 					if c.get('tag') == tag and not c.get('used'):
 						_offh_activate_equipment(c.get('slot'), deviceName)
 						return
-			
+
 			# ---- broken-track visual (ported) ----
 			def _clear_crashed_track(mock):
 				'''Detach and drop a mock's crashed-track overlay, reset the cached state.'''
@@ -15188,7 +16263,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				mock._crashed_track_model = None
 				mock._crashed_track_fashion = None
 				mock._crashed_track_parent = None
-			
+
 			def _sync_crashed_track(mock, chassis_model, fashion, td):
 				'''Broken-track visual, like the game's _CrashedTrackController. Idempotent
 				through a cached (left, right) state; every native call is guarded because a
@@ -15277,12 +16352,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					# both tracks functional again: drop the overlay, restore the live tracks
 					if crashed_model is not None:
 						_clear_crashed_track(mock)
-			
+
 			# ---- crew injuries (ported) ----
 			def _device_td(mock):
 				import BigWorld
 				return getattr(mock, 'typeDescriptor', getattr(BigWorld.player(), 'vehicleTypeDescriptor', None))
-			
+
 			def _crew_roster(td):
 				# Crew instance names ('commander','driver','gunner1',...) - the crew health
 				# extra names minus 'Health'.
@@ -15301,7 +16376,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				if not names:
 					names = ['commander', 'driver', 'gunner1', 'loader1', 'radioman1']
 				return names
-			
+
 			def _recompute_crew_impaired(mock):
 				# Cache the impaired BASE roles. A small crew has men covering SEVERAL roles,
 				# so one casualty can impair more than one - read that from td.type.crewRoles
@@ -15326,7 +16401,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						else:
 							roles.add(_DDc.crew_role_base(inst))
 				mock._crew_impaired = frozenset(roles)
-			
+
 			def _crew_factor(mock, stat):
 				# Stat multiplier from this mock's knocked-out crew (1.0 when all fit).
 				imp = getattr(mock, '_crew_impaired', None)
@@ -15337,7 +16412,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					return _DDc.crew_stat_factor(imp, stat)
 				except Exception:
 					return 1.0
-			
+
 			def _module_factor(mock, stat):
 				# Stat multiplier from this mock's MODULE state (1.0 when everything is
 				# whole), the counterpart of _crew_factor. The client never had these -
@@ -15381,7 +16456,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					except Exception as _ke:
 						LOG_DEBUG('crew KO ui err:', str(_ke))
 				return True
-			
+
 			# ---- module damage / repair support (ported from the shared build) ----
 			_REPAIR_UI_TO_HEALTH = {
 				'engine': ('engineHealth',), 'ammoBay': ('ammoBayHealth',),
@@ -15392,19 +16467,19 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				'track': ('leftTrackHealth', 'rightTrackHealth'),
 				'leftTrack': ('leftTrackHealth',), 'rightTrack': ('rightTrackHealth',),
 			}
-			
+
 			def _dev_destroyed_set(mock):
 				s = getattr(mock, '_destroyed_devices', None)
 				if s is None:
 					s = set()
 					mock._destroyed_devices = s
 				return s
-			
+
 			def _module_ui_name(name):
 				# Damage-panel device name = extra name minus 'Health'; tracks keep their
 				# side, which is what the real 0.8.2 Avatar sends.
 				return name[:-6] if name.endswith('Health') else name
-			
+
 			def _refresh_mobility_flags(mock):
 				# A destroyed track/engine is functional again only once auto-repair reaches
 				# ~50% (the repair tick drops it from the set), so gameplay keys off the
@@ -15414,7 +16489,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				mock.is_engine_dead = ('engineHealth' in s)
 				mock.is_gun_destroyed = ('gunHealth' in s)
 				mock.is_turret_locked = ('turretRotatorHealth' in s)
-			
+
 			# These live in the battle scope, but _offh_knock_out_everything is module-level
 			# and is what every death path calls. Reaching them from there raised NameError
 			# into a bare except, so a destroyed tank pushed NOTHING to the damage panel -
@@ -15427,10 +16502,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				('_module_ui_name', _module_ui_name),
 				('_refresh_mobility_flags', _refresh_mobility_flags)):
 				globals()[_hn] = _hf
-			
+
 			def _offh_play_crit_voice(snd):
 				'''Queue one module or crew voice line for the player's own tank.
-				
+
 				No throttling here, deliberately. gui/sound_notifications.xml gives every
 				module and crew line playRules 3 - append to the voice queue and wait its
 				turn - and the engine already rate-limits repeats of the SAME line through
@@ -15439,7 +16514,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				0.7 s gate that dropped any line following any other one whatever they were,
 				so a shell that broke a track AND downed the driver reported whichever won
 				the race and silently swallowed the other.
-				
+
 				The binding is explicit because every one of these events sets
 				shouldBindToPlayer, which makes play() resolve it through
 				BigWorld.player().vehicle.id - a stub offline. __playFirstFromQueue drops any
@@ -15642,7 +16717,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					# 1.44 s ALONGSIDE ours - no exclusive channel, nothing to steal.
 				except Exception:
 					pass
-			
+
 			def _push_device_ui(target_mock, is_player_target, name, current_hp, max_hp, state=None):
 				# Entry probe. CREWVOICE play sits at the END of this chain, so a zero there
 				# cannot tell "no module was ever damaged" apart from "the chain broke on the
@@ -15728,7 +16803,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						pass
 				except Exception as _e:
 					LOG_DEBUG('DAMAGE_PANEL_UI_ERR:', str(_e))
-			
+
 			# _offh_extinguish is module level (every fire path calls it) and needs this
 			# one; publish it the same way the other battle-scope helpers are published.
 			globals()['_push_device_ui'] = _push_device_ui
@@ -15843,10 +16918,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					_sync_crashed_track(mock, _ch_m, _fa_m, td)
 				except Exception as _cte:
 					LOG_DEBUG('crashed track sync err:', str(_cte))
-			
+
 			def _offh_he_splash(burst_pos, _shot, attacker_id, direct_id):
 				'''HE blast on every OTHER vehicle within explosionRadius.
-				
+
 				The vehicle actually struck is skipped: it is the dist_frac 0 case and its
 				damage is applied by the shot path that called us, so counting it here too
 				would double it. For each victim a ray is run from the burst point into the
@@ -16011,15 +17086,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							pass
 				if _hit_any:
 					LOG_DEBUG('HE BURST: %d vehicle(s) caught in a %.1f m blast' % (_hit_any, _R))
-			
+
 			def _apply_module_damage(target_mock, all_hits, start_pos, end_pos, dmg, _shell, attacker_id, penetrated=None, by_explosion=False):
 				'''Roll module and crew crits for one strike.
-				
+
 				penetrated: True the shell got through, False it did not, None unknown (the
 				bot call sites, which already sit behind their own penetration branch).
 				False restricts the roll to devices IN FRONT of the plate that stopped the
 				round - see the _stop_d block below.
-				
+
 				by_explosion: this is HE splash rather than a solid hit, so every saving throw
 				reads the material's chanceToHitByExplosion. Blast reaches externally mounted
 				gear far more readily than it reaches anything behind a plate, which is what
@@ -16588,120 +17663,17 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									bw._Battle__updatePlayers()
 							except: pass
 							LOG_DEBUG('BOT KILLED ENEMY BOT!')
+							# Wreck ownership is centralized in _KillEventWrapper below.  Per-weapon
+							# swaps used to race the native Servo/filter release and could replace a
+							# chassis which the rigid-body graph still owned.
+							# The canonical event owns native release/wreck scheduling. Fire it before
+							# optional statistics or GUI work so a broken panel cannot strand a live
+							# rigid body after the bot is already dead.
 							try:
-								try: hit_veh.appearance.changeVisibility('', False, False)
-								except: pass
-								try:
-									if getattr(hit_veh, '_wreck_done', False):
-										raise StopIteration  # wreck already handled by another kill path
-									hit_veh._wreck_done = True
-									_dtd = hit_veh.typeDescriptor
-									_d_ch = BigWorld.Model(_dtd.chassis['models']['destroyed'])
-									_d_hu = BigWorld.Model(_dtd.hull['models']['destroyed'])
-									_d_tu = BigWorld.Model(_dtd.turret['models']['destroyed'])
-									_d_gu = BigWorld.Model(_dtd.gun['models']['destroyed'])
-									_old_ch = hit_veh._chassis_model
-									_old_pos = _old_ch.position
-									_old_yaw = _old_ch.yaw
-									# pitch/roll as well: a wreck used to snap dead level on any slope
-									try: _old_pitch = _old_ch.pitch
-									except Exception: _old_pitch = 0.0
-									try: _old_roll = _old_ch.roll
-									except Exception: _old_roll = 0.0
-									_old_ch_ref = _old_ch
-									def _swap_destroyed_model_bot(_d_ch=_d_ch, _d_hu=_d_hu, _d_tu=_d_tu, _d_gu=_d_gu, _old_ch_ref=_old_ch_ref, _old_pos=_old_pos, _old_yaw=_old_yaw, _attacker=hit_veh):
-										if not getattr(_d_ch, 'loaded', True) or not getattr(_d_hu, 'loaded', True) or not getattr(_d_tu, 'loaded', True) or not getattr(_d_gu, 'loaded', True):
-											_offh_battle_callback(0.1, _swap_destroyed_model_bot)
-											return
-										try: _old_ch_ref.visible = False
-										except: pass
-										try: _old_ch_ref.visibleAttachments = False
-										except: pass
-										try:
-											if getattr(_attacker, 'bw_entity', None) is not None:
-												_attacker.bw_entity.model = None  # chassis is entity-owned: delModel alone fails
-										except: pass
-										try: BigWorld.delModel(_old_ch_ref)
-										except: pass
-										# Wreck must rest on the ground (mid-air kill would leave a floating
-										# wreck). _wpos: NEVER rebind _old_pos - in the player-kill path this
-										# code sits in a nested function where _old_pos is only a closure var;
-										# assigning it made it local -> UnboundLocalError -> vanishing wrecks.
-										_wpos = _old_pos
-										try:
-											import BigWorld as _bwx, Math as _mx
-											_gw = _bwx.wg_collideSegment(_offh_bspace(), _mx.Vector3(_wpos.x, _wpos.y + 2.0, _wpos.z), _mx.Vector3(_wpos.x, _wpos.y - 500.0, _wpos.z), 128)
-											if _gw is not None and _wpos.y > _gw[0].y + 0.5:
-												_wpos = _mx.Vector3(_wpos.x, _gw[0].y, _wpos.z)
-										except Exception:
-											pass
-										_d_ch.position = _wpos
-										_d_ch.yaw = _old_yaw
-										# Whole orientation in one go. Model.pitch/.roll assigned separately after
-										# .yaw do NOT compose - each setter rebuilds the transform, which left the
-										# wreck mis-oriented (turretless hulls like the Foch 155 worst of all).
-										# A Servo on a prepared matrix is what the live chassis already uses.
-										try:
-											_wr_mat = Math.Matrix()
-											_wr_mat.setRotateYPR((_old_yaw, _old_pitch, _old_roll))
-											_wr_mat.translation = _wpos
-											_d_ch.addMotor(BigWorld.Servo(_wr_mat))
-											_attacker._wreck_mat = _wr_mat   # hold a ref: a GC'd matrix drops the wreck
-										except Exception as _wme:
-											LOG_DEBUG('Wreck orientation failed:', str(_wme))
-										_h_mat = Math.Matrix(); _h_mat.setIdentity()
-										# freeze the turret where the bot last aimed (identity snapped it forward)
-										# snapshot of the last aim: turret where it pointed, barrel where it sat
-										# The chassis matrix is kept alive on the mock for exactly this reason; the
-										# turret and gun matrices were not. Model.node(name, matrix) does not own the
-										# matrix, so once these locals went out of scope the collector could take them
-										# and the joint fell back to identity - the wreck's turret snapping to 0/0
-										# some deaths but not others, depending on GC timing.
-										_t_mat = Math.Matrix(); _t_mat.setRotateYPR((float(getattr(_attacker, '_turret_yaw', 0.0) or 0.0), 0, 0))
-										_attacker._wreck_t_mat = _t_mat   # hold a ref: a GC'd matrix drops the node back to identity
-										_g_mat = Math.Matrix(); _g_mat.setRotateYPR((0, float(getattr(_attacker, '_gun_pitch', 0.0) or 0.0), 0))
-										_attacker._wreck_g_mat = _g_mat   # hold a ref: a GC'd matrix drops the node back to identity
-										try: _d_ch.node('V').attach(_d_hu)
-										except: pass
-										try:
-											_attacker._d_t_node = _d_hu.node('HP_turretJoint', _t_mat)
-											_attacker._d_t_node.attach(_d_tu)
-										except: pass
-										try:
-											_attacker._d_g_node = _d_tu.node('HP_gunJoint', _g_mat)
-											_attacker._d_g_node.attach(_d_gu)
-										except: pass
-										try: _add_model(_d_ch)
-										except: pass
-									_offh_battle_callback(0.1, _swap_destroyed_model_bot)
-								except Exception as e:
-									LOG_DEBUG('Swap bot destroyed model error:', e)
-
-								if hasattr(player.arena, 'statistics'):
-									if _attacker_id not in player.arena.statistics: player.arena.statistics[_attacker_id] = {'frags': 0}
-									_atk_team = getattr(_attacker, '_bot_team', _attacker.publicInfo.get('team', 2) if getattr(_attacker, 'publicInfo', None) is not None else 2)
-									_vic_team = getattr(hit_veh, '_bot_team', hit_veh.publicInfo.get('team', 2) if getattr(hit_veh, 'publicInfo', None) is not None else 2)
-									_frag_diff_bot = -1 if _atk_team == _vic_team else 1
-									player.arena.vehicles[_attacker_id]['frags'] = player.arena.vehicles[_attacker_id].get('frags', 0) + _frag_diff_bot
-									player.arena.statistics[_attacker_id]['frags'] = player.arena.statistics[_attacker_id].get('frags', 0) + _frag_diff_bot
 								player.arena.onVehicleKilled(hit_veh.id, _attacker_id, 0)
-								try:
-									if hasattr(player, 'onVehicleKilled'): player.onVehicleKilled(hit_veh.id, _attacker_id, 0)
-								except: pass
-								for v_id in player.arena.vehicles:
-									if v_id not in player.arena.statistics: player.arena.statistics[v_id] = {'frags': 0}
-								player.arena.onVehicleStatisticsUpdate(_attacker_id)
-								if hasattr(bw, '_Battle__updatePlayers'):
-									try: bw._Battle__updatePlayers()
-									except: pass
-								if hasattr(bw, '_Battle__fragCorrelation'):
-									p_team = getattr(player, '_offhangar_team', 1)
-									allied = sum(v.get('frags', 0) for i,v in player.arena.vehicles.items() if i in player.arena.statistics and v.get('team') == p_team)
-									enemy = sum(v.get('frags', 0) for i,v in player.arena.vehicles.items() if i in player.arena.statistics and v.get('team') != p_team)
-									try: bw._Battle__fragCorrelation.updateFrags(allied, enemy)
-									except: pass
-								pass  # kill feed is posted centrally in _KillEventWrapper
-							except: pass
+							except Exception:
+								pass
+							pass  # kill feed is posted centrally in _KillEventWrapper
 						else:
 							LOG_DEBUG(
 								'BOT SHELL HIT NON-ENEMY at travelled distance %.1f' %
@@ -16990,159 +17962,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					try:
 						p_id = getattr(player, 'playerVehicleID', -1)
 						if p_id != -1 and p_id in player.arena.vehicles and hasattr(player.arena, 'onVehicleKilled'):
-							_pteam = getattr(player, '_offhangar_team', 1)
-							_vteam = getattr(enemy_mock, '_bot_team', enemy_mock.publicInfo.get('team', 2) if getattr(enemy_mock, 'publicInfo', None) is not None else 2)
-							_frag_diff = -1 if _pteam == _vteam else 1
-							player.arena.vehicles[p_id]['frags'] = player.arena.vehicles[p_id].get('frags', 0) + _frag_diff
-							if _frag_diff == -1:
-								player.arena.vehicles[p_id]['isTeamKiller'] = True
-								player.isTeamKiller = True
-								LOG_DEBUG('ARENA DIR: %s' % dir(player.arena))
-								try: player.arena.onTeamKiller(p_id)
-								except Exception as e: LOG_DEBUG('onTeamKiller error:', str(e))
-								try:
-									from gui import WindowsManager
-									bw = getattr(WindowsManager.g_windowsManager, 'battleWindow', None)
-									if bw and hasattr(bw, '_Battle__vehicles'):
-										try:
-											if hasattr(bw, '_Battle__arena'):
-												bw._Battle__arena.vehicles[p_id]['isTeamKiller'] = True
-												LOG_DEBUG('Updated bw._Battle__arena for p_id')
-											bw._Battle__updatePlayers()
-											if hasattr(bw, '_Battle__onTeamKiller'):
-												bw._Battle__onTeamKiller(p_id)
-										except Exception as e: LOG_DEBUG('Update __arena error:', str(e))
-								except Exception as e: LOG_DEBUG('BW VEHS ERROR:', str(e))
-								try: player.arena.onVehicleUpdated(p_id)
-								except: pass
-								try: player.arena.onVehicleAdded(p_id)
-								except: pass
-							if hasattr(player.arena, 'statistics'):
-								if p_id not in player.arena.statistics: player.arena.statistics[p_id] = {'frags': 0}
-								player.arena.statistics[p_id]['frags'] = player.arena.statistics[p_id].get('frags', 0) + _frag_diff
 							player.arena.onVehicleKilled(enemy_mock.id, p_id, 0)
-							# kill feed is posted centrally in _KillEventWrapper
-							for v_id in player.arena.vehicles:
-								if v_id not in player.arena.statistics: player.arena.statistics[v_id] = {'frags': 0}
-							player.arena.onVehicleStatisticsUpdate(p_id)
-							if hasattr(bw, '_Battle__updatePlayers'):
-								try: bw._Battle__updatePlayers()
-								except Exception as e: LOG_DEBUG('updatePlayers error:', e)
-							LOG_DEBUG('FRAGS AFTER:', player.arena.vehicles[p_id].get('frags'))
-							LOG_DEBUG('ARENA HAS STATS:', hasattr(player.arena, 'statistics'))
-							from gui import WindowsManager
-							bw = getattr(WindowsManager.g_windowsManager, 'battleWindow', None)
-							if bw and hasattr(bw, '_Battle__fragCorrelation'):
-								p_team = getattr(player, 'team', 1)
-								allied = sum(v.get('frags', 0) for v in player.arena.vehicles.values() if v.get('team') == p_team)
-								enemy = sum(v.get('frags', 0) for v in player.arena.vehicles.values() if v.get('team') != p_team)
-								bw._Battle__fragCorrelation.updateFrags(allied, enemy)
-								# kill feed is posted centrally in _KillEventWrapper
 					except Exception as _e:
-						LOG_DEBUG('Frag update error:', _e)
+						LOG_DEBUG('Player kill event error:', _e)
 
-					# --- SWAP TO DESTROYED MODEL ---
-					try:
-						if getattr(enemy_mock, '_wreck_done', False):
-							raise StopIteration  # wreck already handled by another kill path
-						enemy_mock._wreck_done = True
-						_dtd = enemy_mock.typeDescriptor
-						_d_ch = BigWorld.Model(_dtd.chassis['models']['destroyed'])
-						_d_hu = BigWorld.Model(_dtd.hull['models']['destroyed'])
-						_d_tu = BigWorld.Model(_dtd.turret['models']['destroyed'])
-						_d_gu = BigWorld.Model(_dtd.gun['models']['destroyed'])
-						_old_ch = enemy_mock._chassis_model
-						_old_pos = _old_ch.position
-						_old_yaw = _old_ch.yaw
-						# pitch/roll as well: a wreck used to snap dead level on any slope
-						try: _old_pitch = _old_ch.pitch
-						except Exception: _old_pitch = 0.0
-						try: _old_roll = _old_ch.roll
-						except Exception: _old_roll = 0.0
-						_old_ch_ref = _old_ch
-						def _swap_destroyed_model(_d_ch=_d_ch, _d_hu=_d_hu, _d_tu=_d_tu, _d_gu=_d_gu, _old_ch_ref=_old_ch_ref, _old_pos=_old_pos, _old_yaw=_old_yaw):
-							_add_model(_d_ch)
-							_add_model(_d_hu)
-							_add_model(_d_tu)
-							_add_model(_d_gu)
-							def _attach_when_ready():
-								if not getattr(_d_ch, 'loaded', True) or not getattr(_d_hu, 'loaded', True) or not getattr(_d_tu, 'loaded', True) or not getattr(_d_gu, 'loaded', True):
-									_offh_battle_callback(0.1, _attach_when_ready)
-									return
-								try: BigWorld.delModel(_d_hu)
-								except: pass
-								try: BigWorld.delModel(_d_tu)
-								except: pass
-								try: BigWorld.delModel(_d_gu)
-								except: pass
-								try: _old_ch_ref.visible = False
-								except: pass
-								try: _old_ch_ref.visibleAttachments = False
-								except: pass
-								try: BigWorld.delModel(_old_ch_ref)
-								except: pass
-
-								if getattr(enemy_mock, 'bw_entity', None) is not None:
-									try: enemy_mock.bw_entity.model = None
-									except:
-										try: enemy_mock.bw_entity.model = BigWorld.Model('')
-										except: pass
-
-								# Wreck must rest on the ground (mid-air kill would leave a floating
-								# wreck). _wpos: NEVER rebind _old_pos - in the player-kill path this
-								# code sits in a nested function where _old_pos is only a closure var;
-								# assigning it made it local -> UnboundLocalError -> vanishing wrecks.
-								_wpos = _old_pos
-								try:
-									import BigWorld as _bwx, Math as _mx
-									_gw = _bwx.wg_collideSegment(_offh_bspace(), _mx.Vector3(_wpos.x, _wpos.y + 2.0, _wpos.z), _mx.Vector3(_wpos.x, _wpos.y - 500.0, _wpos.z), 128)
-									if _gw is not None and _wpos.y > _gw[0].y + 0.5:
-										_wpos = _mx.Vector3(_wpos.x, _gw[0].y, _wpos.z)
-								except Exception:
-									pass
-								_d_ch.position = _wpos
-								_d_ch.yaw = _old_yaw
-								# Whole orientation in one go. Model.pitch/.roll assigned separately after
-								# .yaw do NOT compose - each setter rebuilds the transform, which left the
-								# wreck mis-oriented (turretless hulls like the Foch 155 worst of all).
-								# A Servo on a prepared matrix is what the live chassis already uses.
-								try:
-									_wr_mat = Math.Matrix()
-									_wr_mat.setRotateYPR((_old_yaw, _old_pitch, _old_roll))
-									_wr_mat.translation = _wpos
-									_d_ch.addMotor(BigWorld.Servo(_wr_mat))
-									enemy_mock._wreck_mat = _wr_mat   # hold a ref: a GC'd matrix drops the wreck
-								except Exception as _wme:
-									LOG_DEBUG('Wreck orientation failed:', str(_wme))
-								# freeze the turret where the bot last aimed (identity snapped it forward)
-								# snapshot of the last aim: turret where it pointed, barrel where it sat
-								_t_mat = Math.Matrix(); _t_mat.setRotateYPR((float(getattr(enemy_mock, '_turret_yaw', 0.0) or 0.0), 0, 0))
-								enemy_mock._wreck_t_mat = _t_mat   # hold a ref: a GC'd matrix drops the node back to identity
-								_g_mat = Math.Matrix(); _g_mat.setRotateYPR((0, float(getattr(enemy_mock, '_gun_pitch', 0.0) or 0.0), 0))
-								enemy_mock._wreck_g_mat = _g_mat   # hold a ref: a GC'd matrix drops the node back to identity
-								try: _d_ch.node('V').attach(_d_hu)
-								except: pass
-								try:
-									enemy_mock._d_t_node = _d_hu.node('HP_turretJoint', _t_mat)
-									enemy_mock._d_t_node.attach(_d_tu)
-								except: pass
-								try:
-									enemy_mock._d_g_node = _d_tu.node('HP_gunJoint', _g_mat)
-									enemy_mock._d_g_node.attach(_d_gu)
-								except: pass
-								try:
-									enemy_mock._collision_obstacle = BigWorld.PyModelObstacle(
-										_dtd.hull['models']['destroyed'],
-										_dtd.turret['models']['destroyed'],
-										enemy_mock.matrix,
-										False
-									)
-								except: pass
-								LOG_DEBUG('Destroyed model swapped OK')
-							_attach_when_ready()
-						_offh_battle_callback(0.0, _swap_destroyed_model)
-					except Exception as _de:
-						LOG_DEBUG('Destroyed model swap error:', str(_de))
+					# The central kill wrapper owns the only native-release/wreck transaction.
 
 
 			def _mock_shoot():
@@ -17168,7 +17992,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					idx = _gun_state.get('shot_index', 0)
 					ammo_key = 'ammo_%d' % idx
 					if _gun_state.get(ammo_key, 1) <= 0: return
-					
+
 					_gun_state[ammo_key] -= 1
 					_gun_state['clip'] -= 1
 					import math
@@ -17177,7 +18001,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					max_disp = _gun_state['base_dispersion'] * 15.0
 					if _gun_state['dispersion'] > max_disp:
 						_gun_state['dispersion'] = max_disp
-					
+
 					if _gun_state['clip'] > 0:
 						_gun_state['reloadTime'] = _gun_state['clip_reload']
 					else:
@@ -17189,10 +18013,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_gun_state['reloadTime'] = _gun_state['reload'] * (_crew_factor(_pm_cr, 'reload') * _module_factor(_pm_cr, 'reload') if _pm_cr is not None else 1.0)
 						except Exception:
 							_gun_state['reloadTime'] = _gun_state['reload']
-						
+
 					if hasattr(BigWorld.player(), 'gunRotator'):
 						BigWorld.player().gunRotator.dispersionAngle = _gun_state['dispersion']
-						
+
 					player = BigWorld.player()
 					try:
 						_player_mock._offh_spot_last_shot = float(BigWorld.time())
@@ -17285,11 +18109,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					try:
 						player._Avatar__shotWaitingTimerID = None
 					except: pass
-					
+
 					# --- RAYCAST HIT DETECTION ---
 					start_pos, dir_vec = player.gunRotator._VehicleGunRotator__getCurShotPosition()
 					dir_vec.normalise()
-					
+
 					# Apply Player Dispersion based on actual aiming circle
 					# (config.json "perfect_accuracy": true disables all scatter - testing aid)
 					disp_angle = getattr(player.gunRotator, 'dispersionAngle', _gun_state.get('dispersion', 0.02))
@@ -17299,7 +18123,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					dir_vec.y += random.gauss(0, sigma)
 					dir_vec.z += random.gauss(0, sigma)
 					dir_vec.normalise()
-					
+
 					# Resolve the selected shell independently of the visual tracer. Collision
 					# and damage must continue to work if ProjectileMover is unavailable.
 					_sid = None
@@ -17340,7 +18164,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					except Exception as e:
 						import traceback
 						LOG_DEBUG('Tracer spawn error:', traceback.format_exc())
-					
+
 					# Dynamic collision is resolved while the shell is actually in flight.
 					# Do not preselect a target here: an un-led shot must pass behind a
 					# moving tank, while a correctly led shot meets its later pose.
@@ -17389,7 +18213,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							import gui.IngameSoundNotifications as IngameSoundNotifications
 							BigWorld.player().soundNotifications = IngameSoundNotifications.IngameSoundNotifications()
 							BigWorld.player().soundNotifications.start()
-						
+
 						td = loaded_models.get('td')
 						# Barrel recoil animation on the player's gun
 						_trigger_gun_recoil(getattr(BigWorld.player(), '_offhangar_gun_recoil', None))
@@ -17407,7 +18231,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						if not _mflash_played:
 							_fallback_gun_sound(td, loaded_models.get('chassis') or loaded_models.get('hull') or loaded_models.get('turret') or loaded_models.get('gun'))
 					except Exception as e: pass
-						
+
 					LOG_DEBUG('OfflineBattle: PROJECTILE LAUNCHED')
 				except Exception as e:
 					import traceback
@@ -17423,7 +18247,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				import BigWorld, Math
 				_pl = BigWorld.player()
 				_sid = _offh_bspace()  # battle space, not empty player.spaceID (dedicated mode)
-				
+
 				def _ground_at(x, z, y_hint):
 					# Probe ground just above the expected height (not from +1000: avoids roofs)
 					try:
@@ -17433,7 +18257,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					except Exception:
 						pass
 					return None
-				
+
 				def _is_free(x, y, z):
 					# 1) Keep distance: >=10 m to the player, >=8 m to other tanks/wrecks
 					try:
@@ -17462,7 +18286,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						if _gy is None or abs(_gy - y) > 1.5:
 							return False
 					return True
-				
+
 				# Candidates: the desired point itself, then rings (8 directions) up to 30 m
 				_cands = [(want_pos.x, want_pos.z)]
 				for _r in (4.0, 8.0, 13.0, 20.0, 30.0):
@@ -17691,13 +18515,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									curr_target = bot
 						if prev_target != curr_target:
 							_set_autoaim_target(curr_target)
-						
+
 						if getattr(player, '_autoaim_target', None) is None:
 							_gun_state['locked_local_yaw'] = turret_yaw[0]
 							_gun_state['locked_local_pitch'] = gun_pitch[0]
 					else:
 						_gun_state['rmb_down'] = False
-						
+
 				# An OPEN equipment fly-out owns the number keys while it is up. Route them to
 				# the panel, but only when a fly-out is actually expanded and the key is bound
 				# to one of its entities - a stale fly-out must not eat the shell keys forever.
@@ -17713,7 +18537,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								return
 					except Exception as _fke:
 						LOG_DEBUG('flyout key route err:', str(_fke))
-				
+
 				# Shell slots honor Controls->Equipment rebinds (CMD_AMMO_CHOICE_1..3)
 				_ammo_bind = [Keys.KEY_1, Keys.KEY_2, Keys.KEY_3]
 				try:
@@ -17761,7 +18585,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					except Exception as e:
 						import debug_utils
 						debug_utils.LOG_DEBUG('Key ammo switch error:', str(e))
-						
+
 				# Consumable slots honor Controls->Equipment rebinds (CMD_AMMO_CHOICE_4..6)
 				_cons_bind = [Keys.KEY_4, Keys.KEY_5, Keys.KEY_6]
 				try:
@@ -17790,23 +18614,24 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							try: _td = loaded_models.get('td')
 							except: pass
 							if not _td: _td = getattr(player, 'vehicleTypeDescriptor', None)
-							
+
 							p_cd = getattr(getattr(_td, 'type', None), 'compactDescr', 0)
-							
+
 							LOG_DEBUG('BATTLE RESULTS LOCAL P_CD IS:', p_cd)
-							
+
 							import debug_utils
 							debug_utils.LOG_DEBUG('BATTLE RESULTS P_CD IS:', p_cd)
-							
+
 							if p_cd == 0 and hasattr(player, 'arena') and player.playerVehicleID in player.arena.vehicles:
 								_vinfo = player.arena.vehicles[player.playerVehicleID]
 								_vtype = _vinfo.get('vehicleType', None)
 								if _vtype:
 									p_cd = getattr(getattr(_vtype, 'type', None), 'compactDescr', 0)
 									debug_utils.LOG_DEBUG('BATTLE RESULTS FALLBACK P_CD IS:', p_cd)
-							
-							allied = sum(v.get('frags', 0) for v in player.arena.vehicles.values() if v.get('team', 2) == p_team)
-							enemy = sum(v.get('frags', 0) for v in player.arena.vehicles.values() if v.get('team', 2) != p_team)
+
+							# Match the live HUD's canonical per-team frag totals. Explicit
+							# capture/wipe outcomes override this display-derived fallback below.
+							allied, enemy = _offh_team_score(player)
 							# A capture win ends the battle through this same K flow and
 							# forces the outcome instead of the frag comparison below.
 							_forced_w = globals().pop('G_OFFH_FORCED_WINNER', None)
@@ -17817,13 +18642,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									allied = enemy = 0
 								else:
 									allied, enemy = (1, 0) if _forced_w == p_team else (0, 1)
-							
+
 							def _show_res():
 								try:
 									from gui.SystemMessages import SM_TYPE, pushMessage
 									pushMessage('Offline battle finished. Returning to Hangar...'.encode('utf-8'), SM_TYPE.Information)
 								except Exception as e: LOG_DEBUG('CRITICAL ERROR IN K KEY:', e); import traceback; LOG_DEBUG(traceback.format_exc())
-								
+
 								try:
 									import MusicController
 									if hasattr(MusicController, 'g_musicController') and MusicController.g_musicController:
@@ -17840,31 +18665,31 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										try: _mc.play(evt)
 										except: pass
 								except Exception as e: LOG_DEBUG('CRITICAL ERROR IN K KEY MUSIC:', e); import traceback; LOG_DEBUG(traceback.format_exc())
-								
+
 								try:
 									import battle_results_shared
 									mock_arena_id = 999
-									
+
 									v_id = getattr(player, 'playerVehicleID', 1)
 									p_max_health = getattr(getattr(player, 'vehicleTypeDescriptor', None), 'maxHealth', 1000)
 									p_health = getattr(getattr(player, 'vehicle', None), 'health', p_max_health)
-									
+
 									_player_mock = globals().get('G_MOCK_VEHICLES', {}).get(getattr(player, 'playerVehicleID', -1))
 									if _player_mock is not None:
 										p_health = max(0, int(getattr(_player_mock, 'health', p_health) or 0))
 									_p_killer_id = getattr(_player_mock, 'last_killer_id', 255) if p_health <= 0 else 0
-									
+
 									total_dmg_dealt = 0
 									total_frags = 0
 									total_hits = 0
 									players_dict = {p_dbid: {'name': p_name, 'clanDBID': 0, 'clanAbbrev': '', 'prebattleID': 0, 'team': p_team, 'igrType': 0}}
 									vehicles_dict = {v_id: {'health': p_health, 'credits': 10000, 'xp': 1000, 'shots': 10, 'hits': 8, 'he_hits': 0, 'pierced': 8, 'damageDealt': 0, 'damageAssisted': 0, 'damageReceived': max(0, p_max_health - p_health), 'shotsReceived': 0, 'spotted': 0, 'damaged': 0, 'kills': 0, 'tdamageDealt': 0, 'tkills': 0, 'isTeamKiller': False, 'capturePoints': 0, 'droppedCapturePoints': 0, 'mileage': 100, 'lifeTime': 300, 'killerID': _p_killer_id, 'achievements': [], 'repair': 0, 'freeXP': 50, 'details': {}, 'accountDBID': p_dbid, 'team': p_team, 'typeCompDescr': p_cd, 'gold': 0}}
 									personal_details = {}
-									
+
 									for vid, vinfo in getattr(player.arena, 'vehicles', {}).items():
 										if vid == v_id: continue
 										bot_team = vinfo.get('team', 2)
-										
+
 										_mock_vehicles = globals().get('G_MOCK_VEHICLES', {})
 										if vid in _mock_vehicles:
 											bot_team = getattr(_mock_vehicles[vid], '_bot_team', bot_team)
@@ -17872,30 +18697,30 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										# Force bot DBID to be its vehicle ID so it never overlaps the player's DBID!
 										bot_dbid = vid
 										td = vinfo.get('vehicleType', None)
-										
+
 										_mock_vehicles = globals().get('G_MOCK_VEHICLES', {})
 										if vid in _mock_vehicles:
 											_true_td = getattr(_mock_vehicles[vid], 'typeDescriptor', None)
 											if _true_td: td = _true_td
-										
+
 										td_type = getattr(td, 'type', None)
 										bot_cd = getattr(td_type, 'compactDescr', 0)
-										
+
 										players_dict[bot_dbid] = {'name': bot_name, 'clanDBID': 0, 'clanAbbrev': '', 'prebattleID': 0, 'team': bot_team, 'igrType': 0}
-										
+
 										is_killed = not vinfo.get('isAlive', True)
 										bot_hp = getattr(td, 'maxHealth', 1000)
 										bot_max_hp = bot_hp
-										
+
 										_mock_vehicles = globals().get('G_MOCK_VEHICLES', {})
 										if vid in _mock_vehicles:
 											bot_hp = max(0, getattr(_mock_vehicles[vid], 'health', 0))
 											bot_max_hp = getattr(_mock_vehicles[vid], 'maxHealth', bot_max_hp)
 											if bot_hp <= 0: is_killed = True
-										
+
 										if not 'mock_vehicles' in locals() and not '_mock_vehicles' in locals():
 											bot_hp = 0 if is_killed else bot_max_hp
-											
+
 										# Retrieve damage tracking from mock_vehicles
 										_dmg_from_player = 0
 										_dmg_from_bots = 0
@@ -17905,26 +18730,26 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											_dmg_from_player = getattr(_mock_vehicles[vid], 'damage_from_player', 0)
 											_dmg_from_bots = getattr(_mock_vehicles[vid], 'damage_from_bots', 0)
 											_hits_from_player = getattr(_mock_vehicles[vid], 'hits_from_player', 0)
-										
+
 										# Removed dangerous fallback! Only explicitly tracked damage counts.
 										dmg_received = bot_max_hp - bot_hp
-										
+
 										player_killed_this = is_killed and _dmg_from_player > 0 and _dmg_from_player >= (dmg_received / 2.0)
 										if player_killed_this and bot_team == p_team: player_killed_this = False
-										
+
 										total_dmg_dealt += _dmg_from_player
 										total_hits += _hits_from_player
 										if player_killed_this: total_frags += 1
-										
+
 										killer_id = v_id if player_killed_this else (getattr(_mock_vehicles.get(vid, None), 'last_killer_id', 255) if is_killed else 0)
-										
+
 										# Simulate some random shots and hits if the bot dealt damage
 										_bot_shots = max(1, int(_dmg_from_bots / 200.0)) if _dmg_from_bots > 0 else 1
 										vehicles_dict[vid] = {'health': bot_hp, 'credits': 100, 'xp': 100, 'shots': _bot_shots, 'hits': _bot_shots, 'he_hits': 0, 'pierced': _bot_shots, 'damageDealt': _dmg_from_bots, 'damageAssisted': 0, 'damageReceived': dmg_received, 'shotsReceived': max(1, int(dmg_received / 300.0)) if dmg_received > 0 else 0, 'spotted': 0, 'damaged': 0, 'kills': 0, 'tdamageDealt': 0, 'tkills': 0, 'isTeamKiller': False, 'capturePoints': 0, 'droppedCapturePoints': 0, 'mileage': 100, 'lifeTime': 300, 'killerID': killer_id, 'achievements': [], 'repair': 0, 'freeXP': 5, 'details': {}, 'accountDBID': bot_dbid, 'team': bot_team, 'typeCompDescr': bot_cd, 'gold': 0}
-										
+
 										if _dmg_from_player > 0 or bot_team != p_team:
 											personal_details[vid] = {'spotted': 1 if bot_team != p_team else 0, 'killed': 1 if player_killed_this else 0, 'hits': _hits_from_player, 'he_hits': 0, 'pierced': _hits_from_player, 'damageDealt': _dmg_from_player, 'damageAssisted': 0, 'crits': 1 if player_killed_this else 0, 'fire': 0}
-											
+
 									_feedback_values = None
 									try:
 										from gui.mods.offhangar import battle_feedback as _offh_feedback_results
@@ -17953,14 +18778,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									vehicles_dict[v_id]['capturePoints'] = (_feedback_values['capturePoints'] if _feedback_values is not None else 0)
 									vehicles_dict[v_id]['mileage'] = (_feedback_values['mileage'] if _feedback_values is not None else 0)
 									vehicles_dict[v_id]['lifeTime'] = (_feedback_values['lifeTime'] if _feedback_values is not None else 0)
-									
+
 									for v_iter_id, v_iter_data in vehicles_dict.items():
 										k_id = v_iter_data.get('killerID', 0)
 										if k_id and k_id in vehicles_dict and k_id != v_iter_id:
 											vehicles_dict[k_id]['kills'] = vehicles_dict[k_id].get('kills', 0) + 1
 									if _feedback_values is not None:
 										vehicles_dict[v_id]['kills'] = total_frags
-									
+
 									mock_res = {
 										'arenaUniqueID': mock_arena_id,
 										'personal': {'health': p_health, 'credits': 10000, 'xp': 1000, 'shots': (_feedback_values['shots'] if _feedback_values is not None else globals().get('G_OFFHANGAR_SHOTS_FIRED', max(0, total_hits))), 'hits': total_hits, 'he_hits': (_feedback_values['he_hits'] if _feedback_values is not None else 0), 'pierced': (_feedback_values['pierced'] if _feedback_values is not None else total_hits), 'damageDealt': total_dmg_dealt, 'damageAssisted': (_feedback_values['damageAssisted'] if _feedback_values is not None else 0), 'damageReceived': (_feedback_values['damageReceived'] if _feedback_values is not None else max(0, p_max_health - p_health)), 'shotsReceived': (_feedback_values['shotsReceived'] if _feedback_values is not None else 0), 'spotted': (_feedback_values['spotted'] if _feedback_values is not None else len(personal_details)), 'damaged': (_feedback_values['damaged'] if _feedback_values is not None else len(personal_details)), 'kills': total_frags, 'tdamageDealt': 0, 'tkills': 0, 'isTeamKiller': False, 'capturePoints': (_feedback_values['capturePoints'] if _feedback_values is not None else 0), 'droppedCapturePoints': (_feedback_values['droppedCapturePoints'] if _feedback_values is not None else 0), 'mileage': (_feedback_values['mileage'] if _feedback_values is not None else 0), 'lifeTime': (_feedback_values['lifeTime'] if _feedback_values is not None else 0), 'killerID': _p_killer_id, 'achievements': [], 'repair': 0, 'freeXP': 50, 'details': personal_details, 'accountDBID': p_dbid, 'team': p_team, 'typeCompDescr': p_cd, 'gold': 0, 'xpPenalty': 0, 'creditsPenalty': 0, 'creditsContributionIn': 0, 'creditsContributionOut': 0, 'tmenXP': 0, 'eventCredits': 0, 'eventGold': 0, 'eventXP': 0, 'eventFreeXP': 0, 'eventTMenXP': 0, 'autoRepairCost': 0, 'autoLoadCost': (0, 0), 'autoEquipCost': (0, 0), 'isPremium': True, 'premiumXPFactor10': 15, 'premiumCreditsFactor10': 15, 'dailyXPFactor10': 10, 'aogasFactor10': 10, 'markOfMastery': 0, 'dossierPopUps': []},
@@ -17968,7 +18793,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										'players': players_dict,
 										'vehicles': vehicles_dict
 									}
-									
+
 									if hasattr(battle_results_shared, 'VEH_FULL_RESULTS'):
 										for k in battle_results_shared.VEH_FULL_RESULTS:
 											if k not in mock_res['personal']: mock_res['personal'][k] = [] if 'list' in k or k == 'achievements' else (0 if k != 'details' else {})
@@ -17976,23 +18801,23 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										for k in battle_results_shared.VEH_BASE_RESULTS:
 											for v in mock_res['vehicles']:
 												if k not in mock_res['vehicles'][v]: mock_res['vehicles'][v][k] = [] if 'list' in k or k == 'achievements' else (0 if k != 'details' else {})
-									
+
 									def _mock_get(arenaUniqueID, callback):
 										import BigWorld
 										BigWorld.callback(0.1, lambda: callback(1, mock_res))
-									
+
 									player_brc = getattr(player, 'battleResultsCache', None)
 									if player_brc:
 										orig_br_get = player_brc.get
 										player_brc.get = _mock_get
-									
+
 									from gui import WindowsManager
 									window = getattr(WindowsManager.g_windowsManager, 'window', None)
 									if hasattr(window, 'onBattleResultsReceived'): window.onBattleResultsReceived(True, mock_arena_id)
 									elif hasattr(window, 'battleResults') and hasattr(window.battleResults, 'show'): window.battleResults.show(mock_arena_id)
 									elif hasattr(window, 'battleResults') and hasattr(window.battleResults, '_BattleResultsManager__showBattleResults'): window.battleResults._BattleResultsManager__showBattleResults(mock_arena_id)
 								except Exception as e: LOG_DEBUG('CRITICAL ERROR IN K KEY:', e); import traceback; LOG_DEBUG(traceback.format_exc())
-							
+
 							BigWorld.callback(4.0, _show_res)
 							player.leaveArena()
 					except Exception: pass
@@ -18005,18 +18830,19 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						dir_vec.normalise()
 						hit = BigWorld.wg_collideSegment(_offh_bspace(), start_pos, start_pos + dir_vec.scale(500.0), 128)
 						target_pos = hit[0] if hit else start_pos + dir_vec.scale(50.0)
-						
+
 						# Auto-spawner forces a spawn location (original map spawn points)
 						_forced_pos = getattr(player, '_forced_spawn_pos', None)
 						if _forced_pos is not None:
-							target_pos = Math.Vector3(_forced_pos[0], _forced_pos[1], _forced_pos[2])
+							target_pos = Math.Vector3(
+								_forced_pos[0], _forced_pos[1], _forced_pos[2])
 						else:
 							# Manual O/P/L spawns need local safety search. Server and
 							# auto-formation positions are already grounded and reserved;
 							# changing those from each client's different local occupancy
 							# made identical LAN coordinates spawn in different places.
 							target_pos = _find_safe_spawn(target_pos)
-						
+
 						td = None
 						bot_name = 'Bot ' + str(_spawn_count[0])
 						bot_team = 1 if event.key == Keys.KEY_L else 2
@@ -18063,7 +18889,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								import traceback
 								LOG_DEBUG('Random spawn error:', str(e), traceback.format_exc())
 								td = loaded_models.get('td')
-						
+
 						if not td: return True
 
 						# OOM guard: each bot is a full tank (models + textures +
@@ -18084,7 +18910,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_offh_load_hit_testers(td)
 						except Exception as e:
 							LOG_DEBUG("Error loading hitTesters for bot:", str(e))
-						
+
 						e_id = 1000 + _spawn_count[0]
 						_spawn_count[0] += 1
 						_network_server_id = getattr(player, '_offhangar_network_forced_id', None)
@@ -18171,6 +18997,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								except Exception:
 									pass
 							e_mock = _MockVeh()
+							e_mock._offh_native_model_root_ready = False
 							e_mock.id = e_id
 							e_mock.position = target_pos
 							# Face the player
@@ -18225,7 +19052,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								ch.visibleAttachments = bool(e_mock._spot_visible)
 							except Exception:
 								pass
-							
+
 							def _install_live_collision_obstacle(_mock=e_mock, _descriptor=td):
 								"""Install the legacy static proxy only for Python-owned bodies."""
 								if getattr(_mock, '_collision_obstacle', None) is not None:
@@ -18242,35 +19069,55 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									return False
 							e_mock._offh_install_collision_obstacle = (
 								_install_live_collision_obstacle)
+							# Establish the movement contract before touching the entity/model
+							# root. A failed retail motor handoff must remain a visible native
+							# failure, never an undeclared Python owner.
+							_native_body_required = _offh_native_movement_required(
+								player, e_mock, _offh_network_bot_role(player))
 
 							_eid = BigWorld.createEntity('OfflineEntity', _offh_bspace(), 0, e_mock.position, (0, 0, e_mock.yaw), dict())
 							e_mock.bw_entity = None
-							def _assign_model_when_ready(eid, model_to_add, retries=10, _e_mock=e_mock):
+							_model_root_handoff = {}
+							def _assign_model_when_ready(eid, model_to_add, retries=10,
+									_e_mock=e_mock, _root_handoff=_model_root_handoff):
 								if globals().get('g_offh_battle_gen', 0) != _bot_gen:
 									return
 								if not getattr(_e_mock, 'isAlive', True) or getattr(_e_mock, '_wreck_done', False):
 									return  # bot died meanwhile: never re-add the intact model over the wreck
 								ent = BigWorld.entity(eid)
 								if ent:
+									_e_mock.bw_entity = ent
 									# Entity assignment installs its own default root motor. Retail
 									# VehicleAppearance removes it before adding Servo(vehicle.matrix);
 									# keeping both makes the chassis visibly twist between two owners.
-									_offh_assign_entity_model_root(ent, model_to_add)
+									if not _offh_assign_entity_model_root(
+											ent, model_to_add, _root_handoff):
+										_e_mock._offh_native_model_root_ready = False
+										if retries > 0:
+											_offh_battle_callback(0.1, lambda: _assign_model_when_ready(
+												eid, model_to_add, retries - 1, _e_mock, _root_handoff))
+										elif not getattr(
+												_e_mock, '_offh_native_model_root_error_logged', False):
+											_e_mock._offh_native_model_root_error_logged = True
+											LOG_ERROR('NATIVE_BOT_PHYSICS model root handoff failed id=%s' % (
+												getattr(_e_mock, 'id', '?'),))
+										return
+									_e_mock._offh_native_model_root_ready = True
 									try:
 										_model_visible = bool(getattr(_e_mock, '_spot_visible', True))
 										model_to_add.visible = _model_visible
 										model_to_add.visibleAttachments = _model_visible
 									except Exception:
 										pass
-									_e_mock.bw_entity = ent
 									_native_body_prepared = False
-									try:
-										from gui.mods.offhangar.native_bot_physics import prepare as _prepare_native_bot_physics
-										_native_body_prepared = _prepare_native_bot_physics(
-											player, _e_mock, td, _offh_bspace(), BigWorld.time())
-									except Exception as _native_prepare_error:
-										LOG_DEBUG('Native bot physics prepare failed:', str(_native_prepare_error))
-									if not _native_body_prepared:
+									if _native_body_required:
+										try:
+											from gui.mods.offhangar.native_bot_physics import prepare as _prepare_native_bot_physics
+											_native_body_prepared = _prepare_native_bot_physics(
+												player, _e_mock, td, _offh_bspace(), BigWorld.time())
+										except Exception as _native_prepare_error:
+											LOG_DEBUG('Native bot physics prepare failed:', str(_native_prepare_error))
+									if not _native_body_prepared and not _native_body_required:
 										try:
 											ent.filter = BigWorld.AvatarFilter()
 											_e_mock.filter = ent.filter
@@ -18280,12 +19127,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										getattr(_e_mock, 'pitch', 0.0) or 0.0,
 										getattr(_e_mock, 'roll', 0.0) or 0.0,
 										space_id=_offh_bspace(), timestamp=BigWorld.time(),
-										sync_filter=not _native_body_prepared,
+										sync_filter=(not _native_body_prepared and
+											not _native_body_required),
 										attach_servo=True, prime_model=True)
-									if not _native_body_prepared:
+									if not _native_body_prepared and not _native_body_required:
 										_install_live_collision_obstacle()
 									else:
-										# PyModelObstacle is a second static collision shape.  Keeping
+										# PyModelObstacle is a second static collision shape. Keeping
 										# it beside WGVehiclePhysics2 makes the native body collide with
 										# its own legacy proxy.
 										_e_mock._collision_obstacle = None
@@ -18406,6 +19254,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										_bm._tco = 1.5
 								except Exception as _bfe:
 									LOG_DEBUG('Bot track fashion failed:', str(_bfe))
+							e_mock._offh_attach_bot_fashion = _attach_bot_fashion
 							_offh_battle_callback(1.5, _attach_bot_fashion)
 							class FakeEnemyAppearance(object):
 								def __init__(self, tmat=None):
@@ -18444,7 +19293,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							try:
 								_assign_model_when_ready(_eid, ch)
 							except Exception:
-								_add_model(ch)
+								# Once entity.model was assigned, adding the same chassis globally
+								# creates a second world owner. Leave the native failure visible.
+								if not _model_root_handoff.get('assigned', False):
+									_add_model(ch)
 							# Safety net for the invisible bot. _assign_model_when_ready can leave the
 							# chassis out of the world entirely - its liveness guard returns without
 							# scheduling a retry, and the entity path can silently not take. Everything
@@ -18466,6 +19318,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										return
 									if not getattr(_vm, 'isAlive', False) or getattr(_vm, '_wreck_done', False):
 										return
+									if _model_root_handoff.get('assigned', False):
+										return
 									if getattr(_vch, 'inWorld', False):
 										return
 									LOG_DEBUG('BOT INVISIBLE: id=%s never reached the world - re-adding' % _vid)
@@ -18478,7 +19332,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								pass
 							import weakref
 							e_mock.proxy = weakref.proxy(e_mock)
-							
+
 							from gui import WindowsManager
 							player.arena.vehicles[e_id] = e_mock.publicInfo
 							try:
@@ -18500,7 +19354,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_spawn_build_started - _spawn_requested_at,
 									time.time() - _spawn_build_started)
 							LOG_DEBUG('Enemy Clone Spawned at:', target_pos)
-						
+
 						_prefetched_models = getattr(
 							player, '_offh_forced_model_refs', None)
 						if isinstance(_prefetched_models, dict):
@@ -18521,7 +19375,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					player._offhangar_network_spawn_remote = _mock_handleKeyEvent
 			except Exception:
 				pass
-			
+
 			# --- 15v15 AUTO-SPAWN like the original game ---
 			# In 0.8.2 ctf the teams spawn AT the teamBasePositions (the arena_defs
 			# only carry teamSpawnPoints for the domination mode). The line-up is a
@@ -18531,6 +19385,25 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				# Returns (x, z, yaw) for a line-up slot of the given team.
 				# Slot 0 = front row centre (the player's own slot in his team).
 				import math
+				try:
+					from gui.mods.offhangar.prebaked_navigation import load_graph, spawn_pose
+					_spawn_graph = globals().get('g_offh_baked_navigation_graph')
+					if _spawn_graph is None:
+						_spawn_graph = load_graph(globals().get('g_offh_battle_mapname', ''))
+						globals()['g_offh_baked_navigation_graph'] = _spawn_graph
+					_baked_pose = spawn_pose(_spawn_graph, t_id, slot)
+					if _baked_pose is not None:
+						return (_baked_pose[0], _baked_pose[2], _baked_pose[3])
+					from gui.mods.offhangar.prebaked_navigation import STOCK_MAPS
+					if globals().get('g_offh_battle_mapname', '') in STOCK_MAPS:
+						raise ValueError('stock map has no validated spawn slot')
+				except Exception as _spawn_graph_error:
+					try:
+						from gui.mods.offhangar.prebaked_navigation import STOCK_MAPS
+						if globals().get('g_offh_battle_mapname', '') in STOCK_MAPS:
+							raise _spawn_graph_error
+					except ImportError:
+						pass
 				_sp = globals().get('g_offline_spawns', {}) or {}
 				_bs = globals().get('g_offline_bases', {}) or {}
 				pts = list(_sp.get(t_id, []) or [])
@@ -18579,8 +19452,31 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					if sz < _fb[1] + 8.0: sz = _fb[1] + 8.0
 					elif sz > _fb[3] - 8.0: sz = _fb[3] - 8.0
 				return (sx, sz, yaw)
+			def _formation_pose(t_id, slot):
+				try:
+					from gui.mods.offhangar.prebaked_navigation import load_graph, spawn_pose
+					_spawn_graph = globals().get('g_offh_baked_navigation_graph')
+					if _spawn_graph is None:
+						_spawn_graph = load_graph(globals().get('g_offh_battle_mapname', ''))
+						globals()['g_offh_baked_navigation_graph'] = _spawn_graph
+					_baked_pose = spawn_pose(_spawn_graph, t_id, slot)
+					if _baked_pose is not None:
+						return _baked_pose
+					from gui.mods.offhangar.prebaked_navigation import STOCK_MAPS
+					if globals().get('g_offh_battle_mapname', '') in STOCK_MAPS:
+						raise ValueError('stock map has no validated spawn slot')
+				except Exception as _spawn_graph_error:
+					try:
+						from gui.mods.offhangar.prebaked_navigation import STOCK_MAPS
+						if globals().get('g_offh_battle_mapname', '') in STOCK_MAPS:
+							raise _spawn_graph_error
+					except ImportError:
+						pass
+				_x, _z, _yaw = _formation_slot(t_id, slot)
+				return (_x, None, _z, _yaw)
 			# Shared via globals: _aih_tick uses it for the player's spawn correction
 			globals()['g_offline_formation_slot'] = _formation_slot
+			globals()['g_offline_formation_pose'] = _formation_pose
 			try:
 				from gui.mods.offhangar._constants import CONFIG_OPTIONS as _NET_FORMATION_CFG
 				if bool(_NET_FORMATION_CFG.get('network_mode', False)) and not getattr(player, '_offhangar_network_fallback_local', False):
@@ -18647,7 +19543,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							if _name not in _local_bot_names:
 								_local_bot_names.add(_name)
 								return _name
-					
+
 					class _FakeSpawnEvent(object):
 						def __init__(self, key):
 							self.key = key
@@ -18661,7 +19557,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							return False
 						def isAltDown(self):
 							return False
-					
+
 					def _anchors(t_id):
 						pts = list(_spawns.get(t_id, []) or [])
 						if not pts:
@@ -18669,7 +19565,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							for _b in (_bases.get(t_id, []) or []):
 								pts.append((_b.x, _b.z))
 						return pts
-					
+
 					def _face_yaw(t_id, x, z):
 						# Line the team up facing the enemy base (like the real line-up)
 						try:
@@ -18854,11 +19750,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							import traceback
 							LOG_DEBUG('AUTO-SPAWN vehicle pick failed:', traceback.format_exc())
 						for _i in range(_count):
-							_sx, _sz, _yw = _formation_slot(_t, _bot_slots[_i])
+							_sx, _sy, _sz, _yw = _formation_pose(_t, _bot_slots[_i])
 							_vn = _veh_names[_i] if _i < len(_veh_names) else None
 							_identity = _bot_identity_by_slot.get((_t, _bot_slots[_i]), {})
 							_bid = _identity.get('id')
-							_jobs.append((_t, _bot_slots[_i], _bid, _sx, _sz, _yw, _vn, _bot_name(_t, _bot_slots[_i])))
+							_jobs.append((_t, _bot_slots[_i], _bid, _sx, _sy, _sz, _yw, _vn, _bot_name(_t, _bot_slots[_i])))
 
 					# The elected client chooses the exact lineup once. Every other client
 					# waits for and recreates that manifest, so bot id, tank and slot match.
@@ -18869,7 +19765,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_manifest_jobs = []
 							from items import vehicles as _manifest_vehicles
 							_manifest_descriptors = {}
-							for _jt, _jslot, _jbid, _jx, _jz, _jyw, _jvn, _jname in _jobs:
+							for _jt, _jslot, _jbid, _jx, _jy, _jz, _jyw, _jvn, _jname in _jobs:
 								if _jbid is None or not _jvn:
 									continue
 								_jtd = _manifest_descriptors.get(_jvn)
@@ -18877,20 +19773,45 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_jtd = _manifest_vehicles.VehicleDescr(typeName=_jvn)
 									_manifest_descriptors[_jvn] = _jtd
 								_manifest_jobs.append((_jbid, _jt, _jslot, _jvn, _jname,
-									_jtd.maxHealth, _jx, _jz, _jyw))
+									_jtd.maxHealth, _jx, _jy, _jz, _jyw))
 							_pl._offh_vehicle_descriptors = _manifest_descriptors
-							publish_bot_manifest(_pl, _manifest_jobs)
+							if not publish_bot_manifest(_pl, _manifest_jobs):
+								_pending_manifest = getattr(
+									_pl, '_offhangar_network_bot_manifest_pending', None)
+								if (isinstance(_pending_manifest, dict) and
+										_pending_manifest.get('state') == 'rejected'):
+									LOG_ERROR('LAN canonical bot manifest rejected; '
+										'spawn remains fail-closed')
+									return
+								_offh_battle_callback(0.25, _auto_spawn_teams)
+								return
+							_manifest = getattr(
+								_pl, '_offhangar_network_bot_manifest', None) or []
+							_jobs = []
+							from gui.mods.offhangar.network_battle import (
+								_world_from_server, _world_yaw_from_server)
+							for _entry in _manifest:
+								_jpoint = _world_from_server(_pl, _entry)
+								_jobs.append((int(_entry.get('team', 0) or 0),
+									int(_entry.get('slot', 0) or 0), int(_entry.get('id')),
+									float(_jpoint.x), float(_jpoint.y), float(_jpoint.z),
+									_world_yaw_from_server(_pl, _entry),
+									str(_entry.get('vehicle')), str(_entry.get('name'))))
 						elif _is_network:
 							_manifest = getattr(_pl, '_offhangar_network_bot_manifest', None) or []
 							if not _manifest:
 								_offh_battle_callback(0.25, _auto_spawn_teams)
 								return
 							_jobs = []
+							from gui.mods.offhangar.network_battle import (_world_from_server,
+								_world_yaw_from_server)
 							for _entry in _manifest:
 								_jt = int(_entry.get('team', 0) or 0)
 								_jslot = int(_entry.get('slot', 0) or 0)
-								_jx, _jz, _jyw = _formation_slot(_jt, _jslot)
-								_jobs.append((_jt, _jslot, int(_entry.get('id')), _jx, _jz, _jyw,
+								_jpoint = _world_from_server(_pl, _entry)
+								_jyw = _world_yaw_from_server(_pl, _entry)
+								_jobs.append((_jt, _jslot, int(_entry.get('id')),
+									float(_jpoint.x), float(_jpoint.y), float(_jpoint.z), _jyw,
 									str(_entry.get('vehicle')), str(_entry.get('name'))))
 					except Exception:
 						import traceback
@@ -18914,7 +19835,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						_lineup_started = time.time()
 						_lineup_descriptors = getattr(_pl, '_offh_vehicle_descriptors', None) or {}
 						_hit_tester_count = 0
-						_lineup_vehicle_names = [_lineup_job[6] for _lineup_job in _jobs]
+						_lineup_vehicle_names = [_lineup_job[7] for _lineup_job in _jobs]
 						for _lineup_human in (getattr(_pl, '_offhangar_network_roster', None) or []):
 							_lineup_vehicle_names.append(_lineup_human.get('vehicle'))
 						for _lineup_vehicle in _lineup_vehicle_names:
@@ -18950,6 +19871,53 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						_pl._offh_auto_spawn_completed = 0
 					except Exception:
 						pass
+
+					# The authority's collision space is camera-streamed. On large maps a
+					# remote spawn chunk can therefore be absent even though the loading
+					# screen reports complete. Temporarily widen the engine load radius and
+					# require a live narrow collision hit for every frozen canonical pose.
+					# Replicas never own native bot movement and must not change projection.
+					_spawn_stream_role = _offh_network_bot_role(_pl)
+					if _spawn_stream_role in ('local', 'authority'):
+						try:
+							_previous_bootstrap = getattr(
+								_pl, '_offh_spawn_streaming_bootstrap', None)
+							if _previous_bootstrap is not None:
+								_previous_bootstrap.stop()
+							from gui.mods.offhangar.spawn_streaming_bootstrap import (
+								SpawnStreamingBootstrap, coverage_target_from_bounds)
+							_spawn_coverage_target = None
+							_spawn_graph = globals().get('g_offh_baked_navigation_graph')
+							if isinstance(_spawn_graph, dict):
+								_spawn_coverage_target = coverage_target_from_bounds(
+									_spawn_graph.get('bounds'))
+							def _probe_canonical_spawn(_probe_job):
+								_probe_hit = BigWorld.wg_collideSegment(
+									_offh_bspace(),
+									Math.Vector3(float(_probe_job[3]),
+										float(_probe_job[4]) + 3.0, float(_probe_job[5])),
+									Math.Vector3(float(_probe_job[3]),
+										float(_probe_job[4]) - 3.0, float(_probe_job[5])), 128)
+								return None if _probe_hit is None else float(_probe_hit[0].y)
+							_pl._offh_spawn_streaming_bootstrap = SpawnStreamingBootstrap(
+								BigWorld.projection(), _jobs,
+								(veh_pos[0], veh_pos[1], veh_pos[2]),
+								_probe_canonical_spawn, time.time(),
+								max(30.0, _auto_spawn_delay + 30.0),
+								coverage_target=_spawn_coverage_target)
+							_pl._offh_spawn_streaming_monitor_active = False
+							_pl._offh_spawn_streaming_wait_logged = 0.0
+						except Exception:
+							import traceback
+							LOG_ERROR('Native spawn streaming bootstrap failed: %s' %
+								traceback.format_exc())
+							return
+					elif _spawn_stream_role == 'replica':
+						_pl._offh_spawn_streaming_bootstrap = None
+					else:
+						LOG_ERROR('Native spawn streaming ownership unavailable: role=%s' %
+							str(_spawn_stream_role))
+						return
 
 					def _lineup_job_key(_job):
 						return (int(_job[0]), int(_job[1]), _job[2])
@@ -18994,7 +19962,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						for _fetch_job in _jobs:
 							_fetch_key = _lineup_job_key(_fetch_job)
 							try:
-								_fetch_td = _pl._offh_vehicle_descriptors[str(_fetch_job[6])]
+								_fetch_td = _pl._offh_vehicle_descriptors[str(_fetch_job[7])]
 								_offh_fetch_vehicle_models(
 									_fetch_td,
 									lambda _refs, _key=_fetch_key: _lineup_model_ready(
@@ -19041,24 +20009,96 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						LOG_DEBUG('LAN lineup dependency warm-up failed:', str(_warm_error))
 						_start_lineup_model_fetches()
 
+					def _poll_spawn_streaming_activation():
+						if globals().get('g_offh_battle_gen', 0) != _offh_my_gen[0]:
+							return
+						_stream_player = BigWorld.player()
+						_bootstrap = getattr(
+							_stream_player, '_offh_spawn_streaming_bootstrap', None)
+						if _bootstrap is None:
+							_stream_player._offh_spawn_streaming_monitor_active = False
+							return
+						_active_count = 0
+						try:
+							from gui.mods.offhangar import native_bot_physics as _STREAM_NBP
+							_stream_job_keys = set()
+							for _stream_job in _bootstrap.jobs:
+								_stream_job_id = _stream_job[2]
+								if _stream_job_id is not None:
+									_stream_job_id = int(_stream_job_id)
+								_stream_job_keys.add((int(_stream_job[0]),
+									int(_stream_job[1]), _stream_job_id))
+							for _stream_mock in list((globals().get(
+									'G_MOCK_VEHICLES', {}) or {}).values()):
+								try:
+									_stream_mock_team = getattr(
+										_stream_mock, '_bot_team', None)
+									_stream_mock_slot = getattr(
+										_stream_mock, '_network_bot_slot', None)
+									# G_MOCK_VEHICLES also contains the player proxy. Its
+									# permissive __getattr__ returns None for bot identity;
+									# it must not erase the count for every valid native bot.
+									if (_stream_mock_team is None or
+											_stream_mock_slot is None):
+										continue
+									_stream_mock_id = getattr(
+										_stream_mock, '_network_bot_id', None)
+									if _stream_mock_id is not None:
+										_stream_mock_id = int(_stream_mock_id)
+									_stream_mock_key = (int(_stream_mock_team),
+										int(_stream_mock_slot), _stream_mock_id)
+									if (_stream_mock_key in _stream_job_keys and
+											_STREAM_NBP.is_active(_stream_mock)):
+										_active_count += 1
+								except Exception:
+									continue
+						except Exception:
+							_active_count = 0
+						try:
+							_stream_phase = _bootstrap.poll(time.time(), _active_count)
+						except Exception:
+							_stream_phase = 'failed'
+						if _stream_phase == 'placement_ready':
+							_offh_battle_callback(0.10, _poll_spawn_streaming_activation)
+							return
+						_stream_player._offh_spawn_streaming_monitor_active = False
+						if _stream_phase == 'complete':
+							try:
+								from gui.mods.offhangar.logging import LOG_NOTE as _STREAM_READY_NOTE
+								_STREAM_READY_NOTE(
+									'Native spawn streaming retained: active=%d/%d' % (
+										_active_count, len(_bootstrap.jobs)))
+							except Exception:
+								pass
+						elif _stream_phase == 'failed':
+							LOG_ERROR('Native spawn streaming failed after placement: '
+								'reason=%s active=%d/%d' % (
+									str(getattr(_bootstrap, 'failure_reason', 'unknown')),
+									_active_count, len(_bootstrap.jobs)))
+
 					def _spawn_next(_rest):
 						if globals().get('g_offh_battle_gen', 0) != _offh_my_gen[0]:
 							return
 						if _battle_finished[0] or not _rest:
 							return
-						_t, _slot, _bid, _x, _z, _yw, _vn, _bn = _rest[0]
+						_spawn_bootstrap = getattr(
+							BigWorld.player(), '_offh_spawn_streaming_bootstrap', None)
+						if (_spawn_bootstrap is not None and
+								getattr(_spawn_bootstrap, 'failure_reason', None) is not None):
+							return
+						_t, _slot, _bid, _x, _y, _z, _yw, _vn, _bn = _rest[0]
 						try:
 							_p2 = BigWorld.player()
-							# Bot ground height. Probe the BATTLE space (_offh_bspace); if it misses
-							# (collision not streamed in yet / odd city-map footprint) fall back to the
-							# PLAYER's own ground height - never y=300, which rained bots from the sky.
+							# Bot ground height. Native owners require an exact live collision hit
+							# in the BATTLE space. A replica may seed presentation from the server's
+							# canonical pose because it never treats that height as local physics.
 							# Keep this slot clear of already-placed hulls: the grid spaces slots, but a
 							# roof-corrected drop can still land on top of a neighbour.
 							_taken = getattr(_p2, '_offh_spawn_taken', None)
 							if _taken is None:
 								_taken = []
 								_p2._offh_spawn_taken = _taken
-							for _nudge in range(4):
+							for _nudge in range(4 if _y is None else 0):
 								_clash = False
 								for _tx, _tz in _taken:
 									if (_x - _tx) ** 2 + (_z - _tz) ** 2 < 81.0:   # < 9 m apart
@@ -19074,20 +20114,41 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# Probe narrowly around that height to retain the collision surface without
 							# ever selecting a roof above it or a cellar below it.
 							_gy = None
+							if _y is not None:
+								if _offh_network_bot_role(_p2) == 'replica':
+									# A replica never owns this pose as physics; the server's
+									# canonical manifest height is only its presentation seed.
+									_gy = float(_y)
+								else:
+									try:
+										_gc = BigWorld.wg_collideSegment(
+											_offh_bspace(), Math.Vector3(_x, float(_y) + 3.0, _z),
+											Math.Vector3(_x, float(_y) - 3.0, _z), 128)
+										if (_gc is not None and
+												abs(float(_gc[0].y) - float(_y)) <= 0.35):
+											_gy = float(_gc[0].y)
+									except Exception:
+										_gy = None
+								if _gy is None:
+									LOG_DEBUG('AUTO-SPAWN: canonical support obstructed team=%d slot=%d' % (
+										int(_t), int(_slot)))
+									_deferred = (_rest[1:] + [_rest[0]]) if len(_rest) > 1 else _rest
+									_offh_battle_callback(0.25,
+										lambda _waiting=_deferred: _spawn_next(_waiting))
+									return
 							try:
 								from gui.mods.offhangar.prebaked_navigation import load_graph, nearest_ground_point
 								_spawn_graph = globals().get('g_offh_baked_navigation_graph')
 								if _spawn_graph is None:
 									_spawn_graph = load_graph(globals().get('g_offh_battle_mapname', ''))
-								_ground_hint = nearest_ground_point(_spawn_graph, _x, _z, 3)
+								_ground_hint = None if _y is not None else nearest_ground_point(_spawn_graph, _x, _z, 3)
 								if _ground_hint is not None:
 									_baked_y = float(_ground_hint[1])
 									_gc = BigWorld.wg_collideSegment(
 										_offh_bspace(), Math.Vector3(_x, _baked_y + 3.0, _z),
 										Math.Vector3(_x, _baked_y - 3.0, _z), 128)
-									# The graph already identifies the drivable terrain layer. If its
-									# narrow confirmation ray misses while collision streams in, retain
-									# that layer; a top-down walk can select a cellar below the spawn.
+									# The graph supplies only a placement-height hint. Native staging
+									# independently waits for a live static-collision hit before attach.
 									_gy = _gc[0].y if _gc is not None else _baked_y
 							except Exception:
 								pass
@@ -19149,12 +20210,41 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										'_offh_spawn_batch_started_at', _p2._offh_spawn_batch_submitted_at))) * 1000.0)))
 							except Exception:
 								pass
-					
+
 					def _begin_bot_placement(_prepared_jobs):
 						if (globals().get('g_offh_battle_gen', 0) != _offh_my_gen[0] or
 								_battle_finished[0]):
 							return
 						_prep_player = BigWorld.player()
+						_streaming_bootstrap = getattr(
+							_prep_player, '_offh_spawn_streaming_bootstrap', None)
+						if _streaming_bootstrap is not None:
+							try:
+								_streaming_phase = _streaming_bootstrap.poll(
+									time.time(), 0)
+							except Exception:
+								_streaming_phase = 'failed'
+							if _streaming_phase == 'waiting_support':
+								_now = time.time()
+								_last_stream_log = float(getattr(
+									_prep_player, '_offh_spawn_streaming_wait_logged', 0.0) or 0.0)
+								if _now - _last_stream_log >= 2.0:
+									_prep_player._offh_spawn_streaming_wait_logged = _now
+									try:
+										from gui.mods.offhangar.logging import LOG_NOTE as _STREAM_WAIT_NOTE
+										_STREAM_WAIT_NOTE(
+											'Native spawn streaming waiting for live support')
+									except Exception:
+										pass
+								_offh_battle_callback(0.10,
+									lambda _waiting_jobs=_prepared_jobs: _begin_bot_placement(
+										_waiting_jobs))
+								return
+							if _streaming_phase == 'failed':
+								LOG_ERROR('Native spawn streaming failed before placement: '
+									'reason=%s' % str(getattr(
+										_streaming_bootstrap, 'failure_reason', 'unknown')))
+								return
 						if not bool(getattr(_prep_player, '_offh_lineup_prefetch_ready', False)):
 							_now = time.time()
 							_last_wait_log = float(getattr(
@@ -19181,6 +20271,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						try: BigWorld.player()._offh_spawn_batch_started_at = time.time()
 						except Exception: pass
 						_spawn_next(_prepared_jobs)
+						if (_streaming_bootstrap is not None and not bool(getattr(
+								_prep_player, '_offh_spawn_streaming_monitor_active', False))):
+							_prep_player._offh_spawn_streaming_monitor_active = True
+							_offh_battle_callback(0.10, _poll_spawn_streaming_activation)
 
 					# Descriptor and collision-resource preparation runs immediately behind
 					# the normal loading page. Native entities still wait for the original
@@ -19195,7 +20289,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				except Exception:
 					import traceback
 					LOG_DEBUG('AUTO-SPAWN failed:', traceback.format_exc())
-			
+
 			try:
 				from _constants import CONFIG_OPTIONS as _CFG_AS
 				if int(_CFG_AS.get('bots_per_team', 15)) > 0:
@@ -19210,7 +20304,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			# -------------------------------------------
 
 			player.shoot = _mock_shoot
-			
+
 			# --- Central kill handling: keep players-panel/minimap icons in sync ---
 			# Every kill path fires arena.onVehicleKilled(...). The bare event does not
 			# flip arena.vehicles[id]['isAlive'], so panel icons stayed 'alive'. Wrap it
@@ -19238,6 +20332,22 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							import BigWorld
 							_pl = BigWorld.player()
 							_mv = globals().get('G_MOCK_VEHICLES', {}).get(victimID)
+							# One victim has one death transaction. Ammo-rack, hull-damage and
+							# delayed LAN snapshots can all report the same terminal transition;
+							# only the first report may credit a frag, notify retail UI or replace
+							# the native-owned chassis.
+							_settled = globals().setdefault('_offh_settled_deaths', set())
+							_first_death = victimID not in _settled
+							if _first_death:
+								_settled.add(victimID)
+							if _mv is not None:
+								try:
+									_mv._network_death_pending = False
+									_mv._network_death_notified = True
+								except Exception:
+									pass
+							if not _first_death:
+								return
 							try:
 								if _pl is not None and victimID in getattr(_pl.arena, 'vehicles', {}):
 									_pl.arena.vehicles[victimID]['isAlive'] = False
@@ -19246,15 +20356,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							try:
 								if _mv is not None:
 									_offh_set_alive(_mv, False)
-									# Dead bots no longer enter the AI loop, so release a native
-									# body's last drive command before the wreck owns the pose.
-									# This central event covers shells, fire, ramming, drowning and
-									# LAN deaths without adding per-weapon teardown paths.
-									try:
-										from gui.mods.offhangar.native_bot_physics import stop_mock as _stop_dead_native_bot
-										_stop_dead_native_bot(_mv, False)
-									except Exception:
-										pass
 									if (getattr(_mv, 'health', None) or 0) > 0:
 										# Drowning is not damage, so remember what it had before zeroing the
 										# internal value that everything else treats as 'dead'.
@@ -19292,11 +20393,43 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									self._orig(victimID, killerID, reason)
 							except Exception:
 								pass
-							# One canonical score path covers shells, fire, ramming, drowning and
-							# LAN deaths. Repeat on the next callback so older per-weapon code that
-							# updates individual frags after this event cannot overwrite the HUD.
-							_offh_refresh_team_score(_pl)
+							# Individual frags are derived exactly once from this same death
+							# transaction. Assign the canonical count after the stock callback so
+							# legacy handlers cannot increment it a second time.
 							try:
+								_vehicles = getattr(getattr(_pl, 'arena', None), 'vehicles', {}) or {}
+								_victim_info = _vehicles.get(victimID) or {}
+								_killer_info = _vehicles.get(killerID) or {}
+								_valid_killer = (
+									killerID is not None and killerID != victimID and
+									killerID in _vehicles)
+								if _valid_killer:
+									_killer_team = _killer_info.get('team')
+									_victim_team = _victim_info.get('team')
+									_delta = (-1 if _killer_team in (1, 2) and
+									          _killer_team == _victim_team else 1)
+									_counts = globals().setdefault('_offh_canonical_frags', {})
+									_counts[killerID] = int(_counts.get(killerID, 0)) + _delta
+									_killer_info['frags'] = _counts[killerID]
+									_statistics = getattr(_pl.arena, 'statistics', None)
+									if isinstance(_statistics, dict):
+										_stat = _statistics.setdefault(killerID, {})
+										_stat['frags'] = _counts[killerID]
+									if _delta < 0:
+										_killer_info['isTeamKiller'] = True
+										if killerID == getattr(_pl, 'playerVehicleID', -1):
+											_pl.isTeamKiller = True
+										try: _pl.arena.onTeamKiller(killerID)
+										except Exception: pass
+									try: _pl.arena.onVehicleStatisticsUpdate(killerID)
+									except Exception: pass
+							except Exception as _frag_error:
+								LOG_DEBUG('Canonical frag update error:', str(_frag_error))
+							# One canonical score path covers shells, fire, ramming, drowning and
+							# LAN deaths. Repeat after the current event stack so the Flash panel
+							# observes the final alive flags even when its stock handler updates late.
+							try:
+								_offh_refresh_team_score(_pl)
 								_offh_battle_callback(0.0, lambda _score_player=_pl:
 									_offh_refresh_team_score(_score_player))
 							except Exception:
@@ -19321,8 +20454,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										_av = getattr(_pl.arena, 'vehicles', {}) or {}
 										_vinfo = _av.get(victimID) or {}
 										_kinfo = _av.get(killerID) or {}
-										_vname = _vinfo.get('name', 'Unknown')
-										_kname = _kinfo.get('name', 'Unknown')
+										_vname = _offh_vehicle_message_label(_pl, victimID)
+										_kname = _offh_vehicle_message_label(_pl, killerID)
 										_pteam_k = getattr(_pl, '_offhangar_team', 1)
 										_vteam = _vinfo.get('team', _pteam_k)
 										_kteam = _kinfo.get('team', None)
@@ -19367,25 +20500,37 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										pass
 							except Exception:
 								pass
+							# The actual `_stop_dead_native_bot(_mv, False)` ownership proof is
+							# performed by _fire_wreck_swap before it allocates any wreck model.
 							# Fire deaths (reason 2) have no wreck-swap path of their own:
 							# swap burnt-out bots to their destroyed models here
 							try:
 								# A drowned tank sank where it stood - it did not blow up. Swapping in the
 								# crash models would reset the turret to its default bearing and level the
 								# hull, throwing away exactly the last state that should be preserved.
-								if getattr(_mv, '_drowned', False):
-									_mv._wreck_done = True   # and never let a later path swap it either
-								if (reason == 2 or reason == 3 or killerID == -1 or getattr(_mv, '_network_remote', False) or getattr(_mv, '_network_shared_bot', False)) and _mv is not None and _pl is not None and victimID != getattr(_pl, 'playerVehicleID', -1) and not getattr(_mv, '_wreck_done', False) and getattr(_mv, '_chassis_model', None) is not None:
-									_mv._wreck_done = True
+								if (_mv is not None and _pl is not None and
+										victimID != getattr(_pl, 'playerVehicleID', -1) and
+										not getattr(_mv, '_wreck_done', False) and
+										getattr(_mv, '_chassis_model', None) is not None):
+									if getattr(_mv, '_drowned', False):
+										def _drowned_native_release(_mv=_mv):
+											if not _offh_wreck_release_or_retry(
+													_mv, _drowned_native_release):
+												return
+											# Keep the last live chassis and its exact submerged pose, but
+											# only after the native physics/filter/Servo graph is detached.
+											_mv._wreck_done = True
+										_drowned_native_release()
+										return
 									_dtd = getattr(_mv, 'typeDescriptor', None)
 									if _dtd is not None:
 										if getattr(_mv, '_network_remote', False) or getattr(_mv, '_network_shared_bot', False):
 											_play_death_effect(_dtd, getattr(_mv, 'position', None), False,
 												getattr(_mv, '_ammo_rack_death', False))
-										_d_ch = BigWorld.Model(_dtd.chassis['models']['destroyed'])
-										_d_hu = BigWorld.Model(_dtd.hull['models']['destroyed'])
-										_d_tu = BigWorld.Model(_dtd.turret['models']['destroyed'])
-										_d_gu = BigWorld.Model(_dtd.gun['models']['destroyed'])
+										_d_ch_path = _dtd.chassis['models']['destroyed']
+										_d_hu_path = _dtd.hull['models']['destroyed']
+										_d_tu_path = _dtd.turret['models']['destroyed']
+										_d_gu_path = _dtd.gun['models']['destroyed']
 										_old_ch = _mv._chassis_model
 										_old_pos = _old_ch.position
 										_old_yaw = _old_ch.yaw
@@ -19394,8 +20539,24 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										except Exception: _old_pitch = 0.0
 										try: _old_roll = _old_ch.roll
 										except Exception: _old_roll = 0.0
-										def _fire_wreck_swap(_d_ch=_d_ch, _d_hu=_d_hu, _d_tu=_d_tu, _d_gu=_d_gu, _old_ch=_old_ch, _old_pos=_old_pos, _old_yaw=_old_yaw, _mv=_mv):
+										_fire_wreck_models = [None]
+										def _fire_wreck_swap(_d_ch_path=_d_ch_path, _d_hu_path=_d_hu_path, _d_tu_path=_d_tu_path, _d_gu_path=_d_gu_path, _old_ch=_old_ch, _old_pos=_old_pos, _old_yaw=_old_yaw, _mv=_mv, _models=_fire_wreck_models):
 											import BigWorld, Math
+											if _models[0] is None:
+												if not _offh_wreck_release_or_retry(
+														_mv, _fire_wreck_swap):
+													return
+												if getattr(_mv, '_wreck_done', False):
+													return
+												_mv._wreck_done = True
+												_models[0] = (
+													BigWorld.Model(_d_ch_path),
+													BigWorld.Model(_d_hu_path),
+													BigWorld.Model(_d_tu_path),
+													BigWorld.Model(_d_gu_path))
+												_offh_battle_callback(0.1, _fire_wreck_swap)
+												return
+											_d_ch, _d_hu, _d_tu, _d_gu = _models[0]
 											if not getattr(_d_ch, 'loaded', True) or not getattr(_d_hu, 'loaded', True) or not getattr(_d_tu, 'loaded', True) or not getattr(_d_gu, 'loaded', True):
 												_offh_battle_callback(0.1, _fire_wreck_swap)
 												return
@@ -19467,7 +20628,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 												_mv._chassis_model = _d_ch
 											except Exception:
 												pass
-										_offh_battle_callback(0.1, _fire_wreck_swap)
+										_fire_wreck_swap()
 							except Exception:
 								pass
 					player.arena.onVehicleKilled = _KillEventWrapper(getattr(player.arena, 'onVehicleKilled', None))
@@ -19477,7 +20638,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			except Exception:
 				import traceback
 				LOG_DEBUG('OfflineBattle: kill wrapper failed:', traceback.format_exc())
-			
+
 			from Account import Account
 			# shoot is a per-battle closure and is already installed on the player
 			# instance above. Never put it on the persistent Account class: doing so
@@ -19490,14 +20651,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			if hasattr(player, 'arena'):
 				if player.arena.vehicles:
 					player.playerVehicleID = player.arena.vehicles.keys()[0]
-			
+
 			Waiting.close()
-			
+
 			# ---- ZVUK: okamžitě zastavit garážové audio, spustit loading hudbu ----
 			try:
 				import MusicController as _MC
-				
-				
+
+
 				_mc = _MC.g_musicController
 				try:
 					import SoundGroups as _SG
@@ -19505,12 +20666,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						# Preserve the user's sliders exactly as retail Avatar startup does.
 						_SG.g_instance.applyPreferences()
 				except Exception: pass
-				
+
 				# Stop the hangar events through the controller, which also clears its
 				# event ids and pending result callback. Directly stopping the private
 				# FMOD handles first duplicated work and left stale controller state.
 				_mc.stop()
-				
+
 				# The stock resolver rejects the synthetic Account because it is not a
 				# PlayerAvatar. Keep the stock event ids and replace only that type gate.
 				def _mock_mc_getArenaSoundEvent(self, eventId):
@@ -19550,7 +20711,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 
 				import types
 				_mc._MusicController__getArenaSoundEvent = types.MethodType(_mock_mc_getArenaSoundEvent, _mc)
-				
+
 				# Match Avatar startup: loading music first, then subscribe to the arena.
 				globals()['g_offh_combat_music_done'] = False
 				# New battle: drop the cached sound objects, the arena (and its tracks) changed.
@@ -19568,15 +20729,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			except Exception as _se:
 				LOG_DEBUG('OfflineBattle.sounds.battle_start error', _se)
 			# ---- konec zvuk ----
-			
+
 			WindowsManager.g_windowsManager.startBattle()
 			WindowsManager.g_windowsManager.showBattleLoading()
-			
+
 			if hasattr(player, 'arena'):
 				if hasattr(player.arena, 'onVehicleAdded'):
 					for vID in player.arena.vehicles.keys():
 						player.arena.onVehicleAdded(vID)
-				
+
 				def _finish_battle_load():
 					try:
 						try:
@@ -19588,22 +20749,22 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# MusicController.__onArenaStateChanged when period becomes BATTLE;
 							# starting it during model/UI completion cut the countdown intro early.
 						except Exception as e: pass
-						
+
 						Waiting.close()
 						WindowsManager.g_windowsManager.showBattle()
 						BigWorld.worldDrawEnabled(True)
-						
+
 						import AvatarInputHandler.cameras
 						AvatarInputHandler.cameras.SniperCamera._USE_SWINGING = False
 						BigWorld.wg_isSniperModeSwingingEnabled = lambda *a, **kw: False
-						
+
 						if not hasattr(BigWorld, '_orig_serverTime'):
 							BigWorld._orig_serverTime = BigWorld.serverTime
 							BigWorld._offline_start_time = __import__('time').time()
 							def _mock_serverTime():
 								return __import__('time').time() - BigWorld._offline_start_time
 							BigWorld.serverTime = _mock_serverTime
-						
+
 						def _do():
 							try:
 								from gui import WindowsManager
@@ -19641,7 +20802,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_mock_getSettings._offh_wrapped = True
 								_mock_getSettings._offh_orig = _orig_getSettings
 								AccountSettings.getSettings = staticmethod(_mock_getSettings)
-								
+
 								if hasattr(player.arena, 'onPeriodChange'):
 									_battle_duration = 900
 
@@ -19676,7 +20837,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										player.arena.onVehicleStatisticsUpdate(vID)
 								if hasattr(WindowsManager.g_windowsManager.battleWindow, '_Battle__populateData'):
 									WindowsManager.g_windowsManager.battleWindow._Battle__populateData()
-									
+
 								if not getattr(player, '_crosshair_init_done', False):
 									player._crosshair_init_done = True
 									# Remember the hangar FOV before any sniper zoom touches it, so the sweep
@@ -19695,19 +20856,21 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 												hs['max'] = getattr(player.vehicleTypeDescriptor, 'maxHealth', 400)
 										except Exception as e:
 											LOG_DEBUG('OfflineBattle aims init error:', str(e))
-											
+
 										# Mock the startup to avoid crashing on missing Vehicle entity
 										g_offline_aih._AvatarInputHandler__isStarted = True
 										g_offline_aih._AvatarInputHandler__isGUIVisible = True
 										g_offline_aih._AvatarInputHandler__isArenaStarted = True
 										for control in g_offline_aih._AvatarInputHandler__ctrls.itervalues():
-											try: control.create()
+											try:
+												control.create()
+												_offh_center_arcade_aim(control)
 											except Exception as e: LOG_DEBUG('Control create error:', e)
-											
+
 											# Pre-warm the gunMarker state so dumpState() doesn't throw KeyError: 'startTime'
 											try: control.setReloading(0.0, 0.0)
 											except Exception as e: LOG_DEBUG('CRITICAL ERROR IN K KEY:', e); import traceback; LOG_DEBUG(traceback.format_exc())
-											
+
 										try:
 											g_offline_aih._AvatarInputHandler__isSPG = 'SPG' in td.type.tags
 										except Exception:
@@ -19736,7 +20899,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							return
 
 						_offh_battle_callback(0.1, _do)
-						
+
 					except Exception:
 						LOG_CURRENT_EXCEPTION()
 				from _constants import CONFIG_OPTIONS
@@ -20029,12 +21192,12 @@ try:
 		orig_updateFightButton = bdi.BattleDispatcherInterface.updateFightButton
 		def _new_updateFightButton(self):
 			orig_updateFightButton(self)
-			
+
 			fightTypes = getattr(self, '_offhangar_fightTypes_temp', None)
 			if fightTypes is None:
 				# In case we can't capture it easily, we just call self.call again!
 				pass
-		
+
 		# Better approach: monkey-patch self.call in BattleDispatcherInterface
 		orig_call = bdi.BattleDispatcherInterface.call
 		def _new_call(self, methodName, args=None):
@@ -20054,12 +21217,12 @@ try:
 			p = BigWorld.player()
 			from gui.mods.offhangar.logging import LOG_DEBUG
 			LOG_DEBUG("FIGHT BUTTON CLICKED", "mapId:", mapId, "type:", type(mapId), "queueType:", queueType, "type:", type(queueType))
-			
+
 			if queueType == 'tutorial':
 				if hasattr(p, 'enqueueTutorial'):
 					p.enqueueTutorial()
 				return
-			
+
 			if queueType == 'demonstrator':
 				if mapId is not None:
 					setattr(p, '_offhangar_selected_mapId', mapId)
@@ -20068,11 +21231,11 @@ try:
 					except: pass
 				start_offline_random_from_hangar(p, 0)
 				return
-			
+
 			# If it's a regular random battle, ensure we clear any demonstrator map override!
 			if hasattr(p, '_offhangar_selected_mapId'):
 				delattr(p, '_offhangar_selected_mapId')
-				
+
 			return orig_onFightButtonClick(self, callbackId, mapId, queueType, confirm)
 		bdi.BattleDispatcherInterface.onFightButtonClick = _new_onFightButtonClick
 except Exception:

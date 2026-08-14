@@ -39,6 +39,7 @@ CLOSE_THREAT_SCORE_BONUS = 100.0
 CLOSE_THREAT_FOCUS_LIMIT = 4
 ROUTE_REBALANCE_SECONDS = 4.0
 ROUTE_LEASE_SECONDS = 6.0
+MAX_BASE_DEFENDERS = 3
 ARTILLERY_ENGAGEMENT_RANGE = 1200.0
 ARTILLERY_BLOCKED_RELOCATE_SECONDS = 12.0
 ARTILLERY_IDLE_RELOCATE_SECONDS = 65.0
@@ -90,6 +91,7 @@ class BotPlanner(object):
         self._cover_reservations = set()
         self._target_assignments = {}
         self._artillery_states = {}
+        self._base_defense = {1: {}, 2: {}}
 
     def reset(self):
         self.revision = 0
@@ -105,6 +107,7 @@ class BotPlanner(object):
         self._cover_reservations = set()
         self._target_assignments = {}
         self._artillery_states = {}
+        self._base_defense = {1: {}, 2: {}}
 
     def report_contacts(self, contacts, known_targets, now):
         """Store only authority-reported observations after identity checks.
@@ -242,22 +245,29 @@ class BotPlanner(object):
             accepted += 1
         return accepted
 
-    def build_orders(self, manifest, bot_states, players, now):
+    def build_orders(self, manifest, bot_states, players, now, defense=None):
         known_targets = self.known_targets(bot_states, players)
         contacts = self._prune_contacts(known_targets, now)
         bots = self._alive_bots(manifest, bot_states)
         self._prune_tactical_state(bots, known_targets, now)
+        defenders = self._update_base_defense(bots, contacts, defense, now)
         self._cover_reservations = set()
         orders = []
         for team in (1, 2):
             team_bots = sorted((bot for bot in bots if bot["team"] == team),
                                key=lambda value: value["id"])
-            self._rebalance_routes(team, team_bots, contacts[team], now)
+            protected_ids = set(defenders.get(team, {}))
+            self._rebalance_routes(
+                team, team_bots, contacts[team], now, protected_ids)
             assignments = self._assign_targets(team_bots, contacts[team], now)
+            assignments = self._prioritize_base_invaders(
+                team, team_bots, contacts[team], assignments,
+                defenders.get(team, {}), defense)
             for index, bot in enumerate(team_bots):
                 orders.append(self._order_for(
                     bot, index, len(team_bots), assignments.get(bot["id"]),
-                    contacts[team], now))
+                    contacts[team], now,
+                    defenders.get(team, {}).get(bot["id"])))
         orders.sort(key=lambda value: value["id"])
         payload = {"orders": orders}
         signature_orders = []
@@ -382,6 +392,12 @@ class BotPlanner(object):
         for bot_id in list(self._artillery_states):
             if bot_id not in live_bots:
                 del self._artillery_states[bot_id]
+        for incident in self._base_defense.values():
+            responders = incident.get("responders") if isinstance(incident, dict) else None
+            if isinstance(responders, dict):
+                for bot_id in list(responders):
+                    if bot_id not in live_bots:
+                        del responders[bot_id]
         for bot_id, report in list(self._affordances.items()):
             bot = live_bots.get(bot_id)
             target_key = report.get("target") if isinstance(report, dict) else None
@@ -429,6 +445,234 @@ class BotPlanner(object):
                 "route": raw.get("route") if isinstance(raw.get("route"), dict) else {},
                 "state": state,
             })
+        return result
+
+    @staticmethod
+    def _base_defense_eligible(bot):
+        state = bot.get("state") if isinstance(bot.get("state"), dict) else {}
+        if not bool(state.get("world_pose", True)):
+            return False
+        if bool(state.get("mobility_disabled", False)):
+            return False
+        critical = state.get("critical")
+        critical = critical if isinstance(critical, dict) else {}
+        destroyed = set(str(value) for value in
+                        (critical.get("destroyed") or ()))
+        return not destroyed.intersection((
+            "engineHealth", "leftTrackHealth", "rightTrackHealth"))
+
+    @staticmethod
+    def _defense_points(raw, team):
+        if not isinstance(raw, dict):
+            return []
+        values = raw.get(str(team), raw.get(team))
+        if not isinstance(values, (list, tuple)):
+            return []
+        result = []
+        for index, value in enumerate(values[:4]):
+            if not isinstance(value, dict):
+                continue
+            result.append({
+                "id": str(value.get("id") or "%d:%d" % (team, index)),
+                "point": _point(value),
+            })
+        return result
+
+    @staticmethod
+    def _defense_eta(bot, point, contacts, deadline):
+        state = bot["state"]
+        distance = math.hypot(
+            point["x"] - _number(state.get("x")),
+            point["z"] - _number(state.get("z")))
+        speed = _number(bot.get("profile", {}).get("speed"))
+        cruise = _clamp(speed * 0.65, 4.0, 22.0)
+        eta = 3.0 + distance * 1.30 / cruise
+        diversion = 0.0
+        for contact in contacts or ():
+            if (not contact.get("visible") or
+                    bot["id"] not in (contact.get(
+                        "shootable_by_bot_ids") or ())):
+                continue
+            contact_distance = math.hypot(
+                contact["position"]["x"] - _number(state.get("x")),
+                contact["position"]["z"] - _number(state.get("z")))
+            if contact_distance <= 50.0:
+                diversion = max(diversion, 12.0)
+            elif contact_distance <= 150.0:
+                diversion = max(diversion, 4.0)
+        health = max(0.0, _number(state.get("health"), 1.0))
+        max_health = max(1.0, _number(state.get("max_health"), 1.0))
+        diversion += 6.0 * (1.0 - min(1.0, health / max_health))
+        class_tag = str(bot.get("profile", {}).get("class_tag") or "")
+        if class_tag == "SPG":
+            diversion += 8.0
+        elif class_tag == "AT-SPG":
+            diversion += 3.0
+        if eta <= deadline:
+            return (0, eta + diversion, eta, bot["id"])
+        return (1, eta - deadline, eta + diversion, bot["id"])
+
+    def _update_base_defense(self, bots, contacts, defense, now):
+        """Keep one to three stable responders while an own base is invaded."""
+        if not isinstance(defense, dict):
+            self._base_defense = {1: {}, 2: {}}
+            return {1: {}, 2: {}}
+        states = defense.get("states")
+        states = states if isinstance(states, dict) else {}
+        bases = defense.get("bases")
+        live_by_team = dict((team, [
+            bot for bot in bots
+            if bot["team"] == team and self._base_defense_eligible(bot)
+        ]) for team in (1, 2))
+        result = {1: {}, 2: {}}
+        for team in (1, 2):
+            incident = self._base_defense.setdefault(team, {})
+            responders = incident.setdefault("responders", {})
+            live = dict((bot["id"], bot) for bot in live_by_team[team])
+            for bot_id in list(responders):
+                if bot_id not in live:
+                    del responders[bot_id]
+            raw_state = states.get(str(team), states.get(team, {}))
+            raw_state = raw_state if isinstance(raw_state, dict) else {}
+            invaders = max(0, _integer(raw_state.get("invaders")))
+            points = self._defense_points(bases, team)
+            reserve_limit = (1 if len(live) == 1 else max(0, len(live) - 1))
+            if len(responders) > reserve_limit:
+                deadline = max(0.0, _number(raw_state.get("time_left")) - 2.0)
+                ranked = sorted(
+                    responders, key=lambda bot_id: self._defense_eta(
+                        live[bot_id], responders[bot_id]["point"],
+                        contacts.get(team, ()), deadline))
+                keep = set(ranked[:reserve_limit])
+                for bot_id in list(responders):
+                    if bot_id not in keep:
+                        del responders[bot_id]
+            if invaders <= 0:
+                if not responders:
+                    incident["clear_since"] = None
+                    incident["need"] = 0
+                    continue
+                clear_since = incident.get("clear_since")
+                if clear_since is None:
+                    incident["clear_since"] = _number(now)
+                elif _number(now) - _number(clear_since) >= 3.0:
+                    responders.clear()
+                    incident["clear_since"] = None
+                    incident["need"] = 0
+                    continue
+            else:
+                incident["clear_since"] = None
+                desired = min(MAX_BASE_DEFENDERS, max(1, invaders))
+                desired = min(desired, reserve_limit)
+                incident["need"] = max(_integer(incident.get("need")), desired)
+                point_by_id = dict((value["id"], value) for value in points)
+                for bot_id, record in list(responders.items()):
+                    if record.get("base_id") in point_by_id:
+                        continue
+                    if not points:
+                        del responders[bot_id]
+                        continue
+                    bot = live[bot_id]
+                    selected = min(points, key=lambda value: (
+                        math.hypot(
+                            value["point"]["x"] - _number(bot["state"].get("x")),
+                            value["point"]["z"] - _number(bot["state"].get("z"))),
+                        value["id"]))
+                    responders[bot_id] = {
+                        "base_id": selected["id"],
+                        "point": dict(selected["point"]),
+                    }
+                missing = max(0, min(_integer(incident.get("need")),
+                                     reserve_limit) - len(responders))
+                if missing and points:
+                    deadline = max(0.0, _number(raw_state.get("time_left")) - 2.0)
+                    candidates = []
+                    for bot in live.values():
+                        if bot["id"] in responders:
+                            continue
+                        selected = min(points, key=lambda value: (
+                            math.hypot(
+                                value["point"]["x"] - _number(bot["state"].get("x")),
+                                value["point"]["z"] - _number(bot["state"].get("z"))),
+                            value["id"]))
+                        key = self._defense_eta(
+                            bot, selected["point"], contacts.get(team, ()),
+                            deadline)
+                        candidates.append((key, bot["id"], selected))
+                    for unused_key, bot_id, selected in sorted(candidates)[:missing]:
+                        responders[bot_id] = {
+                            "base_id": selected["id"],
+                            "point": dict(selected["point"]),
+                        }
+            result[team] = dict(responders)
+        return result
+
+    def _apply_base_defense_order(self, order, bot, base):
+        self._engage_anchors.pop(bot["id"], None)
+        self._cover_states.pop(bot["id"], None)
+        order["combat_mode"] = "base_defense"
+        order["defense_base_id"] = str(base["base_id"])
+        order["move_position"] = dict(base["point"])
+        order["throttle_override"] = None
+        if order.get("target_id") is None:
+            order["face_position"] = dict(base["point"])
+
+    def _prioritize_base_invaders(self, team, bots, contacts, assignments,
+                                  defenders, defense):
+        if not defenders or not isinstance(defense, dict):
+            return assignments
+        contributor_map = defense.get("contributors")
+        contributor_map = (contributor_map
+                           if isinstance(contributor_map, dict) else {})
+        raw = contributor_map.get(str(team), contributor_map.get(team, ()))
+        contributor_keys = set()
+        if isinstance(raw, (list, tuple)):
+            for value in raw:
+                if not isinstance(value, dict):
+                    continue
+                kind = str(value.get("kind") or "")
+                vehicle_id = _integer(value.get("id"))
+                if kind in ("human", "bot") and vehicle_id > 0:
+                    contributor_keys.add((kind, vehicle_id))
+        if not contributor_keys:
+            return assignments
+        result = dict(assignments)
+        bot_by_id = dict((bot["id"], bot) for bot in bots)
+        reservations = {}
+        for bot_id in sorted(defenders):
+            bot = bot_by_id.get(bot_id)
+            if bot is None:
+                continue
+            bx = _number(bot["state"].get("x"))
+            bz = _number(bot["state"].get("z"))
+            choices = []
+            for contact in contacts:
+                key = (str(contact.get("target_kind") or ""),
+                       _integer(contact.get("id")))
+                if (key not in contributor_keys or
+                        not contact.get("visible") or
+                        bot_id not in (contact.get(
+                            "shootable_by_bot_ids") or ())):
+                    continue
+                distance = math.hypot(
+                    contact["position"]["x"] - bx,
+                    contact["position"]["z"] - bz)
+                health_fraction = (_number(contact.get("health"), 1.0) /
+                                   max(1.0, _number(contact.get("max_health"), 1.0)))
+                choices.append((reservations.get(key, 0), health_fraction,
+                                distance, key[0], key[1], contact))
+            if not choices:
+                continue
+            selected = min(choices)
+            contact = selected[-1]
+            key = (str(contact.get("target_kind") or ""),
+                   _integer(contact.get("id")))
+            reservations[key] = reservations.get(key, 0) + 1
+            result[bot_id] = contact
+            self._target_assignments[bot_id] = {
+                "target": key,
+                "until": 0.0,
+            }
         return result
 
     @staticmethod
@@ -598,7 +842,8 @@ class BotPlanner(object):
                 best = route_id
         return best
 
-    def _rebalance_routes(self, team, bots, contacts, now):
+    def _rebalance_routes(self, team, bots, contacts, now,
+                          protected_ids=()):
         """Move at most one adaptable tank toward a pressured route every 4s."""
         catalog = self._route_catalog(bots)
         for bot in bots:
@@ -659,6 +904,8 @@ class BotPlanner(object):
                 assignment["until"] = _number(now) + ROUTE_LEASE_SECONDS
         candidates = []
         for bot in bots:
+            if bot["id"] in protected_ids:
+                continue
             assignment = self._route_assignments.get(bot["id"], {})
             current = assignment.get("route") if isinstance(assignment, dict) else None
             if not isinstance(current, dict):
@@ -1005,7 +1252,8 @@ class BotPlanner(object):
             order["throttle_override"] = 0.0
         return order
 
-    def _order_for(self, bot, index, count, focus, contacts, now):
+    def _order_for(self, bot, index, count, focus, contacts, now,
+                   travel_override=None):
         route_id, route_index, move, route_anchor = self._route(bot, now)
         profile = dict(bot["profile"])
         desired_range = max(10.0, _number(profile.get("desired_range"), 180.0))
@@ -1032,6 +1280,20 @@ class BotPlanner(object):
             "profile": profile,
             "shell_index": 0,
         }
+        if travel_override is not None:
+            if focus is not None:
+                order["target_id"] = focus["id"]
+                order["target_kind"] = focus.get("target_kind")
+                order["aim_position"] = dict(focus["position"])
+                order["face_position"] = dict(focus["position"])
+                observers = focus.get("shootable_by_bot_ids")
+                order["fire_allowed"] = bool(
+                    focus.get("visible") and
+                    (observers is None or bot["id"] in observers))
+                order["shell_index"] = self._shell_index(
+                    profile, focus, personality)
+            self._apply_base_defense_order(order, bot, travel_override)
+            return order
         if str(profile.get("class_tag") or "") == "SPG":
             return self._artillery_order(order, bot, focus, contacts, now)
         if focus is None:

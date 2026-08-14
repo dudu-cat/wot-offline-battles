@@ -167,6 +167,37 @@ class BotNavigationTest(unittest.TestCase):
             calls,
         )
 
+    def test_empty_failed_edge_table_skips_route_segment_scans(self):
+        grid = self.navigation.TerrainGrid(lambda *args: 0.0)
+
+        def unexpected_scan(*args):
+            raise AssertionError("empty failed-edge table scanned a route")
+
+        grid._edge_keys_for_segment = unexpected_scan
+
+        self.assertEqual(
+            0.0,
+            grid.segment_penalty(
+                (0.0, 0.0, 0.0), (20.0, 0.0, 0.0), 1.0
+            ),
+        )
+        self.assertFalse(grid.path_has_penalty(
+            ((0.0, 0.0, 0.0), (20.0, 0.0, 0.0)), 1.0
+        ))
+
+        edge = ((0, 0), (1, 0))
+        grid._failed_edges[edge] = (10.0, 7.0)
+        grid._edge_keys_for_segment = lambda *args: (edge,)
+        self.assertEqual(
+            7.0,
+            grid.segment_penalty(
+                (0.0, 0.0, 0.0), (4.0, 0.0, 0.0), 1.0
+            ),
+        )
+        self.assertTrue(grid.path_has_penalty(
+            ((0.0, 0.0, 0.0), (4.0, 0.0, 0.0)), 1.0
+        ))
+
     def test_housekeeping_bounds_direct_path_cache_without_pending_searches(self):
         navigator = self.navigation.TerrainNavigator(
             lambda *args: 0.0, cell_size=10.0
@@ -1059,8 +1090,20 @@ class BotNavigationTest(unittest.TestCase):
             leading_tabs("if not _battle_active:") + 1,
             leading_tabs("bot_gravity = _PHY.GRAVITY"),
         )
+        native_hazard = battle_source[
+            battle_source.index("# Native contact resolves terrain"):
+            battle_source.index("# Native destructible health", battle_source.index(
+                "# Native contact resolves terrain"
+            ))
+        ]
         self.assertIn("m_veh._offh_ai_driver_mode = 'native_guard'",
-                      battle_source)
+                      native_hazard)
+        self.assertIn("_offh_native_hazard_recovering", native_hazard)
+        self.assertEqual(1, native_hazard.count(
+            "_native_body_manager.hold("
+        ))
+        self.assertIn("_offh_ai_probe_reject(", native_hazard)
+        self.assertNotIn("guard_fault(", native_hazard)
         self.assertEqual(
             leading_tabs("# --- Slope slide (bot):"),
             leading_tabs("# Final realised-pose water guard."),

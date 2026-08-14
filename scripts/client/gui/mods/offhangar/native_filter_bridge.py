@@ -61,8 +61,11 @@ def load():
 				'WorldOfTanks.exe SHA-256 mismatch: expected=%s actual=%s' % (
 					EXPECTED_EXE_SHA256, actual_hash))
 		from gui.mods.offhangar import offhangar_native_seed
-		if not hasattr(offhangar_native_seed, 'seed_filter'):
-			raise RuntimeError('native module has no seed_filter entry point')
+		for entry_point in ('seed_filter', 'output_filter',
+				'filter_has_physics', 'publish_physics_root'):
+			if not hasattr(offhangar_native_seed, entry_point):
+				raise RuntimeError(
+					'native module has no %s entry point' % entry_point)
 		_LOAD_STATE[0] = offhangar_native_seed
 		LOG_NOTE(
 			'NATIVE_FILTER_BRIDGE loaded exe_sha256=%s' % actual_hash)
@@ -74,6 +77,10 @@ def load():
 
 def seed_filter(vehicle_filter, timestamp, space_id, position, direction):
 	"""Inject one world-space filter input for an unmounted vehicle.
+
+	``direction`` follows the native Filter::input history contract exactly:
+	yaw, pitch, roll. This differs from some Python Entity helpers which accept
+	roll, pitch, yaw and reorder before entering the native filter.
 
 	The third integer in the native ``Filter::input`` contract is the ID of the
 	vehicle carrying this entity, not this entity's own ID. Offline tanks are in
@@ -106,4 +113,67 @@ def seed_filter(vehicle_filter, timestamp, space_id, position, direction):
 		return True
 	except Exception as error:
 		LOG_ERROR('NATIVE_FILTER_BRIDGE seed failed: %s' % str(error))
+		return False
+
+
+def output_filter(vehicle_filter, timestamp):
+	"""Publish one attached native body through WGVehicleFilter2::output."""
+	try:
+		timestamp = float(timestamp)
+		if math.isnan(timestamp) or math.isinf(timestamp):
+			raise ValueError('non-finite Filter::output timestamp')
+	except Exception as error:
+		LOG_ERROR('NATIVE_FILTER_BRIDGE output rejected: %s' % str(error))
+		return False
+	bridge = load()
+	if bridge is None:
+		return False
+	try:
+		bridge.output_filter(vehicle_filter, timestamp)
+		return True
+	except Exception as error:
+		LOG_ERROR('NATIVE_FILTER_BRIDGE output failed: %s' % str(error))
+		return False
+
+
+def filter_has_physics(vehicle_filter, vehicle_physics):
+	"""Prove the filter owns the exact rigid body installed by this adapter."""
+	bridge = load()
+	if bridge is None:
+		return False
+	try:
+		bridge.filter_has_physics(vehicle_filter, vehicle_physics)
+		return True
+	except Exception as error:
+		LOG_ERROR('NATIVE_FILTER_BRIDGE owner check failed: %s' % str(error))
+		return False
+
+
+def publish_physics_root(vehicle_filter, vehicle_physics, timestamp,
+		space_id):
+	"""Publish the solved C++ root matrix through its attached filter.
+
+	Retail ``WGVehicleFilter2.output`` uses its input history as the root pose;
+	it does not copy the attached ``WGVehiclePhysics2`` rigid transform. The
+	version-locked bridge reads that solved transform, submits it as the current
+	filter input in yaw, pitch, roll order and then performs exactly one output
+	at the same timestamp.
+	"""
+	try:
+		timestamp = float(timestamp)
+		space_id = int(space_id)
+		if math.isnan(timestamp) or math.isinf(timestamp):
+			raise ValueError('non-finite physics root timestamp')
+	except Exception as error:
+		LOG_ERROR('NATIVE_FILTER_BRIDGE root publish rejected: %s' % str(error))
+		return False
+	bridge = load()
+	if bridge is None:
+		return False
+	try:
+		bridge.publish_physics_root(
+			vehicle_filter, vehicle_physics, timestamp, space_id)
+		return True
+	except Exception as error:
+		LOG_ERROR('NATIVE_FILTER_BRIDGE root publish failed: %s' % str(error))
 		return False

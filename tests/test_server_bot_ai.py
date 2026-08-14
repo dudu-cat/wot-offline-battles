@@ -13,7 +13,8 @@ import time
 import unittest
 
 from lan_battle_server import (
-    BOT_ORDER_WIRE_FIELDS, BattleState, CLIENT_BUILD, ClientHandler, Player,
+    BOT_AUTHORITY_SNAPSHOT_FIELDS, BOT_ORDER_WIRE_FIELDS,
+    BattleState, CLIENT_BUILD, ClientHandler, Player,
     PROTOCOL_VERSION, SERVER_SEND_BUFFER_BYTES,
 )
 from server_bot_ai import BotPlanner
@@ -88,6 +89,66 @@ def _artillery_manifest_and_states():
 
 
 class ServerBotPlannerTests(unittest.TestCase):
+    @staticmethod
+    def _defense_manifest_and_states():
+        manifest = []
+        states = []
+        for bot_id, x, speed in (
+            (11, 30.0, 18.0),
+            (12, 60.0, 18.0),
+            (13, 90.0, 18.0),
+            (14, 500.0, 18.0),
+        ):
+            manifest.append({
+                "id": bot_id,
+                "team": 1,
+                "slot": bot_id - 11,
+                "health": 1000,
+                "profile": {
+                    "speed": speed,
+                    "class_tag": "mediumTank",
+                    "dominant_role": "support",
+                    "desired_range": 180.0,
+                    "fire_range": 500.0,
+                    "roles": {},
+                },
+                "route": {
+                    "id": "lane-%d" % bot_id,
+                    "waypoints": [
+                        {"x": x, "y": 0.0, "z": 0.0},
+                        {"x": x, "y": 0.0, "z": 300.0},
+                    ],
+                },
+            })
+            states.append({
+                "id": bot_id,
+                "team": 1,
+                "alive": True,
+                "world_pose": True,
+                "x": x,
+                "y": 0.0,
+                "z": 0.0,
+                "health": 1000,
+                "max_health": 1000,
+                "critical": {},
+            })
+        return manifest, states
+
+    @staticmethod
+    def _defense_context(invaders=3):
+        return {
+            "bases": {"1": [
+                {"id": "1:0", "x": 0.0, "y": 0.0, "z": 0.0},
+            ]},
+            "states": {"1": {
+                "points": 30,
+                "time_left": 25.0,
+                "invaders": invaders,
+                "stopped": False,
+            }},
+            "contributors": {"1": []},
+        }
+
     def test_bot_state_preserves_relayed_killer_identity(self):
         identity = {
             "id": 16, "team": 2, "slot": 0, "name": "Victim",
@@ -236,7 +297,8 @@ class ServerBotPlannerTests(unittest.TestCase):
                         "traversing": 11, "limited": 7},
                 "driver": {"moving": 9, "drive": 8, "avoid": 3,
                            "blocked": 6, "recovery": 7, "arrived": 5,
-                           "server_wait": 2, "water_guard": 2, "full": 12,
+                           "server_wait": 2, "traffic_wait": 4,
+                           "water_guard": 2, "full": 12,
                            "cruise": 10, "speed_pct": 73, "slow": 3},
                 "safety": {"water_guard_total": 11, "water_guard_active": 2,
                            "edge_guard_total": 7, "edge_guard_active": 1,
@@ -251,6 +313,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(13, state.bot_navigation_stats["search"]["pending"])
         self.assertEqual(15, state.bot_navigation_stats["aim"]["targeted"])
         self.assertEqual(9, state.bot_navigation_stats["driver"]["moving"])
+        self.assertEqual(4, state.bot_navigation_stats["driver"]["traffic_wait"])
         self.assertEqual(12, state.bot_navigation_stats["driver"]["full"])
         self.assertEqual(73, state.bot_navigation_stats["driver"]["speed_pct"])
         self.assertEqual(11, state.bot_navigation_stats["safety"]["water_guard_total"])
@@ -281,7 +344,7 @@ class ServerBotPlannerTests(unittest.TestCase):
             "aim=targeted:15,aligned:4,traversing:11,limited:7,alive:29", text
         )
         self.assertIn(
-            "driver=moving:9,drive:8,avoid:3,blocked:6,recovery:7,arrived:5,wait:2,full:12,cruise:10,speed:73%,slow:3",
+            "driver=moving:9,drive:8,avoid:3,blocked:6,recovery:7,arrived:5,wait:2,traffic:4,full:12,cruise:10,speed:73%,slow:3",
             text,
         )
         self.assertIn("safety=water:11/2,edge:7/1,veto:w4,t3,o2,e1", text)
@@ -320,6 +383,195 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual({"route"}, {order["combat_mode"] for order in first["orders"]})
 
+    def test_capture_rules_are_authority_only_and_preserve_active_invaders(self):
+        state = BattleState(map_name="07_lakeville")
+        state.phase = "battle"
+        authority = Player(1, None, ("127.0.0.1", 1), team=1)
+        replica = Player(2, None, ("127.0.0.1", 2), team=2)
+        state.players = {1: authority, 2: replica}
+        state.bot_authority_id = 1
+        report = {
+            "rules": {"bases": {
+                "1": {
+                    "points": 1,
+                    "stopped": False,
+                    "contributors": {"human:2": 1, "bot:17": 0},
+                    "active_contributors": ["human:2", "bot:17"],
+                    "invaders": 2,
+                    "cursor": 1,
+                },
+                "2": {
+                    "points": 0,
+                    "stopped": False,
+                    "contributors": {},
+                    "active_contributors": [],
+                    "invaders": 0,
+                    "cursor": 0,
+                },
+            }},
+        }
+
+        self.assertFalse(state.update_rules(2, report))
+        self.assertTrue(state.update_rules(1, report))
+        self.assertEqual(2, state.rules_state["bases"]["1"]["invaders"])
+        self.assertEqual(
+            ["bot:17", "human:2"],
+            state.rules_state["bases"]["1"]["active_contributors"],
+        )
+
+    def test_defense_context_uses_navgraph_ctf_bases_in_shared_frame(self):
+        state = BattleState(map_name="07_lakeville")
+        graph_path = ROOT / "scripts/client/gui/mods/offhangar/navgraphs/07_lakeville.json"
+        with graph_path.open() as source:
+            graph = json.load(source)
+        first, second = graph["bases"][:2]
+        frame = {
+            "origin": [first[0], first[1]],
+            "axis": [second[0] - first[0], second[1] - first[1]],
+        }
+        self.assertTrue(state.bot_navigation.configure("07_lakeville", frame))
+        state.rules_state["bases"]["1"].update({
+            "points": 12,
+            "invaders": 1,
+            "active_contributors": ["human:7"],
+        })
+
+        defense = state._bot_defense_context()
+        point = defense["bases"]["1"][0]
+        restored = state.bot_navigation._world(
+            (point["x"], point["y"], point["z"])
+        )
+
+        self.assertAlmostEqual(first[0], restored[0], places=3)
+        self.assertAlmostEqual(first[1], restored[2], places=3)
+        self.assertEqual(1, defense["states"]["1"]["invaders"])
+        self.assertEqual([{"kind": "human", "id": 7}],
+                         defense["contributors"]["1"])
+
+    def test_base_defense_selects_stable_responders_and_keeps_one_attacker(self):
+        planner = BotPlanner()
+        manifest, states = self._defense_manifest_and_states()
+        defense = self._defense_context(3)
+
+        first = planner.build_orders(manifest, states, [], 1.0, defense)
+        selected = [order["id"] for order in first["orders"]
+                    if order["combat_mode"] == "base_defense"]
+        self.assertEqual([11, 12, 13], selected)
+        self.assertTrue(any(order["combat_mode"] != "base_defense"
+                            for order in first["orders"]))
+
+        defense["states"]["1"]["invaders"] = 1
+        second = planner.build_orders(manifest, states, [], 2.0, defense)
+        self.assertEqual(selected, [order["id"] for order in second["orders"]
+                                    if order["combat_mode"] == "base_defense"])
+
+    def test_base_defense_replaces_a_mobility_disabled_responder(self):
+        planner = BotPlanner()
+        manifest, states = self._defense_manifest_and_states()
+        defense = self._defense_context(1)
+
+        first = planner.build_orders(manifest, states, [], 1.0, defense)
+        selected = next(order["id"] for order in first["orders"]
+                        if order["combat_mode"] == "base_defense")
+        for state in states:
+            if state["id"] == selected:
+                state["mobility_disabled"] = True
+        second = planner.build_orders(manifest, states, [], 2.0, defense)
+        replacement = next(order["id"] for order in second["orders"]
+                           if order["combat_mode"] == "base_defense")
+
+        self.assertNotEqual(selected, replacement)
+
+    def test_bot_state_sanitizes_mobility_for_defense_and_handoff(self):
+        identity = {
+            "id": 16, "team": 2, "slot": 0, "name": "Tracked",
+            "vehicle": "ussr:T-34", "max_health": 500,
+        }
+
+        state = BattleState._sanitize_bot_state(
+            {"health": 500, "alive": True, "mobility_disabled": True,
+             "mobility_repair_seconds": 4.25},
+            identity, None)
+
+        self.assertTrue(state["mobility_disabled"])
+        self.assertEqual(4.25, state["mobility_repair_seconds"])
+        self.assertNotIn("mobility_disabled", BOT_AUTHORITY_SNAPSHOT_FIELDS)
+        self.assertNotIn("mobility_repair_seconds", BOT_AUTHORITY_SNAPSHOT_FIELDS)
+
+    def test_base_defense_clears_only_after_three_second_grace(self):
+        planner = BotPlanner()
+        manifest, states = self._defense_manifest_and_states()
+        defense = self._defense_context(1)
+
+        self.assertTrue(any(order["combat_mode"] == "base_defense"
+                            for order in planner.build_orders(
+                                manifest, states, [], 1.0, defense)["orders"]))
+        defense["states"]["1"]["invaders"] = 0
+        self.assertTrue(any(order["combat_mode"] == "base_defense"
+                            for order in planner.build_orders(
+                                manifest, states, [], 2.0, defense)["orders"]))
+        self.assertTrue(any(order["combat_mode"] == "base_defense"
+                            for order in planner.build_orders(
+                                manifest, states, [], 4.99, defense)["orders"]))
+        self.assertFalse(any(order["combat_mode"] == "base_defense"
+                             for order in planner.build_orders(
+                                 manifest, states, [], 5.0, defense)["orders"]))
+
+    def test_base_defenders_prioritize_only_visible_shootable_contributors(self):
+        planner = BotPlanner()
+        manifest, states = self._defense_manifest_and_states()
+        enemies = [
+            {"id": 7, "team": 2, "alive": True},
+            {"id": 8, "team": 2, "alive": True},
+        ]
+        known = planner.known_targets(states, enemies)
+        contacts = []
+        for enemy_id, observers, z in (
+            (7, [11], 15.0),
+            (8, [12], -15.0),
+        ):
+            contacts.append({
+                "observing_team": 1,
+                "target_kind": "human",
+                "target_id": enemy_id,
+                "target_team": 2,
+                "visible": True,
+                "shootable_by_bot_ids": observers,
+                "x": 0.0,
+                "y": 0.0,
+                "z": z,
+                "health": 1000,
+                "max_health": 1000,
+            })
+        self.assertEqual(2, planner.report_contacts(contacts, known, 1.0))
+        defense = self._defense_context(2)
+        defense["contributors"]["1"] = [
+            {"kind": "human", "id": 7},
+            {"kind": "human", "id": 8},
+        ]
+
+        orders = planner.build_orders(manifest, states, enemies, 1.0, defense)["orders"]
+        by_id = {order["id"]: order for order in orders}
+        self.assertEqual(7, by_id[11]["target_id"])
+        self.assertEqual(8, by_id[12]["target_id"])
+        self.assertTrue(by_id[11]["fire_allowed"])
+        self.assertTrue(by_id[12]["fire_allowed"])
+
+    def test_base_defense_wire_order_keeps_executable_identity_and_destination(self):
+        planner = BotPlanner()
+        manifest, states = self._defense_manifest_and_states()
+        order = next(order for order in planner.build_orders(
+            manifest, states, [], 1.0, self._defense_context(1)
+        )["orders"] if order["combat_mode"] == "base_defense")
+        state = BattleState(map_name="07_lakeville")
+        state.bot_orders = {"revision": 1, "orders": [order]}
+
+        unused_revision, body, unused_bytes = state._wire_order_dispatch()
+
+        self.assertEqual("base_defense", body[0]["combat_mode"])
+        self.assertEqual("1:0", body[0]["defense_base_id"])
+        self.assertIn("move_position", body[0])
+
     def test_wire_orders_keep_only_authority_executable_fields_within_budget(self):
         rich_profile = {
             "class_tag": "mediumTank",
@@ -353,9 +605,10 @@ class ServerBotPlannerTests(unittest.TestCase):
         revision, body, byte_increment = state._wire_order_dispatch()
 
         expected_keys = set(BOT_ORDER_WIRE_FIELDS)
+        route_keys = expected_keys - {"defense_base_id"}
         self.assertEqual(7, revision)
         self.assertEqual(29, len(body))
-        self.assertTrue(all(set(order) == expected_keys for order in body))
+        self.assertTrue(all(set(order) == route_keys for order in body))
         self.assertTrue(all("profile" not in order for order in body))
         self.assertEqual(
             len(b',"bot_orders":') + len(json.dumps(
@@ -396,7 +649,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         state.players[1] = Player(1, first_connection, ("127.0.0.1", 1))
         state.players[2] = Player(2, second_connection, ("127.0.0.1", 2))
         state.bot_authority_id = 1
-        state.bot_planner.build_orders = lambda manifest, states, players, now: {
+        state.bot_planner.build_orders = lambda manifest, states, players, now, defense=None: {
             "revision": 3, "orders": [rich_order],
         }
 
@@ -477,7 +730,7 @@ class ServerBotPlannerTests(unittest.TestCase):
                 raw, identity, None)
         state.bot_manifest = manifest
         state.bot_states = states
-        state.bot_planner.build_orders = lambda manifest, states, players, now: {
+        state.bot_planner.build_orders = lambda manifest, states, players, now, defense=None: {
             "revision": 4, "orders": [],
         }
         state.bot_navigation.resolve = lambda orders, states, revision, now: dict(
@@ -509,6 +762,8 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertIn("x", replica_snapshot["bots"][0])
         self.assertNotIn("nav_x", replica_snapshot["bots"][0])
         self.assertNotIn("name", replica_snapshot["bots"][0])
+        self.assertNotIn("mobility_disabled", authority_snapshot["bots"][0])
+        self.assertNotIn("mobility_disabled", replica_snapshot["bots"][0])
         self.assertEqual("human", authority_snapshot["bots"][-1]["killer_kind"])
         self.assertEqual(7, replica_snapshot["bots"][-1]["killer_id"])
 
@@ -528,6 +783,8 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertIn("name", full_snapshot["bots"][0])
         self.assertIn("x", full_snapshot["bots"][0])
         self.assertIn("nav_x", full_snapshot["bots"][0])
+        self.assertIn("mobility_disabled", full_snapshot["bots"][0])
+        self.assertIn("mobility_repair_seconds", full_snapshot["bots"][0])
         self.assertGreater(wire_size(full_snapshot), replica_bytes)
         self.assertLess(wire_size(full_snapshot), 18 * 1024)
 
@@ -572,7 +829,27 @@ class ServerBotPlannerTests(unittest.TestCase):
         second = Player(2, second_connection, ("127.0.0.1", 2))
         state.players = {1: first, 2: second}
         state.bot_authority_id = 1
-        state.bot_planner.build_orders = lambda manifest, states, players, now: {
+        # Both synthetic players occupy the default team-1/slot-0 human slot.
+        # Use the next roster slot so this one-bot manifest is the exact
+        # canonical bot set after human-slot exclusion.
+        identity = state.bot_roster[1]
+        state.bot_roster = [identity]
+        self.assertTrue(state.update_bot_manifest(1, {"bots": [{
+            "id": identity["id"],
+            "team": identity["team"],
+            "slot": identity["slot"],
+            "vehicle": "ussr:T-34",
+            "max_health": 500,
+            "health": 500,
+            "x": 4.0,
+            "y": 1.0,
+            "z": 92.0,
+            "yaw": 0.25,
+            "world_pose": True,
+        }], "round_id": state.round_id,
+            "manifest_nonce": "promoted-authority-1",
+            "map_frame": {"origin": [0.0, 0.0], "axis": [0.0, 1.0]}}))
+        state.bot_planner.build_orders = lambda manifest, states, players, now, defense=None: {
             "revision": 9, "orders": [order],
         }
         first.bot_order_revision_ack = 9
@@ -595,6 +872,14 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertEqual(9, snapshot["bot_order_revision"])
         self.assertEqual("full", snapshot["bot_snapshot_mode"])
         self.assertEqual([1], [value["id"] for value in snapshot["bot_orders"]])
+        self.assertEqual([identity["id"]], [
+            value["id"] for value in snapshot["bots"]
+        ])
+        self.assertEqual((4.0, 1.0, 92.0), (
+            snapshot["bots"][0]["x"],
+            snapshot["bots"][0]["y"],
+            snapshot["bots"][0]["z"],
+        ))
 
     def test_unchanged_orders_are_omitted_from_following_snapshots(self):
         class CaptureConnection(object):
@@ -851,7 +1136,7 @@ class ServerBotPlannerTests(unittest.TestCase):
         ])
         self.assertEqual("Good", good_connection.messages[-1]["players"][0]["name"])
 
-    def test_late_join_bootstrap_precedes_snapshot(self):
+    def test_battle_phase_rejects_late_join_before_snapshot_bootstrap(self):
         class CaptureConnection(object):
             def __init__(self):
                 self.messages = []
@@ -870,21 +1155,11 @@ class ServerBotPlannerTests(unittest.TestCase):
             connection, ("127.0.0.1", 1), {
                 "name": "Late", "vehicle": "ussr:T-34", "max_health": 880,
             })
-        self.assertIsNone(error)
-        self.assertIsNotNone(current_battle)
-        state.tick_once(0.05)
-
-        deadline = time.time() + 1.0
-        while time.time() < deadline:
-            with connection.lock:
-                kinds = [message["type"] for message in connection.messages]
-            if "snapshot" in kinds:
-                break
-            time.sleep(0.01)
-        self.assertEqual("welcome", kinds[0])
-        self.assertLess(kinds.index("roster"), kinds.index("battle_start"))
-        self.assertLess(kinds.index("battle_start"), kinds.index("snapshot"))
-        state.remove_player(player.player_id, expected_player=player)
+        self.assertIsNone(player)
+        self.assertEqual("battle_in_progress", error)
+        self.assertIsNone(current_battle)
+        self.assertEqual([], connection.messages)
+        self.assertEqual({}, state.players)
 
     def test_immediate_start_cannot_overtake_welcome(self):
         class CaptureConnection(object):
@@ -1070,6 +1345,37 @@ class ServerBotPlannerTests(unittest.TestCase):
             order["move_position"],
         )
         self.assertEqual(0.0, order["throttle_override"])
+
+    def test_base_defense_preempts_artillery_hold_without_a_target(self):
+        planner = BotPlanner()
+        manifest, states = _artillery_manifest_and_states()
+
+        order = next(value for value in planner.build_orders(
+            manifest, states, [], 1.0, self._defense_context(1)
+        )["orders"] if value["id"] == 1)
+
+        self.assertEqual("base_defense", order["combat_mode"])
+        self.assertEqual("1:0", order["defense_base_id"])
+
+    def test_base_defense_preempts_artillery_fire_with_a_proved_target(self):
+        planner = BotPlanner()
+        manifest, states = _artillery_manifest_and_states()
+        planner.report_contacts([{
+            "observing_team": 1, "target_kind": "bot", "target_id": 3,
+            "target_team": 2, "visible": True,
+            "shootable_by_bot_ids": [1],
+            "x": 0, "y": 0, "z": 650, "health": 1000,
+            "max_health": 1000, "class_tag": "heavyTank",
+        }], planner.known_targets(states, []), 1.0)
+
+        order = next(value for value in planner.build_orders(
+            manifest, states, [], 1.0, self._defense_context(1)
+        )["orders"] if value["id"] == 1)
+
+        self.assertEqual("base_defense", order["combat_mode"])
+        self.assertEqual(3, order["target_id"])
+        self.assertTrue(order["fire_allowed"])
+        self.assertEqual("1:0", order["defense_base_id"])
 
     def test_artillery_live_hold_pose_does_not_churn_order_revision(self):
         planner = BotPlanner()
@@ -1771,16 +2077,63 @@ class ServerBotPlannerTests(unittest.TestCase):
         self.assertFalse(state.update_bot_states(1, {"bots": {"id": 1}}))
         self.assertEqual([], state.bot_manifest)
 
+    def test_installed_bot_manifest_is_immutable_for_the_round(self):
+        state = BattleState(map_name="04_himmelsdorf")
+        state.phase = "battle"
+        state.bot_authority_id = 1
+        state.bot_navigation.configure = lambda *unused: False
+        identity = state.bot_roster[0]
+        state.bot_roster = [identity]
+        frame = {"origin": [0.0, 0.0], "axis": [0.0, 1.0]}
+        bot = {
+            "id": identity["id"], "team": identity["team"],
+            "slot": identity["slot"], "vehicle": "ussr:T-34",
+            "max_health": 500, "health": 500, "world_pose": True,
+            "x": 1.0, "y": 2.0, "z": 3.0, "yaw": 0.25,
+        }
+        message = {
+            "bots": [bot], "round_id": state.round_id,
+            "manifest_nonce": "immutable-1", "map_frame": frame,
+        }
+
+        self.assertTrue(state.update_bot_manifest(1, message))
+        installed = list(state.bot_manifest)
+        installed_states = dict(state.bot_states)
+        event_count = len(state.pending_events)
+        self.assertTrue(state.update_bot_manifest(1, message))
+        self.assertEqual(event_count, len(state.pending_events))
+
+        mutations = (
+            ({"bots": [dict(bot, x=9.0)]}, {}),
+            ({"bots": [dict(bot, vehicle="germany:PzII")]}, {}),
+            ({}, {"map_frame": {"origin": [1.0, 0.0],
+                                  "axis": [0.0, 1.0]}}),
+        )
+        for body_changes, message_changes in mutations:
+            changed = dict(message)
+            changed.update(message_changes)
+            changed.update(body_changes)
+            changed["manifest_nonce"] = "immutable-changed"
+            self.assertFalse(state.update_bot_manifest(1, changed))
+            self.assertEqual(installed, state.bot_manifest)
+            self.assertEqual(installed_states, state.bot_states)
+            self.assertEqual(event_count, len(state.pending_events))
+
     def test_bot_state_fire_sequence_creates_a_server_diagnostic_event(self):
         state = BattleState(map_name="04_himmelsdorf")
         state.phase = "battle"
         state.bot_authority_id = 1
         identity = state.bot_roster[0]
+        state.bot_roster = [identity]
         self.assertTrue(state.update_bot_manifest(1, {"bots": [{
             "id": identity["id"], "team": identity["team"],
             "slot": identity["slot"], "max_health": 1000,
             "health": 1000, "fire_seq": 0,
-        }]}))
+            "world_pose": True, "x": 0.0, "y": 0.0, "z": 0.0,
+            "yaw": 0.0,
+        }], "round_id": state.round_id,
+            "manifest_nonce": "bot-fire-1",
+            "map_frame": {"origin": [0.0, 0.0], "axis": [0.0, 1.0]}}))
         state.pending_events = []
 
         self.assertTrue(state.update_bot_states(1, {"bots": [{

@@ -74,13 +74,29 @@ def commit_pose(mock, position, yaw=None, pitch=None, roll=None,
 			except Exception:
 				pass
 		if attach_servo and not getattr(mock, '_servo_added', False):
+			servo = None
 			try:
 				import BigWorld
+				# Read before mutating so a model without an ownership surface cannot
+				# accumulate an untracked Servo after a silent native API failure.
+				if list(chassis.motors):
+					raise RuntimeError('model already has a root motor')
 				servo = BigWorld.Servo(matrix)
 				chassis.addMotor(servo)
+				motors = list(chassis.motors)
+				if len(motors) != 1 or motors[0] is not servo:
+					raise RuntimeError('Servo attach readback mismatch')
 				mock._pose_servo = servo
 				mock._servo_added = True
 			except Exception:
-				pass
+				try:
+					if servo is not None and any(
+							motor is servo for motor in list(chassis.motors)):
+						chassis.delMotor(servo)
+				except Exception:
+					pass
+				mock._pose_servo = None
+				mock._servo_added = False
+				return False
 
 	return True

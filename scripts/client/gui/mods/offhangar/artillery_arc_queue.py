@@ -98,6 +98,16 @@ class ArcProbeQueue(object):
 		self.order.append(key)
 		return False, None
 
+	def request_lazy(self, key, candidate_factory, target_position, now):
+		"""Build candidates only when this queue can accept the new job."""
+		ready, solution = self.result(key, now)
+		if ready:
+			return ready, solution
+		if key in self.jobs or len(self.order) >= self.max_jobs:
+			return False, None
+		return self.request(
+			key, candidate_factory(), target_position, now)
+
 	def _complete(self, key, now, solution):
 		ttl = self.success_ttl if solution is not None else self.failure_ttl
 		self.results[key] = (float(now) + ttl, solution)

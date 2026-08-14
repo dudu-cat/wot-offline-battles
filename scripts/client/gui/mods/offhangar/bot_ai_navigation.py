@@ -378,6 +378,8 @@ class TerrainGrid(object):
 		return value[1]
 
 	def segment_penalty(self, start, end, now):
+		if not self._failed_edges:
+			return 0.0
 		penalty = 0.0
 		for key in self._edge_keys_for_segment(start, end):
 			penalty = max(penalty,
@@ -467,6 +469,8 @@ class TerrainGrid(object):
 		return True
 
 	def path_has_penalty(self, path, now):
+		if not self._failed_edges:
+			return False
 		for index in range(len(path) - 1):
 			if self.segment_penalty(path[index], path[index + 1], now) > 0.0:
 				return True

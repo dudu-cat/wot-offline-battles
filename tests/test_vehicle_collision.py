@@ -103,27 +103,38 @@ class VehicleCollisionTests(unittest.TestCase):
             self.collision.support_rise_is_obstacle(0.0, None, 0.65)
         )
 
-    def test_only_gradual_uphill_profiles_bypass_wall_collision(self):
+    def test_gradual_non_flat_ground_profiles_bypass_wall_collision(self):
+        profiles = {
+            "gradual uphill": [4.0, 4.3, 4.7, 5.1],
+            "gradual downhill": [5.1, 4.7, 4.3, 4.0],
+            "rounded bump": [4.0, 4.2, 4.45, 4.6, 4.45, 4.2, 4.0],
+            "rounded crest": [4.0, 4.2, 4.4, 4.55, 4.6, 4.6, 4.6],
+        }
+
+        for name, heights in profiles.items():
+            with self.subTest(name=name):
+                self.assertTrue(
+                    self.collision.drivable_rising_profile(heights, 0.75)
+                )
+
+    def test_flat_ground_cannot_hide_a_horizontal_wall(self):
         self.assertFalse(
             self.collision.drivable_rising_profile(
                 [4.0, 4.0, 4.0, 4.0], 0.75
             )
         )
-        self.assertFalse(
-            self.collision.drivable_rising_profile(
-                [4.5, 4.3, 4.1, 3.9], 0.75
-            )
-        )
-        self.assertTrue(
-            self.collision.drivable_rising_profile(
-                [4.0, 4.3, 4.7, 5.1], 0.75
-            )
-        )
-        self.assertFalse(
-            self.collision.drivable_rising_profile(
-                [4.0, 4.2, 5.5, 5.7], 0.75
-            )
-        )
+
+    def test_abrupt_up_or_down_step_is_not_drivable_ground(self):
+        profiles = {
+            "upward step": [4.0, 4.2, 5.5, 5.7],
+            "downward step": [5.7, 5.5, 4.2, 4.0],
+        }
+
+        for name, heights in profiles.items():
+            with self.subTest(name=name):
+                self.assertFalse(
+                    self.collision.drivable_rising_profile(heights, 0.75)
+                )
 
     def test_equal_mass_pair_separates_and_stops_closing_velocity(self):
         response = self.collision.pair_response(

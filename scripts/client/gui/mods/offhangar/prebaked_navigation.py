@@ -24,6 +24,11 @@ STOCK_MAPS = (
 	'45_north_america', '47_canada_a', '51_asia',
 )
 
+try:
+	_INTEGER_TYPES = (int, long)
+except NameError:
+	_INTEGER_TYPES = (int,)
+
 
 def _short_map_name(map_name):
 	return str(map_name or '').replace('\\', '/').rstrip('/').split('/')[-1]
@@ -52,6 +57,34 @@ def _validate(graph, map_name):
 		raise ValueError('navigation graph origin is invalid')
 	if float(graph.get('cell_size', 0.0)) <= 0.0:
 		raise ValueError('navigation graph cell size is invalid')
+	if map_name in STOCK_MAPS:
+		formations = graph.get('spawn_formations')
+		validation = graph.get('validation') or {}
+		bake = graph.get('bake') or {}
+		skipped_models = bake.get('spawn_obstacle_skipped_models')
+		if (not isinstance(formations, dict) or
+			set(formations.keys()) != set(('1', '2')) or
+			not bool(validation.get('spawn_compiled_bsp_obb_clearance')) or
+			not bool(validation.get('spawn_pairwise_obb_clearance')) or
+			not bool(validation.get('spawn_terrain_footprint_clearance')) or
+			not bool(validation.get('route_terminal_obb_clearance')) or
+			isinstance(skipped_models, bool) or
+			not isinstance(skipped_models, _INTEGER_TYPES) or
+			skipped_models != 0):
+			raise ValueError('stock navigation graph lacks validated spawn poses')
+		for team in ('1', '2'):
+			poses = formations.get(team)
+			if not isinstance(poses, list) or len(poses) != 15:
+				raise ValueError('stock navigation graph spawn formation is incomplete')
+			for pose in poses:
+				try:
+					values = tuple(float(value) for value in pose)
+				except Exception:
+					values = ()
+				if (not isinstance(pose, list) or len(values) != 4 or
+						not all(value == value and abs(value) != float('inf')
+							for value in values)):
+					raise ValueError('stock navigation graph spawn pose is invalid')
 	return graph
 
 
@@ -177,3 +210,22 @@ def nearest_ground_point(graph, x, z, max_radius=3):
 		if best is not None:
 			return best
 	return None
+
+
+def spawn_pose(graph, team, slot):
+	"""Return one offline-validated stock spawn pose without runtime projection."""
+	try:
+		team = int(team)
+		slot = int(slot)
+		formations = graph.get('spawn_formations') if isinstance(graph, dict) else None
+		poses = formations.get(str(team)) if isinstance(formations, dict) else None
+		pose = poses[slot]
+		if team not in (1, 2) or slot < 0 or slot >= 15 or len(pose) != 4:
+			return None
+		values = tuple(float(value) for value in pose)
+		for value in values:
+			if value != value or abs(value) == float('inf'):
+				return None
+		return values
+	except Exception:
+		return None

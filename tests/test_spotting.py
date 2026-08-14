@@ -66,6 +66,66 @@ class SpottingTests(unittest.TestCase):
         self.assertTrue(self.spotting.is_detected(50.0, 100.0, 0.95, False))
         self.assertFalse(self.spotting.is_detected(313.0, 400.0, 0.25, True))
 
+    def test_foliage_visibility_bound_has_exact_three_state_contract(self):
+        """Skip foliage only when every possible foliage result agrees."""
+        classify = self.spotting.foliage_visibility_bound
+        view_range = 400.0
+        camouflage = 0.20
+        max_foliage_bonus = 0.60
+        clear_range = self.spotting.detection_distance(
+            view_range, camouflage
+        )
+        worst_range = self.spotting.detection_distance(
+            view_range, camouflage + max_foliage_bonus
+        )
+
+        self.assertIs(
+            True,
+            classify(
+                worst_range * worst_range,
+                view_range,
+                camouflage,
+                max_foliage_bonus,
+            ),
+        )
+        self.assertIs(
+            None,
+            classify(
+                (worst_range + 0.01) ** 2,
+                view_range,
+                camouflage,
+                max_foliage_bonus,
+            ),
+        )
+        self.assertIs(
+            None,
+            classify(
+                clear_range * clear_range,
+                view_range,
+                camouflage,
+                max_foliage_bonus,
+            ),
+        )
+        self.assertIs(
+            False,
+            classify(
+                (clear_range + 0.01) ** 2,
+                view_range,
+                camouflage,
+                max_foliage_bonus,
+            ),
+        )
+
+    def test_contact_loop_consumes_foliage_bound_before_exact_query(self):
+        battle = BATTLE.read_text()
+        start = battle.index("def _offh_ai_refresh_contacts")
+        end = battle.index("def _offh_battle_sweep", start)
+        contact = battle[start:end]
+
+        bound = contact.index("_contact_spotting.foliage_visibility_bound(")
+        exact = contact.index("_offh_spot_detection_range(", bound)
+        self.assertLess(bound, exact)
+
     def test_movement_shot_and_old_multiplicative_devices_change_camo(self):
         still = self.spotting.effective_camouflage(
             0.12,

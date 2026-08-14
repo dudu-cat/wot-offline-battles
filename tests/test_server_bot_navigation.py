@@ -93,6 +93,88 @@ class ServerBotNavigationTests(unittest.TestCase):
         self.assertEqual("server_hold", resolved["nav_source"])
         self.assertEqual(0, self.resolver.diagnostics()["plans"])
 
+    def test_near_goal_raw_target_requires_clear_hazard_free_segment(self):
+        route = next(item for item in self.graph["routes"]["1"]
+                     if item["id"] == "lake_road")
+        start_world, goal_world = route["waypoints"][:2]
+
+        for segment_clear, has_hazard, returns_raw_goal in (
+                (True, False, True),
+                (False, False, False),
+                (True, True, False)):
+            with self.subTest(segment_clear=segment_clear,
+                              has_hazard=has_hazard):
+                resolver = BotPathResolver()
+                self.assertTrue(resolver.configure("07_lakeville", self.frame))
+                start = resolver._shared(
+                    (float(start_world[0]), 0.0, float(start_world[1])))
+                goal = resolver._shared(
+                    (float(goal_world[0]), 0.0, float(goal_world[1])))
+                self.assertLessEqual(
+                    math.hypot(goal_world[0] - start_world[0],
+                               goal_world[1] - start_world[1]),
+                    15.0,
+                )
+                order = {
+                    "id": 1, "team": 1, "combat_mode": "route",
+                    "route_id": route["id"], "route_index": 1,
+                    "route_anchor": self._dict(start),
+                    "move_position": self._dict(goal),
+                    "target_id": None, "throttle_override": None,
+                }
+                state = dict(self._dict(start), id=1, team=1, alive=True)
+
+                with mock.patch.object(
+                        resolver.grid, "segment_clear",
+                        return_value=segment_clear) as clear_probe, \
+                        mock.patch.object(
+                            resolver.grid, "segment_has_baked_hazard",
+                            return_value=has_hazard) as hazard_probe, \
+                        mock.patch.object(
+                            resolver.grid, "begin_plan",
+                            wraps=resolver.grid.begin_plan) as begin_plan:
+                    target, source = resolver._resolve_one(
+                        order, state, 4, 1.0)
+
+                self.assertEqual("server_hold", source)
+                clear_probe.assert_called()
+                if returns_raw_goal:
+                    self.assertEqual(goal, target)
+                    hazard_probe.assert_called_once()
+                    begin_plan.assert_not_called()
+                else:
+                    self.assertEqual(start, target)
+                    self.assertNotEqual(goal, target)
+                    begin_plan.assert_called_once()
+
+    def test_base_defense_path_identity_ignores_combat_target_changes(self):
+        base = self._shared(self.graph["bases"][0])
+        start = (base[0], base[1], base[2] + 80.0)
+        goal = base
+        first_order = {
+            "id": 11,
+            "team": 1,
+            "combat_mode": "base_defense",
+            "defense_base_id": "1:0",
+            "target_kind": "human",
+            "target_id": 7,
+            "move_position": self._dict(goal),
+            "throttle_override": None,
+        }
+        second_order = dict(first_order, target_id=8)
+        first_identity = self.resolver._path_identity(
+            first_order, self.resolver._world(goal)
+        )
+        second_identity = self.resolver._path_identity(
+            second_order, self.resolver._world(goal)
+        )
+
+        self.assertEqual(first_identity, second_identity)
+        self.assertEqual(
+            ("bot", 11, "base_defense", "1:0"),
+            first_identity[:-1],
+        )
+
     def test_missing_graph_fails_closed(self):
         resolver = BotPathResolver()
         with self.assertRaises(OSError):
@@ -128,6 +210,28 @@ class ServerBotNavigationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "checksum"):
                     resolver.configure("07_lakeville", self.frame)
                 self.assertFalse(resolver.active)
+
+    def test_stock_graph_requires_route_terminal_obb_clearance_proof(self):
+        for proof in (None, False):
+            with self.subTest(proof=proof):
+                graph = json.loads(json.dumps(self.graph))
+                if proof is None:
+                    graph["validation"].pop(
+                        "route_terminal_obb_clearance", None)
+                else:
+                    graph["validation"][
+                        "route_terminal_obb_clearance"] = proof
+                with self.assertRaisesRegex(
+                        ValueError, "route terminal.*clearance"):
+                    server_bot_navigation._validate_graph(
+                        graph, "07_lakeville")
+
+        graph = json.loads(json.dumps(self.graph))
+        graph["validation"]["route_terminal_obb_clearance"] = True
+        self.assertIs(
+            graph,
+            server_bot_navigation._validate_graph(graph, "07_lakeville"),
+        )
 
     def test_inactive_resolver_explicitly_requests_client_fallback(self):
         resolver = BotPathResolver()
@@ -265,7 +369,11 @@ class ServerBotNavigationTests(unittest.TestCase):
         state = dict(self._dict(start), id=1, team=2, alive=True)
         reached = False
 
-        with mock.patch.object(server_bot_navigation, "MAX_EXPANSIONS", 64):
+        # The structure-aware graph has a real local minimum on this leg.  A
+        # 2,048-node cap still forces one partial result from the original
+        # anchor, while leaving enough bounded work for the continuation from
+        # that safe endpoint to get around the ridge.
+        with mock.patch.object(server_bot_navigation, "MAX_EXPANSIONS", 2048):
             for tick in range(2400):
                 resolved = resolver.resolve(
                     [order], [state], 8, 1.0 + tick / 30.0)[1]

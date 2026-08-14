@@ -83,6 +83,63 @@ DIRECTIONS = (
     (-1, 1),  (0, 1),     (1, 1),
 )
 
+SPAWN_SLOTS_PER_TEAM = 15
+SPAWN_COLUMNS = (0, -1, 1, -2, 2, -3, 3, -4, 4)
+SPAWN_ROW_DEPTHS = (20.0, 32.0)
+SPAWN_LATERAL_SPACING = 14.0
+SPAWN_MAXIMUM_PROJECTION = 56.0
+SPAWN_MINIMUM_SPACING = 10.5
+CAPTURE_ROUTE_TERMINAL_RADIUS = 42.0
+CAPTURE_ROUTE_MAXIMUM_DETOUR = 64.0
+
+
+def representative_vehicle_chassis_envelope(client_root):
+    """Measure one conservative spawn OBB from every stock chassis visual."""
+    packages = os.path.join(os.path.abspath(client_root), "res", "packages")
+    package_names = sorted(
+        name for name in os.listdir(packages)
+        if name.startswith("vehicles_") and name.endswith(".pkg")
+    )
+    maximum_width = None
+    maximum_length = None
+    resources_scanned = 0
+    for package_name in package_names:
+        package_path = os.path.join(packages, package_name)
+        with zipfile.ZipFile(package_path, "r") as package:
+            for resource_name in package.namelist():
+                if not resource_name.endswith("/collision/Chassis.visual"):
+                    continue
+                root = read_packed_xml(package.read(resource_name))
+                bounds_value = _packed_child(root, "boundingBox", False)
+                if bounds_value is None or bounds_value.value_type != TYPE_ELEMENT:
+                    raise ValueError("%s has no chassis boundingBox" % resource_name)
+                bounds = bounds_value.value
+                minimum = _packed_vector(_packed_child(bounds, "min"))
+                maximum = _packed_vector(_packed_child(bounds, "max"))
+                half_width = max(abs(minimum[0]), abs(maximum[0]))
+                half_length = max(abs(minimum[2]), abs(maximum[2]))
+                if (not math.isfinite(half_width) or
+                        not math.isfinite(half_length) or
+                        half_width <= 0.0 or half_length <= 0.0):
+                    raise ValueError("%s has invalid chassis bounds" % resource_name)
+                width_record = (float(half_width), resource_name)
+                length_record = (float(half_length), resource_name)
+                if maximum_width is None or width_record[0] > maximum_width[0]:
+                    maximum_width = width_record
+                if maximum_length is None or length_record[0] > maximum_length[0]:
+                    maximum_length = length_record
+                resources_scanned += 1
+    if maximum_width is None or maximum_length is None:
+        raise ValueError("pinned client has no stock chassis collision bounds")
+    return {
+        "half_width": maximum_width[0],
+        "half_length": maximum_length[0],
+        "width_source": maximum_width[1],
+        "length_source": maximum_length[1],
+        "resources_scanned": resources_scanned,
+        "source": "0.8.2 collision chassis visual boundingBox",
+    }
+
 def _load_tactical_maps():
     """Load the Python-2-compatible data modules without importing the game."""
     package_dir = os.path.join(
@@ -337,11 +394,12 @@ def soft_destructible_models(data):
     """Return models a tank can push through instead of routing around."""
     root = read_packed_xml(data)
     result = set()
-    # Structures are the module-based crushable houses from
-    # destructibles.xml, not arbitrary static map buildings. Keeping them in
-    # the obstacle raster made A* route around spawn villages even though the
-    # runtime collision path correctly destroys them on contact.
-    for category_name in ("fragiles", "fallingAtoms", "structures"):
+    # Module-based structures are not unconditionally crushable. Retail gates
+    # every contacted module by the vehicle's mass, speed, scale, and module
+    # health, so a shared route graph must conservatively route around them.
+    # Fragiles and falling atoms remain local contact obstacles that tanks can
+    # clear without turning a building or rubble face into fake flat terrain.
+    for category_name in ("fragiles", "fallingAtoms"):
         category_value = _packed_child(root, category_name, False)
         if category_value is None or category_value.value_type != TYPE_ELEMENT:
             continue
@@ -699,6 +757,7 @@ class ModelLibrary(object):
     def __init__(self, resources):
         self.resources = resources
         self.cache = {}
+        self.conservative_fallbacks = set()
 
     def load(self, model_name):
         if model_name in self.cache:
@@ -746,8 +805,16 @@ class ModelLibrary(object):
                 indices_name = _packed_text(indices_value)
                 if vertices_name not in sections or indices_name not in sections:
                     continue
-                vertices = _vertex_positions(sections[vertices_name])
-                primitives, groups = _index_groups(sections[indices_name])
+                try:
+                    vertices = _vertex_positions(sections[vertices_name])
+                    primitives, groups = _index_groups(sections[indices_name])
+                except (ValueError, struct.error):
+                    # Some stock scenery (notably decorative tank wrecks) uses
+                    # skinned render-only vertex formats. Its authored visual
+                    # bounds remain a conservative collision footprint, while
+                    # BSP2 below remains independently usable when present.
+                    self.conservative_fallbacks.add(model_name)
+                    continue
                 points.extend((vertex[0], vertex[2]) for vertex in vertices)
                 group_values = _packed_children(geometry_value.value, "primitiveGroup")
                 group_indices = []
@@ -765,7 +832,8 @@ class ModelLibrary(object):
                         if max(primitive) >= len(group_vertices):
                             continue
                         render_triangles.append(tuple(group_vertices[index] for index in primitive))
-            if "bsp2" in sections and "bsp2_materials" in sections:
+            has_bsp = "bsp2" in sections and "bsp2_materials" in sections
+            if has_bsp:
                 triangles = _bsp_triangles(
                     sections["bsp2"],
                     _bsp_material_names(sections["bsp2_materials"]),
@@ -773,9 +841,11 @@ class ModelLibrary(object):
                 )
             else:
                 triangles = render_triangles
+                if model_name in self.conservative_fallbacks:
+                    triangles = []
         else:
             triangles = []
-        if not points:
+        if not points or model_name in self.conservative_fallbacks:
             points = (
                 (minimum[0], minimum[2]), (minimum[0], maximum[2]),
                 (maximum[0], maximum[2]), (maximum[0], minimum[2]),
@@ -838,11 +908,13 @@ def _distance_to_polygon(point, polygon):
 
 
 class ObstacleField(object):
-    def __init__(self, resources, map_name, raster_size=1.0, soft_models=None):
+    def __init__(self, resources, map_name, raster_size=1.0, soft_models=None,
+                 retain_local_obstacles=False):
         self.resources = resources
         self.map_name = map_name
         self.raster_size = float(raster_size)
         self.soft_models = set(soft_models or ())
+        self.retain_local_obstacles = bool(retain_local_obstacles)
         self.cells = {}
         self.surface_cells = {}
         self.instance_count = 0
@@ -1027,7 +1099,8 @@ class ObstacleField(object):
                 # cell. Explicit destructibles were already skipped above.
                 if _is_local_obstacle(shape):
                     self.local_instance_count += 1
-                    continue
+                    if not self.retain_local_obstacles:
+                        continue
                 self.instance_count += 1
                 if shape.triangles:
                     transformed_triangles = [
@@ -1569,7 +1642,147 @@ def _route_geometry_issue(waypoints):
     return None
 
 
-def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
+def _capture_terminal_pose_clear(graph, previous, node, obstacles,
+                                 vehicle_envelope):
+    half_width = float(vehicle_envelope["half_width"])
+    half_length = float(vehicle_envelope["half_length"])
+    previous_x, previous_z = _node_point(graph, previous)
+    x, z = _node_point(graph, node)
+    yaw = math.atan2(x - previous_x, z - previous_z)
+    ground_y = float(graph["heights_mm"][node]) / 1000.0
+    return (_spawn_fatal_halo_clear(
+        graph, x, z, yaw, half_width, half_length) and
+        not _spawn_obstacle_obb_blocked(
+            obstacles, x, z, ground_y, yaw, half_width, half_length))
+
+
+def _capture_terminal_detour(graph, path, enemy_base, obstacles,
+                             vehicle_envelope, allowed_nodes=None):
+    """Find the shortest directed graph detour to a safe capture pose."""
+    first_inside = None
+    for path_index, node in enumerate(path):
+        x, z = _node_point(graph, node)
+        if math.hypot(x - float(enemy_base[0]),
+                      z - float(enemy_base[1])) <= \
+                CAPTURE_ROUTE_TERMINAL_RADIUS:
+            first_inside = path_index
+            break
+    if first_inside is None:
+        return ()
+
+    anchor_index = None
+    for path_index in range(first_inside - 1, 0, -1):
+        if _capture_terminal_pose_clear(
+                graph, path[path_index - 1], path[path_index], obstacles,
+                vehicle_envelope):
+            anchor_index = path_index
+            break
+    if anchor_index is None:
+        return ()
+
+    width = int(graph["width"])
+    height = int(graph["height"])
+    cell_size = float(graph["cell_size"])
+    start_state = (path[anchor_index - 1], path[anchor_index])
+    if (allowed_nodes is not None and
+            start_state[1] not in allowed_nodes):
+        return ()
+    start_x, start_z = _node_point(graph, start_state[1])
+    start_heuristic = max(
+        0.0,
+        math.hypot(start_x - float(enemy_base[0]),
+                   start_z - float(enemy_base[1])) -
+        CAPTURE_ROUTE_TERMINAL_RADIUS,
+    )
+    queue = [(start_heuristic, 0.0, start_state)]
+    costs = {start_state: 0.0}
+    parents = {}
+    terminal_state = None
+    while queue:
+        unused_priority, cost, state = heapq.heappop(queue)
+        if cost != costs.get(state):
+            continue
+        previous, current = state
+        current_x, current_z = _node_point(graph, current)
+        if (math.hypot(current_x - float(enemy_base[0]),
+                       current_z - float(enemy_base[1])) <=
+                CAPTURE_ROUTE_TERMINAL_RADIUS and
+                _capture_terminal_pose_clear(
+                    graph, previous, current, obstacles, vehicle_envelope)):
+            terminal_state = state
+            break
+        cell_x = current % width
+        cell_z = current // width
+        mask = int(graph["links"][current])
+        for direction_index, (dx, dz) in enumerate(DIRECTIONS):
+            if not (mask & (1 << direction_index)):
+                continue
+            neighbour_x = cell_x + dx
+            neighbour_z = cell_z + dz
+            if (neighbour_x < 0 or neighbour_x >= width or
+                    neighbour_z < 0 or neighbour_z >= height):
+                continue
+            neighbour = neighbour_z * width + neighbour_x
+            if (allowed_nodes is not None and
+                    neighbour not in allowed_nodes):
+                continue
+            next_state = (current, neighbour)
+            next_cost = cost + cell_size * (
+                math.sqrt(2.0) if dx and dz else 1.0)
+            if next_cost > CAPTURE_ROUTE_MAXIMUM_DETOUR:
+                continue
+            if next_cost >= costs.get(next_state, float("inf")):
+                continue
+            costs[next_state] = next_cost
+            parents[next_state] = state
+            neighbour_x_world, neighbour_z_world = _node_point(
+                graph, neighbour)
+            heuristic = max(
+                0.0,
+                math.hypot(neighbour_x_world - float(enemy_base[0]),
+                           neighbour_z_world - float(enemy_base[1])) -
+                CAPTURE_ROUTE_TERMINAL_RADIUS,
+            )
+            heapq.heappush(
+                queue, (next_cost + heuristic, next_cost, next_state))
+    if terminal_state is None:
+        return ()
+
+    states = [terminal_state]
+    while states[-1] != start_state:
+        states.append(parents[states[-1]])
+    states.reverse()
+    detour = tuple(state[1] for state in states)
+    return tuple(path[:anchor_index]) + detour
+
+
+def _capture_terminal_path(graph, path, enemy_base, obstacles,
+                           vehicle_envelope, allowed_nodes=None):
+    """Stop one attack lane at a full-hull-clear point inside the cap circle."""
+    if len(path) < 2:
+        raise ValueError("capture route has no approach segment")
+    half_width = float(vehicle_envelope["half_width"])
+    half_length = float(vehicle_envelope["half_length"])
+    for path_index in range(1, len(path)):
+        node = path[path_index]
+        x, z = _node_point(graph, node)
+        if math.hypot(x - float(enemy_base[0]),
+                      z - float(enemy_base[1])) > CAPTURE_ROUTE_TERMINAL_RADIUS:
+            continue
+        if _capture_terminal_pose_clear(
+                graph, path[path_index - 1], node, obstacles,
+                vehicle_envelope):
+            return tuple(path[:path_index + 1])
+    detour = _capture_terminal_detour(
+        graph, path, enemy_base, obstacles, vehicle_envelope,
+        allowed_nodes=allowed_nodes)
+    if detour:
+        return detour
+    raise ValueError("capture route has no full-hull-clear terminal node")
+
+
+def bake_tactical_routes(graph, map_config, maximum_projection=180.0,
+                         terminal_obstacles=None, vehicle_envelope=None):
     """Project tactical intent onto the retained graph and emit safe routes.
 
     Hand-authored points select a lane, but they are not trusted locomotion
@@ -1608,6 +1821,7 @@ def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
     else:
         graph["bake"].pop("dry_only_routes", None)
     for route_record in map_config.get("routes", ()):
+        capture_required_nodes = set()
         source_points = _oriented_route_points(route_record, map_config)
         projected = []
         for point in source_points:
@@ -1672,6 +1886,14 @@ def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
                 else:
                     full_path.extend(segment)
             full_path = tuple(full_path)
+            if (not bool(route_record.get("terminal_hold", False)) and
+                    terminal_obstacles is not None and
+                    vehicle_envelope is not None):
+                full_path = _capture_terminal_path(
+                    graph, full_path, map_config["bases"][2 - int(
+                        route_record["team"])], terminal_obstacles,
+                    vehicle_envelope, allowed_nodes=dry_route_nodes)
+                capture_required_nodes = set((full_path[-2],))
             hold_nodes = set()
             for point_index, point in enumerate(source_points):
                 if not bool(point[2]):
@@ -1692,7 +1914,8 @@ def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
                 ))
             waypoints = _sample_route_path(
                 graph, full_path, hold_nodes, 16,
-                set(projected[index] for index in gate_indexes)
+                set(projected[index] for index in gate_indexes) |
+                capture_required_nodes
             )
             detour = _route_maximum_detour(
                 graph, waypoints, allowed_nodes=dry_route_nodes)
@@ -1706,6 +1929,14 @@ def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
                     allowed_nodes=dry_route_nodes)
                 if not full_path:
                     raise ValueError("soft tactical corridor cannot connect its objectives")
+                if (not bool(route_record.get("terminal_hold", False)) and
+                        terminal_obstacles is not None and
+                        vehicle_envelope is not None):
+                    full_path = _capture_terminal_path(
+                        graph, full_path, map_config["bases"][2 - int(
+                            route_record["team"])], terminal_obstacles,
+                        vehicle_envelope, allowed_nodes=dry_route_nodes)
+                    capture_required_nodes = set((full_path[-2],))
                 # Once a hard gate proved geometrically unsafe, do not re-add
                 # nearby hold nodes as mandatory samples. They do not alter the
                 # graph path, but can make the 16-point protocol polyline double
@@ -1713,7 +1944,8 @@ def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
                 hold_nodes = set()
                 waypoints = _sample_route_path(
                     graph, full_path, hold_nodes, 16,
-                    (projected[0], projected[-1]),
+                    set((projected[0], projected[-1])) |
+                    capture_required_nodes,
                 )
                 route_key = "%d:%s" % (
                     int(route_record["team"]), route_record["id"])
@@ -1737,6 +1969,9 @@ def bake_tactical_routes(graph, map_config, maximum_projection=180.0):
             "waypoints": waypoints,
         })
     graph["bake"]["maximum_route_projection"] = round(maximum_offset, 3)
+    if terminal_obstacles is not None and vehicle_envelope is not None:
+        graph["bake"]["capture_route_terminal_radius"] = \
+            CAPTURE_ROUTE_TERMINAL_RADIUS
     graph["bake"]["soft_route_fallbacks"] = soft_fallbacks
     graph["bake"]["soft_route_fallback_causes"] = soft_fallback_causes
     return routes
@@ -1925,7 +2160,289 @@ def _has_safe_edge_clearance(terrain, obstacles, x, z, ground_y):
     return True
 
 
-def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
+def _spawn_obstacle_obb_blocked(obstacles, x, z, ground_y, yaw, half_width,
+                                half_length):
+    sine, cosine = math.sin(float(yaw)), math.cos(float(yaw))
+    extent_x = abs(sine) * half_length + abs(cosine) * half_width
+    extent_z = abs(cosine) * half_length + abs(sine) * half_width
+    cell_radius = float(obstacles.raster_size) * math.sqrt(2.0) * 0.5
+    minimum_cell_x = int(math.floor(
+        (float(x) - extent_x - cell_radius) / obstacles.raster_size))
+    maximum_cell_x = int(math.floor(
+        (float(x) + extent_x + cell_radius) / obstacles.raster_size))
+    minimum_cell_z = int(math.floor(
+        (float(z) - extent_z - cell_radius) / obstacles.raster_size))
+    maximum_cell_z = int(math.floor(
+        (float(z) + extent_z + cell_radius) / obstacles.raster_size))
+    vehicle_minimum_y = float(ground_y) + VEHICLE_GROUND_CLEARANCE
+    vehicle_maximum_y = float(ground_y) + VEHICLE_CLEARANCE_HEIGHT
+    for cell_x in range(minimum_cell_x, maximum_cell_x + 1):
+        sample_x = (cell_x + 0.5) * obstacles.raster_size
+        delta_x = sample_x - float(x)
+        for cell_z in range(minimum_cell_z, maximum_cell_z + 1):
+            interval = obstacles.cells.get((cell_x, cell_z))
+            if interval is None:
+                continue
+            if interval[1] < vehicle_minimum_y or interval[0] > vehicle_maximum_y:
+                continue
+            sample_z = (cell_z + 0.5) * obstacles.raster_size
+            delta_z = sample_z - float(z)
+            forward = delta_x * sine + delta_z * cosine
+            lateral = delta_x * cosine - delta_z * sine
+            outside_forward = max(0.0, abs(forward) - half_length)
+            outside_lateral = max(0.0, abs(lateral) - half_width)
+            if math.hypot(outside_forward, outside_lateral) <= cell_radius:
+                return True
+    return False
+
+
+def _spawn_terrain_footprint_clear(terrain, x, z, ground_y, yaw, half_width,
+                                   half_length):
+    """Verify raw terrain support under one conservative spawn footprint."""
+    sine, cosine = math.sin(float(yaw)), math.cos(float(yaw))
+    centre_y = float(ground_y)
+    for forward_factor, lateral_factor in (
+            (0.0, 0.0),
+            (1.0, 0.0), (-1.0, 0.0),
+            (0.0, 1.0), (0.0, -1.0),
+            (1.0, 1.0), (1.0, -1.0),
+            (-1.0, 1.0), (-1.0, -1.0)):
+        forward = forward_factor * float(half_length)
+        lateral = lateral_factor * float(half_width)
+        sample_x = float(x) + sine * forward + cosine * lateral
+        sample_z = float(z) + cosine * forward - sine * lateral
+        sample_y = terrain.height(sample_x, sample_z)
+        if sample_y is None:
+            return False
+        if terrain.water_depth(sample_x, sample_z, sample_y) > WATER_DEPTH_LIMIT:
+            return False
+        distance = math.hypot(sample_x - float(x), sample_z - float(z))
+        if (distance > 0.0 and
+                abs(float(sample_y) - centre_y) > distance * MAX_GRADE + 0.02):
+            return False
+    return True
+
+
+def _spawn_fatal_halo_clear(graph, x, z, yaw, half_width, half_length):
+    """Reject water/cliff cells touched by the oriented spawn footprint."""
+    origin_x, origin_z = graph["origin"]
+    cell_size = float(graph["cell_size"])
+    width = int(graph["width"])
+    height = int(graph["height"])
+    hazards = graph["hazards"]
+    sine, cosine = math.sin(float(yaw)), math.cos(float(yaw))
+    fatal_mask = HAZARD_WATER | HAZARD_EDGE
+    for forward_factor, lateral_factor in (
+            (0.0, 0.0),
+            (1.0, 0.0), (-1.0, 0.0),
+            (0.0, 1.0), (0.0, -1.0),
+            (1.0, 1.0), (1.0, -1.0),
+            (-1.0, 1.0), (-1.0, -1.0)):
+        forward = forward_factor * float(half_length)
+        lateral = lateral_factor * float(half_width)
+        sample_x = float(x) + sine * forward + cosine * lateral
+        sample_z = float(z) + cosine * forward - sine * lateral
+        cell_x = int(round((sample_x - float(origin_x)) / cell_size))
+        cell_z = int(round((sample_z - float(origin_z)) / cell_size))
+        if cell_x < 0 or cell_x >= width or cell_z < 0 or cell_z >= height:
+            return False
+        if int(hazards[cell_z * width + cell_x]) & fatal_mask:
+            return False
+    return True
+
+
+def _spawn_obbs_overlap(first, second, half_width, half_length):
+    first_yaw = float(first[3])
+    second_yaw = float(second[3])
+    first_forward = (math.sin(first_yaw), math.cos(first_yaw))
+    first_right = (math.cos(first_yaw), -math.sin(first_yaw))
+    second_forward = (math.sin(second_yaw), math.cos(second_yaw))
+    second_right = (math.cos(second_yaw), -math.sin(second_yaw))
+    delta = (float(second[0]) - float(first[0]),
+             float(second[2]) - float(first[2]))
+    for axis in (first_forward, first_right, second_forward, second_right):
+        centre_distance = abs(delta[0] * axis[0] + delta[1] * axis[1])
+        first_radius = (
+            half_length * abs(first_forward[0] * axis[0] +
+                              first_forward[1] * axis[1]) +
+            half_width * abs(first_right[0] * axis[0] +
+                             first_right[1] * axis[1]))
+        second_radius = (
+            half_length * abs(second_forward[0] * axis[0] +
+                              second_forward[1] * axis[1]) +
+            half_width * abs(second_right[0] * axis[0] +
+                             second_right[1] * axis[1]))
+        if centre_distance >= first_radius + second_radius:
+            return False
+    return True
+
+
+def _bake_spawn_formations(graph, anchors, map_name, terrain, obstacles,
+                           vehicle_envelope):
+    if len(anchors) != 2:
+        raise ValueError("%s: two CTF spawn anchors are required" % map_name)
+    half_width = float(vehicle_envelope["half_width"])
+    half_length = float(vehicle_envelope["half_length"])
+    origin_x, origin_z = graph["origin"]
+    width = int(graph["width"])
+    cell_size = float(graph["cell_size"])
+    heights = graph["heights_mm"]
+    hazards = graph["hazards"]
+    links = graph["links"]
+    nodes = []
+    for index, height in enumerate(heights):
+        if (height is None or int(hazards[index]) != 0 or
+                bin(int(links[index])).count("1") < 3):
+            continue
+        nodes.append((
+            index,
+            float(origin_x) + (index % width) * cell_size,
+            float(height) / 1000.0,
+            float(origin_z) + (index // width) * cell_size,
+        ))
+    if not nodes:
+        raise ValueError("%s: no open spawn nodes exist" % map_name)
+
+    formations = {"1": [], "2": []}
+    projections = []
+    all_selected = []
+    for team in (1, 2):
+        anchor_x, anchor_z = anchors[team - 1]
+        enemy_x, enemy_z = anchors[2 - team]
+        delta_x = float(enemy_x) - float(anchor_x)
+        delta_z = float(enemy_z) - float(anchor_z)
+        if abs(delta_x) + abs(delta_z) < 0.001:
+            raise ValueError("%s: CTF spawn anchors overlap" % map_name)
+        yaw = math.atan2(delta_x, delta_z)
+        selected = []
+        for row_depth in SPAWN_ROW_DEPTHS:
+            for column in SPAWN_COLUMNS:
+                if len(selected) >= SPAWN_SLOTS_PER_TEAM:
+                    break
+                lateral = float(column) * SPAWN_LATERAL_SPACING
+                desired_x = (float(anchor_x) + math.sin(yaw) * row_depth +
+                             math.cos(yaw) * lateral)
+                desired_z = (float(anchor_z) + math.cos(yaw) * row_depth -
+                             math.sin(yaw) * lateral)
+                candidates = sorted(
+                    nodes,
+                    key=lambda value: (
+                        (value[1] - desired_x) ** 2 +
+                        (value[3] - desired_z) ** 2,
+                        -bin(int(links[value[0]])).count("1"), value[0]))
+                chosen = None
+                chosen_projection = None
+                for candidate in candidates:
+                    projection = math.hypot(candidate[1] - desired_x,
+                                            candidate[3] - desired_z)
+                    if projection > SPAWN_MAXIMUM_PROJECTION:
+                        break
+                    if any(math.hypot(candidate[1] - other[1],
+                                      candidate[3] - other[3]) <
+                           SPAWN_MINIMUM_SPACING for other in selected):
+                        continue
+                    pose = (candidate[1], candidate[2], candidate[3], yaw)
+                    if not _spawn_terrain_footprint_clear(
+                            terrain, pose[0], pose[2], pose[1], pose[3],
+                            half_width, half_length):
+                        continue
+                    if not _spawn_fatal_halo_clear(
+                            graph, pose[0], pose[2], pose[3],
+                            half_width, half_length):
+                        continue
+                    if _spawn_obstacle_obb_blocked(
+                            obstacles, pose[0], pose[2], pose[1], pose[3],
+                            half_width, half_length):
+                        continue
+                    if any(_spawn_obbs_overlap(
+                            pose, (other[1], other[2], other[3], yaw),
+                            half_width, half_length) for other in selected):
+                        continue
+                    chosen = candidate
+                    chosen_projection = projection
+                    break
+                if chosen is None:
+                    raise ValueError(
+                        "%s: team %d slot %d has no validated spawn node "
+                        "within %.1f m" %
+                        (map_name, team, len(selected),
+                         SPAWN_MAXIMUM_PROJECTION))
+                selected.append(chosen)
+                all_selected.append((team, len(selected) - 1, chosen))
+                projections.append(chosen_projection)
+                formations[str(team)].append([
+                    round(chosen[1], 4), round(chosen[2], 4),
+                    round(chosen[3], 4), round(yaw, 6),
+                ])
+            if len(selected) >= SPAWN_SLOTS_PER_TEAM:
+                break
+        if len(selected) != SPAWN_SLOTS_PER_TEAM:
+            raise ValueError("%s: team %d formation has only %d slots" %
+                             (map_name, team, len(selected)))
+
+    distances = []
+    other_team_distances = []
+    records = []
+    for team in (1, 2):
+        for slot, pose in enumerate(formations[str(team)]):
+            records.append((team, slot, pose))
+            if not _spawn_terrain_footprint_clear(
+                    terrain, pose[0], pose[2], pose[1], pose[3],
+                    half_width, half_length):
+                raise ValueError(
+                    "%s: team %d slot %d lacks terrain footprint support" %
+                    (map_name, team, slot))
+            if not _spawn_fatal_halo_clear(
+                    graph, pose[0], pose[2], pose[3],
+                    half_width, half_length):
+                raise ValueError(
+                    "%s: team %d slot %d touches fatal terrain" %
+                    (map_name, team, slot))
+            if _spawn_obstacle_obb_blocked(
+                    obstacles, pose[0], pose[2], pose[1], pose[3],
+                    half_width, half_length):
+                raise ValueError("%s: team %d slot %d intersects scenery" %
+                                 (map_name, team, slot))
+    for index, first in enumerate(records):
+        for second in records[index + 1:]:
+            distance = math.hypot(first[2][0] - second[2][0],
+                                  first[2][2] - second[2][2])
+            if first[0] == second[0]:
+                distances.append(distance)
+            else:
+                other_team_distances.append(distance)
+            if _spawn_obbs_overlap(first[2], second[2],
+                                   half_width, half_length):
+                raise ValueError("%s: spawn vehicle OBBs overlap" % map_name)
+    minimum_spacing = min(distances)
+    minimum_team_separation = min(other_team_distances)
+    if minimum_spacing < SPAWN_MINIMUM_SPACING:
+        raise ValueError("%s: baked spawn slots are only %.2f m apart" %
+                         (map_name, minimum_spacing))
+    if minimum_team_separation < 80.0:
+        raise ValueError("%s: opposing formations are only %.2f m apart" %
+                         (map_name, minimum_team_separation))
+    return formations, {
+        "spawn_slots_per_team": SPAWN_SLOTS_PER_TEAM,
+        "spawn_minimum_spacing_metres": round(minimum_spacing, 3),
+        "spawn_minimum_team_separation_metres": round(
+            minimum_team_separation, 3),
+        "spawn_maximum_projection_metres": round(max(projections), 3),
+        "spawn_compiled_bsp_obb_clearance": True,
+        "spawn_pairwise_obb_clearance": True,
+        "spawn_terrain_footprint_clearance": True,
+        "spawn_vehicle_half_width_metres": round(half_width, 6),
+        "spawn_vehicle_half_length_metres": round(half_length, 6),
+        "spawn_vehicle_bounds_source": vehicle_envelope["source"],
+        "spawn_vehicle_width_source": vehicle_envelope["width_source"],
+        "spawn_vehicle_length_source": vehicle_envelope["length_source"],
+        "spawn_vehicle_resources_scanned": int(
+            vehicle_envelope["resources_scanned"]),
+    }
+
+
+def bake_graph(resources, map_name, cell_size=4.0, soft_models=None,
+               vehicle_envelope=None):
     map_config = MAPS[map_name]
     bounds = _expanded_bounds(map_config, cell_size)
     terrain = Terrain(resources, map_name)
@@ -2069,8 +2586,32 @@ def bake_graph(resources, map_name, cell_size=4.0, soft_models=None):
         },
     }
     retain_base_component(graph, map_config)
-    graph["routes"] = bake_tactical_routes(graph, map_config)
+    spawn_obstacles = None
+    if vehicle_envelope is not None:
+        spawn_obstacles = ObstacleField(
+            resources, map_name, soft_models=(), retain_local_obstacles=True)
+    graph["routes"] = bake_tactical_routes(
+        graph, map_config, terminal_obstacles=spawn_obstacles,
+        vehicle_envelope=vehicle_envelope)
     graph["validation"] = validate_graph(graph, map_config)
+    if vehicle_envelope is not None:
+        formations, spawn_validation = _bake_spawn_formations(
+            graph, map_config["bases"], map_name, terrain, spawn_obstacles,
+            vehicle_envelope)
+        graph["spawn_formations"] = formations
+        graph["validation"].update(spawn_validation)
+        graph["validation"]["route_terminal_obb_clearance"] = True
+        graph["bake"]["spawn_obstacle_model_instances"] = \
+            spawn_obstacles.instance_count
+        graph["bake"]["spawn_obstacle_raster_cells"] = \
+            len(spawn_obstacles.cells)
+        graph["bake"]["spawn_obstacle_conservative_fallback_models"] = \
+            len(spawn_obstacles.model_library.conservative_fallbacks)
+        graph["bake"]["spawn_obstacle_skipped_models"] = \
+            spawn_obstacles.skipped
+        if spawn_obstacles.skipped:
+            raise ValueError("%s: spawn obstacle bake skipped %d model(s)" %
+                             (map_name, spawn_obstacles.skipped))
     return graph
 
 
@@ -2152,6 +2693,7 @@ def main(argv=None):
             parser.error("required client resource not found: %s" % path)
     with open(destructibles_path, "rb") as destructibles_file:
         soft_models = soft_destructible_models(destructibles_file.read())
+    vehicle_envelope = representative_vehicle_chassis_envelope(args.client)
 
     failures = []
     staging_dir = tempfile.mkdtemp(prefix="offhangar-navgraphs-") if args.all else None
@@ -2172,7 +2714,8 @@ def main(argv=None):
                   if staging_dir is not None else args.output or default_output(map_name))
         resources = PackageResources((map_package, shared_package))
         try:
-            graph = bake_graph(resources, map_name, args.cell_size, soft_models)
+            graph = bake_graph(resources, map_name, args.cell_size, soft_models,
+                               vehicle_envelope)
         except Exception as error:
             failures.append((map_name, str(error)))
             print("FAILED %s: %s" % (map_name, error))

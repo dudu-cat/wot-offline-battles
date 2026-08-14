@@ -1,11 +1,13 @@
 import importlib.util
 import json
+import math
 import struct
 import tempfile
 import types
 import unittest
 import zlib
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +35,31 @@ def rgba_png(width, height, pixel):
             png_chunk(b"IDAT", zlib.compress(raw)) + png_chunk(b"IEND", b""))
 
 
+def destructibles_fixture(baker):
+    def text(value):
+        return types.SimpleNamespace(
+            value_type=baker.TYPE_STRING,
+            value=value.encode("utf-8"),
+        )
+
+    def element(children):
+        return types.SimpleNamespace(
+            value_type=baker.TYPE_ELEMENT,
+            value=types.SimpleNamespace(children=children),
+        )
+
+    categories = []
+    for category, filename in (
+        ("fragiles", "fence.model"),
+        ("fallingAtoms", "pole.model"),
+        ("structures", "house.model"),
+        ("trees", "tree.spt"),
+    ):
+        entry = element([(b"filename", text(filename))])
+        categories.append((category.encode("ascii"), element([(b"entry", entry)])))
+    return types.SimpleNamespace(children=categories)
+
+
 class NavigationBakerTest(unittest.TestCase):
     def setUp(self):
         self.baker = load_baker()
@@ -50,39 +77,84 @@ class NavigationBakerTest(unittest.TestCase):
         self.assertAlmostEqual(-6.482, chunk.values[0][0], places=3)
         self.assertAlmostEqual(-6.482, chunk.sample(50.0, 50.0), places=3)
 
-    def test_soft_destructibles_include_module_based_structures(self):
-        def text(value):
-            return types.SimpleNamespace(
-                value_type=self.baker.TYPE_STRING,
-                value=value.encode("utf-8"),
-            )
-
-        def element(children):
-            return types.SimpleNamespace(
-                value_type=self.baker.TYPE_ELEMENT,
-                value=types.SimpleNamespace(children=children),
-            )
-
-        categories = []
-        for category, filename in (
-            ("fragiles", "fence.model"),
-            ("fallingAtoms", "pole.model"),
-            ("structures", "house.model"),
-            ("trees", "tree.spt"),
-        ):
-            entry = element([(b"filename", text(filename))])
-            categories.append((category.encode("ascii"), element([(b"entry", entry)])))
-        root = types.SimpleNamespace(children=categories)
+    def test_route_soft_destructibles_exclude_structures_without_crush_proof(self):
         original = self.baker.read_packed_xml
-        self.baker.read_packed_xml = lambda unused: root
+        self.baker.read_packed_xml = lambda unused: destructibles_fixture(
+            self.baker)
         try:
             models = self.baker.soft_destructible_models(b"fixture")
         finally:
             self.baker.read_packed_xml = original
 
-        self.assertEqual(
-            {"fence.model", "pole.model", "house.model"}, models
+        self.assertEqual({"fence.model", "pole.model"}, models)
+
+    def test_structure_blocks_exact_corridor_without_runtime_crush_proof(self):
+        original_xml = self.baker.read_packed_xml
+        self.baker.read_packed_xml = lambda unused: destructibles_fixture(
+            self.baker)
+        try:
+            soft_models = self.baker.soft_destructible_models(b"destructibles")
+        finally:
+            self.baker.read_packed_xml = original_xml
+
+        def value(value_type, value):
+            return types.SimpleNamespace(value_type=value_type, value=value)
+
+        model = types.SimpleNamespace(children=[
+            (b"resource", value(self.baker.TYPE_STRING, b"house.model")),
+            (b"transform", value(
+                self.baker.TYPE_VECTOR,
+                struct.pack("<12f", 1.0, 0.0, 0.0,
+                            0.0, 1.0, 0.0,
+                            0.0, 0.0, 1.0,
+                            0.0, 0.0, 0.0),
+            )),
+        ])
+        chunk = types.SimpleNamespace(children=[
+            (b"model", value(self.baker.TYPE_ELEMENT, model)),
+        ])
+
+        class Resources(object):
+            @staticmethod
+            def iter_names(suffix=None, prefix=None):
+                return iter(("spaces/31_airfield/00000000o.chunk",))
+
+            @staticmethod
+            def read(unused_name):
+                return b"chunk"
+
+        wall = self.baker.ModelShape(
+            ((-0.2, -2.0), (0.2, -2.0), (0.2, 2.0), (-0.2, 2.0)),
+            (((0.0, 0.0, -2.0), (0.0, 3.0, -2.0), (0.0, 3.0, 2.0)),
+             ((0.0, 0.0, -2.0), (0.0, 3.0, 2.0), (0.0, 0.0, 2.0))),
+            (-0.2, 0.0, -2.0),
+            (0.2, 3.0, 2.0),
+            "house.model",
         )
+        original_load = self.baker.ModelLibrary.load
+        self.baker.read_packed_xml = lambda unused: chunk
+        self.baker.ModelLibrary.load = lambda unused_library, unused_name: wall
+        try:
+            obstacles = self.baker.ObstacleField(
+                Resources(), "31_airfield", raster_size=0.5,
+                soft_models=soft_models,
+            )
+        finally:
+            self.baker.ModelLibrary.load = original_load
+            self.baker.read_packed_xml = original_xml
+
+        class Terrain(object):
+            @staticmethod
+            def height(unused_x, unused_z):
+                return 0.0
+
+            @staticmethod
+            def water_depth(unused_x, unused_z, unused_ground):
+                return 0.0
+
+        self.assertFalse(self.baker._segment_clear(
+            Terrain(), obstacles, (-4.0, 0.0, 0.0), (4.0, 0.0, 0.0)
+        ))
 
     def test_height_chunk_uses_all_four_png_bytes_above_int16_range(self):
         height = 205231
@@ -109,6 +181,72 @@ class NavigationBakerTest(unittest.TestCase):
 
         self.assertEqual(1, len(solid))
         self.assertEqual([], ignored)
+
+    def test_unsupported_render_vertices_use_conservative_visual_bounds(self):
+        class Resources(object):
+            @staticmethod
+            def read(name):
+                return b"fixture"
+
+            @staticmethod
+            def contains(name):
+                return name.endswith(".primitives")
+
+        def value(value_type, value):
+            return types.SimpleNamespace(value_type=value_type, value=value)
+
+        model = types.SimpleNamespace(children=[
+            (b"nodelessVisual", value(self.baker.TYPE_STRING, b"wreck")),
+        ])
+        bounding = types.SimpleNamespace(children=[
+            (b"min", value(self.baker.TYPE_VECTOR,
+                            struct.pack("<3f", -2.0, 0.0, -4.0))),
+            (b"max", value(self.baker.TYPE_VECTOR,
+                            struct.pack("<3f", 2.0, 2.0, 4.0))),
+        ])
+        geometry = types.SimpleNamespace(children=[
+            (b"vertices", value(self.baker.TYPE_STRING, b"vertices")),
+            (b"primitive", value(self.baker.TYPE_STRING, b"indices")),
+        ])
+        visual = types.SimpleNamespace(children=[
+            (b"boundingBox", value(self.baker.TYPE_ELEMENT, bounding)),
+            (b"renderSet", value(self.baker.TYPE_ELEMENT,
+                                  types.SimpleNamespace(children=[
+                                      (b"geometry", value(
+                                          self.baker.TYPE_ELEMENT, geometry)),
+                                  ]))),
+        ])
+        original_xml = self.baker.read_packed_xml
+        original_sections = self.baker._primitive_sections
+        original_vertices = self.baker._vertex_positions
+        self.baker.read_packed_xml = lambda payload: (
+            model if not getattr(self.baker, "_fixture_visual", False) else visual
+        )
+        calls = [0]
+
+        def read_xml(payload):
+            calls[0] += 1
+            return model if calls[0] == 1 else visual
+
+        self.baker.read_packed_xml = read_xml
+        self.baker._primitive_sections = lambda payload: {
+            "vertices": b"unsupported", "indices": b"unused"
+        }
+        self.baker._vertex_positions = lambda payload: (_ for _ in ()).throw(
+            ValueError("unsupported static vertex type xyznuviiiwwtb")
+        )
+        try:
+            library = self.baker.ModelLibrary(Resources())
+            shape = library.load("wreck.model")
+        finally:
+            self.baker.read_packed_xml = original_xml
+            self.baker._primitive_sections = original_sections
+            self.baker._vertex_positions = original_vertices
+
+        self.assertEqual({"wreck.model"}, library.conservative_fallbacks)
+        self.assertEqual(((-2.0, -4.0), (2.0, -4.0),
+                          (2.0, 4.0), (-2.0, 4.0)), shape.hull)
+        self.assertEqual((), shape.triangles)
 
     def test_bake_prunes_islands_outside_the_two_base_component(self):
         # Nodes 0-2 connect both bases; nodes 8-9 are an isolated ledge.
@@ -234,6 +372,66 @@ class NavigationBakerTest(unittest.TestCase):
         self.assertFalse(self.baker._has_safe_edge_clearance(
             Terrain(drop=True), Surfaces(), 0.0, 0.0, 0.0
         ))
+
+    def test_spawn_terrain_footprint_rejects_unsafe_edge_and_deep_water(self):
+        water_limit = self.baker.WATER_DEPTH_LIMIT
+
+        class Terrain:
+            def __init__(self, missing_support=None, deep_water=None):
+                self.missing_support = missing_support
+                self.deep_water = deep_water
+                self.height_samples = []
+
+            @staticmethod
+            def _matches(point, x, z):
+                return (point is not None and
+                        abs(float(point[0]) - float(x)) < 0.000001 and
+                        abs(float(point[1]) - float(z)) < 0.000001)
+
+            def height(self, x, z):
+                self.height_samples.append((round(float(x), 6),
+                                            round(float(z), 6)))
+                if self._matches(self.missing_support, x, z):
+                    return None
+                return 0.0
+
+            def water_depth(self, x, z, unused_ground):
+                if self._matches(self.deep_water, x, z):
+                    return water_limit + 0.01
+                return 0.0
+
+        helper = getattr(self.baker, "_spawn_terrain_footprint_clear", None)
+        self.assertIsNotNone(
+            helper, "spawn baking must validate the complete vehicle footprint"
+        )
+        args = (0.0, 0.0, 0.0, 0.0, 2.0, 4.0)
+        safe = Terrain()
+
+        self.assertTrue(helper(safe, *args))
+        self.assertEqual(9, len(set(safe.height_samples)))
+
+        for terrain in (
+                Terrain(missing_support=(2.0, 4.0)),
+                Terrain(deep_water=(0.0, -4.0))):
+            with self.subTest(terrain=terrain.__dict__):
+                self.assertEqual(0.0, terrain.height(0.0, 0.0))
+                self.assertEqual(0.0, terrain.water_depth(0.0, 0.0, 0.0))
+                self.assertFalse(helper(terrain, *args))
+
+    def test_spawn_fatal_halo_rejects_an_edge_under_one_track(self):
+        graph = {
+            "origin": [-4.0, -4.0],
+            "cell_size": 4.0,
+            "width": 3,
+            "height": 3,
+            "hazards": [0] * 9,
+        }
+        helper = self.baker._spawn_fatal_halo_clear
+
+        self.assertTrue(helper(graph, 0.0, 0.0, 0.0, 2.0, 4.0))
+        # yaw=0 puts the forward edge midpoint at (0,+4), graph cell (1,2).
+        graph["hazards"][7] = self.baker.HAZARD_EDGE
+        self.assertFalse(helper(graph, 0.0, 0.0, 0.0, 2.0, 4.0))
 
     def test_bridge_deck_uses_collision_rails_instead_of_water_erosion(self):
         class Terrain:
@@ -548,6 +746,142 @@ class NavigationBakerTest(unittest.TestCase):
                         self.baker._route_geometry_issue(route["waypoints"]),
                         (graph["map"], team, route["id"]),
                     )
+
+    def test_airfield_capture_routes_crop_to_full_chassis_clear_terminal(self):
+        graph_path = (ROOT /
+                      "scripts/client/gui/mods/offhangar/navgraphs/31_airfield.json")
+        graph = json.loads(graph_path.read_text())
+        validation = graph["validation"]
+        envelope = {
+            "half_width": validation["spawn_vehicle_half_width_metres"],
+            "half_length": validation["spawn_vehicle_half_length_metres"],
+        }
+
+        # Exact world-space bounds of the two bld000_base collision fixtures in
+        # the pinned Airfield resources.  The test keeps the asset dependency
+        # compact while preserving the regression: the authored objective node
+        # is not a legal full-hull terminal pose at either base.
+        obstacle_cells = {}
+        for minimum_x, maximum_x, minimum_z, maximum_z in (
+                (347.351, 362.616, -161.469, -145.769),
+                (-333.553, -320.912, -176.582, -165.003)):
+            for cell_x in range(int(math.floor(minimum_x)),
+                                int(math.floor(maximum_x)) + 1):
+                for cell_z in range(int(math.floor(minimum_z)),
+                                    int(math.floor(maximum_z)) + 1):
+                    sample_x = cell_x + 0.5
+                    sample_z = cell_z + 0.5
+                    if (minimum_x <= sample_x <= maximum_x and
+                            minimum_z <= sample_z <= maximum_z):
+                        obstacle_cells[(cell_x, cell_z)] = (9.0, 20.0)
+        obstacles = types.SimpleNamespace(
+            raster_size=1.0, cells=obstacle_cells)
+
+        route_records = [(team, route)
+                         for team in ("1", "2")
+                         for route in graph["routes"][team]]
+        self.assertEqual(6, len(route_records))
+        for team, route in route_records:
+            with self.subTest(team=team, route=route["id"]):
+                path = []
+                for waypoint in route["waypoints"]:
+                    node, unused_offset = self.baker._nearest_node(
+                        graph, waypoint)
+                    self.assertIsNotNone(node)
+                    if not path:
+                        path.append(node)
+                        continue
+                    segment, unused_distance = self.baker._graph_path(
+                        graph, path[-1], node)
+                    self.assertTrue(segment)
+                    path.extend(segment[1:])
+
+                enemy_base = graph["bases"][1 if team == "1" else 0]
+                objective_node, unused_offset = self.baker._nearest_node(
+                    graph, enemy_base)
+                objective_path, unused_distance = self.baker._graph_path(
+                    graph, path[-1], objective_node)
+                self.assertTrue(objective_path)
+                path.extend(objective_path[1:])
+
+                raw_x, raw_z = self.baker._node_point(graph, path[-1])
+                previous_x, previous_z = self.baker._node_point(
+                    graph, path[-2])
+                raw_yaw = math.atan2(raw_x - previous_x,
+                                     raw_z - previous_z)
+                raw_y = float(graph["heights_mm"][path[-1]]) / 1000.0
+                self.assertTrue(self.baker._spawn_obstacle_obb_blocked(
+                    obstacles, raw_x, raw_z, raw_y, raw_yaw,
+                    envelope["half_width"], envelope["half_length"],
+                ))
+
+                cropped = self.baker._capture_terminal_path(
+                    graph, tuple(path), enemy_base, obstacles, envelope)
+                self.assertLess(len(cropped), len(path))
+                terminal_x, terminal_z = self.baker._node_point(
+                    graph, cropped[-1])
+                approach_x, approach_z = self.baker._node_point(
+                    graph, cropped[-2])
+                terminal_yaw = math.atan2(
+                    terminal_x - approach_x, terminal_z - approach_z)
+                terminal_y = (float(graph["heights_mm"][cropped[-1]]) /
+                              1000.0)
+                self.assertLessEqual(
+                    math.hypot(terminal_x - enemy_base[0],
+                               terminal_z - enemy_base[1]),
+                    self.baker.CAPTURE_ROUTE_TERMINAL_RADIUS,
+                )
+                self.assertTrue(self.baker._spawn_fatal_halo_clear(
+                    graph, terminal_x, terminal_z, terminal_yaw,
+                    envelope["half_width"], envelope["half_length"],
+                ))
+                self.assertFalse(self.baker._spawn_obstacle_obb_blocked(
+                    obstacles, terminal_x, terminal_z, terminal_y,
+                    terminal_yaw, envelope["half_width"],
+                    envelope["half_length"],
+                ))
+
+    def test_capture_terminal_detours_around_a_blocked_direct_approach(self):
+        width, height = 11, 2
+        links = [0] * (width * height)
+        for cell_z in range(height):
+            for cell_x in range(width):
+                index = cell_z * width + cell_x
+                for direction_index, (dx, dz) in enumerate(
+                        self.baker.DIRECTIONS):
+                    neighbour_x = cell_x + dx
+                    neighbour_z = cell_z + dz
+                    if (0 <= neighbour_x < width and
+                            0 <= neighbour_z < height):
+                        links[index] |= 1 << direction_index
+        graph = {
+            "width": width, "height": height, "cell_size": 4.0,
+            "origin": [0.0, 0.0],
+            "heights_mm": [0] * (width * height),
+            "hazards": [0] * (width * height),
+            "links": links,
+        }
+        direct_path = tuple(range(width))
+        envelope = {"half_width": 0.5, "half_length": 0.5}
+
+        def blocked(unused_obstacles, x, z, unused_y, unused_yaw,
+                    unused_half_width, unused_half_length):
+            return z == 0.0 and x >= 36.0
+
+        with mock.patch.object(
+                self.baker, "CAPTURE_ROUTE_TERMINAL_RADIUS", 6.0), \
+                mock.patch.object(
+                    self.baker, "_spawn_obstacle_obb_blocked",
+                    side_effect=blocked):
+            cropped = self.baker._capture_terminal_path(
+                graph, direct_path, (40.0, 0.0), object(), envelope)
+
+        terminal_x, terminal_z = self.baker._node_point(graph, cropped[-1])
+        self.assertEqual(4.0, terminal_z)
+        self.assertLessEqual(
+            math.hypot(terminal_x - 40.0, terminal_z), 6.0)
+        self.assertIn(8, cropped)
+        self.assertNotEqual(direct_path, cropped)
 
     def test_batch_publish_writes_a_checksum_manifest_after_all_graphs(self):
         with tempfile.TemporaryDirectory() as directory:

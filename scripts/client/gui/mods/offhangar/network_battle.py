@@ -21,7 +21,7 @@ from gui.mods.offhangar import vehicle_pose
 
 
 PROTOCOL_VERSION = 8
-CLIENT_BUILD = '1.8.41-native-experimental-20260812'
+CLIENT_BUILD = '1.8.56-native-experimental-20260814'
 POLL_INTERVAL = 1.0 / 60.0
 INPUT_INTERVAL = 1.0 / 30.0
 BOT_STATE_INTERVAL = 1.0 / 30.0
@@ -89,6 +89,106 @@ def _finite_float(value, fallback=0.0):
 	except Exception:
 		pass
 	return value
+
+
+_MOBILITY_DEVICE_NAMES = (
+	'engineHealth', 'leftTrackHealth', 'rightTrackHealth')
+
+
+def _mobility_report(mock, now=None):
+	"""Return disabled state and bounded repair time for authority handoff."""
+	if now is None:
+		now = time.time()
+	destroyed = set(getattr(mock, '_destroyed_devices', None) or ())
+	disabled_names = set(name for name in _MOBILITY_DEVICE_NAMES
+		if name in destroyed)
+	if getattr(mock, 'is_engine_dead', False):
+		disabled_names.add('engineHealth')
+	if getattr(mock, 'is_tracked', False) and not disabled_names.intersection(
+			('leftTrackHealth', 'rightTrackHealth')):
+		disabled_names.add('leftTrackHealth')
+	devices_hp = getattr(mock, 'devices_hp', None) or {}
+	local_disabled = bool(disabled_names)
+	remaining = 0.0
+	if local_disabled:
+		try:
+			from gui.mods.offhangar import device_damage
+			descriptor = getattr(mock, 'typeDescriptor', None)
+			for name in disabled_names:
+				cap = device_damage.device_regen_hp(descriptor, name)
+				if cap is None or float(cap) <= 0.0:
+					continue
+				hp = max(0.0, min(float(cap), _finite_float(
+					devices_hp.get(name), 0.0)))
+				seconds = device_damage.repair_seconds(
+					name, descriptor, repair_skill_pct=100.0)
+				remaining = max(remaining,
+					float(seconds) * (1.0 - hp / float(cap)))
+		except Exception:
+			remaining = 0.0
+		if remaining <= 0.0:
+			remaining = 9.0 if 'engineHealth' in disabled_names else 5.0
+	carry_until = _finite_float(
+		getattr(mock, '_network_mobility_carry_until', 0.0), 0.0)
+	carry_remaining = max(0.0, carry_until - float(now))
+	if carry_until > 0.0 and carry_remaining <= 0.0:
+		mock._network_mobility_carry_until = 0.0
+		mock._network_mobility_disabled = False
+		mock._network_mobility_repair_seconds = 0.0
+	remaining = max(remaining, carry_remaining)
+	return bool(local_disabled or carry_remaining > 0.0), max(
+		0.0, min(30.0, remaining))
+
+
+def _apply_mobility_snapshot(mock, state, force_authority_pose=False,
+		now=None):
+	"""Carry canonical immobilisation across a promoted-authority handoff."""
+	if now is None:
+		now = time.time()
+	disabled = bool(state.get('mobility_disabled', False))
+	remaining = max(0.0, min(30.0, _finite_float(
+		state.get('mobility_repair_seconds'), 0.0)))
+	if not force_authority_pose:
+		mock._network_mobility_disabled = disabled
+		mock._network_mobility_repair_seconds = remaining
+		return disabled
+	existing = _finite_float(
+		getattr(mock, '_network_mobility_carry_until', 0.0), 0.0)
+	# A full handoff can repeat while another bot's model is still loading. Seed
+	# this bot's repair deadline only once per authority tenure, even if that
+	# deadline expires before the complete lineup is ready.
+	if bool(getattr(mock, '_network_mobility_handoff_seeded', False)):
+		carry_remaining = max(0.0, existing - float(now))
+		mock._network_mobility_disabled = carry_remaining > 0.0
+		mock._network_mobility_repair_seconds = carry_remaining
+		return carry_remaining > 0.0
+	mock._network_mobility_handoff_seeded = True
+	mock._network_mobility_disabled = disabled
+	mock._network_mobility_repair_seconds = remaining
+	if not disabled:
+		mock._network_mobility_carry_until = 0.0
+		return False
+	if remaining <= 0.0:
+		remaining = 9.0
+	candidate = float(now) + remaining
+	mock._network_mobility_carry_until = candidate
+	return True
+
+
+def _reset_mobility_handoff_carry():
+	"""Clear one authority tenure's conservative mobility carry state."""
+	try:
+		for mock in (_offline_mocks() or {}).values():
+			for name in ('_network_mobility_handoff_seeded',
+					'_network_mobility_carry_until',
+					'_network_mobility_disabled',
+					'_network_mobility_repair_seconds'):
+				try:
+					delattr(mock, name)
+				except Exception:
+					pass
+	except Exception:
+		pass
 
 
 def _network_perf_clock():
@@ -225,6 +325,7 @@ class LANClient(object):
 		self.bot_order_revision = 0
 		self.bot_orders = {}
 		self._last_order_resync = 0.0
+		self._manifest_nonce_seq = 0
 		self._last_error = None
 		self._error_notified = False
 		self._stop_requested = False
@@ -495,8 +596,13 @@ class LANClient(object):
 			message['z'] = _finite_float(impact_position[2])
 		return self._send(message)
 
-	def send_bot_manifest(self, bots, map_frame=None):
-		message = {'type': 'bot_manifest', 'bots': bots[:30]}
+	def send_bot_manifest(self, bots, map_frame=None, manifest_nonce=None,
+			round_id=None):
+		message = {
+			'type': 'bot_manifest', 'bots': bots[:30],
+			'manifest_nonce': str(manifest_nonce or ''),
+			'round_id': round_id,
+		}
 		if map_frame is not None:
 			message['map_frame'] = map_frame
 		return self._send(message)
@@ -594,27 +700,79 @@ class LANClient(object):
 		except (TypeError, ValueError):
 			authority_id = None
 		previous_authority_id = self.bot_authority_id
+		demotion_pending = bool(getattr(
+			self.player,
+			'_offhangar_network_authority_demotion_pending', False))
+		was_authority = bool(getattr(
+			self.player, '_offhangar_network_is_authority', False)) or bool(
+				demotion_pending and previous_authority_id == self.player_id)
+		will_be_authority = (
+			authority_id is not None and authority_id == self.player_id)
+		if was_authority and not will_be_authority:
+			# A demotion snapshot is applied in this same message. Release the local
+			# native filter/physics owner before that snapshot writes relay pose.
+			# Mark the transition first: a partial release must not leave this process
+			# publishing or rebuilding the bots which were already stopped.
+			self.player._offhangar_network_authority_demotion_pending = True
+			self.player._offhangar_network_is_authority = False
+			try:
+				from gui.mods.offhangar.offline_battle import release_native_bots_for_replica
+				if not release_native_bots_for_replica(self.player):
+					LOG_ERROR('LAN native authority demotion could not release bot bodies')
+					return False
+			except Exception:
+				LOG_ERROR('LAN native authority demotion failed before snapshot apply')
+				return False
+			self.player._offhangar_network_authority_demotion_pending = False
+			# Drop relay interpolation targets which were sampled before this client
+			# became authority. Otherwise the frame between the authority event and its
+			# first canonical replica snapshot can smooth the lineup backwards once.
+			try:
+				import sys
+				offline = sys.modules.get('gui.mods.offhangar.offline_battle')
+				mocks = getattr(offline, 'G_MOCK_VEHICLES', {}) if offline else {}
+				for mock in (mocks or {}).values():
+					if getattr(mock, '_network_shared_bot', False):
+						for name in (
+								'_network_target_position', '_network_target_velocity',
+								'_network_target_time', '_network_smoothing_ready'):
+							try:
+								delattr(mock, name)
+							except Exception:
+								pass
+			except Exception:
+				pass
 		changed = authority_id != previous_authority_id
+		if changed:
+			_reset_mobility_handoff_carry()
+			self.player._offhangar_network_bot_manifest_pending = None
 		self.bot_authority_id = authority_id
 		self.player._offhangar_network_authority_id = authority_id
-		was_authority = bool(getattr(
-			self.player, '_offhangar_network_is_authority', False))
-		self.player._offhangar_network_is_authority = (
-			authority_id is not None and authority_id == self.player_id)
-		if (self.player._offhangar_network_is_authority and not was_authority and
-				previous_authority_id is not None):
-			# The next canonical snapshot must be applied once before this client
-			# begins simulating. Otherwise a relay promotes its interpolated pose and
-			# zero local speed instead of the server's final authority state.
-			self.player._offhangar_network_authority_handoff_pending = True
-		elif self.player._offhangar_network_is_authority and not was_authority:
-			# The initial authority owns the only canonical state; there is no relay
-			# pose to hand off before it starts publishing.
+		self.player._offhangar_network_is_authority = will_be_authority
+		self.player._offhangar_network_authority_demotion_pending = False
+		if self.player._offhangar_network_is_authority:
+			if changed:
+				if (previous_authority_id is not None and
+						bool(getattr(
+							self.player, '_offhangar_network_bot_manifest', None))):
+					# The next canonical snapshot must be applied once before this client
+					# begins simulating. Otherwise a relay promotes its interpolated pose
+					# and zero local speed instead of the server's final authority state.
+					self.player._offhangar_network_authority_handoff_pending = True
+				else:
+					# The initial authority owns the only canonical state; there is no
+					# relay pose to hand off before it starts publishing. The same is true
+					# when a replacement is elected before any manifest was published.
+					self.player._offhangar_network_authority_handoff_pending = False
+			# An unchanged authority id must preserve a pending handoff. Only a
+			# successfully applied complete snapshot may open that ownership fence.
+		elif not self.player._offhangar_network_is_authority:
 			self.player._offhangar_network_authority_handoff_pending = False
 		if changed and self.phase == 'battle':
 			role = 'simulation authority' if self.player._offhangar_network_is_authority else 'relay client'
 			LOG_NOTE('LAN bot authority=%s; local role=%s' % (authority_id, role))
 			_system_message('LAN battle authority: player %s (%s).' % (authority_id, role))
+		return True
 
 	def _load_bot_orders(self, message):
 		"""Apply a complete revision body and acknowledge game-thread delivery."""
@@ -961,6 +1119,7 @@ class LANClient(object):
 			self.player._offhangar_network_roster = message.get('players') or []
 			self.player._offhangar_network_bot_roster = message.get('bots') or []
 			self.player._offhangar_network_bot_manifest = message.get('bot_manifest') or []
+			self.player._offhangar_network_bot_manifest_pending = None
 			try:
 				from gui.mods.offhangar.lan_waiting_room import close as close_waiting_room
 				close_waiting_room()
@@ -992,13 +1151,57 @@ class LANClient(object):
 				set_status('Start denied: %s' % (message.get('code') or 'request denied'))
 			except Exception:
 				pass
+		elif kind == 'bot_manifest_result':
+			pending = getattr(
+				self.player, '_offhangar_network_bot_manifest_pending', None)
+			if not isinstance(pending, dict):
+				return
+			try:
+				result_round = int(message.get('round_id', -1))
+				pending_round = int(pending.get('round_id', -2))
+			except (TypeError, ValueError):
+				return
+			try:
+				current_round = int(self.round_id)
+			except (TypeError, ValueError):
+				return
+			if (result_round != current_round or
+					result_round != pending_round or
+					str(message.get('manifest_nonce') or '') !=
+					str(pending.get('nonce') or '')):
+				return
+			if not network_is_authority(self.player):
+				return
+			try:
+				result_ids = sorted(int(value) for value in
+					(message.get('bot_ids') or ()))
+			except (TypeError, ValueError):
+				return
+			installed = message.get('bots') or ()
+			try:
+				installed_ids = sorted(int(entry.get('id')) for entry in installed)
+			except (AttributeError, TypeError, ValueError):
+				installed_ids = []
+			if (bool(message.get('accepted')) and
+					result_ids == list(pending.get('bot_ids') or ()) and
+					installed_ids == result_ids):
+				pending['state'] = 'accepted'
+				self.player._offhangar_network_bot_manifest = list(installed)
+				LOG_NOTE('LAN bot manifest accepted: %d bot(s)' % len(result_ids))
+			else:
+				pending['state'] = 'rejected'
+				pending['code'] = str(message.get('code') or 'rejected')
+				LOG_ERROR('LAN bot manifest rejected:', pending['code'])
+				_system_message(
+					'LAN server rejected the canonical bot lineup.', 'error')
 		elif kind == 'snapshot':
 			if not _fence_local_health_round(
 					self.player, message.get('round_id')):
 				return
 			self._last_snapshot = time.time()
 			self._load_server_timing(message)
-			self._set_authority(message.get('bot_authority_id'))
+			if self._set_authority(message.get('bot_authority_id')) is False:
+				return
 			self._load_bot_orders(message)
 			self.player._offhangar_network_snapshot = message
 			_apply_snapshot(self.player, message)
@@ -1214,7 +1417,11 @@ def start_for_player(player):
 	player._offhangar_network_health_round_id = None
 	player._offhangar_network_authority_id = None
 	player._offhangar_network_is_authority = False
+	player._offhangar_network_authority_handoff_pending = False
+	player._offhangar_network_authority_demotion_pending = False
+	player._offhangar_network_announced_authority_id = None
 	player._offhangar_network_bot_manifest = []
+	player._offhangar_network_bot_manifest_pending = None
 	player._offhangar_network_bot_snapshots_deferred = False
 	player._offhangar_network_bot_defer_logged = False
 	player._offhangar_network_server_navigation_at = 0.0
@@ -1272,7 +1479,11 @@ def stop_for_player(player):
 		player._offhangar_network_health_round_id = None
 		player._offhangar_network_authority_id = None
 		player._offhangar_network_is_authority = False
+		player._offhangar_network_authority_handoff_pending = False
+		player._offhangar_network_authority_demotion_pending = False
+		player._offhangar_network_announced_authority_id = None
 		player._offhangar_network_bot_manifest = []
+		player._offhangar_network_bot_manifest_pending = None
 		player._offhangar_network_bot_snapshots_deferred = False
 		player._offhangar_network_bot_defer_logged = False
 		player._offhangar_network_server_navigation_at = 0.0
@@ -1400,8 +1611,14 @@ def send_local_hit(player, target_id, shot_seq, damage, shot_result,
 
 def network_is_authority(player):
 	client = getattr(player, '_offhangar_network_client', None) if player is not None else None
-	return bool(client is not None and client.ready and client.phase == 'battle' and
-		getattr(player, '_offhangar_network_is_authority', False))
+	return bool(client is not None and getattr(client, 'running', True) and
+		getattr(client, 'connected', True) and client.ready and
+		client.phase == 'battle' and
+		getattr(player, '_offhangar_network_is_authority', False) and
+		not getattr(player,
+			'_offhangar_network_authority_handoff_pending', False) and
+		not getattr(player,
+			'_offhangar_network_authority_demotion_pending', False))
 
 
 def _replica_lineup_loading(player):
@@ -1421,10 +1638,38 @@ def publish_bot_manifest(player, jobs):
 	if not network_is_authority(player):
 		return False
 	client = getattr(player, '_offhangar_network_client', None)
+	if client is None:
+		return False
+	pending = getattr(
+		player, '_offhangar_network_bot_manifest_pending', None)
+	if isinstance(pending, dict):
+		try:
+			if int(pending.get('round_id', -1)) != int(client.round_id or -1):
+				return False
+		except (TypeError, ValueError):
+			return False
+		if pending.get('state') == 'accepted':
+			return bool(getattr(
+				player, '_offhangar_network_bot_manifest', None))
+		if pending.get('state') in ('rejected', 'send_failed'):
+			return False
+		# Freeze the first payload while waiting. A retry may arrive after the
+		# matchmaker shuffled a new local candidate, but only this nonce/body may
+		# be accepted for the round.
+		now = time.time()
+		if now - float(pending.get('sent_at', 0.0) or 0.0) >= 0.5:
+			if client.send_bot_manifest(
+					pending.get('manifest') or (), pending.get('map_frame'),
+					pending.get('nonce'), pending.get('round_id')):
+				pending['sent_at'] = now
+		return False
+	frame = _server_pose_frame(player)
+	if frame is None:
+		return False
 	manifest = []
 	for job in jobs[:30]:
 		try:
-			bot_id, team, slot, vehicle, name, max_health, world_x, world_z, world_yaw = job
+			bot_id, team, slot, vehicle, name, max_health, world_x, world_y, world_z, world_yaw = job
 			profile = {}
 			route_payload = {}
 			try:
@@ -1447,9 +1692,9 @@ def publish_bot_manifest(player, jobs):
 					for point in route.get('waypoints', ()):
 						grounded = _ground_world_point(
 							Math.Vector3(float(point[0]), 0.0, float(point[1])))
-						world_y = float(grounded.y) if grounded is not None else 0.0
+						waypoint_world_y = float(grounded.y) if grounded is not None else 0.0
 						shared, unused_yaw = _server_pose_from_world(
-							player, point[0], world_y, point[1], 0.0)
+							player, point[0], waypoint_world_y, point[1], 0.0)
 						waypoints.append({
 							'x': shared[0], 'y': shared[1], 'z': shared[2],
 							'hold': bool(point[2]) if len(point) > 2 else False,
@@ -1461,12 +1706,13 @@ def publish_bot_manifest(player, jobs):
 			except Exception:
 				route_payload = {}
 			server_pos, server_yaw = _server_pose_from_world(
-				player, world_x, 0.0, world_z, world_yaw)
+				player, world_x, world_y, world_z, world_yaw)
 			manifest.append({
 				'id': int(bot_id), 'team': int(team), 'slot': int(slot),
 				'vehicle': str(vehicle), 'name': str(name),
 				'max_health': max(1, int(max_health)),
 				'health': max(1, int(max_health)),
+				'world_pose': True,
 				'x': server_pos[0], 'y': server_pos[1], 'z': server_pos[2],
 				'yaw': server_yaw, 'aim_yaw': server_yaw,
 				'profile': profile,
@@ -1476,18 +1722,38 @@ def publish_bot_manifest(player, jobs):
 			continue
 	if not manifest:
 		return False
-	player._offhangar_network_bot_manifest = manifest
 	map_frame = None
 	try:
-		frame = _server_pose_frame(player)
-		if frame is not None:
-			map_frame = {
-				'origin': [round(float(frame[0]), 4), round(float(frame[1]), 4)],
-				'axis': [round(float(frame[2]), 7), round(float(frame[3]), 7)],
-			}
+		map_frame = {
+			'origin': [round(float(frame[0]), 4), round(float(frame[1]), 4)],
+			'axis': [round(float(frame[2]), 7), round(float(frame[3]), 7)],
+		}
 	except Exception:
-		map_frame = None
-	return client.send_bot_manifest(manifest, map_frame)
+		return False
+	bot_ids = sorted(int(entry['id']) for entry in manifest)
+	try:
+		client._manifest_nonce_seq = int(
+			getattr(client, '_manifest_nonce_seq', 0) or 0) + 1
+		nonce = '%s-%s-%s' % (
+			int(client.round_id or 0), int(client.player_id or 0),
+			client._manifest_nonce_seq)
+	except Exception:
+		return False
+	pending = {
+		'nonce': nonce,
+		'round_id': int(client.round_id or 0),
+		'bot_ids': bot_ids,
+		'manifest': manifest,
+		'map_frame': map_frame,
+		'state': 'pending',
+		'sent_at': time.time(),
+	}
+	player._offhangar_network_bot_manifest_pending = pending
+	if not client.send_bot_manifest(
+			manifest, map_frame, nonce, pending['round_id']):
+		pending['state'] = 'send_failed'
+		return False
+	return False
 
 
 def publish_bot_observation(player, contacts, affordances=None, navigation=None):
@@ -1651,7 +1917,8 @@ def publish_bot_observation(player, contacts, affordances=None, navigation=None)
 		if isinstance(raw_driver, dict):
 			shared_navigation['driver'] = {}
 			for name in ('moving', 'drive', 'avoid', 'blocked', 'recovery', 'arrived',
-					'server_wait', 'water_guard', 'full', 'cruise', 'slow'):
+					'server_wait', 'traffic_wait', 'water_guard', 'full', 'cruise',
+					'slow'):
 				try:
 					value = int(raw_driver.get(name, 0) or 0)
 				except Exception:
@@ -1840,6 +2107,7 @@ def publish_authoritative_bots(player, mocks):
 			# coordinate conversion per bot is unnecessary.
 			server_aim_yaw = server_yaw + _finite_float(
 				getattr(mock, '_turret_yaw', 0.0))
+			mobility_disabled, mobility_repair_seconds = _mobility_report(mock)
 			states.append({
 				'id': int(bot_id),
 				'x': server_pos[0], 'y': server_pos[1], 'z': server_pos[2],
@@ -1855,6 +2123,9 @@ def publish_authoritative_bots(player, mocks):
 				'killer_kind': 'bot' if killer_bot_id else '',
 				'killer_id': int(killer_bot_id or 0),
 				'alive': bool(getattr(mock, 'isAlive', False)) and int(getattr(mock, 'health', 0) or 0) > 0,
+				'mobility_disabled': mobility_disabled,
+				'mobility_repair_seconds': round(
+					mobility_repair_seconds, 3),
 			})
 		except Exception:
 			continue
@@ -1906,10 +2177,19 @@ def send_authoritative_rules(player, bases):
 				continue
 			if points:
 				contributors[str(vehicle_id)[:64]] = points
+		active_contributors = []
+		for vehicle_id in state.get('active_contributors') or ():
+			vehicle_id = str(vehicle_id)[:64]
+			if (vehicle_id.startswith('human:') or
+					vehicle_id.startswith('bot:')):
+				active_contributors.append(vehicle_id)
+		active_contributors = sorted(set(active_contributors))[:30]
 		rules['bases'][str(team)] = {
 			'points': max(0, min(int(state.get('points', 0) or 0), 100)),
 			'stopped': bool(state.get('stopped', False)),
 			'contributors': contributors,
+			'active_contributors': active_contributors,
+			'invaders': len(active_contributors),
 			'cursor': max(0, int(state.get('cursor', 0) or 0)),
 		}
 	return player._offhangar_network_client.send_rules(rules)
@@ -2372,7 +2652,11 @@ def _apply_remote_transform(player, mock, world, yaw, sync_filter=True,
 		timestamp=None, space_id=None):
 	"""Commit one remote pose through the shared native-facing adapter."""
 	if mock is None or world is None:
-		return
+		return False
+	if getattr(mock, '_offh_native_model_root_ready', False) is not True:
+		# Entity.model already installed BigWorld's default motor, but the retail
+		# handoff has not yet removed it. Do not attach a relay Servo beside it.
+		return False
 	pitch = float(getattr(mock, 'pitch', 0.0) or 0.0)
 	roll = float(getattr(mock, 'roll', 0.0) or 0.0)
 	if sync_filter and space_id is None:
@@ -2380,10 +2664,28 @@ def _apply_remote_transform(player, mock, world, yaw, sync_filter=True,
 	if sync_filter and timestamp is None:
 		timestamp = BigWorld.time()
 	needs_servo = not bool(getattr(mock, '_servo_added', False))
-	vehicle_pose.commit_pose(
-		mock, world, yaw, pitch, roll, space_id=space_id,
-		timestamp=timestamp, sync_filter=sync_filter,
-		attach_servo=needs_servo, prime_model=needs_servo)
+	try:
+		committed = vehicle_pose.commit_pose(
+			mock, world, yaw, pitch, roll, space_id=space_id,
+			timestamp=timestamp, sync_filter=sync_filter,
+			attach_servo=needs_servo, prime_model=needs_servo)
+	except Exception:
+		return False
+	if not committed:
+		return False
+	pose_servo = getattr(mock, '_pose_servo', None)
+	if needs_servo and (not getattr(mock, '_servo_added', False) or
+			pose_servo is None):
+		return False
+	if getattr(mock, '_servo_added', False):
+		try:
+			motors = list((getattr(mock, '_chassis_model', None) or
+				getattr(mock, 'model', None)).motors)
+		except Exception:
+			return False
+		if len(motors) != 1 or motors[0] is not pose_servo:
+			return False
+	return True
 
 
 def _queue_network_transform(player, mock, world, hull_yaw, aim_yaw,
@@ -2391,7 +2693,7 @@ def _queue_network_transform(player, mock, world, hull_yaw, aim_yaw,
 		sample_time=None):
 	"""Queue a 30 Hz pose; the battle frame loop renders between packets."""
 	if mock is None or world is None:
-		return
+		return False
 	now = time.time() if sample_time is None else float(sample_time)
 	previous_target = getattr(mock, '_network_target_position', None)
 	previous_time = float(getattr(mock, '_network_target_time', 0.0) or 0.0)
@@ -2422,7 +2724,8 @@ def _queue_network_transform(player, mock, world, hull_yaw, aim_yaw,
 			-10.0, min(10.0, _finite_float(turn_velocity, 0.0)))
 	mock._network_target_time = now
 	if snap or not getattr(mock, '_network_smoothing_ready', False):
-		_apply_remote_transform(player, mock, world, hull_yaw)
+		if not _apply_remote_transform(player, mock, world, hull_yaw):
+			return False
 		mock._turret_yaw = aim_yaw - hull_yaw
 		mock._gun_pitch = gun_pitch
 		try:
@@ -2434,6 +2737,7 @@ def _queue_network_transform(player, mock, world, hull_yaw, aim_yaw,
 		except Exception:
 			pass
 		mock._network_smoothing_ready = True
+	return True
 
 
 def _short_angle_delta(target, current):
@@ -2695,9 +2999,11 @@ def _apply_bot_state(player, state, force_authority_pose=False, mock=None,
 	if mock is None:
 		mock = _find_bot(state.get('id'))
 	if mock is None:
-		return
+		return False
 	try:
 		is_authority = network_is_authority(player)
+		elected_authority = bool(getattr(
+			player, '_offhangar_network_is_authority', False))
 		authority_fast_path = is_authority and not force_authority_pose
 		# Static A* is resolved by the Python 3 server over the shipped graph.  This
 		# short waypoint is advisory: the authority's LocalDriver still performs the
@@ -2751,26 +3057,44 @@ def _apply_bot_state(player, state, force_authority_pose=False, mock=None,
 			mock._network_navigation_revision = nav_revision
 			mock._network_navigation_time = float(sample_time or time.time())
 		old_health = max(0, int(getattr(mock, 'health', 0) or 0))
+		_apply_mobility_snapshot(
+			mock, state, force_authority_pose, sample_time or time.time())
 		target_alive = bool(state.get('alive', True))
 		if not is_authority or force_authority_pose:
 			previous_fire = int(getattr(mock, '_network_seen_fire_seq', 0) or 0)
 			fire_seq = int(state.get('fire_seq', previous_fire) or 0)
 			death_locked = bool(getattr(mock, '_network_death_notified', False))
+			if (force_authority_pose and target_alive and
+					(death_locked or
+					 not bool(getattr(mock, 'isAlive', True)) or
+					 int(getattr(mock, 'health', 0) or 0) <= 0)):
+				# Server bot HP is monotonic. A canonical handoff cannot legitimately
+				# resurrect a locally settled death without also rolling back its frag,
+				# score, kill feed and wreck transaction. Keep the ownership fence closed
+				# instead of creating a half-revived bot.
+				LOG_ERROR('LAN authority handoff rejected bot resurrection:',
+				          state.get('id'))
+				return False
 			world = _world_from_server(player, state)
 			world_yaw = _world_yaw_from_server(player, state)
 			world_aim_yaw = _world_yaw_from_server(player,
 				dict(state, yaw=state.get('aim_yaw')))
+			transform_applied = True
 			if not death_locked:
-				_queue_network_transform(player, mock, world, world_yaw, world_aim_yaw,
+				transform_applied = _queue_network_transform(
+					player, mock, world, world_yaw, world_aim_yaw,
 					_finite_float(state.get('gun_pitch'), getattr(mock, '_gun_pitch', 0.0)),
 					force_authority_pose or not target_alive,
 					state.get('speed'), state.get('turn_velocity'), sample_time)
+			if force_authority_pose and not transform_applied:
+				return False
 			if force_authority_pose:
 				mock._veh_velocity = max(-80.0, min(
 					80.0, _finite_float(state.get('speed'), 0.0)))
 				mock._veh_turn_velocity = max(-10.0, min(
 					10.0, _finite_float(state.get('turn_velocity'), 0.0)))
-			if not is_authority and fire_seq > previous_fire:
+			if (not elected_authority and not force_authority_pose and
+					fire_seq > previous_fire):
 				try:
 					import sys
 					offline = sys.modules.get('gui.mods.offhangar.offline_battle')
@@ -2791,7 +3115,15 @@ def _apply_bot_state(player, state, force_authority_pose=False, mock=None,
 				getattr(mock, 'maxHealth', 1) or 1))
 			if incoming_health > incoming_max_health:
 				incoming_health = incoming_max_health
-			incoming_alive = target_alive and incoming_health > 0
+			# The authority applies combat locally before its next state reaches the
+			# server. A steady-state echo is therefore allowed to confirm damage, but
+			# never to heal or resurrect the locally authoritative bot. Exact server
+			# state is accepted only by the force_authority_pose handoff path below.
+			current_health = max(0, int(getattr(mock, 'health', 0) or 0))
+			current_alive = bool(getattr(mock, 'isAlive', current_health > 0))
+			incoming_health = min(current_health, incoming_health)
+			incoming_alive = (
+				current_alive and target_alive and incoming_health > 0)
 			current_health_matches = (
 				int(getattr(mock, 'health', incoming_health) or 0) ==
 					incoming_health and
@@ -2813,7 +3145,7 @@ def _apply_bot_state(player, state, force_authority_pose=False, mock=None,
 			killer_id = _local_killer_id_from_state(player, state)
 			_push_mock_health(player, mock, state.get('health', mock.health),
 				state.get('max_health', mock.maxHealth), target_alive, killer_id)
-		if not is_authority:
+		if not elected_authority and not force_authority_pose:
 			new_health = max(0, int(getattr(mock, 'health', 0) or 0))
 			if old_health > new_health:
 				try:
@@ -2825,8 +3157,10 @@ def _apply_bot_state(player, state, force_authority_pose=False, mock=None,
 				except Exception:
 					LOG_ERROR('LAN spotting-assist statistics failed:', state.get('id'))
 			update_remote_spotting(player, mock)
+		return True
 	except Exception:
 		LOG_ERROR('LAN bot state apply failed:', state.get('id'))
+		return False
 
 
 def _apply_snapshot(player, message):
@@ -2846,6 +3180,22 @@ def _apply_snapshot(player, message):
 	# this ownership fence. Missing mode is the legacy full-snapshot contract.
 	snapshot_mode = str(message.get('bot_snapshot_mode') or 'full')
 	handoff = handoff_pending and snapshot_mode == 'full'
+	rules_apply_ok = not handoff
+	rules = message.get('rules')
+	if rules is not None:
+		callback = getattr(player, '_offhangar_apply_network_rules_state', None)
+		if callable(callback):
+			try:
+				# A promoted authority is still fenced here, so it consumes the
+				# canonical rules paired with the full pose handoff before it may
+				# publish a newer state. Steady authorities remain authoritative.
+				rules_result = callback(rules)
+				if handoff:
+					rules_apply_ok = rules_result is True
+			except Exception:
+				if handoff:
+					rules_apply_ok = False
+				LOG_ERROR('LAN rules state apply failed')
 	bot_states = message.get('bots') or []
 	# One failed server path must reactivate the client navigator for that bot.
 	# Using only the latest successful waypoint timestamp made 28 successful bots
@@ -2870,22 +3220,45 @@ def _apply_snapshot(player, message):
 			player._offhangar_network_bot_snapshots_deferred = False
 			LOG_NOTE('LAN replica bot snapshots resumed with complete lineup')
 		bot_index = _network_mock_indexes()[1]
+		handoff_applied = set()
 		for state in bot_states:
 			try:
-				indexed_mock = bot_index.get(int(state.get('id')))
+				state_bot_id = int(state.get('id'))
+				indexed_mock = bot_index.get(state_bot_id)
 			except (TypeError, ValueError):
+				state_bot_id = None
 				indexed_mock = None
-			_apply_bot_state(player, state, handoff, indexed_mock, snapshot_time)
-		if handoff and bot_states:
-			player._offhangar_network_authority_handoff_pending = False
-	rules = message.get('rules')
-	if rules is not None:
-		callback = getattr(player, '_offhangar_apply_network_rules_state', None)
-		if callable(callback):
-			try:
-				callback(rules)
-			except Exception:
-				LOG_ERROR('LAN rules state apply failed')
+			if _apply_bot_state(
+					player, state, handoff, indexed_mock, snapshot_time):
+				if handoff and state_bot_id is not None:
+					handoff_applied.add(state_bot_id)
+		if handoff:
+			expected_handoff = set()
+			for entry in (getattr(
+					player, '_offhangar_network_bot_manifest', None) or []):
+				try:
+					expected_handoff.add(int(entry.get('id')))
+				except (AttributeError, TypeError, ValueError):
+					pass
+			# The server full snapshot contains every canonical bot. Do not acquire
+			# native ownership until the complete manifest is mapped/applied and this
+			# newly promoted client has proved live terrain collision for its tenure.
+			_handoff_complete = bool(
+				rules_apply_ok and (
+					(not expected_handoff and not bot_states) or
+					(expected_handoff and handoff_applied == expected_handoff and
+						all(bot_id in bot_index for bot_id in expected_handoff))))
+			if _handoff_complete:
+				_streaming_ready = False
+				_streaming_callback = getattr(
+					player, '_offhangar_prepare_native_authority_streaming', None)
+				if callable(_streaming_callback):
+					try:
+						_streaming_ready = _streaming_callback() is True
+					except Exception:
+						LOG_ERROR('LAN authority streaming gate failed')
+				if _streaming_ready:
+					player._offhangar_network_authority_handoff_pending = False
 	result = message.get('battle_result')
 	if result is not None and not getattr(player, '_offhangar_network_result_applied', False):
 		callback = getattr(player, '_offhangar_apply_network_battle_result', None)
@@ -2916,9 +3289,15 @@ def _handle_events(player, events):
 	for event in events:
 		kind = event.get('kind')
 		if kind == 'authority':
-			client = getattr(player, '_offhangar_network_client', None)
-			if client is not None:
-				client._set_authority(event.get('player_id'))
+			# The paired snapshot is the role source of truth. The game-thread poller
+			# coalesces snapshots but preserves reliable events, so applying this event
+			# directly could let a newer event run before an older coalesced snapshot
+			# and flip native ownership twice in one poll.
+			try:
+				player._offhangar_network_announced_authority_id = int(
+					event.get('player_id'))
+			except (TypeError, ValueError):
+				player._offhangar_network_announced_authority_id = None
 		elif kind == 'bot_manifest':
 			player._offhangar_network_bot_manifest = event.get('bots') or []
 			LOG_NOTE('LAN bot manifest received: %d bot(s)' % len(

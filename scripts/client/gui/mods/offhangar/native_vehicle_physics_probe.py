@@ -609,7 +609,7 @@ def maybe_run(player, descriptor, position, yaw, space_id,
 				from gui.mods.offhangar import native_filter_bridge
 				if not native_filter_bridge.seed_filter(
 						vehicle_filter, _now(), state['space_id'],
-						state['position'], (0.0, 0.0, state['yaw'])):
+						state['position'], (state['yaw'], 0.0, 0.0)):
 					_next_candidate(state, 'native Filter::input bridge rejected seed')
 					return False
 				_pose_record(state, 'T1_native_seed_return', vehicle_filter)

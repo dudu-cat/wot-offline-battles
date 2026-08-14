@@ -110,6 +110,10 @@ def _validate_graph(graph, map_name):
         raise ValueError("navigation graph origin is invalid")
     if _number(graph.get("cell_size"), -1.0) <= 0.0:
         raise ValueError("navigation graph cell size is invalid")
+    validation = graph.get("validation") or {}
+    if not bool(validation.get("route_terminal_obb_clearance")):
+        raise ValueError(
+            "navigation graph lacks route terminal OBB clearance proof")
     return graph
 
 
@@ -217,6 +221,7 @@ class BotPathResolver(object):
         self.context_id = None
         self.grid = None
         self.frame = None
+        self.base_points = None
         self._frame_signature = None
         self._bot_paths = {}
         self._path_cache = {}
@@ -286,6 +291,14 @@ class BotPathResolver(object):
         self.graph_sha256 = digest
         self.grid = grid
         self.frame = frame
+        base_points = []
+        for value in (graph.get("bases") or ())[:2]:
+            world = (float(value[0]), 0.0, float(value[1]))
+            height = grid._baked_cell_height(grid.cell_for(world))
+            base_points.append(self._shared(
+                (world[0], float(height if height is not None else 0.0),
+                 world[2])))
+        self.base_points = tuple(base_points)
         self._frame_signature = signature
         context = "%s|%s|%s" % (
             self.map_name, digest, ",".join("%.6f" % value for value in signature))
@@ -463,7 +476,10 @@ class BotPathResolver(object):
     def _path_identity(self, order, goal):
         mode = str(order.get("combat_mode") or "route")
         route_mode = mode in ("route", "advance") and order.get("target_id") is None
-        if route_mode:
+        if mode == "base_defense":
+            prefix = ("bot", int(order.get("id", 0) or 0), mode,
+                      str(order.get("defense_base_id") or "own_base"))
+        elif route_mode:
             prefix = ("route", int(order.get("team", 0) or 0),
                       str(order.get("route_id") or "direct"),
                       int(order.get("route_index", 0) or 0))
@@ -508,9 +524,13 @@ class BotPathResolver(object):
         goal = self._world(goal_shared)
         distance = _distance(current, goal)
         mode = str(order.get("combat_mode") or "route")
-        if (distance <= 15.0 or order.get("throttle_override") == 0.0 or
+        if (order.get("throttle_override") == 0.0 or
                 mode in ("server_wait", "engage", "cover_hold",
                          "artillery_hold", "artillery_fire")):
+            return goal_shared, "server_hold"
+        if (distance <= 15.0 and self.grid.segment_clear(current, goal) and
+                not self.grid.segment_has_baked_hazard(
+                    current, goal, BAKED_SHALLOW_WATER)):
             return goal_shared, "server_hold"
 
         route_mode = mode in ("route", "advance") and order.get("target_id") is None

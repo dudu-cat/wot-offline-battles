@@ -60,6 +60,31 @@ def _resolve_team(veh, player_team):
     return team
 
 
+def coll_data_from_collision(vehicle, collision, hit_point, player_team):
+    """Build native gun-marker collision data from one proven shell impact.
+
+    The ballistic preview already selected the nearest vehicle/static hit.  Do
+    not cast a second straight ray here: a gun elevated to compensate for drop
+    would test a different plate (or miss the vehicle entirely).
+    """
+    if vehicle is None or collision is None:
+        return None
+    try:
+        nominal_armor = float(collision[2])
+        angle_cos = abs(float(collision[1]))
+        if angle_cos < MIN_ANGLE_COS:
+            angle_cos = MIN_ANGLE_COS
+        effective_armor = (nominal_armor / angle_cos
+                           if angle_cos > 0.0 else nominal_armor)
+        return (
+            _TeamShim(_resolve_team(vehicle, player_team)),
+            hit_point,
+            effective_armor,
+        )
+    except Exception:
+        return None
+
+
 def build_coll_data(mocks, player_id, player_team, start_pos, dir_vec,
                     world_dist, max_dist=DEFAULT_MAX_DIST):
     """Raycast the aim ray against the mock vehicles and return the collData
@@ -126,11 +151,6 @@ def build_coll_data(mocks, player_id, player_team, start_pos, dir_vec,
     # armor. collideSegment returns nominal plate armor (best[2]) plus the
     # impact-angle cosine (best[1]); convert the same way the shot resolver does
     # (armor / cos, capped at 85 deg) so the colour matches what a shot would do.
-    nominal_armor = best[2]
-    angle_cos = abs(best[1])
-    if angle_cos < MIN_ANGLE_COS:
-        angle_cos = MIN_ANGLE_COS
-    eff_armor = nominal_armor / angle_cos if angle_cos > 0.0 else nominal_armor
-    team = _resolve_team(best_veh, player_team)
     hit_point = start_pos + d.scale(best_d)
-    return (_TeamShim(team), hit_point, eff_armor)
+    return coll_data_from_collision(
+        best_veh, best, hit_point, player_team)

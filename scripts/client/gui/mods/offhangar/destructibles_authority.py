@@ -18,13 +18,30 @@ import math
 import BigWorld
 import Math
 
-_state = {'spaceID': None, 'chunks': {}, 'entities': set()}
+_state = {
+	'spaceID': None,
+	'chunks': {},
+	'entities': set(),
+	'collisionHealth': {},
+}
+
+try:
+	_INTEGER_TYPES = (int, long)
+except NameError:
+	_INTEGER_TYPES = (int,)
 
 _PROP_BY_KIND = {
 	'tree': 'fallenTrees',
 	'column': 'fallenColumns',
 	'fragile': 'destroyedFragiles',
 	'module': 'destroyedModules',
+}
+
+_PREV_BY_PROP = {
+	'fallenTrees': '_AreaDestructibles__prevFallenTrees',
+	'fallenColumns': '_AreaDestructibles__prevFallenColumns',
+	'destroyedFragiles': '_AreaDestructibles__prevDestroyedFragiles',
+	'destroyedModules': '_AreaDestructibles__prevDestroyedModules',
 }
 
 
@@ -44,6 +61,7 @@ def reset(spaceID=None):
 	_state['spaceID'] = spaceID
 	_state['chunks'] = {}
 	_state['entities'] = set()
+	_state['collisionHealth'] = {}
 
 
 def _ensure_shape():
@@ -55,6 +73,8 @@ def _ensure_shape():
 		_state['chunks'] = {}
 	if 'entities' not in _state:
 		_state['entities'] = set()
+	if 'collisionHealth' not in _state:
+		_state['collisionHealth'] = {}
 
 
 def _reset_if_new_space(spaceID):
@@ -67,8 +87,10 @@ def _chunk(chunkID):
 	_ensure_shape()
 	c = _state['chunks'].get(chunkID)
 	if c is None:
-		c = {'fallenTrees': [], 'fallenColumns': [], 'destroyedFragiles': [], 'destroyedModules': [], 'keys': set()}
+		c = {'fallenTrees': [], 'fallenColumns': [], 'destroyedFragiles': [], 'destroyedModules': [], 'keys': set(), 'faults': set()}
 		_state['chunks'][chunkID] = c
+	elif 'faults' not in c:
+		c['faults'] = set()
 	return c
 
 
@@ -77,6 +99,257 @@ def is_destroyed(chunkID, itemIndex, matKind=None):
 	if c is None:
 		return False
 	return (itemIndex, matKind) in c['keys'] or (itemIndex, None) in c['keys']
+
+
+def can_crush(owner, spaceID, chunkID, itemIndex, matKind, itemFilename,
+		vehicleSpeed):
+	"""Apply the retail mass/speed/health test to one resolved contact."""
+	try:
+		import AreaDestructibles
+		import DestructiblesCache
+		if is_destroyed(chunkID, itemIndex, matKind):
+			return True
+		desc = AreaDestructibles.g_cache.getDescByFilename(itemFilename)
+		if desc is None:
+			return False
+		scale = _destructible_scale(spaceID, chunkID, itemIndex)
+		if scale is None:
+			return False
+		mass = float(owner.typeDescriptor.physics['weight'])
+		speed = float(vehicleSpeed)
+		if mass <= 0.0:
+			return False
+		instantDamage = 0.5 * mass * speed * speed * 0.00015
+		if desc['type'] == AreaDestructibles.DESTR_TYPE_STRUCTURE:
+			module = desc.get('modules', {}).get(matKind)
+			if module is None:
+				return False
+			referenceHealth = module['health']
+		else:
+			unitMass = float(AreaDestructibles.g_cache.unitVehicleMass)
+			if unitMass <= 0.0:
+				return False
+			instantDamage *= math.pow(
+				mass / unitMass, desc['kineticDamageCorrection'])
+			referenceHealth = desc['health']
+		return (DestructiblesCache.scaledDestructibleHealth(
+			scale, referenceHealth) < instantDamage)
+	except Exception:
+		return False
+
+
+def _callback_int(value, name):
+	if isinstance(value, bool) or not isinstance(value, _INTEGER_TYPES):
+		raise ValueError('%s must be an integer' % name)
+	return int(value)
+
+
+def _finite_float(value, name):
+	try:
+		value = float(value)
+	except Exception:
+		raise ValueError('%s must be finite' % name)
+	if math.isnan(value) or math.isinf(value):
+		raise ValueError('%s must be finite' % name)
+	return value
+
+
+def _validate_point(pos):
+	try:
+		values = (pos.x, pos.y, pos.z)
+	except Exception:
+		try:
+			values = (pos[0], pos[1], pos[2])
+		except Exception:
+			raise ValueError('hitPoint must contain three finite values')
+	for value in values:
+		_finite_float(value, 'hitPoint')
+
+
+def _destructible_scale(spaceID, chunkID, itemIndex):
+	matrix_value = BigWorld.wg_getDestructibleMatrix(
+		spaceID, chunkID, itemIndex)
+	if matrix_value is None:
+		return None
+	matrix = Math.Matrix(matrix_value)
+	axis = matrix.applyVector(Math.Vector3(0.0, 1.0, 0.0))
+	scale = _finite_float(axis.length, 'destructible scale')
+	if scale <= 0.0:
+		raise ValueError('destructible scale must be positive')
+	return scale
+
+
+def _collision_record(spaceID, chunkID, itemIndex):
+	key = (chunkID, itemIndex)
+	record = _state['collisionHealth'].get(key)
+	if record is not None:
+		return record
+
+	import AreaDestructibles
+	import DestructiblesCache
+	desc = AreaDestructibles.g_cache.getDestructibleDesc(
+		spaceID, chunkID, itemIndex)
+	if desc is None:
+		return None
+	scale = _destructible_scale(spaceID, chunkID, itemIndex)
+	if scale is None:
+		return None
+
+	destructible_type = int(desc['type'])
+	values = {}
+	dependencies = {}
+	if destructible_type == AreaDestructibles.DESTR_TYPE_STRUCTURE:
+		import constants
+		normal_min = int(constants.DESTRUCTIBLE_MATKIND.NORMAL_MIN)
+		normal_max = int(constants.DESTRUCTIBLE_MATKIND.NORMAL_MAX)
+		modules = desc.get('modules')
+		if not isinstance(modules, dict) or not modules:
+			raise ValueError('structure has no destructible modules')
+		for raw_kind, module in modules.items():
+			mat_kind = _callback_int(raw_kind, 'module matKind')
+			if mat_kind < normal_min or mat_kind >= normal_max:
+				raise ValueError('structure matKind is outside the normal range')
+			if mat_kind in values:
+				raise ValueError('structure contains duplicate matKind')
+			values[mat_kind] = int(
+				DestructiblesCache.scaledDestructibleHealth(
+					scale, int(module['health'])))
+		for raw_root, raw_depends in desc.get(
+				'destroyDepends', {}).items():
+			root = _callback_int(raw_root, 'destroyDepends matKind')
+			if root not in values:
+				continue
+			depends = set()
+			for raw_kind in raw_depends:
+				mat_kind = _callback_int(
+					raw_kind, 'destroyDepends dependent matKind')
+				if mat_kind in values and mat_kind != root:
+					depends.add(mat_kind)
+			if depends:
+				dependencies[root] = tuple(sorted(depends))
+	else:
+		allowed_types = (
+			AreaDestructibles.DESTR_TYPE_TREE,
+			AreaDestructibles.DESTR_TYPE_FALLING_ATOM,
+			AreaDestructibles.DESTR_TYPE_FRAGILE,
+		)
+		if destructible_type not in allowed_types:
+			raise ValueError('unsupported destructible type')
+		values[None] = int(
+			DestructiblesCache.scaledDestructibleHealth(
+				scale, int(desc['health'])))
+
+	record = {
+		'type': destructible_type,
+		'values': values,
+		'dependencies': dependencies,
+	}
+	_state['collisionHealth'][key] = record
+	return record
+
+
+def collision_health(spaceID, chunkID, itemIndex):
+	"""Return the exact WGVehiclePhysics2 health callback payload.
+
+	Non-structure objects use one scalar health value. Structures use all of
+	their normal material kinds; omitted dictionary entries are interpreted as
+	zero by the retail executable. ``None`` means the streamed descriptor or
+	matrix is not available yet and preserves solid collision in native code.
+	"""
+	spaceID = _callback_int(spaceID, 'spaceID')
+	chunkID = _callback_int(chunkID, 'chunkID')
+	itemIndex = _callback_int(itemIndex, 'itemIndex')
+	_reset_if_new_space(spaceID)
+	record = _collision_record(spaceID, chunkID, itemIndex)
+	if record is None:
+		return None
+	values = record['values']
+	if None in values:
+		if is_destroyed(chunkID, itemIndex, None):
+			return 0
+		return int(values[None])
+	result = {}
+	for mat_kind, health in values.items():
+		if is_destroyed(chunkID, itemIndex, mat_kind):
+			result[int(mat_kind)] = 0
+		else:
+			result[int(mat_kind)] = int(health)
+	return result
+
+
+def _mark_collision_destroyed(chunkID, itemIndex, matKinds):
+	c = _chunk(chunkID)
+	for mat_kind in matKinds:
+		c['keys'].add((itemIndex, mat_kind))
+
+
+def apply_collision_damage(spaceID, chunkID, itemIndex, matKind, damage,
+		pos, fallYaw, impactSpeed):
+	"""Apply one six-argument native damage event to authoritative health.
+
+	Returns False for partial damage and True for an already or newly destroyed
+	object/module. Invalid native data and terminal delivery failures raise so
+	the owning body can fail closed after the shared physics batch completes.
+	"""
+	spaceID = _callback_int(spaceID, 'spaceID')
+	chunkID = _callback_int(chunkID, 'chunkID')
+	itemIndex = _callback_int(itemIndex, 'itemIndex')
+	matKind = _callback_int(matKind, 'matKind')
+	damage = _callback_int(damage, 'damage')
+	if damage <= 0:
+		raise ValueError('damage must be positive')
+	_validate_point(pos)
+	fallYaw = _finite_float(fallYaw, 'fallYaw')
+	impactSpeed = _finite_float(impactSpeed, 'impactSpeed')
+
+	_reset_if_new_space(spaceID)
+	record = _collision_record(spaceID, chunkID, itemIndex)
+	if record is None:
+		raise RuntimeError('destructible descriptor is unavailable')
+
+	import AreaDestructibles
+	destructible_type = record['type']
+	value_key = None
+	if destructible_type == AreaDestructibles.DESTR_TYPE_STRUCTURE:
+		value_key = matKind
+		if value_key not in record['values']:
+			raise ValueError('structure matKind is unavailable')
+	if is_destroyed(chunkID, itemIndex, value_key):
+		record['values'][value_key] = 0
+		return True
+
+	current = int(record['values'][value_key])
+	if current <= 0:
+		raise RuntimeError('damage reported for non-positive health')
+	remaining = max(0, current - damage)
+	if remaining > 0:
+		record['values'][value_key] = remaining
+		return False
+
+	if destructible_type == AreaDestructibles.DESTR_TYPE_TREE:
+		applied = destroy_tree(
+			spaceID, chunkID, itemIndex, fallYaw, impactSpeed, pos)
+	elif destructible_type == AreaDestructibles.DESTR_TYPE_FALLING_ATOM:
+		applied = destroy_column(
+			spaceID, chunkID, itemIndex, fallYaw, impactSpeed, pos)
+	elif destructible_type == AreaDestructibles.DESTR_TYPE_FRAGILE:
+		applied = destroy_fragile(spaceID, chunkID, itemIndex, pos)
+	elif destructible_type == AreaDestructibles.DESTR_TYPE_STRUCTURE:
+		applied = destroy_module(
+			spaceID, chunkID, itemIndex, matKind, pos, False)
+	else:
+		raise RuntimeError('unsupported destructible type')
+	if not applied:
+		raise RuntimeError('terminal destructible update was not delivered')
+
+	record['values'][value_key] = 0
+	destroyed_kinds = [value_key]
+	if value_key is not None:
+		for dependent in record['dependencies'].get(value_key, ()):
+			record['values'][dependent] = 0
+			destroyed_kinds.append(dependent)
+	_mark_collision_destroyed(chunkID, itemIndex, destroyed_kinds)
+	return True
 
 
 def _ensure_chunk(spaceID, chunkID, pos):
@@ -102,15 +375,17 @@ def _ensure_chunk(spaceID, chunkID, pos):
 	if _cur_sid is not None and _mgr_sid != _cur_sid:
 		mgr.startSpace(_cur_sid)
 	if chunkID not in _state['entities']:
-		_state['entities'].add(chunkID)
 		c = _chunk(chunkID)
 		try:
-			BigWorld.createEntity('AreaDestructibles', spaceID, 0, Math.Vector3(pos[0], pos[1], pos[2]), (0.0, 0.0, 0.0), {
+			entityID = BigWorld.createEntity('AreaDestructibles', spaceID, 0, Math.Vector3(pos[0], pos[1], pos[2]), (0.0, 0.0, 0.0), {
 				'fallenTrees': list(c['fallenTrees']),
 				'fallenColumns': list(c['fallenColumns']),
 				'destroyedFragiles': list(c['destroyedFragiles']),
 				'destroyedModules': list(c['destroyedModules']),
 			})
+			if entityID is None or int(entityID) <= 0:
+				raise RuntimeError('AreaDestructibles entity was not created')
+			_state['entities'].add(chunkID)
 		except Exception:
 			_log('DestrAuth: createEntity failed for chunk', chunkID)
 	try:
@@ -129,22 +404,13 @@ def _apply(spaceID, chunkID, pos, kind, destrData, dedupKey):
 	c = _chunk(chunkID)
 	if dedupKey in c['keys']:
 		return False
+	if dedupKey in c['faults']:
+		return False
 	ctrl = _ensure_chunk(spaceID, chunkID, pos)
-	c['keys'].add(dedupKey)
 	prop = _PROP_BY_KIND[kind]
-	c[prop].append(destrData)
-	if ctrl is not None:
-		# Server-style push: update the entity property and fire its
-		# set_ callback; the entity diffs vs its prev-set and animates
-		# only the new entry.
-		try:
-			getattr(ctrl, prop).append(destrData)
-			getattr(ctrl, 'set_' + prop)(None)
-			return True
-		except Exception:
-			_log('DestrAuth: property push failed, direct order fallback', chunkID, kind)
-	# Controller still spawning: order directly - the manager queues it
-	# per chunk until onChunkLoad and animates on flush.
+	# Use exactly one irreversible native delivery boundary. Calling a controller
+	# setter here would call this manager again internally, and an exception after
+	# that nested call cannot be rolled back safely.
 	dmgTypes = {
 		'tree': AreaDestructibles._DAMAGE_TYPE_TREE,
 		'column': AreaDestructibles._DAMAGE_TYPE_COLUMN,
@@ -152,11 +418,29 @@ def _apply(spaceID, chunkID, pos, kind, destrData, dedupKey):
 		'module': AreaDestructibles._DAMAGE_TYPE_MODULE,
 	}
 	try:
-		AreaDestructibles.g_destructiblesManager.orderDestructibleDestroy(chunkID, dmgTypes[kind], destrData, True)
-		return True
+		AreaDestructibles.g_destructiblesManager.orderDestructibleDestroy(
+			chunkID, dmgTypes[kind], destrData, True)
 	except Exception:
-		_log('DestrAuth: direct order failed', chunkID, kind)
-	return False
+		# The native method is irreversible and offers no receipt on exception.
+		# Latch this contact as a terminal fault instead of risking a duplicate
+		# delivery on the next physics frame.
+		c['faults'].add(dedupKey)
+		_log('DestrAuth: terminal direct order failure', chunkID, kind)
+		return False
+	# Commit replay and dedup state only after native delivery accepted it.
+	c[prop].append(destrData)
+	c['keys'].add(dedupKey)
+	if ctrl is not None:
+		# Mirror the accepted authoritative state without firing set_* and therefore
+		# without issuing a second native order.
+		try:
+			values = getattr(ctrl, prop)
+			if destrData not in values:
+				values.append(destrData)
+			setattr(ctrl, _PREV_BY_PROP[prop], frozenset(values))
+		except Exception:
+			_log('DestrAuth: controller ledger sync failed', chunkID, kind)
+	return True
 
 
 def destroy_tree(spaceID, chunkID, itemIndex, fallYaw, speed, pos):

@@ -91,6 +91,81 @@ class ArtilleryArcQueueTests(unittest.TestCase):
         self.assertEqual((True, None), queue.result("shot", 5.4))
         self.assertEqual((False, None), queue.result("shot", 5.6))
 
+    def test_lazy_request_does_not_build_candidates_when_queue_is_full(self):
+        queue = self.module.ArcProbeQueue(max_jobs=1)
+        candidate = self.candidate("low", ((0, 0, 0), (1, 0, 0)))
+        queue.request("first", (candidate,), (1, 0, 0), 6.0)
+        builds = []
+
+        ready, result = queue.request_lazy(
+            "second",
+            lambda: builds.append("built") or (candidate,),
+            (1, 0, 0),
+            6.0,
+        )
+
+        self.assertFalse(ready)
+        self.assertIsNone(result)
+        self.assertEqual([], builds)
+        self.assertTrue(queue.is_pending("first", 6.0))
+        self.assertFalse(queue.is_pending("second", 6.0))
+
+    def test_lazy_request_builds_candidates_once_when_capacity_exists(self):
+        queue = self.module.ArcProbeQueue()
+        candidate = self.candidate("low", ((0, 0, 0), (1, 0, 0)))
+        builds = []
+
+        ready, result = queue.request_lazy(
+            "shot",
+            lambda: builds.append("built") or (candidate,),
+            (1, 0, 0),
+            7.0,
+        )
+
+        self.assertFalse(ready)
+        self.assertIsNone(result)
+        self.assertEqual(["built"], builds)
+        self.assertEqual(1, queue.advance(7.0, 4, lambda _a, _b: None))
+        self.assertEqual((True, candidate), queue.result("shot", 7.0))
+
+    def test_lazy_request_does_not_rebuild_pending_or_cached_result(self):
+        queue = self.module.ArcProbeQueue()
+        candidate = self.candidate("low", ((0, 0, 0), (1, 0, 0)))
+        builds = []
+        factory = lambda: builds.append("built") or (candidate,)
+
+        self.assertEqual(
+            (False, None),
+            queue.request_lazy("shot", factory, (1, 0, 0), 8.0),
+        )
+        self.assertEqual(
+            (False, None),
+            queue.request_lazy("shot", factory, (1, 0, 0), 8.1),
+        )
+        self.assertEqual(["built"], builds)
+
+        queue.advance(8.1, 4, lambda _a, _b: None)
+        self.assertEqual(
+            (True, candidate),
+            queue.request_lazy("shot", factory, (1, 0, 0), 8.2),
+        )
+        self.assertEqual(["built"], builds)
+
+    def test_lazy_request_does_not_rebuild_cached_empty_solution(self):
+        queue = self.module.ArcProbeQueue(failure_ttl=0.5)
+        builds = []
+        factory = lambda: builds.append("built") or ()
+
+        self.assertEqual(
+            (True, None),
+            queue.request_lazy("shot", factory, (0, 0, 0), 9.0),
+        )
+        self.assertEqual(
+            (True, None),
+            queue.request_lazy("shot", factory, (0, 0, 0), 9.1),
+        )
+        self.assertEqual(["built"], builds)
+
 
 if __name__ == "__main__":
     unittest.main()

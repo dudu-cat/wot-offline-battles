@@ -79,6 +79,28 @@ def detection_distance(view_range, camouflage):
 	return clamp(distance, PROXIMITY_SPOT_DISTANCE, MAX_SPOT_DISTANCE)
 
 
+def foliage_visibility_bound(distance_sq, view_range, camouflage,
+		max_foliage_bonus=0.60):
+	"""Classify a pair only when every possible foliage result agrees.
+
+	``True`` means the target remains inside spotting range even at the maximum
+	foliage bonus, ``False`` means it is outside range with no foliage, and
+	``None`` preserves the exact pair-specific foliage query for the interval in
+	between.  This is a mathematical short-circuit, not a visibility cache.
+	"""
+	distance_sq = max(0.0, float(distance_sq or 0.0))
+	clear_range = detection_distance(view_range, camouflage)
+	if distance_sq > clear_range * clear_range:
+		return False
+	worst_camouflage = clamp(
+		float(camouflage or 0.0) + max(0.0, float(max_foliage_bonus or 0.0)),
+		0.0, 0.95)
+	worst_range = detection_distance(view_range, worst_camouflage)
+	if distance_sq <= worst_range * worst_range:
+		return True
+	return None
+
+
 def is_detected(distance, view_range, camouflage, has_line_of_sight=True):
 	distance = max(0.0, float(distance or 0.0))
 	if distance <= PROXIMITY_SPOT_DISTANCE:

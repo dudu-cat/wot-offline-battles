@@ -18,16 +18,78 @@ RVA_PY_INIT_MODULE4 = 0x00019800
 RVA_PY_ARG_PARSE_TUPLE = 0x0001D580
 RVA_PY_ERR_SET_STRING = 0x0000D620
 RVA_WG_FILTER2_TYPE = 0x00D77FC8
+RVA_WG_VEHICLE_PHYSICS2_TYPE = 0x00D77690
 RVA_WG_FILTER2_TYPE_NAME = 0x00B672E8
 RVA_WG_FILTER2_VTABLE = 0x00B67698
 RVA_WG_FILTER2_INPUT = 0x0050A350
+RVA_WG_FILTER2_OUTPUT = 0x0050DDE0
+RVA_WG_FILTER2_SET_VEHICLE_PHYSICS = 0x0050B4D0
+RVA_WG_PHYSICS_FINALIZE_ROOT = 0x004EAF20
+RVA_WG_PHYSICS_MATRIX_GETTER = 0x004E3AB0
+RVA_MATRIX_YAW = 0x00130B40
+RVA_MATRIX_PITCH = 0x00130E00
+RVA_MATRIX_ROLL = 0x00149170
+RVA_ENTITY_DIRECTION_REGISTRATION = 0x0017834F
+RVA_ENTITY_YAW_GETTER = 0x004FB530
+RVA_ENTITY_PITCH_GETTER = 0x00228660
+RVA_ENTITY_ROLL_GETTER = 0x00451880
 
 SIGNATURES = {
     RVA_PY_INIT_MODULE4: bytes.fromhex("81ec18020000a1"),
     RVA_PY_ARG_PARSE_TUPLE: bytes.fromhex("518b4c24088b5424"),
     RVA_PY_ERR_SET_STRING: bytes.fromhex("8b4424085650e8e5"),
     RVA_WG_FILTER2_INPUT: bytes.fromhex("83ec145355568bf1"),
+    RVA_WG_FILTER2_OUTPUT: bytes.fromhex("6aff680ec6ec0064"),
+    RVA_WG_FILTER2_SET_VEHICLE_PHYSICS: bytes.fromhex(
+        "6aff68e0c5ec0064"
+    ),
+    RVA_WG_PHYSICS_FINALIZE_ROOT: bytes.fromhex(
+        "83ec185355568bd9578dab98030000"
+    ),
+    RVA_WG_PHYSICS_MATRIX_GETTER: bytes.fromhex(
+        "81c11807000051e814b8caff"
+    ),
+    RVA_MATRIX_YAW: bytes.fromhex("83ec0c8b41208b51"),
+    RVA_MATRIX_PITCH: bytes.fromhex("83ec108b41208b51"),
+    RVA_MATRIX_ROLL: bytes.fromhex("83ec1c8b018b5104"),
+    RVA_ENTITY_YAW_GETTER: bytes.fromhex("d9412851d91c24"),
+    RVA_ENTITY_PITCH_GETTER: bytes.fromhex("d9412c51d91c24"),
+    RVA_ENTITY_ROLL_GETTER: bytes.fromhex("d9413051d91c24"),
 }
+
+BRIDGE_REQUIRED_STRINGS = (
+    b"seed_filter\0",
+    b"output_filter\0",
+    b"filter_has_physics\0",
+    b"publish_physics_root\0",
+    b"native bridge Filter::output mismatch\0",
+    b"native bridge Filter::output timestamp is not finite\0",
+    b"native bridge Filter::output timestamp is not newer\0",
+    b"native bridge Filter::output timestamp did not advance\0",
+    b"native bridge filter physics owner mismatch\0",
+    b"native bridge requires an exact WGVehiclePhysics2 object\0",
+    b"native bridge physics root matrix is unreadable\0",
+    b"native bridge physics root output did not advance\0",
+)
+
+# MinGW compiles the three exact Matrix angle calls into these ordered image-
+# base-relative immediates inside publish_physics_root. Requiring the sequence
+# prevents a future yaw/roll source swap from passing the executable ABI audit.
+BRIDGE_ROOT_ANGLE_ORDER = bytes.fromhex(
+    "8d86400b1300"  # Matrix::yaw
+    "d95dcc"
+    "ffd0"
+    "8d86000e1300"  # Matrix::pitch
+    "8b4da0"
+    "81c670911400"  # Matrix::roll
+    "d95ddc"
+    "ffd0"
+    "8b4da0"
+    "d95de0"
+    "ffd6"
+    "d9c0"
+    "d95de4"
+)
 
 
 def require(condition, message):
@@ -169,6 +231,38 @@ def audit_executable(path):
         EXPECTED_IMAGE_BASE + RVA_WG_FILTER2_INPUT,
         "WGVehicleFilter2 Filter::input vtable slot mismatch",
     )
+    require(
+        pe.u32_at_rva(RVA_WG_FILTER2_VTABLE + 8) ==
+        EXPECTED_IMAGE_BASE + RVA_WG_FILTER2_OUTPUT,
+        "WGVehicleFilter2 Filter::output vtable slot mismatch",
+    )
+    setter = pe.bytes_at_rva(RVA_WG_FILTER2_SET_VEHICLE_PHYSICS, 0x90)
+    require(
+        struct.pack("<I", EXPECTED_IMAGE_BASE +
+                    RVA_WG_VEHICLE_PHYSICS2_TYPE) in setter,
+        "WGVehicleFilter2 setter physics type gate mismatch",
+    )
+    require(
+        bytes.fromhex("8b86f0040000c6442458013bc7") in setter and
+        bytes.fromhex("89bef0040000") in setter,
+        "WGVehicleFilter2 physics owner offset mismatch",
+    )
+    finalizer = pe.bytes_at_rva(RVA_WG_PHYSICS_FINALIZE_ROOT, 0x100)
+    require(
+        bytes.fromhex("8dab18070000") in finalizer and
+        bytes.fromhex("8db398030000") in finalizer,
+        "WGVehiclePhysics2 root matrix copy contract mismatch",
+    )
+    registration = pe.bytes_at_rva(RVA_ENTITY_DIRECTION_REGISTRATION, 0xE0)
+    require(
+        bytes.fromhex("68c0c0f200") in registration and
+        bytes.fromhex("bf30b58f00") in registration and
+        bytes.fromhex("68c4c0f200") in registration and
+        bytes.fromhex("bf60866200") in registration and
+        bytes.fromhex("68ccc0f200") in registration and
+        bytes.fromhex("bf80188500") in registration,
+        "Entity yaw/pitch/roll registration contract mismatch",
+    )
     print("EXE OK sha256=%s timestamp=0x%08x image=0x%x" % (
         digest, pe.timestamp, pe.image_size
     ))
@@ -189,6 +283,15 @@ def audit_bridge(path):
         "native bridge unexpectedly imports a Python DLL",
     )
     require(b"kernel32.dll" in imports, "native bridge lacks KERNEL32")
+    for marker in BRIDGE_REQUIRED_STRINGS:
+        require(
+            marker in pe.data,
+            "native bridge lacks required output marker: %r" % marker[:-1],
+        )
+    require(
+        BRIDGE_ROOT_ANGLE_ORDER in pe.data,
+        "native bridge physics root yaw/pitch/roll call order mismatch",
+    )
     digest = hashlib.sha256(pe.data).hexdigest()
     print("PYD OK sha256=%s imports=%s exports=%s" % (
         digest,

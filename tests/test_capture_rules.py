@@ -29,6 +29,8 @@ class CaptureRulesTests(unittest.TestCase):
         self.assertEqual(4, self.capture_rules.drop_vehicle(state, "a"))
         self.assertEqual(4, state["points"])
         self.assertEqual({"b": 4}, state["contributors"])
+        self.assertEqual(["b"], state["active_contributors"])
+        self.assertEqual(1, state["invaders"])
 
     def test_leaving_the_circle_drops_only_the_leaver(self):
         state = self.capture_rules.new_state()
@@ -41,7 +43,7 @@ class CaptureRulesTests(unittest.TestCase):
         self.assertEqual(4, state["points"])
         self.assertEqual({"b": 4}, state["contributors"])
 
-    def test_defender_pauses_without_erasing_existing_points(self):
+    def test_owner_presence_does_not_pause_standard_ctf_capture(self):
         state = self.capture_rules.new_state()
         self.capture_rules.advance(state, ["a"])
 
@@ -49,9 +51,60 @@ class CaptureRulesTests(unittest.TestCase):
             state, ["a"], defenders_present=True
         )
 
-        self.assertTrue(result["stopped"])
+        # The exact 0.8.2 standard CTF control point declares
+        # ownerStopsCapturing=false: an owner merely standing in its base must
+        # not pause capture.  Damage remains the mechanism that resets points.
+        self.assertFalse(result["stopped"])
+        self.assertEqual(2, state["points"])
+        self.assertEqual({"a": 2}, state["contributors"])
+
+    def test_team_two_player_inside_team_one_cliff_base_emits_progress_with_owner_present(self):
+        # Exact spaces/18_cliff team-1 ControlPoint world position and radius.
+        base_xz = (-287.414, -436.601)
+        radius_sq = 50.0 * 50.0
+        player_team = 2
+        base_team = 1
+        player_xz = (base_xz[0] + 49.0, base_xz[1])
+        defender_xz = base_xz
+
+        def inside(position):
+            dx = position[0] - base_xz[0]
+            dz = position[1] - base_xz[1]
+            return dx * dx + dz * dz <= radius_sq
+
+        invading_team = 2 if base_team == 1 else 1
+        invader_ids = []
+        if player_team == invading_team and inside(player_xz):
+            invader_ids.append("player")
+        defenders_present = inside(defender_xz)
+
+        state = self.capture_rules.new_state()
+        old_points = state["points"]
+        old_stopped = state["stopped"]
+        result = self.capture_rules.advance(
+            state, invader_ids, defenders_present=defenders_present
+        )
+
+        ui_updates = []
+        if (
+            state["points"] != old_points
+            or state["stopped"] != old_stopped
+            or invader_ids
+        ):
+            ui_updates.append({
+                "base_team": base_team,
+                "points": state["points"],
+                "stopped": result["stopped"],
+            })
+
+        self.assertEqual(["player"], invader_ids)
+        self.assertTrue(defenders_present)
         self.assertEqual(1, state["points"])
-        self.assertEqual({"a": 1}, state["contributors"])
+        self.assertFalse(result["stopped"])
+        self.assertEqual(
+            [{"base_team": 1, "points": 1, "stopped": False}],
+            ui_updates,
+        )
 
     def test_rate_is_capped_and_rotated_across_four_invaders(self):
         state = self.capture_rules.new_state()

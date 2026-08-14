@@ -212,7 +212,7 @@ class NativeVehiclePhysicsProbeTest(unittest.TestCase):
             if not self.bridge_available:
                 return False
             vehicle_filter.bodyMatrix.translation = Vector3(position_tuple)
-            vehicle_filter.bodyMatrix.yaw = float(direction[2])
+            vehicle_filter.bodyMatrix.yaw = float(direction[0])
             vehicle_filter.export_valid = True
             return True
 

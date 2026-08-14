@@ -31,7 +31,7 @@ from server_bot_navigation import BotPathResolver
 
 
 PROTOCOL_VERSION = 8
-CLIENT_BUILD = "1.8.41-native-experimental-20260812"
+CLIENT_BUILD = "1.8.56-native-experimental-20260814"
 TICK_HZ = 30.0
 SERVER_PERF_LOG_SECONDS = 5.0
 PREBATTLE_COUNTDOWN_SECONDS = 30.0
@@ -43,6 +43,7 @@ BOT_ORDER_WIRE_FIELDS = (
     "id", "target_id", "target_kind", "aim_position", "face_position",
     "move_position", "fire_allowed", "combat_mode", "throttle_override",
     "fire_range", "route_id", "route_index", "route_anchor", "shell_index",
+    "defense_base_id",
 )
 BOT_AUTHORITY_SNAPSHOT_FIELDS = (
     "id", "health", "alive", "nav_source", "nav_order_revision",
@@ -496,7 +497,8 @@ class BattleState:
                     "traversing": 0, "limited": 0},
             "driver": {"moving": 0, "drive": 0, "avoid": 0,
                        "blocked": 0, "recovery": 0, "arrived": 0,
-                       "server_wait": 0, "water_guard": 0, "full": 0,
+                       "server_wait": 0, "traffic_wait": 0,
+                       "water_guard": 0, "full": 0,
                        "cruise": 0, "speed_pct": 0, "slow": 0},
             "safety": {"water_guard_total": 0, "water_guard_active": 0,
                        "edge_guard_total": 0, "edge_guard_active": 0,
@@ -505,8 +507,10 @@ class BattleState:
         }
         self.next_bot_ai_log = 0.0
         self.rules_state = {"bases": {
-            "1": {"points": 0, "stopped": False, "contributors": {}, "cursor": 0},
-            "2": {"points": 0, "stopped": False, "contributors": {}, "cursor": 0},
+            "1": {"points": 0, "stopped": False, "contributors": {},
+                  "active_contributors": [], "invaders": 0, "cursor": 0},
+            "2": {"points": 0, "stopped": False, "contributors": {},
+                  "active_contributors": [], "invaders": 0, "cursor": 0},
         }}
         self.battle_result = None
         self.pending_events = []
@@ -548,7 +552,12 @@ class BattleState:
                 # A relay promoted to authority must apply one complete canonical
                 # pose before it starts publishing locally simulated bot state.
                 # Its first accepted bot-state report proves that handoff happened.
-                authority.bot_snapshot_full_pending = old is not None
+                # A previous connection alone does not imply that canonical bot
+                # state exists.  If the first authority disconnects before it
+                # publishes the manifest, the replacement must be allowed to
+                # publish that initial manifest instead of waiting forever for an
+                # empty handoff snapshot.
+                authority.bot_snapshot_full_pending = bool(self.bot_manifest)
             self.bot_planner.clear_observations()
             self.bot_navigation_stats = {
                 "graph": {"source": "none", "cell_mm": 0, "nodes": 0},
@@ -562,7 +571,8 @@ class BattleState:
                         "traversing": 0, "limited": 0},
                 "driver": {"moving": 0, "drive": 0, "avoid": 0,
                            "blocked": 0, "recovery": 0, "arrived": 0,
-                           "server_wait": 0, "water_guard": 0, "full": 0,
+                           "server_wait": 0, "traffic_wait": 0,
+                           "water_guard": 0, "full": 0,
                            "cruise": 0, "speed_pct": 0, "slow": 0},
                 "safety": {"water_guard_total": 0, "water_guard_active": 0,
                            "edge_guard_total": 0, "edge_guard_active": 0,
@@ -624,6 +634,11 @@ class BattleState:
         with self.lock:
             if len(self.players) >= self.max_players:
                 return None, "full", None
+            if self.phase == "battle":
+                # A frozen manifest occupies every non-human slot selected at
+                # battle start. Rejecting from the phase boundary also closes the
+                # race while the authority is publishing that first manifest.
+                return None, "battle_in_progress", None
             player_id = self.next_id
             self.next_id += 1
             team, slot = self._assign_team_and_slot()
@@ -731,7 +746,8 @@ class BattleState:
                             "traversing": 0, "limited": 0},
                     "driver": {"moving": 0, "drive": 0, "avoid": 0,
                                "blocked": 0, "recovery": 0, "arrived": 0,
-                               "server_wait": 0, "water_guard": 0, "full": 0,
+                               "server_wait": 0, "traffic_wait": 0,
+                               "water_guard": 0, "full": 0,
                                "cruise": 0, "speed_pct": 0, "slow": 0},
                     "safety": {"water_guard_total": 0, "water_guard_active": 0,
                                "edge_guard_total": 0, "edge_guard_active": 0,
@@ -740,8 +756,10 @@ class BattleState:
                 }
                 self.next_bot_ai_log = 0.0
                 self.rules_state = {"bases": {
-                    "1": {"points": 0, "stopped": False, "contributors": {}, "cursor": 0},
-                    "2": {"points": 0, "stopped": False, "contributors": {}, "cursor": 0},
+                    "1": {"points": 0, "stopped": False, "contributors": {},
+                          "active_contributors": [], "invaders": 0, "cursor": 0},
+                    "2": {"points": 0, "stopped": False, "contributors": {},
+                          "active_contributors": [], "invaders": 0, "cursor": 0},
                 }}
                 self.battle_result = None
                 self.pending_events = []
@@ -919,15 +937,52 @@ class BattleState:
         with self.lock:
             if self.phase != "battle" or player_id != self.bot_authority_id:
                 return False
+            try:
+                if int(message.get("round_id", -1)) != int(self.round_id):
+                    return False
+            except (TypeError, ValueError):
+                return False
+            manifest_nonce = message.get("manifest_nonce")
+            if (not isinstance(manifest_nonce, str) or
+                    not manifest_nonce or len(manifest_nonce) > 96):
+                return False
             incoming = message.get("bots") or []
             if not isinstance(incoming, (list, tuple)):
                 return False
+            navigation_frame = BotPathResolver.sanitize_frame(
+                message.get("map_frame"))
+            if navigation_frame is None:
+                return False
             roster = {entry["id"]: entry for entry in self.bot_roster}
+            if self.bot_manifest:
+                # A late join or authority handoff must preserve the bot identities
+                # frozen when the battle began. Recomputing from the current humans
+                # could silently add or remove a bot during the same round.
+                expected_ids = set(
+                    int(entry["id"]) for entry in self.bot_manifest)
+            else:
+                occupied_slots = set(
+                    (int(player.team), int(player.slot))
+                    for player in self.players.values()
+                    if player.connected and int(player.team) in (1, 2))
+                expected_ids = set(
+                    bot_id for bot_id, entry in roster.items()
+                    if (int(entry["team"]), int(entry["slot"])) not in occupied_slots
+                ) if occupied_slots else set(roster)
             manifest = []
             states = {}
             seen = set()
             for raw in incoming[:30]:
                 if not isinstance(raw, dict):
+                    continue
+                if raw.get("world_pose") is not True or any(
+                        key not in raw for key in ("x", "y", "z", "yaw")):
+                    continue
+                try:
+                    if any(not math.isfinite(float(raw[key])) for key in
+                           ("x", "y", "z", "yaw")):
+                        continue
+                except (TypeError, ValueError):
                     continue
                 try:
                     bot_id = int(raw.get("id"))
@@ -954,18 +1009,26 @@ class BattleState:
                     "profile": self._sanitize_bot_profile(raw.get("profile")),
                     "route": self._sanitize_bot_route(raw.get("route")),
                 }
+                state = self._sanitize_bot_state(raw, entry, None)
+                entry.update({
+                    "world_pose": True,
+                    "x": state["x"], "y": state["y"], "z": state["z"],
+                    "yaw": state["yaw"], "aim_yaw": state["aim_yaw"],
+                })
                 manifest.append(entry)
-                states[bot_id] = self._sanitize_bot_state(raw, entry, None)
-            if not manifest:
+                states[bot_id] = state
+            if not manifest or seen != expected_ids:
                 return False
-            self.bot_manifest = manifest
-            if not self.bot_states:
-                self.bot_states = states
-            self.bot_navigation_frame = BotPathResolver.sanitize_frame(
-                message.get("map_frame"))
+            # The first accepted manifest is immutable for the round. Replays of
+            # the identical nonce/body are idempotent; the same IDs with changed
+            # tanks, poses, routes or coordinate frame are not a revision protocol.
+            if self.bot_manifest:
+                return bool(
+                    manifest == self.bot_manifest and
+                    navigation_frame == self.bot_navigation_frame)
             try:
                 changed = self.bot_navigation.configure(
-                    self.map_name, self.bot_navigation_frame)
+                    self.map_name, navigation_frame)
                 if changed:
                     details = self.bot_navigation.diagnostics()
                     _server_log(
@@ -978,7 +1041,13 @@ class BattleState:
                 self.bot_navigation_targets = {}
                 _server_log("BOT NAV unavailable map=%s error=%s" % (
                     self.map_name, error))
-            self.pending_events.append({"kind": "bot_manifest", "bots": list(manifest)})
+                return False
+            self.bot_manifest = manifest
+            if not self.bot_states:
+                self.bot_states = states
+            self.bot_navigation_frame = navigation_frame
+            self.pending_events.append({
+                "kind": "bot_manifest", "bots": list(manifest)})
             return True
 
     @staticmethod
@@ -1114,8 +1183,8 @@ class BattleState:
                     raw_driver = {}
                 navigation["driver"] = {}
                 for name in ("moving", "drive", "avoid", "blocked", "recovery",
-                             "arrived", "server_wait", "water_guard", "full",
-                             "cruise", "slow"):
+                             "arrived", "server_wait", "traffic_wait",
+                             "water_guard", "full", "cruise", "slow"):
                     navigation["driver"][name] = max(0, min(
                         int(_finite_float(raw_driver.get(name), 0)), 30))
                 navigation["driver"]["speed_pct"] = max(0, min(
@@ -1194,6 +1263,10 @@ class BattleState:
             "killer_kind": killer_kind,
             "killer_id": killer_id,
             "alive": bool(raw.get("alive", reported_health > 0)) and reported_health > 0,
+            "mobility_disabled": bool(raw.get("mobility_disabled", False)),
+            "mobility_repair_seconds": round(_clamp(_finite_float(
+                raw.get("mobility_repair_seconds"), 0.0), 0.0, 30.0), 3)
+                if bool(raw.get("mobility_disabled", False)) else 0.0,
         }
 
     def update_bot_states(self, player_id, message):
@@ -1346,14 +1419,90 @@ class BattleState:
                             continue
                         if points:
                             contributors[str(vehicle_id)[:64]] = points
+                active_contributors = []
+                raw_active = raw.get("active_contributors") or ()
+                if not isinstance(raw_active, (list, tuple)):
+                    raw_active = ()
+                for vehicle_id in raw_active[:30]:
+                    value = str(vehicle_id)[:64]
+                    parts = value.split(":", 1)
+                    if len(parts) != 2 or parts[0] not in ("human", "bot"):
+                        continue
+                    try:
+                        identity_id = int(parts[1])
+                    except (TypeError, ValueError):
+                        continue
+                    if identity_id <= 0:
+                        continue
+                    if parts[0] == "human":
+                        identity = self.players.get(identity_id)
+                        if (identity is None or not identity.connected or
+                                not identity.alive or identity.team == team):
+                            continue
+                    else:
+                        identity = next((entry for entry in self.bot_roster
+                                         if entry["id"] == identity_id), None)
+                        state = self.bot_states.get(identity_id)
+                        if (identity is None or identity["team"] == team or
+                                (state is not None and not state.get("alive", True))):
+                            continue
+                    active_contributors.append("%s:%d" %
+                                               (parts[0], identity_id))
+                active_contributors = sorted(set(active_contributors))
                 bases[str(team)] = {
                     "points": max(0, min(int(_finite_float(raw.get("points"), 0)), 100)),
                     "stopped": bool(raw.get("stopped", False)),
                     "contributors": contributors,
+                    "active_contributors": active_contributors,
+                    "invaders": len(active_contributors),
                     "cursor": max(0, min(int(_finite_float(raw.get("cursor"), 0)), 100000)),
                 }
             self.rules_state = {"bases": bases}
             return True
+
+    def _bot_defense_context(self):
+        """Build planner input from authority capture state and baked bases."""
+        base_points = self.bot_navigation.base_points
+        if not base_points or len(base_points) < 2:
+            return None
+        bases = {}
+        states = {}
+        contributors = {}
+        rules_bases = self.rules_state.get("bases", {})
+        for team in (1, 2):
+            point = base_points[team - 1]
+            bases[str(team)] = [{
+                "id": "%d:0" % team,
+                "x": float(point[0]),
+                "y": float(point[1]),
+                "z": float(point[2]),
+            }]
+            raw = rules_bases.get(str(team), {})
+            invaders = max(0, min(int(_finite_float(
+                raw.get("invaders"), 0)), 3))
+            points = max(0, min(int(_finite_float(
+                raw.get("points"), 0)), 100))
+            states[str(team)] = {
+                "points": points,
+                "stopped": bool(raw.get("stopped", False)),
+                "invaders": invaders,
+                "time_left": ((100.0 - points) / float(invaders)
+                              if invaders else 0.0),
+            }
+            active = []
+            for value in raw.get("active_contributors") or ():
+                parts = str(value).split(":", 1)
+                if len(parts) != 2 or parts[0] not in ("human", "bot"):
+                    continue
+                try:
+                    identity_id = int(parts[1])
+                except (TypeError, ValueError):
+                    continue
+                if identity_id > 0:
+                    active.append({"kind": parts[0], "id": identity_id})
+            contributors[str(team)] = active
+        return {"bases": bases, "states": states,
+                "contributors": contributors}
 
     def report_battle_result(self, player_id, message):
         with self.lock:
@@ -1540,7 +1689,7 @@ class BattleState:
             self.bot_orders = self.bot_planner.build_orders(
                 self.bot_manifest, list(self.bot_states.values()),
                 [self._public_player(p) for p in self.players.values() if p.connected],
-                now)
+                now, self._bot_defense_context())
             metrics["planner_seconds"] = time.perf_counter() - stage_started
             stage_started = time.perf_counter()
             self.bot_navigation_targets = self.bot_navigation.resolve(
@@ -1621,7 +1770,7 @@ class BattleState:
                 "astar=pending:%d,oldest:%dms,tick_age:%dms,done:%d,failed:%d "
                 "orders=server:%d,client:%d,loaded:%d,acked:%d "
                 "aim=targeted:%d,aligned:%d,traversing:%d,limited:%d,alive:%d "
-                "driver=moving:%d,drive:%d,avoid:%d,blocked:%d,recovery:%d,arrived:%d,wait:%d,full:%d,cruise:%d,speed:%d%%,slow:%d "
+                "driver=moving:%d,drive:%d,avoid:%d,blocked:%d,recovery:%d,arrived:%d,wait:%d,traffic:%d,full:%d,cruise:%d,speed:%d%%,slow:%d "
                 "safety=water:%d/%d,edge:%d/%d,veto:w%d,t%d,o%d,e%d" % (
                     reports.get(1, 0), reports.get(2, 0), reports.get("accepted", 0),
                     teams[1]["visible"], teams[1]["contacts"],
@@ -1659,6 +1808,7 @@ class BattleState:
                     navigation.get("driver", {}).get("recovery", 0),
                     navigation.get("driver", {}).get("arrived", 0),
                     navigation.get("driver", {}).get("server_wait", 0),
+                    navigation.get("driver", {}).get("traffic_wait", 0),
                     navigation.get("driver", {}).get("full", 0),
                     navigation.get("driver", {}).get("cruise", 0),
                     navigation.get("driver", {}).get("speed_pct", 0),
@@ -1871,8 +2021,12 @@ class ClientHandler(socketserver.BaseRequestHandler):
             player, join_error, current_battle = server.state.add_player(
                 conn, self.client_address, hello)
             if player is None:
-                message = ("server is full" if join_error == "full" else
-                           "connection bootstrap failed")
+                if join_error == "full":
+                    message = "server is full"
+                elif join_error == "battle_in_progress":
+                    message = "battle already has a frozen bot lineup"
+                else:
+                    message = "connection bootstrap failed"
                 self._send_raw(conn, {"type": "error", "code": join_error, "message": message})
                 _server_log("Rejected %s:%d: %s" % (self.client_address[0], self.client_address[1], message))
                 return
@@ -1957,7 +2111,20 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     _server_log("HIT REPORT rejected attacker=%d target=%s seq=%s" % (
                         player.player_id, message.get("target"), message.get("shot_seq")))
             elif message_type == "bot_manifest":
-                if state.update_bot_manifest(player.player_id, message):
+                accepted = state.update_bot_manifest(player.player_id, message)
+                player.send({
+                    "type": "bot_manifest_result",
+                    "round_id": state.round_id,
+                    "manifest_nonce": str(
+                        message.get("manifest_nonce") or "")[:96],
+                    "accepted": bool(accepted),
+                    "bot_ids": (sorted(
+                        int(entry["id"]) for entry in state.bot_manifest)
+                        if accepted else []),
+                    "bots": (list(state.bot_manifest) if accepted else []),
+                    "code": "accepted" if accepted else "rejected",
+                })
+                if accepted:
                     routed = sum(1 for entry in state.bot_manifest
                                  if entry.get("route", {}).get("waypoints"))
                     lanes = {}

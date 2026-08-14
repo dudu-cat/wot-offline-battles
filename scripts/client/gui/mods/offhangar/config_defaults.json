@@ -1,6 +1,6 @@
 {
     "_readme": "offhangar options. The live copy is <game folder>/offhangar_user/config.json - created from these defaults on first launch, and it survives mod updates. Options missing from the live copy fall back to the values in config_defaults.json shipped with the mod.",
-    "_experimental_features": "EXPERIMENTAL toggles - may be unstable or change between versions: map_variety (0 = unlimited maps; VA/fragmentation risk on very long sessions), experimental_native_bot_physics (retail authority-side bot rigid bodies; exact supported EXE only).",
+    "_experimental_features": "EXPERIMENTAL options may be unstable or change between versions. map_variety=0 means unlimited maps and may increase VA fragmentation in very long sessions.",
     "nickname": "Defaultplayer",
     "queue_wait_time_seconds": 7.0,
     "loading_screen_time_seconds": 8.0,
@@ -31,8 +31,7 @@
     "_physics": "physics_debug=true logs a ~5 Hz telemetry row to offhangar_user/physics_telemetry.csv while driving (speed, accel, slope, grip vs gravity, turn, slide) - graph it to tune vs original WoT. physics_tuning overrides the physics constants WITHOUT recompiling (restart only). Keys: gravity_factor, cohesion, drive_traction (climb grip, ~0.75 = ~35 deg limit; raise to climb steeper), power_factor, bkwd_power_fraction, traverse_accel_time, traverse_speed_cost, coast_brake_share, steer_resist_mult, slide_max, overspeed_max_factor (downhill overspeed cap, x spec top speed), overspeed_damp (how fast overspeed bleeds back), slope_coh_decay, slope_coh_decay_y, coh_decay_bound, fall_safe_speed, fall_dmg_per_ms, ram_safe_speed. Empty = WG defaults.",
     "physics_debug": false,
     "physics_tuning": {},
-    "_native_physics": "EXPERIMENTAL 0.8.2-only authority simulation. Uses the retail WGVehicleFilter2/WGVehiclePhysics2 stack for bot rigid bodies and requires the exact supported WorldOfTanks.exe. LAN replicas stay snapshot-only. Setup failures fall back before native activation; an active body with an invalid pose freezes until the battle ends instead of hot-switching movement owners.",
-    "experimental_native_bot_physics": true,
+    "_native_physics": "This experimental 0.8.2-only build always uses the retail WGVehicleFilter2/WGVehiclePhysics2 stack for authority-side bot rigid bodies and requires the exact supported WorldOfTanks.exe. LAN replicas stay snapshot-only. Any native setup/runtime failure remains visible and immobile; it never switches to legacy Python bot movement.",
     "_network": "LAN MVP. Disabled by default. Press F11 in the offline hangar to set the server IP/port and toggle LAN mode. The server chooses the map and broadcasts it; the client value is only a fallback.",
     "network_mode": false,
     "network_server_host": "127.0.0.1",

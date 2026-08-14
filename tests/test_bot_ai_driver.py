@@ -175,12 +175,16 @@ class BotAIDriverTest(unittest.TestCase):
         phase = source.index("_battle_active = (")
         reset = source.index("_ai_driver.set_battle_active(_battle_active)", phase)
         intent = source.index(
-            "_driver_intent = bool(_battle_active) and not (", reset
+            "_driver_intent = bool(_battle_active) and (", reset
         )
         drive = source.index("'driver', _ai_driver.drive", intent)
         self.assertLess(phase, reset)
         self.assertLess(reset, intent)
         self.assertLess(intent, drive)
+        self.assertIn(
+            "_native_hazard_recovery_pre or not (",
+            source[intent:drive],
+        )
 
         hull_aim = source.index(".combat_hull_aim(")
         direct_turn = source.find("_PHY.traverse_step(", hull_aim)
@@ -202,6 +206,31 @@ class BotAIDriverTest(unittest.TestCase):
         self.assertGreater(order["throttle"], 0.9)
         self.assertAlmostEqual(0.0, order["turn"], places=5)
         self.assertAlmostEqual(0.0, order["target_yaw"], places=5)
+
+    def test_cached_heading_recomputes_continuous_turn_from_current_yaw(self):
+        target_yaw = 0.20
+
+        before = self.module.steering_turn(target_yaw, 0.0)
+        aligned = self.module.steering_turn(target_yaw, 0.18)
+        passed = self.module.steering_turn(target_yaw, 0.28)
+
+        self.assertGreater(before, 0.30)
+        self.assertGreater(aligned, 0.0)
+        self.assertLess(aligned, 0.05)
+        self.assertLess(passed, -0.10)
+
+    def test_battle_loop_recomputes_cached_drive_and_avoid_steering(self):
+        source = (ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py").read_text()
+        cache = source.index("_driver_order = _driver_cache[3]")
+        feedback = source.index(
+            "turn_dir = _ai_driver.steering_turn(target_yaw, m_veh.yaw)",
+            cache,
+        )
+        native = source.index("_native_body_manager.step", feedback)
+
+        self.assertIn("if _driver_mode in ('drive', 'avoid'):", source[cache:feedback])
+        self.assertLess(cache, feedback)
+        self.assertLess(feedback, native)
 
     def test_normal_route_turn_keeps_full_throttle(self):
         driver = self.module.LocalDriver()
@@ -512,6 +541,214 @@ class BotAIDriverTest(unittest.TestCase):
             3.5, 1.7,
         )
         self.assertTrue(clear)
+
+    def test_friendly_leader_limits_throttle_to_the_available_gap(self):
+        source = {
+            "id": 21,
+            "team": 2,
+            "position": (0.0, 0.0, 0.0),
+            "yaw": 0.0,
+            "speed": 6.0,
+            "half_length": 3.5,
+            "half_width": 1.7,
+            "is_human": False,
+        }
+        leader = {
+            "id": 23,
+            "team": 2,
+            "position": (0.0, 0.0, 16.0),
+            "yaw": 0.0,
+            "velocity": (0.0, 0.0, 2.0),
+            "half_length": 3.5,
+            "half_width": 1.7,
+            "is_human": False,
+        }
+
+        throttle, waiting = self.module.friendly_traffic_throttle(
+            source, {"throttle": 1.0, "target_yaw": 0.0}, [leader]
+        )
+
+        self.assertAlmostEqual(0.75, throttle)
+        self.assertTrue(waiting)
+
+    def test_crossing_friendly_traffic_has_one_stable_right_of_way_winner(self):
+        lower = {
+            "id": 21,
+            "team": 2,
+            "position": (0.0, 0.0, 0.0),
+            "yaw": 0.0,
+            "speed": 5.0,
+            "half_length": 3.5,
+            "half_width": 1.7,
+            "is_human": False,
+        }
+        higher = {
+            "id": 23,
+            "team": 2,
+            "position": (0.0, 0.0, 8.0),
+            "yaw": math.pi,
+            "speed": 5.0,
+            "half_length": 3.5,
+            "half_width": 1.7,
+            "is_human": False,
+        }
+
+        lower_result = self.module.friendly_traffic_throttle(
+            lower,
+            {"throttle": 1.0, "target_yaw": 0.0},
+            [dict(higher, velocity=(0.0, 0.0, -5.0))],
+        )
+        higher_result = self.module.friendly_traffic_throttle(
+            higher,
+            {"throttle": 1.0, "target_yaw": math.pi},
+            [dict(lower, velocity=(0.0, 0.0, 5.0))],
+        )
+
+        self.assertEqual((1.0, False), lower_result)
+        self.assertEqual((0.0, True), higher_result)
+
+    def test_friendly_human_always_has_right_of_way(self):
+        source = {
+            "id": 21,
+            "team": 2,
+            "position": (0.0, 0.0, 0.0),
+            "yaw": 0.0,
+            "speed": 5.0,
+            "half_length": 3.5,
+            "half_width": 1.7,
+            "is_human": False,
+        }
+        human = {
+            # Deliberately larger than the bot id: the explicit human flag, not
+            # an incidental entity-id ordering, owns this priority decision.
+            "id": 999,
+            "team": 2,
+            "position": (0.0, 0.0, 8.0),
+            "yaw": math.pi,
+            "velocity": (0.0, 0.0, -5.0),
+            "half_length": 3.5,
+            "half_width": 1.7,
+            "is_human": True,
+        }
+        command = {"throttle": 1.0, "target_yaw": 0.0}
+
+        self.assertEqual(
+            (0.0, True),
+            self.module.friendly_traffic_throttle(source, command, [human]),
+        )
+        self.assertEqual(
+            (1.0, False),
+            self.module.friendly_traffic_throttle(
+                source, command, [dict(human, team=1)]
+            ),
+        )
+
+    def test_shared_bot_traffic_identity_survives_authority_handoff(self):
+        self.assertEqual(17, self.module.traffic_identity(1001, 17))
+        self.assertEqual(17, self.module.traffic_identity(1027, 17))
+        self.assertEqual(1001, self.module.traffic_identity(1001, None))
+
+    def test_intentional_traffic_wait_never_enters_stuck_recovery(self):
+        driver = self.module.LocalDriver(stuck_seconds=0.4)
+        source = {
+            "id": 11,
+            "team": 1,
+            "position": (0.0, 0.0, 0.0),
+            "yaw": 0.0,
+            "speed": 0.0,
+            "half_length": 3.5,
+            "half_width": 1.7,
+            "is_human": False,
+        }
+        leader = {
+            "id": 12,
+            "team": 1,
+            "position": (0.0, 0.0, 8.0),
+            "yaw": 0.0,
+            "velocity": (0.0, 0.0, 0.0),
+            "half_length": 3.5,
+            "half_width": 1.7,
+            "is_human": False,
+        }
+        modes = []
+
+        for unused in range(20):
+            command = driver.drive(
+                11,
+                source["position"],
+                source["yaw"],
+                source["speed"],
+                0.1,
+                (0.0, 0.0, 50.0),
+                (),
+                lambda angle: True,
+            )
+            throttle, waiting = self.module.friendly_traffic_throttle(
+                source, command, [leader]
+            )
+            self.assertEqual(0.0, throttle)
+            self.assertTrue(waiting)
+            self.assertTrue(driver.wait_for_traffic(11))
+            modes.append(command["recovery_mode"])
+
+        self.assertNotIn("reverse_turn", modes)
+        self.assertNotIn("pivot_recovery", modes)
+        self.assertEqual(0.0, driver.states[11]["stuck_time"])
+        self.assertEqual(0.0, driver.states[11]["recovery_time"])
+
+    def test_wait_for_traffic_cancels_an_already_pending_recovery(self):
+        driver = self.module.LocalDriver()
+        state = driver._state(11, (0.0, 0.0, 0.0))
+        state["stuck_time"] = 10.0
+        state["recovery_time"] = 0.5
+
+        self.assertTrue(driver.wait_for_traffic(11))
+        self.assertEqual(0.0, state["stuck_time"])
+        self.assertEqual(0.0, state["recovery_time"])
+
+    def test_battle_loop_applies_traffic_yield_to_the_final_drive_command(self):
+        source = (
+            ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
+        ).read_text()
+        body_start = source.index("_driver_body = {")
+        body_end = source.index(
+            "_frame_vehicle._offh_driver_frame_body", body_start
+        )
+        body = source[body_start:body_end]
+        for field in ("'id':", "'team':", "'speed':", "'is_human':"):
+            self.assertIn(field, body)
+        self.assertIn("_ai_driver.traffic_identity(", source[:body_end])
+        self.assertIn("'_network_bot_id'", source[:body_end])
+
+        hull_aim = source.index("_ai_driver.combat_hull_aim(")
+        traffic = source.index(
+            "_ai_driver.friendly_traffic_throttle(", hull_aim
+        )
+        wait = source.index("_ai_driver.wait_for_traffic(eid)", traffic)
+        native = source.index("_native_body_manager.step", traffic)
+
+        self.assertLess(hull_aim, traffic)
+        self.assertLess(traffic, wait)
+        self.assertLess(wait, native)
+
+    def test_destroyed_bot_modules_repair_while_drive_is_locked(self):
+        source = (
+            ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
+        ).read_text()
+        start = source.index("# IMMOBILIZATION CHECK")
+        end = source.index("if getattr(m_veh, 'is_on_fire'", start)
+        block = source[start:end]
+        lines = block.splitlines()
+        locked_line = next(line for line in lines
+                           if "if (_b_locked or _network_mobility_locked" in line)
+        repair_line_index = next(index for index, line in enumerate(lines)
+                                 if "_tick_module_repair(m_veh" in line)
+        repair_try_line = lines[repair_line_index - 1]
+
+        locked_indent = len(locked_line) - len(locked_line.lstrip())
+        repair_indent = len(repair_try_line) - len(repair_try_line.lstrip())
+        self.assertEqual(locked_indent, repair_indent)
+        self.assertEqual(1, block.count("_tick_module_repair(m_veh"))
 
     def test_failed_direction_is_penalized_until_its_ttl_expires(self):
         driver = self.module.LocalDriver(failure_ttl=0.5)

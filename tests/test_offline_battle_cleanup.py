@@ -1,4 +1,6 @@
 import json
+import sys
+import types
 import unittest
 from pathlib import Path
 
@@ -8,6 +10,26 @@ BATTLE = ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py"
 LOADER = ROOT / "scripts/client/gui/mods/mod_offhangar.py"
 NETWORK = ROOT / "scripts/client/gui/mods/offhangar/network_battle.py"
 DEFAULTS = ROOT / "scripts/client/gui/mods/offhangar/config_defaults.json"
+
+
+_MISSING_MODULE = object()
+
+
+def install_test_modules(test_case, replacements):
+    previous = {
+        name: sys.modules.get(name, _MISSING_MODULE)
+        for name in replacements
+    }
+
+    def restore():
+        for name, module in previous.items():
+            if module is _MISSING_MODULE:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    test_case.addCleanup(restore)
+    sys.modules.update(replacements)
 
 
 def load_cleanup_helpers():
@@ -65,6 +87,192 @@ class Arena:
 
 
 class OfflineBattleCleanupTest(unittest.TestCase):
+    def test_sweep_defers_without_destroying_or_retrying_native_owners(self):
+        source = BATTLE.read_text()
+        start = source.index("def _offh_battle_sweep(")
+        end = source.index("\nimport BigWorld", start)
+        namespace = {}
+        exec(source[start:end], namespace)
+
+        callbacks = []
+        stop_results = [-1, 1, 1]
+        stop_calls = []
+        streaming_stop_results = [False, True]
+        streaming_stop_calls = []
+
+        class StreamingBootstrap(object):
+            def stop(self):
+                streaming_stop_calls.append("stop")
+                return streaming_stop_results.pop(0)
+
+        streaming_bootstrap = StreamingBootstrap()
+        model = object()
+        entity = types.SimpleNamespace(model=model)
+        mock = types.SimpleNamespace(
+            id=1016,
+            bw_entity=entity,
+            model=model,
+            _chassis_model=model,
+            marker=None,
+        )
+        mocks = {1016: mock}
+        player = types.SimpleNamespace(
+            _outlined_bot=None,
+            _autoaim_target=None,
+            inputHandler=None,
+            _offh_spawn_streaming_bootstrap=streaming_bootstrap,
+        )
+
+        bigworld = types.ModuleType("BigWorld")
+        bigworld.player = lambda: player
+        bigworld.cancelCallback = lambda unused_callback: None
+        bigworld.callback = lambda delay, callback: callbacks.append(
+            (delay, callback)
+        )
+        bigworld.entities = {}
+        bigworld.cachedEntities = lambda: {}
+
+        gui = types.ModuleType("gui")
+        gui.WindowsManager = types.SimpleNamespace(
+            g_windowsManager=types.SimpleNamespace(
+                battleWindow=types.SimpleNamespace(
+                    vMarkersManager=None, minimap=None
+                )
+            )
+        )
+
+        native = types.ModuleType("gui.mods.offhangar.native_bot_physics")
+
+        def stop_all(targets):
+            stop_calls.append(targets)
+            return stop_results.pop(0)
+
+        native.stop_all = stop_all
+        install_test_modules(self, {
+            "BigWorld": bigworld,
+            "gui": gui,
+            native.__name__: native,
+        })
+        namespace.update({
+            "G_MOCK_VEHICLES": mocks,
+            "g_offline_models": [model],
+            "g_offline_enemies": [mock],
+            "g_offh_battle_callbacks": {},
+            "_offh_proc_mem_mb": lambda: (0, 0, 0),
+            "_offh_battle_callback": lambda delay, callback: callbacks.append(
+                (delay, callback)
+            ),
+            "LOG_ERROR": lambda *args: None,
+            "LOG_CURRENT_EXCEPTION": lambda: None,
+        })
+
+        self.assertFalse(namespace["_offh_battle_sweep"]("exit"))
+
+        self.assertEqual([mocks], stop_calls)
+        self.assertIs(entity, mock.bw_entity)
+        self.assertIs(model, entity.model)
+        self.assertIs(model, mock.model)
+        self.assertIs(model, mock._chassis_model)
+        self.assertIs(mocks, namespace["G_MOCK_VEHICLES"])
+        self.assertEqual([], callbacks)
+        self.assertEqual([], streaming_stop_calls)
+
+        self.assertFalse(namespace["_offh_battle_sweep"]("exit"))
+        self.assertEqual([mocks, mocks], stop_calls)
+        self.assertEqual(["stop"], streaming_stop_calls)
+        self.assertIs(entity, mock.bw_entity)
+        self.assertIs(model, entity.model)
+        self.assertIs(model, mock.model)
+        self.assertIs(model, mock._chassis_model)
+        self.assertIs(streaming_bootstrap,
+                      player._offh_spawn_streaming_bootstrap)
+        self.assertIs(mocks, namespace["G_MOCK_VEHICLES"])
+
+        self.assertTrue(namespace["_offh_battle_sweep"]("exit"))
+        self.assertEqual([mocks, mocks, mocks], stop_calls)
+        self.assertEqual(["stop", "stop"], streaming_stop_calls)
+        self.assertIsNone(mock.bw_entity)
+        self.assertIsNone(entity.model)
+        self.assertIsNone(mock.model)
+        self.assertIsNone(mock._chassis_model)
+        self.assertEqual({}, namespace["G_MOCK_VEHICLES"])
+
+    def test_sweep_retry_barrier_resumes_continuation_exactly_once(self):
+        source = BATTLE.read_text()
+        start = source.index("def _offh_sweep_or_retry(")
+        end = source.index("\nimport BigWorld", start)
+        namespace = {}
+        exec(source[start:end], namespace)
+
+        callbacks = []
+        sweep_results = [False, True]
+        sweep_calls = []
+        continuations = []
+        bigworld = types.ModuleType("BigWorld")
+        bigworld.callback = lambda delay, callback: callbacks.append(
+            (delay, callback)
+        )
+        install_test_modules(self, {"BigWorld": bigworld})
+
+        def sweep(tag):
+            sweep_calls.append(tag)
+            return sweep_results.pop(0)
+
+        def caller():
+            if not namespace["_offh_sweep_or_retry"]("exit", caller):
+                return
+            continuations.append("continued")
+
+        namespace.update({
+            "_offh_battle_sweep": sweep,
+            "LOG_CURRENT_EXCEPTION": lambda: None,
+        })
+
+        caller()
+
+        self.assertEqual(["exit"], sweep_calls)
+        self.assertEqual([], continuations)
+        self.assertEqual(1, len(callbacks))
+        delay, retry = callbacks.pop(0)
+        self.assertAlmostEqual(0.1, delay)
+
+        retry()
+
+        self.assertEqual(["exit", "exit"], sweep_calls)
+        self.assertEqual(["continued"], continuations)
+        self.assertEqual([], callbacks)
+
+    def test_all_battle_transitions_use_the_sweep_continuation_barrier(self):
+        source = BATTLE.read_text()
+        spawn = source[source.index("def _try_spawn_battle_avatar_stub("):
+                       source.index("def start_network_battle_from_server(")]
+        leave = spawn[spawn.index("\t\tdef _leaveArena("):
+                      spawn.index("\n\t\tplayer.leaveArena = _leaveArena")]
+        capture = spawn[spawn.index("\t\tdef _capture_tick("):
+                        spawn.index("\n\t\tg_capture_tick_ref = _capture_tick")]
+        aih = spawn[spawn.index("\t\tdef _aih_tick("):
+                    spawn.index("\n\t\tglobals()['g_offh_aih_callback_id'] =", spawn.index("\t\tdef _aih_tick("))]
+        death = spawn[spawn.index("\t\t\t\t\t\tdef _exit_battle("):
+                      spawn.index("\n\t\t\t\t\t\t_offh_battle_callback", spawn.index("\t\t\t\t\t\tdef _exit_battle("))]
+
+        start_gate = "if not _offh_sweep_or_retry('start'"
+        self.assertIn(start_gate, spawn)
+        self.assertLess(spawn.index(start_gate), spawn.index("g_offh_battle_gen"))
+
+        quit_gate = "if not _offh_sweep_or_retry('quit', _leaveArena):"
+        self.assertIn(quit_gate, leave)
+        self.assertLess(leave.index(quit_gate), leave.index("_battle_finished[0] = True"))
+
+        for gui_loss in (capture, aih):
+            lost = gui_loss[gui_loss.index("elif _offh_seen_bw[0]:"):]
+            self.assertIn("_leaveArena()", lost)
+            self.assertLess(lost.index("_leaveArena()"), lost.index("return"))
+            self.assertNotIn("_offh_battle_sweep('esc')", lost)
+
+        exit_gate = "if not _offh_sweep_or_retry('exit', _exit_battle):"
+        self.assertIn(exit_gate, death)
+        self.assertLess(death.index(exit_gate), death.index("_exit_done[0] = True"))
+
     def test_hit_testers_are_loaded_and_released_once_per_unique_object(self):
         helpers = load_cleanup_helpers()
         first = HitTester()

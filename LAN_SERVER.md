@@ -63,8 +63,9 @@ module runs inside the embedded Python 2 runtime shipped with the 0.8.2 client.
 
 The start button appears after the server accepts the client and sends the
 `welcome` message.
-A client that connects after `BATTLE START` receives a late-join `battle_start`
-message and enters the current round on the same map. The server logs `LATE JOIN`.
+Join all players before `BATTLE START`. Once the round begins, the canonical
+human and bot slots are frozen, so a late connection is rejected instead of
+sharing a spawn slot with an existing bot.
 
 There is no independent client-side LAN countdown. A failed LAN connection
 does not silently fall back to a local random battle. Use the queue screen's
@@ -76,7 +77,7 @@ With normal logging settings, each client writes these milestones to
 ```text
 LAN connecting to 192.168.1.20:28782
 LAN TCP connected to 192.168.1.20:28782
-LAN hello sent (protocol 8, build 1.8.41-native-experimental-20260812)
+LAN hello sent (protocol 8, build 1.8.56-native-experimental-20260814)
 LAN welcome id=1 name=Player-158 vehicle=china:Type_59 team=1 slot=0 map=... phase=waiting
 LAN JOIN confirmed; queue screen is now server-backed
 LAN queue UI updated: 2 connected player(s)

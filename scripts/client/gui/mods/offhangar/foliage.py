@@ -57,14 +57,14 @@ def _intersects(instance, start, end):
 	the 2 Hz spotting loop:
 	[cx, min_y, cz, max_y, i00, i01, i10, i11, strength, radius].
 	"""
-	dx0 = float(start[0]) - float(instance[0])
-	dz0 = float(start[2]) - float(instance[2])
-	dx1 = float(end[0]) - float(instance[0])
-	dz1 = float(end[2]) - float(instance[2])
-	u0 = float(instance[4]) * dx0 + float(instance[5]) * dz0
-	v0 = float(instance[6]) * dx0 + float(instance[7]) * dz0
-	u1 = float(instance[4]) * dx1 + float(instance[5]) * dz1
-	v1 = float(instance[6]) * dx1 + float(instance[7]) * dz1
+	dx0 = start[0] - instance[0]
+	dz0 = start[2] - instance[2]
+	dx1 = end[0] - instance[0]
+	dz1 = end[2] - instance[2]
+	u0 = instance[4] * dx0 + instance[5] * dz0
+	v0 = instance[6] * dx0 + instance[7] * dz0
+	u1 = instance[4] * dx1 + instance[5] * dz1
+	v1 = instance[6] * dx1 + instance[7] * dz1
 	interval = _slab_interval(u0, u1 - u0, -1.0, 1.0, 0.0, 1.0)
 	if interval is None:
 		return False
@@ -73,8 +73,8 @@ def _intersects(instance, start, end):
 	if interval is None:
 		return False
 	middle = (interval[0] + interval[1]) * 0.5
-	y = float(start[1]) + (float(end[1]) - float(start[1])) * middle
-	return float(instance[1]) <= y <= float(instance[3])
+	y = start[1] + (end[1] - start[1]) * middle
+	return instance[1] <= y <= instance[3]
 
 
 class FoliageMap(object):
@@ -83,12 +83,17 @@ class FoliageMap(object):
 	def __init__(self, data):
 		self.map_name = str(data.get('map') or '')
 		self.cell_size = max(1.0, float(data.get('cell_size', 32.0)))
-		self.instances = tuple(data.get('instances') or ())
+		# JSON validation happens before construction in production. Normalize the
+		# hot-loop payload once here instead of parsing numbers for every sight ray.
+		self.instances = tuple(
+			tuple(float(value) for value in instance)
+			for instance in (data.get('instances') or ()))
 		self.cells = {}
 		for key, values in (data.get('cells') or {}).items():
 			parts = str(key).split(',', 1)
 			if len(parts) == 2:
-				self.cells[(int(parts[0]), int(parts[1]))] = tuple(values)
+				self.cells[(int(parts[0]), int(parts[1]))] = tuple(
+					int(value) for value in values)
 
 	def camouflage_bonus(self, observer, target, fired_recently=False):
 		"""Return additive camouflage for this observer-target pair."""
@@ -96,27 +101,24 @@ class FoliageMap(object):
 		         float(observer[2]))
 		end = (float(target[0]), float(target[1]) + TARGET_CHECK_HEIGHT,
 		       float(target[2]))
-		candidate_ids = []
 		seen = set()
+		bonus = 0.0
 		for cell_x, cell_z in _segment_cells(start, end, self.cell_size):
 			for instance_id in self.cells.get((cell_x, cell_z), ()):
-				instance_id = int(instance_id)
-				if instance_id not in seen:
-					seen.add(instance_id)
-					candidate_ids.append(instance_id)
-		bonus = 0.0
-		for instance_id in candidate_ids:
-			if instance_id < 0 or instance_id >= len(self.instances):
-				continue
-			instance = self.instances[instance_id]
-			if fired_recently:
-				dx = float(target[0]) - float(instance[0])
-				dz = float(target[2]) - float(instance[2])
-				if math.sqrt(dx * dx + dz * dz) <= (
-						FIRE_TRANSPARENCY_DISTANCE + float(instance[9])):
+				if instance_id in seen:
 					continue
-			if _intersects(instance, start, end):
-				bonus += float(instance[8])
-				if bonus >= FOLIAGE_CAMOUFLAGE_LIMIT:
-					return FOLIAGE_CAMOUFLAGE_LIMIT
+				seen.add(instance_id)
+				if instance_id < 0 or instance_id >= len(self.instances):
+					continue
+				instance = self.instances[instance_id]
+				if fired_recently:
+					dx = float(target[0]) - instance[0]
+					dz = float(target[2]) - instance[2]
+					if math.sqrt(dx * dx + dz * dz) <= (
+							FIRE_TRANSPARENCY_DISTANCE + instance[9]):
+						continue
+				if _intersects(instance, start, end):
+					bonus += instance[8]
+					if bonus >= FOLIAGE_CAMOUFLAGE_LIMIT:
+						return FOLIAGE_CAMOUFLAGE_LIMIT
 		return min(FOLIAGE_CAMOUFLAGE_LIMIT, max(0.0, bonus))

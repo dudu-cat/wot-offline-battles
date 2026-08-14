@@ -1,4 +1,5 @@
 import unittest
+import math
 import sys
 import textwrap
 import types
@@ -40,6 +41,56 @@ def load_module_factor(device_td):
     return namespace["_module_factor"]
 
 
+def load_native_hazard_transition():
+    source = SOURCE.read_text()
+    marker = source.index("_native_hazard_reason = None")
+    start = source.rfind("\n", 0, marker) + 1
+    end = source.index("# Native destructible health", start)
+    block = textwrap.dedent(source[start:end])
+    wrapper = (
+        "def run_transition(m_veh, manager, driver, water, was_safe, "
+        "now_safe):\n"
+        "    _native_body_manager = manager\n"
+        "    _native_water = water\n"
+        "    _native_was_safe = was_safe\n"
+        "    _native_now_safe = now_safe\n"
+        "    _OFFH_AI_WATER_AVOID_DEPTH = 0.90\n"
+        "    _b_ypr = None\n"
+        "    eid = 17\n"
+        "    target_yaw = 0.0\n"
+        "    _native_previous_pose = (1.0, 2.0, 3.0, 0.0, 0.0, 0.0)\n"
+        "    _offh_ai_probe_reject = lambda *args: None\n"
+        "    LOG_NOTE = lambda *args: None\n" +
+        textwrap.indent(block, "    ") +
+        "    return bool(getattr(m_veh, "
+        "'_offh_native_hazard_recovering', False))\n"
+    )
+    namespace = {}
+    exec(wrapper, namespace)
+    return namespace["run_transition"]
+
+
+def load_native_hazard_escape_target():
+    source = SOURCE.read_text()
+    start = source.index("def _offh_native_hazard_escape_target(")
+    end = source.index("\n\ndef _offh_ai_pose_water_depth", start)
+    namespace = {}
+    exec(source[start:end], namespace)
+    return namespace["_offh_native_hazard_escape_target"]
+
+
+def load_native_hazard_recovery_complete():
+    source = SOURCE.read_text()
+    marker = "def _offh_native_hazard_recovery_complete("
+    if marker not in source:
+        return None
+    start = source.index(marker)
+    end = source.index("\n\ndef ", start + len(marker))
+    namespace = {}
+    exec(source[start:end], namespace)
+    return namespace["_offh_native_hazard_recovery_complete"]
+
+
 def device_damage_modules(module_stat_factor):
     gui = types.ModuleType("gui")
     mods = types.ModuleType("gui.mods")
@@ -58,20 +109,28 @@ def device_damage_modules(module_stat_factor):
 
 
 class OfflineBattleProfilerTests(unittest.TestCase):
-    def test_direct_fire_skips_the_overwritten_pre_marker_ray(self):
+    def test_ballistic_marker_preview_is_throttled_and_has_no_duplicate_ray(self):
         source = SOURCE.read_text()
-        start = source.index("# Calculate exact terrain intersection for the green marker")
+        start = source.index("# Stock VehicleGunRotator walks the shell parabola")
         end = source.index("# UPDATE CROSSHAIR", start)
         gun_marker = source[start:end]
-        first_ray = gun_marker.index(
-            "BigWorld.wg_collideSegment(_offh_bspace(), true_gun_pos")
-        final_ray = gun_marker.index(
-            "BigWorld.wg_collideSegment(_offh_bspace(), math_gun_world")
 
-        self.assertLess(gun_marker.index("if is_arty:"), first_ray)
-        self.assertLess(first_ray, gun_marker.index("if not is_arty:"))
-        self.assertLess(gun_marker.index("if not is_arty:"), final_ray)
-        self.assertEqual(2, gun_marker.count("BigWorld.wg_collideSegment"))
+        self.assertIn("_offh_player_gun_marker_impact(", gun_marker)
+        self.assertIn("'marker_preview_at', -999.0", gun_marker)
+        self.assertIn("< 0.1", gun_marker)
+        self.assertIn("_marker_preview_allowed = (_period_g == 3 or not", gun_marker)
+        self.assertIn("if _marker_preview_allowed and not _marker_preview_cached:", gun_marker)
+        self.assertIn("if _marker_preview_cached:", gun_marker)
+        self.assertIn("_offh_perf_stop('player_gun_marker'", gun_marker)
+        self.assertIn("profile_candidates=(_marker_perf is not None)", gun_marker)
+        self.assertIn("marker_preview_error_at", gun_marker)
+        self.assertNotIn("BigWorld.wg_collideSegment", gun_marker)
+
+        ordered_start = source.index("ordered = ('player_loop'")
+        ordered_end = source.index("\n\tparts = []", ordered_start)
+        ordered = source[ordered_start:ordered_end]
+        self.assertIn("'player_gun_marker'", ordered)
+        self.assertIn("'marker_vehicle_candidates'", ordered)
 
     def test_module_factor_pristine_fast_path_skips_damage_helper(self):
         device_td = mock.Mock(side_effect=AssertionError("descriptor lookup"))
@@ -344,6 +403,21 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         self.assertIn("_driver['speed_pct']", source)
         self.assertIn("_driver['slow']", source)
 
+    def test_traffic_wait_diagnostics_record_final_right_of_way_result(self):
+        source = SOURCE.read_text()
+        arbitration = source.index("_ai_driver.friendly_traffic_throttle(")
+        waiting = source.index("if _waiting_for_traffic:", arbitration)
+        mode = source.index(
+            "m_veh._offh_ai_driver_mode = 'traffic_wait'", waiting
+        )
+        native_step = source.index("_native_body_manager.step,", mode)
+
+        self.assertLess(arbitration, waiting)
+        self.assertLess(waiting, mode)
+        self.assertLess(mode, native_step)
+        self.assertIn("'traffic_wait': 0", source)
+        self.assertIn("_offh_perf_count('driver_traffic_wait')", source)
+
     def test_capture_rules_do_not_log_every_vehicle_distance_tick(self):
         source = SOURCE.read_text()
 
@@ -374,7 +448,240 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         self.assertIn("'native_owner': _native_collision_owner", source)
         self.assertIn("_o_body.get('native_owner', False)", source)
         self.assertNotIn("_native_body_manager.reseed(", source)
-        self.assertIn("_native_body_manager.guard_fault(", source)
+
+    def test_base_defense_local_navigation_key_ignores_combat_target_changes(self):
+        source = SOURCE.read_text()
+        start = source.index("_nav_mode = _ai_order.get('combat_mode', 'route')")
+        end = source.index("_navigator = _offh_ai_navigator", start)
+        block = source[start:end]
+
+        self.assertIn("_nav_mode == 'base_defense'", block)
+        self.assertIn("_ai_order.get('defense_base_id')", block)
+        self.assertIn("('local', int(eid), _nav_mode", block)
+
+        native_hazard = source[
+            source.index("# Native contact resolves terrain"):
+            source.index("# Native destructible health", source.index(
+                "# Native contact resolves terrain"
+            ))
+        ]
+        self.assertIn("_offh_native_hazard_recovering", native_hazard)
+        self.assertEqual(1, native_hazard.count(
+            "_native_body_manager.hold("
+        ))
+        self.assertIn("elif not _native_hazard_recovering:", native_hazard)
+        self.assertIn("if _native_hazard_recovering:", native_hazard)
+        self.assertIn(
+            "m_veh._offh_native_hazard_recovering = False",
+            native_hazard,
+        )
+        self.assertIn("_offh_ai_probe_reject(", native_hazard)
+        self.assertNotIn("guard_fault(", native_hazard)
+
+    def test_native_hazard_recovery_requires_safe_fixed_endpoint_hysteresis(self):
+        recovery_complete = load_native_hazard_recovery_complete()
+        self.assertIsNotNone(
+            recovery_complete,
+            "native hazard recovery needs an explicit completion contract",
+        )
+        vehicle = types.SimpleNamespace(
+            position=types.SimpleNamespace(x=-1.0, y=2.0, z=0.0),
+            _offh_native_hazard_escape_endpoint=(-12.0, 2.0, 0.0),
+        )
+
+        # A safe footprint away from the fixed endpoint must not arm the timer.
+        self.assertFalse(recovery_complete(vehicle, True, True, 10.0))
+        self.assertIsNone(getattr(
+            vehicle, "_offh_native_hazard_safe_since", None
+        ))
+
+        # Reaching the endpoint starts, but does not immediately complete, the
+        # continuously-safe interval.
+        vehicle.position.x = -11.0
+        self.assertFalse(recovery_complete(vehicle, True, True, 20.0))
+        self.assertEqual(20.0, vehicle._offh_native_hazard_safe_since)
+        self.assertFalse(recovery_complete(vehicle, True, True, 20.24))
+        self.assertTrue(recovery_complete(vehicle, True, True, 20.25))
+
+        # Either footprint or water becoming unsafe resets hysteresis.
+        self.assertFalse(recovery_complete(vehicle, False, True, 21.0))
+        self.assertIsNone(vehicle._offh_native_hazard_safe_since)
+        self.assertFalse(recovery_complete(vehicle, True, True, 21.1))
+        self.assertFalse(recovery_complete(vehicle, True, False, 21.3))
+        self.assertIsNone(vehicle._offh_native_hazard_safe_since)
+        self.assertFalse(recovery_complete(vehicle, True, True, 21.4))
+        self.assertTrue(recovery_complete(vehicle, True, True, 21.66))
+
+        # Sliding out of endpoint tolerance also resets the interval.
+        vehicle.position.x = -8.0
+        self.assertFalse(recovery_complete(vehicle, True, True, 22.0))
+        self.assertIsNone(vehicle._offh_native_hazard_safe_since)
+
+    def test_native_hazard_transition_guards_clear_with_completion_contract(self):
+        source = SOURCE.read_text()
+        start = source.index("# Native contact resolves terrain")
+        end = source.index("# Native destructible health", start)
+        native_hazard = source[start:end]
+        clear = native_hazard.index(
+            "m_veh._offh_native_hazard_recovering = False"
+        )
+
+        self.assertIn("_offh_native_hazard_recovery_complete(", native_hazard)
+        safety_start = native_hazard.index(
+            "_native_recovery_baked_safe"
+        )
+        completion_start = native_hazard.index(
+            "_offh_native_hazard_recovery_complete(", safety_start
+        )
+        safety_contract = " ".join(
+            native_hazard[safety_start:completion_start].split()
+        )
+        self.assertIn(
+            "_native_water <= _OFFH_AI_WATER_AVOID_DEPTH",
+            safety_contract,
+        )
+        self.assertIn(
+            "_native_recovery_baked_safe = _native_now_safe",
+            safety_contract,
+        )
+        self.assertNotIn("_offh_ai_baked_footprint_safe", native_hazard)
+        self.assertRegex(
+            " ".join(native_hazard.split()),
+            r"_offh_native_hazard_recovery_complete\(\s*m_veh,\s*"
+            r"_native_recovery_baked_safe,\s*"
+            r"_native_recovery_water_safe,\s*_ai_now\s*\)",
+        )
+        self.assertGreater(
+            clear,
+            native_hazard.rindex(
+                "_offh_native_hazard_recovery_complete(", 0, clear
+            ),
+        )
+        self.assertIn(
+            "m_veh._offh_native_hazard_escape_endpoint = None",
+            native_hazard[clear:],
+        )
+        self.assertIn(
+            "m_veh._offh_native_hazard_safe_since = None",
+            native_hazard[clear:],
+        )
+
+    def test_native_hazard_escape_target_is_nonzero_for_hold_and_missing_anchor(self):
+        escape_target = load_native_hazard_escape_target()
+        position = types.SimpleNamespace(x=4.0, y=2.0, z=8.0)
+
+        anchored = types.SimpleNamespace(
+            position=position,
+            yaw=0.25,
+            _offh_native_hazard_anchor=(4.0, 2.0, 8.0),
+            _offh_native_hazard_entry_yaw=math.pi / 2.0,
+        )
+        missing = types.SimpleNamespace(
+            position=position,
+            yaw=math.pi,
+            _offh_native_hazard_anchor=None,
+            _offh_native_hazard_entry_yaw=0.0,
+        )
+
+        anchored_target = escape_target(anchored)
+        missing_target = escape_target(missing)
+
+        for target in (anchored_target, missing_target):
+            distance = math.sqrt(
+                (target[0] - position.x) ** 2 +
+                (target[2] - position.z) ** 2
+            )
+            self.assertGreaterEqual(distance, 6.0)
+        self.assertLess(anchored_target[0], position.x)
+        self.assertAlmostEqual(position.z, anchored_target[2])
+        self.assertAlmostEqual(position.x, missing_target[0])
+        self.assertLess(missing_target[2], position.z)
+
+    def test_native_hazard_escape_endpoint_does_not_flip_after_anchor_crossing(self):
+        escape_target = load_native_hazard_escape_target()
+        position = types.SimpleNamespace(x=0.0, y=2.0, z=0.0)
+        vehicle = types.SimpleNamespace(
+            position=position,
+            yaw=0.0,
+            _offh_native_hazard_anchor=(-1.0, 2.0, 0.0),
+            _offh_native_hazard_entry_yaw=math.pi / 2.0,
+        )
+
+        first_target = escape_target(vehicle)
+        self.assertEqual(
+            first_target,
+            getattr(vehicle, "_offh_native_hazard_escape_endpoint", None),
+        )
+
+        # Once the hull passes the anchor, recomputing anchor-current reverses
+        # the direction and makes recovery oscillate. The first endpoint is an
+        # immutable recovery-session target instead.
+        position.x = -2.0
+        self.assertEqual(first_target, escape_target(vehicle))
+
+    def test_native_hazard_recovery_bypasses_tactical_and_navigation_holds(self):
+        source = SOURCE.read_text()
+        recovery_start = source.index(
+            "# Safety recovery outranks a tactical hold"
+        )
+        driver_start = source.index("# Pure local driver:", recovery_start)
+        driver_end = source.index("_perf_physics =", driver_start)
+        recovery_driver = source[recovery_start:driver_end]
+
+        self.assertIn(
+            "_native_escape_target = _offh_native_hazard_escape_target(m_veh)",
+            recovery_driver,
+        )
+        self.assertIn("drive_pos = _native_escape_target", recovery_driver)
+        self.assertIn("_nav_paused = False", recovery_driver)
+        self.assertIn("_ai_throttle_override = None", recovery_driver)
+        self.assertIn("_ai_server_wait = False", recovery_driver)
+        self.assertIn(
+            "_native_hazard_recovery_pre or not (",
+            recovery_driver,
+        )
+        self.assertIn(
+            "_native_hazard_recovery_pre or _offh_ai_refresh_due(",
+            recovery_driver,
+        )
+        self.assertLess(
+            recovery_driver.index("drive_pos = _native_escape_target"),
+            recovery_driver.index("dx = drive_pos[0]"),
+        )
+        self.assertIn("_ai_driver.drive, eid,", recovery_driver)
+        self.assertIn(
+            "lambda _driver_yaw: _offh_ai_direction_clear(",
+            recovery_driver,
+        )
+
+    def test_native_hazard_escape_still_uses_local_driver_direction_probe(self):
+        from tests.test_bot_ai_driver import load_driver
+
+        escape_target = load_native_hazard_escape_target()
+        driver = load_driver().LocalDriver()
+        position = types.SimpleNamespace(x=4.0, y=2.0, z=8.0)
+        vehicle = types.SimpleNamespace(
+            position=position,
+            yaw=0.0,
+            _offh_native_hazard_anchor=(4.0, 2.0, 8.0),
+            _offh_native_hazard_entry_yaw=0.0,
+        )
+        probes = []
+
+        target = escape_target(vehicle)
+        order = driver.drive(
+            17, (position.x, position.y, position.z), vehicle.yaw,
+            0.0, 0.1, target, (),
+            lambda candidate_yaw: probes.append(candidate_yaw) or True,
+            movement_intent=True,
+        )
+
+        self.assertTrue(probes)
+        self.assertNotEqual("arrived", order["recovery_mode"])
+        self.assertNotIn(order["recovery_mode"], (
+            "arrived", "nav_wait", "budget_wait"
+        ))
+        self.assertGreater(abs(order["turn"]), 0.0)
 
     def test_static_gun_yaw_limits_are_cached_per_vehicle(self):
         source = SOURCE.read_text()
@@ -416,7 +723,7 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         self.assertIn("targets = targets[:_OFFH_AI_CONTACT_TARGETS_PER_FRAME]", contact)
         self.assertIn("_offh_ai_advance_artillery_arcs(now)", contact)
         self.assertIn("_OFFH_AI_ARTILLERY_CHORDS_PER_FRAME = 4", source)
-        self.assertIn("arc_queue.request(", contact)
+        self.assertIn("arc_queue.request_lazy(", contact)
         self.assertIn("float(now) - last_cover >= 0.10", contact)
         self.assertIn("offset_index", contact)
         self.assertIn("bot_observation_due", contact)
@@ -471,13 +778,17 @@ class OfflineBattleProfilerTests(unittest.TestCase):
     def test_network_replica_skips_authority_ai_but_keeps_collision_bodies(self):
         source = SOURCE.read_text()
 
-        self.assertIn("_is_network_replica = not network_is_authority(player)", source)
-        self.assertIn("if not _is_network_replica:\n\t\t\t\t\t\t_ai_director", source)
-        self.assertGreaterEqual(source.count("if not _is_network_replica:"), 3)
+        self.assertIn("_network_bot_role = _offh_network_bot_role(player)", source)
+        self.assertIn(
+            "_network_simulation_authority = (\n"
+            "\t\t\t\t\t_network_bot_role in ('local', 'authority'))",
+            source,
+        )
+        self.assertIn("if _network_simulation_authority:\n\t\t\t\t\t\t_ai_director", source)
         self.assertIn("_driver_frame[_frame_eid]", source)
         self.assertIn("_collision_bodies[_frame_eid]", source)
         self.assertIn(
-            "if (_is_network_replica and\n"
+            "if ((not _network_simulation_authority) and\n"
             "\t\t\t\t\t\t\t\t\t(getattr(m_veh, '_network_remote', False)",
             source,
         )
@@ -554,7 +865,7 @@ class OfflineBattleProfilerTests(unittest.TestCase):
         self.assertIn("def _offh_destructible_mat_passable", source)
         self.assertIn("AreaDestructibles.DESTR_TYPE_STRUCTURE", source)
         self.assertIn(
-            "_mi = _offh_mat_info_for_segment_hit(\n\t\t\t\t\t\t\tspaceID, seg_start, hit_pt)",
+            "_mi = _offh_mat_info_for_segment_hit(\n\t\t\t\t\t\t\tspaceID, hit_pt, surface_normal)",
             source,
         )
 
