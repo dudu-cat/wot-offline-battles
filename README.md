@@ -251,7 +251,7 @@ does not switch back to the legacy chase logic.
 
 Install
 -------
-For the native 1.8.56 experiment, read `START_NATIVE_TEST_HERE.txt` and then
+For the native 1.8.57 experiment, read `START_NATIVE_TEST_HERE.txt` and then
 open `START_HERE.txt`: close the game, delete or move aside the old
 `res_mods\0.8.2`, then drag the package's complete `0.8.2` folder into the
 game's `res_mods` folder. The package also includes double-clickable Windows

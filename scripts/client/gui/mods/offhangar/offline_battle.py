@@ -465,6 +465,7 @@ def _offh_perf_frame_end(started, frame_dt, player):
 	           'tree_scan', 'tree_deferred',
 	           'wall_collision', 'wall_fast', 'wall_exact',
 	           'tank_collision', 'tank_collision_empty', 'collision_candidates',
+	           'player_collision_error',
 	           'pose_commit', 'visibility', 'los', 'network_publish', 'post_bot')
 	parts = []
 	for name in ordered:
@@ -1164,7 +1165,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 #   'OfflineBattle BUILD <stamp>'
 # so a log can be checked against the build that produced it instead of
 # assuming the client picked the new .pyc up.
-_OFFH_BUILD = '1.8.56-native-experimental (2026-08-14)'
+_OFFH_BUILD = '1.8.57-native-experimental (2026-08-14)'
 
 
 def _offh_hit_sound(path, min_gap=0.10):
@@ -9356,6 +9357,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		# ONE source of physics laws + parameters for player AND bots:
 		# gui.mods.offhangar.physics (see its module docstring for units).
 		from gui.mods.offhangar import physics as _PHY
+		# Keep this binding at battle scope. Importing the same name inside
+		# _aih_tick makes every earlier nested collision helper capture an unbound
+		# local cell: vehicle contacts silently disappear and slope contacts fail
+		# closed as walls before the later import can execute.
 		from gui.mods.offhangar import vehicle_collision as _VC
 		from gui.mods.offhangar import vehicle_pose as _VP
 		# Live tuning: config.json "physics_tuning" overrides the WG constants
@@ -11028,6 +11033,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# sweep. Six contacts is a bounded fail-closed budget.
 							_saw_terrain_contact = False
 							_saw_overlimit_terrain = False
+							_terrain_profile_lanes = []
 							for _bottom_hit in _bottom_hits:
 								(offset_x, sx, sz, x2, z2, start_bot, end_bot,
 									col_bot, d_bot) = _bottom_hit
@@ -11038,6 +11044,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_scan_start = start_bot
 								_contact = col_bot
 								_scan_finished = False
+								_lane_saw_terrain = False
 								for _scan_index in range(6):
 									(_matches_ground, _near_solid,
 										_near_solid_distance,
@@ -11048,6 +11055,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_progress_hit = _contact
 									if _contact_saw_terrain:
 										_saw_terrain_contact = True
+										_lane_saw_terrain = True
 									if _contact_overlimit_terrain:
 										_saw_overlimit_terrain = True
 									if _remaining_nonterrain_clear:
@@ -11089,6 +11097,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										return True
 								if not _scan_finished:
 									return True
+								if _lane_saw_terrain:
+									_terrain_profile_lanes.append((sx, sz))
 							if _saw_overlimit_terrain:
 								return True
 							if not _saw_terrain_contact:
@@ -11097,22 +11107,27 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_look = (hl_front if _forward else hl_back) + _ahead
 							_seg_n = 6
 							_seg = _look / _seg_n
-							_ground_heights = []
-							for _si in range(_seg_n + 1):
-								_dd = _seg * _si
-								_px = pos.x + sin_y * _dd * _fw
-								_pz = pos.z + cos_y * _dd * _fw
-								_gg = _terrain_hit(
-									Math.Vector3(_px, pos.y + 12.0, _pz),
-									Math.Vector3(_px, pos.y - 5.0, _pz))
-								if _gg is None:
-									_ground_heights = []
-									break
-								_ground_heights.append(_gg[0].y)
-							if (not _ground_heights or
-									not _VC.drivable_rising_profile(
-										_ground_heights, _seg, allow_flat=True)):
-								return True
+							# Profile the exact lane(s) whose lower sweep proved terrain.
+							# Sampling the chassis centre line here made a shallow cross-slope
+							# feel like a wall whenever the centre happened to cross a narrow
+							# seam, and could also hide a step seen only by one track.
+							for _lane_sx, _lane_sz in _terrain_profile_lanes:
+								_ground_heights = []
+								for _si in range(_seg_n + 1):
+									_dd = _seg * _si
+									_px = _lane_sx + sin_y * _dd * _fw
+									_pz = _lane_sz + cos_y * _dd * _fw
+									_gg = _terrain_hit(
+										Math.Vector3(_px, pos.y + 12.0, _pz),
+										Math.Vector3(_px, pos.y - 5.0, _pz))
+									if _gg is None:
+										_ground_heights = []
+										break
+									_ground_heights.append(_gg[0].y)
+								if (not _ground_heights or
+										not _VC.drivable_rising_profile(
+											_ground_heights, _seg, allow_flat=True)):
+									return True
 							return False
 						except Exception:
 							# Once an exact lower contact exists, any uncertainty in
@@ -11544,8 +11559,20 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					veh_pos[2] += _ptr[1] + player._push_z * dt
 					player._push_x *= 0.90
 					player._push_z *= 0.90
-				except Exception:
-					pass
+				except Exception as _player_collision_error:
+					# Player/native contacts are the only collision bridge between the
+					# Python-owned player and native bot bodies. Never let this subsystem
+					# fail silently: one hidden exception disables vehicle volume for the
+					# whole battle. Count sampled failures and report the first one in each
+					# battle generation without flooding the 32-bit client log.
+					_offh_perf_count('player_collision_error')
+					_player_collision_gen = int(
+						globals().get('g_offh_battle_gen', 0) or 0)
+					if (globals().get('g_offh_player_collision_error_gen') !=
+							_player_collision_gen):
+						globals()['g_offh_player_collision_error_gen'] = _player_collision_gen
+						LOG_ERROR('OfflineBattle player/native collision failed: %s' %
+							str(_player_collision_error))
 
 				# --- Hull Rotation: physics.traverse_step (same law as the bots) ---
 				turn_dir = steer
@@ -11598,7 +11625,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						snap_gap = max(0.8, min(2.5, abs(_veh_velocity[0]) * dt * 2.0 + 0.6))
 						max_climb = max(0.6, abs(_veh_velocity[0]) * dt * 2.5)
 						try:
-							from gui.mods.offhangar import vehicle_collision as _VC
 							if _VC.support_rise_is_obstacle(
 									veh_pos[1], ground_y, max_climb):
 								# The upper hit is an obstacle, not support. Probe below

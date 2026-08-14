@@ -31,7 +31,7 @@ from server_bot_navigation import BotPathResolver
 
 
 PROTOCOL_VERSION = 8
-CLIENT_BUILD = "1.8.56-native-experimental-20260814"
+CLIENT_BUILD = "1.8.57-native-experimental-20260814"
 TICK_HZ = 30.0
 SERVER_PERF_LOG_SECONDS = 5.0
 PREBATTLE_COUNTDOWN_SECONDS = 30.0

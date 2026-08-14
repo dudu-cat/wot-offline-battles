@@ -342,7 +342,9 @@ class PlayerSlopeObstacleRegressionTest(unittest.TestCase):
                 sys.modules["Math"] = previous_math
 
     def _run_multilane_uphill_contact(
-            self, hard_lane=None, vertical_sees_hard_surface=False):
+            self, hard_lane=None, vertical_sees_hard_surface=False,
+            profile_hit_lane=None, hit_lane_profile_abrupt=False,
+            terrain_lateral_gradient=0.0):
         collision_start = self.source.index(
             "\t\t\t\tdef _check_horizontal_collision("
         )
@@ -362,6 +364,9 @@ class PlayerSlopeObstacleRegressionTest(unittest.TestCase):
         terrain_gradient = 0.18
         obstacle_z = 1.5
 
+        def lane_for_x(x):
+            return -1 if x < -1.0 else (1 if x > 1.0 else 0)
+
         def lane_base(x):
             if x < -1.0:
                 return 0.05
@@ -369,10 +374,27 @@ class PlayerSlopeObstacleRegressionTest(unittest.TestCase):
                 return -0.05
             return 0.0
 
+        def profile_height(lane, z):
+            if lane == profile_hit_lane:
+                # The exact lower-hull contact is on this track lane. Its
+                # local face is shallow at z=1.5; the abrupt case adds a
+                # separate step farther ahead that only the lane profile sees.
+                if hit_lane_profile_abrupt and z >= 2.4:
+                    return 1.50 + 0.10 * z
+                return 0.45 + 0.10 * z
+            if lane == 0:
+                if hit_lane_profile_abrupt:
+                    return 0.10 * z
+                # The hull centre bridges a narrow downward seam. Both levels
+                # stay below the 0.6 m lower-hull ray, so this is not an
+                # independent centre-lane wall contact.
+                return 0.40 if z < 2.0 else -0.50
+            return -0.20 + 0.10 * z
+
         def collide_segment(unused_space_id, start, end, unused_mask,
                             collision_filter=None):
             if abs(start.y - end.y) > 0.001:
-                lane = -1 if start.x < -1.0 else (1 if start.x > 1.0 else 0)
+                lane = lane_for_x(start.x)
                 if (vertical_sees_hard_surface and hard_lane == lane and
                         abs(start.z - obstacle_z) < 0.001):
                     # A top-down engine query first meets the same inclined
@@ -390,6 +412,19 @@ class PlayerSlopeObstacleRegressionTest(unittest.TestCase):
                 if (collision_filter is not None and
                         not collision_filter(0, 8, 0, 0)):
                     return None
+                if profile_hit_lane is not None:
+                    return (
+                        _Vector3(
+                            start.x,
+                            profile_height(lane, start.z),
+                            start.z,
+                        ),
+                        _Vector3(
+                            -terrain_lateral_gradient,
+                            1.0,
+                            -0.10,
+                        ),
+                    )
                 # Every vertical probe returns the real ground for its own lane.
                 # A future lane/contact verifier can therefore distinguish the
                 # hard side obstacle below from this traversable surface.
@@ -405,17 +440,34 @@ class PlayerSlopeObstacleRegressionTest(unittest.TestCase):
                 return None
 
             candidates = []
-            ground_z = (
-                start.y - lane_base(start.x)
-            ) / terrain_gradient
-            if start.z <= ground_z <= end.z:
+            lane = lane_for_x(start.x)
+            if (profile_hit_lane is not None and
+                    lane == profile_hit_lane and
+                    start.z <= obstacle_z <= end.z):
                 candidates.append((
-                    ground_z,
-                    _Vector3(0.0, 1.0, -terrain_gradient),
+                    obstacle_z,
+                    _Vector3(
+                        -terrain_lateral_gradient,
+                        1.0,
+                        -0.10,
+                    ),
                     "ground",
                 ))
+            elif profile_hit_lane is None:
+                ground_z = (
+                    start.y - lane_base(start.x)
+                ) / terrain_gradient
+                if start.z <= ground_z <= end.z:
+                    candidates.append((
+                        ground_z,
+                        _Vector3(
+                            -terrain_lateral_gradient,
+                            1.0,
+                            -terrain_gradient,
+                        ),
+                        "ground",
+                    ))
 
-            lane = -1 if start.x < -1.0 else (1 if start.x > 1.0 else 0)
             if (hard_lane == lane and
                     start.z <= obstacle_z <= end.z):
                 # This is an intact inclined rock face, not the lane's ground.
@@ -859,6 +911,35 @@ class PlayerSlopeObstacleRegressionTest(unittest.TestCase):
 
     def test_each_lane_matching_its_real_uphill_ground_remains_drivable(self):
         blocked, solid_attempts = self._run_multilane_uphill_contact()
+
+        self.assertFalse(blocked)
+        self.assertEqual([], solid_attempts)
+
+    def test_side_lane_profile_is_not_replaced_by_hull_centre_gap(self):
+        for hit_lane in (-1, 1):
+            with self.subTest(hit_lane=hit_lane):
+                blocked, solid_attempts = self._run_multilane_uphill_contact(
+                    profile_hit_lane=hit_lane,
+                )
+
+                self.assertFalse(blocked)
+                self.assertEqual([], solid_attempts)
+
+    def test_abrupt_hit_lane_is_not_hidden_by_smooth_hull_centre(self):
+        for hit_lane in (-1, 1):
+            with self.subTest(hit_lane=hit_lane):
+                blocked, solid_attempts = self._run_multilane_uphill_contact(
+                    profile_hit_lane=hit_lane,
+                    hit_lane_profile_abrupt=True,
+                )
+
+                self.assertTrue(blocked)
+                self.assertEqual([], solid_attempts)
+
+    def test_cross_slope_normal_does_not_become_a_forward_wall(self):
+        blocked, solid_attempts = self._run_multilane_uphill_contact(
+            terrain_lateral_gradient=1.50,
+        )
 
         self.assertFalse(blocked)
         self.assertEqual([], solid_attempts)

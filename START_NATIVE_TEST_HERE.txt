@@ -1,4 +1,4 @@
-WORLD OF TANKS 0.8.2 NATIVE BOT PHYSICS EXPERIMENT 1.8.56
+WORLD OF TANKS 0.8.2 NATIVE BOT PHYSICS EXPERIMENT 1.8.57
 ==========================================================
 
 This is a separate experimental build. It keeps the retail 0.8.2 rigid-body
@@ -14,6 +14,20 @@ Install
 
 Do not merge individual files. The package must not leave an old
 mod_offhangar.pyc behind.
+
+What changed in 1.8.57
+----------------------
+
+- Player-to-vehicle collision volume is active again. A tick-local module
+  shadowing error left both the Python-player/native-bot contact resolver and
+  the lower-hull terrain classifier unbound at the time they ran. That allowed
+  friendly/enemy overlap, while the terrain classifier failed closed and made
+  an ordinary lower-hull slope contact feel like a wall. Failures are now
+  counted and reported once per battle instead of being silently swallowed.
+- Cross-slope terrain classification now profiles the exact lower-hull lane
+  that touched the ground instead of substituting the chassis centre line.
+  Continuous track lanes remain drivable while an abrupt step seen by either
+  track remains solid. Engine power and the retail climb limit are unchanged.
 
 What changed in 1.8.56
 ----------------------

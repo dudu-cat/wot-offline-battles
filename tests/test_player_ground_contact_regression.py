@@ -70,10 +70,7 @@ class PlayerGroundContactRegressionTests(unittest.TestCase):
         marker = source.index("\t\t\t\t# --- Ground contact:")
         start = source.index("\t\t\t\ttry:", marker)
         end = source.index("\n\t\t\t\t# --- Drowning:", start)
-        cls.ground_contact_block = textwrap.dedent(source[start:end]).replace(
-            "from gui.mods.offhangar import vehicle_collision as _VC",
-            "_VC = _test_vehicle_collision",
-        )
+        cls.ground_contact_block = textwrap.dedent(source[start:end])
         support_start = source.index("\t\t\t\tdef _terrain_support")
         support_end = source.index(
             "\n\t\t\t\tdef _try_destroy_destructible", support_start
@@ -113,7 +110,9 @@ class PlayerGroundContactRegressionTests(unittest.TestCase):
             "_veh_airborne": [bool(airborne)],
             "_phys_gravity": 12.2625,
             "_offh_land_impact": lambda *unused: None,
-            "_test_vehicle_collision": self.vehicle_collision,
+            # Production captures the battle-scoped vehicle_collision module.
+            # The extracted block receives the same already-bound dependency.
+            "_VC": self.vehicle_collision,
             "LOG_DEBUG": lambda *unused: None,
             "math": math,
         }
