@@ -9,8 +9,9 @@ items/vehicles.pyc from the item_defs XML):
   speedLimits       (fwd m/s, bwd m/s)
   terrainResistance (firm, medium, soft) multipliers
   specificFriction  mu*g in m/s^2 (chassis XML 0.07 x 9.81 = 0.6867 default)
-  brakeForce        N (chassis XML kgf x 9.81; huge by design ->
-                       braking is grip-limited, see BRAKE_GRIP_G)
+  brakeForce        N when the target reader supplies it.  Exact #1513 leaves
+                       this legacy descriptor field at zero; braking therefore
+                       falls back to the shared track-grip limit.
   trackCenterOffset half track gauge in m (chassis topRightCarryingPoint.x)
   rotationSpeed     chassis, rad/s (reader applies radians())
 
@@ -79,12 +80,16 @@ COH_DECAY_POW = 3.0
 COH_DECAY_BOUND = 0.5
 SLOPE_COH_DECAY = 0.25
 SLOPE_COH_DECAY_Y = 0.72
-# ---- offline-model constants (no WG equivalent recoverable) ----
-# Coasting (key released) = rolling resistance + this share of the full brake.
-# At 0.35 the decel was rr + 0.35*grip ~ 6.5 m/s^2: 1.7 s and 9.5 m to stop from
-# 40 km/h, which reads as a tank that will not settle. 0.55 -> ~9.7 m/s^2, i.e.
-# ~1.1 s and 6 m. Tunable from config.json as coast_brake_share.
-COAST_BRAKE_SHARE = 0.55
+# ---- offline-model constants (no exact native transition curve recoverable) ----
+# Exact #1513 exposes per-vehicle mass, speed and terrain resistance plus the
+# common WGVehiclePhysics brake/damping configuration, but the W-release curve
+# itself lives in native code.  Use a conservative share of the recovered track
+# grip: 0.65 shortens a Type 62 flat-road 60 km/h stop by about 15% versus the
+# former 0.55 calibration without pretending that neutral coast is a full track
+# lock.  A real downhill grade progressively unloads this drag.  Above the
+# static perch tangent only rolling resistance remains, so gravity can carry a
+# tank down a steep continuous slope without making flat roads frictionless.
+COAST_BRAKE_SHARE = 0.65
 # Steering adds track-differential drag to the rolling resistance.
 STEER_RESIST_MULT = 1.6
 # Engine force F = P / max(|v|, ENGINE_MIN_V), capped by track cohesion.
@@ -278,10 +283,14 @@ def derive_params(td):
 		if 'specificFriction' in tdp:
 			p['specificFriction'] = float(tdp['specificFriction'])
 		if 'brakeForce' in tdp:
-			# WG: brake grip = COHESION (1.3) x normal force; the descriptor's
-			# brakeForce (kgf x g) only ever binds for absurdly light hulls.
-			p['brakeDecel'] = min(COHESION * GRAVITY,
-			                      float(tdp['brakeForce']) / max(p['mass'], 1.0))
+			# Exact #1513 initializes this legacy field to zero and never reads
+			# the similarly named chassis XML value.  Zero means unavailable, not
+			# a frictionless brake; retain the recovered track-grip fallback.
+			raw_brake = float(tdp['brakeForce'])
+			if raw_brake > 0.0:
+				p['brakeDecel'] = min(
+					COHESION * GRAVITY,
+					raw_brake / max(p['mass'], 1.0))
 		if 'trackCenterOffset' in tdp:
 			tc = abs(float(tdp['trackCenterOffset']))
 			if 0.3 <= tc <= 3.0:
@@ -355,14 +364,16 @@ def brake_force(p, active, terrainIdx=0, slope_pitch=0.0):
 	(cos theta) while cohesion decays on steep ground. So a hull braking on a
 	slope past the grip limit CANNOT hold and slides - the same ~50 deg limit
 	as the lateral fall-line slip, kept consistent on purpose.
-	active=True: opposite-throttle / hold lock-up. active=False: coast.'''
+	active=True: opposite-throttle / hold lock-up. active=False: the established
+	flat-ground drivetrain coast drag; longitudinal_step relieves that drag only
+	when gravity is carrying the hull downhill.'''
 	ny = math.cos(slope_pitch)
 	grip_decel = slope_cohesion(ny) * GRAVITY * (ny if ny > 0.1 else 0.1)
 	brake = p['brakeDecel'] if p['brakeDecel'] < grip_decel else grip_decel
 	if active:
 		return p['mass'] * brake
-	return p['mass'] * (p['specificFriction'] * GRAVITY_FACTOR * p['terrainResist'][terrainIdx]
-	                    + COAST_BRAKE_SHARE * brake)
+	return (rolling_resist_force(p, terrainIdx, False) +
+		p['mass'] * COAST_BRAKE_SHARE * brake)
 
 
 def _grip_decel(p, slope_pitch):
@@ -447,13 +458,22 @@ def longitudinal_step(p, v, throttle, steering, slope_pitch, dt,
 		# Parked / coasting: static grip tries to hold against slope gravity.
 		if abs(v) < 0.02:
 			_ny_h = math.cos(slope_pitch)
-			_hold = SLIDE_HOLD_TAN * GRAVITY * (_ny_h if _ny_h > 0.1 else 0.1)   # static perch limit ~32 deg
+			_hold = SLIDE_HOLD_TAN * GRAVITY * (_ny_h if _ny_h > 0.1 else 0.1)   # static perch limit ~27 deg
 			if abs(grav_a) <= _hold:
 				return 0.0                        # tracks hold - no creep on ordinary hills
 			accel = grav_a - (_hold if grav_a > 0.0 else -_hold)   # slides off a too-steep parked slope
 		else:
-			# rolling + partial grip brake oppose the motion; gravity still acts
-			resist = rr + COAST_BRAKE_SHARE * grip
+			# Preserve the established flat-road settling distance, but unload the
+			# drivetrain drag as the current direction points downhill.  The ratio is
+			# direction-aware: coasting uphill receives no relief.  At/past the static
+			# perch tangent gravity owns the descent and only rolling resistance remains.
+			motion_sign = 1.0 if v > 0.0 else -1.0
+			downhill_tangent = max(
+				0.0, math.tan(slope_pitch) * motion_sign)
+			downhill_relief = min(
+				1.0, downhill_tangent / SLIDE_HOLD_TAN) ** 0.4
+			coast_share = COAST_BRAKE_SHARE * (1.0 - downhill_relief)
+			resist = rr + coast_share * grip
 			accel = grav_a - (resist if v > 0.0 else -resist)
 
 	# TRACK-SLIP DRAG: rolling UP a grade steeper than the tracks can pull, they

@@ -6,8 +6,10 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'ports' / '0.9.22' / 'src' / 'res' / 'scripts' / 'client'))
+sys.path.insert(0, str(ROOT / 'ports' / '0.9.22' / 'server'))
 
 from gui.mods.offline_lan_0922.lan_client import LANClient
+from lan_battle_server import Player, _bot_combat_log_message
 
 
 class LanProtocolTests(unittest.TestCase):
@@ -67,6 +69,32 @@ class LanProtocolTests(unittest.TestCase):
         self.assertEqual(17, self.sent[8]['chunk_id'])
         self.assertTrue(all(message['round_id'] == 7
                             for message in self.sent))
+
+    def test_bot_combat_log_fields_explain_friendly_ram(self):
+        players = {
+            1: Player(1, None, ('127.0.0.1', 1), team=1, slot=0),
+        }
+        bots = {
+            3: {'id': 3, 'team': 1},
+            28: {'id': 28, 'team': 2},
+        }
+
+        self.assertEqual(
+            'BOT COMBAT kind=bot_human_hit source=ram attacker=3 '
+            'attacker_team=1 target=1 target_team=1 damage=27 '
+            'health=853 dead=False', _bot_combat_log_message({
+            'kind': 'bot_human_hit', 'source': 'ram',
+            'attacker_bot': 3, 'target': 1,
+            'damage': 27, 'health': 853, 'dead': False,
+        }, players, bots))
+        self.assertEqual(
+            'BOT COMBAT kind=bot_bot_hit source=ram attacker=28 '
+            'attacker_team=2 target=3 target_team=1 damage=14 '
+            'health=806 dead=False', _bot_combat_log_message({
+            'kind': 'bot_bot_hit', 'source': 'ram',
+            'attacker_bot': 28, 'target_bot': 3,
+            'damage': 14, 'health': 806, 'dead': False,
+        }, players, bots))
 
     def test_critical_hit_requires_exact_target_contract(self):
         critical = {
@@ -145,14 +173,22 @@ class LanProtocolTests(unittest.TestCase):
         self.assertEqual('bot_hit_report', self.sent[0]['type'])
 
     def test_failed_fire_send_does_not_create_sequence_gap(self):
+        launch = {
+            'position': [1.0, 2.0, 3.0],
+            'velocity': [900.0, 0.0, 0.0],
+            'gravity': 9.81,
+            'max_distance': 720.0,
+            'max_time_ms': 20000,
+        }
         self.client._send = lambda unused_message: False
 
-        self.assertIsNone(self.client.send_fire())
+        self.assertIsNone(self.client.send_fire(**launch))
         self.assertEqual(0, self.client._fire_seq)
 
         self.client._send = lambda message: self.sent.append(message) or True
-        self.assertEqual(1, self.client.send_fire())
-        self.assertEqual(1, self.sent[-1]['fire_seq'])
+        self.assertEqual(1, self.client.send_fire(**launch))
+        self.assertEqual('projectile_launch', self.sent[-1]['type'])
+        self.assertEqual(1, self.sent[-1]['shot_seq'])
 
     def test_worker_sends_hello_before_exposing_connected_socket(self):
         client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
@@ -201,6 +237,35 @@ class LanProtocolTests(unittest.TestCase):
         })
 
         self.assertAlmostEqual(25.0, self.client.rtt_ms, places=3)
+
+    def test_bot_observation_is_validated_and_stale_round_is_ignored(self):
+        received = []
+        self.client.on_event = (
+            lambda kind, message: received.append((kind, message)))
+        message = {
+            'type': 'bot_observation', 'protocol': 5, 'round_id': 7,
+            'contacts': [{
+                'observing_team': 2, 'target_kind': 'human',
+                'target_id': 1, 'target_team': 1, 'visible': True,
+            }],
+        }
+
+        self.client._handle_message(message)
+        self.assertEqual(['bot_observation'],
+                         [kind for kind, unused in received])
+
+        stale = dict(message, round_id=6)
+        self.client._handle_message(stale)
+        self.assertEqual(1, len(received))
+
+        malformed = dict(message)
+        malformed['contacts'] = [dict(
+            message['contacts'][0], visible=1)]
+        self.client.running = True
+        self.client._handle_message(malformed)
+        self.assertEqual('invalid bot observation message',
+                         self.client.last_error)
+        self.assertFalse(self.client.ready)
 
     def test_server_timing_projects_receive_time_and_half_rtt(self):
         self.client.rtt_ms = 100.0

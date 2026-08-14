@@ -580,7 +580,10 @@ def build_vehicle_profile(descriptor):
 		'mediumTank': (135.0, 340.0),
 		'lightTank': (175.0, 320.0),
 		'AT-SPG': (255.0, 450.0),
-		'SPG': (340.0, 120.0),  # no indirect-fire controller yet
+		# The client proves a real shell trajectory before an SPG is reported
+		# shootable.  These ranges therefore describe its battery role rather
+		# than the old temporary 120 m direct-fire fallback.
+		'SPG': (650.0, 1250.0),
 	}
 	desired_range, fire_range = desired_ranges[class_tag]
 	if armor >= 120.0 and class_tag == 'AT-SPG':
@@ -610,43 +613,74 @@ def build_vehicle_profile(descriptor):
 
 
 def select_shell_index(profile, target, personality):
-	"""Choose a shell from armor, remaining HP and range without engine APIs."""
+	"""Plan standard AP first, HE for soft targets and premium for hard ones."""
 	shells = profile.get('shells', ()) or ()
 	if not shells:
 		return 0
 	target_armor = max(0.0, _number(target.get('armor', 0.0), 0.0))
 	target_health = max(0.0, _number(target.get('health', 0.0), 0.0))
-	distance = max(0.0, _number(target.get('distance', 0.0), 0.0))
-	# Long-range impact angle and dispersion make nominal penetration less
-	# reliable. This deliberately stays approximate: the client resolves the
-	# actual armor hit and the planner only chooses ammunition.
-	required_penetration = target_armor * (1.02 + min(distance, 500.0) / 2500.0)
-	best_index = int(shells[0].get('index', 0))
-	best_score = -1e18
+	non_he = []
+	high_explosive = []
 	for shell in shells:
 		kind = str(shell.get('kind', '')).lower()
-		penetration = max(0.0, _number(shell.get('penetration', 0.0), 0.0))
-		damage = max(0.0, _number(shell.get('damage', 0.0), 0.0))
-		is_explosive = ('explosive' in kind and 'hollow' not in kind)
-		margin = penetration - required_penetration
-		score = min(margin, 80.0) * 0.42 + damage * 0.045
-		if penetration >= required_penetration:
-			score += 42.0
+		is_he = ('high_explosive' in kind or
+		         ('explosive' in kind and 'armor_piercing' not in kind))
+		(high_explosive if is_he else non_he).append(shell)
+	baseline = min(non_he, key=lambda value: int(value.get('index', 0))) \
+		if non_he else None
+	baseline_penetration = max(0.0, _number(
+		(baseline or {}).get('penetration', 0.0), 0.0))
+	standard = []
+	premium = []
+	for shell in non_he:
+		penetration = max(0.0, _number(
+			shell.get('penetration', 0.0), 0.0))
+		if (shell is not baseline and baseline_penetration > 0.0 and
+				penetration >= baseline_penetration * 1.03):
+			premium.append(shell)
 		else:
-			score -= min(70.0, abs(margin) * 0.55)
-		if is_explosive:
-			# HE is a deliberate finisher/fallback, not the universal answer to
-			# armor that the simple raw-damage comparison would make it.
-			if target_health <= damage * (0.72 + personality['aggression'] * 0.18):
-				score += 36.0
-			elif target_armor > penetration * 1.8:
-				score += 8.0
-			else:
-				score -= 28.0
-		if score > best_score:
-			best_score = score
-			best_index = int(shell.get('index', best_index))
-	return max(0, best_index)
+			standard.append(shell)
+	best_standard = max(standard, key=lambda value: (
+		_number(value.get('penetration', 0.0), 0.0),
+		_number(value.get('damage', 0.0), 0.0),
+		-int(value.get('index', 0)))) if standard else None
+	best_premium = max(premium, key=lambda value: (
+		_number(value.get('penetration', 0.0), 0.0),
+		_number(value.get('damage', 0.0), 0.0),
+		-int(value.get('index', 0)))) if premium else None
+	best_he = max(high_explosive, key=lambda value: (
+		_number(value.get('damage', 0.0), 0.0),
+		_number(value.get('penetration', 0.0), 0.0),
+		-int(value.get('index', 0)))) if high_explosive else None
+	if target_armor <= 0.0:
+		if best_standard is not None:
+			return max(0, int(best_standard.get('index', 0)))
+		if best_premium is not None:
+			return max(0, int(best_premium.get('index', 0)))
+		return (max(0, int(best_he.get('index', 0)))
+			if best_he is not None else 0)
+	if best_he is not None:
+		he_penetration = max(0.0, _number(
+			best_he.get('penetration', 0.0), 0.0))
+		he_damage = max(0.0, _number(best_he.get('damage', 0.0), 0.0))
+		if (target_armor <= he_penetration * 0.90 or
+				(target_health > 0.0 and
+				 target_health <= he_damage * (
+					0.72 + personality['aggression'] * 0.18) and
+				 target_armor <= he_penetration * 1.10)):
+			return max(0, int(best_he.get('index', 0)))
+	if best_standard is not None:
+		standard_penetration = max(0.0, _number(
+			best_standard.get('penetration', 0.0), 0.0))
+		if (best_premium is not None and
+				standard_penetration < target_armor * 1.05):
+			return max(0, int(best_premium.get('index', 0)))
+		return max(0, int(best_standard.get('index', 0)))
+	if best_premium is not None:
+		return max(0, int(best_premium.get('index', 0)))
+	if best_he is not None:
+		return max(0, int(best_he.get('index', 0)))
+	return max(0, int(shells[0].get('index', 0)))
 
 
 def _distance_2d(first, second):

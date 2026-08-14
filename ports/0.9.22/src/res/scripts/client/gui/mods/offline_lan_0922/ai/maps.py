@@ -123,12 +123,14 @@ from gui.mods.offline_lan_0922.ai import maps_group_b as bot_ai_maps_group_b
 from gui.mods.offline_lan_0922.ai import maps_group_c as bot_ai_maps_group_c
 from gui.mods.offline_lan_0922.ai import maps_extra as bot_ai_maps_extra
 from gui.mods.offline_lan_0922.ai import maps_0922_extra as bot_ai_maps_0922_extra
+from gui.mods.offline_lan_0922.ai import reviewed_routes_20260811
 
 TACTICAL_MAPS.update(bot_ai_maps_group_a.TACTICAL_MAPS_GROUP_A)
 TACTICAL_MAPS.update(bot_ai_maps_group_b.TACTICAL_MAPS_GROUP_B)
 TACTICAL_MAPS.update(bot_ai_maps_group_c.TACTICAL_MAPS_GROUP_C)
 TACTICAL_MAPS.update(bot_ai_maps_extra.TACTICAL_MAPS_EXTRA)
 TACTICAL_MAPS.update(bot_ai_maps_0922_extra.TACTICAL_MAPS_0922_EXTRA)
+reviewed_routes_20260811.apply_reviewed_routes(TACTICAL_MAPS)
 
 
 def normalize_map_name(map_name):

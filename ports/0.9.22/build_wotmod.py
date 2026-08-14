@@ -19,11 +19,14 @@ import navigation_graph_schema as _navigation_schema
 
 
 MOD_ID = 'org.peng.offline_lan_0922'
-MOD_VERSION = '0.3.51'
+MOD_VERSION = '0.3.76'
 PYTHON_MAGIC = '\x03\xf3\r\n'
 FOLIAGE_FORMAT = 'offline-lan-0922-foliage'
 FOLIAGE_VERSION = 1
 FOLIAGE_MANIFEST_FORMAT = FOLIAGE_FORMAT + '-manifest'
+DESTRUCTIBLE_FORMAT = 'offline-lan-0922-destructible-catalog'
+DESTRUCTIBLE_VERSION = 3
+DESTRUCTIBLE_MANIFEST_FORMAT = DESTRUCTIBLE_FORMAT + '-manifest'
 PROJECT_ROOT = os.path.abspath(os.path.join(
     os.path.dirname(__file__), '..', '..'))
 LEGAL_FILES = (
@@ -123,7 +126,8 @@ def _release_config():
 
 
 def _write_client_overlay(dist_root, package_path, checksum_path, digest,
-                          graph_source=None, foliage_source=None):
+                          graph_source=None, foliage_source=None,
+                          destructible_source=None):
     release_config = _release_config()
     release_seed = '%s\n%s:%s' % (
         digest, release_config['host'], release_config['port'])
@@ -150,6 +154,11 @@ def _write_client_overlay(dist_root, package_path, checksum_path, digest,
         os.path.dirname(__file__), 'foliage')
     _validate_foliage(foliage_source)
     shutil.copytree(foliage_source, os.path.join(config_root, 'foliage'))
+    destructible_source = destructible_source or os.path.join(
+        os.path.dirname(__file__), 'destructibles')
+    _validate_destructibles(destructible_source)
+    shutil.copytree(
+        destructible_source, os.path.join(config_root, 'destructibles'))
     shutil.copy2(os.path.join(os.path.dirname(__file__), 'INSTALL.txt'),
                  overlay_root)
     _copy_legal_files(overlay_root)
@@ -278,6 +287,193 @@ def _validate_foliage(foliage_root):
         if filename.endswith('.json') and filename != 'manifest.json')
     if seen != expected_maps or actual_files != expected_files:
         raise SystemExit('complete #1513 foliage batch is invalid')
+
+
+def _validate_destructibles(destructible_root):
+    """Reject partial or tampered #1513 contact geometry catalogs."""
+    manifest_path = os.path.join(destructible_root, 'manifest.json')
+    if not os.path.isfile(manifest_path):
+        raise SystemExit('complete #1513 destructible catalog is missing')
+    with open(manifest_path, 'rb') as stream:
+        manifest = json.load(stream)
+    records = manifest.get('maps') if isinstance(manifest, dict) else None
+    try:
+        version = int(manifest.get('version', -1))
+        locator_quantization = int(manifest.get('locator_quantization'))
+    except (AttributeError, TypeError, ValueError):
+        version = -1
+        locator_quantization = -1
+    expected_maps = set(_navigation_schema.SUPPORTED_MAPS)
+    if (not isinstance(manifest, dict) or
+            manifest.get('format') != DESTRUCTIBLE_MANIFEST_FORMAT or
+            version != DESTRUCTIBLE_VERSION or
+            locator_quantization != 1000 or
+            manifest.get('game_version') != _navigation_schema.GAME_VERSION or
+            not isinstance(records, list) or
+            len(records) != len(expected_maps)):
+        raise SystemExit(
+            'complete #1513 destructible catalog manifest is invalid')
+    seen = set()
+    expected_files = set(name + '.json' for name in expected_maps)
+    for record in records:
+        if not isinstance(record, dict):
+            raise SystemExit('complete #1513 destructible catalog is invalid')
+        name = str(record.get('map') or '')
+        filename = str(record.get('file') or '')
+        expected_hash = str(record.get('sha256') or '')
+        path = os.path.join(destructible_root, filename)
+        if (name not in expected_maps or name in seen or
+                filename != name + '.json' or
+                len(expected_hash) != 64 or not os.path.isfile(path)):
+            raise SystemExit('complete #1513 destructible catalog is invalid')
+        with open(path, 'rb') as stream:
+            payload = stream.read()
+        if hashlib.sha256(payload).hexdigest() != expected_hash:
+            raise SystemExit(
+                'destructible catalog checksum mismatch: %s' % name)
+        try:
+            data = json.loads(payload.decode('utf-8'))
+            resources = data.get('resources')
+            if (data.get('format') != DESTRUCTIBLE_FORMAT or
+                    int(data.get('version', -1)) != DESTRUCTIBLE_VERSION or
+                    int(data.get('locator_quantization', -1)) != 1000 or
+                    data.get('game_version') !=
+                    _navigation_schema.GAME_VERSION or
+                    data.get('map') != name or
+                    not isinstance(resources, dict) or not resources):
+                raise ValueError('invalid destructible catalog')
+            for resource_name, resource in resources.items():
+                boxes = resource.get('boxes') if isinstance(
+                    resource, dict) else None
+                kind = resource.get('kind') if isinstance(
+                    resource, dict) else None
+                locators = resource.get('locators') if isinstance(
+                    resource, dict) else None
+                if (not resource_name or
+                        kind not in ('falling', 'fragile', 'structure') or
+                        not isinstance(boxes, list) or not boxes or
+                        any(not isinstance(box, list) or len(box) != 7
+                            for box in boxes)):
+                    raise ValueError('invalid destructible resource')
+                if kind == 'structure' and locators is not None:
+                    raise ValueError('invalid destructible resource locator')
+                if kind != 'structure' and len(boxes) > 1:
+                    if not isinstance(locators, list) or not locators:
+                        raise ValueError(
+                            'invalid destructible resource locator')
+                elif locators is not None:
+                    raise ValueError('invalid destructible resource locator')
+                seen_locators = set()
+                for locator in locators or ():
+                    if (not isinstance(locator, list) or
+                            len(locator) != 13 or
+                            any(type(value) is not int for value in locator)):
+                        raise ValueError(
+                            'invalid destructible resource locator')
+                    signature = tuple(locator[:12])
+                    box_index = int(locator[12])
+                    if (signature in seen_locators or box_index < 0 or
+                            box_index >= len(boxes)):
+                        raise ValueError(
+                            'invalid destructible resource locator')
+                    seen_locators.add(signature)
+            instances = data.get('instances')
+            ambiguous_instances = data.get('ambiguous_instances')
+            if (not isinstance(instances, list) or not instances or
+                    not isinstance(ambiguous_instances, list)):
+                raise ValueError('invalid destructible instance index')
+            seen_instance_signatures = set()
+            instance_kind_counts = dict((kind, 0) for kind in (
+                'falling', 'fragile', 'structure'))
+            previous_signature = None
+            for row in instances:
+                if (not isinstance(row, list) or len(row) != 14 or
+                        any(type(value) is not int for value in row[:12])):
+                    raise ValueError('invalid destructible instance row')
+                signature = tuple(row[:12])
+                resource = resources.get(row[12])
+                box_index = row[13]
+                if (signature in seen_instance_signatures or
+                        (previous_signature is not None and
+                         signature <= previous_signature) or
+                        not isinstance(resource, dict)):
+                    raise ValueError('invalid destructible instance row')
+                if resource.get('kind') == 'structure':
+                    if box_index is not None:
+                        raise ValueError('invalid destructible instance row')
+                elif (type(box_index) is not int or box_index < 0 or
+                      box_index >= len(resource.get('boxes') or ())):
+                    raise ValueError('invalid destructible instance row')
+                seen_instance_signatures.add(signature)
+                previous_signature = signature
+                instance_kind_counts[resource['kind']] += 1
+            previous_signature = None
+            ambiguous_candidate_count = 0
+            for row in ambiguous_instances:
+                if (not isinstance(row, list) or len(row) != 13 or
+                        any(type(value) is not int for value in row[:12]) or
+                        not isinstance(row[12], list) or len(row[12]) < 2):
+                    raise ValueError(
+                        'invalid ambiguous destructible instance row')
+                signature = tuple(row[:12])
+                if (signature in seen_instance_signatures or
+                        (previous_signature is not None and
+                         signature <= previous_signature)):
+                    raise ValueError(
+                        'invalid ambiguous destructible instance row')
+                candidates = []
+                for candidate in row[12]:
+                    if (not isinstance(candidate, list) or
+                            len(candidate) != 2 or
+                            candidate[0] not in resources):
+                        raise ValueError(
+                            'invalid ambiguous destructible candidate')
+                    resource = resources[candidate[0]]
+                    box_index = candidate[1]
+                    if resource.get('kind') == 'structure':
+                        if box_index is not None:
+                            raise ValueError(
+                                'invalid ambiguous destructible candidate')
+                    elif (type(box_index) is not int or box_index < 0 or
+                          box_index >= len(resource.get('boxes') or ())):
+                        raise ValueError(
+                            'invalid ambiguous destructible candidate')
+                    candidates.append((candidate[0], box_index))
+                candidate_sort_key = lambda candidate: (
+                    candidate[0],
+                    -1 if candidate[1] is None else int(candidate[1]))
+                if (candidates != sorted(
+                            candidates, key=candidate_sort_key)):
+                    raise ValueError(
+                        'invalid ambiguous destructible candidate')
+                seen_instance_signatures.add(signature)
+                previous_signature = signature
+                ambiguous_candidate_count += len(candidates)
+            census = data.get('census')
+            if (not isinstance(census, dict) or
+                    int(census.get('instance_signatures', -1)) !=
+                    len(instances) or
+                    int(census.get('falling_instance_signatures', -1)) !=
+                    instance_kind_counts['falling'] or
+                    int(census.get('fragile_instance_signatures', -1)) !=
+                    instance_kind_counts['fragile'] or
+                    int(census.get('structure_instance_signatures', -1)) !=
+                    instance_kind_counts['structure'] or
+                    int(census.get('ambiguous_instance_signatures', -1)) !=
+                    len(ambiguous_instances) or
+                    int(census.get('ambiguous_instance_candidates', -1)) !=
+                    ambiguous_candidate_count):
+                raise ValueError('invalid destructible instance census')
+        except (AttributeError, TypeError, ValueError) as error:
+            raise SystemExit(
+                'destructible catalog is invalid for %s: %s' %
+                (name, error))
+        seen.add(name)
+    actual_files = set(
+        filename for filename in os.listdir(destructible_root)
+        if filename.endswith('.json') and filename != 'manifest.json')
+    if seen != expected_maps or actual_files != expected_files:
+        raise SystemExit('complete #1513 destructible catalog is invalid')
 
 
 def _remove_stale_outputs(dist_root):

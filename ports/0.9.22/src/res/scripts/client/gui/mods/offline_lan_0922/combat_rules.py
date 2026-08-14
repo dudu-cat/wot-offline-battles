@@ -5,11 +5,12 @@ from __future__ import print_function
 import random
 
 
-# The _offh_* functions below are copied from offline_battle.py.  Keep their
-# bodies unchanged; #1513 objects are converted by the wrappers at the end.
+# The _offh_* functions below retain the 0.8.2 laws; the hull resolver also
+# accepts the already-crossed #1513 destructible loss before vehicle layers.
 
 
-def _offh_resolve_hull_hit(shot, dist_m, all_hits):
+def _offh_resolve_hull_hit(shot, dist_m, all_hits, initial_pierce_loss=0.0,
+		penetration_factor=None):
 	'''Find the first STRUCTURAL plate behind any spaced armour.
 
 	Returns (result, eff_armor, pierce, spaced_mm, angle_cos) where result is the
@@ -30,7 +31,7 @@ def _offh_resolve_hull_hit(shot, dist_m, all_hits):
 		return None
 	shell = (shot.get('shell') or {}) if hasattr(shot, 'get') else {}
 	kind = shell.get('kind', 'ARMOR_PIERCING')
-	spaced = 0.0
+	spaced = float(initial_pierce_loss or 0.0)
 	try:
 		_ordered = sorted(all_hits, key=lambda h: h[0])
 	except Exception:
@@ -55,7 +56,8 @@ def _offh_resolve_hull_hit(shot, dist_m, all_hits):
 			continue
 		if _arm <= 0.0:
 			continue
-		_res, _eff, _p = _offh_penetration(shot, dist_m, _arm, _ac, spaced)
+		_res, _eff, _p = _offh_penetration(
+			shot, dist_m, _arm, _ac, spaced, penetration_factor)
 		return (_res, _eff, _p, spaced, _ac)
 	return None
 
@@ -176,7 +178,8 @@ def _offh_he_apply_tuning(overrides):
 	return applied
 
 
-def _offh_penetration(shot, dist_m, armor, hit_angle_cos, pierce_loss=0.0):
+def _offh_penetration(shot, dist_m, armor, hit_angle_cos, pierce_loss=0.0,
+		penetration_factor=None):
 	'''Armour test shared by the player and by bot-vs-bot fire.
 
 	Returns (result, eff_armor, pierce): 0 ricochet, 1 no penetration, 2 penetration.
@@ -213,7 +216,9 @@ def _offh_penetration(shot, dist_m, armor, hit_angle_cos, pierce_loss=0.0):
 	else:
 		_t = (min(dist_m, maxd) - 100.0) / (maxd - 100.0)
 		pierce = p100 + (pfar - p100) * _t
-	pierce *= random.uniform(0.75, 1.25)
+	if penetration_factor is None:
+		penetration_factor = random.uniform(0.75, 1.25)
+	pierce *= float(penetration_factor)
 	# spaced armour already crossed (tracks, external devices) is subtracted here
 	pierce -= float(pierce_loss or 0.0)
 	if pierce < 0.0:
@@ -303,16 +308,58 @@ def _call_with_uniform(function, uniform, *args):
 
 
 def penetration(shot, distance, armor, hit_angle_cos,
-                pierce_loss=0.0, random_uniform=None):
+                pierce_loss=0.0, random_uniform=None,
+                penetration_factor=None):
     return _call_with_uniform(
         _offh_penetration, random_uniform, legacy_shot(shot),
-        distance, armor, hit_angle_cos, pierce_loss)
+        distance, armor, hit_angle_cos, pierce_loss, penetration_factor)
 
 
-def resolve_hull_hit(shot, distance, collisions, random_uniform=None):
+def sample_penetration_factor(random_uniform=None):
+    """Draw the one #1513 penetration random factor owned by a shell."""
+    sampler = random.uniform if random_uniform is None else random_uniform
+    return float(sampler(0.75, 1.25))
+
+
+def range_piercing(shot, distance):
+    """Return the non-randomized piercing mean at one travelled distance."""
+    converted = legacy_shot(shot)
+    pp = converted.get('piercingPower', (100.0, 100.0))
+    try:
+        near, far = float(pp[0]), float(pp[1])
+    except Exception:
+        near = far = 100.0
+    try:
+        maximum = float(converted.get('maxDistance', 0.0) or 0.0)
+    except Exception:
+        maximum = 0.0
+    if maximum <= 100.0:
+        maximum = 400.0
+    if distance <= 100.0:
+        return near
+    factor = (min(float(distance), maximum) - 100.0) / (maximum - 100.0)
+    return near + (far - near) * factor
+
+
+def sampled_piercing(shot, distance, penetration_factor,
+                     pierce_loss=0.0):
+    """Reuse one shell-owned factor at distance after external obstacles."""
+    return max(0.0, range_piercing(shot, distance) *
+               float(penetration_factor) - float(pierce_loss or 0.0))
+
+
+def nominal_piercing_after_loss(shot, distance, pierce_loss=0.0):
+    """Return the non-randomized #1513 range value after external obstacles."""
+    return max(0.0, range_piercing(shot, distance) -
+               float(pierce_loss or 0.0))
+
+
+def resolve_hull_hit(shot, distance, collisions, random_uniform=None,
+                     pierce_loss=0.0, penetration_factor=None):
     return _call_with_uniform(
         _offh_resolve_hull_hit, random_uniform, legacy_shot(shot),
-        distance, collision_layers(collisions))
+        distance, collision_layers(collisions), pierce_loss,
+        penetration_factor)
 
 
 def he_nominal_armor(collisions, descriptor=None):
@@ -321,7 +368,7 @@ def he_nominal_armor(collisions, descriptor=None):
 
 
 def damage(shot, result, nominal_armor, random_uniform=None):
-    """The unchanged direct-damage call-site formula from offline_battle.py."""
+    """Apply the legacy direct-damage formula to the resolved vehicle hit."""
     converted = legacy_shot(shot)
     shell = converted.get('shell') or {}
     raw = shell.get('damage')

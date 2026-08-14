@@ -980,6 +980,13 @@ class LANSession(object):
                     self._battle_runtime is None):
                 return
             self._battle_runtime.on_battle_live(message)
+        elif kind == 'bot_observation':
+            round_id = _message_value(message, 'round_id')
+            if (not self._battle_started or
+                    round_id != self._active_round_id or
+                    self._battle_runtime is None):
+                return
+            self._battle_runtime.on_bot_observation(message)
         elif kind == 'battle_failed':
             self._on_battle_failed(message)
         elif kind == 'snapshot':

@@ -2,7 +2,176 @@
 """Dedented 0.8.2 horizontal world-collision law."""
 
 from gui.mods.offline_lan_0922.destructibles_sensor import (
-	_try_destroy_destructible, _try_destroy_solid_hit, _vehicle_hull_bbox)
+	_catalog_soft_static_path, _diagnostic_static_recast_1513,
+	_try_destroy_solid_hit, _vehicle_hull_bbox)
+
+
+_MAX_DRIVABLE_GRADIENT = 1.28
+_MAX_DESCENDING_GRADIENT = 1.75
+_MIN_DRIVABLE_HEIGHT_CHANGE = 0.15
+_WORLD_SOFT_RECAST_BUDGET = 4
+
+
+def _profile_gradient_limit(heights):
+	try:
+		return (_MAX_DESCENDING_GRADIENT
+			if float(heights[-1]) < float(heights[0]) else
+			_MAX_DRIVABLE_GRADIENT)
+	except (IndexError, TypeError, ValueError):
+		return _MAX_DRIVABLE_GRADIENT
+
+
+def _drivable_ground_profile(heights, segment_length):
+	"""Recognise a continuous, bounded slope in either travel direction.
+
+	A flat profile is deliberately not terrain evidence: a horizontal wall on a
+	level street must still reach the solid collision path. Abrupt rises and drops
+	remain solid edges rather than becoming a blanket downhill bypass.
+	"""
+	try:
+		values = [float(value) for value in heights]
+		if len(values) < 2:
+			return False
+		if abs(values[-1] - values[0]) <= _MIN_DRIVABLE_HEIGHT_CHANGE:
+			return False
+		segment = max(0.001, float(segment_length))
+		for index in range(1, len(values)):
+			delta = values[index] - values[index - 1]
+			maximum_gradient = (_MAX_DESCENDING_GRADIENT
+				if delta < 0.0 else _MAX_DRIVABLE_GRADIENT)
+			if abs(delta) > segment * maximum_gradient:
+				return False
+		return True
+	except Exception:
+		return False
+
+
+def _drivable_surface(collision, maximum_gradient=_MAX_DRIVABLE_GRADIENT):
+	"""Require the actual horizontal hit, not just nearby ground, to be a slope."""
+	try:
+		normal = collision[1]
+		length = (normal.x * normal.x + normal.y * normal.y +
+			normal.z * normal.z) ** 0.5
+		if length <= 0.0:
+			return False
+		minimum_normal_y = 1.0 / (1.0 +
+			float(maximum_gradient) ** 2) ** 0.5
+		return normal.y / length >= minimum_normal_y
+	except (AttributeError, IndexError, TypeError, ZeroDivisionError):
+		return False
+
+
+def _ground_profile(spaceID, Math, pos, sx, sz, sin_y, cos_y, direction,
+		look, segment_count=6):
+	"""Sample the lane that produced a lower-hull hit."""
+	import BigWorld
+	segment = look / float(segment_count)
+	probe_down = max(
+		5.0, float(look) * _MAX_DESCENDING_GRADIENT + 1.0)
+	heights = []
+	for sample_index in range(segment_count + 1):
+		distance = segment * sample_index
+		x = sx + sin_y * distance * direction
+		z = sz + cos_y * distance * direction
+		ground = BigWorld.wg_collideSegment(
+			spaceID, Math.Vector3(x, pos.y + 12.0, z),
+			Math.Vector3(x, pos.y - probe_down, z), 128)
+		if ground is None:
+			return (), segment
+		heights.append(ground[0].y)
+	return heights, segment
+
+
+def _raised_ray_has_wall(spaceID, Math, pos, x1, z1, x2, z2,
+		target_length, maximum_gradient=_MAX_DRIVABLE_GRADIENT):
+	"""A drivable lower slope must not hide an independent wall above it."""
+	import BigWorld
+	for height in (1.1, 1.6):
+		start = Math.Vector3(x1, pos.y + height, z1)
+		end = Math.Vector3(x2, pos.y + height, z2)
+		collision = BigWorld.wg_collideSegment(spaceID, start, end, 128)
+		if collision is None:
+			continue
+		if ((collision[0] - start).length < target_length and
+				not _drivable_surface(collision, maximum_gradient)):
+			return True
+	return False
+
+
+def _solid_contact_cleared(spaceID, segment_start, segment_end, vel, td):
+	"""Admit only a clear ray or a bounded chain of proved light props.
+
+	#1513 keeps a destroyed fragile/module skin solid until its hide callback.
+	After native authority has accepted the first contact, skip that residual
+	skin only through its unique registered OBB exit.  The same read-only helper
+	may classify following light props so the swept catalog commit can destroy
+	them later in this tick.  Unknown geometry, a backing wall, an ambiguous OBB
+	or an over-budget chain remains solid.
+	"""
+	import BigWorld
+	recast = BigWorld.wg_collideSegment(
+		spaceID, segment_start, segment_end, 128)
+	if recast is None:
+		return True
+	return _catalog_soft_static_path(
+		spaceID, segment_start, segment_end, recast, vel, td,
+		[_WORLD_SOFT_RECAST_BUDGET])
+
+
+def _destroy_and_recast(spaceID, segment_start, segment_end, collision,
+		yaw, vel, td, crush_state=None, allow_kinetic=False,
+		kinetic_speed=None):
+	if crush_state is not None and crush_state[0]:
+		# Another hull lane already obtained native authority for this copied-pose
+		# step.  Classify this lane read-only so the delayed skin cannot cause a
+		# second destroy attempt, while every unrelated solid still fails closed.
+		cleared = _catalog_soft_static_path(
+			spaceID, segment_start, segment_end, collision, vel, td,
+			[_WORLD_SOFT_RECAST_BUDGET])
+		_diagnostic_static_recast_1513(cleared)
+		return cleared is True
+	# Revisit an already accepted hide skin before probing material again. This
+	# keeps the 0.2 s native callback window out of the hot path and still
+	# requires the exact pending identity, OBB exit and a real backing-ray recast.
+	cleared = _catalog_soft_static_path(
+		spaceID, segment_start, segment_end, collision, vel, td,
+		[_WORLD_SOFT_RECAST_BUDGET], require_pending_first=True,
+		allow_kinetic_first=allow_kinetic,
+		kinetic_speed=kinetic_speed)
+	if cleared is True:
+		if crush_state is not None:
+			crush_state[0] = True
+		_diagnostic_static_recast_1513(True)
+		return True
+	if cleared in ('deferred', 'pending_hard'):
+		_diagnostic_static_recast_1513(False)
+		return False
+	if cleared == 'kinetic':
+		# This is planning evidence only.  The catalog commit seam still requires
+		# the exact current hull plus this frame's physical travel before it may
+		# use the directional speed cap.
+		_diagnostic_static_recast_1513(False)
+		return 'kinetic'
+	if not _try_destroy_solid_hit(
+			spaceID, segment_start, collision[0], collision[1], yaw, vel, td):
+		# A previously accepted fragile/module may remain in the native static
+		# skin until #1513's hide callback.  Only that exact pending identity may
+		# be skipped here, through its registered OBB exit and another real ray.
+		# Active kinetic rejects, expired skins, falling bodies and unknown solids
+		# remain authoritative.
+		cleared = _catalog_soft_static_path(
+			spaceID, segment_start, segment_end, collision, vel, td,
+			[_WORLD_SOFT_RECAST_BUDGET], require_pending_first=True,
+			allow_kinetic_first=allow_kinetic,
+			kinetic_speed=kinetic_speed)
+		_diagnostic_static_recast_1513(cleared)
+		return cleared if cleared == 'kinetic' else cleared is True
+	if crush_state is not None:
+		crush_state[0] = True
+	cleared = _solid_contact_cleared(
+		spaceID, segment_start, segment_end, vel, td)
+	_diagnostic_static_recast_1513(cleared)
+	return cleared is True
 
 
 def check_horizontal_collision(bigworld, math_module, *args):
@@ -26,7 +195,9 @@ def check_horizontal_collision(bigworld, math_module, *args):
 			sys.modules['Math'] = old_math
 
 
-def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None, airborne=False, dt=0.04):
+def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None,
+		airborne=False, dt=0.04, return_status=False,
+		allow_kinetic=False, kinetic_speed=None):
 	import math, BigWorld, Math
 	try:
 		hw = 1.5
@@ -51,48 +222,17 @@ def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None, airborne=False,
 		if airborne:
 			_ahead = abs(vel) * dt + 0.2
 		else:
-			_ahead = min(1.2, max(0.4, abs(vel) * dt * 2.0))
+			# Cover the complete copied-pose translation of this frame.  A fixed
+			# 1.2 m cap was shorter than a 20 m/s tank's 2 m slow-frame step and
+			# could miss a hard wall immediately behind a crushed light prop.
+			_ahead = max(0.4, abs(vel) * dt + 0.2)
 		back_margin = -0.5 if vel > 0 else 0.5
 		front_margin = (hl_front + _ahead) if vel > 0 else -(hl_back + _ahead)
 		
 		cos_y = math.cos(yaw)
 		sin_y = math.sin(yaw)
-
-		# DRIVABLE-SLOPE GUARD: a rising HILL is not a wall. Sample the ground under
-		# the hull and at the hull front along the heading; only a real, gradual rise
-		# may bypass the wall rays. The old check returned early for every smooth
-		# profile, including level city streets, so ordinary walls were never tested.
-		try:
-			_fw = 1.0 if vel >= 0 else -1.0
-			_look = (hl_front if vel > 0 else hl_back) + _ahead
-			# Walk the ground along the heading in small steps. A drivable HILL rises
-			# gradually at EVERY step -> climb it (no collision). A big rock / step /
-			# wall SPIKES one step (rises more than a climbable amount over its short
-			# length) -> leave it to the ray wall-check so the hull is BLOCKED.
-			_seg_n = 6
-			_seg = _look / _seg_n
-			_smooth = True
-			_first_y = None
-			_prev_y = None
-			for _si in range(_seg_n + 1):
-				_dd = _seg * _si
-				_px = pos.x + sin_y * _dd * _fw
-				_pz = pos.z + cos_y * _dd * _fw
-				_gg = BigWorld.wg_collideSegment(spaceID, Math.Vector3(_px, pos.y + 12.0, _pz), Math.Vector3(_px, pos.y - 5.0, _pz), 128)
-				if _gg is None:
-					_smooth = False
-					break
-				if _first_y is None:
-					_first_y = _gg[0].y
-				if _prev_y is not None and (_gg[0].y - _prev_y) > _seg * 1.28:
-					_smooth = False   # step rises steeper than ~52 deg = rock/step, not a hill
-					break
-				_prev_y = _gg[0].y
-			if (_smooth and _first_y is not None and _prev_y is not None and
-					_prev_y - _first_y > 0.15):
-				return False
-		except Exception:
-			raise
+		_crush_state = [False]
+		_kinetic_contact = False
 
 		for offset_x in (-hw, 0, hw):
 			sx = pos.x + cos_y * offset_x
@@ -103,50 +243,107 @@ def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None, airborne=False,
 			x2 = sx + sin_y * front_margin
 			z2 = sz + cos_y * front_margin
 			
-			# Independent centre-lane scan for trees and fences.  A native
-			# destructible failure is a hard movement failure, never permission to
-			# pass through an object that is still visually intact.
-			if offset_x == 0:
-				seg_start = Math.Vector3(sx, pos.y + 0.5, sz)
-				seg_stop = Math.Vector3(x2, pos.y + 0.5, z2)
-				matInfo = BigWorld.wg_getMatInfoNearPoint(spaceID, seg_start, seg_stop, seg_stop, lambda *a: False)
-				_try_destroy_destructible(
-					spaceID, matInfo, yaw, vel)
-			
 			# Spodní paprsek pro pevnou geometrii (0.6m nad zemí)
 			start_bot = Math.Vector3(x1, pos.y + 0.6, z1)
 			end_bot = Math.Vector3(x2, pos.y + 0.6, z2)
 			col_bot = BigWorld.wg_collideSegment(spaceID, start_bot, end_bot, 128)
+			target_len = (abs(back_margin) +
+				(hl_front if vel > 0 else hl_back) + _ahead)
 			
 			if col_bot is not None:
 				d_bot = (col_bot[0] - start_bot).length
-				target_len = abs(back_margin) + (hl_front if vel > 0 else hl_back) + _ahead
 				if d_bot < target_len:
-					# Něco jsme trefili, zkontrolujeme horní paprsek (1.6m nad zemí)
-					start_top = Math.Vector3(x1, pos.y + 1.6, z1)
-					end_top = Math.Vector3(x2, pos.y + 1.6, z2)
-					col_top = BigWorld.wg_collideSegment(spaceID, start_top, end_top, 128)
-					
-					if col_top is not None:
-						d_top = (col_top[0] - start_top).length
-						if (d_top - d_bot) < 0.5:
-							if _try_destroy_solid_hit(spaceID, col_bot[0], col_bot[1], yaw, vel): pass
-							else: return True
-					else:
-						start_mid = Math.Vector3(x1, pos.y + 1.1, z1)
-						end_mid = Math.Vector3(x2, pos.y + 1.1, z2)
-						col_mid = BigWorld.wg_collideSegment(spaceID, start_mid, end_mid, 128)
-						if col_mid is not None:
-							d_mid = (col_mid[0] - start_mid).length
-							if (d_mid - d_bot) < 0.25:
-								if _try_destroy_solid_hit(spaceID, col_bot[0], col_bot[1], yaw, vel): pass
-								else: return True
-						else:
-							# Low object (<1.1m): only the bottom ray caught it. Crush it if
-							# it's a destructible (fence / small prop) so the tank drives
-							# THROUGH, not over it. Non-destructibles (low rocks) stay drivable.
-							_try_destroy_solid_hit(
-								spaceID, col_bot[0], col_bot[1], yaw, vel)
+					# A lower ray may meet the slope itself. Admit it only when this
+					# exact lane has a continuous non-flat ground profile and the
+					# native contact normal is also a drivable surface. This handles
+					# downhill terrain without hiding a wall merely located on a hill.
+					_direction = 1.0 if vel >= 0 else -1.0
+					_look = (hl_front if vel > 0 else hl_back) + _ahead
+					_heights = ()
+					_segment = 0.0
+					_gradient_limit = _MAX_DESCENDING_GRADIENT
+					# A vertical wall cannot become terrain under either directional
+					# limit, so avoid seven extra ground rays on the common hard-hit path.
+					# Only a surface that could be a slope earns the exact lane profile.
+					if _drivable_surface(col_bot, _gradient_limit):
+						_heights, _segment = _ground_profile(
+							spaceID, Math, pos, sx, sz, sin_y, cos_y,
+							_direction, _look)
+						_gradient_limit = _profile_gradient_limit(_heights)
+						if (_heights and
+								abs(float(_heights[-1]) -
+									float(_heights[0])) >
+								_MIN_DRIVABLE_HEIGHT_CHANGE and
+								not _drivable_ground_profile(
+									_heights, _segment)):
+							# This is a proved continuous-direction terrain profile, not
+							# a small prop. An ascent/descent outside its directional
+							# bound remains solid instead of falling into prop handling.
+							return 'hard' if return_status else True
+					if (_heights and
+							_drivable_ground_profile(_heights, _segment) and
+							_drivable_surface(col_bot, _gradient_limit)):
+						if _raised_ray_has_wall(
+								spaceID, Math, pos, x1, z1, x2, z2,
+								target_len, _gradient_limit):
+							return 'hard' if return_status else True
+						continue
+					# Treat every occupied hull height as independent evidence.  The
+					# previous distance-difference heuristic dropped the whole lane when
+					# a low prop was followed by a farther upper wall, and could destroy
+					# a lower prop even when an upper wall was nearer.  Sort the actual
+					# contacts front-to-back; after the first native acceptance, later
+					# heights use the same read-only exact-OBB recast path.
+					_lane_hits = [(d_bot, start_bot, end_bot, col_bot)]
+					for _height in (1.1, 1.6):
+						_ray_start = Math.Vector3(x1, pos.y + _height, z1)
+						_ray_end = Math.Vector3(x2, pos.y + _height, z2)
+						_ray_hit = BigWorld.wg_collideSegment(
+							spaceID, _ray_start, _ray_end, 128)
+						if _ray_hit is None:
+							continue
+						_ray_distance = (_ray_hit[0] - _ray_start).length
+						if _ray_distance < target_len:
+							_lane_hits.append((_ray_distance, _ray_start,
+								_ray_end, _ray_hit))
+					_lane_hits.sort(key=lambda value: value[0])
+					for _unused_distance, _ray_start, _ray_end, _ray_hit in _lane_hits:
+						_resolved = _destroy_and_recast(
+								spaceID, _ray_start, _ray_end, _ray_hit,
+								yaw, vel, td, _crush_state, allow_kinetic,
+								kinetic_speed)
+						if _resolved == 'kinetic':
+							_kinetic_contact = True
+						elif _resolved is not True:
+							return 'hard' if return_status else True
+			if col_bot is None or d_bot >= target_len:
+				# A suspended beam or upper wall may miss the 0.6 m ray entirely.
+				# Probe the remaining hull heights even on a lower-ray miss; otherwise
+				# three empty lower lanes could classify a real upper collision clear.
+				_upper_hits = []
+				for _height in (1.1, 1.6):
+					_ray_start = Math.Vector3(x1, pos.y + _height, z1)
+					_ray_end = Math.Vector3(x2, pos.y + _height, z2)
+					_ray_hit = BigWorld.wg_collideSegment(
+						spaceID, _ray_start, _ray_end, 128)
+					if _ray_hit is None:
+						continue
+					_ray_distance = (_ray_hit[0] - _ray_start).length
+					if _ray_distance < target_len:
+						_upper_hits.append((_ray_distance, _ray_start,
+							_ray_end, _ray_hit))
+				_upper_hits.sort(key=lambda value: value[0])
+				for _unused_distance, _ray_start, _ray_end, _ray_hit in _upper_hits:
+					_resolved = _destroy_and_recast(
+							spaceID, _ray_start, _ray_end, _ray_hit,
+							yaw, vel, td, _crush_state, allow_kinetic,
+							kinetic_speed)
+					if _resolved == 'kinetic':
+						_kinetic_contact = True
+					elif _resolved is not True:
+						return 'hard' if return_status else True
 	except Exception:
 		raise
-	return False
+	if return_status:
+		return 'kinetic' if _kinetic_contact else 'clear'
+	return bool(_kinetic_contact)

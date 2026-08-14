@@ -658,10 +658,9 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertTrue(bridge.destroy())
 
         self.assertEqual(['create', 'added', 'select', 'entered',
-                          'client_ready', 'avatar_ready', 'period', 'drive',
+                          'client_ready', 'avatar_ready', 'period',
                           'removed', 'destroy'],
                          [event[0] for event in binding.events])
-        self.assertIn(('drive', 91, 1, -1), binding.events)
         self.assertEqual([(91, 'move', {'flags': 7}),
                           (91, 'track_relative', {'point': (1, 2, 3)}),
                           (91, 'shoot', {}),
@@ -673,6 +672,41 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertEqual([(5, 2, '')], avatar.tokens)
         self.assertEqual([(6, {'wins': 0, 'losses': 0})],
                          avatar.account_stats)
+
+    def test_handled_vehicle_setting_is_not_echoed_to_avatar(self):
+        module = _avatar_bridge_module()
+        avatar = _BridgeAvatar()
+        sender = _Sender()
+        sender.change_vehicle_setting = mock.Mock(return_value=True)
+        bridge = module.AvatarServerBridge(
+            avatar, _BridgeBinding(),
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            sender)
+
+        self.assertEqual(91, bridge.addVehicleToArena(_snapshot()))
+        bridge.vehicle_changeSetting(16, 0x530004)
+
+        sender.change_vehicle_setting.assert_called_once_with(
+            91, 16, 0x530004)
+        self.assertEqual([], avatar.settings)
+
+    def test_unhandled_vehicle_setting_is_echoed_to_avatar(self):
+        module = _avatar_bridge_module()
+        avatar = _BridgeAvatar()
+        sender = _Sender()
+        sender.change_vehicle_setting = mock.Mock(return_value=False)
+        bridge = module.AvatarServerBridge(
+            avatar, _BridgeBinding(),
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            sender)
+
+        self.assertEqual(91, bridge.addVehicleToArena(_snapshot()))
+        bridge.vehicle_changeSetting(2, 1)
+
+        sender.change_vehicle_setting.assert_called_once_with(91, 2, 1)
+        self.assertEqual([(91, 2, 1)], avatar.settings)
 
     def test_period_reentry_accepts_stock_initial_move(self):
         module = _avatar_bridge_module()
@@ -699,7 +733,7 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertTrue(bridge.flushClientReady())
         self.assertEqual([(91, 'move', {'flags': 0})], sender.events)
 
-    def test_native_cruise_bits_reach_sender_without_changing_filter_direction(self):
+    def test_native_move_mailbox_relays_without_notifying_filter_twice(self):
         module = _avatar_bridge_module()
         binding = _BridgeBinding()
         sender = _Sender()
@@ -721,10 +755,8 @@ class AvatarServerBridgeTests(unittest.TestCase):
             (91, 'move', {'flags': 33}),
             (91, 'move', {'flags': 18}),
         ], sender.events)
-        self.assertEqual([
-            ('drive', 91, 1, 0),
-            ('drive', 91, -1, 0),
-        ], [event for event in binding.events if event[0] == 'drive'])
+        self.assertEqual(
+            [], [event for event in binding.events if event[0] == 'drive'])
 
     def test_reentrant_vehicle_enter_fails_closed_before_registration(self):
         module = _avatar_bridge_module()
@@ -944,23 +976,36 @@ class AvatarServerBridgeTests(unittest.TestCase):
                 for value in parameters), name)
             self.assertEqual(wire_count + 1, len(parameters), name)
 
-    def test_spectator_switch_is_explicitly_rejected_without_client_desync(self):
+    def test_spectator_switch_delegates_complete_runtime_transaction(self):
         module = _avatar_bridge_module()
         avatar = _BridgeAvatar()
         binding = _BridgeBinding()
         sender = _Sender()
+        switches = []
         bridge = module.AvatarServerBridge(
             avatar, binding,
             _runtime_module().EntityPropertyBuilder(
                 ('typeCompDescr', 'team')),
-            sender)
+            sender, on_viewpoint_switch=lambda is_viewpoint, target_id:
+            switches.append((is_viewpoint, target_id)) or target_id == 92)
 
-        self.assertFalse(bridge.switchViewPointOrBindToVehicle(False, 92))
+        self.assertTrue(bridge.switchViewPointOrBindToVehicle(False, 92))
         self.assertFalse(bridge.switchViewPointOrBindToVehicle(True, 7))
 
+        self.assertEqual([(False, 92), (True, 7)], switches)
         self.assertEqual([], avatar.viewpoint_switches)
         self.assertEqual([], binding.events)
         self.assertEqual([], sender.events)
+
+    def test_spectator_switch_without_runtime_owner_is_rejected(self):
+        module = _avatar_bridge_module()
+        bridge = module.AvatarServerBridge(
+            _BridgeAvatar(), _BridgeBinding(),
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            _Sender())
+
+        self.assertFalse(bridge.switchViewPointOrBindToVehicle(False, 92))
 
     def test_unknown_mailbox_interface_is_not_silently_accepted(self):
         module = _avatar_bridge_module()

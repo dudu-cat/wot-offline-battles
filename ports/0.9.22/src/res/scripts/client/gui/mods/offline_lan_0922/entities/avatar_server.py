@@ -12,10 +12,10 @@ The public 0.9.22 observer implementation at tuxedo commit
 This implementation is intentionally explicit.  Unknown mailboxes still raise
 ``AttributeError`` instead of turning client errors into silent success.
 
-Postmortem spectator switching is deliberately unavailable in the local
-standard-battle slice.  Exact #1513 delegates the actual Avatar attachment to
-the cell server; invoking only ``PlayerAvatar.onSwitchViewpoint`` would update
-the HUD without moving the camera and leave the client in a split state.
+Postmortem spectator switching is delegated to the battle runtime.  Exact
+#1513 requires the cell server to reattach the Avatar before it invokes
+``PlayerAvatar.onSwitchViewpoint``; the bridge therefore never emits that
+client callback without a runtime-owned, validated attachment transaction.
 """
 
 try:
@@ -109,7 +109,7 @@ class AvatarServerBridge(object):
 
     def __init__(self, avatar, entity_binding, property_builder, lan_sender,
                  account_commands=None, on_ready=None, on_leave=None,
-                 on_vehicle_enter=None,
+                 on_vehicle_enter=None, on_viewpoint_switch=None,
                  initial_period='battle', initial_period_seconds=0.0):
         self._avatar = avatar
         self._binding = entity_binding
@@ -119,6 +119,7 @@ class AvatarServerBridge(object):
         self._on_ready = on_ready
         self._on_leave = on_leave
         self._on_vehicle_enter = on_vehicle_enter
+        self._on_viewpoint_switch = on_viewpoint_switch
         self._initial_period = initial_period
         self._initial_period_seconds = max(
             0.0, float(initial_period_seconds))
@@ -294,15 +295,17 @@ class AvatarServerBridge(object):
 
     def switchViewPointOrBindToVehicle(self, is_viewpoint,
                                        vehicle_or_point_id):
-        """Reject unsupported spectator changes without desynchronizing UI.
+        """Delegate one complete server-style postmortem attachment.
 
         ``AvatarPositionControl.switchViewpoint`` discards this mailbox's
-        return value.  A successful server implementation would reattach the
-        Avatar and then call ``PlayerAvatar.onSwitchViewpoint``.  The local
-        bridge cannot perform that engine-owned attachment, so it must not
-        emit the client callback on its own.
+        return value.  Keep all target validation, matrix rebinding and the
+        final client callback in one battle-runtime transaction so a rejected
+        request cannot update only the HUD or only the camera.
         """
-        return False
+        if self._destroyed or not callable(self._on_viewpoint_switch):
+            return False
+        return bool(self._on_viewpoint_switch(
+            bool(is_viewpoint), int(vehicle_or_point_id)))
 
     def _bind_avatar_once(self, vehicle_id):
         if self._bound_vehicle_id == vehicle_id:
@@ -384,11 +387,11 @@ class AvatarServerBridge(object):
 
     def vehicle_moveWith(self, flags):
         flags = int(flags)
-        movement_dir = 1 if flags & 1 else (-1 if flags & 2 else 0)
-        rotation_dir = 1 if flags & 8 else (-1 if flags & 4 else 0)
+        # PlayerAvatar.moveVehicle has already notified the native filter
+        # before invoking this cell mailbox.  The local bridge owns only the
+        # LAN relay; notifying the filter again duplicates stock input and
+        # bypasses PlayerAvatar's movement guards.
         self._send_input('move', {'flags': flags})
-        self._binding.drive_vehicle(
-            self._vehicle_id, movement_dir, rotation_dir)
 
     def setCruiseControlMode(self, mode):
         self._send_input('cruise', {'mode': int(mode)})
@@ -396,8 +399,9 @@ class AvatarServerBridge(object):
     def vehicle_changeSetting(self, code, value):
         handler = getattr(
             self._lan_sender, 'change_vehicle_setting', None)
-        if callable(handler):
-            handler(self._vehicle_id, code, value)
+        if (callable(handler) and
+                handler(self._vehicle_id, code, value)):
+            return
         updater = getattr(self._avatar, 'updateVehicleSetting', None)
         if updater is None:
             raise AttributeError('Avatar.updateVehicleSetting')

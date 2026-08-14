@@ -9,6 +9,10 @@ steering, so it is safe to exercise outside the BigWorld client.
 import math
 
 
+WAYPOINT_ARRIVAL_RADIUS = 1.5
+TRAFFIC_WAIT_LEASE_SECONDS = 1.5
+
+
 def _angle_delta(target, current):
 	value = float(target) - float(current)
 	while value > math.pi:
@@ -147,6 +151,19 @@ class LocalDriver(object):
 	def forget(self, bot_id):
 		self.states.pop(bot_id, None)
 
+	def wait_for_traffic(self, bot_id):
+		"""Suppress brief right-of-way waits without masking a deadlock forever."""
+		state = self.states.get(bot_id)
+		if state is None:
+			return False
+		state['traffic_waiting'] = True
+		state['traffic_wait_time'] += max(
+			0.0, float(state.get('last_step', 0.0)))
+		if state['traffic_wait_time'] <= TRAFFIC_WAIT_LEASE_SECONDS:
+			state['stuck_time'] = 0.0
+			state['recovery_time'] = 0.0
+		return True
+
 	def _state(self, bot_id, position):
 		state = self.states.get(bot_id)
 		if state is None:
@@ -162,6 +179,12 @@ class LocalDriver(object):
 				'phase': phase,
 				'clock': 0.0,
 				'failed_yaws': {},
+				'escape_side': 0.0,
+				'escape_side_until': 0.0,
+				'last_desired_yaw': None,
+				'traffic_waiting': False,
+				'traffic_wait_time': 0.0,
+				'last_step': 0.0,
 			}
 			self.states[bot_id] = state
 		return state
@@ -180,7 +203,22 @@ class LocalDriver(object):
 			return
 		if ttl is None:
 			ttl = self.failure_ttl
-		state['failed_yaws'][self._yaw_key(yaw)] = state['clock'] + max(0.1, float(ttl))
+		ttl = max(0.1, float(ttl))
+		state['failed_yaws'][self._yaw_key(yaw)] = state['clock'] + ttl
+		desired = state.get('last_desired_yaw')
+		offset = _angle_delta(yaw, desired) if desired is not None else 0.0
+		if abs(offset) >= 0.10:
+			side = 1.0 if offset > 0.0 else -1.0
+		else:
+			# Adjacent ids choose opposite initial sides, then keep that side while
+			# widening the escape angle. This avoids left/right grinding at a broad
+			# obstacle without turning the finite failure TTL into a permanent bias.
+			side = 1.0 if (int(state['phase'] * 997.0 + 0.5) & 1) else -1.0
+		state['escape_side'] = side
+		state['escape_side_until'] = (
+			state['clock'] + min(2.0, max(0.8, ttl)))
+		state['steering_yaw'] = None
+		state['plan_age'] = 999.0
 
 	def _failure_penalty(self, state, yaw):
 		key = self._yaw_key(yaw)
@@ -364,6 +402,12 @@ class LocalDriver(object):
 		for offset in self._CANDIDATE_OFFSETS:
 			candidate = desired_yaw + offset
 			score = abs(offset) + self._failure_penalty(state, candidate)
+			if (state.get('escape_side_until', 0.0) > state['clock'] and
+					float(offset) * float(
+						state.get('escape_side', 0.0)) < -0.01):
+				# Continue around the selected side before testing the mirror branch.
+				# The finite penalty still permits the other side when this fan is spent.
+				score += 1.25
 			if separation is not None:
 				# When bodies overlap, separation outranks route alignment; otherwise
 				# two tanks can choose the same narrow opening forever.
@@ -389,11 +433,15 @@ class LocalDriver(object):
 		"""
 		state = self._state(bot_id, position)
 		step = min(0.35, max(0.0, float(dt)))
+		if not state.pop('traffic_waiting', False):
+			state['traffic_wait_time'] = 0.0
+		state['last_step'] = step
 		state['clock'] += step
 		self._prune_failures(state)
 		state['steering_age'] += step
 		state['plan_age'] += step
 		desired_yaw = _yaw_to(position, target)
+		state['last_desired_yaw'] = desired_yaw
 		target_distance = _distance(position, target)
 		if not movement_intent:
 			# Cover/engagement orders intentionally stop within a tolerance. Do not
@@ -411,7 +459,7 @@ class LocalDriver(object):
 		                         (state['last_position'][0], 0.0,
 		                          state['last_position'][1]))
 		state['last_position'] = (float(position[0]), float(position[2]))
-		if target_distance <= 1.5:
+		if target_distance <= WAYPOINT_ARRIVAL_RADIUS:
 			# Reaching a waypoint is a stop, not a request to drive north: atan2(0, 0)
 			# is zero and previously produced full throttle until the next order tick.
 			state['stuck_time'] = 0.0
@@ -515,7 +563,13 @@ class LocalDriver(object):
 		# while braking a recovery or sliding downhill; steering remains forward.
 		avoiding = abs(_angle_delta(chosen_yaw, desired_yaw)) > 0.05
 		throttle = 1.0
-		if abs(delta) > 1.35 and not avoiding:
+		climb_grade = ((float(target[1]) - float(position[1])) /
+		               max(0.1, target_distance))
+		if climb_grade > 0.10 and abs(delta) > 0.30 and not avoiding:
+			# A climbable edge can become impassable when entered diagonally. Align
+			# at the foot of a meaningful ascent before applying forward torque.
+			throttle = 0.0
+		elif abs(delta) > 1.35 and not avoiding:
 			# A target more than about 77 degrees off the bow is a pivot, not a
 			# clearing arc. Driving while applying full steering makes a deployed
 			# formation draw a loop before it can enter its lane. Separation remains

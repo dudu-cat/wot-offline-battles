@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Render every shipped tactical route over the matching 0.8.2 minimap.
+"""Render every shipped tactical route over the matching client minimap.
 
 The output is intended for human route review. Team 1 uses solid lines and
-filled arrowheads; team 2 uses dashed lines and outlined arrowheads. Both
-directions are rendered because the navigation baker may produce different
-geometry for opposite travel directions even when the source macro route is
-the same polyline in reverse.
+filled arrowheads; team 2 uses dashed lines and outlined arrowheads. Ordinary
+through-routes share one validated geometry in strict reverse; both directions
+remain visible so the reviewer can confirm that contract. Local terminal
+routes such as Himmelsdorf's rear_guard stay team-specific.
 """
 
 from __future__ import annotations
@@ -29,6 +29,31 @@ PALETTE = (
     (40, 220, 220),
     (255, 220, 55),
 )
+# Removing Ensk's middle route must not recolour the retained east-field lane
+# from its established green review identity to the now-vacant orange slot.
+PALETTE_SLOT_OVERRIDES = {
+    '06_ensk': {'east_field': 2},
+}
+HEADER = 84
+ANNOTATION_SCALE = 4
+
+
+def _map_sort_key(value):
+    name = value.stem if isinstance(value, Path) else str(value)
+    prefix = name.split("_", 1)[0]
+    try:
+        return int(prefix), name
+    except ValueError:
+        return float("inf"), name
+
+
+def _point_pair(graph, key):
+    points = graph.get(key)
+    if (not isinstance(points, (list, tuple)) or len(points) != 2 or
+            any(not isinstance(point, (list, tuple)) or len(point) < 2
+                for point in points)):
+        raise ValueError("%s requires exactly two x/z points" % key)
+    return points
 
 
 def _font(size: int, bold: bool = False):
@@ -151,30 +176,58 @@ def _arrow(draw, points, colour, fraction, outlined=False):
         draw.polygon(inset, fill=colour)
 
 
-def _marker(draw, point, colour, label, font):
+def _label_origin(draw, point, label, font, canvas_width, right_offset):
+    bounds = draw.textbbox((0, 0), label, font=font, stroke_width=3)
+    label_width = bounds[2] - bounds[0]
+    right = point[0] + right_offset
+    if right + label_width <= canvas_width - 8:
+        return right, point[1] - 13
+    return point[0] - right_offset - label_width, point[1] - 13
+
+
+def _spawn_marker(draw, point, colour, label, font, canvas_width):
     radius = 13
     draw.ellipse((point[0] - radius - 3, point[1] - radius - 3,
                   point[0] + radius + 3, point[1] + radius + 3),
                  fill=(10, 10, 10))
     draw.ellipse((point[0] - radius, point[1] - radius,
                   point[0] + radius, point[1] + radius), fill=colour)
-    draw.text((point[0] + 17, point[1] - 13), label, font=font,
+    draw.text(_label_origin(draw, point, label, font, canvas_width, 17),
+              label, font=font,
+              fill=(255, 255, 255), stroke_width=3, stroke_fill=(0, 0, 0))
+
+
+def _base_marker(draw, point, colour, label, font, canvas_width):
+    pole_top = point[1] - 18
+    pole_bottom = point[1] + 18
+    draw.line(((point[0], pole_top), (point[0], pole_bottom)),
+              fill=(10, 10, 10), width=7)
+    draw.line(((point[0], pole_top), (point[0], pole_bottom)),
+              fill=(245, 245, 245), width=3)
+    flag = ((point[0] + 2, pole_top), (point[0] + 25, pole_top + 6),
+            (point[0] + 2, pole_top + 13))
+    draw.polygon(flag, fill=(10, 10, 10))
+    inset = ((point[0] + 4, pole_top + 3),
+             (point[0] + 20, pole_top + 7),
+             (point[0] + 4, pole_top + 11))
+    draw.polygon(inset, fill=colour)
+    draw.text(_label_origin(draw, point, label, font, canvas_width, 29),
+              label, font=font,
               fill=(255, 255, 255), stroke_width=3, stroke_fill=(0, 0, 0))
 
 
 def _render(graph, minimap, size):
     map_name = graph["map"]
     bounds = [float(value) for value in graph["bounds"]]
-    header = 84
-    image = Image.new("RGB", (size, size + header), (24, 26, 29))
+    image = Image.new("RGB", (size, size + HEADER), (24, 26, 29))
     image.paste(minimap.resize((size, size), Image.Resampling.LANCZOS),
-                (0, header))
+                (0, HEADER))
     draw = ImageDraw.Draw(image)
     title_font = _font(27, True)
     text_font = _font(18, False)
     small_font = _font(15, True)
     draw.text((18, 10), map_name, font=title_font, fill=(245, 245, 245))
-    draw.text((18, 48), "T1 solid / filled arrows    T2 dashed / outlined arrows",
+    draw.text((18, 48), "Solid=T1  dashed=T2  circles=spawn  flags=base  *=fallback",
               font=text_font, fill=(190, 195, 205))
 
     left, bottom, right, top = bounds
@@ -182,8 +235,9 @@ def _render(graph, minimap, size):
     height = max(1.0, top - bottom)
 
     def pixel(point):
-        return ((float(point[0]) - left) / width * size,
-                header + (top - float(point[1])) / height * size)
+        extent = size - 1
+        return ((float(point[0]) - left) / width * extent,
+                HEADER + (top - float(point[1])) / height * extent)
 
     routes_by_team = graph.get("routes") or {}
     route_ids = []
@@ -192,18 +246,27 @@ def _render(graph, minimap, size):
             route_id = str(route.get("id") or "route")
             if route_id not in route_ids:
                 route_ids.append(route_id)
-    colours = {route_id: PALETTE[index % len(PALETTE)]
-               for index, route_id in enumerate(route_ids)}
+    slot_overrides = PALETTE_SLOT_OVERRIDES.get(str(graph.get('map')), {})
+    colours = {
+        route_id: PALETTE[slot_overrides.get(
+            route_id, index) % len(PALETTE)]
+        for index, route_id in enumerate(route_ids)
+    }
+    fallback_keys = set((graph.get("bake") or {}).get(
+        "soft_route_fallbacks") or ())
+    fallback_routes = set(key.split(":", 1)[-1] for key in fallback_keys)
 
     for index, route_id in enumerate(route_ids):
         colour = colours[route_id]
         column = index // 2
         row = index % 2
-        legend_x = 470 + column * 245
+        legend_x = 540 + column * 260
         y = 14 + row * 33
         draw.line(((legend_x, y + 7), (legend_x + 34, y + 7)),
                   fill=colour, width=7)
-        draw.text((legend_x + 43, y - 3), "%d  %s" % (index + 1, route_id),
+        suffix = " *" if route_id in fallback_routes else ""
+        draw.text((legend_x + 43, y - 3),
+                  "%d  %s%s" % (index + 1, route_id, suffix),
                   font=small_font, fill=(240, 240, 240))
 
     # Draw team 1 first and the lighter team 2 dashes on top so coincident
@@ -239,19 +302,42 @@ def _render(graph, minimap, size):
                 else:
                     draw.polygon(inset, fill=colour)
 
-    bases = graph.get("bases") or {}
-    base1 = bases.get("1") if isinstance(bases, dict) else None
-    base2 = bases.get("2") if isinstance(bases, dict) else None
-    if base1 is None and isinstance(bases, (list, tuple)) and len(bases) >= 2:
-        base1, base2 = bases[0], bases[1]
-    if base1 is not None:
-        _marker(draw, pixel(base1), (65, 215, 90), "BASE 1", small_font)
-    if base2 is not None:
-        _marker(draw, pixel(base2), (235, 70, 65), "BASE 2", small_font)
+    team_colours = {"1": (65, 215, 90), "2": (235, 70, 65)}
+    formations = graph.get("spawn_formations") or {}
+    for team in ("1", "2"):
+        colour = team_colours[team]
+        for formation in formations.get(team, ()):
+            if len(formation) < 3:
+                continue
+            point = pixel((formation[0], formation[2]))
+            radius = 4
+            draw.ellipse((point[0] - radius - 1, point[1] - radius - 1,
+                          point[0] + radius + 1, point[1] + radius + 1),
+                         fill=(10, 10, 10))
+            draw.ellipse((point[0] - radius, point[1] - radius,
+                          point[0] + radius, point[1] + radius), fill=colour)
+
+    # #1513 publishes two separate contracts.  Route endpoints and extraction
+    # use spawn_anchors; capture flags must use objective_bases.  In particular,
+    # Tundra and Lost City prove that a spawn anchor is not a base position.
+    spawn_anchors = _point_pair(graph, "spawn_anchors")
+    objective_bases = _point_pair(graph, "objective_bases")
+    for index, team in enumerate(("1", "2")):
+        spawn_point = pixel(spawn_anchors[index])
+        base_point = pixel(objective_bases[index])
+        if math.hypot(base_point[0] - spawn_point[0],
+                      base_point[1] - spawn_point[1]) <= 40.0:
+            _spawn_marker(draw, spawn_point, team_colours[team],
+                          "SPAWN+BASE %s" % team, small_font, size)
+            continue
+        _spawn_marker(draw, spawn_point, team_colours[team],
+                      "SPAWN %s" % team, small_font, size)
+        _base_marker(draw, base_point, team_colours[team],
+                     "BASE %s" % team, small_font, size)
     return image
 
 
-def _write_index(output: Path, rendered):
+def _write_index(output: Path, rendered, game_version):
     cards = []
     for map_name, filename in rendered:
         escaped = html.escape(filename)
@@ -259,23 +345,32 @@ def _write_index(output: Path, rendered):
             '<article><a href="{0}"><img src="{0}" alt="{1}"></a>'
             '<h2>{1}</h2></article>'.format(escaped, html.escape(map_name)))
     document = """<!doctype html>
-<html lang="en"><meta charset="utf-8"><title>WoT 0.8.2 tactical route review</title>
+<html lang="en"><meta charset="utf-8"><title>WoT %s tactical route review</title>
 <style>
 body{margin:24px;background:#17191c;color:#eee;font:15px Arial,sans-serif}
 h1{margin:0 0 8px}.note{color:#b9bec8;margin:0 0 24px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:20px}
 article{background:#24272c;padding:10px;border-radius:8px}img{width:100%%;height:auto;display:block}
 h2{font-size:17px;margin:9px 3px 2px}
-</style><body><h1>World of Tanks 0.8.2 tactical route review</h1>
-<p class="note">Team 1 is solid with filled arrows. Team 2 is dashed with outlined arrows. Click a map for the full-resolution PNG.</p>
-<main class="grid">%s</main></body></html>""" % "\n".join(cards)
+</style><body><h1>World of Tanks %s tactical route review</h1>
+<p class="note">Current reviewed routes only. Ordinary through-routes use the same geometry in reverse: team 1 is solid and team 2 is dashed. Circles are spawn anchors, flags are objective bases, and * marks a soft fallback. Click a map for the full-resolution PNG.</p>
+<main class="grid">%s</main></body></html>""" % (
+        html.escape(game_version), html.escape(game_version), "\n".join(cards))
     (output / "index.html").write_text(document, encoding="utf-8")
     (output / "README.txt").write_text(
-        "World of Tanks 0.8.2 tactical route review\n\n"
+        "World of Tanks %s tactical route review\n\n" % game_version +
+        "This folder renders the current reviewed route candidate.\n"
+        "There are 41 maps: 39 have three routes per team; 06_ensk has two reviewed routes; 04_himmelsdorf has an additional rear_guard route.\n\n"
         "Team 1: solid lines and filled arrows.\n"
         "Team 2: dashed lines and outlined arrows.\n"
-        "Green marker: team 1 base. Red marker: team 2 base.\n\n"
-        "Annotate any incorrect lane directly on the PNG and preserve the map filename.\n",
+        "Ordinary through-routes: one validated geometry, travelled in strict reverse.\n"
+        "Circles and small dots: route spawn anchors and 15-slot formations.\n"
+        "Flags: actual standard-battle objective bases.\n"
+        "Diamonds: tactical hold waypoints.\n"
+        "An asterisk in the legend marks a route with a soft fallback on at least one team side.\n"
+        "Green: team 1. Red: team 2.\n\n"
+        "Annotate any incorrect lane with opaque red ink, preserve the image dimensions and map filename, and return only changed PNGs.\n"
+        "Local terminal routes such as Himmelsdorf rear_guard are reviewed manually from the marked image.\n",
         encoding="utf-8",
     )
 
@@ -283,7 +378,7 @@ h2{font-size:17px;margin:9px 3px 2px}
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--client-root", type=Path, required=True,
-                        help="World of Tanks 0.8.2 client directory")
+                        help="World of Tanks client directory")
     parser.add_argument("--navgraph-dir", type=Path,
                         default=Path("scripts/client/gui/mods/offhangar/navgraphs"))
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -296,19 +391,26 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     packages = args.client_root / "res" / "packages"
     rendered = []
-    graphs = sorted(path for path in args.navgraph_dir.glob("*.json")
-                    if path.name != "manifest.json")
+    game_versions = set()
+    requested_size = int(args.size)
+    if requested_size < 640 or requested_size % ANNOTATION_SCALE:
+        parser.error("--size must be at least 640 and divisible by 4")
+    graphs = sorted((path for path in args.navgraph_dir.glob("*.json")
+                     if path.name != "manifest.json"),
+                    key=_map_sort_key)
     for graph_path in graphs:
         graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        game_versions.add(str(graph.get("game_version") or "0.8.2"))
         map_name = str(graph.get("map") or graph_path.stem)
         package = _find_package(packages, map_name)
         minimap = _load_minimap(package)
-        image = _render(graph, minimap, max(640, int(args.size)))
+        image = _render(graph, minimap, requested_size)
         filename = map_name + ".png"
         image.save(args.output_dir / filename, optimize=True)
         rendered.append((map_name, filename))
         print("rendered %s" % map_name)
-    _write_index(args.output_dir, rendered)
+    game_version = ", ".join(sorted(game_versions)) if game_versions else "unknown"
+    _write_index(args.output_dir, rendered, game_version)
     print("wrote %d maps to %s" % (len(rendered), args.output_dir))
 
 

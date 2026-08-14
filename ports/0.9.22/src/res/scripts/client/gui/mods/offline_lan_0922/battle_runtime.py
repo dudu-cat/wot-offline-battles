@@ -11,21 +11,27 @@ import traceback
 from gui.mods.offline_lan_0922.ai import maps as tactical_maps
 from gui.mods.offline_lan_0922.ai import planner as bot_planner
 from gui.mods.offline_lan_0922.ai.cover import score_candidates
+from gui.mods.offline_lan_0922.artillery_controller import \
+    ArtilleryController
 from gui.mods.offline_lan_0922.battle_feedback import (
     SixthSenseController, VehicleStatePresenter)
-from gui.mods.offline_lan_0922.bot_runtime import BotRuntime
+from gui.mods.offline_lan_0922.bot_runtime import BotRuntime, PROBE_KINDS
 from gui.mods.offline_lan_0922.entities.avatar_server import AvatarServerBridge
 from gui.mods.offline_lan_0922.entities.bigworld_binding import \
     BigWorldVehicleBinding
 from gui.mods.offline_lan_0922.entities.remote_vehicle import (
     RemoteVehicleFactory, collide_vehicle_at_matrix)
 from gui.mods.offline_lan_0922.entities.runtime import EntityPropertyBuilder
+from gui.mods.offline_lan_0922.projectile_manager import InFlightProjectiles
+from gui.mods.offline_lan_0922.projectile_runtime import (
+    PROJECTILE_BROADPHASE_RADIUS, lerp3, point_segment_distance_sq,
+    trajectory_position)
 from gui.mods.offline_lan_0922.snapshot_sync import SnapshotSync
 from gui.mods.offline_lan_0922.spawn_planner import SpawnPlanner
 from gui.mods.offline_lan_0922 import (
     combat_rules, critical_damage, destructibles_compat, gun_mechanics,
-    prebaked_foliage, prebaked_navigation, spotting, tank_collision,
-    vehicle_physics, world_collision)
+    prebaked_destructibles, prebaked_foliage, prebaked_navigation, spotting,
+    tank_collision, vehicle_physics, world_collision)
 
 
 # BigWorld callbacks run on rendered frames.  The mature 0.8.2 battle asks for
@@ -33,16 +39,31 @@ from gui.mods.offline_lan_0922 import (
 # and makes copied local physics, authority bots and remote interpolation step
 # even while the renderer itself reports a healthy frame rate.
 FRAME_SECONDS = 0.0
+# This release is intentionally a measurement build.  The profiler is
+# observational only: it never feeds a gameplay clock, deadline or budget.
+PERFORMANCE_DIAGNOSTICS = True
+DIAGNOSTIC_WINDOW_SECONDS = 5.0
+DIAGNOSTIC_TOP_FRAMES = 5
 AMMO_SECONDS = 0.10
 NETWORK_INPUT_SECONDS = 1.0 / 30.0
 RPM_PRESENTATION_SECONDS = 0.10
+SPOTTING_UPDATE_SECONDS = 0.10
+SPOTTING_PROBE_SECONDS = 0.50
+SPOTTING_PHASE_BUCKETS = 5
 # Bot tree/column enumeration is a proximity sensor, not presentation work.
 # The sensor looks 6 m ahead plus the admitted hull extent, while copied bot
 # speed is capped at 35 m/s.  Recheck within 0.10 s or 3 m of realised travel,
 # whichever comes first, so no moving hull can skip the contact volume.
 BOT_DESTRUCTIBLE_SECONDS = 0.10
 BOT_DESTRUCTIBLE_TRAVEL_METRES = 3.0
+BOT_SOFT_RECAST_BUDGET = 24
 CRITICAL_REPAIR_NETWORK_SECONDS = 1.0
+PROJECTILE_PROGRESS_SECONDS = 0.10
+PROJECTILE_MAX_TIME_MS = 20000
+PROJECTILE_MAX_ACTIVE = 128
+PROJECTILE_CHORDS_PER_FRAME = 128
+PROJECTILE_MAX_CHORDS_PER_FRAME = 256
+ARTILLERY_ARC_RAYS_PER_FRAME = 4
 STANDARD_GAMEPLAY = 'ctf'
 PREBATTLE_SECONDS = 15.0
 BATTLE_SECONDS = 900.0
@@ -50,6 +71,7 @@ BOT_SPAWN_SECONDS = 0.30
 _SHOT_EVENT_KINDS = ('shot', 'bot_shot')
 _COMBAT_EVENT_KINDS = (
     'health', 'hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit')
+_SHOT_OCCLUSION_EPSILON = 1.0e-3
 # The stock #1513 descriptor converts XML movement bloom to per-m/s and
 # per-rad/s factors. Feed those raw factors to PlayerAvatar unchanged: the
 # native gun rotator owns the one dispersion state shared by HUD and shots.
@@ -77,6 +99,286 @@ def _monotonic_time():
     if callable(function):
         return float(function())
     return float(time.clock())
+
+
+_PROFILE_CLOCK = getattr(time, 'perf_counter', None)
+if not callable(_PROFILE_CLOCK):
+    _PROFILE_CLOCK = time.clock
+
+
+_FRAME_STAGE_NAMES = (
+    'house', 'sync', 'critical', 'drown', 'transition', 'local',
+    'outline', 'bots_update', 'bot_present', 'bot_events', 'spot', 'lock',
+    'schedule', 'diag_emit')
+
+
+class _FrameDiagnostics(object):
+    """Correlate one callback's work with the following render interval."""
+
+    def __init__(self, clock=None, writer=None,
+                 window_seconds=DIAGNOSTIC_WINDOW_SECONDS):
+        self._clock = clock or _PROFILE_CLOCK
+        self._writer = writer or sys.stdout.write
+        self._window_seconds = max(0.25, float(window_seconds))
+        self.enabled = True
+        self.reset()
+
+    def reset(self):
+        self._pending = None
+        self._frame_id = 0
+        self._window_id = 0
+        self._reset_window()
+
+    def _reset_window(self):
+        self._samples = 0
+        self._window_elapsed = 0.0
+        self._gap_sum = 0.0
+        self._gap_max = 0.0
+        self._raw_sum = 0.0
+        self._raw_max = 0.0
+        self._exec_sum = 0.0
+        self._exec_max = 0.0
+        self._outside_sum = 0.0
+        self._outside_max = 0.0
+        self._stage_sums = dict((name, 0.0)
+                                for name in _FRAME_STAGE_NAMES)
+        self._stage_maxima = dict((name, 0.0)
+                                  for name in _FRAME_STAGE_NAMES)
+        self._probe_sums = dict((name, 0) for name in PROBE_KINDS)
+        self._probe_maxima = dict((name, 0) for name in PROBE_KINDS)
+        self._probe_duration_sums = dict(
+            (name, 0.0) for name in PROBE_KINDS)
+        self._probe_duration_maxima = dict(
+            (name, 0.0) for name in PROBE_KINDS)
+        self._slow = []
+        self._over_50 = 0
+        self._over_67 = 0
+        self._over_100 = 0
+        self._sim_caps = 0
+        self._clock_regressions = 0
+        self._authority_frames = 0
+        self._last_context = {}
+        self._emit_due = False
+
+    def _disable(self):
+        self.enabled = False
+        self._pending = None
+        self._slow = []
+
+    def begin(self, entry_wall, raw_dt):
+        """Seal the previous callback using this callback's entry interval."""
+        self._frame_id += 1
+        frame_id = self._frame_id
+        if not self.enabled:
+            return frame_id
+        try:
+            pending = self._pending
+            if pending is not None:
+                wall_gap = float(entry_wall) - pending['entry_wall']
+                if wall_gap < 0.0:
+                    wall_gap = 0.0
+                    self._clock_regressions += 1
+                observed_raw = float(raw_dt)
+                if observed_raw < 0.0:
+                    self._clock_regressions += 1
+                row = dict(pending)
+                row.update({
+                    'next': frame_id,
+                    'wall_gap': wall_gap,
+                    'raw_dt': observed_raw,
+                    'outside': max(0.0, wall_gap - pending['exec']),
+                    'bw_minus_wall': observed_raw - wall_gap,
+                })
+                self._add(row)
+            return frame_id
+        except Exception:
+            self._disable()
+            return frame_id
+
+    def _add(self, row):
+        self._samples += 1
+        gap = row['wall_gap']
+        raw_dt = row['raw_dt']
+        execution = row['exec']
+        outside = row['outside']
+        self._window_elapsed += gap
+        self._gap_sum += gap
+        self._gap_max = max(self._gap_max, gap)
+        self._raw_sum += raw_dt
+        self._raw_max = max(self._raw_max, raw_dt)
+        self._exec_sum += execution
+        self._exec_max = max(self._exec_max, execution)
+        self._outside_sum += outside
+        self._outside_max = max(self._outside_max, outside)
+        if gap >= 0.050:
+            self._over_50 += 1
+        if gap >= 0.067:
+            self._over_67 += 1
+        if gap >= 0.100:
+            self._over_100 += 1
+        if raw_dt > 0.100:
+            self._sim_caps += 1
+        if row.get('context', {}).get('role') == 'authority':
+            self._authority_frames += 1
+        for name in _FRAME_STAGE_NAMES:
+            value = max(0.0, float(row['stages'].get(name, 0.0)))
+            self._stage_sums[name] += value
+            self._stage_maxima[name] = max(
+                self._stage_maxima[name], value)
+        for name in PROBE_KINDS:
+            value = max(0, int(row['probes'].get(name, 0)))
+            self._probe_sums[name] += value
+            self._probe_maxima[name] = max(
+                self._probe_maxima[name], value)
+            duration = max(
+                0.0, float(row.get('probe_durations', {}).get(name, 0.0)))
+            self._probe_duration_sums[name] += duration
+            self._probe_duration_maxima[name] = max(
+                self._probe_duration_maxima[name], duration)
+        self._last_context = dict(row.get('context') or {})
+        score = (gap, execution)
+        inserted = False
+        for index, existing in enumerate(self._slow):
+            if score > (existing['wall_gap'], existing['exec']):
+                self._slow.insert(index, row)
+                inserted = True
+                break
+        if not inserted:
+            self._slow.append(row)
+        if len(self._slow) > DIAGNOSTIC_TOP_FRAMES:
+            del self._slow[DIAGNOSTIC_TOP_FRAMES:]
+        if self._window_elapsed >= self._window_seconds:
+            self._emit_due = True
+
+    @staticmethod
+    def _milliseconds(value):
+        return max(0.0, float(value)) * 1000.0
+
+    def _format(self):
+        samples = max(1, self._samples)
+        elapsed = max(1e-9, self._window_elapsed)
+        context = self._last_context
+        self._window_id += 1
+        prefix = '[Offline LAN 0.9.22] PERF '
+        lines = [
+            (prefix +
+             'summary v=2 window=%d round=%s map=%s phase=%s '
+             'samples=%d seconds=%.3f fps=%.2f authority_frames=%d '
+             'gap_ms_avg_max=%.3f/%.3f raw_dt_ms_avg_max=%.3f/%.3f '
+             'exec_ms_avg_max=%.3f/%.3f outside_ms_avg_max=%.3f/%.3f '
+             'over_50_67_100=%d/%d/%d sim_caps=%d clock_regress=%d\n') % (
+                 self._window_id, context.get('round', '-'),
+                 context.get('map', '-'), context.get('phase', '-'),
+                 self._samples, self._window_elapsed,
+                 self._samples / elapsed, self._authority_frames,
+                 self._milliseconds(self._gap_sum / samples),
+                 self._milliseconds(self._gap_max),
+                 self._milliseconds(self._raw_sum / samples),
+                 self._milliseconds(self._raw_max),
+                 self._milliseconds(self._exec_sum / samples),
+                 self._milliseconds(self._exec_max),
+                 self._milliseconds(self._outside_sum / samples),
+                 self._milliseconds(self._outside_max),
+                 self._over_50, self._over_67, self._over_100,
+                 self._sim_caps, self._clock_regressions),
+        ]
+        stage_values = []
+        for name in _FRAME_STAGE_NAMES:
+            stage_values.append('%s=%.3f/%.3f' % (
+                name,
+                self._milliseconds(self._stage_sums[name] / samples),
+                self._milliseconds(self._stage_maxima[name])))
+        lines.append(prefix + 'stages_ms_avg_max ' +
+                     ' '.join(stage_values) + '\n')
+        probe_values = []
+        for name in PROBE_KINDS:
+            probe_values.append('%s=%.2f/%d' % (
+                name, float(self._probe_sums[name]) / samples,
+                self._probe_maxima[name]))
+        lines.append(prefix + 'probes_avg_max ' +
+                     ' '.join(probe_values) + '\n')
+        probe_duration_values = []
+        for name in PROBE_KINDS:
+            probe_duration_values.append('%s=%.3f/%.3f' % (
+                name,
+                self._milliseconds(
+                    self._probe_duration_sums[name] / samples),
+                self._milliseconds(self._probe_duration_maxima[name])))
+        lines.append(prefix + 'probe_ms_avg_max ' +
+                     ' '.join(probe_duration_values) + '\n')
+        for rank, row in enumerate(self._slow, 1):
+            stages = row['stages']
+            probes = row['probes']
+            probe_durations = row.get('probe_durations', {})
+            context = row.get('context') or {}
+            lines.append(
+                (prefix +
+                 'slow rank=%d cause=%d next=%d gap_ms=%.3f '
+                 'raw_dt_ms=%.3f bw_minus_wall_ms=%.3f '
+                 'prev_exec_ms=%.3f outside_ms=%.3f '
+                 'cause_tick_ms=%.3f cause_motion_ms=%.3f '
+                 'pose_step_m=%.4f speed_mps=%.3f camera_mps=%.3f '
+                 'airborne=%d grind=%d bots=%d outgoing=%d '
+                 'transition=%d prev_emit=%d '
+                 'stages_ms=%s probes=%s probe_ms=%s\n') % (
+                     rank, row['cause'], row['next'],
+                     self._milliseconds(row['wall_gap']),
+                     row['raw_dt'] * 1000.0,
+                     row['bw_minus_wall'] * 1000.0,
+                     self._milliseconds(row['exec']),
+                     self._milliseconds(row['outside']),
+                     self._milliseconds(row['tick_dt']),
+                     self._milliseconds(row['motion_dt']),
+                     float(context.get('pose_step', 0.0)),
+                     float(context.get('speed', 0.0)),
+                     float(context.get('camera_speed', 0.0)),
+                     int(bool(context.get('airborne'))),
+                     int(context.get('grind', 0)),
+                     int(context.get('bot_count', 0)),
+                     int(context.get('outgoing_count', 0)),
+                     int(bool(context.get('transitioned'))),
+                     int(bool(row.get('emitted'))),
+                     ','.join('%s:%.3f' % (
+                         name, self._milliseconds(stages.get(name, 0.0)))
+                              for name in _FRAME_STAGE_NAMES),
+                     ','.join('%s:%d' % (
+                         name, int(probes.get(name, 0)))
+                              for name in PROBE_KINDS),
+                     ','.join('%s:%.3f' % (
+                         name, self._milliseconds(
+                             probe_durations.get(name, 0.0)))
+                              for name in PROBE_KINDS)))
+        return ''.join(lines)
+
+    def finish(self, frame_id, entry_wall, tick_dt, motion_dt, stages,
+               probes, context, probe_durations=None):
+        if not self.enabled:
+            return
+        try:
+            stages = dict(stages or {})
+            probes = dict(probes or {})
+            emitted = False
+            emit_seconds = 0.0
+            if self._emit_due and self._samples:
+                emit_start = self._clock()
+                payload = self._format()
+                self._writer(payload)
+                emit_seconds = max(0.0, self._clock() - emit_start)
+                emitted = True
+                self._reset_window()
+            stages['diag_emit'] = emit_seconds
+            end_wall = self._clock()
+            self._pending = {
+                'cause': int(frame_id), 'entry_wall': float(entry_wall),
+                'exec': max(0.0, end_wall - float(entry_wall)),
+                'tick_dt': max(0.0, float(tick_dt)),
+                'motion_dt': max(0.0, float(motion_dt)),
+                'stages': stages, 'probes': probes,
+                'probe_durations': dict(probe_durations or {}),
+                'context': dict(context or {}), 'emitted': emitted,
+            }
+        except Exception:
+            self._disable()
 
 
 def _number(value, default=0.0):
@@ -219,6 +521,13 @@ class _LANInputSender(object):
         self.gun_pitch = 0.0
         self.handbrake = False
 
+    def align_aim(self, turret_yaw=0.0, gun_pitch=0.0):
+        """Seed the world-space LAN aim from the attached native gun."""
+        unused_position, vehicle_yaw = self.owner.local_pose()
+        self.aim_yaw = float(vehicle_yaw) + float(turret_yaw)
+        self.gun_pitch = float(gun_pitch)
+        return True
+
     def send_avatar_input(self, vehicle_id, kind, payload):
         payload = payload if isinstance(payload, dict) else {}
         if kind == 'move':
@@ -318,11 +627,16 @@ class BattleRuntime(object):
         self._sender = None
         self._sync = None
         self._bots = None
+        self._frame_diagnostics = (
+            _FrameDiagnostics() if PERFORMANCE_DIAGNOSTICS else None)
         self._sixth_sense = None
         self._has_sixth_sense = False
         self._records = {}
         self._last_snapshot = None
         self._last_frame_time = None
+        if self._frame_diagnostics is not None:
+            self._frame_diagnostics.enabled = True
+            self._frame_diagnostics.reset()
         self._local_position = (0.0, 0.0, 0.0)
         self._local_yaw = 0.0
         self._last_health = {}
@@ -341,7 +655,12 @@ class BattleRuntime(object):
         self._local_model = None
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
+        self._local_camera_velocity = None
+        self._spectated_engine_id = None
         self._local_grind = 0
+        self._local_motion_soft_block = False
+        self._local_motion_cap_crushed = False
+        self._soft_static_recast_budget = [BOT_SOFT_RECAST_BUDGET]
         self._local_vertical_speed = 0.0
         self._local_airborne = False
         self._local_fall_armed = False
@@ -399,6 +718,22 @@ class BattleRuntime(object):
         self._next_outline_time = 0.0
         self._next_spotting_time = 0.0
         self._foliage = None
+        self._projectiles = None
+        self._projectile_meta = {}
+        self._projectile_visual_meta = {}
+        self._projectile_terminal_data = {}
+        self._projectile_target_positions = {}
+        self._projectile_position_history = []
+        self._projectile_lineage = set()
+        self._projectile_epoch = None
+        self._projectile_server_time_ms = None
+        self._projectile_server_local_time = None
+        self._projectile_revision = -1
+        self._next_projectile_progress_time = 0.0
+        self._projectile_frame_start = 0.0
+        self._projectile_frame_end = 0.0
+        self._projectile_destructible_context = None
+        self._artillery = None
 
     def start(self, config, message=None, lan_client=None,
               on_local_leave=None):
@@ -431,6 +766,9 @@ class BattleRuntime(object):
         self._has_sixth_sense = _selected_vehicle_has_sixth_sense()
         self._last_snapshot = None
         self._last_frame_time = None
+        if self._frame_diagnostics is not None:
+            self._frame_diagnostics.enabled = True
+            self._frame_diagnostics.reset()
         self._last_health = {}
         self._client_ready_received = False
         self._local_descriptor = None
@@ -447,7 +785,12 @@ class BattleRuntime(object):
         self._local_model = None
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
+        self._local_camera_velocity = None
+        self._spectated_engine_id = None
         self._local_grind = 0
+        self._local_motion_soft_block = False
+        self._local_motion_cap_crushed = False
+        self._soft_static_recast_budget = [BOT_SOFT_RECAST_BUDGET]
         self._local_vertical_speed = 0.0
         self._local_airborne = False
         self._local_fall_armed = False
@@ -499,6 +842,25 @@ class BattleRuntime(object):
         self._drown_started = None
         self._next_spotting_time = 0.0
         self._foliage = None
+        projectile_now = self._clock()
+        self._projectiles = InFlightProjectiles(
+            maximum_active=PROJECTILE_MAX_ACTIVE,
+            initial_time=projectile_now)
+        self._projectile_meta = {}
+        self._projectile_visual_meta = {}
+        self._projectile_terminal_data = {}
+        self._projectile_target_positions = {}
+        self._projectile_position_history = []
+        self._projectile_lineage = set()
+        self._projectile_epoch = None
+        self._projectile_server_time_ms = None
+        self._projectile_server_local_time = None
+        self._projectile_revision = -1
+        self._next_projectile_progress_time = projectile_now
+        self._projectile_frame_start = projectile_now
+        self._projectile_frame_end = projectile_now
+        self._projectile_destructible_context = None
+        self._artillery = ArtilleryController()
         self._generation += 1
         self._deadline = self._clock() + float(
             self._config.get('startupTimeoutSeconds', 30.0))
@@ -525,6 +887,18 @@ class BattleRuntime(object):
                 self._runtime, 'foliage_loader',
                 prebaked_foliage.load_foliage)
             self._foliage = foliage_loader(self._config.get('map'))
+            if self._destructibles is not None:
+                catalog_loader = getattr(
+                    self._runtime, 'destructible_catalog_loader',
+                    prebaked_destructibles.load_catalog)
+                destructible_catalog = catalog_loader(
+                    self._config.get('map'))
+                if (map_name in prebaked_navigation.SUPPORTED_MAPS and
+                        destructible_catalog is None):
+                    raise RuntimeError(
+                        'validated destructible catalog is unavailable for %s' %
+                        map_name)
+                self._destructibles.set_catalog(destructible_catalog)
             self._spawn_planner = SpawnPlanner(
                 arena_type,
                 tactical_maps.get_tactical_map(self._config['map']),
@@ -848,12 +1222,13 @@ class BattleRuntime(object):
     def _configure_standard_space_visibility(self):
         """Install the selected gameplay bit normally supplied by the server."""
         bigworld = self._runtime.bigworld
-        spaces = getattr(bigworld, 'spaces', None)
+        set_mask = getattr(
+            bigworld, 'wg_setSpaceItemsVisibilityMask', None)
         visibility = getattr(
             self._runtime, 'client_visibility_flags', None)
         gameplay_mask = getattr(
             self._runtime, 'arena_visibility_mask', None)
-        if (spaces is None or visibility is None or
+        if (not callable(set_mask) or visibility is None or
                 not callable(gameplay_mask)):
             raise RuntimeError(
                 '#1513 space visibility boundary is unavailable')
@@ -864,9 +1239,8 @@ class BattleRuntime(object):
             server_bits = visibility.SERVER_MASK
             gameplay_id = int(self._arena_type.gameplayID)
             selected_bit = gameplay_mask(gameplay_id)
-            space = spaces[self._avatar.spaceID]
-        except (AttributeError, KeyError, TypeError, ValueError,
-                OverflowError):
+            space_id = self._avatar.spaceID
+        except (AttributeError, TypeError, ValueError, OverflowError):
             raise RuntimeError(
                 '#1513 space visibility contract is invalid')
         if (client_bits & server_bits or
@@ -880,18 +1254,14 @@ class BattleRuntime(object):
         # therefore the server-selected gameplay bit.
         expected = selected_bit
         try:
-            # The old wg_get/wg_set exports are inert compatibility stubs in
-            # build #1513.  OldSpaceData.pyc maps key 300 to this exact native
-            # space property for both reads and writes.
-            space.itemsVisibilityMask = expected
-            actual = space.itemsVisibilityMask
+            # Exact #1513 ClientHangarSpace configures a client-only space
+            # through this native setter immediately after createSpace().
+            # Such a space has no server-published GeneralSpaceData object, so
+            # BigWorld.spaces[spaceID] is not a valid startup requirement.
+            set_mask(space_id, expected)
         except (AttributeError, TypeError, ValueError, OverflowError):
             raise RuntimeError(
-                '#1513 gameplay visibility mask readback is invalid')
-        if actual != expected:
-            raise RuntimeError(
-                '#1513 gameplay visibility mask was not applied: '
-                'expected=0x%x actual=%r' % (expected, actual))
+                '#1513 gameplay visibility mask could not be applied')
         return expected
 
     def _clock(self):
@@ -1008,6 +1378,7 @@ class BattleRuntime(object):
                 on_ready=self._on_client_ready,
                 on_leave=self._defer_avatar_leave,
                 on_vehicle_enter=self._prepare_local_presentation,
+                on_viewpoint_switch=self._switch_postmortem_viewpoint,
                 initial_period='prebattle',
                 initial_period_seconds=self._prebattle_seconds())
             self._runtime.compatibility.attach_avatar_server(
@@ -1157,6 +1528,11 @@ class BattleRuntime(object):
             record = self._records.get(local_key)
             if record is None:
                 raise RuntimeError('player Vehicle record is unavailable')
+            # Exact #1513 reapplies ClientVisibilityFlags late in
+            # PlayerAvatar.__onInitStepCompleted.  Cross that stock boundary
+            # before restoring the server-selected gameplay bit for this
+            # client-only space.
+            self._configure_standard_space_visibility()
             record['ready'] = True
             self._attach_local_presentation()
             self._runtime.compatibility.set_control_mode_listener(
@@ -1190,18 +1566,27 @@ class BattleRuntime(object):
                 vehicle_selector=self._select_bot_vehicle,
                 visibility_probe=self._bot_visibility,
                 firing_lane_probe=self._bot_firing_lane,
+                ballistic_solution_probe=self._bot_ballistic_solution,
+                artillery_launch_probe=self._bot_artillery_launch,
+                artillery_launch_cancel=self._bot_artillery_cancel,
                 spawn_resolver=self._formation_pose,
                 ground_probe=self._navigation_ground,
                 physics_ground_probe=self._ground_y,
                 obstacle_probe=self._navigation_obstacle,
                 bounds=getattr(self._spawn_planner, 'bounds', None),
                 cover_probe=self._sample_bot_cover,
+                motion_resolver=self._resolve_bot_motion,
+                world_receipt_probe=self._direction_world_receipt,
                 baked_graph=self._navigation_graph,
                 # Keep the mature 0.8.2 authority model: the copied physics
                 # integrator owns bot poses and the engine interpolates those
                 # poses for presentation.  A remote #1513 Vehicle has no
                 # retail server stream, so treating its WGVehiclePhysics as
                 # authoritative leaves movement inputs without pose samples.
+                # Keep logical probe counts for frame correlation, but do not
+                # read a high-resolution clock around every native query. The
+                # two clock calls are diagnostic work on the render thread and
+                # cannot affect probe order, results, deadlines or budgets.
                 native_motion=False)
             provider = getattr(self._avatar, 'guiSessionProvider', None)
             vehicle_view_state = getattr(
@@ -1234,7 +1619,6 @@ class BattleRuntime(object):
             if self._last_snapshot is not None:
                 self._bots.apply_snapshot(self._last_snapshot)
             self.state = 'running'
-            self._enable_prebattle_camera_controls()
             self._bind_local_arcade_camera()
             self._publish_rpm(self._clock(), force=True)
             self._last_frame_time = self._clock()
@@ -1312,31 +1696,10 @@ class BattleRuntime(object):
             duration = max(1.0, float(network_duration))
         self._config['battleDurationSeconds'] = duration
         self._binding.arena_period('prebattle', countdown)
-        self._enable_prebattle_camera_controls()
         self._prebattle_deadline = self._clock() + countdown
         self._last_frame_time = self._clock()
         if countdown <= 0.0:
             self._begin_battle()
-        return True
-
-    def _enable_prebattle_camera_controls(self):
-        """Keep the mature 0.8.2 camera usable before movement unlocks.
-
-        Exact #1513 rejects non-postmortem control-mode changes while its
-        input handler considers the arena stopped.  This also rejects the
-        arcade-to-sniper transition driven by the mouse wheel.  The mature
-        0.8.2 battle marks only the input handler as started during PREBATTLE;
-        movement and fire remain fenced by this runtime's ``_battle_live``.
-        Invoke the pinned native callback so its gun-marker state stays
-        consistent with the private flag.
-        """
-        handler = getattr(self._avatar, 'inputHandler', None)
-        callback = getattr(
-            handler, '_AvatarInputHandler__onArenaStarted', None)
-        if not callable(callback):
-            raise RuntimeError(
-                'native prebattle camera-control boundary is unavailable')
-        callback(self._runtime.constants.ARENA_PERIOD.BATTLE)
         return True
 
     def _bind_local_arcade_camera(self):
@@ -1350,7 +1713,35 @@ class BattleRuntime(object):
         current = getattr(handler, '_AvatarInputHandler__ctrlModeName', None)
         if current != modes.ARCADE:
             raise RuntimeError('initial #1513 control mode is not arcade')
-        return self._bind_local_control_sources(handler, current)
+        self._bind_local_control_sources(handler, current)
+        control = getattr(handler, '_AvatarInputHandler__curCtrl', None)
+        camera = getattr(control, 'camera', None)
+        align_camera = getattr(camera, 'setToVehicleDirection', None)
+        if not callable(align_camera):
+            raise RuntimeError(
+                '#1513 arcade camera direction boundary is unavailable')
+        # AvatarInputHandler creates ArcadeCamera before the client-only
+        # Vehicle exists.  Its initial yaw therefore comes from the identity
+        # target matrix.  Rebinding vehicleMProv above preserves that stale
+        # yaw; use the stock public reset after the live matrix is attached.
+        align_camera()
+        rotator = getattr(self._avatar, 'gunRotator', None)
+        reset_rotator = getattr(rotator, 'reset', None)
+        if not callable(reset_rotator):
+            raise RuntimeError(
+                '#1513 gun-direction reset boundary is unavailable')
+        # Vehicle.getAimParams reads the appearance turret/gun matrices, not
+        # the packed server echo.  Those matrices can still contain a loading
+        # angle when the first targeting tick runs.  Exact #1513's public
+        # VehicleGunRotator.reset() clears both angles and both matrices
+        # without restarting its timer, marker lifecycle or sound objects.
+        reset_rotator()
+        self._echo_local_gun_angles(0.0, 0.0)
+        align_sender = getattr(self._sender, 'align_aim', None)
+        if not callable(align_sender):
+            raise RuntimeError('player LAN aim sender is unavailable')
+        align_sender(0.0, 0.0)
+        return True
 
     def _on_control_mode_changed(self, handler, mode):
         """Verify the new control captured its canonical pose."""
@@ -1360,20 +1751,164 @@ class BattleRuntime(object):
         if modes is None:
             raise RuntimeError('#1513 control-mode constants are unavailable')
         if mode == modes.POSTMORTEM:
-            return self._assert_postmortem_control_sources(handler)
+            result = self._assert_postmortem_control_sources(handler)
+            if self._server is not None:
+                self._spectated_engine_id = int(self._server.vehicle_id)
+            return result
         return self._assert_local_control_sources(handler, mode)
 
-    def _assert_postmortem_control_sources(self, handler):
-        """Verify the stock death camera follows the attached pose provider.
+    def _spectator_record(self, engine_id, allow_self=False):
+        """Resolve one server-valid postmortem vehicle target."""
+        try:
+            engine_id = int(engine_id)
+        except (TypeError, ValueError, OverflowError):
+            return None, None
+        for record in self._records.values():
+            if int(record.get('engine_id', 0) or 0) != engine_id:
+                continue
+            if (record.get('tombstone') or not record.get('ready') or
+                    int((record.get('state') or {}).get('team', 0) or 0) !=
+                    int(getattr(self.client, 'team', 0) or 0)):
+                return None, None
+            entity = self._server_entity(engine_id)
+            if entity is None or getattr(entity, 'matrix', None) is None:
+                return None, None
+            if record.get('local'):
+                if not allow_self:
+                    return None, None
+            elif not self._record_alive(record, entity):
+                return None, None
+            return record, entity
+        return None, None
 
-        Exact #1513 first relinks the steady aiming calculator, then disables
-        the live control and enables ``PostMortemControlMode``.  The latter
-        deliberately captures ``consistentMatrices.attachedVehicleMatrix``;
-        it does not consume the steady aiming providers.  Once the destroyed
-        vehicle is no longer returned by ``getVehicleAttached()``, the stock
-        steady relink may therefore point at identity without invalidating
-        the postmortem camera.  Keep this transition strict by checking the
-        provider that #1513 actually captures and its copied live target.
+    def _switch_postmortem_viewpoint(self, is_viewpoint, engine_id):
+        """Perform #1513's server reattach and client callback transaction."""
+        if self.state != 'running' or is_viewpoint:
+            return False
+        handler = getattr(self._avatar, 'inputHandler', None)
+        modes = getattr(self._runtime.avatar_input_handler, '_CTRL_MODE', None)
+        if handler is None or modes is None:
+            return False
+        if (getattr(handler, '_AvatarInputHandler__ctrlModeName', None) !=
+                modes.POSTMORTEM):
+            return False
+        control = getattr(handler, '_AvatarInputHandler__curCtrl', None)
+        if (control is None or
+                getattr(control, 'curPostmortemDelay', None) is not None):
+            return False
+        local_id = (int(self._server.vehicle_id)
+                    if self._server is not None else 0)
+        record, entity = self._spectator_record(
+            engine_id, allow_self=int(engine_id) == local_id)
+        if record is None:
+            return False
+
+        matrices = getattr(self._avatar, 'consistentMatrices', None)
+        attached = getattr(matrices, 'attachedVehicleMatrix', None)
+        setter = getattr(matrices, '_ConsistentMatrices__setTarget', None)
+        camera = getattr(control, '_PostMortemControlMode__cam', None)
+        callback = getattr(self._avatar, 'onSwitchViewpoint', None)
+        if (attached is None or not callable(setter) or camera is None or
+                not callable(callback)):
+            return False
+        try:
+            previous_target = attached.target
+            previous_camera = camera.vehicleMProv
+        except AttributeError:
+            return False
+
+        target_matrix = (self._local_matrix if record.get('local')
+                         else entity.matrix)
+        if target_matrix is None:
+            return False
+        try:
+            # A retail cell attachment changes Avatar.vehicle first.  The
+            # client-created LAN entities have no cell relationship, so copy
+            # its exact Python-visible result before invoking the stock client
+            # callback: live attached matrix, then postmortem camera provider.
+            if not record.get('local'):
+                entity._postmortem_visible = True
+            if (self._runtime.bigworld.entity(int(engine_id)) is not entity or
+                    int(engine_id) not in self._runtime.bigworld.entities):
+                raise RuntimeError(
+                    '#1513 spectator entity lookup was rejected')
+            setter(target_matrix, False)
+            if attached.target is not target_matrix:
+                raise RuntimeError(
+                    '#1513 spectator matrix attachment was rejected')
+            camera.vehicleMProv = attached
+            if camera.vehicleMProv is not attached:
+                raise RuntimeError(
+                    '#1513 spectator camera attachment was rejected')
+            position = self._runtime.math.Vector3(0.0, 0.0, 0.0)
+            callback(int(engine_id), position)
+        except Exception:
+            try:
+                setter(previous_target, False)
+                camera.vehicleMProv = previous_camera
+            except Exception:
+                pass
+            if not record.get('local'):
+                entity._postmortem_visible = False
+            raise
+        previous_id = self._spectated_engine_id
+        if previous_id is not None and int(previous_id) != int(engine_id):
+            previous = self._server_entity(previous_id)
+            if previous is not None and bool(getattr(
+                    previous, '_offlineLANPresentation', False)):
+                previous._postmortem_visible = False
+        self._spectated_engine_id = int(engine_id)
+        return True
+
+    def _fallback_postmortem_viewpoint(self, excluded_engine_id):
+        """Move off a dead/removed observed ally, preferring the nearest."""
+        if self._spectated_engine_id != int(excluded_engine_id):
+            return False
+        origin = self._local_position
+        candidates = []
+        for record in self._records.values():
+            engine_id = int(record.get('engine_id', 0) or 0)
+            if not engine_id or engine_id == int(excluded_engine_id):
+                continue
+            valid, entity = self._spectator_record(engine_id)
+            if valid is None:
+                continue
+            position = _xyz(entity.position)
+            distance = ((position[0] - origin[0]) ** 2 +
+                        (position[2] - origin[2]) ** 2)
+            candidates.append((distance, engine_id))
+        candidates.sort()
+        for unused_distance, engine_id in candidates:
+            if self._switch_postmortem_viewpoint(False, engine_id):
+                return True
+        local_id = (int(self._server.vehicle_id)
+                    if self._server is not None else 0)
+        if local_id and local_id != int(excluded_engine_id):
+            return self._switch_postmortem_viewpoint(False, local_id)
+        self._spectated_engine_id = None
+        return False
+
+    def _release_postmortem_visibility(self):
+        engine_id = self._spectated_engine_id
+        self._spectated_engine_id = None
+        if engine_id is None:
+            return False
+        entity = self._server_entity(engine_id)
+        if (entity is None or not bool(getattr(
+                entity, '_offlineLANPresentation', False))):
+            return False
+        entity._postmortem_visible = False
+        return True
+
+    def _assert_postmortem_control_sources(self, handler):
+        """Verify the exact stock death-camera provider selected at enable.
+
+        ``PostMortemControlMode.enable`` first binds the attached matrix.  If
+        postmortem delay is active, its synchronous ``start()`` then moves the
+        same camera before the control-mode callback returns.  Exact #1513
+        selects the still-registered player ``Vehicle.matrix`` or, after that
+        entity has left the registry, the steady calculator output.  Mirror
+        that branch and keep every selected provider on the copied live pose.
         """
         matrices = getattr(self._avatar, 'consistentMatrices', None)
         attached = getattr(matrices, 'attachedVehicleMatrix', None)
@@ -1385,7 +1920,15 @@ class BattleRuntime(object):
         except AttributeError:
             raise RuntimeError(
                 '#1513 attached vehicle matrix target is unavailable')
-        if attached_target is not self._local_matrix:
+        expected_target = self._local_matrix
+        if (self._spectated_engine_id is not None and self._server is not None
+                and int(self._spectated_engine_id) !=
+                int(self._server.vehicle_id)):
+            record, vehicle = self._spectator_record(
+                self._spectated_engine_id)
+            if record is not None:
+                expected_target = vehicle.matrix
+        if attached_target is not expected_target:
             raise RuntimeError(
                 '#1513 postmortem attached provider captured a stale '
                 'vehicle pose')
@@ -1393,12 +1936,42 @@ class BattleRuntime(object):
         camera = getattr(control, '_PostMortemControlMode__cam', None)
         if camera is None:
             raise RuntimeError('#1513 postmortem camera is unavailable')
+        delay = getattr(control, 'curPostmortemDelay', None)
+        expected_camera = attached
+        if delay is not None:
+            entity_lookup = getattr(self._runtime.bigworld, 'entity', None)
+            if not callable(entity_lookup):
+                raise RuntimeError(
+                    '#1513 postmortem vehicle lookup is unavailable')
+            vehicle = entity_lookup(self._avatar.playerVehicleID)
+            if vehicle is not None:
+                expected_camera = getattr(vehicle, 'matrix', None)
+                if expected_camera is not self._local_matrix:
+                    raise RuntimeError(
+                        '#1513 postmortem vehicle captured a stale vehicle '
+                        'pose')
+            else:
+                calculator = getattr(
+                    handler, 'steadyVehicleMatrixCalculator', None)
+                expected_camera = getattr(calculator, 'outputMProv', None)
+                if expected_camera is None:
+                    raise RuntimeError(
+                        '#1513 postmortem delay matrix provider is unavailable')
+                if (getattr(expected_camera, 'rotationSrc', None) is not
+                        self._local_matrix or
+                        getattr(expected_camera, 'translationSrc', None) is not
+                        self._local_matrix):
+                    raise RuntimeError(
+                        '#1513 postmortem delay captured a stale vehicle pose')
+            if expected_camera is None:
+                raise RuntimeError(
+                    '#1513 postmortem delay matrix provider is unavailable')
         try:
             camera_matrix = camera.vehicleMProv
         except AttributeError:
             raise RuntimeError(
                 '#1513 postmortem camera has no vehicle matrix provider')
-        if camera_matrix is not attached:
+        if camera_matrix is not expected_camera:
             raise RuntimeError(
                 '#1513 postmortem camera captured a stale vehicle pose')
         return True
@@ -1854,7 +2427,8 @@ class BattleRuntime(object):
         return prebaked_navigation.pose_is_safe(
             self._navigation_graph, position, shoulder_cells=0)
 
-    def _direction_probe(self, position, yaw, speed=0.0):
+    def _direction_probe(self, position, yaw, speed=0.0,
+                         descriptor=None):
         """Copy the 0.8.2 dual-height, three-lane hull corridor probe."""
         x, y, z = _xyz(position)
         far_distance = 20.0 if abs(float(speed or 0.0)) > 5.0 else 15.0
@@ -1865,6 +2439,16 @@ class BattleRuntime(object):
         lateral_x = cosine
         lateral_z = -sine
         maximum_slope = 0.0
+        signed_speed = float(speed or 0.0)
+        planned_impact_speed = abs(signed_speed)
+        deferred = False
+        planning_params = None
+        if descriptor is not None:
+            try:
+                planning_params = vehicle_physics.derive_params(descriptor)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                raise RuntimeError(
+                    'bot destructible planning speed is unavailable')
         for height, distance in ((0.7, 8.0), (1.5, far_distance)):
             nx = x + sine * distance
             nz = z + cosine * distance
@@ -1906,12 +2490,141 @@ class BattleRuntime(object):
                 except Exception:
                     collision = True
                 if collision is not None:
+                    ray_impact_speed = planned_impact_speed
+                    if planning_params is not None:
+                        try:
+                            hull_bbox = self._destructibles._vehicle_hull_bbox(
+                                descriptor)
+                            minimum, maximum = hull_bbox[:2]
+                            reversing = signed_speed < 0.0
+                            hull_reach = max(
+                                0.0,
+                                (-float(minimum[2]) if reversing else
+                                 float(maximum[2])))
+                            hit_distance = max(
+                                0.0,
+                                (collision[0] - ray_start).length - hull_reach)
+                            # Use the current copied traction law to estimate
+                            # only the speed reachable before this far hit. The
+                            # actual hull contact still owns the retail gate.
+                            drive_sign = -1.0 if reversing else 1.0
+                            acceleration = abs(
+                                vehicle_physics.engine_force(
+                                    planning_params,
+                                    drive_sign * max(
+                                        planned_impact_speed, 0.1),
+                                    drive_sign, 0.0)) / max(
+                                        planning_params['mass'], 1.0)
+                            speed_limit = float(planning_params[
+                                'speedBwd' if reversing else 'speedFwd'])
+                            ray_impact_speed = min(
+                                speed_limit,
+                                math.sqrt(planned_impact_speed ** 2 +
+                                          2.0 * acceleration * hit_distance))
+                        except (AttributeError, KeyError, TypeError,
+                                ValueError, ZeroDivisionError, RuntimeError):
+                            return {'clear': False, 'collision': True,
+                                    'water': False, 'slope': slope}
+                    if descriptor is not None and self._destructibles is not None:
+                        kinetic_speed = None
+                        if planning_params is not None:
+                            kinetic_speed = float(planning_params[
+                                'speedBwd' if signed_speed < 0.0 else
+                                'speedFwd'])
+                        soft_status = (
+                            self._destructibles._catalog_soft_static_path(
+                                self._avatar.spaceID, ray_start, ray_end,
+                                collision, ray_impact_speed, descriptor,
+                                recast_budget=
+                                self._soft_static_recast_budget,
+                                allow_kinetic_first=True,
+                                kinetic_speed=kinetic_speed))
+                        if soft_status is True:
+                            continue
+                        if soft_status == 'kinetic':
+                            # Planning may approach a contact that this vehicle can
+                            # crush at its directional speed cap. The commit-side
+                            # native ray and exact hull contact still own destruction.
+                            continue
+                        if soft_status == 'deferred':
+                            # Budget exhaustion is not evidence of a wall. Keep
+                            # checking the remaining lanes so any directly
+                            # proved backing wall can still win this sample.
+                            deferred = True
+                            continue
                     return {'clear': False, 'collision': True,
                             'water': False, 'slope': slope}
             previous_y = next_y
             previous_distance = distance
-        return {'clear': True, 'collision': False,
-                'water': False, 'slope': maximum_slope}
+        result = {'clear': True, 'collision': False,
+                  'water': False, 'slope': maximum_slope}
+        if deferred:
+            result['deferred'] = True
+        return result
+
+    def _direction_world_receipt(self, position, travel_yaw, signed_speed,
+                                 descriptor):
+        """Prove the exact flat-ground 3x3 hull corridor without mutation."""
+        try:
+            planning_params = vehicle_physics.derive_params(descriptor)
+            bbox = self._destructibles._vehicle_hull_bbox(descriptor)
+            minimum, maximum = bbox[:2]
+            half_width = max(
+                abs(float(minimum[0])), abs(float(maximum[0]))) - 0.1
+            leading = (-float(minimum[2]) if signed_speed < 0.0 else
+                       float(maximum[2]))
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            return None
+        if half_width <= 0.0 or leading <= 0.0:
+            return None
+        x, y, z = _xyz(position)
+        sine = math.sin(float(travel_yaw))
+        cosine = math.cos(float(travel_yaw))
+        lateral_x = cosine
+        lateral_z = -sine
+        # This is a containment proof, not a planning distance.  Fifteen metres
+        # covers the hull, the <=3.5 m cache drift and an ordinary rendered
+        # frame at the copied speed limit.  A long/slow frame simply fails the
+        # containment check and falls back to the authoritative world sweep.
+        proof_distance = 15.0
+        planned_impact_speed = abs(float(signed_speed or 0.0))
+        cap_speed = None
+        if planning_params is not None:
+            cap_speed = float(planning_params[
+                'speedBwd' if signed_speed < 0.0 else 'speedFwd'])
+        for offset in (-half_width, 0.0, half_width):
+            sx = x + lateral_x * offset - sine * 0.5
+            sz = z + lateral_z * offset - cosine * 0.5
+            ex = x + lateral_x * offset + sine * proof_distance
+            ez = z + lateral_z * offset + cosine * proof_distance
+            for height in (0.6, 1.1, 1.6):
+                ray_start = self._vector((sx, y + height, sz))
+                ray_end = self._vector((ex, y + height, ez))
+                try:
+                    collision = self._runtime.bigworld.wg_collideSegment(
+                        self._avatar.spaceID, ray_start, ray_end, 128)
+                except Exception:
+                    return False
+                if collision is None:
+                    continue
+                soft_status = self._destructibles._catalog_soft_static_path(
+                    self._avatar.spaceID, ray_start, ray_end, collision,
+                    planned_impact_speed, descriptor,
+                    recast_budget=self._soft_static_recast_budget,
+                    allow_kinetic_first=True, kinetic_speed=cap_speed)
+                if soft_status in (True, 'kinetic'):
+                    continue
+                if soft_status == 'deferred':
+                    return 'deferred'
+                return False
+        return {
+            'distance': proof_distance,
+            'half_width': half_width,
+            'leading': leading,
+            'origin': (x, y, z),
+            'yaw': float(travel_yaw),
+            'direction': (-1 if signed_speed < 0.0 else 1),
+        }
 
     def _navigation_obstacle(self, start, end, half_width):
         """Exact 0.8.2 coarse graph sweep through the #1513 collision API."""
@@ -2185,15 +2898,18 @@ class BattleRuntime(object):
         matrix.setRotateYPR((self._local_yaw, 0.0, 0.0))
         position = self._vector(self._local_position)
         matrix.translation = position
+        zero_motion = self._vector((0.0, 0.0, 0.0))
         self._runtime.compatibility.set_vehicle_pose_overlay(
             entity, position, self._local_yaw, matrix,
-            self._local_speed, self._local_turn_speed)
+            self._local_speed, self._local_turn_speed,
+            zero_motion, zero_motion)
         native_stabilised = getattr(
             getattr(entity, 'filter', None), 'stabilisedMatrix',
             native_matrix)
         self._local_matrix = matrix
         self._local_native_matrix = native_matrix
         self._local_native_stabilised_matrix = native_stabilised
+        self._local_camera_velocity = zero_motion
         self._local_physics = vehicle_physics.derive_params(
             entity.typeDescriptor)
         return True
@@ -2217,24 +2933,39 @@ class BattleRuntime(object):
         self._local_model = model
         return True
 
-    def _update_local_presentation(self, entity):
+    def _update_local_presentation(self, entity, dt=0.0):
         if self._local_matrix is None or self._local_model is None:
             raise RuntimeError('player presentation is not attached')
+        previous_position = _xyz(self._local_matrix.translation)
         position = self._vector(self._local_position)
+        dt = max(0.0, float(dt))
+        previous_velocity = _xyz(self._local_camera_velocity)
+        if dt > 0.0:
+            current_position = _xyz(position)
+            velocity_tuple = tuple(
+                (current_position[index] - previous_position[index]) / dt
+                for index in range(3))
+            acceleration_tuple = tuple(
+                (velocity_tuple[index] - previous_velocity[index]) / dt
+                for index in range(3))
+        else:
+            velocity_tuple = previous_velocity
+            acceleration_tuple = (0.0, 0.0, 0.0)
+        velocity = self._vector(velocity_tuple)
+        acceleration = self._vector(acceleration_tuple)
         self._local_matrix.setRotateYPR((
             self._local_yaw, self._local_pitch, self._local_roll))
         self._local_matrix.translation = position
-        # CompoundAppearance may refresh after Vehicle.onEnterWorld. Rebind
-        # only when that refresh actually replaced the provider.  The mature
-        # 0.8.2 presentation binds one persistent matrix and mutates it in
-        # place; calling the native PyCompoundModel setter every render frame
-        # needlessly relinks the compound hierarchy and produces visible
-        # stepping despite a healthy renderer frame rate.
-        if self._local_model.matrix is not self._local_matrix:
-            self._local_model.matrix = self._local_matrix
+        # Exact #1513's CompoundAppearance.__linkCompound rebinds
+        # ``compoundModel.matrix`` from Vehicle.matrix after every model
+        # refresh.  Mutate the persistent provider only; even reading and
+        # comparing a native PyCompoundModel provider every render frame can
+        # create a fresh Python wrapper and spuriously relink the hierarchy.
         self._runtime.compatibility.set_vehicle_pose_overlay(
             entity, position, self._local_yaw, self._local_matrix,
-            self._local_speed, self._local_turn_speed)
+            self._local_speed, self._local_turn_speed,
+            velocity, acceleration)
+        self._local_camera_velocity = velocity
         return position
 
     def _detach_local_presentation(self):
@@ -2256,6 +2987,7 @@ class BattleRuntime(object):
         self._local_model = None
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
+        self._local_camera_velocity = None
         return True
 
     def _on_client_ready(self):
@@ -2409,6 +3141,61 @@ class BattleRuntime(object):
         self._ammo_signature = signature
         return True
 
+    def _publish_targeting_info(self, entity=None, state=None):
+        """Initialise #1513 gun-rotator parameters without ticking ammo."""
+        if entity is None:
+            if self._server is None:
+                raise RuntimeError('player Vehicle server identity is unavailable')
+            entity = self._server_entity(self._server.vehicle_id)
+        if entity is None or entity.typeDescriptor is None:
+            raise RuntimeError('player Vehicle descriptor is unavailable')
+        descriptor = entity.typeDescriptor
+        turret = descriptor.turret
+        gun = descriptor.gun
+        if state is None:
+            state = self._gun_state
+        if state is None:
+            raise RuntimeError('player gun state is unavailable')
+        chassis_factors = _field(
+            _field(descriptor, 'chassis', {}),
+            'shotDispersionFactors', (0.0, 0.0))
+        gun_factors = _field(gun, 'shotDispersionFactors', {}) or {}
+        try:
+            movement_factor = float(chassis_factors[0])
+            rotation_factor = float(chassis_factors[1])
+        except (TypeError, ValueError, IndexError):
+            movement_factor = 0.0
+            rotation_factor = 0.0
+        turret_factor = _number(
+            _field(gun_factors, 'turretRotation', 0.0), 0.0)
+        base_dispersion = _number(
+            _field(gun, 'shotDispersionAngle', 0.0), 0.0)
+        if base_dispersion <= 0.0:
+            raise RuntimeError('#1513 gun descriptor has no dispersion angle')
+        shot_multiplier = (
+            state.base_dispersion / base_dispersion *
+            critical_damage.stat_factor(entity, 'dispersion'))
+        aiming_time = (
+            state.aim_time *
+            critical_damage.stat_factor(entity, 'aim_time'))
+        turret_speed = (
+            _number(turret.rotationSpeed) *
+            critical_damage.stat_factor(entity, 'turret_speed'))
+        targeting_signature = (
+            turret_speed,
+            _number(gun.rotationSpeed), shot_multiplier,
+            turret_factor, movement_factor, rotation_factor, aiming_time)
+        if targeting_signature == self._targeting_signature:
+            return False
+        turret_yaw, gun_pitch = entity.getAimParams()
+        self._avatar.updateTargetingInfo(
+            turret_yaw, gun_pitch, targeting_signature[0],
+            targeting_signature[1], targeting_signature[2],
+            targeting_signature[3], targeting_signature[4],
+            targeting_signature[5], targeting_signature[6])
+        self._targeting_signature = targeting_signature
+        return True
+
     def _ammo_tick(self):
         if self.state != 'running' or self._server is None:
             return
@@ -2417,8 +3204,6 @@ class BattleRuntime(object):
             if entity is None or entity.typeDescriptor is None:
                 raise RuntimeError('player Vehicle descriptor is unavailable')
             descriptor = entity.typeDescriptor
-            turret = descriptor.turret
-            gun = descriptor.gun
             state = self._gun_state
             if state is None:
                 state = gun_mechanics.GunState(descriptor)
@@ -2446,50 +3231,11 @@ class BattleRuntime(object):
             elif previous_reload > 0.0 and state.reload_time <= 0.0:
                 self._publish_reload_event(
                     0.0, state.reload_duration, force=True)
-            chassis_factors = _field(
-                _field(descriptor, 'chassis', {}),
-                'shotDispersionFactors', (0.0, 0.0))
-            gun_factors = _field(gun, 'shotDispersionFactors', {}) or {}
-            try:
-                movement_factor = float(chassis_factors[0])
-                rotation_factor = float(chassis_factors[1])
-            except (TypeError, ValueError, IndexError):
-                movement_factor = 0.0
-                rotation_factor = 0.0
-            turret_factor = _number(
-                _field(gun_factors, 'turretRotation', 0.0), 0.0)
-            base_dispersion = _number(
-                _field(gun, 'shotDispersionAngle', 0.0), 0.0)
-            if base_dispersion <= 0.0:
-                raise RuntimeError(
-                    '#1513 gun descriptor has no dispersion angle')
-            shot_multiplier = (
-                state.base_dispersion / base_dispersion *
-                critical_damage.stat_factor(entity, 'dispersion'))
-            aiming_time = (
-                state.aim_time *
-                critical_damage.stat_factor(entity, 'aim_time'))
-            turret_speed = (
-                _number(turret.rotationSpeed) *
-                critical_damage.stat_factor(entity, 'turret_speed'))
-            targeting_signature = (
-                turret_speed,
-                _number(gun.rotationSpeed), shot_multiplier,
-                turret_factor, movement_factor, rotation_factor,
-                aiming_time)
-            if targeting_signature != self._targeting_signature:
-                # #1513 updateTargetingInfo is a server-parameter update, not
-                # a per-frame reticle publisher.  It calls gunRotator.update(),
-                # resets the current turret/gun goals and restarts rotation.
-                # Publish only when descriptor/crew/module parameters change;
-                # the stock rotator then owns live mouse aim and convergence.
-                turret_yaw, gun_pitch = entity.getAimParams()
-                self._avatar.updateTargetingInfo(
-                    turret_yaw, gun_pitch, targeting_signature[0],
-                    targeting_signature[1], targeting_signature[2],
-                    targeting_signature[3], targeting_signature[4],
-                    targeting_signature[5], targeting_signature[6])
-                self._targeting_signature = targeting_signature
+            # #1513 updateTargetingInfo is a server-parameter update, not a
+            # per-frame reticle publisher.  Publish only when descriptor,
+            # crew or module parameters change; the stock rotator owns live
+            # mouse aim and convergence after the native BATTLE transition.
+            self._publish_targeting_info(entity, state)
             self._sync_local_server_marker()
         except Exception as error:
             self._fail(error)
@@ -2523,6 +3269,8 @@ class BattleRuntime(object):
             return
         try:
             self._last_snapshot = dict(message or {})
+            self._observe_projectile_message(self._last_snapshot)
+            self._reconcile_projectile_snapshot(self._last_snapshot)
             if 'rules' in self._last_snapshot:
                 self._apply_rules(self._last_snapshot.get('rules'))
             if self._last_snapshot.get('battle_result') is not None:
@@ -2558,17 +3306,38 @@ class BattleRuntime(object):
             return False
         if 'bot_authority_id' not in message:
             return False
+        self._observe_projectile_message(message)
         player_id = message.get('bot_authority_id')
         self._start_message['bot_authority_id'] = player_id
         if self._bots is None:
             return True
         return self._reconcile_bot_authority(player_id)
 
+    def on_bot_observation(self, message):
+        """Consume one server-admitted observation without relaying it."""
+        if self.state != 'running':
+            return False
+        message = message if isinstance(message, dict) else {}
+        if (self._start_message is None or
+                message.get('round_id') !=
+                self._start_message.get('round_id')):
+            return False
+        try:
+            return self._observe_local_vehicle(message, self._clock())
+        except Exception as error:
+            self._fail(error)
+            return False
+
     def _reconcile_bot_authority(self, player_id):
         """Recover authority changes even if the one-shot event was missed."""
         if (self._bots is None or
                 getattr(self._bots, 'authority_id', None) == player_id):
             return False
+        # Arc jobs and completed launch receipts are native-world proofs made
+        # by one authority.  They must never survive an ownership handoff,
+        # regardless of whether this client gains or loses simulation duty.
+        if self._artillery is not None:
+            self._artillery.reset()
         start = dict(self._start_message or {})
         start['bot_authority_id'] = player_id
         snapshot = self._last_snapshot or {}
@@ -2610,6 +3379,7 @@ class BattleRuntime(object):
         if self.state in ('failed', 'stopped'):
             return False
         try:
+            self._observe_projectile_message(message or {})
             for raw_event in (message or {}).get('events') or ():
                 if not isinstance(raw_event, dict):
                     raise RuntimeError('ordered LAN event is malformed')
@@ -2666,6 +3436,16 @@ class BattleRuntime(object):
             state['shot_penalty_until'] = deadline
             holder['state'] = state
 
+    def _missing_projectile_attacker_allowed(self, event):
+        """Allow a fired shell to outlive a disconnected shooter entity."""
+        if (event.get('source') != 'shot' or
+                event.get('kind') not in (
+                    'hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit')):
+            return False
+        projectile_id = event.get('projectile_id')
+        return (projectile_id is not None and
+                str(projectile_id) in self._projectile_lineage)
+
     def _combat_event_state(self, event, state, target_key):
         if 'health' not in event:
             raise RuntimeError('ordered combat event has no health')
@@ -2675,9 +3455,13 @@ class BattleRuntime(object):
         health = max(0, int(event.get('health', 0)))
         state['health'] = health
         state['alive'] = health > 0 and not bool(event.get('dead', False))
-        if 'display_health' in event:
-            state['display_health'] = max(
-                0, int(event.get('display_health', health)))
+        # Canonical shot/fire/ram events normally omit ``display_health``.
+        # Do not retain the preceding snapshot's value: that would make the
+        # next snapshot look like another health edge and replay it without
+        # the event's attacker.  Exceptional preserved-hull deaths carry an
+        # explicit display value and continue to win here.
+        state['display_health'] = max(
+            0, int(event.get('display_health', health)))
         try:
             death_reason = int(event['death_reason'])
         except (TypeError, ValueError):
@@ -2713,7 +3497,11 @@ class BattleRuntime(object):
         holder, state = self._known_event_state(target_key)
         attacker_key = self._event_entity_key(event, 'attacker')
         if attacker_key is not None:
-            self._known_event_state(attacker_key)
+            try:
+                self._known_event_state(attacker_key)
+            except RuntimeError:
+                if not self._missing_projectile_attacker_allowed(event):
+                    raise
         holder['state'] = self._combat_event_state(
             event, state, target_key)
 
@@ -2721,12 +3509,15 @@ class BattleRuntime(object):
         kind = event.get('kind')
         if kind in _SHOT_EVENT_KINDS:
             self._merge_shot_event_state(event)
+            normalized = self._projectile_wire_meta(event)
+            if normalized is not None:
+                self._projectile_lineage.add(normalized['projectile_id'])
         elif kind in _COMBAT_EVENT_KINDS:
             self._validate_combat_event_contract(event)
             self._merge_combat_event_state(event)
         elif kind not in (
                 'authority', 'bot_manifest', 'vehicle_statistics',
-                'destructible', 'battle_result'):
+                'destructible', 'projectile_impact', 'battle_result'):
             raise RuntimeError(
                 'ordered LAN event kind is unsupported: %s' % kind)
 
@@ -2766,6 +3557,8 @@ class BattleRuntime(object):
             attacker_record = self._records.get(attacker_key)
             if (attacker_record is None and
                     attacker_key not in self._pending_bot_creates):
+                if self._missing_projectile_attacker_allowed(event):
+                    return True
                 raise RuntimeError(
                     'ordered LAN event lost entity %s before apply' %
                     attacker_key)
@@ -2774,19 +3567,25 @@ class BattleRuntime(object):
 
     def _apply_ordered_event(self, event):
         kind = event.get('kind')
-        if kind == 'authority' and self._bots is not None:
-            changed = self._reconcile_bot_authority(
-                event.get('player_id'))
-            if changed and self._last_snapshot is not None:
-                self._bots.apply_snapshot(self._last_snapshot)
+        if kind == 'authority':
+            self._set_projectile_epoch(
+                event.get('authority_epoch'), self._clock())
+            if self._bots is not None:
+                changed = self._reconcile_bot_authority(
+                    event.get('player_id'))
+                if changed and self._last_snapshot is not None:
+                    self._bots.apply_snapshot(self._last_snapshot)
         elif kind in _SHOT_EVENT_KINDS:
             self._show_shot(event, update_state=False)
+            self._accept_projectile_event(event)
         elif kind in _COMBAT_EVENT_KINDS:
             self._apply_combat_event(event, update_state=False)
         elif kind == 'vehicle_statistics':
             self._apply_vehicle_statistics_event(event)
         elif kind == 'destructible':
             self._apply_destructible_event(event)
+        elif kind == 'projectile_impact':
+            self._apply_projectile_terminal_event(event)
         elif kind == 'battle_result':
             self._apply_battle_result(event)
         elif kind == 'bot_manifest':
@@ -2824,6 +3623,27 @@ class BattleRuntime(object):
         return False
 
     def _report_destructible(self, event):
+        context = self._projectile_destructible_context
+        if context is not None:
+            projectile_id = context
+            meta = self._projectile_meta.get(projectile_id)
+            if meta is None or not isinstance(event, dict) or \
+                    event.get('is_shot') is not True:
+                return False
+            frozen = dict(event)
+            key = (
+                frozen.get('destructible_kind'), frozen.get('chunk_id'),
+                frozen.get('item_index'), frozen.get('mat_kind'))
+            pending = meta.setdefault('destructibles_pending', [])
+            if key not in set(
+                    (value.get('destructible_kind'), value.get('chunk_id'),
+                     value.get('item_index'), value.get('mat_kind'))
+                    for value in pending):
+                if len(pending) >= 64:
+                    raise RuntimeError(
+                        'projectile destructible receipt limit exceeded')
+                pending.append(frozen)
+            return True
         if self.client is None:
             raise RuntimeError('LAN client is unavailable for destructible')
         sender = getattr(self.client, 'send_destructible', None)
@@ -2899,6 +3719,11 @@ class BattleRuntime(object):
                 chunk_id, item_index, mat_kind)):
             raise RuntimeError(
                 '#1513 failed to apply canonical destructible event')
+        note_destroyed = getattr(
+            self._destructibles, 'note_destroyed', None)
+        if callable(note_destroyed):
+            note_destroyed(
+                kind, chunk_id, item_index, mat_kind, self._clock())
         return True
 
     def _apply_vehicle_statistics_event(self, event):
@@ -3207,9 +4032,10 @@ class BattleRuntime(object):
         attacker_record = self._records.get(
             '%s:%s' % (attacker_kind, attacker))
         if attacker is not None and attacker_record is None:
-            raise RuntimeError(
-                'ordered combat event attacker is unavailable: %s:%s' %
-                (attacker_kind, attacker))
+            if not self._missing_projectile_attacker_allowed(event):
+                raise RuntimeError(
+                    'ordered combat event attacker is unavailable: %s:%s' %
+                    (attacker_kind, attacker))
         attacker_id = (attacker_record.get('engine_id')
                        if attacker_record is not None else 0)
         entity = self._server_entity(record['engine_id'])
@@ -3664,7 +4490,7 @@ class BattleRuntime(object):
         if entity is None:
             raise RuntimeError(
                 'ordered shot event attacker has no native entity: %s' % key)
-        transient_angles = False
+        transient_names = []
         try:
             entity._offlineLANShotIndex = max(
                 0, int(event.get('shell_index', 0) or 0))
@@ -3675,7 +4501,54 @@ class BattleRuntime(object):
                     event.get('shot_yaw'))
                 entity._offlineLANShotPitch = _number(
                     event.get('shot_pitch'))
-                transient_angles = True
+                transient_names.extend((
+                    '_offlineLANShotYaw', '_offlineLANShotPitch'))
+            canonical = all(name in event for name in (
+                'origin', 'velocity', 'gravity', 'maxDistance'))
+            if canonical:
+                projectile_id = event.get('projectile_id')
+                origin = event.get('origin')
+                velocity = event.get('velocity')
+                gravity = _number(event.get('gravity'))
+                elapsed = self._projectile_launch_age(event, self._clock())
+                reference_origin = trajectory_position(
+                    origin, velocity, (0.0, -gravity, 0.0), elapsed)
+                reference_velocity = (
+                    float(velocity[0]),
+                    float(velocity[1]) - gravity * elapsed,
+                    float(velocity[2]))
+                if projectile_id is not None:
+                    self._projectile_visual_meta[str(projectile_id)] = {
+                        'origin': tuple(float(value) for value in origin),
+                        'velocity': tuple(float(value) for value in velocity),
+                        'gravity': gravity,
+                    }
+                for name, value in (
+                        ('_offlineLANShotOrigin', origin),
+                        ('_offlineLANShotVelocity', velocity),
+                        ('_offlineLANShotGravity', gravity),
+                        ('_offlineLANShotMaxDistance',
+                         event.get('maxDistance')),
+                        ('_offlineLANProjectileID', projectile_id),
+                        ('_offlineLANShotReferenceOrigin', reference_origin),
+                        ('_offlineLANShotReferenceVelocity',
+                         reference_velocity)):
+                    setattr(entity, name, value)
+                    transient_names.append(name)
+                # RemoteVehicle.showShooting delegates to the same factory
+                # presenter and consumes the transient canonical values.  The
+                # stock local Vehicle has no such delegate, so launch its
+                # authoritative tracer explicitly from the event instead of
+                # reconstructing it from a later muzzle pose.
+                if (not bool(getattr(
+                        entity, '_offlineLANPresentation', False)) and
+                        self._remote_factory is not None):
+                    self._remote_factory.play_projectile_tracer(
+                        entity.typeDescriptor,
+                        entity._offlineLANShotIndex,
+                        origin, velocity, gravity,
+                        event.get('maxDistance'), entity.id, projectile_id,
+                        reference_origin, reference_velocity)
             # Exact #1513 uses gun.burst[0] for the predicted-shot fallback.
             # Zero is not a one-shot sentinel: it reaches the native shoot
             # extra as an unbounded burst.  A server event is authoritative,
@@ -3688,43 +4561,1117 @@ class BattleRuntime(object):
                 burst_count = 1
             entity.showShooting(max(1, burst_count), False)
         finally:
-            if transient_angles:
-                for name in ('_offlineLANShotYaw',
-                             '_offlineLANShotPitch'):
-                    try:
-                        delattr(entity, name)
-                    except Exception:
-                        pass
+            for name in transient_names:
+                try:
+                    delattr(entity, name)
+                except Exception:
+                    pass
         return True
+
+    def _projectile_is_authority(self):
+        checker = getattr(self.client, 'is_bot_authority', None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
+    def _set_projectile_epoch(self, value, now):
+        try:
+            epoch = int(value)
+            if isinstance(value, bool) or epoch < 0:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if self._projectile_epoch == epoch:
+            return True
+        self._projectile_epoch = epoch
+        self._projectile_meta = {}
+        self._projectile_terminal_data = {}
+        self._projectile_target_positions = {}
+        self._projectile_position_history = []
+        if self._projectiles is not None:
+            reset_at = max(float(now), self._projectiles.now)
+            if not self._projectiles.reset(reset_at):
+                raise RuntimeError('projectile authority reset failed')
+        self._next_projectile_progress_time = float(now)
+        return True
+
+    def _observe_projectile_message(self, message):
+        """Anchor round-relative server time in this process clock domain."""
+        if not isinstance(message, dict):
+            return False
+        now = self._clock()
+        received = message.get('_client_received_time')
+        local_anchor = now
+        if received is not None:
+            try:
+                received = float(received)
+                if not math.isnan(received) and not math.isinf(received):
+                    # The network thread timestamps receipt with a monotonic
+                    # clock.  Project its queueing delay into BigWorld time so
+                    # a render stall cannot make every in-flight shell young.
+                    process_now = getattr(time, 'monotonic', None)
+                    if callable(process_now):
+                        process_now = float(process_now())
+                    else:
+                        process_now = float(time.clock())
+                    lag = max(0.0, min(60.0, process_now - received))
+                    local_anchor = max(0.0, now - lag)
+            except (TypeError, ValueError, OverflowError):
+                return False
+        if 'server_time_ms' in message:
+            server_time = message.get('server_time_ms')
+            try:
+                server_time = int(server_time)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if server_time < 0:
+                return False
+            if (self._projectile_server_time_ms is None or
+                    server_time >= self._projectile_server_time_ms):
+                one_way = 0.0
+                try:
+                    rtt_ms = getattr(self.client, 'rtt_ms', None)
+                    if rtt_ms is not None:
+                        one_way = max(
+                            0.0, min(0.25, float(rtt_ms) / 2000.0))
+                except (TypeError, ValueError, OverflowError):
+                    one_way = 0.0
+                self._projectile_server_time_ms = server_time
+                self._projectile_server_local_time = max(
+                    0.0, local_anchor - one_way)
+        epoch = message.get(
+            'authority_epoch', getattr(self.client, 'authority_epoch', None))
+        if epoch is not None:
+            self._set_projectile_epoch(epoch, now)
+        return True
+
+    def _projectile_estimated_server_time(self, now):
+        if (self._projectile_server_time_ms is None or
+                self._projectile_server_local_time is None):
+            return None
+        elapsed = max(
+            0.0, float(now) - float(self._projectile_server_local_time))
+        return int(self._projectile_server_time_ms + elapsed * 1000.0)
+
+    def _projectile_local_launch_time(self, launch_server_time_ms, now):
+        estimated = self._projectile_estimated_server_time(now)
+        if estimated is None:
+            return min(float(now), self._projectiles.now)
+        age = max(
+            0.0, float(estimated - int(launch_server_time_ms)) / 1000.0)
+        return max(
+            0.0, min(self._projectiles.now, float(now) - age))
+
+    def _projectile_launch_age(self, raw, now):
+        """Return the canonical launch age shared by simulation and tracer."""
+        if not isinstance(raw, dict):
+            return 0.0
+        launch_time = raw.get('launch_server_time_ms')
+        max_time_ms = raw.get('max_time_ms', PROJECTILE_MAX_TIME_MS)
+        try:
+            launch_time = int(launch_time)
+            maximum = max(0.0, float(max_time_ms) / 1000.0)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        estimated = self._projectile_estimated_server_time(now)
+        if estimated is None:
+            return 0.0
+        return max(
+            0.0, min(maximum, float(estimated - launch_time) / 1000.0))
+
+    @staticmethod
+    def _projectile_wire_meta(raw):
+        """Normalize the canonical-event and snapshot launch spellings."""
+        if not isinstance(raw, dict):
+            return None
+        maximum = raw.get('max_distance', raw.get('maxDistance'))
+        shooter_kind = raw.get('shooter_kind')
+        shooter_id = raw.get('shooter_id')
+        if shooter_kind is None:
+            if raw.get('attacker_bot') is not None:
+                shooter_kind = 'bot'
+                shooter_id = raw.get('attacker_bot')
+            elif raw.get('attacker') is not None:
+                shooter_kind = 'player'
+                shooter_id = raw.get('attacker')
+        required = (
+            'projectile_id', 'source_vehicle', 'shot_seq', 'shell_index', 'origin',
+            'velocity', 'gravity', 'max_time_ms', 'is_he',
+            'splash_radius', 'penetration_factor', 'launch_server_time_ms')
+        if (maximum is None or shooter_kind is None or shooter_id is None or
+                any(name not in raw for name in required)):
+            return None
+        try:
+            origin = tuple(float(value) for value in raw['origin'])
+            velocity = tuple(float(value) for value in raw['velocity'])
+            if len(origin) != 3 or len(velocity) != 3:
+                return None
+            gravity = float(raw['gravity'])
+            maximum = float(maximum)
+            max_time_ms = int(raw['max_time_ms'])
+            projectile_id = str(raw['projectile_id'])
+            source_vehicle = str(raw['source_vehicle'])
+            shooter_kind = str(shooter_kind)
+            shooter_id = int(shooter_id)
+            shot_seq = int(raw['shot_seq'])
+            shell_index = int(raw['shell_index'])
+            launch_server_time = int(raw['launch_server_time_ms'])
+            splash_radius = float(raw['splash_radius'])
+            penetration_factor = float(raw['penetration_factor'])
+        except (TypeError, ValueError, OverflowError):
+            return None
+        values = (origin + velocity + (
+            gravity, maximum, splash_radius, penetration_factor))
+        if (not projectile_id or not source_vehicle or
+                len(source_vehicle) > 128 or
+                shooter_kind not in ('player', 'bot') or
+                shooter_id <= 0 or shot_seq <= 0 or
+                shell_index < 0 or shell_index > 9 or
+                gravity <= 0.0 or maximum <= 0.0 or
+                max_time_ms <= 0 or max_time_ms > PROJECTILE_MAX_TIME_MS or
+                launch_server_time < 0 or splash_radius < 0.0 or
+                penetration_factor < 0.0 or
+                not isinstance(raw['is_he'], bool) or
+                any(math.isnan(value) or math.isinf(value)
+                    for value in values)):
+            return None
+        return {
+            'projectile_id': projectile_id,
+            'shooter_kind': shooter_kind,
+            'shooter_id': shooter_id,
+            'source_vehicle': source_vehicle,
+            'shot_seq': shot_seq,
+            'shell_index': shell_index,
+            'origin': origin,
+            'velocity': velocity,
+            'gravity': gravity,
+            'max_distance': maximum,
+            'max_time_ms': max_time_ms,
+            'is_he': bool(raw['is_he']),
+            'splash_radius': splash_radius,
+            'penetration_factor': penetration_factor,
+            'launch_server_time_ms': launch_server_time,
+            'base_checked_ms': max(
+                0, int(raw.get('checked_through_ms', 0) or 0)),
+            'checked_distance': max(
+                0.0, _number(raw.get('checked_distance'), 0.0)),
+            'piercing_loss': max(
+                0.0, _number(raw.get('piercing_loss'), 0.0)),
+        }
+
+    def _install_projectile_meta(self, normalized):
+        projectile_id = normalized['projectile_id']
+        meta = self._projectile_meta.get(projectile_id)
+        if meta is None:
+            meta = dict(normalized)
+            meta['destructibles_pending'] = []
+            self._projectile_meta[projectile_id] = meta
+        else:
+            # Launch fields are immutable; only the server-acknowledged cursor
+            # and accumulated penetration state may advance in snapshots.
+            frozen = (
+                'shooter_kind', 'shooter_id', 'source_vehicle',
+                'shot_seq', 'shell_index',
+                'origin', 'velocity', 'gravity', 'max_distance',
+                'max_time_ms', 'is_he', 'splash_radius',
+                'launch_server_time_ms')
+            if any(meta.get(name) != normalized.get(name)
+                   for name in frozen):
+                raise RuntimeError('canonical projectile launch changed')
+            if (normalized['base_checked_ms'] >=
+                    meta.get('base_checked_ms', 0)):
+                meta['base_checked_ms'] = normalized['base_checked_ms']
+                meta['acked_distance'] = normalized['checked_distance']
+                meta['acked_piercing_loss'] = normalized['piercing_loss']
+                pending = meta.get('progress_pending')
+                if (pending is not None and
+                        normalized['base_checked_ms'] >=
+                        pending['checked_through_ms']):
+                    meta['progress_pending'] = None
+                active = (self._projectiles is not None and
+                          self._projectiles.contains(projectile_id))
+                if (not active and
+                        meta.get('pending_resolution') is None and
+                        not meta.get('awaiting_resolution')):
+                    meta['checked_distance'] = normalized[
+                        'checked_distance']
+                    meta['piercing_loss'] = normalized['piercing_loss']
+                    meta['penetration_factor'] = normalized[
+                        'penetration_factor']
+        return meta
+
+    def _accept_projectile_event(self, event):
+        """Register one server-admitted launch on the elected simulator."""
+        if not self._projectile_is_authority() or self._projectiles is None:
+            return False
+        epoch = event.get(
+            'authority_epoch', getattr(self.client, 'authority_epoch', None))
+        if not self._set_projectile_epoch(epoch, self._clock()):
+            return False
+        normalized = self._projectile_wire_meta(event)
+        if normalized is None:
+            raise RuntimeError('canonical projectile event is malformed')
+        meta = self._install_projectile_meta(normalized)
+        projectile_id = normalized['projectile_id']
+        if self._projectiles.contains(projectile_id):
+            return True
+        now = self._clock()
+        launch_time = self._projectile_local_launch_time(
+            normalized['launch_server_time_ms'], now)
+        accepted = self._projectiles.launch(
+            projectile_id, normalized['origin'], normalized['velocity'],
+            (0.0, -normalized['gravity'], 0.0), launch_time,
+            float(normalized['max_time_ms']) / 1000.0,
+            normalized['max_distance'], payload={
+                'shooter_kind': normalized['shooter_kind'],
+                'shooter_id': normalized['shooter_id'],
+                'shot_seq': normalized['shot_seq'],
+                'shell_index': normalized['shell_index'],
+            })
+        if not accepted:
+            self._projectile_meta.pop(projectile_id, None)
+            raise RuntimeError('canonical projectile launch was not admitted')
+        meta['awaiting_resolution'] = False
+        return True
+
+    def _reconcile_projectile_snapshot(self, message):
+        """Restore the authoritative cursor without rescanning elapsed time."""
+        if self._projectiles is None or not isinstance(message, dict):
+            return False
+        rows = message.get('projectiles')
+        if not isinstance(rows, (list, tuple)):
+            return False
+        now = self._clock()
+        active_ids = set()
+        for raw in rows:
+            normalized = self._projectile_wire_meta(raw)
+            if normalized is None:
+                raise RuntimeError('active projectile snapshot is malformed')
+            projectile_id = normalized['projectile_id']
+            active_ids.add(projectile_id)
+            self._ensure_projectile_visual(normalized, now)
+        if not self._projectile_is_authority():
+            return True
+        for raw in rows:
+            normalized = self._projectile_wire_meta(raw)
+            projectile_id = normalized['projectile_id']
+            meta = self._install_projectile_meta(normalized)
+            if (self._projectiles.contains(projectile_id) or
+                    meta.get('awaiting_resolution') or
+                    meta.get('pending_resolution') is not None):
+                continue
+            source = self._projectile_source_entity(meta)
+            source_descriptor = (getattr(source, 'typeDescriptor', None)
+                                 if source is not None else None)
+            if source_descriptor is None:
+                source_descriptor = self._projectile_source_descriptor(meta)
+            if source_descriptor is None:
+                # A takeover snapshot can overtake delayed native entity
+                # materialization.  The ledger freezes source_vehicle so a
+                # shooter that disconnected after firing remains resolvable;
+                # only wait when even that canonical descriptor is unavailable.
+                continue
+            launch_time = self._projectile_local_launch_time(
+                normalized['launch_server_time_ms'], now)
+            cursor_time = min(
+                self._projectiles.now,
+                launch_time + normalized['base_checked_ms'] / 1000.0)
+            restored = self._projectiles.restore({
+                'key': projectile_id,
+                'start': normalized['origin'],
+                'velocity': normalized['velocity'],
+                'gravity': (0.0, -normalized['gravity'], 0.0),
+                'launch_time': launch_time,
+                'max_time': normalized['max_time_ms'] / 1000.0,
+                'max_distance': normalized['max_distance'],
+                'payload': {
+                    'shooter_kind': normalized['shooter_kind'],
+                    'shooter_id': normalized['shooter_id'],
+                    'shot_seq': normalized['shot_seq'],
+                    'shell_index': normalized['shell_index'],
+                },
+                'cursor_time': max(launch_time, cursor_time),
+                'distance': normalized['checked_distance'],
+            })
+            if not restored:
+                raise RuntimeError('active projectile restore failed')
+        for projectile_id, meta in tuple(self._projectile_meta.items()):
+            if (projectile_id not in active_ids and
+                    (meta.get('awaiting_resolution') or
+                     meta.get('pending_resolution') is not None)):
+                self._projectile_meta.pop(projectile_id, None)
+                self._projectile_terminal_data.pop(projectile_id, None)
+        try:
+            revision = int(message.get('projectile_revision', -1))
+        except (TypeError, ValueError, OverflowError):
+            revision = -1
+        self._projectile_revision = max(
+            self._projectile_revision, revision)
+        return True
+
+    def _apply_projectile_terminal_event(self, event):
+        projectile_id = event.get('projectile_id')
+        if projectile_id is None:
+            raise RuntimeError('projectile terminal event has no id')
+        projectile_id = str(projectile_id)
+        self._stop_projectile_visual(projectile_id, event)
+        if self._projectiles is not None:
+            self._projectiles.remove(projectile_id)
+        self._projectile_meta.pop(projectile_id, None)
+        self._projectile_terminal_data.pop(projectile_id, None)
+        return True
+
+    def _ensure_projectile_visual(self, normalized, now):
+        """Ensure late joiners and delayed snapshots see the live tracer."""
+        if self._remote_factory is None or not isinstance(normalized, dict):
+            return False
+        descriptor = self._projectile_source_descriptor(normalized)
+        if descriptor is None:
+            return False
+        elapsed = self._projectile_launch_age(normalized, now)
+        gravity = normalized['gravity']
+        reference_origin = trajectory_position(
+            normalized['origin'], normalized['velocity'],
+            (0.0, -gravity, 0.0), elapsed)
+        reference_velocity = (
+            normalized['velocity'][0],
+            normalized['velocity'][1] - gravity * elapsed,
+            normalized['velocity'][2])
+        self._projectile_visual_meta[normalized['projectile_id']] = {
+            'origin': tuple(normalized['origin']),
+            'velocity': tuple(normalized['velocity']),
+            'gravity': gravity,
+        }
+        record = self._records.get('%s:%s' % (
+            normalized['shooter_kind'], normalized['shooter_id']))
+        attacker_id = int(record.get('engine_id', 0) or 0) \
+            if record is not None else 0
+        if attacker_id <= 0:
+            # ProjectileMover only uses the attacker id for presentation
+            # attribution.  A disconnected shooter must not erase a live
+            # projectile restored from the durable snapshot.
+            attacker_id = int(normalized['shooter_id'])
+        return bool(self._remote_factory.play_projectile_tracer(
+            descriptor, normalized['shell_index'], normalized['origin'],
+            normalized['velocity'], gravity, normalized['max_distance'],
+            attacker_id, normalized['projectile_id'], reference_origin,
+            reference_velocity))
+
+    def _stop_projectile_visual(self, projectile_id, event):
+        if self._remote_factory is None:
+            return False
+        impact = event.get('impact') if isinstance(event, dict) else None
+        if impact is None:
+            state = (self._projectiles.get(projectile_id)
+                     if self._projectiles is not None else None)
+            impact = state.get('position') if state is not None else None
+        if impact is None:
+            visual = self._projectile_visual_meta.get(projectile_id)
+            try:
+                elapsed = max(
+                    0.0, float(event.get('resolved_time_ms')) / 1000.0)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                elapsed = None
+            if visual is not None and elapsed is not None:
+                impact = trajectory_position(
+                    visual['origin'], visual['velocity'],
+                    (0.0, -visual['gravity'], 0.0), elapsed)
+        if impact is None:
+            return False
+        stopped = bool(self._remote_factory.stop_projectile_tracer(
+            projectile_id, impact))
+        self._projectile_visual_meta.pop(projectile_id, None)
+        return stopped
+
+    def _projectile_record_positions(self):
+        result = {}
+        for key, record in tuple(self._records.items()):
+            if record.get('tombstone'):
+                continue
+            entity = self._server_entity(record.get('engine_id'))
+            if entity is None or not getattr(entity, 'isStarted', False):
+                continue
+            if record.get('local'):
+                result[key] = tuple(self._local_position)
+            else:
+                result[key] = _xyz(getattr(
+                    entity, 'position', record.get('state', {})))
+        return result
+
+    def _sample_projectile_positions(self, now, positions):
+        """Keep enough pose history for budgeted projectile catch-up."""
+        sample = (float(now), dict(positions or {}))
+        if (self._projectile_position_history and
+                abs(self._projectile_position_history[-1][0] -
+                    sample[0]) <= 1.0e-9):
+            self._projectile_position_history[-1] = sample
+        else:
+            self._projectile_position_history.append(sample)
+        # Twenty seconds is the protocol lifetime.  The small extra margin
+        # retains the left interpolation endpoint during a delayed frame.
+        floor = float(now) - PROJECTILE_MAX_TIME_MS / 1000.0 - 1.0
+        while (len(self._projectile_position_history) > 2 and
+               self._projectile_position_history[1][0] < floor):
+            self._projectile_position_history.pop(0)
+
+    def _projectile_historic_position(self, key, absolute_time, fallback):
+        history = self._projectile_position_history
+        if not history:
+            return fallback
+        wanted = float(absolute_time)
+        first_time, first_positions = history[0]
+        if wanted <= first_time:
+            return first_positions.get(key, fallback)
+        for index in range(1, len(history)):
+            right_time, right_positions = history[index]
+            if wanted > right_time:
+                continue
+            left_time, left_positions = history[index - 1]
+            left = left_positions.get(key)
+            right = right_positions.get(key)
+            if left is None:
+                return right if right is not None else fallback
+            if right is None or right_time <= left_time + 1.0e-9:
+                return left
+            return lerp3(
+                left, right,
+                (wanted - left_time) / (right_time - left_time))
+        return history[-1][1].get(key, fallback)
+
+    def _prune_projectile_position_history(self):
+        if not self._projectile_position_history or self._projectiles is None:
+            return
+        states = self._projectiles.snapshot()
+        if not states:
+            # A non-authority client may be elected before the next network
+            # snapshot. Keep a short recent trail while canonical visual
+            # projectiles prove that takeover work can still arrive.
+            if not self._projectile_visual_meta:
+                self._projectile_position_history = (
+                    self._projectile_position_history[-1:])
+                return
+            floor = self._projectile_position_history[-1][0] - 1.0
+            while (len(self._projectile_position_history) > 2 and
+                   self._projectile_position_history[1][0] < floor):
+                self._projectile_position_history.pop(0)
+            return
+        floor = min(float(state['cursor_time']) for state in states)
+        while (len(self._projectile_position_history) > 2 and
+               self._projectile_position_history[1][0] <= floor):
+            self._projectile_position_history.pop(0)
+
+    def _advance_projectiles(self, now):
+        if self._projectiles is None:
+            return False
+        self._flush_pending_projectile_resolutions()
+        previous = self._projectile_target_positions
+        current = self._projectile_record_positions()
+        if (len(self._projectiles) or self._projectile_visual_meta or
+                self._projectile_is_authority()):
+            self._sample_projectile_positions(now, current)
+            self._prune_projectile_position_history()
+        if not self._projectile_is_authority():
+            self._projectile_target_positions = current
+            return False
+        self._projectile_previous_positions = previous
+        self._projectile_current_positions = current
+        self._projectile_frame_start = self._projectiles.now
+        self._projectile_frame_end = max(
+            self._projectile_frame_start, float(now))
+        active = len(self._projectiles)
+        chord_budget = max(
+            PROJECTILE_CHORDS_PER_FRAME,
+            min(PROJECTILE_MAX_CHORDS_PER_FRAME, active * 2))
+        advanced = self._projectiles.advance(
+            now, self._projectile_chord, self._projectile_terminal,
+            maximum_chords=chord_budget)
+        self._prune_projectile_position_history()
+        self._projectile_target_positions = current
+        if now >= self._next_projectile_progress_time:
+            self._next_projectile_progress_time = (
+                now + PROJECTILE_PROGRESS_SECONDS)
+            self._publish_projectile_progress()
+        return advanced
+
+    def _projectile_chord(self, state, start, end,
+                          absolute_start, absolute_end):
+        projectile_id = state.get('key')
+        meta = self._projectile_meta.get(projectile_id)
+        if meta is None:
+            return {'reason': 'callback_error', 'fraction': 0.0}
+        chord_length = math.sqrt(sum(
+            (float(end[index]) - float(start[index])) ** 2
+            for index in range(3)))
+        if chord_length <= 0.000001:
+            return None
+        direction_tuple = tuple(
+            (float(end[index]) - float(start[index])) / chord_length
+            for index in range(3))
+        direction = self._vector(direction_tuple)
+        source_key = '%s:%s' % (
+            meta['shooter_kind'], meta['shooter_id'])
+        nearest_key = None
+        nearest_collisions = None
+        nearest_fraction = 1.0
+        nearest_query = None
+        broadphase_sq = PROJECTILE_BROADPHASE_RADIUS ** 2
+        for key, record in tuple(self._records.items()):
+            if key == source_key or record.get('tombstone'):
+                continue
+            target = self._server_entity(record.get('engine_id'))
+            if (target is None or not getattr(target, 'isStarted', False) or
+                    not self._record_alive(record, target)):
+                continue
+            current_position = self._projectile_current_positions.get(key)
+            if current_position is None:
+                continue
+            target_at_start = self._projectile_historic_position(
+                key, absolute_start, current_position)
+            target_at_end = self._projectile_historic_position(
+                key, absolute_end, current_position)
+            adjusted_start = tuple(
+                float(start[index]) + float(current_position[index]) -
+                float(target_at_start[index]) for index in range(3))
+            adjusted_end = tuple(
+                float(end[index]) + float(current_position[index]) -
+                float(target_at_end[index]) for index in range(3))
+            if point_segment_distance_sq(
+                    current_position, adjusted_start,
+                    adjusted_end) > broadphase_sq:
+                continue
+            query_start = self._vector(adjusted_start)
+            query_end = self._vector(adjusted_end)
+            if record.get('local') and self._local_matrix is not None:
+                collisions = collide_vehicle_at_matrix(
+                    target, self._local_matrix, query_start, query_end,
+                    self._runtime.math)
+            else:
+                collisions = target.collideSegmentExt(
+                    query_start, query_end)
+            if not collisions:
+                continue
+            collisions = tuple(collisions)
+            nearest = min(collisions, key=lambda item: float(item.dist))
+            query_length = (query_end - query_start).length
+            if query_length <= 0.000001:
+                continue
+            fraction = max(
+                0.0, min(1.0, float(nearest.dist) / query_length))
+            if fraction < nearest_fraction:
+                nearest_key = key
+                nearest_collisions = collisions
+                nearest_fraction = fraction
+                nearest_query = (query_start, query_end)
+
+        scene_end_tuple = lerp3(start, end, nearest_fraction)
+        if self._projectile_destructible_context is not None:
+            raise RuntimeError('nested projectile destructible context')
+        self._projectile_destructible_context = projectile_id
+        try:
+            scene = self._resolve_shot_scene(
+                self._vector(start), self._vector(scene_end_tuple), direction,
+                self._projectile_shot(meta),
+                penetration_factor=meta.get('penetration_factor'),
+                initial_piercing_loss=meta.get('piercing_loss', 0.0),
+                distance_offset=state.get('distance', 0.0))
+        finally:
+            self._projectile_destructible_context = None
+        meta['piercing_loss'] = scene['piercing_loss']
+        meta['penetration_factor'] = scene.get(
+            'penetration_factor', meta.get('penetration_factor'))
+        world_distance = scene['world_distance']
+        cap_distance = chord_length * nearest_fraction
+        world_blocks = (
+            world_distance < 99999.0 and
+            (nearest_key is None or
+             bool(scene.get('stopped_by_destructible')) or
+             cap_distance >
+             world_distance + _SHOT_OCCLUSION_EPSILON))
+        if world_blocks:
+            fraction = max(
+                0.0, min(1.0, world_distance / chord_length))
+            self._projectile_terminal_data[projectile_id] = {
+                'impact': lerp3(start, end, fraction),
+                'target_key': None,
+                'collisions': None,
+                'query': None,
+                'piercing_loss': meta['piercing_loss'],
+                'penetration_factor': meta.get('penetration_factor'),
+            }
+            return {'reason': 'impact', 'fraction': fraction}
+        if nearest_key is not None:
+            self._projectile_terminal_data[projectile_id] = {
+                'impact': lerp3(start, end, nearest_fraction),
+                'target_key': nearest_key,
+                'collisions': nearest_collisions,
+                'query': nearest_query,
+                'piercing_loss': meta['piercing_loss'],
+                'penetration_factor': meta.get('penetration_factor'),
+            }
+            return {'reason': 'impact', 'fraction': nearest_fraction}
+        return None
+
+    def _projectile_shot(self, meta):
+        source = self._projectile_source_entity(meta)
+        descriptor = (getattr(source, 'typeDescriptor', None)
+                      if source is not None else None)
+        if descriptor is None:
+            descriptor = self._projectile_source_descriptor(meta)
+        if descriptor is None:
+            return {}
+        return self._descriptor_shot(
+            descriptor, meta.get('shell_index'))
+
+    def _projectile_source_descriptor(self, meta):
+        descriptor = meta.get('source_descriptor')
+        if descriptor is not None:
+            return descriptor
+        vehicle = meta.get('source_vehicle')
+        if not vehicle:
+            return None
+        try:
+            descriptor = self._resolve_descriptor(vehicle)
+        except Exception:
+            return None
+        meta['source_descriptor'] = descriptor
+        return descriptor
+
+    def _projectile_source_entity(self, meta):
+        key = '%s:%s' % (meta.get('shooter_kind'), meta.get('shooter_id'))
+        record = self._records.get(key)
+        if record is None:
+            return None
+        return self._server_entity(record.get('engine_id'))
+
+    def _projectile_effect(self, record, damage, result, impact,
+                           critical, hull_damage):
+        target_kind = record.get('kind')
+        if target_kind == 'human':
+            target_kind = 'player'
+        if target_kind not in ('player', 'bot'):
+            raise RuntimeError('projectile target kind is invalid')
+        effect = {
+            'target_kind': target_kind,
+            'target_id': int(record.get('network_id')),
+            'damage': max(0, int(damage or 0)),
+            'shot_result': max(0, min(2, int(result or 0))),
+            'x': float(impact[0]), 'y': float(impact[1]),
+            'z': float(impact[2]),
+        }
+        if isinstance(critical, dict):
+            effect['critical'] = critical
+            effect.update(self._critical_proposal_contract(
+                record, critical, hull_damage))
+        return effect
+
+    def _projectile_direct_effect(self, meta, state, terminal_data):
+        target_key = terminal_data.get('target_key')
+        record = self._records.get(target_key)
+        source = self._projectile_source_entity(meta)
+        source_descriptor = (getattr(source, 'typeDescriptor', None)
+                             if source is not None else None)
+        if source_descriptor is None:
+            source_descriptor = self._projectile_source_descriptor(meta)
+        if record is None or source_descriptor is None:
+            return None
+        target = self._server_entity(record.get('engine_id'))
+        collisions = terminal_data.get('collisions')
+        query = terminal_data.get('query')
+        if (target is None or not collisions or query is None or
+                not self._record_alive(record, target)):
+            return None
+        factor = terminal_data.get('penetration_factor')
+        damage, result = self._shell_damage(
+            source_descriptor, collisions, state.get('distance', 0.0),
+            shell_index=meta.get('shell_index'),
+            pierce_loss=terminal_data.get('piercing_loss', 0.0),
+            penetration_factor=factor)
+        hull_damage = damage
+        damage, critical = self._critical_hit(
+            target, source_descriptor, collisions,
+            query[0], query[1], damage, result,
+            int(getattr(source, 'id', meta.get('shooter_id', 0))),
+            meta.get('shell_index'))
+        return self._projectile_effect(
+            record, damage, result, terminal_data['impact'],
+            critical, hull_damage)
+
+    def _projectile_splash_effects(self, meta, impact, direct_key):
+        source = self._projectile_source_entity(meta)
+        source_descriptor = (getattr(source, 'typeDescriptor', None)
+                             if source is not None else None)
+        if source_descriptor is None:
+            source_descriptor = self._projectile_source_descriptor(meta)
+        if source_descriptor is None:
+            return []
+        shot = self._descriptor_shot(
+            source_descriptor, meta.get('shell_index'))
+        radius = combat_rules.he_radius(shot)
+        if radius <= 0.0:
+            return []
+        burst = self._vector(impact)
+        legacy_shell = combat_rules.legacy_shot(shot).get('shell') or {}
+        effects = []
+        for key, record in tuple(self._records.items()):
+            if key == direct_key or record.get('tombstone'):
+                continue
+            target = self._server_entity(record.get('engine_id'))
+            if (target is None or target.typeDescriptor is None or
+                    not getattr(target, 'isStarted', False) or
+                    not self._record_alive(record, target)):
+                continue
+            position = _xyz(getattr(
+                target, 'position', record.get('state', {})))
+            delta = tuple(position[index] - impact[index]
+                          for index in range(3))
+            distance = math.sqrt(sum(value * value for value in delta))
+            if distance > radius:
+                continue
+            aim = self._vector((
+                position[0], position[1] + 1.0, position[2]))
+            try:
+                collisions = tuple(
+                    target.collideSegmentExt(burst, aim) or ())
+                nominal = combat_rules.he_nominal_armor(
+                    collisions, target.typeDescriptor)
+            except Exception:
+                collisions = ()
+                nominal = combat_rules.he_hull_armor(
+                    target.typeDescriptor)
+            damage = combat_rules.he_splash_damage(
+                shot, nominal, distance / radius)
+            if damage <= 0:
+                continue
+            hull_damage = damage
+            damage, critical = critical_damage.propose_direct(
+                target, combat_rules.collision_layers(collisions),
+                burst, self._vector(position), damage, legacy_shell,
+                int(getattr(source, 'id', meta.get('shooter_id', 0))),
+                penetrated=False, by_explosion=True)
+            effects.append(self._projectile_effect(
+                record, damage, 2, impact, critical, hull_damage))
+            if len(effects) >= 30:
+                break
+        return effects
+
+    def _projectile_terminal(self, state, terminal):
+        projectile_id = state.get('key')
+        meta = self._projectile_meta.get(projectile_id)
+        if meta is None:
+            return False
+        data = self._projectile_terminal_data.pop(projectile_id, None)
+        reason = terminal.get('reason')
+        outcome = ('impact' if reason == 'impact' and data is not None else
+                   'miss' if reason == 'max_distance' else 'expired')
+        impact = tuple(state.get('position') or meta.get('origin'))
+        direct = None
+        splash = []
+        try:
+            if outcome == 'impact':
+                impact = tuple(data.get('impact', impact))
+                direct = self._projectile_direct_effect(meta, state, data)
+                if meta.get('is_he'):
+                    splash = self._projectile_splash_effects(
+                        meta, impact, data.get('target_key'))
+        except Exception:
+            # A malformed native collision/proposal cannot be allowed to
+            # damage a different target. Retire the ledger entry without
+            # effects so another authority never replays the same chord.
+            outcome = 'expired'
+            direct = None
+            splash = []
+        pending = {
+            'state': state, 'outcome': outcome, 'impact': impact,
+            'direct': direct, 'splash': splash,
+        }
+        meta['pending_resolution'] = pending
+        return self._submit_projectile_resolution(meta)
+
+    def _submit_projectile_resolution(self, meta):
+        pending = meta.get('pending_resolution')
+        if (pending is None or meta.get('progress_pending') is not None or
+                not self._projectile_is_authority()):
+            return False
+        state = pending['state']
+        elapsed_ms = max(
+            int(meta.get('base_checked_ms', 0)),
+            int(round(float(state.get('elapsed', 0.0)) * 1000.0)))
+        sender = getattr(self.client, 'send_projectile_resolve', None)
+        if not callable(sender):
+            return False
+        sent = sender(
+            self._projectile_epoch, meta['projectile_id'],
+            int(meta.get('base_checked_ms', 0)), pending['outcome'],
+            elapsed_ms,
+            (list(pending['impact'])
+             if pending['outcome'] == 'impact' else None),
+            pending['direct'],
+            pending['splash'],
+            checked_distance=float(state.get('distance', 0.0)),
+            piercing_loss=float(meta.get('piercing_loss', 0.0)),
+            penetration_factor=float(
+                meta.get('penetration_factor', 1.0)),
+            destructibles=[dict(value) for value in
+                           meta.get('destructibles_pending', ())])
+        if sent:
+            meta['destructibles_pending'] = []
+            meta['pending_resolution'] = None
+            meta['awaiting_resolution'] = True
+        return bool(sent)
+
+    def _flush_pending_projectile_resolutions(self):
+        if not self._projectile_is_authority():
+            return False
+        changed = False
+        for meta in tuple(self._projectile_meta.values()):
+            if meta.get('pending_resolution') is not None:
+                changed = self._submit_projectile_resolution(meta) or changed
+        return changed
+
+    def _publish_projectile_progress(self):
+        if not self._projectile_is_authority():
+            return False
+        sender = getattr(self.client, 'send_projectile_progress', None)
+        if not callable(sender):
+            return False
+        cursors = []
+        active_ids = set()
+        for state in self._projectiles.snapshot():
+            meta = self._projectile_meta.get(state.get('key'))
+            if meta is None:
+                continue
+            active_ids.add(meta['projectile_id'])
+            pending = meta.get('progress_pending')
+            if pending is not None:
+                cursors.append(dict(pending))
+                continue
+            base_checked = int(meta.get('base_checked_ms', 0))
+            checked = max(
+                base_checked,
+                int(round(float(state.get('elapsed', 0.0)) * 1000.0)))
+            cursors.append({
+                'projectile_id': meta['projectile_id'],
+                'base_checked_ms': base_checked,
+                'checked_through_ms': min(
+                    meta['max_time_ms'], checked),
+                'checked_distance': float(state.get('distance', 0.0)),
+                'piercing_loss': float(meta.get('piercing_loss', 0.0)),
+                'penetration_factor': float(
+                    meta.get('penetration_factor', 1.0)),
+                'destructibles': [dict(value) for value in
+                                  meta.get('destructibles_pending', ())],
+            })
+        # A projectile can reach its terminal while its preceding cursor is
+        # still awaiting a canonical snapshot acknowledgement. Keep retrying
+        # that exact CAS proposal even though the trajectory manager has
+        # retired the projectile; resolution is submitted only after the
+        # server echoes this base.
+        for projectile_id, meta in tuple(self._projectile_meta.items()):
+            pending = meta.get('progress_pending')
+            if pending is not None and projectile_id not in active_ids:
+                cursors.append(dict(pending))
+        sent = False
+        for index in range(0, len(cursors), 30):
+            batch = cursors[index:index + 30]
+            accepted = bool(sender(self._projectile_epoch, batch))
+            if accepted:
+                for cursor in batch:
+                    meta = self._projectile_meta.get(
+                        cursor['projectile_id'])
+                    if meta is None:
+                        continue
+                    if meta.get('progress_pending') is None:
+                        meta['progress_pending'] = dict(cursor)
+                        meta['destructibles_pending'] = []
+            sent = accepted or sent
+        return sent
+
+    def _authority_players(self):
+        """Give local bot authority only real human world poses.
+
+        A newly joined server player carries a formation placeholder until
+        its first client pose reaches the server.  The authority already owns
+        this client's render-frame pose, so replace its stale snapshot entry;
+        omit other humans until their explicit ``world_pose`` sample arrives.
+        """
+        snapshot_players = (
+            (self._last_snapshot or {}).get('players', ()) or ())
+        if self.client is None:
+            return list(snapshot_players)
+        local_id = int(self.client.player_id)
+        players = []
+        local_found = False
+        for raw in snapshot_players:
+            if not isinstance(raw, dict) or raw.get('id') is None:
+                continue
+            state = dict(raw)
+            if int(state['id']) != local_id:
+                if not bool(state.get('world_pose', False)):
+                    continue
+                players.append(state)
+                continue
+            local_found = True
+            players.append(self._live_local_player_state(state))
+        if not local_found:
+            players.append(self._live_local_player_state(
+                self._local_state()))
+        return players
+
+    def _live_local_player_state(self, state):
+        """Overlay the copied local integrator on one protocol player row."""
+        result = dict(state or {})
+        position, yaw = self.local_pose()
+        result.update({
+            'id': int(self.client.player_id),
+            'x': float(position[0]), 'y': float(position[1]),
+            'z': float(position[2]), 'yaw': float(yaw),
+            'speed': float(self._local_speed), 'world_pose': True,
+        })
+        health = self.local_health()
+        if health is not None:
+            result['health'] = int(health)
+            result['alive'] = health > 0
+        if self._sender is not None:
+            result['aim_yaw'] = float(self._sender.aim_yaw)
+            result['gun_pitch'] = float(self._sender.gun_pitch)
+        return result
 
     def _frame(self):
         if self.state != 'running':
             return
+        diagnostics = self._frame_diagnostics
+        profiling = diagnostics is not None and diagnostics.enabled
+        entry_wall = _PROFILE_CLOCK() if profiling else 0.0
         now = self._clock()
-        dt = max(0.0, min(now - self._last_frame_time, 0.1))
+        raw_dt = (0.0 if self._last_frame_time is None else
+                  now - self._last_frame_time)
+        dt = max(0.0, min(raw_dt, 0.1))
+        tick_dt = dt
         self._last_frame_time = now
+        # Direction probes may recast through proved soft OBBs, but those
+        # native queries share one hard frame budget across all 29 Bots.
+        self._soft_static_recast_budget[0] = BOT_SOFT_RECAST_BUDGET
+        frame_id = (diagnostics.begin(entry_wall, raw_dt)
+                    if profiling else 0)
+        stages = {}
+        probes = dict((name, 0) for name in PROBE_KINDS)
+        probe_durations = dict((name, 0.0) for name in PROBE_KINDS)
+        pose_before = tuple(self._local_position)
+        transitioned = False
+        outgoing_messages = ()
+        bot_count = 0
+        boundary = entry_wall
         try:
             self._flush_pending_bot_create(now)
             self._flush_pending_entities(now)
             self._drain_event_journal()
             self._maybe_send_battle_ready()
+            if profiling:
+                next_boundary = _PROFILE_CLOCK()
+                stages['house'] = max(0.0, next_boundary - boundary)
+                boundary = next_boundary
             if self._sync is not None:
                 self._sync.advance(now)
+            if profiling:
+                next_boundary = _PROFILE_CLOCK()
+                stages['sync'] = max(0.0, next_boundary - boundary)
+                boundary = next_boundary
             self._tick_critical_states(dt)
+            if profiling:
+                next_boundary = _PROFILE_CLOCK()
+                stages['critical'] = max(0.0, next_boundary - boundary)
+                boundary = next_boundary
             if self._battle_live:
                 self._tick_drowning(dt, now)
+            if profiling:
+                next_boundary = _PROFILE_CLOCK()
+                stages['drown'] = max(0.0, next_boundary - boundary)
+                boundary = next_boundary
             if (not self._battle_live and
                     self._prebattle_deadline is not None and
                     now >= self._prebattle_deadline):
                 self._begin_battle()
                 dt = 0.0
+                transitioned = True
+            if profiling:
+                next_boundary = _PROFILE_CLOCK()
+                stages['transition'] = max(0.0, next_boundary - boundary)
+                boundary = next_boundary
             if self._battle_live:
                 self._drive_local(dt)
+            if profiling:
+                next_boundary = _PROFILE_CLOCK()
+                stages['local'] = max(0.0, next_boundary - boundary)
+                boundary = next_boundary
+            if self._battle_live:
                 self._update_target_outline(now)
+            if profiling:
+                next_boundary = _PROFILE_CLOCK()
+                stages['outline'] = max(0.0, next_boundary - boundary)
+                boundary = next_boundary
             if self._battle_live and self._bots is not None:
-                players = (self._last_snapshot or {}).get('players', [])
+                self._advance_artillery_arcs(now)
+                players = self._authority_players()
+                probe_totals = getattr(self._bots, 'probe_totals', None)
+                probe_duration_totals = getattr(
+                    self._bots, 'probe_duration_totals', None)
+                before_probes = None
+                before_probe_durations = None
+                if profiling and callable(probe_totals):
+                    try:
+                        before_probes = probe_totals()
+                    except Exception:
+                        before_probes = None
+                if profiling and callable(probe_duration_totals):
+                    try:
+                        before_probe_durations = probe_duration_totals()
+                    except Exception:
+                        before_probe_durations = None
                 outgoing_messages = self._bots.update(
                     dt, now, players=players)
+                after_probes = None
+                after_probe_durations = None
+                if profiling and callable(probe_totals):
+                    try:
+                        after_probes = probe_totals()
+                    except Exception:
+                        after_probes = None
+                if profiling and callable(probe_duration_totals):
+                    try:
+                        after_probe_durations = probe_duration_totals()
+                    except Exception:
+                        after_probe_durations = None
+                if (isinstance(before_probes, (list, tuple)) and
+                        isinstance(after_probes, (list, tuple)) and
+                        len(before_probes) == len(PROBE_KINDS) and
+                        len(after_probes) == len(PROBE_KINDS)):
+                    try:
+                        for index, name in enumerate(PROBE_KINDS):
+                            probes[name] = max(
+                                0, int(after_probes[index]) -
+                                int(before_probes[index]))
+                    except (TypeError, ValueError, OverflowError):
+                        probes = dict((name, 0) for name in PROBE_KINDS)
+                if (isinstance(before_probe_durations, (list, tuple)) and
+                        isinstance(after_probe_durations, (list, tuple)) and
+                        len(before_probe_durations) == len(PROBE_KINDS) and
+                        len(after_probe_durations) == len(PROBE_KINDS)):
+                    try:
+                        for index, name in enumerate(PROBE_KINDS):
+                            probe_durations[name] = max(
+                                0.0, float(after_probe_durations[index]) -
+                                float(before_probe_durations[index]))
+                    except (TypeError, ValueError, OverflowError):
+                        probe_durations = dict(
+                            (name, 0.0) for name in PROBE_KINDS)
+            if profiling:
+                next_boundary = _PROFILE_CLOCK()
+                stages['bots_update'] = max(0.0, next_boundary - boundary)
+                boundary = next_boundary
+            if self._battle_live and self._bots is not None:
                 presentation_states = getattr(
                     self._bots, 'presentation_states', None)
                 if not callable(presentation_states):
@@ -3735,13 +5682,32 @@ class BattleRuntime(object):
                 # the native filters to that message recreates visible steps
                 # and also tempts transport code to drop strict combat_seq
                 # proposals after they have already been formed.
-                self._apply_authority_bot_poses(presentation_states())
+                states = presentation_states()
+                bot_count = len(states)
+                self._apply_authority_bot_poses(states)
+            if profiling:
+                next_boundary = _PROFILE_CLOCK()
+                stages['bot_present'] = max(0.0, next_boundary - boundary)
+                boundary = next_boundary
+            if self._battle_live and self._bots is not None:
                 for outgoing in outgoing_messages:
-                    self._observe_local_vehicle(outgoing, now)
-                    self._send_bot_message(outgoing)
-                    self._resolve_bot_fire(outgoing)
+                    if self._send_bot_message(outgoing):
+                        self._resolve_bot_fire(outgoing)
+            if (self._battle_live and
+                    (self._projectile_is_authority() or
+                     self._projectile_visual_meta)):
+                self._advance_projectiles(now)
+            if profiling:
+                next_boundary = _PROFILE_CLOCK()
+                stages['bot_events'] = max(0.0, next_boundary - boundary)
+                boundary = next_boundary
             if self._battle_live:
                 self._update_spotting(now)
+            if profiling:
+                next_boundary = _PROFILE_CLOCK()
+                stages['spot'] = max(0.0, next_boundary - boundary)
+                boundary = next_boundary
+            if self._battle_live:
                 validate_lock = getattr(
                     self._runtime.compatibility,
                     'validate_target_lock', None)
@@ -3749,10 +5715,46 @@ class BattleRuntime(object):
                     raise RuntimeError(
                         '#1513 target-lock lifecycle boundary is unavailable')
                 validate_lock(self._avatar)
+            if profiling:
+                next_boundary = _PROFILE_CLOCK()
+                stages['lock'] = max(0.0, next_boundary - boundary)
+                boundary = next_boundary
         except Exception as error:
             self._fail(error)
             return
+        schedule_start = _PROFILE_CLOCK() if profiling else 0.0
         self._schedule(FRAME_SECONDS, self._frame)
+        if profiling:
+            schedule_end = _PROFILE_CLOCK()
+            stages['schedule'] = max(0.0, schedule_end - schedule_start)
+            camera_velocity = _xyz(self._local_camera_velocity)
+            camera_speed = math.sqrt(
+                camera_velocity[0] * camera_velocity[0] +
+                camera_velocity[1] * camera_velocity[1] +
+                camera_velocity[2] * camera_velocity[2])
+            pose_step = _distance_2d(pose_before, self._local_position)
+            authority = False
+            is_authority = getattr(self._bots, 'is_authority', None)
+            if callable(is_authority):
+                try:
+                    authority = bool(is_authority())
+                except Exception:
+                    authority = False
+            diagnostics.finish(
+                frame_id, entry_wall, tick_dt, dt, stages, probes, {
+                    'round': (self._start_message or {}).get('round_id', '-'),
+                    'map': (self._config or {}).get('map', '-'),
+                    'phase': 'live' if self._battle_live else 'prebattle',
+                    'role': 'authority' if authority else 'guest',
+                    'bot_count': bot_count,
+                    'outgoing_count': len(outgoing_messages),
+                    'pose_step': pose_step,
+                    'speed': float(self._local_speed),
+                    'camera_speed': camera_speed,
+                    'airborne': bool(self._local_airborne),
+                    'grind': int(self._local_grind),
+                    'transitioned': transitioned,
+                }, probe_durations=probe_durations)
 
     def _mutable_shot_ray(self):
         """Copy #1513's native gun ray before normalising or scattering it."""
@@ -3833,8 +5835,12 @@ class BattleRuntime(object):
         user's server-aim setting is enabled, but a real cell normally feeds
         that marker through ``VehicleGunRotator.setShotPosition``.  The local
         cell has no independent simulation, so echo the trusted native ray and
-        angle instead of leaving the second marker at its initial size.
+        angle instead of leaving the second marker at its initial size.  Keep
+        PREBATTLE on the stock frozen boundary and begin this echo only after
+        the native BATTLE transition starts the rotator.
         """
+        if not self._battle_live:
+            return False
         gun_rotator = getattr(self._avatar, 'gunRotator', None)
         if (gun_rotator is None or
                 not bool(getattr(gun_rotator, 'showServerMarker', False))):
@@ -4101,13 +6107,157 @@ class BattleRuntime(object):
         self._local_last_pitch = pitch
         return pitch
 
-    def _motion_is_clear(self, entity, position, yaw, speed, dt):
+    def _motion_is_clear(self, entity, position, yaw, speed, dt,
+                         allow_crush_drive=False):
         """Thin tuple-to-Vector adapter around the copied 0.8.2 probe."""
-        blocked = world_collision.check_horizontal_collision(
+        self._local_motion_soft_block = False
+        self._local_motion_cap_crushed = False
+        kinetic_speed = None
+        if allow_crush_drive and not self._local_airborne:
+            params = self._local_physics or vehicle_physics.derive_params(
+                entity.typeDescriptor)
+            limit_name = 'speedBwd' if speed < 0.0 else 'speedFwd'
+            kinetic_speed = (-float(params[limit_name]) if speed < 0.0 else
+                             float(params[limit_name]))
+        world_status = world_collision.check_horizontal_collision(
             self._runtime.bigworld, self._runtime.math,
             self._avatar.spaceID, self._vector(position), yaw, speed,
-            entity.typeDescriptor, self._local_airborne, dt)
-        return not blocked
+            entity.typeDescriptor, self._local_airborne, dt, True,
+            bool(kinetic_speed is not None), kinetic_speed)
+        if isinstance(world_status, bool):
+            world_status = 'hard' if world_status else 'clear'
+        if world_status == 'hard':
+            if (self._destructibles is not None and
+                    self._destructibles._catalog_pending_at_hull(
+                        self._vector(position), yaw, speed,
+                        entity.typeDescriptor, self._clock(), dt)):
+                self._local_motion_soft_block = True
+            return False
+        if self._destructibles is None:
+            return world_status == 'clear'
+        detail = self._destructibles._catalog_motion_blocked(
+            self._avatar.spaceID, self._vector(position), yaw,
+            speed, entity.typeDescriptor, self._clock(),
+            dt=dt, kinetic_speed=kinetic_speed,
+            return_detail=True,
+            kinetic_commit=bool(kinetic_speed is not None))
+        # Keep injected legacy test/adaptor seams fail-closed.  Production's
+        # exact #1513 sensor always returns the typed receipt above.
+        if isinstance(detail, bool):
+            detail = {'status': 'hard' if detail else 'clear'}
+        elif isinstance(detail, str):
+            detail = {'status': detail}
+        if not isinstance(detail, dict):
+            raise RuntimeError(
+                'local motion resolver detail is unavailable')
+        status = detail.get('status')
+        if status not in ('clear', 'crushed', 'soft', 'hard', 'approach'):
+            raise RuntimeError(
+                'local motion resolver returned an invalid status')
+        if status == 'hard':
+            return False
+        used_kinetic_speed = bool(detail.get('used_kinetic_speed', False))
+        accepted_now = bool(detail.get('accepted_now', False))
+        if used_kinetic_speed and not (
+                accepted_now and status == 'crushed' and
+                detail.get('token')):
+            raise RuntimeError(
+                'local cap-crush receipt is inconsistent')
+        if accepted_now and status in ('clear', 'approach', 'soft'):
+            raise RuntimeError(
+                'local contact receipt is inconsistent')
+        if status == 'approach':
+            status = 'clear'
+        if accepted_now and used_kinetic_speed:
+            self._local_motion_cap_crushed = True
+            return False
+        if status == 'soft':
+            self._local_motion_soft_block = True
+        return status in ('clear', 'crushed')
+
+    def _resolve_bot_motion(self, bot_id, position, yaw, speed,
+                            descriptor, dt, now):
+        """Commit-side Bot contact: static world first, then exact catalog."""
+        pos = self._vector(position)
+        bot_state = getattr(self._bots, 'states', {}).get(int(bot_id), {})
+        airborne = bool(bot_state.get('airborne', False))
+        movement_dir = int(_number(bot_state.get('movement_dir')))
+        rotation_dir = int(_number(bot_state.get('rotation_dir')))
+        turn_speed = _number(getattr(
+            self._bots, '_turn_speeds', {}).get(int(bot_id), 0.0))
+        # The staggered planner may reuse a typed, read-only proof only when
+        # the current exact hull sweep is still contained by its 3x3 rays.
+        # A generic path-clear answer is not sufficient: its lane geometry is
+        # deliberately wider and can miss a narrow pillar at the real hull edge.
+        receipt_reusable = getattr(
+            self._bots, 'motion_world_receipt_reusable', None)
+        travel_yaw = (float(yaw) if speed >= 0.0 else
+                      float(yaw) + math.pi)
+        if (self._destructibles is not None and not airborne and
+                movement_dir * float(speed) > 0.0 and rotation_dir == 0 and
+                abs(turn_speed) <= 0.01 and callable(receipt_reusable) and
+                receipt_reusable(
+                    bot_id, position, travel_yaw, speed, now, dt) and
+                not self._destructibles._catalog_hull_contact(
+                    pos, yaw, speed, descriptor, dt)):
+            return 'clear'
+        allow_crush_drive = (
+            not airborne and
+            movement_dir * float(speed) > 0.0)
+        kinetic_speed = None
+        if allow_crush_drive:
+            params = vehicle_physics.derive_params(descriptor)
+            limit_name = 'speedBwd' if speed < 0.0 else 'speedFwd'
+            kinetic_speed = (-float(params[limit_name]) if speed < 0.0 else
+                             float(params[limit_name]))
+        world_status = world_collision.check_horizontal_collision(
+            self._runtime.bigworld, self._runtime.math,
+            self._avatar.spaceID, pos, yaw, speed, descriptor, airborne, dt,
+            True, allow_crush_drive, kinetic_speed)
+        if isinstance(world_status, bool):
+            world_status = 'hard' if world_status else 'clear'
+        if world_status == 'hard':
+            if (self._destructibles is not None and
+                    self._destructibles._catalog_pending_at_hull(
+                        pos, yaw, speed, descriptor, now, dt)):
+                return 'soft'
+            return 'hard'
+        if self._destructibles is None:
+            return 'clear' if world_status == 'clear' else 'hard'
+        if airborne:
+            return 'clear' if world_status == 'clear' else 'hard'
+        # A native kinetic result is only a forward candidate.  Always hand it
+        # to the catalog's exact contact seam; its ``approach`` result keeps a
+        # nearby but non-contact prop clear without granting a destroy.
+        detail = self._destructibles._catalog_motion_blocked(
+            self._avatar.spaceID, pos, yaw, speed, descriptor, now,
+            dt=dt, kinetic_speed=kinetic_speed, return_detail=True,
+            kinetic_commit=allow_crush_drive)
+        if isinstance(detail, bool):
+            detail = {'status': 'hard' if detail else 'clear'}
+        elif isinstance(detail, str):
+            detail = {'status': detail}
+        if not isinstance(detail, dict):
+            raise RuntimeError('bot motion resolver detail is unavailable')
+        status = detail.get('status')
+        if status not in ('clear', 'crushed', 'soft', 'hard', 'approach'):
+            raise RuntimeError(
+                'bot motion resolver returned an invalid status')
+        if status == 'hard':
+            return 'hard'
+        used_kinetic_speed = bool(detail.get('used_kinetic_speed', False))
+        accepted_now = bool(detail.get('accepted_now', False))
+        if used_kinetic_speed and not (
+                accepted_now and status == 'crushed' and
+                detail.get('token')):
+            raise RuntimeError('bot cap-crush receipt is inconsistent')
+        if accepted_now and status in ('clear', 'approach', 'soft'):
+            raise RuntimeError('bot contact receipt is inconsistent')
+        if status == 'approach':
+            return 'clear'
+        if accepted_now and used_kinetic_speed:
+            return 'cap_crushed'
+        return status
 
     @staticmethod
     def _collision_shape(descriptor):
@@ -4267,7 +6417,8 @@ class BattleRuntime(object):
         return self._apply_fall_damage(entity, impact_speed)
 
     def _update_vertical_motion(self, entity, position, yaw, dt):
-        """Copy the 0.8.2 spawn snap, ledge fall and landing boundary."""
+        """Copy vertical motion while rejecting false raised support."""
+        self._local_support_rise_blocked = False
         highest, centre = self._terrain_support(
             position, yaw, entity.typeDescriptor)
         ground = centre if centre is not None else highest
@@ -4282,6 +6433,20 @@ class BattleRuntime(object):
                 self._local_vertical_speed = 0.0
                 self._local_airborne = False
                 self._local_fall_armed = True
+            elif tank_collision.support_rise_is_obstacle(
+                    position[1], centre, max_climb):
+                # Horizontal integration put the hull partly inside a wagon,
+                # roof, or large prop and the centre ray hit its top. Treat the
+                # rise as the hard obstacle it is; never lift the chassis onto
+                # that surface. The caller applies the existing hard-wall
+                # speed response after restoring this tick's starting pose.
+                tick_pose = getattr(self, '_local_support_tick_pose', None)
+                if tick_pose is not None:
+                    position = tuple(tick_pose)
+                self._local_vertical_speed = 0.0
+                self._local_airborne = False
+                self._local_support_rise_blocked = True
+                return position
             elif (position[1] <= ground or
                   (com_gap <= snap_gap and not self._local_airborne)):
                 if self._local_airborne and self._local_vertical_speed < 0.0:
@@ -4334,15 +6499,21 @@ class BattleRuntime(object):
             self._local_airborne = False
         return position
 
-    def _apply_slope_slide(self, position, yaw, dt):
+    def _apply_slope_slide(self, position, yaw, dt, entity=None):
         """Copy 0.8.2 cross-heading slope slip and airborne carry."""
         if self._local_airborne:
             self._local_slide_speed = 0.0
             lateral_x, lateral_z = self._local_air_lateral
             if abs(lateral_x) > 0.0001 or abs(lateral_z) > 0.0001:
-                position = (
+                next_position = (
                     position[0] + lateral_x * dt, position[1],
                     position[2] + lateral_z * dt)
+                lateral_speed = math.sqrt(
+                    lateral_x * lateral_x + lateral_z * lateral_z)
+                lateral_yaw = math.atan2(lateral_x, lateral_z)
+                if (entity is None or self._motion_is_clear(
+                        entity, position, lateral_yaw, lateral_speed, dt)):
+                    position = next_position
                 self._local_air_lateral = (
                     lateral_x * 0.995, lateral_z * 0.995)
             return position
@@ -4363,6 +6534,14 @@ class BattleRuntime(object):
         ground = self._ground_y(next_x, next_z, position[1])
         if ground is None or position[1] - ground >= 4.0:
             return position
+        lateral_speed = abs(slide_dot) * self._local_slide_speed
+        lateral_yaw = math.atan2(slide_x, slide_z)
+        if (entity is not None and not self._motion_is_clear(
+                entity, position, lateral_yaw, lateral_speed, dt)):
+            if not self._local_motion_soft_block:
+                self._local_slide_speed = 0.0
+                self._local_air_lateral = (0.0, 0.0)
+            return position
         delta_y = max(-0.35, min(0.35, ground - position[1]))
         self._local_vertical_speed = 0.0
         self._local_airborne = False
@@ -4382,6 +6561,7 @@ class BattleRuntime(object):
                      not bool(getattr(entity, 'isCrewActive', True)))) or
                    self._drown_level == 2)
         if stopped:
+            dt = max(0.0, min(float(dt), 0.1))
             self._local_speed = 0.0
             self._local_turn_speed = 0.0
             self._sender.forward = 0.0
@@ -4390,6 +6570,9 @@ class BattleRuntime(object):
             stop_input = getattr(vehicle_filter, 'notifyInputKeysDown', None)
             if callable(stop_input):
                 stop_input(0, 0)
+            if (self._local_matrix is not None and
+                    self._local_model is not None):
+                self._update_local_presentation(entity, dt)
             if self._local_damage_report is not None or self._drown_level == 2:
                 self._sender.send_current()
             return
@@ -4398,6 +6581,7 @@ class BattleRuntime(object):
             raise RuntimeError('player physics was not initialized')
         dt = max(0.0, min(float(dt), 0.1))
         position = self._local_position
+        tick_pose = position
         yaw = self._local_yaw
         slope_pitch = (0.0 if self._local_airborne else
                        self._smoothed_drive_pitch(position, yaw))
@@ -4413,6 +6597,7 @@ class BattleRuntime(object):
         # grip-limited path as the handbrake.  A dead engine only removes drive
         # torque, so existing momentum continues to coast.
         handbrake = bool(self._sender.handbrake) or is_tracked
+        previous_speed = self._local_speed
         self._local_speed = vehicle_physics.longitudinal_step(
             self._local_physics, self._local_speed,
             throttle, turn != 0.0,
@@ -4425,38 +6610,54 @@ class BattleRuntime(object):
                     self._avatar.spaceID, self._vector(position), yaw,
                     self._local_speed, entity.typeDescriptor)
             if self._motion_is_clear(
-                    entity, position, yaw, self._local_speed, dt):
+                    entity, position, yaw, self._local_speed, dt,
+                    allow_crush_drive=(throttle * self._local_speed > 0.0 and
+                                       not handbrake)):
                 position = (
                     position[0] + math.sin(yaw) * self._local_speed * dt,
                     position[1],
                     position[2] + math.cos(yaw) * self._local_speed * dt)
                 self._local_grind = max(0, self._local_grind - 1)
             elif not self._local_airborne:
-                deflected = False
-                for delta_yaw in (0.55, -0.55, 1.0, -1.0):
-                    slide_yaw = yaw + delta_yaw
-                    if self._motion_is_clear(
-                            entity, position, slide_yaw,
-                            self._local_speed, dt):
-                        if self._local_grind <= 0:
-                            self._local_speed *= 0.6
-                        slide_speed = self._local_speed * (
-                            0.85 ** (dt * 60.0))
-                        position = (
-                            position[0] + math.sin(slide_yaw) *
-                            slide_speed * dt,
-                            position[1],
-                            position[2] + math.cos(slide_yaw) *
-                            slide_speed * dt)
-                        self._local_speed = slide_speed
+                if self._local_motion_cap_crushed:
+                    # The speed cap only proves that this vehicle may crush the
+                    # exact item.  It is never copied vehicle momentum.  Keep
+                    # this tick outside the accepted native skin and restore
+                    # the real speed from before the longitudinal integration.
+                    self._local_speed = previous_speed
+                    self._local_grind = 1
+                elif self._local_motion_soft_block:
+                    # #1513 hides fragile/module geometry asynchronously.  Keep
+                    # the pose outside its still-native skin, but retain impact
+                    # momentum; the next clear tick advances normally and a
+                    # newly exposed backing wall still uses the hard response.
+                    self._local_grind = 1
+                else:
+                    deflected = False
+                    for delta_yaw in (0.55, -0.55, 1.0, -1.0):
+                        slide_yaw = yaw + delta_yaw
+                        if self._motion_is_clear(
+                                entity, position, slide_yaw,
+                                self._local_speed, dt):
+                            if self._local_grind <= 0:
+                                self._local_speed *= 0.6
+                            slide_speed = self._local_speed * (
+                                0.85 ** (dt * 60.0))
+                            position = (
+                                position[0] + math.sin(slide_yaw) *
+                                slide_speed * dt,
+                                position[1],
+                                position[2] + math.cos(slide_yaw) *
+                                slide_speed * dt)
+                            self._local_speed = slide_speed
+                            self._local_grind = 4
+                            deflected = True
+                            break
+                    if not deflected:
+                        self._local_speed *= 0.35 ** (dt * 60.0)
+                        if abs(self._local_speed) < 0.05:
+                            self._local_speed = 0.0
                         self._local_grind = 4
-                        deflected = True
-                        break
-                if not deflected:
-                    self._local_speed *= 0.35 ** (dt * 60.0)
-                    if abs(self._local_speed) < 0.05:
-                        self._local_speed = 0.0
-                    self._local_grind = 4
 
         if is_tracked or is_engine_dead:
             turn = 0.0
@@ -4472,13 +6673,25 @@ class BattleRuntime(object):
             yaw -= 2.0 * math.pi
         while yaw < -math.pi:
             yaw += 2.0 * math.pi
-        position = self._update_vertical_motion(entity, position, yaw, dt)
+        self._local_support_rise_blocked = False
+        self._local_support_tick_pose = tick_pose
+        try:
+            position = self._update_vertical_motion(
+                entity, position, yaw, dt)
+        finally:
+            self._local_support_tick_pose = None
+        support_blocked = self._local_support_rise_blocked
+        if support_blocked:
+            self._local_speed *= 0.35 ** (dt * 60.0)
+            if abs(self._local_speed) < 0.05:
+                self._local_speed = 0.0
+            self._local_grind = 4
         self._ground_pitch(position, yaw, entity.typeDescriptor)
-        position = self._apply_slope_slide(position, yaw, dt)
+        position = self._apply_slope_slide(position, yaw, dt, entity)
         position = self._resolve_local_tank_contacts(
             entity, position, yaw, dt)
         self._local_position, self._local_yaw = position, yaw
-        presentation_position = self._update_local_presentation(entity)
+        presentation_position = self._update_local_presentation(entity, dt)
         self._avatar.updateOwnVehiclePosition(
             presentation_position,
             self._vector(_engine_rotation(yaw)),
@@ -4486,25 +6699,29 @@ class BattleRuntime(object):
         self._publish_rpm(self._clock())
         self._input_accumulator += dt
         if self._input_accumulator >= NETWORK_INPUT_SECONDS:
-            self._input_accumulator = 0.0
+            # Preserve the nominal 30 Hz phase at render rates that are not a
+            # multiple of 30.  Do not burst stale samples after a slow frame.
+            self._input_accumulator %= NETWORK_INPUT_SECONDS
             self._sender.send_current()
 
     def _bot_destructible_scan_due(self, state, now):
         """Rate-limit proximity enumeration without skipping hull travel."""
         bot_id = int(state['id'])
-        if abs(_number(state.get('speed'))) < 1.0:
-            self._bot_destructible_samples.pop(bot_id, None)
-            return False
         position = (_number(state.get('x')), _number(state.get('y')),
                     _number(state.get('z')))
         previous = self._bot_destructible_samples.get(bot_id)
         if previous is not None:
             deadline, sampled_position = previous
+            # A stopped Bot may be waiting for a blank native slot/catalog OBB
+            # to stream.  Keep a low-frequency phase even without hull travel;
+            # registration is read-only for type1/type2 catalog objects.
             if (float(now) < float(deadline) and
                     _distance_2d(position, sampled_position) <
                     BOT_DESTRUCTIBLE_TRAVEL_METRES):
                 return False
-            deadline = float(now) + BOT_DESTRUCTIBLE_SECONDS
+            interval = (0.50 if abs(_number(state.get('speed'))) < 1.0
+                        else BOT_DESTRUCTIBLE_SECONDS)
+            deadline = float(now) + interval
         else:
             # Schedule the first enumeration instead of making all 29 bots
             # scan on the materialisation frame.  The 6 m forward sensor and
@@ -4553,7 +6770,7 @@ class BattleRuntime(object):
             applied = True
         return applied
 
-    def _bot_visibility(self, source, target):
+    def _bot_visibility(self, source, target, fired_recently=False):
         source_position = _xyz(source)
         target_position = target.get('position') or _xyz(target)
         start = self._vector((source_position[0], source_position[1] + 2.0,
@@ -4562,12 +6779,30 @@ class BattleRuntime(object):
                             target_position[2]))
         hit = self._runtime.bigworld.wg_collideSegment(
             self._avatar.spaceID, start, end, 128)
-        if hit is None:
-            return True
-        return (hit[0] - start).length + 1.5 >= (end - start).length
+        line_of_sight = bool(
+            hit is None or
+            (hit[0] - start).length + 1.5 >= (end - start).length)
+        foliage_bonus = 0.0
+        if line_of_sight and self._foliage is not None:
+            foliage_bonus = self._foliage.camouflage_bonus(
+                source_position, target_position, fired_recently)
+        return {
+            'line_of_sight': line_of_sight,
+            'foliage_bonus': foliage_bonus,
+        }
 
     def _bot_firing_lane(self, source, target):
         """Probe static space between, rather than inside, two vehicle hulls."""
+        profile = source.get('profile')
+        profile = profile if isinstance(profile, dict) else {}
+        if str(profile.get('class_tag') or '') == 'SPG':
+            if self._artillery is None or self._bots is None:
+                return False
+            descriptor = self._bots._descriptors.get(int(source.get('id')))
+            shell_index = max(0, int(source.get('shell_index', 0) or 0))
+            ready, solution = self._artillery.request(
+                source, target, descriptor, shell_index, self._clock())
+            return bool(ready and solution is not None)
         source_position = _xyz(source)
         target_position = target.get('position') or _xyz(target)
         dx = target_position[0] - source_position[0]
@@ -4592,6 +6827,69 @@ class BattleRuntime(object):
             if hit is None:
                 return True
         return False
+
+    def _bot_ballistic_solution(self, source, target, descriptor,
+                                shell_index, now):
+        """Return only a completed SPG arc; pending/blocked stays unshootable."""
+        if self._artillery is None or target is None:
+            return None
+        return self._artillery.solution(
+            source, target, descriptor, shell_index, now)
+
+    def _bot_artillery_launch(
+            self, source, target, descriptor, shell_index, fire_seq,
+            shot_yaw, shot_pitch, flight_time, now):
+        """Prove the exact dispersed SPG path from the live muzzle node."""
+        if (self._artillery is None or not isinstance(source, dict) or
+                not isinstance(target, dict)):
+            return None
+        try:
+            bot_id = int(source.get('id'))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        record = self._records.get('bot:%s' % bot_id)
+        if record is None:
+            return None
+        entity = self._server_entity(record.get('engine_id'))
+        if (entity is None or not getattr(entity, 'isStarted', False) or
+                getattr(entity, 'typeDescriptor', None) is None):
+            return None
+        try:
+            gun_node = entity.model.node('HP_gunFire')
+            origin = _xyz(self._runtime.math.Matrix(gun_node).translation)
+        except Exception:
+            # A logical pose is not a muzzle proof.  SPGs wait until the
+            # native model exposes the exact launch transform.
+            return None
+        ready, receipt = self._artillery.request_launch(
+            source, target, descriptor, int(shell_index), int(fire_seq),
+            origin, float(shot_yaw), float(shot_pitch),
+            float(flight_time), float(now))
+        return receipt if ready and isinstance(receipt, dict) else None
+
+    def _bot_artillery_cancel(self, source):
+        """Discard bounded arc work for a cancelled frozen SPG intent."""
+        if self._artillery is None or not isinstance(source, dict):
+            return False
+        return bool(self._artillery.cancel_launch(source))
+
+    def _artillery_arc_probe(self, start, end):
+        """Return the native world hit point, or None for one clear chord."""
+        hit = self._runtime.bigworld.wg_collideSegment(
+            self._avatar.spaceID, self._vector(start), self._vector(end), 128)
+        if hit is None:
+            return None
+        try:
+            return _xyz(hit[0])
+        except Exception:
+            return False
+
+    def _advance_artillery_arcs(self, now):
+        if self._artillery is None:
+            return 0
+        return self._artillery.advance(
+            now, ARTILLERY_ARC_RAYS_PER_FRAME,
+            self._artillery_arc_probe)
 
     def _send_bot_message(self, message):
         kind = message.get('type')
@@ -4632,9 +6930,123 @@ class BattleRuntime(object):
             except (TypeError, ValueError):
                 continue
             previous = self._bot_fire_seen.get(bot_id, 0)
-            self._bot_fire_seen[bot_id] = max(previous, fire_seq)
-            if fire_seq > previous:
-                self._resolve_bot_shot(state, fire_seq)
+            if (fire_seq > previous and
+                    self._launch_bot_projectile(state, fire_seq)):
+                self._bot_fire_seen[bot_id] = fire_seq
+
+    def _launch_bot_projectile(self, state, shot_seq):
+        """Publish one Bot launch; damage waits for the canonical projectile."""
+        try:
+            bot_id = int(state.get('id'))
+            shot_yaw = float(state.get('shot_yaw'))
+            shot_pitch = float(state.get('shot_pitch'))
+        except (TypeError, ValueError):
+            return False
+        source_record = self._records.get('bot:%s' % bot_id)
+        if source_record is None:
+            return False
+        source = self._server_entity(source_record['engine_id'])
+        if (source is None or source.typeDescriptor is None or
+                not getattr(source, 'isStarted', False)):
+            return False
+        shot = self._descriptor_shot(
+            source.typeDescriptor, state.get('shell_index'))
+        speed = _number(_field(shot, 'speed'), -1.0)
+        gravity = _number(_field(shot, 'gravity'), -1.0)
+        maximum = _number(_field(shot, 'maxDistance'), -1.0)
+        if speed <= 0.0 or gravity <= 0.0 or maximum <= 0.0:
+            return False
+        profile = state.get('profile')
+        profile = profile if isinstance(profile, dict) else {}
+        is_spg = str(profile.get('class_tag') or '') == 'SPG'
+        max_time_ms = PROJECTILE_MAX_TIME_MS
+        if is_spg:
+            proof_key = state.get('shot_proof_key')
+            try:
+                origin = tuple(float(value)
+                               for value in state['shot_origin'])
+                velocity = tuple(float(value)
+                                 for value in state['shot_velocity'])
+                receipt_gravity = float(state['shot_gravity'])
+                receipt_maximum = float(state['shot_max_distance'])
+                max_time_ms = int(state['shot_max_time_ms'])
+                proof_origin = tuple(float(value)
+                                     for value in proof_key[6])
+                proof_flight = float(proof_key[12])
+                if (len(origin) != 3 or len(velocity) != 3 or
+                        not isinstance(proof_key, (list, tuple)) or
+                        len(proof_key) < 13):
+                    return False
+                proof_values = (
+                    proof_key[0], int(proof_key[1]), int(proof_key[4]),
+                    int(proof_key[5]), float(proof_key[7]),
+                    float(proof_key[8]), float(proof_key[9]),
+                    float(proof_key[10]), float(proof_key[11]))
+            except (KeyError, TypeError, ValueError, IndexError,
+                    OverflowError):
+                return False
+            values = origin + velocity + (
+                receipt_gravity, receipt_maximum, proof_flight)
+            horizontal = math.cos(shot_pitch)
+            expected_velocity = (
+                math.sin(shot_yaw) * horizontal * speed,
+                math.sin(shot_pitch) * speed,
+                math.cos(shot_yaw) * horizontal * speed)
+            if (any(math.isnan(value) or math.isinf(value)
+                    for value in values) or
+                    proof_values[0] != 'launch' or
+                    proof_values[1] != bot_id or
+                    proof_values[2] != max(
+                        0, int(state.get('shell_index', 0) or 0)) or
+                    proof_values[3] != int(shot_seq) or
+                    proof_values[4] != shot_yaw or
+                    proof_values[5] != shot_pitch or
+                    proof_values[6] != speed or
+                    proof_values[7] != gravity or
+                    proof_values[8] != maximum or
+                    proof_origin != origin or
+                    receipt_gravity != gravity or
+                    receipt_maximum != maximum or
+                    max_time_ms <= 0 or
+                    max_time_ms > PROJECTILE_MAX_TIME_MS or
+                    proof_flight <= 0.0 or
+                    proof_flight * 1000.0 > max_time_ms + 1e-6 or
+                    any(abs(velocity[index] - expected_velocity[index]) >
+                        1e-7 for index in range(3))):
+                return False
+        else:
+            try:
+                gun_node = source.model.node('HP_gunFire')
+                origin = _xyz(
+                    self._runtime.math.Matrix(gun_node).translation)
+            except Exception:
+                # A guessed hull-centre origin can start beyond nearby cover.
+                # Every canonical shell must leave the native gun-fire node.
+                return False
+            horizontal = math.cos(shot_pitch)
+            direction = (
+                math.sin(shot_yaw) * horizontal,
+                math.sin(shot_pitch),
+                math.cos(shot_yaw) * horizontal)
+            length = math.sqrt(sum(component * component
+                                   for component in direction))
+            if length <= 0.000001:
+                return False
+            velocity = tuple(
+                component * speed / length for component in direction)
+        is_he = combat_rules.is_he(shot)
+        sender = getattr(self.client, 'send_projectile_launch', None)
+        if not callable(sender):
+            return False
+        accepted = sender(
+            'bot', bot_id, int(shot_seq),
+            max(0, int(state.get('shell_index', 0) or 0)),
+            list(origin), list(velocity), gravity, maximum,
+            max_time_ms, is_he,
+            combat_rules.he_radius(shot) if is_he else 0.0,
+            authority_epoch=getattr(self.client, 'authority_epoch', None),
+            penetration_factor=combat_rules.sample_penetration_factor())
+        return accepted == int(shot_seq)
 
     def _resolve_bot_shot(self, state, shot_seq):
         try:
@@ -4686,11 +7098,6 @@ class BattleRuntime(object):
             direction = target_direction
             direction.normalise()
         end = start + direction.scale(maximum)
-        world_distance = 999999.0
-        hit = self._runtime.bigworld.wg_collideSegment(
-            self._avatar.spaceID, start, end, 128)
-        if hit is not None:
-            world_distance = (hit[0] - start).length
         hit_record = None
         target_collisions = None
         distance = 999999.0
@@ -4714,6 +7121,14 @@ class BattleRuntime(object):
                 hit_record = record
                 target_collisions = tuple(candidate_collisions)
                 distance = float(nearest.dist)
+        scene_end = end
+        if hit_record is not None and target_collisions is not None:
+            scene_end = start + direction.scale(
+                max(0.0, min(maximum, distance)))
+        scene = self._resolve_shot_scene(
+            start, scene_end, direction, shot)
+        penetration_factor = scene.get('penetration_factor')
+        world_distance = scene['world_distance']
         if hit_record is None or target_collisions is None:
             if (combat_rules.is_he(shot) and
                     world_distance < maximum):
@@ -4721,15 +7136,20 @@ class BattleRuntime(object):
                     start + direction.scale(world_distance), shot, shot_seq,
                     None, 'bot', bot_id, source_record['engine_id'])
             return False
-        if distance > world_distance + 0.5:
+        if (scene.get('stopped_by_destructible') or
+                distance > world_distance + _SHOT_OCCLUSION_EPSILON):
             if combat_rules.is_he(shot):
                 self._he_splash(
                     start + direction.scale(world_distance), shot, shot_seq,
                     None, 'bot', bot_id, source_record['engine_id'])
             return False
+        if penetration_factor is None:
+            penetration_factor = combat_rules.sample_penetration_factor()
         damage, result = self._shell_damage(
             source.typeDescriptor, target_collisions, distance,
-            shell_index=state.get('shell_index'))
+            shell_index=state.get('shell_index'),
+            pierce_loss=scene['piercing_loss'],
+            penetration_factor=penetration_factor)
         impact = start + direction.scale(distance)
         hull_damage = damage
         damage, critical = self._critical_hit(
@@ -5040,6 +7460,39 @@ class BattleRuntime(object):
             self._stop_remote_visual(record)
         return visible
 
+    def _present_direct_spot(self, record):
+        """Publish the one stock ribbon and sound for a first direct spot."""
+        if record.get('spot_feedback_sent'):
+            return False
+        feedback_common = getattr(
+            self._runtime, 'battle_feedback_common', None)
+        event_types = getattr(feedback_common, 'BATTLE_EVENT_TYPE', None)
+        if event_types is None:
+            raise RuntimeError(
+                '#1513 spotting feedback constants are unavailable')
+        pack_visibility = getattr(event_types, 'packVisibility', None)
+        if not callable(pack_visibility):
+            raise RuntimeError(
+                '#1513 visibility feedback packer is unavailable')
+        callback = getattr(self._avatar, 'onBattleEvents', None)
+        if not callable(callback):
+            raise RuntimeError(
+                '#1513 battle-event feedback boundary is unavailable')
+        target_id = int(record['engine_id'])
+        callback([
+            {
+                'eventType': int(event_types.SPOTTED),
+                'targetID': target_id, 'count': 1, 'details': 0,
+            },
+            {
+                'eventType': int(event_types.TARGET_VISIBILITY),
+                'targetID': target_id, 'count': 1,
+                'details': int(pack_visibility(True, True)),
+            },
+        ])
+        record['spot_feedback_sent'] = True
+        return True
+
     @staticmethod
     def _record_alive(record, entity):
         state = record.get('state') or {}
@@ -5153,11 +7606,49 @@ class BattleRuntime(object):
                 _xyz(entity.position), entity.typeDescriptor, entity))
         return tuple(observers)
 
+    @staticmethod
+    def _spotting_probe_phase(record):
+        """Spread native LOS work across the five 0.10-second frames."""
+        identity = record.get('network_id')
+        if identity is None:
+            identity = record.get('engine_id', 0)
+        try:
+            identity = abs(int(identity))
+        except (TypeError, ValueError, OverflowError):
+            identity = 0
+        return ((identity * 17) % SPOTTING_PHASE_BUCKETS) * \
+            SPOTTING_UPDATE_SECONDS
+
+    @classmethod
+    def _spotting_probe_due(cls, record, now):
+        """Retain one 2 Hz deadline without synchronising late frames."""
+        deadline = float(record.get('spot_next', 0.0) or 0.0)
+        if deadline <= 0.0:
+            cycle = math.floor(float(now) / SPOTTING_PROBE_SECONDS)
+            deadline = (cycle * SPOTTING_PROBE_SECONDS +
+                        cls._spotting_probe_phase(record))
+            if deadline + 1e-9 < float(now):
+                deadline += SPOTTING_PROBE_SECONDS
+            record['spot_next'] = deadline
+        if float(now) + 1e-9 < deadline:
+            return False
+        elapsed = max(0.0, float(now) - deadline)
+        intervals = int(math.floor(
+            (elapsed + 1e-9) / SPOTTING_PROBE_SECONDS)) + 1
+        record['spot_next'] = (
+            deadline + intervals * SPOTTING_PROBE_SECONDS)
+        return True
+
     def _update_spotting(self, now):
         """Copy 0.8.2 proximity, team relay, LOS and five-second memory."""
         if now < self._next_spotting_time:
             return False
-        self._next_spotting_time = now + 0.10
+        if self._next_spotting_time <= 0.0:
+            self._next_spotting_time = now
+        elapsed = max(0.0, float(now) - self._next_spotting_time)
+        intervals = int(math.floor(
+            (elapsed + 1e-9) / SPOTTING_UPDATE_SECONDS)) + 1
+        self._next_spotting_time += intervals * SPOTTING_UPDATE_SECONDS
         observers = self._spotting_observers()
         changed = False
         for record in self._records.values():
@@ -5170,8 +7661,8 @@ class BattleRuntime(object):
             if entity is None:
                 continue
             alive = self._record_alive(record, entity)
-            if alive and now >= float(record.get('spot_next', 0.0)):
-                record['spot_next'] = now + 0.5
+            direct_seen = False
+            if alive and self._spotting_probe_due(record, now):
                 target = _xyz(entity.position)
                 target_moving = abs(_number(
                     state.get('speed'), self._local_speed
@@ -5179,18 +7670,24 @@ class BattleRuntime(object):
                         spotting.MOVING_SPEED_EPSILON)
                 fired_recently = now < float(
                     record.get('shot_penalty_until', 0.0))
-                seen = any(self._spot_line_of_sight(
+                direct_seen = self._spot_line_of_sight(
+                    observers[0], target, entity.typeDescriptor,
+                    target_moving, fired_recently)
+                seen = direct_seen or any(self._spot_line_of_sight(
                     observer, target, entity.typeDescriptor,
                     target_moving, fired_recently)
-                    for observer in observers)
+                    for observer in observers[1:])
                 if seen:
                     record['spot_until'] = (
                         now + spotting.SPOT_MEMORY_SECONDS)
             visible = (alive and
                        now < float(record.get('spot_until', 0.0)))
-            if visible != bool(record.get('spot_visible', False)):
+            previous_visible = bool(record.get('spot_visible', False))
+            if visible != previous_visible:
                 changed = True
             self._set_record_spot_visibility(record, visible)
+            if visible and not previous_visible and direct_seen:
+                self._present_direct_spot(record)
         return changed
 
     def _stop_remote_visual(self, record):
@@ -5219,9 +7716,12 @@ class BattleRuntime(object):
         display_health = max(
             0, int(state.get('display_health', health) or 0))
         crew_active = bool(state.get('alive', health > 0)) and health > 0
+        # ``attacker_id`` and ``attack_reason_id`` are one-shot presentation
+        # causes, not snapshot state.  Ordered combat events force their
+        # native notification; a following cause-free snapshot must not look
+        # like a new health transition and overwrite FROM_PLAYER colouring.
         signature = (
-            health, display_health, crew_active, int(reason_id),
-            int(attack_reason_id))
+            health, display_health, crew_active, int(reason_id))
         previous_signature = self._last_health.get(engine_id)
         durable_changed = previous_signature != signature
         if not durable_changed and not force_cause:
@@ -5300,6 +7800,8 @@ class BattleRuntime(object):
             killed = getattr(self._binding, 'arena_vehicle_killed', None)
             if callable(killed):
                 killed(engine_id, int(attacker_id), int(reason_id))
+            if not record.get('local'):
+                self._fallback_postmortem_viewpoint(engine_id)
 
     def _destroy_entity(self, event):
         record = self._records.get(event.get('entity'))
@@ -5332,6 +7834,7 @@ class BattleRuntime(object):
                 except ValueError:
                     pass
             return
+        self._fallback_postmortem_viewpoint(record['engine_id'])
         if event.get('keep_corpse'):
             state = dict(record.get('state') or {})
             state.update(event.get('state') or {})
@@ -5405,10 +7908,30 @@ class BattleRuntime(object):
         if not state.can_fire(self._battle_live):
             return False
         dispersion_angle = self._native_dispersion_angle()
-        position, yaw = self.local_pose()
         shell_index = state.shot_index
+        shot = self._descriptor_shot(entity.typeDescriptor, shell_index)
+        speed = _number(_field(shot, 'speed'), -1.0)
+        gravity = _number(_field(shot, 'gravity'), -1.0)
+        maximum = _number(_field(shot, 'maxDistance'), -1.0)
+        if speed <= 0.0 or gravity <= 0.0 or maximum <= 0.0:
+            return False
+        start, direction = self._mutable_shot_ray()
+        state.scatter(
+            direction,
+            bool(self._config and self._config.get(
+                'perfect_accuracy', False)),
+            dispersion_angle=dispersion_angle)
+        velocity = direction.scale(speed)
+        penetration_factor = combat_rules.sample_penetration_factor()
+        is_he = combat_rules.is_he(shot)
         shot_seq = self.client.send_fire(
-            shell_index, position, yaw, aim_yaw, gun_pitch)
+            shell_index,
+            position=list(_xyz(start)), velocity=list(_xyz(velocity)),
+            gravity=gravity, max_distance=maximum,
+            max_time_ms=PROJECTILE_MAX_TIME_MS,
+            is_he=is_he,
+            splash_radius=(combat_rules.he_radius(shot) if is_he else 0.0),
+            penetration_factor=penetration_factor)
         if not shot_seq:
             return False
         self._apply_native_shot_bloom()
@@ -5421,8 +7944,6 @@ class BattleRuntime(object):
         self._publish_ammo_state(state, force=True)
         self._publish_reload_event(
             state.reload_time, state.reload_duration, force=True)
-        self._resolve_hit(
-            shot_seq, aim_yaw, gun_pitch, shell_index, dispersion_angle)
         return True
 
     def _resolve_hit(self, shot_seq, aim_yaw, gun_pitch, shell_index=None,
@@ -5440,16 +7961,7 @@ class BattleRuntime(object):
                     'perfect_accuracy', False)),
                 dispersion_angle=dispersion_angle)
         end = start + direction.scale(5000.0)
-        world_distance = 999999.0
-        if self._destructibles is not None:
-            world_distance = self._destructibles.shot_world_distance(
-                self._runtime.bigworld, self._avatar.spaceID,
-                start, end, direction)
-        else:
-            hit = self._runtime.bigworld.wg_collideSegment(
-                self._avatar.spaceID, start, end, 128)
-            if hit is not None:
-                world_distance = (hit[0] - start).length
+        shot = self._descriptor_shot(entity.typeDescriptor, shell_index)
         target_record = None
         target_collisions = None
         distance = 999999.0
@@ -5470,9 +7982,22 @@ class BattleRuntime(object):
                 distance = float(nearest.dist)
                 target_record = record
                 target_collisions = tuple(result)
+        # Destructible submission mutates the native scene immediately.  First
+        # resolve the nearest vehicle without applying damage, then cap the
+        # world/destructible ray at that vehicle.  A prop behind the target
+        # must not be destroyed before the existing world/vehicle ordering
+        # chooses which surface the shell actually reaches.
+        scene_end = end
+        if target_record is not None and target_collisions is not None:
+            scene_end = start + direction.scale(
+                max(0.0, min(5000.0, distance)))
+        scene = self._resolve_shot_scene(
+            start, scene_end, direction, shot)
+        penetration_factor = scene.get('penetration_factor')
+        world_distance = scene['world_distance']
         if (target_record is None or target_collisions is None or
-                distance > world_distance + 0.5):
-            shot = self._descriptor_shot(entity.typeDescriptor, shell_index)
+                scene.get('stopped_by_destructible') or
+                distance > world_distance + _SHOT_OCCLUSION_EPSILON):
             if (combat_rules.is_he(shot) and
                     world_distance < 4999.5):
                 self._he_splash(
@@ -5480,9 +8005,13 @@ class BattleRuntime(object):
                     None, 'player', self.client.player_id,
                     self._server.vehicle_id)
             return
+        if penetration_factor is None:
+            penetration_factor = combat_rules.sample_penetration_factor()
         damage, result = self._shell_damage(
             entity.typeDescriptor, target_collisions, distance,
-            shell_index=shell_index)
+            shell_index=shell_index,
+            pierce_loss=scene['piercing_loss'],
+            penetration_factor=penetration_factor)
         impact = start + direction.scale(distance)
         target = self._server_entity(target_record['engine_id'])
         hull_damage = damage
@@ -5500,7 +8029,6 @@ class BattleRuntime(object):
                 target_record['network_id'], shot_seq, damage, result,
                 shell_index or 0,
                 _xyz(impact), critical, **critical_contract)
-        shot = self._descriptor_shot(entity.typeDescriptor, shell_index)
         if combat_rules.is_he(shot):
             self._he_splash(
                 impact, shot, shot_seq, target_record, 'player',
@@ -5513,6 +8041,96 @@ class BattleRuntime(object):
             shell_index = getattr(descriptor, 'activeGunShotIndex', 0)
         index = max(0, min(int(shell_index), max(0, len(shots) - 1)))
         return shots[index] if shots else {}
+
+    def _resolve_shot_scene(self, start, end, direction, shot,
+                            penetration_factor=None,
+                            initial_piercing_loss=0.0,
+                            distance_offset=0.0):
+        """Traverse exact destructibles in order before the capped endpoint."""
+        maximum = (end - start).length
+        initial_piercing_loss = max(
+            0.0, _number(initial_piercing_loss, 0.0))
+        distance_offset = max(0.0, _number(distance_offset, 0.0))
+        if self._destructibles is None:
+            hit = self._runtime.bigworld.wg_collideSegment(
+                self._avatar.spaceID, start, end, 128)
+            return {
+                'world_distance': ((hit[0] - start).length
+                                   if hit is not None else 999999.0),
+                'piercing_loss': initial_piercing_loss,
+                'stopped_by_destructible': False,
+                'penetration_factor': penetration_factor,
+            }
+        travelled = 0.0
+        piercing_loss = initial_piercing_loss
+        for unused_index in range(64):
+            cursor = start + direction.scale(travelled)
+            result = self._destructibles.shot_world_distance(
+                self._runtime.bigworld, self._avatar.spaceID,
+                cursor, end, direction, shot)
+            if not isinstance(result, dict):
+                raise RuntimeError(
+                    '#1513 destructible shot result must be a dictionary')
+            added_loss = max(0.0, _number(
+                result.get('piercing_loss'), 0.0))
+            piercing_loss += added_loss
+            if added_loss > 0.0 and penetration_factor is None:
+                penetration_factor = (
+                    combat_rules.sample_penetration_factor())
+            # Range falloff is evaluated where the shell enters/hits the
+            # destructible.  ``continue_from`` is the proved OBB exit and is
+            # used only to advance the next ray; using it here would charge a
+            # thick object extra range before applying its fixed 25 mm loss.
+            loss_distance = result.get('loss_distance')
+            if loss_distance is None:
+                loss_distance = result.get('continue_from')
+            obstacle_distance = travelled + max(
+                0.0, _number(loss_distance, 0.0))
+            if (result.get('continue_from') is not None and
+                    penetration_factor is not None and
+                    combat_rules.sampled_piercing(
+                        shot, distance_offset + obstacle_distance,
+                        penetration_factor,
+                        piercing_loss) < 1.0):
+                return {
+                    'world_distance': obstacle_distance,
+                    'piercing_loss': piercing_loss,
+                    'stopped_by_destructible': True,
+                    'penetration_factor': penetration_factor,
+                }
+            stop_distance = result.get('stop_distance')
+            if stop_distance is not None:
+                return {
+                    'world_distance': travelled + max(
+                        0.0, _number(stop_distance)),
+                    'piercing_loss': piercing_loss,
+                    'stopped_by_destructible': bool(
+                        result.get('stopped_by_destructible')),
+                    'penetration_factor': penetration_factor,
+                }
+            advance = result.get('continue_from')
+            if advance is None:
+                world_distance = _number(
+                    result.get('world_distance'), 999999.0)
+                return {
+                    'world_distance': (travelled + world_distance
+                                       if world_distance < 99999.0
+                                       else 999999.0),
+                    'piercing_loss': piercing_loss,
+                    'stopped_by_destructible': False,
+                    'penetration_factor': penetration_factor,
+                }
+            advance = _number(advance)
+            if advance <= 0.0:
+                raise RuntimeError(
+                    '#1513 destructible shot traversal did not advance')
+            travelled += advance
+            if travelled >= maximum:
+                return {'world_distance': 999999.0,
+                        'piercing_loss': piercing_loss,
+                        'stopped_by_destructible': False,
+                        'penetration_factor': penetration_factor}
+        raise RuntimeError('#1513 destructible shot traversal exceeded 64 hits')
 
     def _he_splash(self, burst_position, shot, shot_seq, direct_record,
                    attacker_kind, attacker_id, attacker_engine_id):
@@ -5607,14 +8225,17 @@ class BattleRuntime(object):
             penetrated=int(result) == 2)
 
     def _shell_damage(self, descriptor, collisions, distance,
-                      shell_index=None):
+                      shell_index=None, pierce_loss=0.0,
+                      penetration_factor=None):
         shots = tuple(descriptor.gun.shots or ())
         if shell_index is None:
             shell_index = getattr(descriptor, 'activeGunShotIndex', 0)
         index = max(0, min(int(shell_index),
                            max(0, len(shots) - 1)))
         shot = shots[index] if shots else {}
-        resolved = combat_rules.resolve_hull_hit(shot, distance, collisions)
+        resolved = combat_rules.resolve_hull_hit(
+            shot, distance, collisions, pierce_loss=pierce_loss,
+            penetration_factor=penetration_factor)
         if resolved is None:
             return 0, 1
         result = resolved[0]
@@ -5674,6 +8295,25 @@ class BattleRuntime(object):
 
     def _cleanup(self):
         cleanup_error = None
+        if self._projectiles is not None:
+            try:
+                self._projectiles.reset(max(
+                    self._projectiles.now, self._clock()))
+            except Exception as error:
+                cleanup_error = error
+        self._projectiles = None
+        self._projectile_meta = {}
+        self._projectile_visual_meta = {}
+        self._projectile_terminal_data = {}
+        self._projectile_target_positions = {}
+        self._projectile_lineage = set()
+        if self._artillery is not None:
+            self._artillery.reset()
+        self._artillery = None
+        try:
+            self._release_postmortem_visibility()
+        except Exception as error:
+            cleanup_error = error
         try:
             self._runtime.compatibility.set_control_mode_listener(None)
         except Exception as error:
@@ -5760,6 +8400,7 @@ class BattleRuntime(object):
             try:
                 self._destructibles.set_event_sink(None)
                 self._destructibles.reset()
+                self._destructibles.set_catalog(None)
             except Exception as error:
                 if cleanup_error is None:
                     cleanup_error = error
@@ -5772,6 +8413,8 @@ class BattleRuntime(object):
         self._sender = None
         self._sync = None
         self._bots = None
+        if self._frame_diagnostics is not None:
+            self._frame_diagnostics.reset()
         self._has_sixth_sense = False
         self._last_snapshot = None
         self._last_frame_time = None
@@ -5790,6 +8433,8 @@ class BattleRuntime(object):
         self._local_model = None
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
+        self._local_camera_velocity = None
+        self._spectated_engine_id = None
         self._local_grind = 0
         self._local_vertical_speed = 0.0
         self._local_airborne = False

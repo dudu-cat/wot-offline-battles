@@ -193,6 +193,7 @@ class _RemoteShotPresenter(object):
         self._model_assembler = model_assembler
         self._mover = None
         self._next_shot_id = 1000000
+        self._projectile_shots = {}
         self._closed = False
 
     def setup_recoil(self, vehicle):
@@ -225,38 +226,167 @@ class _RemoteShotPresenter(object):
     def play_tracer(self, vehicle):
         if self._closed or vehicle.model is None:
             return False
+        canonical_names = (
+            '_offlineLANShotOrigin', '_offlineLANShotVelocity',
+            '_offlineLANShotGravity', '_offlineLANShotMaxDistance')
+        if all(hasattr(vehicle, name) for name in canonical_names):
+            shot_id = self.play_canonical(
+                vehicle.typeDescriptor, vehicle._offlineLANShotIndex,
+                vehicle._offlineLANShotOrigin,
+                vehicle._offlineLANShotVelocity,
+                vehicle._offlineLANShotGravity,
+                vehicle._offlineLANShotMaxDistance, vehicle.id,
+                getattr(vehicle, '_offlineLANProjectileID', None),
+                getattr(
+                    vehicle, '_offlineLANShotReferenceOrigin', None),
+                getattr(
+                    vehicle, '_offlineLANShotReferenceVelocity', None))
+            return bool(shot_id)
         shot = self._active_shot(vehicle)
-        shell = _component_value(shot, 'shell')
-        effects_index = _component_value(shell, 'effectsIndex')
         speed = _component_value(shot, 'speed')
         gravity = _component_value(shot, 'gravity')
-        if (shot is None or shell is None or effects_index is None or
-                speed is None or gravity is None):
+        if shot is None or speed is None or gravity is None:
+            return False
+        try:
+            start = self._muzzle_position(vehicle)
+            direction = self._direction(vehicle)
+            velocity = direction.scale(float(speed))
+            maximum = _component_value(shot, 'maxDistance', 5000.0)
+            shot_id = self.play_canonical(
+                vehicle.typeDescriptor, vehicle._offlineLANShotIndex,
+                start, velocity, gravity, maximum or 5000.0, vehicle.id)
+            # Preserve the pre-ledger RemoteVehicle.showShooting contract.
+            # Canonical callers receive the stable visual id itself.
+            return bool(shot_id)
+        except Exception:
+            return False
+
+    def play_canonical(self, descriptor, shell_index, origin, velocity,
+                       gravity, max_distance, attacker_id,
+                       projectile_id=None, reference_position=None,
+                       reference_velocity=None):
+        """Present one canonical launch through the exact #1513 mover ABI.
+
+        The origin and velocity belong to the authoritative launch event.
+        They must never be recomputed from the vehicle's presentation pose,
+        which may already have advanced by the time a relay event arrives.
+        Invalid native-boundary values fail closed before ProjectileMover is
+        constructed or called.
+        """
+        if self._closed:
+            return False
+        shot = self._shot_at(descriptor, shell_index)
+        shell = _component_value(shot, 'shell')
+        effects_index = _component_value(shell, 'effectsIndex')
+        if shot is None or shell is None or effects_index is None:
+            return False
+        visual_start = self._finite_vector(origin)
+        reference_start = (visual_start if reference_position is None else
+                           self._finite_vector(reference_position))
+        reference_velocity = self._finite_vector(
+            velocity if reference_velocity is None else reference_velocity)
+        gravity = self._finite_float(gravity)
+        maximum = self._finite_float(max_distance)
+        try:
+            attacker_id = int(attacker_id)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if projectile_id is not None:
+            try:
+                projectile_id = str(projectile_id)
+            except Exception:
+                return False
+            if not projectile_id or len(projectile_id) > 128:
+                return False
+            existing = self._projectile_shots.get(projectile_id)
+            if existing is not None:
+                return existing
+            if len(self._projectile_shots) >= 128:
+                return False
+        if (visual_start is None or reference_start is None or
+                reference_velocity is None or gravity is None or
+                maximum is None or gravity < 0.0 or maximum <= 0.0 or
+                attacker_id <= 0):
             return False
         try:
             from items import vehicles
             effects_descr = vehicles.g_cache.shotEffects[effects_index]
+            if effects_descr is None:
+                return False
             mover = self._projectile_mover()
             if mover is None:
                 return False
-            start = self._muzzle_position(vehicle)
-            direction = self._direction(vehicle)
-            velocity = direction.scale(float(speed))
             camera = getattr(self._bigworld, 'camera', None)
             camera = camera() if callable(camera) else None
-            camera_position = (getattr(camera, 'position', None) or start)
-            maximum = _component_value(shot, 'maxDistance', 5000.0)
+            camera_position = self._finite_vector(
+                getattr(camera, 'position', None))
+            if camera_position is None:
+                camera_position = reference_start
             shot_id = self._next_shot_id
             self._next_shot_id += 1
             # Exact #1513 ABI:
             # add(id, effects, gravity, refStart, refVelocity, start,
             #     maxDistance, attackerID, tracerCameraPos)
             mover.add(
-                shot_id, effects_descr, gravity, start, velocity, start,
-                float(maximum or 5000.0), vehicle.id, camera_position)
-            return True
+                shot_id, effects_descr, gravity, reference_start,
+                reference_velocity, visual_start, maximum, attacker_id,
+                camera_position)
+            if projectile_id is not None:
+                self._projectile_shots[projectile_id] = shot_id
+            return shot_id
         except Exception:
             return False
+
+    def stop_canonical(self, projectile_id, end_position):
+        """Hide one authoritative tracer at its canonical terminal point."""
+        if self._closed or projectile_id is None:
+            return False
+        try:
+            projectile_id = str(projectile_id)
+        except Exception:
+            return False
+        shot_id = self._projectile_shots.get(projectile_id)
+        end = self._finite_vector(end_position)
+        if shot_id is None or end is None:
+            return False
+        self._projectile_shots.pop(projectile_id, None)
+        mover = self._mover
+        callback = getattr(mover, 'hide', None) if mover is not None else None
+        if not callable(callback):
+            return False
+        try:
+            callback(shot_id, end)
+        except Exception:
+            return False
+        return True
+
+    @staticmethod
+    def _finite_float(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+
+    def _finite_vector(self, value):
+        if value is None:
+            return None
+        try:
+            components = (value.x, value.y, value.z)
+        except AttributeError:
+            try:
+                components = (value[0], value[1], value[2])
+            except (TypeError, IndexError, KeyError):
+                return None
+        components = tuple(self._finite_float(item) for item in components)
+        if None in components:
+            return None
+        try:
+            return self._math.Vector3(*components)
+        except Exception:
+            return None
 
     def _projectile_mover(self):
         if self._mover is None and not self._closed:
@@ -311,8 +441,23 @@ class _RemoteShotPresenter(object):
             index = 0
         return shots[max(0, min(index, len(shots) - 1))]
 
+    @staticmethod
+    def _shot_at(descriptor, shell_index):
+        gun = getattr(descriptor, 'gun', None)
+        shots = tuple(_component_value(gun, 'shots', ()) or ())
+        if not shots:
+            return None
+        try:
+            index = int(shell_index)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if index < 0 or index >= len(shots):
+            return None
+        return shots[index]
+
     def destroy(self):
         self._closed = True
+        self._projectile_shots = {}
         mover = self._mover
         self._mover = None
         if mover is not None:
@@ -500,6 +645,7 @@ class RemoteVehicle(object):
         # LAN authority uses RemoteVehicleFactory.get() explicitly, so an
         # unspotted enemy never leaks into native aiming or ProjectileMover.
         self._spot_visible = False
+        self._postmortem_visible = False
         # helpers.EntityExtra stores each running stock extra on the entity.
         # Without this dictionary the #1513 shoot extra cannot start.
         self.extras = {}
@@ -696,6 +842,18 @@ def _native_visible(vehicle):
         getattr(vehicle, 'model', None) is not None and alive)
 
 
+def _postmortem_visible(vehicle):
+    if vehicle is None:
+        return False
+    alive = getattr(vehicle, 'isAlive', None)
+    alive = alive() if callable(alive) else bool(alive)
+    return bool(
+        getattr(vehicle, '_postmortem_visible', False) and
+        getattr(vehicle, 'isStarted', False) and
+        getattr(vehicle, 'inWorld', False) and
+        getattr(vehicle, 'model', None) is not None and alive)
+
+
 class _EntitiesView(object):
 
     def __init__(self, original, registry):
@@ -707,7 +865,8 @@ class _EntitiesView(object):
             return self._original[key]
         except KeyError:
             vehicle = self._registry.get(key)
-            if _native_visible(vehicle):
+            if (_native_visible(vehicle) or
+                    _postmortem_visible(vehicle)):
                 return vehicle
             raise
 
@@ -727,10 +886,20 @@ class _EntitiesView(object):
         if key in self._original:
             return True
         vehicle = self._registry.get(key)
-        return _native_visible(vehicle)
+        return (_native_visible(vehicle) or
+                _postmortem_visible(vehicle))
 
     def keys(self):
-        return self._original.keys()
+        result = list(self._original.keys())
+        # PostMortemControlMode.__changeVehicle checks ``entities.keys()``
+        # before publishing its camera-change event.  Expose only the one
+        # runtime-validated observed ally; ordinary AOI enumeration remains
+        # the native registry and does not leak other synthetic identities.
+        for entity_id, vehicle in self._registry.items():
+            if (_postmortem_visible(vehicle) and
+                    entity_id not in self._original):
+                result.append(entity_id)
+        return result
 
     def values(self):
         return self._original.values()
@@ -786,7 +955,8 @@ class RemoteVehicleFactory(object):
             if original is not None:
                 return original
             vehicle = factory._vehicles.get(entity_id)
-            if _native_visible(vehicle):
+            if (_native_visible(vehicle) or
+                    _postmortem_visible(vehicle)):
                 return vehicle
             return None
 
@@ -931,6 +1101,21 @@ class RemoteVehicleFactory(object):
     def error(self, entity_id):
         vehicle = self._vehicles.get(entity_id)
         return getattr(vehicle, 'load_error', None)
+
+    def play_projectile_tracer(self, descriptor, shell_index, origin,
+                               velocity, gravity, max_distance, attacker_id,
+                               projectile_id=None, reference_position=None,
+                               reference_velocity=None):
+        """Play one authoritative launch without consulting a vehicle pose."""
+        return self._shot_presenter.play_canonical(
+            descriptor, shell_index, origin, velocity, gravity,
+            max_distance, attacker_id, projectile_id,
+            reference_position, reference_velocity)
+
+    def stop_projectile_tracer(self, projectile_id, end_position):
+        """Retire one canonical tracer after a server terminal event."""
+        return self._shot_presenter.stop_canonical(
+            projectile_id, end_position)
 
     def destroy(self, entity_id):
         vehicle = self._vehicles.pop(entity_id, None)

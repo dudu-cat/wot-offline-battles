@@ -15,10 +15,11 @@ CLIENT_SCRIPTS = ROOT / 'ports' / '0.9.22' / 'src' / 'res' / 'scripts' / 'client
 sys.path.insert(0, str(CLIENT_SCRIPTS))
 
 from gui.mods.offline_lan_0922.battle_runtime import (
-    BattleRuntime, FRAME_SECONDS, _LANInputSender, _engine_rotation,
+    BattleRuntime, FRAME_SECONDS, _FrameDiagnostics, _LANInputSender,
+    _engine_rotation,
     _selected_vehicle_has_sixth_sense)
-from gui.mods.offline_lan_0922 import critical_damage, gun_mechanics, \
-    tank_collision
+from gui.mods.offline_lan_0922 import combat_rules, critical_damage, \
+    gun_mechanics, tank_collision, vehicle_physics
 from gui.mods.offline_lan_0922.entities.remote_vehicle import \
     RemoteVehicle, RemoteVehicleFactory, _RemoteFilter, \
     collide_vehicle_at_matrix
@@ -206,7 +207,7 @@ class _Descriptor(object):
             kind='ARMOR_PIERCING', effectsIndex=3)
         shot = types.SimpleNamespace(
             shell=shell, piercingPower=(1000.0, 800.0),
-            maxDistance=500.0)
+            speed=800.0, gravity=9.81, maxDistance=500.0)
         self.gun = types.SimpleNamespace(
             itemTypeName='vehicleGun',
             pitchLimits={'absolute': (-0.2, 0.4)}, shots=[shot],
@@ -382,6 +383,7 @@ class _ArcadeCamera(object):
     def __init__(self):
         self._vehicle_matrix = object()
         self.bindings = []
+        self.direction_resets = 0
 
     @property
     def vehicleMProv(self):
@@ -392,13 +394,18 @@ class _ArcadeCamera(object):
         self._vehicle_matrix = value
         self.bindings.append(value)
 
+    def setToVehicleDirection(self):
+        self.direction_resets += 1
+
 
 class _ConsistentMatrices(object):
     def __init__(self):
         self.targets = []
+        self.attachedVehicleMatrix = types.SimpleNamespace(target=None)
 
     def _ConsistentMatrices__setTarget(self, matrix, as_static):
         self.targets.append((matrix, as_static))
+        self.attachedVehicleMatrix.target = matrix
 
 
 class _AdaptiveMatrixProvider(object):
@@ -432,9 +439,11 @@ class _Avatar(object):
         self.arena_updates = []
         self.positions = []
         self.round_finished = []
+        self.viewpoint_switches = []
         self.ammo_updates = []
         self.reload_updates = []
         self.targeting_updates = []
+        self.gun_tracking_calls = []
         self.gun_marker_updates = []
         self.damage_info = []
         self.hit_directions = []
@@ -447,16 +456,31 @@ class _Avatar(object):
         self.base_captured = []
         self.arena = _Arena(self)
         self.inputHandler = _InputHandler()
+        self._PlayerAvatar__isOnArena = False
         self.consistentMatrices = _ConsistentMatrices()
         self._PlayerAvatar__ownVehicleStabMProv = \
             _AdaptiveMatrixProvider(_Matrix())
         self.visual_starts = []
         self.visual_stops = []
         self.gunRotator = types.SimpleNamespace(
+            turretYaw=0.0, gunPitch=0.0,
             dispersionAngle=0.25,
             turretRotationSpeed=0.5,
+            _VehicleGunRotator__isStarted=False,
+            _VehicleGunRotator__maxTurretRotationSpeed=None,
+            _VehicleGunRotator__maxGunRotationSpeed=None,
+            reset=mock.Mock(),
             getCurShotPosition=lambda: (
                 _Vector(0.0, 2.0, 0.0), _Vector(0.0, 0.0, 1.0)))
+
+        def start_gun_rotator():
+            self.gun_tracking_calls.append('start')
+            if (self._PlayerAvatar__isOnArena and
+                    self.gunRotator.
+                    _VehicleGunRotator__maxTurretRotationSpeed is not None):
+                self.gunRotator._VehicleGunRotator__isStarted = True
+
+        self.gunRotator.start = mock.Mock(side_effect=start_gun_rotator)
         self.terrainEffects = types.SimpleNamespace(addNew=mock.Mock())
         self.arena_dp = _ArenaDataProvider(self)
         self.guiSessionProvider = types.SimpleNamespace(
@@ -510,6 +534,11 @@ class _Avatar(object):
                             gun_shot_dispersion_turret_rotation,
                             chassis_shot_dispersion_movement,
                             chassis_shot_dispersion_rotation, aiming_time):
+        self.gun_tracking_calls.append('targeting')
+        self.gunRotator._VehicleGunRotator__maxTurretRotationSpeed = \
+            max_turret_rotation_speed
+        self.gunRotator._VehicleGunRotator__maxGunRotationSpeed = \
+            max_gun_rotation_speed
         self.targeting = (
             turret_yaw, gun_pitch, max_turret_rotation_speed,
             max_gun_rotation_speed, shot_disp_multiplier_factor,
@@ -556,6 +585,9 @@ class _Avatar(object):
 
     def onRoundFinished(self, winner, reason):
         self.round_finished.append((winner, reason))
+
+    def onSwitchViewpoint(self, vehicle_id, position):
+        self.viewpoint_switches.append((vehicle_id, position))
 
 
 class _Compatibility(object):
@@ -611,10 +643,12 @@ class _Compatibility(object):
         return getattr(vehicle, name)
 
     def set_vehicle_pose_overlay(self, vehicle, position, yaw, matrix,
-                                 speed=0.0, turn_speed=0.0):
+                                 speed=0.0, turn_speed=0.0, velocity=None,
+                                 acceleration=None):
         self.pose_overlays[id(vehicle)] = {
             'position': position, 'yaw': yaw, 'matrix': matrix,
-            'speed': speed, 'turn_speed': turn_speed}
+            'speed': speed, 'turn_speed': turn_speed,
+            'velocity': velocity, 'acceleration': acceleration}
         vehicle.position = position
         vehicle.yaw = yaw
         vehicle.matrix = matrix
@@ -796,8 +830,7 @@ class _OfflineMap(object):
             self.bigworld.avatar = _Avatar()
         if self.bigworld is not None:
             avatar = self.bigworld.avatar
-            self.bigworld.spaces[avatar.spaceID] = _SpaceData(
-                self.bigworld.operations, avatar.spaceID, 0xffffffff)
+            self.bigworld.space_visibility_masks[avatar.spaceID] = 0xffffffff
             self.bigworld.avatar.guiSessionProvider = types.SimpleNamespace(
                 shared=types.SimpleNamespace(
                     arenaLoad=_ArenaLoadController(self.app_loader)),
@@ -838,24 +871,6 @@ class _HangarSpace(object):
         self.spaceInited = False
 
 
-class _SpaceData(object):
-    def __init__(self, operations, space_id, visibility_mask):
-        self._operations = operations
-        self._space_id = int(space_id)
-        self._items_visibility_mask = int(visibility_mask)
-
-    @property
-    def itemsVisibilityMask(self):
-        return self._items_visibility_mask
-
-    @itemsVisibilityMask.setter
-    def itemsVisibilityMask(self, mask):
-        self._items_visibility_mask = int(mask)
-        self._operations.append(
-            ('space_visibility', self._space_id,
-             self._items_visibility_mask))
-
-
 class _BigWorld(object):
     def __init__(self, avatar, compatibility):
         self.avatar = avatar
@@ -872,8 +887,8 @@ class _BigWorld(object):
         self.created_offline_entities = []
         self.edge_adds = []
         self.edge_removes = []
-        self.spaces = {7: _SpaceData(self.operations, 7, 0xffffffff)}
-        self.legacy_visibility_calls = []
+        self.space_visibility_masks = {7: 0xffffffff}
+        self.reset_visibility_before_ready = False
 
     def player(self):
         return self.avatar
@@ -943,6 +958,11 @@ class _BigWorld(object):
             for tester in entity.typeDescriptor.getHitTesters():
                 tester.loadBspModel()
             bridge.acceptVehicleEnter(entity.id)
+            if self.reset_visibility_before_ready:
+                # Model exact #1513's late ClientVisibilityFlags update
+                # before deferred client readiness is flushed.
+                self.wg_setSpaceItemsVisibilityMask(
+                    self.avatar.spaceID, 0x000fffff)
             bridge.setClientReady()
             bridge.completeVehicleEnter(entity.id)
         # Match #1513: BigWorld.entity(id) becomes visible only after the
@@ -963,7 +983,7 @@ class _BigWorld(object):
         self.operations.append(('clear_entities_spaces',))
         self.entities.clear()
         self.pending_entities.clear()
-        self.spaces.clear()
+        self.space_visibility_masks.clear()
         self.avatar = None
 
     def loadResourceListBG(self, assemblers, callback):
@@ -974,14 +994,13 @@ class _BigWorld(object):
         self.operations.append(('watcher', name, enabled))
 
     def wg_getSpaceItemsVisibilityMask(self, space_id):
-        # Exact #1513 keeps these obsolete exports as inert stubs.
-        self.legacy_visibility_calls.append(('get', int(space_id)))
-        return 0
+        return self.space_visibility_masks[int(space_id)]
 
     def wg_setSpaceItemsVisibilityMask(self, space_id, mask):
-        self.legacy_visibility_calls.append(
-            ('set', int(space_id), int(mask)))
-        return False
+        space_id = int(space_id)
+        mask = int(mask)
+        self.space_visibility_masks[space_id] = mask
+        self.operations.append(('space_visibility', space_id, mask))
 
     def clearAllSpaces(self):
         self.clearEntitiesAndSpaces()
@@ -1020,8 +1039,8 @@ class _Client(object):
         self.sent.append(('input', values, kwargs))
         return True
 
-    def send_fire(self, *values):
-        self.sent.append(('fire', values))
+    def send_fire(self, *values, **kwargs):
+        self.sent.append(('fire', values, kwargs))
         return 1
 
 
@@ -1138,12 +1157,14 @@ def _runtime():
         compatibility=compatibility, constants=constants,
         battle_feedback_common=types.SimpleNamespace(
             BATTLE_EVENT_TYPE=types.SimpleNamespace(
-                CRIT=6, DAMAGE=7, KILL=8, RECEIVED_CRIT=9,
-                RECEIVED_DAMAGE=10,
+                SPOTTED=0, CRIT=6, DAMAGE=7, KILL=8, RECEIVED_CRIT=9,
+                RECEIVED_DAMAGE=10, TARGET_VISIBILITY=12,
                 packDamage=lambda damage, reason: (
                     (int(damage) << 16) | (int(reason) << 9)),
                 packCrits=lambda count, reason: (
-                    (int(count) << 16) | (int(reason) << 8)))),
+                    (int(count) << 16) | (int(reason) << 8)),
+                packVisibility=lambda visible, direct: (
+                    int(bool(visible)) | (int(bool(direct)) << 1)))),
         encode_gun_angles=lambda *unused: 0,
         game=types.SimpleNamespace(abort=mock.Mock()),
         gui_global_space_id=types.SimpleNamespace(
@@ -1802,6 +1823,68 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
 
 
 class BattleRuntimeContractTests(unittest.TestCase):
+    def test_frame_diagnostics_attributes_work_to_the_next_interval(self):
+        wall = [0.0]
+        payloads = []
+
+        def writer(payload):
+            payloads.append(payload)
+            wall[0] += 0.003
+
+        diagnostics = _FrameDiagnostics(
+            clock=lambda: wall[0], writer=writer, window_seconds=0.25)
+        first = diagnostics.begin(0.0, 0.02)
+        wall[0] = 0.006
+        diagnostics.finish(
+            first, 0.0, 0.02, 0.02, {'local': 0.004},
+            {'lane': 7}, {'role': 'authority', 'speed': 14.0},
+            probe_durations={'lane': 0.005})
+        second = diagnostics.begin(0.12, 0.12)
+        wall[0] = 0.125
+        diagnostics.finish(
+            second, 0.12, 0.10, 0.10, {'bots_update': 0.002},
+            {'visibility': 3}, {'role': 'authority'})
+        third = diagnostics.begin(0.30, 0.18)
+        wall[0] = 0.31
+        diagnostics.finish(
+            third, 0.30, 0.10, 0.10, {'spot': 0.001}, {},
+            {'role': 'authority'})
+
+        self.assertEqual(1, len(payloads))
+        first_row = next(
+            line for line in payloads[0].splitlines()
+            if 'cause=1 next=2' in line)
+        self.assertIn('gap_ms=120.000', first_row)
+        self.assertIn('raw_dt_ms=120.000', first_row)
+        self.assertIn('local:4.000', first_row)
+        self.assertIn('lane:7', first_row)
+        self.assertIn('probe_ms=', first_row)
+        self.assertIn('lane:5.000', first_row)
+        self.assertIn('summary v=2', payloads[0])
+        self.assertIn('probe_ms_avg_max', payloads[0])
+        self.assertTrue(diagnostics._pending['emitted'])
+        self.assertAlmostEqual(
+            0.003, diagnostics._pending['stages']['diag_emit'])
+
+    def test_frame_diagnostics_disable_themselves_when_logging_fails(self):
+        wall = [0.0]
+
+        def reject_log(unused_payload):
+            raise IOError('python.log is unavailable')
+
+        diagnostics = _FrameDiagnostics(
+            clock=lambda: wall[0], writer=reject_log, window_seconds=0.25)
+        first = diagnostics.begin(0.0, 0.02)
+        wall[0] = 0.001
+        diagnostics.finish(first, 0.0, 0.02, 0.02, {}, {}, {})
+        diagnostics.begin(0.30, 0.30)
+        wall[0] = 0.31
+
+        diagnostics.finish(2, 0.30, 0.10, 0.10, {}, {}, {})
+
+        self.assertFalse(diagnostics.enabled)
+        self.assertIsNone(diagnostics._pending)
+
     def test_network_deadlines_remove_main_thread_delay_from_periods(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -1815,7 +1898,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle.client.combat_end_deadline = 1010.0
         battle.client.combat_duration = 900.0
         battle._binding = types.SimpleNamespace(arena_period=mock.Mock())
-        battle._enable_prebattle_camera_controls = mock.Mock()
         battle._clock = mock.Mock(return_value=50.0)
 
         module = sys.modules[BattleRuntime.__module__]
@@ -1879,6 +1961,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertLess(position[2], 0.0)
         self.assertLess(battle._local_speed, 5.0)
         battle._motion_is_clear.assert_called_once()
+        self.assertNotIn(
+            'allow_crush_drive',
+            battle._motion_is_clear.call_args.kwargs)
         battle._baked_pose_safe.assert_called_once()
 
     def test_local_tank_contact_cannot_push_hull_through_world_geometry(self):
@@ -1957,6 +2042,51 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(battle._observe_local_vehicle(message, 12.5))
         self.assertEqual([(True, 12.5)], observed)
 
+    def test_relayed_observation_reaches_authority_and_guest_once(self):
+        def client_runtime(player_id):
+            battle = BattleRuntime(_runtime())
+            battle.state = 'running'
+            battle._start_message = {'round_id': 7}
+            battle.client = types.SimpleNamespace(player_id=player_id, team=1)
+            battle._clock = mock.Mock(return_value=12.5)
+            observed = []
+            battle._sixth_sense = types.SimpleNamespace(
+                observe=lambda visible, now: observed.append((visible, now)))
+            return battle, observed
+
+        authority, authority_observed = client_runtime(1)
+        guest, guest_observed = client_runtime(2)
+        authority_target = {
+            'type': 'bot_observation', 'round_id': 7,
+            'contacts': [{
+                'target_kind': 'human', 'target_id': 1,
+                'target_team': 1, 'observing_team': 2,
+                'visible': True,
+            }],
+        }
+
+        self.assertTrue(authority.on_bot_observation(authority_target))
+        self.assertFalse(guest.on_bot_observation(authority_target))
+        self.assertEqual([(True, 12.5)], authority_observed)
+        self.assertEqual([(False, 12.5)], guest_observed)
+
+        guest_target = dict(authority_target)
+        guest_target['contacts'] = [dict(
+            authority_target['contacts'][0], target_id=2)]
+        self.assertTrue(guest.on_bot_observation(guest_target))
+        self.assertEqual((True, 12.5), guest_observed[-1])
+
+        hidden = dict(guest_target)
+        hidden['contacts'] = [dict(
+            guest_target['contacts'][0], visible=False)]
+        self.assertFalse(guest.on_bot_observation(hidden))
+        self.assertEqual(1, sum(1 for visible, unused_now in guest_observed
+                                if visible))
+
+        stale = dict(guest_target, round_id=6)
+        self.assertFalse(guest.on_bot_observation(stale))
+        self.assertEqual(3, len(guest_observed))
+
     def test_bigworld_entity_rotation_keeps_yaw_out_of_roll(self):
         prohorovka_team_one_yaw = 2.947
 
@@ -1975,6 +2105,71 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
 
         self.assertIs(arena, battle._standard_arena('31_airfield'))
+
+    def test_supported_map_installs_catalog_before_native_destructible_reset(self):
+        runtime = _runtime()
+        runtime.area_destructibles = object()
+        runtime.destructibles_cache = object()
+        catalog = {'map': '01_karelia', 'resources': {'proved': {}}}
+        runtime.destructible_catalog_loader = mock.Mock(
+            return_value=catalog)
+        battle = BattleRuntime(runtime)
+        module = sys.modules[BattleRuntime.__module__]
+        from gui.mods.offline_lan_0922 import destructibles_sensor
+        calls = []
+
+        with mock.patch.object(
+                module.destructibles_compat, 'install', return_value=True), \
+                mock.patch.object(
+                    destructibles_sensor, 'set_catalog',
+                    side_effect=lambda value: calls.append(
+                        ('catalog', value))), \
+                mock.patch.object(
+                    destructibles_sensor, 'reset',
+                    side_effect=lambda space_id=None: calls.append(
+                        ('reset', space_id))), \
+                mock.patch.object(
+                    destructibles_sensor, 'set_event_sink',
+                    side_effect=lambda sink: calls.append(
+                        ('sink', sink))):
+            self.assertTrue(battle.start({
+                'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+                'name': 'Player'}, {
+                    'round_id': 1, 'map': '01_karelia',
+                    'bot_authority_id': 1, 'players': [], 'bots': [],
+                }, _Client()))
+            runtime.destructible_catalog_loader.assert_called_once_with(
+                '01_karelia')
+            self.assertIs(catalog, calls[0][1])
+            self.assertEqual('catalog', calls[0][0])
+            self.assertEqual(('reset', 7), calls[1])
+            self.assertEqual('sink', calls[2][0])
+
+            battle.stop(show_login=False)
+
+        self.assertEqual(('catalog', None), calls[-1])
+
+    def test_supported_map_rejects_missing_destructible_catalog_preflight(self):
+        runtime = _runtime()
+        runtime.area_destructibles = object()
+        runtime.destructibles_cache = object()
+        runtime.destructible_catalog_loader = mock.Mock(return_value=None)
+        battle = BattleRuntime(runtime)
+        module = sys.modules[BattleRuntime.__module__]
+        from gui.mods.offline_lan_0922 import destructibles_sensor
+
+        with mock.patch.object(
+                module.destructibles_compat, 'install', return_value=True), \
+                mock.patch.object(destructibles_sensor, 'set_catalog'), \
+                mock.patch.object(destructibles_sensor, 'reset'), \
+                mock.patch.object(destructibles_sensor, 'set_event_sink'):
+            self.assertFalse(battle.start({
+                'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+                'name': 'Player'}, {}, _Client()))
+
+        self.assertIn('destructible catalog is unavailable', battle.error)
+        self.assertNotIn(('map_create', '01_karelia'),
+                         runtime.bigworld.operations)
 
     def test_baked_formation_slot_is_reused_without_runtime_nudging(self):
         runtime = _runtime()
@@ -2089,7 +2284,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
     def test_lobby_is_retired_before_native_map_without_viewer_camera(self):
         runtime = _runtime()
-        stale_space = runtime.bigworld.spaces[7]
         battle = BattleRuntime(runtime)
         client = _Client()
         start = {
@@ -2115,9 +2309,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(1, runtime.app_loader.lobby_disposals)
         self.assertEqual(1, runtime.app_loader.lobby_populates)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
-        self.assertIsNot(stale_space, runtime.bigworld.spaces[7])
-        self.assertEqual(0xffffffff, stale_space.itemsVisibilityMask)
-        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
+        self.assertEqual(1, runtime.bigworld.space_visibility_masks[7])
         self.assertFalse(hasattr(runtime.app_loader, '__dict__'))
         type(runtime.app_loader).battle_page_calls.assert_not_called()
         self.assertFalse(runtime.offline_map_creator.Active())
@@ -2136,8 +2328,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
             0xfff00000)
         runtime.client_visibility_flags.SERVER_MASK = _UnsignedMask(
             0x000fffff)
-        runtime.bigworld.spaces[7]._items_visibility_mask = _UnsignedMask(
-            0x812abcde)
         battle = BattleRuntime(runtime)
         start = {
             'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
@@ -2152,31 +2342,44 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(
             0x00000001,
-            runtime.bigworld.spaces[7].itemsVisibilityMask)
+            runtime.bigworld.space_visibility_masks[7])
         self.assertEqual(
             ('space_visibility', 7, 0x00000001),
             runtime.bigworld.operations[-1])
 
-    def test_native_map_requires_the_fresh_space_visibility_property(self):
+    def test_native_map_does_not_require_a_server_space_data_object(self):
         runtime = _runtime()
-        original_create = runtime.offline_map_creator.create
+        runtime.bigworld.spaces = {}
+        original_set_mask = runtime.bigworld.wg_setSpaceItemsVisibilityMask
 
-        def create_without_live_space(map_name):
-            original_create(map_name)
-            runtime.bigworld.spaces.pop(7)
+        def set_mask_without_status(space_id, mask):
+            original_set_mask(space_id, mask)
+            return False
 
-        runtime.offline_map_creator.create = create_without_live_space
+        runtime.bigworld.wg_setSpaceItemsVisibilityMask = mock.Mock(
+            side_effect=set_mask_without_status)
+        runtime.bigworld.wg_getSpaceItemsVisibilityMask = mock.Mock(
+            side_effect=AssertionError(
+                'client-only visibility must not require synchronous '
+                'readback'))
         battle = BattleRuntime(runtime)
 
-        self.assertFalse(battle.start({
+        self.assertTrue(battle.start({
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
-            'name': 'Player'}, {'round_id': 1}, _Client()))
+            'name': 'Player'}, {
+                'round_id': 1, 'map': '01_karelia',
+                'bot_authority_id': 1,
+                'players': [{
+                    'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                    'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+                'bots': []}, _Client()))
 
-        self.assertEqual('failed', battle.state)
-        self.assertIn('space visibility contract is invalid', battle.error)
-        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
-        self.assertEqual([(4, 5), (5, 4)], runtime.app_loader.transitions)
-        self.assertEqual(1, runtime.app_loader.lobby_listener_balance)
+        self.assertEqual(1, runtime.bigworld.space_visibility_masks[7])
+        runtime.bigworld.wg_setSpaceItemsVisibilityMask.assert_called_once_with(
+            7, 1)
+        runtime.bigworld.wg_getSpaceItemsVisibilityMask.assert_not_called()
+        self.assertEqual([(4, 5)], runtime.app_loader.transitions)
+        self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
 
     def test_incomplete_hangar_fails_before_native_clear(self):
         runtime = _runtime()
@@ -2359,25 +2562,20 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(1, runtime.app_loader.lobby_disposals)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
 
-    def test_visibility_readback_failure_restores_clean_lobby_then_retries(self):
-        class _RejectingSpaceData(_SpaceData):
-            @_SpaceData.itemsVisibilityMask.setter
-            def itemsVisibilityMask(self, mask):
-                self._operations.append(
-                    ('space_visibility_rejected', self._space_id, int(mask)))
-
+    def test_visibility_write_failure_restores_clean_lobby_then_retries(self):
         runtime = _runtime()
-        original_create = runtime.offline_map_creator.create
-        create_count = [0]
+        original_set_mask = runtime.bigworld.wg_setSpaceItemsVisibilityMask
+        write_count = [0]
 
-        def create_with_first_write_rejected(map_name):
-            original_create(map_name)
-            create_count[0] += 1
-            if create_count[0] == 1:
-                runtime.bigworld.spaces[7] = _RejectingSpaceData(
-                    runtime.bigworld.operations, 7, 0)
+        def reject_first_write(space_id, mask):
+            write_count[0] += 1
+            if write_count[0] == 1:
+                runtime.bigworld.operations.append(
+                    ('space_visibility_rejected', int(space_id), int(mask)))
+                raise ValueError('native visibility write rejected')
+            return original_set_mask(space_id, mask)
 
-        runtime.offline_map_creator.create = create_with_first_write_rejected
+        runtime.bigworld.wg_setSpaceItemsVisibilityMask = reject_first_write
         battle = BattleRuntime(runtime)
 
         self.assertFalse(battle.start({
@@ -2385,7 +2583,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'name': 'Player'}, {'round_id': 1}, _Client()))
 
         self.assertEqual('failed', battle.state)
-        self.assertIn('visibility mask was not applied', battle.error)
+        self.assertIn('visibility mask could not be applied', battle.error)
         self.assertEqual([(4, 5), (5, 4)], runtime.app_loader.transitions)
         self.assertEqual(1, runtime.app_loader.lobby_disposals)
         self.assertEqual(2, runtime.app_loader.lobby_populates)
@@ -2408,7 +2606,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(2, runtime.app_loader.lobby_disposals)
         self.assertEqual(2, runtime.app_loader.lobby_populates)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
-        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
+        self.assertEqual(1, runtime.bigworld.space_visibility_masks[7])
 
     def test_battle_page_patch_does_not_overwrite_a_newer_class_patch(self):
         runtime = _runtime()
@@ -2477,6 +2675,81 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertFalse(battle._server.setClientReady())
         self.assertEqual(500, runtime.bigworld.entity(
             battle._server.vehicle_id).health)
+
+    def test_client_ready_restores_lakeville_ctf_visibility_after_stock_update(self):
+        runtime = _runtime()
+        runtime.arena_cache = {7: types.SimpleNamespace(
+            geometryName='07_lakeville', gameplayName='ctf', gameplayID=0)}
+        runtime.bigworld.defer_vehicle_entry = True
+        runtime.bigworld.reset_visibility_before_ready = True
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        start = {
+            'round_id': 1, 'map': '07_lakeville', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
+
+        self.assertTrue(battle.start({
+            'map': '07_lakeville', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, start, client))
+        self.assertEqual(0x00000001,
+                         runtime.bigworld.space_visibility_masks[7])
+
+        runtime.bigworld.callbacks.pop(0)()
+        runtime.bigworld.enter_pending_vehicle(battle._server.vehicle_id)
+        self.assertEqual(0x000fffff,
+                         runtime.bigworld.space_visibility_masks[7])
+        runtime.bigworld.callbacks.pop(0)()
+
+        self.assertEqual('running', battle.state)
+        selected_mask = runtime.bigworld.space_visibility_masks[7]
+        self.assertEqual(0x00000001, selected_mask)
+        visibility_writes = [
+            operation[2] for operation in runtime.bigworld.operations
+            if operation[0] == 'space_visibility']
+        self.assertEqual(
+            [0x00000001, 0x000fffff, 0x00000001], visibility_writes)
+
+        # Exact #1513 Lakeville compiled-space base instances use these
+        # visibility masks: the CTF bases include bit 0, while the nearby
+        # assault2 bases include bit 6 but not bit 0.
+        ctf_base_mask = 0xffffff89
+        assault2_base_mask = 0xffffffc0
+        self.assertTrue(ctf_base_mask & selected_mask)
+        self.assertFalse(assault2_base_mask & selected_mask)
+
+    def test_authority_runtime_counts_probes_without_per_probe_clock(self):
+        runtime = _runtime()
+        runtime.bigworld.defer_vehicle_entry = True
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
+
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, start, client))
+        runtime.bigworld.callbacks.pop(0)()
+        runtime.bigworld.enter_pending_vehicle(battle._server.vehicle_id)
+        runtime.bigworld.callbacks.pop(0)()
+
+        self.assertIsNone(battle._bots._probe_clock)
+        before = battle._bots.probe_totals()
+        result = battle._bots._probe_direction(
+            (0.0, 0.0, 0.0), 0.0, 10.0)
+        after = battle._bots.probe_totals()
+
+        self.assertEqual({'clear': True, 'collision': False,
+                          'water': False, 'slope': 0.0}, result)
+        self.assertEqual(1, after[4] - before[4])
+        self.assertEqual((0.0,) * len(after),
+                         battle._bots.probe_duration_totals())
 
     def test_player_identity_sync_rejects_arena_dp_mismatch(self):
         runtime = _runtime()
@@ -2747,6 +3020,264 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(20.0, max(end.z for unused, end in horizontal))
         self.assertEqual({-2.2, 0.0, 2.2},
                          {round(end.x, 1) for unused, end in horizontal})
+
+    def test_final_motion_world_receipt_copies_exact_flat_ground_geometry(self):
+        from gui.mods.offline_lan_0922 import destructibles_sensor
+
+        runtime = _runtime()
+        rays = []
+        original = runtime.bigworld.wg_collideSegment
+
+        def collide(space_id, start, end, mask):
+            rays.append((start, end))
+            return original(space_id, start, end, mask)
+
+        runtime.bigworld.wg_collideSegment = collide
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._destructibles = destructibles_sensor
+
+        receipt = battle._direction_world_receipt(
+            (0.0, 0.0, 0.0), 0.0, 4.0, _Descriptor())
+
+        self.assertEqual(15.0, receipt['distance'])
+        self.assertAlmostEqual(1.6, receipt['half_width'])
+        self.assertEqual(3.5, receipt['leading'])
+        self.assertEqual((0.0, 0.0, 0.0), receipt['origin'])
+        self.assertEqual(0.0, receipt['yaw'])
+        self.assertEqual(1, receipt['direction'])
+        receipt_rays = [
+            (start, end) for start, end in rays
+            if (abs(start.y - end.y) < 0.001 and
+                abs(start.z + 0.5) < 0.001 and
+                abs(end.z - 15.0) < 0.001)
+        ]
+        self.assertEqual(9, len(receipt_rays))
+        self.assertEqual(
+            {-1.6, 0.0, 1.6},
+            {round(start.x, 1) for start, unused in receipt_rays})
+        self.assertEqual(
+            {0.6, 1.1, 1.6},
+            {round(start.y, 1) for start, unused in receipt_rays})
+
+    def test_reverse_world_receipt_records_exact_travel_heading_and_sign(self):
+        from gui.mods.offline_lan_0922 import destructibles_sensor
+
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._destructibles = destructibles_sensor
+
+        receipt = battle._direction_world_receipt(
+            (4.0, 2.0, 8.0), math.pi, -4.0, _Descriptor())
+
+        self.assertEqual((4.0, 2.0, 8.0), receipt['origin'])
+        self.assertAlmostEqual(math.pi, receipt['yaw'])
+        self.assertEqual(-1, receipt['direction'])
+        self.assertEqual(3.5, receipt['leading'])
+
+    def test_final_world_receipt_catches_narrow_hull_edge_pillar(self):
+        from gui.mods.offline_lan_0922 import destructibles_sensor
+
+        runtime = _runtime()
+        horizontal_x = []
+
+        def collide(unused_space_id, start, end, unused_mask):
+            if abs(start.y - end.y) > 0.1:
+                return (_Vector(end.x, 0.0, end.z),)
+            horizontal_x.append(round(start.x, 1))
+            if abs(start.x - 1.6) < 0.001:
+                return (_Vector(start.x, start.y, start.z + 2.0),)
+            return None
+
+        runtime.bigworld.wg_collideSegment = collide
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._destructibles = destructibles_sensor
+
+        with mock.patch.object(
+                destructibles_sensor, '_catalog_soft_static_path',
+                return_value=False) as soft_path:
+            result = battle._direction_world_receipt(
+                (0.0, 0.0, 0.0), 0.0, 4.0, _Descriptor())
+
+        self.assertFalse(result)
+        self.assertIn(1.6, horizontal_x)
+        self.assertNotIn(1.6, (-2.2, 0.0, 2.2))
+        soft_path.assert_called_once()
+
+    def test_deferred_exact_world_receipt_returns_no_proof(self):
+        from gui.mods.offline_lan_0922 import destructibles_sensor
+
+        runtime = _runtime()
+
+        def collide(unused_space_id, start, end, unused_mask):
+            if abs(start.y - end.y) > 0.1:
+                return (_Vector(end.x, 0.0, end.z),)
+            if abs(start.x - 1.6) < 0.001:
+                return (_Vector(start.x, start.y, start.z + 2.0),)
+            return None
+
+        runtime.bigworld.wg_collideSegment = collide
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._destructibles = destructibles_sensor
+
+        with mock.patch.object(
+                destructibles_sensor, '_catalog_soft_static_path',
+                return_value='deferred'):
+            result = battle._direction_world_receipt(
+                (0.0, 0.0, 0.0), 0.0, 4.0, _Descriptor())
+
+        self.assertEqual('deferred', result)
+
+    def test_generic_direction_probe_never_runs_exact_world_receipt(self):
+        from gui.mods.offline_lan_0922 import destructibles_sensor
+
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._destructibles = destructibles_sensor
+        battle._direction_world_receipt = mock.Mock(
+            side_effect=AssertionError('planning requested exact receipt'))
+
+        result = battle._direction_probe(
+            (0.0, 0.0, 0.0), 0.0, 4.0, _Descriptor())
+
+        self.assertTrue(result['clear'])
+        self.assertNotIn('world_receipt', result)
+        battle._direction_world_receipt.assert_not_called()
+
+    def test_direction_probe_uses_asymmetric_hull_lead_and_directional_cap(self):
+        from gui.mods.offline_lan_0922 import destructibles_sensor
+
+        runtime = _runtime()
+        descriptor = _Descriptor()
+        descriptor.hull.hitTester.bbox = (
+            _Vector(-1.7, -0.2, -2.0),
+            _Vector(1.7, 1.4, 5.0), None)
+        captures = []
+
+        def collide(unused_space_id, start, end, unused_mask):
+            if abs(start.y - end.y) > 0.1:
+                return (_Vector(end.x, 0.0, end.z),)
+            direction = end - start
+            direction.normalise()
+            return (start + direction.scale(6.0),)
+
+        def soft_path(unused_space_id, start, unused_end,
+                      unused_collision, impact_speed, unused_descriptor,
+                      recast_budget=None, allow_kinetic_first=False,
+                      kinetic_speed=None):
+            # The typed receipt owns a separate exact 3x3 sweep beginning
+            # behind the hull. Keep this assertion scoped to the legacy far
+            # planning rays whose reachable-impact calculation it verifies.
+            if abs(float(start.z)) < 0.001:
+                captures.append(float(impact_speed))
+                contracts.append((allow_kinetic_first, kinetic_speed))
+            return True
+
+        runtime.bigworld.wg_collideSegment = collide
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._destructibles = destructibles_sensor
+        params = {
+            'mass': 1000.0, 'speedFwd': 20.0, 'speedBwd': 10.0}
+        contracts = []
+
+        with mock.patch.object(
+                destructibles_sensor, '_catalog_soft_static_path',
+                side_effect=soft_path), \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'vehicle_physics.derive_params', return_value=params), \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'vehicle_physics.engine_force',
+                    side_effect=lambda unused_params, unused_speed, throttle,
+                    unused_pitch: 2000.0 * throttle):
+            self.assertTrue(battle._direction_probe(
+                (0.0, 0.0, 0.0), 0.0, 1.0, descriptor)['clear'])
+            forward = tuple(captures)
+            forward_contracts = tuple(contracts)
+            del captures[:]
+            del contracts[:]
+            self.assertTrue(battle._direction_probe(
+                (0.0, 0.0, 0.0), 0.0, -1.0, descriptor)['clear'])
+            reverse = tuple(captures)
+            reverse_contracts = tuple(contracts)
+
+        self.assertTrue(forward)
+        self.assertTrue(reverse)
+        self.assertTrue(all(abs(value - math.sqrt(5.0)) < 0.0001
+                            for value in forward))
+        self.assertTrue(all(abs(value - math.sqrt(17.0)) < 0.0001
+                            for value in reverse))
+        self.assertTrue(all(value <= 20.0 for value in forward))
+        self.assertTrue(all(value <= 10.0 for value in reverse))
+        self.assertTrue(all(enabled and limit == 20.0
+                            for enabled, limit in forward_contracts))
+        self.assertTrue(all(enabled and limit == 10.0
+                            for enabled, limit in reverse_contracts))
+
+    def test_direction_probe_propagates_soft_budget_defer_but_keeps_wall_hard(self):
+        from gui.mods.offline_lan_0922 import destructibles_sensor
+
+        runtime = _runtime()
+        descriptor = _Descriptor()
+
+        def collide(unused_space_id, start, end, unused_mask):
+            if abs(start.y - end.y) > 0.1:
+                return (_Vector(end.x, 0.0, end.z),)
+            return (_Vector(start.x, start.y, start.z + 4.0),)
+
+        runtime.bigworld.wg_collideSegment = collide
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._destructibles = destructibles_sensor
+
+        with mock.patch.object(
+                destructibles_sensor, '_catalog_soft_static_path',
+                return_value='deferred'):
+            result = battle._direction_probe(
+                (0.0, 0.0, 0.0), 0.0, 4.0, descriptor)
+        self.assertTrue(result['clear'])
+        self.assertFalse(result['collision'])
+        self.assertTrue(result['deferred'])
+
+        statuses = iter(('deferred', False))
+        with mock.patch.object(
+                destructibles_sensor, '_catalog_soft_static_path',
+                side_effect=lambda *unused, **unused_kwargs: next(statuses)):
+            result = battle._direction_probe(
+                (0.0, 0.0, 0.0), 0.0, 4.0, descriptor)
+        self.assertFalse(result['clear'])
+        self.assertTrue(result['collision'])
+
+    def test_direction_probe_fails_closed_without_hull_bbox_abi(self):
+        from gui.mods.offline_lan_0922 import destructibles_sensor
+
+        runtime = _runtime()
+        descriptor = _Descriptor()
+        descriptor.hull.hitTester.bbox = None
+
+        def collide(unused_space_id, start, end, unused_mask):
+            if abs(start.y - end.y) > 0.1:
+                return (_Vector(end.x, 0.0, end.z),)
+            return (_Vector(start.x, start.y, start.z + 4.0),)
+
+        runtime.bigworld.wg_collideSegment = collide
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._destructibles = destructibles_sensor
+
+        with mock.patch.object(
+                destructibles_sensor, '_catalog_soft_static_path') as soft:
+            result = battle._direction_probe(
+                (0.0, 0.0, 0.0), 0.0, 4.0, descriptor)
+        self.assertFalse(result['clear'])
+        self.assertTrue(result['collision'])
+        soft.assert_not_called()
 
     def test_bot_firing_lane_trims_hulls_and_tries_two_target_heights(self):
         runtime = _runtime()
@@ -3341,6 +3872,86 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual([], battle._avatar.battle_events)
         battle._avatar.terrainEffects.addNew.assert_not_called()
 
+    def test_snapshots_do_not_overwrite_local_damage_colour(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        battle._avatar.playerVehicleID = 10
+        battle._synchronise_player_identity(10)
+        attacker = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                            {'health': 500})
+        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 1),
+                          (0, 0, 0), {'health': 500})
+        runtime.bigworld.entities.update({10: attacker, 11: target})
+        target_record = {
+            'engine_id': 11,
+            'state': {
+                'team': 2, 'health': 500, 'display_health': 500,
+                'alive': True, 'death_attacker_kind': '',
+                'death_attacker_id': 0},
+            'kind': 'bot', 'network_id': 2, 'local': False,
+            'presentation': True}
+        battle._records = {
+            'player:1': {
+                'engine_id': 10,
+                'state': {'team': 1, 'health': 500, 'alive': True},
+                'kind': 'player', 'network_id': 1, 'local': True},
+            'bot:2': target_record,
+        }
+
+        def apply_snapshot(health):
+            state = dict(target_record['state'])
+            state.update({
+                'health': health, 'display_health': health, 'alive': True,
+                'death_reason': 0, 'death_attacker_kind': '',
+                'death_attacker_id': 0})
+            target_record['state'] = state
+            battle._apply_health(
+                target_record, state,
+                battle._death_attacker_engine_id(state), 0)
+
+        self.assertTrue(battle._apply_combat_event({
+            'kind': 'bot_hit', 'attacker': 1, 'target_bot': 2,
+            'damage': 10, 'health': 490, 'dead': False,
+            'attack_reason': 0, 'death_reason': 0, 'source': 'shot',
+            'world_pose': True, 'x': 0.0, 'y': 0.0, 'z': 1.0,
+            'shell_index': 0, 'shot_result': 2}))
+        self.assertEqual(490, target_record['state']['display_health'])
+        apply_snapshot(490)
+
+        present_health = battle._avatar.guiSessionProvider.setVehicleHealth
+        present_health.assert_called_once_with(False, 11, 490, 10, 0)
+
+        self.assertTrue(battle._apply_combat_event({
+            'kind': 'bot_hit', 'attacker': 1, 'target_bot': 2,
+            'damage': 10, 'health': 480, 'dead': False,
+            'attack_reason': 0, 'death_reason': 0, 'source': 'shot',
+            'world_pose': True, 'x': 0.0, 'y': 0.0, 'z': 1.0,
+            'shell_index': 0, 'shot_result': 2}))
+        apply_snapshot(480)
+
+        self.assertTrue(battle._apply_combat_event({
+            'kind': 'bot_hit', 'attacker': 1, 'target_bot': 2,
+            'damage': 10, 'health': 470, 'dead': False,
+            'attack_reason': 2, 'death_reason': 0, 'source': 'ram'}))
+        apply_snapshot(470)
+
+        self.assertTrue(battle._apply_combat_event({
+            'kind': 'bot_hit', 'attacker': 1, 'target_bot': 2,
+            'damage': 10, 'health': 460, 'dead': False,
+            'attack_reason': 0, 'death_reason': 0, 'source': 'shot',
+            'world_pose': True, 'x': 0.0, 'y': 0.0, 'z': 1.0,
+            'shell_index': 0, 'shot_result': 2}))
+        apply_snapshot(460)
+
+        self.assertEqual([
+            mock.call(False, 11, 490, 10, 0),
+            mock.call(False, 11, 480, 10, 0),
+            mock.call(False, 11, 470, 10, 2),
+            mock.call(False, 11, 460, 10, 0),
+        ], present_health.call_args_list)
+
     def test_local_ram_of_enemy_uses_ram_efficiency_without_shot_results(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -3501,6 +4112,38 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual([], battle._avatar.shot_results)
         self.assertEqual([], battle._avatar.battle_events)
 
+    def test_disconnected_projectile_attacker_does_not_block_damage(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 1),
+                          (0, 0, 0), {'health': 500})
+        runtime.bigworld.entities[11] = target
+        battle._records = {'bot:2': {
+            'engine_id': 11,
+            'state': {'team': 2, 'health': 500, 'alive': True},
+            'kind': 'bot', 'network_id': 2, 'local': False,
+            'ready': True}}
+        battle._projectile_lineage.add('1:p:7:1')
+        event = {
+            'kind': 'bot_hit', 'attacker': 7, 'target_bot': 2,
+            'projectile_id': '1:p:7:1', 'shot_seq': 1,
+            'shell_index': 0, 'shot_result': 2,
+            'damage': 125, 'health': 375, 'dead': False,
+            'attack_reason': 0, 'death_reason': 0, 'source': 'shot',
+            'world_pose': True, 'x': 0.0, 'y': 0.0, 'z': 1.0,
+        }
+
+        battle._prepare_ordered_event(event)
+        self.assertTrue(battle._event_is_ready(event))
+        self.assertTrue(battle._apply_combat_event(event))
+        self.assertEqual((375, 0, 0), target.health_change)
+
+        unknown = dict(event, projectile_id='1:p:7:2', health=250)
+        with self.assertRaisesRegex(RuntimeError, 'unknown entity'):
+            battle._prepare_ordered_event(unknown)
+
     def test_prebattle_freezes_input_and_publishes_battle_after_countdown(self):
         runtime = _runtime()
         runtime.bigworld.defer_vehicle_entry = True
@@ -3528,9 +4171,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             [(2, 25.0, 15.0, []), (2, 25.0, 15.0, [])], periods)
         self.assertEqual(
-            [runtime.constants.ARENA_PERIOD.BATTLE,
-             runtime.constants.ARENA_PERIOD.BATTLE],
-            runtime.bigworld.avatar.inputHandler.started_periods)
+            [], runtime.bigworld.avatar.inputHandler.started_periods)
         self.assertFalse(battle._battle_live)
         battle._sender.forward = 1.0
         self.assertFalse(battle.shoot(0.0, 0.0))
@@ -3778,8 +4419,83 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(runtime.bigworld.avatar.positions)
         self.assertTrue(client.sent)
 
+    def test_player_pose_publication_preserves_thirty_hz_phase(self):
+        for frame_rate in (40, 45, 50, 60, 75, 120):
+            runtime = _runtime()
+            battle = BattleRuntime(runtime)
+            battle.client = _Client()
+            battle._avatar = runtime.bigworld.avatar
+            entity = _Vehicle(
+                10, _Descriptor(), _Vector(2, 3, 4), (0, 0, 0),
+                {'health': 500})
+            runtime.bigworld.entities[10] = entity
+            battle._server = types.SimpleNamespace(vehicle_id=10)
+            send_current = mock.Mock(return_value=True)
+            battle._sender = types.SimpleNamespace(
+                forward=1.0, turn=0.0, handbrake=False,
+                send_current=send_current)
+            battle._local_position = (2.0, 3.0, 4.0)
+            battle._local_descriptor = entity.typeDescriptor
+            battle._attach_local_presentation()
+            samples = []
+            previous_sends = 0
+
+            with mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'vehicle_physics.longitudinal_step',
+                    return_value=14.0), mock.patch(
+                        'gui.mods.offline_lan_0922.battle_runtime.'
+                        'vehicle_physics.traverse_step', return_value=0.0):
+                for unused_frame in range(frame_rate * 2):
+                    battle._drive_local(1.0 / frame_rate)
+                    samples.append(battle._local_position[2])
+                    current_sends = send_current.call_count
+                    self.assertLessEqual(current_sends - previous_sends, 1)
+                    previous_sends = current_sends
+
+            self.assertTrue(all(
+                right > left for left, right in zip(samples, samples[1:])))
+            self.assertEqual(frame_rate * 2, len(
+                runtime.bigworld.avatar.positions))
+            self.assertGreaterEqual(send_current.call_count, 59)
+            self.assertLessEqual(send_current.call_count, 61)
+
     def test_battle_frame_requests_the_next_render_frame(self):
         self.assertEqual(0.0, FRAME_SECONDS)
+
+    def test_frame_diagnostics_keep_raw_delta_while_motion_uses_cap(self):
+        runtime = _runtime()
+        runtime.bigworld.now = 1.0
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._battle_live = True
+        battle._last_frame_time = 0.85
+        battle._avatar = runtime.bigworld.avatar
+        battle._frame_diagnostics = types.SimpleNamespace(
+            enabled=True, begin=mock.Mock(return_value=19),
+            finish=mock.Mock())
+        battle._flush_pending_bot_create = mock.Mock()
+        battle._flush_pending_entities = mock.Mock()
+        battle._drain_event_journal = mock.Mock()
+        battle._maybe_send_battle_ready = mock.Mock()
+        battle._tick_critical_states = mock.Mock()
+        battle._tick_drowning = mock.Mock()
+        battle._drive_local = mock.Mock()
+        battle._update_target_outline = mock.Mock()
+        battle._update_spotting = mock.Mock()
+        battle._schedule = mock.Mock()
+
+        battle._frame()
+
+        battle._frame_diagnostics.begin.assert_called_once()
+        self.assertAlmostEqual(
+            0.15, battle._frame_diagnostics.begin.call_args[0][1])
+        battle._tick_critical_states.assert_called_once_with(0.1)
+        battle._drive_local.assert_called_once_with(0.1)
+        finish = battle._frame_diagnostics.finish.call_args[0]
+        self.assertEqual(19, finish[0])
+        self.assertAlmostEqual(0.1, finish[2])
+        self.assertAlmostEqual(0.1, finish[3])
 
     def test_authority_pose_is_presented_without_a_network_publication(self):
         runtime = _runtime()
@@ -3819,14 +4535,133 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._apply_authority_bot_poses.assert_called_once_with((state,))
         battle._schedule.assert_called_once_with(0.0, battle._frame)
 
-    def test_local_compound_matrix_is_rebound_only_after_refresh(self):
+    def test_frame_diagnostics_pull_bot_probe_counts_and_durations(self):
+        runtime = _runtime()
+        runtime.bigworld.now = 1.0
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._battle_live = True
+        battle._last_frame_time = 0.98
+        battle._avatar = runtime.bigworld.avatar
+        battle._last_snapshot = {'players': []}
+        diagnostics = types.SimpleNamespace(
+            enabled=True, begin=mock.Mock(return_value=31),
+            finish=mock.Mock())
+        battle._frame_diagnostics = diagnostics
+        battle._bots = types.SimpleNamespace(
+            update=mock.Mock(return_value=[]),
+            presentation_states=mock.Mock(return_value=()),
+            probe_totals=mock.Mock(side_effect=[
+                (10, 20, 30, 40, 50), (12, 23, 30, 41, 54)]),
+            probe_duration_totals=mock.Mock(side_effect=[
+                (0.1, 0.2, 0.3, 0.4, 0.5),
+                (0.102, 0.206, 0.3, 0.404, 0.51)]),
+            is_authority=mock.Mock(return_value=True))
+        battle._flush_pending_bot_create = mock.Mock()
+        battle._flush_pending_entities = mock.Mock()
+        battle._drain_event_journal = mock.Mock()
+        battle._maybe_send_battle_ready = mock.Mock()
+        battle._tick_critical_states = mock.Mock()
+        battle._tick_drowning = mock.Mock()
+        battle._drive_local = mock.Mock()
+        battle._update_target_outline = mock.Mock()
+        battle._apply_authority_bot_poses = mock.Mock()
+        battle._update_spotting = mock.Mock()
+        battle._schedule = mock.Mock()
+
+        battle._frame()
+
+        finish = diagnostics.finish.call_args
+        self.assertEqual(
+            {'visibility': 2, 'lane': 3, 'cover': 0,
+             'ground': 1, 'motion': 4},
+            finish.args[5])
+        durations = finish.kwargs['probe_durations']
+        for name, expected in (
+                ('visibility', 0.002), ('lane', 0.006),
+                ('cover', 0.0), ('ground', 0.004), ('motion', 0.01)):
+            self.assertAlmostEqual(expected, durations[name])
+
+    def test_authority_observation_waits_for_the_server_relay(self):
+        runtime = _runtime()
+        runtime.bigworld.now = 1.0
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._battle_live = True
+        battle._last_frame_time = 0.98
+        battle._avatar = runtime.bigworld.avatar
+        battle._last_snapshot = {'players': []}
+        observation = {
+            'type': 'bot_observation',
+            'contacts': [{'target_kind': 'human', 'target_id': 1,
+                          'observing_team': 2, 'visible': True}],
+            'affordances': [],
+        }
+        battle._bots = types.SimpleNamespace(
+            update=mock.Mock(return_value=[observation]),
+            presentation_states=mock.Mock(return_value=()))
+        battle._flush_pending_bot_create = mock.Mock()
+        battle._flush_pending_entities = mock.Mock()
+        battle._drain_event_journal = mock.Mock()
+        battle._maybe_send_battle_ready = mock.Mock()
+        battle._tick_critical_states = mock.Mock()
+        battle._tick_drowning = mock.Mock()
+        battle._drive_local = mock.Mock()
+        battle._update_target_outline = mock.Mock()
+        battle._apply_authority_bot_poses = mock.Mock()
+        battle._update_spotting = mock.Mock()
+        battle._send_bot_message = mock.Mock(return_value=True)
+        battle._observe_local_vehicle = mock.Mock()
+        battle._schedule = mock.Mock()
+
+        battle._frame()
+
+        battle._send_bot_message.assert_called_once_with(observation)
+        battle._observe_local_vehicle.assert_not_called()
+
+    def test_authority_replaces_local_placeholder_and_omits_remote_one(self):
+        battle = BattleRuntime(_runtime())
+        battle.client = _Client()
+        battle._start_message = {'players': [{
+            'id': 1, 'team': 1, 'slot': 0, 'health': 500,
+            'alive': True}]}
+        battle._local_position = (592.0, 3.0, -418.0)
+        battle._local_yaw = -1.606
+        battle._local_speed = 4.0
+        battle._sender = _LANInputSender(battle)
+        battle._sender.align_aim(0.2, -0.05)
+        battle._last_snapshot = {'players': [
+            {'id': 1, 'team': 1, 'slot': 0, 'world_pose': False,
+             'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0},
+            {'id': 2, 'team': 2, 'slot': 0, 'world_pose': False,
+             'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0},
+            {'id': 3, 'team': 2, 'slot': 1, 'world_pose': True,
+             'x': -300.0, 'y': 2.0, 'z': 100.0, 'yaw': 1.0},
+        ]}
+
+        players = battle._authority_players()
+
+        self.assertEqual([1, 3], [value['id'] for value in players])
+        local = players[0]
+        self.assertEqual((592.0, 3.0, -418.0),
+                         (local['x'], local['y'], local['z']))
+        self.assertAlmostEqual(-1.606, local['yaw'])
+        self.assertAlmostEqual(-1.406, local['aim_yaw'])
+        self.assertAlmostEqual(-0.05, local['gun_pitch'])
+        self.assertTrue(local['world_pose'])
+        self.assertFalse(
+            battle._last_snapshot['players'][0]['world_pose'])
+
+    def test_local_compound_matrix_is_not_polled_or_rebound_per_frame(self):
         class CountingModel(object):
             def __init__(self, matrix):
                 self._matrix = matrix
                 self.assignments = []
+                self.reads = 0
 
             @property
             def matrix(self):
+                self.reads += 1
                 return self._matrix
 
             @matrix.setter
@@ -3849,19 +4684,50 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         battle._attach_local_presentation()
         attach_count = len(entity.model.assignments)
+        attach_reads = entity.model.reads
         battle._local_position = (3.0, 3.0, 5.0)
-        battle._update_local_presentation(entity)
+        battle._update_local_presentation(entity, 0.1)
 
         self.assertEqual(attach_count, len(entity.model.assignments))
-        self.assertIs(battle._local_matrix, entity.model.matrix)
-        refreshed = _Matrix()
-        entity.model.matrix = refreshed
-        refresh_count = len(entity.model.assignments)
+        self.assertEqual(attach_reads, entity.model.reads)
+        self.assertIs(battle._local_matrix, entity.model._matrix)
 
-        battle._update_local_presentation(entity)
+    def test_local_camera_motion_is_derived_from_copied_pose_each_frame(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(10, _Descriptor(), _Vector(2, 3, 4),
+                          (0, 0, 0), {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._local_position = (2.0, 3.0, 4.0)
+        battle._local_descriptor = entity.typeDescriptor
+        battle._attach_local_presentation()
 
-        self.assertEqual(refresh_count + 1, len(entity.model.assignments))
-        self.assertIs(battle._local_matrix, entity.model.matrix)
+        battle._local_position = (2.0, 3.0, 4.5)
+        battle._update_local_presentation(entity, 0.1)
+        overlay = runtime.compatibility.pose_overlays[id(entity)]
+        self.assertEqual((0.0, 0.0, 5.0), tuple(overlay['velocity']))
+        self.assertEqual((0.0, 0.0, 50.0),
+                         tuple(overlay['acceleration']))
+
+        battle._local_position = (2.0, 3.0, 5.0)
+        battle._update_local_presentation(entity, 0.1)
+        overlay = runtime.compatibility.pose_overlays[id(entity)]
+        self.assertEqual((0.0, 0.0, 5.0), tuple(overlay['velocity']))
+        self.assertEqual((0.0, 0.0, 0.0),
+                         tuple(overlay['acceleration']))
+
+        battle._sender = types.SimpleNamespace(
+            forward=1.0, turn=0.0, handbrake=False,
+            send_current=mock.Mock(return_value=True))
+        battle._battle_result = {'winner': 1}
+        battle._drive_local(0.1)
+        overlay = runtime.compatibility.pose_overlays[id(entity)]
+        self.assertEqual((0.0, 0.0, 0.0), tuple(overlay['velocity']))
+        self.assertEqual((0.0, 0.0, -50.0),
+                         tuple(overlay['acceleration']))
 
     def test_local_motion_notifies_destructibles_before_collision_probe(self):
         runtime = _runtime()
@@ -3880,7 +4746,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._attach_local_presentation()
         battle._destructibles = mock.Mock()
 
-        def motion_is_clear(*unused_args):
+        def motion_is_clear(*unused_args, **unused_kwargs):
             battle._destructibles._fell_trees_near.assert_called_once()
             return True
 
@@ -3894,6 +4760,489 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(0.0, call[2])
         self.assertGreater(call[3], 0.0)
         self.assertIs(entity.typeDescriptor, call[4])
+
+    def test_local_catalog_contact_blocks_static_probe_and_motion(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(10, _Descriptor(), _Vector(2, 3, 4), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = types.SimpleNamespace(
+            forward=1.0, turn=0.0, handbrake=False,
+            send_current=mock.Mock(return_value=True))
+        battle._local_position = (2.0, 3.0, 4.0)
+        battle._local_descriptor = entity.typeDescriptor
+        battle._attach_local_presentation()
+        battle._destructibles = mock.Mock()
+        battle._destructibles._catalog_motion_blocked.return_value = True
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision',
+                return_value=False) as static_probe:
+            battle._drive_local(0.1)
+
+        self.assertEqual((2.0, 4.0), (
+            battle._local_position[0], battle._local_position[2]))
+        self.assertTrue(
+            battle._destructibles._catalog_motion_blocked.called)
+        self.assertTrue(static_probe.called)
+
+    def test_catalog_motion_body_type_error_is_not_retried(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._clock = lambda: 10.0
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
+        calls = []
+
+        def resolve(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise TypeError('sensor body failed after native work')
+
+        battle._destructibles = types.SimpleNamespace(
+            _catalog_motion_blocked=resolve,
+            _catalog_pending_at_hull=mock.Mock(return_value=False))
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision',
+                return_value=False):
+            with self.assertRaisesRegex(TypeError, 'sensor body failed'):
+                battle._motion_is_clear(
+                    entity, (0.0, 0.0, 0.0), 0.0, 5.0, 0.04)
+
+        self.assertEqual(1, len(calls))
+
+    def test_player_pending_contact_preserves_speed_but_hard_wall_damps(self):
+        def exercise(pending):
+            runtime = _runtime()
+            battle = BattleRuntime(runtime)
+            battle.client = _Client()
+            battle._avatar = runtime.bigworld.avatar
+            entity = _Vehicle(
+                10, _Descriptor(), _Vector(2, 3, 4), (0, 0, 0),
+                {'health': 500})
+            runtime.bigworld.entities[10] = entity
+            battle._server = types.SimpleNamespace(vehicle_id=10)
+            battle._sender = types.SimpleNamespace(
+                forward=1.0, turn=0.0, handbrake=False,
+                send_current=mock.Mock(return_value=True))
+            battle._local_position = (2.0, 3.0, 4.0)
+            battle._local_descriptor = entity.typeDescriptor
+            battle._attach_local_presentation()
+            battle._destructibles = mock.Mock()
+            battle._destructibles._catalog_pending_at_hull.return_value = (
+                pending)
+            battle._smoothed_drive_pitch = mock.Mock(return_value=0.0)
+            battle._update_vertical_motion = mock.Mock(
+                side_effect=lambda unused_entity, position, unused_yaw,
+                unused_dt: position)
+            battle._ground_pitch = mock.Mock(return_value=0.0)
+            battle._apply_slope_slide = mock.Mock(
+                side_effect=lambda position, unused_yaw, unused_dt,
+                unused_entity=None: position)
+            battle._resolve_local_tank_contacts = mock.Mock(
+                side_effect=lambda unused_entity, position, unused_yaw,
+                unused_dt: position)
+
+            with mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'vehicle_physics.longitudinal_step',
+                    return_value=6.0), mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'vehicle_physics.traverse_step',
+                    return_value=0.0), mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'world_collision.check_horizontal_collision',
+                    return_value=True) as static_probe:
+                battle._drive_local(0.1)
+            return battle, static_probe
+
+        pending_battle, pending_probe = exercise(True)
+        hard_battle, hard_probe = exercise(False)
+
+        self.assertEqual((2.0, 3.0, 4.0), pending_battle._local_position)
+        self.assertEqual(6.0, pending_battle._local_speed)
+        self.assertEqual(1, pending_probe.call_count)
+        self.assertEqual((2.0, 3.0, 4.0), hard_battle._local_position)
+        self.assertEqual(0.0, hard_battle._local_speed)
+        self.assertEqual(5, hard_probe.call_count)
+
+    def test_player_cap_crush_restores_real_speed_then_moves_next_tick(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(2, 3, 4), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = types.SimpleNamespace(
+            forward=1.0, turn=0.0, handbrake=False,
+            send_current=mock.Mock(return_value=True))
+        battle._local_position = (2.0, 3.0, 4.0)
+        battle._local_descriptor = entity.typeDescriptor
+        battle._attach_local_presentation()
+        battle._destructibles = mock.Mock()
+        battle._destructibles._catalog_motion_blocked.side_effect = ({
+            'status': 'crushed',
+            'token': ((22, 37, None),),
+            'accepted_now': True,
+            'used_kinetic_speed': True,
+        }, {
+            'status': 'clear', 'token': None,
+            'accepted_now': False, 'used_kinetic_speed': False,
+        })
+        battle._smoothed_drive_pitch = mock.Mock(return_value=0.0)
+        battle._update_vertical_motion = mock.Mock(
+            side_effect=lambda unused_entity, position, unused_yaw,
+            unused_dt: position)
+        battle._ground_pitch = mock.Mock(return_value=0.0)
+        battle._apply_slope_slide = mock.Mock(
+            side_effect=lambda position, unused_yaw, unused_dt,
+            unused_entity=None: position)
+        battle._resolve_local_tank_contacts = mock.Mock(
+            side_effect=lambda unused_entity, position, unused_yaw,
+            unused_dt: position)
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.longitudinal_step',
+                side_effect=lambda unused_params, speed, *unused_args:
+                speed + 1.0), mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.traverse_step', return_value=0.0), \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'world_collision.check_horizontal_collision',
+                    side_effect=('kinetic', 'clear')) as probe:
+            battle._drive_local(0.1)
+            first_position = battle._local_position
+            first_speed = battle._local_speed
+            battle._drive_local(0.1)
+
+        self.assertEqual((2.0, 3.0, 4.0), first_position)
+        self.assertEqual(0.0, first_speed)
+        self.assertEqual(1.0, battle._local_speed)
+        self.assertGreater(battle._local_position[2], first_position[2])
+        self.assertEqual(2, probe.call_count)
+        self.assertTrue(all(call.args[-2] for call in probe.call_args_list))
+        self.assertTrue(all(call.args[-1] is not None
+                            for call in probe.call_args_list))
+        sensor_calls = (
+            battle._destructibles._catalog_motion_blocked.call_args_list)
+        self.assertEqual(2, len(sensor_calls))
+        self.assertTrue(all(call.kwargs['kinetic_commit']
+                            for call in sensor_calls))
+        self.assertTrue(all(call.kwargs['return_detail']
+                            for call in sensor_calls))
+
+    def test_neutral_coast_does_not_request_kinetic_crush_drive(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(2, 3, 4), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = types.SimpleNamespace(
+            forward=0.0, turn=0.0, handbrake=False,
+            send_current=mock.Mock(return_value=True))
+        battle._local_position = (2.0, 3.0, 4.0)
+        battle._local_descriptor = entity.typeDescriptor
+        battle._attach_local_presentation()
+        battle._local_speed = 4.0
+        battle._destructibles = mock.Mock()
+        battle._smoothed_drive_pitch = mock.Mock(return_value=0.0)
+        battle._update_vertical_motion = mock.Mock(
+            side_effect=lambda unused_entity, position, unused_yaw,
+            unused_dt: position)
+        battle._ground_pitch = mock.Mock(return_value=0.0)
+        battle._apply_slope_slide = mock.Mock(
+            side_effect=lambda position, unused_yaw, unused_dt,
+            unused_entity=None: position)
+        battle._resolve_local_tank_contacts = mock.Mock(
+            side_effect=lambda unused_entity, position, unused_yaw,
+            unused_dt: position)
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.longitudinal_step', return_value=4.0), \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'vehicle_physics.traverse_step', return_value=0.0), \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'world_collision.check_horizontal_collision',
+                    return_value='hard') as probe:
+            battle._drive_local(0.1)
+
+        self.assertTrue(probe.called)
+        self.assertTrue(all(not call.args[-2]
+                            for call in probe.call_args_list))
+        self.assertTrue(all(call.args[-1] is None
+                            for call in probe.call_args_list))
+        self.assertFalse(battle._local_motion_cap_crushed)
+        battle._destructibles._catalog_motion_blocked.assert_not_called()
+
+    def test_static_contact_short_circuits_ambiguous_catalog_layer(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._destructibles = mock.Mock()
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision',
+                return_value=True):
+            self.assertFalse(battle._motion_is_clear(
+                entity, (0.0, 0.0, 0.0), 0.0, 5.0, 0.04))
+
+        battle._destructibles._catalog_motion_blocked.assert_not_called()
+
+    def test_world_contact_without_catalog_never_becomes_clear(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._destructibles = None
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+
+        for world_status in ('hard', 'kinetic'):
+            with self.subTest(world_status=world_status), mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'world_collision.check_horizontal_collision',
+                    return_value=world_status):
+                self.assertFalse(battle._motion_is_clear(
+                    entity, (0.0, 0.0, 0.0), 0.0, 1.0, 0.04,
+                    allow_crush_drive=True))
+
+    def test_player_reverse_braking_does_not_enable_cap_crush(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(2, 3, 4), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = types.SimpleNamespace(
+            forward=-1.0, turn=0.0, handbrake=False,
+            send_current=mock.Mock(return_value=True))
+        battle._local_position = (2.0, 3.0, 4.0)
+        battle._local_descriptor = entity.typeDescriptor
+        battle._attach_local_presentation()
+        battle._local_speed = 4.0
+        battle._smoothed_drive_pitch = mock.Mock(return_value=0.0)
+        battle._motion_is_clear = mock.Mock(return_value=True)
+        battle._update_vertical_motion = mock.Mock(
+            side_effect=lambda unused_entity, position, unused_yaw,
+            unused_dt: position)
+        battle._ground_pitch = mock.Mock(return_value=0.0)
+        battle._apply_slope_slide = mock.Mock(
+            side_effect=lambda position, unused_yaw, unused_dt,
+            unused_entity=None: position)
+        battle._resolve_local_tank_contacts = mock.Mock(
+            side_effect=lambda unused_entity, position, unused_yaw,
+            unused_dt: position)
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.longitudinal_step', return_value=3.0), \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'vehicle_physics.traverse_step', return_value=0.0):
+            battle._drive_local(0.1)
+
+        battle._motion_is_clear.assert_called_once()
+        self.assertFalse(
+            battle._motion_is_clear.call_args.kwargs['allow_crush_drive'])
+
+    def test_bot_braking_opposite_motion_does_not_enable_cap_crush(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._bots = types.SimpleNamespace(states={
+            11: {'movement_dir': -1, 'airborne': False},
+        })
+        battle._destructibles = mock.Mock()
+        battle._destructibles._catalog_pending_at_hull.return_value = False
+        battle._destructibles._catalog_motion_blocked.return_value = {
+            'status': 'clear', 'token': None,
+            'accepted_now': False, 'used_kinetic_speed': False,
+        }
+        descriptor = _Descriptor()
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision',
+                return_value='clear') as world_probe:
+            status = battle._resolve_bot_motion(
+                11, (0.0, 0.0, 0.0), 0.0, 4.0,
+                descriptor, 0.04, 10.0)
+
+        self.assertEqual('clear', status)
+        self.assertFalse(world_probe.call_args.args[-2])
+        self.assertIsNone(world_probe.call_args.args[-1])
+        sensor_call = (
+            battle._destructibles._catalog_motion_blocked.call_args)
+        self.assertFalse(sensor_call.kwargs['kinetic_commit'])
+        self.assertIsNone(sensor_call.kwargs['kinetic_speed'])
+
+    def test_bot_clear_catalog_guard_skips_per_frame_world_probe(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._bots = types.SimpleNamespace(states={
+            11: {'movement_dir': 1, 'airborne': False},
+        }, motion_world_receipt_reusable=mock.Mock(return_value=True))
+        battle._destructibles = mock.Mock()
+        battle._destructibles._catalog_hull_contact.return_value = False
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision') as world_probe:
+            status = battle._resolve_bot_motion(
+                11, (0.0, 0.0, 0.0), 0.0, 4.0,
+                _Descriptor(), 0.04, 10.0)
+
+        self.assertEqual('clear', status)
+        world_probe.assert_not_called()
+        battle._destructibles._catalog_motion_blocked.assert_not_called()
+        battle._bots.motion_world_receipt_reusable.assert_called_once_with(
+            11, (0.0, 0.0, 0.0), 0.0, 4.0, 10.0, 0.04)
+
+    def test_bot_reverse_receipt_uses_travel_yaw_and_actual_dt(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        receipt_reusable = mock.Mock(return_value=True)
+        battle._bots = types.SimpleNamespace(
+            states={11: {
+                'movement_dir': -1, 'rotation_dir': 0,
+                'airborne': False,
+            }},
+            motion_world_receipt_reusable=receipt_reusable)
+        battle._destructibles = mock.Mock()
+        battle._destructibles._catalog_hull_contact.return_value = False
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision') as world_probe:
+            status = battle._resolve_bot_motion(
+                11, (0.0, 0.0, 0.0), 0.0, -4.0,
+                _Descriptor(), 0.04, 10.0)
+
+        self.assertEqual('clear', status)
+        receipt_reusable.assert_called_once_with(
+            11, (0.0, 0.0, 0.0), math.pi, -4.0, 10.0, 0.04)
+        world_probe.assert_not_called()
+        battle._destructibles._catalog_motion_blocked.assert_not_called()
+
+    def test_bot_coast_without_direction_corridor_keeps_world_probe(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._bots = types.SimpleNamespace(states={
+            11: {'movement_dir': 0, 'rotation_dir': 0, 'airborne': False},
+        })
+        battle._destructibles = mock.Mock()
+        battle._destructibles._catalog_pending_at_hull.return_value = False
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision',
+                return_value='hard') as world_probe:
+            status = battle._resolve_bot_motion(
+                11, (0.0, 0.0, 0.0), 0.0, 4.0,
+                _Descriptor(), 0.04, 10.0)
+
+        self.assertEqual('hard', status)
+        world_probe.assert_called_once()
+        battle._destructibles._catalog_hull_contact.assert_not_called()
+        battle._destructibles._catalog_motion_blocked.assert_not_called()
+
+    def test_bot_residual_turn_speed_keeps_world_probe(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._bots = types.SimpleNamespace(
+            states={11: {'movement_dir': 1, 'rotation_dir': 0,
+                         'airborne': False}},
+            _turn_speeds={11: 0.5})
+        battle._destructibles = mock.Mock()
+        battle._destructibles._catalog_pending_at_hull.return_value = False
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision',
+                return_value='hard') as world_probe:
+            status = battle._resolve_bot_motion(
+                11, (0.0, 0.0, 0.0), 0.0, 4.0,
+                _Descriptor(), 0.04, 10.0)
+
+        self.assertEqual('hard', status)
+        world_probe.assert_called_once()
+        battle._destructibles._catalog_hull_contact.assert_not_called()
+        battle._destructibles._catalog_motion_blocked.assert_not_called()
+
+    def test_bot_airborne_motion_uses_airborne_world_probe_without_commit(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._bots = types.SimpleNamespace(states={
+            11: {'movement_dir': 1, 'airborne': True},
+        })
+        battle._destructibles = mock.Mock()
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision',
+                return_value='clear') as world_probe:
+            status = battle._resolve_bot_motion(
+                11, (0.0, 2.0, 0.0), 0.0, 4.0,
+                _Descriptor(), 0.04, 10.0)
+
+        self.assertEqual('clear', status)
+        self.assertTrue(world_probe.call_args.args[7])
+        self.assertFalse(world_probe.call_args.args[-2])
+        self.assertIsNone(world_probe.call_args.args[-1])
+        battle._destructibles._catalog_hull_contact.assert_not_called()
+        battle._destructibles._catalog_motion_blocked.assert_not_called()
+
+    def test_hard_compound_contact_overrides_accepted_cap_receipt(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._bots = types.SimpleNamespace(states={
+            11: {'movement_dir': 1, 'airborne': False},
+        })
+        battle._destructibles = mock.Mock()
+        battle._destructibles._catalog_hull_contact.return_value = True
+        battle._destructibles._catalog_motion_blocked.return_value = {
+            'status': 'hard', 'token': None,
+            'accepted_now': True, 'used_kinetic_speed': True,
+        }
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision',
+                return_value='clear'):
+            status = battle._resolve_bot_motion(
+                11, (0.0, 0.0, 0.0), 0.0, 4.0,
+                _Descriptor(), 0.04, 10.0)
+
+        self.assertEqual('hard', status)
 
     def test_destroyed_track_locks_drive_and_turn_through_brake_path(self):
         runtime = _runtime()
@@ -3999,16 +5348,28 @@ class BattleRuntimeContractTests(unittest.TestCase):
                           {'health': 500})
         runtime.bigworld.entities[10] = entity
         battle._server = types.SimpleNamespace(vehicle_id=10)
-        battle._sender = types.SimpleNamespace(
-            forward=1.0, turn=0.0, handbrake=False,
-            send_current=lambda: client.send_input('current'))
+        battle._binding = mock.Mock()
+        battle._sender = _LANInputSender(battle)
+        battle._sender.forward = 1.0
         battle._local_position = (2.0, 3.0, 4.0)
+        battle._local_yaw = -1.606
         battle._local_descriptor = entity.typeDescriptor
+        battle._gun_state = gun_mechanics.GunState(entity.typeDescriptor)
         camera = battle._avatar.inputHandler.\
             _AvatarInputHandler__curCtrl.camera
         stale_matrix = camera.vehicleMProv
+        rotator = battle._avatar.gunRotator
+        rotator.turretYaw = 0.85
+        rotator.gunPitch = -0.12
+
+        def reset_gun_direction():
+            rotator.turretYaw = 0.0
+            rotator.gunPitch = 0.0
+
+        rotator.reset.side_effect = reset_gun_direction
 
         battle._attach_local_presentation()
+        callbacks_before = len(runtime.bigworld.callbacks)
         battle._bind_local_arcade_camera()
         battle._drive_local(0.1)
 
@@ -4023,9 +5384,140 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIs(battle._local_matrix, output.rotationSrc)
         self.assertIs(battle._local_matrix, output.translationSrc)
         self.assertIs(battle._local_matrix, stabilised.target)
+        self.assertEqual(1, camera.direction_resets)
+        rotator.reset.assert_called_once_with()
+        rotator.start.assert_not_called()
+        self.assertEqual([], battle._avatar.gun_tracking_calls)
+        self.assertIsNone(rotator.
+                          _VehicleGunRotator__maxTurretRotationSpeed)
+        self.assertFalse(rotator._VehicleGunRotator__isStarted)
+        self.assertFalse(battle._avatar._PlayerAvatar__isOnArena)
+        self.assertEqual(callbacks_before, len(runtime.bigworld.callbacks))
+        self.assertEqual([], battle._avatar.ammo_updates)
+        self.assertEqual([], battle._avatar.reload_updates)
+        battle._binding.update_vehicle_aim.assert_called_once_with(
+            10, -1.606, -1.606, 0.0)
+        self.assertAlmostEqual(-1.606, battle._sender.aim_yaw)
+        self.assertAlmostEqual(0.0, battle._sender.gun_pitch)
         self.assertEqual(
             battle._local_position,
             tuple(camera.vehicleMProv.translation))
+
+    def test_prebattle_preserves_native_gun_and_marker_fence(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._battle_live = False
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(10, _Descriptor(), _Vector(2, 3, 4), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._gun_state = gun_mechanics.GunState(entity.typeDescriptor)
+        battle._config = {
+            'prebattleCountdownSeconds': 15.0,
+            'battleDurationSeconds': 900.0,
+        }
+        battle.client = types.SimpleNamespace()
+        rotator = battle._avatar.gunRotator
+        rotator.showServerMarker = True
+        rotator.getCurShotPosition = mock.Mock(return_value=(
+            _Vector(0.0, 2.0, 0.0), _Vector(0.0, 0.0, 1.0)))
+
+        def publish_period(period, duration):
+            self.assertEqual('prebattle', period)
+            self.assertEqual(12.0, duration)
+            # Exact #1513 applies the PREBATTLE fence synchronously.
+            battle._avatar._PlayerAvatar__isOnArena = False
+            rotator._VehicleGunRotator__isStarted = False
+
+        battle._binding = types.SimpleNamespace(arena_period=publish_period)
+
+        self.assertTrue(battle.on_battle_live({
+            'countdown_seconds': 12.0,
+            'battle_duration_seconds': 900.0,
+        }))
+        self.assertFalse(battle._sync_local_server_marker())
+        rotator.start.assert_not_called()
+        rotator.getCurShotPosition.assert_not_called()
+        self.assertEqual([], battle._avatar.inputHandler.started_periods)
+        self.assertEqual([], battle._avatar.gun_marker_updates)
+        self.assertFalse(rotator._VehicleGunRotator__isStarted)
+        self.assertFalse(battle._avatar._PlayerAvatar__isOnArena)
+        self.assertFalse(battle._battle_live)
+
+    def test_battle_transition_starts_one_native_gun_timer_from_zero(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._battle_live = False
+        battle._avatar = runtime.bigworld.avatar
+        battle._config = {
+            'prebattleCountdownSeconds': 15.0,
+            'battleDurationSeconds': 900.0,
+        }
+        battle.client = types.SimpleNamespace()
+        rotator = battle._avatar.gunRotator
+        rotator.turretYaw = 0.0
+        rotator.gunPitch = 0.0
+        rotator._VehicleGunRotator__maxTurretRotationSpeed = 1.0
+        rotator._VehicleGunRotator__isStarted = False
+        periods = []
+
+        def publish_period(period, duration):
+            periods.append((period, duration))
+            if period == 'prebattle':
+                battle._avatar._PlayerAvatar__isOnArena = False
+                rotator._VehicleGunRotator__isStarted = False
+            else:
+                self.assertEqual('battle', period)
+                battle._avatar._PlayerAvatar__isOnArena = True
+                battle._avatar.inputHandler.\
+                    _AvatarInputHandler__onArenaStarted(
+                        runtime.constants.ARENA_PERIOD.BATTLE)
+                rotator.start()
+
+        battle._binding = types.SimpleNamespace(arena_period=publish_period)
+
+        self.assertTrue(battle.on_battle_live({
+            'countdown_seconds': 12.0,
+            'battle_duration_seconds': 900.0,
+        }))
+        rotator.start.assert_not_called()
+        self.assertEqual([('prebattle', 12.0)], periods)
+        self.assertTrue(battle._begin_battle())
+        self.assertFalse(battle._begin_battle())
+        rotator.start.assert_called_once_with()
+        self.assertEqual(['start'], battle._avatar.gun_tracking_calls)
+        self.assertEqual(
+            [runtime.constants.ARENA_PERIOD.BATTLE],
+            battle._avatar.inputHandler.started_periods)
+        self.assertEqual(0.0, rotator.turretYaw)
+        self.assertEqual(0.0, rotator.gunPitch)
+        self.assertTrue(rotator._VehicleGunRotator__isStarted)
+        self.assertTrue(battle._avatar._PlayerAvatar__isOnArena)
+        self.assertTrue(battle._battle_live)
+
+    def test_prebattle_server_marker_waits_for_battle(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._battle_live = False
+        battle._avatar = runtime.bigworld.avatar
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        rotator = battle._avatar.gunRotator
+        rotator.showServerMarker = True
+        rotator.getCurShotPosition = mock.Mock()
+
+        self.assertFalse(battle._sync_local_server_marker())
+        rotator.getCurShotPosition.assert_not_called()
+        self.assertEqual([], battle._avatar.gun_marker_updates)
+
+        battle._battle_live = True
+        rotator.getCurShotPosition.return_value = (
+            _Vector(0.0, 2.0, 0.0), _Vector(0.0, 0.0, 1.0))
+        self.assertTrue(battle._sync_local_server_marker())
+        rotator.getCurShotPosition.assert_called_once_with()
+        self.assertEqual(1, len(battle._avatar.gun_marker_updates))
 
     def test_sniper_transition_rejects_stale_steady_sources(self):
         runtime = _runtime()
@@ -4059,38 +5551,50 @@ class BattleRuntimeContractTests(unittest.TestCase):
         stabilised.target = battle._local_matrix
         self.assertTrue(battle._on_control_mode_changed(handler, 'sniper'))
 
-    def test_postmortem_transition_checks_attached_camera_not_steady_aiming(self):
+    def test_postmortem_delay_uses_live_player_vehicle_matrix(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle.state = 'running'
         battle._avatar = runtime.bigworld.avatar
+        battle._avatar.playerVehicleID = 10
         battle._local_matrix = _Matrix()
         attached = types.SimpleNamespace(target=battle._local_matrix)
         battle._avatar.consistentMatrices = types.SimpleNamespace(
             attachedVehicleMatrix=attached)
+        vehicle = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                           {'health': 0})
+        vehicle.matrix = battle._local_matrix
+        runtime.bigworld.entities[10] = vehicle
         handler = battle._avatar.inputHandler
-        calculator = handler.steadyVehicleMatrixCalculator
-        calculator._SteadyVehicleMatrixCalculator__outputMProv.\
-            rotationSrc = object()
-        calculator._SteadyVehicleMatrixCalculator__outputMProv.\
-            translationSrc = object()
-        calculator._SteadyVehicleMatrixCalculator__stabilisedMProv.target = \
-            object()
-        camera = types.SimpleNamespace(vehicleMProv=attached)
-        handler._AvatarInputHandler__curCtrl = types.SimpleNamespace(
-            _PostMortemControlMode__cam=camera)
+        camera = types.SimpleNamespace(vehicleMProv=battle._local_matrix)
+        control = types.SimpleNamespace(
+            _PostMortemControlMode__cam=camera,
+            curPostmortemDelay=object())
+        handler._AvatarInputHandler__curCtrl = control
         handler._AvatarInputHandler__ctrlModeName = 'postmortem'
 
         self.assertTrue(battle._on_control_mode_changed(
             handler, 'postmortem'))
 
-        camera.vehicleMProv = object()
+        camera.vehicleMProv = attached
         with self.assertRaisesRegex(
                 RuntimeError,
                 'postmortem camera captured a stale vehicle pose'):
             battle._on_control_mode_changed(handler, 'postmortem')
 
+        camera.vehicleMProv = battle._local_matrix
+        vehicle.matrix = object()
+        with self.assertRaisesRegex(
+                RuntimeError,
+                'postmortem vehicle captured a stale vehicle pose'):
+            battle._on_control_mode_changed(handler, 'postmortem')
+
+        vehicle.matrix = battle._local_matrix
+        control.curPostmortemDelay = None
         camera.vehicleMProv = attached
+        self.assertTrue(battle._on_control_mode_changed(
+            handler, 'postmortem'))
+
         attached.target = object()
         with self.assertRaisesRegex(
                 RuntimeError,
@@ -4103,6 +5607,165 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 RuntimeError,
                 'attached vehicle matrix target is unavailable'):
             battle._on_control_mode_changed(handler, 'postmortem')
+
+    def test_postmortem_delay_uses_steady_matrix_after_vehicle_removed(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._avatar = runtime.bigworld.avatar
+        battle._avatar.playerVehicleID = 10
+        battle._local_matrix = _Matrix()
+        attached = types.SimpleNamespace(target=battle._local_matrix)
+        battle._avatar.consistentMatrices = types.SimpleNamespace(
+            attachedVehicleMatrix=attached)
+        handler = battle._avatar.inputHandler
+        calculator = handler.steadyVehicleMatrixCalculator
+        output = calculator.\
+            _SteadyVehicleMatrixCalculator__outputMProv
+        output.rotationSrc = battle._local_matrix
+        output.translationSrc = battle._local_matrix
+        calculator.outputMProv = output
+        camera = types.SimpleNamespace(vehicleMProv=output)
+        handler._AvatarInputHandler__curCtrl = types.SimpleNamespace(
+            _PostMortemControlMode__cam=camera,
+            curPostmortemDelay=object())
+        handler._AvatarInputHandler__ctrlModeName = 'postmortem'
+
+        self.assertTrue(battle._on_control_mode_changed(
+            handler, 'postmortem'))
+
+        output.translationSrc = object()
+        with self.assertRaisesRegex(
+                RuntimeError,
+                'postmortem delay captured a stale vehicle pose'):
+            battle._on_control_mode_changed(handler, 'postmortem')
+
+    @staticmethod
+    def _postmortem_switch_fixture():
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._avatar.playerVehicleID = 10
+        battle._local_matrix = _Matrix()
+        battle._local_position = (0.0, 0.0, 0.0)
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        local = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                         {'health': 0})
+        local.matrix = battle._local_matrix
+        runtime.bigworld.entities[10] = local
+        battle._records = {'player:1': {
+            'engine_id': 10,
+            'state': {'team': 1, 'health': 0, 'alive': False},
+            'kind': 'player', 'network_id': 1, 'local': True,
+            'ready': True}}
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        battle._remote_factory = factory
+        handler = battle._avatar.inputHandler
+        camera = types.SimpleNamespace(vehicleMProv=types.SimpleNamespace())
+        handler._AvatarInputHandler__curCtrl = types.SimpleNamespace(
+            _PostMortemControlMode__cam=camera, curPostmortemDelay=None)
+        handler._AvatarInputHandler__ctrlModeName = 'postmortem'
+        battle._avatar.consistentMatrices._ConsistentMatrices__setTarget(
+            battle._local_matrix, False)
+        camera.vehicleMProv = \
+            battle._avatar.consistentMatrices.attachedVehicleMatrix
+        battle._spectated_engine_id = 10
+        return runtime, battle, factory, camera
+
+    def test_postmortem_switch_attaches_live_friendly_bot_and_calls_stock(self):
+        runtime, battle, factory, camera = \
+            self._postmortem_switch_fixture()
+        ally_id = factory.create(
+            _Descriptor(),
+            {'publicInfo': {'team': 1, 'name': 'Ally'},
+             'health': 500, 'isCrewActive': True,
+             'gunAnglesPacked': 0},
+            _Vector(20.0, 0.0, 10.0), (0.0, 0.0, 0.0))
+        ally = factory.get(ally_id)
+        battle._records['bot:2'] = {
+            'engine_id': ally_id,
+            'state': {'team': 1, 'health': 500, 'alive': True},
+            'kind': 'bot', 'network_id': 2, 'local': False,
+            'ready': True, 'presentation': True}
+
+        self.assertIsNone(runtime.bigworld.entity(ally_id))
+        self.assertTrue(battle._switch_postmortem_viewpoint(False, ally_id))
+
+        self.assertIs(ally.matrix,
+                      battle._avatar.consistentMatrices.
+                      attachedVehicleMatrix.target)
+        self.assertIs(battle._avatar.consistentMatrices.
+                      attachedVehicleMatrix, camera.vehicleMProv)
+        self.assertIs(ally, runtime.bigworld.entity(ally_id))
+        self.assertIn(ally_id, runtime.bigworld.entities.keys())
+        self.assertEqual(ally_id, battle._spectated_engine_id)
+        self.assertEqual(ally_id,
+                         battle._avatar.viewpoint_switches[-1][0])
+
+    def test_postmortem_switch_rejects_enemy_dead_and_active_delay(self):
+        unused_runtime, battle, factory, unused_camera = \
+            self._postmortem_switch_fixture()
+        enemy_id = factory.create(
+            _Descriptor(),
+            {'publicInfo': {'team': 2, 'name': 'Enemy'},
+             'health': 500, 'isCrewActive': True,
+             'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0))
+        enemy = factory.get(enemy_id)
+        battle._records['bot:2'] = {
+            'engine_id': enemy_id,
+            'state': {'team': 2, 'health': 500, 'alive': True},
+            'kind': 'bot', 'network_id': 2, 'local': False,
+            'ready': True, 'presentation': True}
+
+        self.assertFalse(battle._switch_postmortem_viewpoint(False, enemy_id))
+        battle._records['bot:2']['state']['team'] = 1
+        battle._records['bot:2']['state']['health'] = 0
+        battle._records['bot:2']['state']['alive'] = False
+        enemy.onHealthChanged(0)
+        self.assertFalse(battle._switch_postmortem_viewpoint(False, enemy_id))
+        battle._records['bot:2']['state'].update(
+            health=500, alive=True)
+        enemy.onHealthChanged(500)
+        battle._avatar.inputHandler._AvatarInputHandler__curCtrl.\
+            curPostmortemDelay = object()
+        self.assertFalse(battle._switch_postmortem_viewpoint(False, enemy_id))
+        self.assertEqual([], battle._avatar.viewpoint_switches)
+
+    def test_observed_ally_death_falls_back_to_nearest_live_ally(self):
+        unused_runtime, battle, factory, unused_camera = \
+            self._postmortem_switch_fixture()
+        records = []
+        for network_id, position in ((2, (30.0, 0.0, 0.0)),
+                                     (3, (10.0, 0.0, 0.0))):
+            engine_id = factory.create(
+                _Descriptor(),
+                {'publicInfo': {'team': 1, 'name': 'Ally'},
+                 'health': 500, 'isCrewActive': True,
+                 'gunAnglesPacked': 0},
+                _Vector(position), (0.0, 0.0, 0.0))
+            record = {
+                'engine_id': engine_id,
+                'state': {'team': 1, 'health': 500, 'alive': True},
+                'kind': 'bot', 'network_id': network_id, 'local': False,
+                'ready': True, 'presentation': True}
+            battle._records['bot:%s' % network_id] = record
+            records.append(record)
+        observed, nearest = records
+        battle._spectated_engine_id = observed['engine_id']
+        factory.get(observed['engine_id'])._postmortem_visible = True
+
+        self.assertTrue(battle._fallback_postmortem_viewpoint(
+            observed['engine_id']))
+
+        self.assertEqual(nearest['engine_id'], battle._spectated_engine_id)
+        self.assertFalse(factory.get(
+            observed['engine_id'])._postmortem_visible)
+        self.assertTrue(factory.get(
+            nearest['engine_id'])._postmortem_visible)
 
     def test_local_rpm_uses_native_vehicle_state_channel(self):
         runtime = _runtime()
@@ -4240,6 +5903,40 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertGreater(battle._local_position[2], 8.0)
         self.assertEqual(4.0, battle._local_speed)
 
+    def test_grounded_player_rejects_raised_support_as_hard_collision(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        battle.client = client
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(10, _Descriptor(), _Vector(0, 0, 0), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = types.SimpleNamespace(
+            forward=1.0, turn=0.0, handbrake=False,
+            send_current=lambda: client.send_input('current'))
+        battle._local_descriptor = entity.typeDescriptor
+        battle._attach_local_presentation()
+        battle._local_fall_armed = True
+        battle._motion_is_clear = mock.Mock(return_value=True)
+        battle._terrain_support = mock.Mock(return_value=(1.4, 1.4))
+        battle._ground_pitch = mock.Mock(return_value=0.0)
+        battle._resolve_local_tank_contacts = mock.Mock(
+            side_effect=lambda unused_entity, position, unused_yaw,
+            unused_dt: position)
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.longitudinal_step', return_value=4.0):
+            battle._drive_local(0.02)
+
+        self.assertEqual((0.0, 0.0, 0.0), battle._local_position)
+        self.assertAlmostEqual(4.0 * 0.35 ** 1.2, battle._local_speed)
+        self.assertEqual(4, battle._local_grind)
+        self.assertFalse(battle._local_airborne)
+        battle._motion_is_clear.assert_called_once()
+
     def test_first_streamed_ground_snaps_spawn_without_fall_damage(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -4251,9 +5948,25 @@ class BattleRuntimeContractTests(unittest.TestCase):
             entity, (0.0, 100.0, 0.0), 0.0, 0.04)
 
         self.assertEqual((0.0, 0.0, 0.0), position)
+        self.assertFalse(battle._local_support_rise_blocked)
         self.assertTrue(battle._local_fall_armed)
         self.assertFalse(battle._local_airborne)
         self.assertEqual(500, entity.health)
+
+    def test_first_ground_support_rise_is_still_a_spawn_snap(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        battle._terrain_support = mock.Mock(return_value=(1.4, 1.4))
+
+        position = battle._update_vertical_motion(
+            entity, (0.0, 0.0, 0.0), 0.0, 0.04)
+
+        self.assertEqual((0.0, 1.4, 0.0), position)
+        self.assertTrue(battle._local_fall_armed)
+        self.assertFalse(battle._local_support_rise_blocked)
 
     def test_armed_ledge_fall_uses_copied_damage_and_reason(self):
         runtime = _runtime()
@@ -4274,6 +5987,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         for unused in range(30):
             position = battle._update_vertical_motion(
                 entity, position, 0.0, 0.1)
+            self.assertFalse(battle._local_support_rise_blocked)
             if not battle._local_airborne:
                 break
 
@@ -4316,6 +6030,53 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(0.0, battle._local_slide_speed)
         self.assertEqual((1.99, -0.995), battle._local_air_lateral)
 
+    def test_cross_slope_slide_cannot_bypass_horizontal_collision(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
+        battle._local_slope_tangent = 0.8
+        battle._local_downhill = (1.0, 0.0, 0.0)
+        battle._local_slide_speed = 2.0
+        battle._ground_y = lambda *unused, **unused_kw: -0.1
+        battle._motion_is_clear = mock.Mock(return_value=False)
+        battle._local_motion_soft_block = False
+
+        position = battle._apply_slope_slide(
+            (0.0, 0.0, 0.0), 0.0, 0.1, entity)
+
+        self.assertEqual((0.0, 0.0, 0.0), position)
+        self.assertEqual(0.0, battle._local_slide_speed)
+        battle._motion_is_clear.assert_called_once()
+        self.assertNotIn(
+            'allow_crush_drive',
+            battle._motion_is_clear.call_args.kwargs)
+        unused_entity, unused_position, slide_yaw, slide_speed, step = (
+            battle._motion_is_clear.call_args[0])
+        self.assertAlmostEqual(math.pi * 0.5, slide_yaw)
+        self.assertGreater(slide_speed, 0.0)
+        self.assertEqual(0.1, step)
+
+    def test_cross_slope_pending_skin_keeps_slide_for_a_later_tick(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
+        battle._local_slope_tangent = 0.8
+        battle._local_downhill = (1.0, 0.0, 0.0)
+        battle._local_slide_speed = 2.0
+        battle._ground_y = lambda *unused, **unused_kw: -0.1
+        battle._local_motion_soft_block = True
+        battle._motion_is_clear = mock.Mock(return_value=False)
+
+        position = battle._apply_slope_slide(
+            (0.0, 0.0, 0.0), 0.0, 0.1, entity)
+
+        self.assertEqual((0.0, 0.0, 0.0), position)
+        self.assertGreater(battle._local_slide_speed, 0.0)
+
     def test_drive_pitch_skips_bridge_deck_above_the_hull(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -4345,6 +6106,33 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertLess(max(values), 0.2)
         self.assertAlmostEqual(0.19375, values[-1])
+
+    def test_drive_pitch_sign_accelerates_neutral_coast_downhill(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+
+        def collision(unused_space, start, unused_end, unused_mask):
+            return (_Vector(start.x, -0.3 * start.z, start.z),)
+
+        runtime.bigworld.wg_collideSegment = collision
+        downhill = uphill = None
+        for unused in range(8):
+            downhill = battle._smoothed_drive_pitch(
+                (0.0, 0.0, 0.0), 0.0)
+        battle._local_drive_pitch_history = None
+        battle._local_smooth_drive_pitch = 0.0
+        for unused in range(8):
+            uphill = battle._smoothed_drive_pitch(
+                (0.0, 0.0, 0.0), math.pi)
+
+        self.assertGreater(downhill, 0.0)
+        self.assertLess(uphill, 0.0)
+        params = dict(vehicle_physics._DEFAULTS)
+        self.assertGreater(vehicle_physics.longitudinal_step(
+            params, 5.0, 0.0, False, downhill, 0.1), 5.0)
+        self.assertLess(vehicle_physics.longitudinal_step(
+            params, 5.0, 0.0, False, uphill, 0.1), 5.0)
 
     def test_landing_combines_lateral_impact_and_retains_skid(self):
         runtime = _runtime()
@@ -4521,6 +6309,42 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(6.5, call[3])
         self.assertIs(descriptor, call[4])
 
+    def test_stopped_authority_bot_keeps_registration_scan_phase(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        battle._destructibles = mock.Mock()
+        descriptor = _Descriptor()
+        entity = _Vehicle(11, descriptor, _Vector(), (0, 0, 0),
+                          {'health': 500})
+        battle._server_entity = mock.Mock(return_value=entity)
+        battle._records = {
+            'bot:17': {'engine_id': 11, 'kind': 'bot', 'network_id': 17,
+                       'ready': True, 'tombstone': False}}
+        state = {
+            'id': 17, 'alive': True, 'x': 7.0, 'y': 2.0, 'z': 9.0,
+            'yaw': 0.75, 'speed': 0.0,
+            'aim_yaw': 0.9, 'gun_pitch': -0.1}
+
+        runtime.bigworld.now = 10.0
+        self.assertTrue(battle._apply_authority_bot_poses([state]))
+        battle._destructibles._fell_trees_near.assert_not_called()
+        first_deadline = battle._bot_destructible_samples[17][0]
+        self.assertGreater(first_deadline, 10.0)
+        self.assertLessEqual(first_deadline, 10.1)
+
+        runtime.bigworld.now = first_deadline + 0.001
+        self.assertTrue(battle._apply_authority_bot_poses([state]))
+
+        call = battle._destructibles._fell_trees_near.call_args[0]
+        self.assertEqual(7, call[0])
+        self.assertEqual((7.0, 2.0, 9.0), tuple(call[1]))
+        self.assertEqual(0.0, call[3])
+        self.assertIs(descriptor, call[4])
+        next_deadline = battle._bot_destructible_samples[17][0]
+        self.assertAlmostEqual(runtime.bigworld.now + 0.5, next_deadline)
+
     def test_authority_bot_destructible_budget_is_render_rate_independent(self):
         totals = {}
         for fps in (40, 60, 120):
@@ -4611,7 +6435,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
-        battle._destructibles = object()
+        battle._destructibles = mock.Mock()
         event = {
             'destructible_kind': 'fragile',
             'chunk_id': 3, 'item_index': 9,
@@ -4635,6 +6459,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual((7, 3, 9), args[:3])
         self.assertEqual((1.0, 2.0, 3.0), tuple(args[3]))
         self.assertIs(True, args[4])
+        battle._destructibles.note_destroyed.assert_called_once_with(
+            'fragile', 3, 9, None, runtime.bigworld.now)
 
         invalid = dict(event)
         del invalid['is_shot']
@@ -4738,18 +6564,118 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'spot_until': 0.0, 'spot_next': 0.0,
             'state': {'team': 2, 'health': 500, 'alive': True}}}
 
-        self.assertTrue(battle._update_spotting(10.0))
+        # Network id 17 owns the 0.40-second phase of the 2 Hz probe cycle.
+        # The initial update must not put every enemy's native LOS work on the
+        # same rendered frame.
+        self.assertFalse(battle._update_spotting(10.0))
+        self.assertTrue(battle._update_spotting(10.4))
         self.assertTrue(enemy.model.visible)
         battle._binding.start_vehicle_visual.assert_called_once_with(
             1000, True)
+        self.assertEqual(1, len(battle._avatar.battle_events))
+        events = battle._avatar.battle_events[0]
+        self.assertEqual([0, 12], [event['eventType'] for event in events])
+        self.assertEqual([1000, 1000],
+                         [event['targetID'] for event in events])
+        self.assertEqual(3, events[1]['details'])
 
         runtime.bigworld.wg_collideSegment = lambda *unused: (_Vector(),)
-        self.assertFalse(battle._update_spotting(10.6))
+        self.assertFalse(battle._update_spotting(10.9))
         self.assertTrue(enemy.model.visible)
-        self.assertTrue(battle._update_spotting(15.1))
+        self.assertTrue(battle._update_spotting(15.5))
         self.assertFalse(enemy.model.visible)
         battle._binding.stop_vehicle_visual.assert_called_once_with(
             1000, False)
+
+        # Reacquiring the same target is presentation visibility, not a new
+        # first-spot ribbon or detection sound.
+        runtime.bigworld.wg_collideSegment = lambda *unused: None
+        self.assertTrue(battle._update_spotting(15.9))
+        self.assertEqual(1, len(battle._avatar.battle_events))
+
+    def test_team_relay_visibility_does_not_claim_a_direct_spot(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._local_descriptor = _Descriptor()
+        local = _Vehicle(
+            10, battle._local_descriptor, _Vector(), (0, 0, 0),
+            {'health': 500})
+        ally = _Vehicle(
+            11, _Descriptor(), _Vector(90.0, 0.0, 0.0), (0, 0, 0),
+            {'health': 500})
+        enemy = _Vehicle(
+            12, _Descriptor(), _Vector(100.0, 0.0, 0.0), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities.update({10: local, 11: ally, 12: enemy})
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._spotting_observers = lambda: (
+            ((0.0, 0.0, 0.0), local.typeDescriptor, local),
+            ((90.0, 0.0, 0.0), ally.typeDescriptor, ally))
+        battle._set_record_spot_visibility = lambda record, visible: \
+            record.update(spot_visible=bool(visible)) or bool(visible)
+        record = {
+            'engine_id': 12, 'network_id': 17, 'kind': 'bot',
+            'ready': True, 'local': False, 'presentation': True,
+            'tombstone': False, 'spot_visible': False,
+            'spot_until': 0.0, 'spot_next': 10.0,
+            'state': {'team': 2, 'health': 500, 'alive': True}}
+        battle._records = {'bot:17': record}
+        sightings = iter((False, True))
+        battle._spot_line_of_sight = lambda *unused: next(sightings)
+
+        self.assertTrue(battle._update_spotting(10.0))
+        self.assertTrue(record['spot_visible'])
+        self.assertNotIn('spot_feedback_sent', record)
+        self.assertEqual([], battle._avatar.battle_events)
+
+    def test_enemy_spotting_staggers_worst_case_native_los_rays(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        observer_descriptor = _Descriptor()
+        battle._spotting_observers = lambda: tuple(
+            ((0.0, 0.0, 0.0), observer_descriptor, None)
+            for unused in range(15))
+
+        def set_visibility(record, visible):
+            record['spot_visible'] = bool(visible)
+            return bool(visible)
+
+        battle._set_record_spot_visibility = set_visibility
+        rays = []
+
+        def blocked_ray(*args):
+            rays.append(args)
+            return (_Vector(),)
+
+        runtime.bigworld.wg_collideSegment = blocked_ray
+        for offset, network_id in enumerate(range(11, 26)):
+            engine_id = 1000 + offset
+            runtime.bigworld.entities[engine_id] = _Vehicle(
+                engine_id, _Descriptor(), _Vector(100.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0), {'health': 500})
+            battle._records['bot:%d' % network_id] = {
+                'engine_id': engine_id, 'kind': 'bot',
+                'network_id': network_id, 'ready': True,
+                'local': False, 'presentation': True, 'tombstone': False,
+                'spot_visible': False, 'spot_until': 0.0,
+                'spot_next': 0.0,
+                'state': {'team': 2, 'health': 500, 'alive': True}}
+
+        per_update = []
+        for now in (10.0, 10.1, 10.2, 10.3, 10.4,
+                    10.5, 10.6, 10.7, 10.8, 10.9):
+            before = len(rays)
+            battle._update_spotting(now)
+            per_update.append(len(rays) - before)
+
+        # Fifteen enemies times fifteen observers times two static rays used
+        # to produce 450 calls at 10.0 and again at 10.5. Stable ids now put
+        # three enemies on each 0.10-second phase without changing 2 Hz.
+        self.assertEqual([90] * 10, per_update)
 
     def test_spotting_uses_descriptor_camouflage_and_shot_factor(self):
         runtime = _runtime()
@@ -4861,8 +6787,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(battle.shoot(0.2, -0.1))
 
         self.assertEqual([(0.5, 1)], battle._avatar.dispersion_queries)
-        battle._resolve_hit.assert_called_once_with(
-            1, 0.2, -0.1, 0, 0.25)
+        battle._resolve_hit.assert_not_called()
+        fire = next(item for item in client.sent if item[0] == 'fire')
+        self.assertEqual(0, fire[1][0])
+        self.assertAlmostEqual(800.0, math.sqrt(sum(
+            value * value for value in fire[2]['velocity'])))
+        self.assertEqual(9.81, fire[2]['gravity'])
 
     def test_accepted_shot_seeds_stateful_native_convergence(self):
         class StockLikeDispersion(object):
@@ -5395,6 +7325,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle.state = 'running'
+        battle._battle_live = True
         battle._avatar = runtime.bigworld.avatar
         entity = _Vehicle(
             10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
@@ -5543,11 +7474,529 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._records = {
             'player:1': {'engine_id': 10, 'kind': 'player',
                          'network_id': 1, 'local': True},
-            'bot:2': {'engine_id': 11, 'kind': 'bot',
+            'bot:2': {'engine_id': 11,
+                      'state': {'combat_base_revision': 7,
+                                'combat_ack_seq': 3}, 'kind': 'bot',
                       'network_id': 2, 'local': False}}
 
         with self.assertRaisesRegex(RuntimeError, 'remote collision failed'):
             battle._resolve_hit(7, 0.0, 0.0)
+
+    def test_vehicle_caps_destructible_submission_before_prop_behind_it(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        source = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 5),
+                          (0, 0, 0), {'health': 500})
+        target.collideSegmentExt = lambda start, end: [types.SimpleNamespace(
+            dist=5.0, hitAngleCos=1.0,
+            matInfo=types.SimpleNamespace(armor=10.0),
+            compName='vehicleHull')]
+        runtime.bigworld.entities.update({10: source, 11: target})
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._records = {
+            'player:1': {'engine_id': 10, 'kind': 'player',
+                         'network_id': 1, 'local': True},
+            'bot:2': {'engine_id': 11,
+                      'state': {'combat_base_revision': 7,
+                                'combat_ack_seq': 3}, 'kind': 'bot',
+                      'network_id': 2, 'local': False}}
+        runtime.bigworld.avatar.gunRotator = types.SimpleNamespace(
+            getCurShotPosition=lambda: (
+                _Vector(0, 0, 0), _Vector(0, 0, 1)))
+        destroyed = []
+
+        def shot_world_distance(unused_bigworld, unused_space_id,
+                                start, end, unused_direction, unused_shot):
+            if (end - start).length >= 10.0:
+                destroyed.append(('fragile', 10.0))
+            return {'world_distance': 999999.0, 'piercing_loss': 0.0,
+                    'stop_distance': None, 'continue_from': None}
+
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(side_effect=shot_world_distance))
+        battle.client = types.SimpleNamespace(
+            player_id=1, send_bot_hit=mock.Mock(return_value=True))
+        battle._shell_damage = mock.Mock(return_value=(120, 2))
+        battle._critical_hit = lambda *args, **kwargs: (
+            args[5], {'events': []})
+
+        battle._resolve_hit(7, 0.0, 0.0)
+
+        self.assertEqual([], destroyed)
+        ray = battle._destructibles.shot_world_distance.call_args[0]
+        self.assertAlmostEqual(5.0, (ray[3] - ray[2]).length)
+        battle.client.send_bot_hit.assert_called_once()
+
+    def test_fragile_before_vehicle_is_destroyed_and_shell_continues(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        source = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 5),
+                          (0, 0, 0), {'health': 500})
+        target.collideSegmentExt = lambda start, end: [types.SimpleNamespace(
+            dist=5.0, hitAngleCos=1.0,
+            matInfo=types.SimpleNamespace(armor=10.0),
+            compName='vehicleHull')]
+        runtime.bigworld.entities.update({10: source, 11: target})
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._records = {
+            'player:1': {'engine_id': 10, 'kind': 'player',
+                         'network_id': 1, 'local': True},
+            'bot:2': {'engine_id': 11,
+                      'state': {'combat_base_revision': 7,
+                                'combat_ack_seq': 3}, 'kind': 'bot',
+                      'network_id': 2, 'local': False}}
+        runtime.bigworld.avatar.gunRotator = types.SimpleNamespace(
+            getCurShotPosition=lambda: (
+                _Vector(0, 0, 0), _Vector(0, 0, 1)))
+        destroyed = []
+
+        def shot_world_distance(unused_bigworld, unused_space_id,
+                                start, end, unused_direction, unused_shot):
+            if (end - start).length >= 4.0:
+                destroyed.append(('fragile', 4.0))
+            # A dynamic-only fragile has no surviving world collision after
+            # destruction, so the shell remains free to reach the vehicle.
+            return {'world_distance': 999999.0, 'piercing_loss': 25.0,
+                    'stop_distance': None, 'continue_from': None}
+
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(side_effect=shot_world_distance))
+        battle.client = types.SimpleNamespace(
+            player_id=1, send_bot_hit=mock.Mock(return_value=True))
+        battle._shell_damage = mock.Mock(return_value=(120, 2))
+        battle._critical_hit = lambda *args, **kwargs: (
+            args[5], {'events': []})
+
+        battle._resolve_hit(7, 0.0, 0.0)
+
+        self.assertEqual([('fragile', 4.0)], destroyed)
+        ray = battle._destructibles.shot_world_distance.call_args[0]
+        self.assertAlmostEqual(5.0, (ray[3] - ray[2]).length)
+        battle.client.send_bot_hit.assert_called_once()
+        self.assertEqual(
+            25.0, battle._shell_damage.call_args.kwargs['pierce_loss'])
+
+    def test_multiple_ap_destructibles_accumulate_before_vehicle(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        responses = [
+            {'world_distance': 999999.0, 'piercing_loss': 25.0,
+             'stop_distance': None, 'continue_from': 2.0},
+            {'world_distance': 999999.0, 'piercing_loss': 25.0,
+             'stop_distance': None, 'continue_from': 2.0},
+            {'world_distance': 999999.0, 'piercing_loss': 0.0,
+             'stop_distance': None, 'continue_from': None},
+        ]
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(side_effect=responses))
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'combat_rules.sample_penetration_factor',
+                return_value=1.0) as draw:
+            result = battle._resolve_shot_scene(
+                _Vector(), _Vector(0, 0, 5), _Vector(0, 0, 1),
+                _Descriptor().gun.shots[0])
+
+        draw.assert_called_once_with()
+        self.assertEqual(50.0, result['piercing_loss'])
+        self.assertEqual(1.0, result['penetration_factor'])
+        self.assertEqual(999999.0, result['world_distance'])
+        calls = battle._destructibles.shot_world_distance.call_args_list
+        self.assertEqual(3, len(calls))
+        self.assertAlmostEqual(0.0, calls[0].args[2].z)
+        self.assertAlmostEqual(2.0, calls[1].args[2].z)
+        self.assertAlmostEqual(4.0, calls[2].args[2].z)
+
+    def test_thick_native_module_exit_still_reaches_capped_vehicle(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        responses = [
+            {'world_distance': 999999.0, 'piercing_loss': 25.0,
+             'stop_distance': None, 'continue_from': 8.075},
+            {'world_distance': 999999.0, 'piercing_loss': 0.0,
+             'stop_distance': None, 'continue_from': None},
+        ]
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(side_effect=responses))
+
+        result = battle._resolve_shot_scene(
+            _Vector(), _Vector(0, 0, 10), _Vector(0, 0, 1),
+            _Descriptor().gun.shots[0])
+
+        self.assertEqual(25.0, result['piercing_loss'])
+        self.assertEqual(999999.0, result['world_distance'])
+        calls = battle._destructibles.shot_world_distance.call_args_list
+        self.assertEqual(2, len(calls))
+        self.assertAlmostEqual(8.075, calls[1].args[2].z)
+        self.assertAlmostEqual(10.0, calls[1].args[3].z)
+
+    def test_thick_native_module_before_vehicle_preserves_vehicle_hit(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        source = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 10),
+                          (0, 0, 0), {'health': 500})
+        target.collideSegmentExt = lambda start, end: [types.SimpleNamespace(
+            dist=10.0, hitAngleCos=1.0,
+            matInfo=types.SimpleNamespace(armor=10.0),
+            compName='vehicleHull')]
+        runtime.bigworld.entities.update({10: source, 11: target})
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._records = {
+            'player:1': {'engine_id': 10, 'kind': 'player',
+                         'network_id': 1, 'local': True},
+            'bot:2': {'engine_id': 11,
+                      'state': {'combat_base_revision': 7,
+                                'combat_ack_seq': 3}, 'kind': 'bot',
+                      'network_id': 2, 'local': False}}
+        runtime.bigworld.avatar.gunRotator = types.SimpleNamespace(
+            getCurShotPosition=lambda: (
+                _Vector(), _Vector(0, 0, 1)))
+        responses = [
+            {'world_distance': 999999.0, 'piercing_loss': 25.0,
+             'stop_distance': None, 'continue_from': 8.075},
+            {'world_distance': 999999.0, 'piercing_loss': 0.0,
+             'stop_distance': None, 'continue_from': None},
+        ]
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(side_effect=responses))
+        battle.client = types.SimpleNamespace(
+            player_id=1, send_bot_hit=mock.Mock(return_value=True))
+        battle._shell_damage = mock.Mock(return_value=(120, 2))
+        battle._critical_hit = lambda *args, **kwargs: (
+            args[5], {'events': []})
+
+        battle._resolve_hit(7, 0.0, 0.0)
+
+        calls = battle._destructibles.shot_world_distance.call_args_list
+        self.assertEqual(2, len(calls))
+        self.assertAlmostEqual(8.075, calls[1].args[2].z)
+        self.assertAlmostEqual(10.0, calls[1].args[3].z)
+        battle.client.send_bot_hit.assert_called_once()
+        self.assertEqual(
+            25.0, battle._shell_damage.call_args.kwargs['pierce_loss'])
+
+    def test_static_wall_after_thick_module_still_blocks_vehicle(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        source = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 10),
+                          (0, 0, 0), {'health': 500})
+        target.collideSegmentExt = lambda start, end: [types.SimpleNamespace(
+            dist=10.0, hitAngleCos=1.0,
+            matInfo=types.SimpleNamespace(armor=10.0),
+            compName='vehicleHull')]
+        runtime.bigworld.entities.update({10: source, 11: target})
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._records = {
+            'player:1': {'engine_id': 10, 'kind': 'player',
+                         'network_id': 1, 'local': True},
+            'bot:2': {'engine_id': 11, 'state': {'health': 500},
+                      'kind': 'bot', 'network_id': 2, 'local': False}}
+        runtime.bigworld.avatar.gunRotator = types.SimpleNamespace(
+            getCurShotPosition=lambda: (
+                _Vector(), _Vector(0, 0, 1)))
+        responses = [
+            {'world_distance': 999999.0, 'piercing_loss': 25.0,
+             'stop_distance': None, 'continue_from': 8.075},
+            {'world_distance': 0.925, 'piercing_loss': 0.0,
+             'stop_distance': 0.925, 'continue_from': None,
+             'stopped_by_destructible': False},
+        ]
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(side_effect=responses))
+        battle.client = types.SimpleNamespace(
+            player_id=1, send_bot_hit=mock.Mock())
+
+        battle._resolve_hit(7, 0.0, 0.0)
+
+        self.assertEqual(
+            2, battle._destructibles.shot_world_distance.call_count)
+        battle.client.send_bot_hit.assert_not_called()
+
+    def test_player_wall_20_cm_before_vehicle_strictly_blocks_hit(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        source = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 10),
+                          (0, 0, 0), {'health': 500})
+        target.collideSegmentExt = lambda start, end: [types.SimpleNamespace(
+            dist=10.0, hitAngleCos=1.0,
+            matInfo=types.SimpleNamespace(armor=10.0),
+            compName='vehicleHull')]
+        runtime.bigworld.entities.update({10: source, 11: target})
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._records = {
+            'player:1': {'engine_id': 10, 'kind': 'player',
+                         'network_id': 1, 'local': True},
+            'bot:2': {'engine_id': 11, 'state': {'health': 500},
+                      'kind': 'bot', 'network_id': 2, 'local': False}}
+        runtime.bigworld.avatar.gunRotator = types.SimpleNamespace(
+            getCurShotPosition=lambda: (
+                _Vector(), _Vector(0, 0, 1)))
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(return_value={
+                'world_distance': 9.8, 'piercing_loss': 0.0,
+                'stop_distance': 9.8, 'continue_from': None,
+                'stopped_by_destructible': False}))
+        battle.client = types.SimpleNamespace(
+            player_id=1, send_bot_hit=mock.Mock())
+
+        battle._resolve_hit(7, 0.0, 0.0)
+
+        battle.client.send_bot_hit.assert_not_called()
+
+    def test_bot_wall_20_cm_before_vehicle_strictly_blocks_hit(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        source = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 10),
+                          (0, 0, 0), {'health': 500})
+        target.collideSegmentExt = lambda start, end: [types.SimpleNamespace(
+            dist=10.0, hitAngleCos=1.0,
+            matInfo=types.SimpleNamespace(armor=10.0),
+            compName='vehicleHull')]
+        runtime.bigworld.entities.update({10: source, 11: target})
+        source_record = {'engine_id': 10, 'kind': 'bot', 'network_id': 1,
+                         'local': False}
+        target_record = {'engine_id': 11, 'kind': 'bot', 'network_id': 2,
+                         'local': False, 'state': {'health': 500}}
+        battle._records = {'bot:1': source_record, 'bot:2': target_record}
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(return_value={
+                'world_distance': 9.8, 'piercing_loss': 0.0,
+                'stop_distance': 9.8, 'continue_from': None,
+                'stopped_by_destructible': False}))
+        battle.client = types.SimpleNamespace(
+            send_bot_bot_hit=mock.Mock(), send_bot_human_hit=mock.Mock())
+        state = {
+            'id': 1,
+            'target_kind': 'bot', 'target_id': 2,
+            'shell_index': 0,
+            'shot_yaw': 0.0, 'shot_pitch': 0.0,
+        }
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'combat_rules.sample_penetration_factor') as draw:
+            battle._resolve_bot_shot(state, 1)
+
+        draw.assert_not_called()
+        battle.client.send_bot_bot_hit.assert_not_called()
+
+    def test_ap_disappears_when_obstacles_exhaust_nominal_piercing(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        shot = _Descriptor().gun.shots[0]
+        shot.piercingPower = (40.0, 40.0)
+        responses = [
+            {'world_distance': 999999.0, 'piercing_loss': 25.0,
+             'stop_distance': None, 'continue_from': 2.0},
+            {'world_distance': 999999.0, 'piercing_loss': 25.0,
+             'stop_distance': None, 'continue_from': 2.0},
+        ]
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(side_effect=responses))
+
+        result = battle._resolve_shot_scene(
+            _Vector(), _Vector(0, 0, 10), _Vector(0, 0, 1), shot)
+
+        self.assertEqual(4.0, result['world_distance'])
+        self.assertEqual(50.0, result['piercing_loss'])
+        self.assertTrue(result['stopped_by_destructible'])
+        self.assertEqual(
+            2, battle._destructibles.shot_world_distance.call_count)
+
+    def test_one_low_roll_exhausts_30_mm_after_two_obstacles(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        shot = _Descriptor().gun.shots[0]
+        shot.piercingPower = (40.0, 40.0)
+        responses = [
+            {'world_distance': 999999.0, 'piercing_loss': 25.0,
+             'stop_distance': None, 'continue_from': 2.0},
+            {'world_distance': 999999.0, 'piercing_loss': 25.0,
+             'stop_distance': None, 'continue_from': 2.0},
+        ]
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(side_effect=responses))
+
+        result = battle._resolve_shot_scene(
+            _Vector(), _Vector(0, 0, 10), _Vector(0, 0, 1), shot,
+            penetration_factor=0.75)
+
+        self.assertEqual(4.0, result['world_distance'])
+        self.assertEqual(50.0, result['piercing_loss'])
+        self.assertTrue(result['stopped_by_destructible'])
+
+    def test_one_high_roll_keeps_24_mm_after_one_obstacle(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        shot = _Descriptor().gun.shots[0]
+        shot.piercingPower = (39.2, 39.2)
+        responses = [
+            {'world_distance': 999999.0, 'piercing_loss': 25.0,
+             'stop_distance': None, 'continue_from': 2.0},
+            {'world_distance': 999999.0, 'piercing_loss': 0.0,
+             'stop_distance': None, 'continue_from': None},
+        ]
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(side_effect=responses))
+
+        result = battle._resolve_shot_scene(
+            _Vector(), _Vector(0, 0, 10), _Vector(0, 0, 1), shot,
+            penetration_factor=1.25)
+
+        self.assertAlmostEqual(
+            24.0, combat_rules.sampled_piercing(
+                shot, 2.0, 1.25, result['piercing_loss']))
+        self.assertEqual(999999.0, result['world_distance'])
+        self.assertFalse(result['stopped_by_destructible'])
+
+    def test_thick_obstacle_uses_entry_distance_for_range_loss(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        shot = _Descriptor().gun.shots[0]
+        shot.piercingPower = (30.0, 20.0)
+        shot.maxDistance = 200.0
+        responses = [
+            {'world_distance': 999999.0, 'piercing_loss': 25.0,
+             'loss_distance': 100.0, 'stop_distance': None,
+             'continue_from': 150.0},
+            {'world_distance': 999999.0, 'piercing_loss': 0.0,
+             'stop_distance': None, 'continue_from': None},
+        ]
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(side_effect=responses))
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'combat_rules.sample_penetration_factor',
+                return_value=1.0) as draw:
+            result = battle._resolve_shot_scene(
+                _Vector(), _Vector(0, 0, 200), _Vector(0, 0, 1), shot)
+
+        draw.assert_called_once_with()
+        self.assertEqual(999999.0, result['world_distance'])
+        self.assertEqual(25.0, result['piercing_loss'])
+        self.assertEqual(1.0, result['penetration_factor'])
+        self.assertFalse(result['stopped_by_destructible'])
+
+    def test_he_and_heat_stop_at_first_destructible(self):
+        for kind in ('HIGH_EXPLOSIVE', 'HOLLOW_CHARGE'):
+            runtime = _runtime()
+            battle = BattleRuntime(runtime)
+            battle._avatar = runtime.bigworld.avatar
+            descriptor = _Descriptor()
+            descriptor.gun.shots[0].shell.kind = kind
+            battle._destructibles = types.SimpleNamespace(
+                shot_world_distance=mock.Mock(return_value={
+                    'world_distance': 3.0, 'piercing_loss': 0.0,
+                    'stop_distance': 3.0, 'continue_from': None,
+                    'stopped_by_destructible': True}))
+
+            with mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'combat_rules.sample_penetration_factor') as draw:
+                result = battle._resolve_shot_scene(
+                    _Vector(), _Vector(0, 0, 5), _Vector(0, 0, 1),
+                    descriptor.gun.shots[0])
+
+            draw.assert_not_called()
+            self.assertEqual(3.0, result['world_distance'])
+            self.assertEqual(0.0, result['piercing_loss'])
+            self.assertIsNone(result['penetration_factor'])
+            self.assertTrue(result['stopped_by_destructible'])
+            self.assertEqual(
+                1, battle._destructibles.shot_world_distance.call_count)
+
+    def test_he_destructible_bursts_before_vehicle_but_heat_does_not(self):
+        for kind, splash_count in (('HIGH_EXPLOSIVE', 1),
+                                   ('HOLLOW_CHARGE', 0)):
+            runtime = _runtime()
+            battle = BattleRuntime(runtime)
+            battle._avatar = runtime.bigworld.avatar
+            descriptor = _Descriptor()
+            descriptor.gun.shots[0].shell.kind = kind
+            source = _Vehicle(10, descriptor, _Vector(), (0, 0, 0),
+                              {'health': 500})
+            target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 5),
+                              (0, 0, 0), {'health': 500})
+            target.collideSegmentExt = lambda start, end: [
+                types.SimpleNamespace(
+                    dist=5.0, hitAngleCos=1.0,
+                    matInfo=types.SimpleNamespace(armor=10.0),
+                    compName='vehicleHull')]
+            runtime.bigworld.entities.update({10: source, 11: target})
+            battle._server = types.SimpleNamespace(vehicle_id=10)
+            battle._records = {
+                'player:1': {'engine_id': 10, 'kind': 'player',
+                             'network_id': 1, 'local': True},
+                'bot:2': {'engine_id': 11, 'state': {'health': 500},
+                          'kind': 'bot', 'network_id': 2, 'local': False}}
+            runtime.bigworld.avatar.gunRotator = types.SimpleNamespace(
+                getCurShotPosition=lambda: (
+                    _Vector(), _Vector(0, 0, 1)))
+            battle._destructibles = types.SimpleNamespace(
+                shot_world_distance=mock.Mock(return_value={
+                    'world_distance': 3.0, 'piercing_loss': 0.0,
+                    'stop_distance': 3.0, 'continue_from': None,
+                    'stopped_by_destructible': True}))
+            battle.client = types.SimpleNamespace(
+                player_id=1, send_bot_hit=mock.Mock())
+            battle._he_splash = mock.Mock()
+
+            battle._resolve_hit(7, 0.0, 0.0)
+
+            self.assertEqual(0, battle.client.send_bot_hit.call_count)
+            self.assertEqual(splash_count, battle._he_splash.call_count)
+            if splash_count:
+                self.assertAlmostEqual(3.0,
+                                       battle._he_splash.call_args.args[0].z)
+
+    def test_vehicle_before_destructible_never_mutates_prop(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        calls = []
+
+        def sensor(unused_bigworld, unused_space, start, end,
+                   unused_direction, unused_shot):
+            calls.append((start, end))
+            if (end - start).length > 5.0:
+                self.fail('vehicle cap exposed the prop behind it')
+            return {'world_distance': 999999.0, 'piercing_loss': 0.0,
+                    'stop_distance': None, 'continue_from': None}
+
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=sensor)
+        result = battle._resolve_shot_scene(
+            _Vector(), _Vector(0, 0, 5), _Vector(0, 0, 1),
+            _Descriptor().gun.shots[0])
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual(999999.0, result['world_distance'])
 
     def test_he_splash_uses_vehicle_ray_and_skips_direct_target(self):
         runtime = _runtime()
@@ -6209,6 +8658,175 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(6, sent.kwargs[
             'critical_target_base_revision'])
         self.assertEqual(2, sent.kwargs['critical_target_ack_seq'])
+
+    def test_bot_shot_uses_same_destructible_loss_and_vehicle_cap(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        source = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 5), (0, 0, 0),
+                          {'health': 500})
+        target.collideSegmentExt = lambda start, end: [types.SimpleNamespace(
+            dist=5.0, hitAngleCos=1.0,
+            matInfo=types.SimpleNamespace(armor=10.0),
+            compName='vehicleHull')]
+        runtime.bigworld.entities.update({10: source, 11: target})
+        battle._records = {
+            'bot:1': {'engine_id': 10, 'state': {'team': 1},
+                      'kind': 'bot', 'network_id': 1},
+            'bot:2': {'engine_id': 11,
+                      'state': {'team': 2, 'combat_base_revision': 6,
+                                'combat_ack_seq': 2},
+                      'kind': 'bot', 'network_id': 2}}
+        battle.client = types.SimpleNamespace(
+            send_bot_bot_hit=mock.Mock(return_value=True))
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(return_value={
+                'world_distance': 999999.0, 'piercing_loss': 25.0,
+                'stop_distance': None, 'continue_from': None}))
+        battle._shell_damage = mock.Mock(return_value=(80, 2))
+        battle._critical_hit = lambda *args, **kwargs: (
+            80, {'events': []})
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'combat_rules.sample_penetration_factor',
+                return_value=0.8) as draw:
+            self.assertTrue(battle._resolve_bot_shot({
+                'id': 1, 'target_kind': 'bot', 'target_id': 2,
+                'shell_index': 0}, 3))
+
+        draw.assert_called_once_with()
+        ray = battle._destructibles.shot_world_distance.call_args.args
+        self.assertAlmostEqual(5.0, (ray[3] - ray[2]).length)
+        self.assertEqual(
+            25.0, battle._shell_damage.call_args.kwargs['pierce_loss'])
+        factor = battle._shell_damage.call_args.kwargs[
+            'penetration_factor']
+        self.assertEqual(0.8, factor)
+
+    def test_player_reuses_one_penetration_factor_for_scene_and_vehicle(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        source = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 5),
+                          (0, 0, 0), {'health': 500})
+        target.collideSegmentExt = lambda start, end: [types.SimpleNamespace(
+            dist=5.0, hitAngleCos=1.0,
+            matInfo=types.SimpleNamespace(armor=10.0),
+            compName='vehicleHull')]
+        runtime.bigworld.entities.update({10: source, 11: target})
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._records = {
+            'player:1': {'engine_id': 10, 'kind': 'player',
+                         'network_id': 1, 'local': True},
+            'bot:2': {'engine_id': 11,
+                      'state': {'combat_base_revision': 7,
+                                'combat_ack_seq': 3}, 'kind': 'bot',
+                      'network_id': 2, 'local': False}}
+        runtime.bigworld.avatar.gunRotator = types.SimpleNamespace(
+            getCurShotPosition=lambda: (
+                _Vector(), _Vector(0, 0, 1)))
+        battle.client = types.SimpleNamespace(
+            player_id=1, send_bot_hit=mock.Mock(return_value=True))
+        battle._critical_hit = lambda *args, **kwargs: (
+            args[5], {'events': []})
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(side_effect=(
+                {'world_distance': 999999.0, 'piercing_loss': 25.0,
+                 'loss_distance': 2.0, 'stop_distance': None,
+                 'continue_from': 2.1},
+                {'world_distance': 999999.0, 'piercing_loss': 0.0,
+                 'stop_distance': None, 'continue_from': None})))
+        observed = {}
+
+        def damage(descriptor, collisions, distance, shell_index=None,
+                   pierce_loss=0.0, penetration_factor=None):
+            observed['vehicle'] = penetration_factor
+            return 120, 2
+
+        battle._shell_damage = damage
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'combat_rules.sample_penetration_factor',
+                return_value=0.75) as draw:
+            battle._resolve_hit(7, 0.0, 0.0)
+
+        draw.assert_called_once_with()
+        self.assertEqual(0.75, observed['vehicle'])
+
+    def test_direct_vehicle_draws_penetration_only_when_hit_is_resolved(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        source = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 5),
+                          (0, 0, 0), {'health': 500})
+        target.collideSegmentExt = lambda start, end: [types.SimpleNamespace(
+            dist=5.0, hitAngleCos=1.0,
+            matInfo=types.SimpleNamespace(armor=10.0),
+            compName='vehicleHull')]
+        runtime.bigworld.entities.update({10: source, 11: target})
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._records = {
+            'player:1': {'engine_id': 10, 'kind': 'player',
+                         'network_id': 1, 'local': True},
+            'bot:2': {'engine_id': 11,
+                      'state': {'combat_base_revision': 7,
+                                'combat_ack_seq': 3}, 'kind': 'bot',
+                      'network_id': 2, 'local': False}}
+        runtime.bigworld.avatar.gunRotator = types.SimpleNamespace(
+            getCurShotPosition=lambda: (_Vector(), _Vector(0, 0, 1)))
+        battle.client = types.SimpleNamespace(
+            player_id=1, send_bot_hit=mock.Mock(return_value=True))
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(return_value={
+                'world_distance': 999999.0, 'piercing_loss': 0.0,
+                'stop_distance': None, 'continue_from': None}))
+        battle._shell_damage = mock.Mock(return_value=(120, 2))
+        battle._critical_hit = lambda *args, **kwargs: (
+            args[5], {'events': []})
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'combat_rules.sample_penetration_factor',
+                return_value=1.1) as draw:
+            battle._resolve_hit(7, 0.0, 0.0)
+
+        draw.assert_called_once_with()
+        self.assertEqual(
+            1.1, battle._shell_damage.call_args.kwargs[
+                'penetration_factor'])
+
+    def test_pure_player_miss_does_not_draw_penetration_factor(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        source = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = source
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._records = {
+            'player:1': {'engine_id': 10, 'kind': 'player',
+                         'network_id': 1, 'local': True}}
+        runtime.bigworld.avatar.gunRotator = types.SimpleNamespace(
+            getCurShotPosition=lambda: (_Vector(), _Vector(0, 0, 1)))
+        battle.client = types.SimpleNamespace(player_id=1)
+        battle._destructibles = types.SimpleNamespace(
+            shot_world_distance=mock.Mock(return_value={
+                'world_distance': 999999.0, 'piercing_loss': 0.0,
+                'stop_distance': None, 'continue_from': None}))
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'combat_rules.sample_penetration_factor') as draw:
+            battle._resolve_hit(7, 0.0, 0.0)
+
+        draw.assert_not_called()
 
     def test_bot_shot_resolver_uses_dispersed_barrel_ray(self):
         runtime = _runtime()

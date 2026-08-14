@@ -120,15 +120,16 @@ def _ensure_chunk(spaceID, chunkID, pos):
 		# createEntity may complete asynchronously, but a failed call must remain
 		# retryable instead of permanently poisoning this chunk.
 		_state['entities'].add(chunkID)
-	if not mgr.isChunkLoaded(chunkID):
-		fnames = BigWorld.wg_getChunkDestrFilenames(spaceID, chunkID)
-		if fnames is not None:
-			mgr.onChunkLoad(chunkID, len(fnames))
+	# ``game.wg_onChunkLoad`` owns the manager's exact native slot count. The
+	# filename helper may expose only the named SpeedTree prefix, so synthesising
+	# onChunkLoad from its length truncates later fragile/structure/falling slots
+	# and permanently poisons the manager for this streamed chunk.  If the native
+	# callback has not arrived, the manager safely queues direct orders itself.
 	return mgr.getController(chunkID)
 
 
 def _apply(spaceID, chunkID, pos, kind, destrData, dedupKey,
-		syncWithProjectile=False):
+		syncWithProjectile=False, applyShotImmediately=False):
 	import AreaDestructibles
 	_reset_if_new_space(spaceID)
 	c = _chunk(chunkID)
@@ -146,7 +147,24 @@ def _apply(spaceID, chunkID, pos, kind, destrData, dedupKey,
 		previous = getattr(ctrl, prevName)
 		values.append(destrData)
 		try:
-			getattr(ctrl, 'set_' + prop)(None)
+			if applyShotImmediately:
+				# The #1513 property setter decodes the shot bit and always asks
+				# the native manager to synchronize with PlayerAvatar's later
+				# ``damagedDestructibles`` projectile payload.  The copied shell
+				# resolver has no such payload.  Preserve the encoded shot bit for
+				# hit effects and replicated state, but advance the controller's
+				# diff snapshot ourselves and issue the native order unsynchronized.
+				setattr(ctrl, prevName, frozenset(values))
+				dmgTypes = {
+					'tree': AreaDestructibles._DAMAGE_TYPE_TREE,
+					'column': AreaDestructibles._DAMAGE_TYPE_COLUMN,
+					'fragile': AreaDestructibles._DAMAGE_TYPE_FRAGILE,
+					'module': AreaDestructibles._DAMAGE_TYPE_MODULE,
+				}
+				AreaDestructibles.g_destructiblesManager.orderDestructibleDestroy(
+					chunkID, dmgTypes[kind], destrData, True, False)
+			else:
+				getattr(ctrl, 'set_' + prop)(None)
 		except Exception:
 			# A failed setter may not leave the replicated property claiming that
 			# native geometry changed.  Roll back only our own tail append; any
@@ -219,8 +237,12 @@ def destroy_fragile(spaceID, chunkID, itemIndex, pos, isShotDamage=False):
 	import AreaDestructibles
 	chunkID = int(chunkID); itemIndex = int(itemIndex)
 	data = AreaDestructibles.encodeFragile(itemIndex, isShotDamage)
+	# The copied shell resolver does not receive #1513's server-authored
+	# ``damagedDestructibles`` payload, so there is no later
+	# ``onProjectileExploded`` transaction to release a synced native order.
+	# Preserve the shot bit in the encoded destruction, but apply it now.
 	return _apply(spaceID, chunkID, pos, 'fragile', data,
-		(itemIndex, None), isShotDamage)
+		(itemIndex, None), False, bool(isShotDamage))
 
 
 def destroy_module(spaceID, chunkID, itemIndex, matKind, pos, isShotDamage=False):
@@ -230,4 +252,4 @@ def destroy_module(spaceID, chunkID, itemIndex, matKind, pos, isShotDamage=False
 		matKind = int(matKind)
 	data = AreaDestructibles.encodeDestructibleModule(itemIndex, matKind, isShotDamage)
 	return _apply(spaceID, chunkID, pos, 'module', data,
-		(itemIndex, matKind), isShotDamage)
+		(itemIndex, matKind), False, bool(isShotDamage))

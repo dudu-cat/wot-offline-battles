@@ -5,10 +5,342 @@ This review is pinned to the Chinese HD client whose `version.xml` reports
 CPython 2.7 bytecode magic `03 f3 0d 0a`; the embedded build identifies itself
 as Python 2.7.7.
 
-The goal of version 0.3.51 is a complete playable vertical path, not another
+Version 0.3.76 restores exact #1513's frozen PREBATTLE aiming boundary. After
+one initial camera/gun alignment, the physical gun, stock marker and server
+marker remain frozen until the single native BATTLE period transition starts
+stock aiming and opens the existing movement/fire fence.
+
+Exact resources expose vehicle mass, speed and terrain resistance, but not the
+native C++ W-release curve. The neutral-coast share therefore moves
+conservatively from `0.55` to `0.65`, without an exact-retail claim. Type 62
+regression covers 30, 60 and 120 FPS; native feel remains a Windows #1513
+acceptance item.
+
+Version 0.3.75 repairs a lifecycle mismatch introduced by deliberately usable
+PREBATTLE camera controls. Exact #1513's period transition clears the private
+`PlayerAvatar.__isOnArena` flag and stops `VehicleGunRotator`; the enabled
+input handler could therefore move the gun marker while the physical turret
+remained at its spawn angle. The port now supplies native targeting parameters
+before calling the exact rotator `start()` surface, temporarily sets only the
+guard flag, restores it in `finally`, and verifies the rotator's private
+started/maximum-turret-speed state. It does not call the full arena-start
+gameplay transition. `_battle_live` continues to fence movement and fire until
+the server's ordered BATTLE barrier.
+
+The navigation change is confined to shared strategic route A*. It adds a
+small cost derived from the baked cell's existing link completeness, and its
+smoother rejects a shortcut that would increase mean missing-link exposure by
+more than 0.25. Spawn joins and local recovery do not request the preference.
+No collision, shallow-water, grade or link-validity predicate is weakened, so
+an unavoidable one-cell passage remains the same passage rather than being
+made artificially wider.
+
+The full-pair observation period is 0.40 seconds and its phased lane-refresh
+window is 0.20 seconds. The ordinary no-query envelope is 585 m: the server's
+560 m assignment ceiling plus a conservative 25 m two-vehicle travel margin
+across the longer window and presentation phases. This does not change
+`SHOT_LANE_SECONDS = 0.20`; a selected target must still have an independent
+final-fire lane result within that freshness bound. At the compatibility
+boundary, lower periodic probe frequency is therefore allowed to delay shared
+tactical knowledge but not to authorize fire from an older proof.
+
+Bot inventory uses the installed descriptor capacity and at most five
+descriptor-order shell summaries already admitted by protocol v5. Because the
+stable descriptor seam does not expose store price, the first non-HE round is
+the standard baseline and a later non-HE round is classified as premium only
+when its representative penetration is at least 1.03 times the baseline.
+Category weights are
+`3:2:1` for ordinary vehicles and `1:1:4` for SPGs, redistributing any absent
+category. Server planning prefers standard, selects HE only for a safely soft
+or bounded finishing case, selects premium when normal penetration is below
+the target-armor margin, and never requests an exhausted category. Human
+contacts obtain armor/class from `build_vehicle_profile()` over the installed
+descriptor and cache that result by vehicle name. Render-frame live overlays
+update pose, health and team fields only, so they cannot replace this immutable
+profile with an authority-wire armor claim.
+
+Bot `shell_index`, `next_shell_index`, `ammo_reload_pending` and
+`ammo_remaining` form one atomic snapshot. The authority consumes the
+physically loaded round at launch and may promote only the previously planned
+round at a completed reload boundary.
+The server checks inventory shape, exact one-round conservation and the
+loaded/next transition; canonical snapshots preserve all fields for authority
+takeover. This is trusted-LAN Bot admission, not a new player reload validator
+or a reconstruction of retail store economics.
+
+Lakeville's compiled space contains CTF and assault2 base instances with
+different visibility masks. The initial client-only space selection correctly
+writes CTF bit `0x00000001`, but exact #1513's late
+`ClientVisibilityFlags.SERVER_MASK` update may overwrite it with `0x000fffff`
+before deferred client readiness completes. `_finish_entity_startup()` now
+idempotently reapplies the selected gameplay bit after that stock boundary. In
+the exact Lakeville data, CTF mask `0xffffff89` intersects bit 0 while assault2
+mask `0xffffffc0` does not, so the observed write sequence
+`1 -> SERVER_MASK -> 1` leaves only the CTF base visible. XML, capture rules,
+minimap, team assignment
+and the one-base-per-team CTF objective are unchanged. Windows #1513 remains
+required to accept native prebattle turret motion, realised corridor traffic,
+sustained frame pacing, base visibility and ammunition presentation.
+
+Version 0.3.74 keeps full authority-Bot state inside the client but projects the
+v5 `bot_state` wire copy to the server sanitizer's consumed fields before the
+immutable outbound snapshot. This does not move projectile launch or Bot
+simulation to the server: `BattleRuntime` continues to consume the original
+complete update locally. The optional shot yaw/pitch pair remains atomic at the
+projection boundary.
+
+The short 0.0975-second generic planning cache remains a steering and slope
+refresh. A typed exact 3x3 receipt has an independent containment contract and
+may cross that refresh only under its exact origin, yaw, travel sign and
+actual-`dt` forward-coverage checks. Any vertical, lateral or angular drift,
+coverage exhaustion or sign change restores proof. The navigation adapter now
+uses the driver's 1.5-metre arrival radius when rejecting a parked near target,
+and an intentional traffic wait suppresses recovery for no more than 1.5
+seconds. These are pure Python control boundaries; realised native frame pacing
+and congested movement still require Windows #1513 acceptance.
+
+Version 0.3.73 fixes one compatibility gap between the local spawn planner and
+the 0.3.71 asynchronous sender. The planner intentionally returns a dictionary
+keyed by integer team ids `1` and `2`, while the immutable sender rejects any
+mapping whose keys are not already JSON text. `LANClient.send_battle_ready`
+now converts only those known team keys to `"1"` and `"2"` at the protocol
+boundary. The formation payload and server load-barrier contract are otherwise
+unchanged.
+
+Version 0.3.72 replaces the previous fire-time terminal ray with a shared
+elapsed-time projectile law for player and authority-Bot shells. The canonical
+launch records origin, velocity, gravity and lifetime. Its parabola is tested
+in chords of at most 25 ms, including a relative sweep for each moving vehicle,
+so an already-fired shell does not follow a target and the target may dodge it.
+Direct fire and SPG fire use moving-target lead before launch. The same launch
+record drives local and relayed tracer presentation.
+
+The matching server advertises and requires `projectile_ledger_v1`. It owns
+launch identity, checked-through progress, active snapshots, authority epochs
+and terminal tombstones. A launched shell remains live if its shooter leaves;
+an elected successor restores active records and continues only from the
+server-accepted cursor. One terminal resolution validates and commits direct
+or bounded splash HP effects and shot-destructible receipts atomically. The
+server still trusts the map-aware authority client for proprietary BSP,
+destructible, vehicle and armor intersection results; the durable ledger does
+not turn those local geometry queries into server simulation.
+
+SPGs retain their server-owned rear deployment anchor. A bounded authority-
+client controller evaluates low and high ballistic families against exact
+world collision through a fair queue capped at four native rays per rendered
+frame. It freezes a proved moving-target aim/flight intent through the matching
+native muzzle launch, preventing target motion from replacing the pending proof
+every tick. A receipt that finishes more than 1.5 metres from the target's
+newly projected impact pose may wait only while the same identity and full 3-D
+velocity will cross its proved endpoint, with that condition rechecked every
+frame; otherwise it is rejected and re-led through another frozen exact proof.
+The whole proof lifecycle has a 120-second absolute bound. The exact descriptor
+survey finds 52 SPGs, 133 installed shell entries
+and 43 distinct physical tuples. Speed spans 265--510 m/s and gravity spans
+125--190 m/s2. Across installed elevation limits and the baked maps' 89.106 m
+maximum terrain drop, the longest reachable grounded trajectory is the
+FV3805's 440 m/s, 146 m/s2, 70-degree high arc at 5.872907831 seconds. Stun
+remains disabled because the pinned client fragments do not
+supply this port with a complete canonical penalty/duration ledger and
+medical-kit recovery transaction. Python verification does not prove #1513
+tracer visuals, projectile/arc-probe frame pacing, artillery feel or native
+round cleanup; those remain Windows acceptance items.
+
+Version 0.3.71 imports a constrained set of proven 0.8.2 mechanisms without
+changing #1513 native ownership. The caller-facing LAN path freezes plain JSON
+and appends every accepted message to a bounded reliable FIFO; it neither
+serializes nor calls `sendall` on the game thread and it never coalesces ordered
+input, Bot-state or combat payloads. Hello remains the synchronous first wire
+message. The sender and receiver are fenced by one transport generation.
+Invalid input is rejected before admission; overflow or sender failure closes
+that transport rather than losing an ordered message silently.
+
+The copied vertical integrators now distinguish first terrain placement from a
+later centre-support jump. A rise above `min(frame climb, 0.85 m) + 0.02 m`
+rolls the current tick back and reuses the established hard-wall response rather
+than lifting the hull onto a wagon, roof or large prop. Bot support rejection,
+realised navigation rollback and hard motion resolution all invalidate the
+affected decision and typed motion receipt before remembering the attempted
+yaw. The driver chooses one finite escape side around a broad obstacle and
+aligns before applying forward torque to a meaningful ascent. The navigation
+guard preserves a turn immediately before a climb in baked smoothing, live
+reach, lookahead and partial-path continuation.
+
+No native 0.8.2 `WGVehicleFilter`/physics experiment is present in this port.
+The SPG boundary also remains unchanged from 0.3.70: a rear route anchor and
+arrival hold are implemented, but open-sky proof, ballistic trajectory and arc
+collision, indirect-hit resolution and stun are not. Exact Windows #1513
+remains the acceptance boundary for native motion/contact feel, viewpoint
+switching and repeated-round lifecycle safety.
+
+The goal of version 0.3.70 is a complete playable vertical path, not another
 login-only probe: local Account -> stock Lobby/join/map selection -> native map and
 Avatar -> native local Vehicle plus remote presentations -> local movement/aim/fire -> synchronized
 humans and bots -> damage/death/result -> cleanup -> a second round.
+
+Version 0.3.70 narrows the copied horizontal-collision fast path to a
+continuous bounded height profile whose actual collision normal is ground-
+like. Unlike the previous one-direction rise test, the predicate is direction-
+neutral, so a continuous downhill profile is not reclassified as a wall. Level
+streets, step discontinuities, flat walls and raised walls still reach the
+original hull rays. In the copied longitudinal law, neutral coasting preserves
+the established flat-road drivetrain share and progressively unloads only that
+share when current motion is downhill. At or beyond the static-hold tangent,
+only descriptor rolling resistance remains. Uphill coasting gets no downhill
+relief; opposite throttle, handbrake and the zero-speed hold still apply their
+existing laws.
+
+The destructible contact seam retains the exact descriptor filename and #1513
+mass/speed/health gate. At physical speed, exact swept-hull/OBB contact supplies
+the real kinetic input and an accepted fragile/module crush can advance without
+the hard-wall speed response. At low speed or from rest under matching drive,
+the forward/reverse descriptor top speed is only gate evidence. It can trigger
+native submission only when the exact leading hull face, a 0.075-m margin and
+this frame's real travel intersect the item. That submission holds the current
+pose and restores pre-step real speed; the cap never enters copied vehicle,
+LAN or ram state. On following ticks, a pending native skin can clear only by
+advancing through its unique registered OBB exit and recasting the remainder.
+Falling items, backing walls, expired-but-still-solid skins, ambiguous identity,
+native rejection and under-threshold contacts remain blocking.
+
+Authority-Bot planning uses the same strict catalog boundary without moving
+authority to a distance probe. The existing staggered driver cadence retains
+its three-lane 15-metre low-speed and 20-metre above-5-m/s corridor. A pure read
+may classify a segment as soft only by resolving unique stock-crushable OBBs
+and advancing past each exact exit. At most four adjacent items may be skipped;
+a fifth fails closed. Generic planner alternatives retain their six horizontal
+rays. Only the finally selected flat, straight, powered motion sample adds an
+exact read-only 3x3 receipt: commit-width lateral lanes, all three commit heights
+and 15 metres of forward coverage, bound to origin, yaw and direction. An
+ordinary straight frame may skip a fresh world query only when its actual-`dt`
+leading-hull sweep remains strictly inside that typed receipt and no catalog
+OBB touches the hull. A hard proof blocks; a deferred proof is not cached.
+Missing or stale proof, vertical/lateral/yaw drift, catalog contact, coasting,
+braking, turning and airborne motion remain world-first. Destruction and LAN
+publication occur only at exact hull contact, and the directional cap remains
+gate-only. Final-motion receipts have a hard 13-job render-frame budget. The
+waiting rotation retains only Bots that actually made the eligible final-motion
+request; idle, hard-blocked, turning or airborne Bots drop out. Unattempted
+receiptless work keeps initial-backlog priority over refreshes. Once its native
+callback itself defers, it loses that priority and rotates behind the other
+enrolled requests, so neither a persistent callback deferral nor a refresh can
+starve the other. Initial deadlines cover the full 0.0975-second decision
+interval. A deferred eligible Bot pauses for that frame at pre-step real speed,
+does not call route-failure recovery, does not cache the deferred result and
+does not substitute an authoritative world sweep. The strict 24-FPS scheduler
+test drains 29 startup
+jobs as 13/13/3 and grows the receipt cache as 13/26/29; native Windows frame
+time remains outside this deterministic proof. A bounded
+low-rate zero-speed scan merely registers the streamed chunk. This supplements
+the older native sensor without restoring the permissive 0.8.2 pivot workaround.
+
+The server macro planner now stages each SPG at one cached rear-side point
+chosen from direction-neutral own/enemy route geometry, then emits a zero-
+throttle hold inside the arrival radius. This is a portable server order, not
+proof of an open ballistic corridor. The client-side arc solver, arc collision
+budget and indirect-hit loop are not yet claimed by this review; native Windows
+#1513 placement remains a release acceptance item.
+
+Version 0.3.69 adds two constrained adapters without moving proprietary
+terrain or camera law into the Python server. The canonical base state gives
+the server macro planner an `invaders` trigger and the exact threatened base.
+It retains a stable one-to-three-Bot response chosen by distance/profile-speed
+ETA, normally leaving one living Bot on its previous task. Responders keep the
+normal contact and firing-lane gates; capture-contributor identity can rank
+only an already visible and individually shootable contact, so no hidden pose
+crosses this boundary.
+
+The postmortem switch mailbox now delegates to a local server-style attachment
+only after the stock postmortem delay. It admits living friendlies, changes
+the attached matrix, and invokes the exact `PlayerAvatar.onSwitchViewpoint`
+callback transactionally. A selected synthetic remote entity is exposed to
+native lookup only for that observation; death/removal selects the nearest
+living ally and cleanup revokes the exposure. Windows #1513 remains required
+to accept the native switch controls, camera continuity and repeated-round
+teardown.
+
+The 0.3.68 destructible boundary is pinned to a schema-v3 catalog baked from
+all 41 exact #1513 map packages. A checksum-pinned whole-map directory maps
+61,625 unique world-matrix signatures to fragile, falling and structure-module
+resources plus transformed BSMO bounds. This recovers identity for native
+chunk slots whose filename is blank while preserving the engine's chunk/item
+index. Eleven ambiguous signatures covering 28 candidates fail closed.
+Local-player movement does not infer a dynamic prop from a nearby pivot: its
+swept OBB must intersect the exact item OBB, then the stock mass/speed/health
+kinetic gate decides whether native destruction may be requested. Native
+fragile/module acceptance retains a synthetic block through the stock
+0.2-second hiding delay. Falling items instead refresh their exact OBB from the
+native animator matrix and keep the final fallen pose. Static world rays and
+backing collision remain authoritative after a hide
+interval; the catalog is a strict contact/identity source, not permission to
+bypass an intact wall. The broad object-origin proximity workaround used by
+the legacy 0.8.2 implementation is deliberately not transplanted.
+Authority Bots retain the existing streamed proximity/native contact sensor;
+the new dynamic-only OBB supplement is not wired into Bot movement.
+
+The catalog retains normalized keys for deterministic indexing, but native
+`DestructiblesCache.getDescByFilename` receives the resource's case-preserved
+descriptor filename. This is an exact-build ABI requirement: the cache lookup
+is case-sensitive and rejecting a lowercase synthetic filename occurs before
+the unchanged stock mass/speed/health kinetic gate. Version 0.3.68 neither
+lowers that gate nor restores the broad 0.8.2 pivot-proximity workaround.
+
+The shot path also retains native material identity as its first choice. If a
+#1513 native slot is anonymous, only the nearest unique catalog OBB on the
+bounded shot segment may supply identity. The first static collision and
+nearest vehicle cap the search, while ambiguity fails closed. Traversal resumes
+from the exact registered OBB exit plus a small epsilon, not a fixed jump that
+could skip a thick structure or its backing geometry.
+
+The exact #1513 `destructibles.xml` supplies both numeric shooting-through
+contracts: `maxHpForShootingThrough` is `19`, and every listed material has
+`projectilePiercingPowerReduction` factor/minimum values `(0, 25)`. Version
+0.3.68 therefore lets AP, APCR and APHE continue only through an item whose
+scale-adjusted health is at most 19. Each accepted item leaves damage unchanged
+and adds a fixed 25 mm penetration loss; multiple items accumulate. The first
+operation that actually needs penetration lazily samples one shell factor and
+reuses it, while the range-dependent mean is evaluated at each tested obstacle
+distance and again at the vehicle. A pure miss or HE/HEAT stopped by a
+destructible consumes no penetration RNG. A sampled remainder below 1 mm makes
+the shell disappear at that
+obstacle. An above-threshold item may be destroyed but stops traversal. Under
+the pre-1.13 HE mechanics used by #1513, HE and HEAT stop at the first
+destructible, and HE explodes at that point.
+
+The threshold and material reduction are exact pinned-resource evidence.
+Official same-family mechanics descriptions support the shell-family split,
+cumulative penetration reduction and unchanged damage. The proprietary retail
+0.9.22 server implementation and its exact operation order are not published,
+however. The lazy one-factor, per-tested-hit-range, then cumulative-reduction
+order above is therefore documented as a high-confidence reconstruction rather than an exact
+server-source copy. The resulting fragile/module payload preserves its encoded
+shot bit, but the local manager order is unsynchronized: the copied projectile
+path does not deliver the retail server's later `damagedDestructibles` payload
+required to release a projectile-synchronized native order.
+
+The complete streamed-slot boundary comes from the exact #1513 native path:
+`game.onChunkLoad(spaceID, chunkID, numDestructibles, isOutside)` writes
+`numDestructibles` into the active `DestructiblesManager`. Version 0.3.68 reads
+that manager count and enumerates every native index. It uses
+`wg_getChunkDestrFilenames` only for its available filename prefix; a short
+prefix no longer proves that later fragile, structure or falling slots do not
+exist. A missing native count is retried after streaming rather than guessed,
+and a contradictory filename list fails closed.
+
+For Windows verification, bounded `DESTR` lines report one aggregate for each
+newly scanned chunk plus each first distinct contact stage. The logger reuses
+the same enumeration/contact result, adds no BigWorld query, caps chunk/contact
+identities per battle and emits at most one line every 0.25 seconds. Frame
+diagnostics retain callback-stage timing and logical probe counts, but version
+0.3.68 does not install the optional per-query Bot probe clock. Removing those
+two clock calls per native probe is behavior-preserving: the probe sequence,
+return values, freshness windows, deadlines and 110-pair safety budget are
+unchanged. Straight-line Windows driving remains the frame-pacing acceptance
+test; this source review cannot claim that the visible hitch is eliminated.
+
+The previous 0.3.65 schema-v2 catalog supplied transformed OBBs but joined
+runtime slots by native filename. That field exists for trees but is blank for
+many #1513 non-tree slots; schema v3 closes that identity gap.
 
 The stock `BigWorld.entity`/`entities` facade is an AOI surface, not the LAN
 authority registry. Unspotted or dead synthetic vehicles remain private there;
@@ -42,6 +374,9 @@ at their call sites and lifecycle boundaries:
 - presentation and combat calls: vehicle ammo/reload/targeting callbacks,
   `getCurShotPosition`, `showShooting`, health callbacks, kill arena updates
   and collision methods;
+- copied-motion camera consumers: `AccelerationSmoother.update` plus arcade
+  and sniper `__calcCurOscillatorAcceleration`; these read filter velocity
+  and acceleration independently of the compound root matrix;
 - resources: all standard arena definitions exposed by the local cache and the
   tank descriptors/models used by the playable and bot vehicle pools.
 
@@ -291,10 +626,13 @@ re-enabled only by the next waiting roster. Local failure events are accepted
 only for the synchronously starting or currently active round; duplicates from
 the departed round and delayed failures from an older round cannot retire a
 newer Avatar or send a second leave request. Explicit VOIP queries used by
-vehicle markers are present and conservatively disabled. The local slice cannot
-perform the cell-server attachment needed for postmortem spectator switching,
-so the exact switch mailbox rejects the request without falsely updating only
-the HUD.
+vehicle markers are present and conservatively disabled. The postmortem switch
+bridge reproduces the Python-visible outcome of the retail cell attachment
+locally: it validates a living friendly target, updates
+`ConsistentMatrices.attachedVehicleMatrix`, exposes only that selected
+synthetic entity to native lookup and invokes the stock viewpoint callback. It
+is deliberately limited to an active postmortem control after the delay;
+enemy, dead, absent and not-ready vehicles fail closed.
 
 Local Vehicle creation is gated by the complete pinned `Vehicle.def` SHA-256
 `e585c59235ebb2cfbb7857645878ed095360a8efe5df666c055e59a74e6a55c5`,
@@ -369,10 +707,12 @@ during review:
   arena teardown.
 
 Local input follows the exact stock path: `PlayerAvatar.moveVehicle` calls
-`WGVehicleFilter.notifyInputKeysDown` and the explicit Avatar mailbox receives
-the same flags. The client-created Vehicle has no retail game-server transform
-stream, so its installed `WGVehiclePhysics` cannot be the authoritative pose
-source. The copied 0.8.2 longitudinal, traverse, terrain and collision
+`WGVehicleFilter.notifyInputKeysDown` before the explicit Avatar mailbox
+relays the same flags. The mailbox must not notify the filter a second time or
+bypass the stock movement guards. The client-created Vehicle has no retail
+game-server transform stream, so its installed `WGVehiclePhysics` cannot be
+the authoritative pose source. The copied 0.8.2 longitudinal, traverse,
+terrain and collision
 integrator owns the player pose and publishes it through the exact #1513
 `Vehicle.model.matrix`, `ConsistentMatrices.__setTarget`,
 `PlayerAvatar.getOwnVehicleSpeeds` and `PlayerAvatar.updateOwnVehiclePosition`
@@ -406,6 +746,12 @@ The only version-specific substitution is #1513's verified
 and copied bot integrator without feeding a second physics owner.
 `BigWorld.Entity.teleport` remains forbidden; #1513 rejects it for an in-world
 client Vehicle as `Operation is not allowed`.
+
+LAN pose samples retain the fractional remainder of the nominal 30 Hz
+publication interval. Clearing the entire accumulator quantised a 40 FPS
+render loop to 20 Hz and 45/50/75 FPS to 22.5/25/25 Hz. At most one current
+pose is sent per rendered frame, so recovery from a slow frame never bursts
+stale samples.
 
 The player-visible spotting path now copies the 0.8.2 50-metre proximity,
 two-height static LOS, allied observer relay and five-second memory law. Enemy
@@ -477,6 +823,15 @@ local vehicle cannot move or fire, and a dead bot stops movement, targeting and
 late fire events. The elimination result freezes all inputs until the server
 returns the room to waiting.
 
+Exact #1513 creates one `ArenaDataProvider`, exposes it through
+`BattleSessionProvider.getArenaDP()`, and stores a `weakref.proxy` to that same
+provider inside `BattleFeedbackAdaptor`. A proxy and its referent cannot pass
+an object-identity comparison. The compatibility check therefore verifies the
+public shared feedback adaptor, active marker provider and real
+`FROM_PLAYER` classifier without inspecting feedback's private proxy identity.
+The ABI audit pins both the weak-proxy construction and the setup property's
+public forwarding chain.
+
 ## AI, room and round boundaries
 
 Humans take real team slots first. The first waiting 0.9.22 player owns map
@@ -508,6 +863,15 @@ update per second, at most three capture points per update, defender stop,
 empty-base reset and victory at 100 points. Standard battles end by
 elimination, capture or the server-owned 15-minute timeout.
 
+The same canonical update drives a narrow defense context for the server
+planner. One, two or three invaders request at most one, two or three eligible
+responders respectively, selected by distance and vehicle profile speed and
+sent only to a base that is currently invaded. The selection is stable across
+updates and retains a short clear grace; dead, ungrounded, engine-destroyed or
+double-tracked Bots are replaced. Travel overrides route movement but preserves
+ordinary visible-target aim and fire admission. No unspotted invader position
+is included in a Bot order.
+
 This source wiring is not the same as final bot-behavior acceptance. The
 finalized 0.8.2 spawn-congestion/OBB, reverse-steering and baked-route changes
 are migrated as source-derived changes; real-client acceptance still has to
@@ -524,9 +888,11 @@ The source audit deliberately keeps the following differences visible:
 - the server publishes terminal winner/reason/base team plus live frags and the
   human team-killer flag, but not the complete 0.8.2
   `personal`/`players`/`vehicles` battle-result record;
-- bot drowning, bot destructible contact and artillery trajectory behavior
-  remain open. The server also trusts authority-client bot gun timing and rays
-  rather than independently validating ammunition and reload legality.
+- bot drowning and the complete stun penalty/medical-kit loop remain open.
+  Authority-Bot movement now runs the same server-relayed destructible contact
+  boundary as player movement. Projectile trajectories are elapsed-time and
+  server-ledgered, but the server still trusts authority-client Bot gun timing,
+  proprietary collision/armor results, ammunition and reload legality.
 
 The local player path does include server-relayed critical state, fire,
 drowning, exact fall/landing attribution, small repair/medkit/extinguisher
@@ -596,15 +962,21 @@ Windows BigWorld engine. The first real-client run still has to verify:
 - the stock picker owns and releases the visible mouse correctly;
 - map-specific collision/water queries produce sensible local steering on the
   real spaces;
+- low- and high-speed contact on multiple maps destroys the intended fragile,
+  falling and structure-module objects; low-speed cap admission holds its
+  submission tick without publishing synthetic momentum, pending skins clear
+  only through their exact registered OBB exit and a backing-ray recast, falling
+  objects track and retain their native final collision pose, a five-item soft
+  chain fails closed, and surviving backing collision remains solid;
 - the kinematic layer, bot update budget and HUD remain usable at the target
-  frame rate; and
+  frame rate; this source validation does not claim that all visible movement
+  hitches are resolved; and
 - a full result -> lobby -> picker -> second battle cycle completes without a
   new traceback.
 
-Postmortem spectator attachment, SPG/strategic camera movement, battle-settings
-capture-device enumeration and combat-equipment placement are outside the
-current standard light/medium/heavy/tank-destroyer slice. Their exact mailboxes
-are not generalized into silent no-ops.
+SPG/strategic camera movement, battle-settings capture-device enumeration and
+combat-equipment placement remain outside the current standard vehicle-control
+slice. Their exact mailboxes are not generalized into silent no-ops.
 
 No additional Python mismatch is known in the consumer matrix above. Optional
 lobby features outside that matrix and all BigWorld-side behavior still remain

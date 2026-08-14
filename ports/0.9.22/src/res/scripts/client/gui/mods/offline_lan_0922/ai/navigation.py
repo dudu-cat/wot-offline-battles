@@ -12,11 +12,14 @@ import heapq
 import math
 import time
 
+from gui.mods.offline_lan_0922.ai.driver import WAYPOINT_ARRIVAL_RADIUS
+
 
 SQRT_TWO = math.sqrt(2.0)
 BAKED_FATAL_HAZARDS = 1 | 2
 BAKED_SHALLOW_WATER = 4
 BAKED_SHALLOW_WATER_PENALTY = 4.0
+BAKED_EDGE_CLEARANCE_WEIGHT = 0.20
 BAKED_FORMAT_NAME = 'offline-lan-0922-navgraph'
 BAKED_FORMAT_VERSION = 2
 
@@ -274,6 +277,8 @@ class TerrainGrid(object):
 		return value[1]
 
 	def segment_penalty(self, start, end, now):
+		if not self._failed_edges:
+			return 0.0
 		penalty = 0.0
 		for key in self._edge_keys_for_segment(start, end):
 			penalty = max(penalty,
@@ -323,6 +328,8 @@ class TerrainGrid(object):
 		return False
 
 	def path_has_penalty(self, path, now):
+		if not self._failed_edges:
+			return False
 		for index in range(len(path) - 1):
 			if self.segment_penalty(path[index], path[index + 1], now) > 0.0:
 				return True
@@ -404,6 +411,57 @@ class TerrainGrid(object):
 		self._segment_cache[(end_key, start_key)] = bool(clear)
 		return clear
 
+	@staticmethod
+	def shortcut_preserves_climb_approach(path, start_index, end_index,
+			minimum_grade=0.10, minimum_turn=0.30):
+		"""Keep the setup point before a steep path changes direction.
+
+		A collision-free chord is not always a controllable tank manoeuvre. If a
+		climb begins immediately after a bend, skipping the bend point makes the
+		hull meet the slope diagonally. Flat corners and straight climbs remain
+		eligible for smoothing.
+		"""
+		if end_index - start_index < 2:
+			return True
+		for index in range(start_index + 1, end_index):
+			before = path[index - 1]
+			pivot = path[index]
+			after = path[index + 1]
+			out_dx = float(after[0]) - float(pivot[0])
+			out_dz = float(after[2]) - float(pivot[2])
+			out_run = math.sqrt(out_dx * out_dx + out_dz * out_dz)
+			if out_run <= 0.1:
+				continue
+			grade = (float(after[1]) - float(pivot[1])) / out_run
+			if grade <= float(minimum_grade):
+				continue
+			in_dx = float(pivot[0]) - float(before[0])
+			in_dz = float(pivot[2]) - float(before[2])
+			if abs(in_dx) + abs(in_dz) <= 0.1:
+				continue
+			incoming = math.atan2(in_dx, in_dz)
+			outgoing = math.atan2(out_dx, out_dz)
+			turn = outgoing - incoming
+			while turn > math.pi:
+				turn -= math.pi * 2.0
+			while turn < -math.pi:
+				turn += math.pi * 2.0
+			if abs(turn) > float(minimum_turn):
+				return False
+		return True
+
+	@staticmethod
+	def live_shortcut_preserves_climb_approach(current, path, start_index,
+			end_index):
+		"""Apply the climb-approach guard from the hull's live position."""
+		if end_index < start_index:
+			return True
+		live_path = ((float(current[0]), float(current[1]),
+		              float(current[2])),) + tuple(
+			path[start_index:end_index + 1])
+		return TerrainGrid.shortcut_preserves_climb_approach(
+			live_path, 0, len(live_path) - 1)
+
 	def _edge(self, cell, height, next_cell):
 		if self.prebaked:
 			return self._baked_edge_height(cell, next_cell)
@@ -440,8 +498,74 @@ class TerrainGrid(object):
 			return None
 		return float(self._baked_heights[next_index]) / 1000.0
 
-	def _penalty(self, cell, avoid_points):
-		penalty = 0.0
+	def _baked_link_count(self, cell):
+		"""Return the number of independently baked exits from one safe cell."""
+		index = self._baked_index(cell)
+		if index is None:
+			return 0
+		mask = int(self._baked_links[index]) & 0xff
+		count = 0
+		while mask:
+			count += mask & 1
+			mask >>= 1
+		return count
+
+	def _baked_clearance_penalty(self, cell):
+		"""Prefer the middle of a proved corridor without inventing new links.
+
+		Every baked link already includes the shipped vehicle-width, obstacle,
+		water and grade checks.  A cell with exits on both sides therefore has
+		more independently proved manoeuvring room than a cell along the edge.
+		The small weight only breaks otherwise similar routes; an unavoidable
+		one-cell passage remains usable because no link or hazard rule changes.
+		"""
+		if not self.prebaked:
+			return 0.0
+		missing = max(0, len(self._NEIGHBOURS) -
+		              self._baked_link_count(cell))
+		return (float(missing) * self.cell_size *
+		        BAKED_EDGE_CLEARANCE_WEIGHT)
+
+	def _baked_clearance_exposure(self, path):
+		"""Return mean missing-link exposure along a realised path chord."""
+		if not self.prebaked or not path:
+			return 0.0
+		cells = []
+		if len(path) == 1:
+			cell = self._nearest_baked_cell(self.cell_for(path[0]), 2)
+			if cell is None:
+				return None
+			cells.append(cell)
+		else:
+			for start, end in zip(path, path[1:]):
+				segment = self._baked_segment_cells(start, end)
+				if not segment:
+					return None
+				if cells and cells[-1] == segment[0]:
+					segment = segment[1:]
+				cells.extend(segment)
+		if not cells:
+			return None
+		missing = sum(len(self._NEIGHBOURS) -
+		              self._baked_link_count(cell) for cell in cells)
+		return float(missing) / float(len(cells))
+
+	def shortcut_preserves_baked_clearance(self, path, start_index, end_index,
+			maximum_exposure_increase=0.25):
+		"""Do not smooth a centred proved path back onto a corridor edge."""
+		if not self.prebaked or end_index - start_index < 2:
+			return True
+		original = self._baked_clearance_exposure(
+			path[start_index:end_index + 1])
+		shortcut = self._baked_clearance_exposure(
+			(path[start_index], path[end_index]))
+		if original is None or shortcut is None:
+			return False
+		return shortcut <= original + float(maximum_exposure_increase)
+
+	def _penalty(self, cell, avoid_points, prefer_clearance=False):
+		penalty = (self._baked_clearance_penalty(cell)
+		           if prefer_clearance else 0.0)
 		if self.prebaked:
 			index = self._baked_index(cell)
 			if (index is not None and
@@ -497,25 +621,29 @@ class TerrainGrid(object):
 					continue
 				cell = self.cell_for(candidate)
 				score = (_distance_2d(candidate, goal) + abs(offset) * 3.5 +
-				         self._penalty(cell, avoid_points) * 2.0)
+					         self._penalty(cell, avoid_points, False) * 2.0)
 				value = (score, abs(offset), candidate)
 				if best is None or value[:2] < best[:2]:
 					best = value
 		return best[2] if best is not None else None
 
-	def plan(self, start, goal, avoid_points=None, max_expansions=1600, now=0.0):
+	def plan(self, start, goal, avoid_points=None, max_expansions=1600, now=0.0,
+			prefer_clearance=True):
 		"""Return a supported path synchronously (mainly for tests/tools)."""
-		search = self.begin_plan(start, goal, avoid_points, max_expansions, now)
+		search = self.begin_plan(
+			start, goal, avoid_points, max_expansions, now, prefer_clearance)
 		while not search.done:
 			search.step(256)
 		return search.result
 
 	def begin_plan(self, start, goal, avoid_points=None, max_expansions=1600,
-			now=0.0):
+			now=0.0, prefer_clearance=False):
 		return _TerrainSearch(self._plan_steps(
-			start, goal, avoid_points, max_expansions, now))
+			start, goal, avoid_points, max_expansions, now,
+			bool(prefer_clearance)))
 
-	def _plan_steps(self, start, goal, avoid_points, max_expansions, now):
+	def _plan_steps(self, start, goal, avoid_points, max_expansions, now,
+			prefer_clearance):
 		start_cell = self.cell_for(start)
 		goal_cell = self.cell_for(goal)
 		if self.prebaked:
@@ -586,7 +714,8 @@ class TerrainGrid(object):
 				if delta_y < 0.0:
 					slope_cost *= 1.25
 				new_cost = (cost_so_far[current] + run + slope_cost +
-				            self._penalty(next_cell, avoid_points) +
+				            self._penalty(
+				                next_cell, avoid_points, prefer_clearance) +
 				            self._failed_edge_penalty(current, next_cell, now))
 				if next_cell not in cost_so_far or new_cost < cost_so_far[next_cell]:
 					cost_so_far[next_cell] = new_cost
@@ -633,9 +762,9 @@ class TerrainGrid(object):
 		              float(goal[2]))
 		if self.segment_clear(path[-1], goal_point):
 			path.append(goal_point)
-		yield self._smooth(tuple(path), now)
+		yield self._smooth(tuple(path), now, prefer_clearance)
 
-	def _smooth(self, path, now=0.0):
+	def _smooth(self, path, now=0.0, prefer_clearance=False):
 		if len(path) < 3:
 			return path
 		result = [path[0]]
@@ -643,7 +772,12 @@ class TerrainGrid(object):
 		while index < len(path) - 1:
 			furthest = min(len(path) - 1, index + 6)
 			while furthest > index + 1:
-				if (self.segment_penalty(path[index], path[furthest], now) <= 0.0 and
+				if ((not prefer_clearance or
+					 self.shortcut_preserves_baked_clearance(
+						 path, index, furthest)) and
+						self.shortcut_preserves_climb_approach(
+						path, index, furthest) and
+						self.segment_penalty(path[index], path[furthest], now) <= 0.0 and
 						not self.segment_has_baked_hazard(
 							path[index], path[furthest], BAKED_SHALLOW_WATER) and
 						self.segment_clear(path[index], path[furthest])):
@@ -784,6 +918,18 @@ class TerrainNavigator(object):
 	def _cache_key(self, path_key, goal):
 		return (tuple(path_key), self.grid.cell_for(goal))
 
+	@staticmethod
+	def _prefers_baked_clearance(path_key):
+		"""Centre shared route legs, never a bot's spawn or recovery join."""
+		try:
+			kind = path_key[0]
+		except Exception:
+			return False
+		if kind == 'route':
+			return True
+		return (kind == 'continue' and len(path_key) > 3 and
+		        path_key[3] == 'route')
+
 	def _trim_cache(self, now):
 		if len(self.paths) <= 96:
 			return
@@ -918,7 +1064,8 @@ class TerrainNavigator(object):
 			# moving OBBs every frame; A* only owns static terrain and remembered edges.
 			search = self.grid.begin_plan(
 				start, goal, avoid_points=None,
-				max_expansions=self.search_max_expansions, now=now)
+				max_expansions=self.search_max_expansions, now=now,
+				prefer_clearance=self._prefers_baked_clearance(path_key))
 			self.searches[key] = search
 			self.search_times[key] = float(now)
 		self._advance_searches(now)
@@ -1061,13 +1208,17 @@ class TerrainNavigator(object):
 		reach_radius = min(10.0, max(1.5, self.grid.cell_size * 0.55))
 		while (index + 1 < len(path) and
 		       _distance_2d(current, path[index]) < reach_radius and
+		       self.grid.live_shortcut_preserves_climb_approach(
+			       current, path, index, index + 1) and
 		       self.grid.segment_penalty(current, path[index + 1], now) <= 0.0 and
 		       self.grid.segment_clear(current, path[index + 1])):
 			index += 1
 		# Look ahead only while every skipped piece is continuously supported.
 		lookahead = index
 		for candidate in range(index + 1, min(len(path), index + 3)):
-			if (self.grid.segment_penalty(current, path[candidate], now) <= 0.0 and
+			if (self.grid.live_shortcut_preserves_climb_approach(
+					current, path, index, candidate) and
+					self.grid.segment_penalty(current, path[candidate], now) <= 0.0 and
 					self.grid.segment_clear(current, path[candidate])):
 				lookahead = candidate
 			else:
@@ -1087,7 +1238,9 @@ class TerrainNavigator(object):
 				state['path_key'] = next_key
 				next_index = 0
 				for candidate in range(1, min(len(path), 3)):
-					if (self.grid.segment_penalty(current, path[candidate], now) <= 0.0 and
+					if (self.grid.live_shortcut_preserves_climb_approach(
+							current, path, 0, candidate) and
+							self.grid.segment_penalty(current, path[candidate], now) <= 0.0 and
 							self.grid.segment_clear(current, path[candidate])):
 						next_index = candidate
 					else:
@@ -1101,7 +1254,7 @@ class TerrainNavigator(object):
 			return self._fallback_target(
 				bot_id, current, goal, now, avoid_points, state, True)
 		selected = tuple(path[lookahead])
-		if (_distance_2d(current, selected) <= 0.5 and
+		if (_distance_2d(current, selected) <= WAYPOINT_ARRIVAL_RADIUS and
 				_distance_2d(current, goal) > 15.0):
 			# A cached path whose first usable edge has become blocked must not park
 			# the hull on its own position until the four-second stall timer fires.
@@ -1114,7 +1267,8 @@ class TerrainNavigator(object):
 
 	@staticmethod
 	def navigation_paused(current, requested_goal, selected_target,
-			minimum_request_distance=15.0, hold_radius=0.5):
+			minimum_request_distance=15.0,
+			hold_radius=WAYPOINT_ARRIVAL_RADIUS):
 		"""True when pathfinding intentionally returned the current position."""
 		return (_distance_2d(current, requested_goal) > float(minimum_request_distance) and
 		        _distance_2d(current, selected_target) <= float(hold_radius))

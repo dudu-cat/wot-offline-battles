@@ -165,6 +165,27 @@ def vertical_overlap(y_a, shape_a, y_b, shape_b, slop=0.02):
     return min(a_high, b_high) - max(a_low, b_low) > slop
 
 
+def support_rise_is_obstacle(body_y, support_y, maximum_climb, slop=0.02,
+                             maximum_step=0.85):
+    """Return whether a new centre support is a step, not drivable ground.
+
+    A vertical support ray can hit the deck of a wagon, a low roof, or the top
+    of a large prop after horizontal integration moved the hull partly inside
+    it. Only rises this tick can physically climb may be used as ground; the
+    hard cap keeps a slow frame from turning a vertical wall into a step.
+    """
+    if body_y is None or support_y is None:
+        return False
+    try:
+        rise = float(support_y) - float(body_y)
+        limit = min(max(0.0, float(maximum_climb)),
+                    max(0.0, float(maximum_step)))
+        limit += max(0.0, float(slop))
+        return rise > limit
+    except (TypeError, ValueError):
+        return False
+
+
 def _axes(yaw):
     # Local chassis x (right) and z (forward) in world x/z coordinates.
     sine = math.sin(yaw)

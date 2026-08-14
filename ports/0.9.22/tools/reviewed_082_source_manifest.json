@@ -4,7 +4,7 @@
     "ai/cover.py": "e37bc9b25a0e00badfc91a809884fcf384580f5ec7d84ab2b0b5ed127e2fc296",
     "ai/maps_extra.py": "ce7cbdcc257a707ba95c8161c2f85f7ddf2e4dcbbe73795e12811fce1e3023d0",
     "ai/maps_group_c.py": "f50d3599061855d571ead05a62b57f09b32b82747848abee0f33f4598896bdff",
-    "combat_rules.py": "07356c85beb004ffc99546053acfff6f66f2f7e8ec3efd7585dfe5ee74aba8c1",
+    "combat_rules.py": "9dd0296fe2a9e9340de3608f8017f6270e8f8e2d0d6ce9f673edecd2e1ce75bf",
     "critical_damage.py": "c0892e63ddd8cad02f71ba924ee086696c681b560737127e8aad2acc348745bd",
     "device_damage.py": "f5ba505e20a39247c4f97f99c228aac97ce87cb069a4da3af76e85221fdf2163",
     "internal_geometry.py": "1e07513945bdd97647e632fe25b18abbaa7ba1eaae0ae77bcd4d1968f553930f",

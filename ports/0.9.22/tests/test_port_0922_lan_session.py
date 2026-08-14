@@ -110,6 +110,7 @@ class _BattleRuntime(object):
         self.snapshots = []
         self.events = []
         self.rosters = []
+        self.observations = []
 
     def start(self, config, message=None, lan_client=None,
               on_local_leave=None):
@@ -127,6 +128,9 @@ class _BattleRuntime(object):
 
     def on_roster(self, message):
         self.rosters.append(message)
+
+    def on_bot_observation(self, message):
+        self.observations.append(message)
 
     def stop(self, show_login=True, restore_account=True):
         self.stopped.append(show_login)
@@ -785,6 +789,19 @@ class LANSessionTests(unittest.TestCase):
         self.emit('snapshot', snapshot)
         self.assertIs(snapshot, self.session.snapshot)
         self.assertEqual([snapshot], self.snapshots)
+
+    def test_only_active_round_bot_observation_reaches_battle_runtime(self):
+        self.emit('battle_start', {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]})
+        current = {'type': 'bot_observation', 'round_id': 7,
+                   'contacts': []}
+
+        self.emit('bot_observation', current)
+        self.emit('bot_observation', dict(current, round_id=6))
+
+        self.assertEqual([current], self.battle_runtime.observations)
 
     def test_local_avatar_leave_retires_round_and_waits_for_server_reset(self):
         first = {
