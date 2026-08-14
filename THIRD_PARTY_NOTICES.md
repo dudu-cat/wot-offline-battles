@@ -27,10 +27,27 @@ Software License 1.0. The license text is included at
 ## Compiled-space tooling
 
 The build-time decoder under
-`ports/0.9.22/tools/vendor/wot_space_bin_utils` comes from
+`0.9.22/tools/vendor/wot_space_bin_utils` comes from
 [`SkepticalFox/wot-space.bin-utils`](https://bitbucket.org/SkepticalFox/wot-space.bin-utils/)
 and is distributed under the WTFPL version 2. Its license text is retained in
 that vendored directory.
+
+## Windows server runtime and packager
+
+The downloadable Windows LAN server bundles CPython 3.11.9, distributed under
+the Python Software Foundation License Version 2 together with the licenses
+and notices for software incorporated into Python. The complete terms and
+source release are published by the Python Software Foundation at
+[`docs.python.org/3.11/license.html`](https://docs.python.org/3.11/license.html)
+and
+[`python.org/downloads/release/python-3119`](https://www.python.org/downloads/release/python-3119/).
+
+The executable is produced with PyInstaller 6.21.0. Its bootloader and loader
+are GPL-2.0-or-later with the PyInstaller bootloader exception, its runtime
+hooks are under Apache License 2.0, and its isolated helper is additionally
+available under the MIT license. The complete version-pinned licensing terms
+are retained upstream in
+[`PyInstaller v6.21.0 COPYING.txt`](https://github.com/pyinstaller/pyinstaller/blob/v6.21.0/COPYING.txt).
 
 ## Wargaming intellectual property
 

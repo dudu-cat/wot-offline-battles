@@ -3,9 +3,9 @@ offline/LAN battles - World of Tanks 0.8.2 and 0.9.22.0.1
 
 ## World of Tanks 0.9.22.0.1 #1513
 
-The `ports/0.9.22` release targets the frozen Chinese HD client. It is a
+The `0.9.22` release targets the frozen Chinese HD client. It is a
 separate CPython 2.7 `.wotmod`, not a copy of the 0.8.2 scripts. Start its
-Python 3 LAN server at `ports/0.9.22/server/lan_battle_server.py` even for a
+Python 3 LAN server at `0.9.22/server/lan_battle_server.py` even for a
 one-player battle, then click the stock **Battle!** button to join its waiting
 room. The first waiting player becomes
 room host and receives the native training-settings window as a local map
@@ -18,11 +18,22 @@ and start the shared round. There is no F12 or `0` key workflow.
 The 0.9.22 runtime uses native map, Avatar, Vehicle and HUD objects, fills each
 team to 15 vehicles, and supports movement, aiming, firing, damage, tactical
 bots, elimination, return to the picker and another round. See
-`ports/0.9.22/INSTALL.txt` for the copy-ready package instructions and
-`ports/0.9.22/COMPATIBILITY_REVIEW.md` for the exact `#1513` review and honest
+`0.9.22/INSTALL.txt` for the copy-ready package instructions and
+`0.9.22/COMPATIBILITY_REVIEW.md` for the exact `#1513` review and honest
 runtime boundary.
 
-Release `0.3.76` restores the exact #1513 countdown aiming lifecycle. Startup
+Release `0.4.0` turns the frozen #1513 port into a copy-ready product layout.
+The release now lives directly under `0.9.22`, defaults to
+`127.0.0.1:28782`, and stores an address changed in the in-game window in
+`mods/configs/offline_lan_0922/server_endpoint.json`; replacing the release
+overlay does not overwrite that user-owned file. On first garage entry it
+suppresses the stock CN automatic server-announcement browser before creation,
+leaving browsers explicitly opened by the player untouched. The waiting-room text
+uses player-facing host/connect instructions instead of implementation terms.
+A CI-built x64 Windows server can be started by double-clicking its executable;
+it always listens on `0.0.0.0:28782` with the `server_random` map policy.
+
+Release `0.3.76` restored the exact #1513 countdown aiming lifecycle. Startup
 normalizes the camera and gun to the vehicle direction once, then PREBATTLE
 leaves the physical gun, stock reticle and optional server marker frozen. The
 single native BATTLE period transition starts stock aiming and opens the

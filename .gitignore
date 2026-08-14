@@ -6,10 +6,11 @@ __pycache__/
 
 # Runtime state belongs beside the user's game installation, not in source.
 offhangar_user/
+**/mods/configs/offline_lan_0922/server_endpoint.json
 python.log
 *.log
 .DS_Store
 
 # Generated 0.9.22 mod packages are CI/local build artifacts.
-ports/0.9.22/dist/
+0.9.22/dist/
 deliverables/

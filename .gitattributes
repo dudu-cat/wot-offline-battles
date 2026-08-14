@@ -1,7 +1,7 @@
 # These law ports intentionally preserve source whitespace because the
 # executable provenance audit compares their copied 0.8.2 blocks exactly.
-ports/0.9.22/src/res/scripts/client/gui/mods/offline_lan_0922/combat_rules.py -whitespace
-ports/0.9.22/src/res/scripts/client/gui/mods/offline_lan_0922/destructibles_authority.py -whitespace
-ports/0.9.22/src/res/scripts/client/gui/mods/offline_lan_0922/destructibles_sensor.py -whitespace
-ports/0.9.22/src/res/scripts/client/gui/mods/offline_lan_0922/vehicle_physics.py -whitespace
-ports/0.9.22/src/res/scripts/client/gui/mods/offline_lan_0922/world_collision.py -whitespace
+0.9.22/src/res/scripts/client/gui/mods/offline_lan_0922/combat_rules.py -whitespace
+0.9.22/src/res/scripts/client/gui/mods/offline_lan_0922/destructibles_authority.py -whitespace
+0.9.22/src/res/scripts/client/gui/mods/offline_lan_0922/destructibles_sensor.py -whitespace
+0.9.22/src/res/scripts/client/gui/mods/offline_lan_0922/vehicle_physics.py -whitespace
+0.9.22/src/res/scripts/client/gui/mods/offline_lan_0922/world_collision.py -whitespace

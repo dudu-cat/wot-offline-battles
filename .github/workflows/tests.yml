@@ -23,7 +23,7 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: >-
-          python -m unittest discover -s ports/0.9.22/tests
+          python -m unittest discover -s 0.9.22/tests
           -p "test_*.py" -v
       - name: Check Python 2.6 client syntax
         run: |
@@ -34,18 +34,144 @@ jobs:
             done
           '
       - name: Audit 0.9.22 battle source provenance
-        run: python ports/0.9.22/tools/audit_battle_sources.py
+        run: python 0.9.22/tools/audit_battle_sources.py
       - name: Build Python 2.7 0.9.22 LAN client
         run: >-
           docker run --rm --platform linux/amd64 -v "$PWD:/work"
-          -w /work/ports/0.9.22 python:2.7.18
+          -w /work/0.9.22 python:2.7.18
           python build_wotmod.py
       - name: Validate 0.9.22 wotmod package
         run: >-
-          python ports/0.9.22/tools/validate_wotmod.py
-          ports/0.9.22/dist/org.peng.offline_lan_0922_0.3.76.wotmod
+          python 0.9.22/tools/validate_wotmod.py
+          0.9.22/dist/org.peng.offline_lan_0922_0.4.0.wotmod
       - uses: actions/upload-artifact@v4
         with:
           name: wot-0.9.22-lan-client
-          path: ports/0.9.22/dist/*
+          path: 0.9.22/dist/*
+          if-no-files-found: error
+
+  windows-server:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11.9"
+          architecture: "x64"
+      - name: Install pinned Windows server packager
+        run: >-
+          python -m pip install
+          -r 0.9.22/server/requirements-windows-build.txt
+      - name: Build zero-configuration Windows LAN server
+        shell: pwsh
+        run: >-
+          pwsh -NoProfile -File
+          0.9.22/server/build_windows_server.ps1
+      - name: Verify x64 executable, fixed listener, and protocol welcome
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $serverRoot = Join-Path $PWD "0.9.22\dist\server"
+          $serverExe = Join-Path $serverRoot "WoT-0.9.22-LAN-Server.exe"
+          $stdout = Join-Path $env:RUNNER_TEMP "wot-server.stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "wot-server.stderr.log"
+
+          @'
+          import struct
+          import sys
+
+          path = sys.argv[1]
+          with open(path, 'rb') as stream:
+              stream.seek(0x3c)
+              pe_offset = struct.unpack('<I', stream.read(4))[0]
+              stream.seek(pe_offset + 4)
+              machine = struct.unpack('<H', stream.read(2))[0]
+          if machine != 0x8664:
+              raise SystemExit('expected x64 PE machine, got 0x%04x' % machine)
+          '@ | python - $serverExe
+          if ($LASTEXITCODE -ne 0) {
+              throw "PE architecture check failed"
+          }
+
+          $ProtocolProbe = @'
+          import json
+          import socket
+
+          hello = {
+              'type': 'hello',
+              'protocol': 5,
+              'client_build': 'wot-0.9.22.0.1-cn-1513',
+              'capabilities': ['projectile_ledger_v1'],
+              'name': 'CI-Smoke',
+              'vehicle': 'ussr:R11_MS-1',
+              'max_health': 90,
+          }
+          sock = socket.create_connection(('127.0.0.1', 28782), 5.0)
+          try:
+              wire = sock.makefile('rwb', buffering=0)
+              wire.write((json.dumps(hello) + '\n').encode('utf-8'))
+              reply = json.loads(wire.readline().decode('utf-8'))
+          finally:
+              sock.close()
+          assert reply['type'] == 'welcome', reply
+          assert reply['protocol'] == 5, reply
+          assert reply['client_build'] == hello['client_build'], reply
+          assert 'projectile_ledger_v1' in reply['capabilities'], reply
+          '@
+
+          $process = Start-Process `
+              -FilePath $serverExe `
+              -PassThru `
+              -RedirectStandardOutput $stdout `
+              -RedirectStandardError $stderr
+          try {
+              $deadline = (Get-Date).AddSeconds(30)
+              $listening = $false
+              while ((Get-Date) -lt $deadline) {
+                  if ($process.HasExited) {
+                      throw "Windows server exited before opening port 28782"
+                  }
+                  $listeners = Get-NetTCPConnection `
+                      -LocalPort 28782 -State Listen -ErrorAction SilentlyContinue
+                  if ($listeners | Where-Object { $_.LocalAddress -eq "0.0.0.0" }) {
+                      $listening = $true
+                      break
+                  }
+                  Start-Sleep -Milliseconds 250
+              }
+              if (-not $listening) {
+                  throw "Windows server did not bind 0.0.0.0:28782"
+              }
+
+              $ProtocolProbe | python -
+              if ($LASTEXITCODE -ne 0) {
+                  throw "LAN protocol smoke failed"
+              }
+          }
+          finally {
+              if (-not $process.HasExited) {
+                  & taskkill.exe /PID $process.Id /T /F | Out-Null
+              }
+              if (Test-Path $stdout) {
+                  Write-Host "--- server stdout ---"
+                  Get-Content $stdout
+              }
+              if (Test-Path $stderr) {
+                  Write-Host "--- server stderr ---"
+                  Get-Content $stderr
+              }
+          }
+      - name: Package Windows server download
+        shell: pwsh
+        run: |
+          Compress-Archive -Force `
+            -Path 0.9.22/dist/server/WoT-0.9.22-LAN-Server.exe,0.9.22/dist/server/README.txt `
+            -DestinationPath 0.9.22/dist/WoT-0.9.22-LAN-Server-Windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wot-0.9.22-lan-server-windows
+          path: |
+            0.9.22/dist/WoT-0.9.22-LAN-Server-Windows.zip
+            0.9.22/dist/server/WoT-0.9.22-LAN-Server.exe
+            0.9.22/dist/server/README.txt
           if-no-files-found: error
