@@ -126,6 +126,18 @@ def _set_native_cursor_visible(visible):
 			return False
 
 
+def _restore_lobby_cursor():
+	"""Restore the Scaleform lobby cursor without changing mouse ownership."""
+	try:
+		import BigWorld, GUI
+		cursor = GUI.mcursor()
+		cursor.visible = False
+		BigWorld.setCursor(cursor)
+		return True
+	except Exception:
+		return False
+
+
 def _acquire_cursor():
 	global _cursor_acquired
 	if _cursor_acquired:
@@ -136,12 +148,14 @@ def _acquire_cursor():
 		_log_error('LAN settings could not show the mouse cursor')
 
 
-def _release_cursor():
+def _release_cursor(restore_lobby=False):
 	global _cursor_acquired
 	if not _cursor_acquired:
 		return
 	_set_native_cursor_visible(False)
 	_cursor_acquired = False
+	if restore_lobby:
+		_restore_lobby_cursor()
 
 
 def _key(Keys, *names):
@@ -180,7 +194,7 @@ class _EntryScript(object):
 		global _entry_hovered
 		_entry_hovered = False
 		if not _active:
-			_release_cursor()
+			_release_cursor(not _in_battle())
 		return True
 
 	def handleMouseButtonEvent(self, component, event):
@@ -283,7 +297,7 @@ def _set_entry_visible(value):
 		_refresh_entry()
 	elif _entry_hovered and not _active:
 		_entry_hovered = False
-		_release_cursor()
+		_release_cursor(not _in_battle())
 
 
 def _make_entry():
@@ -608,14 +622,15 @@ def open():
 
 def close():
 	global _active, _entry_hovered
+	_return_to_garage = not _in_battle()
 	_active = False
 	_entry_hovered = False
 	if _panel is not None:
 		_safe_set(_panel, 'visible', False)
 		_safe_set(_panel, 'focus', False)
 	_set_controls_visible(False)
-	_release_cursor()
-	_set_entry_visible(not _in_battle())
+	_release_cursor(_return_to_garage)
+	_set_entry_visible(_return_to_garage)
 
 
 def _activate_control(role):

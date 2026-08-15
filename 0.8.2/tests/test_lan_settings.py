@@ -12,6 +12,7 @@ SETTINGS_PATH = ROOT / "scripts/client/gui/mods/offhangar/lan_settings.py"
 def load_settings_module():
     roots = []
     cursor_calls = []
+    cursor_state = {"refcount": 0, "current": None}
 
     class MouseCursor:
         def __init__(self):
@@ -47,12 +48,16 @@ def load_settings_module():
     sys.modules["GUI"] = gui_engine
 
     player = types.SimpleNamespace(isOffline=True, _offhangar_network_client=None)
+    direct_cursor = object()
     bigworld = types.ModuleType("BigWorld")
     bigworld.player = lambda: player
     bigworld.callback = lambda delay, callback: None
-    bigworld.setCursor = lambda cursor: None
-    bigworld.dcursor = lambda: object()
+    bigworld.setCursor = lambda cursor: cursor_state.__setitem__("current", cursor)
+    bigworld.dcursor = lambda: direct_cursor
     sys.modules["BigWorld"] = bigworld
+    cursor_state["current"] = mouse_cursor
+    cursor_state["mouse"] = mouse_cursor
+    cursor_state["direct"] = direct_cursor
 
     keys = types.ModuleType("Keys")
     keys.KEY_F11 = 87
@@ -84,8 +89,19 @@ def load_settings_module():
     logging.LOG_ERROR = lambda *args: None
     sys.modules[logging.__name__] = logging
 
+    def show_cursor(visible):
+        visible = bool(visible)
+        cursor_calls.append(visible)
+        cursor_state["refcount"] += 1 if visible else -1
+        if visible:
+            bigworld.setCursor(mouse_cursor)
+            mouse_cursor.visible = True
+        elif cursor_state["refcount"] == 0:
+            bigworld.setCursor(direct_cursor)
+            mouse_cursor.visible = False
+
     cursor = types.ModuleType("gui.Cursor")
-    cursor.showCursor = lambda visible: cursor_calls.append(bool(visible))
+    cursor.showCursor = show_cursor
     sys.modules[cursor.__name__] = cursor
 
     notices = []
@@ -100,7 +116,14 @@ def load_settings_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module._in_battle = lambda: False
-    return module, config.CONFIG_OPTIONS, cursor_calls, notices, roots
+    return (
+        module,
+        config.CONFIG_OPTIONS,
+        cursor_calls,
+        cursor_state,
+        notices,
+        roots,
+    )
 
 
 class LANSettingsTest(unittest.TestCase):
@@ -109,6 +132,7 @@ class LANSettingsTest(unittest.TestCase):
             self.settings,
             self.config,
             self.cursor_calls,
+            self.cursor_state,
             self.notices,
             self.roots,
         ) = load_settings_module()
@@ -150,6 +174,9 @@ class LANSettingsTest(unittest.TestCase):
         self.settings.close()
 
         self.assertEqual([True, False], self.cursor_calls)
+        self.assertEqual(0, self.cursor_state["refcount"])
+        self.assertIs(self.cursor_state["mouse"], self.cursor_state["current"])
+        self.assertFalse(self.cursor_state["mouse"].visible)
         self.assertTrue(all(not control.visible for control in self.settings._controls.values()))
         self.assertTrue(all(not label.visible for label in self.settings._labels.values()))
 
@@ -162,6 +189,8 @@ class LANSettingsTest(unittest.TestCase):
 
         script.handleMouseLeaveEvent(self.settings._entry_panel)
         self.assertEqual([True, False], self.cursor_calls)
+        self.assertIs(self.cursor_state["mouse"], self.cursor_state["current"])
+        self.assertFalse(self.cursor_state["mouse"].visible)
 
     def test_clicking_hovered_entry_transfers_one_cursor_lease_to_panel(self):
         self.assertTrue(self.settings._make_entry())
@@ -173,6 +202,18 @@ class LANSettingsTest(unittest.TestCase):
         self.assertEqual([True], self.cursor_calls)
         self.settings.close()
         self.assertEqual([True, False], self.cursor_calls)
+        self.assertIs(self.cursor_state["mouse"], self.cursor_state["current"])
+        self.assertFalse(self.cursor_state["mouse"].visible)
+
+    def test_closing_during_battle_does_not_restore_the_lobby_cursor(self):
+        self.assertTrue(self.settings.open())
+        self.settings._in_battle = lambda: True
+
+        self.settings.close()
+
+        self.assertEqual([True, False], self.cursor_calls)
+        self.assertIs(self.cursor_state["direct"], self.cursor_state["current"])
+        self.assertFalse(self.cursor_state["mouse"].visible)
 
     def test_clicking_a_field_makes_the_first_typed_digit_replace_it(self):
         self.settings.open()
