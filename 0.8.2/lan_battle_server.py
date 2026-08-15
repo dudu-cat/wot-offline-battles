@@ -15,11 +15,16 @@ local garage.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import hashlib
 import json
 import math
+import os
 import random
 import socket
 import socketserver
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -99,11 +104,104 @@ BOT_CALLSIGNS = (
     "Orion", "Otter", "Panda", "Quartz", "Raven", "Rook", "Saber", "Scout",
     "Shark", "Sparrow", "Talon", "Tiger", "Viper", "Wolf", "Yak", "Zephyr",
 )
+WINDOWS_FIREWALL_RULE_PREFIX = "WoT 0.8.2 LAN Server"
 
 
 def _server_log(message):
     stamp = time.strftime("%H:%M:%S")
     print("[%s] %s" % (stamp, message), flush=True)
+
+
+def _is_frozen_windows_executable():
+    """Return whether this process is the packaged Windows server executable."""
+    return os.name == "nt" and bool(getattr(sys, "frozen", False))
+
+
+def _windows_firewall_rule_name(executable_path, port):
+    """Build a stable rule name tied to this executable path and TCP port."""
+    normalized_path = str(executable_path).replace("/", "\\").casefold()
+    identity = "%s|%d" % (normalized_path, int(port))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    return "%s TCP %d [%s]" % (
+        WINDOWS_FIREWALL_RULE_PREFIX, int(port), digest)
+
+
+def _powershell_single_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _windows_firewall_rule_exists(rule_name, runner=None):
+    """Check our deterministic inbound rule without requesting elevation."""
+    if runner is None:
+        runner = subprocess.run
+    script = (
+        "$rule = Get-NetFirewallRule -DisplayName %s -Direction Inbound "
+        "-Enabled True -Action Allow -ErrorAction SilentlyContinue | "
+        "Select-Object -First 1; "
+        "if ($null -eq $rule) { exit 1 }; exit 0"
+    ) % _powershell_single_quote(rule_name)
+    result = runner(
+        [
+            "powershell.exe", "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-Command", script,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    return result.returncode == 0
+
+
+def _request_windows_firewall_rule(rule_name, executable_path, port,
+                                   shell_execute=None):
+    """Open one UAC prompt that runs the narrowly scoped netsh command."""
+    arguments = subprocess.list2cmdline([
+        "advfirewall", "firewall", "add", "rule",
+        "name=" + rule_name,
+        "dir=in",
+        "action=allow",
+        "enable=yes",
+        "profile=any",
+        "program=" + executable_path,
+        "protocol=TCP",
+        "localport=%d" % int(port),
+        "remoteip=localsubnet",
+    ])
+    if shell_execute is None:
+        shell_execute = ctypes.windll.shell32.ShellExecuteW
+        shell_execute.restype = ctypes.c_void_p
+    result = shell_execute(
+        None, "runas", "netsh.exe", arguments, None, 1)
+    return int(result or 0) > 32
+
+
+def _ensure_windows_firewall_rule(port):
+    """Request a local-subnet inbound rule only for the frozen Windows EXE."""
+    if not _is_frozen_windows_executable():
+        return False
+
+    executable_path = os.path.abspath(sys.executable)
+    rule_name = _windows_firewall_rule_name(executable_path, port)
+    try:
+        if _windows_firewall_rule_exists(rule_name):
+            return True
+        _server_log(
+            "Windows Firewall access needs approval for LAN clients; "
+            "opening one UAC prompt")
+        if _request_windows_firewall_rule(
+                rule_name, executable_path, port):
+            _server_log(
+                "Windows Firewall rule request launched for TCP %d "
+                "(local subnet only)" % int(port))
+            return True
+        _server_log(
+            "Windows Firewall rule was not requested; remote LAN clients "
+            "may remain blocked")
+    except Exception as error:
+        _server_log(
+            "Windows Firewall rule setup failed (%s); server will continue" %
+            error)
+    return False
 
 
 def _finite_float(value, default=0.0):
@@ -2332,6 +2430,7 @@ def main():
     parser.add_argument("--map", dest="map_name", default=DEFAULT_MAP, help="map name, or server_random (default: server chooses one)")
     parser.add_argument("--max-players", type=int, default=30, help="maximum connected clients")
     args = parser.parse_args()
+    _ensure_windows_firewall_rule(args.port)
     run_server(args.host, args.port, args.map_name, args.max_players)
 
 
