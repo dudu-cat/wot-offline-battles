@@ -24,7 +24,7 @@ What changed in 1.8.58
   vehicle collision and right-of-way remain enabled.
 - Closing LAN SETTINGS now restores the stock garage cursor provider.
 - The packaged Windows LAN server can request a UAC-approved inbound rule for
-  its own executable on TCP 28782, limited to the local subnet.
+  its own executable on TCP 28782 from any remote address.
 
 What changed in 1.8.57
 ----------------------

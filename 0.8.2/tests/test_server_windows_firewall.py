@@ -50,7 +50,7 @@ class WindowsFirewallTest(unittest.TestCase):
         self.assertIn("action=allow", arguments)
         self.assertIn("protocol=TCP", arguments)
         self.assertIn("localport=28782", arguments)
-        self.assertIn("remoteip=localsubnet", arguments)
+        self.assertIn("remoteip=any", arguments)
         self.assertIn("program=" + path, arguments)
 
     def test_rule_identity_is_stable_across_windows_path_case(self):
@@ -59,6 +59,14 @@ class WindowsFirewallTest(unittest.TestCase):
         second = server._windows_firewall_rule_name(
             r"c:/games/wot/SERVER.EXE", 28782)
         self.assertEqual(first, second)
+
+    def test_broader_scope_uses_a_new_rule_identity(self):
+        path = r"C:\Games\WoT\server.exe"
+        local_subnet = server._windows_firewall_rule_name(
+            path, 28782, "localsubnet")
+        any_remote = server._windows_firewall_rule_name(
+            path, 28782, "any")
+        self.assertNotEqual(local_subnet, any_remote)
 
     def test_uac_cancellation_is_nonfatal(self):
         self.assertFalse(server._request_windows_firewall_rule(

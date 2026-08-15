@@ -105,6 +105,7 @@ BOT_CALLSIGNS = (
     "Shark", "Sparrow", "Talon", "Tiger", "Viper", "Wolf", "Yak", "Zephyr",
 )
 WINDOWS_FIREWALL_RULE_PREFIX = "WoT 0.8.2 LAN Server"
+WINDOWS_FIREWALL_REMOTE_IP = "any"
 
 
 def _server_log(message):
@@ -117,10 +118,13 @@ def _is_frozen_windows_executable():
     return os.name == "nt" and bool(getattr(sys, "frozen", False))
 
 
-def _windows_firewall_rule_name(executable_path, port):
-    """Build a stable rule name tied to this executable path and TCP port."""
+def _windows_firewall_rule_name(
+        executable_path, port, remote_ip=WINDOWS_FIREWALL_REMOTE_IP):
+    """Build a stable rule name tied to the executable, port, and scope."""
     normalized_path = str(executable_path).replace("/", "\\").casefold()
-    identity = "%s|%d" % (normalized_path, int(port))
+    normalized_remote_ip = str(remote_ip).strip().casefold()
+    identity = "%s|%d|%s" % (
+        normalized_path, int(port), normalized_remote_ip)
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
     return "%s TCP %d [%s]" % (
         WINDOWS_FIREWALL_RULE_PREFIX, int(port), digest)
@@ -165,7 +169,7 @@ def _request_windows_firewall_rule(rule_name, executable_path, port,
         "program=" + executable_path,
         "protocol=TCP",
         "localport=%d" % int(port),
-        "remoteip=localsubnet",
+        "remoteip=" + WINDOWS_FIREWALL_REMOTE_IP,
     ])
     if shell_execute is None:
         shell_execute = ctypes.windll.shell32.ShellExecuteW
@@ -192,7 +196,7 @@ def _ensure_windows_firewall_rule(port):
                 rule_name, executable_path, port):
             _server_log(
                 "Windows Firewall rule request launched for TCP %d "
-                "(local subnet only)" % int(port))
+                "(all remote addresses)" % int(port))
             return True
         _server_log(
             "Windows Firewall rule was not requested; remote LAN clients "
