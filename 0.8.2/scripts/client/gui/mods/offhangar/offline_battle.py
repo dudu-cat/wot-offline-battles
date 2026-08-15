@@ -14095,6 +14095,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										_ai_target_id is not None and
 										not _native_hazard_recovery_pre))
 							_traffic_neighbours = []
+							_waiting_for_traffic = False
 							_traffic_source = _driver_frame.get(eid)
 							if _traffic_source is not None and throttle > 0.01:
 								for _traffic_eid in _VC.nearby_ids(
@@ -14118,11 +14119,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											'target_yaw': target_yaw,
 										}, _traffic_neighbours))
 								if _waiting_for_traffic:
-									_ai_driver.wait_for_traffic(eid)
+									_ai_driver.wait_for_traffic(
+										eid, dt, throttle <= 0.01)
 									# Record the final arbitration result, not the cached driver
 									# mode that existed before deterministic right-of-way ran.
 									m_veh._offh_ai_driver_mode = 'traffic_wait'
 									_offh_perf_count('driver_traffic_wait')
+							if not _waiting_for_traffic:
+								_ai_driver.clear_traffic_wait(eid)
 
 							_perf_physics = _offh_perf_start()
 							_perf_physics_state = _offh_perf_start()

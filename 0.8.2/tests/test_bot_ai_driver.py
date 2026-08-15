@@ -648,7 +648,7 @@ class BotAIDriverTest(unittest.TestCase):
         self.assertEqual(17, self.module.traffic_identity(1027, 17))
         self.assertEqual(1001, self.module.traffic_identity(1001, None))
 
-    def test_intentional_traffic_wait_never_enters_stuck_recovery(self):
+    def test_short_intentional_traffic_wait_does_not_enter_stuck_recovery(self):
         driver = self.module.LocalDriver(stuck_seconds=0.4)
         source = {
             "id": 11,
@@ -688,7 +688,7 @@ class BotAIDriverTest(unittest.TestCase):
             )
             self.assertEqual(0.0, throttle)
             self.assertTrue(waiting)
-            self.assertTrue(driver.wait_for_traffic(11))
+            self.assertTrue(driver.wait_for_traffic(11, 0.02, True))
             modes.append(command["recovery_mode"])
 
         self.assertNotIn("reverse_turn", modes)
@@ -705,6 +705,78 @@ class BotAIDriverTest(unittest.TestCase):
         self.assertTrue(driver.wait_for_traffic(11))
         self.assertEqual(0.0, state["stuck_time"])
         self.assertEqual(0.0, state["recovery_time"])
+
+    def test_prolonged_stationary_traffic_wait_uses_bounded_recovery(self):
+        driver = self.module.LocalDriver(
+            stuck_seconds=0.4,
+            recovery_seconds=0.5,
+            traffic_wait_seconds=0.5,
+        )
+        source = {
+            "id": 11,
+            "team": 1,
+            "position": (0.0, 0.0, 0.0),
+            "yaw": 0.0,
+            "speed": 0.0,
+            "half_length": 3.5,
+            "half_width": 1.7,
+            "is_human": False,
+        }
+        stationary_human = {
+            "id": 999,
+            "team": 1,
+            "position": (0.0, 0.0, 8.0),
+            "yaw": 0.0,
+            "velocity": (0.0, 0.0, 0.0),
+            "half_length": 3.5,
+            "half_width": 1.7,
+            "is_human": True,
+        }
+
+        modes = []
+        for unused in range(20):
+            command = driver.drive(
+                11,
+                source["position"],
+                source["yaw"],
+                source["speed"],
+                0.1,
+                (0.0, 0.0, 50.0),
+                (),
+                lambda angle: True,
+            )
+            modes.append(command["recovery_mode"])
+            if command["throttle"] > 0.01:
+                throttle, waiting = self.module.friendly_traffic_throttle(
+                    source, command, [stationary_human]
+                )
+                self.assertEqual(0.0, throttle)
+                self.assertTrue(waiting)
+                driver.wait_for_traffic(11, 0.1, True)
+            else:
+                driver.clear_traffic_wait(11)
+            if command["recovery_mode"] in ("reverse_turn", "pivot_recovery"):
+                break
+
+        self.assertIn(modes[-1], ("reverse_turn", "pivot_recovery"))
+        self.assertLessEqual(command["throttle"], 0.0)
+        self.assertLessEqual(len(modes), 10)
+
+    def test_traffic_wait_timeout_resets_after_the_corridor_clears(self):
+        driver = self.module.LocalDriver(
+            stuck_seconds=0.4,
+            traffic_wait_seconds=0.5,
+        )
+        driver._state(11, (0.0, 0.0, 0.0))
+        for unused in range(4):
+            self.assertTrue(driver.wait_for_traffic(11, 0.1, True))
+
+        driver.clear_traffic_wait(11)
+        self.assertTrue(driver.wait_for_traffic(11, 0.2, True))
+
+        state = driver.states[11]
+        self.assertAlmostEqual(0.2, state["traffic_wait_time"])
+        self.assertEqual(0.0, state["stuck_time"])
 
     def test_battle_loop_applies_traffic_yield_to_the_final_drive_command(self):
         source = (
@@ -724,12 +796,14 @@ class BotAIDriverTest(unittest.TestCase):
         traffic = source.index(
             "_ai_driver.friendly_traffic_throttle(", hull_aim
         )
-        wait = source.index("_ai_driver.wait_for_traffic(eid)", traffic)
+        wait = source.index("_ai_driver.wait_for_traffic(", traffic)
+        clear = source.index("_ai_driver.clear_traffic_wait(eid)", wait)
         native = source.index("_native_body_manager.step", traffic)
 
         self.assertLess(hull_aim, traffic)
         self.assertLess(traffic, wait)
-        self.assertLess(wait, native)
+        self.assertLess(wait, clear)
+        self.assertLess(clear, native)
 
     def test_destroyed_bot_modules_repair_while_drive_is_locked(self):
         source = (

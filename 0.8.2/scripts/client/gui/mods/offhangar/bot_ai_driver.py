@@ -449,11 +449,13 @@ class LocalDriver(object):
 	friendly_traffic_throttle = staticmethod(friendly_traffic_throttle)
 
 	def __init__(self, stuck_seconds=1.8, recovery_seconds=0.85,
-			separation_radius=12.0, failure_ttl=2.0):
+			separation_radius=12.0, failure_ttl=2.0,
+			traffic_wait_seconds=1.25):
 		self.stuck_seconds = max(0.4, float(stuck_seconds))
 		self.recovery_seconds = max(0.25, float(recovery_seconds))
 		self.separation_radius = max(2.0, float(separation_radius))
 		self.failure_ttl = max(0.25, float(failure_ttl))
+		self.traffic_wait_seconds = max(0.4, float(traffic_wait_seconds))
 		self.states = {}
 		# Standalone callers are active by default. The battle loop explicitly
 		# supplies the countdown phase before asking this driver for an order.
@@ -478,13 +480,37 @@ class LocalDriver(object):
 	def forget(self, bot_id):
 		self.states.pop(bot_id, None)
 
-	def wait_for_traffic(self, bot_id):
-		"""Keep an intentional right-of-way wait out of stuck recovery."""
+	def wait_for_traffic(self, bot_id, dt=0.0, hard_stop=True):
+		"""Keep a short right-of-way wait out of stuck recovery.
+
+		A hard stop is bounded so a stationary player or route crossing cannot hold
+		the same bot forever. Once the wait expires, arm the existing staggered
+		reverse/pivot recovery; the waiting bot still never drives through the
+		vehicle that owns right of way.
+		"""
 		state = self.states.get(bot_id)
 		if state is None:
 			return False
+		if not hard_stop:
+			state['traffic_wait_time'] = 0.0
+		else:
+			step = min(0.35, max(0.0, float(dt)))
+			state['traffic_wait_time'] += step
+			limit = self.traffic_wait_seconds + state['phase'] * 0.35
+			if state['traffic_wait_time'] >= limit:
+				threshold = self.stuck_seconds + state['phase'] * 0.42
+				state['stuck_time'] = max(state['stuck_time'], threshold)
+				return True
 		state['stuck_time'] = 0.0
 		state['recovery_time'] = 0.0
+		return True
+
+	def clear_traffic_wait(self, bot_id):
+		"""Forget an earlier queue once this bot is no longer yielding."""
+		state = self.states.get(bot_id)
+		if state is None:
+			return False
+		state['traffic_wait_time'] = 0.0
 		return True
 
 	def set_battle_active(self, active):
@@ -512,6 +538,7 @@ class LocalDriver(object):
 				'escape_side': 0.0,
 				'escape_side_until': 0.0,
 				'last_desired_yaw': None,
+				'traffic_wait_time': 0.0,
 			}
 			self.states[bot_id] = state
 		return state
