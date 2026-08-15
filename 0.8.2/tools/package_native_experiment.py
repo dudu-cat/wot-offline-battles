@@ -142,7 +142,7 @@ def _assigned_string(path: Path, name: str) -> str:
 
 
 def _audit_identity(version: str) -> None:
-    expected = "%s-native-experimental-20260814" % version
+    expected = "%s-native-experimental-20260815" % version
     version_text = (VERSION_ROOT / "VERSION.txt").read_text(encoding="utf-8")
     required_lines = (
         "Package: native bot physics experiment %s" % version,
@@ -165,7 +165,7 @@ def _audit_identity(version: str) -> None:
         raise RuntimeError(
             "client/server build mismatch: %s %s expected %s" % (
                 client_build, server_build, expected))
-    expected_offline = "%s-native-experimental (2026-08-14)" % version
+    expected_offline = "%s-native-experimental (2026-08-15)" % version
     if offline_build != expected_offline:
         raise RuntimeError(
             "offline build mismatch: %s expected %s" % (
@@ -174,7 +174,7 @@ def _audit_identity(version: str) -> None:
 
 def build(output_dir: Path, version: str) -> tuple[Path, Path]:
     _audit_identity(version)
-    stem = "WoT-0.8.2-native-bot-physics-experimental-%s-20260814" % version
+    stem = "WoT-0.8.2-native-bot-physics-experimental-%s-20260815" % version
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / stem
     archive = output_dir / (stem + ".zip")
@@ -213,7 +213,7 @@ def build(output_dir: Path, version: str) -> tuple[Path, Path]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, default=Path.home() / "Downloads")
-    parser.add_argument("--version", default="1.8.57")
+    parser.add_argument("--version", default="1.8.58")
     args = parser.parse_args()
     destination, archive = build(args.output_dir.resolve(), args.version)
     print(destination)

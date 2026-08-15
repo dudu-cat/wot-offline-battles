@@ -1,4 +1,4 @@
-WORLD OF TANKS 0.8.2 NATIVE BOT PHYSICS EXPERIMENT 1.8.57
+WORLD OF TANKS 0.8.2 NATIVE BOT PHYSICS EXPERIMENT 1.8.58
 ==========================================================
 
 This is a separate experimental build. It keeps the retail 0.8.2 rigid-body
@@ -14,6 +14,17 @@ Install
 
 Do not merge individual files. The package must not leave an old
 mod_offhangar.pyc behind.
+
+What changed in 1.8.58
+----------------------
+
+- Bots that yield to a stationary player or crossing route now keep a bounded
+  traffic-wait timer. A prolonged standstill makes only the yielding bot use
+  the existing staggered reverse-and-turn recovery instead of waiting forever;
+  vehicle collision and right-of-way remain enabled.
+- Closing LAN SETTINGS now restores the stock garage cursor provider.
+- The packaged Windows LAN server can request a UAC-approved inbound rule for
+  its own executable on TCP 28782, limited to the local subnet.
 
 What changed in 1.8.57
 ----------------------
