@@ -16,16 +16,150 @@ class WindowsServerLauncherTests(unittest.TestCase):
         run_server = mock.Mock()
         with mock.patch.object(
                 windows_server, '_load_server',
-                return_value=('server_random', run_server)):
+                return_value=('server_random', run_server)), \
+                mock.patch.object(
+                    windows_server, '_ensure_windows_firewall_rule') as ensure:
             with mock.patch.object(sys, 'argv', ['server.exe', '--port', '1']):
                 self.assertEqual(0, windows_server.main())
 
+        ensure.assert_called_once_with(28782)
         run_server.assert_called_once_with(
             '0.0.0.0',
             28782,
             'server_random',
             30,
         )
+
+    def test_firewall_request_precedes_server_bind(self):
+        events = []
+
+        def ensure(port):
+            events.append(('firewall', port))
+
+        def run_server(host, port, map_name, max_players):
+            events.append(('server', host, port, map_name, max_players))
+
+        with mock.patch.object(
+                windows_server, '_load_server',
+                return_value=('server_random', run_server)), \
+                mock.patch.object(
+                    windows_server, '_ensure_windows_firewall_rule',
+                    side_effect=ensure):
+            self.assertEqual(0, windows_server.main())
+
+        self.assertEqual([
+            ('firewall', 28782),
+            ('server', '0.0.0.0', 28782, 'server_random', 30),
+        ], events)
+
+    def test_source_process_never_checks_or_changes_firewall(self):
+        with mock.patch.object(
+                windows_server, '_is_frozen_windows_executable',
+                return_value=False), \
+                mock.patch.object(
+                    windows_server, '_windows_firewall_rule_exists') as exists, \
+                mock.patch.object(
+                    windows_server, '_request_windows_firewall_rule') as request:
+            self.assertFalse(
+                windows_server._ensure_windows_firewall_rule(28782))
+
+        exists.assert_not_called()
+        request.assert_not_called()
+
+    def test_existing_rule_does_not_request_uac_again(self):
+        with mock.patch.object(
+                windows_server, '_is_frozen_windows_executable',
+                return_value=True), \
+                mock.patch.object(
+                    windows_server, '_windows_firewall_rule_exists',
+                    return_value=True) as exists, \
+                mock.patch.object(
+                    windows_server, '_request_windows_firewall_rule') as request:
+            self.assertTrue(
+                windows_server._ensure_windows_firewall_rule(28782))
+
+        exists.assert_called_once()
+        request.assert_not_called()
+
+    def test_missing_rule_requests_narrow_elevated_netsh_rule(self):
+        calls = []
+
+        def shell_execute(*args):
+            calls.append(args)
+            return 42
+
+        path = r'C:\Games\WoT LAN\WoT-0.9.22-LAN-Server.exe'
+        netsh_path = r'C:\Windows\System32\netsh.exe'
+        rule_name = windows_server._windows_firewall_rule_name(path, 28782)
+
+        self.assertTrue(windows_server._request_windows_firewall_rule(
+            rule_name, path, 28782, shell_execute=shell_execute,
+            netsh_path=netsh_path))
+        self.assertEqual(1, len(calls))
+        _, verb, executable, arguments, _, _ = calls[0]
+        self.assertEqual('runas', verb)
+        self.assertEqual(netsh_path, executable)
+        self.assertIn('dir=in', arguments)
+        self.assertIn('action=allow', arguments)
+        self.assertIn('protocol=TCP', arguments)
+        self.assertIn('localport=28782', arguments)
+        self.assertIn('remoteip=any', arguments)
+        self.assertIn('program=' + path, arguments)
+
+    def test_rule_identity_is_stable_across_windows_path_case(self):
+        first = windows_server._windows_firewall_rule_name(
+            r'C:\Games\WoT\server.exe', 28782)
+        second = windows_server._windows_firewall_rule_name(
+            r'c:/games/wot/SERVER.EXE', 28782)
+        self.assertEqual(first, second)
+        self.assertFalse(set('*?[') & set(first))
+
+    def test_rule_lookup_is_bounded_and_uses_literal_safe_identity(self):
+        result = mock.Mock(returncode=0)
+        runner = mock.Mock(return_value=result)
+        powershell_path = (
+            r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe')
+        rule_name = windows_server._windows_firewall_rule_name(
+            r'C:\Games\WoT\server.exe', 28782)
+
+        self.assertTrue(windows_server._windows_firewall_rule_exists(
+            rule_name, runner=runner, powershell_path=powershell_path))
+
+        args, kwargs = runner.call_args
+        self.assertEqual(powershell_path, args[0][0])
+        self.assertIn(rule_name, args[0][-1])
+        self.assertEqual(5.0, kwargs['timeout'])
+
+    def test_uac_cancellation_is_nonfatal(self):
+        self.assertFalse(windows_server._request_windows_firewall_rule(
+            'test', r'C:\server.exe', 28782,
+            shell_execute=lambda *args: 5,
+            netsh_path=r'C:\Windows\System32\netsh.exe'))
+
+    def test_netsh_path_comes_from_windows_system_directory(self):
+        calls = []
+
+        def get_system_directory(buffer, size):
+            calls.append(size)
+            buffer.value = r'C:\Windows\System32'
+            return len(buffer.value)
+
+        self.assertEqual(
+            r'C:\Windows\System32\netsh.exe',
+            windows_server._windows_system_netsh_path(
+                get_system_directory=get_system_directory))
+        self.assertEqual([32768], calls)
+
+    def test_powershell_path_comes_from_windows_system_directory(self):
+        def get_system_directory(buffer, size):
+            buffer.value = r'C:\Windows\System32'
+            return len(buffer.value)
+
+        self.assertEqual(
+            r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
+            windows_server._windows_system_path(
+                r'WindowsPowerShell\v1.0\powershell.exe',
+                get_system_directory=get_system_directory))
 
     def test_startup_error_returns_failure_without_hiding_the_traceback(self):
         run_server = mock.Mock(side_effect=OSError('busy'))
@@ -84,6 +218,14 @@ class WindowsServerLauncherTests(unittest.TestCase):
             workflow)
         self.assertIn("\n          '@\n\n          $process", workflow)
         self.assertNotIn("\n              @'\n", workflow)
+        self.assertIn('Get-NetFirewallRule', workflow)
+        self.assertIn('Get-NetFirewallApplicationFilter', workflow)
+        self.assertIn('Get-NetFirewallPortFilter', workflow)
+        self.assertIn('Remove-NetFirewallRule', workflow)
+        self.assertIn(
+            'Packaged server did not create its firewall rule', workflow)
+        self.assertIn(
+            'WoT 0.9.22 LAN Server TCP 28782 - $digest', workflow)
 
     def test_windows_readme_carries_source_and_runtime_license_notices(self):
         readme = (SERVER_ROOT / 'WINDOWS_SERVER_README.txt').read_text(
@@ -92,6 +234,8 @@ class WindowsServerLauncherTests(unittest.TestCase):
         for required in (
                 'GNU GPL',
                 '/tree/v0.4.0',
+                'any remote address/profile',
+                'trusted-LAN server',
                 'CPython 3.11.9',
                 'docs.python.org/3.11/license.html',
                 'PYTHON SOFTWARE FOUNDATION LICENSE VERSION 2',

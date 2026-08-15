@@ -353,9 +353,15 @@ class PortSourceTests(unittest.TestCase):
         self.assertIn(
             'org.peng.offline_lan_0922_%s.wotmod' % version, port_readme)
         normalized_root_readme = ' '.join(root_readme.split())
-        self.assertIn('pre-release test candidate', normalized_root_readme)
         self.assertIn(
-            'A formal release will follow validation on two Windows PCs.',
+            'Versioned client and server packages are published through '
+            'GitHub Releases.',
+            normalized_root_readme)
+        self.assertIn(
+            'WoT-0.9.22-LAN-Client-*.zip',
+            normalized_root_readme)
+        self.assertIn(
+            'WoT-0.9.22-LAN-Server.exe',
             normalized_root_readme)
 
     def test_port_sources_are_python_2_compatible_syntax(self):

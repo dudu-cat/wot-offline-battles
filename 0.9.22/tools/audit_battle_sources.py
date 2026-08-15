@@ -139,6 +139,7 @@ PINNED_PORT_SHA256 = {
 PINNED_SERVER_SHA256 = {
     'server/lan_battle_server.py': '5df02ad81456d30cf96bbf5b76f287ee2b2709850b887e8ffac78eda18ae4e16',
     'server/server_bot_ai.py': '306916334e492297f653ad024bf9004d281ed4142a5fd6afa4155b135a9220de',
+    'server/windows_server.py': '546c40f70f5eaad7b08310b8a5c09905fe63490f95c1182ad9b609560c609eb8',
 }
 PINNED_RELEASE_SHA256 = {
     'tools/bake_destructibles_0922.py':

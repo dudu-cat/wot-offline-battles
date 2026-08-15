@@ -69,6 +69,7 @@ class ReleaseLayoutTests(unittest.TestCase):
                 'validate_wotmod.py',
                 '0.0.0.0:28782',
                 'SmartScreen',
+                'UAC prompt',
                 'Native Windows #1513 acceptance',
                 'git push origin v0.4.0'):
             self.assertIn(required, checklist)

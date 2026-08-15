@@ -2,7 +2,11 @@ WoT 0.9.22 Offline LAN Server
 ================================
 
 1. Double-click WoT-0.9.22-LAN-Server.exe.
-2. If Windows Firewall asks, allow access on private networks.
+2. On first launch from a new path, approve the UAC prompt that adds an
+   inbound TCP 28782 rule for this exact EXE. Later launches reuse that rule.
+   Cancelling is nonfatal, but other PCs may remain unable to connect.
+   The rule accepts any remote address/profile for VM compatibility. Run this
+   trusted-LAN server only on a network you trust.
 3. On the same PC, keep the client address at 127.0.0.1:28782.
 4. On another PC, enter the server PC's LAN address in the client garage.
 

@@ -83,6 +83,23 @@ jobs:
           $serverExe = Join-Path $serverRoot "WoT-0.9.22-LAN-Server.exe"
           $stdout = Join-Path $env:RUNNER_TEMP "wot-server.stdout.log"
           $stderr = Join-Path $env:RUNNER_TEMP "wot-server.stderr.log"
+          $normalizedExe = $serverExe.Replace("/", "\").ToLowerInvariant()
+          $identity = "$normalizedExe|28782|any"
+          $sha256 = [System.Security.Cryptography.SHA256]::Create()
+          try {
+              $digestBytes = $sha256.ComputeHash(
+                  [System.Text.Encoding]::UTF8.GetBytes($identity))
+          }
+          finally {
+              $sha256.Dispose()
+          }
+          $digest = ([System.BitConverter]::ToString($digestBytes) `
+              -replace "-", "").ToLowerInvariant().Substring(0, 12)
+          $firewallRuleName = "WoT 0.9.22 LAN Server TCP 28782 - $digest"
+
+          Get-NetFirewallRule `
+              -DisplayName $firewallRuleName `
+              -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 
           @'
           import struct
@@ -155,6 +172,33 @@ jobs:
               if ($LASTEXITCODE -ne 0) {
                   throw "LAN protocol smoke failed"
               }
+
+              $ruleDeadline = (Get-Date).AddSeconds(20)
+              $firewallRule = $null
+              while ((Get-Date) -lt $ruleDeadline) {
+                  $firewallRule = Get-NetFirewallRule `
+                      -DisplayName $firewallRuleName `
+                      -Direction Inbound `
+                      -Enabled True `
+                      -Action Allow `
+                      -ErrorAction SilentlyContinue | Select-Object -First 1
+                  if ($null -ne $firewallRule) {
+                      break
+                  }
+                  Start-Sleep -Milliseconds 250
+              }
+              if ($null -eq $firewallRule) {
+                  throw "Packaged server did not create its firewall rule"
+              }
+              $application = $firewallRule | Get-NetFirewallApplicationFilter
+              $portFilter = $firewallRule | Get-NetFirewallPortFilter
+              if ($application.Program -ne $serverExe) {
+                  throw "Firewall rule is not scoped to the packaged EXE"
+              }
+              if ($portFilter.Protocol -ne "TCP" -or
+                      $portFilter.LocalPort -ne "28782") {
+                  throw "Firewall rule is not scoped to TCP 28782"
+              }
           }
           finally {
               if (-not $process.HasExited) {
@@ -168,6 +212,9 @@ jobs:
                   Write-Host "--- server stderr ---"
                   Get-Content $stderr
               }
+              Get-NetFirewallRule `
+                  -DisplayName $firewallRuleName `
+                  -ErrorAction SilentlyContinue | Remove-NetFirewallRule
           }
       - name: Package Windows server download
         shell: pwsh

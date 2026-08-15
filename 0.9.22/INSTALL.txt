@@ -482,8 +482,11 @@ To run the source server instead, use:
 
     python3 0.9.22/server/lan_battle_server.py
 
-Allow inbound TCP port 28782 through the host firewall when another computer
-or virtual machine connects.
+On first launch from a new path, the packaged EXE requests one UAC-approved
+inbound rule for that exact program and TCP port 28782. Approve it for LAN or
+VM clients; later launches from the same path reuse the rule. The rule permits
+any remote address/profile, so use the server only on a trusted network. The
+source server does not change the firewall and requires a manual inbound rule.
 
 Start a battle
 --------------

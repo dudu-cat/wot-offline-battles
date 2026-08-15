@@ -8,8 +8,8 @@ two legacy Windows clients:
 | [`0.8.2`](0.8.2/) | World of Tanks 0.8.2 | Server-free single-player or trusted LAN |
 | [`0.9.22`](0.9.22/) | Chinese HD client 0.9.22.0.1 #1513 | Server-backed single-player or trusted LAN |
 
-The current repository head is a pre-release test candidate. A formal release
-will follow validation on two Windows PCs.
+Versioned client and server packages are published through GitHub Releases.
+Each package remains locked to the exact legacy client shown below.
 
 The original client still provides the maps, vehicles, rendering, HUD, physics
 and other proprietary runtime data. This repository provides the client mods,
@@ -62,8 +62,8 @@ reconstruction of a standard World of Tanks battle:
 This is a reconstruction from the frozen clients and same-era mechanics, not a
 source-identical reimplementation of Wargaming's retail server. It implements
 standard battles only; LAN play assumes trusted clients and uses a coordinator,
-not a full or adversarial retail server. The pre-release candidate still awaits
-final validation on two Windows PCs. See
+not a full or adversarial retail server. Native rendering, physics and frame
+pacing can only be validated in the exact Windows client. See
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for exact project lineage and
 licensing.
 
@@ -97,21 +97,17 @@ The current 0.8.2 native-physics build accepts only its pinned executable. See
 ### World of Tanks 0.9.22.0.1 #1513
 
 1. Use the exact frozen Chinese HD `0.9.22.0.1 #1513` client.
-2. Obtain the matching client ZIP and extract it directly into the game root.
-   The archive already contains the correct `mods` layout. Before the formal
-   release, this ZIP is supplied as a separate test artifact; it is not stored
-   in the source repository.
-3. Install Python 3 on the computer that will host the battle, then run from
-   this repository:
-
-   ```bat
-   py -3 0.9.22\server\lan_battle_server.py --host 0.0.0.0 --port 28782
-   ```
-
-4. Allow TCP port `28782` through the host firewall. In each client, use the
-   stock **Battle!** flow and edit the `LAN SERVER: host:port` line in the
-   native window to `<host LAN IP>:28782`. The first waiting player chooses a
-   map and starts the shared round.
+2. Download the matching `WoT-0.9.22-LAN-Client-*.zip` release asset and
+   extract it directly into the game root. The archive already contains the
+   complete replacement `mods` layout.
+3. Download and double-click `WoT-0.9.22-LAN-Server.exe` on the computer that
+   will host the battle. It needs no arguments and listens on TCP `28782`.
+4. On first launch from a new path, approve the UAC prompt that creates the
+   EXE-scoped firewall rule. Run it only on a trusted network. In each client,
+   use the stock **Battle!** flow and edit the `LAN SERVER: host:port` line in
+   the native window to `<host LAN IP>:28782`; a same-PC client can keep the
+   default `127.0.0.1:28782`. The first waiting player chooses a map and starts
+   the shared round.
 
 See [`0.9.22/INSTALL.txt`](0.9.22/INSTALL.txt) for troubleshooting and the
 exact package boundary.

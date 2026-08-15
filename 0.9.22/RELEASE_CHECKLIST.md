@@ -109,6 +109,12 @@ acceptance run.
       Confirm the console stays open, the server selects `server_random`, a
       local client can connect through `127.0.0.1:28782`, Ctrl+C stops it, and
       a port-in-use error remains visible.
+- [ ] With the scoped firewall rule absent, confirm that first launch explains
+      and opens one UAC prompt for the exact EXE and TCP `28782`; approve it,
+      relaunch, and confirm that no second prompt appears. Cancelling must be
+      nonfatal and must leave a clear warning in the server console. The rule
+      intentionally permits any remote address/profile for VM compatibility;
+      document that the server is for trusted networks only.
 - [ ] Record that the artifact is unsigned. Treat an unknown-publisher
       SmartScreen prompt as an explicit release boundary; verify SHA-256 and do
       not claim publisher trust or code signing.

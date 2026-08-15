@@ -830,8 +830,11 @@ README. Double-click the executable and keep its console open while playing.
 It has no required arguments and always binds `0.0.0.0:28782`, allows up to 30
 players and starts with the `server_random` map policy. A client on the same PC
 uses the default `127.0.0.1`; a client on another PC uses the server PC's LAN
-address saved through the in-game window. Allow TCP 28782 on private networks
-if Windows Firewall prompts.
+address saved through the in-game window. On first launch from a new path, the
+server requests one UAC-approved inbound rule scoped to that EXE and TCP port
+`28782`. Cancelling does not stop the server, but remote LAN clients may remain
+blocked. The rule permits any remote address and Windows network profile, so
+run the server only on a trusted network.
 
 The executable is built as an x64 console application by the Windows CI job.
 That job verifies the PE architecture, the exact listener and a v5 protocol
