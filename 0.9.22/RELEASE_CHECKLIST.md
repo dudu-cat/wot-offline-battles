@@ -27,7 +27,11 @@ acceptance run.
 - [ ] Run the full shared and port suites:
 
   ```bash
-  PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v
+  (
+    cd 0.8.2
+    PYTHONDONTWRITEBYTECODE=1 \
+      python3 -m unittest discover -s tests -p 'test_*.py' -v
+  )
   PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s 0.9.22/tests -p 'test_*.py' -v
   ```
 
