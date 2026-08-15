@@ -4276,10 +4276,12 @@ class LANClientTests(unittest.TestCase):
         client._queue_message({
             'type': 'snapshot', 'protocol': 5,
             'round_id': 4, 'server_tick': 0,
+            'bot_state_revision': 0,
             'players': [], 'bots': []})
         client._queue_message({
             'type': 'snapshot', 'protocol': 5,
             'round_id': 4, 'server_tick': 1,
+            'bot_state_revision': 1,
             'players': [], 'bots': []})
         client._queue_message({
             'type': 'roster', 'protocol': 5,
@@ -4289,10 +4291,12 @@ class LANClientTests(unittest.TestCase):
         client._queue_message({
             'type': 'snapshot', 'protocol': 5,
             'round_id': 4, 'server_tick': 2,
+            'bot_state_revision': 2,
             'players': [], 'bots': []})
         client._queue_message({
             'type': 'snapshot', 'protocol': 5,
             'round_id': 4, 'server_tick': 3,
+            'bot_state_revision': 3,
             'players': [], 'bots': []})
         client._poll()
 
@@ -4350,6 +4354,7 @@ class LANClientTests(unittest.TestCase):
                 {'kind': 'battle_result'}]})
         current = {'type': 'snapshot', 'protocol': 5,
                    'round_id': 5, 'server_tick': 3,
+                   'bot_state_revision': 3,
                    'players': [], 'bots': []}
         client._handle_message(current)
 
@@ -4458,6 +4463,36 @@ class LANClientTests(unittest.TestCase):
             'type': 'snapshot', 'protocol': 5,
             'round_id': 3, 'server_tick': 4,
             'players': 'not-a-list', 'bots': []})
+
+        self.assertFalse(client.running)
+        self.assertEqual('invalid snapshot message', client.last_error)
+
+    def test_snapshot_requires_monotonic_bot_state_revision(self):
+        _, client, _, _ = self._client()
+        client.running = True
+        client.round_id = 3
+
+        client._handle_message({
+            'type': 'snapshot', 'protocol': 5,
+            'round_id': 3, 'server_tick': 4,
+            'players': [], 'bots': []})
+
+        self.assertFalse(client.running)
+        self.assertEqual('invalid snapshot message', client.last_error)
+
+        _, client, _, _ = self._client()
+        client.running = True
+        client.round_id = 3
+        client._handle_message({
+            'type': 'snapshot', 'protocol': 5,
+            'round_id': 3, 'server_tick': 4,
+            'bot_state_revision': 5,
+            'players': [], 'bots': []})
+        client._handle_message({
+            'type': 'snapshot', 'protocol': 5,
+            'round_id': 3, 'server_tick': 5,
+            'bot_state_revision': 4,
+            'players': [], 'bots': []})
 
         self.assertFalse(client.running)
         self.assertEqual('invalid snapshot message', client.last_error)

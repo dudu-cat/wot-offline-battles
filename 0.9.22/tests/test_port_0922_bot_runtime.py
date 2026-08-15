@@ -201,6 +201,81 @@ class _CaptureSocket(object):
         self.payloads.append(payload)
 
 
+class ServerBotStateRevisionTests(unittest.TestCase):
+    @staticmethod
+    def _server():
+        server = BattleState(map_name='04_himmelsdorf')
+        server.client_build = CLIENT_BUILD_0922
+        server.phase = 'battle'
+        server.tick = 450
+        authority_socket = _CaptureSocket()
+        guest_socket = _CaptureSocket()
+        server.players[1] = Player(
+            1, authority_socket, ('127.0.0.1', 1), team=1, slot=0)
+        server.players[2] = Player(
+            2, guest_socket, ('127.0.0.1', 2), team=2, slot=0)
+        server.bot_authority_id = 1
+        server.bot_roster = [{
+            'id': 11, 'team': 1, 'slot': 1, 'name': 'Revision-11'}]
+        manifest_bot = {
+            'id': 11, 'team': 1, 'slot': 1, 'name': 'Revision-11',
+            'vehicle': 'ussr:R11_MS-1',
+            'health': 1000, 'max_health': 1000,
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'profile': {'shells': [{
+                'index': 0, 'kind': 'ARMOR_PIERCING',
+                'penetration': 50.0, 'damage': 50.0, 'speed': 500.0,
+            }]},
+            'shell_index': 0, 'next_shell_index': 0,
+            'ammo_remaining': [20], 'ammo_reload_pending': False,
+        }
+        assert server.update_bot_manifest(1, {
+            'round_id': server.round_id, 'bots': [manifest_bot]})
+        return server, manifest_bot, authority_socket
+
+    @staticmethod
+    def _publication(server, x):
+        bot = dict(server.bot_states[11])
+        bot['x'] = float(x)
+        bot['combat_seq'] = bot['combat_ack_seq']
+        return {'round_id': server.round_id, 'bots': [bot]}
+
+    def test_revision_commits_atomically_survives_handoff_and_resets(self):
+        server, manifest_bot, authority_socket = self._server()
+        self.assertEqual(0, server.bot_state_revision)
+
+        self.assertFalse(server.update_bot_states(
+            2, self._publication(server, 1.0)))
+        self.assertEqual(0, server.bot_state_revision)
+        self.assertFalse(server.update_bot_states(1, {
+            'round_id': server.round_id, 'bots': []}))
+        self.assertEqual(0, server.bot_state_revision)
+        self.assertTrue(server.update_bot_states(
+            1, self._publication(server, 1.0)))
+        self.assertEqual(1, server.bot_state_revision)
+
+        server.tick_once(1.0 / 30.0)
+        messages = [json.loads(payload.decode('utf-8'))
+                    for payload in authority_socket.payloads]
+        snapshots = [
+            message for message in messages
+            if message.get('type') == 'snapshot']
+        self.assertEqual(1, snapshots[-1]['bot_state_revision'])
+
+        server.remove_player(1)
+        self.assertEqual(2, server.bot_authority_id)
+        self.assertEqual(1, server.bot_state_revision)
+        self.assertTrue(server.update_bot_manifest(2, {
+            'round_id': server.round_id, 'bots': [manifest_bot]}))
+        self.assertEqual(1, server.bot_state_revision)
+        self.assertTrue(server.update_bot_states(
+            2, self._publication(server, 2.0)))
+        self.assertEqual(2, server.bot_state_revision)
+
+        server._reset_round()
+        self.assertEqual(0, server.bot_state_revision)
+
+
 class ServerReportedHealthTests(unittest.TestCase):
     @staticmethod
     def _server_with_bot():

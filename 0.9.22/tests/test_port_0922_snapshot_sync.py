@@ -146,6 +146,119 @@ class SnapshotSyncTests(unittest.TestCase):
                                                       pose['aim_yaw'])), 0.2)
         self.assertGreater(pose['gun_pitch'], initial['gun_pitch'])
 
+    def test_same_bot_revision_updates_combat_state_without_restarting_pose(self):
+        bot = player(7, 0.0)
+        self.sync.manifest({'round_id': 1, 'bots': [bot]})
+        self.sync.snapshot({
+            'round_id': 1, 'server_tick': 1,
+            'bot_state_revision': 1, 'bots': [bot]})
+        self.now[0] = 0.1
+        moved = player(7, 1.0)
+        self.sync.snapshot({
+            'round_id': 1, 'server_tick': 2,
+            'bot_state_revision': 2, 'bots': [moved]})
+        record = self.sync._entities['bot:7']
+        target_time = record['target_time']
+        velocity = record['velocity']
+
+        self.now[0] = 0.133
+        damaged = player(7, 99.0)
+        damaged['health'] = 50
+        damaged['critical'] = {'fire': True}
+        events = self.sync.snapshot({
+            'round_id': 1, 'server_tick': 3,
+            'bot_state_revision': 2, 'bots': [damaged]})
+
+        self.assertEqual(target_time, record['target_time'])
+        self.assertEqual(velocity, record['velocity'])
+        self.assertEqual(1.0, record['target']['x'])
+        update = next(event for event in events
+                      if event.get('entity') == 'bot:7')
+        self.assertEqual(50, update['state']['health'])
+        self.assertEqual({'fire': True}, update['state']['critical'])
+        self.assertEqual(1.0, update['target']['x'])
+
+        self.now[0] = 0.166
+        dead = player(7, 1.0, alive=False)
+        destroyed = self.sync.snapshot({
+            'round_id': 1, 'server_tick': 4,
+            'bot_state_revision': 2, 'bots': [dead]})
+        self.assertEqual('destroy', destroyed[0]['type'])
+        self.assertEqual(target_time, record['target_time'])
+        self.assertEqual(velocity, record['velocity'])
+
+    def test_18hz_bot_source_stays_smooth_through_30hz_repeated_snapshots(self):
+        clock = [0.0]
+        sync = self.module.SnapshotSync(1, clock=lambda: clock[0])
+
+        def bot(position):
+            state = player(7, position)
+            state.update(team=2, yaw=0.0, aim_yaw=0.0, gun_pitch=0.0)
+            return state
+
+        sync.manifest({'round_id': 1, 'bots': [bot(0.0)]})
+        revision = 0
+        published_x = 0.0
+        last_snapshot_revision = None
+        repeated_snapshots = 0
+        zeroed_repeat_velocities = 0
+        presented = []
+        # 180 Hz is the exact common clock for an 18 Hz authority, a 30 Hz
+        # server and a 60 Hz renderer.  Authority publication happens before
+        # the same-instant server snapshot, matching an already accepted batch.
+        for clock_tick in range(3 * 180 + 1):
+            now = clock_tick / 180.0
+            clock[0] = now
+            if clock_tick % 10 == 0:
+                revision += 1
+                published_x = 10.0 * now
+            if clock_tick % 6 == 0:
+                repeated = revision == last_snapshot_revision
+                sync.snapshot({
+                    'round_id': 1, 'server_tick': clock_tick // 6,
+                    'bot_state_revision': revision,
+                    'bots': [bot(published_x)]})
+                if repeated and revision >= 2:
+                    repeated_snapshots += 1
+                    velocity = sync._entities['bot:7']['velocity']
+                    speed = math.sqrt(sum(value * value
+                                          for value in velocity))
+                    if speed <= 1.0e-9:
+                        zeroed_repeat_velocities += 1
+                last_snapshot_revision = revision
+            if clock_tick % 3 == 0:
+                presented.append(sync.advance(now)[0]['pose']['x'])
+
+        render_speeds = [
+            (presented[index] - presented[index - 1]) * 60.0
+            for index in range(61, len(presented))]
+        self.assertGreater(repeated_snapshots, 30)
+        self.assertEqual(0, zeroed_repeat_velocities)
+        self.assertGreater(min(render_speeds), 5.0)
+        self.assertAlmostEqual(
+            10.0, sum(render_speeds) / len(render_speeds), places=6)
+
+    def test_bot_state_revision_cannot_regress_or_disappear(self):
+        bot = player(7, 0.0)
+        self.sync.manifest({'round_id': 1, 'bots': [bot]})
+        self.sync.snapshot({
+            'round_id': 1, 'server_tick': 1,
+            'bot_state_revision': 3, 'bots': [bot]})
+
+        with self.assertRaisesRegex(ValueError, 'regressed'):
+            self.sync.snapshot({
+                'round_id': 1, 'server_tick': 2,
+                'bot_state_revision': 2, 'bots': [bot]})
+        with self.assertRaisesRegex(ValueError, 'disappeared'):
+            self.sync.snapshot({
+                'round_id': 1, 'server_tick': 3, 'bots': [bot]})
+
+        self.sync.manifest({'round_id': 2, 'bots': [bot]})
+        self.sync.snapshot({
+            'round_id': 2, 'server_tick': 0,
+            'bot_state_revision': 0, 'bots': [bot]})
+        self.assertEqual(0, self.sync._last_bot_state_revision)
+
     def test_non_finite_snapshot_numbers_fall_back_to_safe_zero(self):
         malformed = player(2, float('nan'))
         malformed.update(yaw=float('inf'), aim_yaw=float('-inf'),

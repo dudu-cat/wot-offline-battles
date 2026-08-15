@@ -512,6 +512,7 @@ class BattleState:
         self.bot_manifest_authority_id = None
         self.bot_manifest = []
         self.bot_states = {}
+        self.bot_state_revision = 0
         self.bot_planner = BotPlanner()
         self.bot_orders = {"revision": 0, "orders": []}
         self.bot_reported_hits = set()
@@ -903,6 +904,7 @@ class BattleState:
         self.bot_manifest_authority_id = None
         self.bot_manifest = []
         self.bot_states = {}
+        self.bot_state_revision = 0
         self.bot_planner.reset()
         self.bot_orders = {"revision": 0, "orders": []}
         self.bot_reported_hits = set()
@@ -1152,6 +1154,7 @@ class BattleState:
                 "players": [self._public_player(p) for p in self.players.values()
                             if p.connected and p.participating],
                 "bots": [self.bot_states[key] for key in sorted(self.bot_states)],
+                "bot_state_revision": self.bot_state_revision,
                 "projectile_revision": self.projectile_revision,
                 "projectiles": self._projectile_snapshot(),
                 "bot_manifest": list(self.bot_manifest),
@@ -2055,6 +2058,7 @@ class BattleState:
                 self.pending_events.append(event)
             self.pending_events.extend(shot_events)
             self._maybe_finish_battle()
+            self.bot_state_revision += 1
             return True
 
     @staticmethod
@@ -4077,6 +4081,7 @@ class BattleState:
                 "bot_authority_id": self.bot_authority_id,
                 "players": [self._public_player(p) for p in self.players.values() if p.connected],
                 "bots": [self.bot_states[key] for key in sorted(self.bot_states)],
+                "bot_state_revision": self.bot_state_revision,
                 "bot_manifest": list(self.bot_manifest),
                 "bot_order_revision": self.bot_orders["revision"],
                 "rules": self.rules_state,

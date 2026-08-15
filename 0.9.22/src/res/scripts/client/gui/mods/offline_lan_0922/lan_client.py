@@ -1983,6 +1983,8 @@ class LANClient(object):
                 message.get('authority_epoch'), 0, MAX_PROJECTILE_ID)
             projectile_revision = _projectile_int_range(
                 message.get('projectile_revision'), 0, MAX_PROJECTILE_ID)
+            bot_state_revision = _projectile_int_range(
+                message.get('bot_state_revision'), 0, MAX_PROJECTILE_ID)
             projectiles = message.get('projectiles')
             players = _strict_mapping_list(message.get('players'), 64)
             bots = _strict_mapping_list(message.get('bots'), 30)
@@ -2014,6 +2016,13 @@ class LANClient(object):
             bot_combat_contract = all(
                 _valid_bot_combat_contract(bot) for bot in bots or ())
             ledger_required = self.has_projectile_ledger()
+            previous_bot_state_revision = None
+            if (isinstance(self.last_snapshot, dict) and
+                    _exact_int(self.last_snapshot.get('round_id')) ==
+                    round_id):
+                previous_bot_state_revision = _projectile_int_range(
+                    self.last_snapshot.get('bot_state_revision'),
+                    0, MAX_PROJECTILE_ID)
             valid_projectiles = (not ledger_required or (
                 server_time_ms is not None and authority_epoch is not None and
                 projectile_revision is not None and
@@ -2022,6 +2031,9 @@ class LANClient(object):
                 _valid_active_projectiles(
                     projectiles, authority_epoch, server_time_ms)))
             if (server_tick is None or server_tick < 0 or
+                    bot_state_revision is None or
+                    (previous_bot_state_revision is not None and
+                     bot_state_revision < previous_bot_state_revision) or
                     not valid_projectiles or
                     players is None or bots is None or
                     not player_critical_contract or

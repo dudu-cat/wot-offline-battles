@@ -64,6 +64,7 @@ class SnapshotSync(object):
         self.round_id = None
         self._last_sequence = None
         self._last_order_revision = None
+        self._last_bot_state_revision = None
         self._entities = {}
         self._last_advance = None
 
@@ -82,6 +83,7 @@ class SnapshotSync(object):
         self.round_id = round_id
         self._last_sequence = None
         self._last_order_revision = None
+        self._last_bot_state_revision = None
         self._entities = {}
         self._last_advance = None
 
@@ -134,7 +136,7 @@ class SnapshotSync(object):
             return True
         return False
 
-    def _upsert(self, kind, state, now, output):
+    def _upsert(self, kind, state, now, output, update_remote_pose=True):
         key = _entity_key(kind, state)
         if key is None:
             return
@@ -167,11 +169,16 @@ class SnapshotSync(object):
                         'id': state['id'], 'state': _copy_state(state),
                         'pose': pose, 'correction': True}, output)
             return
-        snapped = self._set_remote_target(record, pose, now) if pose is not None else False
+        update_remote_pose = bool(
+            update_remote_pose or record['target'] is None)
+        snapped = (self._set_remote_target(record, pose, now)
+                   if pose is not None and update_remote_pose else False)
+        target = (dict(record['target'])
+                  if record['target'] is not None else None)
         self._emit({'type': 'update', 'entity': key, 'kind': kind,
                     'id': state['id'], 'state': _copy_state(state),
                     'pose': dict(record['current']) if record['current'] else None,
-                    'target': pose, 'remote': True, 'snap': snapped}, output)
+                    'target': target, 'remote': True, 'snap': snapped}, output)
 
     def snapshot(self, message):
         """Translate one full snapshot, dropping stale rounds/sequences."""
@@ -184,6 +191,25 @@ class SnapshotSync(object):
             return []
         if sequence is not None:
             self._last_sequence = sequence
+        update_bot_poses = True
+        if 'bot_state_revision' in message:
+            raw_revision = message.get('bot_state_revision')
+            try:
+                revision = int(raw_revision)
+                if (isinstance(raw_revision, bool) or revision < 0 or
+                        float(raw_revision) != revision):
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError('bot_state_revision is invalid')
+            if (self._last_bot_state_revision is not None and
+                    revision < self._last_bot_state_revision):
+                raise ValueError('bot_state_revision regressed')
+            update_bot_poses = (
+                self._last_bot_state_revision is None or
+                revision > self._last_bot_state_revision)
+            self._last_bot_state_revision = revision
+        elif self._last_bot_state_revision is not None:
+            raise ValueError('bot_state_revision disappeared')
         now = self._now()
         output = []
         seen = set()
@@ -192,7 +218,9 @@ class SnapshotSync(object):
                 key = _entity_key(kind, state)
                 if key is not None:
                     seen.add(key)
-                self._upsert(kind, state, now, output)
+                self._upsert(
+                    kind, state, now, output,
+                    update_remote_pose=(kind != 'bot' or update_bot_poses))
         for key, record in list(self._entities.items()):
             if key not in seen and not record['dead']:
                 record['dead'] = True
