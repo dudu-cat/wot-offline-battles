@@ -128,8 +128,9 @@ unchanged.
 Version 0.3.72 replaces the previous fire-time terminal ray with a shared
 elapsed-time projectile law for player and authority-Bot shells. The canonical
 launch records origin, velocity, gravity and lifetime. Its parabola is tested
-in chords of at most 25 ms, including a relative sweep for each moving vehicle,
-so an already-fired shell does not follow a target and the target may dodge it.
+in adaptive chords no longer than 50 ms and with at most 5 cm sagitta,
+including a relative sweep for each moving vehicle, so an already-fired shell
+does not follow a target and the target may dodge it.
 Direct fire and SPG fire use moving-target lead before launch. The same launch
 record drives local and relayed tracer presentation.
 
@@ -287,11 +288,12 @@ Local-player movement does not infer a dynamic prop from a nearby pivot: its
 swept OBB must intersect the exact item OBB, then the stock mass/speed/health
 kinetic gate decides whether native destruction may be requested. Native
 fragile/module acceptance retains a synthetic block through the stock
-0.2-second hiding delay. Falling items instead refresh their exact OBB from the
-native animator matrix and keep the final fallen pose. Static world rays and
-backing collision remain authoritative after a hide
-interval; the catalog is a strict contact/identity source, not permission to
-bypass an intact wall. The broad object-origin proximity workaround used by
+0.2-second hiding delay. Falling items refresh their catalog OBB from the
+native animator only until the first touchdown callback; that coarse OBB then
+retires while the moving/final native BSP and ground support remain
+authoritative. Static world rays and backing collision remain authoritative
+after a hiding interval; the catalog is a strict contact/identity source, not
+permission to bypass an intact wall. The broad object-origin proximity workaround used by
 the legacy 0.8.2 implementation is deliberately not transplanted.
 Authority Bots retain the existing streamed proximity/native contact sensor;
 the new dynamic-only OBB supplement is not wired into Bot movement.

@@ -401,6 +401,90 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertEqual([], args[7])
         self.assertAlmostEqual(5.0, kwargs['checked_distance'], places=4)
 
+    def test_far_records_skip_native_entity_lookup_before_exact_broadphase(self):
+        battle, unused_bigworld = _battle()
+        self.assertTrue(battle._accept_projectile_event(_event()))
+        source = battle._server_entity(41)
+        target_ids = []
+        current = {'player:7': (0.0, 0.0, 0.0)}
+        for index in range(29):
+            key = 'bot:%d' % index
+            engine_id = 1000 + index
+            target_ids.append(engine_id)
+            battle._records[key] = {
+                'engine_id': engine_id, 'network_id': index, 'kind': 'bot',
+                'local': False, 'ready': True,
+                'state': {'health': 100, 'alive': True}}
+            current[key] = (1000.0 + index, 0.0, 1000.0)
+        queried = []
+
+        def server_entity(entity_id):
+            queried.append(entity_id)
+            return source if entity_id == 41 else None
+
+        battle._server_entity = server_entity
+        battle._projectile_current_positions = current
+        battle._projectile_position_history = []
+        battle._projectile_scan_count = 0
+        battle._projectile_candidate_count = 0
+        state = battle._projectiles.get('player:7:1')
+
+        self.assertIsNone(battle._projectile_chord(
+            state, (0.0, 1.0, 0.0), (1.0, 1.0, 0.0), 0.0, 0.05))
+        self.assertEqual(30, battle._projectile_scan_count)
+        self.assertEqual(0, battle._projectile_candidate_count)
+        self.assertTrue(queried)
+        self.assertFalse(set(target_ids).intersection(queried))
+
+    def test_stock_max_29_projectile_debt_bounds_frame_and_reduces_scans(self):
+        battle, bigworld = _battle()
+        source = battle._server_entity(41)
+        entities = {41: source}
+        for index in range(29):
+            engine_id = 1000 + index
+            entities[engine_id] = types.SimpleNamespace(
+                id=engine_id, isStarted=True,
+                position=_Vector((1000.0 + index, 0.0, 1000.0)),
+                isAlive=lambda: True,
+                collideSegmentExt=mock.Mock(return_value=[]))
+            battle._records['bot:%d' % index] = {
+                'engine_id': engine_id, 'network_id': index, 'kind': 'bot',
+                'local': False, 'ready': True,
+                'state': {'health': 100, 'alive': True}}
+        battle._server_entity = lambda entity_id: entities.get(entity_id)
+        for shot_seq in range(1, 30):
+            event = dict(_event())
+            event.update({
+                'projectile_id': 'player:7:%d' % shot_seq,
+                'shot_seq': shot_seq,
+                'gravity': 190.0,
+                'maxDistance': 100000.0,
+            })
+            self.assertTrue(battle._accept_projectile_event(event))
+
+        bigworld.now = 1.0
+        totals = {'chords': 0, 'scans': 0}
+        invocations = 0
+        while True:
+            self.assertTrue(battle._advance_projectiles(1.0))
+            perf = battle._projectile_perf
+            totals['chords'] += perf['chords']
+            totals['scans'] += perf['scans']
+            invocations += 1
+            if perf['debt'] <= 1e-9:
+                break
+            self.assertLess(invocations, 11)
+
+        self.assertEqual(11, invocations)
+        self.assertEqual(638, totals['chords'])
+        self.assertEqual(19140, totals['scans'])
+        self.assertEqual(58, battle._projectile_perf['chords'])
+        self.assertEqual(1740, battle._projectile_perf['scans'])
+        self.assertEqual(0, battle._projectile_perf['candidates'])
+        for entity_id, entity in entities.items():
+            if entity_id != 41:
+                entity.collideSegmentExt.assert_not_called()
+
     def test_budgeted_catchup_uses_historic_target_pose_for_relative_sweep(self):
         battle, bigworld = _battle()
         target = types.SimpleNamespace(

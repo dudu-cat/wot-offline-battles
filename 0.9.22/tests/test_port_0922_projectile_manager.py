@@ -70,7 +70,7 @@ class ProjectileManagerTests(unittest.TestCase):
             self.assertAlmostEqual(10.095, snapshot['position'][1])
             self.assertAlmostEqual(12.0, snapshot['position'][2])
             self.assertTrue(all(
-                0.0 < end - start <= 0.025000001
+                0.0 < end - start <= 0.050000001
                 for start, end in chords))
 
         for snapshot in snapshots[1:]:
@@ -89,7 +89,7 @@ class ProjectileManagerTests(unittest.TestCase):
             chords.append((first, last)),
             lambda _state, _terminal: None))
 
-        self.assertEqual(17, len(chords))
+        self.assertEqual(9, len(chords))
         self.assertAlmostEqual(0.0, chords[0][0])
         self.assertAlmostEqual(0.41, chords[-1][1])
         self.assertAlmostEqual(
@@ -144,9 +144,9 @@ class ProjectileManagerTests(unittest.TestCase):
 
         self.assertEqual(1, len(terminals))
         state, terminal = terminals[0]
-        self.assertAlmostEqual(0.01, state['cursor_time'])
-        self.assertAlmostEqual(1.0, state['distance'])
-        self.assertEqual((1.0, 0.0, 0.0), state['position'])
+        self.assertAlmostEqual(0.02, state['cursor_time'])
+        self.assertAlmostEqual(2.0, state['distance'])
+        self.assertEqual((2.0, 0.0, 0.0), state['position'])
         self.assertEqual(9, terminal['target_id'])
         self.assertAlmostEqual(0.4, terminal['fraction'])
         self.assertEqual([], manager.snapshot())
@@ -259,12 +259,12 @@ class ProjectileManagerTests(unittest.TestCase):
 
         manager.advance(0.1, observe, lambda _state, _terminal: None)
 
-        self.assertEqual(['a'] * 4 + ['b'] * 4, callbacks)
+        self.assertEqual(['a'] * 2 + ['b'] * 2, callbacks)
         self.assertEqual(['a', 'c'], [
             state['key'] for state in manager.snapshot()])
         callbacks[:] = []
         manager.advance(0.11, observe, lambda _state, _terminal: None)
-        self.assertEqual(['a'] + ['c'] * 4, callbacks)
+        self.assertEqual(['a'] + ['c'] * 2, callbacks)
 
     def test_self_remove_from_chord_stops_further_chords_without_corruption(self):
         manager = self.module.InFlightProjectiles()
@@ -280,7 +280,7 @@ class ProjectileManagerTests(unittest.TestCase):
         manager.advance(0.1, observe, lambda _state, _terminal: None)
 
         self.assertEqual(1, counts['a'])
-        self.assertEqual(4, counts['b'])
+        self.assertEqual(2, counts['b'])
         self.assertEqual(['b'], [state['key'] for state in manager.snapshot()])
 
     def test_callback_exception_retires_only_affected_projectile(self):
@@ -536,7 +536,7 @@ class ProjectileManagerTests(unittest.TestCase):
                 callbacks[state['key']] += 1
                 callback_total[0] += 1
 
-            # One second of backlog would otherwise cost forty chords per
+            # One second of backlog would otherwise cost twenty chords per
             # projectile in one frame.  A one-chord-per-projectile budget
             # bounds this invocation while giving every launch finite work.
             self.assertTrue(manager.advance(
@@ -547,7 +547,7 @@ class ProjectileManagerTests(unittest.TestCase):
                 set([1]), set(callbacks.values()))
             self.assertAlmostEqual(1.0, manager.now)
             for key in keys:
-                self.assertAlmostEqual(0.025, manager.get(key)['elapsed'])
+                self.assertAlmostEqual(0.05, manager.get(key)['elapsed'])
 
             invocations = 1
             while any(manager.get(key)['elapsed'] < 1.0 - 1e-9
@@ -559,14 +559,173 @@ class ProjectileManagerTests(unittest.TestCase):
                 self.assertLessEqual(
                     callback_total[0] - before, active_count)
                 invocations += 1
-                self.assertLessEqual(invocations, 41)
+                self.assertLessEqual(invocations, 21)
 
-            self.assertEqual(40, invocations)
-            self.assertEqual(active_count * 40, callback_total[0])
+            self.assertEqual(20, invocations)
+            self.assertEqual(active_count * 20, callback_total[0])
             for key in keys:
                 state = manager.get(key)
                 self.assertAlmostEqual(1.0, state['elapsed'])
                 self.assertAlmostEqual(100.0, state['position'][0])
+
+    def test_stock_max_29_projectile_backlog_is_bounded_and_catches_at_17fps(self):
+        active_count = 29
+
+        def populated_manager():
+            manager = self.module.InFlightProjectiles(
+                maximum_active=active_count)
+            for index in range(active_count):
+                self.assertTrue(_launch(
+                    manager, key='shot-%d' % index,
+                    gravity=(0.0, -190.0, 0.0), max_time=10.0,
+                    max_distance=100000.0))
+            return manager
+
+        # The exact #1513 maximum stock gravity takes 29 * 22 = 638 chords,
+        # versus 29 * 40 = 1,160 at the previous fixed 25 ms step.
+        fixed = populated_manager()
+        fixed_callbacks = [0]
+        fixed_invocations = 0
+        while fixed.last_advance_metrics()['debt_after'] > 1e-9 or not fixed_invocations:
+            self.assertTrue(fixed.advance(
+                1.0,
+                lambda *_args: fixed_callbacks.__setitem__(
+                    0, fixed_callbacks[0] + 1),
+                lambda _state, _terminal: None,
+                maximum_chords=active_count * 2))
+            fixed_invocations += 1
+        self.assertEqual(11, fixed_invocations)
+        self.assertEqual(638, fixed_callbacks[0])
+
+        # With a live 17 Hz target clock, 58 chords per frame sustains all 29
+        # projectiles and retires a one-second initial debt in 29 callbacks
+        # (28 render intervals, about 1.647 seconds) without later drift.
+        live = populated_manager()
+        target = 1.0
+        catchup_invocations = 0
+        while True:
+            before = sum(
+                int(state['elapsed'] * 1000000.0)
+                for state in live.snapshot())
+            self.assertTrue(live.advance(
+                target, lambda *_args: None,
+                lambda _state, _terminal: None,
+                maximum_chords=active_count * 2))
+            metrics = live.last_advance_metrics()
+            self.assertLessEqual(metrics['chords'], active_count * 2)
+            after = sum(
+                int(state['elapsed'] * 1000000.0)
+                for state in live.snapshot())
+            self.assertGreater(after, before)
+            catchup_invocations += 1
+            if metrics['debt_after'] <= 1e-9:
+                break
+            target += 1.0 / 17.0
+            self.assertLess(catchup_invocations, 30)
+
+        self.assertEqual(29, catchup_invocations)
+        self.assertAlmostEqual(28.0 / 17.0, target - 1.0)
+        for unused_frame in range(60):
+            target += 1.0 / 17.0
+            self.assertTrue(live.advance(
+                target, lambda *_args: None,
+                lambda _state, _terminal: None,
+                maximum_chords=active_count * 2))
+            metrics = live.last_advance_metrics()
+            self.assertEqual(58, metrics['chords'])
+            self.assertLessEqual(metrics['debt_after'], 1e-9)
+
+    def test_sustainable_budget_covers_stock_capacity_and_protocol_gravity(self):
+        interval = 1.0 / 15.0
+        stock = self.module.InFlightProjectiles(maximum_active=128)
+        for index in range(128):
+            self.assertTrue(_launch(
+                stock, key='stock-%d' % index,
+                gravity=(0.0, -190.0, 0.0), max_time=10.0,
+                max_distance=100000.0))
+        self.assertEqual(256, stock.sustainable_chord_budget(interval))
+
+        stock_target = 1.0
+        stock_invocations = 0
+        while True:
+            self.assertTrue(stock.advance(
+                stock_target, lambda *_args: None,
+                lambda _state, _terminal: None,
+                maximum_chords=256))
+            stock_invocations += 1
+            if stock.last_advance_metrics()['debt_after'] <= 1e-9:
+                break
+            stock_target += 1.0 / 17.0
+            self.assertLess(stock_invocations, 30)
+        self.assertEqual(29, stock_invocations)
+        for unused_frame in range(60):
+            stock_target += 1.0 / 17.0
+            self.assertTrue(stock.advance(
+                stock_target, lambda *_args: None,
+                lambda _state, _terminal: None,
+                maximum_chords=256))
+            metrics = stock.last_advance_metrics()
+            self.assertEqual(256, metrics['chords'])
+            self.assertLessEqual(metrics['debt_after'], 1e-9)
+
+        protocol = self.module.InFlightProjectiles(maximum_active=29)
+        for index in range(29):
+            self.assertTrue(_launch(
+                protocol, key='protocol-%d' % index,
+                gravity=(0.0, -500.0, 0.0), max_time=10.0,
+                max_distance=100000.0))
+        self.assertEqual(87, protocol.sustainable_chord_budget(interval))
+
+        target = 1.0
+        invocations = 0
+        while True:
+            self.assertTrue(protocol.advance(
+                target, lambda *_args: None,
+                lambda _state, _terminal: None,
+                maximum_chords=87))
+            invocations += 1
+            if protocol.last_advance_metrics()['debt_after'] <= 1e-9:
+                break
+            target += 1.0 / 17.0
+            self.assertLess(invocations, 40)
+        self.assertEqual(37, invocations)
+        for unused_frame in range(60):
+            target += 1.0 / 17.0
+            self.assertTrue(protocol.advance(
+                target, lambda *_args: None,
+                lambda _state, _terminal: None,
+                maximum_chords=87))
+            metrics = protocol.last_advance_metrics()
+            self.assertEqual(87, metrics['chords'])
+            self.assertLessEqual(metrics['debt_after'], 1e-9)
+
+    def test_advance_metrics_report_chords_debt_and_one_terminal(self):
+        manager = self.module.InFlightProjectiles()
+        self.assertTrue(_launch(manager, max_time=0.1))
+        terminals = []
+
+        self.assertTrue(manager.advance(
+            0.1, lambda *_args: None,
+            lambda state, terminal: terminals.append((state, terminal)),
+            maximum_chords=1))
+        first = manager.last_advance_metrics()
+        self.assertEqual(1, first['active'])
+        self.assertEqual(1, first['chords'])
+        self.assertEqual(0, first['terminals'])
+        self.assertAlmostEqual(0.1, first['debt_before'])
+        self.assertAlmostEqual(0.05, first['debt_after'])
+
+        first['chords'] = 999
+        self.assertEqual(1, manager.last_advance_metrics()['chords'])
+        self.assertTrue(manager.advance(
+            0.1, lambda *_args: None,
+            lambda state, terminal: terminals.append((state, terminal)),
+            maximum_chords=1))
+        second = manager.last_advance_metrics()
+        self.assertEqual(1, second['chords'])
+        self.assertEqual(1, second['terminals'])
+        self.assertAlmostEqual(0.0, second['debt_after'])
+        self.assertEqual(1, len(terminals))
 
     def test_small_budget_rotates_persistently_without_starvation(self):
         manager = self.module.InFlightProjectiles(maximum_active=5)
@@ -585,7 +744,7 @@ class ProjectileManagerTests(unittest.TestCase):
 
         self.assertEqual(keys + keys, observed)
         for key in keys:
-            self.assertAlmostEqual(0.05, manager.get(key)['elapsed'])
+            self.assertAlmostEqual(0.10, manager.get(key)['elapsed'])
 
     def test_bounded_terminal_is_emitted_once_after_cross_frame_catch_up(self):
         manager = self.module.InFlightProjectiles(maximum_active=3)
@@ -607,7 +766,7 @@ class ProjectileManagerTests(unittest.TestCase):
                 terminals.append((state['key'], terminal['reason'])),
                 maximum_chords=1))
 
-        self.assertEqual({'a': 2, 'b': 2, 'c': 2}, chords)
+        self.assertEqual({'a': 1, 'b': 1, 'c': 1}, chords)
         self.assertEqual(
             [('a', 'max_time'), ('b', 'max_time'), ('c', 'max_time')],
             terminals)

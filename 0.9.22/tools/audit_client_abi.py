@@ -463,13 +463,19 @@ EXPECTED_ABI = {
         'DestructiblesManager.__destroyDestructible': (
             'self', 'chunkID', 'dmgType', 'destData',
             'isNeedAnimation', 'explosionInfo'),
+        'DestructiblesManager.__dropDestructible': (
+            'self', 'chunkID', 'destrIndex', 'dmgType', 'fallDirYaw',
+            'pitchConstr', 'fallSpeed', 'isAnimate',
+            'obstacleCollisionFlags'),
         'DestructiblesManager.__getDestrInitialMatrix': (
             'self', 'chunkID', 'destrIndex'),
         '_DestructiblesAnimator.showFall': (
             'self', 'spaceID', 'chunkID', 'destrIndex', 'fallDirYaw',
             'pitchConstr', 'discreteInitSpeed', 'isNeedAnimation',
             'initialMatrix', 'touchdownCallback'),
+        '_DestructiblesAnimator.__moveBody': ('self', 'body', 'dt'),
         '_DestructiblesAnimator.__positionBodyModel': ('self', 'body'),
+        '_DestructiblesAnimator.__update': ('self', 'dt'),
     },
     'scripts/client/helpers/EffectMaterialCalculation.pyc': {
         'calcSurfaceMaterialNearPoint': (
@@ -1588,6 +1594,80 @@ EXPECTED_SUBSCRIPT_MUTATIONS = {
     },
 }
 
+
+# Ordered semantic skeletons for exact-client behavior that signatures and
+# name-presence checks cannot prove.  The matcher permits unrelated loads and
+# arithmetic between steps, but bounds each gap so dead or distant code cannot
+# accidentally satisfy a contract.
+EXPECTED_ORDERED_INSTRUCTION_PATTERNS = {
+    'scripts/client/AreaDestructibles.pyc': {
+        'DestructiblesManager.__dropDestructible': (
+            'animated falling callback', 16, (
+                ('LOAD_GLOBAL', 'value', 'DestructiblesCache'),
+                ('LOAD_ATTR', 'value', 'DESTR_TYPE_FALLING_ATOM'),
+                ('COMPARE_OP', 'argument', 2),
+                ('POP_JUMP_IF_FALSE', None, None),
+                ('LOAD_FAST', 'value', 'isAnimate'),
+                ('POP_JUMP_IF_FALSE', None, None),
+                ('LOAD_FAST', 'value', 'useEffectsOnTouchDown'),
+                ('POP_JUMP_IF_FALSE', None, None),
+                ('LOAD_GLOBAL', 'value', 'partial'),
+                ('LOAD_ATTR', 'value',
+                 '_DestructiblesManager__touchDownWithEffect'),
+                ('CALL_FUNCTION', 'argument', 6),
+                ('STORE_FAST', 'value', 'touchdownCallback'),
+                ('LOAD_GLOBAL', 'value', 'partial'),
+                ('LOAD_ATTR', 'value', '_DestructiblesManager__touchDown'),
+                ('CALL_FUNCTION', 'argument', 1),
+                ('STORE_FAST', 'value', 'touchdownCallback'),
+                ('LOAD_CONST', 'value', None),
+                ('STORE_FAST', 'value', 'touchdownCallback'),
+                ('LOAD_ATTR', 'value', 'showFall'),
+                ('LOAD_FAST', 'value', 'touchdownCallback'),
+                ('CALL_FUNCTION', 'argument', 9),
+            )),
+        '_DestructiblesAnimator.__moveBody': (
+            'first-touch callback deletion', 16, (
+                ('LOAD_CONST', 'value', 'springAngle'),
+                ('COMPARE_OP', 'argument', 4),
+                ('POP_JUMP_IF_FALSE', None, None),
+                ('LOAD_FAST', 'value', 'body'),
+                ('LOAD_ATTR', 'value', 'get'),
+                ('LOAD_CONST', 'value', 'touchdownCallback'),
+                ('CALL_FUNCTION', 'argument', 1),
+                ('STORE_FAST', 'value', 'touchdownCallback'),
+                ('LOAD_FAST', 'value', 'touchdownCallback'),
+                ('LOAD_CONST', 'value', None),
+                ('COMPARE_OP', 'argument', 9),
+                ('POP_JUMP_IF_FALSE', None, None),
+                ('LOAD_FAST', 'value', 'touchdownCallback'),
+                ('CALL_FUNCTION', 'argument', 0),
+                ('LOAD_FAST', 'value', 'body'),
+                ('LOAD_CONST', 'value', 'touchdownCallback'),
+                ('DELETE_SUBSCR', None, None),
+            )),
+        '_DestructiblesAnimator.__update': (
+            'move-remove-position order', 32, (
+                ('LOAD_ATTR', 'value', '_DestructiblesAnimator__moveBody'),
+                ('CALL_FUNCTION', 'argument', 2),
+                ('LOAD_ATTR', 'value', 'remove'),
+                ('CALL_FUNCTION', 'argument', 1),
+                ('LOAD_ATTR', 'value', '_DestructiblesAnimator__bodies'),
+                ('GET_ITER', None, None),
+                ('LOAD_ATTR', 'value',
+                 '_DestructiblesAnimator__positionBodyModel'),
+                ('LOAD_FAST', 'value', 'body'),
+                ('CALL_FUNCTION', 'argument', 1),
+            )),
+        '_DestructiblesAnimator.__positionBodyModel': (
+            'native matrix update', 16, (
+                ('LOAD_GLOBAL', 'value', 'BigWorld'),
+                ('LOAD_ATTR', 'value', 'wg_setDestructibleMatrix'),
+                ('CALL_FUNCTION', 'argument', 5),
+            )),
+    },
+}
+
 EXPECTED_UNPACK_WIDTHS = {
     'scripts/client_common/ClientArena.pyc': {
         'ClientArena.__onBasePointsUpdate': 6,
@@ -1729,6 +1809,8 @@ def _instructions(code):
                 value = code.co_consts[argument]
             elif operation in opcode.hasname:
                 value = code.co_names[argument]
+            elif operation in opcode.haslocal:
+                value = code.co_varnames[argument]
         result.append({
             'offset': offset,
             'opname': opcode.opname[operation],
@@ -1778,6 +1860,28 @@ def _mutates_subscript(code, attribute_name, index_value):
                 window[2]['opname'] == 'STORE_SUBSCR'):
             return True
     return False
+
+
+def _has_ordered_instruction_pattern(code, pattern, maximum_gap):
+    instructions = _instructions(code)
+    previous = None
+    for opname, field, expected in pattern:
+        start = 0 if previous is None else previous + 1
+        stop = (len(instructions) if previous is None else
+                min(len(instructions), start + int(maximum_gap) + 1))
+        match = None
+        for index in xrange(start, stop):
+            instruction = instructions[index]
+            if instruction['opname'] != opname:
+                continue
+            if field is not None and instruction[field] != expected:
+                continue
+            match = index
+            break
+        if match is None:
+            return False
+        previous = match
+    return True
 
 
 def _unpacks_width(code, width):
@@ -1895,6 +1999,7 @@ def audit(client_root):
     checked_read_only_properties = []
     checked_list_returns = []
     checked_subscript_mutations = []
+    checked_instruction_patterns = []
     checked_unpack_widths = []
     checked_call_widths = []
     checked_tuple_widths = []
@@ -1910,6 +2015,7 @@ def audit(client_root):
                    set(EXPECTED_READ_ONLY_PROPERTIES) |
                    set(EXPECTED_LIST_RETURNS) |
                    set(EXPECTED_SUBSCRIPT_MUTATIONS) |
+                   set(EXPECTED_ORDERED_INSTRUCTION_PATTERNS) |
                    set(EXPECTED_UNPACK_WIDTHS) |
                    set(EXPECTED_CALL_WIDTHS) |
                    set(EXPECTED_TUPLE_WIDTHS) |
@@ -2044,6 +2150,21 @@ def audit(client_root):
                     checked_subscript_mutations.append(
                         '%s:%s:%s[%r]' %
                         (member, name, attribute_name, index_value))
+            for name, contract in sorted(
+                    EXPECTED_ORDERED_INSTRUCTION_PATTERNS.get(
+                        member, {}).items()):
+                code = code_objects.get(name)
+                label, maximum_gap, pattern = contract
+                if code is None:
+                    errors.append('%s: missing %s for %s' %
+                                  (member, name, label))
+                elif not _has_ordered_instruction_pattern(
+                        code, pattern, maximum_gap):
+                    errors.append('%s: %s lacks %s control flow' %
+                                  (member, name, label))
+                else:
+                    checked_instruction_patterns.append(
+                        '%s:%s:%s' % (member, name, label))
             for name, width in sorted(
                     EXPECTED_UNPACK_WIDTHS.get(member, {}).items()):
                 code = code_objects.get(name)
@@ -2148,6 +2269,7 @@ def audit(client_root):
             checked_read_only_properties),
         'checkedListReturns': len(checked_list_returns),
         'checkedSubscriptMutations': len(checked_subscript_mutations),
+        'checkedInstructionPatterns': len(checked_instruction_patterns),
         'checkedUnpackWidths': len(checked_unpack_widths),
         'checkedCallWidths': len(checked_call_widths),
         'checkedTupleWidths': len(checked_tuple_widths),
@@ -2163,6 +2285,7 @@ def audit(client_root):
         'readOnlyProperties': checked_read_only_properties,
         'listReturns': checked_list_returns,
         'subscriptMutations': checked_subscript_mutations,
+        'instructionPatterns': checked_instruction_patterns,
         'unpackWidths': checked_unpack_widths,
         'callWidths': checked_call_widths,
         'tupleWidths': checked_tuple_widths,

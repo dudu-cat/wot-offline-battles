@@ -5,8 +5,11 @@ All vectors are plain three-component sequences. The live adapter remains
 responsible for clocks, BigWorld collision queries, and vehicle matrices.
 """
 
+import math
+
 PROJECTILE_CALLBACK_SECONDS = 0.01
-PROJECTILE_MAX_SUBSTEP_SECONDS = 0.025
+PROJECTILE_MAX_SUBSTEP_SECONDS = 0.05
+PROJECTILE_MAX_CHORD_ERROR_METERS = 0.05
 PROJECTILE_BROADPHASE_RADIUS = 15.0
 
 
@@ -87,6 +90,53 @@ def point_segment_distance_sq(point, start, end):
     delta_y = point_y - segment_y * fraction
     delta_z = point_z - segment_z * fraction
     return delta_x * delta_x + delta_y * delta_y + delta_z * delta_z
+
+
+def point_in_expanded_segment_bounds(point, start, end, radius):
+    """Return whether ``point`` is inside a segment's expanded AABB.
+
+    This is a conservative broad phase: a point within ``radius`` of the
+    finite segment must pass it, while distant records avoid the more costly
+    point-to-segment projection and native entity lookup.
+    """
+    radius = max(0.0, float(radius or 0.0))
+    for index in range(3):
+        value = float(point[index])
+        lower = min(float(start[index]), float(end[index])) - radius
+        upper = max(float(start[index]), float(end[index])) + radius
+        if value < lower or value > upper:
+            return False
+    return True
+
+
+def parabolic_chord_error(gravity, duration):
+    """Return the maximum sagitta of a constant-gravity trajectory chord."""
+    try:
+        gravity_magnitude = math.sqrt(sum(
+            float(value) * float(value) for value in gravity))
+    except TypeError:
+        gravity_magnitude = abs(float(gravity or 0.0))
+    duration = max(0.0, float(duration or 0.0))
+    return gravity_magnitude * duration * duration / 8.0
+
+
+def curvature_limited_substep(
+        gravity, maximum_step=PROJECTILE_MAX_SUBSTEP_SECONDS,
+        maximum_error=PROJECTILE_MAX_CHORD_ERROR_METERS):
+    """Choose the longest chord that keeps parabolic sagitta bounded."""
+    maximum_step = max(0.001, float(
+        maximum_step or PROJECTILE_MAX_SUBSTEP_SECONDS))
+    maximum_error = max(1e-9, float(
+        maximum_error or PROJECTILE_MAX_CHORD_ERROR_METERS))
+    try:
+        gravity_magnitude = math.sqrt(sum(
+            float(value) * float(value) for value in gravity))
+    except TypeError:
+        gravity_magnitude = abs(float(gravity or 0.0))
+    if gravity_magnitude <= 1e-12:
+        return maximum_step
+    error_limited = math.sqrt(8.0 * maximum_error / gravity_magnitude)
+    return max(0.001, min(maximum_step, error_limited))
 
 
 def substep_boundaries(start_time, end_time,

@@ -125,6 +125,51 @@ class ProjectileRuntimeTests(unittest.TestCase):
         self.assertEqual(29.0, self.runtime.point_segment_distance_sq(
             (15.0, 2.0, 0.0), (0.0, 0.0, 0.0), (10.0, 0.0, 0.0)))
 
+    def test_b4_gravity_uses_50ms_below_five_centimetres_error(self):
+        step = self.runtime.curvature_limited_substep(
+            (0.0, -143.0, 0.0))
+
+        self.assertEqual(0.05, step)
+        error = self.runtime.parabolic_chord_error(143.0, step)
+        self.assertAlmostEqual(0.0446875, error)
+        self.assertLessEqual(
+            error, self.runtime.PROJECTILE_MAX_CHORD_ERROR_METERS)
+
+    def test_stock_1513_max_gravity_adapts_to_five_centimetres_error(self):
+        step = self.runtime.curvature_limited_substep(
+            (0.0, -190.0, 0.0))
+
+        self.assertAlmostEqual(0.04588314677411235, step)
+        self.assertAlmostEqual(
+            0.05,
+            self.runtime.parabolic_chord_error((0.0, -190.0, 0.0), step))
+
+    def test_protocol_max_gravity_adapts_to_five_centimetres_error(self):
+        step = self.runtime.curvature_limited_substep(
+            (0.0, -500.0, 0.0))
+
+        self.assertAlmostEqual(0.0282842712474619, step)
+        self.assertAlmostEqual(
+            0.05,
+            self.runtime.parabolic_chord_error((0.0, -500.0, 0.0), step))
+
+    def test_expanded_segment_bounds_are_conservative_and_reject_far_points(self):
+        start = (0.0, 0.0, 0.0)
+        end = (10.0, 0.0, 0.0)
+
+        self.assertTrue(self.runtime.point_in_expanded_segment_bounds(
+            (5.0, 15.0, 0.0), start, end, 15.0))
+        self.assertFalse(self.runtime.point_in_expanded_segment_bounds(
+            (5.0, 15.0001, 0.0), start, end, 15.0))
+        # Corner points may pass this cheap conservative test; the exact
+        # point-to-segment test remains authoritative immediately afterwards.
+        corner = (25.0, 15.0, 0.0)
+        self.assertTrue(self.runtime.point_in_expanded_segment_bounds(
+            corner, start, end, 15.0))
+        self.assertGreater(
+            self.runtime.point_segment_distance_sq(corner, start, end),
+            15.0 ** 2)
+
 
 if __name__ == '__main__':
     unittest.main()

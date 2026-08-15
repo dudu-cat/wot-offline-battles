@@ -121,20 +121,23 @@ PINNED_PORT_SHA256 = {
     'ai/navigation.py': '7aabe5283fd46ab02a30e772be25637661ef6d2e7564640b0226227b6dff3c69',
     'ai/planner.py': '1c7d97f42fd804364e16bd5c1fe5ef86a48a55390bf7c938c5c313d96a50bf92',
     'ai/reviewed_routes_20260811.py': 'dba5ea626d913619467f78cf594c7c990bc0867abf430f5fe9c5519c09e9331a',
-    'battle_runtime.py': '8f57b7bd20418a654a376f0c7945c1bb52353da07780ccd886b322c4cb7d624f',
+    'battle_runtime.py': '96405ad0dace41ce05378cb1163aee91d78bc2306e5baed6b3c499b8f56a2045',
     'bot_runtime.py': '016d27b79a03f56e6ba4f81d514e6c49c1e9aa7b0af9494c8af825771c15c0c7',
     'combat_rules.py': '9dd0296fe2a9e9340de3608f8017f6270e8f8e2d0d6ce9f673edecd2e1ce75bf',
     'entities/remote_vehicle.py': '0978c6f2715f91f82f505de8ae85696940736a30e4bb8733bc7b4c0debecd51b',
-    'lan_client.py': 'd054bd9c7ab362166410c80440f70ae587cc1974471a72e749433f65ca163574',
+    'lan_client.py': '0d60a3af33a70876d3c0aaae58ba9052584bade177c692e5c98f0b2a3fa2a8c6',
+    'snapshot_sync.py': '8b3bfd569d225adc2308c095800c9caf6d2f3b057e362a88dc45bc94b5bd756f',
     'tank_collision.py': '1b8deca1d273e1cc18445a2454222aa23bac3a712cc836feb179a1fa2f8dc0ef',
     'vehicle_physics.py': '97e0411ec332a4c47624316fee88775ce5564942b1851dc2f6b63831fa3a3d26',
     'destructibles_authority.py': 'efe866862fbe2e2e996a63139f14ba471b7487a575911a327e6ddab98125105f',
-    'destructibles_sensor.py': '4cf84b2411cffdc8a3ea690e6a7d8ce506536b6bae9ceb5b096e6214977a4960',
+    'destructibles_sensor.py': '6fb0423388eea6919d9a8994e51866e4f83fd26afb098300e6a69e4420e41ea0',
+    'projectile_manager.py': '5fa806ea34d6256f0b84d26e24dbcf5fc435b289d49b42d3ea5288014b1ac6a3',
+    'projectile_runtime.py': 'adf7b8f1ffc2d1ef926ac04ad835501c1cdc279dcee1d6792b596e902da9573e',
     'prebaked_destructibles.py': '48fe24ceae4ea41692590916948312c4d484a4bed0d8bec729ef29386bb2fcc3',
     'world_collision.py': 'f5506a4cf29e2d6a1eb7bfd2400f1703aeae81fad02392d61a50d618198dd925',
 }
 PINNED_SERVER_SHA256 = {
-    'server/lan_battle_server.py': 'a17bf9350c1b32924f37a68d000c190e4ee37e807db3a90dbc4bf83f3615ff56',
+    'server/lan_battle_server.py': '5df02ad81456d30cf96bbf5b76f287ee2b2709850b887e8ffac78eda18ae4e16',
     'server/server_bot_ai.py': '306916334e492297f653ad024bf9004d281ed4142a5fd6afa4155b135a9220de',
 }
 PINNED_RELEASE_SHA256 = {
@@ -1287,11 +1290,18 @@ def audit(repo_root):
             'BigWorld.wg_getDestructibleMatrix(',
             "instance['boxes'] = boxes",
             '_index_catalog_instance_1513(',
-            'if not animation_active:',
+            'initial_matrix, synthetic_collision_active =',
+            'if synthetic_collision_active:',
+            "instance['bin_keys'] = ()",
             'del active[identity]'):
         if required not in refresh_falling:
             errors.append(
                 'destructibles_sensor.py falling refresh omits %s' % required)
+    falling_native_state = _function_at_any_indent(
+        destructibles_sensor, '_falling_native_state_1513') or ''
+    if "'touchdownCallback' in matches[0]" not in falling_native_state:
+        errors.append('destructibles_sensor.py does not bind synthetic falling '
+                      'collision lifetime to native touchdown')
     note_falling = _function_at_any_indent(
         destructibles_sensor, 'note_destroyed') or ''
     if ("kind not in ('fragile', 'module', 'column')" not in note_falling or

@@ -3550,7 +3550,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             destructibles_sensor.reset(1)
         self.assertNotIn('g_offh_destr_pending', destructibles_sensor.__dict__)
 
-    def test_destroyed_column_follows_native_matrix_and_keeps_final_obb(self):
+    def test_destroyed_column_retires_synthetic_obb_at_touchdown(self):
         destructibles_sensor.xrange = range
         filename = 'content/Environment/test/normal/lod0/pole.model'
         destructibles_sensor.set_catalog(_catalog({
@@ -3592,6 +3592,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         area.g_destructiblesAnimator = types.SimpleNamespace(
             _DestructiblesAnimator__bodies=[{
                 'spaceID': 1, 'chunkID': 22, 'destrIndex': 37,
+                'touchdownCallback': object(),
             }])
         area.DESTR_TYPE_TREE = 1
         area.DESTR_TYPE_FALLING_ATOM = 2
@@ -3653,21 +3654,28 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             self.assertEqual(old_boxes, instance['boxes'])
             self.assertEqual(
                 old_bins, destructibles_sensor.g_offh_destr_contact_bins)
+            current[0] = initial_matrix
+            self.assertTrue(destructibles_sensor._catalog_motion_blocked(
+                1, _Vector(), 0.0, 11.5, descriptor, 10.04))
             current[0] = _ItemMatrix(_Vector(20.0, 0.0, 4.0))
             self.assertFalse(destructibles_sensor._catalog_motion_blocked(
-                1, _Vector(), 0.0, 11.5, descriptor, 10.04))
-            area.g_destructiblesAnimator._DestructiblesAnimator__bodies = []
-            current[0] = _ItemMatrix(_Vector(0.0, 0.0, 4.0))
-            self.assertTrue(destructibles_sensor._catalog_motion_blocked(
                 1, _Vector(), 0.0, 11.5, descriptor, 10.06))
+            del area.g_destructiblesAnimator._DestructiblesAnimator__bodies[0][
+                'touchdownCallback']
+            current[0] = _ItemMatrix(_Vector(0.0, 0.0, 4.0))
+            self.assertFalse(destructibles_sensor._catalog_motion_blocked(
+                1, _Vector(), 0.0, 11.5, descriptor, 10.08))
+            self.assertFalse(any(
+                (22, 37) in members for members in
+                destructibles_sensor.g_offh_destr_contact_bins.values()))
             current[0] = _ItemMatrix(_Vector(20.0, 0.0, 4.0))
-            self.assertTrue(destructibles_sensor._catalog_motion_blocked(
+            self.assertFalse(destructibles_sensor._catalog_motion_blocked(
                 1, _Vector(), 0.0, 11.5, descriptor, 11.0))
 
         self.assertEqual(1, len(calls))
         self.assertNotIn(
             (22, 37), destructibles_sensor.g_offh_destr_falling_active)
-        self.assertEqual(3, len(matrix_queries))
+        self.assertEqual(4, len(matrix_queries))
 
     def test_late_blank_column_registration_uses_native_initial_matrix(self):
         pole = 'content/Environment/env414/normal/lod0/pole.model'

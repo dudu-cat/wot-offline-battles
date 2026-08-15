@@ -12,11 +12,13 @@ import math
 from collections import deque
 
 try:
+    from .projectile_runtime import curvature_limited_substep
     from .projectile_runtime import lerp3
     from .projectile_runtime import substep_boundaries
     from .projectile_runtime import trajectory_position
     from .projectile_runtime import PROJECTILE_MAX_SUBSTEP_SECONDS
 except (ImportError, ValueError):
+    from projectile_runtime import curvature_limited_substep
     from projectile_runtime import lerp3
     from projectile_runtime import substep_boundaries
     from projectile_runtime import trajectory_position
@@ -84,7 +86,7 @@ class _ProjectileState(object):
     """Internal mutable cursor with detached public snapshots."""
 
     def __init__(self, key, start, velocity, gravity, launch_time, max_time,
-                 max_distance, payload):
+                 max_distance, payload, maximum_substep):
         self.key = key
         self.start = start
         self.velocity = velocity
@@ -93,6 +95,8 @@ class _ProjectileState(object):
         self.max_time = max_time
         self.max_distance = max_distance
         self.payload = payload
+        self.maximum_step = curvature_limited_substep(
+            gravity, maximum_substep)
         self.cursor_time = launch_time
         self.position = start
         self.distance = 0.0
@@ -155,6 +159,15 @@ class InFlightProjectiles(object):
         self._pending_remove_keys = set()
         self._current_callback_key = None
         self._cancel_current_keys = set()
+        self._advance_chords = 0
+        self._advance_terminals = 0
+        self._last_advance_metrics = {
+            'active': 0,
+            'chords': 0,
+            'terminals': 0,
+            'debt_before': 0.0,
+            'debt_after': 0.0,
+        }
 
     @property
     def now(self):
@@ -191,6 +204,24 @@ class InFlightProjectiles(object):
             return None
         return state.snapshot()
 
+    def last_advance_metrics(self):
+        """Return detached work counters for the latest valid advance."""
+        return dict(self._last_advance_metrics)
+
+    def sustainable_chord_budget(self, interval):
+        """Return chords needed to cover ``interval`` for every active shot."""
+        try:
+            interval = _finite_number(interval)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        if interval <= 0.0:
+            return 0
+        total = 0
+        for state in self._states.values():
+            total += int(math.ceil(max(
+                0.0, interval - _EPSILON) / state.maximum_step))
+        return total
+
     def launch(self, key, start, velocity, gravity, launch_time, max_time,
                max_distance, payload=None):
         """Freeze and register one unique launch, returning acceptance."""
@@ -219,7 +250,7 @@ class InFlightProjectiles(object):
         state = _ProjectileState(
             frozen_key, frozen_start, frozen_velocity, frozen_gravity,
             frozen_launch_time, frozen_max_time, frozen_max_distance,
-            frozen_payload)
+            frozen_payload, self._maximum_substep)
         self._known_keys.add(frozen_key)
         if self._advancing:
             self._pending_launch_keys.add(frozen_key)
@@ -271,7 +302,7 @@ class InFlightProjectiles(object):
         state = _ProjectileState(
             frozen_key, frozen_start, frozen_velocity, frozen_gravity,
             frozen_launch_time, frozen_max_time, frozen_max_distance,
-            frozen_payload)
+            frozen_payload, self._maximum_substep)
         state.cursor_time = frozen_cursor_time
         state.position = trajectory_position(
             state.start, state.velocity, state.gravity,
@@ -322,6 +353,15 @@ class InFlightProjectiles(object):
         self._pending_remove_keys.clear()
         self._current_callback_key = None
         self._cancel_current_keys.clear()
+        self._advance_chords = 0
+        self._advance_terminals = 0
+        self._last_advance_metrics = {
+            'active': 0,
+            'chords': 0,
+            'terminals': 0,
+            'debt_before': 0.0,
+            'debt_after': 0.0,
+        }
         return True
 
     def advance(self, now, chord_callback, terminal_callback,
@@ -351,6 +391,10 @@ class InFlightProjectiles(object):
         if self._advancing:
             return False
 
+        active_before = len(self._states)
+        debt_before = self._maximum_debt(target_time)
+        self._advance_chords = 0
+        self._advance_terminals = 0
         self._now = max(self._now, target_time)
         self._advancing = True
         try:
@@ -364,7 +408,23 @@ class InFlightProjectiles(object):
         finally:
             self._advancing = False
             self._flush_pending_operations()
+        self._last_advance_metrics = {
+            'active': active_before,
+            'chords': self._advance_chords,
+            'terminals': self._advance_terminals,
+            'debt_before': debt_before,
+            'debt_after': self._maximum_debt(target_time),
+        }
         return True
+
+    def _maximum_debt(self, target_time):
+        maximum = 0.0
+        for state in self._states.values():
+            lifetime_end = state.launch_time + state.max_time
+            desired = min(float(target_time), lifetime_end)
+            maximum = max(
+                maximum, max(0.0, desired - state.cursor_time))
+        return maximum
 
     def _advance_unbounded(self, target_time, chord_callback,
                            terminal_callback):
@@ -460,7 +520,7 @@ class InFlightProjectiles(object):
 
         used = 0
         for absolute_start, absolute_end in substep_boundaries(
-                state.cursor_time, end_time, self._maximum_substep):
+                state.cursor_time, end_time, state.maximum_step):
             if maximum_chords is not None and used >= maximum_chords:
                 break
             start = trajectory_position(
@@ -525,6 +585,7 @@ class InFlightProjectiles(object):
 
     def _call_chord(self, callback, state, start, end, absolute_start,
                     absolute_end):
+        self._advance_chords += 1
         self._current_callback_key = state.key
         try:
             result = callback(
@@ -564,6 +625,8 @@ class InFlightProjectiles(object):
         state.position = terminal_position
 
     def _finish(self, state, result, terminal_callback):
+        if self._advancing:
+            self._advance_terminals += 1
         self._remove_active(state.key)
         snapshot = state.snapshot()
         try:

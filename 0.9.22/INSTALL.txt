@@ -98,13 +98,14 @@ after BOT MANIFEST. Spawn formations, team assignment and server authority are
 unchanged.
 
 Version 0.3.72 gives every player and authority-Bot shell real flight time.
-The gravity path is checked in collision chords no longer than 25 ms, including
-the target vehicle's movement during each interval. Targets may therefore move
-clear after launch, and firing at a moving vehicle requires lead rather than an
-instant fire-time hit test. The server retains accepted launches and progress
-in a durable round ledger, carries active shots across shooter disconnects and
-authority takeover, and atomically commits terminal direct/splash damage plus
-shot-destructible receipts.
+The gravity path is checked in adaptive collision chords no longer than 50 ms
+and with at most 5 cm sagitta, including the target vehicle's movement during
+each interval. Targets may therefore move clear after launch, and firing at a
+moving vehicle requires lead rather than an instant fire-time hit test. The
+server retains accepted launches and progress in a durable round ledger,
+carries active shots across shooter disconnects and authority takeover, and
+atomically commits terminal direct/splash damage plus shot-destructible
+receipts.
 
 SPGs retain their stable rear deploy point and can fire exact low- or high-arc
 solutions. The client schedules arc collision work fairly with a hard budget of
@@ -162,8 +163,10 @@ hull face, a 0.075-m contact margin and this frame's real physical travel reach
 the item. The submission holds the pose for that tick and restores the real
 pre-step speed; the top-speed proof is never copied into vehicle, network or ram
 state. On later ticks, a pending native skin is skipped only to its exact
-registered OBB exit and then recast. Falling objects, backing walls,
-expired-but-still-solid skins and unknown geometry remain blocking.
+registered OBB exit and then recast. Airborne falling objects, backing walls,
+expired-but-still-solid skins and unknown geometry remain blocking. After the
+native touchdown callback, only the final native BSP, world rays and ground
+support decide whether a vehicle can cross the fallen object.
 
 Authority Bots retain the existing staggered driver cadence and 15/20-metre
 three-lane corridor. A catalog item can be planned through only after a read-
@@ -266,12 +269,12 @@ that do not answer the static world ray are considered only when that vehicle's
 swept OBB intersects the exact transformed item OBB. Native material contacts
 use the same stock mass/speed/health kinetic gate and real item scale. Native
 fragile/module acceptance keeps motion blocked through #1513's 0.2-second
-hiding interval. Falling objects instead follow the native animator matrix and
-retain their final fallen OBB. The static world ray and backing geometry remain
-authoritative afterwards, so
-an unknown, ambiguous, stale, under-threshold or still-solid object does not
-become ghost geometry. The permissive legacy 0.8.2 object-origin proximity
-destroy workaround is not included.
+hiding interval. Falling objects follow the native animator matrix until the
+first touchdown callback; the coarse catalog OBB then retires and the native
+moving/final BSP, static world ray and ground support remain authoritative.
+Unknown, ambiguous, stale, under-threshold or still-solid objects continue to
+fail closed. The permissive legacy 0.8.2 object-origin proximity destroy
+workaround is not included.
 Authority Bots retain their existing streamed proximity/native contact sensor;
 0.3.68 does not claim the dynamic-only OBB supplement for Bot movement.
 

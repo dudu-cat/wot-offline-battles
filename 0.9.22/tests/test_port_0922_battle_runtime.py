@@ -1838,7 +1838,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
         diagnostics.finish(
             first, 0.0, 0.02, 0.02, {'local': 0.004},
             {'lane': 7}, {'role': 'authority', 'speed': 14.0},
-            probe_durations={'lane': 0.005})
+            probe_durations={'lane': 0.005}, projectile={
+                'active': 29, 'chords': 58, 'debt': 0.05,
+                'advance': 0.004, 'terminals': 1, 'scans': 1740,
+                'candidates': 3})
         second = diagnostics.begin(0.12, 0.12)
         wall[0] = 0.125
         diagnostics.finish(
@@ -1860,8 +1863,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIn('lane:7', first_row)
         self.assertIn('probe_ms=', first_row)
         self.assertIn('lane:5.000', first_row)
+        self.assertIn('active:29,chords:58,debt_ms:50.000', first_row)
         self.assertIn('summary v=2', payloads[0])
         self.assertIn('probe_ms_avg_max', payloads[0])
+        self.assertIn('projectile_avg_max', payloads[0])
+        self.assertIn('chords=29.00/58', payloads[0])
+        self.assertIn('scans=870.00/1740', payloads[0])
         self.assertTrue(diagnostics._pending['emitted'])
         self.assertAlmostEqual(
             0.003, diagnostics._pending['stages']['diag_emit'])

@@ -1351,7 +1351,13 @@ def _falling_initial_matrix_1513(spaceID, chunkID, itemIndex, math_module):
 
 
 def _falling_native_state_1513(spaceID, chunkID, itemIndex, math_module):
-	"""Return the pinned manager's exact initial matrix and active flag."""
+	"""Return the initial matrix and whether synthetic collision still owns it.
+
+	The pinned animator keeps a body for spring settling after the first ground
+	contact.  Its exact touchdown boundary is deletion of ``touchdownCallback``
+	from that body.  Before deletion the moving catalog OBB is a conservative
+	contact body; afterwards the native matrix/BSP owns collision by itself.
+	"""
 	initial_matrix = _falling_initial_matrix_1513(
 		spaceID, chunkID, itemIndex, math_module)
 	if initial_matrix is None:
@@ -1363,7 +1369,7 @@ def _falling_native_state_1513(spaceID, chunkID, itemIndex, math_module):
 		animator, '_DestructiblesAnimator__bodies', None)
 	if not isinstance(bodies, list):
 		raise RuntimeError('#1513 falling animator body list is unavailable')
-	matches = 0
+	matches = []
 	for body in bodies:
 		if not isinstance(body, dict):
 			raise RuntimeError('#1513 falling animator body is invalid')
@@ -1373,10 +1379,11 @@ def _falling_native_state_1513(spaceID, chunkID, itemIndex, math_module):
 		except (KeyError, TypeError, ValueError, OverflowError):
 			raise RuntimeError('#1513 falling animator body identity is invalid')
 		if body_identity == (int(spaceID), int(chunkID), int(itemIndex)):
-			matches += 1
-	if matches > 1:
+			matches.append(body)
+	if len(matches) > 1:
 		raise RuntimeError('#1513 falling animator identity is ambiguous')
-	return initial_matrix, matches == 1
+	return initial_matrix, bool(
+		matches and 'touchdownCallback' in matches[0])
 
 
 def _refresh_destroyed_falling_instances_1513(spaceID, authority, now):
@@ -1411,7 +1418,7 @@ def _refresh_destroyed_falling_instances_1513(spaceID, authority, now):
 			raise RuntimeError(
 				'#1513 falling catalog identity is unavailable: '
 				'chunk=%s item=%s' % identity)
-		initial_matrix, animation_active = _falling_native_state_1513(
+		initial_matrix, synthetic_collision_active = _falling_native_state_1513(
 			spaceID, chunk_id, item_index, Math)
 		if initial_matrix is None:
 			# The manager has admitted the canonical result but has not flushed its
@@ -1459,15 +1466,18 @@ def _refresh_destroyed_falling_instances_1513(spaceID, authority, now):
 			if not members:
 				del contact_bins[bin_key]
 		instance['boxes'] = boxes
-		_index_catalog_instance_1513(
-			contact_bins, identity, instance, new_bin_keys)
 		state = active[identity]
 		state['last_refresh'] = float(now)
-		if not animation_active:
-			# The manager caches the initial matrix immediately before showFall.
-			# Once that cache exists, no matching body means either synchronous
-			# final placement or a completed animation.  Freeze this final OBB and
-			# stop polling the native matrix for this identity.
+		if synthetic_collision_active:
+			_index_catalog_instance_1513(
+				contact_bins, identity, instance, new_bin_keys)
+		else:
+			# The animator deletes touchdownCallback on first ground contact but can
+			# retain the body for up to eight seconds of spring settling.  Retire the
+			# coarse catalog OBB at that exact boundary: wg_setDestructibleMatrix has
+			# already installed the native moving/final BSP, so world rays and ground
+			# support remain authoritative without a 9-metre pole becoming a box wall.
+			instance['bin_keys'] = ()
 			del active[identity]
 
 

@@ -24,8 +24,8 @@ from gui.mods.offline_lan_0922.entities.remote_vehicle import (
 from gui.mods.offline_lan_0922.entities.runtime import EntityPropertyBuilder
 from gui.mods.offline_lan_0922.projectile_manager import InFlightProjectiles
 from gui.mods.offline_lan_0922.projectile_runtime import (
-    PROJECTILE_BROADPHASE_RADIUS, lerp3, point_segment_distance_sq,
-    trajectory_position)
+    PROJECTILE_BROADPHASE_RADIUS, lerp3, point_in_expanded_segment_bounds,
+    point_segment_distance_sq, trajectory_position)
 from gui.mods.offline_lan_0922.snapshot_sync import SnapshotSync
 from gui.mods.offline_lan_0922.spawn_planner import SpawnPlanner
 from gui.mods.offline_lan_0922 import (
@@ -61,8 +61,11 @@ CRITICAL_REPAIR_NETWORK_SECONDS = 1.0
 PROJECTILE_PROGRESS_SECONDS = 0.10
 PROJECTILE_MAX_TIME_MS = 20000
 PROJECTILE_MAX_ACTIVE = 128
-PROJECTILE_CHORDS_PER_FRAME = 128
+PROJECTILE_CHORDS_PER_FRAME = 32
 PROJECTILE_MAX_CHORDS_PER_FRAME = 256
+# Size the fair global budget for the observed low-FPS boundary without ever
+# exceeding the previous release's 256-chord hard cap.
+PROJECTILE_SUSTAIN_SECONDS = 1.0 / 15.0
 ARTILLERY_ARC_RAYS_PER_FRAME = 4
 STANDARD_GAMEPLAY = 'ctf'
 PREBATTLE_SECONDS = 15.0
@@ -110,6 +113,9 @@ _FRAME_STAGE_NAMES = (
     'house', 'sync', 'critical', 'drown', 'transition', 'local',
     'outline', 'bots_update', 'bot_present', 'bot_events', 'spot', 'lock',
     'schedule', 'diag_emit')
+_PROJECTILE_METRIC_NAMES = (
+    'active', 'chords', 'debt', 'advance', 'terminals', 'scans',
+    'candidates')
 
 
 class _FrameDiagnostics(object):
@@ -150,6 +156,10 @@ class _FrameDiagnostics(object):
             (name, 0.0) for name in PROBE_KINDS)
         self._probe_duration_maxima = dict(
             (name, 0.0) for name in PROBE_KINDS)
+        self._projectile_sums = dict(
+            (name, 0.0) for name in _PROJECTILE_METRIC_NAMES)
+        self._projectile_maxima = dict(
+            (name, 0.0) for name in _PROJECTILE_METRIC_NAMES)
         self._slow = []
         self._over_50 = 0
         self._over_67 = 0
@@ -235,6 +245,12 @@ class _FrameDiagnostics(object):
             self._probe_duration_sums[name] += duration
             self._probe_duration_maxima[name] = max(
                 self._probe_duration_maxima[name], duration)
+        projectile = row.get('projectile') or {}
+        for name in _PROJECTILE_METRIC_NAMES:
+            value = max(0.0, float(projectile.get(name, 0.0)))
+            self._projectile_sums[name] += value
+            self._projectile_maxima[name] = max(
+                self._projectile_maxima[name], value)
         self._last_context = dict(row.get('context') or {})
         score = (gap, execution)
         inserted = False
@@ -306,10 +322,33 @@ class _FrameDiagnostics(object):
                 self._milliseconds(self._probe_duration_maxima[name])))
         lines.append(prefix + 'probe_ms_avg_max ' +
                      ' '.join(probe_duration_values) + '\n')
+        lines.append(
+            (prefix +
+             'projectile_avg_max active=%.2f/%.0f chords=%.2f/%.0f '
+             'debt_ms=%.3f/%.3f advance_ms=%.3f/%.3f '
+             'terminal=%.2f/%.0f scans=%.2f/%.0f '
+             'candidates=%.2f/%.0f\n') % (
+                 self._projectile_sums['active'] / samples,
+                 self._projectile_maxima['active'],
+                 self._projectile_sums['chords'] / samples,
+                 self._projectile_maxima['chords'],
+                 self._milliseconds(
+                     self._projectile_sums['debt'] / samples),
+                 self._milliseconds(self._projectile_maxima['debt']),
+                 self._milliseconds(
+                     self._projectile_sums['advance'] / samples),
+                 self._milliseconds(self._projectile_maxima['advance']),
+                 self._projectile_sums['terminals'] / samples,
+                 self._projectile_maxima['terminals'],
+                 self._projectile_sums['scans'] / samples,
+                 self._projectile_maxima['scans'],
+                 self._projectile_sums['candidates'] / samples,
+                 self._projectile_maxima['candidates']))
         for rank, row in enumerate(self._slow, 1):
             stages = row['stages']
             probes = row['probes']
             probe_durations = row.get('probe_durations', {})
+            projectile = row.get('projectile') or {}
             context = row.get('context') or {}
             lines.append(
                 (prefix +
@@ -320,7 +359,7 @@ class _FrameDiagnostics(object):
                  'pose_step_m=%.4f speed_mps=%.3f camera_mps=%.3f '
                  'airborne=%d grind=%d bots=%d outgoing=%d '
                  'transition=%d prev_emit=%d '
-                 'stages_ms=%s probes=%s probe_ms=%s\n') % (
+                 'projectile=%s stages_ms=%s probes=%s probe_ms=%s\n') % (
                      rank, row['cause'], row['next'],
                      self._milliseconds(row['wall_gap']),
                      row['raw_dt'] * 1000.0,
@@ -338,6 +377,17 @@ class _FrameDiagnostics(object):
                      int(context.get('outgoing_count', 0)),
                      int(bool(context.get('transitioned'))),
                      int(bool(row.get('emitted'))),
+                     ('active:%d,chords:%d,debt_ms:%.3f,'
+                      'advance_ms:%.3f,terminal:%d,scans:%d,'
+                      'candidates:%d') % (
+                          int(projectile.get('active', 0)),
+                          int(projectile.get('chords', 0)),
+                          self._milliseconds(projectile.get('debt', 0.0)),
+                          self._milliseconds(
+                              projectile.get('advance', 0.0)),
+                          int(projectile.get('terminals', 0)),
+                          int(projectile.get('scans', 0)),
+                          int(projectile.get('candidates', 0))),
                      ','.join('%s:%.3f' % (
                          name, self._milliseconds(stages.get(name, 0.0)))
                               for name in _FRAME_STAGE_NAMES),
@@ -351,7 +401,7 @@ class _FrameDiagnostics(object):
         return ''.join(lines)
 
     def finish(self, frame_id, entry_wall, tick_dt, motion_dt, stages,
-               probes, context, probe_durations=None):
+               probes, context, probe_durations=None, projectile=None):
         if not self.enabled:
             return
         try:
@@ -375,6 +425,7 @@ class _FrameDiagnostics(object):
                 'motion_dt': max(0.0, float(motion_dt)),
                 'stages': stages, 'probes': probes,
                 'probe_durations': dict(probe_durations or {}),
+                'projectile': dict(projectile or {}),
                 'context': dict(context or {}), 'emitted': emitted,
             }
         except Exception:
@@ -733,6 +784,9 @@ class BattleRuntime(object):
         self._projectile_frame_start = 0.0
         self._projectile_frame_end = 0.0
         self._projectile_destructible_context = None
+        self._projectile_perf = {}
+        self._projectile_scan_count = 0
+        self._projectile_candidate_count = 0
         self._artillery = None
 
     def start(self, config, message=None, lan_client=None,
@@ -860,6 +914,9 @@ class BattleRuntime(object):
         self._projectile_frame_start = projectile_now
         self._projectile_frame_end = projectile_now
         self._projectile_destructible_context = None
+        self._projectile_perf = {}
+        self._projectile_scan_count = 0
+        self._projectile_candidate_count = 0
         self._artillery = ArtilleryController()
         self._generation += 1
         self._deadline = self._clock() + float(
@@ -5064,6 +5121,9 @@ class BattleRuntime(object):
             self._projectile_position_history.pop(0)
 
     def _advance_projectiles(self, now):
+        self._projectile_perf = {}
+        self._projectile_scan_count = 0
+        self._projectile_candidate_count = 0
         if self._projectiles is None:
             return False
         self._flush_pending_projectile_resolutions()
@@ -5082,12 +5142,26 @@ class BattleRuntime(object):
         self._projectile_frame_end = max(
             self._projectile_frame_start, float(now))
         active = len(self._projectiles)
-        chord_budget = max(
-            PROJECTILE_CHORDS_PER_FRAME,
-            min(PROJECTILE_MAX_CHORDS_PER_FRAME, active * 2))
+        sustainable = self._projectiles.sustainable_chord_budget(
+            PROJECTILE_SUSTAIN_SECONDS)
+        chord_budget = min(
+            PROJECTILE_MAX_CHORDS_PER_FRAME,
+            max(PROJECTILE_CHORDS_PER_FRAME, active * 2, sustainable))
+        advance_start = _PROFILE_CLOCK()
         advanced = self._projectiles.advance(
             now, self._projectile_chord, self._projectile_terminal,
             maximum_chords=chord_budget)
+        advance_seconds = max(0.0, _PROFILE_CLOCK() - advance_start)
+        metrics = self._projectiles.last_advance_metrics()
+        self._projectile_perf = {
+            'active': metrics.get('active', active),
+            'chords': metrics.get('chords', 0),
+            'debt': metrics.get('debt_after', 0.0),
+            'advance': advance_seconds,
+            'terminals': metrics.get('terminals', 0),
+            'scans': self._projectile_scan_count,
+            'candidates': self._projectile_candidate_count,
+        }
         self._prune_projectile_position_history()
         self._projectile_target_positions = current
         if now >= self._next_projectile_progress_time:
@@ -5119,11 +5193,8 @@ class BattleRuntime(object):
         nearest_query = None
         broadphase_sq = PROJECTILE_BROADPHASE_RADIUS ** 2
         for key, record in tuple(self._records.items()):
+            self._projectile_scan_count += 1
             if key == source_key or record.get('tombstone'):
-                continue
-            target = self._server_entity(record.get('engine_id'))
-            if (target is None or not getattr(target, 'isStarted', False) or
-                    not self._record_alive(record, target)):
                 continue
             current_position = self._projectile_current_positions.get(key)
             if current_position is None:
@@ -5138,9 +5209,18 @@ class BattleRuntime(object):
             adjusted_end = tuple(
                 float(end[index]) + float(current_position[index]) -
                 float(target_at_end[index]) for index in range(3))
+            if not point_in_expanded_segment_bounds(
+                    current_position, adjusted_start, adjusted_end,
+                    PROJECTILE_BROADPHASE_RADIUS):
+                continue
             if point_segment_distance_sq(
                     current_position, adjusted_start,
                     adjusted_end) > broadphase_sq:
+                continue
+            self._projectile_candidate_count += 1
+            target = self._server_entity(record.get('engine_id'))
+            if (target is None or not getattr(target, 'isStarted', False) or
+                    not self._record_alive(record, target)):
                 continue
             query_start = self._vector(adjusted_start)
             query_end = self._vector(adjusted_end)
@@ -5563,6 +5643,7 @@ class BattleRuntime(object):
         transitioned = False
         outgoing_messages = ()
         bot_count = 0
+        projectile_perf = {}
         boundary = entry_wall
         try:
             self._flush_pending_bot_create(now)
@@ -5697,6 +5778,7 @@ class BattleRuntime(object):
                     (self._projectile_is_authority() or
                      self._projectile_visual_meta)):
                 self._advance_projectiles(now)
+                projectile_perf = dict(self._projectile_perf)
             if profiling:
                 next_boundary = _PROFILE_CLOCK()
                 stages['bot_events'] = max(0.0, next_boundary - boundary)
@@ -5754,7 +5836,8 @@ class BattleRuntime(object):
                     'airborne': bool(self._local_airborne),
                     'grind': int(self._local_grind),
                     'transitioned': transitioned,
-                }, probe_durations=probe_durations)
+                }, probe_durations=probe_durations,
+                projectile=projectile_perf)
 
     def _mutable_shot_ray(self):
         """Copy #1513's native gun ray before normalising or scattering it."""

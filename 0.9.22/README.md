@@ -118,10 +118,12 @@ assignment, the load barrier or server authority.
 
 Version `0.3.72` gives every player and authority-Bot shell real elapsed flight
 instead of resolving a full-range ray at fire time. One shared projectile
-runtime advances the gravity curve in collision chords of at most 25 ms and
-sweeps moving vehicles over each matching interval. A target can therefore
-move out of the path after launch, and moving-target fire must use a lead
-solution. Local and relayed tracers consume the same canonical launch data.
+runtime advances the gravity curve in chronological collision chords and
+sweeps moving vehicles over each matching interval. The current runtime adapts
+each chord up to 50 ms while bounding parabola-to-chord sagitta to 5 cm. A
+target can therefore move out of the path after launch, and moving-target fire
+must use a lead solution. Local and relayed tracers consume the same canonical
+launch data.
 
 The v5 LAN boundary now requires `projectile_ledger_v1`. The server retains
 each accepted launch, its monotonic checked-through cursor, active-projectile
@@ -307,9 +309,11 @@ when that vehicle's swept OBB intersects the exact item's transformed BSMO
 OBB. Both the dynamic and native-material paths use #1513's stock
 mass/speed/health kinetic gate and real item scale. Fragile and structure
 acceptance starts the stock 0.2-second hiding interval, during which motion
-remains blocked. Falling objects instead keep an exact OBB synchronized to the
-native animator matrix and retain their final fallen collision pose. After a
-hide interval, the static world ray and any backing geometry remain authoritative,
+remains blocked. Falling objects keep the catalog OBB synchronized to the
+native animator only until its first touchdown callback. The coarse OBB is
+then retired, while the native moving/final BSP, static world ray and ground
+support remain authoritative. After any hiding interval, the static world ray
+and any backing geometry remain authoritative,
 so an unknown, stale, ambiguous, under-threshold or still-solid object is not
 made passable merely because a destruction result entered the LAN ledger. The
 legacy 0.8.2 object-origin proximity destroy workaround is intentionally not
