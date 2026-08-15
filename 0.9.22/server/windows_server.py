@@ -47,9 +47,10 @@ def _windows_firewall_rule_exists(rule_name, runner=None,
         powershell_path = _windows_system_path(
             r"WindowsPowerShell\v1.0\powershell.exe")
     script = (
-        "$rule = Get-NetFirewallRule -DisplayName %s -Direction Inbound "
-        "-Enabled True -Action Allow -ErrorAction SilentlyContinue | "
-        "Select-Object -First 1; "
+        "$rule = Get-NetFirewallRule -DisplayName %s "
+        "-ErrorAction SilentlyContinue | Where-Object { "
+        "$_.Direction -eq 'Inbound' -and $_.Enabled -eq 'True' -and "
+        "$_.Action -eq 'Allow' } | Select-Object -First 1; "
         "if ($null -eq $rule) { exit 1 }; exit 0"
     ) % _powershell_single_quote(rule_name)
     result = runner(

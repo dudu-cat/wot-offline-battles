@@ -178,10 +178,11 @@ jobs:
               while ((Get-Date) -lt $ruleDeadline) {
                   $firewallRule = Get-NetFirewallRule `
                       -DisplayName $firewallRuleName `
-                      -Direction Inbound `
-                      -Enabled True `
-                      -Action Allow `
-                      -ErrorAction SilentlyContinue | Select-Object -First 1
+                      -ErrorAction SilentlyContinue | Where-Object {
+                          $_.Direction -eq "Inbound" -and
+                          $_.Enabled -eq "True" -and
+                          $_.Action -eq "Allow"
+                      } | Select-Object -First 1
                   if ($null -ne $firewallRule) {
                       break
                   }

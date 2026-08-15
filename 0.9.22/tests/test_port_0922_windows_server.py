@@ -127,7 +127,14 @@ class WindowsServerLauncherTests(unittest.TestCase):
 
         args, kwargs = runner.call_args
         self.assertEqual(powershell_path, args[0][0])
-        self.assertIn(rule_name, args[0][-1])
+        script = args[0][-1]
+        self.assertIn(rule_name, script)
+        self.assertIn("$_.Direction -eq 'Inbound'", script)
+        self.assertIn("$_.Enabled -eq 'True'", script)
+        self.assertIn("$_.Action -eq 'Allow'", script)
+        self.assertNotIn('-Direction Inbound', script)
+        self.assertNotIn('-Enabled True', script)
+        self.assertNotIn('-Action Allow', script)
         self.assertEqual(5.0, kwargs['timeout'])
 
     def test_uac_cancellation_is_nonfatal(self):
@@ -222,6 +229,10 @@ class WindowsServerLauncherTests(unittest.TestCase):
         self.assertIn('Get-NetFirewallApplicationFilter', workflow)
         self.assertIn('Get-NetFirewallPortFilter', workflow)
         self.assertIn('Remove-NetFirewallRule', workflow)
+        self.assertIn('$_.Direction -eq "Inbound"', workflow)
+        self.assertNotIn('-Direction Inbound', workflow)
+        self.assertNotIn('-Enabled True', workflow)
+        self.assertNotIn('-Action Allow', workflow)
         self.assertIn(
             'Packaged server did not create its firewall rule', workflow)
         self.assertIn(
