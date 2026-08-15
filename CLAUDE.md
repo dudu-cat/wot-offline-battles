@@ -2,8 +2,8 @@
 
 This file contains repository-specific working knowledge that is not obvious
 from the implementation. Read it before changing the repository. When working
-under `0.9.22/`, also read `0.9.22/CLAUDE.md` before investigating or editing
-that port.
+under a client version, also read its version-local guide before investigating
+or editing that implementation: `0.8.2/CLAUDE.md` or `0.9.22/CLAUDE.md`.
 
 ## Working with Peng
 
@@ -57,7 +57,9 @@ committed; remove only exact generated targets after verifying what they are.
 ## Keep the two client lines separate
 
 - `0.8.2/` targets its own client and Python 2.6 runtime. Its code, package,
-  tests, and native-physics boundary are version-local.
+  tests, and native-physics boundary are version-local. Follow
+  `0.8.2/CLAUDE.md` for its legacy-runtime, collision, streaming, and package
+  workflow.
 - `0.9.22/` targets only Chinese HD client `0.9.22.0.1 #1513`, x86, with an
   embedded Python 2.7 runtime. Follow `0.9.22/CLAUDE.md` for its exact-client
   workflow.
@@ -94,6 +96,17 @@ owns memory safely, or feels identical to retail.
 Avoid copying facts that already have an owner:
 
 - Root `README.md`: product and installation overview.
+- `0.8.2/README.md`: 0.8.2 behavior, source installation, settings, and LAN
+  overview.
+- `0.8.2/START_NATIVE_TEST_HERE.txt`: current native experiment identity,
+  change history, and Windows acceptance targets.
+- `0.8.2/LAN_SERVER.md`: current LAN protocol boundary, operation, and
+  diagnostics.
+- `0.8.2/PERFORMANCE_TEST.txt`: current client/server metric definitions and
+  performance acceptance procedure.
+- `0.8.2/VERSION.txt`: current 0.8.2 package and client/server build identity.
+- `0.8.2/tools/package_native_experiment.py`: machine-enforced 0.8.2 package
+  contents and archive audit.
 - `0.9.22/README.md`: port behavior and build entry points. Its older version
   sections are history, not necessarily the current behavior.
 - `0.9.22/COMPATIBILITY_REVIEW.md`: exact-client interfaces and reviewed
