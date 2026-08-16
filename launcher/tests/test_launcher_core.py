@@ -5,6 +5,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import zipfile
 
 import core
 import server_imports
@@ -278,39 +279,48 @@ class ClientInstallTest(unittest.TestCase):
         with open(os.path.join(self.game, *relative_path.split("/"))) as stream:
             return stream.read()
 
-    def _stage_0_8_2(self):
-        root = os.path.join(self.payload, core.CLIENT_PAYLOAD_DIR, "0.8.2")
-        self._write(root, "scripts/client/gui/mods/mod_offhangar.py", "new")
-        self._write(root, "gui/maps/icons/offhangar/pixel.dds", "new")
-        return root
+    def _archive(self, port_version, members):
+        directory = os.path.join(self.payload, core.CLIENT_PAYLOAD_DIR)
+        if not os.path.isdir(directory):
+            os.makedirs(directory)
+        path = os.path.join(directory, "%s.zip" % port_version)
+        with zipfile.ZipFile(path, "w") as archive:
+            for member, content in members.items():
+                archive.writestr(member, content)
+        return path
 
-    def _stage_0_9_22(self):
-        root = os.path.join(self.payload, core.CLIENT_PAYLOAD_DIR, "0.9.22")
-        self._write(root, "mods/0.9.22.0.1/new.wotmod", "new")
-        self._write(root, "mods/configs/offline_lan_0922/navgraphs/a.json", "new")
-        self._write(root, "mods/configs/offline_lan_0922/foliage/a.py", "new")
-        self._write(root, "mods/configs/offline_lan_0922/destructibles/a.py",
-                    "new")
-        self._write(root, "mods/configs/offline_lan_0922/config.json", "new")
-        return root
+    def _stage_0_8_2(self, content="new"):
+        return self._archive("0.8.2", {
+            "res_mods/0.8.2/scripts/client/CameraNode.pyc": content,
+            "res_mods/0.8.2/scripts/client/gui/mods/mod_offhangar.py": content,
+            "res_mods/0.8.2/gui/maps/icons/offhangar/pixel.dds": content,
+        })
+
+    def _stage_0_9_22(self, content="new"):
+        return self._archive("0.9.22", {
+            "mods/0.9.22.0.1/org.peng.offline_lan_0922_9.9.9.wotmod": content,
+            "mods/configs/offline_lan_0922/navgraphs/a.json": content,
+            "mods/configs/offline_lan_0922/config.json": content,
+        })
 
     def test_0_8_2_install_replaces_the_whole_mod_directory(self):
         self._stage_0_8_2()
-        self._write(self.game, "res_mods/0.8.2/scripts/client/gui/mods/"
-                               "mod_offhangar.pyc", "stale")
         self._write(self.game, "res_mods/0.8.2/leftover.txt", "stale")
         actions = core.install_client_mod(self.game, core.PORT_0_8_2,
                                           self.payload)
         self.assertFalse(os.path.exists(
             os.path.join(self.game, "res_mods", "0.8.2", "leftover.txt")))
-        self.assertEqual(
-            "new", self._read("res_mods/0.8.2/scripts/client/gui/mods/"
-                              "mod_offhangar.py"))
-        self.assertTrue(os.path.isfile(os.path.join(
-            self.game, "res_mods", "0.8.2", "gui", "maps", "icons",
-            "offhangar", "pixel.dds")))
-        self.assertTrue(any("res_mods/0.8.2/scripts" in action
+        self.assertEqual("new", self._read(
+            "res_mods/0.8.2/scripts/client/gui/mods/mod_offhangar.py"))
+        self.assertTrue(any("Removed the old" in action
                             for action in actions))
+
+    def test_0_8_2_install_carries_the_loader_bytecode(self):
+        self._stage_0_8_2()
+        core.install_client_mod(self.game, core.PORT_0_8_2, self.payload)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.game, "res_mods", "0.8.2", "scripts", "client",
+            "CameraNode.pyc")))
 
     def test_0_8_2_install_keeps_the_user_directory(self):
         self._stage_0_8_2()
@@ -323,16 +333,12 @@ class ClientInstallTest(unittest.TestCase):
         self._write(self.game,
                     "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.1.0.wotmod",
                     "stale")
-        self._write(self.game,
-                    "mods/configs/offline_lan_0922/navgraphs/old.json", "stale")
         core.install_client_mod(self.game, core.PORT_0_9_22, self.payload)
         self.assertFalse(os.path.exists(os.path.join(
             self.game, "mods", "0.9.22.0.1",
             "org.peng.offline_lan_0922_0.1.0.wotmod")))
-        self.assertEqual("new", self._read("mods/0.9.22.0.1/new.wotmod"))
-        self.assertFalse(os.path.exists(os.path.join(
-            self.game, "mods", "configs", "offline_lan_0922", "navgraphs",
-            "old.json")))
+        self.assertEqual("new", self._read(
+            "mods/0.9.22.0.1/org.peng.offline_lan_0922_9.9.9.wotmod"))
 
     def test_0_9_22_install_keeps_another_authors_mod(self):
         self._stage_0_9_22()
@@ -341,37 +347,62 @@ class ClientInstallTest(unittest.TestCase):
         self.assertEqual("theirs",
                          self._read("mods/0.9.22.0.1/com.other.mod.wotmod"))
 
-    def test_0_9_22_install_keeps_the_saved_endpoint_and_configuration(self):
+    def test_0_9_22_install_keeps_the_saved_settings(self):
         self._stage_0_9_22()
         self._write(self.game,
                     "mods/configs/offline_lan_0922/server_endpoint.json", "mine")
         self._write(self.game, "mods/configs/offline_lan_0922/config.json",
                     "mine")
-        self._write(self.game,
-                    "mods/configs/offline_lan_0922/account_state.json", "mine")
         core.install_client_mod(self.game, core.PORT_0_9_22, self.payload)
-        self.assertEqual(
-            "mine", self._read("mods/configs/offline_lan_0922/"
-                               "server_endpoint.json"))
-        self.assertEqual(
-            "mine", self._read("mods/configs/offline_lan_0922/config.json"))
-        self.assertEqual(
-            "mine", self._read("mods/configs/offline_lan_0922/"
-                               "account_state.json"))
+        self.assertEqual("mine", self._read(
+            "mods/configs/offline_lan_0922/server_endpoint.json"))
+        self.assertEqual("mine", self._read(
+            "mods/configs/offline_lan_0922/config.json"))
 
     def test_0_9_22_install_writes_a_missing_configuration(self):
         self._stage_0_9_22()
         core.install_client_mod(self.game, core.PORT_0_9_22, self.payload)
-        self.assertEqual(
-            "new", self._read("mods/configs/offline_lan_0922/config.json"))
+        self.assertEqual("new", self._read(
+            "mods/configs/offline_lan_0922/config.json"))
+
+    def test_the_same_package_is_not_installed_twice(self):
+        self._stage_0_8_2()
+        core.install_client_mod(self.game, core.PORT_0_8_2, self.payload)
+        self._write(self.game, "res_mods/0.8.2/leftover.txt", "kept")
+
+        actions = core.install_client_mod(self.game, core.PORT_0_8_2,
+                                          self.payload)
+
+        self.assertEqual(["The 0.8.2 mod is already up to date."], actions)
+        self.assertEqual("kept", self._read("res_mods/0.8.2/leftover.txt"))
+
+    def test_a_new_package_replaces_the_installed_one(self):
+        self._stage_0_8_2()
+        core.install_client_mod(self.game, core.PORT_0_8_2, self.payload)
+        self._stage_0_8_2(content="newer")
+
+        core.install_client_mod(self.game, core.PORT_0_8_2, self.payload)
+
+        self.assertEqual("newer", self._read(
+            "res_mods/0.8.2/scripts/client/gui/mods/mod_offhangar.py"))
+
+    def test_a_forced_install_ignores_the_marker(self):
+        self._stage_0_8_2()
+        core.install_client_mod(self.game, core.PORT_0_8_2, self.payload)
+        self._write(self.game, "res_mods/0.8.2/leftover.txt", "stale")
+
+        core.install_client_mod(self.game, core.PORT_0_8_2, self.payload,
+                                force=True)
+
+        self.assertFalse(os.path.exists(
+            os.path.join(self.game, "res_mods", "0.8.2", "leftover.txt")))
 
     def test_a_launcher_without_mod_files_reports_it(self):
         self.assertRaises(core.LauncherError, core.install_client_mod,
                           self.game, core.PORT_0_8_2, self.payload)
 
-    def test_an_incomplete_bundle_reports_it(self):
-        root = os.path.join(self.payload, core.CLIENT_PAYLOAD_DIR, "0.8.2")
-        self._write(root, "scripts/client/gui/mods/mod_offhangar.py", "new")
+    def test_a_member_outside_the_game_folder_is_refused(self):
+        self._archive("0.8.2", {"../escape.txt": "no"})
         self.assertRaises(core.LauncherError, core.install_client_mod,
                           self.game, core.PORT_0_8_2, self.payload)
 
@@ -416,14 +447,21 @@ class PayloadStagingTest(unittest.TestCase):
                 stream.write("x")
         target = os.path.join(source, "staged")
         stage_payload.stage_clients(target, source)
-        for relative in (
-                ("0.8.2", "scripts", "client", "a.py"),
-                ("0.8.2", "gui", "maps", "a.dds"),
-                ("0.9.22", "mods", "0.9.22.0.1", "a.wotmod"),
-                ("0.9.22", "mods", "configs", "offline_lan_0922",
-                 "config.json")):
-            self.assertTrue(os.path.isfile(os.path.join(target, *relative)),
-                            relative)
+        expected = {
+            "0.8.2": ("res_mods/0.8.2/scripts/client/a.py",
+                      "res_mods/0.8.2/gui/maps/a.dds"),
+            "0.9.22": ("mods/0.9.22.0.1/a.wotmod",
+                       "mods/configs/offline_lan_0922/config.json"),
+        }
+        for port_version, members in expected.items():
+            archive = zipfile.ZipFile(
+                os.path.join(target, "%s.zip" % port_version))
+            try:
+                names = set(archive.namelist())
+            finally:
+                archive.close()
+            for member in members:
+                self.assertIn(member, names)
 
     def test_client_staging_without_a_built_package_reports_it(self):
         source = tempfile.mkdtemp()

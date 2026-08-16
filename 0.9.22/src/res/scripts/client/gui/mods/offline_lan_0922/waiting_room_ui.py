@@ -69,6 +69,13 @@ class NativeSurface(object):
     def add_root(self, component):
         self._gui.addRoot(component)
 
+    def show_cursor(self, visible):
+        """Show the native pointer while this room owns the mouse."""
+        cursor = self._gui.mcursor()
+        previous = bool(getattr(cursor, 'visible', False))
+        cursor.visible = bool(visible)
+        return previous
+
     def remove_root(self, component):
         self._gui.delRoot(component)
 
@@ -124,6 +131,7 @@ class WaitingRoomUI(object):
         self._hovered = None
         self._selected_map = None
         self._message = ''
+        self._restore_cursor = False
 
     def install(self):
         """Build the native components without showing them."""
@@ -142,7 +150,7 @@ class WaitingRoomUI(object):
         self._set(panel, 'verticalAnchor', 'CENTER')
         self._set(panel, 'width', 680)
         self._set(panel, 'height', 300)
-        self._set(panel, 'materialFX', 'SOLID')
+        self._set(panel, 'materialFX', 'BLEND')
         self._set(panel, 'colour', (5, 12, 20, 245))
         self._set(panel, 'position', (0.0, 0.0, OVERLAY_Z))
         # The children own every mouse target, matching the reviewed 0.8.2 room.
@@ -177,6 +185,16 @@ class WaitingRoomUI(object):
                          colour=(184, 205, 222, 255))
         return True
 
+    def _show_cursor(self, visible):
+        show = getattr(self._surface, 'show_cursor', None)
+        if not callable(show):
+            return False
+        try:
+            return bool(show(visible))
+        except Exception as error:
+            _log('LAN waiting room could not change the cursor: %s' % error)
+            return False
+
     @staticmethod
     def _set(component, name, value):
         setattr(component, name, value)
@@ -196,7 +214,7 @@ class WaitingRoomUI(object):
                 ('widthMode', 'CLIP'), ('heightMode', 'CLIP'),
                 ('horizontalAnchor', 'CENTER'), ('verticalAnchor', 'CENTER'),
                 ('position', position), ('width', width), ('height', height),
-                ('materialFX', 'SOLID'), ('colour', (24, 55, 78, 245)),
+                ('materialFX', 'BLEND'), ('colour', (24, 55, 78, 245)),
                 ('focus', True), ('mouseButtonFocus', True),
                 ('crossFocus', True), ('moveFocus', True),
                 ('visible', False)):
@@ -247,6 +265,7 @@ class WaitingRoomUI(object):
         self._open = True
         self._surface.add_root(self._panel)
         self._surface.resort()
+        self._restore_cursor = self._show_cursor(True)
         self.refresh()
         _log('LAN waiting room opened')
         return True
@@ -358,6 +377,7 @@ class WaitingRoomUI(object):
             return False
         self._open = False
         self._hovered = None
+        self._show_cursor(self._restore_cursor)
         self._set(self._panel, 'visible', False)
         self._surface.remove_root(self._panel)
         _log('LAN waiting room closed')

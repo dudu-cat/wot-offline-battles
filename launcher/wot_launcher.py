@@ -152,6 +152,7 @@ class LauncherWindow(object):
     def _refresh_mode(self):
         state = "normal" if self.mode.get() == core.MODE_JOIN else "disabled"
         self.join_entry.config(state=state)
+        self.test_button.config(state=state)
 
     def _test_connection(self):
         mode = self.mode.get()
@@ -189,8 +190,20 @@ class LauncherWindow(object):
         self._busy = busy
         self.root.after(
             0, lambda: self.start_button.config(
-                state="disabled" if busy else "normal",
-                text="Game is running" if busy else "Start game"))
+                state="normal",
+                text="Kill the game" if busy else "Start game"))
+
+    def _kill_game(self):
+        """Close a game that did not exit on its own."""
+        self._log("Closing every %s process..." % core.GAME_EXECUTABLE)
+        game = self._game
+        if game is not None and game.poll() is None:
+            try:
+                game.kill()
+            except Exception as error:
+                self._log("Could not close the started process: %s" % error)
+        core.kill_game()
+        return True
 
     def _save_settings(self):
         core.save_settings({
@@ -203,6 +216,7 @@ class LauncherWindow(object):
 
     def _start(self):
         if self._busy:
+            self._kill_game()
             return
         status = self._refresh_client()
         try:

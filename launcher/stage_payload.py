@@ -14,6 +14,7 @@ import glob
 import os
 import shutil
 import sys
+import zipfile
 
 SERVER_DIR = "servers"
 CLIENT_DIR = "client"
@@ -39,9 +40,10 @@ PAYLOAD_TREES = {
     "0.9.22": ("src/res/scripts/client/gui/mods/offline_lan_0922",),
 }
 
-# Client mod trees, as (source directory, directory inside the payload).
+# Client mod trees, as (source directory, path inside the game folder).
 CLIENT_TREES = {
-    "0.8.2": (("scripts", "scripts"), ("gui", "gui")),
+    "0.8.2": (("scripts", "res_mods/0.8.2/scripts"),
+              ("gui", "res_mods/0.8.2/gui")),
     "0.9.22": (("mods", "mods"),),
 }
 
@@ -117,7 +119,10 @@ def stage_servers(target_root, source_root=None):
 
 
 def stage_clients(target_root, source_root=None, client_0922=None):
+    """Write one archive per port, with members relative to the game folder."""
     source_root = source_root or repository_root()
+    if not os.path.isdir(target_root):
+        os.makedirs(target_root)
     written = []
     for port_version, trees in CLIENT_TREES.items():
         if port_version == "0.9.22" and client_0922 is not None:
@@ -128,14 +133,29 @@ def stage_clients(target_root, source_root=None, client_0922=None):
             raise ValueError(
                 "no installable client mod for %s; build it first" %
                 port_version)
-        for source_relative, target_relative in trees:
-            source = os.path.join(port_source, *source_relative.split("/"))
-            if not os.path.isdir(source):
-                raise ValueError("client mod is incomplete: %s/%s" %
-                                 (port_version, source_relative))
-            target = os.path.join(target_root, port_version,
-                                  *target_relative.split("/"))
-            written.extend(_copy_tree(source, target, keep_bytecode=True))
+        archive_path = os.path.join(target_root, "%s.zip" % port_version)
+        archive = zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED)
+        try:
+            for source_relative, target_relative in trees:
+                source = os.path.join(port_source, *source_relative.split("/"))
+                if not os.path.isdir(source):
+                    raise ValueError("client mod is incomplete: %s/%s" %
+                                     (port_version, source_relative))
+                for directory, directories, names in os.walk(source):
+                    directories[:] = [name for name in directories
+                                      if name != "__pycache__"]
+                    for name in sorted(names):
+                        if name in SKIPPED_CLIENT_FILES:
+                            continue
+                        source_path = os.path.join(directory, name)
+                        member = "/".join(
+                            [target_relative] +
+                            os.path.relpath(
+                                source_path, source).split(os.path.sep))
+                        archive.write(source_path, member)
+        finally:
+            archive.close()
+        written.append(archive_path)
     return written
 
 

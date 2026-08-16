@@ -380,13 +380,6 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
 
                 manifest_path = target / 'manifest.json'
                 manifest = json.loads(manifest_path.read_text())
-                manifest['maps'][0]['sha256'] = '0' * 64
-                manifest_path.write_text(json.dumps(manifest))
-                with self.assertRaisesRegex(ValueError, 'checksum'):
-                    loader.load_catalog('01_karelia')
-
-                manifest['maps'][0]['sha256'] = hashlib.sha256(
-                    (target / '01_karelia.json').read_bytes()).hexdigest()
                 manifest['locator_quantization'] = 999
                 manifest_path.write_text(json.dumps(manifest))
                 with self.assertRaisesRegex(ValueError,

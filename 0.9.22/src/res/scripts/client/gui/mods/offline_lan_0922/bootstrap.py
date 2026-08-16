@@ -14,6 +14,7 @@ _callback_id = None
 _started = False
 _session = None
 _announcement_ui = None
+_intro_skip = None
 _config = None
 _account_context = None
 _deadline = 0.0
@@ -237,7 +238,7 @@ def _remove_lobby_listener():
 def _cleanup_runtime():
     global _account_context, _callback_id, _config, _deadline
     global _lobby_listener_installed, _lobby_view_loaded
-    global _announcement_ui, _login_space_seen, _session, _started
+    global _announcement_ui, _intro_skip, _login_space_seen, _session, _started
     errors = []
 
     callback_id = _callback_id
@@ -256,6 +257,14 @@ def _cleanup_runtime():
             # Do not create a fresh Account and start lobby coroutines only to
             # destroy it immediately in the next cleanup stage.
             session.stop(show_login=False, restore_account=False)
+        except Exception as error:
+            errors.append(error)
+
+    intro_skip = _intro_skip
+    _intro_skip = None
+    if intro_skip is not None:
+        try:
+            intro_skip.uninstall()
         except Exception as error:
             errors.append(error)
 
@@ -362,6 +371,24 @@ def _install_lan_session():
     return True
 
 
+def _install_intro_skip():
+    """Skip the startup video so the client reaches the login screen."""
+    global _intro_skip
+    if _intro_skip is not None:
+        return _intro_skip
+    try:
+        from gui.mods.offline_lan_0922.lobby_ui import IntroVideoSkip
+        intro_skip = IntroVideoSkip()
+        intro_skip.install()
+    except Exception as error:
+        # The startup video is presentation only. Never let it stop startup.
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] the startup video stays: %s\n' % error)
+        return None
+    _intro_skip = intro_skip
+    return intro_skip
+
+
 def _install_announcement_ui():
     """Own only the stock CN automatic server-announcement window."""
     global _announcement_ui
@@ -462,6 +489,7 @@ def init():
         return
     _started = True
     try:
+        _install_intro_skip()
         _install_lobby_listener()
         _schedule(0.0, _run_once)
     except Exception as error:

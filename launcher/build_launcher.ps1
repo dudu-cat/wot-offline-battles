@@ -28,16 +28,15 @@ if ($LASTEXITCODE -ne 0) {
 
 foreach ($entry in @("servers\0.8.2\lan_battle_server.py",
                      "servers\0.9.22\server\windows_server.py",
-                     "client\0.8.2\scripts",
-                     "client\0.8.2\gui",
-                     "client\0.9.22\mods")) {
+                     "client\0.8.2.zip",
+                     "client\0.9.22.zip")) {
     if (-not (Test-Path -LiteralPath (Join-Path $PayloadRoot $entry))) {
         throw "Payload is incomplete: $entry"
     }
 }
 
-# A one-folder build keeps the 65 MB payload on disk instead of extracting it
-# on every launch and on every server start.
+# A one-folder build keeps the payload on disk instead of extracting it on
+# every launch and on every server start.
 python -m PyInstaller `
     --noconfirm `
     --clean `

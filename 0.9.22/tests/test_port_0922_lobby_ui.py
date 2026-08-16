@@ -102,5 +102,73 @@ class ServerAnnouncementUITests(unittest.TestCase):
                       _ChinaController.__dict__['onLobbyInited'])
 
 
+class _Module(object):
+    def __init__(self, value):
+        self.isShowStartupVideo = value
+
+
+class IntroVideoSkipTests(unittest.TestCase):
+    def setUp(self):
+        self.module = _load()
+
+    @staticmethod
+    def _stock():
+        return True
+
+    def test_the_startup_video_check_reports_no_video(self):
+        helpers = _Module(self._stock)
+        states = _Module(self._stock)
+        skip = self.module.IntroVideoSkip(runtime=(helpers, states))
+
+        self.assertTrue(skip.install())
+
+        self.assertFalse(helpers.isShowStartupVideo())
+        self.assertFalse(states.isShowStartupVideo())
+
+    def test_uninstall_restores_every_replaced_name(self):
+        helpers = _Module(self._stock)
+        states = _Module(self._stock)
+        skip = self.module.IntroVideoSkip(runtime=(helpers, states))
+        skip.install()
+
+        skip.uninstall()
+
+        self.assertIs(self._stock, helpers.isShowStartupVideo)
+        self.assertIs(self._stock, states.isShowStartupVideo)
+
+    def test_a_module_without_the_check_is_left_alone(self):
+        helpers = _Module(self._stock)
+        other = object()
+        skip = self.module.IntroVideoSkip(runtime=(helpers, other))
+
+        self.assertTrue(skip.install())
+
+        self.assertFalse(helpers.isShowStartupVideo())
+        self.assertFalse(hasattr(other, 'isShowStartupVideo'))
+
+    def test_uninstall_does_not_clobber_another_replacement(self):
+        helpers = _Module(self._stock)
+        skip = self.module.IntroVideoSkip(runtime=(helpers,))
+        skip.install()
+
+        def later(*unused):
+            return True
+
+        helpers.isShowStartupVideo = later
+        skip.uninstall()
+
+        self.assertIs(later, helpers.isShowStartupVideo)
+
+    def test_installing_twice_keeps_one_replacement(self):
+        helpers = _Module(self._stock)
+        skip = self.module.IntroVideoSkip(runtime=(helpers,))
+        skip.install()
+        skip.install()
+
+        skip.uninstall()
+
+        self.assertIs(self._stock, helpers.isShowStartupVideo)
+
+
 if __name__ == '__main__':
     unittest.main()

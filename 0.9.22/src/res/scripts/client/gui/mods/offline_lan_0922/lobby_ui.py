@@ -1,4 +1,6 @@
-"""Small reversible fixes for stock #1513 lobby-only presentation."""
+"""Small reversible fixes for stock #1513 presentation."""
+
+import sys
 
 
 def _auto_announcement_due(controller):
@@ -82,3 +84,54 @@ class ServerAnnouncementUI(object):
             return
         self._installed = False
         self._restore()
+
+
+def _no_startup_video():
+    return False
+
+
+def _load_intro_runtime():
+    """Return the modules that hold this client's startup-video decision."""
+    import helpers
+
+    modules = [helpers]
+    states = sys.modules.get('gui.app_loader.states')
+    if states is not None:
+        modules.append(states)
+    return tuple(modules)
+
+
+class IntroVideoSkip(object):
+    """Send the client straight to the login screen.
+
+    Exact #1513 ``StartState.goNext`` enters ``IntroVideoState`` whenever
+    ``helpers.isShowStartupVideo()`` is true, and that function returns true
+    for a compulsory intro video whatever the player settings say.
+    ``gui/app_loader/states.py`` imports the function by value, so an already
+    imported state module is replaced as well. Uninstall restores every name
+    this adapter replaced.
+    """
+
+    def __init__(self, runtime=None):
+        self._runtime = runtime
+        self._replaced = []
+
+    def install(self):
+        if self._replaced:
+            return True
+        modules = self._runtime or _load_intro_runtime()
+        for module in modules:
+            original = getattr(module, 'isShowStartupVideo', None)
+            if original is None:
+                continue
+            setattr(module, 'isShowStartupVideo', _no_startup_video)
+            self._replaced.append((module, original))
+        return bool(self._replaced)
+
+    def uninstall(self):
+        while self._replaced:
+            module, original = self._replaced.pop()
+            if getattr(module, 'isShowStartupVideo',
+                       None) is _no_startup_video:
+                setattr(module, 'isShowStartupVideo', original)
+        return True

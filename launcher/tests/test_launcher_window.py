@@ -125,13 +125,16 @@ class WindowTest(unittest.TestCase):
     def _log_text(self):
         return "".join(self.window.log_view.lines)
 
-    def test_the_address_field_follows_the_selected_mode(self):
+    def test_the_address_field_and_test_button_follow_the_mode(self):
         self.window.mode.set(core.MODE_JOIN)
         self.window._refresh_mode()
         self.assertEqual(self.window.join_entry.cget("state"), "normal")
-        self.window.mode.set(core.MODE_SINGLE)
-        self.window._refresh_mode()
-        self.assertEqual(self.window.join_entry.cget("state"), "disabled")
+        self.assertEqual(self.window.test_button.cget("state"), "normal")
+        for mode in (core.MODE_SINGLE, core.MODE_HOST):
+            self.window.mode.set(mode)
+            self.window._refresh_mode()
+            self.assertEqual(self.window.join_entry.cget("state"), "disabled")
+            self.assertEqual(self.window.test_button.cget("state"), "disabled")
 
     def test_an_empty_folder_asks_for_the_game_executable(self):
         self.window.game_root.set("")
