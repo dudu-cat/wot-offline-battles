@@ -234,6 +234,8 @@ CLIENT_PAYLOAD_DIR = "client"
 _CLIENT_INSTALL = {
     PORT_0_8_2: {
         "clear": ("res_mods/0.8.2",),
+        "prune": (),
+        "merge": (),
         "replace": (
             ("scripts", "res_mods/0.8.2/scripts"),
             ("gui", "res_mods/0.8.2/gui"),
@@ -241,9 +243,12 @@ _CLIENT_INSTALL = {
         "keep": (),
     },
     PORT_0_9_22: {
-        "clear": ("mods/0.9.22.0.1",),
+        "clear": (),
+        # Other mods may live in the same directory, so only this package's
+        # own files are pruned before the bundled one is copied in.
+        "prune": (("mods/0.9.22.0.1", "org.peng.offline_lan_0922*"),),
+        "merge": (("mods/0.9.22.0.1", "mods/0.9.22.0.1"),),
         "replace": (
-            ("mods/0.9.22.0.1", "mods/0.9.22.0.1"),
             ("mods/configs/offline_lan_0922/navgraphs",
              "mods/configs/offline_lan_0922/navgraphs"),
             ("mods/configs/offline_lan_0922/foliage",
@@ -317,6 +322,15 @@ def install_client_mod(game_root, port_version, base_dir=None):
         if _inside(game_root, target) and os.path.isdir(target):
             shutil.rmtree(target)
             actions.append("Removed the old %s" % relative)
+    for relative, pattern in layout["prune"]:
+        directory = os.path.join(game_root, *relative.split("/"))
+        if not _inside(game_root, directory):
+            continue
+        for path in sorted(glob.glob(os.path.join(directory, pattern))):
+            if os.path.isfile(path):
+                os.unlink(path)
+                actions.append("Removed the old %s" %
+                               os.path.basename(path))
     for source_relative, target_relative in layout["replace"]:
         source = os.path.join(source_root, *source_relative.split("/"))
         target = os.path.join(game_root, *target_relative.split("/"))
@@ -331,6 +345,20 @@ def install_client_mod(game_root, port_version, base_dir=None):
         if parent and not os.path.isdir(parent):
             os.makedirs(parent)
         shutil.copytree(source, target)
+        actions.append("Installed %s" % target_relative)
+    for source_relative, target_relative in layout["merge"]:
+        source = os.path.join(source_root, *source_relative.split("/"))
+        target = os.path.join(game_root, *target_relative.split("/"))
+        if not os.path.isdir(source):
+            raise LauncherError("The bundled mod is incomplete: %s" %
+                                source_relative)
+        if not _inside(game_root, target):
+            raise LauncherError("Refusing to write outside the game folder.")
+        if not os.path.isdir(target):
+            os.makedirs(target)
+        for name in sorted(os.listdir(source)):
+            shutil.copy2(os.path.join(source, name),
+                         os.path.join(target, name))
         actions.append("Installed %s" % target_relative)
     for source_relative, target_relative in layout["keep"]:
         source = os.path.join(source_root, *source_relative.split("/"))

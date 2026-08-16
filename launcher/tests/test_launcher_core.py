@@ -320,16 +320,26 @@ class ClientInstallTest(unittest.TestCase):
 
     def test_0_9_22_install_replaces_old_packages_and_data(self):
         self._stage_0_9_22()
-        self._write(self.game, "mods/0.9.22.0.1/old.wotmod", "stale")
+        self._write(self.game,
+                    "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.1.0.wotmod",
+                    "stale")
         self._write(self.game,
                     "mods/configs/offline_lan_0922/navgraphs/old.json", "stale")
         core.install_client_mod(self.game, core.PORT_0_9_22, self.payload)
         self.assertFalse(os.path.exists(os.path.join(
-            self.game, "mods", "0.9.22.0.1", "old.wotmod")))
+            self.game, "mods", "0.9.22.0.1",
+            "org.peng.offline_lan_0922_0.1.0.wotmod")))
         self.assertEqual("new", self._read("mods/0.9.22.0.1/new.wotmod"))
         self.assertFalse(os.path.exists(os.path.join(
             self.game, "mods", "configs", "offline_lan_0922", "navgraphs",
             "old.json")))
+
+    def test_0_9_22_install_keeps_another_authors_mod(self):
+        self._stage_0_9_22()
+        self._write(self.game, "mods/0.9.22.0.1/com.other.mod.wotmod", "theirs")
+        core.install_client_mod(self.game, core.PORT_0_9_22, self.payload)
+        self.assertEqual("theirs",
+                         self._read("mods/0.9.22.0.1/com.other.mod.wotmod"))
 
     def test_0_9_22_install_keeps_the_saved_endpoint_and_configuration(self):
         self._stage_0_9_22()
