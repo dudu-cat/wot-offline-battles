@@ -234,6 +234,28 @@ class LANSession(object):
             self._open_waiting_picker()
         return True
 
+    def leave_room(self):
+        """Leave the LAN room and return to the garage."""
+        self._picker_open = False
+        self._picker_dismissed = True
+        self._cancel_retry_callback()
+        self._cancel_picker_callback()
+        client = self.client
+        self.client = None
+        if client is not None:
+            client.on_event = None
+            client.stop()
+        self.state = 'ready_to_join'
+        self._host_player_id = None
+        self._waiting_notice_host_id = None
+        self._map_pool = None
+        self._pending_map = None
+        self._start_requested = False
+        self._connection_error_notified = False
+        self._status_notifier(
+            'You left the LAN room. Click Battle! to join again.')
+        return True
+
     def _endpoint_value(self):
         return port_config.format_endpoint(
             self._config.get('host', '127.0.0.1'),
@@ -384,7 +406,7 @@ class LANSession(object):
         try:
             room = self._room_factory(self.request_start, self._map_pool_value,
                                       status=self._room_status,
-                                      on_close=self._on_picker_closed,
+                                      on_close=self.leave_room,
                                       host=self._is_local_host)
             room.install()
         except Exception as error:

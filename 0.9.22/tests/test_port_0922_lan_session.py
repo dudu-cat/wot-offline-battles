@@ -1551,6 +1551,26 @@ class LANSessionRoomTests(unittest.TestCase):
 
         self.assertEqual(2, self.rooms[0].open_calls)
 
+    def test_leaving_the_room_returns_to_the_garage(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+        room = self.rooms[0]
+
+        room.on_close()
+
+        self.assertEqual('ready_to_join', self.session.state)
+        self.assertIsNone(self.session.client)
+        self.assertEqual(1, self.client.stop_calls)
+        self.assertIn('left the LAN room', self.statuses[-1])
+
+    def test_the_battle_button_joins_again_after_leaving(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+        self.rooms[0].on_close()
+
+        self.session.join()
+
+        self.assertEqual(2, len(self.clients))
+        self.assertEqual('connecting', self.session.state)
+
     def test_a_client_without_the_native_gui_uses_the_stock_window(self):
         self.room_error = ImportError('No module named GUI')
 

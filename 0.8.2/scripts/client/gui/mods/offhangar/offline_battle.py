@@ -21116,6 +21116,38 @@ def _step_on_arena_created(player, cmdName):
 		LOG_CURRENT_EXCEPTION()
 
 
+def _open_offline_map_room(player, vehInvID, cmdName, queue_generation):
+	"""Let the player choose the map, or leave, before the battle starts."""
+	def start(map_name):
+		current = BigWorld.player()
+		if (current is not player or
+				queue_generation != getattr(
+					player, '_offhangar_queue_generation', 0) or
+				getattr(player, '_offhangar_queue_cancelled', False)):
+			return
+		player._offhangar_selected_mapId = str(map_name)
+		_step_on_enqueued(player, vehInvID, cmdName)
+		_schedule_arena_created_resilient(cmdName, player, queue_generation)
+
+	def cancel():
+		player._offhangar_queue_cancelled = True
+		if hasattr(player, '_offhangar_selected_mapId'):
+			delattr(player, '_offhangar_selected_mapId')
+		try:
+			dequeue = getattr(player, 'dequeueRandom', None)
+			if callable(dequeue):
+				dequeue()
+		except Exception:
+			LOG_CURRENT_EXCEPTION()
+
+	try:
+		from gui.mods.offhangar.lan_waiting_room import open_offline
+		return bool(open_offline(player, on_start=start, on_cancel=cancel))
+	except Exception:
+		LOG_CURRENT_EXCEPTION()
+		return False
+
+
 def _schedule_arena_created_resilient(cmdName, player, queue_generation):
 	def _fire():
 		if queue_generation != getattr(player, '_offhangar_queue_generation', 0):
@@ -21188,7 +21220,8 @@ def begin_offline_battle_queue(player, vehInvID, cmdName, cmd=0, args=()):
 			return
 		if _network_mode_enabled():
 			_join_network_waiting_room(player, vehInvID, cmdName)
-		else:
+		elif not _open_offline_map_room(player, vehInvID, cmdName,
+				queue_generation):
 			_step_on_enqueued(player, vehInvID, cmdName)
 			_schedule_arena_created_resilient(cmdName, player, queue_generation)
 

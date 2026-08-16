@@ -34,6 +34,8 @@ def load_begin_queue():
         "_join_network_waiting_room": lambda *args: steps.append(("lan", args)),
         "_step_on_enqueued": lambda *args: steps.append(("enqueue", args)),
         "_schedule_arena_created_resilient": lambda *args: steps.append(("schedule", args)),
+        # The map room is covered by its own test; this one drives the queue.
+        "_open_offline_map_room": lambda *args: False,
     }
     exec(compile(text[start:end], str(SOURCE), "exec"), scope)
     return scope["begin_offline_battle_queue"], player, callbacks, steps

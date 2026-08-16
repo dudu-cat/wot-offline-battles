@@ -179,7 +179,7 @@ class WaitingRoomUI(object):
                          anchor='CENTER')
         self._make_label('start', 'START BATTLE', (0.0, -0.40, 0.0), 1.16,
                          0.12, anchor='CENTER')
-        self._make_label('close', 'CLOSE', (0.0, -0.78, 0.0), 0.46, 0.12,
+        self._make_label('close', 'LEAVE', (0.0, -0.78, 0.0), 0.46, 0.12,
                          anchor='CENTER')
         self._make_label('message', '', (-0.86, -0.60, 0.0), 1.72, 0.11,
                          colour=(184, 205, 222, 255))
