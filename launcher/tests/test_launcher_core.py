@@ -434,10 +434,10 @@ class PayloadStagingTest(unittest.TestCase):
                           os.path.join(source, "staged"), source)
 
     def test_staging_replaces_an_earlier_payload(self):
-        stale = os.path.join(self.target, "stale.txt")
+        stale = os.path.join(self.root, "stale.txt")
         with open(stale, "w") as stream:
             stream.write("old")
-        stage_payload.stage(self.target)
+        stage_payload.stage(self.root, include_clients=False)
         self.assertFalse(os.path.exists(stale))
 
 

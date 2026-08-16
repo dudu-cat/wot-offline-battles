@@ -135,7 +135,8 @@ class WindowsServerLauncherTests(unittest.TestCase):
         self.assertNotIn('-Direction Inbound', script)
         self.assertNotIn('-Enabled True', script)
         self.assertNotIn('-Action Allow', script)
-        self.assertEqual(5.0, kwargs['timeout'])
+        self.assertEqual(windows_server.FIREWALL_QUERY_TIMEOUT_SECONDS,
+                         kwargs['timeout'])
 
     def test_uac_cancellation_is_nonfatal(self):
         self.assertFalse(windows_server._request_windows_firewall_rule(

@@ -14,6 +14,8 @@ SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 28782
 SERVER_MAX_PLAYERS = 30
 WINDOWS_FIREWALL_RULE_PREFIX = "WoT 0.9.22 LAN Server"
+# Get-NetFirewallRule can take many seconds on a busy machine.
+FIREWALL_QUERY_TIMEOUT_SECONDS = 60.0
 WINDOWS_FIREWALL_REMOTE_IP = "any"
 
 
@@ -61,7 +63,7 @@ def _windows_firewall_rule_exists(rule_name, runner=None,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        timeout=5.0,
+        timeout=FIREWALL_QUERY_TIMEOUT_SECONDS,
     )
     return result.returncode == 0
 
