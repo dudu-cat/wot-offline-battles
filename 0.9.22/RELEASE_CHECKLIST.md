@@ -163,9 +163,8 @@ acceptance run.
   git push origin v0.4.0
   ```
 
-- [ ] Publish the client ZIP, WOTMOD, sidecar, Windows server ZIP/EXE, install
-      instructions and a SHA-256 manifest. State the exact #1513-only target,
-      unsigned Windows-server boundary and remaining native acceptance limits.
-- [ ] Download every published file into a clean directory and repeat CRC,
-      manifest, version and SHA-256 checks. Record the release URL, tag commit
-      and final hashes in the release handoff.
+- [ ] Publish only the copy-ready client ZIP and the standalone Windows server
+      EXE. Keep the WOTMOD, sidecar, server build ZIP, install text and checksum
+      manifest as internal build outputs rather than public release assets.
+- [ ] Download both published files into a clean directory and verify the
+      client archive and Windows executable before making the release public.
