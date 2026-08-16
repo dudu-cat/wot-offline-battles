@@ -128,12 +128,21 @@ acceptance run.
       afterward and verify explicit browser use remains available.
 - [ ] With server and client on one PC, confirm the unedited client connects to
       `127.0.0.1:28782`.
-- [ ] Change the endpoint through the in-game LAN window, reconnect, restart
-      the client and verify `server_endpoint.json` preserves the value. Install
-      a fresh `0.4.0` overlay and verify the saved endpoint still wins.
-- [ ] Verify the host sees `SELECT A MAP, THEN CLICK CREATE TO START`, guests
-      see whom they are waiting for, and no player-facing instruction requires
-      understanding the internal authority role.
+- [ ] Set the endpoint with the desktop launcher, start the client from it and
+      verify the client connects to that address. Restart the client and verify
+      `server_endpoint.json` preserves the value. Install a fresh `0.4.0`
+      overlay and verify the saved endpoint still wins.
+- [ ] Verify the self-drawn LAN waiting room appears for the host and for a
+      guest, that its text is readable over the garage, and that
+      `python.log` records no skipped native property beyond
+      `wg_inputKeyMode`. If the room cannot be built, verify the client falls
+      back to the stock map window and records the reason.
+- [ ] Verify the room's mouse behavior: hover repaint, `<` and `>` map
+      selection, `START BATTLE` and `CLOSE`, then reopen it with the Battle
+      button. Verify the garage cursor still works after the room closes.
+- [ ] Verify the host sees the map selector, guests see whom they are waiting
+      for, and no player-facing instruction requires understanding the internal
+      authority role.
 - [ ] Complete both a one-player round and a multi-client LAN round. Verify
       map selection, 15-v-15 roster, loading barrier, host transfer, battle
       end, return to waiting and a second round without restarting the client.

@@ -145,8 +145,11 @@ class WaitingRoomUI(object):
         self._set(panel, 'materialFX', 'SOLID')
         self._set(panel, 'colour', (5, 12, 20, 245))
         self._set(panel, 'position', (0.0, 0.0, OVERLAY_Z))
+        # The children own every mouse target, matching the reviewed 0.8.2 room.
         self._set(panel, 'focus', True)
-        self._set(panel, 'moveFocus', True)
+        self._set(panel, 'mouseButtonFocus', False)
+        self._set(panel, 'crossFocus', False)
+        self._set(panel, 'moveFocus', False)
         # Proven on this client only for the Scaleform overlay component.
         self._set_optional(panel, 'wg_inputKeyMode', INPUT_KEY_MODE)
         self._set(panel, 'visible', False)
