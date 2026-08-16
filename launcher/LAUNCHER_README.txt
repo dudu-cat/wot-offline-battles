@@ -7,8 +7,10 @@ Tanks, and stops that server when the game closes.
 
 1. Start WoT-Offline-Battles-Launcher.exe from this folder. Keep the folder
    together; the launcher needs the files beside it.
-2. Select your World of Tanks folder. The launcher reports which client it
-   found.
+2. Select your World of Tanks folder. The list holds the folders you used
+   before, plus any game the launcher finds in the usual install locations.
+   Use Browse... for a folder that is not in the list. The launcher reports
+   which client it found.
 3. Select a mode:
    - Single player: you play alone against bots.
    - Host a LAN battle on this PC: other players join this PC. The launcher
@@ -21,6 +23,10 @@ Tanks, and stops that server when the game closes.
 
 In the game, select a tank and click Battle!. Everyone lands in the LAN waiting
 room. The room host selects a map and clicks START BATTLE.
+
+The client sometimes closes its first process and starts another one while it
+starts up. The launcher waits half a minute after the last game process before
+it stops the server, so that restart does not end your battle.
 
 Your own files stay in place: 0.8.2 settings in offhangar_user, and the 0.9.22
 saved address, account state and configuration in

@@ -96,6 +96,10 @@ class _FakeTk(object):
     StringVar = _StringVar
 
 
+class _FakeTtk(object):
+    Combobox = _Widget
+
+
 class _FakeFileDialog(object):
     def __init__(self, selection=""):
         self.selection = selection
@@ -109,10 +113,13 @@ class WindowTest(unittest.TestCase):
         self.settings_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.settings_dir, True)
         self.addCleanup(setattr, core, "settings_path", core.settings_path)
+        self.addCleanup(setattr, core, "discover_game_folders",
+                        core.discover_game_folders)
         core.settings_path = lambda: os.path.join(self.settings_dir,
                                                   "launcher.json")
+        core.discover_game_folders = lambda *unused, **unused_options: []
         self.dialog = _FakeFileDialog()
-        self.window = wot_launcher.LauncherWindow(_FakeTk, self.dialog)
+        self.window = wot_launcher.LauncherWindow(_FakeTk, _FakeTtk, self.dialog)
 
     def _log_text(self):
         return "".join(self.window.log_view.lines)
@@ -164,9 +171,32 @@ class WindowTest(unittest.TestCase):
         self.window.mode.set(core.MODE_HOST)
         self.window.player_name.set("Peng")
         self.window._save_settings()
-        reopened = wot_launcher.LauncherWindow(_FakeTk, self.dialog)
+        reopened = wot_launcher.LauncherWindow(_FakeTk, _FakeTtk, self.dialog)
         self.assertEqual(reopened.mode.get(), core.MODE_HOST)
         self.assertEqual(reopened.player_name.get(), "Peng")
+
+    def test_a_selected_game_folder_joins_the_known_list(self):
+        game = os.path.join(self.settings_dir, "game")
+        os.makedirs(game)
+        with open(os.path.join(game, core.GAME_EXECUTABLE), "w") as stream:
+            stream.write("")
+        self.dialog.selection = game
+        self.window._browse()
+        self.assertEqual([game], self.window._folders)
+        self.assertEqual([game], self.window.folder_box.cget("values"))
+        reopened = wot_launcher.LauncherWindow(_FakeTk, _FakeTtk, self.dialog)
+        self.assertEqual([game], reopened._folders)
+        self.assertEqual(game, reopened.game_root.get())
+
+    def test_a_folder_without_the_game_is_not_remembered(self):
+        self.dialog.selection = self.settings_dir
+        self.window._browse()
+        self.assertEqual([], self.window._folders)
+
+    def test_closing_the_window_saves_the_settings(self):
+        self.window.player_name.set("Peng")
+        self.window._on_close()
+        self.assertEqual("Peng", core.load_settings().get("name"))
 
     def test_closing_the_window_stops_the_server(self):
         stopped = []

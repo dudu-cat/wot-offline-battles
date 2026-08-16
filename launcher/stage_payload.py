@@ -72,11 +72,20 @@ def _copy_file(source, target):
     shutil.copy2(source, target)
 
 
-def _copy_tree(source, target):
+# The 0.8.2 client mod is loaded by CameraNode.pyc, so client trees keep their
+# bytecode. Only the stale mod entry and local caches are left out.
+SKIPPED_CLIENT_FILES = ("mod_offhangar.pyc",)
+
+
+def _copy_tree(source, target, keep_bytecode=False):
     written = []
-    for directory, unused_dirs, names in os.walk(source):
+    for directory, directories, names in os.walk(source):
+        directories[:] = [name for name in directories
+                          if name != "__pycache__"]
         for name in names:
-            if name.endswith(".pyc"):
+            if name in SKIPPED_CLIENT_FILES:
+                continue
+            if name.endswith(".pyc") and not keep_bytecode:
                 continue
             source_path = os.path.join(directory, name)
             target_path = os.path.join(
@@ -126,7 +135,7 @@ def stage_clients(target_root, source_root=None, client_0922=None):
                                  (port_version, source_relative))
             target = os.path.join(target_root, port_version,
                                   *target_relative.split("/"))
-            written.extend(_copy_tree(source, target))
+            written.extend(_copy_tree(source, target, keep_bytecode=True))
     return written
 
 

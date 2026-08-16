@@ -11,6 +11,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 
 PORT_0_8_2 = "0.8.2"
@@ -27,6 +28,16 @@ LOCAL_HOST = "127.0.0.1"
 LISTEN_HOST = "0.0.0.0"
 GAME_EXECUTABLE = "WorldOfTanks.exe"
 NAVGRAPH_DIR_ENV = "WOT_OFFLINE_NAVGRAPH_DIR"
+# The client can close its first process and start another one while it
+# starts up. The launcher waits this long after the last one before it
+# stops the LAN server.
+GAME_RESTART_GRACE_SECONDS = 30.0
+KNOWN_FOLDER_LIMIT = 10
+COMMON_GAME_ROOTS = (
+    "C:\\Games", "C:\\Program Files", "C:\\Program Files (x86)",
+    "C:\\WOT", "D:\\", "D:\\Games", "D:\\Program Files",
+    "E:\\", "E:\\Games",
+)
 SERVE_FLAG = "--serve"
 
 _VERSION_PATTERN = re.compile(r"v\.(\d+(?:\.\d+)+)")
@@ -474,6 +485,94 @@ def local_addresses(resolver=None):
         return []
     return sorted({address for address in addresses
                    if address and not address.startswith('127.')})
+
+
+def game_is_running(runner=None, executable=GAME_EXECUTABLE):
+    """Report whether a game process runs, through the Windows task list."""
+    if runner is None:
+        if os.name != "nt":
+            return False
+        runner = subprocess.run
+    try:
+        result = runner(
+            ["tasklist", "/FI", "IMAGENAME eq %s" % executable, "/NH"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        # A failed lookup must never stop a battle. Report the game as gone
+        # only after the caller's own grace period.
+        return False
+    output = getattr(result, "stdout", b"") or b""
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", "replace")
+    return executable.lower() in output.lower()
+
+
+def wait_for_game_exit(is_running, on_restart=None,
+                       grace=GAME_RESTART_GRACE_SECONDS, poll=2.0,
+                       sleep=None, clock=None):
+    """Wait until no game process has run for the whole grace period."""
+    import time as time_module
+
+    clock = clock or time_module.monotonic
+    sleep = sleep or time_module.sleep
+    restarted = False
+    quiet_since = clock()
+    while clock() - quiet_since < grace:
+        if is_running():
+            if not restarted and callable(on_restart):
+                on_restart()
+            restarted = True
+            quiet_since = clock()
+        sleep(poll)
+    return restarted
+
+
+def remember_folder(folders, path, limit=KNOWN_FOLDER_LIMIT):
+    """Put one folder at the top of the remembered list."""
+    path = os.path.normpath(str(path or "").strip())
+    if not path or path == ".":
+        return [str(folder) for folder in folders or ()]
+    key = os.path.normcase(path)
+    kept = [str(folder) for folder in folders or ()
+            if os.path.normcase(os.path.normpath(str(folder))) != key]
+    return [path] + kept[:limit - 1]
+
+
+def discover_game_folders(roots=None, is_game=None):
+    """Find game folders in the usual install locations."""
+    roots = COMMON_GAME_ROOTS if roots is None else roots
+    if is_game is None:
+        def is_game(path):
+            return os.path.isfile(game_executable(path))
+    found = []
+    for root in roots:
+        candidates = [root]
+        try:
+            candidates.extend(sorted(
+                os.path.join(root, name) for name in os.listdir(root)))
+        except OSError:
+            pass
+        for candidate in candidates:
+            if candidate not in found and is_game(candidate):
+                found.append(candidate)
+    return found
+
+
+def known_folders(settings, discovered=None):
+    """Merge the remembered folders with the ones found on this PC."""
+    if discovered is None:
+        discovered = discover_game_folders()
+    folders = []
+    seen = set()
+    for folder in list(settings.get("folders") or ()) + list(discovered):
+        path = os.path.normpath(str(folder))
+        key = os.path.normcase(path)
+        if not path or path == "." or key in seen:
+            continue
+        seen.add(key)
+        folders.append(path)
+    return folders
 
 
 def settings_path():

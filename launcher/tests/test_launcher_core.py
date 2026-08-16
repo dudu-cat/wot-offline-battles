@@ -577,6 +577,102 @@ class LocalAddressTest(unittest.TestCase):
         self.assertEqual(core.local_addresses(fail), [])
 
 
+class GameProcessTest(unittest.TestCase):
+    """The client can restart itself once while it starts up."""
+
+    class _Result(object):
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    def test_a_listed_process_means_the_game_runs(self):
+        listing = ("WorldOfTanks.exe   9876 Console   1   1,234,567 K\r\n"
+                   ).encode("utf-8")
+        self.assertTrue(core.game_is_running(
+            runner=lambda *args, **kwargs: self._Result(listing)))
+
+    def test_an_empty_listing_means_the_game_is_gone(self):
+        listing = b"INFO: No tasks are running which match the criteria.\r\n"
+        self.assertFalse(core.game_is_running(
+            runner=lambda *args, **kwargs: self._Result(listing)))
+
+    def test_a_failed_lookup_reports_the_game_as_gone(self):
+        def fail(*args, **kwargs):
+            raise OSError("tasklist is missing")
+
+        self.assertFalse(core.game_is_running(runner=fail))
+
+    def test_the_wait_ends_after_a_quiet_grace_period(self):
+        ticks = iter([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        self.assertFalse(core.wait_for_game_exit(
+            lambda: False, grace=3.0, poll=1.0,
+            clock=lambda: next(ticks), sleep=lambda seconds: None))
+
+    def test_a_restarted_game_keeps_the_wait_open(self):
+        seen = []
+        running = [True, True, False, False, False, False]
+        ticks = iter([float(index) for index in range(20)])
+
+        def is_running():
+            return running.pop(0) if running else False
+
+        self.assertTrue(core.wait_for_game_exit(
+            is_running, on_restart=lambda: seen.append(1), grace=2.0, poll=1.0,
+            clock=lambda: next(ticks), sleep=lambda seconds: None))
+        self.assertEqual([1], seen)
+
+
+class KnownFolderTest(unittest.TestCase):
+    def test_a_folder_moves_to_the_top_without_duplicates(self):
+        folders = core.remember_folder([], os.path.join("C:", "Games", "WoT"))
+        folders = core.remember_folder(folders, os.path.join("D:", "WoT922"))
+        folders = core.remember_folder(folders, os.path.join("C:", "Games",
+                                                             "WoT"))
+        self.assertEqual([os.path.join("C:", "Games", "WoT"),
+                          os.path.join("D:", "WoT922")], folders)
+
+    def test_the_list_stays_bounded(self):
+        folders = []
+        for index in range(15):
+            folders = core.remember_folder(folders, "/games/wot%d" % index,
+                                           limit=4)
+        self.assertEqual(4, len(folders))
+        self.assertEqual(os.path.normpath("/games/wot14"), folders[0])
+
+    def test_an_empty_folder_is_ignored(self):
+        self.assertEqual(["/games/wot"],
+                         core.remember_folder(["/games/wot"], "   "))
+
+    def test_discovery_finds_a_game_beside_the_common_roots(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        for name in ("World_of_Tanks_0.8.2", "Some Other Game"):
+            os.makedirs(os.path.join(root, name))
+        with open(os.path.join(root, "World_of_Tanks_0.8.2",
+                               core.GAME_EXECUTABLE), "w") as stream:
+            stream.write("")
+        self.assertEqual(
+            [os.path.join(root, "World_of_Tanks_0.8.2")],
+            core.discover_game_folders(roots=(root,)))
+
+    def test_discovery_accepts_a_root_that_is_the_game(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with open(os.path.join(root, core.GAME_EXECUTABLE), "w") as stream:
+            stream.write("")
+        self.assertEqual([root], core.discover_game_folders(roots=(root,)))
+
+    def test_discovery_survives_a_missing_root(self):
+        self.assertEqual([], core.discover_game_folders(
+            roots=("/nonexistent-root",)))
+
+    def test_remembered_folders_come_before_discovered_ones(self):
+        folders = core.known_folders(
+            {"folders": ["/games/wot082"]},
+            discovered=["/games/wot0922", "/games/wot082"])
+        self.assertEqual([os.path.normpath("/games/wot082"),
+                          os.path.normpath("/games/wot0922")], folders)
+
+
 class LauncherSettingsTest(unittest.TestCase):
     def test_settings_round_trip(self):
         directory = tempfile.mkdtemp()

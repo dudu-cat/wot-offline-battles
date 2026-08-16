@@ -33,8 +33,9 @@ def _no_console_flags():
 
 
 class LauncherWindow(object):
-    def __init__(self, tk_module, filedialog_module):
+    def __init__(self, tk_module, ttk_module, filedialog_module):
         self._tk = tk_module
+        self._ttk = ttk_module
         self._filedialog = filedialog_module
         self._server = None
         self._game = None
@@ -52,9 +53,14 @@ class LauncherWindow(object):
         frame.pack(fill="both", expand=True)
 
         tk.Label(frame, text="Game folder").grid(row=0, column=0, sticky="w")
-        self.game_root = tk.StringVar(value=settings.get("game_root", ""))
-        entry = tk.Entry(frame, textvariable=self.game_root, width=52)
-        entry.grid(row=0, column=1, sticky="we", padx=(6, 6))
+        self._folders = core.known_folders(settings)
+        self.game_root = tk.StringVar(
+            value=settings.get("game_root", "") or
+            (self._folders[0] if self._folders else ""))
+        self.folder_box = self._ttk.Combobox(
+            frame, textvariable=self.game_root, values=list(self._folders),
+            width=50)
+        self.folder_box.grid(row=0, column=1, sticky="we", padx=(6, 6))
         tk.Button(frame, text="Browse...", command=self._browse).grid(
             row=0, column=2, sticky="e")
         self.game_root.trace_add("write", lambda *unused: self._refresh_client())
@@ -111,6 +117,17 @@ class LauncherWindow(object):
             initialdir=self.game_root.get() or None)
         if selected:
             self.game_root.set(os.path.normpath(selected))
+            self._remember_folder()
+
+    def _remember_folder(self):
+        """Keep this folder at the top of the list for the next launch."""
+        folder = self.game_root.get().strip()
+        if not folder or not os.path.isfile(core.game_executable(folder)):
+            return False
+        self._folders = core.remember_folder(self._folders, folder)
+        self.folder_box.config(values=list(self._folders))
+        self._save_settings()
+        return True
 
     def _refresh_client(self):
         status = core.inspect_game_root(self.game_root.get())
@@ -152,6 +169,7 @@ class LauncherWindow(object):
     def _save_settings(self):
         core.save_settings({
             "game_root": self.game_root.get().strip(),
+            "folders": list(self._folders),
             "mode": self.mode.get(),
             "join_address": self.join_address.get().strip(),
             "name": self.player_name.get().strip(),
@@ -167,6 +185,7 @@ class LauncherWindow(object):
         except core.LauncherError as error:
             self._log(str(error))
             return
+        self._remember_folder()
         self._save_settings()
         self._set_busy(True)
         thread = threading.Thread(
@@ -240,6 +259,12 @@ class LauncherWindow(object):
                                       cwd=game_root)
         self._game.wait()
         self._game = None
+        self._log("Waiting %d seconds in case the game restarts itself..." %
+                  int(core.GAME_RESTART_GRACE_SECONDS))
+        core.wait_for_game_exit(
+            core.game_is_running,
+            on_restart=lambda: self._log(
+                "The game started another process; the server stays up."))
         self._log("The game closed.")
 
     def _stop_server(self):
@@ -255,6 +280,7 @@ class LauncherWindow(object):
             server.kill()
 
     def _on_close(self):
+        self._save_settings()
         self._stop_server()
         self.root.destroy()
 
@@ -302,9 +328,9 @@ def main(argv=None):
     if core.SERVE_FLAG in argv:
         return _serve(argv)
     import tkinter
-    from tkinter import filedialog
+    from tkinter import filedialog, ttk
 
-    LauncherWindow(tkinter, filedialog).run()
+    LauncherWindow(tkinter, ttk, filedialog).run()
     return 0
 
 
