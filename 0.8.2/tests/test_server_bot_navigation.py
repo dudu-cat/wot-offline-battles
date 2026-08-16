@@ -211,6 +211,22 @@ class ServerBotNavigationTests(unittest.TestCase):
                     resolver.configure("07_lakeville", self.frame)
                 self.assertFalse(resolver.active)
 
+    def test_manifest_checksum_accepts_windows_line_endings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = ROOT / "scripts/client/gui/mods/offhangar/navgraphs"
+            for source_path in source.glob("*.json"):
+                shutil.copy2(source_path, Path(directory) / source_path.name)
+            target = Path(directory) / "07_lakeville.json"
+            data = target.read_bytes()
+            self.assertTrue(data.endswith(b"\n"))
+            target.write_bytes(data[:-1] + b"\r\n")
+            with mock.patch.object(
+                    server_bot_navigation, "_graph_directories",
+                    return_value=(directory,)):
+                resolver = BotPathResolver()
+                resolver.configure("07_lakeville", self.frame)
+                self.assertTrue(resolver.active)
+
     def test_stock_graph_requires_route_terminal_obb_clearance_proof(self):
         for proof in (None, False):
             with self.subTest(proof=proof):

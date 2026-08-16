@@ -73,13 +73,10 @@ def _graph_directories():
 
 
 def _sha256(path):
+    """Hash JSON payloads without treating CRLF/LF as different content."""
     digest = hashlib.sha256()
     with open(path, "rb") as source:
-        while True:
-            block = source.read(1024 * 1024)
-            if not block:
-                break
-            digest.update(block)
+        digest.update(source.read().replace(b"\r\n", b"\n"))
     return digest.hexdigest()
 
 
