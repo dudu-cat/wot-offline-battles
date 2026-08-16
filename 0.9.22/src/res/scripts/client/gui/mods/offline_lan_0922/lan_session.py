@@ -6,6 +6,7 @@ import sys
 
 from gui.mods.offline_lan_0922 import config as port_config
 from gui.mods.offline_lan_0922 import queue_ui
+from gui.mods.offline_lan_0922 import waiting_room_ui
 
 
 RECONNECT_DELAY = 2.0
@@ -84,10 +85,12 @@ class LANSession(object):
                  picker_opener=None, join_factory=None, battle_runtime=None,
                  on_snapshot=None, on_event=None, lobby_ready=None,
                  callback=None, cancel_callback=None, status_notifier=None,
-                 vehicle_provider=None):
+                 vehicle_provider=None, room_factory=None):
         self._config = dict(config or {})
         self._client_factory = client_factory or _load_client
         self._queue_factory = queue_factory or queue_ui.QueueUI
+        self._room_factory = (waiting_room_ui.WaitingRoomUI
+                              if room_factory is None else room_factory)
         self._picker_opener = picker_opener or queue_ui.open_picker
         self._join_factory = join_factory or queue_ui.JoinButtonUI
         self._battle_runtime = battle_runtime
@@ -223,13 +226,12 @@ class LANSession(object):
                 self._endpoint_value())
             self._open_connection_picker()
         elif self.state == 'waiting':
-            if self._is_local_host():
-                # An explicit Battle click is the user's request to reopen a
-                # picker they previously dismissed.
-                self._picker_dismissed = False
-                self._open_waiting_picker()
-            else:
+            # An explicit Battle click is the user's request to reopen a room
+            # they previously dismissed.
+            self._picker_dismissed = False
+            if not self._is_local_host():
                 self._show_waiting_notice(force=True)
+            self._open_waiting_picker()
         return True
 
     def _endpoint_value(self):
@@ -365,16 +367,73 @@ class LANSession(object):
 
     def _ensure_queue(self):
         if self._queue is None:
-            self._queue = self._queue_factory(self.request_start,
-                                              self._map_pool_value,
-                                              endpoint=self._picker_description,
-                                              on_close=self._on_picker_closed)
-            self._queue.install()
+            surface = self._new_room()
+            if surface is None:
+                surface = self._queue_factory(
+                    self.request_start, self._map_pool_value,
+                    endpoint=self._picker_description,
+                    on_close=self._on_picker_closed)
+                surface.install()
+            self._queue = surface
+        return self._queue
+
+    def _new_room(self):
+        """Build the self-drawn room, or report that this client cannot."""
+        if self._room_factory is None:
+            return None
+        try:
+            room = self._room_factory(self.request_start, self._map_pool_value,
+                                      status=self._room_status,
+                                      on_close=self._on_picker_closed,
+                                      host=self._is_local_host)
+            room.install()
+        except Exception as error:
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] the native waiting room is unavailable, '
+                'using the stock map window: %s\n' % error)
+            return None
+        return room
+
+    def _room_status(self):
+        """Describe the live room for the self-drawn waiting room."""
+        players = list(getattr(self.client, 'roster', ()) or ())
+        labels = []
+        for player in players:
+            label = self._player_label(player)
+            if label is not None:
+                labels.append(label)
+        shown = labels[:6]
+        if len(labels) > len(shown):
+            shown.append(u'+%d more' % (len(labels) - len(shown)))
+        lines = [
+            text_type(self._endpoint_value()),
+            u'PLAYERS (%d): %s' % (len(players),
+                                   u', '.join(shown) or u'waiting for roster'),
+        ]
+        if not self._is_local_host():
+            lines.append(u'WAITING FOR %s TO START THE BATTLE' %
+                         text_type(self._host_name()))
+        return u'\n'.join(lines)
+
+    def _open_surface(self, surface):
+        opener = getattr(surface, 'open', None)
+        if callable(opener):
+            return opener()
+        return self._picker_opener()
+
+    def _guest_surface(self):
+        return bool(getattr(self._queue, 'guest_view', False))
+
+    def _refresh_surface(self):
+        refresh = getattr(self._queue, 'refresh', None)
+        if callable(refresh):
+            return refresh()
+        return False
 
     def _on_picker_closed(self):
         self._picker_open = False
         if (not self._stopped and self.state == 'waiting' and
-                self._is_local_host()):
+                (self._is_local_host() or self._guest_surface())):
             self._picker_dismissed = True
         # A user close is final.  Reopening on the next BigWorld callback can
         # recapture the cursor while the stock window is still unwinding.
@@ -419,7 +478,6 @@ class LANSession(object):
         def retry():
             self._picker_callback_id = None
             if (not self._stopped and self.state == 'waiting' and
-                    self._is_local_host() and
                     not self._picker_dismissed):
                 self._open_waiting_picker()
 
@@ -466,15 +524,17 @@ class LANSession(object):
         return False
 
     def _open_waiting_picker(self):
-        if (self._stopped or self._picker_open or self._picker_dismissed or
-                not self._is_local_host()):
+        if self._stopped or self._picker_open or self._picker_dismissed:
             return False
         if not self._lobby_ready():
             self._schedule_picker_when_lobby_ready()
             return False
         self._cancel_picker_callback()
-        self._ensure_queue()
-        self._picker_open = bool(self._picker_opener())
+        surface = self._ensure_queue()
+        if not self._is_local_host() and not self._guest_surface():
+            # The stock map window can only present the elected room host.
+            return False
+        self._picker_open = bool(self._open_surface(surface))
         return self._picker_open
 
     def _open_connection_picker(self):
@@ -488,8 +548,12 @@ class LANSession(object):
         # Before welcome, map_pool is None and QueueUI shows the local standard
         # maps.  The selection is provisional: the server later decides both
         # the valid pool and whether this client is the room host.
-        self._ensure_queue()
-        self._picker_open = bool(self._picker_opener())
+        surface = self._ensure_queue()
+        if getattr(surface, 'guest_view', False):
+            # The self-drawn room never edits the server address. The launcher
+            # owns that address before the client starts.
+            return False
+        self._picker_open = bool(self._open_surface(surface))
         return self._picker_open
 
     def _is_local_host(self):
@@ -530,10 +594,18 @@ class LANSession(object):
             if not self._picker_dismissed:
                 self._open_waiting_picker()
             return
-        if self._picker_open:
-            self._close_picker()
         self._show_waiting_notice(
             force=previous_host_player_id != self._host_player_id)
+        if self._picker_open:
+            if self._guest_surface():
+                self._refresh_surface()
+            else:
+                self._close_picker()
+            return
+        if not self._picker_dismissed:
+            # The self-drawn room also presents guests. The stock map window
+            # refuses this call and keeps the notification above.
+            self._open_waiting_picker()
 
     def _close_picker(self):
         self._cancel_picker_callback()
@@ -682,11 +754,8 @@ class LANSession(object):
                 self.state = 'awaiting_battle_start'
                 return
             self.state = 'waiting'
-            if (self._is_local_host() and self._picker_open and
-                    self._queue is not None):
-                refresh = getattr(self._queue, 'refresh', None)
-                if callable(refresh):
-                    refresh()
+            if self._picker_open and self._queue is not None:
+                self._refresh_surface()
             if self._pending_map is not None:
                 pending_map = self._pending_map
                 self._pending_map = None

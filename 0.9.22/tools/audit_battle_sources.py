@@ -78,9 +78,10 @@ PORT_FILES = {
     'tank_collision.py': '082_current_collision_and_spatial_index_port',
     'user_config.py': '1513_path_adapter',
     'vehicle_physics.py': '082_latest_calibrated_law_port',
+    'waiting_room_ui.py': '082_waiting_room_law_plus_1513_native_gui_adapter',
     'world_collision.py': '082_law_plus_strict_destructible_adapter',
 }
-EXPECTED_PORT_MODULE_COUNT = 64
+EXPECTED_PORT_MODULE_COUNT = 65
 
 # The #1513 battle also depends on two Python 3 service modules outside the
 # wotmod. They live with the port and are part of the same provenance gate
@@ -108,7 +109,7 @@ PINNED_PRODUCT_SHA256 = {
     'config.py':
         '5581dff4f35a2968f97ec4dcabc35c692326a020db20a1eaa33c075d2707c70b',
     'lan_session.py':
-        'c9e2daae756875273aaf9552e54e166c30cd319807caaa0185385dd76a4421cb',
+        'e618c793fc47a6080453371a4444a18e1b96ea44c074be44a97d6a1a73db9c66',
     'lobby_ui.py':
         '5d52c57da8b5b131ace99ed16a19a052df40e125eefd24a86e5830af0bccbb54',
 }

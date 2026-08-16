@@ -20,7 +20,7 @@ def _load_source_audit():
 
 
 class ReleaseLayoutTests(unittest.TestCase):
-    def test_port_has_one_top_level_layout_and_64_documented_modules(self):
+    def test_port_has_one_top_level_layout_and_65_documented_modules(self):
         self.assertTrue(PORT_ROOT.is_dir())
         self.assertFalse((ROOT / 'ports' / '0.9.22').exists())
 
@@ -29,7 +29,7 @@ class ReleaseLayoutTests(unittest.TestCase):
             for path in PACKAGE_ROOT.rglob('*.py')
         }
         audit = _load_source_audit()
-        self.assertEqual(64, len(actual))
+        self.assertEqual(65, len(actual))
         self.assertEqual(actual, set(audit.PORT_FILES))
 
     def test_release_surfaces_do_not_reference_the_retired_nested_path(self):

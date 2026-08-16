@@ -470,7 +470,8 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual([], self.client.requests)
         self.assertEqual('waiting', self.session.state)
         self.assertFalse(self.session._picker_open)
-        self.assertEqual([], self.queues)
+        # The stock window cannot present a guest, so it stays closed.
+        self.assertEqual([], self.opens)
         self.assertIn('Waiting for host', self.statuses[-1])
 
     def test_waiting_guest_becomes_host_and_gets_picker(self):
@@ -1414,3 +1415,147 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual(1, self.client.stop_calls)
         self.assertEqual([False], self.battle_runtime.stopped)
         self.session.stop(show_login=False)
+
+
+class _Room(object):
+    guest_view = True
+
+    def __init__(self, request_start, map_pool, status=None, on_close=None,
+                 host=None):
+        self.request_start = request_start
+        self.map_pool = map_pool
+        self.status = status
+        self.on_close = on_close
+        self.host = host
+        self.install_calls = 0
+        self.open_calls = 0
+        self.close_calls = 0
+        self.refresh_calls = 0
+        self.uninstall_calls = 0
+
+    def install(self):
+        self.install_calls += 1
+
+    def open(self):
+        self.open_calls += 1
+        return True
+
+    def close(self):
+        self.close_calls += 1
+        return True
+
+    def refresh(self):
+        self.refresh_calls += 1
+        return True
+
+    def uninstall(self):
+        self.uninstall_calls += 1
+
+
+class LANSessionRoomTests(unittest.TestCase):
+    """The self-drawn room replaces the stock window and also serves guests."""
+
+    def setUp(self):
+        self.module = _load()
+        self.clients = []
+        self.queues = []
+        self.rooms = []
+        self.opens = []
+        self.statuses = []
+        self.room_error = None
+
+        def client_factory(*args, **kwargs):
+            client = _Client(*args, **kwargs)
+            self.clients.append(client)
+            return client
+
+        def queue_factory(*args, **kwargs):
+            queue = _Queue(*args, **kwargs)
+            self.queues.append(queue)
+            return queue
+
+        def room_factory(*args, **kwargs):
+            if self.room_error is not None:
+                raise self.room_error
+            room = _Room(*args, **kwargs)
+            self.rooms.append(room)
+            return room
+
+        self.session = self.module.LANSession(
+            {'host': '10.0.0.5', 'port': 28782, 'name': 'P',
+             'vehicle': 'ussr:MS-1', 'startupTimeoutSeconds': 12.0},
+            client_factory=client_factory, queue_factory=queue_factory,
+            room_factory=room_factory,
+            picker_opener=lambda: self.opens.append(True) or True,
+            battle_runtime=_BattleRuntime(),
+            vehicle_provider=lambda: ('ussr:R11_MS-1', 90),
+            status_notifier=self.statuses.append)
+        self.assertTrue(self.session.start())
+        self.client = self.clients[0]
+
+    def emit(self, kind, message):
+        if kind == 'welcome':
+            self.client.ready = True
+            self.client.phase = message.get('phase', self.client.phase)
+        if 'host_player_id' in message:
+            self.client.host_player_id = message['host_player_id']
+        if 'players' in message:
+            self.client.roster = list(message['players'])
+        self.client.on_event(kind, message)
+
+    def test_the_host_gets_the_room_instead_of_the_stock_window(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia'],
+                              'players': [{'id': 'p1', 'name': 'Host'}]})
+
+        self.assertEqual([], self.queues)
+        self.assertEqual([], self.opens)
+        self.assertEqual(1, len(self.rooms))
+        self.assertEqual(1, self.rooms[0].install_calls)
+        self.assertEqual(1, self.rooms[0].open_calls)
+        self.assertEqual(['01_karelia'], self.rooms[0].map_pool())
+        self.assertTrue(self.rooms[0].host())
+
+    def test_the_room_status_names_the_server_and_the_players(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia'],
+                              'players': [{'id': 'p1', 'name': 'Host'},
+                                          {'id': 'p2', 'name': 'Guest'}]})
+
+        self.assertEqual(
+            'LAN SERVER: 10.0.0.5:28782\nPLAYERS (2): Host, Guest',
+            self.rooms[0].status())
+
+    def test_a_guest_also_sees_the_room_and_the_notification(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia'],
+                              'host_player_id': 'other',
+                              'players': [{'id': 'other', 'name': 'Host'},
+                                          {'id': 'p1', 'name': 'Me'}]})
+
+        self.assertEqual(1, len(self.rooms))
+        self.assertEqual(1, self.rooms[0].open_calls)
+        self.assertFalse(self.rooms[0].host())
+        self.assertIn('WAITING FOR Host TO START THE BATTLE',
+                      self.rooms[0].status())
+        self.assertIn('Waiting for host', self.statuses[-1])
+
+    def test_the_room_start_reaches_the_server(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+        self.assertTrue(self.rooms[0].request_start('01_karelia'))
+        self.assertEqual(['01_karelia'], self.client.requests)
+
+    def test_a_closed_room_reopens_from_the_battle_button(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+        self.session._on_picker_closed()
+        self.assertTrue(self.session._picker_dismissed)
+
+        self.session.join()
+
+        self.assertEqual(2, self.rooms[0].open_calls)
+
+    def test_a_client_without_the_native_gui_uses_the_stock_window(self):
+        self.room_error = ImportError('No module named GUI')
+
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+
+        self.assertEqual([], self.rooms)
+        self.assertEqual(1, len(self.queues))
+        self.assertEqual([True], self.opens)

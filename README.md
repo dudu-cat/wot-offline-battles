@@ -103,11 +103,10 @@ The current 0.8.2 native-physics build accepts only its pinned executable. See
 3. Download and double-click `WoT-0.9.22-LAN-Server.exe` on the computer that
    will host the battle. It needs no arguments and listens on TCP `28782`.
 4. On first launch from a new path, approve the UAC prompt that creates the
-   EXE-scoped firewall rule. Run it only on a trusted network. In each client,
-   use the stock **Battle!** flow and edit the `LAN SERVER: host:port` line in
-   the native window to `<host LAN IP>:28782`; a same-PC client can keep the
-   default `127.0.0.1:28782`. The first waiting player chooses a map and starts
-   the shared round.
+   EXE-scoped firewall rule. Run it only on a trusted network. Set each
+   client's server address with the [`launcher`](launcher/), then click
+   **Battle!** in the garage. Every client opens the LAN waiting room; the
+   first waiting player chooses a map and starts the shared round.
 
 See [`0.9.22/INSTALL.txt`](0.9.22/INSTALL.txt) for troubleshooting and the
 exact package boundary.

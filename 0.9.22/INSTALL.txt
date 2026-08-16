@@ -503,21 +503,19 @@ Start a battle
    health are sent to the LAN server; there is no silent MS-1 fallback. If no
    valid tank is selected, the client stays in the hangar and shows a warning.
    This does not use retail matchmaking or the retail training-room service.
-5. If the endpoint cannot be reached, the stock settings window opens
-   automatically while retrying. Its Description field contains
-   `LAN SERVER: host:port`; edit it if the server address changed. Before a
-   welcome, editing the address does not make that player the room host. You
-   can also click Battle! again while connecting to open it explicitly.
-6. The first waiting player becomes room host and receives the stock training
-   settings window as a map picker. Its Description field shows the endpoint,
-   live player list and `SELECT A MAP, THEN CLICK CREATE TO START`; the host
-   may edit the endpoint on the first line and save it there.
-7. Every later player clicks the same Battle! button and waits in the hangar.
-   Only the host can choose a standard (`ctf`) map and use the window's primary
-   action. The server broadcasts that one selected map to every waiting client.
-   There is no F12 or `0` key workflow.
-   Closing the host picker leaves it closed; the host clicks Battle! to reopen
-   it.
+5. Every accepted client opens the LAN waiting room. It shows the server
+   address and the live player list. Set the server address with the desktop
+   launcher before the client starts, or edit
+   `mods\configs\offline_lan_0922\server_endpoint.json`.
+6. The first waiting player becomes room host. The host selects one standard
+   (`ctf`) map with the `<` and `>` controls and clicks START BATTLE. A guest
+   sees the name of the host who starts the battle.
+7. Every later player clicks the same Battle! button and waits in the room.
+   The server broadcasts that one selected map to every waiting client. There
+   is no F12 or `0` key workflow. Closing the room leaves it closed; click
+   Battle! to reopen it. A client that cannot build the room's native
+   components keeps the stock training settings window as the host map picker,
+   and the server address stays editable in that window's Description field.
 8. The server starts the selected map and fills both teams to 15 vehicles.
    The shared 15-second prebattle countdown runs after every human vehicle has
    loaded and the authority has published the bot line-up. Bots continue to

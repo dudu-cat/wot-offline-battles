@@ -634,8 +634,11 @@ overwrite the next round.
 
 ## User flow
 
-1. Start `server/lan_battle_server.py`. One client is sufficient for an
-   offline round; additional clients can join the same waiting room over LAN.
+1. Start the desktop [`launcher`](../launcher/), or start
+   `server/lan_battle_server.py` yourself. The launcher writes the server
+   address, runs the server for a host and starts the game. One client is
+   sufficient for an offline round; additional clients can join the same
+   waiting room over LAN.
 2. Start the frozen client. After the native intro/login state finishes its
    destructive cleanup, the mod creates its local Account and enters Lobby.
    On the first garage entry it suppresses the stock CN automatic browser for
@@ -647,28 +650,25 @@ overwrite the next round.
    the client stays in the garage and displays a native warning. The button
    joins the LAN waiting room; it does not call retail matchmaking or a retail
    training-room service.
-4. If the endpoint cannot be reached, the stock settings window opens
-   automatically while the client retries. Clicking **Battle!** again while
-   connecting also opens it. Any not-yet-accepted client can edit
-   `LAN SERVER: host:port` there; editing the address does not make that player
-   the room host.
-5. The first waiting player is the room host. Only that client opens the stock
-   training settings window as a local map picker. Its Description field shows
-   the editable `LAN SERVER: host:port` endpoint on the first line, the live
-   player list and `SELECT A MAP, THEN CLICK CREATE TO START`. Later players
-   click the same **Battle!** button, remain in the garage and see that the
-   battle opens automatically after the named host starts it.
-   If the host closes the picker, it remains closed until that client clicks
-   **Battle!** again.
-6. The host chooses one server-offered standard map and uses the window's
-   primary action. The server is authoritative for the host, selected map and
+4. Every accepted client opens the LAN waiting room. It shows the server
+   address, the live player list, and for the room host a map selector and
+   `START BATTLE`. A guest sees the name of the host who starts the battle.
+   Closing the room leaves it closed until that client clicks **Battle!**
+   again. A client that cannot build the room's native components keeps the
+   stock training settings window as the host map picker; the address can be
+   edited in that window's Description field.
+5. The first waiting player is the room host. Later players click the same
+   **Battle!** button and see that the battle opens automatically after the
+   named host starts it.
+6. The host chooses one server-offered standard map and clicks
+   `START BATTLE`. The server is authoritative for the host, selected map and
    start; guest start requests are rejected before they can change the map.
 7. The server fills vacant slots with bots and broadcasts the same round to
    every waiting client.
 8. A team-elimination result freezes the round. After five seconds the server
-   returns connected players to the waiting room and the stock picker opens for
-   the current host. If the waiting host leaves, ownership passes to the lowest
-   connected player id and that client receives the picker.
+   returns connected players to the waiting room and the room reopens. If the
+   waiting host leaves, ownership passes to the lowest connected player id and
+   that client receives the map selector.
 9. Returning to the garage during a round retires that player, transfers bot
    authority when necessary and retains the LAN connection until the server's
    next waiting-room barrier.

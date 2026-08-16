@@ -602,6 +602,35 @@ after the current Scaleform event returns. If `battle_start` arrives first,
 the network poll cancels that callback, closes the picker once, and only then
 crosses the Account-to-Avatar boundary. There is no synchronous-close fallback.
 
+## Self-drawn LAN waiting room
+
+The LAN room is now presented with the port's own native components. The stock
+map window described above remains the fallback for a client that cannot build
+them. The room carries the reviewed 0.8.2 waiting-room presentation: the live
+room status, one map selector limited to the server map pool, one start button
+for the host and one close control. It also presents the players who wait for
+the host, which the stock window cannot do. The desktop launcher owns the
+server address before the client starts, so the room never edits an endpoint.
+
+Every native call is proved in exact build #1513:
+
+| Interface | Exact evidence |
+| --- | --- |
+| `GUI.Simple(texture)`, `GUI.Window(texture)`, `GUI.Text(value)` and the component properties used here | `scripts/client/PostProcessing/ChainView.pyc`, `scripts/client/bwobsolete_tests/GUITest.pyc`, `scripts/client/bwobsolete_helpers/PyGUI/Utils.pyc` |
+| Texture `system/maps/col_white.dds` | `res/packages/misc.pkg` member, read by `ChainView.EffectView.__init__` |
+| Font `default_small.font` | `system/fonts/default_small.font` package member |
+| `GUI.addRoot`, `GUI.delRoot`, `GUI.reSort` and an overlay at `position.z = 0.1` with `focus` and `moveFocus` | `scripts/client/new_year/fade_window.pyc` |
+| `handleMouseClickEvent`, `handleMouseEnterEvent`, `handleMouseLeaveEvent`, `handleMouseButtonEvent` | `scripts/client/PostProcessing/ChainView.pyc` |
+| The lobby already attaches `GUI.mcursor` through `BigWorld.setCursor` | `scripts/client/gui/Scaleform/managers/Cursor.pyc` `attachCursor` |
+
+`shadow` and `dropShadow` appear in no #1513 client script, so the room does not
+set them. `wg_inputKeyMode` is proved only for the Scaleform overlay component,
+so the room sets it optionally and logs a skip.
+
+Static inspection cannot prove that a native component receives mouse events
+while the Scaleform lobby is displayed. The room logs the surface it built, and
+a client that raises during construction keeps the stock map window.
+
 ## Battle and entity lifecycle
 
 The client delegates space, mapping, Avatar construction, camera setup and
