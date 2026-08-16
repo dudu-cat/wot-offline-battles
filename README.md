@@ -112,6 +112,13 @@ The current 0.8.2 native-physics build accepts only its pinned executable. See
 See [`0.9.22/INSTALL.txt`](0.9.22/INSTALL.txt) for troubleshooting and the
 exact package boundary.
 
+### Launcher
+
+The [`launcher`](launcher/) prepares one battle before the client starts. It
+serves both ports: it writes the LAN server address for the installed client,
+runs the LAN server when you host, starts the game, and stops that server when
+the game closes. In the game you then only click the battle button.
+
 Project code is distributed under [`GPL-3.0`](LICENSE). World of Tanks and its
 assets are not included; this project is not affiliated with or endorsed by
 Wargaming.

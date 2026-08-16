@@ -42,6 +42,9 @@ GRAPH_FORMAT = "offhangar-navgraph"
 GRAPH_VERSION = 1
 GRAPH_GAME_VERSION = "0.8.2"
 MANIFEST_FORMAT = GRAPH_FORMAT + "-manifest"
+# The launcher runs this server from a bundle and points it at the navigation
+# graphs installed with the client.
+NAVGRAPH_DIR_ENV = "WOT_OFFLINE_NAVGRAPH_DIR"
 
 
 def _number(value, default=0.0):
@@ -64,12 +67,17 @@ def _distance(first, second):
 
 
 def _graph_directories():
-    return (
+    directories = []
+    override = os.environ.get(NAVGRAPH_DIR_ENV, "").strip()
+    if override:
+        directories.append(override)
+    directories.append(
         os.path.join(_ROOT, "scripts", "client", "gui", "mods", "offhangar",
-                     "navgraphs"),
+                     "navgraphs"))
+    directories.append(
         os.path.join(_RELEASE_CLIENT_ROOT, "scripts", "client", "gui", "mods",
-                     "offhangar", "navgraphs"),
-    )
+                     "offhangar", "navgraphs"))
+    return tuple(directories)
 
 
 def _sha256(path):

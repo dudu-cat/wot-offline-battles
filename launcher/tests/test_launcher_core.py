@@ -1,0 +1,336 @@
+import json
+import os
+import shutil
+import tempfile
+import unittest
+
+import core
+import stage_payload
+
+
+class EndpointTest(unittest.TestCase):
+    def test_address_without_port_uses_the_default(self):
+        self.assertEqual(core.parse_endpoint("192.168.1.10"),
+                         ("192.168.1.10", core.DEFAULT_SERVER_PORT))
+
+    def test_address_with_port(self):
+        self.assertEqual(core.parse_endpoint(" host.lan:9000 "),
+                         ("host.lan", 9000))
+
+    def test_empty_address_is_rejected(self):
+        self.assertRaises(core.LauncherError, core.parse_endpoint, "  ")
+
+    def test_port_out_of_range_is_rejected(self):
+        self.assertRaises(core.LauncherError, core.parse_endpoint, "host:70000")
+
+    def test_port_text_is_rejected(self):
+        self.assertRaises(core.LauncherError, core.parse_endpoint, "host:abc")
+
+    def test_single_player_and_host_use_the_local_endpoint(self):
+        for mode in (core.MODE_SINGLE, core.MODE_HOST):
+            self.assertEqual(core.endpoint_for_mode(mode, "10.0.0.5"),
+                             (core.LOCAL_HOST, core.DEFAULT_SERVER_PORT))
+
+    def test_join_uses_the_typed_endpoint(self):
+        self.assertEqual(core.endpoint_for_mode(core.MODE_JOIN, "10.0.0.5:1234"),
+                         ("10.0.0.5", 1234))
+
+
+class ServerRequirementTest(unittest.TestCase):
+    def test_host_always_needs_a_server(self):
+        for port_version in core.SUPPORTED_PORTS:
+            self.assertTrue(core.server_required(port_version, core.MODE_HOST))
+
+    def test_join_never_starts_a_local_server(self):
+        for port_version in core.SUPPORTED_PORTS:
+            self.assertFalse(core.server_required(port_version, core.MODE_JOIN))
+
+    def test_only_0_9_22_needs_a_server_for_single_player(self):
+        self.assertFalse(
+            core.server_required(core.PORT_0_8_2, core.MODE_SINGLE))
+        self.assertTrue(
+            core.server_required(core.PORT_0_9_22, core.MODE_SINGLE))
+
+
+class GameRootTest(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def _write(self, relative_path, text=""):
+        path = os.path.join(self.root, relative_path)
+        directory = os.path.dirname(path)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory)
+        with open(path, "w") as stream:
+            stream.write(text)
+        return path
+
+    def test_version_file_identifies_the_port(self):
+        self._write("version.xml", "<version> v.0.9.22.0.1 #1513 </version>")
+        self.assertEqual(core.read_client_version(self.root), "0.9.22.0.1")
+        self.assertEqual(core.detect_port(self.root), core.PORT_0_9_22)
+
+    def test_installed_mod_identifies_the_port_without_a_version_file(self):
+        self._write(os.path.join(
+            "res_mods", "0.8.2", "scripts", "client", "gui", "mods",
+            "offhangar", "__init__.py"))
+        self.assertIsNone(core.read_client_version(self.root))
+        self.assertEqual(core.detect_port(self.root), core.PORT_0_8_2)
+
+    def test_unsupported_client_reports_no_port(self):
+        self._write("version.xml", "<version> v.1.0.0 #1 </version>")
+        self.assertIsNone(core.detect_port(self.root))
+
+    def test_inspection_reports_a_missing_executable_and_mod(self):
+        self._write("version.xml", "<version> v.0.8.2 #100 </version>")
+        status = core.inspect_game_root(self.root)
+        self.assertFalse(status["has_executable"])
+        self.assertFalse(status["mod_installed"])
+        self.assertEqual(status["client"], core.PORT_0_8_2)
+
+    def test_inspection_reports_a_complete_installation(self):
+        self._write("version.xml", "<version> v.0.8.2 #100 </version>")
+        self._write(core.GAME_EXECUTABLE)
+        self._write(os.path.join(
+            "res_mods", "0.8.2", "scripts", "client", "gui", "mods",
+            "offhangar", "__init__.py"))
+        status = core.inspect_game_root(self.root)
+        self.assertTrue(status["has_executable"])
+        self.assertTrue(status["mod_installed"])
+
+
+class SessionPlanTest(unittest.TestCase):
+    @staticmethod
+    def _status(**overrides):
+        status = {
+            "path": "C:\\Games\\WoT",
+            "has_executable": True,
+            "version": "0.9.22.0.1",
+            "client": core.PORT_0_9_22,
+            "mod_installed": True,
+        }
+        status.update(overrides)
+        return status
+
+    def test_join_plan_carries_the_typed_endpoint(self):
+        session = core.plan_session(self._status(), core.MODE_JOIN,
+                                    "10.0.0.5:1234")
+        self.assertEqual(session["host"], "10.0.0.5")
+        self.assertEqual(session["tcp_port"], 1234)
+        self.assertFalse(session["needs_server"])
+
+    def test_0_9_22_single_player_plan_starts_a_local_server(self):
+        session = core.plan_session(self._status(), core.MODE_SINGLE)
+        self.assertEqual(session["host"], core.LOCAL_HOST)
+        self.assertTrue(session["needs_server"])
+
+    def test_0_8_2_single_player_plan_starts_no_server(self):
+        session = core.plan_session(
+            self._status(client=core.PORT_0_8_2, version="0.8.2"),
+            core.MODE_SINGLE)
+        self.assertFalse(session["needs_server"])
+
+    def test_a_missing_executable_stops_the_session(self):
+        self.assertRaises(core.LauncherError, core.plan_session,
+                          self._status(has_executable=False), core.MODE_SINGLE)
+
+    def test_an_unsupported_client_stops_the_session(self):
+        self.assertRaises(core.LauncherError, core.plan_session,
+                          self._status(client=None), core.MODE_SINGLE)
+
+    def test_an_unknown_mode_stops_the_session(self):
+        self.assertRaises(core.LauncherError, core.plan_session,
+                          self._status(), "spectate")
+
+    def test_an_invalid_join_address_stops_the_session(self):
+        self.assertRaises(core.LauncherError, core.plan_session,
+                          self._status(), core.MODE_JOIN, "")
+
+    def test_a_missing_mod_still_plans_a_session(self):
+        session = core.plan_session(self._status(mod_installed=False),
+                                    core.MODE_HOST)
+        self.assertTrue(session["needs_server"])
+
+
+class SettingsFileTest(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def _read(self, relative_path):
+        with open(os.path.join(self.root, relative_path), "rb") as stream:
+            return json.load(stream)
+
+    def test_0_8_2_join_enables_network_mode_and_keeps_other_keys(self):
+        path = os.path.join(self.root, "offhangar_user", "config.json")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as stream:
+            json.dump({"bots_per_team": 7, "network_mode": False}, stream)
+        core.write_settings(self.root, core.PORT_0_8_2, core.MODE_JOIN,
+                            "10.0.0.5", 1234, "Peng")
+        config = self._read(os.path.join("offhangar_user", "config.json"))
+        self.assertEqual(config["bots_per_team"], 7)
+        self.assertTrue(config["network_mode"])
+        self.assertEqual(config["network_server_host"], "10.0.0.5")
+        self.assertEqual(config["network_server_port"], 1234)
+        self.assertEqual(config["network_map_name"], "server_random")
+        self.assertEqual(config["nickname"], "Peng")
+
+    def test_0_8_2_single_player_disables_network_mode(self):
+        core.write_settings(self.root, core.PORT_0_8_2, core.MODE_SINGLE,
+                            core.LOCAL_HOST, core.DEFAULT_SERVER_PORT)
+        config = self._read(os.path.join("offhangar_user", "config.json"))
+        self.assertFalse(config["network_mode"])
+        self.assertNotIn("nickname", config)
+
+    def test_0_9_22_writes_the_user_owned_endpoint(self):
+        written = core.write_settings(self.root, core.PORT_0_9_22,
+                                      core.MODE_JOIN, "10.0.0.5", 1234)
+        endpoint = self._read(os.path.join(
+            "mods", "configs", "offline_lan_0922", "server_endpoint.json"))
+        self.assertEqual(endpoint, {"schema": 1, "host": "10.0.0.5",
+                                    "port": 1234})
+        self.assertEqual(len(written), 1)
+
+    def test_0_9_22_name_updates_an_existing_config(self):
+        config_path = os.path.join(self.root, "mods", "configs",
+                                   "offline_lan_0922", "config.json")
+        os.makedirs(os.path.dirname(config_path))
+        with open(config_path, "w") as stream:
+            json.dump({"schema": 1, "name": "Player", "max_health": 90}, stream)
+        core.write_settings(self.root, core.PORT_0_9_22, core.MODE_HOST,
+                            core.LOCAL_HOST, core.DEFAULT_SERVER_PORT, "Peng")
+        config = self._read(os.path.join(
+            "mods", "configs", "offline_lan_0922", "config.json"))
+        self.assertEqual(config["name"], "Peng")
+        self.assertEqual(config["max_health"], 90)
+
+    def test_unsupported_port_is_rejected(self):
+        self.assertRaises(core.LauncherError, core.write_settings, self.root,
+                          "0.1.0", core.MODE_SINGLE, core.LOCAL_HOST, 1)
+
+
+class ServerPayloadTest(unittest.TestCase):
+    def test_repository_layout_resolves_both_servers(self):
+        base = core.payload_root()
+        self.assertTrue(os.path.isfile(core.server_script(core.PORT_0_8_2,
+                                                          base)))
+        self.assertTrue(os.path.isfile(core.server_script(core.PORT_0_9_22,
+                                                          base)))
+
+    def test_0_8_2_server_receives_bind_arguments(self):
+        argv = core.server_argv(core.PORT_0_8_2, "/payload")
+        self.assertEqual(argv[1:], ["--host", core.LISTEN_HOST, "--port",
+                                    str(core.DEFAULT_SERVER_PORT)])
+
+    def test_0_9_22_server_binds_without_arguments(self):
+        argv = core.server_argv(core.PORT_0_9_22, "/payload")
+        self.assertEqual(argv[1:], [])
+
+    def test_frozen_command_reruns_the_launcher_executable(self):
+        command = core.server_child_command(
+            core.PORT_0_8_2, executable="C:\\launcher.exe", frozen=True)
+        self.assertEqual(command, ["C:\\launcher.exe", core.SERVE_FLAG,
+                                   core.PORT_0_8_2])
+
+    def test_source_command_passes_the_launcher_script(self):
+        command = core.server_child_command(
+            core.PORT_0_9_22, launcher_script="/repo/launcher/wot_launcher.py",
+            executable="/usr/bin/python3", frozen=False)
+        self.assertEqual(command, ["/usr/bin/python3",
+                                   "/repo/launcher/wot_launcher.py",
+                                   core.SERVE_FLAG, core.PORT_0_9_22])
+
+    def test_only_the_0_8_2_server_receives_the_navigation_graph_directory(self):
+        environment = core.server_environment(core.PORT_0_8_2, "/game", {})
+        self.assertTrue(environment[core.NAVGRAPH_DIR_ENV].endswith("navgraphs"))
+        self.assertIn("/game", environment[core.NAVGRAPH_DIR_ENV])
+        self.assertEqual(
+            core.server_environment(core.PORT_0_9_22, "/game", {}), {})
+
+    def test_missing_payload_reports_a_launcher_error(self):
+        self.assertRaises(core.LauncherError, core.run_server_payload,
+                          core.PORT_0_8_2, tempfile.mkdtemp())
+
+
+class PayloadStagingTest(unittest.TestCase):
+    def setUp(self):
+        self.target = os.path.join(tempfile.mkdtemp(), "servers")
+        self.addCleanup(shutil.rmtree, os.path.dirname(self.target), True)
+        self.written = stage_payload.stage(self.target)
+
+    def test_both_server_entry_points_are_staged(self):
+        for port_version in core.SUPPORTED_PORTS:
+            self.assertTrue(
+                os.path.isfile(core.server_script(port_version, self.target)),
+                port_version)
+
+    def test_the_0_9_22_server_finds_its_client_modules(self):
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.target, "0.9.22", "src", "res", "scripts", "client", "gui",
+            "mods", "offline_lan_0922", "ai", "maps.py")))
+
+    def test_the_navigation_graphs_stay_out_of_the_bundle(self):
+        self.assertFalse(any(
+            os.path.sep + "navgraphs" + os.path.sep in path
+            for path in self.written))
+
+    def test_staging_replaces_an_earlier_payload(self):
+        stale = os.path.join(self.target, "stale.txt")
+        with open(stale, "w") as stream:
+            stream.write("old")
+        stage_payload.stage(self.target)
+        self.assertFalse(os.path.exists(stale))
+
+
+class ListenerTest(unittest.TestCase):
+    def test_probe_reports_a_closed_port(self):
+        def refuse(address, timeout):
+            raise OSError("refused")
+
+        self.assertFalse(core.probe_endpoint("127.0.0.1", 1, connect=refuse))
+
+    def test_wait_returns_when_the_server_answers(self):
+        attempts = []
+
+        class Connection(object):
+            def close(self):
+                pass
+
+        def connect(address, timeout):
+            attempts.append(address)
+            if len(attempts) < 3:
+                raise OSError("not yet")
+            return Connection()
+
+        self.assertTrue(core.wait_for_listener(
+            "127.0.0.1", 28782, timeout=5.0, connect=connect,
+            clock=lambda: 0.0, sleep=lambda seconds: None))
+        self.assertEqual(len(attempts), 3)
+
+    def test_wait_gives_up_after_the_timeout(self):
+        times = iter([0.0, 1.0, 2.0, 3.0])
+
+        def connect(address, timeout):
+            raise OSError("refused")
+
+        self.assertFalse(core.wait_for_listener(
+            "127.0.0.1", 28782, timeout=1.0, connect=connect,
+            clock=lambda: next(times), sleep=lambda seconds: None))
+
+
+class LauncherSettingsTest(unittest.TestCase):
+    def test_settings_round_trip(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = os.path.join(directory, "launcher.json")
+        self.assertTrue(core.save_settings({"mode": core.MODE_HOST}, path))
+        self.assertEqual(core.load_settings(path), {"mode": core.MODE_HOST})
+
+    def test_missing_settings_are_empty(self):
+        self.assertEqual(core.load_settings("/nonexistent/launcher.json"), {})
+
+
+if __name__ == "__main__":
+    unittest.main()

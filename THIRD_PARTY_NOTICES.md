@@ -32,9 +32,10 @@ The build-time decoder under
 and is distributed under the WTFPL version 2. Its license text is retained in
 that vendored directory.
 
-## Windows server runtime and packager
+## Windows download runtimes and packager
 
-The downloadable Windows LAN server bundles CPython 3.11.9, distributed under
+The downloadable Windows LAN server and the desktop launcher bundle
+CPython 3.11.9, distributed under
 the Python Software Foundation License Version 2 together with the licenses
 and notices for software incorporated into Python. The complete terms and
 source release are published by the Python Software Foundation at
@@ -42,7 +43,11 @@ source release are published by the Python Software Foundation at
 and
 [`python.org/downloads/release/python-3119`](https://www.python.org/downloads/release/python-3119/).
 
-The executable is produced with PyInstaller 6.21.0. Its bootloader and loader
+The launcher window uses Tk, so the launcher executable also bundles Tcl/Tk 8.6
+under the BSD-style Tcl/Tk license. The complete terms are published at
+[`tcl-lang.org/software/tcltk/license.html`](https://www.tcl-lang.org/software/tcltk/license.html).
+
+Both executables are produced with PyInstaller 6.21.0. Its bootloader and loader
 are GPL-2.0-or-later with the PyInstaller bootloader exception, its runtime
 hooks are under Apache License 2.0, and its isolated helper is additionally
 available under the MIT license. The complete version-pinned licensing terms

@@ -28,6 +28,11 @@ jobs:
         run: >-
           python -m unittest discover -s 0.9.22/tests
           -p "test_*.py" -v
+      - name: Run launcher test suite
+        working-directory: launcher
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -s tests -p "test_*.py" -v
       - name: Check Python 2.6 client syntax
         run: |
           docker run --rm --entrypoint /bin/sh -v "$PWD:/work:ro" zinainfra/python26 -c '
@@ -230,4 +235,69 @@ jobs:
             0.9.22/dist/WoT-0.9.22-LAN-Server-Windows.zip
             0.9.22/dist/server/WoT-0.9.22-LAN-Server.exe
             0.9.22/dist/server/README.txt
+          if-no-files-found: error
+
+  windows-launcher:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11.9"
+          architecture: "x64"
+      - name: Install pinned Windows packager
+        run: >-
+          python -m pip install
+          -r 0.9.22/server/requirements-windows-build.txt
+      - name: Build the desktop launcher
+        shell: pwsh
+        run: pwsh -NoProfile -File launcher/build_launcher.ps1
+      - name: Verify that the bundled servers run from the launcher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $launcher = Join-Path $PWD "launcher\dist\WoT-Offline-Battles-Launcher.exe"
+          $navgraphs = Join-Path $PWD "0.8.2\scripts\client\gui\mods\offhangar\navgraphs"
+          $env:WOT_OFFLINE_NAVGRAPH_DIR = $navgraphs
+          foreach ($port in @("0.8.2", "0.9.22")) {
+              $process = Start-Process -FilePath $launcher `
+                  -ArgumentList "--serve", $port -PassThru
+              try {
+                  $deadline = (Get-Date).AddSeconds(60)
+                  $listening = $false
+                  while ((Get-Date) -lt $deadline) {
+                      if ($process.HasExited) {
+                          throw "$port server exited before opening port 28782"
+                      }
+                      $listeners = Get-NetTCPConnection `
+                          -LocalPort 28782 -State Listen -ErrorAction SilentlyContinue
+                      if ($listeners | Where-Object { $_.LocalAddress -eq "0.0.0.0" }) {
+                          $listening = $true
+                          break
+                      }
+                      Start-Sleep -Milliseconds 250
+                  }
+                  if (-not $listening) {
+                      throw "$port server did not bind 0.0.0.0:28782"
+                  }
+                  Write-Host "$port server listens through the launcher bundle"
+              }
+              finally {
+                  if (-not $process.HasExited) {
+                      & taskkill.exe /PID $process.Id /T /F | Out-Null
+                  }
+                  Start-Sleep -Seconds 2
+              }
+          }
+          $log = Join-Path $env:LOCALAPPDATA "WoTOfflineBattles\server.log"
+          if (Test-Path $log) {
+              Write-Host "--- launcher server log ---"
+              Get-Content $log -Tail 40
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wot-offline-battles-launcher
+          path: |
+            launcher/dist/WoT-Offline-Battles-Launcher.exe
+            launcher/dist/README.txt
           if-no-files-found: error

@@ -407,5 +407,42 @@ class ServerBotNavigationTests(unittest.TestCase):
         self.assertLess(resolver.diagnostics()["max_budget_ms"], 100.0)
 
 
+class GraphDirectoryOverrideTests(unittest.TestCase):
+    def test_launcher_directory_is_searched_first(self):
+        with mock.patch.dict(
+                "os.environ",
+                {server_bot_navigation.NAVGRAPH_DIR_ENV: "  /client/navgraphs  "}):
+            directories = server_bot_navigation._graph_directories()
+        self.assertEqual(directories[0], "/client/navgraphs")
+        self.assertEqual(len(directories), 3)
+
+    def test_the_bundled_directories_remain_without_an_override(self):
+        with mock.patch.dict(
+                "os.environ",
+                {server_bot_navigation.NAVGRAPH_DIR_ENV: ""}):
+            directories = server_bot_navigation._graph_directories()
+        self.assertEqual(len(directories), 2)
+        self.assertTrue(
+            all(path.endswith("navgraphs") for path in directories))
+
+    def test_an_overridden_directory_loads_a_graph(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = ROOT / "scripts/client/gui/mods/offhangar/navgraphs"
+            for source_path in source.glob("*.json"):
+                shutil.copy2(source_path, Path(directory) / source_path.name)
+            with mock.patch.dict(
+                    "os.environ",
+                    {server_bot_navigation.NAVGRAPH_DIR_ENV: directory}):
+                with mock.patch.object(
+                        server_bot_navigation, "_ROOT", tempfile.gettempdir()):
+                    with mock.patch.object(
+                            server_bot_navigation, "_RELEASE_CLIENT_ROOT",
+                            tempfile.gettempdir()):
+                        graph, path, unused_digest = (
+                            server_bot_navigation._load_graph("07_lakeville"))
+        self.assertTrue(path.startswith(directory))
+        self.assertTrue(graph["links"])
+
+
 if __name__ == "__main__":
     unittest.main()

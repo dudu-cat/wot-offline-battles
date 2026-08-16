@@ -1,0 +1,191 @@
+"""Wiring tests for the launcher window with a fake Tk module.
+
+Widget option names and real Tk behavior stay unproven here. Only the callback
+wiring and the guard paths are covered.
+"""
+
+import os
+import shutil
+import tempfile
+import unittest
+
+import core
+import wot_launcher
+
+
+class _Widget(object):
+    def __init__(self, master=None, **options):
+        self.options = dict(options)
+        self.children = []
+        if master is not None and hasattr(master, "children"):
+            master.children.append(self)
+
+    def pack(self, **unused):
+        pass
+
+    def grid(self, **unused):
+        pass
+
+    def grid_columnconfigure(self, *unused, **unused_options):
+        pass
+
+    grid_rowconfigure = grid_columnconfigure
+
+    def config(self, **options):
+        self.options.update(options)
+
+    def cget(self, name):
+        return self.options.get(name)
+
+
+class _Text(_Widget):
+    def __init__(self, master=None, **options):
+        _Widget.__init__(self, master, **options)
+        self.lines = []
+
+    def insert(self, unused_index, text):
+        self.lines.append(text)
+
+    def see(self, unused_index):
+        pass
+
+
+class _StringVar(object):
+    def __init__(self, value=""):
+        self._value = value
+        self._callbacks = []
+
+    def get(self):
+        return self._value
+
+    def set(self, value):
+        self._value = value
+        for callback in self._callbacks:
+            callback()
+
+    def trace_add(self, unused_mode, callback):
+        self._callbacks.append(lambda: callback())
+
+
+class _Root(_Widget):
+    def __init__(self):
+        _Widget.__init__(self)
+        self.destroyed = False
+
+    def title(self, unused_title):
+        pass
+
+    def protocol(self, unused_name, unused_handler):
+        pass
+
+    def after(self, unused_delay, callback):
+        callback()
+
+    def destroy(self):
+        self.destroyed = True
+
+
+class _FakeTk(object):
+    Tk = _Root
+    Frame = _Widget
+    Label = _Widget
+    Entry = _Widget
+    Button = _Widget
+    Radiobutton = _Widget
+    Text = _Text
+    StringVar = _StringVar
+
+
+class _FakeFileDialog(object):
+    def __init__(self, selection=""):
+        self.selection = selection
+
+    def askdirectory(self, **unused):
+        return self.selection
+
+
+class WindowTest(unittest.TestCase):
+    def setUp(self):
+        self.settings_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.settings_dir, True)
+        self.addCleanup(setattr, core, "settings_path", core.settings_path)
+        core.settings_path = lambda: os.path.join(self.settings_dir,
+                                                  "launcher.json")
+        self.dialog = _FakeFileDialog()
+        self.window = wot_launcher.LauncherWindow(_FakeTk, self.dialog)
+
+    def _log_text(self):
+        return "".join(self.window.log_view.lines)
+
+    def test_the_address_field_follows_the_selected_mode(self):
+        self.window.mode.set(core.MODE_JOIN)
+        self.window._refresh_mode()
+        self.assertEqual(self.window.join_entry.cget("state"), "normal")
+        self.window.mode.set(core.MODE_SINGLE)
+        self.window._refresh_mode()
+        self.assertEqual(self.window.join_entry.cget("state"), "disabled")
+
+    def test_an_empty_folder_asks_for_the_game_executable(self):
+        self.window.game_root.set("")
+        self.assertIn(core.GAME_EXECUTABLE,
+                      self.window.client_label.cget("text"))
+
+    def test_a_folder_without_the_executable_is_reported(self):
+        self.window.game_root.set(self.settings_dir)
+        self.assertIn("was not found", self.window.client_label.cget("text"))
+
+    def test_browsing_fills_in_the_selected_folder(self):
+        self.dialog.selection = self.settings_dir
+        self.window._browse()
+        self.assertEqual(self.window.game_root.get(),
+                         os.path.normpath(self.settings_dir))
+
+    def test_start_reports_the_problem_and_runs_nothing(self):
+        self.window.game_root.set(self.settings_dir)
+        self.window._start()
+        self.assertIn(core.GAME_EXECUTABLE, self._log_text())
+        self.assertFalse(self.window._busy)
+
+    def test_start_reports_an_invalid_join_address(self):
+        game_root = os.path.join(self.settings_dir, "game")
+        os.makedirs(os.path.join(game_root, "res_mods", "0.8.2", "scripts",
+                                 "client", "gui", "mods", "offhangar"))
+        with open(os.path.join(game_root, core.GAME_EXECUTABLE), "w") as stream:
+            stream.write("")
+        self.window.game_root.set(game_root)
+        self.window.mode.set(core.MODE_JOIN)
+        self.window.join_address.set("")
+        self.window._start()
+        self.assertIn("Enter the address", self._log_text())
+        self.assertFalse(self.window._busy)
+
+    def test_settings_survive_a_new_window(self):
+        self.window.game_root.set(self.settings_dir)
+        self.window.mode.set(core.MODE_HOST)
+        self.window.player_name.set("Peng")
+        self.window._save_settings()
+        reopened = wot_launcher.LauncherWindow(_FakeTk, self.dialog)
+        self.assertEqual(reopened.mode.get(), core.MODE_HOST)
+        self.assertEqual(reopened.player_name.get(), "Peng")
+
+    def test_closing_the_window_stops_the_server(self):
+        stopped = []
+
+        class _Server(object):
+            def poll(self):
+                return None
+
+            def terminate(self):
+                stopped.append("terminate")
+
+            def wait(self, timeout=None):
+                return 0
+
+        self.window._server = _Server()
+        self.window._on_close()
+        self.assertEqual(stopped, ["terminate"])
+        self.assertTrue(self.window.root.destroyed)
+
+
+if __name__ == "__main__":
+    unittest.main()
