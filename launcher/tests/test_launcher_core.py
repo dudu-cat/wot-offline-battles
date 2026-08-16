@@ -559,6 +559,28 @@ class ListenerTest(unittest.TestCase):
             clock=lambda: next(times), sleep=lambda seconds: None))
 
 
+class ConnectionReportTest(unittest.TestCase):
+    def test_a_reachable_join_target_is_confirmed(self):
+        self.assertIn("answered", core.connection_report(
+            core.MODE_JOIN, "10.0.0.5", 28782, True))
+
+    def test_an_unreachable_join_target_names_the_firewall(self):
+        message = core.connection_report(core.MODE_JOIN, "10.0.0.5", 28782,
+                                         False)
+        self.assertIn("No answer from 10.0.0.5:28782", message)
+        self.assertIn("firewall", message)
+
+    def test_a_busy_port_warns_the_host(self):
+        message = core.connection_report(core.MODE_HOST, core.LOCAL_HOST,
+                                         28782, True)
+        self.assertIn("already listens", message)
+
+    def test_a_free_port_tells_the_host_what_happens_next(self):
+        message = core.connection_report(core.MODE_SINGLE, core.LOCAL_HOST,
+                                         28782, False)
+        self.assertIn("Start game runs the server", message)
+
+
 class LocalAddressTest(unittest.TestCase):
     def test_loopback_is_never_offered_to_other_players(self):
         self.assertEqual(

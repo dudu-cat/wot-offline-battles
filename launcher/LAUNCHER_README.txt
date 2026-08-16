@@ -17,7 +17,9 @@ Tanks, and stops that server when the game closes.
      prints the address they should type.
    - Join a LAN battle: type the address of the PC that hosts the battle, for
      example 192.168.1.20 or 192.168.1.20:28782.
-4. Type a player name. Other players see it in the LAN room.
+4. Type a player name. Other players see it in the LAN room. Test connection
+   checks the address you typed, or reports whether port 28782 on this PC is
+   already taken when you host.
 5. Click Start game. The launcher removes older mod files, installs the mod
    for that client, and starts the game. This takes a few seconds.
 

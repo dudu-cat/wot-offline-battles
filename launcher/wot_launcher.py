@@ -83,9 +83,12 @@ class LauncherWindow(object):
             value=settings.get("join_address", "192.168.1.10:%d" %
                                core.DEFAULT_SERVER_PORT))
         self.join_entry = tk.Entry(frame, textvariable=self.join_address,
-                                   width=52)
-        self.join_entry.grid(row=row, column=1, columnspan=2, sticky="we",
-                             padx=(6, 0), pady=(6, 0))
+                                   width=40)
+        self.join_entry.grid(row=row, column=1, sticky="we", padx=(6, 6),
+                             pady=(6, 0))
+        self.test_button = tk.Button(frame, text="Test connection",
+                                     command=self._test_connection)
+        self.test_button.grid(row=row, column=2, sticky="e", pady=(6, 0))
         row += 1
 
         tk.Label(frame, text="Player name").grid(row=row, column=0, sticky="w",
@@ -149,6 +152,29 @@ class LauncherWindow(object):
     def _refresh_mode(self):
         state = "normal" if self.mode.get() == core.MODE_JOIN else "disabled"
         self.join_entry.config(state=state)
+
+    def _test_connection(self):
+        mode = self.mode.get()
+        try:
+            host, port = core.endpoint_for_mode(mode, self.join_address.get())
+        except core.LauncherError as error:
+            self._log(str(error))
+            return False
+        self.test_button.config(state="disabled")
+        self._log("Testing %s:%d..." % (host, port))
+
+        def probe():
+            try:
+                answered = core.probe_endpoint(host, port)
+                self._log(core.connection_report(mode, host, port, answered))
+            finally:
+                self.root.after(
+                    0, lambda: self.test_button.config(state="normal"))
+
+        thread = threading.Thread(target=probe)
+        thread.daemon = True
+        thread.start()
+        return True
 
     def _log(self, message):
         def append():

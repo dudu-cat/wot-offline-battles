@@ -444,6 +444,22 @@ def run_server_payload(port_version, base_dir=None):
     runpy.run_path(script, run_name="__main__")
 
 
+def connection_report(mode, host, port, answered):
+    """Describe one connection test for the launcher window."""
+    endpoint = "%s:%d" % (host, int(port))
+    if mode == MODE_JOIN:
+        if answered:
+            return "The server at %s answered." % endpoint
+        return ("No answer from %s. Check that the host started the battle "
+                "and that its firewall allows TCP %d." %
+                (endpoint, int(port)))
+    if answered:
+        return ("A server already listens on %s. Close it before you host "
+                "here." % endpoint)
+    return ("Nothing listens on %s yet. Start game runs the server there." %
+            endpoint)
+
+
 def probe_endpoint(host, port, timeout=1.5, connect=None):
     """Report whether something accepts TCP connections at this endpoint."""
     connect = connect or socket.create_connection

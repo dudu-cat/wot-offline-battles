@@ -7,6 +7,7 @@ wiring and the guard paths are covered.
 import os
 import shutil
 import tempfile
+import time
 import unittest
 
 import core
@@ -192,6 +193,26 @@ class WindowTest(unittest.TestCase):
         self.dialog.selection = self.settings_dir
         self.window._browse()
         self.assertEqual([], self.window._folders)
+
+    def test_the_test_button_probes_the_typed_address(self):
+        probed = []
+        self.addCleanup(setattr, core, "probe_endpoint", core.probe_endpoint)
+        core.probe_endpoint = lambda host, port: probed.append((host, port))
+        self.window.mode.set(core.MODE_JOIN)
+        self.window.join_address.set("10.0.0.5:1234")
+        self.assertTrue(self.window._test_connection())
+        for attempt in range(200):
+            if probed:
+                break
+            time.sleep(0.01)
+        self.assertEqual([("10.0.0.5", 1234)], probed)
+        self.assertIn("Testing 10.0.0.5:1234", self._log_text())
+
+    def test_the_test_button_reports_an_invalid_address(self):
+        self.window.mode.set(core.MODE_JOIN)
+        self.window.join_address.set("")
+        self.assertFalse(self.window._test_connection())
+        self.assertIn("Enter the address", self._log_text())
 
     def test_closing_the_window_saves_the_settings(self):
         self.window.player_name.set("Peng")
