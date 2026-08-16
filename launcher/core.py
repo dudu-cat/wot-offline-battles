@@ -31,7 +31,7 @@ NAVGRAPH_DIR_ENV = "WOT_OFFLINE_NAVGRAPH_DIR"
 # The client can close its first process and start another one while it
 # starts up. The launcher waits this long after the last one before it
 # stops the LAN server.
-GAME_RESTART_GRACE_SECONDS = 30.0
+GAME_RESTART_GRACE_SECONDS = 8.0
 KNOWN_FOLDER_LIMIT = 10
 COMMON_GAME_ROOTS = (
     "C:\\Games", "C:\\Program Files", "C:\\Program Files (x86)",

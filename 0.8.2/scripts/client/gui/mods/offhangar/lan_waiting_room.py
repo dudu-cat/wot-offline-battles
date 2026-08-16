@@ -8,7 +8,6 @@ _active = False
 _player = None
 _offline = False
 _on_start = None
-_on_cancel = None
 _offline_options = ()
 _panel = None
 _text = None
@@ -214,7 +213,6 @@ def _make_panel():
 		_make_control('map', (0.0, 0.15, 0.05), 1.15, 0.22)
 		_make_control('next', (0.72, 0.15, 0.05), 0.20, 0.22)
 		_make_control('start', (0.0, -0.32, 0.05), 1.62, 0.24)
-		_make_control('cancel', (0.0, -0.68, 0.05), 0.60, 0.20)
 		_make_label('title', 'LAN WAITING ROOM', (-0.84, 0.78, 0.00),
 			1.68, 0.12, colour=(232, 244, 255, 255))
 		_make_label('count', '', (-0.84, 0.54, 0.00), 1.68, 0.11)
@@ -226,9 +224,7 @@ def _make_panel():
 			anchor='CENTER')
 		_make_label('start', 'START BATTLE', (0.0, -0.32, 0.00),
 			1.58, 0.12, anchor='CENTER')
-		_make_label('cancel', 'LEAVE', (0.0, -0.68, 0.00), 0.56, 0.12,
-			anchor='CENTER')
-		_make_label('status', '', (-0.84, -0.90, 0.00), 1.68, 0.12,
+		_make_label('status', '', (-0.84, -0.68, 0.00), 1.68, 0.12,
 			colour=(184, 205, 222, 255))
 		_text = _labels['status']
 		GUI.addRoot(_panel)
@@ -257,8 +253,6 @@ def _paint_controls():
 			colour = (62, 137, 190, 245)
 		elif role == 'start':
 			colour = (40, 118, 64, 245)
-		elif role == 'cancel':
-			colour = (110, 48, 48, 240)
 		elif role == 'map':
 			colour = (38, 104, 154, 245)
 		else:
@@ -324,25 +318,14 @@ def _activate(role):
 			_status = 'Starting %s...' % _friendly_map_name(_selected_map)
 			request_battle_start(_player, _selected_map)
 			_refresh()
-	elif role == 'cancel':
-		cancel = _on_cancel
-		player = _player
-		offline = _offline
-		close()
-		if callable(cancel):
-			cancel()
-		elif not offline:
-			from gui.mods.offhangar.network_battle import stop_for_player
-			stop_for_player(player)
-		return True
 	else:
 		return False
 	return True
 
 
-def open_offline(player, on_start=None, on_cancel=None, options=None):
+def open_offline(player, on_start=None, options=None):
 	"""Show the same room for a single-player queue."""
-	global _offline, _on_start, _on_cancel, _offline_options
+	global _offline, _on_start, _offline_options
 	global _active, _player, _selected_map, _status
 	_offline_options = tuple(options if options is not None
 		else offline_map_options())
@@ -352,7 +335,6 @@ def open_offline(player, on_start=None, on_cancel=None, options=None):
 		return False
 	_offline = True
 	_on_start = on_start
-	_on_cancel = on_cancel
 	_player = player
 	if _selected_map not in _offline_options:
 		_selected_map = _offline_options[0]
@@ -412,11 +394,10 @@ def selected_map():
 
 
 def close():
-	global _active, _player, _offline, _on_start, _on_cancel
+	global _active, _player, _offline, _on_start
 	_active = False
 	_offline = False
 	_on_start = None
-	_on_cancel = None
 	_set_visible(False)
 	_release_cursor()
 	_player = None

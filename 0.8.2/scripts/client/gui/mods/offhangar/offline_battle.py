@@ -19525,15 +19525,18 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			def _auto_spawn_teams(_spawn_gen=_offh_my_gen[0],
 					_spawn_not_before=_auto_spawn_not_before):
 				if globals().get('g_offh_battle_gen', 0) != _spawn_gen:
+					LOG_DEBUG('AUTO-SPAWN skipped: battle generation changed')
 					return
 				import BigWorld, Keys, Math, math
 				try:
 					_pl = BigWorld.player()
 					if _pl is None or _battle_finished[0]:
+						LOG_DEBUG('AUTO-SPAWN skipped: no player or battle over')
 						return
 					from _constants import CONFIG_OPTIONS as _CFG
 					_n_per_team = int(_CFG.get('bots_per_team', 15))
 					if _n_per_team <= 0:
+						LOG_DEBUG('AUTO-SPAWN skipped: bots_per_team is zero')
 						return
 					# Replicas can be called before the authority has published the shared
 					# lineup. Retry cheaply instead of rebuilding a throw-away local match.
@@ -21125,24 +21128,15 @@ def _open_offline_map_room(player, vehInvID, cmdName, queue_generation):
 					player, '_offhangar_queue_generation', 0) or
 				getattr(player, '_offhangar_queue_cancelled', False)):
 			return
+		# The chosen map only reaches the battle context through another
+		# enqueue step, because that step builds the arena from it.
 		player._offhangar_selected_mapId = str(map_name)
 		_step_on_enqueued(player, vehInvID, cmdName)
 		_schedule_arena_created_resilient(cmdName, player, queue_generation)
 
-	def cancel():
-		player._offhangar_queue_cancelled = True
-		if hasattr(player, '_offhangar_selected_mapId'):
-			delattr(player, '_offhangar_selected_mapId')
-		try:
-			dequeue = getattr(player, 'dequeueRandom', None)
-			if callable(dequeue):
-				dequeue()
-		except Exception:
-			LOG_CURRENT_EXCEPTION()
-
 	try:
 		from gui.mods.offhangar.lan_waiting_room import open_offline
-		return bool(open_offline(player, on_start=start, on_cancel=cancel))
+		return bool(open_offline(player, on_start=start))
 	except Exception:
 		LOG_CURRENT_EXCEPTION()
 		return False
@@ -21220,9 +21214,12 @@ def begin_offline_battle_queue(player, vehInvID, cmdName, cmd=0, args=()):
 			return
 		if _network_mode_enabled():
 			_join_network_waiting_room(player, vehInvID, cmdName)
-		elif not _open_offline_map_room(player, vehInvID, cmdName,
+			return
+		# The stock queue screen is already up.  The map room opens over it and
+		# owns the transition; the queue's own cancel button still leaves.
+		_step_on_enqueued(player, vehInvID, cmdName)
+		if not _open_offline_map_room(player, vehInvID, cmdName,
 				queue_generation):
-			_step_on_enqueued(player, vehInvID, cmdName)
 			_schedule_arena_created_resilient(cmdName, player, queue_generation)
 
 	# Run after onCmdResponse so native queue state is visible before transition.
