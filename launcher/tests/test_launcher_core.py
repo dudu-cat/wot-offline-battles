@@ -404,6 +404,24 @@ class ListenerTest(unittest.TestCase):
             clock=lambda: next(times), sleep=lambda seconds: None))
 
 
+class LocalAddressTest(unittest.TestCase):
+    def test_loopback_is_never_offered_to_other_players(self):
+        self.assertEqual(
+            core.local_addresses(lambda: ['127.0.0.1', '192.168.1.20']),
+            ['192.168.1.20'])
+
+    def test_duplicate_addresses_collapse(self):
+        self.assertEqual(
+            core.local_addresses(lambda: ['10.0.0.5', '10.0.0.5']),
+            ['10.0.0.5'])
+
+    def test_a_failed_lookup_reports_no_address(self):
+        def fail():
+            raise OSError('no name')
+
+        self.assertEqual(core.local_addresses(fail), [])
+
+
 class LauncherSettingsTest(unittest.TestCase):
     def test_settings_round_trip(self):
         directory = tempfile.mkdtemp()

@@ -325,6 +325,19 @@ def wait_for_listener(host, port, timeout=20.0, interval=0.25, connect=None,
         sleep(interval)
 
 
+def local_addresses(resolver=None):
+    """Return the addresses other players can use to reach this host."""
+    if resolver is None:
+        def resolver():
+            return socket.gethostbyname_ex(socket.gethostname())[2]
+    try:
+        addresses = resolver()
+    except (socket.error, OSError, IndexError):
+        return []
+    return sorted({address for address in addresses
+                   if address and not address.startswith('127.')})
+
+
 def settings_path():
     base = os.environ.get("LOCALAPPDATA")
     if not base:

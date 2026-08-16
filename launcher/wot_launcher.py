@@ -217,6 +217,9 @@ class LauncherWindow(object):
             return False
         self._log("The LAN server listens on port %d." %
                   core.DEFAULT_SERVER_PORT)
+        for address in core.local_addresses():
+            self._log("Other players join with %s:%d" %
+                      (address, core.DEFAULT_SERVER_PORT))
         return True
 
     def _pump_server_output(self):
