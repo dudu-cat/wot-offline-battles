@@ -245,9 +245,8 @@ the boundary so neither runtime depends on the other's object model.
   rejected before any partial mutation. Validate a complete batch before
   applying its first item.
 
-`0.9.22/SERVER_RESPONSIBILITY_AUDIT.md` is the canonical authority matrix.
-Update it when ownership changes; do not infer authority from which client
-happens to calculate a presentation value.
+The server owns room, round, health, damage and bot authority. Do not infer
+authority from which side happens to calculate a presentation value.
 
 ## Performance investigations
 
@@ -295,46 +294,28 @@ fixed.
 
 ## Validation and release
 
-Use `0.9.22/RELEASE_CHECKLIST.md` as the canonical, current command list. At a
-minimum, ordinary changes should run the focused test, the relevant port
-suite, Python 2.7 source compilation for changed client files, and
-`git diff --check`. Release work additionally requires the shared suite,
-source-provenance audit, exact-client ABI/lifecycle audits, package inspection,
-Windows server CI artifact smoke, and the listed native #1513 acceptance.
-
-The following are convenient examples, but re-check the canonical release
-checklist before running them because that file owns the current gate list:
+Ordinary changes run the focused test, the port suite, Python 2.7 source
+compilation for changed client files, and `git diff --check`. These tools stay
+available for exact-client questions, but none of them is a required ritual:
 
 ```bash
 export PYTHONDONTWRITEBYTECODE=1
 python3 0.9.22/tools/inspect_client.py "$WOT_0922_CLIENT"
-"$PY27" 0.9.22/tools/audit_embedded_types.py
 "$PY27" 0.9.22/tools/audit_client_abi.py "$WOT_0922_CLIENT"
-"$PY27" 0.9.22/tools/audit_lobby_consumers.py "$WOT_0922_CLIENT"
 "$PY27" 0.9.22/tools/audit_client_lifecycle.py "$WOT_0922_CLIENT"
-python3 0.9.22/tools/audit_battle_sources.py .
 ```
 
-Update reviewed source hashes only after production files are frozen and an
-independent review has found no remaining blocker. Build client artifacts with
-`0.9.22/build_for_client.sh "$WOT_0922_CLIENT"`. That script is not read-only:
-it rebuilds `0.9.22/dist` and removes older outputs produced by this port.
-Build the Windows server on Windows CI, not by pretending a macOS artifact
-proves the Windows executable. `validate_wotmod.py` is a read-only internal
-WOTMOD gate, but by itself it does not prove the outer ZIP, overlay, sidecar,
-or Windows runtime.
-
-Before release, independently inspect archive paths, CRC, compression,
-source-to-PYC identity, versions, endpoint defaults, sidecars, map manifests,
-and SHA-256. The packaged default endpoint is loopback; the user-owned
-`server_endpoint.json` must not be shipped in the overlay.
+Build client artifacts with `0.9.22/build_for_client.sh "$WOT_0922_CLIENT"`.
+That script is not read-only: it rebuilds `0.9.22/dist` and removes older
+outputs produced by this port. Build the Windows server and the launcher on
+Windows CI, not by pretending a macOS artifact proves the Windows executable.
+The packaged default endpoint is loopback; the user-owned
+`server_endpoint.json` must never ship in the overlay.
 
 ## Recurring traps
 
 - Old `ports/0.9.22` commands and old test counts are stale. Discover the live
   top-level paths and counts.
-- Older version sections in `0.9.22/README.md` explain history and may describe
-  behavior superseded by the newest section.
 - A successful wrapper call is not proof that native state changed. Read back
   the typed property or verify the exact consumer.
 - A resource field, native string, or similarly named public source method is

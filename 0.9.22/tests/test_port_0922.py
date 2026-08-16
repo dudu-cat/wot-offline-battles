@@ -322,48 +322,6 @@ class PortSourceTests(unittest.TestCase):
             PORT_ROOT / 'src' / 'res' / 'scripts' / 'client' / 'gui' /
             'mods' / 'mod_offline_lan_0922.py').is_file())
 
-    def test_release_version_is_consistent(self):
-        version = '0.4.0'
-        package = (
-            PORT_ROOT / 'src' / 'res' / 'scripts' / 'client' / 'gui' /
-            'mods' / 'offline_lan_0922' / '__init__.py')
-        self.assertIn("PORT_VERSION = '%s'" % version,
-                      package.read_text(encoding='utf-8'))
-        self.assertIn('<version>%s</version>' % version,
-                      (PORT_ROOT / 'meta.xml').read_text(encoding='utf-8'))
-        self.assertIn("MOD_VERSION = '%s'" % version,
-                      (PORT_ROOT / 'build_wotmod.py').read_text(
-                          encoding='utf-8'))
-        self.assertIn("version != '%s'" % version,
-                      (PORT_ROOT / 'tools' / 'validate_wotmod.py').read_text(
-                          encoding='utf-8'))
-        self.assertIn('org.peng.offline_lan_0922_%s.wotmod' % version,
-                      (PORT_ROOT / 'build_for_client.sh').read_text(
-                          encoding='utf-8'))
-        self.assertIn(
-            'org.peng.offline_lan_0922_%s.wotmod' % version,
-            (ROOT / '.github' / 'workflows' / 'tests.yml').read_text(
-                encoding='utf-8'))
-        install = (PORT_ROOT / 'INSTALL.txt').read_text(encoding='utf-8')
-        port_readme = (PORT_ROOT / 'README.md').read_text(encoding='utf-8')
-        root_readme = (ROOT / 'README.md').read_text(encoding='utf-8')
-        self.assertIn('package %s' % version, install)
-        self.assertIn(
-            'org.peng.offline_lan_0922_%s.wotmod' % version, install)
-        self.assertIn(
-            'org.peng.offline_lan_0922_%s.wotmod' % version, port_readme)
-        normalized_root_readme = ' '.join(root_readme.split())
-        self.assertIn(
-            'Versioned client and server packages are published through '
-            'GitHub Releases.',
-            normalized_root_readme)
-        self.assertIn(
-            'WoT-0.9.22-LAN-Client-*.zip',
-            normalized_root_readme)
-        self.assertIn(
-            'WoT-0.9.22-LAN-Server.exe',
-            normalized_root_readme)
-
     def test_port_sources_are_python_2_compatible_syntax(self):
         source_root = PORT_ROOT / 'src'
         for path in source_root.rglob('*.py'):

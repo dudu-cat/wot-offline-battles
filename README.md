@@ -1,123 +1,81 @@
 # World of Tanks Offline Battles
 
-An unofficial compatibility project for playing standard battles with bots in
-two legacy Windows clients:
+Play standard battles with bots in two legacy Windows clients, alone or with
+friends on a LAN:
 
-| Port | Supported client | Play modes |
-| --- | --- | --- |
-| [`0.8.2`](0.8.2/) | World of Tanks 0.8.2 | Server-free single-player or trusted LAN |
-| [`0.9.22`](0.9.22/) | Chinese HD client 0.9.22.0.1 #1513 | Server-backed single-player or trusted LAN |
+| Port | Supported client |
+| --- | --- |
+| [`0.8.2`](0.8.2/) | World of Tanks 0.8.2 |
+| [`0.9.22`](0.9.22/) | Chinese HD client 0.9.22.0.1 #1513 |
 
-Versioned client and server packages are published through GitHub Releases.
-Each package remains locked to the exact legacy client shown below.
+You supply your own client. The client still provides the maps, vehicles,
+rendering, HUD and physics. This repository provides the client mod, the bot
+and battle logic, a small LAN server and a launcher.
 
-The original client still provides the maps, vehicles, rendering, HUD, physics
-and other proprietary runtime data. This repository provides the client mods,
-bot and battle logic, a small LAN coordinator, build tools and tests. It does
-not include the game client or its assets, and it is not a replacement for the
-original BigWorld server.
+## Play
 
-## What makes this repository different
+1. Download `WoT-Offline-Battles-Launcher-Windows.zip` from the releases,
+   unpack it, and start `WoT-Offline-Battles-Launcher.exe`.
+2. Select your World of Tanks folder. The launcher recognizes the client,
+   removes any older mod files and installs the matching mod.
+3. Select a mode:
+   - **Single player**: you play alone against bots.
+   - **Host a LAN battle**: other players join this PC. The launcher starts the
+     server and prints the address to give them.
+   - **Join a LAN battle**: type the host's address, for example
+     `192.168.1.20`.
+4. Click **Start game**. In the garage, select a tank and click **Battle!**.
+   Everyone lands in the LAN waiting room; the host picks a map and clicks
+   **START BATTLE**.
 
-The two credited reference projects are much narrower at the revisions used
-here. [`mod_offhangar_legacy`](https://github.com/SigmaTel71/mod_offhangar_legacy/tree/312534823dab535457f8578d9eae6cf3c549944e)
-describes itself as a partially functional offline hangar: it bypasses login
-and supplies enough account data to inspect vehicles, but does not implement an
-arena or combat. [`wot-offline-server`](https://github.com/the-tuxedo-cat/wot-offline-server/tree/c0bc550c46deac980194b7b860ee8781d53ec97b)
-is an unfinished map-and-vehicle sandbox: it can load a map, an Avatar and one
-hard-coded test vehicle, while firing only plays an effect and its aiming
-handlers are stubs.
+When you host, approve the UAC prompt that opens TCP 28782 for the launcher.
+Run the server only on a network you trust.
 
-This repository carries those foundations into a much higher-fidelity
-reconstruction of a standard World of Tanks battle:
+## What is in the battle
 
-- **The original client remains the game engine.** Each version-locked port
-  drives the stock BigWorld maps, Avatar/Vehicle lifecycle, vehicle
-  descriptors, gun, reticle, camera, collision, destructibles and HUD. The two
-  ports are audited against their exact embedded Python runtimes and native
-  contracts instead of sharing transplanted bytecode or replacing the client
-  with a detached simulator.
-- **Combat follows same-era tank mechanics, not simple hitpoint trading.** A
-  round includes 15-versus-15 spawning, countdown, movement and gun limits,
-  ammunition and reloads, elapsed shell flight with gravity and moving-target
-  sweeps, dispersion, range-dependent penetration, normalization, ricochet,
-  overmatch, spaced armour, HE splash, ramming, module and crew damage, fires
-  and repairs. Spotting accounts for view range, camouflage, movement, firing,
-  foliage, line of sight and last-known positions. Capture, elimination and
-  timeout produce a shared result, followed by clean repeated-round state.
-- **Bots fight the map and battle state, not just the nearest target.** Vehicle
-  class and statistics shape stable roles and personalities. Map geometry,
-  terrain, water, traffic, firing lanes, team strength and shared contacts feed
-  route, cover, target and ammunition decisions. Bots can defend, flank, angle,
-  peek, withdraw, stage artillery and use ballistic SPG arcs. The repository
-  ships map-specific navigation and foliage data for all 33 supported 0.8.2
-  maps and all 41 supported 0.9.22 maps.
-- **A LAN match is one shared battle, not a collection of moving vehicles.**
-  The trusted-LAN coordinator synchronizes lineups, countdown, tactical orders,
-  projectiles, HP and critical damage, destructibles, capture, results and
-  round transitions. Round and revision fencing rejects stale or duplicate
-  combat state, while authority failover preserves the match if the active bot
-  controller disconnects.
+- 15-versus-15 spawning, countdown, capture, elimination and timeout, then a
+  clean next round.
+- Same-era gunnery: shell flight time and gravity, dispersion, penetration by
+  range, normalization, ricochet, overmatch, spaced armour, HE splash, ramming,
+  module and crew damage, fires and repairs.
+- Spotting with view range, camouflage, movement, firing, foliage, line of
+  sight and last-known positions.
+- Bots that use map geometry, terrain, water, firing lanes, team strength and
+  shared contacts to route, take cover, pick targets and choose ammunition,
+  including SPG arcs. Navigation and foliage data ship for all 33 supported
+  0.8.2 maps and all 41 supported 0.9.22 maps.
+- A LAN match is one shared battle: lineups, countdown, orders, projectiles,
+  health, critical damage, destructibles, capture and results stay
+  synchronized, and the match survives the loss of the current bot controller.
 
-This is a reconstruction from the frozen clients and same-era mechanics, not a
-source-identical reimplementation of Wargaming's retail server. It implements
-standard battles only; LAN play assumes trusted clients and uses a coordinator,
-not a full or adversarial retail server. Native rendering, physics and frame
-pacing can only be validated in the exact Windows client. See
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for exact project lineage and
-licensing.
+This is a reconstruction from the frozen clients and same-era mechanics, not
+Wargaming's retail server. LAN play assumes trusted clients. Native rendering,
+physics and frame pacing can only be judged in the Windows client.
 
-## Installation
+## Build it yourself
 
-You must supply your own compatible Windows client. Close the game before
-copying files, and use the client and server from the same repository revision.
+```bash
+# 0.8.2 client package
+python3 0.8.2/tools/package_native_experiment.py --output-dir dist --version 1.8.58
+# 0.9.22 client package, with CPython 2.7
+python2.7 0.9.22/build_wotmod.py
+# Windows launcher, after the 0.9.22 package exists
+pwsh -NoProfile -File launcher/build_launcher.ps1
+```
 
-### World of Tanks 0.8.2
+The launcher carries both LAN servers and both client mods. It writes the
+server address into the file each port already reads at startup, installs the
+mod, starts the game and stops the server when the game closes.
 
-1. Delete or move aside the existing `<game root>\res_mods\0.8.2` directory.
-2. From this repository, run:
+Tests:
 
-   ```bat
-   0.8.2\refresh_client.bat "C:\Games\World_of_Tanks_0.8.2"
-   ```
-
-   Alternatively, copy `0.8.2/scripts/` and `0.8.2/gui/` into
-   `<game root>\res_mods\0.8.2\`.
-3. Start the game. A successful installation goes directly to the offline
-   garage; select a tank and click **Battle!** for a local battle.
-
-For LAN play, install Python 3 on one computer and double-click
-`0.8.2\RUN_SERVER.bat`. On every client, open **LAN SETTINGS**, enter that
-computer's LAN address and port `28782`, enable LAN Battle, then click
-**Battle!**. The waiting-room host chooses a map and starts the battle.
-
-The current 0.8.2 native-physics build accepts only its pinned executable. See
-[`0.8.2/START_HERE.txt`](0.8.2/START_HERE.txt) if it does not load.
-
-### World of Tanks 0.9.22.0.1 #1513
-
-1. Use the exact frozen Chinese HD `0.9.22.0.1 #1513` client.
-2. Download the matching `WoT-0.9.22-LAN-Client-*.zip` release asset and
-   extract it directly into the game root. The archive already contains the
-   complete replacement `mods` layout.
-3. Download and double-click `WoT-0.9.22-LAN-Server.exe` on the computer that
-   will host the battle. It needs no arguments and listens on TCP `28782`.
-4. On first launch from a new path, approve the UAC prompt that creates the
-   EXE-scoped firewall rule. Run it only on a trusted network. Set each
-   client's server address with the [`launcher`](launcher/), then click
-   **Battle!** in the garage. Every client opens the LAN waiting room; the
-   first waiting player chooses a map and starts the shared round.
-
-See [`0.9.22/INSTALL.txt`](0.9.22/INSTALL.txt) for troubleshooting and the
-exact package boundary.
-
-### Launcher
-
-The [`launcher`](launcher/) prepares one battle before the client starts. It
-serves both ports: it writes the LAN server address for the installed client,
-runs the LAN server when you host, starts the game, and stops that server when
-the game closes. In the game you then only click the battle button.
+```bash
+cd 0.8.2 && python3 -m unittest discover -s tests
+python3 -m unittest discover -s 0.9.22/tests
+cd launcher && python3 -m unittest discover -s tests
+```
 
 Project code is distributed under [`GPL-3.0`](LICENSE). World of Tanks and its
 assets are not included; this project is not affiliated with or endorsed by
-Wargaming.
+Wargaming. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for lineage
+and bundled runtimes.

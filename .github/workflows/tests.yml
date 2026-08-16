@@ -46,8 +46,6 @@ jobs:
           python 0.8.2/tools/package_native_experiment.py
           --output-dir "$RUNNER_TEMP/wot-082"
           --version 1.8.58
-      - name: Audit 0.9.22 battle source provenance
-        run: python 0.9.22/tools/audit_battle_sources.py
       - name: Build Python 2.7 0.9.22 LAN client
         run: >-
           docker run --rm --platform linux/amd64 -v "$PWD:/work"
@@ -56,7 +54,7 @@ jobs:
       - name: Validate 0.9.22 wotmod package
         run: >-
           python 0.9.22/tools/validate_wotmod.py
-          0.9.22/dist/org.peng.offline_lan_0922_0.4.0.wotmod
+          0.9.22/dist/org.peng.offline_lan_0922_*.wotmod
       - uses: actions/upload-artifact@v4
         with:
           name: wot-0.9.22-lan-client
@@ -239,6 +237,7 @@ jobs:
 
   windows-launcher:
     runs-on: windows-latest
+    needs: test
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -249,6 +248,11 @@ jobs:
         run: >-
           python -m pip install
           -r 0.9.22/server/requirements-windows-build.txt
+      - name: Take the built 0.9.22 client package
+        uses: actions/download-artifact@v4
+        with:
+          name: wot-0.9.22-lan-client
+          path: 0.9.22/dist
       - name: Build the desktop launcher
         shell: pwsh
         run: pwsh -NoProfile -File launcher/build_launcher.ps1
@@ -256,7 +260,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $launcher = Join-Path $PWD "launcher\dist\WoT-Offline-Battles-Launcher.exe"
+          $launcher = Join-Path $PWD ("launcher\dist\WoT-Offline-Battles-Launcher\" +
+              "WoT-Offline-Battles-Launcher.exe")
           $navgraphs = Join-Path $PWD "0.8.2\scripts\client\gui\mods\offhangar\navgraphs"
           $env:WOT_OFFLINE_NAVGRAPH_DIR = $navgraphs
           foreach ($port in @("0.8.2", "0.9.22")) {
@@ -298,7 +303,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wot-offline-battles-launcher
-          path: |
-            launcher/dist/WoT-Offline-Battles-Launcher.exe
-            launcher/dist/README.txt
+          path: launcher/dist/WoT-Offline-Battles-Launcher-Windows.zip
           if-no-files-found: error

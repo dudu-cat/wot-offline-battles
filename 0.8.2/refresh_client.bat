@@ -24,8 +24,8 @@ rem file therefore masks the updated source and prevents the LAN UI from loading
 del /F /Q "%MODS_DIR%\mod_offhangar.pyc" >nul 2>&1
 
 echo Client mod refreshed successfully.
-echo Start the game and look for LAN SETTINGS in the upper-right of the hangar.
-echo If it is still missing, search python.log for:
+echo Start the game and click Battle! in the garage.
+echo If the mod did not load, search python.log for:
 echo   Offline Battles source loader active
 exit /b 0
 

@@ -216,7 +216,7 @@ class SettingsFileTest(unittest.TestCase):
 
 class ServerPayloadTest(unittest.TestCase):
     def test_repository_layout_resolves_both_servers(self):
-        base = core.payload_root()
+        base = core.server_root()
         self.assertTrue(os.path.isfile(core.server_script(core.PORT_0_8_2,
                                                           base)))
         self.assertTrue(os.path.isfile(core.server_script(core.PORT_0_9_22,
@@ -257,11 +257,121 @@ class ServerPayloadTest(unittest.TestCase):
                           core.PORT_0_8_2, tempfile.mkdtemp())
 
 
+class ClientInstallTest(unittest.TestCase):
+    def setUp(self):
+        self.work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.work, True)
+        self.game = os.path.join(self.work, "game")
+        self.payload = os.path.join(self.work, "payload")
+        os.makedirs(self.game)
+
+    def _write(self, root, relative_path, text="x"):
+        path = os.path.join(root, *relative_path.split("/"))
+        directory = os.path.dirname(path)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory)
+        with open(path, "w") as stream:
+            stream.write(text)
+        return path
+
+    def _read(self, relative_path):
+        with open(os.path.join(self.game, *relative_path.split("/"))) as stream:
+            return stream.read()
+
+    def _stage_0_8_2(self):
+        root = os.path.join(self.payload, core.CLIENT_PAYLOAD_DIR, "0.8.2")
+        self._write(root, "scripts/client/gui/mods/mod_offhangar.py", "new")
+        self._write(root, "gui/maps/icons/offhangar/pixel.dds", "new")
+        return root
+
+    def _stage_0_9_22(self):
+        root = os.path.join(self.payload, core.CLIENT_PAYLOAD_DIR, "0.9.22")
+        self._write(root, "mods/0.9.22.0.1/new.wotmod", "new")
+        self._write(root, "mods/configs/offline_lan_0922/navgraphs/a.json", "new")
+        self._write(root, "mods/configs/offline_lan_0922/foliage/a.py", "new")
+        self._write(root, "mods/configs/offline_lan_0922/destructibles/a.py",
+                    "new")
+        self._write(root, "mods/configs/offline_lan_0922/config.json", "new")
+        return root
+
+    def test_0_8_2_install_replaces_the_whole_mod_directory(self):
+        self._stage_0_8_2()
+        self._write(self.game, "res_mods/0.8.2/scripts/client/gui/mods/"
+                               "mod_offhangar.pyc", "stale")
+        self._write(self.game, "res_mods/0.8.2/leftover.txt", "stale")
+        actions = core.install_client_mod(self.game, core.PORT_0_8_2,
+                                          self.payload)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.game, "res_mods", "0.8.2", "leftover.txt")))
+        self.assertEqual(
+            "new", self._read("res_mods/0.8.2/scripts/client/gui/mods/"
+                              "mod_offhangar.py"))
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.game, "res_mods", "0.8.2", "gui", "maps", "icons",
+            "offhangar", "pixel.dds")))
+        self.assertTrue(any("res_mods/0.8.2/scripts" in action
+                            for action in actions))
+
+    def test_0_8_2_install_keeps_the_user_directory(self):
+        self._stage_0_8_2()
+        self._write(self.game, "offhangar_user/config.json", "mine")
+        core.install_client_mod(self.game, core.PORT_0_8_2, self.payload)
+        self.assertEqual("mine", self._read("offhangar_user/config.json"))
+
+    def test_0_9_22_install_replaces_old_packages_and_data(self):
+        self._stage_0_9_22()
+        self._write(self.game, "mods/0.9.22.0.1/old.wotmod", "stale")
+        self._write(self.game,
+                    "mods/configs/offline_lan_0922/navgraphs/old.json", "stale")
+        core.install_client_mod(self.game, core.PORT_0_9_22, self.payload)
+        self.assertFalse(os.path.exists(os.path.join(
+            self.game, "mods", "0.9.22.0.1", "old.wotmod")))
+        self.assertEqual("new", self._read("mods/0.9.22.0.1/new.wotmod"))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.game, "mods", "configs", "offline_lan_0922", "navgraphs",
+            "old.json")))
+
+    def test_0_9_22_install_keeps_the_saved_endpoint_and_configuration(self):
+        self._stage_0_9_22()
+        self._write(self.game,
+                    "mods/configs/offline_lan_0922/server_endpoint.json", "mine")
+        self._write(self.game, "mods/configs/offline_lan_0922/config.json",
+                    "mine")
+        self._write(self.game,
+                    "mods/configs/offline_lan_0922/account_state.json", "mine")
+        core.install_client_mod(self.game, core.PORT_0_9_22, self.payload)
+        self.assertEqual(
+            "mine", self._read("mods/configs/offline_lan_0922/"
+                               "server_endpoint.json"))
+        self.assertEqual(
+            "mine", self._read("mods/configs/offline_lan_0922/config.json"))
+        self.assertEqual(
+            "mine", self._read("mods/configs/offline_lan_0922/"
+                               "account_state.json"))
+
+    def test_0_9_22_install_writes_a_missing_configuration(self):
+        self._stage_0_9_22()
+        core.install_client_mod(self.game, core.PORT_0_9_22, self.payload)
+        self.assertEqual(
+            "new", self._read("mods/configs/offline_lan_0922/config.json"))
+
+    def test_a_launcher_without_mod_files_reports_it(self):
+        self.assertRaises(core.LauncherError, core.install_client_mod,
+                          self.game, core.PORT_0_8_2, self.payload)
+
+    def test_an_incomplete_bundle_reports_it(self):
+        root = os.path.join(self.payload, core.CLIENT_PAYLOAD_DIR, "0.8.2")
+        self._write(root, "scripts/client/gui/mods/mod_offhangar.py", "new")
+        self.assertRaises(core.LauncherError, core.install_client_mod,
+                          self.game, core.PORT_0_8_2, self.payload)
+
+
 class PayloadStagingTest(unittest.TestCase):
     def setUp(self):
-        self.target = os.path.join(tempfile.mkdtemp(), "servers")
-        self.addCleanup(shutil.rmtree, os.path.dirname(self.target), True)
-        self.written = stage_payload.stage(self.target)
+        self.root = os.path.join(tempfile.mkdtemp(), "payload")
+        self.addCleanup(shutil.rmtree, os.path.dirname(self.root), True)
+        self.written = stage_payload.stage(self.root, include_clients=False)
+        self.target = os.path.join(self.root, stage_payload.SERVER_DIR)
 
     def test_both_server_entry_points_are_staged(self):
         for port_version in core.SUPPORTED_PORTS:
@@ -278,6 +388,40 @@ class PayloadStagingTest(unittest.TestCase):
         self.assertFalse(any(
             os.path.sep + "navgraphs" + os.path.sep in path
             for path in self.written))
+
+    def test_client_staging_takes_both_mods_from_the_checkout(self):
+        source = os.path.join(tempfile.mkdtemp(), "repo")
+        self.addCleanup(shutil.rmtree, os.path.dirname(source), True)
+        overlay = os.path.join(source, "0.9.22", "dist",
+                               "WoT-0.9.22-LAN-Client-abc1234")
+        for relative in (
+                os.path.join("0.8.2", "scripts", "client", "a.py"),
+                os.path.join("0.8.2", "gui", "maps", "a.dds"),
+                os.path.join(overlay, "mods", "0.9.22.0.1", "a.wotmod"),
+                os.path.join(overlay, "mods", "configs", "offline_lan_0922",
+                             "config.json")):
+            path = os.path.join(source, relative)
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w") as stream:
+                stream.write("x")
+        target = os.path.join(source, "staged")
+        stage_payload.stage_clients(target, source)
+        for relative in (
+                ("0.8.2", "scripts", "client", "a.py"),
+                ("0.8.2", "gui", "maps", "a.dds"),
+                ("0.9.22", "mods", "0.9.22.0.1", "a.wotmod"),
+                ("0.9.22", "mods", "configs", "offline_lan_0922",
+                 "config.json")):
+            self.assertTrue(os.path.isfile(os.path.join(target, *relative)),
+                            relative)
+
+    def test_client_staging_without_a_built_package_reports_it(self):
+        source = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, source, True)
+        os.makedirs(os.path.join(source, "0.8.2", "scripts"))
+        os.makedirs(os.path.join(source, "0.8.2", "gui"))
+        self.assertRaises(ValueError, stage_payload.stage_clients,
+                          os.path.join(source, "staged"), source)
 
     def test_staging_replaces_an_earlier_payload(self):
         stale = os.path.join(self.target, "stale.txt")
@@ -300,9 +444,10 @@ class ServerImportTest(unittest.TestCase):
     }
 
     def setUp(self):
-        self.payload = os.path.join(tempfile.mkdtemp(), "servers")
-        self.addCleanup(shutil.rmtree, os.path.dirname(self.payload), True)
-        stage_payload.stage(self.payload)
+        root = os.path.join(tempfile.mkdtemp(), "payload")
+        self.addCleanup(shutil.rmtree, os.path.dirname(root), True)
+        stage_payload.stage(root, include_clients=False)
+        self.payload = os.path.join(root, stage_payload.SERVER_DIR)
 
     def _module_file(self, root, name):
         relative = name.replace('.', os.path.sep)

@@ -21025,11 +21025,6 @@ def _step_on_enqueued(player, vehInvID, cmdName):
 				return False
 			player._offhangar_network_team = _net_client.team
 			player._offhangar_network_map_name = _net_client.map_name
-			try:
-				from gui.mods.offhangar.lan_settings import close as _close_lan_settings
-				_close_lan_settings()
-			except Exception:
-				pass
 		ctx = build_offline_battle_context(player, vehInvID, cmdName)
 		player._offhangar_battle_ctx = ctx
 		player._offhangar_player_vehicle_id = ctx.get('playerVehicleID', vehInvID)

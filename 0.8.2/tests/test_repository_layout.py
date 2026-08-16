@@ -11,8 +11,7 @@ PROJECT_ROOT = VERSION_ROOT.parent
 class RepositoryLayoutTests(unittest.TestCase):
     def test_client_versions_have_parallel_top_level_directories(self):
         self.assertEqual('0.8.2', VERSION_ROOT.name)
-        self.assertTrue((PROJECT_ROOT / '0.8.2' / 'README.md').is_file())
-        self.assertTrue((PROJECT_ROOT / '0.9.22' / 'README.md').is_file())
+        self.assertTrue((PROJECT_ROOT / '0.9.22').is_dir())
 
     def test_082_runtime_and_tools_are_version_local(self):
         for name in ('gui', 'native', 'scripts', 'tests', 'tools'):

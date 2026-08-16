@@ -341,8 +341,8 @@ Use thresholds, a short ring buffer, per-vehicle cooldown, and a battle-global
 cap. Once a cap is reached, return before expensive matrix or ray sampling.
 Reset diagnostic state at battle teardown.
 
-`0.8.2/PERFORMANCE_TEST.txt` owns the current metric definitions and Windows
-acceptance procedure. Do not duplicate a changing metric list here.
+Performance acceptance stays on the Windows client: record client frame pacing
+and the server tick diagnostics in sustained 15-versus-15 play.
 
 ## Testing legacy runtime behavior
 
@@ -393,8 +393,7 @@ payloads. An untracked new module can pass local tests yet be silently absent
 from the replacement package. Confirm new runtime files are in the Git index
 before packaging.
 
-Build into a fresh temporary directory and pass the candidate version from
-`0.8.2/VERSION.txt`:
+Build into a fresh temporary directory and pass the candidate version:
 
 ```bash
 python3 0.8.2/tools/package_native_experiment.py \
@@ -402,22 +401,13 @@ python3 0.8.2/tools/package_native_experiment.py \
   --version <candidate-version>
 ```
 
-The package audit owns the current required-entry list. Independently verify
-wrapper paths, CRC, `SHA256SUMS.txt`, source-to-package bytes, the exact two
-required PYC files, native bridge identity, client/server/offline build
-identity, and absence of tests, tools, native sources, user state, stale
-bytecode, or another client version. Shared `LICENSE`,
-`THIRD_PARTY_NOTICES.md`, and `licenses/` remain at repository root and are
-copied into each release by its packager.
+The packager owns the required-entry list. It also keeps the client and server
+on one LAN build string. Shared `LICENSE`, `THIRD_PARTY_NOTICES.md`, and
+`licenses/` remain at repository root and are copied into each release by its
+packager.
 
 Do not hard-code a current version, test count, package hash, or release status
-in this guide. `0.8.2/VERSION.txt`, the current release notes, CI workflow, and
-fresh package output own those facts.
-
-`START_PROBE_HERE.txt`, `NATIVE_FILTER_BRIDGE_TEST_NOTES.txt`,
-`NATIVE_NAVMESH_TEST.txt`, and `LAN_SPAWN_INVESTIGATION.md` preserve useful
-historical experiment evidence. They are not the current release checklist and
-may contain superseded identities, counts, hashes, or procedures.
+in this guide.
 
 Do not tag or publish merely because static gates pass. A native release still
 needs exact Windows proof for startup, both teams, movement, slopes, vehicle

@@ -6,6 +6,7 @@ user-owned settings files that each port already reads at client startup.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
@@ -225,14 +226,123 @@ def write_settings(game_root, port_version, mode, host, port, name=None):
     raise LauncherError("This game folder is not a supported client.")
 
 
-def payload_root(base_dir=None):
+SERVER_PAYLOAD_DIR = "servers"
+CLIENT_PAYLOAD_DIR = "client"
+
+# Directories the launcher wipes before it copies the bundled mod, the
+# directories it replaces, and the files it writes only when they are absent.
+_CLIENT_INSTALL = {
+    PORT_0_8_2: {
+        "clear": ("res_mods/0.8.2",),
+        "replace": (
+            ("scripts", "res_mods/0.8.2/scripts"),
+            ("gui", "res_mods/0.8.2/gui"),
+        ),
+        "keep": (),
+    },
+    PORT_0_9_22: {
+        "clear": ("mods/0.9.22.0.1",),
+        "replace": (
+            ("mods/0.9.22.0.1", "mods/0.9.22.0.1"),
+            ("mods/configs/offline_lan_0922/navgraphs",
+             "mods/configs/offline_lan_0922/navgraphs"),
+            ("mods/configs/offline_lan_0922/foliage",
+             "mods/configs/offline_lan_0922/foliage"),
+            ("mods/configs/offline_lan_0922/destructibles",
+             "mods/configs/offline_lan_0922/destructibles"),
+        ),
+        "keep": (
+            ("mods/configs/offline_lan_0922/config.json",
+             "mods/configs/offline_lan_0922/config.json"),
+        ),
+    },
+}
+
+
+def repository_root():
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def server_root(base_dir=None):
     """Return the directory that holds the bundled or checked-out servers."""
     if base_dir is not None:
         return base_dir
     bundle_dir = getattr(sys, "_MEIPASS", None)
     if bundle_dir:
-        return os.path.join(bundle_dir, "servers")
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(bundle_dir, SERVER_PAYLOAD_DIR)
+    return repository_root()
+
+
+def client_root(port_version, base_dir=None):
+    """Return the directory that holds one port's installable client mod."""
+    if base_dir is not None:
+        return os.path.join(base_dir, CLIENT_PAYLOAD_DIR, port_version)
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        return os.path.join(bundle_dir, CLIENT_PAYLOAD_DIR, port_version)
+    root = repository_root()
+    if port_version == PORT_0_8_2:
+        return os.path.join(root, PORT_0_8_2)
+    overlays = sorted(
+        path for path in glob.glob(os.path.join(
+            root, PORT_0_9_22, "dist", "WoT-0.9.22-LAN-Client-*"))
+        if os.path.isdir(path))
+    return overlays[-1] if overlays else os.path.join(root, PORT_0_9_22,
+                                                      "dist")
+
+
+def _inside(root, path):
+    root = os.path.abspath(root) + os.path.sep
+    return os.path.abspath(path).startswith(root)
+
+
+def install_client_mod(game_root, port_version, base_dir=None):
+    """Replace the installed mod with the bundled one and report what changed.
+
+    User files stay: the 0.9.22 configuration directory keeps everything this
+    package does not own, and an existing `config.json` is never overwritten.
+    """
+    import shutil
+
+    layout = _CLIENT_INSTALL.get(port_version)
+    if layout is None:
+        raise LauncherError("This game folder is not a supported client.")
+    source_root = client_root(port_version, base_dir)
+    if not os.path.isdir(source_root):
+        raise LauncherError(
+            "This launcher carries no %s mod files." % port_version)
+    actions = []
+    for relative in layout["clear"]:
+        target = os.path.join(game_root, *relative.split("/"))
+        if _inside(game_root, target) and os.path.isdir(target):
+            shutil.rmtree(target)
+            actions.append("Removed the old %s" % relative)
+    for source_relative, target_relative in layout["replace"]:
+        source = os.path.join(source_root, *source_relative.split("/"))
+        target = os.path.join(game_root, *target_relative.split("/"))
+        if not os.path.isdir(source):
+            raise LauncherError("The bundled mod is incomplete: %s" %
+                                source_relative)
+        if not _inside(game_root, target):
+            raise LauncherError("Refusing to write outside the game folder.")
+        if os.path.isdir(target):
+            shutil.rmtree(target)
+        parent = os.path.dirname(target)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent)
+        shutil.copytree(source, target)
+        actions.append("Installed %s" % target_relative)
+    for source_relative, target_relative in layout["keep"]:
+        source = os.path.join(source_root, *source_relative.split("/"))
+        target = os.path.join(game_root, *target_relative.split("/"))
+        if not os.path.isfile(source) or os.path.isfile(target):
+            continue
+        parent = os.path.dirname(target)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent)
+        shutil.copy2(source, target)
+        actions.append("Installed %s" % target_relative)
+    return actions
 
 
 def server_script(port_version, base_dir=None):
@@ -240,7 +350,7 @@ def server_script(port_version, base_dir=None):
     if entry is None:
         return None
     directory, script = entry
-    directory = os.path.join(payload_root(base_dir), directory)
+    directory = os.path.join(server_root(base_dir), directory)
     return os.path.join(directory, script)
 
 

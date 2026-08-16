@@ -3447,12 +3447,10 @@ class LANClientQueueTest(unittest.TestCase):
 
     def test_queue_start_shortcut_keys_are_removed(self):
         account_hook = (ROOT / "scripts/client/gui/mods/mod_offhangar.py").read_text()
-        global_hook = (ROOT / "scripts/client/gui/mods/offhangar/lan_settings.py").read_text()
 
-        for source in (account_hook, global_hook):
-            self.assertNotIn("KEY_F12", source)
-            self.assertNotIn("KEY_0", source)
-            self.assertNotIn("KEY_NUMPAD0", source)
+        self.assertNotIn("KEY_F12", account_hook)
+        self.assertNotIn("KEY_0", account_hook)
+        self.assertNotIn("KEY_NUMPAD0", account_hook)
 
         waiting_room = (
             ROOT / "scripts/client/gui/mods/offhangar/lan_waiting_room.py"

@@ -131,7 +131,7 @@ def _safe_import_offhangar():
 	              'bot_ai_driver', 'spectator_minimap',
 	              'state', 'session_guards', 'offline_battle_stack', 'offline_battle',
 	              'data', 'command_router', 'command_handlers', 'server',
-	              'destructibles_authority', 'pen_indicator', 'lan_settings', 'lan_waiting_room',
+	              'destructibles_authority', 'pen_indicator', 'lan_waiting_room',
 	              'network_battle']
 
 	def _try_load(name):
@@ -202,13 +202,7 @@ from gui.mods.offhangar.utils import *
 from gui.mods.offhangar._constants import *
 from gui.mods.offhangar.server import *
 
-LOG_NOTE('Offline Battles source loader active; LAN settings, prebaked navigation and foliage enabled')
-
-try:
-	from gui.mods.offhangar.lan_settings import install as _install_lan_settings
-	_install_lan_settings()
-except Exception:
-	LOG_CURRENT_EXCEPTION()
+LOG_NOTE('Offline Battles source loader active; prebaked navigation and foliage enabled')
 
 try:
 	from gui.mods.offhangar.data import getOfflineShopItems
@@ -679,11 +673,6 @@ def Account_onBecomePlayer(baseFunc, baseSelf):
 	_ensure_postmortem_event(getattr(baseSelf, 'inputHandler', None))
 	if baseSelf.isOffline:
 		baseSelf.showGUI(OFFLINE_GUI_CTX)
-		try:
-			from gui.mods.offhangar.lan_settings import ensure_entry
-			ensure_entry()
-		except Exception:
-			LOG_CURRENT_EXCEPTION()
 
 @override(Account.PlayerAccount, 'onBecomeNonPlayer')
 def Account_onBecomeNonPlayer(baseFunc, baseSelf):

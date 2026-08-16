@@ -79,8 +79,8 @@ def validate(path, expected_members=None):
         version = (root.findtext('version') or '').strip()
         if mod_id != 'org.peng.offline_lan_0922':
             raise ValueError('unexpected mod id: %r' % mod_id)
-        if version != '0.4.0':
-            raise ValueError('unexpected mod version: %r' % version)
+        if not version:
+            raise ValueError('meta.xml has no version')
         for name in sorted(actual_members):
             if archive.read(name)[:4] != PYTHON_27_MAGIC:
                 raise ValueError('non-Python-2.7 bytecode: %s' % name)

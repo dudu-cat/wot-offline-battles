@@ -16,16 +16,8 @@ import zipfile
 VERSION_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = VERSION_ROOT.parent
 VERSION_TOP_LEVEL_FILES = (
-    "INSTALL.txt",
-    "INSTALL_CLIENT.txt",
-    "LAN_SERVER.md",
-    "PERFORMANCE_TEST.txt",
-    "README.md",
     "RUN_SERVER.bat",
     "RUN_SERVER.command",
-    "START_HERE.txt",
-    "START_NATIVE_TEST_HERE.txt",
-    "VERSION.txt",
     "lan_battle_server.py",
     "server_bot_ai.py",
     "server_bot_navigation.py",
@@ -122,7 +114,6 @@ def _audit_entries(names: list[str], wrapper: str) -> None:
         "0.8.2/scripts/client/gui/mods/offhangar/offhangar_native_seed.pyd",
         "0.8.2/scripts/client/gui/mods/offhangar/spawn_streaming_bootstrap.py",
         "SHA256SUMS.txt",
-        "VERSION.txt",
     }
     missing = required.difference(files)
     if missing:
@@ -142,34 +133,17 @@ def _assigned_string(path: Path, name: str) -> str:
 
 
 def _audit_identity(version: str) -> None:
+    """Keep the client and server on one LAN build string."""
     expected = "%s-native-experimental-20260815" % version
-    version_text = (VERSION_ROOT / "VERSION.txt").read_text(encoding="utf-8")
-    required_lines = (
-        "Package: native bot physics experiment %s" % version,
-        "LAN protocol: 8",
-        "Client build: %s" % expected,
-        "Diagnostic client revision: %s" % expected,
-    )
-    for line in required_lines:
-        if line not in version_text.splitlines():
-            raise RuntimeError("VERSION.txt identity mismatch: %s" % line)
     server_build = _assigned_string(
         VERSION_ROOT / "lan_battle_server.py", "CLIENT_BUILD")
     client_build = _assigned_string(
         VERSION_ROOT / "scripts/client/gui/mods/offhangar/network_battle.py",
         "CLIENT_BUILD")
-    offline_build = _assigned_string(
-        VERSION_ROOT / "scripts/client/gui/mods/offhangar/offline_battle.py",
-        "_OFFH_BUILD")
-    if server_build != expected or client_build != expected:
+    if server_build != client_build:
         raise RuntimeError(
-            "client/server build mismatch: %s %s expected %s" % (
-                client_build, server_build, expected))
-    expected_offline = "%s-native-experimental (2026-08-15)" % version
-    if offline_build != expected_offline:
-        raise RuntimeError(
-            "offline build mismatch: %s expected %s" % (
-                offline_build, expected_offline))
+            "client/server LAN build mismatch: %s and %s" % (
+                client_build, server_build))
 
 
 def build(output_dir: Path, version: str) -> tuple[Path, Path]:

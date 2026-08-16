@@ -121,10 +121,10 @@ class LauncherWindow(object):
         elif status["client"] is None:
             text = "This client version is not supported."
         elif not status["mod_installed"]:
-            text = ("World of Tanks %s found. Install the %s package first." %
-                    (status["version"] or status["client"], status["client"]))
+            text = ("World of Tanks %s found. Start game installs the mod." %
+                    (status["version"] or status["client"]))
         else:
-            text = "World of Tanks %s ready." % (
+            text = "World of Tanks %s ready. Start game updates the mod." % (
                 status["version"] or status["client"])
         self.client_label.config(text=text)
         return status
@@ -179,6 +179,9 @@ class LauncherWindow(object):
         host = session["host"]
         port = session["tcp_port"]
         try:
+            for action in core.install_client_mod(game_root,
+                                                  session["client"]):
+                self._log(action)
             for path in core.write_settings(game_root, session["client"],
                                             session["mode"], host, port, name):
                 self._log("Wrote %s" % path)
@@ -278,7 +281,7 @@ def _serve(argv):
         return 2
     port_version = argv[index + 1]
     print("Starting the %s LAN server from %s" %
-          (port_version, core.payload_root()))
+          (port_version, core.server_root()))
     try:
         core.run_server_payload(port_version)
     except Exception:

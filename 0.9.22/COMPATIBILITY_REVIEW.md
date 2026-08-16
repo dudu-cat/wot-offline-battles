@@ -947,7 +947,7 @@ The local player path does include server-relayed critical state, fire,
 drowning, exact fall/landing attribution, small repair/medkit/extinguisher
 activation, native frag/team-killer updates, durable killer/reason metadata,
 and server-deduplicated destructible results for collision and shots.
-`BATTLE_SOURCE_AUDIT.md` is the authoritative per-file accounting.
+Each module states its own origin in its docstring.
 
 ## Reference implementations reviewed
 

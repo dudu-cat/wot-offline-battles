@@ -93,35 +93,19 @@ owns memory safely, or feels identical to retail.
 
 ## Canonical documentation
 
-Avoid copying facts that already have an owner:
+Keep the documentation small. These files have owners; do not duplicate them:
 
-- Root `README.md`: product and installation overview.
-- `0.8.2/README.md`: 0.8.2 behavior, source installation, settings, and LAN
-  overview.
-- `0.8.2/START_NATIVE_TEST_HERE.txt`: current native experiment identity,
-  change history, and Windows acceptance targets.
-- `0.8.2/LAN_SERVER.md`: current LAN protocol boundary, operation, and
-  diagnostics.
-- `0.8.2/PERFORMANCE_TEST.txt`: current client/server metric definitions and
-  performance acceptance procedure.
-- `0.8.2/VERSION.txt`: current 0.8.2 package and client/server build identity.
-- `0.8.2/tools/package_native_experiment.py`: machine-enforced 0.8.2 package
-  contents and archive audit.
-- `0.9.22/README.md`: port behavior and build entry points. Its older version
-  sections are history, not necessarily the current behavior.
-- `0.9.22/COMPATIBILITY_REVIEW.md`: exact-client interfaces and reviewed
-  lifecycle evidence.
-- `0.9.22/BATTLE_SOURCE_AUDIT.md`: module provenance and allowed divergence
-  from reviewed 0.8.2 law.
-- `0.9.22/SERVER_RESPONSIBILITY_AUDIT.md`: authority ownership and remaining
-  responsibility boundaries.
-- `0.9.22/TACTICAL_ROUTE_AUDIT.md`: map and route evidence.
-- `0.9.22/RELEASE_CHECKLIST.md`: the current version, commands, package gates,
-  native acceptance, and publish sequence.
+- Root `README.md`: what the project is, how a player runs it, how to build it.
+- `0.9.22/INSTALL.txt`: what the 0.9.22 package contains and how to play.
+- `0.9.22/COMPATIBILITY_REVIEW.md`: exact-client interfaces and lifecycle
+  evidence for the #1513 port.
+- `launcher/LAUNCHER_README.txt`: the text shipped inside the launcher
+  download, including the bundled-runtime licenses.
 - `.github/workflows/tests.yml`: what CI actually executes.
 
-Do not hard-code a current test count, release status, CI URL, or source hash in
-this instruction file. Verify those values at the current candidate.
+Do not add a new document for a change that fits in code, a test, or one of the
+files above. Do not hard-code a current test count, release status, CI URL, or
+source hash in this instruction file.
 
 ## Change, validation, and handoff discipline
 
@@ -133,8 +117,6 @@ this instruction file. Verify those values at the current candidate.
 - For asynchronous tests, wait for a state transition or acknowledgement. Do
   not use a small fixed sleep as proof that a handler or worker consumed a
   message.
-- Freeze production files before updating reviewed hashes or release pins.
-  Rerun the source audit after the pins change.
 - Before pushing, inspect the staged diff, run `git diff --check`, commit one
   coherent change, push `main`, and verify the exact pushed commit's CI when
   the change affects runtime, packaging, CI, or release behavior.
