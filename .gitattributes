@@ -9,3 +9,7 @@
 # Navigation manifests hash the exact LF-normalized JSON payload.  Prevent a
 # Windows checkout from rewriting the final newline before PyInstaller embeds it.
 0.8.2/scripts/client/gui/mods/offhangar/navgraphs/*.json -text
+
+# The 0.8.2 client sources keep the CRLF endings the legacy client shipped, so
+# a carriage return at the end of a line is not trailing whitespace there.
+0.8.2/scripts/**/*.py whitespace=cr-at-eol

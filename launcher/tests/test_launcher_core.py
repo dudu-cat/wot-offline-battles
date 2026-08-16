@@ -49,11 +49,10 @@ class ServerRequirementTest(unittest.TestCase):
         for port_version in core.SUPPORTED_PORTS:
             self.assertFalse(core.server_required(port_version, core.MODE_JOIN))
 
-    def test_only_0_9_22_needs_a_server_for_single_player(self):
-        self.assertFalse(
-            core.server_required(core.PORT_0_8_2, core.MODE_SINGLE))
-        self.assertTrue(
-            core.server_required(core.PORT_0_9_22, core.MODE_SINGLE))
+    def test_single_player_needs_a_server_in_both_clients(self):
+        for port_version in core.SUPPORTED_PORTS:
+            self.assertTrue(
+                core.server_required(port_version, core.MODE_SINGLE))
 
 
 class GameRootTest(unittest.TestCase):
@@ -129,11 +128,11 @@ class SessionPlanTest(unittest.TestCase):
         self.assertEqual(session["host"], core.LOCAL_HOST)
         self.assertTrue(session["needs_server"])
 
-    def test_0_8_2_single_player_plan_starts_no_server(self):
+    def test_0_8_2_single_player_plan_starts_a_local_server(self):
         session = core.plan_session(
             self._status(client=core.PORT_0_8_2, version="0.8.2"),
             core.MODE_SINGLE)
-        self.assertFalse(session["needs_server"])
+        self.assertTrue(session["needs_server"])
 
     def test_a_missing_executable_stops_the_session(self):
         self.assertRaises(core.LauncherError, core.plan_session,
@@ -181,11 +180,12 @@ class SettingsFileTest(unittest.TestCase):
         self.assertEqual(config["network_map_name"], "server_random")
         self.assertEqual(config["nickname"], "Peng")
 
-    def test_0_8_2_single_player_disables_network_mode(self):
+    def test_0_8_2_single_player_still_plays_against_the_server(self):
         core.write_settings(self.root, core.PORT_0_8_2, core.MODE_SINGLE,
                             core.LOCAL_HOST, core.DEFAULT_SERVER_PORT)
         config = self._read(os.path.join("offhangar_user", "config.json"))
-        self.assertFalse(config["network_mode"])
+        self.assertTrue(config["network_mode"])
+        self.assertEqual(config["network_server_host"], core.LOCAL_HOST)
         self.assertNotIn("nickname", config)
 
     def test_0_9_22_writes_the_user_owned_endpoint(self):

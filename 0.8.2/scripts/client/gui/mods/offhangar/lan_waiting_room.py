@@ -6,9 +6,6 @@ PANEL_TEXTURE = 'system/maps/col_white.bmp'
 
 _active = False
 _player = None
-_offline = False
-_on_start = None
-_offline_options = ()
 _panel = None
 _text = None
 _controls = {}
@@ -97,22 +94,11 @@ def _client():
 
 
 def _map_options():
-	if _offline:
-		return list(_offline_options)
 	client = _client()
 	options = list(getattr(client, 'available_maps', None) or []) if client else []
 	if not options and client is not None and getattr(client, 'map_name', None):
 		options = [client.map_name]
 	return options
-
-
-def offline_map_options():
-	"""Return the maps this client can drive bots on."""
-	try:
-		from gui.mods.offhangar.prebaked_navigation import STOCK_MAPS
-		return list(STOCK_MAPS)
-	except Exception:
-		return []
 
 
 class _PanelScript(object):
@@ -266,12 +252,8 @@ def _refresh():
 	client = _client()
 	count = int(getattr(client, 'waiting_count', 0) or 0) if client else 0
 	map_name = _friendly_map_name(_selected_map)
-	if _offline:
-		_safe_set(_labels['count'], 'text',
-			'Single player. Choose the battlefield, then click START.')
-	else:
-		_safe_set(_labels['count'], 'text',
-			'%d player(s) connected. Choose the battlefield, then click START.' % count)
+	_safe_set(_labels['count'], 'text',
+		'%d player(s) connected. Choose the battlefield, then click START.' % count)
 	_safe_set(_labels['map'], 'text', 'MAP: %s' % map_name)
 	_safe_set(_labels['status'], 'text', 'STATUS: %s' % (_status or 'Ready.'))
 	_paint_controls()
@@ -302,14 +284,6 @@ def _activate(role):
 	elif role in ('next', 'map'):
 		_cycle(1)
 	elif role == 'start':
-		if _offline:
-			start = _on_start
-			_status = 'Starting %s...' % _friendly_map_name(_selected_map)
-			_refresh()
-			close()
-			if callable(start):
-				start(_selected_map)
-			return True
 		client = _client()
 		if client is None or getattr(client, 'phase', None) != 'waiting':
 			_status = 'The waiting room is no longer active.'
@@ -323,32 +297,8 @@ def _activate(role):
 	return True
 
 
-def open_offline(player, on_start=None, options=None):
-	"""Show the same room for a single-player queue."""
-	global _offline, _on_start, _offline_options
-	global _active, _player, _selected_map, _status
-	_offline_options = tuple(options if options is not None
-		else offline_map_options())
-	if not _offline_options:
-		return False
-	if _panel is None and not _make_panel():
-		return False
-	_offline = True
-	_on_start = on_start
-	_player = player
-	if _selected_map not in _offline_options:
-		_selected_map = _offline_options[0]
-	_status = 'Ready.'
-	_active = True
-	_set_visible(True)
-	_acquire_cursor()
-	_refresh()
-	_log('offline map room opened')
-	return True
-
-
 def open(player):
-	global _active, _player, _selected_map, _status, _offline
+	global _active, _player, _selected_map, _status
 	client = getattr(player, '_offhangar_network_client', None) if player else None
 	if client is None or not getattr(client, 'ready', False) or client.phase != 'waiting':
 		return False
@@ -360,7 +310,6 @@ def open(player):
 		_selected_map = client.map_name if client.map_name in options else (
 			options[0] if options else client.map_name)
 	_status = 'Ready.'
-	_offline = False
 	_active = True
 	_set_visible(True)
 	_acquire_cursor()
@@ -394,10 +343,8 @@ def selected_map():
 
 
 def close():
-	global _active, _player, _offline, _on_start
+	global _active, _player
 	_active = False
-	_offline = False
-	_on_start = None
 	_set_visible(False)
 	_release_cursor()
 	_player = None

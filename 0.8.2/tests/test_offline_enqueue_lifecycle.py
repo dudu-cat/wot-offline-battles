@@ -30,12 +30,10 @@ def load_begin_queue():
         "LOG_DEBUG": lambda *args: None,
         "time": types.SimpleNamespace(time=lambda: 100.0),
         "_resolve_vehicle_inv_id": lambda unused, fallback: fallback,
-        "_network_mode_enabled": lambda: False,
+        "_network_mode_enabled": lambda: True,
         "_join_network_waiting_room": lambda *args: steps.append(("lan", args)),
         "_step_on_enqueued": lambda *args: steps.append(("enqueue", args)),
         "_schedule_arena_created_resilient": lambda *args: steps.append(("schedule", args)),
-        # The map room is covered by its own test; this one drives the queue.
-        "_open_offline_map_room": lambda *args: False,
     }
     exec(compile(text[start:end], str(SOURCE), "exec"), scope)
     return scope["begin_offline_battle_queue"], player, callbacks, steps
@@ -50,7 +48,8 @@ class OfflineEnqueueLifecycleTest(unittest.TestCase):
         self.assertEqual(1, len(callbacks))
 
         callbacks[0][1]()
-        self.assertEqual(["enqueue", "schedule"], [item[0] for item in steps])
+        # Every battle joins the LAN waiting room; the server owns the start.
+        self.assertEqual(["lan"], [item[0] for item in steps])
         self.assertFalse(player._offhangar_queue_pending)
 
     def test_first_click_is_not_discarded_during_recent_account_boot(self):

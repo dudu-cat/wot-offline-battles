@@ -19,6 +19,10 @@ try:
 except Exception, e:
     LOG_ERROR('Failed to load config: ' + str(e))
 
+# Every battle runs against the LAN server, including a single player.
+# The launcher starts that server. There is no server-free path.
+CONFIG_OPTIONS['network_mode'] = True
+
 from chat_shared import CHAT_RESPONSES
 
 OFFLINE_SERVER_ADDRESS = 'offline.loc'

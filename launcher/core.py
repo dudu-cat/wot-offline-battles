@@ -168,13 +168,13 @@ def endpoint_for_mode(mode, join_text="", default_port=DEFAULT_SERVER_PORT):
     return (LOCAL_HOST, default_port)
 
 
-def server_required(port_version, mode):
-    """Report whether the launcher must run a server for this mode."""
-    if mode == MODE_JOIN:
-        return False
-    if mode == MODE_HOST:
-        return True
-    return port_version == PORT_0_9_22
+def server_required(unused_port_version, mode):
+    """Report whether the launcher must run a server for this mode.
+
+    Both clients play every battle against the LAN server, including a single
+    player, so only joining somebody else's room needs no local server.
+    """
+    return mode != MODE_JOIN
 
 
 def _write_json(path, value, indent=2):
@@ -200,7 +200,7 @@ def _read_json(path):
 def write_0_8_2_settings(game_root, mode, host, port, name=None):
     path = os.path.join(game_root, "offhangar_user", "config.json")
     config = _read_json(path) or {}
-    config["network_mode"] = mode != MODE_SINGLE
+    config["network_mode"] = True
     config["network_server_host"] = host
     config["network_server_port"] = int(port)
     config["network_map_name"] = "server_random"

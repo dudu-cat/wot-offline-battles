@@ -12,7 +12,8 @@ Tanks, and stops that server when the game closes.
    Use Browse... for a folder that is not in the list. The launcher reports
    which client it found.
 3. Select a mode:
-   - Single player: you play alone against bots.
+   - Single player: you play alone against bots. The launcher runs the LAN
+     server for you, because every battle is a server battle.
    - Host a LAN battle on this PC: other players join this PC. The launcher
      prints the address they should type.
    - Join a LAN battle: type the address of the PC that hosts the battle, for

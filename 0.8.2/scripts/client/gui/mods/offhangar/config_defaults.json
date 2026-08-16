@@ -33,7 +33,7 @@
     "physics_tuning": {},
     "_native_physics": "This experimental 0.8.2-only build always uses the retail WGVehicleFilter2/WGVehiclePhysics2 stack for authority-side bot rigid bodies and requires the exact supported WorldOfTanks.exe. LAN replicas stay snapshot-only. Any native setup/runtime failure remains visible and immobile; it never switches to legacy Python bot movement.",
     "_network": "LAN MVP. Disabled by default. Press F11 in the offline hangar to set the server IP/port and toggle LAN mode. The server chooses the map and broadcasts it; the client value is only a fallback.",
-    "network_mode": false,
+    "network_mode": true,
     "network_server_host": "127.0.0.1",
     "network_server_port": 28782,
     "network_map_name": "server_random"

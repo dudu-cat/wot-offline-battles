@@ -19,7 +19,8 @@ and battle logic, a small LAN server and a launcher.
 2. Select your World of Tanks folder. The launcher recognizes the client,
    removes any older mod files and installs the matching mod.
 3. Select a mode:
-   - **Single player**: you play alone against bots.
+   - **Single player**: you play alone against bots. The launcher runs the
+     server for you; every battle is a server battle in both clients.
    - **Host a LAN battle**: other players join this PC. The launcher starts the
      server and prints the address to give them.
    - **Join a LAN battle**: type the host's address, for example

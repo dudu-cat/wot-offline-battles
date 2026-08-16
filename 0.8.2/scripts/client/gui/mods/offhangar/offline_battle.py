@@ -21119,29 +21119,6 @@ def _step_on_arena_created(player, cmdName):
 		LOG_CURRENT_EXCEPTION()
 
 
-def _open_offline_map_room(player, vehInvID, cmdName, queue_generation):
-	"""Let the player choose the map, or leave, before the battle starts."""
-	def start(map_name):
-		current = BigWorld.player()
-		if (current is not player or
-				queue_generation != getattr(
-					player, '_offhangar_queue_generation', 0) or
-				getattr(player, '_offhangar_queue_cancelled', False)):
-			return
-		# The chosen map only reaches the battle context through another
-		# enqueue step, because that step builds the arena from it.
-		player._offhangar_selected_mapId = str(map_name)
-		_step_on_enqueued(player, vehInvID, cmdName)
-		_schedule_arena_created_resilient(cmdName, player, queue_generation)
-
-	try:
-		from gui.mods.offhangar.lan_waiting_room import open_offline
-		return bool(open_offline(player, on_start=start))
-	except Exception:
-		LOG_CURRENT_EXCEPTION()
-		return False
-
-
 def _schedule_arena_created_resilient(cmdName, player, queue_generation):
 	def _fire():
 		if queue_generation != getattr(player, '_offhangar_queue_generation', 0):
@@ -21212,15 +21189,9 @@ def begin_offline_battle_queue(player, vehInvID, cmdName, cmd=0, args=()):
 		player._offhangar_queue_pending = False
 		if getattr(player, '_offhangar_queue_cancelled', False):
 			return
-		if _network_mode_enabled():
-			_join_network_waiting_room(player, vehInvID, cmdName)
-			return
-		# The stock queue screen is already up.  The map room opens over it and
-		# owns the transition; the queue's own cancel button still leaves.
-		_step_on_enqueued(player, vehInvID, cmdName)
-		if not _open_offline_map_room(player, vehInvID, cmdName,
-				queue_generation):
-			_schedule_arena_created_resilient(cmdName, player, queue_generation)
+		# Every battle is a server battle.  The waiting room opens over the
+		# stock queue screen and the server owns the start.
+		_join_network_waiting_room(player, vehInvID, cmdName)
 
 	# Run after onCmdResponse so native queue state is visible before transition.
 	BigWorld.callback(0.05, _run)

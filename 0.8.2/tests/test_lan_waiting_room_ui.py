@@ -133,28 +133,5 @@ class WaitingRoomUITest(unittest.TestCase):
         self.assertTrue(all(not control.visible for control in self.ui._controls.values()))
 
 
-class OfflineMapRoomTest(WaitingRoomUITest):
-    """The same room lets a single player pick a map or leave the queue."""
-
-    def test_offline_room_starts_the_selected_map(self):
-        started = []
-        self.assertTrue(self.ui.open_offline(
-            self.player, on_start=started.append,
-            options=["01_karelia", "06_ensk"]))
-        self.assertIn("Single player", self.ui._labels["count"].text)
-        self.assertEqual("MAP: 01 - Karelia", self.ui._labels["map"].text)
-
-        self.ui._activate("next")
-        self.assertEqual("MAP: 06 - Ensk", self.ui._labels["map"].text)
-        self.ui._activate("start")
-
-        self.assertEqual(["06_ensk"], started)
-        self.assertFalse(self.ui._active)
-
-    def test_offline_room_needs_a_map_pool(self):
-        self.assertFalse(self.ui.open_offline(
-            self.player, on_start=lambda unused: None, options=[]))
-
-
 if __name__ == "__main__":
     unittest.main()
