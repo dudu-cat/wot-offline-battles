@@ -269,10 +269,23 @@ def _open_server_log():
 
 def _serve(argv):
     index = argv.index(core.SERVE_FLAG)
-    if index + 1 >= len(argv):
-        raise core.LauncherError("--serve needs a client version.")
     _open_server_log()
-    core.run_server_payload(argv[index + 1])
+    if index + 1 >= len(argv):
+        print("--serve needs a client version.")
+        return 2
+    port_version = argv[index + 1]
+    print("Starting the %s LAN server from %s" %
+          (port_version, core.payload_root()))
+    try:
+        core.run_server_payload(port_version)
+    except Exception:
+        # A windowed build turns an unhandled exception into a dialog that
+        # waits for a user who is not there. Report it and exit instead.
+        import traceback
+
+        print("The %s LAN server stopped: %s" %
+              (port_version, traceback.format_exc()))
+        return 1
     return 0
 
 

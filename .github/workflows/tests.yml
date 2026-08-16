@@ -286,13 +286,14 @@ jobs:
                   if (-not $process.HasExited) {
                       & taskkill.exe /PID $process.Id /T /F | Out-Null
                   }
+                  $log = Join-Path $env:LOCALAPPDATA "WoTOfflineBattles\server.log"
+                  if (Test-Path $log) {
+                      Write-Host "--- launcher server log ---"
+                      Get-Content $log -Tail 60
+                      Remove-Item -LiteralPath $log -Force
+                  }
                   Start-Sleep -Seconds 2
               }
-          }
-          $log = Join-Path $env:LOCALAPPDATA "WoTOfflineBattles\server.log"
-          if (Test-Path $log) {
-              Write-Host "--- launcher server log ---"
-              Get-Content $log -Tail 40
           }
       - uses: actions/upload-artifact@v4
         with:
