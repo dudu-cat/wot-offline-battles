@@ -278,6 +278,10 @@ def run_server_payload(port_version, base_dir=None):
     """Run one bundled server inside this process."""
     import runpy
 
+    # The packaged launcher carries the server sources as data, so their
+    # standard-library imports reach PyInstaller only through this module.
+    import server_imports  # noqa: F401
+
     argv = server_argv(port_version, base_dir)
     if argv is None:
         raise LauncherError("Unknown client port: %s" % port_version)

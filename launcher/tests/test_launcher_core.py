@@ -1,10 +1,13 @@
+import ast
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 
 import core
+import server_imports
 import stage_payload
 
 
@@ -282,6 +285,87 @@ class PayloadStagingTest(unittest.TestCase):
             stream.write("old")
         stage_payload.stage(self.target)
         self.assertFalse(os.path.exists(stale))
+
+
+class ServerImportTest(unittest.TestCase):
+    """The bundle must carry every module the servers import.
+
+    PyInstaller cannot see through ``runpy``, so a server import that is not
+    declared in ``server_imports`` is missing from the packaged launcher.
+    """
+
+    ENTRY_POINTS = {
+        core.PORT_0_8_2: ('lan_battle_server.py',),
+        core.PORT_0_9_22: ('server/windows_server.py',),
+    }
+
+    def setUp(self):
+        self.payload = os.path.join(tempfile.mkdtemp(), "servers")
+        self.addCleanup(shutil.rmtree, os.path.dirname(self.payload), True)
+        stage_payload.stage(self.payload)
+
+    def _module_file(self, root, name):
+        relative = name.replace('.', os.path.sep)
+        for candidate in (relative + '.py',
+                          os.path.join(relative, '__init__.py')):
+            path = os.path.join(root, candidate)
+            if os.path.isfile(path):
+                return path
+        return None
+
+    def _imports(self, path):
+        with open(path, 'rb') as stream:
+            tree = ast.parse(stream.read())
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    names.add(alias.name)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                if node.module:
+                    names.add(node.module)
+        return names
+
+    def _closure(self, port_version):
+        port_root = os.path.join(self.payload, port_version)
+        search_roots = [port_root]
+        if port_version == core.PORT_0_9_22:
+            search_roots.append(os.path.join(port_root, 'server'))
+            search_roots.append(os.path.join(
+                port_root, 'src', 'res', 'scripts', 'client'))
+        pending = [os.path.join(port_root, *entry.split('/'))
+                   for entry in self.ENTRY_POINTS[port_version]]
+        seen = set()
+        external = set()
+        while pending:
+            path = pending.pop()
+            if path in seen:
+                continue
+            seen.add(path)
+            for name in self._imports(path):
+                local = None
+                for root in search_roots:
+                    local = self._module_file(root, name)
+                    if local is not None:
+                        break
+                if local is None:
+                    external.add(name.split('.')[0])
+                else:
+                    pending.append(local)
+        return external
+
+    def test_every_server_import_is_declared(self):
+        declared = set(server_imports.SERVER_STDLIB_MODULES)
+        for port_version in core.SUPPORTED_PORTS:
+            external = self._closure(port_version)
+            required = {name for name in external
+                        if name in sys.stdlib_module_names and
+                        name != '__future__'}
+            self.assertLessEqual(required, declared, port_version)
+
+    def test_the_declared_modules_all_import(self):
+        for name in server_imports.SERVER_STDLIB_MODULES:
+            self.assertIn(name, sys.modules, name)
 
 
 class ListenerTest(unittest.TestCase):
