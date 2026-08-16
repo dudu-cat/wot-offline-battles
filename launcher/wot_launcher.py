@@ -179,6 +179,8 @@ class LauncherWindow(object):
         host = session["host"]
         port = session["tcp_port"]
         try:
+            self._log("Installing the %s mod into %s..." %
+                      (session["client"], game_root))
             for action in core.install_client_mod(game_root,
                                                   session["client"]):
                 self._log(action)

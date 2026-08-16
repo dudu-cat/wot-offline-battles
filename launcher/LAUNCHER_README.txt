@@ -1,44 +1,51 @@
 WoT Offline Battles Launcher
 ================================
 
-The launcher prepares one battle before the game starts. It writes the server
-address for the installed client, runs the LAN server when you host, starts
-World of Tanks, and stops that server when the game closes.
+The launcher prepares one battle before the game starts. It installs the mod,
+writes the server address, runs the LAN server when you host, starts World of
+Tanks, and stops that server when the game closes.
 
-1. Double-click WoT-Offline-Battles-Launcher.exe.
-2. Select your World of Tanks folder. The launcher reports the client version
-   it found and whether the matching mod package is installed.
+1. Start WoT-Offline-Battles-Launcher.exe from this folder. Keep the folder
+   together; the launcher needs the files beside it.
+2. Select your World of Tanks folder. The launcher reports which client it
+   found.
 3. Select a mode:
    - Single player: you play alone against bots.
-   - Host a LAN battle on this PC: other players join this PC.
-   - Join a LAN battle: type the address of the PC that hosts the battle,
-     for example 192.168.1.20 or 192.168.1.20:28782.
+   - Host a LAN battle on this PC: other players join this PC. The launcher
+     prints the address they should type.
+   - Join a LAN battle: type the address of the PC that hosts the battle, for
+     example 192.168.1.20 or 192.168.1.20:28782.
 4. Type a player name. Other players see it in the LAN room.
-5. Click Start game.
+5. Click Start game. The launcher removes older mod files, installs the mod
+   for that client, and starts the game. This takes a few seconds.
 
-In the game, click the battle button. The map choice and the start button are
-in the room window that opens after the client joins.
+In the game, select a tank and click Battle!. Everyone lands in the LAN waiting
+room. The room host selects a map and clicks START BATTLE.
 
-When you host, approve the UAC prompt that adds an inbound TCP 28782 rule for
-this launcher. Cancelling is nonfatal, but other PCs may remain unable to
-connect. Run this trusted-LAN server only on a network you trust.
+Your own files stay in place: 0.8.2 settings in offhangar_user, and the 0.9.22
+saved address, account state and configuration in
+mods\configs\offline_lan_0922.
 
-The launcher keeps its own settings in
-%LOCALAPPDATA%\WoTOfflineBattles\launcher.json and writes the server log for a
+When you host, approve the UAC prompt that opens TCP 28782 for this launcher.
+Cancelling is nonfatal, but other PCs may remain unable to connect. Run this
+trusted-LAN server only on a network you trust.
+
+The launcher keeps its settings in
+%LOCALAPPDATA%\WoTOfflineBattles\launcher.json and writes the server log of a
 hosted battle to %LOCALAPPDATA%\WoTOfflineBattles\server.log.
 
 If the hosted server never opens port 28782, another server may already use
-that port. Close the other server and start the game again.
+that port. Close it and start the game again.
 
 License, source, and bundled runtimes
 =====================================
 
 This launcher is part of wot-offline-battles and is distributed under GNU GPL
-version 3, without warranty. Corresponding source for release 0.4.0 and the
+version 3, without warranty. The corresponding source and the
 complete project license are available at:
 
-https://github.com/pengw0048/wot-offline-battles/tree/v0.4.0
-https://github.com/pengw0048/wot-offline-battles/blob/v0.4.0/LICENSE
+https://github.com/pengw0048/wot-offline-battles
+https://github.com/pengw0048/wot-offline-battles/blob/main/LICENSE
 
 The executable bundles CPython 3.11.9, distributed under the Python Software
 Foundation License Version 2 and the licenses/notices for software incorporated
