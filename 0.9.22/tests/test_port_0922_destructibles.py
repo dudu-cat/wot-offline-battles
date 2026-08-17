@@ -69,7 +69,7 @@ def _catalog(resources, instances=None, ambiguous_instances=None):
         'resources': resources,
     }
     if instances is not None:
-        catalog['version'] = 3
+        catalog['version'] = 4
         catalog['instances'] = instances
         catalog['ambiguous_instances'] = ambiguous_instances or []
     return catalog
@@ -1860,8 +1860,8 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 'kind': 'falling',
                 'boxes': [[-0.3, 0.0, -0.3, 0.3, 9.0, 0.3, None]],
             },
-        }, [list(signatures[0]) + [fence, 0],
-            list(signatures[1]) + [pole, 0]]))
+        }, [list(signatures[0]) + [fence, 0, 22, 0, 1.0],
+            list(signatures[1]) + [pole, 0, 22, 1, 1.0]]))
         descriptors = {
             fence: {'type': 3, 'health': 15},
             pole: {'type': 2, 'health': 1},
@@ -1933,8 +1933,8 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 'kind': 'falling',
                 'boxes': [[-0.3, 0.0, -0.3, 0.3, 9.0, 0.3, None]],
             },
-        }, [list(signatures[0]) + [fence, 0],
-            list(signatures[1]) + [pole, 0]]))
+        }, [list(signatures[0]) + [fence, 0, 22, 1, 1.0],
+            list(signatures[1]) + [pole, 0, 22, 2, 1.0]]))
         descriptors = {
             tree: {'type': 1, 'health': 10, 'mass': 20},
             fence: {'type': 3, 'health': 15},
@@ -2150,7 +2150,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 'kind': 'falling',
                 'boxes': [[-1, 0, -1, 1, 3, 1, None]],
             },
-        }, [list(other_signature) + [unique, 0]], [
+        }, [list(other_signature) + [unique, 0, 23, 0, 1.0]], [
             list(signature) + [[[ambiguous, 0], [ambiguous, 0]]],
         ])
         destructibles_sensor.set_catalog(catalog)
@@ -2200,7 +2200,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 'kind': 'fragile',
                 'boxes': [[-1, 0, -1, 1, 1, 1, None]],
             },
-        }, [list(signature) + [expected, 0]]))
+        }, [list(signature) + [expected, 0, 22, 0, 1.0]]))
         manager = _Manager()
         manager.space_id = 1
         manager.set_chunk_count(22, 1)
@@ -2246,7 +2246,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 'kind': 'fragile',
                 'boxes': [[-1, 0, -1, 1, 1, 1, None]],
             },
-        }, [list(signature) + [filename, 0]])
+        }, [list(signature) + [filename, 0, 22, 0, 1.0]])
         manager = _Manager()
         manager.space_id = 1
         manager.set_chunk_count(22, 1)
@@ -2308,7 +2308,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                     [0, 0, -2, 2, 3, 2, 74],
                 ],
             },
-        }, [list(signature) + [filename, None]]))
+        }, [list(signature) + [filename, None, 22, 0, 1.0]]))
         manager = _Manager()
         manager.space_id = 1
         manager.set_chunk_count(22, 1)
@@ -3677,6 +3677,152 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             (22, 37), destructibles_sensor.g_offh_destr_falling_active)
         self.assertEqual(4, len(matrix_queries))
 
+    def _donation_catalog(self):
+        fence = 'content/GatesAndFences/gaf022/normal/lod0/fence.model'
+        house = 'content/Buildings/test/normal/lod0/house.model'
+        catalog = _catalog({
+            fence: {
+                'kind': 'fragile',
+                'boxes': [[-0.2, 0.0, -2.0, 0.2, 1.5, 2.0, None]],
+            },
+            house: {
+                'kind': 'structure',
+                'boxes': [
+                    [-2, 0, -2, 0, 3, 2, 73],
+                    [0, 0, -2, 2, 3, 2, 74],
+                ],
+            },
+        }, [
+            [0] * 11 + [1, fence, 0, 31, 4, 0.75],
+            [0] * 11 + [2, house, None, 31, 7, 1.25],
+        ])
+        return fence, house, catalog
+
+    def _donation_environment(self, descriptors, scaled_calls=None):
+        def scaled(scale, health):
+            if scaled_calls is not None:
+                scaled_calls.append((scale, health))
+            return scale * health
+
+        area = types.ModuleType('AreaDestructibles')
+        area.DESTR_TYPE_TREE = 1
+        area.DESTR_TYPE_FALLING_ATOM = 2
+        area.DESTR_TYPE_FRAGILE = 3
+        area.DESTR_TYPE_STRUCTURE = 4
+        area.g_cache = types.SimpleNamespace(
+            getDescByFilename=lambda value: descriptors.get(value),
+            unitVehicleMass=8000.0)
+        cache = types.ModuleType('DestructiblesCache')
+        cache.scaledDestructibleHealth = scaled
+        return {'AreaDestructibles': area, 'DestructiblesCache': cache}
+
+    def test_donation_covers_the_baked_catalog_without_streaming(self):
+        fence, house, catalog = self._donation_catalog()
+        destructibles_sensor.set_catalog(catalog)
+        descriptors = {
+            fence: {'type': 3, 'health': 15,
+                    'kineticDamageCorrection': 0.5},
+            house: {'type': 4, 'modules': {
+                73: {'health': 40, 'armor': 12.0},
+                74: {'health': 60}}},
+        }
+        scaled_calls = []
+        modules = self._donation_environment(descriptors, scaled_calls)
+
+        self.assertIsNone(
+            destructibles_sensor.__dict__.get('g_offh_destr_instances'))
+        with mock.patch.dict(sys.modules, modules):
+            donation = destructibles_sensor.donation_rows_1513()
+
+        self.assertEqual(8000.0, donation['unit_vehicle_mass'])
+        rows = donation['instances']
+        self.assertEqual(2, len(rows))
+        by_wire = dict(((row[1], row[2]), row) for row in rows)
+        fence_row = by_wire[(31, 4)]
+        self.assertEqual(0.75 * 15, fence_row[3])
+        self.assertIsNone(fence_row[4])
+        house_row = by_wire[(31, 7)]
+        self.assertIsNone(house_row[3])
+        self.assertEqual([1.25 * 40, 12.0], house_row[4]['73'])
+        self.assertEqual([1.25 * 60, 0.0], house_row[4]['74'])
+        self.assertIn((0.75, 15), scaled_calls)
+        self.assertIn((1.25, 40), scaled_calls)
+        self.assertIn((1.25, 60), scaled_calls)
+        resources = donation['resources']
+        self.assertEqual('fragile',
+                         resources[fence.lower()]['destr_type'])
+        self.assertEqual(0.5,
+                         resources[fence.lower()]['kinetic_correction'])
+        self.assertEqual('structure',
+                         resources[house.lower()]['destr_type'])
+
+    def test_one_bad_descriptor_fails_the_whole_donation(self):
+        fence, house, catalog = self._donation_catalog()
+        descriptors = {
+            fence: {'type': 3, 'health': 15},
+        }
+
+        destructibles_sensor.set_catalog(catalog)
+        with mock.patch.dict(
+                sys.modules, self._donation_environment(descriptors)):
+            with self.assertRaisesRegex(RuntimeError,
+                                        'no #1513 descriptor'):
+                destructibles_sensor.donation_rows_1513()
+
+        descriptors[house] = {'type': 3, 'health': 20}
+        destructibles_sensor.set_catalog(catalog)
+        with mock.patch.dict(
+                sys.modules, self._donation_environment(descriptors)):
+            with self.assertRaisesRegex(RuntimeError, 'kind disagrees'):
+                destructibles_sensor.donation_rows_1513()
+
+    def test_streamed_identity_must_match_the_baked_wire(self):
+        fence = 'content/GatesAndFences/gaf022/normal/lod0/fence.model'
+        chunk_translation = _Vector(100.0, 5.0, 200.0)
+        matrix = _ItemMatrix(_Vector(2.0, 0.0, 4.0))
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Vector
+        math_module.Matrix = lambda value: value
+        signature = destructibles_sensor._locator_signature(
+            matrix, chunk_translation, math_module, 1000)
+        destructibles_sensor.set_catalog(_catalog({
+            fence: {
+                'kind': 'fragile',
+                'boxes': [[-0.2, 0.0, -2.0, 0.2, 1.5, 2.0, None]],
+            },
+        }, [list(signature) + [fence, 0, 23, 5, 1.0]]))
+        manager = _Manager()
+        manager.space_id = 1
+        manager.set_chunk_count(22, 1)
+        area = types.ModuleType('AreaDestructibles')
+        area.g_destructiblesManager = manager
+        area.DESTR_TYPE_TREE = 1
+        area.DESTR_TYPE_FALLING_ATOM = 2
+        area.DESTR_TYPE_FRAGILE = 3
+        area.DESTR_TYPE_STRUCTURE = 4
+        area.chunkIDFromPosition = lambda unused: 22
+        area.g_cache = types.SimpleNamespace(
+            getDescByFilename=lambda unused: {'type': 3, 'health': 15})
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_getChunkDestrFilenames = lambda *unused: ('',)
+        bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
+            translation=chunk_translation)
+        bigworld.wg_getDestructibleMatrix = lambda *unused: matrix
+        type_descriptor = _Strict1513Component(
+            hull=_Strict1513Component(
+                hitTester=types.SimpleNamespace(bbox=(
+                    (-1.6, -1.0, -3.6), (1.6, 1.0, 3.6), None))))
+        destructibles_sensor.xrange = range
+
+        with mock.patch.dict(
+                sys.modules, {'AreaDestructibles': area,
+                              'BigWorld': bigworld, 'Math': math_module}):
+            with self.assertRaisesRegex(
+                    RuntimeError, 'disagrees with the baked wire'):
+                destructibles_sensor._fell_trees_near(
+                    1, _Vector(102.0, 5.0, 204.0), 0.0, 0.25,
+                    type_descriptor)
+
     def test_late_blank_column_registration_uses_native_initial_matrix(self):
         pole = 'content/Environment/env414/normal/lod0/pole.model'
         chunk_translation = _Vector(100.0, 5.0, 200.0)
@@ -3699,8 +3845,8 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 'kind': 'falling',
                 'boxes': [[-2.0, 0.0, -2.0, 2.0, 2.0, 2.0, None]],
             },
-        }, [list(signature) + [pole, 0],
-            list(current_signature) + [decoy, 0]])
+        }, [list(signature) + [pole, 0, 22, 0, 1.0],
+            list(current_signature) + [decoy, 0, 23, 0, 1.0]])
         manager = _Manager()
         manager.space_id = 1
         manager.set_chunk_count(22, 1)

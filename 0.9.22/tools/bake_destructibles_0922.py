@@ -40,7 +40,7 @@ import navigation_graph_schema
 
 
 FORMAT_NAME = 'offline-lan-0922-destructible-catalog'
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 MANIFEST_FORMAT = FORMAT_NAME + '-manifest'
 GAME_VERSION = '0.9.22.0.1-cn-1513'
 DECODER_VERSION = '0.9.22.0.1'
@@ -54,6 +54,7 @@ MODEL_TYPE_FALLING = 1
 MODEL_TYPE_DESTRUCTIBLE = 2
 ENTRY_TYPE_FRAGILE = 0
 ENTRY_TYPE_STRUCTURE = 1
+SPTR_INDEX_BIT = 0x80000000
 
 
 def _children(element, name):
@@ -218,14 +219,91 @@ def _candidate_sort_key(candidate):
     return filename, -1 if box_index is None else int(box_index)
 
 
+def _item_scale(transform):
+    """Return the runtime AreaDestructibles scale: the Y-basis length."""
+    y_axis = (float(transform[4]), float(transform[5]), float(transform[6]))
+    scale = (y_axis[0] * y_axis[0] + y_axis[1] * y_axis[1] +
+             y_axis[2] * y_axis[2]) ** 0.5
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError('BSMI transform has an invalid item scale')
+    return scale
+
+
+def _native_wires(compiled, bsmi_count):
+    """Map each referenced BSMI row to its native (chunk_id, item_index).
+
+    WGDE table "1" rows are (chunk_id, global_item_begin, item_count) and
+    must partition table "2" from zero.  Each table "2" row is one native
+    item spanning an inclusive reference range in table "3"; ref_begin >
+    ref_end is a valid empty item that still consumes an item index.  A
+    table "3" reference selects an SpTr row when bit 0x80000000 is set and
+    a BSMI row otherwise.
+    """
+    wgde = compiled.sections['WGDE']._data
+    table1 = wgde.get('1')
+    table2 = wgde.get('2')
+    table3 = wgde.get('3')
+    if not table1 or not isinstance(table2, list) or \
+            not isinstance(table3, list):
+        raise ValueError('WGDE destructible tables are unavailable')
+    sptr_count = len(compiled.sections['SpTr']._data['speedtree_list'])
+    chunk_ranges = sorted((int(begin), int(count), int(chunk_id))
+                          for chunk_id, begin, count in table1)
+    item_wires = []
+    item_cursor = 0
+    seen_chunk_ids = set()
+    for begin, count, chunk_id in chunk_ranges:
+        if begin != item_cursor or count < 0 or chunk_id in seen_chunk_ids:
+            raise ValueError('WGDE chunk item ranges are not contiguous')
+        seen_chunk_ids.add(chunk_id)
+        item_wires.extend((chunk_id, index) for index in range(count))
+        item_cursor += count
+    if item_cursor != len(table2):
+        raise ValueError('WGDE chunk item ranges do not cover the item table')
+    row_wires = {}
+    wire_rows = {}
+    sptr_seen = set()
+    ref_cursor = 0
+    for position, (ref_begin, ref_end) in enumerate(table2):
+        ref_begin = int(ref_begin)
+        ref_end = int(ref_end)
+        if ref_begin != ref_cursor:
+            raise ValueError('WGDE item references are not contiguous')
+        if ref_begin > ref_end:
+            if ref_end != ref_cursor - 1:
+                raise ValueError('WGDE empty item span is invalid')
+            continue
+        wire = item_wires[position]
+        rows = set()
+        for ref_index in range(ref_begin, ref_end + 1):
+            ref = int(table3[ref_index])
+            if ref & SPTR_INDEX_BIT:
+                index = ref & ~SPTR_INDEX_BIT
+                if not 0 <= index < sptr_count or index in sptr_seen:
+                    raise ValueError('WGDE SpTr reference is invalid')
+                sptr_seen.add(index)
+            else:
+                if not 0 <= ref < bsmi_count or ref in row_wires:
+                    raise ValueError('WGDE BSMI reference is invalid')
+                row_wires[ref] = wire
+                rows.add(ref)
+        if rows:
+            wire_rows[wire] = frozenset(rows)
+        ref_cursor = ref_end + 1
+    if ref_cursor != len(table3):
+        raise ValueError('WGDE item spans do not cover the reference table')
+    return row_wires, wire_rows
+
+
 def bake_compiled_map(map_name, map_package_data, space_data,
                       destructibles_data, descriptors=None):
     """Join one decoded map to descriptors; pure apart from binary decoding."""
     if descriptors is None:
         descriptors = parse_descriptors(destructibles_data)
     compiled = CompiledSpace(io.BytesIO(space_data), DECODER_VERSION,
-                             DECODER_REGION, ['BWST', 'BSMI', 'BSMO'])
-    missing = [name for name in ('BWST', 'BSMI', 'BSMO')
+                             DECODER_REGION,
+                             ['BWST', 'BSMI', 'BSMO', 'WGDE', 'SpTr'])
+    missing = [name for name in ('BWST', 'BSMI', 'BSMO', 'WGDE', 'SpTr')
                if name not in compiled.sections]
     if missing:
         raise ValueError('compiled space omitted %s' % ', '.join(missing))
@@ -235,6 +313,7 @@ def bake_compiled_map(map_name, map_package_data, space_data,
     model_ids = list(bsmi.model_ids())
     if len(model_ids) != len(bsmi._data['transforms']):
         raise ValueError('BSMI model ids do not match transforms')
+    row_wires, wire_rows = _native_wires(compiled, len(model_ids))
     instance_counts = {}
     instances_by_model = {}
     for model_id, transform in zip(model_ids, bsmi._data['transforms']):
@@ -389,7 +468,9 @@ def bake_compiled_map(map_name, map_package_data, space_data,
     # resource or non-structure collider variant is kept explicitly ambiguous
     # and is never eligible for runtime destruction.
     instance_candidates = {}
-    for model_id, transform in zip(model_ids, bsmi._data['transforms']):
+    instance_rows = {}
+    for row_index, (model_id, transform) in enumerate(
+            zip(model_ids, bsmi._data['transforms'])):
         model_resource = instance_model_resources.get(model_id)
         if model_resource is None:
             continue
@@ -401,9 +482,14 @@ def bake_compiled_map(map_name, map_package_data, space_data,
         signature = _locator_signature(transform)
         instance_candidates.setdefault(signature, []).append(
             (filename, box_index, kind, model_id))
+        rows = instance_rows.setdefault(
+            signature, {'rows': set(), 'scales': set()})
+        rows['rows'].add(row_index)
+        rows['scales'].add(_item_scale(transform))
 
     instances = []
     ambiguous_instances = []
+    emitted_wires = set()
     instance_kind_signatures = dict((kind, 0) for kind in kinds)
     ambiguous_instance_candidates = 0
     for signature in sorted(instance_candidates):
@@ -438,7 +524,27 @@ def bake_compiled_map(map_name, map_package_data, space_data,
         candidates.sort(key=_candidate_sort_key)
         if len(candidates) == 1:
             filename, box_index = candidates[0]
-            instances.append(list(signature) + [filename, box_index])
+            rows = instance_rows[signature]
+            wires = set(row_wires.get(row) for row in rows['rows'])
+            if None in wires or len(wires) != 1:
+                raise ValueError(
+                    'destructible instance does not resolve to one native '
+                    'item: %s' % filename)
+            wire = wires.pop()
+            if wire_rows[wire] != frozenset(rows['rows']):
+                raise ValueError(
+                    'native item references rows outside its instance: %s' %
+                    filename)
+            if wire in emitted_wires:
+                raise ValueError(
+                    'native item is claimed by two instances: %s' % filename)
+            emitted_wires.add(wire)
+            if len(rows['scales']) != 1:
+                raise ValueError(
+                    'destructible instance scales disagree: %s' % filename)
+            instances.append(list(signature) + [
+                filename, box_index, wire[0], wire[1],
+                next(iter(rows['scales']))])
             instance_kind_signatures[resources[filename]['kind']] += 1
         else:
             ambiguous_instances.append(

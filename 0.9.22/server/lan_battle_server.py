@@ -862,13 +862,12 @@ class BattleState:
                     self.authority_status == "server_pending" and
                     player_id == self.host_player_id):
                 # The sole native-data donor left while either projection or
-                # destructible identities were pending. Give the round back to
-                # the client election rather than wait for an impossible retry.
+                # destructible identities were pending. End the round rather
+                # than wait for an impossible retry.
                 reason = ("descriptor_donor_disconnected"
                           if not self.server_authority.started()
                           else "destructible_map_donor_disconnected")
-                self._fallback_to_client_authority(
-                    reason)
+                self._fail_server_authority_round(reason)
             if player_id == self.host_player_id:
                 self._elect_room_host()
             if player_id == self.bot_authority_id:
@@ -1009,31 +1008,40 @@ class BattleState:
         self.authority_prerequisite_deadline = None
         return True
 
-    def _fallback_to_client_authority(self, reason):
-        """Atomically abandon failed server prerequisites for this round."""
-        already_fallback = (
-            self.server_authority is None and
-            self.authority_status == "client_fallback" and
-            self.authority_fallback_reason == str(reason))
-        if already_fallback:
-            return False
+    def _fail_server_authority_round(self, reason):
+        """Abort a #1513 round whose server-authority prerequisites failed.
+
+        The server owns every #1513 battle simulation, so a failed
+        prerequisite ends the round instead of degrading to a
+        client-simulated battle.
+        """
+        reason = str(reason)
         authority = self.server_authority
         if (authority is not None and
                 not authority.world.destructible_identities_ready()):
             self.destructible_maps.pop(self.map_name, None)
+        _server_log("SERVER AUTHORITY hard fail reason=%s round=%s" %
+                    (reason, self.round_id))
+        self._reset_round()
+        self.authority_status = "failed"
+        self.authority_fallback_reason = reason
+        return True
+
+    def _refuse_battle_start(self, reason):
+        """Refuse a #1513 start that cannot run under the server authority."""
+        reason = str(reason)
+        self.phase = "waiting"
+        self.roster_finalized = False
         self.server_authority = None
         self.pending_descriptor_names = ()
         self.descriptor_requested_names = ()
         self.descriptor_failed_names = set()
         self.authority_prerequisite_deadline = None
-        self.authority_status = "client_fallback"
-        self.authority_fallback_reason = str(reason)
-        self._elect_bot_authority()
+        self.authority_status = "failed"
+        self.authority_fallback_reason = reason
         self.state_revision += 1
-        _server_log(
-            "SERVER AUTHORITY fallback reason=%s authority=%s" %
-            (self.authority_fallback_reason, self.bot_authority_id))
-        return True
+        _server_log("SERVER AUTHORITY refused start reason=%s" % reason)
+        return None, reason
 
     def _expire_authority_prerequisite(self):
         if (self.phase != "loading" or
@@ -1046,7 +1054,7 @@ class BattleState:
         reason = ("descriptor_timeout"
                   if authority is None or not authority.started()
                   else "destructible_map_timeout")
-        return self._fallback_to_client_authority(reason)
+        return self._fail_server_authority_round(reason)
 
     def lobby_message(self):
         with self.lock:
@@ -1096,7 +1104,9 @@ class BattleState:
             self.roster_finalized = True
             self.phase = ("loading" if self.client_build == CLIENT_BUILD_0922
                           else "battle")
-            self._prepare_server_authority()
+            refusal = self._prepare_server_authority()
+            if refusal is not None:
+                return self._refuse_battle_start(refusal)
             self._elect_bot_authority()
             descriptor_request = None
             if self.server_authority is not None:
@@ -1112,30 +1122,27 @@ class BattleState:
                         error)
                     prepared = False
                 if not prepared:
-                    self._fallback_to_client_authority(
-                        "lineup_unavailable")
-                else:
-                    names = self.server_authority.required_projections()
-                    missing = tuple(sorted(
-                        name for name in names
-                        if self.descriptor_store.get(name) is None))
-                    self.pending_descriptor_names = missing
-                    self.descriptor_requested_names = missing
-                    self.descriptor_failed_names = set()
-                    if missing:
-                        self._wait_for_authority_prerequisite(restart=True)
-                        descriptor_request = {
-                            "type": "descriptor_request",
-                            "round_id": self.round_id,
-                            "names": list(missing),
-                        }
-                    elif not self._start_server_authority():
-                        self._fallback_to_client_authority(
-                            "server_start_failed")
-                    elif not self._mark_server_authority_ready():
-                        self._wait_for_authority_prerequisite(
-                            AUTHORITY_DESTRUCTIBLE_TIMEOUT_SECONDS,
-                            restart=True)
+                    return self._refuse_battle_start("lineup_unavailable")
+                names = self.server_authority.required_projections()
+                missing = tuple(sorted(
+                    name for name in names
+                    if self.descriptor_store.get(name) is None))
+                self.pending_descriptor_names = missing
+                self.descriptor_requested_names = missing
+                self.descriptor_failed_names = set()
+                if missing:
+                    self._wait_for_authority_prerequisite(restart=True)
+                    descriptor_request = {
+                        "type": "descriptor_request",
+                        "round_id": self.round_id,
+                        "names": list(missing),
+                    }
+                elif not self._start_server_authority():
+                    return self._refuse_battle_start("server_start_failed")
+                elif not self._mark_server_authority_ready():
+                    self._wait_for_authority_prerequisite(
+                        AUTHORITY_DESTRUCTIBLE_TIMEOUT_SECONDS,
+                        restart=True)
             self.state_revision += 1
             start_message = {
                 "type": "battle_start",
@@ -1167,7 +1174,7 @@ class BattleState:
             if descriptor_request is not None:
                 host = self.players.get(self.host_player_id)
                 if host is None or not host.send(descriptor_request):
-                    self._fallback_to_client_authority(
+                    return self._refuse_battle_start(
                         "descriptor_request_failed")
             start_message["bot_authority_id"] = self.bot_authority_id
             if self.client_build == CLIENT_BUILD_0922:
@@ -1179,7 +1186,11 @@ class BattleState:
             return start_message, None
 
     def _prepare_server_authority(self):
-        """Build this round's server-hosted authority when it can own bots."""
+        """Build this round's server-hosted authority when it can own bots.
+
+        Returns None on success and a refusal reason when the #1513 round
+        cannot run under the server authority.
+        """
         self.server_authority = None
         self.pending_descriptor_names = ()
         self.descriptor_requested_names = ()
@@ -1188,25 +1199,22 @@ class BattleState:
         self.authority_status = "idle"
         self.authority_fallback_reason = ""
         if self.client_build != CLIENT_BUILD_0922:
-            return
+            return None
         if not self.vehicle_catalogs.get(self.host_player_id):
-            self._fallback_to_client_authority(
-                "vehicle_catalog_unavailable")
-            return
+            return "vehicle_catalog_unavailable"
         try:
             world = server_world.load_world(self.map_name)
         except Exception as error:
             _server_log("server authority world load failed: %s" % error)
-            self._fallback_to_client_authority("world_data_unavailable")
-            return
+            return "world_data_unavailable"
         if world is None:
             _server_log(
                 "server authority has no baked world for %s" % self.map_name)
-            self._fallback_to_client_authority("world_data_unavailable")
-            return
+            return "world_data_unavailable"
         self.server_authority = ServerBattleAuthority(
             self, world, self.descriptor_store)
         self._wait_for_authority_prerequisite(restart=True)
+        return None
 
     def store_vehicle_catalog(self, player_id, message):
         """Keep one connection's eligible-vehicle catalog for lineups."""
@@ -1297,9 +1305,9 @@ class BattleState:
             if (map_name == self.map_name and
                     self.server_authority is not None and
                     not self.server_authority.world.destructible_identities_ready()):
-                self._fallback_to_client_authority(
+                self._fail_server_authority_round(
                     "destructible_map_incomplete")
-                return "fallback"
+                return "failed"
             return True
 
     def _install_destructible_map(self, map_name):
@@ -1375,15 +1383,15 @@ class BattleState:
             if not complete:
                 return True
             if self.descriptor_failed_names or missing:
-                self._fallback_to_client_authority(
+                self._fail_server_authority_round(
                     "descriptor_projection_failed")
-                return "fallback"
+                return "failed"
             self.pending_descriptor_names = ()
             self.descriptor_requested_names = ()
             self.descriptor_failed_names = set()
             if not self._start_server_authority():
-                self._fallback_to_client_authority("server_start_failed")
-                return "fallback"
+                self._fail_server_authority_round("server_start_failed")
+                return "failed"
             if not self._mark_server_authority_ready():
                 self._wait_for_authority_prerequisite(
                     AUTHORITY_DESTRUCTIBLE_TIMEOUT_SECONDS, restart=True)
@@ -1414,6 +1422,9 @@ class BattleState:
 
     def _activate_battle_if_ready(self):
         if self.phase != "loading":
+            return None
+        if (self.client_build == CLIENT_BUILD_0922 and
+                self.server_authority is None):
             return None
         if (self.server_authority is not None and
                 not self._server_authority_prerequisites_ready()):
@@ -5074,7 +5085,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                                         live["round_id"],
                                         live["countdown_seconds"],
                                         len(server.state.players)))
-                        elif installed == "fallback":
+                        elif installed == "failed":
                             server.state.broadcast_current_roster()
                     elif message_type == "descriptor_bundle":
                         accepted = server.state.donate_descriptors(
@@ -5091,7 +5102,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                                         live["round_id"],
                                         live["countdown_seconds"],
                                         len(server.state.players)))
-                        elif accepted == "fallback":
+                        elif accepted == "failed":
                             server.state.broadcast_current_roster()
                     elif message_type == "ping":
                         player.send({

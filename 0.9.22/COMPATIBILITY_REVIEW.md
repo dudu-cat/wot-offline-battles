@@ -946,11 +946,15 @@ Vehicle data stays interpreted only on the #1513 client. A client donates the
 eligible-vehicle catalog (`descriptor_catalog`) after joining; at battle start
 the server runs the mirrored 0.8.2 lineup law over that catalog and asks the
 room host for the round's descriptor projections (`descriptor_request` /
-`descriptor_bundle`) during the loading barrier. A round without a catalog, a
-baked world, or a completed bundle falls back to the previous client
-election, and a donor that disconnects mid-request does the same. Descriptor
-projection has a bounded 30-second wait. Native destructible identities have
-an independent 120-second wait after the server authority starts.
+`descriptor_bundle`) during the loading barrier. The server never returns a
+#1513 round to a client-simulated battle: a start without a catalog or a
+baked world is refused (`start_denied`), and a failed bundle, a failed
+donation, or a donor that disconnects mid-request ends the round and returns
+the room to the waiting phase with the failure reason
+(`authority_status: failed`) shown on every client. Descriptor projection
+keeps a bounded 30-second wait and native destructible identities keep an
+independent 120-second bound after the server authority starts; expiring
+either bound ends the round the same way.
 
 Server-side world answers replace native probes with baked data. Direction
 corridors, world receipts and obstacle sweeps use graph links and heights.
@@ -961,15 +965,27 @@ from the BSMO collision bounds of every plain-static and preserved-structure
 instance), with baked foliage concealment on top.
 
 The server destroys map objects with the retail laws over donated native
-values. A loading client donates each map's destructible identities once
-(`destructible_map`: locator signature to native `chunk_id`/`item_index`,
-plus per-instance healths pre-scaled by the native
-`DestructiblesCache.scaledDestructibleHealth`, `kineticDamageCorrection`
-and `unitVehicleMass`). Server authority starts only when that donation covers
-every interactive instance in the baked catalog with a consistent native
-identity. Exact #1513 normally exposes only currently streamed chunks during
-loading, so an incomplete census explicitly returns the round to elected
-client authority instead of simulating a partial world. Bot hulls crush
+values. The destructible catalogs (schema v4) bake every instance's native
+wire identity and exact transform scale from the compiled `space.bin`:
+WGDE table "1" rows are `(chunk_id, global_item_begin, item_count)`, each
+table "2" row is one native item spanning an inclusive reference range in
+table "3" (`ref_begin > ref_end` is a valid empty item that still consumes
+an item index), and a table "3" reference selects an SpTr row when bit
+`0x80000000` is set and a BSMI row otherwise. All 61,625 emitted instances
+across the 41 shipped maps map one-to-one onto native wires under this
+contract. A loading client therefore donates each map's complete
+destructible identities immediately, without waiting for streamed chunks
+(`destructible_map`: locator signature, native `chunk_id`/`item_index`,
+healths pre-scaled by the native
+`DestructiblesCache.scaledDestructibleHealth` with the baked exact scale,
+`kineticDamageCorrection` and `unitVehicleMass`). The donation is
+transactional: a missing or mismatched descriptor, an invalid scale, or a
+duplicate wire fails the whole bundle. Streamed chunk scanning remains for
+local collision bookkeeping and asserts that every streamed identity equals
+the baked wire, failing closed on drift. Server authority starts only when
+the installed donation covers every interactive instance in the baked
+catalog; an incomplete census ends the round instead of simulating a
+partial world. Bot hulls crush
 fragiles and fell trees and columns
 with the exact `0.5*m*v^2*0.00015` kinetic gate; AP-family shells pass
 through items at or under 19 scaled HP for the fixed 25 mm piercing loss and

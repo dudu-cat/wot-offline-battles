@@ -7,6 +7,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,6 +26,108 @@ def load_baker():
     return module
 
 
+SYNTH_FRAGILE = 'content/Test/Fragile/normal/lod0/Fragile.model'
+SYNTH_SHED = 'content/Test/Shed/normal/lod0/Shed.model'
+SYNTH_POLE = 'content/Test/Pole/normal/lod0/Pole.model'
+
+
+class _FakeSection:
+    def __init__(self, data):
+        self._data = data
+
+
+class _FakeStrings:
+    def __init__(self, table):
+        self._table = dict(table)
+
+    def get(self, key):
+        return self._table.get(key)
+
+
+class _FakeBSMI:
+    def __init__(self, model_ids, transforms):
+        self._ids = list(model_ids)
+        self._data = {'transforms': [tuple(row) for row in transforms]}
+
+    def model_ids(self):
+        return list(self._ids)
+
+
+def _transform(x, y, z, y_scale=1.0):
+    return (
+        1.0, 0.0, 0.0, 0.0,
+        0.0, y_scale, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        x, y, z, 1.0,
+    )
+
+
+def _synthetic_scene():
+    """One SpeedTree item, one empty item, one fragile, one two-module shed
+    and one falling pole across two WGDE chunks."""
+    descriptors = {
+        SYNTH_FRAGILE: {'kind': 'fragile', 'modules': ()},
+        SYNTH_SHED: {'kind': 'structure', 'modules': ('mod_a', 'mod_b')},
+        SYNTH_POLE: {'kind': 'falling', 'modules': ()},
+    }
+    strings = _FakeStrings({
+        1: 'content/Test/Fragile/normal/lod0/Fragile.primitives',
+        2: 'content/Test/Shed/normal/lod0/Shed.primitives',
+        3: 'content/Test/Pole/normal/lod0/Pole.primitives',
+    })
+    bsmo = {
+        'model_info_items': [
+            {'type': 2, 'info_index': 0},
+            {'type': 2, 'info_index': 1},
+            {'type': 2, 'info_index': 2},
+            {'type': 1, 'info_index': 0},
+        ],
+        'fragile_model_info_items': [
+            {'entry_type': 0}, {'entry_type': 1}, {'entry_type': 1}],
+        'falling_model_info_items': [{}],
+        'models_colliders': [
+            {'bsp_section_name_fnv': 1,
+             'collision_bounds_min': [-1.0, 0.0, -1.0],
+             'collision_bounds_max': [1.0, 2.0, 1.0],
+             'bsp_material_kind_begin': 0, 'bsp_material_kind_end': 0},
+            {'bsp_section_name_fnv': 2,
+             'collision_bounds_min': [-2.0, 0.0, -2.0],
+             'collision_bounds_max': [0.0, 3.0, 2.0],
+             'bsp_material_kind_begin': 1, 'bsp_material_kind_end': 1},
+            {'bsp_section_name_fnv': 2,
+             'collision_bounds_min': [0.0, 0.0, -2.0],
+             'collision_bounds_max': [2.0, 3.0, 2.0],
+             'bsp_material_kind_begin': 2, 'bsp_material_kind_end': 2},
+            {'bsp_section_name_fnv': 3,
+             'collision_bounds_min': [-0.3, 0.0, -0.3],
+             'collision_bounds_max': [0.3, 9.0, 0.3],
+             'bsp_material_kind_begin': 3, 'bsp_material_kind_end': 3},
+        ],
+        'bsp_material_kinds': [
+            {'flags': 0 << 8}, {'flags': 73 << 8},
+            {'flags': 74 << 8}, {'flags': 0 << 8}],
+    }
+    transforms = [
+        _transform(2.0, 0.0, 4.0),
+        _transform(10.0, 0.0, 10.0),
+        _transform(10.0, 0.0, 10.0),
+        _transform(-3.0, 0.0, 6.0),
+    ]
+    wgde = {
+        '1': [(100, 0, 3), (200, 3, 2)],
+        '2': [(0, 0), (1, 0), (1, 1), (2, 3), (4, 4)],
+        '3': [0x80000000, 0, 1, 2, 3],
+    }
+    sections = {
+        'BWST': strings,
+        'BSMI': _FakeBSMI([0, 1, 2, 3], transforms),
+        'BSMO': _FakeSection(bsmo),
+        'WGDE': _FakeSection(wgde),
+        'SpTr': _FakeSection({'speedtree_list': [{'transform': [0.0] * 16}]}),
+    }
+    return sections, descriptors
+
+
 class DestructiblesBaker0922Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -33,7 +136,7 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
     def test_contract_is_pinned_to_client_1513(self):
         self.assertEqual('offline-lan-0922-destructible-catalog',
                          self.baker.FORMAT_NAME)
-        self.assertEqual(3, self.baker.FORMAT_VERSION)
+        self.assertEqual(4, self.baker.FORMAT_VERSION)
         self.assertEqual(
             'offline-lan-0922-destructible-catalog-manifest',
             self.baker.MANIFEST_FORMAT)
@@ -68,6 +171,97 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'multiple boxes'):
             self.baker._record_locator(
                 located, signature, 1, 'fragile.model')
+
+    def _bake_synthetic(self, sections, descriptors):
+        class _FakeCompiledSpace:
+            def __init__(self, stream, version, realm, wanted):
+                self.sections = sections
+
+        with mock.patch.object(self.baker, 'CompiledSpace',
+                               _FakeCompiledSpace):
+            return self.baker.bake_compiled_map(
+                'synthetic', b'pkg', b'space', b'xml', descriptors)
+
+    def test_synthetic_wgde_wires_shift_past_speedtree_and_empty_items(self):
+        sections, descriptors = _synthetic_scene()
+        data = self._bake_synthetic(sections, descriptors)
+        by_file = {row[12]: row for row in data['instances']}
+        self.assertEqual(3, len(data['instances']))
+        # Chunk 100 holds a SpeedTree item and an empty item before the
+        # fragile, so the fragile's native itemIndex is 2, not 0.
+        self.assertEqual([100, 2], by_file[SYNTH_FRAGILE][14:16])
+        # Both shed module rows form one multi-reference native item.
+        self.assertEqual([200, 0], by_file[SYNTH_SHED][14:16])
+        self.assertIsNone(by_file[SYNTH_SHED][13])
+        self.assertEqual([200, 1], by_file[SYNTH_POLE][14:16])
+        self.assertEqual(1.0, by_file[SYNTH_FRAGILE][16])
+        self.assertEqual(1.0, by_file[SYNTH_SHED][16])
+
+    def test_synthetic_wgde_rejects_broken_chunk_ranges_and_spans(self):
+        sections, descriptors = _synthetic_scene()
+        sections['WGDE']._data['1'] = [(100, 1, 3), (200, 4, 1)]
+        with self.assertRaisesRegex(ValueError, 'ranges are not contiguous'):
+            self._bake_synthetic(sections, descriptors)
+
+        sections, descriptors = _synthetic_scene()
+        sections['WGDE']._data['1'] = [(100, 0, 3), (200, 3, 4)]
+        with self.assertRaisesRegex(ValueError,
+                                    'do not cover the item table'):
+            self._bake_synthetic(sections, descriptors)
+
+        sections, descriptors = _synthetic_scene()
+        sections['WGDE']._data['2'][2] = (2, 2)
+        with self.assertRaisesRegex(ValueError,
+                                    'references are not contiguous'):
+            self._bake_synthetic(sections, descriptors)
+
+        sections, descriptors = _synthetic_scene()
+        sections['WGDE']._data['2'][1] = (1, -1)
+        with self.assertRaisesRegex(ValueError, 'empty item span is invalid'):
+            self._bake_synthetic(sections, descriptors)
+
+    def test_synthetic_wgde_rejects_bad_and_duplicate_references(self):
+        sections, descriptors = _synthetic_scene()
+        sections['WGDE']._data['3'][1] = 9
+        with self.assertRaisesRegex(ValueError, 'BSMI reference is invalid'):
+            self._bake_synthetic(sections, descriptors)
+
+        sections, descriptors = _synthetic_scene()
+        sections['WGDE']._data['3'][2] = 0
+        with self.assertRaisesRegex(ValueError, 'BSMI reference is invalid'):
+            self._bake_synthetic(sections, descriptors)
+
+        sections, descriptors = _synthetic_scene()
+        sections['WGDE']._data['3'][0] = 0x80000000 | 5
+        with self.assertRaisesRegex(ValueError, 'SpTr reference is invalid'):
+            self._bake_synthetic(sections, descriptors)
+
+    def test_synthetic_instance_must_resolve_to_exactly_one_wire(self):
+        # Splitting the shed module rows across two native items leaves the
+        # emitted structure instance without a single wire.
+        sections, descriptors = _synthetic_scene()
+        sections['WGDE']._data['1'] = [(100, 0, 3), (200, 3, 3)]
+        sections['WGDE']._data['2'] = [
+            (0, 0), (1, 0), (1, 1), (2, 2), (3, 3), (4, 4)]
+        with self.assertRaisesRegex(ValueError,
+                                    'does not resolve to one native item'):
+            self._bake_synthetic(sections, descriptors)
+
+        # One native item spanning the fragile and the shed rows references
+        # rows outside the fragile instance.
+        sections, descriptors = _synthetic_scene()
+        sections['WGDE']._data['1'] = [(100, 0, 3), (200, 3, 1)]
+        sections['WGDE']._data['2'] = [(0, 0), (1, 0), (1, 3), (4, 4)]
+        with self.assertRaisesRegex(ValueError,
+                                    'references rows outside its instance'):
+            self._bake_synthetic(sections, descriptors)
+
+    def test_synthetic_instance_scales_must_agree(self):
+        sections, descriptors = _synthetic_scene()
+        transforms = sections['BSMI']._data['transforms']
+        transforms[2] = _transform(10.0, 0.0, 10.0, y_scale=1.0000004)
+        with self.assertRaisesRegex(ValueError, 'scales disagree'):
+            self._bake_synthetic(sections, descriptors)
 
     def test_model_filename_join_is_separator_only_and_fail_closed(self):
         self.assertEqual(
@@ -177,13 +371,14 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
                     self.assertGreaterEqual(locator[12], 0)
                     self.assertLess(locator[12], len(resource['boxes']))
             seen_instance_signatures = set()
+            seen_wires = set()
             instance_kinds = {kind: 0 for kind in (
                 'falling', 'fragile', 'structure')}
             self.assertEqual(
                 sorted(data['instances'], key=lambda row: tuple(row[:12])),
                 data['instances'])
             for row in data['instances']:
-                self.assertEqual(14, len(row))
+                self.assertEqual(17, len(row))
                 self.assertTrue(all(type(value) is int
                                     for value in row[:12]))
                 signature = tuple(row[:12])
@@ -196,7 +391,18 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
                     self.assertIsInstance(row[13], int)
                     self.assertGreaterEqual(row[13], 0)
                     self.assertLess(row[13], len(resource['boxes']))
+                chunk_id, item_index, item_scale = row[14:]
+                self.assertIsInstance(chunk_id, int)
+                self.assertIsInstance(item_index, int)
+                self.assertGreaterEqual(chunk_id, 0)
+                self.assertLessEqual(chunk_id, 0xFFFFFFFF)
+                self.assertGreaterEqual(item_index, 0)
+                self.assertNotIn((chunk_id, item_index), seen_wires)
+                seen_wires.add((chunk_id, item_index))
+                self.assertIsInstance(item_scale, float)
+                self.assertGreater(item_scale, 0.0)
                 instance_kinds[resource['kind']] += 1
+            self.assertEqual(len(seen_wires), len(data['instances']))
             self.assertEqual(
                 sorted(data['ambiguous_instances'],
                        key=lambda row: tuple(row[:12])),
@@ -426,6 +632,27 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
                 with self.assertRaisesRegex(
                         ValueError, 'has no instance locators'):
                     loader._validate(missing_locator, '35_steppes')
+
+                bad_wire = copy.deepcopy(loaded)
+                bad_wire['instances'][1][14] = bad_wire['instances'][0][14]
+                bad_wire['instances'][1][15] = bad_wire['instances'][0][15]
+                with self.assertRaisesRegex(ValueError,
+                                            'wire is duplicated'):
+                    loader._validate(bad_wire, '06_ensk')
+
+                bad_scale = copy.deepcopy(loaded)
+                bad_scale['instances'][0][16] = 0.0
+                with self.assertRaisesRegex(ValueError, 'scale is invalid'):
+                    loader._validate(bad_scale, '06_ensk')
+
+                bad_scale['instances'][0][16] = float('nan')
+                with self.assertRaisesRegex(ValueError, 'scale is invalid'):
+                    loader._validate(bad_scale, '06_ensk')
+
+                short_row = copy.deepcopy(loaded)
+                short_row['instances'][0] = short_row['instances'][0][:14]
+                with self.assertRaisesRegex(ValueError, 'row is invalid'):
+                    loader._validate(short_row, '06_ensk')
         finally:
             for name, value in saved.items():
                 if value is None:

@@ -3,6 +3,7 @@ from __future__ import print_function
 import compileall
 import hashlib
 import json
+import math
 import os
 import shutil
 import sys
@@ -25,7 +26,7 @@ FOLIAGE_FORMAT = 'offline-lan-0922-foliage'
 FOLIAGE_VERSION = 1
 FOLIAGE_MANIFEST_FORMAT = FOLIAGE_FORMAT + '-manifest'
 DESTRUCTIBLE_FORMAT = 'offline-lan-0922-destructible-catalog'
-DESTRUCTIBLE_VERSION = 3
+DESTRUCTIBLE_VERSION = 4
 DESTRUCTIBLE_MANIFEST_FORMAT = DESTRUCTIBLE_FORMAT + '-manifest'
 PROJECT_ROOT = os.path.abspath(os.path.join(
     os.path.dirname(__file__), '..'))
@@ -414,11 +415,12 @@ def _validate_destructibles(destructible_root):
                     not isinstance(ambiguous_instances, list)):
                 raise ValueError('invalid destructible instance index')
             seen_instance_signatures = set()
+            seen_instance_wires = set()
             instance_kind_counts = dict((kind, 0) for kind in (
                 'falling', 'fragile', 'structure'))
             previous_signature = None
             for row in instances:
-                if (not isinstance(row, list) or len(row) != 14 or
+                if (not isinstance(row, list) or len(row) != 17 or
                         any(type(value) is not int for value in row[:12])):
                     raise ValueError('invalid destructible instance row')
                 signature = tuple(row[:12])
@@ -435,6 +437,20 @@ def _validate_destructibles(destructible_root):
                 elif (type(box_index) is not int or box_index < 0 or
                       box_index >= len(resource.get('boxes') or ())):
                     raise ValueError('invalid destructible instance row')
+                chunk_id, item_index, item_scale = row[14:]
+                if (type(chunk_id) is not int or type(item_index) is not int
+                        or chunk_id < 0 or chunk_id > 0xFFFFFFFF or
+                        item_index < 0 or
+                        (chunk_id, item_index) in seen_instance_wires):
+                    raise ValueError('invalid destructible instance wire')
+                seen_instance_wires.add((chunk_id, item_index))
+                try:
+                    item_scale = float(item_scale)
+                except (TypeError, ValueError):
+                    raise ValueError('invalid destructible instance scale')
+                if (math.isnan(item_scale) or math.isinf(item_scale) or
+                        item_scale <= 0.0):
+                    raise ValueError('invalid destructible instance scale')
                 seen_instance_signatures.add(signature)
                 previous_signature = signature
                 instance_kind_counts[resource['kind']] += 1

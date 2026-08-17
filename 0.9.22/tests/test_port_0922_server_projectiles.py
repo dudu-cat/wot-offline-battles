@@ -494,7 +494,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
     def test_current_battle_message_includes_modern_authority_ledger(self):
         state = _state(players=1)
         state.phase = 'battle'
-        state.authority_status = 'client_fallback'
+        state.authority_status = 'failed'
         state.authority_fallback_reason = 'world_data_unavailable'
         self.assertTrue(state.launch_projectile(1, _launch()))
 
@@ -504,7 +504,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual(state.projectile_revision,
                          message['projectile_revision'])
         self.assertEqual(state._projectile_snapshot(), message['projectiles'])
-        self.assertEqual('client_fallback', message['authority_status'])
+        self.assertEqual('failed', message['authority_status'])
         self.assertEqual('world_data_unavailable',
                          message['authority_fallback_reason'])
 

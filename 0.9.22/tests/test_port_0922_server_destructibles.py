@@ -272,9 +272,10 @@ class ShotTraversalTest(unittest.TestCase):
 
 
 class DonationInstallTest(unittest.TestCase):
-    def test_partial_parts_accumulate_then_incomplete_map_falls_back(self):
+    def test_partial_parts_accumulate_then_incomplete_map_fails(self):
         state = _state_with_authority(ready_world=False)
         state.request_start(1, '01_karelia')
+        started_round = state.round_id
         world = state.server_authority.world
         catalog_rows = [
             [list(_signature(1.0, 0.0, 1.0)), 3, 0, 5.0, None],
@@ -295,14 +296,15 @@ class DonationInstallTest(unittest.TestCase):
             'unit_vehicle_mass': 8000.0, 'resources': {},
             'instances': [],
         })
-        self.assertEqual('fallback', second)
+        self.assertEqual('failed', second)
         self.assertIsNone(state.server_authority)
-        self.assertEqual('client_fallback', state.authority_status)
+        self.assertEqual('waiting', state.phase)
+        self.assertGreater(state.round_id, started_round)
+        self.assertEqual('failed', state.authority_status)
         self.assertEqual('destructible_map_incomplete',
                          state.authority_fallback_reason)
         self.assertNotIn('01_karelia', state.destructible_maps)
 
-        state._reset_round()
         start, error = state.request_start(1, '01_karelia')
         self.assertIsNone(error)
         self.assertTrue(start['need_destructible_map'])
@@ -313,7 +315,7 @@ class DonationInstallTest(unittest.TestCase):
             'unit_vehicle_mass': 8000.0, 'resources': {},
             'instances': [[list(signature), 4, 0, 5.0, None]],
         })
-        self.assertEqual('fallback', retry)
+        self.assertEqual('failed', retry)
         self.assertEqual('destructible_map_incomplete',
                          state.authority_fallback_reason)
 
@@ -337,7 +339,7 @@ class DonationInstallTest(unittest.TestCase):
         self.assertEqual('server_pending', state.authority_status)
         self.assertNotIn('01_karelia', state.destructible_maps)
 
-    def test_pending_identity_donor_disconnect_falls_back_immediately(self):
+    def test_pending_identity_donor_disconnect_fails_the_round(self):
         state = _state_with_authority(ready_world=False)
         state.players[2] = __import__(
             'test_port_0922_server_authority')._player(2, team=2)
@@ -356,8 +358,8 @@ class DonationInstallTest(unittest.TestCase):
 
         self.assertIsNone(state.server_authority)
         self.assertNotIn('01_karelia', state.destructible_maps)
-        self.assertEqual(2, state.bot_authority_id)
-        self.assertEqual('client_fallback', state.authority_status)
+        self.assertEqual('waiting', state.phase)
+        self.assertEqual('failed', state.authority_status)
         self.assertEqual('destructible_map_donor_disconnected',
                          state.authority_fallback_reason)
 

@@ -3009,7 +3009,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIsNone(battle._remote_factory.get(enemy['engine_id']))
         self.assertIsNone(runtime.bigworld.entity(enemy['engine_id']))
 
-    def test_required_destructible_donation_fences_ready_until_retry(self):
+    def test_required_destructible_donation_retries_transport_only(self):
         def donation():
             return {
                 'unit_vehicle_mass': 8000.0,
@@ -3017,8 +3017,41 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'instances': [[list(range(12)), 3, 0, 5.0, None]],
             }
 
-        for failure in ('projection', 'send'):
-            with self.subTest(failure=failure):
+        battle = BattleRuntime(_runtime())
+        battle._battle_live = False
+        battle._start_message = {
+            'map': '01_karelia',
+            'need_destructible_map': True,
+            'players': [{'id': 1}],
+        }
+        battle._records = {'player:1': {
+            'kind': 'player', 'ready': True,
+            'tombstone': False}}
+        battle._spawn_planner = types.SimpleNamespace(
+            bases={'team1': ()})
+        project = mock.Mock(side_effect=(donation(), donation()))
+        send_map = mock.Mock(side_effect=(False, True))
+        battle._destructibles = types.SimpleNamespace(
+            donation_rows_1513=project)
+        battle.client = types.SimpleNamespace(
+            send_destructible_map=send_map,
+            send_battle_ready=mock.Mock(return_value=True))
+
+        self.assertFalse(battle._maybe_send_battle_ready())
+        battle.client.send_battle_ready.assert_not_called()
+        self.assertFalse(battle._ready_sent)
+
+        self.assertTrue(battle._maybe_send_battle_ready())
+        self.assertEqual(2, project.call_count)
+        battle.client.send_battle_ready.assert_called_once_with(
+            {'team1': ()})
+        self.assertTrue(battle._ready_sent)
+
+    def test_required_destructible_donation_data_errors_are_fatal(self):
+        for donation_effect, expected in (
+                (RuntimeError('projection failed'), 'projection failed'),
+                (None, 'baked catalog')):
+            with self.subTest(expected=expected):
                 battle = BattleRuntime(_runtime())
                 battle._battle_live = False
                 battle._start_message = {
@@ -3031,66 +3064,20 @@ class BattleRuntimeContractTests(unittest.TestCase):
                     'tombstone': False}}
                 battle._spawn_planner = types.SimpleNamespace(
                     bases={'team1': ()})
-                project = mock.Mock()
-                send_map = mock.Mock(return_value=True)
-                if failure == 'projection':
-                    project.side_effect = (
-                        RuntimeError('projection failed'), donation())
+                if isinstance(donation_effect, Exception):
+                    project = mock.Mock(side_effect=donation_effect)
                 else:
-                    project.side_effect = (donation(), donation())
-                    send_map.side_effect = (False, True)
+                    project = mock.Mock(return_value=donation_effect)
                 battle._destructibles = types.SimpleNamespace(
                     donation_rows_1513=project)
                 battle.client = types.SimpleNamespace(
-                    send_destructible_map=send_map,
+                    send_destructible_map=mock.Mock(return_value=True),
                     send_battle_ready=mock.Mock(return_value=True))
 
-                self.assertFalse(battle._maybe_send_battle_ready())
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    battle._maybe_send_battle_ready()
                 battle.client.send_battle_ready.assert_not_called()
                 self.assertFalse(battle._ready_sent)
-
-                self.assertTrue(battle._maybe_send_battle_ready())
-                self.assertEqual(2, project.call_count)
-                battle.client.send_battle_ready.assert_called_once_with(
-                    {'team1': ()})
-                self.assertTrue(battle._ready_sent)
-
-    def test_destructible_fallback_roster_releases_ready_barrier(self):
-        battle = BattleRuntime(_runtime())
-        battle.state = 'loading'
-        battle._battle_live = False
-        battle._start_message = {
-            'round_id': 4, 'map': '01_karelia',
-            'bot_authority_id': 0,
-            'authority_status': 'server_pending',
-            'need_destructible_map': True,
-            'players': [{'id': 1}],
-        }
-        battle._records = {'player:1': {
-            'kind': 'player', 'ready': True, 'tombstone': False}}
-        battle._spawn_planner = types.SimpleNamespace(bases={'team1': ()})
-        donation = mock.Mock(side_effect=RuntimeError('projection failed'))
-        battle._destructibles = types.SimpleNamespace(
-            donation_rows_1513=donation)
-        battle.client = types.SimpleNamespace(
-            send_destructible_map=mock.Mock(return_value=False),
-            send_battle_ready=mock.Mock(return_value=True))
-
-        self.assertFalse(battle._maybe_send_battle_ready())
-        self.assertTrue(battle.on_roster({
-            'round_id': 4, 'phase': 'loading', 'bot_authority_id': 1,
-            'authority_status': 'client_fallback',
-            'authority_fallback_reason': 'destructible_map_timeout',
-        }))
-        self.assertTrue(battle._maybe_send_battle_ready())
-
-        self.assertNotIn('need_destructible_map', battle._start_message)
-        self.assertEqual('client_fallback',
-                         battle._start_message['authority_status'])
-        self.assertEqual('destructible_map_timeout',
-                         battle._start_message['authority_fallback_reason'])
-        self.assertEqual(1, donation.call_count)
-        battle.client.send_battle_ready.assert_called_once_with({'team1': ()})
 
     def test_direction_probe_copies_dual_distance_three_lane_corridor(self):
         runtime = _runtime()

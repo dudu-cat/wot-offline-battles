@@ -3352,9 +3352,10 @@ class BattleRuntime(object):
         """Apply authority changes that can arrive before live snapshots.
 
         The server does not tick snapshots while #1513 clients are behind the
-        native entity-load barrier.  A loading-phase roster is therefore the
-        only durable authority handoff if the original simulator disconnects
-        before publishing its bot manifest.
+        native entity-load barrier, so a loading-phase roster is the only
+        durable authority update channel.  A round that loses its server
+        authority is ended by the server; this client never takes the bot
+        simulation over.
         """
         if self.state in ('failed', 'stopped'):
             return False
@@ -3374,11 +3375,6 @@ class BattleRuntime(object):
         if 'authority_fallback_reason' in message:
             self._start_message['authority_fallback_reason'] = message.get(
                 'authority_fallback_reason')
-        if message.get('authority_status') == 'client_fallback':
-            # The server no longer needs native wire identities after it gives
-            # this round back to a real client authority. Retrying the failed
-            # donation here would otherwise block battle_ready forever.
-            self._start_message.pop('need_destructible_map', None)
         if self._bots is None:
             return True
         return self._reconcile_bot_authority(player_id)
@@ -6064,7 +6060,8 @@ class BattleRuntime(object):
         Humans and the authority manifest are the shared state boundary; the
         server separately refuses ``battle_live`` until that manifest arrives.
         A server-requested native destructible map is also a hard boundary:
-        projection or transport failure remains retryable on the next frame.
+        a transport refusal is retried next frame, while invalid baked data
+        fails the battle.
         """
         if self._ready_sent or self._battle_live:
             return False
@@ -6088,20 +6085,22 @@ class BattleRuntime(object):
         return True
 
     def _maybe_donate_destructible_map(self):
-        """Send the map's native destructible identities before readiness."""
+        """Send the map's complete baked destructible identities.
+
+        Invalid baked data fails the battle; only a transport refusal stays
+        retryable on the next frame.
+        """
         if not self._start_message.get('need_destructible_map'):
             return False
         sender = getattr(self.client, 'send_destructible_map', None)
         if not callable(sender) or self._destructibles is None:
-            return False
-        try:
-            donation = self._destructibles.donation_rows_1513()
-        except Exception as error:
-            print('[Offline LAN 0.9.22] destructible map donation '
-                  'failed: %s' % error)
-            return False
+            raise RuntimeError(
+                'LAN server requires a destructible map donation this '
+                'client cannot send')
+        donation = self._destructibles.donation_rows_1513()
         if not donation:
-            return False
+            raise RuntimeError(
+                'destructible map donation requires the baked catalog')
         rows = donation.pop('instances')
         part_size = 1000
         parts = max(1, (len(rows) + part_size - 1) // part_size)

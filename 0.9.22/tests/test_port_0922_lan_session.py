@@ -242,12 +242,12 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual(['test:bad'], terminal['failures'])
         self.assertTrue(terminal['complete'])
 
-    def test_authority_fallback_status_is_visible_once_per_round(self):
+    def test_authority_failure_status_is_visible_once_per_round(self):
         roster = {
             'phase': 'waiting', 'round_id': 1,
             'map_pool': ['01_karelia'],
             'players': [{'id': 'p1', 'name': 'Host'}],
-            'authority_status': 'client_fallback',
+            'authority_status': 'failed',
             'authority_fallback_reason': 'world_data_unavailable',
         }
 
@@ -255,7 +255,7 @@ class LANSessionTests(unittest.TestCase):
         self.emit('roster', roster)
 
         notices = [value for value in self.statuses
-                   if 'Using client authority' in value]
+                   if 'server authority' in value]
         self.assertEqual(1, len(notices))
         self.assertIn('world_data_unavailable', notices[0])
 

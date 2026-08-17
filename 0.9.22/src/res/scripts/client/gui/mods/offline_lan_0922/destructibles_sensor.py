@@ -341,9 +341,11 @@ def set_catalog(catalog):
 		catalog_version = int(catalog.get('version', 1))
 	except (TypeError, ValueError):
 		raise ValueError('destructible catalog version is invalid')
+	if catalog_version == 3:
+		raise ValueError('destructible catalog version is unsupported')
 	raw_instances = catalog.get('instances')
 	raw_ambiguous = catalog.get('ambiguous_instances')
-	if catalog_version >= 3:
+	if catalog_version >= 4:
 		if not isinstance(raw_instances, list) or not raw_instances:
 			raise ValueError('destructible instance index is unavailable')
 		if not isinstance(raw_ambiguous, list):
@@ -352,10 +354,13 @@ def set_catalog(catalog):
 	else:
 		raw_instances = raw_instances or ()
 		raw_ambiguous = raw_ambiguous or ()
+	import math
 	instance_index = {}
+	seen_wires = set()
 	for row in raw_instances:
-		if (not isinstance(row, (list, tuple)) or len(row) != 14 or
-				any(type(value) is not int for value in row[:12])):
+		if (not isinstance(row, (list, tuple)) or len(row) != 17 or
+				any(type(value) not in _INTEGER_TYPES
+					for value in row[:12])):
 			raise ValueError('destructible instance row is invalid')
 		signature = tuple(row[:12])
 		normalized = _normalized_filename(row[12])
@@ -368,13 +373,30 @@ def set_catalog(catalog):
 				raise ValueError(
 					'structure instance has a box index')
 		else:
-			if (type(box_index) is not int or box_index < 0 or
+			if (type(box_index) not in _INTEGER_TYPES or box_index < 0 or
 					box_index >= len(record['boxes'])):
 				raise ValueError(
 					'destructible instance box index is invalid')
+		chunk_id, item_index, item_scale = row[14:]
+		if (type(chunk_id) not in _INTEGER_TYPES or
+				type(item_index) not in _INTEGER_TYPES or
+				chunk_id < 0 or item_index < 0):
+			raise ValueError('destructible instance wire is invalid')
+		wire = (int(chunk_id), int(item_index))
+		if wire in seen_wires:
+			raise ValueError('destructible instance wire is duplicated')
+		seen_wires.add(wire)
+		try:
+			item_scale = float(item_scale)
+		except (TypeError, ValueError):
+			raise ValueError('destructible instance scale is invalid')
+		if (math.isnan(item_scale) or math.isinf(item_scale) or
+				item_scale <= 0.0):
+			raise ValueError('destructible instance scale is invalid')
 		instance_index[signature] = {
 			'filename': normalized, 'kind': record['kind'],
-			'box_index': box_index,
+			'box_index': box_index, 'wire': wire,
+			'exact_scale': item_scale,
 		}
 	ambiguous_signatures = set()
 	for row in raw_ambiguous:
@@ -1856,6 +1878,12 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 								raise RuntimeError(
 									'#1513 destructible filename disagrees with '
 									'catalog instance')
+							if _located['wire'] != (int(cid), int(_ti)):
+								raise RuntimeError(
+									'#1513 streamed destructible identity '
+									'disagrees with the baked wire: live=%r '
+									'baked=%r' % ((int(cid), int(_ti)),
+										_located['wire']))
 							_catalog_record = _destructible_catalog[
 								'resources'][_located['filename']]
 							_filename = _catalog_record['filename']
@@ -2124,62 +2152,85 @@ def _solid_destructible_candidate_1513(mat_info, contact_pt,
 
 
 def donation_rows_1513():
-	"""Project the registered native identities and scaled healths to JSON.
+	"""Project the baked native identities and scaled healths to JSON.
 
 	The server authority reproduces the retail crush and shot-through laws
 	only from these values, so every health is scaled here with the native
-	DestructiblesCache law rather than re-derived elsewhere.
+	DestructiblesCache law rather than re-derived elsewhere.  The bundle
+	covers the complete baked catalog without waiting for streamed chunks,
+	and any inconsistent entry fails the whole donation.
 	"""
 	import AreaDestructibles
 	import DestructiblesCache
-	instances = globals().get('g_offh_destr_instances', {})
-	if not instances:
+	catalog = _destructible_catalog
+	if catalog is None or not catalog.get('has_instance_index'):
 		return None
 	tree_type = getattr(AreaDestructibles, 'DESTR_TYPE_TREE', None)
 	falling_type = getattr(AreaDestructibles, 'DESTR_TYPE_FALLING_ATOM', None)
 	fragile_type = getattr(AreaDestructibles, 'DESTR_TYPE_FRAGILE', None)
 	resources = {}
 	rows = []
-	for key in sorted(instances):
-		chunk_id, item_index = key
-		instance = instances[key]
-		signature = instance.get('signature')
-		scale = instance.get('item_scale')
-		fname = instance.get('descriptor_filename')
-		if signature is None or scale is None or not fname:
-			continue
+	seen_wires = set()
+	for signature in sorted(catalog['instances']):
+		instance = catalog['instances'][signature]
+		wire = instance.get('wire')
+		scale = instance.get('exact_scale')
+		normalized = instance['filename']
+		record = catalog['resources'].get(normalized)
+		if wire is None or scale is None or record is None:
+			raise RuntimeError(
+				'baked destructible instance is incomplete: %r' % (signature,))
+		if wire in seen_wires:
+			raise RuntimeError(
+				'baked destructible wire is duplicated: %r' % (wire,))
+		seen_wires.add(wire)
+		fname = record['filename']
 		desc = AreaDestructibles.g_cache.getDescByFilename(fname)
 		if desc is None:
-			continue
+			raise RuntimeError(
+				'baked destructible has no #1513 descriptor: %s' % fname)
+		desc_type = desc.get('type')
+		if desc_type == falling_type:
+			destr_type = 'column'
+		elif desc_type == fragile_type:
+			destr_type = 'fragile'
+		elif desc_type == tree_type:
+			destr_type = 'tree'
+		else:
+			destr_type = 'structure'
+		expected_kind = _catalog_kind_for_type_1513(
+			AreaDestructibles, desc_type)
+		if expected_kind != instance['kind']:
+			raise RuntimeError(
+				'baked destructible kind disagrees with the #1513 '
+				'descriptor: %s' % fname)
 		scaled_health = None
 		modules = None
 		if instance['kind'] == 'structure':
 			modules = {}
 			for mat_kind, module in (desc.get('modules') or {}).items():
+				try:
+					health = module['health']
+				except (KeyError, TypeError):
+					raise RuntimeError(
+						'#1513 structure module is invalid: %s' % fname)
 				modules[str(int(mat_kind))] = [
 					float(DestructiblesCache.scaledDestructibleHealth(
-						scale, module['health'])),
+						scale, health)),
 					float(module.get('armor', 0.0) or 0.0)]
+			if not modules:
+				raise RuntimeError(
+					'#1513 structure descriptor has no modules: %s' % fname)
 		else:
 			scaled_health = float(DestructiblesCache.scaledDestructibleHealth(
 				scale, desc['health']))
-		normalized = instance['filename']
 		if normalized not in resources:
-			desc_type = desc.get('type')
-			if desc_type == tree_type:
-				destr_type = 'tree'
-			elif desc_type == falling_type:
-				destr_type = 'column'
-			elif desc_type == fragile_type:
-				destr_type = 'fragile'
-			else:
-				destr_type = 'structure'
 			resources[normalized] = {
 				'destr_type': destr_type,
 				'kinetic_correction': float(
 					desc.get('kineticDamageCorrection', 0.0) or 0.0),
 			}
-		rows.append([list(signature), int(chunk_id), int(item_index),
+		rows.append([list(signature), int(wire[0]), int(wire[1]),
 			scaled_health, modules])
 	if not rows:
 		return None

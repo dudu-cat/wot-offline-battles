@@ -144,15 +144,19 @@ class ServerAuthorityElectionTest(unittest.TestCase):
         self.assertIn(1, state.capture_bases)
         self.assertIn(2, state.capture_bases)
 
-    def test_without_donation_falls_back_to_client_authority(self):
+    def test_without_donation_refuses_the_start(self):
         state = BattleState(map_name='01_karelia')
         state.client_build = CLIENT_BUILD_0922
         state.players[1] = _player(1)
         state._elect_room_host()
-        unused_message, error = state.request_start(1, '01_karelia')
-        self.assertIsNone(error)
+        message, error = state.request_start(1, '01_karelia')
+        self.assertIsNone(message)
+        self.assertEqual('vehicle_catalog_unavailable', error)
         self.assertIsNone(state.server_authority)
-        self.assertEqual(1, state.bot_authority_id)
+        self.assertEqual('waiting', state.phase)
+        self.assertEqual('failed', state.authority_status)
+        self.assertEqual('vehicle_catalog_unavailable',
+                         state.authority_fallback_reason)
 
     def test_reset_round_drops_the_authority(self):
         state = _state_with_authority()

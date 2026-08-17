@@ -1106,10 +1106,10 @@ class LANSession(object):
                 dict(items[start:end]), requested=requested,
                 failures=failures, complete=end >= len(items))
 
-    def _notify_authority_fallback(self, message):
-        """Expose an intentional per-round client-authority fallback once."""
+    def _notify_authority_failure(self, message):
+        """Expose a per-round server-authority hard failure once."""
         if (not isinstance(message, dict) or
-                message.get('authority_status') != 'client_fallback'):
+                message.get('authority_status') != 'failed'):
             return False
         reason = str(message.get('authority_fallback_reason') or
                      'server prerequisites unavailable')
@@ -1118,15 +1118,15 @@ class LANSession(object):
             return False
         self._authority_fallback_notice = key
         self._status_notifier(
-            'Server battle authority prerequisites failed (%s). '
-            'Using client authority for this battle.' % reason)
+            'The LAN server ended the battle: server authority '
+            'prerequisites failed (%s).' % reason)
         return True
 
     def _on_event(self, kind, message):
         if self._stopped:
             return
         if kind in ('welcome', 'roster', 'battle_start'):
-            self._notify_authority_fallback(message)
+            self._notify_authority_failure(message)
         if kind in ('welcome', 'roster'):
             if kind == 'welcome':
                 self._send_vehicle_catalog()
@@ -1152,6 +1152,10 @@ class LANSession(object):
             if _message_value(message, 'code') == 'host_only':
                 self._status_notifier(
                     'Only the LAN room host can choose the map and start.')
+            else:
+                self._status_notifier(
+                    'The LAN server refused the battle start (%s).' %
+                    (_message_value(message, 'code') or 'unknown'))
             self._sync_waiting_surface()
         elif kind == 'battle_start':
             self._start_battle(message)

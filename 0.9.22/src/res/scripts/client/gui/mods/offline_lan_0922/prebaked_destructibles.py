@@ -13,7 +13,7 @@ from gui.mods.offline_lan_0922.prebaked_navigation import mod_dir
 
 
 FORMAT_NAME = 'offline-lan-0922-destructible-catalog'
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 MANIFEST_FORMAT = FORMAT_NAME + '-manifest'
 try:
 	_STRING_TYPES = (basestring,)
@@ -206,11 +206,12 @@ def _validate(data, map_name):
 	if not isinstance(ambiguous_instances, list):
 		raise ValueError('ambiguous destructible instance index is invalid')
 	seen_signatures = set()
+	seen_wires = set()
 	instance_kinds = dict((kind, 0)
 		for kind in ('falling', 'fragile', 'structure'))
 	previous_signature = None
 	for row in instances:
-		if (not isinstance(row, list) or len(row) != 14 or
+		if (not isinstance(row, list) or len(row) != 17 or
 				any(type(value) not in _INTEGER_TYPES for value in row[:12])):
 			raise ValueError('destructible instance row is invalid')
 		signature = tuple(row[:12])
@@ -218,7 +219,18 @@ def _validate(data, map_name):
 				(previous_signature is not None and
 				 signature <= previous_signature)):
 			raise ValueError('destructible instance signature is invalid')
-		filename, unused_box_index = _instance_candidate(row[12:], resources)
+		filename, unused_box_index = _instance_candidate(
+			row[12:14], resources)
+		chunk_id, item_index, item_scale = row[14:]
+		if (type(chunk_id) not in _INTEGER_TYPES or
+				type(item_index) not in _INTEGER_TYPES or
+				chunk_id < 0 or chunk_id > 0xFFFFFFFF or item_index < 0):
+			raise ValueError('destructible instance wire is invalid')
+		if (chunk_id, item_index) in seen_wires:
+			raise ValueError('destructible instance wire is duplicated')
+		seen_wires.add((chunk_id, item_index))
+		if not _finite_number(item_scale) or float(item_scale) <= 0.0:
+			raise ValueError('destructible instance scale is invalid')
 		seen_signatures.add(signature)
 		previous_signature = signature
 		instance_kinds[resources[filename]['kind']] += 1

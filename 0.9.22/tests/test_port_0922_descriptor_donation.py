@@ -88,35 +88,6 @@ def _donate_destructible_identity(state):
     })
 
 
-def _client_manifest(state):
-    rows = []
-    for identity in state.bot_roster:
-        x, z, yaw = state._spawn_for(identity['slot'], identity['team'])
-        rows.append({
-            'id': identity['id'], 'team': identity['team'],
-            'slot': identity['slot'], 'vehicle': 'ussr:R11_MS-1',
-            'health': 1000, 'max_health': 1000,
-            'x': x, 'y': 0.0, 'z': z, 'yaw': yaw,
-        })
-    return rows
-
-
-def _finish_client_fallback(state):
-    authority_id = state.bot_authority_id
-    assert authority_id == 1
-    assert state.update_bot_manifest(authority_id, {
-        'type': 'bot_manifest', 'round_id': state.round_id,
-        'bots': _client_manifest(state),
-    })
-    live = state.mark_battle_ready(
-        1, {'type': 'battle_ready', 'round_id': state.round_id})
-    if live is None:
-        live = state.activate_battle_if_ready()
-    assert live is not None
-    assert state.phase == 'battle'
-    return live
-
-
 class DonationFlowTest(unittest.TestCase):
     def test_request_start_requests_missing_projections(self):
         state = _state_with_catalog()
@@ -183,15 +154,17 @@ class DonationFlowTest(unittest.TestCase):
             state, projections={'france:not_requested': _projection()}))
         self.assertFalse(result)
 
-    def test_donor_leaving_falls_back_to_client_authority(self):
+    def test_donor_leaving_fails_the_round(self):
         state = _state_with_catalog()
         state.players[2] = _player(2, team=2)
         state.request_start(1, '01_karelia')
+        started_round = state.round_id
         self.assertEqual(SERVER_AUTHORITY_ID, state.bot_authority_id)
         state.remove_player(1)
         self.assertIsNone(state.server_authority)
-        self.assertEqual(2, state.bot_authority_id)
-        self.assertEqual('client_fallback', state.authority_status)
+        self.assertEqual('waiting', state.phase)
+        self.assertGreater(state.round_id, started_round)
+        self.assertEqual('failed', state.authority_status)
         self.assertEqual('descriptor_donor_disconnected',
                          state.authority_fallback_reason)
 
@@ -201,21 +174,23 @@ class DonationFlowTest(unittest.TestCase):
         for name in state.pending_descriptor_names:
             self.assertIn(name, [row['name'] for row in _catalog_rows()])
 
-    def test_empty_completion_falls_back_and_reaches_battle_live(self):
+    def test_empty_completion_fails_the_round(self):
         state = _state_with_catalog()
         start, error = state.request_start(1, '01_karelia')
         self.assertIsNone(error)
         self.assertEqual('server_pending', start['authority_status'])
+        started_round = state.round_id
 
         result = state.donate_descriptors(1, _bundle(state))
 
-        self.assertEqual('fallback', result)
-        self.assertEqual('client_fallback', state.authority_status)
+        self.assertEqual('failed', result)
+        self.assertEqual('waiting', state.phase)
+        self.assertGreater(state.round_id, started_round)
+        self.assertEqual('failed', state.authority_status)
         self.assertEqual('descriptor_projection_failed',
                          state.authority_fallback_reason)
-        self.assertEqual('battle_live', _finish_client_fallback(state)['type'])
 
-    def test_explicit_projection_failure_falls_back_and_reaches_live(self):
+    def test_explicit_projection_failure_fails_the_round(self):
         state = _state_with_catalog()
         state.request_start(1, '01_karelia')
         names = list(state.descriptor_requested_names)
@@ -226,14 +201,14 @@ class DonationFlowTest(unittest.TestCase):
         result = state.donate_descriptors(1, _bundle(
             state, projections=projections, failures=[failed]))
 
-        self.assertEqual('fallback', result)
+        self.assertEqual('failed', result)
+        self.assertEqual('waiting', state.phase)
         roster = state.lobby_message()
-        self.assertEqual('client_fallback', roster['authority_status'])
+        self.assertEqual('failed', roster['authority_status'])
         self.assertEqual('descriptor_projection_failed',
                          roster['authority_fallback_reason'])
-        self.assertEqual('battle_live', _finish_client_fallback(state)['type'])
 
-    def test_no_descriptor_response_times_out_broadcasts_and_reaches_live(self):
+    def test_no_descriptor_response_times_out_and_fails_the_round(self):
         now = [100.0]
         state = _state_with_catalog(clock=lambda: now[0])
         state.request_start(1, '01_karelia')
@@ -241,15 +216,16 @@ class DonationFlowTest(unittest.TestCase):
 
         state.tick_once(1.0 / 30.0)
 
-        self.assertEqual('client_fallback', state.authority_status)
+        self.assertEqual('failed', state.authority_status)
+        self.assertEqual('waiting', state.phase)
         rosters = [line for line in state.players[1].conn.lines
                    if line.get('type') == 'roster']
         self.assertTrue(rosters)
+        self.assertEqual('waiting', rosters[-1]['phase'])
         self.assertEqual('descriptor_timeout',
                          rosters[-1]['authority_fallback_reason'])
-        self.assertEqual('battle_live', _finish_client_fallback(state)['type'])
 
-    def test_missing_requester_in_catalog_uses_explicit_client_fallback(self):
+    def test_missing_requester_in_catalog_refuses_the_start(self):
         state = _state_with_catalog()
         state.vehicle_catalogs[1] = ({
             'name': 'germany:G12_Ltraktor', 'level': 1,
@@ -258,13 +234,13 @@ class DonationFlowTest(unittest.TestCase):
 
         start, error = state.request_start(1, '01_karelia')
 
-        self.assertIsNone(error)
+        self.assertIsNone(start)
+        self.assertEqual('lineup_unavailable', error)
         self.assertIsNone(state.server_authority)
-        self.assertEqual(1, start['bot_authority_id'])
-        self.assertEqual('client_fallback', start['authority_status'])
+        self.assertEqual('waiting', state.phase)
+        self.assertEqual('failed', state.authority_status)
         self.assertEqual('lineup_unavailable',
-                         start['authority_fallback_reason'])
-        self.assertEqual('battle_live', _finish_client_fallback(state)['type'])
+                         state.authority_fallback_reason)
 
     def test_ready_waits_for_native_identities_then_reaches_live(self):
         state = _state_with_catalog()
@@ -285,7 +261,7 @@ class DonationFlowTest(unittest.TestCase):
         self.assertEqual('server', live['authority_status'])
         self.assertEqual('battle', state.phase)
 
-    def test_native_identity_timeout_broadcasts_fallback_and_reaches_live(self):
+    def test_native_identity_timeout_fails_the_round(self):
         now = [10.0]
         state = _state_with_catalog(clock=lambda: now[0])
         state.vehicle_catalogs[1] = tuple(_catalog_rows()[:1])
@@ -297,13 +273,14 @@ class DonationFlowTest(unittest.TestCase):
 
         state.tick_once(1.0 / 30.0)
 
-        self.assertEqual('client_fallback', state.authority_status)
+        self.assertEqual('failed', state.authority_status)
+        self.assertEqual('waiting', state.phase)
         rosters = [line for line in state.players[1].conn.lines
                    if line.get('type') == 'roster']
         self.assertTrue(rosters)
+        self.assertEqual('waiting', rosters[-1]['phase'])
         self.assertEqual('destructible_map_timeout',
                          rosters[-1]['authority_fallback_reason'])
-        self.assertEqual('battle_live', _finish_client_fallback(state)['type'])
 
 
 class CatalogValidationTest(unittest.TestCase):
