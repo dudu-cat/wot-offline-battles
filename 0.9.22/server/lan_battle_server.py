@@ -115,7 +115,7 @@ ROUND_SCOPED_MESSAGE_TYPES = frozenset((
     "start_battle", "input", "hit_report", "bot_manifest", "bot_state",
     "bot_observation", "bot_hit_report", "bot_human_hit", "bot_ram_report",
     "projectile_launch", "projectile_progress", "projectile_resolve",
-    "rules_state", "destructible",
+    "rules_state", "destructible", "descriptor_bundle",
     "battle_result", "leave_battle", "battle_ready",
 ))
 # The elected #1513 authority uses the same bounded in-process manager.  The
@@ -519,6 +519,8 @@ class BattleState:
         self.bot_planner = BotPlanner()
         self.server_authority = None
         self.descriptor_store = DescriptorStore()
+        self.vehicle_catalogs = {}
+        self.pending_descriptor_names = ()
         self.bot_orders = {"revision": 0, "orders": []}
         self.bot_reported_hits = set()
         self.bot_reported_rams = set()
@@ -845,6 +847,15 @@ class BattleState:
             if player is not None:
                 player.connected = False
                 self.state_revision += 1
+            self.vehicle_catalogs.pop(player_id, None)
+            if (self.server_authority is not None and
+                    not self.server_authority.started() and
+                    player_id == self.host_player_id):
+                # The donor left before the projections arrived; give the
+                # round back to the client election rather than stall it.
+                self.server_authority = None
+                self.pending_descriptor_names = ()
+                self._elect_bot_authority()
             if player_id == self.host_player_id:
                 self._elect_room_host()
             if player_id == self.bot_authority_id:
@@ -916,6 +927,7 @@ class BattleState:
         self.bot_state_revision = 0
         self.bot_planner.reset()
         self.server_authority = None
+        self.pending_descriptor_names = ()
         self.bot_orders = {"revision": 0, "orders": []}
         self.bot_reported_hits = set()
         self.bot_reported_rams = set()
@@ -999,8 +1011,25 @@ class BattleState:
                           else "battle")
             self._prepare_server_authority()
             self._elect_bot_authority()
+            descriptor_request = None
             if self.server_authority is not None:
-                if not self._start_server_authority():
+                self.server_authority.prepare_lineup(
+                    self.vehicle_catalogs.get(self.host_player_id),
+                    list(self.bot_roster),
+                    [self._public_player(p) for p in connected],
+                    player.vehicle)
+                names = self.server_authority.required_projections()
+                self.pending_descriptor_names = tuple(names)
+                missing = sorted(
+                    name for name in names
+                    if self.descriptor_store.get(name) is None)
+                if missing:
+                    descriptor_request = {
+                        "type": "descriptor_request",
+                        "round_id": self.round_id,
+                        "names": missing,
+                    }
+                elif not self._start_server_authority():
                     self.server_authority = None
                     self._elect_bot_authority()
             self.state_revision += 1
@@ -1031,14 +1060,23 @@ class BattleState:
                     "authority_epoch": self.authority_epoch,
                     "server_time_ms": self._server_time_ms(),
                 })
+            if descriptor_request is not None:
+                host = self.players.get(self.host_player_id)
+                if host is None or not host.send(descriptor_request):
+                    self.server_authority = None
+                    self.pending_descriptor_names = ()
+                    self._elect_bot_authority()
+                start_message["bot_authority_id"] = self.bot_authority_id
             return start_message, None
 
     def _prepare_server_authority(self):
         """Build this round's server-hosted authority when it can own bots."""
         self.server_authority = None
+        self.pending_descriptor_names = ()
         if self.client_build != CLIENT_BUILD_0922:
             return
-        if not len(self.descriptor_store):
+        if (not len(self.descriptor_store) and
+                not self.vehicle_catalogs.get(self.host_player_id)):
             return
         try:
             world = server_world.load_world(self.map_name)
@@ -1051,6 +1089,72 @@ class BattleState:
             return
         self.server_authority = ServerBattleAuthority(
             self, world, self.descriptor_store)
+
+    def store_vehicle_catalog(self, player_id, message):
+        """Keep one connection's eligible-vehicle catalog for lineups."""
+        with self.lock:
+            player = self.players.get(player_id)
+            if player is None or not player.connected:
+                return False
+            rows = message.get("vehicles")
+            if not isinstance(rows, list) or not rows or len(rows) > 600:
+                return False
+            catalog = []
+            seen = set()
+            for raw in rows:
+                if not isinstance(raw, dict):
+                    return False
+                name = _safe_vehicle(raw.get("name"), "")
+                try:
+                    level = int(raw.get("level"))
+                except (TypeError, ValueError):
+                    return False
+                tags = raw.get("tags")
+                if (not name or name in seen or not 1 <= level <= 10 or
+                        not isinstance(tags, list) or len(tags) > 32):
+                    return False
+                seen.add(name)
+                catalog.append({
+                    "name": name, "level": level,
+                    "tags": tuple(sorted(str(tag)[:32] for tag in tags)),
+                })
+            self.vehicle_catalogs[player_id] = tuple(catalog)
+            return True
+
+    def donate_descriptors(self, player_id, message):
+        """Admit requested projections; start the authority when complete."""
+        with self.lock:
+            if (not self._message_round_matches(message) or
+                    self.phase != "loading" or
+                    self.server_authority is None or
+                    self.server_authority.started() or
+                    player_id != self.host_player_id):
+                return False
+            projections = message.get("projections")
+            if (not isinstance(projections, dict) or not projections or
+                    len(projections) > 64):
+                return False
+            wanted = set(self.pending_descriptor_names)
+            for name, raw in projections.items():
+                clean = _safe_vehicle(name, "")
+                if not clean or clean not in wanted:
+                    return False
+                if not isinstance(raw, dict):
+                    return False
+                try:
+                    self.descriptor_store.add(clean, raw)
+                except ValueError:
+                    return False
+            missing = [name for name in self.pending_descriptor_names
+                       if self.descriptor_store.get(name) is None]
+            if missing:
+                return True
+            if not self._start_server_authority():
+                self.server_authority = None
+                self.pending_descriptor_names = ()
+                self._elect_bot_authority()
+                return False
+            return "started"
 
     def _start_server_authority(self):
         authority = self.server_authority
@@ -4679,6 +4783,17 @@ class ClientHandler(socketserver.BaseRequestHandler):
                                 # publisher exactly; only #1513 has a loading
                                 # membership barrier to repair.
                                 server.state.broadcast(start_message)
+                    elif message_type == "descriptor_catalog":
+                        server.state.store_vehicle_catalog(
+                            player.player_id, message)
+                    elif message_type == "descriptor_bundle":
+                        accepted = server.state.donate_descriptors(
+                            player.player_id, message)
+                        if accepted == "started":
+                            server.state.broadcast_loading_transition({
+                                "type": "snapshot",
+                                "round_id": server.state.round_id,
+                            })
                     elif message_type == "ping":
                         player.send({
                             "type": "pong",

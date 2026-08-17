@@ -23,9 +23,12 @@ from descriptor_projection import DescriptorStore
 
 _CLIENT_SCRIPT_ROOT = server_world._CLIENT_SCRIPT_ROOT
 
+import random
+
 from gui.mods.offline_lan_0922 import combat_rules
 from gui.mods.offline_lan_0922 import critical_damage
 from gui.mods.offline_lan_0922 import vehicle_physics
+from gui.mods.offline_lan_0922.ai import planner as bot_planner
 from gui.mods.offline_lan_0922.artillery_controller import ArtilleryController
 from gui.mods.offline_lan_0922.bot_runtime import BotRuntime
 from gui.mods.offline_lan_0922.projectile_manager import InFlightProjectiles
@@ -239,6 +242,93 @@ class ServerBattleAuthority(object):
         self._live = False
         self._started = False
         self._progress_cursors = {}
+        self._assignments = {}
+        self._required_names = ()
+        self._last_now = 0.0
+
+    def started(self):
+        return self._started
+
+    def required_projections(self):
+        return self._required_names
+
+    def prepare_lineup(self, catalog, roster, public_players,
+                       requester_vehicle):
+        """Port of the client's mirrored 0.8.2 lineup law over the catalog."""
+        self._assignments = {}
+        human_names = sorted(set(
+            str(raw.get('vehicle') or '')
+            for raw in (public_players or ()) if raw.get('vehicle')))
+        self._required_names = tuple(human_names)
+        profiles = {}
+        for row in (catalog or ()):
+            profiles[row['name']] = {
+                'name': row['name'], 'level': int(row['level']),
+                'tags': tuple(row.get('tags') or ()),
+            }
+        requester_profile = profiles.get(str(requester_vehicle))
+        if requester_profile is None:
+            return False
+        tier = int(requester_profile['level'])
+        candidates = [
+            profile for profile in profiles.values()
+            if bot_planner.vehicle_in_battle_tier_band(
+                tier, profile['level']) and
+            not _vehicle_excluded(profile)]
+        if not candidates:
+            return False
+        bots_by_team = dict((team, sorted(
+            (raw for raw in (roster or ()) if isinstance(raw, dict) and
+             int(raw.get('team', 0)) == team),
+            key=lambda raw: int(raw.get('slot', 0))))
+            for team in (1, 2))
+        humans_by_team = {1: [], 2: []}
+        for raw in (public_players or ()):
+            team = int(raw.get('team', 0) or 0)
+            profile = profiles.get(str(raw.get('vehicle') or ''))
+            if team in humans_by_team and profile is not None:
+                humans_by_team[team].append(profile)
+        if not humans_by_team[1] and not humans_by_team[2]:
+            humans_by_team[1].append(requester_profile)
+        available_tiers = sorted(set(
+            int(candidate['level']) for candidate in candidates))
+        match_tiers = list(bot_planner.choose_match_tiers(
+            tier, random.random(), random.random(), available_tiers))
+        for team_profiles in humans_by_team.values():
+            for profile in team_profiles:
+                if profile['level'] not in match_tiers:
+                    match_tiers.append(profile['level'])
+                if not any(
+                        candidate['level'] == profile['level'] and
+                        bot_planner.vehicle_match_class(candidate) ==
+                        bot_planner.vehicle_match_class(profile)
+                        for candidate in candidates):
+                    candidates.append(profile)
+        match_tiers = tuple(sorted(set(match_tiers)))
+        team_size = max(
+            len(humans_by_team[team]) + len(bots_by_team[team])
+            for team in (1, 2))
+        requirements = bot_planner.shared_human_requirements(humans_by_team)
+        template = bot_planner.build_match_template(
+            candidates, team_size, requester_profile, match_tiers,
+            random, requirements)
+        assignments = {}
+        for team in (1, 2):
+            team_bots = bots_by_team[team]
+            picked = bot_planner.remaining_match_template(
+                template, humans_by_team[team])
+            if len(picked) < len(team_bots):
+                picked = bot_planner.select_bot_lineup(
+                    picked or candidates, len(team_bots), 1, candidates)
+            picked = list(picked[:len(team_bots)])
+            random.shuffle(picked)
+            picked.sort(key=_vehicle_class_order)
+            for raw, entry in zip(team_bots, picked):
+                assignments[(team, int(raw.get('slot', 0)))] = entry['name']
+        self._assignments = assignments
+        self._required_names = tuple(sorted(
+            set(human_names) | set(assignments.values())))
+        return True
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -306,6 +396,10 @@ class ServerBattleAuthority(object):
         requested = raw.get('vehicle')
         if requested:
             return requested
+        assigned = self._assignments.get(
+            (int(raw.get('team', 1)), int(raw.get('slot', 0))))
+        if assigned:
+            return assigned
         names = self.descriptors.names()
         if not names:
             raise RuntimeError('no donated descriptor projections')
@@ -915,6 +1009,22 @@ def _dominant_face(local, half, center_local):
     normal = [0.0, 0.0, 0.0]
     normal[axis] = sign
     return face, tuple(normal)
+
+
+def _vehicle_excluded(profile):
+    tags = profile.get('tags', ()) or ()
+    if 'secret' in tags:
+        return True
+    return profile.get('name') == 'usa:T23'
+
+
+def _vehicle_class_order(profile):
+    tags = profile.get('tags', ()) or ()
+    for tag, order in (('heavyTank', 0), ('mediumTank', 1),
+                       ('AT-SPG', 2), ('lightTank', 3), ('SPG', 4)):
+        if tag in tags:
+            return order
+    return 1
 
 
 def _armor_for_face(descriptor, face):

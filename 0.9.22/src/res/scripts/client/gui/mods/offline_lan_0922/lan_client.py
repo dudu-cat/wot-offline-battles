@@ -1177,6 +1177,19 @@ class LANClient(object):
                            'contacts': list(contacts or ())[:64],
                            'affordances': list(affordances or ())[:16]})
 
+    def send_descriptor_catalog(self, vehicles):
+        if not self.ready:
+            return False
+        return self._send({'type': 'descriptor_catalog',
+                           'vehicles': list(vehicles or ())[:600]})
+
+    def send_descriptor_bundle(self, projections):
+        if not self.ready:
+            return False
+        return self._send({'type': 'descriptor_bundle',
+                           'round_id': self.round_id,
+                           'projections': dict(projections or {})})
+
     def send_bot_hit(self, target_id, shot_seq, damage, shot_result,
                      impact_position=None, critical=None, splash=False,
                      critical_target_base_revision=None,

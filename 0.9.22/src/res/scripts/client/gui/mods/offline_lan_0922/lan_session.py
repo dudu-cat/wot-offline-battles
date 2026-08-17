@@ -1045,11 +1045,58 @@ class LANSession(object):
             reason)
         return True
 
+    def _donation_runtime(self):
+        try:
+            from gui.mods.offline_lan_0922.compat import g_compatibility
+        except Exception:
+            return None
+        return getattr(g_compatibility, '_runtime', None)
+
+    def _send_vehicle_catalog(self):
+        """Donate the eligible-vehicle catalog for server-side lineups."""
+        runtime = self._donation_runtime()
+        if runtime is None:
+            return
+        try:
+            from gui.mods.offline_lan_0922 import descriptor_donation
+            rows = descriptor_donation.vehicle_catalog(runtime)
+        except Exception as error:
+            print('[Offline LAN 0.9.22] vehicle catalog donation '
+                  'failed: %s' % error)
+            return
+        if rows:
+            self.client.send_descriptor_catalog(rows)
+
+    def _donate_descriptors(self, message):
+        """Answer one server request for battle descriptor projections."""
+        runtime = self._donation_runtime()
+        if runtime is None:
+            return
+        names = message.get('names') if isinstance(message, dict) else None
+        if not isinstance(names, (list, tuple)) or not names:
+            return
+        try:
+            from gui.mods.offline_lan_0922 import descriptor_donation
+            projections = descriptor_donation.project_vehicles(
+                runtime, [str(name) for name in names[:64]])
+        except Exception as error:
+            print('[Offline LAN 0.9.22] descriptor donation '
+                  'failed: %s' % error)
+            return
+        items = sorted(projections.items())
+        for start in range(0, len(items), 12):
+            self.client.send_descriptor_bundle(
+                dict(items[start:start + 12]))
+
     def _on_event(self, kind, message):
         if self._stopped:
             return
         if kind in ('welcome', 'roster'):
+            if kind == 'welcome':
+                self._send_vehicle_catalog()
             self._waiting_event(message)
+        elif kind == 'descriptor_request':
+            self._donate_descriptors(message)
         elif kind == 'start_denied':
             # Concurrent start requests can produce an accepted battle_start
             # and a denial for this client's losing request in either order.
