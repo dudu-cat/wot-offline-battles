@@ -264,12 +264,13 @@ def _validate(data, map_name):
 	return data
 
 
-def load_catalog(map_name):
+def load_catalog(map_name, base_dir=None):
 	"""Return the validated contact catalog for one supported arena."""
 	short_name = short_map_name(map_name)
 	if not short_name:
 		return None
-	directory = os.path.join(mod_dir(), 'destructibles')
+	directory = os.path.join(
+		base_dir if base_dir is not None else mod_dir(), 'destructibles')
 	entry = _manifest_entry(directory, short_name)
 	path = os.path.join(directory, short_name + '.json')
 	if not os.path.isfile(path):

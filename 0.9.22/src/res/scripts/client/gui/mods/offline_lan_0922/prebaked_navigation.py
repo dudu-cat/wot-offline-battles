@@ -90,12 +90,13 @@ def _manifest_entry(directory, map_name):
 	return selected
 
 
-def load_graph(map_name):
+def load_graph(map_name, base_dir=None):
 	"""Return a validated graph, or None when this map has not been baked."""
 	short_name = _short_map_name(map_name)
 	if not short_name:
 		return None
-	directory = os.path.join(mod_dir(), 'navgraphs')
+	directory = os.path.join(
+		base_dir if base_dir is not None else mod_dir(), 'navgraphs')
 	entry = _manifest_entry(directory, short_name)
 	path = os.path.join(directory, short_name + '.json')
 	if not os.path.isfile(path):

@@ -95,11 +95,12 @@ def _validate(data, map_name):
 	return data
 
 
-def load_foliage(map_name):
+def load_foliage(map_name, base_dir=None):
 	short_name = short_map_name(map_name)
 	if not short_name:
 		return None
-	directory = os.path.join(mod_dir(), 'foliage')
+	directory = os.path.join(
+		base_dir if base_dir is not None else mod_dir(), 'foliage')
 	entry = _manifest_entry(directory, short_name)
 	path = os.path.join(directory, short_name + '.json')
 	if not os.path.isfile(path):
