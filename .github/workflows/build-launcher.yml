@@ -1,0 +1,184 @@
+name: Build Windows launcher
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  client-payload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Test launcher and payload staging
+        working-directory: launcher
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+      - name: Build Python 2.7 0.9.22 client package
+        run: >-
+          docker run --rm --platform linux/amd64 -v "$PWD:/work"
+          -w /work/0.9.22 python:2.7.18
+          python build_wotmod.py
+      - name: Validate 0.9.22 client package
+        run: >-
+          python 0.9.22/tools/validate_wotmod.py
+          0.9.22/dist/org.peng.offline_lan_0922_*.wotmod
+      - uses: actions/upload-artifact@v4
+        with:
+          name: launcher-build-input
+          path: 0.9.22/dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-launcher:
+    runs-on: windows-latest
+    needs: client-payload
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11.9"
+          architecture: "x64"
+      - name: Install pinned Windows packager
+        run: >-
+          python -m pip install
+          -r 0.9.22/server/requirements-windows-build.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: launcher-build-input
+          path: 0.9.22/dist
+      - name: Test launcher on Windows
+        working-directory: launcher
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+      - name: Build launcher distribution
+        shell: pwsh
+        run: pwsh -NoProfile -File launcher/build_launcher.ps1
+      - name: Verify payload, fake-client install, and bundled servers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $appName = "WoT-Offline-Battles-Launcher"
+          $appRoot = Join-Path $PWD "launcher\dist\$appName"
+          $launcher = Join-Path $appRoot "$appName.exe"
+          $payload = Join-Path $appRoot "_internal"
+          $fakeRoot = Join-Path $env:RUNNER_TEMP "WoT 假客户端"
+          $fake082 = Join-Path $fakeRoot "0.8.2"
+          $fake0922 = Join-Path $fakeRoot "0.9.22 #1513"
+          New-Item -ItemType Directory -Force -Path $fake082,$fake0922 | Out-Null
+          Set-Content -LiteralPath (Join-Path $fake082 "WorldOfTanks.exe") -Value ""
+          Set-Content -LiteralPath (Join-Path $fake082 "version.xml") `
+              -Value "<version> v.0.8.2 #335 </version>"
+          Set-Content -LiteralPath (Join-Path $fake0922 "WorldOfTanks.exe") -Value ""
+          Set-Content -LiteralPath (Join-Path $fake0922 "version.xml") `
+              -Value "<version> v.0.9.22.0.1 #1513 </version>"
+
+          @'
+          import json
+          import os
+          import sys
+          import zipfile
+
+          sys.path.insert(0, os.path.join(os.getcwd(), 'launcher'))
+          import core
+
+          payload, fake082, fake0922 = sys.argv[1:4]
+          retired_prefixes = (
+              'bw_', 'dis_', 'fix_', 'inject_', 'patch_', 'remove_', 'test_')
+          for port in core.SUPPORTED_PORTS:
+              archive_path = os.path.join(payload, 'client', port + '.zip')
+              with zipfile.ZipFile(archive_path) as archive:
+                  names = archive.namelist()
+              assert not any('__pycache__' in name or name.endswith('.sha256')
+                             for name in names), port
+              if port == core.PORT_0_8_2:
+                  assert not any(name.rsplit('/', 1)[-1].startswith(
+                      retired_prefixes) for name in names)
+          cases = ((core.PORT_0_8_2, fake082),
+                   (core.PORT_0_9_22, fake0922))
+          for port, game_root in cases:
+              status = core.inspect_game_root(game_root)
+              assert status['client'] == port, status
+              core.install_client_mod(game_root, port, base_dir=payload)
+              assert core._installation_complete(
+                  game_root, port, core._CLIENT_INSTALL[port])
+
+          data_root_082 = os.path.join(
+              fake082, 'res_mods', '0.8.2', 'scripts', 'client', 'gui',
+              'mods', 'offhangar', 'navgraphs')
+          data_root_0922 = os.path.join(
+              fake0922, 'mods', 'configs', 'offline_lan_0922')
+          inventories = [(data_root_082, 33)]
+          inventories.extend((os.path.join(data_root_0922, name), 41)
+              for name in
+              ('navgraphs', 'foliage', 'destructibles', 'occluders'))
+          for data_root, expected_count in inventories:
+              manifest_path = os.path.join(data_root, 'manifest.json')
+              with open(manifest_path, 'rb') as stream:
+                  manifest = json.load(stream)
+              records = manifest.get('maps')
+              assert (isinstance(records, list) and
+                      len(records) == expected_count), data_root
+              for record in records:
+                  assert os.path.isfile(os.path.join(
+                      data_root, record['file'])), (data_root, record)
+          '@ | python - $payload $fake082 $fake0922
+          if ($LASTEXITCODE -ne 0) {
+              throw "Bundled client installation verification failed"
+          }
+
+          $env:WOT_OFFLINE_NAVGRAPH_DIR = Join-Path $fake082 `
+              "res_mods\0.8.2\scripts\client\gui\mods\offhangar\navgraphs"
+          $env:WOT_0922_SERVER_DATA = Join-Path $fake0922 `
+              "mods\configs\offline_lan_0922"
+          $ProtocolProbe = @'
+          import os
+          import sys
+          sys.path.insert(0, os.path.join(os.getcwd(), 'launcher'))
+          import core
+          raise SystemExit(0 if core.probe_server_protocol(
+              sys.argv[1], '127.0.0.1', 28782, timeout=1.0) else 1)
+          '@
+          foreach ($port in @("0.8.2", "0.9.22")) {
+              $process = Start-Process -FilePath $launcher `
+                  -ArgumentList "--serve", $port -PassThru
+              try {
+                  $deadline = (Get-Date).AddSeconds(60)
+                  $compatible = $false
+                  while ((Get-Date) -lt $deadline) {
+                      if ($process.HasExited) {
+                          throw "$port server exited before its protocol answered"
+                      }
+                      $ProtocolProbe | python - $port
+                      if ($LASTEXITCODE -eq 0) {
+                          $compatible = $true
+                          break
+                      }
+                      Start-Sleep -Milliseconds 250
+                  }
+                  if (-not $compatible) {
+                      throw "$port server did not answer its bundled protocol"
+                  }
+              }
+              finally {
+                  if (-not $process.HasExited) {
+                      & taskkill.exe /PID $process.Id /T /F | Out-Null
+                  }
+                  Start-Sleep -Seconds 2
+              }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wot-offline-battles-launcher-windows-${{ github.run_number }}
+          path: launcher/dist/WoT-Offline-Battles-Launcher-Windows.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

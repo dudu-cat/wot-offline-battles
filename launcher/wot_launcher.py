@@ -152,10 +152,14 @@ class LauncherWindow(object):
     def _refresh_mode(self):
         state = "normal" if self.mode.get() == core.MODE_JOIN else "disabled"
         self.join_entry.config(state=state)
-        self.test_button.config(state=state)
+        self.test_button.config(state="normal")
 
     def _test_connection(self):
         mode = self.mode.get()
+        client = self._refresh_client().get("client")
+        if client not in core.SUPPORTED_PORTS:
+            self._log("Select a supported game folder before testing.")
+            return False
         try:
             host, port = core.endpoint_for_mode(mode, self.join_address.get())
         except core.LauncherError as error:
@@ -166,8 +170,8 @@ class LauncherWindow(object):
 
         def probe():
             try:
-                answered = core.probe_endpoint(host, port)
-                self._log(core.connection_report(mode, host, port, answered))
+                status = core.listener_status(client, host, port)
+                self._log(core.listener_report(mode, host, port, status))
             finally:
                 self.root.after(
                     0, lambda: self.test_button.config(state="normal"))
@@ -250,8 +254,16 @@ class LauncherWindow(object):
                 if not self._start_server(game_root, session["client"]):
                     return
             elif session["mode"] == core.MODE_JOIN:
-                if core.probe_endpoint(host, port):
-                    self._log("The server at %s:%d answered." % (host, port))
+                status = core.listener_status(
+                    session["client"], host, port)
+                if status == core.LISTENER_COMPATIBLE:
+                    self._log("The compatible server at %s:%d answered." %
+                              (host, port))
+                elif status == core.LISTENER_OCCUPIED:
+                    self._log("Something at %s:%d answered, but it is not "
+                              "the server for this client. The game was not "
+                              "started." % (host, port))
+                    return
                 else:
                     self._log("Warning: %s:%d did not answer. Start the game "
                               "anyway and click the battle button when the "
@@ -266,6 +278,17 @@ class LauncherWindow(object):
             self._set_busy(False)
 
     def _start_server(self, game_root, port_version):
+        status = core.listener_status(
+            port_version, core.LOCAL_HOST, core.DEFAULT_SERVER_PORT)
+        if status == core.LISTENER_COMPATIBLE:
+            self._log("A compatible %s LAN server is already running; "
+                      "using it." % port_version)
+            return True
+        if status == core.LISTENER_OCCUPIED:
+            self._log("Another program uses port %d and does not speak the "
+                      "%s LAN protocol. Close it before starting the game." %
+                      (core.DEFAULT_SERVER_PORT, port_version))
+            return False
         command = core.server_child_command(port_version)
         environment = core.server_environment(port_version, game_root)
         self._log("Starting the %s LAN server..." % port_version)
@@ -275,9 +298,10 @@ class LauncherWindow(object):
         pump = threading.Thread(target=self._pump_server_output)
         pump.daemon = True
         pump.start()
-        if not core.wait_for_listener(core.LOCAL_HOST, core.DEFAULT_SERVER_PORT):
-            self._log("The LAN server did not open port %d." %
-                      core.DEFAULT_SERVER_PORT)
+        if not core.wait_for_server(
+                port_version, core.LOCAL_HOST, core.DEFAULT_SERVER_PORT):
+            self._log("The LAN server did not answer the %s protocol on port "
+                      "%d." % (port_version, core.DEFAULT_SERVER_PORT))
             return False
         self._log("The LAN server listens on port %d." %
                   core.DEFAULT_SERVER_PORT)

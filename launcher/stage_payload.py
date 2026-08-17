@@ -52,6 +52,11 @@ CLIENT_TREES = {
 
 CLIENT_0922_OVERLAY = "WoT-0.9.22-LAN-Client-*"
 
+CLIENT_FILE_SUFFIXES = {
+    "0.8.2": (".dds", ".json", ".png", ".py", ".pyc", ".pyd"),
+    "0.9.22": (".json", ".wotmod"),
+}
+
 
 def repository_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -67,7 +72,10 @@ def client_source(port_version, source_root=None):
     overlays = [path for path in overlays if os.path.isdir(path)]
     if not overlays:
         return None
-    return overlays[-1]
+    if len(overlays) != 1:
+        raise ValueError(
+            "multiple 0.9.22 client overlays found; clean dist and rebuild")
+    return overlays[0]
 
 
 def _copy_file(source, target):
@@ -78,21 +86,31 @@ def _copy_file(source, target):
 
 
 # The 0.8.2 client mod is loaded by CameraNode.pyc, so client trees keep their
-# bytecode. Only the stale mod entry and local caches are left out.
+# bytecode. Stale bytecode, retired one-off tools, and local caches stay out.
 SKIPPED_CLIENT_FILES = ("mod_offhangar.pyc",)
+SKIPPED_CLIENT_PREFIXES = (
+    "bw_", "dis_", "fix_", "inject_", "patch_", "remove_", "test_",
+)
 
 
-def _copy_tree(source, target, keep_bytecode=False):
+def _copy_tree(source, target, keep_bytecode=False, suffixes=None):
     written = []
     for directory, directories, names in os.walk(source):
-        directories[:] = [name for name in directories
-                          if name != "__pycache__"]
-        for name in names:
+        directories[:] = sorted(
+            name for name in directories
+            if name != "__pycache__" and not name.startswith(".") and
+            not os.path.islink(os.path.join(directory, name)))
+        for name in sorted(names):
             if name in SKIPPED_CLIENT_FILES:
                 continue
             if name.endswith(".pyc") and not keep_bytecode:
                 continue
+            if name.startswith(".") or (suffixes is not None and
+                                         not name.lower().endswith(suffixes)):
+                continue
             source_path = os.path.join(directory, name)
+            if os.path.islink(source_path):
+                continue
             target_path = os.path.join(
                 target, os.path.relpath(source_path, source))
             _copy_file(source_path, target_path)
@@ -117,7 +135,7 @@ def stage_servers(target_root, source_root=None):
                                   *relative_dir.split("/"))
             target = os.path.join(target_root, port_version,
                                   *relative_dir.split("/"))
-            written.extend(_copy_tree(source, target))
+            written.extend(_copy_tree(source, target, suffixes=(".py",)))
     return written
 
 
@@ -145,12 +163,20 @@ def stage_clients(target_root, source_root=None, client_0922=None):
                     raise ValueError("client mod is incomplete: %s/%s" %
                                      (port_version, source_relative))
                 for directory, directories, names in os.walk(source):
-                    directories[:] = [name for name in directories
-                                      if name != "__pycache__"]
+                    directories[:] = sorted(
+                        name for name in directories
+                        if name != "__pycache__" and not name.startswith(".")
+                        and not os.path.islink(os.path.join(directory, name)))
                     for name in sorted(names):
-                        if name in SKIPPED_CLIENT_FILES:
+                        if (name in SKIPPED_CLIENT_FILES or
+                                name.startswith(SKIPPED_CLIENT_PREFIXES) or
+                                name.startswith(".") or
+                                not name.lower().endswith(
+                                    CLIENT_FILE_SUFFIXES[port_version])):
                             continue
                         source_path = os.path.join(directory, name)
+                        if os.path.islink(source_path):
+                            continue
                         member = "/".join(
                             [target_relative] +
                             os.path.relpath(
@@ -158,8 +184,27 @@ def stage_clients(target_root, source_root=None, client_0922=None):
                         archive.write(source_path, member)
         finally:
             archive.close()
+        _validate_client_archive(archive_path, port_version)
         written.append(archive_path)
     return written
+
+
+def _validate_client_archive(path, port_version):
+    """Apply the launcher's install-time whitelist to every staged client."""
+    import core
+
+    validation_root = os.path.join(
+        os.path.dirname(path), ".payload-validation-root")
+    archive = zipfile.ZipFile(path)
+    try:
+        try:
+            core._validate_archive(
+                archive, validation_root, port_version,
+                core._CLIENT_INSTALL[port_version])
+        except core.LauncherError as error:
+            raise ValueError(str(error))
+    finally:
+        archive.close()
 
 
 def stage(target_root, source_root=None, include_clients=True,

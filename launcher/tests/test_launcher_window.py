@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import core
 import wot_launcher
@@ -125,6 +126,16 @@ class WindowTest(unittest.TestCase):
     def _log_text(self):
         return "".join(self.window.log_view.lines)
 
+    def _game(self, version="0.8.2", build="335"):
+        game_root = os.path.join(self.settings_dir, "game-" + version)
+        os.makedirs(game_root)
+        with open(os.path.join(game_root, core.GAME_EXECUTABLE), "w") as stream:
+            stream.write("")
+        with open(os.path.join(game_root, "version.xml"), "w") as stream:
+            stream.write("<version> v.%s #%s </version>" % (version, build))
+        self.window.game_root.set(game_root)
+        return game_root
+
     def test_the_address_field_and_test_button_follow_the_mode(self):
         self.window.mode.set(core.MODE_JOIN)
         self.window._refresh_mode()
@@ -134,7 +145,7 @@ class WindowTest(unittest.TestCase):
             self.window.mode.set(mode)
             self.window._refresh_mode()
             self.assertEqual(self.window.join_entry.cget("state"), "disabled")
-            self.assertEqual(self.window.test_button.cget("state"), "disabled")
+            self.assertEqual(self.window.test_button.cget("state"), "normal")
 
     def test_an_empty_folder_asks_for_the_game_executable(self):
         self.window.game_root.set("")
@@ -158,12 +169,9 @@ class WindowTest(unittest.TestCase):
         self.assertFalse(self.window._busy)
 
     def test_start_reports_an_invalid_join_address(self):
-        game_root = os.path.join(self.settings_dir, "game")
+        game_root = self._game()
         os.makedirs(os.path.join(game_root, "res_mods", "0.8.2", "scripts",
                                  "client", "gui", "mods", "offhangar"))
-        with open(os.path.join(game_root, core.GAME_EXECUTABLE), "w") as stream:
-            stream.write("")
-        self.window.game_root.set(game_root)
         self.window.mode.set(core.MODE_JOIN)
         self.window.join_address.set("")
         self.window._start()
@@ -199,8 +207,10 @@ class WindowTest(unittest.TestCase):
 
     def test_the_test_button_probes_the_typed_address(self):
         probed = []
-        self.addCleanup(setattr, core, "probe_endpoint", core.probe_endpoint)
-        core.probe_endpoint = lambda host, port: probed.append((host, port))
+        self._game()
+        self.addCleanup(setattr, core, "listener_status", core.listener_status)
+        core.listener_status = lambda client, host, port: (
+            probed.append((client, host, port)) or core.LISTENER_COMPATIBLE)
         self.window.mode.set(core.MODE_JOIN)
         self.window.join_address.set("10.0.0.5:1234")
         self.assertTrue(self.window._test_connection())
@@ -208,14 +218,51 @@ class WindowTest(unittest.TestCase):
             if probed:
                 break
             time.sleep(0.01)
-        self.assertEqual([("10.0.0.5", 1234)], probed)
+        self.assertEqual([(core.PORT_0_8_2, "10.0.0.5", 1234)], probed)
         self.assertIn("Testing 10.0.0.5:1234", self._log_text())
 
     def test_the_test_button_reports_an_invalid_address(self):
+        self._game()
         self.window.mode.set(core.MODE_JOIN)
         self.window.join_address.set("")
         self.assertFalse(self.window._test_connection())
         self.assertIn("Enter the address", self._log_text())
+
+    def test_a_matching_existing_server_is_reused(self):
+        with mock.patch("core.listener_status",
+                        return_value=core.LISTENER_COMPATIBLE), \
+                mock.patch("wot_launcher.subprocess.Popen") as popen:
+            self.assertTrue(self.window._start_server(
+                self.settings_dir, core.PORT_0_9_22))
+        popen.assert_not_called()
+        self.assertIn("already running", self._log_text())
+
+    def test_an_unrelated_listener_blocks_server_start(self):
+        with mock.patch("core.listener_status",
+                        return_value=core.LISTENER_OCCUPIED), \
+                mock.patch("wot_launcher.subprocess.Popen") as popen:
+            self.assertFalse(self.window._start_server(
+                self.settings_dir, core.PORT_0_9_22))
+        popen.assert_not_called()
+        self.assertIn("does not speak", self._log_text())
+
+    def test_join_does_not_start_the_game_for_an_unrelated_listener(self):
+        session = {
+            "client": core.PORT_0_9_22,
+            "host": "10.0.0.5",
+            "tcp_port": 28782,
+            "needs_server": False,
+            "mode": core.MODE_JOIN,
+        }
+        with mock.patch("core.install_client_mod", return_value=[]), \
+                mock.patch("core.write_settings", return_value=[]), \
+                mock.patch("core.listener_status",
+                           return_value=core.LISTENER_OCCUPIED), \
+                mock.patch.object(self.window, "_run_game") as run_game:
+            self.window._run_session(self.settings_dir, session, "Peng")
+
+        run_game.assert_not_called()
+        self.assertIn("not the server for this client", self._log_text())
 
     def test_closing_the_window_saves_the_settings(self):
         self.window.player_name.set("Peng")

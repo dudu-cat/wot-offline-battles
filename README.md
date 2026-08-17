@@ -67,6 +67,8 @@ pwsh -NoProfile -File launcher/build_launcher.ps1
 The launcher carries both LAN servers and both client mods. It writes the
 server address into the file each port already reads at startup, installs the
 mod, starts the game and stops the server when the game closes.
+The `Build Windows launcher` GitHub Actions workflow can also be run manually;
+it publishes the complete Windows launcher ZIP as one artifact.
 
 Tests:
 

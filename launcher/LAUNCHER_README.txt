@@ -10,7 +10,9 @@ Tanks, and stops that server when the game closes.
 2. Select your World of Tanks folder. The list holds the folders you used
    before, plus any game the launcher finds in the usual install locations.
    Use Browse... for a folder that is not in the list. The launcher reports
-   which client it found.
+   which client it found. The supported clients are World of Tanks 0.8.2 and
+   the exact Chinese HD 0.9.22.0.1 #1513 build; another 0.9.22 build is not
+   compatible.
 3. Select a mode:
    - Single player: you play alone against bots. The launcher runs the LAN
      server for you, because every battle is a server battle.
@@ -22,7 +24,9 @@ Tanks, and stops that server when the game closes.
    checks the address you typed, or reports whether port 28782 on this PC is
    already taken when you host.
 5. Click Start game. The launcher removes older mod files, installs the mod
-   for that client, and starts the game. This takes a few seconds.
+   for that client, and starts the game. This takes a few seconds. It validates
+   and stages the complete package before replacing the old mod, and restores
+   the previous mod if that replacement fails.
 
 In the game, select a tank and click Battle!. Everyone lands in the LAN waiting
 room. The room host selects a map and clicks START BATTLE.
@@ -50,11 +54,10 @@ License, source, and bundled runtimes
 =====================================
 
 This launcher is part of wot-offline-battles and is distributed under GNU GPL
-version 3, without warranty. The corresponding source and the
-complete project license are available at:
+version 3, without warranty. LICENSE and THIRD_PARTY_NOTICES.md are included
+beside this file. The corresponding source is available at:
 
 https://github.com/pengw0048/wot-offline-battles
-https://github.com/pengw0048/wot-offline-battles/blob/main/LICENSE
 
 The executable bundles CPython 3.11.9, distributed under the Python Software
 Foundation License Version 2 and the licenses/notices for software incorporated

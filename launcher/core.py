@@ -6,6 +6,7 @@ user-owned settings files that each port already reads at client startup.
 
 from __future__ import annotations
 
+import fnmatch
 import glob
 import json
 import os
@@ -13,6 +14,7 @@ import re
 import socket
 import subprocess
 import sys
+import xml.etree.ElementTree as ElementTree
 
 PORT_0_8_2 = "0.8.2"
 PORT_0_9_22 = "0.9.22"
@@ -40,12 +42,15 @@ COMMON_GAME_ROOTS = (
 )
 SERVE_FLAG = "--serve"
 
-_VERSION_PATTERN = re.compile(r"v\.(\d+(?:\.\d+)+)")
+_VERSION_PATTERN = re.compile(r"v\.(\d+(?:\.\d+)+)(?:\s+#(\d+))?")
+_PINNED_0_9_22_VERSION = "0.9.22.0.1"
+_PINNED_0_9_22_BUILD = "1513"
 
 _MOD_MARKERS = {
     PORT_0_8_2: os.path.join(
         "res_mods", "0.8.2", "scripts", "client", "gui", "mods", "offhangar"),
-    PORT_0_9_22: os.path.join("mods", "0.9.22.0.1"),
+    PORT_0_9_22: os.path.join(
+        "mods", "0.9.22.0.1", "org.peng.offline_lan_0922*.wotmod"),
 }
 
 _NAVGRAPH_RELATIVE_DIR = os.path.join(
@@ -66,6 +71,34 @@ _SERVER_ARGUMENTS = {
     PORT_0_9_22: (),
 }
 
+_SERVER_PROBES = {
+    PORT_0_8_2: {
+        "protocol": 8,
+        "client_build": "1.8.58-native-experimental-20260815",
+        "vehicle": "ussr:MS-1",
+        "capabilities": None,
+    },
+    PORT_0_9_22: {
+        "protocol": 5,
+        "client_build": "wot-0.9.22.0.1-cn-1513",
+        "vehicle": "ussr:R11_MS-1",
+        "capabilities": ("projectile_ledger_v1",),
+    },
+}
+
+LISTENER_FREE = "free"
+LISTENER_COMPATIBLE = "compatible"
+LISTENER_OCCUPIED = "occupied"
+
+_DATASETS_0_9_22 = ("navgraphs", "foliage", "destructibles", "occluders")
+_DATA_INVENTORIES = {
+    PORT_0_8_2: ((
+        "res_mods/0.8.2/scripts/client/gui/mods/offhangar/navgraphs", 33),),
+    PORT_0_9_22: tuple((
+        "mods/configs/offline_lan_0922/%s" % dataset, 41)
+        for dataset in _DATASETS_0_9_22),
+}
+
 
 class LauncherError(Exception):
     """A user-correctable launcher failure."""
@@ -75,53 +108,74 @@ def game_executable(game_root):
     return os.path.join(game_root, GAME_EXECUTABLE)
 
 
-def read_client_version(game_root):
-    """Return the client version recorded in the stock version.xml."""
+def read_client_identity(game_root):
+    """Return the version and build recorded in the stock version.xml."""
     path = os.path.join(game_root, "version.xml")
     try:
-        with open(path, "rb") as stream:
-            text = stream.read().decode("utf-8", "replace")
-    except (IOError, OSError):
+        root = ElementTree.parse(path).getroot()
+    except (IOError, OSError, ElementTree.ParseError):
         return None
-    match = _VERSION_PATTERN.search(text)
+    version_node = root if root.tag == "version" else root.find("version")
+    if version_node is None:
+        return None
+    text = "".join(version_node.itertext()).strip()
+    match = _VERSION_PATTERN.fullmatch(text)
     if match is None:
         return None
-    return match.group(1)
+    return (match.group(1), match.group(2))
 
 
-def port_for_version(version):
+def read_client_version(game_root):
+    """Return the dotted client version recorded in the stock version.xml."""
+    identity = read_client_identity(game_root)
+    return identity[0] if identity is not None else None
+
+
+def port_for_version(version, build=None):
     if not version:
         return None
-    for port_version in SUPPORTED_PORTS:
-        if version == port_version or version.startswith(port_version + "."):
-            return port_version
+    if version == PORT_0_8_2 or version.startswith(PORT_0_8_2 + "."):
+        return PORT_0_8_2
+    if (version == _PINNED_0_9_22_VERSION and
+            str(build or "") == _PINNED_0_9_22_BUILD):
+        return PORT_0_9_22
     return None
 
 
 def installed_port(game_root):
     """Return the port whose client mod is installed in this game folder."""
     for port_version, marker in _MOD_MARKERS.items():
-        if os.path.isdir(os.path.join(game_root, marker)):
+        path = os.path.join(game_root, marker)
+        if ((port_version == PORT_0_9_22 and
+             any(os.path.isfile(candidate) for candidate in glob.glob(path))) or
+                (port_version != PORT_0_9_22 and os.path.isdir(path))):
             return port_version
     return None
 
 
 def detect_port(game_root):
-    return (port_for_version(read_client_version(game_root)) or
-            installed_port(game_root))
+    identity = read_client_identity(game_root)
+    if identity is None:
+        return None
+    return port_for_version(identity[0], identity[1])
 
 
 def inspect_game_root(game_root):
     """Describe one game folder for the launcher window."""
     game_root = os.path.abspath(game_root or "")
-    version = read_client_version(game_root)
-    port_version = port_for_version(version) or installed_port(game_root)
+    identity = read_client_identity(game_root)
+    version, build = identity if identity is not None else (None, None)
+    port_version = (port_for_version(version, build)
+                    if identity is not None else None)
+    installed = installed_port(game_root)
     return {
         "path": game_root,
         "has_executable": os.path.isfile(game_executable(game_root)),
         "version": version,
+        "build": build,
         "client": port_version,
-        "mod_installed": installed_port(game_root) == port_version,
+        "mod_installed": (port_version is not None and
+                          installed == port_version),
     }
 
 
@@ -252,19 +306,43 @@ _USER_DIRS = {
     PORT_0_9_22: "mods/configs/offline_lan_0922",
 }
 
-# Directories the launcher wipes before it installs, the files of its own
-# package it removes from a shared directory, and the members it writes only
-# when they are absent.
+# Directories the launcher replaces as one unit, the files of its own package
+# it removes from a shared directory, and the members it writes only when they
+# are absent.  The replacement roots keep stale baked data out of a new server
+# run without touching the user's endpoint, account state, or configuration.
 _CLIENT_INSTALL = {
     PORT_0_8_2: {
-        "clear": ("res_mods/0.8.2",),
+        "replace": ("res_mods/0.8.2",),
         "prune": (),
         "keep": (),
+        "allowed": ("res_mods/0.8.2/",),
+        "suffixes": (".dds", ".json", ".png", ".py", ".pyc", ".pyd"),
+        "required": (
+            "res_mods/0.8.2/scripts/client/CameraNode.pyc",
+            "res_mods/0.8.2/scripts/client/gui/mods/mod_offhangar.py",
+            "res_mods/0.8.2/scripts/client/gui/mods/offhangar/"
+            "navgraphs/manifest.json",
+        ),
+        "package_pattern": None,
     },
     PORT_0_9_22: {
-        "clear": (),
+        "replace": tuple(
+            "mods/configs/offline_lan_0922/%s" % name
+            for name in _DATASETS_0_9_22),
         "prune": (("mods/0.9.22.0.1", "org.peng.offline_lan_0922*"),),
         "keep": ("mods/configs/offline_lan_0922/config.json",),
+        "allowed": (
+            "mods/0.9.22.0.1/",
+            "mods/configs/offline_lan_0922/",
+        ),
+        "suffixes": (".json", ".wotmod"),
+        "required": tuple(
+            "mods/configs/offline_lan_0922/%s/manifest.json" % name
+            for name in _DATASETS_0_9_22) + (
+            "mods/configs/offline_lan_0922/config.json",
+        ),
+        "package_pattern": (
+            "mods/0.9.22.0.1/org.peng.offline_lan_0922*.wotmod"),
     },
 }
 
@@ -318,8 +396,244 @@ def installed_identity(game_root, port_version):
 
 
 def _inside(root, path):
-    root = os.path.abspath(root) + os.path.sep
-    return os.path.abspath(path).startswith(root)
+    root = os.path.normcase(os.path.realpath(os.path.abspath(root)))
+    path = os.path.normcase(os.path.realpath(os.path.abspath(path)))
+    try:
+        return os.path.commonpath((root, path)) == root and path != root
+    except ValueError:
+        return False
+
+
+def _relative_path(root, relative):
+    path = os.path.join(root, *relative.split("/"))
+    if not _inside(root, path):
+        raise LauncherError("Refusing to write outside the game folder.")
+    return path
+
+
+def _path_is_covered(path, roots):
+    path = os.path.normcase(os.path.abspath(path))
+    for root in roots:
+        root = os.path.normcase(os.path.abspath(root))
+        if path == root or _inside(root, path):
+            return True
+    return False
+
+
+def _data_inventory(port_version, read_member, has_member):
+    """Return the complete baked-data member set, or None when incomplete."""
+    expected = set()
+    try:
+        for data_root, map_count in _DATA_INVENTORIES[port_version]:
+            manifest_member = "%s/manifest.json" % data_root
+            expected.add(manifest_member)
+            manifest = json.loads(read_member(manifest_member).decode("utf-8"))
+            records = manifest.get("maps") if isinstance(manifest, dict) else None
+            if not isinstance(records, list) or len(records) != map_count:
+                return None
+            filenames = set()
+            for record in records:
+                filename = record.get("file") if isinstance(record, dict) else None
+                if (not isinstance(filename, str) or not filename or
+                        filename in (".", "..") or "/" in filename or
+                        "\\" in filename or not filename.endswith(".json") or
+                        filename in filenames):
+                    return None
+                filenames.add(filename)
+                data_member = "%s/%s" % (data_root, filename)
+                if not has_member(data_member):
+                    return None
+                expected.add(data_member)
+    except Exception:
+        return None
+    return expected
+
+
+def _validate_archive(archive, game_root, port_version, layout):
+    """Return safe file members after validating the complete client ZIP."""
+    import stat
+
+    members = []
+    seen = set()
+    for info in archive.infolist():
+        member = info.filename
+        if member.endswith("/"):
+            continue
+        parts = member.split("/")
+        if (not member or "\\" in member or
+                any(not part or part in (".", "..") for part in parts) or
+                not any(member.startswith(prefix)
+                        for prefix in layout["allowed"]) or
+                not member.lower().endswith(layout["suffixes"])):
+            raise LauncherError(
+                "The bundled %s mod contains an invalid path." % port_version)
+        target = os.path.join(game_root, *parts)
+        if not _inside(game_root, target):
+            raise LauncherError(
+                "Refusing to write outside the game folder.")
+        key = member.casefold()
+        if key in seen:
+            raise LauncherError(
+                "The bundled %s mod contains duplicate paths." % port_version)
+        seen.add(key)
+        mode = int(info.external_attr) >> 16
+        if mode and stat.S_ISLNK(mode):
+            raise LauncherError(
+                "The bundled %s mod contains a symbolic link." % port_version)
+        members.append((info, member))
+    names = set(member for unused, member in members)
+    missing = [name for name in layout["required"] if name not in names]
+    pattern = layout["package_pattern"]
+    packages = [name for name in names if pattern and
+                fnmatch.fnmatch(name, pattern)]
+    if missing or (pattern and len(packages) != 1):
+        raise LauncherError(
+            "The bundled %s mod is incomplete." % port_version)
+    inventory = _data_inventory(
+        port_version, archive.read, lambda member: member in names)
+    if inventory is None:
+        raise LauncherError(
+            "The bundled %s baked data is incomplete." % port_version)
+    if port_version == PORT_0_9_22:
+        expected = inventory | set(layout["keep"]) | set(packages)
+        if names != expected:
+            raise LauncherError(
+                "The bundled 0.9.22 mod contains unexpected files.")
+    bad_member = archive.testzip()
+    if bad_member is not None:
+        raise LauncherError(
+            "The bundled %s mod is corrupt: %s" %
+            (port_version, bad_member))
+    return members
+
+
+def _installation_complete(game_root, port_version, layout):
+    if any(not os.path.isfile(_relative_path(game_root, relative))
+           for relative in layout["required"]):
+        return False
+    pattern = layout["package_pattern"]
+    if pattern is not None:
+        matches = glob.glob(_relative_path(game_root, pattern))
+        if len([path for path in matches if os.path.isfile(path)]) != 1:
+            return False
+    def read_member(member):
+        with open(_relative_path(game_root, member), "rb") as stream:
+            return stream.read()
+
+    if _data_inventory(
+            port_version, read_member,
+            lambda member: os.path.isfile(
+                _relative_path(game_root, member))) is None:
+        return False
+    return True
+
+
+def _stage_archive(archive, members, game_root, transaction_root):
+    import shutil
+
+    staged_root = os.path.join(transaction_root, "new")
+    os.makedirs(staged_root)
+    for info, member in members:
+        target = os.path.join(staged_root, *member.split("/"))
+        if not _inside(staged_root, target):
+            raise LauncherError(
+                "Refusing to stage outside the installer workspace.")
+        directory = os.path.dirname(target)
+        if not os.path.isdir(directory):
+            os.makedirs(directory)
+        with archive.open(info) as source:
+            with open(target, "wb") as stream:
+                shutil.copyfileobj(source, stream)
+    return staged_root
+
+
+def _transactional_install(game_root, staged_root, members, layout):
+    """Swap staged package-owned paths in, restoring every old path on error."""
+    transaction_root = os.path.dirname(staged_root)
+    backup_root = os.path.join(transaction_root, "backup")
+    failed_root = os.path.join(transaction_root, "failed")
+    os.makedirs(backup_root)
+    os.makedirs(failed_root)
+
+    replace_targets = [
+        _relative_path(game_root, relative) for relative in layout["replace"]]
+    operations = []
+    for relative, target in zip(layout["replace"], replace_targets):
+        source = os.path.join(staged_root, *relative.split("/"))
+        if not os.path.isdir(source):
+            raise LauncherError(
+                "The bundled mod is missing %s." % relative)
+        operations.append((source, target))
+    for unused, member in members:
+        source = os.path.join(staged_root, *member.split("/"))
+        target = _relative_path(game_root, member)
+        if _path_is_covered(target, replace_targets):
+            continue
+        if member in layout["keep"] and os.path.isfile(target):
+            continue
+        operations.append((source, target))
+
+    operation_targets = [target for unused, target in operations]
+    prune_targets = []
+    for relative, pattern in layout["prune"]:
+        directory = _relative_path(game_root, relative)
+        for path in sorted(glob.glob(os.path.join(directory, pattern))):
+            if (os.path.isfile(path) and
+                    not _path_is_covered(path, operation_targets)):
+                prune_targets.append(path)
+
+    for unused, target in operations:
+        parent = os.path.dirname(target)
+        if not os.path.isdir(parent):
+            os.makedirs(parent)
+
+    backup_targets = []
+    for target in operation_targets + prune_targets:
+        if os.path.lexists(target) and target not in backup_targets:
+            backup_targets.append(target)
+    backups = []
+    installed = []
+    try:
+        for index, target in enumerate(backup_targets):
+            backup = os.path.join(backup_root, str(index))
+            os.replace(target, backup)
+            backups.append((target, backup))
+        for source, target in operations:
+            os.replace(source, target)
+            installed.append(target)
+    except Exception as error:
+        rollback_errors = []
+        for index, target in enumerate(reversed(installed)):
+            if not os.path.lexists(target):
+                continue
+            try:
+                os.replace(target, os.path.join(failed_root, str(index)))
+            except Exception as rollback_error:
+                rollback_errors.append(rollback_error)
+        for target, backup in reversed(backups):
+            if not os.path.lexists(backup):
+                continue
+            try:
+                parent = os.path.dirname(target)
+                if not os.path.isdir(parent):
+                    os.makedirs(parent)
+                os.replace(backup, target)
+            except Exception as rollback_error:
+                rollback_errors.append(rollback_error)
+        if rollback_errors:
+            failure = LauncherError(
+                "Installation failed and could not be fully restored. "
+                "Recovery files remain in %s." % transaction_root)
+            failure.preserve_install_staging = True
+            raise failure
+        raise LauncherError(
+            "Installation failed; the previous mod was restored: %s" % error)
+
+    actions = []
+    for target in backup_targets:
+        relative = os.path.relpath(target, game_root)
+        actions.append("Replaced the old %s" % relative)
+    return actions, len(operations)
 
 
 def install_client_mod(game_root, port_version, base_dir=None, force=False):
@@ -330,6 +644,7 @@ def install_client_mod(game_root, port_version, base_dir=None, force=False):
     never overwrites a configuration that is already there.
     """
     import shutil
+    import tempfile
     import zipfile
 
     layout = _CLIENT_INSTALL.get(port_version)
@@ -339,50 +654,56 @@ def install_client_mod(game_root, port_version, base_dir=None, force=False):
     if archive_path is None:
         raise LauncherError(
             "This launcher carries no %s mod files." % port_version)
-    identity = _payload_identity(archive_path)
-    if not force and installed_identity(game_root, port_version) == identity:
-        return ["The %s mod is already up to date." % port_version]
-
-    actions = []
-    for relative in layout["clear"]:
-        target = os.path.join(game_root, *relative.split("/"))
-        if _inside(game_root, target) and os.path.isdir(target):
-            shutil.rmtree(target)
-            actions.append("Removed the old %s" % relative)
-    for relative, pattern in layout["prune"]:
-        directory = os.path.join(game_root, *relative.split("/"))
-        if not _inside(game_root, directory):
-            continue
-        for path in sorted(glob.glob(os.path.join(directory, pattern))):
-            if os.path.isfile(path):
-                os.unlink(path)
-                actions.append("Removed the old %s" % os.path.basename(path))
-
-    written = 0
-    archive = zipfile.ZipFile(archive_path)
     try:
-        for member in archive.namelist():
-            if member.endswith("/"):
-                continue
-            target = os.path.join(game_root, *member.split("/"))
-            if not _inside(game_root, target):
-                raise LauncherError(
-                    "Refusing to write outside the game folder.")
-            if member in layout["keep"] and os.path.isfile(target):
-                continue
-            directory = os.path.dirname(target)
-            if directory and not os.path.isdir(directory):
-                os.makedirs(directory)
-            with archive.open(member) as source:
-                with open(target, "wb") as stream:
-                    shutil.copyfileobj(source, stream)
-            written += 1
+        identity = _payload_identity(archive_path)
+    except (IOError, OSError) as error:
+        raise LauncherError(
+            "The bundled %s mod cannot be read: %s" %
+            (port_version, error))
+    if (not force and installed_identity(game_root, port_version) == identity
+            and _installation_complete(game_root, port_version, layout)):
+        return ["The %s mod is already up to date." % port_version]
+    transaction_root = None
+    preserve_transaction = False
+    try:
+        try:
+            transaction_root = tempfile.mkdtemp(
+                prefix=".wot-offline-install-", dir=game_root)
+        except (IOError, OSError) as error:
+            raise LauncherError(
+                "The game folder is not writable. Move the game to a writable "
+                "folder or run the launcher with permission to update it: %s" %
+                error)
+        try:
+            archive = zipfile.ZipFile(archive_path)
+        except (IOError, OSError, zipfile.BadZipFile) as error:
+            raise LauncherError(
+                "The bundled %s mod cannot be opened: %s" %
+                (port_version, error))
+        try:
+            members = _validate_archive(
+                archive, game_root, port_version, layout)
+            staged_root = _stage_archive(
+                archive, members, game_root, transaction_root)
+        finally:
+            archive.close()
+        actions, written = _transactional_install(
+            game_root, staged_root, members, layout)
+        actions.append("Installed %d %s mod paths" % (written, port_version))
+        try:
+            _write_json(install_marker_path(game_root, port_version),
+                        {"payload": identity})
+        except (IOError, OSError):
+            actions.append(
+                "The mod was installed, but its update marker could not be saved.")
+        return actions
+    except LauncherError as error:
+        preserve_transaction = bool(getattr(
+            error, "preserve_install_staging", False))
+        raise
     finally:
-        archive.close()
-    actions.append("Installed %d %s mod files" % (written, port_version))
-    _write_json(install_marker_path(game_root, port_version),
-                {"payload": identity})
-    return actions
+        if transaction_root is not None and not preserve_transaction:
+            shutil.rmtree(transaction_root, ignore_errors=True)
 
 
 def server_script(port_version, base_dir=None):
@@ -450,15 +771,28 @@ def run_server_payload(port_version, base_dir=None):
 
 def connection_report(mode, host, port, answered):
     """Describe one connection test for the launcher window."""
+    return listener_report(
+        mode, host, port,
+        LISTENER_COMPATIBLE if answered else LISTENER_FREE)
+
+
+def listener_report(mode, host, port, status):
+    """Describe whether an endpoint is free, compatible, or occupied."""
     endpoint = "%s:%d" % (host, int(port))
     if mode == MODE_JOIN:
-        if answered:
-            return "The server at %s answered." % endpoint
+        if status == LISTENER_COMPATIBLE:
+            return "The compatible server at %s answered." % endpoint
+        if status == LISTENER_OCCUPIED:
+            return ("Something at %s answered, but it is not the server for "
+                    "this client." % endpoint)
         return ("No answer from %s. Check that the host started the battle "
                 "and that its firewall allows TCP %d." %
                 (endpoint, int(port)))
-    if answered:
-        return ("A server already listens on %s. Close it before you host "
+    if status == LISTENER_COMPATIBLE:
+        return ("A compatible server already listens on %s. Start game will "
+                "use it." % endpoint)
+    if status == LISTENER_OCCUPIED:
+        return ("Another program listens on %s. Close it before you host "
                 "here." % endpoint)
     return ("Nothing listens on %s yet. Start game runs the server there." %
             endpoint)
@@ -478,6 +812,81 @@ def probe_endpoint(host, port, timeout=1.5, connect=None):
     return True
 
 
+def probe_server_protocol(port_version, host, port, timeout=1.5, connect=None):
+    """Report whether the endpoint speaks the selected client's LAN protocol."""
+    contract = _SERVER_PROBES.get(port_version)
+    if contract is None:
+        return False
+    connect = connect or socket.create_connection
+    connection = None
+    try:
+        connection = connect((host, int(port)), timeout)
+        settimeout = getattr(connection, "settimeout", None)
+        if callable(settimeout):
+            settimeout(timeout)
+        hello = {
+            "type": "hello",
+            "protocol": contract["protocol"],
+            "client_build": contract["client_build"],
+            "name": "Launcher-Probe",
+            "vehicle": contract["vehicle"],
+            "max_health": 1,
+        }
+        if contract["capabilities"] is not None:
+            hello["capabilities"] = list(contract["capabilities"])
+        connection.sendall(
+            (json.dumps(hello, separators=(",", ":")) + "\n").encode(
+                "utf-8"))
+        payload = b""
+        while b"\n" not in payload and len(payload) < 256 * 1024:
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            payload += chunk
+        line, separator, unused = payload.partition(b"\n")
+        if not separator:
+            return False
+        reply = json.loads(line.decode("utf-8"))
+        if (not isinstance(reply, dict) or reply.get("type") != "welcome" or
+                int(reply.get("protocol", -1)) != contract["protocol"] or
+                reply.get("client_build") != contract["client_build"]):
+            return False
+        capabilities = contract["capabilities"]
+        compatible = (capabilities is None or set(capabilities).issubset(
+            set(reply.get("capabilities") or ())))
+        if compatible:
+            try:
+                connection.sendall(b'{"type":"leave"}\n')
+                shutdown = getattr(connection, "shutdown", None)
+                if callable(shutdown):
+                    shutdown(socket.SHUT_WR)
+                while connection.recv(4096):
+                    pass
+            except (IOError, OSError, socket.error):
+                pass
+        return compatible
+    except (IOError, OSError, TypeError, ValueError, socket.error):
+        return False
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except (IOError, OSError, socket.error):
+                pass
+
+
+def listener_status(port_version, host, port, timeout=1.5,
+                    endpoint_probe=None, protocol_probe=None):
+    """Classify a free port, a matching server, or an unrelated listener."""
+    endpoint_probe = endpoint_probe or probe_endpoint
+    protocol_probe = protocol_probe or probe_server_protocol
+    if not endpoint_probe(host, port, timeout=timeout):
+        return LISTENER_FREE
+    if protocol_probe(port_version, host, port, timeout=timeout):
+        return LISTENER_COMPATIBLE
+    return LISTENER_OCCUPIED
+
+
 def wait_for_listener(host, port, timeout=20.0, interval=0.25, connect=None,
                       clock=None, sleep=None):
     """Wait until the local server accepts a connection."""
@@ -488,6 +897,23 @@ def wait_for_listener(host, port, timeout=20.0, interval=0.25, connect=None,
     deadline = clock() + float(timeout)
     while True:
         if probe_endpoint(host, port, timeout=interval, connect=connect):
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(interval)
+
+
+def wait_for_server(port_version, host, port, timeout=20.0, interval=0.25,
+                    probe=None, clock=None, sleep=None):
+    """Wait until the selected client's protocol answers at the endpoint."""
+    import time as time_module
+
+    probe = probe or probe_server_protocol
+    clock = clock or time_module.monotonic
+    sleep = sleep or time_module.sleep
+    deadline = clock() + float(timeout)
+    while True:
+        if probe(port_version, host, port, timeout=interval):
             return True
         if clock() >= deadline:
             return False
