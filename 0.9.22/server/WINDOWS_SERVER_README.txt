@@ -14,6 +14,14 @@ The server always listens on 0.0.0.0:28782, supports up to 30 players, and
 selects a supported map at random. Keep the console window open while playing.
 Press Ctrl+C or close the window to stop the server.
 
+Server-hosted bots: when the server can read the baked map data, it runs the
+bot simulation itself and every client (including the host PC's) renders as a
+lightweight follower. The launcher sets this up automatically. For a
+standalone EXE, either set WOT_0922_SERVER_DATA to the client install's
+mods\configs\offline_lan_0922 folder, or copy that folder to a directory
+named "data" beside the EXE. Without the data the server still works and
+falls back to running the bots on the first connected client.
+
 If the server exits immediately, port 28782 may already be in use. Close the
 other server instance and try again.
 

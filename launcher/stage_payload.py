@@ -30,8 +30,11 @@ PAYLOAD_FILES = {
         "scripts/client/gui/mods/offhangar/bot_ai_navigation.py",
     ),
     "0.9.22": (
+        "server/descriptor_projection.py",
         "server/lan_battle_server.py",
+        "server/server_battle_authority.py",
         "server/server_bot_ai.py",
+        "server/server_world.py",
         "server/windows_server.py",
     ),
 }

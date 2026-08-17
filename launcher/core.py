@@ -52,6 +52,10 @@ _NAVGRAPH_RELATIVE_DIR = os.path.join(
     "res_mods", "0.8.2", "scripts", "client", "gui", "mods", "offhangar",
     "navgraphs")
 
+SERVER_DATA_ENV_0922 = "WOT_0922_SERVER_DATA"
+_SERVER_DATA_RELATIVE_DIR_0922 = os.path.join(
+    "mods", "configs", "offline_lan_0922")
+
 _SERVER_ENTRIES = {
     PORT_0_8_2: (os.path.join("0.8.2"), "lan_battle_server.py"),
     PORT_0_9_22: (os.path.join("0.9.22", "server"), "windows_server.py"),
@@ -398,11 +402,14 @@ def server_argv(port_version, base_dir=None):
 
 
 def server_environment(port_version, game_root, environment=None):
-    """Point the 0.8.2 server at the navigation graphs of this client."""
+    """Point each server at the baked data installed with its client."""
     environment = dict(os.environ if environment is None else environment)
     if port_version == PORT_0_8_2:
         environment[NAVGRAPH_DIR_ENV] = os.path.join(
             game_root, _NAVGRAPH_RELATIVE_DIR)
+    elif port_version == PORT_0_9_22:
+        environment[SERVER_DATA_ENV_0922] = os.path.join(
+            game_root, _SERVER_DATA_RELATIVE_DIR_0922)
     return environment
 
 

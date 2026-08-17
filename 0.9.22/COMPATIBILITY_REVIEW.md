@@ -926,6 +926,40 @@ finalized 0.8.2 spawn-congestion/OBB, reverse-steering and baked-route changes
 are migrated as source-derived changes; real-client acceptance still has to
 check them against #1513 terrain and presentation timing.
 
+## Server-hosted bot authority
+
+When every prerequisite is donated, the standalone Python 3 server itself owns
+the bot authority under the reserved identity 0, and every connected client
+runs in follower mode. The server hosts the same engine-free simulation the
+elected client ran (BotRuntime, artillery arc queue, projectile ledger, combat
+and critical-damage law) on its fixed 30 Hz tick, and feeds the results
+through the same admission methods, so the wire protocol and follower
+rendering are unchanged. World queries are answered from the shipped baked
+navigation graphs, destructible catalogs and foliage maps; the launcher points
+the server at the client install's `mods/configs/offline_lan_0922` tree
+through `WOT_0922_SERVER_DATA`. Capture bases come from the navigation
+graph's `objective_bases`.
+
+Vehicle data stays interpreted only on the #1513 client. A client donates the
+eligible-vehicle catalog (`descriptor_catalog`) after joining; at battle start
+the server runs the mirrored 0.8.2 lineup law over that catalog and asks the
+room host for the round's descriptor projections (`descriptor_request` /
+`descriptor_bundle`) during the loading barrier. A round without a catalog, a
+baked world, or a completed bundle falls back to the previous client
+election, and a donor that disconnects mid-request does the same.
+
+Server-side world answers replace native probes with baked data. Direction
+corridors, world receipts and obstacle sweeps use graph links and heights;
+line of sight and firing lanes use the height field plus catalog structure
+boxes and baked foliage concealment; SPG arcs are proved against the same
+surfaces. Bot shots resolve against hull oriented boxes with donated
+`primaryArmor` per face instead of native per-plate hit testers, and bot
+muzzles are approximated from donated mount offsets instead of the native
+`HP_gunFire` node. Crushable fragile/falling props are excluded from baked
+links, so bots plan through them, but the server does not yet destroy them or
+occlude with them. These are deliberate fidelity boundaries; only acceptance
+on the exact Windows client can judge them.
+
 ## Known deterministic parity gaps
 
 The source audit deliberately keeps the following differences visible:

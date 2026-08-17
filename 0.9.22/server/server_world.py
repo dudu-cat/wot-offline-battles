@@ -42,10 +42,15 @@ _NEIGHBOUR_BITS = dict(
 
 
 def default_data_dir():
-    """Resolve the baked-data root: env override, then the port tree."""
+    """Resolve the baked-data root: env, packaged data, then the port tree."""
     override = os.environ.get('WOT_0922_SERVER_DATA')
     if override:
         return override
+    if getattr(sys, 'frozen', False):
+        packaged = os.path.join(
+            os.path.dirname(os.path.abspath(sys.executable)), 'data')
+        if os.path.isdir(packaged):
+            return packaged
     return _PORT_ROOT
 
 

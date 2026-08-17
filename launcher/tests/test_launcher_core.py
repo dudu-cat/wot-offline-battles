@@ -246,12 +246,16 @@ class ServerPayloadTest(unittest.TestCase):
                                    "/repo/launcher/wot_launcher.py",
                                    core.SERVE_FLAG, core.PORT_0_9_22])
 
-    def test_only_the_0_8_2_server_receives_the_navigation_graph_directory(self):
+    def test_each_server_receives_its_client_baked_data_directory(self):
         environment = core.server_environment(core.PORT_0_8_2, "/game", {})
         self.assertTrue(environment[core.NAVGRAPH_DIR_ENV].endswith("navgraphs"))
         self.assertIn("/game", environment[core.NAVGRAPH_DIR_ENV])
-        self.assertEqual(
-            core.server_environment(core.PORT_0_9_22, "/game", {}), {})
+        self.assertNotIn(core.SERVER_DATA_ENV_0922, environment)
+        environment = core.server_environment(core.PORT_0_9_22, "/game", {})
+        self.assertTrue(environment[core.SERVER_DATA_ENV_0922].endswith(
+            os.path.join("configs", "offline_lan_0922")))
+        self.assertIn("/game", environment[core.SERVER_DATA_ENV_0922])
+        self.assertNotIn(core.NAVGRAPH_DIR_ENV, environment)
 
     def test_missing_payload_reports_a_launcher_error(self):
         self.assertRaises(core.LauncherError, core.run_server_payload,
