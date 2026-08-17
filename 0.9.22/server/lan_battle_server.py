@@ -1223,21 +1223,31 @@ class BattleState:
             if player is None or not player.connected:
                 return False
             rows = message.get("vehicles")
-            if not isinstance(rows, list) or not rows or len(rows) > 600:
+            if not isinstance(rows, list) or not rows or len(rows) > 1024:
+                _server_log(
+                    "DESCRIPTOR CATALOG rejected id=%d rows=%s" % (
+                        player_id, len(rows) if isinstance(rows, list)
+                        else type(rows).__name__))
                 return False
             catalog = []
             seen = set()
-            for raw in rows:
+            for index, raw in enumerate(rows):
                 if not isinstance(raw, dict):
+                    _server_log(
+                        "DESCRIPTOR CATALOG rejected id=%d row=%d: "
+                        "not an object" % (player_id, index))
                     return False
                 name = _safe_vehicle(raw.get("name"), "")
                 try:
                     level = int(raw.get("level"))
                 except (TypeError, ValueError):
-                    return False
+                    level = 0
                 tags = raw.get("tags")
                 if (not name or name in seen or not 1 <= level <= 10 or
                         not isinstance(tags, list) or len(tags) > 32):
+                    _server_log(
+                        "DESCRIPTOR CATALOG rejected id=%d row=%d: %r" % (
+                            player_id, index, raw.get("name")))
                     return False
                 seen.add(name)
                 catalog.append({
@@ -1245,6 +1255,8 @@ class BattleState:
                     "tags": tuple(sorted(str(tag)[:32] for tag in tags)),
                 })
             self.vehicle_catalogs[player_id] = tuple(catalog)
+            _server_log("DESCRIPTOR CATALOG stored id=%d rows=%d" % (
+                player_id, len(catalog)))
             return True
 
     def store_destructible_map(self, player_id, message):

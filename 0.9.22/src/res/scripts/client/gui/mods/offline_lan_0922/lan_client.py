@@ -1181,7 +1181,7 @@ class LANClient(object):
         if not self.ready:
             return False
         return self._send({'type': 'descriptor_catalog',
-                           'vehicles': list(vehicles or ())[:600]})
+                           'vehicles': list(vehicles or ())[:1024]})
 
     def send_descriptor_bundle(self, projections, requested=None,
                                failures=None, complete=True):

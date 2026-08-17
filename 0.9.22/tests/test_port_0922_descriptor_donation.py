@@ -284,6 +284,22 @@ class DonationFlowTest(unittest.TestCase):
 
 
 class CatalogValidationTest(unittest.TestCase):
+    def test_catalog_accepts_the_full_1513_vehicle_list(self):
+        # The pinned #1513 client lists 680 vehicles across ten nations.
+        state = BattleState(map_name='01_karelia')
+        state.client_build = CLIENT_BUILD_0922
+        state.players[1] = _player(1)
+        rows = [{'name': 'nation%d:Tank_%d' % (index % 10, index),
+                 'level': 1 + index % 10, 'tags': ['lightTank']}
+                for index in range(680)]
+        self.assertTrue(state.store_vehicle_catalog(1, {'vehicles': rows}))
+        self.assertEqual(680, len(state.vehicle_catalogs[1]))
+
+        oversized = [{'name': 'nation%d:Tank_%d' % (index % 10, index),
+                      'level': 1, 'tags': []} for index in range(1025)]
+        self.assertFalse(state.store_vehicle_catalog(
+            1, {'vehicles': oversized}))
+
     def test_rejects_malformed_rows(self):
         state = BattleState(map_name='01_karelia')
         state.client_build = CLIENT_BUILD_0922

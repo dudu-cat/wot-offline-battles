@@ -1057,6 +1057,8 @@ class LANSession(object):
         """Donate the eligible-vehicle catalog for server-side lineups."""
         runtime = self._donation_runtime()
         if runtime is None:
+            print('[Offline LAN 0.9.22] vehicle catalog donation skipped: '
+                  'the compatibility runtime is not installed')
             return
         try:
             from gui.mods.offline_lan_0922 import descriptor_donation
@@ -1065,8 +1067,13 @@ class LANSession(object):
             print('[Offline LAN 0.9.22] vehicle catalog donation '
                   'failed: %s' % error)
             return
-        if rows:
-            self.client.send_descriptor_catalog(rows)
+        if not rows:
+            print('[Offline LAN 0.9.22] vehicle catalog donation skipped: '
+                  'the runtime vehicle list is empty')
+            return
+        if not self.client.send_descriptor_catalog(rows):
+            print('[Offline LAN 0.9.22] vehicle catalog donation was not '
+                  'accepted by the transport (%d rows)' % len(rows))
 
     def _donate_descriptors(self, message):
         """Answer one server request for battle descriptor projections."""
