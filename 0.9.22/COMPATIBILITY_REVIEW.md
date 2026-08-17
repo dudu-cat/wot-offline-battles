@@ -617,7 +617,7 @@ Every native call is proved in exact build #1513:
 | Interface | Exact evidence |
 | --- | --- |
 | `GUI.Simple(texture)`, `GUI.Window(texture)`, `GUI.Text(value)` and the component properties used here | `scripts/client/PostProcessing/ChainView.pyc`, `scripts/client/bwobsolete_tests/GUITest.pyc`, `scripts/client/bwobsolete_helpers/PyGUI/Utils.pyc` |
-| Texture source name `system/maps/col_white.bmp` with 0-255 int `colour` tuples | in-game IME surfaces `CandidateWindow.__init__` (`bwobsolete_helpers/PyGUI/IME.pyc`) and `LanguageIndicator.create` (`LanguageIndicator.pyc`); the packed member is `system/maps/col_white.dds` in `res/packages/misc.pkg`, and passing that packed name rendered untinted white on the real #1513 client |
+| Untextured flat colour (empty texture with `SOLID` and 0-255 int `colour` tuples) | `EffectView.createPhase` constructs `GUI.Window('')` and `ChainView.displayAlpha` sets `textureName = ''`, both in `scripts/client/PostProcessing/ChainView.pyc`; `col_white` texture names (packed `.dds` and source `.bmp`) rendered untinted white on the real #1513 client, and the flat-colour result still needs visual confirmation there |
 | Font `default_small.font` | `system/fonts/default_small.font` package member |
 | `GUI.addRoot`, `GUI.delRoot`, `GUI.reSort` and an overlay at `position.z = 0.1` with `focus` and `moveFocus` | `scripts/client/new_year/fade_window.pyc` |
 | `handleMouseClickEvent`, `handleMouseEnterEvent`, `handleMouseLeaveEvent`, `handleMouseButtonEvent` | `scripts/client/PostProcessing/ChainView.pyc` |

@@ -813,6 +813,9 @@ class LANSession(object):
             self._clear_pending_battle_start()
             self._starting_round_id = None
             if self._battle_started:
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] LAN round %r ended: the server '
+                    'returned the room to waiting\n' % (self._active_round_id,))
                 try:
                     self._stop_active_round()
                 except Exception:
@@ -961,6 +964,9 @@ class LANSession(object):
         """Retire one local round while retaining the waiting-room socket."""
         if self._stopped or not self._battle_started:
             return False
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] local player left LAN round %r\n' %
+            (self._active_round_id,))
         self._departed_round_id = self._active_round_id
         errors = []
         try:
@@ -1006,6 +1012,11 @@ class LANSession(object):
         self._start_requested = False
         self._pending_map = None
         reason = _message_value(message, 'message', 'unknown error')
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] battle aborted for round %r: %s '
+            '(lobby_restored=%r)\n' %
+            (round_id, reason,
+             bool(_message_value(message, 'lobby_restored', False))))
 
         if bool(_message_value(message, 'lobby_restored', False)):
             leave = getattr(self.client, 'leave_battle', None)
@@ -1183,6 +1194,9 @@ class LANSession(object):
         if self._authority_fallback_notice == key:
             return False
         self._authority_fallback_notice = key
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] LAN server ended round %r: authority '
+            'prerequisites failed (%s)\n' % (message.get('round_id'), reason))
         self._status_notifier(
             'The LAN server ended the battle: server authority '
             'prerequisites failed (%s).' % reason)

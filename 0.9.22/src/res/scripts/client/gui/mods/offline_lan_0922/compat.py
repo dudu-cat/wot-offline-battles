@@ -75,7 +75,10 @@ def _sanitize_account_filters(account_settings=None):
     """Make every saved lobby filter carry exactly the default keys."""
     import copy
     if account_settings is None:
-        from account_helpers import AccountSettings as account_settings
+        # account_helpers/__init__ shadows the submodule name with the class,
+        # so resolve the module the way the interpreter recorded it.
+        import account_helpers.AccountSettings  # noqa: F401
+        account_settings = sys.modules['account_helpers.AccountSettings']
     settings_type = account_settings.AccountSettings
     defaults = account_settings.DEFAULT_VALUES[account_settings.KEY_FILTERS]
     repaired = []
@@ -84,21 +87,22 @@ def _sanitize_account_filters(account_settings=None):
             continue
         saved = settings_type.getFilter(name)
         if isinstance(saved, dict):
-            unknown = [key for key in saved if key not in default]
-            missing = [key for key in default if key not in saved]
+            unknown = sorted(key for key in saved if key not in default)
+            missing = sorted(key for key in default if key not in saved)
             if not unknown and not missing:
                 continue
             value = dict((key, saved[key]) for key in saved
                          if key in default)
             for key in missing:
                 value[key] = copy.deepcopy(default[key])
+            print('[Offline LAN 0.9.22] repaired saved lobby filter %s: '
+                  'dropped %r, added %r' % (name, unknown, missing))
         else:
             value = copy.deepcopy(default)
+            print('[Offline LAN 0.9.22] replaced non-mapping saved lobby '
+                  'filter %s (%r)' % (name, type(saved).__name__))
         settings_type.setFilter(name, value)
         repaired.append(name)
-    if repaired:
-        print('[Offline LAN 0.9.22] repaired saved lobby filters: %s' %
-              ', '.join(sorted(repaired)))
     return repaired
 
 

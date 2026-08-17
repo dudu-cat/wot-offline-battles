@@ -6,6 +6,7 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 import tempfile
+import types
 import unittest
 import zlib
 
@@ -285,6 +286,38 @@ class AccountRpcTests(unittest.TestCase):
         self.assertEqual(['CAROUSEL_FILTER_2'], repaired)
         self.assertEqual({'CAROUSEL_FILTER_2': {
             'elite': True, 'favorite': False}}, writes)
+
+    def test_filter_sanitizer_resolves_the_shadowed_settings_module(self):
+        # account_helpers/__init__ in #1513 rebinds the submodule name to the
+        # AccountSettings class, so the default import must use sys.modules.
+        writes = {}
+
+        class _Settings(object):
+            @staticmethod
+            def getFilter(name):
+                return {'stale': 1}
+
+            @staticmethod
+            def setFilter(name, value):
+                writes[name] = value
+
+        module = types.ModuleType('account_helpers.AccountSettings')
+        module.AccountSettings = _Settings
+        module.KEY_FILTERS = 'FILTERS'
+        module.DEFAULT_VALUES = {'FILTERS': {'CAROUSEL_FILTER_2': {
+            'elite': False}}}
+        package = types.ModuleType('account_helpers')
+        package.AccountSettings = _Settings
+        sys.modules['account_helpers'] = package
+        sys.modules['account_helpers.AccountSettings'] = module
+        try:
+            repaired = compatibility._sanitize_account_filters()
+        finally:
+            sys.modules.pop('account_helpers', None)
+            sys.modules.pop('account_helpers.AccountSettings', None)
+
+        self.assertEqual(['CAROUSEL_FILTER_2'], repaired)
+        self.assertEqual({'CAROUSEL_FILTER_2': {'elite': False}}, writes)
 
     def test_filter_sanitizer_replaces_a_non_mapping_saved_filter(self):
         defaults = {'CAROUSEL_FILTER_2': {'elite': False}}
