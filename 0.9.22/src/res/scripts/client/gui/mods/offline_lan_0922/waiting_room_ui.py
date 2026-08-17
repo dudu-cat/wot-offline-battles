@@ -150,7 +150,9 @@ class WaitingRoomUI(object):
         self._set(panel, 'verticalAnchor', 'CENTER')
         self._set(panel, 'width', 680)
         self._set(panel, 'height', 300)
-        self._set(panel, 'materialFX', 'BLEND')
+        # 0.8.2 renders this exact palette with SOLID; BLEND left the panel
+        # untinted white on the real #1513 client.
+        self._set(panel, 'materialFX', 'SOLID')
         self._set(panel, 'colour', (5, 12, 20, 245))
         self._set(panel, 'position', (0.0, 0.0, OVERLAY_Z))
         # The children own every mouse target, matching the reviewed 0.8.2 room.
@@ -214,7 +216,7 @@ class WaitingRoomUI(object):
                 ('widthMode', 'CLIP'), ('heightMode', 'CLIP'),
                 ('horizontalAnchor', 'CENTER'), ('verticalAnchor', 'CENTER'),
                 ('position', position), ('width', width), ('height', height),
-                ('materialFX', 'BLEND'), ('colour', (24, 55, 78, 245)),
+                ('materialFX', 'SOLID'), ('colour', (24, 55, 78, 245)),
                 ('focus', True), ('mouseButtonFocus', True),
                 ('crossFocus', True), ('moveFocus', True),
                 ('visible', False)):
