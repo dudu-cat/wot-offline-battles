@@ -33,6 +33,9 @@ _CLIENT_SCRIPT_ROOT = os.path.join(
 if _CLIENT_SCRIPT_ROOT not in sys.path:
     sys.path.insert(0, _CLIENT_SCRIPT_ROOT)
 
+import server_world
+from descriptor_projection import DescriptorStore
+from server_battle_authority import SERVER_AUTHORITY_ID, ServerBattleAuthority
 from server_bot_ai import BotPlanner
 from gui.mods.offline_lan_0922.ai.maps import get_tactical_map
 from gui.mods.offline_lan_0922.ai.maps_0922_extra import (
@@ -514,6 +517,8 @@ class BattleState:
         self.bot_states = {}
         self.bot_state_revision = 0
         self.bot_planner = BotPlanner()
+        self.server_authority = None
+        self.descriptor_store = DescriptorStore()
         self.bot_orders = {"revision": 0, "orders": []}
         self.bot_reported_hits = set()
         self.bot_reported_rams = set()
@@ -696,10 +701,14 @@ class BattleState:
         return roster
 
     def _elect_bot_authority(self):
-        connected = sorted(
-            p.player_id for p in self.players.values()
-            if p.connected and
-            (self.phase not in ("loading", "battle") or p.participating))
+        if (self.server_authority is not None and
+                self.client_build == CLIENT_BUILD_0922):
+            connected = [SERVER_AUTHORITY_ID]
+        else:
+            connected = sorted(
+                p.player_id for p in self.players.values()
+                if p.connected and
+                (self.phase not in ("loading", "battle") or p.participating))
         old = self.bot_authority_id
         self.bot_authority_id = connected[0] if connected else None
         if (old != self.bot_authority_id and
@@ -906,6 +915,7 @@ class BattleState:
         self.bot_states = {}
         self.bot_state_revision = 0
         self.bot_planner.reset()
+        self.server_authority = None
         self.bot_orders = {"revision": 0, "orders": []}
         self.bot_reported_hits = set()
         self.bot_reported_rams = set()
@@ -987,7 +997,12 @@ class BattleState:
             self.roster_finalized = True
             self.phase = ("loading" if self.client_build == CLIENT_BUILD_0922
                           else "battle")
+            self._prepare_server_authority()
             self._elect_bot_authority()
+            if self.server_authority is not None:
+                if not self._start_server_authority():
+                    self.server_authority = None
+                    self._elect_bot_authority()
             self.state_revision += 1
             start_message = {
                 "type": "battle_start",
@@ -1017,6 +1032,47 @@ class BattleState:
                     "server_time_ms": self._server_time_ms(),
                 })
             return start_message, None
+
+    def _prepare_server_authority(self):
+        """Build this round's server-hosted authority when it can own bots."""
+        self.server_authority = None
+        if self.client_build != CLIENT_BUILD_0922:
+            return
+        if not len(self.descriptor_store):
+            return
+        try:
+            world = server_world.load_world(self.map_name)
+        except Exception as error:
+            _server_log("server authority world load failed: %s" % error)
+            return
+        if world is None:
+            _server_log(
+                "server authority has no baked world for %s" % self.map_name)
+            return
+        self.server_authority = ServerBattleAuthority(
+            self, world, self.descriptor_store)
+
+    def _start_server_authority(self):
+        authority = self.server_authority
+        message = {
+            "round_id": self.round_id,
+            "map": self.map_name,
+            "bots": list(self.bot_roster),
+            "bot_manifest": [],
+            "bot_authority_id": SERVER_AUTHORITY_ID,
+            "bot_order_revision": self.bot_orders["revision"],
+            "bot_orders": list(self.bot_orders["orders"]),
+            "battle_result": self.battle_result,
+        }
+        try:
+            authority.battle_start(message, float(self.tick) / TICK_HZ)
+        except Exception as error:
+            _server_log("server authority start failed: %s" % error)
+            return False
+        bases = self._sanitize_capture_bases(authority.capture_bases())
+        if bases:
+            self.capture_bases = bases
+        return True
 
     def _activate_battle_if_ready(self):
         if self.phase != "loading":
@@ -4052,6 +4108,11 @@ class BattleState:
             self._update_capture()
             for player in list(self.players.values()):
                 self._apply_movement(player, dt)
+            if self.server_authority is not None:
+                self.server_authority.update(
+                    dt, float(self.tick) / TICK_HZ,
+                    live=(self.battle_result is None and
+                          self._timing_payload()["phase"] == "battle"))
             if self.battle_result is None:
                 self.bot_orders = self.bot_planner.build_orders(
                     self.bot_manifest, list(self.bot_states.values()),
@@ -4096,6 +4157,11 @@ class BattleState:
                     "projectile_revision": self.projectile_revision,
                     "projectiles": self._projectile_snapshot(),
                 })
+            if self.server_authority is not None:
+                authority_view = dict(snapshot)
+                authority_view["bots"] = [
+                    dict(value) for value in snapshot["bots"]]
+                self.server_authority.apply_snapshot(authority_view)
             events_message = None
             if events:
                 events_message = {
