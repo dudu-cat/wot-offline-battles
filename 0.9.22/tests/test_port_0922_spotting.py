@@ -13,6 +13,9 @@ from gui.mods.offline_lan_0922 import spotting
 
 class SpottingTests(unittest.TestCase):
 
+    def test_no_skill_memory_uses_the_guaranteed_ten_second_bound(self):
+        self.assertEqual(10.0, spotting.SPOT_MEMORY_SECONDS)
+
     def test_base_camouflage_uses_legacy_crew_curve_and_additive_paint(self):
         moving, still = spotting.base_camouflage(
             0.288, 0.300, crew_skill_level=0.0,

@@ -6646,7 +6646,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._binding.set_vehicle_pose.assert_not_called()
         self.assertEqual(0.60, battle._records['bot:17']['state']['yaw'])
 
-    def test_enemy_spotting_controls_model_marker_and_five_second_memory(self):
+    def test_enemy_spotting_controls_model_marker_and_ten_second_memory(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle.client = _Client()
@@ -6700,7 +6700,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.bigworld.wg_collideSegment = lambda *unused: (_Vector(),)
         self.assertFalse(battle._update_spotting(10.9))
         self.assertTrue(enemy.model.visible)
-        self.assertTrue(battle._update_spotting(15.5))
+        self.assertFalse(battle._update_spotting(15.5))
+        self.assertTrue(enemy.model.visible)
+        self.assertTrue(battle._update_spotting(20.5))
         self.assertFalse(enemy.model.visible)
         battle._binding.stop_vehicle_visual.assert_called_once_with(
             1000, False)
@@ -6708,7 +6710,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         # Reacquiring the same target is presentation visibility, not a new
         # first-spot ribbon or detection sound.
         runtime.bigworld.wg_collideSegment = lambda *unused: None
-        self.assertTrue(battle._update_spotting(15.9))
+        self.assertTrue(battle._update_spotting(20.9))
         self.assertEqual(1, len(battle._avatar.battle_events))
 
     def test_team_relay_visibility_does_not_claim_a_direct_spot(self):

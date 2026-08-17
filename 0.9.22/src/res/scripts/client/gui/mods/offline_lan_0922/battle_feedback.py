@@ -10,7 +10,10 @@ hangar while the #1513 lifecycle remains under BattleRuntime control.
 """
 
 
-OBSERVATION_SECONDS = 5.0
+# Match the deterministic no-skill visibility hold.  A repeated authority
+# observation inside this window is one continuous spotting episode, not a
+# second Sixth Sense notification.
+OBSERVATION_SECONDS = 10.0
 SIXTH_SENSE_DELAY_SECONDS = 3.0
 
 

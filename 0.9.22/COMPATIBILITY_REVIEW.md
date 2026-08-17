@@ -803,7 +803,9 @@ pose is sent per rendered frame, so recovery from a slow frame never bursts
 stale samples.
 
 The player-visible spotting path now copies the 0.8.2 50-metre proximity,
-two-height static LOS, allied observer relay and five-second memory law. Enemy
+two-height static LOS and allied observer relay. Its deterministic no-skill
+memory uses the historical 5--10 second rule's guaranteed ten-second
+disappearance bound. Enemy
 compound models and their stock marker/minimap visuals cross one visibility
 boundary, so an unspotted vehicle cannot remain visible in only one UI layer.
 Authority Bot snapshots also retain the 0.8.2 no-rewind rule: the client that

@@ -66,7 +66,7 @@ class SixthSenseTests(unittest.TestCase):
         self.scheduler.invoke(token)
         self.assertEqual([True], self.presenter.values)
 
-        # The repeated sighting extended the five-second observed window.
+        # The repeated sighting extended the ten-second observed window.
         self.assertTrue(self.controller.observe(
             True, 10.0 + OBSERVATION_SECONDS * 2.0))
 
@@ -97,7 +97,8 @@ class SixthSenseTests(unittest.TestCase):
         self.assertEqual([], self.presenter.values)
 
         self.alive[0] = True
-        self.assertTrue(self.controller.observe(True, 7.0))
+        self.assertTrue(self.controller.observe(
+            True, 1.0 + OBSERVATION_SECONDS + 0.1))
         token = list(self.scheduler.callbacks)[0]
         self.battle[0] = False
         self.scheduler.invoke(token)

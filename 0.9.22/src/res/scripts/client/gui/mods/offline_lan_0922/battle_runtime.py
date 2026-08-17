@@ -7776,7 +7776,7 @@ class BattleRuntime(object):
         return True
 
     def _update_spotting(self, now):
-        """Copy 0.8.2 proximity, team relay, LOS and five-second memory."""
+        """Apply proximity, team relay, LOS and ten-second spot memory."""
         if now < self._next_spotting_time:
             return False
         if self._next_spotting_time <= 0.0:

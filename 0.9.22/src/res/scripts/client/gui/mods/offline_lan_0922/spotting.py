@@ -4,7 +4,10 @@
 
 PROXIMITY_SPOT_DISTANCE = 50.0
 MAX_SPOT_DISTANCE = 500.0
-SPOT_MEMORY_SECONDS = 5.0
+# Retail #1513 varied the post-detection hold within a 5-10 second window.
+# Use its no-skill guaranteed-disappearance bound so deterministic LAN peers
+# never hide a target earlier than the retail rule allowed.
+SPOT_MEMORY_SECONDS = 10.0
 MOVING_SPEED_EPSILON = 0.5
 SHOT_CAMOUFLAGE_SECONDS = 0.75
 
