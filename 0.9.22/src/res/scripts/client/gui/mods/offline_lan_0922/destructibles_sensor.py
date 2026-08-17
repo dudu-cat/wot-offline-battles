@@ -1965,6 +1965,8 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 								'boxes': _world_boxes,
 								'item_scale': _item_scale,
 								'box_index': _instance_box_index,
+								'signature': (tuple(_signature)
+									if _signature is not None else None),
 								'chunk_translation': (
 									float(_cm_t.x), float(_cm_t.y), float(_cm_t.z)),
 							}
@@ -2119,6 +2121,74 @@ def _solid_destructible_candidate_1513(mat_info, contact_pt,
 		_hit_normal.y * contact_normal.y +
 		_hit_normal.z * contact_normal.z)
 	return abs(_dot) >= _SOLID_CONTACT_NORMAL_DOT_1513
+
+
+def donation_rows_1513():
+	"""Project the registered native identities and scaled healths to JSON.
+
+	The server authority reproduces the retail crush and shot-through laws
+	only from these values, so every health is scaled here with the native
+	DestructiblesCache law rather than re-derived elsewhere.
+	"""
+	import AreaDestructibles
+	import DestructiblesCache
+	instances = globals().get('g_offh_destr_instances', {})
+	if not instances:
+		return None
+	tree_type = getattr(AreaDestructibles, 'DESTR_TYPE_TREE', None)
+	falling_type = getattr(AreaDestructibles, 'DESTR_TYPE_FALLING_ATOM', None)
+	fragile_type = getattr(AreaDestructibles, 'DESTR_TYPE_FRAGILE', None)
+	resources = {}
+	rows = []
+	for key in sorted(instances):
+		chunk_id, item_index = key
+		instance = instances[key]
+		signature = instance.get('signature')
+		scale = instance.get('item_scale')
+		fname = instance.get('descriptor_filename')
+		if signature is None or scale is None or not fname:
+			continue
+		desc = AreaDestructibles.g_cache.getDescByFilename(fname)
+		if desc is None:
+			continue
+		scaled_health = None
+		modules = None
+		if instance['kind'] == 'structure':
+			modules = {}
+			for mat_kind, module in (desc.get('modules') or {}).items():
+				modules[str(int(mat_kind))] = [
+					float(DestructiblesCache.scaledDestructibleHealth(
+						scale, module['health'])),
+					float(module.get('armor', 0.0) or 0.0)]
+		else:
+			scaled_health = float(DestructiblesCache.scaledDestructibleHealth(
+				scale, desc['health']))
+		normalized = instance['filename']
+		if normalized not in resources:
+			desc_type = desc.get('type')
+			if desc_type == tree_type:
+				destr_type = 'tree'
+			elif desc_type == falling_type:
+				destr_type = 'column'
+			elif desc_type == fragile_type:
+				destr_type = 'fragile'
+			else:
+				destr_type = 'structure'
+			resources[normalized] = {
+				'destr_type': destr_type,
+				'kinetic_correction': float(
+					desc.get('kineticDamageCorrection', 0.0) or 0.0),
+			}
+		rows.append([list(signature), int(chunk_id), int(item_index),
+			scaled_health, modules])
+	if not rows:
+		return None
+	return {
+		'unit_vehicle_mass': float(
+			AreaDestructibles.g_cache.unitVehicleMass),
+		'resources': resources,
+		'instances': rows,
+	}
 
 
 def _registered_item_scale_1513(chunkID, itemIndex, filename):

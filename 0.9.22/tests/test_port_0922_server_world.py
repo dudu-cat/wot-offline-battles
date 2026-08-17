@@ -32,11 +32,11 @@ def _graph(width=6, height=6, cell_size=4.0, origin=(0.0, 0.0),
         'spawn_anchors': ((0.0, 0.0), (span, span)),
         'objective_bases': ((span, span), (0.0, 0.0)),
         'spawn_formations': {
-            '1': tuple((float(slot % 5) * 4.0, 0.0,
-                        float(slot // 5) * 4.0, 0.0)
+            '1': tuple((float(slot % 5) * 12.0, 0.0,
+                        -60.0 - float(slot // 5) * 12.0, 0.0)
                        for slot in range(15)),
-            '2': tuple((float(slot % 5) * 4.0, 0.0,
-                        span - float(slot // 5) * 4.0, 3.14159)
+            '2': tuple((float(slot % 5) * 12.0, 0.0,
+                        span + 60.0 + float(slot // 5) * 12.0, 3.14159)
                        for slot in range(15)),
         },
         'routes': {

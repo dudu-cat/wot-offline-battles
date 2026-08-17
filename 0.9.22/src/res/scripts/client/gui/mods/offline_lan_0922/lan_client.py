@@ -1190,6 +1190,15 @@ class LANClient(object):
                            'round_id': self.round_id,
                            'projections': dict(projections or {})})
 
+    def send_destructible_map(self, map_name, payload):
+        if not self.ready or not isinstance(payload, dict):
+            return False
+        message = dict(payload)
+        message['type'] = 'destructible_map'
+        message['round_id'] = self.round_id
+        message['map'] = map_name
+        return self._send(message)
+
     def send_bot_hit(self, target_id, shot_seq, damage, shot_result,
                      impact_position=None, critical=None, splash=False,
                      critical_target_base_revision=None,

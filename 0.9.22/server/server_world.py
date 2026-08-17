@@ -7,6 +7,7 @@ contract: same result shapes, and failure always lands on the conservative
 side (unknown terrain is never a clear corridor).
 """
 
+import json
 import math
 import os
 import sys
@@ -54,6 +55,34 @@ def default_data_dir():
     return _PORT_ROOT
 
 
+OCCLUDER_FORMAT = 'offline-lan-0922-occluders'
+OCCLUDER_VERSION = 1
+
+
+def load_occluders(map_name, base_dir):
+    """Return one map's validated static occluder rows, or None."""
+    short_name = prebaked_navigation._short_map_name(map_name)
+    if not short_name:
+        return None
+    path = os.path.join(base_dir, 'occluders', short_name + '.json')
+    if not os.path.isfile(path):
+        return None
+    with open(path, 'r') as handle:
+        document = json.load(handle)
+    if (not isinstance(document, dict) or
+            document.get('format') != OCCLUDER_FORMAT or
+            int(document.get('version', -1)) != OCCLUDER_VERSION or
+            document.get('map') != short_name):
+        raise ValueError('static occluder data is incompatible')
+    rows = document.get('instances')
+    if not isinstance(rows, list):
+        raise ValueError('static occluder data is invalid')
+    for row in rows:
+        if not isinstance(row, list) or len(row) != 18:
+            raise ValueError('static occluder row is invalid')
+    return rows
+
+
 def load_world(map_name, base_dir=None):
     """Return a BakedWorld for one supported map, or None when not baked."""
     base_dir = base_dir if base_dir is not None else default_data_dir()
@@ -62,13 +91,15 @@ def load_world(map_name, base_dir=None):
         return None
     catalog = prebaked_destructibles.load_catalog(map_name, base_dir=base_dir)
     foliage = prebaked_foliage.load_foliage(map_name, base_dir=base_dir)
-    return BakedWorld(graph, catalog=catalog, foliage=foliage)
+    occluders = load_occluders(map_name, base_dir)
+    return BakedWorld(graph, catalog=catalog, foliage=foliage,
+                      occluders=occluders)
 
 
 class BakedWorld(object):
     """One map's static world, answered purely from versioned baked data."""
 
-    def __init__(self, graph, catalog=None, foliage=None):
+    def __init__(self, graph, catalog=None, foliage=None, occluders=None):
         prebaked_navigation._validate(graph, graph.get('map'))
         self.graph = graph
         self.catalog = catalog
@@ -81,10 +112,18 @@ class BakedWorld(object):
         self._links = graph['links']
         self._hazards = graph.get('hazards') or (0,) * (
             self._width * self._height)
-        self._structure_bins = {}
-        self._structure_boxes = []
+        self._instances = {}
+        self._wire_index = {}
+        self._destroyed = set()
+        self._occluder_bins = {}
+        self._occluders = []
+        self._static_bins = {}
+        self._static_boxes = []
+        self._unit_vehicle_mass = None
         if catalog is not None:
-            self._index_structures(catalog)
+            self._index_catalog(catalog)
+        if occluders:
+            self._index_statics(occluders)
 
     # -- grid primitives ---------------------------------------------------
 
@@ -339,47 +378,271 @@ class BakedWorld(object):
         }
 
 
-    # -- static occluders from the destructible catalog ---------------------
+    # -- destructible catalog instances --------------------------------------
 
     _STRUCTURE_BIN_SIZE = 16.0
 
-    def _index_structures(self, catalog):
-        """Build world OBBs for solid structures from quantized locators."""
+    def _index_catalog(self, catalog):
+        """Build world OBBs for every catalog instance from its locator."""
         quantization = float(catalog.get('locator_quantization') or 1000)
         resources = catalog.get('resources') or {}
         for row in catalog.get('instances') or ():
+            signature = tuple(row[:12])
             filename = row[12]
+            box_index = row[13]
             record = resources.get(filename) or {}
-            if record.get('kind') != 'structure':
+            kind = record.get('kind')
+            if kind not in ('structure', 'fragile', 'falling'):
                 continue
             transform = [float(value) / quantization for value in row[:12]]
             origin = transform[0:3]
             basis = (transform[3:6], transform[6:9], transform[9:12])
-            for box in record.get('boxes') or ():
+            raw_boxes = record.get('boxes') or ()
+            if kind != 'structure' and box_index is not None:
+                raw_boxes = raw_boxes[box_index:box_index + 1]
+            boxes = []
+            for box in raw_boxes:
                 world_box = _world_obb(origin, basis, box)
-                if world_box is None:
-                    continue
-                index = len(self._structure_boxes)
-                self._structure_boxes.append(world_box)
+                if world_box is not None:
+                    boxes.append(world_box)
+            if not boxes:
+                continue
+            scale = math.sqrt(sum(value * value
+                                  for value in transform[6:9]))
+            instance = {
+                'signature': signature,
+                'filename': filename,
+                'kind': kind,
+                'boxes': tuple(boxes),
+                'scale': scale,
+                'wire': None,
+                'scaled_health': None,
+                'modules': None,
+                'destr_type': None,
+                'kinetic_correction': None,
+            }
+            self._instances[signature] = instance
+            for box_position, world_box in enumerate(boxes):
+                index = len(self._occluders)
+                self._occluders.append(
+                    (signature, world_box[2], world_box))
                 for key in _obb_bin_keys(world_box,
                                          self._STRUCTURE_BIN_SIZE):
-                    self._structure_bins.setdefault(key, []).append(index)
+                    self._occluder_bins.setdefault(key, []).append(index)
 
-    def _structure_hit(self, start, end):
-        """Nearest structure-OBB hit fraction on a segment, or None."""
-        if not self._structure_boxes:
+    def _index_statics(self, rows):
+        """Index the baked solid-static occluder boxes."""
+        for row in rows:
+            origin = row[0:3]
+            basis = (row[3:6], row[6:9], row[9:12])
+            box = tuple(row[12:18]) + (None,)
+            world_box = _world_obb(origin, basis, box)
+            if world_box is None:
+                continue
+            index = len(self._static_boxes)
+            self._static_boxes.append(world_box)
+            for key in _obb_bin_keys(world_box, self._STRUCTURE_BIN_SIZE):
+                self._static_bins.setdefault(key, []).append(index)
+
+    def _static_hit(self, start, end):
+        """Nearest solid-static hit fraction on a segment, or None."""
+        if not self._static_boxes:
             return None
         candidates = set()
         for key in _segment_bin_keys(start, end, self._STRUCTURE_BIN_SIZE):
-            candidates.update(self._structure_bins.get(key, ()))
+            candidates.update(self._static_bins.get(key, ()))
         nearest = None
         for index in candidates:
             fraction = _segment_obb_entry(
-                start, end, self._structure_boxes[index])
+                start, end, self._static_boxes[index])
             if fraction is not None and (nearest is None or
                                          fraction < nearest):
                 nearest = fraction
         return nearest
+
+    def install_destructible_map(self, instances, resources,
+                                 unit_vehicle_mass):
+        """Install donated wire identities and native-scaled healths."""
+        installed = 0
+        resources = resources or {}
+        try:
+            self._unit_vehicle_mass = float(unit_vehicle_mass)
+        except (TypeError, ValueError):
+            self._unit_vehicle_mass = None
+        for row in instances or ():
+            signature = tuple(int(value) for value in row[0])
+            instance = self._instances.get(signature)
+            if instance is None:
+                continue
+            instance['wire'] = (int(row[1]), int(row[2]))
+            if row[3] is not None:
+                instance['scaled_health'] = float(row[3])
+            modules = row[4]
+            if isinstance(modules, dict):
+                instance['modules'] = dict(
+                    (int(mat_kind), (float(values[0]),
+                                     float(values[1])))
+                    for mat_kind, values in modules.items())
+            resource = resources.get(instance['filename'])
+            if isinstance(resource, dict):
+                instance['destr_type'] = resource.get('destr_type')
+                correction = resource.get('kinetic_correction')
+                if correction is not None:
+                    instance['kinetic_correction'] = float(correction)
+            self._wire_index[instance['wire']] = signature
+            installed += 1
+        return installed
+
+    def has_destructible_identities(self):
+        return bool(self._wire_index)
+
+    def instance(self, signature):
+        return self._instances.get(signature)
+
+    def is_destroyed(self, signature, mat_kind=None):
+        return ((signature, mat_kind) in self._destroyed or
+                (signature, None) in self._destroyed)
+
+    def mark_destroyed(self, signature, mat_kind=None):
+        self._destroyed.add((signature, mat_kind))
+
+    def mark_destroyed_wire(self, chunk_id, item_index, mat_kind=None):
+        signature = self._wire_index.get((int(chunk_id), int(item_index)))
+        if signature is None:
+            return False
+        self.mark_destroyed(signature, mat_kind)
+        return True
+
+    def crushable(self, instance, mat_kind, vehicle_mass, speed):
+        """The exact retail kinetic law over donated native-scaled healths."""
+        try:
+            mass = float(vehicle_mass)
+            velocity = abs(float(speed))
+        except (TypeError, ValueError):
+            return False
+        if mass <= 0.0:
+            return False
+        instant_damage = 0.5 * mass * velocity * velocity * 0.00015
+        if instance['kind'] == 'structure':
+            modules = instance.get('modules') or {}
+            module = modules.get(int(mat_kind) if mat_kind is not None
+                                 else None)
+            if module is None:
+                return False
+            reference = module[0]
+        else:
+            reference = instance.get('scaled_health')
+            correction = instance.get('kinetic_correction')
+            if (reference is None or correction is None or
+                    not self._unit_vehicle_mass):
+                return False
+            try:
+                instant_damage *= math.pow(
+                    mass / self._unit_vehicle_mass, correction)
+            except (ValueError, ZeroDivisionError, OverflowError):
+                return False
+        return float(reference) < instant_damage
+
+    def _blocks_sight(self, signature, mat_kind):
+        instance = self._instances.get(signature)
+        if instance is None:
+            return True
+        if instance['kind'] == 'structure':
+            return not self.is_destroyed(signature, mat_kind)
+        if not self.is_destroyed(signature):
+            return True
+        # A felled column keeps a native body; trees and fragiles clear.
+        return (instance['kind'] == 'falling' and
+                instance.get('destr_type') == 'column')
+
+    def _occluder_hit(self, start, end):
+        """Nearest live occluder hit fraction on a segment, or None."""
+        if not self._occluders:
+            return None
+        candidates = set()
+        for key in _segment_bin_keys(start, end, self._STRUCTURE_BIN_SIZE):
+            candidates.update(self._occluder_bins.get(key, ()))
+        nearest = None
+        for index in candidates:
+            signature, mat_kind, world_box = self._occluders[index]
+            if not self._blocks_sight(signature, mat_kind):
+                continue
+            fraction = _segment_obb_entry(start, end, world_box)
+            if fraction is not None and (nearest is None or
+                                         fraction < nearest):
+                nearest = fraction
+        return nearest
+
+    def destructibles_on_segment(self, start, end):
+        """Ordered live instance hits with entry/exit fractions on a ray."""
+        if not self._occluders:
+            return []
+        candidates = set()
+        for key in _segment_bin_keys(start, end, self._STRUCTURE_BIN_SIZE):
+            candidates.update(self._occluder_bins.get(key, ()))
+        hits = []
+        for index in candidates:
+            signature, mat_kind, world_box = self._occluders[index]
+            instance = self._instances.get(signature)
+            if instance is None:
+                continue
+            if instance['kind'] == 'structure':
+                if self.is_destroyed(signature, mat_kind):
+                    continue
+            elif self.is_destroyed(signature):
+                continue
+            interval = _segment_obb_interval(start, end, world_box)
+            if interval is None:
+                continue
+            hits.append({
+                'fraction': interval[0],
+                'exit_fraction': interval[1],
+                'signature': signature,
+                'mat_kind': mat_kind,
+                'instance': instance,
+            })
+        hits.sort(key=lambda hit: hit['fraction'])
+        return hits
+
+    def hull_destructible_contacts(self, position, yaw, half_width,
+                                   half_length, travel):
+        """Live instances the swept hull rectangle overlaps in the plane."""
+        if not self._occluders:
+            return []
+        x, y, z = (float(position[0]), float(position[1]),
+                   float(position[2]))
+        sine, cosine = math.sin(float(yaw)), math.cos(float(yaw))
+        reach = float(half_length) + max(0.0, float(travel))
+        corners_radius = math.sqrt(half_width * half_width + reach * reach)
+        candidates = set()
+        for key in _segment_bin_keys(
+                (x - corners_radius, y, z - corners_radius),
+                (x + corners_radius, y, z + corners_radius),
+                self._STRUCTURE_BIN_SIZE):
+            candidates.update(self._occluder_bins.get(key, ()))
+        contacts = []
+        seen = set()
+        for index in candidates:
+            signature, mat_kind, world_box = self._occluders[index]
+            if (signature, mat_kind) in seen:
+                continue
+            instance = self._instances.get(signature)
+            if instance is None or instance['kind'] == 'structure':
+                continue
+            if self.is_destroyed(signature):
+                continue
+            if not _hull_overlaps_box(
+                    (x, y, z), sine, cosine, half_width, reach,
+                    world_box):
+                continue
+            seen.add((signature, mat_kind))
+            contacts.append({
+                'signature': signature,
+                'mat_kind': mat_kind,
+                'instance': instance,
+                'position': tuple(world_box[0]),
+            })
+        return contacts
 
     def _terrain_hit(self, start, end):
         """First fraction where the segment dips under baked ground."""
@@ -415,19 +678,24 @@ class BakedWorld(object):
     def segment_hit(self, start, end):
         """World hit point on a segment, or None when the air path is clear.
 
-        Terrain comes from the baked height field; solid occluders are the
-        catalog's structure boxes. Falling and fragile items never block,
-        matching the navigation bake that excludes them from links.
+        Terrain comes from the baked height field; occluders are every live
+        catalog instance box, matching the native ray that trees, fences and
+        structures all stop until they are destroyed.
         """
-        fractions = [value for value in (
-            self._terrain_hit(start, end),
-            self._structure_hit(start, end)) if value is not None]
-        if not fractions:
+        fraction = self.segment_hit_fraction(start, end)
+        if fraction is None:
             return None
-        fraction = min(fractions)
         return (float(start[0]) + (float(end[0]) - float(start[0])) * fraction,
                 float(start[1]) + (float(end[1]) - float(start[1])) * fraction,
                 float(start[2]) + (float(end[2]) - float(start[2])) * fraction)
+
+    def segment_hit_fraction(self, start, end, include_destructibles=True):
+        fractions = [self._terrain_hit(start, end),
+                     self._static_hit(start, end)]
+        if include_destructibles:
+            fractions.append(self._occluder_hit(start, end))
+        fractions = [value for value in fractions if value is not None]
+        return min(fractions) if fractions else None
 
     # -- visibility, firing lanes, cover -------------------------------------
 
@@ -650,7 +918,47 @@ def _segment_bin_keys(start, end, bin_size):
             for z in range(min_z, max_z + 1)]
 
 
-def _segment_obb_entry(start, end, world_box):
+def _segment_obb_interval(start, end, world_box):
+    """(entry, exit) fractions of a segment through one OBB, or None."""
+    entry = _segment_obb_entry(start, end, world_box, want_interval=True)
+    return entry
+
+
+def _hull_overlaps_box(position, sine, cosine, half_width, reach,
+                       world_box):
+    """Planar separating-axis overlap of a hull rectangle and one box."""
+    center, half_axes, unused_kind = world_box
+    box_top = center[1] + _obb_radius(world_box, 1)
+    box_bottom = center[1] - _obb_radius(world_box, 1)
+    if box_bottom > position[1] + 3.0 or box_top < position[1] - 1.0:
+        return False
+    hull_axes = ((cosine, -sine), (sine, cosine))
+    hull_half = (float(half_width), float(reach))
+    box_axes_2d = []
+    box_half = []
+    for half in half_axes:
+        length = math.sqrt(half[0] * half[0] + half[2] * half[2])
+        if length <= 1.0e-6:
+            continue
+        box_axes_2d.append((half[0] / length, half[2] / length))
+        box_half.append(length)
+    delta = (center[0] - position[0], center[2] - position[2])
+    for axis in list(hull_axes) + box_axes_2d:
+        distance = abs(delta[0] * axis[0] + delta[1] * axis[1])
+        hull_radius = sum(
+            hull_half[index] * abs(axis[0] * hull_axes[index][0] +
+                                   axis[1] * hull_axes[index][1])
+            for index in range(2))
+        box_radius = sum(
+            box_half[index] * abs(axis[0] * box_axes_2d[index][0] +
+                                  axis[1] * box_axes_2d[index][1])
+            for index in range(len(box_axes_2d)))
+        if distance > hull_radius + box_radius:
+            return False
+    return True
+
+
+def _segment_obb_entry(start, end, world_box, want_interval=False):
     """Entry fraction of a segment into one OBB via the slab test."""
     center, half_axes, unused_kind = world_box
     lengths = []
@@ -686,6 +994,8 @@ def _segment_obb_entry(start, end, world_box):
         exit_ = min(exit_, high)
         if enter > exit_:
             return None
+    if want_interval:
+        return (enter, exit_)
     return enter
 
 

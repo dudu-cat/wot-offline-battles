@@ -6061,10 +6061,39 @@ class BattleRuntime(object):
         ready = getattr(self.client, 'send_battle_ready', None)
         if not callable(ready):
             return False
+        self._maybe_donate_destructible_map()
         bases = getattr(self._spawn_planner, 'bases', None)
         if not ready(bases):
             raise RuntimeError('LAN server did not accept battle readiness')
         self._ready_sent = True
+        return True
+
+    def _maybe_donate_destructible_map(self):
+        """Send the map's native destructible identities before readiness."""
+        if not self._start_message.get('need_destructible_map'):
+            return False
+        sender = getattr(self.client, 'send_destructible_map', None)
+        if not callable(sender) or self._destructibles is None:
+            return False
+        try:
+            donation = self._destructibles.donation_rows_1513()
+        except Exception as error:
+            print('[Offline LAN 0.9.22] destructible map donation '
+                  'failed: %s' % error)
+            return False
+        if not donation:
+            return False
+        rows = donation.pop('instances')
+        part_size = 1000
+        parts = max(1, (len(rows) + part_size - 1) // part_size)
+        for part in range(parts):
+            payload = dict(donation)
+            payload['part'] = part
+            payload['parts'] = parts
+            payload['instances'] = rows[part * part_size:
+                                        (part + 1) * part_size]
+            if not sender(self._start_message.get('map'), payload):
+                return False
         return True
 
     def _ground_pitch(self, position, yaw, descriptor=None):

@@ -28,6 +28,9 @@ import random
 from gui.mods.offline_lan_0922 import combat_rules
 from gui.mods.offline_lan_0922 import critical_damage
 from gui.mods.offline_lan_0922 import vehicle_physics
+from gui.mods.offline_lan_0922.destructibles_sensor import (
+    _SHOT_AP_KINDS_1513, _SHOT_THROUGH_MAX_HP_1513,
+    _SHOT_THROUGH_MIN_REDUCTION_1513)
 from gui.mods.offline_lan_0922.ai import planner as bot_planner
 from gui.mods.offline_lan_0922.artillery_controller import ArtilleryController
 from gui.mods.offline_lan_0922.bot_runtime import BotRuntime
@@ -242,6 +245,8 @@ class ServerBattleAuthority(object):
         self._live = False
         self._started = False
         self._progress_cursors = {}
+        self._piercing_loss = {}
+        self._shot_receipts = {}
         self._assignments = {}
         self._required_names = ()
         self._last_now = 0.0
@@ -338,6 +343,8 @@ class ServerBattleAuthority(object):
         self._projectiles = InFlightProjectiles(initial_time=float(now))
         self._fire_seen = {}
         self._shot_seq = {}
+        self._piercing_loss = {}
+        self._shot_receipts = {}
         self._bots = BotRuntime(
             SERVER_AUTHORITY_ID,
             descriptor_resolver=self._resolve_descriptor,
@@ -446,27 +453,97 @@ class ServerBattleAuthority(object):
 
     def _resolve_motion(self, bot_id, position, yaw, speed, descriptor,
                         dt, now):
-        """Commit-side contact from baked lanes; fail toward 'hard'."""
+        """Commit-side contact from baked lanes and the crush law."""
         travel_yaw = (float(yaw) if speed >= 0.0 else float(yaw) + math.pi)
         receipt_reusable = getattr(
             self._bots, 'motion_world_receipt_reusable', None)
+        contact_clear = None
         if (callable(receipt_reusable) and receipt_reusable(
                 bot_id, position, travel_yaw, speed, now, dt)):
-            return 'clear'
+            contact_clear = 'clear'
         reach = max(1.0, abs(float(speed)) * float(dt) * 3.0 + 1.5)
-        sine, cosine = math.sin(travel_yaw), math.cos(travel_yaw)
-        end = (float(position[0]) + sine * reach, float(position[1]),
-               float(position[2]) + cosine * reach)
         half_width = 1.4
+        half_length = 3.2
         try:
             bbox = server_world._descriptor_hull_bbox(descriptor)
             half_width = max(abs(float(bbox[0][0])),
                              abs(float(bbox[1][0])))
+            half_length = max(abs(float(bbox[0][2])),
+                              abs(float(bbox[1][2])))
         except (ValueError, TypeError, IndexError, AttributeError):
             pass
-        if self.world.navigation_obstacle(position, end, half_width):
+        if contact_clear is None:
+            sine, cosine = math.sin(travel_yaw), math.cos(travel_yaw)
+            end = (float(position[0]) + sine * reach, float(position[1]),
+                   float(position[2]) + cosine * reach)
+            if self.world.navigation_obstacle(position, end, half_width):
+                return 'hard'
+        if not self.world.has_destructible_identities():
+            return 'clear'
+        contacts = self.world.hull_destructible_contacts(
+            position, travel_yaw, half_width, half_length,
+            abs(float(speed)) * float(dt) + 0.3)
+        if not contacts:
+            return 'clear'
+        try:
+            params = vehicle_physics.derive_params(descriptor)
+            mass = float(params['mass'])
+            cap_speed = float(params['speedBwd' if speed < 0.0
+                                     else 'speedFwd'])
+        except (AttributeError, KeyError, TypeError, ValueError):
             return 'hard'
-        return 'clear'
+        crushed = []
+        blocked = False
+        kinetic_hold = False
+        for contact in contacts:
+            instance = contact['instance']
+            if self.world.crushable(instance, None, mass, speed):
+                crushed.append(contact)
+            elif self.world.crushable(instance, None, mass, cap_speed):
+                kinetic_hold = True
+            else:
+                blocked = True
+        if blocked:
+            return 'hard'
+        if kinetic_hold:
+            return 'soft'
+        column_blocked = False
+        for contact in crushed:
+            instance = contact['instance']
+            kind = ('column' if instance.get('destr_type') == 'column'
+                    else 'tree' if instance.get('destr_type') == 'tree'
+                    else 'fragile')
+            self.world.mark_destroyed(contact['signature'])
+            self._report_destroyed(
+                kind, instance, contact['position'], travel_yaw,
+                abs(float(speed)), is_shot=False)
+            if kind == 'column':
+                column_blocked = True
+        if column_blocked:
+            return 'hard'
+        return 'crushed' if crushed else (contact_clear or 'clear')
+
+    def _report_destroyed(self, kind, instance, position, fall_yaw, speed,
+                          is_shot, mat_kind=None):
+        wire = instance.get('wire')
+        if wire is None:
+            return False
+        message = {
+            'type': 'destructible',
+            'round_id': self._round_id,
+            'destructible_kind': kind,
+            'chunk_id': int(wire[0]),
+            'item_index': int(wire[1]),
+            'x': float(position[0]),
+            'y': float(position[1]),
+            'z': float(position[2]),
+            'fall_yaw': float(fall_yaw),
+            'speed': float(speed),
+            'is_shot': bool(is_shot),
+        }
+        if mat_kind is not None:
+            message['mat_kind'] = int(mat_kind)
+        return self.state.report_destructible(SERVER_AUTHORITY_ID, message)
 
     # -- per-tick update -----------------------------------------------------
 
@@ -631,7 +708,8 @@ class ServerBattleAuthority(object):
     def _projectile_chord(self, state, start, end, absolute_start,
                           absolute_end):
         meta = state.get('payload') or {}
-        world_hit = self.world.segment_hit(start, end)
+        static_fraction = self.world.segment_hit_fraction(
+            start, end, include_destructibles=False)
         nearest = None
         for target in self._chord_targets(meta):
             entry = _segment_hull_entry(start, end, target)
@@ -639,15 +717,96 @@ class ServerBattleAuthority(object):
                 continue
             if nearest is None or entry['fraction'] < nearest['fraction']:
                 nearest = entry
-        if world_hit is not None:
-            world_fraction = _fraction_along(start, end, world_hit)
-            if nearest is None or world_fraction <= nearest['fraction']:
-                return {'outcome': 'impact', 'fraction': world_fraction,
-                        'world': True}
+        limit = min(value for value in (
+            static_fraction,
+            nearest['fraction'] if nearest is not None else None,
+            1.0) if value is not None)
+        stop = self._traverse_shot_destructibles(
+            meta, state, start, end, limit)
+        if stop is not None:
+            return stop
+        if static_fraction is not None and (
+                nearest is None or static_fraction <= nearest['fraction']):
+            return {'outcome': 'impact', 'fraction': static_fraction,
+                    'world': True}
         if nearest is None:
             return None
         return {'outcome': 'impact', 'fraction': nearest['fraction'],
                 'target': nearest}
+
+    def _traverse_shot_destructibles(self, meta, state, start, end, limit):
+        """Destroy and pierce catalog items on one chord, retail-law style."""
+        if not self.world.has_destructible_identities():
+            return None
+        wire_id = self._wire_projectile_id(meta)
+        shooter_descriptor = self._bots._descriptors.get(
+            int(meta.get('shooter_id', -1)))
+        if shooter_descriptor is None:
+            return None
+        shot = _descriptor_shot(shooter_descriptor,
+                                meta.get('shell_index'))
+        shell_kind = str(_field(_field(shot, 'shell', {}) or {},
+                                'kind', '') or '')
+        chord = tuple(float(end[index]) - float(start[index])
+                      for index in range(3))
+        chord_length = math.sqrt(sum(value * value for value in chord))
+        if chord_length <= 1.0e-9:
+            return None
+        fall_yaw = math.atan2(chord[0], chord[2])
+        for hit in self.world.destructibles_on_segment(start, end):
+            if hit['fraction'] >= limit:
+                break
+            instance = hit['instance']
+            mat_kind = hit['mat_kind']
+            if instance['kind'] == 'structure':
+                event_kind = 'module'
+                reference = (instance.get('modules') or {}).get(
+                    int(mat_kind) if mat_kind is not None else None)
+                reference = reference[0] if reference else None
+                self.world.mark_destroyed(hit['signature'], mat_kind)
+            else:
+                event_kind = (
+                    'tree' if instance.get('destr_type') == 'tree' else
+                    'column' if instance.get('destr_type') == 'column'
+                    else 'fragile')
+                reference = instance.get('scaled_health')
+                self.world.mark_destroyed(hit['signature'])
+            entry_point = tuple(
+                float(start[index]) + chord[index] * hit['fraction']
+                for index in range(3))
+            receipt = {
+                'destructible_kind': event_kind,
+                'chunk_id': int(instance['wire'][0]),
+                'item_index': int(instance['wire'][1]),
+                'x': float(entry_point[0]),
+                'y': float(entry_point[1]),
+                'z': float(entry_point[2]),
+                'fall_yaw': float(fall_yaw),
+                'speed': 12.0,
+                'is_shot': True,
+            }
+            if event_kind == 'module':
+                receipt['mat_kind'] = int(mat_kind)
+            if instance.get('wire') is not None:
+                self._shot_receipts.setdefault(wire_id, []).append(receipt)
+            can_continue = (
+                shell_kind in _SHOT_AP_KINDS_1513 and
+                reference is not None and
+                float(reference) <= _SHOT_THROUGH_MAX_HP_1513)
+            if not can_continue:
+                return {'outcome': 'impact', 'fraction': hit['fraction'],
+                        'world': True}
+            loss = (self._piercing_loss.get(wire_id, 0.0) +
+                    _SHOT_THROUGH_MIN_REDUCTION_1513)
+            self._piercing_loss[wire_id] = loss
+            entry_distance = (float(state.get('distance', 0.0)) +
+                              chord_length * hit['fraction'])
+            factor = float(meta.get('penetration_factor', 1.0))
+            if combat_rules.sampled_piercing(
+                    shot, entry_distance, factor, loss) < 1.0:
+                return {'outcome': 'impact', 'fraction': hit['fraction'],
+                        'world': True}
+        return None
 
     def _chord_targets(self, meta, include_shooter=False):
         shooter_key = ('%s:%s' % (meta.get('shooter_kind'),
@@ -719,17 +878,18 @@ class ServerBattleAuthority(object):
             'outcome': outcome,
             'resolved_time_ms': max(base, elapsed_ms),
             'checked_distance': float(state.get('distance', 0.0)),
-            'piercing_loss': 0.0,
+            'piercing_loss': float(self._piercing_loss.get(wire_id, 0.0)),
             'penetration_factor': float(
                 meta.get('penetration_factor', 1.0)),
             'impact': [float(impact[0]), float(impact[1]),
                        float(impact[2])],
             'direct': direct,
             'splash': splash,
-            'destructibles': [],
+            'destructibles': self._shot_receipts.pop(wire_id, []),
         }
         self.state.resolve_projectile(SERVER_AUTHORITY_ID, message)
         self._progress_cursors.pop(wire_id, None)
+        self._piercing_loss.pop(wire_id, None)
 
     def _splash_effects(self, meta, impact, direct):
         """Splash damage from the copied HE law over donated hull armor."""
@@ -802,6 +962,8 @@ class ServerBattleAuthority(object):
         distance = float(state.get('distance', 0.0))
         resolved = combat_rules.resolve_hull_hit(
             shot, distance, collisions,
+            pierce_loss=float(self._piercing_loss.get(
+                self._wire_projectile_id(meta), 0.0)),
             penetration_factor=meta.get('penetration_factor'))
         if resolved is None:
             return None
@@ -872,10 +1034,11 @@ class ServerBattleAuthority(object):
                 'base_checked_ms': base,
                 'checked_through_ms': checked,
                 'checked_distance': float(state.get('distance', 0.0)),
-                'piercing_loss': 0.0,
+                'piercing_loss': float(
+                    self._piercing_loss.get(wire_id, 0.0)),
                 'penetration_factor': float(
                     meta.get('penetration_factor', 1.0)),
-                'destructibles': [],
+                'destructibles': self._shot_receipts.pop(wire_id, []),
             })
             advanced.append((wire_id, checked))
         for index in range(0, len(cursors), PROJECTILE_PROGRESS_BATCH):

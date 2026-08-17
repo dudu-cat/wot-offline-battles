@@ -116,6 +116,7 @@ ROUND_SCOPED_MESSAGE_TYPES = frozenset((
     "bot_observation", "bot_hit_report", "bot_human_hit", "bot_ram_report",
     "projectile_launch", "projectile_progress", "projectile_resolve",
     "rules_state", "destructible", "descriptor_bundle",
+    "destructible_map",
     "battle_result", "leave_battle", "battle_ready",
 ))
 # The elected #1513 authority uses the same bounded in-process manager.  The
@@ -521,6 +522,7 @@ class BattleState:
         self.descriptor_store = DescriptorStore()
         self.vehicle_catalogs = {}
         self.pending_descriptor_names = ()
+        self.destructible_maps = {}
         self.bot_orders = {"revision": 0, "orders": []}
         self.bot_reported_hits = set()
         self.bot_reported_rams = set()
@@ -1060,6 +1062,11 @@ class BattleState:
                     "authority_epoch": self.authority_epoch,
                     "server_time_ms": self._server_time_ms(),
                 })
+            if self.server_authority is not None:
+                cache = self.destructible_maps.get(self.map_name)
+                if (cache is None or
+                        cache["parts_seen"] != set(range(cache["parts"]))):
+                    start_message["need_destructible_map"] = True
             if descriptor_request is not None:
                 host = self.players.get(self.host_player_id)
                 if host is None or not host.send(descriptor_request):
@@ -1121,6 +1128,74 @@ class BattleState:
             self.vehicle_catalogs[player_id] = tuple(catalog)
             return True
 
+    def store_destructible_map(self, player_id, message):
+        """Cache one map's donated native identities and install them."""
+        with self.lock:
+            player = self.players.get(player_id)
+            if (player is None or not player.connected or
+                    not self._message_round_matches(message)):
+                return False
+            map_name = str(message.get("map") or "")
+            if not map_name:
+                return False
+            try:
+                part = int(message.get("part"))
+                parts = int(message.get("parts"))
+                unit_mass = float(message.get("unit_vehicle_mass"))
+            except (TypeError, ValueError):
+                return False
+            if not 0 <= part < parts or parts > 64 or unit_mass <= 0.0:
+                return False
+            rows = message.get("instances")
+            resources = message.get("resources")
+            if (not isinstance(rows, list) or len(rows) > 2000 or
+                    not isinstance(resources, dict)):
+                return False
+            for row in rows:
+                if (not isinstance(row, list) or len(row) != 5 or
+                        not isinstance(row[0], list) or
+                        len(row[0]) != 12):
+                    return False
+            cache = self.destructible_maps.setdefault(map_name, {
+                "unit_vehicle_mass": unit_mass,
+                "resources": {},
+                "instances": {},
+                "parts_seen": set(),
+                "parts": parts,
+            })
+            if cache["parts"] != parts:
+                return False
+            for name, raw in resources.items():
+                if isinstance(raw, dict):
+                    cache["resources"][str(name)] = {
+                        "destr_type": str(raw.get("destr_type") or ""),
+                        "kinetic_correction": _finite_float(
+                            raw.get("kinetic_correction"), 0.0),
+                    }
+            for row in rows:
+                cache["instances"][tuple(int(v) for v in row[0])] = row
+            cache["parts_seen"].add(part)
+            if cache["parts_seen"] != set(range(parts)):
+                return True
+            self._install_destructible_map(map_name)
+            return True
+
+    def _install_destructible_map(self, map_name):
+        if (self.server_authority is None or
+                map_name != self.map_name):
+            return 0
+        cache = self.destructible_maps.get(map_name)
+        if cache is None or cache["parts_seen"] != set(
+                range(cache["parts"])):
+            return 0
+        installed = self.server_authority.world.install_destructible_map(
+            list(cache["instances"].values()), cache["resources"],
+            cache["unit_vehicle_mass"])
+        if installed:
+            _server_log("DESTRUCTIBLE MAP installed map=%s instances=%d" % (
+                map_name, installed))
+        return installed
+
     def donate_descriptors(self, player_id, message):
         """Admit requested projections; start the authority when complete."""
         with self.lock:
@@ -1176,6 +1251,7 @@ class BattleState:
         bases = self._sanitize_capture_bases(authority.capture_bases())
         if bases:
             self.capture_bases = bases
+        self._install_destructible_map(self.map_name)
         return True
 
     def _activate_battle_if_ready(self):
@@ -1385,15 +1461,18 @@ class BattleState:
         return event
 
     def report_destructible(self, player_id, message):
-        """Admit one client-resolved map destruction into shared LAN state."""
+        """Admit one resolved map destruction into shared LAN state."""
         with self.lock:
-            player = self.players.get(player_id)
             if (not self._message_round_matches(message) or
                     not self._combat_accepting() or
-                    self.battle_result is not None or player is None or
-                    not player.connected or not player.participating or
-                    not player.alive):
+                    self.battle_result is not None):
                 return False
+            if player_id != self.bot_authority_id or player_id != \
+                    SERVER_AUTHORITY_ID:
+                player = self.players.get(player_id)
+                if (player is None or not player.connected or
+                        not player.participating or not player.alive):
+                    return False
             event = self._sanitize_destructible(message)
             if event is None:
                 return False
@@ -1406,7 +1485,16 @@ class BattleState:
             event["reported_by"] = player_id
             self.destructibles[key] = event
             self.pending_events.append(dict(event))
+            self._mark_world_destroyed(event)
             return True
+
+    def _mark_world_destroyed(self, event):
+        if self.server_authority is None:
+            return
+        self.server_authority.world.mark_destroyed_wire(
+            event["chunk_id"], event["item_index"],
+            event.get("mat_kind") if
+            event["destructible_kind"] == "module" else None)
 
     @staticmethod
     def _destructible_key(event):
@@ -1452,6 +1540,7 @@ class BattleState:
             stored["reported_by"] = int(player_id)
             self.destructibles[key] = stored
             self.pending_events.append(dict(stored))
+            self._mark_world_destroyed(stored)
             changed += 1
         return changed
 
@@ -4785,6 +4874,9 @@ class ClientHandler(socketserver.BaseRequestHandler):
                                 server.state.broadcast(start_message)
                     elif message_type == "descriptor_catalog":
                         server.state.store_vehicle_catalog(
+                            player.player_id, message)
+                    elif message_type == "destructible_map":
+                        server.state.store_destructible_map(
                             player.player_id, message)
                     elif message_type == "descriptor_bundle":
                         accepted = server.state.donate_descriptors(

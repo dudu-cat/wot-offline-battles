@@ -949,16 +949,32 @@ baked world, or a completed bundle falls back to the previous client
 election, and a donor that disconnects mid-request does the same.
 
 Server-side world answers replace native probes with baked data. Direction
-corridors, world receipts and obstacle sweeps use graph links and heights;
-line of sight and firing lanes use the height field plus catalog structure
-boxes and baked foliage concealment; SPG arcs are proved against the same
-surfaces. Bot shots resolve against hull oriented boxes with donated
-`primaryArmor` per face instead of native per-plate hit testers, and bot
-muzzles are approximated from donated mount offsets instead of the native
-`HP_gunFire` node. Crushable fragile/falling props are excluded from baked
-links, so bots plan through them, but the server does not yet destroy them or
-occlude with them. These are deliberate fidelity boundaries; only acceptance
-on the exact Windows client can judge them.
+corridors, world receipts and obstacle sweeps use graph links and heights.
+Line of sight, firing lanes and SPG arcs are stopped by the height field,
+by every live destructible catalog box, and by the baked solid-static
+occluders (`0.9.22/occluders`, produced by `tools/bake_occluders_0922.py`
+from the BSMO collision bounds of every plain-static and preserved-structure
+instance), with baked foliage concealment on top.
+
+The server destroys map objects with the retail laws over donated native
+values. A loading client donates each map's destructible identities once
+(`destructible_map`: locator signature to native `chunk_id`/`item_index`,
+plus per-instance healths pre-scaled by the native
+`DestructiblesCache.scaledDestructibleHealth`, `kineticDamageCorrection`
+and `unitVehicleMass`). Bot hulls crush fragiles and fell trees and columns
+with the exact `0.5*m*v^2*0.00015` kinetic gate; AP-family shells pass
+through items at or under 19 scaled HP for the fixed 25 mm piercing loss and
+stop otherwise; every destruction is published through the ordinary
+`destructible` events and projectile receipts, and human-reported
+destructions mark the same server ledger so bots and shells respect them.
+
+Remaining approximations, all still requiring exact-Windows acceptance:
+occluders and destructibles use authored bounding boxes rather than
+triangle-exact meshes; a felled column keeps its original box; bot shots
+against vehicles resolve on hull oriented boxes with donated `primaryArmor`
+per face instead of native per-plate hit testers; and bot muzzles are
+approximated from donated mount offsets instead of the native `HP_gunFire`
+node.
 
 ## Known deterministic parity gaps
 

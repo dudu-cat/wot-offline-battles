@@ -117,7 +117,7 @@ def _release_config():
 
 def _write_client_overlay(dist_root, package_path, checksum_path, digest,
                           graph_source=None, foliage_source=None,
-                          destructible_source=None):
+                          destructible_source=None, occluder_source=None):
     release_config = _release_config()
     release_seed = '%s\n%s:%s' % (
         digest, release_config['host'], release_config['port'])
@@ -149,6 +149,11 @@ def _write_client_overlay(dist_root, package_path, checksum_path, digest,
     _validate_destructibles(destructible_source)
     shutil.copytree(
         destructible_source, os.path.join(config_root, 'destructibles'))
+    occluder_source = occluder_source or os.path.join(
+        os.path.dirname(__file__), 'occluders')
+    _validate_occluders(occluder_source)
+    shutil.copytree(
+        occluder_source, os.path.join(config_root, 'occluders'))
     shutil.copy2(os.path.join(os.path.dirname(__file__), 'INSTALL.txt'),
                  overlay_root)
     _copy_legal_files(overlay_root)
@@ -215,6 +220,42 @@ def _validate_navigation_graphs(graph_root):
         if filename.endswith('.json') and filename != 'manifest.json')
     if seen != expected_maps or actual_files != expected_files:
         raise SystemExit('complete #1513 navigation graph batch is invalid')
+
+
+def _validate_occluders(occluder_root):
+    """Reject a partial or tampered static-occluder batch."""
+    manifest_path = os.path.join(occluder_root, 'manifest.json')
+    if not os.path.isfile(manifest_path):
+        raise SystemExit('complete #1513 occluder batch is missing')
+    with open(manifest_path, 'rb') as stream:
+        manifest = json.load(stream)
+    records = manifest.get('maps') if isinstance(manifest, dict) else None
+    expected_maps = set(_navigation_schema.SUPPORTED_MAPS)
+    if (not isinstance(manifest, dict) or
+            manifest.get('format') != 'offline-lan-0922-occluder-manifest' or
+            manifest.get('game_version') != _navigation_schema.GAME_VERSION or
+            not isinstance(records, list) or
+            len(records) != len(expected_maps)):
+        raise SystemExit('complete #1513 occluder manifest is invalid')
+    seen = set()
+    for record in records:
+        if not isinstance(record, dict):
+            raise SystemExit('complete #1513 occluder batch is invalid')
+        name = str(record.get('map') or '')
+        filename = str(record.get('file') or '')
+        expected_hash = str(record.get('sha256') or '')
+        path = os.path.join(occluder_root, filename)
+        if (name not in expected_maps or name in seen or
+                filename != name + '.json' or
+                len(expected_hash) != 64 or not os.path.isfile(path)):
+            raise SystemExit('complete #1513 occluder batch is invalid')
+        with open(path, 'rb') as stream:
+            payload = stream.read()
+        if hashlib.sha256(payload).hexdigest() != expected_hash:
+            raise SystemExit('occluder checksum mismatch: %s' % name)
+        seen.add(name)
+    if seen != expected_maps:
+        raise SystemExit('complete #1513 occluder batch is invalid')
 
 
 def _validate_foliage(foliage_root):
