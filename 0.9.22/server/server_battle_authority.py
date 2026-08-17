@@ -649,9 +649,11 @@ class ServerBattleAuthority(object):
         return {'outcome': 'impact', 'fraction': nearest['fraction'],
                 'target': nearest}
 
-    def _chord_targets(self, meta):
+    def _chord_targets(self, meta, include_shooter=False):
         shooter_key = ('%s:%s' % (meta.get('shooter_kind'),
                                   meta.get('shooter_id')))
+        if include_shooter:
+            shooter_key = None
         for player in self.state.players.values():
             if (not player.connected or not player.participating or
                     not player.alive or not player.client_position):
@@ -702,6 +704,9 @@ class ServerBattleAuthority(object):
         target = terminal.get('target')
         if outcome == 'impact' and target is not None:
             direct = self._direct_effect(meta, state, target)
+        splash = []
+        if outcome == 'impact' and meta.get('is_he'):
+            splash = self._splash_effects(meta, impact, direct)
         wire_id = self._wire_projectile_id(meta)
         elapsed_ms = int(round(float(state.get('elapsed', 0.0)) * 1000.0))
         base = int(self._progress_cursors.get(wire_id, 0))
@@ -720,11 +725,66 @@ class ServerBattleAuthority(object):
             'impact': [float(impact[0]), float(impact[1]),
                        float(impact[2])],
             'direct': direct,
-            'splash': [],
+            'splash': splash,
             'destructibles': [],
         }
         self.state.resolve_projectile(SERVER_AUTHORITY_ID, message)
         self._progress_cursors.pop(wire_id, None)
+
+    def _splash_effects(self, meta, impact, direct):
+        """Splash damage from the copied HE law over donated hull armor."""
+        shooter_descriptor = self._bots._descriptors.get(
+            int(meta.get('shooter_id', -1)))
+        if shooter_descriptor is None:
+            return []
+        shot = _descriptor_shot(shooter_descriptor,
+                                meta.get('shell_index'))
+        radius = combat_rules.he_radius(shot)
+        if radius <= 0.0:
+            return []
+        shell = (combat_rules.legacy_shot(shot).get('shell') or {})
+        effects = []
+        for target in self._chord_targets(meta, include_shooter=True):
+            if (direct is not None and
+                    target['kind'] == direct['target_kind'] and
+                    int(target['id']) == int(direct['target_id'])):
+                continue
+            position = target['position']
+            distance = math.sqrt(sum(
+                (float(position[index]) - float(impact[index])) ** 2
+                for index in range(3)))
+            if distance > radius:
+                continue
+            nominal = combat_rules.he_hull_armor(target['descriptor'])
+            damage = combat_rules.he_splash_damage(
+                shot, nominal, distance / radius)
+            if damage <= 0:
+                continue
+            hull_damage = damage
+            mock = _TargetMock(
+                target['id'], target['health'], target['descriptor'],
+                position, target['yaw'], target.get('state') or {})
+            damage, critical = critical_damage.propose_direct(
+                mock, combat_rules.collision_layers(()),
+                Vector3(*impact), Vector3(*position), damage, shell,
+                int(meta.get('shooter_id', 0)), penetrated=False,
+                by_explosion=True)
+            effect = {
+                'target_kind': target['kind'],
+                'target_id': int(target['id']),
+                'damage': int(damage),
+                'shot_result': 2,
+                'x': float(impact[0]), 'y': float(impact[1]),
+                'z': float(impact[2]),
+            }
+            if isinstance(critical, dict):
+                contract = self._critical_contract(target)
+                if contract is not None:
+                    effect['critical'] = critical
+                    effect['hull_damage'] = int(hull_damage)
+                    effect.update(contract)
+            effects.append(effect)
+        return effects
 
     def _wire_projectile_id(self, meta):
         return '%d:b:%d:%d' % (

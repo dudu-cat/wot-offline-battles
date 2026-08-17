@@ -9,6 +9,7 @@ from lan_battle_server import (  # noqa: E402
     BattleState, CLIENT_BUILD_0922, Player, PREBATTLE_SECONDS,
     PROJECTILE_CAPABILITY, TICK_HZ,
 )
+import server_battle_authority  # noqa: E402
 from server_battle_authority import (  # noqa: E402
     SERVER_AUTHORITY_ID, ServerBattleAuthority, _segment_hull_entry,
 )
@@ -155,6 +156,61 @@ class ServerAuthorityBattleTest(unittest.TestCase):
                 continue
             self.assertIsNotNone(world.ground_height(
                 float(value.get('x', 0.0)), float(value.get('z', 0.0))))
+
+
+class SplashEffectsTest(unittest.TestCase):
+    def _he_projection(self):
+        projection = _projection()
+        projection['gun']['shots'] = [{
+            'shell': {'kind': 'HIGH_EXPLOSIVE', 'caliber': 122.0,
+                      'damage': [450.0, 450.0], 'explosionRadius': 3.5},
+            'speed': 500.0, 'gravity': 9.81, 'maxDistance': 720.0,
+            'piercingPower': [60.0, 60.0],
+        }]
+        return projection
+
+    def test_he_terminal_splashes_nearby_bots(self):
+        state = _state_with_authority()
+        state.request_start(1, '01_karelia')
+        state.mark_battle_ready(1, {'round_id': state.round_id})
+        authority = state.server_authority
+        authority.descriptors.add('he:test', self._he_projection())
+        import types
+        authority._bots._descriptors[99] = authority.descriptors.get(
+            'he:test')
+        victim_id = sorted(state.bot_states)[0]
+        victim = state.bot_states[victim_id]
+        impact = (float(victim['x']) + 2.0, float(victim['y']),
+                  float(victim['z']))
+        with server_battle_authority.engine_modules(lambda: 0.0):
+            effects = authority._splash_effects(
+                {'shooter_kind': 'bot', 'shooter_id': 99,
+                 'shell_index': 0, 'is_he': True}, impact, None)
+        self.assertTrue(any(
+            effect['target_id'] == victim_id and effect['damage'] > 0
+            for effect in effects))
+        for effect in effects:
+            self.assertEqual(2, effect['shot_result'])
+
+    def test_direct_target_is_excluded_from_splash(self):
+        state = _state_with_authority()
+        state.request_start(1, '01_karelia')
+        state.mark_battle_ready(1, {'round_id': state.round_id})
+        authority = state.server_authority
+        authority.descriptors.add('he:test', self._he_projection())
+        authority._bots._descriptors[99] = authority.descriptors.get(
+            'he:test')
+        victim_id = sorted(state.bot_states)[0]
+        victim = state.bot_states[victim_id]
+        impact = (float(victim['x']), float(victim['y']),
+                  float(victim['z']))
+        with server_battle_authority.engine_modules(lambda: 0.0):
+            effects = authority._splash_effects(
+                {'shooter_kind': 'bot', 'shooter_id': 99,
+                 'shell_index': 0, 'is_he': True}, impact,
+                {'target_kind': 'bot', 'target_id': victim_id})
+        self.assertFalse(any(
+            effect['target_id'] == victim_id for effect in effects))
 
 
 class NarrowPhaseTest(unittest.TestCase):
