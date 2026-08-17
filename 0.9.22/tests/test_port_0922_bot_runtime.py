@@ -360,6 +360,31 @@ class ServerReportedHealthTests(unittest.TestCase):
         }))
         self.assertEqual(1, server.bot_states[28]['frags'])
 
+        pending_count = len(server.pending_events)
+        critical_before = player.critical
+        self.assertFalse(server._apply_reported_health(player, {
+            'reported_health': 0,
+            'reported_critical': _critical_payload({
+                'name': 'leftTrackHealth', 'hp': 100.0,
+                'max_hp': 100.0, 'state': 'normal'}),
+            'reported_critical_base_revision': 0,
+            'reported_critical_seq': 1,
+        }))
+        self.assertEqual(critical_before, player.critical)
+        self.assertEqual((0, 0),
+                         (player.critical_revision,
+                          player.critical_ack_seq))
+        self.assertEqual(pending_count, len(server.pending_events))
+
+        calls = []
+        server._apply_reported_health = lambda *args: calls.append(args)
+        server.update_input(player.player_id, {
+            'round_id': server.round_id,
+            'reported_health': 0,
+            'reported_critical': {'events': []},
+        })
+        self.assertEqual([], calls)
+
         server.battle_result = {
             'winner': 0, 'reason': 'test fence', 'base_team': 0}
         server.tick_once(1.0 / 30.0)

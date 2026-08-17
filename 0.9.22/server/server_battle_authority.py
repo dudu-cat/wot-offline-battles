@@ -41,7 +41,7 @@ from gui.mods.offline_lan_0922.spawn_planner import SpawnPlanner
 SERVER_AUTHORITY_ID = 0
 ARTILLERY_ARC_RAYS_PER_TICK = 4
 PROJECTILE_CHORDS_PER_TICK = 240
-PROJECTILE_MAX_TIME_MS = 30000
+PROJECTILE_MAX_TIME_MS = 20000
 PROJECTILE_PROGRESS_BATCH = 30
 
 
@@ -247,6 +247,8 @@ class ServerBattleAuthority(object):
         self._progress_cursors = {}
         self._piercing_loss = {}
         self._shot_receipts = {}
+        self._projectile_launches = {}
+        self._pending_resolutions = {}
         self._assignments = {}
         self._required_names = ()
         self._last_now = 0.0
@@ -345,6 +347,8 @@ class ServerBattleAuthority(object):
         self._shot_seq = {}
         self._piercing_loss = {}
         self._shot_receipts = {}
+        self._projectile_launches = {}
+        self._pending_resolutions = {}
         self._bots = BotRuntime(
             SERVER_AUTHORITY_ID,
             descriptor_resolver=self._resolve_descriptor,
@@ -387,6 +391,20 @@ class ServerBattleAuthority(object):
     def apply_snapshot(self, message):
         if self._bots is not None:
             self._bots.apply_snapshot(message)
+        if self._projectiles is None or not isinstance(message, dict):
+            return
+        rows = message.get('projectiles')
+        if not isinstance(rows, (list, tuple)):
+            return
+        try:
+            now = float(message.get('server_time_ms', 0)) / 1000.0
+        except (TypeError, ValueError, OverflowError):
+            return
+        if now >= self._projectiles.now:
+            self._projectiles.advance(
+                now, self._projectile_chord, self._projectile_terminal,
+                maximum_chords=0)
+        self._reconcile_projectiles(rows)
 
     # -- probes --------------------------------------------------------------
 
@@ -553,22 +571,43 @@ class ServerBattleAuthority(object):
     def update(self, dt, now, live):
         """Advance the whole authority one server tick."""
         if not self._started or self._bots is None:
-            return
+            return ()
         self._last_now = float(now)
         self._live = bool(live)
+        observation_relays = []
         with engine_modules(lambda: float(now)):
+            if self._projectiles is not None:
+                # Move the manager clock before restoring launches admitted at
+                # this server tick. InFlightProjectiles rejects future launch
+                # times even when no projectile is active yet.
+                self._projectiles.advance(
+                    now, self._projectile_chord, self._projectile_terminal,
+                    maximum_chords=0)
+                self._reconcile_projectiles(
+                    self.state._projectile_snapshot())
+                self._flush_pending_resolutions()
             self._artillery.advance(
                 now, ARTILLERY_ARC_RAYS_PER_TICK, self.world.arc_probe)
             if self._live:
                 outgoing = self._bots.update(
                     dt, now, players=self._players_payload())
                 for message in outgoing:
-                    self._route(message, now)
+                    relay = self._route(message, now)
+                    if isinstance(relay, dict):
+                        observation_relays.append(relay)
+            if self._projectiles is not None:
+                # Bot launches enter the same canonical BattleState ledger as
+                # human launches. Reconcile again after BotRuntime publishes
+                # this tick's fire edges so both shooter kinds share one path.
+                self._reconcile_projectiles(
+                    self.state._projectile_snapshot())
             if self._projectiles is not None and len(self._projectiles):
                 self._projectiles.advance(
                     now, self._projectile_chord, self._projectile_terminal,
                     maximum_chords=PROJECTILE_CHORDS_PER_TICK)
                 self._flush_progress(now)
+            self._flush_pending_resolutions()
+        return tuple(observation_relays)
 
     def _players_payload(self):
         rows = []
@@ -604,11 +643,14 @@ class ServerBattleAuthority(object):
             self._resolve_bot_fire(message, now)
             self.state.update_bot_states(SERVER_AUTHORITY_ID, payload)
         elif kind == 'bot_observation':
-            self.state.update_bot_observation(SERVER_AUTHORITY_ID, payload)
+            relay = self.state.update_bot_observation(
+                SERVER_AUTHORITY_ID, payload)
+            return relay if isinstance(relay, dict) else None
         elif kind == 'bot_ram':
             self.state.report_bot_ram(SERVER_AUTHORITY_ID, payload)
         elif kind == 'bot_human_hit':
             self.state.report_bot_human_hit(SERVER_AUTHORITY_ID, payload)
+        return None
 
     # -- bot projectiles -------------------------------------------------------
 
@@ -687,23 +729,175 @@ class ServerBattleAuthority(object):
             'authority_epoch': int(self.state.authority_epoch),
         }
         accepted = self.state.launch_projectile(SERVER_AUTHORITY_ID, message)
-        if not accepted:
+        return bool(accepted)
+
+    @staticmethod
+    def _projectile_launch_signature(meta):
+        return (
+            meta['projectile_id'], meta['shooter_kind'],
+            meta['shooter_id'], meta['source_vehicle'], meta['shot_seq'],
+            meta['shell_index'], meta['team'], meta['origin'],
+            meta['velocity'], meta['gravity'], meta['max_distance'],
+            meta['max_time_ms'], meta['is_he'], meta['splash_radius'],
+            meta['penetration_factor'], meta['launch_server_time_ms'],
+            meta['authority_epoch'])
+
+    def _normalize_ledger_projectile(self, raw):
+        if not isinstance(raw, dict):
+            return None
+        try:
+            projectile_id = str(raw['projectile_id'])
+            shooter_kind = str(raw['shooter_kind'])
+            shooter_id = int(raw['shooter_id'])
+            source_vehicle = str(raw['source_vehicle'])
+            shot_seq = int(raw['shot_seq'])
+            shell_index = int(raw['shell_index'])
+            team = int(raw['team'])
+            origin = tuple(float(value) for value in raw['origin'])
+            velocity = tuple(float(value) for value in raw['velocity'])
+            gravity = float(raw['gravity'])
+            maximum = float(raw['max_distance'])
+            max_time_ms = int(raw['max_time_ms'])
+            splash_radius = float(raw['splash_radius'])
+            penetration_factor = float(raw['penetration_factor'])
+            launch_server_time_ms = int(raw['launch_server_time_ms'])
+            checked_through_ms = int(raw.get('checked_through_ms', 0))
+            checked_distance = float(raw.get('checked_distance', 0.0))
+            piercing_loss = float(raw.get('piercing_loss', 0.0))
+            authority_epoch = int(raw.get(
+                'authority_epoch', self.state.authority_epoch))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+        numbers = (origin + velocity + (
+            gravity, maximum, splash_radius, penetration_factor,
+            checked_distance, piercing_loss))
+        if (not projectile_id or shooter_kind not in ('player', 'bot') or
+                shooter_id <= 0 or not source_vehicle or shot_seq <= 0 or
+                shell_index < 0 or team not in (1, 2) or
+                len(origin) != 3 or len(velocity) != 3 or
+                any(not math.isfinite(value) for value in numbers) or
+                gravity <= 0.0 or maximum <= 0.0 or max_time_ms <= 0 or
+                max_time_ms > PROJECTILE_MAX_TIME_MS or
+                launch_server_time_ms < 0 or checked_through_ms < 0 or
+                checked_through_ms > max_time_ms or checked_distance < 0.0 or
+                checked_distance > maximum or piercing_loss < 0.0 or
+                splash_radius < 0.0 or penetration_factor < 0.0 or
+                authority_epoch != int(self.state.authority_epoch) or
+                not isinstance(raw.get('is_he'), bool)):
+            return None
+        return {
+            'projectile_id': projectile_id,
+            'shooter_kind': shooter_kind,
+            'shooter_id': shooter_id,
+            'source_vehicle': source_vehicle,
+            'shot_seq': shot_seq,
+            'shell_index': shell_index,
+            'team': team,
+            'origin': origin,
+            'velocity': velocity,
+            'gravity': gravity,
+            'max_distance': maximum,
+            'max_time_ms': max_time_ms,
+            'is_he': bool(raw['is_he']),
+            'splash_radius': splash_radius,
+            'penetration_factor': penetration_factor,
+            'launch_server_time_ms': launch_server_time_ms,
+            'checked_through_ms': checked_through_ms,
+            'checked_distance': checked_distance,
+            'piercing_loss': piercing_loss,
+            'authority_epoch': authority_epoch,
+        }
+
+    def _reconcile_projectiles(self, rows):
+        """Install both human and bot shots from the canonical ledger."""
+        if self._projectiles is None:
             return False
-        wire_id = '%d:b:%d:%d' % (int(self._round_id), bot_id,
-                                  int(shot_seq))
-        self._progress_cursors[wire_id] = 0
-        self._projectiles.launch(
-            wire_id,
-            origin, velocity, (0.0, -float(gravity), 0.0),
-            float(now), max_time_ms / 1000.0, float(maximum),
-            payload={'shooter_kind': 'bot', 'shooter_id': bot_id,
-                     'shot_seq': int(shot_seq),
-                     'shell_index': shell_index,
-                     'penetration_factor':
-                         message['penetration_factor'],
-                     'is_he': bool(is_he),
-                     'splash_radius': message['splash_radius']})
+        active_ids = set()
+        for raw in rows or ():
+            meta = self._normalize_ledger_projectile(raw)
+            if meta is None:
+                raise RuntimeError('canonical projectile snapshot is malformed')
+            wire_id = meta['projectile_id']
+            if wire_id in active_ids:
+                raise RuntimeError('canonical projectile snapshot is duplicated')
+            active_ids.add(wire_id)
+            signature = self._projectile_launch_signature(meta)
+            previous = self._projectile_launches.get(wire_id)
+            if previous is not None and previous != signature:
+                raise RuntimeError('canonical projectile launch changed')
+            self._projectile_launches[wire_id] = signature
+            if wire_id in self._pending_resolutions:
+                continue
+            base = int(meta['checked_through_ms'])
+            if self._projectiles.contains(wire_id):
+                self._progress_cursors[wire_id] = base
+                self._piercing_loss[wire_id] = max(
+                    float(meta['piercing_loss']),
+                    float(self._piercing_loss.get(wire_id, 0.0)))
+                continue
+            if self._source_descriptor(meta) is None:
+                continue
+            launch_time = float(meta['launch_server_time_ms']) / 1000.0
+            if launch_time > self._projectiles.now + 1.0e-9:
+                continue
+            cursor_time = min(
+                self._projectiles.now,
+                launch_time + float(base) / 1000.0)
+            restored = self._projectiles.restore({
+                'key': wire_id,
+                'start': meta['origin'],
+                'velocity': meta['velocity'],
+                'gravity': (0.0, -float(meta['gravity']), 0.0),
+                'launch_time': launch_time,
+                'max_time': float(meta['max_time_ms']) / 1000.0,
+                'max_distance': float(meta['max_distance']),
+                'payload': dict(meta),
+                'cursor_time': max(launch_time, cursor_time),
+                'distance': float(meta['checked_distance']),
+            })
+            if not restored:
+                raise RuntimeError('canonical projectile restore failed')
+            self._progress_cursors[wire_id] = base
+            self._piercing_loss[wire_id] = float(meta['piercing_loss'])
+
+        for state in tuple(self._projectiles.snapshot()):
+            wire_id = state.get('key')
+            if wire_id not in active_ids:
+                self._projectiles.remove(wire_id)
+        for wire_id in tuple(self._projectile_launches):
+            if wire_id not in active_ids:
+                self._forget_projectile(wire_id)
         return True
+
+    def _source_descriptor(self, meta):
+        descriptor = self.descriptors.get(meta.get('source_vehicle', ''))
+        if descriptor is not None:
+            return descriptor
+        if self._bots is not None and meta.get('shooter_kind') == 'bot':
+            try:
+                return self._bots._descriptors.get(
+                    int(meta.get('shooter_id', -1)))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _forget_projectile(self, wire_id):
+        self._projectile_launches.pop(wire_id, None)
+        self._pending_resolutions.pop(wire_id, None)
+        self._progress_cursors.pop(wire_id, None)
+        self._piercing_loss.pop(wire_id, None)
+        self._shot_receipts.pop(wire_id, None)
+
+    def _flush_pending_resolutions(self):
+        changed = False
+        for wire_id in sorted(tuple(self._pending_resolutions)):
+            message = self._pending_resolutions.get(wire_id)
+            if (message is not None and
+                    self.state.resolve_projectile(
+                        SERVER_AUTHORITY_ID, message)):
+                self._forget_projectile(wire_id)
+                changed = True
+        return changed
 
     def _projectile_chord(self, state, start, end, absolute_start,
                           absolute_end):
@@ -739,8 +933,7 @@ class ServerBattleAuthority(object):
         if not self.world.has_destructible_identities():
             return None
         wire_id = self._wire_projectile_id(meta)
-        shooter_descriptor = self._bots._descriptors.get(
-            int(meta.get('shooter_id', -1)))
+        shooter_descriptor = self._source_descriptor(meta)
         if shooter_descriptor is None:
             return None
         shot = _descriptor_shot(shooter_descriptor,
@@ -881,20 +1074,23 @@ class ServerBattleAuthority(object):
             'piercing_loss': float(self._piercing_loss.get(wire_id, 0.0)),
             'penetration_factor': float(
                 meta.get('penetration_factor', 1.0)),
-            'impact': [float(impact[0]), float(impact[1]),
-                       float(impact[2])],
+            'impact': ([float(impact[0]), float(impact[1]),
+                        float(impact[2])]
+                       if outcome == 'impact' else None),
             'direct': direct,
             'splash': splash,
             'destructibles': self._shot_receipts.pop(wire_id, []),
         }
-        self.state.resolve_projectile(SERVER_AUTHORITY_ID, message)
-        self._progress_cursors.pop(wire_id, None)
-        self._piercing_loss.pop(wire_id, None)
+        if self.state.resolve_projectile(SERVER_AUTHORITY_ID, message):
+            self._forget_projectile(wire_id)
+        else:
+            # Keep this exact terminal proposal for retry. BattleState's
+            # tombstone fingerprint makes an accepted replay idempotent.
+            self._pending_resolutions[wire_id] = message
 
     def _splash_effects(self, meta, impact, direct):
         """Splash damage from the copied HE law over donated hull armor."""
-        shooter_descriptor = self._bots._descriptors.get(
-            int(meta.get('shooter_id', -1)))
+        shooter_descriptor = self._source_descriptor(meta)
         if shooter_descriptor is None:
             return []
         shot = _descriptor_shot(shooter_descriptor,
@@ -947,13 +1143,15 @@ class ServerBattleAuthority(object):
         return effects
 
     def _wire_projectile_id(self, meta):
-        return '%d:b:%d:%d' % (
-            int(self._round_id), int(meta.get('shooter_id', 0)),
+        if meta.get('projectile_id'):
+            return str(meta['projectile_id'])
+        prefix = 'p' if meta.get('shooter_kind') == 'player' else 'b'
+        return '%d:%s:%d:%d' % (
+            int(self._round_id), prefix, int(meta.get('shooter_id', 0)),
             int(meta.get('shot_seq', 0)))
 
     def _direct_effect(self, meta, state, target):
-        shooter_descriptor = self._bots._descriptors.get(
-            int(meta.get('shooter_id', -1)))
+        shooter_descriptor = self._source_descriptor(meta)
         if shooter_descriptor is None:
             return None
         shot = _descriptor_shot(shooter_descriptor,

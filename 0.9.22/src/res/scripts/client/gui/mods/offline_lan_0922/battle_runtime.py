@@ -3131,6 +3131,8 @@ class BattleRuntime(object):
         entity = self._server_entity(self._server.vehicle_id)
         if entity is None or entity.typeDescriptor is None:
             return False
+        if not self._record_alive(record, entity):
+            return False
         selected = self._critical_name_from_extra_index(
             entity.typeDescriptor, extra_index)
         if equipment['kind'] == 'extinguisher':
@@ -3366,6 +3368,17 @@ class BattleRuntime(object):
         self._observe_projectile_message(message)
         player_id = message.get('bot_authority_id')
         self._start_message['bot_authority_id'] = player_id
+        if 'authority_status' in message:
+            self._start_message['authority_status'] = message.get(
+                'authority_status')
+        if 'authority_fallback_reason' in message:
+            self._start_message['authority_fallback_reason'] = message.get(
+                'authority_fallback_reason')
+        if message.get('authority_status') == 'client_fallback':
+            # The server no longer needs native wire identities after it gives
+            # this round back to a real client authority. Retrying the failed
+            # donation here would otherwise block battle_ready forever.
+            self._start_message.pop('need_destructible_map', None)
         if self._bots is None:
             return True
         return self._reconcile_bot_authority(player_id)
@@ -4377,6 +4390,8 @@ class BattleRuntime(object):
             return
         entity = self._server_entity(record['engine_id'])
         if entity is None or entity.typeDescriptor is None:
+            return
+        if not self._record_alive(record, entity):
             return
         if not hasattr(entity, 'maxHealth'):
             entity.maxHealth = int(entity.typeDescriptor.maxHealth)
@@ -6048,6 +6063,8 @@ class BattleRuntime(object):
         only starts the countdown after the line-up is already complete.
         Humans and the authority manifest are the shared state boundary; the
         server separately refuses ``battle_live`` until that manifest arrives.
+        A server-requested native destructible map is also a hard boundary:
+        projection or transport failure remains retryable on the next frame.
         """
         if self._ready_sent or self._battle_live:
             return False
@@ -6061,7 +6078,9 @@ class BattleRuntime(object):
         ready = getattr(self.client, 'send_battle_ready', None)
         if not callable(ready):
             return False
-        self._maybe_donate_destructible_map()
+        if (self._start_message.get('need_destructible_map') and
+                not self._maybe_donate_destructible_map()):
+            return False
         bases = getattr(self._spawn_planner, 'bases', None)
         if not ready(bases):
             raise RuntimeError('LAN server did not accept battle readiness')
@@ -7703,8 +7722,13 @@ class BattleRuntime(object):
             local_entity = self._server_entity(self._server.vehicle_id)
         if local_entity is None:
             raise RuntimeError('local spotting observer is unavailable')
-        observers = [(
-            self._local_position, self._local_descriptor, local_entity)]
+        local_record = self._records.get(
+            'player:%s' % self.client.player_id)
+        direct_observer = None
+        if self._record_alive(local_record or {}, local_entity):
+            direct_observer = (
+                self._local_position, self._local_descriptor, local_entity)
+        observers = [direct_observer]
         for record in self._records.values():
             if (record.get('local') or not record.get('ready') or
                     record.get('tombstone') or
@@ -7782,9 +7806,11 @@ class BattleRuntime(object):
                         spotting.MOVING_SPEED_EPSILON)
                 fired_recently = now < float(
                     record.get('shot_penalty_until', 0.0))
-                direct_seen = self._spot_line_of_sight(
-                    observers[0], target, entity.typeDescriptor,
-                    target_moving, fired_recently)
+                direct_seen = (
+                    observers[0] is not None and
+                    self._spot_line_of_sight(
+                        observers[0], target, entity.typeDescriptor,
+                        target_moving, fired_recently))
                 seen = direct_seen or any(self._spot_line_of_sight(
                     observer, target, entity.typeDescriptor,
                     target_moving, fired_recently)

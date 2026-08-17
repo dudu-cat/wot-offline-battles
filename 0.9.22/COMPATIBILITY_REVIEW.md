@@ -946,7 +946,9 @@ the server runs the mirrored 0.8.2 lineup law over that catalog and asks the
 room host for the round's descriptor projections (`descriptor_request` /
 `descriptor_bundle`) during the loading barrier. A round without a catalog, a
 baked world, or a completed bundle falls back to the previous client
-election, and a donor that disconnects mid-request does the same.
+election, and a donor that disconnects mid-request does the same. Descriptor
+projection has a bounded 30-second wait. Native destructible identities have
+an independent 120-second wait after the server authority starts.
 
 Server-side world answers replace native probes with baked data. Direction
 corridors, world receipts and obstacle sweeps use graph links and heights.
@@ -961,7 +963,12 @@ values. A loading client donates each map's destructible identities once
 (`destructible_map`: locator signature to native `chunk_id`/`item_index`,
 plus per-instance healths pre-scaled by the native
 `DestructiblesCache.scaledDestructibleHealth`, `kineticDamageCorrection`
-and `unitVehicleMass`). Bot hulls crush fragiles and fell trees and columns
+and `unitVehicleMass`). Server authority starts only when that donation covers
+every interactive instance in the baked catalog with a consistent native
+identity. Exact #1513 normally exposes only currently streamed chunks during
+loading, so an incomplete census explicitly returns the round to elected
+client authority instead of simulating a partial world. Bot hulls crush
+fragiles and fell trees and columns
 with the exact `0.5*m*v^2*0.00015` kinetic gate; AP-family shells pass
 through items at or under 19 scaled HP for the fixed 25 mm piercing loss and
 stop otherwise; every destruction is published through the ordinary
@@ -989,9 +996,13 @@ The source audit deliberately keeps the following differences visible:
   `personal`/`players`/`vehicles` battle-result record;
 - bot drowning and the complete stun penalty/medical-kit loop remain open.
   Authority-Bot movement now runs the same server-relayed destructible contact
-  boundary as player movement. Projectile trajectories are elapsed-time and
-  server-ledgered, but the server still trusts authority-client Bot gun timing,
-  proprietary collision/armor results, ammunition and reload legality.
+  boundary as player movement. When server authority is active, the server
+  advances both human and Bot projectile trajectories and resolves their
+  baked-world collisions and damage. It still trusts each human client for its
+  pose, launch parameters, reload/ammunition legality and native descriptor
+  donation. Human fire, drowning, repair/equipment progression and parts of
+  spotting also remain client-originated. This is a trusted-LAN architecture,
+  not an anti-cheat or a claim that every calculation runs on the server.
 
 The local player path does include server-relayed critical state, fire,
 drowning, exact fall/landing attribution, small repair/medkit/extinguisher

@@ -92,6 +92,11 @@ def load_world(map_name, base_dir=None):
     catalog = prebaked_destructibles.load_catalog(map_name, base_dir=base_dir)
     foliage = prebaked_foliage.load_foliage(map_name, base_dir=base_dir)
     occluders = load_occluders(map_name, base_dir)
+    if catalog is None or foliage is None or occluders is None:
+        # Server authority is an all-or-nothing correctness mode. A partial
+        # dataset would silently turn missing collision or visibility geometry
+        # into clear space, so let the caller enter its explicit fallback.
+        return None
     return BakedWorld(graph, catalog=catalog, foliage=foliage,
                       occluders=occluders)
 
@@ -496,6 +501,17 @@ class BakedWorld(object):
     def has_destructible_identities(self):
         return bool(self._wire_index)
 
+    def requires_destructible_identities(self):
+        """Whether this baked map needs native chunk/item wire identities."""
+        return bool(self._instances)
+
+    def destructible_identities_ready(self):
+        """Whether projectile/destruction results can name native instances."""
+        return all(
+            instance['wire'] is not None and
+            self._wire_index.get(instance['wire']) == signature
+            for signature, instance in self._instances.items())
+
     def instance(self, signature):
         return self._instances.get(signature)
 
@@ -651,6 +667,8 @@ class BakedWorld(object):
         dz = float(end[2]) - float(start[2])
         length = math.sqrt(dx * dx + dy * dy + dz * dz)
         steps = max(1, int(math.ceil(length / (self._cell_size * 0.5))))
+        if self._index(self._cell_for(start[0], start[2])) is None:
+            return 0.0
         previous_fraction = 0.0
         previous_clearance = None
         for index in range(1, steps + 1):
@@ -658,8 +676,14 @@ class BakedWorld(object):
             x = float(start[0]) + dx * fraction
             y = float(start[1]) + dy * fraction
             z = float(start[2]) + dz * fraction
+            if self._index(self._cell_for(x, z)) is None:
+                return fraction
             ground = self.ground_height(x, z)
             if ground is None:
+                # Interior missing heights deliberately mark non-navigable
+                # building footprints in the navgraph. Their finite vertical
+                # collision is owned by the baked static/destructible OBBs;
+                # treating them as infinite terrain columns breaks high arcs.
                 previous_fraction = fraction
                 previous_clearance = None
                 continue

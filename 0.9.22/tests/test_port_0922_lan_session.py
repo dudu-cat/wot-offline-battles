@@ -47,6 +47,7 @@ class _Client(object):
         self.stop_calls = 0
         self.leave_calls = 0
         self.requests = []
+        self.descriptor_bundles = []
 
     def start(self):
         self.start_calls += 1
@@ -61,6 +62,16 @@ class _Client(object):
 
     def leave_battle(self):
         self.leave_calls += 1
+        return True
+
+    def send_descriptor_bundle(self, projections, requested=None,
+                               failures=None, complete=True):
+        self.descriptor_bundles.append({
+            'projections': dict(projections or {}),
+            'requested': list(requested or ()),
+            'failures': list(failures or ()),
+            'complete': complete,
+        })
         return True
 
 
@@ -178,6 +189,75 @@ class LANSessionTests(unittest.TestCase):
         if 'players' in message:
             self.client.roster = list(message['players'])
         self.client.on_event(kind, message)
+
+    def test_descriptor_request_with_no_runtime_sends_terminal_failures(self):
+        self.session._donation_runtime = lambda: None
+
+        self.emit('descriptor_request', {
+            'round_id': 1, 'names': ['ussr:R11_MS-1', 'usa:T1_Cunningham']})
+
+        self.assertEqual([{
+            'projections': {},
+            'requested': ['ussr:R11_MS-1', 'usa:T1_Cunningham'],
+            'failures': ['ussr:R11_MS-1', 'usa:T1_Cunningham'],
+            'complete': True,
+        }], self.client.descriptor_bundles)
+
+    def test_descriptor_chunks_repeat_request_and_end_with_completion(self):
+        from gui.mods.offline_lan_0922 import descriptor_donation
+        names = ['test:vehicle_%02d' % index for index in range(13)]
+        projections = dict((name, {'name': name}) for name in names)
+        self.session._donation_runtime = lambda: object()
+        with mock.patch.object(
+                descriptor_donation, 'project_vehicles',
+                return_value=projections):
+            self.emit('descriptor_request', {'round_id': 1, 'names': names})
+
+        self.assertEqual(2, len(self.client.descriptor_bundles))
+        first, final = self.client.descriptor_bundles
+        self.assertEqual(names, first['requested'])
+        self.assertEqual(names, final['requested'])
+        self.assertEqual([], first['failures'])
+        self.assertFalse(first['complete'])
+        self.assertTrue(final['complete'])
+        self.assertEqual(set(names), set(first['projections']) |
+                         set(final['projections']))
+
+    def test_descriptor_projection_failures_are_explicit_on_completion(self):
+        from gui.mods.offline_lan_0922 import descriptor_donation
+        names = ['test:good', 'test:bad']
+
+        def project(unused_runtime, requested, failures=None):
+            failures.append('test:bad')
+            return {'test:good': {'name': 'test:good'}}
+
+        self.session._donation_runtime = lambda: object()
+        with mock.patch.object(
+                descriptor_donation, 'project_vehicles', side_effect=project):
+            self.emit('descriptor_request', {'round_id': 1, 'names': names})
+
+        self.assertEqual(1, len(self.client.descriptor_bundles))
+        terminal = self.client.descriptor_bundles[0]
+        self.assertEqual(names, terminal['requested'])
+        self.assertEqual(['test:bad'], terminal['failures'])
+        self.assertTrue(terminal['complete'])
+
+    def test_authority_fallback_status_is_visible_once_per_round(self):
+        roster = {
+            'phase': 'waiting', 'round_id': 1,
+            'map_pool': ['01_karelia'],
+            'players': [{'id': 'p1', 'name': 'Host'}],
+            'authority_status': 'client_fallback',
+            'authority_fallback_reason': 'world_data_unavailable',
+        }
+
+        self.emit('roster', roster)
+        self.emit('roster', roster)
+
+        notices = [value for value in self.statuses
+                   if 'Using client authority' in value]
+        self.assertEqual(1, len(notices))
+        self.assertIn('world_data_unavailable', notices[0])
 
     def test_waiting_messages_install_and_open_picker_once(self):
         self.emit('welcome', {

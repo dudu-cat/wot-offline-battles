@@ -19,8 +19,20 @@ bot simulation itself and every client (including the host PC's) renders as a
 lightweight follower. The launcher sets this up automatically. For a
 standalone EXE, either set WOT_0922_SERVER_DATA to the client install's
 mods\configs\offline_lan_0922 folder, or copy that folder to a directory
-named "data" beside the EXE. Without the data the server still works and
-falls back to running the bots on the first connected client.
+named "data" beside the EXE. Client authority is only a compatibility fallback
+when a server prerequisite fails: the complete baked map dataset, eligible
+vehicle catalog, requested descriptor projections, or native destructible
+identity map is missing, invalid, or times out. The loading status reports this
+fallback explicitly; it is not used during a healthy server-authority start.
+The native destructible identity donation must cover every interactive object
+in the baked catalog. Exact #1513 may expose only nearby streamed chunks while
+loading; in that case the round deliberately uses client authority rather than
+running an incomplete server world.
+
+Server authority owns Bot simulation and the shared projectile/collision/
+damage ledger. Human movement, launch inputs and several native vehicle-state
+calculations still originate on trusted clients. It is not an anti-cheat mode
+or a claim that every game calculation runs in this process.
 
 If the server exits immediately, port 28782 may already be in use. Close the
 other server instance and try again.

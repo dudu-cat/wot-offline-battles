@@ -196,13 +196,16 @@ def vehicle_catalog(runtime):
     return rows
 
 
-def project_vehicles(runtime, names):
-    """Build projections for the requested type names; skip failures."""
+def project_vehicles(runtime, names, failures=None):
+    """Build requested projections and optionally report every failed name."""
     projections = {}
     for name in names:
+        name = str(name)
         try:
-            descriptor = runtime.vehicles.VehicleDescr(typeName=str(name))
-            projections[str(name)] = project_descriptor(descriptor)
+            descriptor = runtime.vehicles.VehicleDescr(typeName=name)
+            projections[name] = project_descriptor(descriptor)
         except Exception:
+            if failures is not None:
+                failures.append(name)
             continue
     return projections

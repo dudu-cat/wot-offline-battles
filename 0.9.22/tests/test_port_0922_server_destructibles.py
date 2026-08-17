@@ -272,8 +272,8 @@ class ShotTraversalTest(unittest.TestCase):
 
 
 class DonationInstallTest(unittest.TestCase):
-    def test_partial_parts_accumulate_and_install(self):
-        state = _state_with_authority()
+    def test_partial_parts_accumulate_then_incomplete_map_falls_back(self):
+        state = _state_with_authority(ready_world=False)
         state.request_start(1, '01_karelia')
         world = state.server_authority.world
         catalog_rows = [
@@ -295,7 +295,71 @@ class DonationInstallTest(unittest.TestCase):
             'unit_vehicle_mass': 8000.0, 'resources': {},
             'instances': [],
         })
-        self.assertTrue(second)
+        self.assertEqual('fallback', second)
+        self.assertIsNone(state.server_authority)
+        self.assertEqual('client_fallback', state.authority_status)
+        self.assertEqual('destructible_map_incomplete',
+                         state.authority_fallback_reason)
+        self.assertNotIn('01_karelia', state.destructible_maps)
+
+        state._reset_round()
+        start, error = state.request_start(1, '01_karelia')
+        self.assertIsNone(error)
+        self.assertTrue(start['need_destructible_map'])
+        signature = next(iter(state.server_authority.world._instances))
+        retry = state.store_destructible_map(1, {
+            'type': 'destructible_map', 'round_id': state.round_id,
+            'map': '01_karelia', 'part': 0, 'parts': 1,
+            'unit_vehicle_mass': 8000.0, 'resources': {},
+            'instances': [[list(signature), 4, 0, 5.0, None]],
+        })
+        self.assertEqual('fallback', retry)
+        self.assertEqual('destructible_map_incomplete',
+                         state.authority_fallback_reason)
+
+    def test_non_host_bundle_cannot_pollute_or_fallback_authority(self):
+        state = _state_with_authority(ready_world=False)
+        state.players[2] = __import__(
+            'test_port_0922_server_authority')._player(2, team=2)
+        state.request_start(1, '01_karelia')
+        authority = state.server_authority
+        signature = next(iter(authority.world._instances))
+
+        accepted = state.store_destructible_map(2, {
+            'type': 'destructible_map', 'round_id': state.round_id,
+            'map': '01_karelia', 'part': 0, 'parts': 1,
+            'unit_vehicle_mass': 8000.0, 'resources': {},
+            'instances': [[list(signature), 7, 0, 5.0, None]],
+        })
+
+        self.assertFalse(accepted)
+        self.assertIs(state.server_authority, authority)
+        self.assertEqual('server_pending', state.authority_status)
+        self.assertNotIn('01_karelia', state.destructible_maps)
+
+    def test_pending_identity_donor_disconnect_falls_back_immediately(self):
+        state = _state_with_authority(ready_world=False)
+        state.players[2] = __import__(
+            'test_port_0922_server_authority')._player(2, team=2)
+        state.request_start(1, '01_karelia')
+        self.assertTrue(state.server_authority.started())
+        signature = next(iter(state.server_authority.world._instances))
+        self.assertTrue(state.store_destructible_map(1, {
+            'type': 'destructible_map', 'round_id': state.round_id,
+            'map': '01_karelia', 'part': 0, 'parts': 2,
+            'unit_vehicle_mass': 8000.0, 'resources': {},
+            'instances': [[list(signature), 7, 0, 5.0, None]],
+        }))
+        self.assertIn('01_karelia', state.destructible_maps)
+
+        state.remove_player(1)
+
+        self.assertIsNone(state.server_authority)
+        self.assertNotIn('01_karelia', state.destructible_maps)
+        self.assertEqual(2, state.bot_authority_id)
+        self.assertEqual('client_fallback', state.authority_status)
+        self.assertEqual('destructible_map_donor_disconnected',
+                         state.authority_fallback_reason)
 
     def test_human_destructible_report_marks_the_world(self):
         world = _installed_world(fence_at=(24.0, 0.0, 24.0))

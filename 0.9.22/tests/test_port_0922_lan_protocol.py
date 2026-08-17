@@ -70,6 +70,19 @@ class LanProtocolTests(unittest.TestCase):
         self.assertTrue(all(message['round_id'] == 7
                             for message in self.sent))
 
+    def test_descriptor_bundle_carries_full_terminal_contract(self):
+        self.assertTrue(self.client.send_descriptor_bundle(
+            {'test:good': {'name': 'test:good'}},
+            requested=['test:good', 'test:bad'],
+            failures=['test:bad'], complete=True))
+
+        self.assertEqual({
+            'type': 'descriptor_bundle', 'round_id': 7,
+            'requested': ['test:good', 'test:bad'],
+            'failures': ['test:bad'], 'complete': True,
+            'projections': {'test:good': {'name': 'test:good'}},
+        }, self.sent[-1])
+
     def test_bot_combat_log_fields_explain_friendly_ram(self):
         players = {
             1: Player(1, None, ('127.0.0.1', 1), team=1, slot=0),

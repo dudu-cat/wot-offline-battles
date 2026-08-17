@@ -491,6 +491,23 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         payload = (json.dumps(snapshot, separators=(',', ':')) + '\n').encode()
         self.assertLessEqual(len(payload), MAX_LINE_BYTES)
 
+    def test_current_battle_message_includes_modern_authority_ledger(self):
+        state = _state(players=1)
+        state.phase = 'battle'
+        state.authority_status = 'client_fallback'
+        state.authority_fallback_reason = 'world_data_unavailable'
+        self.assertTrue(state.launch_projectile(1, _launch()))
+
+        message = state.current_battle_message()
+
+        self.assertEqual(state.authority_epoch, message['authority_epoch'])
+        self.assertEqual(state.projectile_revision,
+                         message['projectile_revision'])
+        self.assertEqual(state._projectile_snapshot(), message['projectiles'])
+        self.assertEqual('client_fallback', message['authority_status'])
+        self.assertEqual('world_data_unavailable',
+                         message['authority_fallback_reason'])
+
     def test_launch_event_pitch_uses_physical_positive_up_convention(self):
         state = _state(players=1)
 

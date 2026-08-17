@@ -180,6 +180,11 @@ EXPECTED_ABI = {
         'ArenaDataProvider.isRequiredDataExists': ('self',),
         'ArenaDataProvider.getPlayerVehicleID': ('self', 'forceUpdate'),
     },
+    'scripts/client/gui/battle_control/controllers/view_points_ctrl.pyc': {
+        'ViewPointsController.updateAttachedVehicle': (
+            'self', 'vehicleID'),
+        'ViewPointsController.switch': ('self', 'isNext'),
+    },
     'scripts/client/gui/Scaleform/daapi/view/battle/shared/markers2d/'
     'plugins.pyc': {
         'VehicleMarkerPlugin.__init__': ('self', 'parentObj', 'clazz'),
@@ -201,6 +206,8 @@ EXPECTED_ABI = {
     'scripts/client/AvatarPositionControl.pyc': {
         'ConsistentMatrices.__setTarget': ('self', 'matrix', 'asStatic'),
         'ConsistentMatrices.__linkOwnVehicle': ('self', 'vehicle'),
+        'AvatarPositionControl.switchViewpoint': (
+            'self', 'isViewpoint', 'vehOrPointId'),
     },
     'scripts/client/AvatarInputHandler/DynamicCameras/__init__.pyc': {
         'AccelerationSmoother.update': ('self', 'vehicle', 'deltaTime'),
@@ -394,6 +401,9 @@ EXPECTED_ABI = {
         'SniperControlMode.handleKeyEvent': (
             'self', 'isDown', 'key', 'mods', 'event'),
         'PostMortemControlMode.enable': ('self', '**args'),
+        'PostMortemControlMode.handleKeyEvent': (
+            'self', 'isDown', 'key', 'mods', 'event'),
+        'PostMortemControlMode.__switch': ('self', 'isNext'),
         'PostMortemControlMode.curPostmortemDelay': ('self',),
     },
     'scripts/client/AvatarInputHandler/PostmortemDelay.pyc': {
@@ -932,6 +942,15 @@ EXPECTED_CODE_NAMES = {
             'BigWorld', 'player', 'getOwnVehicleSpeeds', 'speedInfo',
             'value', 'SPEED', 'MAX_SPEED'),
     },
+    'scripts/client/gui/battle_control/controllers/view_points_ctrl.pyc': {
+        'ViewPointsController.updateAttachedVehicle': (
+            '_ViewPointsController__currentVehicleID',),
+        'ViewPointsController.switch': (
+            'getPlayerVehicleID', 'AliveItemsCollection',
+            '_ViewPointsController__currentVehicleID',
+            '_ViewPointsController__doSwitch',
+            '_ViewPointsController__doSelect'),
+    },
     'scripts/client/AvatarInputHandler/control_modes.pyc': {
         'ArcadeControlMode.handleKeyEvent': (
             'CMD_CM_LOCK_TARGET', 'BigWorld', 'target', 'autoAim',
@@ -943,8 +962,18 @@ EXPECTED_CODE_NAMES = {
             '_PostMortemControlMode__cam', 'consistentMatrices',
             'attachedVehicleMatrix', 'vehicleMProv', 'PostmortemDelay',
             '_PostMortemControlMode__postmortemDelay', 'start'),
+        'PostMortemControlMode.handleKeyEvent': (
+            'CMD_CM_POSTMORTEM_NEXT_VEHICLE',
+            '_PostMortemControlMode__switch'),
+        'PostMortemControlMode.__switch': (
+            'guiSessionProvider', 'shared', 'viewPoints', 'switch'),
         'PostMortemControlMode.curPostmortemDelay': (
             '_PostMortemControlMode__postmortemDelay',),
+    },
+    'scripts/client/AvatarPositionControl.pyc': {
+        'AvatarPositionControl.switchViewpoint': (
+            '_AvatarPositionControl__avatar', 'cell',
+            'switchViewPointOrBindToVehicle'),
     },
     'scripts/client/AvatarInputHandler/PostmortemDelay.pyc': {
         'PostmortemDelay.start': (

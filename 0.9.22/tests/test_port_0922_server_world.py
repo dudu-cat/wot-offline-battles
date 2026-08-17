@@ -1,5 +1,6 @@
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -249,6 +250,92 @@ class LoaderTest(unittest.TestCase):
     def test_unsupported_map_returns_none(self):
         self.assertIsNone(server_world.load_world(
             'no_such_map', base_dir=str(PORT_ROOT)))
+
+    def test_any_missing_authority_dataset_rejects_the_world(self):
+        loaders = (
+            (server_world.prebaked_destructibles, 'load_catalog'),
+            (server_world.prebaked_foliage, 'load_foliage'),
+            (server_world, 'load_occluders'),
+        )
+        for owner, name in loaders:
+            with self.subTest(dataset=name):
+                with mock.patch.object(owner, name, return_value=None):
+                    self.assertIsNone(server_world.load_world(
+                        '01_karelia', base_dir=str(PORT_ROOT)))
+
+
+class SegmentUnknownTerrainTest(unittest.TestCase):
+    def test_segment_leaving_the_baked_grid_hits_at_first_outside_sample(self):
+        world = _world()
+        fraction = world._terrain_hit((8.0, 10.0, 8.0),
+                                      (40.0, 10.0, 8.0))
+        self.assertIsNotNone(fraction)
+        self.assertGreater(fraction, 0.0)
+        self.assertLess(fraction, 1.0)
+
+    def test_segment_starting_outside_fails_closed_immediately(self):
+        world = _world()
+        self.assertEqual(0.0, world._terrain_hit(
+            (-40.0, 10.0, 8.0), (8.0, 10.0, 8.0)))
+
+    def test_interior_missing_height_is_not_an_infinite_vertical_column(self):
+        heights = [0] * 36
+        heights[2 * 6 + 2] = None
+        world = _world(heights=heights)
+        self.assertIsNone(world._terrain_hit(
+            (0.0, 100.0, 8.0), (20.0, 100.0, 8.0)))
+
+
+class DestructibleIdentityReadinessTest(unittest.TestCase):
+    @staticmethod
+    def _catalog():
+        basis = [1000, 0, 0, 0, 1000, 0, 0, 0, 1000]
+        return {
+            'locator_quantization': 1000,
+            'resources': {
+                'env/fence.model': {
+                    'kind': 'fragile',
+                    'boxes': [[-1.0, 0.0, -0.2, 1.0, 1.0, 0.2, None]],
+                },
+            },
+            'instances': [
+                [1000, 0, 1000] + basis + ['env/fence.model', 0],
+                [2000, 0, 2000] + basis + ['env/fence.model', 0],
+            ],
+        }
+
+    @staticmethod
+    def _donation_rows(catalog):
+        return [
+            [row[:12], 7, item_index, 10.0, None]
+            for item_index, row in enumerate(catalog['instances'])
+        ]
+
+    def test_world_without_catalog_instances_needs_no_native_identity_map(self):
+        world = _world()
+        self.assertFalse(world.requires_destructible_identities())
+        self.assertTrue(world.destructible_identities_ready())
+
+    def test_partial_native_identity_map_is_not_ready(self):
+        catalog = self._catalog()
+        world = server_world.BakedWorld(_graph(), catalog=catalog)
+
+        installed = world.install_destructible_map(
+            self._donation_rows(catalog)[:1], {}, 8000.0)
+
+        self.assertEqual(installed, 1)
+        self.assertTrue(world.has_destructible_identities())
+        self.assertFalse(world.destructible_identities_ready())
+
+    def test_complete_native_identity_map_is_ready(self):
+        catalog = self._catalog()
+        world = server_world.BakedWorld(_graph(), catalog=catalog)
+
+        installed = world.install_destructible_map(
+            self._donation_rows(catalog), {}, 8000.0)
+
+        self.assertEqual(installed, 2)
+        self.assertTrue(world.destructible_identities_ready())
 
 
 if __name__ == '__main__':

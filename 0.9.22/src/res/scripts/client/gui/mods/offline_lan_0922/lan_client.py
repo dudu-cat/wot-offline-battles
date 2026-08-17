@@ -1183,12 +1183,19 @@ class LANClient(object):
         return self._send({'type': 'descriptor_catalog',
                            'vehicles': list(vehicles or ())[:600]})
 
-    def send_descriptor_bundle(self, projections):
+    def send_descriptor_bundle(self, projections, requested=None,
+                               failures=None, complete=True):
         if not self.ready:
             return False
+        projections = dict(projections or {})
+        if requested is None:
+            requested = sorted(projections)
         return self._send({'type': 'descriptor_bundle',
                            'round_id': self.round_id,
-                           'projections': dict(projections or {})})
+                           'requested': list(requested or ())[:64],
+                           'failures': list(failures or ())[:64],
+                           'complete': bool(complete),
+                           'projections': projections})
 
     def send_destructible_map(self, map_name, payload):
         if not self.ready or not isinstance(payload, dict):

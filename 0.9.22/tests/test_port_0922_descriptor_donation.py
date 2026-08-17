@@ -11,6 +11,8 @@ CLIENT_ROOT = PORT_ROOT / 'src' / 'res' / 'scripts' / 'client'
 sys.path.insert(0, str(CLIENT_ROOT))
 
 from lan_battle_server import (  # noqa: E402
+    AUTHORITY_DESCRIPTOR_TIMEOUT_SECONDS,
+    AUTHORITY_DESTRUCTIBLE_TIMEOUT_SECONDS,
     BattleState, CLIENT_BUILD_0922, Player, PROJECTILE_CAPABILITY,
 )
 from server_battle_authority import SERVER_AUTHORITY_ID  # noqa: E402
@@ -50,8 +52,8 @@ def _catalog_rows():
     ]
 
 
-def _state_with_catalog():
-    state = BattleState(map_name='01_karelia')
+def _state_with_catalog(clock=None):
+    state = BattleState(map_name='01_karelia', clock=clock)
     state.client_build = CLIENT_BUILD_0922
     state.players[1] = _player(1)
     state._elect_room_host()
@@ -59,6 +61,60 @@ def _state_with_catalog():
         1, {'type': 'descriptor_catalog', 'vehicles': _catalog_rows()})
     assert self_ok
     return state
+
+
+def _bundle(state, projections=None, failures=None, complete=True):
+    return {
+        'type': 'descriptor_bundle',
+        'round_id': state.round_id,
+        'requested': list(state.descriptor_requested_names),
+        'failures': list(failures or ()),
+        'complete': complete,
+        'projections': dict(projections or {}),
+    }
+
+
+def _donate_destructible_identity(state):
+    world = state.server_authority.world
+    rows = [
+        [list(signature), 7 + index // 1000, index % 1000, None, None]
+        for index, signature in enumerate(sorted(world._instances))
+    ]
+    return state.store_destructible_map(1, {
+        'type': 'destructible_map', 'round_id': state.round_id,
+        'map': state.map_name, 'part': 0, 'parts': 1,
+        'unit_vehicle_mass': 8000.0, 'resources': {},
+        'instances': rows,
+    })
+
+
+def _client_manifest(state):
+    rows = []
+    for identity in state.bot_roster:
+        x, z, yaw = state._spawn_for(identity['slot'], identity['team'])
+        rows.append({
+            'id': identity['id'], 'team': identity['team'],
+            'slot': identity['slot'], 'vehicle': 'ussr:R11_MS-1',
+            'health': 1000, 'max_health': 1000,
+            'x': x, 'y': 0.0, 'z': z, 'yaw': yaw,
+        })
+    return rows
+
+
+def _finish_client_fallback(state):
+    authority_id = state.bot_authority_id
+    assert authority_id == 1
+    assert state.update_bot_manifest(authority_id, {
+        'type': 'bot_manifest', 'round_id': state.round_id,
+        'bots': _client_manifest(state),
+    })
+    live = state.mark_battle_ready(
+        1, {'type': 'battle_ready', 'round_id': state.round_id})
+    if live is None:
+        live = state.activate_battle_if_ready()
+    assert live is not None
+    assert state.phase == 'battle'
+    return live
 
 
 class DonationFlowTest(unittest.TestCase):
@@ -82,9 +138,8 @@ class DonationFlowTest(unittest.TestCase):
         state.request_start(1, '01_karelia')
         names = state.pending_descriptor_names
         projections = dict((name, _projection()) for name in names)
-        result = state.donate_descriptors(1, {
-            'type': 'descriptor_bundle', 'round_id': state.round_id,
-            'projections': projections})
+        result = state.donate_descriptors(1, _bundle(
+            state, projections=projections))
         self.assertEqual('started', result)
         self.assertTrue(state.server_authority.started())
         self.assertTrue(state.bot_manifest)
@@ -98,36 +153,34 @@ class DonationFlowTest(unittest.TestCase):
         state.request_start(1, '01_karelia')
         names = list(state.pending_descriptor_names)
         first = {names[0]: _projection()}
-        result = state.donate_descriptors(1, {
-            'type': 'descriptor_bundle', 'round_id': state.round_id,
-            'projections': first})
-        if len(names) == 1:
-            self.assertEqual('started', result)
-            return
+        result = state.donate_descriptors(1, _bundle(
+            state, projections=first, complete=False))
         self.assertIs(True, result)
         self.assertFalse(state.server_authority.started())
         rest = dict((name, _projection()) for name in names[1:])
-        result = state.donate_descriptors(1, {
-            'type': 'descriptor_bundle', 'round_id': state.round_id,
-            'projections': rest})
+        result = state.donate_descriptors(1, _bundle(
+            state, projections=rest, complete=True))
         self.assertEqual('started', result)
+        self.assertEqual('ready', _donate_destructible_identity(state))
+        live = state.mark_battle_ready(
+            1, {'type': 'battle_ready', 'round_id': state.round_id})
+        self.assertIsNotNone(live)
+        self.assertEqual('battle', state.phase)
 
     def test_non_host_donation_is_rejected(self):
         state = _state_with_catalog()
         state.players[2] = _player(2, team=2)
         state.request_start(1, '01_karelia')
         names = state.pending_descriptor_names
-        result = state.donate_descriptors(2, {
-            'type': 'descriptor_bundle', 'round_id': state.round_id,
-            'projections': {names[0]: _projection()}})
+        result = state.donate_descriptors(2, _bundle(
+            state, projections={names[0]: _projection()}))
         self.assertFalse(result)
 
     def test_unsolicited_projection_names_are_rejected(self):
         state = _state_with_catalog()
         state.request_start(1, '01_karelia')
-        result = state.donate_descriptors(1, {
-            'type': 'descriptor_bundle', 'round_id': state.round_id,
-            'projections': {'france:not_requested': _projection()}})
+        result = state.donate_descriptors(1, _bundle(
+            state, projections={'france:not_requested': _projection()}))
         self.assertFalse(result)
 
     def test_donor_leaving_falls_back_to_client_authority(self):
@@ -138,12 +191,119 @@ class DonationFlowTest(unittest.TestCase):
         state.remove_player(1)
         self.assertIsNone(state.server_authority)
         self.assertEqual(2, state.bot_authority_id)
+        self.assertEqual('client_fallback', state.authority_status)
+        self.assertEqual('descriptor_donor_disconnected',
+                         state.authority_fallback_reason)
 
     def test_lineup_uses_donated_catalog_tier_band(self):
         state = _state_with_catalog()
         state.request_start(1, '01_karelia')
         for name in state.pending_descriptor_names:
             self.assertIn(name, [row['name'] for row in _catalog_rows()])
+
+    def test_empty_completion_falls_back_and_reaches_battle_live(self):
+        state = _state_with_catalog()
+        start, error = state.request_start(1, '01_karelia')
+        self.assertIsNone(error)
+        self.assertEqual('server_pending', start['authority_status'])
+
+        result = state.donate_descriptors(1, _bundle(state))
+
+        self.assertEqual('fallback', result)
+        self.assertEqual('client_fallback', state.authority_status)
+        self.assertEqual('descriptor_projection_failed',
+                         state.authority_fallback_reason)
+        self.assertEqual('battle_live', _finish_client_fallback(state)['type'])
+
+    def test_explicit_projection_failure_falls_back_and_reaches_live(self):
+        state = _state_with_catalog()
+        state.request_start(1, '01_karelia')
+        names = list(state.descriptor_requested_names)
+        failed = names[-1]
+        projections = dict(
+            (name, _projection()) for name in names if name != failed)
+
+        result = state.donate_descriptors(1, _bundle(
+            state, projections=projections, failures=[failed]))
+
+        self.assertEqual('fallback', result)
+        roster = state.lobby_message()
+        self.assertEqual('client_fallback', roster['authority_status'])
+        self.assertEqual('descriptor_projection_failed',
+                         roster['authority_fallback_reason'])
+        self.assertEqual('battle_live', _finish_client_fallback(state)['type'])
+
+    def test_no_descriptor_response_times_out_broadcasts_and_reaches_live(self):
+        now = [100.0]
+        state = _state_with_catalog(clock=lambda: now[0])
+        state.request_start(1, '01_karelia')
+        now[0] += AUTHORITY_DESCRIPTOR_TIMEOUT_SECONDS + 0.01
+
+        state.tick_once(1.0 / 30.0)
+
+        self.assertEqual('client_fallback', state.authority_status)
+        rosters = [line for line in state.players[1].conn.lines
+                   if line.get('type') == 'roster']
+        self.assertTrue(rosters)
+        self.assertEqual('descriptor_timeout',
+                         rosters[-1]['authority_fallback_reason'])
+        self.assertEqual('battle_live', _finish_client_fallback(state)['type'])
+
+    def test_missing_requester_in_catalog_uses_explicit_client_fallback(self):
+        state = _state_with_catalog()
+        state.vehicle_catalogs[1] = ({
+            'name': 'germany:G12_Ltraktor', 'level': 1,
+            'tags': ('lightTank',),
+        },)
+
+        start, error = state.request_start(1, '01_karelia')
+
+        self.assertIsNone(error)
+        self.assertIsNone(state.server_authority)
+        self.assertEqual(1, start['bot_authority_id'])
+        self.assertEqual('client_fallback', start['authority_status'])
+        self.assertEqual('lineup_unavailable',
+                         start['authority_fallback_reason'])
+        self.assertEqual('battle_live', _finish_client_fallback(state)['type'])
+
+    def test_ready_waits_for_native_identities_then_reaches_live(self):
+        state = _state_with_catalog()
+        state.vehicle_catalogs[1] = tuple(_catalog_rows()[:1])
+        state.descriptor_store.add('ussr:R11_MS-1', _projection())
+        start, error = state.request_start(1, '01_karelia')
+        self.assertIsNone(error)
+        self.assertTrue(start['need_destructible_map'])
+        self.assertTrue(state.server_authority.started())
+
+        self.assertIsNone(state.mark_battle_ready(
+            1, {'type': 'battle_ready', 'round_id': state.round_id}))
+        self.assertEqual('loading', state.phase)
+        self.assertEqual('ready', _donate_destructible_identity(state))
+        live = state.activate_battle_if_ready()
+
+        self.assertIsNotNone(live)
+        self.assertEqual('server', live['authority_status'])
+        self.assertEqual('battle', state.phase)
+
+    def test_native_identity_timeout_broadcasts_fallback_and_reaches_live(self):
+        now = [10.0]
+        state = _state_with_catalog(clock=lambda: now[0])
+        state.vehicle_catalogs[1] = tuple(_catalog_rows()[:1])
+        state.descriptor_store.add('ussr:R11_MS-1', _projection())
+        state.request_start(1, '01_karelia')
+        self.assertIsNone(state.mark_battle_ready(
+            1, {'type': 'battle_ready', 'round_id': state.round_id}))
+        now[0] += AUTHORITY_DESTRUCTIBLE_TIMEOUT_SECONDS + 0.01
+
+        state.tick_once(1.0 / 30.0)
+
+        self.assertEqual('client_fallback', state.authority_status)
+        rosters = [line for line in state.players[1].conn.lines
+                   if line.get('type') == 'roster']
+        self.assertTrue(rosters)
+        self.assertEqual('destructible_map_timeout',
+                         rosters[-1]['authority_fallback_reason'])
+        self.assertEqual('battle_live', _finish_client_fallback(state)['type'])
 
 
 class CatalogValidationTest(unittest.TestCase):
@@ -238,6 +398,24 @@ class ProjectionBuilderTest(unittest.TestCase):
             ['germany:G12_Ltraktor', 'ussr:R11_MS-1'],
             [row['name'] for row in rows])
         self.assertEqual(['lightTank'], rows[0]['tags'])
+
+    def test_project_vehicles_reports_each_projection_failure(self):
+        descriptor = self._descriptor()
+
+        def resolve(typeName=None):
+            if typeName == 'test:good':
+                return descriptor
+            raise ValueError('missing descriptor')
+
+        runtime = types.SimpleNamespace(
+            vehicles=types.SimpleNamespace(VehicleDescr=resolve))
+        failures = []
+
+        projections = descriptor_donation.project_vehicles(
+            runtime, ['test:good', 'test:bad'], failures=failures)
+
+        self.assertEqual(['test:good'], sorted(projections))
+        self.assertEqual(['test:bad'], failures)
 
 
 if __name__ == '__main__':

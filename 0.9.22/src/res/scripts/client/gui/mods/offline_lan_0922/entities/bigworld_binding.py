@@ -199,7 +199,7 @@ class BigWorldVehicleBinding(object):
         self._set_avatar_property('playerVehicleID', entity_id)
 
     def avatar_vehicle_entered(self):
-        """Publish the local Vehicle and bind #1513's attached matrix.
+        """Publish the local Vehicle and bind #1513's attachment state.
 
         A retail server changes the Avatar's engine attachment after
         ``AvatarPositionControl.bindToVehicle``.  The client-only mailbox has
@@ -207,16 +207,27 @@ class BigWorldVehicleBinding(object):
         empty even though ``playerVehicleID`` and the native Vehicle are
         valid.  Stock minimap entries follow
         ``consistentMatrices.attachedVehicleMatrix`` rather than
-        ``updateOwnVehiclePosition``.  Reproduce the exact Python-side result
-        of ``ConsistentMatrices.notifyVehicleChanged`` against the selected
-        Vehicle matrix.
+        ``updateOwnVehiclePosition``.  Likewise, the stock postmortem view
+        controller only updates its current-vehicle cursor from
+        ``PlayerAvatar.onVehicleChanged`` when ``avatar.vehicle`` is present.
+        Reproduce both skipped Python-side results against the selected
+        client-only Vehicle.
         """
         self._avatar.onVehicleChanged()
         entity = self._entity_or_fail(self._avatar.playerVehicleID)
         self._need(entity, 'matrix')
         setter = self._avatar.consistentMatrices.\
             _ConsistentMatrices__setTarget
+        provider = self._need(self._avatar, 'guiSessionProvider')
+        shared = self._need(provider, 'shared')
+        view_points = self._need(shared, 'viewPoints')
+        update_attached = self._need(view_points, 'updateAttachedVehicle')
+        if not callable(update_attached):
+            raise CapabilityError(
+                'required #1513 capability is not callable: '
+                'updateAttachedVehicle')
         setter(entity.matrix, False)
+        update_attached(self._avatar.playerVehicleID)
 
     def avatar_client_ready(self):
         self._set_avatar_property('isGunLocked', False)

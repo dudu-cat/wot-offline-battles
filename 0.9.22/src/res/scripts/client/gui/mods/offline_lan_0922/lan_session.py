@@ -128,6 +128,7 @@ class LANSession(object):
         self._client_generation = 0
         self._host_player_id = None
         self._waiting_notice_host_id = None
+        self._authority_fallback_notice = None
 
     def _new_client(self):
         # Advancing before resolution also retires callbacks from an old
@@ -1069,28 +1070,63 @@ class LANSession(object):
 
     def _donate_descriptors(self, message):
         """Answer one server request for battle descriptor projections."""
-        runtime = self._donation_runtime()
-        if runtime is None:
-            return
         names = message.get('names') if isinstance(message, dict) else None
         if not isinstance(names, (list, tuple)) or not names:
             return
+        requested = []
+        for raw_name in names[:64]:
+            name = str(raw_name)
+            if name and name not in requested:
+                requested.append(name)
+        if not requested:
+            return
+        failures = []
+        projections = {}
+        runtime = self._donation_runtime()
         try:
-            from gui.mods.offline_lan_0922 import descriptor_donation
-            projections = descriptor_donation.project_vehicles(
-                runtime, [str(name) for name in names[:64]])
+            if runtime is None:
+                failures.extend(requested)
+            else:
+                from gui.mods.offline_lan_0922 import descriptor_donation
+                projections = descriptor_donation.project_vehicles(
+                    runtime, requested, failures=failures)
         except Exception as error:
             print('[Offline LAN 0.9.22] descriptor donation '
                   'failed: %s' % error)
-            return
+            projections = {}
+            failures = list(requested)
         items = sorted(projections.items())
-        for start in range(0, len(items), 12):
+        if not items:
             self.client.send_descriptor_bundle(
-                dict(items[start:start + 12]))
+                {}, requested=requested, failures=failures, complete=True)
+            return
+        for start in range(0, len(items), 12):
+            end = start + 12
+            self.client.send_descriptor_bundle(
+                dict(items[start:end]), requested=requested,
+                failures=failures, complete=end >= len(items))
+
+    def _notify_authority_fallback(self, message):
+        """Expose an intentional per-round client-authority fallback once."""
+        if (not isinstance(message, dict) or
+                message.get('authority_status') != 'client_fallback'):
+            return False
+        reason = str(message.get('authority_fallback_reason') or
+                     'server prerequisites unavailable')
+        key = (message.get('round_id'), reason)
+        if self._authority_fallback_notice == key:
+            return False
+        self._authority_fallback_notice = key
+        self._status_notifier(
+            'Server battle authority prerequisites failed (%s). '
+            'Using client authority for this battle.' % reason)
+        return True
 
     def _on_event(self, kind, message):
         if self._stopped:
             return
+        if kind in ('welcome', 'roster', 'battle_start'):
+            self._notify_authority_fallback(message)
         if kind in ('welcome', 'roster'):
             if kind == 'welcome':
                 self._send_vehicle_catalog()

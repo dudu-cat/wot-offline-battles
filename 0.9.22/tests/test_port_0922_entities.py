@@ -176,11 +176,14 @@ class _Avatar(object):
         self.changed = 0
         self.visual_starts = []
         self.visual_stops = []
+        self.view_points = types.SimpleNamespace(
+            updateAttachedVehicle=mock.Mock())
         self.guiSessionProvider = types.SimpleNamespace(
             startVehicleVisual=lambda proxy, immediate:
             self.visual_starts.append((proxy, immediate)),
             stopVehicleVisual=lambda entity_id, is_player:
-            self.visual_stops.append((entity_id, is_player)))
+            self.visual_stops.append((entity_id, is_player)),
+            shared=types.SimpleNamespace(viewPoints=self.view_points))
         self.consistentMatrices = _ConsistentMatrices()
 
     def updateArena(self, update_type, payload):
@@ -219,7 +222,7 @@ class _VehicleDescr(object):
 
 
 class BigWorldBindingTests(unittest.TestCase):
-    def test_local_vehicle_binds_stock_attached_matrix_for_minimap(self):
+    def test_local_vehicle_binds_stock_matrix_and_postmortem_cursor(self):
         module = _binding_module()
         bigworld = _BigWorld()
         avatar = _Avatar()
@@ -235,6 +238,7 @@ class BigWorldBindingTests(unittest.TestCase):
         self.assertEqual(
             [(bigworld.entity_value.matrix, False)],
             avatar.consistentMatrices.targets)
+        avatar.view_points.updateAttachedVehicle.assert_called_once_with(91)
 
     def test_json_unicode_names_are_encoded_for_bigworld_string(self):
         module = _binding_module()
