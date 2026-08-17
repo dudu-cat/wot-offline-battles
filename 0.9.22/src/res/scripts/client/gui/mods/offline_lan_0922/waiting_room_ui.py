@@ -11,8 +11,11 @@ Exact #1513 evidence for the native surface used here:
 - ``GUI.Simple``, ``GUI.Window`` and ``GUI.Text`` with the property names below:
   ``scripts/client/PostProcessing/ChainView.pyc`` and
   ``scripts/client/bwobsolete_tests/GUITest.pyc``.
-- Texture ``system/maps/col_white.dds``: ``misc.pkg`` member, used by
-  ``ChainView.EffectView.__init__``.
+- Texture source name ``system/maps/col_white.bmp`` with 0-255 int ``colour``
+  tuples: the in-game IME surfaces ``CandidateWindow.__init__`` and
+  ``LanguageIndicator.create`` in ``bwobsolete_helpers/PyGUI/IME.pyc`` and
+  ``LanguageIndicator.pyc``. Passing the packed ``.dds`` member name instead
+  rendered the panel untinted white on the real #1513 client.
 - Font ``system/fonts/default_small.font``: package member.
 - ``GUI.addRoot`` / ``GUI.delRoot`` / ``GUI.reSort`` and an overlay at
   ``position.z = 0.1`` with ``focus``, ``moveFocus`` and ``wg_inputKeyMode``:
@@ -26,7 +29,7 @@ Exact #1513 evidence for the native surface used here:
 
 import sys
 
-PANEL_TEXTURE = 'system/maps/col_white.dds'
+PANEL_TEXTURE = 'system/maps/col_white.bmp'
 PANEL_FONT = 'default_small.font'
 OVERLAY_Z = 0.1
 INPUT_KEY_MODE = 2
@@ -150,8 +153,7 @@ class WaitingRoomUI(object):
         self._set(panel, 'verticalAnchor', 'CENTER')
         self._set(panel, 'width', 680)
         self._set(panel, 'height', 300)
-        # 0.8.2 renders this exact palette with SOLID; BLEND left the panel
-        # untinted white on the real #1513 client.
+        # The proven 0.8.2 room uses SOLID over the same texture source name.
         self._set(panel, 'materialFX', 'SOLID')
         self._set(panel, 'colour', (5, 12, 20, 245))
         self._set(panel, 'position', (0.0, 0.0, OVERLAY_Z))

@@ -222,6 +222,29 @@ class LANSessionTests(unittest.TestCase):
             self.client.roster = list(message['players'])
         self.client.on_event(kind, message)
 
+    def test_donation_runtime_reads_the_exact_nations_and_vehicle_list(self):
+        nations_module = types.ModuleType('nations')
+        nations_module.AVAILABLE_NAMES = ('ussr',)
+        nations_module.INDICES = {'ussr': 0}
+        items_module = types.ModuleType('items')
+        vehicles_module = types.ModuleType('items.vehicles')
+        vehicles_module.g_list = object()
+        vehicles_module.VehicleDescr = object
+        items_module.vehicles = vehicles_module
+        sys.modules['nations'] = nations_module
+        sys.modules['items'] = items_module
+        sys.modules['items.vehicles'] = vehicles_module
+        try:
+            runtime = self.session._donation_runtime()
+            self.assertIs(nations_module, runtime.nations)
+            self.assertIs(vehicles_module, runtime.vehicles)
+        finally:
+            for name in ('nations', 'items', 'items.vehicles'):
+                sys.modules.pop(name, None)
+
+    def test_donation_runtime_is_none_without_the_exact_modules(self):
+        self.assertIsNone(self.session._donation_runtime())
+
     def test_descriptor_request_with_no_runtime_sends_terminal_failures(self):
         self.session._donation_runtime = lambda: None
 

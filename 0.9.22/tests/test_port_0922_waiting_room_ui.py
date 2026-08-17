@@ -67,10 +67,10 @@ class _Surface(object):
         self.resorts = 0
 
     def window(self):
-        return _Component('window', 'system/maps/col_white.dds')
+        return _Component('window', 'system/maps/col_white.bmp')
 
     def simple(self):
-        return _Component('simple', 'system/maps/col_white.dds')
+        return _Component('simple', 'system/maps/col_white.bmp')
 
     def text(self):
         return _Component('text', text='')
@@ -118,7 +118,7 @@ class WaitingRoomTests(unittest.TestCase):
 
     def test_the_panel_uses_the_stock_white_texture(self):
         self.room.install()
-        self.assertEqual('system/maps/col_white.dds',
+        self.assertEqual('system/maps/col_white.bmp',
                          self.room._panel.texture)
 
     def test_the_host_sees_the_map_selector_and_start_button(self):
@@ -261,8 +261,8 @@ class NativeSurfaceTests(unittest.TestCase):
         surface.remove_root('window')
         surface.resort()
         self.assertEqual(calls, [
-            ('Window', 'system/maps/col_white.dds'),
-            ('Simple', 'system/maps/col_white.dds'),
+            ('Window', 'system/maps/col_white.bmp'),
+            ('Simple', 'system/maps/col_white.bmp'),
             ('Text', ''),
             ('addRoot', 'window'),
             ('delRoot', 'window'),

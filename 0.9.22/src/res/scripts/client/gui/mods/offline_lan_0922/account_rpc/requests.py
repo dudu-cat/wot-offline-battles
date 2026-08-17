@@ -1,5 +1,9 @@
 """Registered request handlers only; unknown command ids deliberately fail."""
 
+from __future__ import print_function
+
+import traceback
+
 from gui.mods.offline_lan_0922.account_rpc import commands
 from gui.mods.offline_lan_0922.account_rpc import data
 
@@ -63,13 +67,23 @@ def _set_language(context, args):
     return Result(commands.RES_STREAM, '', args[0] if args else '')
 
 
+def _contain_queue_listeners(callback):
+    # The engine's entity-call boundary logs a failing script and keeps the
+    # server alive; Event.__call__ in #1513 re-raises after logging.
+    try:
+        callback(commands.QUEUE_TYPE_RANDOMS)
+    except Exception:
+        print('[Offline LAN 0.9.22] a queue-event listener failed:')
+        traceback.print_exc()
+
+
 def _enqueue_random(context, args):
     on_enqueued = context.get('on_enqueued')
     if not callable(on_enqueued):
         return Result(commands.RES_FAILURE, 'QUEUE_EVENTS_UNAVAILABLE')
 
     def enter_queue():
-        on_enqueued(commands.QUEUE_TYPE_RANDOMS)
+        _contain_queue_listeners(on_enqueued)
 
     return Result(commands.RES_SUCCESS, before_response=enter_queue)
 
@@ -80,7 +94,7 @@ def _dequeue_random(context, args):
         return Result(commands.RES_FAILURE, 'QUEUE_EVENTS_UNAVAILABLE')
 
     def leave_queue():
-        on_dequeued(commands.QUEUE_TYPE_RANDOMS)
+        _contain_queue_listeners(on_dequeued)
 
     return Result(commands.RES_SUCCESS, before_response=leave_queue)
 

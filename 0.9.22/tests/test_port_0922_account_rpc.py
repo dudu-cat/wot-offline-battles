@@ -233,6 +233,82 @@ class AccountRpcTests(unittest.TestCase):
             self.assertEqual(commands.RES_FAILURE, result_id)
             self.assertEqual('QUEUE_EVENTS_UNAVAILABLE', error)
 
+    def test_broken_queue_listener_cannot_abort_the_command_response(self):
+        # Event.__call__ in #1513 re-raises after logging, so a broken lobby
+        # listener reaches the entity boundary; the fake server must contain
+        # it the way the engine's entity dispatch does.
+        def on_enqueued(queue_type):
+            raise RuntimeError('carousel listener failed')
+
+        server = FakeServer(
+            lambda: self.player,
+            lambda delay, fn: self.pending.append((delay, fn)),
+            {'on_enqueued': on_enqueued})
+
+        server.doCmdInt3(commands.REQUEST_ID_NO_RESPONSE,
+                         commands.CMD_ENQUEUE_RANDOM, 9, 65535, 0)
+        self._run()
+        self.assertEqual(
+            [(commands.REQUEST_ID_NO_RESPONSE, commands.RES_SUCCESS, '')],
+            self.player.responses)
+
+    def test_filter_sanitizer_repairs_only_divergent_saved_filters(self):
+        defaults = {
+            'CAROUSEL_FILTER_2': {'elite': False, 'favorite': False},
+            'CAROUSEL_FILTER_CLIENT_1': {'searchNameVehicle': ''},
+            'BOOSTERS_FILTER': 0,
+        }
+        saved = {
+            'CAROUSEL_FILTER_2': {'elite': True, 'legacyKey': True},
+            'CAROUSEL_FILTER_CLIENT_1': {'searchNameVehicle': 'T-34'},
+        }
+        writes = {}
+
+        class _Settings(object):
+            @staticmethod
+            def getFilter(name):
+                if name in saved:
+                    return copy.deepcopy(saved[name])
+                return copy.deepcopy(defaults[name])
+
+            @staticmethod
+            def setFilter(name, value):
+                writes[name] = value
+
+        class _Module(object):
+            KEY_FILTERS = 'FILTERS'
+            DEFAULT_VALUES = {'FILTERS': defaults}
+            AccountSettings = _Settings
+
+        repaired = compatibility._sanitize_account_filters(_Module)
+
+        self.assertEqual(['CAROUSEL_FILTER_2'], repaired)
+        self.assertEqual({'CAROUSEL_FILTER_2': {
+            'elite': True, 'favorite': False}}, writes)
+
+    def test_filter_sanitizer_replaces_a_non_mapping_saved_filter(self):
+        defaults = {'CAROUSEL_FILTER_2': {'elite': False}}
+        writes = {}
+
+        class _Settings(object):
+            @staticmethod
+            def getFilter(name):
+                return 'not-a-mapping'
+
+            @staticmethod
+            def setFilter(name, value):
+                writes[name] = value
+
+        class _Module(object):
+            KEY_FILTERS = 'FILTERS'
+            DEFAULT_VALUES = {'FILTERS': defaults}
+            AccountSettings = _Settings
+
+        repaired = compatibility._sanitize_account_filters(_Module)
+
+        self.assertEqual(['CAROUSEL_FILTER_2'], repaired)
+        self.assertEqual({'CAROUSEL_FILTER_2': {'elite': False}}, writes)
+
     def test_eula_version_survives_server_restart_and_can_be_deleted(self):
         eula_contract = CONTRACT['intUserSettings']
         self.assertEqual(

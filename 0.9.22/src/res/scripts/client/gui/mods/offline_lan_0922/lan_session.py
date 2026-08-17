@@ -46,6 +46,20 @@ def _load_battle_runtime():
     return g_battle_runtime
 
 
+def _load_donation_runtime():
+    """Return the exact #1513 modules the descriptor donation reads."""
+    import nations
+    from items import vehicles
+
+    class Runtime(object):
+        pass
+
+    runtime = Runtime()
+    runtime.nations = nations
+    runtime.vehicles = vehicles
+    return runtime
+
+
 def _selected_vehicle_details():
     """Return the canonical type name and HP of the selected #1513 vehicle."""
     from CurrentVehicle import g_currentVehicle
@@ -1092,17 +1106,18 @@ class LANSession(object):
 
     def _donation_runtime(self):
         try:
-            from gui.mods.offline_lan_0922.compat import g_compatibility
-        except Exception:
+            return _load_donation_runtime()
+        except Exception as error:
+            print('[Offline LAN 0.9.22] descriptor donation modules are '
+                  'unavailable: %s' % error)
             return None
-        return getattr(g_compatibility, '_runtime', None)
 
     def _send_vehicle_catalog(self):
         """Donate the eligible-vehicle catalog for server-side lineups."""
         runtime = self._donation_runtime()
         if runtime is None:
             print('[Offline LAN 0.9.22] vehicle catalog donation skipped: '
-                  'the compatibility runtime is not installed')
+                  'the exact vehicle list is unavailable')
             return
         try:
             from gui.mods.offline_lan_0922 import descriptor_donation

@@ -71,6 +71,37 @@ _LOBBY_GUI_CONTEXT = {
 }
 
 
+def _sanitize_account_filters(account_settings=None):
+    """Make every saved lobby filter carry exactly the default keys."""
+    import copy
+    if account_settings is None:
+        from account_helpers import AccountSettings as account_settings
+    settings_type = account_settings.AccountSettings
+    defaults = account_settings.DEFAULT_VALUES[account_settings.KEY_FILTERS]
+    repaired = []
+    for name, default in defaults.items():
+        if not isinstance(default, dict):
+            continue
+        saved = settings_type.getFilter(name)
+        if isinstance(saved, dict):
+            unknown = [key for key in saved if key not in default]
+            missing = [key for key in default if key not in saved]
+            if not unknown and not missing:
+                continue
+            value = dict((key, saved[key]) for key in saved
+                         if key in default)
+            for key in missing:
+                value[key] = copy.deepcopy(default[key])
+        else:
+            value = copy.deepcopy(default)
+        settings_type.setFilter(name, value)
+        repaired.append(name)
+    if repaired:
+        print('[Offline LAN 0.9.22] repaired saved lobby filters: %s' %
+              ', '.join(sorted(repaired)))
+    return repaired
+
+
 def _load_runtime():
     import Account
     import Avatar
@@ -1512,6 +1543,13 @@ class OfflineCompatibility(object):
                         original_clear_all_spaces
 
             if compatibility._show_lobby:
+                try:
+                    # A stale filter pickle in the shared preferences file
+                    # fails CarouselFilter.load's key assertion at hangar load.
+                    _sanitize_account_filters()
+                except Exception as error:
+                    print('[Offline LAN 0.9.22] saved lobby filters could '
+                          'not be repaired: %s' % error)
                 show_gui = getattr(account, 'showGUI', None)
                 if callable(show_gui):
                     show_gui(_pickle.dumps(
