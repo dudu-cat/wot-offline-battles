@@ -197,6 +197,42 @@ class AccountRpcTests(unittest.TestCase):
         self.assertEqual(commands.RES_FAILURE, self.player.responses[0][1])
         self.assertEqual('UNSUPPORTED_OFFLINE_COMMAND', self.player.responses[0][2])
 
+    def test_enqueue_random_fires_the_account_event_asynchronously(self):
+        queue_events = []
+        server = FakeServer(
+            lambda: self.player,
+            lambda delay, fn: self.pending.append((delay, fn)),
+            {'on_enqueued': queue_events.append})
+
+        server.doCmdInt3(commands.REQUEST_ID_NO_RESPONSE, commands.CMD_ENQUEUE_RANDOM,
+                         9, 65535, 0)
+        self.assertEqual([], queue_events)
+        self._run()
+        self.assertEqual([commands.QUEUE_TYPE_RANDOMS], queue_events)
+
+    def test_dequeue_random_fires_the_account_event_asynchronously(self):
+        queue_events = []
+        server = FakeServer(
+            lambda: self.player,
+            lambda delay, fn: self.pending.append((delay, fn)),
+            {'on_dequeued': queue_events.append})
+
+        server.doCmdInt3(commands.REQUEST_ID_NO_RESPONSE, commands.CMD_DEQUEUE_RANDOM,
+                         0, 0, 0)
+        self.assertEqual([], queue_events)
+        self._run()
+        self.assertEqual([commands.QUEUE_TYPE_RANDOMS], queue_events)
+
+    def test_queue_commands_fail_without_the_account_event_boundary(self):
+        for command in (commands.CMD_ENQUEUE_RANDOM,
+                        commands.CMD_DEQUEUE_RANDOM):
+            self.server.doCmdInt3(commands.REQUEST_ID_NO_RESPONSE, command,
+                                  0, 0, 0)
+            self._run()
+        for unused_request_id, result_id, error in self.player.responses:
+            self.assertEqual(commands.RES_FAILURE, result_id)
+            self.assertEqual('QUEUE_EVENTS_UNAVAILABLE', error)
+
     def test_eula_version_survives_server_restart_and_can_be_deleted(self):
         eula_contract = CONTRACT['intUserSettings']
         self.assertEqual(

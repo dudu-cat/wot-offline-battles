@@ -686,6 +686,12 @@ class OfflineCompatibility(object):
                 receive_stats = getattr(account, 'receiveServerStats', None)
                 if callable(receive_stats):
                     context['receive_server_stats'] = receive_stats
+                on_enqueued = getattr(account, 'onEnqueued', None)
+                if callable(on_enqueued):
+                    context['on_enqueued'] = on_enqueued
+                on_dequeued = getattr(account, 'onDequeued', None)
+                if callable(on_dequeued):
+                    context['on_dequeued'] = on_dequeued
                 callback = getattr(runtime.bigworld, 'callback', None)
                 if callback is None:
                     account.fakeServer = _FallbackServer()

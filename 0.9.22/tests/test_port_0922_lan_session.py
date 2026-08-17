@@ -100,6 +100,31 @@ class _Queue(object):
         return True
 
 
+class _QueueScreen(object):
+    def __init__(self, on_exit):
+        self.on_exit = on_exit
+        self.install_calls = 0
+        self.open_calls = 0
+        self.leave_calls = 0
+        self.uninstall_calls = 0
+
+    def install(self):
+        self.install_calls += 1
+        return True
+
+    def open(self):
+        self.open_calls += 1
+        return True
+
+    def leave(self):
+        self.leave_calls += 1
+        return True
+
+    def uninstall(self):
+        self.uninstall_calls += 1
+        return True
+
+
 class _JoinUI(object):
     def __init__(self, on_join):
         self.on_join = on_join
@@ -168,6 +193,12 @@ class LANSessionTests(unittest.TestCase):
             self.queues.append(queue)
             return queue
 
+        def queue_screen_factory(on_exit):
+            screen = _QueueScreen(on_exit)
+            self.queue_screens.append(screen)
+            return screen
+
+        self.queue_screens = []
         self.session = self.module.LANSession(
             {'host': '10.0.0.5', 'port': 28782, 'name': 'P',
              'vehicle': 'ussr:MS-1', 'startupTimeoutSeconds': 12.0},
@@ -176,7 +207,8 @@ class LANSessionTests(unittest.TestCase):
             battle_runtime=self.battle_runtime,
             vehicle_provider=lambda: ('ussr:R11_MS-1', 90),
             on_snapshot=self.snapshots.append,
-            status_notifier=self.statuses.append)
+            status_notifier=self.statuses.append,
+            queue_screen_factory=queue_screen_factory)
         self.assertTrue(self.session.start())
         self.client = self.clients[0]
 
@@ -294,6 +326,106 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual(1, queue.refresh_calls)
         self.assertIn('PLAYERS (2): Host, Guest', queue.endpoint())
         self.assertEqual([True], self.opens)
+
+    def test_waiting_room_opens_over_the_stock_queue_screen(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+
+        self.assertEqual(1, len(self.queue_screens))
+        screen = self.queue_screens[0]
+        self.assertEqual(1, screen.install_calls)
+        self.assertEqual(1, screen.open_calls)
+        self.assertTrue(self.session._picker_open)
+
+    def test_leave_room_leaves_the_stock_queue(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+
+        self.assertTrue(self.session.leave_room())
+
+        self.assertEqual(1, self.queue_screens[0].leave_calls)
+        self.assertEqual(1, self.client.stop_calls)
+
+    def test_stock_queue_exit_leaves_the_lan_room(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+        screen = self.queue_screens[0]
+
+        self.assertTrue(screen.on_exit())
+
+        self.assertEqual('ready_to_join', self.session.state)
+        self.assertIsNone(self.session.client)
+        self.assertEqual(1, self.client.stop_calls)
+        self.assertFalse(self.session._picker_open)
+        self.assertEqual(1, self.queues[0].close_calls)
+        self.assertEqual(1, screen.leave_calls)
+        self.assertFalse(screen.on_exit())
+        self.assertEqual(1, self.client.stop_calls)
+
+    def test_denied_start_keeps_the_same_queue_screen_engaged(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+        screen = self.queue_screens[0]
+        self.assertTrue(self.queues[0].request_start('01_karelia'))
+
+        self.emit('start_denied', {'code': 'host_only'})
+
+        self.assertEqual('waiting', self.session.state)
+        self.assertEqual([screen], self.queue_screens)
+        self.assertEqual(0, screen.leave_calls)
+
+    def test_battle_start_keeps_the_stock_queue(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+        self.assertTrue(self.queues[0].request_start('01_karelia'))
+
+        self.emit('battle_start', {
+            'round_id': 1, 'map': '01_karelia', 'players': [
+                {'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                 'vehicle': 'ussr:T-34'}]})
+
+        self.assertEqual('battle', self.session.state)
+        self.assertEqual(0, self.queue_screens[0].leave_calls)
+        self.assertEqual(0, self.queue_screens[0].uninstall_calls)
+
+    def test_waiting_disconnect_leaves_the_stock_queue(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+
+        self.emit('connection_lost', {'message': 'socket closed'})
+
+        self.assertEqual('ready_to_join', self.session.state)
+        self.assertEqual(1, self.queue_screens[0].leave_calls)
+
+    def test_stop_uninstalls_the_queue_screen(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+
+        self.session.stop()
+
+        self.assertEqual(1, self.queue_screens[0].uninstall_calls)
+
+    def test_unavailable_queue_screen_keeps_the_room_over_the_hangar(self):
+        def broken_factory(on_exit):
+            raise RuntimeError('no prb runtime')
+
+        clients = []
+
+        def client_factory(*args, **kwargs):
+            client = _Client(*args, **kwargs)
+            clients.append(client)
+            return client
+
+        opens = []
+        session = self.module.LANSession(
+            {'host': '10.0.0.5', 'port': 28782, 'name': 'P'},
+            client_factory=client_factory,
+            queue_factory=lambda *args, **kwargs: _Queue(*args, **kwargs),
+            picker_opener=lambda: opens.append(True) or True,
+            vehicle_provider=lambda: ('ussr:R11_MS-1', 90),
+            status_notifier=lambda message: None,
+            queue_screen_factory=broken_factory)
+        self.assertTrue(session.start())
+        clients[0].ready = True
+        clients[0].on_event('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
+
+        self.assertTrue(session._picker_open)
+        self.assertIsNone(session._queue_screen)
+        self.assertIsNone(session._queue_screen_factory)
 
     def test_install_owns_battle_button_until_join_and_stop(self):
         clients = []

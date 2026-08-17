@@ -63,6 +63,28 @@ def _set_language(context, args):
     return Result(commands.RES_STREAM, '', args[0] if args else '')
 
 
+def _enqueue_random(context, args):
+    on_enqueued = context.get('on_enqueued')
+    if not callable(on_enqueued):
+        return Result(commands.RES_FAILURE, 'QUEUE_EVENTS_UNAVAILABLE')
+
+    def enter_queue():
+        on_enqueued(commands.QUEUE_TYPE_RANDOMS)
+
+    return Result(commands.RES_SUCCESS, before_response=enter_queue)
+
+
+def _dequeue_random(context, args):
+    on_dequeued = context.get('on_dequeued')
+    if not callable(on_dequeued):
+        return Result(commands.RES_FAILURE, 'QUEUE_EVENTS_UNAVAILABLE')
+
+    def leave_queue():
+        on_dequeued(commands.QUEUE_TYPE_RANDOMS)
+
+    return Result(commands.RES_SUCCESS, before_response=leave_queue)
+
+
 def _add_int_user_settings(context, args):
     account_state = context.get('account_state')
     if account_state is None:
@@ -90,6 +112,8 @@ HANDLERS = {
     commands.CMD_REQ_SERVER_STATS: _server_stats,
     commands.CMD_SYNC_SHOP: _sync_shop,
     commands.CMD_SYNC_DOSSIERS: _sync_dossiers,
+    commands.CMD_ENQUEUE_RANDOM: _enqueue_random,
+    commands.CMD_DEQUEUE_RANDOM: _dequeue_random,
     commands.CMD_SET_LANGUAGE: _set_language,
     commands.CMD_COMPLETE_TUTORIAL: lambda context, args: Result(commands.RES_SUCCESS),
     commands.CMD_ADD_INT_USER_SETTINGS: _add_int_user_settings,

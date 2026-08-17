@@ -5,6 +5,7 @@ from __future__ import print_function
 import sys
 
 from gui.mods.offline_lan_0922 import config as port_config
+from gui.mods.offline_lan_0922 import queue_screen
 from gui.mods.offline_lan_0922 import queue_ui
 from gui.mods.offline_lan_0922 import waiting_room_ui
 
@@ -85,12 +86,16 @@ class LANSession(object):
                  picker_opener=None, join_factory=None, battle_runtime=None,
                  on_snapshot=None, on_event=None, lobby_ready=None,
                  callback=None, cancel_callback=None, status_notifier=None,
-                 vehicle_provider=None, room_factory=None):
+                 vehicle_provider=None, room_factory=None,
+                 queue_screen_factory=None):
         self._config = dict(config or {})
         self._client_factory = client_factory or _load_client
         self._queue_factory = queue_factory or queue_ui.QueueUI
         self._room_factory = (waiting_room_ui.WaitingRoomUI
                               if room_factory is None else room_factory)
+        self._queue_screen_factory = (queue_screen.QueueScreenUI
+                                      if queue_screen_factory is None
+                                      else queue_screen_factory)
         self._picker_opener = picker_opener or queue_ui.open_picker
         self._join_factory = join_factory or queue_ui.JoinButtonUI
         self._battle_runtime = battle_runtime
@@ -108,6 +113,7 @@ class LANSession(object):
         # room host opens the stock picker after the welcome/roster barrier.
         self._map_pool = None
         self._queue = None
+        self._queue_screen = None
         self._join_ui = None
         self._picker_open = False
         self._picker_dismissed = False
@@ -241,6 +247,7 @@ class LANSession(object):
         self._picker_dismissed = True
         self._cancel_retry_callback()
         self._cancel_picker_callback()
+        self._leave_queue_screen()
         client = self.client
         self.client = None
         if client is not None:
@@ -400,6 +407,35 @@ class LANSession(object):
             self._queue = surface
         return self._queue
 
+    def _ensure_queue_screen(self):
+        if self._queue_screen is None and self._queue_screen_factory is not None:
+            try:
+                screen = self._queue_screen_factory(self._on_queue_screen_exit)
+                screen.install()
+            except Exception as error:
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] the stock queue screen is '
+                    'unavailable, keeping the room over the hangar: %s\n' %
+                    error)
+                self._queue_screen_factory = None
+                return None
+            self._queue_screen = screen
+        return self._queue_screen
+
+    def _leave_queue_screen(self):
+        if self._queue_screen is None:
+            return False
+        return bool(self._queue_screen.leave())
+
+    def _on_queue_screen_exit(self):
+        """Leave the LAN room when the stock queue exit control dequeues."""
+        if self._stopped or self.client is None:
+            return False
+        if self.state not in ('waiting', 'awaiting_battle_start'):
+            return False
+        self._close_picker()
+        return self.leave_room()
+
     def _new_room(self):
         """Build the self-drawn room, or report that this client cannot."""
         if self._room_factory is None:
@@ -557,6 +593,10 @@ class LANSession(object):
         if not self._is_local_host() and not self._guest_surface():
             # The stock map window can only present the elected room host.
             return False
+        # As in 0.8.2, the stock queue screen loads under the room.
+        screen = self._ensure_queue_screen()
+        if screen is not None:
+            screen.open()
         self._picker_open = bool(self._open_surface(surface))
         return self._picker_open
 
@@ -1031,6 +1071,10 @@ class LANSession(object):
             self._close_picker()
         except Exception:
             pass
+        try:
+            self._leave_queue_screen()
+        except Exception:
+            pass
         if old_client is not None:
             try:
                 old_client.on_event = None
@@ -1245,6 +1289,11 @@ class LANSession(object):
         if self._queue is not None:
             try:
                 self._queue.uninstall()
+            except Exception as error:
+                errors.append(error)
+        if self._queue_screen is not None:
+            try:
+                self._queue_screen.uninstall()
             except Exception as error:
                 errors.append(error)
         if self._join_ui is not None:
