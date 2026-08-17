@@ -2147,7 +2147,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
                 'name': 'Player'}, {
                     'round_id': 1, 'map': '01_karelia',
-                    'bot_authority_id': 1, 'players': [], 'bots': [],
+                    'bot_authority_id': 0, 'players': [], 'bots': [],
                 }, _Client()))
             runtime.destructible_catalog_loader.assert_called_once_with(
                 '01_karelia')
@@ -2298,7 +2298,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         client = _Client()
         start = {
-            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 0,
             'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                 'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -2341,7 +2341,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             0x000fffff)
         battle = BattleRuntime(runtime)
         start = {
-            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 0,
             'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                 'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -2379,7 +2379,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, {
                 'round_id': 1, 'map': '01_karelia',
-                'bot_authority_id': 1,
+                'bot_authority_id': 0,
                 'players': [{
                     'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                     'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -2563,7 +2563,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, {
                 'round_id': 2, 'map': '01_karelia',
-                'bot_authority_id': 1,
+                'bot_authority_id': 0,
                 'players': [{
                     'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                     'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -2605,7 +2605,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, {
                 'round_id': 2, 'map': '01_karelia',
-                'bot_authority_id': 1,
+                'bot_authority_id': 0,
                 'players': [{
                     'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                     'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -2647,7 +2647,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         client = _Client()
         start = {
-            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 0,
             'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                 'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -2696,7 +2696,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         client = _Client()
         start = {
-            'round_id': 1, 'map': '07_lakeville', 'bot_authority_id': 1,
+            'round_id': 1, 'map': '07_lakeville', 'bot_authority_id': 0,
             'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                 'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -2737,7 +2737,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         client = _Client()
         start = {
-            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 0,
             'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                 'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -2867,84 +2867,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'dead': False, 'attack_reason': 0, 'death_reason': 0,
                 'source': 'shot'}, target, attacker)
 
-    def test_empty_loading_snapshot_cannot_tombstone_authority_bots(self):
-        runtime = _runtime()
-        runtime.bigworld.defer_vehicle_entry = True
-        battle = BattleRuntime(runtime)
-        client = _Client()
-        player = {
-            'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
-            'vehicle': 'ussr:R11_MS-1', 'health': 500}
-        start = {
-            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
-            'players': [player],
-            # The server start barrier reserves identities but intentionally
-            # has no canonical pose until the authority publishes a manifest.
-            'bots': [{
-                'id': 11, 'team': 2, 'slot': 0, 'name': 'Enemy 1'}, {
-                'id': 12, 'team': 2, 'slot': 1, 'name': 'Enemy 2'}]}
-
-        self.assertTrue(battle.start({
-            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
-            'name': 'Player'}, start, client))
-        battle.on_snapshot({
-            'round_id': 1, 'server_tick': 1,
-            'players': [player], 'bots': []})
-        runtime.bigworld.callbacks.pop(0)()
-        runtime.bigworld.enter_pending_vehicle(battle._server.vehicle_id)
-        runtime.bigworld.callbacks.pop(0)()
-
-        self.assertIn('bot:11', battle._pending_bot_creates)
-        self.assertIn('bot:12', battle._pending_bot_creates)
-        manifests = [value[1] for value in client.sent
-                     if value[0] == 'manifest']
-        self.assertEqual(1, len(manifests))
-
-        # A second empty snapshot can race with the outbound authority
-        # manifest. It must not register/tombstone the local lineup either.
-        battle.on_snapshot({
-            'round_id': 1, 'server_tick': 2,
-            'players': [player], 'bots': []})
-        self.assertNotIn('bot:11', battle._sync._entities)
-        canonical_bots = [dict(
-            value, critical={}, combat_revision=0,
-            combat_base_revision=0, combat_ack_seq=0,
-            combat_fire_elapsed=0.0, combat_fire_timer=0.0)
-            for value in manifests[0]]
-        battle.on_snapshot({
-            'round_id': 1, 'server_tick': 3,
-            'players': [player], 'bots': canonical_bots})
-        self.assertFalse(battle._sync._entities['bot:11']['dead'])
-        self.assertFalse(battle._sync._entities['bot:12']['dead'])
-
-        battle._frame()
-        self.assertIn('bot:11', battle._records)
-        self.assertNotIn('bot:12', battle._records)
-        runtime.bigworld.now += 0.29
-        battle._frame()
-        self.assertNotIn('bot:12', battle._records)
-        runtime.bigworld.now += 0.02
-        battle._frame()
-        self.assertIn('bot:12', battle._records)
-
-        # VehicleDescr returns unloaded #1513 testers in this full startup
-        # fixture. The resolver must admit every bot descriptor before
-        # BotRuntime reads its collision dimensions, not merely make an
-        # isolated factory unit test pass.
-        bot_descriptors = tuple(battle._bots._descriptors.values())
-        self.assertEqual(2, len(bot_descriptors))
-        for descriptor in bot_descriptors:
-            self.assertTrue(all(
-                tester.bbox is not None
-                for tester in descriptor.getHitTesters()))
-            self.assertEqual(
-                (1.5, 3.5, -0.8, 2.0),
-                tank_collision.chassis_shape(descriptor))
-
-        battle.stop(show_login=False)
-        for descriptor in bot_descriptors:
-            self.assertNotIn(id(descriptor), tank_collision._SHAPE_CACHE)
-
     def test_human_readiness_starts_countdown_while_bots_materialize(self):
         runtime = _runtime()
         runtime.bigworld.defer_vehicle_entry = True
@@ -2952,7 +2874,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         client = _Client()
         client.send_battle_ready = mock.Mock(return_value=True)
         start = {
-            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 0,
             'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                 'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -2967,6 +2889,18 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.bigworld.enter_pending_vehicle(battle._server.vehicle_id)
         runtime.bigworld.callbacks.pop(0)()
 
+        # The server authority owns the manifest; bots materialize from its
+        # first canonical snapshot.
+        battle.on_snapshot({
+            'round_id': 1, 'server_tick': 1,
+            'players': [{'id': 1, 'health': 500, 'alive': True}],
+            'bots': [dict(
+                identity, vehicle='ussr:R11_MS-1', health=500,
+                max_health=500, alive=True, x=15.0 + 5.0 * index, y=0.0,
+                z=15.0, yaw=0.0, critical={}, combat_revision=0,
+                combat_base_revision=0, combat_ack_seq=0,
+                combat_fire_elapsed=0.0, combat_fire_timer=0.0)
+                for index, identity in enumerate(start['bots'])]})
         self.assertEqual(2, len(battle._pending_bot_create_order))
         self.assertFalse(battle._ready_sent)
         battle._frame()
@@ -4255,7 +4189,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         client = _Client()
         start = {
-            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 0,
             'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                 'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -4309,7 +4243,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         client = _Client()
         start = {
-            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 0,
             'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                 'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -4331,7 +4265,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         client = _Client()
         start = {
-            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 0,
             'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                 'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -4355,7 +4289,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         client = _Client()
         start = {
-            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 0,
             'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                 'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -4379,7 +4313,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         client = _Client()
         start = {
-            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 0,
             'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                 'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -4470,7 +4404,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         client = _Client()
         start = {
-            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 0,
             'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                 'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -4687,7 +4621,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 ('cover', 0.0), ('ground', 0.004), ('motion', 0.01)):
             self.assertAlmostEqual(expected, durations[name])
 
-    def test_authority_observation_waits_for_the_server_relay(self):
+    def test_frame_never_publishes_bot_messages(self):
         runtime = _runtime()
         runtime.bigworld.now = 1.0
         battle = BattleRuntime(runtime)
@@ -4696,6 +4630,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._last_frame_time = 0.98
         battle._avatar = runtime.bigworld.avatar
         battle._last_snapshot = {'players': []}
+        battle._start_message = {'round_id': 1, 'players': []}
         observation = {
             'type': 'bot_observation',
             'contacts': [{'target_kind': 'human', 'target_id': 1,
@@ -4715,13 +4650,13 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._update_target_outline = mock.Mock()
         battle._apply_authority_bot_poses = mock.Mock()
         battle._update_spotting = mock.Mock()
-        battle._send_bot_message = mock.Mock(return_value=True)
         battle._observe_local_vehicle = mock.Mock()
         battle._schedule = mock.Mock()
 
         battle._frame()
 
-        battle._send_bot_message.assert_called_once_with(observation)
+        self.assertEqual('running', battle.state)
+        self.assertFalse(hasattr(battle, '_send_bot_message'))
         battle._observe_local_vehicle.assert_not_called()
 
     def test_authority_replaces_local_placeholder_and_omits_remote_one(self):
@@ -7975,46 +7910,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         battle.client.send_bot_hit.assert_not_called()
 
-    def test_bot_wall_20_cm_before_vehicle_strictly_blocks_hit(self):
-        runtime = _runtime()
-        battle = BattleRuntime(runtime)
-        battle._avatar = runtime.bigworld.avatar
-        source = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
-                          {'health': 500})
-        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 10),
-                          (0, 0, 0), {'health': 500})
-        target.collideSegmentExt = lambda start, end: [types.SimpleNamespace(
-            dist=10.0, hitAngleCos=1.0,
-            matInfo=types.SimpleNamespace(armor=10.0),
-            compName='vehicleHull')]
-        runtime.bigworld.entities.update({10: source, 11: target})
-        source_record = {'engine_id': 10, 'kind': 'bot', 'network_id': 1,
-                         'local': False}
-        target_record = {'engine_id': 11, 'kind': 'bot', 'network_id': 2,
-                         'local': False, 'state': {'health': 500}}
-        battle._records = {'bot:1': source_record, 'bot:2': target_record}
-        battle._destructibles = types.SimpleNamespace(
-            shot_world_distance=mock.Mock(return_value={
-                'world_distance': 9.8, 'piercing_loss': 0.0,
-                'stop_distance': 9.8, 'continue_from': None,
-                'stopped_by_destructible': False}))
-        battle.client = types.SimpleNamespace(
-            send_bot_bot_hit=mock.Mock(), send_bot_human_hit=mock.Mock())
-        state = {
-            'id': 1,
-            'target_kind': 'bot', 'target_id': 2,
-            'shell_index': 0,
-            'shot_yaw': 0.0, 'shot_pitch': 0.0,
-        }
-
-        with mock.patch(
-                'gui.mods.offline_lan_0922.battle_runtime.'
-                'combat_rules.sample_penetration_factor') as draw:
-            battle._resolve_bot_shot(state, 1)
-
-        draw.assert_not_called()
-        battle.client.send_bot_bot_hit.assert_not_called()
-
     def test_ap_disappears_when_obstacles_exhaust_nominal_piercing(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -8651,7 +8546,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         client = _Client()
         start = {
-            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 0,
             'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                 'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -8678,7 +8573,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         client = _Client()
         local_leave = mock.Mock()
         start = {
-            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 0,
             'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                 'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -8707,7 +8602,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         for round_id in (1, 2):
             start = {
                 'round_id': round_id, 'map': '01_karelia',
-                'bot_authority_id': 1,
+                'bot_authority_id': 0,
                 'players': [{
                     'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                     'vehicle': 'ussr:R11_MS-1', 'health': 500}],
@@ -8835,91 +8730,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual('failed', battle.state)
         self.assertEqual('first native failure', battle.error)
 
-    def test_bot_to_bot_collision_uses_authority_report(self):
-        runtime = _runtime()
-        battle = BattleRuntime(runtime)
-        battle._avatar = runtime.bigworld.avatar
-        source = _Vehicle(10, _Descriptor(), _Vector(0, 0, 0), (0, 0, 0),
-                          {'health': 500})
-        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 20), (0, 0, 0),
-                          {'health': 500})
-        collision = types.SimpleNamespace(
-            dist=20.0, hitAngleCos=1.0,
-            matInfo=types.SimpleNamespace(armor=10.0),
-            compName='vehicleHull')
-        target.collideSegmentExt = lambda start, end: [collision]
-        runtime.bigworld.entities.update({10: source, 11: target})
-        battle._records = {
-            'bot:1': {'engine_id': 10, 'state': {'team': 1},
-                      'kind': 'bot', 'network_id': 1},
-            'bot:2': {'engine_id': 11,
-                      'state': {'team': 2, 'combat_base_revision': 6,
-                                'combat_ack_seq': 2},
-                      'kind': 'bot', 'network_id': 2}}
-        battle.client = types.SimpleNamespace(
-            send_bot_bot_hit=mock.Mock(return_value=True))
-        battle._shell_damage = mock.Mock(return_value=(80, 2))
-        battle._critical_hit = lambda *args, **kwargs: (
-            400, {'events': []})
-
-        self.assertTrue(battle._resolve_bot_shot({
-            'id': 1, 'target_kind': 'bot', 'target_id': 2,
-            'shell_index': 0}, 3))
-        battle.client.send_bot_bot_hit.assert_called_once()
-        sent = battle.client.send_bot_bot_hit.call_args
-        self.assertEqual(400, sent.args[3])
-        self.assertEqual(80, sent.kwargs['hull_damage'])
-        self.assertEqual(6, sent.kwargs[
-            'critical_target_base_revision'])
-        self.assertEqual(2, sent.kwargs['critical_target_ack_seq'])
-
-    def test_bot_shot_uses_same_destructible_loss_and_vehicle_cap(self):
-        runtime = _runtime()
-        battle = BattleRuntime(runtime)
-        battle._avatar = runtime.bigworld.avatar
-        source = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
-                          {'health': 500})
-        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 5), (0, 0, 0),
-                          {'health': 500})
-        target.collideSegmentExt = lambda start, end: [types.SimpleNamespace(
-            dist=5.0, hitAngleCos=1.0,
-            matInfo=types.SimpleNamespace(armor=10.0),
-            compName='vehicleHull')]
-        runtime.bigworld.entities.update({10: source, 11: target})
-        battle._records = {
-            'bot:1': {'engine_id': 10, 'state': {'team': 1},
-                      'kind': 'bot', 'network_id': 1},
-            'bot:2': {'engine_id': 11,
-                      'state': {'team': 2, 'combat_base_revision': 6,
-                                'combat_ack_seq': 2},
-                      'kind': 'bot', 'network_id': 2}}
-        battle.client = types.SimpleNamespace(
-            send_bot_bot_hit=mock.Mock(return_value=True))
-        battle._destructibles = types.SimpleNamespace(
-            shot_world_distance=mock.Mock(return_value={
-                'world_distance': 999999.0, 'piercing_loss': 25.0,
-                'stop_distance': None, 'continue_from': None}))
-        battle._shell_damage = mock.Mock(return_value=(80, 2))
-        battle._critical_hit = lambda *args, **kwargs: (
-            80, {'events': []})
-
-        with mock.patch(
-                'gui.mods.offline_lan_0922.battle_runtime.'
-                'combat_rules.sample_penetration_factor',
-                return_value=0.8) as draw:
-            self.assertTrue(battle._resolve_bot_shot({
-                'id': 1, 'target_kind': 'bot', 'target_id': 2,
-                'shell_index': 0}, 3))
-
-        draw.assert_called_once_with()
-        ray = battle._destructibles.shot_world_distance.call_args.args
-        self.assertAlmostEqual(5.0, (ray[3] - ray[2]).length)
-        self.assertEqual(
-            25.0, battle._shell_damage.call_args.kwargs['pierce_loss'])
-        factor = battle._shell_damage.call_args.kwargs[
-            'penetration_factor']
-        self.assertEqual(0.8, factor)
-
     def test_player_reuses_one_penetration_factor_for_scene_and_vehicle(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -9042,137 +8852,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         draw.assert_not_called()
 
-    def test_bot_shot_resolver_uses_dispersed_barrel_ray(self):
-        runtime = _runtime()
-        battle = BattleRuntime(runtime)
-        battle._avatar = runtime.bigworld.avatar
-        source = _Vehicle(10, _Descriptor(), _Vector(0, 0, 0), (0, 0, 0),
-                          {'health': 500})
-        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 20), (0, 0, 0),
-                          {'health': 500})
-        segments = []
-        collision = types.SimpleNamespace(
-            dist=20.0, hitAngleCos=1.0,
-            matInfo=types.SimpleNamespace(armor=10.0),
-            compName='vehicleHull')
-
-        def collide(start, end):
-            segments.append((start, end))
-            return [collision]
-
-        target.collideSegmentExt = collide
-        runtime.bigworld.entities.update({10: source, 11: target})
-        battle._records = {
-            'bot:1': {'engine_id': 10, 'state': {'team': 1},
-                      'kind': 'bot', 'network_id': 1},
-            'bot:2': {'engine_id': 11, 'state': {'team': 2},
-                      'kind': 'bot', 'network_id': 2}}
-        battle.client = types.SimpleNamespace(
-            send_bot_bot_hit=mock.Mock(return_value=True))
-        battle._critical_hit = lambda *args, **kwargs: (args[5], None)
-
-        self.assertTrue(battle._resolve_bot_shot({
-            'id': 1, 'target_kind': 'bot', 'target_id': 2,
-            'shell_index': 0, 'shot_yaw': math.pi / 2.0,
-            'shot_pitch': 0.1}, 3))
-
-        start, end = segments[0]
-        direction = end - start
-        self.assertAlmostEqual(500.0, direction.length, places=4)
-        direction.normalise()
-        self.assertAlmostEqual(math.cos(0.1), direction.x, places=5)
-        self.assertAlmostEqual(math.sin(0.1), direction.y, places=5)
-        self.assertAlmostEqual(0.0, direction.z, places=5)
-
-    def test_bot_shot_resolver_reports_damage_to_local_human(self):
-        runtime = _runtime()
-        battle = BattleRuntime(runtime)
-        battle._avatar = runtime.bigworld.avatar
-        source = _Vehicle(10, _Descriptor(), _Vector(0, 0, 0), (0, 0, 0),
-                          {'health': 500})
-        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 20), (0, 0, 0),
-                          {'health': 500})
-        collision = types.SimpleNamespace(
-            dist=20.0, hitAngleCos=1.0,
-            matInfo=types.SimpleNamespace(
-                armor=10.0, vehicleDamageFactor=1.0),
-            compName='vehicleHull')
-        target.collideSegmentExt = mock.Mock(side_effect=AssertionError(
-            'native collision uses the stale retail vehicle filter'))
-        runtime.bigworld.entities.update({10: source, 11: target})
-        battle._records = {
-            'bot:1': {'engine_id': 10, 'state': {'team': 2},
-                      'kind': 'bot', 'network_id': 1},
-            'player:7': {'engine_id': 11,
-                         'state': {'team': 1,
-                                   'critical_base_revision': 4,
-                                   'critical_ack_seq': 1},
-                         'kind': 'player', 'network_id': 7, 'local': True}}
-        battle._local_matrix = _Matrix(target.matrix)
-        battle.client = types.SimpleNamespace(
-            send_bot_human_hit=mock.Mock(return_value=True))
-        battle._shell_damage = mock.Mock(return_value=(90, 2))
-        battle._critical_hit = lambda *args, **kwargs: (
-            450, {'events': []})
-
-        with mock.patch(
-                'gui.mods.offline_lan_0922.battle_runtime.'
-                'collide_vehicle_at_matrix',
-                return_value=[collision]) as collide_at_matrix:
-            self.assertTrue(battle._resolve_bot_shot({
-                'id': 1, 'target_kind': 'human', 'target_id': 7,
-                'shell_index': 0, 'shot_yaw': 0.0,
-                'shot_pitch': 0.0}, 3))
-
-        args = battle.client.send_bot_human_hit.call_args[0]
-        self.assertEqual((1, 7, 3), args[:3])
-        self.assertEqual(450, args[3])
-        kwargs = battle.client.send_bot_human_hit.call_args.kwargs
-        self.assertEqual(90, kwargs['hull_damage'])
-        self.assertEqual(4, kwargs['critical_target_base_revision'])
-        self.assertEqual(1, kwargs['critical_target_ack_seq'])
-        collide_at_matrix.assert_called_once()
-        self.assertIs(target, collide_at_matrix.call_args[0][0])
-        self.assertIs(battle._local_matrix,
-                      collide_at_matrix.call_args[0][1])
-        target.collideSegmentExt.assert_not_called()
-
-    def test_bot_shot_collision_contract_failure_is_not_a_silent_miss(self):
-        runtime = _runtime()
-        battle = BattleRuntime(runtime)
-        battle._avatar = runtime.bigworld.avatar
-        source = _Vehicle(10, _Descriptor(), _Vector(0, 0, 0), (0, 0, 0),
-                          {'health': 500})
-        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 20), (0, 0, 0),
-                          {'health': 500})
-        target.collideSegmentExt = mock.Mock(
-            side_effect=RuntimeError('native collision failed'))
-        runtime.bigworld.entities.update({10: source, 11: target})
-        battle._records = {
-            'bot:1': {'engine_id': 10, 'state': {'team': 2},
-                      'kind': 'bot', 'network_id': 1},
-            'player:7': {'engine_id': 11, 'state': {'team': 1},
-                         'kind': 'player', 'network_id': 7}}
-
-        with self.assertRaisesRegex(RuntimeError, 'native collision failed'):
-            battle._resolve_bot_shot({
-                'id': 1, 'target_kind': 'human', 'target_id': 7,
-                'shell_index': 0, 'shot_yaw': 0.0,
-                'shot_pitch': 0.0}, 3)
-
-    def test_bot_ram_message_uses_authority_client_contract(self):
-        battle = BattleRuntime(_runtime())
-        battle.client = types.SimpleNamespace(
-            send_bot_ram=mock.Mock(return_value=True))
-
-        self.assertTrue(battle._send_bot_message({
-            'type': 'bot_ram', 'bot_id': 11, 'target_kind': 'human',
-            'target_id': 2, 'ram_seq': 4, 'damage_to_bot': 20,
-            'damage_to_target': 40}))
-
-        battle.client.send_bot_ram.assert_called_once_with(
-            11, 'human', 2, 4, 20, 40)
-
     def test_snapshot_health_is_forwarded_to_authority_runtime(self):
         battle = BattleRuntime(_runtime())
         battle._bots = types.SimpleNamespace(apply_snapshot=mock.Mock())
@@ -9207,22 +8886,23 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._drive_local(0.1)
         self.assertEqual([], entity.teleports)
 
-    def test_authority_takeover_primes_seen_fire_sequences(self):
+    def test_authority_event_naming_a_client_fails_the_battle(self):
         battle = BattleRuntime(_runtime())
-        battle._start_message = {'round_id': 4, 'bot_authority_id': 2}
-        battle._last_snapshot = {'bots': [
-            {'id': 11, 'fire_seq': 9, 'health': 500, 'alive': True}]}
-        battle._bots = types.SimpleNamespace(
+        battle._start_message = {'round_id': 4, 'bot_authority_id': 0}
+        battle._last_snapshot = {'bots': []}
+        bots = types.SimpleNamespace(
+            authority_id=0,
             battle_start=mock.Mock(return_value=[]),
-            apply_snapshot=mock.Mock(), is_authority=lambda: True)
+            apply_snapshot=mock.Mock(), is_authority=lambda: False)
+        battle._bots = bots
 
         battle.on_events({'events': [{
             'event_id': '4:1:0',
             'kind': 'authority', 'round_id': 4, 'player_id': 1}]})
 
-        self.assertEqual(9, battle._bot_fire_seen[11])
-        battle._bots.apply_snapshot.assert_called_once_with(
-            battle._last_snapshot)
+        self.assertEqual('failed', battle.state)
+        self.assertIn('bot authority', battle.error)
+        bots.battle_start.assert_not_called()
 
     def test_loading_roster_updates_authority_before_bots_exist(self):
         battle = BattleRuntime(_runtime())
@@ -9237,45 +8917,21 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(1, battle._start_message['bot_authority_id'])
 
-    def test_snapshot_recovers_authority_takeover_without_event(self):
+    def test_snapshot_moving_authority_to_a_client_fails_the_battle(self):
         battle = BattleRuntime(_runtime())
-        battle._start_message = {'round_id': 4, 'bot_authority_id': 2}
-        battle._send_bot_message = mock.Mock(return_value=True)
+        battle._start_message = {'round_id': 4, 'bot_authority_id': 0}
         bots = types.SimpleNamespace(
-            authority_id=2,
-            battle_start=mock.Mock(return_value=[{
-                'type': 'bot_manifest', 'bots': [{'id': 11}]}]),
-            apply_snapshot=mock.Mock(), is_authority=lambda: True)
+            authority_id=0,
+            battle_start=mock.Mock(return_value=[]),
+            apply_snapshot=mock.Mock(), is_authority=lambda: False)
         battle._bots = bots
-        snapshot = {
-            'round_id': 4, 'bot_authority_id': 1,
-            'bot_manifest': [{
-                'id': 11,
-                'profile': {'dominant_role': 'sniper'},
-                'route': {'id': 'ridge', 'waypoints': []}}],
-            'bots': [{'id': 11, 'fire_seq': 9,
-                      'health': 500, 'alive': True,
-                      'x': 123.0, 'y': 4.0, 'z': -87.0, 'yaw': 1.25}]}
+        snapshot = {'round_id': 4, 'bot_authority_id': 1, 'bots': []}
 
         battle.on_snapshot(snapshot)
 
-        bots.battle_start.assert_called_once()
-        takeover = bots.battle_start.call_args[0][0]
-        self.assertEqual('sniper',
-                         takeover['bot_manifest'][0]['profile']['dominant_role'])
-        self.assertEqual('ridge',
-                         takeover['bot_manifest'][0]['route']['id'])
-        self.assertEqual(9, takeover['bot_manifest'][0]['fire_seq'])
-        self.assertEqual(500, takeover['bot_manifest'][0]['health'])
-        self.assertEqual((123.0, 4.0, -87.0, 1.25), (
-            takeover['bot_manifest'][0]['x'],
-            takeover['bot_manifest'][0]['y'],
-            takeover['bot_manifest'][0]['z'],
-            takeover['bot_manifest'][0]['yaw']))
-        battle._send_bot_message.assert_called_once_with({
-            'type': 'bot_manifest', 'bots': [{'id': 11}]})
-        bots.apply_snapshot.assert_called_once_with(snapshot)
-        self.assertEqual(9, battle._bot_fire_seen[11])
+        self.assertEqual('failed', battle.state)
+        self.assertIn('bot authority', battle.error)
+        bots.battle_start.assert_not_called()
 
 
 if __name__ == '__main__':

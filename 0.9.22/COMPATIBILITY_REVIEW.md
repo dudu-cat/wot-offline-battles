@@ -893,10 +893,12 @@ published to other handlers until its own `welcome` has been sent under the
 same state lock, so another player cannot start a battle whose first message to
 the new client would arrive before its identity and round assignment.
 
-The elected authority client runs tactical bots using standard-map annotations,
+The server-hosted authority runs tactical bots using standard-map annotations,
 vehicle roles, persistent randomized personalities, bounded line-of-sight
 caching and local avoidance of terrain, water, steep slopes, obstacles and
-nearby vehicles. The Python server remains canonical for room phase, HP, shot
+nearby vehicles. A #1513 client never simulates bots: it refuses any message
+that assigns the bot authority to it and fails the battle loudly instead. The
+Python server remains canonical for room phase, HP, shot
 events, elimination, capture, timeout and the copied five-second result
 interval. The next waiting roster
 is a synchronization barrier: the previous battle runtime is destroyed before
@@ -907,8 +909,8 @@ be reordered across that barrier.
 
 The pure-data server planner emits revisioned global `bot_orders`, which the
 0.9.22 authority now uses for macro targets after reporting bounded visibility
-observations. BigWorld terrain, collision, water and slope probes remain local,
-and the client planner is a fallback when no server order is available. The
+observations, and the shared planner is a fallback when no order is
+available. The
 server copies the 0.8.2 standard-mode capture law: a 50-metre radius, one
 update per second, at most three capture points per update, defender stop,
 empty-base reset and victory at 100 points. Standard battles end by

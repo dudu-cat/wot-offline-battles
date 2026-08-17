@@ -144,7 +144,7 @@ def _event():
 
 
 class BattleProjectileTests(unittest.TestCase):
-    def test_bot_authority_change_invalidates_artillery_proofs_once(self):
+    def test_bot_authority_change_fails_instead_of_taking_over(self):
         battle, unused_bigworld = _battle()
 
         class _Bots(object):
@@ -161,15 +161,15 @@ class BattleProjectileTests(unittest.TestCase):
         battle._bots = _Bots()
         battle._artillery = types.SimpleNamespace(reset=mock.Mock())
         battle._start_message = {
-            'round_id': 1, 'bot_authority_id': 1, 'bot_manifest': []}
+            'round_id': 1, 'bot_authority_id': 0, 'bot_manifest': []}
         battle._last_snapshot = {'bots': []}
 
         self.assertFalse(battle._reconcile_bot_authority(1))
         battle._artillery.reset.assert_not_called()
-        self.assertTrue(battle._reconcile_bot_authority(2))
-        battle._artillery.reset.assert_called_once_with()
-        self.assertFalse(battle._reconcile_bot_authority(2))
-        battle._artillery.reset.assert_called_once_with()
+        with self.assertRaisesRegex(RuntimeError,
+                                    'simulated only on the server'):
+            battle._reconcile_bot_authority(2)
+        battle._artillery.reset.assert_not_called()
 
     def test_artillery_final_probe_uses_exact_native_muzzle(self):
         battle, unused_bigworld = _battle()
@@ -203,95 +203,6 @@ class BattleProjectileTests(unittest.TestCase):
 
         self.assertTrue(battle._bot_artillery_cancel(source))
         battle._artillery.cancel_launch.assert_called_once_with(source)
-
-    def test_bot_launch_without_native_muzzle_fails_closed(self):
-        battle, unused_bigworld = _battle()
-        shot = types.SimpleNamespace(
-            shell=types.SimpleNamespace(kind='ARMOR_PIERCING'),
-            speed=100.0, gravity=9.81, maxDistance=500.0)
-        descriptor = types.SimpleNamespace(
-            gun=types.SimpleNamespace(shots=[shot]))
-        source = types.SimpleNamespace(
-            isStarted=True, typeDescriptor=descriptor,
-            position=_Vector((4.0, 5.0, 6.0)),
-            model=types.SimpleNamespace(node=mock.Mock(
-                side_effect=RuntimeError('native muzzle unavailable'))))
-        battle._records['bot:11'] = {'engine_id': 77}
-        battle._server_entity = lambda entity_id: (
-            source if entity_id == 77 else None)
-
-        self.assertFalse(battle._launch_bot_projectile({
-            'id': 11, 'profile': {'class_tag': 'MT'},
-            'shot_yaw': 0.0, 'shot_pitch': 0.0, 'shell_index': 0,
-        }, 1))
-        self.assertEqual([], battle.client.launches)
-
-    def test_spg_launch_reuses_the_proved_origin_and_velocity(self):
-        battle, unused_bigworld = _battle()
-        speed = 10.0
-        yaw = 0.25
-        pitch = 0.15
-        horizontal = math.cos(pitch)
-        origin = (3.0, 4.0, 5.0)
-        velocity = (
-            math.sin(yaw) * horizontal * speed,
-            math.sin(pitch) * speed,
-            math.cos(yaw) * horizontal * speed)
-        shot = types.SimpleNamespace(
-            shell=types.SimpleNamespace(kind='ARMOR_PIERCING'),
-            speed=speed, gravity=9.81, maxDistance=100.0)
-        descriptor = types.SimpleNamespace(
-            gun=types.SimpleNamespace(shots=[shot]))
-        source = types.SimpleNamespace(
-            isStarted=True, typeDescriptor=descriptor,
-            model=types.SimpleNamespace(node=mock.Mock(
-                side_effect=AssertionError('SPG launch re-sampled muzzle'))))
-        battle._records['bot:11'] = {
-            'engine_id': 77, 'network_id': 11, 'kind': 'bot'}
-        battle._server_entity = lambda entity_id: (
-            source if entity_id == 77 else None)
-        proof = (
-            'launch', 11, 'player', 7, 0, 4, origin,
-            yaw, pitch, speed, 9.81, 100.0, 2.0)
-        state = {
-            'id': 11, 'profile': {'class_tag': 'SPG'},
-            'fire_seq': 4, 'shell_index': 0,
-            'shot_yaw': yaw, 'shot_pitch': pitch,
-            'shot_origin': origin, 'shot_velocity': velocity,
-            'shot_gravity': 9.81, 'shot_max_distance': 100.0,
-            'shot_max_time_ms': 20000, 'shot_proof_key': proof,
-        }
-
-        self.assertTrue(battle._launch_bot_projectile(state, 4))
-        args, unused_kwargs = battle.client.launches[-1]
-        self.assertEqual(list(origin), args[4])
-        self.assertEqual(list(velocity), args[5])
-        self.assertEqual(20000, args[8])
-        source.model.node.assert_not_called()
-
-        state['shot_velocity'] = (velocity[0] + 0.01,) + velocity[1:]
-        battle.client.launches = []
-        self.assertFalse(battle._launch_bot_projectile(state, 4))
-        self.assertEqual([], battle.client.launches)
-
-    def test_spg_without_final_path_receipt_never_launches(self):
-        battle, unused_bigworld = _battle()
-        shot = types.SimpleNamespace(
-            shell=types.SimpleNamespace(kind='ARMOR_PIERCING'),
-            speed=10.0, gravity=9.81, maxDistance=100.0)
-        source = types.SimpleNamespace(
-            isStarted=True,
-            typeDescriptor=types.SimpleNamespace(
-                gun=types.SimpleNamespace(shots=[shot])))
-        battle._records['bot:11'] = {'engine_id': 77}
-        battle._server_entity = lambda entity_id: (
-            source if entity_id == 77 else None)
-
-        self.assertFalse(battle._launch_bot_projectile({
-            'id': 11, 'profile': {'class_tag': 'SPG'},
-            'shot_yaw': 0.0, 'shot_pitch': 0.1, 'shell_index': 0,
-        }, 1))
-        self.assertEqual([], battle.client.launches)
 
     def test_receive_timestamp_preserves_launch_age_across_main_thread_stall(self):
         battle, bigworld = _battle(now=11.0)

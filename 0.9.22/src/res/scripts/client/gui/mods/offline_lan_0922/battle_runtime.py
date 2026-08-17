@@ -693,7 +693,6 @@ class BattleRuntime(object):
         self._last_health = {}
         self._client_ready_received = False
         self._local_descriptor = None
-        self._bot_fire_seen = {}
         self._bot_destructible_samples = {}
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
@@ -826,7 +825,6 @@ class BattleRuntime(object):
         self._last_health = {}
         self._client_ready_received = False
         self._local_descriptor = None
-        self._bot_fire_seen = {}
         self._bot_destructible_samples = {}
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
@@ -1657,22 +1655,9 @@ class BattleRuntime(object):
                     lambda: (self.local_health() or 0) > 0,
                     lambda: self.state == 'running' and self._battle_live,
                     VehicleStatePresenter(provider, vehicle_view_state))
-            for outgoing in self._bots.battle_start(self._start_message):
-                # The authority already owns the exact bot poses it is about
-                # to publish.  Materialize that canonical lineup locally now,
-                # like 0.8.2 does, instead of waiting for a server echo.  Do
-                # not register it in SnapshotSync until the server echoes the
-                # canonical lineup: an in-flight empty snapshot between send
-                # and echo must not tombstone the local manifest.
-                if outgoing.get('type') == 'bot_manifest':
-                    for state in outgoing.get('bots') or ():
-                        if isinstance(state, dict) and state.get('id') is not None:
-                            self._queue_bot_create({
-                                'type': 'create',
-                                'entity': 'bot:%s' % state['id'],
-                                'kind': 'bot', 'id': state['id'],
-                                'state': state})
-                self._send_bot_message(outgoing)
+            self._assert_server_bot_authority(
+                self._start_message.get('bot_authority_id'))
+            self._bots.battle_start(self._start_message)
             if self._last_snapshot is not None:
                 self._bots.apply_snapshot(self._last_snapshot)
             self.state = 'running'
@@ -3377,7 +3362,11 @@ class BattleRuntime(object):
                 'authority_fallback_reason')
         if self._bots is None:
             return True
-        return self._reconcile_bot_authority(player_id)
+        try:
+            return self._reconcile_bot_authority(player_id)
+        except Exception as error:
+            self._fail(error)
+            return False
 
     def on_bot_observation(self, message):
         """Consume one server-admitted observation without relaying it."""
@@ -3394,52 +3383,27 @@ class BattleRuntime(object):
             self._fail(error)
             return False
 
+    def _assert_server_bot_authority(self, player_id):
+        """The #1513 bot simulation runs only on the LAN server."""
+        if player_id is None:
+            return
+        try:
+            local = int(player_id) == int(self.client.player_id)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if local:
+            raise RuntimeError(
+                'LAN server assigned the bot authority to this client; '
+                '#1513 bots are simulated only on the server')
+
     def _reconcile_bot_authority(self, player_id):
-        """Recover authority changes even if the one-shot event was missed."""
+        """Reject any mid-round attempt to move the bot simulation."""
         if (self._bots is None or
                 getattr(self._bots, 'authority_id', None) == player_id):
             return False
-        # Arc jobs and completed launch receipts are native-world proofs made
-        # by one authority.  They must never survive an ownership handoff,
-        # regardless of whether this client gains or loses simulation duty.
-        if self._artillery is not None:
-            self._artillery.reset()
-        start = dict(self._start_message or {})
-        start['bot_authority_id'] = player_id
-        snapshot = self._last_snapshot or {}
-        manifest = snapshot.get(
-            'bot_manifest', start.get('bot_manifest', [])) or []
-        live_by_id = {}
-        for raw in snapshot.get('bots') or ():
-            if isinstance(raw, dict) and raw.get('id') is not None:
-                live_by_id[int(raw['id'])] = raw
-        # The server manifest intentionally owns identity/profile/route while
-        # snapshot.bots owns the canonical live pose and fire sequence.  Merge
-        # both before promoting a new authority; using the manifest alone
-        # respawned every bot at its formation slot during failover.
-        takeover = []
-        for raw in manifest:
-            if not isinstance(raw, dict) or raw.get('id') is None:
-                continue
-            merged = dict(raw)
-            merged.update(live_by_id.get(int(raw['id']), {}))
-            takeover.append(merged)
-        if not takeover:
-            takeover = [dict(raw) for raw in snapshot.get('bots') or ()
-                        if isinstance(raw, dict)]
-        start['bot_manifest'] = takeover
-        if snapshot.get('battle_result') is not None:
-            start['battle_result'] = snapshot.get('battle_result')
-        for outgoing in self._bots.battle_start(start):
-            self._send_bot_message(outgoing)
-        if self._bots.is_authority():
-            for state in snapshot.get('bots') or ():
-                try:
-                    self._bot_fire_seen[int(state['id'])] = max(
-                        0, int(state.get('fire_seq', 0)))
-                except (KeyError, TypeError, ValueError):
-                    continue
-        return True
+        raise RuntimeError(
+            'LAN server moved the bot authority to %r mid-round; '
+            '#1513 bots are simulated only on the server' % (player_id,))
 
     def on_events(self, message):
         if self.state in ('failed', 'stopped'):
@@ -5781,10 +5745,6 @@ class BattleRuntime(object):
                 next_boundary = _PROFILE_CLOCK()
                 stages['bot_present'] = max(0.0, next_boundary - boundary)
                 boundary = next_boundary
-            if self._battle_live and self._bots is not None:
-                for outgoing in outgoing_messages:
-                    if self._send_bot_message(outgoing):
-                        self._resolve_bot_fire(outgoing)
             if (self._battle_live and
                     (self._projectile_is_authority() or
                      self._projectile_visual_meta)):
@@ -7020,289 +6980,6 @@ class BattleRuntime(object):
         return self._artillery.advance(
             now, ARTILLERY_ARC_RAYS_PER_FRAME,
             self._artillery_arc_probe)
-
-    def _send_bot_message(self, message):
-        kind = message.get('type')
-        if kind == 'bot_manifest':
-            return self.client.send_bot_manifest(message.get('bots'))
-        if kind == 'bot_state':
-            return self.client.send_bot_state(message.get('bots'))
-        if kind == 'bot_observation':
-            return self.client.send_bot_observation(
-                message.get('contacts'), message.get('affordances'))
-        if kind == 'bot_human_hit':
-            return self.client.send_bot_human_hit(
-                message.get('attacker_bot'), message.get('target'),
-                message.get('shot_seq'), message.get('damage'),
-                message.get('shot_result'), message.get('impact_position'))
-        if kind == 'bot_ram':
-            return self.client.send_bot_ram(
-                message.get('bot_id'), message.get('target_kind'),
-                message.get('target_id'), message.get('ram_seq'),
-                message.get('damage_to_bot'),
-                message.get('damage_to_target'))
-        if kind == 'rules_state':
-            rules = message.get('rules') or {}
-            return self.client.send_rules_state(rules.get('bases'))
-        if kind == 'battle_result':
-            return self.client.send_battle_result(
-                message.get('winner'), message.get('reason'),
-                message.get('base_team'))
-        return False
-
-    def _resolve_bot_fire(self, message):
-        if message.get('type') != 'bot_state':
-            return
-        for state in message.get('bots') or ():
-            try:
-                bot_id = int(state.get('id'))
-                fire_seq = int(state.get('fire_seq', 0))
-            except (TypeError, ValueError):
-                continue
-            previous = self._bot_fire_seen.get(bot_id, 0)
-            if (fire_seq > previous and
-                    self._launch_bot_projectile(state, fire_seq)):
-                self._bot_fire_seen[bot_id] = fire_seq
-
-    def _launch_bot_projectile(self, state, shot_seq):
-        """Publish one Bot launch; damage waits for the canonical projectile."""
-        try:
-            bot_id = int(state.get('id'))
-            shot_yaw = float(state.get('shot_yaw'))
-            shot_pitch = float(state.get('shot_pitch'))
-        except (TypeError, ValueError):
-            return False
-        source_record = self._records.get('bot:%s' % bot_id)
-        if source_record is None:
-            return False
-        source = self._server_entity(source_record['engine_id'])
-        if (source is None or source.typeDescriptor is None or
-                not getattr(source, 'isStarted', False)):
-            return False
-        shot = self._descriptor_shot(
-            source.typeDescriptor, state.get('shell_index'))
-        speed = _number(_field(shot, 'speed'), -1.0)
-        gravity = _number(_field(shot, 'gravity'), -1.0)
-        maximum = _number(_field(shot, 'maxDistance'), -1.0)
-        if speed <= 0.0 or gravity <= 0.0 or maximum <= 0.0:
-            return False
-        profile = state.get('profile')
-        profile = profile if isinstance(profile, dict) else {}
-        is_spg = str(profile.get('class_tag') or '') == 'SPG'
-        max_time_ms = PROJECTILE_MAX_TIME_MS
-        if is_spg:
-            proof_key = state.get('shot_proof_key')
-            try:
-                origin = tuple(float(value)
-                               for value in state['shot_origin'])
-                velocity = tuple(float(value)
-                                 for value in state['shot_velocity'])
-                receipt_gravity = float(state['shot_gravity'])
-                receipt_maximum = float(state['shot_max_distance'])
-                max_time_ms = int(state['shot_max_time_ms'])
-                proof_origin = tuple(float(value)
-                                     for value in proof_key[6])
-                proof_flight = float(proof_key[12])
-                if (len(origin) != 3 or len(velocity) != 3 or
-                        not isinstance(proof_key, (list, tuple)) or
-                        len(proof_key) < 13):
-                    return False
-                proof_values = (
-                    proof_key[0], int(proof_key[1]), int(proof_key[4]),
-                    int(proof_key[5]), float(proof_key[7]),
-                    float(proof_key[8]), float(proof_key[9]),
-                    float(proof_key[10]), float(proof_key[11]))
-            except (KeyError, TypeError, ValueError, IndexError,
-                    OverflowError):
-                return False
-            values = origin + velocity + (
-                receipt_gravity, receipt_maximum, proof_flight)
-            horizontal = math.cos(shot_pitch)
-            expected_velocity = (
-                math.sin(shot_yaw) * horizontal * speed,
-                math.sin(shot_pitch) * speed,
-                math.cos(shot_yaw) * horizontal * speed)
-            if (any(math.isnan(value) or math.isinf(value)
-                    for value in values) or
-                    proof_values[0] != 'launch' or
-                    proof_values[1] != bot_id or
-                    proof_values[2] != max(
-                        0, int(state.get('shell_index', 0) or 0)) or
-                    proof_values[3] != int(shot_seq) or
-                    proof_values[4] != shot_yaw or
-                    proof_values[5] != shot_pitch or
-                    proof_values[6] != speed or
-                    proof_values[7] != gravity or
-                    proof_values[8] != maximum or
-                    proof_origin != origin or
-                    receipt_gravity != gravity or
-                    receipt_maximum != maximum or
-                    max_time_ms <= 0 or
-                    max_time_ms > PROJECTILE_MAX_TIME_MS or
-                    proof_flight <= 0.0 or
-                    proof_flight * 1000.0 > max_time_ms + 1e-6 or
-                    any(abs(velocity[index] - expected_velocity[index]) >
-                        1e-7 for index in range(3))):
-                return False
-        else:
-            try:
-                gun_node = source.model.node('HP_gunFire')
-                origin = _xyz(
-                    self._runtime.math.Matrix(gun_node).translation)
-            except Exception:
-                # A guessed hull-centre origin can start beyond nearby cover.
-                # Every canonical shell must leave the native gun-fire node.
-                return False
-            horizontal = math.cos(shot_pitch)
-            direction = (
-                math.sin(shot_yaw) * horizontal,
-                math.sin(shot_pitch),
-                math.cos(shot_yaw) * horizontal)
-            length = math.sqrt(sum(component * component
-                                   for component in direction))
-            if length <= 0.000001:
-                return False
-            velocity = tuple(
-                component * speed / length for component in direction)
-        is_he = combat_rules.is_he(shot)
-        sender = getattr(self.client, 'send_projectile_launch', None)
-        if not callable(sender):
-            return False
-        accepted = sender(
-            'bot', bot_id, int(shot_seq),
-            max(0, int(state.get('shell_index', 0) or 0)),
-            list(origin), list(velocity), gravity, maximum,
-            max_time_ms, is_he,
-            combat_rules.he_radius(shot) if is_he else 0.0,
-            authority_epoch=getattr(self.client, 'authority_epoch', None),
-            penetration_factor=combat_rules.sample_penetration_factor())
-        return accepted == int(shot_seq)
-
-    def _resolve_bot_shot(self, state, shot_seq):
-        try:
-            bot_id = int(state.get('id'))
-            target_kind = state.get('target_kind')
-            target_id = int(state.get('target_id'))
-        except (TypeError, ValueError):
-            return False
-        source_record = self._records.get('bot:%s' % bot_id)
-        record_kind = 'player' if target_kind == 'human' else target_kind
-        target_record = self._records.get('%s:%s' % (record_kind, target_id))
-        if source_record is None or target_record is None:
-            return False
-        source = self._server_entity(source_record['engine_id'])
-        target = self._server_entity(target_record['engine_id'])
-        if (source is None or target is None or
-                source.typeDescriptor is None or
-                not getattr(target, 'isStarted', False)):
-            return False
-        source_position = _xyz(getattr(source, 'position', state))
-        target_position = _xyz(getattr(
-            target, 'position', target_record.get('state', {})))
-        gun_node = source.model.node('HP_gunFire')
-        start = self._vector(
-            self._runtime.math.Matrix(gun_node).translation)
-        destination = self._vector((
-            target_position[0], target_position[1] + 1.2,
-            target_position[2]))
-        target_direction = destination - start
-        target_distance = target_direction.length
-        if target_distance <= 0.01:
-            return False
-        shot = self._descriptor_shot(
-            source.typeDescriptor, state.get('shell_index'))
-        maximum = max(0.01, _number(
-            _field(shot, 'maxDistance', 5000.0), 5000.0))
-        if 'shot_yaw' in state and 'shot_pitch' in state:
-            shot_yaw = _number(state.get('shot_yaw'))
-            shot_pitch = _number(state.get('shot_pitch'))
-            horizontal = math.cos(shot_pitch)
-            direction = self._vector((
-                math.sin(shot_yaw) * horizontal,
-                math.sin(shot_pitch),
-                math.cos(shot_yaw) * horizontal))
-            direction.normalise()
-        else:
-            # Compatibility fallback for recorded v5 fixtures and an authority
-            # takeover snapshot created before shot angles were published.
-            direction = target_direction
-            direction.normalise()
-        end = start + direction.scale(maximum)
-        hit_record = None
-        target_collisions = None
-        distance = 999999.0
-        for record in self._records.values():
-            if record is source_record:
-                continue
-            candidate = self._server_entity(record['engine_id'])
-            if candidate is None or not getattr(candidate, 'isStarted', False):
-                continue
-            if (record.get('local') and self._local_matrix is not None):
-                candidate_collisions = collide_vehicle_at_matrix(
-                    candidate, self._local_matrix, start, end,
-                    self._runtime.math)
-            else:
-                candidate_collisions = candidate.collideSegmentExt(start, end)
-            if not candidate_collisions:
-                continue
-            nearest = min(candidate_collisions,
-                          key=lambda item: float(item.dist))
-            if float(nearest.dist) < distance:
-                hit_record = record
-                target_collisions = tuple(candidate_collisions)
-                distance = float(nearest.dist)
-        scene_end = end
-        if hit_record is not None and target_collisions is not None:
-            scene_end = start + direction.scale(
-                max(0.0, min(maximum, distance)))
-        scene = self._resolve_shot_scene(
-            start, scene_end, direction, shot)
-        penetration_factor = scene.get('penetration_factor')
-        world_distance = scene['world_distance']
-        if hit_record is None or target_collisions is None:
-            if (combat_rules.is_he(shot) and
-                    world_distance < maximum):
-                self._he_splash(
-                    start + direction.scale(world_distance), shot, shot_seq,
-                    None, 'bot', bot_id, source_record['engine_id'])
-            return False
-        if (scene.get('stopped_by_destructible') or
-                distance > world_distance + _SHOT_OCCLUSION_EPSILON):
-            if combat_rules.is_he(shot):
-                self._he_splash(
-                    start + direction.scale(world_distance), shot, shot_seq,
-                    None, 'bot', bot_id, source_record['engine_id'])
-            return False
-        if penetration_factor is None:
-            penetration_factor = combat_rules.sample_penetration_factor()
-        damage, result = self._shell_damage(
-            source.typeDescriptor, target_collisions, distance,
-            shell_index=state.get('shell_index'),
-            pierce_loss=scene['piercing_loss'],
-            penetration_factor=penetration_factor)
-        impact = start + direction.scale(distance)
-        hull_damage = damage
-        damage, critical = self._critical_hit(
-            target, source.typeDescriptor, target_collisions, start, end,
-            damage, result, source.id, state.get('shell_index'))
-        critical_contract = self._critical_proposal_contract(
-            hit_record, critical, hull_damage)
-        sent = False
-        if hit_record.get('kind') == 'bot':
-            sent = self.client.send_bot_bot_hit(
-                bot_id, hit_record['network_id'], shot_seq,
-                damage, result, _xyz(impact), critical,
-                **critical_contract)
-        elif hit_record.get('kind') == 'player':
-            sent = self.client.send_bot_human_hit(
-                bot_id, hit_record['network_id'], shot_seq,
-                damage, result, _xyz(impact), critical,
-                **critical_contract)
-        if combat_rules.is_he(shot):
-            self._he_splash(
-                impact, shot, shot_seq, hit_record, 'bot', bot_id,
-                source_record['engine_id'])
-        return sent
 
     def _apply_sync_event(self, event):
         if self.state in ('failed', 'stopped'):
@@ -8559,7 +8236,6 @@ class BattleRuntime(object):
         self._client_ready_received = False
         self._local_descriptor = None
         self._vehicle_ready_deadline = 0.0
-        self._bot_fire_seen = {}
         self._bot_destructible_samples = {}
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
