@@ -316,7 +316,9 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None):
     """Resolve one hull against other hulls using only plain data.
 
     A body with ``alive`` false is a wreck: it still blocks and separates, but
-    it never moves and never produces a ram event.
+    it never moves and never produces a ram event.  A body with ``impulse``
+    false separates without transferring velocity, which leaves one owner for
+    a contact that both sides resolve.
 
     The return value is a mapping with:
 
@@ -395,8 +397,13 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None):
             (other_velocity_x, other_velocity_z))
         correction_x += response[0]
         correction_z += response[1]
-        delta_velocity_x += response[2]
-        delta_velocity_z += response[3]
+        # One owner per contact velocity.  When both sides cancel the same
+        # closing velocity in the same frame, each re-solves against the
+        # other's already-corrected pose and the pair oscillates; the body
+        # that owns the pair keeps the impulse and the other only separates.
+        if _tank_value(other, 'impulse', True):
+            delta_velocity_x += response[2]
+            delta_velocity_z += response[3]
 
         normal_velocity = (
             (velocity_x - other_velocity_x) * contact[0] +

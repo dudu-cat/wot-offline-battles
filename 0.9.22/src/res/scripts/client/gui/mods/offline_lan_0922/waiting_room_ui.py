@@ -103,31 +103,36 @@ class NativeSurface(object):
         return bool(self._gui.mcursor().active)
 
     def show_cursor(self):
-        """Make the native mouse cursor visible and active.
+        """Make the native cursor active but keep it unpainted.
 
-        Prefer the stock helper so this room uses the exact pair #1513 uses
-        itself; both branches end with ``BigWorld.setCursor``.
+        ``gui/mouse_cursors.xml`` in this build is 12 bytes and defines no
+        shapes, so a visible mcursor falls back to the OS default and the
+        player sees the Windows busy pointer.  Activating it still makes
+        ``mcursor.position`` track the mouse, which is what the room's own
+        drawn arrow follows.
         """
-        try:
-            from Scaleform import showCursor
-        except ImportError:
-            showCursor = None
-        if callable(showCursor):
-            showCursor()
-            return True
         import BigWorld
         cursor = self._gui.mcursor()
-        cursor.visible = True
         BigWorld.setCursor(cursor)
+        cursor.visible = False
         return True
 
-    def hide_cursor(self):
-        """Return the native cursor to the state the lobby expects.
+    def screen_size(self):
+        """Return the screen size in pixels, or None when unavailable."""
+        resolution = getattr(self._gui, 'screenResolution', None)
+        if not callable(resolution):
+            return None
+        try:
+            width, height = resolution()
+            width, height = float(width), float(height)
+        except (TypeError, ValueError):
+            return None
+        if width <= 0.0 or height <= 0.0:
+            return None
+        return width, height
 
-        The lobby keeps its mcursor active but invisible while Scaleform draws
-        the arrow, so restore only the visibility this room changed.  Detaching
-        the cursor outright would take it from the lobby's own manager.
-        """
+    def hide_cursor(self):
+        """Leave the cursor as the lobby keeps it: active and unpainted."""
         self._gui.mcursor().visible = False
         return True
 
@@ -154,6 +159,7 @@ class _ControlScript(object):
         completes the engine's move path.  Returning False keeps the event
         propagating so the tooltip and drag managers still see it.
         """
+        self._room.move_pointer()
         return False
 
     def handleMouseClickEvent(self, unused_component):
@@ -197,6 +203,7 @@ class WaitingRoomUI(object):
         self._frames = {}
         self._labels = {}
         self._cursor_acquired = False
+        self._pointer_rows = []
         self._open = False
         self._hovered = None
         self._selected_map = None
@@ -346,8 +353,82 @@ class WaitingRoomUI(object):
         self._surface.add_root(self._panel)
         self._surface.resort()
         self._acquire_cursor()
+        self._build_pointer()
+        self._move_pointer()
         self.refresh()
         _log('LAN waiting room opened')
+        return True
+
+    # A staircase of one-pixel rows approximates a pointer without a texture:
+    # mouse_cursors.xml defines no shapes and no arrow bitmap ships outside the
+    # lobby SWF, so the room draws its own from flat quads.
+    POINTER_ROWS = 11
+    POINTER_SHADOW = (0, 0, 0, 200)
+    POINTER_FILL = (255, 255, 255, 255)
+
+    def move_pointer(self):
+        """Public move hook: the control scripts call this on every move."""
+        if not self._open:
+            return False
+        return self._move_pointer()
+
+    def _build_pointer(self):
+        """Create the drawn arrow once, as children of the room panel."""
+        if self._pointer_rows or self._panel is None:
+            return False
+        rows = []
+        for layer, colour, offset in (
+                ('shadow', self.POINTER_SHADOW, 1),
+                ('fill', self.POINTER_FILL, 0)):
+            for index in range(self.POINTER_ROWS):
+                row = self._surface.simple()
+                for name, value in (
+                        ('horizontalPositionMode', 'CLIP'),
+                        ('verticalPositionMode', 'CLIP'),
+                        ('widthMode', 'PIXEL'), ('heightMode', 'PIXEL'),
+                        ('horizontalAnchor', 'LEFT'),
+                        ('verticalAnchor', 'TOP'),
+                        # Row i is i+2 pixels wide, which reads as a pointer.
+                        ('width', index + 2), ('height', 1),
+                        ('materialFX', 'SOLID'), ('colour', colour),
+                        ('focus', False), ('mouseButtonFocus', False),
+                        ('crossFocus', False), ('moveFocus', False),
+                        ('visible', False)):
+                    self._set(row, name, value)
+                self._panel.addChild(row)
+                rows.append((row, index, offset))
+        self._pointer_rows = rows
+        return True
+
+    def _move_pointer(self):
+        """Follow ``mcursor.position`` with the drawn arrow."""
+        if not self._pointer_rows:
+            return False
+        size = getattr(self._surface, 'screen_size', None)
+        position = getattr(self._surface, 'cursor_position', None)
+        if not callable(size) or not callable(position):
+            return False
+        try:
+            screen = size()
+            x, y = position()
+        except Exception:
+            return False
+        if screen is None:
+            return False
+        # Clip space spans -1..1 across the screen, so one pixel is 2/size.
+        step_x = 2.0 / screen[0]
+        step_y = 2.0 / screen[1]
+        for row, index, offset in self._pointer_rows:
+            self._set(row, 'position', (
+                x + offset * step_x,
+                y - (index + offset) * step_y,
+                OVERLAY_Z - 0.05))
+            self._set(row, 'visible', True)
+        return True
+
+    def _hide_pointer(self):
+        for row, unused_index, unused_offset in self._pointer_rows:
+            self._set(row, 'visible', False)
         return True
 
     def _acquire_cursor(self):
@@ -497,6 +578,7 @@ class WaitingRoomUI(object):
         self._open = False
         self._hovered = None
         self._release_cursor()
+        self._hide_pointer()
         self._set(self._panel, 'visible', False)
         self._surface.remove_root(self._panel)
         _log('LAN waiting room closed')
@@ -508,4 +590,5 @@ class WaitingRoomUI(object):
         self._controls = {}
         self._frames = {}
         self._labels = {}
+        self._pointer_rows = []
         return True

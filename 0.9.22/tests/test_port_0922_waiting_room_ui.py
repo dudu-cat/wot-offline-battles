@@ -229,6 +229,56 @@ class WaitingRoomTests(unittest.TestCase):
         self.assertFalse(script.handleMouseEnterEvent(None))
         self.assertFalse(script.handleMouseLeaveEvent(None))
 
+    def test_the_drawn_pointer_follows_the_native_cursor(self):
+        """No arrow bitmap ships outside the lobby SWF, so the room draws one."""
+        class _PointerSurface(_Surface):
+            def __init__(self):
+                _Surface.__init__(self)
+                self.cursor = (0.0, 0.0)
+
+            def screen_size(self):
+                return (1000.0, 500.0)
+
+            def cursor_position(self):
+                return self.cursor
+
+            def show_cursor(self):
+                return True
+
+            def hide_cursor(self):
+                return True
+
+        surface = _PointerSurface()
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True, surface=surface)
+        self.assertTrue(room.open())
+
+        self.assertTrue(room._pointer_rows)
+        tip = room._pointer_rows[0][0].properties
+        self.assertTrue(tip['visible'])
+        self.assertAlmostEqual(0.002, tip['position'][0])
+
+        surface.cursor = (-0.5, 0.25)
+        room.move_pointer()
+        moved = room._pointer_rows[0][0].properties
+
+        # One pixel is 2/width in clip space.
+        self.assertAlmostEqual(-0.5 + 0.002, moved['position'][0])
+        self.assertAlmostEqual(0.25 - 0.004, moved['position'][1])
+
+        room.close()
+        self.assertFalse(room._pointer_rows[0][0].properties['visible'])
+
+    def test_the_pointer_never_takes_mouse_focus(self):
+        self.room.open()
+        self.room._build_pointer()
+
+        for row, unused_index, unused_offset in self.room._pointer_rows:
+            self.assertFalse(row.properties['focus'])
+            self.assertFalse(row.properties['mouseButtonFocus'])
+            self.assertFalse(row.properties['crossFocus'])
+
     def test_controls_carry_a_border_frame_behind_the_body(self):
         self.room.open()
         frame = self.room._frames['start'].properties

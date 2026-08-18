@@ -310,7 +310,7 @@ class LANSession(object):
             sys.stdout.write(
                 '[Offline LAN 0.9.22] LAN round %r was not closed by the '
                 'server; rejoining the room\n' % (self._departed_round_id,))
-            self._rejoin_room()
+            self._rejoin_room(user_requested=False)
 
         callback_id = self._callback(ROUND_END_TIMEOUT, expire)
         if self._round_end_token is token:
@@ -322,9 +322,15 @@ class LANSession(object):
         self._schedule_round_end_watchdog()
         return True
 
-    def _rejoin_room(self):
-        """Drop a parked socket and reconnect so the server resynchronises."""
+    def _rejoin_room(self, user_requested=True):
+        """Drop a parked socket and reconnect so the server resynchronises.
+
+        An automatic rejoin keeps the room dismissed: the player is in the
+        garage and never asked for it.
+        """
         self.revive()
+        if not user_requested:
+            self._picker_dismissed = True
         sys.stdout.write(
             '[Offline LAN 0.9.22] LAN rejoin requested: %s\n' %
             self._endpoint_value())
@@ -960,7 +966,10 @@ class LANSession(object):
             # locally departed player eligible for another battle.
             self._departed_round_id = None
             if returning_from_round:
-                self._picker_dismissed = False
+                # Coming back from a round returns the player to the GARAGE.
+                # Treat the room as dismissed so the waiting roster cannot
+                # reopen it over the garage; only a Battle click reopens it.
+                self._picker_dismissed = True
             if self._start_requested:
                 self.state = 'awaiting_battle_start'
                 return

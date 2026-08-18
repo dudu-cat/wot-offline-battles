@@ -480,6 +480,8 @@ class _Avatar(object):
             _AdaptiveMatrixProvider(_Matrix())
         self.visual_starts = []
         self.visual_stops = []
+        self.gun_locks = []
+        self.isGunLocked = False
         self.gunRotator = types.SimpleNamespace(
             turretYaw=0.0, gunPitch=0.0,
             dispersionAngle=0.25,
@@ -488,6 +490,7 @@ class _Avatar(object):
             _VehicleGunRotator__maxTurretRotationSpeed=None,
             _VehicleGunRotator__maxGunRotationSpeed=None,
             reset=mock.Mock(),
+            lock=lambda locked: self.gun_locks.append(bool(locked)),
             getCurShotPosition=lambda: (
                 _Vector(0.0, 2.0, 0.0), _Vector(0.0, 0.0, 1.0)))
 
@@ -5621,6 +5624,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual([True], battle._avatar.inputHandler.client_markers)
         self.assertTrue(battle._avatar._PlayerAvatar__isOnArena)
         self.assertFalse(battle._battle_live)
+        # isOnArena is also PlayerAvatar.shoot's first gate, so the countdown
+        # raises retail's second gate to keep laying and firing frozen.
+        self.assertTrue(battle._avatar.isGunLocked)
+        self.assertEqual([True], battle._avatar.gun_locks)
 
     def test_battle_transition_starts_one_native_gun_timer_from_zero(self):
         runtime = _runtime()
@@ -5668,6 +5675,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(2, rotator.start.call_count)
         self.assertEqual(
             ['start', 'start'], battle._avatar.gun_tracking_calls)
+        # The battle transition releases the countdown's gun lock.
+        self.assertFalse(battle._avatar.isGunLocked)
+        self.assertEqual([True, False], battle._avatar.gun_locks)
         self.assertEqual(
             [runtime.constants.ARENA_PERIOD.BATTLE],
             battle._avatar.inputHandler.started_periods)

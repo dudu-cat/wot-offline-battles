@@ -1771,6 +1771,8 @@ class BattleRuntime(object):
             duration = max(0.1, float(deadline) - _monotonic_time())
         self._binding.arena_period('battle', duration)
         self._battle_live = True
+        # The countdown froze gun laying and firing; the battle releases both.
+        self._set_gun_locked(False)
         self._prebattle_deadline = None
         self._last_frame_time = self._clock()
         if self._gun_state is not None and self._server is not None:
@@ -1839,6 +1841,26 @@ class BattleRuntime(object):
         show_server(use_server())
         show_client(use_client())
         rotator.start()
+        # Starting the rotator needs isOnArena, and that flag is also what
+        # PlayerAvatar.shoot checks first.  Retail's second gate is
+        # ``isGunLocked``: shoot returns at it with the 'gun_locked' error and
+        # the rotator stops laying.  Raise it directly rather than through
+        # ``set_isGunLocked``, whose own handler would also force an SPG out
+        # of strategic view back into arcade.
+        self._set_gun_locked(True)
+        return True
+
+    def _set_gun_locked(self, locked):
+        """Freeze or release gun laying and firing without changing camera."""
+        avatar = self._avatar
+        if avatar is None:
+            return False
+        rotator = getattr(avatar, 'gunRotator', None)
+        lock = getattr(rotator, 'lock', None)
+        if not callable(lock):
+            raise RuntimeError('#1513 gun lock boundary is unavailable')
+        avatar.isGunLocked = bool(locked)
+        lock(bool(locked))
         return True
 
     def _bind_local_arcade_camera(self):

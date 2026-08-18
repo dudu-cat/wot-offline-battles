@@ -1439,6 +1439,9 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual('waiting', self.session.state)
         self.assertFalse(self.session._battle_started)
         self.assertIsNone(self.session.snapshot)
+        # The room stays closed over the garage until the player asks for it.
+        self.assertEqual([True], self.opens)
+        self.session.join()
         self.assertEqual([True, True], self.opens)
 
         second = {
@@ -1448,6 +1451,42 @@ class LANSessionTests(unittest.TestCase):
         self.emit('battle_start', second)
         self.assertEqual(2, len(self.battle_runtime.started))
         self.assertEqual('battle', self.session.state)
+
+    def test_the_room_never_opens_itself_over_the_garage(self):
+        """A finished round returns the player to the garage and stays there."""
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
+        self.emit('battle_start', {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]})
+        opens_before = len(self.opens)
+
+        self.emit('roster', {
+            'phase': 'waiting', 'round_id': 8,
+            'map_pool': ['01_karelia']})
+
+        self.assertEqual(opens_before, len(self.opens))
+        self.assertFalse(self.session._picker_open)
+        self.assertTrue(self.session._picker_dismissed)
+
+    def test_an_automatic_rejoin_does_not_present_the_room(self):
+        """The watchdog reconnects silently; the player never asked for it."""
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
+        opens_before = len(self.opens)
+        self.session.state = 'awaiting_round_end'
+        # revive() reinstalls the Battle button; the stock header is absent.
+        self.session._join_ui = _JoinUI(self.session.join)
+
+        self.session._rejoin_room(user_requested=False)
+
+        self.assertEqual(opens_before, len(self.opens))
+        self.assertTrue(self.session._picker_dismissed)
+
+        # A user-requested rejoin does present it again.
+        self.session._rejoin_room(user_requested=True)
+        self.assertFalse(self.session._picker_dismissed)
 
     def test_next_picker_waits_for_native_lobby_recovery(self):
         ready = [True]
@@ -1469,11 +1508,18 @@ class LANSessionTests(unittest.TestCase):
             'phase': 'waiting', 'round_id': 8,
             'map_pool': ['05_prohorovka']})
 
+        # Returning from a round leaves the player in the garage: the room
+        # must not reopen itself, whatever the lobby recovery does.
         self.assertEqual([True], self.opens)
         self.assertFalse(self.session._picker_open)
-        self.assertEqual(1, len(pending))
         ready[0] = True
-        pending.pop(0)()
+        for callback in list(pending):
+            callback()
+        self.assertEqual([True], self.opens)
+        self.assertFalse(self.session._picker_open)
+
+        # Only an explicit Battle click brings it back.
+        self.session.join()
         self.assertEqual([True, True], self.opens)
         self.assertTrue(self.session._picker_open)
 
