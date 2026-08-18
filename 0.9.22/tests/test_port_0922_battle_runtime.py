@@ -75,6 +75,16 @@ class _ReadOnlyVector(object):
         raise RuntimeError('Operation is not allowed')
 
 
+class _MatrixAnimation(object):
+    """Math.MatrixAnimation: a MatrixProvider with keyframes and a time."""
+
+    def __init__(self):
+        self.keyframes = ()
+        self.time = 0.0
+        self.yaw = self.pitch = self.roll = 0.0
+        self.translation = _Vector()
+
+
 class _Matrix(object):
     def __init__(self, other=None):
         self.yaw = getattr(other, 'yaw', 0.0)
@@ -1213,7 +1223,9 @@ def _runtime():
             LOBBY=4, BATTLE_LOADING=5, BATTLE=6),
         hangar_space=types.SimpleNamespace(
             g_hangarSpace=hangar_space),
-        math=types.SimpleNamespace(Vector3=_Vector, Matrix=_Matrix),
+        math=types.SimpleNamespace(
+            Vector3=_Vector, Matrix=_Matrix,
+            MatrixAnimation=_MatrixAnimation),
         model_assembler=types.SimpleNamespace(
             prepareCompoundAssembler=lambda descriptor, state, space, flag:
             descriptor,
@@ -1532,6 +1544,44 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         projectiles[0].destroy.assert_called_once_with()
         self.assertEqual(runtime.bigworld.entity, original_entity)
 
+    def test_a_bot_pose_is_animated_rather_than_snapped(self):
+        """OfflineEntity declares an empty <Volatile/>, so no WGVehicleFilter
+        can ever interpolate for a bot; the compound animates instead."""
+        runtime = _runtime()
+        vehicle = RemoteVehicle(
+            1000, _Descriptor(), {
+                'publicInfo': {'team': 2, 'name': 'Bot'},
+                'health': 500, 'isCrewActive': True, 'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0), runtime.math)
+        model = _Model()
+        vehicle.attach_visual(types.SimpleNamespace(model=None), 7, model)
+
+        self.assertIsNotNone(vehicle._animation)
+        self.assertIs(vehicle._animation, model.matrix)
+
+        vehicle.set_pose(_Vector(10.0, 0.0, 20.0), (0.0, 0.0, 1.0),
+                         relax_time=0.05)
+
+        keyframes = vehicle._animation.keyframes
+        self.assertEqual(2, len(keyframes))
+        self.assertEqual(0.0, keyframes[0][0])
+        self.assertEqual(0.05, keyframes[1][0])
+        self.assertEqual(0.0, vehicle._animation.time)
+
+    def test_a_pose_without_a_relax_time_is_applied_directly(self):
+        runtime = _runtime()
+        vehicle = RemoteVehicle(
+            1000, _Descriptor(), {
+                'publicInfo': {'team': 2, 'name': 'Bot'},
+                'health': 500, 'isCrewActive': True, 'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0), runtime.math)
+        vehicle.attach_visual(types.SimpleNamespace(model=None), 7, _Model())
+        vehicle._animation.keyframes = ()
+
+        vehicle.set_pose(_Vector(1.0, 0.0, 2.0), (0.0, 0.0, 0.0))
+
+        self.assertEqual((), vehicle._animation.keyframes)
+
     def test_destroyed_remote_vehicle_reloads_the_native_wreck_once(self):
         runtime = _runtime()
         states = []
@@ -1624,7 +1674,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         vehicle.health = 500
         vehicle.isAlive.value = True
         self.assertIs(vehicle, bigworld.entity(vehicle_id))
-        self.assertIs(vehicle.matrix, vehicle.model.matrix)
+        self.assertIs(vehicle._animation, vehicle.model.matrix)
         self.assertEqual(
             (10.0, 2.0, 30.0), tuple(vehicle.matrix.translation))
         self.assertEqual(0.5, vehicle.matrix.yaw)
@@ -1634,10 +1684,10 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
 
         vehicle.set_pose(_Vector(20.0, 3.0, 40.0), (0.0, 0.0, 1.0))
         self.assertEqual((20.0, 3.0, 40.0), tuple(vehicle.position))
-        self.assertIs(vehicle.matrix, vehicle.model.matrix)
+        self.assertIs(vehicle._animation, vehicle.model.matrix)
         self.assertEqual(
-            (20.0, 3.0, 40.0), tuple(vehicle.model.matrix.translation))
-        self.assertEqual(1.0, vehicle.model.matrix.yaw)
+            (20.0, 3.0, 40.0), tuple(vehicle.matrix.translation))
+        self.assertEqual(1.0, vehicle.matrix.yaw)
 
         visual_id = vehicle.bw_entity_id
         visual = bigworld.entity(visual_id)
@@ -6485,7 +6535,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._bot_destructible_samples[17] = (
             runtime.bigworld.now, (7.0, 2.0, 9.0))
 
-        def set_vehicle_pose(*unused_args):
+        def set_vehicle_pose(*unused_args, relax_time=None):
             battle._destructibles._fell_trees_near.assert_called_once()
 
         battle._binding.set_vehicle_pose.side_effect = set_vehicle_pose

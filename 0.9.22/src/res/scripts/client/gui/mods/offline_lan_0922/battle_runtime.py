@@ -719,6 +719,7 @@ class BattleRuntime(object):
         self._local_descriptor = None
         self._bot_fire_seen = {}
         self._bot_destructible_samples = {}
+        self._bot_pose_times = {}
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
         self._local_push_x = 0.0
@@ -861,6 +862,7 @@ class BattleRuntime(object):
         self._local_descriptor = None
         self._bot_fire_seen = {}
         self._bot_destructible_samples = {}
+        self._bot_pose_times = {}
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
         self._local_push_x = 0.0
@@ -7334,6 +7336,20 @@ class BattleRuntime(object):
         self._bot_destructible_samples[bot_id] = (deadline, position)
         return True
 
+    def _bot_pose_relax(self, state, now):
+        """Return how long the compound should take to reach this pose.
+
+        The interval between two accepted poses is what the animation has to
+        cover.  Measuring it keeps the smoothing correct whatever integration
+        rate the bot's distance tier chose.
+        """
+        key = state.get('id')
+        previous = self._bot_pose_times.get(key)
+        self._bot_pose_times[key] = now
+        if previous is None:
+            return None
+        return max(FRAME_SECONDS, min(0.5, float(now) - float(previous)))
+
     def _apply_authority_bot_poses(self, states):
         """Present copied 0.8.2 bot poses through the remote filter."""
         applied = False
@@ -7363,7 +7379,8 @@ class BattleRuntime(object):
             self._binding.set_vehicle_pose(
                 record['engine_id'], position,
                 _engine_rotation(yaw, _number(state.get('pitch')),
-                                 _number(state.get('roll'))))
+                                 _number(state.get('roll'))),
+                relax_time=self._bot_pose_relax(state, now))
             self._binding.update_vehicle_aim(
                 record['engine_id'], yaw,
                 _number(state.get('aim_yaw', yaw)),
@@ -9124,6 +9141,7 @@ class BattleRuntime(object):
         self._vehicle_ready_deadline = 0.0
         self._bot_fire_seen = {}
         self._bot_destructible_samples = {}
+        self._bot_pose_times = {}
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
         self._local_push_x = 0.0

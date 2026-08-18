@@ -688,6 +688,7 @@ class RemoteVehicle(object):
         self._shot_presenter = shot_presenter
         self._gun_recoil = None
         self._collision_obstacle = None
+        self._animation = None
         self._offlineLANShotIndex = int(
             getattr(descriptor, 'activeGunShotIndex', 0) or 0)
         # Stock BigWorld.entity()/entities are presentation/AOI lookups. The
@@ -722,7 +723,16 @@ class RemoteVehicle(object):
         # PyCompoundModel has no ordinary Model position/yaw/pitch/roll
         # attributes.  Exact #1513 CompoundAppearance links the compound to
         # the vehicle's live matrix provider and then mutates that provider.
-        self.model.matrix = self.matrix
+        #
+        # A bot has no WGVehicleFilter to interpolate for it: OfflineEntity
+        # declares an empty <Volatile/> block, so the engine never delivers a
+        # motion sample and filter.movementInfo would stay at rest.  Drive the
+        # compound through Math.MatrixAnimation instead, which is the same
+        # provider gun_marker_ctrl._updateMatrixProvider uses to smooth a
+        # server-tick-rate update up to the render rate.
+        self._animation = self._new_animation()
+        self.model.matrix = (
+            self._animation if self._animation is not None else self.matrix)
         self.appearance.attach(model)
         if self._shot_presenter is not None:
             self._shot_presenter.setup_turret_rotations(self)
@@ -783,13 +793,57 @@ class RemoteVehicle(object):
         if first_error is not None:
             raise first_error
 
-    def set_pose(self, position, rotation):
+    def _new_animation(self):
+        factory = getattr(self._math, 'MatrixAnimation', None)
+        if not callable(factory):
+            return None
+        try:
+            animation = factory()
+        except Exception:
+            return None
+        try:
+            animation.keyframes = ((0.0, self._pose_matrix()),)
+            animation.time = 0.0
+        except Exception:
+            return None
+        return animation
+
+    def _pose_matrix(self):
+        """Return an immutable snapshot of the current pose."""
+        matrix = self._math.Matrix()
+        matrix.setRotateYPR((self.yaw, self.pitch, self.roll))
+        matrix.translation = self.position
+        return matrix
+
+    def _animate_to_pose(self, relax_time):
+        """Key the compound from where it is now to the accepted pose."""
+        animation = self._animation
+        if animation is None:
+            return False
+        relax_time = float(relax_time)
+        if not relax_time > 0.0:
+            return False
+        try:
+            animation.keyframes = (
+                (0.0, self._math.Matrix(animation)),
+                (relax_time, self._pose_matrix()))
+            animation.time = 0.0
+        except Exception:
+            self._animation = None
+            if self.model is not None:
+                self.model.matrix = self.matrix
+            return False
+        return True
+
+    def set_pose(self, position, rotation, relax_time=None):
         previous = self.position
         self.position = self._math.Vector3(position)
         self.roll = float(rotation[0])
         self.pitch = float(rotation[1])
         self.yaw = float(rotation[2])
         self._update_matrix()
+        if relax_time:
+            self._animate_to_pose(relax_time)
         velocity = self.position - previous
         self.filter.update(self.position, velocity)
 

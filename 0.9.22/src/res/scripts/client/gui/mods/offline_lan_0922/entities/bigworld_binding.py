@@ -283,15 +283,21 @@ class BigWorldVehicleBinding(object):
         rotation_dir = self._signed_direction(rotation_dir)
         vehicle_filter.notifyInputKeysDown(movement_dir, rotation_dir)
 
-    def set_vehicle_pose(self, entity_id, position, rotation):
-        """Apply one pose to the copied 0.8.2 presentation boundary."""
+    def set_vehicle_pose(self, entity_id, position, rotation,
+                         relax_time=None):
+        """Apply one pose to the copied 0.8.2 presentation boundary.
+
+        ``relax_time`` is how long this pose should take to reach on screen.
+        Passing the interval until the next expected update lets the compound's
+        MatrixAnimation cover the gap instead of stepping.
+        """
         entity = self._authority_entity_or_fail(entity_id)
         setter = getattr(entity, 'set_pose', None)
         if not (bool(getattr(entity, '_offlineLANPresentation', False)) and
                 callable(setter)):
             raise CapabilityError(
                 'remote vehicle has no authoritative presentation')
-        setter(position, rotation)
+        setter(position, rotation, relax_time)
 
     def update_vehicle_aim(self, entity_id, hull_yaw, aim_yaw, gun_pitch):
         """Apply a network world aim to the exact packed Vehicle property."""

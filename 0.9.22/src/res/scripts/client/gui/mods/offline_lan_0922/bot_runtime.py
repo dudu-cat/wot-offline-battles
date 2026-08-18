@@ -1028,7 +1028,6 @@ class BotRuntime(object):
         self.debug_logging = False
         self._camera_position = None
         self._integration_debt = {}
-        self._integration_time = {}
         self._integration_next = {}
         self._last_step = {}
         self._world_receipt_budget = 0
@@ -2497,7 +2496,6 @@ class BotRuntime(object):
         if interval <= 0.0:
             self._integration_debt[bot_id] = 0.0
             self._last_step[bot_id] = banked
-            self._integration_time[bot_id] = _number(now)
             return banked
         deadline = self._integration_next.get(bot_id)
         if deadline is None:
@@ -2513,7 +2511,6 @@ class BotRuntime(object):
         banked = min(banked, 0.2)
         self._integration_debt[bot_id] = 0.0
         self._last_step[bot_id] = banked
-        self._integration_time[bot_id] = _number(now)
         intervals = int(math.floor(
             (_number(now) - deadline) / interval)) + 1
         self._integration_next[bot_id] = deadline + intervals * interval
@@ -4493,32 +4490,11 @@ class BotRuntime(object):
     def presentation_states(self, now=None):
         """Return current authority poses without forming a LAN proposal.
 
-        A bot that integrates below the render rate has not moved its stored
-        pose this frame, so its presented position is dead-reckoned along its
-        own heading for the time since its last step.  Without this the lower
-        tiers would visibly step; with it the simulation rate and the rendered
-        motion are independent.
+        Poses are published exactly as integrated.  Smoothing between two
+        accepted poses belongs to the compound's own MatrixAnimation, which
+        INTERPOLATES; extrapolating here as well would guess ahead and then
+        correct itself, and that correction is what reads as a jump.
         """
         if not self.is_authority() or self.adapter is None or self.finished:
             return ()
-        if now is None:
-            return tuple(dict(state) for state in self._ordered_states())
-        now = _number(now)
-        result = []
-        for state in self._ordered_states():
-            projected = dict(state)
-            elapsed = now - _number(
-                self._integration_time.get(state['id'], now))
-            speed = _number(state.get('speed'))
-            if (elapsed > 0.0 and state.get('alive', True) and
-                    abs(speed) > 1e-3 and not state.get('airborne', False)):
-                # Cap the extrapolation at one far-tier interval so a stalled
-                # frame can never slide a hull across the map.
-                elapsed = min(elapsed, INTEGRATION_INTERVALS[-1])
-                yaw = _number(state.get('yaw'))
-                projected['x'] = _number(state.get('x')) + (
-                    math.sin(yaw) * speed * elapsed)
-                projected['z'] = _number(state.get('z')) + (
-                    math.cos(yaw) * speed * elapsed)
-            result.append(projected)
-        return tuple(result)
+        return tuple(dict(state) for state in self._ordered_states())

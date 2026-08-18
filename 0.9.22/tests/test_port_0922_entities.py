@@ -130,7 +130,7 @@ class _Presentation(_Entity):
         self.poses = []
         self.aims = []
 
-    def set_pose(self, position, rotation):
+    def set_pose(self, position, rotation, relax_time=None):
         self.poses.append((position, rotation))
 
     def set_aim(self, hull_yaw, aim_yaw, gun_pitch):
