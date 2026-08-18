@@ -1150,7 +1150,85 @@ class _Hosts(object):
         return types.SimpleNamespace(name=name, shortName=short_name, url=url)
 
 
+class _PreferencesSection(object):
+    """The subset of a BigWorld DataSection AccountSettings touches."""
+
+    def __init__(self, values=None):
+        self._values = dict(values or {})
+        self._children = []
+
+    def items(self):
+        return list(self._children)
+
+    def readString(self, key, default=''):
+        return self._values.get(key, default)
+
+    def writeString(self, key, value):
+        self._values[key] = value
+
+    def createSection(self, key):
+        section = _PreferencesSection()
+        self._children.append((key, section))
+        return section
+
+
+def _fake_account_settings(accounts=None):
+    """Build the #1513 AccountSettings surface the offline pin replaces."""
+    root = _PreferencesSection()
+    for login in (accounts or ()):
+        root.createSection('account').writeString('login', login)
+
+    class AccountSettings(object):
+        version = 33
+        _AccountSettings__cache = {'login': None, 'section': None}
+        _AccountSettings__isFirstRun = True
+        converted = []
+
+        @staticmethod
+        def convert():
+            AccountSettings.converted.append('convert')
+
+        @staticmethod
+        def invalidateNewSettingsCounter():
+            AccountSettings.converted.append('invalidate')
+
+        @staticmethod
+        def _AccountSettings__readSection(data_section, name):
+            return root
+
+        @staticmethod
+        def _AccountSettings__readUserSection():
+            return None
+
+    module = types.ModuleType('account_helpers.AccountSettings')
+    module.AccountSettings = AccountSettings
+    module.KEY_FILTERS = 'filters'
+    module.DEFAULT_VALUES = {'filters': {}}
+    package = types.ModuleType('account_helpers')
+    package.AccountSettings = AccountSettings
+    settings = types.ModuleType('Settings')
+    settings.KEY_ACCOUNT_SETTINGS = 'accounts'
+    settings.g_instance = types.SimpleNamespace(userPrefs=object())
+    return root, module, package, settings
+
+
 class OfflineCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        self.preferences, module, package, settings = _fake_account_settings()
+        self._saved_modules = {}
+        for name, value in (('account_helpers', package),
+                            ('account_helpers.AccountSettings', module),
+                            ('Settings', settings)):
+            self._saved_modules[name] = sys.modules.get(name)
+            sys.modules[name] = value
+
+    def tearDown(self):
+        for name, value in self._saved_modules.items():
+            if value is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
+
     def test_offline_battle_server_time_advances_and_restores(self):
         compatibility_module = _load_port_source('compat')
         runtime, unused_operations = self._runtime()
@@ -4086,6 +4164,34 @@ class OfflineCompatibilityTests(unittest.TestCase):
             runtime.avatar_module.PlayerAvatar.__dict__['onBecomePlayer'])
         self.assertEqual(original_connect, runtime.bigworld.connect)
         self.assertFalse(compatibility._installed)
+
+    def test_saved_interface_settings_use_one_account_section(self):
+        # #1513 AccountSettings keys its section on BigWorld.player().name,
+        # which offline differs between the lobby account, the LAN roster name
+        # in battle and the empty pre-login state.
+        compatibility_module = _load_port_source('compat')
+        runtime, _ = self._runtime()
+        settings_type = sys.modules[
+            'account_helpers.AccountSettings'].AccountSettings
+        original = settings_type.__dict__['_AccountSettings__readUserSection']
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+
+        section = settings_type._AccountSettings__readUserSection()
+        self.assertEqual(
+            'offline_account', section.readString('login'))
+        self.assertEqual(['convert', 'invalidate'], settings_type.converted)
+        settings_type._AccountSettings__cache['login'] = 'Player-1'
+        self.assertIs(
+            section, settings_type._AccountSettings__readUserSection())
+        self.assertEqual(
+            1, len([key for key, _ in self.preferences.items()
+                    if key == 'account']))
+
+        compatibility.fini()
+        self.assertIs(
+            original,
+            settings_type.__dict__['_AccountSettings__readUserSection'])
 
     def test_fini_does_not_overwrite_later_third_party_wrappers(self):
         compatibility_module = _load_port_source('compat')

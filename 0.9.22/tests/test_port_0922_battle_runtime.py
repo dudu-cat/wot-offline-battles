@@ -257,6 +257,34 @@ class _HitTester1513(object):
         return ()
 
 
+class _Consumables(object):
+    """#1513 ``_VehicleConsumables``: empty slots read back as ``default``."""
+
+    def __init__(self, installed):
+        self._items = [None if not intCD else types.SimpleNamespace(intCD=intCD)
+                       for intCD in installed]
+
+    def getIntCDs(self, default):
+        return [default if item is None else item.intCD
+                for item in self._items]
+
+    def getInstalledItems(self):
+        return [item for item in self._items if item is not None]
+
+
+def _two_shell_descriptor():
+    shots = [types.SimpleNamespace(shell=types.SimpleNamespace(
+        compactDescr=compact_descr)) for compact_descr in (101, 102)]
+    gun = types.SimpleNamespace(
+        shots=shots, maxAmmo=40, clip=(1, 1.0), reloadTime=6.0,
+        aimingTime=2.0, shotDispersionAngle=0.12,
+        shotDispersionFactors={'afterShot': 1.5, 'turretRotation': 0.3})
+    return types.SimpleNamespace(
+        gun=gun, turret=types.SimpleNamespace(maxAmmo=40),
+        chassis={'shotDispersionFactors': (0.2, 0.4)},
+        activeGunShotIndex=0)
+
+
 class _Descriptor(object):
     def __init__(self, name='ussr:R11_MS-1', loaded=True):
         self.name = name
@@ -1164,7 +1192,7 @@ def _runtime():
         VEHICLE_PHYSICS_MODE=types.SimpleNamespace(STANDARD=0),
         VEHICLE_SIEGE_STATE=types.SimpleNamespace(DISABLED=0),
         VEHICLE_SETTING=types.SimpleNamespace(
-            CURRENT_SHELLS=0, ACTIVATE_EQUIPMENT=16),
+            CURRENT_SHELLS=0, NEXT_SHELLS=1, ACTIVATE_EQUIPMENT=16),
         VEHICLE_MISC_STATUS=types.SimpleNamespace(
             VEHICLE_DROWN_WARNING=4),
         DROWN_WARNING_LEVEL=types.SimpleNamespace(
@@ -2297,6 +2325,90 @@ class BattleRuntimeContractTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {
                 'CurrentVehicle': current_vehicle}):
             self.assertTrue(_selected_vehicle_has_sixth_sense())
+
+    def test_battle_ammo_reads_the_mounted_1513_garage_items(self):
+        # #1513 gui_items.Vehicle carries Shell items and a VehicleEquipment,
+        # not the 0.8.2 shellsLayout mapping and eqs list.
+        battle = BattleRuntime(_runtime())
+        current_vehicle = types.ModuleType('CurrentVehicle')
+        current_vehicle.g_currentVehicle = types.SimpleNamespace(
+            isPresent=lambda: True,
+            item=types.SimpleNamespace(
+                shells=[types.SimpleNamespace(intCD=101, count=30),
+                        types.SimpleNamespace(intCD=102, count=12)],
+                equipment=types.SimpleNamespace(
+                    regularConsumables=_Consumables([401, 0, 403]))))
+
+        with mock.patch.dict(sys.modules, {
+                'CurrentVehicle': current_vehicle}):
+            self.assertEqual({101: 30, 102: 12}, battle._local_ammo_layout())
+            self.assertEqual(
+                [401, 0, 403], battle._local_mounted_equipments())
+
+        # Retiring the lobby Account empties g_currentVehicle, so the battle
+        # must keep reading the snapshot captured before that boundary.
+        current_vehicle.g_currentVehicle = types.SimpleNamespace(
+            isPresent=lambda: False, item=None)
+        with mock.patch.dict(sys.modules, {
+                'CurrentVehicle': current_vehicle}):
+            self.assertEqual({101: 30, 102: 12}, battle._local_ammo_layout())
+            self.assertEqual(
+                [401, 0, 403], battle._local_mounted_equipments())
+
+    def test_battle_ammo_falls_back_without_a_garage_item(self):
+        battle = BattleRuntime(_runtime())
+        current_vehicle = types.ModuleType('CurrentVehicle')
+        current_vehicle.g_currentVehicle = types.SimpleNamespace(
+            isPresent=lambda: False, item=None)
+
+        with mock.patch.dict(sys.modules, {
+                'CurrentVehicle': current_vehicle}):
+            self.assertIsNone(battle._local_ammo_layout())
+            self.assertIsNone(battle._local_mounted_equipments())
+
+    def _shell_change_battle(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        state = gun_mechanics.GunState(
+            _two_shell_descriptor(), ammo_layout={101: 20, 102: 10})
+        state.reload_time = 0.0
+        state.clip = 1
+        battle._gun_state = state
+        battle._publish_ammo_state = mock.Mock()
+        battle._publish_reload_event = mock.Mock()
+        return battle, state, runtime.constants.VEHICLE_SETTING
+
+    def test_next_shell_setting_waits_for_the_loaded_round(self):
+        battle, state, settings = self._shell_change_battle()
+
+        self.assertTrue(
+            battle.change_vehicle_setting(settings.NEXT_SHELLS, 102))
+
+        self.assertEqual(0, state.shot_index)
+        self.assertEqual(1, state.pending_index)
+        battle._publish_ammo_state.assert_not_called()
+
+        state.commit_fire()
+        self.assertEqual(1, state.shot_index)
+
+    def test_current_shell_setting_reloads_the_new_shell_at_once(self):
+        battle, state, settings = self._shell_change_battle()
+        battle.change_vehicle_setting(settings.NEXT_SHELLS, 102)
+
+        self.assertTrue(
+            battle.change_vehicle_setting(settings.CURRENT_SHELLS, 102))
+
+        self.assertEqual(1, state.shot_index)
+        self.assertIsNone(state.pending_index)
+        self.assertEqual(0, state.clip)
+        battle._publish_ammo_state.assert_called_once_with(state, force=True)
+
+    def test_an_unknown_shell_descriptor_is_refused(self):
+        battle, state, settings = self._shell_change_battle()
+
+        self.assertFalse(
+            battle.change_vehicle_setting(settings.NEXT_SHELLS, 999))
+        self.assertIsNone(state.pending_index)
 
     def test_bot_observation_drives_only_enemy_visibility_feedback(self):
         battle = BattleRuntime(_runtime())

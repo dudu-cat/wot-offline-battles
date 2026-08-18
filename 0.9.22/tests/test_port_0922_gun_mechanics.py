@@ -152,6 +152,60 @@ class GunMechanicsParityTests(unittest.TestCase):
 
         self.assertEqual([(0.0, 0.01)] * 3, calls)
 
+    def _loaded_state(self):
+        state = GunState(_descriptor(clip=(1, 1.0)),
+                         ammo_layout={1: 20, 2: 10, 3: 5})
+        state.reload_time = 0.0
+        state.clip = 1
+        return state
+
+    def test_next_shell_waits_for_the_loaded_round(self):
+        state = self._loaded_state()
+
+        self.assertFalse(state.request_shell_index(1))
+        self.assertEqual(0, state.shot_index)
+        self.assertEqual(1, state.pending_index)
+
+        state.commit_fire()
+
+        self.assertEqual(1, state.shot_index)
+        self.assertIsNone(state.pending_index)
+        self.assertEqual(state.reload, state.reload_time)
+        self.assertEqual(0, state.clip)
+        self.assertEqual([19, 10, 5], state.ammo)
+
+    def test_next_shell_loads_at_once_while_the_gun_is_empty(self):
+        state = self._loaded_state()
+        state.clip = 0
+        state.reload_time = 3.0
+
+        self.assertTrue(state.request_shell_index(2))
+        self.assertEqual(2, state.shot_index)
+        self.assertIsNone(state.pending_index)
+        self.assertEqual(state.reload, state.reload_time)
+
+    def test_selecting_the_current_shell_cancels_a_queued_one(self):
+        state = self._loaded_state()
+        state.request_shell_index(1)
+
+        self.assertFalse(state.request_shell_index(0))
+        self.assertIsNone(state.pending_index)
+
+        state.commit_fire()
+        self.assertEqual(0, state.shot_index)
+
+    def test_a_queued_shell_without_ammunition_is_dropped(self):
+        state = GunState(_descriptor(clip=(1, 1.0)),
+                         ammo_layout={1: 20, 2: 0, 3: 5})
+        state.reload_time = 0.0
+        state.clip = 1
+        state.request_shell_index(1)
+
+        state.commit_fire()
+
+        self.assertEqual(0, state.shot_index)
+        self.assertIsNone(state.pending_index)
+
 
 if __name__ == '__main__':
     unittest.main()

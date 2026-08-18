@@ -72,14 +72,50 @@ _LOBBY_GUI_CONTEXT = {
 }
 
 
+def _account_settings_module():
+    # account_helpers/__init__ shadows the submodule name with the class,
+    # so resolve the module the way the interpreter recorded it.
+    import account_helpers.AccountSettings  # noqa: F401
+    return sys.modules['account_helpers.AccountSettings']
+
+
+def _offline_user_section(account_settings):
+    """Return the single ``<account>`` preferences section this port owns.
+
+    #1513 ``AccountSettings.__readUserSection`` keys the section on
+    ``BigWorld.player().name``.  Offline that name is the account in the lobby,
+    the LAN roster name in battle and empty before login, so saved interface
+    settings scatter across sections and read back as defaults.
+    """
+    import Settings
+    settings_type = account_settings.AccountSettings
+    if settings_type._AccountSettings__isFirstRun:
+        settings_type.convert()
+        settings_type.invalidateNewSettingsCounter()
+        settings_type._AccountSettings__isFirstRun = False
+    cache = settings_type._AccountSettings__cache
+    if cache['login'] != _OFFLINE_ACCOUNT_NAME:
+        accounts = settings_type._AccountSettings__readSection(
+            Settings.g_instance.userPrefs, Settings.KEY_ACCOUNT_SETTINGS)
+        section = None
+        for key, candidate in accounts.items():
+            if (key == 'account' and
+                    candidate.readString('login') == _OFFLINE_ACCOUNT_NAME):
+                section = candidate
+                break
+        if section is None:
+            section = accounts.createSection('account')
+            section.writeString('login', _OFFLINE_ACCOUNT_NAME)
+        cache['login'] = _OFFLINE_ACCOUNT_NAME
+        cache['section'] = section
+    return cache['section']
+
+
 def _sanitize_account_filters(account_settings=None):
     """Make every saved lobby filter carry exactly the default keys."""
     import copy
     if account_settings is None:
-        # account_helpers/__init__ shadows the submodule name with the class,
-        # so resolve the module the way the interpreter recorded it.
-        import account_helpers.AccountSettings  # noqa: F401
-        account_settings = sys.modules['account_helpers.AccountSettings']
+        account_settings = _account_settings_module()
     settings_type = account_settings.AccountSettings
     defaults = account_settings.DEFAULT_VALUES[account_settings.KEY_FILTERS]
     repaired = []
@@ -350,6 +386,8 @@ class OfflineCompatibility(object):
         self._battle_player_name = 'OfflinePlayer'
         self._battle_player_team = 1
         self._battle_network_client = None
+        self._original_user_section = None
+        self._user_section_wrapper = None
         self._original_account_init = None
         self._original_account_getattribute = None
         self._original_account_become_player = None
@@ -1772,8 +1810,21 @@ class OfflineCompatibility(object):
         self._disconnect_wrapper = disconnect
         self._server_time_wrapper = server_time
         self._debug_update_wrapper = debug_update
+
+        account_settings = _account_settings_module()
+        settings_type = account_settings.AccountSettings
+        self._original_user_section = settings_type.__dict__.get(
+            '_AccountSettings__readUserSection')
+
+        def offline_user_section():
+            return _offline_user_section(account_settings)
+
+        self._user_section_wrapper = offline_user_section
         try:
             self._install_host()
+            if self._original_user_section is not None:
+                settings_type._AccountSettings__readUserSection = staticmethod(
+                    offline_user_section)
             account_type.__init__ = account_init
             account_type.__getattribute__ = account_getattribute
             if self._original_account_become_player is not None:
@@ -2039,6 +2090,14 @@ class OfflineCompatibility(object):
                 self._compound_getattribute_wrapper):
             compound_type.__getattribute__ = (
                 self._original_compound_getattribute)
+        if self._original_user_section is not None:
+            settings_type = _account_settings_module().AccountSettings
+            if (settings_type._AccountSettings__readUserSection is
+                    self._user_section_wrapper):
+                settings_type._AccountSettings__readUserSection = (
+                    self._original_user_section)
+        self._original_user_section = None
+        self._user_section_wrapper = None
         if runtime.bigworld.connect is self._connect_wrapper:
             runtime.bigworld.connect = self._original_connect
         if runtime.bigworld.disconnect is self._disconnect_wrapper:

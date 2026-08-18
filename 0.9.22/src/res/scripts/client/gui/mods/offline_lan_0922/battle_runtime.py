@@ -768,7 +768,7 @@ class BattleRuntime(object):
         self._equipment_state = None
         self._equipment_signature = None
         self._local_loadout_cache = None
-        self._local_ammo_layout_cache = None
+        self._garage_loadout = None
         self._local_spotting_cache = None
         self._local_still_since = None
         self._battle_result = None
@@ -913,7 +913,7 @@ class BattleRuntime(object):
         self._equipment_state = None
         self._equipment_signature = None
         self._local_loadout_cache = None
-        self._local_ammo_layout_cache = None
+        self._garage_loadout = None
         self._local_spotting_cache = None
         self._local_still_since = None
         self._battle_result = self._start_message.get('battle_result')
@@ -1024,6 +1024,7 @@ class BattleRuntime(object):
                 local_identity.get('name', self.client.name),
                 int(local_identity.get('team', self.client.team)))
             lobby_boundary = self._preflight_lobby_retirement()
+            self._garage_loadout_snapshot()
             self._install_battle_gui_guard()
             self._enter_battle_loading()
             self._retire_lobby_entities(lobby_boundary)
@@ -1656,6 +1657,7 @@ class BattleRuntime(object):
             self._gun_state = gun_mechanics.GunState(
                 descriptor, self._local_loadout(descriptor),
                 ammo_layout=self._local_ammo_layout())
+            self._log_local_ammo(self._gun_state)
             self._gun_last_tick = self._clock()
             self._sync = SnapshotSync(
                 self.client.player_id, on_event=self._apply_sync_event,
@@ -3338,36 +3340,70 @@ class BattleRuntime(object):
         except Exception:
             return None
 
+    def _garage_loadout_snapshot(self):
+        """Copy every garage read a battle needs, before the lobby retires.
+
+        ``retire_current_player`` destroys the lobby Account, so
+        ``g_currentVehicle`` stops answering once the battle Avatar exists.
+        #1513 ``gui_items.Vehicle`` carries ``Shell`` items with ``intCD`` and
+        ``count``, and a ``VehicleEquipment`` whose regular consumables read
+        back an empty slot as the caller's default.
+        """
+        if self._garage_loadout is not None:
+            return self._garage_loadout
+        item = self._garage_item()
+        consumables = getattr(
+            getattr(item, 'equipment', None), 'regularConsumables', None)
+        shells = {}
+        for shell in (getattr(item, 'shells', None) or ()):
+            try:
+                shells[int(shell.intCD)] = max(0, int(shell.count))
+            except (AttributeError, TypeError, ValueError):
+                continue
+        equipment_ids = None
+        if consumables is not None:
+            equipment_ids = []
+            for compact_descr in consumables.getIntCDs(0):
+                try:
+                    equipment_ids.append(int(compact_descr or 0))
+                except (TypeError, ValueError):
+                    equipment_ids.append(0)
+        self._garage_loadout = {
+            'shells': shells,
+            'equipment_ids': equipment_ids,
+            'equipments': (() if consumables is None else
+                           tuple(consumables.getInstalledItems())),
+            'crew': tuple(getattr(item, 'crew', None) or ()),
+        }
+        return self._garage_loadout
+
     def _local_ammo_layout(self):
         """Return the player's mounted ``{shellCompactDescr: count}`` layout.
 
-        The garage item's ``shellsLayout`` is what the player set; ``shells`` is
-        the flat descriptor/count pair list behind it.  Returning None means the
-        layout is unknown and the gun keeps its synthetic fallback split.
+        None means the layout is unknown and the gun keeps its synthetic
+        fallback split.
         """
-        if self._local_ammo_layout_cache is not None:
-            return self._local_ammo_layout_cache or None
-        item = self._garage_item()
-        layout = {}
-        if item is not None:
-            stored = getattr(item, 'shellsLayout', None)
-            if isinstance(stored, dict) and stored:
-                for compact_descr, count in stored.items():
-                    try:
-                        layout[int(compact_descr)] = max(0, int(count))
-                    except (TypeError, ValueError):
-                        continue
-            if not layout:
-                shells = list(getattr(item, 'shells', ()) or ())
-                if shells and not len(shells) % 2:
-                    for index in range(0, len(shells), 2):
-                        try:
-                            layout[int(shells[index])] = max(
-                                0, int(shells[index + 1]))
-                        except (TypeError, ValueError):
-                            continue
-        self._local_ammo_layout_cache = layout
-        return layout or None
+        return self._garage_loadout_snapshot()['shells'] or None
+
+    def _log_local_ammo(self, state):
+        """Print the shell counts this battle starts with, once per round."""
+        layout = self._local_ammo_layout()
+        counts = []
+        loaded = None
+        for index, shot in enumerate(state.shots):
+            shell = _field(shot, 'shell', {})
+            compact_descr = int(_field(shell, 'compactDescr', 0))
+            quantity = state.ammo[index] if index < len(state.ammo) else 0
+            counts.append('%d:%d' % (compact_descr, quantity))
+            if index == state.shot_index:
+                loaded = compact_descr
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] battle ammo garage=%s carried=%s '
+            'first_loaded=%s\n' % (
+                'unknown' if layout is None else
+                ','.join('%d:%d' % (key, layout[key])
+                         for key in sorted(layout)),
+                ','.join(counts), loaded))
 
     def _local_mounted_equipments(self):
         """Return the mounted consumable compact descriptors, zeros included.
@@ -3375,40 +3411,22 @@ class BattleRuntime(object):
         An empty slot stays a zero so the battle really carries no consumable
         there, instead of the previous hardcoded three-kit default.
         """
-        item = self._garage_item()
-        if item is None:
-            return None
-        slots = getattr(item, 'eqs', None)
-        if slots is None:
-            return None
-        result = []
-        for slot in slots:
-            compact_descr = getattr(slot, 'intCD', slot)
-            try:
-                result.append(int(compact_descr or 0))
-            except (TypeError, ValueError):
-                result.append(0)
-        return result
+        return self._garage_loadout_snapshot()['equipment_ids']
 
     def _local_loadout(self, descriptor):
         """Build the passive modifier bundle for the player's own vehicle.
 
         Optional devices come from the battle descriptor, which #1513 builds
         from the account's mounted compact descriptor.  Consumables and crew
-        skills come from the garage item when the lobby still owns one.
+        skills come from the captured garage snapshot.
         """
         if self._local_loadout_cache is not None:
             return self._local_loadout_cache
-        item = self._garage_item()
-        equipments = ()
-        crew_skills = None
-        if item is not None:
-            equipments = getattr(item, 'eqs', ()) or ()
-            crew = getattr(item, 'crew', None)
-            if crew:
-                crew_skills = loadout_law.crew_skill_names(crew)
+        snapshot = self._garage_loadout_snapshot()
+        crew = snapshot['crew']
         self._local_loadout_cache = loadout_law.modifiers(
-            descriptor, equipments, crew_skills)
+            descriptor, snapshot['equipments'],
+            loadout_law.crew_skill_names(crew) if crew else None)
         return self._local_loadout_cache
 
     def _equipment_stages(self):
@@ -3675,25 +3693,28 @@ class BattleRuntime(object):
         self._schedule(AMMO_SECONDS, self._ammo_tick, ammo=True)
 
     def change_vehicle_setting(self, code, value):
-        activate_equipment = getattr(
-            self._runtime.constants.VEHICLE_SETTING,
-            'ACTIVATE_EQUIPMENT', None)
-        if code == activate_equipment:
+        settings = self._runtime.constants.VEHICLE_SETTING
+        if code == getattr(settings, 'ACTIVATE_EQUIPMENT', None):
             return self._activate_equipment(value)
-        current_shells = getattr(
-            self._runtime.constants.VEHICLE_SETTING, 'CURRENT_SHELLS', None)
-        if code != current_shells or self._gun_state is None:
+        current_shells = getattr(settings, 'CURRENT_SHELLS', None)
+        next_shells = getattr(settings, 'NEXT_SHELLS', None)
+        if code not in (current_shells, next_shells) or self._gun_state is None:
             return False
-        for index, shot in enumerate(self._gun_state.shots):
+        state = self._gun_state
+        for index, shot in enumerate(state.shots):
             shell = _field(shot, 'shell', {})
-            if int(_field(shell, 'compactDescr', 0)) == int(value):
-                changed = self._gun_state.sync_shell_index(index)
-                if changed:
-                    self._publish_ammo_state(self._gun_state, force=True)
-                    self._publish_reload_event(
-                        self._gun_state.reload_time,
-                        self._gun_state.reload_duration, force=True)
-                return changed
+            if int(_field(shell, 'compactDescr', 0)) != int(value):
+                continue
+            if code == next_shells:
+                changed = state.request_shell_index(index)
+            else:
+                changed = state.sync_shell_index(index)
+            if changed:
+                self._publish_ammo_state(state, force=True)
+                self._publish_reload_event(
+                    state.reload_time, state.reload_duration, force=True)
+            # The stock ammo panel already blinks a queued shell locally.
+            return True
         return False
 
     def on_snapshot(self, message):
@@ -8236,10 +8257,8 @@ class BattleRuntime(object):
         """
         if local:
             if self._local_spotting_cache is None:
-                item = self._garage_item()
-                crew = getattr(item, 'crew', None) if item is not None else None
                 self._local_spotting_cache = loadout_law.spotting_profile(
-                    descriptor, crew)
+                    descriptor, self._garage_loadout_snapshot()['crew'] or None)
             return self._local_spotting_cache
         return loadout_law.spotting_profile(descriptor, None)
 
@@ -9299,7 +9318,7 @@ class BattleRuntime(object):
         self._equipment_state = None
         self._equipment_signature = None
         self._local_loadout_cache = None
-        self._local_ammo_layout_cache = None
+        self._garage_loadout = None
         self._local_spotting_cache = None
         self._local_still_since = None
         self._battle_result = None

@@ -96,6 +96,7 @@ class GunState(object):
         self.reload_duration = self.reload
         self.dispersion = self.base_dispersion
         self.load_started = False
+        self.pending_index = None
 
     def _layout_ammo(self, ammo_layout):
         """Map a garage shell layout onto this gun's shot order.
@@ -154,6 +155,7 @@ class GunState(object):
         except (TypeError, ValueError):
             return False
         index = max(0, min(index, len(self.shots) - 1))
+        self.pending_index = None
         if index == self.shot_index:
             return False
         self.shot_index = index
@@ -162,6 +164,25 @@ class GunState(object):
         self.reload_duration = self.reload
         self.load_started = False
         return True
+
+    def request_shell_index(self, index):
+        """Queue ``index`` as the next shell, or load it now when idle.
+
+        #1513 sends VEHICLE_SETTING.NEXT_SHELLS while the gun still holds a
+        round, and the loaded round must be fired first.  A gun with nothing
+        loaded swaps immediately and reloads from scratch.
+        """
+        if not self.shots:
+            return False
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            return False
+        index = max(0, min(index, len(self.shots) - 1))
+        if self.clip > 0 and self.reload_time <= 0.0:
+            self.pending_index = None if index == self.shot_index else index
+            return False
+        return self.sync_shell_index(index)
 
     def can_fire(self, battle_live=True):
         if not battle_live or not self.shots or self.reload_time > 0.0:
@@ -196,6 +217,15 @@ class GunState(object):
                     self.reload_time = max(self.reload_time, self.reload)
                     self.reload_duration = self.reload_time
                     break
+        pending = self.pending_index
+        self.pending_index = None
+        if (pending is not None and pending != self.shot_index and
+                pending < len(self.ammo) and self.ammo[pending] > 0):
+            self.shot_index = pending
+            self.clip = 0
+            self.reload_time = self.reload
+            self.reload_duration = self.reload
+            self.load_started = False
         return True
 
     def tick(self, dt, battle_live, move_speed, rotation_speed,

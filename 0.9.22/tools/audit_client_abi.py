@@ -290,8 +290,32 @@ EXPECTED_ABI = {
         'Vehicle._buildCrew': ('self', 'crew', 'proxy'),
         'Vehicle._parseShells': (
             'self', 'layoutList', 'defaultLayoutList', 'proxy'),
+        'Vehicle.shells': ('self',),
+        'Vehicle.equipment': ('self',),
         'Vehicle.isLocked': ('self',),
         'Vehicle.typeOfLockingArena': ('self',),
+    },
+    'scripts/client/gui/shared/gui_items/vehicle_modules.pyc': {
+        'Shell.__init__': (
+            'self', 'intCompactDescr', 'count', 'defaultCount', 'proxy',
+            'isBoughtForCredits'),
+        'Shell.count': ('self',),
+    },
+    'scripts/client/gui/shared/gui_items/vehicle_equipment.pyc': {
+        'VehicleEquipment.regularConsumables': ('self',),
+        '_VehicleConsumables.getIntCDs': ('self', 'default'),
+        '_VehicleConsumables.getInstalledItems': ('self',),
+    },
+    'scripts/client/gui/battle_control/controllers/consumables/'
+    'ammo_ctrl.pyc': {
+        'AmmoController.changeSetting': ('self', 'intCD', 'avatar'),
+        'AmmoController.getNextSettingCode': ('self', 'intCD'),
+        'AmmoController.setNextShellCD': ('self', 'intCD'),
+        'AmmoController.setCurrentShellCD': ('self', 'intCD'),
+    },
+    'scripts/client/account_helpers/AccountSettings.pyc': {
+        'AccountSettings.__readSection': ('ds', 'name'),
+        'AccountSettings.__readUserSection': (),
     },
     'scripts/client/gui/Scaleform/daapi/view/lobby/hangar/'
     'AmmunitionPanel.pyc': {
