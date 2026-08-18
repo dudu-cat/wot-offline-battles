@@ -22,6 +22,9 @@ _login_space_seen = False
 _lobby_view_loaded = False
 _lobby_listener_installed = False
 
+# Enough of every artefact that the garage never blocks a mount on stock.
+OFFLINE_ARTEFACT_STOCK = 200
+
 
 def _schedule(delay, function):
     global _callback_id
@@ -171,6 +174,30 @@ def _selected_vehicle(config):
         if not vehicle_records:
             raise ValueError('client vehicle catalogue is empty')
 
+        # items/__init__ ITEM_TYPE_NAMES: optionalDevice is 9 and equipment is
+        # 11.  Neither was published, so the garage showed an empty equipment
+        # and optional-device surface no matter what the account owned.
+        artefact_counts = {}
+        for item_type_name, cache_accessor in (
+                ('optionalDevice', vehicles.g_cache.optionalDevices),
+                ('equipment', vehicles.g_cache.equipments)):
+            item_type = ITEM_TYPE_INDICES[item_type_name]
+            published = inventory_items.setdefault(item_type, {})
+            for descriptor in cache_accessor().values():
+                try:
+                    compact_descr = int(descriptor.compactDescr)
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                published[compact_descr] = max(
+                    int(published.get(compact_descr, 0)),
+                    OFFLINE_ARTEFACT_STOCK)
+                shop_item_prices[compact_descr] = {'credits': 0, 'gold': 0}
+                unlock_item_compact_descrs.add(compact_descr)
+            artefact_counts[item_type_name] = len(published)
+            if not published:
+                raise ValueError(
+                    'client %s catalogue is empty' % item_type_name)
+
         customization_count = 0
         customization_cache = vehicles.g_cache.customization20()
         for collection_name in (
@@ -199,6 +226,8 @@ def _selected_vehicle(config):
             'customizationItemCount': customization_count,
             'vehicleTypeCompactDescrs': vehicle_type_compact_descrs,
             'unlockItemCompactDescrs': unlock_item_compact_descrs,
+            'optionalDeviceCount': artefact_counts['optionalDevice'],
+            'equipmentCount': artefact_counts['equipment'],
         })
         return result
     except Exception:

@@ -8,9 +8,14 @@ wire shapes can be tested without importing BigWorld.
 
 VEHICLE_ITEM_TYPE = 1
 TANKMAN_ITEM_TYPE = 8
+OPTIONAL_DEVICE_ITEM_TYPE = 9
+SHELL_ITEM_TYPE = 10
+EQUIPMENT_ITEM_TYPE = 11
 CUSTOMIZATION_ITEM_TYPE = 12
 ITEM_TYPE_INDICES = tuple(range(1, 13))
 REQUIRED_VEHICLE_COMPONENT_TYPES = (2, 3, 4, 5, 6, 7)
+# Account-wide artefacts: owned once and mountable on any vehicle.
+ARTEFACT_ITEM_TYPES = (OPTIONAL_DEVICE_ITEM_TYPE, EQUIPMENT_ITEM_TYPE)
 OFFLINE_CREDITS = 100000000
 OFFLINE_GOLD = 1000000
 OFFLINE_FREE_XP = 100000000
@@ -232,6 +237,18 @@ def inventory(selected_vehicle=None):
         # This foreign key is the vehicle inventory id, not its type id.
         tankman_vehicles.update(dict(
             (tankman_id, vehicle_id) for tankman_id in tankmen))
+
+    # Optional devices and equipment are owned by the account, not by one
+    # vehicle, so they arrive in the snapshot's top-level catalogue.
+    for item_type, items in dict(
+            vehicle.get('inventoryItems', {})).items():
+        item_type = int(item_type)
+        if item_type not in ARTEFACT_ITEM_TYPES:
+            continue
+        target = values[item_type]
+        for compact_descr, count in dict(items).items():
+            target[compact_descr] = max(
+                int(target.get(compact_descr, 0)), int(count))
 
     values[TANKMAN_ITEM_TYPE] = {
         'compDescr': all_tankmen,

@@ -30,8 +30,9 @@ from gui.mods.offline_lan_0922.snapshot_sync import SnapshotSync
 from gui.mods.offline_lan_0922.spawn_planner import SpawnPlanner
 from gui.mods.offline_lan_0922 import (
     combat_rules, critical_damage, destructibles_compat, gun_mechanics,
-    prebaked_destructibles, prebaked_foliage, prebaked_navigation, spotting,
-    tank_collision, vehicle_physics, world_collision)
+    loadout as loadout_law, prebaked_destructibles, prebaked_foliage,
+    prebaked_navigation, spotting, tank_collision, vehicle_physics,
+    world_collision)
 
 
 # BigWorld callbacks run on rendered frames.  The mature 0.8.2 battle asks for
@@ -742,6 +743,7 @@ class BattleRuntime(object):
         self._reload_event = None
         self._equipment_state = None
         self._equipment_signature = None
+        self._local_loadout_cache = None
         self._battle_result = None
         self._round_finished_notified = False
         self._on_local_leave = None
@@ -880,6 +882,7 @@ class BattleRuntime(object):
         self._reload_event = None
         self._equipment_state = None
         self._equipment_signature = None
+        self._local_loadout_cache = None
         self._battle_result = self._start_message.get('battle_result')
         self._round_finished_notified = False
         self._on_local_leave = on_local_leave
@@ -1613,7 +1616,8 @@ class BattleRuntime(object):
             self._attach_local_presentation()
             self._runtime.compatibility.set_control_mode_listener(
                 self._on_control_mode_changed)
-            self._gun_state = gun_mechanics.GunState(descriptor)
+            self._gun_state = gun_mechanics.GunState(
+                descriptor, self._local_loadout(descriptor))
             self._gun_last_tick = self._clock()
             self._sync = SnapshotSync(
                 self.client.player_id, on_event=self._apply_sync_event,
@@ -3213,6 +3217,44 @@ class BattleRuntime(object):
                 'ready_at': 0.0})
         return result
 
+    def _garage_item(self):
+        """Return the lobby's current vehicle item, or None outside a garage.
+
+        The mounted consumables and the crew live on the garage item, not on
+        the battle descriptor, exactly as in the 0.8.2 law.
+        """
+        try:
+            from CurrentVehicle import g_currentVehicle
+        except ImportError:
+            return None
+        try:
+            if not g_currentVehicle.isPresent():
+                return None
+            return g_currentVehicle.item
+        except Exception:
+            return None
+
+    def _local_loadout(self, descriptor):
+        """Build the passive modifier bundle for the player's own vehicle.
+
+        Optional devices come from the battle descriptor, which #1513 builds
+        from the account's mounted compact descriptor.  Consumables and crew
+        skills come from the garage item when the lobby still owns one.
+        """
+        if self._local_loadout_cache is not None:
+            return self._local_loadout_cache
+        item = self._garage_item()
+        equipments = ()
+        crew_skills = None
+        if item is not None:
+            equipments = getattr(item, 'eqs', ()) or ()
+            crew = getattr(item, 'crew', None)
+            if crew:
+                crew_skills = loadout_law.crew_skill_names(crew)
+        self._local_loadout_cache = loadout_law.modifiers(
+            descriptor, equipments, crew_skills)
+        return self._local_loadout_cache
+
     def _equipment_stages(self):
         stages = getattr(self._runtime.constants, 'EQUIPMENT_STAGES', None)
         if stages is None:
@@ -3437,7 +3479,8 @@ class BattleRuntime(object):
             descriptor = entity.typeDescriptor
             state = self._gun_state
             if state is None:
-                state = gun_mechanics.GunState(descriptor)
+                state = gun_mechanics.GunState(
+                    descriptor, self._local_loadout(descriptor))
                 self._gun_state = state
             now = self._clock()
             if self._gun_last_tick is None:
@@ -8296,7 +8339,9 @@ class BattleRuntime(object):
             return False
         state = self._gun_state
         if state is None:
-            state = gun_mechanics.GunState(entity.typeDescriptor)
+            state = gun_mechanics.GunState(
+                entity.typeDescriptor,
+                self._local_loadout(entity.typeDescriptor))
             self._gun_state = state
             self._gun_last_tick = self._clock()
         if not state.can_fire(self._battle_live):
@@ -8851,6 +8896,7 @@ class BattleRuntime(object):
         self._targeting_signature = None
         self._equipment_state = None
         self._equipment_signature = None
+        self._local_loadout_cache = None
         self._battle_result = None
         self._round_finished_notified = False
         self._on_local_leave = None

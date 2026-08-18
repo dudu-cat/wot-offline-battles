@@ -560,6 +560,24 @@ class AccountRpcTests(unittest.TestCase):
         self.assertEqual({}, data['inventory'][11])
         self.assertEqual({}, data['inventory'][12])
 
+    def test_account_artefact_catalogue_reaches_devices_and_equipment(self):
+        garage = copy.deepcopy(SELECTED_VEHICLE)
+        # bootstrap publishes these account-wide, not inside a vehicle record.
+        garage['inventoryItems'] = dict(garage['inventoryItems'])
+        garage['inventoryItems'][9] = {9001: 200, 9002: 200}
+        garage['inventoryItems'][11] = {11001: 200}
+        garage['shopItemPrices'] = dict(garage['shopItemPrices'])
+        for compact_descr in (9001, 9002, 11001):
+            garage['shopItemPrices'][compact_descr] = {
+                'credits': 0, 'gold': 0}
+
+        value = account_data.sync_data(selected_vehicle=garage)
+
+        self.assertEqual({9001: 200, 9002: 200}, value['inventory'][9])
+        self.assertEqual({11001: 200}, value['inventory'][11])
+        # The per-vehicle records stay untouched by the account catalogue.
+        self.assertEqual({10010: 20, 10011: 10}, value['inventory'][10])
+
     def test_full_garage_expands_every_vehicle_and_tankman_foreign_key(self):
         garage = _full_garage_snapshot()
         value = account_data.sync_data(selected_vehicle=garage)

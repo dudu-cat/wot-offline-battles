@@ -1005,10 +1005,27 @@ node.
 
 The source audit deliberately keeps the following differences visible:
 
-- the offline garage publishes stock configurations with empty optional-device
-  slots. The player gun uses the copied 100% crew plus commander baseline and
-  critical penalties, but passive optional-device, food and crew-perk modifiers
-  are not wired;
+- the offline garage now publishes the complete optional-device and equipment
+  catalogue (`items/__init__` item types 9 and 11) with shop prices, unlocks and
+  owned stock, and the battle law applies the reviewed 0.8.2 passive modifiers:
+  ventilation, Brothers in Arms and food move the crew level before the
+  `1 / (0.5 + 0.005 * level)` conversion, a gun rammer scales reload by 0.9, a
+  gun laying drive divides aiming time by 1.1, and a vertical stabiliser, Snap
+  Shot and Smooth Ride damp the dispersion bloom terms (`loadout.py`). What is
+  still missing is the account command surface that MOUNTS them: the verified
+  #1513 ids are `CMD_EQUIP` 101, `CMD_EQUIP_OPTDEV` 102, `CMD_EQUIP_SHELLS` 103,
+  `CMD_EQUIP_EQS` 104, `CMD_VEH_SETTINGS` 107, `CMD_SET_AND_FILL_LAYOUTS` 108,
+  `CMD_TMAN_ADD_SKILL` 151, `CMD_TMAN_DROP_SKILLS` 152, `CMD_BUY_ITEM` 302 and
+  `CMD_BUY_AND_EQUIP_ITEM` 308, none of which collide with the ten commands the
+  offline RPC already answers. Mounting also needs a mutable account state: the
+  0.8.2 reference proves that optional devices live inside the vehicle's compact
+  descriptor, so the customization and fitting writers must share one live
+  inventory dictionary or a mount silently reverts the camouflage;
+- gun swap, ammo-count editing and crew skill training share that same
+  unimplemented command surface;
+- the spotting path applies `circularVisionRadiusFactor` from the descriptor, so
+  coated optics work implicitly, but binocular telescope, camouflage net and the
+  Recon, Situational Awareness and Camouflage crew skills are not yet read;
 - the server publishes terminal winner/reason/base team plus live frags and the
   human team-killer flag, but not the complete 0.8.2
   `personal`/`players`/`vehicles` battle-result record;

@@ -154,6 +154,12 @@ class BootstrapLifecycleTests(unittest.TestCase):
             decals={12003: types.SimpleNamespace(compactDescr=12003)},
             modifications={12004: types.SimpleNamespace(compactDescr=12004)},
             styles={12005: types.SimpleNamespace(compactDescr=12005)})
+        optional_devices = dict(
+            (9000 + index, types.SimpleNamespace(compactDescr=9000 + index))
+            for index in range(4))
+        equipments = dict(
+            (11000 + index, types.SimpleNamespace(compactDescr=11000 + index))
+            for index in range(3))
         crew_type_ids = []
         crew_skill_masks = []
         vehicles = types.SimpleNamespace(
@@ -165,7 +171,9 @@ class BootstrapLifecycleTests(unittest.TestCase):
             attemptedTypeIDs=attempted_type_ids,
             crewTypeIDs=crew_type_ids,
             g_cache=types.SimpleNamespace(
-                customization20=lambda: customization))
+                customization20=lambda: customization,
+                optionalDevices=lambda: optional_devices,
+                equipments=lambda: equipments))
 
         def generate_tankmen(nation_id, vehicle_type_id, roles,
                              is_premium, role_level, skills_mask, is_preview):
@@ -248,13 +256,24 @@ class BootstrapLifecycleTests(unittest.TestCase):
         self.assertEqual((0, 0), selected['lock'])
         self.assertEqual([0, 0, 0], selected['eqs'])
         self.assertEqual([0, 0, 0], selected['eqsLayout'])
-        self.assertEqual(set(range(2, 8)),
-                         set(selected['inventoryItems']) - {10})
+        # 9 is optionalDevice and 11 is equipment: account-wide catalogues
+        # the garage needs before it can offer a mount.
+        self.assertEqual(set(range(2, 8)) | {9, 10, 11},
+                         set(selected['inventoryItems']))
         required_prices = set()
-        for item_type in tuple(range(2, 8)) + (10,):
+        for item_type in tuple(range(2, 8)) + (9, 10, 11):
             required_prices.update(selected['inventoryItems'][item_type])
         self.assertTrue(
             required_prices.issubset(selected['shopItemPrices']))
+        self.assertTrue(
+            required_prices.issubset(selected['unlockItemCompactDescrs']))
+        self.assertEqual(4, selected['optionalDeviceCount'])
+        self.assertEqual(3, selected['equipmentCount'])
+        for compact_descr in (9000, 9003, 11000, 11002):
+            self.assertEqual(
+                200,
+                selected['inventoryItems'][
+                    9 if compact_descr < 10000 else 11][compact_descr])
         self.assertEqual(9, selected['shopNationCount'])
         self.assertEqual(5, selected['customizationItemCount'])
         self.assertTrue(

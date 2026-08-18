@@ -11,6 +11,8 @@ Only storage moved from a closure dictionary to an object.
 import math
 import random
 
+from gui.mods.offline_lan_0922 import loadout
+
 
 def _field(value, name, default=None):
     if isinstance(value, dict):
@@ -28,7 +30,7 @@ def _positive(value, default):
 
 class GunState(object):
 
-    def __init__(self, descriptor):
+    def __init__(self, descriptor, loadout_modifiers=None):
         gun = descriptor.gun
         self.shots = tuple(_field(gun, 'shots', ()) or ())
         self.base_dispersion = _positive(
@@ -62,14 +64,23 @@ class GunState(object):
         except (TypeError, ValueError):
             selected = 0
         self.shot_index = max(0, min(selected, max(0, len(self.shots) - 1)))
-        # The fake account carries a plain 100% crew with no equipment or
-        # skills.  Preserve the exact 0.8.2 base-crew plus 10% commander
-        # conversion that its CurrentVehicle fallback applies.
-        crew_multiplier = 1.0 / (0.5 + 0.005 * 110.0)
+        # 0.8.2 converts the crew level through 1/(0.5 + 0.005 * level) and
+        # then applies the gun rammer and gun laying drive.  A bare 100% crew
+        # already yields 0.952; ventilation, Brothers in Arms and rations move
+        # the level before the conversion.
+        if loadout_modifiers is None:
+            loadout_modifiers = loadout.baseline()
+        self.loadout = dict(loadout_modifiers)
+        crew_multiplier = _positive(
+            self.loadout.get('crew_multiplier'), 1.0 / (0.5 + 0.005 * 110.0))
         self.base_dispersion *= crew_multiplier
         self.aim_time *= crew_multiplier
         self.reload *= crew_multiplier
         self.clip_reload *= crew_multiplier
+        self.aim_time *= _positive(self.loadout.get('aim_time_factor'), 1.0)
+        reload_factor = _positive(self.loadout.get('reload_factor'), 1.0)
+        self.reload *= reload_factor
+        self.clip_reload *= reload_factor
         self.clip = 0
         self.reload_time = self.reload
         self.reload_duration = self.reload
@@ -158,9 +169,12 @@ class GunState(object):
             move_factor, rotation_factor = chassis_factors
             gun_factors = _field(gun, 'shotDispersionFactors', {}) or {}
             turret_factor = _field(gun_factors, 'turretRotation', 0.0)
-            move_term = float(move_speed) * float(move_factor)
-            rotation_term = float(rotation_speed) * float(rotation_factor)
-            turret_term = float(turret_speed) * float(turret_factor)
+            move_term = (float(move_speed) * float(move_factor) *
+                         self.loadout.get('bloom_move_factor', 1.0))
+            rotation_term = (float(rotation_speed) * float(rotation_factor) *
+                             self.loadout.get('bloom_rotation_factor', 1.0))
+            turret_term = (float(turret_speed) * float(turret_factor) *
+                           self.loadout.get('bloom_turret_factor', 1.0))
             target_dispersion = self.base_dispersion * math.sqrt(
                 1.0 + move_term * move_term +
                 rotation_term * rotation_term +

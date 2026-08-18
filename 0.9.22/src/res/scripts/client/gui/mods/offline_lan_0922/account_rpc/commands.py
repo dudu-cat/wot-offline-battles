@@ -4,9 +4,12 @@ RES_FAILURE = -1
 RES_SUCCESS = 0
 RES_STREAM = 1
 
-# Sent by the queue commands; below REQUEST_ID_UNRESERVED_MIN (20), so the
-# response callback lookup in Account.onCmdResponse never matches it.
-REQUEST_ID_NO_RESPONSE = 2
+# #1513 derives these from streamIDs.STREAM_ID_ACCOUNT_CMDS_MIN (200), not from
+# zero: REQUEST_ID_NO_RESPONSE is 202 and REQUEST_ID_UNRESERVED_MIN is 220.
+# Account.__getRequestID only ever allocates ids at or above the unreserved
+# minimum, so a reserved id can never match a response callback.
+REQUEST_ID_NO_RESPONSE = 202
+REQUEST_ID_UNRESERVED_MIN = 220
 
 CMD_SYNC_DATA = 100
 CMD_SYNC_SHOP = 300
