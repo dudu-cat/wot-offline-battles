@@ -6,7 +6,7 @@ except ImportError:
     import pickle as _pickle
 import zlib
 
-from gui.mods.offline_lan_0922.account_rpc import commands, requests
+from gui.mods.offline_lan_0922.account_rpc import commands, data, requests
 
 
 def _refresh_garage_views(diff):
@@ -101,6 +101,7 @@ class FakeServer(object):
             revision = int(getattr(player.syncData, 'revision', 0) or 0)
         except (AttributeError, TypeError, ValueError):
             revision = 0
+        diff.setdefault('potapovQuests', data.personal_missions())
         diff.setdefault('prevRev', revision)
         diff.setdefault('rev', revision + 1)
         payload = _pickle.dumps(diff, _pickle.HIGHEST_PROTOCOL)

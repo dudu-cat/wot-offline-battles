@@ -11,6 +11,7 @@ while using #1513's verified compound-model assembler.
 """
 
 import math
+import sys
 import weakref
 from collections import namedtuple
 
@@ -1101,6 +1102,7 @@ class RemoteVehicleFactory(object):
         self._model_assembler = model_assembler
         self._camouflages = camouflages
         self.track_animation_error = None
+        self._track_animation_reported = False
         self._space_id = int(space_id)
         self._vehicles = {}
         self._next_id = 1000
@@ -1217,24 +1219,45 @@ class RemoteVehicleFactory(object):
         """
         camouflages = self._camouflages
         if camouflages is None:
+            self._report_track_animation('disabled', None)
             return False
+        step = 'prepareFashions'
         try:
             fashions = camouflages.prepareFashions(False)
+            step = 'setupVehicleFashion'
             self._model_assembler.setupVehicleFashion(
                 fashions[0], descriptor, False)
+            step = 'setupFashions'
             model.setupFashions(fashions)
+            step = 'createVehicleFilter'
             vehicle_filter = self._model_assembler.createVehicleFilter(
                 descriptor)
+            step = 'PyTrackScroll'
             scroll = self._bigworld.PyTrackScroll()
+            step = 'activate'
             scroll.activate()
+            step = 'setData'
             scroll.setData(vehicle_filter)
+            step = 'movementInfo'
             fashions[0].movementInfo = vehicle_filter.movementInfo
         except Exception as error:
             if self.track_animation_error is None:
-                self.track_animation_error = error
+                self.track_animation_error = '%s: %s' % (step, error)
+            self._report_track_animation(step, error)
             return False
+        self._report_track_animation('assembled', None)
         return vehicle.attach_track_animation(
             vehicle_filter, scroll, fashions)
+
+    def _report_track_animation(self, step, error):
+        """Say once per battle where the belt assembly stopped."""
+        if self._track_animation_reported:
+            return False
+        self._track_animation_reported = True
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] bot track assembly %s%s\n' % (
+                step, '' if error is None else ' failed: %s' % error))
+        return True
 
     @staticmethod
     def _resource(resources, name):

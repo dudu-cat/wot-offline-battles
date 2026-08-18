@@ -31,6 +31,10 @@ DEFAULT_CONFIG = {
     'physics_tuning': {},
     'he_tuning': {},
     'perfect_accuracy': False,
+    # Native belt animation for bots. Off by default: it adds native
+    # calls on a client-only compound model that no acceptance has
+    # cleared yet.
+    'bot_track_animation': False,
     # Per-chunk destructible and bot-steering traces. PERF summaries are
     # always published; these are the noisy per-event lines.
     'debug_logging': False,

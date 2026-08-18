@@ -558,6 +558,7 @@ def _load_runtime():
     runtime.gui_global_space_id = GUI_GLOBAL_SPACE_ID
     runtime.hangar_space = HangarSpace
     runtime.math = Math
+    runtime.camouflages = camouflages
     runtime.model_assembler = model_assembler
     runtime.nations = nations
     runtime.offline_map_creator = g_offlineMapCreator
@@ -1469,7 +1470,10 @@ class BattleRuntime(object):
             self._remote_factory = RemoteVehicleFactory(
                 self._runtime.bigworld, self._runtime.math,
                 self._runtime.model_assembler, self._avatar.spaceID,
-                camouflages=getattr(self._runtime, 'camouflages', None))
+                camouflages=(
+                    getattr(self._runtime, 'camouflages', None)
+                    if self._config.get('bot_track_animation', False)
+                    else None))
             self._remote_factory.prepare_descriptor(descriptor)
             builder = EntityPropertyBuilder(
                 BigWorldVehicleBinding.PROPERTY_NAMES)
@@ -8473,6 +8477,14 @@ class BattleRuntime(object):
                 self._present_direct_spot(record)
         return changed
 
+    def _release_target_lock(self, engine_id):
+        """Drop a lock on a vehicle that just died, before it is re-presented."""
+        release = getattr(
+            self._runtime.compatibility, 'release_target_lock', None)
+        if not callable(release) or self._avatar is None:
+            return False
+        return bool(release(self._avatar, engine_id))
+
     def _present_vehicle_dead(self, record, immediate):
         """Mirror ``Vehicle.__onVehicleDeath`` so the marker takes its dead
         style.  ``immediate`` is False for a vehicle that just died and True
@@ -8595,6 +8607,7 @@ class BattleRuntime(object):
         # presentation.
         entity_alive = getattr(entity, 'isAlive', None)
         if not (entity_alive() if callable(entity_alive) else entity_alive):
+            self._release_target_lock(engine_id)
             self._present_vehicle_dead(record, False)
         if record.get('local'):
             if health <= 0:

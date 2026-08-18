@@ -2821,8 +2821,8 @@ class OfflineCompatibilityTests(unittest.TestCase):
         arcade = runtime.control_modes.ArcadeControlMode()
         target = types.SimpleNamespace(
             _offlineLANPresentation=True, bw_entity=object(),
-            id=1000, team=2, _spot_visible=True,
-            isAlive=lambda: True)
+            id=1000, team=2, _spot_visible=True, model=object(),
+            inWorld=True, isAlive=lambda: True)
         runtime.bigworld.entities[1000] = target
         compatibility.set_target_lock_candidate(target)
         arcade.handleKeyEvent(True, 'lock-target', 0, None)
@@ -2838,6 +2838,88 @@ class OfflineCompatibilityTests(unittest.TestCase):
             ('original_avatar_auto_aim', None),
             [item for item in operations
              if item[0] == 'original_avatar_auto_aim'][-1])
+        compatibility.fini()
+
+    def test_a_locked_target_that_loses_its_visual_drops_the_lock(self):
+        """A wreck keeps rendering after death, so presence is not enough:
+        native aiming must never be handed a target mid-teardown."""
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.team = 1
+        avatar.cell = types.SimpleNamespace(autoAim=mock.Mock())
+        avatar.inputHandler = types.SimpleNamespace(setAimingMode=mock.Mock())
+        avatar.gunRotator = types.SimpleNamespace(
+            clientMode=True, dispersionAngle=0.24)
+        avatar.vehicleTypeDescriptor = types.SimpleNamespace(
+            gun=types.SimpleNamespace(shotDispersionAngle=0.08))
+        avatar.onLockTarget = mock.Mock()
+        runtime.bigworld.entity = runtime.bigworld.entities.get
+        runtime.bigworld._player = avatar
+        arcade = runtime.control_modes.ArcadeControlMode()
+        target = types.SimpleNamespace(
+            _offlineLANPresentation=True, bw_entity=object(),
+            id=1000, team=2, _spot_visible=True, model=object(),
+            inWorld=True, isAlive=lambda: True)
+        runtime.bigworld.entities[1000] = target
+        compatibility.set_target_lock_candidate(target)
+        arcade.handleKeyEvent(True, 'lock-target', 0, None)
+        self.assertFalse(compatibility.validate_target_lock(avatar))
+
+        target.bw_entity = None
+
+        self.assertTrue(compatibility.validate_target_lock(avatar))
+        self.assertEqual(0, avatar._PlayerAvatar__autoAimVehID)
+        compatibility.fini()
+
+    def test_an_unreadable_locked_target_drops_the_lock(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.team = 1
+        avatar.cell = types.SimpleNamespace(autoAim=mock.Mock())
+        avatar.inputHandler = types.SimpleNamespace(setAimingMode=mock.Mock())
+        avatar.gunRotator = types.SimpleNamespace(
+            clientMode=True, dispersionAngle=0.24)
+        avatar.vehicleTypeDescriptor = types.SimpleNamespace(
+            gun=types.SimpleNamespace(shotDispersionAngle=0.08))
+        avatar.onLockTarget = mock.Mock()
+        avatar._PlayerAvatar__autoAimVehID = 1000
+
+        def explode(unused_entity_id):
+            raise RuntimeError('entity lookup rejected')
+
+        runtime.bigworld.entity = explode
+
+        self.assertTrue(compatibility.validate_target_lock(avatar))
+        self.assertEqual(0, avatar._PlayerAvatar__autoAimVehID)
+        compatibility.fini()
+
+    def test_a_dead_target_lock_is_released_in_the_same_frame(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.team = 1
+        avatar.cell = types.SimpleNamespace(autoAim=mock.Mock())
+        avatar.inputHandler = types.SimpleNamespace(setAimingMode=mock.Mock())
+        avatar.gunRotator = types.SimpleNamespace(
+            clientMode=True, dispersionAngle=0.24)
+        avatar.vehicleTypeDescriptor = types.SimpleNamespace(
+            gun=types.SimpleNamespace(shotDispersionAngle=0.08))
+        avatar.onLockTarget = mock.Mock()
+        avatar._PlayerAvatar__autoAimVehID = 1000
+
+        self.assertFalse(compatibility.release_target_lock(avatar, 1001))
+        self.assertEqual(1000, avatar._PlayerAvatar__autoAimVehID)
+
+        self.assertTrue(compatibility.release_target_lock(avatar, 1000))
+        self.assertEqual(0, avatar._PlayerAvatar__autoAimVehID)
         compatibility.fini()
 
     def test_fixed_turret_aim_reads_copied_pose_without_replacing_filter(self):

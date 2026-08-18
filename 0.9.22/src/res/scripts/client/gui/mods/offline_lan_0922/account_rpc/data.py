@@ -318,6 +318,16 @@ def stats(selected_vehicle=None):
     }
 
 
+def personal_missions():
+    """#1513's _PersonalMissionsProgressRequester._response indexes
+    ``value['potapovQuests']['compDescr']`` for every non-empty diff."""
+    return {
+        'compDescr': '',
+        'regular': {'slots': 0, 'selected': [], 'lastIDs': {}},
+        'training': {'slots': 0, 'selected': [], 'lastIDs': {}},
+    }
+
+
 def sync_data(revision=0, selected_vehicle=None, int_user_settings=None):
     # These are deliberately present even when empty.  #1513's account
     # helpers only create a requester cache entry when the corresponding key
@@ -328,11 +338,7 @@ def sync_data(revision=0, selected_vehicle=None, int_user_settings=None):
         'prevRev': int(revision),
         'quests': {},
         'tokens': {},
-        'potapovQuests': {
-            'compDescr': '',
-            'regular': {'slots': 0, 'selected': [], 'lastIDs': {}},
-            'training': {'slots': 0, 'selected': [], 'lastIDs': {}},
-        },
+        'potapovQuests': personal_missions(),
         'intUserSettings': dict(int_user_settings or {}),
         'goodies': {},
         'groupLocks': {'groupBattles': [], 'isGroupLocked': []},

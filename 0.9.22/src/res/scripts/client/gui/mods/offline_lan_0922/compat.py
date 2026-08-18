@@ -2441,6 +2441,26 @@ class OfflineCompatibility(object):
         self._target_lock_candidate = vehicle
         return True
 
+    def _target_lock_holds(self, current_id):
+        """Say whether the locked target is still safe to hand to native code.
+
+        A wreck stays rendered after death, so presence in the world is not
+        enough: the entity must resolve, be alive, be spotted, and still own
+        its visual.
+        """
+        target = self._runtime.bigworld.entity(current_id)
+        if target is None:
+            return False
+        alive = getattr(target, 'isAlive', None)
+        alive = alive() if callable(alive) else bool(alive)
+        if not alive or not bool(getattr(target, '_spot_visible', True)):
+            return False
+        if not bool(getattr(target, '_offlineLANPresentation', False)):
+            return True
+        return (getattr(target, 'bw_entity', None) is not None and
+                getattr(target, 'model', None) is not None and
+                bool(getattr(target, 'inWorld', False)))
+
     def validate_target_lock(self, avatar):
         """Release a stock lock when its private remote target leaves AOI."""
         if not self._battle_active:
@@ -2449,13 +2469,30 @@ class OfflineCompatibility(object):
             avatar, '_PlayerAvatar__autoAimVehID')
         if not current_id:
             return False
-        target = self._runtime.bigworld.entity(current_id)
-        if target is not None:
-            alive = getattr(target, 'isAlive')
-            alive = alive() if callable(alive) else bool(alive)
-            if alive and bool(getattr(target, '_spot_visible', True)):
-                return False
+        try:
+            holds = self._target_lock_holds(current_id)
+        except Exception:
+            # An unreadable target is exactly the case that must not reach
+            # native aiming.
+            holds = False
+        if holds:
+            return False
         # Stock owns target-lost state cleanup and convergence bookkeeping.
+        self._original_avatar_auto_aim(avatar, None)
+        return True
+
+    def release_target_lock(self, avatar, vehicle_id):
+        """Drop a lock held on one vehicle, in the frame it stops being safe.
+
+        Waiting for the next validate leaves stock target-lock tracking one
+        frame with a dead target it can still reach through native state.
+        """
+        if not self._battle_active:
+            return False
+        current_id = self._original_avatar_getattribute(
+            avatar, '_PlayerAvatar__autoAimVehID')
+        if not current_id or int(current_id) != int(vehicle_id):
+            return False
         self._original_avatar_auto_aim(avatar, None)
         return True
 

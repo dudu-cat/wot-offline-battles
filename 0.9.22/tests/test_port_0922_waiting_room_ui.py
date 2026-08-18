@@ -111,8 +111,8 @@ class WaitingRoomTests(unittest.TestCase):
         return self.room._controls[role].properties['visible']
 
     def _root_count(self):
-        """The panel plus the drawn arrow's shadow and fill rows."""
-        return 1 + 2 * self.module.WaitingRoomUI.POINTER_ROWS
+        """The panel plus the pointer's outline and body."""
+        return 3
 
     def test_the_room_only_uses_properties_this_client_has(self):
         self.room.install()
@@ -258,28 +258,35 @@ class WaitingRoomTests(unittest.TestCase):
             status=lambda: self.status, host=lambda: True, surface=surface)
         self.assertTrue(room.open())
 
-        self.assertTrue(room._pointer_rows)
-        tip_row = room._pointer_rows[0][0]
-        tip = tip_row.properties
-        self.assertTrue(tip['visible'])
-        self.assertAlmostEqual(0.002, tip['position'][0])
-        # The arrow is its own root: a child reads its position as an offset
+        self.assertEqual(2, len(room._pointer_parts))
+        outline, body = (part for part, unused in room._pointer_parts)
+        self.assertTrue(body.properties['visible'])
+        self.assertEqual(0.0, body.properties['position'][0])
+        # The pointer is its own root: a child reads its position as an offset
         # from the panel, not as a screen coordinate.
-        self.assertIn(tip_row, surface.roots)
-        self.assertNotIn(tip_row, room._panel.children)
-        self.assertAlmostEqual(2 * 0.002, tip['width'])
-        self.assertAlmostEqual(2 / 500.0, tip['height'])
+        self.assertIn(body, surface.roots)
+        self.assertNotIn(body, room._panel.children)
+        # A pixel-sized quad with the flat material is what the panel and its
+        # buttons already render with; a one-pixel row did not rasterize.
+        self.assertEqual('PIXEL', body.properties['widthMode'])
+        self.assertEqual('PIXEL', body.properties['heightMode'])
+        self.assertEqual(room.POINTER_WIDTH, body.properties['width'])
+        self.assertEqual(room.POINTER_HEIGHT, body.properties['height'])
+        self.assertGreater(outline.properties['width'],
+                           body.properties['width'])
+        self.assertGreater(outline.properties['height'],
+                           body.properties['height'])
+        tip_row = body
 
         surface.cursor = (-0.5, 0.25)
         room.move_pointer()
-        moved = room._pointer_rows[0][0].properties
+        moved = body.properties
 
-        # One pixel is 2/width in clip space.
-        self.assertAlmostEqual(-0.5 + 0.002, moved['position'][0])
-        self.assertAlmostEqual(0.25 - 0.004, moved['position'][1])
+        self.assertAlmostEqual(-0.5, moved['position'][0])
+        self.assertAlmostEqual(0.25, moved['position'][1])
 
         room.close()
-        self.assertEqual([], room._pointer_rows)
+        self.assertEqual([], room._pointer_parts)
         self.assertNotIn(tip_row, surface.roots)
 
     def test_the_pointer_follows_without_any_mouse_event(self):
@@ -324,9 +331,9 @@ class WaitingRoomTests(unittest.TestCase):
         surface.cursor = (0.4, -0.6)
         surface.ticks[-1][1]()
 
-        tip = room._pointer_rows[0][0].properties
-        self.assertAlmostEqual(0.4 + 0.002, tip['position'][0])
-        self.assertAlmostEqual(-0.6 - 0.004, tip['position'][1])
+        tip = room._pointer_parts[1][0].properties
+        self.assertAlmostEqual(0.4, tip['position'][0])
+        self.assertAlmostEqual(-0.6, tip['position'][1])
         # The tick reschedules itself for as long as the room is open.
         self.assertEqual(2, len(surface.ticks))
 
@@ -342,17 +349,17 @@ class WaitingRoomTests(unittest.TestCase):
         self.room._surface.cursor_position = lambda: (0.0, 0.0)
         self.room.move_pointer()
         panel_z = self.room._panel.properties['position'][2]
-        row_z = self.room._pointer_rows[0][0].properties['position'][2]
+        row_z = self.room._pointer_parts[0][0].properties['position'][2]
         self.assertLess(row_z, panel_z)
 
     def test_the_pointer_never_takes_mouse_focus(self):
         self.room.open()
         self.room._build_pointer()
 
-        for row, unused_index, unused_offset in self.room._pointer_rows:
-            self.assertFalse(row.properties['focus'])
-            self.assertFalse(row.properties['mouseButtonFocus'])
-            self.assertFalse(row.properties['crossFocus'])
+        for part, unused_grow in self.room._pointer_parts:
+            self.assertFalse(part.properties['focus'])
+            self.assertFalse(part.properties['mouseButtonFocus'])
+            self.assertFalse(part.properties['crossFocus'])
 
     def test_controls_carry_a_border_frame_behind_the_body(self):
         self.room.open()

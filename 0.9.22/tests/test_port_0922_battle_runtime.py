@@ -1640,6 +1640,14 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertIsNone(scroll.data)
         self.assertIsNone(vehicle.track_scroll)
 
+    def test_the_belt_assembly_is_off_until_the_config_enables_it(self):
+        """The belt path adds native calls on a client-only compound model
+        that no acceptance has cleared, so it must be opt-in."""
+        from gui.mods.offline_lan_0922 import config as port_config
+
+        self.assertFalse(
+            port_config.DEFAULT_CONFIG['bot_track_animation'])
+
     def test_a_client_without_the_belt_boundary_still_presents_bots(self):
         runtime = _runtime()
         factory = RemoteVehicleFactory(
