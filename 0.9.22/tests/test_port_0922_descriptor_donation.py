@@ -316,27 +316,58 @@ class _Tester(object):
         self.bbox = bbox
 
 
+class _Vector(object):
+    """Math.Vector2/3 double: iterable and indexable, not a list or tuple."""
+
+    def __init__(self, *values):
+        self._values = values
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def __getitem__(self, index):
+        return self._values[index]
+
+
+class _ShellType(object):
+    """shell_components.ShellType double: .name carries the kind string."""
+
+    __slots__ = ('name', 'explosionRadius')
+
+    def __init__(self, name, explosionRadius=None):
+        self.name = name
+        if explosionRadius is not None:
+            self.explosionRadius = explosionRadius
+
+
 class ProjectionBuilderTest(unittest.TestCase):
     def _descriptor(self):
+        # Field shapes mirror the exact #1513 readers: hullPosition and
+        # turretPositions are vectors (readVector3), turretYawLimits and
+        # piercingPower are Vector2, and the shell kind lives on shell.type.
+        shell = types.SimpleNamespace(
+            type=_ShellType('ARMOR_PIERCING'), caliber=45.0,
+            damage=(110.0, 110.0), isTracer=False, effectsIndex=3)
         gun = types.SimpleNamespace(
-            shots=({'shell': {'kind': 'ARMOR_PIERCING', 'caliber': 45.0,
-                              'damage': (110.0, 110.0)},
-                    'speed': 700.0, 'gravity': 9.81,
-                    'maxDistance': 720.0,
-                    'piercingPower': (80.0, 60.0)},),
+            shots=(types.SimpleNamespace(
+                shell=shell, speed=700.0, gravity=9.81, maxDistance=720.0,
+                piercingPower=_Vector(80.0, 60.0)),),
             reloadTime=2.3, clip=(1, 0.0),
-            turretYawLimits=(-3.14, 3.14),
-            pitchLimits={'absolute': (-0.35, 0.15)},
+            turretYawLimits=_Vector(-3.14, 3.14),
+            pitchLimits={'minPitch': [(0.0, -0.35)], 'maxPitch': [(0.0, 0.15)]},
             rotationSpeed=0.7, shotDispersionAngle=0.0046,
             maxHealth=54, maxRegenHealth=27)
         chassis = types.SimpleNamespace(
             hitTester=_Tester(((-1.5, -0.8, -3.5), (1.5, 0.8, 3.5), None)),
-            hullPosition=(0.0, 0.6, 0.0), rotationSpeed=0.66,
+            hullPosition=_Vector(0.0, 0.6, 0.0), rotationSpeed=0.66,
             shotDispersionFactors=(0.14, 0.14),
             maxHealth=170, maxRegenHealth=130)
         hull = types.SimpleNamespace(
             hitTester=_Tester(((-1.7, -0.2, -3.5), (1.7, 1.4, 3.5), None)),
-            turretPositions=((0.0, 1.0, 0.0),),
+            turretPositions=(_Vector(0.0, 1.0, 0.0),),
             primaryArmor=(18.0, 16.0, 16.0))
         vehicle_type = types.SimpleNamespace(
             name='ussr:R11_MS-1', level=1, tags=('lightTank',))
@@ -358,12 +389,46 @@ class ProjectionBuilderTest(unittest.TestCase):
         self.assertEqual(1000, decoded['maxHealth'])
         shot = decoded['gun']['shots'][0]
         self.assertEqual(700.0, shot['speed'])
+        self.assertEqual([80.0, 60.0], shot['piercingPower'])
         self.assertEqual('ARMOR_PIERCING', shot['shell']['kind'])
+        self.assertEqual([0.0, 0.6, 0.0],
+                         decoded['chassis']['hullPosition'])
+        self.assertEqual([[0.0, 1.0, 0.0]],
+                         decoded['hull']['turretPositions'])
+        self.assertEqual([-3.14, 3.14], decoded['gun']['turretYawLimits'])
         self.assertEqual([[-1.7, -0.2, -3.5], [1.7, 1.4, 3.5], None],
                          decoded['hull']['hitTester']['bbox'])
         self.assertEqual([18.0, 16.0, 16.0],
                          decoded['hull']['primaryArmor'])
         self.assertEqual(100.0, decoded['engine']['maxHealth'])
+
+    def test_high_explosive_radius_comes_from_the_shell_type(self):
+        descriptor = self._descriptor()
+        descriptor.gun.shots[0].shell = types.SimpleNamespace(
+            type=_ShellType('HIGH_EXPLOSIVE', explosionRadius=1.85),
+            caliber=122.0, damage=(450.0, 90.0), isTracer=True,
+            effectsIndex=7)
+
+        projection = descriptor_donation.project_descriptor(descriptor)
+
+        shell = projection['gun']['shots'][0]['shell']
+        self.assertEqual('HIGH_EXPLOSIVE', shell['kind'])
+        self.assertEqual(1.85, shell['explosionRadius'])
+
+    def test_projection_feeds_the_server_collision_boundary(self):
+        import descriptor_projection
+        from gui.mods.offline_lan_0922 import tank_collision
+
+        projection = json.loads(json.dumps(
+            descriptor_donation.project_descriptor(self._descriptor())))
+        wrapped = descriptor_projection.wrap(projection)
+
+        shape = tank_collision.chassis_shape(wrapped)
+
+        self.assertEqual(1.5, shape[0])
+        self.assertEqual(3.5, shape[1])
+        self.assertEqual(-0.8, shape[2])
+        self.assertEqual(0.6 + 1.4, shape[3])
 
     def test_missing_hull_bbox_fails_closed(self):
         descriptor = self._descriptor()

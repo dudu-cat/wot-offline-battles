@@ -128,6 +128,21 @@ class WaitingRoomTests(unittest.TestCase):
         self.assertEqual('LAN SERVER: 10.0.0.5:28782', self._label('room'))
         self.assertEqual('PLAYERS (2): Host, Guest', self._label('players'))
 
+    def test_controls_carry_a_border_frame_behind_the_body(self):
+        self.room.open()
+        frame = self.room._frames['start'].properties
+        control = self.room._controls['start'].properties
+        self.assertTrue(frame['visible'])
+        self.assertGreater(frame['width'], control['width'])
+        self.assertGreater(frame['height'], control['height'])
+        self.assertGreater(frame['position'][2], control['position'][2])
+        self.assertFalse(frame['focus'])
+
+        self.is_host = False
+        self.room.refresh()
+        self.assertFalse(self.room._frames['start'].properties['visible'])
+        self.assertTrue(self.room._frames['close'].properties['visible'])
+
     def test_a_guest_sees_the_room_without_controls(self):
         self.is_host = False
         self.status += u'\nWAITING FOR Host TO START THE BATTLE'

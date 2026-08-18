@@ -23,9 +23,11 @@ Exact #1513 evidence for the native surface used here:
   ``scripts/client/new_year/fade_window.pyc``.
 - Mouse script methods ``handleMouseClickEvent``, ``handleMouseEnterEvent``,
   ``handleMouseLeaveEvent`` and ``handleMouseButtonEvent``: ``ChainView.pyc``.
-- The lobby already attaches ``GUI.mcursor`` through
-  ``gui/Scaleform/managers/Cursor.pyc``, so this room does not take cursor
-  ownership.
+- The lobby owns the pointer: ``Cursor.attachCursor`` in
+  ``gui/Scaleform/managers/Cursor.pyc`` keeps ``GUI.mcursor().visible`` False
+  and presents the Scaleform-drawn arrow. Forcing the native cursor visible
+  showed the OS busy cursor on the real #1513 client, so this room never
+  touches the cursor; clicks landed on the real client without it.
 """
 
 import sys
@@ -72,13 +74,6 @@ class NativeSurface(object):
 
     def add_root(self, component):
         self._gui.addRoot(component)
-
-    def show_cursor(self, visible):
-        """Show the native pointer while this room owns the mouse."""
-        cursor = self._gui.mcursor()
-        previous = bool(getattr(cursor, 'visible', False))
-        cursor.visible = bool(visible)
-        return previous
 
     def remove_root(self, component):
         self._gui.delRoot(component)
@@ -130,12 +125,12 @@ class WaitingRoomUI(object):
         self._surface = surface
         self._panel = None
         self._controls = {}
+        self._frames = {}
         self._labels = {}
         self._open = False
         self._hovered = None
         self._selected_map = None
         self._message = ''
-        self._restore_cursor = False
 
     def install(self):
         """Build the native components without showing them."""
@@ -190,16 +185,6 @@ class WaitingRoomUI(object):
                          colour=(184, 205, 222, 255))
         return True
 
-    def _show_cursor(self, visible):
-        show = getattr(self._surface, 'show_cursor', None)
-        if not callable(show):
-            return False
-        try:
-            return bool(show(visible))
-        except Exception as error:
-            _log('LAN waiting room could not change the cursor: %s' % error)
-            return False
-
     @staticmethod
     def _set(component, name, value):
         setattr(component, name, value)
@@ -212,6 +197,23 @@ class WaitingRoomUI(object):
             _log('LAN waiting room skipped the %s property' % name)
 
     def _make_control(self, role, position, width, height):
+        # A slightly lighter frame behind each control separates it from the
+        # panel; the button body draws over it, leaving a thin border.
+        frame = self._surface.simple()
+        for name, value in (
+                ('horizontalPositionMode', 'CLIP'),
+                ('verticalPositionMode', 'CLIP'),
+                ('widthMode', 'CLIP'), ('heightMode', 'CLIP'),
+                ('horizontalAnchor', 'CENTER'), ('verticalAnchor', 'CENTER'),
+                ('position', (position[0], position[1], position[2] + 0.01)),
+                ('width', width + 0.014), ('height', height + 0.030),
+                ('materialFX', 'SOLID'), ('colour', (120, 158, 186, 245)),
+                ('focus', False), ('mouseButtonFocus', False),
+                ('crossFocus', False), ('moveFocus', False),
+                ('visible', False)):
+            self._set(frame, name, value)
+        self._panel.addChild(frame)
+        self._frames[role] = frame
         component = self._surface.simple()
         for name, value in (
                 ('horizontalPositionMode', 'CLIP'),
@@ -270,7 +272,6 @@ class WaitingRoomUI(object):
         self._open = True
         self._surface.add_root(self._panel)
         self._surface.resort()
-        self._restore_cursor = self._show_cursor(True)
         self.refresh()
         _log('LAN waiting room opened')
         return True
@@ -294,6 +295,9 @@ class WaitingRoomUI(object):
         for role, component in self._controls.items():
             visible = role == 'close' or is_host
             self._set(component, 'visible', visible)
+            frame = self._frames.get(role)
+            if frame is not None:
+                self._set(frame, 'visible', visible)
             label = self._labels.get(role)
             if label is not None:
                 self._set(label, 'visible', visible)
@@ -382,7 +386,6 @@ class WaitingRoomUI(object):
             return False
         self._open = False
         self._hovered = None
-        self._show_cursor(self._restore_cursor)
         self._set(self._panel, 'visible', False)
         self._surface.remove_root(self._panel)
         _log('LAN waiting room closed')
@@ -392,5 +395,6 @@ class WaitingRoomUI(object):
         self.close()
         self._panel = None
         self._controls = {}
+        self._frames = {}
         self._labels = {}
         return True

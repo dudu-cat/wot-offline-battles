@@ -47,7 +47,13 @@ def _json_safe(value, depth=0):
         return result
     if value is None or isinstance(value, bool):
         return value
-    return None
+    # #1513 readers store Math.Vector2/Vector3 (readVector2/readVector3 in
+    # items/vehicles.pyc); vectors iterate like fixed-size sequences.
+    try:
+        items = list(value)
+    except Exception:
+        return None
+    return [_json_safe(item, depth + 1) for item in items]
 
 
 def _copy_fields(source, names):
@@ -131,7 +137,19 @@ def project_descriptor(descriptor):
     for shot in (_value(gun, 'shots', ()) or ()):
         shot_projection = _copy_fields(shot, _SHOT_FIELDS)
         shell = _value(shot, 'shell', {})
-        shot_projection['shell'] = _copy_fields(shell, _SHELL_FIELDS)
+        shell_projection = _copy_fields(shell, _SHELL_FIELDS)
+        # #1513 stores the shell kind as shell.type (a ShellType whose .name
+        # is the kind string) and explosionRadius on the HighExplosive type.
+        shell_type = _value(shell, 'type')
+        if 'kind' not in shell_projection:
+            kind = _value(shell_type, 'name')
+            if kind:
+                shell_projection['kind'] = str(kind)
+        if 'explosionRadius' not in shell_projection:
+            radius = _json_safe(_value(shell_type, 'explosionRadius'))
+            if radius is not None:
+                shell_projection['explosionRadius'] = radius
+        shot_projection['shell'] = shell_projection
         shots.append(shot_projection)
     gun_projection['shots'] = shots
     projection['gun'] = gun_projection
