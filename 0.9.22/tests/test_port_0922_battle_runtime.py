@@ -26,6 +26,8 @@ from gui.mods.offline_lan_0922 import bot_runtime, combat_rules, \
 from gui.mods.offline_lan_0922.entities.remote_vehicle import \
     RemoteVehicle, RemoteVehicleFactory, _RemoteFilter, \
     collide_vehicle_at_matrix
+from gui.mods.offline_lan_0922.entities import remote_vehicle as \
+    remote_vehicle_module
 from gui.mods.offline_lan_0922.entities.bigworld_binding import \
     BigWorldVehicleBinding
 
@@ -1715,9 +1717,9 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertAlmostEqual(
             0.06 * battle_runtime_module.POSE_RELAX_STRETCH, relax)
 
-    def test_a_bot_pose_is_animated_rather_than_snapped(self):
+    def test_a_bot_pose_is_eased_rather_than_snapped(self):
         """OfflineEntity declares an empty <Volatile/>, so no WGVehicleFilter
-        can ever interpolate for a bot; the compound animates instead."""
+        can ever interpolate for a bot; the vehicle eases its own matrix."""
         runtime = _runtime()
         vehicle = RemoteVehicle(
             1000, _Descriptor(), {
@@ -1727,17 +1729,41 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         model = _Model()
         vehicle.attach_visual(types.SimpleNamespace(model=None), 7, model)
 
-        self.assertIsNotNone(vehicle._animation)
-        self.assertIs(vehicle._animation, model.matrix)
+        self.assertIs(vehicle._render_matrix, model.matrix)
+        allocations = remote_vehicle_module.pose_animation_writes()
 
         vehicle.set_pose(_Vector(10.0, 0.0, 20.0), (0.0, 0.0, 1.0),
-                         relax_time=0.05)
+                         relax_time=0.10, now=100.0)
 
-        keyframes = vehicle._animation.keyframes
-        self.assertEqual(2, len(keyframes))
-        self.assertEqual(0.0, keyframes[0][0])
-        self.assertEqual(0.05, keyframes[1][0])
-        self.assertEqual(0.0, vehicle._animation.time)
+        # The drawn pose starts at the old one and reaches the new one only
+        # after the relax interval, without allocating anything native.
+        self.assertEqual((0.0, 0.0, 0.0), vehicle._render_pose[:3])
+        vehicle.advance_render_pose(100.05)
+        self.assertAlmostEqual(5.0, vehicle._render_pose[0])
+        self.assertAlmostEqual(10.0, vehicle._render_pose[2])
+        vehicle.advance_render_pose(100.10)
+        self.assertAlmostEqual(10.0, vehicle._render_pose[0])
+        self.assertAlmostEqual(1.0, vehicle._render_pose[3])
+        self.assertEqual(
+            allocations, remote_vehicle_module.pose_animation_writes())
+
+    def test_an_unchanged_pose_keeps_the_ease_running(self):
+        runtime = _runtime()
+        vehicle = RemoteVehicle(
+            1000, _Descriptor(), {
+                'publicInfo': {'team': 2, 'name': 'Bot'},
+                'health': 500, 'isCrewActive': True, 'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0), runtime.math)
+        vehicle.attach_visual(types.SimpleNamespace(model=None), 7, _Model())
+        vehicle.set_pose(_Vector(10.0, 0.0, 0.0), (0.0, 0.0, 0.0),
+                         relax_time=0.10, now=100.0)
+
+        # A republished identical pose carries relax_time 0; the ease must
+        # keep interpolating instead of snapping to its target.
+        vehicle.set_pose(_Vector(10.0, 0.0, 0.0), (0.0, 0.0, 0.0),
+                         relax_time=0.0, now=100.05)
+
+        self.assertAlmostEqual(5.0, vehicle._render_pose[0])
 
     def test_a_pose_without_a_relax_time_is_applied_directly(self):
         runtime = _runtime()
@@ -1747,11 +1773,10 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
                 'health': 500, 'isCrewActive': True, 'gunAnglesPacked': 0},
             _Vector(), (0.0, 0.0, 0.0), runtime.math)
         vehicle.attach_visual(types.SimpleNamespace(model=None), 7, _Model())
-        vehicle._animation.keyframes = ()
 
         vehicle.set_pose(_Vector(1.0, 0.0, 2.0), (0.0, 0.0, 0.0))
 
-        self.assertEqual((), vehicle._animation.keyframes)
+        self.assertEqual((1.0, 0.0, 2.0), vehicle._render_pose[:3])
 
     def test_destroyed_remote_vehicle_reloads_the_native_wreck_once(self):
         runtime = _runtime()
@@ -1845,7 +1870,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         vehicle.health = 500
         vehicle.isAlive.value = True
         self.assertIs(vehicle, bigworld.entity(vehicle_id))
-        self.assertIs(vehicle._animation, vehicle.model.matrix)
+        self.assertIs(vehicle._render_matrix, vehicle.model.matrix)
         self.assertEqual(
             (10.0, 2.0, 30.0), tuple(vehicle.matrix.translation))
         self.assertEqual(0.5, vehicle.matrix.yaw)
@@ -1855,7 +1880,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
 
         vehicle.set_pose(_Vector(20.0, 3.0, 40.0), (0.0, 0.0, 1.0))
         self.assertEqual((20.0, 3.0, 40.0), tuple(vehicle.position))
-        self.assertIs(vehicle._animation, vehicle.model.matrix)
+        self.assertIs(vehicle._render_matrix, vehicle.model.matrix)
         self.assertEqual(
             (20.0, 3.0, 40.0), tuple(vehicle.matrix.translation))
         self.assertEqual(1.0, vehicle.matrix.yaw)
@@ -6957,7 +6982,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._bot_destructible_samples[17] = (
             runtime.bigworld.now, (7.0, 2.0, 9.0))
 
-        def set_vehicle_pose(*unused_args, relax_time=None):
+        def set_vehicle_pose(*unused_args, relax_time=None, now=None):
             battle._destructibles._fell_trees_near.assert_called_once()
 
         battle._binding.set_vehicle_pose.side_effect = set_vehicle_pose
@@ -10109,3 +10134,19 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RecentIdSetTests(unittest.TestCase):
+    def test_recent_ids_reject_redelivery_without_growing(self):
+        seen = battle_runtime_module._RecentIdSet(limit=3)
+
+        for value in ('1:1:0', '1:1:1', '1:2:0'):
+            self.assertTrue(seen.add(value))
+        self.assertFalse(seen.add('1:1:0'))
+        self.assertEqual(3, len(seen))
+
+        self.assertTrue(seen.add('1:3:0'))
+
+        self.assertEqual(3, len(seen))
+        self.assertNotIn('1:1:0', seen)
+        self.assertIn('1:3:0', seen)

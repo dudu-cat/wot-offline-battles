@@ -2,6 +2,7 @@ from __future__ import print_function
 
 """Playable #1513 battle runtime built on stock Avatar and Vehicle entities."""
 
+import collections
 import math
 import random
 import sys
@@ -116,9 +117,42 @@ def _monotonic_time():
     return float(time.clock())
 
 
+# Ordered events arrive in order, so remembering this many recent ids rejects
+# every realistic redelivery without growing for the whole round.
+EVENT_ID_MEMORY = 8192
+
 _PROFILE_CLOCK = getattr(time, 'perf_counter', None)
 if not callable(_PROFILE_CLOCK):
     _PROFILE_CLOCK = time.clock
+
+
+class _RecentIdSet(object):
+    """Membership test over the most recent ids only.
+
+    An ordered LAN event id is ``round:tick:ordinal`` and arrives in order, so
+    an unbounded dedup set grows for the whole round on a client that already
+    runs against a 2 GB address space.
+    """
+
+    def __init__(self, limit=EVENT_ID_MEMORY):
+        self._limit = max(1, int(limit))
+        self._ids = set()
+        self._order = collections.deque()
+
+    def add(self, value):
+        if value in self._ids:
+            return False
+        self._ids.add(value)
+        self._order.append(value)
+        while len(self._order) > self._limit:
+            self._ids.discard(self._order.popleft())
+        return True
+
+    def __contains__(self, value):
+        return value in self._ids
+
+    def __len__(self):
+        return len(self._ids)
 
 
 def _underlying_function(value):
@@ -849,8 +883,8 @@ class BattleRuntime(object):
         self._local_critical_server_revision = 0
         self._local_critical_next_seq = 0
         self._local_critical_owned = False
-        self._accepted_event_ids = set()
-        self._applied_event_ids = set()
+        self._accepted_event_ids = _RecentIdSet()
+        self._applied_event_ids = _RecentIdSet()
         # Retain the old name as a read-only compatibility view for audits;
         # an event is "seen" only after its native presentation was applied.
         self._seen_event_ids = self._applied_event_ids
@@ -993,8 +1027,8 @@ class BattleRuntime(object):
         self._local_critical_server_revision = 0
         self._local_critical_next_seq = 0
         self._local_critical_owned = False
-        self._accepted_event_ids = set()
-        self._applied_event_ids = set()
+        self._accepted_event_ids = _RecentIdSet()
+        self._applied_event_ids = _RecentIdSet()
         self._seen_event_ids = self._applied_event_ids
         self._event_journal = []
         self._local_last_attacker = None
@@ -7552,7 +7586,7 @@ class BattleRuntime(object):
             self._binding.set_vehicle_pose(
                 record['engine_id'], position, rotation,
                 relax_time=self._bot_pose_relax(
-                    state, (tuple(position), rotation), now))
+                    state, (tuple(position), rotation), now), now=now)
             self._binding.update_vehicle_aim(
                 record['engine_id'], yaw,
                 _number(state.get('aim_yaw', yaw)),
@@ -9458,8 +9492,8 @@ class BattleRuntime(object):
         self._local_critical_server_revision = 0
         self._local_critical_next_seq = 0
         self._local_critical_owned = False
-        self._accepted_event_ids = set()
-        self._applied_event_ids = set()
+        self._accepted_event_ids = _RecentIdSet()
+        self._applied_event_ids = _RecentIdSet()
         self._seen_event_ids = self._applied_event_ids
         self._event_journal = []
         self._local_last_attacker = None

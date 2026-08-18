@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -521,3 +522,68 @@ class NativeSurfaceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NativeCursorSurfaceTests(unittest.TestCase):
+    def setUp(self):
+        self.module = _load('waiting_room_ui')
+
+    def _surface(self, scaleform=None):
+        cursor = types.SimpleNamespace(
+            active=False, visible=False, position=(0.25, -0.5))
+        calls = []
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.setCursor = lambda value: calls.append(('setCursor', value))
+        bigworld.dcursor = lambda: 'device'
+        gui = types.SimpleNamespace(mcursor=lambda: cursor)
+        gui_module = types.ModuleType('GUI')
+        gui_module.mcursor = gui.mcursor
+        modules = {'BigWorld': bigworld, 'GUI': gui_module}
+        if scaleform is not None:
+            modules['Scaleform'] = scaleform
+        with mock.patch.dict(sys.modules, modules):
+            surface = self.module.NativeSurface()
+        surface._gui = gui
+        return surface, cursor, calls, modules
+
+    def test_show_cursor_prefers_the_stock_1513_helper(self):
+        shown = []
+        scaleform = types.ModuleType('Scaleform')
+        scaleform.showCursor = lambda: shown.append(True)
+        surface, unused_cursor, calls, modules = self._surface(scaleform)
+
+        with mock.patch.dict(sys.modules, modules):
+            self.assertTrue(surface.show_cursor())
+
+        self.assertEqual([True], shown)
+        self.assertEqual([], calls)
+
+    def test_show_cursor_falls_back_to_the_native_pair(self):
+        surface, cursor, calls, modules = self._surface()
+        modules['Scaleform'] = None
+
+        with mock.patch.dict(sys.modules, modules):
+            self.assertTrue(surface.show_cursor())
+
+        # The 0.8.2 room makes the cursor visible; the drawn arrow is extra.
+        self.assertEqual(1, cursor.visible)
+        self.assertEqual([('setCursor', cursor)], calls)
+
+    def test_hide_cursor_restores_the_device_cursor(self):
+        surface, cursor, calls, modules = self._surface()
+
+        with mock.patch.dict(sys.modules, modules):
+            self.assertTrue(surface.hide_cursor())
+
+        self.assertFalse(cursor.visible)
+        self.assertEqual([('setCursor', 'device')], calls)
+
+    def test_cursor_state_reports_what_the_player_should_see(self):
+        surface, cursor, unused_calls, modules = self._surface()
+        cursor.active = True
+
+        with mock.patch.dict(sys.modules, modules):
+            state = surface.cursor_state()
+
+        self.assertTrue(state['active'])
+        self.assertEqual((0.25, -0.5), state['position'])

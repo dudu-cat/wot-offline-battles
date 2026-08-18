@@ -111,19 +111,33 @@ class NativeSurface(object):
         return bool(self._gui.mcursor().active)
 
     def show_cursor(self):
-        """Make the native cursor active but keep it unpainted.
+        """Run the exact #1513 ``Scaleform.showCursor`` sequence.
 
-        ``gui/mouse_cursors.xml`` in this build is 12 bytes and defines no
-        shapes, so a visible mcursor falls back to the OS default and the
-        player sees the Windows busy pointer.  Activating it still makes
-        ``mcursor.position`` track the mouse, which is what the room's own
-        drawn arrow follows.
+        0.8.2 shows its room pointer this way and #1513 has no ``gui.Cursor``
+        module, so the stock helper is the closest equivalent.  The room still
+        draws its own arrow on top, because this build's
+        ``gui/mouse_cursors.xml`` is 12 bytes and defines no shape.
         """
         import BigWorld
+        try:
+            import Scaleform
+            Scaleform.showCursor()
+            return True
+        except Exception as error:
+            _log('LAN room fell back from Scaleform.showCursor: %s' % error)
         cursor = self._gui.mcursor()
+        cursor.visible = 1
         BigWorld.setCursor(cursor)
-        cursor.visible = False
         return True
+
+    def cursor_state(self):
+        """Return the live native cursor state for the pointer diagnostic."""
+        cursor = self._gui.mcursor()
+        return {
+            'active': getattr(cursor, 'active', None),
+            'visible': getattr(cursor, 'visible', None),
+            'position': tuple(getattr(cursor, 'position', ())),
+        }
 
     def screen_size(self):
         """Return the screen size in pixels, or None when unavailable."""
@@ -140,8 +154,12 @@ class NativeSurface(object):
         return width, height
 
     def hide_cursor(self):
-        """Leave the cursor as the lobby keeps it: active and unpainted."""
+        """Undo the acquire the way 0.8.2 does, device cursor included."""
+        import BigWorld
         self._gui.mcursor().visible = False
+        restore = getattr(BigWorld, 'dcursor', None)
+        if callable(restore):
+            BigWorld.setCursor(restore())
         return True
 
     def tick(self, delay, function):
@@ -500,6 +518,12 @@ class WaitingRoomUI(object):
         self._pointer_logged = now
         _log('LAN room pointer mcursor=(%.4f, %.4f) moves=%d ticks=%d' % (
             x, y, self._pointer_moves, self._pointer_ticks))
+        state = getattr(self._surface, 'cursor_state', None)
+        if callable(state):
+            try:
+                _log('LAN room pointer native: %r' % (state(),))
+            except Exception as error:
+                _log('LAN room pointer native state failed: %s' % error)
         _log('LAN room pointer   part: %s' % self._describe(
             self._pointer_parts[-1][0]))
         _log('LAN room pointer button: %s' % self._describe(
