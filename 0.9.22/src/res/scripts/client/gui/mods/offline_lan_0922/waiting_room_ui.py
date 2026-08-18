@@ -23,14 +23,16 @@ Exact #1513 evidence for the native surface used here:
   ``scripts/client/new_year/fade_window.pyc``.
 - Mouse script methods ``handleMouseClickEvent``, ``handleMouseEnterEvent``,
   ``handleMouseLeaveEvent`` and ``handleMouseButtonEvent``: ``ChainView.pyc``.
-- The lobby owns the pointer: ``Cursor.attachCursor`` in
-  ``gui/Scaleform/managers/Cursor.pyc`` keeps ``GUI.mcursor().visible`` False
-  and presents the Scaleform-drawn arrow inside the lobby movie, which cannot
-  render over a native overlay. No #1513 script sets any ``mcursor`` shape
-  (only visible/position/clipped/active are used anywhere), and forcing it
-  visible showed the OS busy cursor on the real client. This room therefore
-  draws its own marker at ``GUI.mcursor().position``, the clip-space value
-  ``ChainView.recordCursorDragOffset`` reads.
+- The pointer is the native GUI mouse cursor, and making it visible is not
+  enough: it also has to become the active cursor. ``Scaleform.showCursor`` in
+  ``scripts/client/Scaleform/__init__.pyc`` is exactly
+  ``c = GUI.mcursor(); c.visible = 1; BigWorld.setCursor(c)``, and
+  ``helpers/OfflineMode.launch`` uses the same pair. Setting only ``visible``
+  leaves the device cursor active, which is what showed the OS pointer.
+  ``Cursor.attachCursor``/``detachCursor`` in
+  ``gui/Scaleform/managers/Cursor.pyc`` supply the ownership rule this room
+  follows: acquire only while ``GUI.mcursor().active`` is False, and release
+  with ``BigWorld.setCursor(None)``.
 """
 
 import sys
@@ -89,6 +91,35 @@ class NativeSurface(object):
         position = self._gui.mcursor().position
         return float(position[0]), float(position[1])
 
+    def cursor_is_active(self):
+        return bool(self._gui.mcursor().active)
+
+    def show_cursor(self):
+        """Make the native mouse cursor visible and active.
+
+        Prefer the stock helper so this room uses the exact pair #1513 uses
+        itself; both branches end with ``BigWorld.setCursor``.
+        """
+        try:
+            from Scaleform import showCursor
+        except ImportError:
+            showCursor = None
+        if callable(showCursor):
+            showCursor()
+            return True
+        import BigWorld
+        cursor = self._gui.mcursor()
+        cursor.visible = True
+        BigWorld.setCursor(cursor)
+        return True
+
+    def hide_cursor(self):
+        """Release the native cursor exactly as ``Cursor.detachCursor`` does."""
+        import BigWorld
+        self._gui.mcursor().visible = False
+        BigWorld.setCursor(None)
+        return True
+
     def tick(self, delay, function):
         import BigWorld
         return BigWorld.callback(delay, function)
@@ -143,9 +174,7 @@ class WaitingRoomUI(object):
         self._controls = {}
         self._frames = {}
         self._labels = {}
-        self._pointer = None
-        self._pointer_tick = None
-        self._pointer_token = None
+        self._cursor_acquired = False
         self._open = False
         self._hovered = None
         self._selected_map = None
@@ -291,70 +320,47 @@ class WaitingRoomUI(object):
         self._open = True
         self._surface.add_root(self._panel)
         self._surface.resort()
-        self._start_pointer()
+        self._acquire_cursor()
         self.refresh()
         _log('LAN waiting room opened')
         return True
 
-    def _start_pointer(self):
-        """Draw a native pointer marker: the Scaleform arrow renders inside
-        the lobby movie and cannot appear over this native overlay."""
+    def _acquire_cursor(self):
+        """Take the native cursor while this room owns the screen."""
         surface = self._surface
-        if not all(callable(getattr(surface, name, None))
-                   for name in ('cursor_position', 'tick', 'cancel_tick')):
+        show = getattr(surface, 'show_cursor', None)
+        if not callable(show):
             return False
-        if self._pointer is None:
-            pointer = surface.simple()
-            for name, value in (
-                    ('horizontalPositionMode', 'CLIP'),
-                    ('verticalPositionMode', 'CLIP'),
-                    ('widthMode', 'PIXEL'), ('heightMode', 'PIXEL'),
-                    ('horizontalAnchor', 'CENTER'),
-                    ('verticalAnchor', 'CENTER'),
-                    ('width', 10), ('height', 10),
-                    ('materialFX', 'SOLID'), ('colour', (235, 242, 255, 255)),
-                    ('focus', False), ('mouseButtonFocus', False),
-                    ('crossFocus', False), ('moveFocus', False),
-                    ('position', (0.0, 0.0, OVERLAY_Z - 0.05)),
-                    ('visible', True)):
-                self._set(pointer, name, value)
-            self._pointer = pointer
-        token = object()
-        self._pointer_token = token
-        surface.add_root(self._pointer)
-        surface.resort()
-
-        def step():
-            if not self._open or self._pointer_token is not token:
-                return
+        is_active = getattr(surface, 'cursor_is_active', None)
+        if callable(is_active):
             try:
-                x, y = self._surface.cursor_position()
-                self._set(self._pointer, 'position',
-                          (x, y, OVERLAY_Z - 0.05))
+                if is_active():
+                    # Another owner already presents the pointer; releasing it
+                    # on close would take it away from that owner.
+                    return False
             except Exception as error:
-                self._pointer_token = None
-                self._pointer_tick = None
-                _log('LAN waiting room pointer stopped: %s' % error)
-                return
-            self._pointer_tick = self._surface.tick(0.03, step)
-
-        step()
+                _log('LAN waiting room cursor state is unavailable: %s' % error)
+                return False
+        try:
+            show()
+        except Exception as error:
+            _log('LAN waiting room could not show the cursor: %s' % error)
+            return False
+        self._cursor_acquired = True
         return True
 
-    def _stop_pointer(self):
-        self._pointer_token = None
-        handle = self._pointer_tick
-        self._pointer_tick = None
-        if handle is not None:
-            try:
-                self._surface.cancel_tick(handle)
-            except Exception:
-                pass
-        if self._pointer is not None:
-            try:
-                self._surface.remove_root(self._pointer)
-            except Exception:
-                pass
+    def _release_cursor(self):
+        if not self._cursor_acquired:
+            return False
+        self._cursor_acquired = False
+        hide = getattr(self._surface, 'hide_cursor', None)
+        if not callable(hide):
+            return False
+        try:
+            hide()
+        except Exception as error:
+            _log('LAN waiting room could not release the cursor: %s' % error)
+            return False
         return True
 
     def refresh(self):
@@ -467,7 +473,7 @@ class WaitingRoomUI(object):
             return False
         self._open = False
         self._hovered = None
-        self._stop_pointer()
+        self._release_cursor()
         self._set(self._panel, 'visible', False)
         self._surface.remove_root(self._panel)
         _log('LAN waiting room closed')
@@ -479,5 +485,4 @@ class WaitingRoomUI(object):
         self._controls = {}
         self._frames = {}
         self._labels = {}
-        self._pointer = None
         return True
