@@ -25,9 +25,12 @@ Exact #1513 evidence for the native surface used here:
   ``handleMouseLeaveEvent`` and ``handleMouseButtonEvent``: ``ChainView.pyc``.
 - The lobby owns the pointer: ``Cursor.attachCursor`` in
   ``gui/Scaleform/managers/Cursor.pyc`` keeps ``GUI.mcursor().visible`` False
-  and presents the Scaleform-drawn arrow. Forcing the native cursor visible
-  showed the OS busy cursor on the real #1513 client, so this room never
-  touches the cursor; clicks landed on the real client without it.
+  and presents the Scaleform-drawn arrow inside the lobby movie, which cannot
+  render over a native overlay. No #1513 script sets any ``mcursor`` shape
+  (only visible/position/clipped/active are used anywhere), and forcing it
+  visible showed the OS busy cursor on the real client. This room therefore
+  draws its own marker at ``GUI.mcursor().position``, the clip-space value
+  ``ChainView.recordCursorDragOffset`` reads.
 """
 
 import sys
@@ -81,6 +84,19 @@ class NativeSurface(object):
     def resort(self):
         self._gui.reSort()
 
+    def cursor_position(self):
+        """Clip-space mouse position, the coordinate system ChainView reads."""
+        position = self._gui.mcursor().position
+        return float(position[0]), float(position[1])
+
+    def tick(self, delay, function):
+        import BigWorld
+        return BigWorld.callback(delay, function)
+
+    def cancel_tick(self, handle):
+        import BigWorld
+        BigWorld.cancelCallback(handle)
+
 
 class _ControlScript(object):
     """Mouse target for one room control."""
@@ -127,6 +143,9 @@ class WaitingRoomUI(object):
         self._controls = {}
         self._frames = {}
         self._labels = {}
+        self._pointer = None
+        self._pointer_tick = None
+        self._pointer_token = None
         self._open = False
         self._hovered = None
         self._selected_map = None
@@ -272,8 +291,70 @@ class WaitingRoomUI(object):
         self._open = True
         self._surface.add_root(self._panel)
         self._surface.resort()
+        self._start_pointer()
         self.refresh()
         _log('LAN waiting room opened')
+        return True
+
+    def _start_pointer(self):
+        """Draw a native pointer marker: the Scaleform arrow renders inside
+        the lobby movie and cannot appear over this native overlay."""
+        surface = self._surface
+        if not all(callable(getattr(surface, name, None))
+                   for name in ('cursor_position', 'tick', 'cancel_tick')):
+            return False
+        if self._pointer is None:
+            pointer = surface.simple()
+            for name, value in (
+                    ('horizontalPositionMode', 'CLIP'),
+                    ('verticalPositionMode', 'CLIP'),
+                    ('widthMode', 'PIXEL'), ('heightMode', 'PIXEL'),
+                    ('horizontalAnchor', 'CENTER'),
+                    ('verticalAnchor', 'CENTER'),
+                    ('width', 10), ('height', 10),
+                    ('materialFX', 'SOLID'), ('colour', (235, 242, 255, 255)),
+                    ('focus', False), ('mouseButtonFocus', False),
+                    ('crossFocus', False), ('moveFocus', False),
+                    ('position', (0.0, 0.0, OVERLAY_Z - 0.05)),
+                    ('visible', True)):
+                self._set(pointer, name, value)
+            self._pointer = pointer
+        token = object()
+        self._pointer_token = token
+        surface.add_root(self._pointer)
+        surface.resort()
+
+        def step():
+            if not self._open or self._pointer_token is not token:
+                return
+            try:
+                x, y = self._surface.cursor_position()
+                self._set(self._pointer, 'position',
+                          (x, y, OVERLAY_Z - 0.05))
+            except Exception as error:
+                self._pointer_token = None
+                self._pointer_tick = None
+                _log('LAN waiting room pointer stopped: %s' % error)
+                return
+            self._pointer_tick = self._surface.tick(0.03, step)
+
+        step()
+        return True
+
+    def _stop_pointer(self):
+        self._pointer_token = None
+        handle = self._pointer_tick
+        self._pointer_tick = None
+        if handle is not None:
+            try:
+                self._surface.cancel_tick(handle)
+            except Exception:
+                pass
+        if self._pointer is not None:
+            try:
+                self._surface.remove_root(self._pointer)
+            except Exception:
+                pass
         return True
 
     def refresh(self):
@@ -386,6 +467,7 @@ class WaitingRoomUI(object):
             return False
         self._open = False
         self._hovered = None
+        self._stop_pointer()
         self._set(self._panel, 'visible', False)
         self._surface.remove_root(self._panel)
         _log('LAN waiting room closed')
@@ -397,4 +479,5 @@ class WaitingRoomUI(object):
         self._controls = {}
         self._frames = {}
         self._labels = {}
+        self._pointer = None
         return True

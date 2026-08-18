@@ -182,6 +182,7 @@ class LocalDriver(object):
 				'escape_side': 0.0,
 				'escape_side_until': 0.0,
 				'last_desired_yaw': None,
+				'last_yaw': None,
 				'traffic_waiting': False,
 				'traffic_wait_time': 0.0,
 				'last_step': 0.0,
@@ -459,6 +460,10 @@ class LocalDriver(object):
 		                         (state['last_position'][0], 0.0,
 		                          state['last_position'][1]))
 		state['last_position'] = (float(position[0]), float(position[2]))
+		previous_yaw = state['last_yaw']
+		state['last_yaw'] = float(yaw)
+		yaw_rate = (abs(_angle_delta(float(yaw), previous_yaw)) /
+		            max(step, 1.0e-6) if previous_yaw is not None else 0.0)
 		if target_distance <= WAYPOINT_ARRIVAL_RADIUS:
 			# Reaching a waypoint is a stop, not a request to drive north: atan2(0, 0)
 			# is zero and previously produced full throttle until the next order tick.
@@ -473,8 +478,11 @@ class LocalDriver(object):
 			}
 
 		# A low reported speed alone is not enough: waiting at a hold point should
-		# not trigger recovery.  Both physical displacement and velocity must fail.
-		if _distance(position, target) > 3.0 and displacement < 0.08 and abs(float(speed)) < 0.35:
+		# not trigger recovery.  Displacement, velocity and rotation must all
+		# fail; a deliberate pivot or ascent alignment turns in place for
+		# seconds and is progress, not a stall.
+		if (_distance(position, target) > 3.0 and displacement < 0.08 and
+				abs(float(speed)) < 0.35 and yaw_rate < 0.25):
 			state['stuck_time'] += step
 		else:
 			state['stuck_time'] = max(0.0, state['stuck_time'] - step * 2.0)

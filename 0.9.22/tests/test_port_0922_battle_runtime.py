@@ -6168,11 +6168,15 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertGreater(downhill, 0.0)
         self.assertLess(uphill, 0.0)
+        # A parkable descent now brakes on coast like the flat, so the sign
+        # contract shows through gravity's offset against the brake share.
         params = dict(vehicle_physics._DEFAULTS)
+        flat = vehicle_physics.longitudinal_step(
+            params, 5.0, 0.0, False, 0.0, 0.1)
         self.assertGreater(vehicle_physics.longitudinal_step(
-            params, 5.0, 0.0, False, downhill, 0.1), 5.0)
+            params, 5.0, 0.0, False, downhill, 0.1), flat)
         self.assertLess(vehicle_physics.longitudinal_step(
-            params, 5.0, 0.0, False, uphill, 0.1), 5.0)
+            params, 5.0, 0.0, False, uphill, 0.1), flat)
 
     def test_landing_combines_lateral_impact_and_retains_skid(self):
         runtime = _runtime()

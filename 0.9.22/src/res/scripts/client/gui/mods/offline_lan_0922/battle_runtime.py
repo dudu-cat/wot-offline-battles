@@ -735,6 +735,7 @@ class BattleRuntime(object):
         self._prebattle_deadline = None
         self._pending_bot_creates = {}
         self._pending_bot_create_order = []
+        self._last_bot_create_team = None
         self._next_bot_create_time = 0.0
         self._arena_type = None
         self._spawn_planner = None
@@ -867,6 +868,7 @@ class BattleRuntime(object):
         self._prebattle_deadline = None
         self._pending_bot_creates = {}
         self._pending_bot_create_order = []
+        self._last_bot_create_team = None
         self._next_bot_create_time = 0.0
         self._navigation_graph = None
         self._grounded_bot_ids = set()
@@ -7046,13 +7048,29 @@ class BattleRuntime(object):
         if (not self._pending_bot_create_order or
                 now < self._next_bot_create_time):
             return False
-        key = self._pending_bot_create_order.pop(0)
+        key = self._pending_bot_create_order[0]
+        # Alternate teams so both bases materialize together instead of one
+        # full lineup appearing before the other.
+        if self._last_bot_create_team is not None:
+            for candidate in self._pending_bot_create_order:
+                event = self._pending_bot_creates.get(candidate)
+                team = ((event or {}).get('state') or {}).get('team')
+                if (team is not None and
+                        int(team) != self._last_bot_create_team):
+                    key = candidate
+                    break
+        self._pending_bot_create_order.remove(key)
         event = self._pending_bot_creates.pop(key, None)
         self._next_bot_create_time = now + BOT_SPAWN_SECONDS
         if event is None or key in self._records:
             return False
         self._create_remote(event)
-        return key in self._records
+        created = key in self._records
+        if created:
+            team = (event.get('state') or {}).get('team')
+            if team is not None:
+                self._last_bot_create_team = int(team)
+        return created
 
     def _create_remote(self, event):
         key = event.get('entity')

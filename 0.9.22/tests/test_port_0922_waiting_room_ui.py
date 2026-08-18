@@ -128,6 +128,52 @@ class WaitingRoomTests(unittest.TestCase):
         self.assertEqual('LAN SERVER: 10.0.0.5:28782', self._label('room'))
         self.assertEqual('PLAYERS (2): Host, Guest', self._label('players'))
 
+    def test_pointer_marker_follows_the_native_cursor_position(self):
+        class _CursorSurface(_Surface):
+            def __init__(self):
+                _Surface.__init__(self)
+                self.ticks = []
+                self.cancelled = []
+                self.cursor = (0.25, -0.5)
+
+            def cursor_position(self):
+                return self.cursor
+
+            def tick(self, delay, function):
+                handle = len(self.ticks) + 1
+                self.ticks.append((handle, delay, function))
+                return handle
+
+            def cancel_tick(self, handle):
+                self.cancelled.append(handle)
+
+        surface = _CursorSurface()
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True, surface=surface)
+        self.assertTrue(room.open())
+
+        self.assertEqual(2, len(surface.roots))
+        pointer = room._pointer
+        self.assertEqual((0.25, -0.5, 0.05),
+                         pointer.properties['position'])
+        self.assertFalse(pointer.properties['focus'])
+
+        surface.cursor = (-0.75, 0.4)
+        handle, unused_delay, step = surface.ticks[-1]
+        step()
+        self.assertEqual((-0.75, 0.4, 0.05),
+                         pointer.properties['position'])
+
+        room.close()
+        self.assertIn(surface.ticks[-1][0], surface.cancelled)
+        self.assertEqual([], surface.roots)
+
+    def test_pointer_is_skipped_on_a_surface_without_cursor_calls(self):
+        self.room.open()
+        self.assertIsNone(self.room._pointer)
+        self.assertEqual(1, len(self.surface.roots))
+
     def test_controls_carry_a_border_frame_behind_the_body(self):
         self.room.open()
         frame = self.room._frames['start'].properties

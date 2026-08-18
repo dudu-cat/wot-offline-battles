@@ -96,13 +96,13 @@ class VehiclePhysicsCoastTests(unittest.TestCase):
             min(row[1] for row in results),
             0.30)
 
-    def test_moving_tank_accelerates_down_a_fifteen_degree_slope(self):
-        speed = 5.0
-        dt = 0.1
-        actual = self._coast(speed, 15.0, dt)
-
-        self.assertGreater(actual, speed)
-        self.assertLess(actual - speed, 0.3)
+    def test_parkable_descent_brakes_and_a_steeper_one_slides(self):
+        # The 2.3-reviewed coast law: every slope the parked hold can keep
+        # brakes like the flat; past the perch limit gravity owns the descent.
+        self.assertLess(self._coast(5.0, 15.0, 0.1), 5.0)
+        self.assertGreater(self._coast(5.0, 15.0, 0.1),
+                           self._coast(5.0, 0.0, 0.1))
+        self.assertGreater(self._coast(5.0, 28.0, 0.1), 5.0)
 
     def test_static_hold_and_handbrake_are_unchanged(self):
         self.assertEqual(0.0, self._coast(0.0, 25.0, 0.1))
@@ -120,11 +120,31 @@ class VehiclePhysicsCoastTests(unittest.TestCase):
             speed = 5.0
             dt = 1.0 / frame_rate
             for unused in range(frame_rate):
-                speed = self._coast(speed, 20.0, dt)
+                speed = self._coast(speed, 28.0, dt)
             results.append(speed)
 
         self.assertGreater(results[0], 7.0)
         self.assertLess(max(results) - min(results), 1e-9)
+
+    def test_released_throttle_bleeds_the_gravity_overspeed(self):
+        speed = self.params['speedFwd'] * 1.04
+        elapsed = 0.0
+        while speed > 0.0 and elapsed < 6.0:
+            speed = self._coast(speed, 4.0, 1.0 / 30.0)
+            elapsed += 1.0 / 30.0
+
+        self.assertEqual(0.0, speed)
+        self.assertLess(elapsed, 2.5)
+
+    def test_a_driven_descent_keeps_the_gravity_overspeed(self):
+        speed = self.params['speedFwd']
+        for unused in range(30 * 20):
+            speed = vehicle_physics.longitudinal_step(
+                self.params, speed, 1.0, False, math.radians(20.0),
+                1.0 / 30.0)
+
+        self.assertAlmostEqual(self.params['speedFwd'] * 1.05, speed,
+                               places=3)
 
 
 if __name__ == '__main__':

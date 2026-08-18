@@ -539,6 +539,35 @@ class BotAiPortTests(unittest.TestCase):
         self.assertEqual(1.0, order['throttle'])
         self.assertGreater(order['turn'], 0.9)
 
+    def test_deliberate_pivot_in_place_never_reverses(self):
+        # A target far behind the bow commands a stationary pivot (throttle
+        # 0, full turn). The rotating hull is progress, not a stall; the old
+        # law reversed for a second on a ~1s cadence through the whole turn.
+        driver = LocalDriver()
+        yaw = 0.0
+        modes = set()
+        for unused in range(150):
+            order = driver.drive(
+                7, (0.0, 0.0, 0.0), yaw, 0.0, 1.0 / 30.0,
+                (0.0, 0.0, -50.0), (), lambda unused_yaw: True)
+            modes.add(order['recovery_mode'])
+            yaw += order['turn'] * 0.66 * (1.0 / 30.0)
+
+        self.assertNotIn('reverse_turn', modes)
+        self.assertNotIn('pivot_recovery', modes)
+        self.assertGreater(abs(yaw), 2.5)
+
+    def test_a_wedged_hull_still_reaches_recovery(self):
+        driver = LocalDriver()
+        modes = set()
+        for unused in range(150):
+            order = driver.drive(
+                8, (0.0, 0.0, 0.0), 0.0, 0.0, 1.0 / 30.0,
+                (0.0, 0.0, 50.0), (), lambda unused_yaw: True)
+            modes.add(order['recovery_mode'])
+
+        self.assertTrue(modes & set(('reverse_turn', 'pivot_recovery')))
+
     def test_brief_traffic_wait_does_not_trigger_reverse_recovery(self):
         driver = LocalDriver()
         order = None
