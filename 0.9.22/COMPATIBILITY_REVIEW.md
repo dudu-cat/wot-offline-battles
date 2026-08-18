@@ -1012,17 +1012,27 @@ The source audit deliberately keeps the following differences visible:
   `1 / (0.5 + 0.005 * level)` conversion, a gun rammer scales reload by 0.9, a
   gun laying drive divides aiming time by 1.1, and a vertical stabiliser, Snap
   Shot and Smooth Ride damp the dispersion bloom terms (`loadout.py`). What is
-  still missing is the account command surface that MOUNTS them: the verified
-  #1513 ids are `CMD_EQUIP` 101, `CMD_EQUIP_OPTDEV` 102, `CMD_EQUIP_SHELLS` 103,
-  `CMD_EQUIP_EQS` 104, `CMD_VEH_SETTINGS` 107, `CMD_SET_AND_FILL_LAYOUTS` 108,
-  `CMD_TMAN_ADD_SKILL` 151, `CMD_TMAN_DROP_SKILLS` 152, `CMD_BUY_ITEM` 302 and
-  `CMD_BUY_AND_EQUIP_ITEM` 308, none of which collide with the ten commands the
-  offline RPC already answers. Mounting also needs a mutable account state: the
-  0.8.2 reference proves that optional devices live inside the vehicle's compact
-  descriptor, so the customization and fitting writers must share one live
-  inventory dictionary or a mount silently reverts the camouflage;
-- gun swap, ammo-count editing and crew skill training share that same
-  unimplemented command surface;
+  the account command surface that MOUNTS them is now implemented in
+  `account_rpc/garage.py`, which keeps one mutable copy of the bootstrap
+  snapshot so the fitting writers share a single live record. The handled
+  commands, all verified against this build's `AccountCommands.pyc`, are
+  `CMD_EQUIP` 101 (module and gun swap), `CMD_EQUIP_OPTDEV` 102,
+  `CMD_EQUIP_SHELLS` 103, `CMD_EQUIP_EQS` 104,
+  `CMD_SET_AND_FILL_LAYOUTS` 108, `CMD_TMAN_ADD_SKILL` 151 and
+  `CMD_TMAN_DROP_SKILLS` 152. Optional devices and modules are rebuilt through
+  `VehicleDescr.installOptionalDevice`/`removeOptionalDevice`/`installComponent`
+  and `makeCompactDescr`, crew skills through `TankmanDescr.addSkill`, and each
+  accepted mutation is pushed with `PlayerAccount.update`, which unpickles its
+  argument into the normal `_update` event path. A gun swap refills the default
+  ammunition, because the new gun's shells would otherwise disagree with the
+  shell inventory that `data._validate_selected_vehicle` cross-checks;
+- purchase-side commands are not implemented, and are not needed: the snapshot
+  already owns stock of every artefact at zero price. `CMD_BUY_ITEM` 302,
+  `CMD_BUY_AND_EQUIP_ITEM` 308 and `CMD_VEH_SETTINGS` 107 therefore still return
+  `UNSUPPORTED_OFFLINE_COMMAND`;
+- the garage state is in-memory only. It is rebuilt from the bootstrap snapshot
+  on each client start, so a fitting or a learned crew skill does not survive
+  restarting the game;
 - the spotting path applies `circularVisionRadiusFactor` from the descriptor, so
   coated optics work implicitly, but binocular telescope, camouflage net and the
   Recon, Situational Awareness and Camouflage crew skills are not yet read;

@@ -6,6 +6,7 @@ import traceback
 
 from gui.mods.offline_lan_0922.account_rpc import commands
 from gui.mods.offline_lan_0922.account_rpc import data
+from gui.mods.offline_lan_0922.account_rpc import garage
 
 
 class Result(object):
@@ -16,6 +17,114 @@ class Result(object):
         self.stream = stream
         self.ext = ext
         self.before_response = before_response
+
+
+def _garage(context):
+    """Return the mutable garage, promoting the immutable snapshot once."""
+    state = context.get('garage')
+    if state is None:
+        state = garage.GarageState(context.get('selected_vehicle') or {})
+        context['garage'] = state
+    return state
+
+
+def _fitting(context, mutate):
+    """Apply one fitting mutation and push the resulting inventory diff.
+
+    #1513 refreshes the garage from ``PlayerAccount.update``, which unpickles
+    its argument and runs the normal ``_update`` event path.  Publishing the
+    reshaped inventory section reuses the same builder a full sync uses, so the
+    pushed diff and a later re-sync can never disagree.
+    """
+    state = _garage(context)
+    try:
+        mutate(state)
+    except garage.GarageError as error:
+        return Result(commands.RES_FAILURE, str(error))
+    context['selected_vehicle'] = state.snapshot()
+    push = context.get('push_update')
+    if not callable(push):
+        return Result(commands.RES_SUCCESS)
+
+    def publish():
+        push(data.inventory(state.snapshot()))
+
+    return Result(commands.RES_SUCCESS, before_response=publish)
+
+
+def _equip_equipments(context, args):
+    values = list(args[0] if args else ())
+    if not values:
+        return Result(commands.RES_FAILURE, 'INVALID_EQUIPMENT_REQUEST')
+    return _fitting(context, lambda state: state.equip_equipments(
+        values[0], values[1:]))
+
+
+def _equip_shells(context, args):
+    values = list(args[0] if args else ())
+    if not values:
+        return Result(commands.RES_FAILURE, 'INVALID_SHELL_REQUEST')
+    return _fitting(context, lambda state: state.equip_shells(
+        values[0], values[1:]))
+
+
+def _equip_optional_device(context, args):
+    # [shopRev, vehInvID, deviceCompDescr, slotIdx, isPaidRemoval]
+    values = list(args[0] if args else ())
+    if len(values) < 4:
+        return Result(commands.RES_FAILURE, 'INVALID_DEVICE_REQUEST')
+    return _fitting(context, lambda state: state.equip_optional_device(
+        values[1], values[2], values[3]))
+
+
+def _equip_component(context, args):
+    # [shopRev, vehInvID, compactDescr, positionIndex, ...]
+    values = list(args[0] if args else ())
+    if len(values) < 3:
+        return Result(commands.RES_FAILURE, 'INVALID_MODULE_REQUEST')
+    position = values[3] if len(values) > 3 else 0
+    return _fitting(context, lambda state: state.install_component(
+        values[1], values[2], position))
+
+
+def _set_and_fill_layouts(context, args):
+    # [shopRev, vehInvID, len(shells), *shells, eqType, len(eqs), *eqs]
+    values = list(args[0] if args else ())
+    if len(values) < 4:
+        return Result(commands.RES_FAILURE, 'INVALID_LAYOUT_REQUEST')
+    cursor = 2
+    shell_count = int(values[cursor])
+    cursor += 1
+    shells_layout = None
+    if shell_count:
+        shells_layout = values[cursor:cursor + shell_count]
+        cursor += shell_count
+    if cursor >= len(values):
+        return Result(commands.RES_FAILURE, 'INVALID_LAYOUT_REQUEST')
+    equipment_type = int(values[cursor])
+    cursor += 1
+    equipments_layout = None
+    if cursor < len(values):
+        equipment_count = int(values[cursor])
+        cursor += 1
+        if equipment_count:
+            equipments_layout = values[cursor:cursor + equipment_count]
+    return _fitting(context, lambda state: state.set_layouts(
+        values[1], shells_layout, equipment_type, equipments_layout))
+
+
+def _add_tankman_skill(context, args):
+    if len(args) < 2:
+        return Result(commands.RES_FAILURE, 'INVALID_CREW_REQUEST')
+    return _fitting(context, lambda state: state.add_tankman_skill(
+        args[0], args[1]))
+
+
+def _drop_tankman_skills(context, args):
+    if not args:
+        return Result(commands.RES_FAILURE, 'INVALID_CREW_REQUEST')
+    return _fitting(
+        context, lambda state: state.drop_tankman_skills(args[0]))
 
 
 def _sync_data(context, args):
@@ -123,6 +232,13 @@ def _del_int_user_settings(context, args):
 
 HANDLERS = {
     commands.CMD_SYNC_DATA: _sync_data,
+    commands.CMD_EQUIP: _equip_component,
+    commands.CMD_EQUIP_OPTDEV: _equip_optional_device,
+    commands.CMD_EQUIP_SHELLS: _equip_shells,
+    commands.CMD_EQUIP_EQS: _equip_equipments,
+    commands.CMD_SET_AND_FILL_LAYOUTS: _set_and_fill_layouts,
+    commands.CMD_TMAN_ADD_SKILL: _add_tankman_skill,
+    commands.CMD_TMAN_DROP_SKILLS: _drop_tankman_skills,
     commands.CMD_REQ_SERVER_STATS: _server_stats,
     commands.CMD_SYNC_SHOP: _sync_shop,
     commands.CMD_SYNC_DOSSIERS: _sync_dossiers,

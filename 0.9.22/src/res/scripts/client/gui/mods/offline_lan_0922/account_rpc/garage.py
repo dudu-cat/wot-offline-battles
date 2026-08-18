@@ -1,0 +1,278 @@
+"""Mutable offline garage: fitting, ammunition layouts and crew skills.
+
+The immutable snapshot that ``bootstrap._selected_vehicle`` builds is the
+starting point.  This module keeps a mutable copy of exactly that shape, so a
+full ``CMD_SYNC_DATA`` and a pushed diff both flow through the already
+validated ``data.inventory`` shaping code instead of a second wire format.
+
+Exact #1513 contracts used here, all from ``account_helpers/Inventory.pyc``:
+
+- ``CMD_EQUIP_EQS`` carries ``[vehInvID] + [int(e) for e in eqs]``;
+- ``CMD_EQUIP_SHELLS`` carries ``[vehInvID] + [int(s) for s in shells]``;
+- ``CMD_EQUIP_OPTDEV`` carries
+  ``[shopRev, vehInvID, deviceCompDescr, slotIdx, int(isPaidRemoval)]``;
+- ``CMD_SET_AND_FILL_LAYOUTS`` carries
+  ``[shopRev, vehInvID, len(shellsLayout), *shellsLayout, equipmentType,
+  len(eqsLayout), *eqsLayout]``, with a single ``0`` in place of a missing
+  layout;
+- ``CMD_TMAN_ADD_SKILL`` is a ``_doCmdInt3`` of ``(tmanInvID, skillIdx, 0)``.
+
+Optional devices and modules live inside the vehicle's own compact descriptor,
+so a mount rebuilds ``compDescr`` through ``VehicleDescr`` rather than storing a
+parallel list.  This is why the 0.8.2 reference insists that the fitting and
+customization writers share one live record: two independent writers would each
+rebuild the descriptor from a stale copy and silently drop the other's change.
+"""
+
+import copy
+
+EQUIPMENT_SLOT_COUNT = 3
+SHELL_ITEM_TYPE = 10
+
+
+class GarageError(Exception):
+    pass
+
+
+def _int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise GarageError('expected an integer, got %r' % (value,))
+
+
+class GarageState(object):
+    """One mutable garage snapshot shared by every account command."""
+
+    def __init__(self, snapshot, vehicles_module=None, tankmen_module=None):
+        if not isinstance(snapshot, dict):
+            raise GarageError('garage snapshot must be a mapping')
+        self._snapshot = copy.deepcopy(snapshot)
+        self._vehicles = vehicles_module
+        self._tankmen = tankmen_module
+        self.revision = 0
+
+    def snapshot(self):
+        return self._snapshot
+
+    def _vehicles_module(self):
+        if self._vehicles is None:
+            from items import vehicles
+            self._vehicles = vehicles
+        return self._vehicles
+
+    def _tankmen_module(self):
+        if self._tankmen is None:
+            from items import tankmen
+            self._tankmen = tankmen
+        return self._tankmen
+
+    def _records(self):
+        records = self._snapshot.get('vehicles')
+        if isinstance(records, (list, tuple)) and records:
+            return list(records)
+        return [self._snapshot] if self._snapshot.get('compDescr') else []
+
+    def _record(self, vehicle_inventory_id):
+        wanted = _int(vehicle_inventory_id)
+        for record in self._records():
+            if _int(record.get('id', 0)) == wanted:
+                return record
+        raise GarageError('unknown vehicle inventory id %d' % wanted)
+
+    def _tankman_record(self, tankman_inventory_id):
+        wanted = _int(tankman_inventory_id)
+        for record in self._records():
+            tankmen = record.get('tankmen')
+            if isinstance(tankmen, dict) and wanted in tankmen:
+                return record, wanted
+        raise GarageError('unknown tankman inventory id %d' % wanted)
+
+    def _own(self, record, compact_descr, item_type, count=1):
+        """Own an item on the record and in the account-wide catalogue.
+
+        ``data._validate_selected_vehicle`` requires the top-level catalogue to
+        cover every per-record item at no less than the record's count, so both
+        levels always move together.
+        """
+        if not compact_descr:
+            return
+        count = max(1, int(count))
+        items = record.setdefault('inventoryItems', {})
+        owned = items.setdefault(int(item_type), {})
+        owned[compact_descr] = max(count, int(owned.get(compact_descr, 0)))
+        self._publish_owned(compact_descr, item_type, owned[compact_descr])
+
+    def _publish_owned(self, compact_descr, item_type, count):
+        published = self._snapshot.setdefault('inventoryItems', {})
+        owned = published.setdefault(int(item_type), {})
+        owned[compact_descr] = max(int(count), int(owned.get(compact_descr, 0)))
+
+    # ---- ammunition -----------------------------------------------------
+
+    def equip_shells(self, vehicle_inventory_id, shells):
+        values = [_int(value) for value in (shells or ())]
+        if len(values) % 2:
+            raise GarageError('shells must be descriptor/count pairs')
+        record = self._record(vehicle_inventory_id)
+        record['shells'] = values
+        # data._validate_selected_vehicle requires the shell inventory and the
+        # flat pair list to agree, so both move together.
+        pairs = {}
+        for index in range(0, len(values), 2):
+            pairs[values[index]] = values[index + 1]
+        record.setdefault('inventoryItems', {})[SHELL_ITEM_TYPE] = pairs
+        for compact_descr, count in pairs.items():
+            self._publish_owned(compact_descr, SHELL_ITEM_TYPE, count)
+            self._price(compact_descr)
+        self.revision += 1
+        return record
+
+    def _price(self, compact_descr):
+        prices = self._snapshot.setdefault('shopItemPrices', {})
+        if compact_descr and compact_descr not in prices:
+            prices[compact_descr] = {'credits': 0, 'gold': 0}
+        unlocks = self._snapshot.get('unlockItemCompactDescrs')
+        # Only extend a set that already lists the garage: an empty set means
+        # the snapshot opted out of the unlock check, and partially filling it
+        # would start enforcing a constraint on items nobody validated.
+        if isinstance(unlocks, set) and unlocks and compact_descr:
+            unlocks.add(compact_descr)
+
+    # ---- consumables ----------------------------------------------------
+
+    def equip_equipments(self, vehicle_inventory_id, equipments):
+        values = [_int(value) for value in (equipments or ())]
+        if len(values) > EQUIPMENT_SLOT_COUNT:
+            raise GarageError('a vehicle has three equipment slots')
+        values += [0] * (EQUIPMENT_SLOT_COUNT - len(values))
+        record = self._record(vehicle_inventory_id)
+        record['eqs'] = values
+        for compact_descr in values:
+            self._own(record, compact_descr, 11)
+            self._price(compact_descr)
+        self.revision += 1
+        return record
+
+    def set_layouts(self, vehicle_inventory_id, shells_layout=None,
+                    equipment_type=0, equipments_layout=None):
+        record = self._record(vehicle_inventory_id)
+        if shells_layout is not None:
+            values = [_int(value) for value in shells_layout]
+            if len(values) % 2:
+                raise GarageError('shell layout must be descriptor/count pairs')
+            layout = {}
+            for index in range(0, len(values), 2):
+                layout[values[index]] = values[index + 1]
+            record['shellsLayout'] = layout
+        if equipments_layout is not None:
+            values = [_int(value) for value in equipments_layout]
+            if len(values) > EQUIPMENT_SLOT_COUNT:
+                raise GarageError('a vehicle has three equipment slots')
+            values += [0] * (EQUIPMENT_SLOT_COUNT - len(values))
+            record['eqsLayout'] = values
+        record['equipmentType'] = _int(equipment_type)
+        self.revision += 1
+        return record
+
+    # ---- optional devices and modules -----------------------------------
+
+    def _rebuild_descriptor(self, record, mutate):
+        vehicles = self._vehicles_module()
+        try:
+            descriptor = vehicles.VehicleDescr(
+                compactDescr=record['compDescr'])
+        except Exception as error:
+            raise GarageError('vehicle descriptor is unreadable: %s' % error)
+        try:
+            mutate(descriptor)
+            record['compDescr'] = descriptor.makeCompactDescr()
+        except Exception as error:
+            raise GarageError('the client refused the fitting: %s' % error)
+        return record
+
+    def equip_optional_device(self, vehicle_inventory_id, device_compact_descr,
+                              slot_index):
+        record = self._record(vehicle_inventory_id)
+        device_compact_descr = _int(device_compact_descr)
+        slot_index = _int(slot_index)
+
+        def mutate(descriptor):
+            # Removing first makes a slot swap idempotent; #1513 rejects an
+            # install into an occupied slot.
+            try:
+                descriptor.removeOptionalDevice(slot_index)
+            except Exception:
+                pass
+            if device_compact_descr:
+                descriptor.installOptionalDevice(
+                    device_compact_descr, slot_index)
+
+        self._rebuild_descriptor(record, mutate)
+        self._own(record, device_compact_descr, 9)
+        self._price(device_compact_descr)
+        self.revision += 1
+        return record
+
+    def install_component(self, vehicle_inventory_id, compact_descr,
+                          position_index=0):
+        """Install a module: this is the gun, turret, engine or chassis swap."""
+        record = self._record(vehicle_inventory_id)
+        compact_descr = _int(compact_descr)
+        position_index = _int(position_index)
+
+        def mutate(descriptor):
+            descriptor.installComponent(compact_descr, position_index)
+
+        self._rebuild_descriptor(record, mutate)
+        self._price(compact_descr)
+        # A gun swap changes which shells fit, so the stale flat pair list and
+        # the shell inventory would no longer agree.  Refill from the new gun.
+        self._refill_default_ammo(record)
+        self.revision += 1
+        return record
+
+    def _refill_default_ammo(self, record):
+        vehicles = self._vehicles_module()
+        try:
+            descriptor = vehicles.VehicleDescr(
+                compactDescr=record['compDescr'])
+            shells = list(vehicles.getDefaultAmmoForGun(descriptor.gun))
+        except Exception:
+            return False
+        if not shells or len(shells) % 2:
+            return False
+        self.equip_shells(_int(record.get('id', 0)), shells)
+        record['shellsLayout'] = {}
+        return True
+
+    # ---- crew -----------------------------------------------------------
+
+    def add_tankman_skill(self, tankman_inventory_id, skill_index):
+        record, tankman_id = self._tankman_record(tankman_inventory_id)
+        tankmen = self._tankmen_module()
+        names = getattr(tankmen, 'SKILL_NAMES', ())
+        try:
+            skill_name = names[_int(skill_index)]
+        except (IndexError, TypeError):
+            raise GarageError('unknown crew skill index %r' % (skill_index,))
+        try:
+            descriptor = tankmen.TankmanDescr(record['tankmen'][tankman_id])
+            descriptor.addSkill(skill_name)
+            record['tankmen'][tankman_id] = descriptor.makeCompactDescr()
+        except Exception as error:
+            raise GarageError('the client refused the crew skill: %s' % error)
+        self.revision += 1
+        return record
+
+    def drop_tankman_skills(self, tankman_inventory_id):
+        record, tankman_id = self._tankman_record(tankman_inventory_id)
+        tankmen = self._tankmen_module()
+        try:
+            descriptor = tankmen.TankmanDescr(record['tankmen'][tankman_id])
+            descriptor.dropSkills(1.0, False)
+            record['tankmen'][tankman_id] = descriptor.makeCompactDescr()
+        except Exception as error:
+            raise GarageError('the client refused the skill reset: %s' % error)
+        self.revision += 1
+        return record

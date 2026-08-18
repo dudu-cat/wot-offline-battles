@@ -31,6 +31,26 @@ class FakeServer(object):
             import BigWorld
             callback = BigWorld.callback
         self._callback = callback
+        self._context.setdefault('push_update', self._push_update)
+
+    def _push_update(self, diff):
+        """Publish one account diff through the exact #1513 entity method.
+
+        ``PlayerAccount.update`` unpickles its argument and forwards it to
+        ``_update(True, diff)``, which is the same event path a full sync uses,
+        so the garage refreshes without a second wire format.
+        """
+        player = self._player()
+        if player is None:
+            return False
+        payload = _pickle.dumps(diff, _pickle.HIGHEST_PROTOCOL)
+
+        def publish():
+            if self._player() is player:
+                player.update(payload)
+
+        self._callback(0.0, publish)
+        return True
 
     def _player(self):
         try:
