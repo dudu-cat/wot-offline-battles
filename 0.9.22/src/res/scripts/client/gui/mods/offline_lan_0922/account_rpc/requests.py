@@ -42,6 +42,12 @@ def _fitting(context, mutate):
     except garage.GarageError as error:
         return Result(commands.RES_FAILURE, str(error))
     context['selected_vehicle'] = state.snapshot()
+    store = context.get('garage_store')
+    if store is not None:
+        # A fitting happens at click speed, so saving on each accepted change
+        # costs nothing and a hard client kill cannot lose an applied change.
+        store.mark_dirty()
+        store.flush(state.snapshot())
     push = context.get('push_update')
     if not callable(push):
         return Result(commands.RES_SUCCESS)
@@ -125,6 +131,30 @@ def _drop_tankman_skills(context, args):
         return Result(commands.RES_FAILURE, 'INVALID_CREW_REQUEST')
     return _fitting(
         context, lambda state: state.drop_tankman_skills(args[0]))
+
+
+def _buy_item(context, args):
+    # _doCmdInt4: (cacheRev, intCompactDescr, count, goldForCredits)
+    if len(args) < 3:
+        return Result(commands.RES_FAILURE, 'INVALID_PURCHASE_REQUEST')
+    return _fitting(context, lambda state: state.buy_item(args[1], args[2]))
+
+
+def _buy_and_equip_item(context, args):
+    # [cacheRev, compDescr, vehInvID, slotIdx, isPaidRemoval, gunCompDescr]
+    values = list(args[0] if args else ())
+    if len(values) < 4:
+        return Result(commands.RES_FAILURE, 'INVALID_PURCHASE_REQUEST')
+    return _fitting(context, lambda state: state.buy_and_equip_item(
+        values[2], values[1], values[3]))
+
+
+def _vehicle_settings(context, args):
+    # _doCmdInt3: (vehInvID, setting, isOn)
+    if len(args) < 3:
+        return Result(commands.RES_FAILURE, 'INVALID_SETTING_REQUEST')
+    return _fitting(context, lambda state: state.change_vehicle_setting(
+        args[0], args[1], args[2]))
 
 
 def _sync_data(context, args):
@@ -239,6 +269,9 @@ HANDLERS = {
     commands.CMD_SET_AND_FILL_LAYOUTS: _set_and_fill_layouts,
     commands.CMD_TMAN_ADD_SKILL: _add_tankman_skill,
     commands.CMD_TMAN_DROP_SKILLS: _drop_tankman_skills,
+    commands.CMD_BUY_ITEM: _buy_item,
+    commands.CMD_BUY_AND_EQUIP_ITEM: _buy_and_equip_item,
+    commands.CMD_VEH_SETTINGS: _vehicle_settings,
     commands.CMD_REQ_SERVER_STATS: _server_stats,
     commands.CMD_SYNC_SHOP: _sync_shop,
     commands.CMD_SYNC_DOSSIERS: _sync_dossiers,

@@ -14,6 +14,23 @@ class ReleaseBuilderTests(unittest.TestCase):
         self.assertNotIn('os.environ.get(', source)
         self.assertNotIn('server_endpoint.json', source)
 
+    def test_the_package_never_carries_user_owned_state_files(self):
+        """State files belong to the player's config directory only."""
+        source = (PORT_ROOT / 'build_wotmod.py').read_text(encoding='utf-8')
+        for name in ('server_endpoint.json', 'account_state.json',
+                     'garage_state.json'):
+            self.assertNotIn(name, source, name)
+
+    def test_the_state_owners_write_only_into_the_config_directory(self):
+        package = (PORT_ROOT / 'src' / 'res' / 'scripts' / 'client' / 'gui' /
+                   'mods' / 'offline_lan_0922')
+        for module, name in (
+                ('account_rpc/state.py', 'account_state.json'),
+                ('account_rpc/garage_store.py', 'garage_state.json')):
+            source = (package / module).read_text(encoding='utf-8')
+            self.assertIn(name, source, module)
+            self.assertIn('port_config.CONFIG_PATH', source, module)
+
 
 if __name__ == '__main__':
     unittest.main()

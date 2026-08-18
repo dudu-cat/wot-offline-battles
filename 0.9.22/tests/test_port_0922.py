@@ -4711,6 +4711,7 @@ class BootstrapContractTests(unittest.TestCase):
                         show_lobby=True,
                         account_context={'selected_vehicle': {
                             'id': 1, 'compDescr': 12345},
+                            'garage_store': None,
                             'account_state': account_state})],
                     lobby_entry.mock_calls)
                 bigworld.run_next()
@@ -4786,6 +4787,7 @@ class BootstrapContractTests(unittest.TestCase):
             show_lobby=True,
             account_context={'selected_vehicle': {
                 'id': 1, 'compDescr': 12345},
+                'garage_store': None,
                 'account_state': account_state})
         self.assertEqual([expected_connect, expected_connect],
                          compatibility.connect.call_args_list)

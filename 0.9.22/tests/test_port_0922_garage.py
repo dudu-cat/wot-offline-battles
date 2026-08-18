@@ -1,5 +1,10 @@
+import contextlib
 import copy
 import importlib.util
+import io
+import os
+import shutil
+import tempfile
 from pathlib import Path
 import sys
 import types
@@ -130,9 +135,14 @@ class _TankmanDescriptor(object):
 
 
 def _modules():
+    def item_type(compact_descr):
+        # 9 optionalDevice, 10 shell, 11 equipment, else a vehicle module.
+        return {9: 9, 10: 10, 11: 11}.get(compact_descr // 1000, 4)
+
     vehicles = types.SimpleNamespace(
         VehicleDescr=lambda compactDescr: _Descriptor(compactDescr),
-        getDefaultAmmoForGun=lambda gun: [20010, 30, 20011, 15])
+        getDefaultAmmoForGun=lambda gun: [20010, 30, 20011, 15],
+        getTypeOfCompactDescr=item_type)
     tankmen = types.SimpleNamespace(
         TankmanDescr=_TankmanDescriptor,
         SKILL_NAMES=('repair', 'camouflage', 'brotherhood'))
@@ -327,6 +337,148 @@ class FittingRequestTests(unittest.TestCase):
 
         self.assertIs(
             self.state.snapshot(), self.context['selected_vehicle'])
+
+
+class GaragePersistenceTests(unittest.TestCase):
+    """Persist -> reload -> same state, across a simulated client restart."""
+
+    def setUp(self):
+        unused_requests, unused_commands, self.garage = _request_modules()
+        self.store_module = _load('garage_store')
+        self.directory = tempfile.mkdtemp()
+        self.path = os.path.join(self.directory, 'garage_state.json')
+
+    def tearDown(self):
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+    def _state(self, snapshot=None):
+        vehicles, tankmen = _modules()
+        return self.garage.GarageState(
+            snapshot if snapshot is not None else SNAPSHOT,
+            vehicles_module=vehicles, tankmen_module=tankmen)
+
+    def _store(self):
+        return self.store_module.GarageStore(path=self.path)
+
+    def _restart(self):
+        """Rebuild the bootstrap snapshot and overlay the saved garage."""
+        fresh = copy.deepcopy(SNAPSHOT)
+        self._store().apply(fresh)
+        return fresh
+
+    def test_a_full_loadout_survives_a_restart(self):
+        state = self._state()
+        state.equip_optional_device(9, 9001, 0)
+        state.equip_optional_device(9, 9002, 1)
+        state.equip_equipments(9, [11001, 0, 0])
+        state.equip_shells(9, [10010, 38, 10011, 9])
+        state.set_layouts(9, [10010, 38], 0, [11001])
+        state.add_tankman_skill(101, 2)
+        state.change_vehicle_setting(9, 3, 1)
+        store = self._store()
+        store.mark_dirty()
+        self.assertTrue(store.flush(state.snapshot()))
+
+        restored = self._restart()['vehicles'][0]
+
+        self.assertEqual(state.snapshot()['vehicles'][0]['compDescr'],
+                         restored['compDescr'])
+        self.assertEqual([11001, 0, 0], restored['eqs'])
+        self.assertEqual([10010, 38, 10011, 9], restored['shells'])
+        self.assertEqual({10010: 38}, restored['shellsLayout'])
+        self.assertEqual([11001, 0, 0], restored['eqsLayout'])
+        self.assertEqual(8, restored['settings'])
+        self.assertEqual(b'tman:101|brotherhood', restored['tankmen'][101])
+        # The reloaded shells must still match the shell inventory that
+        # data._validate_selected_vehicle cross-checks.
+        self.assertEqual({10010: 38, 10011: 9},
+                         restored['inventoryItems'][10])
+
+    def test_purchases_survive_a_restart(self):
+        state = self._state()
+        state.buy_item(9002, 3)
+        store = self._store()
+        store.mark_dirty()
+        store.flush(state.snapshot())
+
+        restored = self._restart()
+
+        self.assertGreaterEqual(restored['inventoryItems'][9][9002], 3)
+
+    def test_a_reload_is_keyed_on_the_vehicle_type_not_the_inventory_id(self):
+        state = self._state()
+        state.equip_equipments(9, [11001, 0, 0])
+        store = self._store()
+        store.mark_dirty()
+        store.flush(state.snapshot())
+
+        # A different configured vehicle renumbers inventory ids; the saved
+        # loadout must still land on the same vehicle type.
+        renumbered = copy.deepcopy(SNAPSHOT)
+        renumbered['vehicles'][0]['id'] = 47
+        self._store().apply(renumbered)
+
+        self.assertEqual([11001, 0, 0], renumbered['vehicles'][0]['eqs'])
+
+    def test_an_unknown_schema_falls_back_to_the_stock_garage(self):
+        with io.open(self.path, 'w', encoding='utf-8') as stream:
+            stream.write(u'{"schema": 999, "vehicles": {}}')
+
+        fresh = copy.deepcopy(SNAPSHOT)
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            self.assertFalse(self._store().apply(fresh))
+
+        self.assertIn('schema', log.getvalue())
+        self.assertEqual([0, 0, 0], fresh['vehicles'][0]['eqs'])
+
+    def test_corrupt_content_falls_back_to_the_stock_garage(self):
+        with io.open(self.path, 'w', encoding='utf-8') as stream:
+            stream.write(u'{ this is not json')
+
+        fresh = copy.deepcopy(SNAPSHOT)
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            self._store().apply(fresh)
+
+        self.assertIn('unreadable', log.getvalue())
+        self.assertEqual([0, 0, 0], fresh['vehicles'][0]['eqs'])
+
+    def test_a_missing_file_is_not_an_error(self):
+        fresh = copy.deepcopy(SNAPSHOT)
+
+        self.assertFalse(self._store().apply(fresh))
+
+        self.assertEqual([0, 0, 0], fresh['vehicles'][0]['eqs'])
+
+    def test_nothing_is_written_without_a_pending_change(self):
+        store = self._store()
+
+        self.assertFalse(store.flush(SNAPSHOT))
+
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_an_unknown_saved_vehicle_type_is_skipped(self):
+        state = self._state()
+        state.equip_equipments(9, [11001, 0, 0])
+        store = self._store()
+        store.mark_dirty()
+        store.flush(state.snapshot())
+
+        fresh = copy.deepcopy(SNAPSHOT)
+        fresh['vehicles'][0]['vehicleTypeCompactDescr'] = 999999
+        self._store().apply(fresh)
+
+        self.assertEqual([0, 0, 0], fresh['vehicles'][0]['eqs'])
+
+    def test_the_write_is_atomic_and_leaves_no_temporary_file(self):
+        state = self._state()
+        state.equip_equipments(9, [11001, 0, 0])
+        store = self._store()
+        store.mark_dirty()
+        store.flush(state.snapshot())
+
+        self.assertTrue(os.path.exists(self.path))
+        self.assertFalse(os.path.exists(self.path + '.tmp'))
+        self.assertFalse(os.path.exists(self.path + '.bak'))
 
 
 if __name__ == '__main__':

@@ -30,7 +30,7 @@ def _positive(value, default):
 
 class GunState(object):
 
-    def __init__(self, descriptor, loadout_modifiers=None):
+    def __init__(self, descriptor, loadout_modifiers=None, ammo_layout=None):
         gun = descriptor.gun
         self.shots = tuple(_field(gun, 'shots', ()) or ())
         self.base_dispersion = _positive(
@@ -58,12 +58,22 @@ class GunState(object):
             maximum = max(0, int(maximum))
         except (TypeError, ValueError):
             maximum = 45
-        self.ammo = self._distribute_ammo(maximum, len(self.shots))
+        # The garage layout wins when we know it.  Only an unknown loadout
+        # falls back to an even split of maxAmmo.
+        self.ammo = self._layout_ammo(ammo_layout)
+        if self.ammo is None:
+            self.ammo = self._distribute_ammo(maximum, len(self.shots))
         try:
             selected = int(getattr(descriptor, 'activeGunShotIndex', 0))
         except (TypeError, ValueError):
             selected = 0
         self.shot_index = max(0, min(selected, max(0, len(self.shots) - 1)))
+        if not self.ammo or self.ammo[self.shot_index] <= 0:
+            # Retail loads the first shell the vehicle actually carries.
+            for index, count in enumerate(self.ammo):
+                if count > 0:
+                    self.shot_index = index
+                    break
         # 0.8.2 converts the crew level through 1/(0.5 + 0.005 * level) and
         # then applies the gun rammer and gun laying drive.  A bare 100% crew
         # already yields 0.952; ventilation, Brothers in Arms and rations move
@@ -86,6 +96,40 @@ class GunState(object):
         self.reload_duration = self.reload
         self.dispersion = self.base_dispersion
         self.load_started = False
+
+    def _layout_ammo(self, ammo_layout):
+        """Map a garage shell layout onto this gun's shot order.
+
+        ``ammo_layout`` is the mounted ``{shellCompactDescr: count}`` mapping.
+        A shell the current gun cannot fire is ignored, and a shot the player
+        carries none of stays at zero, so an empty slot really is empty.
+        """
+        if not ammo_layout:
+            return None
+        wanted = {}
+        for compact_descr, count in dict(ammo_layout).items():
+            try:
+                wanted[int(compact_descr)] = max(0, int(count))
+            except (TypeError, ValueError):
+                continue
+        if not wanted:
+            return None
+        result = []
+        matched = False
+        for shot in self.shots:
+            shell = _field(shot, 'shell', {})
+            compact_descr = _field(shell, 'compactDescr', None)
+            try:
+                compact_descr = int(compact_descr)
+            except (TypeError, ValueError):
+                compact_descr = None
+            count = wanted.get(compact_descr, 0)
+            if compact_descr is not None and compact_descr in wanted:
+                matched = True
+            result.append(count)
+        if not matched:
+            return None
+        return result
 
     @staticmethod
     def _distribute_ammo(maximum, count):

@@ -43,17 +43,63 @@ def _copy_defaults():
                 for key, value in DEFAULT_CONFIG.items())
 
 
+def _replace(temporary_path, path):
+    """Move a finished temporary file over ``path`` without losing both.
+
+    Python 2 has no ``os.replace``, and Windows ``os.rename`` refuses an
+    existing destination.  Unlinking first leaves a window where a crash loses
+    the file entirely, so prefer the Windows atomic replace and fall back to a
+    recoverable backup rather than to a gap.
+    """
+    try:
+        os.rename(temporary_path, path)
+        return
+    except OSError:
+        pass
+    try:
+        import ctypes
+        move = ctypes.windll.kernel32.MoveFileExW
+    except (AttributeError, ImportError, OSError):
+        move = None
+    if move is not None:
+        MOVEFILE_REPLACE_EXISTING = 0x1
+        MOVEFILE_WRITE_THROUGH = 0x8
+        if move(_text(temporary_path), _text(path),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH):
+            return
+    backup_path = path + '.bak'
+    if os.path.exists(backup_path):
+        os.unlink(backup_path)
+    os.rename(path, backup_path)
+    try:
+        os.rename(temporary_path, path)
+    except OSError:
+        os.rename(backup_path, path)
+        raise
+    os.unlink(backup_path)
+
+
+def _text(value):
+    try:
+        return value.decode('utf-8') if isinstance(value, bytes) else value
+    except (AttributeError, UnicodeDecodeError):
+        return value
+
+
 def write_json(path, value):
     output_dir = os.path.dirname(path)
-    if not os.path.isdir(output_dir):
+    if output_dir and not os.path.isdir(output_dir):
         os.makedirs(output_dir)
     temporary_path = path + '.tmp'
     with open(temporary_path, 'wb') as stream:
         payload = json.dumps(value, indent=2, sort_keys=True) + '\n'
         stream.write(payload.encode('utf-8'))
-    if os.path.exists(path):
-        os.unlink(path)
-    os.rename(temporary_path, path)
+        stream.flush()
+        try:
+            os.fsync(stream.fileno())
+        except (AttributeError, OSError):
+            pass
+    _replace(temporary_path, path)
 
 
 # Backward-compatible private name for older extracted packages.

@@ -27,7 +27,9 @@ rebuild the descriptor from a stale copy and silently drop the other's change.
 import copy
 
 EQUIPMENT_SLOT_COUNT = 3
+OPTIONAL_DEVICE_ITEM_TYPE = 9
 SHELL_ITEM_TYPE = 10
+EQUIPMENT_ITEM_TYPE = 11
 
 
 class GarageError(Exception):
@@ -245,6 +247,74 @@ class GarageState(object):
         self.equip_shells(_int(record.get('id', 0)), shells)
         record['shellsLayout'] = {}
         return True
+
+    # ---- purchases and settings -----------------------------------------
+
+    def buy_item(self, compact_descr, count=1):
+        """Own more of one item.
+
+        Offline balances are unlimited: the shop publishes every item at zero
+        price, so deducting credits would always subtract nothing. Ownership is
+        the only part of a purchase that has an observable effect here.
+        """
+        compact_descr = _int(compact_descr)
+        if not compact_descr:
+            raise GarageError('a purchase needs an item')
+        count = max(1, _int(count))
+        item_type = self._item_type(compact_descr)
+        existing = self._snapshot.get('inventoryItems', {}).get(item_type, {})
+        self._publish_owned(
+            compact_descr, item_type,
+            int(existing.get(compact_descr, 0)) + count)
+        self._price(compact_descr)
+        self.revision += 1
+        return compact_descr
+
+    def _item_type(self, compact_descr):
+        vehicles = self._vehicles_module()
+        resolver = getattr(vehicles, 'getTypeOfCompactDescr', None)
+        if resolver is None:
+            from items import getTypeOfCompactDescr as resolver
+        try:
+            return int(resolver(compact_descr))
+        except Exception as error:
+            raise GarageError('unknown item %d: %s' % (compact_descr, error))
+
+    def buy_and_equip_item(self, vehicle_inventory_id, compact_descr,
+                           slot_index=0):
+        """Own one item and mount it on the vehicle in the same request."""
+        compact_descr = _int(compact_descr)
+        item_type = self._item_type(compact_descr)
+        self.buy_item(compact_descr, 1)
+        if item_type == OPTIONAL_DEVICE_ITEM_TYPE:
+            return self.equip_optional_device(
+                vehicle_inventory_id, compact_descr, slot_index)
+        if item_type == EQUIPMENT_ITEM_TYPE:
+            record = self._record(vehicle_inventory_id)
+            slots = list(record.get('eqs') or [0] * EQUIPMENT_SLOT_COUNT)
+            slots += [0] * (EQUIPMENT_SLOT_COUNT - len(slots))
+            index = _int(slot_index)
+            if not 0 <= index < EQUIPMENT_SLOT_COUNT:
+                raise GarageError('a vehicle has three equipment slots')
+            slots[index] = compact_descr
+            return self.equip_equipments(vehicle_inventory_id, slots)
+        # Every remaining owned type is a vehicle module.
+        return self.install_component(
+            vehicle_inventory_id, compact_descr, slot_index)
+
+    def change_vehicle_setting(self, vehicle_inventory_id, setting, is_on):
+        """Set or clear one bit of a vehicle's settings mask."""
+        record = self._record(vehicle_inventory_id)
+        bit = 1 << max(0, _int(setting))
+        current = 0
+        try:
+            current = int(record.get('settings', 0) or 0)
+        except (TypeError, ValueError):
+            current = 0
+        record['settings'] = (current | bit) if _int(is_on) else (
+            current & ~bit)
+        self.revision += 1
+        return record
 
     # ---- crew -----------------------------------------------------------
 

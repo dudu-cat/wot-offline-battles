@@ -744,6 +744,7 @@ class BattleRuntime(object):
         self._equipment_state = None
         self._equipment_signature = None
         self._local_loadout_cache = None
+        self._local_ammo_layout_cache = None
         self._battle_result = None
         self._round_finished_notified = False
         self._on_local_leave = None
@@ -883,6 +884,7 @@ class BattleRuntime(object):
         self._equipment_state = None
         self._equipment_signature = None
         self._local_loadout_cache = None
+        self._local_ammo_layout_cache = None
         self._battle_result = self._start_message.get('battle_result')
         self._round_finished_notified = False
         self._on_local_leave = on_local_leave
@@ -1617,7 +1619,8 @@ class BattleRuntime(object):
             self._runtime.compatibility.set_control_mode_listener(
                 self._on_control_mode_changed)
             self._gun_state = gun_mechanics.GunState(
-                descriptor, self._local_loadout(descriptor))
+                descriptor, self._local_loadout(descriptor),
+                ammo_layout=self._local_ammo_layout())
             self._gun_last_tick = self._clock()
             self._sync = SnapshotSync(
                 self.client.player_id, on_event=self._apply_sync_event,
@@ -3172,30 +3175,74 @@ class BattleRuntime(object):
             if self._ammo_callback_token is None:
                 self._ammo_tick()
 
+    @staticmethod
+    def _equipment_kind(descriptor):
+        """Classify a consumable by its own tags, falling back to its name."""
+        tags = getattr(descriptor, 'tags', ()) or ()
+        try:
+            tags = set(str(tag).lower() for tag in tags)
+        except TypeError:
+            tags = set()
+        name = str(getattr(descriptor, 'name', '') or '').lower()
+        for kind in ('repairkit', 'medkit'):
+            if kind in tags or kind in name:
+                return kind
+        if 'extinguisher' in name or any(
+                'extinguisher' in tag for tag in tags):
+            return 'extinguisher'
+        return None
+
     def _default_equipments(self):
-        """Resolve the three copied 0.8.2 consumables from #1513 data.
+        """Resolve the consumables the player actually mounted in the garage.
 
         ``reuseCount`` and ``cooldownSeconds`` come from the exact client's
-        ``scripts/item_defs/vehicles/common/equipments.xml``, where these three
-        kits carry ``reuseCount = -1`` (unlimited) and 90-second cooldowns.
+        ``scripts/item_defs/vehicles/common/equipments.xml``, where the three
+        stock kits carry ``reuseCount = -1`` (unlimited) and 90-second
+        cooldowns.  An empty garage slot contributes nothing, so a vehicle with
+        no consumables really carries none.
         """
         try:
             values = self._runtime.vehicles.g_cache.equipments().values()
         except Exception:
             return []
         by_name = {}
+        by_compact_descr = {}
         for descriptor in values:
             name = str(getattr(descriptor, 'name', '') or '').lower()
             if name:
                 by_name[name] = descriptor
-        result = []
-        for name, kind in (
-                ('smallrepairkit', 'repairkit'),
-                ('smallmedkit', 'medkit'),
-                ('handextinguishers', 'extinguisher')):
-            descriptor = by_name.get(name)
-            if descriptor is None:
+            try:
+                by_compact_descr[int(descriptor.compactDescr)] = descriptor
+            except (TypeError, ValueError, AttributeError):
                 continue
+
+        mounted = self._local_mounted_equipments()
+        if mounted is not None:
+            selected = []
+            for compact_descr in mounted:
+                descriptor = by_compact_descr.get(compact_descr)
+                if descriptor is None:
+                    continue
+                kind = self._equipment_kind(descriptor)
+                if kind is None:
+                    # A booster or a device this battle law cannot apply.
+                    continue
+                selected.append((
+                    str(getattr(descriptor, 'name', '') or '').lower(),
+                    kind, descriptor))
+        else:
+            # No garage item, for example a test or a direct battle start.
+            selected = []
+            for name, kind in (
+                    ('smallrepairkit', 'repairkit'),
+                    ('smallmedkit', 'medkit'),
+                    ('handextinguishers', 'extinguisher')):
+                descriptor = by_name.get(name)
+                if descriptor is not None:
+                    selected.append((name, kind, descriptor))
+
+        result = []
+        for name, kind, descriptor in selected:
             try:
                 equipment_id = int(descriptor.id[1])
                 compact_descr = int(descriptor.compactDescr)
@@ -3233,6 +3280,58 @@ class BattleRuntime(object):
             return g_currentVehicle.item
         except Exception:
             return None
+
+    def _local_ammo_layout(self):
+        """Return the player's mounted ``{shellCompactDescr: count}`` layout.
+
+        The garage item's ``shellsLayout`` is what the player set; ``shells`` is
+        the flat descriptor/count pair list behind it.  Returning None means the
+        layout is unknown and the gun keeps its synthetic fallback split.
+        """
+        if self._local_ammo_layout_cache is not None:
+            return self._local_ammo_layout_cache or None
+        item = self._garage_item()
+        layout = {}
+        if item is not None:
+            stored = getattr(item, 'shellsLayout', None)
+            if isinstance(stored, dict) and stored:
+                for compact_descr, count in stored.items():
+                    try:
+                        layout[int(compact_descr)] = max(0, int(count))
+                    except (TypeError, ValueError):
+                        continue
+            if not layout:
+                shells = list(getattr(item, 'shells', ()) or ())
+                if shells and not len(shells) % 2:
+                    for index in range(0, len(shells), 2):
+                        try:
+                            layout[int(shells[index])] = max(
+                                0, int(shells[index + 1]))
+                        except (TypeError, ValueError):
+                            continue
+        self._local_ammo_layout_cache = layout
+        return layout or None
+
+    def _local_mounted_equipments(self):
+        """Return the mounted consumable compact descriptors, zeros included.
+
+        An empty slot stays a zero so the battle really carries no consumable
+        there, instead of the previous hardcoded three-kit default.
+        """
+        item = self._garage_item()
+        if item is None:
+            return None
+        slots = getattr(item, 'eqs', None)
+        if slots is None:
+            return None
+        result = []
+        for slot in slots:
+            compact_descr = getattr(slot, 'intCD', slot)
+            try:
+                result.append(int(compact_descr or 0))
+            except (TypeError, ValueError):
+                result.append(0)
+        return result
 
     def _local_loadout(self, descriptor):
         """Build the passive modifier bundle for the player's own vehicle.
@@ -3480,7 +3579,8 @@ class BattleRuntime(object):
             state = self._gun_state
             if state is None:
                 state = gun_mechanics.GunState(
-                    descriptor, self._local_loadout(descriptor))
+                    descriptor, self._local_loadout(descriptor),
+                    ammo_layout=self._local_ammo_layout())
                 self._gun_state = state
             now = self._clock()
             if self._gun_last_tick is None:
@@ -8341,7 +8441,8 @@ class BattleRuntime(object):
         if state is None:
             state = gun_mechanics.GunState(
                 entity.typeDescriptor,
-                self._local_loadout(entity.typeDescriptor))
+                self._local_loadout(entity.typeDescriptor),
+                ammo_layout=self._local_ammo_layout())
             self._gun_state = state
             self._gun_last_tick = self._clock()
         if not state.can_fire(self._battle_live):
@@ -8897,6 +8998,7 @@ class BattleRuntime(object):
         self._equipment_state = None
         self._equipment_signature = None
         self._local_loadout_cache = None
+        self._local_ammo_layout_cache = None
         self._battle_result = None
         self._round_finished_notified = False
         self._on_local_leave = None

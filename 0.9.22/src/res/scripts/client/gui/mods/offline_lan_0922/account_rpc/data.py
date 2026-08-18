@@ -203,7 +203,11 @@ def inventory(selected_vehicle=None):
         # integer 0, while the GUI Vehicle constructor unpacks a two-tuple.
         vehicle_values['repair'][vehicle_id] = tuple(
             record.get('repair', (0, 0)))
-        vehicle_values['settings'][vehicle_id] = 0
+        try:
+            vehicle_values['settings'][vehicle_id] = int(
+                record.get('settings', 0) or 0)
+        except (TypeError, ValueError):
+            vehicle_values['settings'][vehicle_id] = 0
         vehicle_values['compDescr'][vehicle_id] = record['compDescr']
         vehicle_values['eqs'][vehicle_id] = list(
             record.get('eqs', (0, 0, 0)))

@@ -24,11 +24,110 @@ _lobby_listener_installed = False
 
 # Enough of every artefact that the garage never blocks a mount on stock.
 OFFLINE_ARTEFACT_STOCK = 200
+_store = None
 
 
 def _schedule(delay, function):
     global _callback_id
     _callback_id = BigWorld.callback(delay, function)
+
+
+def _garage_store():
+    """Return the persistent garage store, or None if it cannot be used.
+
+    A saved garage is a convenience.  Losing it must never make the garage
+    itself unusable, so every failure here degrades to the stock snapshot.
+    """
+    global _store
+    if _store is None:
+        try:
+            from gui.mods.offline_lan_0922.account_rpc.garage_store import \
+                GarageStore
+            _store = GarageStore()
+        except Exception as error:
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] the garage state store is unavailable: '
+                '%s\n' % error)
+            return None
+    return _store
+
+
+def _restore_garage(snapshot):
+    store = _garage_store()
+    if store is None:
+        return False
+    try:
+        return bool(store.apply(snapshot))
+    except Exception as error:
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] the saved garage could not be restored: '
+            '%s\n' % error)
+        return False
+
+
+def _component_compact_descrs(value, seen):
+    """Yield compact descriptors from a component list, however it nests.
+
+    #1513 stores turrets per turret position, so the same walker has to accept
+    both a flat component list and a list of per-position lists.
+    """
+    if value is None:
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            for compact_descr in _component_compact_descrs(item, seen):
+                yield compact_descr
+        return
+    compact_descr = getattr(value, 'compactDescr', None)
+    if compact_descr is None:
+        return
+    try:
+        compact_descr = int(compact_descr)
+    except (TypeError, ValueError):
+        return
+    if compact_descr in seen:
+        return
+    seen.add(compact_descr)
+    yield compact_descr
+
+
+def _vehicle_type_modules(descriptor):
+    """Yield ``(itemTypeName, compactDescr)`` for every module of one type."""
+    vehicle_type = getattr(descriptor, 'type', None)
+    if vehicle_type is None:
+        return
+    seen = set()
+    for item_type_name, attribute in (
+            ('vehicleChassis', 'chassis'),
+            ('vehicleTurret', 'turrets'),
+            ('vehicleEngine', 'engines'),
+            ('vehicleRadio', 'radios'),
+            ('vehicleFuelTank', 'fuelTanks')):
+        for compact_descr in _component_compact_descrs(
+                getattr(vehicle_type, attribute, None), seen):
+            yield (item_type_name, compact_descr)
+    # Guns hang off each turret variant; a flat ``guns`` list may also exist.
+    gun_seen = set()
+    for turret in _turret_descriptors(vehicle_type):
+        for compact_descr in _component_compact_descrs(
+                getattr(turret, 'guns', None), gun_seen):
+            yield ('vehicleGun', compact_descr)
+    for compact_descr in _component_compact_descrs(
+            getattr(vehicle_type, 'guns', None), gun_seen):
+        yield ('vehicleGun', compact_descr)
+
+
+def _turret_descriptors(vehicle_type):
+    stack = [getattr(vehicle_type, 'turrets', None)]
+    while stack:
+        value = stack.pop()
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple, set, frozenset)):
+            stack.extend(value)
+            continue
+        if getattr(value, 'compactDescr', None) is not None:
+            yield value
 
 
 def _selected_vehicle(config):
@@ -107,6 +206,16 @@ def _selected_vehicle(config):
                     item_type = ITEM_TYPE_INDICES[item_type_name]
                     record_inventory_items.setdefault(
                         item_type, {})[compact_descr] = 1
+                # Publish every module this vehicle type can carry, not only
+                # the stock fitting, so its research tree shows them owned
+                # instead of costing XP.  The lists come from the vehicle's own
+                # type, so a premium hull still offers only its own modules.
+                for item_type_name, compact_descr in _vehicle_type_modules(
+                        descriptor):
+                    item_type = ITEM_TYPE_INDICES[item_type_name]
+                    owned = record_inventory_items.setdefault(item_type, {})
+                    owned[compact_descr] = max(
+                        1, int(owned.get(compact_descr, 0)))
 
                 shells = list(vehicles.getDefaultAmmoForGun(descriptor.gun))
                 if not shells or len(shells) % 2:
@@ -229,6 +338,9 @@ def _selected_vehicle(config):
             'optionalDeviceCount': artefact_counts['optionalDevice'],
             'equipmentCount': artefact_counts['equipment'],
         })
+        # Overlay the saved garage last, so it wins over the stock fitting but
+        # never over the current client's catalogue.
+        _restore_garage(result)
         return result
     except Exception:
         # _run_once owns startup error reporting.  Returning an empty snapshot
@@ -504,6 +616,7 @@ def _run_once():
             return
         _account_context = {
             'selected_vehicle': _selected_vehicle(_config),
+            'garage_store': _garage_store(),
             # Account settings are server-owned in #1513.  Keep their local
             # offline substitute beside config.json across client restarts.
             'account_state': AccountState(),
