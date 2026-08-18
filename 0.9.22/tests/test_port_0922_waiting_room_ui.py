@@ -348,6 +348,8 @@ class WaitingRoomTests(unittest.TestCase):
         body_z = self.room._pointer_parts[1][0].properties['position'][2]
         self.assertLess(outline_z, button_z)
         self.assertLess(body_z, outline_z)
+        # z=0 is the one depth the client refused to draw.
+        self.assertGreater(body_z, 0.0)
 
     def test_the_pointer_never_takes_mouse_focus(self):
         self.room.open()

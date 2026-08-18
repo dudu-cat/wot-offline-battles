@@ -41,6 +41,10 @@ import time
 PANEL_TEXTURE = ''
 PANEL_FONT = 'default_small.font'
 OVERLAY_Z = 0.1
+# Smaller z draws in front. The buttons render at CONTROL_Z and the pointer at
+# z=0 did not, so the pointer keeps the same 0.01 step inside that band.
+CONTROL_Z = 0.05
+CONTROL_FRAME_OFFSET = 0.01
 PANEL_WIDTH = 680
 PANEL_HEIGHT = 300
 POINTER_TICK_SECONDS = 0.03
@@ -250,11 +254,11 @@ class WaitingRoomUI(object):
         # GUI.Window can never accept it.  Setting it only logged a skip.
         self._set(panel, 'visible', False)
         self._panel = panel
-        self._make_control('previous', (-0.72, 0.05, 0.05), 0.20, 0.20)
-        self._make_control('map', (0.0, 0.05, 0.05), 1.15, 0.20)
-        self._make_control('next', (0.72, 0.05, 0.05), 0.20, 0.20)
-        self._make_control('start', (0.0, -0.40, 0.05), 1.20, 0.22)
-        self._make_control('close', (0.0, -0.78, 0.05), 0.50, 0.18)
+        self._make_control('previous', (-0.72, 0.05, CONTROL_Z), 0.20, 0.20)
+        self._make_control('map', (0.0, 0.05, CONTROL_Z), 1.15, 0.20)
+        self._make_control('next', (0.72, 0.05, CONTROL_Z), 0.20, 0.20)
+        self._make_control('start', (0.0, -0.40, CONTROL_Z), 1.20, 0.22)
+        self._make_control('close', (0.0, -0.78, CONTROL_Z), 0.50, 0.18)
         self._make_label('title', 'LAN WAITING ROOM', (-0.86, 0.82, 0.0), 1.72,
                          0.12, colour=(232, 244, 255, 255))
         self._make_label('room', '', (-0.86, 0.62, 0.0), 1.72, 0.11)
@@ -293,7 +297,8 @@ class WaitingRoomUI(object):
                 ('verticalPositionMode', 'CLIP'),
                 ('widthMode', 'CLIP'), ('heightMode', 'CLIP'),
                 ('horizontalAnchor', 'CENTER'), ('verticalAnchor', 'CENTER'),
-                ('position', (position[0], position[1], position[2] + 0.01)),
+                ('position', (position[0], position[1],
+                              position[2] + CONTROL_FRAME_OFFSET)),
                 ('width', width + 0.014), ('height', height + 0.030),
                 ('materialFX', 'SOLID'), ('colour', (120, 158, 186, 245)),
                 ('focus', False), ('mouseButtonFocus', False),
@@ -410,9 +415,10 @@ class WaitingRoomUI(object):
             return False
         step_x, step_y = self._panel_clip_step()
         parts = []
-        for colour, grow, depth in ((self.POINTER_SHADOW,
-                                     self.POINTER_BORDER, 0.005),
-                                    (self.POINTER_FILL, 0, 0.0)):
+        for colour, grow, depth in (
+                (self.POINTER_SHADOW, self.POINTER_BORDER,
+                 CONTROL_Z - CONTROL_FRAME_OFFSET),
+                (self.POINTER_FILL, 0, CONTROL_Z - 2 * CONTROL_FRAME_OFFSET)):
             part = self._surface.simple()
             for name, value in (
                     ('horizontalPositionMode', 'CLIP'),
@@ -464,10 +470,26 @@ class WaitingRoomUI(object):
     def _describe(self, component):
         if component is None:
             return 'missing'
-        pairs = ['texture=%r' % getattr(component, 'texture', None)]
+        pairs = ['parent=%s' % self._parent_of(component),
+                 'texture=%r' % getattr(component, 'texture', None)]
         for name in self._REPORTED_PROPERTIES:
             pairs.append('%s=%r' % (name, getattr(component, name, None)))
         return ' '.join(pairs)
+
+    def _parent_of(self, component):
+        """Report whether a component is a panel child or a GUI root."""
+        children = getattr(self._panel, 'children', None)
+        try:
+            values = list(children.values()) if hasattr(children, 'values') \
+                else list(children or ())
+        except Exception:
+            return 'unknown'
+        for value in values:
+            if value is component or (isinstance(value, tuple) and
+                                      len(value) == 2 and
+                                      value[1] is component):
+                return 'panel-child'
+        return 'root'
 
     def _report_pointer(self, x, y):
         """Log the pointer beside a button the player can definitely see."""

@@ -5142,6 +5142,46 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._apply_authority_bot_poses.assert_called_once_with((state,))
         battle._schedule.assert_called_once_with(0.0, battle._frame)
 
+    def test_collection_counts_report_every_round_lived_structure(self):
+        # The 32-bit client dies at its address-space ceiling, so a leak has
+        # to be visible as a count that grows across windows.
+        battle = BattleRuntime(_runtime())
+        battle._event_journal = [{'event_id': 'a'}, {'event_id': 'b'}]
+        battle._accepted_event_ids = set(['a', 'b', 'c'])
+        battle._applied_event_ids = set(['a'])
+        battle._records = {
+            'player:1': {'state': {'alive': True}},
+            'bot:2': {'state': {'alive': False}},
+        }
+        battle._destructibles = types.SimpleNamespace(
+            registry_counts=lambda: {'instances': 7, 'pending': 2})
+        battle._bots = types.SimpleNamespace(states={11: {}, 12: {}})
+
+        counts = battle._collection_counts()
+
+        self.assertEqual(2, counts['journal'])
+        self.assertEqual(3, counts['accepted_ids'])
+        self.assertEqual(1, counts['applied_ids'])
+        self.assertEqual(2, counts['records'])
+        self.assertEqual(1, counts['records_dead'])
+        self.assertEqual(7, counts['destr_instances'])
+        self.assertEqual(2, counts['bot_states'])
+
+    def test_offframe_callbacks_are_not_charged_to_engine_time(self):
+        diagnostics = _FrameDiagnostics(
+            writer=lambda text: None, clock=lambda: 0.0)
+        diagnostics.enabled = True
+        diagnostics._pending = {
+            'cause': 1, 'entry_wall': 0.0, 'exec': 0.010,
+            'tick_dt': 0.0, 'motion_dt': 0.0, 'stages': {}, 'probes': {},
+            'context': {},
+        }
+
+        diagnostics.begin(0.100, 0.100, 0.030)
+
+        self.assertAlmostEqual(0.030, diagnostics._offframe_sum)
+        self.assertAlmostEqual(0.060, diagnostics._outside_sum)
+
     def test_frame_diagnostics_pull_bot_probe_counts_and_durations(self):
         runtime = _runtime()
         runtime.bigworld.now = 1.0
@@ -10052,6 +10092,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         counts = {}
         for name, state in (('near', near), ('far', far)):
             bots = bot_runtime.BotRuntime.__new__(bot_runtime.BotRuntime)
+            bots._load_level = 0
             bots._probe_totals = [0, 0, 0, 0, 0]
             bots._probe_started = lambda: None
             bots._probe_finished = lambda index, started: None

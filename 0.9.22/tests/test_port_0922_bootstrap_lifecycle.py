@@ -155,11 +155,22 @@ class BootstrapLifecycleTests(unittest.TestCase):
             modifications={12004: types.SimpleNamespace(compactDescr=12004)},
             styles={12005: types.SimpleNamespace(compactDescr=12005)})
         optional_devices = dict(
-            (9000 + index, types.SimpleNamespace(compactDescr=9000 + index))
+            (9000 + index, types.SimpleNamespace(
+                compactDescr=9000 + index, tags=frozenset()))
             for index in range(4))
         equipments = dict(
-            (11000 + index, types.SimpleNamespace(compactDescr=11000 + index))
+            (11000 + index, types.SimpleNamespace(
+                compactDescr=11000 + index, tags=frozenset(),
+                equipmentType=0))
             for index in range(3))
+        # #1513 tags the artillery and airstrike consumables 'avatar' and
+        # gives every battle booster a non-regular equipmentType.
+        equipments[11100] = types.SimpleNamespace(
+            compactDescr=11100, tags=frozenset(('avatar', 'trigger')),
+            equipmentType=0)
+        equipments[11200] = types.SimpleNamespace(
+            compactDescr=11200, tags=frozenset(('notForSale',)),
+            equipmentType=1)
         crew_type_ids = []
         crew_skill_masks = []
         vehicles = types.SimpleNamespace(
@@ -202,6 +213,8 @@ class BootstrapLifecycleTests(unittest.TestCase):
             TankmanDescr=tankman_descr,
             generatedSkillMasks=crew_skill_masks)
         items = types.ModuleType('items')
+        items.EQUIPMENT_TYPES = types.SimpleNamespace(
+            regular=0, battleBoosters=1)
         items.ITEM_TYPE_INDICES = {
             'vehicle': 1, 'vehicleChassis': 2, 'vehicleTurret': 3,
             'vehicleGun': 4, 'vehicleEngine': 5,
@@ -268,7 +281,11 @@ class BootstrapLifecycleTests(unittest.TestCase):
         self.assertTrue(
             required_prices.issubset(selected['unlockItemCompactDescrs']))
         self.assertEqual(4, selected['optionalDeviceCount'])
+        # The avatar strike and the battle booster stay out of the catalogue.
         self.assertEqual(3, selected['equipmentCount'])
+        for compact_descr in (11100, 11200):
+            self.assertNotIn(compact_descr, selected['inventoryItems'][11])
+            self.assertNotIn(compact_descr, selected['shopItemPrices'])
         for compact_descr in (9000, 9003, 11000, 11002):
             self.assertEqual(
                 200,

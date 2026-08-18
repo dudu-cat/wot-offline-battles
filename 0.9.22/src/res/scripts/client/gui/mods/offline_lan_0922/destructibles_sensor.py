@@ -2645,3 +2645,17 @@ def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec,
 		spaceID, recast_start, end_pos, 128)
 	return ((second[0] - start_pos).length
 		if second is not None else 99999.0)
+
+
+def registry_counts():
+	"""Return the streamed registry sizes for the memory diagnostic."""
+	counts = {}
+	for name in ('g_offh_destr_seen', 'g_offh_destr_instances',
+			'g_offh_destr_contact_bins', 'g_offh_destr_pending',
+			'g_offh_destr_falling_active', 'g_offh_destr_chunks'):
+		value = globals().get(name)
+		try:
+			counts[name[13:]] = len(value)
+		except TypeError:
+			counts[name[13:]] = 0
+	return counts

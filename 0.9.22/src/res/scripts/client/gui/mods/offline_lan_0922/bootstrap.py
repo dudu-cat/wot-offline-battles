@@ -91,6 +91,21 @@ def _component_compact_descrs(value, seen):
     yield compact_descr
 
 
+def _offers_in_random_battle(descriptor):
+    """Return whether a standard random battle may carry this artefact.
+
+    #1513 tags the artillery and airstrike consumables ``avatar`` and drives
+    them through ``Avatar.activateAvatarEquipment``, which this port does not
+    implement.  Battle boosters carry a non-regular ``equipmentType`` and the
+    published garage has no slot for them.
+    """
+    from items import EQUIPMENT_TYPES
+    if 'avatar' in (getattr(descriptor, 'tags', None) or ()):
+        return False
+    equipment_type = getattr(descriptor, 'equipmentType', None)
+    return equipment_type in (None, EQUIPMENT_TYPES.regular)
+
+
 def _vehicle_type_modules(descriptor):
     """Yield ``(itemTypeName, compactDescr)`` for every module of one type."""
     vehicle_type = getattr(descriptor, 'type', None)
@@ -296,6 +311,8 @@ def _selected_vehicle(config):
                 try:
                     compact_descr = int(descriptor.compactDescr)
                 except (TypeError, ValueError, AttributeError):
+                    continue
+                if not _offers_in_random_battle(descriptor):
                     continue
                 published[compact_descr] = max(
                     int(published.get(compact_descr, 0)),

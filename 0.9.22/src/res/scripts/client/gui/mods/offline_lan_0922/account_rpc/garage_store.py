@@ -183,7 +183,6 @@ class GarageStore(object):
         owned = stored.get('owned')
         if isinstance(owned, dict):
             published = snapshot.setdefault('inventoryItems', {})
-            prices = snapshot.setdefault('shopItemPrices', {})
             for raw_type, items in owned.items():
                 try:
                     item_type = int(raw_type)
@@ -196,10 +195,12 @@ class GarageStore(object):
                     continue
                 target = published.setdefault(item_type, {})
                 for compact_descr, count in counts.items():
+                    # A saved file written before the current catalogue can
+                    # still name an item this client no longer offers.
+                    if compact_descr not in target:
+                        continue
                     target[compact_descr] = max(
-                        int(target.get(compact_descr, 0)), int(count))
-                    prices.setdefault(
-                        compact_descr, {'credits': 0, 'gold': 0})
+                        int(target[compact_descr]), int(count))
         if applied:
             _log('restored the saved garage for %d vehicle(s)' % applied)
         return True

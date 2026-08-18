@@ -7,14 +7,18 @@ validated ``data.inventory`` shaping code instead of a second wire format.
 
 Exact #1513 contracts used here, all from ``account_helpers/Inventory.pyc``:
 
-- ``CMD_EQUIP_EQS`` carries ``[vehInvID] + [int(e) for e in eqs]``;
+- ``CMD_EQUIP_EQS`` carries ``[vehInvID] + [int(e) for e in eqs]``, where
+  ``eqs`` is ``VehicleEquipment.getConsumablesIntCDs()``: three regular slots
+  followed by the battle-booster slot;
 - ``CMD_EQUIP_SHELLS`` carries ``[vehInvID] + [int(s) for s in shells]``;
 - ``CMD_EQUIP_OPTDEV`` carries
   ``[shopRev, vehInvID, deviceCompDescr, slotIdx, int(isPaidRemoval)]``;
 - ``CMD_SET_AND_FILL_LAYOUTS`` carries
   ``[shopRev, vehInvID, len(shellsLayout), *shellsLayout, equipmentType,
   len(eqsLayout), *eqsLayout]``, with a single ``0`` in place of a missing
-  layout;
+  layout.  Both layouts are flat ``(compactDescr, count)`` pairs read by
+  ``account_shared.LayoutIterator``, which takes ``abs(compactDescr)`` and
+  reads the sign as "buy for the alternative price";
 - ``CMD_TMAN_ADD_SKILL`` is a ``_doCmdInt3`` of ``(tmanInvID, skillIdx, 0)``.
 
 Optional devices and modules live inside the vehicle's own compact descriptor,
@@ -27,6 +31,10 @@ rebuild the descriptor from a stale copy and silently drop the other's change.
 import copy
 
 EQUIPMENT_SLOT_COUNT = 3
+# vehicles.NUM_EQUIPMENT_SLOTS in #1513: the three regular slots plus the
+# battle-booster slot that every equipment payload still carries.
+EQUIPMENT_PAYLOAD_SLOT_COUNT = 4
+EQUIPMENT_TYPE_REGULAR = 0
 OPTIONAL_DEVICE_ITEM_TYPE = 9
 SHELL_ITEM_TYPE = 10
 EQUIPMENT_ITEM_TYPE = 11
@@ -41,6 +49,18 @@ def _int(value):
         return int(value)
     except (TypeError, ValueError):
         raise GarageError('expected an integer, got %r' % (value,))
+
+
+def _layout_pairs(values, slot_limit=None):
+    """Decode a flat #1513 layout into ``(compactDescr, count)`` pairs."""
+    values = [_int(value) for value in (values or ())]
+    if len(values) % 2:
+        raise GarageError('a layout must contain descriptor/count pairs')
+    pairs = [(abs(values[index]), values[index + 1])
+             for index in range(0, len(values), 2)]
+    if slot_limit is not None and len(pairs) > slot_limit:
+        raise GarageError('a layout carries at most %d slots' % slot_limit)
+    return pairs
 
 
 class GarageState(object):
@@ -144,9 +164,12 @@ class GarageState(object):
     # ---- consumables ----------------------------------------------------
 
     def equip_equipments(self, vehicle_inventory_id, equipments):
+        """Mount the regular consumables of one equipment payload."""
         values = [_int(value) for value in (equipments or ())]
-        if len(values) > EQUIPMENT_SLOT_COUNT:
-            raise GarageError('a vehicle has three equipment slots')
+        if len(values) > EQUIPMENT_PAYLOAD_SLOT_COUNT:
+            raise GarageError('an equipment payload carries at most four slots')
+        # The trailing battle-booster slot has no published counterpart.
+        values = values[:EQUIPMENT_SLOT_COUNT]
         values += [0] * (EQUIPMENT_SLOT_COUNT - len(values))
         record = self._record(vehicle_inventory_id)
         record['eqs'] = values
@@ -157,23 +180,31 @@ class GarageState(object):
         return record
 
     def set_layouts(self, vehicle_inventory_id, shells_layout=None,
-                    equipment_type=0, equipments_layout=None):
+                    equipment_type=EQUIPMENT_TYPE_REGULAR,
+                    equipments_layout=None):
+        """Store one layout and load the vehicle to it.
+
+        Offline stock is unlimited, so the "fill" half of the request is the
+        mount itself: the client shows ``eqs`` and ``shells``, not the layout.
+        """
         record = self._record(vehicle_inventory_id)
         if shells_layout is not None:
-            values = [_int(value) for value in shells_layout]
-            if len(values) % 2:
-                raise GarageError('shell layout must be descriptor/count pairs')
-            layout = {}
-            for index in range(0, len(values), 2):
-                layout[values[index]] = values[index + 1]
-            record['shellsLayout'] = layout
-        if equipments_layout is not None:
-            values = [_int(value) for value in equipments_layout]
-            if len(values) > EQUIPMENT_SLOT_COUNT:
-                raise GarageError('a vehicle has three equipment slots')
-            values += [0] * (EQUIPMENT_SLOT_COUNT - len(values))
-            record['eqsLayout'] = values
-        record['equipmentType'] = _int(equipment_type)
+            pairs = _layout_pairs(shells_layout)
+            record['shellsLayout'] = dict(pairs)
+            flat = []
+            for compact_descr, count in pairs:
+                flat.extend((compact_descr, count))
+            self.equip_shells(vehicle_inventory_id, flat)
+        if (equipments_layout is not None and
+                _int(equipment_type) == EQUIPMENT_TYPE_REGULAR):
+            pairs = _layout_pairs(
+                equipments_layout, EQUIPMENT_PAYLOAD_SLOT_COUNT)
+            slots = [compact_descr
+                     for compact_descr, unused_count in pairs
+                     ][:EQUIPMENT_SLOT_COUNT]
+            record['eqsLayout'] = slots + [0] * (
+                EQUIPMENT_SLOT_COUNT - len(slots))
+            self.equip_equipments(vehicle_inventory_id, slots)
         self.revision += 1
         return record
 

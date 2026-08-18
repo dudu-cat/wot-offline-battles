@@ -85,6 +85,14 @@ DECISION_TIER_FACTOR = (1.0, 2.0, 4.0)
 # beats the frame budget.
 INTEGRATION_INTERVALS = (0.0, 0.0, 1.0 / 30.0)
 INTEGRATION_PHASE_BUCKETS = 7
+# Bot planning and integration are the largest per-second cost this port adds,
+# and a saturated frame makes the engine's own per-frame work grow faster than
+# ours shrinks.  A slow frame therefore raises every bot's detail tier instead
+# of letting the frame collapse, and releases the tier once it recovers.
+GOVERNOR_DEGRADE_SECONDS = 1.0 / 30.0
+GOVERNOR_RESTORE_SECONDS = 1.0 / 45.0
+GOVERNOR_SMOOTHING = 0.1
+GOVERNOR_MAX_LEVEL = len(INTEGRATION_INTERVALS) - 1
 # The #1513 production probe owns a 15 m low-speed / 20 m high-speed,
 # three-lane corridor.  A cached sample may only be reused while the hull stays
 # well inside the 2.2 m outer lanes.  The time bound also limits maximum copied
@@ -1039,10 +1047,44 @@ class BotRuntime(object):
         # enter a LAN payload or feed a scheduler/cache decision.
         self._probe_totals = [0, 0, 0, 0, 0]
         self._probe_duration_totals = [0.0, 0.0, 0.0, 0.0, 0.0]
+        self._frame_gap_average = 0.0
+        self._load_level = 0
+        self._decision_counts = {}
 
     def probe_totals(self):
         """Return logical native-query totals without resetting any state."""
         return tuple(self._probe_totals)
+
+    def load_report(self):
+        """Return the governor level, the smoothed gap and the busiest bots."""
+        busiest = sorted(self._decision_counts.items(),
+                         key=lambda item: -item[1])[:5]
+        self._decision_counts = {}
+        return {
+            'level': int(self._load_level),
+            'gap': float(self._frame_gap_average),
+            'busiest': tuple(busiest),
+        }
+
+    def observe_frame_gap(self, seconds):
+        """Raise or release the detail floor from the smoothed frame gap.
+
+        The battle runtime owns the measured render gap; without it the
+        governor stays at level 0 and every bot keeps its distance tier.
+        """
+        gap = max(0.0, min(_number(seconds), 0.2))
+        if self._frame_gap_average <= 0.0:
+            self._frame_gap_average = gap
+        else:
+            self._frame_gap_average += GOVERNOR_SMOOTHING * (
+                gap - self._frame_gap_average)
+        if (self._frame_gap_average > GOVERNOR_DEGRADE_SECONDS and
+                self._load_level < GOVERNOR_MAX_LEVEL):
+            self._load_level += 1
+        elif (self._frame_gap_average < GOVERNOR_RESTORE_SECONDS and
+                self._load_level > 0):
+            self._load_level -= 1
+        return self._load_level
 
     def probe_duration_totals(self):
         """Return measured query time without resetting or driving work."""
@@ -2517,18 +2559,23 @@ class BotRuntime(object):
         return banked
 
     def _detail_tier(self, state):
-        """Return 0 near the camera, 1 at medium range, 2 far away."""
+        """Return 0 near the camera, 1 at medium range, 2 far away.
+
+        The load governor raises this floor while the frame is slow.
+        """
         camera = self._camera_position
         if camera is None:
-            return 0
+            return self._load_level
         dx = _number(state.get('x')) - camera[0]
         dz = _number(state.get('z')) - camera[2]
         distance_sq = dx * dx + dz * dz
         if distance_sq <= DETAIL_NEAR_METRES * DETAIL_NEAR_METRES:
-            return 0
-        if distance_sq <= DETAIL_FAR_METRES * DETAIL_FAR_METRES:
-            return 1
-        return 2
+            tier = 0
+        elif distance_sq <= DETAIL_FAR_METRES * DETAIL_FAR_METRES:
+            tier = 1
+        else:
+            tier = 2
+        return max(tier, self._load_level)
 
     def _update_slope_pose(self, state):
         """Refresh the four-point hull pose after this tick's ground settle."""
@@ -4016,6 +4063,9 @@ class BotRuntime(object):
                     wait = getattr(driver, 'wait_for_traffic', None)
                     if callable(wait):
                         wait(state['id'])
+                bot_id = int(state['id'])
+                self._decision_counts[bot_id] = self._decision_counts.get(
+                    bot_id, 0) + 1
                 self._decision_cache[state['id']] = (
                     cache_key,
                     _cache_deadline(

@@ -20,7 +20,7 @@ from gui.mods.offline_lan_0922.entities.avatar_server import AvatarServerBridge
 from gui.mods.offline_lan_0922.entities.bigworld_binding import \
     BigWorldVehicleBinding
 from gui.mods.offline_lan_0922.entities.remote_vehicle import (
-    RemoteVehicleFactory, collide_vehicle_at_matrix)
+    RemoteVehicleFactory, collide_vehicle_at_matrix, pose_animation_writes)
 from gui.mods.offline_lan_0922.entities.runtime import EntityPropertyBuilder
 from gui.mods.offline_lan_0922.projectile_manager import InFlightProjectiles
 from gui.mods.offline_lan_0922.projectile_runtime import (
@@ -121,6 +121,11 @@ if not callable(_PROFILE_CLOCK):
     _PROFILE_CLOCK = time.clock
 
 
+def _underlying_function(value):
+    """Return a bound method's function so two bindings compare equal."""
+    return getattr(value, 'im_func', getattr(value, '__func__', value))
+
+
 _FRAME_STAGE_NAMES = (
     'house', 'sync', 'critical', 'drown', 'transition', 'local',
     'outline', 'bots_update', 'bot_present', 'bot_events', 'spot', 'lock',
@@ -158,6 +163,12 @@ class _FrameDiagnostics(object):
         self._exec_max = 0.0
         self._outside_sum = 0.0
         self._outside_max = 0.0
+        self._offframe_sum = 0.0
+        self._offframe_max = 0.0
+        self._load_level = 0
+        self._load_gap = 0.0
+        self._load_busiest = ()
+        self._collections = {}
         self._stage_sums = dict((name, 0.0)
                                 for name in _FRAME_STAGE_NAMES)
         self._stage_maxima = dict((name, 0.0)
@@ -187,8 +198,12 @@ class _FrameDiagnostics(object):
         self._pending = None
         self._slow = []
 
-    def begin(self, entry_wall, raw_dt):
-        """Seal the previous callback using this callback's entry interval."""
+    def begin(self, entry_wall, raw_dt, offframe=0.0):
+        """Seal the previous callback using this callback's entry interval.
+
+        ``offframe`` is the time this port's other scheduled callbacks spent
+        inside that gap, so ``outside`` isolates work this port does not run.
+        """
         self._frame_id += 1
         frame_id = self._frame_id
         if not self.enabled:
@@ -203,12 +218,14 @@ class _FrameDiagnostics(object):
                 observed_raw = float(raw_dt)
                 if observed_raw < 0.0:
                     self._clock_regressions += 1
+                off = max(0.0, float(offframe))
                 row = dict(pending)
                 row.update({
                     'next': frame_id,
                     'wall_gap': wall_gap,
                     'raw_dt': observed_raw,
-                    'outside': max(0.0, wall_gap - pending['exec']),
+                    'offframe': off,
+                    'outside': max(0.0, wall_gap - pending['exec'] - off),
                     'bw_minus_wall': observed_raw - wall_gap,
                 })
                 self._add(row)
@@ -232,6 +249,9 @@ class _FrameDiagnostics(object):
         self._exec_max = max(self._exec_max, execution)
         self._outside_sum += outside
         self._outside_max = max(self._outside_max, outside)
+        offframe = row.get('offframe', 0.0)
+        self._offframe_sum += offframe
+        self._offframe_max = max(self._offframe_max, offframe)
         if gap >= 0.050:
             self._over_50 += 1
         if gap >= 0.067:
@@ -278,6 +298,27 @@ class _FrameDiagnostics(object):
         if self._window_elapsed >= self._window_seconds:
             self._emit_due = True
 
+    def emit_due(self):
+        """Whether the next end() closes the window."""
+        return bool(self.enabled and self._emit_due and self._samples)
+
+    def note_collections(self, counts):
+        """Record the per-round collection sizes for this window."""
+        if not self.enabled or not isinstance(counts, dict):
+            return False
+        self._collections = dict(
+            (str(name), int(value)) for name, value in counts.items())
+        return True
+
+    def note_bot_load(self, report):
+        """Record the bot governor state and the busiest planners."""
+        if not self.enabled or not isinstance(report, dict):
+            return False
+        self._load_level = int(report.get('level', 0))
+        self._load_gap = float(report.get('gap', 0.0))
+        self._load_busiest = tuple(report.get('busiest') or ())
+        return True
+
     @staticmethod
     def _milliseconds(value):
         return max(0.0, float(value)) * 1000.0
@@ -293,8 +334,10 @@ class _FrameDiagnostics(object):
              'summary v=2 window=%d round=%s map=%s phase=%s '
              'samples=%d seconds=%.3f fps=%.2f authority_frames=%d '
              'gap_ms_avg_max=%.3f/%.3f raw_dt_ms_avg_max=%.3f/%.3f '
-             'exec_ms_avg_max=%.3f/%.3f outside_ms_avg_max=%.3f/%.3f '
-             'over_50_67_100=%d/%d/%d sim_caps=%d clock_regress=%d\n') % (
+             'exec_ms_avg_max=%.3f/%.3f offframe_ms_avg_max=%.3f/%.3f '
+             'outside_ms_avg_max=%.3f/%.3f '
+             'over_50_67_100=%d/%d/%d sim_caps=%d clock_regress=%d '
+             'bot_load=%d bot_gap_ms=%.1f\n') % (
                  self._window_id, context.get('round', '-'),
                  context.get('map', '-'), context.get('phase', '-'),
                  self._samples, self._window_elapsed,
@@ -305,11 +348,22 @@ class _FrameDiagnostics(object):
                  self._milliseconds(self._raw_max),
                  self._milliseconds(self._exec_sum / samples),
                  self._milliseconds(self._exec_max),
+                 self._milliseconds(self._offframe_sum / samples),
+                 self._milliseconds(self._offframe_max),
                  self._milliseconds(self._outside_sum / samples),
                  self._milliseconds(self._outside_max),
                  self._over_50, self._over_67, self._over_100,
-                 self._sim_caps, self._clock_regressions),
+                 self._sim_caps, self._clock_regressions,
+                 self._load_level, self._milliseconds(self._load_gap)),
         ]
+        lines.append(prefix + 'bot_planners ' + (
+            ' '.join('%d=%d' % (bot_id, count)
+                     for bot_id, count in self._load_busiest) or 'none') +
+            '\n')
+        lines.append(prefix + 'collections ' + (
+            ' '.join('%s=%d' % (name, self._collections[name])
+                     for name in sorted(self._collections)) or 'none') +
+            '\n')
         stage_values = []
         for name in _FRAME_STAGE_NAMES:
             stage_values.append('%s=%.3f/%.3f' % (
@@ -769,6 +823,7 @@ class BattleRuntime(object):
         self._equipment_signature = None
         self._local_loadout_cache = None
         self._garage_loadout = None
+        self._offframe_seconds = 0.0
         self._local_spotting_cache = None
         self._local_still_since = None
         self._battle_result = None
@@ -914,6 +969,7 @@ class BattleRuntime(object):
         self._equipment_signature = None
         self._local_loadout_cache = None
         self._garage_loadout = None
+        self._offframe_seconds = 0.0
         self._local_spotting_cache = None
         self._local_still_since = None
         self._battle_result = self._start_message.get('battle_result')
@@ -1430,6 +1486,8 @@ class BattleRuntime(object):
             self._ammo_callback_token = token
         else:
             self._callback_token = token
+        measured = _underlying_function(function) is not _underlying_function(
+            self._frame)
 
         def invoke():
             if ammo:
@@ -1440,8 +1498,16 @@ class BattleRuntime(object):
                 if self._callback_token is token:
                     self._callback_token = None
                     self._callback_id = None
-            if generation == self._generation:
+            if generation != self._generation:
+                return
+            if not measured:
                 function()
+                return
+            started = _PROFILE_CLOCK()
+            try:
+                function()
+            finally:
+                self._offframe_seconds += _PROFILE_CLOCK() - started
 
         try:
             callback_id = self._runtime.bigworld.callback(delay, invoke)
@@ -4056,6 +4122,44 @@ class BattleRuntime(object):
             raise RuntimeError(
                 'ordered LAN event kind is unsupported: %s' % kind)
 
+    def _collection_counts(self):
+        """Return the per-round collection sizes a leak would grow.
+
+        The client runs against a 32-bit address-space ceiling, so every
+        structure that lives for the whole round is reported once per window.
+        """
+        counts = {
+            'journal': len(self._event_journal),
+            'accepted_ids': len(self._accepted_event_ids),
+            'applied_ids': len(self._applied_event_ids),
+            'records': len(self._records),
+            'records_dead': sum(
+                1 for record in self._records.values()
+                if not (record.get('state') or {}).get('alive', True)),
+            'health': len(self._last_health),
+            'pending_bots': len(self._pending_bot_creates),
+            'grounded_bots': len(self._grounded_bot_ids),
+            'bot_assignments': len(self._bot_vehicle_assignments),
+            'bot_fire_seen': len(self._bot_fire_seen),
+            'bot_destr_samples': len(self._bot_destructible_samples),
+        }
+        try:
+            counts['projectiles'] = len(self._projectiles)
+        except (AttributeError, TypeError):
+            counts['projectiles'] = 0
+        registry_counts = getattr(
+            self._destructibles, 'registry_counts', None)
+        if callable(registry_counts):
+            for name, value in registry_counts().items():
+                counts['destr_' + name] = value
+        bot_states = getattr(self._bots, 'states', None)
+        try:
+            counts['bot_states'] = len(bot_states)
+        except TypeError:
+            counts['bot_states'] = 0
+        counts['pose_keyframes'] = pose_animation_writes()
+        return counts
+
     def _drain_event_journal(self):
         while self._event_journal:
             event = self._event_journal[0]
@@ -6151,7 +6255,12 @@ class BattleRuntime(object):
         # Direction probes may recast through proved soft OBBs, but those
         # native queries share one hard frame budget across all 29 Bots.
         self._soft_static_recast_budget[0] = BOT_SOFT_RECAST_BUDGET
-        frame_id = (diagnostics.begin(entry_wall, raw_dt)
+        offframe = self._offframe_seconds
+        self._offframe_seconds = 0.0
+        observe_gap = getattr(self._bots, 'observe_frame_gap', None)
+        if callable(observe_gap):
+            observe_gap(raw_dt)
+        frame_id = (diagnostics.begin(entry_wall, raw_dt, offframe)
                     if profiling else 0)
         stages = {}
         probes = dict((name, 0) for name in PROBE_KINDS)
@@ -6343,6 +6452,18 @@ class BattleRuntime(object):
                     authority = bool(is_authority())
                 except Exception:
                     authority = False
+            emit_due = getattr(diagnostics, 'emit_due', None)
+            if callable(emit_due) and emit_due():
+                load_report = getattr(self._bots, 'load_report', None)
+                if callable(load_report):
+                    try:
+                        diagnostics.note_bot_load(load_report())
+                    except Exception:
+                        pass
+                try:
+                    diagnostics.note_collections(self._collection_counts())
+                except Exception:
+                    pass
             diagnostics.finish(
                 frame_id, entry_wall, tick_dt, dt, stages, probes, {
                     'round': (self._start_message or {}).get('round_id', '-'),
@@ -9319,6 +9440,7 @@ class BattleRuntime(object):
         self._equipment_signature = None
         self._local_loadout_cache = None
         self._garage_loadout = None
+        self._offframe_seconds = 0.0
         self._local_spotting_cache = None
         self._local_still_since = None
         self._battle_result = None

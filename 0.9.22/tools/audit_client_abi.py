@@ -303,8 +303,20 @@ EXPECTED_ABI = {
     },
     'scripts/client/gui/shared/gui_items/vehicle_equipment.pyc': {
         'VehicleEquipment.regularConsumables': ('self',),
+        # Appends the battle-booster slot, so an equipment payload is four
+        # wide while the published garage holds three regular slots.
+        'VehicleEquipment.getConsumablesIntCDs': ('self', 'default'),
         '_VehicleConsumables.getIntCDs': ('self', 'default'),
         '_VehicleConsumables.getInstalledItems': ('self',),
+    },
+    'scripts/client/account_helpers/Inventory.pyc': {
+        'Inventory.equipEquipments': ('self', 'vehInvID', 'eqs', 'callback'),
+        'Inventory.setAndFillLayouts': (
+            'self', 'vehInvID', 'shellsLayout', 'eqsLayout', 'equipmentType',
+            'callback'),
+        'Inventory.__setAndFillLayouts_onShopSynced': (
+            'self', 'vehInvID', 'shellsLayout', 'equipmentType', 'eqsLayout',
+            'callback', 'resultID', 'shopRev'),
     },
     'scripts/client/gui/battle_control/controllers/consumables/'
     'ammo_ctrl.pyc': {
@@ -1500,6 +1512,8 @@ EXPECTED_GLOBALS = {
         'RES_SUCCESS': 0,
         'RES_STREAM': 1,
         'CMD_SYNC_DATA': 100,
+        'CMD_EQUIP_EQS': 104,
+        'CMD_SET_AND_FILL_LAYOUTS': 108,
         'CMD_SYNC_SHOP': 300,
         'CMD_REQ_SERVER_STATS': 501,
         'CMD_SYNC_DOSSIERS': 600,

@@ -15,6 +15,16 @@ import sys
 import weakref
 from collections import namedtuple
 
+# Every accepted pose rekeys a native MatrixAnimation with two fresh Matrix
+# objects.  This monotonic count lets a battle correlate address-space growth
+# with that path; it never feeds a decision.
+_pose_animation_writes = 0
+
+
+def pose_animation_writes():
+    """Return how many pose keyframe writes this process has made."""
+    return _pose_animation_writes
+
 from gui.mods.offline_lan_0922 import tank_collision
 
 try:
@@ -871,6 +881,8 @@ class RemoteVehicle(object):
         relax_time = float(relax_time)
         if not relax_time > 0.0:
             return False
+        global _pose_animation_writes
+        _pose_animation_writes += 1
         try:
             animation.keyframes = (
                 (0.0, self._math.Matrix(animation)),

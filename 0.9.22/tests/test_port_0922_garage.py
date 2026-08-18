@@ -172,9 +172,15 @@ class GarageStateTests(unittest.TestCase):
         self.assertEqual(
             1, self._record()['inventoryItems'][11][11001])
 
-    def test_mounting_a_fourth_consumable_is_refused(self):
+    def test_the_trailing_battle_booster_slot_is_accepted_and_dropped(self):
+        # VehicleEquipment.getConsumablesIntCDs appends the booster slot.
+        self.state.equip_equipments(9, [11001, 0, 0, 11002])
+
+        self.assertEqual([11001, 0, 0], self._record()['eqs'])
+
+    def test_mounting_a_fifth_consumable_is_refused(self):
         with self.assertRaises(self.garage.GarageError):
-            self.state.equip_equipments(9, [1, 2, 3, 4])
+            self.state.equip_equipments(9, [1, 2, 3, 4, 5])
 
     def test_shell_counts_keep_the_inventory_and_pair_list_in_step(self):
         self.state.equip_shells(9, [10010, 5, 10011, 40])
@@ -246,10 +252,39 @@ class GarageStateTests(unittest.TestCase):
             self.state.equip_equipments(4242, [11001])
 
     def test_layouts_decode_shell_pairs_and_equipment_slots(self):
-        self.state.set_layouts(9, [10010, 12], 0, [11001])
+        self.state.set_layouts(
+            9, [10010, 12], 0, [11001, 1, 0, 0, 0, 0, 0, 0])
 
         self.assertEqual({10010: 12}, self._record()['shellsLayout'])
         self.assertEqual([11001, 0, 0], self._record()['eqsLayout'])
+
+    def test_applying_a_layout_also_loads_the_vehicle(self):
+        self.state.set_layouts(
+            9, [10010, 12], 0, [11001, 1, 0, 0, 0, 0, 0, 0])
+
+        self.assertEqual([11001, 0, 0], self._record()['eqs'])
+        self.assertEqual([10010, 12], self._record()['shells'])
+        self.assertEqual({10010: 12}, self._record()['inventoryItems'][10])
+
+    def test_an_alternative_price_descriptor_is_stored_unsigned(self):
+        # account_shared.LayoutIterator reads a negative descriptor as
+        # "buy for the alternative price" and takes its absolute value.
+        self.state.set_layouts(
+            9, [-10010, 12], 0, [-11001, 1, 0, 0, 0, 0, 0, 0])
+
+        self.assertEqual({10010: 12}, self._record()['shellsLayout'])
+        self.assertEqual([11001, 0, 0], self._record()['eqs'])
+
+    def test_a_battle_booster_layout_leaves_the_regular_slots_alone(self):
+        self.state.equip_equipments(9, [11001, 0, 0])
+
+        self.state.set_layouts(9, None, 1, [0, 0, 0, 0, 0, 0, 11002, 1])
+
+        self.assertEqual([11001, 0, 0], self._record()['eqs'])
+
+    def test_an_odd_equipment_layout_is_refused(self):
+        with self.assertRaises(self.garage.GarageError):
+            self.state.set_layouts(9, None, 0, [11001, 1, 0])
 
 
 class FittingRequestTests(unittest.TestCase):
@@ -305,7 +340,10 @@ class FittingRequestTests(unittest.TestCase):
             self.state.snapshot()['vehicles'][0]['tankmen'][101])
 
     def test_set_and_fill_layouts_decodes_both_counted_blocks(self):
-        payload = [77, 9, 2, 10010, 12, 0, 3, 11001, 0, 0]
+        # The exact payload TechnicalMaintenance sends when the player picks
+        # one consumable: eight equipment values, four descriptor/count pairs.
+        payload = [77, 9, 2, 10010, 12, 0,
+                   8, 11001, 1, 0, 0, 0, 0, 0, 0]
 
         result = self._dispatch(
             self.commands.CMD_SET_AND_FILL_LAYOUTS, (payload,))
@@ -314,20 +352,60 @@ class FittingRequestTests(unittest.TestCase):
         record = self.state.snapshot()['vehicles'][0]
         self.assertEqual({10010: 12}, record['shellsLayout'])
         self.assertEqual([11001, 0, 0], record['eqsLayout'])
+        self.assertEqual([11001, 0, 0], record['eqs'])
+
+    def test_mounting_a_consumable_from_the_ammunition_window_succeeds(self):
+        payload = [77, 9, 4, 10010, 20, 10011, 10, 0,
+                   8, 11001, 1, 0, 0, 0, 0, 0, 0]
+
+        result = self._dispatch(
+            self.commands.CMD_SET_AND_FILL_LAYOUTS, (payload,))
+        result.before_response()
+
+        self.assertEqual(self.commands.RES_SUCCESS, result.result_id)
+        self.assertEqual(
+            [11001, 0, 0], self.pushed[0]['inventory'][1]['eqs'][9])
+
+    def test_equip_eqs_accepts_the_battle_booster_slot(self):
+        result = self._dispatch(
+            self.commands.CMD_EQUIP_EQS, ([9, 11001, 0, 0, 0],))
+
+        self.assertEqual(self.commands.RES_SUCCESS, result.result_id)
 
     def test_a_refused_fitting_returns_failure_and_pushes_nothing(self):
-        result = self._dispatch(
-            self.commands.CMD_EQUIP_EQS, ([4242, 11001],))
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = self._dispatch(
+                self.commands.CMD_EQUIP_EQS, ([4242, 11001],))
 
         self.assertEqual(self.commands.RES_FAILURE, result.result_id)
         self.assertEqual([], self.pushed)
+
+    def test_a_refused_fitting_names_the_command_handler_and_shape(self):
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            self._dispatch(self.commands.CMD_EQUIP_EQS, ([4242, 11001],))
+
+        line = log.getvalue()
+        self.assertIn('command 104', line)
+        self.assertIn('_equip_equipments', line)
+        self.assertIn('unknown vehicle inventory id', line)
+        self.assertIn('list[2]', line)
+        self.assertNotIn('4242', line.split('payload')[1])
+
+    def test_an_unsupported_command_is_logged_once(self):
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            result = self._dispatch(999999, ())
+
+        self.assertEqual(self.commands.RES_FAILURE, result.result_id)
+        self.assertIn('command 999999', log.getvalue())
+        self.assertIn('UNSUPPORTED_OFFLINE_COMMAND', log.getvalue())
 
     def test_a_malformed_payload_never_reaches_the_garage(self):
         for command in (self.commands.CMD_EQUIP_EQS,
                         self.commands.CMD_EQUIP_SHELLS,
                         self.commands.CMD_EQUIP_OPTDEV,
                         self.commands.CMD_SET_AND_FILL_LAYOUTS):
-            result = self._dispatch(command, ([],))
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = self._dispatch(command, ([],))
             self.assertEqual(
                 self.commands.RES_FAILURE, result.result_id, command)
         self.assertEqual([], self.pushed)
@@ -372,7 +450,8 @@ class GaragePersistenceTests(unittest.TestCase):
         state.equip_optional_device(9, 9002, 1)
         state.equip_equipments(9, [11001, 0, 0])
         state.equip_shells(9, [10010, 38, 10011, 9])
-        state.set_layouts(9, [10010, 38], 0, [11001])
+        state.set_layouts(
+            9, [10010, 38, 10011, 9], 0, [11001, 1, 0, 0, 0, 0, 0, 0])
         state.add_tankman_skill(101, 2)
         state.change_vehicle_setting(9, 3, 1)
         store = self._store()
@@ -385,7 +464,7 @@ class GaragePersistenceTests(unittest.TestCase):
                          restored['compDescr'])
         self.assertEqual([11001, 0, 0], restored['eqs'])
         self.assertEqual([10010, 38, 10011, 9], restored['shells'])
-        self.assertEqual({10010: 38}, restored['shellsLayout'])
+        self.assertEqual({10010: 38, 10011: 9}, restored['shellsLayout'])
         self.assertEqual([11001, 0, 0], restored['eqsLayout'])
         self.assertEqual(8, restored['settings'])
         self.assertEqual(b'tman:101|brotherhood', restored['tankmen'][101])
@@ -404,6 +483,21 @@ class GaragePersistenceTests(unittest.TestCase):
         restored = self._restart()
 
         self.assertGreaterEqual(restored['inventoryItems'][9][9002], 3)
+
+    def test_an_item_the_catalogue_no_longer_offers_is_not_restored(self):
+        state = self._state()
+        state.buy_item(9002, 3)
+        store = self._store()
+        store.mark_dirty()
+        store.flush(state.snapshot())
+
+        fresh = copy.deepcopy(SNAPSHOT)
+        del fresh['inventoryItems'][9][9002]
+        del fresh['shopItemPrices'][9002]
+        self._store().apply(fresh)
+
+        self.assertNotIn(9002, fresh['inventoryItems'][9])
+        self.assertNotIn(9002, fresh['shopItemPrices'])
 
     def test_a_reload_is_keyed_on_the_vehicle_type_not_the_inventory_id(self):
         state = self._state()

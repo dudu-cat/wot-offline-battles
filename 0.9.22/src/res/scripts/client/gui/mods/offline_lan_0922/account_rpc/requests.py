@@ -2,6 +2,7 @@
 
 from __future__ import print_function
 
+import sys
 import traceback
 
 from gui.mods.offline_lan_0922.account_rpc import commands
@@ -59,6 +60,7 @@ def _fitting(context, mutate):
 
 
 def _equip_equipments(context, args):
+    # [vehInvID, *getConsumablesIntCDs()]: three regular slots then the booster
     values = list(args[0] if args else ())
     if not values:
         return Result(commands.RES_FAILURE, 'INVALID_EQUIPMENT_REQUEST')
@@ -94,7 +96,8 @@ def _equip_component(context, args):
 
 
 def _set_and_fill_layouts(context, args):
-    # [shopRev, vehInvID, len(shells), *shells, eqType, len(eqs), *eqs]
+    # [shopRev, vehInvID, len(shells), *shells, eqType, len(eqs), *eqs], where
+    # both blocks are flat descriptor/count pairs and eqs covers four slots.
     values = list(args[0] if args else ())
     if len(values) < 4:
         return Result(commands.RES_FAILURE, 'INVALID_LAYOUT_REQUEST')
@@ -284,8 +287,34 @@ HANDLERS = {
 }
 
 
+def _payload_shape(args):
+    """Describe the argument shape without dumping its contents."""
+    parts = []
+    for value in args:
+        if isinstance(value, (list, tuple)):
+            parts.append('%s[%d]' % (type(value).__name__, len(value)))
+        else:
+            parts.append(type(value).__name__)
+    return '(%s)' % ', '.join(parts)
+
+
+def _log_rejection(command, handler, message, args):
+    sys.stdout.write(
+        '[Offline LAN 0.9.22] command %d rejected by %s: %s; payload %s\n'
+        % (command, handler, message or 'no reason given',
+           _payload_shape(args)))
+
+
 def dispatch(command, context, args):
-    handler = HANDLERS.get(int(command))
+    command = int(command)
+    args = tuple(args or ())
+    handler = HANDLERS.get(command)
     if handler is None:
+        _log_rejection(command, 'dispatch', 'UNSUPPORTED_OFFLINE_COMMAND', args)
         return Result(commands.RES_FAILURE, 'UNSUPPORTED_OFFLINE_COMMAND')
-    return handler(context, tuple(args or ()))
+    result = handler(context, args)
+    if result.result_id == commands.RES_FAILURE:
+        _log_rejection(
+            command, getattr(handler, '__name__', repr(handler)),
+            result.error, args)
+    return result
