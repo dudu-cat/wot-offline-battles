@@ -689,6 +689,10 @@ class RemoteVehicle(object):
         self._gun_recoil = None
         self._collision_obstacle = None
         self._animation = None
+        self.track_filter = None
+        self.track_scroll = None
+        self.fashions = None
+        self._track_mode = None
         self._offlineLANShotIndex = int(
             getattr(descriptor, 'activeGunShotIndex', 0) or 0)
         # Stock BigWorld.entity()/entities are presentation/AOI lookups. The
@@ -741,6 +745,48 @@ class RemoteVehicle(object):
         self.isStarted = True
         self.inWorld = True
 
+    def attach_track_animation(self, vehicle_filter, scroll, fashions):
+        """Adopt the native belt animation assembled for this bot."""
+        self.track_filter = vehicle_filter
+        self.track_scroll = scroll
+        self.fashions = fashions
+        self._track_mode = None
+        return True
+
+    def update_tracks(self, left, right, mode):
+        """Feed one frame of belt speed through PyTrackScroll.
+
+        The native tick pins both belts to zero while ``mode[0]`` is at most 1.
+        """
+        scroll = self.track_scroll
+        if scroll is None:
+            return False
+        if mode != self._track_mode:
+            scroll.setMode(mode)
+            self._track_mode = mode
+        scroll.setExternal(float(left), float(right))
+        return True
+
+    def track_scroll_readback(self):
+        """Return the native scroll state, or None without a controller."""
+        scroll = self.track_scroll
+        if scroll is None:
+            return None
+        return tuple(getattr(scroll, name, None) for name in (
+            'leftScroll', 'rightScroll', 'leftContact', 'rightContact'))
+
+    def _release_track_animation(self):
+        scroll = self.track_scroll
+        self.track_scroll = None
+        self.track_filter = None
+        self.fashions = None
+        self._track_mode = None
+        if scroll is None:
+            return False
+        scroll.deactivate()
+        scroll.setData(None)
+        return True
+
     def attach_wreck_model(self, model):
         """Swap this vehicle onto its loaded #1513 destroyed compound."""
         self._stop_shooting_effect()
@@ -761,6 +807,7 @@ class RemoteVehicle(object):
 
     def detach_visual(self):
         self._stop_shooting_effect()
+        self._release_track_animation()
         self._collision_obstacle = None
         self.isStarted = False
         self.inWorld = False
@@ -1047,10 +1094,13 @@ class _EntitiesView(object):
 class RemoteVehicleFactory(object):
     """Load, register and destroy authoritative remote presentations."""
 
-    def __init__(self, bigworld, math_module, model_assembler, space_id):
+    def __init__(self, bigworld, math_module, model_assembler, space_id,
+                 camouflages=None):
         self._bigworld = bigworld
         self._math = math_module
         self._model_assembler = model_assembler
+        self._camouflages = camouflages
+        self.track_animation_error = None
         self._space_id = int(space_id)
         self._vehicles = {}
         self._next_id = 1000
@@ -1157,6 +1207,35 @@ class RemoteVehicleFactory(object):
             vehicle.load_error = error
         return entity_id
 
+    def _assemble_track_animation(self, vehicle, descriptor, model):
+        """Build the native belt animation retail assembles for a remote tank.
+
+        PyTrackScroll writes the filter's belt-speed override and the chassis
+        fashion reads the filter's movementInfo, so the belts turn from the
+        speeds we feed rather than from an engine-delivered motion sample.
+        This is presentation only: a bot without it looks exactly as before.
+        """
+        camouflages = self._camouflages
+        if camouflages is None:
+            return False
+        try:
+            fashions = camouflages.prepareFashions(False)
+            self._model_assembler.setupVehicleFashion(
+                fashions[0], descriptor, False)
+            model.setupFashions(fashions)
+            vehicle_filter = self._model_assembler.createVehicleFilter(
+                descriptor)
+            scroll = self._bigworld.PyTrackScroll()
+            scroll.activate()
+            scroll.setData(vehicle_filter)
+            fashions[0].movementInfo = vehicle_filter.movementInfo
+        except Exception as error:
+            if self.track_animation_error is None:
+                self.track_animation_error = error
+            return False
+        return vehicle.attach_track_animation(
+            vehicle_filter, scroll, fashions)
+
     @staticmethod
     def _resource(resources, name):
         if name in getattr(resources, 'failedIDs', ()):
@@ -1187,6 +1266,7 @@ class RemoteVehicleFactory(object):
                 visual = self._original_entity(visual_id)
             if visual is None:
                 raise RuntimeError('OfflineEntity did not enter the space')
+            self._assemble_track_animation(vehicle, descriptor, model)
             visual.model = model
             vehicle.attach_visual(visual, visual_id, model)
         except Exception as error:

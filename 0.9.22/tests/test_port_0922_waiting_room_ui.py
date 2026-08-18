@@ -110,11 +110,15 @@ class WaitingRoomTests(unittest.TestCase):
     def _visible(self, role):
         return self.room._controls[role].properties['visible']
 
+    def _root_count(self):
+        """The panel plus the drawn arrow's shadow and fill rows."""
+        return 1 + 2 * self.module.WaitingRoomUI.POINTER_ROWS
+
     def test_the_room_only_uses_properties_this_client_has(self):
         self.room.install()
         self.assertTrue(self.room.open())
-        self.assertEqual(1, len(self.surface.roots))
-        self.assertEqual(1, self.surface.resorts)
+        self.assertEqual(self._root_count(), len(self.surface.roots))
+        self.assertEqual(2, self.surface.resorts)
 
     def test_the_panel_draws_untextured_flat_colour(self):
         self.room.install()
@@ -157,10 +161,10 @@ class WaitingRoomTests(unittest.TestCase):
         self.assertTrue(room.open())
         self.assertEqual(1, surface.shown)
         self.assertTrue(room._cursor_acquired)
-        # Only the room's own panel is a GUI root; the cursor is native.
-        self.assertEqual(1, len(surface.roots))
+        self.assertEqual(self._root_count(), len(surface.roots))
 
         room.close()
+        self.assertEqual([], surface.roots)
         self.assertEqual(1, surface.hidden)
         self.assertFalse(room._cursor_acquired)
         self.assertFalse(surface.active)
@@ -199,7 +203,7 @@ class WaitingRoomTests(unittest.TestCase):
     def test_cursor_is_skipped_on_a_surface_without_cursor_calls(self):
         self.room.open()
         self.assertFalse(self.room._cursor_acquired)
-        self.assertEqual(1, len(self.surface.roots))
+        self.assertEqual(self._root_count(), len(self.surface.roots))
         self.room.close()
 
     def test_the_room_handles_mouse_move_so_the_pointer_tracks(self):
@@ -255,9 +259,16 @@ class WaitingRoomTests(unittest.TestCase):
         self.assertTrue(room.open())
 
         self.assertTrue(room._pointer_rows)
-        tip = room._pointer_rows[0][0].properties
+        tip_row = room._pointer_rows[0][0]
+        tip = tip_row.properties
         self.assertTrue(tip['visible'])
         self.assertAlmostEqual(0.002, tip['position'][0])
+        # The arrow is its own root: a child reads its position as an offset
+        # from the panel, not as a screen coordinate.
+        self.assertIn(tip_row, surface.roots)
+        self.assertNotIn(tip_row, room._panel.children)
+        self.assertAlmostEqual(2 * 0.002, tip['width'])
+        self.assertAlmostEqual(2 / 500.0, tip['height'])
 
         surface.cursor = (-0.5, 0.25)
         room.move_pointer()
@@ -268,7 +279,71 @@ class WaitingRoomTests(unittest.TestCase):
         self.assertAlmostEqual(0.25 - 0.004, moved['position'][1])
 
         room.close()
-        self.assertFalse(room._pointer_rows[0][0].properties['visible'])
+        self.assertEqual([], room._pointer_rows)
+        self.assertNotIn(tip_row, surface.roots)
+
+    def test_the_pointer_follows_without_any_mouse_event(self):
+        """The room owns a callback tick, so the arrow moves even when the
+        engine delivers no move event to the panel."""
+        class _TickSurface(_Surface):
+            def __init__(self):
+                _Surface.__init__(self)
+                self.cursor = (0.0, 0.0)
+                self.ticks = []
+                self.cancelled = []
+
+            def screen_size(self):
+                return (1000.0, 500.0)
+
+            def cursor_position(self):
+                return self.cursor
+
+            def show_cursor(self):
+                return True
+
+            def hide_cursor(self):
+                return True
+
+            def tick(self, delay, function):
+                self.ticks.append((delay, function))
+                return len(self.ticks)
+
+            def cancel_tick(self, handle):
+                self.cancelled.append(handle)
+
+        surface = _TickSurface()
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True, surface=surface)
+        room.open()
+
+        self.assertEqual(1, len(surface.ticks))
+        self.assertEqual(self.module.POINTER_TICK_SECONDS,
+                         surface.ticks[0][0])
+
+        surface.cursor = (0.4, -0.6)
+        surface.ticks[-1][1]()
+
+        tip = room._pointer_rows[0][0].properties
+        self.assertAlmostEqual(0.4 + 0.002, tip['position'][0])
+        self.assertAlmostEqual(-0.6 - 0.004, tip['position'][1])
+        # The tick reschedules itself for as long as the room is open.
+        self.assertEqual(2, len(surface.ticks))
+
+        room.close()
+        self.assertEqual([2], surface.cancelled)
+        surface.ticks[-1][1]()
+        self.assertEqual(2, len(surface.ticks))
+
+    def test_the_pointer_draws_in_front_of_the_room_panel(self):
+        self.assertLess(self.module.POINTER_Z, self.module.OVERLAY_Z)
+        self.room.open()
+        self.room._surface.screen_size = lambda: (1000.0, 500.0)
+        self.room._surface.cursor_position = lambda: (0.0, 0.0)
+        self.room.move_pointer()
+        panel_z = self.room._panel.properties['position'][2]
+        row_z = self.room._pointer_rows[0][0].properties['position'][2]
+        self.assertLess(row_z, panel_z)
 
     def test_the_pointer_never_takes_mouse_focus(self):
         self.room.open()
@@ -360,7 +435,7 @@ class WaitingRoomTests(unittest.TestCase):
         self.room.open()
         self.room.close()
         self.assertTrue(self.room.open())
-        self.assertEqual(1, len(self.surface.roots))
+        self.assertEqual(self._root_count(), len(self.surface.roots))
 
     def test_hover_repaints_only_while_the_room_is_open(self):
         self.assertFalse(self.room.hover('start'))

@@ -78,6 +78,8 @@ _COMBAT_EVENT_KINDS = (
 _SHOT_OCCLUSION_EPSILON = 1.0e-3
 # physics_shared.TRACK_SCROLL_LIMITS: the exact #1513 belt-speed wire range.
 TRACK_SCROLL_LIMITS = (-15.0, 30.0)
+# Seconds between two bot-track diagnostic lines.
+TRACK_REPORT_SECONDS = 5.0
 # PyTrackScroll zeroes both belts while engineMode[0] is at most 1.
 ENGINE_MODE_OFF = 0
 ENGINE_MODE_IDLE = 1
@@ -523,10 +525,12 @@ def _load_runtime():
     from gun_rotation_shared import encodeGunAngles
     from gui.app_loader import g_appLoader
     from gui.app_loader.settings import GUI_GLOBAL_SPACE_ID
+    from gui.battle_control.battle_constants import FEEDBACK_EVENT_ID
     from gui.battle_control.battle_constants import VEHICLE_VIEW_STATE
     from gui.mods.offline_lan_0922.compat import g_compatibility
     from gui.shared.utils import HangarSpace
     from items import vehicles
+    from vehicle_systems import camouflages
     from vehicle_systems import model_assembler
 
     class Runtime(object):
@@ -558,6 +562,7 @@ def _load_runtime():
     runtime.nations = nations
     runtime.offline_map_creator = g_offlineMapCreator
     runtime.vehicles = vehicles
+    runtime.feedback_event_id = FEEDBACK_EVENT_ID
     runtime.vehicle_view_state = VEHICLE_VIEW_STATE
     return runtime
 
@@ -720,6 +725,8 @@ class BattleRuntime(object):
         self._bot_fire_seen = {}
         self._bot_destructible_samples = {}
         self._bot_pose_times = {}
+        self._bot_yaw_rates = {}
+        self._track_report_time = None
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
         self._local_push_x = 0.0
@@ -863,6 +870,8 @@ class BattleRuntime(object):
         self._bot_fire_seen = {}
         self._bot_destructible_samples = {}
         self._bot_pose_times = {}
+        self._bot_yaw_rates = {}
+        self._track_report_time = None
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
         self._local_push_x = 0.0
@@ -1459,7 +1468,8 @@ class BattleRuntime(object):
                 authority_entity_resolver=self._server_entity)
             self._remote_factory = RemoteVehicleFactory(
                 self._runtime.bigworld, self._runtime.math,
-                self._runtime.model_assembler, self._avatar.spaceID)
+                self._runtime.model_assembler, self._avatar.spaceID,
+                camouflages=getattr(self._runtime, 'camouflages', None))
             self._remote_factory.prepare_descriptor(descriptor)
             builder = EntityPropertyBuilder(
                 BigWorldVehicleBinding.PROPERTY_NAMES)
@@ -7344,11 +7354,17 @@ class BattleRuntime(object):
         rate the bot's distance tier chose.
         """
         key = state.get('id')
+        yaw = _number(state.get('yaw'))
         previous = self._bot_pose_times.get(key)
-        self._bot_pose_times[key] = now
+        self._bot_pose_times[key] = (now, yaw)
         if previous is None:
+            self._bot_yaw_rates[key] = 0.0
             return None
-        return max(FRAME_SECONDS, min(0.5, float(now) - float(previous)))
+        elapsed = max(FRAME_SECONDS, min(0.5, float(now) - float(previous[0])))
+        turned = (yaw - float(previous[1]) + math.pi) % (
+            2.0 * math.pi) - math.pi
+        self._bot_yaw_rates[key] = turned / elapsed
+        return elapsed
 
     def _apply_authority_bot_poses(self, states):
         """Present copied 0.8.2 bot poses through the remote filter."""
@@ -7385,8 +7401,59 @@ class BattleRuntime(object):
                 record['engine_id'], yaw,
                 _number(state.get('aim_yaw', yaw)),
                 _number(state.get('gun_pitch')))
+            self._update_bot_tracks(record, state, now)
             applied = True
         return applied
+
+    def _bot_track_params(self, record, entity):
+        params = record.get('track_params')
+        if params is None:
+            params = vehicle_physics.derive_params(entity.typeDescriptor)
+            record['track_params'] = params
+        return params
+
+    def _update_bot_tracks(self, record, state, now):
+        """Drive one bot's belts from its authority speed and turn rate."""
+        if self._remote_factory is None:
+            return False
+        vehicle = self._remote_factory.get(record['engine_id'])
+        if vehicle is None or getattr(vehicle, 'track_scroll', None) is None:
+            return False
+        alive = bool(state.get('alive', True)) and int(
+            state.get('health', 1) or 0) > 0
+        speed = _number(state.get('speed'))
+        if not alive:
+            mode = (ENGINE_MODE_OFF, 0)
+        elif abs(speed) > 0.05:
+            mode = (ENGINE_MODE_RUNNING, 1 if speed > 0.0 else 2)
+        else:
+            mode = (ENGINE_MODE_IDLE, 0)
+        left, right = vehicle_physics.track_scroll(
+            self._bot_track_params(record, vehicle), speed,
+            _number(self._bot_yaw_rates.get(state.get('id'))))
+        minimum, maximum = TRACK_SCROLL_LIMITS
+        vehicle.update_tracks(max(minimum, min(maximum, left)),
+                              max(minimum, min(maximum, right)), mode)
+        self._report_bot_tracks(vehicle, left, right, mode, now)
+        return True
+
+    def _report_bot_tracks(self, vehicle, left, right, mode, now):
+        """Log the native scroll readback so one battle decides this design.
+
+        If we feed non-zero belt speeds and ``leftScroll``/``rightScroll`` stay
+        put, the filter does not integrate for a client-only entity.
+        """
+        if self._track_report_time is not None and (
+                now - self._track_report_time) < TRACK_REPORT_SECONDS:
+            return False
+        self._track_report_time = now
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] bot tracks id=%s mode=%r fed=(%.3f, %.3f) '
+            'scroll=%r error=%r\n' % (
+                vehicle.bw_entity_id, mode, left, right,
+                vehicle.track_scroll_readback(),
+                self._remote_factory.track_animation_error))
+        return True
 
     def _bot_visibility(self, source, target, fired_recently=False):
         source_position = _xyz(source)
@@ -7993,6 +8060,8 @@ class BattleRuntime(object):
                 not record.get('visual_started')):
             self._binding.start_vehicle_visual(record['engine_id'], True)
             record['visual_started'] = True
+            if not self._record_alive(record, vehicle):
+                self._present_vehicle_dead(record, True)
         if record.get('presentation'):
             self._set_record_spot_visibility(
                 record, record.get('spot_visible', True))
@@ -8097,6 +8166,8 @@ class BattleRuntime(object):
         if visible and not record.get('visual_started'):
             self._binding.start_vehicle_visual(record['engine_id'], True)
             record['visual_started'] = True
+            if not self._record_alive(record, vehicle):
+                self._present_vehicle_dead(record, True)
         elif not visible and record.get('visual_started'):
             self._stop_remote_visual(record)
         return visible
@@ -8390,8 +8461,10 @@ class BattleRuntime(object):
                 if seen:
                     record['spot_until'] = (
                         now + spotting.SPOT_MEMORY_SECONDS)
-            visible = (alive and
-                       now < float(record.get('spot_until', 0.0)))
+            # A destroyed vehicle stops earning new spots but keeps the memory
+            # it already has, so its marker survives long enough to show the
+            # destroyed style instead of vanishing the frame it dies.
+            visible = now < float(record.get('spot_until', 0.0))
             previous_visible = bool(record.get('spot_visible', False))
             if visible != previous_visible:
                 changed = True
@@ -8399,6 +8472,26 @@ class BattleRuntime(object):
             if visible and not previous_visible and direct_seen:
                 self._present_direct_spot(record)
         return changed
+
+    def _present_vehicle_dead(self, record, immediate):
+        """Mirror ``Vehicle.__onVehicleDeath`` so the marker takes its dead
+        style.  ``immediate`` is False for a vehicle that just died and True
+        for one that was already dead when its visual started."""
+        if record.get('local') or not record.get('presentation'):
+            return False
+        provider = getattr(self._avatar, 'guiSessionProvider', None)
+        shared = getattr(provider, 'shared', None)
+        feedback = getattr(shared, 'feedback', None)
+        if feedback is None:
+            return False
+        set_state = getattr(feedback, 'setVehicleState', None)
+        if not callable(set_state):
+            raise RuntimeError(
+                '#1513 vehicle-marker death boundary is unavailable')
+        set_state(int(record['engine_id']),
+                  self._runtime.feedback_event_id.VEHICLE_DEAD,
+                  bool(immediate))
+        return True
 
     def _stop_remote_visual(self, record):
         if not record.get('visual_started'):
@@ -8497,6 +8590,12 @@ class BattleRuntime(object):
             crew_notifier = getattr(entity, 'set_isCrewActive', None)
             if callable(crew_notifier):
                 crew_notifier(previous_crew_active)
+        # Vehicle.onHealthChanged and Vehicle.set_isCrewActive both reach
+        # __onVehicleDeath from the synced entity properties, after the health
+        # presentation.
+        entity_alive = getattr(entity, 'isAlive', None)
+        if not (entity_alive() if callable(entity_alive) else entity_alive):
+            self._present_vehicle_dead(record, False)
         if record.get('local'):
             if health <= 0:
                 self._local_speed = 0.0
@@ -9142,6 +9241,8 @@ class BattleRuntime(object):
         self._bot_fire_seen = {}
         self._bot_destructible_samples = {}
         self._bot_pose_times = {}
+        self._bot_yaw_rates = {}
+        self._track_report_time = None
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
         self._local_push_x = 0.0

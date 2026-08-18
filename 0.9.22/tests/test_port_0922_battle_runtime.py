@@ -15,7 +15,8 @@ CLIENT_SCRIPTS = ROOT / '0.9.22' / 'src' / 'res' / 'scripts' / 'client'
 sys.path.insert(0, str(CLIENT_SCRIPTS))
 
 from gui.mods.offline_lan_0922.battle_runtime import (
-    BattleRuntime, FRAME_SECONDS, _FrameDiagnostics, _LANInputSender,
+    BattleRuntime, ENGINE_MODE_OFF, ENGINE_MODE_RUNNING, FRAME_SECONDS,
+    _FrameDiagnostics, _LANInputSender,
     _engine_rotation,
     _selected_vehicle_has_sixth_sense)
 from gui.mods.offline_lan_0922 import bot_runtime, combat_rules, \
@@ -148,13 +149,58 @@ class _YawMatrix(_Matrix):
             -sine * value.x + cosine * value.z + self.translation.z)
 
 
+class _VehicleFilter(object):
+    """BigWorld.WGVehicleFilter: the belt override the track scroll writes."""
+
+    def __init__(self):
+        self.movementInfo = object()
+
+
+class _TrackScroll(object):
+    """BigWorld.PyTrackScroll with its native scroll readback."""
+
+    def __init__(self):
+        self.data = None
+        self.active = False
+        self.mode = None
+        self.external = None
+        self.leftScroll = 0.0
+        self.rightScroll = 0.0
+        self.leftContact = False
+        self.rightContact = False
+
+    def activate(self):
+        self.active = True
+
+    def deactivate(self):
+        self.active = False
+
+    def setData(self, value):
+        self.data = value
+
+    def setMode(self, mode):
+        self.mode = mode
+
+    def setExternal(self, left, right):
+        self.external = (left, right)
+        # The native tick pins both belts while the engine is not running.
+        if self.mode and self.mode[0] > 1:
+            self.leftScroll += left
+            self.rightScroll += right
+
+
 class _Model(object):
-    _SUPPORTED_ATTRIBUTES = frozenset(('matrix', 'visible', 'node_bindings'))
+    _SUPPORTED_ATTRIBUTES = frozenset((
+        'matrix', 'visible', 'node_bindings', 'fashions'))
 
     def __init__(self):
         self.matrix = None
         self.visible = True
         self.node_bindings = []
+        self.fashions = None
+
+    def setupFashions(self, fashions):
+        self.fashions = fashions
 
     def __setattr__(self, name, value):
         if name not in self._SUPPORTED_ATTRIBUTES:
@@ -523,6 +569,8 @@ class _Avatar(object):
             shared=types.SimpleNamespace(
                 viewPoints=self.view_points,
                 messages=types.SimpleNamespace(),
+                feedback=types.SimpleNamespace(
+                    setVehicleState=mock.Mock()),
                 vehicleState=types.SimpleNamespace()))
         self.vehicleTypeDescriptor = types.SimpleNamespace(
             extras=tuple(range(16)))
@@ -873,6 +921,8 @@ class _OfflineMap(object):
             self.bigworld.avatar.guiSessionProvider = types.SimpleNamespace(
                 shared=types.SimpleNamespace(
                     arenaLoad=_ArenaLoadController(self.app_loader),
+                    feedback=types.SimpleNamespace(
+                        setVehicleState=mock.Mock()),
                     viewPoints=avatar.view_points),
                 invalidateVehicleState=mock.Mock(),
                 setVehicleHealth=mock.Mock(),
@@ -932,6 +982,9 @@ class _BigWorld(object):
 
     def player(self):
         return self.avatar
+
+    def PyTrackScroll(self):
+        return _TrackScroll()
 
     def time(self):
         return self.now
@@ -1229,10 +1282,13 @@ def _runtime():
         model_assembler=types.SimpleNamespace(
             prepareCompoundAssembler=lambda descriptor, state, space, flag:
             descriptor,
-            setupTurretRotations=setup_turret_rotations),
+            setupTurretRotations=setup_turret_rotations,
+            setupVehicleFashion=lambda fashion, descriptor, crashed: True,
+            createVehicleFilter=lambda descriptor: _VehicleFilter()),
         offline_map_creator=_OfflineMap(bigworld, app_loader),
         navigation_graph_loader=navigation_graph_loader,
         vehicle_view_state=types.SimpleNamespace(RPM='rpm'),
+        feedback_event_id=types.SimpleNamespace(VEHICLE_DEAD=17),
         vehicles=types.SimpleNamespace(
             VehicleDescr=_VehicleDescr,
             g_cache=types.SimpleNamespace(shotEffects={
@@ -1543,6 +1599,63 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertIsNone(vehicle._collision_obstacle)
         projectiles[0].destroy.assert_called_once_with()
         self.assertEqual(runtime.bigworld.entity, original_entity)
+
+    def test_a_bot_gets_the_native_belt_animation(self):
+        """PyTrackScroll writes the filter's belt override and the chassis
+        fashion reads the filter, so the belts turn from the fed speeds."""
+        runtime = _runtime()
+        fashions = [types.SimpleNamespace(movementInfo=None)]
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7,
+            camouflages=types.SimpleNamespace(
+                prepareFashions=lambda damaged: fashions))
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True, 'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+
+        self.assertIsNone(factory.track_animation_error)
+        self.assertIsNotNone(vehicle.track_scroll)
+        self.assertTrue(vehicle.track_scroll.active)
+        self.assertIs(vehicle.track_filter, vehicle.track_scroll.data)
+        self.assertIs(vehicle.track_filter.movementInfo,
+                      fashions[0].movementInfo)
+        self.assertIs(fashions, vehicle.model.fashions)
+
+        vehicle.update_tracks(3.0, 5.0, (2, 1))
+        self.assertEqual((2, 1), vehicle.track_scroll.mode)
+        self.assertEqual((3.0, 5.0), vehicle.track_scroll.external)
+        self.assertEqual((3.0, 5.0, False, False),
+                         vehicle.track_scroll_readback())
+
+        # An idle engine cannot scroll the belts; the native tick zeroes them.
+        vehicle.update_tracks(3.0, 5.0, (1, 0))
+        self.assertEqual((3.0, 5.0, False, False),
+                         vehicle.track_scroll_readback())
+
+        scroll = vehicle.track_scroll
+        vehicle.detach_visual()
+        self.assertFalse(scroll.active)
+        self.assertIsNone(scroll.data)
+        self.assertIsNone(vehicle.track_scroll)
+
+    def test_a_client_without_the_belt_boundary_still_presents_bots(self):
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7,
+            camouflages=types.SimpleNamespace(
+                prepareFashions=mock.Mock(side_effect=RuntimeError('no'))))
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True, 'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+
+        self.assertIsNotNone(factory.track_animation_error)
+        self.assertIsNone(vehicle.track_scroll)
+        self.assertTrue(factory.is_ready(vehicle_id))
+        self.assertIsNotNone(vehicle.model)
 
     def test_a_bot_pose_is_animated_rather_than_snapped(self):
         """OfflineEntity declares an empty <Volatile/>, so no WGVehicleFilter
@@ -4060,6 +4173,133 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual([7, 6], [
             value['eventType']
             for value in battle._avatar.battle_events[0]])
+
+    def test_a_moving_bot_is_fed_belt_speeds_and_a_running_engine(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        vehicle = RemoteVehicle(
+            1000, _Descriptor(), {
+                'publicInfo': {'team': 2, 'name': 'Bot'},
+                'health': 500, 'isCrewActive': True, 'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0), runtime.math)
+        vehicle.attach_track_animation(_VehicleFilter(), _TrackScroll(), None)
+        battle._remote_factory = types.SimpleNamespace(
+            get=lambda entity_id: vehicle if entity_id == 1000 else None,
+            track_animation_error=None)
+        record = {'engine_id': 1000, 'kind': 'bot', 'network_id': 3}
+
+        battle._update_bot_tracks(
+            record, {'id': 3, 'speed': 6.0, 'alive': True, 'health': 500},
+            10.0)
+
+        self.assertEqual((ENGINE_MODE_RUNNING, 1), vehicle.track_scroll.mode)
+        self.assertEqual((6.0, 6.0), vehicle.track_scroll.external)
+
+        battle._update_bot_tracks(
+            record, {'id': 3, 'speed': 0.0, 'alive': False, 'health': 0},
+            15.0)
+        self.assertEqual((ENGINE_MODE_OFF, 0), vehicle.track_scroll.mode)
+
+    def test_a_pivoting_bot_gets_opposed_belt_speeds(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        vehicle = RemoteVehicle(
+            1000, _Descriptor(), {
+                'publicInfo': {'team': 2, 'name': 'Bot'},
+                'health': 500, 'isCrewActive': True, 'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0), runtime.math)
+        vehicle.attach_track_animation(_VehicleFilter(), _TrackScroll(), None)
+        battle._remote_factory = types.SimpleNamespace(
+            get=lambda entity_id: vehicle if entity_id == 1000 else None,
+            track_animation_error=None)
+        record = {'engine_id': 1000, 'kind': 'bot', 'network_id': 3}
+
+        # Two accepted poses a tenth of a second apart give the yaw rate.
+        battle._bot_pose_relax({'id': 3, 'yaw': 0.0}, 10.0)
+        battle._bot_pose_relax({'id': 3, 'yaw': 0.1}, 10.1)
+
+        battle._update_bot_tracks(
+            record, {'id': 3, 'speed': 0.0, 'alive': True, 'health': 500},
+            10.1)
+
+        left, right = vehicle.track_scroll.external
+        self.assertLess(left, 0.0)
+        self.assertGreater(right, 0.0)
+        self.assertAlmostEqual(left, -right)
+
+    def test_a_dying_bot_pushes_the_destroyed_marker_state(self):
+        """Vehicle.__onVehicleDeath restyles the marker; without it a dead
+        vehicle keeps the live plate and its health bar."""
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        battle._avatar.playerVehicleID = 10
+        bot = _Vehicle(11, _Descriptor(), _Vector(0, 0, 1), (0, 0, 0),
+                       {'health': 500})
+        runtime.bigworld.entities.update({11: bot})
+        record = {
+            'engine_id': 11, 'state': {'team': 2, 'health': 500},
+            'kind': 'bot', 'network_id': 2, 'local': False,
+            'presentation': True}
+        battle._records = {'bot:2': record}
+        feedback = battle._avatar.guiSessionProvider.shared.feedback
+        present_health = battle._avatar.guiSessionProvider.setVehicleHealth
+
+        battle._apply_health(record, {'health': 200, 'alive': True})
+        feedback.setVehicleState.assert_not_called()
+
+        battle._apply_health(record, {'health': 0, 'alive': False})
+
+        feedback.setVehicleState.assert_called_once_with(
+            11, runtime.feedback_event_id.VEHICLE_DEAD, False)
+        # Retail presents the health first and the dead state second.
+        self.assertLess(
+            present_health.call_args_list.index(present_health.call_args),
+            len(present_health.call_args_list))
+        self.assertEqual(
+            (False, 11, 0), present_health.call_args_list[-1][0][:3])
+
+    def test_a_drowned_bot_is_dead_even_with_hull_health_left(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        battle._avatar.playerVehicleID = 10
+        bot = _Vehicle(11, _Descriptor(), _Vector(0, 0, 1), (0, 0, 0),
+                       {'health': 500})
+        runtime.bigworld.entities.update({11: bot})
+        record = {
+            'engine_id': 11, 'state': {'team': 2, 'health': 500},
+            'kind': 'bot', 'network_id': 2, 'local': False,
+            'presentation': True}
+        battle._records = {'bot:2': record}
+        feedback = battle._avatar.guiSessionProvider.shared.feedback
+
+        battle._apply_health(record, {
+            'health': 0, 'alive': False, 'crew_active': False,
+            'display_health': 300})
+
+        self.assertGreater(bot.health, 0)
+        feedback.setVehicleState.assert_called_once_with(
+            11, runtime.feedback_event_id.VEHICLE_DEAD, False)
+
+    def test_the_local_player_never_takes_the_remote_dead_state(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        battle._avatar.playerVehicleID = 10
+        record = {
+            'engine_id': 10, 'state': {'team': 1, 'health': 0},
+            'kind': 'player', 'network_id': 1, 'local': True}
+
+        self.assertFalse(battle._present_vehicle_dead(record, False))
+
+        (battle._avatar.guiSessionProvider.shared.feedback
+         .setVehicleState.assert_not_called())
 
     def test_local_ram_of_ally_updates_health_without_projectile_feedback(self):
         runtime = _runtime()
@@ -6880,6 +7120,70 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._binding.stop_vehicle_visual.assert_called_once_with(
             1000, False)
         self.assertTrue(enemy.model.visible)
+
+    def test_a_wreck_that_becomes_visible_again_is_restated_as_dead(self):
+        """A pooled marker re-attached on re-entry is not re-stated by the
+        plugin, so the startVisual tail has to push the dead state again."""
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        enemy = RemoteVehicle(
+            1000, _Descriptor(), {
+                'publicInfo': {'team': 2, 'name': 'Enemy'},
+                'health': 0, 'isCrewActive': True, 'gunAnglesPacked': 0},
+            _Vector(100.0, 0.0, 0.0), (0.0, 0.0, 0.0), runtime.math)
+        enemy.model = _Model()
+        enemy.appearance.attach(enemy.model)
+        battle._remote_factory = types.SimpleNamespace(
+            get=lambda entity_id: enemy if entity_id == 1000 else None)
+        record = {
+            'engine_id': 1000, 'kind': 'bot', 'network_id': 17,
+            'ready': True, 'local': False, 'presentation': True,
+            'visual_started': False, 'spot_visible': False,
+            'state': {'team': 2, 'health': 0, 'alive': False}}
+        battle._records = {'bot:17': record}
+        feedback = battle._avatar.guiSessionProvider.shared.feedback
+
+        battle._set_record_spot_visibility(record, True)
+
+        battle._binding.start_vehicle_visual.assert_called_once_with(
+            1000, True)
+        feedback.setVehicleState.assert_called_once_with(
+            1000, runtime.feedback_event_id.VEHICLE_DEAD, True)
+
+    def test_a_dead_enemy_keeps_its_remaining_spot_memory(self):
+        """Retail never hides a marker because the vehicle died; hiding is
+        visibility-driven, so the destroyed plate has time to show."""
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._local_descriptor = _Descriptor()
+        local = _Vehicle(
+            10, battle._local_descriptor, _Vector(), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = local
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._set_record_spot_visibility = lambda record, visible: \
+            record.update(spot_visible=bool(visible)) or bool(visible)
+        record = {
+            'engine_id': 12, 'network_id': 17, 'kind': 'bot',
+            'ready': True, 'local': False, 'presentation': True,
+            'tombstone': False, 'spot_visible': True,
+            'spot_until': 14.0, 'spot_next': 100.0,
+            'state': {'team': 2, 'health': 0, 'alive': False}}
+        battle._records = {'bot:17': record}
+        enemy = _Vehicle(12, _Descriptor(), _Vector(100.0, 0.0, 0.0),
+                         (0, 0, 0), {'health': 0})
+        runtime.bigworld.entities[12] = enemy
+
+        self.assertFalse(battle._update_spotting(10.4))
+        self.assertTrue(record['spot_visible'])
+
+        # The memory decays on its own clock instead of being cut at death.
+        battle._update_spotting(14.4)
+        self.assertFalse(record['spot_visible'])
 
     def test_team_relay_visibility_does_not_claim_a_direct_spot(self):
         runtime = _runtime()
