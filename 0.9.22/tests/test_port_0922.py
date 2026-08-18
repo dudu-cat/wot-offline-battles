@@ -4777,8 +4777,10 @@ class BootstrapContractTests(unittest.TestCase):
         self.assertEqual(2, announcement_ui.install.call_count)
         self.assertEqual(2, announcement_ui.uninstall.call_count)
         self.assertEqual(
-            [mock.call(show_login=False, restore_account=False),
-             mock.call(show_login=False, restore_account=False)],
+            [mock.call(show_login=False, restore_account=False,
+                       release_join=True),
+             mock.call(show_login=False, restore_account=False,
+                       release_join=True)],
             session.stop.call_args_list)
         expected_connect = mock.call(
             show_lobby=True,

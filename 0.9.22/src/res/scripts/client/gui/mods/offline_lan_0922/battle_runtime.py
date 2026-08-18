@@ -507,6 +507,8 @@ def _load_runtime():
     import nations
     from Avatar import ClientVisibilityFlags
     from OfflineMapCreator import g_offlineMapCreator
+    from AvatarInputHandler import aih_constants
+    from AvatarInputHandler import gun_marker_ctrl
     from gun_rotation_shared import encodeGunAngles
     from gui.app_loader import g_appLoader
     from gui.app_loader.settings import GUI_GLOBAL_SPACE_ID
@@ -522,7 +524,9 @@ def _load_runtime():
     runtime = Runtime()
     runtime.account_commands = AccountCommands
     runtime.area_destructibles = AreaDestructibles
+    runtime.aih_constants = aih_constants
     runtime.avatar_input_handler = AvatarInputHandler
+    runtime.gun_marker_ctrl = gun_marker_ctrl
     runtime.app_loader = g_appLoader
     runtime.arena_cache = ArenaType.g_cache
     runtime.arena_visibility_mask = ArenaType.getVisibilityMask
@@ -677,6 +681,7 @@ class BattleRuntime(object):
         self._map_create_attempted = False
         self._lobby_retire_started = False
         self._app_loader_guard = None
+        self._damage_info_failure_reported = False
         self._avatar = None
         self._binding = None
         self._server = None
@@ -809,10 +814,12 @@ class BattleRuntime(object):
             self._runtime, 'area_destructibles', None)
         destructibles_cache = getattr(
             self._runtime, 'destructibles_cache', None)
+        debug_logging = bool(self._config.get('debug_logging', False))
         if area_destructibles is not None and destructibles_cache is not None:
             destructibles_compat.install(
                 area_destructibles, destructibles_cache)
             from gui.mods.offline_lan_0922 import destructibles_sensor
+            destructibles_sensor.set_diagnostics(debug_logging)
             self._destructibles = destructibles_sensor
         else:
             # Pure-logic tests inject no engine modules.  Production runtime
@@ -1655,6 +1662,8 @@ class BattleRuntime(object):
                 # two clock calls are diagnostic work on the render thread and
                 # cannot affect probe order, results, deadlines or budgets.
                 native_motion=False)
+            self._bots.debug_logging = bool(
+                self._config.get('debug_logging', False))
             provider = getattr(self._avatar, 'guiSessionProvider', None)
             vehicle_view_state = getattr(
                 self._runtime, 'vehicle_view_state', None)
@@ -1763,10 +1772,48 @@ class BattleRuntime(object):
             duration = max(1.0, float(network_duration))
         self._config['battleDurationSeconds'] = duration
         self._binding.arena_period('prebattle', countdown)
+        self._show_prebattle_crosshair()
         self._prebattle_deadline = self._clock() + countdown
         self._last_frame_time = self._clock()
         if countdown <= 0.0:
             self._begin_battle()
+        return True
+
+    def _show_prebattle_crosshair(self):
+        """Draw the aiming reticle during our own countdown.
+
+        ``AvatarInputHandler.__onArenaStarted`` only raises
+        ``GUN_MARKER_FLAG.CONTROL_ENABLED`` for ``ARENA_PERIOD.BATTLE``, and
+        ``VehicleGunRotator.start`` refuses while ``Avatar.isOnArena`` is
+        false, so a stock PREBATTLE has no reticle at all.  The player still
+        aims during this countdown, so raise both gates now.  Movement and
+        firing stay frozen by the runtime's own prebattle gate.
+        """
+        handler = getattr(self._avatar, 'inputHandler', None)
+        rotator = getattr(self._avatar, 'gunRotator', None)
+        if handler is None or rotator is None:
+            return False
+        control = getattr(handler, '_AvatarInputHandler__curCtrl', None)
+        set_flag = getattr(control, 'setGunMarkerFlag', None)
+        constants_module = getattr(
+            self._runtime, 'aih_constants', None)
+        flags = getattr(constants_module, 'GUN_MARKER_FLAG', None)
+        if (not callable(set_flag) or flags is None or
+                not hasattr(flags, 'CONTROL_ENABLED')):
+            raise RuntimeError('#1513 gun-marker control gate is unavailable')
+        setattr(self._avatar, '_PlayerAvatar__isOnArena', True)
+        set_flag(True, flags.CONTROL_ENABLED)
+        marker_module = getattr(self._runtime, 'gun_marker_ctrl', None)
+        show_client = getattr(handler, 'showGunMarker', None)
+        show_server = getattr(handler, 'showGunMarker2', None)
+        use_client = getattr(marker_module, 'useClientGunMarker', None)
+        use_server = getattr(marker_module, 'useServerGunMarker', None)
+        if not all(callable(value) for value in (
+                show_client, show_server, use_client, use_server)):
+            raise RuntimeError('#1513 gun-marker boundary is unavailable')
+        show_server(use_server())
+        show_client(use_client())
+        rotator.start()
         return True
 
     def _bind_local_arcade_camera(self):
@@ -4379,7 +4426,8 @@ class BattleRuntime(object):
                         '#1513 ammo-bay destruction mode is unavailable')
                 callback(int(modes.HE_DETONATION), 0.0, 0.0)
                 shown = True
-        if not record.get('local') or self._avatar is None:
+        if (not record.get('local') or self._avatar is None or
+                not self._damage_info_is_serviceable()):
             return shown
         indices = getattr(self._runtime.constants,
                           'DAMAGE_INFO_INDICES', {})
@@ -4436,11 +4484,62 @@ class BattleRuntime(object):
             if damage_index is None:
                 raise RuntimeError(
                     '#1513 damage-info index is unavailable: %s' % code)
-            self._avatar.showVehicleDamageInfo(
-                record['engine_id'], int(damage_index), extra_index,
-                int(attacker_id or 0), 0)
-            shown = True
+            if self._show_damage_info(
+                    record['engine_id'], int(damage_index), extra_index,
+                    int(attacker_id or 0)):
+                shown = True
         return shown
+
+    def _damage_info_is_serviceable(self):
+        """Whether #1513 can still service a damage-info notification.
+
+        ``PlayerAvatar.showVehicleDamageInfo`` is a server-to-client entity
+        method with no guards of its own.  It dereferences the shared message
+        and vehicle-state controllers, and it repaints the damage panel; both
+        are gone once the session stops or the battle app is destroyed.
+        """
+        provider = getattr(self._avatar, 'guiSessionProvider', None)
+        shared = getattr(provider, 'shared', None)
+        if shared is None:
+            return False
+        if (getattr(shared, 'messages', None) is None or
+                getattr(shared, 'vehicleState', None) is None):
+            return False
+        if getattr(self._avatar, 'vehicleTypeDescriptor', None) is None:
+            return False
+        app_loader = getattr(self._runtime, 'app_loader', None)
+        get_battle_app = getattr(app_loader, 'getDefBattleApp', None)
+        if callable(get_battle_app) and get_battle_app() is None:
+            return False
+        return True
+
+    def _show_damage_info(self, engine_id, damage_index, extra_index,
+                          attacker_id):
+        """Publish one stock damage-info notification, never fatally."""
+        codes = getattr(self._runtime.constants, 'DAMAGE_INFO_CODES', ())
+        extras = getattr(
+            self._avatar.vehicleTypeDescriptor, 'extras', ())
+        if not 0 <= damage_index < len(codes):
+            raise RuntimeError(
+                '#1513 damage-info index is out of range: %d' % damage_index)
+        if not 0 <= extra_index < len(extras):
+            raise RuntimeError(
+                '#1513 damage-info extra index is out of range: %d' %
+                extra_index)
+        try:
+            self._avatar.showVehicleDamageInfo(
+                int(engine_id), damage_index, extra_index,
+                int(attacker_id), 0)
+        except Exception as error:
+            # A repaint failure is presentation, not authority.  Ending the
+            # round over it loses the whole battle.
+            if not self._damage_info_failure_reported:
+                self._damage_info_failure_reported = True
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] damage-info presentation failed: '
+                    '%s\n' % error)
+            return False
+        return True
 
     def _tick_critical_states(self, dt):
         """Advance copied repair/fire laws only for the locally-owned human."""
@@ -5788,6 +5887,10 @@ class BattleRuntime(object):
                         before_probe_durations = probe_duration_totals()
                     except Exception:
                         before_probe_durations = None
+                set_camera = getattr(
+                    self._bots, 'set_camera_position', None)
+                if callable(set_camera):
+                    set_camera(self._local_position)
                 outgoing_messages = self._bots.update(
                     dt, now, players=players)
                 after_probes = None

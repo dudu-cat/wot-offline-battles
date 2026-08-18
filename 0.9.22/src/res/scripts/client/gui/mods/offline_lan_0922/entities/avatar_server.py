@@ -18,6 +18,8 @@ Postmortem spectator switching is delegated to the battle runtime.  Exact
 client callback without a runtime-owned, validated attachment transaction.
 """
 
+import math
+
 try:
     import cPickle as _pickle
 except ImportError:
@@ -291,6 +293,25 @@ class AvatarServerBridge(object):
         if vehicle_id != self._vehicle_id:
             raise AvatarBridgeError('cannot bind unknown Vehicle')
         self._bind_avatar_once(vehicle_id)
+        return True
+
+    def moveTo(self, position):
+        """Accept the free-look Avatar move that the SPG cameras request.
+
+        ``AvatarPositionControl.moveTo`` forwards straight to this mailbox,
+        and ``StrategicCamera.enable``/``ArtyCamera.enable`` call it between
+        ``BigWorld.camera(...)`` and their ``delayCallback`` registration.  A
+        missing mailbox therefore leaves those cameras with no update tick:
+        the aim point stops following the mouse and the arty camera keeps its
+        default matrix at the world origin.  The offline Avatar entity owns no
+        server-side position, so the request only has to be admitted.
+        """
+        if self._destroyed:
+            return False
+        for index in range(3):
+            value = float(position[index])
+            if math.isnan(value) or math.isinf(value):
+                raise AvatarBridgeError('Avatar move position is invalid')
         return True
 
     def switchViewPointOrBindToVehicle(self, is_viewpoint,

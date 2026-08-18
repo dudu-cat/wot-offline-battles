@@ -11,6 +11,9 @@ from gui.mods.offline_lan_0922 import waiting_room_ui
 
 
 RECONNECT_DELAY = 2.0
+# The server returns an abandoned round to its waiting room five seconds after
+# the last participant leaves.  Rejoin if that roster never arrives.
+ROUND_END_TIMEOUT = 12.0
 VEHICLE_SELECTION_WARNING = (
     'Select a valid vehicle in the garage, then click Battle! again.')
 
@@ -136,6 +139,8 @@ class LANSession(object):
         self._battle_start_callback_id = None
         self._retry_callback_id = None
         self._retry_token = None
+        self._round_end_callback_id = None
+        self._round_end_token = None
         self._pending_battle_start = None
         self._pending_map = None
         self._start_requested = False
@@ -240,10 +245,114 @@ class LANSession(object):
         self.state = 'ready_to_join'
         return True
 
-    def join(self, unused_map_id=None, unused_action_name=None):
-        """Handle the stock lobby Battle button as one LAN-room join action."""
-        if self._stopped:
+    def revive(self):
+        """Return a stopped or parked session to a clickable Battle button."""
+        self._stopped = False
+        self._cancel_retry_callback()
+        self._cancel_picker_close_callback()
+        self._cancel_round_end_watchdog()
+        self._clear_pending_battle_start()
+        client = self.client
+        self.client = None
+        self._client_generation += 1
+        if client is not None:
+            try:
+                client.on_event = None
+                client.stop()
+            except Exception:
+                pass
+        self._battle_started = False
+        self._starting_round_id = None
+        self._active_round_id = None
+        self._departed_round_id = None
+        self.snapshot = None
+        self._start_requested = False
+        self._pending_map = None
+        self._map_pool = None
+        self._host_player_id = None
+        self._waiting_notice_host_id = None
+        self._picker_open = False
+        self._picker_dismissed = False
+        self._connection_error_notified = False
+        self.state = 'ready_to_join'
+        if self._join_ui is None:
+            self._join_ui = self._join_factory(self.join)
+        self._join_ui.install()
+        return True
+
+    def _cancel_round_end_watchdog(self):
+        callback_id = self._round_end_callback_id
+        self._round_end_callback_id = None
+        self._round_end_token = None
+        if callback_id is not None and callable(self._cancel_callback):
+            self._cancel_callback(callback_id)
+
+    def _schedule_round_end_watchdog(self):
+        """Rejoin the room if the server never closes the departed round.
+
+        The local player has already left the battle, so the only state that
+        can still arrive is the waiting roster.  Without this the Battle
+        button stays parked in ``awaiting_round_end`` for the whole round.
+        """
+        if not callable(self._callback):
             return False
+        self._cancel_round_end_watchdog()
+        token = object()
+        self._round_end_token = token
+
+        def expire():
+            if self._round_end_token is not token:
+                return
+            self._round_end_callback_id = None
+            self._round_end_token = None
+            if self._stopped or self.state != 'awaiting_round_end':
+                return
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] LAN round %r was not closed by the '
+                'server; rejoining the room\n' % (self._departed_round_id,))
+            self._rejoin_room()
+
+        callback_id = self._callback(ROUND_END_TIMEOUT, expire)
+        if self._round_end_token is token:
+            self._round_end_callback_id = callback_id
+        return True
+
+    def _enter_awaiting_round_end(self):
+        self.state = 'awaiting_round_end'
+        self._schedule_round_end_watchdog()
+        return True
+
+    def _rejoin_room(self):
+        """Drop a parked socket and reconnect so the server resynchronises."""
+        self.revive()
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] LAN rejoin requested: %s\n' %
+            self._endpoint_value())
+        if not self.start():
+            if self.state not in ('ready_to_join', 'retrying'):
+                self._status_notifier('The LAN room could not be rejoined.')
+            return False
+        self._status_notifier(
+            'Rejoining LAN room at %s...' % self._endpoint_value())
+        return True
+
+    def join(self, unused_map_id=None, unused_action_name=None):
+        """Handle the stock lobby Battle button as one LAN-room join action.
+
+        Every state answers the click.  A click that produced neither a room
+        nor a message is what makes the button look dead after a round.
+        """
+        if self._stopped or self.state in ('error', 'stopped'):
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] LAN session was %s; rebuilding it\n' %
+                (self.state,))
+            return bool(self._rejoin_room())
+        if self.state in ('awaiting_round_end', 'awaiting_lobby_for_battle'):
+            return bool(self._rejoin_room())
+        if self.state == 'awaiting_battle_start':
+            self._status_notifier(
+                'The LAN round is starting. Wait for the battle to load.')
+            return True
         if self.client is None:
             self._picker_dismissed = False
             sys.stdout.write(
@@ -271,6 +380,8 @@ class LANSession(object):
             if not self._is_local_host():
                 self._show_waiting_notice(force=True)
             self._open_waiting_picker()
+        else:
+            return bool(self._rejoin_room())
         return True
 
     def leave_room(self):
@@ -278,6 +389,7 @@ class LANSession(object):
         self._picker_open = False
         self._picker_dismissed = True
         self._cancel_retry_callback()
+        self._cancel_round_end_watchdog()
         self._cancel_picker_callback()
         self._leave_queue_screen()
         client = self.client
@@ -805,6 +917,7 @@ class LANSession(object):
 
     def _waiting_event(self, message):
         self._cancel_retry_callback()
+        self._cancel_round_end_watchdog()
         recovered_connection = self._connection_error_notified
         previous_host_player_id = self._host_player_id
         self._host_player_id = _message_value(
@@ -883,7 +996,7 @@ class LANSession(object):
             # local battle back to an awaiting state.
             if (self._departed_round_id is not None and
                     round_id == self._departed_round_id):
-                self.state = 'awaiting_round_end'
+                self._enter_awaiting_round_end()
             else:
                 self.state = ('battle' if self._battle_started
                               else 'awaiting_battle_start')
@@ -1008,7 +1121,7 @@ class LANSession(object):
             except Exception:
                 pass
             raise errors[0]
-        self.state = 'awaiting_round_end'
+        self._enter_awaiting_round_end()
         return True
 
     def _on_battle_failed(self, message):
@@ -1056,7 +1169,7 @@ class LANSession(object):
                 except Exception:
                     pass
                 return False
-            self.state = 'awaiting_round_end'
+            self._enter_awaiting_round_end()
             self._status_notifier(
                 'Battle could not start (%s). Returning to the map picker.' %
                 reason)
@@ -1313,13 +1426,24 @@ class LANSession(object):
             self._on_event_callback(kind, message)
 
     def stop(self, show_login=True, restore_account=True,
-             stop_runtime=True):
+             stop_runtime=True, release_join=False):
+        """Retire this session.
+
+        ``release_join`` restores the retail Battle button and belongs to mod
+        shutdown only.  An error path keeps our button installed, otherwise the
+        next click reaches retail matchmaking and the LAN room is unreachable
+        until the client restarts.
+        """
         if self._stopped:
             return
         self._stopped = True
         errors = []
         try:
             self._cancel_retry_callback()
+        except Exception as error:
+            errors.append(error)
+        try:
+            self._cancel_round_end_watchdog()
         except Exception as error:
             errors.append(error)
         try:
@@ -1344,7 +1468,7 @@ class LANSession(object):
                 self._queue_screen.uninstall()
             except Exception as error:
                 errors.append(error)
-        if self._join_ui is not None:
+        if self._join_ui is not None and release_join:
             try:
                 self._join_ui.uninstall()
             except Exception as error:
@@ -1376,4 +1500,6 @@ class LANSession(object):
         if errors:
             raise errors[0]
 
-    fini = stop
+    def fini(self, show_login=True, restore_account=True, stop_runtime=True):
+        self.stop(show_login=show_login, restore_account=restore_account,
+                  stop_runtime=stop_runtime, release_join=True)

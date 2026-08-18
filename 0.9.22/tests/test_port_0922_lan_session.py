@@ -549,8 +549,102 @@ class LANSessionTests(unittest.TestCase):
         self.assertTrue(join_views[0].on_join(0, 'battle'))
         self.assertEqual(1, len(clients))
         self.assertEqual(1, clients[0].start_calls)
+        # An error stop keeps our Battle button; only mod shutdown releases it.
         session.stop(show_login=False)
+        self.assertEqual(0, join_views[0].uninstall_calls)
+        session._stopped = False
+        session.fini(show_login=False)
         self.assertEqual(1, join_views[0].uninstall_calls)
+
+    def test_battle_click_rejoins_a_room_parked_after_a_round(self):
+        clients = []
+        join_views = []
+
+        def client_factory(*args, **kwargs):
+            client = _Client(*args, **kwargs)
+            clients.append(client)
+            return client
+
+        def join_factory(callback):
+            view = _JoinUI(callback)
+            join_views.append(view)
+            return view
+
+        session = self.module.LANSession(
+            {'host': '10.0.0.5', 'port': 28782},
+            client_factory=client_factory, join_factory=join_factory,
+            vehicle_provider=lambda: ('ussr:R11_MS-1', 90),
+            status_notifier=lambda unused_message: None)
+        self.assertTrue(session.install())
+        self.assertTrue(join_views[0].on_join(0, 'battle'))
+        self.assertEqual(1, len(clients))
+        session.state = 'awaiting_round_end'
+
+        self.assertTrue(join_views[0].on_join(0, 'battle'))
+
+        self.assertEqual(2, len(clients))
+        self.assertEqual(1, clients[0].stop_calls)
+        self.assertEqual('connecting', session.state)
+
+    def test_round_end_watchdog_rejoins_without_a_second_click(self):
+        clients = []
+        callbacks = []
+
+        def client_factory(*args, **kwargs):
+            client = _Client(*args, **kwargs)
+            clients.append(client)
+            return client
+
+        def schedule(unused_delay, callback):
+            callbacks.append(callback)
+            return len(callbacks)
+
+        session = self.module.LANSession(
+            {'host': '10.0.0.5', 'port': 28782},
+            client_factory=client_factory,
+            join_factory=_JoinUI,
+            callback=schedule, cancel_callback=lambda unused_id: None,
+            vehicle_provider=lambda: ('ussr:R11_MS-1', 90),
+            status_notifier=lambda unused_message: None)
+        self.assertTrue(session.install())
+        self.assertTrue(session.join())
+        self.assertEqual(1, len(clients))
+
+        session._enter_awaiting_round_end()
+        self.assertEqual(1, len(callbacks))
+        callbacks[0]()
+
+        self.assertEqual(2, len(clients))
+        self.assertEqual('connecting', session.state)
+
+    def test_battle_click_revives_a_stopped_session(self):
+        clients = []
+        join_views = []
+
+        def client_factory(*args, **kwargs):
+            client = _Client(*args, **kwargs)
+            clients.append(client)
+            return client
+
+        def join_factory(callback):
+            view = _JoinUI(callback)
+            join_views.append(view)
+            return view
+
+        session = self.module.LANSession(
+            {'host': '10.0.0.5', 'port': 28782},
+            client_factory=client_factory, join_factory=join_factory,
+            vehicle_provider=lambda: ('ussr:R11_MS-1', 90),
+            status_notifier=lambda unused_message: None)
+        self.assertTrue(session.install())
+        session.stop(show_login=False)
+        self.assertEqual('stopped', session.state)
+
+        self.assertTrue(join_views[0].on_join(0, 'battle'))
+
+        self.assertEqual(1, len(clients))
+        self.assertFalse(session._stopped)
+        self.assertEqual('connecting', session.state)
 
     def test_selected_vehicle_provider_is_used_for_each_new_client(self):
         clients = []

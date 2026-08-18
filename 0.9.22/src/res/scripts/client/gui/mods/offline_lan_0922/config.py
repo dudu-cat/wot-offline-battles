@@ -31,6 +31,9 @@ DEFAULT_CONFIG = {
     'physics_tuning': {},
     'he_tuning': {},
     'perfect_accuracy': False,
+    # Per-chunk destructible and bot-steering traces. PERF summaries are
+    # always published; these are the noisy per-event lines.
+    'debug_logging': False,
 }
 
 

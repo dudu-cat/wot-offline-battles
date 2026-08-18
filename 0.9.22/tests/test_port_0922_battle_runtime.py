@@ -18,8 +18,8 @@ from gui.mods.offline_lan_0922.battle_runtime import (
     BattleRuntime, FRAME_SECONDS, _FrameDiagnostics, _LANInputSender,
     _engine_rotation,
     _selected_vehicle_has_sixth_sense)
-from gui.mods.offline_lan_0922 import combat_rules, critical_damage, \
-    gun_mechanics, tank_collision, vehicle_physics
+from gui.mods.offline_lan_0922 import bot_runtime, combat_rules, \
+    critical_damage, gun_mechanics, tank_collision, vehicle_physics
 from gui.mods.offline_lan_0922.entities.remote_vehicle import \
     RemoteVehicle, RemoteVehicleFactory, _RemoteFilter, \
     collide_vehicle_at_matrix
@@ -372,9 +372,14 @@ class _ArenaDataProvider(object):
 class _InputHandler(object):
     def __init__(self):
         self.started_periods = []
+        self.gun_marker_flags = []
+        self.client_markers = []
+        self.server_markers = []
         self._AvatarInputHandler__ctrlModeName = 'arcade'
         self._AvatarInputHandler__curCtrl = types.SimpleNamespace(
-            camera=_ArcadeCamera())
+            camera=_ArcadeCamera(),
+            setGunMarkerFlag=lambda positive, bit:
+                self.gun_marker_flags.append((positive, bit)))
         self.steadyVehicleMatrixCalculator = types.SimpleNamespace(
             _SteadyVehicleMatrixCalculator__outputMProv=
             types.SimpleNamespace(rotationSrc=object(),
@@ -384,6 +389,12 @@ class _InputHandler(object):
 
     def _AvatarInputHandler__onArenaStarted(self, period):
         self.started_periods.append(period)
+
+    def showGunMarker(self, flag):
+        self.client_markers.append(bool(flag))
+
+    def showGunMarker2(self, flag):
+        self.server_markers.append(bool(flag))
 
 
 class _ArcadeCamera(object):
@@ -496,7 +507,12 @@ class _Avatar(object):
             invalidateVehicleState=mock.Mock(),
             setVehicleHealth=mock.Mock(),
             getArenaDP=lambda: self.arena_dp,
-            shared=types.SimpleNamespace(viewPoints=self.view_points))
+            shared=types.SimpleNamespace(
+                viewPoints=self.view_points,
+                messages=types.SimpleNamespace(),
+                vehicleState=types.SimpleNamespace()))
+        self.vehicleTypeDescriptor = types.SimpleNamespace(
+            extras=tuple(range(16)))
 
     def getOwnVehicleShotDispersionAngle(self, turret_rotation_speed,
                                          with_shot=0):
@@ -1100,6 +1116,8 @@ def _runtime():
             'TANKMAN_HIT_AT_DROWNING': 12,
             'FIRE_STOPPED': 13,
         },
+        DAMAGE_INFO_CODES=tuple(
+            'CODE_%d' % index for index in range(38)),
         VEHICLE_HIT_FLAGS=types.SimpleNamespace(
             ATTACK_IS_DIRECT_PROJECTILE=1,
             MATERIAL_WITH_POSITIVE_DF_PIERCED_BY_PROJECTILE=2,
@@ -1162,6 +1180,13 @@ def _runtime():
             _CTRL_MODE=types.SimpleNamespace(
                 ARCADE='arcade', SNIPER='sniper',
                 POSTMORTEM='postmortem')),
+        aih_constants=types.SimpleNamespace(
+            GUN_MARKER_FLAG=types.SimpleNamespace(
+                UNDEFINED=0, CONTROL_ENABLED=1, CLIENT_MODE_ENABLED=2,
+                SERVER_MODE_ENABLED=4)),
+        gun_marker_ctrl=types.SimpleNamespace(
+            useClientGunMarker=lambda: True,
+            useServerGunMarker=lambda: False),
         app_loader=app_loader,
         client_visibility_flags=types.SimpleNamespace(
             CLIENT_MASK=0xfff00000, SERVER_MASK=0x000fffff),
@@ -5545,7 +5570,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             battle._local_position,
             tuple(camera.vehicleMProv.translation))
 
-    def test_prebattle_preserves_native_gun_and_marker_fence(self):
+    def test_prebattle_draws_the_reticle_but_fences_the_server_marker(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle.state = 'running'
@@ -5579,13 +5604,17 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'countdown_seconds': 12.0,
             'battle_duration_seconds': 900.0,
         }))
+        # The reticle is drawn during our countdown, but the server-marker
+        # echo still waits for the BATTLE transition.
         self.assertFalse(battle._sync_local_server_marker())
-        rotator.start.assert_not_called()
+        rotator.start.assert_called_once_with()
         rotator.getCurShotPosition.assert_not_called()
         self.assertEqual([], battle._avatar.inputHandler.started_periods)
         self.assertEqual([], battle._avatar.gun_marker_updates)
-        self.assertFalse(rotator._VehicleGunRotator__isStarted)
-        self.assertFalse(battle._avatar._PlayerAvatar__isOnArena)
+        self.assertEqual(
+            [(True, 1)], battle._avatar.inputHandler.gun_marker_flags)
+        self.assertEqual([True], battle._avatar.inputHandler.client_markers)
+        self.assertTrue(battle._avatar._PlayerAvatar__isOnArena)
         self.assertFalse(battle._battle_live)
 
     def test_battle_transition_starts_one_native_gun_timer_from_zero(self):
@@ -5625,12 +5654,15 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'countdown_seconds': 12.0,
             'battle_duration_seconds': 900.0,
         }))
-        rotator.start.assert_not_called()
+        # The countdown already draws the reticle, so the rotator is running
+        # before the BATTLE transition; stock start() is idempotent.
+        rotator.start.assert_called_once_with()
         self.assertEqual([('prebattle', 12.0)], periods)
         self.assertTrue(battle._begin_battle())
         self.assertFalse(battle._begin_battle())
-        rotator.start.assert_called_once_with()
-        self.assertEqual(['start'], battle._avatar.gun_tracking_calls)
+        self.assertEqual(2, rotator.start.call_count)
+        self.assertEqual(
+            ['start', 'start'], battle._avatar.gun_tracking_calls)
         self.assertEqual(
             [runtime.constants.ARENA_PERIOD.BATTLE],
             battle._avatar.inputHandler.started_periods)
@@ -9444,6 +9476,66 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual([(0, 0)], entity.engine_modes)
         self.assertEqual([], entity.track_scrolls)
+
+
+    def test_damage_info_is_skipped_when_the_battle_gui_is_gone(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        record = {'engine_id': 10, 'local': True}
+        events = [{'kind': 'crew', 'name': 'driver',
+                   'state': 'destroyed', 'cause': 'drowning'}]
+        runtime.app_loader = types.SimpleNamespace(
+            getDefBattleApp=lambda: None)
+
+        with mock.patch.object(
+                battle, '_critical_extra_index', return_value=7):
+            self.assertFalse(battle._present_critical(record, events, 99))
+
+        self.assertEqual([], battle._avatar.damage_info)
+
+    def test_damage_info_flash_failure_does_not_end_the_round(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        record = {'engine_id': 10, 'local': True}
+        events = [{'kind': 'crew', 'name': 'driver',
+                   'state': 'destroyed', 'cause': 'drowning'}]
+        battle._avatar.showVehicleDamageInfo = mock.Mock(
+            side_effect=RuntimeError(
+                'PyGFxValue - Failed to invoke method as_updateDeviceState'))
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(
+                    battle, '_critical_extra_index', return_value=7):
+                self.assertFalse(battle._present_critical(record, events, 99))
+
+    def test_far_bots_sample_the_suspension_less_than_near_bots(self):
+        near = {'id': 1, 'x': 10.0, 'y': 2.0, 'z': 0.0, 'yaw': 0.0,
+                'pitch': 0.0, 'roll': 0.0, 'half_length': 3.5,
+                'half_width': 1.7, 'airborne': False, 'grounded_once': True}
+        far = dict(near, id=2, x=400.0)
+        counts = {}
+        for name, state in (('near', near), ('far', far)):
+            bots = bot_runtime.BotRuntime.__new__(bot_runtime.BotRuntime)
+            bots._probe_totals = [0, 0, 0, 0, 0]
+            bots._probe_started = lambda: None
+            bots._probe_finished = lambda index, started: None
+            bots._physics_ground_probe = lambda x, z, hint: 2.0
+            bots.set_camera_position((0.0, 0.0, 0.0))
+            for step in range(20):
+                state['x'] += 0.5
+                bots._update_slope_pose(state)
+            counts[name] = bots._probe_totals[3]
+
+        self.assertGreater(counts['near'], counts['far'])
+        self.assertGreater(counts['near'], 0)
 
 
 if __name__ == '__main__':

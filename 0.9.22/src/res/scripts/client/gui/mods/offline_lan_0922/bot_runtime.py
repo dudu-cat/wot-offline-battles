@@ -65,6 +65,17 @@ COVER_JOB_WINDOW_SECONDS = (
     OBSERVATION_SECONDS - SHOT_LANE_REFRESH_SECONDS)
 PROBE_KINDS = ('visibility', 'lane', 'cover', 'ground', 'motion')
 DECISION_SECONDS = 0.0975
+# Distance tiers for the render-frame work that only presentation consumes.
+# A hull two hundred metres away moves less than one pixel of visible tilt per
+# frame, so its four-point suspension sample and its planner cadence can be
+# spread without changing what the player sees.
+DETAIL_NEAR_METRES = 120.0
+DETAIL_FAR_METRES = 300.0
+# Travel that must accumulate before a tier re-samples the four ground rays.
+SLOPE_SAMPLE_METRES = (0.35, 1.50, 4.00)
+SLOPE_SAMPLE_RADIANS = (0.05, 0.15, 0.40)
+# Planner cadence multiplier per tier.
+DECISION_TIER_FACTOR = (1.0, 2.0, 4.0)
 # The #1513 production probe owns a 15 m low-speed / 20 m high-speed,
 # three-lane corridor.  A cached sample may only be reused while the hull stays
 # well inside the 2.2 m outer lanes.  The time bound also limits maximum copied
@@ -991,6 +1002,8 @@ class BotRuntime(object):
         self._decision_cache = {}
         self._motion_probe_cache = {}
         self._flip_diary = {}
+        self.debug_logging = False
+        self._camera_position = None
         self._world_receipt_budget = 0
         self._world_receipt_waiting = []
         self._world_receipt_frame = None
@@ -2399,6 +2412,8 @@ class BotRuntime(object):
 
     def _log_direction_flip(self, state, path_clear, motion_probe, now):
         """Log rapid drive reversals with the corridor verdict behind them."""
+        if not self.debug_logging:
+            return False
         direction = int(state.get('movement_dir', 0))
         bot_id = state['id']
         diary = self._flip_diary.get(bot_id)
@@ -2429,6 +2444,29 @@ class BotRuntime(object):
                   bool(path_clear), verdict))
         return True
 
+    def set_camera_position(self, position):
+        """Publish the viewpoint that drives the presentation detail tiers."""
+        if position is None:
+            self._camera_position = None
+            return False
+        self._camera_position = (
+            _number(position[0]), _number(position[1]), _number(position[2]))
+        return True
+
+    def _detail_tier(self, state):
+        """Return 0 near the camera, 1 at medium range, 2 far away."""
+        camera = self._camera_position
+        if camera is None:
+            return 0
+        dx = _number(state.get('x')) - camera[0]
+        dz = _number(state.get('z')) - camera[2]
+        distance_sq = dx * dx + dz * dz
+        if distance_sq <= DETAIL_NEAR_METRES * DETAIL_NEAR_METRES:
+            return 0
+        if distance_sq <= DETAIL_FAR_METRES * DETAIL_FAR_METRES:
+            return 1
+        return 2
+
     def _update_slope_pose(self, state):
         """Refresh the four-point hull pose after this tick's ground settle."""
         if state.get('airborne', False) or not state.get(
@@ -2437,11 +2475,14 @@ class BotRuntime(object):
         yaw = _number(state.get('yaw'))
         x = _number(state.get('x'))
         z = _number(state.get('z'))
+        tier = self._detail_tier(state)
+        travel = SLOPE_SAMPLE_METRES[tier]
+        turn = SLOPE_SAMPLE_RADIANS[tier]
         marker = state.get('pose_sample')
         if (isinstance(marker, (list, tuple)) and len(marker) == 3 and
-                abs(x - _number(marker[0])) < 0.05 and
-                abs(z - _number(marker[1])) < 0.05 and
-                abs(yaw - _number(marker[2])) < 0.02):
+                abs(x - _number(marker[0])) < travel and
+                abs(z - _number(marker[1])) < travel and
+                abs(yaw - _number(marker[2])) < turn):
             return False
 
         def probe(sample_x, sample_z, hint):
@@ -3901,8 +3942,10 @@ class BotRuntime(object):
                 self._decision_cache[state['id']] = (
                     cache_key,
                     _cache_deadline(
-                        now, state['id'], DECISION_SECONDS, 3,
-                        decision_cache is None),
+                        now, state['id'],
+                        DECISION_SECONDS *
+                        DECISION_TIER_FACTOR[self._detail_tier(state)],
+                        3, decision_cache is None),
                     _number(now), dict(command), contacts, targets)
             # Preserve the old refresh point: in copied-physics mode, a later
             # bot observes poses integrated by earlier bots in this same tick.

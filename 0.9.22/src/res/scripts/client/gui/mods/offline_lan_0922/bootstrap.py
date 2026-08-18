@@ -256,7 +256,8 @@ def _cleanup_runtime():
             # Global mod shutdown is followed by compatibility.disconnect().
             # Do not create a fresh Account and start lobby coroutines only to
             # destroy it immediately in the next cleanup stage.
-            session.stop(show_login=False, restore_account=False)
+            session.stop(show_login=False, restore_account=False,
+                         release_join=True)
         except Exception as error:
             errors.append(error)
 
@@ -365,7 +366,8 @@ def _install_lan_session():
         if not session.install():
             raise RuntimeError('LAN Battle button did not install')
     except Exception:
-        session.stop(show_login=False, restore_account=False)
+        session.stop(show_login=False, restore_account=False,
+                     release_join=True)
         raise
     _session = session
     return True
