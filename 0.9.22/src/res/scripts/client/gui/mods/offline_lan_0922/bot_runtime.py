@@ -15,6 +15,7 @@ from gui.mods.offline_lan_0922 import ballistics
 from gui.mods.offline_lan_0922 import device_damage
 from gui.mods.offline_lan_0922 import prebaked_navigation
 from gui.mods.offline_lan_0922 import spotting
+from gui.mods.offline_lan_0922 import loadout
 from gui.mods.offline_lan_0922 import tank_collision
 from gui.mods.offline_lan_0922 import vehicle_physics
 
@@ -140,16 +141,30 @@ def _forward_speed(descriptor):
     return max(4.0, min(value, 35.0))
 
 
-def _view_range(descriptor):
+def _view_range(descriptor, still_seconds=0.0):
+    """Bot view range, using the same device law as the player.
+
+    A bot has no garage crew, so its crew-derived factors stay at the
+    untrained baseline; its mounted devices still apply.
+    """
     turret = _value(descriptor, 'turret', {}) or {}
     misc = _value(descriptor, 'miscAttrs', {}) or {}
+    profile = loadout.spotting_profile(descriptor, None)
     return spotting.effective_view_range(
         _value(turret, 'circularVisionRadius', 330.0),
-        vision_factor=_value(misc, 'circularVisionRadiusFactor', 1.0))
+        commander_level=profile['commander_level'],
+        vision_factor=_value(misc, 'circularVisionRadiusFactor', 1.0),
+        recon_level=profile['recon_level'],
+        situational_level=profile['situational_level'],
+        binocular_factor=profile['binocular_factor'],
+        binocular_active=(
+            profile['has_binoculars'] and
+            loadout.still_device_active(
+                still_seconds, profile['binocular_delay'])))
 
 
-def _base_invisibility(descriptor):
-    crew_factor = spotting.crew_camouflage_factor(0.0)
+def _base_invisibility(descriptor, crew_camouflage_level=0.0):
+    crew_factor = spotting.crew_camouflage_factor(crew_camouflage_level)
     calculator = getattr(descriptor, 'computeBaseInvisibility', None)
     if callable(calculator):
         try:

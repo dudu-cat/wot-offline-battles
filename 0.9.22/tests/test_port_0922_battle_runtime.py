@@ -6849,7 +6849,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'state': {'team': 2, 'health': 500, 'alive': True}}
         battle._records = {'bot:17': record}
         sightings = iter((False, True))
-        battle._spot_line_of_sight = lambda *unused: next(sightings)
+        battle._spot_line_of_sight = (
+            lambda *unused, **unused_kwargs: next(sightings))
 
         self.assertTrue(battle._update_spotting(10.0))
         self.assertTrue(record['spot_visible'])
@@ -6896,7 +6897,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             record.update(spot_visible=bool(visible)) or bool(visible)
         observers = []
 
-        def spot(observer, *unused):
+        def spot(observer, *unused, **unused_kwargs):
             observers.append(observer)
             return True
 

@@ -9,6 +9,48 @@ import zlib
 from gui.mods.offline_lan_0922.account_rpc import commands, requests
 
 
+def _refresh_garage_views(diff):
+    """Complete the stock refresh chain for a locally applied inventory diff.
+
+    ``gui/shared/personality.onClientUpdate`` runs
+    ``itemsCache.update(CLIENT_UPDATE, diff)`` and only then
+    ``g_clientUpdateManager.update(diff)``.  The order matters: the first call
+    drops ``ItemsRequester``'s memoised ``Vehicle`` and re-reads the inventory
+    behind it, and the second is what reaches
+    ``_CurrentVehicle.onInventoryUpdate`` -> ``onChanged`` ->
+    ``Hangar.__updateParams``.  Running the second alone would recompute the
+    parameters panel from the pre-mount descriptor.
+
+    This is a fallback: when the stock listener already completes the chain,
+    both calls are idempotent.  Any failure here is presentation only.
+    """
+    try:
+        import adisp
+        from gui.ClientUpdateManager import g_clientUpdateManager
+        from gui.shared.items_cache import CACHE_SYNC_REASON
+        from gui.shared.personality import ServicesLocator
+    except ImportError:
+        return False
+
+    @adisp.process
+    def refresh():
+        try:
+            yield ServicesLocator.itemsCache.update(
+                CACHE_SYNC_REASON.CLIENT_UPDATE, diff)
+            g_clientUpdateManager.update(diff)
+        except Exception as error:
+            print('[Offline LAN 0.9.22] the garage views did not refresh: '
+                  '%s' % error)
+
+    try:
+        refresh()
+    except Exception as error:
+        print('[Offline LAN 0.9.22] the garage refresh could not start: %s'
+              % error)
+        return False
+    return True
+
+
 def pack_stream(value):
     payload = zlib.compress(_pickle.dumps(value, _pickle.HIGHEST_PROTOCOL))
     crc = zlib.crc32(payload) & 0xffffffff
@@ -37,17 +79,37 @@ class FakeServer(object):
         """Publish one account diff through the exact #1513 entity method.
 
         ``PlayerAccount.update`` unpickles its argument and forwards it to
-        ``_update(True, diff)``, which is the same event path a full sync uses,
-        so the garage refreshes without a second wire format.
+        ``_update(True, diff)``.  Two details of that method matter:
+
+        - ``isFullSync`` is ``diff.get('prevRev') is None``, and a full sync
+          makes ``Inventory.synchronize`` clear the account cache before
+          applying the diff.  We publish a complete inventory, so either mode
+          is consistent, but stamping the revision pair keeps
+          ``syncData.revision`` advancing instead of resetting to zero.
+        - the only event it raises for an inventory diff is
+          ``onClientUpdated``.  The garage parameters panel is refreshed
+          further down that chain, by ``_CurrentVehicle.onInventoryUpdate``
+          reading ``diff['inventory'][1]['compDescr'][vehInvID]``, which the
+          published inventory already carries.
         """
         player = self._player()
         if player is None:
             return False
+        diff = dict(diff)
+        revision = 0
+        try:
+            revision = int(getattr(player.syncData, 'revision', 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            revision = 0
+        diff.setdefault('prevRev', revision)
+        diff.setdefault('rev', revision + 1)
         payload = _pickle.dumps(diff, _pickle.HIGHEST_PROTOCOL)
 
         def publish():
-            if self._player() is player:
-                player.update(payload)
+            if self._player() is not player:
+                return
+            player.update(payload)
+            _refresh_garage_views(diff)
 
         self._callback(0.0, publish)
         return True

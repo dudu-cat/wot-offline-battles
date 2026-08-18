@@ -1026,16 +1026,55 @@ The source audit deliberately keeps the following differences visible:
   argument into the normal `_update` event path. A gun swap refills the default
   ammunition, because the new gun's shells would otherwise disagree with the
   shell inventory that `data._validate_selected_vehicle` cross-checks;
-- purchase-side commands are not implemented, and are not needed: the snapshot
-  already owns stock of every artefact at zero price. `CMD_BUY_ITEM` 302,
-  `CMD_BUY_AND_EQUIP_ITEM` 308 and `CMD_VEH_SETTINGS` 107 therefore still return
-  `UNSUPPORTED_OFFLINE_COMMAND`;
-- the garage state is in-memory only. It is rebuilt from the bootstrap snapshot
-  on each client start, so a fitting or a learned crew skill does not survive
-  restarting the game;
-- the spotting path applies `circularVisionRadiusFactor` from the descriptor, so
-  coated optics work implicitly, but binocular telescope, camouflage net and the
-  Recon, Situational Awareness and Camouflage crew skills are not yet read;
+- purchases are implemented: `CMD_BUY_ITEM` 302 carries
+  `(cacheRev, intCompactDescr, count, goldForCredits)` and
+  `CMD_BUY_AND_EQUIP_ITEM` 308 carries
+  `[cacheRev, compDescr, vehInvID, slotIdx, isPaidRemoval, gunCompDescr]`;
+  `CMD_VEH_SETTINGS` 107 is the per-vehicle settings mask, not a purchase.
+  Balances are unlimited by choice: the offline shop publishes every item at
+  zero price, so a deduction would always subtract nothing, and ownership is the
+  only part of a purchase with an observable effect. Buying a VEHICLE is a
+  separate surface that is not implemented: `Shop.buy` routes a vehicle to
+  `buyVehicle`, which needs its own command plus a new inventory record, crew
+  and slot;
+- the garage now persists to `mods/configs/offline_lan_0922/garage_state.json`,
+  a sibling of `account_state.json` so each file keeps one owner. It stores
+  mounted devices and modules through the vehicle's compact descriptor, plus
+  consumables, shells, layouts, settings, learned crew skills and owned stock.
+  Records are keyed on `vehicleTypeCompactDescr` and on the crew slot index,
+  never on inventory ids, because those are renumbered whenever the vehicle in
+  `config.json` changes. The file is never shipped in the overlay, is written
+  atomically after each accepted change, and any unreadable or wrong-schema
+  content logs one line and falls back to the stock garage;
+- every module a vehicle type lists is published as owned and unlocked, so the
+  research tree can mount any gun, turret, engine, chassis or radio. The lists
+  come from the vehicle's own type, so a premium hull still offers only its own
+  modules;
+- the battle uses the garage loadout: the player's shells come from the mounted
+  layout mapped onto the gun's shot order, and the consumables come from the
+  mounted slots, so an empty slot carries nothing. Bots keep a synthetic
+  loadout by design;
+- the spotting law now applies the situational devices and the vision and
+  concealment crew skills for the player and for authority bots. Coated optics
+  stay implicit through `miscAttrs['circularVisionRadiusFactor']`, which
+  `StaticFactorDevice.updateVehicleDescrAttrs` folds into the descriptor;
+  binoculars and the camouflage net are applied explicitly because #1513 gives
+  them only `updateVehicleAttrFactors`, which writes a caller-owned dict this
+  port does not build. Binoculars replace the optics factor rather than stacking
+  with it, exactly as `Stereoscope.updateVehicleAttrFactors` does, and the
+  camouflage net adds `type.invisibilityDeltas['camouflageNetBonus']` to the
+  stationary branch only. Both wait the descriptor's own
+  `activateWhenStillSec`. Commander qualification, Recon
+  (`commander_eagleEye`, best single crewman), Situational Awareness
+  (`radioman_finder`, best single crewman) and crew Camouflage (averaged over
+  the whole crew) are read from the garage crew;
+- what remains unwired on that path: the stationary predicate itself is server
+  law in retail, published through
+  `Avatar.updateVehicleOptionalDeviceStatus`, and this client ships no cell
+  script, so the port uses its own speed threshold with the client's 3.0 second
+  delay; the camouflage paint bonus
+  (`invisibilityDeltas['camouflageBonus']`) and `invisibilityDeltas`
+  `firePenalty` are still not applied;
 - the server publishes terminal winner/reason/base team plus live frags and the
   human team-killer flag, but not the complete 0.8.2
   `personal`/`players`/`vehicles` battle-result record;

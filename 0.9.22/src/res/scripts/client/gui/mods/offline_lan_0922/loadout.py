@@ -200,3 +200,129 @@ def modifiers(descriptor=None, equipments=(), crew_skills=None):
 def baseline():
     """The bare-crew bundle used when no loadout is known."""
     return modifiers()
+
+
+# The two situational devices are absent from ``miscAttrs``: #1513 gives
+# ``Stereoscope`` and ``CamouflageNet`` only ``updateVehicleAttrFactors``, which
+# writes a caller-owned factors dict this port never builds.  Coated optics uses
+# ``updateVehicleDescrAttrs`` instead, so it IS already folded into
+# ``miscAttrs['circularVisionRadiusFactor']`` and must not be applied twice.
+_BINOCULAR_MARKERS = ('stereoscope',)
+_CAMOUFLAGE_NET_MARKERS = ('camouflagenet',)
+_RECON_SKILL = 'commander_eagleeye'
+_SITUATIONAL_SKILL = 'radioman_finder'
+_CAMOUFLAGE_SKILL = 'camouflage'
+
+
+def _number(value, default=0.0):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return value
+
+
+def _skill_level(member, wanted):
+    """Return one crew member's level in a named skill, 0.0 when absent."""
+    skills = getattr(member, 'skills', None)
+    if skills is None:
+        skills = getattr(getattr(member, 'descriptor', None), 'skills', None)
+    for skill in (skills or ()):
+        if _name_of(skill) != wanted:
+            continue
+        if not bool(getattr(skill, 'isActive', True)):
+            return 0.0
+        return max(0.0, _number(getattr(skill, 'level', 100.0), 100.0))
+    return 0.0
+
+
+def spotting_profile(descriptor=None, crew=None):
+    """Return the vision and concealment inputs our spotting law needs.
+
+    Every magnitude is read from the exact client's own descriptors: the
+    stereoscope's ``circularVisionRadiusFactor`` and ``activateWhenStillSec``,
+    and the vehicle type's ``invisibilityDeltas['camouflageNetBonus']``, which
+    is where #1513 keeps the camouflage net's strength.
+    """
+    profile = {
+        'commander_level': 100.0,
+        'recon_level': 0.0,
+        'situational_level': 0.0,
+        'camouflage_level': 0.0,
+        'binocular_factor': 1.0,
+        'binocular_delay': 3.0,
+        'camouflage_net_bonus': 0.0,
+        'camouflage_net_delay': 3.0,
+        'has_binoculars': False,
+        'has_camouflage_net': False,
+    }
+    if descriptor is not None:
+        misc = getattr(descriptor, 'miscAttrs', None) or {}
+        try:
+            optics_factor = float(
+                misc.get('circularVisionRadiusFactor', 1.0) or 1.0)
+        except (AttributeError, TypeError, ValueError):
+            optics_factor = 1.0
+        for device in (getattr(descriptor, 'optionalDevices', None) or ()):
+            if device is None:
+                continue
+            name = _name_of(device)
+            if _matches(name, _BINOCULAR_MARKERS):
+                factor = _number(
+                    getattr(device, 'circularVisionRadiusFactor', 0.0))
+                if factor > 0.0:
+                    # #1513 divides the descriptor's optics factor out, so the
+                    # binocular value replaces it instead of stacking.
+                    profile['binocular_factor'] = max(
+                        profile['binocular_factor'],
+                        factor / max(optics_factor, 1e-6))
+                profile['has_binoculars'] = True
+                profile['binocular_delay'] = _number(
+                    getattr(device, 'activateWhenStillSec', 3.0), 3.0)
+            elif _matches(name, _CAMOUFLAGE_NET_MARKERS):
+                profile['has_camouflage_net'] = True
+                profile['camouflage_net_delay'] = _number(
+                    getattr(device, 'activateWhenStillSec', 3.0), 3.0)
+        if profile['has_camouflage_net']:
+            deltas = getattr(
+                getattr(descriptor, 'type', None), 'invisibilityDeltas',
+                None) or {}
+            try:
+                profile['camouflage_net_bonus'] = max(
+                    0.0, float(deltas.get('camouflageNetBonus', 0.0) or 0.0))
+            except (AttributeError, TypeError, ValueError):
+                profile['camouflage_net_bonus'] = 0.0
+
+    members = []
+    for member in (crew or ()):
+        if isinstance(member, tuple) and len(member) == 2:
+            member = member[1]
+        if member is not None:
+            members.append(member)
+    if members:
+        camouflage_total = 0.0
+        for member in members:
+            role = str(getattr(member, 'role', '') or '').lower()
+            if role == 'commander' or not profile.get('_commander_seen'):
+                level = getattr(member, 'roleLevel', None)
+                if role == 'commander' and level is not None:
+                    profile['commander_level'] = max(
+                        0.0, _number(level, 100.0))
+                    profile['_commander_seen'] = True
+            # #1513 takes the single best crewman for a role-specific skill.
+            profile['recon_level'] = max(
+                profile['recon_level'], _skill_level(member, _RECON_SKILL))
+            profile['situational_level'] = max(
+                profile['situational_level'],
+                _skill_level(member, _SITUATIONAL_SKILL))
+            camouflage_total += _skill_level(member, _CAMOUFLAGE_SKILL)
+        # Camouflage is crew-wide: the sum is divided by the whole crew, so a
+        # member without the skill contributes zero rather than being skipped.
+        profile['camouflage_level'] = camouflage_total / float(len(members))
+    profile.pop('_commander_seen', None)
+    return profile
+
+
+def still_device_active(still_seconds, delay_seconds):
+    """Whether a stationary-only device has finished its activation delay."""
+    return _number(still_seconds, 0.0) >= max(0.0, _number(delay_seconds, 3.0))

@@ -9,7 +9,7 @@ CLIENT_SCRIPTS = (
     ROOT / '0.9.22' / 'src' / 'res' / 'scripts' / 'client')
 sys.path.insert(0, str(CLIENT_SCRIPTS))
 
-from gui.mods.offline_lan_0922 import gun_mechanics, loadout
+from gui.mods.offline_lan_0922 import gun_mechanics, loadout, spotting
 
 
 def _device(name):
@@ -134,6 +134,106 @@ class GunStateLoadoutTests(unittest.TestCase):
         steady.tick(0.0, False, 10.0, 0.0, 0.0, descriptor)
 
         self.assertLess(steady.dispersion, plain.dispersion)
+
+
+class SpottingProfileTests(unittest.TestCase):
+    """The device magnitudes come from the client's own descriptors."""
+
+    def _descriptor(self, devices=(), optics=1.0, net_bonus=0.1):
+        return types.SimpleNamespace(
+            optionalDevices=list(devices),
+            miscAttrs={'circularVisionRadiusFactor': optics},
+            type=types.SimpleNamespace(
+                invisibilityDeltas={'camouflageNetBonus': net_bonus}))
+
+    def _binoculars(self, factor=1.25, delay=3.0):
+        return types.SimpleNamespace(
+            name='stereoscope', circularVisionRadiusFactor=factor,
+            activateWhenStillSec=delay)
+
+    def _camouflage_net(self, delay=3.0):
+        return types.SimpleNamespace(
+            name='camouflageNet', activateWhenStillSec=delay)
+
+    def test_a_bare_vehicle_carries_no_situational_device(self):
+        profile = loadout.spotting_profile(self._descriptor())
+
+        self.assertFalse(profile['has_binoculars'])
+        self.assertFalse(profile['has_camouflage_net'])
+        self.assertEqual(1.0, profile['binocular_factor'])
+        self.assertEqual(0.0, profile['camouflage_net_bonus'])
+
+    def test_binoculars_replace_coated_optics_instead_of_stacking(self):
+        # #1513's Stereoscope divides the descriptor's optics factor out.
+        profile = loadout.spotting_profile(
+            self._descriptor([self._binoculars()], optics=1.1))
+
+        self.assertTrue(profile['has_binoculars'])
+        self.assertAlmostEqual(1.25 / 1.1, profile['binocular_factor'])
+        base = 400.0 * 1.1
+        self.assertAlmostEqual(
+            400.0 * 1.25,
+            spotting.effective_view_range(
+                400.0, vision_factor=1.1,
+                binocular_factor=profile['binocular_factor'],
+                binocular_active=True))
+        self.assertAlmostEqual(
+            base,
+            spotting.effective_view_range(400.0, vision_factor=1.1))
+
+    def test_the_camouflage_net_bonus_comes_from_the_vehicle_type(self):
+        profile = loadout.spotting_profile(
+            self._descriptor([self._camouflage_net()], net_bonus=0.13))
+
+        self.assertTrue(profile['has_camouflage_net'])
+        self.assertAlmostEqual(0.13, profile['camouflage_net_bonus'])
+
+    def test_a_still_device_waits_for_its_activation_delay(self):
+        self.assertFalse(loadout.still_device_active(2.9, 3.0))
+        self.assertTrue(loadout.still_device_active(3.0, 3.0))
+        self.assertTrue(loadout.still_device_active(9.0, 3.0))
+
+    def test_recon_and_situational_take_the_best_single_crewman(self):
+        crew = (
+            types.SimpleNamespace(role='commander', roleLevel=100.0, skills=[
+                types.SimpleNamespace(name='commander_eagleEye', level=60.0)]),
+            types.SimpleNamespace(role='radioman', roleLevel=100.0, skills=[
+                types.SimpleNamespace(name='commander_eagleEye', level=90.0),
+                types.SimpleNamespace(name='radioman_finder', level=50.0)]),
+        )
+
+        profile = loadout.spotting_profile(self._descriptor(), crew)
+
+        self.assertEqual(90.0, profile['recon_level'])
+        self.assertEqual(50.0, profile['situational_level'])
+
+    def test_camouflage_is_averaged_over_the_whole_crew(self):
+        crew = (
+            types.SimpleNamespace(role='commander', roleLevel=100.0, skills=[
+                types.SimpleNamespace(name='camouflage', level=100.0)]),
+            types.SimpleNamespace(role='driver', roleLevel=100.0, skills=[]),
+        )
+
+        profile = loadout.spotting_profile(self._descriptor(), crew)
+
+        # A member without the skill contributes zero, it is not skipped.
+        self.assertAlmostEqual(50.0, profile['camouflage_level'])
+
+    def test_an_inactive_skill_contributes_nothing(self):
+        crew = (types.SimpleNamespace(role='commander', roleLevel=100.0, skills=[
+            types.SimpleNamespace(
+                name='radioman_finder', level=100.0, isActive=False)]),)
+
+        profile = loadout.spotting_profile(self._descriptor(), crew)
+
+        self.assertEqual(0.0, profile['situational_level'])
+
+    def test_the_skills_lengthen_the_view_range(self):
+        plain = spotting.effective_view_range(400.0)
+        keen = spotting.effective_view_range(
+            400.0, recon_level=100.0, situational_level=100.0)
+
+        self.assertAlmostEqual(plain * 1.02 * 1.03, keen)
 
 
 if __name__ == '__main__':

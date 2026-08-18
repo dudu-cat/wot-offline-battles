@@ -467,6 +467,14 @@ def _xyz(value):
                 _number(getattr(value, 'z', 0.0)))
 
 
+def _spotting_observer(observer):
+    """Accept both the three-field and the five-field observer tuple."""
+    values = tuple(observer)
+    if len(values) >= 5:
+        return values[:5]
+    return values[0], values[1], values[2], 0.0, False
+
+
 def _distance_2d(first, second):
     dx = float(first[0]) - float(second[0])
     dz = float(first[2]) - float(second[2])
@@ -745,6 +753,8 @@ class BattleRuntime(object):
         self._equipment_signature = None
         self._local_loadout_cache = None
         self._local_ammo_layout_cache = None
+        self._local_spotting_cache = None
+        self._local_still_since = None
         self._battle_result = None
         self._round_finished_notified = False
         self._on_local_leave = None
@@ -885,6 +895,8 @@ class BattleRuntime(object):
         self._equipment_signature = None
         self._local_loadout_cache = None
         self._local_ammo_layout_cache = None
+        self._local_spotting_cache = None
+        self._local_still_since = None
         self._battle_result = self._start_message.get('battle_result')
         self._round_finished_notified = False
         self._on_local_leave = on_local_leave
@@ -8029,8 +8041,23 @@ class BattleRuntime(object):
         alive = getattr(entity, 'isAlive', None)
         return bool(alive() if callable(alive) else alive)
 
-    @staticmethod
-    def _vision_radius(descriptor, entity=None):
+    def _spotting_profile(self, descriptor, local=False):
+        """Return the device and crew spotting inputs for one descriptor.
+
+        Only the local player has a garage crew to read; a bot keeps the
+        untrained baseline so both sides use one law with different inputs.
+        """
+        if local:
+            if self._local_spotting_cache is None:
+                item = self._garage_item()
+                crew = getattr(item, 'crew', None) if item is not None else None
+                self._local_spotting_cache = loadout_law.spotting_profile(
+                    descriptor, crew)
+            return self._local_spotting_cache
+        return loadout_law.spotting_profile(descriptor, None)
+
+    def _vision_radius(self, descriptor, entity=None, still_seconds=0.0,
+                       local=False):
         turret = _field(descriptor, 'turret', {})
         misc = _field(descriptor, 'miscAttrs', {})
         damage_factor = 1.0
@@ -8038,15 +8065,24 @@ class BattleRuntime(object):
             damage_factor = critical_damage._device_damage.\
                 clamp_vision_factor(
                     critical_damage.stat_factor(entity, 'vision'))
+        profile = self._spotting_profile(descriptor, local)
         return spotting.effective_view_range(
             _field(turret, 'circularVisionRadius', 400.0),
+            commander_level=profile['commander_level'],
             vision_factor=(
                 _field(misc, 'circularVisionRadiusFactor', 1.0) *
-                damage_factor))
+                damage_factor),
+            recon_level=profile['recon_level'],
+            situational_level=profile['situational_level'],
+            binocular_factor=profile['binocular_factor'],
+            binocular_active=(
+                profile['has_binoculars'] and
+                loadout_law.still_device_active(
+                    still_seconds, profile['binocular_delay'])))
 
     @staticmethod
-    def _base_invisibility(descriptor):
-        crew_factor = spotting.crew_camouflage_factor(0.0)
+    def _base_invisibility(descriptor, crew_camouflage_level=0.0):
+        crew_factor = spotting.crew_camouflage_factor(crew_camouflage_level)
         calculator = getattr(descriptor, 'computeBaseInvisibility', None)
         if callable(calculator):
             try:
@@ -8071,8 +8107,11 @@ class BattleRuntime(object):
             _field(gun, 'invisibilityFactorAtShot', 1.0), 0.0, 1.0)
 
     def _spot_line_of_sight(self, observer, target, target_descriptor,
-                            target_moving=False, fired_recently=False):
-        observer_position, observer_descriptor, observer_entity = observer
+                            target_moving=False, fired_recently=False,
+                            target_still_seconds=0.0):
+        (observer_position, observer_descriptor, observer_entity,
+         observer_still_seconds, observer_is_local) = _spotting_observer(
+            observer)
         distance = _distance_2d(observer_position, target)
         if distance <= spotting.PROXIMITY_SPOT_DISTANCE:
             return True
@@ -8101,15 +8140,26 @@ class BattleRuntime(object):
         if self._foliage is not None:
             foliage_bonus = self._foliage.camouflage_bonus(
                 observer_position, target, fired_recently)
+        target_profile = loadout_law.spotting_profile(target_descriptor, None)
         camouflage = spotting.effective_camouflage(
-            self._base_invisibility(target_descriptor),
+            self._base_invisibility(
+                target_descriptor, target_profile['camouflage_level']),
             moving=target_moving,
+            camouflage_net_bonus=target_profile['camouflage_net_bonus'],
+            camouflage_net_active=(
+                target_profile['has_camouflage_net'] and
+                not target_moving and
+                loadout_law.still_device_active(
+                    target_still_seconds,
+                    target_profile['camouflage_net_delay'])),
             shot_factor=self._shot_invisibility_factor(target_descriptor),
             fired_recently=fired_recently,
             foliage_bonus=foliage_bonus)
         return spotting.is_detected(
             distance, self._vision_radius(
-                observer_descriptor, observer_entity), camouflage,
+                observer_descriptor, observer_entity,
+                still_seconds=observer_still_seconds,
+                local=observer_is_local), camouflage,
             has_line_of_sight=True)
 
     def _spotting_observers(self):
@@ -8122,8 +8172,15 @@ class BattleRuntime(object):
             'player:%s' % self.client.player_id)
         direct_observer = None
         if self._record_alive(local_record or {}, local_entity):
+            now = self._clock()
+            if abs(self._local_speed) > spotting.MOVING_SPEED_EPSILON:
+                self._local_still_since = None
+            elif self._local_still_since is None:
+                self._local_still_since = now
             direct_observer = (
-                self._local_position, self._local_descriptor, local_entity)
+                self._local_position, self._local_descriptor, local_entity,
+                0.0 if self._local_still_since is None
+                else max(0.0, now - self._local_still_since), True)
         observers = [direct_observer]
         for record in self._records.values():
             if (record.get('local') or not record.get('ready') or
@@ -8135,8 +8192,22 @@ class BattleRuntime(object):
             if entity is None or not self._record_alive(record, entity):
                 continue
             observers.append((
-                _xyz(entity.position), entity.typeDescriptor, entity))
+                _xyz(entity.position), entity.typeDescriptor, entity,
+                self._record_still_seconds(record), False))
         return tuple(observers)
+
+    def _record_still_seconds(self, record):
+        """How long this record has been stationary, for the still devices."""
+        state = record.get('state') or {}
+        now = self._clock()
+        if abs(_number(state.get('speed'))) > spotting.MOVING_SPEED_EPSILON:
+            record['still_since'] = None
+            return 0.0
+        since = record.get('still_since')
+        if since is None:
+            record['still_since'] = now
+            return 0.0
+        return max(0.0, now - float(since))
 
     @staticmethod
     def _spotting_probe_phase(record):
@@ -8202,14 +8273,17 @@ class BattleRuntime(object):
                         spotting.MOVING_SPEED_EPSILON)
                 fired_recently = now < float(
                     record.get('shot_penalty_until', 0.0))
+                target_still = self._record_still_seconds(record)
                 direct_seen = (
                     observers[0] is not None and
                     self._spot_line_of_sight(
                         observers[0], target, entity.typeDescriptor,
-                        target_moving, fired_recently))
+                        target_moving, fired_recently,
+                        target_still_seconds=target_still))
                 seen = direct_seen or any(self._spot_line_of_sight(
                     observer, target, entity.typeDescriptor,
-                    target_moving, fired_recently)
+                    target_moving, fired_recently,
+                    target_still_seconds=target_still)
                     for observer in observers[1:])
                 if seen:
                     record['spot_until'] = (
@@ -8999,6 +9073,8 @@ class BattleRuntime(object):
         self._equipment_signature = None
         self._local_loadout_cache = None
         self._local_ammo_layout_cache = None
+        self._local_spotting_cache = None
+        self._local_still_since = None
         self._battle_result = None
         self._round_finished_notified = False
         self._on_local_leave = None

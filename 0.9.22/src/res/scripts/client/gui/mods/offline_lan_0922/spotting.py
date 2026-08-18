@@ -21,12 +21,33 @@ def qualification_factor(role_level):
 	return (0.5 + 0.00375 * clamp(role_level, 0.0, 150.0)) / 0.875
 
 
+# scripts/item_defs/tankmen/tankmen.xml: commander_eagleEye carries
+# distanceFactorPerLevelWhenDeviceWorking, radioman_finder carries
+# visionRadiusFactorPerLevel.
+RECON_FACTOR_PER_LEVEL = 0.0002
+SITUATIONAL_FACTOR_PER_LEVEL = 0.0003
+# optional_devices.xml gives both situational devices activateWhenStillSec 3.0.
+STILL_DEVICE_DELAY_SECONDS = 3.0
+
+
 def effective_view_range(base_range, commander_level=100.0,
-		vision_factor=1.0):
-	"""Return uncapped view range; excess range still counters camouflage."""
+		vision_factor=1.0, recon_level=0.0, situational_level=0.0,
+		binocular_factor=1.0, binocular_active=False):
+	"""Return uncapped view range; excess range still counters camouflage.
+
+	``binocular_factor`` is the stereoscope's own
+	``circularVisionRadiusFactor``.  #1513 divides the descriptor's optics
+	factor out before applying it, so binoculars REPLACE coated optics rather
+	than stacking with them; the caller passes the ratio already resolved.
+	"""
 	result = max(PROXIMITY_SPOT_DISTANCE, float(base_range or 0.0))
 	result *= qualification_factor(commander_level)
 	result *= max(0.0, float(vision_factor or 0.0))
+	result *= 1.0 + RECON_FACTOR_PER_LEVEL * clamp(recon_level, 0.0, 100.0)
+	result *= 1.0 + SITUATIONAL_FACTOR_PER_LEVEL * clamp(
+		situational_level, 0.0, 100.0)
+	if binocular_active:
+		result *= max(1.0, float(binocular_factor or 1.0))
 	return max(PROXIMITY_SPOT_DISTANCE, result)
 
 
