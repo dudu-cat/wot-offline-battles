@@ -741,6 +741,7 @@ class BattleRuntime(object):
         self._targeting_signature = None
         self._reload_event = None
         self._equipment_state = None
+        self._equipment_signature = None
         self._battle_result = None
         self._round_finished_notified = False
         self._on_local_leave = None
@@ -878,6 +879,7 @@ class BattleRuntime(object):
         self._targeting_signature = None
         self._reload_event = None
         self._equipment_state = None
+        self._equipment_signature = None
         self._battle_result = self._start_message.get('battle_result')
         self._round_finished_notified = False
         self._on_local_leave = on_local_leave
@@ -3167,7 +3169,12 @@ class BattleRuntime(object):
                 self._ammo_tick()
 
     def _default_equipments(self):
-        """Resolve the three copied 0.8.2 consumables from #1513 data."""
+        """Resolve the three copied 0.8.2 consumables from #1513 data.
+
+        ``reuseCount`` and ``cooldownSeconds`` come from the exact client's
+        ``scripts/item_defs/vehicles/common/equipments.xml``, where these three
+        kits carry ``reuseCount = -1`` (unlimited) and 90-second cooldowns.
+        """
         try:
             values = self._runtime.vehicles.g_cache.equipments().values()
         except Exception:
@@ -3190,18 +3197,66 @@ class BattleRuntime(object):
                 compact_descr = int(descriptor.compactDescr)
             except (TypeError, ValueError, IndexError, AttributeError):
                 continue
+            cooldown = _number(
+                getattr(descriptor, 'cooldownSeconds',
+                        getattr(descriptor, 'cooldownTime', 0.0)), 0.0)
+            try:
+                reuse_count = int(getattr(descriptor, 'reuseCount', -1))
+            except (TypeError, ValueError):
+                reuse_count = -1
             result.append({
                 'id': equipment_id, 'compact_descr': compact_descr,
-                'name': name, 'kind': kind, 'used': False})
+                'name': name, 'kind': kind,
+                'cooldown': max(0.0, cooldown),
+                # -1 is the client's unlimited-reuse marker; 0 means one shot.
+                'uses_left': -1 if reuse_count < 0 else max(1, reuse_count),
+                'ready_at': 0.0})
         return result
 
-    def _present_equipments(self):
+    def _equipment_stages(self):
+        stages = getattr(self._runtime.constants, 'EQUIPMENT_STAGES', None)
+        if stages is None:
+            raise RuntimeError('#1513 equipment stages are unavailable')
+        return stages
+
+    def _equipment_echo(self, equipment, now):
+        """Return the exact ``(quantity, stage, timeRemaining)`` echo.
+
+        ``Avatar.updateVehicleAmmo`` forwards its fourth argument as the
+        equipment STAGE, not a clip count, so a consumable published with
+        stage 0 (``NOT_RUNNING``) never becomes usable again.
+        """
+        stages = self._equipment_stages()
+        if equipment['uses_left'] == 0:
+            return 0, int(stages.EXHAUSTED), 0
+        remaining = _number(equipment.get('ready_at'), 0.0) - float(now)
+        if remaining > 0.0:
+            return 1, int(stages.COOLDOWN), int(math.ceil(remaining))
+        return 1, int(stages.READY), 0
+
+    def _present_equipments(self, now=None):
         if self._equipment_state is None:
             self._equipment_state = self._default_equipments()
+        if now is None:
+            now = self._clock()
         for equipment in self._equipment_state:
+            quantity, stage, remaining = self._equipment_echo(equipment, now)
             self._avatar.updateVehicleAmmo(
                 self._server.vehicle_id, equipment['compact_descr'],
-                0 if equipment['used'] else 1, 0, 0)
+                quantity, stage, remaining)
+
+    def _tick_equipment_cooldowns(self, now):
+        """Republish a consumable the moment its cooldown expires."""
+        if not self._equipment_state:
+            return False
+        signature = tuple(
+            self._equipment_echo(equipment, now)
+            for equipment in self._equipment_state)
+        if signature == self._equipment_signature:
+            return False
+        self._equipment_signature = signature
+        self._present_equipments(now)
+        return True
 
     @staticmethod
     def _critical_name_from_extra_index(descriptor, extra_index):
@@ -3235,7 +3290,10 @@ class BattleRuntime(object):
         extra_index = max(0, activation_code >> 16)
         equipment = next((value for value in self._equipment_state
                           if value['id'] == equipment_id), None)
-        if equipment is None or equipment['used']:
+        if equipment is None or equipment['uses_left'] == 0:
+            return False
+        now = self._clock()
+        if _number(equipment.get('ready_at'), 0.0) > now:
             return False
         record = self._records.get('player:%s' % self.client.player_id)
         if record is None or self._server is None:
@@ -3259,7 +3317,9 @@ class BattleRuntime(object):
             return False
         if payload is None:
             return False
-        equipment['used'] = True
+        equipment['ready_at'] = now + equipment['cooldown']
+        if equipment['uses_left'] > 0:
+            equipment['uses_left'] -= 1
         canonical = self._critical_state(payload)
         record['critical_state'] = canonical
         state = dict(record.get('state') or {})
@@ -3393,6 +3453,7 @@ class BattleRuntime(object):
                 aim_time_factor=critical_damage.stat_factor(
                     entity, 'aim_time'))
             self._publish_ammo_state(state)
+            self._tick_equipment_cooldowns(now)
             if not self._battle_live:
                 self._publish_reload_event(
                     0.0, state.reload_duration)
@@ -8789,6 +8850,7 @@ class BattleRuntime(object):
         self._ammo_signature = None
         self._targeting_signature = None
         self._equipment_state = None
+        self._equipment_signature = None
         self._battle_result = None
         self._round_finished_notified = False
         self._on_local_leave = None

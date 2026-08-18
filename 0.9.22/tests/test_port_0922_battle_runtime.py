@@ -1118,6 +1118,9 @@ def _runtime():
         },
         DAMAGE_INFO_CODES=tuple(
             'CODE_%d' % index for index in range(38)),
+        EQUIPMENT_STAGES=types.SimpleNamespace(
+            NOT_RUNNING=0, DEPLOYING=1, UNAVAILABLE=2, READY=3,
+            PREPARING=4, ACTIVE=5, COOLDOWN=6, EXHAUSTED=255),
         VEHICLE_HIT_FLAGS=types.SimpleNamespace(
             ATTACK_IS_DIRECT_PROJECTILE=1,
             MATERIAL_WITH_POSITIVE_DF_PIERCED_BY_PROJECTILE=2,
@@ -7691,7 +7694,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'angle is invalid'):
             battle._native_dispersion_angle()
 
-    def test_equipment_activation_decodes_exact_extra_and_consumes_once(self):
+    def test_equipment_activation_decodes_extra_and_enters_cooldown(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle.state = 'running'
@@ -7716,8 +7719,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._equipment_state = [{
             'id': 41, 'compact_descr': 401,
             'name': 'smallrepairkit', 'kind': 'repairkit',
-            'used': False}]
+            'cooldown': 90.0, 'uses_left': -1, 'ready_at': 0.0}]
         battle._present_critical = mock.Mock(return_value=True)
+        clock = [1000.0]
+        battle._clock = lambda: clock[0]
 
         activation_code = (7 << 16) | 41
         battle._records['player:1']['state'].update(
@@ -7726,7 +7731,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             runtime.constants.VEHICLE_SETTING.ACTIVATE_EQUIPMENT,
             activation_code))
         self.assertEqual(0.0, entity.devices_hp['engineHealth'])
-        self.assertFalse(battle._equipment_state[0]['used'])
+        self.assertEqual(0.0, battle._equipment_state[0]['ready_at'])
         battle._records['player:1']['state'].update(
             health=500, alive=True)
         self.assertTrue(battle.change_vehicle_setting(
@@ -7734,17 +7739,31 @@ class BattleRuntimeContractTests(unittest.TestCase):
             activation_code))
 
         self.assertEqual(100.0, entity.devices_hp['engineHealth'])
-        self.assertTrue(battle._equipment_state[0]['used'])
-        # The activation is accepted once; the stock controller receives a
-        # zero quantity immediately, so a second click cannot reuse the kit.
-        self.assertEqual((10, 401, 0, 0, 0),
+        # equipments.xml gives these kits reuseCount -1 and a 90 s cooldown,
+        # so the echo is COOLDOWN with a remaining time, never a zero quantity.
+        self.assertEqual(1090.0, battle._equipment_state[0]['ready_at'])
+        self.assertEqual((10, 401, 1, 6, 90),
                          runtime.bigworld.avatar.ammo_updates[-1])
         self.assertEqual([], battle._records[
             'player:1']['critical_state']['destroyed'])
         self.assertIsNotNone(battle._local_damage_report)
+
+        # A second click inside the cooldown is refused.
         self.assertFalse(battle.change_vehicle_setting(
             runtime.constants.VEHICLE_SETTING.ACTIVATE_EQUIPMENT,
             activation_code))
+
+        # Once it expires the kit is READY and usable again.
+        clock[0] = 1090.0
+        battle._tick_equipment_cooldowns(clock[0])
+        self.assertEqual((10, 401, 1, 3, 0),
+                         runtime.bigworld.avatar.ammo_updates[-1])
+        entity.devices_hp['engineHealth'] = 0.0
+        entity._destroyed_devices = set(['engineHealth'])
+        self.assertTrue(battle.change_vehicle_setting(
+            runtime.constants.VEHICLE_SETTING.ACTIVATE_EQUIPMENT,
+            activation_code))
+        self.assertEqual(100.0, entity.devices_hp['engineHealth'])
 
     def test_hit_resolution_uses_public_1513_gun_rotator_api(self):
         runtime = _runtime()
