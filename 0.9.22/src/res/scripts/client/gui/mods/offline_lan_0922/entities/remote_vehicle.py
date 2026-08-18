@@ -337,8 +337,17 @@ class _RemoteShotPresenter(object):
         except Exception:
             return False
 
-    def stop_canonical(self, projectile_id, end_position):
-        """Hide one authoritative tracer at its canonical terminal point."""
+    def stop_canonical(self, projectile_id, end_position,
+                       explosion=None):
+        """Hide one authoritative tracer at its canonical terminal point.
+
+        ``explosion`` carries ``(effectsDescr, effectMaterial, velocityDir)``
+        for a terminal on the world.  Retail plays the ground explosion from
+        ``ProjectileMover.explode``; ``hide`` deliberately clears
+        ``showExplosion``, so hiding alone can never produce one.  A vehicle
+        terminal passes None, because retail plays only the ``armorHit`` family
+        through the vehicle's own bound effects there.
+        """
         if self._closed or projectile_id is None:
             return False
         try:
@@ -356,6 +365,46 @@ class _RemoteShotPresenter(object):
             return False
         try:
             callback(shot_id, end)
+        except Exception:
+            return False
+        self._explode_canonical(mover, shot_id, end, explosion)
+        return True
+
+    def _explode_canonical(self, mover, shot_id, end, explosion):
+        """Play the retail ground explosion for one world terminal.
+
+        ``hide`` re-keys the entry, so ``explode`` no longer finds the
+        projectile and takes its own synthetic-record branch, which reaches
+        ``__addExplosionEffect`` immediately.  The only difference from a
+        server-driven explosion is that the effect carries no attacker id.
+        """
+        if not explosion:
+            return False
+        explode = getattr(mover, 'explode', None)
+        if not callable(explode):
+            return False
+        try:
+            effects_descr, effect_material, velocity = explosion
+        except (TypeError, ValueError):
+            return False
+        if not effects_descr or not effect_material:
+            return False
+        # An artillery-strike descriptor makes ProjectileMover.explode return
+        # before it plays anything; never pretend that produced an effect.
+        try:
+            if 'artilleryID' in effects_descr:
+                return False
+        except TypeError:
+            return False
+        direction = self._finite_vector(velocity)
+        if direction is None:
+            return False
+        try:
+            if direction.length <= 0.0:
+                return False
+            direction.normalise()
+            explode(shot_id, effects_descr, str(effect_material), end,
+                    direction)
         except Exception:
             return False
         return True
@@ -1175,10 +1224,11 @@ class RemoteVehicleFactory(object):
             max_distance, attacker_id, projectile_id,
             reference_position, reference_velocity)
 
-    def stop_projectile_tracer(self, projectile_id, end_position):
+    def stop_projectile_tracer(self, projectile_id, end_position,
+                               explosion=None):
         """Retire one canonical tracer after a server terminal event."""
         return self._shot_presenter.stop_canonical(
-            projectile_id, end_position)
+            projectile_id, end_position, explosion)
 
     def destroy(self, entity_id):
         vehicle = self._vehicles.pop(entity_id, None)

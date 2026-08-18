@@ -4701,7 +4701,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertAlmostEqual(0.02, update_args[0])
         self.assertEqual(1.0, update_args[1])
         self.assertEqual({'players': []}, update_kwargs)
-        battle._bots.presentation_states.assert_called_once_with()
+        # The render clock is passed so a bot integrating below the
+        # frame rate can be dead-reckoned for presentation.
+        battle._bots.presentation_states.assert_called_once_with(1.0)
         battle._apply_authority_bot_poses.assert_called_once_with((state,))
         battle._schedule.assert_called_once_with(0.0, battle._frame)
 

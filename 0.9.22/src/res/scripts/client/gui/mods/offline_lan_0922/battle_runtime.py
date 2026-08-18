@@ -518,6 +518,8 @@ def _load_runtime():
     from OfflineMapCreator import g_offlineMapCreator
     from AvatarInputHandler import aih_constants
     from AvatarInputHandler import gun_marker_ctrl
+    from helpers import EffectMaterialCalculation
+    import material_kinds
     from gun_rotation_shared import encodeGunAngles
     from gui.app_loader import g_appLoader
     from gui.app_loader.settings import GUI_GLOBAL_SPACE_ID
@@ -545,6 +547,8 @@ def _load_runtime():
     runtime.compatibility = g_compatibility
     runtime.constants = constants
     runtime.destructibles_cache = DestructiblesCache
+    runtime.effect_material_calculation = EffectMaterialCalculation
+    runtime.material_kinds = material_kinds
     runtime.encode_gun_angles = encodeGunAngles
     runtime.game = game
     runtime.gui_global_space_id = GUI_GLOBAL_SPACE_ID
@@ -5408,6 +5412,59 @@ class BattleRuntime(object):
             attacker_id, normalized['projectile_id'], reference_origin,
             reference_velocity))
 
+    def _projectile_explosion(self, projectile_id, impact):
+        """Return ``(effectsDescr, effectMaterial, velocity)`` for a world hit.
+
+        Returns None for a vehicle terminal and whenever the verdict is not
+        ours to make, because an explosion added on top of the armour-hit
+        effect would be a visible regression while a missing one is not.
+        """
+        meta = self._projectile_meta.get(projectile_id)
+        if meta is None or meta.get('hit_vehicle') is not False:
+            return None
+        shot = self._projectile_shot(meta)
+        shell = _field(shot, 'shell', None)
+        effects_index = _field(shell, 'effectsIndex', None)
+        if effects_index is None:
+            return None
+        try:
+            effects_descr = self._runtime.vehicles.g_cache.shotEffects[
+                int(effects_index)]
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            return None
+        material = self._surface_effect_material(impact)
+        if material is None:
+            return None
+        velocity = meta.get('terminal_velocity')
+        if not velocity or len(tuple(velocity)) < 3:
+            visual = self._projectile_visual_meta.get(projectile_id)
+            velocity = visual.get('velocity') if visual else None
+        if not velocity:
+            return None
+        return (effects_descr, material, self._vector(_xyz(velocity)))
+
+    def _surface_effect_material(self, impact):
+        """Resolve the impact surface to one ``EFFECT_MATERIALS`` name.
+
+        ``ProjectileMover.explode`` indexes the effect descriptor with
+        ``effectMaterial + 'Hit'``, so a wrong name raises instead of drawing.
+        """
+        calculation = getattr(
+            self._runtime, 'effect_material_calculation', None)
+        materials = getattr(self._runtime, 'material_kinds', None)
+        if calculation is None or materials is None:
+            return None
+        try:
+            surface = calculation.calcSurfaceMaterialNearPoint(
+                self._vector(_xyz(impact)), self._vector((0.0, 1.0, 0.0)),
+                self._avatar.spaceID)
+            index = surface.effectIdx
+            if index is None:
+                return None
+            return materials.EFFECT_MATERIALS[int(index)]
+        except Exception:
+            return None
+
     def _stop_projectile_visual(self, projectile_id, event):
         if self._remote_factory is None:
             return False
@@ -5430,7 +5487,8 @@ class BattleRuntime(object):
         if impact is None:
             return False
         stopped = bool(self._remote_factory.stop_projectile_tracer(
-            projectile_id, impact))
+            projectile_id, impact,
+            explosion=self._projectile_explosion(projectile_id, impact)))
         self._projectile_visual_meta.pop(projectile_id, None)
         return stopped
 
@@ -5859,6 +5917,11 @@ class BattleRuntime(object):
             'state': state, 'outcome': outcome, 'impact': impact,
             'direct': direct, 'splash': splash,
         }
+        # Retail plays a ground explosion only for a terminal on the world; a
+        # vehicle terminal shows the armour-hit family instead.  Record the
+        # verdict now, because the relayed terminal event carries no target.
+        meta['hit_vehicle'] = direct is not None
+        meta['terminal_velocity'] = tuple(state.get('velocity') or ())
         meta['pending_resolution'] = pending
         return self._submit_projectile_resolution(meta)
 
@@ -6159,7 +6222,7 @@ class BattleRuntime(object):
                 # the native filters to that message recreates visible steps
                 # and also tempts transport code to drop strict combat_seq
                 # proposals after they have already been formed.
-                states = presentation_states()
+                states = presentation_states(now)
                 bot_count = len(states)
                 self._apply_authority_bot_poses(states)
             if profiling:

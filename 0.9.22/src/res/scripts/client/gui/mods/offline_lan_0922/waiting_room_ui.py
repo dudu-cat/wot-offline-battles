@@ -40,9 +40,17 @@ import sys
 PANEL_TEXTURE = ''
 PANEL_FONT = 'default_small.font'
 OVERLAY_Z = 0.1
-INPUT_KEY_MODE = 2
 
 _HOST_CONTROLS = ('previous', 'map', 'next', 'start')
+
+
+def _LEFT_MOUSE_KEY():
+    """Return this client's left-mouse key constant, or None."""
+    try:
+        import Keys
+    except ImportError:
+        return None
+    return getattr(Keys, 'KEY_LEFTMOUSE', None)
 
 
 def _log(message):
@@ -114,10 +122,13 @@ class NativeSurface(object):
         return True
 
     def hide_cursor(self):
-        """Release the native cursor exactly as ``Cursor.detachCursor`` does."""
-        import BigWorld
+        """Return the native cursor to the state the lobby expects.
+
+        The lobby keeps its mcursor active but invisible while Scaleform draws
+        the arrow, so restore only the visibility this room changed.  Detaching
+        the cursor outright would take it from the lobby's own manager.
+        """
         self._gui.mcursor().visible = False
-        BigWorld.setCursor(None)
         return True
 
     def tick(self, delay, function):
@@ -136,20 +147,31 @@ class _ControlScript(object):
         self._room = room
         self._role = role
 
+    def handleMouseEvent(self, unused_component, unused_event):
+        """#1513 delivers mouse MOVE here; there is no move-specific method.
+
+        A component with ``moveFocus`` set but no ``handleMouseEvent`` never
+        completes the engine's move path.  Returning False keeps the event
+        propagating so the tooltip and drag managers still see it.
+        """
+        return False
+
     def handleMouseClickEvent(self, unused_component):
         self._room.activate(self._role)
         return True
 
     def handleMouseEnterEvent(self, unused_component):
         self._room.hover(self._role)
-        return True
+        # Do not consume the crossing: swallowing it would also cut the stock
+        # mouse-event chain below the native GUI for this event.
+        return False
 
     def handleMouseLeaveEvent(self, unused_component):
         self._room.hover(None)
-        return True
+        return False
 
-    def handleMouseButtonEvent(self, unused_component, unused_event):
-        return True
+    def handleMouseButtonEvent(self, unused_component, event):
+        return bool(getattr(event, 'key', None) == _LEFT_MOUSE_KEY())
 
     def handleKeyEvent(self, unused_event):
         return False
@@ -201,13 +223,16 @@ class WaitingRoomUI(object):
         self._set(panel, 'materialFX', 'SOLID')
         self._set(panel, 'colour', (5, 12, 20, 245))
         self._set(panel, 'position', (0.0, 0.0, OVERLAY_Z))
-        # The children own every mouse target, matching the reviewed 0.8.2 room.
+        # Every stock root that hosts a live pointer sets focus AND moveFocus
+        # (GUI.Flash, createMovieGUI, FadeWindow, ChainView).  focus alone is
+        # the keyboard list and leaves the root out of the move path entirely.
         self._set(panel, 'focus', True)
         self._set(panel, 'mouseButtonFocus', False)
         self._set(panel, 'crossFocus', False)
-        self._set(panel, 'moveFocus', False)
-        # Proven on this client only for the Scaleform overlay component.
-        self._set_optional(panel, 'wg_inputKeyMode', INPUT_KEY_MODE)
+        self._set(panel, 'moveFocus', True)
+        self._set(panel, 'script', _ControlScript(self, None))
+        # wg_inputKeyMode belongs to FlashGUIComponent in this build, so a
+        # GUI.Window can never accept it.  Setting it only logged a skip.
         self._set(panel, 'visible', False)
         self._panel = panel
         self._make_control('previous', (-0.72, 0.05, 0.05), 0.20, 0.20)
@@ -326,21 +351,19 @@ class WaitingRoomUI(object):
         return True
 
     def _acquire_cursor(self):
-        """Take the native cursor while this room owns the screen."""
+        """Make the native cursor visible while this room owns the screen.
+
+        ``Cursor.attachCursor`` leaves the lobby's mcursor ACTIVE but with
+        ``visible`` False on purpose, because the arrow the player normally
+        sees is ``gui/flash/Cursor.swf`` drawn inside the lobby movie at
+        z 0.5 - behind this room at z 0.1.  So an already-active cursor is not
+        evidence that a visible pointer exists, and skipping the show on
+        ``active`` left the room with no pointer of its own.
+        """
         surface = self._surface
         show = getattr(surface, 'show_cursor', None)
         if not callable(show):
             return False
-        is_active = getattr(surface, 'cursor_is_active', None)
-        if callable(is_active):
-            try:
-                if is_active():
-                    # Another owner already presents the pointer; releasing it
-                    # on close would take it away from that owner.
-                    return False
-            except Exception as error:
-                _log('LAN waiting room cursor state is unavailable: %s' % error)
-                return False
         try:
             show()
         except Exception as error:

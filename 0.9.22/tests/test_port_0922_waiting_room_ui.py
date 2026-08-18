@@ -165,8 +165,10 @@ class WaitingRoomTests(unittest.TestCase):
         self.assertFalse(room._cursor_acquired)
         self.assertFalse(surface.active)
 
-    def test_the_room_leaves_a_cursor_another_owner_already_holds(self):
-        class _HeldCursorSurface(_Surface):
+    def test_an_already_active_cursor_is_still_made_visible(self):
+        """The lobby keeps mcursor active but invisible while Scaleform draws
+        the arrow, so an active cursor is not a visible one."""
+        class _ActiveCursorSurface(_Surface):
             def __init__(self):
                 _Surface.__init__(self)
                 self.shown = 0
@@ -183,22 +185,49 @@ class WaitingRoomTests(unittest.TestCase):
                 self.hidden += 1
                 return True
 
-        surface = _HeldCursorSurface()
+        surface = _ActiveCursorSurface()
         room = self.module.WaitingRoomUI(
             self._request_start, lambda: list(self.pool),
             status=lambda: self.status, host=lambda: True, surface=surface)
 
         self.assertTrue(room.open())
-        room.close()
+        self.assertEqual(1, surface.shown)
 
-        self.assertEqual(0, surface.shown)
-        self.assertEqual(0, surface.hidden)
+        room.close()
+        self.assertEqual(1, surface.hidden)
 
     def test_cursor_is_skipped_on_a_surface_without_cursor_calls(self):
         self.room.open()
         self.assertFalse(self.room._cursor_acquired)
         self.assertEqual(1, len(self.surface.roots))
         self.room.close()
+
+    def test_the_room_handles_mouse_move_so_the_pointer_tracks(self):
+        """#1513 delivers move as handleMouseEvent; there is no move method."""
+        self.room.install()
+        script = self.room._controls['start'].properties.get('script')
+
+        self.assertTrue(hasattr(script, 'handleMouseEvent'))
+        self.assertFalse(script.handleMouseEvent(None, None))
+
+    def test_the_panel_takes_move_focus_and_a_script(self):
+        self.room.install()
+        panel = self.room._panel.properties
+
+        # focus alone is the keyboard list: without moveFocus the root is
+        # never offered a mouse-move event at all.
+        self.assertTrue(panel['focus'])
+        self.assertTrue(panel['moveFocus'])
+        self.assertTrue(hasattr(panel.get('script'), 'handleMouseEvent'))
+
+    def test_crossings_are_not_swallowed(self):
+        self.room.install()
+        script = self.room._controls['start'].properties['script']
+
+        # Returning True here would cut the stock mouse chain below the
+        # native GUI for that event.
+        self.assertFalse(script.handleMouseEnterEvent(None))
+        self.assertFalse(script.handleMouseLeaveEvent(None))
 
     def test_controls_carry_a_border_frame_behind_the_body(self):
         self.room.open()

@@ -342,8 +342,55 @@ class BattleProjectileTests(unittest.TestCase):
 
         self.assertTrue(battle._apply_projectile_terminal_event(event))
 
+        # A terminal whose ground/vehicle verdict is not ours carries no
+        # explosion, so the armour-hit effect is never doubled up.
         battle._remote_factory.stop_projectile_tracer.assert_called_once_with(
-            'player:7:1', [5.0, 0.875, 0.0])
+            'player:7:1', [5.0, 0.875, 0.0], explosion=None)
+
+    def test_a_world_terminal_carries_the_ground_explosion(self):
+        battle, unused_bigworld = _battle(now=1.0)
+        battle._remote_factory = types.SimpleNamespace(
+            stop_projectile_tracer=mock.Mock(return_value=True))
+        battle._projectile_meta['p1'] = {
+            'hit_vehicle': False, 'terminal_velocity': (0.0, -100.0, 10.0),
+            'shooter_kind': 'player', 'shooter_id': 7, 'shell_index': 0}
+        battle._projectile_shot = lambda meta: {
+            'shell': {'effectsIndex': 3}}
+        battle._surface_effect_material = lambda impact: 'ground'
+        battle._runtime.vehicles = types.SimpleNamespace(
+            g_cache=types.SimpleNamespace(shotEffects=[
+                {}, {}, {}, {'groundHit': ('kp', 'fx', set())}]))
+
+        bundle = battle._projectile_explosion('p1', (1.0, 2.0, 3.0))
+
+        self.assertIsNotNone(bundle)
+        effects_descr, material, velocity = bundle
+        self.assertEqual({'groundHit': ('kp', 'fx', set())}, effects_descr)
+        self.assertEqual('ground', material)
+        self.assertEqual(-100.0, velocity[1])
+
+    def test_a_vehicle_terminal_carries_no_ground_explosion(self):
+        battle, unused_bigworld = _battle(now=1.0)
+        battle._projectile_meta['p1'] = {'hit_vehicle': True}
+
+        self.assertIsNone(battle._projectile_explosion('p1', (1.0, 2.0, 3.0)))
+
+    def test_an_unknown_verdict_carries_no_ground_explosion(self):
+        battle, unused_bigworld = _battle(now=1.0)
+        battle._projectile_meta['p1'] = {}
+
+        self.assertIsNone(battle._projectile_explosion('p1', (1.0, 2.0, 3.0)))
+
+    def test_an_unresolvable_surface_carries_no_explosion(self):
+        battle, unused_bigworld = _battle(now=1.0)
+        battle._projectile_meta['p1'] = {
+            'hit_vehicle': False, 'terminal_velocity': (0.0, -1.0, 0.0)}
+        battle._projectile_shot = lambda meta: {'shell': {'effectsIndex': 0}}
+        battle._runtime.vehicles = types.SimpleNamespace(
+            g_cache=types.SimpleNamespace(shotEffects=[{'groundHit': ()}]))
+        battle._surface_effect_material = lambda impact: None
+
+        self.assertIsNone(battle._projectile_explosion('p1', (1.0, 2.0, 3.0)))
 
     def test_snapshot_ensures_tracer_even_when_client_is_not_authority(self):
         battle, unused_bigworld = _battle(now=1.0)

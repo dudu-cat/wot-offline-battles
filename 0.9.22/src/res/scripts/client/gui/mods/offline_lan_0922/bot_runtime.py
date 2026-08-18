@@ -70,13 +70,18 @@ DECISION_SECONDS = 0.0975
 # A hull two hundred metres away moves less than one pixel of visible tilt per
 # frame, so its four-point suspension sample and its planner cadence can be
 # spread without changing what the player sees.
-DETAIL_NEAR_METRES = 120.0
-DETAIL_FAR_METRES = 300.0
+DETAIL_NEAR_METRES = 80.0
+DETAIL_FAR_METRES = 200.0
 # Travel that must accumulate before a tier re-samples the four ground rays.
 SLOPE_SAMPLE_METRES = (0.35, 1.50, 4.00)
 SLOPE_SAMPLE_RADIANS = (0.05, 0.15, 0.40)
 # Planner cadence multiplier per tier.
 DECISION_TIER_FACTOR = (1.0, 2.0, 4.0)
+# Integration rate per tier: every frame near the camera, 20 Hz at medium
+# range, 10 Hz far away.  A hull 300 m out moves under a pixel per frame,
+# so the engine's own interpolation covers the gap between its steps.
+INTEGRATION_INTERVALS = (0.0, 1.0 / 12.0, 1.0 / 6.0)
+INTEGRATION_PHASE_BUCKETS = 7
 # The #1513 production probe owns a 15 m low-speed / 20 m high-speed,
 # three-lane corridor.  A cached sample may only be reused while the hull stays
 # well inside the 2.2 m outer lanes.  The time bound also limits maximum copied
@@ -1019,6 +1024,10 @@ class BotRuntime(object):
         self._flip_diary = {}
         self.debug_logging = False
         self._camera_position = None
+        self._integration_debt = {}
+        self._integration_time = {}
+        self._integration_next = {}
+        self._last_step = {}
         self._world_receipt_budget = 0
         self._world_receipt_waiting = []
         self._world_receipt_frame = None
@@ -2468,6 +2477,45 @@ class BotRuntime(object):
             _number(position[0]), _number(position[1]), _number(position[2]))
         return True
 
+    def _integration_step(self, state, now, frame_step):
+        """Return this bot's step for this frame, or 0.0 to skip it.
+
+        A near bot integrates every frame.  A mid or far bot banks the frame's
+        delta and integrates once its own interval elapses, with the whole
+        banked step, so the same distance is covered with fewer, larger steps.
+        The phase is spread by bot id so the skipped work never lands on one
+        frame.
+        """
+        bot_id = int(state['id'])
+        banked = self._integration_debt.get(bot_id, 0.0) + max(
+            0.0, float(frame_step))
+        tier = self._detail_tier(state)
+        interval = INTEGRATION_INTERVALS[tier]
+        if interval <= 0.0:
+            self._integration_debt[bot_id] = 0.0
+            self._last_step[bot_id] = banked
+            self._integration_time[bot_id] = _number(now)
+            return banked
+        deadline = self._integration_next.get(bot_id)
+        if deadline is None:
+            # Spread the first deadline so 29 bots never share a frame.
+            deadline = _number(now) + interval * (
+                (abs(bot_id) % INTEGRATION_PHASE_BUCKETS) /
+                float(INTEGRATION_PHASE_BUCKETS))
+            self._integration_next[bot_id] = deadline
+        if _number(now) + 1e-9 < deadline:
+            self._integration_debt[bot_id] = banked
+            return 0.0
+        # Never let a long stall replay as one huge step.
+        banked = min(banked, 0.2)
+        self._integration_debt[bot_id] = 0.0
+        self._last_step[bot_id] = banked
+        self._integration_time[bot_id] = _number(now)
+        intervals = int(math.floor(
+            (_number(now) - deadline) / interval)) + 1
+        self._integration_next[bot_id] = deadline + intervals * interval
+        return banked
+
     def _detail_tier(self, state):
         """Return 0 near the camera, 1 at medium range, 2 far away."""
         camera = self._camera_position
@@ -3812,8 +3860,9 @@ class BotRuntime(object):
         self._accumulator += max(0.0, _number(dt))
         if self._accumulator <= 0.0:
             return []
-        step = min(self._accumulator, 0.2)
+        frame_step = min(self._accumulator, 0.2)
         self._accumulator = 0.0
+        step = frame_step
         now = _number(now)
         publish = now >= self._next_publication
         if publish:
@@ -3859,9 +3908,19 @@ class BotRuntime(object):
         tick_poses = {}
         tick_safe = {}
         attempted_yaws = {}
+        integrated = set()
         for state in self.states.values():
             if not state['alive']:
                 continue
+            # Distance-tiered INTEGRATION, not just probe throttling: a far
+            # bot advances at a lower rate with the whole accumulated step, so
+            # the per-frame Python cost scales with nearby bots rather than
+            # with the roster size.  The pose it publishes is unchanged
+            # between its own steps, which is what the engine interpolates.
+            step = self._integration_step(state, now, frame_step)
+            if step <= 0.0:
+                continue
+            integrated.add(state['id'])
             self._advance_bot_critical(state, step, now)
             if not state['alive']:
                 continue
@@ -4395,11 +4454,12 @@ class BotRuntime(object):
         self._pending_ram_reports.extend(
             self._resolve_tank_contacts(players, now, step))
         for state in self._ordered_states():
-            if state.get('alive', True):
+            if state.get('alive', True) and state['id'] in integrated:
                 attempted_yaw = attempted_yaws.get(
                     state['id'], state.get('yaw', 0.0))
                 support_blocked = self._update_vertical_motion(
-                    state, step, tick_poses[state['id']], attempted_yaw)
+                    state, self._last_step.get(state['id'], frame_step),
+                    tick_poses[state['id']], attempted_yaw)
                 if not support_blocked:
                     self._guard_realised_pose(
                         state, tick_poses[state['id']], tick_safe[state['id']],
@@ -4424,8 +4484,35 @@ class BotRuntime(object):
             })
         return outgoing
 
-    def presentation_states(self):
-        """Return current authority poses without forming a LAN proposal."""
+    def presentation_states(self, now=None):
+        """Return current authority poses without forming a LAN proposal.
+
+        A bot that integrates below the render rate has not moved its stored
+        pose this frame, so its presented position is dead-reckoned along its
+        own heading for the time since its last step.  Without this the lower
+        tiers would visibly step; with it the simulation rate and the rendered
+        motion are independent.
+        """
         if not self.is_authority() or self.adapter is None or self.finished:
             return ()
-        return tuple(dict(state) for state in self._ordered_states())
+        if now is None:
+            return tuple(dict(state) for state in self._ordered_states())
+        now = _number(now)
+        result = []
+        for state in self._ordered_states():
+            projected = dict(state)
+            elapsed = now - _number(
+                self._integration_time.get(state['id'], now))
+            speed = _number(state.get('speed'))
+            if (elapsed > 0.0 and state.get('alive', True) and
+                    abs(speed) > 1e-3 and not state.get('airborne', False)):
+                # Cap the extrapolation at one far-tier interval so a stalled
+                # frame can never slide a hull across the map.
+                elapsed = min(elapsed, INTEGRATION_INTERVALS[-1])
+                yaw = _number(state.get('yaw'))
+                projected['x'] = _number(state.get('x')) + (
+                    math.sin(yaw) * speed * elapsed)
+                projected['z'] = _number(state.get('z')) + (
+                    math.cos(yaw) * speed * elapsed)
+            result.append(projected)
+        return tuple(result)
