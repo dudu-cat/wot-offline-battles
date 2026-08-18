@@ -2304,16 +2304,18 @@ class BotRuntime(object):
             return result
         result = list(supplied or ())
         for bot_id, raw in self.states.items():
-            if bot_id == source.get('id') or not raw.get('alive', True):
+            if bot_id == source.get('id'):
                 continue
+            speed = (_number(raw.get('speed'))
+                     if raw.get('alive', True) else 0.0)
             result.append({
                 'id': bot_id, 'position': _position(raw),
                 'team': int(_number(raw.get('team'))),
                 'yaw': _number(raw.get('yaw')),
                 'velocity': (
-                    math.sin(_number(raw.get('yaw'))) * _number(raw.get('speed')),
+                    math.sin(_number(raw.get('yaw'))) * speed,
                     0.0,
-                    math.cos(_number(raw.get('yaw'))) * _number(raw.get('speed'))),
+                    math.cos(_number(raw.get('yaw'))) * speed),
                 'half_length': _number(raw.get('half_length'), 3.5),
                 'half_width': _number(raw.get('half_width'), 1.7),
             })
@@ -2329,10 +2331,9 @@ class BotRuntime(object):
             body['position'] = _position(raw)
             bodies[raw['id']] = body
         for bot_id, raw in self.states.items():
-            if not raw.get('alive', True):
-                continue
             yaw = _number(raw.get('yaw'))
-            speed = _number(raw.get('speed'))
+            speed = (_number(raw.get('speed'))
+                     if raw.get('alive', True) else 0.0)
             bodies[bot_id] = {
                 'id': bot_id, 'position': _position(raw), 'yaw': yaw,
                 'team': int(_number(raw.get('team'))),
@@ -2775,12 +2776,11 @@ class BotRuntime(object):
             return []
         tanks = []
         for state in self._ordered_states():
-            if not state.get('alive', True):
-                continue
+            alive = bool(state.get('alive', True))
             yaw = _number(state.get('yaw'))
-            speed = _number(state.get('speed'))
+            speed = _number(state.get('speed')) if alive else 0.0
             tanks.append({
-                'id': int(state['id']), 'alive': True,
+                'id': int(state['id']), 'alive': alive,
                 'x': _number(state.get('x')), 'y': _number(state.get('y')),
                 'z': _number(state.get('z')), 'yaw': yaw,
                 'mass': _number(state.get('mass'), 25000.0),
@@ -2791,18 +2791,18 @@ class BotRuntime(object):
                        _number(state.get('push_z'))),
             })
         for raw in players or ():
-            if (not isinstance(raw, dict) or raw.get('id') is None or
-                    not raw.get('alive', True)):
+            if not isinstance(raw, dict) or raw.get('id') is None:
                 continue
             try:
                 player_id = HUMAN_TARGET_ID_BASE + int(raw['id'])
             except (TypeError, ValueError):
                 continue
             profile = self._player_collision_profile(raw)
+            alive = bool(raw.get('alive', True))
             yaw = _number(raw.get('yaw'))
-            speed = _number(raw.get('speed'))
+            speed = _number(raw.get('speed')) if alive else 0.0
             tanks.append({
-                'id': player_id, 'alive': True,
+                'id': player_id, 'alive': alive,
                 'x': _number(raw.get('x')), 'y': _number(raw.get('y')),
                 'z': _number(raw.get('z')), 'yaw': yaw,
                 'mass': profile['mass'], 'shape': profile['shape'],

@@ -313,7 +313,10 @@ def _tank_shape(tank):
 
 
 def resolve_tank(tank, others, now=None, ram_cooldowns=None):
-    """Resolve one hull against other living hulls using only plain data.
+    """Resolve one hull against other hulls using only plain data.
+
+    A body with ``alive`` false is a wreck: it still blocks and separates, but
+    it never moves and never produces a ram event.
 
     The return value is a mapping with:
 
@@ -354,8 +357,7 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None):
         other_id = _tank_value(other, 'id', -1)
         if other is None or other_id == self_id:
             continue
-        if not _tank_value(other, 'alive', True):
-            continue
+        other_is_wreck = not _tank_value(other, 'alive', True)
         other_x = float(_tank_value(other, 'x', 0.0) or 0.0)
         other_y = _tank_value(other, 'y')
         other_z = float(_tank_value(other, 'z', 0.0) or 0.0)
@@ -374,7 +376,7 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None):
 
         mass_other = max(
             float(_tank_value(other, 'mass', 1.0) or 1.0), 1.0)
-        inverse_other = 1.0 / mass_other
+        inverse_other = 0.0 if other_is_wreck else 1.0 / mass_other
         other_yaw = float(_tank_value(other, 'yaw', 0.0) or 0.0)
         contact = obb_contact(
             x, z, yaw, own_shape,
@@ -382,8 +384,11 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None):
         if contact is None:
             continue
 
-        other_velocity_x = float(_tank_value(other, 'vx', 0.0) or 0.0)
-        other_velocity_z = float(_tank_value(other, 'vz', 0.0) or 0.0)
+        if other_is_wreck:
+            other_velocity_x = other_velocity_z = 0.0
+        else:
+            other_velocity_x = float(_tank_value(other, 'vx', 0.0) or 0.0)
+            other_velocity_z = float(_tank_value(other, 'vz', 0.0) or 0.0)
         response = pair_response(
             contact, inverse_self, inverse_other,
             (velocity_x, velocity_z),
@@ -399,7 +404,8 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None):
         if normal_velocity >= 0.0:
             continue
 
-        if now is None or normal_velocity >= -RAM_SAFE_SPEED:
+        if (other_is_wreck or now is None or
+                normal_velocity >= -RAM_SAFE_SPEED):
             continue
         pair = (min(self_id, other_id), max(self_id, other_id))
         if float(now) - float(cooldowns.get(pair, 0.0)) <= RAM_COOLDOWN:

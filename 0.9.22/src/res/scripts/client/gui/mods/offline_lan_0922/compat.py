@@ -1,6 +1,7 @@
 from __future__ import print_function
 
 import sys
+import traceback
 
 try:
     import cPickle as _pickle
@@ -121,6 +122,8 @@ def _load_runtime():
     from AvatarInputHandler.DynamicCameras import AccelerationSmoother
     from AvatarInputHandler.DynamicCameras.ArcadeCamera import ArcadeCamera
     from AvatarInputHandler.DynamicCameras.SniperCamera import SniperCamera
+    from AvatarInputHandler.DynamicCameras.StrategicCamera import \
+        StrategicCamera
     import AvatarInputHandler.AimingSystems.steady_vehicle_matrix as \
         SteadyVehicleMatrix
     import vehicle_systems.CompoundAppearance as CompoundAppearanceModule
@@ -163,6 +166,7 @@ def _load_runtime():
     runtime.prb_loader = g_prbLoader
     runtime.sound_groups_module = SoundGroups
     runtime.sniper_camera_type = SniperCamera
+    runtime.strategic_camera_type = StrategicCamera
     runtime.steady_vehicle_matrix = SteadyVehicleMatrix
     runtime.vehicle_module = Vehicle
     runtime.vehicle_marker_plugin_type = VehicleMarkerPlugin
@@ -364,6 +368,9 @@ class OfflineCompatibility(object):
         self._original_avatar_get_speeds = None
         self._original_avatar_auto_aim = None
         self._original_arcade_handle_key_event = None
+        self._original_strategic_camera_update = None
+        self._strategic_camera_update_wrapper = None
+        self._strategic_camera_failure_reported = False
         self._original_sniper_handle_key_event = None
         self._arcade_handle_key_event_code = None
         self._sniper_handle_key_event_code = None
@@ -484,6 +491,11 @@ class OfflineCompatibility(object):
             runtime, 'acceleration_smoother_type', None)
         arcade_camera_type = getattr(runtime, 'arcade_camera_type', None)
         sniper_camera_type = getattr(runtime, 'sniper_camera_type', None)
+        strategic_camera_type = getattr(runtime, 'strategic_camera_type', None)
+        self._original_strategic_camera_update = getattr(
+            strategic_camera_type, '_StrategicCamera__cameraUpdate', None)
+        if not callable(self._original_strategic_camera_update):
+            raise RuntimeError('#1513 strategic camera update is unavailable')
         self._original_account_init = account_type.__dict__.get(
             '__init__', account_type.__init__)
         self._original_account_getattribute = account_type.__dict__.get(
@@ -1345,6 +1357,27 @@ class OfflineCompatibility(object):
                     compatibility._target_lock_input_pending = False
                     compatibility._target_lock_input_avatar = None
 
+        def strategic_camera_update(camera):
+            """Keep the SPG camera loop alive after one failed tick.
+
+            CallbackDelayer removes its entry before it calls the tick and
+            re-arms only from the returned delay, so a single exception here
+            would stop mouse aiming for the rest of the battle.  Report the
+            first failure and return the stock 0.0 reschedule delay.
+            """
+            original = compatibility._original_strategic_camera_update
+            if not compatibility._battle_active:
+                return original(camera)
+            try:
+                return original(camera)
+            except Exception:
+                if not compatibility._strategic_camera_failure_reported:
+                    compatibility._strategic_camera_failure_reported = True
+                    print('[Offline LAN 0.9.22] strategic camera tick failed; '
+                          'the camera loop continues')
+                    traceback.print_exc()
+                return 0.0
+
         def arcade_handle_key_event(control, is_down, key, mods, event):
             return handle_target_lock_input(
                 compatibility._original_arcade_handle_key_event,
@@ -1719,6 +1752,7 @@ class OfflineCompatibility(object):
         self._avatar_auto_aim_wrapper = avatar_auto_aim
         self._arcade_handle_key_event_wrapper = arcade_handle_key_event
         self._sniper_handle_key_event_wrapper = sniper_handle_key_event
+        self._strategic_camera_update_wrapper = strategic_camera_update
         self._control_mode_changed_wrapper = control_mode_changed
         self._vehicle_marker_start_wrapper = vehicle_marker_start
         self._vehicle_marker_stop_wrapper = vehicle_marker_stop
@@ -1767,6 +1801,8 @@ class OfflineCompatibility(object):
             avatar_type.autoAim = avatar_auto_aim
             arcade_control_type.handleKeyEvent = arcade_handle_key_event
             sniper_control_type.handleKeyEvent = sniper_handle_key_event
+            strategic_camera_type._StrategicCamera__cameraUpdate = (
+                strategic_camera_update)
             input_handler_type.onControlModeChanged = control_mode_changed
             vehicle_marker_type.start = vehicle_marker_start
             vehicle_marker_type.stop = vehicle_marker_stop
@@ -1918,6 +1954,15 @@ class OfflineCompatibility(object):
                 self._sniper_handle_key_event_wrapper):
             sniper_control_type.handleKeyEvent = \
                 self._original_sniper_handle_key_event
+        strategic_camera_type = getattr(
+            self._runtime, 'strategic_camera_type', None)
+        if (strategic_camera_type is not None and
+                self._original_strategic_camera_update is not None and
+                strategic_camera_type.__dict__.get(
+                    '_StrategicCamera__cameraUpdate') is
+                self._strategic_camera_update_wrapper):
+            strategic_camera_type._StrategicCamera__cameraUpdate = (
+                self._original_strategic_camera_update)
         if (input_handler_type is not None and
                 self._original_control_mode_changed is not None and
                 input_handler_type.__dict__.get('onControlModeChanged') is
@@ -2235,6 +2280,7 @@ class OfflineCompatibility(object):
                 raise ValueError('Avatar team must be 1 or 2')
         self.install()
         self._battle_active = True
+        self._strategic_camera_failure_reported = False
         self._vehicle_property_overlays = {}
         self._battle_player_vehicle_id = 0
         self._target_lock_candidate = None

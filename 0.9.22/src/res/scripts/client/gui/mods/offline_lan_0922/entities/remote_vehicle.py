@@ -682,6 +682,24 @@ class RemoteVehicle(object):
         self.isStarted = True
         self.inWorld = True
 
+    def attach_wreck_model(self, model):
+        """Swap this vehicle onto its loaded #1513 destroyed compound."""
+        self._stop_shooting_effect()
+        previous = self.model
+        if previous is not None:
+            previous.matrix = self._math.Matrix()
+        self.appearance.detach()
+        self.appearance.gunRecoil = None
+        self._gun_recoil = None
+        self.bw_entity.model = model
+        self.model = model
+        self.model.matrix = self.matrix
+        self.appearance.attach(model)
+        self.appearance.damageState.isCurrentModelDamaged = True
+        if self._shot_presenter is not None:
+            self._shot_presenter.setup_turret_rotations(self)
+        return True
+
     def detach_visual(self):
         self._stop_shooting_effect()
         self._collision_obstacle = None
@@ -1088,6 +1106,51 @@ class RemoteVehicleFactory(object):
                     self._bigworld.destroyEntity(visual_id)
                 except Exception:
                     pass
+            vehicle.load_error = error
+
+    def request_wreck(self, entity_id):
+        """Reload one destroyed remote vehicle on its native wreck models.
+
+        #1513 selects the wreck through ``VehicleDamageState`` model state
+        ``destroyed``; the hit testers are read from the descriptor, so shell
+        collision survives the swap.
+        """
+        vehicle = self._vehicles.get(entity_id)
+        if (vehicle is None or vehicle.model is None or
+                vehicle.typeDescriptor is None or
+                vehicle.appearance.damageState.isCurrentModelDamaged):
+            return False
+        # Claim the state before the asynchronous load so a repeated health
+        # event cannot queue a second refresh for the same vehicle.
+        vehicle.appearance.damageState.isCurrentModelDamaged = True
+        descriptor = vehicle.typeDescriptor
+        try:
+            assembler = self._model_assembler.prepareCompoundAssembler(
+                descriptor, 'destroyed', self._space_id, False)
+            self._bigworld.loadResourceListBG(
+                (assembler,), lambda resources:
+                self._wreck_loaded(entity_id, descriptor, resources))
+        except Exception as error:
+            vehicle.appearance.damageState.isCurrentModelDamaged = False
+            vehicle.load_error = error
+            return False
+        return True
+
+    def _wreck_loaded(self, entity_id, descriptor, resources):
+        vehicle = self._vehicles.get(entity_id)
+        if (vehicle is None or vehicle.bw_entity is None or
+                vehicle.model is None):
+            return
+        model = self._resource(resources, descriptor.name)
+        if model is None:
+            model = self._resource(resources, 'chassis')
+        if model is None:
+            # Keep the undamaged compound rather than lose the wreck cover.
+            vehicle.appearance.damageState.isCurrentModelDamaged = False
+            return
+        try:
+            vehicle.attach_wreck_model(model)
+        except Exception as error:
             vehicle.load_error = error
 
     def get(self, entity_id):

@@ -1,5 +1,7 @@
 import importlib.util
+import contextlib
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -1359,6 +1361,31 @@ class OfflineCompatibilityTests(unittest.TestCase):
         compatibility.fini()
         self.assertIs(original, handler_type.__dict__['onControlModeChanged'])
 
+    def test_failed_strategic_tick_keeps_the_spg_camera_loop_alive(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        camera_type = runtime.strategic_camera_type
+        original = camera_type.__dict__['_StrategicCamera__cameraUpdate']
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        camera = camera_type()
+        camera_type.ticks = 0
+        camera_type.failures = 1
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            delay = camera._StrategicCamera__cameraUpdate()
+            recovered = camera._StrategicCamera__cameraUpdate()
+
+        # A zero delay is what CallbackDelayer needs to re-arm the tick.
+        self.assertEqual(0.0, delay)
+        self.assertEqual(0.0, recovered)
+        self.assertEqual(2, camera_type.ticks)
+
+        compatibility.fini()
+        self.assertIs(
+            original,
+            camera_type.__dict__['_StrategicCamera__cameraUpdate'])
+
     def test_marker_cache_refreshes_when_local_vehicle_identity_arrives(self):
         compatibility_module = _load_port_source('compat')
         runtime, operations = self._runtime()
@@ -2214,6 +2241,17 @@ class OfflineCompatibilityTests(unittest.TestCase):
                     vehicle, delta_time)
                 return velocity, motion
 
+        class StrategicCamera(object):
+            ticks = 0
+            failures = 0
+
+            def _StrategicCamera__cameraUpdate(self):
+                StrategicCamera.ticks += 1
+                if StrategicCamera.failures:
+                    StrategicCamera.failures -= 1
+                    raise RuntimeError('strategic aiming system is missing')
+                return 0.0
+
         class VehicleGunRotator(object):
             def getAvatarOwnVehicleStabilisedMatrix(self, vehicle):
                 return vehicle.filter.interpolateStabilisedMatrix(123.0)
@@ -2323,6 +2361,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
             sound_groups_module=types.SimpleNamespace(
                 g_instance=sound_groups),
             sniper_camera_type=SniperCamera,
+            strategic_camera_type=StrategicCamera,
             steady_vehicle_matrix=types.SimpleNamespace(
                 SteadyVehicleMatrixCalculator=
                 SteadyVehicleMatrixCalculator),

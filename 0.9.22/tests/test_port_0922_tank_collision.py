@@ -294,6 +294,25 @@ class TankCollisionTests(unittest.TestCase):
         self.assertEqual((0, 0), tank_collision.ram_damage(
             tank_collision.RAM_SAFE_SPEED, 25000.0, 25000.0))
 
+    def test_wreck_blocks_the_mover_without_moving_or_dealing_ram_damage(self):
+        mover = _tank(1, 0.0, 0.0, mass=25000.0, vx=10.0)
+        wreck = _tank(2, 0.8, 0.0, mass=10000.0)
+        wreck['alive'] = False
+        live = _tank(2, 0.8, 0.0, mass=10000.0)
+
+        against_wreck = tank_collision.resolve_tank(
+            mover, (wreck,), now=10.0)
+        against_live = tank_collision.resolve_tank(
+            mover, (live,), now=10.0)
+
+        self.assertLess(against_wreck['correction'][0], 0.0)
+        self.assertLess(against_wreck['delta_velocity'][0], 0.0)
+        self.assertEqual((), against_wreck['ram_events'])
+        # An immovable wreck takes the whole separation, so the mover is
+        # pushed out farther than the lighter living hull pushes it.
+        self.assertLess(
+            against_wreck['correction'][0], against_live['correction'][0])
+
 
 if __name__ == '__main__':
     unittest.main()

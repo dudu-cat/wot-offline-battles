@@ -75,6 +75,12 @@ _SHOT_EVENT_KINDS = ('shot', 'bot_shot')
 _COMBAT_EVENT_KINDS = (
     'health', 'hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit')
 _SHOT_OCCLUSION_EPSILON = 1.0e-3
+# physics_shared.TRACK_SCROLL_LIMITS: the exact #1513 belt-speed wire range.
+TRACK_SCROLL_LIMITS = (-15.0, 30.0)
+# PyTrackScroll zeroes both belts while engineMode[0] is at most 1.
+ENGINE_MODE_OFF = 0
+ENGINE_MODE_IDLE = 1
+ENGINE_MODE_RUNNING = 2
 # The stock #1513 descriptor converts XML movement bloom to per-m/s and
 # per-rad/s factors. Feed those raw factors to PlayerAvatar unchanged: the
 # native gun rotator owns the one dispersion state shared by HUD and shots.
@@ -707,6 +713,7 @@ class BattleRuntime(object):
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
         self._local_camera_velocity = None
+        self._local_engine_mode = None
         self._spectated_engine_id = None
         self._local_grind = 0
         self._local_motion_soft_block = False
@@ -841,6 +848,7 @@ class BattleRuntime(object):
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
         self._local_camera_velocity = None
+        self._local_engine_mode = None
         self._spectated_engine_id = None
         self._local_grind = 0
         self._local_motion_soft_block = False
@@ -3025,7 +3033,61 @@ class BattleRuntime(object):
             self._local_speed, self._local_turn_speed,
             velocity, acceleration)
         self._local_camera_velocity = velocity
+        self._update_local_tracks(entity)
         return position
+
+    def _local_engine_mode_value(self, alive):
+        """Return the exact #1513 ``(power, movementFlags)`` engine mode."""
+        forward = _number(getattr(self._sender, 'forward', 0.0))
+        turn = _number(getattr(self._sender, 'turn', 0.0))
+        flags = 0
+        if forward > 0.0:
+            flags |= 1
+        elif forward < 0.0:
+            flags |= 2
+        if turn < 0.0:
+            flags |= 4
+        elif turn > 0.0:
+            flags |= 8
+        if not alive:
+            return (ENGINE_MODE_OFF, 0)
+        if flags or abs(self._local_speed) > 0.05:
+            return (ENGINE_MODE_RUNNING, flags)
+        return (ENGINE_MODE_IDLE, flags)
+
+    def _update_local_tracks(self, entity):
+        """Feed the native track, wheel, spline and trace animation.
+
+        Retail drives this from the cell-owned
+        ``Avatar.ownVehicleAuxPhysicsData``, which an offline client never
+        receives.  ``updateTracksScroll`` reaches the same
+        ``PyTrackScroll.setExternal`` boundary, but its native tick pins both
+        belts to zero while ``engineMode[0]`` is at most 1.
+        """
+        appearance = getattr(entity, 'appearance', None)
+        update_scroll = getattr(appearance, 'updateTracksScroll', None)
+        change_mode = getattr(appearance, 'changeEngineMode', None)
+        if not callable(update_scroll) or not callable(change_mode):
+            raise RuntimeError('#1513 track animation boundary is unavailable')
+        is_alive = getattr(entity, 'isAlive', None)
+        alive = bool(is_alive() if callable(is_alive) else is_alive)
+        mode = self._local_engine_mode_value(alive)
+        if mode != self._local_engine_mode:
+            entity.engineMode = mode
+            change_mode(mode, True)
+            self._local_engine_mode = mode
+        if not alive:
+            return False
+        params = self._local_physics
+        if params is None:
+            return False
+        left, right = vehicle_physics.track_scroll(
+            params, self._local_speed, self._local_turn_speed)
+        minimum, maximum = TRACK_SCROLL_LIMITS
+        update_scroll(
+            max(minimum, min(maximum, left)),
+            max(minimum, min(maximum, right)))
+        return True
 
     def _detach_local_presentation(self):
         if self._server is None:
@@ -3047,6 +3109,7 @@ class BattleRuntime(object):
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
         self._local_camera_velocity = None
+        self._local_engine_mode = None
         return True
 
     def _on_client_ready(self):
@@ -5381,7 +5444,8 @@ class BattleRuntime(object):
             source_descriptor, collisions, state.get('distance', 0.0),
             shell_index=meta.get('shell_index'),
             pierce_loss=terminal_data.get('piercing_loss', 0.0),
-            penetration_factor=factor)
+            penetration_factor=factor,
+            target_descriptor=getattr(target, 'typeDescriptor', None))
         hull_damage = damage
         damage, critical = self._critical_hit(
             target, source_descriptor, collisions,
@@ -6407,12 +6471,11 @@ class BattleRuntime(object):
             state = record.get('state') or {}
             if record.get('kind') == 'bot':
                 state = bot_states.get(record.get('network_id'), state)
-            if not state.get('alive', True):
-                continue
+            alive = bool(state.get('alive', True))
             remote = self._server_entity(record['engine_id'])
             descriptor = getattr(remote, 'typeDescriptor', None)
             yaw = _number(state.get('yaw'))
-            speed = _number(state.get('speed'))
+            speed = _number(state.get('speed')) if alive else 0.0
             mass = state.get('mass')
             if mass is None and descriptor is not None:
                 mass = vehicle_physics.derive_params(descriptor).get('mass')
@@ -6421,7 +6484,7 @@ class BattleRuntime(object):
                 shape = self._collision_shape(descriptor)
             result.append({
                 'id': 1000000 + int(record.get('engine_id', 0)),
-                'alive': True,
+                'alive': alive,
                 'x': _number(state.get('x')),
                 'y': _number(state.get('y')),
                 'z': _number(state.get('z')),
@@ -7279,15 +7342,17 @@ class BattleRuntime(object):
             return False
         if penetration_factor is None:
             penetration_factor = combat_rules.sample_penetration_factor()
+        hit_entity = self._server_entity(hit_record['engine_id'])
         damage, result = self._shell_damage(
             source.typeDescriptor, target_collisions, distance,
             shell_index=state.get('shell_index'),
             pierce_loss=scene['piercing_loss'],
-            penetration_factor=penetration_factor)
+            penetration_factor=penetration_factor,
+            target_descriptor=getattr(hit_entity, 'typeDescriptor', None))
         impact = start + direction.scale(distance)
         hull_damage = damage
         damage, critical = self._critical_hit(
-            target, source.typeDescriptor, target_collisions, start, end,
+            hit_entity, source.typeDescriptor, target_collisions, start, end,
             damage, result, source.id, state.get('shell_index'))
         critical_contract = self._critical_proposal_contract(
             hit_record, critical, hull_damage)
@@ -7592,7 +7657,11 @@ class BattleRuntime(object):
         record['visible_destroy_requested'] = True
 
     def _set_record_spot_visibility(self, record, visible):
-        """Keep the model, marker and minimap on one spotting boundary."""
+        """Keep the marker and minimap on one spotting boundary.
+
+        A destroyed vehicle keeps its model drawn as cover once the spotting
+        gate closes, which is what retail does with a wreck.
+        """
         if not record.get('presentation') or not record.get('ready'):
             record['spot_visible'] = bool(visible)
             return bool(visible)
@@ -7602,7 +7671,8 @@ class BattleRuntime(object):
         visible = bool(visible)
         record['spot_visible'] = visible
         vehicle._spot_visible = visible
-        vehicle.appearance.changeVisibility(visible)
+        vehicle.appearance.changeVisibility(
+            visible or not self._record_alive(record, vehicle))
         if visible and not record.get('visual_started'):
             self._binding.start_vehicle_visual(record['engine_id'], True)
             record['visual_started'] = True
@@ -7959,6 +8029,9 @@ class BattleRuntime(object):
                 killed(engine_id, int(attacker_id), int(reason_id))
             if not record.get('local'):
                 self._fallback_postmortem_viewpoint(engine_id)
+        if (record.get('presentation') and self._remote_factory is not None and
+                not self._record_alive(record, entity)):
+            self._remote_factory.request_wreck(engine_id)
 
     def _destroy_entity(self, event):
         record = self._records.get(event.get('entity'))
@@ -8164,13 +8237,14 @@ class BattleRuntime(object):
             return
         if penetration_factor is None:
             penetration_factor = combat_rules.sample_penetration_factor()
+        target = self._server_entity(target_record['engine_id'])
         damage, result = self._shell_damage(
             entity.typeDescriptor, target_collisions, distance,
             shell_index=shell_index,
             pierce_loss=scene['piercing_loss'],
-            penetration_factor=penetration_factor)
+            penetration_factor=penetration_factor,
+            target_descriptor=getattr(target, 'typeDescriptor', None))
         impact = start + direction.scale(distance)
-        target = self._server_entity(target_record['engine_id'])
         hull_damage = damage
         damage, critical = self._critical_hit(
             target, entity.typeDescriptor, target_collisions, start, end,
@@ -8383,7 +8457,7 @@ class BattleRuntime(object):
 
     def _shell_damage(self, descriptor, collisions, distance,
                       shell_index=None, pierce_loss=0.0,
-                      penetration_factor=None):
+                      penetration_factor=None, target_descriptor=None):
         shots = tuple(descriptor.gun.shots or ())
         if shell_index is None:
             shell_index = getattr(descriptor, 'activeGunShotIndex', 0)
@@ -8393,10 +8467,10 @@ class BattleRuntime(object):
         resolved = combat_rules.resolve_hull_hit(
             shot, distance, collisions, pierce_loss=pierce_loss,
             penetration_factor=penetration_factor)
-        if resolved is None:
-            return 0, 1
-        result = resolved[0]
-        armor = combat_rules.he_nominal_armor(collisions)
+        # 0.8.2 law: a round that never reaches structure is a non-penetration,
+        # and an HE round still detonates on the part it did reach.
+        result = 1 if resolved is None else resolved[0]
+        armor = combat_rules.he_nominal_armor(collisions, target_descriptor)
         return combat_rules.damage(shot, result, armor), result
 
     def _defer_avatar_leave(self):
@@ -8591,6 +8665,7 @@ class BattleRuntime(object):
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
         self._local_camera_velocity = None
+        self._local_engine_mode = None
         self._spectated_engine_id = None
         self._local_grind = 0
         self._local_vertical_speed = 0.0

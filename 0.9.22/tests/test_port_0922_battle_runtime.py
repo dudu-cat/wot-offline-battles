@@ -271,9 +271,16 @@ class _Vehicle(object):
         self.matrix.setTranslate(position)
         self.model = _Model()
         self.model.matrix = self.matrix
+        self.engineMode = (0, 0)
+        self.track_scrolls = []
+        self.engine_modes = []
         self.appearance = types.SimpleNamespace(
             compoundModel=self.model, turretMatrix=_Matrix(),
-            gunMatrix=_Matrix())
+            gunMatrix=_Matrix(),
+            updateTracksScroll=lambda left, right:
+                self.track_scrolls.append((left, right)),
+            changeEngineMode=lambda mode, forceSwinging=False:
+                self.engine_modes.append(tuple(mode)))
         self.health = properties['health']
         self.isCrewActive = True
         self.gunAnglesPacked = properties.get('gunAnglesPacked', 0)
@@ -1493,6 +1500,36 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertIsNone(vehicle._collision_obstacle)
         projectiles[0].destroy.assert_called_once_with()
         self.assertEqual(runtime.bigworld.entity, original_entity)
+
+    def test_destroyed_remote_vehicle_reloads_the_native_wreck_once(self):
+        runtime = _runtime()
+        states = []
+        original_assembler = runtime.model_assembler.prepareCompoundAssembler
+
+        def record_assembler(descriptor, state, space, flag):
+            states.append(state)
+            return original_assembler(descriptor, state, space, flag)
+
+        runtime.model_assembler.prepareCompoundAssembler = record_assembler
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True, 'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        undamaged = vehicle.model
+
+        self.assertTrue(factory.request_wreck(vehicle_id))
+        self.assertFalse(factory.request_wreck(vehicle_id))
+
+        self.assertEqual(['undamaged', 'destroyed'], states)
+        self.assertIsNot(undamaged, vehicle.model)
+        self.assertIs(vehicle.model, vehicle.bw_entity.model)
+        self.assertIs(vehicle.matrix, vehicle.model.matrix)
+        self.assertTrue(
+            vehicle.appearance.damageState.isCurrentModelDamaged)
+        self.assertTrue(factory.is_ready(vehicle_id))
 
     def test_remote_shot_cleanup_failure_still_restores_entity_owners(self):
         runtime = _runtime()
@@ -6704,6 +6741,49 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(battle._update_spotting(20.9))
         self.assertEqual(1, len(battle._avatar.battle_events))
 
+    def test_destroyed_enemy_stays_drawn_as_cover_after_the_spot_expires(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._local_descriptor = _Descriptor()
+        battle._local_position = (0.0, 0.0, 0.0)
+        local = _Vehicle(
+            10, battle._local_descriptor, _Vector(), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = local
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._binding = mock.Mock()
+        enemy = RemoteVehicle(
+            1000, _Descriptor(), {
+                'publicInfo': {'team': 2, 'name': 'Enemy'},
+                'health': 0, 'isCrewActive': True,
+                'gunAnglesPacked': 0},
+            _Vector(100.0, 0.0, 0.0), (0.0, 0.0, 0.0),
+            types.SimpleNamespace(Vector3=_Vector, Matrix=_Matrix))
+        enemy.model = _Model()
+        enemy.model.visible = True
+        enemy.appearance.attach(enemy.model)
+        enemy.isStarted = True
+        enemy.inWorld = True
+        runtime.bigworld.entities[1000] = enemy
+        battle._remote_factory = types.SimpleNamespace(
+            get=lambda entity_id: enemy if entity_id == 1000 else None)
+        battle._records = {'bot:17': {
+            'engine_id': 1000, 'kind': 'bot', 'network_id': 17,
+            'ready': True, 'local': False, 'presentation': True,
+            'tombstone': False, 'arena_added': True,
+            'visual_started': True, 'spot_visible': True,
+            'spot_until': 0.0, 'spot_next': 0.0,
+            'state': {'team': 2, 'health': 0, 'alive': False}}}
+
+        battle._update_spotting(10.4)
+
+        self.assertFalse(battle._records['bot:17']['spot_visible'])
+        battle._binding.stop_vehicle_visual.assert_called_once_with(
+            1000, False)
+        self.assertTrue(enemy.model.visible)
+
     def test_team_relay_visibility_does_not_claim_a_direct_spot(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -8962,7 +9042,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         observed = {}
 
         def damage(descriptor, collisions, distance, shell_index=None,
-                   pierce_loss=0.0, penetration_factor=None):
+                   pierce_loss=0.0, penetration_factor=None,
+                   target_descriptor=None):
             observed['vehicle'] = penetration_factor
             return 120, 2
 
@@ -9280,6 +9361,89 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'type': 'bot_manifest', 'bots': [{'id': 11}]})
         bots.apply_snapshot.assert_called_once_with(snapshot)
         self.assertEqual(9, battle._bot_fire_seen[11])
+
+
+    def test_he_that_only_reaches_a_track_still_blasts_the_hull(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        shell = types.SimpleNamespace(
+            compactDescr=1, damage=(900.0,), caliber=152.0,
+            kind='HIGH_EXPLOSIVE', explosionRadius=3.0, effectsIndex=1)
+        shot = types.SimpleNamespace(
+            shell=shell, piercingPower=(60.0, 60.0), speed=500.0,
+            gravity=9.81, maxDistance=700.0)
+        source = types.SimpleNamespace(
+            gun=types.SimpleNamespace(shots=[shot]), activeGunShotIndex=0)
+        track = types.SimpleNamespace(armor=20.0, vehicleDamageFactor=0.0)
+        collisions = (types.SimpleNamespace(
+            dist=5.0, hitAngleCos=0.2, matInfo=track,
+            compName='vehicleChassis'),)
+        target = types.SimpleNamespace(
+            hull=types.SimpleNamespace(materials={
+                'front': types.SimpleNamespace(
+                    armor=45.0, vehicleDamageFactor=1.0)}))
+
+        damage, result = battle._shell_damage(
+            source, collisions, 200.0, target_descriptor=target)
+
+        self.assertEqual(1, result)
+        self.assertGreater(damage, 0)
+
+    def test_solid_shot_that_only_reaches_a_track_deals_no_hull_damage(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        shell = types.SimpleNamespace(
+            compactDescr=1, damage=(400.0,), caliber=88.0,
+            kind='ARMOR_PIERCING', effectsIndex=1)
+        shot = types.SimpleNamespace(
+            shell=shell, piercingPower=(150.0, 130.0), speed=800.0,
+            gravity=9.81, maxDistance=700.0)
+        source = types.SimpleNamespace(
+            gun=types.SimpleNamespace(shots=[shot]), activeGunShotIndex=0)
+        track = types.SimpleNamespace(armor=20.0, vehicleDamageFactor=0.0)
+        collisions = (types.SimpleNamespace(
+            dist=5.0, hitAngleCos=0.2, matInfo=track,
+            compName='vehicleChassis'),)
+        target = types.SimpleNamespace(
+            hull=types.SimpleNamespace(materials={
+                'front': types.SimpleNamespace(
+                    armor=45.0, vehicleDamageFactor=1.0)}))
+
+        damage, result = battle._shell_damage(
+            source, collisions, 200.0, target_descriptor=target)
+
+        self.assertEqual((0, 1), (damage, result))
+
+    def test_local_track_feed_publishes_engine_mode_and_belt_speeds(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
+        battle._sender = types.SimpleNamespace(forward=1.0, turn=0.0)
+        battle._local_physics = vehicle_physics.derive_params(
+            entity.typeDescriptor)
+        battle._local_speed = 5.0
+        battle._local_turn_speed = 0.0
+
+        battle._update_local_tracks(entity)
+
+        self.assertEqual((2, 1), entity.engineMode)
+        self.assertEqual([(2, 1)], entity.engine_modes)
+        self.assertEqual([(5.0, 5.0)], entity.track_scrolls)
+
+    def test_local_track_feed_turns_the_engine_off_on_death(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 0})
+        battle._sender = types.SimpleNamespace(forward=0.0, turn=0.0)
+        battle._local_physics = vehicle_physics.derive_params(
+            entity.typeDescriptor)
+
+        battle._update_local_tracks(entity)
+
+        self.assertEqual([(0, 0)], entity.engine_modes)
+        self.assertEqual([], entity.track_scrolls)
 
 
 if __name__ == '__main__':
