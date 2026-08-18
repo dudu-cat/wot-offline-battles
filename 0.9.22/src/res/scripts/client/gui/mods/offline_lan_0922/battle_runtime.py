@@ -80,6 +80,9 @@ _SHOT_OCCLUSION_EPSILON = 1.0e-3
 TRACK_SCROLL_LIMITS = (-15.0, 30.0)
 # Seconds between two bot-track diagnostic lines.
 TRACK_REPORT_SECONDS = 5.0
+# Give the pose animation a little longer than the measured gap so it is
+# still interpolating when the next pose lands.
+POSE_RELAX_STRETCH = 1.35
 # PyTrackScroll zeroes both belts while engineMode[0] is at most 1.
 ENGINE_MODE_OFF = 0
 ENGINE_MODE_IDLE = 1
@@ -7350,17 +7353,23 @@ class BattleRuntime(object):
         self._bot_destructible_samples[bot_id] = (deadline, position)
         return True
 
-    def _bot_pose_relax(self, state, now):
+    def _bot_pose_relax(self, state, pose, now):
         """Return how long the compound should take to reach this pose.
 
-        The interval between two accepted poses is what the animation has to
-        cover.  Measuring it keeps the smoothing correct whatever integration
-        rate the bot's distance tier chose.
+        The clock runs between two poses that actually DIFFER, not between
+        frames.  A bot below the render rate republishes the same pose for
+        several frames; timing those would re-key the animation to where it
+        already is, hold still, and then jump when the integration finally
+        steps, which is what reads as a stutter.  The animation is also given
+        slightly longer than the measured gap so it is still interpolating
+        when the next pose lands.
         """
         key = state.get('id')
         yaw = _number(state.get('yaw'))
         previous = self._bot_pose_times.get(key)
-        self._bot_pose_times[key] = (now, yaw)
+        if previous is not None and previous[2] == pose:
+            return None
+        self._bot_pose_times[key] = (now, yaw, pose)
         if previous is None:
             self._bot_yaw_rates[key] = 0.0
             return None
@@ -7368,7 +7377,7 @@ class BattleRuntime(object):
         turned = (yaw - float(previous[1]) + math.pi) % (
             2.0 * math.pi) - math.pi
         self._bot_yaw_rates[key] = turned / elapsed
-        return elapsed
+        return elapsed * POSE_RELAX_STRETCH
 
     def _apply_authority_bot_poses(self, states):
         """Present copied 0.8.2 bot poses through the remote filter."""
@@ -7396,11 +7405,12 @@ class BattleRuntime(object):
                 self._destructibles._fell_trees_near(
                     self._avatar.spaceID, position, yaw,
                     _number(state.get('speed')), descriptor)
+            rotation = _engine_rotation(
+                yaw, _number(state.get('pitch')), _number(state.get('roll')))
             self._binding.set_vehicle_pose(
-                record['engine_id'], position,
-                _engine_rotation(yaw, _number(state.get('pitch')),
-                                 _number(state.get('roll'))),
-                relax_time=self._bot_pose_relax(state, now))
+                record['engine_id'], position, rotation,
+                relax_time=self._bot_pose_relax(
+                    state, (tuple(position), rotation), now))
             self._binding.update_vehicle_aim(
                 record['engine_id'], yaw,
                 _number(state.get('aim_yaw', yaw)),

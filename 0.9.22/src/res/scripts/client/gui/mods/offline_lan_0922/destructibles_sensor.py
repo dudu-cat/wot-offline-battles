@@ -950,10 +950,10 @@ def _catalog_soft_static_path(spaceID, segment_start, segment_end,
 			return 'pending_hard' if pending_contact else False
 		destroyed = authority.is_destroyed(
 			candidate[0], candidate[1], candidate[2])
-		if candidate[4] == 'falling' and destroyed:
-			# A felled column remains a moving/final native body.  Its refreshed
-			# catalog OBB is collision geometry, not a hidden fragile skin.
-			return 'pending_hard' if pending_contact else False
+		# Retail lets a vehicle drive over a felled column: once the item is
+		# destroyed its body stops braking and stops blocking, so the refreshed
+		# catalog OBB must not act as an obstacle either.
+		felled = candidate[4] == 'falling' and destroyed
 		candidate_key = (candidate[0], candidate[1], candidate[2])
 		deadline = pending.get(candidate_key)
 		pending_accepted = False
@@ -972,10 +972,12 @@ def _catalog_soft_static_path(spaceID, segment_start, segment_end,
 			return 'pending_hard'
 		mat_info = _synthetic_mat_info(candidate + ((
 			float(hit_point.x), float(hit_point.y), float(hit_point.z)),), Math)
-		current_crushable = pending_accepted or _stock_crushable_1513(
+		current_crushable = felled or pending_accepted or _stock_crushable_1513(
 			mat_info, vel, td, candidate[5])
 		if require_pending_first and candidate_index == 0:
-			if pending_accepted:
+			if felled:
+				current_crushable = True
+			elif pending_accepted:
 				pending_contact = True
 				current_crushable = True
 			elif (allow_kinetic_first and kinetic_speed is not None and

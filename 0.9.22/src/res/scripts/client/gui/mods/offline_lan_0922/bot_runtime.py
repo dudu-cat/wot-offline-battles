@@ -71,7 +71,7 @@ DECISION_SECONDS = 0.0975
 # frame, so its four-point suspension sample and its planner cadence can be
 # spread without changing what the player sees.
 DETAIL_NEAR_METRES = 150.0
-DETAIL_FAR_METRES = 250.0
+DETAIL_FAR_METRES = 350.0
 # Travel that must accumulate before a tier re-samples the four ground rays.
 SLOPE_SAMPLE_METRES = (0.35, 1.50, 4.00)
 SLOPE_SAMPLE_RADIANS = (0.05, 0.15, 0.40)
@@ -83,7 +83,7 @@ DECISION_TIER_FACTOR = (1.0, 2.0, 4.0)
 # interpolate properly, only hulls beyond DETAIL_FAR_METRES step down, and only
 # to 15 Hz, where the residual correction stays under a pixel.  Smooth motion
 # beats the frame budget.
-INTEGRATION_INTERVALS = (0.0, 0.0, 1.0 / 15.0)
+INTEGRATION_INTERVALS = (0.0, 0.0, 1.0 / 30.0)
 INTEGRATION_PHASE_BUCKETS = 7
 # The #1513 production probe owns a 15 m low-speed / 20 m high-speed,
 # three-lane corridor.  A cached sample may only be reused while the hull stays

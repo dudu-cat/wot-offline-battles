@@ -3067,7 +3067,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertAlmostEqual(-4.2, reverse_min)
         self.assertAlmostEqual(4.0, reverse_max)
 
-    def test_direction_soft_path_keeps_destroyed_falling_item_hard(self):
+    def test_direction_soft_path_drives_through_a_felled_column(self):
         (bigworld, math_module, area, cache, authority,
          descriptor) = self._direction_catalog_fixture(
              kind='falling', destroyed=True)
@@ -3087,13 +3087,14 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                     destructibles_sensor, 'note_destroyed') as note, \
                 mock.patch.object(
                     destructibles_sensor, '_publish_destroyed') as publish:
-            self.assertFalse(
+            # Retail lets a vehicle drive over a felled column: once it is
+            # destroyed its body stops braking and stops blocking.
+            self.assertTrue(
                 destructibles_sensor._catalog_soft_static_path(
                     1, start, end, collision, 20.0, descriptor))
 
         authority.is_destroyed.assert_called_once_with(22, 37, None)
         authority.destroy_column.assert_not_called()
-        bigworld.wg_collideSegment.assert_not_called()
         note.assert_not_called()
         publish.assert_not_called()
 

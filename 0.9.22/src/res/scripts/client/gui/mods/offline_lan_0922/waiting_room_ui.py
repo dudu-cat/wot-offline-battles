@@ -41,8 +41,8 @@ import time
 PANEL_TEXTURE = ''
 PANEL_FONT = 'default_small.font'
 OVERLAY_Z = 0.1
-# The drawn pointer is a root in front of the room panel.
-POINTER_Z = 0.05
+PANEL_WIDTH = 680
+PANEL_HEIGHT = 300
 POINTER_TICK_SECONDS = 0.03
 
 _HOST_CONTROLS = ('previous', 'map', 'next', 'start')
@@ -232,8 +232,8 @@ class WaitingRoomUI(object):
         self._set(panel, 'heightMode', 'PIXEL')
         self._set(panel, 'horizontalAnchor', 'CENTER')
         self._set(panel, 'verticalAnchor', 'CENTER')
-        self._set(panel, 'width', 680)
-        self._set(panel, 'height', 300)
+        self._set(panel, 'width', PANEL_WIDTH)
+        self._set(panel, 'height', PANEL_HEIGHT)
         # Empty texture plus SOLID renders the flat vertex colour.
         self._set(panel, 'materialFX', 'SOLID')
         self._set(panel, 'colour', (5, 12, 20, 245))
@@ -373,11 +373,11 @@ class WaitingRoomUI(object):
 
     # One small quad over a slightly larger dark one reads as a pointer.
     # mouse_cursors.xml is 12 bytes and no arrow bitmap ships outside the
-    # lobby SWF, so the room draws its own from the flat-colour material the
-    # panel and its buttons already render with.
-    POINTER_WIDTH = 12
-    POINTER_HEIGHT = 18
-    POINTER_BORDER = 2
+    # lobby SWF, so the room draws its own.  Every property below is copied
+    # from the room buttons, which Peng can see and click.
+    POINTER_WIDTH = 14
+    POINTER_HEIGHT = 20
+    POINTER_BORDER = 4
     POINTER_SHADOW = (0, 0, 0, 230)
     POINTER_FILL = (255, 255, 255, 255)
 
@@ -388,86 +388,101 @@ class WaitingRoomUI(object):
         self._pointer_moves += 1
         return self._move_pointer()
 
-    def _build_pointer(self):
-        """Create the drawn pointer once, as its own GUI roots.
+    def _panel_clip_step(self):
+        """Return one pixel in the panel's own clip units.
 
-        ``PyGUI.Utils.absoluteClipPosition`` sums a component's position up its
-        parent chain, so a child of the room panel reads its position as an
-        offset from the panel rather than as a screen coordinate.  A root takes
-        the clip position straight from ``mcursor``, which is the path the room
-        panel itself already renders through.
+        A child's CLIP size spans the parent, so the buttons' 1.20 width is
+        1.20 half-panels, not 1.20 screens.
         """
-        if self._pointer_parts:
+        return (2.0 / float(PANEL_WIDTH), 2.0 / float(PANEL_HEIGHT))
+
+    def _build_pointer(self):
+        """Create the drawn pointer once, as children of the room panel.
+
+        The buttons render and the standalone roots did not, so the pointer
+        now takes the buttons' exact property set: a panel child, CLIP size,
+        CLIP position, CENTER anchors and the flat SOLID material.
+        ``PyGUI.Utils.absoluteClipPosition`` sums a position up the parent
+        chain, so a child offset is the cursor's clip position minus the
+        panel's.
+        """
+        if self._pointer_parts or self._panel is None:
             return False
-        border = self.POINTER_BORDER
+        step_x, step_y = self._panel_clip_step()
         parts = []
-        for colour, grow in ((self.POINTER_SHADOW, border),
-                             (self.POINTER_FILL, 0)):
+        for colour, grow, depth in ((self.POINTER_SHADOW,
+                                     self.POINTER_BORDER, 0.005),
+                                    (self.POINTER_FILL, 0, 0.0)):
             part = self._surface.simple()
             for name, value in (
                     ('horizontalPositionMode', 'CLIP'),
                     ('verticalPositionMode', 'CLIP'),
-                    ('widthMode', 'PIXEL'), ('heightMode', 'PIXEL'),
-                    ('horizontalAnchor', 'LEFT'),
-                    ('verticalAnchor', 'TOP'),
-                    ('width', self.POINTER_WIDTH + grow),
-                    ('height', self.POINTER_HEIGHT + grow),
+                    ('widthMode', 'CLIP'), ('heightMode', 'CLIP'),
+                    ('horizontalAnchor', 'CENTER'),
+                    ('verticalAnchor', 'CENTER'),
+                    ('position', (0.0, 0.0, depth)),
+                    ('width', (self.POINTER_WIDTH + grow) * step_x),
+                    ('height', (self.POINTER_HEIGHT + grow) * step_y),
                     ('materialFX', 'SOLID'), ('colour', colour),
                     ('focus', False), ('mouseButtonFocus', False),
                     ('crossFocus', False), ('moveFocus', False),
                     ('visible', False)):
                 self._set(part, name, value)
-            self._surface.add_root(part)
-            parts.append((part, grow))
+            self._panel.addChild(part)
+            parts.append((part, depth))
         self._pointer_parts = parts
-        self._surface.resort()
         _log('LAN room pointer built parts=%d size=%dx%d' % (
             len(parts), self.POINTER_WIDTH, self.POINTER_HEIGHT))
         return True
 
     def _move_pointer(self):
         """Follow ``mcursor.position`` with the drawn pointer."""
-        if not self._pointer_parts:
+        if not self._pointer_parts or self._panel is None:
             return False
-        size = getattr(self._surface, 'screen_size', None)
         position = getattr(self._surface, 'cursor_position', None)
-        if not callable(size) or not callable(position):
+        if not callable(position):
             return False
         try:
-            screen = size()
             x, y = position()
         except Exception as error:
             _log('LAN room pointer read failed: %s' % error)
             return False
-        if screen is None:
-            _log('LAN room pointer has no screen resolution')
-            return False
-        # Clip space spans -1..1 across the screen, so one pixel is 2/size.
-        step_x = 2.0 / screen[0]
-        step_y = 2.0 / screen[1]
-        half = self.POINTER_BORDER / 2.0
-        for part, grow in self._pointer_parts:
-            corner = half if grow else 0.0
-            self._set(part, 'position', (
-                x - corner * step_x, y + corner * step_y, POINTER_Z))
+        panel = getattr(self._panel, 'position', (0.0, 0.0, 0.0))
+        offset_x = x - float(panel[0])
+        offset_y = y - float(panel[1])
+        for part, depth in self._pointer_parts:
+            self._set(part, 'position', (offset_x, offset_y, depth))
             self._set(part, 'visible', True)
-        self._report_pointer(screen, x, y)
+        self._report_pointer(x, y)
         return True
 
-    def _report_pointer(self, screen, x, y):
-        """Log the pointer state once per open and then once per second."""
+    _REPORTED_PROPERTIES = (
+        'materialFX', 'widthMode', 'heightMode', 'horizontalPositionMode',
+        'verticalPositionMode', 'horizontalAnchor', 'verticalAnchor',
+        'position', 'width', 'height', 'colour', 'visible')
+
+    def _describe(self, component):
+        if component is None:
+            return 'missing'
+        pairs = ['texture=%r' % getattr(component, 'texture', None)]
+        for name in self._REPORTED_PROPERTIES:
+            pairs.append('%s=%r' % (name, getattr(component, name, None)))
+        return ' '.join(pairs)
+
+    def _report_pointer(self, x, y):
+        """Log the pointer beside a button the player can definitely see."""
         now = time.time()
         if self._pointer_logged is not None and (
                 now - self._pointer_logged) < 1.0:
             return False
         self._pointer_logged = now
-        part = self._pointer_parts[-1][0]
-        _log('LAN room pointer screen=%r mcursor=(%.4f, %.4f) '
-             'moves=%d ticks=%d part=(%r, %r, %r, %r)' % (
-                 screen, x, y, self._pointer_moves, self._pointer_ticks,
-                 getattr(part, 'visible', None),
-                 getattr(part, 'position', None),
-                 getattr(part, 'width', None), getattr(part, 'height', None)))
+        _log('LAN room pointer mcursor=(%.4f, %.4f) moves=%d ticks=%d' % (
+            x, y, self._pointer_moves, self._pointer_ticks))
+        _log('LAN room pointer   part: %s' % self._describe(
+            self._pointer_parts[-1][0]))
+        _log('LAN room pointer button: %s' % self._describe(
+            self._controls.get('close')))
+        _log('LAN room pointer  panel: %s' % self._describe(self._panel))
         return True
 
     def _start_pointer_tick(self):
@@ -498,10 +513,9 @@ class WaitingRoomUI(object):
             return False
         return True
 
-    def _destroy_pointer(self):
-        for part, unused_grow in self._pointer_parts:
-            self._surface.remove_root(part)
-        self._pointer_parts = []
+    def _hide_pointer(self):
+        for part, unused_depth in self._pointer_parts:
+            self._set(part, 'visible', False)
         return True
 
     def _acquire_cursor(self):
@@ -652,7 +666,7 @@ class WaitingRoomUI(object):
         self._hovered = None
         self._release_cursor()
         self._stop_pointer_tick()
-        self._destroy_pointer()
+        self._hide_pointer()
         self._set(self._panel, 'visible', False)
         self._surface.remove_root(self._panel)
         _log('LAN waiting room closed')
@@ -664,4 +678,5 @@ class WaitingRoomUI(object):
         self._controls = {}
         self._frames = {}
         self._labels = {}
+        self._pointer_parts = []
         return True

@@ -426,15 +426,25 @@ class WorldCollisionTests(unittest.TestCase):
         self.assertFalse(detail['accepted_now'])
         authority.destroy_fragile.assert_not_called()
 
-    def test_falling_body_remains_hard_even_if_pending_and_destroyed(self):
-        (cleared, collide, authority, unused_destroy,
+    def test_a_felled_column_stops_blocking_the_vehicle(self):
+        """Retail lets a vehicle drive over a knocked-down pole, so the
+        refreshed catalog OBB must not keep acting as an obstacle."""
+        (cleared, unused_collide, authority, unused_destroy,
          unused_note, unused_publish) = self._run_pending_recast(
              (4.0,), pending_indices=(0,), destroyed_indices=(0,),
              first_kind='falling')
 
+        self.assertTrue(cleared)
+        authority.destroy_fragile.assert_not_called()
+
+    def test_a_standing_column_still_blocks_the_vehicle(self):
+        (cleared, unused_collide, authority, unused_destroy,
+         unused_note, unused_publish) = self._run_pending_recast(
+             (4.0,), pending_indices=(), destroyed_indices=(),
+             first_kind='falling')
+
         self.assertFalse(cleared)
         authority.destroy_fragile.assert_not_called()
-        collide.assert_not_called()
 
     def test_active_first_contact_cannot_reach_later_pending_skin(self):
         (cleared, collide, authority, unused_destroy,

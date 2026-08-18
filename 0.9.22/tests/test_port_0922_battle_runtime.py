@@ -19,6 +19,8 @@ from gui.mods.offline_lan_0922.battle_runtime import (
     _FrameDiagnostics, _LANInputSender,
     _engine_rotation,
     _selected_vehicle_has_sixth_sense)
+from gui.mods.offline_lan_0922 import battle_runtime as \
+    battle_runtime_module
 from gui.mods.offline_lan_0922 import bot_runtime, combat_rules, \
     critical_damage, gun_mechanics, tank_collision, vehicle_physics
 from gui.mods.offline_lan_0922.entities.remote_vehicle import \
@@ -1664,6 +1666,26 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertIsNone(vehicle.track_scroll)
         self.assertTrue(factory.is_ready(vehicle_id))
         self.assertIsNotNone(vehicle.model)
+
+    def test_an_unchanged_pose_does_not_rekey_the_animation(self):
+        """A bot below the render rate republishes the same pose; re-keying
+        it would hold the model still and then jump on the next step."""
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+
+        first = battle._bot_pose_relax({'id': 3, 'yaw': 0.0}, 'a', 10.0)
+        self.assertIsNone(first)
+
+        self.assertIsNone(
+            battle._bot_pose_relax({'id': 3, 'yaw': 0.0}, 'a', 10.02))
+        self.assertIsNone(
+            battle._bot_pose_relax({'id': 3, 'yaw': 0.0}, 'a', 10.04))
+
+        relax = battle._bot_pose_relax({'id': 3, 'yaw': 0.0}, 'b', 10.06)
+
+        # The gap is measured to the last CHANGE, not to the last frame.
+        self.assertAlmostEqual(
+            0.06 * battle_runtime_module.POSE_RELAX_STRETCH, relax)
 
     def test_a_bot_pose_is_animated_rather_than_snapped(self):
         """OfflineEntity declares an empty <Volatile/>, so no WGVehicleFilter
@@ -4225,8 +4247,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         record = {'engine_id': 1000, 'kind': 'bot', 'network_id': 3}
 
         # Two accepted poses a tenth of a second apart give the yaw rate.
-        battle._bot_pose_relax({'id': 3, 'yaw': 0.0}, 10.0)
-        battle._bot_pose_relax({'id': 3, 'yaw': 0.1}, 10.1)
+        battle._bot_pose_relax({'id': 3, 'yaw': 0.0}, 'a', 10.0)
+        battle._bot_pose_relax({'id': 3, 'yaw': 0.1}, 'b', 10.1)
 
         battle._update_bot_tracks(
             record, {'id': 3, 'speed': 0.0, 'alive': True, 'health': 500},
