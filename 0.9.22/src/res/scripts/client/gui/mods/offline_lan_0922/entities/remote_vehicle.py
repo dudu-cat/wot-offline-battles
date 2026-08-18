@@ -22,9 +22,9 @@ def _blend_angle(source, target, ratio):
         2.0 * math.pi) - math.pi
     return float(source) + delta * ratio
 
-# Native pose objects this process has allocated.  Rekeying a MatrixAnimation
-# per accepted pose walked a 2 GB client into its address-space ceiling, so the
-# drawn pose now owns two objects per vehicle for its whole life.
+# Native pose objects this process has allocated.  Allocating a fresh pair per
+# accepted pose walked a 2 GB client into its address-space ceiling, so a
+# vehicle now owns its animation and both keyframe matrices for its whole life.
 _pose_object_allocations = 0
 
 
@@ -725,10 +725,11 @@ class RemoteVehicle(object):
         self.pitch = float(rotation[1])
         self.roll = float(rotation[0])
         self.matrix = math_module.Matrix()
-        # The drawn compound owns these two for its whole life; the accepted
-        # pose is eased into them instead of rekeying a native animation.
-        self._render_matrix = math_module.Matrix()
-        self._render_translation = math_module.Vector3(position)
+        # The animation and its two keyframe matrices belong to this vehicle
+        # for its whole life; rekeying rewrites their contents in place.
+        self._animation = None
+        self._key_from = math_module.Matrix()
+        self._key_to = math_module.Matrix()
         global _pose_object_allocations
         _pose_object_allocations += 2
         self._render_pose = None
@@ -762,7 +763,9 @@ class RemoteVehicle(object):
         # compound through Math.MatrixAnimation instead, which is the same
         # provider gun_marker_ctrl._updateMatrixProvider uses to smooth a
         # server-tick-rate update up to the render rate.
-        self.model.matrix = self._render_matrix
+        self._animation = self._new_animation()
+        self.model.matrix = (
+            self._animation if self._animation is not None else self.matrix)
         self.appearance.attach(model)
         if self._shot_presenter is not None:
             self._shot_presenter.setup_turret_rotations(self)
@@ -866,65 +869,106 @@ class RemoteVehicle(object):
         if first_error is not None:
             raise first_error
 
-    def _retarget_render_pose(self, relax_time, now):
-        """Ease the drawn compound from where it is now to the new pose.
+    def _new_animation(self):
+        """Create this vehicle's one animation, keyed to its own matrices."""
+        factory = getattr(self._math, 'MatrixAnimation', None)
+        if not callable(factory):
+            return None
+        try:
+            animation = factory()
+        except Exception:
+            return None
+        global _pose_object_allocations
+        _pose_object_allocations += 1
+        pose = (float(self.position.x), float(self.position.y),
+                float(self.position.z), self.yaw, self.pitch, self.roll)
+        self._write_pose(self._key_from, pose)
+        self._write_pose(self._key_to, pose)
+        self._render_pose = pose
+        try:
+            animation.keyframes = ((0.0, self._key_from),)
+            animation.time = 0.0
+        except Exception:
+            return None
+        return animation
 
-        A zero relax time means the accepted pose did not move, so the ease
-        already in flight keeps running instead of snapping to its target.
+    def _mirror_pose(self, now):
+        """Return where the compound is drawn right now.
+
+        The engine interpolates the keyframes linearly from time 0, so the
+        same linear blend reproduces the drawn pose without reading back a
+        native provider.
         """
-        target = (float(self.position.x), float(self.position.y),
-                  float(self.position.z), self.yaw, self.pitch, self.roll)
-        relax_time = float(relax_time or 0.0)
-        if (relax_time > 0.0 and now is not None and
-                self._render_pose is not None):
-            self._render_from = self._render_pose
-            self._render_to = target
-            self._render_started = float(now)
-            self._render_duration = relax_time
-            return True
-        if self._render_to is not None:
-            return False
-        self._render_from = None
-        self._render_to = None
-        self._render_pose = target
-        self._write_render_pose(target)
-        return True
-
-    def advance_render_pose(self, now):
-        """Step the drawn pose one render frame along the current ease."""
         target = self._render_to
-        if target is None or now is None:
-            return False
+        if target is None:
+            return self._render_pose
         source = self._render_from
-        ratio = 1.0
-        if self._render_duration > 0.0:
-            ratio = (float(now) - self._render_started) / self._render_duration
-        if ratio >= 1.0 or source is None:
-            self._render_from = None
-            self._render_to = None
-            self._render_pose = target
-            self._write_render_pose(target)
-            return True
+        if source is None or now is None or self._render_duration <= 0.0:
+            return target
+        ratio = (float(now) - self._render_started) / self._render_duration
+        if ratio >= 1.0:
+            return target
         ratio = max(0.0, ratio)
-        blended = (
+        return (
             source[0] + (target[0] - source[0]) * ratio,
             source[1] + (target[1] - source[1]) * ratio,
             source[2] + (target[2] - source[2]) * ratio,
             _blend_angle(source[3], target[3], ratio),
             _blend_angle(source[4], target[4], ratio),
             _blend_angle(source[5], target[5], ratio))
-        self._render_pose = blended
-        self._write_render_pose(blended)
+
+    def _retarget_render_pose(self, relax_time, now):
+        """Rekey the compound's animation from where it is to the new pose.
+
+        The two keyframe matrices belong to this vehicle for its whole life;
+        only their contents change, so a battle never allocates a new native
+        pose object after the vehicle exists.
+        """
+        target = (float(self.position.x), float(self.position.y),
+                  float(self.position.z), self.yaw, self.pitch, self.roll)
+        relax_time = float(relax_time or 0.0)
+        animation = self._animation
+        if animation is None:
+            self._render_pose = target
+            self._write_pose(self._key_to, target)
+            return False
+        current = self._mirror_pose(now)
+        if relax_time <= 0.0 or current is None:
+            self._render_from = None
+            self._render_to = None
+            self._render_pose = target
+            self._write_pose(self._key_from, target)
+            self._write_pose(self._key_to, target)
+            return self._rekey(0.0)
+        if current == target:
+            return False
+        self._write_pose(self._key_from, current)
+        self._write_pose(self._key_to, target)
+        self._render_from = current
+        self._render_to = target
+        self._render_pose = current
+        self._render_started = float(now or 0.0)
+        self._render_duration = relax_time
+        return self._rekey(relax_time)
+
+    def _rekey(self, relax_time):
+        """Point the animation at this vehicle's own two keyframe matrices."""
+        try:
+            self._animation.keyframes = (
+                (0.0, self._key_from), (relax_time, self._key_to))
+            self._animation.time = 0.0
+        except Exception:
+            self._animation = None
+            if self.model is not None:
+                self.model.matrix = self.matrix
+            return False
         return True
 
-    def _write_render_pose(self, pose):
-        """Write one pose into the vehicle's own drawn matrix, in place."""
-        translation = self._render_translation
-        translation.x = pose[0]
-        translation.y = pose[1]
-        translation.z = pose[2]
-        self._render_matrix.setRotateYPR((pose[3], pose[4], pose[5]))
-        self._render_matrix.translation = translation
+    @staticmethod
+    def _write_pose(matrix, pose):
+        """Write one pose into an existing native matrix, in place."""
+        matrix.setRotateYPR((pose[3], pose[4], pose[5]))
+        matrix.translation = (pose[0], pose[1], pose[2])
         return True
 
     def set_pose(self, position, rotation, relax_time=None, now=None):
@@ -935,7 +979,6 @@ class RemoteVehicle(object):
         self.yaw = float(rotation[2])
         self._update_matrix()
         self._retarget_render_pose(relax_time, now)
-        self.advance_render_pose(now)
         velocity = self.position - previous
         self.filter.update(self.position, velocity)
 

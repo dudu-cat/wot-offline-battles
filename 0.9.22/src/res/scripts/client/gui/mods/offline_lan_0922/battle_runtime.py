@@ -199,8 +199,6 @@ class _FrameDiagnostics(object):
         self._outside_max = 0.0
         self._offframe_sum = 0.0
         self._offframe_max = 0.0
-        self._load_level = 0
-        self._load_gap = 0.0
         self._load_busiest = ()
         self._collections = {}
         self._stage_sums = dict((name, 0.0)
@@ -345,11 +343,9 @@ class _FrameDiagnostics(object):
         return True
 
     def note_bot_load(self, report):
-        """Record the bot governor state and the busiest planners."""
+        """Record the busiest bot planners of this window."""
         if not self.enabled or not isinstance(report, dict):
             return False
-        self._load_level = int(report.get('level', 0))
-        self._load_gap = float(report.get('gap', 0.0))
         self._load_busiest = tuple(report.get('busiest') or ())
         return True
 
@@ -370,8 +366,7 @@ class _FrameDiagnostics(object):
              'gap_ms_avg_max=%.3f/%.3f raw_dt_ms_avg_max=%.3f/%.3f '
              'exec_ms_avg_max=%.3f/%.3f offframe_ms_avg_max=%.3f/%.3f '
              'outside_ms_avg_max=%.3f/%.3f '
-             'over_50_67_100=%d/%d/%d sim_caps=%d clock_regress=%d '
-             'bot_load=%d bot_gap_ms=%.1f\n') % (
+             'over_50_67_100=%d/%d/%d sim_caps=%d clock_regress=%d\n') % (
                  self._window_id, context.get('round', '-'),
                  context.get('map', '-'), context.get('phase', '-'),
                  self._samples, self._window_elapsed,
@@ -387,8 +382,7 @@ class _FrameDiagnostics(object):
                  self._milliseconds(self._outside_sum / samples),
                  self._milliseconds(self._outside_max),
                  self._over_50, self._over_67, self._over_100,
-                 self._sim_caps, self._clock_regressions,
-                 self._load_level, self._milliseconds(self._load_gap)),
+                 self._sim_caps, self._clock_regressions),
         ]
         lines.append(prefix + 'bot_planners ' + (
             ' '.join('%d=%d' % (bot_id, count)
@@ -6291,9 +6285,6 @@ class BattleRuntime(object):
         self._soft_static_recast_budget[0] = BOT_SOFT_RECAST_BUDGET
         offframe = self._offframe_seconds
         self._offframe_seconds = 0.0
-        observe_gap = getattr(self._bots, 'observe_frame_gap', None)
-        if callable(observe_gap):
-            observe_gap(raw_dt)
         frame_id = (diagnostics.begin(entry_wall, raw_dt, offframe)
                     if profiling else 0)
         stages = {}

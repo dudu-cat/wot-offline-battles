@@ -112,14 +112,14 @@ class WaitingRoomTests(unittest.TestCase):
         return self.room._controls[role].properties['visible']
 
     def _root_count(self):
-        """Only the room panel is a GUI root; the pointer is its child."""
-        return 1
+        """The room panel plus the diagnostic root mark."""
+        return 2
 
     def test_the_room_only_uses_properties_this_client_has(self):
         self.room.install()
         self.assertTrue(self.room.open())
         self.assertEqual(self._root_count(), len(self.surface.roots))
-        self.assertEqual(1, self.surface.resorts)
+        self.assertEqual(2, self.surface.resorts)
 
     def test_the_panel_draws_untextured_flat_colour(self):
         self.room.install()

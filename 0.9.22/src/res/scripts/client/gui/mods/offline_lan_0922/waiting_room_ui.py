@@ -23,16 +23,18 @@ Exact #1513 evidence for the native surface used here:
   ``scripts/client/new_year/fade_window.pyc``.
 - Mouse script methods ``handleMouseClickEvent``, ``handleMouseEnterEvent``,
   ``handleMouseLeaveEvent`` and ``handleMouseButtonEvent``: ``ChainView.pyc``.
-- The pointer is the native GUI mouse cursor, and making it visible is not
-  enough: it also has to become the active cursor. ``Scaleform.showCursor`` in
-  ``scripts/client/Scaleform/__init__.pyc`` is exactly
-  ``c = GUI.mcursor(); c.visible = 1; BigWorld.setCursor(c)``, and
-  ``helpers/OfflineMode.launch`` uses the same pair. Setting only ``visible``
-  leaves the device cursor active, which is what showed the OS pointer.
-  ``Cursor.attachCursor``/``detachCursor`` in
-  ``gui/Scaleform/managers/Cursor.pyc`` supply the ownership rule this room
-  follows: acquire only while ``GUI.mcursor().active`` is False, and release
-  with ``BigWorld.setCursor(None)``.
+- The lobby's own arrow is Flash, not a native shape: ``Cursor.attachCursor``
+  in ``gui/Scaleform/managers/Cursor.pyc`` sets ``mcursor.visible = False`` and
+  calls ``BigWorld.setCursor(mcursor)``, then ``Cursor.show`` draws the arrow
+  through ``as_showCursorS`` inside ``gui/flash/Cursor.swf``. So the native
+  cursor is only an input source here, and ``gui/mouse_cursors.xml`` is 12
+  bytes in this build. This room activates the native cursor with the stock
+  ``Scaleform.showCursor`` pair and draws its own arrow.
+- The drawn arrow has never been seen. Two fixed diagnostic marks decide why:
+  ``parked`` is a panel child at the panel centre, ``root`` is a GUI root. A
+  child is clipped to the parent rect, so a pointer placed at a cursor outside
+  the 680x300 panel would be culled; whichever mark the player sees names the
+  mechanism.
 """
 
 import sys
@@ -230,6 +232,7 @@ class WaitingRoomUI(object):
         self._labels = {}
         self._cursor_acquired = False
         self._pointer_parts = []
+        self._pointer_probes = {}
         self._pointer_tick = None
         self._pointer_logged = None
         self._pointer_moves = 0
@@ -429,9 +432,13 @@ class WaitingRoomUI(object):
         chain, so a child offset is the cursor's clip position minus the
         panel's.
         """
-        if self._pointer_parts or self._panel is None:
+        if self._panel is None:
             return False
         step_x, step_y = self._panel_clip_step()
+        if not self._pointer_probes:
+            self._build_pointer_probes(step_x, step_y)
+        if self._pointer_parts:
+            return False
         parts = []
         for colour, grow, depth in (
                 (self.POINTER_SHADOW, self.POINTER_BORDER,
@@ -457,6 +464,54 @@ class WaitingRoomUI(object):
         self._pointer_parts = parts
         _log('LAN room pointer built parts=%d size=%dx%d' % (
             len(parts), self.POINTER_WIDTH, self.POINTER_HEIGHT))
+        return True
+
+    def _remove_pointer_probes(self):
+        """Drop the diagnostic marks, roots included."""
+        probe = self._pointer_probes.pop('root', None)
+        if probe is not None:
+            try:
+                self._surface.remove_root(probe)
+            except Exception as error:
+                _log('LAN room pointer probe root not removed: %s' % error)
+        self._pointer_probes = {}
+        return True
+
+    def _build_pointer_probes(self, step_x, step_y):
+        """Draw two fixed test marks that decide why the arrow is unseen.
+
+        ``parked`` is a panel child at the panel centre, so it can never be
+        clipped by the parent rect.  ``root`` is a GUI root at the same screen
+        place.  Whichever the player sees names the mechanism.
+        """
+        for role, parent in (('parked', self._panel), ('root', None)):
+            probe = self._surface.simple()
+            for name, value in (
+                    ('horizontalPositionMode', 'CLIP'),
+                    ('verticalPositionMode', 'CLIP'),
+                    ('widthMode', 'CLIP'), ('heightMode', 'CLIP'),
+                    ('horizontalAnchor', 'CENTER'),
+                    ('verticalAnchor', 'CENTER'),
+                    ('position', (0.0 if parent is not None else 0.30,
+                                  0.0, CONTROL_Z - 2 * CONTROL_FRAME_OFFSET)),
+                    ('width', (self.POINTER_WIDTH + self.POINTER_BORDER) *
+                     (step_x if parent is not None else 2.0 / PANEL_WIDTH)),
+                    ('height', (self.POINTER_HEIGHT + self.POINTER_BORDER) *
+                     (step_y if parent is not None else 2.0 / PANEL_HEIGHT)),
+                    ('materialFX', 'SOLID'),
+                    ('colour', (255, 64, 64, 255)),
+                    ('focus', False), ('mouseButtonFocus', False),
+                    ('crossFocus', False), ('moveFocus', False),
+                    ('visible', True)):
+                self._set(probe, name, value)
+            if parent is not None:
+                parent.addChild(probe)
+            else:
+                self._surface.add_root(probe)
+                resort = getattr(self._surface, 'resort', None)
+                if callable(resort):
+                    resort()
+            self._pointer_probes[role] = probe
         return True
 
     def _move_pointer(self):
@@ -524,6 +579,9 @@ class WaitingRoomUI(object):
                 _log('LAN room pointer native: %r' % (state(),))
             except Exception as error:
                 _log('LAN room pointer native state failed: %s' % error)
+        for role in sorted(self._pointer_probes):
+            _log('LAN room pointer %6s: %s' % (
+                role, self._describe(self._pointer_probes[role])))
         _log('LAN room pointer   part: %s' % self._describe(
             self._pointer_parts[-1][0]))
         _log('LAN room pointer button: %s' % self._describe(
@@ -715,6 +773,7 @@ class WaitingRoomUI(object):
         self._hide_pointer()
         self._set(self._panel, 'visible', False)
         self._surface.remove_root(self._panel)
+        self._remove_pointer_probes()
         _log('LAN waiting room closed')
         return True
 
@@ -725,4 +784,5 @@ class WaitingRoomUI(object):
         self._frames = {}
         self._labels = {}
         self._pointer_parts = []
+        self._pointer_probes = {}
         return True

@@ -6709,36 +6709,6 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(4.2, neighbour['half_length'])
         self.assertEqual(2.3, neighbour['half_width'])
 
-    def test_a_slow_frame_raises_the_bot_detail_floor_and_releases_it(self):
-        module = self.module
-        runtime = self.runtime
-        runtime.battle_start(self.start)
-        runtime.set_camera_position((0.0, 0.0, 0.0))
-        state = runtime.states[11]
-        state['x'], state['z'] = 0.0, 0.0
-
-        # A near bot stays at the finest tier while the frame keeps up.
-        for unused in range(50):
-            runtime.observe_frame_gap(1.0 / 100.0)
-        self.assertEqual(0, runtime.load_report()['level'])
-        self.assertEqual(0, runtime._detail_tier(state))
-
-        for unused in range(50):
-            runtime.observe_frame_gap(1.0 / 6.0)
-        report = runtime.load_report()
-        self.assertEqual(module.GOVERNOR_MAX_LEVEL, report['level'])
-        self.assertEqual(module.GOVERNOR_MAX_LEVEL,
-                         runtime._detail_tier(state))
-        # A raised floor slows planning and the suspension sample.
-        self.assertGreater(
-            module.DECISION_TIER_FACTOR[module.GOVERNOR_MAX_LEVEL],
-            module.DECISION_TIER_FACTOR[0])
-
-        for unused in range(200):
-            runtime.observe_frame_gap(1.0 / 100.0)
-        self.assertEqual(0, runtime.load_report()['level'])
-        self.assertEqual(0, runtime._detail_tier(state))
-
     def test_the_load_report_names_the_busiest_planners_once(self):
         runtime = self.runtime
         runtime.battle_start(self.start)

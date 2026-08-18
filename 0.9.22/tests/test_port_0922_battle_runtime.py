@@ -1717,9 +1717,10 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertAlmostEqual(
             0.06 * battle_runtime_module.POSE_RELAX_STRETCH, relax)
 
-    def test_a_bot_pose_is_eased_rather_than_snapped(self):
+    def test_a_bot_pose_is_animated_without_allocating_per_pose(self):
         """OfflineEntity declares an empty <Volatile/>, so no WGVehicleFilter
-        can ever interpolate for a bot; the vehicle eases its own matrix."""
+        can ever interpolate for a bot; the compound animates instead, and
+        rekeying it must not allocate a native object per pose."""
         runtime = _runtime()
         vehicle = RemoteVehicle(
             1000, _Descriptor(), {
@@ -1728,26 +1729,29 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
             _Vector(), (0.0, 0.0, 0.0), runtime.math)
         model = _Model()
         vehicle.attach_visual(types.SimpleNamespace(model=None), 7, model)
-
-        self.assertIs(vehicle._render_matrix, model.matrix)
+        self.assertIs(vehicle._animation, model.matrix)
         allocations = remote_vehicle_module.pose_animation_writes()
 
         vehicle.set_pose(_Vector(10.0, 0.0, 20.0), (0.0, 0.0, 1.0),
-                         relax_time=0.10, now=100.0)
+                         relax_time=0.05, now=100.0)
 
-        # The drawn pose starts at the old one and reaches the new one only
-        # after the relax interval, without allocating anything native.
-        self.assertEqual((0.0, 0.0, 0.0), vehicle._render_pose[:3])
-        vehicle.advance_render_pose(100.05)
-        self.assertAlmostEqual(5.0, vehicle._render_pose[0])
-        self.assertAlmostEqual(10.0, vehicle._render_pose[2])
-        vehicle.advance_render_pose(100.10)
-        self.assertAlmostEqual(10.0, vehicle._render_pose[0])
-        self.assertAlmostEqual(1.0, vehicle._render_pose[3])
+        keyframes = vehicle._animation.keyframes
+        self.assertEqual(2, len(keyframes))
+        self.assertEqual(0.0, keyframes[0][0])
+        self.assertEqual(0.05, keyframes[1][0])
+        self.assertEqual(0.0, vehicle._animation.time)
+        # The engine interpolates between the vehicle's own two matrices.
+        self.assertIs(vehicle._key_from, keyframes[0][1])
+        self.assertIs(vehicle._key_to, keyframes[1][1])
+
+        vehicle.set_pose(_Vector(20.0, 0.0, 40.0), (0.0, 0.0, 2.0),
+                         relax_time=0.05, now=100.05)
+
+        self.assertIs(vehicle._key_from, vehicle._animation.keyframes[0][1])
         self.assertEqual(
             allocations, remote_vehicle_module.pose_animation_writes())
 
-    def test_an_unchanged_pose_keeps_the_ease_running(self):
+    def test_a_rekey_starts_from_the_drawn_pose_not_the_last_target(self):
         runtime = _runtime()
         vehicle = RemoteVehicle(
             1000, _Descriptor(), {
@@ -1758,10 +1762,10 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         vehicle.set_pose(_Vector(10.0, 0.0, 0.0), (0.0, 0.0, 0.0),
                          relax_time=0.10, now=100.0)
 
-        # A republished identical pose carries relax_time 0; the ease must
-        # keep interpolating instead of snapping to its target.
-        vehicle.set_pose(_Vector(10.0, 0.0, 0.0), (0.0, 0.0, 0.0),
-                         relax_time=0.0, now=100.05)
+        # Half way through the first ease a new pose arrives; the animation
+        # must continue from the middle rather than jump back to the start.
+        vehicle.set_pose(_Vector(20.0, 0.0, 0.0), (0.0, 0.0, 0.0),
+                         relax_time=0.10, now=100.05)
 
         self.assertAlmostEqual(5.0, vehicle._render_pose[0])
 
@@ -1777,6 +1781,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         vehicle.set_pose(_Vector(1.0, 0.0, 2.0), (0.0, 0.0, 0.0))
 
         self.assertEqual((1.0, 0.0, 2.0), vehicle._render_pose[:3])
+        self.assertEqual(0.0, vehicle._animation.keyframes[1][0])
 
     def test_destroyed_remote_vehicle_reloads_the_native_wreck_once(self):
         runtime = _runtime()
@@ -1870,7 +1875,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         vehicle.health = 500
         vehicle.isAlive.value = True
         self.assertIs(vehicle, bigworld.entity(vehicle_id))
-        self.assertIs(vehicle._render_matrix, vehicle.model.matrix)
+        self.assertIs(vehicle._animation, vehicle.model.matrix)
         self.assertEqual(
             (10.0, 2.0, 30.0), tuple(vehicle.matrix.translation))
         self.assertEqual(0.5, vehicle.matrix.yaw)
@@ -1880,7 +1885,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
 
         vehicle.set_pose(_Vector(20.0, 3.0, 40.0), (0.0, 0.0, 1.0))
         self.assertEqual((20.0, 3.0, 40.0), tuple(vehicle.position))
-        self.assertIs(vehicle._render_matrix, vehicle.model.matrix)
+        self.assertIs(vehicle._animation, vehicle.model.matrix)
         self.assertEqual(
             (20.0, 3.0, 40.0), tuple(vehicle.matrix.translation))
         self.assertEqual(1.0, vehicle.matrix.yaw)
