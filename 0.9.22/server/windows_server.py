@@ -168,6 +168,7 @@ def main():
             SERVER_PORT,
             default_map,
             SERVER_MAX_PLAYERS,
+            os.environ.get("WOT_LAN_AUTHORITY", "client"),
         )
     except Exception:
         traceback.print_exc()

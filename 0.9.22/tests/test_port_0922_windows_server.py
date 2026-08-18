@@ -28,6 +28,7 @@ class WindowsServerLauncherTests(unittest.TestCase):
             28782,
             'server_random',
             30,
+            'client',
         )
 
     def test_firewall_request_precedes_server_bind(self):
@@ -36,8 +37,9 @@ class WindowsServerLauncherTests(unittest.TestCase):
         def ensure(port):
             events.append(('firewall', port))
 
-        def run_server(host, port, map_name, max_players):
-            events.append(('server', host, port, map_name, max_players))
+        def run_server(host, port, map_name, max_players, authority_mode):
+            events.append(('server', host, port, map_name, max_players,
+                           authority_mode))
 
         with mock.patch.object(
                 windows_server, '_load_server',
@@ -49,7 +51,7 @@ class WindowsServerLauncherTests(unittest.TestCase):
 
         self.assertEqual([
             ('firewall', 28782),
-            ('server', '0.0.0.0', 28782, 'server_random', 30),
+            ('server', '0.0.0.0', 28782, 'server_random', 30, 'client'),
         ], events)
 
     def test_source_process_never_checks_or_changes_firewall(self):

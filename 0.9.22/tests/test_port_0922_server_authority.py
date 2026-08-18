@@ -90,7 +90,8 @@ def _prime_destructible_map(state):
 
 
 def _state_with_authority(ready_world=True, clock=None):
-    state = BattleState(map_name='01_karelia', clock=clock)
+    state = BattleState(map_name='01_karelia', clock=clock,
+                        authority_mode='server')
     state.client_build = CLIENT_BUILD_0922
     state.descriptor_store.add('ussr:R11_MS-1', _projection())
     player = _player(1)
@@ -177,7 +178,8 @@ class ServerAuthorityElectionTest(unittest.TestCase):
         self.assertIn(2, state.capture_bases)
 
     def test_without_donation_refuses_the_start(self):
-        state = BattleState(map_name='01_karelia')
+        state = BattleState(map_name='01_karelia',
+                            authority_mode='server')
         state.client_build = CLIENT_BUILD_0922
         state.players[1] = _player(1)
         state._elect_room_host()

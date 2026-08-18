@@ -53,7 +53,8 @@ def _catalog_rows():
 
 
 def _state_with_catalog(clock=None):
-    state = BattleState(map_name='01_karelia', clock=clock)
+    state = BattleState(map_name='01_karelia', clock=clock,
+                        authority_mode='server')
     state.client_build = CLIENT_BUILD_0922
     state.players[1] = _player(1)
     state._elect_room_host()
@@ -286,7 +287,8 @@ class DonationFlowTest(unittest.TestCase):
 class CatalogValidationTest(unittest.TestCase):
     def test_catalog_accepts_the_full_1513_vehicle_list(self):
         # The pinned #1513 client lists 680 vehicles across ten nations.
-        state = BattleState(map_name='01_karelia')
+        state = BattleState(map_name='01_karelia',
+                        authority_mode='server')
         state.client_build = CLIENT_BUILD_0922
         state.players[1] = _player(1)
         rows = [{'name': 'nation%d:Tank_%d' % (index % 10, index),
@@ -301,7 +303,8 @@ class CatalogValidationTest(unittest.TestCase):
             1, {'vehicles': oversized}))
 
     def test_rejects_malformed_rows(self):
-        state = BattleState(map_name='01_karelia')
+        state = BattleState(map_name='01_karelia',
+                        authority_mode='server')
         state.client_build = CLIENT_BUILD_0922
         state.players[1] = _player(1)
         self.assertFalse(state.store_vehicle_catalog(

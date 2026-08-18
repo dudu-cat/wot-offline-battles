@@ -499,7 +499,7 @@ class Player:
 
 class BattleState:
     def __init__(self, map_name=DEFAULT_MAP, max_players=30, clock=None,
-                 authority_mode="server"):
+                 authority_mode="client"):
         self.map_option = map_name
         self.map_name = self._choose_map()
         self.authority_mode = (
@@ -5190,7 +5190,7 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 
 def run_server(host, port, map_name, max_players,
-               authority_mode="server"):
+               authority_mode="client"):
     state = BattleState(map_name=map_name, max_players=max_players,
                         authority_mode=authority_mode)
     tcp_server = ThreadedTCPServer((host, port), ClientHandler)
@@ -5235,8 +5235,8 @@ def main():
     parser.add_argument(
         "--authority", dest="authority_mode",
         choices=("server", "client"),
-        default=os.environ.get("WOT_LAN_AUTHORITY", "server"),
-        help="who simulates bots in 0.9.22 rounds (default: server; "
+        default=os.environ.get("WOT_LAN_AUTHORITY", "client"),
+        help="who simulates bots in 0.9.22 rounds (default: client; "
              "WOT_LAN_AUTHORITY overrides)")
     args = parser.parse_args()
     run_server(args.host, args.port, args.map_name, args.max_players,

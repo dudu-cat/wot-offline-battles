@@ -169,7 +169,8 @@ class _FakeBots(object):
 
 
 def _battle_state():
-    state = BattleState(map_name='01_karelia')
+    state = BattleState(map_name='01_karelia',
+                        authority_mode='server')
     state.client_build = CLIENT_BUILD_0922
     state.phase = 'battle'
     state.tick = int(round(PREBATTLE_SECONDS * TICK_HZ)) + 1
