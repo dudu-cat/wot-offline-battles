@@ -9,7 +9,13 @@ sys.path.insert(0, str(ROOT / '0.9.22' / 'src' / 'res' / 'scripts' / 'client'))
 sys.path.insert(0, str(ROOT / '0.9.22' / 'server'))
 
 from gui.mods.offline_lan_0922.lan_client import LANClient
-from lan_battle_server import Player, _bot_combat_log_message
+from lan_battle_server import (
+    BattleState, CLIENT_BUILD_0922, Player, _bot_combat_log_message)
+
+
+class _Socket(object):
+    def sendall(self, unused_payload):
+        pass
 
 
 class LanProtocolTests(unittest.TestCase):
@@ -69,6 +75,68 @@ class LanProtocolTests(unittest.TestCase):
         self.assertEqual(17, self.sent[8]['chunk_id'])
         self.assertTrue(all(message['round_id'] == 7
                             for message in self.sent))
+
+    def test_waiting_room_publishes_one_changed_garage_vehicle(self):
+        self.client.phase = 'waiting'
+        self.client.vehicle = 'ussr:R11_MS-1'
+        self.client.max_health = 90
+
+        self.assertFalse(self.client.select_vehicle('ussr:R11_MS-1', 90))
+        self.assertTrue(self.client.select_vehicle('germany:G01_PzI', 150))
+
+        self.assertEqual({'type': 'select_vehicle',
+                          'vehicle': 'germany:G01_PzI',
+                          'max_health': 150}, self.sent[-1])
+        # Only the server-published roster may retire the pending selection,
+        # so a rejected update is resent on the next waiting roster.
+        self.assertEqual('ussr:R11_MS-1', self.client.vehicle)
+
+        self.client._handle_message({
+            'type': 'roster', 'protocol': 5, 'round_id': 8,
+            'state_revision': 9, 'phase': 'waiting', 'map': '01_karelia',
+            'host_player_id': 1, 'authority_epoch': 0,
+            'players': [{'id': 1, 'vehicle': 'germany:G01_PzI',
+                         'max_health': 150}]})
+
+        self.assertEqual('germany:G01_PzI', self.client.vehicle)
+        self.assertEqual(150, self.client.max_health)
+        self.assertFalse(self.client.select_vehicle('germany:G01_PzI', 150))
+
+    def test_vehicle_selection_is_refused_outside_the_waiting_room(self):
+        self.client.phase = 'battle'
+
+        self.assertFalse(self.client.select_vehicle('germany:G01_PzI', 150))
+        self.assertEqual([], self.sent)
+
+    def _room_with_one_player(self):
+        state = BattleState(map_name='01_karelia')
+        state.client_build = CLIENT_BUILD_0922
+        state.players[1] = Player(
+            1, _Socket(), ('127.0.0.1', 1), vehicle='ussr:R11_MS-1',
+            team=1, slot=0, health=90, max_health=90)
+        return state
+
+    def test_server_applies_a_waiting_room_vehicle_change(self):
+        state = self._room_with_one_player()
+
+        self.assertTrue(state.select_vehicle(1, {
+            'vehicle': 'germany:G01_PzI', 'max_health': 150}))
+
+        player = state.players[1]
+        self.assertEqual('germany:G01_PzI', player.vehicle)
+        self.assertEqual(150, player.max_health)
+        self.assertEqual(150, player.health)
+        self.assertFalse(state.select_vehicle(1, {
+            'vehicle': 'germany:G01_PzI', 'max_health': 150}))
+
+    def test_server_keeps_the_round_vehicle_once_the_battle_started(self):
+        state = self._room_with_one_player()
+        state.phase = 'battle'
+
+        self.assertFalse(state.select_vehicle(1, {
+            'vehicle': 'germany:G01_PzI', 'max_health': 150}))
+        self.assertEqual('ussr:R11_MS-1', state.players[1].vehicle)
+        self.assertEqual(90, state.players[1].max_health)
 
     def test_descriptor_bundle_carries_full_terminal_contract(self):
         self.assertTrue(self.client.send_descriptor_bundle(

@@ -47,6 +47,7 @@ class _Client(object):
         self.stop_calls = 0
         self.leave_calls = 0
         self.requests = []
+        self.selections = []
         self.descriptor_bundles = []
 
     def start(self):
@@ -62,6 +63,16 @@ class _Client(object):
 
     def leave_battle(self):
         self.leave_calls += 1
+        return True
+
+    def select_vehicle(self, vehicle, max_health):
+        if not self.ready or self.phase != 'waiting':
+            return False
+        if vehicle == self.vehicle and max_health == self.max_health:
+            return False
+        self.selections.append((vehicle, max_health))
+        self.vehicle = vehicle
+        self.max_health = max_health
         return True
 
     def send_descriptor_bundle(self, projections, requested=None,
@@ -392,6 +403,67 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual('waiting', self.session.state)
         self.assertEqual([screen], self.queue_screens)
         self.assertEqual(0, screen.leave_calls)
+
+    def _finish_first_round(self, garage):
+        self.session._vehicle_provider = lambda: (garage[0], garage[1])
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia'],
+                              'round_id': 1, 'host_player_id': 'p1'})
+        self.session.request_start('01_karelia')
+        self.emit('battle_start', {
+            'round_id': 1, 'map': '01_karelia',
+            'players': [{'id': 'p1', 'vehicle': self.client.vehicle,
+                         'spawn': {'x': 1, 'y': 2, 'z': 3}}]})
+        self.session._on_local_battle_leave()
+
+    def _start_second_round(self):
+        self.session.request_start('01_karelia')
+        self.emit('battle_start', {
+            'round_id': 2, 'map': '01_karelia',
+            'players': [{'id': 'p1', 'vehicle': self.client.vehicle,
+                         'spawn': {'x': 1, 'y': 2, 'z': 3}}]})
+        return self.battle_runtime.started[-1]['config']['vehicle']
+
+    def test_second_round_uses_the_vehicle_chosen_after_the_first_one(self):
+        garage = ['ussr:R11_MS-1', 90]
+        self._finish_first_round(garage)
+        garage[0], garage[1] = 'germany:G01_PzI', 150
+
+        self.emit('roster', {'phase': 'waiting', 'round_id': 2,
+                             'map_pool': ['01_karelia'],
+                             'host_player_id': 'p1'})
+
+        self.assertEqual([('germany:G01_PzI', 150)], self.client.selections)
+        self.assertEqual('germany:G01_PzI', self._start_second_round())
+        self.assertEqual(1, len(self.clients))
+
+    def test_battle_click_publishes_a_garage_change_made_in_the_room(self):
+        garage = ['ussr:R11_MS-1', 90]
+        self._finish_first_round(garage)
+        self.emit('roster', {'phase': 'waiting', 'round_id': 2,
+                             'map_pool': ['01_karelia'],
+                             'host_player_id': 'p1'})
+        garage[0], garage[1] = 'usa:T1_Cunningham', 140
+
+        self.session.join()
+
+        self.assertEqual([('usa:T1_Cunningham', 140)], self.client.selections)
+        self.assertEqual('usa:T1_Cunningham', self._start_second_round())
+
+    def test_unreadable_garage_selection_keeps_the_accepted_vehicle(self):
+        garage = ['ussr:R11_MS-1', 90]
+        self._finish_first_round(garage)
+
+        def unavailable():
+            raise ValueError('the current garage vehicle is not available')
+
+        self.session._vehicle_provider = unavailable
+        self.emit('roster', {'phase': 'waiting', 'round_id': 2,
+                             'map_pool': ['01_karelia'],
+                             'host_player_id': 'p1'})
+
+        self.assertEqual([], self.client.selections)
+        self.assertEqual('waiting', self.session.state)
+        self.assertEqual('ussr:R11_MS-1', self._start_second_round())
 
     def test_battle_start_keeps_the_stock_queue(self):
         self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
