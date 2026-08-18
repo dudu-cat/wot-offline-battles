@@ -182,6 +182,23 @@ class LANSession(object):
             max_health=max_health,
             on_event=on_event)
 
+    def _publish_selected_vehicle(self):
+        """Send the current garage tank so the next round uses it."""
+        client = self.client
+        select = getattr(client, 'select_vehicle', None)
+        if client is None or not callable(select):
+            return False
+        try:
+            vehicle, max_health = self._vehicle_provider()
+            max_health = int(max_health)
+        except Exception:
+            # A lobby transition can hide the garage selection.  Keep the
+            # vehicle the server already holds for this player.
+            return False
+        if not vehicle or max_health < 1:
+            return False
+        return bool(select(vehicle, max_health))
+
     def _return_to_join_after_vehicle_selection_error(self):
         self.client = None
         self.state = 'ready_to_join'
@@ -250,6 +267,7 @@ class LANSession(object):
             # An explicit Battle click is the user's request to reopen a room
             # they previously dismissed.
             self._picker_dismissed = False
+            self._publish_selected_vehicle()
             if not self._is_local_host():
                 self._show_waiting_notice(force=True)
             self._open_waiting_picker()
@@ -834,6 +852,7 @@ class LANSession(object):
                 self.state = 'awaiting_battle_start'
                 return
             self.state = 'waiting'
+            self._publish_selected_vehicle()
             if self._picker_open and self._queue is not None:
                 self._refresh_surface()
             if self._pending_map is not None:

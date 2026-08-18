@@ -12,6 +12,7 @@ connected client runs in follower mode.
 import math
 import os
 import sys
+import time
 import types
 
 _SERVER_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -915,14 +916,20 @@ class ServerBattleAuthority(object):
             static_fraction,
             nearest['fraction'] if nearest is not None else None,
             1.0) if value is not None)
+        is_player_shot = str(meta.get('shooter_kind') or '') == 'player'
         stop = self._traverse_shot_destructibles(
             meta, state, start, end, limit)
         if stop is not None:
+            if is_player_shot:
+                stop.setdefault(
+                    'near', self._nearest_target_note(meta, start, end))
             return stop
         if static_fraction is not None and (
                 nearest is None or static_fraction <= nearest['fraction']):
             return {'outcome': 'impact', 'fraction': static_fraction,
-                    'world': True}
+                    'world': True, 'hit_kind': 'world',
+                    'near': (self._nearest_target_note(meta, start, end)
+                             if is_player_shot else None)}
         if nearest is None:
             return None
         return {'outcome': 'impact', 'fraction': nearest['fraction'],
@@ -988,7 +995,7 @@ class ServerBattleAuthority(object):
                 float(reference) <= _SHOT_THROUGH_MAX_HP_1513)
             if not can_continue:
                 return {'outcome': 'impact', 'fraction': hit['fraction'],
-                        'world': True}
+                        'world': True, 'hit_kind': 'destructible'}
             loss = (self._piercing_loss.get(wire_id, 0.0) +
                     _SHOT_THROUGH_MIN_REDUCTION_1513)
             self._piercing_loss[wire_id] = loss
@@ -998,7 +1005,7 @@ class ServerBattleAuthority(object):
             if combat_rules.sampled_piercing(
                     shot, entry_distance, factor, loss) < 1.0:
                 return {'outcome': 'impact', 'fraction': hit['fraction'],
-                        'world': True}
+                        'world': True, 'hit_kind': 'destructible'}
         return None
 
     def _chord_targets(self, meta, include_shooter=False):
@@ -1038,10 +1045,81 @@ class ServerBattleAuthority(object):
                              float(state.get('y', 0.0)),
                              float(state.get('z', 0.0))),
                 'yaw': float(state.get('yaw', 0.0)),
+                'pitch': float(state.get('pitch', 0.0) or 0.0),
+                'roll': float(state.get('roll', 0.0) or 0.0),
                 'descriptor': descriptor,
                 'health': int(state.get('health', 0)),
                 'state': state,
             }
+
+    def _nearest_target_note(self, meta, start, end):
+        """Distance from this chord to the closest live hull, for diagnosis."""
+        chord = tuple(float(end[index]) - float(start[index])
+                      for index in range(3))
+        chord_sq = sum(value * value for value in chord)
+        best = None
+        for target in self._chord_targets(meta):
+            position = target['position']
+            try:
+                bbox = server_world._descriptor_hull_bbox(
+                    target['descriptor'])
+                center_y = (float(bbox[0][1]) + float(bbox[1][1])) * 0.5
+                half_height = (float(bbox[1][1]) - float(bbox[0][1])) * 0.5
+            except (ValueError, TypeError, IndexError, AttributeError):
+                center_y, half_height = 1.0, 1.0
+            center = (float(position[0]), float(position[1]) + center_y,
+                      float(position[2]))
+            if chord_sq <= 1.0e-12:
+                fraction = 0.0
+            else:
+                fraction = max(0.0, min(1.0, sum(
+                    (center[index] - float(start[index])) * chord[index]
+                    for index in range(3)) / chord_sq))
+            closest = tuple(float(start[index]) + chord[index] * fraction
+                            for index in range(3))
+            distance = math.sqrt(sum(
+                (closest[index] - center[index]) ** 2 for index in range(3)))
+            if best is None or distance < best['distance']:
+                best = {
+                    'kind': target['kind'], 'id': target['id'],
+                    'distance': distance,
+                    'dy': closest[1] - center[1],
+                    'half_height': half_height,
+                }
+        return best
+
+    def _log_player_terminal(self, meta, state, terminal, outcome, direct):
+        if str(meta.get('shooter_kind') or '') != 'player':
+            return
+        impact = tuple(state.get('position') or (0.0, 0.0, 0.0))
+        if outcome != 'impact':
+            hit = outcome
+        else:
+            target = terminal.get('target')
+            if target is not None:
+                hit = '%s:%s' % (target.get('kind'), target.get('id'))
+            else:
+                hit = str(terminal.get('hit_kind') or 'world')
+        parts = [
+            'PROJECTILE DETAIL id=%s hit=%s' % (
+                self._wire_projectile_id(meta), hit),
+            'impact=(%.2f,%.2f,%.2f)' % (impact[0], impact[1], impact[2]),
+        ]
+        try:
+            ground = self.world.ground_height(impact[0], impact[2])
+        except Exception:
+            ground = None
+        if ground is not None:
+            parts.append('ground_dy=%.2f' % (impact[1] - float(ground)))
+        if direct is not None:
+            parts.append('damage=%s' % direct.get('damage'))
+        near = terminal.get('near')
+        if isinstance(near, dict):
+            parts.append(
+                'near=%s:%s miss_distance=%.2f dy=%+.2f half_height=%.2f' % (
+                    near['kind'], near['id'], near['distance'], near['dy'],
+                    near['half_height']))
+        _diag_log(' '.join(parts))
 
     def _projectile_terminal(self, state, terminal):
         meta = state.get('payload') or {}
@@ -1059,6 +1137,11 @@ class ServerBattleAuthority(object):
         splash = []
         if outcome == 'impact' and meta.get('is_he'):
             splash = self._splash_effects(meta, impact, direct)
+        try:
+            self._log_player_terminal(meta, state, terminal, outcome, direct)
+        except Exception:
+            # Diagnostics must never change or terminate combat resolution.
+            pass
         wire_id = self._wire_projectile_id(meta)
         elapsed_ms = int(round(float(state.get('elapsed', 0.0)) * 1000.0))
         base = int(self._progress_cursors.get(wire_id, 0))
@@ -1335,6 +1418,26 @@ class _SyntheticCollision(object):
         self.compName = comp_name
 
 
+def _diag_log(message):
+    print("[%s] %s" % (time.strftime("%H:%M:%S"), message), flush=True)
+
+
+def _pose_axes(yaw, pitch, roll):
+    """Local basis vectors in world space for BigWorld's yaw/pitch/roll."""
+    sy, cy = math.sin(yaw), math.cos(yaw)
+    sp, cp = math.sin(pitch), math.cos(pitch)
+    sr, cr = math.sin(roll), math.cos(roll)
+
+    def rotate(vector):
+        x, y, z = vector
+        y, z = cp * y - sp * z, sp * y + cp * z
+        return (cy * x + sy * z, y, -sy * x + cy * z)
+
+    return (rotate((cr, sr, 0.0)),
+            rotate((-sr, cr, 0.0)),
+            rotate((0.0, 0.0, 1.0)))
+
+
 def _segment_hull_entry(start, end, target):
     """Pure narrow-phase: chord versus the target's hull box and armor."""
     descriptor = target['descriptor']
@@ -1345,21 +1448,18 @@ def _segment_hull_entry(start, end, target):
         return None
     position = target['position']
     yaw = float(target['yaw'])
-    sine, cosine = math.sin(yaw), math.cos(yaw)
+    axes = _pose_axes(yaw, float(target.get('pitch', 0.0) or 0.0),
+                      float(target.get('roll', 0.0) or 0.0))
     center_local = ((float(minimum[0]) + float(maximum[0])) * 0.5,
                     (float(minimum[1]) + float(maximum[1])) * 0.5,
                     (float(minimum[2]) + float(maximum[2])) * 0.5)
     half = ((float(maximum[0]) - float(minimum[0])) * 0.5,
             (float(maximum[1]) - float(minimum[1])) * 0.5,
             (float(maximum[2]) - float(minimum[2])) * 0.5)
-    center_world = (
-        float(position[0]) + cosine * center_local[0] + sine * center_local[2],
-        float(position[1]) + center_local[1],
-        float(position[2]) - sine * center_local[0] + cosine * center_local[2])
-    axes = (
-        ((cosine, 0.0, -sine)),
-        ((0.0, 1.0, 0.0)),
-        ((sine, 0.0, cosine)))
+    center_world = tuple(
+        float(position[index]) +
+        sum(axes[row][index] * center_local[row] for row in range(3))
+        for index in range(3))
     world_box = (center_world,
                  tuple(tuple(axis[index] * half[row] for index in range(3))
                        for row, axis in enumerate(axes)),
@@ -1370,7 +1470,7 @@ def _segment_hull_entry(start, end, target):
     hit = tuple(float(start[index]) +
                 (float(end[index]) - float(start[index])) * fraction
                 for index in range(3))
-    local = _world_to_local(hit, position, yaw)
+    local = _world_to_local(hit, position, axes)
     face, normal_local = _dominant_face(local, half, center_local)
     armor = _armor_for_face(descriptor, face)
     direction = tuple(float(end[index]) - float(start[index])
@@ -1379,7 +1479,7 @@ def _segment_hull_entry(start, end, target):
     if length <= 1.0e-9:
         return None
     direction = tuple(value / length for value in direction)
-    normal_world = _local_vector_to_world(normal_local, yaw)
+    normal_world = _local_vector_to_world(normal_local, axes)
     hit_angle_cos = abs(sum(direction[index] * normal_world[index]
                             for index in range(3)))
     collision = _SyntheticCollision(
@@ -1399,19 +1499,18 @@ def _segment_hull_entry(start, end, target):
     }
 
 
-def _world_to_local(point, position, yaw):
-    dx = float(point[0]) - float(position[0])
-    dy = float(point[1]) - float(position[1])
-    dz = float(point[2]) - float(position[2])
-    sine, cosine = math.sin(yaw), math.cos(yaw)
-    return (cosine * dx - sine * dz, dy, sine * dx + cosine * dz)
+def _world_to_local(point, position, axes):
+    delta = (float(point[0]) - float(position[0]),
+             float(point[1]) - float(position[1]),
+             float(point[2]) - float(position[2]))
+    return tuple(sum(axis[index] * delta[index] for index in range(3))
+                 for axis in axes)
 
 
-def _local_vector_to_world(vector, yaw):
-    sine, cosine = math.sin(yaw), math.cos(yaw)
-    return (cosine * vector[0] + sine * vector[2],
-            vector[1],
-            -sine * vector[0] + cosine * vector[2])
+def _local_vector_to_world(vector, axes):
+    return tuple(sum(float(vector[row]) * axes[row][index]
+                     for row in range(3))
+                 for index in range(3))
 
 
 def _dominant_face(local, half, center_local):

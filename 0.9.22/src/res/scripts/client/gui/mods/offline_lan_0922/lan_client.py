@@ -734,6 +734,32 @@ class LANClient(object):
             message['map'] = map_name
         return self._send(message)
 
+    def select_vehicle(self, vehicle, max_health):
+        """Publish one waiting-room garage change for the next round."""
+        if not self.ready or self.phase != 'waiting':
+            return False
+        vehicle = _safe_text(vehicle, '', 64)
+        max_health = _exact_int(max_health)
+        if not vehicle or max_health is None or max_health < 1:
+            return False
+        if vehicle == self.vehicle and max_health == self.max_health:
+            return False
+        return self._send({'type': 'select_vehicle', 'vehicle': vehicle,
+                           'max_health': max_health})
+
+    def _adopt_published_vehicle(self, players):
+        """Track the vehicle and HP the server holds for this client."""
+        for entry in players or ():
+            if _exact_int(entry.get('id')) != self.player_id:
+                continue
+            vehicle = _safe_text(entry.get('vehicle'), '', 64)
+            max_health = _exact_int(entry.get('max_health'))
+            if vehicle:
+                self.vehicle = vehicle
+            if max_health is not None and max_health > 0:
+                self.max_health = max_health
+            return
+
     def is_room_host(self):
         return (self.ready and self.phase == 'waiting' and
                 self.player_id is not None and
@@ -1865,6 +1891,7 @@ class LANClient(object):
             if maps:
                 self.map_pool = maps
             self.roster = players
+            self._adopt_published_vehicle(players)
             self.host_player_id = host_player_id
             self.bot_authority_id = message.get(
                 'bot_authority_id', self.bot_authority_id)
@@ -1951,6 +1978,7 @@ class LANClient(object):
             self.round_id = round_id
             self.state_revision = state_revision
             self.roster = players
+            self._adopt_published_vehicle(players)
             self.host_player_id = host_player_id
             self._battle_start_round_id = round_id
             self.bot_authority_id = message.get(

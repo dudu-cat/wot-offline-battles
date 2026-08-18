@@ -6852,7 +6852,9 @@ class BattleRuntime(object):
                     self._avatar.spaceID, position, yaw,
                     _number(state.get('speed')), descriptor)
             self._binding.set_vehicle_pose(
-                record['engine_id'], position, _engine_rotation(yaw))
+                record['engine_id'], position,
+                _engine_rotation(yaw, _number(state.get('pitch')),
+                                 _number(state.get('roll'))))
             self._binding.update_vehicle_aim(
                 record['engine_id'], yaw,
                 _number(state.get('aim_yaw', yaw)),

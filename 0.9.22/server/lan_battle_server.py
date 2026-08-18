@@ -851,6 +851,24 @@ class BattleState:
             self.state_revision += 1
             return player, None
 
+    def select_vehicle(self, player_id, message):
+        """Apply one waiting-room garage change before the next round."""
+        with self.lock:
+            player = self.players.get(player_id)
+            if (player is None or not player.connected or
+                    self.phase != "waiting"):
+                return False
+            vehicle = _safe_vehicle(message.get("vehicle"), player.vehicle)
+            max_health = max(1, min(int(_finite_float(
+                message.get("max_health"), player.max_health)), 100000))
+            if vehicle == player.vehicle and max_health == player.max_health:
+                return False
+            player.vehicle = vehicle
+            player.max_health = max_health
+            player.health = max_health
+            self.state_revision += 1
+            return True
+
     def remove_player(self, player_id):
         with self.lock:
             player = self.players.pop(player_id, None)
@@ -2062,6 +2080,8 @@ class BattleState:
             "y": round(_clamp(_finite_float(raw.get("y")), -1000.0, 1000.0), 4),
             "z": round(_clamp(_finite_float(raw.get("z")), -2000.0, 2000.0), 4),
             "yaw": round(yaw, 5),
+            "pitch": round(_clamp(_finite_float(raw.get("pitch")), -0.61, 0.61), 5),
+            "roll": round(_clamp(_finite_float(raw.get("roll")), -0.61, 0.61), 5),
             "aim_yaw": round(_finite_float(raw.get("aim_yaw"), yaw), 5),
             "gun_pitch": round(_clamp(_finite_float(raw.get("gun_pitch")), -1.2, 1.2), 5),
             "movement_dir": (1 if movement > 0.01 else
@@ -5115,6 +5135,13 @@ class ClientHandler(socketserver.BaseRequestHandler):
                                         live["countdown_seconds"],
                                         len(server.state.players)))
                         elif accepted == "failed":
+                            server.state.broadcast_current_roster()
+                    elif message_type == "select_vehicle":
+                        if server.state.select_vehicle(
+                                player.player_id, message):
+                            _server_log("VEHICLE id=%d vehicle=%s hp=%d" % (
+                                player.player_id, player.vehicle,
+                                player.max_health))
                             server.state.broadcast_current_roster()
                     elif message_type == "ping":
                         player.send({

@@ -238,6 +238,33 @@ def _rotation_speed(component, default):
                             default))
 
 
+def slope_pose(probe, position, yaw, half_length, half_width,
+               last_pitch=0.0, last_roll=0.0):
+    """One step of the copied 0.8.2 four-point suspension hull pose."""
+    length = max(3.0, 2.0 * float(half_length))
+    width = max(2.0, 2.0 * float(half_width))
+    sine, cosine = math.sin(yaw), math.cos(yaw)
+    front = probe(position[0] + sine * length * 0.5,
+                  position[2] + cosine * length * 0.5, position[1])
+    rear = probe(position[0] - sine * length * 0.5,
+                 position[2] - cosine * length * 0.5, position[1])
+    right = probe(position[0] + cosine * width * 0.5,
+                  position[2] - sine * width * 0.5, position[1])
+    left = probe(position[0] - cosine * width * 0.5,
+                 position[2] + sine * width * 0.5, position[1])
+    if None in (front, rear, right, left):
+        return float(last_pitch), float(last_roll)
+    pitch = -math.atan2(float(front) - float(rear), length) * 0.9
+    roll = math.atan2(float(right) - float(left), width) * 0.9
+    tilt = math.sqrt(pitch * pitch + roll * roll)
+    if tilt > 0.61:
+        scale = 0.61 / tilt
+        pitch *= scale
+        roll *= scale
+    return (float(last_pitch) + (pitch - float(last_pitch)) * 0.5,
+            float(last_roll) + (roll - float(last_roll)) * 0.5)
+
+
 def _gun_pitch_limits(descriptor):
     gun = _value(descriptor, 'gun', {}) or {}
     limits = _value(gun, 'pitchLimits')
@@ -963,6 +990,7 @@ class BotRuntime(object):
         self._cover_results = []
         self._decision_cache = {}
         self._motion_probe_cache = {}
+        self._flip_diary = {}
         self._world_receipt_budget = 0
         self._world_receipt_waiting = []
         self._world_receipt_frame = None
@@ -1380,6 +1408,7 @@ class BotRuntime(object):
                 'push_x': 0.0, 'push_z': 0.0,
                 'vertical_speed': 0.0, 'airborne': False,
                 'grounded_once': False, 'last_drive_pitch': 0.0,
+                'pitch': 0.0, 'roll': 0.0,
                 'critical': (dict(raw.get('critical'))
                              if isinstance(raw.get('critical'), dict) else {}),
                 'combat_revision': max(0, int(_number(
@@ -2366,6 +2395,71 @@ class BotRuntime(object):
             if highest is None or value > highest:
                 highest = value
         return highest, centre
+
+    def _log_direction_flip(self, state, path_clear, motion_probe, now):
+        """Log rapid drive reversals with the corridor verdict behind them."""
+        direction = int(state.get('movement_dir', 0))
+        bot_id = state['id']
+        diary = self._flip_diary.get(bot_id)
+        if diary is None:
+            self._flip_diary[bot_id] = {
+                'dir': direction, 'changed': _number(now), 'logged': -10.0}
+            return False
+        previous = diary['dir']
+        if direction == previous:
+            return False
+        elapsed = _number(now) - diary['changed']
+        diary['dir'] = direction
+        diary['changed'] = _number(now)
+        if (direction == 0 or previous == 0 or elapsed > 2.0 or
+                _number(now) - diary['logged'] < 1.0):
+            return False
+        diary['logged'] = _number(now)
+        verdict = 'none'
+        if isinstance(motion_probe, dict):
+            verdict = 'clear=%s collision=%s deferred=%s' % (
+                bool(motion_probe.get('clear')),
+                bool(motion_probe.get('collision')),
+                bool(motion_probe.get('deferred')))
+        print('[BOT FLIP] id=%s reversed %+d->%+d after %.2fs at '
+              '(%.1f,%.1f) path_clear=%s probe=%s' % (
+                  bot_id, previous, direction, elapsed,
+                  _number(state.get('x')), _number(state.get('z')),
+                  bool(path_clear), verdict))
+        return True
+
+    def _update_slope_pose(self, state):
+        """Refresh the four-point hull pose after this tick's ground settle."""
+        if state.get('airborne', False) or not state.get(
+                'grounded_once', False):
+            return False
+        yaw = _number(state.get('yaw'))
+        x = _number(state.get('x'))
+        z = _number(state.get('z'))
+        marker = state.get('pose_sample')
+        if (isinstance(marker, (list, tuple)) and len(marker) == 3 and
+                abs(x - _number(marker[0])) < 0.05 and
+                abs(z - _number(marker[1])) < 0.05 and
+                abs(yaw - _number(marker[2])) < 0.02):
+            return False
+
+        def probe(sample_x, sample_z, hint):
+            self._probe_totals[3] += 1
+            probe_started = self._probe_started()
+            try:
+                return self._physics_ground_probe(sample_x, sample_z, hint)
+            finally:
+                self._probe_finished(3, probe_started)
+
+        pitch, roll = slope_pose(
+            probe, (x, _number(state.get('y')), z), yaw,
+            _number(state.get('half_length'), 3.5),
+            _number(state.get('half_width'), 1.7),
+            _number(state.get('pitch')), _number(state.get('roll')))
+        state['pitch'] = pitch
+        state['roll'] = roll
+        state['pose_sample'] = (x, z, yaw)
+        return True
 
     def _invalidate_realised_motion(self, bot_id, attempted_yaw):
         """Forget a command whose committed pose hit a real obstacle."""
@@ -4060,6 +4154,7 @@ class BotRuntime(object):
             state['movement_dir'] = (
                 1 if throttle > 0.01 else (-1 if throttle < -0.01 else 0))
             state['rotation_dir'] = steer_dir
+            self._log_direction_flip(state, path_clear, motion_probe, now)
             if not self.native_motion:
                 params = self._physics_params.get(state['id'])
                 if params is None:
@@ -4251,6 +4346,7 @@ class BotRuntime(object):
                     self._guard_realised_pose(
                         state, tick_poses[state['id']], tick_safe[state['id']],
                         attempted_yaw)
+                self._update_slope_pose(state)
             if publish:
                 self._mark_combat_publication(state)
         if not publish:

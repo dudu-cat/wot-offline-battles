@@ -1607,9 +1607,16 @@ class BotRuntimeTests(unittest.TestCase):
 
         runtime.update(0.04, 1.0)
 
-        self.assertEqual(29, len(calls))
-        self.assertEqual(29, dict(zip(
+        # Spawn tick: one support query plus the four-point hull pose.
+        self.assertEqual(29 * 5, len(calls))
+        self.assertEqual(29 * 5, dict(zip(
             self.module.PROBE_KINDS, runtime.probe_totals()))['ground'])
+
+        del calls[:]
+        runtime.update(0.04, 2.0)
+
+        # Stationary bots keep the sampled pose; only support remains.
+        self.assertEqual(29, len(calls))
 
     def test_friendly_crossing_traffic_has_one_right_of_way_winner(self):
         lower = {
