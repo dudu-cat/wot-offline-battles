@@ -498,9 +498,12 @@ class Player:
 
 
 class BattleState:
-    def __init__(self, map_name=DEFAULT_MAP, max_players=30, clock=None):
+    def __init__(self, map_name=DEFAULT_MAP, max_players=30, clock=None,
+                 authority_mode="server"):
         self.map_option = map_name
         self.map_name = self._choose_map()
+        self.authority_mode = (
+            "client" if str(authority_mode) == "client" else "server")
         self.client_build = None
         self.max_players = max(1, min(int(max_players), 30))
         self.players: Dict[int, Player] = {}
@@ -1218,6 +1221,10 @@ class BattleState:
         self.authority_fallback_reason = ""
         if self.client_build != CLIENT_BUILD_0922:
             return None
+        if self.authority_mode == "client":
+            _server_log(
+                "AUTHORITY MODE client: this round elects a client authority")
+            return None
         if not self.vehicle_catalogs.get(self.host_player_id):
             return "vehicle_catalog_unavailable"
         try:
@@ -1454,6 +1461,7 @@ class BattleState:
         if self.phase != "loading":
             return None
         if (self.client_build == CLIENT_BUILD_0922 and
+                self.authority_mode != "client" and
                 self.server_authority is None):
             return None
         if (self.server_authority is not None and
@@ -5181,8 +5189,10 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
 
 
-def run_server(host, port, map_name, max_players):
-    state = BattleState(map_name=map_name, max_players=max_players)
+def run_server(host, port, map_name, max_players,
+               authority_mode="server"):
+    state = BattleState(map_name=map_name, max_players=max_players,
+                        authority_mode=authority_mode)
     tcp_server = ThreadedTCPServer((host, port), ClientHandler)
     tcp_server.game_server = type("GameServer", (), {"state": state})()
 
@@ -5222,8 +5232,15 @@ def main():
         choices=(DEFAULT_MAP,) + ALL_MAP_POOL,
         help="standard map name, or server_random")
     parser.add_argument("--max-players", type=int, default=30, help="maximum connected clients")
+    parser.add_argument(
+        "--authority", dest="authority_mode",
+        choices=("server", "client"),
+        default=os.environ.get("WOT_LAN_AUTHORITY", "server"),
+        help="who simulates bots in 0.9.22 rounds (default: server; "
+             "WOT_LAN_AUTHORITY overrides)")
     args = parser.parse_args()
-    run_server(args.host, args.port, args.map_name, args.max_players)
+    run_server(args.host, args.port, args.map_name, args.max_players,
+               args.authority_mode)
 
 
 if __name__ == "__main__":
