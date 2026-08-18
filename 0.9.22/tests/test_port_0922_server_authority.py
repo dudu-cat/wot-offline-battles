@@ -106,6 +106,38 @@ def _state_with_authority(ready_world=True, clock=None):
 
 
 class ServerAuthorityElectionTest(unittest.TestCase):
+    def test_client_mode_elects_the_lowest_connected_player(self):
+        state = _state_with_authority()
+        state.authority_mode = 'client'
+
+        message, error = state.request_start(1, '01_karelia')
+
+        self.assertIsNone(error)
+        self.assertEqual('battle_start', message['type'])
+        self.assertIsNone(state.server_authority)
+        self.assertEqual(1, state.bot_authority_id)
+        self.assertEqual(1, message['bot_authority_id'])
+        self.assertEqual('loading', state.phase)
+
+    def test_client_mode_round_goes_live_on_manifest_and_readiness(self):
+        state = _state_with_authority()
+        state.authority_mode = 'client'
+        message, error = state.request_start(1, '01_karelia')
+        self.assertIsNone(error)
+
+        manifest = [dict(entry, vehicle='ussr:R11_MS-1', health=350,
+                         max_health=350, x=float(index), y=0.0,
+                         z=0.0, yaw=0.0)
+                    for index, entry in enumerate(state.bot_roster)]
+        self.assertTrue(state.update_bot_manifest(1, {
+            'round_id': state.round_id, 'bots': manifest}))
+        live = state.mark_battle_ready(1, {'round_id': state.round_id})
+
+        self.assertIsNotNone(live)
+        self.assertEqual('battle_live', live['type'])
+        self.assertEqual('battle', state.phase)
+        self.assertEqual(1, state.bot_authority_id)
+
     def test_server_owns_bot_authority_after_start(self):
         state = _state_with_authority()
         message, error = state.request_start(1, '01_karelia')
