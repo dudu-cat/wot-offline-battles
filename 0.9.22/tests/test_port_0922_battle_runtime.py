@@ -2262,12 +2262,11 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual(second_id, battle._outlined_engine_id)
         factory.destroy_all()
 
-    def test_the_cursor_is_measured_against_the_hull_not_the_origin(self):
+    def test_a_cursor_beside_the_hull_outlines_nothing(self):
         """#1513 sets selectionFovDegrees=1.0 together with
-        skeletonCheckEnabled=True, so the engine measures the cursor against
-        the model.  A bare half-degree cone around the entity origin rejects a
-        tank the player is plainly aiming at: 0.7 degrees off at 266 m is
-        inside the hull."""
+        skeletonCheckEnabled=True, so the model decides.  The hull bounding
+        box circumscribes the silhouette: 0.7 degrees off at 266 m sits inside
+        that box while the cursor is still beside the tank."""
         runtime = _runtime()
         factory = RemoteVehicleFactory(
             runtime.bigworld, runtime.math, runtime.model_assembler, 7)
@@ -2288,9 +2287,46 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
 
         battle._update_target_outline(1.0)
 
-        self.assertEqual([(vehicle.bw_entity, 1, 0, False)],
+        self.assertEqual([], runtime.bigworld.edge_adds)
+        self.assertIsNone(battle._outlined_engine_id)
+        factory.destroy_all()
+
+    def test_the_outline_falls_back_to_the_inscribed_hull_width(self):
+        """Without the exact per-part test the cursor must still clear the
+        narrowest hull dimension, not the bounding box diagonal."""
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        near_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Near'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(3.25, 0.0, 266.0),
+            (0.0, 0.0, 0.0))
+        far_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Far'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(8.0, 0.0, 266.0),
+            (0.0, 0.0, 0.0))
+        near = factory.get(near_id)
+        far = factory.get(far_id)
+        near.collideSegmentExt = None
+        far.collideSegmentExt = None
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._remote_factory = factory
+        battle._records = {
+            'bot:11': {'engine_id': near_id, 'local': False,
+                       'ready': True, 'spot_visible': True},
+            'bot:12': {'engine_id': far_id, 'local': False,
+                       'ready': True, 'spot_visible': True}}
+
+        battle._update_target_outline(1.0)
+
+        self.assertEqual([(near.bw_entity, 1, 0, False)],
                          runtime.bigworld.edge_adds)
-        self.assertEqual(vehicle_id, battle._outlined_engine_id)
+        self.assertEqual(near_id, battle._outlined_engine_id)
+        self.assertIsNot(far.bw_entity, None)
         factory.destroy_all()
 
     def test_an_unchanged_target_issues_no_edge_call(self):
@@ -2501,9 +2537,10 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertIsNone(battle._outlined_engine_id)
         factory.destroy_all()
 
-    def test_the_report_names_why_a_held_target_was_kept(self):
-        """A target kept only by the deselection cone must say so, so a log
-        separates a real cursor hit from a hold."""
+    def test_the_outline_goes_when_the_cursor_leaves_the_model(self):
+        """Retail re-runs the skeleton check every pass, so a target 20
+        degrees off the cursor loses its outline even though it is well
+        inside the 80 degree deselection cone."""
         runtime = _runtime()
         factory = RemoteVehicleFactory(
             runtime.bigworld, runtime.math, runtime.model_assembler, 7)
@@ -2531,10 +2568,9 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
 
         self.assertEqual([(outlined, 1, 0, False)],
                          runtime.bigworld.edge_adds)
-        self.assertEqual([], runtime.bigworld.edge_removes)
-        self.assertEqual(vehicle_id, battle._outlined_engine_id)
-        self.assertIn('held id=%s' % vehicle_id, battle._outline_report)
-        self.assertIn('deselection cone', battle._outline_report)
+        self.assertEqual([outlined], runtime.bigworld.edge_removes)
+        self.assertIsNone(battle._outlined_engine_id)
+        self.assertIn('is not under the cursor', battle._outline_report)
         factory.destroy_all()
 
     def test_an_ineligible_held_target_loses_its_outline(self):
@@ -5213,6 +5249,54 @@ class BattleRuntimeContractTests(unittest.TestCase):
                          (effect.args[1], effect.args[2]))
         self.assertTrue(effect.kwargs['showShockWave'])
         self.assertTrue(effect.kwargs['showFlashBang'])
+
+    def test_an_unspotted_target_keeps_the_voice_and_loses_the_impact(self):
+        """#1513 reaches the armour effect only through
+        Vehicle.showDamageFromShot, which returns while the target is not
+        started.  showShotResults and onBattleEvents are Avatar RPCs that
+        never test visibility."""
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._avatar.playerVehicleID = 10
+        battle._synchronise_player_identity(10)
+        battle._local_position = (0.0, 0.0, 0.0)
+        runtime.bigworld.entities.update({
+            10: _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                         {'health': 500}),
+            11: _Vehicle(11, _Descriptor(), _Vector(10, 0, 0), (0, 0, 0),
+                         {'health': 500})})
+        target = {
+            'engine_id': 11, 'local': False, 'kind': 'bot',
+            'network_id': 2, 'spot_visible': False,
+            'state': {'team': 2, 'health': 500,
+                      'x': 10.0, 'y': 0.0, 'z': 0.0}}
+        attacker = {
+            'engine_id': 10, 'local': True, 'kind': 'player',
+            'network_id': 1, 'state': {'team': 1, 'health': 500}}
+        event = {
+            'kind': 'bot_hit', 'world_pose': True,
+            'x': 9.5, 'y': 1.0, 'z': 0.0, 'shell_index': 0,
+            'shot_result': 2, 'damage': 144, 'dead': False,
+            'attack_reason': 0, 'death_reason': 0, 'source': 'shot'}
+
+        self.assertFalse(battle._present_combat_hit(
+            event, target, attacker, 10))
+        self.assertTrue(battle._present_combat_feedback(
+            event, target, attacker))
+
+        battle._avatar.terrainEffects.addNew.assert_not_called()
+        self.assertEqual(1, len(battle._avatar.shot_results))
+        self.assertEqual(
+            11, battle._avatar.shot_results[0][0] & 0xffffffff)
+        self.assertEqual([7], [
+            value['eventType']
+            for value in battle._avatar.battle_events[0]])
+
+        target['spot_visible'] = True
+        self.assertTrue(battle._present_combat_hit(
+            event, target, attacker, 10))
+        battle._avatar.terrainEffects.addNew.assert_called_once()
 
     def test_critical_presentation_uses_exact_causes_and_ammo_effect(self):
         runtime = _runtime()

@@ -58,6 +58,7 @@ SPOTTING_PHASE_BUCKETS = 5
 TARGET_SELECTION_FOV_DEGREES = 1.0
 TARGET_DESELECTION_FOV_DEGREES = 80.0
 TARGET_MAX_DISTANCE = 710.0
+TARGET_OUTLINE_SECONDS = 0.05
 # Bot tree/column enumeration is a proximity sensor, not presentation work.
 # The sensor looks 6 m ahead plus the admitted hull extent, while copied bot
 # speed is capped at 35 m/s.  Recheck within 0.10 s or 3 m of realised travel,
@@ -4980,6 +4981,13 @@ class BattleRuntime(object):
                 damage <= 0, combat_rules.is_he(shot),
                 int(target_record['engine_id']))
 
+        # #1513 reaches the armour effect only from Vehicle.showDamageFromShot,
+        # which returns before any effect while the target is not started.  An
+        # unspotted target keeps its crew voice and ribbon, not its impact.
+        if (not target_record.get('local') and
+                not target_record.get('spot_visible', True)):
+            return False
+
         effects_index = _field(shell, 'effectsIndex', None)
         if effects_index is None:
             raise RuntimeError('combat shell effects index is unavailable')
@@ -7322,16 +7330,18 @@ class BattleRuntime(object):
         return start, direction
 
     def _update_target_outline(self, now):
-        """Outline the vehicle under the cursor the way #1513 does.
+        """Outline the vehicle the cursor ray actually strikes.
 
         Retail reaches ``Vehicle.drawEdge`` from ``PlayerAvatar.targetFocus``,
         which the engine raises for the entity its own cursor-driven targeting
-        selects.  A blocked gun line and blocking scenery are not conditions
-        anywhere on that path.
+        selects.  #1513 pairs selectionFovDegrees=1.0 with
+        skeletonCheckEnabled=True, so the cone only nominates candidates and
+        the model itself decides, on every pass.  A blocked gun line and
+        blocking scenery are not conditions anywhere on that path.
         """
         if now < self._next_outline_time or self._outline_blocked:
             return
-        self._next_outline_time = now + 0.125
+        self._next_outline_time = now + TARGET_OUTLINE_SECONDS
         if self._remote_factory is None:
             self._clear_target_outline()
             return
@@ -7341,10 +7351,9 @@ class BattleRuntime(object):
         deselection_angle = TARGET_DESELECTION_FOV_DEGREES * 0.5
         held_id = self._outlined_engine_id
         held_seen = False
-        held_angle = None
         held_reason = None
         chosen = None
-        chosen_rank = None
+        chosen_depth = None
         miss = None
         decline = None
         for record in self._records.values():
@@ -7377,48 +7386,44 @@ class BattleRuntime(object):
                     held_reason = reason
                 decline = decline or (engine_id, reason)
                 continue
-            cosine = 1.0
+            bearing = 0.0
             if distance > 0.0:
                 cosine = min(1.0, max(-1.0, (
                     offset.x * direction.x + offset.y * direction.y +
                     offset.z * direction.z) / distance))
-            # #1513 pairs selectionFovDegrees=1.0 with skeletonCheckEnabled,
-            # so the engine measures the cursor against the model rather than
-            # against the entity origin.
-            angle = max(0.0, math.degrees(math.acos(cosine)) -
+                bearing = math.degrees(math.acos(cosine))
+            # The bounding box circumscribes the silhouette, so this cone only
+            # narrows how many exact tests run.  It never rejects a real hit.
+            angle = max(0.0, bearing -
                         self._target_angular_radius(vehicle, distance))
-            if vehicle.collideSegmentExt(start, end):
-                rank = (0, distance)
-            elif angle <= selection_angle:
-                rank = (1, angle)
-            else:
+            depth = None
+            if angle <= deselection_angle:
+                collide = getattr(vehicle, 'collideSegmentExt', None)
+                if callable(collide):
+                    collisions = collide(start, end)
+                    if collisions:
+                        depth = min(float(item.dist) for item in collisions)
+                elif bearing - self._target_angular_radius(
+                        vehicle, distance, tight=True) <= selection_angle:
+                    depth = distance
+            if depth is None:
                 if held:
-                    if angle <= deselection_angle:
-                        held_angle = angle
-                    else:
-                        held_reason = (
-                            'is %.1f deg off the cursor, outside the %.0f deg '
-                            'deselection cone' % (
-                                angle, TARGET_DESELECTION_FOV_DEGREES))
+                    held_reason = 'is not under the cursor'
                 if miss is None or angle < miss[0]:
                     miss = (angle, engine_id, distance)
                 continue
-            if chosen_rank is None or rank < chosen_rank:
-                chosen_rank = rank
+            if chosen_depth is None or depth < chosen_depth:
+                chosen_depth = depth
                 chosen = engine_id
-        if chosen is None and held_angle is not None:
-            chosen = held_id
-        # Retail drops the target when it stops being eligible, not only when
-        # it leaves the cone, and a vehicle the round no longer records at all
-        # can never be kept.
+        # Retail drops the target when it stops being eligible, and a vehicle
+        # the round no longer records at all can never be kept.
         if held_id is not None and chosen != held_id and held_reason is None:
             held_reason = ('left the record set' if not held_seen
-                           else 'lost the cursor')
+                           else 'is behind a nearer vehicle')
         dropped = None
         if held_id is not None and chosen != held_id:
             dropped = (held_id, held_reason)
-        self._report_target_outline(
-            now, chosen, held_angle, miss, decline, dropped)
+        self._report_target_outline(now, chosen, miss, decline, dropped)
         if chosen == held_id:
             return
         if not self._clear_target_outline():
@@ -7448,8 +7453,11 @@ class BattleRuntime(object):
                 '#1513 target-lock candidate boundary is unavailable')
         set_candidate(vehicle)
 
-    def _target_angular_radius(self, vehicle, distance):
-        """The half-angle this vehicle's own hull subtends at this range."""
+    def _target_angular_radius(self, vehicle, distance, tight=False):
+        """The half-angle this vehicle's own hull subtends at this range.
+
+        The default circumscribes the hull; ``tight`` inscribes it.
+        """
         if distance <= 0.0:
             return 180.0
         hit_tester = _field(
@@ -7461,7 +7469,10 @@ class BattleRuntime(object):
             width = abs(float(bbox[0][0])) + abs(float(bbox[1][0]))
         except (TypeError, IndexError, ValueError):
             length, width = 6.0, 3.0
-        radius = 0.5 * math.sqrt(max(3.0, length) ** 2 + max(2.0, width) ** 2)
+        length = max(3.0, length)
+        width = max(2.0, width)
+        radius = (0.5 * width if tight
+                  else 0.5 * math.sqrt(length ** 2 + width ** 2))
         return math.degrees(math.atan2(radius, distance))
 
     _EDGE_REPORT_LIMIT = 80
@@ -7534,14 +7545,9 @@ class BattleRuntime(object):
                         None) is not None))
         return True
 
-    def _report_target_outline(self, now, chosen, held_angle, miss, decline,
-                               dropped):
+    def _report_target_outline(self, now, chosen, miss, decline, dropped):
         """Print each new outline decision, at most once a second."""
-        if chosen is not None and held_angle is not None:
-            message = (
-                'held id=%s at %.1f deg, inside the %.0f deg deselection cone'
-                % (chosen, held_angle, TARGET_DESELECTION_FOV_DEGREES))
-        elif chosen is not None:
+        if chosen is not None:
             message = 'outlined id=%s' % chosen
         elif dropped is not None:
             message = 'none: dropped id=%s, it %s' % dropped

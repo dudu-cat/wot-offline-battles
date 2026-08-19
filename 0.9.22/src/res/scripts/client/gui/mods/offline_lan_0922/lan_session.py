@@ -329,22 +329,24 @@ class LANSession(object):
     def _rejoin_room(self, user_requested=True):
         """Drop a parked socket and reconnect so the server resynchronises.
 
-        An automatic rejoin keeps the room dismissed: the player is in the
-        garage and never asked for it.
+        An automatic rejoin keeps the room dismissed and silent: the player is
+        in the garage and never asked for it.  ``revive()`` disarms the room,
+        so a Battle click has to ask for it again here or the first click
+        after a round produces nothing.
         """
         self.revive()
-        if not user_requested:
-            self._picker_dismissed = True
-            self._picker_requested = False
+        self._picker_dismissed = not user_requested
+        self._picker_requested = bool(user_requested)
         sys.stdout.write(
-            '[Offline LAN 0.9.22] LAN rejoin requested: %s\n' %
-            self._endpoint_value())
+            '[Offline LAN 0.9.22] LAN rejoin requested: %s (user=%r)\n' %
+            (self._endpoint_value(), bool(user_requested)))
         if not self.start():
             if self.state not in ('ready_to_join', 'retrying'):
                 self._status_notifier('The LAN room could not be rejoined.')
             return False
-        self._status_notifier(
-            'Rejoining LAN room at %s...' % self._endpoint_value())
+        if user_requested:
+            self._status_notifier(
+                'Joining LAN room at %s...' % self._endpoint_value())
         return True
 
     def join(self, unused_map_id=None, unused_action_name=None):

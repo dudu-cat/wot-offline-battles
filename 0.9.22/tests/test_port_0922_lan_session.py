@@ -1483,6 +1483,7 @@ class LANSessionTests(unittest.TestCase):
         self.emit('welcome', {
             'phase': 'waiting', 'map_pool': ['01_karelia']})
         opens_before = len(self.opens)
+        statuses_before = len(self.statuses)
         self.session.state = 'awaiting_round_end'
         # revive() reinstalls the Battle button; the stock header is absent.
         self.session._join_ui = _JoinUI(self.session.join)
@@ -1491,10 +1492,41 @@ class LANSessionTests(unittest.TestCase):
 
         self.assertEqual(opens_before, len(self.opens))
         self.assertTrue(self.session._picker_dismissed)
+        self.assertFalse(self.session._picker_requested)
+        self.assertEqual(statuses_before, len(self.statuses))
 
         # A user-requested rejoin does present it again.
         self.session._rejoin_room(user_requested=True)
         self.assertFalse(self.session._picker_dismissed)
+        self.assertTrue(self.session._picker_requested)
+
+    def test_one_battle_click_after_a_round_reopens_the_room(self):
+        """revive() disarms the room, so the click that asked for it has to
+        arm it again.  Otherwise the player clicks Battle twice."""
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
+        self.emit('battle_start', {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]})
+        self.assertTrue(self.battle_runtime.started[0]['on_local_leave']())
+        self.assertEqual('awaiting_round_end', self.session.state)
+        opens_before = len(self.opens)
+        self.session._join_ui = _JoinUI(self.session.join)
+
+        self.assertTrue(self.session.join())
+
+        self.assertEqual(2, len(self.clients))
+        self.assertEqual('connecting', self.session.state)
+        replacement = self.clients[-1]
+        replacement.ready = True
+        replacement.on_event('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
+
+        self.assertEqual('waiting', self.session.state)
+        self.assertEqual(opens_before + 1, len(self.opens))
+        for status in self.statuses:
+            self.assertNotIn('Rejoining', status)
 
     def test_next_picker_waits_for_native_lobby_recovery(self):
         ready = [True]
