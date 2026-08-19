@@ -74,7 +74,7 @@ _SERVER_ARGUMENTS = {
 _SERVER_PROBES = {
     PORT_0_8_2: {
         "protocol": 8,
-        "client_build": "1.8.58-native-experimental-20260815",
+        "client_build": "1.8.60-native-experimental-20260815",
         "vehicle": "ussr:MS-1",
         "capabilities": None,
     },

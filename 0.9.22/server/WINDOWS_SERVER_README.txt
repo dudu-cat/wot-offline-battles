@@ -41,11 +41,11 @@ License, source, and bundled runtimes
 =====================================
 
 This server is part of wot-offline-battles and is distributed under GNU GPL
-version 3, without warranty. Corresponding source for release 0.4.0 and the
+version 3, without warranty. Corresponding source for release 0.5.0 and the
 complete project license are available at:
 
-https://github.com/pengw0048/wot-offline-battles/tree/v0.4.0
-https://github.com/pengw0048/wot-offline-battles/blob/v0.4.0/LICENSE
+https://github.com/pengw0048/wot-offline-battles/tree/v0.5.0
+https://github.com/pengw0048/wot-offline-battles/blob/v0.5.0/LICENSE
 
 The executable bundles CPython 3.11.9, distributed under the Python Software
 Foundation License Version 2 and the licenses/notices for software incorporated

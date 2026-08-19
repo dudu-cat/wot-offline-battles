@@ -25,12 +25,30 @@ and battle logic, a small LAN server and a launcher.
      server and prints the address to give them.
    - **Join a LAN battle**: type the host's address, for example
      `192.168.1.20`.
-4. Click **Start game**. In the garage, select a tank and click **Battle!**.
-   Everyone lands in the LAN waiting room; the host picks a map and clicks
-   **START BATTLE**.
+4. Click **Start game**. In the garage, fit a tank and click **Battle!**.
+   Everyone lands in the LAN waiting room over the stock queue screen. The
+   host picks the map and clicks **START BATTLE**. **LEAVE** returns you to
+   the garage.
 
 When you host, approve the UAC prompt that opens TCP 28782 for the launcher.
 Run the server only on a network you trust.
+
+## The garage
+
+The 0.9.22 client gets a working offline garage:
+
+- Every vehicle in the client is owned, and every module in its own tech tree
+  is unlocked. Each vehicle starts with its top chassis, turret, gun, engine,
+  radio and fuel tank, plus an automatic fire extinguisher, a large first aid
+  kit and a large repair kit.
+- You can change modules, optional devices, consumables, shells, camouflage
+  and crew skills. Every item costs nothing.
+- The garage is written to `mods/configs/offline_lan_0922/garage_state.json`
+  after each change, so it survives a restart.
+- The battle runs the vehicle the garage fitted. Crew skills, optional devices
+  and consumables move the same values the garage parameters panel shows: view
+  range, concealment, reload, aim time, dispersion, traverse, engine power,
+  terrain resistance and repair speed.
 
 ## What is in the battle
 
@@ -45,6 +63,9 @@ Run the server only on a network you trust.
   shared contacts to route, take cover, pick targets and choose ammunition,
   including SPG arcs. Navigation and foliage data ship for all 33 supported
   0.8.2 maps and all 41 supported 0.9.22 maps.
+- Live combat statistics, a damage log with assists, hit and critical-damage
+  messages, target outlines, vehicle fires, wrecks, and a consumables panel
+  that counts down each cooldown.
 - A LAN match is one shared battle: lineups, countdown, orders, projectiles,
   health, critical damage, destructibles, capture and results stay
   synchronized, and the match survives the loss of the current bot controller.
@@ -57,7 +78,7 @@ physics and frame pacing can only be judged in the Windows client.
 
 ```bash
 # 0.8.2 client package
-python3 0.8.2/tools/package_native_experiment.py --output-dir dist --version 1.8.58
+python3 0.8.2/tools/package_native_experiment.py --output-dir dist --version 1.8.60
 # 0.9.22 client package, with CPython 2.7
 python2.7 0.9.22/build_wotmod.py
 # Windows launcher, after the 0.9.22 package exists

@@ -45,7 +45,7 @@ jobs:
         run: >-
           python 0.8.2/tools/package_native_experiment.py
           --output-dir "$RUNNER_TEMP/wot-082"
-          --version 1.8.58
+          --version 1.8.60
       - name: Build Python 2.7 0.9.22 LAN client
         run: >-
           docker run --rm --platform linux/amd64 -v "$PWD:/work"

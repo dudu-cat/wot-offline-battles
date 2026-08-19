@@ -28,16 +28,29 @@ Tanks, and stops that server when the game closes.
    and stages the complete package before replacing the old mod, and restores
    the previous mod if that replacement fails.
 
-In the game, select a tank and click Battle!. Everyone lands in the LAN waiting
-room. The room host selects a map and clicks START BATTLE.
+In the game, fit a tank and click Battle!. Everyone lands in the LAN waiting
+room, drawn over the stock battle queue screen. The room host selects the map
+and clicks START BATTLE. LEAVE closes the room and returns you to the garage.
+
+On the 0.9.22 client the garage works offline. Every vehicle is owned and every
+module in its own tech tree is unlocked, each vehicle arrives with its top
+modules and three consumables, and every item costs nothing. Change modules,
+optional devices, consumables, shells, camouflage and crew skills; the garage
+is saved after each change and the battle uses what you fitted.
 
 The client sometimes closes its first process and starts another one while it
 starts up. The launcher waits half a minute after the last game process before
 it stops the server, so that restart does not end your battle.
 
 Your own files stay in place: 0.8.2 settings in offhangar_user, and the 0.9.22
-saved address, account state and configuration in
-mods\configs\offline_lan_0922.
+saved address, account state, garage and configuration in
+mods\configs\offline_lan_0922. Other authors' .wotmod files stay where they
+are.
+
+Two limits to expect. Bot tracks and road wheels do not turn, so a broken enemy
+track has no visual cue. Both clients are 32-bit and can address about 2 GB, so
+a very long session can still run out of memory and exit; restart the client
+between long sessions.
 
 When you host, approve the UAC prompt that opens TCP 28782 for this launcher.
 Cancelling is nonfatal, but other PCs may remain unable to connect. Run this

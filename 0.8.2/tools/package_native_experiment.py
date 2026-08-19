@@ -144,6 +144,10 @@ def _audit_identity(version: str) -> None:
         raise RuntimeError(
             "client/server LAN build mismatch: %s and %s" % (
                 client_build, server_build))
+    if server_build != expected:
+        raise RuntimeError(
+            "LAN build string %s does not match version %s" % (
+                server_build, version))
 
 
 def build(output_dir: Path, version: str) -> tuple[Path, Path]:
@@ -187,7 +191,7 @@ def build(output_dir: Path, version: str) -> tuple[Path, Path]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, default=Path.home() / "Downloads")
-    parser.add_argument("--version", default="1.8.58")
+    parser.add_argument("--version", default="1.8.60")
     args = parser.parse_args()
     destination, archive = build(args.output_dir.resolve(), args.version)
     print(destination)

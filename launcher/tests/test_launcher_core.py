@@ -80,7 +80,7 @@ class GameRootTest(unittest.TestCase):
     def test_another_0_9_22_build_is_not_treated_as_the_pinned_client(self):
         self._write("version.xml", "<version> v.0.9.22.0.1 #0789 </version>")
         self._write(
-            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.4.0.wotmod")
+            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.5.0.wotmod")
         self.assertIsNone(core.detect_port(self.root))
 
     def test_another_0_9_22_patch_is_not_treated_as_the_pinned_client(self):
@@ -100,12 +100,12 @@ class GameRootTest(unittest.TestCase):
     def test_unsupported_client_reports_no_port(self):
         self._write("version.xml", "<version> v.1.0.0 #1 </version>")
         self._write(
-            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.4.0.wotmod")
+            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.5.0.wotmod")
         self.assertIsNone(core.detect_port(self.root))
 
     def test_an_installed_0_9_22_package_is_not_a_version_fallback(self):
         self._write(
-            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.4.0.wotmod")
+            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.5.0.wotmod")
         self.assertIsNone(core.detect_port(self.root))
         self.assertIsNone(core.inspect_game_root(self.root)["client"])
 
@@ -114,7 +114,7 @@ class GameRootTest(unittest.TestCase):
             "version.xml",
             "<broken><version>v.0.9.22.0.1 #1513</version>")
         self._write(
-            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.4.0.wotmod")
+            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.5.0.wotmod")
         self.assertIsNone(core.detect_port(self.root))
         self.assertIsNone(core.inspect_game_root(self.root)["client"])
 
@@ -696,7 +696,7 @@ class PayloadStagingTest(unittest.TestCase):
                          "mod_offhangar.py"),
             os.path.join("0.8.2", "gui", "maps", "a.dds"),
             os.path.join(overlay, "mods", "0.9.22.0.1",
-                         "org.peng.offline_lan_0922_0.4.0.wotmod"),
+                         "org.peng.offline_lan_0922_0.5.0.wotmod"),
             os.path.join(overlay, "mods", "configs", "offline_lan_0922",
                          "config.json"),
         ]
@@ -714,7 +714,7 @@ class PayloadStagingTest(unittest.TestCase):
             "0.8.2": ("res_mods/0.8.2/scripts/client/a.py",
                       "res_mods/0.8.2/gui/maps/a.dds"),
             "0.9.22": ("mods/0.9.22.0.1/"
-                       "org.peng.offline_lan_0922_0.4.0.wotmod",
+                       "org.peng.offline_lan_0922_0.5.0.wotmod",
                        "mods/configs/offline_lan_0922/config.json"),
         }
         for port_version, members in expected.items():
@@ -760,10 +760,10 @@ class PayloadStagingTest(unittest.TestCase):
             ] = "secret"
         paths[os.path.join(
             overlay, "mods/0.9.22.0.1",
-            "org.peng.offline_lan_0922_0.4.0.wotmod")] = "x"
+            "org.peng.offline_lan_0922_0.5.0.wotmod")] = "x"
         paths[os.path.join(
             overlay, "mods/0.9.22.0.1",
-            "org.peng.offline_lan_0922_0.4.0.wotmod.sha256")] = "secret"
+            "org.peng.offline_lan_0922_0.5.0.wotmod.sha256")] = "secret"
         paths[os.path.join(
             overlay, "mods/configs/offline_lan_0922/config.json")] = "x"
         paths[os.path.join(

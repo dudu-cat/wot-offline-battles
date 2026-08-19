@@ -13,6 +13,7 @@ root. It contains:
   mods\configs\offline_lan_0922\navgraphs\
   mods\configs\offline_lan_0922\foliage\
   mods\configs\offline_lan_0922\destructibles\
+  mods\configs\offline_lan_0922\occluders\
 
 Then start the LAN server on one PC and enter its address in the launcher, or
 edit mods\configs\offline_lan_0922\server_endpoint.json. That file holds your
@@ -23,10 +24,13 @@ Play
 
 1. Start the client without logging into an online account. On a fresh profile,
    accept the stock EULA once.
-2. Select a tank and click Battle!. The client joins the LAN room. The battle
-   uses the selected tank and its own health.
-3. Every player sees the waiting room. The first player is the room host: the
-   host selects a standard map with < and >, then clicks START BATTLE.
+2. Fit a tank in the garage and click Battle!. The client joins the LAN room.
+   The battle runs the tank the garage fitted, with its modules, health, armour
+   and gun.
+3. Every player sees the waiting room, drawn over the stock battle queue
+   screen. The first player is the room host: the host selects a standard map
+   with < and >, then clicks START BATTLE. LEAVE closes the room and returns
+   you to the garage.
 4. The server fills both teams to 15 vehicles. Movement and firing unlock when
    the countdown reaches battle.
 5. After a team is eliminated the round freezes, and every connected player
@@ -34,6 +38,20 @@ Play
 
 Only standard battles are supported. In this client the internal name of
 standard battle is `ctf`; assault and encounter maps are excluded.
+
+The garage
+----------
+
+Every vehicle in your client is owned, and every module in its own tech tree is
+unlocked. Each vehicle arrives with its top chassis, turret, gun, engine, radio
+and fuel tank, plus an automatic fire extinguisher, a large first aid kit and a
+large repair kit. Every item costs nothing.
+
+Change modules, optional devices, consumables, shells, camouflage and crew
+skills as you like. Each change is written to
+mods\configs\offline_lan_0922\garage_state.json, so the garage survives a
+restart. Crew skills, optional devices and consumables move the same values the
+garage parameters panel shows, and the battle uses those values.
 
 Requirements
 ------------
@@ -50,8 +68,14 @@ Troubleshooting
   server window is still open.
 - `unsupported compression type`: an older wotmod is still present. Keep only
   the package installed by the launcher.
-- The client keeps its own files. Your saved address, account state and
+- The client keeps its own files. Your saved address, account state, garage and
   configuration survive a reinstall.
+- Bot tracks and road wheels do not turn. A broken enemy track therefore has no
+  visual cue; read the damage panel instead.
+- The client is 32-bit and can address about 2 GB. A very long session can
+  still run out of memory and exit. Restart the client between long sessions.
+- One of the 680 vehicles in this client, germany:G138_VK168_02_Mauerbrecher,
+  ships no models. The garage and the bot lineups skip it.
 
 This package is distributed under GNU GPL version 3, without warranty. World of
 Tanks and its assets are not included, and this project is unofficial.

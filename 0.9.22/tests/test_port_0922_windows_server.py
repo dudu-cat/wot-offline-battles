@@ -247,7 +247,7 @@ class WindowsServerLauncherTests(unittest.TestCase):
 
         for required in (
                 'GNU GPL',
-                '/tree/v0.4.0',
+                '/tree/v0.5.0',
                 'any remote address/profile',
                 'trusted-LAN server',
                 'CPython 3.11.9',
