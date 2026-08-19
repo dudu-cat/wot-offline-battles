@@ -2082,8 +2082,8 @@ its attributes are registered from a single run of calls between RVA `0x26982a`
 and RVA `0x269a59`: `isEnabled`, `skeletonCheckEnabled`, `isFull`, `isHidden`,
 `isHeld`, `noPartial`, `entity`, `source`, `maxDistance`,
 `selectionFovDegrees`, `deselectionFovDegrees` and `exclude`. The getter
-registered under the name `entity` is RVA `0x268270`, and it is four
-instructions long before it faults:
+registered under the name `entity` is RVA `0x268270`. Past its null-self
+check it runs three instructions, and the third one faults:
 
 ```
 mov eax, dword ptr [0x1d20788]   ; the entity picker
