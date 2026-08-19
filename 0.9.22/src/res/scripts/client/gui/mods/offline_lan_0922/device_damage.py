@@ -494,14 +494,21 @@ def crew_repair_factor(repair_skill_pct):
     return 1.0 + REPAIR_SKILL_SPEEDUP * (s / 100.0)
 
 
-def repair_seconds(name, td, repair_skill_pct=0.0, has_big_repairkit=False):
+def repair_seconds(name, td, repair_skill_pct=0.0, has_big_repairkit=False,
+                   repair_factor=None):
     """Seconds to auto-repair the named device from destroyed to functional,
     combining the reconstructed base (at 0% Repair skill) with the multipliers:
-      crew Repair skill  (1 + REPAIR_SKILL_SPEEDUP*skill/100)
+      crew Repair skill  (factors['repairSpeed'] = 0.57 + 0.43*efficiency)
       toolbox            (td.miscAttrs['repairSpeedFactor'], 1.25 when mounted)
-      large repair kit   (passive +10% while carried, bonusValue 0.1)."""
+      large repair kit   (passive +10% while carried, bonusValue 0.1).
+    A ``repair_factor`` from the client's own factor dictionary replaces the
+    percentage, and stays normalized so a fully trained crew keeps the speed
+    this port has always used."""
     base = BASE_TRACK_REPAIR_SECONDS if 'track' in name.lower() else BASE_MODULE_REPAIR_SECONDS
-    factor = crew_repair_factor(repair_skill_pct)
+    if repair_factor is None:
+        factor = crew_repair_factor(repair_skill_pct)
+    else:
+        factor = (1.0 + REPAIR_SKILL_SPEEDUP) * max(0.0, float(repair_factor))
     factor *= _misc_factor(td, 'repairSpeedFactor')
     if has_big_repairkit:
         factor *= 1.10
@@ -510,14 +517,16 @@ def repair_seconds(name, td, repair_skill_pct=0.0, has_big_repairkit=False):
     return base / factor
 
 
-def repair_step_hp(current_hp, name, td, dt, repair_skill_pct=0.0, has_big_repairkit=False):
+def repair_step_hp(current_hp, name, td, dt, repair_skill_pct=0.0,
+                   has_big_repairkit=False, repair_factor=None):
     """Advance a device's HP one tick toward its regen cap (~50%). Returns the new
     HP (unchanged if already at/above the cap). Repair kits set HP directly and
     should not go through here."""
     cap = device_regen_hp(td, name)
     if cap is None or current_hp >= cap:
         return current_hp
-    secs = repair_seconds(name, td, repair_skill_pct, has_big_repairkit)
+    secs = repair_seconds(name, td, repair_skill_pct, has_big_repairkit,
+                          repair_factor)
     rate = cap / max(0.1, secs)          # HP per second
     new_hp = current_hp + rate * dt
     if new_hp > cap:

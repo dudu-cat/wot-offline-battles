@@ -891,6 +891,8 @@ class BattleRuntime(object):
         self._effect_reports = 0
         self._spotted_signature = None
         self._local_spotting_cache = None
+        self._local_factors_cache = None
+        self._remote_spotting_cache = {}
         self._local_still_since = None
         self._battle_result = None
         self._round_finished_notified = False
@@ -1039,6 +1041,8 @@ class BattleRuntime(object):
         self._effect_reports = 0
         self._spotted_signature = None
         self._local_spotting_cache = None
+        self._local_factors_cache = None
+        self._remote_spotting_cache = {}
         self._local_still_since = None
         self._battle_result = self._start_message.get('battle_result')
         self._round_finished_notified = False
@@ -3233,7 +3237,8 @@ class BattleRuntime(object):
         self._local_native_stabilised_matrix = native_stabilised
         self._local_camera_velocity = zero_motion
         self._local_physics = vehicle_physics.derive_params(
-            entity.typeDescriptor)
+            entity.typeDescriptor,
+            self._local_factors(entity.typeDescriptor))
         return True
 
     def _attach_local_presentation(self):
@@ -3514,8 +3519,21 @@ class BattleRuntime(object):
             'equipments': (() if consumables is None else
                            tuple(consumables.getInstalledItems())),
             'crew': tuple(getattr(item, 'crew', None) or ()),
+            'camouflage_id': self._garage_camouflage_id(item),
         }
         return self._garage_loadout
+
+    @staticmethod
+    def _garage_camouflage_id(item):
+        """The paint id ``getClientInvisibility`` passes to the base law."""
+        reader = getattr(item, 'getBonusCamo', None)
+        if not callable(reader):
+            return None
+        try:
+            camouflage = reader()
+        except Exception:
+            return None
+        return None if camouflage is None else getattr(camouflage, 'id', None)
 
     def _local_ammo_layout(self):
         """Return the player's mounted ``{shellCompactDescr: count}`` layout.
@@ -3535,29 +3553,62 @@ class BattleRuntime(object):
         state = self._gun_state
         profile = self._spotting_profile(descriptor, local=True)
         loadout = self._local_loadout(descriptor)
-        still, moving = self._base_invisibility(
-            descriptor, profile['camouflage_level'])
-        chassis = _field(descriptor, 'chassis', {})
-        resistances = _field(chassis, 'terrainResistance', ()) or ()
+        snapshot = self._garage_loadout_snapshot()
+        # computeBaseInvisibility returns (moving, still), in that order.
+        moving, still = self._base_invisibility(
+            descriptor, profile, snapshot['camouflage_id'])
+        moving_add, moving_mult = profile['invisibility_moving']
+        still_add, still_mult = profile['invisibility_still']
+        shot_factor = self._shot_invisibility_factor(descriptor)
+        physics = vehicle_physics.derive_params(
+            descriptor, self._local_factors(descriptor))
+        gun_factors = _field(_field(descriptor, 'gun', {}),
+                             'shotDispersionFactors', {}) or {}
+        chassis_factors = _field(_field(descriptor, 'chassis', {}),
+                                 'shotDispersionFactors', (0.0, 0.0)) or (
+                                     0.0, 0.0)
         sys.stdout.write(
-            '[Offline LAN 0.9.22] PARAMS view=%.1f crew=%.1f/%.1f recon=%.1f '
-            'camo_crew=%.1f conceal_still=%.4f conceal_move=%.4f '
-            'shot_factor=%.3f net=%.3f binoc=%.3f reload=%.2f aim=%.2f '
-            'disp=%.4f traverse=%.2f/%.2f terrain=%s radio=%.0f '
-            'rammer=%s vents=%s brothers=%s rations=%s\n' % (
+            '[Offline LAN 0.9.22] PARAMS source=%s view=%.1f binoc=%.3f '
+            'conceal_move=%.2f%% conceal_still=%.2f%% at_shot=%.3f '
+            'reload=%.2fs aim=%.2fs disp=%.4f disp_move=%.3f '
+            'disp_rot=%.3f disp_turret=%.3f disp_shot=%.3f '
+            'turret_deg=%.2f gun_deg=%.2f hull_deg=%.2f '
+            'terrain=%s power_hp=%.0f speed=%.1f/%.1f repair=%.3f '
+            'big_kit=%s radio=%.0f\n' % (
+                'client-factors' if loadout['from_client_factors']
+                else 'fallback',
                 self._vision_radius(descriptor, local=True),
+                profile['binocular_factor'],
+                ((moving + moving_add) * moving_mult) * 100.0,
+                ((still + still_add) * still_mult) * 100.0, shot_factor,
+                state.reload, state.aim_time, state.base_dispersion,
+                _number(chassis_factors[0]), _number(chassis_factors[1]),
+                _number(_field(gun_factors, 'turretRotation', 0.0)),
+                _number(_field(gun_factors, 'afterShot', 0.0)),
+                math.degrees(
+                    _number(_field(_field(descriptor, 'turret', {}),
+                                   'rotationSpeed', 0.0)) *
+                    loadout['crew_factor']),
+                math.degrees(
+                    _number(_field(_field(descriptor, 'gun', {}),
+                                   'rotationSpeed', 0.0)) *
+                    loadout['gun_rotation_factor']),
+                math.degrees(physics['rotSpd']),
+                ','.join('%.3f' % value for value in physics['terrainResist']),
+                physics['powerW'] / 735.49875,
+                physics['speedFwd'] * 3.6, physics['speedBwd'] * 3.6,
+                loadout['repair_factor'], loadout['has_big_kit'],
+                _number(_field(_field(descriptor, 'radio', {}),
+                               'distance', 0.0)) * loadout['radio_factor']))
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] PARAMS crew=%.1f/%.1f recon=%.1f '
+            'camo_crew=%.1f camo_factor=%.4f vision_factor=%.4f '
+            'net=%.3f paint=%s rammer=%s vents=%s brothers=%s '
+            'rations=%s\n' % (
                 loadout['crew_level'], loadout['effective_crew_level'],
                 profile['recon_level'], profile['camouflage_level'],
-                still, moving,
-                self._shot_invisibility_factor(descriptor),
-                profile['camouflage_net_bonus'], profile['binocular_factor'],
-                state.reload, state.aim_time, state.base_dispersion,
-                _number(_field(_field(descriptor, 'turret', {}),
-                               'rotationSpeed', 0.0)),
-                _number(_field(chassis, 'rotationSpeed', 0.0)),
-                ','.join('%.2f' % _number(value) for value in resistances),
-                _number(_field(_field(descriptor, 'radio', {}),
-                               'distance', 0.0)),
+                profile['camouflage_factor'], profile['vision_factor'],
+                still_add, snapshot['camouflage_id'],
                 loadout['has_rammer'], loadout['has_ventilation'],
                 loadout['has_brotherhood'], loadout['has_rations']))
         return True
@@ -3603,7 +3654,8 @@ class BattleRuntime(object):
         crew = snapshot['crew']
         self._local_loadout_cache = loadout_law.modifiers(
             descriptor, snapshot['equipments'],
-            loadout_law.crew_skill_names(crew) if crew else None)
+            loadout_law.crew_skill_names(crew) if crew else None,
+            factors=self._local_factors(descriptor))
         return self._local_loadout_cache
 
     def _equipment_stages(self):
@@ -3802,12 +3854,20 @@ class BattleRuntime(object):
         aiming_time = (
             state.aim_time *
             critical_damage.stat_factor(entity, 'aim_time'))
+        # updateTargetingInfo takes the FINAL speeds; #1513 multiplies the
+        # descriptor value by the gunner factor before sending them, so a
+        # trained crew and a mounted ventilation both belong here.
+        gunner_factor = max(
+            0.0, _number(state.loadout.get('crew_factor'), 1.0))
+        gun_factor = max(
+            0.0, _number(state.loadout.get('gun_rotation_factor'),
+                         gunner_factor))
         turret_speed = (
-            _number(turret.rotationSpeed) *
+            _number(turret.rotationSpeed) * gunner_factor *
             critical_damage.stat_factor(entity, 'turret_speed'))
         targeting_signature = (
             turret_speed,
-            _number(gun.rotationSpeed), shot_multiplier,
+            _number(gun.rotationSpeed) * gun_factor, shot_multiplier,
             turret_factor, movement_factor, rotation_factor, aiming_time)
         if targeting_signature == self._targeting_signature:
             return False
@@ -5192,7 +5252,10 @@ class BattleRuntime(object):
         if not hasattr(entity, 'maxHealth'):
             entity.maxHealth = int(entity.typeDescriptor.maxHealth)
         now = self._clock()
-        payload = critical_damage.tick_repair(entity, dt)
+        loadout = self._local_loadout(entity.typeDescriptor)
+        payload = critical_damage.tick_repair(
+            entity, dt, has_big_kit=loadout['has_big_kit'],
+            repair_factor=loadout['repair_factor'])
         if payload is not None:
             record['critical_state'] = self._critical_state(payload)
             state = dict(record.get('state') or {})
@@ -8631,15 +8694,42 @@ class BattleRuntime(object):
     def _spotting_profile(self, descriptor, local=False):
         """Return the device and crew spotting inputs for one descriptor.
 
-        Only the local player has a garage crew to read; a bot keeps the
-        untrained baseline so both sides use one law with different inputs.
+        Both sides read the same ``factors`` dictionary the garage panel
+        reads; only the crew behind it differs, because a bot has the default
+        crew instead of the player's own.
         """
         if local:
             if self._local_spotting_cache is None:
+                snapshot = self._garage_loadout_snapshot()
+                crew = snapshot['crew'] or None
                 self._local_spotting_cache = loadout_law.spotting_profile(
-                    descriptor, self._garage_loadout_snapshot()['crew'] or None)
+                    descriptor, crew,
+                    level_increase=loadout_law.crew_level_increase(
+                        descriptor, snapshot['equipments'],
+                        loadout_law.crew_skill_names(crew) if crew else None),
+                    factors=self._local_factors(descriptor))
             return self._local_spotting_cache
-        return loadout_law.spotting_profile(descriptor, None)
+        # Every non-local vehicle carries the default crew, so its profile
+        # depends only on the vehicle type and what is mounted on it.
+        key = (_field(descriptor, 'name', ''),
+               loadout_law.device_names(descriptor))
+        profile = self._remote_spotting_cache.get(key)
+        if profile is None:
+            profile = loadout_law.spotting_profile(
+                descriptor, None,
+                level_increase=loadout_law.crew_level_increase(descriptor),
+                factors=loadout_law.attribute_factors(descriptor))
+            self._remote_spotting_cache[key] = profile
+        return profile
+
+    def _local_factors(self, descriptor):
+        """Cache the player's own #1513 attribute factors for this round."""
+        if self._local_factors_cache is None:
+            snapshot = self._garage_loadout_snapshot()
+            self._local_factors_cache = loadout_law.attribute_factors(
+                descriptor, snapshot['crew'] or None,
+                snapshot['equipments']) or False
+        return self._local_factors_cache or None
 
     def _vision_radius(self, descriptor, entity=None, still_seconds=0.0,
                        local=False):
@@ -8653,12 +8743,10 @@ class BattleRuntime(object):
         profile = self._spotting_profile(descriptor, local)
         return spotting.effective_view_range(
             _field(turret, 'circularVisionRadius', 400.0),
-            commander_level=profile['commander_level'],
-            vision_factor=(
+            misc_factor=(
                 _field(misc, 'circularVisionRadiusFactor', 1.0) *
                 damage_factor),
-            recon_level=profile['recon_level'],
-            situational_level=profile['situational_level'],
+            crew_factor=profile['vision_factor'],
             binocular_factor=profile['binocular_factor'],
             binocular_active=(
                 profile['has_binoculars'] and
@@ -8666,12 +8754,13 @@ class BattleRuntime(object):
                     still_seconds, profile['binocular_delay'])))
 
     @staticmethod
-    def _base_invisibility(descriptor, crew_camouflage_level=0.0):
-        crew_factor = spotting.crew_camouflage_factor(crew_camouflage_level)
+    def _base_invisibility(descriptor, profile, camouflage_id=None):
+        """#1513 ``computeBaseInvisibility``, returned as ``(moving, still)``."""
+        crew_factor = profile['camouflage_factor']
         calculator = getattr(descriptor, 'computeBaseInvisibility', None)
         if callable(calculator):
             try:
-                values = calculator(crew_factor, None)
+                values = calculator(crew_factor, camouflage_id)
                 if isinstance(values, (list, tuple)) and len(values) >= 2:
                     return (_number(values[0]), _number(values[1]))
             except Exception:
@@ -8682,8 +8771,16 @@ class BattleRuntime(object):
             values = (0.0, 0.0)
         misc = _field(descriptor, 'miscAttrs', {})
         return spotting.base_camouflage(
-            values[0], values[1],
+            values[0], values[1], crew_factor=crew_factor,
             invisibility_factor=_field(misc, 'invisibilityFactor', 1.0))
+
+    @staticmethod
+    def _invisibility_aspect(profile, moving, still_device_ready):
+        """Pick the stationary aspect only once the net has really settled."""
+        if moving or (profile['has_camouflage_net'] and
+                      not still_device_ready):
+            return profile['invisibility_moving']
+        return profile['invisibility_still']
 
     @staticmethod
     def _shot_invisibility_factor(descriptor):
@@ -8725,18 +8822,15 @@ class BattleRuntime(object):
         if self._foliage is not None:
             foliage_bonus = self._foliage.camouflage_bonus(
                 observer_position, target, fired_recently)
-        target_profile = loadout_law.spotting_profile(target_descriptor, None)
+        target_profile = self._spotting_profile(target_descriptor)
+        additive, multiplier = self._invisibility_aspect(
+            target_profile, target_moving,
+            loadout_law.still_device_active(
+                target_still_seconds,
+                target_profile['camouflage_net_delay']))
         camouflage = spotting.effective_camouflage(
-            self._base_invisibility(
-                target_descriptor, target_profile['camouflage_level']),
-            moving=target_moving,
-            camouflage_net_bonus=target_profile['camouflage_net_bonus'],
-            camouflage_net_active=(
-                target_profile['has_camouflage_net'] and
-                not target_moving and
-                loadout_law.still_device_active(
-                    target_still_seconds,
-                    target_profile['camouflage_net_delay'])),
+            self._base_invisibility(target_descriptor, target_profile),
+            moving=target_moving, additive=additive, multiplier=multiplier,
             shot_factor=self._shot_invisibility_factor(target_descriptor),
             fired_recently=fired_recently,
             foliage_bonus=foliage_bonus)
@@ -9730,6 +9824,8 @@ class BattleRuntime(object):
         self._effect_reports = 0
         self._spotted_signature = None
         self._local_spotting_cache = None
+        self._local_factors_cache = None
+        self._remote_spotting_cache = {}
         self._local_still_since = None
         self._battle_result = None
         self._round_finished_notified = False

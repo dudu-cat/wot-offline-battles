@@ -96,6 +96,9 @@ EXPECTED_ABI = {
         'VehicleDescr': ('compactDescr', 'typeID', 'typeName'),
         'getDefaultAmmoForGun': ('gunDescr',),
         'VehicleDescriptor.getHitTesters': ('self',),
+        'VehicleDescriptor.computeBaseInvisibility': (
+            'self', 'crewFactor', 'camouflageId'),
+        'getItemByCompactDescr': ('compactDescr',),
         'Cache.equipments': ('self',),
         'Cache.customization20': ('self',),
         'VehicleList.getList': ('self', 'nationID'),
@@ -268,6 +271,46 @@ EXPECTED_ABI = {
             'mainSkillQualifiersApplier', 'activityFlags', 'isFire',
             'stunFactors'),
         'VehicleDescrCrew._validateAndComputeCrew': ('self',),
+        'VehicleDescrCrew._processSkills': (
+            'self', 'skillEfficiencies', 'commonLevelIncrease',
+            'nonCommanderLevelIncrease'),
+        'VehicleDescrCrew.onCollectFactors': ('self', 'factors'),
+        'VehicleDescrCrew.onCollectShotDispersionFactors': (
+            'self', 'factors'),
+        'VehicleDescrCrew._updateCommanderFactors': (
+            'self', 'factor', 'baseAvgLevel'),
+        'VehicleDescrCrew._updateGunnerFactors': (
+            'self', 'factor', 'baseAvgLevel'),
+        'VehicleDescrCrew._updateLoaderFactors': (
+            'self', 'factor', 'baseAvgLevel'),
+        'VehicleDescrCrew._updateDriverFactors': (
+            'self', 'factor', 'baseAvgLevel'),
+        'VehicleDescrCrew._updateRadiomanFactors': (
+            'self', 'factor', 'baseAvgLevel'),
+        'VehicleDescrCrew._updateRepairFactors': (
+            'self', 'factor', 'baseAvgLevel'),
+        'VehicleDescrCrew._updateCamouflageFactors': (
+            'self', 'factor', 'baseAvgLevel'),
+    },
+    # The single dataset the garage panel and the battle law share.
+    'scripts/common/items/utils.pyc': {
+        'makeDefaultVehicleAttributeFactors': (),
+        'updateAttrFactorsWithSplit': (
+            'vehicleDescr', 'crewCompactDescrs', 'eqs', 'factors'),
+        'updateVehicleAttrFactors': (
+            'vehicleDescr', 'crewCompactDescrs', 'eqs', 'factors', 'aspect'),
+        'generateDefaultCrew': ('vehicleType', 'level'),
+        'getCircularVisionRadius': ('vehicleDescr', 'factors'),
+        'getRadioDistance': ('vehicleDescr', 'factors'),
+        'getReloadTime': ('vehicleDescr', 'factors'),
+        'getGunAimingTime': ('vehicleDescr', 'factors'),
+        'getTurretRotationSpeed': ('vehicleDescr', 'factors'),
+        'getGunRotationSpeed': ('vehicleDescr', 'factors'),
+        'getChassisRotationSpeed': ('vehicleDescr', 'factors'),
+        'getClientShotDispersion': ('vehicleDescr', 'shotDispersionFactor'),
+        'getInvisibility': ('factors', 'baseInvisibility', 'isMoving'),
+        'getClientInvisibility': (
+            'vehicleDescr', 'vehicle', 'camouflageFactor', 'factors'),
     },
     'scripts/common/items/item_price.pyc': {
         'getNextSlotPrice': ('slots', 'slotsPrices'),

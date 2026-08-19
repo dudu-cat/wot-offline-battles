@@ -260,10 +260,29 @@ _DEFAULTS = {
 }
 
 
-def derive_params(td):
+def _factor_list(factors, name):
+	try:
+		values = factors[name]
+		return (float(values[0]), float(values[1]), float(values[2]))
+	except (KeyError, IndexError, TypeError, ValueError):
+		return (1.0, 1.0, 1.0)
+
+
+def _factor(factors, name):
+	try:
+		return max(0.0, float(factors[name]))
+	except (KeyError, TypeError, ValueError):
+		return 1.0
+
+
+def derive_params(td, factors=None):
 	'''Real per-vehicle parameter set from a VehicleDescr. Every consumer
 	(player tick, each bot) MUST source its numbers from here - this is the
-	single place that knows the units of td.physics.'''
+	single place that knows the units of td.physics.
+
+	``factors`` is the #1513 attribute-factor dictionary the garage panel
+	reads. With it the driver skills, the grousers and the engine consumables
+	reach the physics exactly as VehicleParams composes them.'''
 	p = dict(_DEFAULTS)
 	try:
 		tdp = getattr(td, 'physics', None) or {}
@@ -314,6 +333,23 @@ def derive_params(td):
 	except (AttributeError, TypeError, ValueError) as error:
 		raise RuntimeError(
 			'#1513 chassis rotation speed is invalid: %s' % error)
+	# VehicleParams composes terrain resistance as the crew factor times the
+	# descriptor's own rolling-friction factors, which is where the grousers
+	# live.
+	rolling = (1.0, 1.0, 1.0)
+	try:
+		if 'rollingFrictionFactors' in tdp:
+			values = tdp['rollingFrictionFactors']
+			rolling = (float(values[0]), float(values[1]), float(values[2]))
+	except (IndexError, TypeError, ValueError):
+		rolling = (1.0, 1.0, 1.0)
+	crew = _factor_list(factors or {}, 'chassis/terrainResistance')
+	p['terrainResist'] = tuple(
+		p['terrainResist'][index] * crew[index] * rolling[index]
+		for index in range(3))
+	if factors:
+		p['rotSpd'] *= _factor(factors, 'vehicle/rotationSpeed')
+		p['powerW'] *= _factor(factors, 'engine/power')
 	return p
 
 

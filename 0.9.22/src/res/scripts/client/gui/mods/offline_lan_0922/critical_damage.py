@@ -1072,7 +1072,8 @@ def apply_payload(vehicle, payload):
     return tuple(normalized)
 
 
-def tick_repair(vehicle, dt, repair_skill=100.0, has_big_kit=False):
+def tick_repair(vehicle, dt, repair_skill=100.0, has_big_kit=False,
+                repair_factor=None):
     """Advance copied 0.8.2 repair law; transport/presentation stay outside."""
     if vehicle is None or dt is None or dt <= 0.0:
         return None
@@ -1090,7 +1091,8 @@ def tick_repair(vehicle, dt, repair_skill=100.0, has_big_kit=False):
                 bool(getattr(vehicle, 'is_on_fire', False))):
             continue
         devices[name] = _device_damage.repair_step_hp(
-            devices[name], name, descriptor, dt, repair_skill, has_big_kit)
+            devices[name], name, descriptor, dt, repair_skill, has_big_kit,
+            repair_factor)
         if name in destroyed and devices[name] >= cap:
             destroyed.discard(name)
     vehicle.devices_hp = devices

@@ -7601,7 +7601,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             sight, target_position, target, False, False))
         self.assertTrue(battle._spot_line_of_sight(
             sight, target_position, target, False, True))
-        self.assertAlmostEqual(4.0 / 7.0, crew_factors[0][0])
+        # VehicleDescrCrew._processSkills: 0.57 with no camouflage skill.
+        self.assertAlmostEqual(0.57, crew_factors[0][0])
         self.assertIsNone(crew_factors[0][1])
 
     def test_damaged_optics_and_crew_reduce_observer_view_range(self):
@@ -8149,7 +8150,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._ammo_tick()
 
         targeting = runtime.bigworld.avatar.targeting
-        crew_multiplier = 1.0 / (0.5 + 0.005 * 110.0)
+        crew_multiplier = 1.0 / (0.57 + 0.0043 * 110.0)
         self.assertAlmostEqual(crew_multiplier, targeting[4])
         self.assertEqual(0.1, targeting[5])
         self.assertEqual(0.14, targeting[6])
@@ -8175,8 +8176,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'critical_damage.stat_factor', side_effect=factor):
             battle._ammo_tick()
 
+        # updateTargetingInfo takes the final speed, so the gunner factor is
+        # applied on top of the damage factor.
         self.assertAlmostEqual(
-            descriptor.turret.rotationSpeed * 0.5,
+            descriptor.turret.rotationSpeed * 0.5 * (0.57 + 0.0043 * 110.0),
             runtime.bigworld.avatar.targeting[2])
 
     def test_parsed_1513_light_tank_bloom_uses_raw_descriptor_factor(self):
@@ -8222,7 +8225,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         descriptor.gun.rotationSpeed = 0.75
         battle._ammo_tick()
         self.assertEqual(2, len(runtime.bigworld.avatar.targeting_updates))
-        self.assertEqual(0.75, runtime.bigworld.avatar.targeting_updates[-1][3])
+        self.assertAlmostEqual(
+            0.75 * (0.57 + 0.0043 * 110.0),
+            runtime.bigworld.avatar.targeting_updates[-1][3])
 
     def test_ammo_tick_keeps_enabled_server_marker_on_the_client_angle(self):
         runtime = _runtime()

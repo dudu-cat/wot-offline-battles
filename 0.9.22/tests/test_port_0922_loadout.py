@@ -29,13 +29,22 @@ def _crew(*skill_lists):
 
 class LoadoutLawTests(unittest.TestCase):
 
-    def test_bare_crew_keeps_the_082_baseline_multiplier(self):
+    def test_a_bare_crew_uses_the_exact_1513_curve(self):
         values = loadout.baseline()
 
         self.assertEqual(110.0, values['effective_crew_level'])
-        self.assertAlmostEqual(1.0 / 1.05, values['crew_multiplier'])
-        self.assertEqual(1.0, values['reload_factor'])
-        self.assertEqual(1.0, values['aim_time_factor'])
+        # VehicleDescrCrew._processSkills: 0.57 + 0.43 * (level / 100).
+        self.assertAlmostEqual(
+            0.57 + 0.0043 * 110.0, values['crew_factor'])
+        self.assertAlmostEqual(
+            1.0 / (0.57 + 0.0043 * 110.0), values['crew_multiplier'])
+        # reload_factor and aim_time_factor are COMPLETE multipliers now.
+        self.assertAlmostEqual(
+            values['crew_multiplier'], values['reload_factor'])
+        self.assertAlmostEqual(
+            values['crew_multiplier'], values['aim_time_factor'])
+        self.assertAlmostEqual(
+            values['crew_multiplier'], values['dispersion_factor'])
 
     def test_ventilation_brotherhood_and_food_stack_on_the_crew_level(self):
         crew = _crew(['brotherhood'], ['brotherhood'])
@@ -52,7 +61,7 @@ class LoadoutLawTests(unittest.TestCase):
         self.assertTrue(values['has_brotherhood'])
         self.assertTrue(values['has_rations'])
         self.assertAlmostEqual(
-            1.0 / (0.5 + 0.005 * 132.0), values['crew_multiplier'])
+            1.0 / (0.57 + 0.0043 * 132.0), values['crew_multiplier'])
 
     def test_brotherhood_needs_every_crew_member(self):
         crew = _crew(['brotherhood'], ['repair'])
@@ -66,9 +75,21 @@ class LoadoutLawTests(unittest.TestCase):
     def test_rammer_and_gun_laying_drive_use_the_exact_082_factors(self):
         values = loadout.modifiers(
             _descriptor([_device('gunRammer'), _device('aimDrives')]))
+        crew = values['crew_multiplier']
 
-        self.assertEqual(0.9, values['reload_factor'])
-        self.assertAlmostEqual(1.0 / 1.1, values['aim_time_factor'])
+        self.assertAlmostEqual(crew * 0.9, values['reload_factor'])
+        self.assertAlmostEqual(crew / 1.1, values['aim_time_factor'])
+
+    def test_the_descriptor_factor_beats_the_device_name(self):
+        # deluxRammer is 0.875, not the 0.9 the 0.8.2 name match assumed.
+        descriptor = _descriptor([_device('deluxRammer')])
+        descriptor.miscAttrs = {'gunReloadTimeFactor': 0.875,
+                                'gunAimingTimeFactor': 0.89}
+        values = loadout.modifiers(descriptor)
+        crew = values['crew_multiplier']
+
+        self.assertAlmostEqual(crew * 0.875, values['reload_factor'])
+        self.assertAlmostEqual(crew * 0.89, values['aim_time_factor'])
 
     def test_stabiliser_snap_shot_and_smooth_ride_dampen_the_bloom(self):
         crew = _crew(['snapShot', 'smoothDriving'])
@@ -174,12 +195,12 @@ class SpottingProfileTests(unittest.TestCase):
         self.assertAlmostEqual(
             400.0 * 1.25,
             spotting.effective_view_range(
-                400.0, vision_factor=1.1,
+                400.0, misc_factor=1.1,
                 binocular_factor=profile['binocular_factor'],
                 binocular_active=True))
         self.assertAlmostEqual(
             base,
-            spotting.effective_view_range(400.0, vision_factor=1.1))
+            spotting.effective_view_range(400.0, misc_factor=1.1))
 
     def test_the_camouflage_net_bonus_comes_from_the_vehicle_type(self):
         profile = loadout.spotting_profile(
@@ -229,11 +250,117 @@ class SpottingProfileTests(unittest.TestCase):
         self.assertEqual(0.0, profile['situational_level'])
 
     def test_the_skills_lengthen_the_view_range(self):
-        plain = spotting.effective_view_range(400.0)
-        keen = spotting.effective_view_range(
-            400.0, recon_level=100.0, situational_level=100.0)
+        crew = (
+            types.SimpleNamespace(role='commander', roleLevel=100.0, skills=[
+                types.SimpleNamespace(name='commander_eagleEye', level=100.0),
+                types.SimpleNamespace(name='radioman_finder', level=100.0)]),)
+        plain = loadout.spotting_profile(self._descriptor())
+        keen = loadout.spotting_profile(self._descriptor(), crew)
 
-        self.assertAlmostEqual(plain * 1.02 * 1.03, keen)
+        self.assertAlmostEqual(
+            plain['vision_factor'] * 1.02 * 1.03, keen['vision_factor'])
+        self.assertAlmostEqual(
+            spotting.effective_view_range(
+                400.0, crew_factor=plain['vision_factor']) * 1.02 * 1.03,
+            spotting.effective_view_range(
+                400.0, crew_factor=keen['vision_factor']))
+
+
+class CrewLevelIncreaseTests(unittest.TestCase):
+    """#1513 folds ventilation into miscAttrs['crewLevelIncrease'] and
+    VehicleDescrCrew adds it to every crewman before any efficiency is taken,
+    so it must reach view range, not only reload."""
+
+    def _descriptor(self, increase=0.0):
+        descriptor = _descriptor([])
+        descriptor.miscAttrs = {'crewLevelIncrease': increase}
+        return descriptor
+
+    def test_ventilation_raises_the_commander_level_for_spotting(self):
+        plain = loadout.spotting_profile(
+            self._descriptor(), _crew([], []),
+            level_increase=loadout.crew_level_increase(self._descriptor()))
+        vented = loadout.spotting_profile(
+            self._descriptor(5.0), _crew([], []),
+            level_increase=loadout.crew_level_increase(self._descriptor(5.0)))
+
+        self.assertEqual(
+            plain['commander_level'] + 5.0, vented['commander_level'])
+
+    def test_brotherhood_and_rations_add_to_the_descriptor_increase(self):
+        crew = _crew(['brotherhood'], ['brotherhood'])
+
+        increase = loadout.crew_level_increase(
+            self._descriptor(5.0), equipments=[_device('chocolate')],
+            crew_skills=loadout.crew_skill_names(crew))
+
+        self.assertAlmostEqual(
+            5.0 + loadout.BROTHERHOOD_CREW_BONUS +
+            loadout.RATION_CREW_BONUS, increase)
+
+    def test_an_untrained_skill_is_not_raised_from_zero(self):
+        # A crewman who never learned camouflage has nothing to add to, which
+        # is why the garage concealment number does not move either.
+        profile = loadout.spotting_profile(
+            self._descriptor(5.0), _crew([], []), level_increase=5.0)
+
+        self.assertEqual(0.0, profile['camouflage_level'])
+
+
+class ClientFactorTests(unittest.TestCase):
+    """With the client's own factors every consumer reads one dictionary."""
+
+    FACTORS = {
+        'turret/rotationSpeed': 1.05, 'gun/rotationSpeed': 1.05,
+        'gun/reloadTime': 0.8, 'gun/aimingTime': 0.9,
+        'shotDispersion': [0.85, 0.0], 'repairSpeed': 0.95,
+        'vehicle/rotationSpeed': 1.04, 'radio/distance': 1.02,
+        'chassis/terrainResistance': [0.9, 0.8, 0.7],
+        'circularVisionRadius': 1.21, 'camouflage': 0.72,
+        'invisibility': {0: [0.0, 1.0], 1: [0.11, 1.0]},
+        '_aspects': (0, 1),
+    }
+
+    def _gun_descriptor(self):
+        descriptor = _descriptor([])
+        descriptor.miscAttrs = {'gunReloadTimeFactor': 0.875,
+                                'gunAimingTimeFactor': 0.89}
+        return descriptor
+
+    def test_every_gun_multiplier_comes_from_the_factor_dictionary(self):
+        values = loadout.modifiers(
+            self._gun_descriptor(), factors=self.FACTORS)
+
+        self.assertTrue(values['from_client_factors'])
+        self.assertAlmostEqual(0.875 * 0.8, values['reload_factor'])
+        self.assertAlmostEqual(0.89 * 0.9, values['aim_time_factor'])
+        self.assertAlmostEqual(0.85, values['dispersion_factor'])
+        self.assertAlmostEqual(1.05, values['crew_factor'])
+        self.assertAlmostEqual(0.95, values['repair_factor'])
+        self.assertAlmostEqual(1.04, values['vehicle_rotation_factor'])
+        self.assertAlmostEqual(1.02, values['radio_factor'])
+        self.assertEqual((0.9, 0.8, 0.7), values['terrain_resistance_factors'])
+
+    def test_the_stereoscope_is_divided_out_of_the_vision_factor(self):
+        descriptor = types.SimpleNamespace(
+            optionalDevices=[types.SimpleNamespace(
+                name='stereoscope', circularVisionRadiusFactor=1.25,
+                activateWhenStillSec=3.0)],
+            miscAttrs={'circularVisionRadiusFactor': 1.0},
+            type=types.SimpleNamespace(invisibilityDeltas={}))
+
+        profile = loadout.spotting_profile(descriptor, factors=self.FACTORS)
+
+        self.assertAlmostEqual(1.25, profile['binocular_factor'])
+        self.assertAlmostEqual(1.21 / 1.25, profile['vision_factor'])
+        self.assertAlmostEqual(0.72, profile['camouflage_factor'])
+
+    def test_the_camouflage_net_lives_in_the_stationary_aspect_only(self):
+        profile = loadout.spotting_profile(
+            _descriptor([]), factors=self.FACTORS)
+
+        self.assertEqual((0.0, 1.0), profile['invisibility_moving'])
+        self.assertEqual((0.11, 1.0), profile['invisibility_still'])
 
 
 if __name__ == '__main__':

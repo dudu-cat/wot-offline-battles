@@ -75,7 +75,7 @@ class GunMechanicsParityTests(unittest.TestCase):
 
     def test_descriptor_state_preserves_082_fallback_ammo_and_crew_factor(self):
         state = GunState(_descriptor())
-        crew_multiplier = 1.0 / (0.5 + 0.005 * 110.0)
+        crew_multiplier = 1.0 / (0.57 + 0.0043 * 110.0)
 
         self.assertEqual([60, 30, 10], state.ammo)
         self.assertAlmostEqual(0.12 * crew_multiplier,

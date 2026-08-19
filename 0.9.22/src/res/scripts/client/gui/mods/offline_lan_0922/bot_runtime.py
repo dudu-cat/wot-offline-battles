@@ -149,21 +149,23 @@ def _forward_speed(descriptor):
     return max(4.0, min(value, 35.0))
 
 
-def _view_range(descriptor, still_seconds=0.0):
-    """Bot view range, using the same device law as the player.
+def _bot_profile(descriptor):
+    """Spotting inputs for a vehicle whose crew is the #1513 default crew."""
+    return loadout.spotting_profile(
+        descriptor, None, factors=loadout.attribute_factors(descriptor))
 
-    A bot has no garage crew, so its crew-derived factors stay at the
-    untrained baseline; its mounted devices still apply.
-    """
+
+
+
+def _view_range(descriptor, still_seconds=0.0):
+    """Bot view range, using the same device and crew law as the player."""
     turret = _value(descriptor, 'turret', {}) or {}
     misc = _value(descriptor, 'miscAttrs', {}) or {}
-    profile = loadout.spotting_profile(descriptor, None)
+    profile = _bot_profile(descriptor)
     return spotting.effective_view_range(
         _value(turret, 'circularVisionRadius', 330.0),
-        commander_level=profile['commander_level'],
-        vision_factor=_value(misc, 'circularVisionRadiusFactor', 1.0),
-        recon_level=profile['recon_level'],
-        situational_level=profile['situational_level'],
+        misc_factor=_value(misc, 'circularVisionRadiusFactor', 1.0),
+        crew_factor=profile['vision_factor'],
         binocular_factor=profile['binocular_factor'],
         binocular_active=(
             profile['has_binoculars'] and
@@ -171,8 +173,10 @@ def _view_range(descriptor, still_seconds=0.0):
                 still_seconds, profile['binocular_delay'])))
 
 
-def _base_invisibility(descriptor, crew_camouflage_level=0.0):
-    crew_factor = spotting.crew_camouflage_factor(crew_camouflage_level)
+def _base_invisibility(descriptor, profile=None):
+    if profile is None:
+        profile = _bot_profile(descriptor)
+    crew_factor = profile['camouflage_factor']
     calculator = getattr(descriptor, 'computeBaseInvisibility', None)
     if callable(calculator):
         try:
@@ -187,7 +191,7 @@ def _base_invisibility(descriptor, crew_camouflage_level=0.0):
         values = (0.0, 0.0)
     misc = _value(descriptor, 'miscAttrs', {}) or {}
     return spotting.base_camouflage(
-        values[0], values[1],
+        values[0], values[1], crew_factor=crew_factor,
         invisibility_factor=_value(misc, 'invisibilityFactor', 1.0))
 
 
@@ -195,6 +199,13 @@ def _shot_invisibility_factor(descriptor):
     gun = _value(descriptor, 'gun', {}) or {}
     return spotting.clamp(
         _value(gun, 'invisibilityFactorAtShot', 1.0), 0.0, 1.0)
+
+
+def _invisibility_aspect(profile, moving, still_device_ready):
+    """Pick the stationary aspect only once the net has really settled."""
+    if moving or (profile['has_camouflage_net'] and not still_device_ready):
+        return profile['invisibility_moving']
+    return profile['invisibility_still']
 
 
 def _detection_upper_bound(distance, view_range, base_pair, moving,
@@ -1004,10 +1015,12 @@ class BotRuntime(object):
         self._shot_los_cache = {}
         self._shot_los_deadlines = {}
         self._physics_params = {}
+        self._repair_factors = {}
         self._player_vehicle_profiles = {}
         self._player_collision_profiles = {}
         self._spotting_profiles = {}
         self._visibility_fire = {}
+        self._visibility_still = {}
         self._turn_speeds = {}
         self._ram_cooldowns = {}
         self._ram_seq = 0
@@ -1325,10 +1338,12 @@ class BotRuntime(object):
             self._shot_los_cache = {}
             self._shot_los_deadlines = {}
             self._physics_params = {}
+            self._repair_factors = {}
             self._player_vehicle_profiles = {}
             self._player_collision_profiles = {}
             self._spotting_profiles = {}
             self._visibility_fire = {}
+            self._visibility_still = {}
             self._turn_speeds = {}
             self._ram_cooldowns = {}
             self._ram_seq = 0
@@ -1365,6 +1380,7 @@ class BotRuntime(object):
             self._clear_artillery_intents()
             self._visibility_cache = {}
             self._visibility_fire = {}
+            self._visibility_still = {}
             self._shot_los_cache = {}
             self._shot_los_deadlines = {}
             self._decision_cache = {}
@@ -1822,7 +1838,9 @@ class BotRuntime(object):
             if was_on_fire and advance_fire else None)
         shadow = _BotCriticalVehicle(
             state, descriptor, fire_started, fire_timer)
-        repair_payload = critical_damage.tick_repair(shadow, step)
+        repair_payload = critical_damage.tick_repair(
+            shadow, step,
+            repair_factor=self._bot_repair_factor(state['id'], descriptor))
         fire_damage = 0
         fire_payload = None
         if advance_fire:
@@ -2025,13 +2043,36 @@ class BotRuntime(object):
             return cached
         if kind == 'bot':
             descriptor = self._descriptors.get(int(target_id), {})
-            cached = (_base_invisibility(descriptor),
-                      _shot_invisibility_factor(descriptor))
+            profile = _bot_profile(descriptor)
+            cached = (_base_invisibility(descriptor, profile),
+                      _shot_invisibility_factor(descriptor), profile)
         else:
             vehicle_profile = self._player_vehicle_profile(target)
             cached = vehicle_profile['spotting']
         self._spotting_profiles[key] = cached
         return cached
+
+    def _bot_repair_factor(self, bot_id, descriptor):
+        """A bot repairs at #1513's default-crew repair speed, like the player."""
+        cached = self._repair_factors.get(bot_id)
+        if cached is None:
+            cached = loadout.modifiers(
+                descriptor,
+                factors=loadout.attribute_factors(descriptor))[
+                    'repair_factor']
+            self._repair_factors[bot_id] = cached
+        return cached
+
+    def _target_still_seconds(self, key, moving, now):
+        """Seconds this target has stood still, for its stationary devices."""
+        if moving:
+            self._visibility_still.pop(key, None)
+            return 0.0
+        since = self._visibility_still.get(key)
+        if since is None:
+            self._visibility_still[key] = _number(now)
+            return 0.0
+        return max(0.0, _number(now) - since)
 
     def _target_fired_recently(self, target, now):
         if target.get('fire_seq') is None:
@@ -2074,9 +2115,11 @@ class BotRuntime(object):
         elif distance > spotting.MAX_SPOT_DISTANCE:
             value = False
         else:
-            base_pair, shot_factor = self._spotting_profile(target)
+            base_pair, shot_factor, profile = self._spotting_profile(target)
             moving = (abs(_number(target.get('speed'))) >
                       spotting.MOVING_SPEED_EPSILON)
+            still_seconds = self._target_still_seconds(
+                (target.get('kind'), int(target_id)), moving, now)
             if not _detection_upper_bound(
                     distance, view_range, base_pair, moving, shot_factor,
                     fired_recently):
@@ -2104,8 +2147,12 @@ class BotRuntime(object):
                 else:
                     has_line_of_sight = bool(visibility)
                     foliage_bonus = 0.0
+                additive, multiplier = _invisibility_aspect(
+                    profile, moving, loadout.still_device_active(
+                        still_seconds, profile['camouflage_net_delay']))
                 camouflage = spotting.effective_camouflage(
-                    base_pair, moving=moving, shot_factor=shot_factor,
+                    base_pair, moving=moving, additive=additive,
+                    multiplier=multiplier, shot_factor=shot_factor,
                     fired_recently=fired_recently,
                     foliage_bonus=foliage_bonus)
                 value = spotting.is_detected(
@@ -2858,12 +2905,13 @@ class BotRuntime(object):
                 tactical = ai_planner.build_vehicle_profile(descriptor)
             except Exception:
                 tactical = {}
+        profile = _bot_profile(descriptor)
         cached = {
             'descriptor': descriptor,
             'class_tag': str(tactical.get('class_tag') or 'unknown'),
             'armor': max(0.0, _number(tactical.get('armor'))),
-            'spotting': (_base_invisibility(descriptor),
-                         _shot_invisibility_factor(descriptor)),
+            'spotting': (_base_invisibility(descriptor, profile),
+                         _shot_invisibility_factor(descriptor), profile),
         }
         self._player_vehicle_profiles[cache_key] = cached
         return cached

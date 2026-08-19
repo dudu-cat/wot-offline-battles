@@ -3986,8 +3986,14 @@ class BotRuntimeTests(unittest.TestCase):
             'bots': [_snapshot_bot(
                 critical=broken, revision=1, base_revision=1)]})
 
+        # A bot carries #1513's default crew, which has no repair skill, so
+        # factors['repairSpeed'] is 0.57 and the track takes 10 / (2 * 0.57)
+        # seconds rather than the five a fully trained crew would need.
         outgoing = None
         for index in range(25):
+            outgoing = runtime.update(.20, 1.0 + index * .20)[0]['bots'][0]
+        self.assertLess(outgoing['critical']['devices'][0]['hp'], 130.0)
+        for index in range(25, 45):
             outgoing = runtime.update(.20, 1.0 + index * .20)[0]['bots'][0]
 
         device = outgoing['critical']['devices'][0]

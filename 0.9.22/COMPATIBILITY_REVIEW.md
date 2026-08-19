@@ -1027,17 +1027,88 @@ per face instead of native per-plate hit testers; and bot muzzles are
 approximated from donated mount offsets instead of the native `HP_gunFire`
 node.
 
+## Garage panel versus battle law: one dataset
+
+The garage panel and the battle law must run on the same numbers. #1513 builds
+those numbers in one place, and the port now calls that place instead of
+approximating it:
+
+```
+gui/Scaleform/daapi/view/lobby/hangar/VehicleParameters.pyc
+  -> items_parameters/params_helper.getParameters(item)
+  -> items_parameters/params.VehicleParams.__init__
+       factors = items_parameters/functions.getVehicleFactors(vehicle)
+  -> items/utils.updateAttrFactorsWithSplit(descr, crewCDs, eqs, factors)
+       every mounted consumable  -> Artefact.updateVehicleAttrFactors
+       every optional device     -> Artefact.updateVehicleAttrFactors
+       VehicleDescrCrew(descr, crewCDs, mainSkillBonuses)
+         .onCollectFactors(factors)
+         .camouflageFactor        -> factors['camouflage']
+         .onCollectShotDispersionFactors -> factors['shotDispersion']
+```
+
+`loadout.attribute_factors` runs exactly that chain for the player's mounted
+descriptor, the crew compact descriptors behind `g_currentVehicle.item.crew`
+and the mounted consumables, and returns the same `factors` dictionary. Bots
+run it with `utils.generateDefaultCrew`, so both sides differ only in the crew
+that feeds them. Off the client the call returns `None` and the pure-data
+fallback in `loadout.py` applies #1513's own curve,
+`factor = 0.57 + 0.43 * efficiency` (`VehicleDescrCrew._processSkills`).
+
+`VehicleParams` in this build exposes 38 properties. The table lists every one
+that a crew skill, an optional device or a consumable can move, plus the
+factors that never reach the panel but do reach the battle.
+
+| Parameter | Garage source | Battle source | Same source | Status |
+|---|---|---|---|---|
+| view range `circularVisionRadius` | `utils.getCircularVisionRadius` = `turret.circularVisionRadius * miscAttrs['circularVisionRadiusFactor'] * factors['circularVisionRadius']` | `battle_runtime._vision_radius` -> `spotting.effective_view_range` with `profile['vision_factor']` = the same factor entry | yes | done |
+| stereoscope | `Stereoscope.updateVehicleAttrFactors` assigns `factors['circularVisionRadius'] = 1.25 / miscAttrs[...]` in both aspects, so the panel shows it always | the same value, divided back out of the base factor and reapplied after `activateWhenStillSec` | yes | done, deliberately gated |
+| concealment still / moving | `params.__getInvisibilityValues` -> `utils.getClientInvisibility` -> `computeBaseInvisibility(factors['camouflage'], camoId)` then `(base + factors['invisibility'][0]) * factors['invisibility'][1]` | `battle_runtime._base_invisibility` + `spotting.effective_camouflage` with the same two factor entries and the same aspect split | yes | done |
+| concealment after firing | `invisibilityFactorAtShot` from `gun` | `_shot_invisibility_factor` reads the same field | yes | done |
+| camouflage net | `CamouflageNet` adds `invisibilityDeltas['camouflageNetBonus']` to the `WHEN_STILL` aspect only | the same aspect, gated on `activateWhenStillSec` | yes | done, deliberately gated |
+| garage paint | `getClientInvisibility` passes `vehicle.getBonusCamo().id` into `computeBaseInvisibility` | the id captured in the garage snapshot, passed into the same call | yes | done |
+| reload `gun/reloadTime` | `utils.getReloadTime` = `gun.reloadTime * miscAttrs['gunReloadTimeFactor'] * factors['gun/reloadTime']` | `GunState.reload` multiplies by `loadout['reload_factor']`, which is that product | yes | done |
+| aim time `gun/aimingTime` | `utils.getGunAimingTime` | `GunState.aim_time` multiplies by `loadout['aim_time_factor']` | yes | done |
+| shot dispersion | `utils.getClientShotDispersion(descr, factors['shotDispersion'][0])` | `GunState.base_dispersion` multiplies by `loadout['dispersion_factor']` = the same entry | yes | done |
+| turret traverse | `utils.getTurretRotationSpeed` = `turret.rotationSpeed * factors['turret/rotationSpeed']` | `_publish_targeting_info` sends `turret.rotationSpeed * loadout['crew_factor']` | yes | done |
+| gun traverse | `utils.getGunRotationSpeed` (panel uses it only on a turretless hull) | `_publish_targeting_info` sends `gun.rotationSpeed * loadout['gun_rotation_factor']` | yes | done |
+| hull traverse `vehicle/rotationSpeed` | `utils.getChassisRotationSpeed` = `chassis.rotationSpeed * factors['vehicle/rotationSpeed']`, then divided by the average terrain resistance | `vehicle_physics.derive_params` multiplies `rotSpd` by the same entry; the panel's division by resistance is presentation | yes | done |
+| terrain resistance | `params.__getTerrainResistanceFactors` = `factors['chassis/terrainResistance'] * physics['rollingFrictionFactors']` | `derive_params` multiplies `terrainResist` by exactly that product | yes | done |
+| engine power | `params.enginePower` = `physics['enginePower'] * factors['engine/power']` | `derive_params` multiplies `powerW` by the same entry | yes | done |
+| radio range | `utils.getRadioDistance` = `radio.distance * factors['radio/distance']` | the battle has no distance gate at all; the effective value is printed at battle start | no consumer | not done, see below |
+| repair speed | not a `VehicleParams` property in #1513, and no client code reads `factors['repairSpeed']` or `miscAttrs['repairSpeedFactor']`; the cell owns the formula | `critical_damage.tick_repair` takes `loadout['repair_factor']` = `factors['repairSpeed']`, the toolbox factor, and the large repair kit | same inputs, our own formula | done |
+| dispersion factors: movement, hull traverse, turret traverse, after shot | not a `VehicleParams` property; the panel shows only the aimed angle | `GunState.tick` reads `chassis.shotDispersionFactors` and `gun.shotDispersionFactors` from the descriptor | descriptor, both sides | done |
+| Snap Shot, Smooth Ride | no `_skillProcessors` entry in this build's `VehicleDescrCrew`, and no client writer for `chassis/shotDispersionFactors`; the cell owns them | `loadout.py` keeps the 0.8.2 constants 0.925 and 0.96 | no | cannot be proved from #1513 |
+| crew level from ventilation | `StaticAdditiveDevice.updateVehicleDescrAttrs` adds 5 to `miscAttrs['crewLevelIncrease']`; `TankmanDescr.efficiencyOnVehicle` returns it as the per-crewman addition | inside `attribute_factors`, so it moves every factor above at once | yes | done |
+| crew level from food and Brothers in Arms | `utils._sumCrewLevelIncrease(eqs)` -> `factors['crewLevelIncrease']`; `skillsConfig.getSkill('brotherhood').crewLevelIncrease` when every slot has the skill | the same chain | yes | done |
+
+Two consequences are deliberate and must not be "fixed" into agreement:
+
+- the panel shows the stereoscope and the camouflage net unconditionally,
+  while the battle waits `activateWhenStillSec`. That is retail behaviour;
+- the panel divides `chassisRotationSpeed` by the average terrain resistance
+  to present one mobility number. The physics keeps the two separate.
+
+Radio range has no battle consumer because this port has no distance-limited
+spotting relay: the server owns visibility for every vehicle in the room, so
+there is nothing for a radio range to gate. The effective distance is printed
+at battle start so the value can still be compared with the panel.
+
+The `PARAMS` lines printed once per battle start carry the effective view
+range, both concealment values, the after-shot factor, reload, aim time,
+dispersion and its four factors, the three traverse speeds in degrees, the
+three terrain resistances, engine power, both speed limits, the repair factor
+and the radio distance, plus a `source=` field that says whether the numbers
+came from the client factor dictionary or from the fallback.
+
 ## Known deterministic parity gaps
 
 The source audit deliberately keeps the following differences visible:
 
 - the offline garage now publishes the complete optional-device and equipment
   catalogue (`items/__init__` item types 9 and 11) with shop prices, unlocks and
-  owned stock, and the battle law applies the reviewed 0.8.2 passive modifiers:
-  ventilation, Brothers in Arms and food move the crew level before the
-  `1 / (0.5 + 0.005 * level)` conversion, a gun rammer scales reload by 0.9, a
-  gun laying drive divides aiming time by 1.1, and a vertical stabiliser, Snap
-  Shot and Smooth Ride damp the dispersion bloom terms (`loadout.py`). What is
+  owned stock, and the battle law consumes the same attribute factors the
+  garage panel consumes, as recorded in the section above. What is
   the account command surface that MOUNTS them is now implemented in
   `account_rpc/garage.py`, which keeps one mutable copy of the bootstrap
   snapshot so the fitting writers share a single live record. The handled

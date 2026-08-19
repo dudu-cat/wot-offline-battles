@@ -74,21 +74,20 @@ class GunState(object):
                 if count > 0:
                     self.shot_index = index
                     break
-        # 0.8.2 converts the crew level through 1/(0.5 + 0.005 * level) and
-        # then applies the gun rammer and gun laying drive.  A bare 100% crew
-        # already yields 0.952; ventilation, Brothers in Arms and rations move
-        # the level before the conversion.
+        # #1513 gives each of these its own crew factor: the loader drives
+        # reload, the gunner drives aiming and dispersion, and the mounted
+        # artefact strength arrives through miscAttrs.
         if loadout_modifiers is None:
             loadout_modifiers = loadout.baseline()
         self.loadout = dict(loadout_modifiers)
         crew_multiplier = _positive(
-            self.loadout.get('crew_multiplier'), 1.0 / (0.5 + 0.005 * 110.0))
-        self.base_dispersion *= crew_multiplier
-        self.aim_time *= crew_multiplier
-        self.reload *= crew_multiplier
-        self.clip_reload *= crew_multiplier
-        self.aim_time *= _positive(self.loadout.get('aim_time_factor'), 1.0)
-        reload_factor = _positive(self.loadout.get('reload_factor'), 1.0)
+            self.loadout.get('crew_multiplier'), 1.0)
+        self.base_dispersion *= _positive(
+            self.loadout.get('dispersion_factor'), crew_multiplier)
+        self.aim_time *= _positive(
+            self.loadout.get('aim_time_factor'), crew_multiplier)
+        reload_factor = _positive(
+            self.loadout.get('reload_factor'), crew_multiplier)
         self.reload *= reload_factor
         self.clip_reload *= reload_factor
         self.clip = 0
