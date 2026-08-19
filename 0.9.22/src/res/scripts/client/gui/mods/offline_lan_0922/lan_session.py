@@ -134,6 +134,8 @@ class LANSession(object):
         self._join_ui = None
         self._picker_open = False
         self._picker_dismissed = False
+        # Only an explicit Battle click may raise the room over the garage.
+        self._picker_requested = False
         self._picker_callback_id = None
         self._picker_close_callback_id = None
         self._battle_start_callback_id = None
@@ -273,6 +275,8 @@ class LANSession(object):
         self._waiting_notice_host_id = None
         self._picker_open = False
         self._picker_dismissed = False
+        # Only an explicit Battle click may raise the room over the garage.
+        self._picker_requested = False
         self._connection_error_notified = False
         self.state = 'ready_to_join'
         if self._join_ui is None:
@@ -331,6 +335,7 @@ class LANSession(object):
         self.revive()
         if not user_requested:
             self._picker_dismissed = True
+            self._picker_requested = False
         sys.stdout.write(
             '[Offline LAN 0.9.22] LAN rejoin requested: %s\n' %
             self._endpoint_value())
@@ -361,6 +366,7 @@ class LANSession(object):
             return True
         if self.client is None:
             self._picker_dismissed = False
+            self._picker_requested = True
             sys.stdout.write(
                 '[Offline LAN 0.9.22] LAN join requested: %s\n' %
                 self._endpoint_value())
@@ -382,6 +388,7 @@ class LANSession(object):
             # An explicit Battle click is the user's request to reopen a room
             # they previously dismissed.
             self._picker_dismissed = False
+            self._picker_requested = True
             self._publish_selected_vehicle()
             if not self._is_local_host():
                 self._show_waiting_notice(force=True)
@@ -688,7 +695,7 @@ class LANSession(object):
             self._picker_callback_id = None
             if (not self._stopped and self.state == 'waiting' and
                     not self._picker_dismissed):
-                self._open_waiting_picker()
+                self._open_waiting_picker('lobby ready')
 
         self._picker_callback_id = self._callback(0.10, retry)
         return True
@@ -732,8 +739,15 @@ class LANSession(object):
         self._schedule_battle_when_lobby_ready()
         return False
 
-    def _open_waiting_picker(self):
+    def _open_waiting_picker(self, reason='battle click'):
+        """Raise the room. Only an explicit Battle click may ask for this.
+
+        Every other caller reached this while the player was in the garage,
+        which is how the room kept appearing over an open maintenance dialog.
+        """
         if self._stopped or self._picker_open or self._picker_dismissed:
+            return False
+        if not self._picker_requested:
             return False
         if not self._lobby_ready():
             self._schedule_picker_when_lobby_ready()
@@ -748,6 +762,9 @@ class LANSession(object):
         if screen is not None:
             screen.open()
         self._picker_open = bool(self._open_surface(surface))
+        if self._picker_open:
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] LAN room opened: %s\n' % reason)
         return self._picker_open
 
     def _open_connection_picker(self):
@@ -795,17 +812,12 @@ class LANSession(object):
 
     def _sync_waiting_surface(self, previous_host_player_id=None):
         if self._is_local_host():
-            if previous_host_player_id != self._host_player_id:
-                # First host election and host transfer are explicit room
-                # ownership changes, so they may present the map picker.
-                self._picker_dismissed = False
             self._waiting_notice_host_id = None
             if (previous_host_player_id is not None and
                     previous_host_player_id != self._host_player_id):
                 self._status_notifier(
                     'You are now the LAN room host. Choose a map to start.')
-            if not self._picker_dismissed:
-                self._open_waiting_picker()
+            self._open_waiting_picker('host election')
             return
         self._show_waiting_notice(
             force=previous_host_player_id != self._host_player_id)
@@ -815,10 +827,9 @@ class LANSession(object):
             else:
                 self._close_picker()
             return
-        if not self._picker_dismissed:
-            # The self-drawn room also presents guests. The stock map window
-            # refuses this call and keeps the notification above.
-            self._open_waiting_picker()
+        # The self-drawn room also presents guests, but a roster update may
+        # never raise it over the garage on its own.
+        self._open_waiting_picker('guest roster')
 
     def _close_picker(self):
         self._cancel_picker_callback()
@@ -970,6 +981,7 @@ class LANSession(object):
                 # Treat the room as dismissed so the waiting roster cannot
                 # reopen it over the garage; only a Battle click reopens it.
                 self._picker_dismissed = True
+                self._picker_requested = False
             if self._start_requested:
                 self.state = 'awaiting_battle_start'
                 return
@@ -1365,6 +1377,8 @@ class LANSession(object):
             self._clear_pending_battle_start()
             self._start_requested = False
             self.state = 'waiting'
+            # The player asked for this start, so its refusal may bring the
+            # room back.  _picker_requested still gates the garage case.
             self._picker_dismissed = False
             self._host_player_id = _message_value(
                 message, 'host_player_id',

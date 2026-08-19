@@ -259,16 +259,21 @@ class WaitingRoomTests(unittest.TestCase):
         self.assertTrue(room.open())
 
         rows = self.module.WaitingRoomUI.POINTER_ROWS
-        self.assertEqual(len(rows), len(room._pointer_parts))
-        tip, tip_x, tip_y, unused_z = room._pointer_parts[0]
+        self.assertEqual(2 * len(rows), len(room._pointer_parts))
+        tip, tip_x, tip_y, unused_z = room._pointer_parts[len(rows)]
         self.assertTrue(tip.properties['visible'])
         # A child's CLIP position is relative to the parent rect, which made
         # the arrow track at half speed; every row is a root instead.
         self.assertIn(tip, surface.roots)
         self.assertNotIn(tip, room._panel.children)
         self.assertEqual('PIXEL', tip.properties['widthMode'])
-        self.assertEqual(
-            self.module.CONTROL_TEXTURE, tip.texture)
+        self.assertEqual(self.module.CONTROL_TEXTURE, tip.texture)
+        outline = room._pointer_parts[0][0]
+        self.assertEqual(self.module.OUTLINE_TEXTURE, outline.texture)
+        self.assertGreater(outline.properties['width'],
+                           tip.properties['width'])
+        self.assertGreater(outline.properties['position'][2],
+                           tip.properties['position'][2])
 
         surface.cursor = (-0.5, 0.25)
         room.move_pointer()
@@ -458,14 +463,29 @@ class NativeCursorSurfaceTests(unittest.TestCase):
         self.assertFalse(cursor.visible)
         self.assertEqual([('setCursor', cursor)], calls)
 
-    def test_hide_cursor_restores_the_device_cursor(self):
+    def test_hide_cursor_puts_back_what_the_lobby_had(self):
         surface, cursor, calls, modules = self._surface()
+        cursor.active, cursor.visible = True, False
 
         with mock.patch.dict(sys.modules, modules):
+            surface.show_cursor()
+            del calls[:]
             self.assertTrue(surface.hide_cursor())
 
+        # Handing back the device cursor left the garage with no pointer.
         self.assertFalse(cursor.visible)
-        self.assertEqual([('setCursor', 'device')], calls)
+        self.assertEqual([('setCursor', cursor)], calls)
+
+    def test_hide_cursor_detaches_when_the_lobby_had_no_cursor(self):
+        surface, cursor, calls, modules = self._surface()
+        cursor.active = False
+
+        with mock.patch.dict(sys.modules, modules):
+            surface.show_cursor()
+            del calls[:]
+            surface.hide_cursor()
+
+        self.assertEqual([('setCursor', None)], calls)
 
     def test_cursor_state_reports_what_the_player_should_see(self):
         surface, cursor, unused_calls, modules = self._surface()
@@ -493,8 +513,13 @@ class RoomTextureTests(unittest.TestCase):
         # be seen needs the one texture this client renders.
         texture = self.module.CONTROL_TEXTURE
         self.assertEqual(texture, self.room._controls['start'].texture)
-        for part, unused_x, unused_y, unused_z in self.room._pointer_parts:
-            self.assertEqual(texture, part.texture)
+        drawn = set(part.texture
+                    for part, unused_x, unused_y, unused_z
+                    in self.room._pointer_parts)
+        # The arrow is a white shape over a black one, so it reads over the
+        # hangar and over the white buttons alike.
+        self.assertEqual(
+            set([texture, self.module.OUTLINE_TEXTURE]), drawn)
 
     def test_button_labels_are_dark_enough_to_read_on_white(self):
         colour = self.module.CONTROL_TEXT_COLOUR

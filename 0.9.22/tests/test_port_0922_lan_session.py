@@ -221,6 +221,9 @@ class LANSessionTests(unittest.TestCase):
             status_notifier=self.statuses.append,
             queue_screen_factory=queue_screen_factory)
         self.assertTrue(self.session.start())
+        # Production only reaches start() from the Battle click, and only that
+        # click may raise the room over the garage.
+        self.session._picker_requested = True
         self.client = self.clients[0]
 
     def emit(self, kind, message):
@@ -514,6 +517,7 @@ class LANSessionTests(unittest.TestCase):
             status_notifier=lambda message: None,
             queue_screen_factory=broken_factory)
         self.assertTrue(session.start())
+        session._picker_requested = True
         clients[0].ready = True
         clients[0].on_event('welcome', {
             'phase': 'waiting', 'map_pool': ['01_karelia']})
@@ -1336,7 +1340,9 @@ class LANSessionTests(unittest.TestCase):
             'map_pool': ['05_prohorovka']})
         self.assertEqual('waiting', self.session.state)
         self.assertIsNone(self.session._departed_round_id)
-        self.assertTrue(self.session._picker_open)
+        # A failed round puts the player back in the GARAGE, so the room waits
+        # for another Battle click instead of raising itself over the hangar.
+        self.assertFalse(self.session._picker_open)
 
     def test_unrestored_runtime_failure_stops_only_lan_owners(self):
         self.emit('battle_start', {
@@ -1938,6 +1944,9 @@ class LANSessionRoomTests(unittest.TestCase):
             vehicle_provider=lambda: ('ussr:R11_MS-1', 90),
             status_notifier=self.statuses.append)
         self.assertTrue(self.session.start())
+        # Production only reaches start() from the Battle click, and only that
+        # click may raise the room over the garage.
+        self.session._picker_requested = True
         self.client = self.clients[0]
 
     def emit(self, kind, message):

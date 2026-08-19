@@ -46,6 +46,9 @@ import time
 # untextured on purpose: a white 680x300 slab would blank out the hangar.
 PANEL_TEXTURE = ''
 CONTROL_TEXTURE = 'system/maps/col_white.dds'
+# misc.pkg ships exactly two solid-colour maps, and colour cannot tint either,
+# so a dark shape has to come from the black one.
+OUTLINE_TEXTURE = 'system/maps/col_black.dds'
 CONTROL_TEXT_COLOUR = (16, 26, 36, 255)
 CONTROL_HOVER_COLOUR = (14, 82, 140, 255)
 PANEL_FONT = 'default_small.font'
@@ -92,6 +95,7 @@ class NativeSurface(object):
         if gui_module is None:
             import GUI as gui_module
         self._gui = gui_module
+        self._saved_cursor = None
 
     def window(self):
         return self._gui.Window(PANEL_TEXTURE)
@@ -129,6 +133,8 @@ class NativeSurface(object):
         """
         import BigWorld
         cursor = self._gui.mcursor()
+        self._saved_cursor = (bool(getattr(cursor, 'active', False)),
+                              getattr(cursor, 'visible', False))
         cursor.visible = False
         BigWorld.setCursor(cursor)
         return True
@@ -157,12 +163,18 @@ class NativeSurface(object):
         return width, height
 
     def hide_cursor(self):
-        """Undo the acquire the way 0.8.2 does, device cursor included."""
+        """Put the cursor back exactly as the lobby had it.
+
+        Handing the device cursor back instead left the garage with no pointer
+        at all: the lobby draws its arrow in Flash over an attached, unpainted
+        mcursor, and it never reattaches one it did not detach.
+        """
         import BigWorld
-        self._gui.mcursor().visible = False
-        restore = getattr(BigWorld, 'dcursor', None)
-        if callable(restore):
-            BigWorld.setCursor(restore())
+        cursor = self._gui.mcursor()
+        active, visible = self._saved_cursor or (True, False)
+        self._saved_cursor = None
+        cursor.visible = visible
+        BigWorld.setCursor(cursor if active else None)
         return True
 
     def tick(self, delay, function):
@@ -413,31 +425,37 @@ class WaitingRoomUI(object):
         A child's CLIP position is relative to the PARENT rect, so a pointer
         parented to the 680 px panel moved at half the mouse displacement in a
         1360 px window.  A root's CLIP position is the screen position.
+
+        A black layer one pixel larger sits behind the white one so the arrow
+        stays readable over the white buttons as well as the hangar.
         """
         if self._pointer_parts:
             return False
         step_x, step_y = self._pixel_step()
-        depth = CONTROL_Z - 2 * CONTROL_FRAME_OFFSET
         parts = []
-        for left, top, width, height in self.POINTER_ROWS:
-            part = self._surface.simple(CONTROL_TEXTURE)
-            for name, value in (
-                    ('horizontalPositionMode', 'CLIP'),
-                    ('verticalPositionMode', 'CLIP'),
-                    ('widthMode', 'PIXEL'), ('heightMode', 'PIXEL'),
-                    ('horizontalAnchor', 'CENTER'),
-                    ('verticalAnchor', 'CENTER'),
-                    ('position', (0.0, 0.0, depth)),
-                    ('width', float(width)), ('height', float(height)),
-                    ('materialFX', 'SOLID'),
-                    ('focus', False), ('mouseButtonFocus', False),
-                    ('crossFocus', False), ('moveFocus', False),
-                    ('visible', False)):
-                self._set(part, name, value)
-            self._surface.add_root(part)
-            # A CENTER anchor puts the component's middle on its position.
-            parts.append((part, (left + width * 0.5) * step_x,
-                          -(top + height * 0.5) * step_y, depth))
+        for texture, grow, depth in (
+                (OUTLINE_TEXTURE, 1.0, CONTROL_Z - CONTROL_FRAME_OFFSET),
+                (CONTROL_TEXTURE, 0.0, CONTROL_Z - 2 * CONTROL_FRAME_OFFSET)):
+            for left, top, width, height in self.POINTER_ROWS:
+                part = self._surface.simple(texture)
+                for name, value in (
+                        ('horizontalPositionMode', 'CLIP'),
+                        ('verticalPositionMode', 'CLIP'),
+                        ('widthMode', 'PIXEL'), ('heightMode', 'PIXEL'),
+                        ('horizontalAnchor', 'CENTER'),
+                        ('verticalAnchor', 'CENTER'),
+                        ('position', (0.0, 0.0, depth)),
+                        ('width', float(width) + 2.0 * grow),
+                        ('height', float(height) + 2.0 * grow),
+                        ('materialFX', 'SOLID'),
+                        ('focus', False), ('mouseButtonFocus', False),
+                        ('crossFocus', False), ('moveFocus', False),
+                        ('visible', False)):
+                    self._set(part, name, value)
+                self._surface.add_root(part)
+                # A CENTER anchor puts the component's middle on its position.
+                parts.append((part, (left + width * 0.5) * step_x,
+                              -(top + height * 0.5) * step_y, depth))
         self._pointer_parts = parts
         resort = getattr(self._surface, 'resort', None)
         if callable(resort):
@@ -572,12 +590,26 @@ class WaitingRoomUI(object):
         show = getattr(surface, 'show_cursor', None)
         if not callable(show):
             return False
+        self._log_cursor('before acquire')
         try:
             show()
         except Exception as error:
             _log('LAN waiting room could not show the cursor: %s' % error)
             return False
         self._cursor_acquired = True
+        self._log_cursor('after acquire')
+        return True
+
+    def _log_cursor(self, moment):
+        """Record the native cursor state around every takeover."""
+        reader = getattr(self._surface, 'cursor_state', None)
+        if not callable(reader):
+            return False
+        try:
+            _log('LAN room cursor %s: %r' % (moment, reader()))
+        except Exception as error:
+            _log('LAN room cursor %s unreadable: %s' % (moment, error))
+            return False
         return True
 
     def _release_cursor(self):
@@ -592,6 +624,7 @@ class WaitingRoomUI(object):
         except Exception as error:
             _log('LAN waiting room could not release the cursor: %s' % error)
             return False
+        self._log_cursor('after release')
         return True
 
     def refresh(self):

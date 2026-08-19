@@ -3,7 +3,10 @@
 from __future__ import print_function
 
 import sys
+import time
 import traceback
+
+_clock = getattr(time, 'perf_counter', None) or time.clock
 
 from gui.mods.offline_lan_0922.account_rpc import commands
 from gui.mods.offline_lan_0922.account_rpc import data
@@ -37,26 +40,50 @@ def _fitting(context, mutate):
     reshaped inventory section reuses the same builder a full sync uses, so the
     pushed diff and a later re-sync can never disagree.
     """
+    started = _clock()
     state = _garage(context)
     try:
         mutate(state)
     except garage.GarageError as error:
         return Result(commands.RES_FAILURE, str(error))
     context['selected_vehicle'] = state.snapshot()
+    mutated = _clock()
     store = context.get('garage_store')
     if store is not None:
         # A fitting happens at click speed, so saving on each accepted change
         # costs nothing and a hard client kill cannot lose an applied change.
         store.mark_dirty()
         store.flush(state.snapshot())
+    saved = _clock()
     push = context.get('push_update')
     if not callable(push):
+        _report_fitting_cost(started, mutated, saved, saved, None)
         return Result(commands.RES_SUCCESS)
 
     def publish():
-        push(data.inventory(state.snapshot()))
+        diff = data.inventory(state.snapshot())
+        built = _clock()
+        push(diff)
+        _report_fitting_cost(started, mutated, saved, built, diff)
 
     return Result(commands.RES_SUCCESS, before_response=publish)
+
+
+def _report_fitting_cost(started, mutated, saved, built, diff):
+    """Log where a garage click spends its time, and how big the diff is."""
+    items = 0
+    if isinstance(diff, dict):
+        for section in (diff.get('inventory') or {}).values():
+            if isinstance(section, dict):
+                for value in section.values():
+                    items += len(value) if hasattr(value, '__len__') else 1
+    finished = _clock()
+    sys.stdout.write(
+        '[Offline LAN 0.9.22] garage command ms mutate=%.1f save=%.1f '
+        'build=%.1f publish=%.1f total=%.1f diff_items=%d\n' % (
+            (mutated - started) * 1000.0, (saved - mutated) * 1000.0,
+            (built - saved) * 1000.0, (finished - built) * 1000.0,
+            (finished - started) * 1000.0, items))
 
 
 def _equip_equipments(context, args):

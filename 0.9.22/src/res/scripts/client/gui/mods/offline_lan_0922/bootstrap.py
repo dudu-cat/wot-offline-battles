@@ -584,6 +584,15 @@ def _wait_for_login_space():
         # cached callback.  Own the action before connect creates the lobby.
         _install_announcement_ui()
         _install_lan_session()
+        try:
+            # This must outlive every connect/disconnect: it decides which
+            # preferences profile the player's interface settings live in.
+            from gui.mods.offline_lan_0922 import compat as _compat
+            _compat.pin_account_settings()
+        except Exception as error:
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] interface settings were not pinned: '
+                '%s\n' % error)
         g_compatibility.connect(
             show_lobby=True, account_context=_account_context)
         _schedule(0.10, _wait_for_lobby)

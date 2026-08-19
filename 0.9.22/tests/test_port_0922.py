@@ -4170,26 +4170,32 @@ class OfflineCompatibilityTests(unittest.TestCase):
         # which offline differs between the lobby account, the LAN roster name
         # in battle and the empty pre-login state.
         compatibility_module = _load_port_source('compat')
-        runtime, _ = self._runtime()
-        settings_type = sys.modules[
-            'account_helpers.AccountSettings'].AccountSettings
+        settings_module = sys.modules['account_helpers.AccountSettings']
+        settings_type = settings_module.AccountSettings
         original = settings_type.__dict__['_AccountSettings__readUserSection']
-        compatibility = compatibility_module.OfflineCompatibility(runtime)
-        compatibility.install()
+
+        self.assertTrue(
+            compatibility_module.pin_account_settings(settings_module))
 
         section = settings_type._AccountSettings__readUserSection()
-        self.assertEqual(
-            'offline_account', section.readString('login'))
+        self.assertEqual('offline_account', section.readString('login'))
         self.assertEqual(['convert', 'invalidate'], settings_type.converted)
         settings_type._AccountSettings__cache['login'] = 'Player-1'
         self.assertIs(
             section, settings_type._AccountSettings__readUserSection())
         self.assertEqual(
-            1, len([key for key, _ in self.preferences.items()
+            1, len([key for key, unused in self.preferences.items()
                     if key == 'account']))
-
+        # The pin must outlive every connect/disconnect: an earlier build
+        # installed it with the rest of the layer, so a battle removed it.
+        self.assertIsNot(
+            original,
+            settings_type.__dict__['_AccountSettings__readUserSection'])
+        compatibility = compatibility_module.OfflineCompatibility(
+            self._runtime()[0])
+        compatibility.install()
         compatibility.fini()
-        self.assertIs(
+        self.assertIsNot(
             original,
             settings_type.__dict__['_AccountSettings__readUserSection'])
 
