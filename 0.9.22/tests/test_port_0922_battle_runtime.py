@@ -11669,6 +11669,8 @@ class DescriptorReuseTests(unittest.TestCase):
 
         runtime = BattleRuntime.__new__(BattleRuntime)
         runtime._descriptor_cache = {}
+        runtime._prepared_vehicle_names = []
+        runtime._unusable_vehicles_reported = set()
         runtime._config = {'vehicle': 'ussr:T-34'}
         runtime._runtime = types.SimpleNamespace(vehicles=_Vehicles)
         runtime._remote_factory = types.SimpleNamespace(
@@ -11681,6 +11683,91 @@ class DescriptorReuseTests(unittest.TestCase):
         self.assertIs(first, second)
         self.assertIsNot(first, other)
         self.assertEqual(['ussr:T-34', 'germany:PzVI'], built)
+
+
+class UnusableVehicleTests(unittest.TestCase):
+    """A vehicle this client cannot load must not cost the round."""
+
+    def _battle(self, broken_name):
+        def VehicleDescr(typeName=None, compactDescr=None):
+            return _Descriptor(typeName or compactDescr, loaded=True)
+
+        def prepare_descriptor(descriptor):
+            if descriptor.name == broken_name:
+                raise RuntimeError(
+                    '#1513 vehicle hit tester BSP load failed: wrong '
+                    'collision model')
+            return descriptor
+
+        battle = BattleRuntime.__new__(BattleRuntime)
+        battle._descriptor_cache = {}
+        battle._prepared_vehicle_names = []
+        battle._unusable_vehicles_reported = set()
+        battle._config = {'vehicle': 'ussr:R11_MS-1'}
+        battle._runtime = types.SimpleNamespace(
+            vehicles=types.SimpleNamespace(VehicleDescr=VehicleDescr))
+        battle._remote_factory = types.SimpleNamespace(
+            prepare_descriptor=prepare_descriptor)
+        return battle
+
+    def test_baked_blacklist_keeps_an_unloadable_type_out_of_the_lineup(self):
+        name = sorted(
+            battle_runtime_module.vehicle_blacklist.UNUSABLE_VEHICLES)[0]
+        entry = types.SimpleNamespace(name=name, level=8, tags=('heavyTank',))
+
+        self.assertTrue(BattleRuntime._vehicle_excluded(entry))
+        self.assertFalse(BattleRuntime._vehicle_excluded(
+            types.SimpleNamespace(
+                name='ussr:R11_MS-1', level=1, tags=('lightTank',))))
+
+    def test_a_failed_bot_descriptor_yields_a_full_battle_on_a_substitute(self):
+        battle = self._battle('germany:broken')
+        roster = [
+            {'id': 11, 'team': 1, 'slot': 0, 'vehicle': 'ussr:R11_MS-1'},
+            {'id': 12, 'team': 2, 'slot': 0, 'vehicle': 'germany:broken'},
+            {'id': 13, 'team': 2, 'slot': 1, 'vehicle': 'ussr:T-34'},
+        ]
+        bots = bot_runtime.BotRuntime(
+            1, descriptor_resolver=battle._resolve_descriptor,
+            vehicle_selector=lambda raw: raw['vehicle'],
+            spawn_resolver=lambda team, slot: ((0.0, 0.0, 0.0), 0.0),
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
+            baked_graph=_runtime().navigation_graph_loader('01_karelia'))
+
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            bots.battle_start({
+                'round_id': 7, 'map': '01_karelia', 'bot_authority_id': 1,
+                'bots': roster})
+
+        self.assertEqual([11, 12, 13], sorted(bots.states))
+        self.assertEqual(
+            'ussr:R11_MS-1', bots._descriptors[12].name)
+        self.assertIn('germany:broken cannot be loaded', log.getvalue())
+
+    def test_a_bot_keeps_its_slot_empty_when_no_substitute_loads(self):
+        battle = self._battle('germany:broken')
+        battle._remote_factory = types.SimpleNamespace(
+            prepare_descriptor=lambda descriptor: (_ for _ in ()).throw(
+                RuntimeError('#1513 vehicle hit tester BSP load failed')))
+        bots = bot_runtime.BotRuntime(
+            1, descriptor_resolver=battle._resolve_descriptor,
+            vehicle_selector=lambda raw: raw['vehicle'],
+            spawn_resolver=lambda team, slot: ((0.0, 0.0, 0.0), 0.0),
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
+            baked_graph=_runtime().navigation_graph_loader('01_karelia'))
+
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            bots.battle_start({
+                'round_id': 7, 'map': '01_karelia', 'bot_authority_id': 1,
+                'bots': [{'id': 12, 'team': 2, 'slot': 0,
+                          'vehicle': 'germany:broken'}]})
+
+        self.assertEqual([], sorted(bots.states))
+        self.assertIn('bot 12 dropped', log.getvalue())
 
 
 class LocalBattleDescriptorTests(unittest.TestCase):

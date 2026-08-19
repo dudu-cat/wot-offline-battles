@@ -11,6 +11,8 @@ value is a plain JSON type; interpretation of #1513 data stays here.
 
 import math
 
+from gui.mods.offline_lan_0922 import vehicle_blacklist
+
 
 def _value(source, name, default=None):
     """Read a #1513 component attribute or mapping key."""
@@ -198,7 +200,7 @@ def vehicle_catalog(runtime):
         entries = iterator() if callable(iterator) else values.values()
         for entry in entries:
             name = str(_value(entry, 'name', '') or '')
-            if not name:
+            if not name or vehicle_blacklist.is_unusable(name):
                 continue
             try:
                 level = int(_value(entry, 'level', 1) or 1)

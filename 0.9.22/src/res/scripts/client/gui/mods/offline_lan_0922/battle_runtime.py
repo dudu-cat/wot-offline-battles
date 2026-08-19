@@ -33,8 +33,8 @@ from gui.mods.offline_lan_0922.spawn_planner import SpawnPlanner
 from gui.mods.offline_lan_0922 import (
     combat_rules, critical_damage, destructibles_compat, gun_mechanics,
     loadout as loadout_law, prebaked_destructibles, prebaked_foliage,
-    prebaked_navigation, spotting, tank_collision, vehicle_physics,
-    world_collision)
+    prebaked_navigation, spotting, tank_collision, vehicle_blacklist,
+    vehicle_physics, world_collision)
 
 
 # BigWorld callbacks run on rendered frames.  The mature 0.8.2 battle asks for
@@ -929,6 +929,8 @@ class BattleRuntime(object):
         self._server = None
         self._remote_factory = None
         self._descriptor_cache = {}
+        self._prepared_vehicle_names = []
+        self._unusable_vehicles_reported = set()
         self._sender = None
         self._sync = None
         self._bots = None
@@ -2690,6 +2692,23 @@ class BattleRuntime(object):
         cached = self._descriptor_cache.get(vehicle_name)
         if cached is not None:
             return cached
+        failure = None
+        for candidate in self._descriptor_candidates(vehicle_name):
+            try:
+                prepared = self._prepare_vehicle_descriptor(candidate)
+            except Exception as error:
+                failure = error
+                self._report_unusable_vehicle(candidate, error)
+                continue
+            self._descriptor_cache[vehicle_name] = prepared
+            if candidate not in self._prepared_vehicle_names:
+                self._prepared_vehicle_names.append(candidate)
+            return prepared
+        raise RuntimeError(
+            '#1513 vehicle %r has no loadable substitute: %s' %
+            (vehicle_name, failure))
+
+    def _prepare_vehicle_descriptor(self, vehicle_name):
         try:
             descriptor = self._runtime.vehicles.VehicleDescr(
                 typeName=vehicle_name)
@@ -2699,9 +2718,29 @@ class BattleRuntime(object):
         if self._remote_factory is None:
             raise RuntimeError(
                 '#1513 vehicle descriptor geometry owner is unavailable')
-        prepared = self._remote_factory.prepare_descriptor(descriptor)
-        self._descriptor_cache[vehicle_name] = prepared
-        return prepared
+        return self._remote_factory.prepare_descriptor(descriptor)
+
+    def _descriptor_candidates(self, vehicle_name):
+        """Yield the requested vehicle, then this round's proven substitutes.
+
+        The baked blacklist keeps unloadable types out of the lineup already.
+        This is the safety net for a type it does not cover: the slot keeps a
+        tank instead of the round failing.
+        """
+        offered = []
+        for name in ([vehicle_name] + list(self._prepared_vehicle_names) +
+                     [self._config.get('vehicle')]):
+            if name and name not in offered:
+                offered.append(name)
+                yield name
+
+    def _report_unusable_vehicle(self, vehicle_name, error):
+        if vehicle_name in self._unusable_vehicles_reported:
+            return
+        self._unusable_vehicles_reported.add(vehicle_name)
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] vehicle %s cannot be loaded, substituting: '
+            '%s\n' % (vehicle_name, error))
 
     def _select_bot_vehicle(self, raw):
         requested = raw.get('vehicle')
@@ -2716,7 +2755,10 @@ class BattleRuntime(object):
         tags = _field(entry, 'tags', ()) or ()
         if 'secret' in tags:
             return True
-        return _field(entry, 'name') == 'usa:T23'
+        name = _field(entry, 'name')
+        if vehicle_blacklist.is_unusable(name):
+            return True
+        return name == 'usa:T23'
 
     @staticmethod
     def _vehicle_class_order(entry):
@@ -10564,6 +10606,8 @@ class BattleRuntime(object):
                     cleanup_error = error
             self._remote_factory = None
         self._descriptor_cache = {}
+        self._prepared_vehicle_names = []
+        self._unusable_vehicles_reported = set()
         self._records = {}
         _release_layout_caches()
         if self._map_create_attempted:

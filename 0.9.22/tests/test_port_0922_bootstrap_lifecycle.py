@@ -7,9 +7,20 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
-BOOTSTRAP = (ROOT / '0.9.22' / 'src' / 'res' / 'scripts' /
-             'client' / 'gui' / 'mods' / 'offline_lan_0922' /
-             'bootstrap.py')
+PACKAGE_ROOT = (ROOT / '0.9.22' / 'src' / 'res' / 'scripts' /
+                'client' / 'gui' / 'mods' / 'offline_lan_0922')
+BOOTSTRAP = PACKAGE_ROOT / 'bootstrap.py'
+
+
+def _real_module(name):
+    spec = importlib.util.spec_from_file_location(
+        'gui.mods.offline_lan_0922.' + name, PACKAGE_ROOT / (name + '.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+VEHICLE_BLACKLIST = _real_module('vehicle_blacklist')
 
 
 MAX_SKILL_LEVEL = 100
@@ -182,6 +193,7 @@ class BootstrapLifecycleTests(unittest.TestCase):
                         _part(base + 13, 5, guns)]]
             vehicle_type = types.SimpleNamespace(
                 id=(nation_id, vehicle_type_id),
+                name='nation-%d:vehicle-%d' % (nation_id, vehicle_type_id),
                 crewRoles=(('commander',), ('driver',)),
                 tags=frozenset(tags),
                 chassis=[_part(base + 2, 2), _part(base + 12, 5)],
@@ -360,6 +372,7 @@ class BootstrapLifecycleTests(unittest.TestCase):
             'gui.mods.offline_lan_0922.config': config_module,
             'gui.mods.offline_lan_0922.lan_session': lan_session_module,
             'gui.mods.offline_lan_0922.lobby_ui': lobby_ui_module,
+            'gui.mods.offline_lan_0922.vehicle_blacklist': VEHICLE_BLACKLIST,
             'gui.app_loader': app_loader_module,
             'gui.app_loader.settings': settings_module,
             'items': items,
@@ -425,6 +438,22 @@ class BootstrapLifecycleTests(unittest.TestCase):
         for record in selected['vehicles']:
             key = record['shellsLayoutIdx']
             self.assertEqual({key: record['shells']}, record['shellsLayout'])
+
+    def test_the_garage_never_offers_a_vehicle_the_client_cannot_load(self):
+        (bootstrap, unused_callbacks, unused_compatibility,
+         unused_app_loader, unused_spaces, unused_events,
+         modules) = self._load()
+
+        with mock.patch.dict(sys.modules, modules), \
+                mock.patch.dict(
+                    VEHICLE_BLACKLIST.UNUSABLE_VEHICLES,
+                    {'nation-0:vehicle-12': ('vehicles/x/collision_client/'
+                                             'Hull.model',)}):
+            selected = bootstrap._selected_vehicle(
+                {'vehicle': 'ussr:R11_MS-1'})
+
+        self.assertEqual({90011, 91007},
+                         selected['vehicleTypeCompactDescrs'])
 
     def test_selected_vehicle_snapshot_is_relationally_complete(self):
         (bootstrap, unused_callbacks, unused_compatibility,

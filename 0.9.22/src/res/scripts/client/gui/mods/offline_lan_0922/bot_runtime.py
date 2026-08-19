@@ -4,6 +4,7 @@ from __future__ import print_function
 
 import math
 import random
+import sys
 
 from gui.mods.offline_lan_0922.ai.adapter import BotAdapter
 from gui.mods.offline_lan_0922.ai import maps as tactical_maps
@@ -1444,7 +1445,15 @@ class BotRuntime(object):
                 continue
             bot_id = int(raw['id'])
             vehicle_name = self.vehicle_selector(raw)
-            descriptor = self.descriptor_resolver(vehicle_name)
+            try:
+                descriptor = self.descriptor_resolver(vehicle_name)
+            except Exception as error:
+                # A vehicle this client cannot build is a roster problem, not
+                # an authority one.  Leave the slot empty and keep the round.
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] bot %d dropped, vehicle %s is '
+                    'unusable: %s\n' % (bot_id, vehicle_name, error))
+                continue
             half_length, half_width = _hull_dimensions(descriptor)
             self._descriptors.setdefault(bot_id, descriptor)
             self._gun_yaw_limits.setdefault(

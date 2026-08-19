@@ -7,6 +7,7 @@ import BigWorld
 
 from gui.mods.offline_lan_0922.compat import g_compatibility
 from gui.mods.offline_lan_0922 import config as port_config
+from gui.mods.offline_lan_0922 import vehicle_blacklist
 from gui.mods.offline_lan_0922.account_rpc.state import AccountState
 
 
@@ -297,6 +298,12 @@ def _selected_vehicle(config):
                         descriptor.type.tags):
                     raise ValueError(
                         'vehicle type is not available in standard battles')
+                if vehicle_blacklist.is_unusable(descriptor.type.name):
+                    raise ValueError(
+                        'this client has no resources for %s: %s' % (
+                            descriptor.type.name, ', '.join(
+                                vehicle_blacklist.missing_resources(
+                                    descriptor.type.name))))
                 _install_top_modules(descriptor)
                 # generateTankmen filters this mask through each crew role;
                 # only the commander receives the offline Sixth Sense perk.
