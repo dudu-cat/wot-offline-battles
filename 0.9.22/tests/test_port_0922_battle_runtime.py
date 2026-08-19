@@ -6663,6 +6663,64 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(0.0, hard_battle._local_speed)
         self.assertEqual(5, hard_probe.call_count)
 
+    def test_crushed_destructible_costs_no_speed_and_names_the_path(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(2, 3, 4), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = types.SimpleNamespace(
+            forward=1.0, turn=0.0, handbrake=False,
+            send_current=mock.Mock(return_value=True))
+        battle._local_position = (2.0, 3.0, 4.0)
+        battle._local_descriptor = entity.typeDescriptor
+        battle._attach_local_presentation()
+        battle._destructibles = mock.Mock()
+        battle._destructibles._catalog_motion_blocked.return_value = {
+            'status': 'crushed',
+            'token': ((22, 37, None),),
+            'accepted_now': True,
+            'used_kinetic_speed': False,
+            'kinds': 'structure',
+        }
+        battle._smoothed_drive_pitch = mock.Mock(return_value=0.0)
+        battle._update_vertical_motion = mock.Mock(
+            side_effect=lambda unused_entity, position, unused_yaw,
+            unused_dt: position)
+        battle._ground_pitch = mock.Mock(return_value=0.0)
+        battle._apply_slope_slide = mock.Mock(
+            side_effect=lambda position, unused_yaw, unused_dt,
+            unused_entity=None: position)
+        battle._resolve_local_tank_contacts = mock.Mock(
+            side_effect=lambda unused_entity, position, unused_yaw,
+            unused_dt: position)
+        written = []
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.longitudinal_step', return_value=8.0), \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'vehicle_physics.traverse_step', return_value=0.0), \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'world_collision.check_horizontal_collision',
+                    return_value='clear'), \
+                mock.patch.object(sys, 'stdout') as stdout:
+            stdout.write = written.append
+            battle._drive_local(0.1)
+
+        self.assertEqual(8.0, battle._local_speed)
+        self.assertGreater(battle._local_position[2], 4.0)
+        self.assertEqual(
+            ['[Offline LAN 0.9.22] CRUSH who=local kind=structure '
+             'status=crushed path=advance v0=8.00 v1=8.00\n'],
+            [line for line in written if 'CRUSH' in line])
+
     def test_player_cap_crush_restores_real_speed_then_moves_next_tick(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)

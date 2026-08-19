@@ -3210,6 +3210,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             'token': ((22, 37, None),),
             'accepted_now': False,
             'used_kinetic_speed': False,
+            'kinds': 'fragile',
         }, detail)
         authority.destroy_fragile.assert_not_called()
         authority.destroy_module.assert_not_called()
@@ -3227,6 +3228,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             'token': ((22, 37, None),),
             'accepted_now': True,
             'used_kinetic_speed': True,
+            'kinds': 'fragile',
         }, detail)
         authority.destroy_fragile.assert_called_once()
         authority.destroy_module.assert_not_called()
@@ -3312,13 +3314,6 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
     def test_stationary_kinetic_gate_fails_closed_for_non_fragile_contacts(self):
         cases = (
             ('falling', [{'kind': 'falling'}]),
-            ('multi-module', [{
-                'kind': 'structure',
-                'boxes': [
-                    [-1.0, -0.2, -0.5, 1.0, 2.0, 0.5, 73],
-                    [-1.0, -0.2, -0.4, 1.0, 2.0, 0.6, 74],
-                ],
-            }]),
             ('mixed-hard', [{}, {'health': 100, 'x': 0.5}]),
         )
         for name, specs in cases:
@@ -3330,7 +3325,21 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 authority.destroy_module.assert_not_called()
                 authority.destroy_column.assert_not_called()
 
-    def test_catalog_motion_contact_blocks_until_native_hide_deadline(self):
+    def test_stationary_multi_module_structure_crushes_each_module(self):
+        detail, authority, unused_descriptor = (
+            self._stationary_contact_status([{
+                'kind': 'structure',
+                'boxes': [
+                    [-1.0, -0.2, -0.5, 1.0, 2.0, 0.5, 73],
+                    [-1.0, -0.2, -0.4, 1.0, 2.0, 0.6, 74],
+                ],
+            }], return_detail=True, kinetic_commit=True))
+
+        self.assertEqual('crushed', detail['status'])
+        self.assertEqual('structure', detail['kinds'])
+        self.assertEqual(2, authority.destroy_module.call_count)
+
+    def test_catalog_motion_contact_clears_once_the_item_is_broken(self):
         destructibles_sensor.xrange = range
         filename = 'content/GatesAndFences/test/normal/lod0/fence.model'
         destructibles_sensor.set_catalog(_catalog({
@@ -3396,23 +3405,26 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 mock.patch.object(
                     destructibles_sensor, '_get_destr_authority',
                     return_value=authority):
-            self.assertTrue(destructibles_sensor._catalog_motion_blocked(
-                1, _Vector(), 0.0, 1.0, descriptor, 10.0))
             self.assertEqual('hard',
                 destructibles_sensor._catalog_motion_blocked(
                     1, _Vector(), 0.0, 1.0, descriptor, 10.0,
                     return_status=True))
             self.assertEqual([], calls)
-            self.assertTrue(destructibles_sensor._catalog_motion_blocked(
-                1, _Vector(), 0.0, 10.0, descriptor, 11.0))
-            self.assertTrue(destructibles_sensor._catalog_motion_blocked(
-                1, _Vector(), 0.0, 10.0, descriptor, 11.199))
-            self.assertFalse(destructibles_sensor._catalog_motion_blocked(
-                1, _Vector(), 0.0, 10.0, descriptor, 11.2))
+            self.assertEqual('crushed',
+                destructibles_sensor._catalog_motion_blocked(
+                    1, _Vector(), 0.0, 10.0, descriptor, 11.0,
+                    return_status=True))
+            # #1513 reports the item broken from here on, so it never resists
+            # again - not while its skin hides, and not afterwards.
+            for moment in (11.0, 11.199, 11.2, 30.0):
+                self.assertEqual('crushed',
+                    destructibles_sensor._catalog_motion_blocked(
+                        1, _Vector(), 0.0, 1.0, descriptor, moment,
+                        return_status=True))
 
         self.assertEqual(1, len(calls))
 
-    def test_catalog_motion_contact_fails_closed_on_structure_ambiguity(self):
+    def test_catalog_motion_contact_blocks_on_one_hard_structure_module(self):
         destructibles_sensor.xrange = range
         filename = 'content/Buildings/test/normal/lod0/shed.model'
         destructibles_sensor.set_catalog(_catalog({
@@ -3453,7 +3465,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             unitVehicleMass=10000.0,
             getDescByFilename=lambda unused: {
                 'type': 4, 'modules': {
-                    73: {'health': 5}, 74: {'health': 5}}})
+                    73: {'health': 5}, 74: {'health': 100000}}})
         cache = types.ModuleType('DestructiblesCache')
         cache.scaledDestructibleHealth = lambda scale, health: scale * health
         math_module = types.ModuleType('Math')
@@ -3554,7 +3566,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             destructibles_sensor.reset(1)
         self.assertNotIn('g_offh_destr_pending', destructibles_sensor.__dict__)
 
-    def test_destroyed_column_retires_synthetic_obb_at_touchdown(self):
+    def test_felled_column_never_blocks_and_keeps_its_resting_obb(self):
         destructibles_sensor.xrange = range
         filename = 'content/Environment/test/normal/lod0/pole.model'
         destructibles_sensor.set_catalog(_catalog({
@@ -3642,8 +3654,10 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 mock.patch.object(
                     destructibles_sensor, '_get_destr_authority',
                     return_value=authority):
-            self.assertTrue(destructibles_sensor._catalog_motion_blocked(
-                1, _Vector(), 0.0, 11.5, descriptor, 10.0))
+            self.assertEqual('crushed',
+                destructibles_sensor._catalog_motion_blocked(
+                    1, _Vector(), 0.0, 11.5, descriptor, 10.0,
+                    return_status=True))
             self.assertNotIn(
                 (22, 37, None),
                 getattr(destructibles_sensor, 'g_offh_destr_pending', {}))
@@ -3659,22 +3673,31 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             self.assertEqual(
                 old_bins, destructibles_sensor.g_offh_destr_contact_bins)
             current[0] = initial_matrix
-            self.assertTrue(destructibles_sensor._catalog_motion_blocked(
-                1, _Vector(), 0.0, 11.5, descriptor, 10.04))
+            self.assertEqual('crushed',
+                destructibles_sensor._catalog_motion_blocked(
+                    1, _Vector(), 0.0, 11.5, descriptor, 10.04,
+                    return_status=True))
             current[0] = _ItemMatrix(_Vector(20.0, 0.0, 4.0))
-            self.assertFalse(destructibles_sensor._catalog_motion_blocked(
-                1, _Vector(), 0.0, 11.5, descriptor, 10.06))
+            self.assertEqual('clear',
+                destructibles_sensor._catalog_motion_blocked(
+                    1, _Vector(), 0.0, 11.5, descriptor, 10.06,
+                    return_status=True))
             del area.g_destructiblesAnimator._DestructiblesAnimator__bodies[0][
                 'touchdownCallback']
             current[0] = _ItemMatrix(_Vector(0.0, 0.0, 4.0))
-            self.assertFalse(destructibles_sensor._catalog_motion_blocked(
-                1, _Vector(), 0.0, 11.5, descriptor, 10.08))
-            self.assertFalse(any(
+            # The resting OBB stays indexed so the ray seam can still name the
+            # felled column; a broken column never blocks either way.
+            self.assertEqual('crushed',
+                destructibles_sensor._catalog_motion_blocked(
+                    1, _Vector(), 0.0, 11.5, descriptor, 10.08,
+                    return_status=True))
+            self.assertTrue(any(
                 (22, 37) in members for members in
                 destructibles_sensor.g_offh_destr_contact_bins.values()))
-            current[0] = _ItemMatrix(_Vector(20.0, 0.0, 4.0))
-            self.assertFalse(destructibles_sensor._catalog_motion_blocked(
-                1, _Vector(), 0.0, 11.5, descriptor, 11.0))
+            self.assertEqual('crushed',
+                destructibles_sensor._catalog_motion_blocked(
+                    1, _Vector(), 0.0, 11.5, descriptor, 11.0,
+                    return_status=True))
 
         self.assertEqual(1, len(calls))
         self.assertNotIn(

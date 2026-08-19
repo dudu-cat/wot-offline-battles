@@ -969,6 +969,11 @@ class BattleRuntime(object):
         self._local_grind = 0
         self._local_motion_soft_block = False
         self._local_motion_cap_crushed = False
+        self._local_motion_kinds = '-'
+        self._local_motion_status = 'clear'
+        self._bot_motion_kinds = {}
+        self._crush_reports = 0
+        self._next_crush_report = {}
         self._soft_static_recast_budget = [BOT_SOFT_RECAST_BUDGET]
         self._local_vertical_speed = 0.0
         self._local_airborne = False
@@ -1135,6 +1140,11 @@ class BattleRuntime(object):
         self._local_grind = 0
         self._local_motion_soft_block = False
         self._local_motion_cap_crushed = False
+        self._local_motion_kinds = '-'
+        self._local_motion_status = 'clear'
+        self._bot_motion_kinds = {}
+        self._crush_reports = 0
+        self._next_crush_report = {}
         self._soft_static_recast_budget = [BOT_SOFT_RECAST_BUDGET]
         self._local_vertical_speed = 0.0
         self._local_airborne = False
@@ -1982,6 +1992,7 @@ class BattleRuntime(object):
                 bounds=getattr(self._spawn_planner, 'bounds', None),
                 cover_probe=self._sample_bot_cover,
                 motion_resolver=self._resolve_bot_motion,
+                motion_report=self._report_bot_destructible_contact,
                 world_receipt_probe=self._direction_world_receipt,
                 baked_graph=self._navigation_graph,
                 # Keep the mature 0.8.2 authority model: the copied physics
@@ -7475,6 +7486,43 @@ class BattleRuntime(object):
                   else 0.5 * math.sqrt(length ** 2 + width ** 2))
         return math.degrees(math.atan2(radius, distance))
 
+    _CRUSH_REPORT_LIMIT = 80
+    _CRUSH_REPORT_SECONDS = 0.1
+    _BOT_CONTACT_PATHS = {
+        'clear': 'advance',
+        'crushed': 'advance',
+        'soft': 'soft_hold',
+        'cap_crushed': 'cap_hold',
+        'hard': 'brake',
+    }
+
+    def _report_destructible_contact(self, who, kinds, status, path,
+                                     before, after, now):
+        """Name the item and the code path that changed a contact speed."""
+        if not kinds or kinds == '-':
+            return False
+        if self._crush_reports >= self._CRUSH_REPORT_LIMIT:
+            return False
+        if now < self._next_crush_report.get(who, 0.0):
+            return False
+        self._next_crush_report[who] = now + self._CRUSH_REPORT_SECONDS
+        self._crush_reports += 1
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] CRUSH who=%s kind=%s status=%s path=%s '
+            'v0=%.2f v1=%.2f\n' % (
+                who, kinds, status, path, float(before), float(after)))
+        return True
+
+    def _report_bot_destructible_contact(self, bot_id, status, before, after):
+        """Bot-side seam for the same contact-speed diagnostic."""
+        if status == 'clear':
+            return False
+        return self._report_destructible_contact(
+            'bot:%s' % int(bot_id),
+            self._bot_motion_kinds.get(int(bot_id), '-'), status,
+            self._BOT_CONTACT_PATHS.get(status, status),
+            before, after, self._clock())
+
     _EDGE_REPORT_LIMIT = 80
 
     def _report_edge(self, message):
@@ -7818,6 +7866,8 @@ class BattleRuntime(object):
         """Thin tuple-to-Vector adapter around the copied 0.8.2 probe."""
         self._local_motion_soft_block = False
         self._local_motion_cap_crushed = False
+        self._local_motion_kinds = '-'
+        self._local_motion_status = 'clear'
         kinetic_speed = None
         if allow_crush_drive and not self._local_airborne:
             params = self._local_physics or vehicle_physics.derive_params(
@@ -7833,11 +7883,17 @@ class BattleRuntime(object):
         if isinstance(world_status, bool):
             world_status = 'hard' if world_status else 'clear'
         if world_status == 'hard':
-            if (self._destructibles is not None and
-                    self._destructibles._catalog_pending_at_hull(
+            if self._destructibles is not None:
+                if self._destructibles._catalog_pending_at_hull(
                         self._vector(position), yaw, speed,
-                        entity.typeDescriptor, self._clock(), dt)):
-                self._local_motion_soft_block = True
+                        entity.typeDescriptor, self._clock(), dt):
+                    self._local_motion_soft_block = True
+                    self._local_motion_kinds = 'broken'
+                elif self._destructibles._catalog_hull_contact(
+                        self._vector(position), yaw, speed,
+                        entity.typeDescriptor, dt):
+                    self._local_motion_kinds = 'world'
+            self._local_motion_status = 'hard'
             return False
         if self._destructibles is None:
             return world_status == 'clear'
@@ -7860,6 +7916,8 @@ class BattleRuntime(object):
         if status not in ('clear', 'crushed', 'soft', 'hard', 'approach'):
             raise RuntimeError(
                 'local motion resolver returned an invalid status')
+        self._local_motion_kinds = str(detail.get('kinds', '-'))
+        self._local_motion_status = status
         if status == 'hard':
             return False
         used_kinetic_speed = bool(detail.get('used_kinetic_speed', False))
@@ -7922,10 +7980,12 @@ class BattleRuntime(object):
             True, allow_crush_drive, kinetic_speed)
         if isinstance(world_status, bool):
             world_status = 'hard' if world_status else 'clear'
+        self._bot_motion_kinds[int(bot_id)] = '-'
         if world_status == 'hard':
             if (self._destructibles is not None and
                     self._destructibles._catalog_pending_at_hull(
                         pos, yaw, speed, descriptor, now, dt)):
+                self._bot_motion_kinds[int(bot_id)] = 'broken'
                 return 'soft'
             return 'hard'
         if self._destructibles is None:
@@ -7949,6 +8009,7 @@ class BattleRuntime(object):
         if status not in ('clear', 'crushed', 'soft', 'hard', 'approach'):
             raise RuntimeError(
                 'bot motion resolver returned an invalid status')
+        self._bot_motion_kinds[int(bot_id)] = str(detail.get('kinds', '-'))
         if status == 'hard':
             return 'hard'
         used_kinetic_speed = bool(detail.get('used_kinetic_speed', False))
@@ -8314,6 +8375,8 @@ class BattleRuntime(object):
                 self._destructibles._fell_trees_near(
                     self._avatar.spaceID, self._vector(position), yaw,
                     self._local_speed, entity.typeDescriptor)
+            contact_speed = self._local_speed
+            contact_path = None
             if self._motion_is_clear(
                     entity, position, yaw, self._local_speed, dt,
                     allow_crush_drive=(throttle * self._local_speed > 0.0 and
@@ -8323,6 +8386,7 @@ class BattleRuntime(object):
                     position[1],
                     position[2] + math.cos(yaw) * self._local_speed * dt)
                 self._local_grind = max(0, self._local_grind - 1)
+                contact_path = 'advance'
             elif not self._local_airborne:
                 if self._local_motion_cap_crushed:
                     # The speed cap only proves that this vehicle may crush the
@@ -8331,12 +8395,14 @@ class BattleRuntime(object):
                     # the real speed from before the longitudinal integration.
                     self._local_speed = previous_speed
                     self._local_grind = 1
+                    contact_path = 'cap_hold'
                 elif self._local_motion_soft_block:
                     # #1513 hides fragile/module geometry asynchronously.  Keep
                     # the pose outside its still-native skin, but retain impact
                     # momentum; the next clear tick advances normally and a
                     # newly exposed backing wall still uses the hard response.
                     self._local_grind = 1
+                    contact_path = 'soft_hold'
                 else:
                     deflected = False
                     for delta_yaw in (0.55, -0.55, 1.0, -1.0):
@@ -8357,12 +8423,21 @@ class BattleRuntime(object):
                             self._local_speed = slide_speed
                             self._local_grind = 4
                             deflected = True
+                            contact_path = 'deflect'
                             break
                     if not deflected:
                         self._local_speed *= 0.35 ** (dt * 60.0)
                         if abs(self._local_speed) < 0.05:
                             self._local_speed = 0.0
                         self._local_grind = 4
+                        contact_path = 'brake'
+            if contact_path is not None and (
+                    contact_path != 'advance' or
+                    self._local_motion_status == 'crushed'):
+                self._report_destructible_contact(
+                    'local', self._local_motion_kinds,
+                    self._local_motion_status, contact_path,
+                    contact_speed, self._local_speed, self._clock())
 
         if is_tracked or is_engine_dead:
             turn = 0.0
@@ -8387,10 +8462,14 @@ class BattleRuntime(object):
             self._local_support_tick_pose = None
         support_blocked = self._local_support_rise_blocked
         if support_blocked:
+            support_speed = self._local_speed
             self._local_speed *= 0.35 ** (dt * 60.0)
             if abs(self._local_speed) < 0.05:
                 self._local_speed = 0.0
             self._local_grind = 4
+            self._report_destructible_contact(
+                'local', 'support', 'hard', 'support',
+                support_speed, self._local_speed, self._clock())
         self._ground_pitch(position, yaw, entity.typeDescriptor)
         position = self._apply_slope_slide(position, yaw, dt, entity)
         position = self._resolve_local_tank_contacts(

@@ -980,7 +980,8 @@ class BotRuntime(object):
                  physics_ground_probe=None,
                  obstacle_probe=None, bounds=None, cover_probe=None,
                  native_motion=False, baked_graph=None, probe_clock=None,
-                 motion_resolver=None, world_receipt_probe=None):
+                 motion_resolver=None, motion_report=None,
+                 world_receipt_probe=None):
         self.local_player_id = local_player_id
         self.descriptor_resolver = descriptor_resolver or (lambda unused: {})
         self.direction_probe = self._adapt_direction_probe(
@@ -1019,6 +1020,7 @@ class BotRuntime(object):
         self.cover_probe = cover_probe
         self.native_motion = bool(native_motion)
         self.motion_resolver = motion_resolver
+        self.motion_report = motion_report
         self.world_receipt_probe = world_receipt_probe
         self._probe_clock = probe_clock if callable(probe_clock) else None
         self.adapter = None
@@ -4434,6 +4436,7 @@ class BotRuntime(object):
                 motion_status = 'clear'
                 contact_speed = _number(state.get(
                     'destructible_contact_speed'), speed)
+                contact_v0 = speed
                 if (path_clear and abs(speed) > 0.0001 and
                         callable(self.motion_resolver)):
                     motion_status = self.motion_resolver(
@@ -4467,6 +4470,9 @@ class BotRuntime(object):
                             state.pop('destructible_contact_speed', None)
                     else:
                         state.pop('destructible_contact_speed', None)
+                    if callable(self.motion_report):
+                        self.motion_report(
+                            state['id'], motion_status, contact_v0, speed)
                 state['speed'] = speed
                 if path_clear:
                     state['x'] += math.sin(state['yaw']) * speed * step

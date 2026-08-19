@@ -349,17 +349,17 @@ class WorldCollisionTests(unittest.TestCase):
         self.assertGreater(recast_start, 4.5)
         self.assertLess(recast_start, 4.51)
 
-    def test_expired_pending_skin_remains_native_hard(self):
+    def test_broken_skin_stays_transparent_after_the_hide_window(self):
         (cleared, collide, authority, unused_destroy,
          unused_note, unused_publish) = self._run_pending_recast(
              (4.0,), pending_indices=(0,), destroyed_indices=(0,),
              now=100.2, deadline=100.2)
 
-        self.assertFalse(cleared)
+        self.assertTrue(cleared)
         authority.destroy_fragile.assert_not_called()
-        collide.assert_not_called()
+        self.assertEqual(1, collide.call_count)
 
-    def test_expired_pending_with_kinetic_hint_never_probes_material(self):
+    def test_broken_skin_with_kinetic_hint_never_probes_material(self):
         (bigworld, math_module, area, cache, authority,
          descriptor, normal) = self._soft_recast_fixture((4.0,))
         destructibles_sensor.g_offh_destr_pending = {
@@ -384,7 +384,7 @@ class WorldCollisionTests(unittest.TestCase):
                 1, start, end, collision, 0.0, 1.0, descriptor,
                 allow_kinetic=True, kinetic_speed=20.0)
 
-        self.assertFalse(status)
+        self.assertTrue(status)
         material_probe.assert_not_called()
         authority.destroy_fragile.assert_not_called()
 

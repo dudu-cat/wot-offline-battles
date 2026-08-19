@@ -938,7 +938,6 @@ def _catalog_soft_static_path(spaceID, segment_start, segment_end,
 	current_start = segment_start
 	current_hit = collision
 	authority = _get_destr_authority()
-	pending = globals().get('g_offh_destr_pending', {})
 	kinetic_contact = False
 	pending_contact = False
 	for candidate_index in range(_SOFT_STATIC_MAX_SKIPS):
@@ -950,45 +949,26 @@ def _catalog_soft_static_path(spaceID, segment_start, segment_end,
 			hit_point, current_start, segment_end)
 		if candidate is None:
 			return 'pending_hard' if pending_contact else False
-		destroyed = authority.is_destroyed(
-			candidate[0], candidate[1], candidate[2])
-		# Retail lets a vehicle drive over a felled column: once the item is
-		# destroyed its body stops braking and stops blocking, so the refreshed
-		# catalog OBB must not act as an obstacle either.
-		felled = candidate[4] == 'falling' and destroyed
-		candidate_key = (candidate[0], candidate[1], candidate[2])
-		deadline = pending.get(candidate_key)
-		pending_accepted = False
-		if (candidate[4] in ('fragile', 'structure') and
-				deadline is not None and destroyed):
-			try:
-				pending_accepted = float(BigWorld.time()) < float(deadline)
-			except (AttributeError, TypeError, ValueError):
-				raise RuntimeError(
-					'#1513 pending destructible clock is unavailable')
-		if (candidate[4] in ('fragile', 'structure') and destroyed and
-				not pending_accepted):
-			# An accepted identity cannot become a fresh kinetic contact.  If its
-			# native skin survives past the pinned hide window, fail closed without
-			# re-running the native material probes for an already-destroyed item.
-			return 'pending_hard'
+		# #1513 ``Vehicle._isDestructibleMayBeBroken`` returns True as soon as the
+		# chunk controller reports the item broken, whatever the vehicle speed and
+		# whatever the hide callback still draws.  A broken skin therefore never
+		# resists again, and a felled column stops being an obstacle.
+		broken = (candidate[4] in ('fragile', 'structure', 'falling') and
+			authority.is_destroyed(candidate[0], candidate[1], candidate[2]))
 		mat_info = _synthetic_mat_info(candidate + ((
 			float(hit_point.x), float(hit_point.y), float(hit_point.z)),), Math)
-		current_crushable = felled or pending_accepted or _stock_crushable_1513(
+		current_crushable = broken or _stock_crushable_1513(
 			mat_info, vel, td, candidate[5])
 		if require_pending_first and candidate_index == 0:
-			if felled:
-				current_crushable = True
-			elif pending_accepted:
+			if broken:
 				pending_contact = True
-				current_crushable = True
 			elif (allow_kinetic_first and kinetic_speed is not None and
 					not current_crushable and _stock_crushable_1513(
 						mat_info, kinetic_speed, td, candidate[5])):
 				kinetic_contact = True
 				current_crushable = True
 			else:
-				return 'pending_hard' if pending_contact else False
+				return False
 		elif (allow_kinetic_first and
 				kinetic_speed is not None and not current_crushable and
 				_stock_crushable_1513(
@@ -1026,11 +1006,12 @@ def _motion_travel_reach(vel, dt):
 
 
 def _catalog_pending_at_hull(pos, yaw, vel, td, now, dt=0.04):
-	"""Return whether a proved fragile/module hide window overlaps the hull.
+	"""Return whether a fragile/module hide window still covers the hull.
 
-	This is classification only.  Callers keep the pose blocked while native
-	geometry hides, but preserve impact momentum instead of applying the hard
-	wall exponential brake.  Falling atoms deliberately never enter this map.
+	This is classification only.  Callers keep the pose blocked while the native
+	skin of a broken item is still drawn, but preserve impact momentum instead
+	of applying the hard wall exponential brake.  The window is the pinned
+	``DESTRUCTIBLE_HIDING_DELAY``, so a wall that outlives it is a real wall.
 	"""
 	bbox = _vehicle_hull_bbox(td)
 	if _destructible_catalog is None or bbox is None:
@@ -1039,8 +1020,7 @@ def _catalog_pending_at_hull(pos, yaw, vel, td, now, dt=0.04):
 		pos, yaw, vel, bbox, _motion_travel_reach(vel, dt))
 	pending = globals().get('g_offh_destr_pending', {})
 	for candidate in _catalog_contact_candidates(vehicle_box):
-		key = (candidate[0], candidate[1], candidate[2])
-		deadline = pending.get(key)
+		deadline = pending.get((candidate[0], candidate[1], candidate[2]))
 		if deadline is not None and float(now) < float(deadline):
 			return True
 	return False
@@ -1057,7 +1037,8 @@ def _catalog_hull_contact(pos, yaw, vel, td, dt=0.04):
 
 
 def _catalog_motion_result(status, token=None, accepted_now=False,
-		used_kinetic_speed=False, return_status=False, return_detail=False):
+		used_kinetic_speed=False, return_status=False, return_detail=False,
+		kinds=None):
 	"""Keep the legacy status seam while exposing an exact commit receipt."""
 	if return_detail:
 		return {
@@ -1065,6 +1046,7 @@ def _catalog_motion_result(status, token=None, accepted_now=False,
 			'token': tuple(sorted(token or ())) or None,
 			'accepted_now': bool(accepted_now),
 			'used_kinetic_speed': bool(used_kinetic_speed),
+			'kinds': ','.join(sorted(kinds or ())) or '-',
 		}
 	# ``approach`` is meaningful only to the combined world+catalog resolver.
 	# Older callers must continue to fail closed on a non-contact lookahead.
@@ -1100,7 +1082,6 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 	grouped = {}
 	for candidate in candidates:
 		grouped.setdefault((candidate[0], candidate[1]), []).append(candidate)
-	pending = globals().setdefault('g_offh_destr_pending', {})
 	instances = globals().get('g_offh_destr_instances', {})
 	contact_box = (_vehicle_contact_box(
 		pos, yaw, bbox, travel=float(vel) * max(0.0, float(dt)))
@@ -1110,6 +1091,7 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 	kinetic = False
 	approach = False
 	exact_token = set()
+	contact_kinds = set()
 	commit_candidates = []
 
 	for identity in sorted(grouped):
@@ -1129,38 +1111,15 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 					for world_box in instances.get(
 						(chunk_id, item_index), {}).get('boxes', ())
 					if (kind != 'structure' or world_box[2] == mat_kind)))
-			if (kind == 'falling' and
-					auth.is_destroyed(chunk_id, item_index, None)):
-				blocked = True
-				_diagnostic_contact_1513(
-					'swept_falling_active', chunk_id, item_index,
-					fields=(('kind', kind),), now=now)
-				continue
-			deadline = pending.get(key)
-			if deadline is not None:
-				if (float(now) < float(deadline) and
-						auth.is_destroyed(chunk_id, item_index, mat_kind)):
-					crushed = True
-					if contact_candidate:
-						exact_token.add(key)
-					_diagnostic_contact_1513(
-						'swept_pending', chunk_id, item_index,
-						fields=(('kind', kind), ('mat', mat_kind)), now=now)
-				elif not auth.is_destroyed(
-						chunk_id, item_index, mat_kind):
-					blocked = True
-					_diagnostic_contact_1513(
-						'swept_pending_expired', chunk_id, item_index,
-						fields=(('kind', kind), ('mat', mat_kind)), now=now)
-				# The native static probe already ran before this catalog seam.
-				# Once its hide window expires, an authority-destroyed dynamic OBB
-				# is clear here; a still-visible native skin is rejected in
-				# ``_catalog_soft_static_path`` before this function is reached.
-				continue
+			contact_kinds.add(kind)
+			# #1513 ``Vehicle._isDestructibleMayBeBroken`` returns True for any
+			# item the chunk controller already reports broken, so a hiding skin
+			# and a felled column are both transparent from that moment.
 			if auth.is_destroyed(chunk_id, item_index, mat_kind):
-				note_destroyed(
-					'module' if mat_kind is not None else 'fragile',
-					chunk_id, item_index, mat_kind, now)
+				if kind != 'falling':
+					note_destroyed(
+						'module' if mat_kind is not None else 'fragile',
+						chunk_id, item_index, mat_kind, now)
 				crushed = True
 				if contact_candidate:
 					exact_token.add(key)
@@ -1171,12 +1130,6 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 			active.append((candidate, contact_candidate))
 
 		if not active:
-			continue
-		if active[0][0][4] == 'structure' and len(active) != 1:
-			blocked = True
-			_diagnostic_contact_1513(
-				'swept_multi_module', identity[0], identity[1],
-				fields=(('modules', len(active)),), now=now)
 			continue
 		for candidate, contact_candidate in active:
 			chunk_id, item_index, mat_kind, unused_filename, kind = (
@@ -1255,10 +1208,7 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 				'swept_native_accept', chunk_id, item_index,
 				fields=(('kind', kind), ('mat', mat_kind),
 					('speed', '%.3f' % float(gate_speed))), now=now)
-			if event_kind == 'column':
-				blocked = True
-			else:
-				crushed = True
+			crushed = True
 
 	status = ('hard' if blocked else
 		'kinetic' if kinetic else
@@ -1266,7 +1216,7 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 		'approach' if approach else 'clear')
 	return _catalog_motion_result(
 		status, None if blocked else exact_token, accepted_now,
-		used_kinetic_speed, return_status, return_detail)
+		used_kinetic_speed, return_status, return_detail, contact_kinds)
 
 
 def _catalog_instance_boxes(chunkID, itemIndex, filename, kind,
@@ -1494,16 +1444,13 @@ def _refresh_destroyed_falling_instances_1513(spaceID, authority, now):
 		instance['boxes'] = boxes
 		state = active[identity]
 		state['last_refresh'] = float(now)
-		if synthetic_collision_active:
-			_index_catalog_instance_1513(
-				contact_bins, identity, instance, new_bin_keys)
-		else:
-			# The animator deletes touchdownCallback on first ground contact but can
-			# retain the body for up to eight seconds of spring settling.  Retire the
-			# coarse catalog OBB at that exact boundary: wg_setDestructibleMatrix has
-			# already installed the native moving/final BSP, so world rays and ground
-			# support remain authoritative without a 9-metre pole becoming a box wall.
-			instance['bin_keys'] = ()
+		_index_catalog_instance_1513(
+			contact_bins, identity, instance, new_bin_keys)
+		if not synthetic_collision_active:
+			# The animator deletes touchdownCallback on first ground contact.  Stop
+			# following the matrix at that exact boundary, but keep the resting OBB
+			# indexed: the ray and sweep seams need the identity to recognise the
+			# felled column as broken, and a broken item never blocks.
 			del active[identity]
 
 
