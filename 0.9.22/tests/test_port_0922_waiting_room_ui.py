@@ -70,8 +70,8 @@ class _Surface(object):
     def window(self):
         return _Component('window', '')
 
-    def simple(self):
-        return _Component('simple', '')
+    def simple(self, texture=''):
+        return _Component('simple', texture)
 
     def text(self):
         return _Component('text', text='')
@@ -111,9 +111,9 @@ class WaitingRoomTests(unittest.TestCase):
     def _visible(self, role):
         return self.room._controls[role].properties['visible']
 
-    def _root_count(self):
-        """The room panel plus the diagnostic root mark."""
-        return 2
+    def _root_count(self, room=None):
+        """The room panel plus one root per tint diagnostic square."""
+        return 1 + len((room or self.room)._pointer_probes)
 
     def test_the_room_only_uses_properties_this_client_has(self):
         self.room.install()
@@ -162,7 +162,7 @@ class WaitingRoomTests(unittest.TestCase):
         self.assertTrue(room.open())
         self.assertEqual(1, surface.shown)
         self.assertTrue(room._cursor_acquired)
-        self.assertEqual(self._root_count(), len(surface.roots))
+        self.assertEqual(self._root_count(room), len(surface.roots))
 
         room.close()
         self.assertEqual(1, surface.hidden)
@@ -587,3 +587,41 @@ class NativeCursorSurfaceTests(unittest.TestCase):
 
         self.assertTrue(state['active'])
         self.assertEqual((0.25, -0.5), state['position'])
+
+
+class RoomTextureTests(unittest.TestCase):
+    def setUp(self):
+        self.module = _load('waiting_room_ui')
+        self.surface = _Surface()
+        self.room = self.module.WaitingRoomUI(
+            lambda name: True, lambda: ['01_karelia'],
+            status=lambda: '', host=lambda: True, surface=self.surface)
+        self.room.install()
+        self.room.open()
+
+    def test_every_drawn_rectangle_carries_the_proven_texture(self):
+        # An untextured GUI.Simple draws nothing here, so anything meant to
+        # be seen needs the one texture this client renders.
+        texture = self.module.CONTROL_TEXTURE
+        self.assertEqual(texture, self.room._controls['start'].texture)
+        for part, unused_depth in self.room._pointer_parts:
+            self.assertEqual(texture, part.texture)
+
+    def test_button_labels_are_dark_enough_to_read_on_white(self):
+        colour = self.module.CONTROL_TEXT_COLOUR
+        self.assertEqual(
+            colour, self.room._labels['start'].properties['colour'])
+        # The free-floating labels stay light: they sit over the garage.
+        self.assertNotEqual(
+            colour, self.room._labels['title'].properties['colour'])
+
+    def test_the_tint_row_varies_one_property_at_a_time(self):
+        probes = self.room._pointer_probes
+        self.assertEqual(8, len(probes))
+        control = probes['1-dds-solid-white'].properties
+        self.assertEqual('SOLID', control['materialFX'])
+        self.assertEqual((255, 255, 255, 255), control['colour'])
+        # The untextured square is the one expected to stay invisible.
+        self.assertEqual('', probes['8-none-solid-dark'].texture)
+        self.assertEqual(
+            'BLEND', probes['3-dds-blend-dark'].properties['materialFX'])

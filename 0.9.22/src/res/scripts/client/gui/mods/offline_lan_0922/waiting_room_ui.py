@@ -40,7 +40,12 @@ Exact #1513 evidence for the native surface used here:
 import sys
 import time
 
+# An untextured GUI.Simple/GUI.Window draws nothing on this client: the room
+# rendered only its GUI.Text while every rectangle stayed invisible.  This
+# misc.pkg member is the one texture proved to render here, untinted white.
 PANEL_TEXTURE = ''
+CONTROL_TEXTURE = 'system/maps/col_white.dds'
+CONTROL_TEXT_COLOUR = (16, 26, 36, 255)
 PANEL_FONT = 'default_small.font'
 OVERLAY_Z = 0.1
 # Smaller z draws in front. The buttons render at CONTROL_Z and the pointer at
@@ -89,8 +94,8 @@ class NativeSurface(object):
     def window(self):
         return self._gui.Window(PANEL_TEXTURE)
 
-    def simple(self):
-        return self._gui.Simple(PANEL_TEXTURE)
+    def simple(self, texture=PANEL_TEXTURE):
+        return self._gui.Simple(texture)
 
     def text(self):
         return self._gui.Text('')
@@ -284,16 +289,18 @@ class WaitingRoomUI(object):
                          0.12, colour=(232, 244, 255, 255))
         self._make_label('room', '', (-0.86, 0.62, 0.0), 1.72, 0.11)
         self._make_label('players', '', (-0.86, 0.44, 0.0), 1.72, 0.11)
+        # These five sit on a textured button, which renders white until a
+        # tint is proved, so their text has to be dark to stay readable.
         self._make_label('previous', '<', (-0.72, 0.05, 0.0), 0.18, 0.12,
-                         anchor='CENTER')
+                         anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
         self._make_label('map', '', (0.0, 0.05, 0.0), 1.10, 0.12,
-                         anchor='CENTER')
+                         anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
         self._make_label('next', '>', (0.72, 0.05, 0.0), 0.18, 0.12,
-                         anchor='CENTER')
+                         anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
         self._make_label('start', 'START BATTLE', (0.0, -0.40, 0.0), 1.16,
-                         0.12, anchor='CENTER')
+                         0.12, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
         self._make_label('close', 'LEAVE', (0.0, -0.78, 0.0), 0.46, 0.12,
-                         anchor='CENTER')
+                         anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
         self._make_label('message', '', (-0.86, -0.60, 0.0), 1.72, 0.11,
                          colour=(184, 205, 222, 255))
         return True
@@ -328,7 +335,7 @@ class WaitingRoomUI(object):
             self._set(frame, name, value)
         self._panel.addChild(frame)
         self._frames[role] = frame
-        component = self._surface.simple()
+        component = self._surface.simple(CONTROL_TEXTURE)
         for name, value in (
                 ('horizontalPositionMode', 'CLIP'),
                 ('verticalPositionMode', 'CLIP'),
@@ -444,7 +451,7 @@ class WaitingRoomUI(object):
                 (self.POINTER_SHADOW, self.POINTER_BORDER,
                  CONTROL_Z - CONTROL_FRAME_OFFSET),
                 (self.POINTER_FILL, 0, CONTROL_Z - 2 * CONTROL_FRAME_OFFSET)):
-            part = self._surface.simple()
+            part = self._surface.simple(CONTROL_TEXTURE)
             for name, value in (
                     ('horizontalPositionMode', 'CLIP'),
                     ('verticalPositionMode', 'CLIP'),
@@ -467,51 +474,56 @@ class WaitingRoomUI(object):
         return True
 
     def _remove_pointer_probes(self):
-        """Drop the diagnostic marks, roots included."""
-        probe = self._pointer_probes.pop('root', None)
-        if probe is not None:
+        """Drop the tint marks; every one of them is a GUI root."""
+        for name, probe in sorted(self._pointer_probes.items()):
             try:
                 self._surface.remove_root(probe)
             except Exception as error:
-                _log('LAN room pointer probe root not removed: %s' % error)
+                _log('LAN room tint probe %s not removed: %s' % (name, error))
         self._pointer_probes = {}
         return True
 
-    def _build_pointer_probes(self, step_x, step_y):
-        """Draw two fixed test marks that decide why the arrow is unseen.
+    def _build_pointer_probes(self, unused_step_x, unused_step_y):
+        """Draw one labelled square per tint candidate, left to right.
 
-        ``parked`` is a panel child at the panel centre, so it can never be
-        clipped by the parent rect.  ``root`` is a GUI root at the same screen
-        place.  Whichever the player sees names the mechanism.
+        Every square is a GUI root so no parent rect can clip it, and each
+        varies exactly one of texture, materialFX and colour.  One screenshot
+        then names the combination that tints instead of drawing white.
         """
-        for role, parent in (('parked', self._panel), ('root', None)):
-            probe = self._surface.simple()
-            for name, value in (
+        white = (255, 255, 255, 255)
+        dark = (5, 12, 20, 245)
+        green = (40, 118, 64, 245)
+        dds = CONTROL_TEXTURE
+        bmp = 'system/maps/col_white.bmp'
+        for index, (name, texture, effect, colour) in enumerate((
+                ('1-dds-solid-white', dds, 'SOLID', white),
+                ('2-dds-solid-dark', dds, 'SOLID', dark),
+                ('3-dds-blend-dark', dds, 'BLEND', dark),
+                ('4-dds-add-dark', dds, 'ADD', dark),
+                ('5-dds-blend-green', dds, 'BLEND', green),
+                ('6-bmp-solid-dark', bmp, 'SOLID', dark),
+                ('7-bmp-blend-dark', bmp, 'BLEND', dark),
+                ('8-none-solid-dark', PANEL_TEXTURE, 'SOLID', dark))):
+            probe = self._surface.simple(texture)
+            for property_name, value in (
                     ('horizontalPositionMode', 'CLIP'),
                     ('verticalPositionMode', 'CLIP'),
-                    ('widthMode', 'CLIP'), ('heightMode', 'CLIP'),
+                    ('widthMode', 'PIXEL'), ('heightMode', 'PIXEL'),
                     ('horizontalAnchor', 'CENTER'),
                     ('verticalAnchor', 'CENTER'),
-                    ('position', (0.0 if parent is not None else 0.30,
-                                  0.0, CONTROL_Z - 2 * CONTROL_FRAME_OFFSET)),
-                    ('width', (self.POINTER_WIDTH + self.POINTER_BORDER) *
-                     (step_x if parent is not None else 2.0 / PANEL_WIDTH)),
-                    ('height', (self.POINTER_HEIGHT + self.POINTER_BORDER) *
-                     (step_y if parent is not None else 2.0 / PANEL_HEIGHT)),
-                    ('materialFX', 'SOLID'),
-                    ('colour', (255, 64, 64, 255)),
+                    ('position', (-0.70 + index * 0.20, 0.90,
+                                  CONTROL_Z - 2 * CONTROL_FRAME_OFFSET)),
+                    ('width', 48.0), ('height', 48.0),
+                    ('materialFX', effect), ('colour', colour),
                     ('focus', False), ('mouseButtonFocus', False),
                     ('crossFocus', False), ('moveFocus', False),
                     ('visible', True)):
-                self._set(probe, name, value)
-            if parent is not None:
-                parent.addChild(probe)
-            else:
-                self._surface.add_root(probe)
-                resort = getattr(self._surface, 'resort', None)
-                if callable(resort):
-                    resort()
-            self._pointer_probes[role] = probe
+                self._set_optional(probe, property_name, value)
+            self._surface.add_root(probe)
+            self._pointer_probes[name] = probe
+        resort = getattr(self._surface, 'resort', None)
+        if callable(resort):
+            resort()
         return True
 
     def _move_pointer(self):
@@ -580,7 +592,7 @@ class WaitingRoomUI(object):
             except Exception as error:
                 _log('LAN room pointer native state failed: %s' % error)
         for role in sorted(self._pointer_probes):
-            _log('LAN room pointer %6s: %s' % (
+            _log('LAN room tint %-18s: %s' % (
                 role, self._describe(self._pointer_probes[role])))
         _log('LAN room pointer   part: %s' % self._describe(
             self._pointer_parts[-1][0]))
