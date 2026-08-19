@@ -31,9 +31,10 @@ DEFAULT_CONFIG = {
     'physics_tuning': {},
     'he_tuning': {},
     'perfect_accuracy': False,
-    # Native belt animation for bots. Set it false to build bots without
-    # any belt call at all.
-    'bot_track_animation': True,
+    # Native belt animation for bots.  Off: a client-only vehicle gets no
+    # engine-owned filter, so the belts cannot turn.  See
+    # 0.9.22/COMPATIBILITY_REVIEW.md.
+    'bot_track_animation': False,
     # Per-chunk destructible and bot-steering traces. PERF summaries are
     # always published; these are the noisy per-event lines.
     'debug_logging': False,

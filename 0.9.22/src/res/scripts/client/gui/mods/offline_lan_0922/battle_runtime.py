@@ -8261,11 +8261,12 @@ class BattleRuntime(object):
         return True
 
     def _report_bot_tracks(self, vehicle, left, right, mode, now):
-        """Log both belt writers so one battle decides this design.
+        """Log what the scroll controller actually holds.
 
-        The chassis fashion reads ``filter.movementInfo``, which no client-only
-        entity advances, so ``setTracksSpeed`` is the only writer that can move
-        the belts. This says whether the exact client exposes it and took it.
+        ``leftContact``/``rightContact`` still reading the constructor's
+        ``True`` and ``leftScroll``/``rightScroll`` still reading ``0.0`` mean
+        the controller's 20 Hz updater never ran, which is what a filter with
+        no owning entity looks like from Python.
         """
         if self._track_report_time is not None and (
                 now - self._track_report_time) < TRACK_REPORT_SECONDS:
@@ -8273,11 +8274,9 @@ class BattleRuntime(object):
         self._track_report_time = now
         sys.stdout.write(
             '[Offline LAN 0.9.22] bot tracks id=%s mode=%r fed=(%.3f, %.3f) '
-            'scroll=%r speeds=%s speeds_error=%r error=%r\n' % (
+            'scroll=%r error=%r\n' % (
                 vehicle.bw_entity_id, mode, left, right,
                 vehicle.track_scroll_readback(),
-                callable(getattr(vehicle.track_filter, 'setTracksSpeed', None)),
-                vehicle.track_speed_error,
                 self._remote_factory.track_animation_error))
         return True
 
@@ -10108,14 +10107,17 @@ class BattleRuntime(object):
             except Exception as error:
                 if cleanup_error is None:
                     cleanup_error = error
-            for record in tuple(self._records.values()):
-                if not record.get('presentation'):
-                    continue
-                try:
-                    self._stop_remote_visual(record)
-                except Exception as error:
-                    if cleanup_error is None:
-                        cleanup_error = error
+            # Once the engine has reset the entity manager, stopping a visual
+            # would call into objects it already freed.
+            if self._remote_factory.engine_active():
+                for record in tuple(self._records.values()):
+                    if not record.get('presentation'):
+                        continue
+                    try:
+                        self._stop_remote_visual(record)
+                    except Exception as error:
+                        if cleanup_error is None:
+                            cleanup_error = error
             try:
                 self._remote_factory.destroy_all()
             except Exception as error:

@@ -718,7 +718,6 @@ class RemoteVehicle(object):
         self.track_filter = None
         self.track_scroll = None
         self.track_flying_info = None
-        self.track_speed_error = None
         self.fashions = None
         self._track_mode = None
         self._offlineLANShotIndex = int(
@@ -791,18 +790,18 @@ class RemoteVehicle(object):
         self.track_filter = vehicle_filter
         self.track_scroll = scroll
         self.track_flying_info = flying_info
-        self.track_speed_error = None
         self.fashions = fashions
         self._track_mode = None
         return True
 
     def update_tracks(self, left, right, mode):
-        """Feed one frame of belt speed to the filter and to PyTrackScroll.
+        """Feed one frame of belt speed through the stock PyTrackScroll path.
 
-        The chassis fashion, the spline belt, the track-link nodes and the road
-        wheels all read ``filter.movementInfo``; PyTrackScroll only feeds the
-        ground dust and the audition.  ``setTracksSpeed`` is the one native
-        writer on ``WGVehicleFilter`` that can move a filter no entity owns.
+        ``PyTrackScroll`` owns the filter's belt-speed override, because its
+        own 20 Hz updater writes those fields every tick.  ``setMode`` and
+        ``setExternal`` are the only sanctioned writers, the same pair
+        #1513 uses in ``CompoundAppearance.changeEngineMode`` and
+        ``updateTracksScroll``.
         """
         scroll = self.track_scroll
         if scroll is None:
@@ -811,26 +810,6 @@ class RemoteVehicle(object):
             scroll.setMode(mode)
             self._track_mode = mode
         scroll.setExternal(float(left), float(right))
-        self._set_filter_track_speeds(float(left), True, float(right), True)
-        return True
-
-    def _set_filter_track_speeds(self, left, left_external, right,
-                                 right_external):
-        """Write both belts through the exact four-argument #1513 setter.
-
-        ``WGVehicleFilter.setTracksSpeed(float, bool, float, bool)`` is
-        ``(leftSpeed, leftIsExternal, rightSpeed, rightIsExternal)``: each bool
-        gates its own side, and the filter ignores a side's speed and derives
-        it from its own contact-point motion while that side's bool is false.
-        """
-        speeds = getattr(self.track_filter, 'setTracksSpeed', None)
-        if not callable(speeds):
-            return False
-        try:
-            speeds(left, left_external, right, right_external)
-        except Exception as error:
-            self.track_speed_error = '%s' % (error,)
-            return False
         return True
 
     def track_scroll_readback(self):
@@ -852,20 +831,26 @@ class RemoteVehicle(object):
             values.append(reader)
         return tuple(values)
 
-    def _release_track_animation(self):
-        # Teardown can run after BigWorld cleared the space, so this drops the
-        # filter reference rather than writing one last belt speed into it.
+    def _release_track_animation(self, engine_alive=True):
+        """Retire the scroll controller before the filter reference goes.
+
+        ``setData`` keeps a raw, non-owning pointer to the native filter and
+        ``activate`` registers a 20 Hz updater that dereferences it, so the
+        controller must be deactivated and cleared while the filter is still
+        alive.  Once the engine has torn the space down, drop both references
+        without calling into either object.
+        """
         scroll = self.track_scroll
+        released = scroll is not None
+        if released and engine_alive:
+            scroll.deactivate()
+            scroll.setData(None)
         self.track_scroll = None
         self.track_filter = None
         self.track_flying_info = None
         self.fashions = None
         self._track_mode = None
-        if scroll is None:
-            return False
-        scroll.deactivate()
-        scroll.setData(None)
-        return True
+        return released
 
     def attach_wreck_model(self, model):
         """Swap this vehicle onto its loaded #1513 destroyed compound."""
@@ -923,6 +908,29 @@ class RemoteVehicle(object):
         self._gun_recoil = None
         if first_error is not None:
             raise first_error
+
+    def abandon_visual(self):
+        """Forget every native object without touching one of them.
+
+        BigWorld resets the entity manager and clears every space before
+        ``guiModsFini`` reaches this mod, so by then the compound, the filter
+        and the scroll controller this vehicle points at are already freed.
+        """
+        self._release_track_animation(engine_alive=False)
+        self.extras.clear()
+        self._collision_obstacle = None
+        self.isStarted = False
+        self.inWorld = False
+        self.appearance.compoundModel = None
+        self.appearance.models = []
+        self.appearance.isLoaded = False
+        self.appearance.gunRecoil = None
+        self.bw_entity = None
+        self.bw_entity_id = None
+        self.model = None
+        self._animation = None
+        self._gun_recoil = None
+        return True
 
     def _new_animation(self):
         """Create this vehicle's one animation, keyed to its own matrices."""
@@ -1362,10 +1370,9 @@ class RemoteVehicleFactory(object):
     def _assemble_track_animation(self, vehicle, descriptor, model):
         """Build the native belt animation retail assembles for a remote tank.
 
-        PyTrackScroll writes the filter's belt-speed override and the chassis
-        fashion reads the filter's movementInfo, so the belts turn from the
-        speeds we feed rather than from an engine-delivered motion sample.
-        This is presentation only: a bot without it looks exactly as before.
+        A client-only vehicle gets no engine-owned filter, so the belts stay
+        still whatever is fed to them.  This is off by default; see
+        0.9.22/COMPATIBILITY_REVIEW.md.
         """
         camouflages = self._camouflages
         if camouflages is None:
@@ -1551,11 +1558,38 @@ class RemoteVehicleFactory(object):
         return self._shot_presenter.stop_canonical(
             projectile_id, end_position, explosion)
 
+    def engine_owns(self, entity_id):
+        """Whether BigWorld still knows this client-only entity."""
+        if entity_id is None:
+            return False
+        entities = self._original_entities
+        if entities is None:
+            entities = getattr(self._bigworld, 'entities', None)
+        if entities is None:
+            return False
+        try:
+            return int(entity_id) in entities
+        except Exception:
+            return False
+
+    def engine_active(self):
+        """Whether the engine still holds the presentations we created."""
+        for vehicle in self._vehicles.values():
+            if vehicle.bw_entity_id is None:
+                continue
+            if self.engine_owns(vehicle.bw_entity_id):
+                return True
+            return False
+        return True
+
     def destroy(self, entity_id):
         vehicle = self._vehicles.pop(entity_id, None)
         if vehicle is None:
             return False
         visual_id = vehicle.bw_entity_id
+        if visual_id is not None and not self.engine_owns(visual_id):
+            vehicle.abandon_visual()
+            return True
         first_error = None
         try:
             vehicle.detach_visual()

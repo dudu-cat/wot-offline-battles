@@ -1161,6 +1161,67 @@ ends, because a player can refit between rounds.
 camouflage terms to both members of `type.invisibility`, and a light tank
 carries the same pair for moving and still.
 
+## A client-only vehicle has no engine-owned filter
+
+`BigWorld.WGVehicleFilter` is an entity filter. The engine allocates its native
+implementation only when an entity owns the filter, and every Python method on
+the wrapper reads that implementation through one virtual getter,
+`mov eax, [this + 0x14]; ret`. A filter that
+`vehicle_systems/model_assembler.createVehicleFilter` builds and that no entity
+adopts keeps `this + 0x14 == 0` for its whole life: the base constructor at
+`0x0065cdf0` writes the zero, and no method in the wrapper's table reaches the
+allocating virtual.
+
+That is fatal, not recoverable. `setTracksSpeed` (`0x006e30f0`) parses its four
+arguments, fetches the filter, and on NULL runs
+`MF_ASSERT_DEV FAILED: pFilter` from
+`wot\lib\wot_entity_filters\py_wg_vehicle_filter.cpp(555)`. BigWorld's
+dev-critical handler calls `_set_abort_behavior(0, _WRITE_ABORT_MSG |
+_CALL_REPORTFAULT)` and then `abort()`, so the process leaves with exit code 3,
+no CRT text, no Windows Error Reporting event, and nothing in `python.log`. A
+`try`/`except` cannot catch it, and the client exposes no way to read `pFilter`
+first.
+
+A full-memory dump taken at process termination proved this on build
+`32183ee`: the receiver was a `BigWorld.WGVehicleFilter` with `pFilter == 0`,
+the arguments were `(0.0, True, 0.0, True)`, and of the 59 live filter
+instances in that process exactly one, the player's entity filter, had an
+implementation. The abort landed on the first frame that moved the bots,
+before the diagnostic line that follows the call.
+
+The rule for this port: on a client-only vehicle, treat every
+`WGVehicleFilter` method as a call that can terminate the process, not as a
+call that can raise. The same assertion exists in
+`wot\lib\wot_entity_filters\wg_gun_angles_filter.hpp`, which is the trap
+`compat.py::_OfflineVehicleFilterSyncProxy.syncGunAngles` already avoids.
+
+### Animated bot belts are closed until bots are real entities
+
+`bot_track_animation` stays off by default and the port no longer calls
+`setTracksSpeed` at all. What remains behind the flag is the stock pair,
+`PyTrackScroll.setMode` and `PyTrackScroll.setExternal`, which is what #1513's
+`CompoundAppearance.changeEngineMode` and `updateTracksScroll` call and which
+never touches `WGVehicleFilter`. That pair is safe, and it is also inert for a
+bot:
+
+- `PyTrackScroll.setData` stores a raw, non-owning pointer to the native filter
+  at the controller's `+0x14`, and `activate` registers a 20 Hz updater whose
+  first instruction pair is `mov esi, [edi + 0x14]; test esi, esi; je`. With a
+  NULL filter the updater returns without reading its inputs.
+- The belt scroll the chassis fashion draws comes from the filter's own routine
+  at `0x006eee00`, which converts the override fields `+0x4a8`/`+0x4ac`/`+0x4b0`
+  /`+0x4b1` into `+0x48c`/`+0x490`, the pair `movementInfo` exposes. Both live
+  on the native filter.
+- Peng's own battle log confirms it from the Python side: for a whole battle
+  `leftScroll`/`rightScroll` read `0.0` and `leftContact`/`rightContact` read
+  `True`, which are exactly the values `TrackScroller`'s constructor at
+  `0x00762f80` writes. The updater never ran once.
+
+So animated bot belts require bots built as real
+`BigWorld.createEntity('Vehicle', ...)` entities, so that the engine owns each
+filter. That is the previously estimated three-round change, and it is Peng's
+call whether to spend it. Nothing smaller can move the belts.
+
 ## Known deterministic parity gaps
 
 The source audit deliberately keeps the following differences visible:

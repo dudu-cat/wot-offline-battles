@@ -155,23 +155,21 @@ class _YawMatrix(_Matrix):
 
 
 class _VehicleFilter(object):
-    """BigWorld.WGVehicleFilter: the only source of a belt movementInfo."""
+    """BigWorld.WGVehicleFilter built by createVehicleFilter, owned by nobody.
+
+    Its native implementation pointer stays NULL until an entity adopts the
+    filter, and every method asserts on it. `MF_ASSERT_DEV FAILED: pFilter`
+    reaches `abort()`, so this fake fails loudly instead of returning.
+    """
 
     def __init__(self):
         self.movementInfo = object()
-        self.tracks_speed = None
-        self.belt_speeds = (None, None)
+        self.pFilter = None
 
-    def setTracksSpeed(self, left, left_external, right, right_external):
-        if not isinstance(left_external, bool) or not isinstance(
-                right_external, bool):
-            raise TypeError('setTracksSpeed() expects 4 arguments of types '
-                            'float, bool, float, bool')
-        self.tracks_speed = (left, left_external, right, right_external)
-        # The native tick ignores a side while its external flag is false and
-        # derives that belt from the filter's own contact-point motion.
-        self.belt_speeds = (left if left_external else None,
-                            right if right_external else None)
+    def setTracksSpeed(self, *unused_args):
+        raise AssertionError(
+            'MF_ASSERT_DEV FAILED: pFilter -> abort(): '
+            'py_wg_vehicle_filter.cpp(555)')
 
 
 class _TrackScroll(object):
@@ -184,6 +182,8 @@ class _TrackScroll(object):
         self.external = None
         self._left = 0.0
         self._right = 0.0
+        # TrackScroller's constructor writes both contact flags true.
+        self._contact = True
 
     def activate(self):
         self.active = True
@@ -199,10 +199,14 @@ class _TrackScroll(object):
 
     def setExternal(self, left, right):
         self.external = (left, right)
-        # The native tick pins both belts while the engine is not running.
+        # The 20 Hz updater returns at once while the filter it was given has
+        # no implementation, which is every filter no entity owns.
+        if self.data is None or getattr(self.data, 'pFilter', None) is None:
+            return
         if self.mode and self.mode[0] > 1:
             self._left += left
             self._right += right
+            self._contact = True
 
     def leftScroll(self):
         return self._left
@@ -211,10 +215,10 @@ class _TrackScroll(object):
         return self._right
 
     def leftContact(self):
-        return False
+        return self._contact
 
     def rightContact(self):
-        return False
+        return self._contact
 
 
 class _Model(object):
@@ -1664,9 +1668,10 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         projectiles[0].destroy.assert_called_once_with()
         self.assertEqual(runtime.bigworld.entity, original_entity)
 
-    def test_a_bot_gets_the_native_belt_animation(self):
-        """PyTrackScroll writes the filter's belt override and the chassis
-        fashion reads the filter, so the belts turn from the fed speeds."""
+    def test_a_bot_belt_feed_never_touches_the_vehicle_filter(self):
+        """setTracksSpeed aborts the client on a filter no entity owns, so the
+        feed uses only the stock PyTrackScroll pair, and the belts stay still
+        because that controller has no filter implementation either."""
         runtime = _runtime()
         fashions = [types.SimpleNamespace(movementInfo=None)]
         factory = RemoteVehicleFactory(
@@ -1690,35 +1695,57 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         vehicle.update_tracks(3.0, 5.0, (2, 1))
         self.assertEqual((2, 1), vehicle.track_scroll.mode)
         self.assertEqual((3.0, 5.0), vehicle.track_scroll.external)
-        self.assertEqual((3.0, 5.0, False, False),
-                         vehicle.track_scroll_readback())
-        # Only the filter reaches the chassis fashion and the spline belt, and
-        # it takes a side's speed only while that side's external flag is set.
-        self.assertEqual((3.0, True, 5.0, True),
-                         vehicle.track_filter.tracks_speed)
-        self.assertEqual((3.0, 5.0), vehicle.track_filter.belt_speeds)
-        self.assertIsNone(vehicle.track_speed_error)
-
-        # An idle engine cannot scroll the belts; the native tick zeroes them.
-        vehicle.update_tracks(3.0, 5.0, (1, 0))
-        self.assertEqual((3.0, 5.0, False, False),
+        # The controller's own readback still holds its constructed values,
+        # which is what the exact client reported for a whole battle.
+        self.assertEqual((0.0, 0.0, True, True),
                          vehicle.track_scroll_readback())
 
         scroll = vehicle.track_scroll
-        filter_object = vehicle.track_filter
         vehicle.detach_visual()
+        # The updater must be cancelled and its raw filter pointer cleared
+        # before the filter reference goes.
         self.assertFalse(scroll.active)
         self.assertIsNone(scroll.data)
         self.assertIsNone(vehicle.track_scroll)
         self.assertIsNone(vehicle.track_filter)
-        # Teardown can run after BigWorld cleared the space, so the filter
-        # must not be written again.
-        self.assertEqual((3.0, True, 5.0, True), filter_object.tracks_speed)
 
-    def test_the_belt_assembly_is_on_and_still_switchable(self):
+    def test_a_teardown_after_the_engine_leaves_native_objects_alone(self):
+        """game.fini resets the entity manager and clears every space before
+        this mod runs, so the held compounds and filters are already freed."""
+        runtime = _runtime()
+        fashions = [types.SimpleNamespace(movementInfo=None)]
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7,
+            camouflages=types.SimpleNamespace(
+                prepareFashions=lambda damaged: fashions))
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True, 'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        scroll = vehicle.track_scroll
+        model = vehicle.model
+        self.assertTrue(factory.engine_owns(vehicle.bw_entity_id))
+
+        runtime.bigworld.entities.clear()
+        self.assertFalse(factory.engine_owns(vehicle.bw_entity_id))
+        self.assertTrue(factory.destroy(vehicle_id))
+
+        self.assertIsNone(vehicle.track_scroll)
+        self.assertIsNone(vehicle.track_filter)
+        self.assertIsNone(vehicle.model)
+        self.assertIsNone(vehicle.bw_entity)
+        self.assertFalse(vehicle.inWorld)
+        # Nothing native was called: the updater keeps its stale registration
+        # and the compound keeps its last matrix.
+        self.assertTrue(scroll.active)
+        self.assertIsNotNone(scroll.data)
+        self.assertIsNotNone(model.matrix)
+
+    def test_the_belt_assembly_is_off_and_still_switchable(self):
         from gui.mods.offline_lan_0922 import config as port_config
 
-        self.assertTrue(
+        self.assertFalse(
             port_config.DEFAULT_CONFIG['bot_track_animation'])
 
     def test_a_client_without_the_belt_boundary_still_presents_bots(self):
@@ -4488,9 +4515,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
         # native tick pins both belts to zero.
         self.assertEqual((ENGINE_MODE_RUNNING, _MOVEMENT_ROTATE_RIGHT),
                          vehicle.track_scroll.mode)
-        self.assertEqual((left, right), vehicle.track_filter.belt_speeds)
-        self.assertEqual((left, right),
-                         vehicle.track_scroll_readback()[:2])
 
         # The mirrored turn reports the other rotation flag.
         battle._bot_pose_relax({'id': 3, 'yaw': 0.1}, 'c', 10.2)
@@ -9328,6 +9352,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         calls = []
 
         class _FailingRemoteFactory(object):
+            def engine_active(self):
+                return True
+
             def destroy_all(self):
                 calls.append('remote')
                 raise RuntimeError('remote cleanup failed')
