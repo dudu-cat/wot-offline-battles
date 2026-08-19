@@ -2019,16 +2019,133 @@ against the selection and deselection angles. An exact `collideSegmentExt` hit
 still outranks every angular candidate, and the 710 m limit and the 80-degree
 deselection behaviour are unchanged.
 
-Using the engine's selection directly is the better answer if it is reachable,
-and two of the three preconditions are already proved.
-`_Targeting.getTargetEntity` reads `BigWorld.target.entity`, and both
-`PlayerAvatar.targetFocus` and `PlayerAvatar.targetBlur` open with
+Using the engine's selection directly is the better answer if it is reachable.
+Both `PlayerAvatar.targetFocus` and `PlayerAvatar.targetBlur` open with
 `if entity not in self.__vehicles: return`, so the stock handlers ignore a
 client-only `OfflineEntity` instead of calling `drawEdge` on it. What is not
-proved is whether the native targeting enumerates these entities at all, and
-whether `isEnabled` is true through this port's control-mode flow. A
-`TARGETING` line now reports `isEnabled`, the three constants and the id of
-`BigWorld.target.entity` once a second, so one battle settles it.
+proved is whether the native picker enumerates these entities at all. A
+`TARGETING` line now reports `isEnabled`, `isFull`, the three constants and the
+id of the engine's current pick once a second, so one battle settles it. Read
+that pick with `BigWorld.target()`, never with `BigWorld.target.entity`; the
+next section explains why the attribute kills the process.
+
+## Reading `BigWorld.target.entity` kills the client
+
+The sixth dump is the first one this port earned by reading a native attribute
+rather than by holding a native object too long. `BigWorld.target.entity` has no
+null check, and the `TARGETING` diagnostic read it once a second.
+
+### What the dump reports
+
+`crash6.dmp` carries no exception stream. The outermost `EXCEPTION_RECORD` sits
+at `0x001af204` on the main stack, with the matching `CONTEXT` at `0x001af254`:
+
+```
+code    = 0xC0000005  ACCESS_VIOLATION
+address = 0x006682a3
+params  = 0 (read), 0x000000d4
+eip=006682a3 esp=001af540 ebp=001af55c
+eax=0faf64c0 ecx=00668270 edx=01a09348 esi=00000000 edi=00000000
+```
+
+A neighbouring stack buffer holds the reporter's own text, `Read @ 0x000000D4`.
+The fault is a read of `esi + 0xD4` with `esi` zero. It is not an assertion, and
+it is not in the `EdgeDrawer`.
+
+The C++ frames follow the `EBP` chain without a gap:
+
+```
+eip  0x006682a3  the PyTarget attribute getter registered as `entity`
+#01  0x0102cb06  getset_get, CPython's descriptor read
+#02  0x00fb4926  PyObject_GenericGetAttr, at the tp_descr_get call
+#05  0x006a9277  PyTarget's own tp_getattro, whose entry is 0x006a9230
+#10  0x010036cf  PyEval_EvalFrameEx
+```
+
+The Python frames on that stack are this port's own:
+
+```
+./res/scripts/client/gui/mods/offline_lan_0922/battle_runtime.py
+    invoke -> _frame -> _report_local_compound
+```
+
+`_report_local_compound`'s frame reports `f_lineno 7479` and `f_lasti 195`.
+Offset 195 in that code object is the `CALL_FUNCTION 3` of
+`getattr(target, 'entity', None)`. `python.log` agrees: the last line the
+process ever wrote is the `COMPOUND` line, and the `TARGETING` line that the
+next statement builds never appears.
+
+### The exact getter, and why the attribute is unsafe
+
+`BigWorld.target` is a `PyTarget`. Its type object stands at `0x01a09348`, and
+its attributes are registered from a single run of calls between RVA `0x26982a`
+and RVA `0x269a59`: `isEnabled`, `skeletonCheckEnabled`, `isFull`, `isHidden`,
+`isHeld`, `noPartial`, `entity`, `source`, `maxDistance`,
+`selectionFovDegrees`, `deselectionFovDegrees` and `exclude`. The getter
+registered under the name `entity` is RVA `0x268270`, and it is four
+instructions long before it faults:
+
+```
+mov eax, dword ptr [0x1d20788]   ; the entity picker
+mov esi, dword ptr [eax + 0x60]  ; the picked entity, null when nothing is held
+mov esi, dword ptr [esi + 0xd4]  ; the entity's Python object -- no null check
+```
+
+The picker is a process-wide singleton reached through the pointer at
+`0x01d20788`. Its Python-visible fields are `selectionFovDegrees` at `+0x08`
+and `deselectionFovDegrees` at `+0x0c`, both stored in radians and multiplied
+into degrees by the getter, `maxDistance` at `+0x10`, `source` at `+0x5c`, the
+picked entity at `+0x60`, `isFull` at `+0x64`, `isHidden` at `+0x65`,
+`noPartial` at `+0x7c`, `isHeld` at `+0x7e`, `isEnabled` at `+0x7f` and
+`skeletonCheckEnabled` at `+0x80`. Every getter except `entity`, `source` and
+`exclude` reads a scalar out of that singleton and cannot fault.
+
+`PyTarget`'s `tp_call` is RVA `0x267070`, and it is the guarded read:
+
+```c
+if (PyTuple_Size(args) != 0) { TypeError("No arguments expected"); }
+EntityPicker & p = *pPicker;
+if (!p.isFull_)          return Py_None;
+if (p.isHidden_)         return Py_None;
+if (p.pTarget_ == NULL)  return Py_None;
+if (p.pTarget_->[0x92])  return Py_None;
+return newref(p.pTarget_->[0xD4]);
+```
+
+#1513 itself reads the target that way. `PlayerAvatar.handleKey` line 1109 opens
+its mark-target branch with `if BigWorld.target() is None:`. The one script that
+reads the raw attribute, `_Targeting.getTargetEntity`, is never called anywhere
+in the shipped scripts.
+
+`getattr(target, 'entity', None)` does not protect anything here. The default
+only applies to `AttributeError`; the getter finds the attribute and then
+dereferences a null pointer inside the engine.
+
+### What the picker actually held
+
+The dump also settles the state that the diagnostic was written to report. At
+the moment of the fault the picker read `isEnabled = 1`,
+`skeletonCheckEnabled = 1`, `selectionFovDegrees` = 1 degree,
+`deselectionFovDegrees` = 80 degrees, `maxDistance` = 710, `isFull = 0` and a
+null picked entity. The engine's targeting is enabled and carries the constants
+`AvatarInputHandler._Targeting.__init__` sets, and at that instant it held
+nothing. That is one sample from one frame. It does not yet prove whether the
+native picker enumerates this port's client-only entities.
+
+### The fix
+
+`_report_local_compound` now calls `BigWorld.target()` instead of reading
+`BigWorld.target.entity`. The scalar attributes stay, and `isFull` joins them so
+the log separates "the picker never locks anything" from "the picker locks
+something this port cannot see".
+
+The five dumps before this one all came from one direction of the boundary: a
+native object this port created, replaced or released while the engine still
+held it. This dump names the other direction. A native read can dereference
+engine state that no Python guard covers, and `getattr` with a default hides
+nothing, because the engine faults instead of raising. Treat a new native
+attribute the same way as a new native call: find the getter, read what it
+dereferences, and prefer the accessor that #1513's own scripts use.
 
 ## What can paint a black shape on the ground under the player
 

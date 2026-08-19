@@ -8415,6 +8415,44 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIsNone(battle._outlined_engine_id)
         self.assertFalse(battle._outline_blocked)
 
+    def test_the_targeting_report_never_reads_the_entity_attribute(self):
+        """#1513's PyTarget.entity getter loads EntityPicker::pTarget_ and
+        dereferences it at +0xD4 with no null check, so reading the attribute
+        while nothing is picked faults on 0x000000D4 and kills the client.
+        PyTarget's tp_call checks isFull, isHidden and the pointer before it
+        returns the entity, and PlayerAvatar.handleKey reads the target that
+        way."""
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        picked = []
+
+        class _PyTarget(object):
+
+            isEnabled = True
+            isFull = False
+            selectionFovDegrees = 1.0
+            maxDistance = 710.0
+            skeletonCheckEnabled = True
+
+            @property
+            def entity(self):
+                raise AssertionError('PyTarget.entity faults on a null pick')
+
+            def __call__(self):
+                picked.append(True)
+                return None
+
+        runtime.bigworld.target = _PyTarget()
+        battle._local_matrix = _Matrix()
+        written = []
+        with mock.patch.object(sys, 'stdout') as stdout:
+            stdout.write = written.append
+            self.assertTrue(battle._report_local_compound(100.0))
+
+        self.assertEqual([True], picked)
+        self.assertTrue(any('TARGETING' in line and 'entity=None' in line
+                            for line in written))
+
     def test_a_wreck_that_becomes_visible_again_is_restated_as_dead(self):
         """A pooled marker re-attached on re-entry is not re-stated by the
         plugin, so the startVisual tail has to push the dead state again."""

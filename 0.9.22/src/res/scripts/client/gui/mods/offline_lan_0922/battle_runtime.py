@@ -7495,11 +7495,14 @@ class BattleRuntime(object):
             '[Offline LAN 0.9.22] COMPOUND at=%s axes=%s\n' % (
                 _format_xyz(matrix.translation), _format_axes(matrix)))
         target = getattr(self._runtime.bigworld, 'target', None)
-        entity = getattr(target, 'entity', None)
+        # PyTarget.entity dereferences the picked entity with no null check.
+        # Calling the object is the guarded read #1513 itself uses.
+        entity = target() if callable(target) else None
         sys.stdout.write(
-            '[Offline LAN 0.9.22] TARGETING enabled=%s fov=%s max=%s '
+            '[Offline LAN 0.9.22] TARGETING enabled=%s full=%s fov=%s max=%s '
             'skeleton=%s entity=%s\n' % (
                 getattr(target, 'isEnabled', None),
+                getattr(target, 'isFull', None),
                 getattr(target, 'selectionFovDegrees', None),
                 getattr(target, 'maxDistance', None),
                 getattr(target, 'skeletonCheckEnabled', None),
