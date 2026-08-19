@@ -20,7 +20,8 @@ else:
     from . import core
 
 
-WINDOW_TITLE = "World of Tanks Offline Battles"
+LAUNCHER_VERSION = "0.5.0"
+WINDOW_TITLE = "World of Tanks Offline Battles %s" % LAUNCHER_VERSION
 MODE_LABELS = (
     (core.MODE_SINGLE, "Single player"),
     (core.MODE_HOST, "Host a LAN battle on this PC"),
