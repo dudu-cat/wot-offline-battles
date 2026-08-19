@@ -175,7 +175,11 @@ def pin_account_settings(account_settings=None):
 
 
 def _sanitize_account_filters(account_settings=None):
-    """Make every saved lobby filter carry exactly the default keys."""
+    """Make every keyed lobby filter carry exactly the default keys.
+
+    An empty default declares no key schema.  #1513 stores a set of shown
+    promo URLs under such a default, so those filters keep their saved value.
+    """
     import copy
     if account_settings is None:
         account_settings = _account_settings_module()
@@ -183,7 +187,7 @@ def _sanitize_account_filters(account_settings=None):
     defaults = account_settings.DEFAULT_VALUES[account_settings.KEY_FILTERS]
     repaired = []
     for name, default in defaults.items():
-        if not isinstance(default, dict):
+        if not isinstance(default, dict) or not default:
             continue
         saved = settings_type.getFilter(name)
         if isinstance(saved, dict):

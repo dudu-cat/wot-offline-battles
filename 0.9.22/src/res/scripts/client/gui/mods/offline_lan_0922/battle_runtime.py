@@ -976,6 +976,7 @@ class BattleRuntime(object):
         self._local_still_since = None
         self._published_vision_radius = None
         self._published_still_devices = {}
+        self._vision_feed_failed = False
         self._reported_crew_impaired = None
         self._battle_result = None
         self._round_finished_notified = False
@@ -1130,6 +1131,7 @@ class BattleRuntime(object):
         self._local_still_since = None
         self._published_vision_radius = None
         self._published_still_devices = {}
+        self._vision_feed_failed = False
         self._reported_crew_impaired = None
         self._battle_result = self._start_message.get('battle_result')
         self._round_finished_notified = False
@@ -9238,26 +9240,40 @@ class BattleRuntime(object):
         Retail feeds both of these from the cell: ``syncVehicleAttrs`` carries
         the effective ``circularVisionRadius`` that the minimap view circle
         draws, and ``updateVehicleOptionalDeviceStatus`` lights one optional
-        device slot in the consumables panel.
+        device slot in the consumables panel.  Both are presentation only, so
+        a stock panel failure disables the feed instead of ending the round.
         """
         descriptor = self._local_descriptor
-        if self._avatar is None or descriptor is None:
+        if (self._vision_feed_failed or self._avatar is None or
+                descriptor is None):
             return False
-        radius = self._vision_radius(
-            descriptor, entity=entity, still_seconds=still_seconds, local=True)
-        if (self._published_vision_radius is None or
-                abs(radius - self._published_vision_radius) >
-                VISION_PUBLISH_EPSILON):
-            self._avatar.syncVehicleAttrs({'circularVisionRadius': radius})
-            self._published_vision_radius = radius
-        self._publish_optional_devices(descriptor, still_seconds)
+        try:
+            radius = self._vision_radius(
+                descriptor, entity=entity, still_seconds=still_seconds,
+                local=True)
+            if (self._published_vision_radius is None or
+                    abs(radius - self._published_vision_radius) >
+                    VISION_PUBLISH_EPSILON):
+                self._avatar.syncVehicleAttrs(
+                    {'circularVisionRadius': radius})
+                self._published_vision_radius = radius
+            self._publish_optional_devices(descriptor, still_seconds)
+        except Exception:
+            self._vision_feed_failed = True
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] battle HUD vision feed disabled for '
+                'this round: %s\n' % traceback.format_exc().rstrip())
+            return False
         return True
 
     def _publish_optional_devices(self, descriptor, still_seconds):
-        """Mark every mounted optional device on or off in the battle panel.
+        """Light the mounted stationary optional devices in the battle panel.
 
-        The stock panel creates a slot on the first status for a device, so a
-        device whose status never arrives has no icon at all.
+        #1513 announces a device on its first status and only updates it
+        afterwards, and ``ConsumablesPanel.__genNextIdx`` asserts once the two
+        optional-device slots are taken.  Only ``camouflageNet`` and
+        ``stereoscope`` carry ``activateWhenStillSec``, so publishing exactly
+        those matches retail and cannot exhaust the panel.
         """
         update = getattr(
             self._avatar, 'updateVehicleOptionalDeviceStatus', None)
@@ -9268,10 +9284,11 @@ class BattleRuntime(object):
             identity = getattr(device, 'id', None)
             if not isinstance(identity, tuple) or len(identity) != 2:
                 continue
-            device_id = int(identity[1])
             delay = _number(getattr(device, 'activateWhenStillSec', 0.0))
-            active = (loadout_law.still_device_active(still_seconds, delay)
-                      if delay > 0.0 else True)
+            if delay <= 0.0:
+                continue
+            device_id = int(identity[1])
+            active = loadout_law.still_device_active(still_seconds, delay)
             if self._published_still_devices.get(device_id) is active:
                 continue
             self._published_still_devices[device_id] = active
@@ -10253,6 +10270,7 @@ class BattleRuntime(object):
         self._local_still_since = None
         self._published_vision_radius = None
         self._published_still_devices = {}
+        self._vision_feed_failed = False
         self._reported_crew_impaired = None
         self._battle_result = None
         self._round_finished_notified = False

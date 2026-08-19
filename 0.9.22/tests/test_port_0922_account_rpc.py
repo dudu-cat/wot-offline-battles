@@ -342,6 +342,30 @@ class AccountRpcTests(unittest.TestCase):
         self.assertEqual(['CAROUSEL_FILTER_2'], repaired)
         self.assertEqual({'CAROUSEL_FILTER_2': {'elite': False}}, writes)
 
+    def test_filter_sanitizer_keeps_a_filter_that_has_no_key_schema(self):
+        # #1513 stores the shown promo URLs as a set under an empty default.
+        defaults = {'PROMO': {}, 'CAROUSEL_FILTER_2': {'elite': False}}
+        writes = {}
+
+        class _Settings(object):
+            @staticmethod
+            def getFilter(name):
+                return set(['seen']) if name == 'PROMO' else {'elite': True}
+
+            @staticmethod
+            def setFilter(name, value):
+                writes[name] = value
+
+        class _Module(object):
+            KEY_FILTERS = 'FILTERS'
+            DEFAULT_VALUES = {'FILTERS': defaults}
+            AccountSettings = _Settings
+
+        repaired = compatibility._sanitize_account_filters(_Module)
+
+        self.assertEqual([], repaired)
+        self.assertEqual({}, writes)
+
     def test_eula_version_survives_server_restart_and_can_be_deleted(self):
         eula_contract = CONTRACT['intUserSettings']
         self.assertEqual(

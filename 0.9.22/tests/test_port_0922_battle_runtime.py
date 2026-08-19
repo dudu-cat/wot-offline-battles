@@ -4537,6 +4537,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 name='coatedOptics', id=(0, 5),
                 circularVisionRadiusFactor=1.1),
             types.SimpleNamespace(
+                name='camouflageNet', id=(0, 6),
+                activateWhenStillSec=3.0),
+            types.SimpleNamespace(
                 name='stereoscope', id=(0, 4),
                 circularVisionRadiusFactor=1.25,
                 activateWhenStillSec=3.0),
@@ -4546,11 +4549,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
             still_seconds=0.0, local=False: (
                 460.0 if still_seconds >= 3.0 else 405.0)
 
-        # A moving player: the always-on optic is lit, the telescope is not.
+        # A moving player: both stationary devices are out, and the always-on
+        # optic never takes one of the two panel slots.
         battle._publish_local_vision_state(None, 0.0)
         self.assertEqual([{'circularVisionRadius': 405.0}],
                          battle._avatar.attr_updates)
-        self.assertEqual([(10, 5, True), (10, 4, False)],
+        self.assertEqual([(10, 6, False), (10, 4, False)],
                          battle._avatar.optional_devices)
 
         # Nothing changed, so neither surface is written again.
@@ -4558,16 +4562,45 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(1, len(battle._avatar.attr_updates))
         self.assertEqual(2, len(battle._avatar.optional_devices))
 
-        # Past the activation delay the telescope lights and the circle grows.
+        # Past the activation delay both light and the circle grows.
         battle._publish_local_vision_state(None, 3.0)
         self.assertEqual([{'circularVisionRadius': 405.0},
                           {'circularVisionRadius': 460.0}],
                          battle._avatar.attr_updates)
-        self.assertEqual((10, 4, True), battle._avatar.optional_devices[-1])
+        self.assertEqual([(10, 6, True), (10, 4, True)],
+                         battle._avatar.optional_devices[2:])
 
-        # Moving again puts it back out.
+        # Moving again puts them back out.
         battle._publish_local_vision_state(None, 0.0)
-        self.assertEqual((10, 4, False), battle._avatar.optional_devices[-1])
+        self.assertEqual([(10, 6, False), (10, 4, False)],
+                         battle._avatar.optional_devices[4:])
+        self.assertEqual(6, len(battle._avatar.optional_devices))
+
+    def test_a_battle_hud_panel_failure_does_not_end_the_round(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._avatar.playerVehicleID = 10
+        descriptor = _Descriptor()
+        descriptor.miscAttrs = {'circularVisionRadiusFactor': 1.1}
+        descriptor.optionalDevices = (
+            types.SimpleNamespace(
+                name='stereoscope', id=(0, 4), activateWhenStillSec=3.0),)
+        battle._local_descriptor = descriptor
+        battle._vision_radius = lambda unused_descriptor, entity=None, \
+            still_seconds=0.0, local=False: 405.0
+
+        def _explode(vehicle_id, device_id, is_on):
+            raise AssertionError
+
+        battle._avatar.updateVehicleOptionalDeviceStatus = _explode
+
+        self.assertFalse(battle._publish_local_vision_state(None, 0.0))
+        self.assertTrue(battle._vision_feed_failed)
+        # The feed stays off, and the round keeps running.
+        battle._avatar.updateVehicleOptionalDeviceStatus = (
+            lambda *args: self.fail('the disabled feed published again'))
+        self.assertFalse(battle._publish_local_vision_state(None, 5.0))
 
     def test_a_bot_that_neither_moves_nor_turns_idles(self):
         runtime = _runtime()
