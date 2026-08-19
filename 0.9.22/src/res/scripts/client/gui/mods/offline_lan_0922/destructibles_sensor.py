@@ -252,7 +252,8 @@ def _clear_runtime_registry():
 			'g_offh_tree_state', 'g_offh_destr_ordered',
 			'g_offh_destr_chunks', 'g_offh_destr_instances',
 			'g_offh_destr_contact_bins', 'g_offh_destr_pending',
-			'g_offh_destr_falling_active',
+			'g_offh_destr_falling_active', 'g_offh_destr_ground_skips',
+			'g_offh_destr_broken_cache',
 			'g_offh_destr_diagnostics', 'g_offh_destr_diag_last_static',
 			'g_offh_destr_runtime_space'):
 		globals().pop(name, None)
@@ -1003,6 +1004,71 @@ def _motion_travel_reach(vel, dt):
 	# reach can accept the static hit, then miss the pending native skin during
 	# the copied pose commit and incorrectly feed it through hard-wall braking.
 	return max(0.4, abs(float(vel)) * max(0.0, float(dt)) + 0.2)
+
+
+def ground_collision_filter(x, z):
+	"""Return a ``wg_collideSegment`` filter that hides broken destructibles.
+
+	#1513 passes such a callback as the fifth argument itself: the falling
+	animator builds ``partial(_fallCollideCallback, destrIndex, chunkID)`` so
+	the engine skips that surface and reports the next real one.  A broken item
+	is not part of the vehicle's collision in retail, so the suspension and the
+	drive slope must not sample its skin while the model waits to hide.
+	``None`` keeps the native fast path where no broken item covers this column.
+	"""
+	if _destructible_catalog is None:
+		return None
+	contact_bins = globals().get('g_offh_destr_contact_bins')
+	if not contact_bins:
+		return None
+	members = contact_bins.get(_destructible_bin_key(x, z))
+	if not members:
+		return None
+	authority = _get_destr_authority()
+	broken = set()
+	for chunk_id, item_index in members:
+		for mat_kind in _broken_item_materials_1513(
+				authority, chunk_id).get(int(item_index), ()):
+			broken.add((int(chunk_id), int(item_index), mat_kind))
+	if not broken:
+		return None
+
+	def reject_broken_skin(*hit):
+		# This runs inside a native ray query.  It reads local state only and
+		# keeps the surface whenever the identity cannot be resolved.
+		try:
+			identity = (int(hit[3]), int(hit[2]))
+		except (IndexError, TypeError, ValueError, OverflowError):
+			return True
+		if (identity + (hit[0],)) not in broken and (
+				identity + (None,)) not in broken:
+			return True
+		globals()['g_offh_destr_ground_skips'] = globals().get(
+			'g_offh_destr_ground_skips', 0) + 1
+		return False
+
+	return reject_broken_skin
+
+
+def _broken_item_materials_1513(authority, chunkID):
+	"""Index one chunk's accepted keys by item, refreshed as the set grows."""
+	cache = globals().setdefault('g_offh_destr_broken_cache', {})
+	keys = authority.destroyed_keys(chunkID)
+	entry = cache.get(chunkID)
+	if entry is not None and entry[0] == len(keys):
+		return entry[1]
+	items = {}
+	for item_index, mat_kind in keys:
+		items.setdefault(int(item_index), set()).add(mat_kind)
+	cache[chunkID] = (len(keys), items)
+	return items
+
+
+def take_ground_skip_count():
+	"""Return and clear how many broken surfaces the ground filter hid."""
+	count = globals().get('g_offh_destr_ground_skips', 0)
+	globals()['g_offh_destr_ground_skips'] = 0
+	return int(count)
 
 
 def _catalog_pending_at_hull(pos, yaw, vel, td, now, dt=0.04):

@@ -2868,13 +2868,35 @@ class BattleRuntime(object):
         return self._runtime.math.Vector3(
             float(position[0]), float(position[1]), float(position[2]))
 
+    def _ground_filter(self, x, z):
+        """Build the #1513 fifth-argument filter for this ground column.
+
+        Retail keeps a breakable destructible out of the vehicle's collision,
+        so a crushed fence must not carry the suspension or the drive slope
+        while its model waits for the hiding callback.
+        """
+        probe = getattr(
+            self._destructibles, 'ground_collision_filter', None)
+        if not callable(probe):
+            return None
+        ground_filter = probe(x, z)
+        return ground_filter if callable(ground_filter) else None
+
+    def _collide_down(self, start, end, ground_filter):
+        """Vertical probe that skips the skin of an already broken item."""
+        if ground_filter is None:
+            return self._runtime.bigworld.wg_collideSegment(
+                self._avatar.spaceID, start, end, 128)
+        return self._runtime.bigworld.wg_collideSegment(
+            self._avatar.spaceID, start, end, 128, ground_filter)
+
     def _ground_y(self, x, z, hint=0.0, allow_wide=False):
         """Use the 0.8.2 near-hull probe so roofs do not become terrain."""
+        ground_filter = self._ground_filter(x, z)
         try:
-            hit = self._runtime.bigworld.wg_collideSegment(
-                self._avatar.spaceID,
+            hit = self._collide_down(
                 self._vector((x, hint + 8.0, z)),
-                self._vector((x, hint - 30.0, z)), 128)
+                self._vector((x, hint - 30.0, z)), ground_filter)
             if hit is not None:
                 value = float(hit[0].y)
                 if -14.0 < value - float(hint) < 6.0:
@@ -2886,16 +2908,15 @@ class BattleRuntime(object):
         from_y = max(1000.0, hint + 50.0)
         height = None
         for unused_layer in range(4):
-            hit = self._runtime.bigworld.wg_collideSegment(
-                self._avatar.spaceID, self._vector((x, from_y, z)),
-                self._vector((x, -1000.0, z)), 128)
+            hit = self._collide_down(
+                self._vector((x, from_y, z)),
+                self._vector((x, -1000.0, z)), ground_filter)
             if hit is None:
                 return None
             height = float(hit[0].y)
-            below = self._runtime.bigworld.wg_collideSegment(
-                self._avatar.spaceID,
+            below = self._collide_down(
                 self._vector((x, height - 0.4, z)),
-                self._vector((x, -1000.0, z)), 128)
+                self._vector((x, -1000.0, z)), ground_filter)
             if below is None or height - float(below[0].y) < 2.5:
                 return height
             from_y = height - 0.4
@@ -2905,12 +2926,12 @@ class BattleRuntime(object):
         """Copy the 0.8.2 same-layer graph probe, including ford depth."""
         probe_top = float(hint_y) + 8.0
         probe_bottom = float(hint_y) - 18.0
+        ground_filter = self._ground_filter(x, z)
         for unused_layer in range(3):
             try:
-                hit = self._runtime.bigworld.wg_collideSegment(
-                    self._avatar.spaceID,
+                hit = self._collide_down(
                     self._vector((x, probe_top, z)),
-                    self._vector((x, probe_bottom, z)), 128)
+                    self._vector((x, probe_bottom, z)), ground_filter)
             except Exception:
                 return None
             if hit is None:
@@ -7497,7 +7518,7 @@ class BattleRuntime(object):
     }
 
     def _report_destructible_contact(self, who, kinds, status, path,
-                                     before, after, now):
+                                     before, after, now, extra=''):
         """Name the item and the code path that changed a contact speed."""
         if not kinds or kinds == '-':
             return False
@@ -7509,9 +7530,30 @@ class BattleRuntime(object):
         self._crush_reports += 1
         sys.stdout.write(
             '[Offline LAN 0.9.22] CRUSH who=%s kind=%s status=%s path=%s '
-            'v0=%.2f v1=%.2f\n' % (
-                who, kinds, status, path, float(before), float(after)))
+            'v0=%.2f v1=%.2f%s\n' % (
+                who, kinds, status, path, float(before), float(after), extra))
         return True
+
+    def _report_local_contact_tick(self, path, before, pitch, rise):
+        """Close the tick with the drive slope, the hull rise and the skips.
+
+        A crushed item must cost neither speed nor height, so the same line
+        carries the contact seam's answer and what the ground probes did.
+        """
+        reader = getattr(
+            self._destructibles, 'take_ground_skip_count', None)
+        skips = int(_number(reader())) if callable(reader) else 0
+        kinds = self._local_motion_kinds
+        if kinds == '-' and skips:
+            kinds = 'ground'
+        if (path in (None, 'advance') and not skips and
+                self._local_motion_status != 'crushed'):
+            return False
+        return self._report_destructible_contact(
+            'local', kinds, self._local_motion_status, path or 'still',
+            before, self._local_speed, self._clock(),
+            ' pitch=%.3f dy=%+.3f skip=%d' % (
+                float(pitch), float(rise), int(skips)))
 
     def _report_bot_destructible_contact(self, bot_id, status, before, after):
         """Bot-side seam for the same contact-speed diagnostic."""
@@ -7813,12 +7855,13 @@ class BattleRuntime(object):
 
         def ground_y(x, z):
             start_y = position[1] + 15.0
+            ground_filter = self._ground_filter(x, z)
             for unused in range(3):
                 try:
-                    collision = self._runtime.bigworld.wg_collideSegment(
-                        self._avatar.spaceID,
+                    collision = self._collide_down(
                         self._vector((x, start_y, z)),
-                        self._vector((x, position[1] - 60.0, z)), 128)
+                        self._vector((x, position[1] - 60.0, z)),
+                        ground_filter)
                 except Exception:
                     return None
                 if collision is None:
@@ -8133,10 +8176,10 @@ class BattleRuntime(object):
             x = position[0] + sine * distance
             z = position[2] + cosine * distance
             try:
-                hit = self._runtime.bigworld.wg_collideSegment(
-                    self._avatar.spaceID,
+                hit = self._collide_down(
                     self._vector((x, position[1] + 2.0, z)),
-                    self._vector((x, -1000.0, z)), 128)
+                    self._vector((x, -1000.0, z)),
+                    self._ground_filter(x, z))
             except Exception:
                 hit = None
             if hit is None:
@@ -8349,6 +8392,10 @@ class BattleRuntime(object):
         position = self._local_position
         tick_pose = position
         yaw = self._local_yaw
+        contact_path = None
+        reader = getattr(self._destructibles, 'take_ground_skip_count', None)
+        if callable(reader):
+            reader()
         slope_pitch = (0.0 if self._local_airborne else
                        self._smoothed_drive_pitch(position, yaw))
         throttle = self._sender.forward
@@ -8375,8 +8422,6 @@ class BattleRuntime(object):
                 self._destructibles._fell_trees_near(
                     self._avatar.spaceID, self._vector(position), yaw,
                     self._local_speed, entity.typeDescriptor)
-            contact_speed = self._local_speed
-            contact_path = None
             if self._motion_is_clear(
                     entity, position, yaw, self._local_speed, dt,
                     allow_crush_drive=(throttle * self._local_speed > 0.0 and
@@ -8431,13 +8476,6 @@ class BattleRuntime(object):
                             self._local_speed = 0.0
                         self._local_grind = 4
                         contact_path = 'brake'
-            if contact_path is not None and (
-                    contact_path != 'advance' or
-                    self._local_motion_status == 'crushed'):
-                self._report_destructible_contact(
-                    'local', self._local_motion_kinds,
-                    self._local_motion_status, contact_path,
-                    contact_speed, self._local_speed, self._clock())
 
         if is_tracked or is_engine_dead:
             turn = 0.0
@@ -8462,18 +8500,18 @@ class BattleRuntime(object):
             self._local_support_tick_pose = None
         support_blocked = self._local_support_rise_blocked
         if support_blocked:
-            support_speed = self._local_speed
             self._local_speed *= 0.35 ** (dt * 60.0)
             if abs(self._local_speed) < 0.05:
                 self._local_speed = 0.0
             self._local_grind = 4
-            self._report_destructible_contact(
-                'local', 'support', 'hard', 'support',
-                support_speed, self._local_speed, self._clock())
+            contact_path = 'support'
         self._ground_pitch(position, yaw, entity.typeDescriptor)
         position = self._apply_slope_slide(position, yaw, dt, entity)
         position = self._resolve_local_tank_contacts(
             entity, position, yaw, dt)
+        self._report_local_contact_tick(
+            contact_path, previous_speed, slope_pitch,
+            position[1] - tick_pose[1])
         self._local_position, self._local_yaw = position, yaw
         presentation_position = self._update_local_presentation(entity, dt)
         self._avatar.updateOwnVehiclePosition(

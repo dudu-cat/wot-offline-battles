@@ -3325,6 +3325,80 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 authority.destroy_module.assert_not_called()
                 authority.destroy_column.assert_not_called()
 
+    def _ground_filter_fixture(self, destroyed_keys):
+        """Index one fence tile and answer with the given accepted keys."""
+        destructibles_sensor.xrange = range
+        filename = 'content/GatesAndFences/gaf010/normal/lod0/tile.model'
+        destructibles_sensor.set_catalog(_catalog({
+            filename: {
+                'kind': 'fragile',
+                'boxes': [[-1.0, -0.04, -0.5, 1.0, 1.9, 0.5, None]],
+            },
+        }))
+        record = destructibles_sensor._destructible_catalog[
+            'resources'][filename.lower()]
+        boxes = destructibles_sensor._world_catalog_boxes(
+            record, _ItemMatrix(_Vector(0.0, 0.0, 4.0)), _Vector(),
+            types.SimpleNamespace(Vector3=_Vector))
+        instance = {
+            'filename': filename.lower(), 'kind': 'fragile',
+            'boxes': boxes, 'item_scale': 1.0,
+        }
+        destructibles_sensor.g_offh_destr_instances = {(22, 37): instance}
+        destructibles_sensor.g_offh_destr_contact_bins = {}
+        destructibles_sensor._index_catalog_instance_1513(
+            destructibles_sensor.g_offh_destr_contact_bins,
+            (22, 37), instance)
+        authority = types.SimpleNamespace(
+            destroyed_keys=lambda chunk_id: (
+                destroyed_keys if chunk_id == 22 else ()))
+        return authority
+
+    def test_ground_filter_is_absent_until_the_item_is_broken(self):
+        authority = self._ground_filter_fixture(set())
+
+        with mock.patch.object(
+                destructibles_sensor, '_get_destr_authority',
+                return_value=authority):
+            self.assertIsNone(
+                destructibles_sensor.ground_collision_filter(0.0, 4.0))
+            self.assertIsNone(
+                destructibles_sensor.ground_collision_filter(80.0, 80.0))
+
+    def test_ground_filter_hides_only_the_broken_identity(self):
+        authority = self._ground_filter_fixture(set([(37, None)]))
+
+        with mock.patch.object(
+                destructibles_sensor, '_get_destr_authority',
+                return_value=authority):
+            ground_filter = destructibles_sensor.ground_collision_filter(
+                0.0, 4.0)
+            self.assertIsNone(
+                destructibles_sensor.ground_collision_filter(80.0, 80.0))
+
+        destructibles_sensor.take_ground_skip_count()
+        # The engine passes (matKind, collFlags, itemIndex, chunkID) and keeps
+        # the surface when the filter answers True.
+        self.assertFalse(ground_filter(75, 0, 37, 22))
+        self.assertTrue(ground_filter(75, 0, 38, 22))
+        self.assertTrue(ground_filter(75, 0, 37, 23))
+        self.assertTrue(ground_filter(2, 0, -1, -1))
+        self.assertTrue(ground_filter(2, 0, None, None))
+        self.assertEqual(1, destructibles_sensor.take_ground_skip_count())
+        self.assertEqual(0, destructibles_sensor.take_ground_skip_count())
+
+    def test_ground_filter_hides_one_broken_structure_module(self):
+        authority = self._ground_filter_fixture(set([(37, 74)]))
+
+        with mock.patch.object(
+                destructibles_sensor, '_get_destr_authority',
+                return_value=authority):
+            ground_filter = destructibles_sensor.ground_collision_filter(
+                0.0, 4.0)
+
+        self.assertTrue(ground_filter(73, 0, 37, 22))
+        self.assertFalse(ground_filter(74, 0, 37, 22))
+
     def test_stationary_multi_module_structure_crushes_each_module(self):
         detail, authority, unused_descriptor = (
             self._stationary_contact_status([{

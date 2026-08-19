@@ -106,6 +106,12 @@ def is_destroyed(chunkID, itemIndex, matKind=None):
 	return (itemIndex, matKind) in c['keys'] or (itemIndex, None) in c['keys']
 
 
+def destroyed_keys(chunkID):
+	"""Return this chunk's accepted (itemIndex, matKind) keys. Read only."""
+	c = _state.get('chunks', {}).get(chunkID)
+	return c['keys'] if c is not None else ()
+
+
 def _ensure_chunk(spaceID, chunkID, pos):
 	"""Start the manager space, spawn the chunk controller entity once
 	(the real server did this) and register the chunk. Returns the

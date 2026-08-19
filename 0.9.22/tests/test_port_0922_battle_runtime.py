@@ -6663,6 +6663,32 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(0.0, hard_battle._local_speed)
         self.assertEqual(5, hard_probe.call_count)
 
+    def test_ground_probe_hands_the_broken_skin_filter_to_the_engine(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        skin_filter = lambda *unused: True
+        battle._destructibles = mock.Mock()
+        battle._destructibles.ground_collision_filter.side_effect = (
+            lambda x, z: skin_filter if x > 0.0 else None)
+        calls = []
+
+        def collide(*args):
+            calls.append(args)
+            return (_Vector(args[1].x, 1.0, args[1].z),
+                    _Vector(0.0, 1.0, 0.0), 2)
+
+        runtime.bigworld.wg_collideSegment = collide
+
+        self.assertEqual(1.0, battle._ground_y(1.0, 0.0, 0.0))
+        self.assertEqual(1.0, battle._ground_y(-1.0, 0.0, 0.0))
+        battle._terrain_support((1.0, 0.0, 0.0), 0.0)
+
+        self.assertEqual(5, len(calls[0]))
+        self.assertIs(skin_filter, calls[0][4])
+        self.assertEqual(4, len(calls[1]))
+        self.assertTrue(all(len(call) == 5 for call in calls[2:]))
+
     def test_crushed_destructible_costs_no_speed_and_names_the_path(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -6679,7 +6705,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._local_position = (2.0, 3.0, 4.0)
         battle._local_descriptor = entity.typeDescriptor
         battle._attach_local_presentation()
+        battle._local_speed = 8.0
         battle._destructibles = mock.Mock()
+        battle._destructibles.take_ground_skip_count.return_value = 0
         battle._destructibles._catalog_motion_blocked.return_value = {
             'status': 'crushed',
             'token': ((22, 37, None),),
@@ -6718,7 +6746,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertGreater(battle._local_position[2], 4.0)
         self.assertEqual(
             ['[Offline LAN 0.9.22] CRUSH who=local kind=structure '
-             'status=crushed path=advance v0=8.00 v1=8.00\n'],
+             'status=crushed path=advance v0=8.00 v1=8.00 '
+             'pitch=0.000 dy=+0.000 skip=0\n'],
             [line for line in written if 'CRUSH' in line])
 
     def test_player_cap_crush_restores_real_speed_then_moves_next_tick(self):
