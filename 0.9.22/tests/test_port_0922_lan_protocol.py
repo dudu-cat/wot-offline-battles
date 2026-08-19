@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from pathlib import Path
 import unittest
@@ -641,3 +642,45 @@ class LanProtocolTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class OrderedEventVocabularyTests(unittest.TestCase):
+    """The client fails a round closed on an unknown ordered event, so the
+    two sides' vocabularies must not drift.  Shipping an `assist` event the
+    client did not know ended every battle."""
+
+    SERVER = (Path(__file__).resolve().parents[1] / 'server' /
+              'lan_battle_server.py')
+    CLIENT = (Path(__file__).resolve().parents[1] / 'src' / 'res' /
+              'scripts' / 'client' / 'gui' / 'mods' / 'offline_lan_0922' /
+              'battle_runtime.py')
+
+    def _server_kinds(self):
+        source = self.SERVER.read_text()
+        return set(re.findall(r'"kind":\s*"([a-z_]+)"', source))
+
+    def _client_kinds(self):
+        namespace = {}
+        source = self.CLIENT.read_text()
+        for name in ('_SHOT_EVENT_KINDS', '_COMBAT_EVENT_KINDS',
+                     '_SIMPLE_EVENT_KINDS'):
+            match = re.search(
+                r'^%s = \(.*?\)' % name, source, re.MULTILINE | re.DOTALL)
+            self.assertIsNotNone(match, name)
+            exec(compile(match.group(0), name, 'exec'), namespace)
+        return (set(namespace['_SHOT_EVENT_KINDS']) |
+                set(namespace['_COMBAT_EVENT_KINDS']) |
+                set(namespace['_SIMPLE_EVENT_KINDS']))
+
+    def test_the_client_handles_every_kind_the_server_emits(self):
+        server_kinds = self._server_kinds()
+        self.assertIn('assist', server_kinds)
+
+        unhandled = server_kinds - self._client_kinds()
+
+        self.assertEqual(set(), unhandled)
+
+    def test_battle_result_stays_in_the_client_vocabulary(self):
+        # The server sends it inside the round-end message rather than as a
+        # "kind" literal, so the extraction above cannot see it.
+        self.assertIn('battle_result', self._client_kinds())

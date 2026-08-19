@@ -85,6 +85,7 @@ class GarageState(object):
         self._snapshot = copy.deepcopy(snapshot)
         self._vehicles = vehicles_module
         self._tankmen = tankmen_module
+        self._touched = set()
         self.revision = 0
 
     def snapshot(self):
@@ -112,14 +113,22 @@ class GarageState(object):
         wanted = _int(vehicle_inventory_id)
         for record in self._records():
             if _int(record.get('id', 0)) == wanted:
+                self._touched.add(wanted)
                 return record
         raise GarageError('unknown vehicle inventory id %d' % wanted)
+
+    def touched_vehicles(self):
+        """Return the vehicle ids mutated since the last call, then reset."""
+        touched = set(self._touched)
+        self._touched = set()
+        return touched
 
     def _tankman_record(self, tankman_inventory_id):
         wanted = _int(tankman_inventory_id)
         for record in self._records():
             tankmen = record.get('tankmen')
             if isinstance(tankmen, dict) and wanted in tankmen:
+                self._touched.add(_int(record.get('id', 0)))
                 return record, wanted
         raise GarageError('unknown tankman inventory id %d' % wanted)
 

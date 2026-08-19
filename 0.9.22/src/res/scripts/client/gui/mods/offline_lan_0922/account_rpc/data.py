@@ -176,7 +176,7 @@ def _validate_selected_vehicle(vehicle):
             'selected vehicle customization catalogue must be non-empty')
 
 
-def inventory(selected_vehicle=None, validate=True):
+def inventory(selected_vehicle=None, validate=True, only_vehicles=None):
     """Return every loadable garage vehicle and its relational records.
 
     ``selected_vehicle`` is serialized by ``bootstrap._selected_vehicle``.  It
@@ -185,6 +185,11 @@ def inventory(selected_vehicle=None, validate=True):
 
     ``validate`` walks every record, so a fitting that already went through
     ``GarageState`` publishes without paying for it again.
+
+    ``only_vehicles`` limits the per-vehicle rows to the ids a fitting
+    touched.  ``Inventory.synchronize`` merges a partial diff per item type
+    through ``synchronizeDicts``, so the untouched rows keep their cached
+    values instead of being republished.
     """
     vehicle = selected_vehicle if isinstance(selected_vehicle, dict) else {}
     if validate:
@@ -200,6 +205,8 @@ def inventory(selected_vehicle=None, validate=True):
     tankman_vehicles = {}
     for record in records:
         vehicle_id = int(record.get('id', 1))
+        if only_vehicles is not None and vehicle_id not in only_vehicles:
+            continue
         crew = list(record.get('crew', ()))
         tankmen = dict(record.get('tankmen', {}))
         vehicle_values['crew'][vehicle_id] = crew

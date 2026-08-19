@@ -74,6 +74,12 @@ PREBATTLE_SECONDS = 15.0
 BATTLE_SECONDS = 900.0
 BOT_SPAWN_SECONDS = 0.30
 _SHOT_EVENT_KINDS = ('shot', 'bot_shot')
+# Ordered kinds that carry no shot or combat contract.  An unknown kind still
+# fails the round closed: the stream also carries health and kills, and a
+# silently skipped authority event would desynchronise the battle.
+_SIMPLE_EVENT_KINDS = (
+    'authority', 'bot_manifest', 'vehicle_statistics', 'destructible',
+    'projectile_impact', 'battle_result', 'assist')
 _COMBAT_EVENT_KINDS = (
     'health', 'hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit')
 _SHOT_OCCLUSION_EPSILON = 1.0e-3
@@ -1787,6 +1793,7 @@ class BattleRuntime(object):
                 descriptor, self._local_loadout(descriptor),
                 ammo_layout=self._local_ammo_layout())
             self._log_local_ammo(self._gun_state)
+            self._log_effective_parameters(descriptor)
             self._report_memory('battle_start')
             self._gun_last_tick = self._clock()
             self._sync = SnapshotSync(
@@ -3518,6 +3525,43 @@ class BattleRuntime(object):
         """
         return self._garage_loadout_snapshot()['shells'] or None
 
+    def _log_effective_parameters(self, descriptor):
+        """Print the values this battle actually uses for the player's tank.
+
+        These are the numbers to compare against the garage panel: a crew or
+        equipment bonus the garage shows and the battle ignores shows up here
+        as a difference, not as a feeling.
+        """
+        state = self._gun_state
+        profile = self._spotting_profile(descriptor, local=True)
+        loadout = self._local_loadout(descriptor)
+        still, moving = self._base_invisibility(
+            descriptor, profile['camouflage_level'])
+        chassis = _field(descriptor, 'chassis', {})
+        resistances = _field(chassis, 'terrainResistance', ()) or ()
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] PARAMS view=%.1f crew=%.1f/%.1f recon=%.1f '
+            'camo_crew=%.1f conceal_still=%.4f conceal_move=%.4f '
+            'shot_factor=%.3f net=%.3f binoc=%.3f reload=%.2f aim=%.2f '
+            'disp=%.4f traverse=%.2f/%.2f terrain=%s radio=%.0f '
+            'rammer=%s vents=%s brothers=%s rations=%s\n' % (
+                self._vision_radius(descriptor, local=True),
+                loadout['crew_level'], loadout['effective_crew_level'],
+                profile['recon_level'], profile['camouflage_level'],
+                still, moving,
+                self._shot_invisibility_factor(descriptor),
+                profile['camouflage_net_bonus'], profile['binocular_factor'],
+                state.reload, state.aim_time, state.base_dispersion,
+                _number(_field(_field(descriptor, 'turret', {}),
+                               'rotationSpeed', 0.0)),
+                _number(_field(chassis, 'rotationSpeed', 0.0)),
+                ','.join('%.2f' % _number(value) for value in resistances),
+                _number(_field(_field(descriptor, 'radio', {}),
+                               'distance', 0.0)),
+                loadout['has_rammer'], loadout['has_ventilation'],
+                loadout['has_brotherhood'], loadout['has_rations']))
+        return True
+
     def _log_local_ammo(self, state):
         """Print the shell counts this battle starts with, once per round."""
         layout = self._local_ammo_layout()
@@ -4108,9 +4152,7 @@ class BattleRuntime(object):
         elif kind in _COMBAT_EVENT_KINDS:
             self._validate_combat_event_contract(event)
             self._merge_combat_event_state(event)
-        elif kind not in (
-                'authority', 'bot_manifest', 'vehicle_statistics',
-                'destructible', 'projectile_impact', 'battle_result'):
+        elif kind not in _SIMPLE_EVENT_KINDS:
             raise RuntimeError(
                 'ordered LAN event kind is unsupported: %s' % kind)
 
@@ -4289,6 +4331,19 @@ class BattleRuntime(object):
         ('start_message', '_start_message'),
         ('health', '_last_health'),
         ('bot_destr_samples', '_bot_destructible_samples'),
+        ('spawn_planner', '_spawn_planner'),
+        ('projectile_meta', '_projectile_meta'),
+        ('projectile_visual', '_projectile_visual_meta'),
+        ('projectile_lineage', '_projectile_lineage'),
+        ('bot_assignments', '_bot_vehicle_assignments'),
+    )
+
+    _MEASURED_BOT_STRUCTURES = (
+        ('bot_states', 'states'),
+        ('bot_decisions', '_decision_cache'),
+        ('bot_cover_queue', '_cover_queue'),
+        ('bot_receipts', '_world_receipt_waiting'),
+        ('bot_debt', '_integration_debt'),
     )
 
     def _report_memory(self, moment):
@@ -4304,12 +4359,20 @@ class BattleRuntime(object):
                     (_deep_size(getattr(self, attribute, None)), name))
             except Exception:
                 continue
-        bots = getattr(self._bots, 'states', None)
-        if bots is not None:
+        for name, attribute in self._MEASURED_BOT_STRUCTURES:
             try:
-                sizes.append((_deep_size(bots), 'bot_states'))
+                sizes.append(
+                    (_deep_size(getattr(self._bots, attribute, None)), name))
             except Exception:
-                pass
+                continue
+        for name, holder in (('destructibles', self._destructibles),
+                             ('remote_vehicles', self._remote_factory)):
+            try:
+                sizes.append((_deep_size(
+                    getattr(holder, '_vehicles', None) or
+                    getattr(holder, '_destructible_catalog', None)), name))
+            except Exception:
+                continue
         registry = getattr(self._destructibles, 'registry_sizes', None)
         if callable(registry):
             try:
@@ -5795,9 +5858,15 @@ class BattleRuntime(object):
             velocity = visual.get('velocity') if visual else None
         if not velocity:
             return None
+        # __addExplosionEffect keys the effect at position +/- velocityDir,
+        # so a raw muzzle velocity stretched it over a kilometre of terrain.
+        direction = self._vector(_xyz(velocity))
+        if direction.length <= 0.0:
+            return None
+        direction.normalise()
         self._report_effect(
-            'world_explosion', material, effects_index, impact, velocity)
-        return (effects_descr, material, self._vector(_xyz(velocity)))
+            'world_explosion', material, effects_index, impact, direction)
+        return (effects_descr, material, direction)
 
     def _surface_effect_material(self, impact):
         """Resolve the impact surface to one ``EFFECT_MATERIALS`` name.

@@ -665,3 +665,40 @@ class GaragePersistenceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NarrowInventoryDiffTests(unittest.TestCase):
+    """A fitting republished all 632 vehicles and ~3500 tankmen, 15310 items
+    for a one-slot change. Inventory.synchronize merges a partial diff per
+    item type through synchronizeDicts, so only the touched rows are needed."""
+
+    def setUp(self):
+        unused_requests, unused_commands, self.garage = _request_modules()
+        self.data = _load('data')
+        self.vehicles, self.tankmen = _modules()
+
+    def test_only_the_touched_vehicle_is_published(self):
+        full = self.data.inventory(SNAPSHOT)
+        narrow = self.data.inventory(SNAPSHOT, only_vehicles=set([9]))
+
+        vehicle_type = self.data.VEHICLE_ITEM_TYPE
+        self.assertIn(
+            9, full['inventory'][vehicle_type]['compDescr'])
+        self.assertEqual(
+            set([9]), set(narrow['inventory'][vehicle_type]['compDescr']))
+        # The account-wide artefact counts stay whole: they are small and a
+        # mount changes them.
+        self.assertEqual(
+            full['inventory'][10], narrow['inventory'][10])
+
+    def test_a_mutation_records_the_vehicle_it_touched(self):
+        state = self.garage.GarageState(
+            SNAPSHOT, vehicles_module=self.vehicles,
+            tankmen_module=self.tankmen)
+        state.touched_vehicles()
+
+        state.equip_equipments(9, [11001, 0, 0])
+
+        self.assertEqual(set([9]), state.touched_vehicles())
+        # Reading the set clears it, so the next fitting starts clean.
+        self.assertEqual(set(), state.touched_vehicles())

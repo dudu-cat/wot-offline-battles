@@ -44,6 +44,13 @@ class _Vector(object):
     def scale(self, value):
         return _Vector((self.x * value, self.y * value, self.z * value))
 
+    def normalise(self):
+        length = self.length
+        if length:
+            self.x /= length
+            self.y /= length
+            self.z /= length
+
 
 class _BigWorld(object):
     def __init__(self):
@@ -367,7 +374,11 @@ class BattleProjectileTests(unittest.TestCase):
         effects_descr, material, velocity = bundle
         self.assertEqual({'groundHit': ('kp', 'fx', set())}, effects_descr)
         self.assertEqual('ground', material)
-        self.assertEqual(-100.0, velocity[1])
+        # __addExplosionEffect places the effect at position +/- velocityDir,
+        # so a raw muzzle velocity would stretch it over a kilometre.
+        self.assertAlmostEqual(1.0, velocity.length)
+        self.assertAlmostEqual(-100.0 / math.sqrt(100.0 ** 2 + 10.0 ** 2),
+                               velocity[1])
 
     def test_a_vehicle_terminal_carries_no_ground_explosion(self):
         battle, unused_bigworld = _battle(now=1.0)

@@ -42,6 +42,7 @@ def _fitting(context, mutate):
     """
     started = _clock()
     state = _garage(context)
+    state.touched_vehicles()
     try:
         mutate(state)
     except garage.GarageError as error:
@@ -60,8 +61,11 @@ def _fitting(context, mutate):
         _report_fitting_cost(started, mutated, saved, saved, None)
         return Result(commands.RES_SUCCESS)
 
+    touched = state.touched_vehicles()
+
     def publish():
-        diff = data.inventory(state.snapshot(), validate=False)
+        diff = data.inventory(
+            state.snapshot(), validate=False, only_vehicles=touched or None)
         built = _clock()
         push(diff)
         _report_fitting_cost(started, mutated, saved, built, diff)
