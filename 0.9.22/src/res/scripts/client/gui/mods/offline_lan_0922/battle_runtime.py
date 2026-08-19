@@ -3481,6 +3481,7 @@ class BattleRuntime(object):
         entity = self._server_entity(self._server.vehicle_id)
         if entity is None:
             return False
+        self._sync_fire_effect(entity, False)
         if self._local_model is not None and self._local_native_matrix is not None:
             self._local_model.matrix = self._local_native_matrix
         clear = getattr(
@@ -5431,12 +5432,34 @@ class BattleRuntime(object):
                 '#1513 descriptor has no critical extra: %s' % extra_name)
         return selected_index
 
+    def _sync_fire_effect(self, entity, burning=None):
+        """Match the stock #1513 fire extra to the copied burning state."""
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        extras = getattr(descriptor, 'extrasDict', None)
+        extra = extras.get('fire') if extras is not None else None
+        if extra is None:
+            return False
+        if burning is None:
+            burning = getattr(entity, 'is_on_fire', False)
+        burning = bool(burning)
+        if burning == bool(extra.isRunningFor(entity)):
+            return False
+        if not burning:
+            extra.stopFor(entity)
+            return True
+        appearance = getattr(entity, 'appearance', None)
+        if getattr(appearance, 'compoundModel', None) is None:
+            return False
+        extra.startFor(entity)
+        return True
+
     def _present_critical(self, record, events, attacker_id):
         """Map copied state transitions to audited stock #1513 UI callbacks."""
-        if not events:
-            return False
         entity = self._server_entity(record['engine_id'])
         if entity is None or entity.typeDescriptor is None:
+            return False
+        self._sync_fire_effect(entity)
+        if not events:
             return False
         shown = False
         for event in events:

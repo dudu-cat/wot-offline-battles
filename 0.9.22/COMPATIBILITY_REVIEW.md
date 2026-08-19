@@ -1352,6 +1352,227 @@ so the link rests on the single `WRECK swap` line immediately before the crash
 and on `0x21` being the only kind-12 handle missing. Only a run on the exact
 Windows client can prove that the fix removes the crash.
 
+### The third dump repeats the same fault on a build that predates the fix
+
+A third full dump was taken at `12:28:33` after another kill. It is the same
+fault, the same call chain and the same missing key as the dump above. The
+process that produced it did not carry the outline fix.
+
+The dump holds one thread, `Eip 0x00010002`, `Ebx 3` and no `ExceptionStream`.
+The unhandled-exception filter's report sits at `0x0019e974`:
+
+```
+Application C:/World_of_Tanks_0.09.22.00.01_CH_1513_HD/WorldOfTanks.exe
+crashed 08.19.2026 at 12:28:33
+
+Message:
+The BigWorld Client has encountered an unhandled exception and must close
+(EXCEPTION_ACCESS_VIOLATION : 0xC0000005)
+```
+
+with `Read @ 0x00000008` at `0x001af1c8`. The saved `EXCEPTION_RECORD` at
+`0x001af738` reads code `0xC0000005`, `ExceptionAddress 0x00ab9e31`,
+`NumberParameters 2`, parameters `0` and `8`. The saved `CONTEXT` at
+`0x001af788` reads `Eax 0`, `Esi 0x0fab9b80`, `Esp 0x001afa74`,
+`Ebp 0x001afa78`. The frame-pointer chain repeats the second dump exactly:
+
+| Frame | Return address | Function | Identity |
+| --- | --- | --- | --- |
+| 0 | fault at `0x00ab9e31` | RVA `0x6b9e20` | scene-object transform lookup |
+| 1 | `0x00af3bd7` | RVA `0x6f3b90` | walks one outline list |
+| 2 | `0x00af4dff` | RVA `0x6f4db0` | `EdgeDrawer` frame update, first list |
+| 3 | `0x00631af3` | RVA `0x231aa0` | `BW::CanvasApp::tick` |
+| 4 | `0x0063af6d` | RVA `0x23af30` | `BW::MainLoopTasks::tick` |
+| 5 | `0x0063af94` | RVA `0x23af30` | `BW::MainLoopTasks::tick`, outer group |
+| 6 | `0x0061e4be` | RVA `0x21e370` | holds the literal `MainLoopTask::tick` |
+| 7 | `0x00612d56` | RVA `0x2121e0` | application frame |
+
+RTTI names both objects from their vtables: the receiver `0x0fab9b80` is
+`BW::SpatialFeature` (`.?AVSpatialFeature@BW@@`, vtable `0x0150c288`) and the
+caller's owner `0x1701d840` is `BW::wargaming::EdgeDrawer`
+(`.?AVEdgeDrawer@wargaming@BW@@`, vtable `0x0150e748`).
+
+The arguments read directly from the frame: matrix output `0x001afaac`,
+handle `0x21`, kind `12`. The `SpatialFeature` map at `this + 0x20` holds
+3260 records, 30 of them kind 12, and `(0x21, 12)` is absent. The drawer's
+first list at `+4` holds one entry whose single key is `(0x21, 12)`. Its
+second list at `+0x10` holds one entry with seven keys, and every one of them
+is present. The process holds exactly one `EdgeDrawer`, and the global pointer
+that `wgAddEdgeDetectEntity` and `wgDelEdgeDetectEntity` read, `0x01d20c70`,
+holds that same `0x1701d840`. So the fault is again an outline that points at a
+compound the client already released, on the one drawer this port writes to.
+
+The build is the difference. The client that crashed loaded
+`mods/0.9.22.0.1/org.peng.offline_lan_0922_0.4.0.wotmod`, and that file still
+held the pre-fix build. Compiling `battle_runtime.py` from both revisions and
+comparing every code object proves it: all 373 code objects in the shipped
+`battle_runtime.pyc` are byte-identical to `47664e3`, and exactly the two
+functions the fix changed, `BattleRuntime._apply_health` and
+`BattleRuntime._cleanup`, differ from `f1a1250`. `python.log` shows the
+crashing session started at `12:26:04` and loaded that same file, which
+`f1a1250` at `12:18:36` never reached. That file has SHA-256
+`6bb17963e458f7c679f57bcc0929154870bbf3c68656dc390c7b5d2cc92291fa`. The WOTMOD
+left in `0.9.22/dist` is older still, so the fix reaches the client only
+through a fresh build.
+
+The dump also shows the second, subtler half of the same trap, and explains why
+several kills before this one were harmless. The `BattleRuntime` instance
+dictionary in the dump holds `_outlined_engine_id = None`, so Python had
+already run `_clear_target_outline`, yet the engine still held the key. The
+removal path explains that. `wgDelEdgeDetectEntity` (RVA `0x252cf0`) does not
+remove by entity. It reads the entity's *current* model at `+0xe8`, takes the
+scene key at that model's `+0x10`, and passes it to `EdgeDrawer::removeKey`
+(RVA `0x6f4480`), which scans the first list for `handle` and `kind` and then
+the second, and does nothing when neither matches. Once
+`attach_wreck_model` has run `self.bw_entity.model = model`, the entity reports
+the wreck's key, so the removal deletes nothing and the dead key stays.
+
+Four facts then fix the order of events without any timing argument:
+
+1. `_outlined_engine_id` is `None`, and in the pre-fix build only
+   `_clear_target_outline` writes that, so the clear ran;
+2. `python.log` ends with
+   `12:28:33.164 WRECK swap id=2130706475 pose=(-239.9, 34.1, -222.7)`, 99 ms
+   after the `armour_hit` at `(-237.7, 35.0, -221.4)`. `attach_wreck_model`
+   prints that line, and `_wreck_loaded` calls it only when `bw_entity` is not
+   `None`, so the vehicle still had a visual entity;
+3. `_clear_target_outline` skips the removal only when the vehicle or its
+   `bw_entity` is missing, so it did call `wgDelEdgeDetectEntity`;
+4. the key is still in the list, so that removal matched nothing.
+
+The clear therefore ran after the model swap. The window is a race, and that
+is why the three earlier kills in the same battle, at `12:28:04`, `12:28:10`
+and `12:28:16`, were harmless. `_apply_health` starts the asynchronous wreck
+load, and `_update_target_outline` drops a dead target only on its next
+0.125-second pass. A load that finishes after that pass removes the right key.
+A load that finishes before it leaves the dead key for the next
+`CanvasApp::tick`.
+
+`f1a1250` closes both orderings, because it removes the outline inside
+`_apply_health` before `request_wreck` is issued at all. No further code change
+follows from this dump. What follows is a build step: rebuild the WOTMOD from
+`f1a1250` or later and replace the file under `mods/0.9.22.0.1`. Which wreck
+loads fast enough to lose the race is an inference, most plausibly one whose
+compound another kill already cached; the dump proves the ordering, not the
+cause of the load time.
+
+## A burning remote vehicle has no flame, because nothing starts the extra
+
+Peng reports that an enemy vehicle never shows fire while it burns. The
+burning state exists in this port, but it stops at the Python object. Nothing
+reaches the effect that #1513 plays.
+
+First, one reading correction. `bot_fire_seen` in the `PERF collections` line
+is not a burning counter. `_resolve_bot_fire` compares each bot's `fire_seq`
+and launches a projectile, so the number counts bots whose gun shot has been
+seen. It says nothing about fire.
+
+### What #1513 actually does
+
+The flame is an entity extra, not a property of the appearance:
+
+1. `scripts/entity_defs/Vehicle.def` declares `publicStateModifiers`, and
+   `Vehicle.pyc` is the only member in the whole package that reads it;
+2. `Vehicle.set_publicStateModifiers` is the property-change callback. It runs
+   only when `isStarted`, keeps the previous frozenset in
+   `__prevPublicStateModifiers`, and passes the two set differences to
+   `Vehicle.__updateModifiers`;
+3. `__updateModifiers` calls `typeDescriptor.extras[idx].stopFor(self)` for
+   every removed index and `startFor(self)` for every added one, the second
+   inside `try`/`except Exception: LOG_CURRENT_EXCEPTION`;
+4. `vehicle_extras.Fire._start` reads `vehicle.appearance.isUnderwater`, calls
+   `__playEffect` when the vehicle is dry, and then calls
+   `vehicle.appearance.switchFireVibrations(True)`;
+5. `Fire.__playEffect` picks one variant with
+   `random.choice(vehicle.typeDescriptor.type.effects['flaming'])` and plays it
+   through `vehicle.appearance.boundEffects.addNew(None, effects, stages,
+   True, **data)`.
+
+`items/vehicles._readExtras` builds the list as `[NoneExtra]` plus one entry
+per `<extras>` child of `scripts/item_defs/vehicles/common/vehicle.xml`. That
+file holds 95 children and `fire` is the 22nd of them, so `extras[22]` is
+`extrasDict['fire']` on every descriptor in this build.
+
+`_readVehicleEffects` turns the vehicle's own `<damagedStateGroup>` into the
+group name, so `small` selects `smallFlaming` in
+`scripts/item_defs/vehicles/common/vehicle_effects.xml`. That group holds two
+variants, each a pixie from `particles/Tank/destruction/flaming_small_*.xml` at
+node `HP_Fire_1`, a WWISE sound with a PC and an NPC name, and a
+`stopEmission` at the `noEmission` stage.
+
+### Why the port showed nothing
+
+Four separate reasons, and each one alone was enough:
+
+- the port never writes `publicStateModifiers`. It is set once to `()` in
+  `bigworld_binding` and read once in `remote_vehicle`, so even the local
+  player's stock `Vehicle` never receives a modifier;
+- a bot is not a `Vehicle` entity. Every remote vehicle is an `OfflineEntity`
+  with a Python `RemoteVehicle`, so the engine has no property to replicate and
+  no `set_` callback to call;
+- the state stopped at `critical_damage.apply_payload`, which sets
+  `vehicle.is_on_fire`. `_present_critical` then returned before its fire
+  branch for any record that is not `local`, and that branch is a damage-info
+  panel index rather than an effect;
+- `_RemoteAppearance` had none of the three members `Fire` touches. It defined
+  `compoundModel`, `models`, `modelsDesc`, `damageState`, `isLoaded`,
+  `isInWater`, `gunRecoil`, `engineAudition`, `turretMatrix` and `gunMatrix`,
+  so `Fire._start` raised `AttributeError` on `isUnderwater`.
+
+### What now drives the flame
+
+The extra machinery already worked in this port. `_start_shooting_effect`
+drives `extrasDict['shoot']` with `stopFor`/`startFor` on a `RemoteVehicle`,
+and `EntityExtra.startFor(self, entity, args=None)` takes exactly the one
+argument `__updateModifiers` passes. Three edits complete the fire path.
+
+`_RemoteAppearance` gained the three members `Fire` reads. `isUnderwater`
+starts `False`. `switchFireVibrations(start)` returns `None`, which matches
+retail, because `CompoundAppearance.switchFireVibrations` needs a
+`peripheralsController` that `vehicle_assembler` builds only for the player.
+`boundEffects` creates one `bound_effects.ModelBoundEffects` over the current
+compound on first use, `detach` destroys it while that compound is still
+alive, and the new `abandon` forgets it without a native call once BigWorld
+has already freed the space. Construction is deferred rather than done in
+`attach` so that a vehicle that never burns never imports the stock module.
+
+`_stop_shooting_effect` became `_stop_extras`, in the shape of retail
+`Vehicle.__stopExtras`: a loop over `self.extras.items()` that calls
+`typeDescriptor.extras[index].stop(data)`. The old bare `self.extras.clear()`
+would orphan a running fire's `EffectsListPlayer` across the wreck swap.
+`attach_wreck_model` and `detach_visual` both call it before they touch the
+compound, so the flame is always released before the model it hangs on.
+
+`_present_critical` now resolves the entity first and matches the extra to
+`is_on_fire` before the branch that returns for a non-local record. It is
+level-driven rather than event-driven, because `_apply_critical_state` skips
+an unchanged canonical state. One owner covers every vehicle: bots and allied
+bots through `RemoteVehicle`, and the local player through the stock
+`Vehicle`, whose `CompoundAppearance` already carries all three members.
+`_detach_local_presentation` stops the player's flame when the port releases
+that vehicle.
+
+Death keeps the crash-2 ordering explicit. `_apply_health` runs
+`critical_damage.apply_death`, which extinguishes the fire, and presents that
+state before it asks for the wreck, so `stopFor` always precedes
+`request_wreck`. One detail differs from retail: the port assigns
+`entity.health` after that presentation, so `Fire._cleanup` reads a positive
+health and takes the `keyOff()` branch instead of retail's
+`stop(forceCallback=True)`. The flame then fades on the old compound and the
+wreck swap destroys the bound effects while that compound is still alive.
+
+The fire is unrelated to the outline crash. Nothing in this port ever created
+a fire effect, so no effect held a reference to the compound the wreck swap
+released.
+
+Static reading cannot prove the rest. A Windows run has to show that the pixie
+loads and draws on the bot's compound, that `_findTargetNode` finds `HP_Fire_1`
+rather than falling back to the model root, that the WWISE sound picks the NPC
+name for a remote vehicle, and that no `EffectsListPlayer` callback survives
+the round. Underwater suppression is a deliberate difference: retail drives
+`isUnderwater` from a water sensor, and a constant `False` keeps a flame on a
+bot that drowns.
+
 ## Known deterministic parity gaps
 
 The source audit deliberately keeps the following differences visible:

@@ -165,12 +165,30 @@ class _RemoteAppearance(object):
         self.damageState = _DamageState()
         self.isLoaded = False
         self.isInWater = False
+        self.isUnderwater = False
         self.gunRecoil = None
         self.engineAudition = _RemoteEngineAudition(owner)
+        self._bound_effects = None
 
     @property
     def typeDescriptor(self):
         return self._owner.typeDescriptor
+
+    @property
+    def boundEffects(self):
+        """Own the compound the #1513 fire extra plays its flame on."""
+        if self._bound_effects is None:
+            if self.compoundModel is None:
+                raise RuntimeError(
+                    'remote bound effects requested without a compound')
+            from helpers import bound_effects
+            self._bound_effects = bound_effects.ModelBoundEffects(
+                self.compoundModel)
+        return self._bound_effects
+
+    def switchFireVibrations(self, unused_start):
+        """#1513 routes fire vibrations to the player's peripherals only."""
+        return None
 
     def attach(self, model):
         self.compoundModel = model
@@ -180,10 +198,22 @@ class _RemoteAppearance(object):
 
     def detach(self):
         self.engineAudition.detach()
+        effects = self._bound_effects
+        self._bound_effects = None
+        if effects is not None:
+            effects.destroy()
         self.compoundModel = None
         self.models = []
         self.isLoaded = False
         self.onModelChanged()
+
+    def abandon(self):
+        """Forget the freed compound and its effects without a native call."""
+        self._bound_effects = None
+        self.compoundModel = None
+        self.models = []
+        self.isLoaded = False
+        self.gunRecoil = None
 
     def changeVisibility(self, visible):
         """Expose the exact #1513 CompoundAppearance visibility boundary."""
@@ -858,7 +888,7 @@ class RemoteVehicle(object):
             '[Offline LAN 0.9.22] WRECK swap id=%s pose=(%.1f, %.1f, %.1f)\n'
             % (self.bw_entity_id, self.position.x, self.position.y,
                self.position.z))
-        self._stop_shooting_effect()
+        self._stop_extras()
         previous = self.model
         if previous is not None:
             previous.matrix = self._math.Matrix()
@@ -875,7 +905,7 @@ class RemoteVehicle(object):
         return True
 
     def detach_visual(self):
-        self._stop_shooting_effect()
+        self._stop_extras()
         self._release_track_animation()
         self._collision_obstacle = None
         self.isStarted = False
@@ -921,10 +951,7 @@ class RemoteVehicle(object):
         self._collision_obstacle = None
         self.isStarted = False
         self.inWorld = False
-        self.appearance.compoundModel = None
-        self.appearance.models = []
-        self.appearance.isLoaded = False
-        self.appearance.gunRecoil = None
+        self.appearance.abandon()
         self.bw_entity = None
         self.bw_entity_id = None
         self.model = None
@@ -1106,11 +1133,12 @@ class RemoteVehicle(object):
         extra.startFor(self, int(burst_count))
         return True
 
-    def _stop_shooting_effect(self):
-        extra = self._shoot_extra()
-        if extra is not None:
+    def _stop_extras(self):
+        """Drain every running extra through its own #1513 cleanup."""
+        extra_types = getattr(self.typeDescriptor, 'extras', None) or ()
+        for index, data in tuple(self.extras.items()):
             try:
-                extra.stopFor(self)
+                extra_types[index].stop(data)
             except Exception:
                 pass
         self.extras.clear()

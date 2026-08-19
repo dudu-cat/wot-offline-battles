@@ -153,6 +153,20 @@ EXPECTED_ABI = {
             'startPoint', 'endPoint', 'entities', 'skipGun'),
         'getCollidableEntities': ('exceptIDs', 'startPoint', 'endPoint'),
     },
+    'scripts/client/helpers/EntityExtra.pyc': {
+        'EntityExtra.startFor': ('self', 'entity', 'args'),
+        'EntityExtra.stopFor': ('self', 'entity'),
+        'EntityExtra.stop': ('self', 'data'),
+        'EntityExtra.isRunningFor': ('self', 'entity'),
+    },
+    'scripts/client/helpers/bound_effects.pyc': {
+        'ModelBoundEffects.__init__': ('self', 'model'),
+        'ModelBoundEffects.addNew': (
+            'self', 'matProv', 'effectsList', 'keyPoints', 'waitForKeyOff',
+            '**args'),
+        'ModelBoundEffects.destroy': ('self',),
+        'ModelBoundEffects.stop': ('self',),
+    },
     'scripts/client/helpers/EffectsList.pyc': {
         '_ShotSoundEffectDesc.create': ('self', 'model', 'list', 'args'),
     },
@@ -1105,6 +1119,8 @@ EXPECTED_CODE_NAMES = {
         'Vehicle.showShooting': (
             'typeDescriptor', 'extrasDict', 'stopFor', 'startFor',
             'isPlayerVehicle', 'cancelWaitingForShot'),
+        'Vehicle.__stopExtras': (
+            'typeDescriptor', 'extras', 'items', 'stop'),
         'Vehicle.showAmmoBayEffect': ('appearance', 'showAmmoBayEffect'),
         'Vehicle.collideSegmentExt': (
             '_Vehicle__collideSegment',),
@@ -1126,6 +1142,21 @@ EXPECTED_CODE_NAMES = {
         'getCollidableEntities': (
             'arena', 'vehicles', 'entity', 'isStarted',
             'segmentMayHitEntity'),
+    },
+    'scripts/client/vehicle_extras.pyc': {
+        'Fire._start': (
+            'appearance', 'isUnderwater', '_Fire__playEffect',
+            'switchFireVibrations'),
+        'Fire.__playEffect': (
+            'typeDescriptor', 'type', 'effects', 'appearance',
+            'boundEffects', 'addNew'),
+        'Fire._cleanup': (
+            'appearance', 'switchFireVibrations', 'health', 'stop',
+            'keyOff'),
+    },
+    'scripts/client/helpers/bound_effects.pyc': {
+        'ModelBoundEffects.addNew': ('addNewToNode',),
+        'ModelBoundEffects.destroy': ('stop', '_ModelBoundEffects__model'),
     },
     'scripts/client/helpers/EffectsList.pyc': {
         '_ShotSoundEffectDesc.create': (

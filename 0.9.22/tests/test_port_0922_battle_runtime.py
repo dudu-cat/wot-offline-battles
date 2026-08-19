@@ -248,6 +248,108 @@ class _Model(object):
             position.x, position.y + 1.5, position.z))
 
 
+class _FireExtra(object):
+    """helpers.EntityExtra plus the vehicle_extras.Fire guards of #1513."""
+
+    def __init__(self, log=None, index=22):
+        self.index = index
+        self.name = 'fire'
+        self.log = [] if log is None else log
+
+    def isRunningFor(self, entity):
+        return self.index in entity.extras
+
+    def startFor(self, entity, args=None):
+        if self.index in entity.extras:
+            raise Exception("the extra 'fire' is already started")
+        data = {'extra': self, 'entity': entity}
+        entity.extras[self.index] = data
+        try:
+            self._start(data)
+        except Exception:
+            del entity.extras[self.index]
+            data['entity'] = None
+            raise
+
+    def stopFor(self, entity):
+        data = entity.extras.pop(self.index, None)
+        if data is None:
+            return False
+        self._cleanup(data)
+        data['entity'] = None
+        return True
+
+    def stop(self, data):
+        assert data['extra'] is self
+        if data['entity'] is None:
+            return
+        del data['entity'].extras[self.index]
+        self._cleanup(data)
+        data['entity'] = None
+
+    def _start(self, data):
+        vehicle = data['entity']
+        appearance = vehicle.appearance
+        if not appearance.isUnderwater:
+            data['_effectsPlayer'] = appearance.boundEffects.addNew(
+                None, ('flaming',), ('start',), True, **data)
+        appearance.switchFireVibrations(True)
+        self.log.append(('fire start', vehicle.model))
+
+    def _cleanup(self, data):
+        vehicle = data['entity']
+        vehicle.appearance.switchFireVibrations(False)
+        self.log.append(('fire cleanup', vehicle.model))
+        player = data.pop('_effectsPlayer', None)
+        if player is None:
+            return
+        if vehicle.health <= 0:
+            player.stop(forceCallback=True)
+        else:
+            player.keyOff()
+
+
+def _bound_effects_modules(log):
+    """Stand in for helpers.bound_effects with its exact #1513 ownership."""
+
+    class ModelBoundEffects(object):
+        def __init__(self, model):
+            self.model = model
+            self._effects = []
+
+        def addNew(self, matProv, effectsList, keyPoints, waitForKeyOff,
+                   **args):
+            model = self.model
+            effects = self._effects
+            player = types.SimpleNamespace(model=model)
+
+            def stop(keepPosteffects=False, forceCallback=False):
+                log.append(('effect stop', model))
+                if forceCallback and player in effects:
+                    effects.remove(player)
+
+            player.stop = stop
+            player.keyOff = lambda: log.append(('effect key off', model))
+            effects.append(player)
+            log.append(('effect play', model))
+            return player
+
+        def stop(self):
+            for player in tuple(self._effects):
+                player.stop()
+                self._effects.remove(player)
+
+        def destroy(self):
+            self.stop()
+            self.model = None
+
+    module = types.ModuleType('helpers.bound_effects')
+    module.ModelBoundEffects = ModelBoundEffects
+    package = types.ModuleType('helpers')
+    package.bound_effects = module
+    return {'helpers': package, 'helpers.bound_effects': module}
+
+
 class _Strict1513Component(object):
     """Attribute-only stand-in for #1513's ``NoLegacyStuff`` mixin."""
 
@@ -1571,17 +1673,29 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
                 projectiles.append(self)
 
         class ShootExtra(object):
+            index = 5
+
             def __init__(self):
                 self.started = []
                 self.stopped = []
 
             def stopFor(self, entity):
+                data = entity.extras.pop(self.index, None)
+                if data is None:
+                    return False
                 self.stopped.append(entity.id)
-                entity.extras.pop('shoot-test', None)
+                return True
+
+            def stop(self, data):
+                entity = data['entity']
+                del entity.extras[self.index]
+                self.stopped.append(entity.id)
+                data['entity'] = None
 
             def startFor(self, entity, burst_count):
                 self.started.append((entity.id, burst_count))
-                entity.extras['shoot-test'] = True
+                entity.extras[self.index] = {
+                    'extra': self, 'entity': entity}
                 entity.appearance.recoil()
 
         descriptor = _Descriptor()
@@ -1589,6 +1703,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         descriptor.turret.models = {'undamaged': 'turret.model'}
         shoot_extra = ShootExtra()
         descriptor.extrasDict = {'shoot': shoot_extra}
+        descriptor.extras = {ShootExtra.index: shoot_extra}
         descriptor.gun.burst = (3, 0.1)
         descriptor.gun.shots[0].speed = 950.0
         descriptor.gun.shots[0].gravity = 9.81
@@ -1662,7 +1777,9 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
             self.assertFalse(vehicle.showShooting(1, False))
             projectiles[0].add.assert_called_once_with(*projectile_args)
 
-        self.assertGreaterEqual(shoot_extra.stopped.count(vehicle_id), 2)
+        # The teardown drains the running extra through its own stop(),
+        # exactly like #1513 Vehicle.__stopExtras.
+        self.assertEqual([vehicle_id], shoot_extra.stopped)
         self.assertEqual({}, vehicle.extras)
         self.assertIsNone(vehicle._collision_obstacle)
         projectiles[0].destroy.assert_called_once_with()
@@ -2049,6 +2166,162 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
 
         self.assertIsNot(undamaged, vehicle.model)
         self.assertIs(vehicle.model, vehicle.bw_entity.model)
+        factory.destroy_all()
+
+    def test_a_burning_bot_plays_and_stops_the_stock_1513_fire_extra(self):
+        runtime = _runtime()
+        log = []
+        fire = _FireExtra(log)
+        descriptor = _Descriptor()
+        descriptor.extrasDict = {'fire': fire}
+        descriptor.extras = {22: fire}
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(descriptor, {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(), (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        compound = vehicle.model
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._remote_factory = factory
+        record = {'engine_id': vehicle_id, 'local': False,
+                  'presentation': True}
+        ignited = ({'kind': 'fire', 'state': True, 'cause': 'shot'},)
+        extinguished = ({'kind': 'fire', 'state': False, 'cause': 'repair'},)
+
+        with mock.patch.dict(sys.modules, _bound_effects_modules(log)):
+            vehicle.is_on_fire = True
+            self.assertFalse(battle._present_critical(record, ignited, 0))
+            self.assertTrue(fire.isRunningFor(vehicle))
+            # A repeated burning state must not start a second flame.
+            battle._present_critical(record, ignited, 0)
+            vehicle.is_on_fire = False
+            battle._present_critical(record, extinguished, 0)
+
+        self.assertFalse(fire.isRunningFor(vehicle))
+        # A vehicle that survives keys the flame off; the appearance owns
+        # the player until the compound goes away.
+        factory.destroy_all()
+        self.assertEqual([
+            ('effect play', compound), ('fire start', compound),
+            ('fire cleanup', compound), ('effect key off', compound),
+            ('effect stop', compound)], log)
+
+    def test_a_burning_local_player_drives_the_same_fire_extra(self):
+        runtime = _runtime()
+        log = []
+        fire = _FireExtra(log)
+        descriptor = _Descriptor()
+        descriptor.extrasDict = {'fire': fire}
+        descriptor.extras = {22: fire}
+        entity = _Vehicle(10, descriptor, _Vector(), (0, 0, 0),
+                          {'health': 500})
+        entity.extras = {}
+        entity.appearance.isUnderwater = False
+        entity.appearance.switchFireVibrations = lambda start: None
+        entity.appearance.boundEffects = _bound_effects_modules(
+            log)['helpers.bound_effects'].ModelBoundEffects(entity.model)
+        runtime.bigworld.entities[10] = entity
+        runtime.constants.DAMAGE_INFO_INDICES[
+            'DEVICE_STARTED_FIRE_AT_SHOT'] = 14
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        record = {'engine_id': 10, 'local': True}
+
+        entity.is_on_fire = True
+        battle._present_critical(
+            record, ({'kind': 'fire', 'state': True, 'cause': 'shot'},), 0)
+        self.assertTrue(fire.isRunningFor(entity))
+        entity.is_on_fire = False
+        battle._present_critical(
+            record, ({'kind': 'fire', 'state': False, 'cause': 'repair'},), 0)
+
+        self.assertFalse(fire.isRunningFor(entity))
+        self.assertEqual([
+            ('effect play', entity.model), ('fire start', entity.model),
+            ('fire cleanup', entity.model), ('effect key off', entity.model)],
+            log)
+
+    def test_a_still_burning_bot_drains_its_extra_when_the_visual_goes(self):
+        runtime = _runtime()
+        log = []
+        fire = _FireExtra(log)
+        descriptor = _Descriptor()
+        descriptor.extrasDict = {'fire': fire}
+        descriptor.extras = {22: fire}
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(descriptor, {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(), (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        compound = vehicle.model
+
+        with mock.patch.dict(sys.modules, _bound_effects_modules(log)):
+            fire.startFor(vehicle)
+
+        factory.destroy_all()
+
+        self.assertEqual({}, vehicle.extras)
+        self.assertEqual([
+            ('effect play', compound), ('fire start', compound),
+            ('fire cleanup', compound), ('effect key off', compound),
+            ('effect stop', compound)], log)
+
+    def test_a_burning_bot_stops_its_flame_before_the_wreck_swap(self):
+        """EffectsListPlayer holds the compound the wreck load replaces, so
+        the flame must be gone before the swap, exactly like the outline."""
+        runtime = _runtime()
+        log = []
+        fire = _FireExtra(log)
+        descriptor = _Descriptor()
+        descriptor.extrasDict = {'fire': fire}
+        descriptor.extras = {22: fire}
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(descriptor, {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(), (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        undamaged = vehicle.model
+        loads = []
+        runtime.bigworld.loadResourceListBG = (
+            lambda assemblers, callback: loads.append((assemblers, callback)))
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        battle._remote_factory = factory
+        record = {'engine_id': vehicle_id, 'local': False, 'ready': True,
+                  'presentation': True,
+                  'state': {'team': 2, 'health': 500}}
+        battle._records = {'bot:11': record}
+
+        with mock.patch.dict(sys.modules, _bound_effects_modules(log)):
+            vehicle.is_on_fire = True
+            battle._present_critical(
+                record, ({'kind': 'fire', 'state': True},), 0)
+            self.assertTrue(fire.isRunningFor(vehicle))
+
+            battle._apply_health(record, {'health': 0, 'alive': False})
+
+            self.assertFalse(fire.isRunningFor(vehicle))
+            self.assertEqual(1, len(loads))
+            loads[0][1]({descriptor.name: _Model()})
+
+        self.assertIsNot(undamaged, vehicle.model)
+        self.assertIs(vehicle.model, vehicle.bw_entity.model)
+        self.assertEqual({}, vehicle.extras)
+        self.assertIsNone(vehicle.appearance._bound_effects)
+        # Every flame call names the compound that was alive at the time,
+        # so nothing still points at it when the wreck replaces it.
+        self.assertEqual([
+            ('effect play', undamaged), ('fire start', undamaged),
+            ('fire cleanup', undamaged), ('effect key off', undamaged),
+            ('effect stop', undamaged)], log)
         factory.destroy_all()
 
     def test_remote_visual_cleanup_survives_destroy_entity_failure(self):
