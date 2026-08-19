@@ -2004,6 +2004,53 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual([vehicle.bw_entity], runtime.bigworld.edge_removes)
         factory.destroy_all()
 
+    def test_a_killed_bot_drops_its_outline_before_the_wreck_swap(self):
+        """wgAddEdgeDetectEntity binds the compound the wreck load replaces,
+        so the engine reads a freed handle unless the outline goes first."""
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        descriptor = _Descriptor()
+        vehicle_id = factory.create(descriptor, {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(0.0, 0.0, 20.0),
+            (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        vehicle.collideSegmentExt = lambda start, end: (
+            types.SimpleNamespace(dist=20.0),)
+        # The wreck compound answers on a later frame, exactly as
+        # loadResourceListBG does in the client.
+        loads = []
+        runtime.bigworld.loadResourceListBG = (
+            lambda assemblers, callback: loads.append((assemblers, callback)))
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        battle._remote_factory = factory
+        record = {'engine_id': vehicle_id, 'local': False, 'ready': True,
+                  'presentation': True,
+                  'state': {'team': 2, 'health': 500}}
+        battle._records = {'bot:11': record}
+        battle._update_target_outline(1.0)
+        outlined = vehicle.bw_entity
+        undamaged = vehicle.model
+        self.assertEqual([(outlined, 1, 0, False)],
+                         runtime.bigworld.edge_adds)
+
+        battle._apply_health(record, {'health': 0, 'alive': False})
+
+        self.assertEqual([outlined], runtime.bigworld.edge_removes)
+        self.assertIsNone(battle._outlined_engine_id)
+        self.assertEqual(1, len(loads))
+
+        loads[0][1]({descriptor.name: _Model()})
+
+        self.assertIsNot(undamaged, vehicle.model)
+        self.assertIs(vehicle.model, vehicle.bw_entity.model)
+        factory.destroy_all()
+
     def test_remote_visual_cleanup_survives_destroy_entity_failure(self):
         runtime = _runtime()
         factory = RemoteVehicleFactory(
@@ -9409,6 +9456,34 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(['remote', 'retire', 'destroy'], calls)
         self.assertIsNone(battle._remote_factory)
+
+    def test_cleanup_after_an_engine_reset_leaves_the_outline_alone(self):
+        """abandon_visual exists because the engine already freed these
+        objects, and the edge-detect removal reads the same entity."""
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._map_create_attempted = True
+
+        class _AbandonedRemoteFactory(object):
+            def engine_active(self):
+                return False
+
+            def get(self, entity_id):
+                raise AssertionError('read a freed presentation')
+
+            def destroy_all(self):
+                return True
+
+        battle._remote_factory = _AbandonedRemoteFactory()
+        battle._outlined_engine_id = 11
+        battle._records = {
+            'bot:2': {'engine_id': 11, 'local': False,
+                      'presentation': True, 'visual_started': True}}
+
+        battle._cleanup()
+
+        self.assertEqual([], runtime.bigworld.edge_removes)
+        self.assertIsNone(battle._outlined_engine_id)
 
     def test_cleanup_releases_space_id_lost_by_stock_destroy_failure(self):
         runtime = _runtime()

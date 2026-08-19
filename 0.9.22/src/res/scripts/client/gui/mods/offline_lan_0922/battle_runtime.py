@@ -9557,6 +9557,10 @@ class BattleRuntime(object):
         # presentation.
         entity_alive = getattr(entity, 'isAlive', None)
         if not (entity_alive() if callable(entity_alive) else entity_alive):
+            # wgAddEdgeDetectEntity binds the vehicle's current compound, and
+            # request_wreck below replaces it on a later frame.
+            if self._outlined_engine_id == engine_id:
+                self._clear_target_outline()
             self._release_target_lock(engine_id)
             self._present_vehicle_dead(record, False)
         if record.get('local'):
@@ -10119,14 +10123,19 @@ class BattleRuntime(object):
             # Each step owns its own boundary. A failed outline clear or one
             # failed visual must still reach destroy_all(), which releases the
             # native models and BSP trees for the whole battle.
-            try:
-                self._clear_target_outline()
-            except Exception as error:
-                if cleanup_error is None:
-                    cleanup_error = error
-            # Once the engine has reset the entity manager, stopping a visual
-            # would call into objects it already freed.
-            if self._remote_factory.engine_active():
+            # Once the engine has reset the entity manager, removing the
+            # outline or stopping a visual would call into objects it already
+            # freed.
+            engine_active = self._remote_factory.engine_active()
+            if engine_active:
+                try:
+                    self._clear_target_outline()
+                except Exception as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+            else:
+                self._outlined_engine_id = None
+            if engine_active:
                 for record in tuple(self._records.values()):
                     if not record.get('presentation'):
                         continue

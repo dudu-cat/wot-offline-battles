@@ -1189,6 +1189,11 @@ instances in that process exactly one, the player's entity filter, had an
 implementation. The abort landed on the first frame that moved the bots,
 before the diagnostic line that follows the call.
 
+Exit code 3 alone does not prove an assertion. An unhandled access violation
+leaves the process the same way, as the outline crash below shows. Search the
+crashing stack for the saved `EXCEPTION_RECORD` and `CONTEXT` before you name
+the cause.
+
 The rule for this port: on a client-only vehicle, treat every
 `WGVehicleFilter` method as a call that can terminate the process, not as a
 call that can raise. The same assertion exists in
@@ -1221,6 +1226,131 @@ So animated bot belts require bots built as real
 `BigWorld.createEntity('Vehicle', ...)` entities, so that the engine owns each
 filter. That is the previously estimated three-round change, and it is Peng's
 call whether to spend it. Nothing smaller can move the belts.
+
+## The vehicle outline outlives the wreck model swap
+
+Exit code 3 does not always mean an assertion. The second full dump, taken at
+`11:50:28` on build `47664e3` after Peng killed an enemy vehicle, carries the
+same `-t` signature as the first: one thread, `Eip 0x00010002`, `Ebx 3`, no
+`ExceptionStream`, nothing in `python.log`. It is not an `MF_ASSERT_DEV`. No
+assertion text exists anywhere on the stack. BigWorld's unhandled-exception
+filter formats its own report instead, and that report is still in place at
+`0x0019e974`:
+
+```
+The BigWorld Client has encountered an unhandled exception and must close
+(EXCEPTION_ACCESS_VIOLATION : 0xC0000005)
+```
+
+with `Read @ 0x00000008` at `0x001af1c8`. The filter keeps the real
+`EXCEPTION_RECORD` at `0x001af738` and the faulting `CONTEXT` at `0x001af788`.
+They give the fault directly: code `0xC0000005`, `ExceptionAddress 0x00ab9e31`
+(RVA `0x6b9e31`), a read of address `0x00000008`, `Eax 0`, `Esp 0x001afa74`,
+`Ebp 0x001afa78`. Search the stack for a saved `CONTEXT` before you conclude
+that a BigWorld exit-code-3 dump is an assertion.
+
+The frame-pointer chain from `Ebp 0x001afa78` reconstructs the whole call, and
+the exe's RTTI names most of it:
+
+| Frame | Return address | Function | Identity |
+| --- | --- | --- | --- |
+| 0 | fault at `0x00ab9e31` | RVA `0x6b9e20` | scene-object transform lookup |
+| 1 | `0x00af3bd7` | RVA `0x6f3b90` | walks one outline list |
+| 2 | `0x00af4dff` | RVA `0x6f4db0` | `BW::wargaming::EdgeDrawer` frame update |
+| 3 | `0x00631af3` | RVA `0x231aa0` | `BW::CanvasApp::tick`, vtable slot 4 |
+| 4 | `0x0063af6d` | RVA `0x23af30` | `BW::MainLoopTasks::tick` |
+| 5 | `0x0063af94` | RVA `0x23af30` | `BW::MainLoopTasks::tick`, outer group |
+| 6 | `0x0061e4be` | RVA `0x21e370` | holds the literal `MainLoopTask::tick` |
+| 7 | `0x00612d56` | RVA `0x2121e0` | application frame |
+
+There is no Python frame on this stack. The crash is the engine's own
+per-frame outline pass, one or more frames after the mod's Python call
+returned.
+
+The faulting routine takes a receiver, a matrix output pointer and a two-part
+key. It calls the hash lookup at RVA `0x6b9da0`, which returns the record or
+NULL, and then reads the record without a test:
+
+```
+0x6b9e2c  call 0x6b9da0                      ; find(handle, kind)
+0x6b9e31  imul ecx, dword ptr [eax + 8], 0x54 ; eax == 0  ->  read at 0x8
+```
+
+The receiver at `0x0fab9900` reads `BW::SpatialFeature` through its vtable.
+Its `std::unordered_map` at `+0x20` held 3256 records keyed by a
+`(uint32 handle, uint8 kind)` pair, and each record indexes an `0x54`-byte
+entry in the space's transform array. The call means "give me the world matrix
+of scene object (handle, kind)". A missing scene object is a NULL return and an
+immediate access violation.
+
+The dump then names the missing object exactly. The `EdgeDrawer` at
+`0x1711d780` held one entry in its list at `+4`, and that entry's key list held
+one key, `(0x21, 12)`. The map holds 30 records of kind 12. Their handles are
+the odd numbers `0x01` through `0x3b` plus `0x01000000`, and `0x21` is the
+single one absent. The one scene object the outline still pointed at was the
+only vehicle compound the client had just released. The second list, at
+`+0x10`, held one entry whose seven keys were all present, so it would have
+drawn normally.
+
+`python.log` closes the loop:
+
+```
+11:50:28.375  EFFECT armour_hit  at=(-185.0, 26.7, -158.2)
+11:50:28.478  WRECK swap id=2130706475 pose=(-185.9, 25.9, -159.9)
+11:50:28.518  EFFECT world_explosion ...
+```
+
+The crash report is stamped `08.19.2026 at 11:50:28`, and a
+`BW::PyVectorCopy<Vector3>` holding `(-184.887, 26.639, -157.859)` sits in the
+heap block next to the outline list.
+
+The port creates the dangling reference itself.
+`battle_runtime.py::_update_target_outline` picks the nearest aimed-at, alive,
+visible remote vehicle at most every 0.125 s and calls
+`BigWorld.wgAddEdgeDetectEntity(vehicle.bw_entity, color, 0, False)`. The
+engine records that entity's current compound handles. When the vehicle dies,
+`_apply_health` asks `remote_vehicle.py::request_wreck` for the destroyed
+compound, `BigWorld.loadResourceListBG` answers on a later frame, and
+`attach_wreck_model` assigns `self.bw_entity.model = model`. That releases the
+old compound and removes handle `0x21` from the space. No step between the two
+calls `wgDelEdgeDetectEntity`. `_clear_target_outline` runs only on the next
+outline pass, on `_stop_remote_visual`, or on teardown, so the swap can land in
+any of the roughly four frames inside the refresh window. The next
+`CanvasApp::tick` reads the freed handle.
+
+Exact `#1513` never allows that window. `CompoundAppearance.__onModelsRefresh`
+is the stock damaged-model swap, and its bytecode order is `deactivate(False)`,
+`__prepareSystemsForDamagedVehicle`, `__setupModels`, `setVehicle`, `activate`,
+`__reattachComponents`. `CompoundAppearance.deactivate` calls
+`ComponentSystem.deactivate`, which reaches
+`vehicle_systems/components/highlighter.py::Highlighter.deactivate`, and that
+method calls `BigWorld.wgDelEdgeDetectEntity(vehicle)` whenever a highlight is
+on. The retail client always drops the edge-detect registration before it
+replaces the compound model.
+
+The rule for this port: `wgAddEdgeDetectEntity` binds the entity's current
+compound, not the entity. Remove the registration before any code replaces
+that compound. The smallest fix is to clear the outline where the port already
+drops the player's other attachments to a vehicle that just died, next to
+`self._release_target_lock(engine_id)` in `_apply_health`, with the two lines
+`_stop_remote_visual` already uses:
+
+```python
+if self._outlined_engine_id == engine_id:
+    self._clear_target_outline()
+```
+
+`_update_target_outline` rejects a dead vehicle, so the outline cannot return
+and no second guard is needed. `request_wreck` runs later in the same method
+and its load is asynchronous, so the removal is always ordered before the
+model changes.
+
+Every step above except one comes from the dump, the exe disassembly and the
+exact `#1513` bytecode. The inference is that the outlined vehicle is the
+vehicle Peng killed: the `EdgeDrawer` stores scene handles and not entity ids,
+so the link rests on the single `WRECK swap` line immediately before the crash
+and on `0x21` being the only kind-12 handle missing. Only a run on the exact
+Windows client can prove that the fix removes the crash.
 
 ## Known deterministic parity gaps
 
