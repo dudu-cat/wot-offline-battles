@@ -617,11 +617,37 @@ Every native call is proved in exact build #1513:
 | Interface | Exact evidence |
 | --- | --- |
 | `GUI.Simple(texture)`, `GUI.Window(texture)`, `GUI.Text(value)` and the component properties used here | `scripts/client/PostProcessing/ChainView.pyc`, `scripts/client/bwobsolete_tests/GUITest.pyc`, `scripts/client/bwobsolete_helpers/PyGUI/Utils.pyc` |
-| Untextured flat colour (empty texture with `SOLID` and 0-255 int `colour` tuples) | `EffectView.createPhase` constructs `GUI.Window('')` and `ChainView.displayAlpha` sets `textureName = ''`, both in `scripts/client/PostProcessing/ChainView.pyc`; `col_white` texture names (packed `.dds` and source `.bmp`) rendered untinted white on the real #1513 client, and the flat-colour result still needs visual confirmation there |
+| Texture `system/maps/col_white.dds` on every drawn rectangle | `misc.pkg` member; see the two rendering facts below |
 | Font `default_small.font` | `system/fonts/default_small.font` package member |
 | `GUI.addRoot`, `GUI.delRoot`, `GUI.reSort` and an overlay at `position.z = 0.1` with `focus` and `moveFocus` | `scripts/client/new_year/fade_window.pyc` |
 | `handleMouseClickEvent`, `handleMouseEnterEvent`, `handleMouseLeaveEvent`, `handleMouseButtonEvent` | `scripts/client/PostProcessing/ChainView.pyc` |
 | The lobby already attaches `GUI.mcursor` through `BigWorld.setCursor` | `scripts/client/gui/Scaleform/managers/Cursor.pyc` `attachCursor` |
+
+Two rendering facts govern how this room may look. Neither is derivable from
+the client scripts; both were established on the real #1513 client and both
+contradict what the source reads suggested:
+
+1. An **untextured** `GUI.Simple` or `GUI.Window` draws nothing. `GUI.Window('')`
+   does appear in `ChainView.pyc`, so an empty texture is a legal state, but it
+   is not a visible one. A build that drew the panel, the buttons and the
+   pointer as untextured flat colour rendered only its `GUI.Text`; the buttons
+   still worked because hit testing does not depend on drawing.
+2. Vertex `colour` is **never applied** to a textured component. A row of test
+   quads varying `materialFX` (`SOLID`, `BLEND`, `ADD`), `colour` (white, dark
+   blue, green) and texture name (`.dds`, `.bmp`) all drew the same white.
+
+So every visible rectangle carries `col_white.dds` and is white, and all
+readable contrast comes from `GUI.Text`, whose `colour` **is** honoured: the
+room uses dark labels on the white buttons and light labels over the hangar.
+Hover feedback recolours the label rather than the button. The panel itself
+stays untextured and therefore invisible, which keeps the hangar visible behind
+the floating text.
+
+A child component's `position` in `CLIP` mode is relative to its **parent**
+rect, not the screen. A pointer parented to the 680 px panel therefore tracked
+at exactly half the mouse displacement in a 1360 px window. The drawn arrow is
+a set of `GUI.addRoot` components at absolute clip coordinates, sized in
+`PIXEL`, so it follows the cursor one-to-one at any resolution.
 
 `shadow` and `dropShadow` appear in no #1513 client script, so the room does not
 set them. `wg_inputKeyMode` is proved only for the Scaleform overlay component,

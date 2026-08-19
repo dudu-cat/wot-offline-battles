@@ -11,12 +11,13 @@ Exact #1513 evidence for the native surface used here:
 - ``GUI.Simple``, ``GUI.Window`` and ``GUI.Text`` with the property names below:
   ``scripts/client/PostProcessing/ChainView.pyc`` and
   ``scripts/client/bwobsolete_tests/GUITest.pyc``.
-- Untextured flat colour: ``EffectView.createPhase`` constructs
-  ``GUI.Window('')`` and ``ChainView.displayAlpha`` sets ``textureName = ''``
-  with SOLID, both in ``scripts/client/PostProcessing/ChainView.pyc``.
-  ``col_white`` texture names (packed ``.dds`` and source ``.bmp``) rendered
-  the panel untinted white on the real #1513 client, so this room draws no
-  texture at all. The flat-colour result still needs visual confirmation.
+- Two rendering facts, both established on the real #1513 client and not
+  reversible from source: an untextured ``GUI.Simple``/``GUI.Window`` draws
+  NOTHING, and vertex ``colour`` is never applied to one that is textured.
+  A row of test quads varying ``materialFX`` (SOLID/BLEND/ADD), ``colour`` and
+  texture name all drew the same white, and the untextured quad drew nothing.
+  So every visible rectangle here carries ``system/maps/col_white.dds`` and is
+  white, and readable contrast comes from dark ``GUI.Text`` on top.
 - Font ``system/fonts/default_small.font``: package member.
 - ``GUI.addRoot`` / ``GUI.delRoot`` / ``GUI.reSort`` and an overlay at
   ``position.z = 0.1`` with ``focus``, ``moveFocus`` and ``wg_inputKeyMode``:
@@ -28,24 +29,25 @@ Exact #1513 evidence for the native surface used here:
   calls ``BigWorld.setCursor(mcursor)``, then ``Cursor.show`` draws the arrow
   through ``as_showCursorS`` inside ``gui/flash/Cursor.swf``. So the native
   cursor is only an input source here, and ``gui/mouse_cursors.xml`` is 12
-  bytes in this build. This room activates the native cursor with the stock
-  ``Scaleform.showCursor`` pair and draws its own arrow.
-- The drawn arrow has never been seen. Two fixed diagnostic marks decide why:
-  ``parked`` is a panel child at the panel centre, ``root`` is a GUI root. A
-  child is clipped to the parent rect, so a pointer placed at a cursor outside
-  the 680x300 panel would be culled; whichever mark the player sees names the
-  mechanism.
+  bytes in this build. This room activates it the same way, unpainted, and
+  draws its own arrow so the player sees exactly one pointer.
+- A child's CLIP position is relative to the PARENT rect, not the screen: a
+  pointer parented to the 680 px panel tracked at exactly half the mouse
+  displacement in a 1360 px window. The arrow is therefore a set of GUI roots
+  placed at absolute clip coordinates.
 """
 
 import sys
 import time
 
-# An untextured GUI.Simple/GUI.Window draws nothing on this client: the room
-# rendered only its GUI.Text while every rectangle stayed invisible.  This
-# misc.pkg member is the one texture proved to render here, untinted white.
+# An untextured GUI.Simple/GUI.Window draws nothing on this client, and vertex
+# colour is never applied to a textured one, so every visible rectangle is a
+# white col_white quad and contrast comes from GUI.Text.  The panel stays
+# untextured on purpose: a white 680x300 slab would blank out the hangar.
 PANEL_TEXTURE = ''
 CONTROL_TEXTURE = 'system/maps/col_white.dds'
 CONTROL_TEXT_COLOUR = (16, 26, 36, 255)
+CONTROL_HOVER_COLOUR = (14, 82, 140, 255)
 PANEL_FONT = 'default_small.font'
 OVERLAY_Z = 0.1
 # Smaller z draws in front. The buttons render at CONTROL_Z and the pointer at
@@ -118,22 +120,16 @@ class NativeSurface(object):
         return bool(self._gui.mcursor().active)
 
     def show_cursor(self):
-        """Run the exact #1513 ``Scaleform.showCursor`` sequence.
+        """Activate the native cursor without painting it.
 
-        0.8.2 shows its room pointer this way and #1513 has no ``gui.Cursor``
-        module, so the stock helper is the closest equivalent.  The room still
-        draws its own arrow on top, because this build's
-        ``gui/mouse_cursors.xml`` is 12 bytes and defines no shape.
+        ``Cursor.attachCursor`` does the same: the lobby's arrow is Flash, and
+        this build's ``gui/mouse_cursors.xml`` is 12 bytes, so a visible
+        mcursor only shows the OS pointer beside the room's own arrow.
+        Activating it is still what makes ``mcursor.position`` track.
         """
         import BigWorld
-        try:
-            import Scaleform
-            Scaleform.showCursor()
-            return True
-        except Exception as error:
-            _log('LAN room fell back from Scaleform.showCursor: %s' % error)
         cursor = self._gui.mcursor()
-        cursor.visible = 1
+        cursor.visible = False
         BigWorld.setCursor(cursor)
         return True
 
@@ -233,11 +229,9 @@ class WaitingRoomUI(object):
         self._surface = surface
         self._panel = None
         self._controls = {}
-        self._frames = {}
         self._labels = {}
         self._cursor_acquired = False
         self._pointer_parts = []
-        self._pointer_probes = {}
         self._pointer_tick = None
         self._pointer_logged = None
         self._pointer_moves = 0
@@ -317,24 +311,6 @@ class WaitingRoomUI(object):
             _log('LAN waiting room skipped the %s property' % name)
 
     def _make_control(self, role, position, width, height):
-        # A slightly lighter frame behind each control separates it from the
-        # panel; the button body draws over it, leaving a thin border.
-        frame = self._surface.simple()
-        for name, value in (
-                ('horizontalPositionMode', 'CLIP'),
-                ('verticalPositionMode', 'CLIP'),
-                ('widthMode', 'CLIP'), ('heightMode', 'CLIP'),
-                ('horizontalAnchor', 'CENTER'), ('verticalAnchor', 'CENTER'),
-                ('position', (position[0], position[1],
-                              position[2] + CONTROL_FRAME_OFFSET)),
-                ('width', width + 0.014), ('height', height + 0.030),
-                ('materialFX', 'SOLID'), ('colour', (120, 158, 186, 245)),
-                ('focus', False), ('mouseButtonFocus', False),
-                ('crossFocus', False), ('moveFocus', False),
-                ('visible', False)):
-            self._set(frame, name, value)
-        self._panel.addChild(frame)
-        self._frames[role] = frame
         component = self._surface.simple(CONTROL_TEXTURE)
         for name, value in (
                 ('horizontalPositionMode', 'CLIP'),
@@ -404,15 +380,13 @@ class WaitingRoomUI(object):
         _log('LAN waiting room opened')
         return True
 
-    # One small quad over a slightly larger dark one reads as a pointer.
-    # mouse_cursors.xml is 12 bytes and no arrow bitmap ships outside the
-    # lobby SWF, so the room draws its own.  Every property below is copied
-    # from the room buttons, which Peng can see and click.
-    POINTER_WIDTH = 14
-    POINTER_HEIGHT = 20
-    POINTER_BORDER = 4
-    POINTER_SHADOW = (0, 0, 0, 230)
-    POINTER_FILL = (255, 255, 255, 255)
+    # Vertex colour is ignored on this client, so the arrow is white.  Each
+    # entry is one row of the staircase: (left offset, top offset, width,
+    # height) in pixels, measured from the tip.
+    POINTER_ROWS = (
+        (0, 0, 2, 2), (0, 2, 4, 2), (0, 4, 6, 2), (0, 6, 8, 2),
+        (0, 8, 10, 2), (0, 10, 12, 2), (0, 12, 6, 2), (6, 12, 4, 4),
+    )
 
     def move_pointer(self):
         """Public move hook: the control scripts call this on every move."""
@@ -421,114 +395,70 @@ class WaitingRoomUI(object):
         self._pointer_moves += 1
         return self._move_pointer()
 
-    def _panel_clip_step(self):
-        """Return one pixel in the panel's own clip units.
-
-        A child's CLIP size spans the parent, so the buttons' 1.20 width is
-        1.20 half-panels, not 1.20 screens.
-        """
-        return (2.0 / float(PANEL_WIDTH), 2.0 / float(PANEL_HEIGHT))
+    def _pixel_step(self):
+        """Return one screen pixel in root CLIP units."""
+        size = None
+        reader = getattr(self._surface, 'screen_size', None)
+        if callable(reader):
+            try:
+                size = reader()
+            except Exception:
+                size = None
+        width, height = size if size else (1024.0, 768.0)
+        return 2.0 / float(width), 2.0 / float(height)
 
     def _build_pointer(self):
-        """Create the drawn pointer once, as children of the room panel.
+        """Create the drawn arrow once, as standalone GUI roots.
 
-        The buttons render and the standalone roots did not, so the pointer
-        now takes the buttons' exact property set: a panel child, CLIP size,
-        CLIP position, CENTER anchors and the flat SOLID material.
-        ``PyGUI.Utils.absoluteClipPosition`` sums a position up the parent
-        chain, so a child offset is the cursor's clip position minus the
-        panel's.
+        A child's CLIP position is relative to the PARENT rect, so a pointer
+        parented to the 680 px panel moved at half the mouse displacement in a
+        1360 px window.  A root's CLIP position is the screen position.
         """
-        if self._panel is None:
-            return False
-        step_x, step_y = self._panel_clip_step()
-        if not self._pointer_probes:
-            self._build_pointer_probes(step_x, step_y)
         if self._pointer_parts:
             return False
+        step_x, step_y = self._pixel_step()
+        depth = CONTROL_Z - 2 * CONTROL_FRAME_OFFSET
         parts = []
-        for colour, grow, depth in (
-                (self.POINTER_SHADOW, self.POINTER_BORDER,
-                 CONTROL_Z - CONTROL_FRAME_OFFSET),
-                (self.POINTER_FILL, 0, CONTROL_Z - 2 * CONTROL_FRAME_OFFSET)):
+        for left, top, width, height in self.POINTER_ROWS:
             part = self._surface.simple(CONTROL_TEXTURE)
             for name, value in (
-                    ('horizontalPositionMode', 'CLIP'),
-                    ('verticalPositionMode', 'CLIP'),
-                    ('widthMode', 'CLIP'), ('heightMode', 'CLIP'),
-                    ('horizontalAnchor', 'CENTER'),
-                    ('verticalAnchor', 'CENTER'),
-                    ('position', (0.0, 0.0, depth)),
-                    ('width', (self.POINTER_WIDTH + grow) * step_x),
-                    ('height', (self.POINTER_HEIGHT + grow) * step_y),
-                    ('materialFX', 'SOLID'), ('colour', colour),
-                    ('focus', False), ('mouseButtonFocus', False),
-                    ('crossFocus', False), ('moveFocus', False),
-                    ('visible', False)):
-                self._set(part, name, value)
-            self._panel.addChild(part)
-            parts.append((part, depth))
-        self._pointer_parts = parts
-        _log('LAN room pointer built parts=%d size=%dx%d' % (
-            len(parts), self.POINTER_WIDTH, self.POINTER_HEIGHT))
-        return True
-
-    def _remove_pointer_probes(self):
-        """Drop the tint marks; every one of them is a GUI root."""
-        for name, probe in sorted(self._pointer_probes.items()):
-            try:
-                self._surface.remove_root(probe)
-            except Exception as error:
-                _log('LAN room tint probe %s not removed: %s' % (name, error))
-        self._pointer_probes = {}
-        return True
-
-    def _build_pointer_probes(self, unused_step_x, unused_step_y):
-        """Draw one labelled square per tint candidate, left to right.
-
-        Every square is a GUI root so no parent rect can clip it, and each
-        varies exactly one of texture, materialFX and colour.  One screenshot
-        then names the combination that tints instead of drawing white.
-        """
-        white = (255, 255, 255, 255)
-        dark = (5, 12, 20, 245)
-        green = (40, 118, 64, 245)
-        dds = CONTROL_TEXTURE
-        bmp = 'system/maps/col_white.bmp'
-        for index, (name, texture, effect, colour) in enumerate((
-                ('1-dds-solid-white', dds, 'SOLID', white),
-                ('2-dds-solid-dark', dds, 'SOLID', dark),
-                ('3-dds-blend-dark', dds, 'BLEND', dark),
-                ('4-dds-add-dark', dds, 'ADD', dark),
-                ('5-dds-blend-green', dds, 'BLEND', green),
-                ('6-bmp-solid-dark', bmp, 'SOLID', dark),
-                ('7-bmp-blend-dark', bmp, 'BLEND', dark),
-                ('8-none-solid-dark', PANEL_TEXTURE, 'SOLID', dark))):
-            probe = self._surface.simple(texture)
-            for property_name, value in (
                     ('horizontalPositionMode', 'CLIP'),
                     ('verticalPositionMode', 'CLIP'),
                     ('widthMode', 'PIXEL'), ('heightMode', 'PIXEL'),
                     ('horizontalAnchor', 'CENTER'),
                     ('verticalAnchor', 'CENTER'),
-                    ('position', (-0.70 + index * 0.20, 0.90,
-                                  CONTROL_Z - 2 * CONTROL_FRAME_OFFSET)),
-                    ('width', 48.0), ('height', 48.0),
-                    ('materialFX', effect), ('colour', colour),
+                    ('position', (0.0, 0.0, depth)),
+                    ('width', float(width)), ('height', float(height)),
+                    ('materialFX', 'SOLID'),
                     ('focus', False), ('mouseButtonFocus', False),
                     ('crossFocus', False), ('moveFocus', False),
-                    ('visible', True)):
-                self._set_optional(probe, property_name, value)
-            self._surface.add_root(probe)
-            self._pointer_probes[name] = probe
+                    ('visible', False)):
+                self._set(part, name, value)
+            self._surface.add_root(part)
+            # A CENTER anchor puts the component's middle on its position.
+            parts.append((part, (left + width * 0.5) * step_x,
+                          -(top + height * 0.5) * step_y, depth))
+        self._pointer_parts = parts
         resort = getattr(self._surface, 'resort', None)
         if callable(resort):
             resort()
+        _log('LAN room pointer built parts=%d rows=%d' % (
+            len(parts), len(self.POINTER_ROWS)))
+        return True
+
+    def _remove_pointer(self):
+        """Drop the arrow roots so a reopen rebuilds them."""
+        for part, unused_x, unused_y, unused_z in self._pointer_parts:
+            try:
+                self._surface.remove_root(part)
+            except Exception as error:
+                _log('LAN room pointer root not removed: %s' % error)
+        self._pointer_parts = []
         return True
 
     def _move_pointer(self):
-        """Follow ``mcursor.position`` with the drawn pointer."""
-        if not self._pointer_parts or self._panel is None:
+        """Follow ``mcursor.position`` with the drawn arrow."""
+        if not self._pointer_parts:
             return False
         position = getattr(self._surface, 'cursor_position', None)
         if not callable(position):
@@ -538,11 +468,8 @@ class WaitingRoomUI(object):
         except Exception as error:
             _log('LAN room pointer read failed: %s' % error)
             return False
-        panel = getattr(self._panel, 'position', (0.0, 0.0, 0.0))
-        offset_x = x - float(panel[0])
-        offset_y = y - float(panel[1])
-        for part, depth in self._pointer_parts:
-            self._set(part, 'position', (offset_x, offset_y, depth))
+        for part, offset_x, offset_y, depth in self._pointer_parts:
+            self._set(part, 'position', (x + offset_x, y + offset_y, depth))
             self._set(part, 'visible', True)
         self._report_pointer(x, y)
         return True
@@ -591,9 +518,6 @@ class WaitingRoomUI(object):
                 _log('LAN room pointer native: %r' % (state(),))
             except Exception as error:
                 _log('LAN room pointer native state failed: %s' % error)
-        for role in sorted(self._pointer_probes):
-            _log('LAN room tint %-18s: %s' % (
-                role, self._describe(self._pointer_probes[role])))
         _log('LAN room pointer   part: %s' % self._describe(
             self._pointer_parts[-1][0]))
         _log('LAN room pointer button: %s' % self._describe(
@@ -630,12 +554,12 @@ class WaitingRoomUI(object):
         return True
 
     def _hide_pointer(self):
-        for part, unused_depth in self._pointer_parts:
+        for part, unused_x, unused_y, unused_z in self._pointer_parts:
             self._set(part, 'visible', False)
         return True
 
     def _acquire_cursor(self):
-        """Make the native cursor visible while this room owns the screen.
+        """Activate the native cursor while this room owns the screen.
 
         ``Cursor.attachCursor`` leaves the lobby's mcursor ACTIVE but with
         ``visible`` False on purpose, because the arrow the player normally
@@ -689,9 +613,6 @@ class WaitingRoomUI(object):
         for role, component in self._controls.items():
             visible = role == 'close' or is_host
             self._set(component, 'visible', visible)
-            frame = self._frames.get(role)
-            if frame is not None:
-                self._set(frame, 'visible', visible)
             label = self._labels.get(role)
             if label is not None:
                 self._set(label, 'visible', visible)
@@ -707,18 +628,13 @@ class WaitingRoomUI(object):
             self._set(label, 'text', value)
 
     def _paint(self):
-        for role, component in self._controls.items():
-            if role == self._hovered:
-                colour = (62, 137, 190, 245)
-            elif role == 'start':
-                colour = (40, 118, 64, 245)
-            elif role == 'map':
-                colour = (38, 104, 154, 245)
-            elif role == 'close':
-                colour = (78, 46, 46, 240)
-            else:
-                colour = (24, 55, 78, 235)
-            self._set(component, 'colour', colour)
+        """Show hover through the label, the only colour this client applies."""
+        for role in self._controls:
+            label = self._labels.get(role)
+            if label is None:
+                continue
+            self._set(label, 'colour', CONTROL_HOVER_COLOUR
+                      if role == self._hovered else CONTROL_TEXT_COLOUR)
 
     def hover(self, role):
         if not self._open:
@@ -785,7 +701,7 @@ class WaitingRoomUI(object):
         self._hide_pointer()
         self._set(self._panel, 'visible', False)
         self._surface.remove_root(self._panel)
-        self._remove_pointer_probes()
+        self._remove_pointer()
         _log('LAN waiting room closed')
         return True
 
@@ -793,8 +709,6 @@ class WaitingRoomUI(object):
         self.close()
         self._panel = None
         self._controls = {}
-        self._frames = {}
         self._labels = {}
         self._pointer_parts = []
-        self._pointer_probes = {}
         return True

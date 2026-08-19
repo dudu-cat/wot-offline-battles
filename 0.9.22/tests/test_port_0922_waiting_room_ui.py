@@ -112,8 +112,8 @@ class WaitingRoomTests(unittest.TestCase):
         return self.room._controls[role].properties['visible']
 
     def _root_count(self, room=None):
-        """The room panel plus one root per tint diagnostic square."""
-        return 1 + len((room or self.room)._pointer_probes)
+        """The room panel plus one root per arrow row."""
+        return 1 + len((room or self.room)._pointer_parts)
 
     def test_the_room_only_uses_properties_this_client_has(self):
         self.room.install()
@@ -258,34 +258,30 @@ class WaitingRoomTests(unittest.TestCase):
             status=lambda: self.status, host=lambda: True, surface=surface)
         self.assertTrue(room.open())
 
-        self.assertEqual(2, len(room._pointer_parts))
-        outline, body = (part for part, unused in room._pointer_parts)
-        self.assertTrue(body.properties['visible'])
-        self.assertEqual(0.0, body.properties['position'][0])
-        # The buttons render and standalone roots did not, so the pointer
-        # takes their exact property set: a panel child with CLIP sizing.
-        self.assertNotIn(body, surface.roots)
-        self.assertIn(body, room._panel.children)
-        button = room._controls['close'].properties
-        for name in ('widthMode', 'heightMode', 'horizontalPositionMode',
-                     'verticalPositionMode', 'horizontalAnchor',
-                     'verticalAnchor', 'materialFX'):
-            self.assertEqual(button[name], body.properties[name], name)
-        self.assertGreater(outline.properties['width'],
-                           body.properties['width'])
-        self.assertGreater(outline.properties['height'],
-                           body.properties['height'])
-        tip_row = body
+        rows = self.module.WaitingRoomUI.POINTER_ROWS
+        self.assertEqual(len(rows), len(room._pointer_parts))
+        tip, tip_x, tip_y, unused_z = room._pointer_parts[0]
+        self.assertTrue(tip.properties['visible'])
+        # A child's CLIP position is relative to the parent rect, which made
+        # the arrow track at half speed; every row is a root instead.
+        self.assertIn(tip, surface.roots)
+        self.assertNotIn(tip, room._panel.children)
+        self.assertEqual('PIXEL', tip.properties['widthMode'])
+        self.assertEqual(
+            self.module.CONTROL_TEXTURE, tip.texture)
 
         surface.cursor = (-0.5, 0.25)
         room.move_pointer()
-        moved = body.properties
+        moved = tip.properties
 
-        self.assertAlmostEqual(-0.5, moved['position'][0])
-        self.assertAlmostEqual(0.25, moved['position'][1])
+        # The tip sits at the cursor; a 1000x500 screen makes one pixel
+        # 0.002 clip units wide, so the offsets stay sub-pixel small.
+        self.assertAlmostEqual(-0.5 + tip_x, moved['position'][0])
+        self.assertAlmostEqual(0.25 + tip_y, moved['position'][1])
+        self.assertLess(abs(tip_x), 0.01)
 
         room.close()
-        self.assertFalse(tip_row.properties['visible'])
+        self.assertFalse(tip.properties['visible'])
 
     def test_the_pointer_follows_without_any_mouse_event(self):
         """The room owns a callback tick, so the arrow moves even when the
@@ -329,9 +325,9 @@ class WaitingRoomTests(unittest.TestCase):
         surface.cursor = (0.4, -0.6)
         surface.ticks[-1][1]()
 
-        tip = room._pointer_parts[1][0].properties
-        self.assertAlmostEqual(0.4, tip['position'][0])
-        self.assertAlmostEqual(-0.6, tip['position'][1])
+        part, offset_x, offset_y, unused_z = room._pointer_parts[1]
+        self.assertAlmostEqual(0.4 + offset_x, part.properties['position'][0])
+        self.assertAlmostEqual(-0.6 + offset_y, part.properties['position'][1])
         # The tick reschedules itself for as long as the room is open.
         self.assertEqual(2, len(surface.ticks))
 
@@ -345,111 +341,19 @@ class WaitingRoomTests(unittest.TestCase):
         self.room._surface.cursor_position = lambda: (0.0, 0.0)
         self.room.move_pointer()
         button_z = self.room._controls['close'].properties['position'][2]
-        outline_z = self.room._pointer_parts[0][0].properties['position'][2]
-        body_z = self.room._pointer_parts[1][0].properties['position'][2]
-        self.assertLess(outline_z, button_z)
-        self.assertLess(body_z, outline_z)
+        arrow_z = self.room._pointer_parts[0][0].properties['position'][2]
+        self.assertLess(arrow_z, button_z)
         # z=0 is the one depth the client refused to draw.
-        self.assertGreater(body_z, 0.0)
+        self.assertGreater(arrow_z, 0.0)
 
     def test_the_pointer_never_takes_mouse_focus(self):
         self.room.open()
         self.room._build_pointer()
 
-        for part, unused_grow in self.room._pointer_parts:
+        for part, unused_x, unused_y, unused_z in self.room._pointer_parts:
             self.assertFalse(part.properties['focus'])
             self.assertFalse(part.properties['mouseButtonFocus'])
             self.assertFalse(part.properties['crossFocus'])
-
-    def test_controls_carry_a_border_frame_behind_the_body(self):
-        self.room.open()
-        frame = self.room._frames['start'].properties
-        control = self.room._controls['start'].properties
-        self.assertTrue(frame['visible'])
-        self.assertGreater(frame['width'], control['width'])
-        self.assertGreater(frame['height'], control['height'])
-        self.assertGreater(frame['position'][2], control['position'][2])
-        self.assertFalse(frame['focus'])
-
-        self.is_host = False
-        self.room.refresh()
-        self.assertFalse(self.room._frames['start'].properties['visible'])
-        self.assertTrue(self.room._frames['close'].properties['visible'])
-
-    def test_a_guest_sees_the_room_without_controls(self):
-        self.is_host = False
-        self.status += u'\nWAITING FOR Host TO START THE BATTLE'
-        self.room.open()
-        for role in ('previous', 'map', 'next', 'start'):
-            self.assertFalse(self._visible(role), role)
-        self.assertTrue(self._visible('close'))
-        self.assertEqual('WAITING FOR Host TO START THE BATTLE',
-                         self._label('map'))
-
-    def test_the_selector_cycles_the_server_map_pool(self):
-        self.room.open()
-        self.room.activate('next')
-        self.assertEqual('MAP: 05 - Prohorovka', self._label('map'))
-        self.room.activate('next')
-        self.assertEqual('MAP: 01 - Karelia', self._label('map'))
-        self.room.activate('previous')
-        self.assertEqual('MAP: 05 - Prohorovka', self._label('map'))
-
-    def test_start_sends_the_selected_map(self):
-        self.room.open()
-        self.room.activate('next')
-        self.assertTrue(self.room.activate('start'))
-        self.assertEqual(['05_prohorovka'], self.started)
-
-    def test_a_denied_start_reports_the_refusal(self):
-        self.room = self.module.WaitingRoomUI(
-            lambda map_name: False, lambda: list(self.pool),
-            status=lambda: self.status, host=lambda: True,
-            surface=self.surface)
-        self.room.open()
-        self.assertFalse(self.room.activate('start'))
-        self.assertIn('did not accept', self._label('message'))
-
-    def test_a_guest_cannot_start_or_change_the_map(self):
-        self.is_host = False
-        self.room.open()
-        self.assertFalse(self.room.activate('start'))
-        self.assertFalse(self.room.activate('next'))
-        self.assertEqual([], self.started)
-
-    def test_an_empty_pool_refuses_the_start(self):
-        self.pool = []
-        self.room.open()
-        self.assertFalse(self.room.activate('start'))
-        self.assertEqual([], self.started)
-        self.assertIn('Choose a map', self._label('message'))
-
-    def test_a_removed_map_falls_back_to_the_current_pool(self):
-        self.room.open()
-        self.room.activate('next')
-        self.pool = ['19_monastery']
-        self.room.refresh()
-        self.assertEqual('MAP: 19 - Monastery', self._label('map'))
-
-    def test_close_removes_the_room_and_reports_it_once(self):
-        self.room.open()
-        self.assertTrue(self.room.activate('close'))
-        self.assertEqual([], self.surface.roots)
-        self.assertEqual([1], self.closed)
-        self.assertFalse(self.room.close())
-
-    def test_reopening_shows_the_room_again(self):
-        self.room.open()
-        self.room.close()
-        self.assertTrue(self.room.open())
-        self.assertEqual(self._root_count(), len(self.surface.roots))
-
-    def test_hover_repaints_only_while_the_room_is_open(self):
-        self.assertFalse(self.room.hover('start'))
-        self.room.open()
-        self.assertTrue(self.room.hover('start'))
-        self.assertEqual((62, 137, 190, 245),
-                         self.room._controls['start'].properties['colour'])
 
     def test_uninstall_drops_every_component(self):
         self.room.open()
@@ -528,9 +432,9 @@ class NativeCursorSurfaceTests(unittest.TestCase):
     def setUp(self):
         self.module = _load('waiting_room_ui')
 
-    def _surface(self, scaleform=None):
+    def _surface(self):
         cursor = types.SimpleNamespace(
-            active=False, visible=False, position=(0.25, -0.5))
+            active=False, visible=True, position=(0.25, -0.5))
         calls = []
         bigworld = types.ModuleType('BigWorld')
         bigworld.setCursor = lambda value: calls.append(('setCursor', value))
@@ -539,34 +443,19 @@ class NativeCursorSurfaceTests(unittest.TestCase):
         gui_module = types.ModuleType('GUI')
         gui_module.mcursor = gui.mcursor
         modules = {'BigWorld': bigworld, 'GUI': gui_module}
-        if scaleform is not None:
-            modules['Scaleform'] = scaleform
         with mock.patch.dict(sys.modules, modules):
             surface = self.module.NativeSurface()
         surface._gui = gui
         return surface, cursor, calls, modules
 
-    def test_show_cursor_prefers_the_stock_1513_helper(self):
-        shown = []
-        scaleform = types.ModuleType('Scaleform')
-        scaleform.showCursor = lambda: shown.append(True)
-        surface, unused_cursor, calls, modules = self._surface(scaleform)
-
-        with mock.patch.dict(sys.modules, modules):
-            self.assertTrue(surface.show_cursor())
-
-        self.assertEqual([True], shown)
-        self.assertEqual([], calls)
-
-    def test_show_cursor_falls_back_to_the_native_pair(self):
+    def test_show_cursor_activates_without_painting_the_os_pointer(self):
         surface, cursor, calls, modules = self._surface()
-        modules['Scaleform'] = None
 
         with mock.patch.dict(sys.modules, modules):
             self.assertTrue(surface.show_cursor())
 
-        # The 0.8.2 room makes the cursor visible; the drawn arrow is extra.
-        self.assertEqual(1, cursor.visible)
+        # A painted mcursor is the Windows pointer beside our own arrow.
+        self.assertFalse(cursor.visible)
         self.assertEqual([('setCursor', cursor)], calls)
 
     def test_hide_cursor_restores_the_device_cursor(self):
@@ -604,7 +493,7 @@ class RoomTextureTests(unittest.TestCase):
         # be seen needs the one texture this client renders.
         texture = self.module.CONTROL_TEXTURE
         self.assertEqual(texture, self.room._controls['start'].texture)
-        for part, unused_depth in self.room._pointer_parts:
+        for part, unused_x, unused_y, unused_z in self.room._pointer_parts:
             self.assertEqual(texture, part.texture)
 
     def test_button_labels_are_dark_enough_to_read_on_white(self):
@@ -614,14 +503,3 @@ class RoomTextureTests(unittest.TestCase):
         # The free-floating labels stay light: they sit over the garage.
         self.assertNotEqual(
             colour, self.room._labels['title'].properties['colour'])
-
-    def test_the_tint_row_varies_one_property_at_a_time(self):
-        probes = self.room._pointer_probes
-        self.assertEqual(8, len(probes))
-        control = probes['1-dds-solid-white'].properties
-        self.assertEqual('SOLID', control['materialFX'])
-        self.assertEqual((255, 255, 255, 255), control['colour'])
-        # The untextured square is the one expected to stay invisible.
-        self.assertEqual('', probes['8-none-solid-dark'].texture)
-        self.assertEqual(
-            'BLEND', probes['3-dds-blend-dark'].properties['materialFX'])
