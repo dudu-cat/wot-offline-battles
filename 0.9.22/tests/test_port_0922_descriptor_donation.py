@@ -105,6 +105,16 @@ class DonationFlowTest(unittest.TestCase):
         self.assertEqual(sorted(state.pending_descriptor_names),
                          list(state.pending_descriptor_names))
 
+    def test_a_players_own_vehicle_is_read_again_after_a_round(self):
+        state = _state_with_catalog()
+        state.descriptor_store.add('ussr:R11_MS-1', _projection())
+        state.descriptor_store.add('usa:T1_Cunningham', _projection())
+
+        state._reset_round()
+
+        self.assertIsNone(state.descriptor_store.get('ussr:R11_MS-1'))
+        self.assertIsNotNone(state.descriptor_store.get('usa:T1_Cunningham'))
+
     def test_bundle_completion_starts_the_authority(self):
         state = _state_with_catalog()
         state.request_start(1, '01_karelia')
@@ -246,10 +256,11 @@ class DonationFlowTest(unittest.TestCase):
     def test_ready_waits_for_native_identities_then_reaches_live(self):
         state = _state_with_catalog()
         state.vehicle_catalogs[1] = tuple(_catalog_rows()[:1])
-        state.descriptor_store.add('ussr:R11_MS-1', _projection())
         start, error = state.request_start(1, '01_karelia')
         self.assertIsNone(error)
         self.assertTrue(start['need_destructible_map'])
+        state.donate_descriptors(1, _bundle(
+            state, projections={'ussr:R11_MS-1': _projection()}))
         self.assertTrue(state.server_authority.started())
 
         self.assertIsNone(state.mark_battle_ready(
@@ -266,8 +277,9 @@ class DonationFlowTest(unittest.TestCase):
         now = [10.0]
         state = _state_with_catalog(clock=lambda: now[0])
         state.vehicle_catalogs[1] = tuple(_catalog_rows()[:1])
-        state.descriptor_store.add('ussr:R11_MS-1', _projection())
         state.request_start(1, '01_karelia')
+        state.donate_descriptors(1, _bundle(
+            state, projections={'ussr:R11_MS-1': _projection()}))
         self.assertIsNone(state.mark_battle_ready(
             1, {'type': 'battle_ready', 'round_id': state.round_id}))
         now[0] += AUTHORITY_DESTRUCTIBLE_TIMEOUT_SECONDS + 0.01
@@ -477,6 +489,25 @@ class ProjectionBuilderTest(unittest.TestCase):
 
         self.assertEqual(['test:good'], sorted(projections))
         self.assertEqual(['test:bad'], failures)
+
+    def test_a_mounted_fitting_replaces_the_stock_descriptor(self):
+        stock = self._descriptor()
+        fitted = self._descriptor()
+        fitted.hull.maxHealth = 4321
+        seen = []
+
+        def resolve(typeName=None, compactDescr=None):
+            seen.append((typeName, compactDescr))
+            return fitted if compactDescr == 'fitted' else stock
+
+        runtime = types.SimpleNamespace(
+            vehicles=types.SimpleNamespace(VehicleDescr=resolve))
+
+        projections = descriptor_donation.project_vehicles(
+            runtime, ['test:good'], fittings={'test:good': 'fitted'})
+
+        self.assertEqual([(None, 'fitted')], seen)
+        self.assertEqual(4321, projections['test:good']['hull']['maxHealth'])
 
 
 if __name__ == '__main__':

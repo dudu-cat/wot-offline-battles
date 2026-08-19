@@ -214,13 +214,23 @@ def vehicle_catalog(runtime):
     return rows
 
 
-def project_vehicles(runtime, names, failures=None):
-    """Build requested projections and optionally report every failed name."""
+def project_vehicles(runtime, names, failures=None, fittings=None):
+    """Build requested projections and optionally report every failed name.
+
+    ``fittings`` maps a type name to a mounted compact descriptor, so the
+    server measures the tank the owner actually fitted instead of the stock
+    one.
+    """
     projections = {}
     for name in names:
         name = str(name)
         try:
-            descriptor = runtime.vehicles.VehicleDescr(typeName=name)
+            fitting = (fittings or {}).get(name)
+            if fitting is None:
+                descriptor = runtime.vehicles.VehicleDescr(typeName=name)
+            else:
+                descriptor = runtime.vehicles.VehicleDescr(
+                    compactDescr=fitting)
             projections[name] = project_descriptor(descriptor)
         except Exception:
             if failures is not None:

@@ -1123,6 +1123,34 @@ three terrain resistances, engine power, both speed limits, the repair factor
 and the radio distance, plus a `source=` field that says whether the numbers
 came from the client factor dictionary or from the fallback.
 
+### What a live battle actually reported, and the two defects it exposed
+
+The table above states the intended source for each row. A battle on the exact
+client reported `source=fallback`, `vision_factor=1.0000` and `vents=False`
+while ventilation was mounted, so two separate defects kept every row on the
+fallback path:
+
+- `loadout._artefact` tested a mounted item with `value == 0`. #1513
+  `FittingItem.__eq__` guards only against `None` and then reads `other.intCD`,
+  so the comparison raised `'int' object has no attribute 'intCD'` and
+  `attribute_factors` returned `None` for the whole loadout. The guard now
+  tests the integer case only after the type check;
+- the battle built the player's descriptor with `VehicleDescr(typeName=...)`.
+  That descriptor carries the stock modules and an empty `optionalDevices`, so
+  no mounted device could be seen at all. `_local_battle_descriptor` now builds
+  it from the garage item's own `makeCompactDescr()`, which is the compact
+  descriptor #1513 itself uses to build `gui_items.Vehicle.descriptor`.
+
+The same fitted compact descriptor is donated to the server authority, so the
+health, armour and gun the server resolves damage against are the ones the
+garage panel measured. The server forgets each player's projection when a round
+ends, because a player can refit between rounds.
+
+`conceal_move == conceal_still` in that report is not a defect.
+`VehicleDescriptor.computeBaseInvisibility` applies the same crew, vehicle and
+camouflage terms to both members of `type.invisibility`, and a light tank
+carries the same pair for moving and still.
+
 ## Known deterministic parity gaps
 
 The source audit deliberately keeps the following differences visible:

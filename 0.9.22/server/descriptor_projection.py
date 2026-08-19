@@ -50,6 +50,9 @@ class DescriptorStore(object):
     def get(self, name):
         return self._projections.get(str(name))
 
+    def forget(self, name):
+        self._projections.pop(str(name), None)
+
     def names(self):
         return sorted(self._projections)
 

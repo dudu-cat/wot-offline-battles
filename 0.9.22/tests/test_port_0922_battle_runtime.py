@@ -154,24 +154,26 @@ class _YawMatrix(_Matrix):
 
 
 class _VehicleFilter(object):
-    """BigWorld.WGVehicleFilter: the belt override the track scroll writes."""
+    """BigWorld.WGVehicleFilter: the only source of a belt movementInfo."""
 
     def __init__(self):
         self.movementInfo = object()
+        self.tracks_speed = None
+
+    def setTracksSpeed(self, left, right):
+        self.tracks_speed = (left, right)
 
 
 class _TrackScroll(object):
-    """BigWorld.PyTrackScroll with its native scroll readback."""
+    """BigWorld.PyTrackScroll: #1513 exposes all ten entries as methods."""
 
     def __init__(self):
         self.data = None
         self.active = False
         self.mode = None
         self.external = None
-        self.leftScroll = 0.0
-        self.rightScroll = 0.0
-        self.leftContact = False
-        self.rightContact = False
+        self._left = 0.0
+        self._right = 0.0
 
     def activate(self):
         self.active = True
@@ -189,8 +191,20 @@ class _TrackScroll(object):
         self.external = (left, right)
         # The native tick pins both belts while the engine is not running.
         if self.mode and self.mode[0] > 1:
-            self.leftScroll += left
-            self.rightScroll += right
+            self._left += left
+            self._right += right
+
+    def leftScroll(self):
+        return self._left
+
+    def rightScroll(self):
+        return self._right
+
+    def leftContact(self):
+        return False
+
+    def rightContact(self):
+        return False
 
 
 class _Model(object):
@@ -1662,6 +1676,9 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual((3.0, 5.0), vehicle.track_scroll.external)
         self.assertEqual((3.0, 5.0, False, False),
                          vehicle.track_scroll_readback())
+        # Only the filter reaches the chassis fashion and the spline belt.
+        self.assertEqual((3.0, 5.0), vehicle.track_filter.tracks_speed)
+        self.assertIsNone(vehicle.track_speed_error)
 
         # An idle engine cannot scroll the belts; the native tick zeroes them.
         vehicle.update_tracks(3.0, 5.0, (1, 0))
@@ -1781,7 +1798,12 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         vehicle.set_pose(_Vector(1.0, 0.0, 2.0), (0.0, 0.0, 0.0))
 
         self.assertEqual((1.0, 0.0, 2.0), vehicle._render_pose[:3])
-        self.assertEqual(0.0, vehicle._animation.keyframes[1][0])
+        # Both keys carry the new pose, so the animation cannot blend away
+        # from it; the interval stays positive because 0/0 is not a factor.
+        keyframes = vehicle._animation.keyframes
+        self.assertGreater(keyframes[1][0], keyframes[0][0])
+        self.assertEqual(keyframes[0][1].translation,
+                         keyframes[1][1].translation)
 
     def test_destroyed_remote_vehicle_reloads_the_native_wreck_once(self):
         runtime = _runtime()
@@ -10359,3 +10381,40 @@ class DescriptorReuseTests(unittest.TestCase):
         self.assertIs(first, second)
         self.assertIsNot(first, other)
         self.assertEqual(['ussr:T-34', 'germany:PzVI'], built)
+
+
+class LocalBattleDescriptorTests(unittest.TestCase):
+    """The battle measures the tank the garage panel measured."""
+
+    def _runtime(self, fitting):
+        def VehicleDescr(typeName=None, compactDescr=None):
+            if compactDescr is not None:
+                return types.SimpleNamespace(source='fitted:%s' % compactDescr)
+            return types.SimpleNamespace(source='stock:%s' % typeName)
+
+        runtime = BattleRuntime.__new__(BattleRuntime)
+        runtime._runtime = types.SimpleNamespace(
+            vehicles=types.SimpleNamespace(VehicleDescr=VehicleDescr))
+        runtime._garage_loadout = {'fitting': fitting}
+        return runtime
+
+    def test_the_mounted_compact_descriptor_wins(self):
+        runtime = self._runtime(('CD', 'ussr:T-34'))
+
+        descriptor = runtime._local_battle_descriptor('ussr:T-34')
+
+        self.assertEqual('fitted:CD', descriptor.source)
+
+    def test_another_vehicle_falls_back_to_the_stock_fitting(self):
+        runtime = self._runtime(('CD', 'ussr:T-34'))
+
+        descriptor = runtime._local_battle_descriptor('germany:PzVI')
+
+        self.assertEqual('stock:germany:PzVI', descriptor.source)
+
+    def test_no_garage_falls_back_to_the_stock_fitting(self):
+        runtime = self._runtime(None)
+
+        descriptor = runtime._local_battle_descriptor('ussr:T-34')
+
+        self.assertEqual('stock:ussr:T-34', descriptor.source)

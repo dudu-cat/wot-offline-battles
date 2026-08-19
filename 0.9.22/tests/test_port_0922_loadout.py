@@ -363,5 +363,30 @@ class ClientFactorTests(unittest.TestCase):
         self.assertEqual((0.11, 1.0), profile['invisibility_still'])
 
 
+class MountedArtefactTests(unittest.TestCase):
+    """#1513 ``FittingItem.__eq__`` reads ``other.intCD`` without a guard."""
+
+    class _GuiItem(object):
+
+        def __init__(self):
+            self.descriptor = types.SimpleNamespace(
+                updateVehicleAttrFactors=lambda *args: None)
+
+        def __eq__(self, other):
+            return self.descriptor is other.intCD
+
+        def __ne__(self, other):
+            return not self.__eq__(other)
+
+    def test_a_mounted_item_is_never_compared_against_zero(self):
+        item = self._GuiItem()
+
+        self.assertIs(item.descriptor, loadout._artefact(item, None))
+
+    def test_an_empty_slot_still_resolves_to_nothing(self):
+        self.assertIsNone(loadout._artefact(0, None))
+        self.assertIsNone(loadout._artefact(None, None))
+
+
 if __name__ == '__main__':
     unittest.main()

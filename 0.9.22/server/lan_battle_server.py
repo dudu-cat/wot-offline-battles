@@ -940,6 +940,10 @@ class BattleState:
         self.phase = "waiting"
         self.round_id += 1
         self.tick = 0
+        # A player can refit in the garage between rounds, so the next round
+        # asks its owner for the fitted descriptor again.
+        for player in self.players.values():
+            self.descriptor_store.forget(player.vehicle)
         self.map_name = self._choose_map(self._active_map_pool())
         for player in self.players.values():
             player.health = player.max_health

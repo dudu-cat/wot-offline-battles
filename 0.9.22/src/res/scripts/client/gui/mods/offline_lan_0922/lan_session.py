@@ -1297,6 +1297,16 @@ class LANSession(object):
             print('[Offline LAN 0.9.22] vehicle catalog donation was not '
                   'accepted by the transport (%d rows)' % len(rows))
 
+    @staticmethod
+    def _local_fitting():
+        """Map the selected vehicle's type name to its mounted descriptor."""
+        try:
+            from CurrentVehicle import g_currentVehicle
+            descriptor = g_currentVehicle.item.descriptor
+            return {str(descriptor.type.name): descriptor.makeCompactDescr()}
+        except Exception:
+            return {}
+
     def _donate_descriptors(self, message):
         """Answer one server request for battle descriptor projections."""
         names = message.get('names') if isinstance(message, dict) else None
@@ -1318,7 +1328,8 @@ class LANSession(object):
             else:
                 from gui.mods.offline_lan_0922 import descriptor_donation
                 projections = descriptor_donation.project_vehicles(
-                    runtime, requested, failures=failures)
+                    runtime, requested, failures=failures,
+                    fittings=self._local_fitting())
         except Exception as error:
             print('[Offline LAN 0.9.22] descriptor donation '
                   'failed: %s' % error)

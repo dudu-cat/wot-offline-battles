@@ -97,9 +97,13 @@ def crew_compact_descrs(crew):
 
 def _artefact(value, vehicles_module):
     """Resolve one mounted item to the ``items.artefacts`` object #1513 uses."""
-    if value is None or value == 0:
+    if value is None:
         return None
     if isinstance(value, _INTEGER_TYPES):
+        # #1513 FittingItem.__eq__ reads other.intCD unguarded, so comparing a
+        # mounted gui item against 0 raises instead of answering.
+        if not value:
+            return None
         try:
             return vehicles_module.getItemByCompactDescr(int(value))
         except Exception:

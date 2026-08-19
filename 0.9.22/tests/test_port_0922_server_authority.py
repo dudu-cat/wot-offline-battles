@@ -501,6 +501,14 @@ class VehicleStatisticsTest(unittest.TestCase):
         message, error = state.request_start(1, '01_karelia')
         self.assertIsNone(error)
         self.assertEqual('battle_start', message['type'])
+        pending = list(state.pending_descriptor_names)
+        if pending:
+            state.donate_descriptors(1, {
+                'type': 'descriptor_bundle', 'round_id': state.round_id,
+                'requested': list(state.descriptor_requested_names),
+                'failures': [], 'complete': True,
+                'projections': dict((name, _projection())
+                                    for name in pending)})
         for player_id in sorted(state.players):
             state.mark_battle_ready(player_id, {'round_id': state.round_id})
         self.assertEqual('battle', state.phase)

@@ -14,11 +14,15 @@ which also makes cross-battle chunk-ID collisions harmless.
 """
 
 import math
+import sys
 
 import BigWorld
 import Math
 
 _state = {'spaceID': None, 'chunks': {}, 'entities': set()}
+
+_APPLY_REPORT_LIMIT = 24
+_applies_reported = [0]
 
 _PROP_BY_KIND = {
 	'tree': 'fallenTrees',
@@ -51,6 +55,7 @@ def reset(spaceID=None):
 	_state['spaceID'] = spaceID
 	_state['chunks'] = {}
 	_state['entities'] = set()
+	_applies_reported[0] = 0
 
 
 def _ensure_shape():
@@ -128,6 +133,25 @@ def _ensure_chunk(spaceID, chunkID, pos):
 	return mgr.getController(chunkID)
 
 
+def _report_apply(spaceID, chunkID, pos, kind, destrData, ctrl,
+		applyShotImmediately):
+	"""Say what each of the first destructions this round asked the engine for."""
+	if _applies_reported[0] >= _APPLY_REPORT_LIMIT:
+		return
+	_applies_reported[0] += 1
+	try:
+		import AreaDestructibles
+		manager_space = AreaDestructibles.g_destructiblesManager.getSpaceID()
+	except Exception as error:
+		manager_space = 'unavailable:%s' % (error,)
+	sys.stdout.write(
+		'[Offline LAN 0.9.22] DESTR apply kind=%s chunk=%s data=%s ctrl=%s '
+		'shot_now=%s space=%s manager_space=%s at=(%.1f, %.1f, %.1f)\n' % (
+			kind, chunkID, destrData, ctrl is not None,
+			bool(applyShotImmediately), spaceID, manager_space,
+			pos[0], pos[1], pos[2]))
+
+
 def _apply(spaceID, chunkID, pos, kind, destrData, dedupKey,
 		syncWithProjectile=False, applyShotImmediately=False):
 	import AreaDestructibles
@@ -136,6 +160,8 @@ def _apply(spaceID, chunkID, pos, kind, destrData, dedupKey,
 	if dedupKey in c['keys']:
 		return False
 	ctrl = _ensure_chunk(spaceID, chunkID, pos)
+	_report_apply(spaceID, chunkID, pos, kind, destrData, ctrl,
+		applyShotImmediately)
 	prop = _PROP_BY_KIND[kind]
 	if ctrl is not None:
 		# Server-style push: update the entity property and fire its

@@ -692,8 +692,10 @@ def _load_runtime():
     import AvatarInputHandler
     import BattleFeedbackCommon
     import BigWorld
+    import DataLinks
     import DestructiblesCache
     import Math
+    import Vehicular
     import constants
     import game
     import nations
@@ -731,7 +733,9 @@ def _load_runtime():
     runtime.battle_feedback_common = BattleFeedbackCommon
     runtime.compatibility = g_compatibility
     runtime.constants = constants
+    runtime.data_links = DataLinks
     runtime.destructibles_cache = DestructiblesCache
+    runtime.vehicular = Vehicular
     runtime.effect_material_calculation = EffectMaterialCalculation
     runtime.material_kinds = material_kinds
     runtime.encode_gun_angles = encodeGunAngles
@@ -950,6 +954,7 @@ class BattleRuntime(object):
         self._garage_loadout = None
         self._offframe_seconds = 0.0
         self._effect_reports = 0
+        self._decal_probe = None
         self._spotted_signature = None
         self._local_spotting_cache = None
         self._local_factors_cache = None
@@ -1658,13 +1663,33 @@ class BattleRuntime(object):
             if self._callback_token is token:
                 self._callback_id = callback_id
 
+    def _local_battle_descriptor(self, vehicle_name):
+        """Return the player's own descriptor with the garage fitting on it.
+
+        A descriptor built from the type name alone carries the stock modules
+        and no optional devices, so the battle would measure a different tank
+        from the one the garage panel measures.
+        """
+        vehicles = self._runtime.vehicles
+        fitting = self._garage_loadout_snapshot()['fitting']
+        if fitting is not None and fitting[1] == vehicle_name:
+            try:
+                return vehicles.VehicleDescr(compactDescr=fitting[0])
+            except Exception as error:
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] the garage fitting is unreadable, '
+                    'falling back to the stock %s: %s\n' %
+                    (vehicle_name, error))
+        return vehicles.VehicleDescr(typeName=vehicle_name)
+
     def _create_entities(self):
         try:
             self.state = 'loading_entities'
             self._vehicle_ready_deadline = 0.0
+            self._install_decal_probe()
             local = self._local_state()
-            descriptor = self._runtime.vehicles.VehicleDescr(
-                typeName=local.get('vehicle', self._config['vehicle']))
+            descriptor = self._local_battle_descriptor(
+                local.get('vehicle', self._config['vehicle']))
             self._binding = BigWorldVehicleBinding(
                 self._runtime.bigworld, self._avatar,
                 self._runtime.constants, self._runtime.vehicles.VehicleDescr,
@@ -1677,7 +1702,9 @@ class BattleRuntime(object):
                 camouflages=(
                     getattr(self._runtime, 'camouflages', None)
                     if self._config.get('bot_track_animation', False)
-                    else None))
+                    else None),
+                vehicular=getattr(self._runtime, 'vehicular', None),
+                data_links=getattr(self._runtime, 'data_links', None))
             self._remote_factory.prepare_descriptor(descriptor)
             builder = EntityPropertyBuilder(
                 BigWorldVehicleBinding.PROPERTY_NAMES)
@@ -3594,8 +3621,26 @@ class BattleRuntime(object):
                            tuple(consumables.getInstalledItems())),
             'crew': tuple(getattr(item, 'crew', None) or ()),
             'camouflage_id': self._garage_camouflage_id(item),
+            'fitting': self._garage_fitting(item),
         }
         return self._garage_loadout
+
+    @staticmethod
+    def _garage_fitting(item):
+        """The mounted compact descriptor, or None outside a garage.
+
+        #1513 builds ``gui_items.Vehicle.descriptor`` from the account's own
+        ``strCompactDescr``, so this carries the fitted modules, optional
+        devices and camouflage the garage panel measures.
+        """
+        descriptor = getattr(item, 'descriptor', None)
+        maker = getattr(descriptor, 'makeCompactDescr', None)
+        if not callable(maker):
+            return None
+        try:
+            return maker(), str(descriptor.type.name)
+        except Exception:
+            return None
 
     @staticmethod
     def _garage_camouflage_id(item):
@@ -4841,6 +4886,51 @@ class BattleRuntime(object):
             end=hit_position + direction.scale(0.4),
             showShockWave=bool(target_record.get('local')),
             showFlashBang=bool(target_record.get('local')))
+        return True
+
+    _DECAL_REPORT_LIMIT = 32
+
+    def _install_decal_probe(self):
+        """Log the first ground decals this round paints, and who painted them.
+
+        A large black wedge has been seen on open terrain in three battles.
+        Every other candidate is ruled out, so this names the exact caller and
+        corners of any decal that is too large or degenerate.
+        """
+        bigworld = self._runtime.bigworld
+        original = getattr(bigworld, 'wg_addDecal', None)
+        if not callable(original) or self._decal_probe is not None:
+            return False
+        reports = [0]
+
+        def wg_addDecal(group, start, end, size, yaw, *textures):
+            if reports[0] < self._DECAL_REPORT_LIMIT:
+                reports[0] += 1
+                try:
+                    frame = sys._getframe(1)
+                    caller = '%s:%d' % (frame.f_code.co_filename,
+                                        frame.f_lineno)
+                except Exception:
+                    caller = 'unknown'
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] DECAL group=%s start=%s end=%s '
+                    'size=%s yaw=%s from=%s\n' % (
+                        group, tuple(start), tuple(end), tuple(size), yaw,
+                        caller))
+            return original(group, start, end, size, yaw, *textures)
+
+        bigworld.wg_addDecal = wg_addDecal
+        self._decal_probe = (original, wg_addDecal)
+        return True
+
+    def _remove_decal_probe(self):
+        probe = self._decal_probe
+        self._decal_probe = None
+        if probe is None:
+            return False
+        bigworld = self._runtime.bigworld
+        if getattr(bigworld, 'wg_addDecal', None) is probe[1]:
+            bigworld.wg_addDecal = probe[0]
         return True
 
     _EFFECT_REPORT_LIMIT = 12
@@ -8075,10 +8165,11 @@ class BattleRuntime(object):
         return True
 
     def _report_bot_tracks(self, vehicle, left, right, mode, now):
-        """Log the native scroll readback so one battle decides this design.
+        """Log both belt writers so one battle decides this design.
 
-        If we feed non-zero belt speeds and ``leftScroll``/``rightScroll`` stay
-        put, the filter does not integrate for a client-only entity.
+        The chassis fashion reads ``filter.movementInfo``, which no client-only
+        entity advances, so ``setTracksSpeed`` is the only writer that can move
+        the belts. This says whether the exact client exposes it and took it.
         """
         if self._track_report_time is not None and (
                 now - self._track_report_time) < TRACK_REPORT_SECONDS:
@@ -8086,9 +8177,11 @@ class BattleRuntime(object):
         self._track_report_time = now
         sys.stdout.write(
             '[Offline LAN 0.9.22] bot tracks id=%s mode=%r fed=(%.3f, %.3f) '
-            'scroll=%r error=%r\n' % (
+            'scroll=%r speeds=%s speeds_error=%r error=%r\n' % (
                 vehicle.bw_entity_id, mode, left, right,
                 vehicle.track_scroll_readback(),
+                callable(getattr(vehicle.track_filter, 'setTracksSpeed', None)),
+                vehicle.track_speed_error,
                 self._remote_factory.track_animation_error))
         return True
 
@@ -9814,6 +9907,10 @@ class BattleRuntime(object):
 
     def _cleanup(self):
         cleanup_error = None
+        try:
+            self._remove_decal_probe()
+        except Exception as error:
+            cleanup_error = error
         if self._projectiles is not None:
             try:
                 self._projectiles.reset(max(

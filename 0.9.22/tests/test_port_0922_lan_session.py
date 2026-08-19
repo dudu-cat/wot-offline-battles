@@ -296,7 +296,7 @@ class LANSessionTests(unittest.TestCase):
         from gui.mods.offline_lan_0922 import descriptor_donation
         names = ['test:good', 'test:bad']
 
-        def project(unused_runtime, requested, failures=None):
+        def project(unused_runtime, requested, failures=None, fittings=None):
             failures.append('test:bad')
             return {'test:good': {'name': 'test:good'}}
 

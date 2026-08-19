@@ -27,6 +27,9 @@ def _blend_angle(source, target, ratio):
 # vehicle now owns its animation and both keyframe matrices for its whole life.
 _pose_object_allocations = 0
 
+# The shortest interval a Math.MatrixAnimation keyframe pair may span.
+_MINIMUM_KEYFRAME_SECONDS = 0.001
+
 
 def pose_animation_writes():
     """Return how many native pose objects this process has allocated."""
@@ -708,6 +711,8 @@ class RemoteVehicle(object):
         self._collision_obstacle = None
         self.track_filter = None
         self.track_scroll = None
+        self.track_flying_info = None
+        self.track_speed_error = None
         self.fashions = None
         self._track_mode = None
         self._offlineLANShotIndex = int(
@@ -774,18 +779,24 @@ class RemoteVehicle(object):
         self.isStarted = True
         self.inWorld = True
 
-    def attach_track_animation(self, vehicle_filter, scroll, fashions):
+    def attach_track_animation(self, vehicle_filter, scroll, fashions,
+                               flying_info=None):
         """Adopt the native belt animation assembled for this bot."""
         self.track_filter = vehicle_filter
         self.track_scroll = scroll
+        self.track_flying_info = flying_info
+        self.track_speed_error = None
         self.fashions = fashions
         self._track_mode = None
         return True
 
     def update_tracks(self, left, right, mode):
-        """Feed one frame of belt speed through PyTrackScroll.
+        """Feed one frame of belt speed to the filter and to PyTrackScroll.
 
-        The native tick pins both belts to zero while ``mode[0]`` is at most 1.
+        The chassis fashion, the spline belt, the track-link nodes and the road
+        wheels all read ``filter.movementInfo``; PyTrackScroll only feeds the
+        ground dust and the audition.  ``setTracksSpeed`` is the one native
+        writer on ``WGVehicleFilter`` that can move a filter no entity owns.
         """
         scroll = self.track_scroll
         if scroll is None:
@@ -794,20 +805,38 @@ class RemoteVehicle(object):
             scroll.setMode(mode)
             self._track_mode = mode
         scroll.setExternal(float(left), float(right))
+        speeds = getattr(self.track_filter, 'setTracksSpeed', None)
+        if callable(speeds):
+            try:
+                speeds(float(left), float(right))
+            except Exception as error:
+                self.track_speed_error = '%s' % (error,)
         return True
 
     def track_scroll_readback(self):
-        """Return the native scroll state, or None without a controller."""
+        """Call the four #1513 ``PyTrackScroll`` readers and return their values."""
         scroll = self.track_scroll
         if scroll is None:
             return None
-        return tuple(getattr(scroll, name, None) for name in (
-            'leftScroll', 'rightScroll', 'leftContact', 'rightContact'))
+        values = []
+        for name in ('leftScroll', 'rightScroll', 'leftContact',
+                     'rightContact'):
+            reader = getattr(scroll, name, None)
+            if callable(reader):
+                try:
+                    values.append(reader())
+                    continue
+                except Exception as error:
+                    values.append('%s!%s' % (name, error))
+                    continue
+            values.append(reader)
+        return tuple(values)
 
     def _release_track_animation(self):
         scroll = self.track_scroll
         self.track_scroll = None
         self.track_filter = None
+        self.track_flying_info = None
         self.fashions = None
         self._track_mode = None
         if scroll is None:
@@ -956,10 +985,16 @@ class RemoteVehicle(object):
         return self._rekey(relax_time)
 
     def _rekey(self, relax_time):
-        """Point the animation at this vehicle's own two keyframe matrices."""
+        """Point the animation at this vehicle's own two keyframe matrices.
+
+        Both stock users key the second frame at a strictly positive time.
+        Two keys at the same time leave the native blend factor at zero over
+        zero, which turns the whole compound's transform into NaN.
+        """
         try:
             self._animation.keyframes = (
-                (0.0, self._key_from), (relax_time, self._key_to))
+                (0.0, self._key_from),
+                (max(relax_time, _MINIMUM_KEYFRAME_SECONDS), self._key_to))
             self._animation.time = 0.0
         except Exception:
             self._animation = None
@@ -1187,11 +1222,13 @@ class RemoteVehicleFactory(object):
     """Load, register and destroy authoritative remote presentations."""
 
     def __init__(self, bigworld, math_module, model_assembler, space_id,
-                 camouflages=None):
+                 camouflages=None, vehicular=None, data_links=None):
         self._bigworld = bigworld
         self._math = math_module
         self._model_assembler = model_assembler
         self._camouflages = camouflages
+        self._vehicular = vehicular
+        self._data_links = data_links
         self.track_animation_error = None
         self._track_animation_reported = False
         self._space_id = int(space_id)
@@ -1325,6 +1362,8 @@ class RemoteVehicleFactory(object):
                 descriptor)
             step = 'PyTrackScroll'
             scroll = self._bigworld.PyTrackScroll()
+            step = 'setFlyingInfo'
+            flying = self._attach_flying_info(scroll)
             step = 'activate'
             scroll.activate()
             step = 'setData'
@@ -1338,7 +1377,19 @@ class RemoteVehicleFactory(object):
             return False
         self._report_track_animation('assembled', None)
         return vehicle.attach_track_animation(
-            vehicle_filter, scroll, fashions)
+            vehicle_filter, scroll, fashions, flying)
+
+    def _attach_flying_info(self, scroll):
+        """Give PyTrackScroll the two side-flying links retail always sets."""
+        vehicular = self._vehicular
+        data_links = self._data_links
+        if vehicular is None or data_links is None:
+            return None
+        provider = vehicular.FlyingInfoProvider()
+        scroll.setFlyingInfo(
+            data_links.createBoolLink(provider, 'isLeftSideFlying'),
+            data_links.createBoolLink(provider, 'isRightSideFlying'))
+        return provider
 
     def _report_track_animation(self, step, error):
         """Say once per battle where the belt assembly stopped."""
