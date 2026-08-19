@@ -2290,7 +2290,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
 
     def test_the_outline_leaves_the_exact_entity_that_received_it(self):
         """Highlighter removes the edge from the entity it added, so the port
-        must too, even after the remote vehicle has dropped that entity."""
+        must too."""
         runtime = _runtime()
         factory = RemoteVehicleFactory(
             runtime.bigworld, runtime.math, runtime.model_assembler, 7)
@@ -2314,12 +2314,97 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         outlined = vehicle.bw_entity
         self.assertEqual([(outlined, 1, 0, False)],
                          runtime.bigworld.edge_adds)
-        vehicle.bw_entity = None
-        battle._clear_target_outline()
+
+        self.assertTrue(battle._clear_target_outline())
 
         self.assertEqual([outlined], runtime.bigworld.edge_removes)
         self.assertIsNone(battle._outlined_engine_id)
-        vehicle.bw_entity = outlined
+        factory.destroy_all()
+
+    def test_the_engine_lookup_never_asks_python_for_membership(self):
+        """#1513 PyEntities exposes only __getitem__, __len__, get, has_key,
+        keys, items and values.  It has no sq_contains and no tp_iter, so
+        `id in BigWorld.entities` raises TypeError and every caller of
+        engine_owns would silently read False."""
+
+        class _PyEntities(object):
+
+            def __init__(self, rows):
+                self._rows = dict(rows)
+
+            def __getitem__(self, key):
+                return self._rows[key]
+
+            def __len__(self):
+                return len(self._rows)
+
+            def get(self, key, default=None):
+                return self._rows.get(key, default)
+
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(0.0, 0.0, 20.0),
+            (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        engine_entities = factory._original_entities
+        present = _PyEntities({vehicle.bw_entity_id: vehicle.bw_entity})
+
+        factory._original_entities = present
+        self.assertTrue(factory.engine_owns(vehicle.bw_entity_id))
+        self.assertTrue(factory.engine_active())
+
+        factory._original_entities = _PyEntities({})
+        self.assertFalse(factory.engine_owns(vehicle.bw_entity_id))
+        self.assertFalse(factory.engine_active())
+
+        # The view the port installs over BigWorld.entities wraps that same
+        # object, so its own membership test cannot use `in` either.
+        view = runtime.bigworld.entities
+        view._original = present
+        self.assertIn(vehicle.bw_entity_id, view)
+        self.assertNotIn(999999, view)
+
+        view._original = engine_entities
+        factory._original_entities = engine_entities
+        factory.destroy_all()
+
+    def test_a_replaced_compound_stops_the_outline_instead_of_leaking(self):
+        """wgDelEdgeDetectEntity resolves the drawer key from the entity's
+        current compound.  A removal issued after that compound changed
+        deletes nothing, so the port refuses it and outlines nothing more."""
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(0.0, 0.0, 20.0),
+            (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        vehicle.collideSegmentExt = lambda start, end: (
+            types.SimpleNamespace(dist=20.0),)
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._remote_factory = factory
+        battle._records = {
+            'bot:11': {'engine_id': vehicle_id, 'local': False,
+                       'ready': True, 'spot_visible': True}}
+
+        battle._update_target_outline(1.0)
+        self.assertEqual(1, len(runtime.bigworld.edge_adds))
+        vehicle.model = _Model()
+
+        self.assertFalse(battle._clear_target_outline())
+
+        self.assertEqual([], runtime.bigworld.edge_removes)
+        self.assertTrue(battle._outline_blocked)
+        battle._update_target_outline(2.0)
+        self.assertEqual(1, len(runtime.bigworld.edge_adds))
         factory.destroy_all()
 
     def test_a_control_mode_change_drops_the_outline(self):
@@ -8213,6 +8298,50 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._binding.stop_vehicle_visual.assert_called_once_with(
             1000, False)
         self.assertTrue(enemy.model.visible)
+
+    def test_spotting_removes_the_outline_before_the_compound_hides(self):
+        """The edge is keyed on the compound's scene registration, so it must
+        go before changeVisibility touches that compound."""
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        enemy = RemoteVehicle(
+            1000, _Descriptor(), {
+                'publicInfo': {'team': 2, 'name': 'Enemy'},
+                'health': 500, 'isCrewActive': True, 'gunAnglesPacked': 0},
+            _Vector(100.0, 0.0, 0.0), (0.0, 0.0, 0.0), runtime.math)
+        enemy.model = _Model()
+        enemy.appearance.attach(enemy.model)
+        enemy.bw_entity = types.SimpleNamespace(model=enemy.model)
+        battle._remote_factory = types.SimpleNamespace(
+            get=lambda entity_id: enemy if entity_id == 1000 else None)
+        order = []
+        original = enemy.appearance.changeVisibility
+
+        def changeVisibility(visible):
+            order.append('visibility')
+            return original(visible)
+
+        enemy.appearance.changeVisibility = changeVisibility
+        runtime.bigworld.wgDelEdgeDetectEntity = (
+            lambda entity: order.append('edge'))
+        battle._outlined_engine_id = 1000
+        battle._outlined_entity = enemy.bw_entity
+        battle._outlined_vehicle = enemy
+        battle._outlined_model = enemy.model
+        record = {
+            'engine_id': 1000, 'kind': 'bot', 'network_id': 17,
+            'ready': True, 'local': False, 'presentation': True,
+            'visual_started': True, 'spot_visible': True,
+            'state': {'team': 2, 'health': 500, 'alive': True}}
+        battle._records = {'bot:17': record}
+
+        battle._set_record_spot_visibility(record, False)
+
+        self.assertEqual(['edge', 'visibility'], order)
+        self.assertIsNone(battle._outlined_engine_id)
+        self.assertFalse(battle._outline_blocked)
 
     def test_a_wreck_that_becomes_visible_again_is_restated_as_dead(self):
         """A pooled marker re-attached on re-entry is not re-stated by the

@@ -669,6 +669,24 @@ def _xyz(value):
                 _number(getattr(value, 'z', 0.0)))
 
 
+def _format_xyz(value):
+    return '(%.2f, %.2f, %.2f)' % _xyz(value)
+
+
+def _format_axes(matrix):
+    """Return one matrix's three basis lengths, which read as its scale."""
+    axis = getattr(matrix, 'applyToAxis', None)
+    if not callable(axis):
+        return 'unreadable'
+    lengths = []
+    for index in range(3):
+        try:
+            lengths.append(_number(axis(index).length))
+        except Exception:
+            return 'unreadable'
+    return '%.3f/%.3f/%.3f' % tuple(lengths)
+
+
 def _spotting_observer(observer):
     """Accept both the three-field and the five-field observer tuple."""
     values = tuple(observer)
@@ -1023,7 +1041,13 @@ class BattleRuntime(object):
         self._drown_started = None
         self._outlined_engine_id = None
         self._outlined_entity = None
+        self._outlined_vehicle = None
+        self._outlined_model = None
+        self._outline_blocked = False
+        self._edge_reports = 0
         self._next_outline_time = 0.0
+        self._next_compound_report = 0.0
+        self._compound_reports = 0
         self._mouse_target_matrix = None
         self._outline_report = None
         self._next_outline_report = 0.0
@@ -7003,6 +7027,7 @@ class BattleRuntime(object):
                 boundary = next_boundary
             if self._battle_live:
                 self._update_target_outline(now)
+                self._report_local_compound(now)
             if profiling:
                 next_boundary = _PROFILE_CLOCK()
                 stages['outline'] = max(0.0, next_boundary - boundary)
@@ -7304,7 +7329,7 @@ class BattleRuntime(object):
         selects.  A blocked gun line and blocking scenery are not conditions
         anywhere on that path.
         """
-        if now < self._next_outline_time:
+        if now < self._next_outline_time or self._outline_blocked:
             return
         self._next_outline_time = now + 0.125
         if self._remote_factory is None:
@@ -7394,7 +7419,8 @@ class BattleRuntime(object):
             now, chosen, held_angle, miss, decline, dropped)
         if chosen == held_id:
             return
-        self._clear_target_outline()
+        if not self._clear_target_outline():
+            return
         if chosen is None:
             return
         vehicle = self._remote_factory.get(chosen)
@@ -7406,16 +7432,76 @@ class BattleRuntime(object):
         if not callable(add_edge):
             raise RuntimeError('#1513 edge-detect add boundary is unavailable')
         add_edge(vehicle.bw_entity, color, 0, False)
-        # Record the exact entity the engine now draws before anything else can
-        # fail.  An untracked registration is never removed.
+        self._report_edge('add id=%s colour=%d' % (chosen, color))
+        # Record the exact entity and compound the engine keyed the edge on.
+        # An untracked registration is never removed.
         self._outlined_engine_id = chosen
         self._outlined_entity = vehicle.bw_entity
+        self._outlined_vehicle = vehicle
+        self._outlined_model = vehicle.model
         set_candidate = getattr(
             self._runtime.compatibility, 'set_target_lock_candidate', None)
         if not callable(set_candidate):
             raise RuntimeError(
                 '#1513 target-lock candidate boundary is unavailable')
         set_candidate(vehicle)
+
+    _EDGE_REPORT_LIMIT = 80
+
+    def _report_edge(self, message):
+        """Pair every edge-detect add with its removal in the log."""
+        if self._edge_reports >= self._EDGE_REPORT_LIMIT:
+            return False
+        self._edge_reports += 1
+        sys.stdout.write('[Offline LAN 0.9.22] EDGE %s\n' % message)
+        return True
+
+    _COMPOUND_REPORT_LIMIT = 200
+
+    def _report_local_compound(self, now):
+        """Name a degenerate transform under the player's own compound.
+
+        The ambient-occlusion decals and the ground splodge hang off that
+        compound and project onto the terrain through this provider.
+        """
+        matrix = self._local_matrix
+        if matrix is None or now < self._next_compound_report:
+            return False
+        self._next_compound_report = now + 1.0
+        if self._compound_reports >= self._COMPOUND_REPORT_LIMIT:
+            return False
+        self._compound_reports += 1
+        if self._compound_reports == 1:
+            self._report_local_decals()
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] COMPOUND at=%s axes=%s\n' % (
+                _format_xyz(matrix.translation), _format_axes(matrix)))
+        return True
+
+    def _report_local_decals(self):
+        """Report the exact decal transforms the player's tank was built on."""
+        entity = (self._server_entity(self._server.vehicle_id)
+                  if self._server is not None else None)
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        if descriptor is None:
+            return False
+        for part_name in ('chassis', 'hull', 'turret'):
+            part = getattr(descriptor, part_name, None)
+            decals = getattr(part, 'AODecals', None) or ()
+            for index, transform in enumerate(decals):
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] AODECAL %s[%d] at=%s axes=%s\n' % (
+                        part_name, index, _format_xyz(
+                            getattr(transform, 'translation', None)),
+                        _format_axes(transform)))
+        chassis = getattr(descriptor, 'chassis', None)
+        appearance = getattr(entity, 'appearance', None)
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] AODECAL hullPosition=%s splodge=%s\n' % (
+                _format_xyz(getattr(chassis, 'hullPosition', None)),
+                getattr(appearance, '_CompoundAppearance__splodge',
+                        None) is not None))
+        return True
 
     def _report_target_outline(self, now, chosen, held_angle, miss, decline,
                                dropped):
@@ -7443,28 +7529,48 @@ class BattleRuntime(object):
         sys.stdout.write('[Offline LAN 0.9.22] TARGET %s\n' % message)
 
     def _clear_target_outline(self):
+        """Remove the one edge this port owns, and say whether it could.
+
+        ``wgDelEdgeDetectEntity`` resolves the drawer key from the entity's
+        current compound, so a removal issued after that compound changed
+        deletes nothing and leaves an entry no later call can reach.
+        """
         entity = self._outlined_entity
-        if self._outlined_engine_id is None and entity is None:
-            return
+        vehicle = self._outlined_vehicle
+        model = self._outlined_model
+        engine_id = self._outlined_engine_id
         self._outlined_engine_id = None
         self._outlined_entity = None
+        self._outlined_vehicle = None
+        self._outlined_model = None
+        if entity is None and engine_id is None:
+            return not self._outline_blocked
         set_candidate = getattr(
             self._runtime.compatibility, 'set_target_lock_candidate', None)
         if not callable(set_candidate):
             raise RuntimeError(
                 '#1513 target-lock candidate boundary is unavailable')
         set_candidate(None)
-        factory = self._remote_factory
-        if entity is None or factory is None or not factory.engine_active():
-            # Once the engine has reset the entity manager, the registration
-            # went with the entity and must not be touched again.
-            return
+        if entity is None:
+            return not self._outline_blocked
+        if (vehicle is None or model is None or
+                getattr(vehicle, 'bw_entity', None) is not entity or
+                getattr(vehicle, 'model', None) is not model or
+                getattr(entity, 'model', None) is None):
+            self._outline_blocked = True
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] TARGET id=%s changed its compound '
+                'before the edge was removed; this round outlines nothing '
+                'more\n' % engine_id)
+            return False
         remove_edge = getattr(
             self._runtime.bigworld, 'wgDelEdgeDetectEntity', None)
         if not callable(remove_edge):
             raise RuntimeError(
                 '#1513 edge-detect remove boundary is unavailable')
         remove_edge(entity)
+        self._report_edge('del id=%s' % engine_id)
+        return True
 
     def _observe_local_vehicle(self, message, now):
         """Feed authority visibility into the native #1513 Sixth Sense HUD."""
@@ -9144,6 +9250,10 @@ class BattleRuntime(object):
         visible = bool(visible)
         record['spot_visible'] = visible
         vehicle._spot_visible = visible
+        # Stock reaches Highlighter.deactivate before the compound's
+        # visibility changes, and the edge is keyed on that compound.
+        if self._outlined_engine_id == record['engine_id']:
+            self._clear_target_outline()
         vehicle.appearance.changeVisibility(
             visible or not self._record_alive(record, vehicle))
         if visible and not record.get('visual_started'):
@@ -9606,10 +9716,10 @@ class BattleRuntime(object):
         return True
 
     def _stop_remote_visual(self, record):
-        if not record.get('visual_started'):
-            return False
         if self._outlined_engine_id == record.get('engine_id'):
             self._clear_target_outline()
+        if not record.get('visual_started'):
+            return False
         self._binding.stop_vehicle_visual(record['engine_id'], False)
         record['visual_started'] = False
         return True
@@ -10286,6 +10396,8 @@ class BattleRuntime(object):
             else:
                 self._outlined_engine_id = None
                 self._outlined_entity = None
+                self._outlined_vehicle = None
+                self._outlined_model = None
             if engine_active:
                 for record in tuple(self._records.values()):
                     if not record.get('presentation'):
@@ -10369,6 +10481,12 @@ class BattleRuntime(object):
         self._mouse_target_matrix = None
         self._outline_report = None
         self._outlined_entity = None
+        self._outlined_vehicle = None
+        self._outlined_model = None
+        self._outline_blocked = False
+        self._edge_reports = 0
+        self._next_compound_report = 0.0
+        self._compound_reports = 0
         self._avatar = None
         self._binding = None
         self._server = None

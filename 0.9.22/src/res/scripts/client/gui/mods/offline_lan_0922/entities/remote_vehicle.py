@@ -1247,7 +1247,9 @@ class _EntitiesView(object):
             return default
 
     def __contains__(self, key):
-        if key in self._original:
+        # The wrapped #1513 PyEntities answers a lookup, never a membership
+        # test.
+        if self._original.get(key) is not None:
             return True
         vehicle = self._registry.get(key)
         return (_native_visible(vehicle) or
@@ -1598,7 +1600,12 @@ class RemoteVehicleFactory(object):
             projectile_id, end_position, explosion)
 
     def engine_owns(self, entity_id):
-        """Whether BigWorld still knows this client-only entity."""
+        """Whether BigWorld still knows this client-only entity.
+
+        #1513 ``PyEntities`` carries no ``sq_contains`` and no ``tp_iter``, so
+        ``id in BigWorld.entities`` raises ``TypeError``.  Ask it the way it
+        can answer.
+        """
         if entity_id is None:
             return False
         entities = self._original_entities
@@ -1606,10 +1613,10 @@ class RemoteVehicleFactory(object):
             entities = getattr(self._bigworld, 'entities', None)
         if entities is None:
             return False
-        try:
-            return int(entity_id) in entities
-        except Exception:
-            return False
+        lookup = getattr(entities, 'get', None)
+        if not callable(lookup):
+            raise RuntimeError('#1513 entity table lookup is unavailable')
+        return lookup(int(entity_id)) is not None
 
     def engine_active(self):
         """Whether the engine still holds the presentations we created."""

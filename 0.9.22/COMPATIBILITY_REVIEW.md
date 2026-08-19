@@ -1456,6 +1456,63 @@ loads fast enough to lose the race is an inference, most plausibly one whose
 compound another kill already cached; the dump proves the ordering, not the
 cause of the load time.
 
+### The complete edge-detect contract, read from the exact executable
+
+The outline stayed on several vehicles at once, allies included, and never
+cleared. A single held target cannot draw several rings, so the port was
+leaking registrations. Disassembling both natives in the exact
+`WorldOfTanks.exe` settles what a leak needs.
+
+`BigWorld.wgAddEdgeDetectEntity` is RVA `0x252ab0`; its `PyMethodDef` sits at
+RVA `0x19ba18` with the name string at `0x014b3534`.
+`BigWorld.wgDelEdgeDetectEntity` is RVA `0x252cf0`, from the `PyMethodDef` at
+RVA `0x19ba48`. The global drawer pointer both read is `0x01d20c70`.
+
+Add accepts two to four arguments, `(entity, colour, group=0, behind=False)`.
+It warns but continues when `group > 2` or `colour > 3`. It then takes the C++
+entity at `PyObject + 8`, reads that entity's current model at `entity + 0xE8`,
+and turns it into a key with the one-instruction helper at RVA `0x74e280`,
+which is `lea eax, [ecx + 0x10]`: the key is the `(handle, kind)` pair stored
+inside the model itself. That key, the colour, the group and the behind flag go
+to `EdgeDrawer::add` (RVA `0x6f3c50`). Add then walks the entity's auxiliary
+model vector, `[entity + 0xEC, entity + 0xF0)`, and registers one key for each
+of those models too.
+
+Delete is the mirror image. It reads the same `entity + 0xE8` model, takes the
+same `model + 0x10` key, calls `EdgeDrawer::removeKey` (RVA `0x6f4480`), and
+then walks the same auxiliary vector. `EdgeDrawer::add` first erases any entry
+whose first key matches, from both drawer lists, so a repeated add cannot
+duplicate an entry. `EdgeDrawer::removeKey` erases the entry whose first key
+matches, and does nothing when neither list matches. Both functions return
+immediately when the drawer's active flag at `this + 0x20` is clear; that flag
+is set when the feature flag at `+0x21` is on and a space is attached at
+`+0x54`, so add and remove are disabled together and neither can leak.
+
+Three consequences fix the port's law:
+
+1. The registration is keyed on the model, not on the entity. A removal issued
+   after anything replaced `entity.model`, or after that model left the scene,
+   matches nothing and leaves an entry no later call can reach.
+2. `wgDelEdgeDetectEntity` dereferences `entity.model` with no null check. An
+   entity that has dropped its model makes it read address `0x10`.
+3. Retail outlines allies. `vehicle_systems/components/highlighter.py`,
+   `Highlighter.highlight`, reads
+   `arenaDP.isAllyTeam(vehicle.publicInfo['team'])` and passes `(2, 0, False)`
+   for an ally and `(1, 0, False)` for an enemy. The port's colour choice and
+   its `group`/`behind` arguments already match that bytecode exactly.
+
+The fifth dump, below, then proved that the port had never reached
+`wgDelEdgeDetectEntity` at all. Beside that fix, the port now records the
+entity, the remote vehicle and the exact compound the add was keyed on.
+`_clear_target_outline` removes the edge only while the vehicle still holds that
+same entity and that same compound, and otherwise reports the mismatch and
+outlines nothing more for the rest of the round rather than leaving an entry it
+can never reach. `_set_record_spot_visibility` removes the edge before
+`changeVisibility` touches the compound, which is the order stock keeps:
+`ComponentSystem.deactivate` reaches `Highlighter.deactivate` and its
+`wgDelEdgeDetectEntity` before the compound goes. `EDGE add`/`EDGE del` lines,
+capped at 80 a round, pair the two calls in the log.
+
 ## Quitting a live battle destroys a bot sound object after the scene dies
 
 The fourth full dump was taken at `14:08:56` on build `6fbf615` after Peng left
@@ -1801,6 +1858,168 @@ name for a remote vehicle, and that no `EffectsListPlayer` callback survives
 the round. Underwater suppression is a deliberate difference: retail drives
 `isUnderwater` from a water sensor, and a constant `False` keeps a flame on a
 bot that drowns.
+
+## `id in BigWorld.entities` raises, so the outline was never removed
+
+The fifth full dump was taken at `15:05:59` on build `c50aee8`, in the session
+where Peng reported that an outline never cleared again once a vehicle had been
+circled, on allies as well as enemies, on several vehicles at once. It is the
+same fault as the second and third dumps, and this time the dump names the
+cause instead of a race.
+
+### The fault
+
+There is no `ExceptionStream`; the dump holds one thread, `Eip 0x00010002` and
+`Ebx 3`. The unhandled-exception filter's report is still at `0x0019e974` and
+reads `crashed 08.19.2026 at 15:05:59 ... EXCEPTION_ACCESS_VIOLATION :
+0xC0000005`, with `Read @ 0x00000008` at `0x001af1c8`. The saved
+`EXCEPTION_RECORD` at `0x001af738` gives code `0xC0000005`, `ExceptionAddress
+0x00ab9e31` and parameters `(0, 8)`. The saved `CONTEXT` at `0x001af788` gives
+`Eax 0`, `Ecx 0x4250c620`, `Esi 0x2bb6a080`, `Esp 0x001afa74`,
+`Ebp 0x001afa78`. The faulting instruction is the scene transform lookup:
+
+```
+0x00ab9e2c  call 0xab9da0                        ; find(handle, kind) -> 0
+0x00ab9e31  imul ecx, dword ptr [eax + 8], 0x54  ; eax == 0, so it reads 0x8
+```
+
+Its arguments come straight off the frame: matrix output `0x001afaac`, handle
+`0x16`, kind `12`. The frame-pointer chain repeats the second and third dumps
+exactly, from RVA `0x6b9e20` through the outline list walk at `0x6f3b90`, the
+`EdgeDrawer` frame update at `0x6f4db0`, `BW::CanvasApp::tick` at `0x231aa0`
+and `BW::MainLoopTasks::tick` at `0x23af30`. No Python frame is on the stack:
+the crash is in the engine's own per-frame outline pass.
+
+### Three leaked outlines, and whose they are
+
+The drawer at `0x16f03840` is the one the global `0x01d20c70` holds, and its
+active byte at `+0x20` is `1`. Its first list, at `+4`, holds **three** entries:
+`(0x16, 12)` colour 2, `(0x1d, 12)` colour 1 and `(0x1f, 12)` colour 2. Its
+second list, at `+0x10`, holds one six-key entry, `(0x1000000, 12)` colour 0,
+which is the player's own vehicle and not this port's. The receiver
+`0x2bb6a080` is `BW::SpatialFeature`; its map at `+0x20` holds 3256 records, 30
+of them kind 12, and `0x16` is the only one missing.
+
+Reading every remote vehicle's `bw_entity`, its native object at `PyObject + 8`,
+its model at `+0xE8` and the key at `model + 0x10` puts the live handles in
+ascending id order: `1010` at `0x14`, `1012` at `0x19`, `1013` at `0x1b`,
+`1014` at `0x1d`, `1015` at `0x1f`, `1016` at `0x21`. Vehicle `1011` is the one
+vehicle with `health = 0`, and its current key is `(0x3b, 12)`: it is the
+vehicle that vacated `0x16`. Its native entity at `0x3a8c8b00` carries BigWorld
+id `2130706470` at `+0x1c`, which is exactly the id on the last line
+`python.log` ever wrote, `WRECK swap id=2130706470`, 40 ms before the crash
+stamp.
+
+The heap still holds this port's own `TARGET held id=1011`, `id=1014` and
+`id=1015` report strings, and the three colours match the port's rule against
+`client.team = 1`: `1011` and `1015` are allies and got colour 2, `1014` is an
+enemy and got colour 1. Those three entries are the rings Peng saw stuck on
+several vehicles at once, allies included.
+
+### Why nothing was ever removed
+
+The crashing build is `c50aee8`. The dump's code objects carry
+`co_firstlineno` 7299 for `_update_target_outline`, 7445 for
+`_clear_target_outline` and 9617 for `_apply_health`, which match that commit,
+and `_apply_health.co_names` contains `_outlined_engine_id` and
+`_clear_target_outline`, so the death-path fix from the third dump was present.
+The `BattleRuntime` instance dictionary reads `_outlined_engine_id = None`,
+`_outlined_entity = None`, `error = None`, `state = 'running'` and
+`_battle_live = True`, so `_clear_target_outline` had run and had not raised.
+
+`_clear_target_outline` had exactly one branch that skipped the native removal:
+
+```python
+if entity is None or factory is None or not factory.engine_active():
+    return
+```
+
+`engine_active` asks `engine_owns`, and `engine_owns` asked
+`int(entity_id) in entities`, where `entities` is `BigWorld.entities`. The
+dump's type object for it, at `0x01a07b90`, is `PyEntities` with
+`tp_as_sequence` null, `tp_iter` and `tp_iternext` null, a `tp_as_mapping` that
+carries only `mp_length` and `mp_subscript`, and a `tp_dict` holding only
+`__getitem__`, `__len__`, `get`, `has_key`, `keys`, `items` and `values`. There
+is no `__contains__` and no `__iter__`. CPython 2.7's own path in this
+executable confirms the outcome: `PyObject_GetIter` at `0x00fcb3b0` reads
+`tp_iter` at `+0x6c`, falls through to `0x00fcb433`, finds `tp_as_sequence`
+null and raises `'%.200s' object is not iterable`, and
+`_PySequence_IterSearch` at `0x00fcca80` raises
+`argument of type '%.200s' is not iterable`.
+
+So `int(id) in BigWorld.entities` always raised `TypeError`, the
+`except Exception: return False` in `engine_owns` always swallowed it,
+`engine_active` was always false, and `wgDelEdgeDetectEntity` never ran once.
+Every outline the port ever drew stayed in the drawer. When `1011` died, its
+wreck swap released the compound that owned handle `0x16`, and the next
+`CanvasApp::tick` read the freed key.
+
+The same swallowed lookup explains the fourth dump. `RemoteVehicleFactory.destroy`
+chooses between `abandon_visual` and `detach_visual` on the same `engine_owns`,
+so it always took the abandon path and never detached the sound objects, which
+is exactly what that dump observed.
+
+### The fix
+
+`engine_owns` now asks `PyEntities` the way it can answer, with
+`entities.get(int(entity_id)) is not None`. `PyEntities.get` is RVA `0x229980`
+and `has_key` is RVA `0x2299e0`; both parse one integer argument and look it up
+in the global entity table at `[0x01d20624]`. A missing `get` now raises
+instead of reading false. `_clear_target_outline` no longer probes the engine at
+all before removing an edge; `_cleanup` keeps its own `engine_active` gate,
+which is the teardown window that guard was written for.
+
+Two inferences remain. That `1011`'s original compound owned handle `0x16` rests
+on the ascending handle order with exactly that one gap, on `1011` being the
+only dead vehicle, and on the `WRECK swap` id matching; the drawer stores scene
+handles and not entity ids, so the link is not direct. That the same lookup
+caused the fourth dump follows from the shared call, not from a second dump
+taken after the fix. Only a run on the exact Windows client can prove that the
+outline now clears and that the crash is gone.
+
+## What can paint a black shape on the ground under the player
+
+Peng's newest screenshots move this defect. The shape is not a distant terrain
+patch. It is a large flat black region on the ground, centred on his own tank
+and travelling with it: a wide wedge whose apex is at the vehicle in one shot,
+and a black quad around the vehicle in another. It appears in almost every
+battle.
+
+Only the player's own vehicle carries ground-projected geometry in this port.
+`vehicle_systems/CompoundAppearance.py::__setupModels` builds
+`BigWorld.Splodge(typeDesc.chassis.AODecals[0], MAX_DISTANCE,
+typeDesc.chassis.hullPosition.y)` whenever `MAX_DISTANCE > 0`, and
+`__attachSplodge` hangs it on `compoundModel.node(TankPartNames.HULL)`.
+`vehicle_systems/components/vehicleDecal.py::VehicleDecal.__createDecals` builds
+one decal per entry of `chassis.AODecals`, `hull.AODecals` and
+`turret.AODecals`; `__createDecal` creates a `BigWorld.WGOcclusionDecal` or a
+`BigWorld.WGShadowForwardDecal`, textures both with
+`maps/spots/TankOcclusion/TankOcclusionMap.dds`, and calls
+`setLocalTransform(transform)`. `__attach` parents the chassis decals to
+`compoundModel.root`, the hull decals to `node(TankPartNames.HULL)` and the
+turret decals to `node(TankPartNames.TURRET)`. Every one of them projects that
+occlusion map onto the terrain through the compound's own provider, so a scaled
+or unbounded provider paints exactly one large black shape around the player.
+The remote bots run `_RemoteAppearance`, never `CompoundAppearance` and never
+`VehicleDecal`, so they carry no such object. That matches the observation that
+the shape belongs to the player's tank.
+
+Two inputs are already accounted for. The player's descriptor is a stock
+`VehicleDescr`, built from the garage compact descriptor or from the type name,
+so `AODecals` and `hullPosition` are the client's own data. The provider the
+port binds to `compoundModel.matrix` is one persistent `Math.Matrix` that
+`_update_local_presentation` writes with `setRotateYPR` and `translation` only,
+which cannot introduce a scale. The `wg_addDecal` probe from `e89e6b7` printed
+nothing at all across the whole session log, so the ground decals painted
+through that native are not the painter either.
+
+That leaves the compound provider and the descriptor transforms to be read from
+a real battle. `_report_local_compound` now prints the player's provider
+translation and its three basis lengths once a second, capped at 200 lines a
+round, and `_report_local_decals` prints every `AODecals` transform of the
+chassis, hull and turret with the same two figures, plus `hullPosition` and
+whether the appearance holds a splodge. A degenerate scale or an oversized
+decal transform names itself in the next log.
 
 ## Known deterministic parity gaps
 
