@@ -176,15 +176,19 @@ def _validate_selected_vehicle(vehicle):
             'selected vehicle customization catalogue must be non-empty')
 
 
-def inventory(selected_vehicle=None):
+def inventory(selected_vehicle=None, validate=True):
     """Return every loadable garage vehicle and its relational records.
 
     ``selected_vehicle`` is serialized by ``bootstrap._selected_vehicle``.  It
     carries engine-derived compact descriptors, while this low-level module
     stays importable without BigWorld or the item definition cache.
+
+    ``validate`` walks every record, so a fitting that already went through
+    ``GarageState`` publishes without paying for it again.
     """
     vehicle = selected_vehicle if isinstance(selected_vehicle, dict) else {}
-    _validate_selected_vehicle(vehicle)
+    if validate:
+        _validate_selected_vehicle(vehicle)
     records = _vehicle_records(vehicle)
     values = dict((item_type, {}) for item_type in ITEM_TYPE_INDICES)
     vehicle_values = {

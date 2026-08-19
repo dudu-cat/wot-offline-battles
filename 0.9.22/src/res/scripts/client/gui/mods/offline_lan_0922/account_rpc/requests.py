@@ -61,7 +61,7 @@ def _fitting(context, mutate):
         return Result(commands.RES_SUCCESS)
 
     def publish():
-        diff = data.inventory(state.snapshot())
+        diff = data.inventory(state.snapshot(), validate=False)
         built = _clock()
         push(diff)
         _report_fitting_cost(started, mutated, saved, built, diff)

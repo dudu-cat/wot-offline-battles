@@ -1922,6 +1922,9 @@ class BattleRuntime(object):
             duration = max(0.1, float(deadline) - _monotonic_time())
         self._binding.arena_period('battle', duration)
         self._battle_live = True
+        # The server refuses a spotted report during the countdown, so the
+        # first live report must go out even when the set has not changed.
+        self._spotted_signature = None
         # The countdown froze gun laying and firing; the battle releases both.
         self._set_gun_locked(False)
         self._prebattle_deadline = None

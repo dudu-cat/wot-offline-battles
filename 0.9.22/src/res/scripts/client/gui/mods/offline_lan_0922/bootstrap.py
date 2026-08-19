@@ -58,12 +58,12 @@ def _new_skill_xp(tankmen, descriptor, trained):
     return _NEW_SKILL_XP[trained]
 
 
-def _with_new_skill_slots(tankmen, compact_descr):
+def _with_new_skill_slots(tankmen, descriptor):
     """Return the tankman with NEW_SKILL_SLOTS skills left for the player.
 
-    No skill is chosen here; the player picks all of them.
+    No skill is chosen here; the player picks all of them.  The caller already
+    unpacked this descriptor to validate the crew slot, so it is reused.
     """
-    descriptor = tankmen.TankmanDescr(compact_descr)
     descriptor.freeXP = _new_skill_xp(
         tankmen, descriptor,
         descriptor.lastSkillNumber - descriptor.freeSkillsNumber)
@@ -250,7 +250,7 @@ def _selected_vehicle(config):
                         raise ValueError(
                             'generated tankman does not match vehicle crew slot')
                     validated_tankmen.append(
-                        _with_new_skill_slots(tankmen, compact_descr))
+                        _with_new_skill_slots(tankmen, tankman_descr))
 
                 components = (
                     ('vehicleChassis', descriptor.chassis),
