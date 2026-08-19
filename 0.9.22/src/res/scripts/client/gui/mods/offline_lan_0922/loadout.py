@@ -415,6 +415,9 @@ _CAMOUFLAGE_NET_MARKERS = ('camouflagenet',)
 _RECON_SKILL = 'commander_eagleeye'
 _SITUATIONAL_SKILL = 'radioman_finder'
 _CAMOUFLAGE_SKILL = 'camouflage'
+_INTUITION_SKILL = 'loader_intuition'
+# tankmen.xml loader_intuition: one independent chance per finished perk.
+INTUITION_CHANCE = 0.17
 # tankmen.xml: commander_eagleEye distanceFactorPerLevelWhenDeviceWorking and
 # radioman_finder visionRadiusFactorPerLevel.
 RECON_FACTOR_PER_LEVEL = 0.0002
@@ -441,6 +444,23 @@ def _skill_level(member, wanted):
             return 0.0
         return max(0.0, _number(getattr(skill, 'level', 100.0), 100.0))
     return 0.0
+
+
+def intuition_chances(crew):
+    """How many crewmen carry a finished ``loader_intuition`` perk.
+
+    #1513 makes it a perk, so it only counts at full proficiency, and the skill
+    text says two loaders stack.
+    """
+    count = 0
+    for member in (crew or ()):
+        if isinstance(member, tuple) and len(member) == 2:
+            member = member[1]
+        if member is None:
+            continue
+        if _skill_level(member, _INTUITION_SKILL) >= 100.0:
+            count += 1
+    return count
 
 
 def crew_level_increase(descriptor, equipments=(), crew_skills=None):

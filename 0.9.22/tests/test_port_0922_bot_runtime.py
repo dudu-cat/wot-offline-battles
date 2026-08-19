@@ -3687,10 +3687,12 @@ class BotRuntimeTests(unittest.TestCase):
             'gun_pitch': -0.1, 'critical': critical,
         }
 
-        # Installed 0.012 rad x gunner 2.0 x damaged gun 2.0 = 0.048.
+        # Installed 0.012 rad x a dead gunner x a damaged gun 2.0.
+        from gui.mods.offline_lan_0922 import device_damage
         self.assertAlmostEqual(0.012, gun_state.fully_aimed_dispersion)
         self.assertAlmostEqual(
-            0.048, self.module._effective_shot_dispersion(
+            0.012 * device_damage.CREW_KO_TIME_FACTOR * 2.0,
+            self.module._effective_shot_dispersion(
                 gun_state, state, descriptor))
 
         sigmas = []
@@ -3717,7 +3719,8 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(3, len(sigmas))
         for mean, sigma in sigmas:
             self.assertEqual(0.0, mean)
-            self.assertAlmostEqual(0.016, sigma)
+            self.assertAlmostEqual(
+                0.012 * device_damage.CREW_KO_TIME_FACTOR * 2.0 / 3.0, sigma)
         self.assertAlmostEqual(0.4, state['shot_yaw'])
         self.assertAlmostEqual(0.1, state['shot_pitch'])
 
@@ -3952,13 +3955,15 @@ class BotRuntimeTests(unittest.TestCase):
         player = {'id': 2, 'team': 1, 'alive': True,
                   'x': 0.0, 'y': 0.5, 'z': 100.0}
 
+        from gui.mods.offline_lan_0922 import device_damage
+        expected_reload = 0.5 * device_damage.CREW_KO_TIME_FACTOR
         last = None
-        for index in range(6):
+        for index in range(4):
             last = runtime.update(.20, 1.0 + index * .20,
                                   players=[player])[0]['bots'][0]
         self.assertEqual(0, last['fire_seq'])
-        self.assertAlmostEqual(1.25, last['reload_duration'])
-        fired = runtime.update(.20, 2.2, players=[player])[0]['bots'][0]
+        self.assertAlmostEqual(expected_reload, last['reload_duration'])
+        fired = runtime.update(.20, 1.8, players=[player])[0]['bots'][0]
         self.assertEqual(1, fired['fire_seq'])
 
         runtime.states[11]['critical'] = {

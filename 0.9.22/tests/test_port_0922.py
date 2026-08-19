@@ -1229,6 +1229,28 @@ class OfflineCompatibilityTests(unittest.TestCase):
             else:
                 sys.modules[name] = value
 
+    def test_the_garage_survives_the_account_rebuild_after_a_battle(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility._account_context = {'selected_vehicle': {
+            'vehicles': [{'id': 1, 'compDescr': b'v', 'eqs': [1, 2, 3]}]}}
+
+        first = compatibility.seed_account_context()
+        # The player empties a slot; #1513 then leaves battle, which destroys
+        # the lobby Account and constructs another one.
+        first['garage'].snapshot()['vehicles'][0]['eqs'] = [1, 0, 3]
+        second = compatibility.seed_account_context()
+
+        self.assertIs(first['garage'], second['garage'])
+        self.assertEqual(
+            [1, 0, 3], second['selected_vehicle']['vehicles'][0]['eqs'])
+        # The bootstrap snapshot stays the seed, not a second live copy.
+        self.assertEqual(
+            [1, 2, 3],
+            compatibility._account_context[
+                'selected_vehicle']['vehicles'][0]['eqs'])
+
     def test_offline_battle_server_time_advances_and_restores(self):
         compatibility_module = _load_port_source('compat')
         runtime, unused_operations = self._runtime()

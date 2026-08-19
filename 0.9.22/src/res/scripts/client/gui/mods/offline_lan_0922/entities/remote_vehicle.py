@@ -35,6 +35,12 @@ def pose_animation_writes():
     """Return how many native pose objects this process has allocated."""
     return _pose_object_allocations
 
+
+def reset_pose_animation_writes():
+    """Start a new round's count, so the number is not a process total."""
+    global _pose_object_allocations
+    _pose_object_allocations = 0
+
 from gui.mods.offline_lan_0922 import tank_collision
 
 try:
@@ -805,12 +811,26 @@ class RemoteVehicle(object):
             scroll.setMode(mode)
             self._track_mode = mode
         scroll.setExternal(float(left), float(right))
+        self._set_filter_track_speeds(float(left), True, float(right), True)
+        return True
+
+    def _set_filter_track_speeds(self, left, left_external, right,
+                                 right_external):
+        """Write both belts through the exact four-argument #1513 setter.
+
+        ``WGVehicleFilter.setTracksSpeed(float, bool, float, bool)`` is
+        ``(leftSpeed, leftIsExternal, rightSpeed, rightIsExternal)``: each bool
+        gates its own side, and the filter ignores a side's speed and derives
+        it from its own contact-point motion while that side's bool is false.
+        """
         speeds = getattr(self.track_filter, 'setTracksSpeed', None)
-        if callable(speeds):
-            try:
-                speeds(float(left), float(right))
-            except Exception as error:
-                self.track_speed_error = '%s' % (error,)
+        if not callable(speeds):
+            return False
+        try:
+            speeds(left, left_external, right, right_external)
+        except Exception as error:
+            self.track_speed_error = '%s' % (error,)
+            return False
         return True
 
     def track_scroll_readback(self):
@@ -833,6 +853,8 @@ class RemoteVehicle(object):
         return tuple(values)
 
     def _release_track_animation(self):
+        # Teardown can run after BigWorld cleared the space, so this drops the
+        # filter reference rather than writing one last belt speed into it.
         scroll = self.track_scroll
         self.track_scroll = None
         self.track_filter = None

@@ -21,7 +21,8 @@ from gui.mods.offline_lan_0922.entities.avatar_server import AvatarServerBridge
 from gui.mods.offline_lan_0922.entities.bigworld_binding import \
     BigWorldVehicleBinding
 from gui.mods.offline_lan_0922.entities.remote_vehicle import (
-    RemoteVehicleFactory, collide_vehicle_at_matrix, pose_animation_writes)
+    RemoteVehicleFactory, collide_vehicle_at_matrix, pose_animation_writes,
+    reset_pose_animation_writes)
 from gui.mods.offline_lan_0922.entities.runtime import EntityPropertyBuilder
 from gui.mods.offline_lan_0922.projectile_manager import InFlightProjectiles
 from gui.mods.offline_lan_0922.projectile_runtime import (
@@ -85,6 +86,8 @@ _COMBAT_EVENT_KINDS = (
 _SHOT_OCCLUSION_EPSILON = 1.0e-3
 # physics_shared.TRACK_SCROLL_LIMITS: the exact #1513 belt-speed wire range.
 TRACK_SCROLL_LIMITS = (-15.0, 30.0)
+# Metres of view-range change worth another syncVehicleAttrs push.
+VISION_PUBLISH_EPSILON = 0.5
 # Seconds between two bot-track diagnostic lines.
 TRACK_REPORT_SECONDS = 5.0
 # Give the pose animation a little longer than the measured gap so it is
@@ -103,8 +106,13 @@ ENGINE_MODE_RUNNING = 2
 # the throttle encoded in each ``vehicle_moveWith(flags)`` mailbox call.
 _MOVEMENT_FORWARD = 1
 _MOVEMENT_BACKWARD = 2
+_MOVEMENT_ROTATE_LEFT = 4
+_MOVEMENT_ROTATE_RIGHT = 8
 _MOVEMENT_CRUISE_CONTROL50 = 16
 _MOVEMENT_CRUISE_CONTROL25 = 32
+# Deadbands that decide whether a bot counts as moving or turning.
+BOT_MOVING_SPEED = 0.05
+BOT_TURNING_RATE = 0.02
 _CRUISE_MODE_THROTTLE = {
     -2: -1.0,
     -1: -0.5,
@@ -228,18 +236,24 @@ def _deep_size(value, seen=None):
 
 
 def _release_layout_caches():
-    """Drop the hit-layout caches, which are module state and outlive a round."""
-    module = sys.modules.get('%s.internal_hit_layouts' % _PORT_PACKAGE)
-    if module is None:
-        return False
-    for name in ('clear_cache', 'clear_runtime_evidence'):
-        release = getattr(module, name, None)
-        if callable(release):
-            try:
-                release()
-            except Exception:
-                continue
-    return True
+    """Drop the geometry caches, which are module state and outlive a round."""
+    released = False
+    for module_name, releases in (
+            ('internal_hit_layouts', ('clear_cache',
+                                      'clear_runtime_evidence')),
+            ('internal_geometry', ('clear_cache',))):
+        module = sys.modules.get('%s.%s' % (_PORT_PACKAGE, module_name))
+        if module is None:
+            continue
+        released = True
+        for name in releases:
+            release = getattr(module, name, None)
+            if callable(release):
+                try:
+                    release()
+                except Exception:
+                    continue
+    return released
 
 
 def _is_port_object(value):
@@ -960,6 +974,9 @@ class BattleRuntime(object):
         self._local_factors_cache = None
         self._remote_spotting_cache = {}
         self._local_still_since = None
+        self._published_vision_radius = None
+        self._published_still_devices = {}
+        self._reported_crew_impaired = None
         self._battle_result = None
         self._round_finished_notified = False
         self._on_local_leave = None
@@ -968,6 +985,7 @@ class BattleRuntime(object):
         self._pending_bot_creates = {}
         self._pending_bot_create_order = []
         self._last_bot_create_team = None
+        self._bots_ready_reported = False
         self._next_bot_create_time = 0.0
         self._arena_type = None
         self._spawn_planner = None
@@ -1110,6 +1128,9 @@ class BattleRuntime(object):
         self._local_factors_cache = None
         self._remote_spotting_cache = {}
         self._local_still_since = None
+        self._published_vision_radius = None
+        self._published_still_devices = {}
+        self._reported_crew_impaired = None
         self._battle_result = self._start_message.get('battle_result')
         self._round_finished_notified = False
         self._on_local_leave = on_local_leave
@@ -1118,6 +1139,7 @@ class BattleRuntime(object):
         self._pending_bot_creates = {}
         self._pending_bot_create_order = []
         self._last_bot_create_team = None
+        self._bots_ready_reported = False
         self._next_bot_create_time = 0.0
         self._navigation_graph = None
         self._grounded_bot_ids = set()
@@ -1940,6 +1962,7 @@ class BattleRuntime(object):
                 self._config.get('debug_logging', False))
             # Sampled here, not before BotRuntime exists: the bot, navigator
             # and planner structures are most of what this port holds.
+            reset_pose_animation_writes()
             self._report_memory('battle_start')
             provider = getattr(self._avatar, 'guiSessionProvider', None)
             vehicle_view_state = getattr(
@@ -3403,13 +3426,13 @@ class BattleRuntime(object):
         turn = _number(getattr(self._sender, 'turn', 0.0))
         flags = 0
         if forward > 0.0:
-            flags |= 1
+            flags |= _MOVEMENT_FORWARD
         elif forward < 0.0:
-            flags |= 2
+            flags |= _MOVEMENT_BACKWARD
         if turn < 0.0:
-            flags |= 4
+            flags |= _MOVEMENT_ROTATE_LEFT
         elif turn > 0.0:
-            flags |= 8
+            flags |= _MOVEMENT_ROTATE_RIGHT
         if not alive:
             return (ENGINE_MODE_OFF, 0)
         if flags or abs(self._local_speed) > 0.05:
@@ -3687,7 +3710,8 @@ class BattleRuntime(object):
                                  'shotDispersionFactors', (0.0, 0.0)) or (
                                      0.0, 0.0)
         sys.stdout.write(
-            '[Offline LAN 0.9.22] PARAMS source=%s view=%.1f binoc=%.3f '
+            '[Offline LAN 0.9.22] PARAMS source=%s view=%.1f '
+            'view_still=%.1f binoc=%.3f binoc_delay=%.1fs '
             'conceal_move=%.2f%% conceal_still=%.2f%% at_shot=%.3f '
             'reload=%.2fs aim=%.2fs disp=%.4f disp_move=%.3f '
             'disp_rot=%.3f disp_turret=%.3f disp_shot=%.3f '
@@ -3697,7 +3721,11 @@ class BattleRuntime(object):
                 'client-factors' if loadout['from_client_factors']
                 else 'fallback',
                 self._vision_radius(descriptor, local=True),
+                self._vision_radius(
+                    descriptor, local=True,
+                    still_seconds=profile['binocular_delay']),
                 profile['binocular_factor'],
+                profile['binocular_delay'],
                 ((moving + moving_add) * moving_mult) * 100.0,
                 ((still + still_add) * still_mult) * 100.0, shot_factor,
                 state.reload, state.aim_time, state.base_dispersion,
@@ -4026,6 +4054,7 @@ class BattleRuntime(object):
                     entity, 'dispersion'),
                 aim_time_factor=critical_damage.stat_factor(
                     entity, 'aim_time'))
+            self._report_crew_penalty(entity)
             self._publish_ammo_state(state)
             self._tick_equipment_cooldowns(now)
             if not self._battle_live:
@@ -4048,6 +4077,51 @@ class BattleRuntime(object):
             return
         self._schedule(AMMO_SECONDS, self._ammo_tick, ammo=True)
 
+    def _report_crew_penalty(self, entity):
+        """Log the player's crew and module factors once per crew change."""
+        impaired = frozenset(getattr(entity, '_crew_impaired', None) or ())
+        if impaired == self._reported_crew_impaired:
+            return False
+        self._reported_crew_impaired = impaired
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] CREW out=%s reload=%.3f aim=%.3f '
+            'disp=%.3f turret=%.3f mobility=%.3f vision=%.3f\n' % (
+                ','.join(sorted(impaired)) or '-',
+                critical_damage.stat_factor(entity, 'reload'),
+                critical_damage.stat_factor(entity, 'aim_time'),
+                critical_damage.stat_factor(entity, 'dispersion'),
+                critical_damage.stat_factor(entity, 'turret_speed'),
+                critical_damage.stat_factor(entity, 'mobility'),
+                critical_damage.stat_factor(entity, 'vision')))
+        return True
+
+    def _roll_loader_intuition(self):
+        """Roll the finished ``loader_intuition`` perk for one shell swap.
+
+        The #1513 skill text stacks two loaders, so each finished perk rolls
+        its own ``INTUITION_CHANCE``.
+        """
+        chances = loadout_law.intuition_chances(
+            self._garage_loadout_snapshot()['crew'])
+        for unused_index in range(chances):
+            if random.random() < loadout_law.INTUITION_CHANCE:
+                return True
+        return False
+
+    def _present_loader_intuition(self):
+        """Play the stock intuition notification for an instant shell swap."""
+        status_group = getattr(
+            self._runtime.constants, 'VEHICLE_MISC_STATUS', None)
+        callback = getattr(self._avatar, 'updateVehicleMiscStatus', None)
+        if (status_group is None or not callable(callback) or
+                self._server is None):
+            return False
+        status = getattr(status_group, 'LOADER_INTUITION_WAS_USED', None)
+        if status is None:
+            return False
+        callback(self._server.vehicle_id, status, 0, ())
+        return True
+
     def change_vehicle_setting(self, code, value):
         settings = self._runtime.constants.VEHICLE_SETTING
         if code == getattr(settings, 'ACTIVATE_EQUIPMENT', None):
@@ -4064,7 +4138,10 @@ class BattleRuntime(object):
             if code == next_shells:
                 changed = state.request_shell_index(index)
             else:
-                changed = state.sync_shell_index(index)
+                instant = self._roll_loader_intuition()
+                changed = state.sync_shell_index(index, instant=instant)
+                if changed and instant:
+                    self._present_loader_intuition()
             if changed:
                 self._publish_ammo_state(state, force=True)
                 self._publish_reload_event(
@@ -4644,11 +4721,13 @@ class BattleRuntime(object):
                 moment, total // 1024, len(sizes),
                 ' '.join('%s=%dk' % (name, size // 1024)
                          for size, name in sizes[:24])))
+        vehicles = getattr(self._remote_factory, '_vehicles', None) or {}
         sys.stdout.write(
-            '[Offline LAN 0.9.22] MEM %s native poses=%d models=%d '
-            'descriptors=%d testers=%d\n' % (
-                moment, pose_animation_writes(),
-                len(getattr(self._remote_factory, '_vehicles', ()) or ()),
+            '[Offline LAN 0.9.22] MEM %s native poses=%d vehicles=%d '
+            'models=%d descriptors=%d testers=%d\n' % (
+                moment, pose_animation_writes(), len(vehicles),
+                sum(1 for vehicle in vehicles.values()
+                    if getattr(vehicle, 'model', None) is not None),
                 len(getattr(self._remote_factory, '_descriptors', ()) or ()),
                 len(getattr(self._remote_factory, '_hit_testers', ()) or ())))
         return True
@@ -8139,6 +8218,28 @@ class BattleRuntime(object):
             record['track_params'] = params
         return params
 
+    def _bot_engine_mode(self, alive, speed, turn):
+        """Return the exact #1513 ``(power, movementFlags)`` for one bot.
+
+        A bot that turns in place has no forward speed, and the native tick
+        pins both belts to zero while the power is at most
+        ``ENGINE_MODE_IDLE``, so the turn rate has to raise the power too.
+        """
+        if not alive:
+            return (ENGINE_MODE_OFF, 0)
+        flags = 0
+        if speed > BOT_MOVING_SPEED:
+            flags |= _MOVEMENT_FORWARD
+        elif speed < -BOT_MOVING_SPEED:
+            flags |= _MOVEMENT_BACKWARD
+        if turn < -BOT_TURNING_RATE:
+            flags |= _MOVEMENT_ROTATE_LEFT
+        elif turn > BOT_TURNING_RATE:
+            flags |= _MOVEMENT_ROTATE_RIGHT
+        if flags:
+            return (ENGINE_MODE_RUNNING, flags)
+        return (ENGINE_MODE_IDLE, 0)
+
     def _update_bot_tracks(self, record, state, now):
         """Drive one bot's belts from its authority speed and turn rate."""
         if self._remote_factory is None:
@@ -8149,15 +8250,10 @@ class BattleRuntime(object):
         alive = bool(state.get('alive', True)) and int(
             state.get('health', 1) or 0) > 0
         speed = _number(state.get('speed'))
-        if not alive:
-            mode = (ENGINE_MODE_OFF, 0)
-        elif abs(speed) > 0.05:
-            mode = (ENGINE_MODE_RUNNING, 1 if speed > 0.0 else 2)
-        else:
-            mode = (ENGINE_MODE_IDLE, 0)
+        turn = _number(self._bot_yaw_rates.get(state.get('id')))
+        mode = self._bot_engine_mode(alive, speed, turn)
         left, right = vehicle_physics.track_scroll(
-            self._bot_track_params(record, vehicle), speed,
-            _number(self._bot_yaw_rates.get(state.get('id'))))
+            self._bot_track_params(record, vehicle), speed, turn)
         minimum, maximum = TRACK_SCROLL_LIMITS
         vehicle.update_tracks(max(minimum, min(maximum, left)),
                               max(minimum, min(maximum, right)), mode)
@@ -8676,6 +8772,12 @@ class BattleRuntime(object):
             team = (event.get('state') or {}).get('team')
             if team is not None:
                 self._last_bot_create_team = int(team)
+        if created and not self._pending_bot_create_order and not (
+                self._bots_ready_reported):
+            # battle_start runs before the first bot is queued, so the native
+            # counters only mean something once the whole roster exists.
+            self._bots_ready_reported = True
+            self._report_memory('bots_ready')
         return created
 
     def _create_remote(self, event):
@@ -9109,10 +9211,13 @@ class BattleRuntime(object):
                 self._local_still_since = None
             elif self._local_still_since is None:
                 self._local_still_since = now
+            still_seconds = (
+                0.0 if self._local_still_since is None
+                else max(0.0, now - self._local_still_since))
             direct_observer = (
                 self._local_position, self._local_descriptor, local_entity,
-                0.0 if self._local_still_since is None
-                else max(0.0, now - self._local_still_since), True)
+                still_seconds, True)
+            self._publish_local_vision_state(local_entity, still_seconds)
         observers = [direct_observer]
         for record in self._records.values():
             if (record.get('local') or not record.get('ready') or
@@ -9127,6 +9232,52 @@ class BattleRuntime(object):
                 _xyz(entity.position), entity.typeDescriptor, entity,
                 self._record_still_seconds(record), False))
         return tuple(observers)
+
+    def _publish_local_vision_state(self, entity, still_seconds):
+        """Publish the player's live view range and still-device state.
+
+        Retail feeds both of these from the cell: ``syncVehicleAttrs`` carries
+        the effective ``circularVisionRadius`` that the minimap view circle
+        draws, and ``updateVehicleOptionalDeviceStatus`` lights one optional
+        device slot in the consumables panel.
+        """
+        descriptor = self._local_descriptor
+        if self._avatar is None or descriptor is None:
+            return False
+        radius = self._vision_radius(
+            descriptor, entity=entity, still_seconds=still_seconds, local=True)
+        if (self._published_vision_radius is None or
+                abs(radius - self._published_vision_radius) >
+                VISION_PUBLISH_EPSILON):
+            self._avatar.syncVehicleAttrs({'circularVisionRadius': radius})
+            self._published_vision_radius = radius
+        self._publish_optional_devices(descriptor, still_seconds)
+        return True
+
+    def _publish_optional_devices(self, descriptor, still_seconds):
+        """Mark every mounted optional device on or off in the battle panel.
+
+        The stock panel creates a slot on the first status for a device, so a
+        device whose status never arrives has no icon at all.
+        """
+        update = getattr(
+            self._avatar, 'updateVehicleOptionalDeviceStatus', None)
+        if not callable(update):
+            return False
+        vehicle_id = self._avatar.playerVehicleID
+        for device in (_field(descriptor, 'optionalDevices', ()) or ()):
+            identity = getattr(device, 'id', None)
+            if not isinstance(identity, tuple) or len(identity) != 2:
+                continue
+            device_id = int(identity[1])
+            delay = _number(getattr(device, 'activateWhenStillSec', 0.0))
+            active = (loadout_law.still_device_active(still_seconds, delay)
+                      if delay > 0.0 else True)
+            if self._published_still_devices.get(device_id) is active:
+                continue
+            self._published_still_devices[device_id] = active
+            update(vehicle_id, device_id, active)
+        return True
 
     def _record_still_seconds(self, record):
         """How long this record has been stationary, for the still devices."""
@@ -10098,6 +10249,9 @@ class BattleRuntime(object):
         self._local_factors_cache = None
         self._remote_spotting_cache = {}
         self._local_still_since = None
+        self._published_vision_radius = None
+        self._published_still_devices = {}
+        self._reported_crew_impaired = None
         self._battle_result = None
         self._round_finished_notified = False
         self._on_local_leave = None

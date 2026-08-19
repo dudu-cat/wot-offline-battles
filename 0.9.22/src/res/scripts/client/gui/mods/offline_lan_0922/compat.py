@@ -441,6 +441,7 @@ class OfflineCompatibility(object):
         self._host_added = False
         self._account_context = {}
         self._account_state = None
+        self._garage_state = None
         self._show_lobby = False
         self._battle_active = False
         self._native_battle = False
@@ -828,8 +829,7 @@ class OfflineCompatibility(object):
                 property_name, property_value = (
                     runtime.account_module._CLIENT_SERVER_VERSION)
                 setattr(account, property_name, property_value)
-                context = dict(compatibility._account_context)
-                context['account_state'] = compatibility._account_state
+                context = compatibility.seed_account_context()
                 receive_stats = getattr(account, 'receiveServerStats', None)
                 if callable(receive_stats):
                     context['receive_server_stats'] = receive_stats
@@ -2185,12 +2185,38 @@ class OfflineCompatibility(object):
         self._target_lock_input_avatar = None
         self._installed = False
 
+    def garage_state(self):
+        """Return the one live garage, seeded from the bootstrap snapshot.
+
+        Leaving battle destroys the lobby Account and builds a new one, so a
+        garage owned by the retired Account would fall back to the bootstrap
+        fitting and undo whatever the player changed in this session.
+        """
+        if self._garage_state is None:
+            snapshot = self._account_context.get('selected_vehicle')
+            if not snapshot:
+                return None
+            from gui.mods.offline_lan_0922.account_rpc import garage
+            self._garage_state = garage.GarageState(snapshot)
+        return self._garage_state
+
+    def seed_account_context(self):
+        """Build the request context handed to one Account entity."""
+        context = dict(self._account_context)
+        context['account_state'] = self._account_state
+        garage_state = self.garage_state()
+        if garage_state is not None:
+            context['garage'] = garage_state
+            context['selected_vehicle'] = garage_state.snapshot()
+        return context
+
     def connect(self, show_lobby=False, account_context=None):
         self.install()
         if self.is_ready() or self._connecting:
             return
         self._show_lobby = bool(show_lobby)
         self._account_context = dict(account_context or {})
+        self._garage_state = None
         provided_state = self._account_context.get('account_state')
         if provided_state is not None:
             self._account_state = provided_state

@@ -174,14 +174,56 @@ class GunMechanicsParityTests(unittest.TestCase):
         self.assertEqual(0, state.clip)
         self.assertEqual([19, 10, 5], state.ammo)
 
-    def test_next_shell_loads_at_once_while_the_gun_is_empty(self):
+    def test_a_first_press_mid_reload_only_queues_the_next_shell(self):
+        """#1513 sends NEXT_SHELLS on the first press whatever the gun does."""
         state = self._loaded_state()
+        state.clip = 0
+        state.reload_time = 3.0
+
+        self.assertFalse(state.request_shell_index(2))
+        self.assertEqual(0, state.shot_index)
+        self.assertEqual(2, state.pending_index)
+        # The round in progress keeps its remaining time.
+        self.assertEqual(3.0, state.reload_time)
+
+    def test_a_queued_shell_loads_when_the_current_type_is_empty(self):
+        state = self._loaded_state()
+        state.ammo[0] = 0
         state.clip = 0
         state.reload_time = 3.0
 
         self.assertTrue(state.request_shell_index(2))
         self.assertEqual(2, state.shot_index)
         self.assertIsNone(state.pending_index)
+        self.assertEqual(state.reload, state.reload_time)
+
+    def test_a_switch_now_restarts_the_reload_from_zero(self):
+        state = self._loaded_state()
+        state.reload_time = 1.0
+        state.reload_duration = 4.0
+
+        self.assertTrue(state.sync_shell_index(2))
+        self.assertEqual(0, state.clip)
+        self.assertEqual(state.reload, state.reload_time)
+        self.assertEqual(state.reload, state.reload_duration)
+
+    def test_loader_intuition_swaps_without_a_reload(self):
+        state = self._loaded_state()
+
+        self.assertTrue(state.sync_shell_index(2, instant=True))
+        self.assertEqual(2, state.shot_index)
+        self.assertEqual(0.0, state.reload_time)
+        self.assertEqual(1, state.clip)
+        self.assertTrue(state.can_fire(True))
+
+    def test_loader_intuition_cannot_load_an_empty_shell_type(self):
+        state = GunState(_descriptor(clip=(1, 1.0)),
+                         ammo_layout={1: 20, 2: 0, 3: 5})
+        state.reload_time = 0.0
+        state.clip = 1
+
+        self.assertTrue(state.sync_shell_index(1, instant=True))
+        self.assertEqual(0, state.clip)
         self.assertEqual(state.reload, state.reload_time)
 
     def test_selecting_the_current_shell_cancels_a_queued_one(self):

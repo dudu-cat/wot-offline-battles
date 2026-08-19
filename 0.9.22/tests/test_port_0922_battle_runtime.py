@@ -15,8 +15,9 @@ CLIENT_SCRIPTS = ROOT / '0.9.22' / 'src' / 'res' / 'scripts' / 'client'
 sys.path.insert(0, str(CLIENT_SCRIPTS))
 
 from gui.mods.offline_lan_0922.battle_runtime import (
-    BattleRuntime, ENGINE_MODE_OFF, ENGINE_MODE_RUNNING, FRAME_SECONDS,
-    _FrameDiagnostics, _LANInputSender,
+    BattleRuntime, ENGINE_MODE_IDLE, ENGINE_MODE_OFF, ENGINE_MODE_RUNNING,
+    FRAME_SECONDS, _FrameDiagnostics, _LANInputSender,
+    _MOVEMENT_BACKWARD, _MOVEMENT_ROTATE_LEFT, _MOVEMENT_ROTATE_RIGHT,
     _engine_rotation,
     _selected_vehicle_has_sixth_sense)
 from gui.mods.offline_lan_0922 import battle_runtime as \
@@ -159,9 +160,18 @@ class _VehicleFilter(object):
     def __init__(self):
         self.movementInfo = object()
         self.tracks_speed = None
+        self.belt_speeds = (None, None)
 
-    def setTracksSpeed(self, left, right):
-        self.tracks_speed = (left, right)
+    def setTracksSpeed(self, left, left_external, right, right_external):
+        if not isinstance(left_external, bool) or not isinstance(
+                right_external, bool):
+            raise TypeError('setTracksSpeed() expects 4 arguments of types '
+                            'float, bool, float, bool')
+        self.tracks_speed = (left, left_external, right, right_external)
+        # The native tick ignores a side while its external flag is false and
+        # derives that belt from the filter's own contact-point motion.
+        self.belt_speeds = (left if left_external else None,
+                            right if right_external else None)
 
 
 class _TrackScroll(object):
@@ -562,6 +572,8 @@ class _Avatar(object):
         self.viewpoint_switches = []
         self.ammo_updates = []
         self.reload_updates = []
+        self.attr_updates = []
+        self.optional_devices = []
         self.targeting_updates = []
         self.gun_tracking_calls = []
         self.gun_marker_updates = []
@@ -646,6 +658,10 @@ class _Avatar(object):
 
     def syncVehicleAttrs(self, values):
         self.synced_attrs = values
+        self.attr_updates.append(dict(values))
+
+    def updateVehicleOptionalDeviceStatus(self, vehicle_id, device_id, is_on):
+        self.optional_devices.append((vehicle_id, device_id, is_on))
 
     def updateOwnVehiclePosition(self, position, direction,
                                  vehicle_speed, vehicle_rotation_speed):
@@ -1211,7 +1227,7 @@ def _runtime():
         VEHICLE_SETTING=types.SimpleNamespace(
             CURRENT_SHELLS=0, NEXT_SHELLS=1, ACTIVATE_EQUIPMENT=16),
         VEHICLE_MISC_STATUS=types.SimpleNamespace(
-            VEHICLE_DROWN_WARNING=4),
+            LOADER_INTUITION_WAS_USED=2, VEHICLE_DROWN_WARNING=4),
         DROWN_WARNING_LEVEL=types.SimpleNamespace(
             SAFE=0, CAUTION=1, DANGER=2),
         ATTACK_REASON=types.SimpleNamespace(
@@ -1676,8 +1692,11 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual((3.0, 5.0), vehicle.track_scroll.external)
         self.assertEqual((3.0, 5.0, False, False),
                          vehicle.track_scroll_readback())
-        # Only the filter reaches the chassis fashion and the spline belt.
-        self.assertEqual((3.0, 5.0), vehicle.track_filter.tracks_speed)
+        # Only the filter reaches the chassis fashion and the spline belt, and
+        # it takes a side's speed only while that side's external flag is set.
+        self.assertEqual((3.0, True, 5.0, True),
+                         vehicle.track_filter.tracks_speed)
+        self.assertEqual((3.0, 5.0), vehicle.track_filter.belt_speeds)
         self.assertIsNone(vehicle.track_speed_error)
 
         # An idle engine cannot scroll the belts; the native tick zeroes them.
@@ -1686,10 +1705,15 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
                          vehicle.track_scroll_readback())
 
         scroll = vehicle.track_scroll
+        filter_object = vehicle.track_filter
         vehicle.detach_visual()
         self.assertFalse(scroll.active)
         self.assertIsNone(scroll.data)
         self.assertIsNone(vehicle.track_scroll)
+        self.assertIsNone(vehicle.track_filter)
+        # Teardown can run after BigWorld cleared the space, so the filter
+        # must not be written again.
+        self.assertEqual((3.0, True, 5.0, True), filter_object.tracks_speed)
 
     def test_the_belt_assembly_is_on_and_still_switchable(self):
         from gui.mods.offline_lan_0922 import config as port_config
@@ -2454,6 +2478,44 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIsNone(state.pending_index)
         self.assertEqual(0, state.clip)
         battle._publish_ammo_state.assert_called_once_with(state, force=True)
+
+    def test_a_first_press_mid_reload_leaves_the_reload_running(self):
+        battle, state, settings = self._shell_change_battle()
+        state.clip = 0
+        state.reload_time = 3.0
+
+        self.assertTrue(
+            battle.change_vehicle_setting(settings.NEXT_SHELLS, 102))
+
+        self.assertEqual(0, state.shot_index)
+        self.assertEqual(1, state.pending_index)
+        self.assertEqual(3.0, state.reload_time)
+        battle._publish_reload_event.assert_not_called()
+
+    def test_loader_intuition_swaps_at_once_and_notifies_the_hud(self):
+        battle, state, settings = self._shell_change_battle()
+        battle._avatar = _runtime().bigworld.avatar
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._roll_loader_intuition = lambda: True
+
+        self.assertTrue(
+            battle.change_vehicle_setting(settings.CURRENT_SHELLS, 102))
+
+        self.assertEqual(1, state.shot_index)
+        self.assertEqual(0.0, state.reload_time)
+        self.assertEqual(1, state.clip)
+        status = battle._runtime.constants.VEHICLE_MISC_STATUS
+        self.assertEqual(
+            [(10, status.LOADER_INTUITION_WAS_USED, 0, ())],
+            battle._avatar.misc_statuses)
+
+    def test_an_unfinished_intuition_perk_never_rolls(self):
+        battle, unused_state, unused_settings = self._shell_change_battle()
+        battle._garage_loadout_snapshot = lambda: {'crew': (
+            types.SimpleNamespace(skills=(types.SimpleNamespace(
+                name='loader_intuition', level=42.0, isActive=True),)),)}
+
+        self.assertFalse(battle._roll_loader_intuition())
 
     def test_an_unknown_shell_descriptor_is_refused(self):
         battle, state, settings = self._shell_change_battle()
@@ -4422,6 +4484,78 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertLess(left, 0.0)
         self.assertGreater(right, 0.0)
         self.assertAlmostEqual(left, -right)
+        # A bot with no forward speed still needs a running engine, or the
+        # native tick pins both belts to zero.
+        self.assertEqual((ENGINE_MODE_RUNNING, _MOVEMENT_ROTATE_RIGHT),
+                         vehicle.track_scroll.mode)
+        self.assertEqual((left, right), vehicle.track_filter.belt_speeds)
+        self.assertEqual((left, right),
+                         vehicle.track_scroll_readback()[:2])
+
+        # The mirrored turn reports the other rotation flag.
+        battle._bot_pose_relax({'id': 3, 'yaw': 0.1}, 'c', 10.2)
+        battle._bot_pose_relax({'id': 3, 'yaw': 0.0}, 'd', 10.3)
+        battle._update_bot_tracks(
+            record, {'id': 3, 'speed': 0.0, 'alive': True, 'health': 500},
+            10.3)
+        self.assertEqual((ENGINE_MODE_RUNNING, _MOVEMENT_ROTATE_LEFT),
+                         vehicle.track_scroll.mode)
+
+    def test_the_still_devices_and_view_circle_reach_the_battle_hud(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._avatar.playerVehicleID = 10
+        descriptor = _Descriptor()
+        descriptor.miscAttrs = {'circularVisionRadiusFactor': 1.1}
+        descriptor.optionalDevices = (
+            types.SimpleNamespace(
+                name='coatedOptics', id=(0, 5),
+                circularVisionRadiusFactor=1.1),
+            types.SimpleNamespace(
+                name='stereoscope', id=(0, 4),
+                circularVisionRadiusFactor=1.25,
+                activateWhenStillSec=3.0),
+            None)
+        battle._local_descriptor = descriptor
+        battle._vision_radius = lambda unused_descriptor, entity=None, \
+            still_seconds=0.0, local=False: (
+                460.0 if still_seconds >= 3.0 else 405.0)
+
+        # A moving player: the always-on optic is lit, the telescope is not.
+        battle._publish_local_vision_state(None, 0.0)
+        self.assertEqual([{'circularVisionRadius': 405.0}],
+                         battle._avatar.attr_updates)
+        self.assertEqual([(10, 5, True), (10, 4, False)],
+                         battle._avatar.optional_devices)
+
+        # Nothing changed, so neither surface is written again.
+        battle._publish_local_vision_state(None, 1.0)
+        self.assertEqual(1, len(battle._avatar.attr_updates))
+        self.assertEqual(2, len(battle._avatar.optional_devices))
+
+        # Past the activation delay the telescope lights and the circle grows.
+        battle._publish_local_vision_state(None, 3.0)
+        self.assertEqual([{'circularVisionRadius': 405.0},
+                          {'circularVisionRadius': 460.0}],
+                         battle._avatar.attr_updates)
+        self.assertEqual((10, 4, True), battle._avatar.optional_devices[-1])
+
+        # Moving again puts it back out.
+        battle._publish_local_vision_state(None, 0.0)
+        self.assertEqual((10, 4, False), battle._avatar.optional_devices[-1])
+
+    def test_a_bot_that_neither_moves_nor_turns_idles(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+
+        self.assertEqual((ENGINE_MODE_IDLE, 0),
+                         battle._bot_engine_mode(True, 0.01, 0.005))
+        self.assertEqual((ENGINE_MODE_OFF, 0),
+                         battle._bot_engine_mode(False, 6.0, 1.0))
+        self.assertEqual(
+            (ENGINE_MODE_RUNNING, _MOVEMENT_BACKWARD | _MOVEMENT_ROTATE_LEFT),
+            battle._bot_engine_mode(True, -6.0, -1.0))
 
     def test_a_dying_bot_pushes_the_destroyed_marker_state(self):
         """Vehicle.__onVehicleDeath restyles the marker; without it a dead

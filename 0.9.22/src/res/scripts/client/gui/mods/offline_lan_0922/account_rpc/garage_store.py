@@ -25,6 +25,12 @@ from gui.mods.offline_lan_0922 import config as port_config
 from gui.mods.offline_lan_0922.account_rpc.garage import mirror_shells_layout
 
 
+try:
+    integer_types = (int, long)
+except NameError:
+    integer_types = (int,)
+
+
 # Schema 2 fixes schema 1's vehicle settings, which were stored as a shifted
 # bit index instead of a VEHICLE_SETTINGS_FLAG value.  Schema 3 drops files
 # written before every vehicle was fitted with its top modules and its three
@@ -60,7 +66,7 @@ def _int_list(value):
         return None
     result = []
     for item in value:
-        if isinstance(item, bool) or not isinstance(item, int):
+        if isinstance(item, bool) or not isinstance(item, integer_types):
             return None
         result.append(int(item))
     return result
@@ -75,7 +81,8 @@ def _int_map(value):
             key = int(raw_key)
         except (TypeError, ValueError):
             return None
-        if isinstance(raw_value, bool) or not isinstance(raw_value, int):
+        if isinstance(raw_value, bool) or not isinstance(
+                raw_value, integer_types):
             return None
         result[key] = int(raw_value)
     return result

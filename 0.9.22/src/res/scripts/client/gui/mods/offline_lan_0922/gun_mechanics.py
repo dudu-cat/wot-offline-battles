@@ -146,7 +146,12 @@ class GunState(object):
             result.append(quantity)
         return result
 
-    def sync_shell_index(self, index):
+    def sync_shell_index(self, index, instant=False):
+        """Load ``index`` now, restarting the reload from zero.
+
+        ``instant`` is the finished ``loader_intuition`` perk: the new shell
+        arrives loaded instead of starting a reload.
+        """
         if not self.shots:
             return False
         try:
@@ -158,18 +163,24 @@ class GunState(object):
         if index == self.shot_index:
             return False
         self.shot_index = index
+        self.load_started = False
+        if instant and index < len(self.ammo) and self.ammo[index] > 0:
+            self.clip = min(self.clip_size, self.ammo[index])
+            self.reload_time = 0.0
+            self.reload_duration = self.reload
+            return True
         self.clip = 0
         self.reload_time = self.reload
         self.reload_duration = self.reload
-        self.load_started = False
         return True
 
     def request_shell_index(self, index):
-        """Queue ``index`` as the next shell, or load it now when idle.
+        """Queue ``index`` as the next shell without touching the reload.
 
-        #1513 sends VEHICLE_SETTING.NEXT_SHELLS while the gun still holds a
-        round, and the loaded round must be fired first.  A gun with nothing
-        loaded swaps immediately and reloads from scratch.
+        #1513 ``AmmoController.getNextSettingCode`` reads no reload field: the
+        first press on a shell key always sends VEHICLE_SETTING.NEXT_SHELLS and
+        the second press sends CURRENT_SHELLS.  So a queued shell waits for the
+        round in progress, whether that round is loaded or still loading.
         """
         if not self.shots:
             return False
@@ -178,10 +189,12 @@ class GunState(object):
         except (TypeError, ValueError):
             return False
         index = max(0, min(index, len(self.shots) - 1))
-        if self.clip > 0 and self.reload_time <= 0.0:
-            self.pending_index = None if index == self.shot_index else index
-            return False
-        return self.sync_shell_index(index)
+        if self.shot_index < len(self.ammo) and self.ammo[self.shot_index] <= 0:
+            # An empty shell type is never fired, so nothing would ever
+            # promote the queued round.
+            return self.sync_shell_index(index)
+        self.pending_index = None if index == self.shot_index else index
+        return False
 
     def can_fire(self, battle_live=True):
         if not battle_live or not self.shots or self.reload_time > 0.0:

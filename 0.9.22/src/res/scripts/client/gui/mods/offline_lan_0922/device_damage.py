@@ -147,41 +147,85 @@ def crew_impaired_roles(ko_names):
     return roles
 
 
-# RECONSTRUCTED penalty multipliers for a knocked-out role (server-only in 2012).
-# A KO role is impaired, not zero: other crew partially cover, so we approximate.
-CREW_KO_RELOAD_FACTOR = 2.5       # loader out -> much slower reload (higher = worse)
-CREW_KO_DISPERSION_FACTOR = 2.0   # gunner out -> much worse accuracy (higher = worse)
-CREW_KO_MOBILITY_FACTOR = 0.5     # driver out -> half throttle (lower = worse)
-CREW_KO_VISION_FACTOR = 0.75      # commander/radioman out -> less view range
-CREW_KO_COMMANDER_MALUS = 1.1     # commander out nudges reload/dispersion worse (~ -10% crew)
+# #1513 VehicleDescrCrew._processSkills: factor = 0.57 + 0.43 * efficiency, and
+# efficiency is the role's average level over its slots divided by 100.  A dead
+# crewman contributes nothing to the sum but still counts as a slot.
+CREW_FACTOR_BASE = 0.57
+CREW_FACTOR_SLOPE = 0.43
+# _calcLeverIncreaseForNonCommander adds commanderLevel/COMMANDER_ADDITION_RATIO
+# to every other role, so a live 100% commander lifts them to 110.
+COMMANDER_ADDITION_RATIO = 10.0
+
+
+def crew_role_factor(level_share, commander_alive=True):
+    """#1513's role factor for a share of a role's slots still crewed.
+
+    ``level_share`` is the surviving fraction of the role's slots.  A 100% crew
+    is the reference, so each surviving slot carries level 100 plus the live
+    commander's own 100/10 contribution, and a dead slot carries nothing.
+    """
+    per_slot = 100.0
+    if commander_alive:
+        per_slot += 100.0 / COMMANDER_ADDITION_RATIO
+    level = per_slot * max(0.0, min(1.0, float(level_share)))
+    return CREW_FACTOR_BASE + CREW_FACTOR_SLOPE * (level / 100.0)
+
+
+# A fit 100% crew, and one whose single-man role is out, on the same curve.
+CREW_FACTOR_FIT = crew_role_factor(1.0, True)
+CREW_FACTOR_ROLE_OUT = crew_role_factor(0.0, True)
+CREW_FACTOR_COMMANDER_OUT = crew_role_factor(1.0, False)
+# A slower time divides by the factor; a speed multiplies by it.
+CREW_KO_TIME_FACTOR = CREW_FACTOR_FIT / CREW_FACTOR_ROLE_OUT
+CREW_KO_SPEED_FACTOR = CREW_FACTOR_ROLE_OUT / CREW_FACTOR_FIT
+CREW_KO_COMMANDER_TIME_MALUS = CREW_FACTOR_FIT / CREW_FACTOR_COMMANDER_OUT
+CREW_KO_COMMANDER_SPEED_MALUS = CREW_FACTOR_COMMANDER_OUT / CREW_FACTOR_FIT
+# The driver's #1513 factor multiplies terrain resistance; this port applies it
+# to the throttle instead, which is the mobility knob the battle owns.
+CREW_KO_MOBILITY_FACTOR = CREW_KO_SPEED_FACTOR
+CREW_KO_VISION_FACTOR = CREW_KO_SPEED_FACTOR
 
 
 def crew_stat_factor(ko_names, stat):
-    """Multiplier for a stat given the knocked-out crew. stat in
-    ('reload','dispersion','mobility','vision'). >1 worsens reload/dispersion;
-    <1 worsens mobility/vision."""
+    """Multiplier for one stat given the knocked-out crew.
+
+    ``stat`` is one of 'reload', 'aim_time', 'dispersion', 'turret_speed',
+    'mobility', 'vision', 'signal'.  A value above 1.0 lengthens a time; a
+    value below 1.0 slows a speed or shrinks a range.
+    """
     roles = crew_impaired_roles(ko_names)
+    commander_out = 'commander' in roles
     f = 1.0
     if stat == 'reload':
         if 'loader' in roles:
-            f *= CREW_KO_RELOAD_FACTOR
-        if 'commander' in roles:
-            f *= CREW_KO_COMMANDER_MALUS
-    elif stat == 'dispersion':
+            f *= CREW_KO_TIME_FACTOR
+        if commander_out:
+            f *= CREW_KO_COMMANDER_TIME_MALUS
+    elif stat in ('dispersion', 'aim_time'):
         if 'gunner' in roles:
-            f *= CREW_KO_DISPERSION_FACTOR
-        if 'commander' in roles:
-            f *= CREW_KO_COMMANDER_MALUS
+            f *= CREW_KO_TIME_FACTOR
+        if commander_out:
+            f *= CREW_KO_COMMANDER_TIME_MALUS
+    elif stat == 'turret_speed':
+        if 'gunner' in roles:
+            f *= CREW_KO_SPEED_FACTOR
+        if commander_out:
+            f *= CREW_KO_COMMANDER_SPEED_MALUS
     elif stat == 'mobility':
         if 'driver' in roles:
             f *= CREW_KO_MOBILITY_FACTOR
-        if 'commander' in roles:
-            f *= 0.95
+        if commander_out:
+            f *= CREW_KO_COMMANDER_SPEED_MALUS
     elif stat == 'vision':
-        if 'commander' in roles:
+        if commander_out:
             f *= CREW_KO_VISION_FACTOR
         if 'radioman' in roles:
             f *= CREW_KO_VISION_FACTOR
+    elif stat == 'signal':
+        if 'radioman' in roles:
+            f *= CREW_KO_SPEED_FACTOR
+        if commander_out:
+            f *= CREW_KO_COMMANDER_SPEED_MALUS
     return f
 
 

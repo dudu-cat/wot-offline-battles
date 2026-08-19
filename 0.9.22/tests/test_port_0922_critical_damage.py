@@ -458,5 +458,58 @@ class CriticalDamageTests(unittest.TestCase):
              for event in payload['events']])
 
 
+class CrewInjuryLawTests(unittest.TestCase):
+    """#1513 VehicleDescrCrew: factor = 0.57 + 0.43 * role average / 100."""
+
+    def test_a_fit_100_percent_crew_sits_on_the_commander_bonus(self):
+        # Level 100 plus the live commander's 100/10 gives 1.043.
+        self.assertAlmostEqual(1.043, device_damage.CREW_FACTOR_FIT)
+        self.assertAlmostEqual(0.57, device_damage.CREW_FACTOR_ROLE_OUT)
+        self.assertAlmostEqual(1.0, device_damage.CREW_FACTOR_COMMANDER_OUT)
+
+    def test_a_dead_single_man_role_lengthens_a_time_by_the_curve(self):
+        self.assertAlmostEqual(
+            1.043 / 0.57, device_damage.crew_stat_factor(
+                ('loader1',), 'reload'))
+        self.assertAlmostEqual(
+            0.57 / 1.043, device_damage.crew_stat_factor(
+                ('driver',), 'mobility'))
+
+    def test_a_dead_gunner_now_reaches_aim_time_and_turret_traverse(self):
+        for stat in ('dispersion', 'aim_time'):
+            self.assertAlmostEqual(
+                1.043 / 0.57,
+                device_damage.crew_stat_factor(('gunner1',), stat))
+        self.assertAlmostEqual(
+            0.57 / 1.043,
+            device_damage.crew_stat_factor(('gunner1',), 'turret_speed'))
+
+    def test_a_dead_radioman_reaches_signal_and_view_range(self):
+        self.assertAlmostEqual(
+            0.57 / 1.043,
+            device_damage.crew_stat_factor(('radioman1',), 'signal'))
+        self.assertAlmostEqual(
+            0.57 / 1.043,
+            device_damage.crew_stat_factor(('radioman1',), 'vision'))
+
+    def test_a_dead_commander_costs_every_other_role_its_bonus(self):
+        # His own factor drops to 1.0, so times grow and speeds shrink by 4.3%.
+        self.assertAlmostEqual(
+            1.043, device_damage.crew_stat_factor(
+                ('commander',), 'reload'))
+        self.assertAlmostEqual(
+            1.0 / 1.043, device_damage.crew_stat_factor(
+                ('commander',), 'turret_speed'))
+        # Commander out also takes his own view-range role down.
+        self.assertAlmostEqual(
+            0.57 / 1.043, device_damage.crew_stat_factor(
+                ('commander',), 'vision'))
+
+    def test_a_fit_crew_changes_nothing(self):
+        for stat in ('reload', 'aim_time', 'dispersion', 'turret_speed',
+                     'mobility', 'vision', 'signal'):
+            self.assertEqual(1.0, device_damage.crew_stat_factor((), stat))
+
+
 if __name__ == '__main__':
     unittest.main()
