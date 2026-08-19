@@ -2262,6 +2262,68 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual(second_id, battle._outlined_engine_id)
         factory.destroy_all()
 
+    def test_the_cursor_is_measured_against_the_hull_not_the_origin(self):
+        """#1513 sets selectionFovDegrees=1.0 together with
+        skeletonCheckEnabled=True, so the engine measures the cursor against
+        the model.  A bare half-degree cone around the entity origin rejects a
+        tank the player is plainly aiming at: 0.7 degrees off at 266 m is
+        inside the hull."""
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(3.25, 0.0, 266.0),
+            (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        vehicle.collideSegmentExt = lambda start, end: ()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._remote_factory = factory
+        battle._records = {
+            'bot:11': {'engine_id': vehicle_id, 'local': False,
+                       'ready': True, 'spot_visible': True}}
+
+        battle._update_target_outline(1.0)
+
+        self.assertEqual([(vehicle.bw_entity, 1, 0, False)],
+                         runtime.bigworld.edge_adds)
+        self.assertEqual(vehicle_id, battle._outlined_engine_id)
+        factory.destroy_all()
+
+    def test_an_unchanged_target_issues_no_edge_call(self):
+        """Every add costs a delete, so an unchanged choice must do neither.
+        Adding and deleting the same outline each pass leaves a flicker no
+        player can see."""
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(0.0, 0.0, 20.0),
+            (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        vehicle.collideSegmentExt = lambda start, end: (
+            types.SimpleNamespace(dist=20.0),)
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._remote_factory = factory
+        battle._records = {
+            'bot:11': {'engine_id': vehicle_id, 'local': False,
+                       'ready': True, 'spot_visible': True}}
+
+        for tick in range(1, 8):
+            battle._update_target_outline(float(tick))
+
+        self.assertEqual(1, len(runtime.bigworld.edge_adds))
+        self.assertEqual([], runtime.bigworld.edge_removes)
+        self.assertEqual(vehicle_id, battle._outlined_engine_id)
+        factory.destroy_all()
+
     def test_the_outline_reports_why_it_declined_a_candidate(self):
         runtime = _runtime()
         factory = RemoteVehicleFactory(
@@ -2284,7 +2346,9 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         battle._update_target_outline(1.0)
 
         self.assertEqual([], runtime.bigworld.edge_adds)
-        self.assertIn('45.0 deg off the cursor', battle._outline_report)
+        # 45 degrees to the entity origin, less the half-angle its own hull
+        # subtends at 424 m.
+        self.assertIn('44.5 deg off the cursor', battle._outline_report)
         self.assertIn('424 m', battle._outline_report)
         factory.destroy_all()
 
@@ -8299,9 +8363,11 @@ class BattleRuntimeContractTests(unittest.TestCase):
             1000, False)
         self.assertTrue(enemy.model.visible)
 
-    def test_spotting_removes_the_outline_before_the_compound_hides(self):
-        """The edge is keyed on the compound's scene registration, so it must
-        go before changeVisibility touches that compound."""
+    def test_spotting_leaves_the_outline_alone(self):
+        """PyModel.visible writes one flag at model+0xC4 and never touches the
+        scene key, so a spotting update must not disturb the edge.  It runs
+        every tick for every enemy, and clearing there erased the outline the
+        same frame the port had drawn it."""
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
@@ -8337,9 +8403,15 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'state': {'team': 2, 'health': 500, 'alive': True}}
         battle._records = {'bot:17': record}
 
+        battle._set_record_spot_visibility(record, True)
+        battle._set_record_spot_visibility(record, True)
+
+        self.assertEqual(['visibility', 'visibility'], order)
+        self.assertEqual(1000, battle._outlined_engine_id)
+
         battle._set_record_spot_visibility(record, False)
 
-        self.assertEqual(['edge', 'visibility'], order)
+        self.assertEqual('edge', order[-1])
         self.assertIsNone(battle._outlined_engine_id)
         self.assertFalse(battle._outline_blocked)
 

@@ -7337,10 +7337,8 @@ class BattleRuntime(object):
             return
         start, direction = self._mouse_targeting_ray()
         end = start + direction.scale(TARGET_MAX_DISTANCE)
-        selection_cos = math.cos(
-            math.radians(TARGET_SELECTION_FOV_DEGREES * 0.5))
-        deselection_cos = math.cos(
-            math.radians(TARGET_DESELECTION_FOV_DEGREES * 0.5))
+        selection_angle = TARGET_SELECTION_FOV_DEGREES * 0.5
+        deselection_angle = TARGET_DESELECTION_FOV_DEGREES * 0.5
         held_id = self._outlined_engine_id
         held_seen = False
         held_angle = None
@@ -7384,14 +7382,18 @@ class BattleRuntime(object):
                 cosine = min(1.0, max(-1.0, (
                     offset.x * direction.x + offset.y * direction.y +
                     offset.z * direction.z) / distance))
-            angle = math.degrees(math.acos(cosine))
+            # #1513 pairs selectionFovDegrees=1.0 with skeletonCheckEnabled,
+            # so the engine measures the cursor against the model rather than
+            # against the entity origin.
+            angle = max(0.0, math.degrees(math.acos(cosine)) -
+                        self._target_angular_radius(vehicle, distance))
             if vehicle.collideSegmentExt(start, end):
                 rank = (0, distance)
-            elif cosine >= selection_cos:
-                rank = (1, -cosine)
+            elif angle <= selection_angle:
+                rank = (1, angle)
             else:
                 if held:
-                    if cosine >= deselection_cos:
+                    if angle <= deselection_angle:
                         held_angle = angle
                     else:
                         held_reason = (
@@ -7446,6 +7448,22 @@ class BattleRuntime(object):
                 '#1513 target-lock candidate boundary is unavailable')
         set_candidate(vehicle)
 
+    def _target_angular_radius(self, vehicle, distance):
+        """The half-angle this vehicle's own hull subtends at this range."""
+        if distance <= 0.0:
+            return 180.0
+        hit_tester = _field(
+            _field(getattr(vehicle, 'typeDescriptor', None), 'hull', {}),
+            'hitTester', None)
+        bbox = getattr(hit_tester, 'bbox', None)
+        try:
+            length = abs(float(bbox[0][2])) + abs(float(bbox[1][2]))
+            width = abs(float(bbox[0][0])) + abs(float(bbox[1][0]))
+        except (TypeError, IndexError, ValueError):
+            length, width = 6.0, 3.0
+        radius = 0.5 * math.sqrt(max(3.0, length) ** 2 + max(2.0, width) ** 2)
+        return math.degrees(math.atan2(radius, distance))
+
     _EDGE_REPORT_LIMIT = 80
 
     def _report_edge(self, message):
@@ -7476,6 +7494,16 @@ class BattleRuntime(object):
         sys.stdout.write(
             '[Offline LAN 0.9.22] COMPOUND at=%s axes=%s\n' % (
                 _format_xyz(matrix.translation), _format_axes(matrix)))
+        target = getattr(self._runtime.bigworld, 'target', None)
+        entity = getattr(target, 'entity', None)
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] TARGETING enabled=%s fov=%s max=%s '
+            'skeleton=%s entity=%s\n' % (
+                getattr(target, 'isEnabled', None),
+                getattr(target, 'selectionFovDegrees', None),
+                getattr(target, 'maxDistance', None),
+                getattr(target, 'skeletonCheckEnabled', None),
+                getattr(entity, 'id', None)))
         return True
 
     def _report_local_decals(self):
@@ -9250,10 +9278,6 @@ class BattleRuntime(object):
         visible = bool(visible)
         record['spot_visible'] = visible
         vehicle._spot_visible = visible
-        # Stock reaches Highlighter.deactivate before the compound's
-        # visibility changes, and the edge is keyed on that compound.
-        if self._outlined_engine_id == record['engine_id']:
-            self._clear_target_outline()
         vehicle.appearance.changeVisibility(
             visible or not self._record_alive(record, vehicle))
         if visible and not record.get('visual_started'):

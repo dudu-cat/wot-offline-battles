@@ -1507,11 +1507,21 @@ entity, the remote vehicle and the exact compound the add was keyed on.
 `_clear_target_outline` removes the edge only while the vehicle still holds that
 same entity and that same compound, and otherwise reports the mismatch and
 outlines nothing more for the rest of the round rather than leaving an entry it
-can never reach. `_set_record_spot_visibility` removes the edge before
-`changeVisibility` touches the compound, which is the order stock keeps:
-`ComponentSystem.deactivate` reaches `Highlighter.deactivate` and its
-`wgDelEdgeDetectEntity` before the compound goes. `EDGE add`/`EDGE del` lines,
-capped at 80 a round, pair the two calls in the log.
+can never reach. `EDGE add`/`EDGE del` lines, capped at 80 a round, pair the
+two calls in the log.
+
+Hiding a vehicle is not one of those changes. `PyModel`'s `visible` setter is
+RVA `0x4f44b0`, registered next to `moveAttachments` at RVA `0x4f39f0` with the
+getter at `0x4f1610`. Its whole body is `mov dword ptr [esi + 0xC4], ecx`: it
+writes one flag inside the model and touches neither the scene nor the
+`(handle, kind)` pair at `model + 0x10`. A spot-visibility change therefore
+cannot invalidate a drawer key, and the port does not remove the edge there.
+Removing it there was in fact harmful: `_update_spotting` calls
+`_set_record_spot_visibility` on every enemy every tick whether or not its
+visibility changed, so the clear erased the outline about 30 ms after the
+0.125 s outline pass had drawn it. Peng's log showed 40 such `EDGE add` /
+`EDGE del` pairs and almost no visible outline. `_stop_remote_visual` still
+removes the edge, which is the boundary that really does release the compound.
 
 ## Quitting a live battle destroys a bot sound object after the scene dies
 
@@ -1977,6 +1987,49 @@ caused the fourth dump follows from the shared call, not from a second dump
 taken after the fix. Only a run on the exact Windows client can prove that the
 outline now clears and that the crash is gone.
 
+## The cursor has to be measured against the model, not the origin
+
+`AvatarInputHandler._Targeting.__init__` configures the engine's own targeting
+object in four statements:
+
+```python
+target = BigWorld.target
+target.selectionFovDegrees = 1.0
+target.deselectionFovDegrees = 80.0
+target.maxDistance = 710.0
+target.skeletonCheckEnabled = True
+```
+
+This port copied the three numbers and dropped the fourth. A half-degree cone
+around the entity origin is far stricter than what retail applies, because
+`skeletonCheckEnabled` makes the engine measure the cursor against the model
+rather than against the origin. Peng's log shows the cost directly:
+
+```
+TARGET none: id=1016 is 0.7 deg off the cursor at 266 m
+```
+
+A tank hull is about 6.7 m across the diagonal, so at 266 m it subtends about
+0.8 degrees from its own centre. The cursor was on the tank and the port
+declined it.
+
+The port now subtracts the half-angle the vehicle's own hull subtends at that
+range, taken from `typeDescriptor.hull.hitTester.bbox`, before it compares
+against the selection and deselection angles. An exact `collideSegmentExt` hit
+still outranks every angular candidate, and the 710 m limit and the 80-degree
+deselection behaviour are unchanged.
+
+Using the engine's selection directly is the better answer if it is reachable,
+and two of the three preconditions are already proved.
+`_Targeting.getTargetEntity` reads `BigWorld.target.entity`, and both
+`PlayerAvatar.targetFocus` and `PlayerAvatar.targetBlur` open with
+`if entity not in self.__vehicles: return`, so the stock handlers ignore a
+client-only `OfflineEntity` instead of calling `drawEdge` on it. What is not
+proved is whether the native targeting enumerates these entities at all, and
+whether `isEnabled` is true through this port's control-mode flow. A
+`TARGETING` line now reports `isEnabled`, the three constants and the id of
+`BigWorld.target.entity` once a second, so one battle settles it.
+
 ## What can paint a black shape on the ground under the player
 
 Peng's newest screenshots move this defect. The shape is not a distant terrain
@@ -2013,13 +2066,23 @@ which cannot introduce a scale. The `wg_addDecal` probe from `e89e6b7` printed
 nothing at all across the whole session log, so the ground decals painted
 through that native are not the painter either.
 
-That leaves the compound provider and the descriptor transforms to be read from
-a real battle. `_report_local_compound` now prints the player's provider
-translation and its three basis lengths once a second, capped at 200 lines a
-round, and `_report_local_decals` prints every `AODecals` transform of the
-chassis, hull and turret with the same two figures, plus `hullPosition` and
-whether the appearance holds a splodge. A degenerate scale or an oversized
-decal transform names itself in the next log.
+That left the compound provider and the descriptor transforms to be read from a
+real battle. `_report_local_compound` prints the player's provider translation
+and its three basis lengths once a second, capped at 200 lines a round, and
+`_report_local_decals` prints every `AODecals` transform of the chassis, hull
+and turret with the same two figures, plus `hullPosition` and whether the
+appearance holds a splodge.
+
+The first battle to carry them reported nothing wrong. Every one of the 67
+`COMPOUND` lines reads `axes=1.000/1.000/1.000` with a translation that tracks
+the vehicle, so the provider carries no scale at any point in the round. The
+tank had one decal, `AODECAL chassis[0] at=(-0.00, -0.00, 0.00)
+axes=3.974/1.282/5.730`, which is a normal hull-sized occlusion box, with
+`hullPosition=(0.00, 0.90, 0.00)` and `splodge=True`. Peng saw no black shape in
+that session either, so the measurement rules out a degenerate provider and an
+oversized decal transform for that round; it does not yet explain the shape,
+because the shape did not occur. Keep both reports until a session that shows
+it produces numbers.
 
 ## Known deterministic parity gaps
 
