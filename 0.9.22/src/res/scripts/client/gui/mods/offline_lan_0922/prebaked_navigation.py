@@ -106,7 +106,27 @@ def load_graph(map_name, base_dir=None):
 		graph = json.load(handle)
 	finally:
 		handle.close()
-	return _validate(graph, short_name)
+	graph = _validate(graph, short_name)
+	return _pack_cell_arrays(graph)
+
+
+def _pack_cell_arrays(graph):
+	"""Store the byte-valued cell arrays as bytearrays.
+
+	``links`` and ``hazards`` hold one value below 256 per cell, so a bytearray
+	replaces a list of 62750 pointers. ``heights_mm`` keeps its list because
+	its consumers test individual cells for ``None``.
+	"""
+	if not isinstance(graph, dict):
+		return graph
+	for name in ('links', 'hazards'):
+		values = graph.get(name)
+		if isinstance(values, list):
+			try:
+				graph[name] = bytearray(values)
+			except (TypeError, ValueError):
+				pass
+	return graph
 
 
 def nearest_ground_point(graph, x, z, max_radius=3):

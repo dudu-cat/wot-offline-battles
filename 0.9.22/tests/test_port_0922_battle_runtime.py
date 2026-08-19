@@ -10288,3 +10288,74 @@ class SpottedReportTests(unittest.TestCase):
         ])
 
         self.assertEqual([[]], sent)
+
+
+class MemoryRankingTests(unittest.TestCase):
+    """The first baseline reported 1.3 MB because the sizer stopped at the
+    object boundary and the sample ran before BotRuntime existed."""
+
+    def setUp(self):
+        self.deep_size = battle_runtime_module._deep_size
+
+    def test_a_container_is_counted_once_across_two_roots(self):
+        shared = [0] * 500
+        seen = set()
+
+        first = self.deep_size({'a': shared}, seen)
+        second = self.deep_size({'b': shared}, seen)
+
+        self.assertGreater(first, second)
+
+    def test_the_sizer_walks_into_this_port_s_own_objects(self):
+        holder = battle_runtime_module._RecentIdSet()
+        for index in range(400):
+            holder.add('1:%d:0' % index)
+
+        # A bare getsizeof of the object returns about 32 bytes.
+        self.assertGreater(self.deep_size(holder), 8000)
+
+    def test_the_sizer_stops_at_a_foreign_object(self):
+        foreign = types.SimpleNamespace(payload=[0] * 5000)
+
+        self.assertLess(self.deep_size(foreign), 500)
+
+    def test_a_cycle_terminates(self):
+        node = {}
+        node['self'] = node
+
+        self.assertGreater(self.deep_size(node), 0)
+
+    def test_the_recent_id_window_stays_bounded(self):
+        holder = battle_runtime_module._RecentIdSet(limit=64)
+        for index in range(500):
+            holder.add('1:%d:0' % index)
+
+        self.assertEqual(64, len(holder))
+
+
+class DescriptorReuseTests(unittest.TestCase):
+    """Two descriptors were built per bot, and the factory pins every one."""
+
+    def test_one_descriptor_is_built_per_vehicle_type(self):
+        built = []
+
+        class _Vehicles(object):
+            @staticmethod
+            def VehicleDescr(typeName=None, compactDescr=None):
+                built.append(typeName)
+                return types.SimpleNamespace(name=typeName)
+
+        runtime = BattleRuntime.__new__(BattleRuntime)
+        runtime._descriptor_cache = {}
+        runtime._config = {'vehicle': 'ussr:T-34'}
+        runtime._runtime = types.SimpleNamespace(vehicles=_Vehicles)
+        runtime._remote_factory = types.SimpleNamespace(
+            prepare_descriptor=lambda descriptor: descriptor)
+
+        first = runtime._resolve_descriptor('ussr:T-34')
+        second = runtime._resolve_descriptor('ussr:T-34')
+        other = runtime._resolve_descriptor('germany:PzVI')
+
+        self.assertIs(first, second)
+        self.assertIsNot(first, other)
+        self.assertEqual(['ussr:T-34', 'germany:PzVI'], built)

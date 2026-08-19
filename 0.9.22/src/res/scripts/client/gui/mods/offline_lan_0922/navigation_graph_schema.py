@@ -126,9 +126,12 @@ def validate_graph(graph, map_name):
 	if width <= 0 or height <= 0:
 		raise ValueError('navigation graph dimensions are invalid')
 	cell_count = width * height
+	# A loaded graph stores its byte-valued cell arrays as bytearrays, so the
+	# same graph validates before and after packing.
 	for name in ('heights_mm', 'links', 'hazards'):
 		values = graph.get(name)
-		if not isinstance(values, (list, tuple)) or len(values) != cell_count:
+		if (not isinstance(values, (list, tuple, bytearray)) or
+				len(values) != cell_count):
 			raise ValueError(
 				'navigation graph %s array is incomplete' % name)
 	_point(graph.get('origin'), 'navigation graph origin', exact_length=2)

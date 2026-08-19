@@ -175,25 +175,85 @@ def _format_xyz(value):
         return repr(value)
 
 
-def _deep_size(value, seen=None, depth=0):
-    """Approximate retained bytes, counting each object once."""
-    if value is None or depth > 6:
+_PORT_PACKAGE = 'gui.mods.offline_lan_0922'
+# Sizing these adds nothing and walking a string character by character is slow.
+_ATOMIC_TYPES = (bool, float, complex, bytes, bytearray)
+try:
+    _ATOMIC_TYPES += (int, long, str, unicode)
+except NameError:
+    _ATOMIC_TYPES += (int, str)
+
+
+def _deep_size(value, seen=None):
+    """Approximate retained bytes, counting each object once.
+
+    ``seen`` is shared across a whole ranking so an object reachable from two
+    roots is charged to the first one only.  Instances are walked through
+    ``__dict__``, because most of this port's state hides behind objects
+    rather than behind bare containers.
+    """
+    if value is None:
         return 0
     if seen is None:
         seen = set()
-    marker = id(value)
-    if marker in seen:
-        return 0
-    seen.add(marker)
-    total = sys.getsizeof(value, 64)
-    if isinstance(value, dict):
-        for key, item in value.items():
-            total += _deep_size(key, seen, depth + 1)
-            total += _deep_size(item, seen, depth + 1)
-    elif isinstance(value, (list, tuple, set, frozenset)):
-        for item in value:
-            total += _deep_size(item, seen, depth + 1)
+    pending = [value]
+    total = 0
+    while pending:
+        item = pending.pop()
+        if item is None:
+            continue
+        marker = id(item)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        try:
+            total += sys.getsizeof(item, 64)
+        except Exception:
+            total += 64
+        if isinstance(item, _ATOMIC_TYPES):
+            continue
+        if isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+            continue
+        if isinstance(item, (list, tuple, set, frozenset)):
+            pending.extend(item)
+            continue
+        if not _is_port_object(item):
+            continue
+        members = getattr(item, '__dict__', None)
+        if isinstance(members, dict):
+            pending.append(members)
     return total
+
+
+def _release_layout_caches():
+    """Drop the hit-layout caches, which are module state and outlive a round."""
+    module = sys.modules.get('%s.internal_hit_layouts' % _PORT_PACKAGE)
+    if module is None:
+        return False
+    for name in ('clear_cache', 'clear_runtime_evidence'):
+        release = getattr(module, name, None)
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                continue
+    return True
+
+
+def _is_port_object(value):
+    """True for an instance of one of this port's own classes.
+
+    The walk stops at anything else on purpose.  A BigWorld entity, a native
+    model or a client module would drag the whole engine into the ranking, and
+    touching a native attribute merely to size it is not worth the risk.
+    """
+    try:
+        origin = getattr(type(value), '__module__', '')
+    except Exception:
+        return False
+    return isinstance(origin, str) and origin.startswith(_PORT_PACKAGE)
 
 
 _FRAME_STAGE_NAMES = (
@@ -826,6 +886,7 @@ class BattleRuntime(object):
         self._binding = None
         self._server = None
         self._remote_factory = None
+        self._descriptor_cache = {}
         self._sender = None
         self._sync = None
         self._bots = None
@@ -1798,7 +1859,6 @@ class BattleRuntime(object):
                 ammo_layout=self._local_ammo_layout())
             self._log_local_ammo(self._gun_state)
             self._log_effective_parameters(descriptor)
-            self._report_memory('battle_start')
             self._gun_last_tick = self._clock()
             self._sync = SnapshotSync(
                 self.client.player_id, on_event=self._apply_sync_event,
@@ -1851,6 +1911,9 @@ class BattleRuntime(object):
                 native_motion=False)
             self._bots.debug_logging = bool(
                 self._config.get('debug_logging', False))
+            # Sampled here, not before BotRuntime exists: the bot, navigator
+            # and planner structures are most of what this port holds.
+            self._report_memory('battle_start')
             provider = getattr(self._avatar, 'guiSessionProvider', None)
             vehicle_view_state = getattr(
                 self._runtime, 'vehicle_view_state', None)
@@ -2517,6 +2580,15 @@ class BattleRuntime(object):
         return self._local_damage_report
 
     def _resolve_descriptor(self, vehicle_name):
+        """Return one shared descriptor per vehicle type for this round.
+
+        The factory pins every descriptor it prepares, and nothing in this port
+        writes to one, so building a second copy per bot only doubled the
+        retained descriptors and their native BSP testers.
+        """
+        cached = self._descriptor_cache.get(vehicle_name)
+        if cached is not None:
+            return cached
         try:
             descriptor = self._runtime.vehicles.VehicleDescr(
                 typeName=vehicle_name)
@@ -2526,7 +2598,9 @@ class BattleRuntime(object):
         if self._remote_factory is None:
             raise RuntimeError(
                 '#1513 vehicle descriptor geometry owner is unavailable')
-        return self._remote_factory.prepare_descriptor(descriptor)
+        prepared = self._remote_factory.prepare_descriptor(descriptor)
+        self._descriptor_cache[vehicle_name] = prepared
+        return prepared
 
     def _select_bot_vehicle(self, raw):
         requested = raw.get('vehicle')
@@ -4381,71 +4455,157 @@ class BattleRuntime(object):
         return counts
 
     _MEASURED_STRUCTURES = (
+        ('navgraph', '_navigation_graph'),
+        ('foliage', '_foliage'),
         ('records', '_records'),
         ('journal', '_event_journal'),
         ('accepted_ids', '_accepted_event_ids'),
         ('applied_ids', '_applied_event_ids'),
-        ('navgraph', '_navigation_graph'),
-        ('foliage', '_foliage'),
         ('last_snapshot', '_last_snapshot'),
         ('start_message', '_start_message'),
         ('health', '_last_health'),
         ('bot_destr_samples', '_bot_destructible_samples'),
         ('spawn_planner', '_spawn_planner'),
+        ('projectiles', '_projectiles'),
         ('projectile_meta', '_projectile_meta'),
         ('projectile_visual', '_projectile_visual_meta'),
         ('projectile_lineage', '_projectile_lineage'),
         ('bot_assignments', '_bot_vehicle_assignments'),
+        ('spotting_cache', '_remote_spotting_cache'),
+        ('frame_diag', '_frame_diagnostics'),
     )
 
     _MEASURED_BOT_STRUCTURES = (
         ('bot_states', 'states'),
         ('bot_decisions', '_decision_cache'),
+        ('bot_descriptors', '_descriptors'),
+        ('bot_visibility', '_visibility_cache'),
+        ('bot_shot_los', '_shot_los_cache'),
+        ('bot_gun_states', '_gun_states'),
+        ('bot_ammo_states', '_ammo_states'),
+        ('bot_physics', '_physics_params'),
+        ('bot_motion_probe', '_motion_probe_cache'),
+        ('bot_server_orders', '_server_orders'),
+        ('bot_spot_profiles', '_spotting_profiles'),
         ('bot_cover_queue', '_cover_queue'),
         ('bot_receipts', '_world_receipt_waiting'),
         ('bot_debt', '_integration_debt'),
     )
 
+    # The navigator and its terrain grid hold the port's second-largest set of
+    # caches and were entirely absent from the first baseline.
+    _MEASURED_NAVIGATOR_STRUCTURES = (
+        ('nav_paths', 'paths'),
+        ('nav_searches', 'searches'),
+        ('nav_bot_states', 'bot_states'),
+    )
+
+    _MEASURED_NAV_GRID_STRUCTURES = (
+        ('nav_edge_cache', '_edge_cache'),
+        ('nav_segment_cache', '_segment_cache'),
+        ('nav_ground_cache', '_ground_cache'),
+        ('nav_failed_edges', '_failed_edges'),
+    )
+
+    _MEASURED_DIRECTOR_STRUCTURES = (
+        ('ai_agents', 'agents'),
+        ('ai_contacts', 'contacts'),
+        ('ai_map_data', 'map_data'),
+    )
+
+    _MEASURED_DESTRUCTIBLE_GLOBALS = (
+        ('destr_catalog', '_destructible_catalog'),
+        ('destr_tree_state', 'g_offh_tree_state'),
+        ('destr_instances', 'g_offh_destr_instances'),
+        ('destr_contact_bins', 'g_offh_destr_contact_bins'),
+        ('destr_pending', 'g_offh_destr_pending'),
+        ('destr_falling', 'g_offh_destr_falling_active'),
+        ('destr_seen', 'g_offh_destr_seen'),
+        ('destr_chunks', 'g_offh_destr_chunks'),
+    )
+
+    _MEASURED_REMOTE_STRUCTURES = (
+        ('remote_vehicles', '_vehicles'),
+        ('remote_descriptors', '_descriptors'),
+        ('remote_hit_testers', '_hit_testers'),
+    )
+
+    def _measured_module_structures(self):
+        """Module caches that outlive a round, so a leak shows across rounds."""
+        rows = []
+        for module_name, attribute, label in (
+                ('internal_hit_layouts', '_LAYOUT_CACHE', 'hit_layout_cache'),
+                ('internal_hit_layouts', '_RUNTIME_VERIFICATION',
+                 'hit_layout_evidence'),
+                ('internal_layout_profiles', 'PROFILES', 'layout_profiles'),
+                ('internal_geometry', '_PROBE_CACHE', 'geometry_probes'),
+                ('tank_collision', '_SHAPE_CACHE', 'chassis_shapes')):
+            module = sys.modules.get('%s.%s' % (_PORT_PACKAGE, module_name))
+            if module is not None:
+                rows.append((label, getattr(module, attribute, None)))
+        maps = sys.modules.get('%s.ai.maps' % _PORT_PACKAGE)
+        if maps is not None:
+            rows.append(('ai_tactical_maps', getattr(maps, 'TACTICAL_MAPS', None)))
+        return rows
+
+    def _memory_rows(self):
+        """Every resident structure this port owns, as (label, object) pairs."""
+        rows = [(name, getattr(self, attribute, None))
+                for name, attribute in self._MEASURED_STRUCTURES]
+        bots = self._bots
+        rows.extend((name, getattr(bots, attribute, None))
+                    for name, attribute in self._MEASURED_BOT_STRUCTURES)
+        navigator = getattr(bots, 'navigator', None)
+        rows.extend((name, getattr(navigator, attribute, None))
+                    for name, attribute in self._MEASURED_NAVIGATOR_STRUCTURES)
+        rows.extend((name, getattr(getattr(navigator, 'grid', None),
+                                   attribute, None))
+                    for name, attribute in self._MEASURED_NAV_GRID_STRUCTURES)
+        director = getattr(getattr(bots, 'adapter', None), 'director', None)
+        rows.extend((name, getattr(director, attribute, None))
+                    for name, attribute in self._MEASURED_DIRECTOR_STRUCTURES)
+        rows.extend((name, getattr(self._destructibles, attribute, None))
+                    for name, attribute
+                    in self._MEASURED_DESTRUCTIBLE_GLOBALS)
+        rows.extend((name, getattr(self._remote_factory, attribute, None))
+                    for name, attribute in self._MEASURED_REMOTE_STRUCTURES)
+        rows.extend(self._measured_module_structures())
+        return rows
+
     def _report_memory(self, moment):
-        """Rank the port's per-round structures by retained bytes, once.
+        """Rank the port's resident structures by retained bytes, once.
 
         The client is 32-bit and already runs near its address-space ceiling,
-        so a baseline needs sizes, not just counts.
+        so a baseline needs sizes, not just counts.  One ``seen`` set spans the
+        whole ranking, so a structure reachable from two roots is charged once
+        and the total stays a real total.  Native memory is invisible here: the
+        native counters are printed beside the total instead.
         """
+        seen = set()
         sizes = []
-        for name, attribute in self._MEASURED_STRUCTURES:
+        for name, value in self._memory_rows():
+            if value is None:
+                continue
             try:
-                sizes.append(
-                    (_deep_size(getattr(self, attribute, None)), name))
+                size = _deep_size(value, seen)
             except Exception:
                 continue
-        for name, attribute in self._MEASURED_BOT_STRUCTURES:
-            try:
-                sizes.append(
-                    (_deep_size(getattr(self._bots, attribute, None)), name))
-            except Exception:
-                continue
-        for name, holder in (('destructibles', self._destructibles),
-                             ('remote_vehicles', self._remote_factory)):
-            try:
-                sizes.append((_deep_size(
-                    getattr(holder, '_vehicles', None) or
-                    getattr(holder, '_destructible_catalog', None)), name))
-            except Exception:
-                continue
-        registry = getattr(self._destructibles, 'registry_sizes', None)
-        if callable(registry):
-            try:
-                for name, value in registry().items():
-                    sizes.append((int(value), 'destr_' + name))
-            except Exception:
-                pass
+            if size:
+                sizes.append((size, name))
         sizes.sort(reverse=True)
+        total = sum(size for size, unused in sizes)
         sys.stdout.write(
-            '[Offline LAN 0.9.22] MEM %s total_kb=%d %s\n' % (
-                moment, sum(size for size, unused in sizes) // 1024,
+            '[Offline LAN 0.9.22] MEM %s total_kb=%d rows=%d %s\n' % (
+                moment, total // 1024, len(sizes),
                 ' '.join('%s=%dk' % (name, size // 1024)
-                         for size, name in sizes[:12])))
+                         for size, name in sizes[:24])))
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] MEM %s native poses=%d models=%d '
+            'descriptors=%d testers=%d\n' % (
+                moment, pose_animation_writes(),
+                len(getattr(self._remote_factory, '_vehicles', ()) or ()),
+                len(getattr(self._remote_factory, '_descriptors', ()) or ()),
+                len(getattr(self._remote_factory, '_hit_testers', ()) or ())))
         return True
 
     def _drain_event_journal(self):
@@ -9692,17 +9852,31 @@ class BattleRuntime(object):
         # detached before the stock Avatar tears down the battle space.  The
         # local stock Vehicle remains owned by Avatar/OfflineMapCreator.
         if self._remote_factory is not None:
+            # Each step owns its own boundary. A failed outline clear or one
+            # failed visual must still reach destroy_all(), which releases the
+            # native models and BSP trees for the whole battle.
             try:
                 self._clear_target_outline()
-                for record in tuple(self._records.values()):
-                    if record.get('presentation'):
-                        self._stop_remote_visual(record)
+            except Exception as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+            for record in tuple(self._records.values()):
+                if not record.get('presentation'):
+                    continue
+                try:
+                    self._stop_remote_visual(record)
+                except Exception as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+            try:
                 self._remote_factory.destroy_all()
             except Exception as error:
                 if cleanup_error is None:
                     cleanup_error = error
             self._remote_factory = None
+        self._descriptor_cache = {}
         self._records = {}
+        _release_layout_caches()
         if self._map_create_attempted:
             creator = self._runtime.offline_map_creator
             retained_space_id = getattr(

@@ -172,6 +172,8 @@ def _diagnostic_counts_1513(values):
 
 def _diagnostic_chunk_1513(chunk_id, native_count, filenames, registry):
 	"""Emit one aggregate after a complete first scan of a streamed chunk."""
+	if not _DIAGNOSTICS_ENABLED:
+		return
 	slots = registry['slot_diagnostics']
 	ordered = [slots[index] for index in sorted(slots)]
 	signatures = [slot['signature_state'] for slot in ordered]
@@ -1841,7 +1843,10 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 							'result': 'pending',
 							'boxes': 0,
 						}
-						registry['slot_diagnostics'][_ti] = _slot_diag
+						# Retained for the whole battle, one dict per native slot
+						# including every tree, so only keep it when a reader exists.
+						if _DIAGNOSTICS_ENABLED:
+							registry['slot_diagnostics'][_ti] = _slot_diag
 						if ((cid, _ti) in globals().setdefault(
 								'g_offh_destr_falling_active', {})):
 							# A falling item's live matrix is no longer its catalog

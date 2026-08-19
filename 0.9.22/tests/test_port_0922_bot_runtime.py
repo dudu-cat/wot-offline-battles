@@ -6726,3 +6726,65 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(busiest[0][1], 1)
         # Reading the report clears the window's counters.
         self.assertEqual((), runtime.load_report()['busiest'])
+
+
+class BotOwnStationaryVisionTests(unittest.TestCase):
+    """A bot's own stereoscope was evaluated once at registration with zero
+    stationary seconds, so a bot never earned the bonus its target did."""
+
+    def setUp(self):
+        self.module = _load()
+        self.runtime = self.module.BotRuntime.__new__(self.module.BotRuntime)
+        self.runtime._vision_ranges = {7: (400.0, 500.0, 3.0)}
+        self.runtime._source_still = {}
+
+    def _state(self, speed):
+        return {'id': 7, 'kind': 'bot', 'speed': speed, 'view_range': 300.0}
+
+    def test_a_moving_bot_keeps_its_moving_range(self):
+        state = self._state(5.0)
+        self.runtime._note_source_stillness(state, 100.0)
+
+        self.assertEqual(400.0, self.runtime._source_view_range(state, 100.0))
+
+    def test_a_bot_earns_its_stereoscope_after_the_device_delay(self):
+        state = self._state(0.0)
+        self.runtime._note_source_stillness(state, 100.0)
+
+        self.assertEqual(400.0, self.runtime._source_view_range(state, 100.0))
+        self.assertEqual(400.0, self.runtime._source_view_range(state, 102.9))
+        self.assertEqual(500.0, self.runtime._source_view_range(state, 103.0))
+
+    def test_the_stamp_survives_ticks_without_an_observation(self):
+        state = self._state(0.0)
+        # The tick loop keeps stamping while nothing observes this bot.
+        for tick in range(40):
+            self.runtime._note_source_stillness(state, 100.0 + tick * 0.1)
+
+        self.assertEqual(500.0, self.runtime._source_view_range(state, 104.0))
+
+    def test_moving_again_disarms_the_device(self):
+        still = self._state(0.0)
+        self.runtime._note_source_stillness(still, 100.0)
+        self.assertEqual(500.0, self.runtime._source_view_range(still, 104.0))
+
+        moving = self._state(9.0)
+        self.runtime._note_source_stillness(moving, 105.0)
+        self.assertEqual(400.0, self.runtime._source_view_range(moving, 105.0))
+
+        self.runtime._note_source_stillness(still, 105.1)
+        self.assertEqual(400.0, self.runtime._source_view_range(still, 107.0))
+        self.assertEqual(500.0, self.runtime._source_view_range(still, 108.1))
+
+    def test_a_bot_without_the_device_keeps_one_range(self):
+        self.runtime._vision_ranges[7] = (400.0, 400.0, None)
+        state = self._state(0.0)
+        self.runtime._note_source_stillness(state, 100.0)
+
+        self.assertEqual(400.0, self.runtime._source_view_range(state, 110.0))
+
+    def test_an_unregistered_source_falls_back_to_its_published_range(self):
+        self.runtime._vision_ranges = {}
+
+        self.assertEqual(
+            300.0, self.runtime._source_view_range(self._state(0.0), 100.0))

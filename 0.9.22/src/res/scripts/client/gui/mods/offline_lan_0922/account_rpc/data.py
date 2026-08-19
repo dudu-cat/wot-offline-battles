@@ -176,7 +176,8 @@ def _validate_selected_vehicle(vehicle):
             'selected vehicle customization catalogue must be non-empty')
 
 
-def inventory(selected_vehicle=None, validate=True, only_vehicles=None):
+def inventory(selected_vehicle=None, validate=True, only_vehicles=None,
+              only_items=None):
     """Return every loadable garage vehicle and its relational records.
 
     ``selected_vehicle`` is serialized by ``bootstrap._selected_vehicle``.  It
@@ -186,14 +187,18 @@ def inventory(selected_vehicle=None, validate=True, only_vehicles=None):
     ``validate`` walks every record, so a fitting that already went through
     ``GarageState`` publishes without paying for it again.
 
-    ``only_vehicles`` limits the per-vehicle rows to the ids a fitting
-    touched.  ``Inventory.synchronize`` merges a partial diff per item type
-    through ``synchronizeDicts``, so the untouched rows keep their cached
-    values instead of being republished.
+    ``only_vehicles`` limits the per-vehicle rows to the ids a fitting touched,
+    and ``only_items`` maps an item type to the owned compact descriptors it
+    changed.  Either one selects a delta: ``Inventory.synchronize`` merges the
+    diff per item type through ``synchronizeDicts``, and an omitted type keeps
+    its cache untouched.  This matters because ``ItemsRequester.invalidateCache``
+    evicts one GUI item per published compact descriptor, so a full catalogue
+    would rebuild the whole garage on every click.
     """
     vehicle = selected_vehicle if isinstance(selected_vehicle, dict) else {}
     if validate:
         _validate_selected_vehicle(vehicle)
+    delta = only_vehicles is not None or only_items is not None
     records = _vehicle_records(vehicle)
     values = dict((item_type, {}) for item_type in ITEM_TYPE_INDICES)
     vehicle_values = {
@@ -243,8 +248,11 @@ def inventory(selected_vehicle=None, validate=True, only_vehicles=None):
             if item_type in values and item_type not in (
                     VEHICLE_ITEM_TYPE, TANKMAN_ITEM_TYPE,
                     CUSTOMIZATION_ITEM_TYPE):
+                wanted = _wanted_items(only_items, item_type)
                 target = values[item_type]
                 for compact_descr, count in items.items():
+                    if wanted is not None and compact_descr not in wanted:
+                        continue
                     target[compact_descr] = max(
                         int(target.get(compact_descr, 0)), int(count))
 
@@ -260,8 +268,11 @@ def inventory(selected_vehicle=None, validate=True, only_vehicles=None):
         item_type = int(item_type)
         if item_type not in ARTEFACT_ITEM_TYPES:
             continue
+        wanted = _wanted_items(only_items, item_type)
         target = values[item_type]
         for compact_descr, count in dict(items).items():
+            if wanted is not None and compact_descr not in wanted:
+                continue
             target[compact_descr] = max(
                 int(target.get(compact_descr, 0)), int(count))
 
@@ -271,7 +282,27 @@ def inventory(selected_vehicle=None, validate=True, only_vehicles=None):
     }
     values[VEHICLE_ITEM_TYPE] = vehicle_values
     values[CUSTOMIZATION_ITEM_TYPE] = {}
+    if delta:
+        values = _prune_empty(values)
     return {'inventory': values}
+
+
+def _wanted_items(only_items, item_type):
+    """Return the owned descriptors to publish for one item type, or None."""
+    if only_items is None:
+        return None
+    return set(only_items.get(int(item_type)) or ())
+
+
+def _prune_empty(values):
+    """Drop the sections a delta did not change."""
+    pruned = {}
+    for item_type, section in values.items():
+        section = dict((key, value)
+                       for key, value in section.items() if value)
+        if section:
+            pruned[item_type] = section
+    return pruned
 
 
 def stats(selected_vehicle=None):

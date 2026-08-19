@@ -173,6 +173,27 @@ def _view_range(descriptor, still_seconds=0.0):
                 still_seconds, profile['binocular_delay'])))
 
 
+def _vision_range_pair(descriptor):
+    """Bot view range while moving, once its stereoscope arms, and the delay.
+
+    The delay is ``None`` when the bot carries no stationary vision device, so
+    the caller never pays for a stillness lookup it cannot use.
+    """
+    profile = _bot_profile(descriptor)
+    moving = _view_range(descriptor)
+    if not profile['has_binoculars']:
+        return moving, moving, None
+    turret = _value(descriptor, 'turret', {}) or {}
+    misc = _value(descriptor, 'miscAttrs', {}) or {}
+    still = spotting.effective_view_range(
+        _value(turret, 'circularVisionRadius', 330.0),
+        misc_factor=_value(misc, 'circularVisionRadiusFactor', 1.0),
+        crew_factor=profile['vision_factor'],
+        binocular_factor=profile['binocular_factor'],
+        binocular_active=True)
+    return moving, still, profile['binocular_delay']
+
+
 def _base_invisibility(descriptor, profile=None):
     if profile is None:
         profile = _bot_profile(descriptor)
@@ -1016,6 +1037,8 @@ class BotRuntime(object):
         self._shot_los_deadlines = {}
         self._physics_params = {}
         self._repair_factors = {}
+        self._vision_ranges = {}
+        self._source_still = {}
         self._player_vehicle_profiles = {}
         self._player_collision_profiles = {}
         self._spotting_profiles = {}
@@ -1339,6 +1362,8 @@ class BotRuntime(object):
             self._shot_los_deadlines = {}
             self._physics_params = {}
             self._repair_factors = {}
+            self._vision_ranges = {}
+            self._source_still = {}
             self._player_vehicle_profiles = {}
             self._player_collision_profiles = {}
             self._spotting_profiles = {}
@@ -1464,7 +1489,7 @@ class BotRuntime(object):
                 'speed': _number(raw.get('speed')),
                 'movement_dir': 0, 'rotation_dir': 0,
                 'move_speed': _forward_speed(descriptor),
-                'view_range': _view_range(descriptor),
+                'view_range': self._cache_vision_range(bot_id, descriptor),
                 'half_length': half_length, 'half_width': half_width,
                 'collision_shape': _collision_shape(descriptor),
                 'mass': self._physics_params[bot_id]['mass'],
@@ -2063,6 +2088,40 @@ class BotRuntime(object):
             self._repair_factors[bot_id] = cached
         return cached
 
+    def _cache_vision_range(self, bot_id, descriptor):
+        """Record this bot's moving and armed view ranges, return the moving one."""
+        moving, still, delay = _vision_range_pair(descriptor)
+        self._vision_ranges[int(bot_id)] = (moving, still, delay)
+        return moving
+
+    def _source_view_range(self, source, now):
+        """A bot earns its own stereoscope after it stands still, like the player."""
+        bot_id = int(source.get('id', 0))
+        cached = self._vision_ranges.get(bot_id)
+        if cached is None:
+            return _number(source.get('view_range'), 330.0)
+        moving, still, delay = cached
+        if delay is None:
+            return moving
+        since = self._source_still.get(bot_id)
+        if since is None:
+            return moving
+        return still if loadout.still_device_active(
+            _number(now) - since, delay) else moving
+
+    def _note_source_stillness(self, state, now):
+        """Stamp when this bot stopped, so its own stereoscope can arm.
+
+        Every alive bot is sampled once per tick here rather than per observed
+        pair, so the stamp cannot go stale between two cache misses.
+        """
+        bot_id = int(state.get('id', 0))
+        if abs(_number(state.get('speed'))) > spotting.MOVING_SPEED_EPSILON:
+            self._source_still.pop(bot_id, None)
+        elif bot_id not in self._source_still:
+            self._source_still[bot_id] = _number(now)
+        return True
+
     def _target_still_seconds(self, key, moving, now):
         """Seconds this target has stood still, for its stationary devices."""
         if moving:
@@ -2109,7 +2168,7 @@ class BotRuntime(object):
             return cached[1]
         distance = _distance(_position(source), target.get('position') or
                              _position(target))
-        view_range = _number(source.get('view_range'), 330.0)
+        view_range = self._source_view_range(source, now)
         if distance <= spotting.PROXIMITY_SPOT_DISTANCE:
             value = True
         elif distance > spotting.MAX_SPOT_DISTANCE:
@@ -3971,6 +4030,7 @@ class BotRuntime(object):
         for state in self.states.values():
             if not state['alive']:
                 continue
+            self._note_source_stillness(state, now)
             # Distance-tiered INTEGRATION, not just probe throttling: a far
             # bot advances at a lower rate with the whole accumulated step, so
             # the per-frame Python cost scales with nearby bots rather than

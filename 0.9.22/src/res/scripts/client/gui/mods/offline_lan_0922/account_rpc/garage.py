@@ -86,6 +86,7 @@ class GarageState(object):
         self._vehicles = vehicles_module
         self._tankmen = tankmen_module
         self._touched = set()
+        self._touched_items = {}
         self.revision = 0
 
     def snapshot(self):
@@ -123,6 +124,12 @@ class GarageState(object):
         self._touched = set()
         return touched
 
+    def touched_items(self):
+        """Return the owned items mutated since the last call, then reset."""
+        touched = self._touched_items
+        self._touched_items = {}
+        return touched
+
     def _tankman_record(self, tankman_inventory_id):
         wanted = _int(tankman_inventory_id)
         for record in self._records():
@@ -151,6 +158,7 @@ class GarageState(object):
         published = self._snapshot.setdefault('inventoryItems', {})
         owned = published.setdefault(int(item_type), {})
         owned[compact_descr] = max(int(count), int(owned.get(compact_descr, 0)))
+        self._touched_items.setdefault(int(item_type), set()).add(compact_descr)
 
     # ---- ammunition -----------------------------------------------------
 

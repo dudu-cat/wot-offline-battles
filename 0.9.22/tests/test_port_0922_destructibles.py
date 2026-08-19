@@ -1892,6 +1892,9 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 hitTester=types.SimpleNamespace(bbox=(
                     (-1.6, -1.0, -3.6), (1.6, 1.0, 3.6), None))))
         destructibles_sensor.xrange = range
+        # The per-slot record is only retained for a diagnostics build.
+        destructibles_sensor.set_diagnostics(True)
+        self.addCleanup(destructibles_sensor.set_diagnostics, False)
 
         with mock.patch.dict(
                 sys.modules, {'AreaDestructibles': area,

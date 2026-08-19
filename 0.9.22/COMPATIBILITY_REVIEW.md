@@ -1059,29 +1059,42 @@ fallback in `loadout.py` applies #1513's own curve,
 that a crew skill, an optional device or a consumable can move, plus the
 factors that never reach the panel but do reach the battle.
 
-| Parameter | Garage source | Battle source | Same source | Status |
-|---|---|---|---|---|
-| view range `circularVisionRadius` | `utils.getCircularVisionRadius` = `turret.circularVisionRadius * miscAttrs['circularVisionRadiusFactor'] * factors['circularVisionRadius']` | `battle_runtime._vision_radius` -> `spotting.effective_view_range` with `profile['vision_factor']` = the same factor entry | yes | done |
-| stereoscope | `Stereoscope.updateVehicleAttrFactors` assigns `factors['circularVisionRadius'] = 1.25 / miscAttrs[...]` in both aspects, so the panel shows it always | the same value, divided back out of the base factor and reapplied after `activateWhenStillSec` | yes | done, deliberately gated |
-| concealment still / moving | `params.__getInvisibilityValues` -> `utils.getClientInvisibility` -> `computeBaseInvisibility(factors['camouflage'], camoId)` then `(base + factors['invisibility'][0]) * factors['invisibility'][1]` | `battle_runtime._base_invisibility` + `spotting.effective_camouflage` with the same two factor entries and the same aspect split | yes | done |
-| concealment after firing | `invisibilityFactorAtShot` from `gun` | `_shot_invisibility_factor` reads the same field | yes | done |
-| camouflage net | `CamouflageNet` adds `invisibilityDeltas['camouflageNetBonus']` to the `WHEN_STILL` aspect only | the same aspect, gated on `activateWhenStillSec` | yes | done, deliberately gated |
-| garage paint | `getClientInvisibility` passes `vehicle.getBonusCamo().id` into `computeBaseInvisibility` | the id captured in the garage snapshot, passed into the same call | yes | done |
-| reload `gun/reloadTime` | `utils.getReloadTime` = `gun.reloadTime * miscAttrs['gunReloadTimeFactor'] * factors['gun/reloadTime']` | `GunState.reload` multiplies by `loadout['reload_factor']`, which is that product | yes | done |
-| aim time `gun/aimingTime` | `utils.getGunAimingTime` | `GunState.aim_time` multiplies by `loadout['aim_time_factor']` | yes | done |
-| shot dispersion | `utils.getClientShotDispersion(descr, factors['shotDispersion'][0])` | `GunState.base_dispersion` multiplies by `loadout['dispersion_factor']` = the same entry | yes | done |
-| turret traverse | `utils.getTurretRotationSpeed` = `turret.rotationSpeed * factors['turret/rotationSpeed']` | `_publish_targeting_info` sends `turret.rotationSpeed * loadout['crew_factor']` | yes | done |
-| gun traverse | `utils.getGunRotationSpeed` (panel uses it only on a turretless hull) | `_publish_targeting_info` sends `gun.rotationSpeed * loadout['gun_rotation_factor']` | yes | done |
-| hull traverse `vehicle/rotationSpeed` | `utils.getChassisRotationSpeed` = `chassis.rotationSpeed * factors['vehicle/rotationSpeed']`, then divided by the average terrain resistance | `vehicle_physics.derive_params` multiplies `rotSpd` by the same entry; the panel's division by resistance is presentation | yes | done |
-| terrain resistance | `params.__getTerrainResistanceFactors` = `factors['chassis/terrainResistance'] * physics['rollingFrictionFactors']` | `derive_params` multiplies `terrainResist` by exactly that product | yes | done |
-| engine power | `params.enginePower` = `physics['enginePower'] * factors['engine/power']` | `derive_params` multiplies `powerW` by the same entry | yes | done |
-| radio range | `utils.getRadioDistance` = `radio.distance * factors['radio/distance']` | the battle has no distance gate at all; the effective value is printed at battle start | no consumer | not done, see below |
-| repair speed | not a `VehicleParams` property in #1513, and no client code reads `factors['repairSpeed']` or `miscAttrs['repairSpeedFactor']`; the cell owns the formula | `critical_damage.tick_repair` takes `loadout['repair_factor']` = `factors['repairSpeed']`, the toolbox factor, and the large repair kit | same inputs, our own formula | done |
-| dispersion factors: movement, hull traverse, turret traverse, after shot | not a `VehicleParams` property; the panel shows only the aimed angle | `GunState.tick` reads `chassis.shotDispersionFactors` and `gun.shotDispersionFactors` from the descriptor | descriptor, both sides | done |
-| Snap Shot, Smooth Ride | no `_skillProcessors` entry in this build's `VehicleDescrCrew`, and no client writer for `chassis/shotDispersionFactors`; the cell owns them | `loadout.py` keeps the 0.8.2 constants 0.925 and 0.96 | no | cannot be proved from #1513 |
-| a bot's own stereoscope | the panel is about the player's vehicle only | `bot_runtime._view_range` is evaluated once at registration with zero stationary seconds, so a bot never earns its own stationary bonus. A bot's TARGET is gated correctly, because `_target_still_seconds` tracks it | not applicable | not done: the bot's own stationary timer would have to enter the bot state, which is a wire schema change |
-| crew level from ventilation | `StaticAdditiveDevice.updateVehicleDescrAttrs` adds 5 to `miscAttrs['crewLevelIncrease']`; `TankmanDescr.efficiencyOnVehicle` returns it as the per-crewman addition | inside `attribute_factors`, so it moves every factor above at once | yes | done |
-| crew level from food and Brothers in Arms | `utils._sumCrewLevelIncrease(eqs)` -> `factors['crewLevelIncrease']`; `skillsConfig.getSkill('brotherhood').crewLevelIncrease` when every slot has the skill | the same chain | yes | done |
+| Parameter | Garage source | Battle source | Same source | Status | What is missing |
+|---|---|---|---|---|---|
+| view range `circularVisionRadius` | `utils.getCircularVisionRadius` = `turret.circularVisionRadius * miscAttrs['circularVisionRadiusFactor'] * factors['circularVisionRadius']` | `battle_runtime._vision_radius` -> `spotting.effective_view_range` with `profile['vision_factor']` = the same factor entry | yes | done | nothing |
+| stereoscope | `Stereoscope.updateVehicleAttrFactors` assigns `factors['circularVisionRadius'] = 1.25 / miscAttrs[...]` in both aspects, so the panel shows it always | the same value, divided back out of the base factor and reapplied after `activateWhenStillSec` | yes | done, deliberately gated | nothing |
+| concealment still / moving | `params.__getInvisibilityValues` -> `utils.getClientInvisibility` -> `computeBaseInvisibility(factors['camouflage'], camoId)` then `(base + factors['invisibility'][0]) * factors['invisibility'][1]` | `battle_runtime._base_invisibility` + `spotting.effective_camouflage` with the same two factor entries and the same aspect split | yes | done | nothing |
+| concealment after firing | `invisibilityFactorAtShot` from `gun` | `_shot_invisibility_factor` reads the same field | yes | done | nothing |
+| camouflage net | `CamouflageNet` adds `invisibilityDeltas['camouflageNetBonus']` to the `WHEN_STILL` aspect only | the same aspect, gated on `activateWhenStillSec` | yes | done, deliberately gated | nothing |
+| garage paint | `getClientInvisibility` passes `vehicle.getBonusCamo().id` into `computeBaseInvisibility` | the id captured in the garage snapshot, passed into the same call | yes | done | nothing |
+| reload `gun/reloadTime` | `utils.getReloadTime` = `gun.reloadTime * miscAttrs['gunReloadTimeFactor'] * factors['gun/reloadTime']` | `GunState.reload` multiplies by `loadout['reload_factor']`, which is that product | yes | done | nothing |
+| aim time `gun/aimingTime` | `utils.getGunAimingTime` | `GunState.aim_time` multiplies by `loadout['aim_time_factor']` | yes | done | nothing |
+| shot dispersion | `utils.getClientShotDispersion(descr, factors['shotDispersion'][0])` | `GunState.base_dispersion` multiplies by `loadout['dispersion_factor']` = the same entry | yes | done | nothing |
+| turret traverse | `utils.getTurretRotationSpeed` = `turret.rotationSpeed * factors['turret/rotationSpeed']` | `_publish_targeting_info` sends `turret.rotationSpeed * loadout['crew_factor']` | yes | done | nothing |
+| gun traverse | `utils.getGunRotationSpeed` (panel uses it only on a turretless hull) | `_publish_targeting_info` sends `gun.rotationSpeed * loadout['gun_rotation_factor']` | yes | done | nothing |
+| hull traverse `vehicle/rotationSpeed` | `utils.getChassisRotationSpeed` = `chassis.rotationSpeed * factors['vehicle/rotationSpeed']`, then divided by the average terrain resistance | `vehicle_physics.derive_params` multiplies `rotSpd` by the same entry; the panel's division by resistance is presentation | yes | done | nothing |
+| terrain resistance | `params.__getTerrainResistanceFactors` = `factors['chassis/terrainResistance'] * physics['rollingFrictionFactors']` | `derive_params` multiplies `terrainResist` by exactly that product | yes | done | nothing |
+| engine power | `params.enginePower` = `physics['enginePower'] * factors['engine/power']` | `derive_params` multiplies `powerW` by the same entry | yes | done | nothing |
+| radio range | `utils.getRadioDistance` = `radio.distance * factors['radio/distance']` | the battle has no distance gate at all; the effective value is printed at battle start | matches the client | done, see below | nothing on the client; #1513 has no battle reader for it |
+| repair speed | not a `VehicleParams` property in #1513, and no client code reads `factors['repairSpeed']` or `miscAttrs['repairSpeedFactor']`; the cell owns the formula | `critical_damage.tick_repair` takes `loadout['repair_factor']` = `factors['repairSpeed']`, the toolbox factor, and the large repair kit | same inputs, our own formula | done | nothing the client can supply; #1513 has no client formula |
+| dispersion factors: movement, hull traverse, turret traverse, after shot | not a `VehicleParams` property; the panel shows only the aimed angle | `GunState.tick` reads `chassis.shotDispersionFactors` and `gun.shotDispersionFactors` from the descriptor | descriptor, both sides | done | nothing |
+| Snap Shot, Smooth Ride | no `_skillProcessors` entry in this build's `VehicleDescrCrew`, and no client writer for `chassis/shotDispersionFactors`; the cell owns them | `loadout.py` keeps the 0.8.2 constants 0.925 and 0.96 | no | cannot be proved from #1513 | a #1513 writer for `chassis/shotDispersionFactors`; this build has none, so the two constants stay |
+| a bot's own stereoscope | the panel is about the player's vehicle only | `_vision_range_pair` stores the moving and armed ranges per bot, `_note_source_stillness` stamps when the bot stops, and `_source_view_range` picks between them on the same `activateWhenStillSec` the player uses | not applicable | done | nothing |
+| crew level from ventilation | `StaticAdditiveDevice.updateVehicleDescrAttrs` adds 5 to `miscAttrs['crewLevelIncrease']`; `TankmanDescr.efficiencyOnVehicle` returns it as the per-crewman addition | inside `attribute_factors`, so it moves every factor above at once | yes | done | nothing |
+| crew level from food and Brothers in Arms | `utils._sumCrewLevelIncrease(eqs)` -> `factors['crewLevelIncrease']`; `skillsConfig.getSkill('brotherhood').crewLevelIncrease` when every slot has the skill | the same chain | yes | done | nothing |
+
+Ventilation does not move the concealment number, in the panel or in the
+battle, and that is #1513's own law rather than a gap. Ventilation is a
+`StaticAdditiveDevice` writing `miscAttrs['crewLevelIncrease'] = 5`, which
+`TankmanDescr.efficiencyOnVehicle` returns as the per-crewman addition, so it
+raises the level of skills a crewman already has. Concealment reads
+`factors['camouflage']`, which `VehicleDescrCrew.onCollectFactors` fills from
+`_camouflageFactor`; `_calculateSkillEfficiencies` sets that skill's efficiency
+to `0.0` when the crew has no `camouflage` skill, and `_processSkills` turns
+that into the constant `0.57`. A crew without the camouflage skill therefore
+keeps the same concealment at any crew level. Ventilation does move view range
+by about 2.15% and reload, aim time, traverse and radio distance by about
+2.27%, and those are the values to compare against the panel.
 
 Two consequences are deliberate and must not be "fixed" into agreement:
 
@@ -1090,10 +1103,18 @@ Two consequences are deliberate and must not be "fixed" into agreement:
 - the panel divides `chassisRotationSpeed` by the average terrain resistance
   to present one mobility number. The physics keeps the two separate.
 
-Radio range has no battle consumer because this port has no distance-limited
-spotting relay: the server owns visibility for every vehicle in the room, so
-there is nothing for a radio range to gate. The effective distance is printed
-at battle start so the value can still be compared with the panel.
+Radio range has no battle consumer because #1513 itself has none. A search of
+every `scripts.pkg` member for `radioDistance` returns eleven modules, and all
+of them are lobby presentation or item definitions: `params.pyc`,
+`params_helper.pyc`, `formatters.pyc`, `fitting_select_popover.pyc`,
+`tooltips/module.pyc`, three `locale` tables, `skills_components.pyc` and
+`skills_readers.pyc` for the radio operator skill, and `vehicles.pyc` for the
+descriptor field. `Avatar.pyc`, `Vehicle.pyc` and the arena and vision modules
+never read it. So the exact client does not gate spotting, relay or anything
+else on radio distance, and a distance gate in this port would diverge from the
+build it targets rather than match it. The effective distance is printed at
+battle start so the value can still be compared with the panel. What WG's own
+server did with the value cannot be proved from a client, and is not claimed.
 
 The `PARAMS` lines printed once per battle start carry the effective view
 range, both concealment values, the after-shot factor, reload, aim time,

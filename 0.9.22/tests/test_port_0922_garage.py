@@ -702,3 +702,40 @@ class NarrowInventoryDiffTests(unittest.TestCase):
         self.assertEqual(set([9]), state.touched_vehicles())
         # Reading the set clears it, so the next fitting starts clean.
         self.assertEqual(set(), state.touched_vehicles())
+
+    def test_a_mutation_records_the_owned_items_it_touched(self):
+        state = self.garage.GarageState(
+            SNAPSHOT, vehicles_module=self.vehicles,
+            tankmen_module=self.tankmen)
+        state.touched_items()
+
+        state.equip_equipments(9, [11001, 0, 0])
+
+        self.assertEqual({11: set([11001])}, state.touched_items())
+        self.assertEqual({}, state.touched_items())
+
+    def test_an_untouched_item_type_is_left_out_of_the_delta(self):
+        delta = self.data.inventory(
+            SNAPSHOT, only_vehicles=set([9]), only_items={11: set([11001])})
+
+        self.assertEqual(set([11001]), set(delta['inventory'][11]))
+        # ItemsRequester.invalidateCache evicts one GUI item per published
+        # descriptor, so an unchanged type must not appear at all.
+        self.assertNotIn(10, delta['inventory'])
+        self.assertNotIn(9, delta['inventory'])
+
+    def test_an_empty_item_delta_still_publishes_the_vehicle_row(self):
+        delta = self.data.inventory(
+            SNAPSHOT, only_vehicles=set([9]), only_items={})
+
+        vehicle_type = self.data.VEHICLE_ITEM_TYPE
+        self.assertEqual(
+            set([9]), set(delta['inventory'][vehicle_type]['compDescr']))
+        self.assertEqual([vehicle_type, self.data.TANKMAN_ITEM_TYPE],
+                         sorted(delta['inventory']))
+
+    def test_a_full_sync_still_carries_every_item_type(self):
+        full = self.data.inventory(SNAPSHOT)
+
+        self.assertEqual(set(self.data.ITEM_TYPE_INDICES),
+                         set(full['inventory']))
