@@ -53,6 +53,11 @@ RPM_PRESENTATION_SECONDS = 0.10
 SPOTTING_UPDATE_SECONDS = 0.10
 SPOTTING_PROBE_SECONDS = 0.50
 SPOTTING_PHASE_BUCKETS = 5
+# AvatarInputHandler._Targeting gives the native BigWorld.target these
+# exact values, and nothing on that path tests the gun or a clear line.
+TARGET_SELECTION_FOV_DEGREES = 1.0
+TARGET_DESELECTION_FOV_DEGREES = 80.0
+TARGET_MAX_DISTANCE = 710.0
 # Bot tree/column enumeration is a proximity sensor, not presentation work.
 # The sensor looks 6 m ahead plus the admitted hull extent, while copied bot
 # speed is capped at 35 m/s.  Recheck within 0.10 s or 3 m of realised travel,
@@ -1018,6 +1023,9 @@ class BattleRuntime(object):
         self._drown_started = None
         self._outlined_engine_id = None
         self._next_outline_time = 0.0
+        self._mouse_target_matrix = None
+        self._outline_report = None
+        self._next_outline_report = 0.0
         self._next_spotting_time = 0.0
         self._foliage = None
         self._projectiles = None
@@ -7256,52 +7264,111 @@ class BattleRuntime(object):
             self._native_dispersion_angle())
         return True
 
+    def _mouse_targeting_ray(self):
+        """Copy the ray #1513 gives to ``BigWorld.target.source``.
+
+        ``AvatarInputHandler._Targeting`` builds the native target from the
+        mouse matrix, so the cursor selects the outlined vehicle in every
+        control mode.  ``bwdeprecations`` renamed the factory, and only the
+        current name is a native symbol of ``WorldOfTanks.exe``.
+        """
+        provider = self._mouse_target_matrix
+        if provider is None:
+            factory = getattr(
+                self._runtime.bigworld, 'MouseTargetingMatrix',
+                getattr(
+                    self._runtime.bigworld, 'MouseTargettingMatrix', None))
+            if not callable(factory):
+                raise RuntimeError(
+                    '#1513 mouse targeting matrix is unavailable')
+            provider = factory()
+            self._mouse_target_matrix = provider
+        matrix = self._runtime.math.Matrix(provider)
+        start = self._vector(_xyz(matrix.applyToOrigin()))
+        direction = self._vector(_xyz(matrix.applyToAxis(2)))
+        direction.normalise()
+        if direction.length <= 0.0:
+            raise RuntimeError('#1513 mouse targeting ray is empty')
+        return start, direction
+
     def _update_target_outline(self, now):
+        """Outline the vehicle under the cursor the way #1513 does.
+
+        Retail reaches ``Vehicle.drawEdge`` from ``PlayerAvatar.targetFocus``,
+        which the engine raises for the entity its own cursor-driven targeting
+        selects.  A blocked gun line and blocking scenery are not conditions
+        anywhere on that path.
+        """
         if now < self._next_outline_time:
             return
         self._next_outline_time = now + 0.125
         if self._remote_factory is None:
             self._clear_target_outline()
             return
-        if not any(
-                record.get('ready') and not record.get('local') and
-                not record.get('tombstone')
-                for record in self._records.values()):
-            self._clear_target_outline()
-            return
-        start, direction = self._mutable_shot_ray()
-        end = start + direction.scale(5000.0)
-        world_distance = 5000.0
-        collision = self._runtime.bigworld.wg_collideSegment(
-            self._avatar.spaceID, start, end, 128)
-        if collision is not None:
-            world_distance = (collision[0] - start).length
-        nearest_id = None
-        nearest_distance = 5000.0
+        start, direction = self._mouse_targeting_ray()
+        end = start + direction.scale(TARGET_MAX_DISTANCE)
+        selection_cos = math.cos(
+            math.radians(TARGET_SELECTION_FOV_DEGREES * 0.5))
+        deselection_cos = math.cos(
+            math.radians(TARGET_DESELECTION_FOV_DEGREES * 0.5))
+        chosen = None
+        chosen_rank = None
+        keep_current = False
+        miss = None
+        decline = None
         for record in self._records.values():
-            if (record.get('local') or not record.get('ready') or
-                    record.get('tombstone') or
-                    not record.get('spot_visible', True)):
+            if record.get('local'):
                 continue
-            vehicle = self._server_entity(record['engine_id'])
-            if (vehicle is None or not vehicle.isAlive() or
-                    vehicle.bw_entity is None):
+            engine_id = record.get('engine_id')
+            if not record.get('ready') or record.get('tombstone'):
+                decline = decline or (engine_id, 'is not ready')
                 continue
-            collisions = vehicle.collideSegmentExt(start, end)
-            if not collisions:
+            if not record.get('spot_visible', True):
+                decline = decline or (engine_id, 'is not spotted')
                 continue
-            distance = min(float(item.dist) for item in collisions)
-            if distance < nearest_distance:
-                nearest_id = record['engine_id']
-                nearest_distance = distance
-        if nearest_id is None or nearest_distance > world_distance + 0.5:
-            nearest_id = None
-        if nearest_id == self._outlined_engine_id:
+            vehicle = self._server_entity(engine_id)
+            if vehicle is None or getattr(vehicle, 'bw_entity', None) is None:
+                decline = decline or (engine_id, 'has no visual entity')
+                continue
+            if not vehicle.isAlive():
+                decline = decline or (engine_id, 'is destroyed')
+                continue
+            offset = self._vector(_xyz(vehicle.position)) - start
+            distance = offset.length
+            if distance > TARGET_MAX_DISTANCE:
+                decline = decline or (
+                    engine_id, 'is past %.0f m' % TARGET_MAX_DISTANCE)
+                continue
+            cosine = 1.0
+            if distance > 0.0:
+                cosine = min(1.0, max(-1.0, (
+                    offset.x * direction.x + offset.y * direction.y +
+                    offset.z * direction.z) / distance))
+            if vehicle.collideSegmentExt(start, end):
+                rank = (0, distance)
+            elif cosine >= selection_cos:
+                rank = (1, -cosine)
+            else:
+                if (self._outlined_engine_id is not None and
+                        engine_id == self._outlined_engine_id and
+                        cosine >= deselection_cos):
+                    keep_current = True
+                angle = math.degrees(math.acos(cosine))
+                if miss is None or angle < miss[0]:
+                    miss = (angle, engine_id, distance)
+                continue
+            if chosen_rank is None or rank < chosen_rank:
+                chosen_rank = rank
+                chosen = engine_id
+        if chosen is None and keep_current:
+            chosen = self._outlined_engine_id
+        self._report_target_outline(now, chosen, miss, decline)
+        if chosen == self._outlined_engine_id:
             return
         self._clear_target_outline()
-        if nearest_id is None:
+        if chosen is None:
             return
-        vehicle = self._remote_factory.get(nearest_id)
+        vehicle = self._remote_factory.get(chosen)
         if vehicle is None or vehicle.bw_entity is None:
             raise RuntimeError('outlined remote vehicle has no visual entity')
         color = 2 if int(vehicle.team) == int(self.client.team) else 1
@@ -7316,7 +7383,25 @@ class BattleRuntime(object):
             raise RuntimeError(
                 '#1513 target-lock candidate boundary is unavailable')
         set_candidate(vehicle)
-        self._outlined_engine_id = nearest_id
+        self._outlined_engine_id = chosen
+
+    def _report_target_outline(self, now, chosen, miss, decline):
+        """Print each new outline decision, at most once a second."""
+        if chosen is not None:
+            message = 'outlined id=%s' % chosen
+        elif miss is not None:
+            message = (
+                'none: id=%s is %.1f deg off the cursor at %.0f m'
+                % (miss[1], miss[0], miss[2]))
+        elif decline is not None:
+            message = 'none: id=%s %s' % decline
+        else:
+            message = 'none: no remote vehicle to consider'
+        if message == self._outline_report or now < self._next_outline_report:
+            return
+        self._outline_report = message
+        self._next_outline_report = now + 1.0
+        sys.stdout.write('[Offline LAN 0.9.22] TARGET %s\n' % message)
 
     def _clear_target_outline(self):
         if self._outlined_engine_id is None:
@@ -10238,6 +10323,8 @@ class BattleRuntime(object):
                     cleanup_error = error
         self._map_create_attempted = False
         self._lobby_retire_started = False
+        self._mouse_target_matrix = None
+        self._outline_report = None
         self._avatar = None
         self._binding = None
         self._server = None

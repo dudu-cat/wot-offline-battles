@@ -98,6 +98,15 @@ class _Matrix(object):
         self.roll = getattr(other, 'roll', 0.0)
         self.translation = _Vector(getattr(
             other, 'translation', _Vector()))
+        self.axis = _Vector(getattr(other, 'axis', _Vector(0.0, 0.0, 1.0)))
+
+    def applyToOrigin(self):
+        return _Vector(self.translation)
+
+    def applyToAxis(self, index):
+        if index != 2:
+            raise NotImplementedError('only the forward axis is modelled')
+        return _Vector(self.axis)
 
     def setIdentity(self):
         self.yaw = self.pitch = self.roll = 0.0
@@ -1146,6 +1155,8 @@ class _BigWorld(object):
         self.created_offline_entities = []
         self.edge_adds = []
         self.edge_removes = []
+        self.mouse_target = types.SimpleNamespace(
+            translation=_Vector(), axis=_Vector(0.0, 0.0, 1.0))
         self.space_visibility_masks = {7: 0xffffffff}
         self.reset_visibility_before_ready = False
 
@@ -1271,6 +1282,9 @@ class _BigWorld(object):
         if start.y > end.y and abs(start.x - end.x) < 0.001 and abs(start.z - end.z) < 0.001:
             return (_Vector(start.x, 0.0, start.z),)
         return None
+
+    def MouseTargetingMatrix(self):
+        return self.mouse_target
 
     def wgAddEdgeDetectEntity(self, entity, color, group, behind):
         self.edge_adds.append((entity, color, group, behind))
@@ -2119,6 +2133,117 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
             runtime.bigworld.edge_adds)
         battle._clear_target_outline()
         self.assertEqual([vehicle.bw_entity], runtime.bigworld.edge_removes)
+        factory.destroy_all()
+
+    def test_a_blocked_gun_line_still_outlines_the_aimed_at_enemy(self):
+        """#1513 picks the outline from the cursor ray alone.  Neither the gun
+        line nor blocking scenery gates PlayerAvatar.targetFocus."""
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Churchill'},
+            'health': 539, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(0.0, 0.0, 300.0),
+            (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        vehicle.collideSegmentExt = lambda start, end: (
+            types.SimpleNamespace(dist=300.0),)
+
+        def refuse_gun_ray():
+            raise AssertionError('the outline must not read the gun ray')
+
+        runtime.bigworld.avatar.gunRotator.getCurShotPosition = refuse_gun_ray
+        runtime.bigworld.wg_collideSegment = (
+            lambda space, start, end, mask: (_Vector(0.0, 0.0, 5.0),))
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._remote_factory = factory
+        battle._records = {
+            'bot:11': {'engine_id': vehicle_id, 'local': False,
+                       'ready': True, 'spot_visible': True}}
+
+        battle._update_target_outline(1.0)
+
+        self.assertEqual([(vehicle.bw_entity, 1, 0, False)],
+                         runtime.bigworld.edge_adds)
+        self.assertEqual(vehicle_id, battle._outlined_engine_id)
+        factory.destroy_all()
+
+    def test_a_new_target_removes_the_previous_outline_before_adding(self):
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        first_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'First'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(0.0, 0.0, 100.0),
+            (0.0, 0.0, 0.0))
+        second_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Second'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(60.0, 0.0, 100.0),
+            (0.0, 0.0, 0.0))
+        first = factory.get(first_id)
+        second = factory.get(second_id)
+        aimed = [first_id]
+        for vehicle_id, vehicle in ((first_id, first), (second_id, second)):
+            vehicle.collideSegmentExt = (
+                lambda start, end, key=vehicle_id: (
+                    (types.SimpleNamespace(dist=100.0),)
+                    if key == aimed[0] else ()))
+        events = []
+        runtime.bigworld.wgAddEdgeDetectEntity = (
+            lambda entity, color, group, behind: events.append(
+                ('add', entity, color)))
+        runtime.bigworld.wgDelEdgeDetectEntity = (
+            lambda entity: events.append(('del', entity)))
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._remote_factory = factory
+        battle._records = {
+            'bot:11': {'engine_id': first_id, 'local': False,
+                       'ready': True, 'spot_visible': True},
+            'bot:12': {'engine_id': second_id, 'local': False,
+                       'ready': True, 'spot_visible': True}}
+
+        battle._update_target_outline(1.0)
+        first_entity = first.bw_entity
+        aimed[0] = second_id
+        battle._update_target_outline(2.0)
+
+        self.assertEqual(
+            [('add', first_entity, 1), ('del', first_entity),
+             ('add', second.bw_entity, 1)], events)
+        self.assertEqual(second_id, battle._outlined_engine_id)
+        factory.destroy_all()
+
+    def test_the_outline_reports_why_it_declined_a_candidate(self):
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Churchill'},
+            'health': 539, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(300.0, 0.0, 300.0),
+            (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        vehicle.collideSegmentExt = lambda start, end: ()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._remote_factory = factory
+        battle._records = {
+            'bot:11': {'engine_id': vehicle_id, 'local': False,
+                       'ready': True, 'spot_visible': True}}
+
+        battle._update_target_outline(1.0)
+
+        self.assertEqual([], runtime.bigworld.edge_adds)
+        self.assertIn('45.0 deg off the cursor', battle._outline_report)
+        self.assertIn('424 m', battle._outline_report)
         factory.destroy_all()
 
     def test_a_killed_bot_drops_its_outline_before_the_wreck_swap(self):
