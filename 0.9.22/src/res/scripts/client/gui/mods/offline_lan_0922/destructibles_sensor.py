@@ -2659,3 +2659,24 @@ def registry_counts():
 		except TypeError:
 			counts[name[13:]] = 0
 	return counts
+
+
+def registry_sizes():
+	"""Approximate retained bytes per streamed registry, for the memory log."""
+	import sys
+	sizes = {}
+	for name in ('g_offh_destr_seen', 'g_offh_destr_instances',
+			'g_offh_destr_contact_bins', 'g_offh_destr_pending',
+			'g_offh_destr_falling_active', 'g_offh_destr_chunks'):
+		value = globals().get(name)
+		total = sys.getsizeof(value, 64) if value is not None else 0
+		try:
+			for item in value:
+				total += sys.getsizeof(item, 64)
+				child = value[item] if isinstance(value, dict) else None
+				if child is not None:
+					total += sys.getsizeof(child, 64)
+		except TypeError:
+			pass
+		sizes[name[13:]] = total
+	return sizes

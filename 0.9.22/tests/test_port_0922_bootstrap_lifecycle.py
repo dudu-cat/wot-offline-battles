@@ -12,6 +12,72 @@ BOOTSTRAP = (ROOT / '0.9.22' / 'src' / 'res' / 'scripts' /
              'bootstrap.py')
 
 
+MAX_SKILL_LEVEL = 100
+# The exact #1513 tankmen._makeLevelXpCosts, with _LEVELUP_K1/_LEVELUP_K2.
+SKILL_XP_COSTS = [0]
+for _level in range(1, MAX_SKILL_LEVEL + 1):
+    SKILL_XP_COSTS.append(SKILL_XP_COSTS[-1] + int(round(
+        50.0 * pow(100.0, float(_level - 1) / MAX_SKILL_LEVEL))))
+
+
+class _TankmanDescr(object):
+    """Reproduces the #1513 TankmanDescr skill/XP surface bootstrap uses."""
+
+    def __init__(self, compact_descr):
+        passport, _, tail = compact_descr.partition(b'|')
+        skills, _, free_xp = tail.partition(b'|')
+        nation_id, vehicle_type_id, role = passport.decode('ascii').split(':')
+        self.nationID = int(nation_id)
+        self.vehicleTypeID = int(vehicle_type_id)
+        self.role = role
+        self._passport = passport
+        self.skills = [name for name in skills.decode('ascii').split(',')
+                       if name]
+        self.freeSkillsNumber = 0
+        self.freeXP = int(free_xp or 0)
+
+    @property
+    def lastSkillNumber(self):
+        return len(self.skills)
+
+    @staticmethod
+    def levelUpXpCost(from_skill_level, skill_sequence_number):
+        return 2 ** skill_sequence_number * (
+            SKILL_XP_COSTS[from_skill_level + 1] -
+            SKILL_XP_COSTS[from_skill_level])
+
+    def makeCompactDescr(self):
+        return b'%s|%s|%d' % (self._passport,
+                              ','.join(self.skills).encode('ascii'),
+                              self.freeXP)
+
+
+def new_skill_count(descriptor, active_skills):
+    """The exact #1513 Tankman.newSkillCount loop, as a pure simulation."""
+    available = list(active_skills)
+    count = 0
+    last_skill_level = MAX_SKILL_LEVEL
+    free_xp = descriptor.freeXP
+    skills = list(descriptor.skills)
+    while last_skill_level == MAX_SKILL_LEVEL or not skills:
+        if not available:
+            break
+        name = available.pop()
+        if name in skills:
+            continue
+        skills.append(name)
+        count += 1
+        last_skill_level = 0
+        sequence = len(skills) - descriptor.freeSkillsNumber
+        while last_skill_level < MAX_SKILL_LEVEL:
+            cost = descriptor.levelUpXpCost(last_skill_level, sequence)
+            if cost > free_xp:
+                break
+            free_xp -= cost
+            last_skill_level += 1
+    return count
+
+
 class _Callbacks(object):
     def __init__(self):
         self.pending = []
@@ -192,17 +258,14 @@ class BootstrapLifecycleTests(unittest.TestCase):
             crew_skill_masks.append(skills_mask)
             if (nation_id, vehicle_type_id) == (1, 8):
                 raise ValueError('unloadable crew definition')
+            # Only the commander receives the offline Sixth Sense perk.
             return [
-                ('%d:%d:%s' % (nation_id, vehicle_type_id, role[0])).encode(
-                    'ascii')
+                ('%d:%d:%s|%s|0' % (
+                    nation_id, vehicle_type_id, role[0],
+                    'commander_sixthSense'
+                    if skills_mask and role[0] == 'commander' else '')).encode(
+                        'ascii')
                 for role in roles]
-
-        def tankman_descr(compact):
-            nation_id, vehicle_type_id, role = compact.decode('ascii').split(
-                ':')
-            return types.SimpleNamespace(
-                nationID=int(nation_id), vehicleTypeID=int(vehicle_type_id),
-                role=role)
 
         tankmen = types.SimpleNamespace(
             MAX_SKILL_LEVEL=100,
@@ -210,7 +273,7 @@ class BootstrapLifecycleTests(unittest.TestCase):
                 1 << 18 if tuple(skills) ==
                 ('commander_sixthSense',) else 0),
             generateTankmen=generate_tankmen,
-            TankmanDescr=tankman_descr,
+            TankmanDescr=_TankmanDescr,
             generatedSkillMasks=crew_skill_masks)
         items = types.ModuleType('items')
         items.EQUIPMENT_TYPES = types.SimpleNamespace(
@@ -226,8 +289,15 @@ class BootstrapLifecycleTests(unittest.TestCase):
         items.vehicles = vehicles
         nations = types.ModuleType('nations')
         nations.NAMES = tuple('nation-%d' % index for index in range(9))
+        # The exact #1513 scripts/common/AccountCommands.pyc values.
+        account_commands = types.ModuleType('AccountCommands')
+        account_commands.VEHICLE_SETTINGS_FLAG = types.SimpleNamespace(
+            NONE=0, XP_TO_TMAN=1, AUTO_REPAIR=2, AUTO_LOAD=4, AUTO_EQUIP=8,
+            GROUP_0=16, ORIGINAL_CREW=32, NO_BATTLE=64,
+            AUTO_EQUIP_BOOSTER=128, AUTO_RENT_CUSTOMIZATION=256)
 
         modules = {
+            'AccountCommands': account_commands,
             'BigWorld': bigworld,
             'gui': _package('gui'),
             'gui.mods': _package('gui.mods'),
@@ -253,6 +323,59 @@ class BootstrapLifecycleTests(unittest.TestCase):
         return (module, callbacks, compatibility, app_loader, spaces, events,
                 modules)
 
+    ACTIVE_SKILLS = ('repair', 'camouflage', 'brotherhood', 'firefighting',
+                     'commander_sixthSense', 'driver_virtuoso',
+                     'gunner_smoothTurret')
+
+    def test_a_fresh_garage_vehicle_starts_with_the_refill_switches_on(self):
+        (bootstrap, unused_callbacks, unused_compatibility,
+         unused_app_loader, unused_spaces, unused_events, modules) = self._load()
+
+        with mock.patch.dict(sys.modules, modules):
+            selected = bootstrap._selected_vehicle({'vehicle': 'ussr:R11_MS-1'})
+
+        # XP_TO_TMAN | AUTO_REPAIR | AUTO_LOAD | AUTO_EQUIP
+        self.assertEqual(15, selected['settings'])
+        for record in selected['vehicles']:
+            self.assertEqual(15, record['settings'])
+
+    def test_every_crewman_starts_with_three_skills_left_to_pick(self):
+        (bootstrap, unused_callbacks, unused_compatibility,
+         unused_app_loader, unused_spaces, unused_events, modules) = self._load()
+
+        with mock.patch.dict(sys.modules, modules):
+            selected = bootstrap._selected_vehicle({'vehicle': 'ussr:R11_MS-1'})
+
+        for record in selected['vehicles']:
+            for compact_descr in record['tankmen'].values():
+                descriptor = _TankmanDescr(compact_descr)
+                self.assertEqual(
+                    3, new_skill_count(descriptor, self.ACTIVE_SKILLS))
+
+    def test_no_crew_skill_is_chosen_for_the_player(self):
+        (bootstrap, unused_callbacks, unused_compatibility,
+         unused_app_loader, unused_spaces, unused_events, modules) = self._load()
+
+        with mock.patch.dict(sys.modules, modules):
+            selected = bootstrap._selected_vehicle({'vehicle': 'ussr:R11_MS-1'})
+
+        for record in selected['vehicles']:
+            for compact_descr in record['tankmen'].values():
+                skills = _TankmanDescr(compact_descr).skills
+                self.assertIn(skills, ([], ['commander_sixthSense']))
+
+    def test_the_ammunition_layout_mirrors_the_loaded_shells(self):
+        (bootstrap, unused_callbacks, unused_compatibility,
+         unused_app_loader, unused_spaces, unused_events, modules) = self._load()
+
+        with mock.patch.dict(sys.modules, modules):
+            selected = bootstrap._selected_vehicle({'vehicle': 'ussr:R11_MS-1'})
+
+        # Vehicle.isAutoLoadFull compares every loaded count with this layout.
+        for record in selected['vehicles']:
+            key = record['shellsLayoutIdx']
+            self.assertEqual({key: record['shells']}, record['shellsLayout'])
+
     def test_selected_vehicle_snapshot_is_relationally_complete(self):
         (bootstrap, unused_callbacks, unused_compatibility,
          unused_app_loader, unused_spaces, unused_events, modules) = self._load()
@@ -263,8 +386,9 @@ class BootstrapLifecycleTests(unittest.TestCase):
 
         self.assertEqual([100001, 100002], selected['crew'])
         self.assertEqual(
-            {100001: b'0:11:commander', 100002: b'0:11:driver'},
-            selected['tankmen'])
+            [b'0:11:commander|commander_sixthSense|1260360',
+             b'0:11:driver||630180'],
+            [selected['tankmen'][100001], selected['tankmen'][100002]])
         self.assertEqual((0, 111), selected['repair'])
         self.assertEqual((0, 0), selected['lock'])
         self.assertEqual([0, 0, 0], selected['eqs'])

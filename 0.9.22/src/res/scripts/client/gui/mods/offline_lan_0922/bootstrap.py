@@ -24,7 +24,50 @@ _lobby_listener_installed = False
 
 # Enough of every artefact that the garage never blocks a mount on stock.
 OFFLINE_ARTEFACT_STOCK = 200
+# Untrained skills offered per crewman before the player picks any.
+NEW_SKILL_SLOTS = 3
+_NEW_SKILL_XP = {}
 _store = None
+
+
+def _default_vehicle_settings():
+    """Return the VEHICLE_SETTINGS_FLAG mask a fresh garage vehicle starts with.
+
+    Auto-repair, both auto-resupply switches and accelerated crew training are
+    on, so the player never has to tick them.
+    """
+    from AccountCommands import VEHICLE_SETTINGS_FLAG
+    return (VEHICLE_SETTINGS_FLAG.XP_TO_TMAN |
+            VEHICLE_SETTINGS_FLAG.AUTO_REPAIR |
+            VEHICLE_SETTINGS_FLAG.AUTO_LOAD |
+            VEHICLE_SETTINGS_FLAG.AUTO_EQUIP)
+
+
+def _new_skill_xp(tankmen, descriptor, trained):
+    """Return the free XP that leaves NEW_SKILL_SLOTS skills to pick.
+
+    #1513's ``Tankman.newSkillCount`` offers one more skill for every skill the
+    stored free XP can train to ``tankmen.MAX_SKILL_LEVEL``, plus the one it
+    starts.  The cost depends only on how many skills the crewman already has.
+    """
+    if trained not in _NEW_SKILL_XP:
+        _NEW_SKILL_XP[trained] = sum(
+            descriptor.levelUpXpCost(level, trained + step)
+            for step in range(1, NEW_SKILL_SLOTS)
+            for level in range(tankmen.MAX_SKILL_LEVEL))
+    return _NEW_SKILL_XP[trained]
+
+
+def _with_new_skill_slots(tankmen, compact_descr):
+    """Return the tankman with NEW_SKILL_SLOTS skills left for the player.
+
+    No skill is chosen here; the player picks all of them.
+    """
+    descriptor = tankmen.TankmanDescr(compact_descr)
+    descriptor.freeXP = _new_skill_xp(
+        tankmen, descriptor,
+        descriptor.lastSkillNumber - descriptor.freeSkillsNumber)
+    return descriptor.makeCompactDescr()
 
 
 def _schedule(delay, function):
@@ -171,6 +214,7 @@ def _selected_vehicle(config):
         vehicle_type_compact_descrs = set()
         unlock_item_compact_descrs = set()
         next_tankman_id = 100001
+        default_settings = _default_vehicle_settings()
         for type_id in type_ids:
             try:
                 if type_id == selected_type_id:
@@ -205,7 +249,8 @@ def _selected_vehicle(config):
                             tankman_descr.role != roles[0]):
                         raise ValueError(
                             'generated tankman does not match vehicle crew slot')
-                    validated_tankmen.append(compact_descr)
+                    validated_tankmen.append(
+                        _with_new_skill_slots(tankmen, compact_descr))
 
                 components = (
                     ('vehicleChassis', descriptor.chassis),
@@ -241,6 +286,9 @@ def _selected_vehicle(config):
                 for index in range(0, len(shells), 2):
                     record_shell_items[shells[index]] = shells[index + 1]
 
+                # The exact key #1513 Vehicle.shellsLayoutIdx looks up.
+                layout_key = (descriptor.turret.compactDescr,
+                              descriptor.gun.compactDescr)
                 vehicle_compact_descr = descriptor.makeCompactDescr()
                 if not vehicle_compact_descr or descriptor.maxHealth <= 0:
                     raise ValueError('vehicle descriptor is not garage-ready')
@@ -288,7 +336,9 @@ def _selected_vehicle(config):
                 'repair': (0, descriptor.maxHealth),
                 'lock': (0, 0),
                 'shells': shells,
-                'shellsLayout': {},
+                'shellsLayout': {layout_key: list(shells)},
+                'shellsLayoutIdx': layout_key,
+                'settings': default_settings,
                 'eqs': [0, 0, 0],
                 'eqsLayout': [0, 0, 0],
                 'inventoryItems': record_inventory_items,

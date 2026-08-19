@@ -648,14 +648,13 @@ class LANSession(object):
 
     def _on_picker_closed(self):
         self._picker_open = False
+        # A close disarms the room: it took a host election after a refused
+        # start to raise it over the garage again.  Only the Battle button
+        # rearms it.
+        self._picker_requested = False
         if (not self._stopped and self.state == 'waiting' and
                 (self._is_local_host() or self._guest_surface())):
             self._picker_dismissed = True
-        # A user close is final.  Reopening on the next BigWorld callback can
-        # recapture the cursor while the stock window is still unwinding.
-        # The host can explicitly reopen the picker with the Battle button;
-        # start denial and host transfer also reopen it through their own
-        # state transitions.
 
     def _cancel_picker_callback(self):
         callback_id = self._picker_callback_id

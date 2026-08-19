@@ -1203,6 +1203,14 @@ class LANClient(object):
                            'contacts': list(contacts or ())[:64],
                            'affordances': list(affordances or ())[:16]})
 
+    def send_spotted_report(self, targets):
+        """Report this player's own spotted set, for assist accounting only."""
+        if not self.ready:
+            return False
+        return self._send({'type': 'spotted_report',
+                           'round_id': self.round_id,
+                           'targets': list(targets or ())[:64]})
+
     def send_descriptor_catalog(self, vehicles):
         if not self.ready:
             return False

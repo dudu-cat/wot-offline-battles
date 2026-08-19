@@ -10,7 +10,8 @@ sys.path.insert(0, str(ROOT / '0.9.22' / 'server'))
 
 from gui.mods.offline_lan_0922.lan_client import LANClient
 from lan_battle_server import (
-    BattleState, CLIENT_BUILD_0922, Player, _bot_combat_log_message)
+    BattleState, CLIENT_BUILD_082, CLIENT_BUILD_0922, Player,
+    _bot_combat_log_message)
 
 
 class _Socket(object):
@@ -200,6 +201,57 @@ class LanProtocolTests(unittest.TestCase):
                 critical_target_base_revision=0,
                 critical_target_ack_seq=0, hull_damage=-1)
         self.assertEqual([], self.sent)
+
+    def test_assist_event_and_result_statistics_are_json_safe(self):
+        state = BattleState(map_name='01_karelia')
+        state.client_build = CLIENT_BUILD_0922
+        for player_id, team in ((1, 1), (2, 2), (3, 1)):
+            state.players[player_id] = Player(
+                player_id, _Socket(), ('127.0.0.1', player_id), team=team)
+        tracked = {
+            'devices': [{'name': 'rightTrackHealth', 'hp': 0.0,
+                         'max_hp': 100.0, 'state': 'destroyed'}],
+            'destroyed': ['rightTrackHealth'], 'crew_ko': [],
+            'fire': False, 'ammo_rack_death': False, 'events': []}
+        state.track_immobilisers[('player', 2)] = ('player', 1)
+        state.player_spotted[1] = frozenset([('player', 2)])
+        state._record_damage(('player', 3), ('player', 2), 240, tracked)
+        self.assertTrue(state._finish_battle(1, 'elimination'))
+
+        self.assertEqual(
+            ['track', 'radio'],
+            [event['category'] for event in state.pending_events
+             if event['kind'] == 'assist'])
+        event = state.pending_events[0]
+        self.assertEqual({
+            'kind': 'assist', 'category': 'track',
+            'assister_kind': 'player', 'assister_id': 1,
+            'attacker_kind': 'player', 'attacker_id': 3,
+            'target_kind': 'player', 'target_id': 2,
+            'damage': 240,
+        }, json.loads(json.dumps(event)))
+        result = state.battle_result
+        self.assertEqual(result, json.loads(json.dumps(result)))
+        rows = dict((row['actor_id'], row)
+                    for row in result['vehicle_statistics'])
+        self.assertEqual({
+            'actor_kind', 'actor_id', 'team', 'shots_fired', 'shots_hit',
+            'shots_penetrated', 'damage_dealt', 'damage_received',
+            'damage_blocked', 'damage_assisted_track',
+            'damage_assisted_radio', 'kills'}, set(rows[1]))
+        for row in rows.values():
+            self.assertTrue(all(key == key.lower() and key.isidentifier()
+                                for key in row))
+        self.assertEqual(240, rows[1]['damage_assisted_track'])
+        self.assertEqual(240, rows[1]['damage_assisted_radio'])
+        self.assertEqual(240, rows[3]['damage_dealt'])
+        self.assertEqual(240, rows[2]['damage_received'])
+
+    def test_battle_result_omits_statistics_for_the_0_8_2_build(self):
+        state = BattleState(map_name='01_karelia')
+        state.client_build = CLIENT_BUILD_082
+        self.assertTrue(state._finish_battle(1, 'elimination'))
+        self.assertNotIn('vehicle_statistics', state.battle_result)
 
     def test_destructible_report_requires_exact_identity_fields(self):
         self.assertFalse(self.client.send_destructible({

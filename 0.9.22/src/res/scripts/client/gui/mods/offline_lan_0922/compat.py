@@ -448,6 +448,7 @@ class OfflineCompatibility(object):
         self._battle_bonus_type = None
         self._battle_player_name = 'OfflinePlayer'
         self._battle_player_team = 1
+        self._battle_arena_type_id = 0
         self._battle_network_client = None
         self._original_account_init = None
         self._original_account_getattribute = None
@@ -2370,7 +2371,8 @@ class OfflineCompatibility(object):
         self._runtime.offline_map_creator.SetActive(True)
 
     def configure_battle(self, gui_type=None, bonus_type=None,
-                         player_name=None, player_team=None):
+                         player_name=None, player_team=None,
+                         arena_type_id=None):
         """Enable the normal battle UI/input path for the next native Avatar."""
         if player_name is not None:
             player_name = _entity_bytes(player_name, 'OfflinePlayer')
@@ -2378,6 +2380,8 @@ class OfflineCompatibility(object):
             player_team = int(player_team)
             if player_team not in (1, 2):
                 raise ValueError('Avatar team must be 1 or 2')
+        if arena_type_id is not None:
+            self._battle_arena_type_id = int(arena_type_id)
         self.install()
         self._battle_active = True
         self._strategic_camera_failure_reported = False
@@ -2756,7 +2760,10 @@ class OfflineCompatibility(object):
             'isObserverBothTeams': False,
             'isGunLocked': False,
             'arenaUniqueID': 0,
-            'arenaTypeID': 0,
+            # ArenaType.id is (gameplayID << 16) | geometryID, and the battle
+            # GUI resolves bases and the minimap from it.  Zero named another
+            # map's standard bases, which is what drew stray flags.
+            'arenaTypeID': self._battle_arena_type_id,
             'arenaBonusType': 0,
             'arenaGuiType': 0,
             'arenaExtraData': {},

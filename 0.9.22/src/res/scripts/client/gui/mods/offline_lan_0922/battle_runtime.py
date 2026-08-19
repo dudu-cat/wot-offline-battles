@@ -160,6 +160,36 @@ def _underlying_function(value):
     return getattr(value, 'im_func', getattr(value, '__func__', value))
 
 
+def _format_xyz(value):
+    """Render a Vector3 or a 3-sequence compactly for a diagnostic line."""
+    try:
+        x, y, z = _xyz(value)
+        return '(%.1f, %.1f, %.1f)' % (x, y, z)
+    except Exception:
+        return repr(value)
+
+
+def _deep_size(value, seen=None, depth=0):
+    """Approximate retained bytes, counting each object once."""
+    if value is None or depth > 6:
+        return 0
+    if seen is None:
+        seen = set()
+    marker = id(value)
+    if marker in seen:
+        return 0
+    seen.add(marker)
+    total = sys.getsizeof(value, 64)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            total += _deep_size(key, seen, depth + 1)
+            total += _deep_size(item, seen, depth + 1)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            total += _deep_size(item, seen, depth + 1)
+    return total
+
+
 _FRAME_STAGE_NAMES = (
     'house', 'sync', 'critical', 'drown', 'transition', 'local',
     'outline', 'bots_update', 'bot_present', 'bot_events', 'spot', 'lock',
@@ -852,6 +882,8 @@ class BattleRuntime(object):
         self._local_loadout_cache = None
         self._garage_loadout = None
         self._offframe_seconds = 0.0
+        self._effect_reports = 0
+        self._spotted_signature = None
         self._local_spotting_cache = None
         self._local_still_since = None
         self._battle_result = None
@@ -998,6 +1030,8 @@ class BattleRuntime(object):
         self._local_loadout_cache = None
         self._garage_loadout = None
         self._offframe_seconds = 0.0
+        self._effect_reports = 0
+        self._spotted_signature = None
         self._local_spotting_cache = None
         self._local_still_since = None
         self._battle_result = self._start_message.get('battle_result')
@@ -1106,7 +1140,8 @@ class BattleRuntime(object):
                 getattr(constants.ARENA_GUI_TYPE, 'RANDOM', 0),
                 getattr(constants.ARENA_BONUS_TYPE, 'REGULAR', 0),
                 local_identity.get('name', self.client.name),
-                int(local_identity.get('team', self.client.team)))
+                int(local_identity.get('team', self.client.team)),
+                arena_type_id=getattr(arena_type, 'id', 0))
             lobby_boundary = self._preflight_lobby_retirement()
             self._garage_loadout_snapshot()
             self._install_battle_gui_guard()
@@ -1752,6 +1787,7 @@ class BattleRuntime(object):
                 descriptor, self._local_loadout(descriptor),
                 ammo_layout=self._local_ammo_layout())
             self._log_local_ammo(self._gun_state)
+            self._report_memory('battle_start')
             self._gun_last_tick = self._clock()
             self._sync = SnapshotSync(
                 self.client.player_id, on_event=self._apply_sync_event,
@@ -4119,6 +4155,55 @@ class BattleRuntime(object):
             return self._record_is_event_ready(attacker_record)
         return True
 
+    _ASSIST_EVENT_TYPES = {
+        'radio': 'RADIO_ASSIST',
+        'track': 'TRACK_ASSIST',
+        'stun': 'STUN_ASSIST',
+    }
+
+    def _apply_assist_event(self, event):
+        """Feed one server-attributed assist to the stock damage log.
+
+        ``PlayerAvatar.onBattleEvents`` forwards only the controlled vehicle's
+        own events, so publish nothing unless this client is the assister.
+        """
+        assister = self._records.get(self._assist_entity_key(event, 'assister'))
+        if assister is None or not assister.get('local'):
+            return False
+        target = self._records.get(self._assist_entity_key(event, 'target'))
+        if target is None:
+            raise RuntimeError('assist event has no known target')
+        name = self._ASSIST_EVENT_TYPES.get(event.get('category'))
+        if name is None:
+            raise RuntimeError(
+                'assist category is unsupported: %s' % event.get('category'))
+        feedback_common = getattr(
+            self._runtime, 'battle_feedback_common', None)
+        event_types = getattr(feedback_common, 'BATTLE_EVENT_TYPE', None)
+        if event_types is None:
+            raise RuntimeError('#1513 battle feedback constants are unavailable')
+        callback = getattr(self._avatar, 'onBattleEvents', None)
+        if not callable(callback):
+            raise RuntimeError(
+                '#1513 battle-event feedback boundary is unavailable')
+        damage = max(0, int(event.get('damage', 0) or 0))
+        callback([{
+            'eventType': int(getattr(event_types, name)),
+            'targetID': int(target['engine_id']), 'count': 1,
+            'details': int(event_types.packDamage(
+                damage, self._attack_reason('SHOT', 0)))}])
+        return True
+
+    @staticmethod
+    def _assist_entity_key(event, role):
+        """Resolve one ``<role>_kind``/``<role>_id`` pair to a record key."""
+        kind = event.get(role + '_kind')
+        actor = event.get(role + '_id')
+        if kind not in ('player', 'bot') or actor is None:
+            raise RuntimeError(
+                'assist event has an invalid %s identity' % role)
+        return '%s:%s' % (kind, actor)
+
     def _apply_ordered_event(self, event):
         kind = event.get('kind')
         if kind == 'authority':
@@ -4136,6 +4221,8 @@ class BattleRuntime(object):
             self._apply_combat_event(event, update_state=False)
         elif kind == 'vehicle_statistics':
             self._apply_vehicle_statistics_event(event)
+        elif kind == 'assist':
+            self._apply_assist_event(event)
         elif kind == 'destructible':
             self._apply_destructible_event(event)
         elif kind == 'projectile_impact':
@@ -4187,6 +4274,53 @@ class BattleRuntime(object):
             counts['bot_states'] = 0
         counts['pose_keyframes'] = pose_animation_writes()
         return counts
+
+    _MEASURED_STRUCTURES = (
+        ('records', '_records'),
+        ('journal', '_event_journal'),
+        ('accepted_ids', '_accepted_event_ids'),
+        ('applied_ids', '_applied_event_ids'),
+        ('navgraph', '_navigation_graph'),
+        ('foliage', '_foliage'),
+        ('last_snapshot', '_last_snapshot'),
+        ('start_message', '_start_message'),
+        ('health', '_last_health'),
+        ('bot_destr_samples', '_bot_destructible_samples'),
+    )
+
+    def _report_memory(self, moment):
+        """Rank the port's per-round structures by retained bytes, once.
+
+        The client is 32-bit and already runs near its address-space ceiling,
+        so a baseline needs sizes, not just counts.
+        """
+        sizes = []
+        for name, attribute in self._MEASURED_STRUCTURES:
+            try:
+                sizes.append(
+                    (_deep_size(getattr(self, attribute, None)), name))
+            except Exception:
+                continue
+        bots = getattr(self._bots, 'states', None)
+        if bots is not None:
+            try:
+                sizes.append((_deep_size(bots), 'bot_states'))
+            except Exception:
+                pass
+        registry = getattr(self._destructibles, 'registry_sizes', None)
+        if callable(registry):
+            try:
+                for name, value in registry().items():
+                    sizes.append((int(value), 'destr_' + name))
+            except Exception:
+                pass
+        sizes.sort(reverse=True)
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] MEM %s total_kb=%d %s\n' % (
+                moment, sum(size for size, unused in sizes) // 1024,
+                ' '.join('%s=%dk' % (name, size // 1024)
+                         for size, name in sizes[:12])))
+        return True
 
     def _drain_event_journal(self):
         while self._event_journal:
@@ -4411,12 +4545,34 @@ class BattleRuntime(object):
         add_effect = getattr(terrain_effects, 'addNew', None)
         if not callable(add_effect):
             raise RuntimeError('#1513 terrain hit-effects boundary is unavailable')
+        self._report_effect(
+            'armour_hit', effect_group, effects_index,
+            (_number(event.get('x')), _number(event.get('y')),
+             _number(event.get('z'))), direction)
         add_effect(
             hit_position, effects, stages, None, dir=direction,
             start=hit_position - direction.scale(0.4),
             end=hit_position + direction.scale(0.4),
             showShockWave=bool(target_record.get('local')),
             showFlashBang=bool(target_record.get('local')))
+        return True
+
+    _EFFECT_REPORT_LIMIT = 12
+
+    def _report_effect(self, kind, material, effects_index, where, direction):
+        """Log the first few visual effects a round plays, then stop.
+
+        A black wedge over the terrain has been seen twice; a mis-specified
+        effect material or a bad transform is the leading candidate.
+        """
+        if self._effect_reports >= self._EFFECT_REPORT_LIMIT:
+            return False
+        self._effect_reports += 1
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] EFFECT %s material=%r index=%r at=%s '
+            'dir=%s\n' % (
+                kind, material, effects_index,
+                _format_xyz(where), _format_xyz(direction)))
         return True
 
     @staticmethod
@@ -5092,6 +5248,7 @@ class BattleRuntime(object):
                 captured(base_team, 0)
         callback(max(0, min(int(result.get('winner', 0)), 2)), reason)
         self._round_finished_notified = True
+        self._report_memory('round_end')
         return True
 
     def _apply_rules(self, rules):
@@ -5635,6 +5792,8 @@ class BattleRuntime(object):
             velocity = visual.get('velocity') if visual else None
         if not velocity:
             return None
+        self._report_effect(
+            'world_explosion', material, effects_index, impact, velocity)
         return (effects_descr, material, self._vector(_xyz(velocity)))
 
     def _surface_effect_material(self, impact):
@@ -6285,6 +6444,8 @@ class BattleRuntime(object):
         self._soft_static_recast_budget[0] = BOT_SOFT_RECAST_BUDGET
         offframe = self._offframe_seconds
         self._offframe_seconds = 0.0
+        self._effect_reports = 0
+        self._spotted_signature = None
         frame_id = (diagnostics.begin(entry_wall, raw_dt, offframe)
                     if profiling else 0)
         stages = {}
@@ -8606,6 +8767,7 @@ class BattleRuntime(object):
         self._next_spotting_time += intervals * SPOTTING_UPDATE_SECONDS
         observers = self._spotting_observers()
         changed = False
+        spotted = []
         for record in self._records.values():
             state = record.get('state') or {}
             if (record.get('local') or not record.get('presentation') or
@@ -8650,7 +8812,34 @@ class BattleRuntime(object):
             self._set_record_spot_visibility(record, visible)
             if visible and not previous_visible and direct_seen:
                 self._present_direct_spot(record)
+            if visible and direct_seen:
+                spotted.append(record)
+        self._publish_spotted_targets(spotted)
         return changed
+
+    def _publish_spotted_targets(self, records):
+        """Report who this player currently sees, for radio assist only.
+
+        The server never lets this claim move visibility or damage; it only
+        decides who earns assist for somebody else's shot.
+        """
+        targets = []
+        for record in records:
+            kind = record.get('kind')
+            actor = record.get('network_id')
+            if kind not in ('player', 'bot') or actor is None:
+                continue
+            targets.append(
+                {'target_kind': kind, 'target_id': int(actor)})
+        signature = tuple(sorted(
+            (entry['target_kind'], entry['target_id']) for entry in targets))
+        if signature == self._spotted_signature:
+            return False
+        sender = getattr(self.client, 'send_spotted_report', None)
+        if not callable(sender):
+            return False
+        self._spotted_signature = signature
+        return bool(sender(targets))
 
     def _release_target_lock(self, engine_id):
         """Drop a lock on a vehicle that just died, before it is re-presented."""
@@ -9466,6 +9655,8 @@ class BattleRuntime(object):
         self._local_loadout_cache = None
         self._garage_loadout = None
         self._offframe_seconds = 0.0
+        self._effect_reports = 0
+        self._spotted_signature = None
         self._local_spotting_cache = None
         self._local_still_since = None
         self._battle_result = None

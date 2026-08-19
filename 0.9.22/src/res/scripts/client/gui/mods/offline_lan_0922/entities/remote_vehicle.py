@@ -818,6 +818,10 @@ class RemoteVehicle(object):
 
     def attach_wreck_model(self, model):
         """Swap this vehicle onto its loaded #1513 destroyed compound."""
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] WRECK swap id=%s pose=(%.1f, %.1f, %.1f)\n'
+            % (self.bw_entity_id, self.position.x, self.position.y,
+               self.position.z))
         self._stop_shooting_effect()
         previous = self.model
         if previous is not None:

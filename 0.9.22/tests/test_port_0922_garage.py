@@ -56,7 +56,8 @@ SNAPSHOT = {
         'repair': (0, 100),
         'lock': (0, 0),
         'shells': [10010, 20, 10011, 10],
-        'shellsLayout': {},
+        'shellsLayout': {(7001, 7002): [10010, 20, 10011, 10]},
+        'shellsLayoutIdx': (7001, 7002),
         'eqs': [0, 0, 0],
         'eqsLayout': [0, 0, 0],
         'inventoryItems': {
@@ -85,12 +86,19 @@ SNAPSHOT = {
 }
 
 
+class _Component(object):
+    def __init__(self, compact_descr):
+        self.compactDescr = compact_descr
+
+
 class _Descriptor(object):
     def __init__(self, compact_descr):
         self.compact_descr = compact_descr
         self.devices = {}
         self.components = {}
-        self.gun = 'gun'
+        # #1513 Vehicle.shellsLayoutIdx reads both compact descriptors.
+        self.turret = _Component(7001)
+        self.gun = _Component(7002)
 
     def installOptionalDevice(self, compact_descr, slot_index):
         if slot_index in self.devices:
@@ -104,7 +112,7 @@ class _Descriptor(object):
 
     def installComponent(self, compact_descr, position_index):
         self.components[position_index] = compact_descr
-        self.gun = 'gun:%d' % compact_descr
+        self.gun = _Component(compact_descr)
 
     def makeCompactDescr(self):
         return b'veh:9|dev=%s|comp=%s' % (
@@ -255,7 +263,8 @@ class GarageStateTests(unittest.TestCase):
         self.state.set_layouts(
             9, [10010, 12], 0, [11001, 1, 0, 0, 0, 0, 0, 0])
 
-        self.assertEqual({10010: 12}, self._record()['shellsLayout'])
+        self.assertEqual({(7001, 7002): [10010, 12]},
+                         self._record()['shellsLayout'])
         self.assertEqual([11001, 0, 0], self._record()['eqsLayout'])
 
     def test_applying_a_layout_also_loads_the_vehicle(self):
@@ -272,8 +281,45 @@ class GarageStateTests(unittest.TestCase):
         self.state.set_layouts(
             9, [-10010, 12], 0, [-11001, 1, 0, 0, 0, 0, 0, 0])
 
-        self.assertEqual({10010: 12}, self._record()['shellsLayout'])
+        self.assertEqual({(7001, 7002): [10010, 12]},
+                         self._record()['shellsLayout'])
         self.assertEqual([11001, 0, 0], self._record()['eqs'])
+
+    def test_a_setting_is_a_flag_value_not_a_bit_index(self):
+        # VEHICLE_SETTINGS_FLAG.AUTO_REPAIR is the value #1513 sends.
+        self.state.change_vehicle_setting(9, 2, 1)
+
+        self.assertEqual(2, self._record()['settings'])
+
+    def test_clearing_a_setting_leaves_the_other_flags_alone(self):
+        self.state.change_vehicle_setting(9, 2, 1)
+        self.state.change_vehicle_setting(9, 4, 1)
+
+        self.state.change_vehicle_setting(9, 2, 0)
+
+        self.assertEqual(4, self._record()['settings'])
+
+    def test_mounting_a_consumable_keeps_the_layout_in_step(self):
+        # Vehicle.isAutoEquipFull warns whenever the two disagree.
+        self.state.equip_equipments(9, [11001, 0, 0])
+
+        record = self._record()
+        self.assertEqual(record['eqs'], record['eqsLayout'])
+
+    def test_loading_shells_keeps_the_layout_in_step(self):
+        self.state.equip_shells(9, [10010, 5, 10011, 40])
+
+        record = self._record()
+        self.assertEqual({(7001, 7002): [10010, 5, 10011, 40]},
+                         record['shellsLayout'])
+
+    def test_a_gun_swap_rekeys_the_ammunition_layout(self):
+        self.state.install_component(9, 4444, 0)
+
+        record = self._record()
+        self.assertEqual((7001, 4444), record['shellsLayoutIdx'])
+        self.assertEqual({(7001, 4444): record['shells']},
+                         record['shellsLayout'])
 
     def test_a_battle_booster_layout_leaves_the_regular_slots_alone(self):
         self.state.equip_equipments(9, [11001, 0, 0])
@@ -350,7 +396,7 @@ class FittingRequestTests(unittest.TestCase):
 
         self.assertEqual(self.commands.RES_SUCCESS, result.result_id)
         record = self.state.snapshot()['vehicles'][0]
-        self.assertEqual({10010: 12}, record['shellsLayout'])
+        self.assertEqual({(7001, 7002): [10010, 12]}, record['shellsLayout'])
         self.assertEqual([11001, 0, 0], record['eqsLayout'])
         self.assertEqual([11001, 0, 0], record['eqs'])
 
@@ -453,7 +499,8 @@ class GaragePersistenceTests(unittest.TestCase):
         state.set_layouts(
             9, [10010, 38, 10011, 9], 0, [11001, 1, 0, 0, 0, 0, 0, 0])
         state.add_tankman_skill(101, 2)
-        state.change_vehicle_setting(9, 3, 1)
+        # VEHICLE_SETTINGS_FLAG.AUTO_EQUIP, the value #1513 itself sends.
+        state.change_vehicle_setting(9, 8, 1)
         store = self._store()
         store.mark_dirty()
         self.assertTrue(store.flush(state.snapshot()))
@@ -464,7 +511,8 @@ class GaragePersistenceTests(unittest.TestCase):
                          restored['compDescr'])
         self.assertEqual([11001, 0, 0], restored['eqs'])
         self.assertEqual([10010, 38, 10011, 9], restored['shells'])
-        self.assertEqual({10010: 38, 10011: 9}, restored['shellsLayout'])
+        self.assertEqual({(7001, 7002): [10010, 38, 10011, 9]},
+                         restored['shellsLayout'])
         self.assertEqual([11001, 0, 0], restored['eqsLayout'])
         self.assertEqual(8, restored['settings'])
         self.assertEqual(b'tman:101|brotherhood', restored['tankmen'][101])
@@ -472,6 +520,46 @@ class GaragePersistenceTests(unittest.TestCase):
         # data._validate_selected_vehicle cross-checks.
         self.assertEqual({10010: 38, 10011: 9},
                          restored['inventoryItems'][10])
+
+    def test_a_mounted_optional_device_survives_a_restart(self):
+        state = self._state()
+        state.equip_optional_device(9, 9001, 0)
+        mounted = state.snapshot()['vehicles'][0]['compDescr']
+        store = self._store()
+        store.mark_dirty()
+        store.flush(state.snapshot())
+
+        restored = self._restart()['vehicles'][0]
+
+        self.assertEqual(mounted, restored['compDescr'])
+        self.assertNotEqual(SNAPSHOT['vehicles'][0]['compDescr'],
+                            restored['compDescr'])
+
+    def test_a_learned_crew_skill_survives_a_restart(self):
+        state = self._state()
+        state.add_tankman_skill(101, 2)
+        store = self._store()
+        store.mark_dirty()
+        store.flush(state.snapshot())
+
+        restored = self._restart()['vehicles'][0]
+
+        self.assertEqual(b'tman:101|brotherhood', restored['tankmen'][101])
+
+    def test_a_saved_setting_wins_over_the_bootstrap_default(self):
+        state = self._state()
+        # The player clears AUTO_LOAD, leaving XP_TO_TMAN|AUTO_REPAIR|AUTO_EQUIP.
+        state.change_vehicle_setting(9, 4, 0)
+        state.change_vehicle_setting(9, 11, 1)
+        store = self._store()
+        store.mark_dirty()
+        store.flush(state.snapshot())
+
+        fresh = copy.deepcopy(SNAPSHOT)
+        fresh['vehicles'][0]['settings'] = 15
+        self._store().apply(fresh)
+
+        self.assertEqual(11, fresh['vehicles'][0]['settings'])
 
     def test_purchases_survive_a_restart(self):
         state = self._state()

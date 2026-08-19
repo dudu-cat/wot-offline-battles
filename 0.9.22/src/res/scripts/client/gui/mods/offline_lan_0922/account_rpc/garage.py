@@ -51,6 +51,19 @@ def _int(value):
         raise GarageError('expected an integer, got %r' % (value,))
 
 
+def mirror_shells_layout(record):
+    """Publish the loaded shells as the vehicle's own ammunition layout.
+
+    #1513 reads ``shellsLayout[(turretCompDescr, gunCompDescr)]`` and falls back
+    to the gun's default ammo, then warns through ``Vehicle.isAutoLoadFull``
+    when a loaded count differs from that layout.  Offline resupply is instant,
+    so the layout is always exactly what is loaded.
+    """
+    key = record.get('shellsLayoutIdx')
+    record['shellsLayout'] = (
+        {tuple(key): list(record.get('shells') or ())} if key else {})
+
+
 def _layout_pairs(values, slot_limit=None):
     """Decode a flat #1513 layout into ``(compactDescr, count)`` pairs."""
     values = [_int(value) for value in (values or ())]
@@ -138,6 +151,7 @@ class GarageState(object):
             raise GarageError('shells must be descriptor/count pairs')
         record = self._record(vehicle_inventory_id)
         record['shells'] = values
+        mirror_shells_layout(record)
         # data._validate_selected_vehicle requires the shell inventory and the
         # flat pair list to agree, so both move together.
         pairs = {}
@@ -173,6 +187,9 @@ class GarageState(object):
         values += [0] * (EQUIPMENT_SLOT_COUNT - len(values))
         record = self._record(vehicle_inventory_id)
         record['eqs'] = values
+        # Offline resupply is instant, so the vehicle is always at its layout.
+        # Vehicle.isAutoEquipFull compares the two and warns when they differ.
+        record['eqsLayout'] = list(values)
         for compact_descr in values:
             self._own(record, compact_descr, 11)
             self._price(compact_descr)
@@ -189,10 +206,8 @@ class GarageState(object):
         """
         record = self._record(vehicle_inventory_id)
         if shells_layout is not None:
-            pairs = _layout_pairs(shells_layout)
-            record['shellsLayout'] = dict(pairs)
             flat = []
-            for compact_descr, count in pairs:
+            for compact_descr, count in _layout_pairs(shells_layout):
                 flat.extend((compact_descr, count))
             self.equip_shells(vehicle_inventory_id, flat)
         if (equipments_layout is not None and
@@ -202,8 +217,6 @@ class GarageState(object):
             slots = [compact_descr
                      for compact_descr, unused_count in pairs
                      ][:EQUIPMENT_SLOT_COUNT]
-            record['eqsLayout'] = slots + [0] * (
-                EQUIPMENT_SLOT_COUNT - len(slots))
             self.equip_equipments(vehicle_inventory_id, slots)
         self.revision += 1
         return record
@@ -220,8 +233,11 @@ class GarageState(object):
         try:
             mutate(descriptor)
             record['compDescr'] = descriptor.makeCompactDescr()
+            record['shellsLayoutIdx'] = (
+                descriptor.turret.compactDescr, descriptor.gun.compactDescr)
         except Exception as error:
             raise GarageError('the client refused the fitting: %s' % error)
+        mirror_shells_layout(record)
         return record
 
     def equip_optional_device(self, vehicle_inventory_id, device_compact_descr,
@@ -276,7 +292,6 @@ class GarageState(object):
         if not shells or len(shells) % 2:
             return False
         self.equip_shells(_int(record.get('id', 0)), shells)
-        record['shellsLayout'] = {}
         return True
 
     # ---- purchases and settings -----------------------------------------
@@ -334,9 +349,13 @@ class GarageState(object):
             vehicle_inventory_id, compact_descr, slot_index)
 
     def change_vehicle_setting(self, vehicle_inventory_id, setting, is_on):
-        """Set or clear one bit of a vehicle's settings mask."""
+        """Set or clear one bit of a vehicle's settings mask.
+
+        ``setting`` is already a ``VEHICLE_SETTINGS_FLAG`` value: #1513's
+        VehicleSettingsProcessor sends AUTO_REPAIR (2) itself, not its index.
+        """
         record = self._record(vehicle_inventory_id)
-        bit = 1 << max(0, _int(setting))
+        bit = max(0, _int(setting))
         current = 0
         try:
             current = int(record.get('settings', 0) or 0)

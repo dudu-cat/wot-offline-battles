@@ -22,13 +22,16 @@ import os
 import sys
 
 from gui.mods.offline_lan_0922 import config as port_config
+from gui.mods.offline_lan_0922.account_rpc.garage import mirror_shells_layout
 
 
-SCHEMA = 1
+# Schema 2 fixes schema 1's vehicle settings, which were stored as a shifted
+# bit index instead of a VEHICLE_SETTINGS_FLAG value.
+SCHEMA = 2
 STATE_PATH = os.path.join(
     os.path.dirname(port_config.CONFIG_PATH), 'garage_state.json')
 
-_VEHICLE_INT_KEYS = ('eqs', 'eqsLayout', 'shells')
+_VEHICLE_INT_KEYS = ('eqs', 'eqsLayout', 'shells', 'shellsLayoutIdx')
 _ARTEFACT_ITEM_TYPES = (9, 10, 11)
 
 
@@ -118,10 +121,6 @@ class GarageStore(object):
                 value = _int_list(record.get(name))
                 if value is not None:
                     stored[name] = value
-            layout = _int_map(record.get('shellsLayout'))
-            if layout is not None:
-                stored['shellsLayout'] = dict(
-                    (str(shell), count) for shell, count in layout.items())
             try:
                 stored['settings'] = int(record.get('settings', 0) or 0)
             except (TypeError, ValueError):
@@ -207,21 +206,16 @@ class GarageStore(object):
 
     def _apply_vehicle(self, record, saved):
         changed = False
-        compact_descr = saved.get('compDescr')
-        if isinstance(compact_descr, str):
-            decoded = _decode_bytes(compact_descr)
-            if decoded:
-                record['compDescr'] = decoded
-                changed = True
+        # Python 2 json.load returns unicode, so this must not test for str.
+        decoded = _decode_bytes(saved.get('compDescr'))
+        if decoded:
+            record['compDescr'] = decoded
+            changed = True
         for name in _VEHICLE_INT_KEYS:
             value = _int_list(saved.get(name))
             if value is not None:
                 record[name] = value
                 changed = True
-        layout = _int_map(saved.get('shellsLayout'))
-        if layout is not None:
-            record['shellsLayout'] = layout
-            changed = True
         if 'settings' in saved:
             try:
                 record['settings'] = int(saved['settings'])
@@ -239,11 +233,11 @@ class GarageStore(object):
                     continue
                 if not 0 <= slot < len(order):
                     continue
-                decoded = _decode_bytes(encoded) if isinstance(
-                    encoded, str) else None
+                decoded = _decode_bytes(encoded)
                 if decoded:
                     tankmen[order[slot]] = decoded
                     changed = True
+        mirror_shells_layout(record)
         # Mounted shells must stay consistent with the shell inventory that
         # data._validate_selected_vehicle cross-checks.
         shells = _int_list(record.get('shells'))

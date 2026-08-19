@@ -1148,14 +1148,16 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual(1, queue.close_calls)
         self.assertEqual('battle', self.session.state)
 
-    def test_stock_picker_close_allows_the_waiting_view_to_reopen(self):
+    def test_a_denial_after_a_close_leaves_the_garage_alone(self):
         self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
 
         self.queues[0].on_close()
         self.emit('start_denied', {'reason': 'try again'})
 
-        self.assertEqual([True, True], self.opens)
-        self.assertTrue(self.session._picker_open)
+        # Closing the room disarms it; a refused start that arrives afterwards
+        # must not raise it over the garage again.
+        self.assertEqual([True], self.opens)
+        self.assertFalse(self.session._picker_open)
 
     def test_stock_picker_close_stays_closed_until_explicit_action(self):
         callbacks = []

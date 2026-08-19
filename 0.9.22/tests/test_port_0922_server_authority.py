@@ -475,6 +475,356 @@ class ServerAuthorityProjectileTest(unittest.TestCase):
         self.assertTrue(authority._projectiles.contains(projectile_id))
 
 
+_TRACK_CRITICAL = {
+    'devices': [{'name': 'leftTrackHealth', 'hp': 0.0, 'max_hp': 100.0,
+                 'state': 'destroyed'}],
+    'destroyed': ['leftTrackHealth'], 'crew_ko': [],
+    'fire': False, 'ammo_rack_death': False,
+    'events': [{'kind': 'device', 'name': 'leftTrackHealth',
+                'state': 'destroyed', 'cause': 'shot'}],
+}
+
+
+class VehicleStatisticsTest(unittest.TestCase):
+    def _live_state(self):
+        state = _state_with_authority()
+        state.players[1].x = 0.0
+        state.players[1].y = 0.0
+        state.players[1].z = 0.0
+        state.players[2] = _player(2, team=2, x=0.0, z=20.0)
+        state.players[3] = _player(3, team=1, x=0.0, z=40.0)
+        state.players[4] = _player(4, team=1, x=0.0, z=60.0)
+        self._start_round(state)
+        return state
+
+    def _start_round(self, state):
+        message, error = state.request_start(1, '01_karelia')
+        self.assertIsNone(error)
+        self.assertEqual('battle_start', message['type'])
+        for player_id in sorted(state.players):
+            state.mark_battle_ready(player_id, {'round_id': state.round_id})
+        self.assertEqual('battle', state.phase)
+        state.tick = int(round(PREBATTLE_SECONDS * TICK_HZ))
+        state.pending_live_message = None
+        state.server_authority._bots.update = (
+            lambda unused_dt, unused_now, players=None: [])
+        state.server_authority.world.segment_hit_fraction = (
+            lambda unused_start, unused_end, include_destructibles=True: None)
+
+    def _launch(self, state, shooter_id, shot_seq=1):
+        launch = {
+            'type': 'projectile_launch',
+            'round_id': state.round_id,
+            'shooter_kind': 'player',
+            'shooter_id': shooter_id,
+            'shot_seq': shot_seq,
+            'shell_index': 0,
+            'origin': [0.0, 1.0, 0.0],
+            'velocity': [0.0, 0.0, 100.0],
+            'gravity': 9.81,
+            'max_distance': 200.0,
+            'max_time_ms': 2000,
+            'is_he': False,
+            'splash_radius': 0.0,
+            'penetration_factor': 1.0,
+        }
+        self.assertTrue(state.launch_projectile(shooter_id, launch))
+        return '%d:p:%d:%d' % (state.round_id, shooter_id, shot_seq)
+
+    def _shoot(self, state, shooter_id, target_id, damage, shot_seq=1,
+               critical=None, shot_result=2, potential_damage=None):
+        projectile_id = self._launch(state, shooter_id, shot_seq)
+        record = state.projectiles[projectile_id]
+        target = state.players[target_id]
+        direct = {
+            'target_kind': 'player', 'target_id': target_id,
+            'damage': damage, 'shot_result': shot_result,
+            'x': 0.0, 'y': 1.0, 'z': 20.0,
+        }
+        if potential_damage is not None:
+            direct['potential_damage'] = potential_damage
+        if critical is not None:
+            direct.update({
+                'critical': critical,
+                'critical_target_base_revision':
+                    target.critical_report_base_revision,
+                'critical_target_ack_seq': target.critical_ack_seq,
+                'hull_damage': damage,
+            })
+        self.assertTrue(state.resolve_projectile(SERVER_AUTHORITY_ID, {
+            'type': 'projectile_resolve',
+            'round_id': state.round_id,
+            'authority_epoch': state.authority_epoch,
+            'projectile_id': projectile_id,
+            'base_checked_ms': record['checked_through_ms'],
+            'outcome': 'impact',
+            'resolved_time_ms': record['checked_through_ms'],
+            'checked_distance': record['checked_distance'],
+            'piercing_loss': record['piercing_loss'],
+            'penetration_factor': record['penetration_factor'],
+            'impact': [0.0, 1.0, 20.0],
+            'direct': direct,
+            'splash': [],
+            'destructibles': [],
+        }))
+
+    def _assists(self, state):
+        return [event for event in state.pending_events
+                if event.get('kind') == 'assist']
+
+    def test_track_assist_credits_the_immobiliser_not_the_shooter(self):
+        state = self._live_state()
+        self._shoot(state, 1, 2, 50, critical=_TRACK_CRITICAL)
+        state.pending_events = []
+        self._shoot(state, 3, 2, 200)
+
+        assists = self._assists(state)
+        self.assertEqual(1, len(assists))
+        self.assertEqual({
+            'kind': 'assist', 'category': 'track',
+            'assister_kind': 'player', 'assister_id': 1,
+            'attacker_kind': 'player', 'attacker_id': 3,
+            'target_kind': 'player', 'target_id': 2,
+            'damage': 200,
+        }, assists[0])
+        self.assertEqual(
+            200, state.vehicle_statistics[('player', 1)][
+                'damage_assisted_track'])
+        self.assertEqual(
+            0, state.vehicle_statistics[('player', 3)][
+                'damage_assisted_track'])
+        self.assertEqual(
+            200, state.vehicle_statistics[('player', 3)]['damage_dealt'])
+        self.assertEqual(
+            250, state.vehicle_statistics[('player', 2)]['damage_received'])
+
+    def test_the_immobiliser_earns_no_assist_from_its_own_damage(self):
+        state = self._live_state()
+        self._shoot(state, 1, 2, 50, critical=_TRACK_CRITICAL)
+        state.pending_events = []
+        self._shoot(state, 1, 2, 120, shot_seq=2)
+
+        self.assertEqual([], self._assists(state))
+        self.assertEqual(
+            0, state.vehicle_statistics[('player', 1)][
+                'damage_assisted_track'])
+        self.assertEqual(
+            170, state.vehicle_statistics[('player', 1)]['damage_dealt'])
+
+    def test_repaired_tracks_stop_earning_assist(self):
+        state = self._live_state()
+        self._shoot(state, 1, 2, 50, critical=_TRACK_CRITICAL)
+        state.players[2].critical = {
+            'devices': [{'name': 'leftTrackHealth', 'hp': 100.0,
+                         'max_hp': 100.0, 'state': 'normal'}],
+            'destroyed': [], 'crew_ko': [], 'fire': False,
+            'ammo_rack_death': False, 'events': []}
+        state.pending_events = []
+        self._shoot(state, 3, 2, 200)
+
+        self.assertEqual([], self._assists(state))
+        self.assertEqual(
+            0, state.vehicle_statistics[('player', 1)][
+                'damage_assisted_track'])
+
+    def test_round_end_result_carries_the_accumulated_totals(self):
+        state = self._live_state()
+        self._shoot(state, 1, 2, 50, critical=_TRACK_CRITICAL)
+        self._shoot(state, 3, 2, 200)
+        self._shoot(state, 1, 2, 0, shot_seq=2, shot_result=0,
+                    potential_damage=320)
+        state._finish_battle(1, 'test_finished')
+
+        rows = dict((row['actor_id'], row) for row
+                    in state.battle_result['vehicle_statistics']
+                    if row['actor_kind'] == 'player')
+        self.assertEqual({
+            'actor_kind': 'player', 'actor_id': 1, 'team': 1,
+            'shots_fired': 2, 'shots_hit': 2, 'shots_penetrated': 1,
+            'damage_dealt': 50, 'damage_received': 0, 'damage_blocked': 0,
+            'damage_assisted_track': 200, 'damage_assisted_radio': 0,
+            'kills': 0,
+        }, rows[1])
+        self.assertEqual(200, rows[3]['damage_dealt'])
+        self.assertEqual(250, rows[2]['damage_received'])
+        self.assertEqual(320, rows[2]['damage_blocked'])
+        self.assertEqual(2, rows[2]['team'])
+        published = [event for event in state.pending_events
+                     if event.get('kind') == 'battle_result']
+        self.assertEqual(
+            state.battle_result['vehicle_statistics'],
+            published[0]['vehicle_statistics'])
+
+    def test_damage_blocked_counts_only_the_unpenetrated_remainder(self):
+        state = self._live_state()
+        self._shoot(state, 1, 2, 40, shot_result=1, potential_damage=300)
+        self._shoot(state, 1, 2, 250, shot_seq=2, shot_result=2,
+                    potential_damage=250)
+
+        row = state.vehicle_statistics[('player', 2)]
+        self.assertEqual(260, row['damage_blocked'])
+        self.assertEqual(290, row['damage_received'])
+        self.assertEqual(
+            2, state.vehicle_statistics[('player', 1)]['shots_hit'])
+        self.assertEqual(
+            1, state.vehicle_statistics[('player', 1)]['shots_penetrated'])
+
+    def test_a_second_round_starts_from_zero(self):
+        state = self._live_state()
+        self._shoot(state, 1, 2, 50, critical=_TRACK_CRITICAL)
+        self._shoot(state, 3, 2, 200)
+        state._finish_battle(1, 'test_finished')
+        state.tick = state.result_reset_tick - 1
+        state.tick_once(1.0 / TICK_HZ)
+
+        self.assertEqual('waiting', state.phase)
+        self.assertEqual({}, state.vehicle_statistics)
+        self.assertEqual({}, state.track_immobilisers)
+        self.assertEqual({}, state.player_spotted)
+
+        self._start_round(state)
+        self._shoot(state, 3, 2, 120)
+
+        self.assertEqual([], self._assists(state))
+        self.assertNotIn(('player', 1), state.vehicle_statistics)
+        self.assertEqual({
+            'actor_kind': 'player', 'actor_id': 3, 'team': 1,
+            'shots_fired': 1, 'shots_hit': 1, 'shots_penetrated': 1,
+            'damage_dealt': 120, 'damage_received': 0, 'damage_blocked': 0,
+            'damage_assisted_track': 0, 'damage_assisted_radio': 0,
+            'kills': 0,
+        }, state.vehicle_statistics[('player', 3)])
+
+    def _report_spotted(self, state, player_id, targets):
+        return state.update_spotted_targets(player_id, {
+            'type': 'spotted_report',
+            'round_id': state.round_id,
+            'targets': [{'target_kind': kind, 'target_id': target_id}
+                        for kind, target_id in targets],
+        })
+
+    def test_radio_assist_goes_to_the_reporter_not_the_shooter(self):
+        state = self._live_state()
+        self.assertTrue(self._report_spotted(state, 3, [('player', 2)]))
+        self._shoot(state, 1, 2, 180)
+
+        assists = self._assists(state)
+        self.assertEqual(1, len(assists))
+        self.assertEqual({
+            'kind': 'assist', 'category': 'radio',
+            'assister_kind': 'player', 'assister_id': 3,
+            'attacker_kind': 'player', 'attacker_id': 1,
+            'target_kind': 'player', 'target_id': 2,
+            'damage': 180,
+        }, assists[0])
+        self.assertEqual(
+            180, state.vehicle_statistics[('player', 3)][
+                'damage_assisted_radio'])
+        self.assertEqual(
+            0, state.vehicle_statistics[('player', 1)][
+                'damage_assisted_radio'])
+
+    def test_a_reporter_earns_no_radio_assist_from_its_own_damage(self):
+        state = self._live_state()
+        self.assertTrue(self._report_spotted(state, 1, [('player', 2)]))
+        self._shoot(state, 1, 2, 180)
+
+        self.assertEqual([], self._assists(state))
+        self.assertEqual(
+            0, state.vehicle_statistics[('player', 1)][
+                'damage_assisted_radio'])
+
+    def test_an_empty_report_clears_the_previous_spotted_set(self):
+        state = self._live_state()
+        self.assertTrue(self._report_spotted(state, 3, [('player', 2)]))
+        self.assertTrue(self._report_spotted(state, 3, []))
+        self._shoot(state, 1, 2, 180)
+
+        self.assertEqual([], self._assists(state))
+
+    def test_a_dead_reporter_stops_earning_radio_assist(self):
+        state = self._live_state()
+        self.assertTrue(self._report_spotted(state, 3, [('player', 2)]))
+        state.players[3].alive = False
+        self._shoot(state, 1, 2, 180)
+
+        self.assertEqual([], self._assists(state))
+
+    def test_spotted_report_refuses_an_invalid_claim_entirely(self):
+        state = self._live_state()
+        enemy_bot_id = min(bot_id for bot_id, bot in state.bot_states.items()
+                           if int(bot['team']) == 2)
+        self.assertTrue(self._report_spotted(state, 3, [('player', 2)]))
+
+        self.assertFalse(self._report_spotted(state, 3, [('player', 99)]))
+        self.assertFalse(self._report_spotted(state, 3, [('player', 1)]))
+        self.assertFalse(self._report_spotted(state, 3, [('crew', 2)]))
+        self.assertFalse(state.update_spotted_targets(3, {
+            'type': 'spotted_report', 'round_id': state.round_id,
+            'targets': [{'target_kind': 'player', 'target_id': 2},
+                        {'target_kind': 'player', 'target_id': 99}]}))
+        self.assertFalse(state.update_spotted_targets(3, {
+            'type': 'spotted_report', 'round_id': state.round_id + 5,
+            'targets': []}))
+        self.assertEqual(frozenset([('player', 2)]), state.player_spotted[3])
+        self.assertTrue(self._report_spotted(
+            state, 3, [('player', 2), ('bot', enemy_bot_id)]))
+
+    def test_track_and_radio_assist_are_both_credited(self):
+        state = self._live_state()
+        self._shoot(state, 1, 2, 50, critical=_TRACK_CRITICAL)
+        self.assertTrue(self._report_spotted(state, 3, [('player', 2)]))
+        state.pending_events = []
+        self._shoot(state, 4, 2, 200)
+
+        self.assertEqual(
+            [('track', 1), ('radio', 3)],
+            [(event['category'], event['assister_id'])
+             for event in self._assists(state)])
+        self.assertEqual(
+            200, state.vehicle_statistics[('player', 1)][
+                'damage_assisted_track'])
+        self.assertEqual(
+            200, state.vehicle_statistics[('player', 3)][
+                'damage_assisted_radio'])
+        self.assertEqual(
+            200, state.vehicle_statistics[('player', 4)]['damage_dealt'])
+
+    def test_a_resolved_shot_publishes_its_rolled_potential_damage(self):
+        state = self._live_state()
+        captured = []
+        original = state.resolve_projectile
+
+        def capture(player_id, message):
+            captured.append(copy.deepcopy(message))
+            return original(player_id, message)
+
+        state.resolve_projectile = capture
+        projectile_id = self._launch(state, 1)
+        for unused in range(30):
+            state.tick_once(1.0 / TICK_HZ)
+            if projectile_id in state.projectile_tombstones:
+                break
+        else:
+            self.fail('projectile did not reach a terminal')
+
+        direct = captured[-1]['direct']
+        self.assertIsNotNone(direct)
+        self.assertGreater(direct['potential_damage'], 0)
+        self.assertGreaterEqual(direct['potential_damage'], direct['damage'])
+        self.assertEqual(
+            1, state.vehicle_statistics[('player', 1)]['shots_hit'])
+
+    def test_a_kill_is_counted_once_for_the_attacker(self):
+        state = self._live_state()
+        self._shoot(state, 3, 2, 1000)
+
+        self.assertFalse(state.players[2].alive)
+        self.assertEqual(1, state.vehicle_statistics[('player', 3)]['kills'])
+        self.assertEqual(
+            1000, state.vehicle_statistics[('player', 3)]['damage_dealt'])
+
+
 class SplashEffectsTest(unittest.TestCase):
     def _he_projection(self):
         projection = _projection()

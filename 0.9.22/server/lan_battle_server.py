@@ -114,6 +114,7 @@ BOT_CALLSIGNS = (
 ROUND_SCOPED_MESSAGE_TYPES = frozenset((
     "start_battle", "input", "hit_report", "bot_manifest", "bot_state",
     "bot_observation", "bot_hit_report", "bot_human_hit", "bot_ram_report",
+    "spotted_report",
     "projectile_launch", "projectile_progress", "projectile_resolve",
     "rules_state", "destructible", "descriptor_bundle",
     "destructible_map",
@@ -159,6 +160,7 @@ CRITICAL_CREW_NAMES = frozenset((
 CRITICAL_STATES = frozenset(("normal", "critical", "destroyed"))
 CRITICAL_CAUSES = frozenset((
     "shot", "explosion", "repair", "fire", "drowning"))
+TRACK_DEVICE_NAMES = frozenset(("leftTrackHealth", "rightTrackHealth"))
 
 
 def _server_log(message):
@@ -428,6 +430,20 @@ def _critical_damage_transition(previous, current):
              not bool(previous.get("ammo_rack_death"))))
 
 
+def _destroyed_tracks(critical):
+    """Return the track devices one critical payload reports as destroyed."""
+    if not isinstance(critical, dict):
+        return frozenset()
+    names = set(str(name) for name in critical.get("destroyed") or ()
+                if str(name) in TRACK_DEVICE_NAMES)
+    for record in critical.get("devices") or ():
+        if (isinstance(record, dict) and
+                str(record.get("name")) in TRACK_DEVICE_NAMES and
+                record.get("state") == "destroyed"):
+            names.add(str(record.get("name")))
+    return frozenset(names)
+
+
 @dataclass
 class Player:
     player_id: int
@@ -538,6 +554,9 @@ class BattleState:
         self.bot_reported_hits = set()
         self.bot_reported_rams = set()
         self.bot_ram_cooldowns = {}
+        self.vehicle_statistics = {}
+        self.track_immobilisers = {}
+        self.player_spotted = {}
         self.rules_state = {"bases": {
             "1": {"points": 0, "time_left": 0.0,
                   "invaders": 0, "stopped": False},
@@ -878,6 +897,7 @@ class BattleState:
             if player is not None:
                 player.connected = False
                 self.state_revision += 1
+            self.player_spotted.pop(player_id, None)
             self.vehicle_catalogs.pop(player_id, None)
             if (self.server_authority is not None and
                     self.authority_status == "server_pending" and
@@ -970,6 +990,9 @@ class BattleState:
         self.bot_reported_hits = set()
         self.bot_reported_rams = set()
         self.bot_ram_cooldowns = {}
+        self.vehicle_statistics = {}
+        self.track_immobilisers = {}
+        self.player_spotted = {}
         self.rules_state = {"bases": {
             "1": {"points": 0, "time_left": 0.0,
                   "invaders": 0, "stopped": False},
@@ -2685,6 +2708,7 @@ class BattleState:
             else:
                 self.bot_pending_projectile_launches.discard(
                     (shooter_id, shot_seq))
+            self._statistics_row(shooter_kind, shooter_id)["shots_fired"] += 1
             self.projectile_revision += 1
 
             horizontal = math.hypot(velocity[0], velocity[2])
@@ -2836,7 +2860,7 @@ class BattleState:
             "target_kind", "target_id", "damage", "shot_result",
             "x", "y", "z", "critical",
             "critical_target_base_revision", "critical_target_ack_seq",
-            "hull_damage",
+            "hull_damage", "potential_damage",
         }
         required = {
             "target_kind", "target_id", "damage", "shot_result",
@@ -2851,6 +2875,8 @@ class BattleState:
         target_id = _exact_int(
             raw.get("target_id"), 1, PROJECTILE_MAX_ID)
         damage = _exact_int(raw.get("damage"), 0, 5000)
+        potential_damage = (_exact_int(raw["potential_damage"], 0, 5000)
+                            if "potential_damage" in raw else 0)
         shot_result = _exact_int(raw.get("shot_result"), 0, 2)
         pose = _bounded_vector(
             [raw.get("x"), raw.get("y"), raw.get("z")],
@@ -2901,6 +2927,7 @@ class BattleState:
             "target_kind": target_kind, "target_id": target_id,
             "target": target, "target_team": target_team,
             "target_alive": target_alive, "damage": damage,
+            "potential_damage": potential_damage,
             "shot_result": shot_result, "pose": pose,
             "critical": critical,
             "critical_accepted": critical_accepted,
@@ -2995,6 +3022,21 @@ class BattleState:
                 if critical_commit:
                     event.update(critical_commit)
         self.pending_events.append(event)
+        shooter = (str(record["shooter_kind"]), int(record["shooter_id"]))
+        victim = (str(target_kind), int(target_id))
+        self._record_damage(shooter, victim, applied, critical_before)
+        if _destroyed_tracks(admitted_critical) - _destroyed_tracks(
+                critical_before):
+            self.track_immobilisers[victim] = shooter
+        if (not proposal["splash"] and
+                int(record["team"]) != int(proposal["target_team"])):
+            row = self._statistics_row(*shooter)
+            row["shots_hit"] += 1
+            if proposal["shot_result"] == 2:
+                row["shots_penetrated"] += 1
+            elif was_alive:
+                self._statistics_row(*victim)["damage_blocked"] += max(
+                    0, proposal["potential_damage"] - damage)
         if was_alive and not alive:
             if target_kind == "player":
                 target.death_attacker_kind = record["shooter_kind"]
@@ -3684,9 +3726,13 @@ class BattleState:
             else:
                 bot_event["attacker"] = target_id
             self.pending_events.append(bot_event)
+            self._record_damage(
+                ("bot" if target_kind == "bot" else "player", target_id),
+                ("bot", bot_id), applied_bot, bot_combat_before[2])
 
             if target_kind == "bot":
                 target_combat_before = self._bot_combat_signature(target)
+                target_critical_before = target_combat_before[2]
                 applied_target = min(
                     damage_to_target, int(target.get("health", 0)))
                 target["health"] -= applied_target
@@ -3707,6 +3753,7 @@ class BattleState:
                 }
                 target_team = int(target.get("team", 0))
             else:
+                target_critical_before = target.critical
                 applied_target = min(damage_to_target, target.health)
                 target.health -= applied_target
                 target.alive = target.health > 0
@@ -3723,6 +3770,10 @@ class BattleState:
                 }
                 target_team = target.team
             self.pending_events.append(target_event)
+            self._record_damage(
+                ("bot", bot_id),
+                ("bot" if target_kind == "bot" else "player", target_id),
+                applied_target, target_critical_before)
 
             if not bot["alive"]:
                 bot["death_attacker_kind"] = (
@@ -3804,6 +3855,9 @@ class BattleState:
             "reason": _safe_name(reason, "battle finished"),
             "base_team": max(0, min(int(base_team), 2)),
         }
+        if self.client_build == CLIENT_BUILD_0922:
+            self.battle_result["vehicle_statistics"] = (
+                self._vehicle_statistics_payload())
         self.result_reset_tick = self.tick + max(
             1, int(round(RESULT_RESET_SECONDS * TICK_HZ)))
         for player in self.players.values():
@@ -4028,6 +4082,9 @@ class BattleState:
         was_alive = player.alive
         damage = player.health - health
         player.health = health
+        # The cause is a client claim, so only the victim's loss is attributed.
+        self._record_damage(
+            None, ("player", player.player_id), damage, critical_before)
         capture_reset = bool(damage > 0 or critical_damage)
         if capture_reset:
             self._drop_capture_for_vehicle("player", player.player_id)
@@ -4216,6 +4273,125 @@ class BattleState:
             self._maybe_finish_battle()
             return True
 
+    def _vehicle_team(self, kind, vehicle_id):
+        if kind == "player":
+            player = self.players.get(int(vehicle_id))
+            return int(player.team) if player is not None else 0
+        state = self.bot_states.get(int(vehicle_id))
+        return int(state.get("team", 0)) if state is not None else 0
+
+    def _statistics_row(self, kind, vehicle_id):
+        """Return this round's mutable statistics row for one vehicle."""
+        key = (str(kind), int(vehicle_id))
+        row = self.vehicle_statistics.get(key)
+        if row is None:
+            row = {
+                "actor_kind": key[0], "actor_id": key[1],
+                "team": self._vehicle_team(*key),
+                "shots_fired": 0, "shots_hit": 0, "shots_penetrated": 0,
+                "damage_dealt": 0, "damage_received": 0,
+                "damage_blocked": 0, "damage_assisted_track": 0,
+                "damage_assisted_radio": 0, "kills": 0,
+            }
+            self.vehicle_statistics[key] = row
+        elif not row["team"]:
+            row["team"] = self._vehicle_team(*key)
+        return row
+
+    def update_spotted_targets(self, player_id, message):
+        """Store one player's own spotted set for assist accounting only.
+
+        The claim never changes visibility, damage or any authority decision;
+        it only decides who earns radio assist for another vehicle's damage.
+        """
+        with self.lock:
+            player = self.players.get(player_id)
+            if (not self._message_round_matches(message) or
+                    not self._combat_accepting() or player is None or
+                    not player.connected or not player.participating):
+                return False
+            raw = message.get("targets")
+            if (not isinstance(raw, list) or
+                    len(raw) > len(self.players) + len(self.bot_states)):
+                return False
+            spotted = set()
+            for entry in raw:
+                if (not isinstance(entry, dict) or
+                        set(entry) != {"target_kind", "target_id"}):
+                    return False
+                kind = entry.get("target_kind")
+                try:
+                    target_id = _exact_int(
+                        entry.get("target_id"), 1, PROJECTILE_MAX_ID)
+                except ValueError:
+                    return False
+                if kind == "player":
+                    target = self.players.get(target_id)
+                    team = target.team if target is not None else 0
+                elif kind == "bot":
+                    target = self.bot_states.get(target_id)
+                    team = int(target.get("team", 0)) if target else 0
+                else:
+                    return False
+                if target is None or team == player.team:
+                    return False
+                spotted.add((kind, target_id))
+            self.player_spotted[player_id] = frozenset(spotted)
+            return True
+
+    def _radio_assisters(self, attacker, target, target_team):
+        """Return live players whose own spotted set contains this target."""
+        result = []
+        for reporter_id in sorted(self.player_spotted):
+            reporter = self.players.get(reporter_id)
+            if (reporter is None or not reporter.connected or
+                    not reporter.alive or reporter.team == target_team or
+                    ("player", reporter_id) == attacker or
+                    target not in self.player_spotted[reporter_id]):
+                continue
+            result.append(("player", reporter_id))
+        return result
+
+    def _vehicle_statistics_payload(self):
+        return [dict(self.vehicle_statistics[key])
+                for key in sorted(self.vehicle_statistics)]
+
+    def _record_damage(self, attacker, target, damage, target_critical):
+        """Attribute one applied damage amount and every assist it earned.
+
+        ``attacker`` and ``target`` are ``(kind, id)`` pairs; ``attacker`` is
+        None when the server does not own the cause.  ``target_critical`` is
+        the target's critical state before this damage.
+        """
+        damage = int(damage)
+        if damage <= 0:
+            return
+        self._statistics_row(*target)["damage_received"] += damage
+        target_team = self._vehicle_team(*target)
+        if attacker is None or self._vehicle_team(*attacker) == target_team:
+            return
+        self._statistics_row(*attacker)["damage_dealt"] += damage
+        credits = []
+        holder = self.track_immobilisers.get(target)
+        if (holder is not None and holder != attacker and
+                self._vehicle_team(*holder) != target_team and
+                _destroyed_tracks(target_critical)):
+            credits.append(("track", holder))
+        credits.extend(
+            ("radio", assister) for assister in
+            self._radio_assisters(attacker, target, target_team))
+        for category, assister in credits:
+            self._statistics_row(*assister)[
+                "damage_assisted_%s" % category] += damage
+            self.pending_events.append({
+                "kind": "assist",
+                "category": category,
+                "assister_kind": assister[0], "assister_id": assister[1],
+                "attacker_kind": attacker[0], "attacker_id": attacker[1],
+                "target_kind": target[0], "target_id": target[1],
+                "damage": damage,
+            })
+
     def _record_frag(self, attacker_kind, attacker_id, victim_team,
                      victim_kind, victim_id):
         """Copy 0.8.2 +1 enemy / -1 ally frag and team-killer law."""
@@ -4246,6 +4422,8 @@ class BattleState:
             team_killer = False
         else:
             return False
+        if delta > 0:
+            self._statistics_row(attacker_kind, attacker_id)["kills"] += 1
         self.pending_events.append({
             "kind": "vehicle_statistics",
             "actor_kind": attacker_kind,
@@ -5015,6 +5193,15 @@ class ClientHandler(socketserver.BaseRequestHandler):
                             player.player_id, message)
                         if isinstance(relay, dict):
                             server.state.broadcast_bot_observation(relay)
+                    elif message_type == "spotted_report":
+                        if not server.state.update_spotted_targets(
+                                player.player_id, message):
+                            _server_log(
+                                "SPOTTED REPORT rejected sender=%d count=%s"
+                                % (player.player_id,
+                                   len(message.get("targets"))
+                                   if isinstance(message.get("targets"), list)
+                                   else None))
                     elif message_type == "bot_hit_report":
                         accepted = server.state.report_bot_hit(
                             player.player_id, message)

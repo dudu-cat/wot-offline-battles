@@ -800,9 +800,10 @@ class _Compatibility(object):
         return True
 
     def configure_battle(self, gui_type, bonus_type, player_name=None,
-                         player_team=None):
+                         player_team=None, arena_type_id=None):
         self.configured.append(
             (gui_type, bonus_type, player_name, player_team))
+        self.arena_type_id = arena_type_id
 
     def attach_avatar_server(self, avatar, bridge):
         self.bridge = bridge
@@ -1294,8 +1295,9 @@ def _runtime():
         compatibility=compatibility, constants=constants,
         battle_feedback_common=types.SimpleNamespace(
             BATTLE_EVENT_TYPE=types.SimpleNamespace(
-                SPOTTED=0, CRIT=6, DAMAGE=7, KILL=8, RECEIVED_CRIT=9,
-                RECEIVED_DAMAGE=10, TARGET_VISIBILITY=12,
+                SPOTTED=0, RADIO_ASSIST=1, TRACK_ASSIST=2, CRIT=6,
+                DAMAGE=7, KILL=8, RECEIVED_CRIT=9,
+                RECEIVED_DAMAGE=10, STUN_ASSIST=11, TARGET_VISIBILITY=12,
                 packDamage=lambda damage, reason: (
                     (int(damage) << 16) | (int(reason) << 9)),
                 packCrits=lambda count, reason: (
@@ -10155,3 +10157,131 @@ class RecentIdSetTests(unittest.TestCase):
         self.assertEqual(3, len(seen))
         self.assertNotIn('1:1:0', seen)
         self.assertIn('1:3:0', seen)
+
+
+class ArenaIdentityTests(unittest.TestCase):
+    def test_the_avatar_carries_the_resolved_standard_arena_id(self):
+        # ArenaType.id is (gameplayID << 16) | geometryID, and the battle GUI
+        # resolves bases and the minimap from it.  Zero named geometry 0's
+        # standard bases, which drew flags belonging to another map.
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._runtime.arena_cache = {
+            0x10005: types.SimpleNamespace(
+                id=0x10005, geometryName='01_karelia',
+                gameplayName='ctf', gameplayID=1),
+            0x20005: types.SimpleNamespace(
+                id=0x20005, geometryName='01_karelia',
+                gameplayName='domination', gameplayID=2),
+        }
+
+        arena_type = battle._standard_arena('01_karelia')
+
+        self.assertIsNotNone(arena_type)
+        self.assertEqual(0x10005, arena_type.id)
+        self.assertEqual('ctf', arena_type.gameplayName)
+
+
+class AssistFeedTests(unittest.TestCase):
+    def _battle(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._records = {
+            'player:1': {'engine_id': 10, 'local': True,
+                         'state': {'team': 1, 'alive': True}},
+            'bot:7': {'engine_id': 17, 'local': False,
+                      'state': {'team': 2, 'alive': True}},
+        }
+        return battle, runtime
+
+    def _event(self, **overrides):
+        event = {
+            'kind': 'assist', 'category': 'track',
+            'assister_kind': 'player', 'assister_id': 1,
+            'attacker_kind': 'bot', 'attacker_id': 3,
+            'target_kind': 'bot', 'target_id': 7, 'damage': 240,
+        }
+        event.update(overrides)
+        return event
+
+    def test_a_local_assist_reaches_the_stock_damage_log(self):
+        battle, runtime = self._battle()
+
+        self.assertTrue(battle._apply_assist_event(self._event()))
+
+        events = runtime.bigworld.avatar.battle_events[-1]
+        self.assertEqual(1, len(events))
+        entry = events[0]
+        # RADIO_ASSIST and TRACK_ASSIST both map to
+        # PLAYER_ASSIST_TO_KILL_ENEMY, whose converter is _unpackDamage.
+        self.assertEqual(
+            int(runtime.battle_feedback_common.BATTLE_EVENT_TYPE.TRACK_ASSIST),
+            entry['eventType'])
+        self.assertEqual(17, entry['targetID'])
+        self.assertEqual(240, entry['details'] >> 16)
+
+    def test_radio_and_stun_categories_use_their_own_event_type(self):
+        battle, runtime = self._battle()
+        types_ = runtime.battle_feedback_common.BATTLE_EVENT_TYPE
+
+        battle._apply_assist_event(self._event(category='radio'))
+        self.assertEqual(
+            int(types_.RADIO_ASSIST),
+            runtime.bigworld.avatar.battle_events[-1][0]['eventType'])
+
+        battle._apply_assist_event(self._event(category='stun'))
+        self.assertEqual(
+            int(types_.STUN_ASSIST),
+            runtime.bigworld.avatar.battle_events[-1][0]['eventType'])
+
+    def test_an_assist_by_somebody_else_is_not_published(self):
+        battle, runtime = self._battle()
+        before = len(runtime.bigworld.avatar.battle_events)
+
+        self.assertFalse(battle._apply_assist_event(
+            self._event(assister_kind='bot', assister_id=7)))
+
+        self.assertEqual(before, len(runtime.bigworld.avatar.battle_events))
+
+    def test_an_unknown_assist_category_is_refused(self):
+        battle, unused_runtime = self._battle()
+
+        with self.assertRaises(RuntimeError):
+            battle._apply_assist_event(self._event(category='ramming'))
+
+
+class SpottedReportTests(unittest.TestCase):
+    def _battle(self):
+        battle = BattleRuntime(_runtime())
+        sent = []
+        battle.client = types.SimpleNamespace(
+            team=1, player_id=1,
+            send_spotted_report=lambda targets: sent.append(
+                list(targets)) or True)
+        return battle, sent
+
+    def test_only_a_changed_spotted_set_is_reported(self):
+        battle, sent = self._battle()
+        bot = {'kind': 'bot', 'network_id': 7, 'engine_id': 17}
+
+        self.assertTrue(battle._publish_spotted_targets([bot]))
+        self.assertEqual(
+            [[{'target_kind': 'bot', 'target_id': 7}]], sent)
+
+        # An unchanged set costs nothing: the server keeps the last claim.
+        self.assertFalse(battle._publish_spotted_targets([bot]))
+        self.assertEqual(1, len(sent))
+
+        self.assertTrue(battle._publish_spotted_targets([]))
+        self.assertEqual([[], ], sent[1:])
+
+    def test_a_record_without_a_network_identity_is_skipped(self):
+        battle, sent = self._battle()
+
+        battle._publish_spotted_targets([
+            {'kind': 'bot', 'network_id': None, 'engine_id': 17},
+            {'kind': 'scenery', 'network_id': 3, 'engine_id': 18},
+        ])
+
+        self.assertEqual([[]], sent)

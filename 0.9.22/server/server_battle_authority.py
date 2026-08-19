@@ -1250,7 +1250,13 @@ class ServerBattleAuthority(object):
             return None
         result = resolved[0]
         armor = combat_rules.he_nominal_armor(collisions)
-        damage = combat_rules.damage(shot, result, armor)
+        rolls = []
+
+        def roll(low, high):
+            rolls.append(random.uniform(low, high))
+            return rolls[-1]
+
+        damage = combat_rules.damage(shot, result, armor, random_uniform=roll)
         hull_damage = damage
         mock = _TargetMock(
             target['id'], target['health'], target['descriptor'],
@@ -1266,6 +1272,8 @@ class ServerBattleAuthority(object):
             'target_kind': target['kind'],
             'target_id': int(target['id']),
             'damage': int(damage),
+            # The same roll the damage law used, before armor and modules.
+            'potential_damage': int(rolls[0]) if rolls else 0,
             'shot_result': int(result),
             'x': float(state['position'][0]),
             'y': float(state['position'][1]),
