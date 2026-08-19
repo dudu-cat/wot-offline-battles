@@ -26,8 +26,11 @@ from gui.mods.offline_lan_0922.account_rpc.garage import mirror_shells_layout
 
 
 # Schema 2 fixes schema 1's vehicle settings, which were stored as a shifted
-# bit index instead of a VEHICLE_SETTINGS_FLAG value.
-SCHEMA = 2
+# bit index instead of a VEHICLE_SETTINGS_FLAG value.  Schema 3 drops files
+# written before every vehicle was fitted with its top modules and its three
+# consumables: a saved file covers the whole garage, so an older one would
+# restore the stock fitting over every new default.
+SCHEMA = 3
 STATE_PATH = os.path.join(
     os.path.dirname(port_config.CONFIG_PATH), 'garage_state.json')
 

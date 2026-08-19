@@ -35,6 +35,7 @@ EQUIPMENT_SLOT_COUNT = 3
 # battle-booster slot that every equipment payload still carries.
 EQUIPMENT_PAYLOAD_SLOT_COUNT = 4
 EQUIPMENT_TYPE_REGULAR = 0
+TURRET_ITEM_TYPE = 3
 OPTIONAL_DEVICE_ITEM_TYPE = 9
 SHELL_ITEM_TYPE = 10
 EQUIPMENT_ITEM_TYPE = 11
@@ -281,17 +282,31 @@ class GarageState(object):
         return record
 
     def install_component(self, vehicle_inventory_id, compact_descr,
-                          position_index=0):
-        """Install a module: this is the gun, turret, engine or chassis swap."""
+                          gun_compact_descr=0, position_index=0):
+        """Install a module: this is the gun, turret, engine or chassis swap.
+
+        #1513 ``installComponent`` dispatches on the gun, chassis, engine,
+        radio and fuel tank and ends in ``assert False`` for a turret, so a
+        turret goes through ``installTurret`` with the gun ``Inventory.
+        equipTurret`` carries in the third integer of ``CMD_EQUIP``.
+        """
         record = self._record(vehicle_inventory_id)
         compact_descr = _int(compact_descr)
+        gun_compact_descr = _int(gun_compact_descr)
         position_index = _int(position_index)
+        is_turret = self._item_type(compact_descr) == TURRET_ITEM_TYPE
 
         def mutate(descriptor):
-            descriptor.installComponent(compact_descr, position_index)
+            if is_turret:
+                descriptor.installTurret(
+                    compact_descr, gun_compact_descr, position_index)
+            else:
+                descriptor.installComponent(compact_descr, position_index)
 
         self._rebuild_descriptor(record, mutate)
         self._price(compact_descr)
+        if gun_compact_descr:
+            self._price(gun_compact_descr)
         # A gun swap changes which shells fit, so the stale flat pair list and
         # the shell inventory would no longer agree.  Refill from the new gun.
         self._refill_default_ammo(record)
@@ -363,7 +378,7 @@ class GarageState(object):
             return self.equip_equipments(vehicle_inventory_id, slots)
         # Every remaining owned type is a vehicle module.
         return self.install_component(
-            vehicle_inventory_id, compact_descr, slot_index)
+            vehicle_inventory_id, compact_descr, 0, slot_index)
 
     def change_vehicle_setting(self, vehicle_inventory_id, setting, is_on):
         """Set or clear one bit of a vehicle's settings mask.

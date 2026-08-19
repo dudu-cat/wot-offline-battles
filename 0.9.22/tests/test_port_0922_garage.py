@@ -111,8 +111,18 @@ class _Descriptor(object):
         del self.devices[slot_index]
 
     def installComponent(self, compact_descr, position_index):
+        # #1513 installComponent ends in ``assert False`` for a turret.
+        if compact_descr // 1000 == 3:
+            raise AssertionError(compact_descr)
         self.components[position_index] = compact_descr
         self.gun = _Component(compact_descr)
+
+    def installTurret(self, turret_compact_descr, gun_compact_descr,
+                      position_index):
+        self.components[position_index] = turret_compact_descr
+        self.turret = _Component(turret_compact_descr)
+        if gun_compact_descr:
+            self.gun = _Component(gun_compact_descr)
 
     def makeCompactDescr(self):
         return b'veh:9|dev=%s|comp=%s' % (
@@ -144,8 +154,8 @@ class _TankmanDescriptor(object):
 
 def _modules():
     def item_type(compact_descr):
-        # 9 optionalDevice, 10 shell, 11 equipment, else a vehicle module.
-        return {9: 9, 10: 10, 11: 11}.get(compact_descr // 1000, 4)
+        # 3 turret, 9 optionalDevice, 10 shell, 11 equipment, else a module.
+        return {3: 3, 9: 9, 10: 10, 11: 11}.get(compact_descr // 1000, 4)
 
     vehicles = types.SimpleNamespace(
         VehicleDescr=lambda compactDescr: _Descriptor(compactDescr),
@@ -225,8 +235,15 @@ class GarageStateTests(unittest.TestCase):
 
         self.assertNotIn(b'9001', self._record()['compDescr'])
 
+    def test_a_turret_swap_carries_its_gun_through_install_turret(self):
+        self.state.install_component(9, 3333, 4444)
+
+        record = self._record()
+        self.assertIn(b'3333', record['compDescr'])
+        self.assertEqual((3333, 4444), record['shellsLayoutIdx'])
+
     def test_a_gun_swap_refills_the_default_ammunition(self):
-        self.state.install_component(9, 4444, 0)
+        self.state.install_component(9, 4444)
 
         self.assertIn(b'4444', self._record()['compDescr'])
         self.assertEqual([20010, 30, 20011, 15], self._record()['shells'])
@@ -314,7 +331,7 @@ class GarageStateTests(unittest.TestCase):
                          record['shellsLayout'])
 
     def test_a_gun_swap_rekeys_the_ammunition_layout(self):
-        self.state.install_component(9, 4444, 0)
+        self.state.install_component(9, 4444)
 
         record = self._record()
         self.assertEqual((7001, 4444), record['shellsLayoutIdx'])

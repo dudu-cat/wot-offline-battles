@@ -168,22 +168,68 @@ class BootstrapLifecycleTests(unittest.TestCase):
         settings_module = types.ModuleType('gui.app_loader.settings')
         settings_module.GUI_GLOBAL_SPACE_ID = spaces
 
+        def _part(compact_descr, level, guns=None):
+            part = types.SimpleNamespace(
+                compactDescr=compact_descr, level=level)
+            if guns is not None:
+                part.guns = guns
+            return part
+
         def make_descriptor(nation_id, vehicle_type_id, base, tags=()):
-            return types.SimpleNamespace(
-                type=types.SimpleNamespace(
-                    id=(nation_id, vehicle_type_id),
-                    crewRoles=(('commander',), ('driver',)),
-                    tags=frozenset(tags)),
-                chassis=types.SimpleNamespace(compactDescr=base + 2),
-                turret=types.SimpleNamespace(compactDescr=base + 3),
-                gun=types.SimpleNamespace(compactDescr=base + 4),
-                engine=types.SimpleNamespace(compactDescr=base + 5),
-                fuelTank=types.SimpleNamespace(compactDescr=base + 6),
-                radio=types.SimpleNamespace(compactDescr=base + 7),
+            # Two entries per slot, stock first, exactly as #1513 orders them.
+            guns = [_part(base + 4, 3), _part(base + 14, 6)]
+            turrets = [[_part(base + 3, 2, guns[:1]),
+                        _part(base + 13, 5, guns)]]
+            vehicle_type = types.SimpleNamespace(
+                id=(nation_id, vehicle_type_id),
+                crewRoles=(('commander',), ('driver',)),
+                tags=frozenset(tags),
+                chassis=[_part(base + 2, 2), _part(base + 12, 5)],
+                turrets=turrets,
+                engines=[_part(base + 5, 2), _part(base + 15, 5)],
+                fuelTanks=[_part(base + 6, 1)],
+                radios=[_part(base + 7, 2), _part(base + 17, 5)])
+            descriptor = types.SimpleNamespace(
+                type=vehicle_type,
+                chassis=vehicle_type.chassis[0],
+                turret=turrets[0][0],
+                gun=guns[0],
+                engine=vehicle_type.engines[0],
+                fuelTank=vehicle_type.fuelTanks[0],
+                radio=vehicle_type.radios[0],
                 maxHealth=100 + vehicle_type_id,
                 makeCompactDescr=lambda: (
                     'vehicle-%d-%d' %
                     (nation_id, vehicle_type_id)).encode('ascii'))
+
+            def find(components, compact_descr):
+                for component in components:
+                    if component.compactDescr == compact_descr:
+                        return component
+                raise KeyError(compact_descr)
+
+            def install_component(compact_descr, position_index=0):
+                for attribute, mounted in (('chassis', 'chassis'),
+                                           ('engines', 'engine'),
+                                           ('radios', 'radio'),
+                                           ('fuelTanks', 'fuelTank')):
+                    components = getattr(vehicle_type, attribute)
+                    if any(item.compactDescr == compact_descr
+                           for item in components):
+                        setattr(descriptor, mounted,
+                                find(components, compact_descr))
+                        return
+                # #1513 ends installComponent in ``assert False`` for a turret.
+                raise AssertionError(compact_descr)
+
+            def install_turret(turret_cd, gun_cd, position_index=0):
+                turret = find(vehicle_type.turrets[position_index], turret_cd)
+                descriptor.gun = find(turret.guns, gun_cd)
+                descriptor.turret = turret
+
+            descriptor.installComponent = install_component
+            descriptor.installTurret = install_turret
+            return descriptor
 
         descriptors = {
             (0, 11): make_descriptor(0, 11, 2000),
@@ -196,6 +242,7 @@ class BootstrapLifecycleTests(unittest.TestCase):
             (2, 3): make_descriptor(2, 3, 9000, ('observer',)),
         }
         delattr(descriptors[(1, 9)], 'gun')
+        descriptors[(1, 9)].type.turrets = [[]]
 
         attempted_type_ids = []
 
@@ -237,6 +284,8 @@ class BootstrapLifecycleTests(unittest.TestCase):
         equipments[11200] = types.SimpleNamespace(
             compactDescr=11200, tags=frozenset(('notForSale',)),
             equipmentType=1)
+        equipment_ids = {'autoExtinguishers': 11000, 'largeMedkit': 11001,
+                         'largeRepairkit': 11002}
         crew_type_ids = []
         crew_skill_masks = []
         vehicles = types.SimpleNamespace(
@@ -250,6 +299,7 @@ class BootstrapLifecycleTests(unittest.TestCase):
             g_cache=types.SimpleNamespace(
                 customization20=lambda: customization,
                 optionalDevices=lambda: optional_devices,
+                equipmentIDs=lambda: equipment_ids,
                 equipments=lambda: equipments))
 
         def generate_tankmen(nation_id, vehicle_type_id, roles,
@@ -391,8 +441,14 @@ class BootstrapLifecycleTests(unittest.TestCase):
             [selected['tankmen'][100001], selected['tankmen'][100002]])
         self.assertEqual((0, 111), selected['repair'])
         self.assertEqual((0, 0), selected['lock'])
-        self.assertEqual([0, 0, 0], selected['eqs'])
-        self.assertEqual([0, 0, 0], selected['eqsLayout'])
+        # Every tank starts with the extinguisher, the large first aid kit
+        # and the large repair kit already mounted.
+        self.assertEqual([11000, 11001, 11002], selected['eqs'])
+        self.assertEqual([11000, 11001, 11002], selected['eqsLayout'])
+        # The top modules are mounted, not the stock ones: base 2000 gives
+        # the stock parts 2002-2007 and the top parts 2012-2017.
+        self.assertEqual((2013, 2014), selected['shellsLayoutIdx'])
+        self.assertEqual([12014, 20], selected['shells'])
         # 9 is optionalDevice and 11 is equipment: account-wide catalogues
         # the garage needs before it can offer a mount.
         self.assertEqual(set(range(2, 8)) | {9, 10, 11},
@@ -498,6 +554,43 @@ class BootstrapLifecycleTests(unittest.TestCase):
 
         self.assertEqual([], compatibility.connect_calls)
         self.assertEqual(1, len(callbacks.pending))
+
+
+class TopModuleRuleTests(unittest.TestCase):
+    """The top module is the highest level, not the last list entry."""
+
+    def setUp(self):
+        self.bootstrap = BootstrapLifecycleTests._load(self)[0]
+
+    @staticmethod
+    def _part(name, level):
+        return types.SimpleNamespace(name=name, level=level)
+
+    def test_a_low_tier_howitzer_listed_last_is_not_the_top_gun(self):
+        # usa:A63_M46_Patton lists _105mm_SPH_M4_L23 (level 5) after the
+        # level 9 gun.
+        guns = [self._part('_90mm_Gun_M3', 7),
+                self._part('_90mm_Gun_M36', 7),
+                self._part('_90mm_Gun_T15E2M2', 8),
+                self._part('_105mm_Gun_T5E1M2', 9),
+                self._part('_105mm_SPH_M4_L23', 5)]
+
+        self.assertEqual('_105mm_Gun_T5E1M2',
+                         self.bootstrap._top_component(guns).name)
+
+    def test_a_tie_takes_the_later_entry(self):
+        parts = [self._part('stock', 5), self._part('later', 5)]
+
+        self.assertEqual('later', self.bootstrap._top_component(parts).name)
+
+    def test_a_single_entry_keeps_the_retail_fitting(self):
+        parts = [self._part('only', 1)]
+
+        self.assertEqual('only', self.bootstrap._top_component(parts).name)
+
+    def test_an_empty_list_has_no_top(self):
+        self.assertIsNone(self.bootstrap._top_component(()))
+        self.assertIsNone(self.bootstrap._top_component(None))
 
 
 if __name__ == '__main__':

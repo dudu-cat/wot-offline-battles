@@ -120,13 +120,12 @@ def _equip_optional_device(context, args):
 
 
 def _equip_component(context, args):
-    # [shopRev, vehInvID, compactDescr, positionIndex, ...]
-    values = list(args[0] if args else ())
-    if len(values) < 3:
+    # _doCmdInt3: (vehInvID, compactDescr, gunCompactDescr).  Inventory.equip
+    # sends 0 in the third slot; Inventory.equipTurret puts the gun there.
+    if len(args) < 3:
         return Result(commands.RES_FAILURE, 'INVALID_MODULE_REQUEST')
-    position = values[3] if len(values) > 3 else 0
     return _fitting(context, lambda state: state.install_component(
-        values[1], values[2], position))
+        args[0], args[1], args[2]))
 
 
 def _set_and_fill_layouts(context, args):

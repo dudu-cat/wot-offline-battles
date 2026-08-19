@@ -175,6 +175,75 @@ def _vehicle_type_modules(descriptor):
         yield ('vehicleGun', compact_descr)
 
 
+# equipments.xml: autoExtinguishers id=1, largeMedkit id=3, largeRepairkit
+# id=5.  None carries a <type>, a vehicleFilter or an incompatibleTags section,
+# so all three are regular consumables that fit every vehicle.
+_DEFAULT_CONSUMABLE_NAMES = ('autoExtinguishers', 'largeMedkit',
+                             'largeRepairkit')
+
+
+def _default_consumables(vehicles):
+    """Return the compact descriptors of the three mounted consumables.
+
+    They come from the cache rather than from a rebuilt id, because #1513
+    gives an artefact ``nations.NONE_INDEX`` instead of a real nation.
+    """
+    ids = vehicles.g_cache.equipmentIDs()
+    equipments = vehicles.g_cache.equipments()
+    slots = []
+    for name in _DEFAULT_CONSUMABLE_NAMES:
+        descriptor = equipments.get(ids.get(name))
+        if descriptor is None or not _offers_in_random_battle(descriptor):
+            raise ValueError('client equipment %r is unavailable' % (name,))
+        slots.append(int(descriptor.compactDescr))
+    return slots
+
+
+def _top_component(components):
+    """Return the highest ``level``, ties broken by the later list position.
+
+    ``_readLevel`` gives every chassis, turret, gun, engine, fuel tank and
+    radio a level of 1 to 10, so this rule is total.  The last list entry is
+    not the top one: nineteen vehicles list a low-tier howitzer last.  Nor is
+    the leaf of ``unlocksDescrs``, because a top module is usually a
+    prerequisite of the next vehicle's own unlock entry.
+    """
+    best = None
+    for index, descriptor in enumerate(components or ()):
+        key = (int(getattr(descriptor, 'level', 1)), index)
+        if best is None or key >= best[0]:
+            best = (key, descriptor)
+    return None if best is None else best[1]
+
+
+def _install_top_modules(descriptor):
+    """Fit the top module of every slot, in the order #1513 accepts.
+
+    A vehicle with nothing to research, which is every premium, keeps the
+    exact fitting retail gives it, because each list then holds one entry.
+    """
+    vehicle_type = descriptor.type
+    # The chassis goes first: installTurret reruns __selectBestHull against
+    # the mounted chassis, so the hull is chosen once against the final pair.
+    chassis = _top_component(vehicle_type.chassis)
+    if chassis is not None:
+        descriptor.installComponent(chassis.compactDescr, 0)
+    # installComponent ends in ``assert False`` for a turret.  installTurret
+    # takes the pair and resolves the gun against the new turret's own guns,
+    # which is the only order that accepts a top gun.
+    for position in range(len(vehicle_type.turrets)):
+        turret = _top_component(vehicle_type.turrets[position])
+        gun = None if turret is None else _top_component(turret.guns)
+        if gun is not None:
+            descriptor.installTurret(
+                turret.compactDescr, gun.compactDescr, position)
+    for attribute in ('engines', 'radios', 'fuelTanks'):
+        component = _top_component(getattr(vehicle_type, attribute, None))
+        if component is not None:
+            descriptor.installComponent(component.compactDescr, 0)
+    return descriptor
+
+
 def _turret_descriptors(vehicle_type):
     stack = [getattr(vehicle_type, 'turrets', None)]
     while stack:
@@ -195,6 +264,7 @@ def _selected_vehicle(config):
         selected_descriptor = vehicles.VehicleDescr(
             typeName=config['vehicle'])
         selected_type_id = tuple(selected_descriptor.type.id)
+        default_consumables = _default_consumables(vehicles)
 
         # The exact #1513 VehicleList exposes one nation-indexed mapping for
         # every nations.NAMES entry.  Put the configured vehicle first so its
@@ -227,6 +297,7 @@ def _selected_vehicle(config):
                         descriptor.type.tags):
                     raise ValueError(
                         'vehicle type is not available in standard battles')
+                _install_top_modules(descriptor)
                 # generateTankmen filters this mask through each crew role;
                 # only the commander receives the offline Sixth Sense perk.
                 skills_mask = tankmen.getSkillsMask(
@@ -339,8 +410,8 @@ def _selected_vehicle(config):
                 'shellsLayout': {layout_key: list(shells)},
                 'shellsLayoutIdx': layout_key,
                 'settings': default_settings,
-                'eqs': [0, 0, 0],
-                'eqsLayout': [0, 0, 0],
+                'eqs': list(default_consumables),
+                'eqsLayout': list(default_consumables),
                 'inventoryItems': record_inventory_items,
                 'vehicleTypeCompactDescr': vehicle_int_compact_descr,
             })
