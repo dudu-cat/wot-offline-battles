@@ -24,6 +24,9 @@ _state = {'spaceID': None, 'chunks': {}, 'entities': set()}
 _APPLY_REPORT_LIMIT = 24
 _applies_reported = [0]
 
+_CHUNK_REPORT_LIMIT = 24
+_chunks_reported = [0]
+
 _PROP_BY_KIND = {
 	'tree': 'fallenTrees',
 	'column': 'fallenColumns',
@@ -56,6 +59,18 @@ def reset(spaceID=None):
 	_state['chunks'] = {}
 	_state['entities'] = set()
 	_applies_reported[0] = 0
+	_chunks_reported[0] = 0
+
+
+def _report_chunk(event, spaceID, chunkID, pos, extra=''):
+	"""Say what each of the first chunk-scoped orders this round asked for."""
+	if _chunks_reported[0] >= _CHUNK_REPORT_LIMIT:
+		return
+	_chunks_reported[0] += 1
+	sys.stdout.write(
+		'[Offline LAN 0.9.22] DESTR chunk %s chunk=%s space=%s '
+		'at=(%.1f, %.1f, %.1f)%s\n' % (
+			event, chunkID, spaceID, pos[0], pos[1], pos[2], extra))
 
 
 def _ensure_shape():
@@ -109,7 +124,15 @@ def _ensure_chunk(spaceID, chunkID, pos):
 	_cur_sid = int(spaceID) if spaceID is not None else None
 	_mgr_sid = mgr.getSpaceID()
 	if _cur_sid is not None and _mgr_sid != _cur_sid:
+		# startSpace() runs clear(), which drops the manager's streamed-chunk
+		# map, its controllers and its saved destructible matrices.
+		loaded = getattr(
+			mgr, '_DestructiblesManager__loadedChunkIDs', None)
+		streamed = len(loaded) if isinstance(loaded, dict) else 'unavailable'
 		mgr.startSpace(_cur_sid)
+		_report_chunk('startSpace', spaceID, chunkID, pos,
+			' was=%s now=%s dropped_streamed_chunks=%s' % (
+				_mgr_sid, mgr.getSpaceID(), streamed))
 	if chunkID not in _state['entities']:
 		c = _chunk(chunkID)
 		entityID = BigWorld.createEntity('AreaDestructibles', spaceID, 0, Math.Vector3(pos[0], pos[1], pos[2]), (0.0, 0.0, 0.0), {
@@ -125,6 +148,15 @@ def _ensure_chunk(spaceID, chunkID, pos):
 		# createEntity may complete asynchronously, but a failed call must remain
 		# retryable instead of permanently poisoning this chunk.
 		_state['entities'].add(chunkID)
+		# AreaDestructibles.onEnterWorld ignores the caller's chunk and derives
+		# its own from the entity position, so report both.
+		reader = getattr(AreaDestructibles, 'chunkIDFromPosition', None)
+		try:
+			derived = reader(Math.Vector3(pos[0], pos[1], pos[2]))
+		except Exception as error:
+			derived = 'unavailable:%s' % (error,)
+		_report_chunk('controller', spaceID, chunkID, pos,
+			' entity=%s derived_chunk=%s' % (entityID, derived))
 	# ``game.wg_onChunkLoad`` owns the manager's exact native slot count. The
 	# filename helper may expose only the named SpeedTree prefix, so synthesising
 	# onChunkLoad from its length truncates later fragile/structure/falling slots

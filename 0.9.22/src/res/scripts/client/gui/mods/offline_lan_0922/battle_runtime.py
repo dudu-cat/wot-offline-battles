@@ -1022,6 +1022,7 @@ class BattleRuntime(object):
         self._drown_level = 0
         self._drown_started = None
         self._outlined_engine_id = None
+        self._outlined_entity = None
         self._next_outline_time = 0.0
         self._mouse_target_matrix = None
         self._outline_report = None
@@ -2194,6 +2195,10 @@ class BattleRuntime(object):
 
     def _on_control_mode_changed(self, handler, mode):
         """Verify the new control captured its canonical pose."""
+        # AvatarInputHandler.onControlModeChanged calls
+        # _Targeting.onRecreateDevice, which clears BigWorld.target; the engine
+        # then reaches targetBlur and removes the previous edge.
+        self._clear_target_outline()
         if self.state != 'running' or self._local_matrix is None:
             return False
         modes = getattr(self._runtime.avatar_input_handler, '_CTRL_MODE', None)
@@ -7311,59 +7316,83 @@ class BattleRuntime(object):
             math.radians(TARGET_SELECTION_FOV_DEGREES * 0.5))
         deselection_cos = math.cos(
             math.radians(TARGET_DESELECTION_FOV_DEGREES * 0.5))
+        held_id = self._outlined_engine_id
+        held_seen = False
+        held_angle = None
+        held_reason = None
         chosen = None
         chosen_rank = None
-        keep_current = False
         miss = None
         decline = None
         for record in self._records.values():
             if record.get('local'):
                 continue
             engine_id = record.get('engine_id')
+            held = held_id is not None and engine_id == held_id
+            held_seen = held_seen or held
+            vehicle = None
+            distance = 0.0
+            reason = None
             if not record.get('ready') or record.get('tombstone'):
-                decline = decline or (engine_id, 'is not ready')
-                continue
-            if not record.get('spot_visible', True):
-                decline = decline or (engine_id, 'is not spotted')
-                continue
-            vehicle = self._server_entity(engine_id)
-            if vehicle is None or getattr(vehicle, 'bw_entity', None) is None:
-                decline = decline or (engine_id, 'has no visual entity')
-                continue
-            if not vehicle.isAlive():
-                decline = decline or (engine_id, 'is destroyed')
-                continue
-            offset = self._vector(_xyz(vehicle.position)) - start
-            distance = offset.length
-            if distance > TARGET_MAX_DISTANCE:
-                decline = decline or (
-                    engine_id, 'is past %.0f m' % TARGET_MAX_DISTANCE)
+                reason = 'is not ready'
+            elif not record.get('spot_visible', True):
+                reason = 'is not spotted'
+            else:
+                vehicle = self._server_entity(engine_id)
+                if (vehicle is None or
+                        getattr(vehicle, 'bw_entity', None) is None):
+                    reason = 'has no visual entity'
+                elif not vehicle.isAlive():
+                    reason = 'is destroyed'
+                else:
+                    offset = self._vector(_xyz(vehicle.position)) - start
+                    distance = offset.length
+                    if distance > TARGET_MAX_DISTANCE:
+                        reason = 'is past %.0f m' % TARGET_MAX_DISTANCE
+            if reason is not None:
+                if held:
+                    held_reason = reason
+                decline = decline or (engine_id, reason)
                 continue
             cosine = 1.0
             if distance > 0.0:
                 cosine = min(1.0, max(-1.0, (
                     offset.x * direction.x + offset.y * direction.y +
                     offset.z * direction.z) / distance))
+            angle = math.degrees(math.acos(cosine))
             if vehicle.collideSegmentExt(start, end):
                 rank = (0, distance)
             elif cosine >= selection_cos:
                 rank = (1, -cosine)
             else:
-                if (self._outlined_engine_id is not None and
-                        engine_id == self._outlined_engine_id and
-                        cosine >= deselection_cos):
-                    keep_current = True
-                angle = math.degrees(math.acos(cosine))
+                if held:
+                    if cosine >= deselection_cos:
+                        held_angle = angle
+                    else:
+                        held_reason = (
+                            'is %.1f deg off the cursor, outside the %.0f deg '
+                            'deselection cone' % (
+                                angle, TARGET_DESELECTION_FOV_DEGREES))
                 if miss is None or angle < miss[0]:
                     miss = (angle, engine_id, distance)
                 continue
             if chosen_rank is None or rank < chosen_rank:
                 chosen_rank = rank
                 chosen = engine_id
-        if chosen is None and keep_current:
-            chosen = self._outlined_engine_id
-        self._report_target_outline(now, chosen, miss, decline)
-        if chosen == self._outlined_engine_id:
+        if chosen is None and held_angle is not None:
+            chosen = held_id
+        # Retail drops the target when it stops being eligible, not only when
+        # it leaves the cone, and a vehicle the round no longer records at all
+        # can never be kept.
+        if held_id is not None and chosen != held_id and held_reason is None:
+            held_reason = ('left the record set' if not held_seen
+                           else 'lost the cursor')
+        dropped = None
+        if held_id is not None and chosen != held_id:
+            dropped = (held_id, held_reason)
+        self._report_target_outline(
+            now, chosen, held_angle, miss, decline, dropped)
+        if chosen == held_id:
             return
         self._clear_target_outline()
         if chosen is None:
@@ -7377,18 +7406,28 @@ class BattleRuntime(object):
         if not callable(add_edge):
             raise RuntimeError('#1513 edge-detect add boundary is unavailable')
         add_edge(vehicle.bw_entity, color, 0, False)
+        # Record the exact entity the engine now draws before anything else can
+        # fail.  An untracked registration is never removed.
+        self._outlined_engine_id = chosen
+        self._outlined_entity = vehicle.bw_entity
         set_candidate = getattr(
             self._runtime.compatibility, 'set_target_lock_candidate', None)
         if not callable(set_candidate):
             raise RuntimeError(
                 '#1513 target-lock candidate boundary is unavailable')
         set_candidate(vehicle)
-        self._outlined_engine_id = chosen
 
-    def _report_target_outline(self, now, chosen, miss, decline):
+    def _report_target_outline(self, now, chosen, held_angle, miss, decline,
+                               dropped):
         """Print each new outline decision, at most once a second."""
-        if chosen is not None:
+        if chosen is not None and held_angle is not None:
+            message = (
+                'held id=%s at %.1f deg, inside the %.0f deg deselection cone'
+                % (chosen, held_angle, TARGET_DESELECTION_FOV_DEGREES))
+        elif chosen is not None:
             message = 'outlined id=%s' % chosen
+        elif dropped is not None:
+            message = 'none: dropped id=%s, it %s' % dropped
         elif miss is not None:
             message = (
                 'none: id=%s is %.1f deg off the cursor at %.0f m'
@@ -7404,25 +7443,28 @@ class BattleRuntime(object):
         sys.stdout.write('[Offline LAN 0.9.22] TARGET %s\n' % message)
 
     def _clear_target_outline(self):
-        if self._outlined_engine_id is None:
+        entity = self._outlined_entity
+        if self._outlined_engine_id is None and entity is None:
             return
-        vehicle = (self._remote_factory.get(self._outlined_engine_id)
-                   if self._remote_factory is not None else None)
         self._outlined_engine_id = None
+        self._outlined_entity = None
         set_candidate = getattr(
             self._runtime.compatibility, 'set_target_lock_candidate', None)
         if not callable(set_candidate):
             raise RuntimeError(
                 '#1513 target-lock candidate boundary is unavailable')
         set_candidate(None)
-        if vehicle is None or vehicle.bw_entity is None:
+        factory = self._remote_factory
+        if entity is None or factory is None or not factory.engine_active():
+            # Once the engine has reset the entity manager, the registration
+            # went with the entity and must not be touched again.
             return
         remove_edge = getattr(
             self._runtime.bigworld, 'wgDelEdgeDetectEntity', None)
         if not callable(remove_edge):
             raise RuntimeError(
                 '#1513 edge-detect remove boundary is unavailable')
-        remove_edge(vehicle.bw_entity)
+        remove_edge(entity)
 
     def _observe_local_vehicle(self, message, now):
         """Feed authority visibility into the native #1513 Sixth Sense HUD."""
@@ -10243,6 +10285,7 @@ class BattleRuntime(object):
                         cleanup_error = error
             else:
                 self._outlined_engine_id = None
+                self._outlined_entity = None
             if engine_active:
                 for record in tuple(self._records.values()):
                     if not record.get('presentation'):
@@ -10325,6 +10368,7 @@ class BattleRuntime(object):
         self._lobby_retire_started = False
         self._mouse_target_matrix = None
         self._outline_report = None
+        self._outlined_entity = None
         self._avatar = None
         self._binding = None
         self._server = None

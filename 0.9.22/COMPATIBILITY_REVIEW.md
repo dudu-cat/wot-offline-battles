@@ -1456,6 +1456,235 @@ loads fast enough to lose the race is an inference, most plausibly one whose
 compound another kill already cached; the dump proves the ordering, not the
 cause of the load time.
 
+## Quitting a live battle destroys a bot sound object after the scene dies
+
+The fourth full dump was taken at `14:08:56` on build `6fbf615` after Peng left
+the game with Alt+F4. It is the first dump in this series that carries a real
+`ExceptionStream`, and the exception it reports is not the original fault.
+
+### What the dump reports, and why it is a stack overflow
+
+The `ExceptionStream` names thread `0x115c`, code
+`EXCEPTION_ACCESS_VIOLATION` (`0xC0000005`), `ExceptionAddress 0x00701b50`,
+and `ExceptionInformation [1, 724728]`. Parameter 0 is `1`, so this is a
+write, and parameter 1 is `0x000b0ef8`. The thread's saved stack runs
+`0x000b11e0` to `0x001b0000`, `Esp` is `0x000b11e4`, and the faulting write
+sits `0x2ec` bytes below `Esp`. The whole 1 MB main-thread stack is used, so
+the reported fault is stack exhaustion.
+
+The stack holds 309 saved `CONTEXT` records, every one with the same
+`Eip 0x00701b50`, `Ecx 0`, `Eax 0` and `Esi 0xC0000005`. Each nested
+`EXCEPTION_RECORD`, for example the one at `0x000b4344`, reads code
+`0xC0000005`, flags `0x10` (`EXCEPTION_NESTED_CALL`), `ExceptionAddress
+0x00701b50`, and parameters `0` and `0x190`. So the client faulted the same
+way 309 times and then ran out of stack.
+
+The repeated fault is inside the client's own crash reporter.
+
+```
+00701b50  mov ecx, dword ptr [ecx + 0x190]   ; ecx == 0  ->  read @ 0x190
+00701b56  test ecx, ecx
+00701b58  jne 0x708cf0
+00701b5e  ret
+```
+
+Its caller is one instruction earlier in the chain:
+
+```
+0061412b  mov ecx, dword ptr [0x1d2a448]
+00614131  call 0x701b50
+```
+
+`[0x01d2a448]` is `0` in the dump. That global is the application object: it is
+stored at `0x006fd9e4` and cleared at `0x006fdd86`, and the routine
+`0x00701b50` tail-jumps into, `0x00708cd0`, holds the literal
+`"Exceptional finalizing....."`. So the reporter's first step asks the
+application to finalize, and by shutdown the application object is gone.
+
+Function `0x00613f70` holds that call, and `[0x01d24340] == 0x00613f70` in the
+dump. BigWorld's unhandled-exception reporter is `0x006858c0`; it loads
+`[0x01d24340]` at `0x006858d3` and calls that hook **before** the
+`cmp esi, 0xc0000005` at `0x006858fc` that begins formatting the report. The
+hook faults, the same filter runs again, and the exception nests until the
+stack dies.
+
+This is why the dump carries no report text. Searching the whole 1.4 GB image
+for `BigWorld Client has encountered` finds only the two `.rdata` literals at
+`0x014b7eac` and `0x014b7f0c`, never a formatted copy. The rule for this port:
+after `game.fini` starts, this client cannot report a crash. Read the outermost
+saved `EXCEPTION_POINTERS` at the top of the main stack instead.
+
+### The original fault: a null scene pointer
+
+The outermost `EXCEPTION_POINTERS` is at `0x001af378`. It points at
+`EXCEPTION_RECORD 0x001af4b0` and `CONTEXT 0x001af500`.
+
+The record reads code `0xC0000005`, flags `0`, `ExceptionAddress 0x008e057f`,
+`NumberParameters 2`, parameters `0` and `4`, so it is a **read of address
+`0x00000004`**. The context reads `Eip 0x008e057f`, `Edx 0`, `Ecx 9`,
+`Esp 0x001af7ec`, `Ebp 0x001af7fc`.
+
+The faulting routine turns a scene handle into a transform entry:
+
+```
+008e0570  mov edx, dword ptr [0x1d211b8]     ; current scene
+008e0576  mov ecx, dword ptr [ecx + 0xc]
+008e0579  and ecx, 0xffffff                  ; 24-bit handle, ecx == 9
+008e057f  mov eax, dword ptr [edx + 4]       ; edx == 0  ->  read @ 4
+008e0582  mov eax, dword ptr [eax + ecx*4]
+008e058a  imul eax, eax, 0x74
+008e058d  add eax, dword ptr [edx + 0x20]
+```
+
+`[0x01d211b8]` is `0` in the dump. This is the same trap family as the outline
+crash above: a lookup with no null test on the table it indexes.
+
+### The reconstructed call chain
+
+The frame-pointer chain from `Ebp 0x001af7fc` is complete, and the exe's RTTI,
+literals and type objects name every frame.
+
+| Frame | Return address | Function | Identity |
+| --- | --- | --- | --- |
+| 0 | fault at `0x008e057f` | RVA `0x4e0570` | scene handle to transform lookup |
+| 1 | `0x008dd4c1` | RVA `0x4dd430` | `BW::PyModelNodeAdapter` world matrix |
+| 2 | `0x01250e66` | RVA `0xe50e10` | sound game object position push |
+| 3 | `0x012510e2` | RVA `0xe51080` | sound game object record update |
+| 4 | `0x0124ade0` | RVA `0xe4ad70` | `_WWISE.SoundObject` native destructor |
+| 5 | `0x006dedbb` | RVA `0x2ded90` | `_WWISE.SoundObject` `tp_dealloc` |
+| 6-10 | `0x00fe30a8`, `0x00fc2b04`, `0x00fc28c8` | | Python dealloc cascade |
+| 11 | `0x00fea51e` | RVA `0xbea4de` | `collect()`, gcmodule.c |
+| 12 | `0x00fe9d3d` | RVA `0xbe9d20` | `PyGC_Collect` |
+| 13 | `0x006355e5` | RVA `0x235560` | main-loop task that runs the shutdown collection |
+| 14-15 | `0x0063a40a` | RVA `0x23a343` | `BW::MainLoopTasks::fini`, nested group |
+| 16 | `0x0063a4cb` | RVA `0x23a4b0` | `BW::MainLoopTasks::fini`, root |
+| 17 | `0x00617e7b` | RVA `0x217d60` | `App::~App` |
+| 18 | `0x006181ab` | RVA `0x2181a0` | `App` deleting destructor |
+| 19 | `0x006131b5` | RVA `0x212ca1` | `main` |
+| 20 | `0x00602fd3` | RVA `0x202f65` | `main`'s `__try` body |
+| 21 | `0x013d7e86` | | CRT startup |
+
+Frame 1 is reached through the virtual matrix slot at `0x01250e63`
+(`call dword ptr [eax + 8]`), and the receiver `0x39f27c80` has RTTI
+`.?AVPyModelNodeAdapter@BW@@`. Frame 5 is the `tp_dealloc` of the type object
+at `0x01b63cb0`, whose `tp_name` is `_WWISE.SoundObject` and whose
+`tp_dealloc` is `0x006ded90`. Frame 11 is anchored by the literal
+`"gc: done, %d unreachable, %d uncollectable"` at `0x00fea69f`.
+
+So the process was inside the engine's shutdown garbage collection, freeing an
+unreachable reference cycle, and the destructor of one `_WWISE.SoundObject`
+asked its matrix provider for a world matrix after the scene was gone.
+
+### The cycle the collector was freeing is this port's
+
+Four Python objects sit on that stack, read through their type objects:
+
+| Object | Type | Refcount |
+| --- | --- | --- |
+| `0x3c9007a4` | `_WWISE.SoundObject` | 0 |
+| `0x3e234eb0` | `_RemoteEngineAudition` | 0 |
+| `0x3e2345d0` | `_RemoteAppearance` | 0 |
+| `0x3e234810` | `Vehicle` | 6 |
+
+The appearance's instance dictionary reads `compoundModel = None`,
+`models = []`, `isLoaded = False`, `_bound_effects = None` and
+`gunRecoil = None`. Those are exactly the assignments
+`_RemoteAppearance.abandon` makes, so the abandon path did run. The audition's
+`_objects` dictionary still holds `{2: <_WWISE.SoundObject>}`, and only
+`_RemoteEngineAudition.detach` empties it, so the detach path did not run.
+
+The census confirms the scale. The dump holds 30 live `Vehicle`, 30
+`_RemoteAppearance` and 30 `_RemoteEngineAudition` objects, and exactly six of
+those auditions still cache one sound object. Six sound names exist in the
+heap: `offline_lan_vehicle_1004_sound_2`, `_1010_`, `_1011_`, `_1015_`,
+`_1018_` and `_1019_`. Six bots fired in that battle, and each left its gun
+sound object alive. The collector freed the first of the six and faulted; the
+other five carried the same fault.
+
+`Vehicle`, `_RemoteAppearance` and `_RemoteEngineAudition` point at each other
+through `_owner`, so the group is a reference cycle. Clearing
+`RemoteVehicleFactory._vehicles` makes it unreachable but does not free it.
+Only a collection frees it, and the collection that frees it is the one the
+engine runs from `MainLoopTasks::fini`.
+
+### The one window where the release is safe, and the port misses it
+
+Exact `scripts/client/game.pyc` fixes the Python order:
+
+1. `g_postProcessing.fini()` - the last line in `python.log`, `14:08:55.226`;
+2. `EdgeDetectColorController.g_instance.destroy()`;
+3. `BigWorld.resetEntityManager(False, False)`;
+4. `BigWorld.clearAllSpaces()`;
+5. `TriggersManager.g_manager.destroy()`;
+6. `gui_personality.fini()` - `guiModsFini` and this mod's `fini` run here;
+7. `SoundGroups.g_instance.destroy()`.
+
+The exe fixes where that sits in the native shutdown. `App::fini`
+(`0x00624ef0`, which holds both `"fini"` and `"App::~App: "`) calls the Python
+`fini`. Only afterwards does `main` destroy the application object, and
+`App::~App` (`0x00617d60`) calls `MainLoopTasks::fini` (`0x0063a4b0`) at
+`0x00617e76`.
+
+The scene pointer follows the `WorldApp` task, not a space. `WorldApp::init`
+(`0x00637730`) constructs it once at `0x006378f1`, the constructor at
+`0x008db610` stores `this` into `[0x01d211b8]`, and `WorldApp::fini`
+(`0x00637560`, the fini slot of the `World/App` task record at `0x014b0bc4`)
+zeroes it at `0x00637647`.
+
+So `[0x01d211b8]` is still valid while `guiModsFini` runs, and it is null by
+the time `MainLoopTasks::fini` collects. The port holds its sound objects
+across the one window in which it could release them, and hands them to the
+collection that cannot.
+
+`RemoteVehicleFactory.destroy` chooses `abandon_visual` whenever
+`engine_owns(visual_id)` is false, which is every vehicle once
+`BigWorld.resetEntityManager` has run. `_RemoteAppearance.detach` releases the
+sound objects; `_RemoteAppearance.abandon` does not. That single difference is
+the defect.
+
+`engine_active()` is still the right guard for the objects it was written for.
+A compound, a filter and a track-scroll controller belong to the entity
+manager. A `_WWISE.SoundObject` belongs to the sound engine and to the
+`WorldApp` scene, so the abandon path must release it rather than skip it.
+
+### The fix
+
+`_RemoteAppearance.abandon` must release the cached sound objects, using the
+call `detach` already makes:
+
+```python
+def abandon(self):
+    self.engineAudition.detach()
+    self._bound_effects = None
+    ...
+```
+
+Nothing else changes. The release happens inside `guiModsFini`, one step before
+`SoundGroups.g_instance.destroy()`, while both the scene registry and the model
+the `PyModelNodeAdapter` holds are alive.
+
+One hardening step is available if a real client still faults in that
+destructor. `_WWISE.SoundObject` exposes a settable `matrixProvider` (getter
+`0x0124b560`, setter `0x0124b780`). The setter replaces the record's provider
+first, at `0x01251121`, and then pushes the position through the new provider
+read back at `0x0125115a`. The destructor instead passes a null provider at
+`0x0124add1`, which is why it always pushes through the old one. Assigning a
+plain `Math.Matrix` before the release therefore removes the scene lookup
+completely, and it is the same idiom `detach_visual` already uses for
+`model.matrix`.
+
+### Evidence ladder for this crash
+
+- The dump proves the fault codes and addresses, the 309 nested contexts, the
+  two null globals, the Python object graph, and the six-object census.
+- The exe disassembly proves every function identity, the crash-reporter
+  ordering, and that the scene pointer lives for the `WorldApp` task.
+- The exact `game.pyc` proves the `game.fini` order.
+- It is an inference that the remaining five cached sound objects carry the
+  same fault. The collector faulted on the first one it reached.
+- It is unproved that the release inside `guiModsFini` succeeds. Only a run on
+  the exact Windows client can prove that.
+
 ## A burning remote vehicle has no flame, because nothing starts the extra
 
 Peng reports that an enemy vehicle never shows fire while it burns. The

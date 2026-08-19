@@ -257,6 +257,23 @@ class _Model(object):
             position.x, position.y + 1.5, position.z))
 
 
+class _Watched(object):
+    """Record the order of attribute writes reaching one native stand-in."""
+
+    def __init__(self, target, label, order):
+        object.__setattr__(self, '_target', target)
+        object.__setattr__(self, '_label', label)
+        object.__setattr__(self, '_order', order)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, '_target'), name)
+
+    def __setattr__(self, name, value):
+        object.__getattribute__(self, '_order').append(
+            (object.__getattribute__(self, '_label'), name, value is None))
+        setattr(object.__getattribute__(self, '_target'), name, value)
+
+
 class _FireExtra(object):
     """helpers.EntityExtra plus the vehicle_extras.Fire guards of #1513."""
 
@@ -1603,6 +1620,31 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual('offline_lan_vehicle_1000_sound_3', name)
         self.assertIsNotNone(node)
 
+    def test_abandoning_a_visual_releases_its_cached_sound_objects(self):
+        """A _WWISE.SoundObject belongs to the sound engine and the WorldApp
+        scene, not to the entity manager, so guiModsFini must release it while
+        that scene is still alive.  The shutdown GC runs after it is gone."""
+        vehicle = RemoteVehicle(
+            1004, _Descriptor(), {
+                'publicInfo': {'team': 2, 'name': 'Bot'},
+                'health': 500, 'isCrewActive': True,
+                'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0),
+            types.SimpleNamespace(Vector3=_Vector, Matrix=_Matrix))
+        vehicle.model = _Model()
+        sound_object = mock.Mock()
+        sound_module = types.ModuleType('SoundGroups')
+        sound_module.g_instance = types.SimpleNamespace(
+            WWgetSoundObject=mock.Mock(return_value=sound_object))
+        with mock.patch.dict(sys.modules, {'SoundGroups': sound_module}):
+            vehicle.appearance.engineAudition.getSoundObject(2)
+        self.assertEqual(
+            {2: sound_object}, vehicle.appearance.engineAudition._objects)
+
+        vehicle.abandon_visual()
+
+        self.assertEqual({}, vehicle.appearance.engineAudition._objects)
+
     def test_remote_shot_effect_contract_failure_is_not_hidden(self):
         class BrokenExtra(object):
             def stopFor(self, unused_vehicle):
@@ -2245,6 +2287,187 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertIn('45.0 deg off the cursor', battle._outline_report)
         self.assertIn('424 m', battle._outline_report)
         factory.destroy_all()
+
+    def test_the_outline_leaves_the_exact_entity_that_received_it(self):
+        """Highlighter removes the edge from the entity it added, so the port
+        must too, even after the remote vehicle has dropped that entity."""
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(0.0, 0.0, 20.0),
+            (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        vehicle.collideSegmentExt = lambda start, end: (
+            types.SimpleNamespace(dist=20.0),)
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._remote_factory = factory
+        battle._records = {
+            'bot:11': {'engine_id': vehicle_id, 'local': False,
+                       'ready': True, 'spot_visible': True}}
+
+        battle._update_target_outline(1.0)
+        outlined = vehicle.bw_entity
+        self.assertEqual([(outlined, 1, 0, False)],
+                         runtime.bigworld.edge_adds)
+        vehicle.bw_entity = None
+        battle._clear_target_outline()
+
+        self.assertEqual([outlined], runtime.bigworld.edge_removes)
+        self.assertIsNone(battle._outlined_engine_id)
+        vehicle.bw_entity = outlined
+        factory.destroy_all()
+
+    def test_a_control_mode_change_drops_the_outline(self):
+        """AvatarInputHandler.onControlModeChanged clears BigWorld.target, and
+        the engine then reaches targetBlur, which removes the edge."""
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(0.0, 0.0, 20.0),
+            (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        vehicle.collideSegmentExt = lambda start, end: (
+            types.SimpleNamespace(dist=20.0),)
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._remote_factory = factory
+        battle._records = {
+            'bot:11': {'engine_id': vehicle_id, 'local': False,
+                       'ready': True, 'spot_visible': True}}
+
+        battle._update_target_outline(1.0)
+        outlined = vehicle.bw_entity
+        battle._on_control_mode_changed(None, 'arcade')
+
+        self.assertEqual([outlined], runtime.bigworld.edge_removes)
+        self.assertIsNone(battle._outlined_engine_id)
+        factory.destroy_all()
+
+    def test_the_report_names_why_a_held_target_was_kept(self):
+        """A target kept only by the deselection cone must say so, so a log
+        separates a real cursor hit from a hold."""
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(36.397, 0.0, 100.0),
+            (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        hits = [True]
+        vehicle.collideSegmentExt = lambda start, end: (
+            (types.SimpleNamespace(dist=100.0),) if hits[0] else ())
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._remote_factory = factory
+        battle._records = {
+            'bot:11': {'engine_id': vehicle_id, 'local': False,
+                       'ready': True, 'spot_visible': True}}
+
+        battle._update_target_outline(1.0)
+        outlined = vehicle.bw_entity
+        hits[0] = False
+        battle._update_target_outline(2.0)
+
+        self.assertEqual([(outlined, 1, 0, False)],
+                         runtime.bigworld.edge_adds)
+        self.assertEqual([], runtime.bigworld.edge_removes)
+        self.assertEqual(vehicle_id, battle._outlined_engine_id)
+        self.assertIn('held id=%s' % vehicle_id, battle._outline_report)
+        self.assertIn('deselection cone', battle._outline_report)
+        factory.destroy_all()
+
+    def test_an_ineligible_held_target_loses_its_outline(self):
+        """Retail drops the target when it stops being eligible, not only when
+        the cursor leaves it."""
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(36.397, 0.0, 100.0),
+            (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        hits = [True]
+        vehicle.collideSegmentExt = lambda start, end: (
+            (types.SimpleNamespace(dist=100.0),) if hits[0] else ())
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._remote_factory = factory
+        record = {'engine_id': vehicle_id, 'local': False,
+                  'ready': True, 'spot_visible': True}
+        battle._records = {'bot:11': record}
+
+        battle._update_target_outline(1.0)
+        outlined = vehicle.bw_entity
+        hits[0] = False
+        record['spot_visible'] = False
+        battle._update_target_outline(2.0)
+
+        self.assertEqual([outlined], runtime.bigworld.edge_removes)
+        self.assertIsNone(battle._outlined_engine_id)
+        self.assertIn('is not spotted', battle._outline_report)
+        factory.destroy_all()
+
+    def test_the_wreck_swap_detaches_the_compound_before_it_moves(self):
+        """CompoundAppearance.deactivate clears entity.model first and only
+        then points the released compound at an identity matrix."""
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(0.0, 0.0, 20.0),
+            (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        order = []
+        vehicle.model = _Watched(vehicle.model, 'compound', order)
+        entity = vehicle.bw_entity
+        vehicle.bw_entity = _Watched(entity, 'entity', order)
+
+        vehicle.attach_wreck_model(_Model())
+
+        self.assertLess(order.index(('entity', 'model', True)),
+                        order.index(('compound', 'matrix', False)))
+        self.assertLess(order.index(('compound', 'matrix', False)),
+                        order.index(('entity', 'model', False)))
+        vehicle.bw_entity = entity
+        factory.destroy_all()
+
+    def test_detach_visual_detaches_the_compound_before_it_moves(self):
+        """The same order retires a visual: the entity releases the compound
+        before the compound loses its live matrix provider."""
+        runtime = _runtime()
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(_Descriptor(), {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(0.0, 0.0, 20.0),
+            (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        order = []
+        vehicle.model = _Watched(vehicle.model, 'compound', order)
+        vehicle.bw_entity = _Watched(vehicle.bw_entity, 'entity', order)
+
+        vehicle.detach_visual()
+
+        self.assertLess(order.index(('entity', 'model', True)),
+                        order.index(('compound', 'matrix', False)))
 
     def test_a_killed_bot_drops_its_outline_before_the_wreck_swap(self):
         """wgAddEdgeDetectEntity binds the compound the wreck load replaces,

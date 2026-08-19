@@ -208,7 +208,14 @@ class _RemoteAppearance(object):
         self.onModelChanged()
 
     def abandon(self):
-        """Forget the freed compound and its effects without a native call."""
+        """Release the sound objects and forget the freed compound.
+
+        A ``_WWISE.SoundObject`` belongs to the sound engine and the WorldApp
+        scene, not to the entity manager, so it must go while ``guiModsFini``
+        still has a live scene.  The shutdown GC destroys it after the scene
+        pointer is gone.
+        """
+        self.engineAudition.detach()
         self._bound_effects = None
         self.compoundModel = None
         self.models = []
@@ -890,11 +897,15 @@ class RemoteVehicle(object):
                self.position.z))
         self._stop_extras()
         previous = self.model
-        if previous is not None:
-            previous.matrix = self._math.Matrix()
         self.appearance.detach()
         self.appearance.gunRecoil = None
         self._gun_recoil = None
+        # CompoundAppearance.deactivate detaches the compound from the entity
+        # before it severs the live matrix provider, and __linkCompound clears
+        # entity.model before it attaches the replacement.
+        self.bw_entity.model = None
+        if previous is not None:
+            previous.matrix = self._math.Matrix()
         self.bw_entity.model = model
         self.model = model
         self.model.matrix = self.matrix
@@ -914,15 +925,15 @@ class RemoteVehicle(object):
         entity = self.bw_entity
         first_error = None
         try:
-            if model is not None:
-                # Match CompoundAppearance.deactivate(): sever the live world
-                # provider before the OfflineEntity releases the model.
-                model.matrix = self._math.Matrix()
+            if entity is not None:
+                entity.model = None
         except Exception as error:
             first_error = error
         try:
-            if entity is not None:
-                entity.model = None
+            if model is not None:
+                # Match CompoundAppearance.deactivate(): the compound leaves
+                # the entity first, and only then loses the live provider.
+                model.matrix = self._math.Matrix()
         except Exception as error:
             if first_error is None:
                 first_error = error
