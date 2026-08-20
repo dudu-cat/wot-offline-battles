@@ -147,6 +147,17 @@ class WindowTest(unittest.TestCase):
             self.assertEqual(self.window.join_entry.cget("state"), "disabled")
             self.assertEqual(self.window.test_button.cget("state"), "normal")
 
+    def test_team_size_is_editable_only_when_0_9_22_hosts(self):
+        self._game("0.9.22.0.1", "1513")
+        for mode in (core.MODE_SINGLE, core.MODE_HOST):
+            self.window.mode.set(mode)
+            self.window._refresh_mode()
+            self.assertEqual(
+                "readonly", self.window.team_size_box.cget("state"))
+        self.window.mode.set(core.MODE_JOIN)
+        self.window._refresh_mode()
+        self.assertEqual("disabled", self.window.team_size_box.cget("state"))
+
     def test_an_empty_folder_asks_for_the_game_executable(self):
         self.window.game_root.set("")
         self.assertIn(core.GAME_EXECUTABLE,
@@ -182,10 +193,21 @@ class WindowTest(unittest.TestCase):
         self.window.game_root.set(self.settings_dir)
         self.window.mode.set(core.MODE_HOST)
         self.window.player_name.set("Peng")
+        self.window.team_size.set("7")
         self.window._save_settings()
         reopened = wot_launcher.LauncherWindow(_FakeTk, _FakeTtk, self.dialog)
         self.assertEqual(reopened.mode.get(), core.MODE_HOST)
         self.assertEqual(reopened.player_name.get(), "Peng")
+        self.assertEqual(reopened.team_size.get(), "7")
+
+    def test_invalid_team_size_stops_before_starting_a_game(self):
+        self._game("0.9.22.0.1", "1513")
+        self.window.team_size.set("16")
+
+        self.window._start()
+
+        self.assertIn("Tanks per team must be 1-15", self._log_text())
+        self.assertFalse(self.window._busy)
 
     def test_a_selected_game_folder_joins_the_known_list(self):
         game = os.path.join(self.settings_dir, "game")
@@ -204,6 +226,78 @@ class WindowTest(unittest.TestCase):
         self.dialog.selection = self.settings_dir
         self.window._browse()
         self.assertEqual([], self.window._folders)
+
+    def test_maintenance_buttons_are_only_enabled_for_0_9_22(self):
+        self._game()
+        self.assertEqual("disabled",
+                         self.window.repair_button.cget("state"))
+        self.assertEqual("disabled",
+                         self.window.vehicle_editor_button.cget("state"))
+        self._game("0.9.22.0.1", "1513")
+        self.assertEqual("normal", self.window.repair_button.cget("state"))
+        self.assertEqual("normal", self.window.reset_button.cget("state"))
+        self.assertEqual(
+            "normal", self.window.vehicle_editor_button.cget("state"))
+
+    def test_vehicle_editor_opens_for_the_selected_0_9_22_folder(self):
+        game_root = self._game("0.9.22.0.1", "1513")
+        with mock.patch(
+                "wot_launcher.vehicle_editor_ui.open_vehicle_editor") as open_editor:
+            self.assertTrue(self.window._open_vehicle_editor())
+
+        open_editor.assert_called_once_with(
+            self.window.root, game_root, log=self.window._log)
+
+    def test_startup_repair_runs_in_the_background_and_reports_actions(self):
+        game_root = self._game("0.9.22.0.1", "1513")
+        with mock.patch(
+                "core.repair_0_9_22_startup",
+                return_value=["repair complete"]) as repair:
+            self.assertTrue(self.window._repair_startup())
+            for unused in range(200):
+                if not self.window._maintenance_busy:
+                    break
+                time.sleep(0.01)
+
+        repair.assert_called_once_with(game_root)
+        self.assertIn("repair complete", self._log_text())
+        self.assertEqual("normal", self.window.start_button.cget("state"))
+
+    def test_reset_requires_confirmation(self):
+        self._game("0.9.22.0.1", "1513")
+        with mock.patch.object(
+                self.window, "_confirm_reset", return_value=False), \
+                mock.patch("core.reset_0_9_22_state") as reset:
+            self.assertFalse(self.window._reset_all_state())
+
+        reset.assert_not_called()
+        self.assertIn("reset was cancelled", self._log_text())
+
+    def test_confirmed_reset_runs_only_after_the_game_is_closed(self):
+        game_root = self._game("0.9.22.0.1", "1513")
+        with mock.patch.object(
+                self.window, "_confirm_reset", return_value=True), \
+                mock.patch("core.game_is_running", return_value=False), \
+                mock.patch(
+                    "core.reset_0_9_22_state",
+                    return_value=["reset complete"]) as reset:
+            self.assertTrue(self.window._reset_all_state())
+            for unused in range(200):
+                if not self.window._maintenance_busy:
+                    break
+                time.sleep(0.01)
+
+        reset.assert_called_once_with(game_root)
+        self.assertIn("reset complete", self._log_text())
+
+    def test_reset_refuses_a_running_game_before_confirmation(self):
+        self._game("0.9.22.0.1", "1513")
+        with mock.patch.object(self.window, "_confirm_reset") as confirm, \
+                mock.patch("core.game_is_running", return_value=True):
+            self.assertFalse(self.window._reset_all_state())
+
+        confirm.assert_not_called()
+        self.assertIn("Close World of Tanks", self._log_text())
 
     def test_the_test_button_probes_the_typed_address(self):
         probed = []
@@ -255,12 +349,16 @@ class WindowTest(unittest.TestCase):
             "mode": core.MODE_JOIN,
         }
         with mock.patch("core.install_client_mod", return_value=[]), \
+                mock.patch(
+                    "core.ensure_0_9_22_preferences_isolation",
+                    return_value="preferences isolated") as isolate, \
                 mock.patch("core.write_settings", return_value=[]), \
                 mock.patch("core.listener_status",
                            return_value=core.LISTENER_OCCUPIED), \
                 mock.patch.object(self.window, "_run_game") as run_game:
             self.window._run_session(self.settings_dir, session, "Peng")
 
+        isolate.assert_called_once_with(self.settings_dir)
         run_game.assert_not_called()
         self.assertIn("not the server for this client", self._log_text())
 

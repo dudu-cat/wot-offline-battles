@@ -8,6 +8,7 @@ missing here.
 
 import argparse
 import array
+import base64
 import collections
 import copy
 import ctypes
@@ -28,12 +29,14 @@ import time
 import traceback
 import types
 import typing
+import uuid
 import weakref
 import zlib
 
 SERVER_STDLIB_MODULES = (
     argparse.__name__,
     array.__name__,
+    base64.__name__,
     collections.__name__,
     copy.__name__,
     ctypes.__name__,
@@ -54,6 +57,7 @@ SERVER_STDLIB_MODULES = (
     traceback.__name__,
     types.__name__,
     typing.__name__,
+    uuid.__name__,
     weakref.__name__,
     zlib.__name__,
 )

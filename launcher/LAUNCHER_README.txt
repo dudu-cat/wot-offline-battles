@@ -22,7 +22,9 @@ Tanks, and stops that server when the game closes.
      example 192.168.1.20 or 192.168.1.20:28782.
 4. Type a player name. Other players see it in the LAN room. Test connection
    checks the address you typed, or reports whether port 28782 on this PC is
-   already taken when you host.
+   already taken when you host. A 0.9.22 single-player or host session also
+   lets you choose the total tanks per team, including human players, from 1
+   through 15.
 5. Click Start game. The launcher removes older mod files, installs the mod
    for that client, and starts the game. This takes a few seconds. It validates
    and stages the complete package before replacing the old mod, and restores
@@ -38,18 +40,51 @@ modules and three consumables, and every item costs nothing. Change modules,
 optional devices, consumables, shells, camouflage and crew skills; the garage
 is saved after each change and the battle uses what you fitted.
 
+The Advanced vehicle data editor is for the exact supported 0.9.22 build. Its
+country, vehicle, category and field lists are derived from that client's
+scripts.pkg. Shared components such as guns and engines show every listed
+vehicle their edit affects. It accepts only existing numeric scalar fields from
+a small safety allowlist plus the stock two-value penetration string, and shows
+the stock value, Packed XML type, validation rule, output path and any ownership
+conflict before writing. Close the game before applying or restoring changes.
+The editor never changes res\packages\scripts.pkg: it rebuilds the complete
+source member into res_mods\0.9.22.0.1 and records ownership in
+vehicle_overlays.json. Restore all vehicle defaults removes only files proven
+to be owned by that manifest; other mods remain in place.
+
+For the exact 0.9.22 client, Repair startup validates the mod configuration
+and reinstalls the package while retaining the saved endpoint, garage,
+vehicle-data overrides, account progress, battle results and isolated client
+preferences. Reset all offline data is a separate confirmed operation. It
+deletes the endpoint, account, garage, post-battle, configuration and isolated
+client-preference files; it does not delete vehicle-data overrides, other mods
+or the normal World of Tanks profile. Both operations require the game to be
+closed and leave unrelated mods alone.
+
+The launcher gives the exact 0.9.22 client its own graphics, window, zoom and
+input settings. It creates a complete res_mods engine-config overlay from the
+installed stock file, changing only the preferences location to
+%LOCALAPPDATA%\WoTOfflineBattles\client_profiles\0.9.22\preferences.xml.
+The stock engine_config.xml and the profile used by another World of Tanks
+installation are never changed. The first offline launch therefore starts
+with a new profile and needs its settings chosen once. An existing
+engine_config.xml overlay from another tool is reported as a conflict and is
+left unchanged.
+
 The client sometimes closes its first process and starts another one while it
 starts up. The launcher waits half a minute after the last game process before
 it stops the server, so that restart does not end your battle.
 
 Your own files stay in place: 0.8.2 settings in offhangar_user, and the 0.9.22
-saved address, account state, garage and configuration in
+saved address, account state, garage, pending post-battle results and
+configuration in
 mods\configs\offline_lan_0922. Other authors' .wotmod files stay where they
 are.
 
 Two limits to expect. Bot tracks and road wheels do not turn, so a broken enemy
-track has no visual cue. Both clients are 32-bit and can address about 2 GB, so
-a very long session can still run out of memory and exit; restart the client
+track has no visual cue. Both clients are 32-bit; the exact #1513 executable is
+large-address-aware and can normally address about 4 GB on 64-bit Windows, but
+a very long session can still run out of memory and exit. Restart the client
 between long sessions.
 
 When you host, approve the UAC prompt that opens TCP 28782 for this launcher.

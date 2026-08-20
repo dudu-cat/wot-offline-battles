@@ -15,6 +15,7 @@ local garage.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import random
@@ -24,6 +25,8 @@ import socket
 import socketserver
 import threading
 import time
+import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -37,6 +40,7 @@ import server_world
 from descriptor_projection import DescriptorStore
 from server_battle_authority import SERVER_AUTHORITY_ID, ServerBattleAuthority
 from server_bot_ai import BotPlanner
+from offline_rewards import compute_offline_rewards
 from gui.mods.offline_lan_0922.ai.maps import get_tactical_map
 from gui.mods.offline_lan_0922.ai.maps_0922_extra import (
     TACTICAL_MAPS_0922_EXTRA as _MAPS_0922_DATA,
@@ -55,6 +59,9 @@ RAM_COOLDOWN_SECONDS = 0.75
 BOT_FIRE_DURATION_SECONDS = 10.0
 BOT_FIRE_TICK_SECONDS = 1.0
 MAX_LINE_BYTES = 256 * 1024
+MAX_RESULT_RECEIPTS = 256
+RESULT_RECEIPT_STATE_SCHEMA = 1
+RESULT_RECEIPT_STATE_FILE = "unacked_battle_receipts.json"
 DEFAULT_MAP = "server_random"
 CLIENT_BUILD_082 = "wot-0.8.2"
 CLIENT_BUILD_0922 = "wot-0.9.22.0.1-cn-1513"
@@ -161,6 +168,36 @@ CRITICAL_STATES = frozenset(("normal", "critical", "destroyed"))
 CRITICAL_CAUSES = frozenset((
     "shot", "explosion", "repair", "fire", "drowning"))
 TRACK_DEVICE_NAMES = frozenset(("leftTrackHealth", "rightTrackHealth"))
+OUTFIT_SEASONS = frozenset((1, 2, 4))
+MAX_OUTFIT_BYTES = 64 * 1024
+
+
+def _validated_outfits(value):
+    """Return canonical base64 outfit rows or raise ValueError."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or len(value) > len(OUTFIT_SEASONS):
+        raise ValueError("invalid outfit catalogue")
+    result = {}
+    total = 0
+    for raw_season, encoded in value.items():
+        try:
+            season = int(raw_season)
+        except (TypeError, ValueError):
+            raise ValueError("invalid outfit season")
+        if season not in OUTFIT_SEASONS or not isinstance(encoded, str):
+            raise ValueError("invalid outfit row")
+        try:
+            raw = base64.b64decode(encoded.encode("ascii"), validate=True)
+        except Exception:
+            raise ValueError("invalid outfit descriptor")
+        if not raw or len(raw) > MAX_OUTFIT_BYTES:
+            raise ValueError("invalid outfit descriptor size")
+        total += len(raw)
+        if total > MAX_OUTFIT_BYTES * len(OUTFIT_SEASONS):
+            raise ValueError("outfit catalogue is too large")
+        result[str(season)] = base64.b64encode(raw).decode("ascii")
+    return result
 
 
 def _server_log(message):
@@ -287,6 +324,143 @@ def _safe_vehicle(value, fallback):
     return value[:64] or fallback
 
 
+def _default_result_receipt_state_path(port=28782):
+    """Keep unacknowledged results beside the portable server executable."""
+    if getattr(sys, "frozen", False):
+        root = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        root = os.path.dirname(os.path.abspath(__file__))
+    stem, extension = os.path.splitext(RESULT_RECEIPT_STATE_FILE)
+    return os.path.join(root, "%s-%d%s" % (
+        stem, int(port), extension))
+
+
+def _write_json_atomic(path, value):
+    """Replace one JSON file only after its complete contents reach disk."""
+    path = os.path.abspath(path)
+    directory = os.path.dirname(path)
+    if not os.path.isdir(directory):
+        os.makedirs(directory, exist_ok=True)
+    temporary = "%s.tmp-%s" % (path, uuid.uuid4().hex)
+    try:
+        with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(value, stream, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            if os.path.isfile(temporary):
+                os.unlink(temporary)
+        except OSError:
+            pass
+
+
+def _persisted_result_receipt(value):
+    """Return a plain bounded receipt loaded from disk, or raise ValueError."""
+    if (not isinstance(value, dict) or
+            value.get("type") != "battle_receipt" or
+            value.get("protocol") != PROTOCOL_VERSION):
+        raise ValueError("invalid persisted battle receipt envelope")
+    required_text = {
+        "receipt_id": 96, "account_key": 64, "player_name": 32,
+        "vehicle": 96, "map": 96,
+    }
+    for name, limit in required_text.items():
+        field = value.get(name)
+        if not isinstance(field, str) or not field or len(field) > limit:
+            raise ValueError("invalid persisted battle receipt identity")
+    if any(character not in
+           "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
+           for character in value["account_key"]):
+        raise ValueError("invalid persisted battle receipt account")
+    for name, low, high in (
+            ("arena_unique_id", 0, None), ("round_id", 1, None),
+            ("player_id", 1, None), ("team", 1, 2),
+            ("winner", 0, 2), ("finish_reason", 0, 255),
+            ("death_reason", -1, 255), ("duration", 0, None)):
+        parsed = value.get(name)
+        if (isinstance(parsed, bool) or not isinstance(parsed, int) or
+                parsed < low or (high is not None and parsed > high)):
+            raise ValueError("invalid persisted battle receipt number")
+    if not isinstance(value.get("premature_leave"), bool):
+        raise ValueError("invalid persisted battle receipt leave state")
+    stats = value.get("stats")
+    rewards = value.get("rewards")
+    stat_names = (
+        "shots", "direct_hits", "piercings", "damage", "damage_received",
+        "damage_blocked", "assist_track", "assist_radio", "assist_stun",
+        "kills", "spotted", "capture_points", "dropped_capture_points",
+    )
+    reward_names = ("credits", "xp", "free_xp", "repair_cost", "ammo_cost")
+    if not isinstance(stats, dict) or not isinstance(rewards, dict):
+        raise ValueError("invalid persisted battle receipt summary")
+    for mapping, names in ((stats, stat_names), (rewards, reward_names)):
+        if any(isinstance(mapping.get(name), bool) or
+               not isinstance(mapping.get(name), int) or
+               mapping.get(name) < 0 for name in names):
+            raise ValueError("invalid persisted battle receipt statistic")
+    if rewards["repair_cost"] or rewards["ammo_cost"]:
+        raise ValueError("offline service costs must be zero")
+    public_rows = value.get("public_results")
+    if not isinstance(public_rows, list) or not 1 <= len(public_rows) <= 30:
+        raise ValueError("invalid persisted public result roster")
+    seen = set()
+    personal = None
+    for row in public_rows:
+        if not isinstance(row, dict):
+            raise ValueError("invalid persisted public result row")
+        actor_kind = row.get("actor_kind")
+        actor_id = row.get("actor_id")
+        identity = (actor_kind, actor_id)
+        if (actor_kind not in ("player", "bot") or
+                isinstance(actor_id, bool) or not isinstance(actor_id, int) or
+                actor_id < 1 or identity in seen or
+                not isinstance(row.get("name"), str) or
+                not 1 <= len(row["name"]) <= 32 or
+                not isinstance(row.get("vehicle"), str) or
+                not 1 <= len(row["vehicle"]) <= 96 or
+                isinstance(row.get("team"), bool) or
+                row.get("team") not in (1, 2) or
+                isinstance(row.get("health"), bool) or
+                not isinstance(row.get("health"), int) or
+                row.get("health") < 0 or
+                isinstance(row.get("death_reason"), bool) or
+                not isinstance(row.get("death_reason"), int) or
+                not -1 <= row.get("death_reason") <= 255 or
+                isinstance(row.get("xp"), bool) or
+                not isinstance(row.get("xp"), int) or row.get("xp") < 0 or
+                not isinstance(row.get("is_team_killer"), bool) or
+                not isinstance(row.get("stats"), dict)):
+            raise ValueError("invalid persisted public result row")
+        if any(isinstance(row["stats"].get(name), bool) or
+               not isinstance(row["stats"].get(name), int) or
+               row["stats"].get(name) < 0 for name in stat_names):
+            raise ValueError("invalid persisted public result statistic")
+        killer_kind = row.get("killer_kind", "")
+        killer_id = row.get("killer_id", 0)
+        if (killer_kind not in ("", "player", "bot") or
+                isinstance(killer_id, bool) or not isinstance(killer_id, int) or
+                killer_id < 0 or bool(killer_kind) != bool(killer_id)):
+            raise ValueError("invalid persisted public result killer")
+        seen.add(identity)
+        if identity == ("player", value["player_id"]):
+            personal = row
+    if (personal is None or personal["name"] != value["player_name"] or
+            personal["vehicle"] != value["vehicle"] or
+            personal["team"] != value["team"] or
+            personal["death_reason"] != value["death_reason"] or
+            personal["xp"] != rewards["xp"] or
+            personal["stats"] != stats):
+        raise ValueError("inconsistent persisted personal result row")
+    encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    if len(encoded.encode("utf-8")) + 1 > MAX_LINE_BYTES:
+        raise ValueError("persisted battle receipt exceeds wire limit")
+    return json.loads(encoded)
+
+
 def _critical_payload(value):
     """Validate one client-resolved 0.8.2 critical-state transition.
 
@@ -321,6 +495,19 @@ def _critical_payload(value):
     crew_ko = sorted(set(
         str(name) for name in value.get("crew_ko") or ()
         if str(name) in CRITICAL_CREW_NAMES))
+    raw_roster = value.get("crew_roster")
+    crew_roster = []
+    if raw_roster is not None:
+        if (not isinstance(raw_roster, (list, tuple)) or
+                not 1 <= len(raw_roster) <= len(CRITICAL_CREW_NAMES)):
+            raise ValueError("invalid critical crew roster")
+        for raw_name in raw_roster:
+            name = str(raw_name)
+            if name not in CRITICAL_CREW_NAMES or name in crew_roster:
+                raise ValueError("invalid critical crew roster")
+            crew_roster.append(name)
+        if not set(crew_ko).issubset(crew_roster):
+            raise ValueError("critical crew knockout is outside roster")
     events = []
     for raw in list(value.get("events") or ())[:24]:
         if not isinstance(raw, dict):
@@ -350,7 +537,7 @@ def _critical_payload(value):
             raise ValueError("invalid critical event kind")
         event["cause"] = cause if cause in CRITICAL_CAUSES else "shot"
         events.append(event)
-    return {
+    result = {
         "devices": devices,
         "destroyed": destroyed,
         "crew_ko": crew_ko,
@@ -358,6 +545,17 @@ def _critical_payload(value):
         "ammo_rack_death": bool(value.get("ammo_rack_death", False)),
         "events": events,
     }
+    if crew_roster:
+        result["crew_roster"] = crew_roster
+    return result
+
+
+def _whole_crew_knocked_out(value):
+    """Return whether a validated #1513 physical crew roster is all KO."""
+    if not isinstance(value, dict):
+        return False
+    roster = set(value.get("crew_roster") or ())
+    return bool(roster) and roster.issubset(set(value.get("crew_ko") or ()))
 
 
 def _critical_state(value):
@@ -485,6 +683,9 @@ class Player:
     destructible_revision_sent: int = -1
     battle_ready_round: int = 0
     capabilities: Tuple[str, ...] = field(default_factory=tuple)
+    account_key: str = ""
+    outfits: dict = field(default_factory=dict)
+    delivered_receipt_id: str = ""
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def send(self, message):
@@ -515,13 +716,21 @@ class Player:
 
 class BattleState:
     def __init__(self, map_name=DEFAULT_MAP, max_players=30, clock=None,
-                 authority_mode="client"):
+                 authority_mode="client", team_size=15,
+                 receipt_state_path=None):
         self.map_option = map_name
         self.map_name = self._choose_map()
         self.authority_mode = (
             "client" if str(authority_mode) == "client" else "server")
         self.client_build = None
         self.max_players = max(1, min(int(max_players), 30))
+        if isinstance(team_size, bool):
+            raise ValueError("team_size must be 1-15")
+        self.team_size = int(team_size)
+        if isinstance(team_size, float) and team_size != self.team_size:
+            raise ValueError("team_size must be 1-15")
+        if not 1 <= self.team_size <= 15:
+            raise ValueError("team_size must be 1-15")
         self.players: Dict[int, Player] = {}
         self.next_id = 1
         self.tick = 0
@@ -555,6 +764,7 @@ class BattleState:
         self.bot_reported_rams = set()
         self.bot_ram_cooldowns = {}
         self.vehicle_statistics = {}
+        self.round_participants = {}
         self.track_immobilisers = {}
         self.player_spotted = {}
         self.rules_state = {"bases": {
@@ -563,6 +773,14 @@ class BattleState:
             "2": {"points": 0, "time_left": 0.0,
                   "invaders": 0, "stopped": False}}}
         self.battle_result = None
+        # Receipts outlive the round reset so a client that left the battle or
+        # reconnects in the garage can still receive the same idempotent row.
+        self.result_receipts = OrderedDict()
+        self.receipt_state_path = receipt_state_path
+        self._load_result_receipts()
+        self.receipt_namespace = uuid.uuid4().hex
+        self.receipt_arena_prefix = uuid.uuid4().int & 0xffffffff
+        self.round_start_time = int(time.time())
         self.result_reset_tick = None
         self.roster_finalized = False
         self.pending_events = []
@@ -584,6 +802,49 @@ class BattleState:
         self.last_bot_human_hit_reject = ""
         self.last_bot_human_hit_reject_code = ""
         self._logged_protocol_reject_codes = {}
+
+    def _load_result_receipts(self):
+        """Recover only bounded, unacknowledged per-account receipts."""
+        path = self.receipt_state_path
+        if path is None or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                value = json.load(stream)
+            if (not isinstance(value, dict) or
+                    value.get("schema") != RESULT_RECEIPT_STATE_SCHEMA or
+                    not isinstance(value.get("receipts"), list) or
+                    len(value["receipts"]) > MAX_RESULT_RECEIPTS):
+                raise ValueError("invalid result receipt state")
+            recovered = OrderedDict()
+            for raw in value["receipts"]:
+                receipt = _persisted_result_receipt(raw)
+                receipt_id = receipt["receipt_id"]
+                if receipt_id in recovered:
+                    raise ValueError("duplicate persisted receipt id")
+                recovered[receipt_id] = receipt
+            self.result_receipts = recovered
+        except (OSError, UnicodeError, ValueError, TypeError,
+                json.JSONDecodeError) as error:
+            _server_log("RESULT RECEIPTS ignored invalid state: %s" % error)
+            self.result_receipts = OrderedDict()
+
+    def _persist_result_receipts(self, receipts=None):
+        """Atomically persist the current unacknowledged receipt ledger."""
+        if self.receipt_state_path is None:
+            return
+        receipts = self.result_receipts if receipts is None else receipts
+        rows = [_persisted_result_receipt(receipt)
+                for receipt in receipts.values()]
+        _write_json_atomic(self.receipt_state_path, {
+            "schema": RESULT_RECEIPT_STATE_SCHEMA,
+            "receipts": rows[-MAX_RESULT_RECEIPTS:],
+        })
+
+    def _result_receipts_for_account(self, account_key):
+        """Return this account's unacknowledged receipts oldest first."""
+        return [receipt for receipt in self.result_receipts.values()
+                if receipt.get("account_key") == account_key]
 
     def _choose_map(self, map_pool=None):
         map_pool = MAP_POOL if map_pool is None else tuple(map_pool)
@@ -713,13 +974,12 @@ class BattleState:
                 "client_simulation event must not have an attacker")
         return True
 
-    @staticmethod
-    def _new_bot_roster(occupied_slots=None):
+    def _new_bot_roster(self, occupied_slots=None):
         occupied_slots = set(occupied_slots or ())
         roster = []
         used = set()
         for team in (1, 2):
-            for slot in range(15):
+            for slot in range(self.team_size):
                 if (team, slot) in occupied_slots:
                     continue
                 while True:
@@ -821,6 +1081,36 @@ class BattleState:
                 capabilities = tuple(raw_capabilities)
                 if PROJECTILE_CAPABILITY not in capabilities:
                     return None, "unsupported_capabilities"
+                account_key = hello.get("account_key")
+                if account_key is None:
+                    # Protocol-v5 clients released before durable receipts did
+                    # not send this field.  Keep them joinable; current clients
+                    # always send the persistent random key.
+                    legacy = "".join(
+                        character for character in str(
+                            hello.get("name", "player"))
+                        if character.isalnum())[:48]
+                    account_key = "legacy_%s" % (legacy or "player")
+                if (not isinstance(account_key, str) or
+                        not 1 <= len(account_key) <= 64 or
+                        any(character not in
+                            "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
+                            for character in account_key)):
+                    return None, "invalid_account_key"
+                if any(participant.account_key == account_key
+                       for participant in self.players.values()
+                       if participant.connected):
+                    # The account key owns durable receipts.  Letting two
+                    # live players share it would collapse their frozen round
+                    # rows and overwrite one player's result at battle end.
+                    return None, "duplicate_account_key"
+                try:
+                    outfits = _validated_outfits(hello.get("outfits"))
+                except ValueError:
+                    return None, "invalid_outfits"
+            else:
+                account_key = ""
+                outfits = {}
             if (self.client_build is not None and
                     client_build != self.client_build):
                 return None, "incompatible_client_build"
@@ -838,7 +1128,7 @@ class BattleState:
                        if player.connected and player.team == team}
                 for team in (1, 2)}
             available = {
-                team: [slot for slot in range(15)
+                team: [slot for slot in range(self.team_size)
                        if slot not in occupied[team]]
                 for team in (1, 2)}
             candidates = [team for team in (1, 2) if available[team]]
@@ -866,6 +1156,8 @@ class BattleState:
                 health=max(1, min(int(_finite_float(hello.get("max_health"), 1000)), 100000)),
                 max_health=max(1, min(int(_finite_float(hello.get("max_health"), 1000)), 100000)),
                 capabilities=capabilities,
+                account_key=account_key,
+                outfits=outfits,
             )
             self.players[player_id] = player
             if self.host_player_id is None:
@@ -883,11 +1175,17 @@ class BattleState:
             vehicle = _safe_vehicle(message.get("vehicle"), player.vehicle)
             max_health = max(1, min(int(_finite_float(
                 message.get("max_health"), player.max_health)), 100000))
-            if vehicle == player.vehicle and max_health == player.max_health:
+            try:
+                outfits = _validated_outfits(message.get("outfits"))
+            except ValueError:
+                return False
+            if (vehicle == player.vehicle and max_health == player.max_health
+                    and outfits == player.outfits):
                 return False
             player.vehicle = vehicle
             player.max_health = max_health
             player.health = max_health
+            player.outfits = outfits
             self.state_revision += 1
             return True
 
@@ -896,6 +1194,17 @@ class BattleState:
             player = self.players.pop(player_id, None)
             if player is not None:
                 player.connected = False
+                participant = self.round_participants.get(
+                    player.account_key)
+                if participant is not None:
+                    participant['alive'] = bool(player.alive)
+                    participant['health'] = int(player.health)
+                    participant['death_reason'] = int(player.death_reason)
+                    participant['death_attacker_kind'] = str(
+                        player.death_attacker_kind or '')
+                    participant['death_attacker_id'] = int(
+                        player.death_attacker_id or 0)
+                    participant['team_killer'] = bool(player.team_killer)
                 self.state_revision += 1
             self.player_spotted.pop(player_id, None)
             self.vehicle_catalogs.pop(player_id, None)
@@ -916,10 +1225,11 @@ class BattleState:
             if self.phase == "loading":
                 self._activate_battle_if_ready()
             reset = False
-            if self.players and self.phase in ("loading", "battle"):
+            if self.phase in ("loading", "battle"):
                 self._maybe_finish_battle()
                 self._finish_abandoned_battle()
-            if not self.players and self.phase in ("loading", "battle"):
+            if (not self.players and self.phase == "loading" and
+                    self.battle_result is None):
                 self._reset_round()
                 reset = True
             if not self.players:
@@ -975,7 +1285,10 @@ class BattleState:
             player.destructible_revision_sent = -1
             player.battle_ready_round = 0
         self.next_id = max([player.player_id for player in self.players.values()] or [0]) + 1
-        self.bot_roster = self._new_bot_roster()
+        occupied_slots = {
+            (player.team, player.slot) for player in self.players.values()
+            if player.connected}
+        self.bot_roster = self._new_bot_roster(occupied_slots)
         self.bot_authority_id = None
         self.authority_epoch = 0
         self.bot_manifest_authority_id = None
@@ -995,6 +1308,7 @@ class BattleState:
         self.bot_reported_rams = set()
         self.bot_ram_cooldowns = {}
         self.vehicle_statistics = {}
+        self.round_participants = {}
         self.track_immobilisers = {}
         self.player_spotted = {}
         self.rules_state = {"bases": {
@@ -1117,7 +1431,9 @@ class BattleState:
                 "map_pool": list(self._active_map_pool()),
                 "host_player_id": self.host_player_id,
                 "bot_authority_id": self.bot_authority_id,
-                "players": [self._public_player(p) for p in self.players.values() if p.connected],
+                "team_size": self.team_size,
+                "players": [self._public_player(p)
+                            for p in self.players.values() if p.connected],
             }
             if self.client_build == CLIENT_BUILD_0922:
                 message["authority_epoch"] = self.authority_epoch
@@ -1145,8 +1461,10 @@ class BattleState:
                     return None, "invalid_map"
                 self.map_name = requested_map
             connected = [p for p in self.players.values() if p.connected]
+            self.round_start_time = int(time.time())
             for participant in connected:
                 participant.participating = True
+            self._freeze_round_participants(connected)
             occupied_slots = {(p.team, p.slot) for p in connected}
             self.bot_roster = self._new_bot_roster(occupied_slots)
             self.roster_finalized = True
@@ -1162,7 +1480,8 @@ class BattleState:
                     prepared = self.server_authority.prepare_lineup(
                         self.vehicle_catalogs.get(self.host_player_id),
                         list(self.bot_roster),
-                        [self._public_player(p) for p in connected],
+                        [self._public_player(p, include_outfits=False)
+                         for p in connected],
                         player.vehicle)
                 except Exception as error:
                     _server_log(
@@ -1205,6 +1524,7 @@ class BattleState:
                 "delay": 0.75,
                 "players": [self._public_player(p) for p in connected],
                 "bots": list(self.bot_roster),
+                "team_size": self.team_size,
                 "bot_authority_id": self.bot_authority_id,
                 "bot_manifest": list(self.bot_manifest),
                 "bot_order_revision": self.bot_orders["revision"],
@@ -1232,6 +1552,34 @@ class BattleState:
                     not self.server_authority.world.destructible_identities_ready()):
                 start_message["need_destructible_map"] = True
             return start_message, None
+
+    def _freeze_round_participants(self, players):
+        """Retain receipt identity after a participant disconnects."""
+        frozen = {}
+        for participant in players:
+            tier = 1
+            for row in self.vehicle_catalogs.get(
+                    participant.player_id, ()):
+                if row.get("name") == participant.vehicle:
+                    tier = max(1, min(10, int(row.get("level", 1))))
+                    break
+            frozen[participant.account_key] = {
+                "player_id": int(participant.player_id),
+                "account_key": participant.account_key,
+                "name": participant.name,
+                "vehicle": participant.vehicle,
+                "vehicle_tier": tier,
+                "team": int(participant.team),
+                "alive": bool(participant.alive),
+                "health": int(participant.health),
+                "death_reason": int(participant.death_reason),
+                "death_attacker_kind": str(
+                    participant.death_attacker_kind or ""),
+                "death_attacker_id": int(
+                    participant.death_attacker_id or 0),
+                "team_killer": bool(participant.team_killer),
+            }
+        self.round_participants = frozen
 
     def _prepare_server_authority(self):
         """Build this round's server-hosted authority when it can own bots.
@@ -1860,6 +2208,7 @@ class BattleState:
                 "late_join": True,
                 "players": [self._public_player(p) for p in connected],
                 "bots": list(self.bot_roster),
+                "team_size": self.team_size,
                 "bot_authority_id": self.bot_authority_id,
                 "bot_manifest": list(self.bot_manifest),
                 "bot_order_revision": self.bot_orders["revision"],
@@ -2065,12 +2414,44 @@ class BattleState:
                     ("affordances" in message and
                      not isinstance(message.get("affordances"), (list, tuple)))):
                 return False
-            players = [self._public_player(p) for p in self.players.values() if p.connected]
+            players = [
+                self._public_player(p, include_outfits=False)
+                for p in self.players.values() if p.connected]
             known_targets = self.bot_planner.known_targets(list(self.bot_states.values()), players)
+            # Every human computes only that player's own direct spotting.
+            # Merge those already-validated reports into the authority bot
+            # contacts before the planner consumes them.  Recomputing every
+            # friendly observer against every enemy on every client duplicated
+            # the same native LOS work and made team radio client-authoritative.
+            human_visible = set()
+            for reporter_id, targets in self.player_spotted.items():
+                reporter = self.players.get(reporter_id)
+                if (reporter is None or not reporter.connected or
+                        not reporter.participating or not reporter.alive):
+                    continue
+                for target_kind, target_id in targets:
+                    wire_kind = ("human" if target_kind == "player"
+                                 else target_kind)
+                    human_visible.add((
+                        int(reporter.team), wire_kind, int(target_id)))
+            contacts = []
+            for raw in message.get("contacts"):
+                contact = dict(raw) if isinstance(raw, dict) else raw
+                if isinstance(contact, dict):
+                    try:
+                        key = (
+                            int(contact.get("observing_team", 0)),
+                            contact.get("target_kind"),
+                            int(contact.get("target_id", 0)))
+                    except (TypeError, ValueError):
+                        key = None
+                    if key in human_visible:
+                        contact["visible"] = True
+                contacts.append(contact)
             now = time.monotonic()
             accepted_visibility = []
             accepted_contacts = self.bot_planner.report_contacts(
-                message.get("contacts"), known_targets, now,
+                contacts, known_targets, now,
                 accepted_visibility=accepted_visibility)
             known_bots = self.bot_planner.known_bots(
                 self.bot_manifest, list(self.bot_states.values()))
@@ -2946,6 +3327,8 @@ class BattleState:
         critical = proposal["critical"]
         admitted_critical = (
             critical if proposal["critical_accepted"] and was_alive else None)
+        crew_knockout = bool(
+            was_alive and _whole_crew_knocked_out(admitted_critical))
         damage = proposal["damage"]
         if critical is not None and not proposal["critical_accepted"]:
             damage = proposal["hull_damage"]
@@ -2956,8 +3339,13 @@ class BattleState:
             critical_before = target.critical
             applied = min(damage, target.health)
             target.health -= applied
-            target.alive = target.health > 0
+            target.alive = target.health > 0 and not crew_knockout
             target.display_health = target.health
+            if crew_knockout:
+                # #1513 uses ATTACK_REASON.SHOT (index 0) for a crew-loss
+                # death and preserves the hull's remaining health while
+                # isCrewActive becomes false on the client.
+                target.death_reason = 0
             critical_commit = self._commit_external_player_critical(
                 target, admitted_critical)
             health = target.health
@@ -2967,8 +3355,10 @@ class BattleState:
             critical_before = combat_before[2]
             applied = min(damage, int(target.get("health", 0)))
             target["health"] = int(target.get("health", 0)) - applied
-            target["alive"] = target["health"] > 0
+            target["alive"] = target["health"] > 0 and not crew_knockout
             target["display_health"] = target["health"]
+            if crew_knockout:
+                target["death_reason"] = 0
             if admitted_critical is not None:
                 target["critical"] = _critical_state(admitted_critical)
                 before_fire = bool(
@@ -3850,18 +4240,229 @@ class BattleState:
             return self._finish_battle(
                 winner, reason, base_team)
 
+    @staticmethod
+    def _receipt_statistics(row):
+        """Project only statistics the battle server actually records."""
+        return {
+            "shots": max(0, int(row.get("shots_fired", 0))),
+            "direct_hits": max(0, int(row.get("shots_hit", 0))),
+            "piercings": max(0, int(row.get("shots_penetrated", 0))),
+            "damage": max(0, int(row.get("damage_dealt", 0))),
+            "damage_received": max(0, int(row.get("damage_received", 0))),
+            "damage_blocked": max(0, int(row.get("damage_blocked", 0))),
+            "assist_track": max(0, int(
+                row.get("damage_assisted_track", 0))),
+            "assist_radio": max(0, int(
+                row.get("damage_assisted_radio", 0))),
+            "assist_stun": max(0, int(
+                row.get("damage_assisted_stun", 0))),
+            "kills": max(0, int(row.get("kills", 0))),
+            "spotted": max(0, int(row.get("spotted", 0))),
+            "capture_points": max(0, int(
+                row.get("capture_points", 0))),
+            "dropped_capture_points": max(0, int(
+                row.get("dropped_capture_points", 0))),
+        }
+
+    def _result_vehicle_tier(self, vehicle, preferred_player_id=None):
+        catalog_ids = []
+        if preferred_player_id is not None:
+            catalog_ids.append(int(preferred_player_id))
+        catalog_ids.extend(sorted(
+            player_id for player_id in self.vehicle_catalogs
+            if player_id not in catalog_ids))
+        for player_id in catalog_ids:
+            for entry in self.vehicle_catalogs.get(player_id, ()):
+                if entry.get("name") == vehicle:
+                    return max(1, min(10, int(entry.get("level", 1))))
+        return 1
+
+    def _public_result_roster(self, winner, participants):
+        """Freeze complete human and bot team rows from authoritative state."""
+        rows = []
+        for participant in sorted(
+                participants, key=lambda value: int(value["player_id"])):
+            player_id = int(participant["player_id"])
+            live = self.players.get(player_id)
+            alive = bool(live.alive if live is not None else
+                         participant.get("alive", True))
+            statistics = self._receipt_statistics(
+                self._statistics_row("player", player_id))
+            tier = participant.get("vehicle_tier")
+            if tier is None:
+                tier = self._result_vehicle_tier(
+                    participant["vehicle"], player_id)
+            xp = compute_offline_rewards(
+                {
+                    "damage_dealt": statistics["damage"],
+                    "damage_assisted_track": statistics["assist_track"],
+                    "damage_assisted_radio": statistics["assist_radio"],
+                    "damage_assisted_stun": statistics["assist_stun"],
+                    "kills": statistics["kills"],
+                    "spotted": statistics["spotted"],
+                    "capture_points": statistics["capture_points"],
+                    "dropped_capture_points":
+                        statistics["dropped_capture_points"],
+                },
+                int(winner) == int(participant["team"]),
+                participated=True, vehicle_tier=tier)["xp"]
+            rows.append({
+                "actor_kind": "player", "actor_id": player_id,
+                "name": participant["name"],
+                "vehicle": participant["vehicle"],
+                "team": int(participant["team"]),
+                "health": max(0, int(
+                    live.health if live is not None else
+                    participant.get("health", 0))),
+                "death_reason": (-1 if alive else max(0, int(
+                    live.death_reason if live is not None else
+                    participant.get("death_reason", 0)))),
+                "killer_kind": str(
+                    live.death_attacker_kind if live is not None else
+                    participant.get("death_attacker_kind", "") or ""),
+                "killer_id": max(0, int(
+                    live.death_attacker_id if live is not None else
+                    participant.get("death_attacker_id", 0) or 0)),
+                "is_team_killer": bool(
+                    live.team_killer if live is not None else
+                    participant.get("team_killer", False)),
+                "xp": int(xp), "stats": statistics,
+            })
+
+        manifest = {int(entry["id"]): entry for entry in self.bot_manifest}
+        for bot_id in sorted(manifest):
+            identity = manifest[bot_id]
+            state = self.bot_states.get(bot_id, identity)
+            alive = bool(state.get("alive", int(state.get("health", 0)) > 0))
+            statistics = self._receipt_statistics(
+                self._statistics_row("bot", bot_id))
+            xp = compute_offline_rewards(
+                {
+                    "damage_dealt": statistics["damage"],
+                    "damage_assisted_track": statistics["assist_track"],
+                    "damage_assisted_radio": statistics["assist_radio"],
+                    "damage_assisted_stun": statistics["assist_stun"],
+                    "kills": statistics["kills"],
+                    "spotted": statistics["spotted"],
+                    "capture_points": statistics["capture_points"],
+                    "dropped_capture_points":
+                        statistics["dropped_capture_points"],
+                }, int(winner) == int(identity["team"]), participated=True,
+                vehicle_tier=self._result_vehicle_tier(
+                    identity["vehicle"]))["xp"]
+            rows.append({
+                "actor_kind": "bot", "actor_id": bot_id,
+                "name": identity["name"], "vehicle": identity["vehicle"],
+                "team": int(identity["team"]),
+                "health": max(0, int(state.get("health", 0))),
+                "death_reason": (-1 if alive else max(
+                    0, int(state.get("death_reason", 0)))),
+                "killer_kind": str(
+                    state.get("death_attacker_kind", "") or ""),
+                "killer_id": max(0, int(
+                    state.get("death_attacker_id", 0) or 0)),
+                "is_team_killer": False,
+                "xp": int(xp), "stats": statistics,
+            })
+        return rows
+
     def _finish_battle(self, winner, reason, base_team=0):
-        """Store and announce a terminal result exactly once."""
+        """Durably store and announce a terminal result exactly once."""
         if self.battle_result is not None:
             return False
-        self.battle_result = {
-            "winner": max(0, min(int(winner), 2)),
+        winner = max(0, min(int(winner), 2))
+        result = {
+            "winner": winner,
             "reason": _safe_name(reason, "battle finished"),
             "base_team": max(0, min(int(base_team), 2)),
         }
+        next_receipts = OrderedDict(self.result_receipts)
         if self.client_build == CLIENT_BUILD_0922:
-            self.battle_result["vehicle_statistics"] = (
-                self._vehicle_statistics_payload())
+            participants = list(self.round_participants.values())
+            if not participants:
+                participants = [{
+                    "player_id": int(player.player_id),
+                    "account_key": player.account_key,
+                    "name": player.name,
+                    "vehicle": player.vehicle,
+                    "vehicle_tier": self._result_vehicle_tier(
+                        player.vehicle, player.player_id),
+                    "team": int(player.team),
+                    "alive": bool(player.alive),
+                    "health": int(player.health),
+                    "death_reason": int(player.death_reason),
+                    "death_attacker_kind": str(
+                        player.death_attacker_kind or ""),
+                    "death_attacker_id": int(
+                        player.death_attacker_id or 0),
+                    "team_killer": bool(player.team_killer),
+                } for player in self.players.values()]
+            public_results = self._public_result_roster(winner, participants)
+            public_by_player = dict(
+                (row["actor_id"], row) for row in public_results
+                if row["actor_kind"] == "player")
+            result["vehicle_statistics"] = self._vehicle_statistics_payload()
+            arena_unique_id = (
+                (((self.receipt_arena_prefix + int(self.round_id)) &
+                  0xffffffff) << 32) |
+                (int(self.round_start_time) & 0xffffffff))
+            finish_reason = {
+                "team_eliminated": 1,
+                "elimination": 1,
+                "base captured": 2,
+                "battle_timeout": 3,
+                "all_players_left": 4,
+            }.get(result["reason"], 5)
+            for participant in participants:
+                player_id = int(participant["player_id"])
+                live_player = self.players.get(player_id)
+                public_row = public_by_player[player_id]
+                rewards = compute_offline_rewards(
+                    self._statistics_row("player", player_id),
+                    winner == int(participant["team"]), participated=True,
+                    vehicle_tier=participant.get(
+                        "vehicle_tier", self._result_vehicle_tier(
+                            participant["vehicle"], player_id)))
+                receipt = {
+                    "type": "battle_receipt",
+                    "protocol": PROTOCOL_VERSION,
+                    "receipt_id": "%s:%d:%d" % (
+                        self.receipt_namespace, self.round_id, player_id),
+                    "arena_unique_id": arena_unique_id,
+                    "round_id": int(self.round_id),
+                    "player_id": player_id,
+                    "account_key": participant["account_key"],
+                    "player_name": participant["name"],
+                    "vehicle": participant["vehicle"],
+                    "team": int(participant["team"]),
+                    "winner": winner,
+                    "map": self.map_name,
+                    "finish_reason": finish_reason,
+                    "death_reason": public_row["death_reason"],
+                    "duration": max(0, int(round(
+                        float(self.tick) / TICK_HZ))),
+                    "premature_leave": bool(
+                        live_player is None or
+                        not live_player.participating),
+                    "stats": dict(public_row["stats"]),
+                    "rewards": rewards,
+                    "public_results": public_results,
+                }
+                receipt_id = receipt["receipt_id"]
+                # One account may finish another arena before an earlier ACK
+                # reaches the server. Keep both idempotent receipts; delivery
+                # drains them oldest-first for that account.
+                next_receipts[receipt_id] = receipt
+                while len(next_receipts) > MAX_RESULT_RECEIPTS:
+                    next_receipts.popitem(last=False)
+            try:
+                # Persist before the result can be broadcast or delivered.
+                self._persist_result_receipts(next_receipts)
+            except (OSError, ValueError, TypeError) as error:
+                _server_log("BATTLE RESULT persistence failed: %s" % error)
+                return False
+            self.result_receipts = next_receipts
+        self.battle_result = result
         self.result_reset_tick = self.tick + max(
             1, int(round(RESULT_RESET_SECONDS * TICK_HZ)))
         for player in self.players.values():
@@ -4722,7 +5323,8 @@ class BattleState:
             if self.battle_result is None:
                 self.bot_orders = self.bot_planner.build_orders(
                     self.bot_manifest, list(self.bot_states.values()),
-                    [self._public_player(p) for p in self.players.values() if p.connected],
+                    [self._public_player(p, include_outfits=False)
+                     for p in self.players.values() if p.connected],
                     time.monotonic(), self._bot_defense_context())
             events = []
             for ordinal, pending in enumerate(self.pending_events):
@@ -4746,7 +5348,8 @@ class BattleState:
                 "round_id": self.round_id,
                 "map": self.map_name,
                 "bot_authority_id": self.bot_authority_id,
-                "players": [self._public_player(p) for p in self.players.values() if p.connected],
+                "players": [self._public_player(p, include_outfits=False)
+                            for p in self.players.values() if p.connected],
                 "bots": [self.bot_states[key] for key in sorted(self.bot_states)],
                 "bot_state_revision": self.bot_state_revision,
                 "bot_manifest": list(self.bot_manifest),
@@ -4845,9 +5448,12 @@ class BattleState:
                     self.destructibles.values())
             if not player.send(outgoing):
                 self.remove_player(player.player_id)
+                continue
+            if not self._deliver_result_receipt(player):
+                self.remove_player(player.player_id)
 
     @staticmethod
-    def _public_player(player):
+    def _public_player(player, include_outfits=True):
         result = {
             "id": player.player_id,
             "name": player.name,
@@ -4883,9 +5489,51 @@ class BattleState:
                 player.critical_report_base_revision,
             "critical_ack_seq": player.critical_ack_seq,
         }
+        if include_outfits:
+            result["outfits"] = dict(player.outfits)
         if player.critical:
             result["critical"] = player.critical
         return result
+
+    def _deliver_result_receipt(self, player):
+        """Deliver each unacknowledged result once per TCP connection."""
+        receipts = self._result_receipts_for_account(player.account_key)
+        if not receipts:
+            return True
+        receipt = receipts[0]
+        receipt_id = receipt.get("receipt_id")
+        if receipt_id == player.delivered_receipt_id:
+            return True
+        if not player.send(receipt):
+            return False
+        player.delivered_receipt_id = receipt_id
+        return True
+
+    def acknowledge_result_receipt(self, player_id, message):
+        """Remove one receipt only after its owning client durably accepted it."""
+        with self.lock:
+            player = self.players.get(player_id)
+            if player is None or not player.connected:
+                return False
+            receipt_id = message.get("receipt_id")
+            if (not isinstance(receipt_id, str) or
+                    not 1 <= len(receipt_id) <= 96):
+                return False
+            receipt = self.result_receipts.get(receipt_id)
+            if (receipt is None or
+                    receipt.get("account_key") != player.account_key):
+                return False
+            remaining = OrderedDict(self.result_receipts)
+            del remaining[receipt_id]
+            try:
+                # Persist the removal first. A crash before this point must
+                # recover and retry the still-unacknowledged receipt.
+                self._persist_result_receipts(remaining)
+            except (OSError, ValueError, TypeError) as error:
+                _server_log("RESULT RECEIPT ack persistence failed: %s" % error)
+                return False
+            self.result_receipts = remaining
+            return True
 
     def broadcast(self, message):
         with self.lock:
@@ -4975,6 +5623,7 @@ class BattleState:
                     "players": [self._public_player(player)
                                 for player in connected],
                     "bots": list(self.bot_roster),
+                    "team_size": self.team_size,
                     "bot_authority_id": self.bot_authority_id,
                     "authority_epoch": self.authority_epoch,
                     "server_time_ms": self._server_time_ms(),
@@ -5056,6 +5705,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         "player_id": player.player_id,
                         "name": player.name,
                         "vehicle": player.vehicle,
+                        "outfits": dict(player.outfits),
                         "team": player.team,
                         "slot": player.slot,
                         "max_health": player.max_health,
@@ -5067,6 +5717,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         "state_revision": server.state.state_revision,
                         "spawn": {"x": player.x, "y": player.y, "z": player.z, "yaw": player.yaw},
                         "bot_authority_id": server.state.bot_authority_id,
+                        "team_size": server.state.team_size,
                     }
                     if server.state.client_build == CLIENT_BUILD_0922:
                         welcome_message.update({
@@ -5074,6 +5725,8 @@ class ClientHandler(socketserver.BaseRequestHandler):
                             "capabilities": list(player.capabilities),
                         })
                     welcomed = player.send(welcome_message)
+                    if welcomed:
+                        welcomed = server.state._deliver_result_receipt(player)
             if player is None:
                 messages = {
                     "battle_in_progress": "battle already in progress",
@@ -5082,6 +5735,9 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     "incompatible_client_build": "this room is using a different client build",
                     "map_not_available_for_client": "the fixed server map is unavailable in this client build",
                     "unsupported_capabilities": "required client capabilities are missing",
+                    "invalid_account_key": "invalid offline account identity",
+                    "duplicate_account_key": "offline account identity is already connected",
+                    "invalid_outfits": "invalid vehicle customization data",
                 }
                 message = messages.get(join_error, "join rejected")
                 self._send_raw(conn, {"type": "error", "code": join_error, "message": message})
@@ -5256,6 +5912,12 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     elif message_type == "battle_result":
                         if not server.state.report_battle_result(player.player_id, message):
                             _server_log("BATTLE RESULT rejected sender=%d" % player.player_id)
+                    elif message_type == "battle_receipt_ack":
+                        if not server.state.acknowledge_result_receipt(
+                                player.player_id, message):
+                            _server_log(
+                                "BATTLE RECEIPT ACK rejected sender=%d" %
+                                player.player_id)
                     elif message_type == "leave_battle":
                         if server.state.leave_battle_and_publish(
                                 player.player_id, message):
@@ -5381,9 +6043,13 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 
 def run_server(host, port, map_name, max_players,
-               authority_mode="client"):
+               authority_mode="client", team_size=15,
+               receipt_state_path=None):
+    if receipt_state_path is None:
+        receipt_state_path = _default_result_receipt_state_path(port)
     state = BattleState(map_name=map_name, max_players=max_players,
-                        authority_mode=authority_mode)
+                        authority_mode=authority_mode, team_size=team_size,
+                        receipt_state_path=receipt_state_path)
     tcp_server = ThreadedTCPServer((host, port), ClientHandler)
     tcp_server.game_server = type("GameServer", (), {"state": state})()
 
@@ -5401,8 +6067,10 @@ def run_server(host, port, map_name, max_players,
 
     thread = threading.Thread(target=tick_loop, name="battle-tick", daemon=True)
     thread.start()
-    _server_log("LAN battle server listening on %s:%d (map=%s, max_players=%d)" % (
-        host, port, state.map_name, state.max_players))
+    _server_log(
+        "LAN battle server listening on %s:%d "
+        "(map=%s, max_players=%d, team_size=%d)" % (
+            host, port, state.map_name, state.max_players, state.team_size))
     _server_log("Ready: clients click Battle! to join, choose a map, then click START BATTLE")
     try:
         tcp_server.serve_forever(poll_interval=0.5)
@@ -5424,6 +6092,9 @@ def main():
         help="standard map name, or server_random")
     parser.add_argument("--max-players", type=int, default=30, help="maximum connected clients")
     parser.add_argument(
+        "--team-size", type=int, choices=range(1, 16), default=15,
+        help="total tanks per team, including players (default: 15)")
+    parser.add_argument(
         "--authority", dest="authority_mode",
         choices=("server", "client"),
         default=os.environ.get("WOT_LAN_AUTHORITY", "client"),
@@ -5431,7 +6102,7 @@ def main():
              "WOT_LAN_AUTHORITY overrides)")
     args = parser.parse_args()
     run_server(args.host, args.port, args.map_name, args.max_players,
-               args.authority_mode)
+               args.authority_mode, args.team_size)
 
 
 if __name__ == "__main__":

@@ -35,6 +35,18 @@ DEFAULT_CONFIG = {
     # engine-owned filter, so the belts cannot turn.  See
     # 0.9.22/COMPATIBILITY_REVIEW.md.
     'bot_track_animation': False,
+    # Exact-build experiment: stock remote Vehicle entities provide native
+    # compounds, stickers and engine-owned belt animation. Copied physics
+    # remains authoritative because #1513 has no legal remote pose setter.
+    'native_remote_vehicles': False,
+    # One-shot measurement for a future non-rendering authority process.
+    # This is intentionally off and does not change LAN authority or launch a
+    # second client. The hidden-window phase also requires the external tools/
+    # authority_worker_probe_supervisor.py process.
+    'authority_worker_probe': {
+        'enabled': False,
+        'stageSeconds': 15.0,
+    },
     # Per-chunk destructible and bot-steering traces. PERF summaries are
     # always published; these are the noisy per-event lines.
     'debug_logging': False,
@@ -45,6 +57,80 @@ def _copy_defaults():
     return dict((key, (value[:] if isinstance(value, list) else
                        dict(value) if isinstance(value, dict) else value))
                 for key, value in DEFAULT_CONFIG.items())
+
+
+def _quarantine_invalid_config(path):
+    """Move an unreadable startup config aside without overwriting evidence."""
+    candidate = path + '.invalid'
+    suffix = 1
+    while os.path.exists(candidate):
+        candidate = path + '.invalid.%d' % suffix
+        suffix += 1
+    try:
+        os.rename(path, candidate)
+    except (IOError, OSError):
+        return None
+    return candidate
+
+
+def _load_config_file(path):
+    config = _copy_defaults()
+    with open(path, 'rb') as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError('config root must be an object')
+    for key in DEFAULT_CONFIG:
+        if key in value:
+            config[key] = value[key]
+    config['startupTimeoutSeconds'] = max(
+        1.0, float(config['startupTimeoutSeconds']))
+    config['prebattleCountdownSeconds'] = max(
+        0.0, float(config['prebattleCountdownSeconds']))
+    config['battleDurationSeconds'] = max(
+        1.0, float(config['battleDurationSeconds']))
+    try:
+        base_endpoint = _validate_endpoint(
+            config.get('host'), config.get('port'))
+    except ValueError:
+        base_endpoint = (
+            DEFAULT_CONFIG['host'], DEFAULT_CONFIG['port'])
+    config['host'], config['port'] = base_endpoint
+    config['max_health'] = max(1, int(config['max_health']))
+    if not isinstance(config.get('enabled'), bool):
+        raise ValueError('enabled must be true or false')
+    if not isinstance(config.get('vehicle'), string_types) or not config['vehicle']:
+        raise ValueError('vehicle must be a non-empty string')
+    if not isinstance(config.get('name'), string_types) or not config['name']:
+        raise ValueError('name must be a non-empty string')
+    if not isinstance(config.get('physics_tuning'), dict):
+        raise ValueError('physics_tuning must be an object')
+    if not isinstance(config.get('he_tuning'), dict):
+        raise ValueError('he_tuning must be an object')
+    if not isinstance(config.get('perfect_accuracy'), bool):
+        raise ValueError('perfect_accuracy must be true or false')
+    if not isinstance(config.get('native_remote_vehicles'), bool):
+        raise ValueError('native_remote_vehicles must be true or false')
+    probe = config.get('authority_worker_probe')
+    if not isinstance(probe, dict):
+        raise ValueError('authority_worker_probe must be an object')
+    if not isinstance(probe.get('enabled'), bool):
+        raise ValueError(
+            'authority_worker_probe.enabled must be true or false')
+    try:
+        stage_seconds = float(probe.get('stageSeconds'))
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            'authority_worker_probe.stageSeconds must be a number')
+    if (stage_seconds != stage_seconds or
+            stage_seconds in (float('inf'), float('-inf')) or
+            stage_seconds < 15.0 or stage_seconds > 60.0):
+        raise ValueError(
+            'authority_worker_probe.stageSeconds must be 15-60 seconds')
+    config['authority_worker_probe'] = {
+        'enabled': probe['enabled'],
+        'stageSeconds': stage_seconds,
+    }
+    return config, base_endpoint
 
 
 def _replace(temporary_path, path):
@@ -204,43 +290,23 @@ def _endpoint_path_for_config(path):
 
 
 def load(path=CONFIG_PATH, endpoint_path=None):
-    config = _copy_defaults()
     if not os.path.isfile(path):
+        config = _copy_defaults()
         write_json(path, config)
+        base_endpoint = (config['host'], config['port'])
     else:
-        with open(path, 'rb') as stream:
-            value = json.load(stream)
-        if not isinstance(value, dict):
-            raise ValueError('config root must be an object')
-        for key in DEFAULT_CONFIG:
-            if key in value:
-                config[key] = value[key]
-    config['startupTimeoutSeconds'] = max(
-        1.0, float(config['startupTimeoutSeconds']))
-    config['prebattleCountdownSeconds'] = max(
-        0.0, float(config['prebattleCountdownSeconds']))
-    config['battleDurationSeconds'] = max(
-        1.0, float(config['battleDurationSeconds']))
-    try:
-        base_endpoint = _validate_endpoint(
-            config.get('host'), config.get('port'))
-    except ValueError:
-        base_endpoint = (
-            DEFAULT_CONFIG['host'], DEFAULT_CONFIG['port'])
-    config['host'], config['port'] = base_endpoint
-    config['max_health'] = max(1, int(config['max_health']))
-    if not isinstance(config.get('enabled'), bool):
-        raise ValueError('enabled must be true or false')
-    if not isinstance(config.get('vehicle'), string_types) or not config['vehicle']:
-        raise ValueError('vehicle must be a non-empty string')
-    if not isinstance(config.get('name'), string_types) or not config['name']:
-        raise ValueError('name must be a non-empty string')
-    if not isinstance(config.get('physics_tuning'), dict):
-        raise ValueError('physics_tuning must be an object')
-    if not isinstance(config.get('he_tuning'), dict):
-        raise ValueError('he_tuning must be an object')
-    if not isinstance(config.get('perfect_accuracy'), bool):
-        raise ValueError('perfect_accuracy must be true or false')
+        try:
+            config, base_endpoint = _load_config_file(path)
+        except (IOError, OSError, OverflowError, TypeError, ValueError):
+            _quarantine_invalid_config(path)
+            config = _copy_defaults()
+            base_endpoint = (config['host'], config['port'])
+            try:
+                write_json(path, config)
+            except (IOError, OSError):
+                # Login must remain available even when this directory became
+                # read-only after the previous client exit.
+                pass
 
     if endpoint_path is None:
         endpoint_path = _endpoint_path_for_config(path)

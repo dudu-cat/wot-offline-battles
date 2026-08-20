@@ -47,6 +47,7 @@ python -m PyInstaller `
     --distpath $DistRoot `
     --workpath $WorkRoot `
     --specpath $SpecRoot `
+    --paths (Join-Path $RepoRoot "0.9.22\tools") `
     --add-data "$PayloadRoot\servers;servers" `
     --add-data "$PayloadRoot\client;client" `
     (Join-Path $LauncherRoot "wot_launcher.py")

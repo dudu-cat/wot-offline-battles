@@ -3,6 +3,7 @@ import copy
 import importlib.util
 import io
 import os
+import ast
 import shutil
 import tempfile
 from pathlib import Path
@@ -98,7 +99,29 @@ class _Descriptor(object):
         self.components = {}
         # #1513 Vehicle.shellsLayoutIdx reads both compact descriptors.
         self.turret = _Component(7001)
-        self.gun = _Component(7002)
+        self.turret.maxAmmo = 45
+        self._set_gun(7002)
+        try:
+            encoded = compact_descr.decode('ascii')
+        except AttributeError:
+            encoded = str(compact_descr)
+        for field in encoded.split('|')[1:]:
+            if field.startswith('dev='):
+                self.devices = dict(ast.literal_eval(field[4:]))
+            elif field.startswith('comp='):
+                self.components = dict(ast.literal_eval(field[5:]))
+            elif field.startswith('turret='):
+                self.turret = _Component(int(field[7:]))
+                self.turret.maxAmmo = 45
+            elif field.startswith('gun='):
+                self._set_gun(int(field[4:]))
+
+    def _set_gun(self, compact_descr):
+        self.gun = _Component(compact_descr)
+        self.gun.maxAmmo = 45
+        self.gun.shots = tuple(
+            types.SimpleNamespace(shell=_Component(shell_compact_descr))
+            for shell_compact_descr in (20010, 20011))
 
     def installOptionalDevice(self, compact_descr, slot_index):
         if slot_index in self.devices:
@@ -115,19 +138,21 @@ class _Descriptor(object):
         if compact_descr // 1000 == 3:
             raise AssertionError(compact_descr)
         self.components[position_index] = compact_descr
-        self.gun = _Component(compact_descr)
+        self._set_gun(compact_descr)
 
     def installTurret(self, turret_compact_descr, gun_compact_descr,
                       position_index):
         self.components[position_index] = turret_compact_descr
         self.turret = _Component(turret_compact_descr)
+        self.turret.maxAmmo = 45
         if gun_compact_descr:
-            self.gun = _Component(gun_compact_descr)
+            self._set_gun(gun_compact_descr)
 
     def makeCompactDescr(self):
-        return b'veh:9|dev=%s|comp=%s' % (
+        return b'veh:9|dev=%s|comp=%s|turret=%d|gun=%d' % (
             repr(sorted(self.devices.items())).encode('ascii'),
-            repr(sorted(self.components.items())).encode('ascii'))
+            repr(sorted(self.components.items())).encode('ascii'),
+            self.turret.compactDescr, self.gun.compactDescr)
 
 
 class _TankmanDescriptor(object):
@@ -165,6 +190,34 @@ def _modules():
         TankmanDescr=_TankmanDescriptor,
         SKILL_NAMES=('repair', 'camouflage', 'brotherhood'))
     return vehicles, tankmen
+
+
+class _ParsedOutfit(object):
+    def __init__(self, descriptor):
+        self.descriptor = descriptor
+
+    def makeCompDescr(self):
+        return self.descriptor
+
+
+class _StyleOutfit(_ParsedOutfit):
+    def __init__(self, styleId=0):
+        _ParsedOutfit.__init__(self, b'style:%d' % styleId)
+
+
+class _Customizations(object):
+    CustomizationOutfit = _StyleOutfit
+
+    @staticmethod
+    def parseOutfitDescr(descriptor):
+        if not isinstance(descriptor, bytes) or not descriptor.startswith(
+                (b'outfit:', b'style:')):
+            raise ValueError('bad stock descriptor')
+        return _ParsedOutfit(descriptor)
+
+    @staticmethod
+    def parseIntCompactDescr(compact_descr):
+        return 12, 1, compact_descr % 1000
 
 
 class GarageStateTests(unittest.TestCase):
@@ -250,6 +303,76 @@ class GarageStateTests(unittest.TestCase):
         self.assertEqual(
             {20010: 30, 20011: 15},
             self._record()['inventoryItems'][10])
+
+    def test_a_descriptor_failure_leaves_the_old_fitting_and_ammo_intact(self):
+        vehicles, tankmen = _modules()
+
+        class RefusedDescriptor(_Descriptor):
+            def makeCompactDescr(self):
+                raise ValueError('invalid module combination')
+
+        vehicles.VehicleDescr = lambda compactDescr: RefusedDescriptor(
+            compactDescr)
+        state = self.garage.GarageState(
+            SNAPSHOT, vehicles_module=vehicles, tankmen_module=tankmen)
+        before = copy.deepcopy(state.snapshot())
+
+        with self.assertRaises(self.garage.GarageError):
+            state.install_component(9, 4444)
+
+        self.assertEqual(before, state.snapshot())
+        self.assertEqual(0, state.revision)
+        self.assertEqual(set(), state.touched_vehicles())
+        self.assertEqual({}, state.touched_items())
+
+    def test_incompatible_default_ammo_leaves_the_old_fitting_intact(self):
+        vehicles, tankmen = _modules()
+        vehicles.getDefaultAmmoForGun = lambda gun: [29999, 45]
+        state = self.garage.GarageState(
+            SNAPSHOT, vehicles_module=vehicles, tankmen_module=tankmen)
+        before = copy.deepcopy(state.snapshot())
+
+        with self.assertRaises(self.garage.GarageError):
+            state.install_component(9, 4444)
+
+        self.assertEqual(before, state.snapshot())
+        self.assertEqual(0, state.revision)
+        self.assertEqual(set(), state.touched_vehicles())
+        self.assertEqual({}, state.touched_items())
+
+    def test_zero_default_ammo_leaves_the_old_fitting_intact(self):
+        vehicles, tankmen = _modules()
+        vehicles.getDefaultAmmoForGun = lambda gun: [20010, 0]
+        state = self.garage.GarageState(
+            SNAPSHOT, vehicles_module=vehicles, tankmen_module=tankmen)
+        before = copy.deepcopy(state.snapshot())
+
+        with self.assertRaises(self.garage.GarageError):
+            state.install_component(9, 4444)
+
+        self.assertEqual(before, state.snapshot())
+        self.assertEqual(0, state.revision)
+
+    def test_a_turret_cannot_silently_fall_back_to_the_stock_gun(self):
+        vehicles, tankmen = _modules()
+
+        class StockGunDescriptor(_Descriptor):
+            def installTurret(self, turret_compact_descr, gun_compact_descr,
+                              position_index):
+                _Descriptor.installTurret(
+                    self, turret_compact_descr, 0, position_index)
+
+        vehicles.VehicleDescr = lambda compactDescr: StockGunDescriptor(
+            compactDescr)
+        state = self.garage.GarageState(
+            SNAPSHOT, vehicles_module=vehicles, tankmen_module=tankmen)
+        before = copy.deepcopy(state.snapshot())
+
+        with self.assertRaises(self.garage.GarageError):
+            state.install_component(9, 3333, 4444)
+
+        self.assertEqual(before, state.snapshot())
+        self.assertEqual(0, state.revision)
 
     def test_a_crew_skill_rebuilds_only_that_tankman(self):
         self.state.add_tankman_skill(101, 2)
@@ -349,6 +472,45 @@ class GarageStateTests(unittest.TestCase):
         with self.assertRaises(self.garage.GarageError):
             self.state.set_layouts(9, None, 0, [11001, 1, 0])
 
+    def test_outfit_is_stock_parsed_and_committed_atomically(self):
+        vehicles, tankmen = _modules()
+        state = self.garage.GarageState(
+            SNAPSHOT, vehicles_module=vehicles, tankmen_module=tankmen,
+            customizations_module=_Customizations)
+
+        state.apply_outfit(9, 2, b'outfit:summer')
+
+        self.assertEqual(
+            (b'outfit:summer', True),
+            state.snapshot()['vehicles'][0]['outfits'][2])
+
+    def test_refused_outfit_cannot_partially_replace_live_record(self):
+        vehicles, tankmen = _modules()
+        state = self.garage.GarageState(
+            SNAPSHOT, vehicles_module=vehicles, tankmen_module=tankmen,
+            customizations_module=_Customizations)
+        before = copy.deepcopy(state.snapshot())
+
+        with self.assertRaises(self.garage.GarageError):
+            state.apply_outfit(9, 2, b'not-an-outfit')
+
+        self.assertEqual(before, state.snapshot())
+
+    def test_customization_inventory_uses_exact_outfit_shape(self):
+        vehicles, tankmen = _modules()
+        state = self.garage.GarageState(
+            SNAPSHOT, vehicles_module=vehicles, tankmen_module=tankmen,
+            customizations_module=_Customizations)
+        state.buy_customizations(9, [12001, 3])
+        state.apply_outfit(9, 2, b'outfit:summer')
+        data = _load('data').inventory(state.snapshot(), validate=False)
+
+        self.assertEqual(
+            {50001: 3}, data['inventory'][12][1][1][1])
+        self.assertEqual(
+            (b'outfit:summer', True),
+            data['inventory'][12][2][50001][2])
+
 
 class FittingRequestTests(unittest.TestCase):
 
@@ -367,6 +529,16 @@ class FittingRequestTests(unittest.TestCase):
     def _dispatch(self, command, args):
         return self.requests.dispatch(command, self.context, args)
 
+    def _customization_state(self):
+        vehicles, tankmen = _modules()
+        vehicles.g_cache = types.SimpleNamespace(
+            customization20=lambda: types.SimpleNamespace(styles={7: object()}))
+        self.state = self.garage.GarageState(
+            SNAPSHOT, vehicles_module=vehicles, tankmen_module=tankmen,
+            customizations_module=_Customizations)
+        self.context['garage'] = self.state
+        return self.state
+
     def test_equip_eqs_decodes_the_exact_1513_payload(self):
         result = self._dispatch(
             self.commands.CMD_EQUIP_EQS, ([9, 11001, 0, 0],))
@@ -377,6 +549,56 @@ class FittingRequestTests(unittest.TestCase):
         self.assertEqual(
             [11001, 0, 0], self.pushed[0]['inventory'][1]['eqs'][9])
 
+    def test_cmd_119_decodes_and_publishes_the_exact_outfit_payload(self):
+        self._customization_state()
+
+        result = self._dispatch(
+            self.commands.CMD_VEH_APPLY_OUTFIT,
+            ([77, 9, 2], [b'outfit:summer']))
+        result.before_response()
+
+        self.assertEqual(self.commands.RES_SUCCESS, result.result_id)
+        self.assertEqual(
+            (b'outfit:summer', True),
+            self.pushed[0]['inventory'][12][2][50001][2])
+
+    def test_cmd_118_and_117_update_vehicle_bound_ownership(self):
+        self._customization_state()
+
+        bought = self._dispatch(
+            self.commands.CMD_BUY_C11N_ITEMS, ([77, 9, 12001, 3],))
+        sold = self._dispatch(
+            self.commands.CMD_SELL_C11N_ITEMS, (77, 12001, 2, 9))
+
+        self.assertEqual(self.commands.RES_SUCCESS, bought.result_id)
+        self.assertEqual(self.commands.RES_SUCCESS, sold.result_id)
+        self.assertEqual(
+            1, self.state.snapshot()['customizationItems'][1][1][50001])
+
+    def test_cmd_116_uses_the_stock_style_serializer(self):
+        self._customization_state()
+
+        result = self._dispatch(
+            self.commands.CMD_VEH_APPLY_STYLE, (77, 9, 7))
+
+        self.assertEqual(self.commands.RES_SUCCESS, result.result_id)
+        self.assertEqual(
+            (b'style:7', True),
+            self.state.snapshot()['vehicles'][0]['outfits'][15])
+
+    def test_custom_outfit_replaces_the_style_that_would_mask_it(self):
+        self._customization_state()
+        self._dispatch(self.commands.CMD_VEH_APPLY_STYLE, (77, 9, 7))
+
+        result = self._dispatch(
+            self.commands.CMD_VEH_APPLY_OUTFIT,
+            ([77, 9, 2], [b'outfit:summer']))
+
+        self.assertEqual(self.commands.RES_SUCCESS, result.result_id)
+        self.assertEqual(
+            {2: (b'outfit:summer', True)},
+            self.state.snapshot()['vehicles'][0]['outfits'])
+
     def test_equip_optdev_skips_the_leading_shop_revision(self):
         result = self._dispatch(
             self.commands.CMD_EQUIP_OPTDEV, ([77, 9, 9001, 1, 0],))
@@ -384,6 +606,35 @@ class FittingRequestTests(unittest.TestCase):
         self.assertEqual(self.commands.RES_SUCCESS, result.result_id)
         self.assertIn(
             b'9001', self.state.snapshot()['vehicles'][0]['compDescr'])
+
+    def test_buy_and_equip_carries_the_selected_gun_for_a_turret(self):
+        result = self._dispatch(
+            self.commands.CMD_BUY_AND_EQUIP_ITEM,
+            ([77, 3333, 9, 0, 0, 4444],))
+
+        self.assertEqual(self.commands.RES_SUCCESS, result.result_id)
+        record = self.state.snapshot()['vehicles'][0]
+        self.assertEqual((3333, 4444), record['shellsLayoutIdx'])
+        self.assertEqual([20010, 30, 20011, 15], record['shells'])
+
+    def test_refused_buy_and_equip_does_not_publish_new_ownership(self):
+        vehicles, tankmen = _modules()
+        vehicles.getDefaultAmmoForGun = lambda gun: [29999, 45]
+        self.state = self.garage.GarageState(
+            SNAPSHOT, vehicles_module=vehicles, tankmen_module=tankmen)
+        self.context['garage'] = self.state
+        before = copy.deepcopy(self.state.snapshot())
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = self._dispatch(
+                self.commands.CMD_BUY_AND_EQUIP_ITEM,
+                ([77, 3333, 9, 0, 0, 4444],))
+
+        self.assertEqual(self.commands.RES_FAILURE, result.result_id)
+        self.assertEqual(before, self.state.snapshot())
+        self.assertNotIn(
+            3333, self.state.snapshot()['inventoryItems'].get(3, {}))
+        self.assertEqual([], self.pushed)
 
     def test_equip_shells_updates_the_published_inventory(self):
         result = self._dispatch(
@@ -551,6 +802,21 @@ class GaragePersistenceTests(unittest.TestCase):
         self.assertEqual(mounted, restored['compDescr'])
         self.assertNotEqual(SNAPSHOT['vehicles'][0]['compDescr'],
                             restored['compDescr'])
+
+    def test_an_applied_outfit_survives_a_restart(self):
+        vehicles, tankmen = _modules()
+        state = self.garage.GarageState(
+            SNAPSHOT, vehicles_module=vehicles, tankmen_module=tankmen,
+            customizations_module=_Customizations)
+        state.apply_outfit(9, 2, b'outfit:summer')
+        store = self._store()
+        store.mark_dirty()
+        store.flush(state.snapshot())
+
+        restored = self._restart()['vehicles'][0]
+
+        self.assertEqual(
+            (b'outfit:summer', True), restored['outfits'][2])
 
     def test_a_learned_crew_skill_survives_a_restart(self):
         state = self._state()

@@ -16,8 +16,9 @@ import threading
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import core
+    import vehicle_editor_ui
 else:
-    from . import core
+    from . import core, vehicle_editor_ui
 
 
 LAUNCHER_VERSION = "0.5.0"
@@ -41,6 +42,8 @@ class LauncherWindow(object):
         self._server = None
         self._game = None
         self._busy = False
+        self._maintenance_busy = False
+        self._selected_client = None
         self._build()
 
     def _build(self):
@@ -100,6 +103,39 @@ class LauncherWindow(object):
             pady=(6, 0))
         row += 1
 
+        tk.Label(frame, text="Tanks per team (including players)").grid(
+            row=row, column=0, sticky="w", pady=(6, 0))
+        self.team_size = tk.StringVar(
+            value=str(settings.get("team_size", core.DEFAULT_TEAM_SIZE)))
+        self.team_size_box = self._ttk.Combobox(
+            frame, textvariable=self.team_size,
+            values=tuple(str(value) for value in range(
+                core.MIN_TEAM_SIZE, core.MAX_TEAM_SIZE + 1)), width=10)
+        self.team_size_box.grid(row=row, column=1, sticky="w", padx=(6, 6),
+                                pady=(6, 0))
+        row += 1
+
+        maintenance = tk.Frame(frame)
+        maintenance.grid(row=row, column=0, columnspan=3, sticky="we",
+                         pady=(10, 0))
+        self.repair_button = tk.Button(
+            maintenance, text="Repair startup (keep saved data)",
+            command=self._repair_startup)
+        self.repair_button.pack(side="left", fill="x", expand=True)
+        self.reset_button = tk.Button(
+            maintenance, text="Reset all offline data...",
+            command=self._reset_all_state)
+        self.reset_button.pack(side="left", fill="x", expand=True,
+                               padx=(6, 0))
+        row += 1
+
+        self.vehicle_editor_button = tk.Button(
+            frame, text="Advanced vehicle data editor...",
+            command=self._open_vehicle_editor)
+        self.vehicle_editor_button.grid(
+            row=row, column=0, columnspan=3, sticky="we", pady=(6, 0))
+        row += 1
+
         self.start_button = tk.Button(frame, text="Start game",
                                       command=self._start)
         self.start_button.grid(row=row, column=0, columnspan=3, sticky="we",
@@ -148,12 +184,34 @@ class LauncherWindow(object):
             text = "World of Tanks %s ready. Start game updates the mod." % (
                 status["version"] or status["client"])
         self.client_label.config(text=text)
+        self._selected_client = status["client"]
+        self._update_action_controls()
+        if hasattr(self, "team_size_box"):
+            self._refresh_mode()
         return status
+
+    def _update_action_controls(self):
+        if self._busy:
+            self.start_button.config(state="normal", text="Kill the game")
+        elif self._maintenance_busy:
+            self.start_button.config(state="disabled", text="Start game")
+        else:
+            self.start_button.config(state="normal", text="Start game")
+        maintenance_state = (
+            "normal" if self._selected_client == core.PORT_0_9_22 and
+            not self._busy and not self._maintenance_busy else "disabled")
+        self.repair_button.config(state=maintenance_state)
+        self.reset_button.config(state=maintenance_state)
+        self.vehicle_editor_button.config(state=maintenance_state)
 
     def _refresh_mode(self):
         state = "normal" if self.mode.get() == core.MODE_JOIN else "disabled"
         self.join_entry.config(state=state)
         self.test_button.config(state="normal")
+        team_state = (
+            "readonly" if self._selected_client == core.PORT_0_9_22 and
+            self.mode.get() != core.MODE_JOIN else "disabled")
+        self.team_size_box.config(state=team_state)
 
     def _test_connection(self):
         mode = self.mode.get()
@@ -193,10 +251,11 @@ class LauncherWindow(object):
 
     def _set_busy(self, busy):
         self._busy = busy
-        self.root.after(
-            0, lambda: self.start_button.config(
-                state="normal",
-                text="Kill the game" if busy else "Start game"))
+        self.root.after(0, self._update_action_controls)
+
+    def _set_maintenance_busy(self, busy):
+        self._maintenance_busy = busy
+        self.root.after(0, self._update_action_controls)
 
     def _kill_game(self):
         """Close a game that did not exit on its own."""
@@ -211,22 +270,103 @@ class LauncherWindow(object):
         return True
 
     def _save_settings(self):
+        try:
+            team_size = core.parse_team_size(self.team_size.get())
+        except core.LauncherError:
+            team_size = core.DEFAULT_TEAM_SIZE
         core.save_settings({
             "game_root": self.game_root.get().strip(),
             "folders": list(self._folders),
             "mode": self.mode.get(),
             "join_address": self.join_address.get().strip(),
             "name": self.player_name.get().strip(),
+            "team_size": team_size,
         })
 
+    def _start_maintenance(self, action):
+        if self._busy or self._maintenance_busy:
+            self._log("Wait for the current launcher operation to finish.")
+            return False
+        status = self._refresh_client()
+        if status.get("client") != core.PORT_0_9_22:
+            self._log("Select the supported 0.9.22 game folder first.")
+            return False
+        self._remember_folder()
+        self._set_maintenance_busy(True)
+
+        def run():
+            try:
+                for message in action(status["path"]):
+                    self._log(message)
+            except core.LauncherError as error:
+                self._log(str(error))
+            except Exception as error:
+                self._log("Launcher maintenance failed: %s" % error)
+            finally:
+                self._set_maintenance_busy(False)
+                self.root.after(0, self._refresh_client)
+
+        thread = threading.Thread(target=run)
+        thread.daemon = True
+        thread.start()
+        return True
+
+    def _repair_startup(self):
+        return self._start_maintenance(core.repair_0_9_22_startup)
+
+    def _open_vehicle_editor(self):
+        if self._busy or self._maintenance_busy:
+            self._log("Wait for the current launcher operation to finish.")
+            return False
+        status = self._refresh_client()
+        if status.get("client") != core.PORT_0_9_22:
+            self._log("Select the supported 0.9.22 game folder first.")
+            return False
+        self._remember_folder()
+        vehicle_editor_ui.open_vehicle_editor(
+            self.root, status["path"], log=self._log)
+        return True
+
+    @staticmethod
+    def _confirm_reset():
+        from tkinter import messagebox
+
+        return messagebox.askyesno(
+            "Reset all offline data?",
+            "This deletes this mod's saved address, account settings, garage "
+            "fittings, post-battle results, configuration, and isolated client "
+            "graphics/input preferences. Other mods and the normal World of "
+            "Tanks profile are kept. Continue?",
+            icon="warning")
+
+    def _reset_all_state(self):
+        if self._busy or self._maintenance_busy:
+            self._log("Wait for the current launcher operation to finish.")
+            return False
+        if self._refresh_client().get("client") != core.PORT_0_9_22:
+            self._log("Select the supported 0.9.22 game folder first.")
+            return False
+        if core.game_is_running():
+            self._log(
+                "Close World of Tanks before repairing or resetting offline data.")
+            return False
+        if not self._confirm_reset():
+            self._log("Offline data reset was cancelled.")
+            return False
+        return self._start_maintenance(core.reset_0_9_22_state)
+
     def _start(self):
+        if self._maintenance_busy:
+            self._log("Wait for launcher maintenance to finish.")
+            return
         if self._busy:
             self._kill_game()
             return
         status = self._refresh_client()
         try:
             session = core.plan_session(status, self.mode.get(),
-                                        self.join_address.get())
+                                        self.join_address.get(),
+                                        self.team_size.get())
         except core.LauncherError as error:
             self._log(str(error))
             return
@@ -248,11 +388,14 @@ class LauncherWindow(object):
             for action in core.install_client_mod(game_root,
                                                   session["client"]):
                 self._log(action)
+            if session["client"] == core.PORT_0_9_22:
+                self._log(core.ensure_0_9_22_preferences_isolation(game_root))
             for path in core.write_settings(game_root, session["client"],
                                             session["mode"], host, port, name):
                 self._log("Wrote %s" % path)
             if session["needs_server"]:
-                if not self._start_server(game_root, session["client"]):
+                if not self._start_server(
+                        game_root, session["client"], session["team_size"]):
                     return
             elif session["mode"] == core.MODE_JOIN:
                 status = core.listener_status(
@@ -278,7 +421,8 @@ class LauncherWindow(object):
             self._stop_server()
             self._set_busy(False)
 
-    def _start_server(self, game_root, port_version):
+    def _start_server(self, game_root, port_version,
+                      team_size=core.DEFAULT_TEAM_SIZE):
         status = core.listener_status(
             port_version, core.LOCAL_HOST, core.DEFAULT_SERVER_PORT)
         if status == core.LISTENER_COMPATIBLE:
@@ -291,7 +435,8 @@ class LauncherWindow(object):
                       (core.DEFAULT_SERVER_PORT, port_version))
             return False
         command = core.server_child_command(port_version)
-        environment = core.server_environment(port_version, game_root)
+        environment = core.server_environment(
+            port_version, game_root, team_size=team_size)
         self._log("Starting the %s LAN server..." % port_version)
         self._server = subprocess.Popen(
             command, env=environment, stdout=subprocess.PIPE,

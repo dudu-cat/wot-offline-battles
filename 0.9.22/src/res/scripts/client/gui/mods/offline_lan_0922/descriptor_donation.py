@@ -12,6 +12,7 @@ value is a plain JSON type; interpretation of #1513 data stays here.
 import math
 
 from gui.mods.offline_lan_0922 import vehicle_blacklist
+from gui.mods.offline_lan_0922 import vehicle_physics
 
 
 def _value(source, name, default=None):
@@ -161,6 +162,11 @@ def project_descriptor(descriptor):
     projection['physics'] = _json_safe(dict(
         (str(key), physics[key]) for key in physics) if
         isinstance(physics, dict) else {}) or {}
+    # The server cannot see VehicleType.xphysics. Donate the already-selected
+    # #1513 detailed-engine override as a dimensionless ratio so its copied
+    # integrator uses the same effective power as client authority mode.
+    projection['physics']['nativePowerRatio'] = float(
+        vehicle_physics.derive_params(descriptor)['nativePowerRatio'])
     chassis = _value(descriptor, 'chassis', {})
     chassis_projection = _copy_fields(chassis, _CHASSIS_FIELDS)
     bbox = _hit_tester_bbox(chassis)

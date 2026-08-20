@@ -2214,6 +2214,13 @@ class OfflineCompatibility(object):
             context['selected_vehicle'] = garage_state.snapshot()
         return context
 
+    def dispatch_account_int_command(self, command, values):
+        """Persist a server-owned setting while Avatar owns the connection."""
+        from gui.mods.offline_lan_0922.account_rpc import requests
+        result = requests.dispatch(
+            command, {'account_state': self._account_state}, (values,))
+        return result.result_id, result.error
+
     def connect(self, show_lobby=False, account_context=None):
         self.install()
         if self.is_ready() or self._connecting:
@@ -2567,9 +2574,11 @@ class OfflineCompatibility(object):
             if not self._battle_active:
                 raise RuntimeError('target-lock candidate requires a battle')
             if not bool(getattr(
-                    vehicle, '_offlineLANPresentation', False)):
+                    vehicle, '_offlineLANPresentation', False) or getattr(
+                        vehicle, '_offlineNativeRemote', False)):
                 raise TypeError('target-lock candidate is not a remote Vehicle')
-            if getattr(vehicle, 'bw_entity', None) is None:
+            if (bool(getattr(vehicle, '_offlineLANPresentation', False)) and
+                    getattr(vehicle, 'bw_entity', None) is None):
                 raise ValueError(
                     'target-lock candidate has no visual entity')
         self._target_lock_candidate = vehicle

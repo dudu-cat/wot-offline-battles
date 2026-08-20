@@ -12,6 +12,10 @@ OPTIONAL_DEVICE_ITEM_TYPE = 9
 SHELL_ITEM_TYPE = 10
 EQUIPMENT_ITEM_TYPE = 11
 CUSTOMIZATION_ITEM_TYPE = 12
+# account_helpers.CustomizationInvData in the exact #1513 client.
+CUSTOMIZATION_ITEMS = 1
+CUSTOMIZATION_OUTFITS = 2
+CUSTOMIZATION_UNLOCKS = 3
 ITEM_TYPE_INDICES = tuple(range(1, 13))
 REQUIRED_VEHICLE_COMPONENT_TYPES = (2, 3, 4, 5, 6, 7)
 # Account-wide artefacts: owned once and mountable on any vehicle.
@@ -208,6 +212,7 @@ def inventory(selected_vehicle=None, validate=True, only_vehicles=None,
     }
     all_tankmen = {}
     tankman_vehicles = {}
+    customization_outfits = {}
     for record in records:
         vehicle_id = int(record.get('id', 1))
         if only_vehicles is not None and vehicle_id not in only_vehicles:
@@ -241,6 +246,20 @@ def inventory(selected_vehicle=None, validate=True, only_vehicles=None,
         # A missing lastCrew record means that no historical crew is stored.
         # An empty per-vehicle list is not equivalent in #1513: the crew
         # operations popover treats presence as a real history entry.
+
+        outfits = record.get('outfits')
+        vehicle_type = record.get('vehicleTypeCompactDescr')
+        if isinstance(outfits, dict) and vehicle_type is not None:
+            serialized = {}
+            for season, outfit_data in outfits.items():
+                try:
+                    season = int(season)
+                    compact_descr, enabled = outfit_data
+                except (TypeError, ValueError):
+                    continue
+                serialized[season] = (compact_descr, bool(enabled))
+            if serialized:
+                customization_outfits[int(vehicle_type)] = serialized
 
         for item_type, items in dict(
                 record.get('inventoryItems', {})).items():
@@ -281,7 +300,20 @@ def inventory(selected_vehicle=None, validate=True, only_vehicles=None,
         'vehicle': tankman_vehicles,
     }
     values[VEHICLE_ITEM_TYPE] = vehicle_values
-    values[CUSTOMIZATION_ITEM_TYPE] = {}
+    customization_items = {}
+    for custom_type, items in dict(
+            vehicle.get('customizationItems', {})).items():
+        custom_type = int(custom_type)
+        customization_items[custom_type] = {}
+        for item_id, counts in dict(items).items():
+            customization_items[custom_type][int(item_id)] = dict(
+                (int(vehicle_type), int(count))
+                for vehicle_type, count in dict(counts).items())
+    values[CUSTOMIZATION_ITEM_TYPE] = {
+        CUSTOMIZATION_ITEMS: customization_items,
+        CUSTOMIZATION_OUTFITS: customization_outfits,
+        CUSTOMIZATION_UNLOCKS: {},
+    }
     if delta:
         values = _prune_empty(values)
     return {'inventory': values}
@@ -305,7 +337,7 @@ def _prune_empty(values):
     return pruned
 
 
-def stats(selected_vehicle=None):
+def stats(selected_vehicle=None, postbattle_progress=None):
     """Return an unlocked, well-funded account for the local garage."""
     vehicle = selected_vehicle if isinstance(selected_vehicle, dict) else {}
     vehicle_types = set(vehicle.get('vehicleTypeCompactDescrs', ()))
@@ -316,16 +348,34 @@ def stats(selected_vehicle=None):
             if record.get('vehicleTypeCompactDescr') is not None)
     unlocks = set(vehicle.get('unlockItemCompactDescrs', ()))
     unlocks.update(vehicle_types)
+    progress = (postbattle_progress
+                if isinstance(postbattle_progress, dict) else {})
+    earned_credits = max(0, int(progress.get('credits', 0) or 0))
+    earned_free_xp = max(0, int(progress.get('freeXP', 0) or 0))
+    vehicle_xp = dict((compact_descr, 0) for compact_descr in vehicle_types)
+    try:
+        from items import vehicles
+        for type_name, row in (progress.get('vehicles') or {}).items():
+            descriptor = vehicles.VehicleDescr(typeName=str(type_name))
+            nation_id, vehicle_type_id = descriptor.type.id
+            compact_descr = vehicles.makeIntCompactDescrByID(
+                'vehicle', nation_id, vehicle_type_id)
+            vehicle_xp[int(compact_descr)] = max(
+                0, int(row.get('xp', 0) or 0))
+    except Exception:
+        # Native lookup is presentation-only; persisted progress remains
+        # available for the next sync when the vehicle cache is ready.
+        pass
     return {
         'account': {
             'clanDBID': 0, 'attrs': 0, 'premiumExpiryTime': 0,
             'autoBanTime': 0, 'globalRating': 0,
         },
         'stats': {
-            'credits': OFFLINE_CREDITS,
+            'credits': OFFLINE_CREDITS + earned_credits,
             'gold': OFFLINE_GOLD,
             'crystal': 0,
-            'freeXP': OFFLINE_FREE_XP,
+            'freeXP': OFFLINE_FREE_XP + earned_free_xp,
             'slots': OFFLINE_GARAGE_SLOTS,
             'berths': OFFLINE_BARRACKS_BERTHS,
             'accOnline': 0, 'accOffline': 0,
@@ -340,8 +390,7 @@ def stats(selected_vehicle=None):
             # the native #1513 GameSessionController.  Zero means no allowed
             # play time, not "unlimited".
             'playLimits': ((86400, ''), (604800, '')),
-            'vehTypeXP': dict((compact_descr, 0)
-                              for compact_descr in vehicle_types),
+            'vehTypeXP': vehicle_xp,
             'vehTypeLocks': {}, 'restrictions': {},
             'globalVehicleLocks': {}, 'refSystem': {'referrals': {}},
             'unlocks': unlocks,
@@ -370,7 +419,8 @@ def personal_missions():
     }
 
 
-def sync_data(revision=0, selected_vehicle=None, int_user_settings=None):
+def sync_data(revision=0, selected_vehicle=None, int_user_settings=None,
+              postbattle_progress=None):
     # These are deliberately present even when empty.  #1513's account
     # helpers only create a requester cache entry when the corresponding key
     # exists in the sync diff; several lobby requesters then index that entry
@@ -392,7 +442,7 @@ def sync_data(revision=0, selected_vehicle=None, int_user_settings=None):
         'eventsData': {},
     }
     result.update(inventory(selected_vehicle))
-    result.update(stats(selected_vehicle))
+    result.update(stats(selected_vehicle, postbattle_progress))
     return result
 
 
@@ -505,6 +555,65 @@ def shop(revision=0, selected_vehicle=None):
     }
 
 
-def dossiers(revision=0):
-    """Return the exact tuple unpacked by #1513 ``DossierCache``."""
-    return (int(revision) + 1, [])
+def _vehicle_type_compact_descr(type_name):
+    from items import vehicles
+    descriptor = vehicles.VehicleDescr(typeName=str(type_name))
+    nation_id, vehicle_type_id = descriptor.type.id
+    return int(vehicles.makeIntCompactDescrByID(
+        'vehicle', nation_id, vehicle_type_id))
+
+
+def dossiers(revision=0, max_change_time=0, postbattle_progress=None,
+             dossier_factory=None, vehicle_type_resolver=None):
+    """Return exact native-built vehicle dossier rows for #1513 cache."""
+    progress = (postbattle_progress
+                if isinstance(postbattle_progress, dict) else {})
+    vehicle_rows = dict(progress.get('vehicles', {}))
+    if not vehicle_rows:
+        return (1, [])
+    if dossier_factory is None:
+        from dossiers2.custom.builders import getVehicleDossierDescr
+        dossier_factory = getVehicleDossierDescr
+    resolver = vehicle_type_resolver or _vehicle_type_compact_descr
+    rows = []
+    for type_name, stats in sorted(
+            vehicle_rows.items()):
+        change_time = max(1, int(stats.get(
+            'changeTime', stats.get('battles', 0)) or 0))
+        if change_time <= int(max_change_time or 0):
+            continue
+        dossier = dossier_factory('')
+        block = dossier['a15x15']
+        block2 = dossier['a15x15_2']
+        battles = max(0, int(stats.get('battles', 0) or 0))
+        wins = min(battles, max(0, int(stats.get('wins', 0) or 0)))
+        if 'losses' in stats:
+            losses = min(
+                battles - wins,
+                max(0, int(stats.get('losses', 0) or 0)))
+        else:
+            # Schema-1 files written before draws were preserved have no way
+            # to distinguish a draw from a loss. Keep their former behavior.
+            losses = battles - wins
+        block['xp'] = max(0, int(stats.get('xp', 0) or 0))
+        block['battlesCount'] = battles
+        block['wins'] = wins
+        block['losses'] = losses
+        block['frags'] = max(0, int(stats.get('kills', 0) or 0))
+        block['damageDealt'] = max(0, int(stats.get('damage', 0) or 0))
+        for field_name in (
+                'shots', 'directHits', 'spotted', 'damageReceived',
+                'capturePoints', 'droppedCapturePoints', 'survivedBattles'):
+            block[field_name] = max(
+                0, int(stats.get(field_name, 0) or 0))
+        for field_name in (
+                'piercings', 'damageBlockedByArmor',
+                'damageAssistedTrack', 'damageAssistedRadio',
+                'damageAssistedStun'):
+            block2[field_name] = max(
+                0, int(stats.get(field_name, 0) or 0))
+        rows.append((resolver(type_name), change_time,
+                     dossier.makeCompDescr()))
+    # This cache version describes our dossier row schema, not battle count.
+    # Keeping it stable lets maxChangeTime request only changed vehicle rows.
+    return (1, rows)

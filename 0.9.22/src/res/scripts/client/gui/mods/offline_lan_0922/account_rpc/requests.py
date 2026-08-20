@@ -181,8 +181,9 @@ def _buy_and_equip_item(context, args):
     values = list(args[0] if args else ())
     if len(values) < 4:
         return Result(commands.RES_FAILURE, 'INVALID_PURCHASE_REQUEST')
+    gun_compact_descr = values[5] if len(values) > 5 else 0
     return _fitting(context, lambda state: state.buy_and_equip_item(
-        values[2], values[1], values[3]))
+        values[2], values[1], values[3], gun_compact_descr))
 
 
 def _vehicle_settings(context, args):
@@ -193,13 +194,51 @@ def _vehicle_settings(context, args):
         args[0], args[1], args[2]))
 
 
+def _apply_style(context, args):
+    # Shop.applyStyle -> _doCmdInt3(shopRev, vehInvID, styleID).
+    if len(args) != 3:
+        return Result(commands.RES_FAILURE, 'INVALID_STYLE_REQUEST')
+    return _fitting(context, lambda state: state.apply_style(
+        args[1], args[2]))
+
+
+def _sell_customization(context, args):
+    # Shop.sellCustomization -> (shopRev, itemCD, count, vehInvID).
+    if len(args) != 4:
+        return Result(commands.RES_FAILURE, 'INVALID_CUSTOMIZATION_SALE')
+    return _fitting(context, lambda state: state.sell_customization(
+        args[3], args[1], args[2]))
+
+
+def _buy_customizations(context, args):
+    # [shopRev, vehInvID, itemCD, count, ...].
+    values = list(args[0] if len(args) == 1 else ())
+    if len(values) < 4 or len(values[2:]) % 2:
+        return Result(commands.RES_FAILURE, 'INVALID_CUSTOMIZATION_PURCHASE')
+    return _fitting(context, lambda state: state.buy_customizations(
+        values[1], values[2:]))
+
+
+def _apply_outfit(context, args):
+    # Shop.applyOutfit -> intArr [shopRev, vehInvID, season], strArr [descr].
+    ints = list(args[0] if len(args) == 2 else ())
+    strings = list(args[1] if len(args) == 2 else ())
+    if len(ints) != 3 or len(strings) != 1:
+        return Result(commands.RES_FAILURE, 'INVALID_OUTFIT_REQUEST')
+    return _fitting(context, lambda state: state.apply_outfit(
+        ints[1], ints[2], strings[0]))
+
+
 def _sync_data(context, args):
     revision = args[0] if args else 0
     account_state = context.get('account_state')
     int_user_settings = (
         account_state.snapshot() if account_state is not None else {})
+    postbattle = context.get('postbattle_store')
+    progress = postbattle.progress() if postbattle is not None else None
     return Result(commands.RES_SUCCESS, '', ext=data.sync_data(
-        revision, context.get('selected_vehicle'), int_user_settings))
+        revision, context.get('selected_vehicle'), int_user_settings,
+        progress))
 
 
 def _server_stats(context, args):
@@ -235,7 +274,38 @@ def _sync_shop(context, args):
 
 def _sync_dossiers(context, args):
     revision = args[0] if args else 0
-    return Result(commands.RES_STREAM, '', data.dossiers(revision))
+    max_change_time = args[1] if len(args) > 1 else 0
+    postbattle = context.get('postbattle_store')
+    progress = postbattle.progress() if postbattle is not None else None
+    return Result(commands.RES_STREAM, '', data.dossiers(
+        revision, max_change_time, progress))
+
+
+def _request_battle_results(context, args):
+    store = context.get('postbattle_store')
+    if store is None or len(args) != 3:
+        return Result(commands.RES_FAILURE, 'BATTLE_RESULTS_UNAVAILABLE')
+    try:
+        result = store.result(args[0])
+    except Exception as error:
+        return Result(commands.RES_FAILURE, 'BATTLE_RESULTS_PACK_FAILED: %s'
+                      % error)
+    if result is None:
+        return Result(commands.RES_FAILURE, 'BATTLE_RESULTS_NOT_FOUND')
+    return Result(commands.RES_STREAM, '', result)
+
+
+def _battle_results_received(context, args):
+    store = context.get('postbattle_store')
+    if store is None or len(args) != 3:
+        return Result(commands.RES_FAILURE, 'BATTLE_RESULTS_UNAVAILABLE')
+    try:
+        acknowledged = store.acknowledge(args[0])
+    except (IOError, OSError, TypeError, ValueError):
+        return Result(commands.RES_FAILURE, 'BATTLE_RESULTS_ACK_FAILED')
+    if not acknowledged:
+        return Result(commands.RES_FAILURE, 'BATTLE_RESULTS_NOT_FOUND')
+    return Result(commands.RES_SUCCESS)
 
 
 def _set_language(context, args):
@@ -308,6 +378,10 @@ HANDLERS = {
     commands.CMD_BUY_ITEM: _buy_item,
     commands.CMD_BUY_AND_EQUIP_ITEM: _buy_and_equip_item,
     commands.CMD_VEH_SETTINGS: _vehicle_settings,
+    commands.CMD_VEH_APPLY_STYLE: _apply_style,
+    commands.CMD_SELL_C11N_ITEMS: _sell_customization,
+    commands.CMD_BUY_C11N_ITEMS: _buy_customizations,
+    commands.CMD_VEH_APPLY_OUTFIT: _apply_outfit,
     commands.CMD_REQ_SERVER_STATS: _server_stats,
     commands.CMD_SYNC_SHOP: _sync_shop,
     commands.CMD_SYNC_DOSSIERS: _sync_dossiers,
@@ -315,6 +389,8 @@ HANDLERS = {
     commands.CMD_DEQUEUE_RANDOM: _dequeue_random,
     commands.CMD_SET_LANGUAGE: _set_language,
     commands.CMD_COMPLETE_TUTORIAL: lambda context, args: Result(commands.RES_SUCCESS),
+    commands.CMD_REQ_BATTLE_RESULTS: _request_battle_results,
+    commands.CMD_BATTLE_RESULTS_RECEIVED: _battle_results_received,
     commands.CMD_ADD_INT_USER_SETTINGS: _add_int_user_settings,
     commands.CMD_DEL_INT_USER_SETTINGS: _del_int_user_settings,
 }

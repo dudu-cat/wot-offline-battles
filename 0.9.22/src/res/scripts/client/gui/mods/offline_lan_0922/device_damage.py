@@ -352,9 +352,10 @@ def pick_interior(candidates, roll=None):
 # --- Damaged-module penalties -------------------------------------------------
 # RECONSTRUCTED. The client never computed these: avatar.py only gates input on
 # __cantMoveCriticals (engine/leftTrack/rightTrack/vehicle/crew destroyed) and
-# __cantShootCriticals (gun/vehicle/crew destroyed); every degradation was server
-# side. The era rule is that a module is either functional-with-penalty (orange)
-# or dead, so ONE efficiency constant covers the damaged state.
+# __cantShootCriticals (gun/vehicle/crew destroyed); every degradation was
+# server side.  Yellow tracks are intentionally absent below: #1513 only hard
+# gates a destroyed track, while the documented damaged-module penalties cover
+# engine/ammo/turret/radio/crew rather than reducing track traverse.
 DAMAGED_MODULE_EFFICIENCY = 0.5
 # For the two modules whose destruction is not already a hard gate (optics and
 # radio keep working, just badly), destruction is worse than damage but not zero.
@@ -369,7 +370,6 @@ _MODULE_STAT_SPEC = {
     'aim_time': (('gunHealth',), 1.0 / DAMAGED_MODULE_EFFICIENCY, None),
     'turret_speed': (('turretRotatorHealth',), DAMAGED_MODULE_EFFICIENCY, 0.0),
     'mobility': (('engineHealth',), DAMAGED_MODULE_EFFICIENCY, 0.0),
-    'traverse': (('leftTrackHealth', 'rightTrackHealth'), DAMAGED_MODULE_EFFICIENCY, 0.0),
     'vision': (('surveyingDeviceHealth',), DAMAGED_MODULE_EFFICIENCY, DESTROYED_MODULE_EFFICIENCY),
     'signal': (('radioHealth',), DAMAGED_MODULE_EFFICIENCY, DESTROYED_MODULE_EFFICIENCY),
 }
@@ -400,8 +400,8 @@ def clamp_vision_factor(factor):
 def module_stat_factor(devices_hp, destroyed, td, stat):
     """Multiplier for a stat from MODULE state, the counterpart of
     crew_stat_factor. >1 worsens time-like stats (reload, dispersion, aim_time);
-    <1 worsens capability-like stats (mobility, traverse, turret_speed, vision,
-    signal). 1.0 when the relevant module is untouched."""
+    <1 worsens capability-like stats (mobility, turret_speed, vision, signal).
+    1.0 when the relevant module is untouched."""
     spec = _MODULE_STAT_SPEC.get(stat)
     if spec is None:
         return 1.0
@@ -695,9 +695,15 @@ if __name__ == '__main__':
     check('crew role base gunner1', crew_role_base('gunner1') == 'gunner')
     check('crew role base commander', crew_role_base('commander') == 'commander')
     check('impaired roles', crew_impaired_roles(['gunner1', 'commander']) == set(['gunner', 'commander']))
-    check('gunner KO worsens dispersion', crew_stat_factor(['gunner1'], 'dispersion') >= 2.0)
-    check('loader KO slows reload', crew_stat_factor(['loader1'], 'reload') >= 2.5)
-    check('driver KO halves mobility', abs(crew_stat_factor(['driver'], 'mobility') - 0.5) < 1e-9)
+    check('gunner KO worsens dispersion', abs(
+        crew_stat_factor(['gunner1'], 'dispersion') -
+        CREW_KO_TIME_FACTOR) < 1e-9)
+    check('loader KO slows reload', abs(
+        crew_stat_factor(['loader1'], 'reload') -
+        CREW_KO_TIME_FACTOR) < 1e-9)
+    check('driver KO reduces mobility', abs(
+        crew_stat_factor(['driver'], 'mobility') -
+        CREW_KO_MOBILITY_FACTOR) < 1e-9)
     check('commander KO cuts vision', crew_stat_factor(['commander'], 'vision') <= 0.75 + 1e-9)
     check('healthy crew = no penalty', crew_stat_factor([], 'reload') == 1.0)
     check('crew health names', 'gunner1Health' in CREW_HEALTH_NAMES and 'engineHealth' not in CREW_HEALTH_NAMES)
@@ -776,8 +782,8 @@ if __name__ == '__main__':
           abs(module_stat_factor(dmg4, set(['surveyingDeviceHealth']), td, 'vision') - 0.25) < 1e-9)
     dmg5 = dict(dh)
     dmg5['leftTrackHealth'] = 100
-    check('one damaged track halves traverse',
-          abs(module_stat_factor(dmg5, set(), td, 'traverse') - 0.5) < 1e-9)
+    check('a damaged track does not reduce traverse',
+          module_stat_factor(dmg5, set(), td, 'traverse') == 1.0)
     check('unknown stat -> 1.0', module_stat_factor(dh, set(), td, 'nope') == 1.0)
     check('vision malus is floored, never blinding',
           abs(clamp_vision_factor(0.75 * 0.75 * 0.25) - MIN_VISION_FACTOR) < 1e-9)

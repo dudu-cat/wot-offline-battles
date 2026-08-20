@@ -312,7 +312,8 @@ def _tank_shape(tank):
     return DEFAULT_SHAPE
 
 
-def resolve_tank(tank, others, now=None, ram_cooldowns=None):
+def resolve_tank(tank, others, now=None, ram_cooldowns=None,
+                 active_ram_contacts=None):
     """Resolve one hull against other hulls using only plain data.
 
     A body with ``alive`` false is a wreck: it still blocks and separates, but
@@ -331,6 +332,10 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None):
     ``cooldowns``
         A copied and updated pair->time mapping.  The input mapping is never
         mutated, so callers can publish the result atomically.
+    ``contacts``
+        The OBB pairs touching in this solve.  Feed the preceding complete
+        frame back as ``active_ram_contacts`` so a sustained overlap cannot
+        replay one impact; an absent frame re-arms the pair.
 
     Supplying ``now=None`` disables ram-event admission while retaining all
     collision correction and impulses.
@@ -354,6 +359,8 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None):
     delta_velocity_z = 0.0
     ram_events = []
     cooldowns = dict(ram_cooldowns or {})
+    previous_contacts = set(active_ram_contacts or ())
+    contact_pairs = set()
 
     for other in others or ():
         other_id = _tank_value(other, 'id', -1)
@@ -385,6 +392,8 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None):
             other_x, other_z, other_yaw, other_shape)
         if contact is None:
             continue
+        pair = (min(self_id, other_id), max(self_id, other_id))
+        contact_pairs.add(pair)
 
         if other_is_wreck:
             other_velocity_x = other_velocity_z = 0.0
@@ -414,7 +423,13 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None):
         if (other_is_wreck or now is None or
                 normal_velocity >= -RAM_SAFE_SPEED):
             continue
-        pair = (min(self_id, other_id), max(self_id, other_id))
+        # A retail ram consumes the relative kinetic impulse at contact.  A
+        # persistent OBB overlap is still the same collision, even when a
+        # driving input keeps publishing its pre-response speed.  Requiring
+        # one separated frame before re-arming prevents the old 0.75-second
+        # timer from applying the same impact repeatedly.
+        if pair in previous_contacts:
+            continue
         if float(now) - float(cooldowns.get(pair, 0.0)) <= RAM_COOLDOWN:
             continue
         cooldowns[pair] = float(now)
@@ -436,6 +451,7 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None):
         'delta_velocity': (delta_velocity_x, delta_velocity_z),
         'ram_events': tuple(ram_events),
         'cooldowns': cooldowns,
+        'contacts': frozenset(contact_pairs),
     }
 
 

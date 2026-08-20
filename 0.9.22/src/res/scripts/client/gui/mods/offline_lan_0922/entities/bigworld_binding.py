@@ -293,7 +293,8 @@ class BigWorldVehicleBinding(object):
         """
         entity = self._authority_entity_or_fail(entity_id)
         setter = getattr(entity, 'set_pose', None)
-        if not (bool(getattr(entity, '_offlineLANPresentation', False)) and
+        if not (bool(getattr(entity, '_offlineLANPresentation', False) or
+                     getattr(entity, '_offlineNativeRemote', False)) and
                 callable(setter)):
             raise CapabilityError(
                 'remote vehicle has no authoritative presentation')
@@ -303,7 +304,8 @@ class BigWorldVehicleBinding(object):
         """Apply a network world aim to the exact packed Vehicle property."""
         entity = self._authority_entity_or_fail(entity_id)
         presentation_setter = getattr(entity, 'set_aim', None)
-        if (bool(getattr(entity, '_offlineLANPresentation', False)) and
+        if (bool(getattr(entity, '_offlineLANPresentation', False) or
+                 getattr(entity, '_offlineNativeRemote', False)) and
                 callable(presentation_setter)):
             presentation_setter(hull_yaw, aim_yaw, gun_pitch)
             return

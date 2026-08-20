@@ -3,7 +3,13 @@
 
 
 PROXIMITY_SPOT_DISTANCE = 50.0
-MAX_SPOT_DISTANCE = 500.0
+# Exact #1513 ``constants.VISIBILITY.MAX_RADIUS``.  This is the detection
+# ceiling, not the wider entity-AOI radius used to draw an already spotted tank.
+MAX_SPOT_DISTANCE = 445.0
+# Exact #1513 ``constants.AOI.VEHICLE_CIRCULAR_AOI_RADIUS``.  Team spotting may
+# keep its ten-second memory beyond this boundary, but the local client must not
+# draw the remote vehicle there.
+VEHICLE_AOI_RADIUS = 565.0
 # Retail #1513 varied the post-detection hold within a 5-10 second window.
 # Use its no-skill guaranteed-disappearance bound so deterministic LAN peers
 # never hide a target earlier than the retail rule allowed.
@@ -68,7 +74,7 @@ def effective_camouflage(base_pair, moving=False, additive=0.0,
 
 
 def detection_distance(view_range, camouflage):
-	"""Apply the historical 50 metre floor and 500 metre spotting ceiling."""
+	"""Apply #1513's 50 metre floor and 445 metre spotting ceiling."""
 	view_range = max(PROXIMITY_SPOT_DISTANCE, float(view_range or 0.0))
 	camouflage = clamp(camouflage, 0.0, 0.95)
 	distance = view_range - (

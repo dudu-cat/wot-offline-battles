@@ -110,7 +110,8 @@ class AvatarServerBridge(object):
     """Bridge native Avatar/Vehicle mailbox calls to entities and LAN input."""
 
     def __init__(self, avatar, entity_binding, property_builder, lan_sender,
-                 account_commands=None, on_ready=None, on_leave=None,
+                 account_commands=None, on_account_int_command=None,
+                 on_ready=None, on_leave=None,
                  on_vehicle_enter=None, on_viewpoint_switch=None,
                  initial_period='battle', initial_period_seconds=0.0):
         self._avatar = avatar
@@ -118,6 +119,7 @@ class AvatarServerBridge(object):
         self._builder = property_builder
         self._lan_sender = lan_sender
         self._account_commands = tuple(account_commands or ())
+        self._on_account_int_command = on_account_int_command
         self._on_ready = on_ready
         self._on_leave = on_leave
         self._on_vehicle_enter = on_vehicle_enter
@@ -557,7 +559,13 @@ class AvatarServerBridge(object):
         self._ack_command(request_id, command)
 
     def doCmdIntArr(self, request_id, command, values):
-        self._ack_command(request_id, command)
+        if command not in self._account_commands:
+            raise AttributeError('unsupported account command: %s' % command)
+        result_id = 0
+        error = ''
+        if callable(self._on_account_int_command):
+            result_id, error = self._on_account_int_command(command, values)
+        self._ack_command(request_id, command, result_id, error)
 
     def destroy(self):
         if self._destroyed:
@@ -584,13 +592,13 @@ class AvatarServerBridge(object):
             self._binding.destroy_entity(vehicle_id)
         return True
 
-    def _ack_command(self, request_id, command):
+    def _ack_command(self, request_id, command, result_id=0, error=''):
         if command not in self._account_commands:
             raise AttributeError('unsupported account command: %s' % command)
         callback = getattr(self._avatar, 'onCmdResponse', None)
         if callback is None:
             raise AttributeError('Avatar.onCmdResponse')
-        callback(request_id, 0, '')
+        callback(request_id, result_id, error)
 
     def _send_input(self, kind, payload):
         if self._vehicle_id is None or not self._client_ready:

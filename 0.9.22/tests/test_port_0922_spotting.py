@@ -37,8 +37,10 @@ class SpottingTests(unittest.TestCase):
     def test_detection_distance_keeps_floor_and_ceiling(self):
         self.assertEqual(67.5, spotting.detection_distance(400.0, 0.95))
         self.assertEqual(225.0, spotting.detection_distance(400.0, 0.5))
-        self.assertEqual(500.0, spotting.detection_distance(700.0, 0.0))
+        self.assertEqual(445.0, spotting.detection_distance(700.0, 0.0))
+        self.assertEqual(565.0, spotting.VEHICLE_AOI_RADIUS)
         self.assertTrue(spotting.is_detected(50.0, 50.0, 0.95, False))
+        self.assertFalse(spotting.is_detected(445.01, 700.0, 0.0, True))
 
 
 if __name__ == '__main__':

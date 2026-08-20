@@ -161,7 +161,11 @@ class BootstrapLifecycleTests(unittest.TestCase):
             'vehicle': 'ussr:R11_MS-1'}
         state_module = types.ModuleType(
             'gui.mods.offline_lan_0922.account_rpc.state')
-        state_module.AccountState = object
+        state_module.AccountState = types.SimpleNamespace
+        postbattle_store = types.SimpleNamespace()
+        postbattle_module = types.ModuleType(
+            'gui.mods.offline_lan_0922.account_rpc.postbattle_store')
+        postbattle_module.PostBattleStore = lambda: postbattle_store
         session = types.SimpleNamespace(
             install=lambda: events.append('install_battle_router') or True,
             stop=lambda **unused_kwargs: None)
@@ -367,6 +371,8 @@ class BootstrapLifecycleTests(unittest.TestCase):
                 'gui.mods.offline_lan_0922'),
             'gui.mods.offline_lan_0922.account_rpc': _package(
                 'gui.mods.offline_lan_0922.account_rpc'),
+            'gui.mods.offline_lan_0922.account_rpc.postbattle_store': (
+                postbattle_module),
             'gui.mods.offline_lan_0922.account_rpc.state': state_module,
             'gui.mods.offline_lan_0922.compat': compat_module,
             'gui.mods.offline_lan_0922.config': config_module,

@@ -1,10 +1,12 @@
 from __future__ import print_function
 
+import base64
 import json
 import math
 import socket
 import threading
 import time
+import uuid
 
 
 PROTOCOL_VERSION = 5
@@ -32,11 +34,13 @@ MAX_PROJECTILE_DISTANCE = 10000.0
 MAX_PROJECTILE_TIME_MS = 20000
 MAX_PROJECTILE_SPLASH_RADIUS = 100.0
 MAX_PROJECTILE_PIERCING_LOSS = 100000.0
+OUTFIT_SEASONS = frozenset((1, 2, 4))
+MAX_OUTFIT_BYTES = 64 * 1024
 SENDER_JOIN_TIMEOUT = 0.1
 LEAVE_SEND_TIMEOUT = 0.05
 LEAVE_PAYLOAD = b'{"type":"leave"}\n'
 _BOT_STATE_WIRE_FIELDS = (
-    'id', 'x', 'y', 'z', 'yaw', 'aim_yaw', 'gun_pitch',
+    'id', 'x', 'y', 'z', 'yaw', 'pitch', 'roll', 'aim_yaw', 'gun_pitch',
     'movement_dir', 'rotation_dir', 'fire_seq', 'shell_index',
     'next_shell_index', 'ammo_remaining', 'ammo_reload_pending',
     'health', 'alive', 'critical', 'combat_base_revision', 'combat_seq',
@@ -47,7 +51,7 @@ STATE_BARRIER_TYPES = frozenset((
     'start_denied', 'events', 'error'))
 SERVER_STATE_TYPES = frozenset((
     'welcome', 'roster', 'battle_start', 'battle_live', 'start_denied',
-    'snapshot', 'events', 'bot_observation'))
+    'snapshot', 'events', 'bot_observation', 'battle_receipt'))
 
 
 def _monotonic_time():
@@ -255,7 +259,7 @@ def _strict_mapping_list(value, limit=30):
     return [dict(item) for item in value]
 
 
-def _project_bot_state(state):
+def project_bot_state(state):
     """Return only fields consumed by the v5 server bot-state sanitizer."""
     if not isinstance(state, dict):
         return None
@@ -277,6 +281,10 @@ def _project_bot_state(state):
             not isinstance(state.get('ammo_reload_pending'), bool)):
         return None
     return projected
+
+
+# Compatibility for engine-free callers which imported the old private name.
+_project_bot_state = project_bot_state
 
 
 def _projectile_int_range(value, minimum, maximum):
@@ -547,6 +555,129 @@ def _valid_active_projectiles(value, authority_epoch, server_time_ms):
     return True
 
 
+def _valid_battle_receipt(message):
+    """Validate the bounded JSON receipt before it reaches persistent state."""
+    if not isinstance(message, dict):
+        return False
+    receipt_id = _safe_text(message.get('receipt_id'), '', 97)
+    account_key = _safe_text(message.get('account_key'), '', 65)
+    player_name = _safe_text(message.get('player_name'), '', 33)
+    vehicle = _safe_text(message.get('vehicle'), '', 97)
+    map_name = _safe_text(message.get('map'), '', 97)
+    arena_unique_id = _exact_int(message.get('arena_unique_id'))
+    round_id = _exact_int(message.get('round_id'))
+    player_id = _exact_int(message.get('player_id'))
+    team = _exact_int(message.get('team'))
+    winner = _exact_int(message.get('winner'))
+    duration = _exact_int(message.get('duration'))
+    if (not receipt_id or len(receipt_id) > 96 or not account_key or
+            len(account_key) > 64 or not player_name or
+            len(player_name) > 32 or not vehicle or len(vehicle) > 96 or
+            not map_name or len(map_name) > 96 or
+            arena_unique_id is None or arena_unique_id < 0 or
+            round_id is None or round_id < 1 or team not in (1, 2) or
+            player_id is None or not 1 <= player_id <= MAX_PROJECTILE_ID or
+            winner not in (0, 1, 2) or duration is None or duration < 0 or
+            not isinstance(message.get('premature_leave'), bool)):
+        return False
+    stats = message.get('stats')
+    rewards = message.get('rewards')
+    stat_names = (
+        'shots', 'direct_hits', 'piercings', 'damage', 'damage_received',
+        'damage_blocked', 'assist_track', 'assist_radio', 'assist_stun',
+        'kills', 'spotted', 'capture_points', 'dropped_capture_points')
+    reward_names = ('credits', 'xp', 'free_xp', 'repair_cost', 'ammo_cost')
+    if not isinstance(stats, dict) or not isinstance(rewards, dict):
+        return False
+    if any(_exact_int(stats.get(name)) is None or
+           _exact_int(stats.get(name)) < 0 for name in stat_names):
+        return False
+    if any(_exact_int(rewards.get(name)) is None or
+           _exact_int(rewards.get(name)) < 0 for name in reward_names):
+        return False
+    if rewards.get('repair_cost') != 0 or rewards.get('ammo_cost') != 0:
+        return False
+    public_rows = message.get('public_results')
+    if (not isinstance(public_rows, list) or
+            not 1 <= len(public_rows) <= 30):
+        return False
+    seen = set()
+    personal_row = None
+    for row in public_rows:
+        if not isinstance(row, dict):
+            return False
+        actor_kind = row.get('actor_kind')
+        actor_id = _exact_int(row.get('actor_id'))
+        row_team = _exact_int(row.get('team'))
+        health = _exact_int(row.get('health'))
+        death_reason = _exact_int(row.get('death_reason'))
+        xp = _exact_int(row.get('xp'))
+        killer_kind = row.get('killer_kind', '')
+        killer_id = _exact_int(row.get('killer_id', 0))
+        identity = (actor_kind, actor_id)
+        name = _safe_text(row.get('name'), '', 33)
+        row_vehicle = _safe_text(row.get('vehicle'), '', 97)
+        row_stats = row.get('stats')
+        if (actor_kind not in ('player', 'bot') or actor_id is None or
+                not 1 <= actor_id <= MAX_PROJECTILE_ID or
+                identity in seen or row_team not in (1, 2) or
+                health is None or health < 0 or
+                death_reason is None or not -1 <= death_reason <= 255 or
+                xp is None or xp < 0 or not name or len(name) > 32 or
+                not row_vehicle or len(row_vehicle) > 96 or
+                not isinstance(row.get('is_team_killer'), bool) or
+                killer_kind not in ('', 'player', 'bot') or
+                killer_id is None or killer_id < 0 or
+                bool(killer_kind) != bool(killer_id) or
+                not isinstance(row_stats, dict)):
+            return False
+        if any(_exact_int(row_stats.get(stat_name)) is None or
+               _exact_int(row_stats.get(stat_name)) < 0
+               for stat_name in stat_names):
+            return False
+        seen.add(identity)
+        if identity == ('player', player_id):
+            personal_row = row
+    return bool(
+        personal_row is not None and
+        personal_row.get('name') == message.get('player_name') and
+        personal_row.get('vehicle') == message.get('vehicle') and
+        personal_row.get('team') == message.get('team') and
+        personal_row.get('death_reason') == message.get('death_reason') and
+        personal_row.get('xp') == rewards.get('xp') and
+        personal_row.get('stats') == stats)
+
+
+def _canonical_wire_outfits(value):
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or len(value) > len(OUTFIT_SEASONS):
+        return None
+    result = {}
+    total = 0
+    for raw_season, encoded in value.items():
+        try:
+            season = int(raw_season)
+        except (TypeError, ValueError):
+            return None
+        if (season not in OUTFIT_SEASONS or
+                not isinstance(encoded, string_types)):
+            return None
+        try:
+            ascii_value = encoded.encode('ascii')
+            raw = base64.b64decode(ascii_value)
+            canonical = base64.b64encode(raw).decode('ascii')
+        except Exception:
+            return None
+        if canonical != encoded or not raw or len(raw) > MAX_OUTFIT_BYTES:
+            return None
+        total += len(raw)
+        if total > MAX_OUTFIT_BYTES * len(OUTFIT_SEASONS):
+            return None
+        result[str(season)] = canonical
+    return result
+
+
 def _load_bigworld():
     import BigWorld
     return BigWorld
@@ -555,12 +686,17 @@ def _load_bigworld():
 class LANClient(object):
 
     def __init__(self, host, port, name, vehicle, max_health=100,
-                 on_event=None, bigworld=None):
+                 on_event=None, bigworld=None, account_key=None,
+                 outfits=None):
         self.host = _safe_text(host, '127.0.0.1', 255)
         self.port = int(port or 28782)
         self.name = _safe_text(name, 'Player')
         self.vehicle = _safe_text(vehicle, 'ussr:R11_MS-1')
         self.max_health = max(1, int(max_health or 100))
+        self.account_key = _safe_text(
+            account_key, uuid.uuid4().hex, 64)
+        self.outfits = _canonical_wire_outfits(outfits or {}) or {}
+        self._published_player_outfits = {}
         self.on_event = on_event
         self.bigworld = bigworld
         self.sock = None
@@ -734,7 +870,7 @@ class LANClient(object):
             message['map'] = map_name
         return self._send(message)
 
-    def select_vehicle(self, vehicle, max_health):
+    def select_vehicle(self, vehicle, max_health, outfits=None):
         """Publish one waiting-room garage change for the next round."""
         if not self.ready or self.phase != 'waiting':
             return False
@@ -742,10 +878,19 @@ class LANClient(object):
         max_health = _exact_int(max_health)
         if not vehicle or max_health is None or max_health < 1:
             return False
-        if vehicle == self.vehicle and max_health == self.max_health:
+        publishes_outfits = outfits is not None
+        outfits = (_canonical_wire_outfits(outfits)
+                   if publishes_outfits else self.outfits)
+        if outfits is None:
             return False
-        return self._send({'type': 'select_vehicle', 'vehicle': vehicle,
-                           'max_health': max_health})
+        if (vehicle == self.vehicle and max_health == self.max_health and
+                outfits == self.outfits):
+            return False
+        message = {'type': 'select_vehicle', 'vehicle': vehicle,
+                   'max_health': max_health}
+        if publishes_outfits:
+            message['outfits'] = outfits
+        return self._send(message)
 
     def _adopt_published_vehicle(self, players):
         """Track the vehicle and HP the server holds for this client."""
@@ -758,7 +903,27 @@ class LANClient(object):
                 self.vehicle = vehicle
             if max_health is not None and max_health > 0:
                 self.max_health = max_health
+            outfits = _canonical_wire_outfits(entry.get('outfits'))
+            if outfits is not None:
+                self.outfits = outfits
             return
+
+    def _remember_player_outfits(self, players):
+        """Canonicalize static outfits and inherit them on lean snapshots."""
+        result = []
+        for raw in players or ():
+            entry = dict(raw)
+            player_id = _exact_int(entry.get('id'))
+            if 'outfits' in entry:
+                outfits = _canonical_wire_outfits(entry.get('outfits'))
+                if outfits is not None and player_id is not None:
+                    self._published_player_outfits[player_id] = outfits
+                    entry['outfits'] = outfits
+            elif player_id in self._published_player_outfits:
+                entry['outfits'] = dict(
+                    self._published_player_outfits[player_id])
+            result.append(entry)
+        return result
 
     def is_room_host(self):
         return (self.ready and self.phase == 'waiting' and
@@ -1188,12 +1353,22 @@ class LANClient(object):
             return False
         projected = []
         for state in list(bots or ())[:30]:
-            state = _project_bot_state(state)
+            state = project_bot_state(state)
             if state is None:
                 return False
             projected.append(state)
         return self._send({'type': 'bot_state', 'round_id': self.round_id,
                            'bots': projected})
+
+    def send_projected_bot_state(self, bots):
+        """Send BotRuntime's already-projected canonical publication once."""
+        if not self.is_bot_authority():
+            return False
+        if (not isinstance(bots, (list, tuple)) or len(bots) > 30 or
+                any(not isinstance(state, dict) for state in bots)):
+            return False
+        return self._send({'type': 'bot_state', 'round_id': self.round_id,
+                           'bots': bots})
 
     def send_bot_observation(self, contacts, affordances=None):
         if not self.is_bot_authority():
@@ -1340,6 +1515,16 @@ class LANClient(object):
                            'reason': _safe_text(reason, 'battle finished', 80),
                            'base_team': int(base_team or 0)})
 
+    def acknowledge_battle_receipt(self, receipt_id):
+        """Ack only after PostBattleStore has durably accepted the receipt."""
+        receipt_id = _safe_text(receipt_id, '', 97)
+        if not self.ready or not receipt_id or len(receipt_id) > 96:
+            return False
+        return self._send({
+            'type': 'battle_receipt_ack',
+            'receipt_id': receipt_id,
+        })
+
     def _publish_connected_transport(self, sock, generation):
         """Atomically publish one hello-complete transport generation."""
         sender = threading.Thread(
@@ -1395,6 +1580,8 @@ class LANClient(object):
                 'name': self.name,
                 'vehicle': self.vehicle,
                 'max_health': self.max_health,
+                'account_key': self.account_key,
+                'outfits': dict(self.outfits),
             }
             payload = (json.dumps(
                 hello, separators=(',', ':')) + '\n').encode('utf-8')
@@ -1794,6 +1981,7 @@ class LANClient(object):
             phase = _safe_text(message.get('phase'), '')
             map_name = _safe_text(message.get('map'), '')
             spawn = message.get('spawn')
+            outfits = _canonical_wire_outfits(message.get('outfits'))
             if (player_id is None or state_revision is None or
                     state_revision < 0 or host_player_id is None or
                     host_player_id <= 0 or team not in (1, 2) or
@@ -1802,7 +1990,7 @@ class LANClient(object):
                     authority_epoch is None or
                     ('server_time_ms' in message and
                      welcome_server_time is None) or
-                    phase != 'waiting' or not map_name or
+                    phase != 'waiting' or not map_name or outfits is None or
                     not isinstance(spawn, dict) or
                     not all(axis in spawn for axis in ('x', 'y', 'z'))):
                 self.last_error = 'invalid welcome message'
@@ -1820,6 +2008,8 @@ class LANClient(object):
             self.team = team
             self.slot = slot
             self.max_health = max_health
+            self.outfits = outfits
+            self._published_player_outfits[player_id] = dict(outfits)
             self.map_name = map_name
             self.map_pool = self._map_names(message.get('map_pool'))
             self.spawn = dict(spawn)
@@ -1831,6 +2021,12 @@ class LANClient(object):
             self.authority_epoch = authority_epoch
             self.capabilities = capabilities
             self.server_time_ms = welcome_server_time
+        elif kind == 'battle_receipt':
+            if (not _valid_battle_receipt(message) or
+                    message.get('account_key') != self.account_key):
+                self.last_error = 'invalid battle receipt'
+                self.stop()
+                return
         elif kind == 'roster':
             round_id = _exact_int(message.get('round_id'))
             if round_id is None:
@@ -1860,9 +2056,13 @@ class LANClient(object):
                     message.get('server_time_ms'), 0, MAX_PROJECTILE_ID)
             player_ids = set(_exact_int(value.get('id'))
                              for value in players or ())
+            player_outfits_valid = all(
+                _canonical_wire_outfits(value.get('outfits')) is not None
+                for value in players or ())
             ledger_required = self.has_projectile_ledger()
             if (phase not in ('waiting', 'loading', 'battle') or not map_name or
-                    players is None or host_player_id not in player_ids or
+                    players is None or not player_outfits_valid or
+                    host_player_id not in player_ids or
                     (ledger_required and authority_epoch is None) or
                     (ledger_required and round_id == self.round_id and
                      self.authority_epoch is not None and
@@ -1898,6 +2098,7 @@ class LANClient(object):
             maps = self._map_names(message.get('map_pool'))
             if maps:
                 self.map_pool = maps
+            players = self._remember_player_outfits(players)
             self.roster = players
             self._adopt_published_vehicle(players)
             self.host_player_id = host_player_id
@@ -1949,6 +2150,9 @@ class LANClient(object):
             map_name = _safe_text(message.get('map'), '')
             phase = _safe_text(message.get('phase'), '')
             players = _strict_mapping_list(message.get('players'), 64)
+            player_outfits_valid = all(
+                _canonical_wire_outfits(value.get('outfits')) is not None
+                for value in players or ())
             local_ids = set(_exact_int(value.get('id')) for value in players or ())
             host_player_id = _exact_int(message.get('host_player_id'))
             authority_epoch = _projectile_int_range(
@@ -1959,7 +2163,7 @@ class LANClient(object):
                     message.get('server_time_ms'), 0, MAX_PROJECTILE_ID)
             ledger_required = self.has_projectile_ledger()
             if (phase != 'loading' or
-                    not map_name or not players or
+                    not map_name or not players or not player_outfits_valid or
                     self.player_id not in local_ids or
                     host_player_id not in local_ids or
                     (ledger_required and authority_epoch is None) or
@@ -1985,6 +2189,7 @@ class LANClient(object):
             self.map_name = map_name
             self.round_id = round_id
             self.state_revision = state_revision
+            players = self._remember_player_outfits(players)
             self.roster = players
             self._adopt_published_vehicle(players)
             self.host_player_id = host_player_id
@@ -2052,6 +2257,10 @@ class LANClient(object):
                 message.get('bot_state_revision'), 0, MAX_PROJECTILE_ID)
             projectiles = message.get('projectiles')
             players = _strict_mapping_list(message.get('players'), 64)
+            player_outfits_valid = all(
+                ('outfits' not in value or
+                 _canonical_wire_outfits(value.get('outfits')) is not None)
+                for value in players or ())
             bots = _strict_mapping_list(message.get('bots'), 30)
             manifest = None
             if 'bot_manifest' in message:
@@ -2100,7 +2309,8 @@ class LANClient(object):
                     (previous_bot_state_revision is not None and
                      bot_state_revision < previous_bot_state_revision) or
                     not valid_projectiles or
-                    players is None or bots is None or
+                    players is None or not player_outfits_valid or
+                    bots is None or
                     not player_critical_contract or
                     not bot_combat_contract or
                     ('bot_manifest' in message and manifest is None) or
@@ -2119,6 +2329,10 @@ class LANClient(object):
                 self.last_error = 'invalid battle timing'
                 self.stop()
                 return
+            players = self._remember_player_outfits(players)
+            if players != message.get('players'):
+                message = dict(message)
+                message['players'] = players
             self.last_snapshot = message
             if server_time_ms is not None:
                 self.server_time_ms = server_time_ms

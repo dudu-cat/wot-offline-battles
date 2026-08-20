@@ -69,13 +69,18 @@ class FakeServer(object):
         if self._context.get('account_state') is None:
             from gui.mods.offline_lan_0922.account_rpc.state import AccountState
             self._context['account_state'] = AccountState(path=None)
+        if self._context.get('postbattle_store') is None:
+            account_state = self._context.get('account_state')
+            postbattle = getattr(account_state, 'postbattle_store', None)
+            if postbattle is not None:
+                self._context['postbattle_store'] = postbattle
         if callback is None:
             import BigWorld
             callback = BigWorld.callback
         self._callback = callback
         self._context.setdefault('push_update', self._push_update)
 
-    def _push_update(self, diff):
+    def _push_update(self, diff, after_publish=None):
         """Publish one account diff through the exact #1513 entity method.
 
         ``PlayerAccount.update`` unpickles its argument and forwards it to
@@ -111,6 +116,8 @@ class FakeServer(object):
                 return
             player.update(payload)
             _refresh_garage_views(diff)
+            if callable(after_publish):
+                after_publish(player)
 
         self._callback(0.0, publish)
         return True
@@ -120,6 +127,21 @@ class FakeServer(object):
             return self._player_getter()
         except ReferenceError:
             return None
+
+    def publish_postbattle_progress(self):
+        """Push earned resources through the normal revisioned Account diff."""
+        store = self._context.get('postbattle_store')
+        if store is None:
+            return False
+        diff = data.stats(
+            self._context.get('selected_vehicle'), store.progress())
+
+        def resync_dossiers(player):
+            resync = getattr(player, 'resyncDossiers', None)
+            if callable(resync):
+                resync()
+
+        return self._push_update(diff, after_publish=resync_dossiers)
 
     def _respond(self, request_id, command, args):
         result = requests.dispatch(command, self._context, args)

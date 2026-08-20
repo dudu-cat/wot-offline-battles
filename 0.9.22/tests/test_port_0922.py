@@ -437,6 +437,8 @@ class PortSourceTests(unittest.TestCase):
                              'manifest.json').is_file())
             self.assertTrue((config_path.parent / 'destructibles' /
                              'manifest.json').is_file())
+            self.assertTrue(
+                (Path(overlay) / 'START_OFFLINE_0922.bat').is_file())
             self.assertTrue(Path(archive).is_file())
 
     def test_navigation_release_gate_rejects_wrong_41_map_names(self):
@@ -581,6 +583,58 @@ class PortConfigTests(unittest.TestCase):
             self.assertEqual('lan-host.local', config['host'])
             self.assertEqual(30000, config['port'])
             self.assertEqual(20.0, config['prebattleCountdownSeconds'])
+
+    def test_invalid_json_is_quarantined_and_replaced_with_defaults(self):
+        config_module = _load_port_source('config')
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config_path.write_text('{not json', encoding='utf-8')
+
+            config = config_module.load(str(config_path))
+
+            self.assertTrue(config['enabled'])
+            self.assertEqual('127.0.0.1', config['host'])
+            self.assertEqual('{not json', (Path(directory) /
+                             'config.json.invalid').read_text(encoding='utf-8'))
+            self.assertEqual(
+                config_module.DEFAULT_CONFIG,
+                json.loads(config_path.read_text(encoding='utf-8')))
+
+    def test_invalid_config_types_cannot_prevent_offline_login(self):
+        config_module = _load_port_source('config')
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            endpoint_path = Path(directory) / 'server_endpoint.json'
+            config_path.write_text(
+                '{"enabled": "yes", "startupTimeoutSeconds": "never"}',
+                encoding='utf-8')
+            endpoint_path.write_text(
+                '{"schema": 1, "host": "lan-host.local", "port": 30000}',
+                encoding='utf-8')
+
+            config = config_module.load(
+                str(config_path), str(endpoint_path))
+
+            self.assertTrue(config['enabled'])
+            self.assertEqual('lan-host.local', config['host'])
+            self.assertEqual(30000, config['port'])
+            self.assertTrue(
+                (Path(directory) / 'config.json.invalid').is_file())
+
+    def test_overflowing_config_number_cannot_prevent_offline_login(self):
+        config_module = _load_port_source('config')
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config_path.write_text(
+                '{"max_health": 1e999}', encoding='utf-8')
+
+            config = config_module.load(str(config_path))
+
+            self.assertEqual(
+                config_module.DEFAULT_CONFIG['max_health'],
+                config['max_health'])
+            self.assertTrue(
+                (Path(directory) / 'config.json.invalid').is_file())
 
     def test_failed_endpoint_replace_restores_previous_user_value(self):
         config_module = _load_port_source('config')
@@ -1250,6 +1304,23 @@ class OfflineCompatibilityTests(unittest.TestCase):
             [1, 2, 3],
             compatibility._account_context[
                 'selected_vehicle']['vehicles'][0]['eqs'])
+
+    def test_battle_interface_settings_survive_client_restart(self):
+        compatibility_module = _load_port_source('compat')
+        from gui.mods.offline_lan_0922.account_rpc import commands
+        from gui.mods.offline_lan_0922.account_rpc.state import AccountState
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'account_state.json')
+            compatibility = compatibility_module.OfflineCompatibility(
+                self._runtime()[0])
+            compatibility._account_state = AccountState(path)
+
+            result = compatibility.dispatch_account_int_command(
+                commands.CMD_ADD_INT_USER_SETTINGS, [54, 3, 81, 1])
+
+            self.assertEqual((commands.RES_SUCCESS, ''), result)
+            self.assertEqual({54: 3, 81: 1}, AccountState(path).snapshot())
 
     def test_offline_battle_server_time_advances_and_restores(self):
         compatibility_module = _load_port_source('compat')
@@ -4353,6 +4424,28 @@ class LANClientTests(unittest.TestCase):
                 client.thread.join(2.0)
             listener.close()
 
+    def test_projected_bot_state_send_does_not_project_a_second_time(self):
+        module, client, unused_events, unused_bigworld = self._client()
+        client.ready = True
+        client.phase = 'battle'
+        client.player_id = 1
+        client.bot_authority_id = 1
+        client.round_id = 3
+        client._send = mock.Mock(return_value=True)
+        bots = [{'id': 11, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+                 'yaw': 0.0, 'health': 1000, 'alive': True,
+                 'fire_seq': 0}]
+        original = module.project_bot_state
+        module.project_bot_state = mock.Mock(
+            side_effect=AssertionError('second projection'))
+        try:
+            self.assertTrue(client.send_projected_bot_state(bots))
+        finally:
+            module.project_bot_state = original
+
+        client._send.assert_called_once_with({
+            'type': 'bot_state', 'round_id': 3, 'bots': bots})
+
     def test_welcome_roster_and_server_validated_start_request(self):
         module, client, events, _ = self._client()
         self._activate_outbound(client)
@@ -4794,6 +4887,10 @@ class BootstrapContractTests(unittest.TestCase):
             'maxHealth': 880,
             'startupTimeoutSeconds': 30.0,
         })
+        vehicle_blacklist = types.ModuleType(
+            'gui.mods.offline_lan_0922.vehicle_blacklist')
+        vehicle_blacklist.is_unusable = mock.Mock(return_value=False)
+        vehicle_blacklist.missing_resources = mock.Mock(return_value=())
         session = types.SimpleNamespace(
             install=mock.Mock(return_value=True), stop=mock.Mock())
         lan_session = types.ModuleType(
@@ -4808,10 +4905,15 @@ class BootstrapContractTests(unittest.TestCase):
         compatibility_module = types.ModuleType(
             'gui.mods.offline_lan_0922.compat')
         compatibility_module.g_compatibility = compatibility
-        account_state = object()
+        account_state = types.SimpleNamespace()
         state_module = types.ModuleType(
             'gui.mods.offline_lan_0922.account_rpc.state')
         state_module.AccountState = mock.Mock(return_value=account_state)
+        postbattle = types.SimpleNamespace(account_key='test-account')
+        postbattle_module = types.ModuleType(
+            'gui.mods.offline_lan_0922.account_rpc.postbattle_store')
+        postbattle_module.PostBattleStore = mock.Mock(
+            return_value=postbattle)
         class EventBus(object):
             def __init__(self):
                 self.listeners = {}
@@ -4869,7 +4971,10 @@ class BootstrapContractTests(unittest.TestCase):
             'gui.mods.offline_lan_0922': package,
             'gui.mods.offline_lan_0922.compat': compatibility_module,
             'gui.mods.offline_lan_0922.config': config,
+            'gui.mods.offline_lan_0922.vehicle_blacklist': vehicle_blacklist,
             'gui.mods.offline_lan_0922.account_rpc.state': state_module,
+            'gui.mods.offline_lan_0922.account_rpc.postbattle_store':
+                postbattle_module,
             'gui.mods.offline_lan_0922.lan_session': lan_session,
             'gui.mods.offline_lan_0922.lobby_ui': lobby_ui_module,
             'gui.app_loader': app_loader,
@@ -4986,7 +5091,8 @@ class BootstrapContractTests(unittest.TestCase):
             config.load.return_value,
             lobby_ready=module._native_lobby_is_ready,
             callback=bigworld.callback,
-            cancel_callback=bigworld.cancelCallback)
+            cancel_callback=bigworld.cancelCallback,
+            postbattle_store=postbattle)
         self.assertEqual(
             [expected_session, expected_session],
             lan_session.LANSession.call_args_list)

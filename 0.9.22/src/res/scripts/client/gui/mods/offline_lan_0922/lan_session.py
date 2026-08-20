@@ -2,7 +2,9 @@ from __future__ import print_function
 
 """Coordinator between LAN protocol, stock map picker and battle runtime."""
 
+import base64
 import sys
+import time
 
 from gui.mods.offline_lan_0922 import config as port_config
 from gui.mods.offline_lan_0922 import queue_screen
@@ -78,6 +80,32 @@ def _selected_vehicle_details():
     return type_name, max_health
 
 
+def _selected_vehicle_outfits():
+    """Return stock compact outfits for each arena season, base64 on JSON."""
+    try:
+        from CurrentVehicle import g_currentVehicle
+    except ImportError:
+        return {}
+    item = g_currentVehicle.item
+    if item is None:
+        return {}
+    result = {}
+    for season in (1, 2, 4):
+        outfit = item.getOutfit(season)
+        if outfit is None:
+            continue
+        compact = getattr(outfit, 'strCompactDescr', None)
+        if compact is None:
+            maker = getattr(outfit, 'makeCompDescr', None)
+            compact = maker() if callable(maker) else None
+        if not isinstance(compact, bytes) or not compact:
+            continue
+        if len(compact) > 64 * 1024:
+            raise ValueError('selected vehicle outfit is too large')
+        result[str(season)] = base64.b64encode(compact).decode('ascii')
+    return result
+
+
 def _message_value(message, name, default=None):
     if isinstance(message, dict):
         return message.get(name, default)
@@ -104,7 +132,7 @@ class LANSession(object):
                  on_snapshot=None, on_event=None, lobby_ready=None,
                  callback=None, cancel_callback=None, status_notifier=None,
                  vehicle_provider=None, room_factory=None,
-                 queue_screen_factory=None):
+                 queue_screen_factory=None, postbattle_store=None):
         self._config = dict(config or {})
         self._client_factory = client_factory or _load_client
         self._queue_factory = queue_factory or queue_ui.QueueUI
@@ -123,6 +151,15 @@ class LANSession(object):
         self._cancel_callback = cancel_callback
         self._status_notifier = status_notifier or _show_status
         self._vehicle_provider = vehicle_provider or _selected_vehicle_details
+        self._outfit_provider = _selected_vehicle_outfits
+        self._postbattle_store = postbattle_store
+        self._published_progress_battles = (
+            -1 if postbattle_store is None else
+            int(postbattle_store.progress().get('battles', 0)))
+        self._requested_results = set()
+        self._completed_results = set()
+        self._notified_results = set()
+        self._archived_result_replayed = False
         self.client = None
         self.snapshot = None
         self.state = 'idle'
@@ -181,13 +218,126 @@ class LANSession(object):
                     generation == self._client_generation):
                 self._on_event(kind, message)
 
-        return factory(
+        client = factory(
             self._config.get('host', '127.0.0.1'),
             self._config.get('port', 28782),
             self._config.get('name', 'Player'),
             vehicle,
             max_health=max_health,
             on_event=on_event)
+        if self._postbattle_store is not None:
+            client.account_key = self._postbattle_store.account_key
+        client.outfits = self._outfit_provider()
+        return client
+
+    def _publish_postbattle_results(self):
+        """Let the stock service request and cache each durable pending row."""
+        store = self._postbattle_store
+        if store is None or not self._lobby_ready():
+            return False
+        try:
+            from gui.battle_results.context import RequestResultsContext
+            from gui.shared.personality import ServicesLocator
+            service = ServicesLocator.battleResults
+        except Exception:
+            return False
+        arenas = list(store.pending_arenas())
+        archived_arena = None
+        if not self._archived_result_replayed:
+            latest_archived = getattr(store, 'latest_archived_arena', None)
+            if callable(latest_archived):
+                archived_arena = latest_archived()
+                if (archived_arena is not None and
+                        archived_arena not in arenas):
+                    arenas.append(archived_arena)
+        for arena_unique_id in arenas:
+            if (arena_unique_id in self._requested_results or
+                    arena_unique_id in self._completed_results):
+                continue
+            message_data = store.service_message_data(arena_unique_id)
+            self._requested_results.add(arena_unique_id)
+            try:
+                is_archived = arena_unique_id == archived_arena
+                def completed(success, arena=arena_unique_id,
+                              summary=message_data,
+                              archived=is_archived):
+                    self._requested_results.discard(arena)
+                    if not success:
+                        return
+                    if archived:
+                        self._archived_result_replayed = True
+                    self._completed_results.add(arena)
+                    if summary is not None:
+                        self._publish_battle_service_message(arena, summary)
+                    # #1513 BattleResultsCache accepts one request at a time.
+                    # Its callback runs after releasing that wait gate, so
+                    # drain the next durable result serially.
+                    self._publish_postbattle_results()
+                service.requestResults(RequestResultsContext(
+                    arena_unique_id, False, False, True), completed)
+            except Exception as error:
+                self._requested_results.discard(arena_unique_id)
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] battle result %s could not be '
+                    'requested: %s\n' % (arena_unique_id, error))
+                continue
+            return True
+        return False
+
+    def _publish_battle_service_message(self, arena_unique_id, result_data):
+        """Inject one exact #1513 clickable service-channel result message."""
+        if arena_unique_id in self._notified_results:
+            return False
+        try:
+            from chat_shared import SYS_MESSAGE_IMPORTANCE, SYS_MESSAGE_TYPE
+            from messenger import MessengerEntry
+            timestamp = int(time.time())
+            chat_action = {
+                'sentTime': timestamp,
+                'data': {
+                    'messageID': int(arena_unique_id),
+                    'user_id': 0,
+                    'type': SYS_MESSAGE_TYPE.battleResults.index(),
+                    'importance': SYS_MESSAGE_IMPORTANCE.normal.index(),
+                    'active': True,
+                    'started_at': timestamp,
+                    'finished_at': None,
+                    'created_at': timestamp,
+                    'data': dict(result_data),
+                },
+            }
+            MessengerEntry.g_instance.protos.BW.serviceChannel.onReceiveSysMessage(
+                chat_action)
+        except Exception as error:
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] battle result %s notification could '
+                'not be published: %s\n' % (arena_unique_id, error))
+            return False
+        self._notified_results.add(arena_unique_id)
+        return True
+
+    def _publish_postbattle_progress(self):
+        """Refresh the current Account resources after a durable receipt."""
+        store = self._postbattle_store
+        if store is None or not self._lobby_ready():
+            return False
+        battles = int(store.progress().get('battles', 0))
+        if battles == self._published_progress_battles:
+            return False
+        try:
+            import BigWorld
+            publisher = getattr(
+                getattr(BigWorld.player(), 'fakeServer', None),
+                'publish_postbattle_progress', None)
+            if not callable(publisher) or not publisher():
+                return False
+        except Exception as error:
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] postbattle resources could not be '
+                'published: %s\n' % error)
+            return False
+        self._published_progress_battles = battles
+        return True
 
     def _publish_selected_vehicle(self):
         """Send the current garage tank so the next round uses it."""
@@ -198,13 +348,19 @@ class LANSession(object):
         try:
             vehicle, max_health = self._vehicle_provider()
             max_health = int(max_health)
+            outfits = self._outfit_provider()
         except Exception:
             # A lobby transition can hide the garage selection.  Keep the
             # vehicle the server already holds for this player.
             return False
         if not vehicle or max_health < 1:
             return False
-        return bool(select(vehicle, max_health))
+        try:
+            return bool(select(vehicle, max_health, outfits))
+        except TypeError:
+            # Test doubles and the first protocol-v5 client accepted only the
+            # original vehicle and max-health arguments.
+            return bool(select(vehicle, max_health))
 
     def _return_to_join_after_vehicle_selection_error(self):
         self.client = None
@@ -987,6 +1143,8 @@ class LANSession(object):
                 self.state = 'awaiting_battle_start'
                 return
             self.state = 'waiting'
+            self._publish_postbattle_progress()
+            self._publish_postbattle_results()
             self._publish_selected_vehicle()
             if self._picker_open and self._queue is not None:
                 self._refresh_surface()
@@ -1422,6 +1580,29 @@ class LANSession(object):
             self._battle_runtime.on_bot_observation(message)
         elif kind == 'battle_failed':
             self._on_battle_failed(message)
+        elif kind == 'battle_receipt':
+            store = self._postbattle_store
+            if store is None:
+                return
+            try:
+                accepted = store.accept(message)
+            except Exception as error:
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] battle receipt was rejected: %s\n'
+                    % error)
+                return
+            # Store.accept() returns only after its atomic JSON replacement.
+            # Ack duplicates too: they already exist in durable local state,
+            # and the server may be retrying because an earlier ACK was lost.
+            acknowledge = getattr(
+                self.client, 'acknowledge_battle_receipt', None)
+            if callable(acknowledge):
+                acknowledge(_message_value(message, 'receipt_id'))
+            if accepted:
+                self._status_notifier(
+                    'Battle results received. They will appear in the garage.')
+                self._publish_postbattle_progress()
+            self._publish_postbattle_results()
         elif kind == 'snapshot':
             round_id = _message_value(message, 'round_id')
             if (not self._battle_started or

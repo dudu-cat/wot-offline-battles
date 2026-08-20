@@ -789,6 +789,9 @@ class RemoteVehicle(object):
         self.proxy = weakref.proxy(self)
         self._aim_yaw = self.yaw
         self._gun_pitch = 0.0
+        self._offline_outfit = None
+        self._offline_outfit_valid = None
+        self._vehicle_stickers = None
         self._last_pose_time = None
         self._update_matrix()
 
@@ -830,6 +833,17 @@ class RemoteVehicle(object):
         self.fashions = fashions
         self._track_mode = None
         return True
+
+    def attach_stickers(self, stickers):
+        self._vehicle_stickers = stickers
+        return True
+
+    def _release_stickers(self, engine_alive=True):
+        stickers = self._vehicle_stickers
+        self._vehicle_stickers = None
+        if stickers is not None and engine_alive:
+            stickers.detach()
+        return stickers is not None
 
     def update_tracks(self, left, right, mode):
         """Feed one frame of belt speed through the stock PyTrackScroll path.
@@ -896,6 +910,7 @@ class RemoteVehicle(object):
             % (self.bw_entity_id, self.position.x, self.position.y,
                self.position.z))
         self._stop_extras()
+        self._release_stickers()
         previous = self.model
         self.appearance.detach()
         self.appearance.gunRecoil = None
@@ -917,6 +932,7 @@ class RemoteVehicle(object):
 
     def detach_visual(self):
         self._stop_extras()
+        self._release_stickers()
         self._release_track_animation()
         self._collision_obstacle = None
         self.isStarted = False
@@ -958,6 +974,7 @@ class RemoteVehicle(object):
         and the scroll controller this vehicle points at are already freed.
         """
         self._release_track_animation(engine_alive=False)
+        self._release_stickers(engine_alive=False)
         self.extras.clear()
         self._collision_obstacle = None
         self.isStarted = False
@@ -1293,13 +1310,18 @@ class RemoteVehicleFactory(object):
     """Load, register and destroy authoritative remote presentations."""
 
     def __init__(self, bigworld, math_module, model_assembler, space_id,
-                 camouflages=None, vehicular=None, data_links=None):
+                 camouflages=None, vehicular=None, data_links=None,
+                 enable_track_animation=True, outfit_factory=None,
+                 vehicle_stickers_factory=None):
         self._bigworld = bigworld
         self._math = math_module
         self._model_assembler = model_assembler
         self._camouflages = camouflages
         self._vehicular = vehicular
         self._data_links = data_links
+        self._enable_track_animation = bool(enable_track_animation)
+        self._outfit_factory = outfit_factory
+        self._vehicle_stickers_factory = vehicle_stickers_factory
         self.track_animation_error = None
         self._track_animation_reported = False
         self._space_id = int(space_id)
@@ -1409,11 +1431,11 @@ class RemoteVehicleFactory(object):
         return entity_id
 
     def _assemble_track_animation(self, vehicle, descriptor, model):
-        """Build the native belt animation retail assembles for a remote tank.
+        """Apply retail fashions, then optionally build native belt animation.
 
         A client-only vehicle gets no engine-owned filter, so the belts stay
-        still whatever is fed to them.  This is off by default; see
-        0.9.22/COMPATIBILITY_REVIEW.md.
+        still whatever is fed to them.  Camouflage and paint still need the
+        same fashion setup when that optional controller is disabled.
         """
         camouflages = self._camouflages
         if camouflages is None:
@@ -1425,8 +1447,20 @@ class RemoteVehicleFactory(object):
             step = 'setupVehicleFashion'
             self._model_assembler.setupVehicleFashion(
                 fashions[0], descriptor, False)
+            outfit_cd = vehicle.publicInfo.get('outfit', '')
+            if outfit_cd:
+                outfit, valid = self._vehicle_outfit(vehicle)
+            else:
+                outfit, valid = None, False
+            if valid and outfit_cd:
+                step = 'updateFashions'
+                camouflages.updateFashions(
+                    fashions, descriptor, False, outfit)
             step = 'setupFashions'
             model.setupFashions(fashions)
+            if not self._enable_track_animation:
+                self._report_track_animation('disabled', None)
+                return False
             step = 'createVehicleFilter'
             vehicle_filter = self._model_assembler.createVehicleFilter(
                 descriptor)
@@ -1448,6 +1482,56 @@ class RemoteVehicleFactory(object):
         self._report_track_animation('assembled', None)
         return vehicle.attach_track_animation(
             vehicle_filter, scroll, fashions, flying)
+
+    def _vehicle_outfit(self, vehicle):
+        if vehicle._offline_outfit_valid is not None:
+            return (vehicle._offline_outfit,
+                    vehicle._offline_outfit_valid)
+        factory = self._outfit_factory
+        if factory is None:
+            from gui.shared.gui_items.customization.outfit import Outfit
+            factory = Outfit
+        compact = vehicle.publicInfo.get('outfit', '')
+        try:
+            outfit = factory(compact) if compact else factory()
+            valid = True
+        except Exception as error:
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] remote vehicle %s outfit was rejected: '
+                '%s\n' % (vehicle.id, error))
+            outfit = factory()
+            valid = False
+        vehicle._offline_outfit = outfit
+        vehicle._offline_outfit_valid = valid
+        return outfit, valid
+
+    def _attach_vehicle_stickers(self, vehicle, descriptor, model):
+        factory = self._vehicle_stickers_factory
+        stickers = None
+        try:
+            if factory is None:
+                from VehicleStickers import VehicleStickers
+                factory = VehicleStickers
+            outfit, unused_valid = self._vehicle_outfit(vehicle)
+            stickers = factory(
+                descriptor,
+                int(vehicle.publicInfo.get('marksOnGun', 0) or 0),
+                outfit)
+            stickers.setClanID(int(
+                vehicle.publicInfo.get('clanDBID', 0) or 0))
+            stickers.attach(model, False, False)
+            vehicle.attach_stickers(stickers)
+            return True
+        except Exception as error:
+            if stickers is not None:
+                try:
+                    stickers.detach()
+                except Exception:
+                    pass
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] remote vehicle %s stickers were '
+                'unavailable: %s\n' % (vehicle.id, error))
+            return False
 
     def _attach_flying_info(self, scroll):
         """Give PyTrackScroll the two side-flying links retail always sets."""
@@ -1504,6 +1588,7 @@ class RemoteVehicleFactory(object):
             self._assemble_track_animation(vehicle, descriptor, model)
             visual.model = model
             vehicle.attach_visual(visual, visual_id, model)
+            self._attach_vehicle_stickers(vehicle, descriptor, model)
         except Exception as error:
             # createEntity succeeded before the Python presentation took
             # ownership. Roll that operation back transactionally or the

@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import sys
 import unittest
 from unittest import mock
@@ -29,6 +30,7 @@ class WindowsServerLauncherTests(unittest.TestCase):
             'server_random',
             30,
             'client',
+            15,
         )
 
     def test_firewall_request_precedes_server_bind(self):
@@ -37,9 +39,10 @@ class WindowsServerLauncherTests(unittest.TestCase):
         def ensure(port):
             events.append(('firewall', port))
 
-        def run_server(host, port, map_name, max_players, authority_mode):
+        def run_server(host, port, map_name, max_players, authority_mode,
+                       team_size):
             events.append(('server', host, port, map_name, max_players,
-                           authority_mode))
+                           authority_mode, team_size))
 
         with mock.patch.object(
                 windows_server, '_load_server',
@@ -51,8 +54,37 @@ class WindowsServerLauncherTests(unittest.TestCase):
 
         self.assertEqual([
             ('firewall', 28782),
-            ('server', '0.0.0.0', 28782, 'server_random', 30, 'client'),
+            ('server', '0.0.0.0', 28782, 'server_random', 30, 'client', 15),
         ], events)
+
+    def test_launcher_environment_selects_the_total_tanks_per_team(self):
+        run_server = mock.Mock()
+        with mock.patch.dict(
+                os.environ, {windows_server.SERVER_TEAM_SIZE_ENV: '4'}), \
+                mock.patch.object(
+                    windows_server, '_load_server',
+                    return_value=('server_random', run_server)), \
+                mock.patch.object(
+                    windows_server, '_ensure_windows_firewall_rule'):
+            self.assertEqual(0, windows_server.main())
+
+        self.assertEqual(4, run_server.call_args.args[-1])
+
+    def test_invalid_launcher_team_size_fails_before_server_bind(self):
+        run_server = mock.Mock()
+        with mock.patch.dict(
+                os.environ, {windows_server.SERVER_TEAM_SIZE_ENV: '16'}), \
+                mock.patch.object(
+                    windows_server, '_load_server',
+                    return_value=('server_random', run_server)), \
+                mock.patch.object(
+                    windows_server, '_ensure_windows_firewall_rule') as ensure, \
+                mock.patch.object(windows_server, '_pause_after_error'), \
+                mock.patch.object(windows_server.traceback, 'print_exc'):
+            self.assertEqual(1, windows_server.main())
+
+        ensure.assert_not_called()
+        run_server.assert_not_called()
 
     def test_source_process_never_checks_or_changes_firewall(self):
         with mock.patch.object(
@@ -247,7 +279,7 @@ class WindowsServerLauncherTests(unittest.TestCase):
 
         for required in (
                 'GNU GPL',
-                '/tree/v0.5.0',
+                '/tree/peng/0922-feedback-candidate',
                 'any remote address/profile',
                 'trusted-LAN server',
                 'CPython 3.11.9',

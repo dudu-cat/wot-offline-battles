@@ -10,13 +10,15 @@ from gui.mods.offline_lan_0922.ai.adapter import BotAdapter
 from gui.mods.offline_lan_0922.ai import maps as tactical_maps
 from gui.mods.offline_lan_0922.ai import driver as ai_driver
 from gui.mods.offline_lan_0922.ai import planner as ai_planner
-from gui.mods.offline_lan_0922.ai.navigation import TerrainNavigator
+from gui.mods.offline_lan_0922.ai.navigation import (
+    BAKED_FATAL_HAZARDS, TerrainNavigator)
 from gui.mods.offline_lan_0922 import critical_damage
 from gui.mods.offline_lan_0922 import ballistics
 from gui.mods.offline_lan_0922 import device_damage
 from gui.mods.offline_lan_0922 import prebaked_navigation
 from gui.mods.offline_lan_0922 import spotting
 from gui.mods.offline_lan_0922 import loadout
+from gui.mods.offline_lan_0922 import lan_client
 from gui.mods.offline_lan_0922 import tank_collision
 from gui.mods.offline_lan_0922 import vehicle_physics
 
@@ -39,15 +41,16 @@ HUMAN_TARGET_ID_BASE = 1000000
 VISIBILITY_MIN_SECONDS = 0.18
 VISIBILITY_JITTER_SECONDS = 0.018
 SHOT_LANE_SECONDS = 0.20
-# Spread full-roster tactical refreshes over the latter half of the
-# observation window.  A selected target still goes through the independent
-# 0.20-second final-fire gate above.
-SHOT_LANE_REFRESH_SECONDS = 0.20
+# Spread full-roster tactical refreshes across the complete observation
+# window.  A selected target still goes through the independent 0.20-second
+# final-fire gate above, so this only flattens the server-planning snapshot.
+SHOT_LANE_REFRESH_SECONDS = OBSERVATION_SECONDS
 SHOT_LANE_PHASES = 29
-# At 24 FPS the final 0.20-second window contains only five render frames.
-# Keep the native collision work bounded and delay the complete observation
-# instead of forcing every remaining pair through its due frame.
-MAX_SHOT_LANE_PAIRS_PER_FRAME = 110
+# Sixty-four exact static rays finish all 435 protocol-maximum pairs inside a
+# 0.40-second window at 24 FPS while removing the old 110-ray render-thread
+# spike.  If a slower renderer misses that envelope, delay the complete
+# observation instead of publishing a partial shooter list.
+MAX_SHOT_LANE_PAIRS_PER_FRAME = 64
 # The server never assigns a visible target beyond 560 metres.  The pinned
 # #1513 catalogue tops out at 79 km/h; including the copied 1.05 downhill
 # overspeed, two vehicles close less than 22 metres across one 0.40-second
@@ -59,33 +62,28 @@ SHOT_LANE_QUERY_DISTANCE = 585.0
 # pitch-valid curved-world probe.  Keep its query envelope at map scale without
 # making every ordinary tank spend native rays beyond the server's 560 m lease.
 SPG_SHOT_LANE_QUERY_DISTANCE = 2500.0
-# Cover fans occupy the first half of the observation window; firing-lane
-# refreshes already occupy the final half.  Keeping the two native probe
-# families disjoint avoids replacing one periodic render-thread burst with a
-# different combined burst.
-COVER_JOB_WINDOW_SECONDS = (
-    OBSERVATION_SECONDS - SHOT_LANE_REFRESH_SECONDS)
+# Cover fans remain phased through the first half of the observation window.
+# Lane refreshes span the full window, but their global per-frame cap above and
+# the existing one-cover-job limit keep the overlap bounded.
+COVER_JOB_WINDOW_SECONDS = OBSERVATION_SECONDS * 0.5
 PROBE_KINDS = ('visibility', 'lane', 'cover', 'ground', 'motion')
 DECISION_SECONDS = 0.0975
-# Distance tiers for the render-frame work that only presentation consumes.
-# A hull two hundred metres away moves less than one pixel of visible tilt per
-# frame, so its four-point suspension sample and its planner cadence can be
-# spread without changing what the player sees.
+# Distance tiers for planner and suspension sampling.  Physical integration is
+# globally capped by PUBLICATION_SECONDS; MatrixAnimation interpolates the
+# accepted poses, so a second per-bot integration throttle would only create
+# incomplete observations and unequal time steps.
 DETAIL_NEAR_METRES = 150.0
 DETAIL_FAR_METRES = 350.0
 # Travel that must accumulate before a tier re-samples the four ground rays.
 SLOPE_SAMPLE_METRES = (0.35, 1.50, 4.00)
 SLOPE_SAMPLE_RADIANS = (0.05, 0.15, 0.40)
+# Pitch/roll is presentation-only; centre support and copied longitudinal
+# physics remain live for every Bot every authority tick.  Countdown prewarm
+# removes the 29 * 4 start spike, while this full-roster limit guarantees that
+# every due visual hull target is refreshed in the same authority tick.
+MAX_SLOPE_POSE_SAMPLES_PER_FRAME = 29
 # Planner cadence multiplier per tier.
 DECISION_TIER_FACTOR = (1.0, 2.0, 4.0)
-# Integration rate per tier.  Dead reckoning between steps EXTRAPOLATES, so
-# every step corrects the guess and that correction is visible as a jump: the
-# lower the rate, the bigger the jump.  Until bots own a native filter that can
-# interpolate properly, only hulls beyond DETAIL_FAR_METRES step down, and only
-# to 15 Hz, where the residual correction stays under a pixel.  Smooth motion
-# beats the frame budget.
-INTEGRATION_INTERVALS = (0.0, 0.0, 1.0 / 30.0)
-INTEGRATION_PHASE_BUCKETS = 7
 # The #1513 production probe owns a 15 m low-speed / 20 m high-speed,
 # three-lane corridor.  A cached sample may only be reused while the hull stays
 # well inside the 2.2 m outer lanes.  The time bound also limits maximum copied
@@ -94,10 +92,11 @@ MOTION_PROBE_SECONDS = DECISION_SECONDS
 MOTION_PROBE_LATERAL_BUDGET = 1.0
 MOTION_PROBE_FORWARD_BUDGET = 3.5
 # A final exact receipt costs nine native rays.  Thirteen jobs per render frame
-# drains all 29 Bots within three frames even at the supported 24 FPS floor,
-# while preventing the first copied-motion frame from issuing 29 receipts at
-# once.  Budget exhaustion pauses that Bot and retries next frame; falling back
-# to a nine-ray commit sweep would merely move the same spike elsewhere.
+# drains all 29 Bots within three frames even at the supported 24 FPS floor.
+# New, unproved motion fails closed when the budget is exhausted; proactive
+# refresh keeps using the old receipt only while it still contains that exact
+# motion.  Falling back to a nine-ray commit sweep would merely move the same
+# spike elsewhere.
 MAX_WORLD_RECEIPTS_PER_FRAME = 13
 FIRE_DURATION_SECONDS = 10.0
 FIRE_TICK_SECONDS = 1.0
@@ -195,14 +194,14 @@ def _vision_range_pair(descriptor):
     return moving, still, profile['binocular_delay']
 
 
-def _base_invisibility(descriptor, profile=None):
+def _base_invisibility(descriptor, profile=None, camouflage_id=None):
     if profile is None:
         profile = _bot_profile(descriptor)
     crew_factor = profile['camouflage_factor']
     calculator = getattr(descriptor, 'computeBaseInvisibility', None)
     if callable(calculator):
         try:
-            values = calculator(crew_factor, None)
+            values = calculator(crew_factor, camouflage_id)
             if isinstance(values, (list, tuple)) and len(values) >= 2:
                 return (_number(values[0]), _number(values[1]))
         except Exception:
@@ -460,6 +459,30 @@ def _combat_record(state):
     }
 
 
+def _local_launch_record(state):
+    """Return only fields consumed by BattleRuntime's projectile launch."""
+    if 'shot_yaw' not in state or 'shot_pitch' not in state:
+        return None
+    profile = state.get('profile')
+    profile = profile if isinstance(profile, dict) else {}
+    class_tag = str(profile.get('class_tag') or '')
+    result = {
+        'id': int(state['id']),
+        'fire_seq': int(state.get('fire_seq', 0)),
+        'shell_index': int(state.get('shell_index', 0)),
+        'shot_yaw': state['shot_yaw'],
+        'shot_pitch': state['shot_pitch'],
+        'class_tag': class_tag,
+    }
+    if class_tag == 'SPG':
+        for name in (
+                'shot_origin', 'shot_velocity', 'shot_gravity',
+                'shot_max_distance', 'shot_max_time_ms', 'shot_proof_key'):
+            if name in state:
+                result[name] = state[name]
+    return result
+
+
 def _apply_combat_record(state, record):
     state['health'] = max(0, min(
         int(_number(record.get('health'))), int(state['max_health'])))
@@ -553,6 +576,7 @@ class _BotGunState(object):
         self.clip = self.clip_size
         self.elapsed = 0.0
         self.reload_duration = self.reload_full
+        self.reload_factor = 1.0
         self.restore_fire_seq(fire_seq)
 
     def restore_fire_seq(self, fire_seq):
@@ -571,6 +595,26 @@ class _BotGunState(object):
 
     def tick(self, dt):
         self.elapsed += max(0.0, float(dt))
+
+    def rescale_reload(self, reload_factor):
+        """Keep the completed fraction when a live reload penalty changes."""
+        reload_factor = max(0.0, float(reload_factor))
+        if abs(reload_factor - self.reload_factor) <= 1.0e-9:
+            return False
+        old_duration = self.reload_duration * self.reload_factor
+        new_duration = self.reload_duration * reload_factor
+        if old_duration > 0.0:
+            if self.elapsed < old_duration:
+                completed_fraction = max(
+                    0.0, min(1.0, self.elapsed / old_duration))
+                self.elapsed = new_duration * completed_fraction
+            else:
+                # A shell that was already ready stays ready. Preserve the
+                # strict-ready clock's small overrun across the factor change.
+                self.elapsed = new_duration + (
+                    self.elapsed - old_duration)
+        self.reload_factor = reload_factor
+        return True
 
     def ready(self, reload_factor=1.0):
         return self.elapsed > (
@@ -973,9 +1017,10 @@ class BotRuntime(object):
     def __init__(self, local_player_id, descriptor_resolver=None,
                  direction_probe=None, adapter_factory=None,
                  vehicle_selector=None, visibility_probe=None,
-                 firing_lane_probe=None,
+                 firing_lane_probe=None, friendly_lane_probe=None,
                  ballistic_solution_probe=None,
                  artillery_launch_probe=None,
+                 artillery_friendly_lane_probe=None,
                  artillery_launch_cancel=None,
                  spawn_resolver=None, ground_probe=None,
                  physics_ground_probe=None,
@@ -997,6 +1042,10 @@ class BotRuntime(object):
         # Keeping an explicit seam also makes it impossible for a stale team
         # spot to stand in for a current clear barrel lane.
         self.firing_lane_probe = firing_lane_probe or self.visibility_probe
+        # Dynamic allied hulls are deliberately outside the cached static-world
+        # lane.  Production checks this seam again at every final fire attempt.
+        self.friendly_lane_probe = friendly_lane_probe or (
+            lambda unused_source, unused_target: True)
         # SPG solutions are completed by BattleRuntime's bounded native arc
         # queue.  Returning None means pending or fail-closed; a dict is a
         # fully probed physical solution shared by aiming and firing.
@@ -1005,6 +1054,12 @@ class BotRuntime(object):
         # publishes a frozen receipt only after the next deterministic,
         # dispersed SPG trajectory itself has passed the bounded arc queue.
         self.artillery_launch_probe = artillery_launch_probe
+        # The exact receipt carries that same proved path.  Production checks
+        # live allied hulls against it immediately before committing the shot.
+        self.artillery_friendly_lane_probe = (
+            artillery_friendly_lane_probe or
+            (lambda unused_source, unused_target, unused_descriptor,
+             unused_shell, unused_receipt: True))
         self.artillery_launch_cancel = artillery_launch_cancel
         self.spawn_resolver = spawn_resolver
         self._injected_baked_graph = baked_graph
@@ -1049,9 +1104,11 @@ class BotRuntime(object):
         self._visibility_still = {}
         self._turn_speeds = {}
         self._ram_cooldowns = {}
+        self._ram_contacts = frozenset()
         self._ram_seq = 0
         self.finished = False
         self._visibility_cache = {}
+        self._team_visibility_cache = {}
         self._server_orders = {}
         self._server_order_tokens = {}
         self._order_revision = -1
@@ -1063,21 +1120,21 @@ class BotRuntime(object):
         self._cover_results = []
         self._decision_cache = {}
         self._motion_probe_cache = {}
+        self._slope_pose_cursor = 0
         self._flip_diary = {}
         self.debug_logging = False
         self._camera_position = None
-        self._integration_debt = {}
-        self._integration_next = {}
-        self._last_step = {}
         self._world_receipt_budget = 0
         self._world_receipt_waiting = []
         self._world_receipt_frame = None
+        self._prewarm_receipt_cursor = 0
         self._combat_sync = {}
         self._server_tick = -1
         # These monotonic, pull-only totals are diagnostic data.  They never
         # enter a LAN payload or feed a scheduler/cache decision.
         self._probe_totals = [0, 0, 0, 0, 0]
         self._probe_duration_totals = [0.0, 0.0, 0.0, 0.0, 0.0]
+        self._alive_bot_ticks = 0
         self._decision_counts = {}
 
     def probe_totals(self):
@@ -1094,6 +1151,10 @@ class BotRuntime(object):
     def probe_duration_totals(self):
         """Return measured query time without resetting or driving work."""
         return tuple(self._probe_duration_totals)
+
+    def diagnostic_totals(self):
+        """Return counters which never participate in simulation decisions."""
+        return {'alive_bot_ticks': int(self._alive_bot_ticks)}
 
     def _probe_started(self):
         if self._probe_clock is None:
@@ -1322,6 +1383,16 @@ class BotRuntime(object):
             return 'deferred'
         self._world_receipt_budget -= 1
         frame['attempted'].add(bot_id)
+        result = self._call_world_receipt_probe(
+            position, yaw, speed, descriptor)
+        if result == 'deferred':
+            frame['attempt_deferred'].append(bot_id)
+        return result
+
+    def _call_world_receipt_probe(self, position, yaw, speed, descriptor):
+        """Run one measured exact receipt without changing queue ownership."""
+        if not callable(self.world_receipt_probe):
+            return None
         self._probe_totals[4] += 1
         probe_started = self._probe_started()
         try:
@@ -1333,9 +1404,66 @@ class BotRuntime(object):
             return None
         finally:
             self._probe_finished(4, probe_started)
-        if result == 'deferred':
-            frame['attempt_deferred'].append(bot_id)
         return result
+
+    def prewarm_world_receipts(self, now):
+        """Pre-prove one stationary forward corridor during the countdown.
+
+        This method never plans, integrates, publishes or grants motion.  A
+        successful receipt is retained with an already-expired generic sample,
+        so the first live travel tick must still run the complete native
+        direction probe before it may consume the exact contained receipt.
+        """
+        if (not self.is_authority() or self.adapter is None or self.finished or
+                not callable(self.world_receipt_probe)):
+            return False
+        states = [state for state in self._ordered_states()
+                  if state.get('alive', True)]
+        if not states:
+            return False
+        start = self._prewarm_receipt_cursor % len(states)
+        for visited in range(len(states)):
+            index = (start + visited) % len(states)
+            state = states[index]
+            cached = self._motion_probe_cache.get(state['id'])
+            result = ((cached or {}).get('result')
+                      if isinstance(cached, dict) else None)
+            if isinstance(result, dict) and isinstance(
+                    result.get('world_receipt'), dict):
+                continue
+            self._prewarm_receipt_cursor = (index + 1) % len(states)
+            position = _position(state)
+            yaw = _number(state.get('yaw'))
+            descriptor = self._descriptors.get(state['id'])
+            # Presentation-only suspension is safe to sample at the baked
+            # spawn pose before the first grounded simulation tick.  No pose,
+            # velocity or integration state is advanced here.
+            self._update_slope_pose(state, allow_ungrounded=True)
+            direction = self._probe_direction(
+                position, yaw, 0.0, descriptor)
+            if (not isinstance(direction, dict) or
+                    not self._probe_is_clear(direction) or
+                    direction.get('deferred', False) or
+                    abs(_number(direction.get('slope'))) > 0.01):
+                return False
+            receipt = self._call_world_receipt_probe(
+                position, yaw, 0.000001, descriptor)
+            if not self._world_receipt_contains(
+                    receipt, position, yaw, 0.000001, 0.1):
+                return False
+            direction = dict(direction)
+            direction['world_receipt'] = receipt
+            # Expire the generic proof immediately.  Only the exact static
+            # corridor survives countdown time; live movement re-probes its
+            # selected direction natively before using this receipt.
+            self._motion_probe_cache[state['id']] = {
+                'result': direction,
+                'position': position,
+                'yaw': yaw,
+                'deadline': _number(now),
+            }
+            return True
+        return False
 
     @staticmethod
     def _probe_is_clear(result):
@@ -1374,10 +1502,12 @@ class BotRuntime(object):
             self._visibility_still = {}
             self._turn_speeds = {}
             self._ram_cooldowns = {}
+            self._ram_contacts = frozenset()
             self._ram_seq = 0
             self.adapter = None
             self.finished = False
             self._visibility_cache = {}
+            self._team_visibility_cache = {}
             self._server_orders = {}
             self._server_order_tokens = {}
             self._order_revision = -1
@@ -1389,8 +1519,10 @@ class BotRuntime(object):
             self._cover_results = []
             self._decision_cache = {}
             self._motion_probe_cache = {}
+            self._slope_pose_cursor = 0
             self._world_receipt_waiting = []
             self._world_receipt_frame = None
+            self._prewarm_receipt_cursor = 0
             self._combat_sync = {}
             self._server_tick = -1
         self._apply_orders(message)
@@ -1407,6 +1539,7 @@ class BotRuntime(object):
         if previous_authority != self.authority_id:
             self._clear_artillery_intents()
             self._visibility_cache = {}
+            self._team_visibility_cache = {}
             self._visibility_fire = {}
             self._visibility_still = {}
             self._shot_los_cache = {}
@@ -1415,7 +1548,10 @@ class BotRuntime(object):
             self._motion_probe_cache = {}
             self._world_receipt_waiting = []
             self._world_receipt_frame = None
+            self._prewarm_receipt_cursor = 0
             self._pending_ram_reports = []
+            self._ram_cooldowns = {}
+            self._ram_contacts = frozenset()
             self._cover_queue = []
             self._cover_results = []
             self._next_publication = 0.0
@@ -2239,10 +2375,31 @@ class BotRuntime(object):
     def _human_planner_id(player_id):
         return HUMAN_TARGET_ID_BASE + int(player_id)
 
-    def _contacts_for(self, source, players, now):
+    def _contacts_for(self, source, players, now, team_spotted=None):
         contacts = []
         lookup = {}
         source_team = int(source.get('team', 0))
+
+        def visible_to_team(target):
+            if team_spotted is None:
+                return self._visible(source, target, now)
+            key = (source_team, target.get('kind'),
+                   int(target.get('network_id', 0)))
+            # A positive direct spot is relayed to the whole team in the same
+            # authority tick.  Never share a negative result: another observer
+            # may have a clear angle and must still run its own exact probe.
+            team_sample = self._team_visibility_cache.get(key)
+            if (team_spotted.get(key, False) or
+                    (team_sample is not None and
+                     _number(now) - team_sample < VISIBILITY_MIN_SECONDS)):
+                team_spotted[key] = True
+                return True
+            value = self._visible(source, target, now)
+            if value:
+                team_spotted[key] = True
+                self._team_visibility_cache[key] = _number(now)
+            return value
+
         for raw in players or ():
             if (not isinstance(raw, dict) or raw.get('id') is None or
                     not raw.get('alive', True) or
@@ -2257,7 +2414,7 @@ class BotRuntime(object):
             vehicle_profile = self._player_vehicle_profile(raw)
             target['class_tag'] = vehicle_profile['class_tag']
             target['armor'] = vehicle_profile['armor']
-            target['visible'] = self._visible(source, target, now)
+            target['visible'] = visible_to_team(target)
             lookup[planner_id] = target
             contacts.append(target)
         for bot_id, raw in self.states.items():
@@ -2268,7 +2425,7 @@ class BotRuntime(object):
             target['kind'] = 'bot'
             target['network_id'] = int(bot_id)
             target['position'] = _position(raw)
-            target['visible'] = self._visible(source, target, now)
+            target['visible'] = visible_to_team(target)
             lookup[int(bot_id)] = target
             contacts.append(target)
         return contacts, lookup
@@ -2376,6 +2533,27 @@ class BotRuntime(object):
             receipt_forward + leading + current_reach <= distance and
             rdy <= 0.0001 and receipt_lateral <= 0.0001 and
             receipt_angle <= 0.00001)
+
+    @staticmethod
+    def _world_receipt_refresh_due(receipt, position, travel_yaw, speed, dt):
+        """Refresh a contained receipt before its remaining corridor expires."""
+        if not BotRuntime._world_receipt_contains(
+                receipt, position, travel_yaw, speed, dt):
+            return False
+        origin = receipt['origin']
+        receipt_yaw = _number(receipt.get('yaw'))
+        dx = _number(position[0]) - _number(origin[0])
+        dz = _number(position[2]) - _number(origin[2])
+        forward = dx * math.sin(receipt_yaw) + dz * math.cos(receipt_yaw)
+        frame_step = max(0.0, min(0.2, _number(dt)))
+        current_reach = max(
+            0.4, abs(_number(speed)) * frame_step + 0.2)
+        remaining = (
+            max(0.0, _number(receipt.get('distance'))) - forward -
+            max(0.0, _number(receipt.get('leading'))) - current_reach)
+        # At the supported 24 FPS floor, six metres covers four maximum-speed
+        # frames while the 13-job fair queue drains a 29-Bot cohort in three.
+        return remaining <= 6.0
 
     @staticmethod
     def _contained_cached_world_receipt(cached, position, travel_yaw,
@@ -2604,43 +2782,6 @@ class BotRuntime(object):
             _number(position[0]), _number(position[1]), _number(position[2]))
         return True
 
-    def _integration_step(self, state, now, frame_step):
-        """Return this bot's step for this frame, or 0.0 to skip it.
-
-        A near bot integrates every frame.  A mid or far bot banks the frame's
-        delta and integrates once its own interval elapses, with the whole
-        banked step, so the same distance is covered with fewer, larger steps.
-        The phase is spread by bot id so the skipped work never lands on one
-        frame.
-        """
-        bot_id = int(state['id'])
-        banked = self._integration_debt.get(bot_id, 0.0) + max(
-            0.0, float(frame_step))
-        tier = self._detail_tier(state)
-        interval = INTEGRATION_INTERVALS[tier]
-        if interval <= 0.0:
-            self._integration_debt[bot_id] = 0.0
-            self._last_step[bot_id] = banked
-            return banked
-        deadline = self._integration_next.get(bot_id)
-        if deadline is None:
-            # Spread the first deadline so 29 bots never share a frame.
-            deadline = _number(now) + interval * (
-                (abs(bot_id) % INTEGRATION_PHASE_BUCKETS) /
-                float(INTEGRATION_PHASE_BUCKETS))
-            self._integration_next[bot_id] = deadline
-        if _number(now) + 1e-9 < deadline:
-            self._integration_debt[bot_id] = banked
-            return 0.0
-        # Never let a long stall replay as one huge step.
-        banked = min(banked, 0.2)
-        self._integration_debt[bot_id] = 0.0
-        self._last_step[bot_id] = banked
-        intervals = int(math.floor(
-            (_number(now) - deadline) / interval)) + 1
-        self._integration_next[bot_id] = deadline + intervals * interval
-        return banked
-
     def _detail_tier(self, state):
         """Return 0 near the camera, 1 at medium range, 2 far away."""
         camera = self._camera_position
@@ -2655,10 +2796,52 @@ class BotRuntime(object):
             return 1
         return 2
 
-    def _update_slope_pose(self, state):
+    def _planner_corridor_clear(self, position, yaw, speed):
+        """Rank one candidate through the validated baked static corridor.
+
+        ``True`` or ``False`` is advisory to LocalDriver only. ``None`` asks
+        the caller to retain the native planner probe because the shipped
+        graph contract is unavailable or failed.  This result is never stored
+        in the native motion cache and can never authorize a realised step.
+        """
+        navigator = self.navigator
+        grid = getattr(navigator, 'grid', None)
+        graph = self.baked_graph
+        bake = graph.get('bake') if isinstance(graph, dict) else None
+        clearance_radii = (bake.get('edge_clearance_radii')
+                           if isinstance(bake, dict) else ())
+        if (grid is None or not getattr(grid, 'prebaked', False) or
+                not isinstance(bake, dict) or
+                _number(bake.get('vehicle_half_width')) < 2.15 or
+                not isinstance(clearance_radii, (list, tuple)) or
+                max([_number(value) for value in clearance_radii] or [0.0]) <
+                3.0):
+            return None
+        try:
+            if not grid.near_baked_navigation(position, 0):
+                return None
+            distance = 20.0 if abs(_number(speed)) > 5.0 else 15.0
+            sine = math.sin(float(yaw))
+            cosine = math.cos(float(yaw))
+            end = (
+                _number(position[0]) + sine * distance,
+                _number(position[1]),
+                _number(position[2]) + cosine * distance,
+            )
+            if grid.segment_has_baked_hazard(
+                    position, end, BAKED_FATAL_HAZARDS):
+                return False
+            return bool(grid.segment_clear(position, end))
+        except Exception:
+            # The graph is a planner optimisation. Unknown graph state keeps
+            # the old native candidate probe; it never becomes a clear path.
+            return None
+
+    def _update_slope_pose(self, state, allow_ungrounded=False):
         """Refresh the four-point hull pose after this tick's ground settle."""
-        if state.get('airborne', False) or not state.get(
-                'grounded_once', False):
+        if (state.get('airborne', False) or
+                (not allow_ungrounded and not state.get(
+                    'grounded_once', False))):
             return False
         yaw = _number(state.get('yaw'))
         x = _number(state.get('x'))
@@ -2959,7 +3142,8 @@ class BotRuntime(object):
 
     def _player_vehicle_profile(self, raw):
         vehicle_name = raw.get('vehicle')
-        cache_key = vehicle_name or ''
+        camouflage_id = raw.get('camouflage_id')
+        cache_key = (vehicle_name or '', camouflage_id)
         cached = self._player_vehicle_profiles.get(cache_key)
         if cached is not None:
             return cached
@@ -2980,7 +3164,8 @@ class BotRuntime(object):
             'descriptor': descriptor,
             'class_tag': str(tactical.get('class_tag') or 'unknown'),
             'armor': max(0.0, _number(tactical.get('armor'))),
-            'spotting': (_base_invisibility(descriptor, profile),
+            'spotting': (_base_invisibility(
+                             descriptor, profile, camouflage_id),
                          _shot_invisibility_factor(descriptor), profile),
         }
         self._player_vehicle_profiles[cache_key] = cached
@@ -3011,6 +3196,7 @@ class BotRuntime(object):
             speed = _number(state.get('speed')) if alive else 0.0
             tanks.append({
                 'id': int(state['id']), 'alive': alive,
+                'team': int(_number(state.get('team'))),
                 'x': _number(state.get('x')), 'y': _number(state.get('y')),
                 'z': _number(state.get('z')), 'yaw': yaw,
                 'mass': _number(state.get('mass'), 25000.0),
@@ -3033,8 +3219,11 @@ class BotRuntime(object):
             speed = _number(raw.get('speed')) if alive else 0.0
             tanks.append({
                 'id': player_id, 'alive': alive,
+                'team': int(_number(raw.get('team'))),
                 # The human client owns its own contact impulse; taking it
-                # here too would make the pair shake.
+                # here too would make an enemy pair shake.  A friendly bot is
+                # the exception: it owns the velocity response so the local
+                # player does not inherit the teammate's lateral momentum.
                 'impulse': False,
                 'x': _number(raw.get('x')), 'y': _number(raw.get('y')),
                 'z': _number(raw.get('z')), 'yaw': yaw,
@@ -3057,6 +3246,8 @@ class BotRuntime(object):
         collision_index = tank_collision.build_spatial_index(
             collision_bodies, maximum_radius * 2.0 + 4.0)
         reports = []
+        previous_ram_contacts = self._ram_contacts
+        current_ram_contacts = set()
         for state in self._ordered_states():
             if not state.get('alive', True):
                 continue
@@ -3065,11 +3256,24 @@ class BotRuntime(object):
                 continue
             candidate_ids = tank_collision.nearby_ids(
                 collision_index, own['x'], own['z'])
+            others = []
+            for tank_id in candidate_ids:
+                if tank_id == own['id'] or tank_id not in by_id:
+                    continue
+                other = by_id[tank_id]
+                if (tank_id >= HUMAN_TARGET_ID_BASE and
+                        bool(other.get('alive', True)) and
+                        int(other.get('team', 0)) ==
+                        int(own.get('team', -1))):
+                    other = dict(other)
+                    other['impulse'] = True
+                others.append(other)
             result = tank_collision.resolve_tank(
-                own, (by_id[tank_id] for tank_id in candidate_ids
-                      if tank_id != own['id'] and tank_id in by_id),
-                now=now, ram_cooldowns=self._ram_cooldowns)
+                own, others,
+                now=now, ram_cooldowns=self._ram_cooldowns,
+                active_ram_contacts=previous_ram_contacts)
             self._ram_cooldowns = result['cooldowns']
+            current_ram_contacts.update(result['contacts'])
             delta_x, delta_z = result['delta_velocity']
             yaw = _number(state.get('yaw'))
             speed = _number(state.get('speed'))
@@ -3103,8 +3307,12 @@ class BotRuntime(object):
                     push_z = 0.0
             state['x'] += move_x
             state['z'] += move_z
-            state['push_x'] = push_x * 0.90
-            state['push_z'] = push_z * 0.90
+            # Keep the copied 0.90 damping law time-based.  Per-frame damping
+            # retains lateral momentum much longer on a low-FPS authority and
+            # lets a light tank keep sliding a heavy one after contact.
+            push_decay = 0.90 ** (max(0.0, float(step)) * 60.0)
+            state['push_x'] = push_x * push_decay
+            state['push_z'] = push_z * push_decay
             for event in result['ram_events']:
                 other_id = int(event['other_id'])
                 target_kind = ('human' if
@@ -3119,6 +3327,7 @@ class BotRuntime(object):
                     'damage_to_bot': event['damage_to_self'],
                     'damage_to_target': event['damage_to_other'],
                 })
+        self._ram_contacts = frozenset(current_ram_contacts)
         return reports
 
     @staticmethod
@@ -3980,30 +4189,27 @@ class BotRuntime(object):
         if (not self.is_authority() or self.adapter is None or
                 self.finished):
             return []
-        # Match the mature 0.8.2 split: copied bot physics and presentation
-        # advance once per rendered frame, while one canonical combat/pose
-        # publication is formed at no more than 30 Hz.  Accumulating render
-        # deltas until 1/30 s made the authority client's visible bots move in
-        # discrete steps; dropping already-formed messages in LANClient would
-        # instead create gaps in the strict combat proposal sequence.
+        # One render callback may run one complete authority tick, never more.
+        # Faster render rates bank their delta until the existing 30 Hz
+        # publication deadline; a slower renderer still simulates every frame
+        # with its full elapsed time.  MatrixAnimation owns interpolation
+        # between these accepted poses, so no render-frame physics is needed.
         self._accumulator += max(0.0, _number(dt))
         if self._accumulator <= 0.0:
             return []
+        now = _number(now)
+        publish = now + 1e-9 >= self._next_publication
+        if not publish:
+            return []
+        if self._next_publication <= 0.0:
+            self._next_publication = now
+        # Carry the nominal deadline to preserve an average 30 Hz at render
+        # rates such as 40 FPS, but skip every missed deadline in one pass.
+        # A stalled render callback therefore never triggers catch-up ticks.
+        while self._next_publication <= now + 1e-9:
+            self._next_publication += PUBLICATION_SECONDS
         frame_step = min(self._accumulator, 0.2)
         self._accumulator = 0.0
-        step = frame_step
-        now = _number(now)
-        publish = now >= self._next_publication
-        if publish:
-            if self._next_publication <= 0.0:
-                self._next_publication = now
-            # Advance the nominal clock rather than restarting it from a late
-            # rendered frame.  At 40 FPS a restart would quantise 30 Hz down
-            # to 20 Hz (one publication every other frame).  Carrying the
-            # deadline preserves the requested average cadence while still
-            # forming at most one proposal in any render callback.
-            while self._next_publication <= now:
-                self._next_publication += PUBLICATION_SECONDS
         players = list(players or [])
         live_players = None
         live_probe_targets = {}
@@ -4028,11 +4234,12 @@ class BotRuntime(object):
         self._begin_world_receipt_frame()
         neighbours = list(neighbours or []) + self._player_neighbours(players)
         # Native terrain and visibility probes run on BigWorld's render thread.
-        # Build the traffic view lazily, only when a staggered decision is due;
-        # render-only frames integrate the last accepted command and pose.
+        # Build the traffic view lazily, only when a staggered decision is due.
         traffic_bodies = None
         traffic_index = None
         observation_entries = {}
+        observation_pairs = []
+        team_visibility = {}
         cover_jobs = []
         tick_poses = {}
         tick_safe = {}
@@ -4042,14 +4249,11 @@ class BotRuntime(object):
             if not state['alive']:
                 continue
             self._note_source_stillness(state, now)
-            # Distance-tiered INTEGRATION, not just probe throttling: a far
-            # bot advances at a lower rate with the whole accumulated step, so
-            # the per-frame Python cost scales with nearby bots rather than
-            # with the roster size.  The pose it publishes is unchanged
-            # between its own steps, which is what the engine interpolates.
-            step = self._integration_step(state, now, frame_step)
-            if step <= 0.0:
-                continue
+            # Every live bot consumes the same banked authority step. Planner
+            # and slope detail may still vary by distance, but skipping one
+            # far bot here would leak an incomplete observation and a different
+            # contact/reload/vertical clock into the same canonical tick.
+            step = frame_step
             integrated.add(state['id'])
             self._advance_bot_critical(state, step, now)
             if not state['alive']:
@@ -4068,22 +4272,28 @@ class BotRuntime(object):
                 decision_cache is not None and
                 decision_cache[0] == cache_key and
                 _number(now) < decision_cache[1])
-            probe_samples = {}
+            planner_probe_samples = {}
 
-            def sample_direction(sample_yaw):
-                # A planner can ask about the same heading that physics consumes
-                # later in this tick.  One raw probe owns both answers.
+            def planner_sample_direction(sample_yaw):
+                # Invalid or unavailable baked data retains the mature native
+                # planner path.  These advisory samples never enter the motion
+                # cache and never authorize the finally selected direction.
                 normalised = ((float(sample_yaw) + math.pi) %
                               (2.0 * math.pi) - math.pi)
                 key = round(normalised, 4)
-                if key not in probe_samples:
-                    probe_samples[key] = self._probe_direction(
+                if key not in planner_probe_samples:
+                    planner_probe_samples[key] = self._probe_direction(
                         position, sample_yaw, state.get('speed', 0.0),
                         self._descriptors.get(state['id']))
-                return probe_samples[key]
+                return planner_probe_samples[key]
 
             def sample_clear(sample_yaw):
-                return self._probe_is_clear(sample_direction(sample_yaw))
+                advisory = self._planner_corridor_clear(
+                    position, sample_yaw, state.get('speed', 0.0))
+                if advisory is not None:
+                    return bool(advisory)
+                return self._probe_is_clear(
+                    planner_sample_direction(sample_yaw))
 
             if not decision_due:
                 if len(decision_cache) < 6:
@@ -4093,7 +4303,8 @@ class BotRuntime(object):
                 contacts = decision_cache[4]
                 targets = decision_cache[5]
             else:
-                contacts, targets = self._contacts_for(state, players, now)
+                contacts, targets = self._contacts_for(
+                    state, players, now, team_visibility)
                 if traffic_bodies is None:
                     traffic_bodies, traffic_index = self._traffic_snapshot(
                         neighbours)
@@ -4169,26 +4380,11 @@ class BotRuntime(object):
                     targets, live_players=live_players,
                     probe_targets=live_probe_targets,
                     processed_bot_ids=processed_bot_ids)
+            lane_source = dict(state) if active_contacts else None
             for cached_target in active_contacts:
                 observed_target = live_targets.get(
                     cached_target.get('id'), cached_target)
                 lane_key = self._shot_los_key(state, observed_target)
-                lane_distance = ([None] if
-                                 collect_observation and refresh_shot_lanes
-                                 else None)
-                if refresh_shot_lanes:
-                    if (self._shot_los_deadlines.get(lane_key) !=
-                            self._next_observation):
-                        self._refresh_shot_clear(
-                            state, observed_target, now,
-                            self._next_observation, shot_lane_budget,
-                            lane_key=lane_key,
-                            distance_cache=lane_distance)
-                    if (self._shot_los_deadlines.get(lane_key) !=
-                            self._next_observation):
-                        shot_lanes_ready = False
-                if not collect_observation:
-                    continue
                 key = (int(state.get('team', 0)),
                        observed_target.get('kind'),
                        int(observed_target.get('network_id', 0)))
@@ -4196,30 +4392,18 @@ class BotRuntime(object):
                         not isinstance(observed_target['visible'], bool)):
                     raise ValueError(
                         'canonical contact visible flag is invalid')
-                target_visible = cached_target['visible']
-                shooter_id = None
-                if (self._shot_los_deadlines.get(lane_key) ==
-                        self._next_observation and
-                        self._shot_clear(
-                            state, observed_target, now,
-                            probe_budget=shot_lane_budget,
-                            lane_key=lane_key,
-                            distance_cache=lane_distance)):
-                    shooter_id = int(state['id'])
-                # Once one pair misses the fixed deadline, this observation
-                # cannot become complete again during the same ``now``. Keep
-                # all lane-cache calls above, but avoid constructing payload
-                # intermediates that the end-of-frame completeness gate will
-                # discard.
-                if shot_lanes_ready:
+                target_visible = bool(cached_target['visible'])
+                team_visibility[key] = bool(
+                    target_visible or team_visibility.get(key, False))
+                if collect_observation:
                     entry = observation_entries.get(key)
                     if entry is None:
                         entry = [False, set(), observed_target]
                         observation_entries[key] = entry
                     entry[0] = bool(target_visible or entry[0])
-                    if shooter_id is not None:
-                        entry[1].add(shooter_id)
                     entry[2] = observed_target
+                observation_pairs.append((
+                    lane_source, observed_target, lane_key, key, [None]))
             target_id = command.get('target_id')
             if target_id in (targets or {}):
                 # Aim/fire gating retains the observer-specific spotting flag.
@@ -4244,9 +4428,10 @@ class BotRuntime(object):
             if ammo_state is None:
                 ammo_state = _BotAmmoState(descriptor, profile, state)
                 self._ammo_states[state['id']] = ammo_state
-            gun_state.tick(step)
             reload_factor = _critical_factor(
                 state, descriptor, 'reload')
+            gun_state.rescale_reload(reload_factor)
+            gun_state.tick(step)
             ammo_state.stage(
                 gun_state.shell_index(command.get('shell_index', 0)),
                 gun_state.ready(reload_factor))
@@ -4322,7 +4507,12 @@ class BotRuntime(object):
             if not self._motion_probe_reusable(
                     cached_motion_probe, position, travel_yaw,
                     state.get('speed', 0.0), now, settled_motion, step):
-                motion_probe = sample_direction(travel_yaw)
+                # Planner ranking is intentionally unable to satisfy this
+                # gate.  Every newly selected travel corridor receives its own
+                # complete native generic probe before an exact receipt can be
+                # reused or acquired.
+                motion_probe = self._probe_direction(
+                    position, travel_yaw, state.get('speed', 0.0), descriptor)
                 # Planner alternatives keep the mature six horizontal rays.
                 # Only the finally selected, powered, non-turning travel sample
                 # pays for the exact 3x3 receipt used by commit-side motion.
@@ -4345,9 +4535,29 @@ class BotRuntime(object):
                         cached_motion_probe, position, travel_yaw,
                         receipt_speed, step)
                     if receipt is not None:
-                        # Refresh the generic slope/steering sample without
-                        # paying another nine exact rays for the same contained
-                        # world corridor.
+                        if self._world_receipt_refresh_due(
+                                receipt, position, travel_yaw,
+                                receipt_speed, step):
+                            refreshed = self._probe_world_receipt(
+                                state['id'], position, travel_yaw,
+                                receipt_speed, descriptor, False)
+                            if refreshed is False:
+                                # A completed exact probe found a new blocker;
+                                # the older corridor may no longer grant motion.
+                                motion_probe.update({
+                                    'clear': False,
+                                    'collision': True,
+                                })
+                            elif refreshed == 'deferred':
+                                motion_probe['_receipt_refresh_deferred'] = \
+                                    True
+                            elif self._world_receipt_contains(
+                                    refreshed, position, travel_yaw,
+                                    receipt_speed, step):
+                                receipt = refreshed
+                        # Queue deferral or callback failure proves no new
+                        # blocker. Keep the still-contained old corridor while
+                        # its fair proactive refresh remains queued.
                         motion_probe['world_receipt'] = receipt
                     else:
                         receipt = self._probe_world_receipt(
@@ -4372,8 +4582,13 @@ class BotRuntime(object):
                         'result': motion_probe,
                         'position': position,
                         'yaw': travel_yaw,
-                        'deadline': _motion_probe_deadline(
-                            now, state['id'], cached_motion_probe is None),
+                        'deadline': (
+                            _number(now)
+                            if motion_probe.get(
+                                '_receipt_refresh_deferred', False)
+                            else _motion_probe_deadline(
+                                now, state['id'],
+                                cached_motion_probe is None)),
                     }
                 else:
                     old_result = ((cached_motion_probe or {}).get(
@@ -4513,12 +4728,18 @@ class BotRuntime(object):
                      pending_reproof is not None or
                      self._shot_clear(
                         state, target, now,
-                        probe_budget=shot_lane_budget))):
+                        probe_budget=shot_lane_budget)) and
+                    bool(self.friendly_lane_probe(state, target))):
                 launch_receipt = None
                 if is_spg:
                     launch_receipt = self._artillery_launch_receipt(
                         state, target, descriptor, state['shell_index'],
                         gun_state, ballistic_solution, now)
+                    if (launch_receipt is not None and
+                            not bool(self.artillery_friendly_lane_probe(
+                                state, target, descriptor,
+                                state['shell_index'], launch_receipt))):
+                        launch_receipt = None
                 if not is_spg or launch_receipt is not None:
                     fired = self._fire(
                         state, gun_state, reload_factor, descriptor,
@@ -4538,6 +4759,44 @@ class BotRuntime(object):
                 cover_jobs.append((state['id'], dict(state), dict(target),
                                    command.get('move_position', position)))
             processed_bot_ids.add(int(state['id']))
+        # A static firing lane is only meaningful after at least one member of
+        # the observing team has spotted the target.  The server ignores the
+        # shooter set for an unspotted contact, so probing all 14x15 enemy
+        # pairs in that state spent hundreds of render-thread collision rays
+        # without changing a decision.  Aggregate radio spotting first, then
+        # prove every shooter lane for only those team-visible targets.  The
+        # selected target's independent final-fire gate below remains live.
+        for (lane_source, observed_target, lane_key, key,
+             lane_distance) in observation_pairs:
+            if not team_visibility.get(key, False):
+                continue
+            if refresh_shot_lanes:
+                if (self._shot_los_deadlines.get(lane_key) !=
+                        self._next_observation):
+                    self._refresh_shot_clear(
+                        lane_source, observed_target, now,
+                        self._next_observation, shot_lane_budget,
+                        lane_key=lane_key,
+                        distance_cache=lane_distance)
+                if (self._shot_los_deadlines.get(lane_key) !=
+                        self._next_observation):
+                    shot_lanes_ready = False
+            if (collect_observation and
+                    self._shot_los_deadlines.get(lane_key) ==
+                    self._next_observation):
+                # ``_refresh_shot_clear`` already proved this pair inside the
+                # tactical observation window.  Re-entering ``_shot_clear``
+                # here applies the independent 0.20-second final-fire expiry;
+                # at 24 FPS those rechecks consume the whole 64-ray budget
+                # before the last 115 roster pairs can ever be sampled.  The
+                # observation owns the completed deadline and its cached
+                # verdict; only an actual fire attempt uses the shorter gate.
+                lane_sample = self._shot_los_cache.get(lane_key)
+                if lane_sample is None:
+                    shot_lanes_ready = False
+                elif lane_sample[1]:
+                    observation_entries[key][1].add(
+                        int(lane_source['id']))
         self._finish_world_receipt_frame()
         if collect_observation and not shot_lanes_ready:
             collect_observation = False
@@ -4589,25 +4848,55 @@ class BotRuntime(object):
                         'candidates': list(candidates),
                     })
         self._pending_ram_reports.extend(
-            self._resolve_tank_contacts(players, now, step))
-        for state in self._ordered_states():
+            self._resolve_tank_contacts(players, now, frame_step))
+        ordered_states = self._ordered_states()
+        slope_candidates = []
+        for state in ordered_states:
             if state.get('alive', True) and state['id'] in integrated:
                 attempted_yaw = attempted_yaws.get(
                     state['id'], state.get('yaw', 0.0))
                 support_blocked = self._update_vertical_motion(
-                    state, self._last_step.get(state['id'], frame_step),
+                    state, frame_step,
                     tick_poses[state['id']], attempted_yaw)
                 if not support_blocked:
                     self._guard_realised_pose(
                         state, tick_poses[state['id']], tick_safe[state['id']],
                         attempted_yaw)
-                self._update_slope_pose(state)
+                slope_candidates.append(state)
+        self._alive_bot_ticks += len(slope_candidates)
+        if slope_candidates:
+            start = self._slope_pose_cursor % len(slope_candidates)
+            visited = 0
+            sampled = 0
+            while (visited < len(slope_candidates) and
+                   sampled < MAX_SLOPE_POSE_SAMPLES_PER_FRAME):
+                index = (start + visited) % len(slope_candidates)
+                if self._update_slope_pose(slope_candidates[index]):
+                    sampled += 1
+                visited += 1
+            self._slope_pose_cursor = (
+                start + max(1, visited)) % len(slope_candidates)
+        for state in ordered_states:
             if publish:
                 self._mark_combat_publication(state)
         if not publish:
             return []
-        outgoing = [{'type': 'bot_state', 'bots': [dict(state)
-                                                   for state in self._ordered_states()]}]
+        wire_states = []
+        launches = []
+        for state in self._ordered_states():
+            projected = lan_client.project_bot_state(state)
+            if projected is None:
+                raise RuntimeError('bot publication projection failed')
+            wire_states.append(projected)
+            launch = _local_launch_record(state)
+            if launch is not None:
+                launches.append(launch)
+        publication = {'type': 'bot_state', 'bots': wire_states}
+        if launches:
+            # Never put these local-only SPG proof receipts on the LAN wire.
+            # BattleRuntime retries an unaccepted launch from this compact list.
+            publication['launches'] = launches
+        outgoing = [publication]
         # The server validates ram proximity against its latest authority pose.
         # Publish state first, then the cooldown-gated damage reports.
         outgoing.extend(self._pending_ram_reports)

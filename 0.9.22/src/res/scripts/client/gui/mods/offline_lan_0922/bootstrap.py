@@ -29,6 +29,7 @@ OFFLINE_ARTEFACT_STOCK = 200
 NEW_SKILL_SLOTS = 3
 _NEW_SKILL_XP = {}
 _store = None
+_postbattle_store = None
 
 
 def _default_vehicle_settings():
@@ -94,6 +95,16 @@ def _garage_store():
                 '%s\n' % error)
             return None
     return _store
+
+
+def _battle_results_store():
+    """Return the one receipt owner shared by LAN and reconstructed Accounts."""
+    global _postbattle_store
+    if _postbattle_store is None:
+        from gui.mods.offline_lan_0922.account_rpc.postbattle_store import \
+            PostBattleStore
+        _postbattle_store = PostBattleStore()
+    return _postbattle_store
 
 
 def _restore_garage(snapshot):
@@ -647,7 +658,8 @@ def _install_lan_session():
     session = LANSession(
         _config, lobby_ready=_native_lobby_is_ready,
         callback=BigWorld.callback,
-        cancel_callback=BigWorld.cancelCallback)
+        cancel_callback=BigWorld.cancelCallback,
+        postbattle_store=_battle_results_store())
     try:
         if not session.install():
             raise RuntimeError('LAN Battle button did not install')
@@ -768,12 +780,14 @@ def _run_once():
             _cleanup_runtime()
             sys.stdout.write('[Offline LAN 0.9.22] disabled by config\n')
             return
+        account_state = AccountState()
+        account_state.postbattle_store = _battle_results_store()
         _account_context = {
             'selected_vehicle': _selected_vehicle(_config),
             'garage_store': _garage_store(),
             # Account settings are server-owned in #1513.  Keep their local
             # offline substitute beside config.json across client restarts.
-            'account_state': AccountState(),
+            'account_state': account_state,
         }
         _deadline = 0.0
         _wait_for_login_space()

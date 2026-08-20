@@ -9,6 +9,7 @@ import zipfile
 from unittest import mock
 
 import core
+import preferences_overlay
 import server_imports
 import stage_payload
 
@@ -161,9 +162,22 @@ class SessionPlanTest(unittest.TestCase):
         self.assertFalse(session["needs_server"])
 
     def test_0_9_22_single_player_plan_starts_a_local_server(self):
-        session = core.plan_session(self._status(), core.MODE_SINGLE)
+        session = core.plan_session(
+            self._status(), core.MODE_SINGLE, team_size="7")
         self.assertEqual(session["host"], core.LOCAL_HOST)
         self.assertTrue(session["needs_server"])
+        self.assertEqual(7, session["team_size"])
+
+    def test_0_9_22_team_size_must_be_between_one_and_fifteen(self):
+        for value in ("", "four", 0, 16, 1.5, True):
+            with self.assertRaises(core.LauncherError, msg=value):
+                core.plan_session(
+                    self._status(), core.MODE_HOST, team_size=value)
+
+    def test_join_does_not_apply_the_local_team_size(self):
+        session = core.plan_session(
+            self._status(), core.MODE_JOIN, "10.0.0.5", team_size="invalid")
+        self.assertEqual(core.DEFAULT_TEAM_SIZE, session["team_size"])
 
     def test_0_8_2_single_player_plan_starts_a_local_server(self):
         session = core.plan_session(
@@ -292,7 +306,15 @@ class ServerPayloadTest(unittest.TestCase):
         self.assertTrue(environment[core.SERVER_DATA_ENV_0922].endswith(
             os.path.join("configs", "offline_lan_0922")))
         self.assertIn("/game", environment[core.SERVER_DATA_ENV_0922])
+        self.assertEqual(
+            str(core.DEFAULT_TEAM_SIZE),
+            environment[core.SERVER_TEAM_SIZE_ENV_0922])
         self.assertNotIn(core.NAVGRAPH_DIR_ENV, environment)
+
+    def test_0_9_22_server_receives_the_selected_team_size(self):
+        environment = core.server_environment(
+            core.PORT_0_9_22, "/game", {}, team_size=4)
+        self.assertEqual("4", environment[core.SERVER_TEAM_SIZE_ENV_0922])
 
     def test_missing_payload_reports_a_launcher_error(self):
         self.assertRaises(core.LauncherError, core.run_server_payload,
@@ -365,6 +387,22 @@ class ClientInstallTest(unittest.TestCase):
             ] = json.dumps({"maps": records})
         return self._archive("0.9.22", members)
 
+    def _make_0_9_22_target(self):
+        self._write(self.game, core.GAME_EXECUTABLE, "")
+        self._write(
+            self.game, "version.xml",
+            "<version> v.0.9.22.0.1 #1513 </version>")
+        engine_config = preferences_overlay.packed_xml.PackedElement(children=[
+            (b"preferences", preferences_overlay.packed_xml.PackedValue(
+                preferences_overlay.packed_xml.TYPE_STRING,
+                b"preferences.xml")),
+        ])
+        path = os.path.join(self.game, "res", "engine_config.xml")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as stream:
+            stream.write(preferences_overlay.packed_xml.write_packed_xml(
+                engine_config))
+
     def test_0_8_2_install_replaces_the_whole_mod_directory(self):
         self._stage_0_8_2()
         self._write(self.game, "res_mods/0.8.2/leftover.txt", "stale")
@@ -436,6 +474,200 @@ class ClientInstallTest(unittest.TestCase):
         core.install_client_mod(self.game, core.PORT_0_9_22, self.payload)
         self.assertEqual("new", self._read(
             "mods/configs/offline_lan_0922/config.json"))
+
+    def test_startup_repair_quarantines_only_an_invalid_config(self):
+        default_config = json.dumps({
+            "enabled": True,
+            "startupTimeoutSeconds": 30.0,
+            "physics_tuning": {},
+            "he_tuning": {},
+            "perfect_accuracy": False,
+        })
+        self._stage_0_9_22(default_config)
+        self._make_0_9_22_target()
+        self._write(
+            self.game, "mods/configs/offline_lan_0922/config.json",
+            "{broken")
+        for name in ("server_endpoint.json", "account_state.json",
+                     "garage_state.json"):
+            self._write(
+                self.game, "mods/configs/offline_lan_0922/" + name,
+                "saved-" + name)
+        postbattle = json.dumps({
+            "schema": 1,
+            "accountKey": "offline",
+            "pending": [{"arenaUniqueID": 17}],
+            "history": [],
+            "progress": {},
+        })
+        self._write(
+            self.game,
+            "mods/configs/offline_lan_0922/postbattle_state.json",
+            postbattle)
+        self._write(
+            self.game, "mods/0.9.22.0.1/com.other.mod.wotmod", "theirs")
+
+        actions = core.repair_0_9_22_startup(
+            self.game, self.payload, is_running=lambda: False)
+
+        self.assertEqual(default_config, self._read(
+            "mods/configs/offline_lan_0922/config.json"))
+        self.assertEqual("{broken", self._read(
+            "mods/configs/offline_lan_0922/config.json.invalid"))
+        for name in ("server_endpoint.json", "account_state.json",
+                     "garage_state.json"):
+            self.assertEqual("saved-" + name, self._read(
+                "mods/configs/offline_lan_0922/" + name))
+        self.assertEqual(postbattle, self._read(
+            "mods/configs/offline_lan_0922/postbattle_state.json"))
+        self.assertEqual("theirs", self._read(
+            "mods/0.9.22.0.1/com.other.mod.wotmod"))
+        self.assertIn("kept the saved endpoint", " ".join(actions))
+
+    def test_startup_repair_keeps_a_valid_config(self):
+        default_config = json.dumps({"enabled": True})
+        self._stage_0_9_22(default_config)
+        self._make_0_9_22_target()
+        saved_config = json.dumps({
+            "enabled": False, "startupTimeoutSeconds": 45.0})
+        self._write(
+            self.game, "mods/configs/offline_lan_0922/config.json",
+            saved_config)
+
+        core.repair_0_9_22_startup(
+            self.game, self.payload, is_running=lambda: False)
+
+        self.assertEqual(saved_config, self._read(
+            "mods/configs/offline_lan_0922/config.json"))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.game, "mods", "configs", "offline_lan_0922",
+            "config.json.invalid")))
+
+    def test_startup_repair_refuses_to_touch_a_running_game(self):
+        self._stage_0_9_22(json.dumps({"enabled": True}))
+        self._make_0_9_22_target()
+        self._write(
+            self.game, "mods/configs/offline_lan_0922/config.json",
+            "{broken")
+
+        with self.assertRaisesRegex(core.LauncherError, "Close World of Tanks"):
+            core.repair_0_9_22_startup(
+                self.game, self.payload, is_running=lambda: True)
+
+        self.assertEqual("{broken", self._read(
+            "mods/configs/offline_lan_0922/config.json"))
+
+    def test_failed_startup_repair_restores_the_invalid_config(self):
+        self._make_0_9_22_target()
+        self._write(
+            self.game, "mods/configs/offline_lan_0922/config.json",
+            "{broken")
+
+        def fail_install(game_root, port_version, base_dir, force):
+            self._write(
+                self.game, "mods/configs/offline_lan_0922/config.json",
+                "partial-default")
+            raise core.LauncherError("install failed")
+
+        with mock.patch.object(
+                core, "install_client_mod", side_effect=fail_install):
+            with self.assertRaisesRegex(core.LauncherError, "install failed"):
+                core.repair_0_9_22_startup(
+                    self.game, self.payload, is_running=lambda: False)
+
+        self.assertEqual("{broken", self._read(
+            "mods/configs/offline_lan_0922/config.json"))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.game, "mods", "configs", "offline_lan_0922",
+            "config.json.invalid")))
+
+    def test_reset_deletes_only_known_offline_state_after_confirmation(self):
+        default_config = json.dumps({"enabled": True})
+        self._stage_0_9_22(default_config)
+        self._make_0_9_22_target()
+        state_root = "mods/configs/offline_lan_0922/"
+        for name in ("config.json", "config.json.invalid",
+                     "server_endpoint.json", "server_endpoint.json.tmp",
+                     "account_state.json", "garage_state.json.bak",
+                     "postbattle_state.json"):
+            self._write(self.game, state_root + name, "saved-" + name)
+        self._write(self.game, state_root + "notes.json", "keep")
+        self._write(
+            self.game, "mods/0.9.22.0.1/com.other.mod.wotmod", "theirs")
+
+        actions = core.reset_0_9_22_state(
+            self.game, self.payload, is_running=lambda: False)
+
+        self.assertEqual(default_config, self._read(state_root + "config.json"))
+        for name in ("config.json.invalid", "server_endpoint.json",
+                     "server_endpoint.json.tmp", "account_state.json",
+                     "garage_state.json.bak", "postbattle_state.json"):
+            self.assertFalse(os.path.exists(os.path.join(
+                self.game, *(state_root + name).split("/"))))
+        self.assertEqual("keep", self._read(state_root + "notes.json"))
+        self.assertEqual("theirs", self._read(
+            "mods/0.9.22.0.1/com.other.mod.wotmod"))
+        self.assertIn("Deleted 7 offline saved-data file(s).", actions)
+
+    def test_reset_also_deletes_only_the_isolated_client_preferences(self):
+        default_config = json.dumps({"enabled": True})
+        self._stage_0_9_22(default_config)
+        self._make_0_9_22_target()
+        preferences = os.path.join(
+            self.work, "local-app-data",
+            *preferences_overlay.PROFILE_RELATIVE_PATH.split("/"))
+        os.makedirs(os.path.dirname(preferences))
+        with open(preferences, "w") as stream:
+            stream.write("offline graphics and input settings")
+
+        with mock.patch.object(
+                core, "_isolated_0_9_22_preferences_path",
+                return_value=preferences):
+            actions = core.reset_0_9_22_state(
+                self.game, self.payload, is_running=lambda: False)
+
+        self.assertFalse(os.path.exists(preferences))
+        self.assertIn("Deleted 1 offline saved-data file(s).", actions)
+
+    def test_failed_reset_restores_the_isolated_client_preferences(self):
+        self._make_0_9_22_target()
+        preferences = os.path.join(
+            self.work, "local-app-data",
+            *preferences_overlay.PROFILE_RELATIVE_PATH.split("/"))
+        os.makedirs(os.path.dirname(preferences))
+        with open(preferences, "w") as stream:
+            stream.write("keep me")
+
+        with mock.patch.object(
+                core, "_isolated_0_9_22_preferences_path",
+                return_value=preferences), mock.patch.object(
+                    core, "install_client_mod",
+                    side_effect=core.LauncherError("install failed")):
+            with self.assertRaisesRegex(core.LauncherError, "install failed"):
+                core.reset_0_9_22_state(
+                    self.game, self.payload, is_running=lambda: False)
+
+        with open(preferences) as stream:
+            self.assertEqual("keep me", stream.read())
+
+    def test_failed_reset_restores_every_saved_file(self):
+        self._make_0_9_22_target()
+        state_root = "mods/configs/offline_lan_0922/"
+        for name in ("config.json", "server_endpoint.json",
+                     "garage_state.json", "postbattle_state.json"):
+            self._write(self.game, state_root + name, "saved-" + name)
+
+        with mock.patch.object(
+                core, "install_client_mod",
+                side_effect=core.LauncherError("install failed")):
+            with self.assertRaisesRegex(core.LauncherError, "install failed"):
+                core.reset_0_9_22_state(
+                    self.game, self.payload, is_running=lambda: False)
+
+        for name in ("config.json", "server_endpoint.json",
+                     "garage_state.json", "postbattle_state.json"):
+            self.assertEqual("saved-" + name,
+                             self._read(state_root + name))
 
     def test_the_same_package_is_not_installed_twice(self):
         self._stage_0_8_2()
@@ -678,6 +910,10 @@ class PayloadStagingTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(
             self.target, "0.9.22", "src", "res", "scripts", "client", "gui",
             "mods", "offline_lan_0922", "ai", "maps.py")))
+
+    def test_the_0_9_22_server_stages_its_reward_module(self):
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.target, "0.9.22", "server", "offline_rewards.py")))
 
     def test_the_navigation_graphs_stay_out_of_the_bundle(self):
         self.assertFalse(any(

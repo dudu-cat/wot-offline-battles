@@ -430,6 +430,28 @@ class ProjectionBuilderTest(unittest.TestCase):
         self.assertEqual('HIGH_EXPLOSIVE', shell['kind'])
         self.assertEqual(1.85, shell['explosionRadius'])
 
+    def test_selected_engine_power_ratio_survives_server_projection(self):
+        from gui.mods.offline_lan_0922 import vehicle_physics
+        import descriptor_projection
+
+        descriptor = self._descriptor()
+        descriptor.physics['enginePower'] = 430.0 * 735.5
+        descriptor.engine = types.SimpleNamespace(
+            name='selected-engine', maxHealth=100, maxRegenHealth=50)
+        descriptor.type.xphysics = {
+            'detailed': {'engines': {
+                'selected-engine': {'smplEnginePower': 454.6309}}}}
+
+        projection = descriptor_donation.project_descriptor(descriptor)
+        wrapped = descriptor_projection.wrap(json.loads(json.dumps(projection)))
+
+        self.assertAlmostEqual(
+            1.15, projection['physics']['nativePowerRatio'], places=6)
+        self.assertAlmostEqual(
+            1.15,
+            vehicle_physics.derive_params(wrapped)['nativePowerRatio'],
+            places=6)
+
     def test_projection_feeds_the_server_collision_boundary(self):
         import descriptor_projection
         from gui.mods.offline_lan_0922 import tank_collision

@@ -269,7 +269,7 @@ class TankCollisionTests(unittest.TestCase):
         self.assertLess(approach_result['delta_velocity'][0], 0.0)
         self.assertEqual((0.0, 0.0), separate_result['delta_velocity'])
 
-    def test_ram_damage_and_pair_cooldown_match_final_082_law(self):
+    def test_ram_damage_requires_a_new_contact_after_separation(self):
         heavy = _tank(9, 0.0, 0.0, mass=60000.0, vx=10.0)
         light = _tank(4, 0.8, 0.0, mass=10000.0)
 
@@ -283,11 +283,23 @@ class TankCollisionTests(unittest.TestCase):
         self.assertGreater(event['damage_to_other'], event['damage_to_self'])
 
         cooling_down = tank_collision.resolve_tank(
-            heavy, (light,), now=10.5, ram_cooldowns=first['cooldowns'])
+            heavy, (light,), now=10.5, ram_cooldowns=first['cooldowns'],
+            active_ram_contacts=first['contacts'])
+        still_overlapping = tank_collision.resolve_tank(
+            heavy, (light,), now=10.76, ram_cooldowns=first['cooldowns'],
+            active_ram_contacts=first['contacts'])
+        separated_light = dict(light, x=20.0)
+        separated = tank_collision.resolve_tank(
+            heavy, (separated_light,), now=10.8,
+            ram_cooldowns=first['cooldowns'],
+            active_ram_contacts=first['contacts'])
         ready_again = tank_collision.resolve_tank(
-            heavy, (light,), now=10.76, ram_cooldowns=first['cooldowns'])
+            heavy, (light,), now=11.0, ram_cooldowns=first['cooldowns'],
+            active_ram_contacts=separated['contacts'])
 
         self.assertEqual((), cooling_down['ram_events'])
+        self.assertEqual((), still_overlapping['ram_events'])
+        self.assertEqual(frozenset(), separated['contacts'])
         self.assertEqual(1, len(ready_again['ram_events']))
 
     def test_ram_threshold_is_harmless(self):

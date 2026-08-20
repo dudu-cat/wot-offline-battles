@@ -101,6 +101,16 @@ class LanClientQueueTests(unittest.TestCase):
         self.assertEqual(((-10.0, -20.0),), queued['bases']['1'])
         self.assertEqual(((10.0, 20.0),), queued['bases']['2'])
 
+    def test_battle_receipt_ack_uses_reliable_queue_without_round_scope(self):
+        client = self.activate()
+        client.ready = True
+
+        self.assertTrue(client.acknowledge_battle_receipt('server:7:1'))
+
+        self.assertEqual({
+            'type': 'battle_receipt_ack', 'receipt_id': 'server:7:1'},
+            client._outbound_queue[0][1])
+
     def test_bot_state_queue_projects_full_local_state_to_wire_contract(self):
         client = self.activate()
         client.ready = True
@@ -114,7 +124,8 @@ class LanClientQueueTests(unittest.TestCase):
                 'slot': index % 15, 'name': 'Bot-%d' % index,
                 'vehicle': 'ussr:R11_MS-1', 'max_health': 1000,
                 'x': float(index), 'y': 0.0, 'z': float(index * 2),
-                'yaw': 0.1, 'aim_yaw': 0.2, 'gun_pitch': -0.05,
+                'yaw': 0.1, 'pitch': 0.03, 'roll': -0.02,
+                'aim_yaw': 0.2, 'gun_pitch': -0.05,
                 'movement_dir': 1, 'rotation_dir': 0,
                 'fire_seq': 4, 'shell_index': 0,
                 'next_shell_index': 1,
@@ -153,7 +164,8 @@ class LanClientQueueTests(unittest.TestCase):
         queued = client._outbound_queue[0]
         queued_bots = queued[1]['bots']
         expected = {
-            'id', 'x', 'y', 'z', 'yaw', 'aim_yaw', 'gun_pitch',
+            'id', 'x', 'y', 'z', 'yaw', 'pitch', 'roll',
+            'aim_yaw', 'gun_pitch',
             'movement_dir', 'rotation_dir', 'fire_seq', 'shell_index',
             'next_shell_index', 'ammo_remaining', 'ammo_reload_pending',
             'health', 'alive', 'critical', 'combat_base_revision',

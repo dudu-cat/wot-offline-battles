@@ -1,12 +1,8 @@
 World of Tanks 0.9.22.0.1 #1513 LAN/offline package
 ===================================================
 
-The simplest way to install this package is the launcher. It removes older mod
-files, installs this package, sets the server address, starts the LAN server
-and starts the game.
-
-To install by hand instead, extract the contents of this folder into the game
-root. It contains:
+Close the game, then extract the contents of this folder directly into the
+directory that contains WorldOfTanks.exe. It contains:
 
   mods\0.9.22.0.1\org.peng.offline_lan_0922_<version>.wotmod
   mods\configs\offline_lan_0922\config.json
@@ -14,10 +10,17 @@ root. It contains:
   mods\configs\offline_lan_0922\foliage\
   mods\configs\offline_lan_0922\destructibles\
   mods\configs\offline_lan_0922\occluders\
+  START_OFFLINE_0922.bat
 
-Then start the LAN server on one PC and enter its address in the launcher, or
-edit mods\configs\offline_lan_0922\server_endpoint.json. That file holds your
-own address and is never shipped in this package.
+Move every older org.peng.offline_lan_0922*.wotmod out of
+mods\0.9.22.0.1 before copying this version. Start the LAN server on one PC,
+then edit mods\configs\offline_lan_0922\server_endpoint.json when the server is
+not 127.0.0.1:28782. That user-owned file is never shipped in this package.
+
+Start the client with START_OFFLINE_0922.bat. It changes APPDATA only for this
+game process, so the legacy client's preferences.xml cannot overwrite the
+normal WoT profile. The first isolated start may ask for the EULA and display
+settings again.
 
 Play
 ----
@@ -31,10 +34,14 @@ Play
    screen. The first player is the room host: the host selects a standard map
    with < and >, then clicks START BATTLE. LEAVE closes the room and returns
    you to the garage.
-4. The server fills both teams to 15 vehicles. Movement and firing unlock when
-   the countdown reaches battle.
-5. After a team is eliminated the round freezes, and every connected player
-   returns to the waiting room after five seconds.
+4. The server fills each team to WOT_0922_TEAM_SIZE total tanks, including
+   human players (1 through 15, default 15). Set that environment variable in
+   the batch file that starts the server. Movement and firing unlock when the
+   countdown reaches battle.
+5. After a team is eliminated the round freezes, every connected player
+   returns to the waiting room after five seconds, and the stock battle-results
+   notification is requested. A player who left after dying receives the same
+   durable result on reconnect.
 
 Only standard battles are supported. In this client the internal name of
 standard battle is `ctf`; assault and encounter maps are excluded.
@@ -70,10 +77,18 @@ Troubleshooting
   the package installed by the launcher.
 - The client keeps its own files. Your saved address, account state, garage and
   configuration survive a reinstall.
+- If a crash leaves this mod stuck at login, close the game and use Repair
+  startup in the launcher. It quarantines an invalid configuration and keeps
+  the garage, account progress, vehicle-data overrides and battle results. The
+  separately confirmed Reset all offline data action removes the endpoint,
+  account, garage, result and mod-configuration state. Vehicle-data overlays
+  remain until Restore all vehicle defaults is used in the data editor.
 - Bot tracks and road wheels do not turn. A broken enemy track therefore has no
   visual cue; read the damage panel instead.
-- The client is 32-bit and can address about 2 GB. A very long session can
-  still run out of memory and exit. Restart the client between long sessions.
+- The client is 32-bit but its executable is large-address-aware, so on 64-bit
+  Windows it can use up to about 4 GB rather than the ordinary 2 GB ceiling.
+  That address space is still finite: a very long session can run out of memory
+  and exit. Restart the client between long sessions.
 - One of the 680 vehicles in this client, germany:G138_VK168_02_Mauerbrecher,
   ships no models. The garage and the bot lineups skip it.
 

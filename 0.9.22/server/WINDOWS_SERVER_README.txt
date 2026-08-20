@@ -14,25 +14,26 @@ The server always listens on 0.0.0.0:28782, supports up to 30 players, and
 selects a supported map at random. Keep the console window open while playing.
 Press Ctrl+C or close the window to stop the server.
 
-Server-hosted bots: when the server can read the baked map data, it runs the
-bot simulation itself and every client (including the host PC's) renders as a
-lightweight follower. The launcher sets this up automatically. For a
-standalone EXE, either set WOT_0922_SERVER_DATA to the client install's
-mods\configs\offline_lan_0922 folder, or copy that folder to a directory
-named "data" beside the EXE. Client authority is only a compatibility fallback
-when a server prerequisite fails: the complete baked map dataset, eligible
-vehicle catalog, requested descriptor projections, or native destructible
-identity map is missing, invalid, or times out. The loading status reports this
-fallback explicitly; it is not used during a healthy server-authority start.
-The native destructible identity donation must cover every interactive object
-in the baked catalog. Exact #1513 may expose only nearby streamed chunks while
-loading; in that case the round deliberately uses client authority rather than
-running an incomplete server world.
+The default is client authority: one connected client simulates bots while the
+server owns the shared LAN state. To choose the number of tanks per team, set
+WOT_0922_TEAM_SIZE to 1 through 15 before starting the EXE. The number includes
+human players. For example, this batch file starts a seven-tank-per-team game:
 
-Server authority owns Bot simulation and the shared projectile/collision/
-damage ledger. Human movement, launch inputs and several native vehicle-state
-calculations still originate on trusted clients. It is not an anti-cheat mode
-or a claim that every game calculation runs in this process.
+  @echo off
+  set "WOT_0922_TEAM_SIZE=7"
+  set "WOT_LAN_AUTHORITY=client"
+  "%~dp0WoT-0.9.22-LAN-Server.exe"
+
+The experimental server-authority mode requires WOT_LAN_AUTHORITY=server and
+WOT_0922_SERVER_DATA pointing at the client install's
+mods\configs\offline_lan_0922 folder. It is not the normal configuration and
+does not replace the native calculations that still originate on clients.
+
+In experimental server-authority mode, the server owns Bot simulation and the
+shared projectile/collision/damage ledger. Human movement, launch inputs and
+several native vehicle-state calculations still originate on trusted clients.
+It is not an anti-cheat mode or a claim that every game calculation runs in
+this process.
 
 If the server exits immediately, port 28782 may already be in use. Close the
 other server instance and try again.
@@ -40,12 +41,12 @@ other server instance and try again.
 License, source, and bundled runtimes
 =====================================
 
-This server is part of wot-offline-battles and is distributed under GNU GPL
-version 3, without warranty. Corresponding source for release 0.5.0 and the
+This test-candidate server is part of wot-offline-battles and is distributed
+under GNU GPL version 3, without warranty. Corresponding source and the
 complete project license are available at:
 
-https://github.com/pengw0048/wot-offline-battles/tree/v0.5.0
-https://github.com/pengw0048/wot-offline-battles/blob/v0.5.0/LICENSE
+https://github.com/pengw0048/wot-offline-battles/tree/peng/0922-feedback-candidate
+https://github.com/pengw0048/wot-offline-battles/blob/peng/0922-feedback-candidate/LICENSE
 
 The executable bundles CPython 3.11.9, distributed under the Python Software
 Foundation License Version 2 and the licenses/notices for software incorporated

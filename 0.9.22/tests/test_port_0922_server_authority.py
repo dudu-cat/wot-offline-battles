@@ -10,7 +10,7 @@ sys.path.insert(0, str(PORT_ROOT / 'server'))
 
 from lan_battle_server import (  # noqa: E402
     BattleState, CLIENT_BUILD_0922, Player, PREBATTLE_SECONDS,
-    PROJECTILE_CAPABILITY, TICK_HZ,
+    PROJECTILE_CAPABILITY, TICK_HZ, _critical_payload,
 )
 import server_battle_authority  # noqa: E402
 from server_battle_authority import (  # noqa: E402
@@ -484,6 +484,15 @@ _TRACK_CRITICAL = {
                 'state': 'destroyed', 'cause': 'shot'}],
 }
 
+_WHOLE_CREW_CRITICAL = {
+    'devices': [], 'destroyed': [],
+    'crew_roster': ['commander', 'driver'],
+    'crew_ko': ['commander', 'driver'],
+    'fire': False, 'ammo_rack_death': False,
+    'events': [{'kind': 'crew', 'name': 'driver',
+                'state': 'destroyed', 'cause': 'shot'}],
+}
+
 
 class VehicleStatisticsTest(unittest.TestCase):
     def _live_state(self):
@@ -831,6 +840,46 @@ class VehicleStatisticsTest(unittest.TestCase):
         self.assertEqual(1, state.vehicle_statistics[('player', 3)]['kills'])
         self.assertEqual(
             1000, state.vehicle_statistics[('player', 3)]['damage_dealt'])
+
+    def test_whole_crew_knockout_kills_and_preserves_remaining_hull_hp(self):
+        state = self._live_state()
+
+        self._shoot(
+            state, 3, 2, 25, critical=_WHOLE_CREW_CRITICAL)
+
+        target = state.players[2]
+        self.assertFalse(target.alive)
+        self.assertEqual(975, target.health)
+        self.assertEqual(975, target.display_health)
+        self.assertEqual(0, target.death_reason)
+        self.assertEqual('player', target.death_attacker_kind)
+        self.assertEqual(3, target.death_attacker_id)
+        self.assertEqual(1, state.players[3].frags)
+        self.assertEqual(
+            1, state.vehicle_statistics[('player', 3)]['kills'])
+        hit = [event for event in state.pending_events
+               if event.get('kind') == 'hit'][-1]
+        self.assertTrue(hit['dead'])
+        self.assertEqual(975, hit['health'])
+        self.assertEqual(0, hit['death_reason'])
+
+    def test_partial_crew_knockout_does_not_kill(self):
+        state = self._live_state()
+        critical = copy.deepcopy(_WHOLE_CREW_CRITICAL)
+        critical['crew_ko'] = ['commander']
+
+        self._shoot(state, 3, 2, 25, critical=critical)
+
+        self.assertTrue(state.players[2].alive)
+        self.assertEqual(975, state.players[2].health)
+        self.assertEqual(0, state.players[3].frags)
+
+    def test_crew_knockout_cannot_claim_a_name_outside_exact_roster(self):
+        critical = copy.deepcopy(_WHOLE_CREW_CRITICAL)
+        critical['crew_roster'] = ['commander']
+
+        with self.assertRaisesRegex(ValueError, 'outside roster'):
+            _critical_payload(critical)
 
 
 class SplashEffectsTest(unittest.TestCase):

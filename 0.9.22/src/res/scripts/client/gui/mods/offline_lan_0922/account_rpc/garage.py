@@ -36,9 +36,15 @@ EQUIPMENT_SLOT_COUNT = 3
 EQUIPMENT_PAYLOAD_SLOT_COUNT = 4
 EQUIPMENT_TYPE_REGULAR = 0
 TURRET_ITEM_TYPE = 3
+GUN_ITEM_TYPE = 4
 OPTIONAL_DEVICE_ITEM_TYPE = 9
 SHELL_ITEM_TYPE = 10
 EQUIPMENT_ITEM_TYPE = 11
+
+# items.components.c11n_constants.SeasonType in #1513.  Keep these values
+# engine-free here; the stock parser still owns the descriptor validation.
+CUSTOMIZATION_SEASONS = (1, 2, 4, 8, 15)
+CUSTOMIZATION_ALL_SEASONS = 15
 
 
 class GarageError(Exception):
@@ -80,12 +86,14 @@ def _layout_pairs(values, slot_limit=None):
 class GarageState(object):
     """One mutable garage snapshot shared by every account command."""
 
-    def __init__(self, snapshot, vehicles_module=None, tankmen_module=None):
+    def __init__(self, snapshot, vehicles_module=None, tankmen_module=None,
+                 customizations_module=None):
         if not isinstance(snapshot, dict):
             raise GarageError('garage snapshot must be a mapping')
         self._snapshot = copy.deepcopy(snapshot)
         self._vehicles = vehicles_module
         self._tankmen = tankmen_module
+        self._customizations = customizations_module
         self._touched = set()
         self._touched_items = {}
         self.revision = 0
@@ -105,17 +113,24 @@ class GarageState(object):
             self._tankmen = tankmen
         return self._tankmen
 
+    def _customizations_module(self):
+        if self._customizations is None:
+            from items import customizations
+            self._customizations = customizations
+        return self._customizations
+
     def _records(self):
         records = self._snapshot.get('vehicles')
         if isinstance(records, (list, tuple)) and records:
             return list(records)
         return [self._snapshot] if self._snapshot.get('compDescr') else []
 
-    def _record(self, vehicle_inventory_id):
+    def _record(self, vehicle_inventory_id, touch=True):
         wanted = _int(vehicle_inventory_id)
         for record in self._records():
             if _int(record.get('id', 0)) == wanted:
-                self._touched.add(wanted)
+                if touch:
+                    self._touched.add(wanted)
                 return record
         raise GarageError('unknown vehicle inventory id %d' % wanted)
 
@@ -290,41 +305,134 @@ class GarageState(object):
         turret goes through ``installTurret`` with the gun ``Inventory.
         equipTurret`` carries in the third integer of ``CMD_EQUIP``.
         """
-        record = self._record(vehicle_inventory_id)
+        # Build the complete fitting on a detached record.  VehicleDescr can
+        # accept the component and still refuse serialization, and default
+        # ammunition discovery can fail after a gun changes.  Neither failure
+        # may leave a new descriptor paired with stale or empty shells.
+        record = self._record(vehicle_inventory_id, touch=False)
+        staged = copy.deepcopy(record)
         compact_descr = _int(compact_descr)
         gun_compact_descr = _int(gun_compact_descr)
         position_index = _int(position_index)
-        is_turret = self._item_type(compact_descr) == TURRET_ITEM_TYPE
+        item_type = self._item_type(compact_descr)
+        is_turret = item_type == TURRET_ITEM_TYPE
 
-        def mutate(descriptor):
+        vehicles = self._vehicles_module()
+        try:
+            descriptor = vehicles.VehicleDescr(
+                compactDescr=staged['compDescr'])
+            old_layout_key = (
+                _int(descriptor.turret.compactDescr),
+                _int(descriptor.gun.compactDescr))
             if is_turret:
                 descriptor.installTurret(
                     compact_descr, gun_compact_descr, position_index)
             else:
                 descriptor.installComponent(compact_descr, position_index)
+            serialized = descriptor.makeCompactDescr()
+            if not serialized:
+                raise ValueError('the fitted descriptor is empty')
+            # Parse the serialized result once before publishing it.  This is
+            # the same constructor bootstrap and battle entry will use, and it
+            # catches a component combination that only fails on round-trip.
+            verified = vehicles.VehicleDescr(compactDescr=serialized)
+            new_layout_key = (
+                _int(verified.turret.compactDescr),
+                _int(verified.gun.compactDescr))
+            expected_layout_key = (
+                _int(descriptor.turret.compactDescr),
+                _int(descriptor.gun.compactDescr))
+            if is_turret and expected_layout_key[0] != compact_descr:
+                raise ValueError('the selected turret was not installed')
+            if (is_turret and gun_compact_descr and
+                    expected_layout_key[1] != gun_compact_descr):
+                raise ValueError('the selected gun was not installed')
+            if (item_type == GUN_ITEM_TYPE and
+                    expected_layout_key[1] != compact_descr):
+                raise ValueError('the selected gun was not installed')
+            if new_layout_key != expected_layout_key:
+                raise ValueError('the fitted descriptor did not round-trip')
+        except GarageError:
+            raise
+        except Exception as error:
+            raise GarageError('the client refused the fitting: %s' % error)
 
-        self._rebuild_descriptor(record, mutate)
+        staged['compDescr'] = serialized
+        staged['shellsLayoutIdx'] = new_layout_key
+        if new_layout_key != old_layout_key:
+            shells = self._validated_default_ammo(vehicles, verified)
+            staged['shells'] = shells
+            staged.setdefault('inventoryItems', {})[SHELL_ITEM_TYPE] = dict(
+                (shells[index], shells[index + 1])
+                for index in range(0, len(shells), 2))
+        mirror_shells_layout(staged)
+
+        # Everything above is validation-only.  Publish the descriptor,
+        # layout and ammunition together once no native operation can fail.
+        record.clear()
+        record.update(staged)
+        self._touched.add(_int(vehicle_inventory_id))
         self._price(compact_descr)
         if gun_compact_descr:
             self._price(gun_compact_descr)
-        # A gun swap changes which shells fit, so the stale flat pair list and
-        # the shell inventory would no longer agree.  Refill from the new gun.
-        self._refill_default_ammo(record)
+        if new_layout_key != old_layout_key:
+            for index in range(0, len(shells), 2):
+                self._publish_owned(
+                    shells[index], SHELL_ITEM_TYPE, shells[index + 1])
+                self._price(shells[index])
         self.revision += 1
         return record
 
-    def _refill_default_ammo(self, record):
-        vehicles = self._vehicles_module()
+    def _validated_default_ammo(self, vehicles, descriptor):
+        """Return non-empty default ammo belonging to ``descriptor.gun``."""
         try:
-            descriptor = vehicles.VehicleDescr(
-                compactDescr=record['compDescr'])
-            shells = list(vehicles.getDefaultAmmoForGun(descriptor.gun))
-        except Exception:
-            return False
+            shells = [_int(value) for value in
+                      vehicles.getDefaultAmmoForGun(descriptor.gun)]
+        except GarageError:
+            raise
+        except Exception as error:
+            raise GarageError(
+                'compatible ammunition is unavailable: %s' % error)
         if not shells or len(shells) % 2:
-            return False
-        self.equip_shells(_int(record.get('id', 0)), shells)
-        return True
+            raise GarageError(
+                'compatible ammunition must contain descriptor/count pairs')
+
+        compatible = set()
+        for shot in (getattr(descriptor.gun, 'shots', ()) or ()):
+            shell = getattr(shot, 'shell', None)
+            compact_descr = getattr(shell, 'compactDescr', 0)
+            if compact_descr:
+                compatible.add(_int(compact_descr))
+        if not compatible:
+            raise GarageError('the fitted gun has no compatible ammunition')
+
+        total = 0
+        seen = set()
+        for index in range(0, len(shells), 2):
+            compact_descr = shells[index]
+            count = shells[index + 1]
+            if compact_descr <= 0 or count < 0:
+                raise GarageError(
+                    'compatible ammunition has an invalid descriptor or count')
+            if compact_descr in seen:
+                raise GarageError(
+                    'compatible ammunition contains a duplicate shell')
+            if compact_descr not in compatible:
+                raise GarageError(
+                    'default ammunition does not fit the selected gun')
+            seen.add(compact_descr)
+            total += count
+        if total <= 0:
+            raise GarageError('the selected gun has no loaded ammunition')
+
+        maximum = getattr(descriptor.gun, 'maxAmmo', 0)
+        try:
+            maximum = int(maximum or 0)
+        except (TypeError, ValueError):
+            maximum = 0
+        if maximum > 0 and total > maximum:
+            raise GarageError('default ammunition exceeds the gun capacity')
+        return shells
 
     # ---- purchases and settings -----------------------------------------
 
@@ -359,15 +467,14 @@ class GarageState(object):
             raise GarageError('unknown item %d: %s' % (compact_descr, error))
 
     def buy_and_equip_item(self, vehicle_inventory_id, compact_descr,
-                           slot_index=0):
+                           slot_index=0, gun_compact_descr=0):
         """Own one item and mount it on the vehicle in the same request."""
         compact_descr = _int(compact_descr)
         item_type = self._item_type(compact_descr)
-        self.buy_item(compact_descr, 1)
         if item_type == OPTIONAL_DEVICE_ITEM_TYPE:
-            return self.equip_optional_device(
+            record = self.equip_optional_device(
                 vehicle_inventory_id, compact_descr, slot_index)
-        if item_type == EQUIPMENT_ITEM_TYPE:
+        elif item_type == EQUIPMENT_ITEM_TYPE:
             record = self._record(vehicle_inventory_id)
             slots = list(record.get('eqs') or [0] * EQUIPMENT_SLOT_COUNT)
             slots += [0] * (EQUIPMENT_SLOT_COUNT - len(slots))
@@ -375,10 +482,17 @@ class GarageState(object):
             if not 0 <= index < EQUIPMENT_SLOT_COUNT:
                 raise GarageError('a vehicle has three equipment slots')
             slots[index] = compact_descr
-            return self.equip_equipments(vehicle_inventory_id, slots)
-        # Every remaining owned type is a vehicle module.
-        return self.install_component(
-            vehicle_inventory_id, compact_descr, 0, slot_index)
+            record = self.equip_equipments(vehicle_inventory_id, slots)
+        else:
+            # Every remaining owned type is a vehicle module.  A turret buy
+            # carries its selected gun in the sixth wire value.
+            record = self.install_component(
+                vehicle_inventory_id, compact_descr, gun_compact_descr,
+                slot_index)
+        # Mount first so a refused descriptor or ammunition set cannot leave
+        # behind ownership from a failed buy-and-equip request.
+        self.buy_item(compact_descr, 1)
+        return record
 
     def change_vehicle_setting(self, vehicle_inventory_id, setting, is_on):
         """Set or clear one bit of a vehicle's settings mask.
@@ -397,6 +511,143 @@ class GarageState(object):
             current & ~bit)
         self.revision += 1
         return record
+
+    # ---- customization 2.0 ---------------------------------------------
+
+    def apply_outfit(self, vehicle_inventory_id, season, outfit_descr):
+        """Validate and atomically store one #1513 outfit compact descriptor.
+
+        The client already serializes the editor state.  Re-parsing and
+        re-serializing it through ``items.customizations`` is deliberately the
+        only accepted path: the offline mod never splices the binary format.
+        """
+        season = _int(season)
+        if season not in CUSTOMIZATION_SEASONS:
+            raise GarageError('unknown customization season %d' % season)
+        record = self._record(vehicle_inventory_id, touch=False)
+        customizations = self._customizations_module()
+        try:
+            outfit = customizations.parseOutfitDescr(outfit_descr)
+            canonical = outfit.makeCompDescr()
+            # Exercise the parser once more on exactly what will be persisted.
+            customizations.parseOutfitDescr(canonical)
+        except Exception as error:
+            raise GarageError('the client refused the outfit: %s' % error)
+
+        staged = copy.deepcopy(record)
+        outfits = staged.setdefault('outfits', {})
+        # Vehicle.getOutfit prioritizes a styled outfit.  Leaving the previous
+        # ALL-season style beside a newly applied custom season would make the
+        # accepted CMD 119 invisible in both garage and battle.
+        if season != CUSTOMIZATION_ALL_SEASONS:
+            outfits.pop(CUSTOMIZATION_ALL_SEASONS, None)
+        outfits[season] = (canonical, True)
+        record.clear()
+        record.update(staged)
+        self._touched.add(_int(vehicle_inventory_id))
+        self.revision += 1
+        return record
+
+    def apply_style(self, vehicle_inventory_id, style_id):
+        """Store a stock style reference under SeasonType.ALL.
+
+        #1513's style command carries an id rather than an outfit descriptor;
+        ``CustomizationOutfit`` is the stock serializer for that reference.
+        """
+        style_id = _int(style_id)
+        if style_id <= 0:
+            raise GarageError('a style request needs a positive style id')
+        try:
+            styles = self._vehicles_module().g_cache.customization20().styles
+            if style_id not in styles:
+                raise ValueError('unknown style id %d' % style_id)
+            customizations = self._customizations_module()
+            outfit = customizations.CustomizationOutfit(styleId=style_id)
+            canonical = outfit.makeCompDescr()
+            customizations.parseOutfitDescr(canonical)
+        except Exception as error:
+            raise GarageError('the client refused the style: %s' % error)
+
+        record = self._record(vehicle_inventory_id, touch=False)
+        staged = copy.deepcopy(record)
+        # Vehicle._parseStyledOutfits expands an ALL-season style into the
+        # arena-specific outfits supplied by the style definition.
+        staged['outfits'] = {
+            CUSTOMIZATION_ALL_SEASONS: (canonical, True)}
+        record.clear()
+        record.update(staged)
+        self._touched.add(_int(vehicle_inventory_id))
+        self.revision += 1
+        return record
+
+    def buy_customizations(self, vehicle_inventory_id, purchases):
+        """Own ``(intCompactDescr, count)`` pairs for one vehicle type."""
+        record = self._record(vehicle_inventory_id)
+        pairs = _layout_pairs(purchases)
+        vehicle_type = _int(record.get('vehicleTypeCompactDescr', 0))
+        if vehicle_type <= 0:
+            raise GarageError('the vehicle has no type compact descriptor')
+        parsed = []
+        for compact_descr, count in pairs:
+            if count <= 0:
+                raise GarageError('a customization purchase needs a count')
+            custom_type, item_id = self._customization_identity(compact_descr)
+            parsed.append((custom_type, item_id, count))
+
+        owned = self._snapshot.setdefault('customizationItems', {})
+        staged = copy.deepcopy(owned)
+        for custom_type, item_id, count in parsed:
+            buckets = staged.setdefault(custom_type, {}).setdefault(
+                item_id, {})
+            buckets[vehicle_type] = int(buckets.get(vehicle_type, 0)) + count
+        self._snapshot['customizationItems'] = staged
+        self.revision += 1
+        return record
+
+    def sell_customization(self, vehicle_inventory_id, compact_descr, count):
+        """Remove a vehicle-bound customization item using CMD 117 fields."""
+        record = self._record(vehicle_inventory_id)
+        count = _int(count)
+        if count <= 0:
+            raise GarageError('a customization sale needs a count')
+        custom_type, item_id = self._customization_identity(compact_descr)
+        vehicle_type = _int(record.get('vehicleTypeCompactDescr', 0))
+        owned = self._snapshot.setdefault('customizationItems', {})
+        staged = copy.deepcopy(owned)
+        buckets = staged.get(custom_type, {}).get(item_id, {})
+        current = int(buckets.get(vehicle_type, 0))
+        if current < count:
+            raise GarageError('not enough vehicle-bound customizations to sell')
+        remaining = current - count
+        if remaining:
+            buckets[vehicle_type] = remaining
+        else:
+            buckets.pop(vehicle_type, None)
+        self._snapshot['customizationItems'] = staged
+        self.revision += 1
+        return record
+
+    def _customization_identity(self, compact_descr):
+        compact_descr = _int(compact_descr)
+        if compact_descr <= 0:
+            raise GarageError('a customization needs a compact descriptor')
+        try:
+            parser = getattr(
+                self._customizations_module(), 'parseIntCompactDescr', None)
+            if parser is None:
+                from items import parseIntCompactDescr as parser
+            # items.parseIntCompactDescr returns
+            # (GUI_ITEM_TYPE.CUSTOMIZATION, customizationType, itemID).
+            value = parser(compact_descr)
+            custom_type, item_id = value[1], value[2]
+            custom_type = int(custom_type)
+            item_id = int(item_id)
+        except Exception as error:
+            raise GarageError('unknown customization %d: %s' % (
+                compact_descr, error))
+        if custom_type <= 0 or item_id <= 0:
+            raise GarageError('unknown customization %d' % compact_descr)
+        return custom_type, item_id
 
     # ---- crew -----------------------------------------------------------
 

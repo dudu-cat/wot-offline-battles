@@ -677,6 +677,28 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertEqual([(6, {'wins': 0, 'losses': 0})],
                          avatar.account_stats)
 
+    def test_battle_integer_settings_are_dispatched_before_response(self):
+        module = _avatar_bridge_module()
+        avatar = _BridgeAvatar()
+        dispatched = []
+
+        def dispatch(command, values):
+            dispatched.append((command, values))
+            return -1, 'SETTINGS_WRITE_FAILED'
+
+        bridge = module.AvatarServerBridge(
+            avatar, _BridgeBinding(),
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            _Sender(), account_commands=('add-settings',),
+            on_account_int_command=dispatch)
+
+        bridge.doCmdIntArr(17, 'add-settings', [54, 3])
+
+        self.assertEqual([('add-settings', [54, 3])], dispatched)
+        self.assertEqual(
+            [(17, -1, 'SETTINGS_WRITE_FAILED')], avatar.responses)
+
     def test_handled_vehicle_setting_is_not_echoed_to_avatar(self):
         module = _avatar_bridge_module()
         avatar = _BridgeAvatar()

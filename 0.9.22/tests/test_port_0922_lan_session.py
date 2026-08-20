@@ -49,6 +49,7 @@ class _Client(object):
         self.requests = []
         self.selections = []
         self.descriptor_bundles = []
+        self.receipt_acks = []
 
     def start(self):
         self.start_calls += 1
@@ -83,6 +84,10 @@ class _Client(object):
             'failures': list(failures or ()),
             'complete': complete,
         })
+        return True
+
+    def acknowledge_battle_receipt(self, receipt_id):
+        self.receipt_acks.append(receipt_id)
         return True
 
 
@@ -235,6 +240,181 @@ class LANSessionTests(unittest.TestCase):
         if 'players' in message:
             self.client.roster = list(message['players'])
         self.client.on_event(kind, message)
+
+    def test_postbattle_request_retries_after_failure_then_completes_once(self):
+        class Store(object):
+            def pending_arenas(self):
+                return [123]
+            def service_message_data(self, arena):
+                return {'arenaUniqueID': arena}
+            def progress(self):
+                return {'battles': 0}
+
+        callbacks = [False, True]
+        service = types.SimpleNamespace(requestResults=mock.Mock(
+            side_effect=lambda context, callback: callback(callbacks.pop(0))))
+        personality = types.ModuleType('gui.shared.personality')
+        personality.ServicesLocator = types.SimpleNamespace(
+            battleResults=service)
+        context_module = types.ModuleType('gui.battle_results.context')
+        context_module.RequestResultsContext = mock.Mock(
+            side_effect=lambda *args: args)
+        session = self.module.LANSession(
+            {}, postbattle_store=Store(), lobby_ready=lambda: True)
+        session._publish_battle_service_message = mock.Mock(return_value=True)
+        with mock.patch.dict(sys.modules, {
+                'gui.shared.personality': personality,
+                'gui.battle_results.context': context_module}):
+            self.assertTrue(session._publish_postbattle_results())
+            self.assertEqual(set(), session._requested_results)
+            self.assertTrue(session._publish_postbattle_results())
+
+        self.assertEqual(2, service.requestResults.call_count)
+        self.assertEqual({123}, session._completed_results)
+        session._publish_battle_service_message.assert_called_once_with(
+            123, {'arenaUniqueID': 123})
+
+    def test_new_session_rebuilds_only_latest_archived_result_entry(self):
+        class Store(object):
+            def pending_arenas(self):
+                return []
+            def latest_archived_arena(self):
+                return 456
+            def service_message_data(self, arena):
+                return {'arenaUniqueID': arena}
+            def progress(self):
+                return {'battles': 3}
+
+        requested = []
+        service = types.SimpleNamespace(requestResults=mock.Mock(
+            side_effect=lambda context, callback: (
+                requested.append(context), callback(True))))
+        personality = types.ModuleType('gui.shared.personality')
+        personality.ServicesLocator = types.SimpleNamespace(
+            battleResults=service)
+        context_module = types.ModuleType('gui.battle_results.context')
+        context_module.RequestResultsContext = mock.Mock(
+            side_effect=lambda *args: args)
+        session = self.module.LANSession(
+            {}, postbattle_store=Store(), lobby_ready=lambda: True)
+        session._publish_battle_service_message = mock.Mock(return_value=True)
+        with mock.patch.dict(sys.modules, {
+                'gui.shared.personality': personality,
+                'gui.battle_results.context': context_module}):
+            self.assertTrue(session._publish_postbattle_results())
+            self.assertFalse(session._publish_postbattle_results())
+
+        self.assertEqual([(456, False, False, True)], requested)
+        session._publish_battle_service_message.assert_called_once_with(
+            456, {'arenaUniqueID': 456})
+
+    def test_postbattle_results_drain_one_request_at_a_time(self):
+        class Store(object):
+            def pending_arenas(self):
+                return [123, 124]
+            def latest_archived_arena(self):
+                return 456
+            def service_message_data(self, arena):
+                return {'arenaUniqueID': arena}
+            def progress(self):
+                return {'battles': 3}
+
+        active = [False]
+        requested = []
+
+        def request_results(context, callback):
+            self.assertFalse(active[0])
+            active[0] = True
+            requested.append(context[0])
+            # The exact cache clears its waiting gate before this callback.
+            active[0] = False
+            callback(True)
+
+        service = types.SimpleNamespace(
+            requestResults=mock.Mock(side_effect=request_results))
+        personality = types.ModuleType('gui.shared.personality')
+        personality.ServicesLocator = types.SimpleNamespace(
+            battleResults=service)
+        context_module = types.ModuleType('gui.battle_results.context')
+        context_module.RequestResultsContext = mock.Mock(
+            side_effect=lambda *args: args)
+        session = self.module.LANSession(
+            {}, postbattle_store=Store(), lobby_ready=lambda: True)
+        session._publish_battle_service_message = mock.Mock(return_value=True)
+        with mock.patch.dict(sys.modules, {
+                'gui.shared.personality': personality,
+                'gui.battle_results.context': context_module}):
+            self.assertTrue(session._publish_postbattle_results())
+
+        self.assertEqual([123, 124, 456], requested)
+        self.assertEqual({123, 124, 456}, session._completed_results)
+        self.assertTrue(session._archived_result_replayed)
+
+    def test_clickable_battle_result_uses_native_service_channel_wrapper(self):
+        received = []
+
+        class Entry(object):
+            def index(self):
+                return 17
+
+        chat_shared = types.ModuleType('chat_shared')
+        chat_shared.SYS_MESSAGE_TYPE = types.SimpleNamespace(
+            battleResults=Entry())
+        chat_shared.SYS_MESSAGE_IMPORTANCE = types.SimpleNamespace(
+            normal=Entry())
+        messenger_entry = types.ModuleType('messenger.MessengerEntry')
+        messenger_entry.g_instance = types.SimpleNamespace(
+            protos=types.SimpleNamespace(BW=types.SimpleNamespace(
+                serviceChannel=types.SimpleNamespace(
+                    onReceiveSysMessage=received.append))))
+        messenger = types.ModuleType('messenger')
+        messenger.MessengerEntry = messenger_entry
+        with mock.patch.dict(sys.modules, {
+                'chat_shared': chat_shared, 'messenger': messenger,
+                'messenger.MessengerEntry': messenger_entry}):
+            self.assertTrue(self.session._publish_battle_service_message(
+                123, {'arenaUniqueID': 123, 'credits': 7}))
+            self.assertFalse(self.session._publish_battle_service_message(
+                123, {'arenaUniqueID': 123, 'credits': 7}))
+
+        self.assertEqual(1, len(received))
+        action = received[0]
+        self.assertEqual(123, action['data']['messageID'])
+        self.assertEqual(17, action['data']['type'])
+        self.assertEqual(123, action['data']['data']['arenaUniqueID'])
+
+    def test_receipt_pushes_account_progress_once_and_duplicate_does_not(self):
+        class Store(object):
+            account_key = 'account'
+            def __init__(self):
+                self.battles = 0
+            def progress(self):
+                return {'battles': self.battles}
+            def accept(self, unused_message):
+                if self.battles:
+                    return False
+                self.battles = 1
+                return True
+            def pending_arenas(self):
+                return []
+
+        store = Store()
+        publisher = mock.Mock(return_value=True)
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.player = lambda: types.SimpleNamespace(
+            fakeServer=types.SimpleNamespace(
+                publish_postbattle_progress=publisher))
+        session = self.module.LANSession(
+            {}, postbattle_store=store, lobby_ready=lambda: True,
+            status_notifier=lambda unused: None)
+        session.client = self.client
+        session._publish_postbattle_results = mock.Mock(return_value=False)
+        with mock.patch.dict(sys.modules, {'BigWorld': bigworld}):
+            session._on_event('battle_receipt', {'receipt_id': 'r1'})
+            session._on_event('battle_receipt', {'receipt_id': 'r1'})
+
+        publisher.assert_called_once_with()
+        self.assertEqual(['r1', 'r1'], self.client.receipt_acks)
 
     def test_donation_runtime_reads_the_exact_nations_and_vehicle_list(self):
         nations_module = types.ModuleType('nations')

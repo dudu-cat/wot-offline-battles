@@ -33,6 +33,17 @@ class _Strict1513Component(object):
 
 class VehiclePhysicsDescriptorTests(unittest.TestCase):
 
+    @staticmethod
+    def _native_descriptor(power_hp, native_power):
+        engine_name = 'selected-engine'
+        return types.SimpleNamespace(
+            physics={'enginePower': power_hp * 735.5},
+            engine=_Strict1513Component(name=engine_name),
+            type=_Strict1513Component(xphysics={
+                'detailed': {'engines': {
+                    engine_name: {'smplEnginePower': native_power}}}}),
+            chassis=_Strict1513Component(rotationSpeed=0.75))
+
     def test_rotation_speed_reads_native_1513_chassis_attribute(self):
         descriptor = types.SimpleNamespace(
             physics={},
@@ -52,6 +63,92 @@ class VehiclePhysicsDescriptorTests(unittest.TestCase):
         self.assertEqual(
             vehicle_physics.COHESION * vehicle_physics.GRAVITY,
             params['brakeDecel'])
+
+    def test_selected_1513_xphysics_engine_power_replaces_generic_scaling(self):
+        # Exact pinned-client values: Type 62's 430 hp descriptor engine is
+        # overridden by physics/detailed/engines/.../smplEnginePower.
+        descriptor = self._native_descriptor(430.0, 454.6309)
+
+        params = vehicle_physics.derive_params(descriptor)
+        effective_power = (params['powerW'] * vehicle_physics.POWER_FACTOR *
+                           params['nativePowerRatio'])
+
+        self.assertAlmostEqual(1.15, params['nativePowerRatio'], places=6)
+        self.assertAlmostEqual(454630.9, effective_power, places=3)
+
+    def test_missing_detailed_engine_power_keeps_generic_fallback(self):
+        descriptor = types.SimpleNamespace(
+            physics={'enginePower': 430.0 * 735.5},
+            chassis=_Strict1513Component(rotationSpeed=0.75))
+
+        params = vehicle_physics.derive_params(descriptor)
+
+        self.assertEqual(1.0, params['nativePowerRatio'])
+
+    def test_server_projection_keeps_donated_native_power_ratio(self):
+        descriptor = types.SimpleNamespace(
+            physics={
+                'enginePower': 430.0 * 735.5,
+                'nativePowerRatio': 1.15,
+            },
+            chassis=_Strict1513Component(rotationSpeed=0.75))
+
+        params = vehicle_physics.derive_params(descriptor)
+
+        self.assertEqual(1.15, params['nativePowerRatio'])
+
+
+class VehiclePhysicsPinnedClimbTests(unittest.TestCase):
+
+    PINNED_VEHICLES = (
+        # name, mass kg, rated hp, smplEnginePower, speed km/h, firm resistance
+        ('Type 62', 21000.0, 430.0, 454.6309, 60.0, 0.5),
+        ('T-34-85', 32000.0, 600.0, 634.3687, 54.0, 1.1),
+        ('Maus', 188980.0, 1750.0, 1850.242, 20.0, 1.1),
+        ('ISU-152', 49300.0, 700.0, 740.0968, 43.0, 1.1),
+    )
+
+    @staticmethod
+    def _params(row, native_ratio=True):
+        unused_name, mass, power_hp, native_power, speed_kmh, resistance = row
+        params = dict(vehicle_physics._DEFAULTS)
+        params.update({
+            'mass': mass,
+            'powerW': power_hp * 735.5,
+            'speedFwd': speed_kmh / 3.6,
+            'terrainResist': (resistance, resistance, resistance),
+            'nativePowerRatio': (native_power /
+                                 (power_hp * 735.5 * 0.00125)
+                                 if native_ratio else 1.0),
+        })
+        return params
+
+    @staticmethod
+    def _climb_speed(params, degrees, seconds=30):
+        speed = 0.0
+        for unused in range(60 * seconds):
+            speed = vehicle_physics.longitudinal_step(
+                params, speed, 1.0, False, -math.radians(degrees),
+                1.0 / 60.0)
+        return speed * 3.6
+
+    def test_native_detailed_power_improves_every_representative_climb(self):
+        for row in self.PINNED_VEHICLES:
+            with self.subTest(vehicle=row[0]):
+                copied = self._climb_speed(self._params(row), 15.0)
+                generic = self._climb_speed(
+                    self._params(row, native_ratio=False), 15.0)
+                self.assertGreater(copied, generic * 1.10)
+
+    def test_pinned_maus_can_launch_below_its_25_degree_chassis_limit(self):
+        maus = self.PINNED_VEHICLES[2]
+
+        copied = self._climb_speed(self._params(maus), 24.0)
+        generic = self._climb_speed(
+            self._params(maus, native_ratio=False), 24.0)
+
+        self.assertGreater(copied, 3.0)
+        self.assertLess(generic, 1.0)
 
 
 class VehiclePhysicsCoastTests(unittest.TestCase):

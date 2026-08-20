@@ -257,6 +257,7 @@ _DEFAULTS = {
 	'brakeDecel': COHESION * GRAVITY,
 	'trackCenter': 1.5,
 	'minPlaneNormalY': math.cos(math.radians(25.0)),
+	'nativePowerRatio': 1.0,
 }
 
 
@@ -273,6 +274,40 @@ def _factor(factors, name):
 		return max(0.0, float(factors[name]))
 	except (KeyError, TypeError, ValueError):
 		return 1.0
+
+
+def _native_power_ratio(td, power_w):
+	'''Read #1513's selected detailed-physics engine override.
+
+	``smplEnginePower`` is stored in the native tonnes-based configuration.
+	The generic descriptor conversion would be ``enginePower * 0.00125``;
+	the selected detailed entry replaces that value before the native physics
+	is configured.  Return the exact replacement/base ratio so the copied SI
+	integrator keeps the same per-engine override while retaining POWER_FACTOR
+	as the live-tuning base.
+	'''
+	try:
+		projected = getattr(td, 'physics', {}).get('nativePowerRatio')
+		projected = float(projected)
+		if (projected > 0.0 and not math.isnan(projected) and
+				not math.isinf(projected)):
+			return projected
+	except (AttributeError, TypeError, ValueError):
+		pass
+	try:
+		engine_name = getattr(getattr(td, 'engine'), 'name')
+		xphysics = getattr(getattr(td, 'type'), 'xphysics')
+		detailed = xphysics['detailed']
+		engine_cfg = detailed['engines'][engine_name]
+		native_power = float(engine_cfg['smplEnginePower'])
+		base_power = float(power_w) * 0.001 * GRAVITY_FACTOR
+		if (native_power > 0.0 and base_power > 0.0 and
+				not math.isnan(native_power) and
+				not math.isinf(native_power)):
+			return native_power / base_power
+	except (AttributeError, KeyError, TypeError, ValueError):
+		pass
+	return 1.0
 
 
 def derive_params(td, factors=None):
@@ -319,6 +354,7 @@ def derive_params(td, factors=None):
 			p['minPlaneNormalY'] = float(tdp['minPlaneNormalY'])
 	except Exception:
 		pass
+	p['nativePowerRatio'] = _native_power_ratio(td, p['powerW'])
 	try:
 		ch = getattr(td, 'chassis', None)
 		if ch is not None:
@@ -369,7 +405,7 @@ def engine_force(p, v, throttle, slope_pitch=0.0):
 	climb 40-50 deg walls the way a cohesion(1.3) cap wrongly allowed.'''
 	if throttle == 0:
 		return 0.0
-	pw = p['powerW'] * POWER_FACTOR
+	pw = p['powerW'] * POWER_FACTOR * p.get('nativePowerRatio', 1.0)
 	if throttle < 0:
 		pw *= BKWD_POWER_FRACTION
 	f = pw / max(abs(v), ENGINE_MIN_V)

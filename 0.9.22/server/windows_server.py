@@ -13,6 +13,8 @@ import traceback
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 28782
 SERVER_MAX_PLAYERS = 30
+SERVER_TEAM_SIZE = 15
+SERVER_TEAM_SIZE_ENV = "WOT_0922_TEAM_SIZE"
 WINDOWS_FIREWALL_RULE_PREFIX = "WoT 0.9.22 LAN Server"
 # Get-NetFirewallRule can take many seconds on a busy machine.
 FIREWALL_QUERY_TIMEOUT_SECONDS = 60.0
@@ -155,6 +157,21 @@ def _load_server():
     return (DEFAULT_MAP, run_server)
 
 
+def _team_size_from_environment(environment=None):
+    environment = os.environ if environment is None else environment
+    raw_value = environment.get(SERVER_TEAM_SIZE_ENV, str(SERVER_TEAM_SIZE))
+    if isinstance(raw_value, bool):
+        raise ValueError("%s must be 1-15" % SERVER_TEAM_SIZE_ENV)
+    try:
+        team_size = int(raw_value)
+    except (TypeError, ValueError):
+        raise ValueError("%s must be a number from 1 to 15" %
+                         SERVER_TEAM_SIZE_ENV)
+    if not 1 <= team_size <= 15:
+        raise ValueError("%s must be 1-15" % SERVER_TEAM_SIZE_ENV)
+    return team_size
+
+
 def main():
     print("WoT 0.9.22 Offline LAN Server")
     print("Listening on all network interfaces, port %d." % SERVER_PORT)
@@ -162,6 +179,7 @@ def main():
     print("Press Ctrl+C to stop the server.\n")
     try:
         default_map, run_server = _load_server()
+        team_size = _team_size_from_environment()
         _ensure_windows_firewall_rule(SERVER_PORT)
         run_server(
             SERVER_HOST,
@@ -169,6 +187,7 @@ def main():
             default_map,
             SERVER_MAX_PLAYERS,
             os.environ.get("WOT_LAN_AUTHORITY", "client"),
+            team_size,
         )
     except Exception:
         traceback.print_exc()

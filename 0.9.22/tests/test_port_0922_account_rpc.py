@@ -8,6 +8,7 @@ from pathlib import Path
 import tempfile
 import types
 import unittest
+from unittest import mock
 import zlib
 
 
@@ -109,6 +110,8 @@ class _Player(object):
         self.responses = []
         self.ext_responses = []
         self.streams = []
+        self.updates = []
+        self.dossier_resyncs = 0
 
     def onCmdResponse(self, request_id, result_id, error):
         self.responses.append((request_id, result_id, error))
@@ -118,6 +121,12 @@ class _Player(object):
 
     def onCmdResponseExt(self, request_id, result_id, error, ext):
         self.ext_responses.append((request_id, result_id, error, ext))
+
+    def update(self, payload):
+        self.updates.append(payload)
+
+    def resyncDossiers(self):
+        self.dossier_resyncs += 1
 
 
 class _ItemsPrices(dict):
@@ -145,6 +154,41 @@ class AccountRpcTests(unittest.TestCase):
         self.assertEqual([], self.player.responses)
         self._run()
         self.assertEqual([(31, commands.RES_SUCCESS, '')], self.player.responses)
+
+    def test_postbattle_progress_pushes_resources_and_vehicle_xp_now(self):
+        class Store(object):
+            def progress(self):
+                return {
+                    'credits': 700, 'freeXP': 30,
+                    'vehicles': {'ussr:R11_MS-1': {'xp': 600}},
+                }
+
+        vehicles_module = types.ModuleType('items.vehicles')
+        vehicles_module.VehicleDescr = lambda typeName=None: (
+            types.SimpleNamespace(type=types.SimpleNamespace(id=(0, 1))))
+        vehicles_module.makeIntCompactDescrByID = (
+            lambda unused_type, unused_nation, unused_vehicle: 50001)
+        items_module = types.ModuleType('items')
+        items_module.vehicles = vehicles_module
+        server = FakeServer(
+            lambda: self.player,
+            lambda delay, fn: self.pending.append((delay, fn)), {
+                'selected_vehicle': {
+                    'vehicleTypeCompactDescrs': [50001]},
+                'postbattle_store': Store(),
+            })
+        with mock.patch.dict(sys.modules, {
+                'items': items_module, 'items.vehicles': vehicles_module}):
+            self.assertTrue(server.publish_postbattle_progress())
+            self._run()
+
+        update = pickle.loads(self.player.updates[-1])
+        self.assertEqual(account_data.OFFLINE_CREDITS + 700,
+                         update['stats']['credits'])
+        self.assertEqual(account_data.OFFLINE_FREE_XP + 30,
+                         update['stats']['freeXP'])
+        self.assertEqual(600, update['stats']['vehTypeXP'][50001])
+        self.assertEqual(1, self.player.dossier_resyncs)
 
     def test_response_is_dropped_after_account_is_retired(self):
         active = [self.player]
@@ -582,7 +626,7 @@ class AccountRpcTests(unittest.TestCase):
             ((86400, ''), (604800, '')), data['stats']['playLimits'])
         self.assertEqual({}, data['inventory'][9])
         self.assertEqual({}, data['inventory'][11])
-        self.assertEqual({}, data['inventory'][12])
+        self.assertEqual({1: {}, 2: {}, 3: {}}, data['inventory'][12])
 
     def test_account_artefact_catalogue_reaches_devices_and_equipment(self):
         garage = copy.deepcopy(SELECTED_VEHICLE)
@@ -758,7 +802,10 @@ class AccountRpcTests(unittest.TestCase):
         validator = CONTRACT['accountValidator']
 
         for item_type in validator['emptyItemTypeIndicesWithoutSelectedVehicle']:
-            self.assertEqual({}, inventory[item_type], item_type)
+            if item_type == 12:
+                self.assertEqual({1: {}, 2: {}, 3: {}}, inventory[item_type])
+            else:
+                self.assertEqual({}, inventory[item_type], item_type)
         self.assertIsInstance(inventory[1]['compDescr'], Mapping)
         self.assertIsInstance(inventory[8]['compDescr'], Mapping)
         self.assertIsInstance(value['stats']['eliteVehicles'], set)
@@ -768,7 +815,11 @@ class AccountRpcTests(unittest.TestCase):
         selected_inventory = account_data.sync_data(
             selected_vehicle=SELECTED_VEHICLE)['inventory']
         for item_type in validator['emptyItemTypeIndicesWithSelectedVehicle']:
-            self.assertEqual({}, selected_inventory[item_type], item_type)
+            if item_type == 12:
+                self.assertEqual(
+                    {1: {}, 2: {}, 3: {}}, selected_inventory[item_type])
+            else:
+                self.assertEqual({}, selected_inventory[item_type], item_type)
 
         bootstrap = (
             CLIENT_SCRIPTS / 'gui' / 'mods' / 'offline_lan_0922' /
@@ -831,7 +882,7 @@ class AccountRpcTests(unittest.TestCase):
         for change in value[1]:
             self.assertEqual(
                 CONTRACT['dossiers']['changeTupleArity'], len(change))
-        self.assertEqual((5, []), value)
+        self.assertEqual((1, []), value)
 
     def test_old_chat_mailbox_does_not_echo_command_as_chat_action(self):
         events = []

@@ -42,6 +42,7 @@ STATE_PATH = os.path.join(
 
 _VEHICLE_INT_KEYS = ('eqs', 'eqsLayout', 'shells', 'shellsLayoutIdx')
 _ARTEFACT_ITEM_TYPES = (9, 10, 11)
+_CUSTOMIZATION_SEASONS = (1, 2, 4, 8, 15)
 
 
 def _log(message):
@@ -127,6 +128,19 @@ class GarageStore(object):
             compact_descr = _encode_bytes(record.get('compDescr'))
             if compact_descr is not None:
                 stored['compDescr'] = compact_descr
+            outfits = {}
+            if isinstance(record.get('outfits'), dict):
+                for raw_season, outfit_data in record['outfits'].items():
+                    try:
+                        season = int(raw_season)
+                        descriptor, enabled = outfit_data
+                    except (TypeError, ValueError):
+                        continue
+                    encoded = _encode_bytes(descriptor)
+                    if season in _CUSTOMIZATION_SEASONS and encoded is not None:
+                        outfits[str(season)] = [encoded, bool(enabled)]
+            if outfits:
+                stored['outfits'] = outfits
             for name in _VEHICLE_INT_KEYS:
                 value = _int_list(record.get(name))
                 if value is not None:
@@ -221,6 +235,22 @@ class GarageStore(object):
         if decoded:
             record['compDescr'] = decoded
             changed = True
+        outfits = saved.get('outfits')
+        if isinstance(outfits, dict):
+            restored_outfits = {}
+            for raw_season, outfit_data in outfits.items():
+                try:
+                    season = int(raw_season)
+                    encoded, enabled = outfit_data
+                except (TypeError, ValueError):
+                    continue
+                descriptor = _decode_bytes(encoded)
+                if (season in _CUSTOMIZATION_SEASONS and descriptor is not None
+                        and isinstance(enabled, bool)):
+                    restored_outfits[season] = (descriptor, enabled)
+            if restored_outfits:
+                record['outfits'] = restored_outfits
+                changed = True
         for name in _VEHICLE_INT_KEYS:
             value = _int_list(saved.get(name))
             if value is not None:

@@ -113,6 +113,10 @@ def _release_config():
         'physics_tuning': {},
         'he_tuning': {},
         'perfect_accuracy': False,
+        'authority_worker_probe': {
+            'enabled': False,
+            'stageSeconds': 15.0,
+        },
     }
 
 
@@ -157,6 +161,9 @@ def _write_client_overlay(dist_root, package_path, checksum_path, digest,
         occluder_source, os.path.join(config_root, 'occluders'))
     shutil.copy2(os.path.join(os.path.dirname(__file__), 'INSTALL.txt'),
                  overlay_root)
+    shutil.copy2(
+        os.path.join(os.path.dirname(__file__), 'START_OFFLINE_0922.bat'),
+        overlay_root)
     _copy_legal_files(overlay_root)
     zip_path = os.path.join(
         dist_root,

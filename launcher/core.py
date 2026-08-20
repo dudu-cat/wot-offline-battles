@@ -26,6 +26,9 @@ MODE_JOIN = "join"
 MODES = (MODE_SINGLE, MODE_HOST, MODE_JOIN)
 
 DEFAULT_SERVER_PORT = 28782
+DEFAULT_TEAM_SIZE = 15
+MIN_TEAM_SIZE = 1
+MAX_TEAM_SIZE = 15
 LOCAL_HOST = "127.0.0.1"
 LISTEN_HOST = "0.0.0.0"
 GAME_EXECUTABLE = "WorldOfTanks.exe"
@@ -58,6 +61,7 @@ _NAVGRAPH_RELATIVE_DIR = os.path.join(
     "navgraphs")
 
 SERVER_DATA_ENV_0922 = "WOT_0922_SERVER_DATA"
+SERVER_TEAM_SIZE_ENV_0922 = "WOT_0922_TEAM_SIZE"
 _SERVER_DATA_RELATIVE_DIR_0922 = os.path.join(
     "mods", "configs", "offline_lan_0922")
 
@@ -179,7 +183,7 @@ def inspect_game_root(game_root):
     }
 
 
-def plan_session(status, mode, join_text=""):
+def plan_session(status, mode, join_text="", team_size=DEFAULT_TEAM_SIZE):
     """Turn the window fields into one battle session, or explain the problem."""
     if not status.get("has_executable"):
         raise LauncherError(
@@ -190,12 +194,16 @@ def plan_session(status, mode, join_text=""):
     if mode not in MODES:
         raise LauncherError("Select single player, host, or join.")
     host, tcp_port = endpoint_for_mode(mode, join_text)
+    effective_team_size = DEFAULT_TEAM_SIZE
+    if port_version == PORT_0_9_22 and mode != MODE_JOIN:
+        effective_team_size = parse_team_size(team_size)
     return {
         "client": port_version,
         "mode": mode,
         "host": host,
         "tcp_port": tcp_port,
         "needs_server": server_required(port_version, mode),
+        "team_size": effective_team_size,
     }
 
 
@@ -218,6 +226,21 @@ def parse_endpoint(text, default_port=DEFAULT_SERVER_PORT):
     if port < 1 or port > 65535:
         raise LauncherError("The server port must be 1-65535.")
     return (host, port)
+
+
+def parse_team_size(value):
+    """Validate the total number of tanks on each team, including players."""
+    if isinstance(value, bool):
+        raise LauncherError("Tanks per team must be a whole number from 1 to 15.")
+    try:
+        team_size = int(value)
+    except (TypeError, ValueError):
+        raise LauncherError("Tanks per team must be a number from 1 to 15.")
+    if isinstance(value, float) and value != team_size:
+        raise LauncherError("Tanks per team must be a whole number from 1 to 15.")
+    if team_size < MIN_TEAM_SIZE or team_size > MAX_TEAM_SIZE:
+        raise LauncherError("Tanks per team must be 1-15.")
+    return team_size
 
 
 def endpoint_for_mode(mode, join_text="", default_port=DEFAULT_SERVER_PORT):
@@ -305,6 +328,14 @@ _USER_DIRS = {
     PORT_0_8_2: "offhangar_user",
     PORT_0_9_22: "mods/configs/offline_lan_0922",
 }
+
+_MUTABLE_STATE_0_9_22 = (
+    "config.json",
+    "server_endpoint.json",
+    "account_state.json",
+    "garage_state.json",
+    "postbattle_state.json",
+)
 
 # Directories the launcher replaces as one unit, the files of its own package
 # it removes from a shared directory, and the members it writes only when they
@@ -706,6 +737,196 @@ def install_client_mod(game_root, port_version, base_dir=None, force=False):
             shutil.rmtree(transaction_root, ignore_errors=True)
 
 
+def _valid_0_9_22_config(path):
+    """Match the startup-fatal part of the client config contract."""
+    try:
+        with open(path, "rb") as stream:
+            value = json.load(stream)
+        if not isinstance(value, dict):
+            return False
+        for name in ("startupTimeoutSeconds", "prebattleCountdownSeconds",
+                     "battleDurationSeconds"):
+            if name in value:
+                float(value[name])
+        if "max_health" in value:
+            int(value["max_health"])
+        if "enabled" in value and not isinstance(value["enabled"], bool):
+            return False
+        for name in ("vehicle", "name"):
+            if name in value and (not isinstance(value[name], str) or
+                                  not value[name]):
+                return False
+        for name in ("physics_tuning", "he_tuning"):
+            if name in value and not isinstance(value[name], dict):
+                return False
+        if ("perfect_accuracy" in value and
+                not isinstance(value["perfect_accuracy"], bool)):
+            return False
+        if "authority_worker_probe" in value:
+            probe = value["authority_worker_probe"]
+            if (not isinstance(probe, dict) or
+                    not isinstance(probe.get("enabled"), bool)):
+                return False
+            seconds = float(probe.get("stageSeconds"))
+            if (seconds != seconds or seconds in (float("inf"),
+                                                  float("-inf")) or
+                    seconds < 15.0 or seconds > 60.0):
+                return False
+    except (IOError, OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _quarantine_file(path):
+    candidate = path + ".invalid"
+    suffix = 1
+    while os.path.exists(candidate):
+        candidate = path + ".invalid.%d" % suffix
+        suffix += 1
+    try:
+        os.replace(path, candidate)
+    except (IOError, OSError) as error:
+        raise LauncherError(
+            "The invalid offline configuration could not be quarantined: %s" %
+            error)
+    return candidate
+
+
+def _require_0_9_22_maintenance_target(game_root, is_running=None):
+    status = inspect_game_root(game_root)
+    if not status["has_executable"]:
+        raise LauncherError(
+            "Select the folder that contains %s." % GAME_EXECUTABLE)
+    if status["client"] != PORT_0_9_22:
+        raise LauncherError(
+            "Startup repair and saved-data reset require the supported "
+            "0.9.22 client.")
+    is_running = game_is_running if is_running is None else is_running
+    if is_running():
+        raise LauncherError(
+            "Close World of Tanks before repairing or resetting offline data.")
+    return status
+
+
+def ensure_0_9_22_preferences_isolation(game_root):
+    """Redirect the exact 0.9.22 client to its launcher-owned profile."""
+    try:
+        from . import preferences_overlay
+    except ImportError:
+        import preferences_overlay
+
+    return preferences_overlay.ensure_preferences_overlay(game_root)
+
+
+def _isolated_0_9_22_preferences_path(environment=None):
+    try:
+        from . import preferences_overlay
+    except ImportError:
+        import preferences_overlay
+
+    return preferences_overlay.profile_path(environment)
+
+
+def repair_0_9_22_startup(game_root, base_dir=None, is_running=None):
+    """Refresh package-owned files and preserve every usable saved value."""
+    _require_0_9_22_maintenance_target(game_root, is_running)
+    config_path = _relative_path(
+        game_root, "mods/configs/offline_lan_0922/config.json")
+    quarantined = None
+    if os.path.isfile(config_path) and not _valid_0_9_22_config(config_path):
+        quarantined = _quarantine_file(config_path)
+    try:
+        actions = install_client_mod(
+            game_root, PORT_0_9_22, base_dir, force=True)
+        actions.append(ensure_0_9_22_preferences_isolation(game_root))
+    except Exception:
+        if quarantined is not None and os.path.exists(quarantined):
+            if os.path.exists(config_path):
+                os.unlink(config_path)
+            os.replace(quarantined, config_path)
+        raise
+    if quarantined is not None:
+        actions.insert(0, "Quarantined invalid config.json as %s" %
+                       os.path.basename(quarantined))
+    actions.append(
+        "Startup repair kept the saved endpoint, account, garage, "
+        "post-battle results, and isolated client preferences.")
+    return actions
+
+
+def _reset_state_name(name):
+    for base_name in _MUTABLE_STATE_0_9_22:
+        if name == base_name or name in (
+                base_name + ".tmp", base_name + ".bak",
+                base_name + ".invalid"):
+            return True
+        prefix = base_name + ".invalid."
+        if name.startswith(prefix) and name[len(prefix):].isdigit():
+            return True
+    return False
+
+
+def reset_0_9_22_state(game_root, base_dir=None, is_running=None):
+    """Delete this mod's mutable state after the caller confirms the reset."""
+    import shutil
+    import tempfile
+
+    _require_0_9_22_maintenance_target(game_root, is_running)
+    state_root = _relative_path(
+        game_root, "mods/configs/offline_lan_0922")
+    targets = []
+    if os.path.isdir(state_root):
+        targets = [os.path.join(state_root, name)
+                   for name in sorted(os.listdir(state_root))
+                   if _reset_state_name(name) and
+                   os.path.isfile(os.path.join(state_root, name))]
+    preferences_path = _isolated_0_9_22_preferences_path()
+    if preferences_path is not None and os.path.lexists(preferences_path):
+        if (os.path.islink(preferences_path) or
+                not os.path.isfile(preferences_path)):
+            raise LauncherError(
+                "The isolated client preferences path is not a regular file; "
+                "it was left unchanged.")
+        targets.append(preferences_path)
+
+    backup_root = tempfile.mkdtemp(prefix=".wot-offline-reset-", dir=game_root)
+    backup_roots = [backup_root]
+    moved = []
+    try:
+        preferences_backup_root = None
+        if preferences_path is not None and preferences_path in targets:
+            # LOCALAPPDATA and the game can be on different volumes. Keep this
+            # backup beside the profile so both the delete and rollback remain
+            # atomic filesystem replacements.
+            preferences_backup_root = tempfile.mkdtemp(
+                prefix=".wot-offline-reset-",
+                dir=os.path.dirname(preferences_path))
+            backup_roots.append(preferences_backup_root)
+        for index, target in enumerate(targets):
+            target_backup_root = (
+                preferences_backup_root
+                if target == preferences_path else backup_root)
+            backup = os.path.join(target_backup_root, str(index))
+            os.replace(target, backup)
+            moved.append((target, backup))
+        actions = install_client_mod(
+            game_root, PORT_0_9_22, base_dir, force=True)
+        actions.append(ensure_0_9_22_preferences_isolation(game_root))
+    except Exception as error:
+        for target, backup in reversed(moved):
+            if os.path.exists(backup):
+                os.replace(backup, target)
+        for directory in reversed(backup_roots):
+            shutil.rmtree(directory, ignore_errors=True)
+        if isinstance(error, LauncherError):
+            raise
+        raise LauncherError("Offline data reset failed: %s" % error)
+    for directory in reversed(backup_roots):
+        shutil.rmtree(directory, ignore_errors=True)
+    actions.insert(0, "Deleted %d offline saved-data file(s)." % len(targets))
+    return actions
+
+
 def server_script(port_version, base_dir=None):
     entry = _SERVER_ENTRIES.get(port_version)
     if entry is None:
@@ -722,7 +943,8 @@ def server_argv(port_version, base_dir=None):
     return [script] + list(_SERVER_ARGUMENTS[port_version])
 
 
-def server_environment(port_version, game_root, environment=None):
+def server_environment(port_version, game_root, environment=None,
+                       team_size=DEFAULT_TEAM_SIZE):
     """Point each server at the baked data installed with its client."""
     environment = dict(os.environ if environment is None else environment)
     if port_version == PORT_0_8_2:
@@ -731,6 +953,8 @@ def server_environment(port_version, game_root, environment=None):
     elif port_version == PORT_0_9_22:
         environment[SERVER_DATA_ENV_0922] = os.path.join(
             game_root, _SERVER_DATA_RELATIVE_DIR_0922)
+        environment[SERVER_TEAM_SIZE_ENV_0922] = str(
+            parse_team_size(team_size))
     return environment
 
 
