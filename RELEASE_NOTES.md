@@ -1,131 +1,182 @@
-# 坦克世界 单机 / 局域网战斗 0.5.0
+# World of Tanks Offline / LAN Battles 0.5.0
 
-这一版同时更新 **两个客户端**：
+This release updates **both clients**:
 
 - **0.8.2**
-- **0.9.22.0.1 #1513（国服 HD）**
+- **0.9.22.0.1 #1513 (Chinese HD)**
 
-下载 `WoT-Offline-Battles-Launcher-Windows.zip`，解压，运行
-`WoT-Offline-Battles-Launcher.exe`。选游戏目录、选模式（单人 / 建房 / 加入）、
-填个名字，点“开始游戏”。启动器会自己装好 mod、写好地址、需要的时候开服务器，
-游戏关掉服务器也跟着关。进游戏之后只要配好车，点“战斗！”。
+Download `WoT-Offline-Battles-Launcher-Windows.zip`, unpack it, and run
+`WoT-Offline-Battles-Launcher.exe`. Select your game folder, select a mode
+(single player / host / join), type a name, and click **Start game**. The
+launcher installs the mod, writes the address, starts the server when one is
+needed, and stops the server when the game closes. In the game, fit a tank and
+click **Battle!**.
 
-上一版是 0.4.0（0.9.22）和 1.8.59（0.8.2）。
-
----
-
-## 战斗更流畅
-
-下面几段主要是 0.9.22 这边的改动，0.8.2 的改动单独列在后面。
-
-- 撞到栅栏、棚子、地上的杂物不再几乎停住，车身也不会被压断的东西顶得一起一伏。
-  压断的东西就是压断了，可以直接开过去。
-- 下坡不再刹不住车，任何能停住的坡度都跟平地一样收油就减速。
-- 被打爆的坦克留下的残骸会挡路，不能再直接开过去。
-- 机器人跑起来顺了，不再一跳一跳地挪。远处的机器人也是连续的。
-- 和机器人撞在一起，两辆车不再互相抖个不停。
-- 机器人在斜坡上车身姿态是对的，不会车头扎进地里，贴脸打它也真的能打中。
-- 机器人不再原地来回倒车。
-- 机器人的高爆弹会溅射到旁边的车；自行火炮擦到履带的炮弹不再是零伤害。
-- 视线、射界、火炮弹道会被建筑和可破坏物挡住。打仗过程中这些东西能被打坏，
-  树和柱子会倒。
-- 一局打到一半闪退的问题修了一批：按 Alt+F4、打死敌人、倒计时结束、
-  助攻结算、伤害面板刷新失败，这些场合以前都会把游戏搞崩。
-- 一局结束后占用的内存会释放，不会一局一局累积下去。
-
-## 车库能用了（0.9.22）
-
-- 车库是真的车库，而且会保存。装的设备、乘员技能、炮弹、消耗品，
-  关掉游戏再开还在。
-- 客户端里的车全都有，而且同一辆车科技树上的模块全部解锁，不用花经验。
-- 每辆车一进车库就配好了顶级底盘、炮塔、炮、发动机、电台、油箱，
-  外加自动灭火器、大急救包、大修理包。想换随便换。
-- 所有东西都是零价格。
-- 装完东西，左边的参数面板立刻更新，不会还是旧数字。
-- 车库点击快了很多，不再点一下卡一下。
-- 每个乘员一开始就有三个技能位。
-- 上场用的就是车库里配好的那辆车，模块、血量、装甲、火炮都按配好的来。
-- 两局之间换车真的会换。以前第二局还是第一局那辆。
-
-## 装的东西战斗里真的有用（0.9.22）
-
-- 车库参数面板上写的数字，就是战斗里实际生效的数字。以前战斗里根本读不到
-  你装了什么。
-- 会跟着乘员技能和设备变的有：观察范围、隐蔽、装填时间、瞄准时间、散布、
-  炮塔和车体转速、发动机功率、地形阻力、修理速度。
-- 双筒望远镜和伪装网要站住不动几秒才生效，和正常游戏一样。
-- 炮镜（双筒）和涂层观察镜不叠加，只算一个。
-- 涂装的隐蔽加成会算进去。
-- 乘员受伤有真实影响：炮手阵亡瞄准变慢、炮塔转得慢，无线电员阵亡通讯距离下降。
-- “爆发装填”会触发，触发时立刻装好新弹，并且有原版的提示。
-- 换弹规则和正常游戏一样：第一次点是排队，第二次点是立刻换并重新装填。
-- 消耗品可以重复用，冷却 90 秒。
-- 机器人也按同一套规则算，只是乘员是没练过技能的水平。
-
-## 战斗里的显示（0.9.22）
-
-- 瞄准的敌人会有描边高亮。以前经常明明瞄着、也点亮了却没有描边。
-- 描边跟的是鼠标真正指到的那辆车，不再高亮旁边那辆，也不会一直挂在车上不消失。
-- 着火的车终于会冒火。
-- 自己的履带、负重轮会转，地上有车辙。
-- 被打爆的车留下残骸。
-- 高爆弹打在地面上有爆炸效果，而且爆炸不再拉长到几百米远。
-- 打没点亮的车不再冒出装甲命中的火花，和正常游戏一致。
-- 阵亡的车头顶标记会变成阵亡状态。
-- 战斗面板会显示你装的设备图标，小地图上是真实的观察范围圈。
-- 消耗品面板会显示“可用 / 冷却剩余秒数 / 已用完”，冷却完自己变回可用。
-- 战绩是实时统计的，伤害记录里有助攻，点亮助攻是真实数字。
-- 倒计时期间准星就出现了（还是不能开炮，要等战斗开始）。
-- 自行火炮的战术视角和弹道视角能用了，不再从地底下往上看。
-
-## 房间界面（0.9.22）
-
-- 局域网房间：能看到房间里有谁、选地图、开始、离开。
-- 房间是叠在游戏原本的排队界面上的。点排队界面自己的取消，就退出房间回车库。
-- 房间不会自己弹出来了，只有点“战斗！”才出现。
-- 打完一局回车库，第一次点“战斗！”就能进房间，不用点两下。
-- 中间出过错也不会让“战斗！”按钮永久失灵。
-- 房间的面板、按钮、鼠标指针现在画得出来了。这个客户端上一直画不出来。
-- 客户端里的车全都能在房间里用了。以前列表被截断在前 600 辆，英、美、苏的后半段直接没有。
-
-## 0.8.2 这边的改动
-
-- **单人战斗也走局域网服务器了。** 以前单人打是完全没有机器人的，
-  只是干等七秒的假排队。现在阵容、机器人、节奏都由服务器给，
-  单人的时候启动器会自己在本机开一个服务器。
-- **地图在排队界面里选，也可以直接离开。** 点“开始战斗”进选好的地图，
-  点“离开”取消排队回车库。以前是点完“战斗！”过几秒就被丢进一张没人选的图。
-- 原来的排队界面留在房间下面，不会被顶掉。
-- **植被和寻路数据不再被客户端自己拒绝。** 以前会报校验不匹配，然后一个机器人都没有。
-- **mod 装不上导致进不去游戏的问题修了。** 以前安装时会把整个 mod 的加载器删掉，
-  开出来是原版，卡在登录界面。
-- 跳过开场动画，直接到登录界面。
-- 车库里那个局域网设置面板去掉了，地址由启动器在开游戏前写好。
-
-## 启动器（两个客户端共用）
-
-- 一个窗口搞定：选游戏目录 → 选模式 → 填名字 → 开始游戏。装 mod、写地址、
-  开服务器、关服务器都是它做。
-- 游戏目录是记住的列表，也会自动去常见安装位置找。
-- 有“测试连接”按钮。加入别人时告诉你对面通不通，自己建房时告诉你 28782 端口
-  是不是被别的程序占了。
-- 建房之后会把本机的局域网地址打出来，直接念给别人抄。
-- 别人做的 .wotmod 不会被动。
-- 你自己的存档不会被动：0.8.2 的 offhangar_user，0.9.22 的地址、账号状态、
-  车库、配置。
-- 下载包小了很多：两个客户端的文件各打一个压缩包，装的时候只解压你要用的那一个。
-
-## 还没做好的
-
-- **机器人的履带和负重轮不会转。** 所以敌人履带被你打断的时候，画面上看不出来，
-  只能看伤害面板的提示。这个要等机器人改成客户端里真正的车辆实体才能做。
-- **客户端是 32 位的，最多只能用大约 2 GB 内存。** 这一版已经堵掉了几个大的
-  内存泄漏，但是连续玩很久还是可能自己退出。长时间玩的话中间重开一次客户端。
-- **乘员受伤的规则只做了一部分。**
-- **有 1 辆车不能用**：德系的 VK 168.02 Mauerbrecher。这个客户端的 680 辆车里，
-  只有它缺模型文件，开出来会崩，所以车库和机器人阵容都跳过它。
+The previous releases were 0.4.0 (0.9.22) and 1.8.59 (0.8.2).
 
 ---
 
-本项目按 GNU GPL v3 发布，不含《坦克世界》的任何游戏内容，与 Wargaming 无关。
-局域网服务器只在你信任的网络里用。
+## Smoother battles
+
+The sections below describe the 0.9.22 client. The 0.8.2 changes have their
+own section.
+
+- A fence, a shed or ground clutter no longer almost stops the tank, and the
+  hull no longer heaves over the item it just flattened. A crushed item is
+  gone, so you drive straight over it.
+- Downhill braking works. Any slope you can hold now slows the tank when you
+  release the throttle, exactly like flat ground.
+- A destroyed tank leaves a wreck that blocks the road. You can no longer
+  drive through it.
+- Bots move smoothly instead of hopping from position to position. Distant
+  bots move continuously too.
+- A collision with a bot no longer makes both vehicles shake.
+- A bot on a slope holds the correct hull pose. Its nose no longer digs into
+  the ground, and point-blank shots hit it.
+- Bots no longer reverse back and forth on the spot.
+- Bot HE shells splash the vehicles beside the target. An SPG shell that
+  grazes a track no longer does zero damage.
+- Buildings and destructible items block sight lines, gun arcs and artillery
+  trajectories. The battle destroys these items, and trees and poles fall.
+- Several crashes are fixed: Alt+F4, killing an enemy, the end of the
+  countdown, the assist accounting, and a failed damage-panel refresh.
+- The memory a round uses is released at the end of the round. It no longer
+  accumulates from round to round.
+
+## The garage works (0.9.22)
+
+- The garage is a real garage, and it saves. Your optional devices, crew
+  skills, shells and consumables survive a restart.
+- You own every vehicle in the client, and every module in that vehicle's own
+  tech tree is unlocked. No experience is needed.
+- Each vehicle already carries its top chassis, turret, gun, engine, radio and
+  fuel tank, plus an automatic fire extinguisher, a large first aid kit and a
+  large repair kit. Change any of them freely.
+- Everything costs nothing.
+- The parameters panel updates as soon as you fit something.
+- The garage responds immediately. It no longer pauses after each click.
+- Each crew member starts with three skill slots.
+- The battle runs the vehicle the garage fitted, with the fitted modules,
+  health, armour and gun.
+- A vehicle change between rounds takes effect. The second round no longer
+  runs the first round's tank.
+
+## Your fittings take effect in battle (0.9.22)
+
+- The numbers on the garage parameters panel are the numbers the battle uses.
+  The battle could not read your fittings before.
+- Crew skills and optional devices move view range, concealment, reload time,
+  aim time, dispersion, turret and hull traverse, engine power, terrain
+  resistance and repair speed.
+- Binocular telescope and camouflage net need a few seconds without movement,
+  as in the retail game.
+- The binocular telescope and the coated optics do not stack. Only one
+  applies.
+- The concealment bonus of a camouflage is included.
+- Crew injuries have a real effect. A dead gunner slows aiming and turret
+  traverse, and a dead radio operator shortens the communication range.
+- Intuition triggers. It loads the new shell at once and shows the stock
+  message.
+- Shell selection follows the retail rule. The first press queues the shell,
+  and the second press switches at once and restarts the loading.
+- Consumables are reusable, with a 90-second cooldown.
+- Bots follow the same rules, with an untrained crew.
+
+## What the battle shows (0.9.22)
+
+- The enemy you aim at gets an outline. The outline was often missing before,
+  even on a spotted target you were aiming at.
+- The outline follows the vehicle the mouse really points at. It no longer
+  marks the vehicle beside it, and it no longer stays on a vehicle forever.
+- A burning vehicle shows fire.
+- Your own tracks and road wheels turn, and the ground shows tracks.
+- A destroyed vehicle leaves a wreck.
+- An HE shell that lands on the ground shows an explosion, and the explosion
+  is no longer stretched over hundreds of metres.
+- A shot at an unspotted vehicle no longer shows armour-hit sparks. This
+  matches the retail client.
+- The marker of a destroyed vehicle changes to the destroyed state.
+- The battle panel shows the icons of the devices you fitted, and the minimap
+  circle is your real view range.
+- The consumables panel shows ready, the remaining cooldown, or used up, and
+  returns to ready by itself.
+- The statistics are live. The damage log includes assists, and the spotting
+  assist is a real number.
+- The gun marker appears during the countdown. You still cannot fire until the
+  battle starts.
+- The SPG strategic view and trajectory view work. They no longer look up from
+  under the ground.
+
+## The room screen (0.9.22)
+
+- The LAN room shows who is in the room, the map selection, start and leave.
+- The room is drawn over the client's own queue screen. The cancel button of
+  that screen leaves the room and returns you to the garage.
+- The room no longer opens by itself. It appears only when you click
+  **Battle!**.
+- After a round, the first click on **Battle!** enters the room. Two clicks
+  were needed before.
+- An error during a round no longer disables the **Battle!** button
+  permanently.
+- The room panel, its buttons and the mouse pointer are drawn. This client
+  never drew them.
+- Every vehicle in the client is available in the room. The list stopped at
+  the first 600 vehicles before, which cut the second half of the British,
+  American and Soviet trees.
+
+## The 0.8.2 client
+
+- **A single-player battle also runs on the LAN server.** A single-player
+  battle had no bots at all before, only a fake seven-second queue. The
+  lineup, the bots and the pacing now come from the server, and the launcher
+  starts a local server for you.
+- **You select the map in the queue screen, and you can leave.** **START
+  BATTLE** enters the map you selected, and **LEAVE** cancels the queue and
+  returns you to the garage. The old behaviour dropped you into an unselected
+  map a few seconds after **Battle!**.
+- The client's own queue screen stays below the room instead of being
+  replaced.
+- **The client no longer rejects the foliage and navigation data.** It
+  reported a checksum mismatch and then produced no bots.
+- **A failed mod installation no longer blocks the game.** The installer
+  removed the whole mod loader, so the game started unmodified and stopped at
+  the login screen.
+- The intro video is skipped. The game opens at the login screen.
+- The LAN settings panel is removed from the garage. The launcher writes the
+  address before the game starts.
+
+## The launcher (both clients)
+
+- One window: select the game folder, select a mode, type a name, start the
+  game. The launcher installs the mod, writes the address, and starts and
+  stops the server.
+- The game folder list is remembered, and the launcher also searches the
+  common installation paths.
+- A **Test connection** button reports whether the host answers when you join,
+  and whether another program holds TCP 28782 when you host.
+- After you start hosting, the launcher prints this PC's LAN address for the
+  other players.
+- Other people's `.wotmod` files are left alone.
+- Your own saved data is left alone: `offhangar_user` for 0.8.2, and the
+  address, account state, garage and configuration for 0.9.22.
+- The download is much smaller. Each client's files are one archive, and the
+  installation unpacks only the archive you need.
+
+## Known limits
+
+- **Bot tracks and road wheels do not turn.** A broken enemy track has no
+  visual feedback, only the damage-panel message. This needs the bots to
+  become real vehicle entities in the client.
+- **The client is a 32-bit program and can address about 2 GB.** This release
+  closes several large memory leaks, but a very long session can still exhaust
+  the address space. Restart the client between long sessions.
+- **Only part of the crew-injury rules are implemented.**
+- **One vehicle is unavailable**: the German VK 168.02 Mauerbrecher. It is the
+  only one of the client's 680 vehicles that is missing its model files, and
+  it crashes the client, so the garage and the bot lineup both skip it.
+
+---
+
+This project is released under the GNU GPL v3. It contains no World of Tanks
+content and is not affiliated with Wargaming. Run the LAN server only on a
+network you trust.
