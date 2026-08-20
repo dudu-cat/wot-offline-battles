@@ -439,6 +439,12 @@ class PortSourceTests(unittest.TestCase):
                              'manifest.json').is_file())
             self.assertTrue(
                 (Path(overlay) / 'START_OFFLINE_0922.bat').is_file())
+            self.assertTrue(
+                (Path(overlay) / 'tools' /
+                 'AUTHORITY_WORKER_PROBE.md').is_file())
+            self.assertTrue(
+                (Path(overlay) / 'tools' /
+                 'authority_worker_probe_supervisor.py').is_file())
             self.assertTrue(Path(archive).is_file())
 
     def test_navigation_release_gate_rejects_wrong_41_map_names(self):

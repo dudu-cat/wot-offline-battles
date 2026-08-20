@@ -164,6 +164,14 @@ def _write_client_overlay(dist_root, package_path, checksum_path, digest,
     shutil.copy2(
         os.path.join(os.path.dirname(__file__), 'START_OFFLINE_0922.bat'),
         overlay_root)
+    tools_root = os.path.join(overlay_root, 'tools')
+    os.makedirs(tools_root)
+    for filename in (
+            'AUTHORITY_WORKER_PROBE.md',
+            'authority_worker_probe_supervisor.py'):
+        shutil.copy2(
+            os.path.join(os.path.dirname(__file__), 'tools', filename),
+            tools_root)
     _copy_legal_files(overlay_root)
     zip_path = os.path.join(
         dist_root,
