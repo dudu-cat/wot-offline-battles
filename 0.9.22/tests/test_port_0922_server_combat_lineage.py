@@ -275,6 +275,61 @@ class ServerCombatLineageIntegrationTests(unittest.TestCase):
         self.assertGreater(hit_reports, 100)
         self.assertTrue(ignited)
 
+    def test_external_hit_crew_roster_survives_repeated_publication(self):
+        runtime, server, unused_roster = self._runtime_and_server()
+        human = {
+            'id': 1, 'team': 1, 'alive': True,
+            'x': 0.0, 'y': 0.0, 'z': 100.0,
+        }
+        first = runtime.update(
+            1.0 / 24.0, 1.0, players=[human])[0]
+        self.assertTrue(server.update_bot_states(1, {
+            'round_id': server.round_id, 'bots': first['bots']}))
+
+        critical = {
+            'devices': [{
+                'name': 'leftTrackHealth', 'hp': 170.0,
+                'max_hp': 170.0, 'state': 'normal',
+            }],
+            'destroyed': [], 'crew_ko': [],
+            'crew_roster': ['driver', 'gunner1'],
+            'fire': False, 'ammo_rack_death': False, 'events': [],
+        }
+        canonical = server.bot_states[11]
+        before = server._bot_combat_signature(canonical)
+        canonical.update(health=900, display_health=900,
+                         critical=dict(critical))
+        self.assertTrue(server._commit_external_bot_combat(
+            canonical, before))
+
+        runtime.apply_snapshot({
+            'server_tick': 2,
+            'bots': [dict(server.bot_states[bot_id])
+                     for bot_id in sorted(server.bot_states)],
+        })
+        repeated = runtime.update(
+            1.0 / 24.0, 1.1, players=[human])[0]
+        wire = next(bot for bot in repeated['bots'] if bot['id'] == 11)
+        self.assertEqual(['driver', 'gunner1'],
+                         wire['critical']['crew_roster'])
+        self.assertEqual(0, wire['combat_seq'])
+        self.assertTrue(server.update_bot_states(1, {
+            'round_id': server.round_id, 'bots': repeated['bots'],
+        }), server.last_bot_state_reject)
+        for frame in range(1, 25):
+            publication = runtime.update(
+                1.0 / 24.0, 1.1 + frame / 24.0,
+                players=[human])[0]
+            self.assertTrue(server.update_bot_states(1, {
+                'round_id': server.round_id,
+                'bots': publication['bots'],
+            }), server.last_bot_state_reject)
+            if server.bot_pending_projectile_launches:
+                break
+        self.assertTrue(any(
+            bot_id != 11 for bot_id, unused_fire_seq in
+            server.bot_pending_projectile_launches))
+
     def test_exact_reject_reason_is_coalesced_without_changing_returns(self):
         runtime, server, unused_roster = self._runtime_and_server()
         def legacy_report(method, message):

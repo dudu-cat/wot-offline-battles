@@ -402,9 +402,11 @@ def _critical_signature(payload):
                      (payload.get('destroyed') or ()))),
         tuple(sorted(str(name) for name in
                      (payload.get('crew_ko') or ()))),
+        tuple(str(name) for name in
+              (payload.get('crew_roster') or ())),
         bool(payload.get('fire', False)),
         bool(payload.get('ammo_rack_death', False)))
-    if signature == ((), (), (), False, False):
+    if signature == ((), (), (), (), False, False):
         return ()
     return signature
 
@@ -426,7 +428,7 @@ def _canonical_critical(payload):
             'name': str(record['name']), 'hp': hp, 'max_hp': maximum,
             'state': str(record['state'])})
     devices.sort(key=lambda record: record['name'])
-    return {
+    result = {
         'devices': devices,
         'destroyed': sorted(str(name) for name in
                             (payload.get('destroyed') or ())),
@@ -436,6 +438,10 @@ def _canonical_critical(payload):
         'ammo_rack_death': bool(payload.get('ammo_rack_death', False)),
         'events': [],
     }
+    crew_roster = payload.get('crew_roster')
+    if isinstance(crew_roster, (list, tuple)) and crew_roster:
+        result['crew_roster'] = [str(name) for name in crew_roster]
+    return result
 
 
 def _combat_signature(state):
