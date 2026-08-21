@@ -32,8 +32,8 @@ class _Widget(object):
 
 
 class _Root(_Widget):
-    def title(self, unused_title):
-        pass
+    def title(self, title):
+        self.options["title"] = title
 
 
 class _StringVar(object):
@@ -291,6 +291,31 @@ class VehicleEditorWindowTest(unittest.TestCase):
         self.assertEqual("32", self.window.current.get())
         self.assertIn("Fast MS-1", self.log[-1])
         self.assertEqual(2, len(self.service.inspect_calls))
+
+    def test_chinese_language_localizes_the_editor_and_discovered_fields(self):
+        service = _Service()
+        messagebox = _MessageBox(answer=False)
+        window = vehicle_editor_ui.VehicleEditorWindow(
+            self.parent, "C:/WoT", "Fast MS-1", _FakeTk, _FakeTtk,
+            messagebox, service=service, language="zh")
+
+        self.assertEqual(
+            "0.9.22 车辆属性方案：Fast MS-1",
+            window.root.cget("title"))
+        self.assertEqual("查看所选属性",
+                         window.inspect_button.cget("text"))
+        self.assertEqual(("车辆", "火炮"),
+                         window.category_box.cget("values"))
+        self.assertEqual(("速度限制 / 前进速度",),
+                         window.field_box.cget("values"))
+        self.assertEqual("整数", window.packed_type.get())
+        self.assertIn("正数", window.constraint.get())
+        self.assertIn("只影响该车", window.scope.get())
+        self.assertIn("可以安全修改", window.status.get())
+
+        self.assertFalse(window.restore_defaults())
+        self.assertIn("清除", messagebox.calls[-1][0][0])
+        self.assertIn("已取消", window.status.get())
 
 
 if __name__ == "__main__":

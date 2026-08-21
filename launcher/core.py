@@ -37,6 +37,8 @@ NAVGRAPH_DIR_ENV = "WOT_OFFLINE_NAVGRAPH_DIR"
 # starts up. The launcher waits this long after the last one before it
 # stops the LAN server.
 GAME_RESTART_GRACE_SECONDS = 8.0
+GAME_SHUTDOWN_TIMEOUT_SECONDS = 10.0
+GAME_SHUTDOWN_POLL_SECONDS = 0.1
 KNOWN_FOLDER_LIMIT = 10
 COMMON_GAME_ROOTS = (
     "C:\\Games", "C:\\Program Files", "C:\\Program Files (x86)",
@@ -1358,6 +1360,24 @@ def wait_for_game_exit(is_running, on_restart=None,
             quiet_since = clock()
         sleep(poll)
     return restarted
+
+
+def wait_for_game_shutdown(
+        is_running=None, timeout=GAME_SHUTDOWN_TIMEOUT_SECONDS,
+        poll=GAME_SHUTDOWN_POLL_SECONDS, sleep=None, clock=None):
+    """Wait a bounded time for terminated game processes to disappear."""
+    import time as time_module
+
+    is_running = game_is_running if is_running is None else is_running
+    clock = clock or time_module.monotonic
+    sleep = sleep or time_module.sleep
+    deadline = clock() + max(0.0, float(timeout))
+    while is_running():
+        remaining = deadline - clock()
+        if remaining <= 0.0:
+            return False
+        sleep(min(max(0.001, float(poll)), remaining))
+    return True
 
 
 def remember_folder(folders, path, limit=KNOWN_FOLDER_LIMIT):

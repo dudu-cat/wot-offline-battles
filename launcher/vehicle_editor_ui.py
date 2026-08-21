@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 try:
-    from . import vehicle_overlays
+    from . import i18n, vehicle_overlays
 except ImportError:
+    import i18n
     import vehicle_overlays
 
 
@@ -14,17 +15,120 @@ DEFAULT_NATION = "ussr"
 DEFAULT_VEHICLE = "R11_MS-1"
 
 
+_CHINESE = {
+    "0.9.22 vehicle profile: %s": "0.9.22 车辆属性方案：%s",
+    "Editing profile '%s'. Choose a nation and vehicle, then a category and "
+    "field. Changes are saved outside res_mods and are materialized only "
+    "while this profile runs in single player. Shared guns, engines and "
+    "other components show every vehicle they affect. IDs, resource paths, "
+    "topology and unknown fields remain locked.":
+        "正在编辑方案“%s”。请依次选择系别、车辆、类别和属性。修改保存在 "
+        "res_mods 之外，只会在单人游戏使用该方案时生效。共用的火炮、"
+        "发动机等部件会列出所有受影响的车辆。ID、资源路径、数据结构和"
+        "未知属性不可修改。",
+    "Nation": "系别",
+    "Only nations found in the original vehicle definitions.":
+        "只显示原始车辆数据中存在的系别。",
+    "Vehicle": "车辆",
+    "Vehicle code from the selected nation's original data.":
+        "所选系别原始数据中的车辆代号。",
+    "Category": "类别",
+    "Only categories with an existing safe field are shown.":
+        "只显示包含可安全修改属性的类别。",
+    "Field": "属性",
+    "The exact package member and field path stay internal.":
+        "实际数据包成员和属性路径由程序内部管理。",
+    "Inspect selected field": "查看所选属性",
+    "Impact": "影响范围",
+    "Original value": "原始值",
+    "Current value": "当前值",
+    "Packed type": "数据类型",
+    "Constraint": "数值限制",
+    "Technical source": "数据来源",
+    "Profile file": "方案文件",
+    "Replacement value": "新值",
+    "Save field to profile": "保存到方案",
+    "Clear all edits in this profile...": "清除该方案的全部修改…",
+    "Choose a vehicle field.": "请选择一项车辆属性。",
+    "Choose one listed vehicle field.": "请选择列表中的一项车辆属性。",
+    "Field is safe to edit.": "该属性可以安全修改。",
+    "Validation error": "验证错误",
+    "No supported vehicles were found in scripts.pkg.":
+        "scripts.pkg 中没有找到受支持的车辆。",
+    "The selected nation has no supported vehicles.":
+        "所选系别中没有受支持的车辆。",
+    "Choose one listed vehicle.": "请选择列表中的一辆车。",
+    "This vehicle has no existing fields in the safe allowlist.":
+        "该车辆没有位于安全允许列表中的属性。",
+    "This category has no existing fields in the safe allowlist.":
+        "该类别没有位于安全允许列表中的属性。",
+    "The original topology produced ambiguous field labels.":
+        "原始数据结构中出现了无法区分的属性名。",
+    "Profile edit saved and reparsed successfully.":
+        "属性修改已保存，并已成功重新解析。",
+    "Clear this vehicle profile?": "清除该车辆属性方案？",
+    "Remove every saved vehicle edit from profile '%s'? The profile itself "
+    "will remain.": "删除方案“%s”中保存的全部车辆修改？方案本身会保留。",
+    "Profile clearing was cancelled.": "已取消清除方案。",
+    "Close World of Tanks before changing vehicle data.":
+        "请先关闭 World of Tanks，再修改车辆数据。",
+}
+
+_CATEGORY_CHINESE = {
+    "Vehicle": "车辆", "Chassis": "悬挂装置", "Turret": "炮塔",
+    "Engine": "发动机", "Fuel tank": "油箱", "Gun": "火炮",
+    "Radio": "电台", "Shell": "炮弹",
+}
+
+_FIELD_CHINESE = {
+    "Speed limits": "速度限制", "Forward speed": "前进速度",
+    "Reverse speed": "倒车速度", "Hull": "车体", "Ammo rack": "弹药架",
+    "Engine health": "发动机耐久", "Fuel tank health": "油箱耐久",
+    "Radio health": "电台耐久", "Observation device": "观察装置",
+    "Turret traverse": "炮塔旋转机构", "Weight": "重量",
+    "Load limit": "载重上限", "Maximum health": "最大耐久",
+    "Repair threshold": "修复阈值", "Power": "功率",
+    "Traverse speed": "旋转速度", "Reload time": "装填时间",
+    "Aiming time": "瞄准时间", "Ammunition capacity": "弹药容量",
+    "Shell": "炮弹", "Projectile speed": "炮弹速度",
+    "Maximum distance": "最大射程", "Gravity": "重力",
+    "Penetration": "穿深", "Caliber": "口径", "Damage": "伤害",
+    "Vehicle damage": "车辆伤害", "Module damage": "模块伤害",
+}
+
+_PACKED_TYPE_CHINESE = {
+    "string": "字符串", "integer": "整数", "vector": "向量",
+    "boolean": "布尔值", "compressed-string": "压缩字符串",
+    "unknown": "未知",
+}
+
+_CONSTRAINT_CHINESE = (
+    ("stock parser requires a positive number", "原版解析器要求正数"),
+    ("stock parser requires a non-negative number", "原版解析器要求非负数"),
+    ("ammunition capacity must be a non-negative integer", "弹药容量必须是非负整数"),
+    ("device maximum health must be at least one", "模块最大耐久必须至少为 1"),
+    ("regeneration health must be non-negative and no greater than maxHealth",
+     "修复耐久必须为非负数，且不得超过 maxHealth"),
+    ("penetration must contain exactly two positive finite numbers; the "
+     "first value must be no less than the second",
+     "穿深必须包含两个正的有限数，且第一个数不得小于第二个数"),
+    ("; finite value ", "；有限数值 "),
+)
+
+
 class VehicleEditorWindow(object):
     """Small advanced editor backed by the strict profile service."""
 
     def __init__(self, parent, game_root, profile_name, tk_module, ttk_module,
-                 messagebox_module, log=None, service=vehicle_overlays):
+                 messagebox_module, log=None, service=vehicle_overlays,
+                 language=i18n.LANGUAGE_ENGLISH):
         self._tk = tk_module
         self._ttk = ttk_module
         self._messagebox = messagebox_module
         self._service = service
         self._game_root = game_root
         self._profile_name = profile_name
+        self._language = i18n.resolve_language(language)
         self._log = log or (lambda unused_message: None)
         self._vehicle_choices = []
         self._fields = []
@@ -35,18 +139,19 @@ class VehicleEditorWindow(object):
     def _build(self, parent):
         tk = self._tk
         self.root = tk.Toplevel(parent)
-        self.root.title("0.9.22 vehicle profile: %s" % self._profile_name)
+        self.root.title(
+            self._t("0.9.22 vehicle profile: %s") % self._profile_name)
 
         frame = tk.Frame(self.root, padx=12, pady=12)
         frame.pack(fill="both", expand=True)
 
-        explanation = (
+        explanation = self._t(
             "Editing profile '%s'. Choose a nation and vehicle, then a "
             "category and field. Changes are saved outside res_mods and are "
             "materialized only while this profile runs in single player. "
             "Shared guns, engines and other components show every vehicle "
             "they affect. IDs, resource paths, topology and unknown fields "
-            "remain locked." % self._profile_name)
+            "remain locked.") % self._profile_name
         tk.Label(frame, text=explanation, justify="left", anchor="w",
                  wraplength=720).grid(
                      row=0, column=0, columnspan=3, sticky="we",
@@ -54,7 +159,7 @@ class VehicleEditorWindow(object):
 
         self.nation = tk.StringVar(value=DEFAULT_NATION)
         self.vehicle = tk.StringVar(value=DEFAULT_VEHICLE)
-        self.category = tk.StringVar(value="Vehicle")
+        self.category = tk.StringVar(value=self._category_label("Vehicle"))
         self.field = tk.StringVar(value="")
         self.member = tk.StringVar(value=DEFAULT_MEMBER)
         self.field_path = tk.StringVar(value=DEFAULT_FIELD)
@@ -66,21 +171,21 @@ class VehicleEditorWindow(object):
         self.scope = tk.StringVar(value="-")
         self.source = tk.StringVar(value="-")
         self.overlay_path = tk.StringVar(value="-")
-        self.status = tk.StringVar(value="Choose a vehicle field.")
+        self.status = tk.StringVar(value=self._t("Choose a vehicle field."))
 
         row = 1
         row, self.nation_box = self._selector_row(
-            frame, row, "Nation", self.nation,
-            "Only nations found in the original vehicle definitions.")
+            frame, row, self._t("Nation"), self.nation,
+            self._t("Only nations found in the original vehicle definitions."))
         row, self.vehicle_box = self._selector_row(
-            frame, row, "Vehicle", self.vehicle,
-            "Vehicle code from the selected nation's original data.")
+            frame, row, self._t("Vehicle"), self.vehicle,
+            self._t("Vehicle code from the selected nation's original data."))
         row, self.category_box = self._selector_row(
-            frame, row, "Category", self.category,
-            "Only categories with an existing safe field are shown.")
+            frame, row, self._t("Category"), self.category,
+            self._t("Only categories with an existing safe field are shown."))
         row, self.field_box = self._selector_row(
-            frame, row, "Field", self.field,
-            "The exact package member and field path stay internal.")
+            frame, row, self._t("Field"), self.field,
+            self._t("The exact package member and field path stay internal."))
         self.nation_box.bind("<<ComboboxSelected>>", self.refresh_vehicles)
         self.vehicle_box.bind(
             "<<ComboboxSelected>>", self.refresh_vehicle_fields)
@@ -88,18 +193,19 @@ class VehicleEditorWindow(object):
         self.field_box.bind("<<ComboboxSelected>>", self.inspect)
 
         self.inspect_button = tk.Button(
-            frame, text="Inspect selected field", command=self.inspect)
+            frame, text=self._t("Inspect selected field"),
+            command=self.inspect)
         self.inspect_button.grid(row=row, column=1, sticky="w", pady=(4, 8))
         row += 1
 
         for label, variable in (
-                ("Impact", self.scope),
-                ("Original value", self.original),
-                ("Current value", self.current),
-                ("Packed type", self.packed_type),
-                ("Constraint", self.constraint),
-                ("Technical source", self.source),
-                ("Profile file", self.overlay_path)):
+                (self._t("Impact"), self.scope),
+                (self._t("Original value"), self.original),
+                (self._t("Current value"), self.current),
+                (self._t("Packed type"), self.packed_type),
+                (self._t("Constraint"), self.constraint),
+                (self._t("Technical source"), self.source),
+                (self._t("Profile file"), self.overlay_path)):
             tk.Label(frame, text=label, anchor="w").grid(
                 row=row, column=0, sticky="nw", pady=(2, 0))
             tk.Label(frame, textvariable=variable, anchor="w",
@@ -108,19 +214,19 @@ class VehicleEditorWindow(object):
                          padx=(8, 0), pady=(2, 0))
             row += 1
 
-        tk.Label(frame, text="Replacement value", anchor="w").grid(
+        tk.Label(frame, text=self._t("Replacement value"), anchor="w").grid(
             row=row, column=0, sticky="w", pady=(8, 0))
         self.replacement_entry = tk.Entry(
             frame, textvariable=self.replacement, width=32)
         self.replacement_entry.grid(
             row=row, column=1, sticky="we", padx=(8, 8), pady=(8, 0))
         self.apply_button = tk.Button(
-            frame, text="Save field to profile", command=self.apply)
+            frame, text=self._t("Save field to profile"), command=self.apply)
         self.apply_button.grid(row=row, column=2, sticky="e", pady=(8, 0))
         row += 1
 
         self.restore_button = tk.Button(
-            frame, text="Clear all edits in this profile...",
+            frame, text=self._t("Clear all edits in this profile..."),
             command=self.restore_defaults)
         self.restore_button.grid(
             row=row, column=1, columnspan=2, sticky="w", pady=(10, 0))
@@ -132,6 +238,61 @@ class VehicleEditorWindow(object):
                      pady=(10, 0))
 
         frame.grid_columnconfigure(1, weight=1)
+
+    def _t(self, text):
+        if self._language == i18n.LANGUAGE_CHINESE:
+            return _CHINESE.get(text, text)
+        return text
+
+    def _category_label(self, label):
+        if self._language == i18n.LANGUAGE_CHINESE:
+            return _CATEGORY_CHINESE.get(label, label)
+        return label
+
+    def _field_label(self, label):
+        if self._language != i18n.LANGUAGE_CHINESE:
+            return label
+        return " / ".join(
+            _FIELD_CHINESE.get(part, part) for part in label.split(" / "))
+
+    def _constraint_text(self, text):
+        if self._language != i18n.LANGUAGE_CHINESE:
+            return text
+        for source, replacement in _CONSTRAINT_CHINESE:
+            text = text.replace(source, replacement)
+        return text
+
+    def _scope_text(self, record):
+        if self._language != i18n.LANGUAGE_CHINESE:
+            return record["scope"]
+        affected = tuple(record.get("affectedVehicles", ()))
+        if record.get("shared"):
+            field_parts = record.get("fieldPath", "").split("/")
+            component = record.get("component")
+            if not component and len(field_parts) >= 2:
+                component = field_parts[1]
+            return "共享%s %s；影响 %s 的 %d 辆车：%s" % (
+                self._category_label(record.get("categoryLabel", "")),
+                component or "-", record.get("nation", self.nation.get()),
+                len(affected), ", ".join(affected))
+        vehicle = record.get("vehicle", self.vehicle.get())
+        result = "仅存于 %s；只影响该车。" % vehicle
+        field_path = record.get("fieldPath", "")
+        if (field_path == "hull/maxHealth" or
+                (field_path.startswith("turrets") and
+                 field_path.endswith("/maxHealth"))):
+            result += " 实战耐久是车体最大耐久与已安装炮塔最大耐久之和。"
+        return result
+
+    def _error_text(self, message):
+        if self._language != i18n.LANGUAGE_CHINESE:
+            return message
+        translated = _CHINESE.get(message)
+        if translated is not None:
+            return translated
+        if message.startswith("Conflict:"):
+            return "冲突：" + message[len("Conflict:"):].lstrip()
+        return message
 
     def _selector_row(self, frame, row, label, variable, hint, button=None):
         tk = self._tk
@@ -156,26 +317,30 @@ class VehicleEditorWindow(object):
         record = self._field_by_label.get(self.field.get().strip())
         if record is None:
             raise self._service.VehicleOverlayError(
-                "Choose one listed vehicle field.")
+                self._t("Choose one listed vehicle field."))
         return (record["member"], record["fieldPath"])
 
     def _show_result(self, result, success_message=None):
         self.original.set(result["originalValue"])
         self.current.set(result["currentValue"])
-        self.packed_type.set(result["packedType"])
-        self.constraint.set(result["constraint"])
+        packed_type = result["packedType"]
+        if self._language == i18n.LANGUAGE_CHINESE:
+            packed_type = _PACKED_TYPE_CHINESE.get(packed_type, packed_type)
+        self.packed_type.set(packed_type)
+        self.constraint.set(self._constraint_text(result["constraint"]))
         self.overlay_path.set(result["overlayPath"])
         conflict = result.get("conflict", "")
         self.apply_button.config(
             state="disabled" if conflict.startswith("Conflict:") else "normal")
         if conflict:
-            self.status.set(conflict)
+            self.status.set(self._error_text(conflict))
         else:
-            self.status.set(success_message or "Field is safe to edit.")
+            self.status.set(
+                success_message or self._t("Field is safe to edit."))
 
     def _show_error(self, error, clear_contract=False):
-        message = str(error)
-        self.status.set("Validation error: %s" % message)
+        message = self._error_text(str(error))
+        self.status.set("%s: %s" % (self._t("Validation error"), message))
         self.apply_button.config(state="disabled")
         if clear_contract:
             self.original.set("-")
@@ -194,7 +359,7 @@ class VehicleEditorWindow(object):
             return self._show_error(error, clear_contract=True)
         if not choices:
             return self._show_error(
-                "No supported vehicles were found in scripts.pkg.",
+                self._t("No supported vehicles were found in scripts.pkg."),
                 clear_contract=True)
         self._vehicle_choices = list(choices)
         nations = sorted(set(choice["nation"] for choice in choices))
@@ -216,7 +381,7 @@ class VehicleEditorWindow(object):
         self.vehicle_box.config(values=tuple(vehicles))
         if not vehicles:
             return self._show_error(
-                "The selected nation has no supported vehicles.",
+                self._t("The selected nation has no supported vehicles."),
                 clear_contract=True)
         if self.vehicle.get().strip() not in vehicles:
             self.vehicle.set(
@@ -232,7 +397,7 @@ class VehicleEditorWindow(object):
                        item["vehicle"] == vehicle), None)
         if choice is None:
             return self._show_error(
-                "Choose one listed vehicle.", clear_contract=True)
+                self._t("Choose one listed vehicle."), clear_contract=True)
         try:
             fields = self._service.list_vehicle_field_choices(
                 self._game_root, choice["member"])
@@ -240,12 +405,13 @@ class VehicleEditorWindow(object):
             return self._show_error(error, clear_contract=True)
         if not fields:
             return self._show_error(
-                "This vehicle has no existing fields in the safe allowlist.",
+                self._t(
+                    "This vehicle has no existing fields in the safe allowlist."),
                 clear_contract=True)
         self._fields = list(fields)
         categories = []
         for record in self._fields:
-            label = record["categoryLabel"]
+            label = self._category_label(record["categoryLabel"])
             if label not in categories:
                 categories.append(label)
         self.category_box.config(values=tuple(categories))
@@ -256,19 +422,23 @@ class VehicleEditorWindow(object):
     def refresh_fields(self, unused_event=None):
         category = self.category.get().strip()
         fields = [record for record in self._fields
-                  if record["categoryLabel"] == category]
+                  if self._category_label(record["categoryLabel"]) == category]
         if not fields:
             self.field_box.config(values=())
             return self._show_error(
-                "This category has no existing fields in the safe allowlist.",
+                self._t(
+                    "This category has no existing fields in the safe allowlist."),
                 clear_contract=True)
-        labels = [record["fieldLabel"] for record in fields]
+        labels = [self._field_label(record["fieldLabel"])
+                  for record in fields]
         if len(labels) != len(set(labels)):
             return self._show_error(
-                "The original topology produced ambiguous field labels.",
+                self._t(
+                    "The original topology produced ambiguous field labels."),
                 clear_contract=True)
         self._field_by_label = dict(
-            (record["fieldLabel"], record) for record in fields)
+            (self._field_label(record["fieldLabel"]), record)
+            for record in fields)
         self.field_box.config(values=tuple(labels))
         if self.field.get().strip() not in labels:
             self.field.set(labels[0])
@@ -284,7 +454,7 @@ class VehicleEditorWindow(object):
             return self._show_error(error, clear_contract=True)
         self.member.set(member)
         self.field_path.set(field_path)
-        self.scope.set(record["scope"])
+        self.scope.set(self._scope_text(record))
         self.source.set("%s :: %s" % (member, field_path))
         self.replacement.set(result["currentValue"])
         self._show_result(result)
@@ -299,17 +469,18 @@ class VehicleEditorWindow(object):
         except self._service.VehicleOverlayError as error:
             return self._show_error(error)
         message = "Profile edit saved and reparsed successfully."
-        self._show_result(result, message)
+        self._show_result(result, self._t(message))
         self._log("Vehicle data editor: %s" % message)
         return True
 
     def restore_defaults(self):
         if not self._messagebox.askyesno(
-                "Clear this vehicle profile?",
-                "Remove every saved vehicle edit from profile '%s'? "
-                "The profile itself will remain." % self._profile_name,
+                self._t("Clear this vehicle profile?"),
+                self._t(
+                    "Remove every saved vehicle edit from profile '%s'? "
+                    "The profile itself will remain.") % self._profile_name,
                 parent=self.root, icon="warning"):
-            self.status.set("Profile clearing was cancelled.")
+            self.status.set(self._t("Profile clearing was cancelled."))
             return False
         try:
             count = self._service.clear_vehicle_profile(
@@ -321,14 +492,21 @@ class VehicleEditorWindow(object):
             (count, "" if count == 1 else "s", self._profile_name))
         self._log("Vehicle data editor: %s" % message)
         if self.inspect():
-            self.status.set(message)
+            if self._language == i18n.LANGUAGE_CHINESE:
+                self.status.set(
+                    "已清除方案“%s”中 %d 个数据包成员的修改。" %
+                    (self._profile_name, count))
+            else:
+                self.status.set(message)
         return True
 
 
-def open_vehicle_editor(parent, game_root, profile_name, log=None):
+def open_vehicle_editor(parent, game_root, profile_name, log=None,
+                        language=i18n.LANGUAGE_AUTO):
     """Open a vehicle editor using the real Tk modules."""
     import tkinter
     from tkinter import messagebox, ttk
 
     return VehicleEditorWindow(
-        parent, game_root, profile_name, tkinter, ttk, messagebox, log=log)
+        parent, game_root, profile_name, tkinter, ttk, messagebox, log=log,
+        language=language)

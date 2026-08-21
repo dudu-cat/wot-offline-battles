@@ -198,6 +198,8 @@ def _safe_text(value, default='', limit=80):
 def _exact_int(value, default=None):
     if isinstance(value, bool):
         return default
+    if isinstance(value, integer_types):
+        return value
     try:
         parsed = int(value)
         if float(value) != parsed:

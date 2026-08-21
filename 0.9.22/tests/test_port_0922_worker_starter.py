@@ -109,6 +109,31 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertLess(launch.index('AssignProcessToJobObject'),
                         launch.index('ResumeThread'))
 
+    def test_paired_player_tracks_handoffs_outside_the_player_job(self):
+        source = SOURCE.read_text(encoding='utf-8')
+        launch = source.split(
+            'static int launch_player', 1)[1].split(
+                'int WINAPI wWinMain', 1)[0]
+        process_scan = source.split(
+            'static int collect_game_processes', 1)[1].split(
+                'static int launch_player', 1)[0]
+
+        self.assertIn('CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)',
+                      process_scan)
+        self.assertIn('QueryFullProcessImageNameW(', process_scan)
+        self.assertIn('lstrcmpiW(process_path, game_path) == 0', process_scan)
+        self.assertIn('PLAYER_HANDOFF_GRACE_MS', process_scan)
+        self.assertIn('process_set_contains(', process_scan)
+        self.assertIn('has_new_game_process(', process_scan)
+        self.assertIn(
+            'has_new_game_process(&current_processes, baseline_processes)',
+            process_scan)
+        self.assertIn('baseline_collected = collect_game_processes(', launch)
+        self.assertIn('wait_for_paired_player_handoff(', launch)
+        self.assertLess(
+            launch.index('baseline_collected = collect_game_processes('),
+            launch.index('CreateProcessW(game_path'))
+
     def test_duplicate_host_cannot_erase_the_live_worker_ready_marker(self):
         source = SOURCE.read_text(encoding='utf-8')
         main = source.split('int WINAPI wWinMain', 1)[1]
@@ -193,6 +218,8 @@ class WorkerStarterTests(unittest.TestCase):
             '<H', payload, optional_offset + 68)[0])
         self.assertIn(b'CreateDesktopW', payload)
         self.assertIn(b'CreateProcessW', payload)
+        self.assertIn(b'CreateToolhelp32Snapshot', payload)
+        self.assertIn(b'QueryFullProcessImageNameW', payload)
         self.assertIn('--player'.encode('utf-16le'), payload)
         self.assertIn('--paired-player'.encode('utf-16le'), payload)
         self.assertIn('--worker-only'.encode('utf-16le'), payload)

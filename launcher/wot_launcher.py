@@ -747,7 +747,8 @@ class LauncherWindow(object):
             return False
         self._remember_folder()
         vehicle_editor_ui.open_vehicle_editor(
-            self.root, status["path"], profile_name, log=self._log)
+            self.root, status["path"], profile_name, log=self._log,
+            language=self.language)
         return True
 
     def _delete_vehicle_profile(self):
@@ -958,12 +959,19 @@ class LauncherWindow(object):
             self._stop_server()
             if session.get("client") == core.PORT_0_9_22:
                 try:
-                    removed = vehicle_overlays.ensure_original_vehicle_data(
-                        game_root)
-                    if removed:
+                    if not core.wait_for_game_shutdown():
                         self._log(
-                            "Removed the temporary vehicle profile; original "
-                            "vehicle data is active again.")
+                            "A World of Tanks process did not finish closing; "
+                            "vehicle cleanup will retry at the next launcher "
+                            "start.")
+                    else:
+                        removed = (
+                            vehicle_overlays.ensure_original_vehicle_data(
+                                game_root))
+                        if removed:
+                            self._log(
+                                "Removed the temporary vehicle profile; "
+                                "original vehicle data is active again.")
                 except vehicle_overlays.VehicleOverlayError as error:
                     self._log(
                         "Could not restore original vehicle data: %s" % error)

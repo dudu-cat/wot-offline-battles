@@ -1446,6 +1446,23 @@ class GameProcessTest(unittest.TestCase):
             clock=lambda: next(ticks), sleep=lambda seconds: None))
         self.assertEqual([1], seen)
 
+    def test_shutdown_waits_for_terminated_processes_to_disappear(self):
+        running = [True, True, False]
+        ticks = iter([0.0, 0.0, 0.1])
+        sleeps = []
+
+        self.assertTrue(core.wait_for_game_shutdown(
+            is_running=lambda: running.pop(0), timeout=1.0, poll=0.1,
+            clock=lambda: next(ticks), sleep=sleeps.append))
+        self.assertEqual([0.1, 0.1], sleeps)
+
+    def test_shutdown_wait_is_bounded(self):
+        ticks = iter([0.0, 1.0])
+
+        self.assertFalse(core.wait_for_game_shutdown(
+            is_running=lambda: True, timeout=1.0, poll=0.1,
+            clock=lambda: next(ticks), sleep=lambda unused: None))
+
     def test_worker_ready_requires_a_live_process_and_marker(self):
         game_root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, game_root, True)

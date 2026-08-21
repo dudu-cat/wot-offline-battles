@@ -303,6 +303,12 @@ class PostBattleContractTests(unittest.TestCase):
         receipt.update({'type': 'battle_receipt', 'protocol': 5})
         self.assertTrue(lan_client_module._valid_battle_receipt(receipt))
 
+        large_arena = json.loads(json.dumps(receipt))
+        large_arena['arena_unique_id'] = (
+            (0x2a2a2a2a << 32) | 0x12345678)
+        self.assertGreater(large_arena['arena_unique_id'], 1 << 53)
+        self.assertTrue(lan_client_module._valid_battle_receipt(large_arena))
+
         missing_personal = json.loads(json.dumps(receipt))
         missing_personal['public_results'][0]['actor_id'] = 2
         self.assertFalse(

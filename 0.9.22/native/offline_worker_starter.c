@@ -8,8 +8,10 @@
  */
 
 #define WIN32_LEAN_AND_MEAN
+#define _WIN32_WINNT 0x0600
 #include <winsock2.h>
 #include <windows.h>
+#include <tlhelp32.h>
 #include <strsafe.h>
 
 
@@ -38,10 +40,19 @@
 #define SERVER_READY_TIMEOUT_MS 30000
 #define WORKER_READY_TIMEOUT_MS 60000
 #define WORKER_READY_POLL_MS 50
+#define PLAYER_HANDOFF_GRACE_MS 10000
+#define PLAYER_HANDOFF_POLL_MS 100
+#define MAX_GAME_PROCESS_IDS 32
 
 
 static WCHAR g_root[MAX_PATH];
 static WCHAR g_ready_marker[MAX_PATH];
+
+
+typedef struct GameProcessSet {
+	DWORD count;
+	DWORD ids[MAX_GAME_PROCESS_IDS];
+} GameProcessSet;
 
 
 static void log_failure(const char *stage, DWORD error_code)
@@ -262,6 +273,104 @@ static int wait_for_worker_ready(HANDLE worker_process, HANDLE server_process)
 }
 
 
+static int collect_game_processes(const WCHAR *game_path,
+		GameProcessSet *processes)
+{
+	PROCESSENTRY32W entry;
+	HANDLE process;
+	HANDLE snapshot;
+	WCHAR process_path[MAX_PATH];
+	DWORD process_path_count;
+	processes->count = 0;
+	snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		return 0;
+	}
+	ZeroMemory(&entry, sizeof(entry));
+	entry.dwSize = sizeof(entry);
+	if (!Process32FirstW(snapshot, &entry)) {
+		DWORD error_code = GetLastError();
+		CloseHandle(snapshot);
+		SetLastError(error_code);
+		return 0;
+	}
+	do {
+		if (lstrcmpiW(entry.szExeFile, L"WorldOfTanks.exe") != 0) {
+			continue;
+		}
+		process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+			entry.th32ProcessID);
+		if (process == 0) {
+			continue;
+		}
+		process_path_count = MAX_PATH;
+		if (QueryFullProcessImageNameW(process, 0, process_path,
+				&process_path_count) &&
+				lstrcmpiW(process_path, game_path) == 0) {
+			if (processes->count >= MAX_GAME_PROCESS_IDS) {
+				CloseHandle(process);
+				CloseHandle(snapshot);
+				SetLastError(ERROR_INSUFFICIENT_BUFFER);
+				return 0;
+			}
+			processes->ids[processes->count++] = entry.th32ProcessID;
+		}
+		CloseHandle(process);
+	} while (Process32NextW(snapshot, &entry));
+	CloseHandle(snapshot);
+	return 1;
+}
+
+
+static int process_set_contains(const GameProcessSet *processes, DWORD id)
+{
+	DWORD index;
+	for (index = 0; index < processes->count; ++index) {
+		if (processes->ids[index] == id) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+
+static int has_new_game_process(const GameProcessSet *current,
+		const GameProcessSet *baseline)
+{
+	DWORD index;
+	for (index = 0; index < current->count; ++index) {
+		if (!process_set_contains(baseline, current->ids[index])) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+
+static int wait_for_paired_player_handoff(const WCHAR *game_path,
+		const GameProcessSet *baseline_processes)
+{
+	GameProcessSet current_processes;
+	DWORD quiet_ms = 0;
+	while (quiet_ms < PLAYER_HANDOFF_GRACE_MS) {
+		if (!collect_game_processes(game_path, &current_processes)) {
+			log_failure("collect_game_processes(player)", GetLastError());
+			return 0;
+		}
+		/* Baseline PIDs belong to clients that predate this launch, normally
+		 * the hidden simulation worker. A visible client handed off through an
+		 * external broker has a new PID even if the worker exits simultaneously. */
+		if (has_new_game_process(&current_processes, baseline_processes)) {
+			quiet_ms = 0;
+		} else {
+			quiet_ms += PLAYER_HANDOFF_POLL_MS;
+		}
+		Sleep(PLAYER_HANDOFF_POLL_MS);
+	}
+	return 1;
+}
+
+
 static int launch_player(const WCHAR *game_path, BOOL paired_worker)
 {
 	WCHAR child_command[2 * MAX_PATH];
@@ -271,6 +380,8 @@ static int launch_player(const WCHAR *game_path, BOOL paired_worker)
 	HANDLE player_job = 0;
 	DWORD exit_code = 1;
 	DWORD wait_state;
+	GameProcessSet baseline_game_processes;
+	BOOL baseline_collected = FALSE;
 	int result = 1;
 	if (paired_worker) {
 		if (!SetEnvironmentVariableW(MULTI_CLIENT_ENV, MULTI_CLIENT_VALUE)) {
@@ -295,6 +406,11 @@ static int launch_player(const WCHAR *game_path, BOOL paired_worker)
 	ZeroMemory(&startup, sizeof(startup));
 	startup.cb = sizeof(startup);
 	ZeroMemory(&process, sizeof(process));
+	ZeroMemory(&baseline_game_processes, sizeof(baseline_game_processes));
+	if (paired_worker) {
+		baseline_collected = collect_game_processes(
+			game_path, &baseline_game_processes);
+	}
 	player_job = CreateJobObjectW(0, 0);
 	if (player_job == 0 || !configure_kill_job(player_job)) {
 		log_failure("CreateJobObjectW(player)", GetLastError());
@@ -342,6 +458,12 @@ static int launch_player(const WCHAR *game_path, BOOL paired_worker)
 					!GetExitCodeProcess(process.hProcess, &exit_code)) {
 				exit_code = 24;
 				log_failure("GetExitCodeProcess(player)", GetLastError());
+			}
+			if (paired_worker && baseline_collected &&
+					!wait_for_paired_player_handoff(
+						game_path, &baseline_game_processes)) {
+				result = 25;
+				goto player_cleanup;
 			}
 			break;
 		}

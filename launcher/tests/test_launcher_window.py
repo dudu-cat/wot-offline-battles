@@ -444,6 +444,7 @@ class WindowTest(unittest.TestCase):
             game_root = self._game("0.9.22.0.1", "1513")
         self.window.vehicle_profile.set("Fast MS-1")
         self.window._profile_selected()
+        self.window.language = wot_launcher.i18n.LANGUAGE_CHINESE
         with mock.patch(
                 "wot_launcher.vehicle_overlays.list_vehicle_profiles",
                 return_value=["Fast MS-1"]), mock.patch(
@@ -451,7 +452,8 @@ class WindowTest(unittest.TestCase):
             self.assertTrue(self.window._open_vehicle_editor())
 
         open_editor.assert_called_once_with(
-            self.window.root, game_root, "Fast MS-1", log=self.window._log)
+            self.window.root, game_root, "Fast MS-1", log=self.window._log,
+            language=wot_launcher.i18n.LANGUAGE_CHINESE)
 
     def test_vehicle_profile_selector_is_single_player_only(self):
         with mock.patch(
@@ -502,7 +504,8 @@ class WindowTest(unittest.TestCase):
 
         create.assert_called_once_with(game_root, "Fast MS-1")
         editor.assert_called_once_with(
-            self.window.root, game_root, "Fast MS-1", log=self.window._log)
+            self.window.root, game_root, "Fast MS-1", log=self.window._log,
+            language=wot_launcher.i18n.LANGUAGE_ENGLISH)
         self.assertEqual("Fast MS-1", self.window.vehicle_profile.get())
 
     def test_single_player_profile_is_removed_after_a_launch_failure(self):
@@ -530,6 +533,9 @@ class WindowTest(unittest.TestCase):
                 mock.patch(
                     "core.ensure_0_9_22_preferences_isolation",
                     return_value="preferences isolated"), \
+                mock.patch(
+                    "core.wait_for_game_shutdown",
+                    return_value=True), \
                 mock.patch("core.write_settings", return_value=[]), \
                 mock.patch.object(
                     self.window, "_run_game",
@@ -586,7 +592,11 @@ class WindowTest(unittest.TestCase):
                     side_effect=lambda: order.append("worker_stop")), \
                 mock.patch.object(
                     self.window, "_stop_server",
-                    side_effect=lambda: order.append("server_stop")):
+                    side_effect=lambda: order.append("server_stop")), \
+                mock.patch(
+                    "core.wait_for_game_shutdown",
+                    side_effect=lambda: (
+                        order.append("shutdown_wait") or True)):
             self.window._run_session(self.settings_dir, session, "Peng")
 
         start_server.assert_called_once_with(
@@ -599,7 +609,7 @@ class WindowTest(unittest.TestCase):
             core.DEFAULT_SERVER_PORT, paired_worker=True)
         self.assertEqual(
             ["profile", "server", "worker", "player", "worker_stop",
-             "server_stop", "profile_cleanup"], order)
+             "server_stop", "shutdown_wait", "profile_cleanup"], order)
 
     def test_startup_repair_runs_in_the_background_and_reports_actions(self):
         game_root = self._game("0.9.22.0.1", "1513")
