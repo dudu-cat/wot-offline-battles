@@ -3,6 +3,7 @@ import re
 import sys
 from pathlib import Path
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -12,7 +13,7 @@ sys.path.insert(0, str(ROOT / '0.9.22' / 'server'))
 from gui.mods.offline_lan_0922.lan_client import LANClient
 from lan_battle_server import (
     BattleState, CLIENT_BUILD_082, CLIENT_BUILD_0922, Player,
-    _bot_combat_log_message)
+    _bot_combat_log_message, _server_event_log_message, _server_log)
 
 
 class _Socket(object):
@@ -159,6 +160,7 @@ class LanProtocolTests(unittest.TestCase):
         }
         bots = {
             3: {'id': 3, 'team': 1},
+            4: {'id': 4, 'team': 1},
             28: {'id': 28, 'team': 2},
         }
 
@@ -178,6 +180,83 @@ class LanProtocolTests(unittest.TestCase):
             'attacker_bot': 28, 'target_bot': 3,
             'damage': 14, 'health': 806, 'dead': False,
         }, players, bots))
+
+    def test_server_event_log_omits_routine_simulation_noise(self):
+        players = {
+            1: Player(1, None, ('127.0.0.1', 1), team=1, slot=0),
+        }
+        bots = {
+            3: {'id': 3, 'team': 1},
+            4: {'id': 4, 'team': 1},
+            28: {'id': 28, 'team': 2},
+        }
+
+        for event in (
+                {'kind': 'destructible', 'destructible_kind': 'tree'},
+                {'kind': 'health', 'target': 1, 'damage': 0,
+                 'health': 850, 'dead': False,
+                 'source': 'client_simulation'},
+                {'kind': 'bot_bot_hit', 'attacker_bot': 28,
+                 'target_bot': 3, 'damage': 14, 'health': 806,
+                 'dead': False, 'source': 'shot'},
+                {'kind': 'projectile_impact', 'shooter_kind': 'bot',
+                 'projectile_id': '1:b:28:1'}):
+            self.assertIsNone(
+                _server_event_log_message(event, players, bots))
+
+        self.assertIn('kind=bot_human_hit', _server_event_log_message({
+            'kind': 'bot_human_hit', 'attacker_bot': 3, 'target': 1,
+            'damage': 0, 'health': 850, 'dead': False, 'source': 'shot',
+        }, players, bots))
+        self.assertIn('attacker_team=1', _server_event_log_message({
+            'kind': 'bot_bot_hit', 'attacker_bot': 3,
+            'target_bot': 4, 'damage': 14, 'health': 806,
+            'dead': False, 'source': 'shot',
+        }, players, bots))
+        self.assertIn('source=ram', _server_event_log_message({
+            'kind': 'bot_bot_hit', 'attacker_bot': 28,
+            'target_bot': 3, 'damage': 14, 'health': 806,
+            'dead': False, 'source': 'ram',
+        }, players, bots))
+        self.assertIn('attacker_team=None', _server_event_log_message({
+            'kind': 'bot_bot_hit', 'attacker_bot': 99,
+            'target_bot': 4, 'damage': 14, 'health': 806,
+            'dead': False, 'source': 'shot',
+        }, players, bots))
+        self.assertIn('source=shot', _server_event_log_message({
+            'kind': 'health', 'target': 1, 'damage': 0,
+            'health': 850, 'dead': False, 'source': 'shot',
+        }, players, bots))
+        self.assertIn('source=client_simulation',
+                      _server_event_log_message({
+                          'kind': 'health', 'target': 1, 'damage': None,
+                          'health': 850, 'dead': False,
+                          'source': 'client_simulation',
+                      }, players, bots))
+        self.assertEqual(
+            'PROJECTILE TERMINAL id=1:p:1:4 outcome=impact elapsed_ms=117',
+            _server_event_log_message({
+                'kind': 'projectile_impact', 'shooter_kind': 'player',
+                'projectile_id': '1:p:1:4', 'outcome': 'impact',
+                'resolved_time_ms': 117,
+            }, players, bots))
+        self.assertEqual(
+            'BATTLE RESULT winner=1 reason=base_captured base_team=2',
+            _server_event_log_message({
+                'kind': 'battle_result', 'winner': 1,
+                'reason': 'base_captured', 'base_team': 2,
+            }, players, bots))
+
+    def test_server_log_writes_each_line_atomically(self):
+        output = mock.Mock()
+        with mock.patch('lan_battle_server.sys.stdout', output):
+            _server_log('battle lifecycle')
+
+        output.write.assert_called_once()
+        self.assertTrue(
+            output.write.call_args[0][0].endswith(
+                '] battle lifecycle\n'))
+        output.flush.assert_called_once_with()
 
     def test_critical_hit_requires_exact_target_contract(self):
         critical = {

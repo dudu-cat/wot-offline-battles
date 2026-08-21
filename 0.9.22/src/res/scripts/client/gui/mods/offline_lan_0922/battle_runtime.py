@@ -54,8 +54,12 @@ FRAME_SECONDS = 0.0
 # observational only: it never feeds a gameplay clock, deadline or budget.
 PERFORMANCE_DIAGNOSTICS = True
 WORKER_NATIVE_PROBE_SECONDS = 5.0
-DIAGNOSTIC_WINDOW_SECONDS = 5.0
-DIAGNOSTIC_TOP_FRAMES = 5
+# Keep enough timing evidence for user-submitted logs without displacing
+# lifecycle failures and tracebacks with a twelve-line report every five
+# seconds. One half-minute window still catches sustained worker jitter.
+DIAGNOSTIC_INITIAL_WINDOW_SECONDS = 5.0
+DIAGNOSTIC_WINDOW_SECONDS = 30.0
+DIAGNOSTIC_TOP_FRAMES = 3
 AMMO_SECONDS = 0.10
 NETWORK_INPUT_SECONDS = 1.0 / 30.0
 RPM_PRESENTATION_SECONDS = 0.10
@@ -306,10 +310,14 @@ class _FrameDiagnostics(object):
     """Correlate one callback's work with the following render interval."""
 
     def __init__(self, clock=None, writer=None,
-                 window_seconds=DIAGNOSTIC_WINDOW_SECONDS):
+                 window_seconds=DIAGNOSTIC_WINDOW_SECONDS,
+                 initial_window_seconds=None):
         self._clock = clock or _PROFILE_CLOCK
         self._writer = writer or sys.stdout.write
-        self._window_seconds = max(0.25, float(window_seconds))
+        self._steady_window_seconds = max(0.25, float(window_seconds))
+        self._initial_window_seconds = max(0.25, float(
+            self._steady_window_seconds if initial_window_seconds is None
+            else initial_window_seconds))
         self.enabled = True
         self.reset()
 
@@ -317,6 +325,7 @@ class _FrameDiagnostics(object):
         self._pending = None
         self._frame_id = 0
         self._window_id = 0
+        self._window_seconds = self._initial_window_seconds
         self._reset_window()
 
     def _reset_window(self):
@@ -644,6 +653,7 @@ class _FrameDiagnostics(object):
                 self._writer(payload)
                 emit_seconds = max(0.0, self._clock() - emit_start)
                 emitted = True
+                self._window_seconds = self._steady_window_seconds
                 self._reset_window()
             stages['diag_emit'] = emit_seconds
             end_wall = self._clock()
@@ -971,7 +981,9 @@ class BattleRuntime(object):
         self._worker_probe_bot_count = 0
         self._worker_probe_simulation_caps = 0
         self._frame_diagnostics = (
-            _FrameDiagnostics() if PERFORMANCE_DIAGNOSTICS else None)
+            _FrameDiagnostics(
+                initial_window_seconds=DIAGNOSTIC_INITIAL_WINDOW_SECONDS)
+            if PERFORMANCE_DIAGNOSTICS else None)
         self._sixth_sense = None
         self._has_sixth_sense = False
         self._records = {}
@@ -1099,11 +1111,14 @@ class BattleRuntime(object):
         self._outlined_model = None
         self._outline_blocked = False
         self._edge_reports = 0
+        self._target_reports = 0
         self._next_outline_time = 0.0
         self._next_compound_report = 0.0
         self._compound_reports = 0
+        self._compound_report_signature = None
         self._mouse_target_matrix = None
         self._outline_report = None
+        self._outline_logged_report = None
         self._next_outline_report = 0.0
         self._next_spotting_time = 0.0
         self._foliage = None
@@ -1513,6 +1528,15 @@ class BattleRuntime(object):
         bigworld = self._runtime.bigworld
         game_module = self._runtime.game
 
+        mapping_name = 'addSpaceGeometryMapping'
+        bigworld_dict = getattr(bigworld, '__dict__', {})
+        had_instance_mapping = mapping_name in bigworld_dict
+        original_instance_mapping = bigworld_dict.get(mapping_name)
+        original_add_mapping = getattr(bigworld, mapping_name, None)
+        if not callable(original_add_mapping):
+            raise RuntimeError(
+                'BigWorld.addSpaceGeometryMapping boundary is unavailable')
+
         original_abort = getattr(game_module, 'abort', None)
         if not callable(original_abort):
             raise RuntimeError('game.abort boundary is unavailable')
@@ -1529,13 +1553,42 @@ class BattleRuntime(object):
             raise RuntimeError(
                 'native Avatar requested game.abort during battle start')
 
+        visibility_error = [None]
+
+        def add_standard_space_geometry(space_id, *args, **kwargs):
+            # Static ControlPoint instances are filtered while the compiled
+            # space is mapped.  Setting the gameplay mask after create()
+            # returns leaves other gameplays' already-created circles alive.
+            try:
+                self._configure_standard_space_visibility(space_id)
+            except Exception as error:
+                # OfflineMapCreator.create() catches every setup exception.
+                # Preserve this precise boundary failure for start() instead
+                # of reducing it to a generic rejected-map error.
+                visibility_error[0] = error
+                raise
+            return original_add_mapping(space_id, *args, **kwargs)
+
         setattr(loader_type, page_name, defer_battle_page)
         try:
             game_module.abort = reject_game_abort
+            setattr(bigworld, mapping_name, add_standard_space_geometry)
             setattr(creator, setup_name, finish_native_setup)
             try:
                 creator.create(map_name)
             finally:
+                current_add_mapping = getattr(
+                    bigworld, '__dict__', {}).get(mapping_name)
+                if current_add_mapping is add_standard_space_geometry:
+                    if had_instance_mapping:
+                        setattr(
+                            bigworld, mapping_name,
+                            original_instance_mapping)
+                    else:
+                        try:
+                            delattr(bigworld, mapping_name)
+                        except AttributeError:
+                            pass
                 current_setup = getattr(
                     creator, '__dict__', {}).get(setup_name)
                 if current_setup is finish_native_setup:
@@ -1547,6 +1600,8 @@ class BattleRuntime(object):
                             delattr(creator, setup_name)
                         except AttributeError:
                             pass
+            if visibility_error[0] is not None:
+                raise visibility_error[0]
         finally:
             if getattr(game_module, 'abort', None) is reject_game_abort:
                 game_module.abort = original_abort
@@ -1668,16 +1723,15 @@ class BattleRuntime(object):
                 return arena_type
         return None
 
-    def _configure_standard_space_visibility(self):
+    def _configure_standard_space_visibility(self, space_id=None):
         """Install the selected gameplay bit normally supplied by the server."""
         bigworld = self._runtime.bigworld
-        set_mask = getattr(
-            bigworld, 'wg_setSpaceItemsVisibilityMask', None)
+        spaces = getattr(bigworld, 'spaces', None)
         visibility = getattr(
             self._runtime, 'client_visibility_flags', None)
         gameplay_mask = getattr(
             self._runtime, 'arena_visibility_mask', None)
-        if (not callable(set_mask) or visibility is None or
+        if (spaces is None or visibility is None or
                 not callable(gameplay_mask)):
             raise RuntimeError(
                 '#1513 space visibility boundary is unavailable')
@@ -1688,7 +1742,8 @@ class BattleRuntime(object):
             server_bits = visibility.SERVER_MASK
             gameplay_id = int(self._arena_type.gameplayID)
             selected_bit = gameplay_mask(gameplay_id)
-            space_id = self._avatar.spaceID
+            if space_id is None:
+                space_id = self._avatar.spaceID
         except (AttributeError, TypeError, ValueError, OverflowError):
             raise RuntimeError(
                 '#1513 space visibility contract is invalid')
@@ -1703,14 +1758,26 @@ class BattleRuntime(object):
         # therefore the server-selected gameplay bit.
         expected = selected_bit
         try:
-            # Exact #1513 ClientHangarSpace configures a client-only space
-            # through this native setter immediately after createSpace().
-            # Such a space has no server-published GeneralSpaceData object, so
-            # BigWorld.spaces[spaceID] is not a valid startup requirement.
-            set_mask(space_id, expected)
+            # OldSpaceData maps key 300 and addSpaceGeometryMapping to this
+            # exact typed object.  Configure its UINT32 property before the
+            # geometryMappings.add() call instantiates static ControlPoints.
+            space = spaces[space_id]
+        except (KeyError, TypeError):
+            raise RuntimeError(
+                '#1513 live space data is unavailable before geometry '
+                'mapping: space_id=%r' % (space_id,))
+        try:
+            actual = space.itemsVisibilityMask
+            if actual != expected:
+                space.itemsVisibilityMask = expected
+                actual = space.itemsVisibilityMask
         except (AttributeError, TypeError, ValueError, OverflowError):
             raise RuntimeError(
                 '#1513 gameplay visibility mask could not be applied')
+        if actual != expected:
+            raise RuntimeError(
+                '#1513 gameplay visibility mask was not applied: '
+                'expected=0x%x actual=%r' % (expected, actual))
         self._standard_space_visibility = (
             space_id, expected, client_bits, server_bits)
         self._next_space_visibility_check = (
@@ -1726,25 +1793,28 @@ class BattleRuntime(object):
             now + SPACE_VISIBILITY_CHECK_SECONDS)
         space_id, selected_bit, client_bits, server_bits = boundary
         bigworld = self._runtime.bigworld
-        get_mask = getattr(
-            bigworld, 'wg_getSpaceItemsVisibilityMask', None)
-        set_mask = getattr(
-            bigworld, 'wg_setSpaceItemsVisibilityMask', None)
-        if not callable(get_mask) or not callable(set_mask):
+        spaces = getattr(bigworld, 'spaces', None)
+        if spaces is None:
             raise RuntimeError(
                 '#1513 space visibility maintenance is unavailable')
         try:
-            current = get_mask(space_id)
+            space = spaces[space_id]
+            current = space.itemsVisibilityMask
             if current & server_bits == selected_bit:
                 return False
             # Preserve any live client-only flags while replacing only the
             # server gameplay selection that controls bases and capture zones.
             corrected = (current & client_bits) | selected_bit
-            set_mask(space_id, corrected)
+            space.itemsVisibilityMask = corrected
+            actual = space.itemsVisibilityMask
         except (AttributeError, KeyError, TypeError, ValueError,
                 OverflowError):
             raise RuntimeError(
                 '#1513 gameplay visibility mask could not be maintained')
+        if actual != corrected:
+            raise RuntimeError(
+                '#1513 maintained gameplay visibility mask was not applied: '
+                'expected=0x%x actual=%r' % (corrected, actual))
         return True
 
     def _clock(self):
@@ -8354,7 +8424,9 @@ class BattleRuntime(object):
             self._BOT_CONTACT_PATHS.get(status, status),
             before, after, self._clock())
 
-    _EDGE_REPORT_LIMIT = 80
+    _EDGE_REPORT_LIMIT = 24
+    _TARGET_REPORT_LIMIT = 24
+    _TARGET_REPORT_SECONDS = 5.0
 
     def _report_edge(self, message):
         """Pair every edge-detect add with its removal in the log."""
@@ -8364,7 +8436,8 @@ class BattleRuntime(object):
         sys.stdout.write('[Offline LAN 0.9.22] EDGE %s\n' % message)
         return True
 
-    _COMPOUND_REPORT_LIMIT = 200
+    _COMPOUND_REPORT_LIMIT = 8
+    _COMPOUND_REPORT_SECONDS = 5.0
 
     def _report_local_compound(self, now):
         """Name a degenerate transform under the player's own compound.
@@ -8373,29 +8446,37 @@ class BattleRuntime(object):
         compound and project onto the terrain through this provider.
         """
         matrix = self._local_matrix
-        if matrix is None or now < self._next_compound_report:
+        if matrix is None:
             return False
-        self._next_compound_report = now + 1.0
-        if self._compound_reports >= self._COMPOUND_REPORT_LIMIT:
+        target = getattr(self._runtime.bigworld, 'target', None)
+        axes = _format_axes(matrix)
+        targeting = (
+            getattr(target, 'isEnabled', None),
+            getattr(target, 'isFull', None),
+            getattr(target, 'selectionFovDegrees', None),
+            getattr(target, 'maxDistance', None),
+            getattr(target, 'skeletonCheckEnabled', None))
+        signature = (axes,) + tuple(repr(value) for value in targeting)
+        if (signature == self._compound_report_signature or
+                self._compound_reports >= self._COMPOUND_REPORT_LIMIT or
+                now < self._next_compound_report):
             return False
+        self._compound_report_signature = signature
+        self._next_compound_report = now + self._COMPOUND_REPORT_SECONDS
         self._compound_reports += 1
         if self._compound_reports == 1:
             self._report_local_decals()
         sys.stdout.write(
             '[Offline LAN 0.9.22] COMPOUND at=%s axes=%s\n' % (
-                _format_xyz(matrix.translation), _format_axes(matrix)))
-        target = getattr(self._runtime.bigworld, 'target', None)
+                _format_xyz(matrix.translation), axes))
         # PyTarget.entity dereferences the picked entity with no null check.
         # Calling the object is the guarded read #1513 itself uses.
         entity = target() if callable(target) else None
         sys.stdout.write(
             '[Offline LAN 0.9.22] TARGETING enabled=%s full=%s fov=%s max=%s '
             'skeleton=%s entity=%s\n' % (
-                getattr(target, 'isEnabled', None),
-                getattr(target, 'isFull', None),
-                getattr(target, 'selectionFovDegrees', None),
-                getattr(target, 'maxDistance', None),
-                getattr(target, 'skeletonCheckEnabled', None),
+                targeting[0], targeting[1], targeting[2], targeting[3],
+                targeting[4],
                 getattr(entity, 'id', None)))
         return True
 
@@ -8425,7 +8506,7 @@ class BattleRuntime(object):
         return True
 
     def _report_target_outline(self, now, chosen, miss, decline, dropped):
-        """Print each new outline decision, at most once a second."""
+        """Keep a bounded sample of changing outline decisions."""
         if chosen is not None:
             message = 'outlined id=%s' % chosen
         elif dropped is not None:
@@ -8438,10 +8519,14 @@ class BattleRuntime(object):
             message = 'none: id=%s %s' % decline
         else:
             message = 'none: no remote vehicle to consider'
-        if message == self._outline_report or now < self._next_outline_report:
-            return
         self._outline_report = message
-        self._next_outline_report = now + 1.0
+        if (message == self._outline_logged_report or
+                now < self._next_outline_report or
+                self._target_reports >= self._TARGET_REPORT_LIMIT):
+            return
+        self._outline_logged_report = message
+        self._next_outline_report = now + self._TARGET_REPORT_SECONDS
+        self._target_reports += 1
         sys.stdout.write('[Offline LAN 0.9.22] TARGET %s\n' % message)
 
     def _clear_target_outline(self):
@@ -11957,13 +12042,17 @@ class BattleRuntime(object):
         self._lobby_retire_started = False
         self._mouse_target_matrix = None
         self._outline_report = None
+        self._outline_logged_report = None
         self._outlined_entity = None
         self._outlined_vehicle = None
         self._outlined_model = None
         self._outline_blocked = False
         self._edge_reports = 0
+        self._target_reports = 0
+        self._next_outline_report = 0.0
         self._next_compound_report = 0.0
         self._compound_reports = 0
+        self._compound_report_signature = None
         self._avatar = None
         self._standard_space_visibility = None
         self._next_space_visibility_check = 0.0

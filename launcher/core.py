@@ -166,9 +166,20 @@ def worker_failure_log(game_root):
     return os.path.join(game_root, WORKER_FAILURE_LOG_FILENAME_0922)
 
 
-def server_log_path():
-    """Return the stable per-user log used by launcher-owned servers."""
-    return os.path.join(os.path.dirname(settings_path()), SERVER_LOG_FILENAME)
+def launcher_directory(executable=None, frozen=None):
+    """Return the folder containing the launcher the user opened."""
+    if frozen is None:
+        frozen = bool(getattr(sys, "frozen", False))
+    if frozen:
+        return os.path.dirname(os.path.abspath(executable or sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def server_log_path(executable=None, frozen=None):
+    """Return the server log beside the launcher executable or script."""
+    return os.path.join(
+        launcher_directory(executable=executable, frozen=frozen),
+        SERVER_LOG_FILENAME)
 
 
 def visible_client_command(game_root, port_version, paired_worker=False):

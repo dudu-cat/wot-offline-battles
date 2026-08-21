@@ -281,14 +281,18 @@ class SettingsFileTest(unittest.TestCase):
 
 
 class ServerPayloadTest(unittest.TestCase):
-    def test_server_log_lives_beside_the_per_user_launcher_settings(self):
-        local_app_data = os.path.join(tempfile.gettempdir(), "local-app-data")
-        with mock.patch.dict(
-                os.environ, {"LOCALAPPDATA": local_app_data}, clear=False):
-            self.assertEqual(
-                os.path.join(
-                    local_app_data, "WoTOfflineBattles", "server.log"),
-                core.server_log_path())
+    def test_server_log_lives_beside_the_frozen_launcher(self):
+        executable = os.path.join(
+            tempfile.gettempdir(), "portable-launcher", "Launcher.exe")
+
+        self.assertEqual(
+            os.path.join(os.path.dirname(executable), "server.log"),
+            core.server_log_path(executable=executable, frozen=True))
+
+    def test_source_server_log_lives_beside_the_launcher_script(self):
+        self.assertEqual(
+            os.path.join(os.path.dirname(core.__file__), "server.log"),
+            core.server_log_path(frozen=False))
 
     def test_repository_layout_resolves_both_servers(self):
         base = core.server_root()

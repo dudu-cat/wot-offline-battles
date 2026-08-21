@@ -513,6 +513,20 @@ class PostBattleStore(object):
             'arenaUniqueID': receipt['arena_unique_id'],
         }
 
+    def should_show_immediately(self, arena_unique_id):
+        """Whether this result came from a battle watched to its end."""
+        arena_unique_id = _int(arena_unique_id, -1)
+        receipt = self._pending.get(str(arena_unique_id))
+        if receipt is None:
+            for archived in reversed(self._history):
+                if ('account_key' in archived and
+                        _int(archived.get('arena_unique_id'), -2) ==
+                        arena_unique_id):
+                    receipt = archived
+                    break
+        return bool(receipt is not None and
+                    not receipt.get('premature_leave', False))
+
     def acknowledge(self, arena_unique_id):
         key = str(_int(arena_unique_id, -1))
         receipt = self._pending.get(key)

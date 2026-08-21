@@ -1151,6 +1151,13 @@ class _OfflineMap(object):
         if self.app_loader is not None:
             self.app_loader.showBattlePage()
         if self.bigworld is not None:
+            # Match OfflineMapCreator.create(): the client space exists before
+            # its compiled geometry is mapped, and static-item visibility is
+            # consumed at that mapping boundary.
+            self.bigworld.spaces[7] = self.bigworld.space_data_factory(
+                self.bigworld.operations, 7, 0xffffffff)
+            self.bigworld.addSpaceGeometryMapping(
+                7, None, 'spaces/' + map_name)
             self.bigworld.operations.append(('map_create', map_name))
         self.active = True
         self.map_name = map_name
@@ -1158,7 +1165,6 @@ class _OfflineMap(object):
             self.bigworld.avatar = _Avatar()
         if self.bigworld is not None:
             avatar = self.bigworld.avatar
-            self.bigworld.space_visibility_masks[avatar.spaceID] = 0xffffffff
             self.bigworld.avatar.guiSessionProvider = types.SimpleNamespace(
                 shared=types.SimpleNamespace(
                     arenaLoad=_ArenaLoadController(self.app_loader),
@@ -1202,6 +1208,23 @@ class _HangarSpace(object):
         self.spaceInited = False
 
 
+class _SpaceData(object):
+    def __init__(self, operations, space_id, visibility_mask):
+        self._operations = operations
+        self._space_id = int(space_id)
+        self._items_visibility_mask = visibility_mask
+
+    @property
+    def itemsVisibilityMask(self):
+        return self._items_visibility_mask
+
+    @itemsVisibilityMask.setter
+    def itemsVisibilityMask(self, mask):
+        self._items_visibility_mask = mask
+        self._operations.append(
+            ('space_visibility', self._space_id, mask))
+
+
 class _BigWorld(object):
     def __init__(self, avatar, compatibility):
         self.avatar = avatar
@@ -1220,7 +1243,11 @@ class _BigWorld(object):
         self.edge_removes = []
         self.mouse_target = types.SimpleNamespace(
             translation=_Vector(), axis=_Vector(0.0, 0.0, 1.0))
-        self.space_visibility_masks = {7: 0xffffffff}
+        self.spaces = {
+            7: _SpaceData(self.operations, 7, 0xffffffff)}
+        self.space_data_factory = _SpaceData
+        self.mapped_visibility_masks = []
+        self.legacy_visibility_calls = []
         self.reset_visibility_before_ready = False
 
     def player(self):
@@ -1297,8 +1324,8 @@ class _BigWorld(object):
             if self.reset_visibility_before_ready:
                 # Model exact #1513's late ClientVisibilityFlags update
                 # before deferred client readiness is flushed.
-                self.wg_setSpaceItemsVisibilityMask(
-                    self.avatar.spaceID, 0x000fffff)
+                self.spaces[self.avatar.spaceID].itemsVisibilityMask = \
+                    0x000fffff
             bridge.setClientReady()
             bridge.completeVehicleEnter(entity.id)
         # Match #1513: BigWorld.entity(id) becomes visible only after the
@@ -1319,7 +1346,7 @@ class _BigWorld(object):
         self.operations.append(('clear_entities_spaces',))
         self.entities.clear()
         self.pending_entities.clear()
-        self.space_visibility_masks.clear()
+        self.spaces.clear()
         self.avatar = None
 
     def loadResourceListBG(self, assemblers, callback):
@@ -1329,14 +1356,19 @@ class _BigWorld(object):
     def setWatcher(self, name, enabled):
         self.operations.append(('watcher', name, enabled))
 
+    def addSpaceGeometryMapping(self, space_id, unused_mapper, unused_path):
+        self.mapped_visibility_masks.append(
+            self.spaces[int(space_id)].itemsVisibilityMask)
+        return 1
+
     def wg_getSpaceItemsVisibilityMask(self, space_id):
-        return self.space_visibility_masks[int(space_id)]
+        self.legacy_visibility_calls.append(('get', int(space_id)))
+        return self.spaces[int(space_id)].itemsVisibilityMask
 
     def wg_setSpaceItemsVisibilityMask(self, space_id, mask):
         space_id = int(space_id)
-        mask = int(mask)
-        self.space_visibility_masks[space_id] = mask
-        self.operations.append(('space_visibility', space_id, mask))
+        self.legacy_visibility_calls.append(('set', space_id, mask))
+        self.spaces[space_id].itemsVisibilityMask = mask
 
     def clearAllSpaces(self):
         self.clearEntitiesAndSpaces()
@@ -3531,6 +3563,26 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertFalse(diagnostics.enabled)
         self.assertIsNone(diagnostics._pending)
 
+    def test_frame_diagnostics_use_a_short_first_window_then_slow_down(self):
+        production = BattleRuntime(_runtime())._frame_diagnostics
+        self.assertEqual(5.0, production._window_seconds)
+        self.assertEqual(30.0, production._steady_window_seconds)
+
+        payloads = []
+        diagnostics = _FrameDiagnostics(
+            clock=lambda: 0.0, writer=payloads.append,
+            window_seconds=1.0, initial_window_seconds=0.25)
+        diagnostics._samples = 1
+        diagnostics._window_elapsed = 0.25
+        diagnostics._emit_due = True
+
+        diagnostics.finish(1, 0.0, 0.0, 0.0, {}, {}, {})
+
+        self.assertEqual(1, len(payloads))
+        self.assertEqual(1.0, diagnostics._window_seconds)
+        diagnostics.reset()
+        self.assertEqual(0.25, diagnostics._window_seconds)
+
     def test_network_deadlines_remove_main_thread_delay_from_periods(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -4309,16 +4361,22 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             [('account_retire',), ('hangar_destroy',),
              ('clear_entities_spaces',),
+             ('space_visibility', 7, 0x00000001),
              ('map_create', '01_karelia'),
-             ('watcher', 'Visibility/GUI', True),
-             ('space_visibility', 7, 0x00000001)],
+             ('watcher', 'Visibility/GUI', True)],
             runtime.bigworld.operations)
+        self.assertEqual([0x00000001],
+                         runtime.bigworld.mapped_visibility_masks)
+        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
+        self.assertNotIn(
+            'addSpaceGeometryMapping', runtime.bigworld.__dict__)
         self.assertEqual(0, runtime.offline_map_creator.viewer_camera_calls)
         self.assertEqual([(4, 5)], runtime.app_loader.transitions)
         self.assertEqual(1, runtime.app_loader.lobby_disposals)
         self.assertEqual(1, runtime.app_loader.lobby_populates)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
-        self.assertEqual(1, runtime.bigworld.space_visibility_masks[7])
+        self.assertEqual(
+            1, runtime.bigworld.spaces[7].itemsVisibilityMask)
         self.assertFalse(hasattr(runtime.app_loader, '__dict__'))
         type(runtime.app_loader).battle_page_calls.assert_not_called()
         self.assertFalse(runtime.offline_map_creator.Active())
@@ -4327,7 +4385,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.app_loader.showBattlePage()
         type(runtime.app_loader).battle_page_calls.assert_called_once_with()
 
-    def test_native_map_selects_only_ctf_server_visibility_bit(self):
+    def test_malinovka_mapping_sees_only_ctf_visibility_bit(self):
         class _UnsignedMask(int):
             def __int__(self):
                 raise OverflowError('32-bit Python cannot narrow this mask')
@@ -4337,40 +4395,39 @@ class BattleRuntimeContractTests(unittest.TestCase):
             0xfff00000)
         runtime.client_visibility_flags.SERVER_MASK = _UnsignedMask(
             0x000fffff)
+        runtime.arena_cache = {2: types.SimpleNamespace(
+            geometryName='02_malinovka', gameplayName='ctf', gameplayID=0)}
         battle = BattleRuntime(runtime)
         start = {
-            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'round_id': 1, 'map': '02_malinovka', 'bot_authority_id': 1,
             'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
                 'vehicle': 'ussr:R11_MS-1', 'health': 500}],
             'bots': []}
 
         self.assertTrue(battle.start({
-            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'map': '02_malinovka', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, start, _Client()))
 
         self.assertEqual(
             0x00000001,
-            runtime.bigworld.space_visibility_masks[7])
-        self.assertEqual(
-            ('space_visibility', 7, 0x00000001),
-            runtime.bigworld.operations[-1])
+            runtime.bigworld.spaces[7].itemsVisibilityMask)
+        self.assertEqual([0x00000001],
+                         runtime.bigworld.mapped_visibility_masks)
+        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
 
-    def test_native_map_does_not_require_a_server_space_data_object(self):
+        # Exact #1513 Malinovka WTCP records: both CTF bases include bit 0;
+        # the neutral domination control point includes bit 1 but not bit 0.
+        mapped_mask = runtime.bigworld.mapped_visibility_masks[0]
+        self.assertTrue(0xffffff89 & mapped_mask)
+        self.assertFalse(0xffffff82 & mapped_mask)
+
+    def test_native_map_uses_typed_client_space_without_legacy_exports(self):
         runtime = _runtime()
-        runtime.bigworld.spaces = {}
-        original_set_mask = runtime.bigworld.wg_setSpaceItemsVisibilityMask
-
-        def set_mask_without_status(space_id, mask):
-            original_set_mask(space_id, mask)
-            return False
-
         runtime.bigworld.wg_setSpaceItemsVisibilityMask = mock.Mock(
-            side_effect=set_mask_without_status)
+            side_effect=AssertionError('legacy visibility setter was used'))
         runtime.bigworld.wg_getSpaceItemsVisibilityMask = mock.Mock(
-            side_effect=AssertionError(
-                'client-only visibility must not require synchronous '
-                'readback'))
+            side_effect=AssertionError('legacy visibility getter was used'))
         battle = BattleRuntime(runtime)
 
         self.assertTrue(battle.start({
@@ -4383,12 +4440,39 @@ class BattleRuntimeContractTests(unittest.TestCase):
                     'vehicle': 'ussr:R11_MS-1', 'health': 500}],
                 'bots': []}, _Client()))
 
-        self.assertEqual(1, runtime.bigworld.space_visibility_masks[7])
-        runtime.bigworld.wg_setSpaceItemsVisibilityMask.assert_called_once_with(
-            7, 1)
+        self.assertEqual(
+            1, runtime.bigworld.spaces[7].itemsVisibilityMask)
+        self.assertEqual([1], runtime.bigworld.mapped_visibility_masks)
+        runtime.bigworld.wg_setSpaceItemsVisibilityMask.assert_not_called()
         runtime.bigworld.wg_getSpaceItemsVisibilityMask.assert_not_called()
         self.assertEqual([(4, 5)], runtime.app_loader.transitions)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
+
+    def test_native_map_fails_if_live_space_is_missing_before_mapping(self):
+        runtime = _runtime()
+
+        def create_without_live_space(map_name):
+            runtime.bigworld.spaces.pop(7, None)
+            try:
+                runtime.bigworld.addSpaceGeometryMapping(
+                    7, None, 'spaces/' + map_name)
+            except RuntimeError:
+                # Exact OfflineMapCreator catches its entire create body.
+                return
+
+        runtime.offline_map_creator.create = create_without_live_space
+        battle = BattleRuntime(runtime)
+
+        self.assertFalse(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {'round_id': 1}, _Client()))
+
+        self.assertEqual('failed', battle.state)
+        self.assertIn(
+            'live space data is unavailable before geometry mapping',
+            battle.error)
+        self.assertNotIn(
+            'addSpaceGeometryMapping', runtime.bigworld.__dict__)
 
     def test_incomplete_hangar_fails_before_native_clear(self):
         runtime = _runtime()
@@ -4571,20 +4655,21 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(1, runtime.app_loader.lobby_disposals)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
 
-    def test_visibility_write_failure_restores_clean_lobby_then_retries(self):
+    def test_visibility_readback_failure_restores_clean_lobby_then_retries(self):
         runtime = _runtime()
-        original_set_mask = runtime.bigworld.wg_setSpaceItemsVisibilityMask
         write_count = [0]
 
-        def reject_first_write(space_id, mask):
-            write_count[0] += 1
-            if write_count[0] == 1:
-                runtime.bigworld.operations.append(
-                    ('space_visibility_rejected', int(space_id), int(mask)))
-                raise ValueError('native visibility write rejected')
-            return original_set_mask(space_id, mask)
+        class _RejectFirstSpaceData(_SpaceData):
+            @_SpaceData.itemsVisibilityMask.setter
+            def itemsVisibilityMask(self, mask):
+                write_count[0] += 1
+                if write_count[0] == 1:
+                    self._operations.append(
+                        ('space_visibility_rejected', self._space_id, mask))
+                    return
+                _SpaceData.itemsVisibilityMask.fset(self, mask)
 
-        runtime.bigworld.wg_setSpaceItemsVisibilityMask = reject_first_write
+        runtime.bigworld.space_data_factory = _RejectFirstSpaceData
         battle = BattleRuntime(runtime)
 
         self.assertFalse(battle.start({
@@ -4592,7 +4677,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'name': 'Player'}, {'round_id': 1}, _Client()))
 
         self.assertEqual('failed', battle.state)
-        self.assertIn('visibility mask could not be applied', battle.error)
+        self.assertIn('visibility mask was not applied', battle.error)
         self.assertEqual([(4, 5), (5, 4)], runtime.app_loader.transitions)
         self.assertEqual(1, runtime.app_loader.lobby_disposals)
         self.assertEqual(2, runtime.app_loader.lobby_populates)
@@ -4615,7 +4700,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(2, runtime.app_loader.lobby_disposals)
         self.assertEqual(2, runtime.app_loader.lobby_populates)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
-        self.assertEqual(1, runtime.bigworld.space_visibility_masks[7])
+        self.assertEqual(
+            1, runtime.bigworld.spaces[7].itemsVisibilityMask)
+        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
 
     def test_battle_page_patch_does_not_overwrite_a_newer_class_patch(self):
         runtime = _runtime()
@@ -4710,16 +4797,16 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'map': '07_lakeville', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, start, client))
         self.assertEqual(0x00000001,
-                         runtime.bigworld.space_visibility_masks[7])
+                         runtime.bigworld.spaces[7].itemsVisibilityMask)
 
         runtime.bigworld.callbacks.pop(0)()
         runtime.bigworld.enter_pending_vehicle(battle._server.vehicle_id)
         self.assertEqual(0x000fffff,
-                         runtime.bigworld.space_visibility_masks[7])
+                         runtime.bigworld.spaces[7].itemsVisibilityMask)
         runtime.bigworld.callbacks.pop(0)()
 
         self.assertEqual('running', battle.state)
-        selected_mask = runtime.bigworld.space_visibility_masks[7]
+        selected_mask = runtime.bigworld.spaces[7].itemsVisibilityMask
         self.assertEqual(0x00000001, selected_mask)
         visibility_writes = [
             operation[2] for operation in runtime.bigworld.operations
@@ -4738,7 +4825,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         # A still-later stock visibility update must not leak another
         # gameplay's objects after the one-time client-ready repair.  Exact
         # #1513 Malinovka uses bit 1 for its neutral domination control point.
-        runtime.bigworld.space_visibility_masks[7] = 0x00000003
+        runtime.bigworld.spaces[7].itemsVisibilityMask = 0x00000003
         writes_before_maintenance = len([
             operation for operation in runtime.bigworld.operations
             if operation[0] == 'space_visibility'])
@@ -4746,7 +4833,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._frame()
 
         self.assertEqual(
-            0x00000001, runtime.bigworld.space_visibility_masks[7])
+            0x00000001,
+            runtime.bigworld.spaces[7].itemsVisibilityMask)
         writes_after_repair = [
             operation for operation in runtime.bigworld.operations
             if operation[0] == 'space_visibility']
@@ -4759,10 +4847,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
         malinovka_domination_mask = 0xffffff82
         self.assertTrue(
             malinovka_ctf_base_mask &
-            runtime.bigworld.space_visibility_masks[7])
+            runtime.bigworld.spaces[7].itemsVisibilityMask)
         self.assertFalse(
             malinovka_domination_mask &
-            runtime.bigworld.space_visibility_masks[7])
+            runtime.bigworld.spaces[7].itemsVisibilityMask)
 
         # The next periodic read sees a correct mask and performs no native
         # write, keeping this guard observational during normal frames.
@@ -10157,10 +10245,82 @@ class BattleRuntimeContractTests(unittest.TestCase):
         with mock.patch.object(sys, 'stdout') as stdout:
             stdout.write = written.append
             self.assertTrue(battle._report_local_compound(100.0))
+            self.assertFalse(battle._report_local_compound(101.0))
 
         self.assertEqual([True], picked)
-        self.assertTrue(any('TARGETING' in line and 'entity=None' in line
-                            for line in written))
+        targeting = [line for line in written if 'TARGETING' in line]
+        compound = [line for line in written if 'COMPOUND' in line]
+        self.assertEqual(1, len(targeting))
+        self.assertEqual(1, len(compound))
+        self.assertIn('entity=None', targeting[0])
+
+    def test_compound_report_repeats_only_for_a_bounded_signature_change(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+
+        class _DiagnosticMatrix(object):
+            def __init__(self):
+                self.translation = _Vector()
+                self.scale = 1.0
+
+            def applyToAxis(self, index):
+                axes = ((_Vector(1.0), _Vector(0.0, 1.0),
+                         _Vector(0.0, 0.0, 1.0)))
+                return axes[index].scale(self.scale)
+
+        class _Target(object):
+            isEnabled = True
+            isFull = False
+            selectionFovDegrees = 1.0
+            maxDistance = 710.0
+            skeletonCheckEnabled = True
+
+            def __call__(self):
+                return None
+
+        matrix = _DiagnosticMatrix()
+        target = _Target()
+        runtime.bigworld.target = target
+        battle._local_matrix = matrix
+        written = []
+        with mock.patch.object(sys, 'stdout') as stdout:
+            stdout.write = written.append
+            self.assertTrue(battle._report_local_compound(100.0))
+            matrix.translation = _Vector(10.0, 0.0, 0.0)
+            self.assertFalse(battle._report_local_compound(105.0))
+            target.maxDistance = 720.0
+            self.assertTrue(battle._report_local_compound(105.0))
+            matrix.scale = 0.0
+            self.assertTrue(battle._report_local_compound(110.0))
+            for index in range(20):
+                target.maxDistance = 800.0 + index
+                battle._report_local_compound(115.0 + index * 5.0)
+
+        targeting = [line for line in written if 'TARGETING' in line]
+        compounds = [line for line in written if 'COMPOUND' in line]
+        self.assertEqual(battle._COMPOUND_REPORT_LIMIT, len(targeting))
+        self.assertEqual(battle._COMPOUND_REPORT_LIMIT, len(compounds))
+        self.assertIn('axes=0.000/0.000/0.000', ''.join(compounds))
+
+    def test_outline_diagnostics_are_slow_and_bounded(self):
+        battle = BattleRuntime(_runtime())
+        written = []
+        with mock.patch.object(sys, 'stdout') as stdout:
+            stdout.write = written.append
+            battle._report_target_outline(0.0, 1000, None, None, None)
+            battle._report_target_outline(1.0, 1001, None, None, None)
+            battle._report_target_outline(5.0, 1002, None, None, None)
+            for index in range(100):
+                battle._report_target_outline(
+                    10.0 + 5.0 * index, 2000 + index,
+                    None, None, None)
+                battle._report_edge('transition=%d' % index)
+
+        targets = [line for line in written if 'TARGET ' in line]
+        edges = [line for line in written if 'EDGE ' in line]
+        self.assertEqual(battle._TARGET_REPORT_LIMIT, len(targets))
+        self.assertNotIn('id=1001', ''.join(targets))
+        self.assertEqual(battle._EDGE_REPORT_LIMIT, len(edges))
 
     def test_a_wreck_that_becomes_visible_again_is_restated_as_dead(self):
         """A pooled marker re-attached on re-entry is not re-stated by the

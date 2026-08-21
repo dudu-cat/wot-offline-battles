@@ -215,7 +215,22 @@ def _validated_outfits(value):
 
 def _server_log(message):
     stamp = time.strftime("%H:%M:%S")
-    print("[%s] %s" % (stamp, message), flush=True)
+    sys.stdout.write("[%s] %s\n" % (stamp, message))
+    sys.stdout.flush()
+
+
+_SERVER_LOG_LAST = {}
+
+
+def _server_log_limited(key, message, interval=5.0):
+    """Keep repeated protocol failures useful without flooding the log."""
+    now = time.monotonic()
+    previous = _SERVER_LOG_LAST.get(key)
+    if previous is not None and now - previous < float(interval):
+        return False
+    _SERVER_LOG_LAST[key] = now
+    _server_log(message)
+    return True
 
 
 def _bot_combat_log_message(event, players, bot_states):
@@ -237,6 +252,52 @@ def _bot_combat_log_message(event, players, bot_states):
             event.get("kind"), event.get("source"), attacker_id,
             attacker_team, target_id, target_team, event.get("damage"),
             event.get("health"), event.get("dead")))
+
+
+def _server_event_log_message(event, players, bot_states):
+    """Format only battle events that help diagnose a reported failure."""
+    kind = event.get("kind")
+    if kind == "shot":
+        return "SHOT attacker=%s seq=%s shell=%s" % (
+            event.get("attacker"), event.get("shot_seq"),
+            event.get("shell_index"))
+    if kind == "hit":
+        return "HIT attacker=%s target=%s damage=%s health=%s dead=%s" % (
+            event.get("attacker"), event.get("target"),
+            event.get("damage"), event.get("health"), event.get("dead"))
+    if kind == "health":
+        if (event.get("damage") == 0 and event.get("dead") is False and
+                event.get("source") == "client_simulation"):
+            return None
+        return "HEALTH target=%s damage=%s health=%s dead=%s source=%s" % (
+            event.get("target"), event.get("damage"), event.get("health"),
+            event.get("dead"), event.get("source"))
+    if kind in ("bot_hit", "bot_human_hit"):
+        return _bot_combat_log_message(event, players, bot_states)
+    if kind == "bot_bot_hit":
+        attacker = bot_states.get(event.get("attacker_bot"))
+        target = bot_states.get(event.get("target_bot"))
+        attacker_team = (attacker.get("team")
+                         if isinstance(attacker, dict) else None)
+        target_team = (target.get("team")
+                       if isinstance(target, dict) else None)
+        if (event.get("source") == "shot" and not event.get("dead") and
+                attacker_team in (1, 2) and target_team in (1, 2) and
+                attacker_team != target_team):
+            return None
+        return _bot_combat_log_message(event, players, bot_states)
+    if kind == "authority":
+        return "BOT AUTHORITY player_id=%s" % event.get("player_id")
+    if kind == "battle_result":
+        return "BATTLE RESULT winner=%s reason=%s base_team=%s" % (
+            event.get("winner"), event.get("reason"),
+            event.get("base_team"))
+    if (kind == "projectile_impact" and
+            event.get("shooter_kind") == "player"):
+        return "PROJECTILE TERMINAL id=%s outcome=%s elapsed_ms=%s" % (
+            event.get("projectile_id"), event.get("outcome"),
+            event.get("resolved_time_ms"))
+    return None
 
 
 def _finite_float(value, default=0.0):
@@ -5858,46 +5919,14 @@ class BattleState:
             recipients = list(self.players.values())
             if self.simulation_worker is not None:
                 recipients.append(self.simulation_worker)
-            bot_combat_logs = dict(
-                (event["event_id"], _bot_combat_log_message(
-                    event, self.players, self.bot_states))
-                for event in events
-                if event.get("kind") in (
-                    "bot_hit", "bot_human_hit", "bot_bot_hit"))
         for relay in authority_observation_relays:
             self.broadcast_bot_observation(relay)
         if events:
             for event in events:
-                if event.get("kind") == "shot":
-                    _server_log("SHOT attacker=%s seq=%s shell=%s" % (
-                        event.get("attacker"), event.get("shot_seq"), event.get("shell_index")))
-                elif event.get("kind") == "hit":
-                    _server_log("HIT attacker=%s target=%s damage=%s health=%s dead=%s" % (
-                        event.get("attacker"), event.get("target"), event.get("damage"),
-                        event.get("health"), event.get("dead")))
-                elif event.get("kind") == "health":
-                    _server_log("HEALTH target=%s damage=%s health=%s dead=%s source=%s" % (
-                        event.get("target"), event.get("damage"), event.get("health"),
-                        event.get("dead"), event.get("source")))
-                elif event.get("kind") in ("bot_hit", "bot_human_hit", "bot_bot_hit"):
-                    _server_log(bot_combat_logs[event["event_id"]])
-                elif event.get("kind") == "authority":
-                    _server_log("BOT AUTHORITY player_id=%s" % event.get("player_id"))
-                elif event.get("kind") == "battle_result":
-                    _server_log("BATTLE RESULT winner=%s reason=%s base_team=%s" % (
-                        event.get("winner"), event.get("reason"), event.get("base_team")))
-                elif event.get("kind") == "destructible":
-                    _server_log(
-                        "DESTRUCTIBLE kind=%s chunk=%s item=%s by=%s" % (
-                            event.get("destructible_kind"),
-                            event.get("chunk_id"), event.get("item_index"),
-                            event.get("reported_by")))
-                elif event.get("kind") == "projectile_impact":
-                    _server_log(
-                        "PROJECTILE TERMINAL id=%s outcome=%s elapsed_ms=%s" % (
-                            event.get("projectile_id"),
-                            event.get("outcome"),
-                            event.get("resolved_time_ms")))
+                message = _server_event_log_message(
+                    event, self.players, self.bot_states)
+                if message is not None:
+                    _server_log(message)
             self.broadcast(events_message)
         # Ordered combat causes must reach the client before the durable state
         # they produced.  Otherwise #1513 observes the new HP/death first and
@@ -6242,10 +6271,14 @@ class ClientHandler(socketserver.BaseRequestHandler):
             # player leave-battle lifecycle or mutates player statistics.
             return "close"
         else:
-            _server_log("WORKER COMMAND rejected type=%s" % message_type)
+            _server_log_limited(
+                "worker-command:%s" % message_type,
+                "WORKER COMMAND rejected type=%s" % message_type)
             return False
         if not accepted:
-            _server_log("WORKER COMMAND rejected type=%s" % message_type)
+            _server_log_limited(
+                "worker-command:%s" % message_type,
+                "WORKER COMMAND rejected type=%s" % message_type)
         return bool(accepted)
 
     def _handle_simulation_worker(self, server, conn, buffer, hello):

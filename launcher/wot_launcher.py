@@ -80,6 +80,67 @@ def _no_console_flags():
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
+SERVER_LOG_MAX_BYTES = 1024 * 1024
+SERVER_LOG_RETAIN_BYTES = 768 * 1024
+
+
+class _BoundedLogStream(object):
+    """Keep the newest complete UTF-8 log lines within a fixed-size file."""
+
+    def __init__(self, path, max_bytes=SERVER_LOG_MAX_BYTES,
+                 retain_bytes=SERVER_LOG_RETAIN_BYTES):
+        self._max_bytes = max(1, int(max_bytes))
+        self._retain_bytes = max(
+            1, min(int(retain_bytes), self._max_bytes - 1))
+        # One launcher-owned server run is one diagnostic unit. Starting a
+        # new run discards stale output from older builds and battles.
+        self._stream = open(path, "w+b")
+        self._size = 0
+
+    @staticmethod
+    def _complete_tail(payload):
+        newline = payload.find(b"\n")
+        if newline >= 0:
+            return payload[newline + 1:]
+        return b""
+
+    def _compact(self, incoming_bytes=0):
+        keep = min(
+            self._retain_bytes, self._size,
+            max(0, self._max_bytes - int(incoming_bytes)))
+        self._stream.flush()
+        self._stream.seek(max(0, self._size - keep))
+        tail = self._stream.read(keep)
+        if keep < self._size:
+            tail = self._complete_tail(tail)
+        self._stream.seek(0)
+        self._stream.truncate()
+        self._stream.write(tail)
+        self._size = len(tail)
+
+    def write(self, value):
+        text = str(value)
+        payload = text.encode("utf-8", "replace")
+        if len(payload) >= self._max_bytes:
+            payload = self._complete_tail(payload[-self._retain_bytes:])
+        if self._size + len(payload) > self._max_bytes:
+            self._compact(len(payload))
+        self._stream.seek(0, os.SEEK_END)
+        self._stream.write(payload)
+        self._size += len(payload)
+        return len(text)
+
+    def flush(self):
+        self._stream.flush()
+
+    def close(self):
+        self._stream.close()
+
+    @property
+    def closed(self):
+        return self._stream.closed
+
+
 class _TeeTextStream(object):
     """Mirror server output to its inherited stream and a persistent log."""
 
@@ -93,14 +154,36 @@ class _TeeTextStream(object):
             result = None
             if self._primary is not None:
                 result = self._primary.write(value)
-            self._log_stream.write(value)
+            self._write_log(value)
             return len(value) if result is None else result
 
     def flush(self):
         with self._lock:
             if self._primary is not None:
                 self._primary.flush()
+            self._flush_log()
+
+    def _write_log(self, value):
+        try:
+            if self._log_stream.closed:
+                return
+            self._log_stream.write(value)
+        except Exception:
+            self._disable_log()
+
+    def _flush_log(self):
+        try:
+            if self._log_stream.closed:
+                return
             self._log_stream.flush()
+        except Exception:
+            self._disable_log()
+
+    def _disable_log(self):
+        try:
+            self._log_stream.close()
+        except Exception:
+            pass
 
     def __getattr__(self, name):
         target = self._primary or self._log_stream
@@ -1211,12 +1294,22 @@ class LauncherWindow(object):
 
 
 def _open_server_log():
-    """Persist server output while preserving the launcher's live pipe."""
-    path = core.server_log_path()
-    directory = os.path.dirname(path)
-    if directory and not os.path.isdir(directory):
-        os.makedirs(directory)
-    stream = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
+    """Persist one bounded server run while preserving the live pipe."""
+    try:
+        path = core.server_log_path()
+        directory = os.path.dirname(path)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory)
+        stream = _BoundedLogStream(path)
+    except Exception as error:
+        try:
+            sys.stderr.write(
+                "Server log is unavailable; continuing with live output: "
+                "%s\n" % error)
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return None
     lock = threading.RLock()
     sys.stdout = _TeeTextStream(sys.stdout, stream, lock)
     sys.stderr = _TeeTextStream(sys.stderr, stream, lock)

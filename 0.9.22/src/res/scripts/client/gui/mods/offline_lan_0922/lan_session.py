@@ -13,6 +13,7 @@ from gui.mods.offline_lan_0922 import waiting_room_ui
 
 
 RECONNECT_DELAY = 2.0
+POSTBATTLE_RETRY_DELAY = 0.10
 # The server returns an abandoned round to its waiting room five seconds after
 # the last participant leaves.  Rejoin if that roster never arrives.
 ROUND_END_TIMEOUT = 12.0
@@ -178,6 +179,13 @@ class LANSession(object):
         self._battle_start_callback_id = None
         self._retry_callback_id = None
         self._retry_token = None
+        self._postbattle_callback_id = None
+        self._postbattle_token = None
+        self._postbattle_request_token = None
+        self._postbattle_service_error_reported = False
+        self._postbattle_result_retry_attempted = set()
+        self._postbattle_notification_retry_attempted = set()
+        self._postbattle_notification_error_reported = set()
         self._round_end_callback_id = None
         self._round_end_token = None
         self._pending_battle_start = None
@@ -233,13 +241,7 @@ class LANSession(object):
     def _publish_postbattle_results(self):
         """Let the stock service request and cache each durable pending row."""
         store = self._postbattle_store
-        if store is None or not self._lobby_ready():
-            return False
-        try:
-            from gui.battle_results.context import RequestResultsContext
-            from gui.shared.personality import ServicesLocator
-            service = ServicesLocator.battleResults
-        except Exception:
+        if store is None:
             return False
         arenas = list(store.pending_arenas())
         archived_arena = None
@@ -250,39 +252,167 @@ class LANSession(object):
                 if (archived_arena is not None and
                         archived_arena not in arenas):
                     arenas.append(archived_arena)
+        arenas = [arena for arena in arenas
+                  if (arena not in self._requested_results and
+                      arena not in self._completed_results)]
+        notifications = sorted(
+            self._completed_results.difference(self._notified_results))
+        if not arenas and not notifications:
+            return False
+        if not self._lobby_ready():
+            self._schedule_postbattle_publish()
+            return False
+        published = self._publish_completed_battle_notifications(
+            notifications)
+        if not arenas:
+            return published
+        try:
+            from gui.battle_results.context import RequestResultsContext
+            from gui.shared.personality import ServicesLocator
+            service = ServicesLocator.battleResults
+            request_results = getattr(service, 'requestResults', None)
+            if not callable(RequestResultsContext) or not callable(
+                    request_results):
+                raise TypeError(
+                    '#1513 battle-results service boundary is invalid')
+        except Exception as error:
+            self._report_postbattle_service_error(error)
+            return published
+        self._postbattle_service_error_reported = False
         for arena_unique_id in arenas:
-            if (arena_unique_id in self._requested_results or
-                    arena_unique_id in self._completed_results):
-                continue
-            message_data = store.service_message_data(arena_unique_id)
             self._requested_results.add(arena_unique_id)
+            request_token = object()
+            self._postbattle_request_token = request_token
+            generation = self._client_generation
             try:
                 is_archived = arena_unique_id == archived_arena
+                show_immediately = not is_archived
+                show_policy = getattr(
+                    store, 'should_show_immediately', None)
+                if show_immediately and callable(show_policy):
+                    show_immediately = bool(show_policy(arena_unique_id))
                 def completed(success, arena=arena_unique_id,
-                              summary=message_data,
-                              archived=is_archived):
-                    self._requested_results.discard(arena)
-                    if not success:
+                              archived=is_archived,
+                              token=request_token,
+                              client_generation=generation):
+                    if (self._postbattle_request_token is not token or
+                            self._stopped or
+                            client_generation != self._client_generation):
                         return
+                    self._requested_results.discard(arena)
+                    self._postbattle_request_token = None
+                    if not success:
+                        self._retry_postbattle_result(arena)
+                        return
+                    self._postbattle_result_retry_attempted.discard(arena)
                     if archived:
                         self._archived_result_replayed = True
                     self._completed_results.add(arena)
-                    if summary is not None:
-                        self._publish_battle_service_message(arena, summary)
                     # #1513 BattleResultsCache accepts one request at a time.
                     # Its callback runs after releasing that wait gate, so
-                    # drain the next durable result serially.
+                    # publish this notification and drain the next durable
+                    # result serially.
                     self._publish_postbattle_results()
-                service.requestResults(RequestResultsContext(
-                    arena_unique_id, False, False, True), completed)
+                request_results(RequestResultsContext(
+                    arena_unique_id, show_immediately, False, True), completed)
             except Exception as error:
                 self._requested_results.discard(arena_unique_id)
-                sys.stdout.write(
-                    '[Offline LAN 0.9.22] battle result %s could not be '
-                    'requested: %s\n' % (arena_unique_id, error))
-                continue
+                if self._postbattle_request_token is request_token:
+                    self._postbattle_request_token = None
+                if isinstance(error, (AttributeError, TypeError)):
+                    self._report_postbattle_service_error(error)
+                else:
+                    sys.stdout.write(
+                        '[Offline LAN 0.9.22] battle result %s could not be '
+                        'requested: %s\n' % (arena_unique_id, error))
+                    self._retry_postbattle_result(arena_unique_id)
+                return published
             return True
-        return False
+        return published
+
+    def _report_postbattle_service_error(self, error):
+        """Report a permanent #1513 service/ABI mismatch only once."""
+        if self._postbattle_service_error_reported:
+            return
+        self._postbattle_service_error_reported = True
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] native battle-results service is '
+            'unavailable: %s\n' % error)
+
+    def _publish_completed_battle_notifications(self, arenas):
+        """Publish cached results without fetching them from Account again."""
+        store = self._postbattle_store
+        published = False
+        for arena_unique_id in arenas:
+            message_data = store.service_message_data(arena_unique_id)
+            if message_data is None:
+                self._report_postbattle_notification_error(
+                    arena_unique_id,
+                    'native service-message data is unavailable')
+                if arena_unique_id not in \
+                        self._postbattle_notification_retry_attempted:
+                    self._postbattle_notification_retry_attempted.add(
+                        arena_unique_id)
+                    self._schedule_postbattle_publish()
+                continue
+            if self._publish_battle_service_message(
+                    arena_unique_id, message_data):
+                self._notified_results.add(arena_unique_id)
+                self._postbattle_notification_retry_attempted.discard(
+                    arena_unique_id)
+                published = True
+            elif arena_unique_id not in \
+                    self._postbattle_notification_retry_attempted:
+                self._postbattle_notification_retry_attempted.add(
+                    arena_unique_id)
+                self._schedule_postbattle_publish()
+        return published
+
+    def _retry_postbattle_result(self, arena_unique_id):
+        if arena_unique_id in self._postbattle_result_retry_attempted:
+            return False
+        self._postbattle_result_retry_attempted.add(arena_unique_id)
+        return self._schedule_postbattle_publish()
+
+    def _report_postbattle_notification_error(self, arena_unique_id, error):
+        if arena_unique_id in self._postbattle_notification_error_reported:
+            return
+        self._postbattle_notification_error_reported.add(arena_unique_id)
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] battle result %s notification could '
+            'not be published: %s\n' % (arena_unique_id, error))
+
+    def _cancel_postbattle_callback(self):
+        callback_id = self._postbattle_callback_id
+        self._postbattle_callback_id = None
+        self._postbattle_token = None
+        self._postbattle_request_token = None
+        self._requested_results.clear()
+        if callback_id is not None and callable(self._cancel_callback):
+            self._cancel_callback(callback_id)
+
+    def _schedule_postbattle_publish(self):
+        """Wait for the rebuilt lobby, then use its native result service."""
+        if (self._stopped or self._postbattle_callback_id is not None or
+                not callable(self._callback)):
+            return False
+        token = object()
+        self._postbattle_token = token
+
+        def retry():
+            if self._postbattle_token is not token:
+                return
+            self._postbattle_callback_id = None
+            self._postbattle_token = None
+            if self._stopped:
+                return
+            self._publish_postbattle_progress()
+            self._publish_postbattle_results()
+
+        callback_id = self._callback(POSTBATTLE_RETRY_DELAY, retry)
+        if self._postbattle_token is token:
+            self._postbattle_callback_id = callback_id
+        return True
 
     def _publish_battle_service_message(self, arena_unique_id, result_data):
         """Inject one exact #1513 clickable service-channel result message."""
@@ -309,9 +439,8 @@ class LANSession(object):
             MessengerEntry.g_instance.protos.BW.serviceChannel.onReceiveSysMessage(
                 chat_action)
         except Exception as error:
-            sys.stdout.write(
-                '[Offline LAN 0.9.22] battle result %s notification could '
-                'not be published: %s\n' % (arena_unique_id, error))
+            self._report_postbattle_notification_error(
+                arena_unique_id, error)
             return False
         self._notified_results.add(arena_unique_id)
         return True
@@ -407,6 +536,7 @@ class LANSession(object):
         """Return a stopped or parked session to a clickable Battle button."""
         self._stopped = False
         self._cancel_retry_callback()
+        self._cancel_postbattle_callback()
         self._cancel_picker_close_callback()
         self._cancel_round_end_watchdog()
         self._clear_pending_battle_start()
@@ -434,6 +564,10 @@ class LANSession(object):
         # Only an explicit Battle click may raise the room over the garage.
         self._picker_requested = False
         self._connection_error_notified = False
+        self._postbattle_service_error_reported = False
+        self._postbattle_result_retry_attempted.clear()
+        self._postbattle_notification_retry_attempted.clear()
+        self._postbattle_notification_error_reported.clear()
         self.state = 'ready_to_join'
         if self._join_ui is None:
             self._join_ui = self._join_factory(self.join)
@@ -1599,8 +1733,6 @@ class LANSession(object):
             if callable(acknowledge):
                 acknowledge(_message_value(message, 'receipt_id'))
             if accepted:
-                self._status_notifier(
-                    'Battle results received. They will appear in the garage.')
                 self._publish_postbattle_progress()
             self._publish_postbattle_results()
         elif kind == 'snapshot':
@@ -1656,6 +1788,10 @@ class LANSession(object):
         errors = []
         try:
             self._cancel_retry_callback()
+        except Exception as error:
+            errors.append(error)
+        try:
+            self._cancel_postbattle_callback()
         except Exception as error:
             errors.append(error)
         try:

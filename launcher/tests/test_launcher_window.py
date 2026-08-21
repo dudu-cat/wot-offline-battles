@@ -761,10 +761,12 @@ class WindowTest(unittest.TestCase):
     def test_server_process_output_is_teed_to_the_live_pipe_and_log_file(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
+        log_path = os.path.join(self.settings_dir, "server.log")
         with mock.patch.object(wot_launcher.sys, "stdout", stdout), \
-                mock.patch.object(wot_launcher.sys, "stderr", stderr):
+                mock.patch.object(wot_launcher.sys, "stderr", stderr), \
+                mock.patch("core.server_log_path", return_value=log_path):
             self.assertEqual(
-                core.server_log_path(), wot_launcher._open_server_log())
+                log_path, wot_launcher._open_server_log())
             log_stream = wot_launcher.sys.stdout._log_stream
             wot_launcher.sys.stdout.write("server stdout\n")
             wot_launcher.sys.stderr.write("server stderr\n")
@@ -774,10 +776,69 @@ class WindowTest(unittest.TestCase):
 
         self.assertEqual("server stdout\n", stdout.getvalue())
         self.assertEqual("server stderr\n", stderr.getvalue())
-        with open(core.server_log_path(), encoding="utf-8") as stream:
+        with open(log_path, encoding="utf-8") as stream:
             saved = stream.read()
         self.assertIn("server stdout\n", saved)
         self.assertIn("server stderr\n", saved)
+
+    def test_server_log_keeps_only_the_current_bounded_run(self):
+        log_path = os.path.join(self.settings_dir, "server.log")
+        with open(log_path, "w", encoding="utf-8") as stream:
+            stream.write("older server run\n")
+
+        stream = wot_launcher._BoundedLogStream(
+            log_path, max_bytes=80, retain_bytes=48)
+        for index in range(12):
+            stream.write("current line %02d\n" % index)
+        stream.close()
+
+        with open(log_path, "rb") as saved:
+            payload = saved.read()
+        self.assertLessEqual(len(payload), 80)
+        self.assertNotIn(b"older server run", payload)
+        self.assertIn(b"current line 11", payload)
+        payload.decode("utf-8")
+
+    def test_server_log_write_failure_keeps_the_live_pipe_running(self):
+        class _FailingLog(object):
+            def __init__(self):
+                self.closed = False
+
+            def write(self, unused_value):
+                raise IOError("disk full")
+
+            def flush(self):
+                raise IOError("disk full")
+
+            def close(self):
+                self.closed = True
+
+        primary = io.StringIO()
+        log_stream = _FailingLog()
+        tee = wot_launcher._TeeTextStream(
+            primary, log_stream, wot_launcher.threading.RLock())
+
+        self.assertEqual(len("still live\n"), tee.write("still live\n"))
+        tee.flush()
+
+        self.assertEqual("still live\n", primary.getvalue())
+        self.assertTrue(log_stream.closed)
+
+    def test_unavailable_server_log_does_not_stop_the_server(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        log_path = os.path.join(self.settings_dir, "server.log")
+        with mock.patch.object(wot_launcher.sys, "stdout", stdout), \
+                mock.patch.object(wot_launcher.sys, "stderr", stderr), \
+                mock.patch("core.server_log_path", return_value=log_path), \
+                mock.patch.object(
+                    wot_launcher, "_BoundedLogStream",
+                    side_effect=IOError("launcher folder is read-only")):
+            self.assertIsNone(wot_launcher._open_server_log())
+            self.assertIs(stdout, wot_launcher.sys.stdout)
+            self.assertIs(stderr, wot_launcher.sys.stderr)
+
+        self.assertIn("continuing with live output", stderr.getvalue())
 
     def test_worker_start_failure_reports_the_native_failure_log(self):
         starter = core.worker_starter_executable(self.settings_dir)

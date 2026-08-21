@@ -179,6 +179,26 @@ class PostBattleContractTests(unittest.TestCase):
         vehicle = store.progress()['vehicles'][receipt['vehicle']]
         self.assertEqual(0, vehicle['survivedBattles'])
 
+    def test_only_a_battle_watched_to_the_end_opens_results_immediately(self):
+        watched = postbattle_store.PostBattleStore(path=None)
+        watched_receipt = _receipt(watched.account_key)
+        watched_receipt['premature_leave'] = False
+        self.assertTrue(watched.accept(watched_receipt))
+        self.assertTrue(watched.should_show_immediately(
+            watched_receipt['arena_unique_id']))
+        self.assertTrue(watched.acknowledge(
+            watched_receipt['arena_unique_id']))
+        self.assertTrue(watched.should_show_immediately(
+            watched_receipt['arena_unique_id']))
+
+        departed = postbattle_store.PostBattleStore(path=None)
+        departed_receipt = _receipt(departed.account_key)
+        departed_receipt['premature_leave'] = True
+        self.assertTrue(departed.accept(departed_receipt))
+        self.assertFalse(departed.should_show_immediately(
+            departed_receipt['arena_unique_id']))
+        self.assertFalse(departed.should_show_immediately(-1))
+
     def test_offline_reward_is_monotone_and_has_documented_boundaries(self):
         base = compute_offline_rewards({}, False, True)
         damage = compute_offline_rewards({'damage_dealt': 1000}, False, True)
@@ -226,10 +246,18 @@ class PostBattleContractTests(unittest.TestCase):
                 self.assertIsNotNone(final.result(
                     receipt['arena_unique_id'], packers=_Packers(),
                     replay_types=(_Replay, _ReplayConnector)))
-                self.assertEqual(
-                    receipt['arena_unique_id'],
-                    final.service_message_data(
-                        receipt['arena_unique_id'])['arenaUniqueID'])
+                service_data = final.service_message_data(
+                    receipt['arena_unique_id'])
+                self.assertEqual({
+                    'arenaTypeID', 'arenaCreateTime', 'playerVehicles',
+                    'xp', 'credits', 'crystal', 'creditsToDraw',
+                    'isWinner', 'team', 'winnerIfDraw', 'guiType',
+                    'arenaUniqueID',
+                }, set(service_data))
+                self.assertEqual(receipt['arena_unique_id'],
+                                 service_data['arenaUniqueID'])
+                self.assertEqual({50001: {}},
+                                 service_data['playerVehicles'])
             finally:
                 postbattle_store._vehicle_type_compact_descr = original_vehicle
                 postbattle_store._arena_type_id = original_arena
