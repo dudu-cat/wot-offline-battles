@@ -39,6 +39,8 @@ NAVGRAPH_DIR_ENV = "WOT_OFFLINE_NAVGRAPH_DIR"
 GAME_RESTART_GRACE_SECONDS = 8.0
 GAME_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 GAME_SHUTDOWN_POLL_SECONDS = 0.1
+PAIRED_PLAYER_WINDOW_CLOSE_GRACE_SECONDS = 3.0
+PAIRED_PLAYER_WINDOW_POLL_SECONDS = 0.25
 KNOWN_FOLDER_LIMIT = 10
 COMMON_GAME_ROOTS = (
     "C:\\Games", "C:\\Program Files", "C:\\Program Files (x86)",
@@ -391,7 +393,27 @@ def _write_json(path, value, indent=2):
     payload = json.dumps(value, indent=indent, sort_keys=False) + "\n"
     with open(temporary_path, "wb") as stream:
         stream.write(payload.encode("utf-8"))
-    os.replace(temporary_path, path)
+    try:
+        os.replace(temporary_path, path)
+    except OSError as error:
+        # Windows refuses to replace an existing file whose read-only bit was
+        # preserved by an older installation. Only relax that specific case;
+        # locks and directory permission failures must still surface.
+        if getattr(error, "winerror", None) != 5 or not os.path.isfile(path):
+            raise
+        import stat
+        original_mode = os.stat(path).st_mode
+        if original_mode & stat.S_IWRITE:
+            raise
+        os.chmod(path, original_mode | stat.S_IWRITE)
+        try:
+            os.replace(temporary_path, path)
+        except OSError:
+            try:
+                os.chmod(path, original_mode)
+            except OSError:
+                pass
+            raise
 
 
 def _read_json(path):
@@ -1341,6 +1363,135 @@ def game_is_running(runner=None, executable=GAME_EXECUTABLE):
     if isinstance(output, bytes):
         output = output.decode("utf-8", "replace")
     return executable.lower() in output.lower()
+
+
+def _visible_window_process_paths():
+    """Return executable paths owning visible windows on this desktop."""
+    if os.name != "nt":
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    process_ids = set()
+    callback_type = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = [
+        wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD)]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    @callback_type
+    def collect(window, unused):
+        if user32.IsWindowVisible(window):
+            process_id = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(
+                window, ctypes.byref(process_id))
+            if process_id.value:
+                process_ids.add(process_id.value)
+        return True
+
+    if not user32.EnumWindows(collect, 0):
+        raise ctypes.WinError()
+
+    query_limited_information = 0x1000
+    paths = []
+    for process_id in process_ids:
+        process = kernel32.OpenProcess(
+            query_limited_information, False, process_id)
+        if not process:
+            continue
+        try:
+            path = ctypes.create_unicode_buffer(32768)
+            path_length = wintypes.DWORD(len(path))
+            if kernel32.QueryFullProcessImageNameW(
+                    process, 0, path, ctypes.byref(path_length)):
+                paths.append(path.value)
+        finally:
+            kernel32.CloseHandle(process)
+    return paths
+
+
+def game_window_is_visible(game_root, enumerator=None):
+    """Report whether this game's visible client window still exists.
+
+    ``None`` means the Windows window lookup was unavailable. The hidden
+    simulation client lives on a private desktop, so it is deliberately absent
+    from this lookup.
+    """
+    try:
+        paths = (_visible_window_process_paths() if enumerator is None
+                 else enumerator())
+    except Exception:
+        return None
+    if paths is None:
+        return None
+    target = os.path.normcase(os.path.realpath(game_executable(game_root)))
+    return any(
+        os.path.normcase(os.path.realpath(path)) == target
+        for path in paths)
+
+
+def wait_for_paired_player_exit(
+        process, game_root, window_visible=None,
+        close_grace=PAIRED_PLAYER_WINDOW_CLOSE_GRACE_SECONDS,
+        poll=PAIRED_PLAYER_WINDOW_POLL_SECONDS, sleep=None, clock=None):
+    """Wait for the paired player, retiring a windowless process residue.
+
+    The #1513 client can destroy its only visible window without terminating
+    its process. Only treat that as closure after a player window has first
+    appeared and then remained absent for the full grace period.
+    """
+    import time as time_module
+
+    sleep = sleep or time_module.sleep
+    clock = clock or time_module.monotonic
+    window_visible = window_visible or (
+        lambda: game_window_is_visible(game_root))
+    window_seen = False
+    missing_since = None
+    while True:
+        exit_code = process.poll()
+        if exit_code is not None:
+            return exit_code, False
+        visible = window_visible()
+        now = clock()
+        if visible is True:
+            window_seen = True
+            missing_since = None
+        elif visible is False and window_seen:
+            if missing_since is None:
+                missing_since = now
+            elif now - missing_since >= max(0.0, float(close_grace)):
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                try:
+                    exit_code = process.wait(
+                        timeout=GAME_SHUTDOWN_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    exit_code = process.wait()
+                return exit_code, True
+        else:
+            # An unavailable lookup does not count toward a confirmed absence.
+            missing_since = None
+        sleep(max(0.001, float(poll)))
 
 
 def kill_game(runner=None, executable=GAME_EXECUTABLE):

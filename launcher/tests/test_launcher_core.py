@@ -2,6 +2,7 @@ import ast
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import unittest
@@ -274,6 +275,38 @@ class SettingsFileTest(unittest.TestCase):
             "mods", "configs", "offline_lan_0922", "config.json"))
         self.assertEqual(config["name"], "Peng")
         self.assertEqual(config["max_health"], 90)
+
+    def test_0_9_22_name_updates_a_windows_read_only_config(self):
+        config_path = os.path.join(self.root, "mods", "configs",
+                                   "offline_lan_0922", "config.json")
+        os.makedirs(os.path.dirname(config_path))
+        with open(config_path, "w") as stream:
+            json.dump({"schema": 1, "name": "Player", "max_health": 90},
+                      stream)
+        os.chmod(config_path, stat.S_IREAD)
+        original_replace = os.replace
+        config_replace_attempts = []
+
+        def windows_replace(source, target):
+            if target == config_path:
+                config_replace_attempts.append((source, target))
+            if target == config_path and len(config_replace_attempts) == 1:
+                error = PermissionError(13, "Access is denied", target)
+                error.winerror = 5
+                raise error
+            return original_replace(source, target)
+
+        with mock.patch("core.os.replace", side_effect=windows_replace):
+            core.write_settings(
+                self.root, core.PORT_0_9_22, core.MODE_HOST,
+                core.LOCAL_HOST, core.DEFAULT_SERVER_PORT, "Peng")
+
+        config = self._read(os.path.join(
+            "mods", "configs", "offline_lan_0922", "config.json"))
+        self.assertEqual(config["name"], "Peng")
+        self.assertEqual(config["max_health"], 90)
+        self.assertEqual(len(config_replace_attempts), 2)
+        self.assertFalse(os.path.exists(config_path + ".tmp"))
 
     def test_unsupported_port_is_rejected(self):
         self.assertRaises(core.LauncherError, core.write_settings, self.root,
@@ -1423,6 +1456,26 @@ class GameProcessTest(unittest.TestCase):
                 return self.states.pop(0)
             return self.states[0]
 
+    class _TerminableProcess(object):
+        def __init__(self):
+            self.exit_code = None
+            self.terminated = False
+            self.killed = False
+
+        def poll(self):
+            return self.exit_code
+
+        def terminate(self):
+            self.terminated = True
+            self.exit_code = 1
+
+        def kill(self):
+            self.killed = True
+            self.exit_code = -9
+
+        def wait(self, timeout=None):
+            return self.exit_code
+
     def test_a_listed_process_means_the_game_runs(self):
         listing = ("WorldOfTanks.exe   9876 Console   1   1,234,567 K\r\n"
                    ).encode("utf-8")
@@ -1439,6 +1492,40 @@ class GameProcessTest(unittest.TestCase):
             raise OSError("tasklist is missing")
 
         self.assertFalse(core.game_is_running(runner=fail))
+
+    def test_visible_game_window_matches_the_selected_client_path(self):
+        selected = core.game_executable("/selected-game")
+
+        self.assertTrue(core.game_window_is_visible(
+            "/selected-game", enumerator=lambda: [selected]))
+        self.assertFalse(core.game_window_is_visible(
+            "/selected-game",
+            enumerator=lambda: [core.game_executable("/other-game")]))
+
+    def test_hidden_worker_does_not_latch_paired_player_as_closed(self):
+        process = self._Process([None, None, 0])
+        ticks = iter([0.0, 10.0])
+
+        self.assertEqual(
+            (0, False),
+            core.wait_for_paired_player_exit(
+                process, "/game", window_visible=lambda: False,
+                close_grace=1.0, poll=1.0,
+                clock=lambda: next(ticks), sleep=lambda unused: None))
+
+    def test_paired_player_retires_after_continuous_window_loss(self):
+        process = self._TerminableProcess()
+        visible = iter([False, False, True, False, None, False, False, False])
+        ticks = iter(float(index) for index in range(8))
+
+        self.assertEqual(
+            (1, True),
+            core.wait_for_paired_player_exit(
+                process, "/game", window_visible=lambda: next(visible),
+                close_grace=2.0, poll=1.0,
+                clock=lambda: next(ticks), sleep=lambda unused: None))
+        self.assertTrue(process.terminated)
+        self.assertFalse(process.killed)
 
     def test_the_wait_ends_after_a_quiet_grace_period(self):
         ticks = iter([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0])

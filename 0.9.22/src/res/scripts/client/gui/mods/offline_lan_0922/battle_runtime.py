@@ -1560,7 +1560,8 @@ class BattleRuntime(object):
             # space is mapped.  Setting the gameplay mask after create()
             # returns leaves other gameplays' already-created circles alive.
             try:
-                self._configure_standard_space_visibility(space_id)
+                self._configure_standard_space_visibility(
+                    space_id, before_mapping=True)
             except Exception as error:
                 # OfflineMapCreator.create() catches every setup exception.
                 # Preserve this precise boundary failure for start() instead
@@ -1723,15 +1724,17 @@ class BattleRuntime(object):
                 return arena_type
         return None
 
-    def _configure_standard_space_visibility(self, space_id=None):
+    def _configure_standard_space_visibility(
+            self, space_id=None, before_mapping=False):
         """Install the selected gameplay bit normally supplied by the server."""
         bigworld = self._runtime.bigworld
-        spaces = getattr(bigworld, 'spaces', None)
+        set_mask = getattr(
+            bigworld, 'wg_setSpaceItemsVisibilityMask', None)
         visibility = getattr(
             self._runtime, 'client_visibility_flags', None)
         gameplay_mask = getattr(
             self._runtime, 'arena_visibility_mask', None)
-        if (spaces is None or visibility is None or
+        if (not callable(set_mask) or visibility is None or
                 not callable(gameplay_mask)):
             raise RuntimeError(
                 '#1513 space visibility boundary is unavailable')
@@ -1757,27 +1760,37 @@ class BattleRuntime(object):
         # bits for an ordinary player.  The complete final stock mask is
         # therefore the server-selected gameplay bit.
         expected = selected_bit
+        get_mask = getattr(
+            bigworld, 'wg_getSpaceItemsVisibilityMask', None)
+        current = None
+        if not before_mapping and callable(get_mask):
+            try:
+                current = get_mask(space_id)
+            except (AttributeError, KeyError, TypeError, ValueError,
+                    OverflowError):
+                current = None
         try:
-            # OldSpaceData maps key 300 and addSpaceGeometryMapping to this
-            # exact typed object.  Configure its UINT32 property before the
-            # geometryMappings.add() call instantiates static ControlPoints.
-            space = spaces[space_id]
-        except (KeyError, TypeError):
-            raise RuntimeError(
-                '#1513 live space data is unavailable before geometry '
-                'mapping: space_id=%r' % (space_id,))
-        try:
-            actual = space.itemsVisibilityMask
-            if actual != expected:
-                space.itemsVisibilityMask = expected
-                actual = space.itemsVisibilityMask
+            # Match exact #1513 ClientHangarSpace.create(): a client-only
+            # space has no BigWorld.spaces entry yet, so the native setter is
+            # called between createSpace() and addSpaceGeometryMapping().
+            # Reusing the same boundary later also repairs the stock Avatar
+            # visibility update without requiring server space data.
+            if before_mapping or current != expected:
+                set_mask(space_id, expected)
         except (AttributeError, TypeError, ValueError, OverflowError):
             raise RuntimeError(
                 '#1513 gameplay visibility mask could not be applied')
-        if actual != expected:
-            raise RuntimeError(
-                '#1513 gameplay visibility mask was not applied: '
-                'expected=0x%x actual=%r' % (expected, actual))
+        if (not before_mapping and callable(get_mask) and
+                current != expected):
+            try:
+                actual = get_mask(space_id)
+            except (AttributeError, KeyError, TypeError, ValueError,
+                    OverflowError):
+                actual = None
+            if actual is not None and actual != expected:
+                raise RuntimeError(
+                    '#1513 gameplay visibility mask was not applied: '
+                    'expected=0x%x actual=%r' % (expected, actual))
         self._standard_space_visibility = (
             space_id, expected, client_bits, server_bits)
         self._next_space_visibility_check = (
@@ -1793,20 +1806,22 @@ class BattleRuntime(object):
             now + SPACE_VISIBILITY_CHECK_SECONDS)
         space_id, selected_bit, client_bits, server_bits = boundary
         bigworld = self._runtime.bigworld
-        spaces = getattr(bigworld, 'spaces', None)
-        if spaces is None:
+        get_mask = getattr(
+            bigworld, 'wg_getSpaceItemsVisibilityMask', None)
+        set_mask = getattr(
+            bigworld, 'wg_setSpaceItemsVisibilityMask', None)
+        if not callable(get_mask) or not callable(set_mask):
             raise RuntimeError(
                 '#1513 space visibility maintenance is unavailable')
         try:
-            space = spaces[space_id]
-            current = space.itemsVisibilityMask
+            current = get_mask(space_id)
             if current & server_bits == selected_bit:
                 return False
             # Preserve any live client-only flags while replacing only the
             # server gameplay selection that controls bases and capture zones.
             corrected = (current & client_bits) | selected_bit
-            space.itemsVisibilityMask = corrected
-            actual = space.itemsVisibilityMask
+            set_mask(space_id, corrected)
+            actual = get_mask(space_id)
         except (AttributeError, KeyError, TypeError, ValueError,
                 OverflowError):
             raise RuntimeError(

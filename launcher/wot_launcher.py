@@ -1235,10 +1235,16 @@ class LauncherWindow(object):
         self._game = subprocess.Popen(
             command, cwd=game_root, env=environment)
         try:
-            exit_code = self._game.wait()
+            window_closed = False
+            if paired_worker:
+                exit_code, window_closed = core.wait_for_paired_player_exit(
+                    self._game, game_root)
+            else:
+                exit_code = self._game.wait()
         finally:
             self._game = None
-        if (exit_code not in (None, 0) and not self._stop_requested):
+        if (exit_code not in (None, 0) and not self._stop_requested and
+                not window_closed):
             self._log("The game stopped with exit code %s." % exit_code)
         if paired_worker:
             self._log("The game closed.")

@@ -1151,11 +1151,10 @@ class _OfflineMap(object):
         if self.app_loader is not None:
             self.app_loader.showBattlePage()
         if self.bigworld is not None:
-            # Match OfflineMapCreator.create(): the client space exists before
-            # its compiled geometry is mapped, and static-item visibility is
-            # consumed at that mapping boundary.
-            self.bigworld.spaces[7] = self.bigworld.space_data_factory(
-                self.bigworld.operations, 7, 0xffffffff)
+            # Match exact #1513 OfflineMapCreator.create(): createSpace() does
+            # not publish a BigWorld.spaces entry before geometry mapping.
+            # The stock hangar path primes native visibility through
+            # wg_setSpaceItemsVisibilityMask at this same boundary.
             self.bigworld.addSpaceGeometryMapping(
                 7, None, 'spaces/' + map_name)
             self.bigworld.operations.append(('map_create', map_name))
@@ -1245,6 +1244,7 @@ class _BigWorld(object):
             translation=_Vector(), axis=_Vector(0.0, 0.0, 1.0))
         self.spaces = {
             7: _SpaceData(self.operations, 7, 0xffffffff)}
+        self.pending_visibility_masks = {}
         self.space_data_factory = _SpaceData
         self.mapped_visibility_masks = []
         self.legacy_visibility_calls = []
@@ -1347,6 +1347,7 @@ class _BigWorld(object):
         self.entities.clear()
         self.pending_entities.clear()
         self.spaces.clear()
+        self.pending_visibility_masks.clear()
         self.avatar = None
 
     def loadResourceListBG(self, assemblers, callback):
@@ -1357,18 +1358,31 @@ class _BigWorld(object):
         self.operations.append(('watcher', name, enabled))
 
     def addSpaceGeometryMapping(self, space_id, unused_mapper, unused_path):
+        space_id = int(space_id)
+        if space_id not in self.spaces:
+            visibility_mask = self.pending_visibility_masks.pop(
+                space_id, 0xffffffff)
+            self.spaces[space_id] = self.space_data_factory(
+                self.operations, space_id, visibility_mask)
         self.mapped_visibility_masks.append(
-            self.spaces[int(space_id)].itemsVisibilityMask)
+            self.spaces[space_id].itemsVisibilityMask)
         return 1
 
     def wg_getSpaceItemsVisibilityMask(self, space_id):
-        self.legacy_visibility_calls.append(('get', int(space_id)))
-        return self.spaces[int(space_id)].itemsVisibilityMask
+        space_id = int(space_id)
+        self.legacy_visibility_calls.append(('get', space_id))
+        if space_id in self.spaces:
+            return self.spaces[space_id].itemsVisibilityMask
+        return self.pending_visibility_masks.get(space_id)
 
     def wg_setSpaceItemsVisibilityMask(self, space_id, mask):
         space_id = int(space_id)
         self.legacy_visibility_calls.append(('set', space_id, mask))
-        self.spaces[space_id].itemsVisibilityMask = mask
+        if space_id in self.spaces:
+            self.spaces[space_id].itemsVisibilityMask = mask
+        else:
+            self.pending_visibility_masks[space_id] = mask
+            self.operations.append(('space_visibility', space_id, mask))
 
     def clearAllSpaces(self):
         self.clearEntitiesAndSpaces()
@@ -4367,7 +4381,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
             runtime.bigworld.operations)
         self.assertEqual([0x00000001],
                          runtime.bigworld.mapped_visibility_masks)
-        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
+        self.assertEqual(
+            [('set', 7, 0x00000001), ('get', 7)],
+            runtime.bigworld.legacy_visibility_calls)
         self.assertNotIn(
             'addSpaceGeometryMapping', runtime.bigworld.__dict__)
         self.assertEqual(0, runtime.offline_map_creator.viewer_camera_calls)
@@ -4414,7 +4430,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
             runtime.bigworld.spaces[7].itemsVisibilityMask)
         self.assertEqual([0x00000001],
                          runtime.bigworld.mapped_visibility_masks)
-        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
+        self.assertEqual(
+            [('set', 7, 0x00000001), ('get', 7)],
+            runtime.bigworld.legacy_visibility_calls)
 
         # Exact #1513 Malinovka WTCP records: both CTF bases include bit 0;
         # the neutral domination control point includes bit 1 but not bit 0.
@@ -4422,12 +4440,17 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(0xffffff89 & mapped_mask)
         self.assertFalse(0xffffff82 & mapped_mask)
 
-    def test_native_map_uses_typed_client_space_without_legacy_exports(self):
+    def test_native_map_primes_visibility_with_stock_setter(self):
         runtime = _runtime()
+        original_set_mask = runtime.bigworld.wg_setSpaceItemsVisibilityMask
+        live_space_at_write = []
+
+        def set_mask(space_id, mask):
+            live_space_at_write.append(int(space_id) in runtime.bigworld.spaces)
+            return original_set_mask(space_id, mask)
+
         runtime.bigworld.wg_setSpaceItemsVisibilityMask = mock.Mock(
-            side_effect=AssertionError('legacy visibility setter was used'))
-        runtime.bigworld.wg_getSpaceItemsVisibilityMask = mock.Mock(
-            side_effect=AssertionError('legacy visibility getter was used'))
+            side_effect=set_mask)
         battle = BattleRuntime(runtime)
 
         self.assertTrue(battle.start({
@@ -4443,36 +4466,43 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             1, runtime.bigworld.spaces[7].itemsVisibilityMask)
         self.assertEqual([1], runtime.bigworld.mapped_visibility_masks)
-        runtime.bigworld.wg_setSpaceItemsVisibilityMask.assert_not_called()
-        runtime.bigworld.wg_getSpaceItemsVisibilityMask.assert_not_called()
+        self.assertEqual([False], live_space_at_write)
+        runtime.bigworld.wg_setSpaceItemsVisibilityMask.assert_called_once_with(
+            7, 1)
+        self.assertEqual(
+            [('set', 7, 1), ('get', 7)],
+            runtime.bigworld.legacy_visibility_calls)
         self.assertEqual([(4, 5)], runtime.app_loader.transitions)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
 
-    def test_native_map_fails_if_live_space_is_missing_before_mapping(self):
+    def test_native_map_does_not_require_live_space_before_mapping(self):
         runtime = _runtime()
+        original_add_mapping = runtime.bigworld.addSpaceGeometryMapping
+        live_space_at_mapping = []
 
-        def create_without_live_space(map_name):
-            runtime.bigworld.spaces.pop(7, None)
-            try:
-                runtime.bigworld.addSpaceGeometryMapping(
-                    7, None, 'spaces/' + map_name)
-            except RuntimeError:
-                # Exact OfflineMapCreator catches its entire create body.
-                return
+        def add_mapping(space_id, mapper, path):
+            live_space_at_mapping.append(
+                int(space_id) in runtime.bigworld.spaces)
+            return original_add_mapping(space_id, mapper, path)
 
-        runtime.offline_map_creator.create = create_without_live_space
+        runtime.bigworld.addSpaceGeometryMapping = add_mapping
         battle = BattleRuntime(runtime)
 
-        self.assertFalse(battle.start({
+        self.assertTrue(battle.start({
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
-            'name': 'Player'}, {'round_id': 1}, _Client()))
+            'name': 'Player'}, {
+                'round_id': 1, 'map': '01_karelia',
+                'bot_authority_id': 1,
+                'players': [{
+                    'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                    'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+                'bots': []}, _Client()))
 
-        self.assertEqual('failed', battle.state)
-        self.assertIn(
-            'live space data is unavailable before geometry mapping',
-            battle.error)
-        self.assertNotIn(
-            'addSpaceGeometryMapping', runtime.bigworld.__dict__)
+        self.assertEqual([False], live_space_at_mapping)
+        self.assertEqual([1], runtime.bigworld.mapped_visibility_masks)
+        self.assertIs(
+            add_mapping,
+            runtime.bigworld.__dict__['addSpaceGeometryMapping'])
 
     def test_incomplete_hangar_fails_before_native_clear(self):
         runtime = _runtime()
@@ -4655,21 +4685,20 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(1, runtime.app_loader.lobby_disposals)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
 
-    def test_visibility_readback_failure_restores_clean_lobby_then_retries(self):
+    def test_visibility_setter_failure_restores_clean_lobby_then_retries(self):
         runtime = _runtime()
         write_count = [0]
+        original_set_mask = runtime.bigworld.wg_setSpaceItemsVisibilityMask
 
-        class _RejectFirstSpaceData(_SpaceData):
-            @_SpaceData.itemsVisibilityMask.setter
-            def itemsVisibilityMask(self, mask):
-                write_count[0] += 1
-                if write_count[0] == 1:
-                    self._operations.append(
-                        ('space_visibility_rejected', self._space_id, mask))
-                    return
-                _SpaceData.itemsVisibilityMask.fset(self, mask)
+        def reject_first_write(space_id, mask):
+            write_count[0] += 1
+            if write_count[0] == 1:
+                runtime.bigworld.operations.append(
+                    ('space_visibility_rejected', int(space_id), mask))
+                raise ValueError('native visibility write rejected')
+            return original_set_mask(space_id, mask)
 
-        runtime.bigworld.space_data_factory = _RejectFirstSpaceData
+        runtime.bigworld.wg_setSpaceItemsVisibilityMask = reject_first_write
         battle = BattleRuntime(runtime)
 
         self.assertFalse(battle.start({
@@ -4677,7 +4706,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'name': 'Player'}, {'round_id': 1}, _Client()))
 
         self.assertEqual('failed', battle.state)
-        self.assertIn('visibility mask was not applied', battle.error)
+        self.assertIn('visibility mask could not be applied', battle.error)
         self.assertEqual([(4, 5), (5, 4)], runtime.app_loader.transitions)
         self.assertEqual(1, runtime.app_loader.lobby_disposals)
         self.assertEqual(2, runtime.app_loader.lobby_populates)
@@ -4702,7 +4731,40 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
         self.assertEqual(
             1, runtime.bigworld.spaces[7].itemsVisibilityMask)
-        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
+        self.assertEqual(
+            [('set', 7, 1), ('get', 7)],
+            runtime.bigworld.legacy_visibility_calls)
+
+    def test_post_mapping_visibility_write_is_read_back(self):
+        runtime = _runtime()
+        original_create = runtime.offline_map_creator.create
+        original_set_mask = runtime.bigworld.wg_setSpaceItemsVisibilityMask
+
+        def create_then_reset_visibility(map_name):
+            original_create(map_name)
+            runtime.bigworld.spaces[7]._items_visibility_mask = 0xffffffff
+
+        def reject_live_space_write(space_id, mask):
+            if int(space_id) in runtime.bigworld.spaces:
+                runtime.bigworld.legacy_visibility_calls.append(
+                    ('set_rejected', int(space_id), mask))
+                return
+            return original_set_mask(space_id, mask)
+
+        runtime.offline_map_creator.create = create_then_reset_visibility
+        runtime.bigworld.wg_setSpaceItemsVisibilityMask = \
+            reject_live_space_write
+        battle = BattleRuntime(runtime)
+
+        self.assertFalse(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {'round_id': 1}, _Client()))
+
+        self.assertEqual('failed', battle.state)
+        self.assertIn('visibility mask was not applied', battle.error)
+        self.assertIn(
+            ('set_rejected', 7, 1),
+            runtime.bigworld.legacy_visibility_calls)
 
     def test_battle_page_patch_does_not_overwrite_a_newer_class_patch(self):
         runtime = _runtime()

@@ -871,6 +871,22 @@ class WindowTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(marker))
         self.assertIn("worker_exited_before_ready", self._log_text())
 
+    def test_paired_player_uses_window_aware_exit_monitor(self):
+        game = _Process(exit_code=None)
+        with mock.patch(
+                "wot_launcher.subprocess.Popen", return_value=game), \
+                mock.patch(
+                    "core.wait_for_paired_player_exit",
+                    return_value=(1, True)) as wait:
+            self.window._run_game(
+                self.settings_dir, core.PORT_0_9_22, core.LOCAL_HOST,
+                core.DEFAULT_SERVER_PORT, paired_worker=True)
+
+        wait.assert_called_once_with(game, self.settings_dir)
+        self.assertIsNone(self.window._game)
+        self.assertNotIn("exit code 1", self._log_text())
+        self.assertIn("The game closed.", self._log_text())
+
     def test_join_does_not_start_the_game_for_an_unrelated_listener(self):
         session = {
             "client": core.PORT_0_9_22,
