@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -785,6 +786,41 @@ class VehicleOverlayTest(unittest.TestCase):
         self.assertFalse(os.path.exists(escaped))
         self.assertFalse(os.path.exists(
             vehicle_overlays.manifest_path(self.game)))
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction check")
+    def test_overlay_parent_junction_cannot_redirect_activation_outside_game(self):
+        vehicle_overlays.create_vehicle_profile(self.game, "Fast")
+        vehicle_overlays.apply_profile_edit(
+            self.game, "Fast", self.VEHICLE,
+            "speedLimits/forward", "40", is_running=lambda: False)
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        overlay_root = os.path.join(
+            self.game, *vehicle_overlays.OVERLAY_ROOT.split("/"))
+        os.makedirs(overlay_root)
+        redirected = os.path.join(overlay_root, "scripts")
+        result = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", redirected, outside],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if result.returncode != 0:
+            self.skipTest(
+                "directory junctions are unavailable: %s" %
+                result.stdout.decode("utf-8", "replace"))
+
+        def remove_junction():
+            if os.path.lexists(redirected):
+                os.rmdir(redirected)
+
+        self.addCleanup(remove_junction)
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError,
+                "symlink, or junction"):
+            vehicle_overlays.activate_vehicle_profile(
+                self.game, "Fast", is_running=lambda: False)
+
+        escaped = os.path.join(
+            outside, "item_defs", "vehicles", "ussr", "R11_MS-1.xml")
+        self.assertFalse(os.path.exists(escaped))
 
     def test_restore_refuses_to_follow_an_owned_overlay_outside_game(self):
         vehicle_overlays.create_vehicle_profile(self.game, "Fast")
