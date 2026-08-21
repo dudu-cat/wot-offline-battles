@@ -215,6 +215,11 @@ def write_packed_xml(element):
     names = []
     dictionary = {}
     _collect_dictionary(element, names, dictionary)
+    # BigWorld's packer writes the shared name dictionary in bytewise lexical
+    # order, independently of element traversal order.  Rebuild those indices
+    # so an unchanged stock document serializes to its original bytes.
+    names.sort()
+    dictionary = dict((name, index) for index, name in enumerate(names))
     prefix = bytearray(PACKED_XML_MAGIC + b"\0")
     for name in names:
         prefix.extend(name + b"\0")

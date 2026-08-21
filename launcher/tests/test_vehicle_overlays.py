@@ -326,6 +326,53 @@ class VehicleOverlayTest(unittest.TestCase):
         self.assertEqual(self.GUNS, gun["member"])
         self.assertEqual(self.SHELLS, shell["member"])
 
+    def test_vehicle_local_gun_values_win_and_hull_health_is_editable(self):
+        root = packed.read_packed_xml(self.members[self.VEHICLE])
+        root.children.append((b"hull", element([
+            (b"maxHealth", scalar(packed.TYPE_INTEGER, 80)),
+        ])))
+        turret = child(child(root, "turrets0").value, "T-18_mod").value
+        gun = child(child(turret, "guns").value, "Gun-A").value
+        gun.children.extend((
+            (b"reloadTime", scalar(packed.TYPE_STRING, b"3.2")),
+            (b"maxAmmo", scalar(packed.TYPE_INTEGER, 60)),
+        ))
+        self.members[self.VEHICLE] = packed.write_packed_xml(root)
+        self._write_package()
+
+        fields = vehicle_overlays.list_vehicle_field_choices(
+            self.game, self.VEHICLE)
+
+        local_reload = next(
+            record for record in fields
+            if record["fieldPath"] ==
+            "turrets0/T-18_mod/guns/Gun-A/reloadTime")
+        hull_health = next(
+            record for record in fields
+            if record["fieldPath"] == "hull/maxHealth")
+        self.assertEqual(self.VEHICLE, local_reload["member"])
+        self.assertEqual("Gun", local_reload["categoryLabel"])
+        self.assertFalse(local_reload["shared"])
+        self.assertEqual(("R11_MS-1",), local_reload["affectedVehicles"])
+        self.assertFalse(any(
+            record["fieldPath"] == "shared/Gun-A/reloadTime"
+            for record in fields))
+        self.assertTrue(any(
+            record["fieldPath"] == "shared/Gun-A/aimingTime"
+            for record in fields))
+        self.assertIn("Effective battle HP", hull_health["scope"])
+
+        vehicle_overlays.create_vehicle_profile(self.game, "Local gun")
+        vehicle_overlays.apply_profile_edit(
+            self.game, "Local gun", self.VEHICLE,
+            local_reload["fieldPath"], "2.5", is_running=lambda: False)
+        vehicle_overlays.activate_vehicle_profile(
+            self.game, "Local gun", is_running=lambda: False)
+        self.assertEqual(
+            b"2.5", vehicle_overlays._find_value(
+                self._root(self.VEHICLE),
+                local_reload["fieldPath"]).value)
+
     def test_vehicle_browser_does_not_infer_unlisted_component_links(self):
         root = packed.read_packed_xml(self.members[self.VEHICLE])
         engine = child(root, "engines").value
@@ -617,6 +664,146 @@ class VehicleOverlayTest(unittest.TestCase):
             vehicle_overlays.apply_vehicle_edit(
                 self.game, self.VEHICLE, "speedLimits/backward", "12",
                 is_running=lambda: False)
+
+    def test_named_profile_edits_stay_out_of_res_mods_until_activation(self):
+        vehicle_overlays.create_vehicle_profile(self.game, "Fast MS-1")
+
+        result = vehicle_overlays.apply_profile_edit(
+            self.game, "Fast MS-1", self.VEHICLE,
+            "speedLimits/forward", "40", is_running=lambda: False)
+
+        self.assertEqual("40", result["currentValue"])
+        self.assertEqual("Fast MS-1", result["profileName"])
+        self.assertFalse(os.path.exists(self._overlay(self.VEHICLE)))
+        self.assertFalse(os.path.exists(
+            vehicle_overlays.manifest_path(self.game)))
+        self.assertTrue(os.path.isfile(
+            vehicle_overlays.profile_store_path(self.game)))
+
+    def test_profiles_keep_independent_values(self):
+        for name, speed in (("Fast", "40"), ("Very fast", "55")):
+            vehicle_overlays.create_vehicle_profile(self.game, name)
+            vehicle_overlays.apply_profile_edit(
+                self.game, name, self.VEHICLE,
+                "speedLimits/forward", speed, is_running=lambda: False)
+
+        fast = vehicle_overlays.inspect_profile_field(
+            self.game, "Fast", self.VEHICLE, "speedLimits/forward")
+        very_fast = vehicle_overlays.inspect_profile_field(
+            self.game, "Very fast", self.VEHICLE,
+            "speedLimits/forward")
+
+        self.assertEqual("40", fast["currentValue"])
+        self.assertEqual("55", very_fast["currentValue"])
+        self.assertEqual(["Fast", "Very fast"],
+                         vehicle_overlays.list_vehicle_profiles(self.game))
+
+    def test_switching_profiles_removes_members_owned_only_by_the_previous_one(self):
+        vehicle_overlays.create_vehicle_profile(self.game, "Fast")
+        vehicle_overlays.apply_profile_edit(
+            self.game, "Fast", self.VEHICLE,
+            "speedLimits/forward", "40", is_running=lambda: False)
+        vehicle_overlays.create_vehicle_profile(self.game, "Strong engine")
+        vehicle_overlays.apply_profile_edit(
+            self.game, "Strong engine", self.ENGINES,
+            "shared/GAZ-M1/power", "120", is_running=lambda: False)
+        vehicle_overlays.activate_vehicle_profile(
+            self.game, "Fast", is_running=lambda: False)
+        self.assertTrue(os.path.isfile(self._overlay(self.VEHICLE)))
+
+        vehicle_overlays.activate_vehicle_profile(
+            self.game, "Strong engine", is_running=lambda: False)
+
+        self.assertFalse(os.path.exists(self._overlay(self.VEHICLE)))
+        self.assertTrue(os.path.isfile(self._overlay(self.ENGINES)))
+        self.assertEqual(120, self._value(
+            self.ENGINES, "shared/GAZ-M1/power"))
+
+    def test_activation_materializes_then_original_mode_removes_profile(self):
+        vehicle_overlays.create_vehicle_profile(self.game, "Fast")
+        vehicle_overlays.apply_profile_edit(
+            self.game, "Fast", self.VEHICLE,
+            "speedLimits/forward", "40", is_running=lambda: False)
+
+        prepared = vehicle_overlays.prepare_vehicle_profile(
+            self.game, "Fast", is_running=lambda: False)
+
+        self.assertEqual(1, prepared["installedMembers"])
+        self.assertEqual(40, self._value(
+            self.VEHICLE, "speedLimits/forward"))
+        with open(vehicle_overlays.manifest_path(self.game), "rb") as stream:
+            self.assertEqual("Fast", json.load(stream)["activeProfile"])
+
+        original = vehicle_overlays.prepare_vehicle_profile(
+            self.game, None, is_running=lambda: False)
+
+        self.assertEqual(1, original["removedMembers"])
+        self.assertFalse(os.path.exists(self._overlay(self.VEHICLE)))
+        self.assertFalse(os.path.exists(
+            vehicle_overlays.manifest_path(self.game)))
+        self.assertEqual(["Fast"],
+                         vehicle_overlays.list_vehicle_profiles(self.game))
+
+    def test_original_mode_leaves_foreign_vehicle_overrides_unchanged(self):
+        foreign = "/".join((
+            vehicle_overlays.OVERLAY_ROOT, self.VEHICLE))
+        self._write(foreign, b"another tool")
+
+        prepared = vehicle_overlays.prepare_vehicle_profile(
+            self.game, None, is_running=lambda: False)
+
+        self.assertIsNone(prepared["profile"])
+        self.assertTrue(os.path.isfile(self._overlay(self.VEHICLE)))
+        with open(self._overlay(self.VEHICLE), "rb") as stream:
+            self.assertEqual(b"another tool", stream.read())
+
+    def test_clear_and_delete_change_only_the_named_profile(self):
+        for name in ("Fast", "Heavy"):
+            vehicle_overlays.create_vehicle_profile(self.game, name)
+            vehicle_overlays.apply_profile_edit(
+                self.game, name, self.VEHICLE,
+                "speedLimits/forward", "40", is_running=lambda: False)
+
+        self.assertEqual(1, vehicle_overlays.clear_vehicle_profile(
+            self.game, "Fast", is_running=lambda: False))
+        self.assertEqual("32", vehicle_overlays.inspect_profile_field(
+            self.game, "Fast", self.VEHICLE,
+            "speedLimits/forward")["currentValue"])
+        self.assertEqual("40", vehicle_overlays.inspect_profile_field(
+            self.game, "Heavy", self.VEHICLE,
+            "speedLimits/forward")["currentValue"])
+
+        self.assertEqual("Fast", vehicle_overlays.delete_vehicle_profile(
+            self.game, "Fast", is_running=lambda: False))
+        self.assertEqual(["Heavy"],
+                         vehicle_overlays.list_vehicle_profiles(self.game))
+
+    def test_profile_names_are_trimmed_case_unique_and_reserve_original(self):
+        self.assertEqual("Fast", vehicle_overlays.create_vehicle_profile(
+            self.game, "  Fast  "))
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError, "already exists"):
+            vehicle_overlays.create_vehicle_profile(self.game, "fast")
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError, "reserved"):
+            vehicle_overlays.create_vehicle_profile(
+                self.game, vehicle_overlays.ORIGINAL_PROFILE_LABEL)
+
+    def test_invalid_profile_store_fails_closed_without_writing_res_mods(self):
+        self._write(
+            vehicle_overlays.PROFILE_STORE_RELATIVE,
+            b'{"schema":999,"profiles":[]}')
+
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError, "does not belong"):
+            vehicle_overlays.list_vehicle_profiles(self.game)
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError, "does not belong"):
+            vehicle_overlays.activate_vehicle_profile(
+                self.game, "Fast", is_running=lambda: False)
+
+        self.assertFalse(os.path.exists(
+            vehicle_overlays.manifest_path(self.game)))
 
     def test_packaged_launcher_analysis_includes_the_shared_packed_xml_parser(self):
         script = os.path.join(

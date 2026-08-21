@@ -183,7 +183,8 @@ def inspect_game_root(game_root):
     }
 
 
-def plan_session(status, mode, join_text="", team_size=DEFAULT_TEAM_SIZE):
+def plan_session(status, mode, join_text="", team_size=DEFAULT_TEAM_SIZE,
+                 vehicle_profile=None):
     """Turn the window fields into one battle session, or explain the problem."""
     if not status.get("has_executable"):
         raise LauncherError(
@@ -197,6 +198,11 @@ def plan_session(status, mode, join_text="", team_size=DEFAULT_TEAM_SIZE):
     effective_team_size = DEFAULT_TEAM_SIZE
     if port_version == PORT_0_9_22 and mode != MODE_JOIN:
         effective_team_size = parse_team_size(team_size)
+    profile_name = str(vehicle_profile or "").strip() or None
+    if profile_name is not None and (
+            port_version != PORT_0_9_22 or mode != MODE_SINGLE):
+        raise LauncherError(
+            "Modified vehicle profiles are limited to 0.9.22 single player.")
     return {
         "client": port_version,
         "mode": mode,
@@ -204,6 +210,7 @@ def plan_session(status, mode, join_text="", team_size=DEFAULT_TEAM_SIZE):
         "tcp_port": tcp_port,
         "needs_server": server_required(port_version, mode),
         "team_size": effective_team_size,
+        "vehicle_profile": profile_name,
     }
 
 

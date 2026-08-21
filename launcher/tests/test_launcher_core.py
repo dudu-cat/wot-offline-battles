@@ -163,10 +163,24 @@ class SessionPlanTest(unittest.TestCase):
 
     def test_0_9_22_single_player_plan_starts_a_local_server(self):
         session = core.plan_session(
-            self._status(), core.MODE_SINGLE, team_size="7")
+            self._status(), core.MODE_SINGLE, team_size="7",
+            vehicle_profile="Fast MS-1")
         self.assertEqual(session["host"], core.LOCAL_HOST)
         self.assertTrue(session["needs_server"])
         self.assertEqual(7, session["team_size"])
+        self.assertEqual("Fast MS-1", session["vehicle_profile"])
+
+    def test_modified_profile_is_refused_for_lan_and_other_clients(self):
+        for status, mode in (
+                (self._status(), core.MODE_HOST),
+                (self._status(), core.MODE_JOIN),
+                (self._status(client=core.PORT_0_8_2, version="0.8.2"),
+                 core.MODE_SINGLE)):
+            with self.assertRaisesRegex(
+                    core.LauncherError, "limited to 0.9.22 single player"):
+                core.plan_session(
+                    status, mode, "10.0.0.5" if mode == core.MODE_JOIN else "",
+                    vehicle_profile="Fast MS-1")
 
     def test_0_9_22_team_size_must_be_between_one_and_fifteen(self):
         for value in ("", "four", 0, 16, 1.5, True):
@@ -593,6 +607,8 @@ class ClientInstallTest(unittest.TestCase):
             self._write(self.game, state_root + name, "saved-" + name)
         self._write(self.game, state_root + "notes.json", "keep")
         self._write(
+            self.game, state_root + "vehicle_profiles.json", "profiles")
+        self._write(
             self.game, "mods/0.9.22.0.1/com.other.mod.wotmod", "theirs")
 
         actions = core.reset_0_9_22_state(
@@ -605,6 +621,8 @@ class ClientInstallTest(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(
                 self.game, *(state_root + name).split("/"))))
         self.assertEqual("keep", self._read(state_root + "notes.json"))
+        self.assertEqual(
+            "profiles", self._read(state_root + "vehicle_profiles.json"))
         self.assertEqual("theirs", self._read(
             "mods/0.9.22.0.1/com.other.mod.wotmod"))
         self.assertIn("Deleted 7 offline saved-data file(s).", actions)

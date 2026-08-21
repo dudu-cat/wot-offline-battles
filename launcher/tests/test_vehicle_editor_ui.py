@@ -144,26 +144,30 @@ class _Service(object):
             "currentValue": self.current,
             "packedType": "integer",
             "constraint": "stock parser requires a positive number",
-            "overlayPath": "C:/WoT/res_mods/0.9.22.0.1/" + member,
+            "overlayPath": "C:/WoT/mods/configs/offline_lan_0922/"
+                           "vehicle_profiles.json",
             "conflict": self.conflict,
         }
 
-    def inspect_vehicle_field(self, game_root, member, field_path):
-        self.inspect_calls.append((game_root, member, field_path))
+    def inspect_profile_field(self, game_root, profile_name, member,
+                              field_path):
+        self.inspect_calls.append(
+            (game_root, profile_name, member, field_path))
         if self.inspect_error:
             raise self.VehicleOverlayError(self.inspect_error)
         return self._result(member, field_path)
 
-    def apply_vehicle_edit(self, game_root, member, field_path, replacement):
+    def apply_profile_edit(self, game_root, profile_name, member, field_path,
+                           replacement):
         self.apply_calls.append(
-            (game_root, member, field_path, replacement))
+            (game_root, profile_name, member, field_path, replacement))
         if self.apply_error:
             raise self.VehicleOverlayError(self.apply_error)
         self.current = replacement
         return self._result(member, field_path)
 
-    def restore_vehicle_defaults(self, game_root):
-        self.restore_calls.append(game_root)
+    def clear_vehicle_profile(self, game_root, profile_name):
+        self.restore_calls.append((game_root, profile_name))
         if self.restore_error:
             raise self.VehicleOverlayError(self.restore_error)
         self.current = "32"
@@ -177,7 +181,8 @@ class VehicleEditorWindowTest(unittest.TestCase):
         self.messagebox = _MessageBox()
         self.log = []
         self.window = vehicle_editor_ui.VehicleEditorWindow(
-            self.parent, "C:/WoT", _FakeTk, _FakeTtk, self.messagebox,
+            self.parent, "C:/WoT", "Fast MS-1", _FakeTk, _FakeTtk,
+            self.messagebox,
             log=self.log.append, service=self.service)
 
     def test_opening_inspects_and_shows_the_original_contract(self):
@@ -186,14 +191,14 @@ class VehicleEditorWindowTest(unittest.TestCase):
             [("C:/WoT", vehicle_editor_ui.DEFAULT_MEMBER)],
             self.service.topology_calls)
         self.assertEqual(
-            [("C:/WoT", vehicle_editor_ui.DEFAULT_MEMBER,
+            [("C:/WoT", "Fast MS-1", vehicle_editor_ui.DEFAULT_MEMBER,
               vehicle_editor_ui.DEFAULT_FIELD)],
             self.service.inspect_calls)
         self.assertEqual("32", self.window.original.get())
         self.assertEqual("32", self.window.replacement.get())
         self.assertEqual("integer", self.window.packed_type.get())
         self.assertIn("positive", self.window.constraint.get())
-        self.assertIn("res_mods/0.9.22.0.1",
+        self.assertIn("vehicle_profiles.json",
                       self.window.overlay_path.get())
         self.assertEqual(("usa", "ussr"),
                          self.window.nation_box.cget("values"))
@@ -253,7 +258,7 @@ class VehicleEditorWindowTest(unittest.TestCase):
         self.assertTrue(self.window.apply())
 
         self.assertEqual(
-            [("C:/WoT", vehicle_editor_ui.DEFAULT_MEMBER,
+            [("C:/WoT", "Fast MS-1", vehicle_editor_ui.DEFAULT_MEMBER,
               vehicle_editor_ui.DEFAULT_FIELD, "40")],
             self.service.apply_calls)
         self.assertEqual("40", self.window.current.get())
@@ -281,9 +286,10 @@ class VehicleEditorWindowTest(unittest.TestCase):
 
         self.assertTrue(self.window.restore_defaults())
 
-        self.assertEqual(["C:/WoT"], self.service.restore_calls)
+        self.assertEqual(
+            [("C:/WoT", "Fast MS-1")], self.service.restore_calls)
         self.assertEqual("32", self.window.current.get())
-        self.assertIn("Other mods were kept", self.log[-1])
+        self.assertIn("Fast MS-1", self.log[-1])
         self.assertEqual(2, len(self.service.inspect_calls))
 
 

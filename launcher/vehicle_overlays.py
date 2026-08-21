@@ -1,15 +1,17 @@
-"""Safe 0.9.22 Packed XML vehicle-data overlays.
+"""Safe 0.9.22 Packed XML vehicle-data profiles and temporary overlays.
 
-The editor never writes ``scripts.pkg``.  Every accepted edit rebuilds the
-complete package member from that original archive, then writes the result to
-``res_mods/0.9.22.0.1``.  A manifest owns complete members, not individual
-bytes, so an existing overlay from another tool is always a conflict.
+The editor never writes ``scripts.pkg``. Saved profiles contain logical edits
+only. Immediately before a profile launch, every edited package member is
+rebuilt from the original archive and installed under
+``res_mods/0.9.22.0.1``; the launcher removes those owned files after the game
+exits. An existing overlay from another tool is always a conflict.
 """
 
 from __future__ import annotations
 
 import copy
 import datetime
+import errno
 import hashlib
 import json
 import math
@@ -44,6 +46,11 @@ SOURCE_PACKAGE = "res/packages/scripts.pkg"
 OVERLAY_ROOT = "res_mods/0.9.22.0.1"
 MANIFEST_NAME = "vehicle_overlays.json"
 MANIFEST_SCHEMA = 1
+PROFILE_STORE_RELATIVE = (
+    "mods/configs/offline_lan_0922/vehicle_profiles.json")
+PROFILE_STORE_SCHEMA = 1
+ORIGINAL_PROFILE_LABEL = "Original vehicle values"
+MAX_PROFILE_NAME_LENGTH = 64
 
 _COMPONENT_MEMBER = re.compile(
     r"^scripts/item_defs/vehicles/([a-z][a-z0-9_]*)/components/"
@@ -131,6 +138,31 @@ def manifest_path(game_root):
         os.path.abspath(game_root), *OVERLAY_ROOT.split("/"), MANIFEST_NAME)
 
 
+def profile_store_path(game_root):
+    return os.path.join(
+        os.path.abspath(game_root), *PROFILE_STORE_RELATIVE.split("/"))
+
+
+def _normalize_profile_name(raw_name):
+    if not isinstance(raw_name, str):
+        raise VehicleOverlayError("The profile name must be text.")
+    name = raw_name.strip()
+    if not name:
+        raise VehicleOverlayError("Enter a profile name.")
+    if len(name) > MAX_PROFILE_NAME_LENGTH:
+        raise VehicleOverlayError(
+            "Profile names may contain at most %d characters." %
+            MAX_PROFILE_NAME_LENGTH)
+    if any(ord(character) < 32 or ord(character) == 127
+           for character in name):
+        raise VehicleOverlayError(
+            "Profile names cannot contain control characters.")
+    if name.casefold() == ORIGINAL_PROFILE_LABEL.casefold():
+        raise VehicleOverlayError(
+            "%s is reserved for unmodified data." % ORIGINAL_PROFILE_LABEL)
+    return name
+
+
 def _validate_member(member):
     if not isinstance(member, str):
         raise VehicleOverlayError("The package member must be text.")
@@ -195,6 +227,26 @@ def _health_rule(name):
     return _MAX_HEALTH if name == "maxHealth" else _MAX_REGEN
 
 
+def _gun_value_rule(parts):
+    if len(parts) == 1 and parts[-1] == "rotationSpeed":
+        return _NONNEGATIVE
+    if len(parts) == 1 and parts[-1] in (
+            "weight", "reloadTime", "aimingTime"):
+        return _POSITIVE
+    if len(parts) == 1 and parts[-1] == "maxAmmo":
+        return _MAX_AMMO
+    if (len(parts) == 3 and parts[0] == "shots" and
+            parts[-1] in ("speed", "maxDistance")):
+        return _POSITIVE
+    if (len(parts) == 3 and parts[0] == "shots" and
+            parts[-1] == "gravity"):
+        return _NONNEGATIVE
+    if (len(parts) == 3 and parts[0] == "shots" and
+            parts[-1] == "piercingPower"):
+        return _PIERCING_PAIR
+    return None
+
+
 def _field_rule(member, field_path):
     member_kind, component_name = _validate_member(member)
     parts = _field_parts(field_path)
@@ -203,6 +255,8 @@ def _field_rule(member, field_path):
         if parts in (["speedLimits", "forward"],
                      ["speedLimits", "backward"]):
             return _POSITIVE
+        if parts == ["hull", "maxHealth"]:
+            return _MAX_HEALTH
         if (len(parts) == 3 and parts[0] == "chassis" and
                 parts[2] in ("weight", "maxLoad")):
             return _POSITIVE
@@ -219,6 +273,12 @@ def _field_rule(member, field_path):
                 parts[2] in _HEALTH_CONTAINERS and
                 parts[-1] in ("maxHealth", "maxRegenHealth")):
             return _health_rule(parts[-1])
+        if (len(parts) >= 5 and
+                re.fullmatch(r"turrets\d+", parts[0]) and
+                parts[2] == "guns"):
+            rule = _gun_value_rule(parts[4:])
+            if rule is not None:
+                return rule
 
     if member_kind == "component":
         if (component_name == "engines" and len(parts) == 3 and
@@ -229,22 +289,9 @@ def _field_rule(member, field_path):
                 parts[-1] in ("weight", "maxLoad")):
             return _POSITIVE
         if component_name == "guns" and parts[:1] == ["shared"]:
-            if len(parts) == 3 and parts[-1] == "rotationSpeed":
-                return _NONNEGATIVE
-            if (len(parts) == 3 and
-                    parts[-1] in ("weight", "reloadTime", "aimingTime")):
-                return _POSITIVE
-            if len(parts) == 3 and parts[-1] == "maxAmmo":
-                return _MAX_AMMO
-            if (len(parts) == 5 and parts[2] == "shots" and
-                    parts[-1] in ("speed", "maxDistance")):
-                return _POSITIVE
-            if (len(parts) == 5 and parts[2] == "shots" and
-                    parts[-1] == "gravity"):
-                return _NONNEGATIVE
-            if (len(parts) == 5 and parts[2] == "shots" and
-                    parts[-1] == "piercingPower"):
-                return _PIERCING_PAIR
+            rule = _gun_value_rule(parts[2:])
+            if rule is not None:
+                return rule
         if component_name == "shells":
             if len(parts) == 2 and parts[-1] == "caliber":
                 return _POSITIVE
@@ -586,6 +633,50 @@ def _vehicle_component_references(root):
     return references
 
 
+def _vehicle_local_gun_overrides(root):
+    """Return every gun occurrence and the leaves overriding shared data."""
+    occurrences = {}
+
+    def leaf_paths(element, prefix=()):
+        paths = set()
+        for raw_name, value in element.children:
+            try:
+                name = raw_name.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            path = prefix + (name,)
+            if value.value_type == packed_xml.TYPE_ELEMENT:
+                paths.update(leaf_paths(value.value, path))
+            else:
+                paths.add("/".join(path))
+        return paths
+
+    for raw_group, group_value in root.children:
+        try:
+            group_name = raw_group.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if (re.fullmatch(r"turrets\d+", group_name) is None or
+                group_value.value_type != packed_xml.TYPE_ELEMENT):
+            continue
+        for unused_turret_name, turret_value in group_value.value.children:
+            if turret_value.value_type != packed_xml.TYPE_ELEMENT:
+                continue
+            guns = _element_child(turret_value.value, "guns")
+            if guns is None:
+                continue
+            for raw_gun, gun_value in guns.children:
+                try:
+                    gun_name = raw_gun.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                overrides = set()
+                if gun_value.value_type == packed_xml.TYPE_ELEMENT:
+                    overrides = leaf_paths(gun_value.value)
+                occurrences.setdefault(gun_name, []).append(overrides)
+    return occurrences
+
+
 def _gun_shell_references(guns_root, gun_names):
     shared = _element_child(guns_root, "shared")
     if shared is None:
@@ -616,10 +707,13 @@ def _component_name(category, field_path):
 
 
 def _direct_category(field_path):
-    first = _field_parts(field_path)[0]
+    parts = _field_parts(field_path)
+    first = parts[0]
     if first == "chassis":
         return "chassis"
     if re.fullmatch(r"turrets\d+", first) is not None:
+        if len(parts) >= 5 and parts[2] == "guns":
+            return "guns"
         return "turret"
     return "vehicle"
 
@@ -628,6 +722,9 @@ def _field_label(category, field_path):
     parts = _field_parts(field_path)
     if category != "shells" and parts[:1] == ["shared"]:
         parts = parts[1:]
+    elif (category == "guns" and len(parts) >= 5 and
+          re.fullmatch(r"turrets\d+", parts[0]) and parts[2] == "guns"):
+        parts = [parts[1], parts[3]] + parts[4:]
     return " / ".join(_FIELD_LABELS.get(part, part) for part in parts)
 
 
@@ -641,6 +738,13 @@ def _choice_record(nation, vehicle, category, member, field, shared,
             ", ".join(affected)))
     else:
         scope = "Stored in %s only; affects this vehicle only." % vehicle
+        if (field["fieldPath"] == "hull/maxHealth" or
+                re.fullmatch(
+                    r"turrets\d+/[^/]+/maxHealth",
+                    field["fieldPath"]) is not None):
+            scope += (
+                " Effective battle HP is hull maximum health plus the "
+                "mounted turret maximum health.")
     result = dict(field)
     result.update({
         "nation": nation,
@@ -691,10 +795,13 @@ def list_vehicle_field_choices(game_root, vehicle_member):
 
             roots = {}
             references = {}
+            local_gun_overrides = {}
             for choice in roster:
                 member = choice["member"]
                 roots[member] = packed_xml.read_packed_xml(archive.read(member))
                 references[member] = _vehicle_component_references(
+                    roots[member])
+                local_gun_overrides[member] = _vehicle_local_gun_overrides(
                     roots[member])
 
             component_roots = {}
@@ -764,9 +871,20 @@ def list_vehicle_field_choices(game_root, vehicle_member):
             if component not in components:
                 continue
             users = affected.get((category, component), set())
+            if category == "guns":
+                shared_parts = _field_parts(field["fieldPath"])
+                shared_suffix = "/".join(shared_parts[2:])
+                users = set()
+                for choice in roster:
+                    occurrences = local_gun_overrides[
+                        choice["member"]].get(component, ())
+                    if any(shared_suffix not in overrides
+                           for overrides in occurrences):
+                        users.add(choice["vehicle"])
             if vehicle not in users:
-                raise VehicleOverlayError(
-                    "The shared component impact set is incomplete.")
+                # Every occurrence on this vehicle has a local leaf which the
+                # stock reader prefers over this shared value.
+                continue
             records.append(_choice_record(
                 nation, vehicle, category, member, field, True,
                 component, users))
@@ -1105,11 +1223,45 @@ def _write_staged(path, data):
             pass
 
 
+def _open_exclusive(path):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_BINARY", 0)
+    try:
+        return os.open(path, flags, 0o666)
+    except OSError as error:
+        if error.errno == errno.EEXIST:
+            raise VehicleOverlayError(
+                "A vehicle-data override appeared after the stock-data "
+                "check; it was left unchanged: %s" % path)
+        raise
+
+
+def _retire_transaction_root(transaction_root):
+    """Move completed recovery data out of the live prefix before deletion."""
+    cleanup_root = None
+    try:
+        cleanup_root = tempfile.mkdtemp(
+            prefix=".wot-vehicle-cleanup-",
+            dir=os.path.dirname(transaction_root))
+        os.rmdir(cleanup_root)
+        os.replace(transaction_root, cleanup_root)
+    except (IOError, OSError):
+        if cleanup_root is not None and os.path.isdir(cleanup_root):
+            try:
+                os.rmdir(cleanup_root)
+            except (IOError, OSError):
+                pass
+        return False
+    shutil.rmtree(cleanup_root, ignore_errors=True)
+    return True
+
+
 def _recovery_bytes(game_root, operation, targets):
     records = []
     for index, target in enumerate(targets):
         records.append({
             "backup": "backup-%d" % index,
+            "hadTarget": bool(os.path.lexists(target)),
             "target": os.path.relpath(target, game_root).replace(os.sep, "/"),
         })
     return (json.dumps({
@@ -1118,8 +1270,14 @@ def _recovery_bytes(game_root, operation, targets):
     }, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
-def _transactional_write(game_root, writes):
+def _transactional_write(game_root, writes, expected_absent=()):
     game_root = os.path.abspath(game_root)
+    expected_absent = set(os.path.abspath(path) for path in expected_absent)
+    write_targets = set(os.path.abspath(target)
+                        for target, unused_data in writes)
+    if not expected_absent.issubset(write_targets):
+        raise VehicleOverlayError(
+            "An expected-absent transaction target is not being written.")
     try:
         transaction_root = tempfile.mkdtemp(
             prefix=".wot-vehicle-overlay-", dir=game_root)
@@ -1139,19 +1297,37 @@ def _transactional_write(game_root, writes):
         for index, (target, data) in enumerate(writes):
             staged_path = os.path.join(transaction_root, "new-%d" % index)
             _write_staged(staged_path, data)
-            staged.append((staged_path, target))
-        for index, (unused_staged, target) in enumerate(staged):
+            staged.append((staged_path, target, data))
+        for index, (unused_staged, target, unused_data) in enumerate(staged):
+            if target in expected_absent and os.path.lexists(target):
+                raise VehicleOverlayError(
+                    "A vehicle-data override appeared after the stock-data "
+                    "check; it was left unchanged: %s" % target)
             if os.path.lexists(target):
                 backup = os.path.join(
                     transaction_root, "backup-%d" % index)
                 os.replace(target, backup)
                 backups.append((target, backup))
-        for staged_path, target in staged:
+        for staged_path, target, data in staged:
             directory = os.path.dirname(target)
             if not os.path.isdir(directory):
                 os.makedirs(directory)
-            os.replace(staged_path, target)
-            installed.append(target)
+            if target in expected_absent:
+                descriptor = _open_exclusive(target)
+                installed.append(target)
+                try:
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(data)
+                        stream.flush()
+                        try:
+                            os.fsync(stream.fileno())
+                        except (AttributeError, OSError):
+                            pass
+                except Exception:
+                    raise
+            else:
+                os.replace(staged_path, target)
+                installed.append(target)
     except Exception as error:
         rollback_errors = []
         backed_targets = set(target for target, unused_backup in backups)
@@ -1182,7 +1358,176 @@ def _transactional_write(game_root, writes):
             "The overlay transaction was rolled back: %s" % error)
     finally:
         if not preserve_recovery:
-            shutil.rmtree(transaction_root, ignore_errors=True)
+            _retire_transaction_root(transaction_root)
+
+
+_TRANSACTION_PREFIXES = (
+    ".wot-vehicle-overlay-", ".wot-vehicle-restore-")
+
+
+def _pending_transaction_roots(game_root):
+    game_root = os.path.abspath(game_root)
+    try:
+        names = os.listdir(game_root)
+    except (IOError, OSError) as error:
+        raise VehicleOverlayError(
+            "The game folder cannot be checked for profile recovery: %s" %
+            error)
+    return sorted(
+        os.path.join(game_root, name) for name in names
+        if name.startswith(_TRANSACTION_PREFIXES))
+
+
+def has_pending_vehicle_recovery(game_root):
+    return bool(_pending_transaction_roots(game_root))
+
+
+def _recovery_target(game_root, relative):
+    if (not isinstance(relative, str) or not relative or "\\" in relative or
+            any(part in ("", ".", "..") for part in relative.split("/"))):
+        raise VehicleOverlayError(
+            "A vehicle profile recovery target is unsafe.")
+    game_root = os.path.abspath(game_root)
+    target = os.path.abspath(os.path.join(game_root, *relative.split("/")))
+    try:
+        if os.path.commonpath((game_root, target)) != game_root:
+            raise VehicleOverlayError(
+                "A vehicle profile recovery target escapes the game folder.")
+    except ValueError:
+        raise VehicleOverlayError(
+            "A vehicle profile recovery target escapes the game folder.")
+    return target
+
+
+def _recovery_target_kind(relative):
+    if relative == PROFILE_STORE_RELATIVE:
+        return "profile-store"
+    manifest_relative = "%s/%s" % (OVERLAY_ROOT, MANIFEST_NAME)
+    if relative == manifest_relative:
+        return "manifest"
+    prefix = OVERLAY_ROOT + "/"
+    if relative.startswith(prefix):
+        member = relative[len(prefix):]
+        _validate_member(member)
+        return "overlay"
+    raise VehicleOverlayError(
+        "A vehicle profile recovery target is outside the owned files.")
+
+
+def _load_recovery_records(game_root, transaction_root):
+    recovery_path = os.path.join(transaction_root, "recovery.json")
+    if not os.path.lexists(recovery_path):
+        try:
+            if not os.listdir(transaction_root):
+                return []
+        except (IOError, OSError) as error:
+            raise VehicleOverlayError(
+                "A vehicle profile recovery directory is unreadable: %s" %
+                error)
+        raise VehicleOverlayError(
+            "A vehicle profile recovery directory has no recovery journal: %s" %
+            transaction_root)
+    if os.path.islink(recovery_path) or not os.path.isfile(recovery_path):
+        raise VehicleOverlayError(
+            "A vehicle profile recovery journal is not a regular file.")
+    try:
+        with open(recovery_path, "rb") as stream:
+            recovery = json.load(stream)
+    except (IOError, OSError, TypeError, ValueError) as error:
+        raise VehicleOverlayError(
+            "A vehicle profile recovery journal is unreadable: %s" % error)
+    if (not isinstance(recovery, dict) or
+            recovery.get("operation") not in ("apply", "restore-defaults") or
+            not isinstance(recovery.get("targets"), list)):
+        raise VehicleOverlayError(
+            "A vehicle profile recovery journal is invalid.")
+    operation = recovery["operation"]
+    records = []
+    kinds = []
+    seen = set()
+    for index, record in enumerate(recovery["targets"]):
+        if (not isinstance(record, dict) or
+                record.get("backup") != "backup-%d" % index or
+                not isinstance(record.get("hadTarget"), bool)):
+            raise VehicleOverlayError(
+                "A vehicle profile recovery record is invalid.")
+        relative = record.get("target")
+        target = _recovery_target(game_root, relative)
+        kinds.append(_recovery_target_kind(relative))
+        if target in seen:
+            raise VehicleOverlayError(
+                "A vehicle profile recovery journal repeats a target.")
+        seen.add(target)
+        records.append({
+            "backup": os.path.join(transaction_root, record["backup"]),
+            "hadTarget": record["hadTarget"],
+            "target": target,
+        })
+    valid_apply = (
+        kinds == ["profile-store"] or
+        (len(kinds) >= 2 and kinds[-1] == "manifest" and
+         all(kind == "overlay" for kind in kinds[:-1])))
+    valid_restore = (
+        bool(kinds) and kinds[-1] == "manifest" and
+        all(kind == "overlay" for kind in kinds[:-1]))
+    if ((operation == "apply" and not valid_apply) or
+            (operation == "restore-defaults" and not valid_restore)):
+        raise VehicleOverlayError(
+            "A vehicle profile recovery journal has an invalid target set.")
+    return records
+
+
+def recover_vehicle_profile_transactions(game_root, is_running=None):
+    """Roll back profile writes interrupted before their staging was removed."""
+    status, unused_package = _require_target(
+        game_root, require_closed=True, is_running=is_running)
+    recovered = 0
+    for transaction_root in _pending_transaction_roots(status["path"]):
+        if os.path.islink(transaction_root) or not os.path.isdir(
+                transaction_root):
+            raise VehicleOverlayError(
+                "A vehicle profile recovery path is not a regular directory: "
+                "%s" % transaction_root)
+        records = _load_recovery_records(status["path"], transaction_root)
+        try:
+            for index, record in enumerate(records):
+                target = record["target"]
+                backup = record["backup"]
+                discard = os.path.join(
+                    transaction_root, "discard-%d" % index)
+                if record["hadTarget"]:
+                    if os.path.lexists(backup):
+                        if os.path.lexists(target):
+                            if os.path.lexists(discard):
+                                raise VehicleOverlayError(
+                                    "A vehicle profile recovery discard path "
+                                    "already exists.")
+                            os.replace(target, discard)
+                        directory = os.path.dirname(target)
+                        if not os.path.isdir(directory):
+                            os.makedirs(directory)
+                        os.replace(backup, target)
+                    elif not os.path.lexists(target):
+                        raise VehicleOverlayError(
+                            "A vehicle profile recovery backup is missing.")
+                elif os.path.lexists(target):
+                    if os.path.lexists(discard):
+                        raise VehicleOverlayError(
+                            "A vehicle profile recovery discard path already "
+                            "exists.")
+                    os.replace(target, discard)
+        except VehicleOverlayError:
+            raise
+        except Exception as error:
+            raise VehicleOverlayError(
+                "Vehicle profile crash recovery is incomplete; recovery "
+                "files were kept in %s: %s" % (transaction_root, error))
+        if not _retire_transaction_root(transaction_root):
+            raise VehicleOverlayError(
+                "Vehicle profile crash recovery succeeded but its staging "
+                "directory could not be retired safely.")
+        recovered += 1
+    return recovered
 
 
 def _manifest_bytes(manifest):
@@ -1352,5 +1697,369 @@ def restore_vehicle_defaults(game_root, is_running=None):
             "Default restoration was rolled back: %s" % error)
     finally:
         if not preserve_recovery:
-            shutil.rmtree(transaction_root, ignore_errors=True)
+            _retire_transaction_root(transaction_root)
     return len(entries)
+
+
+def _empty_profile_store():
+    timestamp = _now()
+    return {
+        "schema": PROFILE_STORE_SCHEMA,
+        "targetVersion": TARGET_VERSION,
+        "targetBuild": TARGET_BUILD,
+        "createdAt": timestamp,
+        "updatedAt": timestamp,
+        "profiles": [],
+    }
+
+
+def _profile_manifest(profile):
+    manifest = _empty_manifest()
+    manifest["createdAt"] = profile["createdAt"]
+    manifest["updatedAt"] = profile["updatedAt"]
+    manifest["members"] = copy.deepcopy(profile["members"])
+    return _validate_manifest(manifest)
+
+
+def _validate_profile_store(value):
+    if not isinstance(value, dict):
+        raise VehicleOverlayError("vehicle_profiles.json must be an object.")
+    if (value.get("schema") != PROFILE_STORE_SCHEMA or
+            value.get("targetVersion") != TARGET_VERSION or
+            str(value.get("targetBuild")) != TARGET_BUILD):
+        raise VehicleOverlayError(
+            "vehicle_profiles.json does not belong to this editor and build.")
+    if not isinstance(value.get("createdAt"), str) or not isinstance(
+            value.get("updatedAt"), str):
+        raise VehicleOverlayError(
+            "The vehicle profile store timestamps are invalid.")
+    profiles = value.get("profiles")
+    if not isinstance(profiles, list):
+        raise VehicleOverlayError("The vehicle profile list is invalid.")
+    seen = set()
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            raise VehicleOverlayError("A vehicle profile is invalid.")
+        name = _normalize_profile_name(profile.get("name"))
+        if name != profile.get("name"):
+            raise VehicleOverlayError(
+                "A saved vehicle profile name is not normalized.")
+        key = name.casefold()
+        if key in seen:
+            raise VehicleOverlayError(
+                "Vehicle profile names must be unique ignoring case.")
+        seen.add(key)
+        if not isinstance(profile.get("createdAt"), str) or not isinstance(
+                profile.get("updatedAt"), str):
+            raise VehicleOverlayError(
+                "A vehicle profile timestamp is invalid.")
+        if not isinstance(profile.get("members"), list):
+            raise VehicleOverlayError(
+                "A vehicle profile member list is invalid.")
+        _profile_manifest(profile)
+    return value
+
+
+def _load_profile_store(game_root):
+    path = profile_store_path(game_root)
+    if not os.path.lexists(path):
+        return _empty_profile_store(), False
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise VehicleOverlayError(
+            "vehicle_profiles.json is not a regular file.")
+    try:
+        with open(path, "rb") as stream:
+            value = json.load(stream)
+    except (IOError, OSError, TypeError, ValueError) as error:
+        raise VehicleOverlayError(
+            "vehicle_profiles.json is unreadable: %s" % error)
+    return _validate_profile_store(value), True
+
+
+def _profile_store_bytes(store):
+    return (json.dumps(store, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8")
+
+
+def _save_profile_store(game_root, store):
+    store["updatedAt"] = _now()
+    _validate_profile_store(store)
+    _transactional_write(
+        game_root,
+        [(profile_store_path(game_root), _profile_store_bytes(store))])
+
+
+def _logical_profile_signature(members):
+    return tuple(
+        (entry["sourceMember"], tuple(
+            (edit["fieldPath"], edit["originalPackedType"],
+             edit["originalValue"], edit["replacementValue"])
+            for edit in entry["edits"]))
+        for entry in sorted(members, key=lambda item: item["sourceMember"]))
+
+
+def preserve_legacy_vehicle_overlay(game_root, is_running=None):
+    """Import the old persistent editor manifest before deactivating it."""
+    status, unused_package = _require_target(
+        game_root, require_closed=True, is_running=is_running)
+    manifest, exists = _load_manifest(status["path"])
+    if not exists or manifest.get("activeProfile") is not None:
+        return None
+    entries = _entry_map(manifest)
+    for member, entry in entries.items():
+        problem = _ownership_problem(status["path"], member, entry)
+        if problem and not problem.startswith("Owned overlay is missing"):
+            raise VehicleOverlayError(problem)
+
+    store, unused_exists = _load_profile_store(status["path"])
+    signature = _logical_profile_signature(manifest["members"])
+    for profile in store["profiles"]:
+        if _logical_profile_signature(profile["members"]) == signature:
+            return profile["name"]
+
+    base_name = "Imported vehicle edits"
+    used = set(profile["name"].casefold() for profile in store["profiles"])
+    name = base_name
+    suffix = 2
+    while name.casefold() in used:
+        name = "%s %d" % (base_name, suffix)
+        suffix += 1
+    timestamp = _now()
+    store["profiles"].append({
+        "name": name,
+        "createdAt": manifest.get("createdAt", timestamp),
+        "updatedAt": timestamp,
+        "members": copy.deepcopy(manifest["members"]),
+    })
+    store["profiles"].sort(key=lambda profile: profile["name"].casefold())
+    _save_profile_store(status["path"], store)
+    return name
+
+
+def _profile_index(store, profile_name):
+    normalized = _normalize_profile_name(profile_name)
+    key = normalized.casefold()
+    matches = [index for index, profile in enumerate(store["profiles"])
+               if profile["name"].casefold() == key]
+    if len(matches) != 1:
+        raise VehicleOverlayError(
+            "Vehicle profile %s does not exist." % normalized)
+    return matches[0]
+
+
+def list_vehicle_profiles(game_root):
+    """List saved profiles without materializing anything into res_mods."""
+    status, unused_package = _require_target(game_root)
+    store, unused_exists = _load_profile_store(status["path"])
+    return sorted(
+        (profile["name"] for profile in store["profiles"]),
+        key=lambda name: name.casefold())
+
+
+def create_vehicle_profile(game_root, profile_name):
+    status, unused_package = _require_target(game_root)
+    name = _normalize_profile_name(profile_name)
+    store, unused_exists = _load_profile_store(status["path"])
+    if any(profile["name"].casefold() == name.casefold()
+           for profile in store["profiles"]):
+        raise VehicleOverlayError(
+            "A vehicle profile named %s already exists." % name)
+    timestamp = _now()
+    store["profiles"].append({
+        "name": name,
+        "createdAt": timestamp,
+        "updatedAt": timestamp,
+        "members": [],
+    })
+    store["profiles"].sort(key=lambda profile: profile["name"].casefold())
+    _save_profile_store(status["path"], store)
+    return name
+
+
+def delete_vehicle_profile(game_root, profile_name, is_running=None):
+    status, unused_package = _require_target(
+        game_root, require_closed=True, is_running=is_running)
+    # A previous launcher crash may have left one temporary profile active.
+    # Clear it before allowing its logical definition to be deleted.
+    recover_vehicle_profile_transactions(
+        status["path"], is_running=lambda: False)
+    preserve_legacy_vehicle_overlay(
+        status["path"], is_running=lambda: False)
+    restore_vehicle_defaults(status["path"], is_running=lambda: False)
+    store, unused_exists = _load_profile_store(status["path"])
+    index = _profile_index(store, profile_name)
+    deleted = store["profiles"].pop(index)["name"]
+    _save_profile_store(status["path"], store)
+    return deleted
+
+
+def clear_vehicle_profile(game_root, profile_name, is_running=None):
+    status, unused_package = _require_target(
+        game_root, require_closed=True, is_running=is_running)
+    store, unused_exists = _load_profile_store(status["path"])
+    index = _profile_index(store, profile_name)
+    profile = store["profiles"][index]
+    count = len(profile["members"])
+    profile["members"] = []
+    profile["updatedAt"] = _now()
+    _save_profile_store(status["path"], store)
+    return count
+
+
+def inspect_profile_field(game_root, profile_name, member, field_path):
+    """Show one original value and the value saved in a named profile."""
+    status, package_path = _require_target(game_root)
+    rule = _field_rule(member, field_path)
+    unused_data, original_root = _read_source_member(package_path, member)
+    original = _find_value(original_root, field_path)
+    _validate_original(original, rule)
+
+    store, unused_exists = _load_profile_store(status["path"])
+    profile = store["profiles"][_profile_index(store, profile_name)]
+    entry = _entry_map(_profile_manifest(profile)).get(member)
+    current = original
+    if entry is not None:
+        output, unused_edits = _build_member(package_path, entry)
+        current_root = packed_xml.read_packed_xml(output)
+        current = _find_value(current_root, field_path)
+
+    return {
+        "profileName": profile["name"],
+        "member": member,
+        "fieldPath": field_path,
+        "originalValue": _scalar_text(original),
+        "currentValue": _scalar_text(current),
+        "packedType": _TYPE_NAMES.get(original.value_type, "unknown"),
+        "constraint": rule["description"],
+        "overlayPath": profile_store_path(status["path"]),
+        "conflict": "",
+    }
+
+
+def apply_profile_edit(game_root, profile_name, member, field_path,
+                       replacement_value, is_running=None):
+    """Save one logical edit without leaving modified data in res_mods."""
+    status, package_path = _require_target(
+        game_root, require_closed=True, is_running=is_running)
+    rule = _field_rule(member, field_path)
+    unused_data, source_root = _read_source_member(package_path, member)
+    original = _find_value(source_root, field_path)
+    _validate_original(original, rule)
+    replacement, manifest_value = _parse_replacement(
+        replacement_value, original, rule)
+    if replacement.value_type != original.value_type:
+        raise VehicleOverlayError("The replacement changed the Packed type.")
+
+    store, unused_exists = _load_profile_store(status["path"])
+    profile_index = _profile_index(store, profile_name)
+    profile = store["profiles"][profile_index]
+    entries = copy.deepcopy(_entry_map(_profile_manifest(profile)))
+    entry = entries.get(member)
+    if entry is None:
+        entry = {
+            "sourcePackage": SOURCE_PACKAGE,
+            "sourceMember": member,
+            "overlayRelativePath": member,
+            "overlaySha256": "0" * 64,
+            "edits": [],
+        }
+        entries[member] = entry
+
+    edits = dict((edit["fieldPath"], edit) for edit in entry["edits"])
+    existing = edits.get(field_path)
+    original_type = _TYPE_NAMES.get(original.value_type, "unknown")
+    original_value = _manifest_scalar(original)
+    if existing is not None:
+        if (existing.get("originalPackedType") != original_type or
+                not _same_recorded_value(
+                    existing.get("originalValue"), original_value,
+                    original.value_type)):
+            raise VehicleOverlayError(
+                "The original package contract changed for this saved edit.")
+    edits[field_path] = {
+        "fieldPath": field_path,
+        "originalPackedType": original_type,
+        "originalValue": original_value,
+        "replacementValue": manifest_value,
+        "constraint": rule["description"],
+    }
+    entry["edits"] = sorted(
+        edits.values(), key=lambda item: item["fieldPath"])
+
+    for owned_member in sorted(entries):
+        output, normalized_edits = _build_member(
+            package_path, entries[owned_member])
+        entries[owned_member]["edits"] = normalized_edits
+        entries[owned_member]["overlaySha256"] = _sha256(output)
+
+    profile["members"] = [entries[name] for name in sorted(entries)]
+    profile["updatedAt"] = _now()
+    _save_profile_store(status["path"], store)
+    return inspect_profile_field(
+        status["path"], profile["name"], member, field_path)
+
+
+def ensure_original_vehicle_data(game_root, is_running=None):
+    """Remove only this launcher's temporary vehicle-data overlay."""
+    status, unused_package = _require_target(
+        game_root, require_closed=True, is_running=is_running)
+    recover_vehicle_profile_transactions(
+        status["path"], is_running=lambda: False)
+    preserve_legacy_vehicle_overlay(
+        status["path"], is_running=lambda: False)
+    removed = restore_vehicle_defaults(
+        status["path"], is_running=lambda: False)
+    return removed
+
+
+def activate_vehicle_profile(game_root, profile_name, is_running=None):
+    """Materialize one profile for a single-player process only."""
+    status, package_path = _require_target(
+        game_root, require_closed=True, is_running=is_running)
+    ensure_original_vehicle_data(status["path"], is_running=lambda: False)
+    store, unused_exists = _load_profile_store(status["path"])
+    profile = store["profiles"][_profile_index(store, profile_name)]
+    entries = copy.deepcopy(_entry_map(_profile_manifest(profile)))
+    if not entries:
+        return 0
+
+    rebuilt = {}
+    for member in sorted(entries):
+        output, normalized_edits = _build_member(
+            package_path, entries[member])
+        entries[member]["edits"] = normalized_edits
+        entries[member]["overlaySha256"] = _sha256(output)
+        rebuilt[member] = output
+
+    manifest = _empty_manifest()
+    manifest["activeProfile"] = profile["name"]
+    manifest["members"] = [entries[name] for name in sorted(entries)]
+    _validate_manifest(manifest)
+    writes = [(_overlay_path(status["path"], member), rebuilt[member])
+              for member in sorted(rebuilt)]
+    writes.append((manifest_path(status["path"]), _manifest_bytes(manifest)))
+    # A loose same-path override cannot coexist with this profile. Refuse only
+    # that exact collision so unrelated third-party mods remain unrestricted.
+    _transactional_write(
+        status["path"], writes,
+        expected_absent=[target for target, unused_data in writes])
+    return len(entries)
+
+
+def prepare_vehicle_profile(game_root, profile_name=None, is_running=None):
+    """Prepare stock data or one named profile immediately before launch."""
+    if profile_name is None or not str(profile_name).strip():
+        removed = ensure_original_vehicle_data(
+            game_root, is_running=is_running)
+        return {
+            "profile": None,
+            "installedMembers": 0,
+            "removedMembers": removed,
+        }
+    installed = activate_vehicle_profile(
+        game_root, profile_name, is_running=is_running)
+    return {
+        "profile": _normalize_profile_name(profile_name),
+        "installedMembers": installed,
+        "removedMembers": 0,
+    }

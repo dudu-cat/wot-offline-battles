@@ -17,8 +17,9 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import core
     import vehicle_editor_ui
+    import vehicle_overlays
 else:
-    from . import core, vehicle_editor_ui
+    from . import core, vehicle_editor_ui, vehicle_overlays
 
 
 LAUNCHER_VERSION = "0.5.0"
@@ -44,6 +45,7 @@ class LauncherWindow(object):
         self._busy = False
         self._maintenance_busy = False
         self._selected_client = None
+        self._profile_names = []
         self._build()
 
     def _build(self):
@@ -115,6 +117,41 @@ class LauncherWindow(object):
                                 pady=(6, 0))
         row += 1
 
+        tk.Label(frame, text="Vehicle data profile").grid(
+            row=row, column=0, sticky="w", pady=(6, 0))
+        self.vehicle_profile = tk.StringVar(
+            value=settings.get(
+                "vehicle_profile", vehicle_overlays.ORIGINAL_PROFILE_LABEL))
+        self.vehicle_profile_box = self._ttk.Combobox(
+            frame, textvariable=self.vehicle_profile,
+            values=(vehicle_overlays.ORIGINAL_PROFILE_LABEL,),
+            state="disabled", width=40)
+        self.vehicle_profile_box.grid(
+            row=row, column=1, columnspan=2, sticky="we", padx=(6, 0),
+            pady=(6, 0))
+        self.vehicle_profile_box.bind(
+            "<<ComboboxSelected>>", self._profile_selected)
+        row += 1
+
+        profile_actions = tk.Frame(frame)
+        profile_actions.grid(
+            row=row, column=0, columnspan=3, sticky="we", pady=(6, 0))
+        self.new_profile_button = tk.Button(
+            profile_actions, text="New profile...",
+            command=self._new_vehicle_profile)
+        self.new_profile_button.pack(side="left", fill="x", expand=True)
+        self.vehicle_editor_button = tk.Button(
+            profile_actions, text="Edit selected profile...",
+            command=self._open_vehicle_editor)
+        self.vehicle_editor_button.pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
+        self.delete_profile_button = tk.Button(
+            profile_actions, text="Delete selected profile...",
+            command=self._delete_vehicle_profile)
+        self.delete_profile_button.pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
+        row += 1
+
         maintenance = tk.Frame(frame)
         maintenance.grid(row=row, column=0, columnspan=3, sticky="we",
                          pady=(10, 0))
@@ -127,13 +164,6 @@ class LauncherWindow(object):
             command=self._reset_all_state)
         self.reset_button.pack(side="left", fill="x", expand=True,
                                padx=(6, 0))
-        row += 1
-
-        self.vehicle_editor_button = tk.Button(
-            frame, text="Advanced vehicle data editor...",
-            command=self._open_vehicle_editor)
-        self.vehicle_editor_button.grid(
-            row=row, column=0, columnspan=3, sticky="we", pady=(6, 0))
         row += 1
 
         self.start_button = tk.Button(frame, text="Start game",
@@ -150,6 +180,7 @@ class LauncherWindow(object):
 
         self._refresh_client()
         self._refresh_mode()
+        self._recover_stale_vehicle_profile()
 
     def _browse(self):
         selected = self._filedialog.askdirectory(
@@ -185,6 +216,7 @@ class LauncherWindow(object):
                 status["version"] or status["client"])
         self.client_label.config(text=text)
         self._selected_client = status["client"]
+        self._refresh_profiles(status)
         self._update_action_controls()
         if hasattr(self, "team_size_box"):
             self._refresh_mode()
@@ -202,7 +234,86 @@ class LauncherWindow(object):
             not self._busy and not self._maintenance_busy else "disabled")
         self.repair_button.config(state=maintenance_state)
         self.reset_button.config(state=maintenance_state)
-        self.vehicle_editor_button.config(state=maintenance_state)
+        profile_state = (
+            "readonly" if maintenance_state == "normal" and
+            self.mode.get() == core.MODE_SINGLE else "disabled")
+        self.vehicle_profile_box.config(state=profile_state)
+        create_state = (
+            "normal" if profile_state == "readonly" else "disabled")
+        self.new_profile_button.config(state=create_state)
+        selected_profile = self.vehicle_profile.get().strip()
+        selected_custom = (
+            profile_state == "readonly" and selected_profile in
+            self._profile_names)
+        edit_state = "normal" if selected_custom else "disabled"
+        self.vehicle_editor_button.config(state=edit_state)
+        self.delete_profile_button.config(state=edit_state)
+
+    def _refresh_profiles(self, status=None):
+        status = status or core.inspect_game_root(self.game_root.get())
+        names = []
+        if status.get("client") == core.PORT_0_9_22:
+            try:
+                names = vehicle_overlays.list_vehicle_profiles(status["path"])
+            except vehicle_overlays.VehicleOverlayError as error:
+                if hasattr(self, "log_view"):
+                    self._log("Vehicle profiles could not be loaded: %s" % error)
+        self._profile_names = list(names)
+        values = tuple(
+            [vehicle_overlays.ORIGINAL_PROFILE_LABEL] + self._profile_names)
+        self.vehicle_profile_box.config(values=values)
+        if self.vehicle_profile.get().strip() not in values:
+            self.vehicle_profile.set(vehicle_overlays.ORIGINAL_PROFILE_LABEL)
+        return values
+
+    def _profile_selected(self, unused_event=None):
+        self._update_action_controls()
+        self._save_settings()
+
+    def _recover_stale_vehicle_profile(self):
+        game_root = self.game_root.get().strip()
+        if self._selected_client != core.PORT_0_9_22:
+            return 0
+        manifest_exists = os.path.lexists(
+            vehicle_overlays.manifest_path(game_root))
+        try:
+            recovery_exists = vehicle_overlays.has_pending_vehicle_recovery(
+                game_root)
+        except vehicle_overlays.VehicleOverlayError as error:
+            self._log("Vehicle profile recovery could not be checked: %s" % error)
+            return 0
+        if not manifest_exists and not recovery_exists:
+            return 0
+        if core.game_is_running():
+            self._log(
+                "A vehicle profile is active while World of Tanks is running; "
+                "close the game and reopen this launcher before any other "
+                "launch so it can be cleaned safely.")
+            return 0
+        try:
+            recovered = vehicle_overlays.recover_vehicle_profile_transactions(
+                game_root)
+            imported = vehicle_overlays.preserve_legacy_vehicle_overlay(
+                game_root)
+            removed = vehicle_overlays.restore_vehicle_defaults(game_root)
+        except vehicle_overlays.VehicleOverlayError as error:
+            self._log(
+                "A stale vehicle profile could not be cleaned: %s" % error)
+            return 0
+        if recovered or imported:
+            self._refresh_profiles(core.inspect_game_root(game_root))
+        if imported:
+            self._log(
+                "Preserved the previous vehicle edits as profile '%s'." %
+                imported)
+        if recovered:
+            self._log(
+                "Recovered an interrupted vehicle profile update.")
+        if removed:
+            self._log(
+                "Cleaned a stale temporary vehicle profile from the previous "
+                "launcher session.")
+        return removed + recovered
 
     def _refresh_mode(self):
         state = "normal" if self.mode.get() == core.MODE_JOIN else "disabled"
@@ -212,6 +323,9 @@ class LauncherWindow(object):
             "readonly" if self._selected_client == core.PORT_0_9_22 and
             self.mode.get() != core.MODE_JOIN else "disabled")
         self.team_size_box.config(state=team_state)
+        if self.mode.get() != core.MODE_SINGLE:
+            self.vehicle_profile.set(vehicle_overlays.ORIGINAL_PROFILE_LABEL)
+        self._update_action_controls()
 
     def _test_connection(self):
         mode = self.mode.get()
@@ -281,6 +395,7 @@ class LauncherWindow(object):
             "join_address": self.join_address.get().strip(),
             "name": self.player_name.get().strip(),
             "team_size": team_size,
+            "vehicle_profile": self.vehicle_profile.get().strip(),
         })
 
     def _start_maintenance(self, action):
@@ -314,6 +429,50 @@ class LauncherWindow(object):
     def _repair_startup(self):
         return self._start_maintenance(core.repair_0_9_22_startup)
 
+    @staticmethod
+    def _ask_profile_name():
+        from tkinter import simpledialog
+
+        return simpledialog.askstring(
+            "New vehicle profile",
+            "Profile name:")
+
+    @staticmethod
+    def _confirm_delete_profile(profile_name):
+        from tkinter import messagebox
+
+        return messagebox.askyesno(
+            "Delete vehicle profile?",
+            "Delete profile '%s' and all of its saved vehicle edits?" %
+            profile_name,
+            icon="warning")
+
+    def _new_vehicle_profile(self):
+        if self._busy or self._maintenance_busy:
+            self._log("Wait for the current launcher operation to finish.")
+            return False
+        status = self._refresh_client()
+        if (status.get("client") != core.PORT_0_9_22 or
+                self.mode.get() != core.MODE_SINGLE):
+            self._log(
+                "Vehicle profiles are available for 0.9.22 single player.")
+            return False
+        raw_name = self._ask_profile_name()
+        if raw_name is None:
+            return False
+        try:
+            profile_name = vehicle_overlays.create_vehicle_profile(
+                status["path"], raw_name)
+        except vehicle_overlays.VehicleOverlayError as error:
+            self._log("Could not create the vehicle profile: %s" % error)
+            return False
+        self._refresh_profiles(status)
+        self.vehicle_profile.set(profile_name)
+        self._update_action_controls()
+        self._save_settings()
+        self._log("Created vehicle profile '%s'." % profile_name)
+        return self._open_vehicle_editor()
+
     def _open_vehicle_editor(self):
         if self._busy or self._maintenance_busy:
             self._log("Wait for the current launcher operation to finish.")
@@ -322,9 +481,39 @@ class LauncherWindow(object):
         if status.get("client") != core.PORT_0_9_22:
             self._log("Select the supported 0.9.22 game folder first.")
             return False
+        profile_name = self.vehicle_profile.get().strip()
+        if profile_name not in self._profile_names:
+            self._log("Create or select a vehicle profile before editing.")
+            return False
         self._remember_folder()
         vehicle_editor_ui.open_vehicle_editor(
-            self.root, status["path"], log=self._log)
+            self.root, status["path"], profile_name, log=self._log)
+        return True
+
+    def _delete_vehicle_profile(self):
+        if self._busy or self._maintenance_busy:
+            self._log("Wait for the current launcher operation to finish.")
+            return False
+        status = self._refresh_client()
+        profile_name = self.vehicle_profile.get().strip()
+        if (status.get("client") != core.PORT_0_9_22 or
+                profile_name not in self._profile_names):
+            self._log("Select a saved vehicle profile before deleting it.")
+            return False
+        if not self._confirm_delete_profile(profile_name):
+            self._log("Vehicle profile deletion was cancelled.")
+            return False
+        try:
+            vehicle_overlays.delete_vehicle_profile(
+                status["path"], profile_name)
+        except vehicle_overlays.VehicleOverlayError as error:
+            self._log("Could not delete the vehicle profile: %s" % error)
+            return False
+        self.vehicle_profile.set(vehicle_overlays.ORIGINAL_PROFILE_LABEL)
+        self._refresh_profiles(status)
+        self._update_action_controls()
+        self._save_settings()
+        self._log("Deleted vehicle profile '%s'." % profile_name)
         return True
 
     @staticmethod
@@ -363,10 +552,14 @@ class LauncherWindow(object):
             self._kill_game()
             return
         status = self._refresh_client()
+        selected_profile = self.vehicle_profile.get().strip()
+        profile_name = (
+            selected_profile if selected_profile in self._profile_names
+            else None)
         try:
             session = core.plan_session(status, self.mode.get(),
                                         self.join_address.get(),
-                                        self.team_size.get())
+                                        self.team_size.get(), profile_name)
         except core.LauncherError as error:
             self._log(str(error))
             return
@@ -389,6 +582,19 @@ class LauncherWindow(object):
                                                   session["client"]):
                 self._log(action)
             if session["client"] == core.PORT_0_9_22:
+                prepared = vehicle_overlays.prepare_vehicle_profile(
+                    game_root, session.get("vehicle_profile"))
+                if prepared["profile"] is None:
+                    self._log(
+                        "No launcher-owned vehicle profile is active; other "
+                        "installed mods are unchanged.")
+                else:
+                    self._log(
+                        "Activated single-player vehicle profile '%s' "
+                        "(%d package member%s)." % (
+                            prepared["profile"],
+                            prepared["installedMembers"],
+                            "" if prepared["installedMembers"] == 1 else "s"))
                 self._log(core.ensure_0_9_22_preferences_isolation(game_root))
             for path in core.write_settings(game_root, session["client"],
                                             session["mode"], host, port, name):
@@ -419,6 +625,17 @@ class LauncherWindow(object):
             self._log("The launcher failed: %s" % error)
         finally:
             self._stop_server()
+            if session.get("client") == core.PORT_0_9_22:
+                try:
+                    removed = vehicle_overlays.ensure_original_vehicle_data(
+                        game_root)
+                    if removed:
+                        self._log(
+                            "Removed the temporary vehicle profile; original "
+                            "vehicle data is active again.")
+                except vehicle_overlays.VehicleOverlayError as error:
+                    self._log(
+                        "Could not restore original vehicle data: %s" % error)
             self._set_busy(False)
 
     def _start_server(self, game_root, port_version,
@@ -490,9 +707,15 @@ class LauncherWindow(object):
             server.kill()
 
     def _on_close(self):
+        if self._busy or self._maintenance_busy:
+            self._log(
+                "Finish the current launcher operation before closing. Use "
+                "Kill the game if a started client must be closed now.")
+            return False
         self._save_settings()
         self._stop_server()
         self.root.destroy()
+        return True
 
     def run(self):
         self.root.mainloop()

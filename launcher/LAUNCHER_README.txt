@@ -40,24 +40,36 @@ modules and three consumables, and every item costs nothing. Change modules,
 optional devices, consumables, shells, camouflage and crew skills; the garage
 is saved after each change and the battle uses what you fitted.
 
-The Advanced vehicle data editor is for the exact supported 0.9.22 build. Its
-country, vehicle, category and field lists are derived from that client's
-scripts.pkg. Shared components such as guns and engines show every listed
-vehicle their edit affects. It accepts only existing numeric scalar fields from
-a small safety allowlist plus the stock two-value penetration string, and shows
-the stock value, Packed XML type, validation rule, output path and any ownership
-conflict before writing. Close the game before applying or restoring changes.
-The editor never changes res\packages\scripts.pkg: it rebuilds the complete
-source member into res_mods\0.9.22.0.1 and records ownership in
-vehicle_overlays.json. Restore all vehicle defaults removes only files proven
-to be owned by that manifest; other mods remain in place.
+The Vehicle data profile selector is for the exact supported 0.9.22 build.
+Original vehicle values is the default and is required for hosting or joining
+a LAN battle. New profile creates a named set of single-player edits; Edit
+selected profile opens country, vehicle, category and field lists derived from
+that client's scripts.pkg. Shared components such as shells and engines show
+every listed vehicle their edit affects. A vehicle-local gun value is shown
+instead of an inherited shared value when that is what the stock client reads.
+The editor accepts only existing numeric scalar fields from a small safety
+allowlist plus the stock two-value penetration string. Close the game before
+saving or clearing profile edits.
+
+Profiles are saved in
+mods\configs\offline_lan_0922\vehicle_profiles.json and never change
+res\packages\scripts.pkg. A saved profile leaves no active vehicle data in
+res_mods. Immediately before a profile's single-player process starts, the
+launcher rebuilds each complete Packed XML member from the original package
+and installs a temporary owned overlay under res_mods\0.9.22.0.1. It removes
+that overlay after the game exits. Original single player, LAN host and LAN
+join all remove any launcher-owned profile first. Other mods remain enabled and
+are not treated as a launch error. If another tool owns the exact loose vehicle
+file a selected profile needs, that profile is left inactive rather than
+overwriting the file. The next launcher start also cleans a temporary profile
+left by an interrupted launcher session.
 
 For the exact 0.9.22 client, Repair startup validates the mod configuration
 and reinstalls the package while retaining the saved endpoint, garage,
-vehicle-data overrides, account progress, battle results and isolated client
+vehicle profiles, account progress, battle results and isolated client
 preferences. Reset all offline data is a separate confirmed operation. It
 deletes the endpoint, account, garage, post-battle, configuration and isolated
-client-preference files; it does not delete vehicle-data overrides, other mods
+client-preference files; it does not delete vehicle profiles, other mods
 or the normal World of Tanks profile. Both operations require the game to be
 closed and leave unrelated mods alone.
 

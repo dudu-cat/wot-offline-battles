@@ -1,4 +1,4 @@
-"""Tk window for the safe 0.9.22 vehicle-data overlay editor."""
+"""Tk window for named 0.9.22 vehicle-data profiles."""
 
 from __future__ import annotations
 
@@ -15,15 +15,16 @@ DEFAULT_VEHICLE = "R11_MS-1"
 
 
 class VehicleEditorWindow(object):
-    """Small advanced editor backed by the strict overlay service."""
+    """Small advanced editor backed by the strict profile service."""
 
-    def __init__(self, parent, game_root, tk_module, ttk_module,
+    def __init__(self, parent, game_root, profile_name, tk_module, ttk_module,
                  messagebox_module, log=None, service=vehicle_overlays):
         self._tk = tk_module
         self._ttk = ttk_module
         self._messagebox = messagebox_module
         self._service = service
         self._game_root = game_root
+        self._profile_name = profile_name
         self._log = log or (lambda unused_message: None)
         self._vehicle_choices = []
         self._fields = []
@@ -34,18 +35,18 @@ class VehicleEditorWindow(object):
     def _build(self, parent):
         tk = self._tk
         self.root = tk.Toplevel(parent)
-        self.root.title("0.9.22 vehicle data editor")
+        self.root.title("0.9.22 vehicle profile: %s" % self._profile_name)
 
         frame = tk.Frame(self.root, padx=12, pady=12)
         frame.pack(fill="both", expand=True)
 
         explanation = (
-            "Choose a nation and vehicle, then a category and field. The "
-            "launcher resolves those choices through the original 0.9.22 "
-            "vehicle topology and writes a safe overlay under "
-            "res_mods/0.9.22.0.1. Shared guns, engines and other components "
-            "show every vehicle they affect. IDs, resource paths, topology "
-            "and unknown fields remain locked.")
+            "Editing profile '%s'. Choose a nation and vehicle, then a "
+            "category and field. Changes are saved outside res_mods and are "
+            "materialized only while this profile runs in single player. "
+            "Shared guns, engines and other components show every vehicle "
+            "they affect. IDs, resource paths, topology and unknown fields "
+            "remain locked." % self._profile_name)
         tk.Label(frame, text=explanation, justify="left", anchor="w",
                  wraplength=720).grid(
                      row=0, column=0, columnspan=3, sticky="we",
@@ -98,7 +99,7 @@ class VehicleEditorWindow(object):
                 ("Packed type", self.packed_type),
                 ("Constraint", self.constraint),
                 ("Technical source", self.source),
-                ("Overlay path", self.overlay_path)):
+                ("Profile file", self.overlay_path)):
             tk.Label(frame, text=label, anchor="w").grid(
                 row=row, column=0, sticky="nw", pady=(2, 0))
             tk.Label(frame, textvariable=variable, anchor="w",
@@ -114,12 +115,12 @@ class VehicleEditorWindow(object):
         self.replacement_entry.grid(
             row=row, column=1, sticky="we", padx=(8, 8), pady=(8, 0))
         self.apply_button = tk.Button(
-            frame, text="Apply overlay", command=self.apply)
+            frame, text="Save field to profile", command=self.apply)
         self.apply_button.grid(row=row, column=2, sticky="e", pady=(8, 0))
         row += 1
 
         self.restore_button = tk.Button(
-            frame, text="Restore all vehicle defaults...",
+            frame, text="Clear all edits in this profile...",
             command=self.restore_defaults)
         self.restore_button.grid(
             row=row, column=1, columnspan=2, sticky="w", pady=(10, 0))
@@ -277,8 +278,8 @@ class VehicleEditorWindow(object):
         try:
             member, field_path = self._selection()
             record = self._field_by_label[self.field.get().strip()]
-            result = self._service.inspect_vehicle_field(
-                self._game_root, member, field_path)
+            result = self._service.inspect_profile_field(
+                self._game_root, self._profile_name, member, field_path)
         except self._service.VehicleOverlayError as error:
             return self._show_error(error, clear_contract=True)
         self.member.set(member)
@@ -292,40 +293,42 @@ class VehicleEditorWindow(object):
     def apply(self):
         try:
             member, field_path = self._selection()
-            result = self._service.apply_vehicle_edit(
-                self._game_root, member, field_path, self.replacement.get())
+            result = self._service.apply_profile_edit(
+                self._game_root, self._profile_name, member, field_path,
+                self.replacement.get())
         except self._service.VehicleOverlayError as error:
             return self._show_error(error)
-        message = "Overlay applied and reparsed successfully."
+        message = "Profile edit saved and reparsed successfully."
         self._show_result(result, message)
         self._log("Vehicle data editor: %s" % message)
         return True
 
     def restore_defaults(self):
         if not self._messagebox.askyesno(
-                "Restore vehicle defaults?",
-                "Remove every complete package member owned by this editor? "
-                "Other res_mods files are kept.",
+                "Clear this vehicle profile?",
+                "Remove every saved vehicle edit from profile '%s'? "
+                "The profile itself will remain." % self._profile_name,
                 parent=self.root, icon="warning"):
-            self.status.set("Default restoration was cancelled.")
+            self.status.set("Profile clearing was cancelled.")
             return False
         try:
-            count = self._service.restore_vehicle_defaults(self._game_root)
+            count = self._service.clear_vehicle_profile(
+                self._game_root, self._profile_name)
         except self._service.VehicleOverlayError as error:
             return self._show_error(error)
         message = (
-            "Restored defaults for %d owned package member%s. Other mods were "
-            "kept." % (count, "" if count == 1 else "s"))
+            "Cleared edits from %d package member%s in profile '%s'." %
+            (count, "" if count == 1 else "s", self._profile_name))
         self._log("Vehicle data editor: %s" % message)
         if self.inspect():
             self.status.set(message)
         return True
 
 
-def open_vehicle_editor(parent, game_root, log=None):
+def open_vehicle_editor(parent, game_root, profile_name, log=None):
     """Open a vehicle editor using the real Tk modules."""
     import tkinter
     from tkinter import messagebox, ttk
 
     return VehicleEditorWindow(
-        parent, game_root, tkinter, ttk, messagebox, log=log)
+        parent, game_root, profile_name, tkinter, ttk, messagebox, log=log)

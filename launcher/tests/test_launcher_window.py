@@ -36,6 +36,9 @@ class _Widget(object):
     def config(self, **options):
         self.options.update(options)
 
+    def bind(self, event, callback):
+        self.options.setdefault("bindings", {})[event] = callback
+
     def cget(self, name):
         return self.options.get(name)
 
@@ -237,16 +240,102 @@ class WindowTest(unittest.TestCase):
         self.assertEqual("normal", self.window.repair_button.cget("state"))
         self.assertEqual("normal", self.window.reset_button.cget("state"))
         self.assertEqual(
-            "normal", self.window.vehicle_editor_button.cget("state"))
+            "readonly", self.window.vehicle_profile_box.cget("state"))
+        self.assertEqual("normal", self.window.new_profile_button.cget("state"))
+        self.assertEqual(
+            "disabled", self.window.vehicle_editor_button.cget("state"))
 
     def test_vehicle_editor_opens_for_the_selected_0_9_22_folder(self):
-        game_root = self._game("0.9.22.0.1", "1513")
         with mock.patch(
+                "wot_launcher.vehicle_overlays.list_vehicle_profiles",
+                return_value=["Fast MS-1"]):
+            game_root = self._game("0.9.22.0.1", "1513")
+        self.window.vehicle_profile.set("Fast MS-1")
+        self.window._profile_selected()
+        with mock.patch(
+                "wot_launcher.vehicle_overlays.list_vehicle_profiles",
+                return_value=["Fast MS-1"]), mock.patch(
                 "wot_launcher.vehicle_editor_ui.open_vehicle_editor") as open_editor:
             self.assertTrue(self.window._open_vehicle_editor())
 
         open_editor.assert_called_once_with(
-            self.window.root, game_root, log=self.window._log)
+            self.window.root, game_root, "Fast MS-1", log=self.window._log)
+
+    def test_vehicle_profile_selector_is_single_player_only(self):
+        with mock.patch(
+                "wot_launcher.vehicle_overlays.list_vehicle_profiles",
+                return_value=["Fast MS-1"]):
+            self._game("0.9.22.0.1", "1513")
+        self.window.vehicle_profile.set("Fast MS-1")
+        self.window._profile_selected()
+        self.assertEqual(
+            "normal", self.window.vehicle_editor_button.cget("state"))
+
+        self.window.mode.set(core.MODE_HOST)
+        self.window._refresh_mode()
+
+        self.assertEqual(
+            wot_launcher.vehicle_overlays.ORIGINAL_PROFILE_LABEL,
+            self.window.vehicle_profile.get())
+        self.assertEqual(
+            "disabled", self.window.vehicle_profile_box.cget("state"))
+        self.assertEqual(
+            "disabled", self.window.vehicle_editor_button.cget("state"))
+
+    def test_new_profile_is_selected_and_opened(self):
+        with mock.patch(
+                "wot_launcher.vehicle_overlays.list_vehicle_profiles",
+                side_effect=[[], [], ["Fast MS-1"], ["Fast MS-1"]]), \
+                mock.patch.object(
+                    self.window, "_ask_profile_name",
+                    return_value="Fast MS-1"), \
+                mock.patch(
+                    "wot_launcher.vehicle_overlays.create_vehicle_profile",
+                    return_value="Fast MS-1") as create, \
+                mock.patch(
+                    "wot_launcher.vehicle_editor_ui.open_vehicle_editor") as editor:
+            game_root = self._game("0.9.22.0.1", "1513")
+            self.assertTrue(self.window._new_vehicle_profile())
+
+        create.assert_called_once_with(game_root, "Fast MS-1")
+        editor.assert_called_once_with(
+            self.window.root, game_root, "Fast MS-1", log=self.window._log)
+        self.assertEqual("Fast MS-1", self.window.vehicle_profile.get())
+
+    def test_single_player_profile_is_removed_after_a_launch_failure(self):
+        session = {
+            "client": core.PORT_0_9_22,
+            "host": core.LOCAL_HOST,
+            "tcp_port": core.DEFAULT_SERVER_PORT,
+            "needs_server": False,
+            "mode": core.MODE_SINGLE,
+            "team_size": core.DEFAULT_TEAM_SIZE,
+            "vehicle_profile": "Fast MS-1",
+        }
+        prepared = {
+            "profile": "Fast MS-1",
+            "installedMembers": 1,
+            "removedMembers": 0,
+        }
+        with mock.patch("core.install_client_mod", return_value=[]), \
+                mock.patch(
+                    "wot_launcher.vehicle_overlays.prepare_vehicle_profile",
+                    return_value=prepared) as prepare, \
+                mock.patch(
+                    "wot_launcher.vehicle_overlays.ensure_original_vehicle_data",
+                    return_value=1) as cleanup, \
+                mock.patch(
+                    "core.ensure_0_9_22_preferences_isolation",
+                    return_value="preferences isolated"), \
+                mock.patch("core.write_settings", return_value=[]), \
+                mock.patch.object(
+                    self.window, "_run_game",
+                    side_effect=RuntimeError("synthetic launch failure")):
+            self.window._run_session(self.settings_dir, session, "Peng")
+
+        prepare.assert_called_once_with(self.settings_dir, "Fast MS-1")
+        cleanup.assert_called_once_with(self.settings_dir)
+        self.assertIn("temporary vehicle profile", self._log_text())
 
     def test_startup_repair_runs_in_the_background_and_reports_actions(self):
         game_root = self._game("0.9.22.0.1", "1513")
@@ -350,6 +439,13 @@ class WindowTest(unittest.TestCase):
         }
         with mock.patch("core.install_client_mod", return_value=[]), \
                 mock.patch(
+                    "wot_launcher.vehicle_overlays.prepare_vehicle_profile",
+                    return_value={"profile": None, "installedMembers": 0,
+                                  "removedMembers": 0}), \
+                mock.patch(
+                    "wot_launcher.vehicle_overlays.ensure_original_vehicle_data",
+                    return_value=0), \
+                mock.patch(
                     "core.ensure_0_9_22_preferences_isolation",
                     return_value="preferences isolated") as isolate, \
                 mock.patch("core.write_settings", return_value=[]), \
@@ -366,6 +462,14 @@ class WindowTest(unittest.TestCase):
         self.window.player_name.set("Peng")
         self.window._on_close()
         self.assertEqual("Peng", core.load_settings().get("name"))
+
+    def test_window_cannot_close_while_profile_cleanup_is_pending(self):
+        self.window._busy = True
+
+        self.assertFalse(self.window._on_close())
+
+        self.assertFalse(self.window.root.destroyed)
+        self.assertIn("Kill the game", self._log_text())
 
     def test_closing_the_window_stops_the_server(self):
         stopped = []

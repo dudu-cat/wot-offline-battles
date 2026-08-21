@@ -25,7 +25,11 @@ and battle logic, a small LAN server and a launcher.
      server and prints the address to give them.
    - **Join a LAN battle**: type the host's address, for example
      `192.168.1.20`.
-4. Click **Start game**. In the garage, fit a tank and click **Battle!**.
+4. On 0.9.22, keep **Original vehicle values** for single-player or LAN play
+   without a launcher profile, or create and edit a named vehicle-data profile
+   for single player. Profiles are applied only for that game process and
+   removed after it exits; unrelated mods are left alone.
+5. Click **Start game**. In the garage, fit a tank and click **Battle!**.
    Everyone lands in the LAN waiting room over the stock queue screen. The
    host picks the map and clicks **START BATTLE**. **LEAVE** returns you to
    the garage.
