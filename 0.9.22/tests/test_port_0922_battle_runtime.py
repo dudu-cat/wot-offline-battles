@@ -3557,12 +3557,14 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'prebattle', 10.0)
         self.assertEqual(60.0, battle._prebattle_deadline)
 
+        battle._next_spotting_time = 50.1
         with mock.patch.object(
                 module, '_monotonic_time', return_value=110.0):
             self.assertTrue(battle._begin_battle())
         self.assertEqual(
             mock.call('battle', 900.0),
             battle._binding.arena_period.call_args_list[-1])
+        self.assertEqual(0.0, battle._next_spotting_time)
 
     def test_native_shot_ray_is_copied_before_normalise_or_scatter(self):
         runtime = _runtime()
@@ -6387,6 +6389,96 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual([(10, 6, False), (10, 4, False)],
                          battle._avatar.optional_devices[4:])
         self.assertEqual(6, len(battle._avatar.optional_devices))
+
+    def test_countdown_view_circle_uses_skills_and_stationary_devices_only(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle.client.send_spotted_report = mock.Mock(return_value=True)
+        battle._avatar = runtime.bigworld.avatar
+        battle._avatar.playerVehicleID = 10
+        descriptor = _Descriptor()
+        descriptor.turret.circularVisionRadius = 300.0
+        descriptor.miscAttrs = {'circularVisionRadiusFactor': 1.1}
+        descriptor.optionalDevices = (types.SimpleNamespace(
+            name='stereoscope', id=(0, 4),
+            circularVisionRadiusFactor=1.25,
+            activateWhenStillSec=3.0),)
+        battle._local_descriptor = descriptor
+        battle._local_position = (0.0, 0.0, 0.0)
+        battle._garage_loadout = {'crew': (), 'equipments': ()}
+        local = _Vehicle(
+            10, descriptor, _Vector(), (0.0, 0.0, 0.0),
+            {'health': 500})
+        enemy = _Vehicle(
+            1000, _Descriptor(), _Vector(100.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0), {'health': 500})
+        runtime.bigworld.entities.update({10: local, 1000: enemy})
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._records = {
+            'player:1': {
+                'engine_id': 10, 'kind': 'player', 'network_id': 1,
+                'ready': True, 'local': True, 'presentation': True,
+                'state': {'team': 1, 'health': 500, 'alive': True}},
+            'bot:15': {
+                'engine_id': 1000, 'kind': 'bot', 'network_id': 15,
+                'ready': True, 'local': False, 'presentation': True,
+                'spot_visible': False, 'spot_until': 0.0,
+                'spot_next': 0.0,
+                'state': {'team': 2, 'health': 500, 'alive': True}},
+        }
+        battle._spot_line_of_sight = mock.Mock(return_value=True)
+        battle._set_record_spot_visibility = mock.Mock()
+        battle._publish_spotted_targets = mock.Mock()
+
+        # Exact #1513 factors include the still stereoscope.  The loadout law
+        # divides it out until the three-second stationary gate has elapsed.
+        factors = {
+            'circularVisionRadius': 1.06 * (1.25 / 1.1),
+        }
+        with mock.patch.object(
+                battle_runtime_module.loadout_law, 'attribute_factors',
+                return_value=factors):
+            runtime.bigworld.now = 10.0
+            self.assertFalse(battle._update_spotting(10.0, hud_only=True))
+            runtime.bigworld.now = 13.0
+            self.assertFalse(battle._update_spotting(13.0, hud_only=True))
+
+        radii = [update['circularVisionRadius']
+                 for update in battle._avatar.attr_updates]
+        self.assertEqual(2, len(radii))
+        self.assertAlmostEqual(300.0 * 1.1 * 1.06, radii[0])
+        self.assertAlmostEqual(300.0 * 1.25 * 1.06, radii[1])
+        self.assertEqual([(10, 4, False), (10, 4, True)],
+                         battle._avatar.optional_devices)
+        battle._spot_line_of_sight.assert_not_called()
+        battle._set_record_spot_visibility.assert_not_called()
+        battle._publish_spotted_targets.assert_not_called()
+        battle.client.send_spotted_report.assert_not_called()
+
+    def test_countdown_frame_routes_spotting_to_the_local_hud_only(self):
+        runtime = _runtime()
+        runtime.bigworld.now = 10.0
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._battle_live = False
+        battle._prebattle_deadline = 20.0
+        battle._last_frame_time = 9.9
+        battle._avatar = runtime.bigworld.avatar
+        battle._frame_diagnostics = None
+        battle._flush_pending_bot_create = mock.Mock()
+        battle._flush_pending_entities = mock.Mock()
+        battle._drain_event_journal = mock.Mock()
+        battle._maybe_send_battle_ready = mock.Mock()
+        battle._tick_critical_states = mock.Mock()
+        battle._update_spotting = mock.Mock()
+        battle._schedule = mock.Mock()
+
+        battle._frame()
+
+        battle._update_spotting.assert_called_once_with(
+            10.0, hud_only=True)
+        battle._schedule.assert_called_once_with(0.0, battle._frame)
 
     def test_a_battle_hud_panel_failure_does_not_end_the_round(self):
         runtime = _runtime()

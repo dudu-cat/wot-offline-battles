@@ -33,6 +33,7 @@
 #define SERVER_DATA_RELATIVE L"mods\\configs\\offline_lan_0922"
 #define SERVER_PORT 28782
 #define PLAYER_MODE L"--player"
+#define PAIRED_PLAYER_MODE L"--paired-player"
 #define WORKER_ONLY_MODE L"--worker-only"
 #define SERVER_READY_TIMEOUT_MS 30000
 #define WORKER_READY_TIMEOUT_MS 60000
@@ -266,6 +267,11 @@ static int launch_player(const WCHAR *game_path, BOOL paired_worker)
 	WCHAR child_command[2 * MAX_PATH];
 	STARTUPINFOW startup;
 	PROCESS_INFORMATION process;
+	JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
+	HANDLE player_job = 0;
+	DWORD exit_code = 1;
+	DWORD wait_state;
+	int result = 1;
 	if (paired_worker) {
 		if (!SetEnvironmentVariableW(MULTI_CLIENT_ENV, MULTI_CLIENT_VALUE)) {
 			log_failure("SetEnvironmentVariableW", GetLastError());
@@ -289,27 +295,90 @@ static int launch_player(const WCHAR *game_path, BOOL paired_worker)
 	ZeroMemory(&startup, sizeof(startup));
 	startup.cb = sizeof(startup);
 	ZeroMemory(&process, sizeof(process));
-	if (!CreateProcessW(game_path, child_command, 0, 0, FALSE, 0, 0,
-			g_root, &startup, &process)) {
-		log_failure("CreateProcessW(player)", GetLastError());
+	player_job = CreateJobObjectW(0, 0);
+	if (player_job == 0 || !configure_kill_job(player_job)) {
+		log_failure("CreateJobObjectW(player)", GetLastError());
+		if (player_job != 0) {
+			CloseHandle(player_job);
+		}
 		return 22;
 	}
+	if (!CreateProcessW(game_path, child_command, 0, 0, FALSE,
+			CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP, 0,
+			g_root, &startup, &process)) {
+		log_failure("CreateProcessW(player)", GetLastError());
+		CloseHandle(player_job);
+		return 22;
+	}
+	if (!AssignProcessToJobObject(player_job, process.hProcess)) {
+		log_failure("AssignProcessToJobObject(player)", GetLastError());
+		TerminateProcess(process.hProcess, 22);
+		result = 22;
+		goto player_cleanup;
+	}
+	if (ResumeThread(process.hThread) == (DWORD)-1) {
+		log_failure("ResumeThread(player)", GetLastError());
+		TerminateJobObject(player_job, 22);
+		result = 22;
+		goto player_cleanup;
+	}
 	CloseHandle(process.hThread);
-	if (WaitForSingleObject(process.hProcess, INFINITE) == WAIT_FAILED) {
-		DWORD error_code = GetLastError();
-		CloseHandle(process.hProcess);
-		log_failure("WaitForSingleObject(player)", error_code);
-		return 23;
-	}
-	{
-		DWORD exit_code = 1;
-		if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
-			exit_code = 24;
-			log_failure("GetExitCodeProcess(player)", GetLastError());
+	process.hThread = 0;
+	/* The stock client can hand off to another WorldOfTanks.exe process. Every
+	 * descendant remains in this private job, so the launcher-visible starter
+	 * exits only after the whole visible client tree is gone. */
+	for (;;) {
+		ZeroMemory(&accounting, sizeof(accounting));
+		if (!QueryInformationJobObject(
+				player_job, JobObjectBasicAccountingInformation,
+				&accounting, sizeof(accounting), 0)) {
+			log_failure("QueryInformationJobObject(player)", GetLastError());
+			TerminateJobObject(player_job, 23);
+			result = 23;
+			goto player_cleanup;
 		}
-		CloseHandle(process.hProcess);
-		return (int)exit_code;
+		if (accounting.ActiveProcesses == 0) {
+			if (process.hProcess != 0 &&
+					!GetExitCodeProcess(process.hProcess, &exit_code)) {
+				exit_code = 24;
+				log_failure("GetExitCodeProcess(player)", GetLastError());
+			}
+			break;
+		}
+		if (process.hProcess == 0) {
+			Sleep(100);
+			continue;
+		}
+		wait_state = WaitForSingleObject(process.hProcess, 100);
+		if (wait_state == WAIT_FAILED) {
+			log_failure("WaitForSingleObject(player)", GetLastError());
+			TerminateJobObject(player_job, 23);
+			result = 23;
+			goto player_cleanup;
+		}
+		if (wait_state == WAIT_OBJECT_0) {
+			if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
+				exit_code = 24;
+				log_failure("GetExitCodeProcess(player)", GetLastError());
+			}
+			/* The original handle is no longer needed after its exit code is
+			 * saved. Release it while the job keeps tracking replacement
+			 * descendants. */
+			CloseHandle(process.hProcess);
+			process.hProcess = 0;
+		}
 	}
+	result = (int)exit_code;
+
+player_cleanup:
+	if (process.hThread != 0) {
+		CloseHandle(process.hThread);
+	}
+	if (process.hProcess != 0) {
+		CloseHandle(process.hProcess);
+	}
+	CloseHandle(player_job);
+	return result;
 }
 
 
@@ -358,6 +427,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 	}
 	if (lstrcmpiW(command_line, PLAYER_MODE) == 0) {
 		return launch_player(game_path, FALSE);
+	}
+	if (lstrcmpiW(command_line, PAIRED_PLAYER_MODE) == 0) {
+		return launch_player(game_path, TRUE);
 	}
 	worker_only = lstrcmpiW(command_line, WORKER_ONLY_MODE) == 0;
 

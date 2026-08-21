@@ -51,8 +51,11 @@ class WorkerStarterTests(unittest.TestCase):
             '--config engine_config.offline-player.xml', source)
         self.assertIn('--logFilePrefix offline-player-', source)
         self.assertIn('lstrcmpiW(command_line, PLAYER_MODE)', source)
+        self.assertIn(
+            'lstrcmpiW(command_line, PAIRED_PLAYER_MODE)', source)
         self.assertIn('result = launch_player(game_path, TRUE);', source)
         self.assertIn('return launch_player(game_path, FALSE);', source)
+        self.assertIn('return launch_player(game_path, TRUE);', source)
         self.assertIn('TerminateJobObject(job, ERROR_PROCESS_ABORTED)', source)
         self.assertLess(source.index('wait_for_worker_ready(\n'),
                         source.index('result = launch_player(game_path, TRUE);'))
@@ -89,6 +92,22 @@ class WorkerStarterTests(unittest.TestCase):
 
         self.assertIn('SetEnvironmentVariableW(SERVER_HOST_ENV, 0);', launch)
         self.assertIn('SetEnvironmentVariableW(SERVER_PORT_ENV, 0);', launch)
+
+    def test_visible_player_job_tracks_client_process_handoffs(self):
+        source = SOURCE.read_text(encoding='utf-8')
+        launch = source.split(
+            'static int launch_player', 1)[1].split(
+                'int WINAPI wWinMain', 1)[0]
+
+        self.assertIn('CreateJobObjectW(0, 0)', launch)
+        self.assertIn(
+            'AssignProcessToJobObject(player_job, process.hProcess)', launch)
+        self.assertIn('JobObjectBasicAccountingInformation', launch)
+        self.assertIn('accounting.ActiveProcesses == 0', launch)
+        self.assertLess(launch.index('CREATE_SUSPENDED'),
+                        launch.index('AssignProcessToJobObject'))
+        self.assertLess(launch.index('AssignProcessToJobObject'),
+                        launch.index('ResumeThread'))
 
     def test_duplicate_host_cannot_erase_the_live_worker_ready_marker(self):
         source = SOURCE.read_text(encoding='utf-8')
@@ -175,6 +194,7 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertIn(b'CreateDesktopW', payload)
         self.assertIn(b'CreateProcessW', payload)
         self.assertIn('--player'.encode('utf-16le'), payload)
+        self.assertIn('--paired-player'.encode('utf-16le'), payload)
         self.assertIn('--worker-only'.encode('utf-16le'), payload)
         self.assertIn(
             'engine_config.offline-player.xml'.encode('utf-16le'), payload)

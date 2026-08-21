@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Desktop launcher for the World of Tanks offline-battle client ports.
 
-The launcher writes the server address before the client starts, runs the LAN
-server for a host, and stops that server when the game exits. In the game the
-player then only clicks the battle button.
+The launcher installs client payloads, manages the hidden single-player
+authority, and can run a persistent LAN server explicitly.
 """
 
 from __future__ import annotations
@@ -16,19 +15,65 @@ import threading
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import core
+    import i18n
     import vehicle_editor_ui
     import vehicle_overlays
 else:
-    from . import core, vehicle_editor_ui, vehicle_overlays
+    from . import core, i18n, vehicle_editor_ui, vehicle_overlays
 
 
 LAUNCHER_VERSION = "0.5.0"
 WINDOW_TITLE = "World of Tanks Offline Battles %s" % LAUNCHER_VERSION
-MODE_LABELS = (
-    (core.MODE_SINGLE, "Single player"),
-    (core.MODE_HOST, "Host a LAN battle on this PC"),
-    (core.MODE_JOIN, "Join a LAN battle"),
-)
+
+_CHINESE = {
+    "Language": "语言",
+    "Game client": "游戏客户端",
+    "Game folder": "游戏目录",
+    "Browse...": "浏览…",
+    "Single player": "单人游戏",
+    "Online": "联网游戏",
+    "Player name": "玩家名",
+    "Tanks per team (including players)": "每队坦克数（包含玩家）",
+    "The launcher starts the private server and hidden simulation client "
+    "automatically.": "启动游戏时会自动运行隐藏服务器和模拟客户端。",
+    "Start single-player battle": "开始单人战斗",
+    "Server address": "服务器地址",
+    "Test connection": "测试连接",
+    "Tanks per team on this server": "本机服务器每队坦克数",
+    "Start server": "启动服务器",
+    "Stop server": "关闭服务器",
+    "To host: start the server, then join the game. Other players use a LAN "
+    "address shown in the log.": "作为主机：先启动服务器，再加入游戏；其他玩家使用日志中显示的局域网地址。",
+    "Join network battle": "加入联网战斗",
+    "Vehicle modifier": "坦克属性修改器",
+    "Vehicle data profile": "车辆属性方案",
+    "New profile...": "新建方案…",
+    "Edit selected profile...": "编辑所选方案…",
+    "Delete selected profile...": "删除所选方案…",
+    "Repair": "修复",
+    "Repair startup (keep saved data)": "修复启动问题（保留存档）",
+    "Reset all offline data...": "重置全部离线数据…",
+    "Activity log": "运行日志",
+    "Close game": "关闭游戏",
+    "Select the folder that contains %s.": "请选择包含 %s 的目录。",
+    "%s was not found in this folder.": "此目录中没有找到 %s。",
+    "This client version is not supported.": "不支持此客户端版本。",
+    "World of Tanks %s found. Starting the game installs the mod.":
+        "已找到 World of Tanks %s；启动游戏时会安装 Mod。",
+    "World of Tanks %s ready. Starting the game updates the mod.":
+        "World of Tanks %s 已准备就绪；启动游戏时会更新 Mod。",
+    "Select the World of Tanks folder": "选择 World of Tanks 游戏目录",
+    "New vehicle profile": "新建车辆属性方案",
+    "Profile name:": "方案名称：",
+    "Delete vehicle profile?": "删除车辆属性方案？",
+    "Delete profile '%s' and all of its saved vehicle edits?":
+        "删除方案“%s”及其中保存的全部车辆修改？",
+    "Reset all offline data?": "重置全部离线数据？",
+    "This deletes this mod's saved address, account settings, garage fittings, "
+    "post-battle results, configuration, and isolated client graphics/input "
+    "preferences. Other mods and the normal World of Tanks profile are kept. "
+    "Continue?": "这会删除本 Mod 保存的地址、账号设置、车库配件、战后结果、配置，以及独立的客户端画面/输入偏好。其他 Mod 和正常的 World of Tanks 配置会保留。是否继续？",
+}
 
 
 def _no_console_flags():
@@ -55,148 +100,301 @@ class LauncherWindow(object):
 
     def _build(self):
         tk = self._tk
+        settings = core.load_settings()
+        preference = settings.get("language", i18n.LANGUAGE_AUTO)
+        if preference not in i18n.LANGUAGES:
+            preference = i18n.LANGUAGE_ENGLISH
+        self.language_preference = preference
+        self.language = i18n.resolve_language(preference)
+
         self.root = tk.Tk()
         self.root.title(WINDOW_TITLE)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        settings = core.load_settings()
 
         frame = tk.Frame(self.root, padx=12, pady=12)
         frame.pack(fill="both", expand=True)
 
-        tk.Label(frame, text="Game folder").grid(row=0, column=0, sticky="w")
+        header = tk.Frame(frame)
+        header.grid(row=0, column=0, sticky="we", pady=(0, 8))
+        tk.Label(
+            header, text="World of Tanks Offline Battles",
+            font=("TkDefaultFont", 11, "bold")).pack(side="left")
+        language_controls = tk.Frame(header)
+        language_controls.pack(side="right")
+        self.language_label = tk.Label(language_controls, text="")
+        self.language_label.pack(side="left", padx=(0, 6))
+        self.language_choice = tk.StringVar(
+            value=i18n.choice_for_language(self.language_preference))
+        self.language_box = self._ttk.Combobox(
+            language_controls, textvariable=self.language_choice,
+            values=tuple(label for unused, label in i18n.LANGUAGE_CHOICES),
+            state="readonly", width=13)
+        self.language_box.pack(side="left")
+        self.language_box.bind(
+            "<<ComboboxSelected>>", self._language_selected)
+
+        self.game_panel = tk.LabelFrame(frame, text="", padx=8, pady=8)
+        self.game_panel.grid(row=1, column=0, sticky="we", pady=(0, 8))
+        self.game_folder_label = tk.Label(self.game_panel, text="")
+        self.game_folder_label.grid(row=0, column=0, sticky="w")
         self._folders = core.known_folders(settings)
         self.game_root = tk.StringVar(
             value=settings.get("game_root", "") or
             (self._folders[0] if self._folders else ""))
         self.folder_box = self._ttk.Combobox(
-            frame, textvariable=self.game_root, values=list(self._folders),
+            self.game_panel, textvariable=self.game_root,
+            values=list(self._folders),
             width=50)
         self.folder_box.grid(row=0, column=1, sticky="we", padx=(6, 6))
-        tk.Button(frame, text="Browse...", command=self._browse).grid(
-            row=0, column=2, sticky="e")
+        self.browse_button = tk.Button(
+            self.game_panel, text="", command=self._browse)
+        self.browse_button.grid(row=0, column=2, sticky="e")
         self.game_root.trace_add("write", lambda *unused: self._refresh_client())
 
-        self.client_label = tk.Label(frame, text="", anchor="w")
-        self.client_label.grid(row=1, column=0, columnspan=3, sticky="we",
-                               pady=(4, 10))
+        self.client_label = tk.Label(self.game_panel, text="", anchor="w")
+        self.client_label.grid(
+            row=1, column=0, columnspan=3, sticky="we", pady=(4, 0))
+        self.game_panel.grid_columnconfigure(1, weight=1)
 
-        self.mode = tk.StringVar(value=settings.get("mode", core.MODE_SINGLE))
-        row = 2
-        for value, label in MODE_LABELS:
-            tk.Radiobutton(frame, text=label, value=value, variable=self.mode,
-                           anchor="w", command=self._refresh_mode).grid(
-                row=row, column=0, columnspan=3, sticky="w")
-            row += 1
-
-        tk.Label(frame, text="Server address").grid(row=row, column=0,
-                                                    sticky="w", pady=(6, 0))
-        self.join_address = tk.StringVar(
-            value=settings.get("join_address", "192.168.1.10:%d" %
-                               core.DEFAULT_SERVER_PORT))
-        self.join_entry = tk.Entry(frame, textvariable=self.join_address,
-                                   width=40)
-        self.join_entry.grid(row=row, column=1, sticky="we", padx=(6, 6),
-                             pady=(6, 0))
-        self.test_button = tk.Button(frame, text="Test connection",
-                                     command=self._test_connection)
-        self.test_button.grid(row=row, column=2, sticky="e", pady=(6, 0))
-        row += 1
-
-        tk.Label(frame, text="Player name").grid(row=row, column=0, sticky="w",
-                                                 pady=(6, 0))
+        saved_mode = settings.get("mode", core.MODE_SINGLE)
+        # Older launchers exposed Host and Join separately. Both now open the
+        # Online tab; hosting is an explicit server action inside that tab.
+        saved_mode = (core.MODE_SINGLE if saved_mode == core.MODE_SINGLE
+                      else core.MODE_JOIN)
+        self.mode = tk.StringVar(value=saved_mode)
         self.player_name = tk.StringVar(value=settings.get("name", ""))
-        tk.Entry(frame, textvariable=self.player_name, width=52).grid(
-            row=row, column=1, columnspan=2, sticky="we", padx=(6, 0),
-            pady=(6, 0))
-        row += 1
-
-        tk.Label(frame, text="Tanks per team (including players)").grid(
-            row=row, column=0, sticky="w", pady=(6, 0))
         self.team_size = tk.StringVar(
             value=str(settings.get("team_size", core.DEFAULT_TEAM_SIZE)))
-        self.team_size_box = self._ttk.Combobox(
-            frame, textvariable=self.team_size,
+        self.join_address = tk.StringVar(
+            value=settings.get(
+                "join_address", "%s:%d" %
+                (core.LOCAL_HOST, core.DEFAULT_SERVER_PORT)))
+
+        self.battle_tabs = self._ttk.Notebook(frame)
+        self.battle_tabs.grid(row=2, column=0, sticky="we", pady=(0, 8))
+        self.single_panel = tk.Frame(self.battle_tabs, padx=10, pady=10)
+        self.network_panel = tk.Frame(self.battle_tabs, padx=10, pady=10)
+        self.battle_tabs.add(self.single_panel, text="")
+        self.battle_tabs.add(self.network_panel, text="")
+        self.battle_tabs.bind("<<NotebookTabChanged>>", self._mode_tab_changed)
+
+        self.single_player_name_label = tk.Label(self.single_panel, text="")
+        self.single_player_name_label.grid(row=0, column=0, sticky="w")
+        self.single_player_name_entry = tk.Entry(
+            self.single_panel, textvariable=self.player_name, width=52)
+        self.single_player_name_entry.grid(
+            row=0, column=1, columnspan=2, sticky="we", padx=(6, 0))
+        self.single_team_size_label = tk.Label(self.single_panel, text="")
+        self.single_team_size_label.grid(
+            row=1, column=0, sticky="w", pady=(6, 0))
+        self.single_team_size_box = self._ttk.Combobox(
+            self.single_panel, textvariable=self.team_size,
             values=tuple(str(value) for value in range(
                 core.MIN_TEAM_SIZE, core.MAX_TEAM_SIZE + 1)), width=10)
-        self.team_size_box.grid(row=row, column=1, sticky="w", padx=(6, 6),
-                                pady=(6, 0))
-        row += 1
+        self.single_team_size_box.grid(
+            row=1, column=1, sticky="w", padx=(6, 6), pady=(6, 0))
+        self.team_size_box = self.single_team_size_box
+        self.single_help_label = tk.Label(
+            self.single_panel, text="", anchor="w", justify="left")
+        self.single_help_label.grid(
+            row=2, column=0, columnspan=3, sticky="we", pady=(8, 6))
+        self.single_start_button = tk.Button(
+            self.single_panel, text="", command=self._start_single,
+            height=2, font=("TkDefaultFont", 10, "bold"))
+        self.single_start_button.grid(
+            row=3, column=0, columnspan=3, sticky="we")
+        self.single_panel.grid_columnconfigure(1, weight=1)
 
-        tk.Label(frame, text="Vehicle data profile").grid(
-            row=row, column=0, sticky="w", pady=(6, 0))
+        self.server_address_label = tk.Label(self.network_panel, text="")
+        self.server_address_label.grid(row=0, column=0, sticky="w")
+        self.join_entry = tk.Entry(
+            self.network_panel, textvariable=self.join_address, width=40)
+        self.join_entry.grid(row=0, column=1, sticky="we", padx=(6, 6))
+        self.test_button = tk.Button(
+            self.network_panel, text="", command=self._test_connection)
+        self.test_button.grid(row=0, column=2, sticky="e")
+        self.network_player_name_label = tk.Label(self.network_panel, text="")
+        self.network_player_name_label.grid(
+            row=1, column=0, sticky="w", pady=(6, 0))
+        self.network_player_name_entry = tk.Entry(
+            self.network_panel, textvariable=self.player_name, width=52)
+        self.network_player_name_entry.grid(
+            row=1, column=1, columnspan=2, sticky="we", padx=(6, 0),
+            pady=(6, 0))
+        self.network_team_size_label = tk.Label(self.network_panel, text="")
+        self.network_team_size_label.grid(
+            row=2, column=0, sticky="w", pady=(6, 0))
+        self.network_team_size_box = self._ttk.Combobox(
+            self.network_panel, textvariable=self.team_size,
+            values=tuple(str(value) for value in range(
+                core.MIN_TEAM_SIZE, core.MAX_TEAM_SIZE + 1)), width=10)
+        self.network_team_size_box.grid(
+            row=2, column=1, sticky="w", padx=(6, 6), pady=(6, 0))
+        self.server_button = tk.Button(
+            self.network_panel, text="", command=self._toggle_lan_server)
+        self.server_button.grid(
+            row=3, column=0, columnspan=3, sticky="we", pady=(8, 0))
+        self.network_help_label = tk.Label(
+            self.network_panel, text="", anchor="w", justify="left",
+            wraplength=620)
+        self.network_help_label.grid(
+            row=4, column=0, columnspan=3, sticky="we", pady=(8, 6))
+        self.network_start_button = tk.Button(
+            self.network_panel, text="", command=self._start_network,
+            height=2, font=("TkDefaultFont", 10, "bold"))
+        self.network_start_button.grid(
+            row=5, column=0, columnspan=3, sticky="we")
+        self.network_panel.grid_columnconfigure(1, weight=1)
+
+        self.tools_tabs = self._ttk.Notebook(frame)
+        self.tools_tabs.grid(row=3, column=0, sticky="we", pady=(0, 8))
+        self.vehicle_panel = tk.Frame(self.tools_tabs, padx=10, pady=10)
+        self.repair_panel = tk.Frame(self.tools_tabs, padx=10, pady=10)
+        self.tools_tabs.add(self.vehicle_panel, text="")
+        self.tools_tabs.add(self.repair_panel, text="")
+
+        self.vehicle_profile_label = tk.Label(self.vehicle_panel, text="")
+        self.vehicle_profile_label.grid(row=0, column=0, sticky="w")
         self.vehicle_profile = tk.StringVar(
             value=settings.get(
                 "vehicle_profile", vehicle_overlays.ORIGINAL_PROFILE_LABEL))
         self.vehicle_profile_box = self._ttk.Combobox(
-            frame, textvariable=self.vehicle_profile,
+            self.vehicle_panel, textvariable=self.vehicle_profile,
             values=(vehicle_overlays.ORIGINAL_PROFILE_LABEL,),
             state="disabled", width=40)
         self.vehicle_profile_box.grid(
-            row=row, column=1, columnspan=2, sticky="we", padx=(6, 0),
-            pady=(6, 0))
+            row=0, column=1, sticky="we", padx=(6, 0))
         self.vehicle_profile_box.bind(
             "<<ComboboxSelected>>", self._profile_selected)
-        row += 1
 
-        profile_actions = tk.Frame(frame)
+        profile_actions = tk.Frame(self.vehicle_panel)
         profile_actions.grid(
-            row=row, column=0, columnspan=3, sticky="we", pady=(6, 0))
+            row=1, column=0, columnspan=2, sticky="we", pady=(6, 0))
         self.new_profile_button = tk.Button(
-            profile_actions, text="New profile...",
+            profile_actions, text="",
             command=self._new_vehicle_profile)
         self.new_profile_button.pack(side="left", fill="x", expand=True)
         self.vehicle_editor_button = tk.Button(
-            profile_actions, text="Edit selected profile...",
+            profile_actions, text="",
             command=self._open_vehicle_editor)
         self.vehicle_editor_button.pack(
             side="left", fill="x", expand=True, padx=(6, 0))
         self.delete_profile_button = tk.Button(
-            profile_actions, text="Delete selected profile...",
+            profile_actions, text="",
             command=self._delete_vehicle_profile)
         self.delete_profile_button.pack(
             side="left", fill="x", expand=True, padx=(6, 0))
-        row += 1
+        self.vehicle_panel.grid_columnconfigure(1, weight=1)
 
-        maintenance = tk.Frame(frame)
-        maintenance.grid(row=row, column=0, columnspan=3, sticky="we",
-                         pady=(10, 0))
         self.repair_button = tk.Button(
-            maintenance, text="Repair startup (keep saved data)",
+            self.repair_panel, text="",
             command=self._repair_startup)
         self.repair_button.pack(side="left", fill="x", expand=True)
         self.reset_button = tk.Button(
-            maintenance, text="Reset all offline data...",
+            self.repair_panel, text="",
             command=self._reset_all_state)
         self.reset_button.pack(side="left", fill="x", expand=True,
                                padx=(6, 0))
-        row += 1
 
-        launch_actions = tk.Frame(frame)
-        launch_actions.grid(
-            row=row, column=0, columnspan=3, sticky="we", pady=(12, 6))
-        self.server_button = tk.Button(
-            launch_actions, text="Start LAN server",
-            command=self._toggle_lan_server)
-        self.server_button.pack(side="left", fill="x", expand=True)
-        self.start_button = tk.Button(
-            launch_actions, text="Start game", command=self._start)
-        self.start_button.pack(
-            side="left", fill="x", expand=True, padx=(6, 0))
-        row += 1
-
-        self.log_view = tk.Text(frame, height=12, width=72, state="disabled",
+        self.log_panel = tk.LabelFrame(frame, text="", padx=6, pady=6)
+        self.log_panel.grid(row=4, column=0, sticky="nsew")
+        self.log_view = tk.Text(
+            self.log_panel, height=10, width=72, state="disabled",
                                 wrap="none")
-        self.log_view.grid(row=row, column=0, columnspan=3, sticky="nsew")
-        frame.grid_columnconfigure(1, weight=1)
-        frame.grid_rowconfigure(row, weight=1)
+        self.log_view.pack(fill="both", expand=True)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(4, weight=1)
+
+        self.start_button = (self.single_start_button
+                             if self.mode.get() == core.MODE_SINGLE
+                             else self.network_start_button)
+        self._sync_mode_tab()
+        self._apply_language(refresh=False)
 
         self._refresh_client()
         self._refresh_mode()
         self._recover_stale_vehicle_profile()
 
+    def _t(self, text):
+        if self.language == i18n.LANGUAGE_CHINESE:
+            return _CHINESE.get(text, text)
+        return text
+
+    def _apply_language(self, refresh=True):
+        self.language_label.config(text=self._t("Language"))
+        self.game_panel.config(text=self._t("Game client"))
+        self.game_folder_label.config(text=self._t("Game folder"))
+        self.browse_button.config(text=self._t("Browse..."))
+        self.battle_tabs.tab(
+            self.single_panel, text=self._t("Single player"))
+        self.battle_tabs.tab(self.network_panel, text=self._t("Online"))
+        self.single_player_name_label.config(text=self._t("Player name"))
+        self.network_player_name_label.config(text=self._t("Player name"))
+        self.single_team_size_label.config(
+            text=self._t("Tanks per team (including players)"))
+        self.network_team_size_label.config(
+            text=self._t("Tanks per team on this server"))
+        self.single_help_label.config(text=self._t(
+            "The launcher starts the private server and hidden simulation "
+            "client automatically."))
+        self.server_address_label.config(text=self._t("Server address"))
+        self.test_button.config(text=self._t("Test connection"))
+        self.network_help_label.config(text=self._t(
+            "To host: start the server, then join the game. Other players use "
+            "a LAN address shown in the log."))
+        self.tools_tabs.tab(
+            self.vehicle_panel, text=self._t("Vehicle modifier"))
+        self.tools_tabs.tab(self.repair_panel, text=self._t("Repair"))
+        self.vehicle_profile_label.config(text=self._t("Vehicle data profile"))
+        self.new_profile_button.config(text=self._t("New profile..."))
+        self.vehicle_editor_button.config(
+            text=self._t("Edit selected profile..."))
+        self.delete_profile_button.config(
+            text=self._t("Delete selected profile..."))
+        self.repair_button.config(
+            text=self._t("Repair startup (keep saved data)"))
+        self.reset_button.config(text=self._t("Reset all offline data..."))
+        self.log_panel.config(text=self._t("Activity log"))
+        self._update_action_controls()
+        if refresh:
+            self._refresh_client()
+
+    def _language_selected(self, unused_event=None):
+        self.language_preference = i18n.language_for_choice(
+            self.language_choice.get())
+        self.language = i18n.resolve_language(self.language_preference)
+        self._apply_language()
+        self._save_settings()
+
+    def _sync_mode_tab(self):
+        panel = (self.single_panel if self.mode.get() == core.MODE_SINGLE
+                 else self.network_panel)
+        self.battle_tabs.select(panel)
+        self.start_button = (self.single_start_button
+                             if self.mode.get() == core.MODE_SINGLE
+                             else self.network_start_button)
+
+    def _mode_tab_changed(self, unused_event=None):
+        try:
+            index = self.battle_tabs.index("current")
+        except Exception:
+            return
+        self.mode.set(core.MODE_SINGLE if index == 0 else core.MODE_JOIN)
+        self._refresh_mode(sync_tab=False)
+
+    def _start_single(self):
+        self.mode.set(core.MODE_SINGLE)
+        self._refresh_mode()
+        return self._start()
+
+    def _start_network(self):
+        self.mode.set(core.MODE_JOIN)
+        self._refresh_mode()
+        return self._start()
+
     def _browse(self):
         selected = self._filedialog.askdirectory(
-            title="Select the World of Tanks folder",
+            title=self._t("Select the World of Tanks folder"),
             initialdir=self.game_root.get() or None)
         if selected:
             self.game_root.set(os.path.normpath(selected))
@@ -215,17 +413,21 @@ class LauncherWindow(object):
     def _refresh_client(self):
         status = core.inspect_game_root(self.game_root.get())
         if not self.game_root.get().strip():
-            text = "Select the folder that contains %s." % core.GAME_EXECUTABLE
+            text = self._t("Select the folder that contains %s.") % (
+                core.GAME_EXECUTABLE,)
         elif not status["has_executable"]:
-            text = "%s was not found in this folder." % core.GAME_EXECUTABLE
+            text = self._t("%s was not found in this folder.") % (
+                core.GAME_EXECUTABLE,)
         elif status["client"] is None:
-            text = "This client version is not supported."
+            text = self._t("This client version is not supported.")
         elif not status["mod_installed"]:
-            text = ("World of Tanks %s found. Start game installs the mod." %
-                    (status["version"] or status["client"]))
+            text = self._t(
+                "World of Tanks %s found. Starting the game installs the mod."
+            ) % (status["version"] or status["client"])
         else:
-            text = "World of Tanks %s ready. Start game updates the mod." % (
-                status["version"] or status["client"])
+            text = self._t(
+                "World of Tanks %s ready. Starting the game updates the mod."
+            ) % (status["version"] or status["client"])
         self.client_label.config(text=text)
         self._selected_client = status["client"]
         self._refresh_profiles(status)
@@ -239,25 +441,38 @@ class LauncherWindow(object):
 
     def _update_action_controls(self):
         server_running = self._server_is_running()
+        self.start_button = (self.single_start_button
+                             if self.mode.get() == core.MODE_SINGLE
+                             else self.network_start_button)
+        self.single_start_button.config(
+            text=self._t("Start single-player battle"))
+        self.network_start_button.config(text=self._t("Join network battle"))
         if self._busy:
-            self.start_button.config(state="normal", text="Kill the game")
+            inactive = (self.network_start_button
+                        if self.start_button is self.single_start_button
+                        else self.single_start_button)
+            inactive.config(state="disabled")
+            self.start_button.config(
+                state="normal", text=self._t("Close game"))
         elif self._maintenance_busy:
-            self.start_button.config(state="disabled", text="Start game")
+            self.single_start_button.config(state="disabled")
+            self.network_start_button.config(state="disabled")
         else:
-            self.start_button.config(state="normal", text="Start game")
+            self.single_start_button.config(state="normal")
+            self.network_start_button.config(state="normal")
         if server_running:
             server_state = (
                 "normal" if not self._busy and not self._maintenance_busy
                 else "disabled")
             self.server_button.config(
-                state=server_state, text="Stop LAN server")
+                state=server_state, text=self._t("Stop server"))
         else:
             server_state = (
                 "normal" if self._selected_client in core.SUPPORTED_PORTS and
-                self.mode.get() == core.MODE_HOST and not self._busy and
+                self.mode.get() == core.MODE_JOIN and not self._busy and
                 not self._maintenance_busy else "disabled")
             self.server_button.config(
-                state=server_state, text="Start LAN server")
+                state=server_state, text=self._t("Start server"))
         maintenance_state = (
             "normal" if self._selected_client == core.PORT_0_9_22 and
             not self._busy and not self._maintenance_busy and
@@ -345,20 +560,30 @@ class LauncherWindow(object):
                 "launcher session.")
         return removed + recovered
 
-    def _refresh_mode(self):
-        state = "normal" if self.mode.get() == core.MODE_JOIN else "disabled"
-        self.join_entry.config(state=state)
-        self.test_button.config(state="normal")
-        team_state = (
-            "readonly" if self._selected_client == core.PORT_0_9_22 and
-            self.mode.get() != core.MODE_JOIN else "disabled")
-        self.team_size_box.config(state=team_state)
-        if self.mode.get() != core.MODE_SINGLE:
-            self.vehicle_profile.set(vehicle_overlays.ORIGINAL_PROFILE_LABEL)
+    def _refresh_mode(self, sync_tab=True):
+        if self.mode.get() not in (core.MODE_SINGLE, core.MODE_JOIN):
+            self.mode.set(core.MODE_JOIN)
+        if sync_tab:
+            self._sync_mode_tab()
+        network = self.mode.get() == core.MODE_JOIN
+        network_state = (
+            "normal" if network and not self._busy and
+            not self._maintenance_busy else "disabled")
+        self.join_entry.config(state=network_state)
+        self.test_button.config(state=network_state)
+        controls_available = (
+            self._selected_client == core.PORT_0_9_22 and not self._busy and
+            not self._maintenance_busy and not self._server_is_running())
+        self.single_team_size_box.config(
+            state="readonly" if controls_available and not network
+            else "disabled")
+        self.network_team_size_box.config(
+            state="readonly" if controls_available and network
+            else "disabled")
         self._update_action_controls()
 
     def _test_connection(self):
-        mode = self.mode.get()
+        mode = core.MODE_JOIN
         client = self._refresh_client().get("client")
         if client not in core.SUPPORTED_PORTS:
             self._log("Select a supported game folder before testing.")
@@ -424,11 +649,14 @@ class LauncherWindow(object):
         core.save_settings({
             "game_root": self.game_root.get().strip(),
             "folders": list(self._folders),
-            "mode": self.mode.get(),
+            "mode": (core.MODE_SINGLE
+                     if self.mode.get() == core.MODE_SINGLE
+                     else core.MODE_JOIN),
             "join_address": self.join_address.get().strip(),
             "name": self.player_name.get().strip(),
             "team_size": team_size,
             "vehicle_profile": self.vehicle_profile.get().strip(),
+            "language": self.language_preference,
         })
 
     def _start_maintenance(self, action):
@@ -462,22 +690,21 @@ class LauncherWindow(object):
     def _repair_startup(self):
         return self._start_maintenance(core.repair_0_9_22_startup)
 
-    @staticmethod
-    def _ask_profile_name():
+    def _ask_profile_name(self):
         from tkinter import simpledialog
 
         return simpledialog.askstring(
-            "New vehicle profile",
-            "Profile name:")
+            self._t("New vehicle profile"),
+            self._t("Profile name:"))
 
-    @staticmethod
-    def _confirm_delete_profile(profile_name):
+    def _confirm_delete_profile(self, profile_name):
         from tkinter import messagebox
 
         return messagebox.askyesno(
-            "Delete vehicle profile?",
-            "Delete profile '%s' and all of its saved vehicle edits?" %
-            profile_name,
+            self._t("Delete vehicle profile?"),
+            self._t(
+                "Delete profile '%s' and all of its saved vehicle edits?"
+            ) % profile_name,
             icon="warning")
 
     def _new_vehicle_profile(self):
@@ -549,16 +776,16 @@ class LauncherWindow(object):
         self._log("Deleted vehicle profile '%s'." % profile_name)
         return True
 
-    @staticmethod
-    def _confirm_reset():
+    def _confirm_reset(self):
         from tkinter import messagebox
 
         return messagebox.askyesno(
-            "Reset all offline data?",
-            "This deletes this mod's saved address, account settings, garage "
-            "fittings, post-battle results, configuration, and isolated client "
-            "graphics/input preferences. Other mods and the normal World of "
-            "Tanks profile are kept. Continue?",
+            self._t("Reset all offline data?"),
+            self._t(
+                "This deletes this mod's saved address, account settings, "
+                "garage fittings, post-battle results, configuration, and "
+                "isolated client graphics/input preferences. Other mods and "
+                "the normal World of Tanks profile are kept. Continue?"),
             icon="warning")
 
     def _reset_all_state(self):
@@ -589,9 +816,9 @@ class LauncherWindow(object):
             self._stop_server(force=True)
         status = self._refresh_client()
         if (status.get("client") not in core.SUPPORTED_PORTS or
-                self.mode.get() != core.MODE_HOST):
+                self.mode.get() != core.MODE_JOIN):
             self._log(
-                "Select Host a LAN battle and a supported game folder first.")
+                "Select Online and a supported game folder first.")
             return False
         try:
             team_size = (core.parse_team_size(self.team_size.get())
@@ -611,9 +838,10 @@ class LauncherWindow(object):
                 for action in core.install_client_mod(
                         status["path"], status["client"]):
                     self._log(action)
-                self._start_server(
-                    status["path"], status["client"], team_size,
-                    persistent=True)
+                if self._start_server(
+                        status["path"], status["client"], team_size,
+                        persistent=True):
+                    self.root.after(0, self._use_local_server_address)
             except core.LauncherError as error:
                 self._log(str(error))
             except Exception as error:
@@ -626,6 +854,11 @@ class LauncherWindow(object):
         thread.start()
         return True
 
+    def _use_local_server_address(self):
+        self.join_address.set("%s:%d" % (
+            core.LOCAL_HOST, core.DEFAULT_SERVER_PORT))
+        self._save_settings()
+
     def _start(self):
         if self._maintenance_busy:
             self._log("Wait for launcher maintenance to finish.")
@@ -636,7 +869,8 @@ class LauncherWindow(object):
         status = self._refresh_client()
         selected_profile = self.vehicle_profile.get().strip()
         profile_name = (
-            selected_profile if selected_profile in self._profile_names
+            selected_profile if self.mode.get() == core.MODE_SINGLE and
+            selected_profile in self._profile_names
             else None)
         try:
             session = core.plan_session(status, self.mode.get(),
@@ -875,7 +1109,8 @@ class LauncherWindow(object):
     def _run_game(self, game_root, port_version, host, port,
                   paired_worker=False):
         self._log("Starting %s..." % core.GAME_EXECUTABLE)
-        command = core.visible_client_command(game_root, port_version)
+        command = core.visible_client_command(
+            game_root, port_version, paired_worker=paired_worker)
         environment = core.visible_client_environment(
             port_version, host, port, paired_worker=paired_worker)
         self._game = subprocess.Popen(

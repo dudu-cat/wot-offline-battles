@@ -17,6 +17,7 @@ import wot_launcher
 
 class _Widget(object):
     def __init__(self, master=None, **options):
+        self.master = master
         self.options = dict(options)
         self.children = []
         if master is not None and hasattr(master, "children"):
@@ -53,6 +54,34 @@ class _Text(_Widget):
 
     def see(self, unused_index):
         pass
+
+
+class _Notebook(_Widget):
+    def __init__(self, master=None, **options):
+        _Widget.__init__(self, master, **options)
+        self.tabs = []
+        self.tab_options = {}
+        self.selected = None
+
+    def add(self, child, **options):
+        self.tabs.append(child)
+        self.tab_options[child] = dict(options)
+        if self.selected is None:
+            self.selected = child
+
+    def tab(self, child, **options):
+        self.tab_options.setdefault(child, {}).update(options)
+        return self.tab_options[child]
+
+    def select(self, child=None):
+        if child is None:
+            return self.selected
+        self.selected = child
+        return child
+
+    def index(self, value):
+        child = self.selected if value == "current" else value
+        return self.tabs.index(child)
 
 
 class _StringVar(object):
@@ -93,6 +122,7 @@ class _Root(_Widget):
 class _FakeTk(object):
     Tk = _Root
     Frame = _Widget
+    LabelFrame = _Widget
     Label = _Widget
     Entry = _Widget
     Button = _Widget
@@ -103,6 +133,7 @@ class _FakeTk(object):
 
 class _FakeTtk(object):
     Combobox = _Widget
+    Notebook = _Notebook
 
 
 class _FakeFileDialog(object):
@@ -145,6 +176,10 @@ class WindowTest(unittest.TestCase):
         core.settings_path = lambda: os.path.join(self.settings_dir,
                                                   "launcher.json")
         core.discover_game_folders = lambda *unused, **unused_options: []
+        language_patch = mock.patch.object(
+            wot_launcher.i18n, "detect_system_language", return_value="en")
+        language_patch.start()
+        self.addCleanup(language_patch.stop)
         self.dialog = _FakeFileDialog()
         self.window = wot_launcher.LauncherWindow(_FakeTk, _FakeTtk, self.dialog)
 
@@ -161,43 +196,124 @@ class WindowTest(unittest.TestCase):
         self.window.game_root.set(game_root)
         return game_root
 
+    def test_layout_separates_play_vehicle_and_repair_controls(self):
+        self.assertEqual(
+            "Single player",
+            self.window.battle_tabs.tab(self.window.single_panel).get("text"))
+        self.assertEqual(
+            "Online",
+            self.window.battle_tabs.tab(self.window.network_panel).get("text"))
+        self.assertIs(
+            self.window.single_start_button.master, self.window.single_panel)
+        self.assertIs(
+            self.window.network_start_button.master, self.window.network_panel)
+        self.assertIs(
+            self.window.vehicle_profile_box.master, self.window.vehicle_panel)
+        self.assertIs(self.window.repair_button.master, self.window.repair_panel)
+
+    def test_old_host_setting_migrates_to_the_online_tab(self):
+        core.save_settings({"mode": core.MODE_HOST})
+
+        reopened = wot_launcher.LauncherWindow(
+            _FakeTk, _FakeTtk, self.dialog)
+
+        self.assertEqual(core.MODE_JOIN, reopened.mode.get())
+        self.assertIs(reopened.network_panel, reopened.battle_tabs.select())
+
+    def test_auto_chinese_and_explicit_english_are_applied_and_saved(self):
+        core.save_settings({"language": wot_launcher.i18n.LANGUAGE_AUTO})
+        with mock.patch.object(
+                wot_launcher.i18n, "detect_system_language",
+                return_value=wot_launcher.i18n.LANGUAGE_CHINESE):
+            reopened = wot_launcher.LauncherWindow(
+                _FakeTk, _FakeTtk, self.dialog)
+
+        self.assertEqual("游戏客户端", reopened.game_panel.cget("text"))
+        self.assertEqual(
+            "开始单人战斗", reopened.single_start_button.cget("text"))
+        self.assertEqual(
+            "坦克属性修改器",
+            reopened.tools_tabs.tab(reopened.vehicle_panel).get("text"))
+
+        reopened.language_choice.set("English")
+        reopened._language_selected()
+
+        self.assertEqual("Game client", reopened.game_panel.cget("text"))
+        self.assertEqual(
+            "Start single-player battle",
+            reopened.single_start_button.cget("text"))
+        self.assertEqual(
+            wot_launcher.i18n.LANGUAGE_ENGLISH,
+            core.load_settings().get("language"))
+
+    def test_primary_action_text_follows_the_selected_tab(self):
+        self.assertEqual(
+            "Start single-player battle",
+            self.window.single_start_button.cget("text"))
+        self.window.mode.set(core.MODE_JOIN)
+        self.window._refresh_mode()
+        self.assertEqual(
+            "Join network battle",
+            self.window.network_start_button.cget("text"))
+        self.assertIs(self.window.network_start_button, self.window.start_button)
+
+    def test_network_start_always_plans_a_join_session(self):
+        self._game()
+        self.window.join_address.set("10.0.0.5:1234")
+        session = {
+            "client": core.PORT_0_8_2,
+            "mode": core.MODE_JOIN,
+            "host": "10.0.0.5",
+            "tcp_port": 1234,
+            "needs_server": False,
+            "team_size": core.DEFAULT_TEAM_SIZE,
+            "vehicle_profile": None,
+        }
+        with mock.patch("core.plan_session", return_value=session) as plan, \
+                mock.patch("wot_launcher.threading.Thread") as thread:
+            self.window._start_network()
+
+        self.assertEqual(core.MODE_JOIN, plan.call_args.args[1])
+        thread.return_value.start.assert_called_once_with()
+
     def test_the_address_field_and_test_button_follow_the_mode(self):
         self.window.mode.set(core.MODE_JOIN)
         self.window._refresh_mode()
         self.assertEqual(self.window.join_entry.cget("state"), "normal")
         self.assertEqual(self.window.test_button.cget("state"), "normal")
-        for mode in (core.MODE_SINGLE, core.MODE_HOST):
-            self.window.mode.set(mode)
-            self.window._refresh_mode()
-            self.assertEqual(self.window.join_entry.cget("state"), "disabled")
-            self.assertEqual(self.window.test_button.cget("state"), "normal")
+        self.window.mode.set(core.MODE_SINGLE)
+        self.window._refresh_mode()
+        self.assertEqual(self.window.join_entry.cget("state"), "disabled")
+        self.assertEqual(self.window.test_button.cget("state"), "disabled")
 
-    def test_team_size_is_editable_only_when_0_9_22_hosts(self):
+    def test_each_tab_has_its_own_0_9_22_team_size_control(self):
         self._game("0.9.22.0.1", "1513")
-        for mode in (core.MODE_SINGLE, core.MODE_HOST):
-            self.window.mode.set(mode)
-            self.window._refresh_mode()
-            self.assertEqual(
-                "readonly", self.window.team_size_box.cget("state"))
+        self.assertEqual(
+            "readonly", self.window.single_team_size_box.cget("state"))
+        self.assertEqual(
+            "disabled", self.window.network_team_size_box.cget("state"))
         self.window.mode.set(core.MODE_JOIN)
         self.window._refresh_mode()
-        self.assertEqual("disabled", self.window.team_size_box.cget("state"))
+        self.assertEqual(
+            "disabled", self.window.single_team_size_box.cget("state"))
+        self.assertEqual(
+            "readonly", self.window.network_team_size_box.cget("state"))
 
-    def test_lan_server_button_starts_only_from_host_mode(self):
+    def test_server_button_is_an_explicit_online_action(self):
         self._game("0.9.22.0.1", "1513")
         self.assertEqual("disabled", self.window.server_button.cget("state"))
-        self.window.mode.set(core.MODE_HOST)
+        self.window.mode.set(core.MODE_JOIN)
         self.window._refresh_mode()
         self.assertEqual("normal", self.window.server_button.cget("state"))
         self.assertEqual(
-            "Start LAN server", self.window.server_button.cget("text"))
-        self.window.mode.set(core.MODE_JOIN)
+            "Start server", self.window.server_button.cget("text"))
+        self.window.mode.set(core.MODE_SINGLE)
         self.window._refresh_mode()
         self.assertEqual("disabled", self.window.server_button.cget("state"))
 
     def test_lan_server_button_installs_data_and_starts_persistent_server(self):
         game_root = self._game("0.9.22.0.1", "1513")
-        self.window.mode.set(core.MODE_HOST)
+        self.window.mode.set(core.MODE_JOIN)
         self.window.team_size.set("7")
         self.window._refresh_mode()
         with mock.patch(
@@ -214,10 +330,13 @@ class WindowTest(unittest.TestCase):
         install.assert_called_once_with(game_root, core.PORT_0_9_22)
         start_server.assert_called_once_with(
             game_root, core.PORT_0_9_22, 7, persistent=True)
+        self.assertEqual(
+            "%s:%d" % (core.LOCAL_HOST, core.DEFAULT_SERVER_PORT),
+            self.window.join_address.get())
 
     def test_0_8_2_server_button_ignores_hidden_team_size_text(self):
         game_root = self._game("0.8.2", "335")
-        self.window.mode.set(core.MODE_HOST)
+        self.window.mode.set(core.MODE_JOIN)
         self.window.team_size.set("not a team size")
         self.window._refresh_mode()
         with mock.patch("core.install_client_mod", return_value=[]), \
@@ -267,12 +386,12 @@ class WindowTest(unittest.TestCase):
 
     def test_settings_survive_a_new_window(self):
         self.window.game_root.set(self.settings_dir)
-        self.window.mode.set(core.MODE_HOST)
+        self.window.mode.set(core.MODE_JOIN)
         self.window.player_name.set("Peng")
         self.window.team_size.set("7")
         self.window._save_settings()
         reopened = wot_launcher.LauncherWindow(_FakeTk, _FakeTtk, self.dialog)
-        self.assertEqual(reopened.mode.get(), core.MODE_HOST)
+        self.assertEqual(reopened.mode.get(), core.MODE_JOIN)
         self.assertEqual(reopened.player_name.get(), "Peng")
         self.assertEqual(reopened.team_size.get(), "7")
 
@@ -344,11 +463,11 @@ class WindowTest(unittest.TestCase):
         self.assertEqual(
             "normal", self.window.vehicle_editor_button.cget("state"))
 
-        self.window.mode.set(core.MODE_HOST)
+        self.window.mode.set(core.MODE_JOIN)
         self.window._refresh_mode()
 
         self.assertEqual(
-            wot_launcher.vehicle_overlays.ORIGINAL_PROFILE_LABEL,
+            "Fast MS-1",
             self.window.vehicle_profile.get())
         self.assertEqual(
             "disabled", self.window.vehicle_profile_box.cget("state"))

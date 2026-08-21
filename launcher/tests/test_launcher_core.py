@@ -357,6 +357,11 @@ class ServerPayloadTest(unittest.TestCase):
         command = core.visible_client_command("/game", core.PORT_0_9_22)
         self.assertEqual(os.path.join("/game", core.GAME_EXECUTABLE), command[0])
         self.assertIn(core.PLAYER_ENGINE_CONFIG_0922, command)
+        self.assertEqual(
+            [os.path.join("/game", core.WORKER_STARTER_FILENAME_0922),
+             core.PAIRED_PLAYER_ARGUMENT_0922],
+            core.visible_client_command(
+                "/game", core.PORT_0_9_22, paired_worker=True))
         environment = core.visible_client_environment(
             core.PORT_0_9_22, "10.0.0.5", 1234, paired_worker=True,
             environment={

@@ -77,6 +77,7 @@ WORKER_READY_MARKER_FILENAME_0922 = "offline-worker.ready"
 WORKER_FAILURE_LOG_FILENAME_0922 = "offline-worker-starter.log"
 PLAYER_ENGINE_CONFIG_0922 = "engine_config.offline-player.xml"
 WORKER_ONLY_ARGUMENT_0922 = "--worker-only"
+PAIRED_PLAYER_ARGUMENT_0922 = "--paired-player"
 WORKER_READY_TIMEOUT_SECONDS_0922 = 60.0
 
 _CLIENT_RUNTIME_FILES_0_9_22 = (
@@ -162,8 +163,11 @@ def worker_failure_log(game_root):
     return os.path.join(game_root, WORKER_FAILURE_LOG_FILENAME_0922)
 
 
-def visible_client_command(game_root, port_version):
+def visible_client_command(game_root, port_version, paired_worker=False):
     """Build the visible client command for one supported port."""
+    if port_version == PORT_0_9_22 and paired_worker:
+        return [worker_starter_executable(game_root),
+                PAIRED_PLAYER_ARGUMENT_0922]
     command = [game_executable(game_root)]
     if port_version == PORT_0_9_22:
         command.extend([

@@ -2225,6 +2225,7 @@ class BattleRuntime(object):
         self._battle_live = True
         # Publish one fresh live set even when it matches the prebattle state.
         self._spotted_signature = None
+        self._next_spotting_time = 0.0
         # The countdown froze gun laying and firing; the battle releases both.
         self._set_gun_locked(False)
         self._prebattle_deadline = None
@@ -7900,8 +7901,14 @@ class BattleRuntime(object):
                 next_boundary = _PROFILE_CLOCK()
                 stages['bot_events'] = max(0.0, next_boundary - boundary)
                 boundary = next_boundary
-            if self._battle_live and not self._worker_mode:
-                self._update_spotting(now)
+            if not self._worker_mode:
+                if self._battle_live:
+                    self._update_spotting(now)
+                elif self._prebattle_deadline is not None:
+                    # The minimap view circle is live during the countdown, but
+                    # enemy spotting and its LAN report stay behind the battle
+                    # gate.  This also lets still devices arm before 00:00.
+                    self._update_spotting(now, hud_only=True)
             if profiling:
                 next_boundary = _PROFILE_CLOCK()
                 stages['spot'] = max(0.0, next_boundary - boundary)
@@ -10908,8 +10915,8 @@ class BattleRuntime(object):
             deadline + intervals * SPOTTING_PROBE_SECONDS)
         return True
 
-    def _update_spotting(self, now):
-        """Apply proximity, team relay, LOS and ten-second spot memory."""
+    def _update_spotting(self, now, hud_only=False):
+        """Refresh the local vision HUD, then apply live spotting when allowed."""
         if now < self._next_spotting_time:
             return False
         if self._next_spotting_time <= 0.0:
@@ -10919,6 +10926,8 @@ class BattleRuntime(object):
             (elapsed + 1e-9) / SPOTTING_UPDATE_SECONDS)) + 1
         self._next_spotting_time += intervals * SPOTTING_UPDATE_SECONDS
         observers = self._spotting_observers()
+        if hud_only:
+            return False
         changed = False
         spotted_records = []
         for record in self._records.values():
