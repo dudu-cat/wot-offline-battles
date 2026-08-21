@@ -1372,14 +1372,18 @@ class _BigWorld(object):
         space_id = int(space_id)
         self.legacy_visibility_calls.append(('get', space_id))
         if space_id in self.spaces:
-            return self.spaces[space_id].itemsVisibilityMask
+            # Exact #1513 returns zero for this client-only PlayerAvatar
+            # space even after its native setter was called successfully.
+            return 0
         return self.pending_visibility_masks.get(space_id)
 
     def wg_setSpaceItemsVisibilityMask(self, space_id, mask):
         space_id = int(space_id)
         self.legacy_visibility_calls.append(('set', space_id, mask))
         if space_id in self.spaces:
-            self.spaces[space_id].itemsVisibilityMask = mask
+            # The mapped client-only space is maintained through its typed
+            # itemsVisibilityMask property, not these inert legacy exports.
+            return
         else:
             self.pending_visibility_masks[space_id] = mask
             self.operations.append(('space_visibility', space_id, mask))
@@ -4382,7 +4386,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual([0x00000001],
                          runtime.bigworld.mapped_visibility_masks)
         self.assertEqual(
-            [('set', 7, 0x00000001), ('get', 7)],
+            [('set', 7, 0x00000001)],
             runtime.bigworld.legacy_visibility_calls)
         self.assertNotIn(
             'addSpaceGeometryMapping', runtime.bigworld.__dict__)
@@ -4431,7 +4435,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual([0x00000001],
                          runtime.bigworld.mapped_visibility_masks)
         self.assertEqual(
-            [('set', 7, 0x00000001), ('get', 7)],
+            [('set', 7, 0x00000001)],
             runtime.bigworld.legacy_visibility_calls)
 
         # Exact #1513 Malinovka WTCP records: both CTF bases include bit 0;
@@ -4470,7 +4474,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.bigworld.wg_setSpaceItemsVisibilityMask.assert_called_once_with(
             7, 1)
         self.assertEqual(
-            [('set', 7, 1), ('get', 7)],
+            [('set', 7, 1)],
             runtime.bigworld.legacy_visibility_calls)
         self.assertEqual([(4, 5)], runtime.app_loader.transitions)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
@@ -4685,7 +4689,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(1, runtime.app_loader.lobby_disposals)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
 
-    def test_visibility_setter_failure_restores_clean_lobby_then_retries(self):
+    def test_visibility_setter_failure_does_not_abort_loaded_battle(self):
         runtime = _runtime()
         write_count = [0]
         original_set_mask = runtime.bigworld.wg_setSpaceItemsVisibilityMask
@@ -4700,71 +4704,131 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         runtime.bigworld.wg_setSpaceItemsVisibilityMask = reject_first_write
         battle = BattleRuntime(runtime)
-
-        self.assertFalse(battle.start({
-            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
-            'name': 'Player'}, {'round_id': 1}, _Client()))
-
-        self.assertEqual('failed', battle.state)
-        self.assertIn('visibility mask could not be applied', battle.error)
-        self.assertEqual([(4, 5), (5, 4)], runtime.app_loader.transitions)
-        self.assertEqual(1, runtime.app_loader.lobby_disposals)
-        self.assertEqual(2, runtime.app_loader.lobby_populates)
-        self.assertEqual(1, runtime.app_loader.lobby_listener_balance)
-        self.assertTrue(runtime.compatibility.account_restored)
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
 
         self.assertTrue(battle.start({
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
-            'name': 'Player'}, {
-                'round_id': 2, 'map': '01_karelia',
-                'bot_authority_id': 1,
-                'players': [{
-                    'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
-                    'vehicle': 'ussr:R11_MS-1', 'health': 500}],
-                'bots': []}, _Client()))
+            'name': 'Player'}, start, _Client()))
 
-        self.assertEqual(
-            [(4, 5), (5, 4), (4, 5)],
-            runtime.app_loader.transitions)
-        self.assertEqual(2, runtime.app_loader.lobby_disposals)
-        self.assertEqual(2, runtime.app_loader.lobby_populates)
+        self.assertIsNone(battle.error)
+        self.assertEqual([(4, 5)], runtime.app_loader.transitions)
+        self.assertEqual(1, runtime.app_loader.lobby_disposals)
+        self.assertEqual(1, runtime.app_loader.lobby_populates)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
+        self.assertEqual([0xffffffff],
+                         runtime.bigworld.mapped_visibility_masks)
         self.assertEqual(
             1, runtime.bigworld.spaces[7].itemsVisibilityMask)
-        self.assertEqual(
-            [('set', 7, 1), ('get', 7)],
-            runtime.bigworld.legacy_visibility_calls)
+        self.assertTrue(battle._space_visibility_warning_reported)
 
-    def test_post_mapping_visibility_write_is_read_back(self):
+    def test_legacy_zero_readback_does_not_abort_mapped_battle(self):
         runtime = _runtime()
         original_create = runtime.offline_map_creator.create
-        original_set_mask = runtime.bigworld.wg_setSpaceItemsVisibilityMask
+
+        def create_then_remove_legacy_setter(map_name):
+            original_create(map_name)
+            runtime.bigworld.wg_setSpaceItemsVisibilityMask = None
+
+        runtime.offline_map_creator.create = \
+            create_then_remove_legacy_setter
+        battle = BattleRuntime(runtime)
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
+
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, start, _Client()))
+
+        # Reproduce the exact VM symptom without consulting it during start:
+        # the legacy API still reports zero, while the mapped typed property
+        # contains the selected gameplay mask and the battle remains live.
+        self.assertEqual(0,
+                         runtime.bigworld.wg_getSpaceItemsVisibilityMask(7))
+        self.assertEqual(1,
+                         runtime.bigworld.spaces[7].itemsVisibilityMask)
+        self.assertIsNone(battle.error)
+        self.assertFalse(battle._space_visibility_warning_reported)
+        self.assertIn(
+            ('get', 7),
+            runtime.bigworld.legacy_visibility_calls)
+
+    def test_post_mapping_zero_mask_is_repaired_only_through_typed_space(self):
+        runtime = _runtime()
+        original_create = runtime.offline_map_creator.create
+
+        def create_then_clear_typed_mask(map_name):
+            original_create(map_name)
+            runtime.bigworld.spaces[7]._items_visibility_mask = 0
+
+        runtime.offline_map_creator.create = create_then_clear_typed_mask
+        battle = BattleRuntime(runtime)
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
+
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, start, _Client()))
+
+        self.assertEqual(1,
+                         runtime.bigworld.spaces[7].itemsVisibilityMask)
+        self.assertEqual(
+            [('set', 7, 1)],
+            runtime.bigworld.legacy_visibility_calls)
+        self.assertFalse(battle._space_visibility_warning_reported)
+
+    def test_typed_visibility_write_failure_does_not_abort_battle(self):
+        class _RejectTypedSpaceData(_SpaceData):
+            @property
+            def itemsVisibilityMask(self):
+                return self._items_visibility_mask
+
+            @itemsVisibilityMask.setter
+            def itemsVisibilityMask(self, mask):
+                self._operations.append(
+                    ('space_visibility_rejected', self._space_id, mask))
+
+        runtime = _runtime()
+        runtime.bigworld.space_data_factory = _RejectTypedSpaceData
+        original_create = runtime.offline_map_creator.create
 
         def create_then_reset_visibility(map_name):
             original_create(map_name)
-            runtime.bigworld.spaces[7]._items_visibility_mask = 0xffffffff
-
-        def reject_live_space_write(space_id, mask):
-            if int(space_id) in runtime.bigworld.spaces:
-                runtime.bigworld.legacy_visibility_calls.append(
-                    ('set_rejected', int(space_id), mask))
-                return
-            return original_set_mask(space_id, mask)
+            runtime.bigworld.spaces[7]._items_visibility_mask = 0
 
         runtime.offline_map_creator.create = create_then_reset_visibility
-        runtime.bigworld.wg_setSpaceItemsVisibilityMask = \
-            reject_live_space_write
         battle = BattleRuntime(runtime)
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
 
-        self.assertFalse(battle.start({
+        self.assertTrue(battle.start({
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
-            'name': 'Player'}, {'round_id': 1}, _Client()))
+            'name': 'Player'}, start, _Client()))
 
-        self.assertEqual('failed', battle.state)
-        self.assertIn('visibility mask was not applied', battle.error)
+        self.assertIsNone(battle.error)
+        self.assertEqual(0,
+                         runtime.bigworld.spaces[7].itemsVisibilityMask)
+        self.assertIsNone(battle._standard_space_visibility)
+        self.assertTrue(battle._space_visibility_warning_reported)
         self.assertIn(
-            ('set_rejected', 7, 1),
-            runtime.bigworld.legacy_visibility_calls)
+            ('space_visibility_rejected', 7, 1),
+            runtime.bigworld.operations)
 
     def test_battle_page_patch_does_not_overwrite_a_newer_class_patch(self):
         runtime = _runtime()
@@ -4887,7 +4951,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         # A still-later stock visibility update must not leak another
         # gameplay's objects after the one-time client-ready repair.  Exact
         # #1513 Malinovka uses bit 1 for its neutral domination control point.
-        runtime.bigworld.spaces[7].itemsVisibilityMask = 0x00000003
+        client_visibility_bit = 0x00100000
+        runtime.bigworld.spaces[7].itemsVisibilityMask = \
+            client_visibility_bit | 0x00000003
         writes_before_maintenance = len([
             operation for operation in runtime.bigworld.operations
             if operation[0] == 'space_visibility'])
@@ -4895,7 +4961,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._frame()
 
         self.assertEqual(
-            0x00000001,
+            client_visibility_bit | 0x00000001,
             runtime.bigworld.spaces[7].itemsVisibilityMask)
         writes_after_repair = [
             operation for operation in runtime.bigworld.operations
@@ -4903,16 +4969,24 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             writes_before_maintenance + 1, len(writes_after_repair))
         self.assertEqual(
-            ('space_visibility', 7, 0x00000001),
+            ('space_visibility', 7,
+             client_visibility_bit | 0x00000001),
             writes_after_repair[-1])
         malinovka_ctf_base_mask = 0xffffff89
         malinovka_domination_mask = 0xffffff82
+        maintained_server_mask = (
+            runtime.bigworld.spaces[7].itemsVisibilityMask &
+            runtime.client_visibility_flags.SERVER_MASK)
+        self.assertEqual(
+            client_visibility_bit,
+            runtime.bigworld.spaces[7].itemsVisibilityMask &
+            runtime.client_visibility_flags.CLIENT_MASK)
         self.assertTrue(
             malinovka_ctf_base_mask &
-            runtime.bigworld.spaces[7].itemsVisibilityMask)
+            maintained_server_mask)
         self.assertFalse(
             malinovka_domination_mask &
-            runtime.bigworld.spaces[7].itemsVisibilityMask)
+            maintained_server_mask)
 
         # The next periodic read sees a correct mask and performs no native
         # write, keeping this guard observational during normal frames.
