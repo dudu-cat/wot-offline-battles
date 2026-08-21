@@ -113,6 +113,28 @@ class _FakeFileDialog(object):
         return self.selection
 
 
+class _Process(object):
+    def __init__(self, exit_code=None, stdout=None):
+        self.exit_code = exit_code
+        self.stdout = stdout
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self.exit_code
+
+    def terminate(self):
+        self.terminated = True
+        self.exit_code = 0
+
+    def kill(self):
+        self.killed = True
+        self.exit_code = -9
+
+    def wait(self, timeout=None):
+        return self.exit_code
+
+
 class WindowTest(unittest.TestCase):
     def setUp(self):
         self.settings_dir = tempfile.mkdtemp()
@@ -160,6 +182,57 @@ class WindowTest(unittest.TestCase):
         self.window.mode.set(core.MODE_JOIN)
         self.window._refresh_mode()
         self.assertEqual("disabled", self.window.team_size_box.cget("state"))
+
+    def test_lan_server_button_starts_only_from_host_mode(self):
+        self._game("0.9.22.0.1", "1513")
+        self.assertEqual("disabled", self.window.server_button.cget("state"))
+        self.window.mode.set(core.MODE_HOST)
+        self.window._refresh_mode()
+        self.assertEqual("normal", self.window.server_button.cget("state"))
+        self.assertEqual(
+            "Start LAN server", self.window.server_button.cget("text"))
+        self.window.mode.set(core.MODE_JOIN)
+        self.window._refresh_mode()
+        self.assertEqual("disabled", self.window.server_button.cget("state"))
+
+    def test_lan_server_button_installs_data_and_starts_persistent_server(self):
+        game_root = self._game("0.9.22.0.1", "1513")
+        self.window.mode.set(core.MODE_HOST)
+        self.window.team_size.set("7")
+        self.window._refresh_mode()
+        with mock.patch(
+                "core.install_client_mod", return_value=["installed"]) \
+                as install, mock.patch.object(
+                    self.window, "_start_server", return_value=True) \
+                as start_server:
+            self.assertTrue(self.window._toggle_lan_server())
+            for unused in range(200):
+                if not self.window._maintenance_busy:
+                    break
+                time.sleep(0.01)
+
+        install.assert_called_once_with(game_root, core.PORT_0_9_22)
+        start_server.assert_called_once_with(
+            game_root, core.PORT_0_9_22, 7, persistent=True)
+
+    def test_0_8_2_server_button_ignores_hidden_team_size_text(self):
+        game_root = self._game("0.8.2", "335")
+        self.window.mode.set(core.MODE_HOST)
+        self.window.team_size.set("not a team size")
+        self.window._refresh_mode()
+        with mock.patch("core.install_client_mod", return_value=[]), \
+                mock.patch.object(
+                    self.window, "_start_server", return_value=True) \
+                as start_server:
+            self.assertTrue(self.window._toggle_lan_server())
+            for unused in range(200):
+                if not self.window._maintenance_busy:
+                    break
+                time.sleep(0.01)
+
+        start_server.assert_called_once_with(
+            game_root, core.PORT_0_8_2, core.DEFAULT_TEAM_SIZE,
+            persistent=True)
 
     def test_an_empty_folder_asks_for_the_game_executable(self):
         self.window.game_root.set("")
@@ -282,6 +355,17 @@ class WindowTest(unittest.TestCase):
         self.assertEqual(
             "disabled", self.window.vehicle_editor_button.cget("state"))
 
+    def test_stale_profile_recovery_reports_an_unsafe_manifest_path(self):
+        self._game("0.9.22.0.1", "1513")
+        with mock.patch(
+                "wot_launcher.vehicle_overlays.manifest_path",
+                side_effect=wot_launcher.vehicle_overlays.VehicleOverlayError(
+                    "unsafe overlay path")):
+            self.assertEqual(0, self.window._recover_stale_vehicle_profile())
+
+        self.assertIn("could not be checked", self._log_text())
+        self.assertIn("unsafe overlay path", self._log_text())
+
     def test_new_profile_is_selected_and_opened(self):
         with mock.patch(
                 "wot_launcher.vehicle_overlays.list_vehicle_profiles",
@@ -336,6 +420,67 @@ class WindowTest(unittest.TestCase):
         prepare.assert_called_once_with(self.settings_dir, "Fast MS-1")
         cleanup.assert_called_once_with(self.settings_dir)
         self.assertIn("temporary vehicle profile", self._log_text())
+
+    def test_single_player_orders_server_worker_player_and_profile_cleanup(self):
+        session = {
+            "client": core.PORT_0_9_22,
+            "host": core.LOCAL_HOST,
+            "tcp_port": core.DEFAULT_SERVER_PORT,
+            "needs_server": True,
+            "mode": core.MODE_SINGLE,
+            "team_size": 7,
+            "vehicle_profile": "Fast MS-1",
+        }
+        order = []
+        prepared = {
+            "profile": "Fast MS-1",
+            "installedMembers": 1,
+            "removedMembers": 0,
+        }
+        with mock.patch("core.install_client_mod", return_value=[]), \
+                mock.patch(
+                    "wot_launcher.vehicle_overlays.prepare_vehicle_profile",
+                    side_effect=lambda *unused: (
+                        order.append("profile") or prepared)), \
+                mock.patch(
+                    "wot_launcher.vehicle_overlays.ensure_original_vehicle_data",
+                    side_effect=lambda *unused: (
+                        order.append("profile_cleanup") or 1)), \
+                mock.patch(
+                    "core.ensure_0_9_22_preferences_isolation",
+                    return_value="preferences isolated"), \
+                mock.patch("core.write_settings", return_value=[]), \
+                mock.patch.object(
+                    self.window, "_start_server",
+                    side_effect=lambda *args, **kwargs: (
+                        order.append("server") or True)) as start_server, \
+                mock.patch.object(
+                    self.window, "_start_worker",
+                    side_effect=lambda *unused: (
+                        order.append("worker") or True)) as start_worker, \
+                mock.patch.object(
+                    self.window, "_run_game",
+                    side_effect=lambda *args, **kwargs: order.append("player")) \
+                    as run_game, \
+                mock.patch.object(
+                    self.window, "_stop_worker",
+                    side_effect=lambda: order.append("worker_stop")), \
+                mock.patch.object(
+                    self.window, "_stop_server",
+                    side_effect=lambda: order.append("server_stop")):
+            self.window._run_session(self.settings_dir, session, "Peng")
+
+        start_server.assert_called_once_with(
+            self.settings_dir, core.PORT_0_9_22, 7, loopback_only=True)
+        start_worker.assert_called_once_with(
+            self.settings_dir, core.LOCAL_HOST,
+            core.DEFAULT_SERVER_PORT, 7)
+        run_game.assert_called_once_with(
+            self.settings_dir, core.PORT_0_9_22, core.LOCAL_HOST,
+            core.DEFAULT_SERVER_PORT, paired_worker=True)
+        self.assertEqual(
+            ["profile", "server", "worker", "player", "worker_stop",
+             "server_stop", "profile_cleanup"], order)
 
     def test_startup_repair_runs_in_the_background_and_reports_actions(self):
         game_root = self._game("0.9.22.0.1", "1513")
@@ -429,6 +574,89 @@ class WindowTest(unittest.TestCase):
         popen.assert_not_called()
         self.assertIn("does not speak", self._log_text())
 
+    def test_single_player_refuses_an_external_compatible_server(self):
+        with mock.patch("core.listener_status",
+                        return_value=core.LISTENER_COMPATIBLE), \
+                mock.patch("wot_launcher.subprocess.Popen") as popen:
+            self.assertFalse(self.window._start_server(
+                self.settings_dir, core.PORT_0_9_22,
+                loopback_only=True))
+        popen.assert_not_called()
+        self.assertIn("fresh launcher-owned server", self._log_text())
+
+    def test_launcher_owned_server_reuse_requires_the_exact_context(self):
+        server = _Process()
+        self.window._server = server
+        game_root = os.path.realpath(self.settings_dir)
+        self.window._server_context = {
+            "game_root": os.path.normcase(game_root),
+            "port_version": core.PORT_0_9_22,
+            "loopback_only": False,
+            "team_size": 7,
+        }
+        with mock.patch("core.listener_status") as listener:
+            self.assertTrue(self.window._start_server(
+                self.settings_dir, core.PORT_0_9_22, team_size=7))
+            self.assertFalse(self.window._start_server(
+                self.settings_dir, core.PORT_0_9_22, team_size=8))
+            self.assertFalse(self.window._start_server(
+                self.settings_dir, core.PORT_0_9_22, team_size=7,
+                loopback_only=True))
+            self.assertFalse(self.window._start_server(
+                os.path.join(self.settings_dir, "other"),
+                core.PORT_0_9_22, team_size=7))
+        listener.assert_not_called()
+        self.assertIn("different game, visibility, or team", self._log_text())
+
+    def test_persistent_server_survives_session_cleanup_until_stopped(self):
+        server = _Process()
+        with mock.patch("core.listener_status",
+                        return_value=core.LISTENER_FREE), \
+                mock.patch("core.wait_for_server", return_value=True), \
+                mock.patch("core.local_addresses", return_value=[]), \
+                mock.patch("wot_launcher.subprocess.Popen",
+                           return_value=server):
+            self.assertTrue(self.window._start_server(
+                self.settings_dir, core.PORT_0_9_22, team_size=7,
+                persistent=True))
+
+        self.assertTrue(self.window._server_persistent)
+        self.assertFalse(self.window._stop_server())
+        self.assertFalse(server.terminated)
+        self.assertTrue(self.window._stop_server(force=True))
+        self.assertTrue(server.terminated)
+
+    def test_worker_start_failure_reports_the_native_failure_log(self):
+        starter = core.worker_starter_executable(self.settings_dir)
+        with open(starter, "w") as stream:
+            stream.write("starter")
+        marker = core.worker_ready_marker(self.settings_dir)
+        with open(marker, "w") as stream:
+            stream.write("live-worker-marker")
+        previous_marker_token = core.worker_ready_marker_token(
+            self.settings_dir)
+        with open(core.worker_failure_log(self.settings_dir), "w") as stream:
+            stream.write("stage=worker_exited_before_ready win32_error=7\n")
+        worker = _Process(exit_code=23)
+        with mock.patch(
+                "core.wait_for_worker_ready", return_value=False) as wait, \
+                mock.patch("wot_launcher.subprocess.Popen",
+                           return_value=worker) as popen:
+            self.assertFalse(self.window._start_worker(
+                self.settings_dir, "10.0.0.5", 1234, 7))
+
+        self.assertEqual(self.settings_dir, popen.call_args.kwargs["cwd"])
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(
+            "10.0.0.5", environment[core.CLIENT_SERVER_HOST_ENV_0922])
+        self.assertEqual(
+            "1234", environment[core.CLIENT_SERVER_PORT_ENV_0922])
+        self.assertEqual(
+            previous_marker_token,
+            wait.call_args.kwargs["previous_marker_token"])
+        self.assertTrue(os.path.isfile(marker))
+        self.assertIn("worker_exited_before_ready", self._log_text())
+
     def test_join_does_not_start_the_game_for_an_unrelated_listener(self):
         session = {
             "client": core.PORT_0_9_22,
@@ -458,20 +686,61 @@ class WindowTest(unittest.TestCase):
         run_game.assert_not_called()
         self.assertIn("not the server for this client", self._log_text())
 
+    def test_host_starts_no_hidden_worker(self):
+        session = {
+            "client": core.PORT_0_9_22,
+            "host": core.LOCAL_HOST,
+            "tcp_port": core.DEFAULT_SERVER_PORT,
+            "needs_server": True,
+            "mode": core.MODE_HOST,
+            "team_size": 7,
+            "vehicle_profile": None,
+        }
+        with mock.patch("core.install_client_mod", return_value=[]), \
+                mock.patch(
+                    "wot_launcher.vehicle_overlays.prepare_vehicle_profile",
+                    return_value={"profile": None, "installedMembers": 0,
+                                  "removedMembers": 0}), \
+                mock.patch(
+                    "wot_launcher.vehicle_overlays.ensure_original_vehicle_data",
+                    return_value=0), \
+                mock.patch(
+                    "core.ensure_0_9_22_preferences_isolation",
+                    return_value="preferences isolated"), \
+                mock.patch("core.write_settings", return_value=[]), \
+                mock.patch.object(
+                    self.window, "_start_server", return_value=True) \
+                    as start_server, \
+                mock.patch.object(self.window, "_start_worker") as worker, \
+                mock.patch.object(self.window, "_run_game") as game, \
+                mock.patch.object(self.window, "_stop_worker"), \
+                mock.patch.object(self.window, "_stop_server"):
+            self.window._run_session(self.settings_dir, session, "Peng")
+
+        start_server.assert_called_once_with(
+            self.settings_dir, core.PORT_0_9_22, 7,
+            loopback_only=False)
+        worker.assert_not_called()
+        game.assert_called_once_with(
+            self.settings_dir, core.PORT_0_9_22, core.LOCAL_HOST,
+            core.DEFAULT_SERVER_PORT, paired_worker=False)
+
     def test_closing_the_window_saves_the_settings(self):
         self.window.player_name.set("Peng")
         self.window._on_close()
         self.assertEqual("Peng", core.load_settings().get("name"))
 
-    def test_window_cannot_close_while_profile_cleanup_is_pending(self):
+    def test_close_stops_children_but_waits_for_profile_cleanup(self):
         self.window._busy = True
 
         self.assertFalse(self.window._on_close())
 
         self.assertFalse(self.window.root.destroyed)
-        self.assertIn("Kill the game", self._log_text())
+        self.assertTrue(self.window._close_pending)
+        self.assertTrue(self.window._stop_requested)
+        self.assertIn("Closing the game", self._log_text())
 
-    def test_closing_the_window_stops_the_server(self):
+    def test_closing_the_window_stops_a_persistent_server(self):
         stopped = []
 
         class _Server(object):
@@ -485,6 +754,7 @@ class WindowTest(unittest.TestCase):
                 return 0
 
         self.window._server = _Server()
+        self.window._server_persistent = True
         self.window._on_close()
         self.assertEqual(stopped, ["terminate"])
         self.assertTrue(self.window.root.destroyed)

@@ -330,6 +330,51 @@ class ServerPayloadTest(unittest.TestCase):
             core.PORT_0_9_22, "/game", {}, team_size=4)
         self.assertEqual("4", environment[core.SERVER_TEAM_SIZE_ENV_0922])
 
+    def test_single_player_server_is_explicitly_loopback_only(self):
+        environment = core.server_environment(
+            core.PORT_0_9_22, "/game", {}, loopback_only=True)
+        self.assertEqual(
+            "1", environment[core.SERVER_LOOPBACK_ONLY_ENV_0922])
+        lan_environment = core.server_environment(
+            core.PORT_0_9_22, "/game",
+            {core.SERVER_LOOPBACK_ONLY_ENV_0922: "1"})
+        self.assertNotIn(core.SERVER_LOOPBACK_ONLY_ENV_0922, lan_environment)
+
+    def test_hidden_worker_inherits_the_selected_server_endpoint(self):
+        environment = core.worker_environment(
+            "/game", "10.0.0.5", 1234, team_size=7, environment={})
+        self.assertEqual(
+            "10.0.0.5", environment[core.CLIENT_SERVER_HOST_ENV_0922])
+        self.assertEqual(
+            "1234", environment[core.CLIENT_SERVER_PORT_ENV_0922])
+        self.assertEqual("7", environment[core.SERVER_TEAM_SIZE_ENV_0922])
+        self.assertEqual(
+            [os.path.join("/game", core.WORKER_STARTER_FILENAME_0922),
+             core.WORKER_ONLY_ARGUMENT_0922],
+            core.worker_child_command("/game"))
+
+    def test_visible_0_9_22_client_uses_isolated_config_and_endpoint(self):
+        command = core.visible_client_command("/game", core.PORT_0_9_22)
+        self.assertEqual(os.path.join("/game", core.GAME_EXECUTABLE), command[0])
+        self.assertIn(core.PLAYER_ENGINE_CONFIG_0922, command)
+        environment = core.visible_client_environment(
+            core.PORT_0_9_22, "10.0.0.5", 1234, paired_worker=True,
+            environment={
+                core.CLIENT_MODE_ENV_0922: "simulation_worker",
+                core.HIDDEN_DESKTOP_ENV_0922: "1",
+                core.WORKER_READY_MARKER_ENV_0922: "stale",
+            })
+        self.assertEqual(
+            "10.0.0.5", environment[core.CLIENT_SERVER_HOST_ENV_0922])
+        self.assertEqual(
+            "1234", environment[core.CLIENT_SERVER_PORT_ENV_0922])
+        self.assertEqual(
+            "1", environment[core.ALLOW_MULTIPLE_CLIENTS_ENV_0922])
+        for name in (core.CLIENT_MODE_ENV_0922,
+                     core.HIDDEN_DESKTOP_ENV_0922,
+                     core.WORKER_READY_MARKER_ENV_0922):
+            self.assertNotIn(name, environment)
+
     def test_missing_payload_reports_a_launcher_error(self):
         self.assertRaises(core.LauncherError, core.run_server_payload,
                           core.PORT_0_8_2, tempfile.mkdtemp())
@@ -385,7 +430,11 @@ class ClientInstallTest(unittest.TestCase):
     def _stage_0_9_22(self, content="new"):
         members = {
             "mods/0.9.22.0.1/org.peng.offline_lan_0922_9.9.9.wotmod": content,
+            "mods/0.9.22.0.1/offline_instance_guard_native.pyd": content,
             "mods/configs/offline_lan_0922/config.json": content,
+            "offline_worker_starter.exe": content,
+            "res_mods/0.9.22.0.1/engine_config.offline-player.xml": content,
+            "res_mods/0.9.22.0.1/engine_config.offline-worker.xml": content,
         }
         for name in ("navgraphs", "foliage", "destructibles", "occluders"):
             records = []
@@ -903,6 +952,17 @@ class PayloadStagingTest(unittest.TestCase):
 
     @staticmethod
     def _write_0_9_22_data(overlay):
+        runtime_files = (
+            "offline_worker_starter.exe",
+            "mods/0.9.22.0.1/offline_instance_guard_native.pyd",
+            "res_mods/0.9.22.0.1/engine_config.offline-player.xml",
+            "res_mods/0.9.22.0.1/engine_config.offline-worker.xml",
+        )
+        for relative in runtime_files:
+            path = os.path.join(overlay, *relative.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as stream:
+                stream.write("runtime")
         data_root = os.path.join(
             overlay, "mods", "configs", "offline_lan_0922")
         for dataset in ("navgraphs", "foliage", "destructibles",
@@ -969,7 +1029,13 @@ class PayloadStagingTest(unittest.TestCase):
                       "res_mods/0.8.2/gui/maps/a.dds"),
             "0.9.22": ("mods/0.9.22.0.1/"
                        "org.peng.offline_lan_0922_0.5.0.wotmod",
-                       "mods/configs/offline_lan_0922/config.json"),
+                       "mods/configs/offline_lan_0922/config.json",
+                       "offline_worker_starter.exe",
+                       "mods/0.9.22.0.1/offline_instance_guard_native.pyd",
+                       "res_mods/0.9.22.0.1/"
+                       "engine_config.offline-player.xml",
+                       "res_mods/0.9.22.0.1/"
+                       "engine_config.offline-worker.xml"),
         }
         for port_version, members in expected.items():
             archive = zipfile.ZipFile(
@@ -1330,6 +1396,15 @@ class GameProcessTest(unittest.TestCase):
         def __init__(self, stdout):
             self.stdout = stdout
 
+    class _Process(object):
+        def __init__(self, states):
+            self.states = list(states)
+
+        def poll(self):
+            if len(self.states) > 1:
+                return self.states.pop(0)
+            return self.states[0]
+
     def test_a_listed_process_means_the_game_runs(self):
         listing = ("WorldOfTanks.exe   9876 Console   1   1,234,567 K\r\n"
                    ).encode("utf-8")
@@ -1365,6 +1440,55 @@ class GameProcessTest(unittest.TestCase):
             is_running, on_restart=lambda: seen.append(1), grace=2.0, poll=1.0,
             clock=lambda: next(ticks), sleep=lambda seconds: None))
         self.assertEqual([1], seen)
+
+    def test_worker_ready_requires_a_live_process_and_marker(self):
+        game_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, game_root, True)
+        marker = core.worker_ready_marker(game_root)
+        attempts = []
+
+        def sleep(unused):
+            attempts.append(1)
+            with open(marker, "w") as stream:
+                stream.write("ready")
+
+        process = self._Process([None])
+        self.assertTrue(core.wait_for_worker_ready(
+            process, game_root, timeout=1.0, interval=0.1,
+            clock=lambda: 0.0, sleep=sleep))
+        self.assertEqual([1], attempts)
+
+    def test_worker_ready_rejects_an_unchanged_stale_marker(self):
+        game_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, game_root, True)
+        marker = core.worker_ready_marker(game_root)
+        with open(marker, "w") as stream:
+            stream.write("stale")
+        previous = core.worker_ready_marker_token(game_root)
+        attempts = []
+
+        def sleep(unused):
+            attempts.append(1)
+            with open(marker, "w") as stream:
+                stream.write("new-ready-marker")
+
+        self.assertTrue(core.wait_for_worker_ready(
+            self._Process([None]), game_root,
+            previous_marker_token=previous, timeout=1.0, interval=0.1,
+            clock=lambda: 0.0, sleep=sleep))
+        self.assertEqual([1], attempts)
+
+    def test_worker_exit_or_cancellation_rejects_readiness(self):
+        game_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, game_root, True)
+        with open(core.worker_ready_marker(game_root), "w") as stream:
+            stream.write("stale")
+        self.assertFalse(core.wait_for_worker_ready(
+            self._Process([9]), game_root, clock=lambda: 0.0,
+            sleep=lambda unused: None))
+        self.assertFalse(core.wait_for_worker_ready(
+            self._Process([None]), game_root, cancelled=lambda: True,
+            clock=lambda: 0.0, sleep=lambda unused: None))
 
 
 class KnownFolderTest(unittest.TestCase):

@@ -48,14 +48,21 @@ PAYLOAD_TREES = {
 CLIENT_TREES = {
     "0.8.2": (("scripts", "res_mods/0.8.2/scripts"),
               ("gui", "res_mods/0.8.2/gui")),
-    "0.9.22": (("mods", "mods"),),
+    "0.9.22": (("mods", "mods"),
+               ("res_mods/0.9.22.0.1", "res_mods/0.9.22.0.1")),
+}
+
+CLIENT_FILES = {
+    "0.8.2": (),
+    "0.9.22": (("offline_worker_starter.exe",
+                 "offline_worker_starter.exe"),),
 }
 
 CLIENT_0922_OVERLAY = "WoT-0.9.22-LAN-Client-*"
 
 CLIENT_FILE_SUFFIXES = {
     "0.8.2": (".dds", ".json", ".png", ".py", ".pyc", ".pyd"),
-    "0.9.22": (".json", ".wotmod"),
+    "0.9.22": (".exe", ".json", ".pyd", ".wotmod", ".xml"),
 }
 
 
@@ -183,6 +190,13 @@ def stage_clients(target_root, source_root=None, client_0922=None):
                             os.path.relpath(
                                 source_path, source).split(os.path.sep))
                         archive.write(source_path, member)
+            for source_relative, target_relative in CLIENT_FILES[port_version]:
+                source_path = os.path.join(
+                    port_source, *source_relative.split("/"))
+                if not os.path.isfile(source_path):
+                    raise ValueError("client mod is incomplete: %s/%s" %
+                                     (port_version, source_relative))
+                archive.write(source_path, target_relative)
         finally:
             archive.close()
         _validate_client_archive(archive_path, port_version)

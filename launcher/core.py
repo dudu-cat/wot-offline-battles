@@ -62,8 +62,29 @@ _NAVGRAPH_RELATIVE_DIR = os.path.join(
 
 SERVER_DATA_ENV_0922 = "WOT_0922_SERVER_DATA"
 SERVER_TEAM_SIZE_ENV_0922 = "WOT_0922_TEAM_SIZE"
+SERVER_LOOPBACK_ONLY_ENV_0922 = "WOT_0922_LOOPBACK_ONLY"
+CLIENT_SERVER_HOST_ENV_0922 = "OFFLINE_LAN_0922_SERVER_HOST"
+CLIENT_SERVER_PORT_ENV_0922 = "OFFLINE_LAN_0922_SERVER_PORT"
+CLIENT_MODE_ENV_0922 = "OFFLINE_LAN_0922_CLIENT_MODE"
+ALLOW_MULTIPLE_CLIENTS_ENV_0922 = "OFFLINE_LAN_0922_ALLOW_MULTIPLE_CLIENTS"
+HIDDEN_DESKTOP_ENV_0922 = "OFFLINE_LAN_0922_HIDDEN_DESKTOP"
+WORKER_READY_MARKER_ENV_0922 = "OFFLINE_LAN_0922_WORKER_READY_MARKER"
 _SERVER_DATA_RELATIVE_DIR_0922 = os.path.join(
     "mods", "configs", "offline_lan_0922")
+
+WORKER_STARTER_FILENAME_0922 = "offline_worker_starter.exe"
+WORKER_READY_MARKER_FILENAME_0922 = "offline-worker.ready"
+WORKER_FAILURE_LOG_FILENAME_0922 = "offline-worker-starter.log"
+PLAYER_ENGINE_CONFIG_0922 = "engine_config.offline-player.xml"
+WORKER_ONLY_ARGUMENT_0922 = "--worker-only"
+WORKER_READY_TIMEOUT_SECONDS_0922 = 60.0
+
+_CLIENT_RUNTIME_FILES_0_9_22 = (
+    WORKER_STARTER_FILENAME_0922,
+    "mods/0.9.22.0.1/offline_instance_guard_native.pyd",
+    "res_mods/0.9.22.0.1/engine_config.offline-player.xml",
+    "res_mods/0.9.22.0.1/engine_config.offline-worker.xml",
+)
 
 _SERVER_ENTRIES = {
     PORT_0_8_2: (os.path.join("0.8.2"), "lan_battle_server.py"),
@@ -110,6 +131,80 @@ class LauncherError(Exception):
 
 def game_executable(game_root):
     return os.path.join(game_root, GAME_EXECUTABLE)
+
+
+def worker_starter_executable(game_root):
+    return os.path.join(game_root, WORKER_STARTER_FILENAME_0922)
+
+
+def worker_ready_marker(game_root):
+    return os.path.join(game_root, WORKER_READY_MARKER_FILENAME_0922)
+
+
+def worker_ready_marker_token(game_root):
+    """Identify one regular ready marker without following a symlink."""
+    import stat
+
+    try:
+        value = os.lstat(worker_ready_marker(game_root))
+    except (IOError, OSError):
+        return None
+    if not stat.S_ISREG(value.st_mode):
+        return None
+    mtime_ns = getattr(
+        value, "st_mtime_ns", int(value.st_mtime * 1000000000))
+    ctime_ns = getattr(
+        value, "st_ctime_ns", int(value.st_ctime * 1000000000))
+    return (value.st_dev, value.st_ino, value.st_size, mtime_ns, ctime_ns)
+
+
+def worker_failure_log(game_root):
+    return os.path.join(game_root, WORKER_FAILURE_LOG_FILENAME_0922)
+
+
+def visible_client_command(game_root, port_version):
+    """Build the visible client command for one supported port."""
+    command = [game_executable(game_root)]
+    if port_version == PORT_0_9_22:
+        command.extend([
+            "--config", PLAYER_ENGINE_CONFIG_0922,
+            "--logFilePrefix", "offline-player-",
+        ])
+    return command
+
+
+def visible_client_environment(port_version, host=LOCAL_HOST,
+                               port=DEFAULT_SERVER_PORT,
+                               paired_worker=False, environment=None):
+    """Keep worker-only state out of the visible game process."""
+    environment = dict(os.environ if environment is None else environment)
+    if port_version != PORT_0_9_22:
+        return environment
+    for name in (CLIENT_MODE_ENV_0922, HIDDEN_DESKTOP_ENV_0922,
+                 WORKER_READY_MARKER_ENV_0922):
+        environment.pop(name, None)
+    environment[CLIENT_SERVER_HOST_ENV_0922] = str(host)
+    environment[CLIENT_SERVER_PORT_ENV_0922] = str(int(port))
+    if paired_worker:
+        environment[ALLOW_MULTIPLE_CLIENTS_ENV_0922] = "1"
+    else:
+        environment.pop(ALLOW_MULTIPLE_CLIENTS_ENV_0922, None)
+    return environment
+
+
+def worker_child_command(game_root):
+    return [worker_starter_executable(game_root), WORKER_ONLY_ARGUMENT_0922]
+
+
+def worker_environment(game_root, host=LOCAL_HOST,
+                       port=DEFAULT_SERVER_PORT,
+                       team_size=DEFAULT_TEAM_SIZE, environment=None):
+    """Build the endpoint inherited by the hidden simulation client."""
+    environment = server_environment(
+        PORT_0_9_22, game_root, environment, team_size=team_size)
+    environment[CLIENT_SERVER_HOST_ENV_0922] = str(host)
+    environment[CLIENT_SERVER_PORT_ENV_0922] = str(int(port))
+    return environment
 
 
 def read_client_identity(game_root):
@@ -361,6 +456,7 @@ _CLIENT_INSTALL = {
             "res_mods/0.8.2/scripts/client/gui/mods/offhangar/"
             "navgraphs/manifest.json",
         ),
+        "owned_files": (),
         "package_pattern": None,
     },
     PORT_0_9_22: {
@@ -372,13 +468,16 @@ _CLIENT_INSTALL = {
         "allowed": (
             "mods/0.9.22.0.1/",
             "mods/configs/offline_lan_0922/",
+            "res_mods/0.9.22.0.1/",
+            WORKER_STARTER_FILENAME_0922,
         ),
-        "suffixes": (".json", ".wotmod"),
+        "suffixes": (".exe", ".json", ".pyd", ".wotmod", ".xml"),
         "required": tuple(
             "mods/configs/offline_lan_0922/%s/manifest.json" % name
             for name in _DATASETS_0_9_22) + (
             "mods/configs/offline_lan_0922/config.json",
-        ),
+        ) + _CLIENT_RUNTIME_FILES_0_9_22,
+        "owned_files": _CLIENT_RUNTIME_FILES_0_9_22,
         "package_pattern": (
             "mods/0.9.22.0.1/org.peng.offline_lan_0922*.wotmod"),
     },
@@ -533,7 +632,8 @@ def _validate_archive(archive, game_root, port_version, layout):
         raise LauncherError(
             "The bundled %s baked data is incomplete." % port_version)
     if port_version == PORT_0_9_22:
-        expected = inventory | set(layout["keep"]) | set(packages)
+        expected = (inventory | set(layout["keep"]) | set(packages) |
+                    set(layout["owned_files"]))
         if names != expected:
             raise LauncherError(
                 "The bundled 0.9.22 mod contains unexpected files.")
@@ -951,7 +1051,7 @@ def server_argv(port_version, base_dir=None):
 
 
 def server_environment(port_version, game_root, environment=None,
-                       team_size=DEFAULT_TEAM_SIZE):
+                       team_size=DEFAULT_TEAM_SIZE, loopback_only=False):
     """Point each server at the baked data installed with its client."""
     environment = dict(os.environ if environment is None else environment)
     if port_version == PORT_0_8_2:
@@ -962,6 +1062,10 @@ def server_environment(port_version, game_root, environment=None,
             game_root, _SERVER_DATA_RELATIVE_DIR_0922)
         environment[SERVER_TEAM_SIZE_ENV_0922] = str(
             parse_team_size(team_size))
+        if loopback_only:
+            environment[SERVER_LOOPBACK_ONLY_ENV_0922] = "1"
+        else:
+            environment.pop(SERVER_LOOPBACK_ONLY_ENV_0922, None)
     return environment
 
 
@@ -1135,7 +1239,7 @@ def wait_for_listener(host, port, timeout=20.0, interval=0.25, connect=None,
 
 
 def wait_for_server(port_version, host, port, timeout=20.0, interval=0.25,
-                    probe=None, clock=None, sleep=None):
+                    probe=None, clock=None, sleep=None, cancelled=None):
     """Wait until the selected client's protocol answers at the endpoint."""
     import time as time_module
 
@@ -1144,8 +1248,39 @@ def wait_for_server(port_version, host, port, timeout=20.0, interval=0.25,
     sleep = sleep or time_module.sleep
     deadline = clock() + float(timeout)
     while True:
+        if callable(cancelled) and cancelled():
+            return False
         if probe(port_version, host, port, timeout=interval):
             return True
+        if clock() >= deadline:
+            return False
+        sleep(interval)
+
+
+def wait_for_worker_ready(process, game_root,
+                          timeout=WORKER_READY_TIMEOUT_SECONDS_0922,
+                          interval=0.05, clock=None, sleep=None,
+                          cancelled=None, previous_marker_token=None):
+    """Wait for a live hidden client to publish its ready marker."""
+    import time as time_module
+
+    clock = clock or time_module.monotonic
+    sleep = sleep or time_module.sleep
+    deadline = clock() + float(timeout)
+    previous_marker_disappeared = False
+    while True:
+        if callable(cancelled) and cancelled():
+            return False
+        if process.poll() is not None:
+            return False
+        current_marker_token = worker_ready_marker_token(game_root)
+        if current_marker_token is None:
+            if previous_marker_token is not None:
+                previous_marker_disappeared = True
+        elif (previous_marker_token is None or
+              previous_marker_disappeared or
+              current_marker_token != previous_marker_token):
+            return process.poll() is None
         if clock() >= deadline:
             return False
         sleep(interval)

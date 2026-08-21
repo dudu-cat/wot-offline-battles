@@ -41,9 +41,14 @@ class LauncherWindow(object):
         self._ttk = ttk_module
         self._filedialog = filedialog_module
         self._server = None
+        self._server_persistent = False
+        self._server_context = None
+        self._worker = None
         self._game = None
         self._busy = False
         self._maintenance_busy = False
+        self._stop_requested = False
+        self._close_pending = False
         self._selected_client = None
         self._profile_names = []
         self._build()
@@ -166,10 +171,17 @@ class LauncherWindow(object):
                                padx=(6, 0))
         row += 1
 
-        self.start_button = tk.Button(frame, text="Start game",
-                                      command=self._start)
-        self.start_button.grid(row=row, column=0, columnspan=3, sticky="we",
-                               pady=(12, 6))
+        launch_actions = tk.Frame(frame)
+        launch_actions.grid(
+            row=row, column=0, columnspan=3, sticky="we", pady=(12, 6))
+        self.server_button = tk.Button(
+            launch_actions, text="Start LAN server",
+            command=self._toggle_lan_server)
+        self.server_button.pack(side="left", fill="x", expand=True)
+        self.start_button = tk.Button(
+            launch_actions, text="Start game", command=self._start)
+        self.start_button.pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
         row += 1
 
         self.log_view = tk.Text(frame, height=12, width=72, state="disabled",
@@ -222,16 +234,34 @@ class LauncherWindow(object):
             self._refresh_mode()
         return status
 
+    def _server_is_running(self):
+        return self._server is not None and self._server.poll() is None
+
     def _update_action_controls(self):
+        server_running = self._server_is_running()
         if self._busy:
             self.start_button.config(state="normal", text="Kill the game")
         elif self._maintenance_busy:
             self.start_button.config(state="disabled", text="Start game")
         else:
             self.start_button.config(state="normal", text="Start game")
+        if server_running:
+            server_state = (
+                "normal" if not self._busy and not self._maintenance_busy
+                else "disabled")
+            self.server_button.config(
+                state=server_state, text="Stop LAN server")
+        else:
+            server_state = (
+                "normal" if self._selected_client in core.SUPPORTED_PORTS and
+                self.mode.get() == core.MODE_HOST and not self._busy and
+                not self._maintenance_busy else "disabled")
+            self.server_button.config(
+                state=server_state, text="Start LAN server")
         maintenance_state = (
             "normal" if self._selected_client == core.PORT_0_9_22 and
-            not self._busy and not self._maintenance_busy else "disabled")
+            not self._busy and not self._maintenance_busy and
+            not server_running else "disabled")
         self.repair_button.config(state=maintenance_state)
         self.reset_button.config(state=maintenance_state)
         profile_state = (
@@ -274,9 +304,9 @@ class LauncherWindow(object):
         game_root = self.game_root.get().strip()
         if self._selected_client != core.PORT_0_9_22:
             return 0
-        manifest_exists = os.path.lexists(
-            vehicle_overlays.manifest_path(game_root))
         try:
+            manifest_exists = os.path.lexists(
+                vehicle_overlays.manifest_path(game_root))
             recovery_exists = vehicle_overlays.has_pending_vehicle_recovery(
                 game_root)
         except vehicle_overlays.VehicleOverlayError as error:
@@ -371,8 +401,9 @@ class LauncherWindow(object):
         self._maintenance_busy = busy
         self.root.after(0, self._update_action_controls)
 
-    def _kill_game(self):
+    def _kill_game(self, stop_persistent_server=False):
         """Close a game that did not exit on its own."""
+        self._stop_requested = True
         self._log("Closing every %s process..." % core.GAME_EXECUTABLE)
         game = self._game
         if game is not None and game.poll() is None:
@@ -381,6 +412,8 @@ class LauncherWindow(object):
             except Exception as error:
                 self._log("Could not close the started process: %s" % error)
         core.kill_game()
+        self._stop_worker()
+        self._stop_server(force=stop_persistent_server)
         return True
 
     def _save_settings(self):
@@ -544,6 +577,55 @@ class LauncherWindow(object):
             return False
         return self._start_maintenance(core.reset_0_9_22_state)
 
+    def _toggle_lan_server(self):
+        if self._busy or self._maintenance_busy:
+            self._log("Wait for the current launcher operation to finish.")
+            return False
+        if self._server_is_running():
+            self._stop_server(force=True)
+            self._update_action_controls()
+            return True
+        if self._server is not None:
+            self._stop_server(force=True)
+        status = self._refresh_client()
+        if (status.get("client") not in core.SUPPORTED_PORTS or
+                self.mode.get() != core.MODE_HOST):
+            self._log(
+                "Select Host a LAN battle and a supported game folder first.")
+            return False
+        try:
+            team_size = (core.parse_team_size(self.team_size.get())
+                         if status["client"] == core.PORT_0_9_22
+                         else core.DEFAULT_TEAM_SIZE)
+        except core.LauncherError as error:
+            self._log(str(error))
+            return False
+        self._remember_folder()
+        self._save_settings()
+        self._set_maintenance_busy(True)
+
+        def run():
+            try:
+                self._log("Installing the %s server data into %s..." %
+                          (status["client"], status["path"]))
+                for action in core.install_client_mod(
+                        status["path"], status["client"]):
+                    self._log(action)
+                self._start_server(
+                    status["path"], status["client"], team_size,
+                    persistent=True)
+            except core.LauncherError as error:
+                self._log(str(error))
+            except Exception as error:
+                self._log("The LAN server could not start: %s" % error)
+            finally:
+                self._set_maintenance_busy(False)
+
+        thread = threading.Thread(target=run)
+        thread.daemon = True
+        thread.start()
+        return True
+
     def _start(self):
         if self._maintenance_busy:
             self._log("Wait for launcher maintenance to finish.")
@@ -565,6 +647,7 @@ class LauncherWindow(object):
             return
         self._remember_folder()
         self._save_settings()
+        self._stop_requested = False
         self._set_busy(True)
         thread = threading.Thread(
             target=self._run_session,
@@ -575,6 +658,9 @@ class LauncherWindow(object):
     def _run_session(self, game_root, session, name):
         host = session["host"]
         port = session["tcp_port"]
+        needs_worker = (
+            session["client"] == core.PORT_0_9_22 and
+            session["mode"] == core.MODE_SINGLE)
         try:
             self._log("Installing the %s mod into %s..." %
                       (session["client"], game_root))
@@ -601,7 +687,8 @@ class LauncherWindow(object):
                 self._log("Wrote %s" % path)
             if session["needs_server"]:
                 if not self._start_server(
-                        game_root, session["client"], session["team_size"]):
+                        game_root, session["client"], session["team_size"],
+                        loopback_only=needs_worker):
                     return
             elif session["mode"] == core.MODE_JOIN:
                 status = core.listener_status(
@@ -618,12 +705,22 @@ class LauncherWindow(object):
                     self._log("Warning: %s:%d did not answer. Start the game "
                               "anyway and click the battle button when the "
                               "host is ready." % (host, port))
-            self._run_game(game_root)
+            if self._stop_requested:
+                return
+            if needs_worker and not self._start_worker(
+                    game_root, host, port, session["team_size"]):
+                return
+            if self._stop_requested:
+                return
+            self._run_game(
+                game_root, session["client"], host, port,
+                paired_worker=needs_worker)
         except core.LauncherError as error:
             self._log(str(error))
         except Exception as error:  # The window must survive any failure.
             self._log("The launcher failed: %s" % error)
         finally:
+            self._stop_worker()
             self._stop_server()
             if session.get("client") == core.PORT_0_9_22:
                 try:
@@ -637,12 +734,40 @@ class LauncherWindow(object):
                     self._log(
                         "Could not restore original vehicle data: %s" % error)
             self._set_busy(False)
+            if self._close_pending:
+                self.root.after(0, self._finish_close)
 
     def _start_server(self, game_root, port_version,
-                      team_size=core.DEFAULT_TEAM_SIZE):
+                      team_size=core.DEFAULT_TEAM_SIZE,
+                      loopback_only=False, persistent=False):
+        requested_context = {
+            "game_root": os.path.normcase(os.path.realpath(
+                os.path.abspath(game_root))),
+            "port_version": port_version,
+            "loopback_only": bool(loopback_only),
+            "team_size": core.parse_team_size(team_size),
+        }
+        if self._server_is_running():
+            if self._server_context != requested_context:
+                self._log(
+                    "The launcher-owned LAN server uses different game, "
+                    "visibility, or team settings. Stop it before starting "
+                    "this session.")
+                return False
+            self._log("Reusing the launcher-owned %s LAN server." %
+                      port_version)
+            return True
+        if self._server is not None:
+            self._stop_server(force=True)
         status = core.listener_status(
             port_version, core.LOCAL_HOST, core.DEFAULT_SERVER_PORT)
         if status == core.LISTENER_COMPATIBLE:
+            if loopback_only:
+                self._log(
+                    "Single player needs a fresh launcher-owned server, but "
+                    "a compatible server already uses port %d. Close it "
+                    "first." % core.DEFAULT_SERVER_PORT)
+                return False
             self._log("A compatible %s LAN server is already running; "
                       "using it." % port_version)
             return True
@@ -653,39 +778,117 @@ class LauncherWindow(object):
             return False
         command = core.server_child_command(port_version)
         environment = core.server_environment(
-            port_version, game_root, team_size=team_size)
+            port_version, game_root, team_size=team_size,
+            loopback_only=loopback_only)
         self._log("Starting the %s LAN server..." % port_version)
         self._server = subprocess.Popen(
             command, env=environment, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, creationflags=_no_console_flags())
-        pump = threading.Thread(target=self._pump_server_output)
+        self._server_persistent = bool(persistent)
+        self._server_context = requested_context
+        pump = threading.Thread(
+            target=self._pump_server_output, args=(self._server,))
         pump.daemon = True
         pump.start()
         if not core.wait_for_server(
-                port_version, core.LOCAL_HOST, core.DEFAULT_SERVER_PORT):
-            self._log("The LAN server did not answer the %s protocol on port "
-                      "%d." % (port_version, core.DEFAULT_SERVER_PORT))
+                port_version, core.LOCAL_HOST, core.DEFAULT_SERVER_PORT,
+                cancelled=(None if persistent else
+                           lambda: self._stop_requested)):
+            if not self._stop_requested:
+                self._log(
+                    "The LAN server did not answer the %s protocol on port "
+                    "%d." % (port_version, core.DEFAULT_SERVER_PORT))
+            self._stop_server(force=True)
             return False
         self._log("The LAN server listens on port %d." %
                   core.DEFAULT_SERVER_PORT)
-        for address in core.local_addresses():
-            self._log("Other players join with %s:%d" %
-                      (address, core.DEFAULT_SERVER_PORT))
+        if not loopback_only:
+            for address in core.local_addresses():
+                self._log("Other players join with %s:%d" %
+                          (address, core.DEFAULT_SERVER_PORT))
+        self.root.after(0, self._update_action_controls)
         return True
 
-    def _pump_server_output(self):
-        server = self._server
+    def _pump_server_output(self, server=None):
+        server = server or self._server
         if server is None or server.stdout is None:
             return
         for line in iter(server.stdout.readline, b""):
             self._log("[server] " + line.decode("utf-8", "replace").rstrip())
+        if server is self._server and server.poll() not in (None, 0):
+            self._log("The LAN server stopped with exit code %s." %
+                      server.poll())
+        self.root.after(0, self._update_action_controls)
 
-    def _run_game(self, game_root):
+    def _start_worker(self, game_root, host, port, team_size):
+        starter = core.worker_starter_executable(game_root)
+        if not os.path.isfile(starter):
+            raise core.LauncherError(
+                "The hidden simulation worker starter is missing: %s" %
+                starter)
+        previous_marker_token = core.worker_ready_marker_token(game_root)
+        self._log("Starting the hidden simulation worker...")
+        self._worker = subprocess.Popen(
+            core.worker_child_command(game_root), cwd=game_root,
+            env=core.worker_environment(
+                game_root, host, port, team_size=team_size),
+            creationflags=_no_console_flags())
+        if core.wait_for_worker_ready(
+                self._worker, game_root,
+                cancelled=lambda: self._stop_requested,
+                previous_marker_token=previous_marker_token):
+            self._log("The hidden simulation worker is ready.")
+            return True
+        if not self._stop_requested:
+            exit_code = self._worker.poll()
+            if exit_code is None:
+                self._log("The hidden simulation worker did not become ready.")
+            else:
+                self._log(
+                    "The hidden simulation worker stopped with exit code %s." %
+                    exit_code)
+            self._log_worker_failure(game_root)
+        self._stop_worker()
+        return False
+
+    def _log_worker_failure(self, game_root):
+        try:
+            with open(core.worker_failure_log(game_root), "r",
+                      encoding="utf-8", errors="replace") as stream:
+                detail = stream.read().strip()
+        except (IOError, OSError):
+            return
+        if detail:
+            self._log("[worker] %s" % detail.replace("\n", " | "))
+
+    def _stop_worker(self):
+        worker = self._worker
+        self._worker = None
+        if worker is not None and worker.poll() is None:
+            self._log("Stopping the hidden simulation worker...")
+            worker.terminate()
+            try:
+                worker.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                worker.kill()
+
+    def _run_game(self, game_root, port_version, host, port,
+                  paired_worker=False):
         self._log("Starting %s..." % core.GAME_EXECUTABLE)
-        self._game = subprocess.Popen([core.game_executable(game_root)],
-                                      cwd=game_root)
-        self._game.wait()
-        self._game = None
+        command = core.visible_client_command(game_root, port_version)
+        environment = core.visible_client_environment(
+            port_version, host, port, paired_worker=paired_worker)
+        self._game = subprocess.Popen(
+            command, cwd=game_root, env=environment)
+        try:
+            exit_code = self._game.wait()
+        finally:
+            self._game = None
+        if (exit_code not in (None, 0) and not self._stop_requested):
+            self._log("The game stopped with exit code %s." % exit_code)
+        if paired_worker:
+            self._log("The game closed.")
+            return
         self._log("Waiting %d seconds in case the game restarts itself..." %
                   int(core.GAME_RESTART_GRACE_SECONDS))
         core.wait_for_game_exit(
@@ -694,26 +897,41 @@ class LauncherWindow(object):
                 "The game started another process; the server stays up."))
         self._log("The game closed.")
 
-    def _stop_server(self):
+    def _stop_server(self, force=False):
+        if self._server_persistent and not force:
+            return False
         server = self._server
         self._server = None
-        if server is None or server.poll() is not None:
-            return
-        self._log("Stopping the LAN server...")
-        server.terminate()
-        try:
-            server.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            server.kill()
+        self._server_persistent = False
+        self._server_context = None
+        if server is not None and server.poll() is None:
+            self._log("Stopping the LAN server...")
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
+        self.root.after(0, self._update_action_controls)
+        return server is not None
 
     def _on_close(self):
-        if self._busy or self._maintenance_busy:
+        if self._maintenance_busy:
             self._log(
-                "Finish the current launcher operation before closing. Use "
-                "Kill the game if a started client must be closed now.")
+                "Finish the current launcher maintenance before closing.")
+            return False
+        if self._busy:
+            self._close_pending = True
+            self._log("Closing the game and its offline processes...")
+            self._kill_game(stop_persistent_server=True)
+            return False
+        return self._finish_close()
+
+    def _finish_close(self):
+        if self._busy or self._maintenance_busy:
             return False
         self._save_settings()
-        self._stop_server()
+        self._stop_worker()
+        self._stop_server(force=True)
         self.root.destroy()
         return True
 
