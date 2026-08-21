@@ -4317,6 +4317,75 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertNotIn('_BOT_POOL_BY_TIER', vars(sys.modules[
             'gui.mods.offline_lan_0922.battle_runtime']))
 
+    def test_all_clients_preload_the_same_server_roster(self):
+        runtime = _runtime()
+        runtime.nations = types.SimpleNamespace(
+            AVAILABLE_NAMES=('ussr',), INDICES={'ussr': 0})
+        entries = {
+            1: types.SimpleNamespace(
+                level=8, tags=frozenset(('heavyTank',)),
+                name='ussr:heavy'),
+            2: types.SimpleNamespace(
+                level=8, tags=frozenset(('mediumTank',)),
+                name='ussr:medium'),
+            3: types.SimpleNamespace(
+                level=8, tags=frozenset(('AT-SPG',)),
+                name='ussr:td'),
+        }
+        runtime.vehicles.g_list = types.SimpleNamespace(
+            getList=lambda unused_nation_id: entries)
+        first_descriptor = _Descriptor('ussr:first')
+        first_descriptor.type.level = 8
+        second_descriptor = _Descriptor('ussr:second')
+        second_descriptor.type.level = 8
+        descriptors = {
+            first_descriptor.name: first_descriptor,
+            second_descriptor.name: second_descriptor,
+        }
+        start = {
+            'round_id': 17, 'map': '02_malinovka',
+            'players': [
+                {'id': 1, 'team': 1, 'slot': 0,
+                 'vehicle': first_descriptor.name},
+                {'id': 2, 'team': 2, 'slot': 0,
+                 'vehicle': second_descriptor.name},
+            ],
+            'bots': [
+                {'id': 11, 'team': 1, 'slot': 1},
+                {'id': 12, 'team': 1, 'slot': 2},
+                {'id': 21, 'team': 2, 'slot': 1},
+                {'id': 22, 'team': 2, 'slot': 2},
+            ],
+        }
+
+        def make_battle(player_id):
+            battle = BattleRuntime(runtime)
+            battle._config = {'vehicle': descriptors[
+                first_descriptor.name if player_id == 1 else
+                second_descriptor.name].name}
+            battle._start_message = start
+            battle.client = types.SimpleNamespace(
+                team=player_id, player_id=player_id)
+            battle._resolve_descriptor = lambda name: descriptors[name]
+            return battle
+
+        first = make_battle(1)
+        second = make_battle(2)
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.random.random',
+                side_effect=AssertionError('global RNG used')), \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.random.shuffle',
+                    side_effect=AssertionError('global RNG used')):
+            self.assertTrue(first._prepare_bot_vehicle_assignments(
+                first_descriptor))
+            self.assertTrue(second._prepare_bot_vehicle_assignments(
+                second_descriptor))
+
+        self.assertEqual(
+            first._bot_vehicle_assignments,
+            second._bot_vehicle_assignments)
+
     def test_game_abort_is_rejected_and_original_is_restored(self):
         runtime = _runtime()
         original_abort = runtime.game.abort
@@ -4507,6 +4576,59 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIs(
             add_mapping,
             runtime.bigworld.__dict__['addSpaceGeometryMapping'])
+
+    def test_visibility_retries_when_live_space_publication_lags_mapping(self):
+        runtime = _runtime()
+        runtime.arena_cache = {2: types.SimpleNamespace(
+            geometryName='02_malinovka', gameplayName='ctf', gameplayID=0)}
+        original_add_mapping = runtime.bigworld.addSpaceGeometryMapping
+        delayed_spaces = []
+
+        def map_before_publishing_space(space_id, mapper, path):
+            result = original_add_mapping(space_id, mapper, path)
+            delayed_spaces.append(runtime.bigworld.spaces.pop(int(space_id)))
+            return result
+
+        runtime.bigworld.addSpaceGeometryMapping = map_before_publishing_space
+        battle = BattleRuntime(runtime)
+        start = {
+            'round_id': 1, 'map': '02_malinovka', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
+
+        self.assertTrue(battle.start({
+            'map': '02_malinovka', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, start, _Client()))
+
+        self.assertEqual([0x00000001],
+                         runtime.bigworld.mapped_visibility_masks)
+        self.assertIsNotNone(battle._standard_space_visibility)
+        self.assertFalse(battle._space_visibility_warning_reported)
+
+        runtime.bigworld.now += \
+            battle_runtime_module.SPACE_VISIBILITY_CHECK_SECONDS
+        self.assertFalse(battle._maintain_standard_space_visibility(
+            runtime.bigworld.now))
+        self.assertIsNotNone(battle._standard_space_visibility)
+        self.assertFalse(battle._space_visibility_warning_reported)
+
+        # PySpaces becomes visible on a later engine tick, after another
+        # stock update has widened the server mask to include domination.
+        delayed_space = delayed_spaces[0]
+        delayed_space._items_visibility_mask = 0x00000003
+        runtime.bigworld.spaces[7] = delayed_space
+        runtime.bigworld.now += \
+            battle_runtime_module.SPACE_VISIBILITY_CHECK_SECONDS
+
+        self.assertTrue(battle._maintain_standard_space_visibility(
+            runtime.bigworld.now))
+        self.assertEqual(0x00000001,
+                         runtime.bigworld.spaces[7].itemsVisibilityMask)
+        self.assertFalse(0xffffff82 &
+                         runtime.bigworld.spaces[7].itemsVisibilityMask)
+        self.assertFalse(battle._space_visibility_warning_reported)
 
     def test_incomplete_hangar_fails_before_native_clear(self):
         runtime = _runtime()
@@ -5210,7 +5332,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         for descriptor in bot_descriptors:
             self.assertNotIn(id(descriptor), tank_collision._SHAPE_CACHE)
 
-    def test_human_readiness_starts_countdown_while_bots_materialize(self):
+    def test_countdown_waits_until_all_bot_presentations_are_ready(self):
         runtime = _runtime()
         runtime.bigworld.defer_vehicle_entry = True
         battle = BattleRuntime(runtime)
@@ -5236,12 +5358,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertFalse(battle._ready_sent)
         battle._frame()
 
-        client.send_battle_ready.assert_called_once()
-        self.assertTrue(battle._ready_sent)
+        client.send_battle_ready.assert_not_called()
+        self.assertFalse(battle._ready_sent)
         self.assertEqual(1, len(battle._pending_bot_create_order))
         self.assertFalse(battle._battle_live)
-        # Enemy models may finish loading during the countdown, but their
-        # marker/minimap visual is not registered before the first real spot.
+        # Enemy models finish behind BattleLoading, but their marker/minimap
+        # visual is still not registered before the first real spot.
         self.assertEqual(0, len(runtime.bigworld.avatar.visual_starts))
         enemy = battle._records['bot:11']
         self.assertFalse(enemy['spot_visible'])
@@ -5250,6 +5372,13 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIsNone(runtime.bigworld.entity(enemy['engine_id']))
         self.assertIsNone(runtime.bigworld.entities.get(enemy['engine_id']))
         self.assertNotIn(enemy['engine_id'], runtime.bigworld.entities)
+
+        runtime.bigworld.now += battle_runtime_module.BOT_SPAWN_SECONDS + 0.01
+        battle._frame()
+
+        client.send_battle_ready.assert_called_once()
+        self.assertTrue(battle._ready_sent)
+        self.assertFalse(battle._pending_bot_create_order)
 
         self.assertTrue(battle._apply_authority_bot_poses([{
             'id': 11, 'alive': True, 'x': 17.0, 'y': 2.0, 'z': 19.0,
@@ -6326,6 +6455,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             player_id=1, send_input=send_input)
         battle._avatar = runtime.bigworld.avatar
         battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._binding = mock.Mock()
         battle._sender = _LANInputSender(battle)
         battle._local_position = (0.0, 0.0, 0.0)
         battle._local_yaw = 0.0
@@ -6352,12 +6482,42 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(475, entity.health)
         self.assertEqual(475, record['state']['health'])
+        self.assertEqual(475, record['state']['display_health'])
+        self.assertEqual(
+            (10, 475, battle._attack_reason('FIRE', 1), True, False),
+            battle._avatar.health_update)
         send_input.assert_called_once()
         self.assertEqual(
             475, send_input.call_args.kwargs['reported_health'])
         self.assertEqual(
             battle._attack_reason('FIRE', 1),
             send_input.call_args.kwargs['reported_reason'])
+
+        # The 30 Hz snapshot which was already in flight may still contain
+        # the pre-fire 500 HP.  It must not repaint or restore that value.
+        record['ready'] = True
+        battle._update_entity({
+            'entity': 'player:1',
+            'state': {
+                'health': 500, 'display_health': 500,
+                'alive': True, 'death_reason': 0}})
+        self.assertEqual(475, record['state']['health'])
+        self.assertEqual(475, record['state']['display_health'])
+        self.assertEqual(475, entity.health)
+        self.assertEqual(475, battle._avatar.health_update[1])
+        self.assertEqual(
+            battle._attack_reason('FIRE', 1),
+            record['state']['death_reason'])
+
+        # A newer canonical reduction is still allowed through.
+        with mock.patch.object(battle, '_materialize_record'):
+            battle._update_entity({
+                'entity': 'player:1',
+                'state': {
+                    'health': 450, 'display_health': 450,
+                    'alive': True, 'death_reason': 0}})
+        self.assertEqual(450, record['state']['health'])
+        self.assertEqual(450, record['state']['display_health'])
 
     def test_repair_progress_closes_with_zero_seconds_once(self):
         runtime = _runtime()

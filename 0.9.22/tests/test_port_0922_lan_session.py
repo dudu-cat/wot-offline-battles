@@ -11,12 +11,37 @@ PACKAGE_ROOT = (ROOT / '0.9.22' / 'src' / 'res' / 'scripts' /
                 'client' / 'gui' / 'mods' / 'offline_lan_0922')
 
 
+def _test_adisp_process(function):
+    def start(*args, **kwargs):
+        generator = function(*args, **kwargs)
+        try:
+            caller = next(generator)
+        except StopIteration:
+            return
+
+        def completed(result):
+            try:
+                generator.send(result)
+            except StopIteration:
+                pass
+
+        caller(callback=completed)
+    return start
+
+
+def _lazy_result(result):
+    return lambda callback: callback(result)
+
+
 def _load():
     for name in ('gui', 'gui.mods', 'gui.mods.offline_lan_0922'):
         if name not in sys.modules:
             module = types.ModuleType(name)
             module.__path__ = [str(PACKAGE_ROOT)]
             sys.modules[name] = module
+    adisp = types.ModuleType('adisp')
+    adisp.process = _test_adisp_process
+    sys.modules['adisp'] = adisp
     full_name = 'gui.mods.offline_lan_0922.lan_session'
     sys.modules.pop(full_name, None)
     spec = importlib.util.spec_from_file_location(full_name,
@@ -252,7 +277,7 @@ class LANSessionTests(unittest.TestCase):
 
         callbacks = [False, True]
         service = types.SimpleNamespace(requestResults=mock.Mock(
-            side_effect=lambda context, callback: callback(callbacks.pop(0))))
+            side_effect=lambda context: _lazy_result(callbacks.pop(0))))
         personality = types.ModuleType('gui.shared.personality')
         personality.ServicesLocator = types.SimpleNamespace(
             battleResults=service)
@@ -280,6 +305,35 @@ class LANSessionTests(unittest.TestCase):
         session._publish_battle_service_message.assert_called_once_with(
             123, {'arenaUniqueID': 123})
 
+    def test_install_schedules_durable_postbattle_result_before_lan_join(self):
+        class Store(object):
+            def pending_arenas(self):
+                return [123]
+            def progress(self):
+                return {'battles': 1}
+
+        scheduled = []
+        join_views = []
+
+        def join_factory(on_join):
+            view = _JoinUI(on_join)
+            join_views.append(view)
+            return view
+
+        session = self.module.LANSession(
+            {}, postbattle_store=Store(), lobby_ready=lambda: False,
+            callback=lambda delay, function: (
+                scheduled.append((delay, function)), len(scheduled))[1],
+            join_factory=join_factory)
+
+        self.assertTrue(session.install())
+
+        self.assertEqual('ready_to_join', session.state)
+        self.assertEqual(1, join_views[0].install_calls)
+        self.assertEqual(1, len(scheduled))
+        self.assertEqual(
+            self.module.POSTBATTLE_RETRY_DELAY, scheduled[0][0])
+
     def test_postbattle_notification_retries_without_refetching_result(self):
         class Store(object):
             def pending_arenas(self):
@@ -293,7 +347,7 @@ class LANSessionTests(unittest.TestCase):
 
         scheduled = []
         service = types.SimpleNamespace(requestResults=mock.Mock(
-            side_effect=lambda context, callback: callback(True)))
+            side_effect=lambda context: _lazy_result(True)))
         personality = types.ModuleType('gui.shared.personality')
         personality.ServicesLocator = types.SimpleNamespace(
             battleResults=service)
@@ -358,8 +412,8 @@ class LANSessionTests(unittest.TestCase):
 
         result_callbacks = []
         service = types.SimpleNamespace(requestResults=mock.Mock(
-            side_effect=lambda context, callback: result_callbacks.append(
-                callback)))
+            side_effect=lambda context: (
+                lambda callback: result_callbacks.append(callback))))
         personality = types.ModuleType('gui.shared.personality')
         personality.ServicesLocator = types.SimpleNamespace(
             battleResults=service)
@@ -428,8 +482,8 @@ class LANSessionTests(unittest.TestCase):
 
         requested = []
         service = types.SimpleNamespace(requestResults=mock.Mock(
-            side_effect=lambda context, callback: (
-                requested.append(context), callback(True))))
+            side_effect=lambda context: (
+                requested.append(context), _lazy_result(True))[1]))
         personality = types.ModuleType('gui.shared.personality')
         personality.ServicesLocator = types.SimpleNamespace(
             battleResults=service)
@@ -463,13 +517,15 @@ class LANSessionTests(unittest.TestCase):
         active = [False]
         requested = []
 
-        def request_results(context, callback):
+        def request_results(context):
             self.assertFalse(active[0])
             active[0] = True
             requested.append(context)
-            # The exact cache clears its waiting gate before this callback.
-            active[0] = False
-            callback(True)
+            def caller(callback):
+                # The exact cache clears its waiting gate before this callback.
+                active[0] = False
+                callback(True)
+            return caller
 
         service = types.SimpleNamespace(
             requestResults=mock.Mock(side_effect=request_results))
@@ -510,8 +566,8 @@ class LANSessionTests(unittest.TestCase):
 
         requested = []
         service = types.SimpleNamespace(requestResults=mock.Mock(
-            side_effect=lambda context, callback: (
-                requested.append(context), callback(True))))
+            side_effect=lambda context: (
+                requested.append(context), _lazy_result(True))[1]))
         personality = types.ModuleType('gui.shared.personality')
         personality.ServicesLocator = types.SimpleNamespace(
             battleResults=service)
@@ -544,7 +600,7 @@ class LANSessionTests(unittest.TestCase):
         lobby_ready = [False]
         callbacks = []
         service = types.SimpleNamespace(requestResults=mock.Mock(
-            side_effect=lambda context, callback: callback(True)))
+            side_effect=lambda context: _lazy_result(True)))
         personality = types.ModuleType('gui.shared.personality')
         personality.ServicesLocator = types.SimpleNamespace(
             battleResults=service)
@@ -569,7 +625,7 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual(self.module.POSTBATTLE_RETRY_DELAY, callbacks[0][0])
         session._publish_postbattle_progress.assert_called_once_with()
         service.requestResults.assert_called_once_with(
-            (123, True, False, True), mock.ANY)
+            (123, True, False, True))
         self.assertEqual({123}, session._completed_results)
 
     def test_clickable_battle_result_uses_native_service_channel_wrapper(self):

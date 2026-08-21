@@ -70,6 +70,12 @@ SPOTTING_PHASE_BUCKETS = 5
 # after the local map has entered the battle.  Read it infrequently and only
 # write when it no longer selects this arena's gameplay.
 SPACE_VISIBILITY_CHECK_SECONDS = 0.50
+
+
+class _LiveSpaceVisibilityPending(Exception):
+    """The mapped native space has not reached BigWorld.spaces yet."""
+
+
 # AvatarInputHandler._Targeting gives the native BigWorld.target these exact
 # values.  The manual target adapter applies the static-world mouse-ray gate
 # separately; the physical gun line is still irrelevant to an outline.
@@ -1721,6 +1727,12 @@ class BattleRuntime(object):
         try:
             return self._apply_standard_space_visibility(
                 space_id, before_mapping)
+        except _LiveSpaceVisibilityPending:
+            # addSpaceGeometryMapping() returns before exact #1513 publishes
+            # the client-only battle space through BigWorld.spaces.  Keep the
+            # pre-mapping boundary alive so the frame guard can finish the
+            # typed write as soon as that native space becomes observable.
+            return None
         except Exception as error:
             # Visibility only filters map decoration such as inactive bases.
             # A missing client-only space contract must never discard an
@@ -1778,11 +1790,7 @@ class BattleRuntime(object):
             # Once geometry is mapped, maintain the live typed UINT32
             # property.  The legacy getter/setter pair is inert for this
             # client-only PlayerAvatar space on exact #1513.
-            spaces = getattr(bigworld, 'spaces', None)
-            if spaces is None:
-                raise RuntimeError(
-                    '#1513 live space visibility data is unavailable')
-            space = spaces[space_id]
+            space = self._live_standard_space(space_id)
             actual = space.itemsVisibilityMask
             if actual != expected:
                 space.itemsVisibilityMask = expected
@@ -1797,6 +1805,19 @@ class BattleRuntime(object):
             self._clock() + SPACE_VISIBILITY_CHECK_SECONDS)
         return expected
 
+    def _live_standard_space(self, space_id):
+        """Return mapped space data, or defer while native publication lags."""
+        spaces = getattr(self._runtime.bigworld, 'spaces', None)
+        if spaces is None:
+            raise RuntimeError(
+                '#1513 live space visibility data is unavailable')
+        try:
+            return spaces[space_id]
+        except KeyError:
+            # Exact #1513 raises ``No space(<id>) exists.`` during the short
+            # interval between geometry mapping and PySpaces publication.
+            raise _LiveSpaceVisibilityPending()
+
     def _maintain_standard_space_visibility(self, now):
         """Restore a gameplay bit if later stock code widens the server mask."""
         boundary = self._standard_space_visibility
@@ -1805,13 +1826,8 @@ class BattleRuntime(object):
         self._next_space_visibility_check = (
             now + SPACE_VISIBILITY_CHECK_SECONDS)
         space_id, selected_bit, client_bits, server_bits = boundary
-        bigworld = self._runtime.bigworld
         try:
-            spaces = getattr(bigworld, 'spaces', None)
-            if spaces is None:
-                raise RuntimeError(
-                    '#1513 live space visibility data is unavailable')
-            space = spaces[space_id]
+            space = self._live_standard_space(space_id)
             current = space.itemsVisibilityMask
             if current & server_bits == selected_bit:
                 return False
@@ -1824,6 +1840,8 @@ class BattleRuntime(object):
                 raise RuntimeError(
                     '#1513 typed gameplay visibility mask was not applied: '
                     'expected=0x%x actual=%r' % (corrected, actual))
+        except _LiveSpaceVisibilityPending:
+            return False
         except Exception as error:
             self._standard_space_visibility = None
             self._warn_standard_space_visibility(error)
@@ -3052,28 +3070,38 @@ class BattleRuntime(object):
         There is deliberately no process-wide vehicle pool.  The selected
         battle tiers and role template are shared by both teams, humans remove
         their matching slots, and bots fill the remainder from the complete
-        eligible #1513 vehicle catalog.
+        eligible #1513 vehicle catalog.  Every process derives the same local
+        random stream from the server roster; otherwise the hidden worker and
+        visible client pre-load different tanks before the canonical manifest
+        arrives and the real line-up is loaded again during the countdown.
         """
         try:
             planning_descriptor = player_descriptor
-            if self._worker_mode:
-                # The off-map Avatar is only an engine loading carrier. Match
-                # composition must be anchored to an actual server player,
-                # never to that private descriptor or its synthetic slot.
-                for raw in self._start_message.get('players') or ():
-                    if not isinstance(raw, dict):
+            server_players = []
+            for raw in self._start_message.get('players') or ():
+                if not isinstance(raw, dict):
+                    continue
+                try:
+                    player_id = int(raw.get('id'))
+                    if player_id <= 0:
                         continue
-                    try:
-                        if int(raw.get('id')) <= 0:
-                            continue
-                    except (TypeError, ValueError, OverflowError):
-                        continue
-                    vehicle_name = raw.get('vehicle')
-                    if not vehicle_name:
-                        continue
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                server_players.append((player_id, raw))
+            server_players.sort(key=lambda value: value[0])
+            if server_players:
+                # The off-map worker Avatar is only an engine loading carrier.
+                # Visible LAN clients must use this same canonical anchor too;
+                # anchoring each process to its own selected tank gives every
+                # client a different speculative roster in a mixed-tier room.
+                anchor_id, anchor = server_players[0]
+                vehicle_name = anchor.get('vehicle')
+                if vehicle_name and not (
+                        not self._worker_mode and
+                        anchor_id == getattr(
+                            self.client, 'player_id', None)):
                     planning_descriptor = self._resolve_descriptor(
                         vehicle_name)
-                    break
             player_profile = self._vehicle_profile(
                 planning_descriptor.type)
             tier = int(player_profile['level'])
@@ -3090,6 +3118,31 @@ class BattleRuntime(object):
                         candidates.append(self._vehicle_profile(entry))
             if not candidates:
                 return False
+            candidates.sort(key=lambda value: (
+                int(value.get('level', 0)),
+                self._vehicle_class_order(value),
+                str(value.get('name', ''))))
+
+            seed_players = ';'.join(
+                '%d,%s,%s,%s' % (
+                    player_id, raw.get('team', ''), raw.get('slot', ''),
+                    raw.get('vehicle', ''))
+                for player_id, raw in server_players)
+            seed_bots = ';'.join(
+                '%s,%s,%s' % (
+                    raw.get('id', ''), raw.get('team', ''),
+                    raw.get('slot', ''))
+                for raw in sorted(
+                    (value for value in
+                     (self._start_message.get('bots') or ())
+                     if isinstance(value, dict)),
+                    key=lambda value: (
+                        int(value.get('team', 0)),
+                        int(value.get('slot', 0)),
+                        int(value.get('id', 0)))))
+            lineup_random = random.Random(bot_planner.stable_seed(
+                'battle-lineup-v1', self._start_message.get('round_id'),
+                self._start_message.get('map'), seed_players, seed_bots))
 
             roster = self._start_message.get('bots') or ()
             bots_by_team = dict((team, sorted(
@@ -3128,7 +3181,8 @@ class BattleRuntime(object):
             available_tiers = sorted(set(
                 int(candidate['level']) for candidate in candidates))
             match_tiers = list(bot_planner.choose_match_tiers(
-                tier, random.random(), random.random(), available_tiers))
+                tier, lineup_random.random(), lineup_random.random(),
+                available_tiers))
             for profiles in humans_by_team.values():
                 for profile in profiles:
                     if profile['level'] not in match_tiers:
@@ -3147,7 +3201,7 @@ class BattleRuntime(object):
                 humans_by_team)
             template = bot_planner.build_match_template(
                 candidates, team_size, player_profile, match_tiers,
-                random, requirements)
+                lineup_random, requirements)
 
             assignments = {}
             for team in (1, 2):
@@ -3158,7 +3212,7 @@ class BattleRuntime(object):
                     picked = bot_planner.select_bot_lineup(
                         picked or candidates, len(team_bots), 1, candidates)
                 picked = list(picked[:len(team_bots)])
-                random.shuffle(picked)
+                lineup_random.shuffle(picked)
                 picked.sort(key=self._vehicle_class_order)
                 for raw, entry in zip(team_bots, picked):
                     assignments[(team, int(raw.get('slot', 0)))] = \
@@ -6299,6 +6353,11 @@ class BattleRuntime(object):
             state['health'] = max(
                 0, int(getattr(entity, 'health', 0)) - int(damage))
             state['alive'] = state['health'] > 0
+            # A live vehicle has no separate display-health value.  Keeping
+            # the preceding snapshot's value here makes PlayerAvatar first
+            # show the new native HP, then immediately paint the old HUD HP
+            # over it until the server echoes this fire tick.
+            state['display_health'] = state['health']
             state['death_reason'] = fire_reason
             record['state'] = state
             self._queue_local_damage_report(reason=fire_reason)
@@ -8671,17 +8730,14 @@ class BattleRuntime(object):
         return visible
 
     def _maybe_send_battle_ready(self):
-        """Open the shared countdown once all human vehicles have entered.
+        """Open the shared countdown after the complete line-up has entered.
 
-        The mature 0.8.2 flow deliberately materializes full bot models during
-        the 15-second countdown.  Making all 29 bot entities part of the LAN
-        loading barrier leaves the stock HUD at 00:00 for many seconds and
-        only starts the countdown after the line-up is already complete.
-        Humans and the authority manifest are the shared state boundary; the
-        server separately refuses ``battle_live`` until that manifest arrives.
-        A server-requested native destructible map is also a hard boundary:
-        a transport refusal is retried next frame, while invalid baked data
-        fails the battle.
+        Bot presentation remains staggered to keep one 32-bit render callback
+        from constructing 29 HD compounds.  It now finishes behind the stock
+        BattleLoading screen instead of spending the first countdown seconds
+        loading the line-up that will shortly begin moving.  A server-requested
+        native destructible map is also a hard boundary: a transport refusal
+        is retried next frame, while invalid baked data fails the battle.
         """
         if self._ready_sent or self._battle_live:
             return False
@@ -8691,6 +8747,15 @@ class BattleRuntime(object):
                           not record.get('tombstone')]
         if (len(player_records) != expected_players or
                 any(not record.get('ready') for record in player_records)):
+            return False
+        expected_bots = len(self._start_message.get('bots') or ())
+        bot_records = [record for record in self._records.values()
+                       if record.get('kind') == 'bot' and
+                       not record.get('tombstone')]
+        if (len(bot_records) != expected_bots or
+                self._pending_bot_create_order or
+                self._pending_bot_creates or
+                any(not record.get('ready') for record in bot_records)):
             return False
         ready = getattr(self.client, 'send_battle_ready', None)
         if not callable(ready):
@@ -10536,7 +10601,22 @@ class BattleRuntime(object):
             if record is None:
                 return
         state = dict(record.get('state') or {})
-        state.update(event.get('state') or {})
+        incoming = dict(event.get('state') or {})
+        if record.get('local') and 'health' in incoming and 'health' in state:
+            current_health = max(0, int(state['health']))
+            snapshot_health = max(0, int(incoming['health']))
+            if snapshot_health > current_health:
+                # Fire/fall/drowning are simulated by the owning client and
+                # HP cannot increase during a round.  A snapshot already in
+                # flight may therefore echo the pre-damage value before the
+                # server accepts the immediately-sent checkpoint.  Preserve
+                # the lower local value so that delayed echo cannot flash the
+                # old health bar or erase a burn tick.
+                incoming['health'] = current_health
+                for name in ('alive', 'display_health', 'death_reason'):
+                    if name in state:
+                        incoming[name] = state[name]
+        state.update(incoming)
         record['state'] = state
         pose = event.get('pose')
         if pose is not None:

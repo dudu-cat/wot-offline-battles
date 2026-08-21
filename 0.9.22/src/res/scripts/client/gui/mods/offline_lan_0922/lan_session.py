@@ -47,6 +47,18 @@ def _load_client():
     return LANClient
 
 
+def _start_adisp_request(request_results, context, completed):
+    """Advance one stock ``@async @process`` request to completion."""
+    from adisp import process
+
+    @process
+    def fetch():
+        success = yield request_results(context)
+        completed(success)
+
+    fetch()
+
+
 def _load_battle_runtime():
     from gui.mods.offline_lan_0922.battle_runtime import g_battle_runtime
     return g_battle_runtime
@@ -313,8 +325,9 @@ class LANSession(object):
                     # publish this notification and drain the next durable
                     # result serially.
                     self._publish_postbattle_results()
-                request_results(RequestResultsContext(
-                    arena_unique_id, show_immediately, False, True), completed)
+                context = RequestResultsContext(
+                    arena_unique_id, show_immediately, False, True)
+                _start_adisp_request(request_results, context, completed)
             except Exception as error:
                 self._requested_results.discard(arena_unique_id)
                 if self._postbattle_request_token is request_token:
@@ -530,6 +543,10 @@ class LANSession(object):
             self._join_ui = self._join_factory(self.join)
             self._join_ui.install()
         self.state = 'ready_to_join'
+        # A previous process may have durably accepted a receipt before the
+        # stock result service became available. Drain it as soon as this
+        # lobby finishes loading, without requiring another LAN join.
+        self._publish_postbattle_results()
         return True
 
     def revive(self):
