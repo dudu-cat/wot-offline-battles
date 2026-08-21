@@ -211,7 +211,7 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertTrue(battle._bot_artillery_cancel(source))
         battle._artillery.cancel_launch.assert_called_once_with(source)
 
-    def test_bot_launch_without_native_muzzle_fails_closed(self):
+    def test_bot_launch_without_frozen_muzzle_fails_closed(self):
         battle, unused_bigworld = _battle()
         shot = types.SimpleNamespace(
             shell=types.SimpleNamespace(kind='ARMOR_PIERCING'),
@@ -232,6 +232,53 @@ class BattleProjectileTests(unittest.TestCase):
             'shot_yaw': 0.0, 'shot_pitch': 0.0, 'shell_index': 0,
         }, 1))
         self.assertEqual([], battle.client.launches)
+
+    def test_direct_launch_reuses_muzzle_frozen_before_pose_update(self):
+        battle, unused_bigworld = _battle()
+        speed = 100.0
+        muzzle = [_Vector((4.0, 5.0, 6.0))]
+        moved_origin = _Vector((40.0, 50.0, 60.0))
+        shot = types.SimpleNamespace(
+            shell=types.SimpleNamespace(kind='ARMOR_PIERCING'),
+            speed=speed, gravity=9.81, maxDistance=500.0)
+        descriptor = types.SimpleNamespace(
+            gun=types.SimpleNamespace(shots=[shot]))
+        source = types.SimpleNamespace(
+            isStarted=True, typeDescriptor=descriptor,
+            model=types.SimpleNamespace(node=mock.Mock(
+                side_effect=lambda unused: types.SimpleNamespace(
+                    translation=muzzle[0]))))
+        battle._records['bot:11'] = {
+            'engine_id': 77, 'kind': 'bot', 'network_id': 11,
+            'ready': True, 'local': False,
+            'state': {'team': 2, 'health': 500, 'alive': True}}
+        battle._server_entity = lambda entity_id: (
+            source if entity_id == 77 else None)
+        battle._runtime.math.Matrix = lambda node: node
+        frozen_origin = battle._bot_direct_launch_origin(
+            {'id': 11}, descriptor, 0, 1, 0.0, 0.0, 0.5)
+        launch = {
+            'fire_seq': 1, 'shell_index': 0,
+            'shot_yaw': 0.0, 'shot_pitch': 0.0,
+            'flight_time': 0.5, 'origin': frozen_origin,
+        }
+        self.assertTrue(battle._bot_friendly_firing_lane(
+            {'id': 11, 'team': 2, 'fire_seq': 0}, {}, descriptor, 0,
+            launch)['clear'])
+
+        muzzle[0] = moved_origin
+        source.model.node.reset_mock()
+        state = {
+            'id': 11, 'profile': {'class_tag': 'MT'},
+            'shot_yaw': 0.0, 'shot_pitch': 0.0, 'shell_index': 0,
+            'shot_origin': frozen_origin,
+        }
+
+        self.assertTrue(battle._launch_bot_projectile(state, 1))
+        args, unused_kwargs = battle.client.launches[-1]
+        self.assertEqual(list(frozen_origin), args[4])
+        self.assertEqual([0.0, 0.0, speed], args[5])
+        source.model.node.assert_not_called()
 
     def test_spg_launch_reuses_the_proved_origin_and_velocity(self):
         battle, unused_bigworld = _battle()

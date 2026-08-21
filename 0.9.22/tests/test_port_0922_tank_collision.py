@@ -288,6 +288,14 @@ class TankCollisionTests(unittest.TestCase):
         still_overlapping = tank_collision.resolve_tank(
             heavy, (light,), now=10.76, ram_cooldowns=first['cooldowns'],
             active_ram_contacts=first['contacts'])
+        harmless_overlap = tank_collision.resolve_tank(
+            dict(heavy, vx=2.0), (light,), now=10.8,
+            ram_cooldowns=first['cooldowns'],
+            active_ram_contacts=still_overlapping['contacts'])
+        reaccelerated_overlap = tank_collision.resolve_tank(
+            heavy, (light,), now=11.0,
+            ram_cooldowns=first['cooldowns'],
+            active_ram_contacts=harmless_overlap['contacts'])
         separated_light = dict(light, x=20.0)
         separated = tank_collision.resolve_tank(
             heavy, (separated_light,), now=10.8,
@@ -299,12 +307,91 @@ class TankCollisionTests(unittest.TestCase):
 
         self.assertEqual((), cooling_down['ram_events'])
         self.assertEqual((), still_overlapping['ram_events'])
+        self.assertEqual(first['contacts'], harmless_overlap['contacts'])
+        self.assertEqual((), reaccelerated_overlap['ram_events'])
         self.assertEqual(frozenset(), separated['contacts'])
         self.assertEqual(1, len(ready_again['ram_events']))
+
+    def test_harmless_touch_does_not_consume_a_later_high_speed_ram(self):
+        light = _tank(4, 0.0, 0.0, mass=10000.0, vx=2.0)
+        heavy = _tank(9, 0.8, 0.0, mass=60000.0)
+
+        touching = tank_collision.resolve_tank(
+            light, (heavy,), now=10.0)
+        light['vx'] = 10.0
+        impact = tank_collision.resolve_tank(
+            light, (heavy,), now=10.1,
+            ram_cooldowns=touching['cooldowns'],
+            active_ram_contacts=touching['contacts'])
+
+        self.assertEqual((), touching['ram_events'])
+        self.assertEqual(frozenset(), touching['contacts'])
+        self.assertEqual(1, len(impact['ram_events']))
+        self.assertGreater(impact['ram_events'][0]['damage_to_other'], 0)
+        self.assertGreater(impact['ram_events'][0]['damage_to_self'], 0)
+
+    def test_light_into_heavy_diagnostic_preserves_zero_target_damage(self):
+        light = _tank(4, 0.0, 0.0, mass=10000.0, vx=4.5)
+        heavy = _tank(9, 0.8, 0.0, mass=60000.0)
+        light['vehicle'] = 'ussr:T-50'
+        heavy['vehicle'] = 'germany:Maus'
+
+        result = tank_collision.resolve_tank(light, (heavy,), now=10.0)
+        event = result['ram_events'][0]
+
+        self.assertEqual((0, 4), (
+            event['damage_to_other'], event['damage_to_self']))
+        self.assertEqual(('ussr:T-50', 'germany:Maus'), (
+            event['self_vehicle'], event['other_vehicle']))
+        self.assertEqual((10000.0, 60000.0), (
+            event['mass_self'], event['mass_other']))
+        self.assertEqual(((4.5, 0.0), (0.0, 0.0)), (
+            event['velocity_self'], event['velocity_other']))
+        self.assertEqual((-1.0, 0.0), event['contact_normal'])
+        self.assertGreater(event['contact_penetration'], 0.0)
+        self.assertEqual(4.5, event['closing_speed'])
+
+    def test_high_tangential_speed_is_a_harmless_glancing_contact(self):
+        light = _tank(
+            4, 0.0, 0.0, mass=10000.0, vx=3.0, vz=30.0)
+        heavy = _tank(9, 0.8, 0.0, mass=60000.0)
+
+        result = tank_collision.resolve_tank(light, (heavy,), now=10.0)
+
+        self.assertEqual((), result['ram_events'])
+
+    def test_head_on_diagnostic_records_both_moving_bodies(self):
+        first = _tank(4, 0.0, 0.0, mass=25000.0, vx=6.0)
+        second = _tank(9, 0.8, 0.0, mass=30000.0, vx=-4.0)
+        first['vehicle'] = 'ussr:T-34'
+        second['vehicle'] = 'germany:PzV'
+
+        result = tank_collision.resolve_tank(first, (second,), now=10.0)
+        event = result['ram_events'][0]
+
+        self.assertEqual(10.0, event['closing_speed'])
+        self.assertEqual(((6.0, 0.0), (-4.0, 0.0)), (
+            event['velocity_self'], event['velocity_other']))
+        self.assertEqual((first['yaw'], second['yaw']), (
+            event['yaw_self'], event['yaw_other']))
+        self.assertEqual((first['shape'], second['shape']), (
+            event['shape_self'], event['shape_other']))
+        self.assertGreater(event['damage_to_other'], 0)
+        self.assertGreater(event['damage_to_self'], 0)
 
     def test_ram_threshold_is_harmless(self):
         self.assertEqual((0, 0), tank_collision.ram_damage(
             tank_collision.RAM_SAFE_SPEED, 25000.0, 25000.0))
+
+    def test_type62_v_k3002db_ram_is_owner_invariant(self):
+        bot_owner = tank_collision.ram_damage(
+            16.66827, 37290.0, 21000.0)
+        player_owner = tank_collision.ram_damage(
+            16.66827, 21000.0, 37290.0)
+
+        self.assertEqual((307, 97), bot_owner)
+        self.assertEqual((97, 307), player_owner)
+        self.assertEqual(bot_owner, tuple(reversed(player_owner)))
 
     def test_wreck_blocks_the_mover_without_moving_or_dealing_ram_damage(self):
         mover = _tank(1, 0.0, 0.0, mass=25000.0, vx=10.0)

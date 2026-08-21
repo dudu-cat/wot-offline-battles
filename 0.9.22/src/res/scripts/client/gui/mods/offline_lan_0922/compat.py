@@ -551,6 +551,7 @@ class OfflineCompatibility(object):
         self._vehicle_property_overlays = {}
         self._vehicle_marker_plugins = {}
         self._battle_player_vehicle_id = 0
+        self._postmortem_vehicle_id = 0
         self._control_mode_listener = None
         self._target_lock_candidate = None
         self._target_lock_input_pending = False
@@ -1166,6 +1167,15 @@ class OfflineCompatibility(object):
                 except AttributeError:
                     pass
             if name == 'vehicle' and compatibility._battle_active:
+                vehicle_id = compatibility._postmortem_vehicle_id
+                if vehicle_id:
+                    vehicle = runtime.bigworld.entity(vehicle_id)
+                    if vehicle is not None:
+                        # Retail changes Avatar.vehicle before it publishes
+                        # onSwitchViewpoint.  A client-only Avatar has no cell
+                        # attachment, so expose the selected observed vehicle
+                        # for the lifetime of postmortem control instead.
+                        return vehicle
                 try:
                     caller_code = sys._getframe(1).f_code
                 except (AttributeError, ValueError):
@@ -2183,6 +2193,7 @@ class OfflineCompatibility(object):
         self._vehicle_property_overlays = {}
         self._vehicle_marker_plugins = {}
         self._battle_player_vehicle_id = 0
+        self._postmortem_vehicle_id = 0
         self._control_mode_listener = None
         self._target_lock_candidate = None
         self._target_lock_input_pending = False
@@ -2424,6 +2435,7 @@ class OfflineCompatibility(object):
         self._strategic_camera_failure_reported = False
         self._vehicle_property_overlays = {}
         self._battle_player_vehicle_id = 0
+        self._postmortem_vehicle_id = 0
         self._target_lock_candidate = None
         self._native_battle = True
         self._battle_gui_type = gui_type
@@ -2665,6 +2677,29 @@ class OfflineCompatibility(object):
             overlay['acceleration'] = acceleration
         return True
 
+    def set_postmortem_vehicle(self, vehicle_id):
+        """Mirror #1513's Avatar.vehicle switch for a client-only battle."""
+        if not self._battle_active:
+            raise RuntimeError('postmortem attachment requires a battle')
+        try:
+            vehicle_id = int(vehicle_id or 0)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError('postmortem vehicle id is invalid')
+        if vehicle_id < 0:
+            raise ValueError('postmortem vehicle id is invalid')
+        if (vehicle_id and
+                self._runtime.bigworld.entity(vehicle_id) is None):
+            raise RuntimeError('postmortem vehicle is unavailable')
+        previous = self._postmortem_vehicle_id
+        self._postmortem_vehicle_id = vehicle_id
+        return previous
+
+    def clear_postmortem_vehicle(self):
+        """Clear a synthetic attachment at any startup/teardown boundary."""
+        previous = self._postmortem_vehicle_id
+        self._postmortem_vehicle_id = 0
+        return previous
+
     def bind_vehicle_pose_sources(self, avatar, vehicle):
         """Bind every stock #1513 pose provider to one live matrix.
 
@@ -2849,6 +2884,7 @@ class OfflineCompatibility(object):
             self._battle_clock_origin = None
             self._vehicle_property_overlays = {}
             self._battle_player_vehicle_id = 0
+            self._postmortem_vehicle_id = 0
 
     def disconnect(self):
         if self._runtime is None:

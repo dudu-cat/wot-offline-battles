@@ -227,6 +227,74 @@ class ServerAuthorityBattleTest(unittest.TestCase):
             0.05)
         self.assertGreater(moved, 0)
 
+    def test_player_ram_contact_is_validated_and_relayed_by_revision(self):
+        state = self._live_state()
+        bot_id = min(state.bot_states)
+        state.bot_state_revision = 300
+        state.bot_state_time_us = 3000000
+        valid = {
+            'seq': 1, 'bot_id': bot_id, 'bot_state_revision': 299,
+            'presentation_time_us': 2900000,
+            'x': 1.25, 'y': 0.0, 'z': -2.5, 'yaw': 0.25,
+            'vx': 0.0, 'vz': 16.5,
+        }
+
+        state.update_input(1, {
+            'round_id': state.round_id, 'ram_contact': valid})
+
+        self.assertEqual(valid, state._public_player(
+            state.players[1])['ram_contact'])
+        for rejected in (
+                dict(valid, seq=2, bot_state_revision=301),
+                dict(valid, seq=3, bot_state_revision=44),
+                dict(valid, seq=4, vx=float('nan')),
+                dict(valid, seq=5, bot_id=31),
+                dict(valid, seq=6, presentation_time_us=3000001),
+                dict(valid, seq=7, presentation_time_us=1.5),
+                dict(valid, seq=0)):
+            state.update_input(1, {
+                'round_id': state.round_id, 'ram_contact': rejected})
+            self.assertEqual(valid, state.players[1].ram_contact)
+        state.update_input(1, {
+            'round_id': state.round_id + 1,
+            'ram_contact': dict(valid, seq=8)})
+        self.assertEqual(valid, state.players[1].ram_contact)
+
+    def test_accepted_ram_receipt_cannot_reappear_after_authority_change(self):
+        state = self._live_state()
+        player = state.players[1]
+        bot_id = min(state.bot_states)
+        bot = state.bot_states[bot_id]
+        bot.update(x=player.x, z=player.z, health=1000, alive=True)
+        state.bot_state_revision = 300
+        state.bot_state_time_us = 3000000
+        receipt = {
+            'seq': 9, 'bot_id': bot_id, 'bot_state_revision': 299,
+            'presentation_time_us': 2900000,
+            'x': player.x, 'y': player.y, 'z': player.z,
+            'yaw': 0.0, 'vx': 0.0, 'vz': 16.0,
+        }
+        state.update_input(1, {
+            'round_id': state.round_id, 'ram_contact': receipt})
+
+        self.assertTrue(state.report_bot_ram(SERVER_AUTHORITY_ID, {
+            'round_id': state.round_id,
+            'bot_id': bot_id, 'target_kind': 'human', 'target_id': 1,
+            'ram_seq': 1, 'damage_to_bot': 40,
+            'damage_to_target': 80,
+            'ram_contact_player_id': 1, 'ram_contact_seq': 9,
+        }))
+
+        self.assertEqual({}, player.ram_contact)
+        self.assertEqual(9, player.ram_contact_seq)
+        self.assertNotIn('ram_contact', state._public_player(player))
+        # The input sender repeats its latest receipt until a newer contact.
+        # Keeping the monotonic sequence after clearing prevents that old
+        # payload from becoming visible to a takeover authority again.
+        state.update_input(1, {
+            'round_id': state.round_id, 'ram_contact': receipt})
+        self.assertEqual({}, player.ram_contact)
+
     def test_bot_states_stay_inside_the_baked_grid(self):
         state = self._live_state()
         world = state.server_authority.world
@@ -758,6 +826,22 @@ class VehicleStatisticsTest(unittest.TestCase):
         self._shoot(state, 1, 2, 180)
 
         self.assertEqual([], self._assists(state))
+
+    def test_first_spotted_report_is_accepted_during_shared_countdown(self):
+        state = _state_with_authority()
+        self.assertFalse(self._report_spotted(state, 1, []))
+        unused_message, error = state.request_start(1, '01_karelia')
+        self.assertIsNone(error)
+        self.assertEqual('loading', state.phase)
+        self.assertFalse(self._report_spotted(state, 1, []))
+        live = state.mark_battle_ready(
+            1, {'round_id': state.round_id})
+
+        self.assertIsNotNone(live)
+        self.assertEqual('battle', state.phase)
+        self.assertEqual(0, state.tick)
+        self.assertTrue(self._report_spotted(state, 1, []))
+        self.assertEqual(frozenset(), state.player_spotted[1])
 
     def test_a_dead_reporter_stops_earning_radio_assist(self):
         state = self._live_state()

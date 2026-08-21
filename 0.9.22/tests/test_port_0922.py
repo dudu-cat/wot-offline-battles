@@ -411,6 +411,9 @@ class PortSourceTests(unittest.TestCase):
             root = Path(directory)
             package = root / 'mod.wotmod'
             checksum = root / 'mod.wotmod.sha256'
+            native_bridge = root / 'offline_instance_guard_native.pyd'
+            worker_starter = root / 'offline_worker_starter.exe'
+            server_executable = root / 'WoT-0.9.22-LAN-Server.exe'
             graphs = root / 'navgraphs'
             graphs.mkdir()
             _write_navigation_batch(
@@ -418,11 +421,17 @@ class PortSourceTests(unittest.TestCase):
                 _valid_navigation_graph)
             package.write_bytes(b'mod')
             checksum.write_text('checksum\n', encoding='ascii')
+            native_bridge.write_bytes(b'native bridge')
+            worker_starter.write_bytes(b'worker starter')
+            server_executable.write_bytes(b'LAN server')
             overlay, archive = packager._write_client_overlay(
                 str(root), str(package), str(checksum), 'a' * 64,
                 str(graphs),
                 str(PORT_ROOT / 'foliage'),
-                str(PORT_ROOT / 'destructibles'))
+                str(PORT_ROOT / 'destructibles'),
+                native_bridge_source=str(native_bridge),
+                worker_starter_source=str(worker_starter),
+                server_executable_source=str(server_executable))
 
             config_path = (Path(overlay) / 'mods' / 'configs' /
                            'offline_lan_0922' / 'config.json')
@@ -437,8 +446,70 @@ class PortSourceTests(unittest.TestCase):
                              'manifest.json').is_file())
             self.assertTrue((config_path.parent / 'destructibles' /
                              'manifest.json').is_file())
-            self.assertTrue(
-                (Path(overlay) / 'START_OFFLINE_0922.bat').is_file())
+            packaged_bridge = (
+                Path(overlay) / 'mods' / '0.9.22.0.1' /
+                packager.NATIVE_BRIDGE_FILENAME)
+            self.assertEqual(b'native bridge', packaged_bridge.read_bytes())
+            packed_xml = _load_tool('packed_xml')
+            for filename, preferences_leaf in packager.PREFERENCES_CONFIGS:
+                packaged_config = (
+                    Path(overlay) / 'res_mods' / '0.9.22.0.1' / filename)
+                self.assertTrue(packaged_config.is_file())
+                config_root = packed_xml.read_packed_xml(
+                    packaged_config.read_bytes())
+                preferences = [
+                    value for name, value in config_root.children
+                    if name == b'preferences'
+                ]
+                self.assertEqual(1, len(preferences))
+                self.assertEqual(
+                    preferences_leaf.encode('ascii'), preferences[0].value)
+            player_batch = Path(overlay) / 'START_OFFLINE_0922.bat'
+            self.assertTrue(player_batch.is_file())
+            player_text = player_batch.read_text(encoding='utf-8')
+            self.assertIn('offline_worker_starter.exe', player_text)
+            self.assertEqual(
+                1, player_text.count(
+                    'start "" "%GAME_ROOT%offline_worker_starter.exe"'))
+            lan_client_batch = Path(overlay) / 'START_LAN_CLIENT_0922.bat'
+            self.assertTrue(lan_client_batch.is_file())
+            self.assertIn(
+                'offline_worker_starter.exe" --player',
+                lan_client_batch.read_text(encoding='utf-8'))
+            self.assertNotIn('powershell.exe', player_text.lower())
+            self.assertNotIn('set "APPDATA=', player_text)
+            worker_batch = (
+                Path(overlay) / 'START_SIMULATION_WORKER_0922.bat')
+            self.assertTrue(worker_batch.is_file())
+            packaged_starter = (
+                Path(overlay) / packager.WORKER_STARTER_FILENAME)
+            self.assertEqual(
+                b'worker starter', packaged_starter.read_bytes())
+            self.assertEqual(
+                b'LAN server',
+                (Path(overlay) / packager.SERVER_FILENAME).read_bytes())
+            worker_text = worker_batch.read_text(encoding='utf-8')
+            self.assertIn(
+                'OFFLINE_LAN_0922_CLIENT_MODE=simulation_worker',
+                worker_text)
+            self.assertIn(
+                'OFFLINE_LAN_0922_ALLOW_MULTIPLE_CLIENTS=1',
+                worker_text)
+            self.assertNotIn('set "APPDATA=', worker_text)
+            self.assertNotIn('set "LOCALAPPDATA=', worker_text)
+            self.assertIn('offline_worker_starter.exe', worker_text)
+            self.assertIn('--worker-only', worker_text)
+            self.assertNotIn('powershell.exe', worker_text.lower())
+            self.assertNotIn('WorldOfTanks.offline-worker.exe', worker_text)
+            self.assertNotIn('prepare_worker_client.ps1', worker_text)
+            self.assertNotIn('.offline-simulation-worker-copy', worker_text)
+            self.assertNotIn('choice /C YN', worker_text)
+            self.assertFalse(
+                (Path(overlay) /
+                 'RESTORE_SIMULATION_WORKER_0922.bat').exists())
+            self.assertFalse(
+                (Path(overlay) / 'tools' /
+                 'prepare_worker_client.ps1').exists())
             self.assertTrue(
                 (Path(overlay) / 'tools' /
                  'AUTHORITY_WORKER_PROBE.md').is_file())
@@ -545,6 +616,49 @@ class PortSourceTests(unittest.TestCase):
         self.assertEqual(batch.schema.MANIFEST_FORMAT, manifest['format'])
 
 class PortConfigTests(unittest.TestCase):
+    def test_windows_user_state_lives_outside_the_mods_directory(self):
+        config_module = _load_port_source('config')
+        appdata = r'C:\Users\Player\AppData\Roaming'
+
+        path = config_module._default_user_data_dir({'APPDATA': appdata})
+
+        self.assertEqual(
+            os.path.join(appdata, 'Wargaming.net', 'WorldOfTanks',
+                         'offline_lan_0922'), path)
+        self.assertNotIn(os.path.join('mods', 'configs'), path)
+
+    def test_legacy_user_state_is_copied_without_deleting_the_old_file(self):
+        config_module = _load_port_source('config')
+        with tempfile.TemporaryDirectory() as directory:
+            legacy = Path(directory) / 'mods' / 'configs' / 'state.json'
+            target = Path(directory) / 'appdata' / 'state.json'
+            legacy.parent.mkdir(parents=True)
+            payload = b'{"schema": 1, "saved": true}\n'
+            legacy.write_bytes(payload)
+
+            resolved = config_module.migrate_legacy_user_file(
+                str(target), str(legacy))
+
+            self.assertEqual(str(target), resolved)
+            self.assertEqual(payload, target.read_bytes())
+            self.assertEqual(payload, legacy.read_bytes())
+            self.assertFalse(Path(str(target) + '.migrate.tmp').exists())
+
+    def test_failed_user_state_migration_keeps_using_the_legacy_file(self):
+        config_module = _load_port_source('config')
+        with tempfile.TemporaryDirectory() as directory:
+            legacy = Path(directory) / 'legacy.json'
+            blocked_parent = Path(directory) / 'not-a-directory'
+            target = blocked_parent / 'state.json'
+            legacy.write_text('{"schema": 1}\n', encoding='utf-8')
+            blocked_parent.write_text('blocked', encoding='utf-8')
+
+            resolved = config_module.migrate_legacy_user_file(
+                str(target), str(legacy))
+
+            self.assertEqual(str(legacy), resolved)
+            self.assertTrue(legacy.is_file())
+
     def test_writes_default_and_reads_override(self):
         config_module = _load_port_source('config')
         with tempfile.TemporaryDirectory() as directory:
@@ -589,6 +703,40 @@ class PortConfigTests(unittest.TestCase):
             self.assertEqual('lan-host.local', config['host'])
             self.assertEqual(30000, config['port'])
             self.assertEqual(20.0, config['prebattleCountdownSeconds'])
+
+    def test_process_endpoint_override_does_not_replace_saved_lan_room(self):
+        config_module = _load_port_source('config')
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            endpoint_path = Path(directory) / 'server_endpoint.json'
+            config_path.write_text(
+                '{"host": "127.0.0.1", "port": 28782}',
+                encoding='utf-8')
+            endpoint_path.write_text(
+                '{"schema": 1, "host": "lan-host.local", "port": 30000}',
+                encoding='utf-8')
+
+            config = config_module.load(
+                str(config_path), str(endpoint_path), {
+                    config_module.SERVER_HOST_ENV: '127.0.0.1',
+                    config_module.SERVER_PORT_ENV: '28782',
+                })
+
+            self.assertEqual('127.0.0.1', config['host'])
+            self.assertEqual(28782, config['port'])
+            self.assertEqual(
+                {'schema': 1, 'host': 'lan-host.local', 'port': 30000},
+                json.loads(endpoint_path.read_text(encoding='utf-8')))
+
+    def test_invalid_process_endpoint_override_is_rejected(self):
+        config_module = _load_port_source('config')
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = str(Path(directory) / 'config.json')
+
+            with self.assertRaises(ValueError):
+                config_module.load(config_path, environ={
+                    config_module.SERVER_HOST_ENV: 'bad host',
+                })
 
     def test_invalid_json_is_quarantined_and_replaced_with_defaults(self):
         config_module = _load_port_source('config')
@@ -776,6 +924,9 @@ class _BigWorld(object):
     def cancelCallback(self, callback_id):
         self._callbacks = [item for item in self._callbacks
                            if item[0] != callback_id]
+
+    def quit(self):
+        self.operations.append(('quit',))
 
     def run_next(self):
         callback_id, delay, function = self._callbacks.pop(0)
@@ -2675,6 +2826,34 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertTrue(vehicle.isCrewActive)
         compatibility.fini()
 
+    def test_postmortem_callback_sees_the_selected_observed_vehicle(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle()
+        avatar = runtime.avatar_module.PlayerAvatar()
+        observed = runtime.vehicle_module.Vehicle()
+        runtime.bigworld.entities[92] = observed
+        runtime.bigworld.entity = runtime.bigworld.entities.get
+        runtime.bigworld._player = avatar
+
+        self.assertEqual(0, compatibility.set_postmortem_vehicle(92))
+        self.assertIs(observed, avatar.vehicle)
+        self.assertEqual(92, compatibility.set_postmortem_vehicle(0))
+        with self.assertRaises(AttributeError):
+            unused_vehicle = avatar.vehicle
+
+        compatibility.fini()
+
+    def test_postmortem_attachment_can_clear_before_battle_activation(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility._postmortem_vehicle_id = 92
+
+        self.assertEqual(92, compatibility.clear_postmortem_vehicle())
+        self.assertEqual(0, compatibility._postmortem_vehicle_id)
+
     def test_offline_vehicle_pose_overlay_preserves_native_entity_transform(self):
         compatibility_module = _load_port_source('compat')
         runtime, unused_operations = self._runtime()
@@ -4452,6 +4631,26 @@ class LANClientTests(unittest.TestCase):
         client._send.assert_called_once_with({
             'type': 'bot_state', 'round_id': 3, 'bots': bots})
 
+    def test_bot_ram_send_preserves_human_contact_receipt_identity(self):
+        unused_module, client, unused_events, unused_bigworld = self._client()
+        client.ready = True
+        client.phase = 'battle'
+        client.player_id = 1
+        client.bot_authority_id = 1
+        client.round_id = 3
+        client._send = mock.Mock(return_value=True)
+
+        self.assertTrue(client.send_bot_ram(
+            11, 'human', 2, 4, 20, 40, 2, 9))
+
+        client._send.assert_called_once_with({
+            'type': 'bot_ram_report', 'round_id': 3,
+            'bot_id': 11, 'target_kind': 'human', 'target_id': 2,
+            'ram_seq': 4, 'damage_to_bot': 20,
+            'damage_to_target': 40,
+            'ram_contact_player_id': 2, 'ram_contact_seq': 9,
+        })
+
     def test_welcome_roster_and_server_validated_start_request(self):
         module, client, events, _ = self._client()
         self._activate_outbound(client)
@@ -4815,6 +5014,74 @@ class LANClientTests(unittest.TestCase):
         self.assertFalse(client.running)
         self.assertEqual('invalid snapshot message', client.last_error)
 
+    def test_snapshot_bot_pose_timing_is_atomic_and_monotonic(self):
+        _, client, _, _ = self._client()
+        client.running = True
+        client.round_id = 3
+        client._handle_message({
+            'type': 'snapshot', 'protocol': 5,
+            'round_id': 3, 'server_tick': 4,
+            'bot_state_revision': 5,
+            'motion_time_us': 120000, 'bot_state_time_us': 90000,
+            'players': [], 'bots': []})
+        self.assertTrue(client.running)
+
+        client._handle_message({
+            'type': 'snapshot', 'protocol': 5,
+            'round_id': 3, 'server_tick': 5,
+            'bot_state_revision': 5,
+            'motion_time_us': 150000, 'bot_state_time_us': 100000,
+            'players': [], 'bots': []})
+        self.assertFalse(client.running)
+        self.assertEqual('invalid snapshot message', client.last_error)
+
+        _, client, _, _ = self._client()
+        client.running = True
+        client.round_id = 3
+        client._handle_message({
+            'type': 'snapshot', 'protocol': 5,
+            'round_id': 3, 'server_tick': 4,
+            'bot_state_revision': 5,
+            'motion_time_us': 120000, 'bot_state_time_us': 90000,
+            'players': [], 'bots': []})
+        client._handle_message({
+            'type': 'snapshot', 'protocol': 5,
+            'round_id': 3, 'server_tick': 5,
+            'bot_state_revision': 6,
+            'players': [], 'bots': []})
+        self.assertFalse(client.running)
+        self.assertEqual('invalid snapshot message', client.last_error)
+
+        _, client, _, _ = self._client()
+        client.running = True
+        client.round_id = 3
+        client._handle_message({
+            'type': 'snapshot', 'protocol': 5,
+            'round_id': 3, 'server_tick': 4,
+            'bot_state_revision': 5,
+            'motion_time_us': 120000, 'bot_state_time_us': 90000,
+            'players': [], 'bots': []})
+        client._handle_message({
+            'type': 'snapshot', 'protocol': 5,
+            'round_id': 3, 'server_tick': 5,
+            'bot_state_revision': 6,
+            'motion_time_us': 150000, 'bot_state_time_us': 90000,
+            'players': [], 'bots': []})
+        self.assertFalse(client.running)
+        self.assertEqual('invalid snapshot message', client.last_error)
+
+        _, client, _, _ = self._client()
+        client.running = True
+        client.round_id = 3
+        client._handle_message({
+            'type': 'snapshot', 'protocol': 5,
+            'round_id': 3, 'server_tick': 4,
+            'bot_state_revision': 5,
+            'motion_time_us': 120000,
+            'players': [], 'bots': []})
+        self.assertFalse(client.running)
+        self.assertEqual('invalid snapshot message', client.last_error)
+
     def test_state_message_without_protocol_fails_closed(self):
         _, client, _, _ = self._client()
         client.running = True
@@ -4884,6 +5151,10 @@ class BootstrapContractTests(unittest.TestCase):
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []
         config = types.ModuleType('gui.mods.offline_lan_0922.config')
+        config.PLAYER_MODE = 'player'
+        config.SIMULATION_WORKER_MODE = 'simulation_worker'
+        config.CLIENT_MODE_ENV = 'OFFLINE_LAN_0922_CLIENT_MODE'
+        config.client_mode = mock.Mock(return_value=config.PLAYER_MODE)
         config.load = mock.Mock(return_value={
             'enabled': True,
             'vehicle': 'ussr:R11_MS-1',
@@ -4897,6 +5168,9 @@ class BootstrapContractTests(unittest.TestCase):
             'gui.mods.offline_lan_0922.vehicle_blacklist')
         vehicle_blacklist.is_unusable = mock.Mock(return_value=False)
         vehicle_blacklist.missing_resources = mock.Mock(return_value=())
+        instance_guard = types.ModuleType(
+            'gui.mods.offline_lan_0922.instance_guard')
+        instance_guard.release_if_requested = mock.Mock(return_value=False)
         session = types.SimpleNamespace(
             install=mock.Mock(return_value=True), stop=mock.Mock())
         lan_session = types.ModuleType(
@@ -4963,10 +5237,18 @@ class BootstrapContractTests(unittest.TestCase):
         current_vehicle_module = types.ModuleType('CurrentVehicle')
         current_vehicle_module.g_currentVehicle = current_vehicle
         announcement_ui = mock.Mock()
+        intro_skip = mock.Mock()
         lobby_ui_module = types.ModuleType(
             'gui.mods.offline_lan_0922.lobby_ui')
         lobby_ui_module.ServerAnnouncementUI = mock.Mock(
             return_value=announcement_ui)
+        lobby_ui_module.IntroVideoSkip = mock.Mock(return_value=intro_skip)
+        worker_presentation = mock.Mock()
+        worker_presentation.activate.return_value = True
+        worker_presentation_module = types.ModuleType(
+            'gui.mods.offline_lan_0922.worker_presentation')
+        worker_presentation_module.WorkerPresentation = mock.Mock(
+            return_value=worker_presentation)
         modules = {
             'BigWorld': bigworld,
             'gui': types.ModuleType('gui'),
@@ -4977,17 +5259,21 @@ class BootstrapContractTests(unittest.TestCase):
             'gui.mods.offline_lan_0922': package,
             'gui.mods.offline_lan_0922.compat': compatibility_module,
             'gui.mods.offline_lan_0922.config': config,
+            'gui.mods.offline_lan_0922.instance_guard': instance_guard,
             'gui.mods.offline_lan_0922.vehicle_blacklist': vehicle_blacklist,
             'gui.mods.offline_lan_0922.account_rpc.state': state_module,
             'gui.mods.offline_lan_0922.account_rpc.postbattle_store':
                 postbattle_module,
             'gui.mods.offline_lan_0922.lan_session': lan_session,
             'gui.mods.offline_lan_0922.lobby_ui': lobby_ui_module,
+            'gui.mods.offline_lan_0922.worker_presentation':
+                worker_presentation_module,
             'gui.app_loader': app_loader,
             'gui.app_loader.settings': app_loader_settings,
             'CurrentVehicle': current_vehicle_module,
         }
         package.config = config
+        package.instance_guard = instance_guard
         with mock.patch.dict(sys.modules, modules):
             spec = importlib.util.spec_from_file_location(
                 'bootstrap0922', bootstrap_path)
@@ -4995,8 +5281,10 @@ class BootstrapContractTests(unittest.TestCase):
             spec.loader.exec_module(module)
             module._selected_vehicle = lambda value: {
                 'id': 1, 'compDescr': 12345}
+            module._signal_worker_ready = mock.Mock(return_value=True)
             module.init()
             module.init()
+            instance_guard.release_if_requested.assert_called_once_with()
             self.assertEqual(
                 [module._on_lobby_view_loaded],
                 event_bus.listeners[lobby_loaded])
@@ -5093,6 +5381,51 @@ class BootstrapContractTests(unittest.TestCase):
             module.fini()
             self.assertFalse(module._started)
             self.assertEqual([], bigworld._callbacks)
+
+            # A process explicitly launched as the simulation worker must not
+            # schedule any bootstrap work unless the owner-thread release was
+            # proven successful.
+            with mock.patch.dict(os.environ, {
+                    config.CLIENT_MODE_ENV: config.SIMULATION_WORKER_MODE}):
+                module.init()
+            self.assertFalse(module._started)
+            # Even a worker rejected before callbacks must bypass #1513's
+            # compulsory first-run movie on its fresh preferences leaf.
+            self.assertEqual(4, intro_skip.install.call_count)
+            self.assertEqual(('quit',), bigworld.operations[-1])
+            self.assertEqual([], bigworld._callbacks)
+            self.assertEqual([], event_bus.listeners[lobby_loaded])
+
+            # A proven worker release activates presentation isolation before
+            # any deferred Account or lobby work is allowed to run.
+            instance_guard.release_if_requested.return_value = True
+            with mock.patch.dict(os.environ, {
+                    config.CLIENT_MODE_ENV: config.SIMULATION_WORKER_MODE}):
+                module.init()
+            worker_presentation.activate.assert_called_once_with()
+            # Presentation and guard release are not enough: the starter is
+            # released only after native Hangar readiness and a LAN welcome.
+            module._signal_worker_ready.assert_not_called()
+            self.assertEqual(1, len(bigworld._callbacks))
+            module.fini()
+            worker_presentation.deactivate.assert_called_once_with(
+                restore=False)
+
+            # Presentation isolation failures terminate the worker without
+            # restoring sound or exposing a login window.
+            worker_presentation.reset_mock()
+            worker_presentation.activate.side_effect = RuntimeError(
+                'window isolation failed')
+            with mock.patch.dict(os.environ, {
+                    config.CLIENT_MODE_ENV: config.SIMULATION_WORKER_MODE}):
+                module.init()
+            self.assertFalse(module._started)
+            self.assertIsNone(module._worker_presentation)
+            worker_presentation.deactivate.assert_called_once_with(
+                restore=False)
+            module._signal_worker_ready.assert_not_called()
+            self.assertEqual(('quit',), bigworld.operations[-1])
+            self.assertEqual([], bigworld._callbacks)
         expected_session = mock.call(
             config.load.return_value,
             lobby_ready=module._native_lobby_is_ready,
@@ -5105,6 +5438,8 @@ class BootstrapContractTests(unittest.TestCase):
         self.assertEqual(2, session.install.call_count)
         self.assertEqual(2, announcement_ui.install.call_count)
         self.assertEqual(2, announcement_ui.uninstall.call_count)
+        self.assertEqual(5, intro_skip.install.call_count)
+        self.assertEqual(5, intro_skip.uninstall.call_count)
         self.assertEqual(
             [mock.call(show_login=False, restore_account=False,
                        release_join=True),
@@ -5120,7 +5455,7 @@ class BootstrapContractTests(unittest.TestCase):
         self.assertEqual([expected_connect, expected_connect],
                          compatibility.connect.call_args_list)
         self.assertEqual(2, state_module.AccountState.call_count)
-        self.assertEqual(3, compatibility.fini.call_count)
+        self.assertEqual(5, compatibility.fini.call_count)
         self.assertEqual([], event_bus.listeners[lobby_loaded])
 
 

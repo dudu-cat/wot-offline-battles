@@ -21,6 +21,13 @@ import navigation_graph_schema as _navigation_schema
 
 MOD_ID = 'org.peng.offline_lan_0922'
 MOD_VERSION = '0.5.0'
+NATIVE_BRIDGE_FILENAME = 'offline_instance_guard_native.pyd'
+WORKER_STARTER_FILENAME = 'offline_worker_starter.exe'
+SERVER_FILENAME = 'WoT-0.9.22-LAN-Server.exe'
+PREFERENCES_CONFIGS = (
+    ('engine_config.offline-player.xml', 'playerprefs.xml'),
+    ('engine_config.offline-worker.xml', 'workerprefs.xml'),
+)
 PYTHON_MAGIC = '\x03\xf3\r\n'
 FOLIAGE_FORMAT = 'offline-lan-0922-foliage'
 FOLIAGE_VERSION = 1
@@ -120,12 +127,61 @@ def _release_config():
     }
 
 
+def _preferences_config_payloads(source_root):
+    stock_leaf = b'preferences.xml'
+    baseline = None
+    payloads = []
+    for filename, preferences_leaf in PREFERENCES_CONFIGS:
+        encoded_leaf = preferences_leaf.encode('ascii')
+        source = os.path.join(source_root, filename)
+        if not os.path.isfile(source):
+            raise SystemExit(
+                'isolated preferences config is missing: %s' % source)
+        with open(source, 'rb') as stream:
+            payload = stream.read()
+        if (not payload.startswith(b'\x45\x4e\xa1\x62') or
+                payload.count(encoded_leaf) != 1 or
+                stock_leaf in payload or
+                len(encoded_leaf) != len(stock_leaf)):
+            raise SystemExit(
+                'isolated preferences config is invalid: %s' % source)
+        restored = payload.replace(encoded_leaf, stock_leaf, 1)
+        if baseline is None:
+            baseline = restored
+        elif restored != baseline:
+            raise SystemExit(
+                'isolated preferences configs do not share one stock base')
+        payloads.append((filename, payload))
+    return payloads
+
+
 def _write_client_overlay(dist_root, package_path, checksum_path, digest,
                           graph_source=None, foliage_source=None,
-                          destructible_source=None, occluder_source=None):
+                          destructible_source=None, occluder_source=None,
+                          native_bridge_source=None,
+                          worker_starter_source=None,
+                          server_executable_source=None):
     release_config = _release_config()
-    release_seed = '%s\n%s:%s' % (
-        digest, release_config['host'], release_config['port'])
+    native_bridge_source = native_bridge_source or os.path.join(
+        os.path.dirname(__file__), 'native', NATIVE_BRIDGE_FILENAME)
+    worker_starter_source = worker_starter_source or os.path.join(
+        os.path.dirname(__file__), 'native', WORKER_STARTER_FILENAME)
+    server_executable_source = server_executable_source or os.path.join(
+        os.path.dirname(__file__), 'dist', 'server', SERVER_FILENAME)
+    native_payloads = (
+        ('native instance guard bridge', native_bridge_source),
+        ('simulation worker starter', worker_starter_source),
+        ('Windows LAN server', server_executable_source),
+    )
+    native_digests = []
+    for description, source in native_payloads:
+        if not os.path.isfile(source):
+            raise SystemExit('%s is missing: %s' % (description, source))
+        with open(source, 'rb') as stream:
+            native_digests.append(hashlib.sha256(stream.read()).hexdigest())
+    release_seed = '%s\n%s:%s\n%s' % (
+        digest, release_config['host'], release_config['port'],
+        '\n'.join(native_digests))
     release_digest = hashlib.sha256(release_seed.encode('utf-8')).hexdigest()
     release_name = 'WoT-0.9.22-LAN-Client-%s' % release_digest[:7]
     overlay_root = os.path.join(dist_root, release_name)
@@ -134,6 +190,19 @@ def _write_client_overlay(dist_root, package_path, checksum_path, digest,
     os.makedirs(mod_root)
     shutil.copy2(package_path, mod_root)
     shutil.copy2(checksum_path, mod_root)
+    # Windows cannot load a native extension directly from a wotmod ZIP.
+    # Keep the exact-build bridge beside the package for imp.load_dynamic.
+    shutil.copy2(native_bridge_source, mod_root)
+    preferences_source = os.path.join(
+        os.path.dirname(__file__), 'client_overlay', 'res_mods',
+        '0.9.22.0.1')
+    preferences_root = os.path.join(
+        overlay_root, 'res_mods', '0.9.22.0.1')
+    os.makedirs(preferences_root)
+    for filename, payload in _preferences_config_payloads(
+            preferences_source):
+        with open(os.path.join(preferences_root, filename), 'wb') as stream:
+            stream.write(payload)
     config_root = os.path.join(
         overlay_root, 'mods', 'configs', 'offline_lan_0922')
     os.makedirs(config_root)
@@ -164,6 +233,16 @@ def _write_client_overlay(dist_root, package_path, checksum_path, digest,
     shutil.copy2(
         os.path.join(os.path.dirname(__file__), 'START_OFFLINE_0922.bat'),
         overlay_root)
+    shutil.copy2(
+        os.path.join(os.path.dirname(__file__), 'START_LAN_CLIENT_0922.bat'),
+        overlay_root)
+    shutil.copy2(
+        os.path.join(
+            os.path.dirname(__file__),
+            'START_SIMULATION_WORKER_0922.bat'),
+        overlay_root)
+    shutil.copy2(worker_starter_source, overlay_root)
+    shutil.copy2(server_executable_source, overlay_root)
     tools_root = os.path.join(overlay_root, 'tools')
     os.makedirs(tools_root)
     for filename in (
@@ -547,8 +626,10 @@ def _remove_stale_outputs(dist_root):
         is_old_overlay = filename == 'client-overlay'
         is_old_zip = filename.startswith(
             'WoT-0.9.22.0.1-Offline-LAN-Vertical-Slice-')
+        is_native_bridge = filename == NATIVE_BRIDGE_FILENAME
         output_path = os.path.join(dist_root, filename)
-        if is_mod or is_client_release or is_old_overlay or is_old_zip:
+        if (is_mod or is_client_release or is_old_overlay or is_old_zip or
+                is_native_bridge):
             if os.path.isdir(output_path):
                 shutil.rmtree(output_path)
             else:
@@ -606,8 +687,18 @@ def build():
         checksum_path = destination + '.sha256'
         with open(checksum_path, 'wb') as stream:
             stream.write(('%s  %s\n' % (digest, filename)).encode('ascii'))
+        native_bridge_source = os.path.join(
+            port_root, 'native', NATIVE_BRIDGE_FILENAME)
+        if not os.path.isfile(native_bridge_source):
+            raise SystemExit(
+                'native instance guard bridge is missing: %s' %
+                native_bridge_source)
+        native_bridge_path = os.path.join(
+            dist_root, NATIVE_BRIDGE_FILENAME)
+        shutil.copy2(native_bridge_source, native_bridge_path)
         overlay_root, overlay_zip = _write_client_overlay(
-            dist_root, destination, checksum_path, digest)
+            dist_root, destination, checksum_path, digest,
+            native_bridge_source=native_bridge_path)
         print(destination)
         print('sha256=%s' % digest)
         print(overlay_root)

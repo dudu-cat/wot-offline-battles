@@ -182,9 +182,10 @@ class FjordDepartureTests(unittest.TestCase):
                 runtime.adapter.driver.drive = drive
                 original_traffic = runtime._traffic_throttle
 
-                def traffic_throttle(source, command, neighbours):
+                def traffic_throttle(
+                        source, command, neighbours, physics_params=None):
                     throttle, waiting = original_traffic(
-                        source, command, neighbours)
+                        source, command, neighbours, physics_params)
                     monitor.record(
                         'traffic', int(source['id']), waiting, now[0])
                     return throttle, waiting

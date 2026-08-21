@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   test:
+    needs: windows-server
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -46,6 +47,10 @@ jobs:
           python 0.8.2/tools/package_native_experiment.py
           --output-dir "$RUNNER_TEMP/wot-082"
           --version 1.8.60
+      - uses: actions/download-artifact@v4
+        with:
+          name: wot-0.9.22-lan-server-windows
+          path: 0.9.22/dist
       - name: Build Python 2.7 0.9.22 LAN client
         run: >-
           docker run --rm --platform linux/amd64 -v "$PWD:/work"

@@ -1021,8 +1021,8 @@ class LANSession(object):
             return True
         if not port_config.save_endpoint(host, port):
             self._status_notifier(
-                'Could not save the LAN server address. Check that the game '
-                'folder is writable.')
+                'Could not save the LAN server address. Check that the user '
+                'data directory is writable.')
             return False
         self._config['host'] = host
         self._config['port'] = port

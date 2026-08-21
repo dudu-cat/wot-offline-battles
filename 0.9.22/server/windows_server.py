@@ -11,10 +11,12 @@ import sys
 import traceback
 
 SERVER_HOST = "0.0.0.0"
+SERVER_LOOPBACK_HOST = "127.0.0.1"
 SERVER_PORT = 28782
 SERVER_MAX_PLAYERS = 30
 SERVER_TEAM_SIZE = 15
 SERVER_TEAM_SIZE_ENV = "WOT_0922_TEAM_SIZE"
+SERVER_LOOPBACK_ONLY_ENV = "WOT_0922_LOOPBACK_ONLY"
 WINDOWS_FIREWALL_RULE_PREFIX = "WoT 0.9.22 LAN Server"
 # Get-NetFirewallRule can take many seconds on a busy machine.
 FIREWALL_QUERY_TIMEOUT_SECONDS = 60.0
@@ -172,17 +174,28 @@ def _team_size_from_environment(environment=None):
     return team_size
 
 
+def _loopback_only_from_environment(environment=None):
+    environment = os.environ if environment is None else environment
+    return environment.get(SERVER_LOOPBACK_ONLY_ENV) == "1"
+
+
 def main():
+    loopback_only = _loopback_only_from_environment()
+    server_host = SERVER_LOOPBACK_HOST if loopback_only else SERVER_HOST
     print("WoT 0.9.22 Offline LAN Server")
-    print("Listening on all network interfaces, port %d." % SERVER_PORT)
-    print("Use 127.0.0.1 in the client on this PC, or this PC's LAN IP on another PC.")
+    if loopback_only:
+        print("Listening on 127.0.0.1, port %d." % SERVER_PORT)
+    else:
+        print("Listening on all network interfaces, port %d." % SERVER_PORT)
+        print("Use 127.0.0.1 in the client on this PC, or this PC's LAN IP on another PC.")
     print("Press Ctrl+C to stop the server.\n")
     try:
         default_map, run_server = _load_server()
         team_size = _team_size_from_environment()
-        _ensure_windows_firewall_rule(SERVER_PORT)
+        if not loopback_only:
+            _ensure_windows_firewall_rule(SERVER_PORT)
         run_server(
-            SERVER_HOST,
+            server_host,
             SERVER_PORT,
             default_map,
             SERVER_MAX_PLAYERS,

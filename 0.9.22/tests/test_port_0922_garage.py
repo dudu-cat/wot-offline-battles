@@ -789,6 +789,68 @@ class GaragePersistenceTests(unittest.TestCase):
         self.assertEqual({10010: 38, 10011: 9},
                          restored['inventoryItems'][10])
 
+    def test_an_alternate_gun_and_its_shells_survive_a_restart(self):
+        state = self._state()
+        state.install_component(9, 4444)
+        store = self._store()
+        store.mark_dirty()
+        self.assertTrue(store.flush(state.snapshot()))
+
+        # bootstrap publishes every mountable gun's ammunition in this
+        # account-level whitelist even though only the mounted gun is loaded
+        # on the per-vehicle row.
+        fresh = copy.deepcopy(SNAPSHOT)
+        fresh['inventoryItems'][10].update({20010: 30, 20011: 15})
+        fresh['shopItemPrices'].update({
+            20010: {'credits': 0, 'gold': 0},
+            20011: {'credits': 0, 'gold': 0},
+        })
+
+        self.assertTrue(self._store().apply(fresh))
+        restored = fresh['vehicles'][0]
+        self.assertEqual((7001, 4444),
+                         tuple(restored['shellsLayoutIdx']))
+        self.assertEqual([20010, 30, 20011, 15], restored['shells'])
+        self.assertEqual({20010: 30, 20011: 15},
+                         restored['inventoryItems'][10])
+        self.assertEqual(30, fresh['inventoryItems'][10][20010])
+        self.assertEqual(15, fresh['inventoryItems'][10][20011])
+        _load('data')._validate_selected_vehicle(fresh)
+
+    def test_a_saved_shell_outside_the_current_catalogue_falls_back_atomically(self):
+        state = self._state()
+        state.install_component(9, 4444)
+        store = self._store()
+        store.mark_dirty()
+        self.assertTrue(store.flush(state.snapshot()))
+
+        fresh = copy.deepcopy(SNAPSHOT)
+        before = copy.deepcopy(fresh)
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            self.assertFalse(self._store().apply(fresh))
+
+        self.assertIn('inconsistent', log.getvalue())
+        self.assertEqual(before, fresh)
+
+    def test_a_native_validation_failure_falls_back_atomically(self):
+        state = self._state()
+        state.equip_equipments(9, [11001, 0, 0])
+        store = self._store()
+        store.mark_dirty()
+        self.assertTrue(store.flush(state.snapshot()))
+
+        fresh = copy.deepcopy(SNAPSHOT)
+        before = copy.deepcopy(fresh)
+
+        def reject(unused_snapshot):
+            raise ValueError('native descriptor rejected')
+
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            self.assertFalse(self._store().apply(fresh, validator=reject))
+
+        self.assertIn('native descriptor rejected', log.getvalue())
+        self.assertEqual(before, fresh)
+
     def test_a_mounted_optional_device_survives_a_restart(self):
         state = self._state()
         state.equip_optional_device(9, 9001, 0)

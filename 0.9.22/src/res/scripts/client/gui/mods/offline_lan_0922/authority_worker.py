@@ -1,0 +1,989 @@
+from __future__ import print_function
+
+"""Dedicated #1513 client lifecycle for native bot simulation authority.
+
+The worker is not a player.  It keeps one private, off-map Avatar only because
+the exact client exposes terrain, model nodes and hit testers through a loaded
+native battle space.  That synthetic identity is projected into this process'
+BattleRuntime messages and is never sent to the LAN server.
+"""
+
+import os
+import sys
+import time
+
+from gui.mods.offline_lan_0922 import config as port_config
+from gui.mods.offline_lan_0922.lan_client import (
+    CLIENT_BUILD, CLIENT_CAPABILITIES, MAX_PROJECTILE_ID, PROTOCOL_VERSION,
+    PROJECTILE_LEDGER_CAPABILITY, SIMULATION_WORKER_CAPABILITY,
+    WORKER_AUTHORITY_ID, LANClient, _BOT_STATE_WIRE_FIELDS,
+    _canonical_wire_outfits, _exact_int, _projectile_int_range, _safe_text,
+    _strict_capabilities, _strict_mapping_list)
+
+
+WORKER_ROLE = 'simulation_worker'
+WORKER_STATUS_PATH = os.path.join(
+    os.path.dirname(port_config.CONFIG_PATH), 'authority_worker_status.json')
+WORKER_MONITOR_SECONDS = 0.10
+WORKER_RETRY_SECONDS = 1.0
+WORKER_PROGRESS_SECONDS = 1.0
+WORKER_STATUS_SECONDS = 2.0
+WORKER_DUMMY_Y = -500.0
+_PROJECTED_BOT_STATE_FIELDS = frozenset(
+    _BOT_STATE_WIRE_FIELDS + ('shot_yaw', 'shot_pitch'))
+
+
+def _trusted_projected_bot_states(bots):
+    """Verify the shallow shape produced by BotRuntime's wire projector."""
+    if not isinstance(bots, (list, tuple)) or len(bots) > 30:
+        return False
+    ammo_fields = frozenset((
+        'shell_index', 'next_shell_index', 'ammo_remaining',
+        'ammo_reload_pending'))
+    for state in bots:
+        if not isinstance(state, dict):
+            return False
+        fields = set(state)
+        if not fields.issubset(_PROJECTED_BOT_STATE_FIELDS):
+            return False
+        if (('shot_yaw' in fields) != ('shot_pitch' in fields)):
+            return False
+        present_ammo = fields.intersection(ammo_fields)
+        if present_ammo and present_ammo != ammo_fields:
+            return False
+        if (present_ammo and
+                not isinstance(state.get('ammo_reload_pending'), bool)):
+            return False
+    return True
+
+
+def _authority_id(value):
+    parsed = _exact_int(value)
+    if parsed in (None, WORKER_AUTHORITY_ID):
+        return parsed
+    return _projectile_int_range(parsed, 1, MAX_PROJECTILE_ID)
+
+
+def _load_battle_runtime():
+    from gui.mods.offline_lan_0922.battle_runtime import BattleRuntime
+    return BattleRuntime
+
+
+class AuthorityWorkerLANClient(LANClient):
+    """LAN v5 transport whose identity never enters ``players``."""
+
+    def __init__(self, host, port, on_event=None, bigworld=None):
+        LANClient.__init__(
+            self, host, port, 'SimulationWorker', 'ussr:R11_MS-1',
+            max_health=1, on_event=on_event, bigworld=bigworld,
+            account_key='simulation-worker', outfits={})
+        self.player_id = WORKER_AUTHORITY_ID
+        self.worker_id = WORKER_AUTHORITY_ID
+        self.role = WORKER_ROLE
+        self.team = 1
+        self.slot = 0
+        self.spawn = {
+            'x': 0.0, 'y': WORKER_DUMMY_Y, 'z': 0.0, 'yaw': 0.0}
+        self._worker_avatar = None
+
+    def _hello_payload(self):
+        """Advertise only a worker role; no dummy player data crosses wire."""
+        return {
+            'type': 'hello',
+            'protocol': PROTOCOL_VERSION,
+            'client_build': CLIENT_BUILD,
+            'capabilities': list(CLIENT_CAPABILITIES) + [
+                SIMULATION_WORKER_CAPABILITY],
+            'role': WORKER_ROLE,
+        }
+
+    def send_projected_bot_state(self, bots):
+        """Queue BotRuntime's canonical publication as one frozen wire blob."""
+        if (not self.is_bot_authority() or
+                not _trusted_projected_bot_states(bots)):
+            return False
+        return self._send_preencoded_trusted({
+            'type': 'bot_state', 'round_id': self.round_id, 'bots': bots})
+
+    def send_simulation_progress(self, frame_seq):
+        """Prove that the native BattleRuntime frame callback is advancing."""
+        sequence = _projectile_int_range(frame_seq, 1, MAX_PROJECTILE_ID)
+        if (sequence is None or not self.is_bot_authority() or
+                self.round_id is None or self.authority_epoch is None):
+            return False
+        return self._send({
+            'type': 'simulation_progress',
+            'round_id': int(self.round_id),
+            'authority_epoch': int(self.authority_epoch),
+            'frame_seq': int(sequence),
+        })
+
+    def _invalid_worker_message(self, reason):
+        self.last_error = reason
+        self.stop()
+        return False
+
+    def _handle_worker_welcome(self, message):
+        capabilities = _strict_capabilities(message.get('capabilities'))
+        state_revision = _exact_int(message.get('state_revision'))
+        round_id = _exact_int(message.get('round_id'))
+        host_player_id = _exact_int(message.get('host_player_id'))
+        authority_epoch = _projectile_int_range(
+            message.get('authority_epoch'), 0, MAX_PROJECTILE_ID)
+        server_time_ms = None
+        if 'server_time_ms' in message:
+            server_time_ms = _projectile_int_range(
+                message.get('server_time_ms'), 0, MAX_PROJECTILE_ID)
+        team_size = _exact_int(message.get('team_size'))
+        authority_id = _authority_id(message.get('bot_authority_id'))
+        phase = _safe_text(message.get('phase'), '', 16)
+        map_name = _safe_text(message.get('map'), '', 80)
+        if (
+                _exact_int(message.get('protocol')) != PROTOCOL_VERSION or
+                _safe_text(message.get('client_build'), '') != CLIENT_BUILD or
+                message.get('role') != WORKER_ROLE or
+                _exact_int(message.get('worker_id')) != WORKER_AUTHORITY_ID or
+                capabilities is None or
+                PROJECTILE_LEDGER_CAPABILITY not in capabilities or
+                SIMULATION_WORKER_CAPABILITY not in capabilities or
+                state_revision is None or state_revision < 0 or
+                round_id is None or round_id < 0 or
+                (host_player_id is not None and host_player_id <= 0) or
+                authority_epoch is None or server_time_ms is None or
+                team_size is None or not 1 <= team_size <= 15 or
+                authority_id is None or
+                phase not in ('waiting', 'loading', 'battle') or
+                not map_name):
+            return self._invalid_worker_message('invalid worker welcome')
+        self.ready = True
+        self.worker_id = WORKER_AUTHORITY_ID
+        self.player_id = WORKER_AUTHORITY_ID
+        self.phase = phase
+        self.map_name = map_name
+        self.map_pool = self._map_names(message.get('map_pool'))
+        self.round_id = round_id
+        self.state_revision = state_revision
+        self.host_player_id = host_player_id
+        self.bot_authority_id = authority_id
+        self.authority_epoch = authority_epoch
+        self.server_time_ms = server_time_ms
+        self.capabilities = capabilities
+        self._notify('welcome', message)
+        return True
+
+    def _handle_worker_roster(self, message):
+        round_id = _exact_int(message.get('round_id'))
+        state_revision = _exact_int(message.get('state_revision'))
+        phase = _safe_text(message.get('phase'), '', 16)
+        map_name = _safe_text(message.get('map'), '', 80)
+        players = _strict_mapping_list(message.get('players'), 64)
+        host_player_id = _exact_int(message.get('host_player_id'))
+        authority_id = _authority_id(message.get('bot_authority_id'))
+        authority_epoch = _projectile_int_range(
+            message.get('authority_epoch'), 0, MAX_PROJECTILE_ID)
+        server_time_ms = _projectile_int_range(
+            message.get('server_time_ms'), 0, MAX_PROJECTILE_ID)
+        player_ids = set(
+            _exact_int(value.get('id')) for value in players or ())
+        outfits_valid = all(
+            _canonical_wire_outfits(value.get('outfits')) is not None
+            for value in players or ())
+        if (
+                _exact_int(message.get('protocol')) != PROTOCOL_VERSION or
+                round_id is None or round_id < 0 or
+                state_revision is None or state_revision < 0 or
+                phase not in ('waiting', 'loading', 'battle') or
+                not map_name or players is None or not outfits_valid or
+                ((players and host_player_id not in player_ids) or
+                 (not players and host_player_id is not None)) or
+                authority_id is None or authority_epoch is None or
+                ('server_time_ms' in message and server_time_ms is None) or
+                (server_time_ms is not None and
+                 self.server_time_ms is not None and
+                 server_time_ms < self.server_time_ms)):
+            return self._invalid_worker_message('invalid worker roster')
+        if self.round_id is not None and round_id < self.round_id:
+            return False
+        if (round_id == self.round_id and self.state_revision is not None and
+                state_revision < self.state_revision):
+            return False
+        # A same-round waiting roster can be sent by an earlier server thread
+        # after the loading barrier. Never demote or tear down an active worker
+        # because those two TCP writes overtook each other.
+        if (round_id == self.round_id and
+                self.phase in ('loading', 'battle') and
+                phase == 'waiting'):
+            return False
+        if (self.authority_epoch is not None and
+                authority_epoch < self.authority_epoch):
+            return self._invalid_worker_message(
+                'worker authority epoch regressed')
+        if round_id != self.round_id:
+            self.last_snapshot = None
+            self._battle_start_round_id = None
+            self._battle_live_round_id = None
+            self._worker_avatar = None
+        self.round_id = round_id
+        self.state_revision = state_revision
+        self.phase = phase
+        self.map_name = map_name
+        maps = self._map_names(message.get('map_pool'))
+        if maps:
+            self.map_pool = maps
+        self.roster = self._remember_player_outfits(players)
+        self.host_player_id = host_player_id
+        self.bot_authority_id = authority_id
+        self.authority_epoch = authority_epoch
+        if server_time_ms is not None:
+            self.server_time_ms = server_time_ms
+        self._notify('roster', message)
+        return True
+
+    def _dummy_player(self, players):
+        if self._worker_avatar is not None:
+            return dict(self._worker_avatar)
+        source = None
+        for value in players or ():
+            if not isinstance(value, dict):
+                continue
+            player_id = _exact_int(value.get('id'))
+            if player_id is not None and player_id > 0 and value.get('vehicle'):
+                source = value
+                break
+        if source is None:
+            raise ValueError('worker round has no real player descriptor')
+        maximum = _exact_int(source.get('max_health'))
+        if maximum is None or maximum <= 0:
+            maximum = _exact_int(source.get('health'))
+        maximum = max(1, int(maximum or 1))
+        dummy = {
+            'id': WORKER_AUTHORITY_ID,
+            'name': 'SimulationWorker',
+            'vehicle': source['vehicle'],
+            'team': int(source.get('team', 1) or 1),
+            'slot': 0,
+            'x': 0.0, 'y': WORKER_DUMMY_Y, 'z': 0.0,
+            'yaw': 0.0, 'aim_yaw': 0.0, 'gun_pitch': 0.0,
+            'speed': 0.0, 'world_pose': True,
+            'health': maximum, 'max_health': maximum, 'alive': True,
+            'critical': {}, 'critical_revision': 0,
+            'critical_base_revision': 0, 'critical_ack_seq': 0,
+            'outfits': {},
+        }
+        self._worker_avatar = dummy
+        self.vehicle = dummy['vehicle']
+        self.max_health = maximum
+        self.team = dummy['team']
+        self.spawn = {
+            'x': dummy['x'], 'y': dummy['y'], 'z': dummy['z'],
+            'yaw': dummy['yaw']}
+        return dict(dummy)
+
+    def _project_runtime_message(self, message):
+        projected = dict(message)
+        players = _strict_mapping_list(message.get('players'), 63)
+        if players is None:
+            return None
+        try:
+            dummy = self._dummy_player(players)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        projected['players'] = list(players) + [dummy]
+        if projected.get('type') == 'battle_start':
+            projected['spawn'] = dict(self.spawn)
+            projected['vehicle'] = self.vehicle
+        return projected
+
+    def _refresh_stale_battle_start(self, message):
+        """Preserve the local dummy when a newer roster overtook start."""
+        round_id = _exact_int(message.get('round_id'))
+        state_revision = _exact_int(message.get('state_revision'))
+        stale = (
+            round_id == self.round_id and
+            state_revision is not None and
+            self.state_revision is not None and
+            state_revision < self.state_revision)
+        if not stale:
+            return message
+        if self._battle_start_round_id == round_id:
+            return None
+        refreshed = dict(message)
+        refreshed['state_revision'] = self.state_revision
+        if self.map_name:
+            refreshed['map'] = self.map_name
+        if self.roster:
+            refreshed['players'] = list(self.roster)
+        if self.host_player_id is not None:
+            refreshed['host_player_id'] = self.host_player_id
+        if self.bot_authority_id is not None:
+            refreshed['bot_authority_id'] = self.bot_authority_id
+        if self.authority_epoch is not None:
+            refreshed['authority_epoch'] = self.authority_epoch
+        if self.server_time_ms is not None:
+            refreshed['server_time_ms'] = self.server_time_ms
+        return refreshed
+
+    def _handle_message(self, message):
+        if not isinstance(message, dict):
+            return
+        kind = message.get('type')
+        if kind == 'welcome':
+            self._handle_worker_welcome(message)
+            return
+        if kind == 'roster':
+            self._handle_worker_roster(message)
+            return
+        if kind == 'battle_start':
+            message = self._refresh_stale_battle_start(message)
+            if message is None:
+                return
+            # Start a fresh local carrier from this round's real descriptor.
+            self._worker_avatar = None
+        if kind in ('battle_start', 'snapshot'):
+            projected = self._project_runtime_message(message)
+            if projected is None:
+                self._invalid_worker_message(
+                    'worker runtime projection is unavailable')
+                return
+            message = projected
+        LANClient._handle_message(self, message)
+
+
+class _WorldDrawLease(object):
+    """Reversible ownership of BigWorld.worldDrawEnabled(False)."""
+
+    def __init__(self, bigworld):
+        self._bigworld = bigworld
+        self._original = None
+        self.active = False
+
+    def read(self):
+        boundary = getattr(self._bigworld, 'worldDrawEnabled', None)
+        if not callable(boundary):
+            raise RuntimeError('BigWorld.worldDrawEnabled is unavailable')
+        value = boundary()
+        if value not in (False, True, 0, 1):
+            raise RuntimeError('world draw getter returned an invalid state')
+        return bool(value)
+
+    def acquire(self):
+        if self.active:
+            return True
+        boundary = getattr(self._bigworld, 'worldDrawEnabled', None)
+        if not callable(boundary):
+            raise RuntimeError('BigWorld.worldDrawEnabled is unavailable')
+        self._original = self.read()
+        boundary(False)
+        if self.read() is not False:
+            try:
+                boundary(self._original)
+            finally:
+                self._original = None
+            raise RuntimeError('world draw disable readback mismatch')
+        self.active = True
+        return True
+
+    def restore(self):
+        if not self.active:
+            return False
+        boundary = getattr(self._bigworld, 'worldDrawEnabled', None)
+        original = self._original
+        if not callable(boundary):
+            raise RuntimeError('BigWorld.worldDrawEnabled is unavailable')
+        boundary(original)
+        if self.read() is not original:
+            raise RuntimeError('world draw restore readback mismatch')
+        self.active = False
+        self._original = None
+        return True
+
+
+class WorkerSession(object):
+    """Auto-connected worker lifecycle with no player lobby/UI ownership."""
+
+    def __init__(self, config, client_factory=None, battle_factory=None,
+                 lobby_ready=None, callback=None, cancel_callback=None,
+                 bigworld=None, status_path=WORKER_STATUS_PATH):
+        self._config = dict(config or {})
+        self._client_factory = client_factory or AuthorityWorkerLANClient
+        self._battle_factory = battle_factory or _load_battle_runtime()
+        self._lobby_ready = lobby_ready or (lambda: True)
+        self._bigworld = bigworld
+        self._callback = callback
+        self._cancel_callback = cancel_callback
+        self._status_path = status_path
+        self.client = None
+        self.runtime = None
+        self.state = 'idle'
+        self._stopped = False
+        self._generation = 0
+        self._active_round_id = None
+        self._pending_start = None
+        self._pending_start_deadline = None
+        self._retired_rounds = set()
+        self._monitor_callback_id = None
+        self._retry_callback_id = None
+        self._next_status_time = 0.0
+        self._next_progress_time = 0.0
+        self._last_progress_frame = 0
+        self._handling_failure = False
+        self._draw = None
+        self._probe_runtime = None
+        self._probe_round_id = None
+        self._probe_time = None
+        self._probe_sample = None
+
+    def _ensure_runtime_boundaries(self):
+        if self._bigworld is None:
+            import BigWorld
+            self._bigworld = BigWorld
+        if self._callback is None:
+            self._callback = self._bigworld.callback
+        if self._cancel_callback is None:
+            self._cancel_callback = self._bigworld.cancelCallback
+        if self._draw is None:
+            self._draw = _WorldDrawLease(self._bigworld)
+
+    def start(self):
+        if self._stopped or self.client is not None:
+            return False
+        self._ensure_runtime_boundaries()
+        return self._connect()
+
+    def _connect(self):
+        if self._stopped:
+            return False
+        self._generation += 1
+        generation = self._generation
+
+        def on_event(kind, message):
+            if not self._stopped and generation == self._generation:
+                try:
+                    self._on_event(kind, message)
+                except Exception as error:
+                    # Native event adapters are private #1513 boundaries. One
+                    # failure must fence authority and clean up, not escape the
+                    # LAN poll callback and leave a connected zombie worker.
+                    self._worker_failure(error)
+
+        self.client = self._client_factory(
+            self._config.get('host', '127.0.0.1'),
+            self._config.get('port', 28782), on_event=on_event,
+            bigworld=self._bigworld)
+        self.state = 'connecting'
+        try:
+            if not self.client.start():
+                raise RuntimeError('worker LAN client could not start')
+        except Exception as error:
+            self.client = None
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] worker connect failed: %s\n' % error)
+            self._schedule_retry()
+            return False
+        self._schedule_monitor()
+        self._write_status(force=True)
+        return True
+
+    def _schedule_monitor(self):
+        if self._stopped or self._monitor_callback_id is not None:
+            return False
+
+        def monitor():
+            self._monitor_callback_id = None
+            self._monitor()
+
+        self._monitor_callback_id = self._callback(
+            WORKER_MONITOR_SECONDS, monitor)
+        return True
+
+    def _schedule_retry(self):
+        if self._stopped or self._retry_callback_id is not None:
+            return False
+
+        def retry():
+            self._retry_callback_id = None
+            if self._stopped:
+                return
+            if not self._lobby_ready():
+                self._schedule_retry()
+                return
+            self._connect()
+
+        self._retry_callback_id = self._callback(
+            WORKER_RETRY_SECONDS, retry)
+        return True
+
+    def _publish_simulation_progress(self, runtime):
+        now = time.time()
+        if now < self._next_progress_time:
+            return False
+        sampler = getattr(runtime, '_authority_worker_probe_sample', None)
+        sender = getattr(self.client, 'send_simulation_progress', None)
+        if not callable(sampler) or not callable(sender):
+            raise RuntimeError(
+                'worker simulation progress boundary is unavailable')
+        sample = sampler() or {}
+        if sample.get('round_finished') is True:
+            return False
+        frame_seq = _projectile_int_range(
+            sample.get('frame_callbacks'), 1, MAX_PROJECTILE_ID)
+        if frame_seq is None or frame_seq <= self._last_progress_frame:
+            return False
+        if not sender(frame_seq):
+            return False
+        self._last_progress_frame = frame_seq
+        self._next_progress_time = now + WORKER_PROGRESS_SECONDS
+        return True
+
+    def _monitor(self):
+        if self._stopped:
+            return
+        if self.runtime is None and self._pending_start is not None:
+            if (self.client is None or
+                    not self.client.is_bot_authority()):
+                self._pending_start = None
+                self._pending_start_deadline = None
+                self.state = 'standby'
+            elif (self._pending_start_deadline is not None and
+                  time.time() >= self._pending_start_deadline):
+                self._worker_failure(RuntimeError(
+                    'worker lobby restoration timed out'))
+                return
+        if self.runtime is None and self._pending_start is not None:
+            try:
+                lobby_ready = bool(self._lobby_ready())
+            except Exception as error:
+                self._worker_failure(error)
+                return
+            if lobby_ready:
+                pending = self._pending_start
+                self._pending_start = None
+                self._pending_start_deadline = None
+                if not self._start_round(pending):
+                    return
+        runtime = self.runtime
+        if runtime is not None:
+            if (self.client is None or not self.client.is_bot_authority() or
+                    self._active_round_id in self._retired_rounds):
+                if not self._retire_or_fail('authority_lost'):
+                    return
+            elif runtime.state == 'running':
+                try:
+                    self._publish_simulation_progress(runtime)
+                except Exception as error:
+                    self._worker_failure(error)
+                    return
+                ready_for_draw = getattr(
+                    runtime, 'authority_worker_ready_for_draw_off', None)
+                if not callable(ready_for_draw):
+                    self._worker_failure(RuntimeError(
+                        'worker draw-off readiness boundary is unavailable'))
+                    return
+                if not ready_for_draw():
+                    self.state = 'loading_models'
+                    self._write_status()
+                    self._schedule_monitor()
+                    return
+                try:
+                    self._draw.acquire()
+                except Exception as error:
+                    self._worker_failure(error)
+                    return
+                self.state = 'battle'
+            elif runtime.state == 'failed':
+                self._worker_failure(
+                    RuntimeError(runtime.error or 'worker runtime failed'))
+                return
+        self._write_status()
+        self._schedule_monitor()
+
+    def _start_round(self, message):
+        round_id = _exact_int(message.get('round_id'))
+        if (round_id is None or round_id in self._retired_rounds or
+                self.client is None or not self.client.is_bot_authority()):
+            return False
+        if self.runtime is not None and round_id == self._active_round_id:
+            return False
+        if self.runtime is not None and round_id != self._active_round_id:
+            if (self._active_round_id is not None and
+                    round_id < self._active_round_id):
+                return False
+            # The new start barrier may overtake the previous round's waiting
+            # roster on another server handler. Retire the old native space
+            # first, then wait for its asynchronous lobby restoration.
+            try:
+                self._retire_runtime('round_complete')
+            except Exception as error:
+                self._worker_failure(error)
+                return False
+        try:
+            lobby_ready = bool(self._lobby_ready())
+        except Exception as error:
+            self._worker_failure(error)
+            return False
+        if not lobby_ready:
+            if (self._pending_start is not None and
+                    _exact_int(self._pending_start.get('round_id')) !=
+                    round_id):
+                self._worker_failure(RuntimeError(
+                    'worker received overlapping pending rounds'))
+                return False
+            self._pending_start = dict(message)
+            self._pending_start_deadline = (
+                time.time() + float(
+                    self._config.get('startupTimeoutSeconds', 30.0)))
+            self.state = 'waiting_lobby'
+            self._write_status(force=True)
+            return True
+        self._pending_start = None
+        self._pending_start_deadline = None
+        self._last_progress_frame = 0
+        self._next_progress_time = 0.0
+        if message.get('need_destructible_map'):
+            self._worker_failure(RuntimeError(
+                'worker cannot own a server-authority donation round'))
+            return False
+        if self.runtime is not None:
+            if round_id == self._active_round_id:
+                return False
+            self._worker_failure(RuntimeError(
+                'worker received overlapping round lifecycles'))
+            return False
+        players = message.get('players') or ()
+        dummy = next((dict(value) for value in players
+                      if isinstance(value, dict) and
+                      _exact_int(value.get('id')) == WORKER_AUTHORITY_ID), None)
+        if dummy is None:
+            self._worker_failure(RuntimeError(
+                'worker dummy Avatar projection is missing'))
+            return False
+        config = dict(self._config)
+        config.update({
+            'worker_mode': True,
+            'native_remote_vehicles': False,
+            'bot_track_animation': False,
+            'map': message.get('map'),
+            'spawn': {
+                'x': dummy['x'], 'y': dummy['y'], 'z': dummy['z'],
+                'yaw': dummy.get('yaw', 0.0)},
+            'vehicle': dummy['vehicle'],
+            'name': dummy['name'],
+        })
+        runtime = self._battle_factory()
+        self.runtime = runtime
+        self._active_round_id = round_id
+        self.state = 'loading'
+        try:
+            accepted = runtime.start(
+                config, message=message, lan_client=self.client,
+                on_local_leave=None)
+        except Exception as error:
+            if self.runtime is runtime:
+                self._worker_failure(error)
+            return False
+        if not accepted:
+            # A synchronous BattleRuntime._fail notification may already have
+            # retired this exact object through client.on_event.
+            if self.runtime is runtime:
+                self._worker_failure(RuntimeError(
+                    runtime.error or
+                    'worker battle runtime rejected start'))
+            return False
+        self._write_status(force=True)
+        return True
+
+    def _retire_runtime(self, reason):
+        runtime = self.runtime
+        round_id = self._active_round_id
+        if reason != 'round_complete' and self.client is not None:
+            # Fence every authority publisher before touching native objects.
+            self.client.bot_authority_id = None
+        self.runtime = None
+        self._active_round_id = None
+        self._last_progress_frame = 0
+        self._next_progress_time = 0.0
+        if round_id is not None and reason not in ('round_complete',):
+            self._retired_rounds.add(round_id)
+        errors = []
+        try:
+            if runtime is not None and runtime.state != 'failed':
+                runtime.stop(show_login=False, restore_account=True)
+        except Exception as error:
+            errors.append(error)
+        finally:
+            # Keep the arena hidden until every native model is destroyed.
+            try:
+                if self._draw is not None:
+                    self._draw.restore()
+            except Exception as error:
+                errors.append(error)
+        self._reset_probe_window()
+        self.state = 'waiting' if reason == 'round_complete' else 'standby'
+        self._write_status(force=True)
+        if errors:
+            raise errors[0]
+        return runtime is not None
+
+    def _retire_or_fail(self, reason):
+        try:
+            return self._retire_runtime(reason)
+        except Exception as error:
+            self._worker_failure(error)
+            return False
+
+    def _worker_failure(self, error):
+        if self._handling_failure or self._stopped:
+            return False
+        self._handling_failure = True
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] simulation worker failed: %s\n' % error)
+        if self._active_round_id is not None:
+            self._retired_rounds.add(self._active_round_id)
+        self._pending_start = None
+        self._pending_start_deadline = None
+        # Fence every authority send before native teardown starts.
+        if self.client is not None:
+            self.client.bot_authority_id = None
+        cleanup_failed = False
+        try:
+            self._retire_runtime('worker_failed')
+        except Exception as cleanup_error:
+            cleanup_failed = True
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] worker cleanup failed: %s\n' %
+                cleanup_error)
+        client = self.client
+        self.client = None
+        self._generation += 1
+        if client is not None:
+            try:
+                client.on_event = None
+                client.stop()
+            except Exception:
+                pass
+        self.state = 'failed' if cleanup_failed else 'retrying'
+        if cleanup_failed:
+            self._stopped = True
+        self._write_status(force=True)
+        self._handling_failure = False
+        if cleanup_failed:
+            # A process with uncertain native cleanup or draw state must not
+            # re-enter a new arena. Keep it fenced for manual restart.
+            return False
+        try:
+            self._schedule_retry()
+        except Exception as retry_error:
+            self.state = 'failed'
+            self._stopped = True
+            self._write_status(force=True)
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] worker retry failed: %s\n' %
+                retry_error)
+            return False
+        return True
+
+    def _on_event(self, kind, message):
+        message = message if isinstance(message, dict) else {}
+        if kind in ('welcome', 'roster'):
+            if (self.client is not None and
+                    not self.client.is_bot_authority()):
+                self._pending_start = None
+                self._pending_start_deadline = None
+            if (self.runtime is not None and
+                    not self.client.is_bot_authority()):
+                if not self._retire_or_fail('authority_lost'):
+                    return
+            if message.get('phase') == 'waiting':
+                self._pending_start = None
+                self._pending_start_deadline = None
+                if self.runtime is not None:
+                    if not self._retire_or_fail('round_complete'):
+                        return
+                self.state = 'waiting'
+            elif self.runtime is None:
+                self.state = 'standby'
+        elif kind == 'battle_start':
+            if self.client.is_bot_authority():
+                self._start_round(message)
+            else:
+                self.state = 'standby'
+        elif kind in ('snapshot', 'events', 'battle_live',
+                      'bot_observation'):
+            if (self.runtime is not None and
+                    not self.client.is_bot_authority()):
+                self._retire_or_fail('authority_lost')
+                return
+            if self.runtime is None:
+                return
+            round_id = _exact_int(message.get('round_id'))
+            if round_id != self._active_round_id:
+                return
+            if kind == 'snapshot':
+                self.runtime.on_snapshot(message)
+            elif kind == 'events':
+                self.runtime.on_events(message)
+            elif kind == 'battle_live':
+                self.runtime.on_battle_live(message)
+            else:
+                self.runtime.on_bot_observation(message)
+        elif kind == 'battle_failed':
+            self._worker_failure(RuntimeError(
+                message.get('message') or 'worker battle failed'))
+        elif kind in ('error', 'connection_lost', 'disconnected'):
+            self._worker_failure(RuntimeError(
+                message.get('message') or 'worker transport lost'))
+        self._write_status()
+
+    def _write_status(self, force=False):
+        now = time.time()
+        if not force and now < self._next_status_time:
+            return False
+        self._next_status_time = now + WORKER_STATUS_SECONDS
+        draw_enabled = None
+        try:
+            if self._draw is not None:
+                draw_enabled = self._draw.read()
+        except Exception:
+            draw_enabled = None
+        value = {
+            'schema': 1,
+            'role': WORKER_ROLE,
+            'process_id': os.getpid(),
+            'heartbeat_epoch': now,
+            'state': self.state,
+            'connected': bool(
+                self.client is not None and
+                getattr(self.client, 'connected', False)),
+            'phase': (
+                None if self.client is None else
+                getattr(self.client, 'phase', None)),
+            'round_id': self._active_round_id,
+            'bot_authority_id': (
+                None if self.client is None else
+                self.client.bot_authority_id),
+            'world_draw_enabled': draw_enabled,
+            'runtime': self._runtime_status(now),
+        }
+        try:
+            # This is live diagnostics, not user state. Avoid an fsync and
+            # write-through rename on the native simulation callback thread.
+            port_config.write_json(
+                self._status_path, value, durable=False)
+        except Exception:
+            return False
+        return True
+
+    @staticmethod
+    def _counter_delta(current, previous, name):
+        try:
+            return max(0, int(current.get(name)) - int(previous.get(name)))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+
+    def _reset_probe_window(self):
+        self._probe_runtime = None
+        self._probe_round_id = None
+        self._probe_time = None
+        self._probe_sample = None
+
+    def _runtime_status(self, now):
+        runtime = self.runtime
+        sampler = getattr(runtime, '_authority_worker_probe_sample', None)
+        if runtime is None or not callable(sampler):
+            self._reset_probe_window()
+            return {}
+        try:
+            sample = dict(sampler() or {})
+        except Exception:
+            return {}
+        previous = self._probe_sample
+        previous_time = self._probe_time
+        same_window = (
+            runtime is self._probe_runtime and
+            self._active_round_id == self._probe_round_id and
+            previous is not None and previous_time is not None and
+            now > previous_time)
+        window_seconds = None
+        callback_delta = publication_delta = None
+        revision_delta = send_failed_delta = None
+        if same_window:
+            window_seconds = float(now - previous_time)
+            callback_delta = self._counter_delta(
+                sample, previous, 'authority_callbacks')
+            publication_delta = self._counter_delta(
+                sample, previous, 'bot_state_enqueued')
+            revision_delta = self._counter_delta(
+                sample, previous, 'bot_state_revision')
+            send_failed_delta = self._counter_delta(
+                sample, previous, 'bot_state_send_failed')
+        sample.update({
+            'window_seconds': window_seconds,
+            'callback_hz': (
+                None if callback_delta is None else
+                callback_delta / window_seconds),
+            'bot_publication_hz': (
+                None if publication_delta is None else
+                publication_delta / window_seconds),
+            'revision_delta': revision_delta,
+            'send_failed_delta': send_failed_delta,
+        })
+        self._probe_runtime = runtime
+        self._probe_round_id = self._active_round_id
+        self._probe_time = now
+        self._probe_sample = dict(sample)
+        return sample
+
+    def stop(self, show_login=False, restore_account=False,
+             release_join=False):
+        del show_login, release_join
+        if self._stopped:
+            return
+        self._stopped = True
+        self._generation += 1
+        for name in ('_monitor_callback_id', '_retry_callback_id'):
+            callback_id = getattr(self, name)
+            setattr(self, name, None)
+            if callback_id is not None and self._cancel_callback is not None:
+                try:
+                    self._cancel_callback(callback_id)
+                except Exception:
+                    pass
+        client = self.client
+        self.client = None
+        if client is not None:
+            client.bot_authority_id = None
+        cleanup_error = None
+        try:
+            if self.runtime is not None:
+                runtime = self.runtime
+                self.runtime = None
+                try:
+                    if runtime.state != 'failed':
+                        runtime.stop(
+                            show_login=False,
+                            restore_account=bool(restore_account))
+                finally:
+                    # Do not reveal still-live models during native teardown.
+                    if self._draw is not None:
+                        self._draw.restore()
+            elif self._draw is not None:
+                self._draw.restore()
+        except Exception as error:
+            cleanup_error = error
+        finally:
+            if client is not None:
+                try:
+                    client.on_event = None
+                    client.stop()
+                except Exception:
+                    pass
+        self._active_round_id = None
+        self._pending_start = None
+        self._pending_start_deadline = None
+        self._last_progress_frame = 0
+        self._next_progress_time = 0.0
+        self._reset_probe_window()
+        self.state = 'stopped'
+        self._write_status(force=True)
+        if cleanup_error is not None:
+            raise cleanup_error

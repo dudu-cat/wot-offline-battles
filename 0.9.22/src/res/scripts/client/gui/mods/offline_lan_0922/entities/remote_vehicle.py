@@ -12,6 +12,7 @@ while using #1513's verified compound-model assembler.
 
 import math
 import sys
+import time
 import weakref
 from collections import namedtuple
 
@@ -164,6 +165,9 @@ class _RemoteAppearance(object):
         # setupTurretRotations reads this exact CompoundAppearance contract.
         self.damageState = _DamageState()
         self.isLoaded = False
+        # Observed-vehicle UI handlers read this exact CompoundAppearance
+        # field while constructing their speed/RPM state handlers.
+        self.gear = 0
         self.isInWater = False
         self.isUnderwater = False
         self.gunRecoil = None
@@ -587,11 +591,17 @@ class _RemoteFilter(object):
     # collision result less authoritative.
     _BROAD_PHASE_RADIUS_SQUARED = 20.0 * 20.0
 
-    def __init__(self, math_module, position):
+    def __init__(self, math_module, position, matrix_provider):
         self._math = math_module
         self.position = math_module.Vector3(position)
         self.velocity = math_module.Vector3(0.0, 0.0, 0.0)
         self.speed = 0.0
+        # SteadyVehicleMatrixCalculator.relinkSources reads these exact
+        # WGVehicleFilter providers whenever Avatar.vehicle changes.  A LAN
+        # RemoteVehicle owns one in-place Math.Matrix instead of a native
+        # filter, so both stock aiming paths must follow that same provider.
+        self.stabilisedMatrix = matrix_provider
+        self.groundPlacingMatrixFiltered = matrix_provider
 
     def update(self, position, velocity):
         self.position = self._math.Vector3(position)
@@ -621,6 +631,17 @@ class _RemoteFilter(object):
         offset_z = pz - dz * fraction
         return (offset_x * offset_x + offset_y * offset_y +
                 offset_z * offset_z <= self._BROAD_PHASE_RADIUS_SQUARED)
+
+
+class _RemoteSpeedInfo(object):
+    """Expose the value tuple consumed by #1513's observed-vehicle UI."""
+
+    def __init__(self, vehicle_filter):
+        self._filter = vehicle_filter
+
+    @property
+    def value(self):
+        return (self._filter.speed, 0.0)
 
 
 def _component_value(component, name, default=None):
@@ -784,7 +805,8 @@ class RemoteVehicle(object):
         self._render_to = None
         self._render_started = 0.0
         self._render_duration = 0.0
-        self.filter = _RemoteFilter(math_module, self.position)
+        self.filter = _RemoteFilter(math_module, self.position, self.matrix)
+        self.speedInfo = _RemoteSpeedInfo(self.filter)
         self.appearance = _RemoteAppearance(math_module, self)
         self.proxy = weakref.proxy(self)
         self._aim_yaw = self.yaw
@@ -793,6 +815,7 @@ class RemoteVehicle(object):
         self._offline_outfit_valid = None
         self._vehicle_stickers = None
         self._last_pose_time = None
+        self._wreck_retained = False
         self._update_matrix()
 
     def _update_matrix(self):
@@ -902,6 +925,44 @@ class RemoteVehicle(object):
         self.fashions = None
         self._track_mode = None
         return released
+
+    def retain_wreck_model(self):
+        """Freeze the loaded compound as non-blocking wreck cover.
+
+        ``loadResourceListBG`` still finalizes a newly assembled destroyed
+        compound on BigWorld's callback thread.  Exact client logs show that
+        cold finalization can stop every callback for 9--15 seconds.  A
+        second compound per vehicle would avoid the cold load only by roughly
+        doubling the model ownership of this 32-bit client, so remote wrecks
+        keep their existing compound and the independent dead marker instead.
+        Descriptor hit testers already own gameplay collision.
+        """
+        if self.model is None or self._wreck_retained:
+            return False
+        self._wreck_retained = True
+        self._stop_extras()
+        self.appearance.engineAudition.detach()
+        effects = self.appearance._bound_effects
+        self.appearance._bound_effects = None
+        if effects is not None:
+            try:
+                effects.destroy()
+            except Exception:
+                pass
+        self.engineMode = (0, 0)
+        self.appearance.gear = 0
+        self.filter.update(
+            self.position, self._math.Vector3(0.0, 0.0, 0.0))
+        try:
+            self.update_tracks(0.0, 0.0, self.engineMode)
+        except Exception:
+            pass
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] WRECK retained id=%s '
+            'pose=(%.1f, %.1f, %.1f)\n' % (
+                self.bw_entity_id, self.position.x, self.position.y,
+                self.position.z))
+        return True
 
     def attach_wreck_model(self, model):
         """Swap this vehicle onto its loaded #1513 destroyed compound."""
@@ -1097,14 +1158,25 @@ class RemoteVehicle(object):
 
     def set_pose(self, position, rotation, relax_time=None, now=None):
         previous = self.position
+        previous_time = self._last_pose_time
         self.position = self._math.Vector3(position)
         self.roll = float(rotation[0])
         self.pitch = float(rotation[1])
         self.yaw = float(rotation[2])
         self._update_matrix()
         self._retarget_render_pose(relax_time, now)
-        velocity = self.position - previous
+        velocity = self._math.Vector3(0.0, 0.0, 0.0)
+        if now is not None:
+            now = float(now)
+            if previous_time is not None and now > previous_time:
+                velocity = (self.position - previous).scale(
+                    1.0 / (now - previous_time))
+            self._last_pose_time = now
+        # Calls without a timestamp cannot establish velocity units. Publish
+        # a truthful stationary sample instead of treating displacement per
+        # network update as metres per second.
         self.filter.update(self.position, velocity)
+        self.appearance.gear = 1 if self.filter.speed > 0.01 else 0
 
     def set_aim(self, hull_yaw, aim_yaw, gun_pitch):
         relative = ((float(aim_yaw) - float(hull_yaw) + math.pi) %
@@ -1280,7 +1352,7 @@ class _EntitiesView(object):
         # the native registry and does not leak other synthetic identities.
         for entity_id, vehicle in self._registry.items():
             if (_postmortem_visible(vehicle) and
-                    entity_id not in self._original):
+                    self._original.get(entity_id) is None):
                 result.append(entity_id)
         return result
 
@@ -1312,7 +1384,8 @@ class RemoteVehicleFactory(object):
     def __init__(self, bigworld, math_module, model_assembler, space_id,
                  camouflages=None, vehicular=None, data_links=None,
                  enable_track_animation=True, outfit_factory=None,
-                 vehicle_stickers_factory=None):
+                 vehicle_stickers_factory=None,
+                 prewarm_wreck_resources=False):
         self._bigworld = bigworld
         self._math = math_module
         self._model_assembler = model_assembler
@@ -1320,6 +1393,7 @@ class RemoteVehicleFactory(object):
         self._vehicular = vehicular
         self._data_links = data_links
         self._enable_track_animation = bool(enable_track_animation)
+        self._prewarm_wreck_resources = bool(prewarm_wreck_resources)
         self._outfit_factory = outfit_factory
         self._vehicle_stickers_factory = vehicle_stickers_factory
         self.track_animation_error = None
@@ -1333,6 +1407,16 @@ class RemoteVehicleFactory(object):
         self._entities_wrapper = None
         self._hit_testers = {}
         self._descriptors = {}
+        self._wreck_descriptor_paths = {}
+        self._wreck_requested_paths = set()
+        self._wreck_pending_paths = set()
+        self._wreck_ready_paths = set()
+        self._wreck_failed_paths = set()
+        self._wreck_resource_refs = []
+        self._wreck_requested_entities = set()
+        self._wreck_waiting_entities = set()
+        self._wreck_loading_entities = set()
+        self._wreck_loading_started = {}
         self._shot_presenter = _RemoteShotPresenter(
             bigworld, math_module, model_assembler)
         self.install()
@@ -1411,7 +1495,178 @@ class RemoteVehicleFactory(object):
         if owned is not None and owned is not descriptor:
             raise RuntimeError('#1513 vehicle descriptor identity collided')
         self._descriptors[key] = descriptor
+        if self._prewarm_wreck_resources:
+            self.prewarm_wreck_descriptor(descriptor)
         return descriptor
+
+    def prewarm_wreck_descriptor(self, descriptor):
+        """Keep this descriptor's destroyed part resources hot for battle."""
+        key = id(descriptor)
+        paths = self._wreck_descriptor_paths.get(key)
+        if paths is not None:
+            return bool(paths)
+        getter = getattr(
+            self._model_assembler, 'getPartModelsFromDesc', None)
+        if not callable(getter):
+            self._wreck_descriptor_paths[key] = ()
+            return False
+        try:
+            unique_paths = []
+            seen_paths = set()
+            for path in getter(descriptor, 'destroyed'):
+                if not path or path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                unique_paths.append(path)
+            paths = tuple(unique_paths)
+        except Exception as error:
+            self._wreck_descriptor_paths[key] = ()
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] wreck resource prewarm unavailable '
+                'for %s: %s\n' % (getattr(descriptor, 'name', key), error))
+            return False
+        self._wreck_descriptor_paths[key] = paths
+        pending = tuple(path for path in paths
+                        if path not in self._wreck_requested_paths)
+        if not pending:
+            return bool(paths)
+        self._wreck_requested_paths.update(pending)
+        self._wreck_pending_paths.update(pending)
+        started = time.time()
+        descriptor_name = getattr(descriptor, 'name', key)
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] WRECK prewarm submit vehicle=%s '
+            'paths=%d pending=%d\n' % (
+                descriptor_name, len(pending),
+                len(self._wreck_pending_paths)))
+        call_started = time.time()
+        try:
+            self._bigworld.loadResourceListBG(
+                pending, lambda resources:
+                self._wreck_resources_loaded(
+                    pending, resources, descriptor_name, started))
+        except Exception as error:
+            self._wreck_pending_paths.difference_update(pending)
+            self._wreck_failed_paths.update(pending)
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] wreck resource prewarm failed '
+                'for %s: %s\n' % (getattr(descriptor, 'name', key), error))
+            return False
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] WRECK prewarm return vehicle=%s '
+            'call_ms=%.3f\n' % (
+                descriptor_name,
+                max(0.0, time.time() - call_started) * 1000.0))
+        return True
+
+    def prewarm_wrecks_enabled(self):
+        return self._prewarm_wreck_resources
+
+    def wreck_prewarm_pending_count(self):
+        """Return how many unique destroyed resources still block loading."""
+        return len(self._wreck_pending_paths)
+
+    def abandon_pending_wreck_prewarm(self):
+        """Stop waiting for resources which missed the startup deadline."""
+        pending = tuple(self._wreck_pending_paths)
+        if not pending:
+            return False
+        self._wreck_pending_paths.clear()
+        self._wreck_failed_paths.update(pending)
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] WRECK prewarm abandoned paths=%d\n' %
+            len(pending))
+        self._resume_waiting_wrecks()
+        return True
+
+    def _wreck_resources_loaded(self, paths, resources,
+                                descriptor_name=None, started=None):
+        if self._wreck_resource_refs is None:
+            return
+        # A startup timeout deliberately closes this batch before combat.
+        # Ignore its late callback instead of turning it into a mid-battle
+        # resource residency change and a delayed wreck-model request.
+        active_paths = tuple(
+            path for path in paths if path in self._wreck_pending_paths)
+        if not active_paths:
+            return
+        failed = set(getattr(resources, 'failedIDs', ()) or ())
+        self._wreck_pending_paths.difference_update(active_paths)
+        self._wreck_failed_paths.update(
+            path for path in active_paths if path in failed)
+        self._wreck_ready_paths.update(
+            path for path in active_paths if path not in failed)
+        # ResourceRefs owns the native resources.  Retain the exact callback
+        # object until battle teardown instead of relying on an engine cache
+        # eviction policy that is not exposed to Python.
+        self._wreck_resource_refs.append(resources)
+        elapsed_ms = (0.0 if started is None else
+                      max(0.0, time.time() - started) * 1000.0)
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] WRECK prewarm callback vehicle=%s '
+            'paths=%d failed=%d elapsed_ms=%.3f pending=%d\n' % (
+                descriptor_name or '-', len(active_paths),
+                len(tuple(path for path in active_paths if path in failed)),
+                elapsed_ms, len(self._wreck_pending_paths)))
+        self._resume_waiting_wrecks()
+
+    def _wreck_resources_ready(self, descriptor):
+        paths = self._wreck_descriptor_paths.get(id(descriptor), ())
+        return bool(paths) and all(
+            path in self._wreck_ready_paths for path in paths)
+
+    def _wreck_resources_failed(self, descriptor):
+        paths = self._wreck_descriptor_paths.get(id(descriptor), ())
+        return not paths or any(
+            path in self._wreck_failed_paths for path in paths)
+
+    def _resume_waiting_wrecks(self):
+        for entity_id in tuple(self._wreck_waiting_entities):
+            vehicle = self._vehicles.get(entity_id)
+            if (vehicle is None or vehicle.model is None or
+                    vehicle.typeDescriptor is None):
+                self._wreck_waiting_entities.discard(entity_id)
+                continue
+            descriptor = vehicle.typeDescriptor
+            if self._wreck_resources_ready(descriptor):
+                self._wreck_waiting_entities.discard(entity_id)
+                self._start_hot_wreck_load(entity_id, descriptor)
+            elif self._wreck_resources_failed(descriptor):
+                self._wreck_waiting_entities.discard(entity_id)
+
+    def _start_hot_wreck_load(self, entity_id, descriptor):
+        vehicle = self._vehicles.get(entity_id)
+        if (vehicle is None or vehicle.model is None or
+                entity_id in self._wreck_loading_entities):
+            return False
+        self._wreck_loading_entities.add(entity_id)
+        self._wreck_loading_started[entity_id] = time.time()
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] WRECK hot submit id=%s vehicle=%s\n' % (
+                entity_id, getattr(descriptor, 'name', '-')))
+        prepare_started = time.time()
+        try:
+            assembler = self._model_assembler.prepareCompoundAssembler(
+                descriptor, 'destroyed', self._space_id, False)
+            prepared = time.time()
+            self._bigworld.loadResourceListBG(
+                (assembler,), lambda resources:
+                self._wreck_loaded(entity_id, descriptor, resources))
+        except Exception as error:
+            self._wreck_loading_entities.discard(entity_id)
+            self._wreck_loading_started.pop(entity_id, None)
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] hot wreck assembly failed for %s: '
+                '%s\n' % (getattr(descriptor, 'name', entity_id), error))
+            return False
+        returned = time.time()
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] WRECK hot return id=%s prepare_ms=%.3f '
+            'load_call_ms=%.3f\n' % (
+                entity_id,
+                max(0.0, prepared - prepare_started) * 1000.0,
+                max(0.0, returned - prepared) * 1000.0))
+        return True
 
     def create(self, descriptor, properties, position, rotation):
         entity_id = self._allocate_id()
@@ -1612,49 +1867,62 @@ class RemoteVehicleFactory(object):
             vehicle.load_error = error
 
     def request_wreck(self, entity_id):
-        """Reload one destroyed remote vehicle on its native wreck models.
-
-        #1513 selects the wreck through ``VehicleDamageState`` model state
-        ``destroyed``; the hit testers are read from the descriptor, so shell
-        collision survives the swap.
-        """
+        """Swap to a wreck only after all destroyed parts were prewarmed."""
         vehicle = self._vehicles.get(entity_id)
         if (vehicle is None or vehicle.model is None or
                 vehicle.typeDescriptor is None or
+                entity_id in self._wreck_requested_entities or
                 vehicle.appearance.damageState.isCurrentModelDamaged):
             return False
-        # Claim the state before the asynchronous load so a repeated health
-        # event cannot queue a second refresh for the same vehicle.
-        vehicle.appearance.damageState.isCurrentModelDamaged = True
         descriptor = vehicle.typeDescriptor
-        try:
-            assembler = self._model_assembler.prepareCompoundAssembler(
-                descriptor, 'destroyed', self._space_id, False)
-            self._bigworld.loadResourceListBG(
-                (assembler,), lambda resources:
-                self._wreck_loaded(entity_id, descriptor, resources))
-        except Exception as error:
-            vehicle.appearance.damageState.isCurrentModelDamaged = False
-            vehicle.load_error = error
-            return False
+        self._wreck_requested_entities.add(entity_id)
+        vehicle.retain_wreck_model()
+        if self._wreck_resources_ready(descriptor):
+            self._start_hot_wreck_load(entity_id, descriptor)
+        elif not self._wreck_resources_failed(descriptor):
+            # The prewarm began before the countdown. If a very early death
+            # wins the race, keep the full compound until its own exact paths
+            # are resident, then perform the hot destroyed-model swap.
+            self._wreck_waiting_entities.add(entity_id)
+        # Failed or unavailable paths deliberately stay on the full compound;
+        # never retry them through a cold mid-battle resource request.
         return True
 
     def _wreck_loaded(self, entity_id, descriptor, resources):
+        self._wreck_loading_entities.discard(entity_id)
+        started = self._wreck_loading_started.pop(entity_id, None)
+        callback_started = time.time()
         vehicle = self._vehicles.get(entity_id)
         if (vehicle is None or vehicle.bw_entity is None or
                 vehicle.model is None):
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] WRECK hot callback id=%s dropped=1 '
+                'elapsed_ms=%.3f\n' % (
+                    entity_id, 0.0 if started is None else
+                    max(0.0, callback_started - started) * 1000.0))
             return
         model = self._resource(resources, descriptor.name)
         if model is None:
             model = self._resource(resources, 'chassis')
         if model is None:
-            # Keep the undamaged compound rather than lose the wreck cover.
-            vehicle.appearance.damageState.isCurrentModelDamaged = False
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] WRECK hot callback id=%s missing=1 '
+                'elapsed_ms=%.3f\n' % (
+                    entity_id, 0.0 if started is None else
+                    max(0.0, callback_started - started) * 1000.0))
             return
         try:
             vehicle.attach_wreck_model(model)
         except Exception as error:
             vehicle.load_error = error
+            return
+        finished = time.time()
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] WRECK hot callback id=%s missing=0 '
+            'elapsed_ms=%.3f swap_ms=%.3f\n' % (
+                entity_id, 0.0 if started is None else
+                max(0.0, callback_started - started) * 1000.0,
+                max(0.0, finished - callback_started) * 1000.0))
 
     def get(self, entity_id):
         return self._vehicles.get(entity_id)
@@ -1717,6 +1985,10 @@ class RemoteVehicleFactory(object):
         vehicle = self._vehicles.pop(entity_id, None)
         if vehicle is None:
             return False
+        self._wreck_requested_entities.discard(entity_id)
+        self._wreck_waiting_entities.discard(entity_id)
+        self._wreck_loading_entities.discard(entity_id)
+        self._wreck_loading_started.pop(entity_id, None)
         visual_id = vehicle.bw_entity_id
         if visual_id is not None and not self.engine_owns(visual_id):
             vehicle.abandon_visual()
@@ -1763,6 +2035,16 @@ class RemoteVehicleFactory(object):
                 if first_error is None:
                     first_error = error
         self._hit_testers = {}
+        self._wreck_descriptor_paths = {}
+        self._wreck_requested_paths = set()
+        self._wreck_pending_paths = set()
+        self._wreck_ready_paths = set()
+        self._wreck_failed_paths = set()
+        self._wreck_resource_refs = None
+        self._wreck_requested_entities = set()
+        self._wreck_waiting_entities = set()
+        self._wreck_loading_entities = set()
+        self._wreck_loading_started = {}
         try:
             self._shot_presenter.destroy()
         except Exception as error:

@@ -267,18 +267,21 @@ def pair_response(contact, inverse_a, inverse_b, velocity_a, velocity_b,
 def ram_damage(closing_speed, mass_self, mass_other):
     """Return ``(damage_to_other, damage_to_self)`` for one ram event.
 
-    This is the mature 0.8.2 mass-ratio law.  A heavier rammer deals more and
-    receives less damage; impacts at or below 3.5 m/s are harmless.
+    This remains an approximate local law: the proprietary server formula is
+    unavailable.  Keep it owner-invariant, however.  Swapping the two bodies
+    must only swap their damages; authority iteration order is not physics.
+    Impacts at or below 3.5 m/s are harmless.
     """
     relative_speed = abs(closing_speed)
     if relative_speed <= RAM_SAFE_SPEED:
         return 0, 0
     impulse = (relative_speed - RAM_SAFE_SPEED) ** 2
-    ratio = max(0.1, min(4.0, mass_self / max(mass_other, 1.0)))
-    damage_other = min(
-        450, int(impulse * 1.7 * max(0.35, min(2.6, ratio))))
-    damage_self = min(
-        350, int(impulse * 1.0 * max(0.25, min(2.2, 1.0 / ratio))))
+    ratio_to_other = max(
+        0.1, min(4.0, mass_self / max(mass_other, 1.0)))
+    ratio_to_self = max(
+        0.1, min(4.0, mass_other / max(mass_self, 1.0)))
+    damage_other = min(350, int(impulse * ratio_to_other))
+    damage_self = min(350, int(impulse * ratio_to_self))
     return damage_other, damage_self
 
 
@@ -333,9 +336,10 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
         A copied and updated pair->time mapping.  The input mapping is never
         mutated, so callers can publish the result atomically.
     ``contacts``
-        The OBB pairs touching in this solve.  Feed the preceding complete
-        frame back as ``active_ram_contacts`` so a sustained overlap cannot
-        replay one impact; an absent frame re-arms the pair.
+        The OBB pairs in a damaging compression episode. Feed the preceding
+        complete frame back as ``active_ram_contacts`` so sustained pressure
+        cannot replay one impact. Harmless touching does not consume a later
+        real impact from the same overlap.
 
     Supplying ``now=None`` disables ram-event admission while retaining all
     collision correction and impulses.
@@ -360,7 +364,8 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
     ram_events = []
     cooldowns = dict(ram_cooldowns or {})
     previous_contacts = set(active_ram_contacts or ())
-    contact_pairs = set()
+    overlap_pairs = set()
+    newly_damaging_pairs = set()
 
     for other in others or ():
         other_id = _tank_value(other, 'id', -1)
@@ -393,7 +398,7 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
         if contact is None:
             continue
         pair = (min(self_id, other_id), max(self_id, other_id))
-        contact_pairs.add(pair)
+        overlap_pairs.add(pair)
 
         if other_is_wreck:
             other_velocity_x = other_velocity_z = 0.0
@@ -423,35 +428,52 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
         if (other_is_wreck or now is None or
                 normal_velocity >= -RAM_SAFE_SPEED):
             continue
+        closing_speed = -normal_velocity
+        damage_other, damage_self = ram_damage(
+            closing_speed, mass_self, mass_other)
+        if not damage_other and not damage_self:
+            continue
+        newly_damaging_pairs.add(pair)
         # A retail ram consumes the relative kinetic impulse at contact.  A
-        # persistent OBB overlap is still the same collision, even when a
-        # driving input keeps publishing its pre-response speed.  Requiring
-        # one separated frame before re-arming prevents the old 0.75-second
-        # timer from applying the same impact repeatedly.
+        # pair remains armed until the hulls separate, even if compression
+        # briefly falls below the damage threshold. A harmless initial touch
+        # is not an impact and must not suppress a later acceleration into the
+        # other hull.
         if pair in previous_contacts:
             continue
         if float(now) - float(cooldowns.get(pair, 0.0)) <= RAM_COOLDOWN:
             continue
         cooldowns[pair] = float(now)
-        closing_speed = -normal_velocity
-        damage_other, damage_self = ram_damage(
-            closing_speed, mass_self, mass_other)
-        if damage_other or damage_self:
-            ram_events.append({
-                'pair': pair,
-                'self_id': self_id,
-                'other_id': other_id,
-                'closing_speed': closing_speed,
-                'damage_to_other': damage_other,
-                'damage_to_self': damage_self,
-            })
+        ram_events.append({
+            'pair': pair,
+            'self_id': self_id,
+            'other_id': other_id,
+            'self_vehicle': str(
+                _tank_value(tank, 'vehicle', '') or ''),
+            'other_vehicle': str(
+                _tank_value(other, 'vehicle', '') or ''),
+            'mass_self': mass_self,
+            'mass_other': mass_other,
+            'velocity_self': (velocity_x, velocity_z),
+            'velocity_other': (other_velocity_x, other_velocity_z),
+            'yaw_self': yaw,
+            'yaw_other': other_yaw,
+            'shape_self': own_shape,
+            'shape_other': other_shape,
+            'contact_normal': (contact[0], contact[1]),
+            'contact_penetration': contact[2],
+            'closing_speed': closing_speed,
+            'damage_to_other': damage_other,
+            'damage_to_self': damage_self,
+        })
 
     return {
         'correction': (correction_x, correction_z),
         'delta_velocity': (delta_velocity_x, delta_velocity_z),
         'ram_events': tuple(ram_events),
         'cooldowns': cooldowns,
-        'contacts': frozenset(contact_pairs),
+        'contacts': frozenset(
+            (previous_contacts & overlap_pairs) | newly_damaging_pairs),
     }
 
 

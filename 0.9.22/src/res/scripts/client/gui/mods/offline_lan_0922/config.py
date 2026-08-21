@@ -13,13 +13,41 @@ except NameError:
 CONFIG_PATH = os.path.join(
     '.', 'mods', 'configs', 'offline_lan_0922', 'config.json')
 ENDPOINT_FILE_NAME = 'server_endpoint.json'
-ENDPOINT_PATH = os.path.join(
-    os.path.dirname(CONFIG_PATH), ENDPOINT_FILE_NAME)
+LEGACY_USER_DATA_DIR = os.path.dirname(CONFIG_PATH)
+
+
+def _default_user_data_dir(environ=None):
+    """Keep player state outside ``mods`` when Windows exposes APPDATA."""
+    environ = os.environ if environ is None else environ
+    appdata = environ.get('APPDATA')
+    if isinstance(appdata, string_types):
+        appdata = appdata.strip()
+    if appdata:
+        return os.path.join(
+            appdata, 'Wargaming.net', 'WorldOfTanks', 'offline_lan_0922')
+    # Tests, portable Wine setups and unusual launchers may not expose
+    # APPDATA.  Retain the old writable location instead of disabling state.
+    return LEGACY_USER_DATA_DIR
+
+
+USER_DATA_DIR = _default_user_data_dir()
+ENDPOINT_PATH = os.path.join(USER_DATA_DIR, ENDPOINT_FILE_NAME)
+LEGACY_ENDPOINT_PATH = os.path.join(
+    LEGACY_USER_DATA_DIR, ENDPOINT_FILE_NAME)
 ENDPOINT_PREFIX = 'LAN SERVER:'
+CLIENT_MODE_ENV = 'OFFLINE_LAN_0922_CLIENT_MODE'
+SERVER_HOST_ENV = 'OFFLINE_LAN_0922_SERVER_HOST'
+SERVER_PORT_ENV = 'OFFLINE_LAN_0922_SERVER_PORT'
+PLAYER_MODE = 'player'
+SIMULATION_WORKER_MODE = 'simulation_worker'
+CLIENT_MODES = frozenset((PLAYER_MODE, SIMULATION_WORKER_MODE))
 
 DEFAULT_CONFIG = {
     'schema': 1,
     'enabled': True,
+    # The normal package remains a player client. A separate copied game
+    # directory may opt into the native-space simulation worker explicitly.
+    'client_mode': PLAYER_MODE,
     'host': '127.0.0.1',
     'port': 28782,
     'name': 'Player',
@@ -98,6 +126,10 @@ def _load_config_file(path):
     config['max_health'] = max(1, int(config['max_health']))
     if not isinstance(config.get('enabled'), bool):
         raise ValueError('enabled must be true or false')
+    if (not isinstance(config.get('client_mode'), string_types) or
+            config.get('client_mode') not in CLIENT_MODES):
+        raise ValueError(
+            'client_mode must be player or simulation_worker')
     if not isinstance(config.get('vehicle'), string_types) or not config['vehicle']:
         raise ValueError('vehicle must be a non-empty string')
     if not isinstance(config.get('name'), string_types) or not config['name']:
@@ -133,7 +165,24 @@ def _load_config_file(path):
     return config, base_endpoint
 
 
-def _replace(temporary_path, path):
+def client_mode(config, environ=None):
+    """Resolve one process-local mode without rewriting shared config.
+
+    A worker launch batch sets the environment only for its child process.
+    This lets an ordinary player package keep the default wire and bootstrap
+    even when both copies use otherwise identical config files.
+    """
+    environ = os.environ if environ is None else environ
+    configured = (config or {}).get('client_mode', PLAYER_MODE)
+    override = environ.get(CLIENT_MODE_ENV)
+    mode = override.strip() if isinstance(override, string_types) else configured
+    if mode not in CLIENT_MODES:
+        raise ValueError(
+            '%s must be player or simulation_worker' % CLIENT_MODE_ENV)
+    return mode
+
+
+def _replace(temporary_path, path, write_through=True):
     """Move a finished temporary file over ``path`` without losing both.
 
     Python 2 has no ``os.replace``, and Windows ``os.rename`` refuses an
@@ -154,8 +203,10 @@ def _replace(temporary_path, path):
     if move is not None:
         MOVEFILE_REPLACE_EXISTING = 0x1
         MOVEFILE_WRITE_THROUGH = 0x8
-        if move(_text(temporary_path), _text(path),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH):
+        flags = MOVEFILE_REPLACE_EXISTING
+        if write_through:
+            flags |= MOVEFILE_WRITE_THROUGH
+        if move(_text(temporary_path), _text(path), flags):
             return
     backup_path = path + '.bak'
     if os.path.exists(backup_path):
@@ -176,7 +227,7 @@ def _text(value):
         return value
 
 
-def write_json(path, value):
+def write_json(path, value, durable=True):
     output_dir = os.path.dirname(path)
     if output_dir and not os.path.isdir(output_dir):
         os.makedirs(output_dir)
@@ -184,12 +235,50 @@ def write_json(path, value):
     with open(temporary_path, 'wb') as stream:
         payload = json.dumps(value, indent=2, sort_keys=True) + '\n'
         stream.write(payload.encode('utf-8'))
-        stream.flush()
+        if durable:
+            stream.flush()
+            try:
+                os.fsync(stream.fileno())
+            except (AttributeError, OSError):
+                pass
+    _replace(temporary_path, path, write_through=durable)
+
+
+def migrate_legacy_user_file(path, legacy_path):
+    """Copy one old ``mods/configs`` state file to its external owner path.
+
+    The old file is intentionally retained for rollback to an earlier build.
+    A failed migration returns the readable legacy path, so an APPDATA
+    permission problem never turns a valid saved garage into a login failure.
+    """
+    if (path is None or legacy_path is None or
+            os.path.normcase(os.path.abspath(path)) ==
+            os.path.normcase(os.path.abspath(legacy_path)) or
+            os.path.isfile(path) or not os.path.isfile(legacy_path)):
+        return path
+    output_dir = os.path.dirname(path)
+    temporary_path = path + '.migrate.tmp'
+    try:
+        if output_dir and not os.path.isdir(output_dir):
+            os.makedirs(output_dir)
+        with open(legacy_path, 'rb') as source:
+            payload = source.read()
+        with open(temporary_path, 'wb') as destination:
+            destination.write(payload)
+            destination.flush()
+            try:
+                os.fsync(destination.fileno())
+            except (AttributeError, OSError):
+                pass
+        _replace(temporary_path, path)
+        return path
+    except (IOError, OSError):
         try:
-            os.fsync(stream.fileno())
-        except (AttributeError, OSError):
+            if os.path.isfile(temporary_path):
+                os.unlink(temporary_path)
+        except (IOError, OSError):
             pass
-    _replace(temporary_path, path)
+        return legacy_path
 
 
 # Backward-compatible private name for older extracted packages.
@@ -289,7 +378,21 @@ def _endpoint_path_for_config(path):
     return os.path.join(os.path.dirname(path), ENDPOINT_FILE_NAME)
 
 
-def load(path=CONFIG_PATH, endpoint_path=None):
+def _environment_endpoint(host, port, environ=None):
+    """Apply one process-local endpoint without changing the saved LAN room."""
+    environ = os.environ if environ is None else environ
+    override_host = environ.get(SERVER_HOST_ENV)
+    override_port = environ.get(SERVER_PORT_ENV)
+    if override_host is None and override_port is None:
+        return host, port
+    if override_host is None:
+        override_host = host
+    if override_port is None:
+        override_port = port
+    return _validate_endpoint(override_host, override_port)
+
+
+def load(path=CONFIG_PATH, endpoint_path=None, environ=None):
     if not os.path.isfile(path):
         config = _copy_defaults()
         write_json(path, config)
@@ -309,7 +412,13 @@ def load(path=CONFIG_PATH, endpoint_path=None):
                 pass
 
     if endpoint_path is None:
-        endpoint_path = _endpoint_path_for_config(path)
+        if path == CONFIG_PATH:
+            endpoint_path = migrate_legacy_user_file(
+                ENDPOINT_PATH, LEGACY_ENDPOINT_PATH)
+        else:
+            # Tests and embedded consumers with an explicit config path keep
+            # their endpoint beside that caller-owned config.
+            endpoint_path = _endpoint_path_for_config(path)
     if os.path.isfile(endpoint_path):
         try:
             config['host'], config['port'] = _load_endpoint(endpoint_path)
@@ -322,4 +431,6 @@ def load(path=CONFIG_PATH, endpoint_path=None):
         # Migrate the endpoint written by older packages before a later
         # overlay refresh restores config.json to the product defaults.
         save_endpoint(base_endpoint[0], base_endpoint[1], endpoint_path)
+    config['host'], config['port'] = _environment_endpoint(
+        config['host'], config['port'], environ)
     return config

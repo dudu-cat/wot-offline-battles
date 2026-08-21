@@ -14,9 +14,8 @@ if not exist "%GAME_ROOT%offline_worker_starter.exe" (
 )
 
 pushd "%GAME_ROOT%"
-rem The coordinator opens the hidden worker, waits for its server welcome,
-rem opens the visible host client, and retires the worker when that client exits.
-start "" "%GAME_ROOT%offline_worker_starter.exe"
+rem A joining LAN client uses the host's simulation worker.
+start "" "%GAME_ROOT%offline_worker_starter.exe" --player
 set "GAME_EXIT=%ERRORLEVEL%"
 popd
 

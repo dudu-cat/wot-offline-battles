@@ -7,7 +7,33 @@ permissions:
   contents: read
 
 jobs:
+  windows-server:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11.9"
+          architecture: "x64"
+      - name: Install pinned Windows server packager
+        run: >-
+          python -m pip install
+          -r 0.9.22/server/requirements-windows-build.txt
+      - name: Build Windows LAN server for the manual client overlay
+        shell: pwsh
+        run: >-
+          pwsh -NoProfile -File
+          0.9.22/server/build_windows_server.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: launcher-manual-server-input
+          path: 0.9.22/dist/server/WoT-0.9.22-LAN-Server.exe
+          if-no-files-found: error
+          retention-days: 1
+
   client-payload:
+    needs: windows-server
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -20,6 +46,10 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python -m unittest discover -s tests -p "test_*.py" -v
+      - uses: actions/download-artifact@v4
+        with:
+          name: launcher-manual-server-input
+          path: 0.9.22/dist/server
       - name: Build Python 2.7 0.9.22 client package
         run: >-
           docker run --rm --platform linux/amd64 -v "$PWD:/work"

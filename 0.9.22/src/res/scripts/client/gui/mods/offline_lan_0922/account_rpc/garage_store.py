@@ -18,10 +18,12 @@ Compact descriptors are Python 2 byte strings, so they are base64 text on disk.
 from __future__ import print_function
 
 import base64
+import copy
 import os
 import sys
 
 from gui.mods.offline_lan_0922 import config as port_config
+from gui.mods.offline_lan_0922.account_rpc import data
 from gui.mods.offline_lan_0922.account_rpc.garage import mirror_shells_layout
 
 
@@ -38,7 +40,9 @@ except NameError:
 # restore the stock fitting over every new default.
 SCHEMA = 3
 STATE_PATH = os.path.join(
-    os.path.dirname(port_config.CONFIG_PATH), 'garage_state.json')
+    port_config.USER_DATA_DIR, 'garage_state.json')
+LEGACY_STATE_PATH = os.path.join(
+    port_config.LEGACY_USER_DATA_DIR, 'garage_state.json')
 
 _VEHICLE_INT_KEYS = ('eqs', 'eqsLayout', 'shells', 'shellsLayoutIdx')
 _ARTEFACT_ITEM_TYPES = (9, 10, 11)
@@ -93,7 +97,8 @@ class GarageStore(object):
     """Load and save the mutable parts of one garage snapshot."""
 
     def __init__(self, path=STATE_PATH):
-        self._path = path
+        self._path = (port_config.migrate_legacy_user_file(
+            path, LEGACY_STATE_PATH) if path == STATE_PATH else path)
         self._dirty = False
 
     # ---- writing --------------------------------------------------------
@@ -180,22 +185,24 @@ class GarageStore(object):
 
     # ---- reading --------------------------------------------------------
 
-    def apply(self, snapshot):
+    def apply(self, snapshot, validator=None):
         """Overlay the saved garage onto a freshly built bootstrap snapshot.
 
         The snapshot always comes from the current client, so an unknown or
-        stale key is skipped rather than trusted.  Any problem falls back to the
-        bootstrap snapshot untouched: an unusable garage is worse than a lost
-        fitting.
+        stale key is skipped rather than trusted.  Restoration and validation
+        happen on a detached copy; any problem leaves the bootstrap snapshot
+        byte-for-byte untouched.  ``validator`` may additionally exercise the
+        exact client's native compact-descriptor parsers before commit.
         """
         stored = self._read()
         if stored is None:
             return False
+        staged = copy.deepcopy(snapshot)
         vehicles = stored.get('vehicles')
         if not isinstance(vehicles, dict):
             vehicles = {}
         applied = 0
-        for record in _records(snapshot):
+        for record in _records(staged):
             key = record.get('vehicleTypeCompactDescr')
             if key is None:
                 continue
@@ -205,7 +212,7 @@ class GarageStore(object):
 
         owned = stored.get('owned')
         if isinstance(owned, dict):
-            published = snapshot.setdefault('inventoryItems', {})
+            published = staged.setdefault('inventoryItems', {})
             for raw_type, items in owned.items():
                 try:
                     item_type = int(raw_type)
@@ -224,6 +231,18 @@ class GarageStore(object):
                         continue
                     target[compact_descr] = max(
                         int(target[compact_descr]), int(count))
+
+        try:
+            data._validate_selected_vehicle(staged)
+            if validator is not None:
+                validator(staged)
+        except Exception as error:
+            _log('the saved garage state is inconsistent; using the stock '
+                 'garage (%s)' % error)
+            return False
+
+        snapshot.clear()
+        snapshot.update(staged)
         if applied:
             _log('restored the saved garage for %d vehicle(s)' % applied)
         return True

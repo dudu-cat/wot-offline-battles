@@ -425,6 +425,7 @@ EXPECTED_ABI = {
         'PlayerAvatar.__setIsOnArena': ('self', 'onArena'),
         'PlayerAvatar.__onInitStepCompleted': ('self',),
         'PlayerAvatar.moveVehicle': ('self', 'flags', 'isKeyDown'),
+        'PlayerAvatar.enableOwnVehicleAutorotation': ('self', 'enable'),
         'PlayerAvatar.autoAim': ('self', 'target'),
         'PlayerAvatar.targetFocus': ('self', 'entity'),
         'PlayerAvatar.shoot': ('self', 'isRepeat'),
@@ -483,6 +484,8 @@ EXPECTED_ABI = {
             'self', 'isRespawn'),
         'AvatarInputHandler.__onArenaStarted': (
             'self', 'period', '*args'),
+        'AvatarInputHandler.getAutorotation': ('self',),
+        'AvatarInputHandler.setAutorotation': ('self', 'bValue'),
         '_Targeting.__init__': ('self',),
         '_Targeting.getTargetEntity': ('self',),
         '_Targeting.enable': ('self', 'flag'),
@@ -545,6 +548,7 @@ EXPECTED_ABI = {
         'VehicleGunRotator.getCurShotPosition': ('self',),
         'VehicleGunRotator.__getShotPosition': (
             'self', 'turretYaw', 'gunPitch'),
+        'VehicleGunRotator.__getTurretYawLimits': ('self',),
         'VehicleGunRotator.__rotate': ('self', 'shotPoint', 'timeDiff'),
     },
     'scripts/client/AreaDestructibles.pyc': {
@@ -953,6 +957,9 @@ EXPECTED_CODE_NAMES = {
             'BigWorld', 'wg_getSpaceItemsVisibilityMask',
             'ClientVisibilityFlags', 'SERVER_MASK',
             'wg_setSpaceItemsVisibilityMask'),
+        'PlayerAvatar.enableOwnVehicleAutorotation': (
+            'base', 'vehicle_changeSetting', 'VEHICLE_SETTING',
+            'AUTOROTATION_ENABLED'),
         'PlayerAvatar.__init__': (
             'Account', 'g_accountRepository', 'intUserSettings',
             'prebattleInvitations'),
@@ -1079,6 +1086,13 @@ EXPECTED_CODE_NAMES = {
             '_PostmortemDelay__setCameraSettings'),
     },
     'scripts/client/AvatarInputHandler/__init__.pyc': {
+        'AvatarInputHandler.getAutorotation': (
+            '_AvatarInputHandler__isAutorotation',),
+        'AvatarInputHandler.setAutorotation': (
+            '_AvatarInputHandler__curCtrl',
+            'enableSwitchAutorotationMode',
+            '_AvatarInputHandler__isAutorotation',
+            'enableOwnVehicleAutorotation'),
         'AvatarInputHandler.activatePostmortem': (
             '_CTRL_MODE', 'POSTMORTEM', 'onControlModeChanged'),
         '_Targeting.__init__': (
@@ -1417,7 +1431,11 @@ EXPECTED_CODE_NAMES = {
         'VehicleGunRotator.__getShotPosition': (
             'getAvatarOwnVehicleStabilisedMatrix', 'applyPoint',
             'applyVector'),
+        'VehicleGunRotator.__getTurretYawLimits': (
+            '_VehicleGunRotator__avatar', 'vehicleTypeDescriptor',
+            'gun', 'turretYawLimits'),
         'VehicleGunRotator.__rotate': (
+            '_VehicleGunRotator__getTurretYawLimits',
             'getAvatarOwnVehicleStabilisedMatrix', 'getShotAngles',
             '_VehicleGunRotator__updateTurretMatrix',
             '_VehicleGunRotator__updateGunMatrix'),

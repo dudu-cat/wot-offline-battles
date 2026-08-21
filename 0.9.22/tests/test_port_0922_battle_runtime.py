@@ -918,6 +918,7 @@ class _Compatibility(object):
         self.target_lock_candidate = None
         self.target_lock_validations = []
         self.account_int_commands = []
+        self.postmortem_vehicle_id = 0
 
     def dispatch_account_int_command(self, command, values):
         self.account_int_commands.append((command, values))
@@ -950,6 +951,16 @@ class _Compatibility(object):
     def set_target_lock_candidate(self, vehicle):
         self.target_lock_candidate = vehicle
         return True
+
+    def set_postmortem_vehicle(self, vehicle_id):
+        previous = self.postmortem_vehicle_id
+        self.postmortem_vehicle_id = int(vehicle_id or 0)
+        return previous
+
+    def clear_postmortem_vehicle(self):
+        previous = self.postmortem_vehicle_id
+        self.postmortem_vehicle_id = 0
+        return previous
 
     def validate_target_lock(self, avatar):
         self.target_lock_validations.append(avatar)
@@ -1823,13 +1834,16 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
 
     def test_remote_filter_implements_1513_three_argument_broad_phase(self):
         math_module = types.SimpleNamespace(Vector3=_Vector)
+        matrix = _Matrix()
         remote_filter = _RemoteFilter(
-            math_module, _Vector(0.0, 0.0, 0.0))
+            math_module, _Vector(0.0, 0.0, 0.0), matrix)
 
         self.assertTrue(remote_filter.segmentMayHitEntity(
             _Vector(-30.0, 0.0, 0.0), _Vector(30.0, 0.0, 0.0), True))
         self.assertFalse(remote_filter.segmentMayHitEntity(
             _Vector(-30.0, 50.0, 0.0), _Vector(30.0, 50.0, 0.0), False))
+        self.assertIs(matrix, remote_filter.stabilisedMatrix)
+        self.assertIs(matrix, remote_filter.groundPlacingMatrixFiltered)
 
     def test_remote_collision_returns_exact_1513_nearest_tuple(self):
         vehicle = RemoteVehicle(
@@ -2089,6 +2103,31 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertTrue(factory.is_ready(vehicle_id))
         self.assertIsNotNone(vehicle.model)
 
+    def test_observed_vehicle_state_handlers_can_read_health_and_motion(self):
+        runtime = _runtime()
+        vehicle = RemoteVehicle(
+            1000, _Descriptor(), {
+                'publicInfo': {'team': 1, 'name': 'Observed'},
+                'health': 375, 'isCrewActive': True,
+                'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0), runtime.math)
+
+        # Exact #1513 constructs all four non-player state handlers before
+        # its first health poll; these fields therefore share one contract.
+        self.assertFalse(vehicle.isPlayerVehicle)
+        self.assertEqual(375, vehicle.health)
+        self.assertEqual(0, vehicle.appearance.gear)
+        self.assertEqual((0.0, 0.0), vehicle.speedInfo.value)
+
+        vehicle.set_pose(
+            _Vector(1.0, 0.0, 0.0), (0.0, 0.0, 0.0), now=10.0)
+        self.assertEqual(0, vehicle.appearance.gear)
+        self.assertEqual((0.0, 0.0), vehicle.speedInfo.value)
+        vehicle.set_pose(
+            _Vector(4.0, 0.0, 0.0), (0.0, 0.0, 0.0), now=11.0)
+        self.assertEqual(1, vehicle.appearance.gear)
+        self.assertEqual((3.0, 0.0), vehicle.speedInfo.value)
+
     def test_an_unchanged_pose_does_not_rekey_the_animation(self):
         """A bot below the render rate republishes the same pose; re-keying
         it would hold the model still and then jump on the next step."""
@@ -2180,7 +2219,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual(keyframes[0][1].translation,
                          keyframes[1][1].translation)
 
-    def test_destroyed_remote_vehicle_reloads_the_native_wreck_once(self):
+    def test_destroyed_remote_vehicle_retains_loaded_compound_once(self):
         runtime = _runtime()
         states = []
         original_assembler = runtime.model_assembler.prepareCompoundAssembler
@@ -2202,13 +2241,202 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertTrue(factory.request_wreck(vehicle_id))
         self.assertFalse(factory.request_wreck(vehicle_id))
 
+        self.assertEqual(['undamaged'], states)
+        self.assertIs(undamaged, vehicle.model)
+        self.assertIs(vehicle.model, vehicle.bw_entity.model)
+        self.assertTrue(vehicle._wreck_retained)
+        self.assertFalse(
+            vehicle.appearance.damageState.isCurrentModelDamaged)
+        self.assertTrue(factory.is_ready(vehicle_id))
+
+    def test_wreck_parts_are_deduplicated_and_resource_refs_are_retained(self):
+        runtime = _runtime()
+        runtime.model_assembler.getPartModelsFromDesc = (
+            lambda descriptor, state: (
+                'shared-destroyed-chassis.model',
+                'shared-destroyed-chassis.model',
+                '%s-destroyed-hull.model' % descriptor.name))
+        requests = []
+        runtime.bigworld.loadResourceListBG = (
+            lambda paths, callback: requests.append((paths, callback)))
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7,
+            prewarm_wreck_resources=True)
+        first = _Descriptor('ussr:R11_MS-1')
+        second = _Descriptor('ussr:R04_T-34')
+
+        factory.prepare_descriptor(first)
+        factory.prepare_descriptor(second)
+
+        self.assertEqual(
+            ('shared-destroyed-chassis.model',
+             'ussr:R11_MS-1-destroyed-hull.model'), requests[0][0])
+        self.assertEqual(
+            ('ussr:R04_T-34-destroyed-hull.model',), requests[1][0])
+        refs = types.SimpleNamespace(failedIDs=())
+        requests[0][1](refs)
+        requests[1][1](types.SimpleNamespace(failedIDs=()))
+        self.assertIs(refs, factory._wreck_resource_refs[0])
+        self.assertTrue(factory._wreck_resources_ready(first))
+        self.assertTrue(factory._wreck_resources_ready(second))
+        factory.destroy_all()
+        self.assertIsNone(factory._wreck_resource_refs)
+
+    def test_hot_wreck_parts_swap_to_the_destroyed_compound(self):
+        runtime = _runtime()
+        states = []
+        runtime.model_assembler.getPartModelsFromDesc = (
+            lambda descriptor, state: tuple(
+                '%s-%s-%s.model' % (descriptor.name, state, part)
+                for part in ('chassis', 'hull', 'turret', 'gun')))
+
+        def prepare(descriptor, state, unused_space, unused_detached):
+            states.append(state)
+            return types.SimpleNamespace(name=descriptor.name, state=state)
+
+        class ResourceRefs(dict):
+            failedIDs = ()
+
+        def load(resources, callback):
+            if isinstance(resources[0], str):
+                callback(ResourceRefs())
+                return
+            callback(ResourceRefs({resources[0].name: _Model()}))
+
+        runtime.model_assembler.prepareCompoundAssembler = prepare
+        runtime.bigworld.loadResourceListBG = load
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7,
+            prewarm_wreck_resources=True)
+        descriptor = _Descriptor()
+        vehicle_id = factory.create(descriptor, {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True, 'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        undamaged = vehicle.model
+
+        self.assertTrue(factory.request_wreck(vehicle_id))
+
         self.assertEqual(['undamaged', 'destroyed'], states)
         self.assertIsNot(undamaged, vehicle.model)
         self.assertIs(vehicle.model, vehicle.bw_entity.model)
-        self.assertIs(vehicle.matrix, vehicle.model.matrix)
         self.assertTrue(
             vehicle.appearance.damageState.isCurrentModelDamaged)
-        self.assertTrue(factory.is_ready(vehicle_id))
+        self.assertFalse(factory.request_wreck(vehicle_id))
+        factory.destroy_all()
+
+    def test_early_death_swaps_after_its_pending_prewarm_finishes(self):
+        runtime = _runtime()
+        states = []
+        pending = []
+        runtime.model_assembler.getPartModelsFromDesc = (
+            lambda descriptor, state: ('cold-destroyed.model',))
+
+        def prepare(descriptor, state, unused_space, unused_detached):
+            states.append(state)
+            return types.SimpleNamespace(name=descriptor.name, state=state)
+
+        class ResourceRefs(dict):
+            failedIDs = ()
+
+        def load(resources, callback):
+            if isinstance(resources[0], str):
+                pending.append(callback)
+                return
+            callback(ResourceRefs({resources[0].name: _Model()}))
+
+        runtime.model_assembler.prepareCompoundAssembler = prepare
+        runtime.bigworld.loadResourceListBG = load
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7,
+            prewarm_wreck_resources=True)
+        descriptor = _Descriptor()
+        vehicle_id = factory.create(descriptor, {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True, 'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        undamaged = vehicle.model
+
+        self.assertTrue(factory.request_wreck(vehicle_id))
+        self.assertEqual(['undamaged'], states)
+        self.assertIs(undamaged, vehicle.model)
+        pending[0](ResourceRefs())
+
+        self.assertEqual(['undamaged', 'destroyed'], states)
+        self.assertIsNot(undamaged, vehicle.model)
+        self.assertTrue(vehicle._wreck_retained)
+        self.assertTrue(
+            vehicle.appearance.damageState.isCurrentModelDamaged)
+        factory.destroy_all()
+
+    def test_failed_wreck_prewarm_permanently_keeps_the_full_compound(self):
+        runtime = _runtime()
+        states = []
+        pending = []
+        runtime.model_assembler.getPartModelsFromDesc = (
+            lambda descriptor, state: ('missing-destroyed.model',))
+
+        def prepare(descriptor, state, unused_space, unused_detached):
+            states.append(state)
+            return types.SimpleNamespace(name=descriptor.name, state=state)
+
+        class ResourceRefs(dict):
+            failedIDs = ('missing-destroyed.model',)
+
+        def load(resources, callback):
+            if isinstance(resources[0], str):
+                pending.append(callback)
+                return
+            callback(ResourceRefs({resources[0].name: _Model()}))
+
+        runtime.model_assembler.prepareCompoundAssembler = prepare
+        runtime.bigworld.loadResourceListBG = load
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7,
+            prewarm_wreck_resources=True)
+        descriptor = _Descriptor()
+        vehicle_id = factory.create(descriptor, {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True, 'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        undamaged = vehicle.model
+
+        self.assertTrue(factory.request_wreck(vehicle_id))
+        pending[0](ResourceRefs())
+
+        self.assertEqual(['undamaged'], states)
+        self.assertIs(undamaged, vehicle.model)
+        self.assertTrue(vehicle._wreck_retained)
+        self.assertFalse(
+            vehicle.appearance.damageState.isCurrentModelDamaged)
+        self.assertEqual(set(), factory._wreck_waiting_entities)
+        factory.destroy_all()
+
+    def test_abandoned_wreck_prewarm_ignores_its_late_callback(self):
+        runtime = _runtime()
+        pending = []
+        runtime.model_assembler.getPartModelsFromDesc = (
+            lambda descriptor, state: ('late-destroyed.model',))
+        runtime.bigworld.loadResourceListBG = (
+            lambda paths, callback: pending.append(callback))
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7,
+            prewarm_wreck_resources=True)
+        descriptor = _Descriptor()
+
+        factory.prepare_descriptor(descriptor)
+        self.assertEqual(1, factory.wreck_prewarm_pending_count())
+        self.assertTrue(factory.abandon_pending_wreck_prewarm())
+        self.assertEqual(0, factory.wreck_prewarm_pending_count())
+
+        pending[0](types.SimpleNamespace(failedIDs=()))
+
+        self.assertFalse(factory._wreck_resources_ready(descriptor))
+        self.assertEqual([], factory._wreck_resource_refs)
+        factory.destroy_all()
 
     def test_remote_shot_cleanup_failure_still_restores_entity_owners(self):
         runtime = _runtime()
@@ -2595,6 +2823,12 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
             def get(self, key, default=None):
                 return self._rows.get(key, default)
 
+            def keys(self):
+                return list(self._rows.keys())
+
+            def __contains__(self, unused_key):
+                raise TypeError('PyEntities does not support membership')
+
         runtime = _runtime()
         factory = RemoteVehicleFactory(
             runtime.bigworld, runtime.math, runtime.model_assembler, 7)
@@ -2621,6 +2855,9 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         view._original = present
         self.assertIn(vehicle.bw_entity_id, view)
         self.assertNotIn(999999, view)
+        vehicle._postmortem_visible = True
+        self.assertIn(vehicle_id, view.keys())
+        vehicle._postmortem_visible = False
 
         view._original = engine_entities
         factory._original_entities = engine_entities
@@ -2808,9 +3045,8 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertLess(order.index(('entity', 'model', True)),
                         order.index(('compound', 'matrix', False)))
 
-    def test_a_killed_bot_drops_its_outline_before_the_wreck_swap(self):
-        """wgAddEdgeDetectEntity binds the compound the wreck load replaces,
-        so the engine reads a freed handle unless the outline goes first."""
+    def test_a_killed_bot_clears_outline_and_retains_its_compound(self):
+        """Death styling is independent from the retained cover model."""
         runtime = _runtime()
         factory = RemoteVehicleFactory(
             runtime.bigworld, runtime.math, runtime.model_assembler, 7)
@@ -2823,8 +3059,6 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         vehicle = factory.get(vehicle_id)
         vehicle.collideSegmentExt = lambda start, end: (
             types.SimpleNamespace(dist=20.0),)
-        # The wreck compound answers on a later frame, exactly as
-        # loadResourceListBG does in the client.
         loads = []
         runtime.bigworld.loadResourceListBG = (
             lambda assemblers, callback: loads.append((assemblers, callback)))
@@ -2847,12 +3081,14 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
 
         self.assertEqual([outlined], runtime.bigworld.edge_removes)
         self.assertIsNone(battle._outlined_engine_id)
-        self.assertEqual(1, len(loads))
-
-        loads[0][1]({descriptor.name: _Model()})
-
-        self.assertIsNot(undamaged, vehicle.model)
+        self.assertEqual([], loads)
+        self.assertIs(undamaged, vehicle.model)
         self.assertIs(vehicle.model, vehicle.bw_entity.model)
+        feedback = battle._avatar.guiSessionProvider.shared.feedback
+        feedback.setVehicleState.assert_called_once_with(
+            vehicle_id, runtime.feedback_event_id.VEHICLE_DEAD, False)
+        battle._binding.arena_vehicle_killed.assert_called_once_with(
+            vehicle_id, 0, 0)
         factory.destroy_all()
 
     def test_a_burning_bot_plays_and_stops_the_stock_1513_fire_extra(self):
@@ -2958,9 +3194,8 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
             ('fire cleanup', compound), ('effect key off', compound),
             ('effect stop', compound)], log)
 
-    def test_a_burning_bot_stops_its_flame_before_the_wreck_swap(self):
-        """EffectsListPlayer holds the compound the wreck load replaces, so
-        the flame must be gone before the swap, exactly like the outline."""
+    def test_a_burning_bot_stops_its_flame_on_the_retained_wreck(self):
+        """A retained cover model must own no surviving live-tank effect."""
         runtime = _runtime()
         log = []
         fire = _FireExtra(log)
@@ -2996,15 +3231,14 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
             battle._apply_health(record, {'health': 0, 'alive': False})
 
             self.assertFalse(fire.isRunningFor(vehicle))
-            self.assertEqual(1, len(loads))
-            loads[0][1]({descriptor.name: _Model()})
+            self.assertEqual([], loads)
 
-        self.assertIsNot(undamaged, vehicle.model)
+        self.assertIs(undamaged, vehicle.model)
         self.assertIs(vehicle.model, vehicle.bw_entity.model)
         self.assertEqual({}, vehicle.extras)
         self.assertIsNone(vehicle.appearance._bound_effects)
-        # Every flame call names the compound that was alive at the time,
-        # so nothing still points at it when the wreck replaces it.
+        # Every flame call names the retained compound and the final stop
+        # leaves it with no EffectsListPlayer ownership.
         self.assertEqual([
             ('effect play', undamaged), ('fire start', undamaged),
             ('fire cleanup', undamaged), ('effect key off', undamaged),
@@ -3249,7 +3483,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         wall[0] = 0.125
         diagnostics.finish(
             second, 0.12, 0.10, 0.10, {'bots_update': 0.002},
-            {'visibility': 3}, {'role': 'authority'})
+            {'visibility': 3}, {
+                'role': 'authority', 'probe_timing': 'active'})
         third = diagnostics.begin(0.30, 0.18)
         wall[0] = 0.31
         diagnostics.finish(
@@ -3268,6 +3503,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIn('lane:5.000', first_row)
         self.assertIn('active:29,chords:58,debt_ms:50.000', first_row)
         self.assertIn('summary v=2', payloads[0])
+        self.assertIn('role=authority probe_timing=active', payloads[0])
         self.assertIn('probe_ms_avg_max', payloads[0])
         self.assertIn('projectile_avg_max', payloads[0])
         self.assertIn('chords=29.00/58', payloads[0])
@@ -3376,7 +3612,121 @@ class BattleRuntimeContractTests(unittest.TestCase):
             battle._motion_is_clear.call_args.kwargs)
         battle._baked_pose_safe.assert_called_once()
 
-    def test_friendly_bot_owns_impulse_while_enemy_still_pushes_local_tank(self):
+    def test_local_bot_ram_receipt_preserves_pre_separation_pose(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        local = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                         {'health': 500})
+        remote = _Vehicle(11, _Descriptor(), _Vector(0.0, 0.0, 6.5),
+                          (0, 0, 0), {'health': 500})
+        runtime.bigworld.entities[11] = remote
+        battle._records = {'bot:11': {
+            'engine_id': 11, 'network_id': 11, 'kind': 'bot',
+            'local': False, 'ready': True, 'tombstone': False,
+            'presented_pose': {
+                'x': 0.0, 'y': 0.0, 'z': 6.5, 'yaw': math.pi},
+            'presentation_time_us': 123000,
+            # The newest canonical sample is already well ahead of the hull
+            # being drawn. Contact must use the actual presented pose.
+            'state': {'id': 11, 'x': 0.0, 'y': 0.0, 'z': 30.0,
+                      'yaw': math.pi, 'speed': 0.0, 'alive': True,
+                      'team': 1}}}
+        battle._bots = types.SimpleNamespace(states={})
+        battle._last_snapshot = {'bot_state_revision': 37}
+        battle._local_physics = {'mass': 25000.0}
+        battle._local_speed = 10.0
+        battle._motion_is_clear = mock.Mock(return_value=True)
+        battle._baked_pose_safe = mock.Mock(return_value=True)
+
+        corrected = battle._resolve_local_tank_contacts(
+            local, (0.0, 0.0, 0.0), 0.0, 0.1)
+        receipt = battle.local_ram_contact()
+
+        self.assertLess(corrected[2], 0.0)
+        self.assertEqual((11, 37), (
+            receipt['bot_id'], receipt['bot_state_revision']))
+        self.assertEqual(123000, receipt['presentation_time_us'])
+        self.assertEqual((0.0, 0.0, 0.0), (
+            receipt['x'], receipt['y'], receipt['z']))
+        self.assertGreater(receipt['vz'], 0.0)
+        self.assertLess(battle._local_speed, 10.0)
+
+    def test_ram_history_keeps_wire_pose_not_integrated_authority_pose(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._bots = types.SimpleNamespace(states={11: {
+            'id': 11, 'x': 99.0, 'y': 0.0, 'z': 98.0, 'yaw': 1.0,
+            'speed': 8.0, 'push_x': 3.0, 'push_z': 4.0,
+            'mass': 28000.0, 'collision_shape': (1.5, 3.5, 0.0, 1.0),
+            'vehicle': 'ussr:T-34', 'team': 2,
+        }})
+
+        self.assertTrue(battle._remember_ram_bot_snapshot({
+            'bot_state_revision': 37,
+            'bot_state_time_us': 370000,
+            'bots': [{'id': 11, 'x': 1.0, 'y': 2.0, 'z': 3.0,
+                      'yaw': 0.25, 'speed': 4.0, 'alive': True}],
+        }))
+
+        historical = battle._ram_bot_history[37][11]
+        self.assertEqual((1.0, 2.0, 3.0, 0.25, 4.0), (
+            historical['x'], historical['y'], historical['z'],
+            historical['yaw'], historical['speed']))
+        self.assertEqual(28000.0, historical['mass'])
+        self.assertNotIn('push_x', historical)
+        self.assertNotIn('push_z', historical)
+
+    def test_ram_history_interpolates_presented_wire_time_and_velocity(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._bots = types.SimpleNamespace(states={11: {
+            'id': 11, 'mass': 28000.0,
+            'collision_shape': (1.5, 3.5, 0.0, 1.0),
+            'vehicle': 'ussr:T-34', 'team': 2,
+        }})
+        for revision, sample_time, z in (
+                (36, 100000, 0.0), (37, 200000, 1.6)):
+            self.assertTrue(battle._remember_ram_bot_snapshot({
+                'bot_state_revision': revision,
+                'bot_state_time_us': sample_time,
+                'bots': [{'id': 11, 'x': 0.0, 'y': 0.0, 'z': z,
+                          'yaw': 0.0, 'alive': True}],
+            }))
+
+        historical = battle._ram_bot_state_at(11, 37, 150000)
+
+        self.assertAlmostEqual(0.8, historical['z'])
+        self.assertAlmostEqual(16.0, historical['ram_vz'])
+        self.assertIsNone(battle._ram_bot_state_at(11, 36, 150000))
+        self.assertIsNone(battle._ram_bot_state_at(11, 37, 250000))
+
+    def test_ram_wire_history_is_bounded_with_its_sample_times(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._bots = types.SimpleNamespace(states={11: {
+            'id': 11, 'mass': 28000.0,
+            'collision_shape': (1.5, 3.5, 0.0, 1.0),
+            'vehicle': 'ussr:T-34', 'team': 2,
+        }})
+        for revision in range(260):
+            self.assertTrue(battle._remember_ram_bot_snapshot({
+                'bot_state_revision': revision,
+                'bot_state_time_us': revision * 40000,
+                'bots': [{'id': 11, 'x': 0.0, 'y': 0.0,
+                          'z': revision * 0.1, 'yaw': 0.0,
+                          'alive': True}],
+            }))
+
+        self.assertEqual(256, len(battle._ram_bot_history_order))
+        self.assertEqual(256, len(battle._ram_bot_history))
+        self.assertEqual(256, len(battle._ram_bot_history_times))
+        self.assertNotIn(3, battle._ram_bot_history)
+        self.assertNotIn(3, battle._ram_bot_history_times)
+        self.assertIn(4, battle._ram_bot_history)
+
+    def test_live_bot_contact_applies_local_half_for_both_teams(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle.client = _Client()
@@ -3413,11 +3763,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._local_push_z = 0.0
         enemy_position = battle._resolve_local_tank_contacts(
             local, (0.0, 0.0, 0.0), 0.0, 0.1)
+        enemy_push = battle._local_push_z
 
         self.assertLess(friendly_position[2], 0.0)
-        self.assertEqual(0.0, friendly_push)
-        self.assertLess(battle._local_push_z, 0.0)
-        self.assertLess(enemy_position[2], friendly_position[2])
+        self.assertLess(friendly_push, 0.0)
+        self.assertAlmostEqual(friendly_push, enemy_push)
+        self.assertAlmostEqual(friendly_position[2], enemy_position[2])
 
         # A dead Bot is an immovable wreck, not a live teammate ownership
         # exception.  Its contact response must not depend on team colour.
@@ -3605,6 +3956,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIsNone(state.pending_index)
         self.assertEqual(0, state.clip)
         battle._publish_ammo_state.assert_called_once_with(state, force=True)
+        battle._publish_reload_event.assert_called_once_with(
+            state.reload_time, state.reload_duration, force=True)
 
     def test_a_first_press_mid_reload_leaves_the_reload_running(self):
         battle, state, settings = self._shell_change_battle()
@@ -3618,6 +3971,35 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(1, state.pending_index)
         self.assertEqual(3.0, state.reload_time)
         battle._publish_reload_event.assert_not_called()
+
+    def test_second_press_mid_reload_restarts_the_native_hud_cycle(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        state = gun_mechanics.GunState(
+            _two_shell_descriptor(), ammo_layout={101: 20, 102: 10})
+        state.reload = 6.0
+        state.clip = 0
+        state.reload_time = 3.0
+        state.reload_duration = 6.0
+        battle._gun_state = state
+        battle._avatar = runtime.bigworld.avatar
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._publish_ammo_state = mock.Mock()
+        settings = runtime.constants.VEHICLE_SETTING
+
+        self.assertTrue(
+            battle.change_vehicle_setting(settings.NEXT_SHELLS, 102))
+        self.assertEqual([], runtime.bigworld.avatar.reload_updates)
+
+        self.assertTrue(
+            battle.change_vehicle_setting(settings.CURRENT_SHELLS, 102))
+
+        self.assertEqual(1, state.shot_index)
+        self.assertEqual(6.0, state.reload_time)
+        self.assertEqual([
+            (10, 0.0, 6.0),
+            (10, 6.0, 6.0),
+        ], runtime.bigworld.avatar.reload_updates)
 
     def test_loader_intuition_swaps_at_once_and_notifies_the_hud(self):
         battle, state, settings = self._shell_change_battle()
@@ -4629,6 +5011,74 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIsNone(battle._remote_factory.get(enemy['engine_id']))
         self.assertIsNone(runtime.bigworld.entity(enemy['engine_id']))
 
+    def test_wreck_prewarm_is_batched_in_loading_before_runtime_starts(self):
+        runtime = _runtime()
+        runtime.bigworld.defer_vehicle_entry = True
+        original_load = runtime.bigworld.loadResourceListBG
+        wreck_requests = []
+        runtime.model_assembler.getPartModelsFromDesc = (
+            lambda descriptor, state: (
+                '%s-%s.model' % (descriptor.name, state),))
+
+        def defer_wrecks(resources, callback):
+            if isinstance(resources[0], str):
+                wreck_requests.append((resources, callback))
+                return
+            original_load(resources, callback)
+
+        runtime.bigworld.loadResourceListBG = defer_wrecks
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': [{
+                'id': 11, 'team': 2, 'slot': 0, 'name': 'Enemy 1'}, {
+                'id': 12, 'team': 2, 'slot': 1, 'name': 'Enemy 2'}]}
+
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, start, client))
+
+        # All selected descriptors submit immediately from _create_entities;
+        # no bot-spawn timer has run and engine time has not advanced.
+        self.assertTrue(wreck_requests)
+        self.assertEqual(10.0, runtime.bigworld.now)
+        self.assertEqual(
+            sum(len(paths) for paths, unused_callback in wreck_requests),
+            battle._remote_factory.wreck_prewarm_pending_count())
+
+        runtime.bigworld.callbacks.pop(0)()
+        runtime.bigworld.enter_pending_vehicle(battle._server.vehicle_id)
+        runtime.bigworld.callbacks.pop(0)()
+
+        self.assertEqual('loading_entities', battle.state)
+        self.assertTrue(runtime.bigworld.callbacks)
+
+        for unused_paths, callback in wreck_requests:
+            callback(types.SimpleNamespace(failedIDs=()))
+        runtime.bigworld.callbacks.pop(0)()
+
+        self.assertEqual('running', battle.state)
+        self.assertEqual(
+            0, battle._remote_factory.wreck_prewarm_pending_count())
+        battle.stop(show_login=False)
+
+    def test_wreck_prewarm_timeout_degrades_instead_of_blocking_battle(self):
+        runtime = _runtime()
+        runtime.bigworld.now = 20.0
+        battle = BattleRuntime(runtime)
+        battle._vehicle_ready_deadline = 19.0
+        battle._remote_factory = types.SimpleNamespace(
+            wreck_prewarm_pending_count=lambda: 3,
+            abandon_pending_wreck_prewarm=mock.Mock(return_value=True))
+
+        self.assertTrue(battle._wreck_prewarm_ready_for_startup())
+        battle._remote_factory.abandon_pending_wreck_prewarm.\
+            assert_called_once_with()
+
     def test_required_destructible_donation_retries_transport_only(self):
         def donation():
             return {
@@ -5047,18 +5497,26 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.bigworld.wg_collideSegment = lambda *unused: None
         self.assertTrue(battle._bot_firing_lane(source, target))
 
-    def test_bot_friendly_lane_rejects_a_live_ally_on_the_barrel_ray(self):
+    def test_bot_friendly_lane_uses_the_frozen_dispersed_parabola(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
+        battle._worker_mode = True
         battle._avatar = runtime.bigworld.avatar
+        descriptor = _Descriptor()
         source_entity = _Vehicle(
-            10, _Descriptor(), _Vector(0.0, 0.0, 0.0), (0, 0, 0),
+            10, descriptor, _Vector(0.0, 0.0, 0.0), (0, 0, 0),
             {'health': 500})
         ally_entity = _Vehicle(
-            11, _Descriptor(), _Vector(0.0, 0.0, 40.0), (0, 0, 0),
+            11, _Descriptor(), _Vector(5.0, 0.0, 100.0), (0, 0, 0),
             {'health': 500})
-        ally_entity.collideSegmentExt = lambda start, end: (
-            types.SimpleNamespace(dist=40.0),)
+        chords = []
+
+        def collide_disperse_path(start, end):
+            chords.append((start, end))
+            return ((types.SimpleNamespace(dist=1.0),)
+                    if end.x > 1.0 else ())
+
+        ally_entity.collideSegmentExt = collide_disperse_path
         runtime.bigworld.entities.update({10: source_entity, 11: ally_entity})
         battle._records = {
             'bot:7': {
@@ -5072,13 +5530,72 @@ class BattleRuntimeContractTests(unittest.TestCase):
         }
         source = {
             'id': 7, 'team': 1, 'x': 0.0, 'y': 0.0, 'z': 0.0,
-            'profile': {'class_tag': 'mediumTank'}}
+            'fire_seq': 0, 'profile': {'class_tag': 'mediumTank'}}
         target = {'position': (0.0, 0.0, 100.0)}
+        launch = {
+            'fire_seq': 1, 'shell_index': 0,
+            'shot_yaw': 0.05, 'shot_pitch': 0.0,
+            'flight_time': 0.125,
+            'origin': (0.0, 1.5, 0.0),
+        }
 
-        self.assertFalse(battle._bot_friendly_firing_lane(source, target))
+        verdict = battle._bot_friendly_firing_lane(
+            source, target, descriptor, 0, launch)
+        self.assertFalse(verdict['clear'])
+        self.assertTrue(chords)
+        self.assertGreater(max(end.x for unused, end in chords), 1.0)
 
         ally_entity.collideSegmentExt = lambda start, end: ()
-        self.assertTrue(battle._bot_friendly_firing_lane(source, target))
+        self.assertTrue(battle._bot_friendly_firing_lane(
+            source, target, descriptor, 0, launch)['clear'])
+
+        ally_entity.collideSegmentExt = lambda *unused: (_ for _ in ()).throw(
+            RuntimeError('native hull unavailable'))
+        failed = battle._bot_friendly_firing_lane(
+            source, target, descriptor, 0, launch)
+        self.assertFalse(failed['clear'])
+        self.assertNotIn('blocker_id', failed)
+        ally_entity.collideSegmentExt = lambda start, end: ()
+
+        # The worker's private player:-1 native-space carrier must not become
+        # an artificial friendly-fire obstruction.
+        dummy = _Vehicle(
+            12, _Descriptor(), _Vector(0.0, 0.0, 20.0), (0, 0, 0),
+            {'health': 1})
+        dummy.collideSegmentExt = lambda start, end: (
+            types.SimpleNamespace(dist=20.0),)
+        runtime.bigworld.entities[12] = dummy
+        battle._records['player:-1'] = {
+            'engine_id': 12, 'kind': 'player', 'network_id': -1,
+            'ready': True, 'local': True,
+            'state': {'team': 1, 'health': 1, 'alive': True}}
+        self.assertTrue(battle._bot_friendly_firing_lane(
+            source, target, descriptor, 0, launch)['clear'])
+
+    def test_worker_spg_launch_keeps_exact_remote_muzzle_node(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._worker_mode = True
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(4.0, 2.0, 6.0), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._records = {'bot:7': {
+            'engine_id': 10, 'kind': 'bot', 'network_id': 7,
+            'ready': True, 'local': False,
+            'state': {'team': 1, 'health': 500, 'alive': True}}}
+        receipt = {'path': ((4.0, 3.5, 6.0), (4.0, 1.0, 100.0))}
+        battle._artillery = types.SimpleNamespace(
+            request_launch=mock.Mock(return_value=(True, receipt)))
+
+        result = battle._bot_artillery_launch(
+            {'id': 7}, {'position': (4.0, 0.0, 100.0)},
+            entity.typeDescriptor, 0, 3, 0.0, 0.1, 2.0, 10.0)
+
+        self.assertIs(receipt, result)
+        args = battle._artillery.request_launch.call_args.args
+        self.assertEqual((4.0, 3.5, 6.0), args[5])
 
     def test_spg_friendly_lane_uses_exact_arc_and_real_he_radius(self):
         runtime = _runtime()
@@ -5112,21 +5629,21 @@ class BattleRuntimeContractTests(unittest.TestCase):
             (0.0, 1.0, 100.0))}
 
         self.assertFalse(battle._bot_artillery_friendly_lane(
-            source, {}, descriptor, 0, receipt))
+            source, {}, descriptor, 0, receipt)['clear'])
         self.assertEqual(1, ally_entity.collideSegmentExt.call_count)
 
         ally_entity.collideSegmentExt.reset_mock()
         ally_entity.collideSegmentExt.return_value = ()
         ally_entity.position = _Vector(5.0, 0.0, 100.0)
         self.assertFalse(battle._bot_artillery_friendly_lane(
-            source, {}, descriptor, 0, receipt))
+            source, {}, descriptor, 0, receipt)['clear'])
         ally_entity.collideSegmentExt.assert_not_called()
 
         descriptor.gun.shots[0].shell.explosionRadius = 4.0
         self.assertTrue(battle._bot_artillery_friendly_lane(
-            source, {}, descriptor, 0, receipt))
+            source, {}, descriptor, 0, receipt)['clear'])
         self.assertFalse(battle._bot_artillery_friendly_lane(
-            source, {}, descriptor, 0, {'path': ()}))
+            source, {}, descriptor, 0, {'path': ()})['clear'])
 
     def test_direction_and_graph_probes_reject_drowning_depth_water(self):
         runtime = _runtime()
@@ -5537,6 +6054,47 @@ class BattleRuntimeContractTests(unittest.TestCase):
         fire.assert_not_called()
         battle._present_repair_progress.assert_not_called()
         self.assertIsNone(battle._local_damage_report)
+
+    def test_fire_damage_is_sent_before_a_stale_snapshot_can_restore_health(self):
+        runtime = _runtime()
+        send_input = mock.Mock(return_value=True)
+        battle = BattleRuntime(runtime)
+        battle.client = types.SimpleNamespace(
+            player_id=1, send_input=send_input)
+        battle._avatar = runtime.bigworld.avatar
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = _LANInputSender(battle)
+        battle._local_position = (0.0, 0.0, 0.0)
+        battle._local_yaw = 0.0
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        entity.maxHealth = 500
+        entity.devices_hp = {'fuelTankHealth': 0.0}
+        entity._destroyed_devices = set(['fuelTankHealth'])
+        entity._crew_ko = set()
+        entity.is_on_fire = True
+        entity._fire_started = 0.0
+        entity._fire_timer = 0.0
+        runtime.bigworld.entities[10] = entity
+        record = {
+            'engine_id': 10,
+            'state': {'health': 500, 'display_health': 500, 'alive': True},
+            'kind': 'player', 'network_id': 1, 'local': True}
+        battle._records = {'player:1': record}
+        battle._present_critical = mock.Mock(return_value=False)
+        battle._present_repair_progress = mock.Mock(return_value=True)
+        battle._clock = lambda: 1.0
+
+        battle._tick_critical_states(1.0)
+
+        self.assertEqual(475, entity.health)
+        self.assertEqual(475, record['state']['health'])
+        send_input.assert_called_once()
+        self.assertEqual(
+            475, send_input.call_args.kwargs['reported_health'])
+        self.assertEqual(
+            battle._attack_reason('FIRE', 1),
+            send_input.call_args.kwargs['reported_reason'])
 
     def test_repair_progress_closes_with_zero_seconds_once(self):
         runtime = _runtime()
@@ -6526,6 +7084,115 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(runtime.bigworld.avatar.positions)
         self.assertTrue(client.sent)
 
+    def test_limited_traverse_autorotation_follows_unclamped_mouse_target(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        descriptor = _Descriptor()
+        descriptor.gun.turretYawLimits = (-0.10, 0.10)
+        entity = _Vehicle(
+            10, descriptor, _Vector(), (0, 0, 0), {'health': 500})
+        battle._sender = types.SimpleNamespace(aim_yaw=0.75)
+        battle._local_yaw = 0.0
+        battle._avatar.inputHandler.getAutorotation = lambda: True
+
+        self.assertEqual(
+            1.0, battle._local_autorotation_turn(entity, 0.0))
+        battle._sender.aim_yaw = -0.75
+        self.assertEqual(
+            -1.0, battle._local_autorotation_turn(entity, 0.0))
+        battle._sender.aim_yaw = 0.05
+        self.assertEqual(
+            0.0, battle._local_autorotation_turn(entity, 0.0))
+
+    def test_autorotation_respects_stock_mode_and_manual_hull_input(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        descriptor = _Descriptor()
+        descriptor.gun.turretYawLimits = (-0.10, 0.10)
+        entity = _Vehicle(
+            10, descriptor, _Vector(), (0, 0, 0), {'health': 500})
+        battle._sender = types.SimpleNamespace(aim_yaw=0.75)
+        battle._avatar.inputHandler.getAutorotation = lambda: False
+
+        self.assertEqual(
+            0.0, battle._local_autorotation_turn(entity, 0.0))
+        battle._avatar.inputHandler.getAutorotation = lambda: True
+        self.assertEqual(
+            -1.0, battle._local_autorotation_turn(entity, -1.0))
+        descriptor.gun.turretYawLimits = None
+        self.assertEqual(
+            0.0, battle._local_autorotation_turn(entity, 0.0))
+
+    def test_limited_traverse_autorotation_requires_no_drive_or_cruise(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        descriptor = _Descriptor()
+        descriptor.gun.turretYawLimits = (-0.10, 0.10)
+        entity = _Vehicle(
+            10, descriptor, _Vector(), (0, 0, 0), {'health': 500})
+        battle._sender = types.SimpleNamespace(aim_yaw=0.75)
+        battle._local_yaw = 0.0
+        battle._avatar.inputHandler.getAutorotation = lambda: True
+
+        self.assertEqual(0.0, battle._local_autorotation_turn(
+            entity, 0.0, drive_intent=1.0))
+        self.assertEqual(0.0, battle._local_autorotation_turn(
+            entity, 0.0, drive_intent=-1.0))
+        self.assertEqual(0.0, battle._local_autorotation_turn(
+            entity, 0.0, drive_intent=0.25))
+        self.assertEqual(1.0, battle._local_autorotation_turn(
+            entity, 0.0, drive_intent=0.0))
+
+    def test_limited_traverse_autorotation_respects_block_tracks(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        descriptor = _Descriptor()
+        descriptor.gun.turretYawLimits = (-0.10, 0.10)
+        entity = _Vehicle(
+            10, descriptor, _Vector(), (0, 0, 0), {'health': 500})
+        battle._sender = types.SimpleNamespace(aim_yaw=0.75)
+        battle._local_yaw = 0.0
+        battle._avatar.inputHandler.getAutorotation = lambda: True
+
+        self.assertEqual(0.0, battle._local_autorotation_turn(
+            entity, 0.0, tracks_blocked=True))
+        self.assertEqual(1.0, battle._local_autorotation_turn(
+            entity, 0.0, tracks_blocked=False))
+
+    def test_limited_traverse_autorotation_uses_copied_traverse_physics(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        battle.client = client
+        battle._avatar = runtime.bigworld.avatar
+        battle._avatar.inputHandler.getAutorotation = lambda: True
+        descriptor = _Descriptor()
+        descriptor.gun.turretYawLimits = (-0.10, 0.10)
+        entity = _Vehicle(
+            10, descriptor, _Vector(), (0, 0, 0), {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = types.SimpleNamespace(
+            forward=0.0, turn=0.0, aim_yaw=0.75, handbrake=False,
+            send_current=lambda: client.send_input('current'))
+        battle._local_descriptor = descriptor
+        battle._attach_local_presentation()
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.traverse_step', return_value=0.5) as step:
+            battle._drive_local(0.1)
+
+        self.assertEqual(1.0, step.call_args.args[2])
+        self.assertAlmostEqual(0.05, battle._local_yaw)
+        self.assertEqual(0.5, battle._local_turn_speed)
+        self.assertEqual((2, 8), entity.engineMode)
+        self.assertEqual(0.5, runtime.bigworld.avatar.positions[-1][3])
+
     def test_drowning_countdown_keeps_movement_until_the_vehicle_drowns(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -6797,6 +7464,50 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._send_bot_message.assert_called_once_with(observation)
         battle._observe_local_vehicle.assert_not_called()
 
+    def test_worker_samples_live_callbacks_without_starting_legacy_probe(self):
+        runtime = _runtime()
+        runtime.bigworld.now = 1.0
+        battle = BattleRuntime(runtime)
+        battle._worker_mode = True
+        battle._config = {
+            'authority_worker_probe': {'enabled': True, 'stageSeconds': 1}}
+        battle.state = 'running'
+        battle._battle_live = True
+        battle._last_frame_time = 0.98
+        battle._avatar = runtime.bigworld.avatar
+        battle.client = types.SimpleNamespace(
+            player_id=-1, team=1, bot_authority_id=-1,
+            phase='battle', is_bot_authority=lambda: True)
+        battle._last_snapshot = {'players': []}
+        publication = {'type': 'bot_state', 'bots': []}
+        battle._bots = types.SimpleNamespace(
+            update=mock.Mock(return_value=[publication]),
+            presentation_states=mock.Mock(return_value=()),
+            is_authority=lambda: True,
+            probe_totals=lambda: (0, 0, 0, 0, 0),
+            set_camera_position=mock.Mock())
+        battle._flush_pending_bot_create = mock.Mock()
+        battle._flush_pending_entities = mock.Mock()
+        battle._drain_event_journal = mock.Mock()
+        battle._maybe_send_battle_ready = mock.Mock()
+        battle._apply_authority_bot_poses = mock.Mock()
+        battle._send_bot_message = mock.Mock(return_value=True)
+        battle._projectile_is_authority = mock.Mock(return_value=False)
+        battle._schedule = mock.Mock()
+
+        battle._frame()
+
+        self.assertEqual(1, battle._worker_frame_callbacks)
+        self.assertEqual(
+            1, battle._authority_worker_probe_sample()['frame_callbacks'])
+        self.assertEqual(1, battle._worker_probe_authority_callbacks)
+        self.assertEqual(1, battle._worker_probe_bot_generated)
+        self.assertEqual(1, battle._worker_probe_bot_enqueued)
+        self.assertEqual(0, battle._worker_probe_bot_send_failed)
+        self.assertIsNone(battle._worker_probe)
+        self.assertFalse(battle._worker_probe_attempted)
+        battle._bots.set_camera_position.assert_called_once_with(None)
+
     def test_authority_replaces_local_placeholder_and_omits_remote_one(self):
         battle = BattleRuntime(_runtime())
         battle.client = _Client()
@@ -6831,6 +7542,159 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(local['world_pose'])
         self.assertFalse(
             battle._last_snapshot['players'][0]['world_pose'])
+
+    def test_worker_authority_omits_dummy_and_unpublished_humans(self):
+        battle = BattleRuntime(_runtime())
+        battle._worker_mode = True
+        battle.client = types.SimpleNamespace(player_id=-1)
+        battle._last_snapshot = {'players': [
+            {'id': -1, 'world_pose': True, 'x': 0.0, 'y': -500.0,
+             'z': 0.0},
+            {'id': 1, 'world_pose': True, 'x': 5.0, 'y': 0.0, 'z': 8.0},
+            {'id': 2, 'world_pose': False, 'x': 0.0, 'y': 0.0, 'z': 0.0},
+            {'id': 0, 'world_pose': True, 'x': 1.0, 'y': 0.0, 'z': 1.0},
+        ]}
+
+        players = battle._authority_players()
+
+        self.assertEqual([1], [value['id'] for value in players])
+
+    def test_worker_draw_off_waits_for_pending_and_loading_models(self):
+        battle = BattleRuntime(_runtime())
+        battle._worker_mode = True
+        battle.state = 'running'
+        battle._records = {
+            'player:-1': {'ready': True},
+            'bot:1': {'ready': False},
+        }
+        battle._pending_bot_creates = {'bot:2': {}}
+        battle._pending_bot_create_order = ['bot:2']
+
+        self.assertFalse(battle.authority_worker_ready_for_draw_off())
+
+        battle._pending_bot_creates = {}
+        battle._pending_bot_create_order = []
+        self.assertFalse(battle.authority_worker_ready_for_draw_off())
+
+        battle._records['bot:1']['ready'] = True
+        self.assertTrue(battle.authority_worker_ready_for_draw_off())
+
+    def test_worker_projectile_targets_keep_real_entities_and_omit_dummy(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._worker_mode = True
+        battle._local_position = (0.0, -500.0, 0.0)
+        entities = {
+            10: _Vehicle(10, _Descriptor(), _Vector(0.0, -500.0, 0.0),
+                         (0, 0, 0), {'health': 1}),
+            11: _Vehicle(11, _Descriptor(), _Vector(10.0, 0.0, 20.0),
+                         (0, 0, 0), {'health': 500}),
+            12: _Vehicle(12, _Descriptor(), _Vector(30.0, 0.0, 40.0),
+                         (0, 0, 0), {'health': 500}),
+        }
+        runtime.bigworld.entities.update(entities)
+        battle._records = {
+            'player:-1': {
+                'engine_id': 10, 'kind': 'player', 'network_id': -1,
+                'ready': True, 'local': True, 'state': {}},
+            'player:1': {
+                'engine_id': 11, 'kind': 'player', 'network_id': 1,
+                'ready': True, 'local': False, 'state': {}},
+            'bot:2': {
+                'engine_id': 12, 'kind': 'bot', 'network_id': 2,
+                'ready': True, 'local': False, 'state': {}},
+        }
+
+        positions = battle._projectile_record_positions()
+
+        self.assertEqual({'player:1', 'bot:2'}, set(positions))
+
+    def test_worker_materializes_remote_compounds_without_arena_ui(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._worker_mode = True
+        battle._binding = mock.Mock()
+        vehicles = {
+            11: _Vehicle(11, _Descriptor(), _Vector(1.0, 0.0, 2.0),
+                         (0, 0, 0), {'health': 500}),
+            12: _Vehicle(12, _Descriptor(), _Vector(3.0, 0.0, 4.0),
+                         (0, 0, 0), {'health': 500}),
+        }
+        runtime.bigworld.entities.update(vehicles)
+        battle._remote_factory = mock.Mock()
+        battle._remote_factory.error.return_value = None
+        battle._remote_factory.is_ready.return_value = True
+        battle._remote_factory.get.side_effect = vehicles.get
+        records = []
+        for engine_id, kind, network_id in ((11, 'player', 1), (12, 'bot', 2)):
+            record = {
+                'engine_id': engine_id,
+                'state': {'team': 1, 'health': 500, 'alive': True},
+                'kind': kind, 'network_id': network_id,
+                'local': False, 'presentation': True, 'ready': False,
+                'arena_added': False, 'native_remote': False,
+                'properties': {}, 'spot_visible': True,
+            }
+            records.append(record)
+            self.assertTrue(battle._materialize_record(record))
+
+        self.assertTrue(all(record['simulation_entity']
+                            for record in records))
+        self.assertTrue(all(record['ready'] for record in records))
+        self.assertTrue(all(vehicle.model.node('HP_gunFire') is not None
+                            for vehicle in vehicles.values()))
+        self.assertTrue(all(battle._record_is_event_ready(record)
+                            for record in records))
+        battle._binding.arena_vehicle_added.assert_not_called()
+        battle._binding.start_vehicle_visual.assert_not_called()
+
+    def test_worker_death_keeps_collision_compound_without_wreck_load(self):
+        runtime = _runtime()
+        states = []
+        original_assembler = runtime.model_assembler.prepareCompoundAssembler
+
+        def record_assembler(descriptor, state, space, flag):
+            states.append(state)
+            return original_assembler(descriptor, state, space, flag)
+
+        runtime.model_assembler.prepareCompoundAssembler = record_assembler
+        descriptor = _Descriptor()
+        material = types.SimpleNamespace(armor=75.0)
+        descriptor.hull.hitTester.localHitTest = mock.Mock(return_value=[
+            (12.0, None, 0.9, 7)])
+        descriptor.hull.materials = {7: material}
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(descriptor, {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True, 'gunAnglesPacked': 0},
+            _Vector(3.0, 0.0, 4.0), (0.0, 0.0, 0.0))
+        entity = factory.get(vehicle_id)
+        compound = entity.model
+        battle = BattleRuntime(runtime)
+        battle._worker_mode = True
+        battle._remote_factory = factory
+        record = {
+            'engine_id': vehicle_id, 'kind': 'bot', 'network_id': 2,
+            'local': False, 'presentation': True,
+            'state': {'team': 2, 'health': 500, 'alive': True},
+        }
+        start = _Vector(3.0, 1.0, -16.0)
+        end = _Vector(3.0, 1.0, 84.0)
+        before = entity.collideSegmentExt(start, end)
+
+        with mock.patch.object(
+                critical_damage, 'apply_death', return_value=None):
+            battle._apply_health(record, {'health': 0, 'alive': False})
+
+        after = entity.collideSegmentExt(start, end)
+        self.assertEqual(0, entity.health)
+        self.assertIs(compound, entity.model)
+        self.assertEqual(['undamaged'], states)
+        self.assertEqual(['vehicleHull'], [hit.compName for hit in before])
+        self.assertEqual(['vehicleHull'], [hit.compName for hit in after])
+        self.assertIs(material, after[0].matInfo)
+        factory.destroy_all()
 
     def test_garage_outfit_uses_the_arena_season_and_native_vehicle(self):
         requested = []
@@ -8037,8 +8901,64 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIs(ally, runtime.bigworld.entity(ally_id))
         self.assertIn(ally_id, runtime.bigworld.entities.keys())
         self.assertEqual(ally_id, battle._spectated_engine_id)
+        self.assertEqual(
+            ally_id, runtime.compatibility.postmortem_vehicle_id)
         self.assertEqual(ally_id,
                          battle._avatar.viewpoint_switches[-1][0])
+
+    def test_postmortem_switch_survives_exact_1513_steady_matrix_relink(self):
+        runtime, battle, factory, unused_camera = \
+            self._postmortem_switch_fixture()
+        descriptor = _Descriptor()
+        descriptor.isPitchHullAimingAvailable = False
+        ally_id = factory.create(
+            descriptor,
+            {'publicInfo': {'team': 1, 'name': 'Ally'},
+             'health': 500, 'isCrewActive': True,
+             'gunAnglesPacked': 0},
+            _Vector(20.0, 0.0, 10.0), (0.0, 0.0, 0.0))
+        ally = factory.get(ally_id)
+        battle._records['bot:2'] = {
+            'engine_id': ally_id,
+            'state': {'team': 1, 'health': 500, 'alive': True},
+            'kind': 'bot', 'network_id': 2, 'local': False,
+            'ready': True, 'presentation': True}
+
+        matrices = battle._avatar.consistentMatrices
+        original_set_target = matrices._ConsistentMatrices__setTarget
+        calculator = battle._avatar.inputHandler.\
+            steadyVehicleMatrixCalculator
+
+        def set_target_and_relink(matrix, as_static):
+            original_set_target(matrix, as_static)
+            selected = runtime.bigworld.entity(
+                runtime.compatibility.postmortem_vehicle_id)
+            if selected is None:
+                return
+            output = calculator.\
+                _SteadyVehicleMatrixCalculator__outputMProv
+            stabilised = calculator.\
+                _SteadyVehicleMatrixCalculator__stabilisedMProv
+            # Exact #1513 SteadyVehicleMatrixCalculator.relinkSources.
+            if selected.typeDescriptor.isPitchHullAimingAvailable:
+                output.rotationSrc = \
+                    selected.filter.groundPlacingMatrixFiltered
+                output.translationSrc = selected.filter.stabilisedMatrix
+            else:
+                output.rotationSrc = selected.filter.stabilisedMatrix
+                output.translationSrc = output.rotationSrc
+            stabilised.target = selected.filter.stabilisedMatrix
+
+        matrices._ConsistentMatrices__setTarget = set_target_and_relink
+
+        self.assertTrue(
+            battle._switch_postmortem_viewpoint(False, ally_id))
+        output = calculator._SteadyVehicleMatrixCalculator__outputMProv
+        stabilised = calculator.\
+            _SteadyVehicleMatrixCalculator__stabilisedMProv
+        self.assertIs(ally.matrix, output.rotationSrc)
+        self.assertIs(ally.matrix, output.translationSrc)
+        self.assertIs(ally.matrix, stabilised.target)
 
     def test_postmortem_switch_cycles_live_friendly_bot_and_human(self):
         runtime, battle, factory, unused_camera = \
@@ -8180,6 +9100,19 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._detach_local_presentation()
 
         self.assertIs(native_matrix, provider.target)
+
+    def test_remote_snapshot_applies_confirmed_suspension_rotation(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._binding = mock.Mock()
+        battle._apply_record_pose(
+            {'engine_id': 17, 'local': False, 'state': {}},
+            {'x': 2.0, 'y': 3.0, 'z': 4.0, 'yaw': 0.6,
+             'pitch': -0.14, 'roll': 0.08})
+
+        args = battle._binding.set_vehicle_pose.call_args.args
+        self.assertEqual(17, args[0])
+        self.assertEqual(_engine_rotation(0.6, -0.14, 0.08), args[2])
 
     def test_native_reverse_sample_preserves_yaw_component_order(self):
         runtime = _runtime()
@@ -9773,6 +10706,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(11, pose_call[0][0])
         self.assertEqual((4.0, 0.0, 8.0), tuple(pose_call[0][1]))
         self.assertEqual((0.0, 0.0, 3.0), pose_call[0][2])
+        self.assertEqual(runtime.bigworld.now, pose_call[1]['now'])
 
     def test_remote_update_is_coalesced_until_vehicle_materializes(self):
         runtime = _runtime()
@@ -9893,6 +10827,21 @@ class BattleRuntimeContractTests(unittest.TestCase):
             [(2, runtime.constants.FINISH_REASON.EXTERMINATION)],
             runtime.bigworld.avatar.round_finished)
         self.assertTrue(battle._round_finished_notified)
+
+    def test_worker_terminal_result_stops_simulation_without_hud(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._worker_mode = True
+        battle._avatar = runtime.bigworld.avatar
+        battle._battle_live = True
+        battle.state = 'running'
+
+        self.assertTrue(battle._apply_battle_result({
+            'winner': 2, 'reason': 'battle_timeout'}))
+
+        self.assertFalse(battle._battle_live)
+        self.assertTrue(battle._round_finished_notified)
+        self.assertEqual([], runtime.bigworld.avatar.round_finished)
 
     def test_base_capture_uses_exact_1513_event_shapes(self):
         runtime = _runtime()
@@ -11032,6 +11981,46 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._binding.arena_vehicle_killed.assert_called_once_with(
             10, 11, 0)
 
+    def test_terminal_critical_state_does_not_replay_device_hits_to_flash(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        record = {
+            'engine_id': 10,
+            'state': {'team': 1, 'health': 500, 'alive': True},
+            'kind': 'player', 'network_id': 1, 'local': True}
+        battle._records = {'player:1': record}
+        battle._last_health[10] = (500, 500, True, 0)
+        terminal = {
+            'devices': [], 'destroyed': ['engineHealth'],
+            'crew_ko': ['driver'], 'fire': False,
+            'ammo_rack_death': False,
+            'events': [
+                {'kind': 'device', 'name': 'engineHealth',
+                 'state': 'destroyed', 'cause': 'shot'},
+                {'kind': 'crew', 'name': 'driver',
+                 'state': 'destroyed', 'cause': 'shot'},
+            ]}
+        battle._present_critical = mock.Mock(return_value=True)
+        battle._sync_fire_effect = mock.Mock(return_value=True)
+
+        with mock.patch.object(
+                critical_damage, 'apply_death', return_value=terminal):
+            battle._apply_health(record, {
+                'health': 0, 'display_health': 0, 'alive': False,
+                'death_reason': 0}, attacker_id=11, reason_id=0,
+                force_cause=True)
+
+        battle._present_critical.assert_not_called()
+        battle._sync_fire_effect.assert_called_once_with(entity)
+        self.assertEqual([], record['critical_state']['events'])
+        self.assertEqual(
+            terminal, battle._local_damage_report['critical'])
+
     def test_critical_proposal_carries_exact_descriptor_crew_roster(self):
         descriptor = _Descriptor()
         descriptor.type = types.SimpleNamespace(crewRoles=(
@@ -11997,7 +12986,16 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'damage_to_target': 40}))
 
         battle.client.send_bot_ram.assert_called_once_with(
-            11, 'human', 2, 4, 20, 40)
+            11, 'human', 2, 4, 20, 40, None, None)
+
+        battle.client.send_bot_ram.reset_mock()
+        self.assertTrue(battle._send_bot_message({
+            'type': 'bot_ram', 'bot_id': 11, 'target_kind': 'human',
+            'target_id': 2, 'ram_seq': 5, 'damage_to_bot': 21,
+            'damage_to_target': 41,
+            'ram_contact_player_id': 2, 'ram_contact_seq': 9}))
+        battle.client.send_bot_ram.assert_called_once_with(
+            11, 'human', 2, 5, 21, 41, 2, 9)
 
     def test_bot_state_uses_the_already_projected_client_boundary(self):
         battle = BattleRuntime(_runtime())

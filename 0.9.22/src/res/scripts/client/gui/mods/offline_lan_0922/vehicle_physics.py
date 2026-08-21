@@ -694,15 +694,3 @@ def fall_damage(maxHealth, impact_speed):
 		return 0
 	return int(maxHealth * (iv - FALL_SAFE_SPEED) * FALL_DMG_PER_MS)
 
-
-def ram_damage(closing_speed, mass_self, mass_other):
-	'''(dmg_to_other, dmg_to_self) for a ram at the given closing speed.
-	Heavier rammer deals more, takes less.'''
-	rel = abs(closing_speed)
-	if rel <= RAM_SAFE_SPEED:
-		return 0, 0
-	imp = (rel - RAM_SAFE_SPEED) * (rel - RAM_SAFE_SPEED)
-	ratio = max(0.1, min(4.0, mass_self / max(mass_other, 1.0)))
-	dmg_other = min(450, int(imp * 1.7 * max(0.35, min(2.6, ratio))))
-	dmg_self = min(350, int(imp * 1.0 * max(0.25, min(2.2, 1.0 / ratio))))
-	return dmg_other, dmg_self

@@ -1,5 +1,6 @@
 from __future__ import print_function
 
+import os
 import sys
 import time
 
@@ -7,6 +8,7 @@ import BigWorld
 
 from gui.mods.offline_lan_0922.compat import g_compatibility
 from gui.mods.offline_lan_0922 import config as port_config
+from gui.mods.offline_lan_0922 import instance_guard
 from gui.mods.offline_lan_0922 import vehicle_blacklist
 from gui.mods.offline_lan_0922.account_rpc.state import AccountState
 
@@ -16,12 +18,16 @@ _started = False
 _session = None
 _announcement_ui = None
 _intro_skip = None
+_worker_presentation = None
 _config = None
+_client_mode = None
 _account_context = None
 _deadline = 0.0
 _login_space_seen = False
 _lobby_view_loaded = False
 _lobby_listener_installed = False
+_client_guard_released = False
+_worker_ready_signaled = False
 
 # Enough of every artefact that the garage never blocks a mount on stock.
 OFFLINE_ARTEFACT_STOCK = 200
@@ -112,12 +118,84 @@ def _restore_garage(snapshot):
     if store is None:
         return False
     try:
-        return bool(store.apply(snapshot))
+        return bool(store.apply(
+            snapshot, validator=_validate_restored_garage))
     except Exception as error:
         sys.stdout.write(
             '[Offline LAN 0.9.22] the saved garage could not be restored: '
             '%s\n' % error)
         return False
+
+
+def _validate_restored_garage(snapshot):
+    """Exercise saved native descriptors before publishing the Account.
+
+    ``GarageStore`` first validates the engine-free relational snapshot.  This
+    second boundary rejects a damaged compact descriptor, crew row, outfit or
+    ammunition set while the restore still lives on a detached copy.  A bad
+    save therefore falls back to the freshly built stock garage instead of
+    aborting Account synchronization and parking the client at login.
+    """
+    from items import customizations, tankmen, vehicles
+    from gui.mods.offline_lan_0922.account_rpc import data
+
+    data._validate_selected_vehicle(snapshot)
+    records = snapshot.get('vehicles')
+    if not isinstance(records, (list, tuple)):
+        records = [snapshot]
+    for record in records:
+        descriptor = vehicles.VehicleDescr(
+            compactDescr=record['compDescr'])
+        nation_id, vehicle_type_id = descriptor.type.id
+        vehicle_type = vehicles.makeIntCompactDescrByID(
+            'vehicle', nation_id, vehicle_type_id)
+        if int(record.get('vehicleTypeCompactDescr', 0)) != int(vehicle_type):
+            raise ValueError(
+                'saved vehicle descriptor does not match its garage type')
+
+        layout_key = (int(descriptor.turret.compactDescr),
+                      int(descriptor.gun.compactDescr))
+        if tuple(record.get('shellsLayoutIdx') or ()) != layout_key:
+            raise ValueError(
+                'saved ammunition layout does not match the mounted gun')
+        compatible_shells = set()
+        for shot in (getattr(descriptor.gun, 'shots', ()) or ()):
+            shell = getattr(shot, 'shell', None)
+            compact_descr = getattr(shell, 'compactDescr', 0)
+            if compact_descr:
+                compatible_shells.add(int(compact_descr))
+        shells = list(record.get('shells') or ())
+        loaded = 0
+        for index in range(0, len(shells), 2):
+            compact_descr = int(shells[index])
+            count = int(shells[index + 1])
+            if compact_descr not in compatible_shells or count < 0:
+                raise ValueError(
+                    'saved ammunition does not fit the mounted gun')
+            loaded += count
+        if loaded <= 0:
+            raise ValueError('saved vehicle has no loaded ammunition')
+        maximum = int(getattr(descriptor.gun, 'maxAmmo', 0) or 0)
+        if maximum > 0 and loaded > maximum:
+            raise ValueError('saved ammunition exceeds the gun capacity')
+
+        crew_ids = list(record.get('crew') or ())
+        crew = dict(record.get('tankmen') or {})
+        roles = tuple(descriptor.type.crewRoles)
+        if len(crew_ids) != len(roles):
+            raise ValueError('saved crew does not match the vehicle')
+        for slot, tankman_id in enumerate(crew_ids):
+            tankman = tankmen.TankmanDescr(crew[tankman_id])
+            if (int(tankman.nationID) != int(nation_id) or
+                    int(tankman.vehicleTypeID) != int(vehicle_type_id) or
+                    tankman.role != roles[slot][0]):
+                raise ValueError(
+                    'saved crew member does not match the vehicle slot')
+
+        for outfit_data in dict(record.get('outfits') or {}).values():
+            outfit_descr, unused_enabled = outfit_data
+            customizations.parseOutfitDescr(outfit_descr)
+    return True
 
 
 def _component_compact_descrs(value, seen):
@@ -144,6 +222,26 @@ def _component_compact_descrs(value, seen):
         return
     seen.add(compact_descr)
     yield compact_descr
+
+
+def _component_descriptors(value, seen):
+    """Yield unique component objects from a possibly nested component list."""
+    if value is None:
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            for descriptor in _component_descriptors(item, seen):
+                yield descriptor
+        return
+    compact_descr = getattr(value, 'compactDescr', None)
+    try:
+        compact_descr = int(compact_descr)
+    except (TypeError, ValueError):
+        return
+    if compact_descr in seen:
+        return
+    seen.add(compact_descr)
+    yield value
 
 
 def _offers_in_random_battle(descriptor):
@@ -185,6 +283,21 @@ def _vehicle_type_modules(descriptor):
     for compact_descr in _component_compact_descrs(
             getattr(vehicle_type, 'guns', None), gun_seen):
         yield ('vehicleGun', compact_descr)
+
+
+def _vehicle_type_guns(descriptor):
+    """Yield every gun the vehicle type can mount, including stock guns."""
+    vehicle_type = getattr(descriptor, 'type', None)
+    if vehicle_type is None:
+        return
+    seen = set()
+    for turret in _turret_descriptors(vehicle_type):
+        for gun in _component_descriptors(
+                getattr(turret, 'guns', None), seen):
+            yield gun
+    for gun in _component_descriptors(
+            getattr(vehicle_type, 'guns', None), seen):
+        yield gun
 
 
 # equipments.xml: autoExtinguishers id=1, largeMedkit id=3, largeRepairkit
@@ -269,7 +382,7 @@ def _turret_descriptors(vehicle_type):
             yield value
 
 
-def _selected_vehicle(config):
+def _selected_vehicle(config, restore_saved=True):
     try:
         import nations
         from items import ITEM_TYPE_INDICES, tankmen, vehicles
@@ -375,6 +488,27 @@ def _selected_vehicle(config):
                 for index in range(0, len(shells), 2):
                     record_shell_items[shells[index]] = shells[index + 1]
 
+                # Saved fittings may mount any gun in the vehicle's research
+                # tree.  Catalogue every such gun's shells at account level,
+                # while the per-vehicle inventory below remains exactly the
+                # ammunition currently loaded.  Without this closure an
+                # alternate gun saved valid shells that disappeared from the
+                # next bootstrap's prices/unlocks and Account sync aborted.
+                shell_catalog = {}
+                for gun in _vehicle_type_guns(descriptor):
+                    gun_shells = list(vehicles.getDefaultAmmoForGun(gun))
+                    if not gun_shells or len(gun_shells) % 2:
+                        raise ValueError(
+                            'gun ammo must contain descriptor/count pairs')
+                    for index in range(0, len(gun_shells), 2):
+                        compact_descr = int(gun_shells[index])
+                        count = int(gun_shells[index + 1])
+                        if compact_descr <= 0 or count < 0:
+                            raise ValueError(
+                                'gun ammo has an invalid descriptor or count')
+                        shell_catalog[compact_descr] = max(
+                            count, int(shell_catalog.get(compact_descr, 0)))
+
                 # The exact key #1513 Vehicle.shellsLayoutIdx looks up.
                 layout_key = (descriptor.turret.compactDescr,
                               descriptor.gun.compactDescr)
@@ -411,6 +545,16 @@ def _selected_vehicle(config):
                         'credits': 0, 'gold': 0,
                     }
                     unlock_item_compact_descrs.add(compact_descr)
+
+            published_shells = inventory_items.setdefault(
+                ITEM_TYPE_INDICES['shell'], {})
+            for compact_descr, count in shell_catalog.items():
+                published_shells[compact_descr] = max(
+                    int(published_shells.get(compact_descr, 0)), int(count))
+                shop_item_prices[compact_descr] = {
+                    'credits': 0, 'gold': 0,
+                }
+                unlock_item_compact_descrs.add(compact_descr)
 
             vehicle_type_compact_descrs.add(vehicle_int_compact_descr)
             unlock_item_compact_descrs.add(vehicle_int_compact_descr)
@@ -496,7 +640,8 @@ def _selected_vehicle(config):
         })
         # Overlay the saved garage last, so it wins over the stock fitting but
         # never over the current client's catalogue.
-        _restore_garage(result)
+        if restore_saved:
+            _restore_garage(result)
         return result
     except Exception:
         # _run_once owns startup error reporting.  Returning an empty snapshot
@@ -533,9 +678,11 @@ def _remove_lobby_listener():
 
 
 def _cleanup_runtime():
-    global _account_context, _callback_id, _config, _deadline
+    global _account_context, _callback_id, _client_mode, _config, _deadline
     global _lobby_listener_installed, _lobby_view_loaded
     global _announcement_ui, _intro_skip, _login_space_seen, _session, _started
+    global _worker_presentation, _worker_ready_signaled
+    global _client_guard_released
     errors = []
 
     callback_id = _callback_id
@@ -555,6 +702,17 @@ def _cleanup_runtime():
             # destroy it immediately in the next cleanup stage.
             session.stop(show_login=False, restore_account=False,
                          release_join=True)
+        except Exception as error:
+            errors.append(error)
+
+    worker_presentation = _worker_presentation
+    _worker_presentation = None
+    if worker_presentation is not None:
+        try:
+            # This cleanup runs only during worker failure or process exit.
+            # Keep the second client hidden and silent until Windows tears it
+            # down; restoring here produces a visible/audible shutdown flash.
+            worker_presentation.deactivate(restore=False)
         except Exception as error:
             errors.append(error)
 
@@ -586,17 +744,24 @@ def _cleanup_runtime():
         errors.append(error)
 
     _account_context = None
+    _client_mode = None
     _config = None
     _deadline = 0.0
     _login_space_seen = False
     _lobby_view_loaded = False
+    _client_guard_released = False
+    _worker_ready_signaled = False
     _started = False
     if errors:
         return errors[0]
     return None
 
 
-def _fail_startup(error, prefix='startup failed'):
+def _fail_startup(error, prefix='startup failed', worker_process=False):
+    worker_process = bool(
+        worker_process or
+        _worker_presentation is not None or
+        _client_mode == port_config.SIMULATION_WORKER_MODE)
     cleanup_error = _cleanup_runtime()
     if cleanup_error is None:
         sys.stdout.write('[Offline LAN 0.9.22] %s: %s\n' %
@@ -605,6 +770,13 @@ def _fail_startup(error, prefix='startup failed'):
         sys.stdout.write(
             '[Offline LAN 0.9.22] %s: %s; cleanup failed: %s\n' %
             (prefix, error, cleanup_error))
+    if worker_process:
+        try:
+            BigWorld.quit()
+        except Exception as quit_error:
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] simulation worker exit failed: %s\n' %
+                quit_error)
 
 
 def _lobby_is_ready(app_loader, lobby):
@@ -671,6 +843,54 @@ def _install_lan_session():
     return True
 
 
+def _install_worker_session():
+    """Install the opt-in simulation worker without any lobby controls."""
+    global _session
+    if _session is not None:
+        return True
+    from gui.mods.offline_lan_0922.authority_worker import WorkerSession
+    _session = WorkerSession(
+        _config, lobby_ready=_native_lobby_is_ready,
+        callback=BigWorld.callback,
+        cancel_callback=BigWorld.cancelCallback,
+        bigworld=BigWorld)
+    return True
+
+
+def _install_worker_presentation():
+    """Hide and mute only the explicitly launched simulation worker."""
+    global _worker_presentation
+    if _worker_presentation is not None:
+        return True
+    from gui.mods.offline_lan_0922.worker_presentation import \
+        WorkerPresentation
+    presentation = WorkerPresentation()
+    _worker_presentation = presentation
+    try:
+        if not presentation.activate():
+            raise RuntimeError(
+                'simulation worker presentation did not start')
+    except Exception:
+        # Activation may have muted WWISE or hidden a window before the final
+        # step failed. Never undo those safeguards while the worker exits.
+        try:
+            presentation.deactivate(restore=False)
+        except Exception as cleanup_error:
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] worker presentation cleanup failed: '
+                '%s\n' % cleanup_error)
+        _worker_presentation = None
+        raise
+    return True
+
+
+def _signal_worker_ready():
+    """Publish readiness after the worker Hangar and LAN welcome succeed."""
+    from gui.mods.offline_lan_0922.worker_presentation import \
+        signal_worker_ready
+    return signal_worker_ready()
+
+
 def _install_intro_skip():
     """Skip the startup video so the client reaches the login screen."""
     global _intro_skip
@@ -718,21 +938,27 @@ def _wait_for_login_space():
             _schedule(0.0, _wait_for_login_space)
             return
         _login_space_seen = False
-        # LobbyHeaderMeta stores a bound ``fightClick`` Function when its
-        # Scaleform movie receives ``script = self``.  A class patch installed
-        # after HANGAR_READY can repaint the button but cannot replace that
-        # cached callback.  Own the action before connect creates the lobby.
-        _install_announcement_ui()
-        _install_lan_session()
-        try:
-            # This must outlive every connect/disconnect: it decides which
-            # preferences profile the player's interface settings live in.
-            from gui.mods.offline_lan_0922 import compat as _compat
-            _compat.pin_account_settings()
-        except Exception as error:
-            sys.stdout.write(
-                '[Offline LAN 0.9.22] interface settings were not pinned: '
-                '%s\n' % error)
+        if _client_mode == port_config.SIMULATION_WORKER_MODE:
+            # The worker needs a native lobby only as a safe map-lifecycle
+            # bridge. It owns no Battle button, announcement or preference
+            # profile and therefore cannot mutate the player's UI settings.
+            _install_worker_session()
+        else:
+            # LobbyHeaderMeta stores a bound ``fightClick`` Function when its
+            # Scaleform movie receives ``script = self``.  A class patch
+            # installed after HANGAR_READY can repaint the button but cannot
+            # replace that cached callback. Own it before lobby creation.
+            _install_announcement_ui()
+            _install_lan_session()
+            try:
+                # This must outlive every connect/disconnect: it decides which
+                # preferences profile the player's interface settings use.
+                from gui.mods.offline_lan_0922 import compat as _compat
+                _compat.pin_account_settings()
+            except Exception as error:
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] interface settings were not pinned: '
+                    '%s\n' % error)
         g_compatibility.connect(
             show_lobby=True, account_context=_account_context)
         _schedule(0.10, _wait_for_lobby)
@@ -752,13 +978,23 @@ def _wait_for_lobby():
         if (g_compatibility.is_ready() and
                 _lobby_is_ready(g_appLoader, lobby)):
             if _session is None:
-                raise RuntimeError('LAN Battle button is not installed')
+                raise RuntimeError('LAN session is not installed')
             _remove_lobby_listener()
-            sys.stdout.write(
-                '[Offline LAN 0.9.22] lobby ready; click Battle to join '
-                '%s:%s\n' % (
-                    _config.get('host', '127.0.0.1'),
-                    _config.get('port', 28782)))
+            if _client_mode == port_config.SIMULATION_WORKER_MODE:
+                if not _session.start():
+                    raise RuntimeError('simulation worker did not start')
+                # WorkerSession.start only launches its socket thread. Do not
+                # release the player until the worker receives a valid server
+                # welcome and publishes connected+ready on the main thread.
+                _deadline = time.time() + float(
+                    _config.get('startupTimeoutSeconds', 30.0))
+                _schedule(0.10, _wait_for_worker_connection)
+            else:
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] lobby ready; click Battle to join '
+                    '%s:%s\n' % (
+                        _config.get('host', '127.0.0.1'),
+                        _config.get('port', 28782)))
             return
         # EULA and other first-run screens require user interaction and must
         # not consume the hangar-startup timeout.  The deadline begins when
@@ -771,8 +1007,55 @@ def _wait_for_lobby():
         _fail_startup(error)
 
 
+def _wait_for_worker_connection():
+    global _callback_id, _deadline, _worker_ready_signaled
+    _callback_id = None
+    try:
+        if _worker_ready_signaled:
+            return
+        if _session is None:
+            raise RuntimeError('simulation worker session is unavailable')
+        client = getattr(_session, 'client', None)
+        if (client is not None and
+                bool(getattr(client, 'connected', False)) and
+                bool(getattr(client, 'ready', False))):
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] simulation worker connected to '
+                '%s:%s\n' % (
+                    _config.get('host', '127.0.0.1'),
+                    _config.get('port', 28782)))
+            if not _signal_worker_ready():
+                raise RuntimeError(
+                    'simulation worker ready marker was not published')
+            # The marker is the final fallible startup operation. Once it is
+            # visible, the waiting player helper may launch immediately.
+            _worker_ready_signaled = True
+            _deadline = 0.0
+            return
+        if (getattr(_session, 'state', None) == 'failed' or
+                (_deadline > 0.0 and time.time() >= _deadline)):
+            raise RuntimeError('simulation worker connection timed out')
+        _schedule(0.10, _wait_for_worker_connection)
+    except Exception as error:
+        _fail_startup(error)
+
+
+def _worker_account_state():
+    """Seed the hidden worker's EULA setting from this exact client."""
+    from constants import USER_SERVER_SETTINGS
+    from gui.doc_loaders.EULAVersionLoader import EULAVersionLoader
+
+    setting_key = int(USER_SERVER_SETTINGS.EULA_VERSION)
+    version = int(EULAVersionLoader().xmlVersion)
+    if version < 0:
+        raise RuntimeError('invalid client EULA version')
+    account_state = AccountState(path=None)
+    account_state.add_int_settings((setting_key, version))
+    return account_state
+
+
 def _run_once():
-    global _account_context, _callback_id, _config, _deadline
+    global _account_context, _callback_id, _client_mode, _config, _deadline
     _callback_id = None
     try:
         _config = port_config.load()
@@ -780,15 +1063,29 @@ def _run_once():
             _cleanup_runtime()
             sys.stdout.write('[Offline LAN 0.9.22] disabled by config\n')
             return
-        account_state = AccountState()
-        account_state.postbattle_store = _battle_results_store()
-        _account_context = {
-            'selected_vehicle': _selected_vehicle(_config),
-            'garage_store': _garage_store(),
-            # Account settings are server-owned in #1513.  Keep their local
-            # offline substitute beside config.json across client restarts.
-            'account_state': account_state,
-        }
+        _client_mode = port_config.client_mode(_config)
+        if _client_mode == port_config.SIMULATION_WORKER_MODE:
+            if not _client_guard_released:
+                raise RuntimeError(
+                    'simulation worker requires client guard release')
+            # The worker still needs Account/Hangar to enter and leave native
+            # spaces safely. Every mutable store is in memory and the saved
+            # player garage is neither read nor overlaid.
+            _account_context = {
+                'selected_vehicle': _selected_vehicle(
+                    _config, restore_saved=False),
+                'account_state': _worker_account_state(),
+            }
+        else:
+            account_state = AccountState()
+            account_state.postbattle_store = _battle_results_store()
+            _account_context = {
+                'selected_vehicle': _selected_vehicle(_config),
+                'garage_store': _garage_store(),
+                # Account settings are server-owned in #1513. Keep their
+                # local offline substitute beside config across restarts.
+                'account_state': account_state,
+            }
         _deadline = 0.0
         _wait_for_login_space()
     except Exception as error:
@@ -796,16 +1093,58 @@ def _run_once():
 
 
 def init():
-    global _callback_id, _started
+    global _callback_id, _client_guard_released, _started
     if _started:
         return
     _started = True
+    guard_error = None
     try:
+        # Complete #1513's native WGC teardown before scheduling callbacks;
+        # the Python callback thread does not own WGC's client mutex.
+        _client_guard_released = instance_guard.release_if_requested()
+    except Exception as error:
+        guard_error = error
+        _client_guard_released = False
+
+    if _client_guard_released:
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] released wot_client_mutex for another '
+            'offline client\n')
+    elif guard_error is not None:
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] client guard release failed: %s\n' %
+            guard_error)
+
+    requested_mode = os.environ.get(port_config.CLIENT_MODE_ENV, '')
+    try:
+        requested_mode = requested_mode.strip()
+    except AttributeError:
+        requested_mode = ''
+    try:
+        # Install this before every worker refusal path. A fresh preferences
+        # leaf otherwise selects #1513's compulsory, unskippable intro movie.
         _install_intro_skip()
+        if requested_mode == port_config.SIMULATION_WORKER_MODE:
+            if not _client_guard_released:
+                _started = False
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] simulation worker startup refused: '
+                    'WGC client guard teardown did not complete\n')
+                try:
+                    BigWorld.quit()
+                except Exception as quit_error:
+                    sys.stdout.write(
+                        '[Offline LAN 0.9.22] simulation worker exit failed: '
+                        '%s\n' % quit_error)
+                return
+            _install_worker_presentation()
         _install_lobby_listener()
         _schedule(0.0, _run_once)
     except Exception as error:
-        _fail_startup(error, prefix='startup callback failed')
+        _fail_startup(
+            error, prefix='startup callback failed',
+            worker_process=(
+                requested_mode == port_config.SIMULATION_WORKER_MODE))
 
 
 def fini():

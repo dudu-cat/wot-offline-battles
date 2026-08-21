@@ -57,6 +57,29 @@ class WindowsServerLauncherTests(unittest.TestCase):
             ('server', '0.0.0.0', 28782, 'server_random', 30, 'client', 15),
         ], events)
 
+    def test_hidden_coordinator_loopback_mode_skips_firewall(self):
+        run_server = mock.Mock()
+        with mock.patch.dict(
+                os.environ,
+                {windows_server.SERVER_LOOPBACK_ONLY_ENV: '1'}), \
+                mock.patch.object(
+                    windows_server, '_load_server',
+                    return_value=('server_random', run_server)), \
+                mock.patch.object(
+                    windows_server,
+                    '_ensure_windows_firewall_rule') as ensure:
+            self.assertEqual(0, windows_server.main())
+
+        ensure.assert_not_called()
+        run_server.assert_called_once_with(
+            '127.0.0.1',
+            28782,
+            'server_random',
+            30,
+            'client',
+            15,
+        )
+
     def test_launcher_environment_selects_the_total_tanks_per_team(self):
         run_server = mock.Mock()
         with mock.patch.dict(

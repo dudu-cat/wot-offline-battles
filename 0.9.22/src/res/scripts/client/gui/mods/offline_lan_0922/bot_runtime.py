@@ -38,6 +38,7 @@ ARTILLERY_IMPACT_ERROR_METRES = 1.5
 ARTILLERY_RECEIPT_HOLD_SECONDS = 10.0
 COVER_JOBS_PER_OBSERVATION = 3
 HUMAN_TARGET_ID_BASE = 1000000
+RAM_REPORT_CURRENT_DISTANCE = 12.5
 VISIBILITY_MIN_SECONDS = 0.18
 VISIBILITY_JITTER_SECONDS = 0.018
 SHOT_LANE_SECONDS = 0.20
@@ -91,6 +92,15 @@ DECISION_TIER_FACTOR = (1.0, 2.0, 4.0)
 MOTION_PROBE_SECONDS = DECISION_SECONDS
 MOTION_PROBE_LATERAL_BUDGET = 1.0
 MOTION_PROBE_FORWARD_BUDGET = 3.5
+# Friendly following uses the same one-second time gap that the former hard
+# cutoff attempted to enforce.  Keep its standstill gap separate from hull
+# extents: ``clearance`` below is already measured edge-to-edge.
+TRAFFIC_HEADWAY_SECONDS = 1.0
+TRAFFIC_STANDSTILL_CLEARANCE = 1.5
+# A friendly-hull escape is a temporary tactical override, not a new route.
+# Bound it so an unreachable lateral point cannot suppress the server order
+# forever; every metre still has to pass the ordinary native motion gate.
+FRIENDLY_REPOSITION_SECONDS = 4.0
 # A final exact receipt costs nine native rays.  Thirteen jobs per render frame
 # drains all 29 Bots within three frames even at the supported 24 FPS floor.
 # New, unproved motion fails closed when the budget is exhausted; proactive
@@ -480,9 +490,11 @@ def _local_launch_record(state):
         'shot_pitch': state['shot_pitch'],
         'class_tag': class_tag,
     }
+    if 'shot_origin' in state:
+        result['shot_origin'] = state['shot_origin']
     if class_tag == 'SPG':
         for name in (
-                'shot_origin', 'shot_velocity', 'shot_gravity',
+                'shot_velocity', 'shot_gravity',
                 'shot_max_distance', 'shot_max_time_ms', 'shot_proof_key'):
             if name in state:
                 result[name] = state[name]
@@ -1020,10 +1032,32 @@ class BotRuntime(object):
                 position, yaw)
         raise ValueError('direction probe must accept 2, 3 or 4 arguments')
 
+    @staticmethod
+    def _adapt_friendly_lane_probe(probe):
+        """Adapt the former two-argument internal seam once at startup."""
+        target = getattr(
+            probe, 'im_func', getattr(probe, '__func__', probe))
+        code = getattr(target, 'func_code', getattr(target, '__code__', None))
+        if code is None:
+            return probe
+        argument_count = int(code.co_argcount)
+        bound_self = getattr(
+            probe, 'im_self', getattr(probe, '__self__', None))
+        if bound_self is not None:
+            argument_count -= 1
+        if bool(code.co_flags & 0x04) or argument_count >= 5:
+            return probe
+        if argument_count == 2:
+            return lambda source, target, unused_descriptor, unused_shell, \
+                    unused_launch: probe(source, target)
+        raise ValueError(
+            'friendly lane probe must accept 2 or at least 5 arguments')
+
     def __init__(self, local_player_id, descriptor_resolver=None,
                  direction_probe=None, adapter_factory=None,
                  vehicle_selector=None, visibility_probe=None,
                  firing_lane_probe=None, friendly_lane_probe=None,
+                 direct_launch_origin_probe=None,
                  ballistic_solution_probe=None,
                  artillery_launch_probe=None,
                  artillery_friendly_lane_probe=None,
@@ -1033,7 +1067,7 @@ class BotRuntime(object):
                  obstacle_probe=None, bounds=None, cover_probe=None,
                  native_motion=False, baked_graph=None, probe_clock=None,
                  motion_resolver=None, motion_report=None,
-                 world_receipt_probe=None):
+                 world_receipt_probe=None, probe_timing_seconds=0.0):
         self.local_player_id = local_player_id
         self.descriptor_resolver = descriptor_resolver or (lambda unused: {})
         self.direction_probe = self._adapt_direction_probe(
@@ -1050,8 +1084,21 @@ class BotRuntime(object):
         self.firing_lane_probe = firing_lane_probe or self.visibility_probe
         # Dynamic allied hulls are deliberately outside the cached static-world
         # lane.  Production checks this seam again at every final fire attempt.
-        self.friendly_lane_probe = friendly_lane_probe or (
-            lambda unused_source, unused_target: True)
+        self.friendly_lane_probe = self._adapt_friendly_lane_probe(
+            friendly_lane_probe or (
+                lambda unused_source, unused_target: True))
+        # Production freezes the exact native HP_gunFire transform before the
+        # friendly-hull proof.  The logical fallback keeps the pure runtime
+        # usable in engine-free tests; BattleRuntime always injects the native
+        # boundary.
+        self.direct_launch_origin_probe = (
+            direct_launch_origin_probe or
+            (lambda source, unused_descriptor, unused_shell,
+             unused_fire_seq, unused_yaw, unused_pitch,
+             unused_flight_time: (
+                 _number(source.get('x')),
+                 _number(source.get('y')) + 1.5,
+                 _number(source.get('z')))))
         # SPG solutions are completed by BattleRuntime's bounded native arc
         # queue.  Returning None means pending or fail-closed; a dict is a
         # fully probed physical solution shared by aiming and firing.
@@ -1084,7 +1131,23 @@ class BotRuntime(object):
         self.motion_resolver = motion_resolver
         self.motion_report = motion_report
         self.world_receipt_probe = world_receipt_probe
-        self._probe_clock = probe_clock if callable(probe_clock) else None
+        probe_clock = probe_clock if callable(probe_clock) else None
+        self._probe_timing_seconds = max(
+            0.0, _number(probe_timing_seconds))
+        self._probe_timing_deadline = None
+        self._probe_clock_pending = None
+        if probe_clock is not None and self._probe_timing_seconds > 0.0:
+            # A bounded timing window starts only on the first accepted
+            # authority tick. Countdown prewarm and an idle worker therefore
+            # cannot consume the useful sample before BotRuntime does work.
+            self._probe_clock = None
+            self._probe_clock_pending = probe_clock
+            self._probe_timing_state = 'pending'
+        else:
+            # Preserve the injected-test and explicit unbounded-probe contract.
+            self._probe_clock = probe_clock
+            self._probe_timing_state = (
+                'unbounded' if probe_clock is not None else 'off')
         self.adapter = None
         self.authority_id = None
         self.round_id = None
@@ -1097,6 +1160,7 @@ class BotRuntime(object):
         self._ammo_states = {}
         self._artillery_intents = {}
         self._artillery_reproofs = {}
+        self._friendly_repositions = {}
         self._shot_los_cache = {}
         self._shot_los_deadlines = {}
         self._physics_params = {}
@@ -1112,6 +1176,7 @@ class BotRuntime(object):
         self._ram_cooldowns = {}
         self._ram_contacts = frozenset()
         self._ram_seq = 0
+        self._human_ram_receipt_seq = {}
         self.finished = False
         self._visibility_cache = {}
         self._team_visibility_cache = {}
@@ -1158,6 +1223,24 @@ class BotRuntime(object):
         """Return measured query time without resetting or driving work."""
         return tuple(self._probe_duration_totals)
 
+    def probe_timing_state(self):
+        """Describe the bounded native-query timer without advancing it."""
+        return self._probe_timing_state
+
+    def _advance_probe_timing(self, now):
+        """Start and expire the optional bounded timer on authority time."""
+        if self._probe_clock_pending is not None:
+            self._probe_clock = self._probe_clock_pending
+            self._probe_clock_pending = None
+            self._probe_timing_deadline = (
+                float(now) + self._probe_timing_seconds)
+            self._probe_timing_state = 'active'
+        elif (self._probe_timing_deadline is not None and
+              float(now) + 1e-9 >= self._probe_timing_deadline):
+            self._probe_clock = None
+            self._probe_timing_deadline = None
+            self._probe_timing_state = 'complete'
+
     def diagnostic_totals(self):
         """Return counters which never participate in simulation decisions."""
         return {'alive_bot_ticks': int(self._alive_bot_ticks)}
@@ -1170,6 +1253,9 @@ class BotRuntime(object):
         except Exception:
             # Diagnostics must never change or terminate gameplay.
             self._probe_clock = None
+            self._probe_clock_pending = None
+            self._probe_timing_deadline = None
+            self._probe_timing_state = 'failed'
             return None
 
     def _probe_finished(self, index, started):
@@ -1182,6 +1268,9 @@ class BotRuntime(object):
                 self._probe_duration_totals[index] += elapsed
         except Exception:
             self._probe_clock = None
+            self._probe_clock_pending = None
+            self._probe_timing_deadline = None
+            self._probe_timing_state = 'failed'
 
     def is_authority(self):
         return self.authority_id == self.local_player_id
@@ -1495,6 +1584,7 @@ class BotRuntime(object):
             self._gun_states = {}
             self._ammo_states = {}
             self._clear_artillery_intents()
+            self._friendly_repositions = {}
             self._shot_los_cache = {}
             self._shot_los_deadlines = {}
             self._physics_params = {}
@@ -1510,6 +1600,7 @@ class BotRuntime(object):
             self._ram_cooldowns = {}
             self._ram_contacts = frozenset()
             self._ram_seq = 0
+            self._human_ram_receipt_seq = {}
             self.adapter = None
             self.finished = False
             self._visibility_cache = {}
@@ -1535,6 +1626,7 @@ class BotRuntime(object):
         if message.get('battle_result') is not None:
             self.finished = True
             self._clear_artillery_intents()
+            self._friendly_repositions = {}
         previous_authority = self.authority_id
         self.authority_id = message.get('bot_authority_id')
         authority_handoff = (
@@ -1544,6 +1636,7 @@ class BotRuntime(object):
             isinstance(message.get('bot_manifest'), (list, tuple)))
         if previous_authority != self.authority_id:
             self._clear_artillery_intents()
+            self._friendly_repositions = {}
             self._visibility_cache = {}
             self._team_visibility_cache = {}
             self._visibility_fire = {}
@@ -2042,6 +2135,7 @@ class BotRuntime(object):
             state['alive'] = state['health'] > 0
             state['display_health'] = state['health']
             if not state['alive']:
+                self._friendly_repositions.pop(state['id'], None)
                 state['death_reason'] = 1
                 state['speed'] = 0.0
                 state['movement_dir'] = 0
@@ -2069,6 +2163,7 @@ class BotRuntime(object):
         if message.get('battle_result') is not None:
             self.finished = True
             self._clear_artillery_intents()
+            self._friendly_repositions = {}
         server_tick = message.get('server_tick')
         if server_tick is not None:
             try:
@@ -2123,6 +2218,7 @@ class BotRuntime(object):
                     not state['alive']):
                 self._cancel_artillery_intent(state['id'])
             if not state['alive']:
+                self._friendly_repositions.pop(state['id'], None)
                 state['speed'] = 0.0
                 state['movement_dir'] = 0
                 state['rotation_dir'] = 0
@@ -3047,13 +3143,16 @@ class BotRuntime(object):
         return result
 
     @staticmethod
-    def _traffic_throttle(source, command, neighbours):
+    def _traffic_throttle(source, command, neighbours, physics_params=None):
         """Return ``(throttle, waiting)`` for nearby friendly traffic.
 
         Same-lane followers always respect the vehicle ahead. At a crossing or
         merge, the lower bot id has deterministic right of way; every bot yields
-        to a human. This breaks the symmetric stop/turn/reverse loop without
-        changing route selection or the physical tank-contact response.
+        to a human.  A following vehicle uses a continuous time-gap controller
+        translated through its copied drivetrain.  The former absolute-speed
+        cutoff alternated full throttle and coast braking whenever a dense
+        spawn row crossed ``clearance == speed`` even if both tanks had the
+        same velocity.
         """
         throttle = max(-1.0, min(1.0, _number(command.get('throttle'))))
         if throttle <= 0.01:
@@ -3131,20 +3230,57 @@ class BotRuntime(object):
             other_forward = max(
                 0.0, other_vx * corridor_sine +
                 other_vz * corridor_cosine)
-            candidate = (clearance, other_forward)
+            candidate = (clearance, other_forward, same_direction)
             if nearest is None or candidate[0] < nearest[0]:
                 nearest = candidate
         if nearest is None:
             return throttle, False
-        clearance, leader_speed = nearest
-        safe_clearance = max(1.5, own_speed * 1.0)
-        if clearance <= safe_clearance:
+        clearance, leader_speed, same_direction = nearest
+        if not same_direction:
+            # A crossing or head-on merge is a discrete right-of-way event,
+            # not longitudinal following.  Preserve the established yield
+            # gate; the continuous controller below applies only to vehicles
+            # travelling along the same corridor.
+            safe_clearance = max(
+                TRAFFIC_STANDSTILL_CLEARANCE,
+                own_speed * TRAFFIC_HEADWAY_SECONDS)
+            if clearance <= safe_clearance:
+                return 0.0, True
+            if own_speed > leader_speed + 0.5:
+                limited = min(throttle, max(0.0, min(
+                    1.0, (clearance - safe_clearance) / 4.0)))
+                return limited, limited + 1e-9 < throttle
+            return throttle, False
+        if clearance <= TRAFFIC_STANDSTILL_CLEARANCE:
             return 0.0, True
-        if own_speed > leader_speed + 0.5:
-            limited = min(throttle, max(0.0, min(
-                1.0, (clearance - safe_clearance) / 4.0)))
-            return limited, limited + 1e-9 < throttle
-        return throttle, False
+        if physics_params is None:
+            physics_params = vehicle_physics.derive_params({})
+        try:
+            mass = max(1.0, float(physics_params['mass']))
+            slope_pitch = _number(source.get('last_drive_pitch'))
+            steering = abs(_number(command.get('turn'))) > 0.01
+            drive_accel = vehicle_physics.engine_force(
+                physics_params, own_speed, 1.0, slope_pitch) / mass
+            rolling_accel = vehicle_physics.rolling_resist_force(
+                physics_params, 0, steering) / mass
+            gravity_accel = vehicle_physics.GRAVITY * math.sin(slope_pitch)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return throttle, False
+        if drive_accel <= 0.000001:
+            return throttle, False
+        desired_clearance = (TRAFFIC_STANDSTILL_CLEARANCE +
+                             own_speed * TRAFFIC_HEADWAY_SECONDS)
+        # Standard constant-time-headway feedback: close the spacing error in
+        # one headway while also matching the leader's forward velocity.  The
+        # result is an acceleration, not a hand-tuned throttle blend.
+        desired_accel = (
+            (clearance - desired_clearance) /
+            (TRAFFIC_HEADWAY_SECONDS * TRAFFIC_HEADWAY_SECONDS) +
+            (leader_speed - own_speed) / TRAFFIC_HEADWAY_SECONDS)
+        required = ((desired_accel - gravity_accel + rolling_accel) /
+                    drive_accel)
+        limited = min(throttle, max(0.0, min(1.0, required)))
+        return limited, limited + 1e-9 < throttle
 
     def _player_vehicle_profile(self, raw):
         vehicle_name = raw.get('vehicle')
@@ -3191,6 +3327,206 @@ class BotRuntime(object):
         self._player_collision_profiles[cache_key] = cached
         return cached
 
+    def _ram_reports(self, state, events, human_ram_receipt=None):
+        reports = []
+        for event in events:
+            other_id = int(event['other_id'])
+            target_kind = ('human' if
+                           other_id >= HUMAN_TARGET_ID_BASE else 'bot')
+            if target_kind == 'human':
+                other_id -= HUMAN_TARGET_ID_BASE
+            self_velocity = event['velocity_self']
+            other_velocity = event['velocity_other']
+            self_shape = event['shape_self']
+            other_shape = event['shape_other']
+            contact_normal = event['contact_normal']
+            self_vehicle = event['self_vehicle'].replace(
+                '\r', ' ').replace('\n', ' ')
+            other_vehicle = event['other_vehicle'].replace(
+                '\r', ' ').replace('\n', ' ')
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] RAM diagnostic '
+                'self_id=%d self_vehicle=%s other_kind=%s other_id=%d '
+                'other_vehicle=%s mass_self=%.3f mass_other=%.3f '
+                'velocity_self_xz=(%.4f,%.4f) '
+                'velocity_other_xz=(%.4f,%.4f) '
+                'yaw_self=%.5f yaw_other=%.5f '
+                'shape_self=(%.3f,%.3f,%.3f,%.3f) '
+                'shape_other=(%.3f,%.3f,%.3f,%.3f) '
+                'contact_normal_xz=(%.5f,%.5f) '
+                'contact_penetration=%.5f '
+                'normal_closing_speed=%.5f damage_to_self=%d '
+                'damage_to_other=%d\n' % (
+                    int(event['self_id']), self_vehicle, target_kind,
+                    other_id, other_vehicle, event['mass_self'],
+                    event['mass_other'], self_velocity[0],
+                    self_velocity[1], other_velocity[0],
+                    other_velocity[1], event['yaw_self'],
+                    event['yaw_other'], self_shape[0], self_shape[1],
+                    self_shape[2], self_shape[3], other_shape[0],
+                    other_shape[1], other_shape[2], other_shape[3],
+                    contact_normal[0], contact_normal[1],
+                    event['contact_penetration'], event['closing_speed'],
+                    event['damage_to_self'], event['damage_to_other']))
+            self._ram_seq += 1
+            report = {
+                'type': 'bot_ram', 'bot_id': int(state['id']),
+                'target_kind': target_kind, 'target_id': other_id,
+                'ram_seq': self._ram_seq,
+                'damage_to_bot': event['damage_to_self'],
+                'damage_to_target': event['damage_to_other'],
+            }
+            if (target_kind == 'human' and
+                    isinstance(human_ram_receipt, dict)):
+                report['ram_contact_player_id'] = int(
+                    human_ram_receipt['player_id'])
+                report['ram_contact_seq'] = int(
+                    human_ram_receipt['seq'])
+            reports.append(report)
+        return reports
+
+    def _apply_tank_contact_response(self, state, result, step,
+                                     advance_push=True,
+                                     apply_correction=True):
+        """Apply one resolver response through the canonical bot motion path."""
+        delta_x, delta_z = result['delta_velocity']
+        yaw = _number(state.get('yaw'))
+        speed = _number(state.get('speed'))
+        forward_impulse = (delta_x * math.sin(yaw) +
+                           delta_z * math.cos(yaw))
+        applied_forward = 0.0
+        if forward_impulse * speed < 0.0:
+            applied_forward = (-speed if
+                               abs(forward_impulse) >= abs(speed)
+                               else forward_impulse)
+            state['speed'] = speed + applied_forward
+        push_x = (_number(state.get('push_x')) + delta_x -
+                  applied_forward * math.sin(yaw))
+        push_z = (_number(state.get('push_z')) + delta_z -
+                  applied_forward * math.cos(yaw))
+        correction_x, correction_z = (result['correction'] if
+                                      apply_correction else (0.0, 0.0))
+        move_x = correction_x + (push_x * step if advance_push else 0.0)
+        move_z = correction_z + (push_z * step if advance_push else 0.0)
+        move_distance = math.sqrt(move_x * move_x + move_z * move_z)
+        if move_distance > 0.0001:
+            contact_yaw = math.atan2(move_x, move_z)
+            contact_speed = move_distance / max(float(step), 1.0 / 120.0)
+            if not self._clear(
+                    _position(state), contact_yaw, contact_speed, None):
+                # Tank separation is not permission to cross static world
+                # geometry. Let the other hull keep its inverse-mass share.
+                move_x = 0.0
+                move_z = 0.0
+                push_x = 0.0
+                push_z = 0.0
+        state['x'] += move_x
+        state['z'] += move_z
+        push_decay = (0.90 ** (max(0.0, float(step)) * 60.0)
+                      if advance_push else 1.0)
+        state['push_x'] = push_x * push_decay
+        state['push_z'] = push_z * push_decay
+
+    def _resolve_human_ram_receipts(self, players, now, step=None,
+                                    processed_pairs=None):
+        """Recompute client-observed contact against its canonical bot body."""
+        reports = []
+        for raw in players or ():
+            if not isinstance(raw, dict) or raw.get('id') is None:
+                continue
+            receipt = raw.get('ram_contact')
+            historical = raw.get('_ram_contact_bot_state')
+            if not isinstance(receipt, dict) or not isinstance(
+                    historical, dict):
+                continue
+            try:
+                player_id = int(raw['id'])
+                seq = int(receipt['seq'])
+                bot_id = int(receipt['bot_id'])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if seq <= int(self._human_ram_receipt_seq.get(player_id, 0)):
+                continue
+            self._human_ram_receipt_seq[player_id] = seq
+            current = self.states.get(bot_id)
+            if (current is None or not current.get('alive', True) or
+                    int(_number(historical.get('id'), -1)) != bot_id):
+                continue
+            try:
+                player_x = float(receipt['x'])
+                player_y = float(receipt['y'])
+                player_z = float(receipt['z'])
+                player_yaw = float(receipt['yaw'])
+                player_vx = float(receipt['vx'])
+                player_vz = float(receipt['vz'])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            current_dx = _number(current.get('x')) - _number(raw.get('x'))
+            current_dz = _number(current.get('z')) - _number(raw.get('z'))
+            if (current_dx * current_dx + current_dz * current_dz >
+                    RAM_REPORT_CURRENT_DISTANCE *
+                    RAM_REPORT_CURRENT_DISTANCE):
+                continue
+            profile = self._player_collision_profile(raw)
+            bot_yaw = _number(historical.get('yaw'))
+            bot_speed = (_number(historical.get('speed')) if
+                         historical.get('alive', True) else 0.0)
+            bot = {
+                'id': bot_id,
+                'alive': bool(historical.get('alive', True)),
+                'team': int(_number(historical.get('team'))),
+                'vehicle': str(historical.get('vehicle') or ''),
+                'x': _number(historical.get('x')),
+                'y': _number(historical.get('y')),
+                'z': _number(historical.get('z')),
+                'yaw': bot_yaw,
+                'mass': _number(historical.get('mass'), 25000.0),
+                'shape': historical.get('collision_shape'),
+                'vx': _number(historical.get(
+                    'ram_vx', math.sin(bot_yaw) * bot_speed +
+                    _number(historical.get('push_x')))),
+                'vz': _number(historical.get(
+                    'ram_vz', math.cos(bot_yaw) * bot_speed +
+                    _number(historical.get('push_z')))),
+            }
+            player = {
+                'id': HUMAN_TARGET_ID_BASE + player_id,
+                'alive': bool(raw.get('alive', True)),
+                'team': int(_number(raw.get('team'))),
+                'vehicle': str(raw.get('vehicle') or ''),
+                'x': player_x, 'y': player_y, 'z': player_z,
+                'yaw': player_yaw,
+                'mass': profile['mass'], 'shape': profile['shape'],
+                'vx': player_vx, 'vz': player_vz,
+            }
+            result = tank_collision.resolve_tank(
+                bot, (player,), now=now,
+                ram_cooldowns=self._ram_cooldowns,
+                active_ram_contacts=frozenset())
+            self._ram_cooldowns = result['cooldowns']
+            if result['ram_events'] and step is not None:
+                # The human client already applied its half of the e=0
+                # response at the visually presented contact. Apply the bot's
+                # half here as well; otherwise it remains artificially still
+                # and the slowed player collides with it again one second
+                # later. The current-frame detector skips this exact pair.
+                # Accumulate the historical impulse now, but leave its push
+                # integration/damping to the ordinary once-per-bot pass below.
+                # Do not transplant old penetration correction onto the bot's
+                # newer canonical pose; that correction is not time-invariant.
+                self._apply_tank_contact_response(
+                    current, result, step, advance_push=False,
+                    apply_correction=False)
+                if processed_pairs is not None:
+                    processed_pairs.add((
+                        min(bot_id, HUMAN_TARGET_ID_BASE + player_id),
+                        max(bot_id, HUMAN_TARGET_ID_BASE + player_id)))
+            reports.extend(self._ram_reports(
+                current, result['ram_events'], {
+                    'player_id': player_id, 'seq': seq,
+                }))
+        return reports
+
     def _resolve_tank_contacts(self, players, now, step):
         """Apply current 0.8.2 chassis OBB response and report rams."""
         if self.native_motion:
@@ -3203,6 +3539,7 @@ class BotRuntime(object):
             tanks.append({
                 'id': int(state['id']), 'alive': alive,
                 'team': int(_number(state.get('team'))),
+                'vehicle': str(state.get('vehicle') or ''),
                 'x': _number(state.get('x')), 'y': _number(state.get('y')),
                 'z': _number(state.get('z')), 'yaw': yaw,
                 'mass': _number(state.get('mass'), 25000.0),
@@ -3226,6 +3563,7 @@ class BotRuntime(object):
             tanks.append({
                 'id': player_id, 'alive': alive,
                 'team': int(_number(raw.get('team'))),
+                'vehicle': str(raw.get('vehicle') or ''),
                 # The human client owns its own contact impulse; taking it
                 # here too would make an enemy pair shake.  A friendly bot is
                 # the exception: it owns the velocity response so the local
@@ -3251,7 +3589,9 @@ class BotRuntime(object):
                 'position': (tank['x'], tank['y'], tank['z'])}
         collision_index = tank_collision.build_spatial_index(
             collision_bodies, maximum_radius * 2.0 + 4.0)
-        reports = []
+        receipt_pairs = set()
+        reports = self._resolve_human_ram_receipts(
+            players, now, step=step, processed_pairs=receipt_pairs)
         previous_ram_contacts = self._ram_contacts
         current_ram_contacts = set()
         for state in self._ordered_states():
@@ -3265,6 +3605,9 @@ class BotRuntime(object):
             others = []
             for tank_id in candidate_ids:
                 if tank_id == own['id'] or tank_id not in by_id:
+                    continue
+                pair = (min(own['id'], tank_id), max(own['id'], tank_id))
+                if pair in receipt_pairs:
                     continue
                 other = by_id[tank_id]
                 if (tank_id >= HUMAN_TARGET_ID_BASE and
@@ -3280,59 +3623,9 @@ class BotRuntime(object):
                 active_ram_contacts=previous_ram_contacts)
             self._ram_cooldowns = result['cooldowns']
             current_ram_contacts.update(result['contacts'])
-            delta_x, delta_z = result['delta_velocity']
-            yaw = _number(state.get('yaw'))
-            speed = _number(state.get('speed'))
-            forward_impulse = (delta_x * math.sin(yaw) +
-                               delta_z * math.cos(yaw))
-            applied_forward = 0.0
-            if forward_impulse * speed < 0.0:
-                applied_forward = (-speed if
-                                   abs(forward_impulse) >= abs(speed)
-                                   else forward_impulse)
-                state['speed'] = speed + applied_forward
-            push_x = (_number(state.get('push_x')) + delta_x -
-                      applied_forward * math.sin(yaw))
-            push_z = (_number(state.get('push_z')) + delta_z -
-                      applied_forward * math.cos(yaw))
-            correction_x, correction_z = result['correction']
-            move_x = correction_x + push_x * step
-            move_z = correction_z + push_z * step
-            move_distance = math.sqrt(move_x * move_x + move_z * move_z)
-            if move_distance > 0.0001:
-                contact_yaw = math.atan2(move_x, move_z)
-                contact_speed = move_distance / max(float(step), 1.0 / 120.0)
-                if not self._clear(
-                        _position(state), contact_yaw, contact_speed, None):
-                    # Tank separation is not permission to cross static world
-                    # geometry. Let the other hull take its own inverse-mass
-                    # share instead of pushing this hull through a wall.
-                    move_x = 0.0
-                    move_z = 0.0
-                    push_x = 0.0
-                    push_z = 0.0
-            state['x'] += move_x
-            state['z'] += move_z
-            # Keep the copied 0.90 damping law time-based.  Per-frame damping
-            # retains lateral momentum much longer on a low-FPS authority and
-            # lets a light tank keep sliding a heavy one after contact.
-            push_decay = 0.90 ** (max(0.0, float(step)) * 60.0)
-            state['push_x'] = push_x * push_decay
-            state['push_z'] = push_z * push_decay
-            for event in result['ram_events']:
-                other_id = int(event['other_id'])
-                target_kind = ('human' if
-                               other_id >= HUMAN_TARGET_ID_BASE else 'bot')
-                if target_kind == 'human':
-                    other_id -= HUMAN_TARGET_ID_BASE
-                self._ram_seq += 1
-                reports.append({
-                    'type': 'bot_ram', 'bot_id': int(state['id']),
-                    'target_kind': target_kind, 'target_id': other_id,
-                    'ram_seq': self._ram_seq,
-                    'damage_to_bot': event['damage_to_self'],
-                    'damage_to_target': event['damage_to_other'],
-                })
+            self._apply_tank_contact_response(state, result, step)
+            reports.extend(self._ram_reports(
+                state, result['ram_events']))
         self._ram_contacts = frozenset(current_ram_contacts)
         return reports
 
@@ -3624,10 +3917,20 @@ class BotRuntime(object):
             if reproof is not None and isinstance(target, dict):
                 probe_target = self._corrected_artillery_target(
                     target, reproof['compensation_offset'])
-            value = self.ballistic_solution_probe(
-                dict(state), (dict(probe_target)
-                              if probe_target is not None else None),
-                descriptor, int(shell_index), _number(now))
+            if self._probe_clock is None:
+                value = self.ballistic_solution_probe(
+                    dict(state), (dict(probe_target)
+                                  if probe_target is not None else None),
+                    descriptor, int(shell_index), _number(now))
+            else:
+                probe_started = self._probe_started()
+                try:
+                    value = self.ballistic_solution_probe(
+                        dict(state), (dict(probe_target)
+                                      if probe_target is not None else None),
+                        descriptor, int(shell_index), _number(now))
+                finally:
+                    self._probe_finished(1, probe_started)
             if not isinstance(value, dict):
                 return None
             try:
@@ -4097,9 +4400,19 @@ class BotRuntime(object):
         shot_yaw = intent['shot_yaw']
         shot_pitch = intent['shot_pitch']
         flight_time = intent['solution']['flight_time']
-        value = self.artillery_launch_probe(
-            dict(state), dict(target), descriptor, int(shell_index),
-            fire_seq, shot_yaw, shot_pitch, flight_time, _number(now))
+        if self._probe_clock is None:
+            value = self.artillery_launch_probe(
+                dict(state), dict(target), descriptor, int(shell_index),
+                fire_seq, shot_yaw, shot_pitch, flight_time, _number(now))
+        else:
+            probe_started = self._probe_started()
+            try:
+                value = self.artillery_launch_probe(
+                    dict(state), dict(target), descriptor, int(shell_index),
+                    fire_seq, shot_yaw, shot_pitch, flight_time,
+                    _number(now))
+            finally:
+                self._probe_finished(1, probe_started)
         receipt = self._validated_artillery_receipt(
             value, descriptor, shell_index, fire_seq,
             shot_yaw, shot_pitch, flight_time)
@@ -4143,11 +4456,186 @@ class BotRuntime(object):
             return None
         return receipt
 
+    def _direct_launch_preview(
+            self, state, descriptor, shell_index, gun_state,
+            ballistic_solution):
+        """Freeze the exact next direct-shell angles without committing it."""
+        if not isinstance(ballistic_solution, dict):
+            return None
+        try:
+            flight_time = float(ballistic_solution['flight_time'])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+        if (math.isnan(flight_time) or math.isinf(flight_time) or
+                flight_time <= 0.0 or
+                flight_time > ballistics.PROJECTILE_MAX_FLIGHT_SECONDS):
+            return None
+        fire_seq = int(state.get('fire_seq', 0)) + 1
+        shot_yaw, shot_pitch = _dispersed_barrel_angles(
+            state['id'], self.round_id, fire_seq,
+            state['aim_yaw'], state['gun_pitch'],
+            _effective_shot_dispersion(gun_state, state, descriptor))
+        try:
+            if self._probe_clock is None:
+                raw_origin = self.direct_launch_origin_probe(
+                    dict(state), descriptor, int(shell_index), fire_seq,
+                    shot_yaw, shot_pitch, flight_time)
+            else:
+                probe_started = self._probe_started()
+                try:
+                    raw_origin = self.direct_launch_origin_probe(
+                        dict(state), descriptor, int(shell_index), fire_seq,
+                        shot_yaw, shot_pitch, flight_time)
+                finally:
+                    self._probe_finished(1, probe_started)
+            origin = tuple(float(value) for value in raw_origin)
+        except Exception:
+            return None
+        if (len(origin) != 3 or
+                any(math.isnan(value) or math.isinf(value)
+                    for value in origin)):
+            return None
+        return {
+            'fire_seq': fire_seq,
+            'shell_index': int(shell_index),
+            'shot_yaw': shot_yaw,
+            'shot_pitch': shot_pitch,
+            'flight_time': flight_time,
+            'origin': origin,
+        }
+
+    @staticmethod
+    def _friendly_lane_verdict(value):
+        """Return a fail-closed clear flag plus optional blocker metadata."""
+        if isinstance(value, dict):
+            if not isinstance(value.get('clear'), bool):
+                return False, {}
+            return bool(value['clear']), dict(value)
+        return bool(value), {}
+
+    def _clear_friendly_reposition(self, bot_id):
+        try:
+            bot_id = int(bot_id)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        removed = self._friendly_repositions.pop(bot_id, None)
+        if removed is not None:
+            self._decision_cache.pop(bot_id, None)
+        return removed is not None
+
+    def _mark_friendly_reposition(
+            self, state, command, target, launch, verdict, now):
+        """Move laterally through the existing safe driver after a blocked shot."""
+        try:
+            bot_id = int(state['id'])
+            source_team = int(state['team'])
+            fire_seq = int(launch['fire_seq'])
+            shot_yaw = float(launch['shot_yaw'])
+            target_id = int(command['target_id'])
+            blocker_kind = str(verdict['blocker_kind'])
+            blocker_id = int(verdict['blocker_id'])
+            blocker_team = int(verdict['blocker_team'])
+            blocker_position = tuple(
+                float(verdict['blocker_position'][index])
+                for index in range(3))
+        except (KeyError, TypeError, ValueError, IndexError, OverflowError):
+            return False
+        if (blocker_kind not in ('bot', 'player') or
+                blocker_id <= 0 or blocker_team != source_team or
+                (blocker_kind == 'bot' and blocker_id == bot_id) or
+                any(math.isnan(value) or math.isinf(value)
+                    for value in blocker_position)):
+            return False
+        shape = state.get('collision_shape')
+        try:
+            source_radius = math.hypot(float(shape[0]), float(shape[1]))
+        except (TypeError, ValueError, IndexError):
+            source_radius = math.hypot(
+                max(0.3, _number(state.get('half_width'), 1.7)),
+                max(0.5, _number(state.get('half_length'), 3.5)))
+        blocker_radius = _number(
+            verdict.get('blocker_radius'), source_radius)
+        if (math.isnan(blocker_radius) or math.isinf(blocker_radius) or
+                blocker_radius <= 0.0):
+            blocker_radius = source_radius
+        clearance = source_radius + blocker_radius + \
+            tank_collision.POSITION_SLOP
+        side = 1.0 if ((bot_id + fire_seq) & 1) else -1.0
+        position = _position(state)
+        destination = (
+            position[0] + math.cos(shot_yaw) * clearance * side,
+            position[1],
+            position[2] - math.sin(shot_yaw) * clearance * side,
+        )
+        self._friendly_repositions[bot_id] = {
+            'target_id': target_id,
+            'target_kind': target.get('kind') if isinstance(target, dict)
+            else None,
+            'destination': destination,
+            'shell_index': int(state.get('shell_index', 0)),
+            'fire_range': max(0.0, _number(command.get('fire_range'))),
+            'deadline': _number(now) + FRIENDLY_REPOSITION_SECONDS,
+        }
+        # The next authority frame must run the safe LocalDriver for this new
+        # destination; a cached hold command would otherwise remain stationary.
+        self._decision_cache.pop(bot_id, None)
+        return True
+
+    def _friendly_reposition_order(self, state, targets, now):
+        """Return an ordinary lane escape plus whether its lease expired."""
+        bot_id = int(state['id'])
+        marker = self._friendly_repositions.get(bot_id)
+        if marker is None:
+            return None, False
+        if _number(now) >= _number(marker.get('deadline')):
+            self._clear_friendly_reposition(bot_id)
+            return None, True
+        target = (targets or {}).get(marker['target_id'])
+        if (not isinstance(target, dict) or
+                not bool(target.get('alive', True)) or
+                ('health' in target and _number(target.get('health')) <= 0.0)):
+            self._clear_friendly_reposition(bot_id)
+            return None, False
+        destination = marker['destination']
+        if _distance(_position(state), destination) <= \
+                ai_driver.WAYPOINT_ARRIVAL_RADIUS:
+            self._clear_friendly_reposition(bot_id)
+            return None, False
+        target_position = _point(
+            target.get('position'), _position(target))
+        return {
+            'target_id': marker['target_id'],
+            'aim_position': target_position,
+            'face_position': target_position,
+            'move_position': destination,
+            'fire_allowed': False,
+            'combat_mode': 'friendly_lane_reposition',
+            'throttle_override': 0.72,
+            'fire_range': marker['fire_range'],
+            'shell_index': marker['shell_index'],
+        }, False
+
     def _fire(self, state, gun_state, reload_factor, descriptor,
-              launch_receipt=None, ammo_state=None):
+              launch_receipt=None, ammo_state=None, launch_preview=None):
         next_fire_seq = int(state.get('fire_seq', 0)) + 1
         if launch_receipt is not None:
             if int(launch_receipt.get('fire_seq', -1)) != next_fire_seq:
+                return False
+        if launch_preview is not None:
+            try:
+                preview_seq = int(launch_preview['fire_seq'])
+                preview_yaw = float(launch_preview['shot_yaw'])
+                preview_pitch = float(launch_preview['shot_pitch'])
+                preview_origin = tuple(
+                    float(value) for value in launch_preview['origin'])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return False
+            if (launch_receipt is not None or preview_seq != next_fire_seq or
+                    len(preview_origin) != 3 or
+                    math.isnan(preview_yaw) or math.isinf(preview_yaw) or
+                    math.isnan(preview_pitch) or math.isinf(preview_pitch) or
+                    any(math.isnan(value) or math.isinf(value)
+                        for value in preview_origin)):
                 return False
         if ammo_state is None:
             ammo_state = self._ammo_states.get(int(state.get('id', 0)))
@@ -4168,12 +4656,17 @@ class BotRuntime(object):
                 'shot_max_distance', 'shot_max_time_ms', 'shot_proof_key'):
             state.pop(name, None)
         if launch_receipt is None:
-            state['shot_yaw'], state['shot_pitch'] = \
-                _dispersed_barrel_angles(
-                    state['id'], self.round_id, state['fire_seq'],
-                    state['aim_yaw'], state['gun_pitch'],
-                    _effective_shot_dispersion(
-                        gun_state, state, descriptor))
+            if launch_preview is not None:
+                state['shot_yaw'] = preview_yaw
+                state['shot_pitch'] = preview_pitch
+                state['shot_origin'] = preview_origin
+            else:
+                state['shot_yaw'], state['shot_pitch'] = \
+                    _dispersed_barrel_angles(
+                        state['id'], self.round_id, state['fire_seq'],
+                        state['aim_yaw'], state['gun_pitch'],
+                        _effective_shot_dispersion(
+                            gun_state, state, descriptor))
         else:
             state['shot_yaw'] = launch_receipt['shot_yaw']
             state['shot_pitch'] = launch_receipt['shot_pitch']
@@ -4214,6 +4707,7 @@ class BotRuntime(object):
         # A stalled render callback therefore never triggers catch-up ticks.
         while self._next_publication <= now + 1e-9:
             self._next_publication += PUBLICATION_SECONDS
+        self._advance_probe_timing(now)
         frame_step = min(self._accumulator, 0.2)
         self._accumulator = 0.0
         players = list(players or [])
@@ -4278,6 +4772,7 @@ class BotRuntime(object):
                 decision_cache is not None and
                 decision_cache[0] == cache_key and
                 _number(now) < decision_cache[1])
+            traffic_neighbours = None
             planner_probe_samples = {}
 
             def planner_sample_direction(sample_yaw):
@@ -4337,7 +4832,13 @@ class BotRuntime(object):
                     'half_width': _number(state.get('half_width'), 1.7),
                 }
                 traffic_neighbours = decision_state['neighbours']
-                if server_order is not None and callable(decide_with_order):
+                reposition_order, reposition_expired = \
+                    self._friendly_reposition_order(state, targets, now)
+                if (reposition_order is not None and
+                        callable(decide_with_order)):
+                    command = decide_with_order(
+                        decision_state, reposition_order, sample_clear)
+                elif server_order is not None and callable(decide_with_order):
                     server_order = dict(server_order)
                     if (server_order.get('target_kind') == 'human' and
                             server_order.get('target_id') is not None):
@@ -4352,14 +4853,11 @@ class BotRuntime(object):
                 else:
                     command = self.adapter.decide(
                         decision_state, sample_clear)
-                command['throttle'], waiting_for_traffic = \
-                    self._traffic_throttle(
-                        state, command, traffic_neighbours)
-                if waiting_for_traffic:
-                    driver = getattr(self.adapter, 'driver', None)
-                    wait = getattr(driver, 'wait_for_traffic', None)
-                    if callable(wait):
-                        wait(state['id'])
+                if reposition_expired:
+                    # Resume the ordinary strategic movement on this frame,
+                    # but do not immediately recreate the expired override by
+                    # attempting the same blocked shot again.
+                    command['fire_allowed'] = False
                 bot_id = int(state['id'])
                 self._decision_counts[bot_id] = self._decision_counts.get(
                     bot_id, 0) + 1
@@ -4371,6 +4869,25 @@ class BotRuntime(object):
                         DECISION_TIER_FACTOR[self._detail_tier(state)],
                         3, decision_cache is None),
                     _number(now), dict(command), contacts, targets)
+            # Traffic is motion feedback, not planner intent.  Re-evaluate it
+            # on every accepted authority tick from the raw cached command and
+            # the current simultaneous traffic snapshot; caching a limited
+            # throttle for a whole decision lease recreated 0.1 s speed steps.
+            if traffic_neighbours is None:
+                if traffic_bodies is None:
+                    traffic_bodies, traffic_index = self._traffic_snapshot(
+                        neighbours)
+                traffic_neighbours = self._neighbours_for(
+                    state, neighbours, traffic_index, traffic_bodies)
+            command['throttle'], waiting_for_traffic = \
+                self._traffic_throttle(
+                    state, command, traffic_neighbours,
+                    self._physics_params.get(state['id']))
+            if waiting_for_traffic:
+                driver = getattr(self.adapter, 'driver', None)
+                wait = getattr(driver, 'wait_for_traffic', None)
+                if callable(wait):
+                    wait(state['id'])
             # Preserve the old refresh point: in copied-physics mode, a later
             # bot observes poses integrated by earlier bots in this same tick.
             # Human records do not change inside update, so index them once at
@@ -4669,9 +5186,18 @@ class BotRuntime(object):
                 contact_v0 = speed
                 if (path_clear and abs(speed) > 0.0001 and
                         callable(self.motion_resolver)):
-                    motion_status = self.motion_resolver(
-                        state['id'], position, state['yaw'], speed,
-                        descriptor, step, now)
+                    if self._probe_clock is None:
+                        motion_status = self.motion_resolver(
+                            state['id'], position, state['yaw'], speed,
+                            descriptor, step, now)
+                    else:
+                        probe_started = self._probe_started()
+                        try:
+                            motion_status = self.motion_resolver(
+                                state['id'], position, state['yaw'], speed,
+                                descriptor, step, now)
+                        finally:
+                            self._probe_finished(4, probe_started)
                     if motion_status not in (
                             'clear', 'crushed', 'soft', 'cap_crushed',
                             'hard'):
@@ -4734,24 +5260,67 @@ class BotRuntime(object):
                      pending_reproof is not None or
                      self._shot_clear(
                         state, target, now,
-                        probe_budget=shot_lane_budget)) and
-                    bool(self.friendly_lane_probe(state, target))):
+                        probe_budget=shot_lane_budget))):
                 launch_receipt = None
+                launch_preview = None
+                lane_clear = False
+                lane_verdict = {}
                 if is_spg:
                     launch_receipt = self._artillery_launch_receipt(
                         state, target, descriptor, state['shell_index'],
                         gun_state, ballistic_solution, now)
-                    if (launch_receipt is not None and
-                            not bool(self.artillery_friendly_lane_probe(
+                    if launch_receipt is not None:
+                        if self._probe_clock is None:
+                            lane_value = self.artillery_friendly_lane_probe(
                                 state, target, descriptor,
-                                state['shell_index'], launch_receipt))):
-                        launch_receipt = None
-                if not is_spg or launch_receipt is not None:
+                                state['shell_index'], launch_receipt)
+                        else:
+                            probe_started = self._probe_started()
+                            try:
+                                lane_value = \
+                                    self.artillery_friendly_lane_probe(
+                                        state, target, descriptor,
+                                        state['shell_index'], launch_receipt)
+                            finally:
+                                self._probe_finished(1, probe_started)
+                        lane_clear, lane_verdict = \
+                            self._friendly_lane_verdict(lane_value)
+                else:
+                    launch_preview = self._direct_launch_preview(
+                        state, descriptor, state['shell_index'], gun_state,
+                        ballistic_solution)
+                    if launch_preview is not None:
+                        if self._probe_clock is None:
+                            lane_value = self.friendly_lane_probe(
+                                state, target, descriptor,
+                                state['shell_index'], launch_preview)
+                        else:
+                            probe_started = self._probe_started()
+                            try:
+                                lane_value = self.friendly_lane_probe(
+                                    state, target, descriptor,
+                                    state['shell_index'], launch_preview)
+                            finally:
+                                self._probe_finished(1, probe_started)
+                        lane_clear, lane_verdict = \
+                            self._friendly_lane_verdict(lane_value)
+                launch = launch_receipt if is_spg else launch_preview
+                if launch is not None and lane_clear:
+                    self._clear_friendly_reposition(state['id'])
                     fired = self._fire(
                         state, gun_state, reload_factor, descriptor,
                         launch_receipt=launch_receipt,
-                        ammo_state=ammo_state)
+                        ammo_state=ammo_state,
+                        launch_preview=launch_preview)
                     if fired and is_spg:
+                        self._cancel_artillery_intent(state['id'])
+                elif launch is not None:
+                    self._mark_friendly_reposition(
+                        state, command, target, launch, lane_verdict, now)
+                    if is_spg:
+                        # The proved path belongs to the old muzzle pose. A
+                        # moving SPG must discard it and prove the next shot
+                        # again after its normal safe-driver motion completes.
                         self._cancel_artillery_intent(state['id'])
             mode = command.get('combat_mode')
             if (collect_observation and

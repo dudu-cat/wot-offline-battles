@@ -3,7 +3,7 @@ setlocal
 
 set "GAME_ROOT=%~dp0"
 if not exist "%GAME_ROOT%WorldOfTanks.exe" (
-    echo Extract this file and the mods folder into the directory that contains WorldOfTanks.exe.
+    echo Extract this file and the mods folder into the exact 0.9.22.0.1 #1513 game directory.
     pause
     exit /b 2
 )
@@ -13,10 +13,11 @@ if not exist "%GAME_ROOT%offline_worker_starter.exe" (
     exit /b 3
 )
 
+set "OFFLINE_LAN_0922_CLIENT_MODE=simulation_worker"
+set "OFFLINE_LAN_0922_ALLOW_MULTIPLE_CLIENTS=1"
+
 pushd "%GAME_ROOT%"
-rem The coordinator opens the hidden worker, waits for its server welcome,
-rem opens the visible host client, and retires the worker when that client exits.
-start "" "%GAME_ROOT%offline_worker_starter.exe"
+start "" "%GAME_ROOT%offline_worker_starter.exe" --worker-only
 set "GAME_EXIT=%ERRORLEVEL%"
 popd
 

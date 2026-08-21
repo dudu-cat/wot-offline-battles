@@ -32,12 +32,14 @@ from gui.mods.offline_lan_0922.entities.remote_vehicle import (
 from gui.mods.offline_lan_0922.entities.runtime import EntityPropertyBuilder
 from gui.mods.offline_lan_0922.projectile_manager import InFlightProjectiles
 from gui.mods.offline_lan_0922.projectile_runtime import (
-    PROJECTILE_BROADPHASE_RADIUS, lerp3, point_in_expanded_segment_bounds,
-    point_segment_distance_sq, trajectory_position)
+    PROJECTILE_BROADPHASE_RADIUS, PROJECTILE_MAX_SUBSTEP_SECONDS, lerp3,
+    point_in_expanded_segment_bounds, point_segment_distance_sq,
+    trajectory_position)
 from gui.mods.offline_lan_0922.snapshot_sync import SnapshotSync
 from gui.mods.offline_lan_0922.spawn_planner import SpawnPlanner
 from gui.mods.offline_lan_0922 import (
-    combat_rules, critical_damage, destructibles_compat, gun_mechanics,
+    ballistics, combat_rules, critical_damage, destructibles_compat,
+    gun_mechanics,
     loadout as loadout_law, prebaked_destructibles, prebaked_foliage,
     prebaked_navigation, spotting, tank_collision, vehicle_blacklist,
     vehicle_physics, world_collision)
@@ -51,6 +53,7 @@ FRAME_SECONDS = 0.0
 # This release is intentionally a measurement build.  The profiler is
 # observational only: it never feeds a gameplay clock, deadline or budget.
 PERFORMANCE_DIAGNOSTICS = True
+WORKER_NATIVE_PROBE_SECONDS = 5.0
 DIAGNOSTIC_WINDOW_SECONDS = 5.0
 DIAGNOSTIC_TOP_FRAMES = 5
 AMMO_SECONDS = 0.10
@@ -123,6 +126,9 @@ _MOVEMENT_ROTATE_LEFT = 4
 _MOVEMENT_ROTATE_RIGHT = 8
 _MOVEMENT_CRUISE_CONTROL50 = 16
 _MOVEMENT_CRUISE_CONTROL25 = 32
+# VehicleGunRotator.__isOutOfLimits uses this exact #1513 angular epsilon
+# when deciding whether a limited-traverse gun is already on either stop.
+GUN_TRAVERSE_LIMIT_EPSILON = 1.0e-5
 # Deadbands that decide whether a bot counts as moving or turning.
 BOT_MOVING_SPEED = 0.05
 BOT_TURNING_RATE = 0.02
@@ -484,7 +490,8 @@ class _FrameDiagnostics(object):
         prefix = '[Offline LAN 0.9.22] PERF '
         lines = [
             (prefix +
-             'summary v=2 window=%d round=%s map=%s phase=%s '
+             'summary v=2 window=%d round=%s map=%s phase=%s role=%s '
+             'probe_timing=%s '
              'samples=%d seconds=%.3f fps=%.2f authority_frames=%d '
              'gap_ms_avg_max=%.3f/%.3f raw_dt_ms_avg_max=%.3f/%.3f '
              'exec_ms_avg_max=%.3f/%.3f offframe_ms_avg_max=%.3f/%.3f '
@@ -492,6 +499,7 @@ class _FrameDiagnostics(object):
              'over_50_67_100=%d/%d/%d sim_caps=%d clock_regress=%d\n') % (
                  self._window_id, context.get('round', '-'),
                  context.get('map', '-'), context.get('phase', '-'),
+                 context.get('role', '-'), context.get('probe_timing', 'off'),
                  self._samples, self._window_elapsed,
                  self._samples / elapsed, self._authority_frames,
                  self._milliseconds(self._gap_sum / samples),
@@ -657,6 +665,10 @@ def _number(value, default=0.0):
         return value
     except (TypeError, ValueError):
         return float(default)
+
+
+def _angle_delta(current, target):
+    return (target - current + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def _field(value, name, default=None):
@@ -895,9 +907,12 @@ class _LANInputSender(object):
         health = health_getter() if callable(health_getter) else None
         report_getter = getattr(self.owner, 'local_damage_report', None)
         report = report_getter() if callable(report_getter) else None
+        ram_getter = getattr(self.owner, 'local_ram_contact', None)
+        ram_contact = ram_getter() if callable(ram_getter) else None
         result = self.owner.client.send_input(
             self.forward, self.turn, self.aim_yaw, self.gun_pitch,
             position, yaw, speed=getattr(self.owner, '_local_speed', 0.0),
+            ram_contact=ram_contact,
             reported_health=health,
             reported_critical=(report or {}).get('critical'),
             reported_reason=(report or {}).get('reason'),
@@ -916,6 +931,7 @@ class BattleRuntime(object):
     def __init__(self, runtime=None):
         self._runtime = runtime
         self._config = None
+        self._worker_mode = False
         self._start_message = None
         self.client = None
         self.state = 'idle'
@@ -943,6 +959,7 @@ class BattleRuntime(object):
         self._bots = None
         self._worker_probe = None
         self._worker_probe_attempted = False
+        self._worker_frame_callbacks = 0
         self._worker_probe_authority_callbacks = 0
         self._worker_probe_bot_generated = 0
         self._worker_probe_bot_enqueued = 0
@@ -971,8 +988,16 @@ class BattleRuntime(object):
         self._track_report_time = None
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
+        self._local_drive_turn = 0.0
         self._local_push_x = 0.0
         self._local_push_z = 0.0
+        self._local_ram_cooldowns = {}
+        self._local_ram_contacts = frozenset()
+        self._local_ram_seq = 0
+        self._local_ram_receipt = None
+        self._ram_bot_history = {}
+        self._ram_bot_history_order = []
+        self._ram_bot_history_times = {}
         self._local_physics = None
         self._local_pitch = 0.0
         self._local_roll = 0.0
@@ -1104,8 +1129,13 @@ class BattleRuntime(object):
             raise ValueError('LAN client is required')
         self._runtime = self._runtime or _load_runtime()
         self._config = dict(config or {})
+        self._worker_mode = bool(self._config.get('worker_mode', False))
+        if self._worker_mode:
+            self._config['native_remote_vehicles'] = False
+            self._config['bot_track_animation'] = False
         self._worker_probe = None
         self._worker_probe_attempted = False
+        self._worker_frame_callbacks = 0
         self._worker_probe_authority_callbacks = 0
         self._worker_probe_bot_generated = 0
         self._worker_probe_bot_enqueued = 0
@@ -1134,7 +1164,9 @@ class BattleRuntime(object):
         self._start_message = dict(message or {})
         self.client = lan_client
         self._sixth_sense = None
-        self._has_sixth_sense = _selected_vehicle_has_sixth_sense()
+        self._has_sixth_sense = (
+            False if self._worker_mode else
+            _selected_vehicle_has_sixth_sense())
         self._last_snapshot = None
         self._last_frame_time = None
         if self._frame_diagnostics is not None:
@@ -1150,8 +1182,16 @@ class BattleRuntime(object):
         self._track_report_time = None
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
+        self._local_drive_turn = 0.0
         self._local_push_x = 0.0
         self._local_push_z = 0.0
+        self._local_ram_cooldowns = {}
+        self._local_ram_contacts = frozenset()
+        self._local_ram_seq = 0
+        self._local_ram_receipt = None
+        self._ram_bot_history = {}
+        self._ram_bot_history_order = []
+        self._ram_bot_history_times = {}
         self._local_physics = None
         self._local_pitch = 0.0
         self._local_roll = 0.0
@@ -1779,7 +1819,8 @@ class BattleRuntime(object):
         try:
             self.state = 'loading_entities'
             self._vehicle_ready_deadline = 0.0
-            self._install_decal_probe()
+            if not self._worker_mode:
+                self._install_decal_probe()
             local = self._local_state()
             descriptor = self._local_battle_descriptor(
                 local.get('vehicle', self._config['vehicle']))
@@ -1799,7 +1840,11 @@ class BattleRuntime(object):
                 'vehicular': getattr(self._runtime, 'vehicular', None),
                 'data_links': getattr(self._runtime, 'data_links', None),
                 'enable_track_animation': self._config.get(
-                    'bot_track_animation', False)}
+                    'bot_track_animation', False),
+                # The visible client warms destroyed part resources before
+                # battle; the hidden worker never draws a wreck and retains
+                # its live collision compound instead.
+                'prewarm_wreck_resources': not self._worker_mode}
             if factory_type is NativeRemoteVehicleFactory:
                 factory_kwargs.update({
                     'binding': self._binding,
@@ -1819,6 +1864,17 @@ class BattleRuntime(object):
             self._local_position = position
             self._local_yaw = yaw
             self._local_descriptor = descriptor
+            # Resolve the complete line-up while BattleLoading is still up.
+            # Every unique destroyed-model prerequisite is submitted now in
+            # this one startup callback; bot presentation staggering is a
+            # separate later phase and never throttles this prewarm.
+            self._prepare_bot_vehicle_assignments(descriptor)
+            prewarm_enabled = getattr(
+                self._remote_factory, 'prewarm_wrecks_enabled', None)
+            if callable(prewarm_enabled) and prewarm_enabled():
+                for vehicle_name in sorted(set(
+                        self._bot_vehicle_assignments.values())):
+                    self._resolve_descriptor(vehicle_name)
             commands = self._runtime.account_commands
             self._server = AvatarServerBridge(
                 self._avatar, self._binding, builder, self._sender,
@@ -1973,6 +2029,11 @@ class BattleRuntime(object):
 
     def _finish_entity_startup(self):
         try:
+            if self.state != 'loading_entities':
+                return
+            if not self._wreck_prewarm_ready_for_startup():
+                self._schedule(0.05, self._finish_entity_startup)
+                return
             descriptor = self._local_descriptor
             if descriptor is None:
                 raise RuntimeError('player Vehicle descriptor is unavailable')
@@ -1987,14 +2048,15 @@ class BattleRuntime(object):
             self._configure_standard_space_visibility()
             record['ready'] = True
             self._attach_local_presentation()
-            self._runtime.compatibility.set_control_mode_listener(
-                self._on_control_mode_changed)
-            self._gun_state = gun_mechanics.GunState(
-                descriptor, self._local_loadout(descriptor),
-                ammo_layout=self._local_ammo_layout())
-            self._log_local_ammo(self._gun_state)
-            self._log_effective_parameters(descriptor)
-            self._gun_last_tick = self._clock()
+            if not self._worker_mode:
+                self._runtime.compatibility.set_control_mode_listener(
+                    self._on_control_mode_changed)
+                self._gun_state = gun_mechanics.GunState(
+                    descriptor, self._local_loadout(descriptor),
+                    ammo_layout=self._local_ammo_layout())
+                self._log_local_ammo(self._gun_state)
+                self._log_effective_parameters(descriptor)
+                self._gun_last_tick = self._clock()
             self._sync = SnapshotSync(
                 self.client.player_id, on_event=self._apply_sync_event,
                 clock=self._clock, pose_safe=self._baked_pose_safe)
@@ -2014,7 +2076,6 @@ class BattleRuntime(object):
                 self._last_snapshot = dict(latest_snapshot)
             if self._last_snapshot is not None:
                 self._sync.snapshot(self._last_snapshot)
-            self._prepare_bot_vehicle_assignments(descriptor)
             self._bots = BotRuntime(
                 self.client.player_id,
                 descriptor_resolver=self._resolve_descriptor,
@@ -2023,6 +2084,7 @@ class BattleRuntime(object):
                 visibility_probe=self._bot_visibility,
                 firing_lane_probe=self._bot_firing_lane,
                 friendly_lane_probe=self._bot_friendly_firing_lane,
+                direct_launch_origin_probe=self._bot_direct_launch_origin,
                 ballistic_solution_probe=self._bot_ballistic_solution,
                 artillery_launch_probe=self._bot_artillery_launch,
                 artillery_friendly_lane_probe=(
@@ -2047,7 +2109,13 @@ class BattleRuntime(object):
                 # read a high-resolution clock around every native query. The
                 # two clock calls are diagnostic work on the render thread and
                 # cannot affect probe order, results, deadlines or budgets.
-                native_motion=False)
+                # The hidden worker enables them only for its first five
+                # authoritative seconds so we can separate native query time
+                # from pure Python without permanently lowering its cadence.
+                native_motion=False,
+                probe_clock=(_PROFILE_CLOCK if self._worker_mode else None),
+                probe_timing_seconds=(
+                    WORKER_NATIVE_PROBE_SECONDS if self._worker_mode else 0.0))
             self._bots.debug_logging = bool(
                 self._config.get('debug_logging', False))
             # Sampled here, not before BotRuntime exists: the bot, navigator
@@ -2057,7 +2125,8 @@ class BattleRuntime(object):
             provider = getattr(self._avatar, 'guiSessionProvider', None)
             vehicle_view_state = getattr(
                 self._runtime, 'vehicle_view_state', None)
-            if provider is not None and vehicle_view_state is not None:
+            if (not self._worker_mode and provider is not None and
+                    vehicle_view_state is not None):
                 self._sixth_sense = SixthSenseController(
                     self._runtime.bigworld.callback,
                     self._runtime.bigworld.cancelCallback,
@@ -2084,11 +2153,14 @@ class BattleRuntime(object):
                 self._send_bot_message(outgoing)
             if self._last_snapshot is not None:
                 self._bots.apply_snapshot(self._last_snapshot)
+                self._remember_ram_bot_snapshot(self._last_snapshot)
             self.state = 'running'
-            self._bind_local_arcade_camera()
-            self._publish_rpm(self._clock(), force=True)
+            if not self._worker_mode:
+                self._bind_local_arcade_camera()
+                self._publish_rpm(self._clock(), force=True)
             self._last_frame_time = self._clock()
-            self._ammo_tick()
+            if not self._worker_mode:
+                self._ammo_tick()
             if self.state != 'running':
                 return
             if self._battle_result is not None:
@@ -2106,6 +2178,21 @@ class BattleRuntime(object):
             self._schedule(FRAME_SECONDS, self._frame)
         except Exception as error:
             self._fail(error)
+
+    def _wreck_prewarm_ready_for_startup(self):
+        """Keep the client in BattleLoading until raw wreck assets settle."""
+        pending = getattr(
+            self._remote_factory, 'wreck_prewarm_pending_count', None)
+        if not callable(pending) or pending() <= 0:
+            return True
+        deadline = float(self._vehicle_ready_deadline or 0.0)
+        if deadline <= 0.0 or self._clock() < deadline:
+            return False
+        abandon = getattr(
+            self._remote_factory, 'abandon_pending_wreck_prewarm', None)
+        if callable(abandon):
+            abandon()
+        return True
 
     def _local_state(self):
         for value in self._start_message.get('players') or ():
@@ -2136,8 +2223,7 @@ class BattleRuntime(object):
             duration = max(0.1, float(deadline) - _monotonic_time())
         self._binding.arena_period('battle', duration)
         self._battle_live = True
-        # The server refuses a spotted report during the countdown, so the
-        # first live report must go out even when the set has not changed.
+        # Publish one fresh live set even when it matches the prebattle state.
         self._spotted_signature = None
         # The countdown froze gun laying and firing; the battle releases both.
         self._set_gun_locked(False)
@@ -2341,8 +2427,10 @@ class BattleRuntime(object):
         setter = getattr(matrices, '_ConsistentMatrices__setTarget', None)
         camera = getattr(control, '_PostMortemControlMode__cam', None)
         callback = getattr(self._avatar, 'onSwitchViewpoint', None)
+        attach_vehicle = getattr(
+            self._runtime.compatibility, 'set_postmortem_vehicle', None)
         if (attached is None or not callable(setter) or camera is None or
-                not callable(callback)):
+                not callable(callback) or not callable(attach_vehicle)):
             return False
         try:
             previous_target = attached.target
@@ -2354,6 +2442,7 @@ class BattleRuntime(object):
                          else entity.matrix)
         if target_matrix is None:
             return False
+        previous_vehicle_id = None
         try:
             # A retail cell attachment changes Avatar.vehicle first.  The
             # client-created LAN entities have no cell relationship, so copy
@@ -2365,6 +2454,7 @@ class BattleRuntime(object):
                     int(engine_id) not in self._runtime.bigworld.entities):
                 raise RuntimeError(
                     '#1513 spectator entity lookup was rejected')
+            previous_vehicle_id = attach_vehicle(int(engine_id))
             setter(target_matrix, False)
             if attached.target is not target_matrix:
                 raise RuntimeError(
@@ -2377,6 +2467,8 @@ class BattleRuntime(object):
             callback(int(engine_id), position)
         except Exception:
             try:
+                if previous_vehicle_id is not None:
+                    attach_vehicle(previous_vehicle_id)
                 setter(previous_target, False)
                 camera.vehicleMProv = previous_camera
             except Exception:
@@ -2418,12 +2510,13 @@ class BattleRuntime(object):
                     if self._server is not None else 0)
         if local_id and local_id != int(excluded_engine_id):
             return self._switch_postmortem_viewpoint(False, local_id)
-        self._spectated_engine_id = None
+        self._release_postmortem_visibility()
         return False
 
     def _release_postmortem_visibility(self):
         engine_id = self._spectated_engine_id
         self._spectated_engine_id = None
+        self._runtime.compatibility.clear_postmortem_vehicle()
         if engine_id is None:
             return False
         entity = self._server_entity(engine_id)
@@ -2828,7 +2921,27 @@ class BattleRuntime(object):
         eligible #1513 vehicle catalog.
         """
         try:
-            player_profile = self._vehicle_profile(player_descriptor.type)
+            planning_descriptor = player_descriptor
+            if self._worker_mode:
+                # The off-map Avatar is only an engine loading carrier. Match
+                # composition must be anchored to an actual server player,
+                # never to that private descriptor or its synthetic slot.
+                for raw in self._start_message.get('players') or ():
+                    if not isinstance(raw, dict):
+                        continue
+                    try:
+                        if int(raw.get('id')) <= 0:
+                            continue
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    vehicle_name = raw.get('vehicle')
+                    if not vehicle_name:
+                        continue
+                    planning_descriptor = self._resolve_descriptor(
+                        vehicle_name)
+                    break
+            player_profile = self._vehicle_profile(
+                planning_descriptor.type)
             tier = int(player_profile['level'])
             candidates = []
             for nation in self._runtime.nations.AVAILABLE_NAMES:
@@ -2854,12 +2967,18 @@ class BattleRuntime(object):
             for raw in self._start_message.get('players') or ():
                 if not isinstance(raw, dict):
                     continue
+                if self._worker_mode:
+                    try:
+                        if int(raw.get('id')) <= 0:
+                            continue
+                    except (TypeError, ValueError, OverflowError):
+                        continue
                 team = int(raw.get('team', 0) or 0)
                 if team not in humans_by_team:
                     continue
                 try:
-                    if raw.get('id') == getattr(
-                            self.client, 'player_id', None):
+                    if (not self._worker_mode and raw.get('id') == getattr(
+                            self.client, 'player_id', None)):
                         descriptor = player_descriptor
                     else:
                         descriptor = self._resolve_descriptor(
@@ -3582,7 +3701,10 @@ class BattleRuntime(object):
     def _local_engine_mode_value(self, alive):
         """Return the exact #1513 ``(power, movementFlags)`` engine mode."""
         forward = _number(getattr(self._sender, 'forward', 0.0))
-        turn = _number(getattr(self._sender, 'turn', 0.0))
+        # The retail cell contributes limited-traverse autorotation even when
+        # A/D is idle.  Drive native track animation from the effective turn
+        # consumed by copied physics, not from keyboard state alone.
+        turn = _number(self._local_drive_turn)
         flags = 0
         if forward > 0.0:
             flags |= _MOVEMENT_FORWARD
@@ -4378,6 +4500,7 @@ class BattleRuntime(object):
             shell = _field(shot, 'shell', {})
             if int(_field(shell, 'compactDescr', 0)) != int(value):
                 continue
+            previous_reload = state.reload_time
             if code == next_shells:
                 changed = state.request_shell_index(index)
             else:
@@ -4387,6 +4510,14 @@ class BattleRuntime(object):
                     self._present_loader_intuition()
             if changed:
                 self._publish_ammo_state(state, force=True)
+                # #1513 ReloadingTimeState retains its original _startTime
+                # while actualTime stays positive.  A shell switch during an
+                # active reload is a new cycle, so close the old cycle before
+                # publishing the new full duration.  This resets both stock
+                # HUD consumers (the ammo-slot fill and crosshair progress).
+                if previous_reload > 0.0 and state.reload_time > 0.0:
+                    self._publish_reload_event(
+                        0.0, state.reload_duration, force=True)
                 self._publish_reload_event(
                     state.reload_time, state.reload_duration, force=True)
             # The stock ammo panel already blinks a queued shell locally.
@@ -4413,10 +4544,130 @@ class BattleRuntime(object):
                     self._reconcile_bot_authority(
                         self._last_snapshot.get('bot_authority_id'))
                 self._bots.apply_snapshot(self._last_snapshot)
+                self._remember_ram_bot_snapshot(self._last_snapshot)
             if self._sync is not None:
                 self._sync.snapshot(message)
         except Exception as error:
             self._fail(error)
+
+    def _remember_ram_bot_snapshot(self, snapshot):
+        """Retain the canonical bot bodies referenced by player contacts."""
+        if not isinstance(snapshot, dict) or self._bots is None:
+            return False
+        try:
+            revision = int(snapshot.get('bot_state_revision'))
+            sample_time_us = int(snapshot.get('bot_state_time_us'))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if revision < 0 or sample_time_us < 0:
+            return False
+        states = {}
+        current = getattr(self._bots, 'states', {}) or {}
+        for raw in snapshot.get('bots') or ():
+            if not isinstance(raw, dict) or raw.get('id') is None:
+                continue
+            try:
+                bot_id = int(raw['id'])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            # Dynamic pose fields must come from the exact wire revision the
+            # player collided with.  An authority runtime may already have
+            # integrated its local ``states`` beyond this snapshot; only use
+            # that newer state to fill descriptor-derived static fields.
+            state = {}
+            current_state = current.get(bot_id)
+            if isinstance(current_state, dict):
+                for name in ('mass', 'collision_shape', 'vehicle', 'team'):
+                    if name in current_state:
+                        state[name] = current_state[name]
+            state.update(raw)
+            states[bot_id] = state
+        if revision not in self._ram_bot_history:
+            self._ram_bot_history_order.append(revision)
+        self._ram_bot_history[revision] = states
+        self._ram_bot_history_times[revision] = sample_time_us
+        while len(self._ram_bot_history_order) > 256:
+            expired = self._ram_bot_history_order.pop(0)
+            self._ram_bot_history.pop(expired, None)
+            self._ram_bot_history_times.pop(expired, None)
+        return True
+
+    def _ram_bot_state_at(self, bot_id, revision, sample_time_us):
+        """Interpolate one bot from the exact wire samples a player saw."""
+        try:
+            bot_id = int(bot_id)
+            revision = int(revision)
+            sample_time_us = int(sample_time_us)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        samples = []
+        for candidate_revision in self._ram_bot_history_order:
+            if candidate_revision > revision:
+                continue
+            candidate_time = self._ram_bot_history_times.get(
+                candidate_revision)
+            candidate_states = self._ram_bot_history.get(
+                candidate_revision, {})
+            state = candidate_states.get(bot_id)
+            if candidate_time is None or not isinstance(state, dict):
+                continue
+            samples.append((candidate_time, state))
+        if not samples:
+            return None
+        left = right = None
+        for candidate in samples:
+            if candidate[0] <= sample_time_us:
+                left = candidate
+            if candidate[0] >= sample_time_us:
+                right = candidate
+                break
+        if left is None or right is None:
+            return None
+        if left[0] == right[0]:
+            result = dict(left[1])
+            result['ram_vx'] = 0.0
+            result['ram_vz'] = 0.0
+            if len(samples) >= 2:
+                index = samples.index(left)
+                before, after = ((samples[index - 1], left) if index > 0
+                                 else (left, samples[index + 1]))
+                span = float(after[0] - before[0]) / 1000000.0
+                if span > 0.0:
+                    result['ram_vx'] = (
+                        _number(after[1].get('x')) -
+                        _number(before[1].get('x'))) / span
+                    result['ram_vz'] = (
+                        _number(after[1].get('z')) -
+                        _number(before[1].get('z'))) / span
+            return result
+        left_time, left_state = left
+        right_time, right_state = right
+        span_us = float(right_time - left_time)
+        if span_us <= 0.0:
+            return None
+        progress = max(0.0, min(
+            (sample_time_us - left_time) / span_us, 1.0))
+        result = dict(left_state)
+        for name in ('x', 'y', 'z', 'pitch', 'roll', 'aim_yaw',
+                     'gun_pitch'):
+            if name in left_state and name in right_state:
+                result[name] = (_number(left_state.get(name)) +
+                                (_number(right_state.get(name)) -
+                                 _number(left_state.get(name))) * progress)
+        if 'yaw' in left_state and 'yaw' in right_state:
+            result['yaw'] = (_number(left_state.get('yaw')) +
+                             _angle_delta(
+                                 _number(left_state.get('yaw')),
+                                 _number(right_state.get('yaw'))) * progress)
+        if progress >= 1.0:
+            result['alive'] = bool(right_state.get('alive', True))
+        result['ram_vx'] = (
+            _number(right_state.get('x')) -
+            _number(left_state.get('x'))) * 1000000.0 / span_us
+        result['ram_vz'] = (
+            _number(right_state.get('z')) -
+            _number(left_state.get('z'))) * 1000000.0 / span_us
+        return result
 
     def on_roster(self, message):
         """Apply authority changes that can arrive before live snapshots.
@@ -4665,7 +4916,8 @@ class BattleRuntime(object):
         if not record.get('ready', True):
             return False
         if (record.get('presentation') and
-                not record.get('arena_added', False)):
+                not record.get('arena_added', False) and
+                not record.get('simulation_entity', False)):
             return False
         return True
 
@@ -4714,6 +4966,8 @@ class BattleRuntime(object):
         ``PlayerAvatar.onBattleEvents`` forwards only the controlled vehicle's
         own events, so publish nothing unless this client is the assister.
         """
+        if self._worker_mode:
+            return False
         assister = self._records.get(self._assist_entity_key(event, 'assister'))
         if assister is None or not assister.get('local'):
             return False
@@ -5163,6 +5417,8 @@ class BattleRuntime(object):
     def _present_combat_hit(self, event, target_record, attacker_record,
                             attacker_id):
         """Port the mature 0.8.2 hit feedback through exact #1513 APIs."""
+        if self._worker_mode:
+            return False
         if (self._combat_event_source(event) != 'shot' or
                 event.get('kind') not in (
                     'hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit')):
@@ -5633,11 +5889,14 @@ class BattleRuntime(object):
         state = dict(record.get('state') or {})
         state['critical'] = canonical
         record['state'] = state
-        self._present_critical(record, events, 0)
+        if not self._worker_mode:
+            self._present_critical(record, events, 0)
         return True
 
     def _apply_vehicle_statistics(self, record, state):
         """Feed server-owned frags/team-killer state to stock ClientArena."""
+        if self._worker_mode:
+            return False
         try:
             frags = int(state.get('frags', 0))
         except (TypeError, ValueError):
@@ -5713,6 +5972,8 @@ class BattleRuntime(object):
 
     def _present_critical(self, record, events, attacker_id):
         """Map copied state transitions to audited stock #1513 UI callbacks."""
+        if self._worker_mode:
+            return False
         entity = self._server_entity(record['engine_id'])
         if entity is None or entity.typeDescriptor is None:
             return False
@@ -5910,6 +6171,13 @@ class BattleRuntime(object):
             self._apply_health(
                 record, state, getattr(entity, 'last_killer_id', 0),
                 fire_reason)
+            # Freeze the lower HP into the outbound queue in this callback.
+            # Waiting for the regular 30 Hz input phase leaves a window where
+            # an older server snapshot can restore ``entity.health`` first;
+            # send_current() would then report that stale higher value and the
+            # entire one-second burn tick would disappear.
+            if self._sender is not None:
+                self._sender.send_current()
         self._present_repair_progress(entity)
 
     def _present_repair_progress(self, entity):
@@ -5963,6 +6231,14 @@ class BattleRuntime(object):
         if not isinstance(result, dict):
             return False
         self._battle_result = dict(result)
+        if self._worker_mode:
+            # Stop authority simulation immediately. Native teardown waits for
+            # the ordered waiting roster, but no bot/projectile work should run
+            # during the server's short result-publication window.
+            self._battle_live = False
+            self._round_finished_notified = True
+            self._report_memory('round_end')
+            return True
         if (self._round_finished_notified or self._avatar is None or
                 self.state != 'running'):
             return False
@@ -5997,7 +6273,7 @@ class BattleRuntime(object):
         incoming = (rules or {}).get('bases') or {}
         arena = getattr(self._avatar, 'arena', None)
         callback = getattr(arena, 'onTeamBasePointsUpdate', None)
-        if not callable(callback):
+        if not self._worker_mode and not callable(callback):
             return False
         changed = False
         stored = self._rules_state.setdefault('bases', {})
@@ -6013,10 +6289,11 @@ class BattleRuntime(object):
             }
             if stored.get(str(team)) != current:
                 stored[str(team)] = current
-                callback(
-                    team, 0, current['points'],
-                    current['time_left'], current['invaders'],
-                    current['stopped'])
+                if not self._worker_mode:
+                    callback(
+                        team, 0, current['points'],
+                        current['time_left'], current['invaders'],
+                        current['stopped'])
                 changed = True
         return changed
 
@@ -6031,6 +6308,8 @@ class BattleRuntime(object):
         if update_state:
             record['shot_penalty_until'] = (
                 self._clock() + spotting.SHOT_CAMOUFLAGE_SECONDS)
+        if self._worker_mode:
+            return True
         entity = self._server_entity(record['engine_id'])
         if entity is None:
             raise RuntimeError(
@@ -6471,6 +6750,8 @@ class BattleRuntime(object):
 
     def _ensure_projectile_visual(self, normalized, now):
         """Ensure late joiners and delayed snapshots see the live tracer."""
+        if self._worker_mode:
+            return False
         if self._remote_factory is None or not isinstance(normalized, dict):
             return False
         descriptor = self._projectile_source_descriptor(normalized)
@@ -6567,6 +6848,9 @@ class BattleRuntime(object):
             return None
 
     def _stop_projectile_visual(self, projectile_id, event):
+        if self._worker_mode:
+            self._projectile_visual_meta.pop(projectile_id, None)
+            return False
         if self._remote_factory is None:
             return False
         impact = event.get('impact') if isinstance(event, dict) else None
@@ -6597,6 +6881,10 @@ class BattleRuntime(object):
         result = {}
         for key, record in tuple(self._records.items()):
             if record.get('tombstone'):
+                continue
+            if self._worker_mode and record.get('local'):
+                # player:-1 is a private native-space carrier, never a
+                # projectile broadphase or collision target.
                 continue
             entity = self._server_entity(record.get('engine_id'))
             if entity is None or not getattr(entity, 'isStarted', False):
@@ -6953,6 +7241,8 @@ class BattleRuntime(object):
         for key, record in tuple(self._records.items()):
             if key == direct_key or record.get('tombstone'):
                 continue
+            if self._worker_mode and record.get('local'):
+                continue
             target = self._server_entity(record.get('engine_id'))
             if (target is None or target.typeDescriptor is None or
                     not getattr(target, 'isStarted', False) or
@@ -7147,6 +7437,36 @@ class BattleRuntime(object):
             (self._last_snapshot or {}).get('players', ()) or ())
         if self.client is None:
             return list(snapshot_players)
+        if self._worker_mode:
+            players = []
+            for raw in snapshot_players:
+                if not isinstance(raw, dict):
+                    continue
+                try:
+                    player_id = int(raw.get('id'))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                # id=-1 is the private native-space carrier injected only on
+                # this worker. It is never a combat target or server player.
+                if player_id <= 0 or not bool(
+                        raw.get('world_pose', False)):
+                    continue
+                state = dict(raw)
+                receipt = state.get('ram_contact')
+                if isinstance(receipt, dict):
+                    try:
+                        revision = int(receipt.get('bot_state_revision'))
+                        bot_id = int(receipt.get('bot_id'))
+                        presentation_time_us = int(
+                            receipt.get('presentation_time_us'))
+                    except (TypeError, ValueError, OverflowError):
+                        revision = bot_id = presentation_time_us = None
+                    bot_state = self._ram_bot_state_at(
+                        bot_id, revision, presentation_time_us)
+                    if bot_state is not None:
+                        state['_ram_contact_bot_state'] = dict(bot_state)
+                players.append(state)
+            return players
         local_id = int(self.client.player_id)
         players = []
         local_found = False
@@ -7215,6 +7535,8 @@ class BattleRuntime(object):
                 diagnostic_totals = {}
         snapshot = self._last_snapshot or {}
         return {
+            'round_finished': self._battle_result is not None,
+            'frame_callbacks': self._worker_frame_callbacks,
             'authority_callbacks': self._worker_probe_authority_callbacks,
             'bot_state_generated': self._worker_probe_bot_generated,
             'bot_state_enqueued': self._worker_probe_bot_enqueued,
@@ -7226,8 +7548,31 @@ class BattleRuntime(object):
             'alive_bot_ticks': diagnostic_totals.get('alive_bot_ticks'),
         }
 
+    def authority_worker_ready_for_draw_off(self):
+        """Return true only after every native simulation model is ready.
+
+        Bot compounds are intentionally created over several callbacks. The
+        exact client has not proved that background model completion continues
+        after world drawing is disabled, so keep drawing enabled through that
+        short load and acquire draw-off only after every live record entered
+        the native space.
+        """
+        if not self._worker_mode or self.state != 'running':
+            return False
+        if self._pending_bot_create_order or self._pending_bot_creates:
+            return False
+        for record in self._records.values():
+            if not record.get('tombstone') and not record.get('ready'):
+                return False
+        return bool(self._records)
+
     def _advance_authority_worker_probe(self):
         """Advance the opt-in probe without making diagnostics authoritative."""
+        if self._worker_mode:
+            # Dedicated workers remain draw-disabled for the whole round. The
+            # legacy diagnostic intentionally toggles draw/window stages and
+            # must not alter this process' lifecycle.
+            return False
         settings = (self._config or {}).get('authority_worker_probe') or {}
         enabled = bool(isinstance(settings, dict) and
                        settings.get('enabled', False))
@@ -7316,13 +7661,16 @@ class BattleRuntime(object):
     def _frame(self):
         if self.state != 'running':
             return
+        if self._worker_mode:
+            self._worker_frame_callbacks += 1
         diagnostics = self._frame_diagnostics
         profiling = diagnostics is not None and diagnostics.enabled
         entry_wall = _PROFILE_CLOCK() if profiling else 0.0
         now = self._clock()
         raw_dt = (0.0 if self._last_frame_time is None else
                   now - self._last_frame_time)
-        if self._worker_probe is not None and raw_dt > 0.1000001:
+        if ((self._worker_mode or self._worker_probe is not None) and
+                raw_dt > 0.1000001):
             self._worker_probe_simulation_caps += 1
         dt = max(0.0, min(raw_dt, 0.1))
         tick_dt = dt
@@ -7360,12 +7708,13 @@ class BattleRuntime(object):
                 next_boundary = _PROFILE_CLOCK()
                 stages['sync'] = max(0.0, next_boundary - boundary)
                 boundary = next_boundary
-            self._tick_critical_states(dt)
+            if not self._worker_mode:
+                self._tick_critical_states(dt)
             if profiling:
                 next_boundary = _PROFILE_CLOCK()
                 stages['critical'] = max(0.0, next_boundary - boundary)
                 boundary = next_boundary
-            if self._battle_live:
+            if self._battle_live and not self._worker_mode:
                 self._tick_drowning(dt, now)
             if profiling:
                 next_boundary = _PROFILE_CLOCK()
@@ -7429,13 +7778,13 @@ class BattleRuntime(object):
                 next_boundary = _PROFILE_CLOCK()
                 stages['transition'] = max(0.0, next_boundary - boundary)
                 boundary = next_boundary
-            if self._battle_live:
+            if self._battle_live and not self._worker_mode:
                 self._drive_local(dt)
             if profiling:
                 next_boundary = _PROFILE_CLOCK()
                 stages['local'] = max(0.0, next_boundary - boundary)
                 boundary = next_boundary
-            if self._battle_live:
+            if self._battle_live and not self._worker_mode:
                 self._update_target_outline(now)
                 self._report_local_compound(now)
             if profiling:
@@ -7443,6 +7792,8 @@ class BattleRuntime(object):
                 stages['outline'] = max(0.0, next_boundary - boundary)
                 boundary = next_boundary
             if self._battle_live and self._bots is not None:
+                if self._worker_mode:
+                    self._worker_probe_authority_callbacks += 1
                 self._advance_artillery_arcs(now)
                 players = self._authority_players()
                 probe_totals = getattr(self._bots, 'probe_totals', None)
@@ -7463,7 +7814,11 @@ class BattleRuntime(object):
                 set_camera = getattr(
                     self._bots, 'set_camera_position', None)
                 if callable(set_camera):
-                    set_camera(self._local_position)
+                    # A worker has no presentation camera. Using its off-map
+                    # dummy as one would lower update detail for distant bots
+                    # and make worker authority behave unlike player authority.
+                    set_camera(
+                        None if self._worker_mode else self._local_position)
                 outgoing_messages = self._bots.update(
                     dt, now, players=players)
                 after_probes = None
@@ -7545,13 +7900,13 @@ class BattleRuntime(object):
                 next_boundary = _PROFILE_CLOCK()
                 stages['bot_events'] = max(0.0, next_boundary - boundary)
                 boundary = next_boundary
-            if self._battle_live:
+            if self._battle_live and not self._worker_mode:
                 self._update_spotting(now)
             if profiling:
                 next_boundary = _PROFILE_CLOCK()
                 stages['spot'] = max(0.0, next_boundary - boundary)
                 boundary = next_boundary
-            if self._battle_live:
+            if self._battle_live and not self._worker_mode:
                 validate_lock = getattr(
                     self._runtime.compatibility,
                     'validate_target_lock', None)
@@ -7586,6 +7941,14 @@ class BattleRuntime(object):
                     authority = bool(is_authority())
                 except Exception:
                     authority = False
+            probe_timing = 'off'
+            probe_timing_state = getattr(
+                self._bots, 'probe_timing_state', None)
+            if callable(probe_timing_state):
+                try:
+                    probe_timing = str(probe_timing_state())
+                except Exception:
+                    probe_timing = 'failed'
             emit_due = getattr(diagnostics, 'emit_due', None)
             if callable(emit_due) and emit_due():
                 load_report = getattr(self._bots, 'load_report', None)
@@ -7603,7 +7966,9 @@ class BattleRuntime(object):
                     'round': (self._start_message or {}).get('round_id', '-'),
                     'map': (self._config or {}).get('map', '-'),
                     'phase': 'live' if self._battle_live else 'prebattle',
-                    'role': 'authority' if authority else 'guest',
+                    'role': ('worker' if self._worker_mode else
+                             ('authority' if authority else 'guest')),
+                    'probe_timing': probe_timing,
                     'bot_count': bot_count,
                     'outgoing_count': len(outgoing_messages),
                     'pose_step': pose_step,
@@ -8518,6 +8883,10 @@ class BattleRuntime(object):
             state = record.get('state') or {}
             if record.get('kind') == 'bot':
                 state = bot_states.get(record.get('network_id'), state)
+                presented_pose = record.get('presented_pose')
+                if isinstance(presented_pose, dict):
+                    state = dict(state)
+                    state.update(presented_pose)
             alive = bool(state.get('alive', True))
             remote = self._server_entity(record['engine_id'])
             descriptor = getattr(remote, 'typeDescriptor', None)
@@ -8529,22 +8898,21 @@ class BattleRuntime(object):
             shape = state.get('collision_shape')
             if shape is None:
                 shape = self._collision_shape(descriptor)
-            impulse = True
-            if (alive and record.get('kind') == 'bot' and
-                    self.client is not None):
-                try:
-                    impulse = int(state.get('team')) != int(self.client.team)
-                except (TypeError, ValueError):
-                    # Preserve the established enemy/contact ownership when a
-                    # malformed snapshot cannot prove this is a teammate.
-                    impulse = True
             result.append({
                 'id': 1000000 + int(record.get('engine_id', 0)),
+                'network_id': int(record.get('network_id', 0)),
+                'engine_id': int(record.get('engine_id', 0)),
+                'kind': record.get('kind'),
+                'presentation_time_us': record.get(
+                    'presentation_time_us'),
                 'alive': alive,
-                # Same-team bots own the pair's velocity response.  The local
-                # player still receives its inverse-mass overlap separation;
-                # enemy bot impulses and ram physics remain unchanged.
-                'impulse': impulse,
+                # Apply the local body's reciprocal e=0 response for every
+                # live Bot.  The authority receipt applies the Bot's half at
+                # the same presented contact and skips that pair in its
+                # current-frame detector.  Leaving teammates as correction-
+                # only keeps the player at full speed after a ram, so it
+                # immediately catches and damages the same Bot again.
+                'impulse': True,
                 'x': _number(state.get('x')),
                 'y': _number(state.get('y')),
                 'z': _number(state.get('z')),
@@ -8570,7 +8938,42 @@ class BattleRuntime(object):
             'vx': math.sin(yaw) * self._local_speed + self._local_push_x,
             'vz': math.cos(yaw) * self._local_speed + self._local_push_z,
         }
-        contact = tank_collision.resolve_tank(own, others)
+        now = self._clock()
+        contact = tank_collision.resolve_tank(
+            own, others, now=now,
+            ram_cooldowns=self._local_ram_cooldowns,
+            active_ram_contacts=self._local_ram_contacts)
+        self._local_ram_cooldowns = contact['cooldowns']
+        self._local_ram_contacts = contact['contacts']
+        targets = dict((body['id'], body) for body in others
+                       if body.get('network_id') and
+                       body.get('kind') == 'bot')
+        try:
+            revision = int((self._last_snapshot or {}).get(
+                'bot_state_revision'))
+        except (TypeError, ValueError, OverflowError):
+            revision = None
+        for event in contact['ram_events']:
+            target = targets.get(event.get('other_id'))
+            presentation_time_us = (target or {}).get(
+                'presentation_time_us')
+            if (target is None or revision is None or
+                    presentation_time_us is None):
+                continue
+            velocity = event['velocity_self']
+            self._local_ram_seq += 1
+            self._local_ram_receipt = {
+                'seq': self._local_ram_seq,
+                'bot_id': int(target['network_id']),
+                'bot_state_revision': revision,
+                'presentation_time_us': int(presentation_time_us),
+                'x': float(position[0]),
+                'y': float(position[1]),
+                'z': float(position[2]),
+                'yaw': float(yaw),
+                'vx': float(velocity[0]),
+                'vz': float(velocity[1]),
+            }
         delta_x, delta_z = contact['delta_velocity']
         forward_impulse = (delta_x * math.sin(yaw) +
                            delta_z * math.cos(yaw))
@@ -8609,6 +9012,12 @@ class BattleRuntime(object):
         self._local_push_x = push_x * push_decay
         self._local_push_z = push_z * push_decay
         return position
+
+    def local_ram_contact(self):
+        """Return the latest pre-separation contact proof for server relay."""
+        if not isinstance(self._local_ram_receipt, dict):
+            return None
+        return dict(self._local_ram_receipt)
 
     def _terrain_support(self, position, yaw, descriptor=None):
         """Copy 0.8.2 front/centre/back support and CoM ground probes."""
@@ -8807,6 +9216,67 @@ class BattleRuntime(object):
         self._local_airborne = False
         return (next_x, position[1] + delta_y, next_z)
 
+    def _local_autorotation_turn(self, entity, turn, drive_intent=0.0,
+                                 tracks_blocked=False):
+        """Apply #1513's limited-traverse autorotation to copied physics.
+
+        The stock input handler owns whether autorotation is enabled in the
+        current control mode.  VehicleGunRotator keeps sending the unclamped
+        mouse target to the cell while it clamps the rendered gun to the
+        installed ``gun.turretYawLimits``.  A retail cell turns the hull; our
+        local cell must feed that same binary direction into its sole pose
+        integrator.  The descriptor, native gun rotator and copied traverse
+        physics continue to own the arc, gun speed and resulting dispersion.
+        """
+        turn = float(turn)
+        if turn != 0.0:
+            return turn
+        # Retail autorotation is an idle arcade-mode convenience.  Any live
+        # drive command owns the hull even when the vehicle is physically
+        # blocked and its measured speed is zero.  ``forward`` also carries
+        # the native R/F cruise presets, so this covers both keyboard drive
+        # and cruise without inferring motion from speed.
+        if float(drive_intent) != 0.0:
+            return turn
+        # CMD_BLOCK_TRACKS is independent from the persistent autorotation
+        # setting.  Holding Space does not clear that setting, but the retail
+        # cell must not turn the locked tracks on its behalf.
+        if bool(tracks_blocked):
+            return turn
+        handler = getattr(self._avatar, 'inputHandler', None)
+        get_autorotation = getattr(handler, 'getAutorotation', None)
+        if not callable(get_autorotation) or not get_autorotation():
+            return turn
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        gun = _field(descriptor, 'gun')
+        limits = _field(gun, 'turretYawLimits')
+        # Exact #1513 uses None for a fully rotating turret.  Do not infer a
+        # traverse arc from vehicle tags or the separate turret descriptor.
+        if limits is None:
+            return turn
+        try:
+            minimum = float(limits[0])
+            maximum = float(limits[1])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            raise RuntimeError(
+                '#1513 installed gun traverse limits are invalid')
+        if (math.isnan(minimum) or math.isinf(minimum) or
+                math.isnan(maximum) or math.isinf(maximum) or
+                minimum > maximum):
+            raise RuntimeError(
+                '#1513 installed gun traverse limits are invalid')
+        aim_yaw = float(getattr(self._sender, 'aim_yaw', self._local_yaw))
+        relative_yaw = ((aim_yaw - float(self._local_yaw) + math.pi) %
+                        (2.0 * math.pi) - math.pi)
+        autorotation_turn = 0.0
+        if relative_yaw < minimum - GUN_TRAVERSE_LIMIT_EPSILON:
+            autorotation_turn = -1.0
+        elif relative_yaw > maximum + GUN_TRAVERSE_LIMIT_EPSILON:
+            autorotation_turn = 1.0
+        if autorotation_turn:
+            return autorotation_turn
+        return turn
+
     def _drive_local(self, dt):
         if self._sender is None or self._server is None:
             return
@@ -8823,6 +9293,7 @@ class BattleRuntime(object):
             dt = max(0.0, min(float(dt), 0.1))
             self._local_speed = 0.0
             self._local_turn_speed = 0.0
+            self._local_drive_turn = 0.0
             self._sender.forward = 0.0
             self._sender.turn = 0.0
             vehicle_filter = getattr(entity, 'filter', None)
@@ -8849,7 +9320,9 @@ class BattleRuntime(object):
         slope_pitch = (0.0 if self._local_airborne else
                        self._smoothed_drive_pitch(position, yaw))
         throttle = self._sender.forward
-        turn = self._sender.turn
+        turn = self._local_autorotation_turn(
+            entity, self._sender.turn, throttle,
+            tracks_blocked=self._sender.handbrake)
         is_tracked = bool(getattr(entity, 'is_tracked', False))
         is_engine_dead = bool(getattr(entity, 'is_engine_dead', False))
         if is_tracked or is_engine_dead:
@@ -8930,6 +9403,7 @@ class BattleRuntime(object):
         if is_tracked or is_engine_dead:
             turn = 0.0
             self._local_turn_speed = 0.0
+        self._local_drive_turn = turn
         self._local_turn_speed = vehicle_physics.traverse_step(
             self._local_physics, self._local_turn_speed,
             turn, self._local_speed, dt,
@@ -9200,42 +9674,29 @@ class BattleRuntime(object):
                 return True
         return False
 
-    def _bot_friendly_firing_lane(self, source, target):
-        """Reject a direct shot whose live barrel ray crosses an allied hull.
-
-        The static-world lane has a short cache for frame pacing.  Vehicle
-        poses do not: this callback runs at every final fire admission so a
-        teammate crossing a previously clear lane stops the shot.  SPGs keep
-        their separately proved curved trajectory; a straight centre ray is
-        not a valid obstruction test for that path.
-        """
-        profile = source.get('profile')
-        profile = profile if isinstance(profile, dict) else {}
-        if str(profile.get('class_tag') or '') == 'SPG':
-            return True
+    def _bot_friendly_path_verdict(
+            self, source, path, splash_radius=0.0):
+        """Test live allied hulls against one frozen physical shell path."""
         try:
             source_id = int(source.get('id'))
             source_team = int(source.get('team'))
-        except (TypeError, ValueError):
-            return False
-        source_record = self._records.get('bot:%s' % source_id)
-        if source_record is None:
-            return False
-        source_entity = self._server_entity(source_record['engine_id'])
-        try:
-            gun_node = source_entity.model.node('HP_gunFire')
-            start = self._vector(
-                self._runtime.math.Matrix(gun_node).translation)
-        except Exception:
-            return False
-        target_position = target.get('position') or _xyz(target)
-        end = self._vector((
-            target_position[0], target_position[1] + 1.2,
-            target_position[2]))
-        if (end - start).length <= 0.01:
-            return False
+            points = tuple(tuple(float(value) for value in point[:3])
+                           for point in path)
+            splash_radius = float(splash_radius)
+        except (AttributeError, TypeError, ValueError, IndexError,
+                OverflowError):
+            return {'clear': False}
+        if (len(points) < 2 or splash_radius < 0.0 or
+                math.isnan(splash_radius) or math.isinf(splash_radius) or
+                any(math.isnan(value) or math.isinf(value)
+                    for point in points for value in point)):
+            return {'clear': False}
+        terminal = points[-1]
+        broadphase_sq = PROJECTILE_BROADPHASE_RADIUS ** 2
         for record in self._records.values():
             if record.get('tombstone') or not record.get('ready'):
+                continue
+            if self._worker_mode and record.get('local'):
                 continue
             if record.get('kind') == 'bot':
                 try:
@@ -9249,23 +9710,129 @@ class BattleRuntime(object):
                     continue
             except (TypeError, ValueError):
                 continue
-            vehicle = self._server_entity(record['engine_id'])
-            if vehicle is None or not self._record_alive(record, vehicle):
+            vehicle = self._server_entity(record.get('engine_id'))
+            if (vehicle is None or not getattr(vehicle, 'isStarted', False) or
+                    not self._record_alive(record, vehicle)):
                 continue
-            if record.get('local') and self._local_matrix is not None:
-                collisions = collide_vehicle_at_matrix(
-                    vehicle, self._local_matrix, start, end,
-                    self._runtime.math)
-            elif record.get('native_remote'):
-                collisions = collide_vehicle_at_matrix(
-                    vehicle, vehicle.matrix, start, end,
-                    self._runtime.math)
-            else:
-                collide = getattr(vehicle, 'collideSegmentExt', None)
-                collisions = collide(start, end) if callable(collide) else ()
-            if collisions:
-                return False
-        return True
+            position = (tuple(self._local_position)
+                        if record.get('local') else
+                        _xyz(getattr(vehicle, 'position', state)))
+            blocked = bool(
+                splash_radius > 0.0 and
+                sum((position[index] - terminal[index]) ** 2
+                    for index in range(3)) <= splash_radius ** 2)
+            if not blocked:
+                for first, second in zip(points, points[1:]):
+                    if (not point_in_expanded_segment_bounds(
+                            position, first, second,
+                            PROJECTILE_BROADPHASE_RADIUS) or
+                            point_segment_distance_sq(
+                                position, first, second) > broadphase_sq):
+                        continue
+                    start = self._vector(first)
+                    end = self._vector(second)
+                    try:
+                        if (record.get('local') and
+                                self._local_matrix is not None):
+                            collisions = collide_vehicle_at_matrix(
+                                vehicle, self._local_matrix, start, end,
+                                self._runtime.math)
+                        elif record.get('native_remote'):
+                            collisions = collide_vehicle_at_matrix(
+                                vehicle, vehicle.matrix, start, end,
+                                self._runtime.math)
+                        else:
+                            collide = getattr(
+                                vehicle, 'collideSegmentExt', None)
+                            collisions = (collide(start, end)
+                                          if callable(collide) else ())
+                    except Exception:
+                        return {'clear': False}
+                    if collisions:
+                        blocked = True
+                        break
+            if not blocked:
+                continue
+            try:
+                shape = tank_collision.chassis_shape(
+                    vehicle.typeDescriptor)
+                blocker_radius = math.hypot(shape[0], shape[1])
+            except Exception:
+                fallback = tank_collision.DEFAULT_SHAPE
+                blocker_radius = math.hypot(fallback[0], fallback[1])
+            return {
+                'clear': False,
+                'blocker_kind': record.get('kind'),
+                'blocker_id': record.get('network_id'),
+                'blocker_team': source_team,
+                'blocker_position': position,
+                'blocker_radius': blocker_radius,
+            }
+        return {'clear': True}
+
+    def _bot_friendly_firing_lane(
+            self, source, unused_target, descriptor, shell_index, launch):
+        """Reject allies on the exact frozen direct-shell parabola."""
+        try:
+            source_id = int(source.get('id'))
+            fire_seq = int(launch.get('fire_seq'))
+            launch_shell_index = int(launch.get('shell_index'))
+            shot_yaw = float(launch.get('shot_yaw'))
+            shot_pitch = float(launch.get('shot_pitch'))
+            flight_time = float(launch.get('flight_time'))
+            origin = tuple(float(launch['origin'][index])
+                           for index in range(3))
+        except (AttributeError, KeyError, TypeError, ValueError, IndexError,
+                OverflowError):
+            return {'clear': False}
+        if (fire_seq != int(source.get('fire_seq', 0)) + 1 or
+                launch_shell_index != int(shell_index) or
+                flight_time <= 0.0 or
+                flight_time > ballistics.PROJECTILE_MAX_FLIGHT_SECONDS or
+                any(math.isnan(value) or math.isinf(value) for value in (
+                    shot_yaw, shot_pitch, flight_time) + origin)):
+            return {'clear': False}
+        try:
+            shot = self._descriptor_shot(descriptor, shell_index)
+            speed = float(_field(shot, 'speed'))
+            gravity = abs(float(_field(shot, 'gravity')))
+            maximum = float(_field(shot, 'maxDistance'))
+            splash_radius = float(combat_rules.he_radius(shot))
+        except (AttributeError, TypeError, ValueError, IndexError,
+                OverflowError):
+            return {'clear': False}
+        if (speed <= 0.0 or gravity <= 0.0 or maximum <= 0.0 or
+                speed * flight_time > maximum + 1e-6):
+            return {'clear': False}
+        path = ballistics.ballistic_path(
+            # Protocol shot pitch is positive-up; the pure helper follows the
+            # rendered BigWorld negative-is-up convention.
+            origin, shot_yaw, -shot_pitch, speed, gravity, flight_time,
+            PROJECTILE_MAX_SUBSTEP_SECONDS)
+        return self._bot_friendly_path_verdict(
+            source, path, splash_radius)
+
+    def _bot_direct_launch_origin(
+            self, source, unused_descriptor, unused_shell_index,
+            unused_fire_seq, unused_shot_yaw, unused_shot_pitch,
+            unused_flight_time):
+        """Freeze one direct shell's real native muzzle before its lane proof."""
+        try:
+            source_id = int(source.get('id'))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        source_record = self._records.get('bot:%s' % source_id)
+        if source_record is None:
+            return None
+        source_entity = self._server_entity(source_record.get('engine_id'))
+        if (source_entity is None or
+                not getattr(source_entity, 'isStarted', False)):
+            return None
+        try:
+            gun_node = source_entity.model.node('HP_gunFire')
+            return _xyz(self._runtime.math.Matrix(gun_node).translation)
+        except Exception:
+            return None
 
     def _bot_ballistic_solution(self, source, target, descriptor,
                                 shell_index, now):
@@ -9310,82 +9877,30 @@ class BattleRuntime(object):
             self, source, unused_target, descriptor, shell_index, receipt):
         """Reject allies intersecting the proved SPG path or HE terminal."""
         try:
-            source_id = int(source.get('id'))
-            source_team = int(source.get('team'))
             raw_path = receipt.get('path')
             if not isinstance(raw_path, (list, tuple)) or len(raw_path) < 2:
-                return False
+                return {'clear': False}
             path = []
             for raw in raw_path:
                 point = tuple(float(raw[index]) for index in range(3))
                 if any(math.isnan(value) or math.isinf(value)
                        for value in point):
-                    return False
+                    return {'clear': False}
                 path.append(point)
         except (AttributeError, TypeError, ValueError, IndexError,
                 OverflowError):
-            return False
+            return {'clear': False}
         try:
             shot = self._descriptor_shot(descriptor, shell_index)
             splash_radius = float(combat_rules.he_radius(shot))
             if (math.isnan(splash_radius) or math.isinf(splash_radius) or
                     splash_radius < 0.0):
-                return False
+                return {'clear': False}
         except (AttributeError, TypeError, ValueError, IndexError,
                 OverflowError):
-            return False
-        terminal = path[-1]
-        broadphase_sq = PROJECTILE_BROADPHASE_RADIUS ** 2
-        for record in self._records.values():
-            if record.get('tombstone') or not record.get('ready'):
-                continue
-            if record.get('kind') == 'bot':
-                try:
-                    if int(record.get('network_id')) == source_id:
-                        continue
-                except (TypeError, ValueError, OverflowError):
-                    continue
-            state = record.get('state') or {}
-            try:
-                if int(state.get('team')) != source_team:
-                    continue
-            except (TypeError, ValueError, OverflowError):
-                continue
-            vehicle = self._server_entity(record.get('engine_id'))
-            if (vehicle is None or not getattr(vehicle, 'isStarted', False) or
-                    not self._record_alive(record, vehicle)):
-                continue
-            position = (tuple(self._local_position)
-                        if record.get('local') else
-                        _xyz(getattr(vehicle, 'position', state)))
-            if (splash_radius > 0.0 and
-                    sum((position[index] - terminal[index]) ** 2
-                        for index in range(3)) <= splash_radius ** 2):
-                return False
-            for first, second in zip(path, path[1:]):
-                if (not point_in_expanded_segment_bounds(
-                        position, first, second,
-                        PROJECTILE_BROADPHASE_RADIUS) or
-                        point_segment_distance_sq(
-                            position, first, second) > broadphase_sq):
-                    continue
-                start = self._vector(first)
-                end = self._vector(second)
-                if record.get('local') and self._local_matrix is not None:
-                    collisions = collide_vehicle_at_matrix(
-                        vehicle, self._local_matrix, start, end,
-                        self._runtime.math)
-                elif record.get('native_remote'):
-                    collisions = collide_vehicle_at_matrix(
-                        vehicle, vehicle.matrix, start, end,
-                        self._runtime.math)
-                else:
-                    collide = getattr(vehicle, 'collideSegmentExt', None)
-                    collisions = (collide(start, end)
-                                  if callable(collide) else ())
-                if collisions:
-                    return False
-        return True
+            return {'clear': False}
+        return self._bot_friendly_path_verdict(
+            source, path, splash_radius)
 
     def _bot_artillery_cancel(self, source):
         """Discard bounded arc work for a cancelled frozen SPG intent."""
@@ -9434,7 +9949,9 @@ class BattleRuntime(object):
                 message.get('bot_id'), message.get('target_kind'),
                 message.get('target_id'), message.get('ram_seq'),
                 message.get('damage_to_bot'),
-                message.get('damage_to_target'))
+                message.get('damage_to_target'),
+                message.get('ram_contact_player_id'),
+                message.get('ram_contact_seq'))
         if kind == 'rules_state':
             rules = message.get('rules') or {}
             return self.client.send_rules_state(rules.get('bases'))
@@ -9541,12 +10058,12 @@ class BattleRuntime(object):
                 return False
         else:
             try:
-                gun_node = source.model.node('HP_gunFire')
-                origin = _xyz(
-                    self._runtime.math.Matrix(gun_node).translation)
-            except Exception:
-                # A guessed hull-centre origin can start beyond nearby cover.
-                # Every canonical shell must leave the native gun-fire node.
+                origin = tuple(float(value) for value in state['shot_origin'])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return False
+            if (len(origin) != 3 or
+                    any(math.isnan(value) or math.isinf(value)
+                        for value in origin)):
                 return False
             horizontal = math.cos(shot_pitch)
             direction = (
@@ -9868,6 +10385,11 @@ class BattleRuntime(object):
         pose = event.get('pose')
         if pose is not None:
             record['pending_pose'] = dict(pose)
+            if (record.get('kind') == 'bot' and
+                    event.get('presentation_time_us') is not None):
+                record['presented_pose'] = dict(pose)
+                record['presentation_time_us'] = int(
+                    event.get('presentation_time_us'))
         self._materialize_record(record)
 
     def _materialize_record(self, record):
@@ -9906,7 +10428,12 @@ class BattleRuntime(object):
                 raise RuntimeError('remote vehicle has no ready presentation')
             initially_visible = bool(record.get('spot_visible', True))
             vehicle._spot_visible = initially_visible
-            if record.get('native_remote'):
+            if self._worker_mode:
+                # Keep the assembled compound, muzzle nodes and hit tester for
+                # authority simulation. Do not register markers, target caps,
+                # battle UI or shot/sound presentation in the hidden worker.
+                record['simulation_entity'] = True
+            elif record.get('native_remote'):
                 vehicle.show(initially_visible)
                 vehicle.targetCaps = [1] if initially_visible else []
                 # Stock Vehicle.startVisual registered the native marker.
@@ -9914,14 +10441,15 @@ class BattleRuntime(object):
                 vehicle._offlineNativeMarkerVisible = True
             else:
                 vehicle.appearance.changeVisibility(initially_visible)
-        if (record.get('presentation') and
+        if (not self._worker_mode and record.get('presentation') and
                 not record.get('arena_added')):
             self._binding.arena_vehicle_added(record['engine_id'], {
                 'properties': record['properties'],
                 'team_killer': bool(
                     (record.get('state') or {}).get('team_killer', False))})
             record['arena_added'] = True
-        if (record.get('presentation') and not record.get('native_remote') and
+        if (not self._worker_mode and record.get('presentation') and
+                not record.get('native_remote') and
                 record.get('arena_added') and
                 record.get('spot_visible', True) and
                 not record.get('visual_started')):
@@ -9929,7 +10457,7 @@ class BattleRuntime(object):
             record['visual_started'] = True
             if not self._record_alive(record, vehicle):
                 self._present_vehicle_dead(record, True)
-        if record.get('presentation'):
+        if record.get('presentation') and not self._worker_mode:
             self._set_record_spot_visibility(
                 record, record.get('spot_visible', True))
         pose = record.pop('pending_pose', None)
@@ -9970,7 +10498,10 @@ class BattleRuntime(object):
             self._binding.set_vehicle_pose(
                 record['engine_id'], self._vector((
                     _number(pose.get('x')), _number(pose.get('y')),
-                    _number(pose.get('z')))), _engine_rotation(yaw))
+                    _number(pose.get('z')))), _engine_rotation(
+                        yaw, _number(pose.get('pitch')),
+                        _number(pose.get('roll'))),
+                now=self._clock())
             self._binding.update_vehicle_aim(
                 record['engine_id'], yaw,
                 _number(pose.get('aim_yaw', yaw)),
@@ -10574,8 +11105,16 @@ class BattleRuntime(object):
                 state['critical'] = canonical
                 record['critical_state'] = canonical
                 record['state'] = state
-                self._present_critical(
-                    record, death_payload.get('events'), attacker_id)
+                # #1513's native health transition owns the terminal damage
+                # panel state (DESTROYED or CREW_DEACTIVATED).  The canonical
+                # all-module/all-crew payload is durable authority state, not a
+                # burst of new device-hit notifications; replaying it through
+                # showVehicleDamageInfo feeds terminal device updates outside
+                # the stock death-panel lifecycle and Flash rejects the call.
+                # Stop the native fire extra, but leave the death HUD to the
+                # stock Vehicle/PlayerAvatar consumer below.
+                if not self._worker_mode:
+                    self._sync_fire_effect(entity)
                 if record.get('local'):
                     self._queue_local_damage_report(
                         critical=death_payload,
@@ -10583,6 +11122,25 @@ class BattleRuntime(object):
                             'drowning', 'world_collision'))
         preserve_inactive_hull = dead and display_health > 0
         native_health = display_health if preserve_inactive_hull else health
+        if self._worker_mode:
+            entity.health = native_health
+            notifier = getattr(entity, 'set_health', None)
+            if callable(notifier):
+                notifier(previous)
+            previous_crew_active = getattr(
+                entity, 'isCrewActive', crew_active)
+            entity.isCrewActive = crew_active
+            crew_notifier = getattr(entity, 'set_isCrewActive', None)
+            if callable(crew_notifier):
+                crew_notifier(previous_crew_active)
+            retain_wreck = getattr(entity, 'retain_wreck_model', None)
+            if (record.get('presentation') and dead and
+                    callable(retain_wreck)):
+                # The worker never draws this compound, but finalizing it
+                # still stops live extras and native track motion without
+                # loading a second model.
+                retain_wreck()
+            return
         entity.health = native_health
         health_changed = getattr(entity, 'onHealthChanged', None)
         if callable(health_changed):
@@ -10612,8 +11170,8 @@ class BattleRuntime(object):
         # presentation.
         entity_alive = getattr(entity, 'isAlive', None)
         if not (entity_alive() if callable(entity_alive) else entity_alive):
-            # wgAddEdgeDetectEntity binds the vehicle's current compound, and
-            # request_wreck below replaces it on a later frame.
+            # A dead vehicle cannot remain the live target even though its
+            # existing compound stays in place as non-blocking wreck cover.
             if self._outlined_engine_id == engine_id:
                 self._clear_target_outline()
             self._release_target_lock(engine_id)
@@ -10668,7 +11226,8 @@ class BattleRuntime(object):
                 except ValueError:
                     pass
             return
-        self._fallback_postmortem_viewpoint(record['engine_id'])
+        if not self._worker_mode:
+            self._fallback_postmortem_viewpoint(record['engine_id'])
         if event.get('keep_corpse'):
             state = dict(record.get('state') or {})
             state.update(event.get('state') or {})
@@ -10988,6 +11547,8 @@ class BattleRuntime(object):
         legacy_shell = combat_rules.legacy_shot(shot).get('shell') or {}
         for record in tuple(self._records.values()):
             if record is direct_record or record.get('tombstone'):
+                continue
+            if self._worker_mode and record.get('local'):
                 continue
             target = self._server_entity(record['engine_id'])
             if (target is None or target.typeDescriptor is None or
@@ -11360,6 +11921,7 @@ class BattleRuntime(object):
         self._bots = None
         self._worker_probe = None
         self._worker_probe_attempted = False
+        self._worker_frame_callbacks = 0
         self._worker_probe_authority_callbacks = 0
         self._worker_probe_bot_generated = 0
         self._worker_probe_bot_enqueued = 0
@@ -11382,6 +11944,7 @@ class BattleRuntime(object):
         self._track_report_time = None
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
+        self._local_drive_turn = 0.0
         self._local_push_x = 0.0
         self._local_push_z = 0.0
         self._local_physics = None

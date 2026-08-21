@@ -12,7 +12,9 @@ import uuid
 PROTOCOL_VERSION = 5
 CLIENT_BUILD = 'wot-0.9.22.0.1-cn-1513'
 PROJECTILE_LEDGER_CAPABILITY = 'projectile_ledger_v1'
+SIMULATION_WORKER_CAPABILITY = 'simulation_worker_v1'
 CLIENT_CAPABILITIES = (PROJECTILE_LEDGER_CAPABILITY,)
+WORKER_AUTHORITY_ID = -1
 POLL_INTERVAL = 1.0 / 60.0
 PING_INTERVAL = 1.0
 MAX_MESSAGE_BYTES = 256 * 1024
@@ -25,6 +27,9 @@ MAX_OUTBOUND_DEPTH = 16
 MAX_PROJECTILE_BATCH = 30
 MAX_PROJECTILE_DESTRUCTIBLES = 64
 MAX_PROJECTILE_ID = 2147483647
+# A process-relative microsecond clock fits comfortably in this bound for
+# centuries while remaining an exact JSON integer on Python 2 and Python 3.
+MAX_MOTION_TIME_US = 10000000000000000
 MAX_PROJECTILE_ORIGIN = 5000.0
 MAX_PROJECTILE_VELOCITY = 3000.0
 # #1513 includes SPG shells such as the B-4 with gravity=143.  Keep the
@@ -77,6 +82,15 @@ except NameError:
 
 class _OutboundPayloadError(Exception):
     pass
+
+
+class _PreencodedOutbound(object):
+    """Immutable wire bytes owned by the reliable outbound queue."""
+
+    __slots__ = ('payload',)
+
+    def __init__(self, payload):
+        self.payload = payload
 
 
 def _json_text_size(value):
@@ -779,6 +793,25 @@ class LANClient(object):
         self._schedule_poll()
         return True
 
+    def _hello_payload(self):
+        """Return the unchanged player hello sent by the transport worker.
+
+        A simulation worker overrides this one construction boundary.  Keeping
+        the ordinary payload here prevents the opt-in role from changing the
+        wire shape used by every player client and older v5 server.
+        """
+        return {
+            'type': 'hello',
+            'protocol': PROTOCOL_VERSION,
+            'client_build': CLIENT_BUILD,
+            'capabilities': list(CLIENT_CAPABILITIES),
+            'name': self.name,
+            'vehicle': self.vehicle,
+            'max_health': self.max_health,
+            'account_key': self.account_key,
+            'outfits': dict(self.outfits),
+        }
+
     def stop(self):
         with self._outbound_lock:
             if (not self.running and self.sock is None and
@@ -942,6 +975,7 @@ class LANClient(object):
     def send_input(self, forward, turn, aim_yaw=0.0, gun_pitch=0.0,
                    position=None, yaw=None, fire_seq=0,
                    speed=None,
+                   ram_contact=None,
                    reported_health=None, reported_critical=None,
                    reported_reason=None, reported_display_health=None,
                    reported_attacker=None, reported_attacker_bot=None,
@@ -966,6 +1000,8 @@ class LANClient(object):
         if speed is not None:
             message['speed'] = max(
                 -200.0, min(200.0, _finite_float(speed)))
+        if isinstance(ram_contact, dict):
+            message['ram_contact'] = dict(ram_contact)
         if reported_health is not None:
             message['reported_health'] = max(0, int(reported_health))
         if isinstance(reported_critical, dict):
@@ -1482,21 +1518,27 @@ class LANClient(object):
         return self._send(message)
 
     def send_bot_ram(self, bot_id, target_kind, target_id, ram_seq,
-                     damage_to_bot, damage_to_target):
+                     damage_to_bot, damage_to_target,
+                     ram_contact_player_id=None, ram_contact_seq=None):
         """Report one mature cooldown-gated tank collision as authority."""
         if not self.is_bot_authority():
             return False
         kind = str(target_kind)
         if kind not in ('bot', 'human'):
             return False
-        return self._send({
+        message = {
             'type': 'bot_ram_report', 'round_id': self.round_id,
             'bot_id': int(bot_id), 'target_kind': kind,
             'target_id': int(target_id), 'ram_seq': max(1, int(ram_seq)),
             'damage_to_bot': max(0, min(int(damage_to_bot or 0), 500)),
             'damage_to_target': max(
                 0, min(int(damage_to_target or 0), 500)),
-        })
+        }
+        if (ram_contact_player_id is not None and
+                ram_contact_seq is not None):
+            message['ram_contact_player_id'] = int(ram_contact_player_id)
+            message['ram_contact_seq'] = int(ram_contact_seq)
+        return self._send(message)
 
     def send_rules_state(self, bases):
         """Send the server's documented standard-base state shape."""
@@ -1572,17 +1614,7 @@ class LANClient(object):
             # The server requires hello to be the first wire message.  Do not
             # expose the socket to the BigWorld poller until it is on the
             # wire, or the first main-thread ping can win this race.
-            hello = {
-                'type': 'hello',
-                'protocol': PROTOCOL_VERSION,
-                'client_build': CLIENT_BUILD,
-                'capabilities': list(CLIENT_CAPABILITIES),
-                'name': self.name,
-                'vehicle': self.vehicle,
-                'max_health': self.max_health,
-                'account_key': self.account_key,
-                'outfits': dict(self.outfits),
-            }
+            hello = self._hello_payload()
             payload = (json.dumps(
                 hello, separators=(',', ':')) + '\n').encode('utf-8')
             with self._send_lock:
@@ -1725,10 +1757,13 @@ class LANClient(object):
             return item
 
     def _send_wire(self, message, sock, generation):
-        """Encode and write one queued message from the sender thread."""
+        """Write one queued message, encoding generic payloads on demand."""
         try:
-            payload = (json.dumps(
-                message, separators=(',', ':')) + '\n').encode('utf-8')
+            if isinstance(message, _PreencodedOutbound):
+                payload = message.payload
+            else:
+                payload = (json.dumps(
+                    message, separators=(',', ':')) + '\n').encode('utf-8')
             if len(payload) > MAX_MESSAGE_BYTES:
                 if self._record_transport_error(
                         'client message exceeded wire limit',
@@ -1777,6 +1812,57 @@ class LANClient(object):
                         self._sender_thread is threading.current_thread()):
                     self._sender_thread = None
 
+    def _enqueue_outbound(self, message, encoded_size, generation):
+        """Apply the common generation, FIFO and queue-size boundaries."""
+        overflow = False
+        with self._outbound_lock:
+            if (generation != self._transport_generation or
+                    not self._outbound_accepting or self._stopping or
+                    not self.running or not self.connected):
+                return False
+            if (len(self._outbound_queue) >= MAX_OUTBOUND_MESSAGES or
+                    self._outbound_bytes + encoded_size >
+                    MAX_OUTBOUND_BYTES):
+                overflow = True
+            else:
+                self._outbound_seq += 1
+                self._outbound_queue.append((
+                    self._outbound_seq, message, encoded_size))
+                self._outbound_bytes += encoded_size
+        if overflow:
+            self._abort_outbound('LAN outbound queue exceeded limit',
+                                 generation)
+            return False
+        self._outbound_event.set()
+        return True
+
+    def _send_preencoded_trusted(self, message):
+        """Encode one trusted canonical message directly into queue bytes.
+
+        This deliberately bypasses the generic recursive freeze/copy pass.
+        Callers must therefore own the schema and must not pass data received
+        from the network.  Encoding before enqueue still freezes the caller's
+        state, rejects non-finite numbers, and gives both the wire and queue an
+        exact byte bound.
+        """
+        with self._outbound_lock:
+            if (not self.connected or self.sock is None or
+                    self._stopping or not self.running or
+                    not self._outbound_accepting):
+                return False
+            generation = self._transport_generation
+        try:
+            payload = (json.dumps(
+                message, separators=(',', ':'), allow_nan=False) +
+                '\n').encode('utf-8')
+        except Exception:
+            return False
+        encoded_size = len(payload)
+        if encoded_size > MAX_MESSAGE_BYTES:
+            return False
+        return self._enqueue_outbound(
+            _PreencodedOutbound(payload), encoded_size, generation)
+
     def _send(self, message):
         """Freeze and enqueue one reliable message without wire I/O."""
         with self._outbound_lock:
@@ -1792,27 +1878,7 @@ class LANClient(object):
         estimated_size += 1
         if estimated_size > MAX_MESSAGE_BYTES:
             return False
-        overflow = False
-        with self._outbound_lock:
-            if (generation != self._transport_generation or
-                    not self._outbound_accepting or self._stopping or
-                    not self.running or not self.connected):
-                return False
-            if (len(self._outbound_queue) >= MAX_OUTBOUND_MESSAGES or
-                    self._outbound_bytes + estimated_size >
-                    MAX_OUTBOUND_BYTES):
-                overflow = True
-            else:
-                self._outbound_seq += 1
-                self._outbound_queue.append((
-                    self._outbound_seq, frozen, estimated_size))
-                self._outbound_bytes += estimated_size
-        if overflow:
-            self._abort_outbound('LAN outbound queue exceeded limit',
-                                 generation)
-            return False
-        self._outbound_event.set()
-        return True
+        return self._enqueue_outbound(frozen, estimated_size, generation)
 
     def _schedule_poll(self):
         if self._poll_callback is not None:
@@ -2255,6 +2321,14 @@ class LANClient(object):
                 message.get('projectile_revision'), 0, MAX_PROJECTILE_ID)
             bot_state_revision = _projectile_int_range(
                 message.get('bot_state_revision'), 0, MAX_PROJECTILE_ID)
+            has_motion_time = 'motion_time_us' in message
+            has_bot_state_time = 'bot_state_time_us' in message
+            motion_time_us = (_projectile_int_range(
+                message.get('motion_time_us'), 0, MAX_MOTION_TIME_US)
+                if has_motion_time else None)
+            bot_state_time_us = (_projectile_int_range(
+                message.get('bot_state_time_us'), 0, MAX_MOTION_TIME_US)
+                if has_bot_state_time else None)
             projectiles = message.get('projectiles')
             players = _strict_mapping_list(message.get('players'), 64)
             player_outfits_valid = all(
@@ -2291,12 +2365,47 @@ class LANClient(object):
                 _valid_bot_combat_contract(bot) for bot in bots or ())
             ledger_required = self.has_projectile_ledger()
             previous_bot_state_revision = None
+            previous_snapshot = None
+            previous_motion_time = None
+            previous_bot_state_time = None
             if (isinstance(self.last_snapshot, dict) and
                     _exact_int(self.last_snapshot.get('round_id')) ==
                     round_id):
+                previous_snapshot = self.last_snapshot
                 previous_bot_state_revision = _projectile_int_range(
                     self.last_snapshot.get('bot_state_revision'),
                     0, MAX_PROJECTILE_ID)
+            motion_timing_valid = (
+                has_motion_time == has_bot_state_time and
+                (not has_motion_time or (
+                    motion_time_us is not None and
+                    bot_state_time_us is not None and
+                    bot_state_time_us <= motion_time_us)))
+            if motion_timing_valid and previous_snapshot is not None:
+                previous_has_motion = (
+                    'motion_time_us' in previous_snapshot)
+                previous_has_bot_state = (
+                    'bot_state_time_us' in previous_snapshot)
+                if previous_has_motion != previous_has_bot_state:
+                    motion_timing_valid = False
+                elif previous_has_motion:
+                    previous_motion_time = _projectile_int_range(
+                        previous_snapshot.get('motion_time_us'), 0,
+                        MAX_MOTION_TIME_US)
+                    previous_bot_state_time = _projectile_int_range(
+                        previous_snapshot.get('bot_state_time_us'), 0,
+                        MAX_MOTION_TIME_US)
+                    motion_timing_valid = bool(
+                        has_motion_time and
+                        previous_motion_time is not None and
+                        previous_bot_state_time is not None and
+                        motion_time_us >= previous_motion_time and
+                        ((bot_state_revision ==
+                          previous_bot_state_revision and
+                          bot_state_time_us == previous_bot_state_time) or
+                         (bot_state_revision >
+                          previous_bot_state_revision and
+                          bot_state_time_us > previous_bot_state_time)))
             valid_projectiles = (not ledger_required or (
                 server_time_ms is not None and authority_epoch is not None and
                 projectile_revision is not None and
@@ -2304,23 +2413,72 @@ class LANClient(object):
                  authority_epoch >= self.authority_epoch) and
                 _valid_active_projectiles(
                     projectiles, authority_epoch, server_time_ms)))
-            if (server_tick is None or server_tick < 0 or
-                    bot_state_revision is None or
-                    (previous_bot_state_revision is not None and
-                     bot_state_revision < previous_bot_state_revision) or
-                    not valid_projectiles or
-                    players is None or not player_outfits_valid or
-                    bots is None or
-                    not player_critical_contract or
-                    not bot_combat_contract or
-                    ('bot_manifest' in message and manifest is None) or
-                    ('bot_orders' in message and
-                     (orders is None or order_revision is None or
-                      order_revision < 0)) or
-                    ('destructibles' in message and
-                     (destructibles is None or
-                      destructible_revision is None or
-                      destructible_revision < 0))):
+            invalid_reasons = []
+            if server_tick is None or server_tick < 0:
+                invalid_reasons.append('server_tick')
+            if bot_state_revision is None:
+                invalid_reasons.append('bot_state_revision')
+            elif (previous_bot_state_revision is not None and
+                  bot_state_revision < previous_bot_state_revision):
+                invalid_reasons.append('bot_state_revision_regressed')
+            if not motion_timing_valid:
+                invalid_reasons.append('motion_timing')
+            if not valid_projectiles:
+                invalid_reasons.append('projectiles')
+            if players is None:
+                invalid_reasons.append('players')
+            if not player_outfits_valid:
+                invalid_reasons.append('player_outfits')
+            if bots is None:
+                invalid_reasons.append('bots')
+            if not player_critical_contract:
+                invalid_reasons.append('player_critical')
+            if not bot_combat_contract:
+                invalid_reasons.append('bot_combat')
+            if 'bot_manifest' in message and manifest is None:
+                invalid_reasons.append('bot_manifest')
+            if ('bot_orders' in message and
+                    (orders is None or order_revision is None or
+                     order_revision < 0)):
+                invalid_reasons.append('bot_orders')
+            if ('destructibles' in message and
+                    (destructibles is None or
+                     destructible_revision is None or
+                     destructible_revision < 0)):
+                invalid_reasons.append('destructibles')
+            if invalid_reasons:
+                bad_bot = next((
+                    value for value in bots or ()
+                    if not _valid_bot_combat_contract(value)), None)
+                bad_bot_detail = None
+                if isinstance(bad_bot, dict):
+                    bad_bot_critical = bad_bot.get('critical')
+                    bad_bot_detail = {
+                        'id': bad_bot.get('id'),
+                        'revision': bad_bot.get('combat_revision'),
+                        'base': bad_bot.get('combat_base_revision'),
+                        'ack': bad_bot.get('combat_ack_seq'),
+                        'fire': (bad_bot_critical.get('fire')
+                                 if isinstance(bad_bot_critical, dict)
+                                 else None),
+                        'elapsed': bad_bot.get('combat_fire_elapsed'),
+                        'timer': bad_bot.get('combat_fire_timer'),
+                    }
+                print(
+                    '[Offline LAN 0.9.22] snapshot rejected reasons=%s '
+                    'round=%s tick=%s bot_revision=%s previous_revision=%s '
+                    'motion_us=%s previous_motion_us=%s bot_state_us=%s '
+                    'previous_bot_state_us=%s projectiles=%s bots=%s '
+                    'players=%s bad_bot=%s' % (
+                        ','.join(invalid_reasons), round_id, server_tick,
+                        bot_state_revision, previous_bot_state_revision,
+                        motion_time_us, previous_motion_time,
+                        bot_state_time_us, previous_bot_state_time,
+                        (len(projectiles)
+                         if isinstance(projectiles, list) else None),
+                        (len(bots) if bots is not None else None),
+                        (len(players) if players is not None else None),
+                        bad_bot_detail))
                 self.last_error = 'invalid snapshot message'
                 self.stop()
                 return
@@ -2370,8 +2528,12 @@ class LANClient(object):
                     event.get('authority_epoch'), 0, MAX_PROJECTILE_ID)
                 authority_id = event.get('player_id')
                 if authority_id is not None:
-                    authority_id = _projectile_int_range(
-                        authority_id, 1, MAX_PROJECTILE_ID)
+                    parsed_authority_id = _exact_int(authority_id)
+                    authority_id = (
+                        parsed_authority_id
+                        if parsed_authority_id == WORKER_AUTHORITY_ID else
+                        _projectile_int_range(
+                            authority_id, 1, MAX_PROJECTILE_ID))
                 if (event_authority_epoch is None or
                         (self.authority_epoch is not None and
                          event_authority_epoch < self.authority_epoch) or

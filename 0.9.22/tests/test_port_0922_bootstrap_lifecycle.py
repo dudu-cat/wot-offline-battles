@@ -156,9 +156,14 @@ class BootstrapLifecycleTests(unittest.TestCase):
         compat_module.g_compatibility = compatibility
         config_module = types.ModuleType(
             'gui.mods.offline_lan_0922.config')
+        config_module.PLAYER_MODE = 'player'
+        config_module.SIMULATION_WORKER_MODE = 'simulation_worker'
+        config_module.CLIENT_MODE_ENV = 'OFFLINE_LAN_0922_CLIENT_MODE'
         config_module.load = lambda: {
             'enabled': True, 'startupTimeoutSeconds': 30.0,
             'vehicle': 'ussr:R11_MS-1'}
+        config_module.client_mode = lambda unused_config: (
+            config_module.PLAYER_MODE)
         state_module = types.ModuleType(
             'gui.mods.offline_lan_0922.account_rpc.state')
         state_module.AccountState = types.SimpleNamespace
@@ -166,6 +171,9 @@ class BootstrapLifecycleTests(unittest.TestCase):
         postbattle_module = types.ModuleType(
             'gui.mods.offline_lan_0922.account_rpc.postbattle_store')
         postbattle_module.PostBattleStore = lambda: postbattle_store
+        instance_guard_module = types.ModuleType(
+            'gui.mods.offline_lan_0922.instance_guard')
+        instance_guard_module.release_if_requested = lambda: False
         session = types.SimpleNamespace(
             install=lambda: events.append('install_battle_router') or True,
             stop=lambda **unused_kwargs: None)
@@ -376,6 +384,8 @@ class BootstrapLifecycleTests(unittest.TestCase):
             'gui.mods.offline_lan_0922.account_rpc.state': state_module,
             'gui.mods.offline_lan_0922.compat': compat_module,
             'gui.mods.offline_lan_0922.config': config_module,
+            'gui.mods.offline_lan_0922.instance_guard': (
+                instance_guard_module),
             'gui.mods.offline_lan_0922.lan_session': lan_session_module,
             'gui.mods.offline_lan_0922.lobby_ui': lobby_ui_module,
             'gui.mods.offline_lan_0922.vehicle_blacklist': VEHICLE_BLACKLIST,
@@ -484,6 +494,13 @@ class BootstrapLifecycleTests(unittest.TestCase):
         # the stock parts 2002-2007 and the top parts 2012-2017.
         self.assertEqual((2013, 2014), selected['shellsLayoutIdx'])
         self.assertEqual([12014, 20], selected['shells'])
+        # The loaded rows contain only each mounted top gun, but the
+        # account-level catalogue must also retain every alternate gun's
+        # ammunition so a saved stock-gun fitting can close prices/unlocks on
+        # the next startup.
+        self.assertEqual(
+            {12004, 12014, 13004, 13014, 14004, 14014},
+            set(selected['inventoryItems'][10]))
         # 9 is optionalDevice and 11 is equipment: account-wide catalogues
         # the garage needs before it can offer a mount.
         self.assertEqual(set(range(2, 8)) | {9, 10, 11},

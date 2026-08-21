@@ -11,6 +11,7 @@ directory that contains WorldOfTanks.exe. It contains:
   mods\configs\offline_lan_0922\destructibles\
   mods\configs\offline_lan_0922\occluders\
   START_OFFLINE_0922.bat
+  START_SIMULATION_WORKER_0922.bat
   tools\AUTHORITY_WORKER_PROBE.md
   tools\authority_worker_probe_supervisor.py
 
@@ -19,10 +20,10 @@ mods\0.9.22.0.1 before copying this version. Start the LAN server on one PC,
 then edit mods\configs\offline_lan_0922\server_endpoint.json when the server is
 not 127.0.0.1:28782. That user-owned file is never shipped in this package.
 
-Start the client with START_OFFLINE_0922.bat. It changes APPDATA only for this
-game process, so the legacy client's preferences.xml cannot overwrite the
-normal WoT profile. The first isolated start may ask for the EULA and display
-settings again.
+Start the client with START_OFFLINE_0922.bat. It passes the #1513-supported
+preferences leaf `preferences.offline-player.xml`, so it never reads or writes
+the normal `preferences.xml`. The first isolated start may ask for the EULA
+and display settings again.
 
 Play
 ----
@@ -69,6 +70,13 @@ Requirements
 - The LAN server from the same repository revision, on one PC. It always
   listens on 0.0.0.0:28782 and supports up to 30 players. A single-player round
   also uses it.
+
+Optional simulation worker
+--------------------------
+
+Start the server, START_SIMULATION_WORKER_0922.bat, then
+START_OFFLINE_0922.bat. Both clients use the same game installation; the
+worker does not occupy a player slot.
 
 Troubleshooting
 ---------------
