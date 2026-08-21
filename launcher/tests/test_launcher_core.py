@@ -281,6 +281,15 @@ class SettingsFileTest(unittest.TestCase):
 
 
 class ServerPayloadTest(unittest.TestCase):
+    def test_server_log_lives_beside_the_per_user_launcher_settings(self):
+        local_app_data = os.path.join(tempfile.gettempdir(), "local-app-data")
+        with mock.patch.dict(
+                os.environ, {"LOCALAPPDATA": local_app_data}, clear=False):
+            self.assertEqual(
+                os.path.join(
+                    local_app_data, "WoTOfflineBattles", "server.log"),
+                core.server_log_path())
+
     def test_repository_layout_resolves_both_servers(self):
         base = core.server_root()
         self.assertTrue(os.path.isfile(core.server_script(core.PORT_0_8_2,

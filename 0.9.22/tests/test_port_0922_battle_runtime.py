@@ -4735,6 +4735,43 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(ctf_base_mask & selected_mask)
         self.assertFalse(assault2_base_mask & selected_mask)
 
+        # A still-later stock visibility update must not leak another
+        # gameplay's objects after the one-time client-ready repair.  Exact
+        # #1513 Malinovka uses bit 1 for its neutral domination control point.
+        runtime.bigworld.space_visibility_masks[7] = 0x00000003
+        writes_before_maintenance = len([
+            operation for operation in runtime.bigworld.operations
+            if operation[0] == 'space_visibility'])
+        runtime.bigworld.now += 0.5
+        battle._frame()
+
+        self.assertEqual(
+            0x00000001, runtime.bigworld.space_visibility_masks[7])
+        writes_after_repair = [
+            operation for operation in runtime.bigworld.operations
+            if operation[0] == 'space_visibility']
+        self.assertEqual(
+            writes_before_maintenance + 1, len(writes_after_repair))
+        self.assertEqual(
+            ('space_visibility', 7, 0x00000001),
+            writes_after_repair[-1])
+        malinovka_ctf_base_mask = 0xffffff89
+        malinovka_domination_mask = 0xffffff82
+        self.assertTrue(
+            malinovka_ctf_base_mask &
+            runtime.bigworld.space_visibility_masks[7])
+        self.assertFalse(
+            malinovka_domination_mask &
+            runtime.bigworld.space_visibility_masks[7])
+
+        # The next periodic read sees a correct mask and performs no native
+        # write, keeping this guard observational during normal frames.
+        runtime.bigworld.now += 0.5
+        battle._frame()
+        self.assertEqual(writes_after_repair, [
+            operation for operation in runtime.bigworld.operations
+            if operation[0] == 'space_visibility'])
+
     def test_authority_runtime_counts_probes_without_per_probe_clock(self):
         runtime = _runtime()
         runtime.bigworld.defer_vehicle_entry = True

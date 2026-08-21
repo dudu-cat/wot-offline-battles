@@ -183,12 +183,37 @@ class AccountRpcTests(unittest.TestCase):
             self._run()
 
         update = pickle.loads(self.player.updates[-1])
+        self.assertEqual(
+            {'credits', 'freeXP', 'vehTypeXP'}, set(update['stats']))
+        self.assertNotIn('eliteVehicles', update['stats'])
+        self.assertNotIn('unlocks', update['stats'])
         self.assertEqual(account_data.OFFLINE_CREDITS + 700,
                          update['stats']['credits'])
         self.assertEqual(account_data.OFFLINE_FREE_XP + 30,
                          update['stats']['freeXP'])
         self.assertEqual(600, update['stats']['vehTypeXP'][50001])
         self.assertEqual(1, self.player.dossier_resyncs)
+
+    def test_stats_update_does_not_run_the_inventory_refresh_fallback(self):
+        with mock.patch(
+                'gui.mods.offline_lan_0922.account_rpc.server.'
+                '_refresh_garage_views') as refresh:
+            self.assertTrue(self.server._push_update({'stats': {'credits': 1}}))
+            self._run()
+
+        refresh.assert_not_called()
+
+    def test_inventory_update_runs_the_garage_refresh_fallback(self):
+        diff = {'inventory': {1: {'compDescr': {9: b'compact'}}}}
+        with mock.patch(
+                'gui.mods.offline_lan_0922.account_rpc.server.'
+                '_refresh_garage_views') as refresh:
+            self.assertTrue(self.server._push_update(diff))
+            self._run()
+
+        refresh.assert_called_once()
+        self.assertEqual(diff['inventory'],
+                         refresh.call_args[0][0]['inventory'])
 
     def test_response_is_dropped_after_account_is_retired(self):
         active = [self.player]

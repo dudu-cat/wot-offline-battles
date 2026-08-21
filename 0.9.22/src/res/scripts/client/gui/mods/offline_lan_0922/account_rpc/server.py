@@ -115,7 +115,12 @@ class FakeServer(object):
             if self._player() is not player:
                 return
             player.update(payload)
-            _refresh_garage_views(diff)
+            # The fallback exists for fitting changes whose inventory payload
+            # must be re-read by the current-vehicle cache.  Reapplying a
+            # stats-only update needlessly runs that expensive inventory path
+            # a second time.
+            if 'inventory' in diff:
+                _refresh_garage_views(diff)
             if callable(after_publish):
                 after_publish(player)
 
@@ -133,8 +138,16 @@ class FakeServer(object):
         store = self._context.get('postbattle_store')
         if store is None:
             return False
-        diff = data.stats(
+        snapshot = data.stats(
             self._context.get('selected_vehicle'), store.progress())
+        # PlayerAccount._update treats every descriptor carried by an
+        # incremental ``eliteVehicles`` field as a newly elite vehicle and
+        # emits one modal notification for each.  A post-battle update changes
+        # only these accumulated values; the static unlocked/elite snapshot
+        # belongs exclusively to the initial full sync.
+        stats = snapshot['stats']
+        diff = {'stats': dict((name, stats[name]) for name in (
+            'credits', 'freeXP', 'vehTypeXP'))}
 
         def resync_dossiers(player):
             resync = getattr(player, 'resyncDossiers', None)

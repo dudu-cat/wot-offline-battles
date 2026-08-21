@@ -77,6 +77,7 @@ _SERVER_DATA_RELATIVE_DIR_0922 = os.path.join(
 WORKER_STARTER_FILENAME_0922 = "offline_worker_starter.exe"
 WORKER_READY_MARKER_FILENAME_0922 = "offline-worker.ready"
 WORKER_FAILURE_LOG_FILENAME_0922 = "offline-worker-starter.log"
+SERVER_LOG_FILENAME = "server.log"
 PLAYER_ENGINE_CONFIG_0922 = "engine_config.offline-player.xml"
 WORKER_ONLY_ARGUMENT_0922 = "--worker-only"
 PAIRED_PLAYER_ARGUMENT_0922 = "--paired-player"
@@ -163,6 +164,11 @@ def worker_ready_marker_token(game_root):
 
 def worker_failure_log(game_root):
     return os.path.join(game_root, WORKER_FAILURE_LOG_FILENAME_0922)
+
+
+def server_log_path():
+    """Return the stable per-user log used by launcher-owned servers."""
+    return os.path.join(os.path.dirname(settings_path()), SERVER_LOG_FILENAME)
 
 
 def visible_client_command(game_root, port_version, paired_worker=False):

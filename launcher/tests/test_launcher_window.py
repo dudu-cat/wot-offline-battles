@@ -4,6 +4,7 @@ Widget option names and real Tk behavior stay unproven here. Only the callback
 wiring and the guard paths are covered.
 """
 
+import io
 import os
 import shutil
 import tempfile
@@ -750,10 +751,33 @@ class WindowTest(unittest.TestCase):
                 persistent=True))
 
         self.assertTrue(self.window._server_persistent)
+        self.assertIn(
+            "Server log: %s" % core.server_log_path(), self._log_text())
         self.assertFalse(self.window._stop_server())
         self.assertFalse(server.terminated)
         self.assertTrue(self.window._stop_server(force=True))
         self.assertTrue(server.terminated)
+
+    def test_server_process_output_is_teed_to_the_live_pipe_and_log_file(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(wot_launcher.sys, "stdout", stdout), \
+                mock.patch.object(wot_launcher.sys, "stderr", stderr):
+            self.assertEqual(
+                core.server_log_path(), wot_launcher._open_server_log())
+            log_stream = wot_launcher.sys.stdout._log_stream
+            wot_launcher.sys.stdout.write("server stdout\n")
+            wot_launcher.sys.stderr.write("server stderr\n")
+            wot_launcher.sys.stdout.flush()
+            wot_launcher.sys.stderr.flush()
+            log_stream.close()
+
+        self.assertEqual("server stdout\n", stdout.getvalue())
+        self.assertEqual("server stderr\n", stderr.getvalue())
+        with open(core.server_log_path(), encoding="utf-8") as stream:
+            saved = stream.read()
+        self.assertIn("server stdout\n", saved)
+        self.assertIn("server stderr\n", saved)
 
     def test_worker_start_failure_reports_the_native_failure_log(self):
         starter = core.worker_starter_executable(self.settings_dir)

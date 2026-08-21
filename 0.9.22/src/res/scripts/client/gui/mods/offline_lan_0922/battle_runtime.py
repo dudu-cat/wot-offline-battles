@@ -62,6 +62,10 @@ RPM_PRESENTATION_SECONDS = 0.10
 SPOTTING_UPDATE_SECONDS = 0.10
 SPOTTING_PROBE_SECONDS = 0.50
 SPOTTING_PHASE_BUCKETS = 5
+# Stock client code can republish the server half of a space visibility mask
+# after the local map has entered the battle.  Read it infrequently and only
+# write when it no longer selects this arena's gameplay.
+SPACE_VISIBILITY_CHECK_SECONDS = 0.50
 # AvatarInputHandler._Targeting gives the native BigWorld.target these exact
 # values.  The manual target adapter applies the static-world mouse-ray gate
 # separately; the physical gun line is still irrelevant to an outline.
@@ -973,6 +977,8 @@ class BattleRuntime(object):
         self._records = {}
         self._last_snapshot = None
         self._last_frame_time = None
+        self._standard_space_visibility = None
+        self._next_space_visibility_check = 0.0
         if self._frame_diagnostics is not None:
             self._frame_diagnostics.enabled = True
             self._frame_diagnostics.reset()
@@ -1169,6 +1175,8 @@ class BattleRuntime(object):
             _selected_vehicle_has_sixth_sense())
         self._last_snapshot = None
         self._last_frame_time = None
+        self._standard_space_visibility = None
+        self._next_space_visibility_check = 0.0
         if self._frame_diagnostics is not None:
             self._frame_diagnostics.enabled = True
             self._frame_diagnostics.reset()
@@ -1703,7 +1711,41 @@ class BattleRuntime(object):
         except (AttributeError, TypeError, ValueError, OverflowError):
             raise RuntimeError(
                 '#1513 gameplay visibility mask could not be applied')
+        self._standard_space_visibility = (
+            space_id, expected, client_bits, server_bits)
+        self._next_space_visibility_check = (
+            self._clock() + SPACE_VISIBILITY_CHECK_SECONDS)
         return expected
+
+    def _maintain_standard_space_visibility(self, now):
+        """Restore a gameplay bit if later stock code widens the server mask."""
+        boundary = self._standard_space_visibility
+        if boundary is None or now < self._next_space_visibility_check:
+            return False
+        self._next_space_visibility_check = (
+            now + SPACE_VISIBILITY_CHECK_SECONDS)
+        space_id, selected_bit, client_bits, server_bits = boundary
+        bigworld = self._runtime.bigworld
+        get_mask = getattr(
+            bigworld, 'wg_getSpaceItemsVisibilityMask', None)
+        set_mask = getattr(
+            bigworld, 'wg_setSpaceItemsVisibilityMask', None)
+        if not callable(get_mask) or not callable(set_mask):
+            raise RuntimeError(
+                '#1513 space visibility maintenance is unavailable')
+        try:
+            current = get_mask(space_id)
+            if current & server_bits == selected_bit:
+                return False
+            # Preserve any live client-only flags while replacing only the
+            # server gameplay selection that controls bases and capture zones.
+            corrected = (current & client_bits) | selected_bit
+            set_mask(space_id, corrected)
+        except (AttributeError, KeyError, TypeError, ValueError,
+                OverflowError):
+            raise RuntimeError(
+                '#1513 gameplay visibility mask could not be maintained')
+        return True
 
     def _clock(self):
         function = getattr(self._runtime.bigworld, 'time', None)
@@ -7695,6 +7737,7 @@ class BattleRuntime(object):
         projectile_perf = {}
         boundary = entry_wall
         try:
+            self._maintain_standard_space_visibility(now)
             self._flush_pending_bot_create(now)
             self._flush_pending_entities(now)
             self._drain_event_journal()
@@ -11922,6 +11965,8 @@ class BattleRuntime(object):
         self._next_compound_report = 0.0
         self._compound_reports = 0
         self._avatar = None
+        self._standard_space_visibility = None
+        self._next_space_visibility_check = 0.0
         self._binding = None
         self._server = None
         self._remote_factory = None

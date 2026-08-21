@@ -80,6 +80,33 @@ def _no_console_flags():
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
+class _TeeTextStream(object):
+    """Mirror server output to its inherited stream and a persistent log."""
+
+    def __init__(self, primary, log_stream, lock):
+        self._primary = primary
+        self._log_stream = log_stream
+        self._lock = lock
+
+    def write(self, value):
+        with self._lock:
+            result = None
+            if self._primary is not None:
+                result = self._primary.write(value)
+            self._log_stream.write(value)
+            return len(value) if result is None else result
+
+    def flush(self):
+        with self._lock:
+            if self._primary is not None:
+                self._primary.flush()
+            self._log_stream.flush()
+
+    def __getattr__(self, name):
+        target = self._primary or self._log_stream
+        return getattr(target, name)
+
+
 class LauncherWindow(object):
     def __init__(self, tk_module, ttk_module, filedialog_module):
         self._tk = tk_module
@@ -1023,6 +1050,7 @@ class LauncherWindow(object):
             port_version, game_root, team_size=team_size,
             loopback_only=loopback_only)
         self._log("Starting the %s LAN server..." % port_version)
+        self._log("Server log: %s" % core.server_log_path())
         self._server = subprocess.Popen(
             command, env=environment, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, creationflags=_no_console_flags())
@@ -1183,16 +1211,16 @@ class LauncherWindow(object):
 
 
 def _open_server_log():
-    """A windowed build can leave the child process without usable streams."""
-    if sys.stdout is not None and sys.stderr is not None:
-        return
-    path = os.path.join(os.path.dirname(core.settings_path()), "server.log")
+    """Persist server output while preserving the launcher's live pipe."""
+    path = core.server_log_path()
     directory = os.path.dirname(path)
     if directory and not os.path.isdir(directory):
         os.makedirs(directory)
     stream = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
-    sys.stdout = stream
-    sys.stderr = stream
+    lock = threading.RLock()
+    sys.stdout = _TeeTextStream(sys.stdout, stream, lock)
+    sys.stderr = _TeeTextStream(sys.stderr, stream, lock)
+    return path
 
 
 def _serve(argv):
