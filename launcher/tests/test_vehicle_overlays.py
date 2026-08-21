@@ -38,6 +38,9 @@ class VehicleOverlayTest(unittest.TestCase):
     SHELLS = "scripts/item_defs/vehicles/ussr/components/shells.xml"
 
     def setUp(self):
+        environment = mock.patch.dict(os.environ, {"APPDATA": ""})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.game = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.game, True)
         self._write(core.GAME_EXECUTABLE, b"")
@@ -511,6 +514,10 @@ class VehicleOverlayTest(unittest.TestCase):
         vehicle_overlays.apply_vehicle_edit(
             self.game, self.VEHICLE, "speedLimits/forward", "40",
             is_running=lambda: False)
+        with open(self._overlay(self.VEHICLE), "rb") as stream:
+            overlay_before = stream.read()
+        with open(vehicle_overlays.manifest_path(self.game), "rb") as stream:
+            manifest_before = stream.read()
         original_replace = os.replace
 
         def fail_install_and_rollback(source, target):
@@ -547,6 +554,14 @@ class VehicleOverlayTest(unittest.TestCase):
             recovery["targets"][0]["target"].replace("/", os.sep))
         self.assertTrue(os.path.isfile(os.path.join(
             recovery_roots[0], "backup-0")))
+
+        self.assertEqual(1, vehicle_overlays.recover_vehicle_profile_transactions(
+            self.game, is_running=lambda: False))
+        with open(self._overlay(self.VEHICLE), "rb") as stream:
+            self.assertEqual(overlay_before, stream.read())
+        with open(vehicle_overlays.manifest_path(self.game), "rb") as stream:
+            self.assertEqual(manifest_before, stream.read())
+        self.assertFalse(os.path.exists(recovery_roots[0]))
 
     def test_failed_default_restore_puts_every_owned_file_back(self):
         vehicle_overlays.apply_vehicle_edit(
@@ -679,6 +694,170 @@ class VehicleOverlayTest(unittest.TestCase):
             vehicle_overlays.manifest_path(self.game)))
         self.assertTrue(os.path.isfile(
             vehicle_overlays.profile_store_path(self.game)))
+
+    def test_profiles_use_appdata_without_creating_a_game_recovery_journal(self):
+        appdata = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, appdata, True)
+        with mock.patch.dict(os.environ, {"APPDATA": appdata}):
+            vehicle_overlays.create_vehicle_profile(self.game, "Fast MS-1")
+            path = vehicle_overlays.profile_store_path(self.game)
+
+        self.assertEqual(
+            os.path.join(
+                appdata, *vehicle_overlays.PROFILE_STORE_APPDATA_PARTS,
+                vehicle_overlays.PROFILE_STORE_NAME),
+            path)
+        self.assertTrue(os.path.isfile(path))
+        self.assertFalse(os.path.exists(
+            vehicle_overlays.legacy_profile_store_path(self.game)))
+        self.assertFalse(any(
+            name.startswith(".wot-vehicle-")
+            for name in os.listdir(self.game)))
+
+    def test_legacy_profile_store_is_copied_to_appdata_and_retained(self):
+        vehicle_overlays.create_vehicle_profile(self.game, "Fast MS-1")
+        vehicle_overlays.apply_profile_edit(
+            self.game, "Fast MS-1", self.VEHICLE,
+            "speedLimits/forward", "40", is_running=lambda: False)
+        legacy_path = vehicle_overlays.legacy_profile_store_path(self.game)
+        with open(legacy_path, "rb") as stream:
+            legacy_payload = stream.read()
+        appdata = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, appdata, True)
+
+        with mock.patch.dict(os.environ, {"APPDATA": appdata}):
+            self.assertEqual(
+                ["Fast MS-1"],
+                vehicle_overlays.list_vehicle_profiles(self.game))
+            external_path = vehicle_overlays.profile_store_path(self.game)
+            current = vehicle_overlays.inspect_profile_field(
+                self.game, "Fast MS-1", self.VEHICLE,
+                "speedLimits/forward")
+
+        self.assertEqual("40", current["currentValue"])
+        with open(external_path, "rb") as stream:
+            self.assertEqual(legacy_payload, stream.read())
+        with open(legacy_path, "rb") as stream:
+            self.assertEqual(legacy_payload, stream.read())
+
+    def test_failed_appdata_migration_keeps_the_legacy_store_readable(self):
+        vehicle_overlays.create_vehicle_profile(self.game, "Fast MS-1")
+        legacy_path = vehicle_overlays.legacy_profile_store_path(self.game)
+        appdata = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, appdata, True)
+
+        with mock.patch.dict(os.environ, {"APPDATA": appdata}), mock.patch(
+                "vehicle_overlays._atomic_profile_store_write",
+                side_effect=vehicle_overlays.VehicleOverlayError(
+                    "APPDATA is read-only")):
+            self.assertEqual(
+                ["Fast MS-1"],
+                vehicle_overlays.list_vehicle_profiles(self.game))
+            external_path = vehicle_overlays.profile_store_path(self.game)
+
+        self.assertTrue(os.path.isfile(legacy_path))
+        self.assertFalse(os.path.exists(external_path))
+
+    def test_overlay_parent_symlink_cannot_redirect_activation_outside_game(self):
+        vehicle_overlays.create_vehicle_profile(self.game, "Fast")
+        vehicle_overlays.apply_profile_edit(
+            self.game, "Fast", self.VEHICLE,
+            "speedLimits/forward", "40", is_running=lambda: False)
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        overlay_root = os.path.join(
+            self.game, *vehicle_overlays.OVERLAY_ROOT.split("/"))
+        os.makedirs(overlay_root)
+        redirected = os.path.join(overlay_root, "scripts")
+        try:
+            os.symlink(outside, redirected, target_is_directory=True)
+        except (AttributeError, NotImplementedError, OSError) as error:
+            self.skipTest("directory symlinks are unavailable: %s" % error)
+
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError,
+                "symlink, or junction"):
+            vehicle_overlays.activate_vehicle_profile(
+                self.game, "Fast", is_running=lambda: False)
+
+        escaped = os.path.join(
+            outside, "item_defs", "vehicles", "ussr", "R11_MS-1.xml")
+        self.assertFalse(os.path.exists(escaped))
+        self.assertFalse(os.path.exists(
+            vehicle_overlays.manifest_path(self.game)))
+
+    def test_restore_refuses_to_follow_an_owned_overlay_outside_game(self):
+        vehicle_overlays.create_vehicle_profile(self.game, "Fast")
+        vehicle_overlays.apply_profile_edit(
+            self.game, "Fast", self.VEHICLE,
+            "speedLimits/forward", "40", is_running=lambda: False)
+        vehicle_overlays.activate_vehicle_profile(
+            self.game, "Fast", is_running=lambda: False)
+        overlay_root = os.path.join(
+            self.game, *vehicle_overlays.OVERLAY_ROOT.split("/"))
+        scripts_root = os.path.join(overlay_root, "scripts")
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        outside_scripts = os.path.join(outside, "scripts")
+        os.replace(scripts_root, outside_scripts)
+        try:
+            os.symlink(
+                outside_scripts, scripts_root, target_is_directory=True)
+        except (AttributeError, NotImplementedError, OSError) as error:
+            os.replace(outside_scripts, scripts_root)
+            self.skipTest("directory symlinks are unavailable: %s" % error)
+        escaped = os.path.join(
+            outside_scripts, "item_defs", "vehicles", "ussr",
+            "R11_MS-1.xml")
+
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError,
+                "symlink, or junction"):
+            vehicle_overlays.restore_vehicle_defaults(
+                self.game, is_running=lambda: False)
+
+        self.assertTrue(os.path.isfile(escaped))
+        self.assertTrue(os.path.isfile(
+            vehicle_overlays.manifest_path(self.game)))
+
+    def test_recovery_refuses_a_target_redirected_outside_game(self):
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        overlay_root = os.path.join(
+            self.game, *vehicle_overlays.OVERLAY_ROOT.split("/"))
+        os.makedirs(overlay_root)
+        try:
+            os.symlink(
+                outside, os.path.join(overlay_root, "scripts"),
+                target_is_directory=True)
+        except (AttributeError, NotImplementedError, OSError) as error:
+            self.skipTest("directory symlinks are unavailable: %s" % error)
+        transaction = os.path.join(
+            self.game, ".wot-vehicle-overlay-synthetic")
+        os.makedirs(transaction)
+        with open(os.path.join(transaction, "recovery.json"),
+                  "w", encoding="utf-8") as stream:
+            json.dump({
+                "operation": "apply",
+                "targets": [
+                    {"backup": "backup-0", "hadTarget": False,
+                     "target": "%s/%s" % (
+                         vehicle_overlays.OVERLAY_ROOT, self.VEHICLE)},
+                    {"backup": "backup-1", "hadTarget": False,
+                     "target": "%s/%s" % (
+                         vehicle_overlays.OVERLAY_ROOT,
+                         vehicle_overlays.MANIFEST_NAME)},
+                ],
+            }, stream)
+
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError,
+                "symlink, or junction"):
+            vehicle_overlays.recover_vehicle_profile_transactions(
+                self.game, is_running=lambda: False)
+
+        self.assertTrue(os.path.isfile(
+            os.path.join(transaction, "recovery.json")))
 
     def test_profiles_keep_independent_values(self):
         for name, speed in (("Fast", "40"), ("Very fast", "55")):

@@ -48,6 +48,9 @@ MANIFEST_NAME = "vehicle_overlays.json"
 MANIFEST_SCHEMA = 1
 PROFILE_STORE_RELATIVE = (
     "mods/configs/offline_lan_0922/vehicle_profiles.json")
+PROFILE_STORE_NAME = "vehicle_profiles.json"
+PROFILE_STORE_APPDATA_PARTS = (
+    "Wargaming.net", "WorldOfTanks", "offline_lan_0922")
 PROFILE_STORE_SCHEMA = 1
 ORIGINAL_PROFILE_LABEL = "Original vehicle values"
 MAX_PROFILE_NAME_LENGTH = 64
@@ -133,14 +136,65 @@ def _now():
         microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _contained_path(root, path, label):
+    """Return one lexical path only when it also resolves below ``root``.
+
+    Checking both forms matters on Windows: a junction in the middle of the
+    nominal game path can otherwise redirect an owned overlay outside the
+    selected installation without appearing as a symlink at the final file.
+    """
+    absolute_root = os.path.abspath(root)
+    absolute_path = os.path.abspath(path)
+    pairs = (
+        (os.path.normcase(absolute_root), os.path.normcase(absolute_path)),
+        (os.path.normcase(os.path.realpath(absolute_root)),
+         os.path.normcase(os.path.realpath(absolute_path))),
+    )
+    for checked_root, checked_path in pairs:
+        try:
+            if os.path.commonpath((checked_root, checked_path)) != checked_root:
+                raise VehicleOverlayError(
+                    "%s escapes its owned root through a path, symlink, or "
+                    "junction." % label)
+        except ValueError:
+            raise VehicleOverlayError(
+                "%s escapes its owned root through a path, symlink, or "
+                "junction." % label)
+    return absolute_path
+
+
+def _game_owned_path(game_root, path, label):
+    return _contained_path(os.path.abspath(game_root), path, label)
+
+
 def manifest_path(game_root):
-    return os.path.join(
+    path = os.path.join(
         os.path.abspath(game_root), *OVERLAY_ROOT.split("/"), MANIFEST_NAME)
+    return _game_owned_path(game_root, path, "The vehicle overlay manifest")
 
 
-def profile_store_path(game_root):
-    return os.path.join(
+def legacy_profile_store_path(game_root):
+    path = os.path.join(
         os.path.abspath(game_root), *PROFILE_STORE_RELATIVE.split("/"))
+    return _game_owned_path(game_root, path, "The legacy vehicle profile store")
+
+
+def _appdata_profile_root(environment=None):
+    environment = os.environ if environment is None else environment
+    appdata = environment.get("APPDATA")
+    if not isinstance(appdata, str) or not appdata.strip():
+        return None
+    return os.path.join(
+        os.path.abspath(appdata.strip()), *PROFILE_STORE_APPDATA_PARTS)
+
+
+def profile_store_path(game_root, environment=None):
+    root = _appdata_profile_root(environment)
+    if root is None:
+        return legacy_profile_store_path(game_root)
+    return _contained_path(
+        root, os.path.join(root, PROFILE_STORE_NAME),
+        "The vehicle profile store")
 
 
 def _normalize_profile_name(raw_name):
@@ -314,9 +368,10 @@ def _field_rule(member, field_path):
 
 def _overlay_path(game_root, member):
     _validate_member(member)
-    return os.path.join(
+    path = os.path.join(
         os.path.abspath(game_root), *OVERLAY_ROOT.split("/"),
         *member.split("/"))
+    return _game_owned_path(game_root, path, "The vehicle data overlay")
 
 
 def _require_target(game_root, require_closed=False, is_running=None):
@@ -1223,7 +1278,9 @@ def _write_staged(path, data):
             pass
 
 
-def _open_exclusive(path):
+def _open_exclusive(game_root, path):
+    path = _game_owned_path(
+        game_root, path, "The vehicle overlay transaction target")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_BINARY", 0)
     try:
@@ -1236,14 +1293,20 @@ def _open_exclusive(path):
         raise
 
 
-def _retire_transaction_root(transaction_root):
+def _retire_transaction_root(game_root, transaction_root):
     """Move completed recovery data out of the live prefix before deletion."""
+    transaction_root = _game_owned_path(
+        game_root, transaction_root, "The vehicle recovery directory")
     cleanup_root = None
     try:
         cleanup_root = tempfile.mkdtemp(
             prefix=".wot-vehicle-cleanup-",
             dir=os.path.dirname(transaction_root))
+        cleanup_root = _game_owned_path(
+            game_root, cleanup_root, "The vehicle recovery cleanup directory")
         os.rmdir(cleanup_root)
+        _game_owned_path(
+            game_root, transaction_root, "The vehicle recovery directory")
         os.replace(transaction_root, cleanup_root)
     except (IOError, OSError):
         if cleanup_root is not None and os.path.isdir(cleanup_root):
@@ -1256,9 +1319,18 @@ def _retire_transaction_root(transaction_root):
     return True
 
 
+def _transaction_target(game_root, target):
+    target = _game_owned_path(
+        game_root, target, "The vehicle overlay transaction target")
+    relative = os.path.relpath(target, game_root).replace(os.sep, "/")
+    _recovery_target_kind(relative)
+    return target
+
+
 def _recovery_bytes(game_root, operation, targets):
     records = []
     for index, target in enumerate(targets):
+        target = _transaction_target(game_root, target)
         records.append({
             "backup": "backup-%d" % index,
             "hadTarget": bool(os.path.lexists(target)),
@@ -1272,15 +1344,22 @@ def _recovery_bytes(game_root, operation, targets):
 
 def _transactional_write(game_root, writes, expected_absent=()):
     game_root = os.path.abspath(game_root)
-    expected_absent = set(os.path.abspath(path) for path in expected_absent)
-    write_targets = set(os.path.abspath(target)
-                        for target, unused_data in writes)
+    writes = [(_transaction_target(game_root, target), data)
+              for target, data in writes]
+    expected_absent = set(
+        _transaction_target(game_root, path) for path in expected_absent)
+    write_targets = set(target for target, unused_data in writes)
+    if len(write_targets) != len(writes):
+        raise VehicleOverlayError(
+            "A vehicle overlay transaction repeats one target.")
     if not expected_absent.issubset(write_targets):
         raise VehicleOverlayError(
             "An expected-absent transaction target is not being written.")
     try:
         transaction_root = tempfile.mkdtemp(
             prefix=".wot-vehicle-overlay-", dir=game_root)
+        transaction_root = _game_owned_path(
+            game_root, transaction_root, "The vehicle recovery directory")
     except (IOError, OSError) as error:
         raise VehicleOverlayError(
             "The overlay transaction could not start: %s" % error)
@@ -1290,15 +1369,20 @@ def _transactional_write(game_root, writes, expected_absent=()):
     preserve_recovery = False
     try:
         _write_staged(
-            os.path.join(transaction_root, "recovery.json"),
+            _game_owned_path(
+                game_root, os.path.join(transaction_root, "recovery.json"),
+                "The vehicle recovery journal"),
             _recovery_bytes(
                 game_root, "apply",
                 [target for target, unused_data in writes]))
         for index, (target, data) in enumerate(writes):
-            staged_path = os.path.join(transaction_root, "new-%d" % index)
+            staged_path = _game_owned_path(
+                game_root, os.path.join(transaction_root, "new-%d" % index),
+                "The staged vehicle overlay")
             _write_staged(staged_path, data)
             staged.append((staged_path, target, data))
         for index, (unused_staged, target, unused_data) in enumerate(staged):
+            target = _transaction_target(game_root, target)
             if target in expected_absent and os.path.lexists(target):
                 raise VehicleOverlayError(
                     "A vehicle-data override appeared after the stock-data "
@@ -1306,14 +1390,18 @@ def _transactional_write(game_root, writes, expected_absent=()):
             if os.path.lexists(target):
                 backup = os.path.join(
                     transaction_root, "backup-%d" % index)
+                backup = _game_owned_path(
+                    game_root, backup, "The vehicle overlay backup")
                 os.replace(target, backup)
                 backups.append((target, backup))
         for staged_path, target, data in staged:
+            target = _transaction_target(game_root, target)
             directory = os.path.dirname(target)
             if not os.path.isdir(directory):
                 os.makedirs(directory)
+            target = _transaction_target(game_root, target)
             if target in expected_absent:
-                descriptor = _open_exclusive(target)
+                descriptor = _open_exclusive(game_root, target)
                 installed.append(target)
                 try:
                     with os.fdopen(descriptor, "wb") as stream:
@@ -1334,15 +1422,20 @@ def _transactional_write(game_root, writes, expected_absent=()):
         for target in reversed(installed):
             if target not in backed_targets and os.path.lexists(target):
                 try:
+                    target = _transaction_target(game_root, target)
                     os.unlink(target)
                 except Exception as rollback_error:
                     rollback_errors.append(str(rollback_error))
         for target, backup in reversed(backups):
             if os.path.lexists(backup):
                 try:
+                    target = _transaction_target(game_root, target)
+                    backup = _game_owned_path(
+                        game_root, backup, "The vehicle overlay backup")
                     directory = os.path.dirname(target)
                     if not os.path.isdir(directory):
                         os.makedirs(directory)
+                    target = _transaction_target(game_root, target)
                     os.replace(backup, target)
                 except Exception as rollback_error:
                     rollback_errors.append(str(rollback_error))
@@ -1358,7 +1451,7 @@ def _transactional_write(game_root, writes, expected_absent=()):
             "The overlay transaction was rolled back: %s" % error)
     finally:
         if not preserve_recovery:
-            _retire_transaction_root(transaction_root)
+            _retire_transaction_root(game_root, transaction_root)
 
 
 _TRANSACTION_PREFIXES = (
@@ -1389,14 +1482,8 @@ def _recovery_target(game_root, relative):
             "A vehicle profile recovery target is unsafe.")
     game_root = os.path.abspath(game_root)
     target = os.path.abspath(os.path.join(game_root, *relative.split("/")))
-    try:
-        if os.path.commonpath((game_root, target)) != game_root:
-            raise VehicleOverlayError(
-                "A vehicle profile recovery target escapes the game folder.")
-    except ValueError:
-        raise VehicleOverlayError(
-            "A vehicle profile recovery target escapes the game folder.")
-    return target
+    return _game_owned_path(
+        game_root, target, "A vehicle profile recovery target")
 
 
 def _recovery_target_kind(relative):
@@ -1415,7 +1502,11 @@ def _recovery_target_kind(relative):
 
 
 def _load_recovery_records(game_root, transaction_root):
-    recovery_path = os.path.join(transaction_root, "recovery.json")
+    transaction_root = _game_owned_path(
+        game_root, transaction_root, "The vehicle recovery directory")
+    recovery_path = _game_owned_path(
+        game_root, os.path.join(transaction_root, "recovery.json"),
+        "The vehicle recovery journal")
     if not os.path.lexists(recovery_path):
         try:
             if not os.listdir(transaction_root):
@@ -1458,8 +1549,15 @@ def _load_recovery_records(game_root, transaction_root):
             raise VehicleOverlayError(
                 "A vehicle profile recovery journal repeats a target.")
         seen.add(target)
+        backup = _game_owned_path(
+            game_root, os.path.join(transaction_root, record["backup"]),
+            "A vehicle profile recovery backup")
+        if os.path.lexists(backup) and (
+                os.path.islink(backup) or not os.path.isfile(backup)):
+            raise VehicleOverlayError(
+                "A vehicle profile recovery backup is not a regular file.")
         records.append({
-            "backup": os.path.join(transaction_root, record["backup"]),
+            "backup": backup,
             "hadTarget": record["hadTarget"],
             "target": target,
         })
@@ -1483,6 +1581,9 @@ def recover_vehicle_profile_transactions(game_root, is_running=None):
         game_root, require_closed=True, is_running=is_running)
     recovered = 0
     for transaction_root in _pending_transaction_roots(status["path"]):
+        transaction_root = _game_owned_path(
+            status["path"], transaction_root,
+            "The vehicle recovery directory")
         if os.path.islink(transaction_root) or not os.path.isdir(
                 transaction_root):
             raise VehicleOverlayError(
@@ -1491,12 +1592,21 @@ def recover_vehicle_profile_transactions(game_root, is_running=None):
         records = _load_recovery_records(status["path"], transaction_root)
         try:
             for index, record in enumerate(records):
-                target = record["target"]
-                backup = record["backup"]
-                discard = os.path.join(
-                    transaction_root, "discard-%d" % index)
+                target = _transaction_target(
+                    status["path"], record["target"])
+                backup = _game_owned_path(
+                    status["path"], record["backup"],
+                    "A vehicle profile recovery backup")
+                discard = _game_owned_path(
+                    status["path"], os.path.join(
+                        transaction_root, "discard-%d" % index),
+                    "A vehicle profile recovery discard")
                 if record["hadTarget"]:
                     if os.path.lexists(backup):
+                        if os.path.islink(backup) or not os.path.isfile(backup):
+                            raise VehicleOverlayError(
+                                "A vehicle profile recovery backup is not a "
+                                "regular file.")
                         if os.path.lexists(target):
                             if os.path.lexists(discard):
                                 raise VehicleOverlayError(
@@ -1506,6 +1616,7 @@ def recover_vehicle_profile_transactions(game_root, is_running=None):
                         directory = os.path.dirname(target)
                         if not os.path.isdir(directory):
                             os.makedirs(directory)
+                        target = _transaction_target(status["path"], target)
                         os.replace(backup, target)
                     elif not os.path.lexists(target):
                         raise VehicleOverlayError(
@@ -1522,7 +1633,7 @@ def recover_vehicle_profile_transactions(game_root, is_running=None):
             raise VehicleOverlayError(
                 "Vehicle profile crash recovery is incomplete; recovery "
                 "files were kept in %s: %s" % (transaction_root, error))
-        if not _retire_transaction_root(transaction_root):
+        if not _retire_transaction_root(status["path"], transaction_root):
             raise VehicleOverlayError(
                 "Vehicle profile crash recovery succeeded but its staging "
                 "directory could not be retired safely.")
@@ -1654,6 +1765,9 @@ def restore_vehicle_defaults(game_root, is_running=None):
     try:
         transaction_root = tempfile.mkdtemp(
             prefix=".wot-vehicle-restore-", dir=status["path"])
+        transaction_root = _game_owned_path(
+            status["path"], transaction_root,
+            "The vehicle recovery directory")
     except (IOError, OSError) as error:
         raise VehicleOverlayError(
             "Default restoration could not start: %s" % error)
@@ -1664,14 +1778,21 @@ def restore_vehicle_defaults(game_root, is_running=None):
                    for member in sorted(entries)]
         targets.append((manifest_path(status["path"]), MANIFEST_NAME))
         _write_staged(
-            os.path.join(transaction_root, "recovery.json"),
+            _game_owned_path(
+                status["path"], os.path.join(
+                    transaction_root, "recovery.json"),
+                "The vehicle recovery journal"),
             _recovery_bytes(
                 status["path"], "restore-defaults",
                 [target for target, unused_name in targets]))
         for index, (target, unused_name) in enumerate(targets):
+            target = _transaction_target(status["path"], target)
             if not os.path.lexists(target):
                 continue
-            backup = os.path.join(transaction_root, "backup-%d" % index)
+            backup = _game_owned_path(
+                status["path"], os.path.join(
+                    transaction_root, "backup-%d" % index),
+                "The vehicle overlay backup")
             os.replace(target, backup)
             moved.append((target, backup))
     except Exception as error:
@@ -1679,9 +1800,14 @@ def restore_vehicle_defaults(game_root, is_running=None):
         for target, backup in reversed(moved):
             if os.path.lexists(backup):
                 try:
+                    target = _transaction_target(status["path"], target)
+                    backup = _game_owned_path(
+                        status["path"], backup,
+                        "The vehicle overlay backup")
                     directory = os.path.dirname(target)
                     if not os.path.isdir(directory):
                         os.makedirs(directory)
+                    target = _transaction_target(status["path"], target)
                     os.replace(backup, target)
                 except Exception as rollback_error:
                     rollback_errors.append(str(rollback_error))
@@ -1697,7 +1823,7 @@ def restore_vehicle_defaults(game_root, is_running=None):
             "Default restoration was rolled back: %s" % error)
     finally:
         if not preserve_recovery:
-            _retire_transaction_root(transaction_root)
+            _retire_transaction_root(status["path"], transaction_root)
     return len(entries)
 
 
@@ -1760,20 +1886,90 @@ def _validate_profile_store(value):
     return value
 
 
-def _load_profile_store(game_root):
-    path = profile_store_path(game_root)
+def _read_profile_store(path):
     if not os.path.lexists(path):
-        return _empty_profile_store(), False
+        return None, None
     if os.path.islink(path) or not os.path.isfile(path):
         raise VehicleOverlayError(
             "vehicle_profiles.json is not a regular file.")
     try:
         with open(path, "rb") as stream:
-            value = json.load(stream)
+            payload = stream.read()
+        value = json.loads(payload.decode("utf-8"))
     except (IOError, OSError, TypeError, ValueError) as error:
         raise VehicleOverlayError(
             "vehicle_profiles.json is unreadable: %s" % error)
-    return _validate_profile_store(value), True
+    return _validate_profile_store(value), payload
+
+
+def _atomic_profile_store_write(path, payload):
+    """Replace the profile store from a temporary file beside its target."""
+    directory = os.path.dirname(os.path.abspath(path))
+    descriptor = None
+    temporary_path = None
+    try:
+        if not os.path.isdir(directory):
+            os.makedirs(directory)
+        path = _contained_path(
+            directory, path, "The vehicle profile store")
+        if os.path.lexists(path) and (
+                os.path.islink(path) or not os.path.isfile(path)):
+            raise VehicleOverlayError(
+                "vehicle_profiles.json is not a regular file.")
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=".vehicle-profiles-", suffix=".tmp", dir=directory)
+        temporary_path = _contained_path(
+            directory, temporary_path,
+            "The staged vehicle profile store")
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(payload)
+            stream.flush()
+            try:
+                os.fsync(stream.fileno())
+            except (AttributeError, OSError):
+                pass
+        path = _contained_path(
+            directory, path, "The vehicle profile store")
+        os.replace(temporary_path, path)
+        temporary_path = None
+    except VehicleOverlayError:
+        raise
+    except (IOError, OSError) as error:
+        raise VehicleOverlayError(
+            "vehicle_profiles.json could not be saved: %s" % error)
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary_path is not None and os.path.lexists(temporary_path):
+            try:
+                os.unlink(temporary_path)
+            except (IOError, OSError):
+                pass
+
+
+def _load_profile_store(game_root):
+    path = profile_store_path(game_root)
+    value, unused_payload = _read_profile_store(path)
+    if value is not None:
+        return value, True
+
+    # The profile feature originally stored user data below ``mods``.  Copy a
+    # valid old store on first use, but retain it for rollback to that build.
+    # If APPDATA is unavailable, ``path`` already is this legacy location.
+    if _appdata_profile_root() is not None:
+        legacy_path = legacy_profile_store_path(game_root)
+        legacy_value, legacy_payload = _read_profile_store(legacy_path)
+        if legacy_value is not None:
+            try:
+                _atomic_profile_store_write(path, legacy_payload)
+            except VehicleOverlayError:
+                return legacy_value, True
+            return legacy_value, True
+    return _empty_profile_store(), False
 
 
 def _profile_store_bytes(store):
@@ -1784,9 +1980,8 @@ def _profile_store_bytes(store):
 def _save_profile_store(game_root, store):
     store["updatedAt"] = _now()
     _validate_profile_store(store)
-    _transactional_write(
-        game_root,
-        [(profile_store_path(game_root), _profile_store_bytes(store))])
+    _atomic_profile_store_write(
+        profile_store_path(game_root), _profile_store_bytes(store))
 
 
 def _logical_profile_signature(members):
