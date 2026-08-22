@@ -381,13 +381,17 @@ class AvatarServerBridge(object):
             self._binding.avatar_vehicle_entered()
             self._binding.avatar_client_ready()
             self._binding.avatar_ready()
-            # Exact #1513 handles the PERIOD update synchronously.  Its
+            # Exact #1513 handles a PERIOD update synchronously.  Its
             # PlayerAvatar.__setIsOnArena path immediately calls moveVehicle,
             # so the mailbox must accept input before entering that callback.
-            # All entity/materialization gates above have passed already.
+            # A LAN battle deliberately leaves ``initial_period`` unset: the
+            # ClientArena remains in WAITING while the remaining vehicles are
+            # materialized, and the server publishes the sole PREBATTLE
+            # countdown only after every client reports ready.
             self._client_ready = True
-            self._binding.arena_period(
-                self._initial_period, self._initial_period_seconds)
+            if self._initial_period is not None:
+                self._binding.arena_period(
+                    self._initial_period, self._initial_period_seconds)
         except Exception as error:
             self._client_ready = False
             self._ready_publish_error = str(error)

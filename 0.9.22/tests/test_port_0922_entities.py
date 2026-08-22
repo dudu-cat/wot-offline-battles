@@ -759,6 +759,23 @@ class AvatarServerBridgeTests(unittest.TestCase):
         self.assertTrue(bridge.flushClientReady())
         self.assertEqual([(91, 'move', {'flags': 0})], sender.events)
 
+    def test_initial_period_can_wait_for_server_ready_barrier(self):
+        module = _avatar_bridge_module()
+        binding = _BridgeBinding()
+        bridge = module.AvatarServerBridge(
+            _BridgeAvatar(), binding,
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            _Sender(), initial_period=None)
+
+        self.assertEqual(91, bridge.addVehicleToArena(_snapshot()))
+        self.assertTrue(bridge.acceptVehicleEnter(91))
+        self.assertTrue(bridge.setClientReady())
+        self.assertTrue(bridge.completeVehicleEnter(91))
+        self.assertTrue(bridge.flushClientReady())
+
+        self.assertNotIn('period', [event[0] for event in binding.events])
+
     def test_native_move_mailbox_relays_without_notifying_filter_twice(self):
         module = _avatar_bridge_module()
         binding = _BridgeBinding()

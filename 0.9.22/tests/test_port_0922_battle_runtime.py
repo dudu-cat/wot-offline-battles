@@ -1298,6 +1298,7 @@ class _BigWorld(object):
             7: _SpaceData(self.operations, 7, 0xffffffff)}
         self.pending_visibility_masks = {}
         self.space_data_factory = _SpaceData
+        self.mapping_visibility_mask = 0xffffffff
         self.mapped_visibility_masks = []
         self.mapped_control_point_masks = []
         self.mapped_gui_visibility = []
@@ -1422,13 +1423,13 @@ class _BigWorld(object):
             section = self.res_mgr.openSection(path + '/space.bin')
             self.mapped_control_point_masks.append([
                 mask for mask in _control_point_masks(section.asBinary)
-                if mask])
+                if mask & self.mapping_visibility_mask])
         if space_id not in self.spaces:
             visibility_mask = 0xffffffff
             self.spaces[space_id] = self.space_data_factory(
                 self.operations, space_id, visibility_mask)
         self.mapped_visibility_masks.append(
-            self.spaces[space_id].itemsVisibilityMask)
+            self.mapping_visibility_mask)
         return 1
 
     def wg_getSpaceItemsVisibilityMask(self, space_id):
@@ -1594,6 +1595,16 @@ def _runtime():
         appearance.compoundModel.node(
             'gun_inclination', appearance.gunMatrix)
 
+    def call_with_standard_gameplay_mask(callback, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        previous = bigworld.mapping_visibility_mask
+        bigworld.mapping_visibility_mask = 0x00000001
+        try:
+            return callback(*args, **kwargs)
+        finally:
+            bigworld.mapping_visibility_mask = previous
+
     return types.SimpleNamespace(
         account_commands=types.SimpleNamespace(
             CMD_GET_AVATAR_SYNC=1, CMD_ADD_INT_USER_SETTINGS=2,
@@ -1643,6 +1654,7 @@ def _runtime():
             setupVehicleFashion=lambda fashion, descriptor, crashed: True,
             createVehicleFilter=lambda descriptor: _VehicleFilter()),
         offline_map_creator=_OfflineMap(bigworld, app_loader),
+        call_with_standard_gameplay_mask=call_with_standard_gameplay_mask,
         res_mgr=res_mgr,
         navigation_graph_loader=navigation_graph_loader,
         vehicle_view_state=types.SimpleNamespace(RPM='rpm'),
@@ -4514,7 +4526,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
              ('watcher', 'Visibility/GUI', True),
              ('space_visibility', 7, 0x00000001)],
             runtime.bigworld.operations)
-        self.assertEqual([0xffffffff],
+        self.assertEqual([0x00000001],
                          runtime.bigworld.mapped_visibility_masks)
         self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
         self.assertNotIn(
@@ -4561,89 +4573,16 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             0x00000001,
             runtime.bigworld.spaces[7].itemsVisibilityMask)
-        self.assertEqual([0xffffffff],
+        self.assertEqual([0x00000001],
                          runtime.bigworld.mapped_visibility_masks)
         self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
 
         # Exact #1513 Malinovka WTCP records: both CTF bases include bit 0;
-        # the neutral domination and base-3 records do not and are zero before
-        # the broad client-only mapping mask reaches the native WTCP handler.
+        # the neutral domination and base-3 records do not.  The mapping is
+        # constructed with bit 0, so native WTCP instantiates only CTF bases.
         self.assertEqual(
             [[0xffffff89, 0xffffff89]],
             runtime.bigworld.mapped_control_point_masks)
-        section = runtime.res_mgr.sections[
-            'spaces/02_malinovka/space.bin']
-        self.assertEqual(
-            [0xffffff89, 0, 0xffffff89, 0],
-            _control_point_masks(section.asBinary))
-        self.assertIs(section, battle._compiled_space_resource[2])
-
-    def test_compiled_control_point_resource_is_purged_after_map_cleanup(self):
-        runtime = _runtime()
-        battle = BattleRuntime(runtime)
-
-        self.assertTrue(battle.start({
-            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
-            'name': 'Player'}, {
-                'round_id': 1, 'map': '01_karelia',
-                'bot_authority_id': 1,
-                'players': [{
-                    'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
-                    'vehicle': 'ussr:R11_MS-1', 'health': 500}],
-                'bots': []}, _Client()))
-
-        path = 'spaces/01_karelia/space.bin'
-        self.assertIn(path, runtime.res_mgr.sections)
-        battle._cleanup()
-
-        self.assertEqual([(path, True)], runtime.res_mgr.purges)
-        self.assertLess(
-            runtime.bigworld.operations.index(('clear_entities_spaces',)),
-            runtime.bigworld.operations.index(('purge', path, True)))
-        self.assertIsNone(battle._compiled_space_resource)
-        self.assertEqual(
-            [0xffffff89, 0xffffff82, 0xffffff89, 0xffffff84],
-            _control_point_masks(
-                runtime.res_mgr.openSection(path).asBinary))
-
-    def test_compiled_control_point_filter_rejects_truncated_wtcp(self):
-        binary = _compiled_space_binary()
-        truncated = binary[:-1]
-
-        with self.assertRaisesRegex(
-                ValueError, 'outside the container'):
-            battle_runtime_module._filter_compiled_control_points(
-                truncated, 1)
-
-        self.assertEqual(
-            [0xffffff89, 0xffffff82, 0xffffff89, 0xffffff84],
-            _control_point_masks(binary))
-
-    def test_compiled_control_point_filter_accepts_missing_wtcp(self):
-        binary = struct.pack('<4s5I', b'BWTB', 1, 24, 0, 0, 0)
-
-        patched, replacements = \
-            battle_runtime_module._filter_compiled_control_points(binary, 1)
-
-        self.assertEqual(binary, patched)
-        self.assertEqual(0, replacements)
-
-    def test_retained_compiled_resource_blocks_next_start_before_lobby(self):
-        runtime = _runtime()
-        battle = BattleRuntime(runtime)
-        retained = (
-            runtime.res_mgr, 'spaces/01_karelia/space.bin',
-            runtime.res_mgr.openSection('spaces/01_karelia/space.bin'))
-        battle._compiled_space_resource = retained
-        battle.state = 'stopped'
-
-        self.assertFalse(battle.start({
-            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
-            'name': 'Player'}, {}, _Client()))
-
-        self.assertIs(retained, battle._compiled_space_resource)
-        self.assertEqual([], runtime.bigworld.operations)
-        self.assertIn('still retained', battle.error)
 
     def test_native_map_does_not_use_inert_legacy_visibility_setter(self):
         runtime = _runtime()
@@ -4670,7 +4609,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(
             1, runtime.bigworld.spaces[7].itemsVisibilityMask)
-        self.assertEqual([0xffffffff],
+        self.assertEqual([0x00000001],
                          runtime.bigworld.mapped_visibility_masks)
         self.assertEqual([], live_space_at_write)
         runtime.bigworld.wg_setSpaceItemsVisibilityMask.assert_not_called()
@@ -4696,7 +4635,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual([False], runtime.bigworld.mapped_gui_visibility)
         self.assertTrue(runtime.bigworld.gui_visibility)
-        self.assertEqual([0xffffffff],
+        self.assertEqual([0x00000001],
                          runtime.bigworld.mapped_visibility_masks)
         self.assertLess(
             runtime.bigworld.operations.index(
@@ -4733,7 +4672,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'bots': []}, _Client()))
 
         self.assertEqual([False], live_space_at_mapping)
-        self.assertEqual([0xffffffff],
+        self.assertEqual([0x00000001],
                          runtime.bigworld.mapped_visibility_masks)
         self.assertIs(
             add_mapping,
@@ -4764,7 +4703,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'map': '02_malinovka', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, start, _Client()))
 
-        self.assertEqual([0xffffffff],
+        self.assertEqual([0x00000001],
                          runtime.bigworld.mapped_visibility_masks)
         self.assertIsNotNone(battle._standard_space_visibility)
         self.assertFalse(battle._space_visibility_warning_reported)
@@ -5004,7 +4943,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(1, runtime.app_loader.lobby_disposals)
         self.assertEqual(1, runtime.app_loader.lobby_populates)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
-        self.assertEqual([0xffffffff],
+        self.assertEqual([0x00000001],
                          runtime.bigworld.mapped_visibility_masks)
         self.assertEqual(
             1, runtime.bigworld.spaces[7].itemsVisibilityMask)
@@ -5517,6 +5456,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(2, len(battle._pending_bot_create_order))
         self.assertFalse(battle._ready_sent)
+        periods = [payload for kind, payload
+                   in runtime.bigworld.avatar.arena_updates
+                   if kind == runtime.constants.ARENA_UPDATE.PERIOD]
+        self.assertEqual([], periods)
         battle._frame()
 
         client.send_battle_ready.assert_not_called()
@@ -7503,7 +7446,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
                    for kind, payload in runtime.bigworld.avatar.arena_updates
                    if kind == runtime.constants.ARENA_UPDATE.PERIOD]
         self.assertEqual(
-            [(2, 25.0, 15.0, []), (2, 25.0, 15.0, [])], periods)
+            [(2, 25.0, 15.0, [])], periods)
         self.assertEqual(
             [], runtime.bigworld.avatar.inputHandler.started_periods)
         self.assertFalse(battle._battle_live)
@@ -13075,23 +13018,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
             ('retire',), ('destroy',), ('mapping', 7, 3),
             ('clear', 7), ('release', 7)], calls)
         self.assertNotIn(7, client_spaces)
-
-    def test_cleanup_retains_compiled_resource_when_space_release_fails(self):
-        runtime = _runtime()
-        battle = BattleRuntime(runtime)
-        battle._map_create_attempted = True
-        path = 'spaces/01_karelia/space.bin'
-        retained = (
-            runtime.res_mgr, path, runtime.res_mgr.openSection(path))
-        battle._compiled_space_resource = retained
-        battle._release_retained_client_space = mock.Mock(
-            return_value=RuntimeError('space release failed'))
-
-        with self.assertRaisesRegex(RuntimeError, 'space release failed'):
-            battle._cleanup()
-
-        self.assertIs(retained, battle._compiled_space_resource)
-        self.assertEqual([], runtime.res_mgr.purges)
 
     def test_lan_disconnect_still_restores_fake_account(self):
         runtime = _runtime()

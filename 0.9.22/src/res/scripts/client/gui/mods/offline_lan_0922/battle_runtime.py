@@ -7,7 +7,6 @@ import collections
 import math
 import os
 import random
-import struct
 import sys
 import time
 import traceback
@@ -42,8 +41,8 @@ from gui.mods.offline_lan_0922 import (
     ballistics, combat_rules, critical_damage, destructibles_compat,
     gun_mechanics,
     loadout as loadout_law, prebaked_destructibles, prebaked_foliage,
-    prebaked_navigation, spotting, tank_collision, vehicle_blacklist,
-    vehicle_physics, world_collision)
+    prebaked_navigation, native_mapping_mask, spotting, tank_collision,
+    vehicle_blacklist, vehicle_physics, world_collision)
 
 
 # BigWorld callbacks run on rendered frames.  The mature 0.8.2 battle asks for
@@ -71,87 +70,6 @@ SPOTTING_PHASE_BUCKETS = 5
 # after the local map has entered the battle.  Read it infrequently and only
 # write when it no longer selects this arena's gameplay.
 SPACE_VISIBILITY_CHECK_SECONDS = 0.50
-
-# Exact #1513 compiled-space ControlPoint wire layout.  The client-only
-# OfflineMapCreator maps with the engine's broad default visibility mask, so
-# inactive gameplay records must be removed from the cached resource before
-# native geometry mapping instantiates them.
-_BWTB_HEADER = struct.Struct('<4s5I')
-_WTCP_VERSION = 2
-_WTCP_RECORD_HEADER = struct.Struct('<2I')
-_WTCP_RECORD_SIZE = 124
-_WTCP_VISIBILITY_OFFSET = 120
-
-
-class _CompiledSpaceVisibilityError(ValueError):
-    pass
-
-
-def _filter_compiled_control_points(binary, selected_bit):
-    """Return ``space.bin`` with non-selected WTCP records disabled."""
-    if not isinstance(binary, (bytes, bytearray)):
-        raise _CompiledSpaceVisibilityError(
-            'compiled space resource is not binary')
-    selected_bit = int(selected_bit)
-    if (selected_bit <= 0 or selected_bit > 0xffffffff or
-            selected_bit & (selected_bit - 1)):
-        raise _CompiledSpaceVisibilityError(
-            'selected gameplay visibility bit is invalid')
-    if len(binary) < _BWTB_HEADER.size:
-        raise _CompiledSpaceVisibilityError(
-            'compiled space is shorter than the BWTB header')
-    magic, version, directory_end, unused_a, unused_b, count = \
-        _BWTB_HEADER.unpack_from(binary, 0)
-    expected_directory_end = _BWTB_HEADER.size * (count + 1)
-    if magic != b'BWTB' or version != 1:
-        raise _CompiledSpaceVisibilityError(
-            'compiled space has an unsupported BWTB header')
-    if (directory_end != expected_directory_end or
-            directory_end > len(binary)):
-        raise _CompiledSpaceVisibilityError(
-            'compiled space has an invalid BWTB directory')
-    wtcp = None
-    for index in range(count):
-        offset = _BWTB_HEADER.size * (index + 1)
-        row = _BWTB_HEADER.unpack_from(binary, offset)
-        name, section_version, section_offset, unused_c, section_size, \
-            unused_rows = row
-        if (section_offset < directory_end or
-                section_offset + section_size > len(binary)):
-            raise _CompiledSpaceVisibilityError(
-                'compiled-space section extends outside the container')
-        if name == b'WTCP':
-            if wtcp is not None:
-                raise _CompiledSpaceVisibilityError(
-                    'compiled space has duplicate WTCP sections')
-            wtcp = (section_version, section_offset, section_size)
-    if wtcp is None:
-        # A map without static ControlPoints has nothing for this filter to
-        # select.  Preserve its resource byte-for-byte and map normally.
-        return bytes(binary), 0
-    section_version, section_offset, section_size = wtcp
-    if section_version != _WTCP_VERSION or section_size < 8:
-        raise _CompiledSpaceVisibilityError(
-            'compiled space has an unsupported WTCP section')
-    record_size, record_count = _WTCP_RECORD_HEADER.unpack_from(
-        binary, section_offset)
-    expected_size = _WTCP_RECORD_HEADER.size + record_size * record_count
-    if (record_size != _WTCP_RECORD_SIZE or
-            expected_size != section_size):
-        raise _CompiledSpaceVisibilityError(
-            'compiled space has an invalid WTCP record table')
-    patched = bytearray(binary)
-    replacements = 0
-    records_offset = section_offset + _WTCP_RECORD_HEADER.size
-    for index in range(record_count):
-        mask_offset = (records_offset + index * record_size +
-                       _WTCP_VISIBILITY_OFFSET)
-        mask = struct.unpack_from('<I', binary, mask_offset)[0]
-        if mask and not mask & selected_bit:
-            struct.pack_into('<I', patched, mask_offset, 0)
-            replacements += 1
-    return bytes(patched), replacements
-
 
 class _LiveSpaceVisibilityPending(Exception):
     """The mapped native space has not reached BigWorld.spaces yet."""
@@ -853,7 +771,6 @@ def _load_runtime():
     import DataLinks
     import DestructiblesCache
     import Math
-    import ResMgr
     import Vehicular
     import constants
     import game
@@ -906,7 +823,8 @@ def _load_runtime():
     runtime.model_assembler = model_assembler
     runtime.nations = nations
     runtime.offline_map_creator = g_offlineMapCreator
-    runtime.res_mgr = ResMgr
+    runtime.call_with_standard_gameplay_mask = \
+        native_mapping_mask.call_with_standard_gameplay_mask
     runtime.vehicles = vehicles
     runtime.feedback_event_id = FEEDBACK_EVENT_ID
     runtime.vehicle_view_state = VEHICLE_VIEW_STATE
@@ -1079,7 +997,6 @@ class BattleRuntime(object):
         self._last_snapshot = None
         self._last_frame_time = None
         self._standard_space_visibility = None
-        self._compiled_space_resource = None
         self._next_space_visibility_check = 0.0
         self._space_visibility_warning_reported = False
         if self._frame_diagnostics is not None:
@@ -1239,14 +1156,6 @@ class BattleRuntime(object):
             return False
         if lan_client is None:
             raise ValueError('LAN client is required')
-        if self._compiled_space_resource is not None:
-            # A prior cleanup retained this object because native space
-            # teardown could not prove the mapping dead.  Never discard that
-            # last Python reference or start another map over the same cache.
-            self.error = (
-                'previous compiled-space mapping resource is still retained')
-            self.state = 'failed'
-            return False
         self._runtime = self._runtime or _load_runtime()
         self._config = dict(config or {})
         self._worker_mode = bool(self._config.get('worker_mode', False))
@@ -1646,9 +1555,9 @@ class BattleRuntime(object):
 
         def finish_battle_map_setup():
             # OfflineMapCreator disables this watcher before mapping.  Keep it
-            # disabled while native static-scene handlers consume the filtered
-            # resource, then restore normal battle GUI visibility at the stock
-            # setup-camera boundary without installing the viewer camera.
+            # disabled while native static-scene handlers consume the selected
+            # gameplay mapping, then restore normal battle GUI visibility at
+            # the stock setup-camera boundary without the viewer camera.
             set_watcher = getattr(bigworld, 'setWatcher', None)
             if callable(set_watcher):
                 set_watcher('Visibility/GUI', True)
@@ -1658,9 +1567,14 @@ class BattleRuntime(object):
                 'native Avatar requested game.abort during battle start')
 
         def add_standard_space_geometry(space_id, *args, **kwargs):
-            path = args[1] if len(args) > 1 else kwargs.get('path')
-            self._prepare_standard_control_points(space_id, path)
-            return original_add_mapping(space_id, *args, **kwargs)
+            self._prepare_standard_mapping_visibility(space_id)
+            call_with_mask = getattr(
+                self._runtime, 'call_with_standard_gameplay_mask', None)
+            if not callable(call_with_mask):
+                raise RuntimeError(
+                    '#1513 native mapping-mask boundary is unavailable')
+            return call_with_mask(
+                original_add_mapping, (space_id,) + args, kwargs)
 
         setattr(loader_type, page_name, defer_battle_page)
         try:
@@ -1819,9 +1733,9 @@ class BattleRuntime(object):
         try:
             return self._apply_standard_space_visibility(space_id)
         except _LiveSpaceVisibilityPending:
-            # _prepare_standard_control_points already retained the selected
-            # bit.  The periodic guard can finish the typed write when exact
-            # #1513 publishes this client-only space through BigWorld.spaces.
+            # The mapping itself already received the selected bit.  The
+            # periodic guard can finish the typed write when exact #1513
+            # publishes this client-only space through BigWorld.spaces.
             return None
         except Exception as error:
             # Visibility only filters map decoration such as inactive bases.
@@ -1858,65 +1772,21 @@ class BattleRuntime(object):
                 '#1513 gameplay visibility mask is invalid')
         return selected_bit, client_bits, server_bits
 
-    def _prepare_standard_control_points(self, space_id, mapping_path):
-        """Filter inactive WTCP records in ResMgr before native mapping."""
+    def _prepare_standard_mapping_visibility(self, space_id):
+        """Latch the CTF bit before the exact native mapping call."""
         selected_bit, client_bits, server_bits = \
             self._standard_visibility_contract()
+        # This runtime exposes only standard CTF arenas.  The exact #1513
+        # native helper narrows the hard-coded all-bits mapping mask to this
+        # one wire bit; reject any build/data drift before touching code.
+        if selected_bit != 0x00000001:
+            raise RuntimeError(
+                '#1513 standard gameplay visibility bit is not 0x1')
         self._standard_space_visibility = (
             space_id, selected_bit, client_bits, server_bits)
         self._next_space_visibility_check = (
             self._clock() + SPACE_VISIBILITY_CHECK_SECONDS)
-        if not mapping_path or not hasattr(mapping_path, 'rstrip'):
-            raise RuntimeError(
-                '#1513 compiled-space mapping path is unavailable')
-        res_mgr = getattr(self._runtime, 'res_mgr', None)
-        open_section = getattr(res_mgr, 'openSection', None)
-        purge = getattr(res_mgr, 'purge', None)
-        if not callable(open_section) or not callable(purge):
-            raise RuntimeError(
-                '#1513 compiled-space resource boundary is unavailable')
-        if self._compiled_space_resource is not None:
-            raise RuntimeError(
-                '#1513 compiled-space resource is already retained')
-        resource_path = mapping_path.rstrip('/') + '/space.bin'
-        section = open_section(resource_path)
-        if section is None:
-            raise RuntimeError(
-                '#1513 compiled-space resource is unavailable: %s' %
-                resource_path)
-        patched, replacements = _filter_compiled_control_points(
-            section.asBinary, selected_bit)
-        if replacements:
-            try:
-                section.asBinary = patched
-                if section.asBinary != patched:
-                    raise RuntimeError(
-                        '#1513 compiled-space visibility write was not applied')
-            except Exception:
-                # Assignment may already have replaced the cached bytes.  If
-                # rollback itself fails, retain the DataSection so no native
-                # consumer can outlive its final Python owner.
-                self._compiled_space_resource = (
-                    res_mgr, resource_path, section)
-                try:
-                    purge(resource_path, True)
-                except Exception:
-                    raise
-                self._compiled_space_resource = None
-                raise
-            self._compiled_space_resource = (
-                res_mgr, resource_path, section)
-        return replacements
-
-    def _purge_compiled_space_resource(self):
-        """Drop the patched cache only after its mapping has been released."""
-        retained = self._compiled_space_resource
-        if retained is None:
-            return False
-        res_mgr, resource_path, unused_section = retained
-        res_mgr.purge(resource_path, True)
-        self._compiled_space_resource = None
-        return True
+        return selected_bit
 
     def _apply_standard_space_visibility(self, space_id=None):
         """Maintain the live typed property after geometry is mapped."""
@@ -2172,8 +2042,10 @@ class BattleRuntime(object):
                 on_leave=self._defer_avatar_leave,
                 on_vehicle_enter=self._prepare_local_presentation,
                 on_viewpoint_switch=self._switch_postmortem_viewpoint,
-                initial_period='prebattle',
-                initial_period_seconds=self._prebattle_seconds())
+                # ClientArena starts in WAITING.  Keep that stock state while
+                # bot presentations finish, then publish PREBATTLE exactly
+                # once from on_battle_live after the shared ready barrier.
+                initial_period=None)
             self._runtime.compatibility.attach_avatar_server(
                 self._avatar, self._server)
             properties = self._binding.properties_from_compact_descr(
@@ -12231,10 +12103,8 @@ class BattleRuntime(object):
             # cleanup boundaries.  A partial onBecomeNonPlayer failure must
             # not prevent OfflineMapCreator from releasing its entity, space,
             # mapping and camera ids.
-            creator_destroyed = False
             try:
                 creator.destroy()
-                creator_destroyed = True
             except Exception as error:
                 if cleanup_error is None:
                     cleanup_error = error
@@ -12242,21 +12112,6 @@ class BattleRuntime(object):
                 retained_space_id, retained_mapping_id)
             if space_error is not None and cleanup_error is None:
                 cleanup_error = space_error
-            # If destroy raised before retaining an id, there is no boundary
-            # through which we can prove the mapping dead.  Keep the patched
-            # DataSection alive rather than purging memory native code may use.
-            fallback_release_proven = (
-                bool(retained_space_id) and callable(getattr(
-                    self._runtime.bigworld, 'isClientSpace', None)))
-            mapping_released = (
-                space_error is None and
-                (creator_destroyed or fallback_release_proven))
-            if mapping_released:
-                try:
-                    self._purge_compiled_space_resource()
-                except Exception as error:
-                    if cleanup_error is None:
-                        cleanup_error = error
             player, player_error = self._read_engine_player()
             if player_error is not None and cleanup_error is None:
                 cleanup_error = player_error
@@ -12311,9 +12166,6 @@ class BattleRuntime(object):
         self._compound_report_signature = None
         self._avatar = None
         self._standard_space_visibility = None
-        # A non-None resource here means native map teardown could not prove
-        # the mapping dead; retain its DataSection instead of purging memory
-        # still owned by the engine.
         self._next_space_visibility_check = 0.0
         self._space_visibility_warning_reported = False
         self._binding = None
