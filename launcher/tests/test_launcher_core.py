@@ -746,6 +746,9 @@ class ClientInstallTest(unittest.TestCase):
             app_data,
             *preferences_overlay.NORMAL_PROFILE_RELATIVE_PATH.split("/"))
         os.makedirs(os.path.dirname(preferences))
+        preferences = preferences_overlay.normal_profile_path(
+            {"APPDATA": app_data})
+        self.assertIsNotNone(preferences)
         with open(preferences, "w") as stream:
             stream.write("normal client settings")
         first_backup = preferences + ".wot-offline-backup-20260822-120000"
