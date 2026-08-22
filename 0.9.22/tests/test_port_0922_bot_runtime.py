@@ -278,6 +278,8 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         server._reset_round()
         self.assertEqual(0, server.bot_state_revision)
         self.assertEqual(0, server.bot_state_time_us)
+        self.assertIsNone(server.bot_source_time_us)
+        self.assertIsNone(server.bot_source_receipt_time_us)
 
     def test_snapshot_carries_real_bot_receipt_time_and_queue_age(self):
         now = [100.0]
@@ -290,6 +292,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         self.assertTrue(server.update_bot_states(
             1, self._publication(server, 1.0)))
         self.assertEqual(65000, server.bot_state_time_us)
+        self.assertIsNone(server.bot_source_time_us)
 
         now[0] = 100.080
         server.tick_once(1.0 / 30.0)
@@ -300,6 +303,163 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         self.assertTrue(snapshots)
         self.assertEqual(65000, snapshots[-1]['bot_state_time_us'])
         self.assertEqual(80000, snapshots[-1]['motion_time_us'])
+
+    def test_source_sample_clock_excludes_variable_worker_completion_time(self):
+        now = [100.0]
+        server, _, authority_socket = self._server(
+            clock=lambda: now[0],
+            before_manifest=lambda: now.__setitem__(0, 100.025))
+
+        now[0] = 100.065
+        first = self._publication(server, 0.4)
+        first['sample_time_us'] = 40000
+        self.assertTrue(server.update_bot_states(1, first))
+        first_mapped_time = server.bot_state_time_us
+        self.assertEqual(65000, first_mapped_time)
+
+        # The worker spends an extra 95 ms finishing this callback, although
+        # the pose itself integrated exactly one more 40 ms step.
+        now[0] = 100.200
+        delayed = self._publication(server, 0.8)
+        delayed['sample_time_us'] = 80000
+        self.assertTrue(server.update_bot_states(1, delayed))
+        self.assertEqual(first_mapped_time + 40000,
+                         server.bot_state_time_us)
+
+        # A fast following callback keeps the same pose-time interval instead
+        # of inheriting the preceding callback's completion-time spike.
+        now[0] = 100.210
+        fast = self._publication(server, 1.2)
+        fast['sample_time_us'] = 120000
+        self.assertTrue(server.update_bot_states(1, fast))
+        self.assertEqual(first_mapped_time + 80000,
+                         server.bot_state_time_us)
+
+        server.tick_once(1.0 / 30.0)
+        snapshots = [
+            json.loads(payload.decode('utf-8'))
+            for payload in authority_socket.payloads
+            if json.loads(payload.decode('utf-8')).get('type') == 'snapshot']
+        self.assertNotIn('sample_time_us', snapshots[-1])
+        self.assertEqual(server.bot_state_time_us,
+                         snapshots[-1]['bot_state_time_us'])
+
+        repeated = self._publication(server, 1.2)
+        repeated['sample_time_us'] = 120000
+        self.assertFalse(server.update_bot_states(1, repeated))
+        self.assertEqual('sample_time_order',
+                         server.last_bot_state_reject_code)
+
+        self.assertFalse(server.update_bot_states(
+            1, self._publication(server, 1.6)))
+        self.assertEqual('sample_time_missing',
+                         server.last_bot_state_reject_code)
+
+        server.remove_player(1)
+        self.assertEqual(2, server.bot_authority_id)
+        self.assertIsNone(server.bot_source_time_us)
+        self.assertIsNone(server.bot_source_receipt_time_us)
+
+    def test_source_lead_keeps_snapshot_motion_clock_advancing_uniformly(self):
+        now = [100.0]
+        server, _, authority_socket = self._server(
+            clock=lambda: now[0],
+            before_manifest=lambda: now.__setitem__(0, 100.025))
+
+        # A slow publication establishes its source epoch at a late receipt.
+        now[0] = 100.200
+        slow = self._publication(server, 0.4)
+        slow['sample_time_us'] = 40000
+        self.assertTrue(server.update_bot_states(1, slow))
+        self.assertEqual(200000, server.bot_state_time_us)
+        self.assertEqual(0, server.motion_time_offset_us)
+
+        # The next pose integrates 100 ms but arrives only 10 ms later. Its
+        # mapped source time is therefore 90 ms ahead of the raw server clock.
+        now[0] = 100.210
+        fast = self._publication(server, 1.4)
+        fast['sample_time_us'] = 140000
+        self.assertTrue(server.update_bot_states(1, fast))
+        self.assertEqual(300000, server.bot_state_time_us)
+        self.assertEqual(90000, server.motion_time_offset_us)
+
+        # The offset must not decay through max(raw, sample). Even without a
+        # third bot revision, every server snapshot advances by the raw 10 ms
+        # interval instead of remaining pinned at 300 ms until raw catches up.
+        for raw_time in (100.220, 100.230, 100.240):
+            now[0] = raw_time
+            server.tick_once(1.0 / 30.0)
+
+        # A following normal-cadence pose must join that same logical clock;
+        # otherwise the clock-only snapshots above could pass while the next
+        # real revision still reintroduced a catch-up hold.
+        now[0] = 100.250
+        steady = self._publication(server, 1.8)
+        steady['sample_time_us'] = 180000
+        self.assertTrue(server.update_bot_states(1, steady))
+        self.assertEqual(340000, server.bot_state_time_us)
+        server.tick_once(1.0 / 30.0)
+        snapshots = [
+            json.loads(payload.decode('utf-8'))
+            for payload in authority_socket.payloads
+            if json.loads(payload.decode('utf-8')).get('type') == 'snapshot']
+        motion_times = [message['motion_time_us']
+                        for message in snapshots[-4:]]
+        self.assertEqual(
+            [310000, 320000, 330000, 340000], motion_times)
+        self.assertEqual(
+            [10000, 10000, 10000],
+            [motion_times[index] - motion_times[index - 1]
+             for index in range(1, len(motion_times))])
+        self.assertTrue(all(
+            message['bot_state_time_us'] == 300000
+            for message in snapshots[-4:-1]))
+        self.assertEqual(340000, snapshots[-1]['bot_state_time_us'])
+
+        # Several publications can disappear before reaching the server. A
+        # source delta larger than one 200 ms BotRuntime step remains valid
+        # when the same amount of raw receipt time has elapsed.
+        now[0] = 100.490
+        skipped = self._publication(server, 2.2)
+        skipped['sample_time_us'] = 420000
+        self.assertTrue(server.update_bot_states(1, skipped))
+        self.assertEqual(580000, server.bot_state_time_us)
+        self.assertEqual(90000, server.motion_time_offset_us)
+
+        # An instantaneous source leap beyond real elapsed time plus one
+        # maximum integration step is rejected without poisoning the accepted
+        # origins. A later normal sample can therefore recover immediately.
+        now[0] = 100.500
+        oversized = self._publication(server, 9.0)
+        oversized['sample_time_us'] = 1000000
+        self.assertFalse(server.update_bot_states(1, oversized))
+        self.assertEqual('sample_time_rate',
+                         server.last_bot_state_reject_code)
+        self.assertEqual(580000, server.bot_state_time_us)
+        self.assertEqual(420000, server.bot_source_time_us)
+        self.assertEqual(490000, server.bot_source_receipt_time_us)
+        self.assertEqual(90000, server.motion_time_offset_us)
+
+        now[0] = 100.530
+        recovered = self._publication(server, 2.6)
+        recovered['sample_time_us'] = 460000
+        self.assertTrue(server.update_bot_states(1, recovered))
+        self.assertEqual(620000, server.bot_state_time_us)
+        self.assertEqual(460000, server.bot_source_time_us)
+        self.assertEqual(530000, server.bot_source_receipt_time_us)
+        self.assertEqual(90000, server.motion_time_offset_us)
+
+        # A failover resets only the new producer's source origin. The public
+        # logical timeline is still this round's timeline and cannot fall back.
+        server.remove_player(1)
+        self.assertEqual(2, server.bot_authority_id)
+        self.assertIsNone(server.bot_source_time_us)
+        self.assertIsNone(server.bot_source_receipt_time_us)
+        self.assertEqual(90000, server.motion_time_offset_us)
+
+        server._reset_round()
+        self.assertIsNone(server.bot_source_receipt_time_us)
+        self.assertEqual(0, server.motion_time_offset_us)
 
     def test_revision_advances_inside_one_coarse_clock_quantum(self):
         now = [100.0]
@@ -2346,6 +2506,31 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual('bot_state', result[0]['type'])
         self.assertGreater(bot['z'], 0.0); self.assertEqual(1, bot['fire_seq'])
         self.assertEqual(0, bot['shell_index'])
+
+    def test_publication_sample_clock_tracks_integrated_time_not_callback_time(self):
+        self.runtime.battle_start(self.start)
+
+        first = next(message for message in self.runtime.update(.04, 10.0)
+                     if message.get('type') == 'bot_state')
+        self.assertEqual(40000, first['sample_time_us'])
+
+        # This render callback is banked until the next authority deadline.
+        self.assertEqual([], self.runtime.update(.02, 10.02))
+        second = next(message for message in self.runtime.update(.02, 10.04)
+                      if message.get('type') == 'bot_state')
+        self.assertEqual(80000, second['sample_time_us'])
+
+        # The callback arrived 250 ms later, but BotRuntime intentionally
+        # integrated only its bounded 200 ms step. Native work after that pose
+        # is formed must not leak into the source sample timestamp.
+        stalled = next(message for message in self.runtime.update(.25, 10.29)
+                       if message.get('type') == 'bot_state')
+        self.assertEqual(280000, stalled['sample_time_us'])
+
+        self.runtime.battle_start(dict(self.start, round_id=6))
+        reset = next(message for message in self.runtime.update(.03, 20.0)
+                     if message.get('type') == 'bot_state')
+        self.assertEqual(30000, reset['sample_time_us'])
 
     def test_authority_publication_and_server_ack_remain_live_for_two_minutes(self):
         command = {

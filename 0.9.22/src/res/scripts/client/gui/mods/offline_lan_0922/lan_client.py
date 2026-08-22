@@ -1387,7 +1387,7 @@ class LANClient(object):
                            'round_id': self.round_id,
                            'bots': list(bots or ())[:30]})
 
-    def send_bot_state(self, bots):
+    def send_bot_state(self, bots, sample_time_us=None):
         if not self.is_bot_authority():
             return False
         projected = []
@@ -1396,18 +1396,32 @@ class LANClient(object):
             if state is None:
                 return False
             projected.append(state)
-        return self._send({'type': 'bot_state', 'round_id': self.round_id,
-                           'bots': projected})
+        message = {'type': 'bot_state', 'round_id': self.round_id,
+                   'bots': projected}
+        if sample_time_us is not None:
+            sample_time_us = _exact_int(sample_time_us)
+            if (sample_time_us is None or
+                    not 0 <= sample_time_us <= MAX_MOTION_TIME_US):
+                return False
+            message['sample_time_us'] = sample_time_us
+        return self._send(message)
 
-    def send_projected_bot_state(self, bots):
+    def send_projected_bot_state(self, bots, sample_time_us=None):
         """Send BotRuntime's already-projected canonical publication once."""
         if not self.is_bot_authority():
             return False
         if (not isinstance(bots, (list, tuple)) or len(bots) > 30 or
                 any(not isinstance(state, dict) for state in bots)):
             return False
-        return self._send({'type': 'bot_state', 'round_id': self.round_id,
-                           'bots': bots})
+        message = {'type': 'bot_state', 'round_id': self.round_id,
+                   'bots': bots}
+        if sample_time_us is not None:
+            sample_time_us = _exact_int(sample_time_us)
+            if (sample_time_us is None or
+                    not 0 <= sample_time_us <= MAX_MOTION_TIME_US):
+                return False
+            message['sample_time_us'] = sample_time_us
+        return self._send(message)
 
     def send_bot_observation(self, contacts, affordances=None):
         if not self.is_bot_authority():
@@ -2639,6 +2653,17 @@ class LANClient(object):
 
     def _notify(self, kind, message):
         if self.on_event is not None and kind is not None:
+            if (isinstance(message, dict) and
+                    '_client_received_time' in message):
+                # Keep a duration rather than forwarding the receive clock's
+                # epoch. SnapshotSync normally runs on BigWorld.time(), while
+                # the socket thread uses the process monotonic clock.
+                dispatched = _monotonic_time()
+                received = _finite_float(
+                    message.get('_client_received_time'), dispatched)
+                message = dict(message)
+                message['_client_dispatch_delay'] = max(
+                    0.0, dispatched - received)
             self.on_event(kind, message)
 
     @staticmethod

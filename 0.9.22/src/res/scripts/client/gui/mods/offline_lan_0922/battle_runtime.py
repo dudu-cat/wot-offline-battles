@@ -1554,19 +1554,22 @@ class BattleRuntime(object):
         def defer_battle_page(unused_app_loader):
             return None
 
-        def finish_native_setup():
-            set_watcher = getattr(bigworld, 'setWatcher', None)
-            if callable(set_watcher):
-                set_watcher('Visibility/GUI', True)
+        def suppress_viewer_camera():
+            return None
 
         def reject_game_abort(*unused_args, **unused_kwargs):
             raise RuntimeError(
                 'native Avatar requested game.abort during battle start')
 
         def add_standard_space_geometry(space_id, *args, **kwargs):
-            # Static ControlPoint instances are filtered while the compiled
-            # space is mapped.  Setting the gameplay mask after create()
-            # returns leaves other gameplays' already-created circles alive.
+            # OfflineMapCreator disables Visibility/GUI before it creates the
+            # space.  A normal battle keeps that watcher enabled while the
+            # compiled space is mapped; restoring it in __setupCamera is too
+            # late because every ControlPoint has already been instantiated.
+            # Cross both native visibility boundaries before mapping.
+            set_watcher = getattr(bigworld, 'setWatcher', None)
+            if callable(set_watcher):
+                set_watcher('Visibility/GUI', True)
             self._configure_standard_space_visibility(
                 space_id, before_mapping=True)
             return original_add_mapping(space_id, *args, **kwargs)
@@ -1575,7 +1578,7 @@ class BattleRuntime(object):
         try:
             game_module.abort = reject_game_abort
             setattr(bigworld, mapping_name, add_standard_space_geometry)
-            setattr(creator, setup_name, finish_native_setup)
+            setattr(creator, setup_name, suppress_viewer_camera)
             try:
                 creator.create(map_name)
             finally:
@@ -1593,7 +1596,7 @@ class BattleRuntime(object):
                             pass
                 current_setup = getattr(
                     creator, '__dict__', {}).get(setup_name)
-                if current_setup is finish_native_setup:
+                if current_setup is suppress_viewer_camera:
                     if had_instance_setup:
                         setattr(
                             creator, setup_name, original_instance_setup)
@@ -10217,6 +10220,10 @@ class BattleRuntime(object):
             projected_sender = getattr(
                 self.client, 'send_projected_bot_state', None)
             if callable(projected_sender):
+                if 'sample_time_us' in message:
+                    return projected_sender(
+                        message.get('bots'),
+                        sample_time_us=message.get('sample_time_us'))
                 return projected_sender(message.get('bots'))
             return self.client.send_bot_state(message.get('bots'))
         if kind == 'bot_observation':

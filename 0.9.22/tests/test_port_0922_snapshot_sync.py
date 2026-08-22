@@ -341,6 +341,43 @@ class SnapshotSyncTests(unittest.TestCase):
                                   render_hz=render_hz):
                     run(authority_hz, render_hz)
 
+    def test_socket_dispatch_delay_does_not_shift_the_motion_clock_anchor(self):
+        clock = [0.016]
+        sync = self.module.SnapshotSync(1, clock=lambda: clock[0])
+        bot = player(7, 0.0)
+
+        sync.snapshot({
+            'round_id': 1, 'server_tick': 1,
+            'bot_state_revision': 1,
+            'motion_time_us': 0, 'bot_state_time_us': 0,
+            '_client_dispatch_delay': 0.016,
+            'bots': [bot],
+        })
+        record = sync._entities['bot:7']
+        self.assertAlmostEqual(0.0, record['motion_anchor_local_time'])
+        authority_now_us = (
+            record['motion_anchor_time_us'] +
+            (clock[0] - record['motion_anchor_local_time']) * 1000000.0)
+        self.assertAlmostEqual(16000.0, authority_now_us)
+
+        # A different 60 Hz poll phase still reconstructs the same advancing
+        # authority clock instead of resetting it to the older server stamp.
+        clock[0] = 0.117
+        moved = player(7, 1.0)
+        sync.snapshot({
+            'round_id': 1, 'server_tick': 2,
+            'bot_state_revision': 2,
+            'motion_time_us': 100000, 'bot_state_time_us': 100000,
+            '_client_dispatch_delay': 0.017,
+            'bots': [moved],
+        })
+        record = sync._entities['bot:7']
+        self.assertAlmostEqual(0.100, record['motion_anchor_local_time'])
+        authority_now_us = (
+            record['motion_anchor_time_us'] +
+            (clock[0] - record['motion_anchor_local_time']) * 1000000.0)
+        self.assertAlmostEqual(117000.0, authority_now_us)
+
     def test_timed_gap_and_sudden_stop_never_extrapolate_or_backtrack(self):
         clock = [0.0]
         sync = self.module.SnapshotSync(1, clock=lambda: clock[0])

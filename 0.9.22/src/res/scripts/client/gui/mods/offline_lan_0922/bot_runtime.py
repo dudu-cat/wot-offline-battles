@@ -1153,6 +1153,11 @@ class BotRuntime(object):
         self.round_id = None
         self.states = {}
         self._accumulator = 0.0
+        # This is the pose's simulation clock, not the wall clock observed
+        # after native probes and JSON preparation have finished.  The server
+        # maps it onto its own motion epoch so variable worker execution time
+        # cannot be mistaken for a variable vehicle speed.
+        self._sample_time_us = 0
         self._manifest_sent = False
         self._descriptors = {}
         self._gun_yaw_limits = {}
@@ -1578,6 +1583,7 @@ class BotRuntime(object):
             self.round_id = round_id
             self.states = {}
             self._accumulator = 0.0
+            self._sample_time_us = 0
             self._manifest_sent = False
             self._descriptors = {}
             self._gun_yaw_limits = {}
@@ -1635,6 +1641,7 @@ class BotRuntime(object):
             self.is_authority() and
             isinstance(message.get('bot_manifest'), (list, tuple)))
         if previous_authority != self.authority_id:
+            self._sample_time_us = 0
             self._clear_artillery_intents()
             self._friendly_repositions = {}
             self._visibility_cache = {}
@@ -5466,7 +5473,12 @@ class BotRuntime(object):
             launch = _local_launch_record(state)
             if launch is not None:
                 launches.append(launch)
-        publication = {'type': 'bot_state', 'bots': wire_states}
+        self._sample_time_us += max(
+            1, int(round(frame_step * 1000000.0)))
+        publication = {
+            'type': 'bot_state', 'bots': wire_states,
+            'sample_time_us': self._sample_time_us,
+        }
         if launches:
             # Never put these local-only SPG proof receipts on the LAN wire.
             # BattleRuntime retries an unaccepted launch from this compact list.

@@ -303,6 +303,7 @@ class SnapshotSync(object):
 
     def _upsert(self, kind, state, now, output, update_remote_pose=True,
                 sample_time_us=None, sample_age=0.0, motion_time_us=None,
+                motion_anchor_local_time=None,
                 live_timeline_started=False):
         key = _entity_key(kind, state)
         if key is None:
@@ -355,7 +356,9 @@ class SnapshotSync(object):
                 record['snapshot_interval_us'] = (
                     motion_time_us - previous_motion_time_us)
             record['motion_anchor_time_us'] = motion_time_us
-            record['motion_anchor_local_time'] = now
+            record['motion_anchor_local_time'] = (
+                now if motion_anchor_local_time is None else
+                motion_anchor_local_time)
         update_remote_pose = bool(
             update_remote_pose or record['target'] is None)
         snapped = (self._set_remote_target(
@@ -466,6 +469,14 @@ class SnapshotSync(object):
         if timing_phase in ('loading', 'prebattle', 'battle', 'finished'):
             self._last_timing_phase = timing_phase
         now = self._now()
+        # LANClient receives on a socket thread but dispatches snapshots from
+        # a 60 Hz BigWorld callback.  Anchor the server motion clock at the
+        # actual receive instant; anchoring it at dispatch makes every varying
+        # queue delay look like authority clock jitter.  Only the elapsed
+        # duration crosses clock domains, never either clock's epoch.
+        dispatch_delay = max(
+            0.0, _number(message.get('_client_dispatch_delay'), 0.0))
+        motion_anchor_local_time = now - dispatch_delay
         output = []
         seen = set()
         for kind, field in (('player', 'players'), ('bot', 'bots')):
@@ -486,6 +497,9 @@ class SnapshotSync(object):
                     motion_time_us=(motion_time_us
                                     if kind == 'bot' and timed_bot_poses
                                     else None),
+                    motion_anchor_local_time=(
+                        motion_anchor_local_time
+                        if kind == 'bot' and timed_bot_poses else None),
                     live_timeline_started=(
                         kind == 'bot' and live_timeline_started))
         if live_timeline_started:

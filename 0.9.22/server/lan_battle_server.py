@@ -142,6 +142,10 @@ PROJECTILE_CLOCK_LEEWAY_MS = 250
 PROJECTILE_TOLERANCE = 0.001
 PROJECTILE_CAPABILITY = "projectile_ledger_v1"
 MAX_MOTION_TIME_US = 10000000000000000
+# A source clock may span publications that were dropped or rejected, so its
+# delta can exceed one BotRuntime step. It may not, however, advance more than
+# one maximum 0.2-second integration step ahead of real receipt time.
+MAX_BOT_SAMPLE_LEAD_US = 200000
 SIMULATION_WORKER_CAPABILITY = "simulation_worker_v1"
 SIMULATION_WORKER_ROLE = "simulation_worker"
 # Negative ids are never legal player or bot ids.  Keep the external native
@@ -922,6 +926,13 @@ class BattleState:
         # and the time already spent waiting for the next server snapshot.
         self._motion_clock_origin = float(self._motion_clock())
         self.bot_state_time_us = 0
+        self.bot_source_time_us = None
+        self.bot_source_receipt_time_us = None
+        # Once a source-integrated pose runs ahead of its receipt clock, keep
+        # the whole round's motion timeline ahead by the same amount. Letting
+        # raw time catch up under max(raw, sample) would flatten successive
+        # snapshot timestamps and recreate a presentation hold.
+        self.motion_time_offset_us = 0
         self.destructible_maps = {}
         self.bot_orders = {"revision": 0, "orders": []}
         self.bot_reported_hits = set()
@@ -1029,6 +1040,13 @@ class BattleState:
         return max(0, int(round(
             (float(self._motion_clock()) - self._motion_clock_origin) *
             1000000.0)))
+
+    def _logical_motion_time_us(self, raw_time_us=None):
+        if raw_time_us is None:
+            raw_time_us = self._motion_time_us()
+        return min(
+            MAX_MOTION_TIME_US,
+            int(raw_time_us) + int(self.motion_time_offset_us))
 
     def _projectile_snapshot(self):
         result = []
@@ -1177,6 +1195,12 @@ class BattleState:
                 (self.phase not in ("loading", "battle") or p.participating))
         old = self.bot_authority_id
         self.bot_authority_id = connected[0] if connected else None
+        if old != self.bot_authority_id:
+            # A new producer has a new source-clock origin. The logical motion
+            # offset is round-scoped, however: dropping it here would make the
+            # public snapshot clock stall until raw time caught up.
+            self.bot_source_time_us = None
+            self.bot_source_receipt_time_us = None
         if (old != self.bot_authority_id and
                 self.client_build == CLIENT_BUILD_0922):
             self.authority_epoch += 1
@@ -1628,6 +1652,9 @@ class BattleState:
         self.bot_states = {}
         self.bot_state_revision = 0
         self.bot_state_time_us = 0
+        self.bot_source_time_us = None
+        self.bot_source_receipt_time_us = None
+        self.motion_time_offset_us = 0
         self.bot_planner.reset()
         self.server_authority = None
         self.pending_descriptor_names = ()
@@ -2334,8 +2361,7 @@ class BattleState:
                 "bot_authority_id": self.bot_authority_id,
                 "authority_epoch": self.authority_epoch,
                 "server_time_ms": self._server_time_ms(),
-                "motion_time_us": max(
-                    self._motion_time_us(), self.bot_state_time_us),
+                "motion_time_us": self._logical_motion_time_us(),
                 "bot_state_time_us": self.bot_state_time_us,
                 "players": [self._public_player(p) for p in self.players.values()
                             if p.connected and p.participating],
@@ -2611,8 +2637,10 @@ class BattleState:
 
     def update_bot_manifest(self, player_id, message):
         """Accept the canonical bot lineup from the elected simulation client."""
-        received_motion_time_us = self._motion_time_us()
+        received_raw_motion_time_us = self._motion_time_us()
         with self.lock:
+            received_motion_time_us = self._logical_motion_time_us(
+                received_raw_motion_time_us)
             if (not self._message_round_matches(message) or
                     self.phase not in ("loading", "battle") or
                     self.battle_result is not None or
@@ -3152,8 +3180,10 @@ class BattleState:
         current["combat_ack_seq"] = raw_seq
 
     def update_bot_states(self, player_id, message):
-        received_motion_time_us = self._motion_time_us()
+        received_raw_motion_time_us = self._motion_time_us()
         with self.lock:
+            received_motion_time_us = self._logical_motion_time_us(
+                received_raw_motion_time_us)
             self._clear_protocol_reject("bot_state")
             if not self._message_round_matches(message):
                 return self._set_protocol_reject(
@@ -3181,6 +3211,63 @@ class BattleState:
             if not self.bot_manifest:
                 return self._set_protocol_reject(
                     "bot_state", "manifest_missing", "manifest=empty")
+            source_time_us = None
+            if "sample_time_us" in message:
+                try:
+                    source_time_us = _exact_int(
+                        message.get("sample_time_us"), 0,
+                        MAX_MOTION_TIME_US)
+                except ValueError:
+                    return self._set_protocol_reject(
+                        "bot_state", "sample_time",
+                        "sample_time_us=%s" % message.get(
+                            "sample_time_us"))
+                if (self.bot_source_time_us is not None and
+                        source_time_us <= self.bot_source_time_us):
+                    return self._set_protocol_reject(
+                        "bot_state", "sample_time_order",
+                        "sample_time_us=%s previous=%s" % (
+                            source_time_us, self.bot_source_time_us))
+                if self.bot_source_time_us is None:
+                    next_bot_state_time_us = max(
+                        received_motion_time_us,
+                        self.bot_state_time_us + 1)
+                else:
+                    if self.bot_source_receipt_time_us is None:
+                        return self._set_protocol_reject(
+                            "bot_state", "sample_time_clock",
+                            "accepted source receipt origin is missing")
+                    source_delta_us = (
+                        source_time_us - self.bot_source_time_us)
+                    receipt_elapsed_us = max(
+                        0, received_raw_motion_time_us -
+                        self.bot_source_receipt_time_us)
+                    if source_delta_us > (
+                            receipt_elapsed_us +
+                            MAX_BOT_SAMPLE_LEAD_US):
+                        return self._set_protocol_reject(
+                            "bot_state", "sample_time_rate",
+                            ("sample_delta=%s receipt_elapsed=%s "
+                             "max_lead=%s") % (
+                                source_delta_us, receipt_elapsed_us,
+                                MAX_BOT_SAMPLE_LEAD_US))
+                    next_bot_state_time_us = (
+                        self.bot_state_time_us + source_delta_us)
+            elif self.bot_source_time_us is not None:
+                return self._set_protocol_reject(
+                    "bot_state", "sample_time_missing",
+                    "previous=%s" % self.bot_source_time_us)
+            else:
+                next_bot_state_time_us = max(
+                    received_motion_time_us, self.bot_state_time_us + 1)
+            if next_bot_state_time_us > MAX_MOTION_TIME_US:
+                return self._set_protocol_reject(
+                    "bot_state", "sample_time_range",
+                    "mapped_sample_time_us=%s" %
+                    next_bot_state_time_us)
+            next_motion_time_offset_us = max(
+                self.motion_time_offset_us,
+                next_bot_state_time_us - received_raw_motion_time_us)
             identities = {entry["id"]: entry for entry in self.bot_manifest}
             incoming = message.get("bots") or []
             if (not isinstance(incoming, (list, tuple)) or
@@ -3351,12 +3438,16 @@ class BattleState:
                 self.pending_events.append(event)
             self.pending_events.extend(shot_events)
             self._maybe_finish_battle()
-            # A worker can enqueue two accepted publications inside one
-            # coarse Windows monotonic-clock quantum.  Every new revision is
-            # nevertheless a distinct pose sample, so its wire timestamp must
-            # advance with the revision instead of repeating the prior time.
-            self.bot_state_time_us = max(
-                received_motion_time_us, self.bot_state_time_us + 1)
+            # New authorities publish their actual integrated-time clock.
+            # Mapping its deltas onto the server epoch keeps native probe and
+            # serialization duration out of the pose velocity. Older clients
+            # retain receipt-time stamping until they opt into this field.
+            self.bot_state_time_us = next_bot_state_time_us
+            self.motion_time_offset_us = next_motion_time_offset_us
+            if source_time_us is not None:
+                self.bot_source_time_us = source_time_us
+                self.bot_source_receipt_time_us = (
+                    received_raw_motion_time_us)
             self.bot_state_revision += 1
             return True
 
@@ -5908,8 +5999,7 @@ class BattleState:
                 snapshot.update({
                     "authority_epoch": self.authority_epoch,
                     "server_time_ms": tick_server_time_ms,
-                    "motion_time_us": max(
-                        self._motion_time_us(), self.bot_state_time_us),
+                    "motion_time_us": self._logical_motion_time_us(),
                     "bot_state_time_us": self.bot_state_time_us,
                     "projectile_revision": self.projectile_revision,
                     "projectiles": self._projectile_snapshot(),

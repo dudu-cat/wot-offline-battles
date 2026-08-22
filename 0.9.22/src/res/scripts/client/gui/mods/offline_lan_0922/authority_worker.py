@@ -14,9 +14,10 @@ import time
 
 from gui.mods.offline_lan_0922 import config as port_config
 from gui.mods.offline_lan_0922.lan_client import (
-    CLIENT_BUILD, CLIENT_CAPABILITIES, MAX_PROJECTILE_ID, PROTOCOL_VERSION,
-    PROJECTILE_LEDGER_CAPABILITY, SIMULATION_WORKER_CAPABILITY,
-    WORKER_AUTHORITY_ID, LANClient, _BOT_STATE_WIRE_FIELDS,
+    CLIENT_BUILD, CLIENT_CAPABILITIES, MAX_MOTION_TIME_US,
+    MAX_PROJECTILE_ID, PROTOCOL_VERSION, PROJECTILE_LEDGER_CAPABILITY,
+    SIMULATION_WORKER_CAPABILITY, WORKER_AUTHORITY_ID, LANClient,
+    _BOT_STATE_WIRE_FIELDS,
     _canonical_wire_outfits, _exact_int, _projectile_int_range, _safe_text,
     _strict_capabilities, _strict_mapping_list)
 
@@ -99,13 +100,20 @@ class AuthorityWorkerLANClient(LANClient):
             'role': WORKER_ROLE,
         }
 
-    def send_projected_bot_state(self, bots):
+    def send_projected_bot_state(self, bots, sample_time_us=None):
         """Queue BotRuntime's canonical publication as one frozen wire blob."""
         if (not self.is_bot_authority() or
                 not _trusted_projected_bot_states(bots)):
             return False
-        return self._send_preencoded_trusted({
-            'type': 'bot_state', 'round_id': self.round_id, 'bots': bots})
+        message = {
+            'type': 'bot_state', 'round_id': self.round_id, 'bots': bots}
+        if sample_time_us is not None:
+            sample_time_us = _exact_int(sample_time_us)
+            if (sample_time_us is None or
+                    not 0 <= sample_time_us <= MAX_MOTION_TIME_US):
+                return False
+            message['sample_time_us'] = sample_time_us
+        return self._send_preencoded_trusted(message)
 
     def send_simulation_progress(self, frame_seq):
         """Prove that the native BattleRuntime frame callback is advancing."""

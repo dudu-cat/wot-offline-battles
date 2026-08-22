@@ -61,6 +61,25 @@ class LanClientQueueTests(unittest.TestCase):
             client._outbound_accepting = True
         return client
 
+    def test_notify_reports_socket_to_main_thread_dispatch_delay(self):
+        events = []
+        client = LANClient(
+            '127.0.0.1', 28782, 'P', 'ussr:MS-1',
+            on_event=lambda kind, message: events.append((kind, message)),
+            bigworld=QueueBigWorld())
+        message = {
+            'type': 'snapshot', '_client_received_time': 10.0}
+        original_clock = lan_client_module._monotonic_time
+        lan_client_module._monotonic_time = lambda: 10.017
+        try:
+            client._notify('snapshot', message)
+        finally:
+            lan_client_module._monotonic_time = original_clock
+
+        self.assertAlmostEqual(
+            0.017, events[0][1]['_client_dispatch_delay'])
+        self.assertNotIn('_client_dispatch_delay', message)
+
     def test_reliable_fifo_freezes_all_state_without_coalescing(self):
         client = self.activate()
         first = {'type': 'input', 'nested': {'values': [1, 2]}}
@@ -159,9 +178,11 @@ class LanClientQueueTests(unittest.TestCase):
         unused_frozen, full_size = lan_client_module._freeze_outbound(
             full_message, [0])
 
-        self.assertTrue(client.send_bot_state(states))
+        self.assertTrue(client.send_bot_state(
+            states, sample_time_us=40000))
 
         queued = client._outbound_queue[0]
+        self.assertEqual(40000, queued[1]['sample_time_us'])
         queued_bots = queued[1]['bots']
         expected = {
             'id', 'x', 'y', 'z', 'yaw', 'pitch', 'roll',

@@ -1247,6 +1247,8 @@ class _BigWorld(object):
         self.pending_visibility_masks = {}
         self.space_data_factory = _SpaceData
         self.mapped_visibility_masks = []
+        self.mapped_gui_visibility = []
+        self.gui_visibility = True
         self.legacy_visibility_calls = []
         self.reset_visibility_before_ready = False
 
@@ -1356,9 +1358,12 @@ class _BigWorld(object):
 
     def setWatcher(self, name, enabled):
         self.operations.append(('watcher', name, enabled))
+        if name == 'Visibility/GUI':
+            self.gui_visibility = bool(enabled)
 
     def addSpaceGeometryMapping(self, space_id, unused_mapper, unused_path):
         space_id = int(space_id)
+        self.mapped_gui_visibility.append(self.gui_visibility)
         if space_id not in self.spaces:
             visibility_mask = self.pending_visibility_masks.pop(
                 space_id, 0xffffffff)
@@ -4448,9 +4453,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             [('account_retire',), ('hangar_destroy',),
              ('clear_entities_spaces',),
+             ('watcher', 'Visibility/GUI', True),
              ('space_visibility', 7, 0x00000001),
-             ('map_create', '01_karelia'),
-             ('watcher', 'Visibility/GUI', True)],
+             ('map_create', '01_karelia')],
             runtime.bigworld.operations)
         self.assertEqual([0x00000001],
                          runtime.bigworld.mapped_visibility_masks)
@@ -4590,6 +4595,40 @@ class BattleRuntimeContractTests(unittest.TestCase):
             runtime.bigworld.legacy_visibility_calls)
         self.assertEqual([(4, 5)], runtime.app_loader.transitions)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
+
+    def test_native_map_restores_gui_visibility_before_mapping(self):
+        runtime = _runtime()
+        runtime.arena_cache = {2: types.SimpleNamespace(
+            geometryName='02_malinovka', gameplayName='ctf', gameplayID=0)}
+        stock_create = runtime.offline_map_creator.create
+
+        def create_with_viewer_visibility_disabled(map_name):
+            # Exact #1513 OfflineMapCreator.create() disables this watcher
+            # before createSpace(), unlike the compact general test double.
+            runtime.bigworld.setWatcher('Visibility/GUI', False)
+            return stock_create(map_name)
+
+        runtime.offline_map_creator.create = \
+            create_with_viewer_visibility_disabled
+        battle = BattleRuntime(runtime)
+
+        self.assertTrue(battle.start({
+            'map': '02_malinovka', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {
+                'round_id': 1, 'map': '02_malinovka',
+                'bot_authority_id': 1,
+                'players': [{
+                    'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                    'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+                'bots': []}, _Client()))
+
+        self.assertEqual([True], runtime.bigworld.mapped_gui_visibility)
+        self.assertEqual([1], runtime.bigworld.mapped_visibility_masks)
+        self.assertLess(
+            runtime.bigworld.operations.index(
+                ('watcher', 'Visibility/GUI', True)),
+            runtime.bigworld.operations.index(
+                ('space_visibility', 7, 1)))
 
     def test_native_map_does_not_require_live_space_before_mapping(self):
         runtime = _runtime()
@@ -13639,6 +13678,13 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         battle.client.send_projected_bot_state.assert_called_once_with(bots)
         battle.client.send_bot_state.assert_not_called()
+
+        battle.client.send_projected_bot_state.reset_mock()
+        self.assertTrue(battle._send_bot_message({
+            'type': 'bot_state', 'bots': bots,
+            'sample_time_us': 40000}))
+        battle.client.send_projected_bot_state.assert_called_once_with(
+            bots, sample_time_us=40000)
 
     def test_snapshot_health_is_forwarded_to_authority_runtime(self):
         battle = BattleRuntime(_runtime())

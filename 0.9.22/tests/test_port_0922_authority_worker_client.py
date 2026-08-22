@@ -248,7 +248,8 @@ class AuthorityWorkerClientTests(unittest.TestCase):
             with mock.patch.object(
                     lan_client_module.json, 'dumps',
                     side_effect=recording_dumps):
-                self.assertTrue(client.send_projected_bot_state([state]))
+                self.assertTrue(client.send_projected_bot_state(
+                    [state], sample_time_us=40000))
                 state['x'] = 99.0
                 state['critical']['devices'][0]['hp'] = 1.0
                 generation = client._transport_generation
@@ -262,6 +263,7 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         self.assertEqual(1, len(client.sock.sent))
         self.assertEqual(queued[2], len(client.sock.sent[0]))
         wire = json.loads(client.sock.sent[0].decode('utf-8'))
+        self.assertEqual(40000, wire['sample_time_us'])
         self.assertEqual(1.0, wire['bots'][0]['x'])
         self.assertEqual(100.0,
                          wire['bots'][0]['critical']['devices'][0]['hp'])
