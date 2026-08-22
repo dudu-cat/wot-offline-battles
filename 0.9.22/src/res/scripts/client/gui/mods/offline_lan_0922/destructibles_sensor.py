@@ -1006,6 +1006,42 @@ def _motion_travel_reach(vel, dt):
 	return max(0.4, abs(float(vel)) * max(0.0, float(dt)) + 0.2)
 
 
+def _broken_collision_filter(members):
+	"""Return one native filter for the exact broken identities in ``members``."""
+	if not members:
+		return None
+	authority = _get_destr_authority()
+	# The production authority always exposes its accepted-key ledger.  Keep
+	# injected compatibility/test seams fail-closed instead of guessing from an
+	# ``is_destroyed`` result that cannot enumerate structure materials.
+	if not callable(getattr(authority, 'destroyed_keys', None)):
+		return None
+	broken = set()
+	for chunk_id, item_index in members:
+		for mat_kind in _broken_item_materials_1513(
+				authority, chunk_id).get(int(item_index), ()):
+			broken.add((int(chunk_id), int(item_index), mat_kind))
+	if not broken:
+		return None
+
+	def reject_broken_skin(*hit):
+		# #1513 passes (matKind, collFlags, itemIndex, chunkID).  Keeping
+		# every unrecognised surface means a backing wall is still returned by
+		# the same native query after the broken skin is skipped.
+		try:
+			identity = (int(hit[3]), int(hit[2]))
+		except (IndexError, TypeError, ValueError, OverflowError):
+			return True
+		if (identity + (hit[0],)) not in broken and (
+				identity + (None,)) not in broken:
+			return True
+		globals()['g_offh_destr_ground_skips'] = globals().get(
+			'g_offh_destr_ground_skips', 0) + 1
+		return False
+
+	return reject_broken_skin
+
+
 def ground_collision_filter(x, z):
 	"""Return a ``wg_collideSegment`` filter that hides broken destructibles.
 
@@ -1022,32 +1058,33 @@ def ground_collision_filter(x, z):
 	if not contact_bins:
 		return None
 	members = contact_bins.get(_destructible_bin_key(x, z))
-	if not members:
-		return None
-	authority = _get_destr_authority()
-	broken = set()
-	for chunk_id, item_index in members:
-		for mat_kind in _broken_item_materials_1513(
-				authority, chunk_id).get(int(item_index), ()):
-			broken.add((int(chunk_id), int(item_index), mat_kind))
-	if not broken:
-		return None
+	return _broken_collision_filter(members)
 
-	def reject_broken_skin(*hit):
-		# This runs inside a native ray query.  It reads local state only and
-		# keeps the surface whenever the identity cannot be resolved.
-		try:
-			identity = (int(hit[3]), int(hit[2]))
-		except (IndexError, TypeError, ValueError, OverflowError):
-			return True
-		if (identity + (hit[0],)) not in broken and (
-				identity + (None,)) not in broken:
-			return True
-		globals()['g_offh_destr_ground_skips'] = globals().get(
-			'g_offh_destr_ground_skips', 0) + 1
-		return False
 
-	return reject_broken_skin
+def horizontal_collision_filter(start, end):
+	"""Hide exact broken identities from one horizontal hull ray.
+
+	The native callback is safer than treating a 0.2-second hide window as a
+	blanket pass: the engine skips only the accepted ``(chunk, item, material)``
+	and immediately returns an unrelated prop or backing wall on the same ray.
+	"""
+	if _destructible_catalog is None:
+		return None
+	contact_bins = globals().get('g_offh_destr_contact_bins')
+	if not contact_bins:
+		return None
+	try:
+		keys = _bin_keys_for_bounds(
+			min(float(start.x), float(end.x)),
+			max(float(start.x), float(end.x)),
+			min(float(start.z), float(end.z)),
+			max(float(start.z), float(end.z)))
+	except (AttributeError, TypeError, ValueError):
+		return None
+	members = set()
+	for key in keys:
+		members.update(contact_bins.get(key, ()))
+	return _broken_collision_filter(members)
 
 
 def _broken_item_materials_1513(authority, chunkID):

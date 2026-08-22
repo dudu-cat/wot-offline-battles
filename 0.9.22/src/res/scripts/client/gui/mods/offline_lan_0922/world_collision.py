@@ -3,13 +3,24 @@
 
 from gui.mods.offline_lan_0922.destructibles_sensor import (
 	_catalog_soft_static_path, _diagnostic_static_recast_1513,
-	_try_destroy_solid_hit, _vehicle_hull_bbox)
+	_try_destroy_solid_hit, _vehicle_hull_bbox,
+	horizontal_collision_filter)
 
 
 _MAX_DRIVABLE_GRADIENT = 1.28
 _MAX_DESCENDING_GRADIENT = 1.75
 _MIN_DRIVABLE_HEIGHT_CHANGE = 0.15
 _WORLD_SOFT_RECAST_BUDGET = 4
+
+
+def _collide_horizontal(spaceID, start, end):
+	"""Raycast while hiding only exact destructibles already marked broken."""
+	import BigWorld
+	broken_filter = horizontal_collision_filter(start, end)
+	if broken_filter is None:
+		return BigWorld.wg_collideSegment(spaceID, start, end, 128)
+	return BigWorld.wg_collideSegment(
+		spaceID, start, end, 128, broken_filter)
 
 
 def _profile_gradient_limit(heights):
@@ -89,7 +100,7 @@ def _raised_ray_has_wall(spaceID, Math, pos, x1, z1, x2, z2,
 	for height in (1.1, 1.6):
 		start = Math.Vector3(x1, pos.y + height, z1)
 		end = Math.Vector3(x2, pos.y + height, z2)
-		collision = BigWorld.wg_collideSegment(spaceID, start, end, 128)
+		collision = _collide_horizontal(spaceID, start, end)
 		if collision is None:
 			continue
 		if ((collision[0] - start).length < target_length and
@@ -109,8 +120,7 @@ def _solid_contact_cleared(spaceID, segment_start, segment_end, vel, td):
 	or an over-budget chain remains solid.
 	"""
 	import BigWorld
-	recast = BigWorld.wg_collideSegment(
-		spaceID, segment_start, segment_end, 128)
+	recast = _collide_horizontal(spaceID, segment_start, segment_end)
 	if recast is None:
 		return True
 	return _catalog_soft_static_path(
@@ -246,7 +256,7 @@ def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None,
 			# Spodní paprsek pro pevnou geometrii (0.6m nad zemí)
 			start_bot = Math.Vector3(x1, pos.y + 0.6, z1)
 			end_bot = Math.Vector3(x2, pos.y + 0.6, z2)
-			col_bot = BigWorld.wg_collideSegment(spaceID, start_bot, end_bot, 128)
+			col_bot = _collide_horizontal(spaceID, start_bot, end_bot)
 			target_len = (abs(back_margin) +
 				(hl_front if vel > 0 else hl_back) + _ahead)
 			
@@ -298,8 +308,8 @@ def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None,
 					for _height in (1.1, 1.6):
 						_ray_start = Math.Vector3(x1, pos.y + _height, z1)
 						_ray_end = Math.Vector3(x2, pos.y + _height, z2)
-						_ray_hit = BigWorld.wg_collideSegment(
-							spaceID, _ray_start, _ray_end, 128)
+						_ray_hit = _collide_horizontal(
+							spaceID, _ray_start, _ray_end)
 						if _ray_hit is None:
 							continue
 						_ray_distance = (_ray_hit[0] - _ray_start).length
@@ -324,8 +334,8 @@ def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None,
 				for _height in (1.1, 1.6):
 					_ray_start = Math.Vector3(x1, pos.y + _height, z1)
 					_ray_end = Math.Vector3(x2, pos.y + _height, z2)
-					_ray_hit = BigWorld.wg_collideSegment(
-						spaceID, _ray_start, _ray_end, 128)
+					_ray_hit = _collide_horizontal(
+						spaceID, _ray_start, _ray_end)
 					if _ray_hit is None:
 						continue
 					_ray_distance = (_ray_hit[0] - _ray_start).length

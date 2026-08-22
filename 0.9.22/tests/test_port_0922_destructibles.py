@@ -3399,6 +3399,22 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertTrue(ground_filter(73, 0, 37, 22))
         self.assertFalse(ground_filter(74, 0, 37, 22))
 
+    def test_horizontal_filter_covers_every_bin_crossed_by_the_hull_ray(self):
+        authority = self._ground_filter_fixture(set([(37, None)]))
+
+        with mock.patch.object(
+                destructibles_sensor, '_get_destr_authority',
+                return_value=authority):
+            collision_filter = (
+                destructibles_sensor.horizontal_collision_filter(
+                    _Vector(0.0, 0.6, -1.0),
+                    _Vector(0.0, 0.6, 10.0)))
+
+        self.assertIsNotNone(collision_filter)
+        self.assertFalse(collision_filter(75, 0, 37, 22))
+        self.assertTrue(collision_filter(75, 0, 38, 22))
+        self.assertTrue(collision_filter(75, 0, 37, 23))
+
     def test_stationary_multi_module_structure_crushes_each_module(self):
         detail, authority, unused_descriptor = (
             self._stationary_contact_status([{

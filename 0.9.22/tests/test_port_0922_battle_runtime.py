@@ -3,6 +3,7 @@ import io
 import math
 from pathlib import Path
 import pickle
+import struct
 import sys
 import types
 import unittest
@@ -1153,8 +1154,7 @@ class _OfflineMap(object):
         if self.bigworld is not None:
             # Match exact #1513 OfflineMapCreator.create(): createSpace() does
             # not publish a BigWorld.spaces entry before geometry mapping.
-            # The stock hangar path primes native visibility through
-            # wg_setSpaceItemsVisibilityMask at this same boundary.
+            self.bigworld.setWatcher('Visibility/GUI', False)
             self.bigworld.addSpaceGeometryMapping(
                 7, None, 'spaces/' + map_name)
             self.bigworld.operations.append(('map_create', map_name))
@@ -1224,6 +1224,58 @@ class _SpaceData(object):
             ('space_visibility', self._space_id, mask))
 
 
+def _compiled_space_binary(masks=(0xffffff89, 0xffffff82,
+                                  0xffffff89, 0xffffff84)):
+    records = bytearray()
+    for index, mask in enumerate(masks):
+        record = bytearray(124)
+        struct.pack_into('<II', record, 68, index % 3, index + 1)
+        struct.pack_into('<I', record, 120, mask)
+        records.extend(record)
+    section = struct.pack('<II', 124, len(masks)) + bytes(records)
+    directory_end = 48
+    return (struct.pack('<4s5I', b'BWTB', 1, directory_end, 0, 0, 1) +
+            struct.pack('<4s5I', b'WTCP', 2, directory_end, 0,
+                        len(section), 0) + section)
+
+
+def _control_point_masks(binary):
+    unused_magic, unused_version, unused_end, unused_a, unused_b, count = \
+        struct.unpack_from('<4s5I', binary, 0)
+    for index in range(count):
+        row = struct.unpack_from('<4s5I', binary, 24 + index * 24)
+        if row[0] != b'WTCP':
+            continue
+        record_size, record_count = struct.unpack_from('<II', binary, row[2])
+        return [struct.unpack_from(
+            '<I', binary, row[2] + 8 + item * record_size + 120)[0]
+                for item in range(record_count)]
+    return []
+
+
+class _DataSection(object):
+    def __init__(self, binary):
+        self.asBinary = binary
+
+
+class _ResMgr(object):
+    def __init__(self, operations):
+        self.operations = operations
+        self.original = _compiled_space_binary()
+        self.sections = {}
+        self.purges = []
+
+    def openSection(self, path):
+        if path not in self.sections:
+            self.sections[path] = _DataSection(self.original)
+        return self.sections[path]
+
+    def purge(self, path, recursive):
+        self.operations.append(('purge', path, bool(recursive)))
+        self.purges.append((path, bool(recursive)))
+        self.sections.pop(path, None)
+
+
 class _BigWorld(object):
     def __init__(self, avatar, compatibility):
         self.avatar = avatar
@@ -1247,10 +1299,12 @@ class _BigWorld(object):
         self.pending_visibility_masks = {}
         self.space_data_factory = _SpaceData
         self.mapped_visibility_masks = []
+        self.mapped_control_point_masks = []
         self.mapped_gui_visibility = []
         self.gui_visibility = True
         self.legacy_visibility_calls = []
         self.reset_visibility_before_ready = False
+        self.res_mgr = None
 
     def player(self):
         return self.avatar
@@ -1361,12 +1415,16 @@ class _BigWorld(object):
         if name == 'Visibility/GUI':
             self.gui_visibility = bool(enabled)
 
-    def addSpaceGeometryMapping(self, space_id, unused_mapper, unused_path):
+    def addSpaceGeometryMapping(self, space_id, unused_mapper, path):
         space_id = int(space_id)
         self.mapped_gui_visibility.append(self.gui_visibility)
+        if self.res_mgr is not None:
+            section = self.res_mgr.openSection(path + '/space.bin')
+            self.mapped_control_point_masks.append([
+                mask for mask in _control_point_masks(section.asBinary)
+                if mask])
         if space_id not in self.spaces:
-            visibility_mask = self.pending_visibility_masks.pop(
-                space_id, 0xffffffff)
+            visibility_mask = 0xffffffff
             self.spaces[space_id] = self.space_data_factory(
                 self.operations, space_id, visibility_mask)
         self.mapped_visibility_masks.append(
@@ -1385,13 +1443,8 @@ class _BigWorld(object):
     def wg_setSpaceItemsVisibilityMask(self, space_id, mask):
         space_id = int(space_id)
         self.legacy_visibility_calls.append(('set', space_id, mask))
-        if space_id in self.spaces:
-            # The mapped client-only space is maintained through its typed
-            # itemsVisibilityMask property, not these inert legacy exports.
-            return
-        else:
-            self.pending_visibility_masks[space_id] = mask
-            self.operations.append(('space_visibility', space_id, mask))
+        # Exact #1513 export is inert for both mapped and unmapped spaces.
+        return
 
     def clearAllSpaces(self):
         self.clearEntitiesAndSpaces()
@@ -1442,6 +1495,8 @@ def _runtime():
     avatar = _Avatar()
     compatibility = _Compatibility()
     bigworld = _BigWorld(avatar, compatibility)
+    res_mgr = _ResMgr(bigworld.operations)
+    bigworld.res_mgr = res_mgr
     compatibility.bigworld = bigworld
     hangar_space = _HangarSpace(bigworld.operations)
     compatibility.hangar_space = hangar_space
@@ -1588,6 +1643,7 @@ def _runtime():
             setupVehicleFashion=lambda fashion, descriptor, crashed: True,
             createVehicleFilter=lambda descriptor: _VehicleFilter()),
         offline_map_creator=_OfflineMap(bigworld, app_loader),
+        res_mgr=res_mgr,
         navigation_graph_loader=navigation_graph_loader,
         vehicle_view_state=types.SimpleNamespace(RPM='rpm'),
         feedback_event_id=types.SimpleNamespace(VEHICLE_DEAD=17),
@@ -4453,15 +4509,14 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             [('account_retire',), ('hangar_destroy',),
              ('clear_entities_spaces',),
+             ('watcher', 'Visibility/GUI', False),
+             ('map_create', '01_karelia'),
              ('watcher', 'Visibility/GUI', True),
-             ('space_visibility', 7, 0x00000001),
-             ('map_create', '01_karelia')],
+             ('space_visibility', 7, 0x00000001)],
             runtime.bigworld.operations)
-        self.assertEqual([0x00000001],
+        self.assertEqual([0xffffffff],
                          runtime.bigworld.mapped_visibility_masks)
-        self.assertEqual(
-            [('set', 7, 0x00000001)],
-            runtime.bigworld.legacy_visibility_calls)
+        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
         self.assertNotIn(
             'addSpaceGeometryMapping', runtime.bigworld.__dict__)
         self.assertEqual(0, runtime.offline_map_creator.viewer_camera_calls)
@@ -4479,7 +4534,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.app_loader.showBattlePage()
         type(runtime.app_loader).battle_page_calls.assert_called_once_with()
 
-    def test_malinovka_mapping_sees_only_ctf_visibility_bit(self):
+    def test_malinovka_mapping_filters_non_ctf_control_points(self):
         class _UnsignedMask(int):
             def __int__(self):
                 raise OverflowError('32-bit Python cannot narrow this mask')
@@ -4506,62 +4561,91 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             0x00000001,
             runtime.bigworld.spaces[7].itemsVisibilityMask)
-        self.assertEqual([0x00000001],
+        self.assertEqual([0xffffffff],
                          runtime.bigworld.mapped_visibility_masks)
-        self.assertEqual(
-            [('set', 7, 0x00000001)],
-            runtime.bigworld.legacy_visibility_calls)
+        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
 
         # Exact #1513 Malinovka WTCP records: both CTF bases include bit 0;
-        # the neutral domination control point includes bit 1 but not bit 0.
-        mapped_mask = runtime.bigworld.mapped_visibility_masks[0]
-        self.assertTrue(0xffffff89 & mapped_mask)
-        self.assertFalse(0xffffff82 & mapped_mask)
-
-    def test_late_client_visibility_update_keeps_malinovka_ctf_bit(self):
-        updates = []
-
-        class _ClientVisibilityFlags(object):
-            CLIENT_MASK = 0xfff00000
-            SERVER_MASK = 0x000fffff
-
-            @staticmethod
-            def updateSpaceVisibility(space_id, client_flags):
-                updates.append((space_id, client_flags))
-
-        original = _ClientVisibilityFlags.__dict__[
-            'updateSpaceVisibility']
-        runtime = _runtime()
-        runtime.client_visibility_flags = _ClientVisibilityFlags
-        battle = BattleRuntime(runtime)
-        battle._standard_space_visibility = (
-            7, 0x00000001,
-            _ClientVisibilityFlags.CLIENT_MASK,
-            _ClientVisibilityFlags.SERVER_MASK)
-
-        self.assertTrue(
-            battle._install_standard_space_visibility_guard())
-        _ClientVisibilityFlags.updateSpaceVisibility(7, 0x00400000)
-
-        # Exact #1513's legacy getter returns zero for a client-only mapped
-        # space.  The guarded stock call must nevertheless keep CTF bit 0 and
-        # must never publish zero, which instantiates Malinovka's neutral
-        # domination ControlPoint.
-        self.assertEqual([], updates)
+        # the neutral domination and base-3 records do not and are zero before
+        # the broad client-only mapping mask reaches the native WTCP handler.
         self.assertEqual(
-            ('set', 7, 0x00400001),
-            runtime.bigworld.legacy_visibility_calls[-1])
+            [[0xffffff89, 0xffffff89]],
+            runtime.bigworld.mapped_control_point_masks)
+        section = runtime.res_mgr.sections[
+            'spaces/02_malinovka/space.bin']
+        self.assertEqual(
+            [0xffffff89, 0, 0xffffff89, 0],
+            _control_point_masks(section.asBinary))
+        self.assertIs(section, battle._compiled_space_resource[2])
 
-        # An unrelated space still uses the stock implementation.
-        _ClientVisibilityFlags.updateSpaceVisibility(8, 0x00800000)
-        self.assertEqual([(8, 0x00800000)], updates)
-        self.assertTrue(
-            battle._restore_standard_space_visibility_guard())
-        self.assertIs(
-            original,
-            _ClientVisibilityFlags.__dict__['updateSpaceVisibility'])
+    def test_compiled_control_point_resource_is_purged_after_map_cleanup(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
 
-    def test_native_map_primes_visibility_with_stock_setter(self):
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {
+                'round_id': 1, 'map': '01_karelia',
+                'bot_authority_id': 1,
+                'players': [{
+                    'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                    'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+                'bots': []}, _Client()))
+
+        path = 'spaces/01_karelia/space.bin'
+        self.assertIn(path, runtime.res_mgr.sections)
+        battle._cleanup()
+
+        self.assertEqual([(path, True)], runtime.res_mgr.purges)
+        self.assertLess(
+            runtime.bigworld.operations.index(('clear_entities_spaces',)),
+            runtime.bigworld.operations.index(('purge', path, True)))
+        self.assertIsNone(battle._compiled_space_resource)
+        self.assertEqual(
+            [0xffffff89, 0xffffff82, 0xffffff89, 0xffffff84],
+            _control_point_masks(
+                runtime.res_mgr.openSection(path).asBinary))
+
+    def test_compiled_control_point_filter_rejects_truncated_wtcp(self):
+        binary = _compiled_space_binary()
+        truncated = binary[:-1]
+
+        with self.assertRaisesRegex(
+                ValueError, 'outside the container'):
+            battle_runtime_module._filter_compiled_control_points(
+                truncated, 1)
+
+        self.assertEqual(
+            [0xffffff89, 0xffffff82, 0xffffff89, 0xffffff84],
+            _control_point_masks(binary))
+
+    def test_compiled_control_point_filter_accepts_missing_wtcp(self):
+        binary = struct.pack('<4s5I', b'BWTB', 1, 24, 0, 0, 0)
+
+        patched, replacements = \
+            battle_runtime_module._filter_compiled_control_points(binary, 1)
+
+        self.assertEqual(binary, patched)
+        self.assertEqual(0, replacements)
+
+    def test_retained_compiled_resource_blocks_next_start_before_lobby(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        retained = (
+            runtime.res_mgr, 'spaces/01_karelia/space.bin',
+            runtime.res_mgr.openSection('spaces/01_karelia/space.bin'))
+        battle._compiled_space_resource = retained
+        battle.state = 'stopped'
+
+        self.assertFalse(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, {}, _Client()))
+
+        self.assertIs(retained, battle._compiled_space_resource)
+        self.assertEqual([], runtime.bigworld.operations)
+        self.assertIn('still retained', battle.error)
+
+    def test_native_map_does_not_use_inert_legacy_visibility_setter(self):
         runtime = _runtime()
         original_set_mask = runtime.bigworld.wg_setSpaceItemsVisibilityMask
         live_space_at_write = []
@@ -4586,30 +4670,18 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(
             1, runtime.bigworld.spaces[7].itemsVisibilityMask)
-        self.assertEqual([1], runtime.bigworld.mapped_visibility_masks)
-        self.assertEqual([False], live_space_at_write)
-        runtime.bigworld.wg_setSpaceItemsVisibilityMask.assert_called_once_with(
-            7, 1)
-        self.assertEqual(
-            [('set', 7, 1)],
-            runtime.bigworld.legacy_visibility_calls)
+        self.assertEqual([0xffffffff],
+                         runtime.bigworld.mapped_visibility_masks)
+        self.assertEqual([], live_space_at_write)
+        runtime.bigworld.wg_setSpaceItemsVisibilityMask.assert_not_called()
+        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
         self.assertEqual([(4, 5)], runtime.app_loader.transitions)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
 
-    def test_native_map_restores_gui_visibility_before_mapping(self):
+    def test_native_map_restores_gui_visibility_after_mapping(self):
         runtime = _runtime()
         runtime.arena_cache = {2: types.SimpleNamespace(
             geometryName='02_malinovka', gameplayName='ctf', gameplayID=0)}
-        stock_create = runtime.offline_map_creator.create
-
-        def create_with_viewer_visibility_disabled(map_name):
-            # Exact #1513 OfflineMapCreator.create() disables this watcher
-            # before createSpace(), unlike the compact general test double.
-            runtime.bigworld.setWatcher('Visibility/GUI', False)
-            return stock_create(map_name)
-
-        runtime.offline_map_creator.create = \
-            create_with_viewer_visibility_disabled
         battle = BattleRuntime(runtime)
 
         self.assertTrue(battle.start({
@@ -4622,13 +4694,20 @@ class BattleRuntimeContractTests(unittest.TestCase):
                     'vehicle': 'ussr:R11_MS-1', 'health': 500}],
                 'bots': []}, _Client()))
 
-        self.assertEqual([True], runtime.bigworld.mapped_gui_visibility)
-        self.assertEqual([1], runtime.bigworld.mapped_visibility_masks)
+        self.assertEqual([False], runtime.bigworld.mapped_gui_visibility)
+        self.assertTrue(runtime.bigworld.gui_visibility)
+        self.assertEqual([0xffffffff],
+                         runtime.bigworld.mapped_visibility_masks)
         self.assertLess(
             runtime.bigworld.operations.index(
-                ('watcher', 'Visibility/GUI', True)),
+                ('watcher', 'Visibility/GUI', False)),
             runtime.bigworld.operations.index(
-                ('space_visibility', 7, 1)))
+                ('map_create', '02_malinovka')))
+        self.assertLess(
+            runtime.bigworld.operations.index(
+                ('map_create', '02_malinovka')),
+            runtime.bigworld.operations.index(
+                ('watcher', 'Visibility/GUI', True)))
 
     def test_native_map_does_not_require_live_space_before_mapping(self):
         runtime = _runtime()
@@ -4654,7 +4733,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'bots': []}, _Client()))
 
         self.assertEqual([False], live_space_at_mapping)
-        self.assertEqual([1], runtime.bigworld.mapped_visibility_masks)
+        self.assertEqual([0xffffffff],
+                         runtime.bigworld.mapped_visibility_masks)
         self.assertIs(
             add_mapping,
             runtime.bigworld.__dict__['addSpaceGeometryMapping'])
@@ -4684,7 +4764,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'map': '02_malinovka', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, start, _Client()))
 
-        self.assertEqual([0x00000001],
+        self.assertEqual([0xffffffff],
                          runtime.bigworld.mapped_visibility_masks)
         self.assertIsNotNone(battle._standard_space_visibility)
         self.assertFalse(battle._space_visibility_warning_reported)
@@ -4893,7 +4973,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(1, runtime.app_loader.lobby_disposals)
         self.assertEqual(0, runtime.app_loader.lobby_listener_balance)
 
-    def test_visibility_setter_failure_does_not_abort_loaded_battle(self):
+    def test_inert_legacy_visibility_setter_is_never_consulted(self):
         runtime = _runtime()
         write_count = [0]
         original_set_mask = runtime.bigworld.wg_setSpaceItemsVisibilityMask
@@ -4928,7 +5008,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
                          runtime.bigworld.mapped_visibility_masks)
         self.assertEqual(
             1, runtime.bigworld.spaces[7].itemsVisibilityMask)
-        self.assertTrue(battle._space_visibility_warning_reported)
+        self.assertEqual(0, write_count[0])
+        self.assertFalse(battle._space_visibility_warning_reported)
 
     def test_legacy_zero_readback_does_not_abort_mapped_battle(self):
         runtime = _runtime()
@@ -4988,9 +5069,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(1,
                          runtime.bigworld.spaces[7].itemsVisibilityMask)
-        self.assertEqual(
-            [('set', 7, 1)],
-            runtime.bigworld.legacy_visibility_calls)
+        self.assertEqual([], runtime.bigworld.legacy_visibility_calls)
         self.assertFalse(battle._space_visibility_warning_reported)
 
     def test_typed_visibility_write_failure_does_not_abort_battle(self):
@@ -12996,6 +13075,23 @@ class BattleRuntimeContractTests(unittest.TestCase):
             ('retire',), ('destroy',), ('mapping', 7, 3),
             ('clear', 7), ('release', 7)], calls)
         self.assertNotIn(7, client_spaces)
+
+    def test_cleanup_retains_compiled_resource_when_space_release_fails(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._map_create_attempted = True
+        path = 'spaces/01_karelia/space.bin'
+        retained = (
+            runtime.res_mgr, path, runtime.res_mgr.openSection(path))
+        battle._compiled_space_resource = retained
+        battle._release_retained_client_space = mock.Mock(
+            return_value=RuntimeError('space release failed'))
+
+        with self.assertRaisesRegex(RuntimeError, 'space release failed'):
+            battle._cleanup()
+
+        self.assertIs(retained, battle._compiled_space_resource)
+        self.assertEqual([], runtime.res_mgr.purges)
 
     def test_lan_disconnect_still_restores_fake_account(self):
         runtime = _runtime()

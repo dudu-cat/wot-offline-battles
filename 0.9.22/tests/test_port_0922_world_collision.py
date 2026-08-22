@@ -336,6 +336,80 @@ class WorldCollisionTests(unittest.TestCase):
         self.assertEqual(1, collide.call_count)
         self.assertGreater(collide.call_args[0][1].z, 4.5)
 
+    def test_native_horizontal_filter_skips_only_the_broken_identity(self):
+        (bigworld, math_module, area, cache, authority,
+         unused_descriptor, normal) = self._soft_recast_fixture((4.0,))
+        authority.destroyed_keys = lambda chunk_id: (
+            set([(37, None)]) if chunk_id == 22 else set())
+        start = _Vector(0.0, 0.6, 0.0)
+        end = _Vector(0.0, 0.6, 10.0)
+        broken_hit = (_Vector(0.0, 0.6, 3.5), normal, 75)
+        wall_hit = (_Vector(0.0, 0.6, 4.8), normal, 1)
+
+        def collide(unused_space, unused_start, unused_end, unused_mask,
+                    collision_filter=None):
+            if collision_filter is None:
+                return broken_hit
+            if collision_filter(75, 0, 37, 22):
+                return broken_hit
+            # The same callback keeps every unrelated native identity, so the
+            # engine can return a real backing wall instead of a false clear.
+            self.assertTrue(collision_filter(1, 0, -1, -1))
+            return wall_hit
+
+        bigworld.wg_collideSegment = mock.Mock(side_effect=collide)
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': bigworld, 'Math': math_module,
+                              'AreaDestructibles': area,
+                              'DestructiblesCache': cache}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority):
+            result = world_collision._collide_horizontal(1, start, end)
+
+        self.assertIs(result, wall_hit)
+        self.assertEqual(5, len(bigworld.wg_collideSegment.call_args[0]))
+
+    def test_first_destroy_recasts_with_native_filter_without_hide_delay(self):
+        (bigworld, math_module, area, cache, authority,
+         descriptor, normal) = self._soft_recast_fixture((4.0,))
+        accepted_keys = set()
+        authority.destroyed_keys = lambda chunk_id: (
+            accepted_keys if chunk_id == 22 else set())
+        start = _Vector(0.0, 0.6, 0.0)
+        end = _Vector(0.0, 0.6, 10.0)
+        collision = (_Vector(0.0, 0.6, 3.5), normal, 75)
+
+        def accept_destroy(*unused_args):
+            accepted_keys.add((37, None))
+            return True
+
+        def collide(unused_space, unused_start, unused_end, unused_mask,
+                    collision_filter=None):
+            self.assertIsNotNone(collision_filter)
+            self.assertFalse(collision_filter(75, 0, 37, 22))
+            return None
+
+        bigworld.wg_collideSegment = mock.Mock(side_effect=collide)
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': bigworld, 'Math': math_module,
+                              'AreaDestructibles': area,
+                              'DestructiblesCache': cache}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority), \
+                mock.patch.object(
+                    world_collision, '_try_destroy_solid_hit',
+                    side_effect=accept_destroy) as destroy:
+            cleared = world_collision._destroy_and_recast(
+                1, start, end, collision, 0.0, 20.0, descriptor)
+
+        self.assertTrue(cleared)
+        destroy.assert_called_once()
+        self.assertEqual(set([(37, None)]), accepted_keys)
+        self.assertEqual(1, bigworld.wg_collideSegment.call_count)
+        self.assertEqual(5, len(bigworld.wg_collideSegment.call_args[0]))
+
     def test_pending_hide_skin_cannot_skip_wall_one_centimetre_behind(self):
         (cleared, collide, authority, unused_destroy,
          unused_note, unused_publish) = self._run_pending_recast(
