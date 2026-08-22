@@ -1786,6 +1786,18 @@ class LANSession(object):
                 # The stock window owns cursor capture. Closing it before
                 # uninstalling our wrappers lets its normal close path release
                 # it on active-battle and unrecoverable failure paths.
+                if self._battle_started:
+                    reason = _message_value(
+                        message, 'message',
+                        _message_value(message, 'reason', 'connection lost'))
+                    reason = str(reason)[:160]
+                    sys.stdout.write(
+                        '[Offline LAN 0.9.22] active LAN transport failed '
+                        'kind=%s round=%r: %s\n' %
+                        (kind, self._active_round_id, reason))
+                    self._status_notifier(
+                        'LAN battle connection lost (%s). Returning to the '
+                        'garage.' % reason)
                 self.stop(show_login=True)
         if self._on_event_callback is not None:
             self._on_event_callback(kind, message)

@@ -22,6 +22,13 @@ MAX_INITIAL_TIMED_INTERVAL_US = int(
 INITIAL_TIMED_DELAY_US = 90000.0
 MIN_TIMED_DELAY_US = 60000.0
 TIMED_DELAY_DECAY_RATIO = 0.005
+# Build the confirmed-history high-water mark from the first few live source
+# intervals before playback has consumed the initial cushion.  This avoids a
+# series of early buffer underruns while preserving the steady-state latency
+# curve for remote vehicles after warm-up.
+TIMED_WARMUP_INTERVALS = 3
+TIMED_WARMUP_HEADROOM_RATIO = 1.0 / 3.0
+TIMED_WARMUP_MAX_HEADROOM_US = 20000.0
 SNAP_DISTANCE = 25.0
 MAX_VELOCITY = 80.0
 MAX_MOTION_TIME_US = 10000000000000000
@@ -152,6 +159,8 @@ class SnapshotSync(object):
                               'snapshot_interval_us': None,
                               'interpolation_delay_us': None,
                               'presentation_delay_us': None,
+                              'timed_warmup_intervals': 0,
+                              'timed_warmup_active': False,
                               'timed_samples': [],
                               'presentation_time_us': None,
                               'timed_teleport': False,
@@ -230,13 +239,30 @@ class SnapshotSync(object):
                 # and eventually makes the 25 m teleport guard fire.
                 record['interpolation_delay_us'] = None
                 record['presentation_delay_us'] = None
+                record['timed_warmup_intervals'] = 0
+                record['timed_warmup_active'] = True
                 record['timed_samples'] = []
                 record['presentation_time_us'] = sample_time_us
             if previous is not None and previous_sample_time_us is not None:
                 if not stale_initial_anchor:
+                    record['timed_warmup_intervals'] = (
+                        int(record.get('timed_warmup_intervals') or 0) + 1)
+                    source_interval_us = (
+                        sample_time_us - previous_sample_time_us)
                     observed_delay_us = (
-                        sample_time_us - previous_sample_time_us +
+                        source_interval_us +
                         (record.get('snapshot_interval_us') or 0))
+                    if (record.get('timed_warmup_active') and
+                            record['timed_warmup_intervals'] <=
+                            TIMED_WARMUP_INTERVALS):
+                        # The first intervals arrive while the initial buffer
+                        # is still filling, so reserve a small measured-cadence
+                        # margin now. Later outliers use their actual interval
+                        # and cannot permanently inflate normal latency.
+                        observed_delay_us += min(
+                            TIMED_WARMUP_MAX_HEADROOM_US,
+                            source_interval_us *
+                            TIMED_WARMUP_HEADROOM_RATIO)
                     previous_delay_us = record.get(
                         'interpolation_delay_us')
                     if previous_delay_us is None:
@@ -250,6 +276,13 @@ class SnapshotSync(object):
                     record['interpolation_delay_us'] = max(
                         observed_delay_us, retained_delay_us)
                     if record.get('presentation_delay_us') is None:
+                        record['presentation_delay_us'] = \
+                            record['interpolation_delay_us']
+                    elif (record.get('timed_warmup_active') and
+                          record['timed_warmup_intervals'] <=
+                          TIMED_WARMUP_INTERVALS and
+                          record['interpolation_delay_us'] >
+                          record['presentation_delay_us']):
                         record['presentation_delay_us'] = \
                             record['interpolation_delay_us']
             else:
@@ -285,6 +318,8 @@ class SnapshotSync(object):
                       'snapshot_interval_us': None,
                       'interpolation_delay_us': None,
                       'presentation_delay_us': None,
+                      'timed_warmup_intervals': 0,
+                      'timed_warmup_active': False,
                       'timed_samples': [],
                       'presentation_time_us': None,
                       'timed_teleport': False,
@@ -621,6 +656,8 @@ class SnapshotSync(object):
                         record['target_sample_time_us'])
                     record['interpolation_delay_us'] = None
                     record['presentation_delay_us'] = None
+                    record['timed_warmup_intervals'] = 0
+                    record['timed_warmup_active'] = False
                     record['timed_teleport'] = False
                 snapped = True
             elif timed:

@@ -42,6 +42,7 @@ MAX_PROJECTILE_PIERCING_LOSS = 100000.0
 OUTFIT_SEASONS = frozenset((1, 2, 4))
 MAX_OUTFIT_BYTES = 64 * 1024
 SENDER_JOIN_TIMEOUT = 0.1
+SEND_STALL_TIMEOUT = 5.0
 LEAVE_SEND_TIMEOUT = 0.05
 LEAVE_PAYLOAD = b'{"type":"leave"}\n'
 _BOT_STATE_WIRE_FIELDS = (
@@ -1607,7 +1608,6 @@ class LANClient(object):
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except Exception:
                 pass
-            sock.settimeout(0.5)
             with self._outbound_lock:
                 if (generation != self._transport_generation or
                         self._stopping or not self.running):
@@ -1626,6 +1626,10 @@ class LANClient(object):
                             self.sock is not sock):
                         return
                 sock.sendall(payload)
+            # Keep receive polling responsive.  Queued writes use
+            # _send_payload(), which can safely resume after a partial send
+            # instead of treating this socket-wide timeout as fatal.
+            sock.settimeout(0.5)
             if not self._publish_connected_transport(sock, generation):
                 return
             while (self.running and
@@ -1778,12 +1782,45 @@ class LANClient(object):
                             self._stopping or not self.running or
                             not self.connected or self.sock is not sock):
                         return None
-                sock.sendall(payload)
+                sent = self._send_payload(payload, sock, generation)
+                if sent is not True:
+                    return sent
             return True
         except Exception as error:
             if self._record_transport_error(error, generation, sock):
                 return False
             return None
+
+    def _send_payload(self, payload, sock, generation):
+        """Send one frame without corrupting it after a partial timeout."""
+        sender = getattr(sock, 'send', None)
+        if not callable(sender):
+            # Test doubles and unusual socket shims may only expose sendall.
+            sock.sendall(payload)
+            return True
+        offset = 0
+        stalled_since = None
+        while offset < len(payload):
+            with self._outbound_lock:
+                if (generation != self._transport_generation or
+                        self._stopping or not self.running or
+                        not self.connected or self.sock is not sock):
+                    return None
+            try:
+                count = sender(payload[offset:])
+                if count is None or int(count) <= 0:
+                    raise socket.error('server closed the connection')
+                offset += int(count)
+                stalled_since = None
+            except socket.timeout:
+                now = _monotonic_time()
+                if stalled_since is None:
+                    stalled_since = now
+                elif now - stalled_since >= SEND_STALL_TIMEOUT:
+                    raise socket.timeout(
+                        'server did not accept client messages for %.0f '
+                        'seconds' % SEND_STALL_TIMEOUT)
+        return True
 
     def _sender_worker(self, sock, generation):
         try:
@@ -2015,12 +2052,20 @@ class LANClient(object):
                 'server_time_ms' in message):
             server_time_ms = _projectile_int_range(
                 message.get('server_time_ms'), 0, MAX_PROJECTILE_ID)
-            if (server_time_ms is None or
-                    (self.server_time_ms is not None and
-                     server_time_ms < self.server_time_ms)):
+            if server_time_ms is None:
                 self.last_error = 'invalid server time'
                 self.stop()
                 return
+            # Message construction and socket publication happen on multiple
+            # server threads.  The endpoint send lock preserves wire writes,
+            # but an older message can acquire it after a newer message whose
+            # server clock was sampled later.  Treat the clock as a monotonic
+            # observation rather than a transport sequence fence.
+            if (self.server_time_ms is not None and
+                    server_time_ms < self.server_time_ms):
+                message = dict(message)
+                server_time_ms = self.server_time_ms
+                message['server_time_ms'] = server_time_ms
             self.server_time_ms = server_time_ms
         if kind == 'welcome':
             if _safe_text(message.get('client_build'), '') != CLIENT_BUILD:

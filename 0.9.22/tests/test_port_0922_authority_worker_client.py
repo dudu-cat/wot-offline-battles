@@ -16,8 +16,8 @@ from gui.mods.offline_lan_0922 import config as port_config
 from gui.mods.offline_lan_0922 import lan_client as lan_client_module
 from gui.mods.offline_lan_0922.account_rpc.state import AccountState
 from gui.mods.offline_lan_0922.authority_worker import (
-    AuthorityWorkerLANClient, WORKER_DUMMY_Y, WORKER_ROLE, WorkerSession,
-    _WorldDrawLease)
+    AuthorityWorkerLANClient, WORKER_BUSY_RETRY_SECONDS, WORKER_DUMMY_Y,
+    WORKER_RETRY_SECONDS, WORKER_ROLE, WorkerSession, _WorldDrawLease)
 from gui.mods.offline_lan_0922.lan_client import (
     CLIENT_BUILD, CLIENT_CAPABILITIES, LANClient, PROTOCOL_VERSION,
     SIMULATION_WORKER_CAPABILITY, WORKER_AUTHORITY_ID)
@@ -484,6 +484,63 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         self.assertEqual(8, events[-1][1]['state_revision'])
         self.assertEqual(100, events[-1][1]['server_time_ms'])
 
+    def test_worker_roster_clamps_regressing_server_time(self):
+        events = []
+        client = AuthorityWorkerLANClient(
+            '127.0.0.1', 28782,
+            on_event=lambda kind, message: events.append((kind, message)))
+        client.running = True
+        client.ready = True
+        client.round_id = 4
+        client.state_revision = 8
+        client.phase = 'battle'
+        client.map_name = '01_karelia'
+        client.host_player_id = 1
+        client.bot_authority_id = WORKER_AUTHORITY_ID
+        client.authority_epoch = 2
+        client.server_time_ms = 100
+
+        client._handle_message({
+            'type': 'roster', 'protocol': PROTOCOL_VERSION,
+            'round_id': 4, 'state_revision': 9, 'phase': 'battle',
+            'map': '01_karelia', 'host_player_id': 1,
+            'bot_authority_id': WORKER_AUTHORITY_ID,
+            'authority_epoch': 2, 'server_time_ms': 99,
+            'players': [_human()],
+        })
+
+        self.assertTrue(client.running)
+        self.assertIsNone(client.last_error)
+        self.assertEqual(100, client.server_time_ms)
+        self.assertEqual(100, events[-1][1]['server_time_ms'])
+
+        client._handle_message({
+            'type': 'roster', 'protocol': PROTOCOL_VERSION,
+            'round_id': 5, 'state_revision': 0, 'phase': 'waiting',
+            'map': '01_karelia', 'host_player_id': 1,
+            'bot_authority_id': WORKER_AUTHORITY_ID,
+            'authority_epoch': 3,
+            'players': [_human()],
+        })
+
+        self.assertTrue(client.running)
+        self.assertIsNone(client.server_time_ms)
+        self.assertNotIn('server_time_ms', events[-1][1])
+
+        client._handle_message({
+            'type': 'battle_start', 'protocol': PROTOCOL_VERSION,
+            'round_id': 5, 'state_revision': 1, 'phase': 'loading',
+            'map': '01_karelia', 'host_player_id': 1,
+            'bot_authority_id': WORKER_AUTHORITY_ID,
+            'authority_epoch': 3, 'server_time_ms': 0,
+            'players': [_human()], 'bots': [],
+        })
+
+        self.assertTrue(client.running)
+        self.assertIsNone(client.last_error)
+        self.assertEqual(0, client.server_time_ms)
+        self.assertEqual(0, events[-1][1]['server_time_ms'])
+
     def test_world_draw_lease_requires_readback_and_restores(self):
         world = _DrawWorld()
         lease = _WorldDrawLease(world)
@@ -630,6 +687,50 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         self.assertTrue(client.stopped)
         self.assertIsNone(session._retry_callback_id)
         session._callback.assert_not_called()
+
+    def test_busy_worker_rechecks_at_fixed_delay_and_welcome_resets_it(self):
+        world = _DrawWorld()
+        scheduled = []
+        with tempfile.TemporaryDirectory() as directory:
+            session = WorkerSession(
+                {}, bigworld=world,
+                status_path=str(Path(directory) / 'status.json'))
+            session._callback = lambda delay, callback: (
+                scheduled.append((delay, callback)) or len(scheduled))
+
+            self.assertTrue(session._worker_failure(
+                RuntimeError('battle already in progress')))
+            self.assertEqual(WORKER_BUSY_RETRY_SECONDS, scheduled[-1][0])
+
+            session._retry_callback_id = None
+            self.assertTrue(session._worker_failure(
+                RuntimeError('battle already in progress')))
+            self.assertEqual(WORKER_BUSY_RETRY_SECONDS, scheduled[-1][0])
+
+            client = _WorkerClient()
+            client.phase = 'waiting'
+            session.client = client
+            session._on_event('welcome', {'phase': 'waiting'})
+
+        self.assertEqual(WORKER_RETRY_SECONDS, session._retry_delay)
+
+    def test_retry_polls_unready_lobby_without_growing_network_backoff(self):
+        world = _DrawWorld()
+        scheduled = []
+        with tempfile.TemporaryDirectory() as directory:
+            session = WorkerSession(
+                {}, bigworld=world, lobby_ready=lambda: False,
+                status_path=str(Path(directory) / 'status.json'))
+            session._retry_delay = WORKER_BUSY_RETRY_SECONDS
+            session._callback = lambda delay, callback: (
+                scheduled.append((delay, callback)) or len(scheduled))
+
+            self.assertTrue(session._schedule_retry(grow=False))
+            self.assertEqual(WORKER_BUSY_RETRY_SECONDS, scheduled[-1][0])
+            scheduled[-1][1]()
+
+        self.assertEqual(WORKER_RETRY_SECONDS, scheduled[-1][0])
+        self.assertEqual(WORKER_BUSY_RETRY_SECONDS, session._retry_delay)
 
     def test_event_adapter_exception_enters_worker_failure_boundary(self):
         world = _DrawWorld()

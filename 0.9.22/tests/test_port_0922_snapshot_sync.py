@@ -487,6 +487,59 @@ class SnapshotSyncTests(unittest.TestCase):
             for unused_time, unused_pose, presentation_time,
             confirmed_time, unused_delay, unused_ideal in steady))
 
+    def test_first_live_intervals_establish_jitter_high_water_immediately(self):
+        clock = [0.0]
+        sync = self.module.SnapshotSync(1, clock=lambda: clock[0])
+
+        def bot(sample_time_us):
+            state = player(7, max(
+                0, sample_time_us - 15040000) / 100000.0)
+            state.update(team=2, yaw=0.0, aim_yaw=0.0,
+                         gun_pitch=0.0)
+            return state
+
+        sync.snapshot({
+            'round_id': 1, 'server_tick': 0,
+            'bot_state_revision': 0,
+            'motion_time_us': 0, 'bot_state_time_us': 0,
+            'timing': {'phase': 'loading'}, 'bots': [bot(0)],
+        })
+        clock[0] = 15.0
+        sync.snapshot({
+            'round_id': 1, 'server_tick': 450,
+            'bot_state_revision': 0,
+            'motion_time_us': 15000000, 'bot_state_time_us': 0,
+            'timing': {'phase': 'prebattle'}, 'bots': [bot(0)],
+        })
+
+        source_times = (15040000, 15080000, 15122000, 15188000)
+        revision = 0
+        sample_time_us = source_times[0]
+        for server_time_us in (15040000, 15073333, 15106666,
+                               15139999, 15173332, 15206665):
+            available = [value for value in source_times
+                         if value <= server_time_us]
+            next_sample = available[-1]
+            if next_sample != sample_time_us or server_time_us == 15040000:
+                revision += 1
+                sample_time_us = next_sample
+            clock[0] = server_time_us / 1000000.0
+            sync.snapshot({
+                'round_id': 1, 'server_tick': server_time_us,
+                'bot_state_revision': revision,
+                'motion_time_us': server_time_us,
+                'bot_state_time_us': sample_time_us,
+                'timing': {'phase': 'battle'},
+                'bots': [bot(sample_time_us)],
+            })
+
+        record = sync._entities['bot:7']
+        self.assertEqual(3, record['timed_warmup_intervals'])
+        self.assertTrue(record['timed_warmup_active'])
+        self.assertGreater(record['interpolation_delay_us'], 98000.0)
+        self.assertEqual(record['interpolation_delay_us'],
+                         record['presentation_delay_us'])
+
     def test_first_live_sample_does_not_replay_the_countdown_as_latency(self):
         clock = [0.0]
         sync = self.module.SnapshotSync(1, clock=lambda: clock[0])

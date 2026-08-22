@@ -15,7 +15,7 @@ sys.path.insert(0, str(SERVER_ROOT))
 import lan_battle_server as server_module  # noqa: E402
 from lan_battle_server import (  # noqa: E402
     BattleState, CLIENT_BUILD_0922, ClientHandler, PROJECTILE_CAPABILITY,
-    PREBATTLE_SECONDS,
+    Player, PREBATTLE_SECONDS,
     SimulationWorker,
     SIMULATION_WORKER_AUTHORITY_ID, SIMULATION_WORKER_CAPABILITY,
     SIMULATION_WORKER_ROLE, TICK_HZ, ThreadedTCPServer,
@@ -125,6 +125,32 @@ def _wait_until(predicate, timeout=2.0):
 
 
 class SimulationWorkerStateTests(unittest.TestCase):
+    def test_endpoint_send_clamps_server_time_within_each_round(self):
+        player_connection = _Connection()
+        worker_connection = _Connection()
+        endpoints = (
+            (Player(1, player_connection, ('127.0.0.1', 1000)),
+             player_connection),
+            (SimulationWorker(
+                worker_connection, ('127.0.0.1', 1001)),
+             worker_connection),
+        )
+
+        for endpoint, connection in endpoints:
+            self.assertTrue(endpoint.send({
+                'type': 'snapshot', 'round_id': 7,
+                'server_time_ms': 101}))
+            self.assertTrue(endpoint.send({
+                'type': 'events', 'round_id': 7,
+                'server_time_ms': 100}))
+            self.assertTrue(endpoint.send({
+                'type': 'roster', 'round_id': 8,
+                'server_time_ms': 0}))
+            self.assertEqual(
+                [101, 101, 0],
+                [message['server_time_ms']
+                 for message in connection.messages])
+
     def test_worker_is_not_a_player_and_survives_round_reset(self):
         state = BattleState(
             map_name='01_karelia', max_players=1, team_size=1)
@@ -340,13 +366,13 @@ class SimulationWorkerStateTests(unittest.TestCase):
         self.assertIs(worker, state.simulation_worker)
         self.assertEqual('battle', state.phase)
         self.assertEqual(2, state.battle_result['winner'])
-        self.assertEqual('battle_timeout', state.battle_result['reason'])
+        self.assertEqual('team_eliminated', state.battle_result['reason'])
         receipts = [
             receipt for receipt in state.result_receipts.values()
             if receipt.get('account_key') == player.account_key]
         self.assertEqual(1, len(receipts))
         self.assertEqual(2, receipts[0]['death_reason'])
-        self.assertEqual(3, receipts[0]['finish_reason'])
+        self.assertEqual(1, receipts[0]['finish_reason'])
         self.assertEqual(123, receipts[0]['stats']['damage'])
         self.assertTrue(receipts[0]['premature_leave'])
 
@@ -373,7 +399,7 @@ class SimulationWorkerStateTests(unittest.TestCase):
             if message.get('type') == 'events'
             for event in message.get('events', ())))
 
-    def test_live_human_disconnect_remains_abandoned_result(self):
+    def test_live_human_disconnect_adjudicates_remaining_bots(self):
         state = BattleState(map_name='01_karelia', team_size=2)
         worker, error = state.add_simulation_worker(
             _Connection(), ('127.0.0.1', 1000), _worker_hello())
@@ -399,15 +425,15 @@ class SimulationWorkerStateTests(unittest.TestCase):
         self.assertFalse(reset)
         self.assertIs(worker, state.simulation_worker)
         self.assertIsNotNone(state.battle_result)
-        self.assertEqual(0, state.battle_result['winner'])
-        self.assertEqual('all_players_left',
+        self.assertEqual(2, state.battle_result['winner'])
+        self.assertEqual('team_eliminated',
                          state.battle_result['reason'])
         receipt = next(
             value for value in state.result_receipts.values()
             if value.get('account_key') == player.account_key)
-        self.assertEqual(4, receipt['finish_reason'])
+        self.assertEqual(1, receipt['finish_reason'])
 
-    def test_live_graceful_leave_disconnect_preserves_abandoned_result(self):
+    def test_live_graceful_leave_adjudicates_remaining_bots(self):
         state = BattleState(map_name='01_karelia', team_size=2)
         worker, error = state.add_simulation_worker(
             _Connection(), ('127.0.0.1', 1000), _worker_hello())
@@ -448,8 +474,8 @@ class SimulationWorkerStateTests(unittest.TestCase):
             second.player_id, {'round_id': state.round_id}))
 
         self.assertIs(worker, state.simulation_worker)
-        self.assertEqual('all_players_left', state.battle_result['reason'])
-        self.assertEqual(0, state.battle_result['winner'])
+        self.assertEqual('team_eliminated', state.battle_result['reason'])
+        self.assertEqual(2, state.battle_result['winner'])
 
     def test_remaining_bot_adjudication_is_deterministic(self):
         state = BattleState(map_name='01_karelia')
@@ -477,7 +503,9 @@ class SimulationWorkerStateTests(unittest.TestCase):
         forces(((50, 100),), ((100, 200),))
         self.assertEqual(2, state._remaining_bot_winner())
         forces(((50, 100),), ((50, 100),))
-        self.assertEqual(0, state._remaining_bot_winner())
+        self.assertEqual(2, state._remaining_bot_winner())
+        state.round_id = 2
+        self.assertEqual(1, state._remaining_bot_winner())
 
         capture_state = BattleState(map_name='01_karelia')
         capture_state.phase = 'battle'

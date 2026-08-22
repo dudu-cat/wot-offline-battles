@@ -242,6 +242,53 @@ class LanClientQueueTests(unittest.TestCase):
             lan_client_module.json.dumps = original_dumps
             client.stop()
 
+    def test_partial_send_resumes_after_socket_timeout_without_duplication(self):
+        class PartialSocket(RecordingSocket):
+            def __init__(self):
+                RecordingSocket.__init__(self)
+                self.bytes = b''
+                self.calls = 0
+
+            def send(self, payload):
+                self.calls += 1
+                if self.calls == 1:
+                    self.bytes += payload[:4]
+                    return 4
+                if self.calls in (2, 3):
+                    raise socket.timeout()
+                self.bytes += payload
+                return len(payload)
+
+        sock = PartialSocket()
+        client = self.activate(sock)
+
+        self.assertTrue(client._send_wire(
+            {'type': 'input', 'round_id': 7}, sock,
+            client._transport_generation))
+        self.assertEqual(
+            {'type': 'input', 'round_id': 7},
+            json.loads(sock.bytes.decode('utf-8')))
+        self.assertEqual(4, sock.calls)
+
+    def test_send_stall_has_bounded_transport_failure(self):
+        class StalledSocket(RecordingSocket):
+            def send(self, unused_payload):
+                raise socket.timeout()
+
+        sock = StalledSocket()
+        client = self.activate(sock)
+        samples = iter((10.0, 15.1))
+        original_clock = lan_client_module._monotonic_time
+        lan_client_module._monotonic_time = lambda: next(samples)
+        try:
+            self.assertFalse(client._send_wire(
+                {'type': 'input'}, sock,
+                client._transport_generation))
+        finally:
+            lan_client_module._monotonic_time = original_clock
+
+        self.assertIn('did not accept client messages', client.last_error)
+
     def test_oversized_nested_payload_is_rejected_before_enqueue(self):
         client = self.activate()
         message = {

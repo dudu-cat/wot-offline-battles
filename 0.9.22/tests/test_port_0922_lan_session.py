@@ -2320,6 +2320,29 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual(1, self.client.stop_calls)
         self.assertEqual([True], self.battle_runtime.stopped)
 
+    def test_active_battle_transport_error_reports_round_and_reason(self):
+        self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
+        self.emit('battle_start', {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]})
+        output = types.SimpleNamespace(write=mock.Mock())
+
+        with mock.patch.object(self.module.sys, 'stdout', output):
+            self.emit('error', {
+                'message': 'server did not accept client messages for 5 '
+                           'seconds'})
+
+        output.write.assert_called_once_with(
+            '[Offline LAN 0.9.22] active LAN transport failed kind=error '
+            'round=7: server did not accept client messages for 5 seconds\n')
+        self.assertEqual(
+            'LAN battle connection lost (server did not accept client '
+            'messages for 5 seconds). Returning to the garage.',
+            self.statuses[-1])
+        self.assertEqual('stopped', self.session.state)
+        self.assertEqual([True], self.battle_runtime.stopped)
+
     def test_stop_finishes_every_cleanup_stage_then_raises_first_error(self):
         self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
         queue = self.queues[0]

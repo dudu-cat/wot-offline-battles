@@ -716,6 +716,27 @@ def _destroyed_tracks(critical):
     return frozenset(names)
 
 
+def _monotonic_endpoint_server_time(endpoint, message):
+    """Clamp concurrently-produced clock samples on one ordered stream."""
+    if not isinstance(message, dict) or "server_time_ms" not in message:
+        return message
+    try:
+        round_id = int(message.get("round_id"))
+        server_time_ms = int(message.get("server_time_ms"))
+    except (TypeError, ValueError, OverflowError):
+        return message
+    if endpoint.server_time_round_id != round_id:
+        endpoint.server_time_round_id = round_id
+        endpoint.last_server_time_ms = server_time_ms
+        return message
+    if server_time_ms >= endpoint.last_server_time_ms:
+        endpoint.last_server_time_ms = server_time_ms
+        return message
+    outgoing = dict(message)
+    outgoing["server_time_ms"] = endpoint.last_server_time_ms
+    return outgoing
+
+
 @dataclass
 class Player:
     player_id: int
@@ -762,16 +783,20 @@ class Player:
     account_key: str = ""
     outfits: dict = field(default_factory=dict)
     delivered_receipt_id: str = ""
+    server_time_round_id: Optional[int] = field(default=None, repr=False)
+    last_server_time_ms: int = field(default=-1, repr=False)
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def send(self, message):
         if not self.connected:
             return False
-        payload = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
-        if len(payload) > MAX_LINE_BYTES:
-            return False
         try:
             with self.send_lock:
+                outgoing = _monotonic_endpoint_server_time(self, message)
+                payload = (json.dumps(
+                    outgoing, separators=(",", ":")) + "\n").encode("utf-8")
+                if len(payload) > MAX_LINE_BYTES:
+                    return False
                 self.conn.sendall(payload)
             if "bot_orders" in message:
                 try:
@@ -805,16 +830,20 @@ class SimulationWorker:
     simulation_progress_round_id: int = 0
     simulation_progress_authority_epoch: int = -1
     simulation_progress_frame_seq: int = -1
+    server_time_round_id: Optional[int] = field(default=None, repr=False)
+    last_server_time_ms: int = field(default=-1, repr=False)
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def send(self, message):
         if not self.connected:
             return False
-        payload = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
-        if len(payload) > MAX_LINE_BYTES:
-            return False
         try:
             with self.send_lock:
+                outgoing = _monotonic_endpoint_server_time(self, message)
+                payload = (json.dumps(
+                    outgoing, separators=(",", ":")) + "\n").encode("utf-8")
+                if len(payload) > MAX_LINE_BYTES:
+                    return False
                 self.conn.sendall(payload)
             if "bot_orders" in message:
                 try:
@@ -1486,26 +1515,19 @@ class BattleState:
 
     def _finish_abandoned_battle(self):
         """Resolve a round once no human participant remains connected."""
-        worker = self.simulation_worker
         if (self.phase != "battle" or self.battle_result is not None or
                 any(player.connected and player.participating
                     for player in self.players.values())):
             return False
-        participants = list(self.round_participants.values())
-        if (worker is not None and worker.connected and participants and all(
-                not bool(participant.get("alive", True))
-                for participant in participants)):
-            for base_team in (1, 2):
-                base = self.rules_state.get("bases", {}).get(
-                    str(base_team), {})
-                if int(_finite_float(base.get("points"), 0)) >= 100:
-                    return self._finish_battle(
-                        3 - base_team, "base captured", base_team)
-            if self._maybe_finish_battle():
-                return True
-            return self._finish_battle(
-                self._remaining_bot_winner(), "battle_timeout", 0)
-        return self._finish_battle(0, "all_players_left", 0)
+        for base_team in (1, 2):
+            base = self.rules_state.get("bases", {}).get(str(base_team), {})
+            if int(_finite_float(base.get("points"), 0)) >= 100:
+                return self._finish_battle(
+                    3 - base_team, "base captured", base_team)
+        if self._maybe_finish_battle():
+            return True
+        return self._finish_battle(
+            self._remaining_bot_winner(), "team_eliminated", 0)
 
     def _remaining_bot_winner(self):
         """Adjudicate an unobserved remainder from canonical bot state."""
@@ -1539,7 +1561,10 @@ class BattleState:
         if totals[1]["health"] != totals[2]["health"]:
             return (1 if totals[1]["health"] >
                     totals[2]["health"] else 2)
-        return 0
+        # An abandoned battle is adjudicated immediately so the single-room
+        # server can accept another match.  Break an exact tie deterministically
+        # instead of manufacturing the same draw on every early departure.
+        return 1 if int(self.round_id) % 2 == 0 else 2
 
     def _reset_round(self):
         """Return connected players to a clean waiting-room round."""
@@ -2489,10 +2514,8 @@ class BattleState:
             was_alive = bool(player.alive)
             participant = self.round_participants.get(player.account_key)
             if participant is not None:
-                # Preserve whether this was a dead spectator leaving or a
-                # still-live participant abandoning the round.  The latter
-                # must keep the abnormal all_players_left outcome instead of
-                # being mistaken for a normal remaining-forces adjudication.
+                # Preserve the final participant state for the result receipt
+                # before the unobserved remainder is adjudicated from bot state.
                 participant["alive"] = was_alive
                 participant["health"] = int(player.health)
                 participant["death_reason"] = int(player.death_reason)

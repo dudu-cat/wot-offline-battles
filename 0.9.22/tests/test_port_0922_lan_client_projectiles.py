@@ -464,7 +464,7 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertFalse(client.running)
         self.assertEqual('invalid bot authority event', client.last_error)
 
-    def test_invalid_snapshot_ledger_and_regressing_time_stop_client(self):
+    def test_invalid_snapshot_ledger_stops_client(self):
         client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
         client.running = True
         client._handle_message(self.welcome())
@@ -487,9 +487,14 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertFalse(client.running)
         self.assertEqual('invalid snapshot message', client.last_error)
 
-        client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
+    def test_regressing_wire_time_is_clamped_without_dropping_events(self):
+        received = []
+        client = LANClient(
+            '127.0.0.1', 28782, 'P', 'ussr:MS-1',
+            on_event=lambda kind, message: received.append((kind, message)))
         client.running = True
         client._handle_message(self.welcome())
+        client.phase = 'battle'
         client.server_time_ms = 1000
         client._handle_message({
             'type': 'events',
@@ -497,8 +502,26 @@ class ProjectileWireTests(unittest.TestCase):
             'round_id': 3,
             'server_tick': 11,
             'server_time_ms': 999,
+            'authority_epoch': 2,
             'events': [],
         })
+
+        self.assertTrue(client.running)
+        self.assertIsNone(client.last_error)
+        self.assertEqual(1000, client.server_time_ms)
+        self.assertEqual(1000, received[-1][1]['server_time_ms'])
+
+    def test_malformed_server_time_still_stops_client(self):
+        client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
+        client.running = True
+        client._handle_message(self.welcome())
+        client.server_time_ms = 1000
+        client._handle_message({
+            'type': 'events', 'protocol': module.PROTOCOL_VERSION,
+            'round_id': 3, 'server_tick': 11,
+            'server_time_ms': -1, 'authority_epoch': 2, 'events': [],
+        })
+
         self.assertFalse(client.running)
         self.assertEqual('invalid server time', client.last_error)
 

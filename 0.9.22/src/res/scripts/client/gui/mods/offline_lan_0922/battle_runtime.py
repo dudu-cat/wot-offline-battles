@@ -998,6 +998,7 @@ class BattleRuntime(object):
         self._standard_space_visibility = None
         self._next_space_visibility_check = 0.0
         self._space_visibility_warning_reported = False
+        self._space_visibility_guard = None
         if self._frame_diagnostics is not None:
             self._frame_diagnostics.enabled = True
             self._frame_diagnostics.reset()
@@ -1393,6 +1394,7 @@ class BattleRuntime(object):
             # entering stock code so every exit can run its stronger destroy()
             # rollback, even when Active() is already false afterward.
             self._map_create_attempted = True
+            self._install_standard_space_visibility_guard()
             self._create_native_battle_map(self._config['map'])
             if not self._runtime.offline_map_creator.Active():
                 raise RuntimeError('stock OfflineMapCreator rejected the map')
@@ -1740,6 +1742,65 @@ class BattleRuntime(object):
             self._standard_space_visibility = None
             self._warn_standard_space_visibility(error)
             return None
+
+    def _install_standard_space_visibility_guard(self):
+        """Keep #1513's late client flag update from erasing gameplay bits.
+
+        ``PlayerAvatar.__onInitStepCompleted`` calls
+        ``ClientVisibilityFlags.updateSpaceVisibility`` after the compiled
+        space has already been mapped.  Its legacy getter reports zero for
+        this client-only Avatar space, so the stock helper otherwise writes a
+        zero server mask and materializes inactive ControlPoints (notably the
+        neutral Malinovka domination circle).  Preserve the server-selected
+        gameplay bit until that one late initialization call has completed.
+        """
+        if self._space_visibility_guard is not None:
+            return False
+        visibility = getattr(
+            self._runtime, 'client_visibility_flags', None)
+        original = getattr(visibility, 'updateSpaceVisibility', None)
+        if not callable(original):
+            return False
+        visibility_dict = getattr(visibility, '__dict__', {})
+        raw_original = visibility_dict.get('updateSpaceVisibility')
+        if raw_original is None:
+            return False
+
+        def update_standard_space_visibility(space_id, client_flags):
+            boundary = self._standard_space_visibility
+            if boundary is None or int(space_id) != int(boundary[0]):
+                return original(space_id, client_flags)
+            unused_space_id, selected_bit, client_bits, unused_server_bits = \
+                boundary
+            expected = (client_flags & client_bits) | selected_bit
+            self._runtime.bigworld.wg_setSpaceItemsVisibilityMask(
+                space_id, expected)
+
+        # #1513 defines ClientVisibilityFlags as an old-style class.  Keep
+        # the replacement static there; injected test runtimes use an object.
+        replacement = (staticmethod(update_standard_space_visibility)
+                       if hasattr(visibility, '__bases__')
+                       else update_standard_space_visibility)
+        setattr(visibility, 'updateSpaceVisibility', replacement)
+        self._space_visibility_guard = {
+            'owner': visibility,
+            'original': raw_original,
+            'replacement': replacement,
+        }
+        return True
+
+    def _restore_standard_space_visibility_guard(self):
+        guard = self._space_visibility_guard
+        self._space_visibility_guard = None
+        if guard is None:
+            return False
+        owner = guard['owner']
+        current = getattr(owner, '__dict__', {}).get(
+            'updateSpaceVisibility')
+        if current is guard['replacement']:
+            setattr(owner, 'updateSpaceVisibility', guard['original'])
+            return True
+        return False
 
     def _apply_standard_space_visibility(
             self, space_id=None, before_mapping=False):
@@ -2197,6 +2258,7 @@ class BattleRuntime(object):
             # before restoring the server-selected gameplay bit for this
             # client-only space.
             self._configure_standard_space_visibility()
+            self._restore_standard_space_visibility_guard()
             record['ready'] = True
             self._attach_local_presentation()
             if not self._worker_mode:
@@ -12131,6 +12193,11 @@ class BattleRuntime(object):
         except Exception as error:
             if cleanup_error is None:
                 cleanup_error = error
+        try:
+            self._restore_standard_space_visibility_guard()
+        except Exception as error:
+            if cleanup_error is None:
+                cleanup_error = error
         if self._destructibles is not None:
             try:
                 self._destructibles.set_event_sink(None)
@@ -12158,6 +12225,7 @@ class BattleRuntime(object):
         self._standard_space_visibility = None
         self._next_space_visibility_check = 0.0
         self._space_visibility_warning_reported = False
+        self._space_visibility_guard = None
         self._binding = None
         self._server = None
         self._remote_factory = None

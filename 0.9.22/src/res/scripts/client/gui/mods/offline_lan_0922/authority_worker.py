@@ -26,6 +26,8 @@ WORKER_STATUS_PATH = os.path.join(
     os.path.dirname(port_config.CONFIG_PATH), 'authority_worker_status.json')
 WORKER_MONITOR_SECONDS = 0.10
 WORKER_RETRY_SECONDS = 1.0
+WORKER_BUSY_RETRY_SECONDS = 5.0
+WORKER_RETRY_MAX_SECONDS = 15.0
 WORKER_PROGRESS_SECONDS = 1.0
 WORKER_STATUS_SECONDS = 2.0
 WORKER_DUMMY_Y = -500.0
@@ -197,10 +199,7 @@ class AuthorityWorkerLANClient(LANClient):
                 ((players and host_player_id not in player_ids) or
                  (not players and host_player_id is not None)) or
                 authority_id is None or authority_epoch is None or
-                ('server_time_ms' in message and server_time_ms is None) or
-                (server_time_ms is not None and
-                 self.server_time_ms is not None and
-                 server_time_ms < self.server_time_ms)):
+                ('server_time_ms' in message and server_time_ms is None)):
             return self._invalid_worker_message('invalid worker roster')
         if self.round_id is not None and round_id < self.round_id:
             return False
@@ -218,11 +217,13 @@ class AuthorityWorkerLANClient(LANClient):
                 authority_epoch < self.authority_epoch):
             return self._invalid_worker_message(
                 'worker authority epoch regressed')
-        if round_id != self.round_id:
+        same_round = round_id == self.round_id
+        if not same_round:
             self.last_snapshot = None
             self._battle_start_round_id = None
             self._battle_live_round_id = None
             self._worker_avatar = None
+            self.server_time_ms = None
         self.round_id = round_id
         self.state_revision = state_revision
         self.phase = phase
@@ -235,7 +236,14 @@ class AuthorityWorkerLANClient(LANClient):
         self.bot_authority_id = authority_id
         self.authority_epoch = authority_epoch
         if server_time_ms is not None:
-            self.server_time_ms = server_time_ms
+            effective_server_time = int(server_time_ms)
+            if same_round and self.server_time_ms is not None:
+                effective_server_time = max(
+                    effective_server_time, int(self.server_time_ms))
+            if effective_server_time != server_time_ms:
+                message = dict(message)
+                message['server_time_ms'] = effective_server_time
+            self.server_time_ms = effective_server_time
         self._notify('roster', message)
         return True
 
@@ -423,6 +431,7 @@ class WorkerSession(object):
         self._retired_rounds = set()
         self._monitor_callback_id = None
         self._retry_callback_id = None
+        self._retry_delay = WORKER_RETRY_SECONDS
         self._next_status_time = 0.0
         self._next_progress_time = 0.0
         self._last_progress_frame = 0
@@ -496,21 +505,31 @@ class WorkerSession(object):
             WORKER_MONITOR_SECONDS, monitor)
         return True
 
-    def _schedule_retry(self):
+    def _schedule_retry(self, delay=None, grow=True):
         if self._stopped or self._retry_callback_id is not None:
             return False
+
+        if delay is None:
+            delay = self._retry_delay
+        if grow:
+            self._retry_delay = min(
+                WORKER_RETRY_MAX_SECONDS,
+                max(WORKER_RETRY_SECONDS, delay * 2.0))
 
         def retry():
             self._retry_callback_id = None
             if self._stopped:
                 return
             if not self._lobby_ready():
-                self._schedule_retry()
+                # Native teardown can briefly precede the worker's garage.
+                # Poll that local condition quickly without inflating the
+                # network retry delay and missing the next user-started round.
+                self._schedule_retry(
+                    delay=WORKER_RETRY_SECONDS, grow=False)
                 return
             self._connect()
 
-        self._retry_callback_id = self._callback(
-            WORKER_RETRY_SECONDS, retry)
+        self._retry_callback_id = self._callback(delay, retry)
         return True
 
     def _publish_simulation_progress(self, runtime):
@@ -735,6 +754,9 @@ class WorkerSession(object):
         if self._handling_failure or self._stopped:
             return False
         self._handling_failure = True
+        server_busy = 'battle already in progress' in str(error).lower()
+        if server_busy:
+            self._retry_delay = WORKER_BUSY_RETRY_SECONDS
         sys.stdout.write(
             '[Offline LAN 0.9.22] simulation worker failed: %s\n' % error)
         if self._active_round_id is not None:
@@ -771,7 +793,10 @@ class WorkerSession(object):
             # re-enter a new arena. Keep it fenced for manual restart.
             return False
         try:
-            self._schedule_retry()
+            # A busy server is expected until the current battle ends. Five
+            # seconds avoids a restart storm while bounding how late this
+            # worker can rejoin after the room returns to waiting.
+            self._schedule_retry(grow=not server_busy)
         except Exception as retry_error:
             self.state = 'failed'
             self._stopped = True
@@ -785,6 +810,8 @@ class WorkerSession(object):
     def _on_event(self, kind, message):
         message = message if isinstance(message, dict) else {}
         if kind in ('welcome', 'roster'):
+            if kind == 'welcome':
+                self._retry_delay = WORKER_RETRY_SECONDS
             if (self.client is not None and
                     not self.client.is_bot_authority()):
                 self._pending_start = None

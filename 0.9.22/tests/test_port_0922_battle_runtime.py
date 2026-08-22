@@ -4513,6 +4513,49 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(0xffffff89 & mapped_mask)
         self.assertFalse(0xffffff82 & mapped_mask)
 
+    def test_late_client_visibility_update_keeps_malinovka_ctf_bit(self):
+        updates = []
+
+        class _ClientVisibilityFlags(object):
+            CLIENT_MASK = 0xfff00000
+            SERVER_MASK = 0x000fffff
+
+            @staticmethod
+            def updateSpaceVisibility(space_id, client_flags):
+                updates.append((space_id, client_flags))
+
+        original = _ClientVisibilityFlags.__dict__[
+            'updateSpaceVisibility']
+        runtime = _runtime()
+        runtime.client_visibility_flags = _ClientVisibilityFlags
+        battle = BattleRuntime(runtime)
+        battle._standard_space_visibility = (
+            7, 0x00000001,
+            _ClientVisibilityFlags.CLIENT_MASK,
+            _ClientVisibilityFlags.SERVER_MASK)
+
+        self.assertTrue(
+            battle._install_standard_space_visibility_guard())
+        _ClientVisibilityFlags.updateSpaceVisibility(7, 0x00400000)
+
+        # Exact #1513's legacy getter returns zero for a client-only mapped
+        # space.  The guarded stock call must nevertheless keep CTF bit 0 and
+        # must never publish zero, which instantiates Malinovka's neutral
+        # domination ControlPoint.
+        self.assertEqual([], updates)
+        self.assertEqual(
+            ('set', 7, 0x00400001),
+            runtime.bigworld.legacy_visibility_calls[-1])
+
+        # An unrelated space still uses the stock implementation.
+        _ClientVisibilityFlags.updateSpaceVisibility(8, 0x00800000)
+        self.assertEqual([(8, 0x00800000)], updates)
+        self.assertTrue(
+            battle._restore_standard_space_visibility_guard())
+        self.assertIs(
+            original,
+            _ClientVisibilityFlags.__dict__['updateSpaceVisibility'])
+
     def test_native_map_primes_visibility_with_stock_setter(self):
         runtime = _runtime()
         original_set_mask = runtime.bigworld.wg_setSpaceItemsVisibilityMask
