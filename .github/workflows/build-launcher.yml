@@ -190,6 +190,7 @@ jobs:
               finally {
                   if (-not $process.HasExited) {
                       & taskkill.exe /PID $process.Id /T /F | Out-Null
+                      $global:LASTEXITCODE = 0
                   }
                   Start-Sleep -Seconds 2
               }
