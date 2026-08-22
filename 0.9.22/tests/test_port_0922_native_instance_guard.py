@@ -88,6 +88,8 @@ class NativeInstanceGuardArtifactTests(unittest.TestCase):
         self.assertFalse(any(name.startswith('python') for name in imports))
         for method_name in (
                 b'release_client_guard\0',
+                b'apply_standard_gameplay_mask\0',
+                b'restore_standard_gameplay_mask\0',
                 b'hide_process_windows\0',
                 b'show_process_windows\0'):
             self.assertIn(method_name, payload)
@@ -106,6 +108,14 @@ class NativeInstanceGuardArtifactTests(unittest.TestCase):
         self.assertIn('#define RVA_WGC_CLEANUP_THUNK 0x004b7180U', source)
         self.assertIn('#define RVA_WGC_HOLDER 0x019351ecU', source)
         self.assertIn('#define RVA_WGC_WRAPPER_VTABLE 0x010ef788U', source)
+        self.assertIn('#define RVA_MAPPING_SIGNATURE 0x00254fb9U', source)
+        self.assertIn(
+            '#define RVA_MAPPING_MASK_IMMEDIATE 0x00254fc2U', source)
+        self.assertIn('MAPPING_ORIGINAL_SIGNATURE', source)
+        self.assertIn('MAPPING_PATCHED_SIGNATURE', source)
+        self.assertIn('VirtualProtect(mask, 1U, PAGE_EXECUTE_READWRITE', source)
+        self.assertIn('FlushInstructionCache(', source)
+        self.assertIn('restore_standard_gameplay_mask_internal()', source)
         self.assertIn('validate_host(base)', source)
         self.assertIn(
             'OpenMutexW(SYNCHRONIZE, FALSE, CLIENT_MUTEX_NAME)', source)

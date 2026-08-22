@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -11,134 +12,111 @@ sys.path.insert(0, str(CLIENT_SCRIPTS))
 from gui.mods.offline_lan_0922 import native_mapping_mask
 
 
-class _Memory(object):
-    def __init__(self, signature=None, module_base=0x00400000):
-        self._module_base = module_base
-        self.signature_address = (
-            module_base + native_mapping_mask._SIGNATURE_RVA)
-        self.mask_address = (
-            module_base + native_mapping_mask._MASK_IMMEDIATE_RVA)
-        if signature is None:
-            signature = native_mapping_mask._ORIGINAL_SIGNATURE
-        self.data = bytearray(signature)
-        self.writes = []
+class _Bridge(object):
+    def __init__(self, apply_status=0, restore_status=0):
+        self.apply_status = apply_status
+        self.restore_status = restore_status
+        self.events = []
+        self.active = False
 
-    def module_base(self):
-        return self._module_base
+    def apply_standard_gameplay_mask(self):
+        self.events.append('apply')
+        if self.apply_status == 0:
+            self.active = True
+        return self.apply_status
 
-    def read(self, address, size):
-        offset = address - self.signature_address
-        return bytes(self.data[offset:offset + size])
-
-    def write_byte(self, address, value):
-        offset = address - self.signature_address
-        self.data[offset] = value
-        self.writes.append((address, value))
-
-
-class _PostWriteFailureMemory(_Memory):
-    def __init__(self):
-        _Memory.__init__(self)
-        self.failed = False
-
-    def write_byte(self, address, value):
-        _Memory.write_byte(self, address, value)
-        if value == 0x01 and not self.failed:
-            self.failed = True
-            raise native_mapping_mask.NativeMappingMaskError(
-                'simulated post-write failure')
+    def restore_standard_gameplay_mask(self):
+        self.events.append('restore')
+        if not self.active and self.restore_status == 0:
+            return 102
+        if self.restore_status == 0:
+            self.active = False
+        return self.restore_status
 
 
 class NativeMappingMaskTests(unittest.TestCase):
-    def test_exact_1513_signature_wraps_one_mapping_and_restores(self):
-        memory = _Memory()
+    def test_native_bridge_wraps_one_mapping_and_restores(self):
+        bridge = _Bridge()
         observed = []
 
         def mapping(space_id, path=None):
-            observed.append((
-                space_id, path, memory.read(memory.mask_address, 1)))
+            observed.append((space_id, path, bridge.active))
             return 37
 
         result = native_mapping_mask.call_with_standard_gameplay_mask(
             mapping, (1073741825,), {'path': 'spaces/02_malinovka'},
-            memory)
+            bridge)
 
         self.assertEqual(37, result)
         self.assertEqual(
-            [(1073741825, 'spaces/02_malinovka', b'\x01')], observed)
-        self.assertEqual(
-            [(memory.mask_address, 0x01),
-             (memory.mask_address, 0xff)], memory.writes)
-        self.assertEqual(
-            native_mapping_mask._ORIGINAL_SIGNATURE, bytes(memory.data))
+            [(1073741825, 'spaces/02_malinovka', True)], observed)
+        self.assertEqual(['apply', 'restore'], bridge.events)
+        self.assertFalse(bridge.active)
 
-    def test_mapping_exception_still_restores_original_opcode(self):
-        memory = _Memory()
+    def test_mapping_exception_still_restores_original_mask(self):
+        bridge = _Bridge()
 
         def mapping():
-            self.assertEqual(b'\x01', memory.read(memory.mask_address, 1))
+            self.assertTrue(bridge.active)
             raise LookupError('mapping failed')
 
         with self.assertRaisesRegex(LookupError, 'mapping failed'):
             native_mapping_mask.call_with_standard_gameplay_mask(
-                mapping, memory=memory)
+                mapping, native_bridge=bridge)
 
-        self.assertEqual(b'\xff', memory.read(memory.mask_address, 1))
-        self.assertEqual(
-            native_mapping_mask._ORIGINAL_SIGNATURE, bytes(memory.data))
+        self.assertEqual(['apply', 'restore'], bridge.events)
+        self.assertFalse(bridge.active)
 
-    def test_wrong_executable_signature_fails_before_callback(self):
-        signature = bytearray(native_mapping_mask._ORIGINAL_SIGNATURE)
-        signature[0] ^= 0xff
-        memory = _Memory(signature)
+    def test_apply_failure_fails_before_callback(self):
+        bridge = _Bridge(apply_status=103)
         called = []
 
         with self.assertRaisesRegex(
-                RuntimeError, 'signature does not match'):
+                RuntimeError, 'signature changed.*status 103'):
             native_mapping_mask.call_with_standard_gameplay_mask(
-                lambda: called.append(True), memory=memory)
+                lambda: called.append(True), native_bridge=bridge)
 
         self.assertEqual([], called)
-        self.assertEqual([], memory.writes)
+        self.assertEqual(['apply'], bridge.events)
 
-    def test_unexpected_module_base_fails_before_memory_access(self):
-        memory = _Memory(module_base=0x00500000)
+    def test_failed_native_rollback_is_reported(self):
+        bridge = _Bridge(apply_status=108, restore_status=106)
 
-        with self.assertRaisesRegex(RuntimeError, 'unexpected.*module base'):
+        with self.assertRaisesRegex(RuntimeError, 'rollback.*status 108'):
             native_mapping_mask.call_with_standard_gameplay_mask(
-                lambda: None, memory=memory)
+                lambda: None, native_bridge=bridge)
 
-        self.assertEqual([], memory.writes)
+        self.assertEqual(['apply', 'restore'], bridge.events)
 
-    def test_post_write_failure_rolls_back_changed_opcode(self):
-        memory = _PostWriteFailureMemory()
+    def test_restore_failure_replaces_mapping_result_with_failure(self):
+        bridge = _Bridge(restore_status=106)
 
-        with self.assertRaisesRegex(RuntimeError, 'post-write failure'):
+        with self.assertRaisesRegex(
+                RuntimeError, 'protection restore.*status 106'):
             native_mapping_mask.call_with_standard_gameplay_mask(
-                lambda: None, memory=memory)
+                lambda: 37, native_bridge=bridge)
 
-        self.assertEqual(
-            [(memory.mask_address, 0x01),
-             (memory.mask_address, 0xff)], memory.writes)
-        self.assertEqual(
-            native_mapping_mask._ORIGINAL_SIGNATURE, bytes(memory.data))
+        self.assertEqual(['apply', 'restore'], bridge.events)
 
-    def test_concurrent_opcode_change_restores_ours_then_fails_closed(self):
-        memory = _Memory()
+    def test_missing_native_method_fails_closed(self):
+        bridge = object()
 
-        def mapping():
-            memory.data[0] ^= 0xff
-
-        with self.assertRaisesRegex(RuntimeError, 'signature changed'):
+        with self.assertRaisesRegex(RuntimeError, 'bridge is incomplete'):
             native_mapping_mask.call_with_standard_gameplay_mask(
-                mapping, memory=memory)
+                lambda: None, native_bridge=bridge)
 
-        # A neighbouring opcode changed, but the finally path still restores
-        # the one immediate byte owned by this helper before reporting it.
-        self.assertEqual(b'\xff', memory.read(memory.mask_address, 1))
-        self.assertEqual(
-            [(memory.mask_address, 0x01),
-             (memory.mask_address, 0xff)], memory.writes)
+    def test_default_path_loads_the_exact_sidecar_bridge(self):
+        bridge = _Bridge()
+        with mock.patch.object(
+                native_mapping_mask, '_load_native_bridge',
+                return_value=bridge) as loader:
+            self.assertEqual(
+                9,
+                native_mapping_mask.call_with_standard_gameplay_mask(
+                    lambda: 9))
+
+        loader.assert_called_once_with()
+        self.assertEqual(['apply', 'restore'], bridge.events)
 
 
 if __name__ == '__main__':

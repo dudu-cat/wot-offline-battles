@@ -4,8 +4,8 @@
  * The embedded interpreter does not ship _ctypes and does not export its
  * Python C API.  This module resolves the two required C API functions from
  * validated RVAs in the main executable, then exposes a deliberately small
- * native surface.  It never patches the executable or closes a borrowed WGC
- * handle directly.
+ * native surface.  The gameplay-mapping opcode is changed only between one
+ * Python apply/restore pair; WGC handles are never closed directly.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -45,6 +45,8 @@ typedef void (__attribute__((thiscall)) *WgcCleanupThunkFn)(void *);
 #define RVA_WGC_CLEANUP_THUNK 0x004b7180U
 #define RVA_WGC_HOLDER 0x019351ecU
 #define RVA_WGC_WRAPPER_VTABLE 0x010ef788U
+#define RVA_MAPPING_SIGNATURE 0x00254fb9U
+#define RVA_MAPPING_MASK_IMMEDIATE 0x00254fc2U
 
 #define CLIENT_MUTEX_NAME L"wot_client_mutex"
 
@@ -62,6 +64,15 @@ typedef void (__attribute__((thiscall)) *WgcCleanupThunkFn)(void *);
 #define GUARD_STATUS_STATE_NOT_DISABLED 12L
 #define GUARD_STATUS_MUTEX_STILL_EXISTS 13L
 #define GUARD_STATUS_MUTEX_PROBE_FAILED 14L
+
+#define MAPPING_STATUS_ALREADY_ACTIVE 101L
+#define MAPPING_STATUS_NOT_ACTIVE 102L
+#define MAPPING_STATUS_SIGNATURE_CHANGED 103L
+#define MAPPING_STATUS_PROTECT_ENABLE_FAILED 104L
+#define MAPPING_STATUS_CACHE_FLUSH_FAILED 105L
+#define MAPPING_STATUS_PROTECT_RESTORE_FAILED 106L
+#define MAPPING_STATUS_VERIFY_FAILED 107L
+#define MAPPING_STATUS_ROLLBACK_FAILED 108L
 
 #define MAX_HIDDEN_WINDOWS 16U
 
@@ -82,6 +93,24 @@ static unsigned char *g_image_base = 0;
 static PyIntFromLongFn g_py_int_from_long = 0;
 static HiddenWindow g_hidden_windows[MAX_HIDDEN_WINDOWS];
 static unsigned int g_hidden_window_count = 0;
+static int g_mapping_mask_active = 0;
+static DWORD g_mapping_original_protection = 0;
+
+static const unsigned char MAPPING_ORIGINAL_SIGNATURE[] = {
+	0xc6, 0x45, 0xfc, 0x06, 0x85, 0xf6, 0x74, 0x44,
+	0x6a, 0xff, 0x57, 0x8d, 0x45, 0xb0, 0x8b, 0xce,
+	0x50, 0xff, 0xb5, 0x24, 0xff, 0xff, 0xff, 0xff,
+	0xb5, 0x20, 0xff, 0xff, 0xff, 0xe8, 0xc5, 0xda,
+	0x46, 0x00
+};
+
+static const unsigned char MAPPING_PATCHED_SIGNATURE[] = {
+	0xc6, 0x45, 0xfc, 0x06, 0x85, 0xf6, 0x74, 0x44,
+	0x6a, 0x01, 0x57, 0x8d, 0x45, 0xb0, 0x8b, 0xce,
+	0x50, 0xff, 0xb5, 0x24, 0xff, 0xff, 0xff, 0xff,
+	0xb5, 0x20, 0xff, 0xff, 0xff, 0xe8, 0xc5, 0xda,
+	0x46, 0x00
+};
 
 
 static int bytes_equal(const unsigned char *actual,
@@ -227,17 +256,23 @@ static int validate_host(unsigned char *base)
 				sizeof(py_int_signature)) ||
 			!readable_region(base + RVA_WGC_CLEANUP_THUNK,
 				sizeof(wgc_cleanup_signature)) ||
+			!readable_region(base + RVA_MAPPING_SIGNATURE,
+				sizeof(MAPPING_ORIGINAL_SIGNATURE)) ||
 			!bytes_equal(base + RVA_PY_INIT_MODULE4, py_init_signature,
 				sizeof(py_init_signature)) ||
 			!bytes_equal(base + RVA_PY_INT_FROM_LONG, py_int_signature,
 				sizeof(py_int_signature)) ||
 			!bytes_equal(base + RVA_WGC_CLEANUP_THUNK,
-				wgc_cleanup_signature, sizeof(wgc_cleanup_signature))) {
+				wgc_cleanup_signature, sizeof(wgc_cleanup_signature)) ||
+			!bytes_equal(base + RVA_MAPPING_SIGNATURE,
+				MAPPING_ORIGINAL_SIGNATURE,
+				sizeof(MAPPING_ORIGINAL_SIGNATURE))) {
 		return 0;
 	}
 	return executable_region(base + RVA_PY_INIT_MODULE4) &&
 		executable_region(base + RVA_PY_INT_FROM_LONG) &&
-		executable_region(base + RVA_WGC_CLEANUP_THUNK);
+		executable_region(base + RVA_WGC_CLEANUP_THUNK) &&
+		executable_region(base + RVA_MAPPING_SIGNATURE);
 }
 
 
@@ -338,6 +373,123 @@ static PyObject *release_client_guard(PyObject *unused_self,
 		return python_int(GUARD_STATUS_STATE_NOT_DISABLED);
 	}
 	return python_int(verify_client_mutex_absent());
+}
+
+
+static long restore_standard_gameplay_mask_internal(void)
+{
+	unsigned char *signature = g_image_base + RVA_MAPPING_SIGNATURE;
+	unsigned char *mask = g_image_base + RVA_MAPPING_MASK_IMMEDIATE;
+	DWORD current_protection = 0;
+	DWORD unused_protection = 0;
+	int flush_succeeded;
+	int protection_restored;
+	long status = 0;
+
+	if (!g_mapping_mask_active) {
+		return MAPPING_STATUS_NOT_ACTIVE;
+	}
+	if (!readable_region(signature,
+			sizeof(MAPPING_PATCHED_SIGNATURE)) ||
+			(*mask != 0x01U && *mask != 0xffU)) {
+		return MAPPING_STATUS_SIGNATURE_CHANGED;
+	}
+	if (!VirtualProtect(mask, 1U, PAGE_EXECUTE_READWRITE,
+			&current_protection)) {
+		return MAPPING_STATUS_PROTECT_ENABLE_FAILED;
+	}
+	if (*mask == 0x01U) {
+		*mask = 0xffU;
+	}
+	flush_succeeded = FlushInstructionCache(
+		GetCurrentProcess(), mask, 1U) != 0;
+	protection_restored = VirtualProtect(
+		mask, 1U, g_mapping_original_protection,
+		&unused_protection) != 0;
+
+	if (!flush_succeeded) {
+		status = MAPPING_STATUS_CACHE_FLUSH_FAILED;
+	} else if (!protection_restored) {
+		status = MAPPING_STATUS_PROTECT_RESTORE_FAILED;
+	} else if (!readable_region(signature,
+			sizeof(MAPPING_ORIGINAL_SIGNATURE)) || *mask != 0xffU) {
+		status = MAPPING_STATUS_VERIFY_FAILED;
+	} else if (!bytes_equal(signature, MAPPING_ORIGINAL_SIGNATURE,
+			sizeof(MAPPING_ORIGINAL_SIGNATURE))) {
+		/* A neighbouring opcode changed.  Our immediate is restored, but
+		 * report the exact-build boundary violation to the Python caller.
+		 */
+		status = MAPPING_STATUS_SIGNATURE_CHANGED;
+	}
+	if (*mask == 0xffU && flush_succeeded && protection_restored) {
+		g_mapping_mask_active = 0;
+		g_mapping_original_protection = 0;
+	}
+	return status;
+}
+
+
+static PyObject *apply_standard_gameplay_mask(PyObject *unused_self,
+		PyObject *unused_args)
+{
+	unsigned char *signature = g_image_base + RVA_MAPPING_SIGNATURE;
+	unsigned char *mask = g_image_base + RVA_MAPPING_MASK_IMMEDIATE;
+	DWORD old_protection = 0;
+	DWORD unused_protection = 0;
+	int flush_succeeded;
+	int protection_restored;
+	long status = 0;
+	long rollback_status;
+	(void)unused_self;
+	(void)unused_args;
+
+	if (g_mapping_mask_active) {
+		return python_int(MAPPING_STATUS_ALREADY_ACTIVE);
+	}
+	if (!readable_region(signature,
+			sizeof(MAPPING_ORIGINAL_SIGNATURE)) ||
+			!bytes_equal(signature, MAPPING_ORIGINAL_SIGNATURE,
+				sizeof(MAPPING_ORIGINAL_SIGNATURE))) {
+		return python_int(MAPPING_STATUS_SIGNATURE_CHANGED);
+	}
+	if (!VirtualProtect(mask, 1U, PAGE_EXECUTE_READWRITE,
+			&old_protection)) {
+		return python_int(MAPPING_STATUS_PROTECT_ENABLE_FAILED);
+	}
+	g_mapping_original_protection = old_protection;
+	*mask = 0x01U;
+	g_mapping_mask_active = 1;
+	flush_succeeded = FlushInstructionCache(
+		GetCurrentProcess(), mask, 1U) != 0;
+	protection_restored = VirtualProtect(
+		mask, 1U, old_protection, &unused_protection) != 0;
+
+	if (!flush_succeeded) {
+		status = MAPPING_STATUS_CACHE_FLUSH_FAILED;
+	} else if (!protection_restored) {
+		status = MAPPING_STATUS_PROTECT_RESTORE_FAILED;
+	} else if (!readable_region(signature,
+			sizeof(MAPPING_PATCHED_SIGNATURE)) ||
+			!bytes_equal(signature, MAPPING_PATCHED_SIGNATURE,
+				sizeof(MAPPING_PATCHED_SIGNATURE))) {
+		status = MAPPING_STATUS_VERIFY_FAILED;
+	}
+	if (status != 0) {
+		rollback_status = restore_standard_gameplay_mask_internal();
+		if (rollback_status != 0) {
+			return python_int(MAPPING_STATUS_ROLLBACK_FAILED);
+		}
+	}
+	return python_int(status);
+}
+
+
+static PyObject *restore_standard_gameplay_mask(PyObject *unused_self,
+		PyObject *unused_args)
+{
+	(void)unused_self;
+	(void)unused_args;
+	return python_int(restore_standard_gameplay_mask_internal());
 }
 
 
@@ -477,6 +629,16 @@ static PyMethodDef MODULE_METHODS[] = {
 	{
 		"release_client_guard", release_client_guard, METH_NOARGS,
 		"Run #1513's complete WGC teardown for this client process."
+	},
+	{
+		"apply_standard_gameplay_mask", apply_standard_gameplay_mask,
+		METH_NOARGS,
+		"Temporarily select standard CTF items for one geometry mapping."
+	},
+	{
+		"restore_standard_gameplay_mask", restore_standard_gameplay_mask,
+		METH_NOARGS,
+		"Restore #1513's original all-gameplay geometry mapping mask."
 	},
 	{
 		"hide_process_windows", hide_process_windows, METH_NOARGS,
