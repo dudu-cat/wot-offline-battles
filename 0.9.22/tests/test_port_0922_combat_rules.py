@@ -102,6 +102,19 @@ class CombatRulesTests(unittest.TestCase):
 
         self.assertEqual(89, value)
 
+    def test_ap_damage_roll_stays_within_twenty_five_percent(self):
+        shot = _shot(kind='ARMOR_PIERCING_CR', damage=400.0)
+
+        low = combat_rules.damage(
+            shot, 2, 100.0,
+            random_uniform=lambda minimum, unused_maximum: minimum)
+        high = combat_rules.damage(
+            shot, 2, 100.0,
+            random_uniform=lambda unused_minimum, maximum: maximum)
+
+        self.assertEqual(300, low)
+        self.assertEqual(500, high)
+
     def test_spaced_armour_is_paid_before_structural_plate(self):
         track = types.SimpleNamespace(armor=20.0, vehicleDamageFactor=0.0)
         hull = types.SimpleNamespace(armor=100.0, vehicleDamageFactor=1.0)

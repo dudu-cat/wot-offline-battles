@@ -12,12 +12,14 @@ from __future__ import annotations
 import copy
 import datetime
 import errno
+import gettext
 import hashlib
 import json
 import math
 import os
 import re
 import shutil
+import struct
 import sys
 import tempfile
 import zipfile
@@ -124,6 +126,7 @@ _FIELD_LABELS = {
     "damage": "Damage",
     "armor": "Vehicle damage",
     "devices": "Module damage",
+    "explosionRadius": "Explosion radius",
 }
 
 
@@ -349,6 +352,8 @@ def _field_rule(member, field_path):
         if component_name == "shells":
             if len(parts) == 2 and parts[-1] == "caliber":
                 return _POSITIVE
+            if len(parts) == 2 and parts[-1] == "explosionRadius":
+                return _POSITIVE
             if (len(parts) == 3 and parts[1] == "damage" and
                     parts[-1] in ("armor", "devices")):
                 return _POSITIVE
@@ -518,7 +523,7 @@ def list_vehicle_members(game_root):
 
 def list_vehicle_choices(game_root):
     """List real vehicle definitions as nation/vehicle choices."""
-    unused_status, package_path = _require_target(game_root)
+    status, package_path = _require_target(game_root)
     try:
         with zipfile.ZipFile(package_path, "r") as archive:
             counts = {}
@@ -531,9 +536,55 @@ def list_vehicle_choices(game_root):
             zipfile.BadZipFile) as error:
         raise VehicleOverlayError(
             "The original vehicle roster is unreadable: %s" % error)
-    return [dict((key, record[key]) for key in (
-        "nation", "vehicle", "member"))
-        for record in roster if record["selectable"]]
+    translators = {}
+    choices = []
+    for record in roster:
+        if not record["selectable"]:
+            continue
+        nation = record["nation"]
+        if nation not in translators:
+            translators[nation] = _vehicle_translations(
+                status["path"], nation)
+        label = _vehicle_label(record, translators[nation])
+        choice = dict((key, record[key]) for key in (
+            "nation", "vehicle", "member"))
+        choice["label"] = label
+        choices.append(choice)
+    return choices
+
+
+def _vehicle_translations(game_root, nation):
+    """Load one stock vehicle catalog, falling back to internal names."""
+    relative = "res/text/LC_MESSAGES/%s_vehicles.mo" % nation
+    try:
+        path = _game_owned_path(
+            game_root, os.path.join(game_root, *relative.split("/")),
+            "The stock vehicle translation catalog")
+    except VehicleOverlayError:
+        return None
+    if os.path.islink(path) or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb") as stream:
+            return gettext.GNUTranslations(stream)
+    except (IOError, OSError, EOFError, UnicodeError, ValueError,
+            struct.error):
+        return None
+
+
+def _vehicle_label(record, translations):
+    """Show a stock localized name while retaining the exact resource ID."""
+    vehicle = record["vehicle"]
+    for raw_key in (
+            record.get("shortUserString"), record.get("userString")):
+        key = raw_key or ""
+        if ":" in key:
+            key = key.rsplit(":", 1)[1]
+        key = key.lstrip("#")
+        localized = translations.gettext(key) if translations and key else key
+        if localized and localized not in (key, vehicle):
+            return "%s (%s)" % (localized, vehicle)
+    return vehicle
 
 
 def _vehicle_roster_from_archive(archive, counts, nation=None):
@@ -579,6 +630,7 @@ def _vehicle_roster_from_archive(archive, counts, nation=None):
                     member)
 
             tags = ""
+            user_strings = {}
             tag_values = [child for name, child in value.value.children
                           if name == b"tags"]
             if len(tag_values) == 1:
@@ -586,11 +638,22 @@ def _vehicle_roster_from_archive(archive, counts, nation=None):
                     tags = _scalar_text(tag_values[0])
                 except VehicleOverlayError:
                     tags = ""
+            for field_name in (b"userString", b"shortUserString"):
+                values = [child for name, child in value.value.children
+                          if name == field_name]
+                if len(values) == 1:
+                    try:
+                        user_strings[field_name.decode("ascii")] = (
+                            _scalar_text(values[0]))
+                    except VehicleOverlayError:
+                        pass
             records.append({
                 "nation": roster_nation,
                 "vehicle": vehicle,
                 "member": member,
                 "selectable": "observer" not in tags.split(),
+                "userString": user_strings.get("userString", ""),
+                "shortUserString": user_strings.get("shortUserString", ""),
             })
     return sorted(records, key=lambda record: (
         record["nation"], record["vehicle"], record["member"]))

@@ -32,6 +32,7 @@ OVERLAY_ENGINE_CONFIG = "res_mods/0.9.22.0.1/engine_config.xml"
 PROFILE_RELATIVE_PATH = (
     "WoTOfflineBattles/client_profiles/0.9.22/preferences.xml")
 PROFILE_PATH_BASE = "LOCAL_APP_DATA"
+NORMAL_PROFILE_RELATIVE_PATH = "Wargaming.net/WorldOfTanks/preferences.xml"
 
 _OWNED_PROFILE_PATH = re.compile(
     r"^WoTOfflineBattles/client_profiles/0\.9\.22"
@@ -225,6 +226,28 @@ def profile_path(environment=None):
     root = os.path.realpath(os.path.abspath(local_app_data))
     path = os.path.realpath(os.path.abspath(os.path.join(
         root, *PROFILE_RELATIVE_PATH.split("/"))))
+    root_key = os.path.normcase(root)
+    path_key = os.path.normcase(path)
+    try:
+        if (os.path.commonpath((root_key, path_key)) != root_key or
+                path_key == root_key):
+            return None
+    except ValueError:
+        return None
+    return path
+
+
+def normal_profile_path(environment=None):
+    """Return the stock client's shared preferences path, when resolvable."""
+    environment = os.environ if environment is None else environment
+    app_data = str(environment.get("APPDATA") or "").strip()
+    if not app_data or not os.path.isabs(app_data):
+        return None
+    root = os.path.realpath(os.path.abspath(app_data))
+    parts = NORMAL_PROFILE_RELATIVE_PATH.split("/")
+    directory = os.path.realpath(os.path.abspath(os.path.join(
+        root, *parts[:-1])))
+    path = os.path.join(directory, parts[-1])
     root_key = os.path.normcase(root)
     path_key = os.path.normcase(path)
     try:

@@ -4658,7 +4658,11 @@ class LANClientTests(unittest.TestCase):
             'type': 'welcome',
             'protocol': module.PROTOCOL_VERSION,
             'client_build': module.CLIENT_BUILD,
-            'capabilities': [module.PROJECTILE_LEDGER_CAPABILITY],
+            'capabilities': list(module.CLIENT_CAPABILITIES),
+            'server_capabilities': [
+                module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
+                module.RANDOM_MAP_CAPABILITY],
             'authority_epoch': 1,
             'player_id': 7,
             'host_player_id': 7,
@@ -4713,6 +4717,22 @@ class LANClientTests(unittest.TestCase):
         self.assertFalse(client.is_room_host())
         self.assertFalse(client.request_start('04_himmelsdorf'))
         self.assertEqual([], client.sock.payloads)
+
+    def test_room_host_can_request_random_but_unknown_maps_stay_closed(self):
+        module, client, _, _ = self._client()
+        self._activate_outbound(client)
+        client.ready = True
+        client.phase = 'waiting'
+        client.player_id = 7
+        client.host_player_id = 7
+        client.round_id = 3
+        client.map_pool = ['01_karelia', '04_himmelsdorf']
+        client.server_capabilities = [module.RANDOM_MAP_CAPABILITY]
+
+        self.assertFalse(client.request_start('99_missing'))
+        self.assertTrue(client.request_start(module.RANDOM_MAP_OPTION))
+        self.assertEqual(
+            module.RANDOM_MAP_OPTION, client._outbound_queue[-1][1]['map'])
 
     def test_older_same_round_roster_cannot_roll_back_room_host(self):
         _, client, events, _ = self._client()
@@ -4908,7 +4928,9 @@ class LANClientTests(unittest.TestCase):
         client._handle_message({
             'type': 'welcome', 'protocol': 5,
             'client_build': module.CLIENT_BUILD, 'player_id': 'bad',
-            'capabilities': [module.PROJECTILE_LEDGER_CAPABILITY],
+            'capabilities': list(module.CLIENT_CAPABILITIES),
+            'server_capabilities': [
+                module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY],
             'authority_epoch': 1,
             'host_player_id': 7, 'name': 'Player',
             'vehicle': 'ussr:MS-1', 'max_health': 100,
@@ -4928,7 +4950,9 @@ class LANClientTests(unittest.TestCase):
         client._handle_message({
             'type': 'welcome', 'protocol': 5,
             'client_build': module.CLIENT_BUILD, 'player_id': 7,
-            'capabilities': [module.PROJECTILE_LEDGER_CAPABILITY],
+            'capabilities': list(module.CLIENT_CAPABILITIES),
+            'server_capabilities': [
+                module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY],
             'authority_epoch': 1,
             'name': 'Player', 'vehicle': 'ussr:MS-1',
             'max_health': 100, 'team': 1, 'slot': 0, 'round_id': 1,

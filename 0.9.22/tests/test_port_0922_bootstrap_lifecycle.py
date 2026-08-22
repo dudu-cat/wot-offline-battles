@@ -332,7 +332,6 @@ class BootstrapLifecycleTests(unittest.TestCase):
             crew_skill_masks.append(skills_mask)
             if (nation_id, vehicle_type_id) == (1, 8):
                 raise ValueError('unloadable crew definition')
-            # Only the commander receives the offline Sixth Sense perk.
             return [
                 ('%d:%d:%s|%s|0' % (
                     nation_id, vehicle_type_id, role[0],
@@ -404,7 +403,7 @@ class BootstrapLifecycleTests(unittest.TestCase):
 
     ACTIVE_SKILLS = ('repair', 'camouflage', 'brotherhood', 'firefighting',
                      'commander_sixthSense', 'driver_virtuoso',
-                     'gunner_smoothTurret')
+                     'gunner_smoothTurret', 'loader_intuition')
 
     def test_a_fresh_garage_vehicle_starts_with_the_refill_switches_on(self):
         (bootstrap, unused_callbacks, unused_compatibility,
@@ -418,7 +417,7 @@ class BootstrapLifecycleTests(unittest.TestCase):
         for record in selected['vehicles']:
             self.assertEqual(15, record['settings'])
 
-    def test_every_crewman_starts_with_three_skills_left_to_pick(self):
+    def test_every_crewman_starts_with_eight_skills_left_to_pick(self):
         (bootstrap, unused_callbacks, unused_compatibility,
          unused_app_loader, unused_spaces, unused_events, modules) = self._load()
 
@@ -429,7 +428,7 @@ class BootstrapLifecycleTests(unittest.TestCase):
             for compact_descr in record['tankmen'].values():
                 descriptor = _TankmanDescr(compact_descr)
                 self.assertEqual(
-                    3, new_skill_count(descriptor, self.ACTIVE_SKILLS))
+                    8, new_skill_count(descriptor, self.ACTIVE_SKILLS))
 
     def test_no_crew_skill_is_chosen_for_the_player(self):
         (bootstrap, unused_callbacks, unused_compatibility,
@@ -441,7 +440,7 @@ class BootstrapLifecycleTests(unittest.TestCase):
         for record in selected['vehicles']:
             for compact_descr in record['tankmen'].values():
                 skills = _TankmanDescr(compact_descr).skills
-                self.assertIn(skills, ([], ['commander_sixthSense']))
+                self.assertEqual([], skills)
 
     def test_the_ammunition_layout_mirrors_the_loaded_shells(self):
         (bootstrap, unused_callbacks, unused_compatibility,
@@ -480,9 +479,13 @@ class BootstrapLifecycleTests(unittest.TestCase):
                 {'vehicle': 'ussr:R11_MS-1'})
 
         self.assertEqual([100001, 100002], selected['crew'])
+        skill_xp = sum(
+            _TankmanDescr.levelUpXpCost(level, step)
+            for step in range(1, 8)
+            for level in range(MAX_SKILL_LEVEL))
         self.assertEqual(
-            [b'0:11:commander|commander_sixthSense|1260360',
-             b'0:11:driver||630180'],
+            [b'0:11:commander||%d' % skill_xp,
+             b'0:11:driver||%d' % skill_xp],
             [selected['tankmen'][100001], selected['tankmen'][100002]])
         self.assertEqual((0, 111), selected['repair'])
         self.assertEqual((0, 0), selected['lock'])
@@ -554,7 +557,7 @@ class BootstrapLifecycleTests(unittest.TestCase):
         self.assertTrue({(1, 8), (1, 9)}.issubset(
                         set(runtime_vehicles.crewTypeIDs)))
         self.assertEqual(
-            {1 << 18},
+            {0},
             set(modules['items'].tankmen.generatedSkillMasks))
         self.assertTrue(
             {(2, 1), (2, 2), (2, 3)}.isdisjoint(

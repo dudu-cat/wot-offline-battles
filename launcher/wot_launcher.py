@@ -52,6 +52,8 @@ _CHINESE = {
     "Delete selected profile...": "删除所选方案…",
     "Repair": "修复",
     "Repair startup (keep saved data)": "修复启动问题（保留存档）",
+    "Normal client stuck loading? Clean preferences...":
+        "正式客户端卡在加载界面？点击清理配置…",
     "Reset all offline data...": "重置全部离线数据…",
     "Activity log": "运行日志",
     "Close game": "关闭游戏",
@@ -69,6 +71,11 @@ _CHINESE = {
     "Delete profile '%s' and all of its saved vehicle edits?":
         "删除方案“%s”及其中保存的全部车辆修改？",
     "Reset all offline data?": "重置全部离线数据？",
+    "Clean normal client preferences?": "清理正式客户端配置？",
+    "This moves the normal World of Tanks preferences.xml aside as a backup. "
+    "Graphics, window, and input settings will reset the next time the normal "
+    "client starts. Offline saved data is not changed. Continue?":
+        "这会把正式客户端的 preferences.xml 移到备份文件。下次启动正式客户端时，画面、窗口和按键设置会恢复默认；离线 Mod 存档不会改变。是否继续？",
     "This deletes this mod's saved address, account settings, garage fittings, "
     "post-battle results, configuration, and isolated client graphics/input "
     "preferences. Other mods and the normal World of Tanks profile are kept. "
@@ -399,12 +406,18 @@ class LauncherWindow(object):
         self.repair_button = tk.Button(
             self.repair_panel, text="",
             command=self._repair_startup)
-        self.repair_button.pack(side="left", fill="x", expand=True)
+        self.repair_button.grid(row=0, column=0, sticky="we")
         self.reset_button = tk.Button(
             self.repair_panel, text="",
             command=self._reset_all_state)
-        self.reset_button.pack(side="left", fill="x", expand=True,
-                               padx=(6, 0))
+        self.reset_button.grid(row=0, column=1, sticky="we", padx=(6, 0))
+        self.normal_preferences_button = tk.Button(
+            self.repair_panel, text="",
+            command=self._clean_normal_client_preferences)
+        self.normal_preferences_button.grid(
+            row=1, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        self.repair_panel.grid_columnconfigure(0, weight=1)
+        self.repair_panel.grid_columnconfigure(1, weight=1)
 
         self.log_panel = tk.LabelFrame(frame, text="", padx=6, pady=6)
         self.log_panel.grid(row=4, column=0, sticky="nsew")
@@ -412,6 +425,22 @@ class LauncherWindow(object):
             self.log_panel, height=10, width=72, state="disabled",
                                 wrap="none")
         self.log_view.pack(fill="both", expand=True)
+        self.author_text = tk.StringVar(value=(
+            "作者：伪红学家  B站：tiancaihb  QQ群：302519768  GitHub: "
+            "https://github.com/pengw0048/wot-offline-battles"))
+        self.author_entry = tk.Entry(
+            frame, textvariable=self.author_text, state="readonly",
+            relief="flat", borderwidth=0, highlightthickness=0)
+        self.author_entry.grid(row=5, column=0, sticky="we", pady=(8, 0))
+        self.distribution_notice_text = tk.StringVar(value=(
+            "本mod免费传播、开源、欢迎二创，使用无需付费，售卖与本人无关，"
+            "仅供个人学习交流"))
+        self.distribution_notice_entry = tk.Entry(
+            frame, textvariable=self.distribution_notice_text,
+            state="readonly", relief="flat", borderwidth=0,
+            highlightthickness=0)
+        self.distribution_notice_entry.grid(
+            row=6, column=0, sticky="we", pady=(2, 0))
         frame.grid_columnconfigure(0, weight=1)
         frame.grid_rowconfigure(4, weight=1)
 
@@ -463,6 +492,8 @@ class LauncherWindow(object):
             text=self._t("Delete selected profile..."))
         self.repair_button.config(
             text=self._t("Repair startup (keep saved data)"))
+        self.normal_preferences_button.config(text=self._t(
+            "Normal client stuck loading? Clean preferences..."))
         self.reset_button.config(text=self._t("Reset all offline data..."))
         self.log_panel.config(text=self._t("Activity log"))
         self._update_action_controls()
@@ -588,6 +619,7 @@ class LauncherWindow(object):
             not self._busy and not self._maintenance_busy and
             not server_running else "disabled")
         self.repair_button.config(state=maintenance_state)
+        self.normal_preferences_button.config(state=maintenance_state)
         self.reset_button.config(state=maintenance_state)
         profile_state = (
             "readonly" if maintenance_state == "normal" and
@@ -799,6 +831,35 @@ class LauncherWindow(object):
 
     def _repair_startup(self):
         return self._start_maintenance(core.repair_0_9_22_startup)
+
+    def _confirm_normal_preferences_cleanup(self):
+        from tkinter import messagebox
+
+        return messagebox.askyesno(
+            self._t("Clean normal client preferences?"),
+            self._t(
+                "This moves the normal World of Tanks preferences.xml aside "
+                "as a backup. Graphics, window, and input settings will reset "
+                "the next time the normal client starts. Offline saved data "
+                "is not changed. Continue?"),
+            icon="warning")
+
+    def _clean_normal_client_preferences(self):
+        if self._busy or self._maintenance_busy:
+            self._log("Wait for the current launcher operation to finish.")
+            return False
+        if self._refresh_client().get("client") != core.PORT_0_9_22:
+            self._log("Select the supported 0.9.22 game folder first.")
+            return False
+        if core.game_is_running():
+            self._log(
+                "Close World of Tanks before cleaning normal client "
+                "preferences.")
+            return False
+        if not self._confirm_normal_preferences_cleanup():
+            self._log("Normal client preferences cleanup was cancelled.")
+            return False
+        return self._start_maintenance(core.backup_normal_client_preferences)
 
     def _ask_profile_name(self):
         from tkinter import simpledialog
@@ -1324,11 +1385,14 @@ def _open_server_log():
 
 def _serve(argv):
     index = argv.index(core.SERVE_FLAG)
-    _open_server_log()
     if index + 1 >= len(argv):
         print("--serve needs a client version.")
         return 2
     port_version = argv[index + 1]
+    if port_version not in core.SUPPORTED_PORTS:
+        print("Unsupported client version: %s" % port_version)
+        return 2
+    _open_server_log()
     print("Starting the %s LAN server from %s" %
           (port_version, core.server_root()))
     try:

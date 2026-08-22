@@ -1,13 +1,15 @@
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 
 SERVER_ROOT = Path(__file__).resolve().parents[1] / 'server'
 sys.path.insert(0, str(SERVER_ROOT))
 
 from lan_battle_server import (  # noqa: E402
-    BattleState, CLIENT_BUILD_0922, PROJECTILE_CAPABILITY,
+    BattleState, CLIENT_BUILD_0922, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+    PROJECTILE_CAPABILITY,
 )
 
 
@@ -22,7 +24,8 @@ class _Connection(object):
 def _hello(index):
     return {
         'client_build': CLIENT_BUILD_0922,
-        'capabilities': [PROJECTILE_CAPABILITY],
+        'capabilities': [
+            PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY],
         'name': 'Player-%d' % index,
         'vehicle': 'ussr:R11_MS-1',
         'max_health': 90,
@@ -90,6 +93,37 @@ class ServerTeamSizeTests(unittest.TestCase):
         for value in (0, 16, 'invalid', 1.5, True):
             with self.assertRaises((TypeError, ValueError), msg=value):
                 BattleState(team_size=value)
+
+    def test_random_start_chooses_from_the_active_client_map_pool(self):
+        state = BattleState(
+            map_name='01_karelia', team_size=1, authority_mode='client')
+        player, error = state.add_player(
+            _Connection(), ('10.0.0.1', 1001), _hello(1))
+        self.assertIsNone(error)
+
+        with mock.patch(
+                'lan_battle_server.random.choice',
+                return_value='05_prohorovka') as choose:
+            start, error = state.request_start(
+                player.player_id, 'server_random')
+
+        self.assertIsNone(error)
+        self.assertEqual('05_prohorovka', state.map_name)
+        self.assertEqual('05_prohorovka', start['map'])
+        choose.assert_any_call(tuple(state._active_map_pool()))
+
+    def test_unknown_start_map_remains_fail_closed(self):
+        state = BattleState(
+            map_name='01_karelia', team_size=1, authority_mode='client')
+        player, error = state.add_player(
+            _Connection(), ('10.0.0.1', 1001), _hello(1))
+        self.assertIsNone(error)
+
+        start, error = state.request_start(player.player_id, '99_missing')
+
+        self.assertIsNone(start)
+        self.assertEqual('invalid_map', error)
+        self.assertEqual('01_karelia', state.map_name)
 
 
 if __name__ == '__main__':

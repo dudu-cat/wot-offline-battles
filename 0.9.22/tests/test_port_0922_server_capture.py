@@ -177,7 +177,22 @@ class ServerCaptureTests(unittest.TestCase):
         self.assertFalse(self._capture_tick(outside))
         self.assertEqual(0, outside.rules_state['bases']['1']['points'])
 
-    def test_leaver_drops_only_own_points_and_defender_only_pauses(self):
+    def test_owner_presence_does_not_pause_standard_ctf_capture(self):
+        state = self._state()
+        state.players[1] = _player(1, 1, 0.0, 0.0)
+        state.players[2] = _player(2, 2, 0.0, 0.0)
+
+        self._capture_tick(state)
+        self._capture_tick(state, 1)
+
+        base = state.rules_state['bases']['1']
+        self.assertEqual(2, base['points'])
+        self.assertEqual(1, base['invaders'])
+        self.assertEqual(98.0, base['time_left'])
+        self.assertFalse(base['stopped'])
+        self.assertEqual({'human:2': 2}, state.capture_contributors[1])
+
+    def test_leaver_drops_only_own_points_and_owner_does_not_pause(self):
         state = self._state()
         state.players[2] = _player(2, 2, 0.0, 0.0)
         state.players[3] = _player(3, 2, 1.0, 0.0)
@@ -192,8 +207,9 @@ class ServerCaptureTests(unittest.TestCase):
 
         state.players[1] = _player(1, 1, 0.0, 0.0)
         self._capture_tick(state, 3)
-        self.assertEqual(3, state.rules_state['bases']['1']['points'])
-        self.assertTrue(state.rules_state['bases']['1']['stopped'])
+        self.assertEqual(4, state.rules_state['bases']['1']['points'])
+        self.assertEqual({'human:3': 4}, state.capture_contributors[1])
+        self.assertFalse(state.rules_state['bases']['1']['stopped'])
 
     def test_bot_hit_resets_only_damaged_human_contribution(self):
         state = self._state()

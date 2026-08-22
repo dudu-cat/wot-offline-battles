@@ -94,6 +94,7 @@ _FIELD_CHINESE = {
     "Maximum distance": "最大射程", "Gravity": "重力",
     "Penetration": "穿深", "Caliber": "口径", "Damage": "伤害",
     "Vehicle damage": "车辆伤害", "Module damage": "模块伤害",
+    "Explosion radius": "HE 溅射范围",
 }
 
 _PACKED_TYPE_CHINESE = {
@@ -361,7 +362,11 @@ class VehicleEditorWindow(object):
             return self._show_error(
                 self._t("No supported vehicles were found in scripts.pkg."),
                 clear_contract=True)
-        self._vehicle_choices = list(choices)
+        self._vehicle_choices = sorted(
+            choices,
+            key=lambda choice: (
+                choice["nation"], self._choice_label(choice).casefold(),
+                choice["vehicle"]))
         nations = sorted(set(choice["nation"] for choice in choices))
         self.nation_box.config(values=tuple(nations))
         if self.nation.get().strip() not in nations:
@@ -377,24 +382,35 @@ class VehicleEditorWindow(object):
         nation = self.nation.get().strip()
         choices = [choice for choice in self._vehicle_choices
                    if choice["nation"] == nation]
-        vehicles = [choice["vehicle"] for choice in choices]
-        self.vehicle_box.config(values=tuple(vehicles))
-        if not vehicles:
+        labels = [self._choice_label(choice) for choice in choices]
+        self.vehicle_box.config(values=tuple(labels))
+        if not labels:
             return self._show_error(
                 self._t("The selected nation has no supported vehicles."),
                 clear_contract=True)
-        if self.vehicle.get().strip() not in vehicles:
-            self.vehicle.set(
-                DEFAULT_VEHICLE if DEFAULT_VEHICLE in vehicles
-                else vehicles[0])
+        selected = self.vehicle.get().strip()
+        selected_choice = next((
+            choice for choice in choices
+            if selected in (choice["vehicle"], self._choice_label(choice))),
+            None)
+        if selected_choice is None:
+            selected_choice = next((
+                choice for choice in choices
+                if choice["vehicle"] == DEFAULT_VEHICLE), choices[0])
+        self.vehicle.set(self._choice_label(selected_choice))
         return self.refresh_vehicle_fields()
+
+    @staticmethod
+    def _choice_label(choice):
+        return choice.get("label") or choice["vehicle"]
 
     def refresh_vehicle_fields(self, unused_event=None):
         nation = self.nation.get().strip()
         vehicle = self.vehicle.get().strip()
         choice = next((item for item in self._vehicle_choices
                        if item["nation"] == nation and
-                       item["vehicle"] == vehicle), None)
+                       vehicle in (
+                           item["vehicle"], self._choice_label(item))), None)
         if choice is None:
             return self._show_error(
                 self._t("Choose one listed vehicle."), clear_contract=True)

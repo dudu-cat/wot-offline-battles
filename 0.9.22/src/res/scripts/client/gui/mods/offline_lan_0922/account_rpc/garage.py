@@ -40,6 +40,8 @@ GUN_ITEM_TYPE = 4
 OPTIONAL_DEVICE_ITEM_TYPE = 9
 SHELL_ITEM_TYPE = 10
 EQUIPMENT_ITEM_TYPE = 11
+# Shop.freeXPToTManXPRate in the pinned #1513 sync data.
+FREE_XP_TO_TANKMAN_XP_RATE = 10
 
 # items.components.c11n_constants.SeasonType in #1513.  Keep these values
 # engine-free here; the stock parser still owns the descriptor validation.
@@ -677,5 +679,21 @@ class GarageState(object):
             record['tankmen'][tankman_id] = descriptor.makeCompactDescr()
         except Exception as error:
             raise GarageError('the client refused the skill reset: %s' % error)
+        self.revision += 1
+        return record
+
+    def train_tankman(self, tankman_inventory_id, free_xp):
+        """Convert the requested free XP into crew XP at the #1513 rate."""
+        record, tankman_id = self._tankman_record(tankman_inventory_id)
+        amount = _int(free_xp)
+        if amount <= 0:
+            raise GarageError('crew training XP must be positive')
+        tankmen = self._tankmen_module()
+        try:
+            descriptor = tankmen.TankmanDescr(record['tankmen'][tankman_id])
+            descriptor.addXP(amount * FREE_XP_TO_TANKMAN_XP_RATE)
+            record['tankmen'][tankman_id] = descriptor.makeCompactDescr()
+        except Exception as error:
+            raise GarageError('the client refused crew training: %s' % error)
         self.revision += 1
         return record

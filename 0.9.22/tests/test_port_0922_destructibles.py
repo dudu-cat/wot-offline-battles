@@ -1572,6 +1572,226 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual(1, len(calls))
         self.assertTrue(calls[0][-1])
 
+    def test_shot_lazily_registers_far_baked_fragile_after_live_validation(self):
+        filename = 'content/MilitaryEnvironment/mle033_WatchTower.model'
+        matrix = _ItemMatrix(_Vector(0.0, 0.0, 5.0))
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Vector
+        math_module.Matrix = lambda value: value
+        signature = destructibles_sensor._locator_signature(
+            matrix, _Vector(), math_module, 1000)
+        destructibles_sensor.set_catalog(_catalog({
+            filename: {
+                'kind': 'fragile',
+                'boxes': [[-1.0, -1.0, -1.0,
+                           1.0, 2.0, 1.0, None]],
+            },
+        }, [list(signature) + [filename, 0, 22, 0, 1.0]]))
+        self.assertEqual({}, getattr(
+            destructibles_sensor, 'g_offh_destr_instances', {}))
+
+        manager = _Manager()
+        manager.space_id = 1
+        manager.set_chunk_count(22, 1)
+        area = types.ModuleType('AreaDestructibles')
+        area.g_destructiblesManager = manager
+        area.DESTR_TYPE_TREE = 1
+        area.DESTR_TYPE_FALLING_ATOM = 2
+        area.DESTR_TYPE_FRAGILE = 3
+        area.DESTR_TYPE_STRUCTURE = 4
+        area.g_cache = types.SimpleNamespace(
+            getDescByFilename=lambda value: (
+                {'type': 3, 'health': 5} if value == filename else None))
+        category_calls = []
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_collideSegment = lambda *unused: None
+        # The #1513 helper is only a diagnostic prefix and may disagree with
+        # the exact signature, including for a nonblank slot.
+        bigworld.wg_getChunkDestrFilenames = lambda *unused: ('other',)
+        bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
+            translation=_Vector())
+        bigworld.wg_getDestructibleMatrix = lambda *unused: matrix
+        bigworld.wg_getDestructibleEffectCategory = (
+            lambda *args: category_calls.append(args) or 3)
+        bigworld.time = lambda: 10.0
+        cache = types.ModuleType('DestructiblesCache')
+        cache.scaledDestructibleHealth = lambda scale, health: int(
+            math.ceil(scale * scale * health))
+        calls = []
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda *unused: False,
+            destroy_fragile=lambda *args: calls.append(args) or True)
+        shot = types.SimpleNamespace(shell=types.SimpleNamespace(
+            kind='ARMOR_PIERCING'))
+        destructibles_sensor.xrange = range
+        destructibles_sensor.set_event_sink(lambda unused: True)
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': bigworld,
+                              'AreaDestructibles': area,
+                              'DestructiblesCache': cache,
+                              'Math': math_module}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority):
+            result = destructibles_sensor.shot_world_distance(
+                bigworld, 1, _Vector(), _Vector(0, 0, 20),
+                _Vector(0, 0, 1), shot)
+
+        self.assertIsNone(result['stop_distance'])
+        self.assertEqual(25.0, result['piercing_loss'])
+        self.assertIn((22, 0), destructibles_sensor.g_offh_destr_instances)
+        self.assertEqual(1, len(category_calls))
+        self.assertEqual((1, 22, 0, -1), category_calls[0])
+        self.assertEqual(1, len(calls))
+        self.assertTrue(calls[0][-1])
+
+    def test_far_baked_fragile_fails_closed_until_chunk_is_streamed(self):
+        filename = 'content/MilitaryEnvironment/mle008_Canisters.model'
+        matrix = _ItemMatrix(_Vector(0.0, 0.0, 5.0))
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Vector
+        math_module.Matrix = lambda value: value
+        signature = destructibles_sensor._locator_signature(
+            matrix, _Vector(), math_module, 1000)
+        destructibles_sensor.set_catalog(_catalog({
+            filename: {
+                'kind': 'fragile',
+                'boxes': [[-1.0, -1.0, -1.0,
+                           1.0, 2.0, 1.0, None]],
+            },
+        }, [list(signature) + [filename, 0, 22, 0, 1.0]]))
+        manager = _Manager()
+        manager.space_id = 1
+        area = types.ModuleType('AreaDestructibles')
+        area.g_destructiblesManager = manager
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Vector
+        math_module.Matrix = lambda value: value
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_collideSegment = lambda *unused: None
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda *unused: False,
+            destroy_fragile=lambda *unused: self.fail(
+                'unstreamed baked identity was destroyed'))
+        shot = types.SimpleNamespace(shell=types.SimpleNamespace(
+            kind='ARMOR_PIERCING'))
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': bigworld,
+                              'AreaDestructibles': area,
+                              'Math': math_module}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority):
+            result = destructibles_sensor.shot_world_distance(
+                bigworld, 1, _Vector(), _Vector(0, 0, 20),
+                _Vector(0, 0, 1), shot)
+
+        self.assertTrue(result['stopped_by_destructible'])
+        self.assertAlmostEqual(4.0, result['stop_distance'])
+        self.assertNotIn((22, 0), getattr(
+            destructibles_sensor, 'g_offh_destr_instances', {}))
+
+    def test_far_baked_fragile_effect_mismatch_fails_closed(self):
+        filename = 'content/MilitaryEnvironment/mle011_GroupBoxes.model'
+        matrix = _ItemMatrix(_Vector(0.0, 0.0, 5.0))
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Vector
+        math_module.Matrix = lambda value: value
+        signature = destructibles_sensor._locator_signature(
+            matrix, _Vector(), math_module, 1000)
+        destructibles_sensor.set_catalog(_catalog({
+            filename: {
+                'kind': 'fragile',
+                'boxes': [[-1.0, -1.0, -1.0,
+                           1.0, 2.0, 1.0, None]],
+            },
+        }, [list(signature) + [filename, 0, 22, 0, 1.0]]))
+        manager = _Manager()
+        manager.space_id = 1
+        manager.set_chunk_count(22, 1)
+        area = types.ModuleType('AreaDestructibles')
+        area.g_destructiblesManager = manager
+        area.DESTR_TYPE_TREE = 1
+        area.DESTR_TYPE_FALLING_ATOM = 2
+        area.DESTR_TYPE_FRAGILE = 3
+        area.DESTR_TYPE_STRUCTURE = 4
+        area.g_cache = types.SimpleNamespace(
+            getDescByFilename=lambda value: (
+                {'type': 3, 'health': 5} if value == filename else None))
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_getChunkDestrFilenames = lambda *unused: ('',)
+        bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
+            translation=_Vector())
+        bigworld.wg_getDestructibleMatrix = lambda *unused: matrix
+        # The exact wire/signature says fragile, but the live native category
+        # says structure.  Baked geometry must not authorize this mutation.
+        bigworld.wg_getDestructibleEffectCategory = lambda *unused: 4
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda *unused: False)
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': bigworld,
+                              'AreaDestructibles': area,
+                              'Math': math_module}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority):
+            result = destructibles_sensor._catalog_shot_intersection(
+                1, _Vector(), _Vector(0, 0, 20))
+
+        self.assertTrue(result['ambiguous'])
+        self.assertIsNone(result['candidate'])
+        self.assertNotIn((22, 0), getattr(
+            destructibles_sensor, 'g_offh_destr_instances', {}))
+
+    def test_baked_broad_phase_covers_signature_quantization_at_bin_edge(self):
+        filename = 'content/MilitaryEnvironment/mle008_Canisters.model'
+        # The live origin still quantizes to 7.999, while this asymmetric box
+        # crosses the 8 m bin edge only in the exact live transform.
+        matrix = _ItemMatrix(_Vector(7.99949, 0.0, 5.0))
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Vector
+        math_module.Matrix = lambda value: value
+        signature = destructibles_sensor._locator_signature(
+            matrix, _Vector(), math_module, 1000)
+        record = {
+            'kind': 'fragile',
+            'boxes': [[-1.0, -1.0, -1.0,
+                       0.0006, 2.0, 1.0, None]],
+        }
+        destructibles_sensor.set_catalog(_catalog({
+            filename: record,
+        }, [list(signature) + [filename, 0, 22, 0, 1.0]]))
+        prepared = destructibles_sensor._destructible_catalog[
+            'resources'][filename.lower()]
+        live = {
+            'filename': filename.lower(),
+            'descriptor_filename': filename,
+            'kind': 'fragile',
+            'boxes': destructibles_sensor._world_catalog_boxes(
+                prepared, matrix, _Vector(), math_module, 0),
+            'item_scale': 1.0,
+            'box_index': 0,
+        }
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda *unused: False)
+
+        with mock.patch.object(
+                destructibles_sensor, '_get_destr_authority',
+                return_value=authority), mock.patch.object(
+                destructibles_sensor, '_stream_baked_shot_instance_1513',
+                return_value=live) as streamed:
+            hit = destructibles_sensor._catalog_shot_intersection(
+                1, _Vector(8.00005, 0.0, 0.0),
+                _Vector(8.00005, 0.0, 20.0))
+
+        self.assertIsNotNone(hit)
+        self.assertFalse(hit['ambiguous'])
+        self.assertEqual((22, 0), hit['candidate'][:2])
+        streamed.assert_called_once_with(1, (22, 0))
+
     def test_typed_shot_uses_scaled_health_and_shell_family(self):
         destructibles_sensor.xrange = range
         filename = 'content/Environment/ScaledFragile.model'
@@ -2190,7 +2410,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
 
         self.assertEqual({}, destructibles_sensor.g_offh_destr_instances)
 
-    def test_nonblank_v3_filename_mismatch_is_rejected(self):
+    def test_nonblank_filename_mismatch_defers_to_exact_instance_identity(self):
         expected = 'content/test/normal/lod0/expected.model'
         matrix = _ItemMatrix()
         math_module = types.ModuleType('Math')
@@ -2222,6 +2442,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
             translation=_Vector())
         bigworld.wg_getDestructibleMatrix = lambda *unused: matrix
+        bigworld.wg_getDestructibleEffectCategory = lambda *unused: 3
         type_descriptor = _Strict1513Component(
             hull=_Strict1513Component(
                 hitTester=types.SimpleNamespace(bbox=(
@@ -2231,10 +2452,11 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         with mock.patch.dict(
                 sys.modules, {'AreaDestructibles': area,
                               'BigWorld': bigworld, 'Math': math_module}):
-            with self.assertRaisesRegex(
-                    RuntimeError, 'filename disagrees'):
-                destructibles_sensor._fell_trees_near(
-                    1, _Vector(), 0.0, 6.0, type_descriptor)
+            destructibles_sensor._fell_trees_near(
+                1, _Vector(), 0.0, 6.0, type_descriptor)
+
+        instance = destructibles_sensor.g_offh_destr_instances[(22, 0)]
+        self.assertEqual(expected, instance['filename'])
 
     def test_v3_native_slot_and_effect_category_abi_fail_explicitly(self):
         filename = 'content/test/normal/lod0/fence.model'

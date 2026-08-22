@@ -14,7 +14,8 @@ import time
 
 from gui.mods.offline_lan_0922 import config as port_config
 from gui.mods.offline_lan_0922.lan_client import (
-    CLIENT_BUILD, CLIENT_CAPABILITIES, MAX_MOTION_TIME_US,
+    CLIENT_BUILD, CLIENT_CAPABILITIES, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+    MAX_MOTION_TIME_US,
     MAX_PROJECTILE_ID, PROTOCOL_VERSION, PROJECTILE_LEDGER_CAPABILITY,
     SIMULATION_WORKER_CAPABILITY, WORKER_AUTHORITY_ID, LANClient,
     _BOT_STATE_WIRE_FIELDS,
@@ -135,6 +136,8 @@ class AuthorityWorkerLANClient(LANClient):
 
     def _handle_worker_welcome(self, message):
         capabilities = _strict_capabilities(message.get('capabilities'))
+        server_capabilities = _strict_capabilities(
+            message.get('server_capabilities', []))
         state_revision = _exact_int(message.get('state_revision'))
         round_id = _exact_int(message.get('round_id'))
         host_player_id = _exact_int(message.get('host_player_id'))
@@ -154,6 +157,9 @@ class AuthorityWorkerLANClient(LANClient):
                 message.get('role') != WORKER_ROLE or
                 _exact_int(message.get('worker_id')) != WORKER_AUTHORITY_ID or
                 capabilities is None or
+                server_capabilities is None or
+                DESTRUCTIBLE_CATALOG_V5_CAPABILITY not in
+                server_capabilities or
                 PROJECTILE_LEDGER_CAPABILITY not in capabilities or
                 SIMULATION_WORKER_CAPABILITY not in capabilities or
                 state_revision is None or state_revision < 0 or
@@ -178,6 +184,7 @@ class AuthorityWorkerLANClient(LANClient):
         self.authority_epoch = authority_epoch
         self.server_time_ms = server_time_ms
         self.capabilities = capabilities
+        self.server_capabilities = server_capabilities
         self._notify('welcome', message)
         return True
 

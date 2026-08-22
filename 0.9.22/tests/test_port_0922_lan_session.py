@@ -2391,12 +2391,13 @@ class _Room(object):
     guest_view = True
 
     def __init__(self, request_start, map_pool, status=None, on_close=None,
-                 host=None):
+                 host=None, random_supported=None):
         self.request_start = request_start
         self.map_pool = map_pool
         self.status = status
         self.on_close = on_close
         self.host = host
+        self.random_supported = random_supported
         self.install_calls = 0
         self.open_calls = 0
         self.close_calls = 0

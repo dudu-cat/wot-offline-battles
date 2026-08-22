@@ -136,7 +136,7 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
     def test_contract_is_pinned_to_client_1513(self):
         self.assertEqual('offline-lan-0922-destructible-catalog',
                          self.baker.FORMAT_NAME)
-        self.assertEqual(4, self.baker.FORMAT_VERSION)
+        self.assertEqual(5, self.baker.FORMAT_VERSION)
         self.assertEqual(
             'offline-lan-0922-destructible-catalog-manifest',
             self.baker.MANIFEST_FORMAT)
@@ -182,14 +182,15 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
             return self.baker.bake_compiled_map(
                 'synthetic', b'pkg', b'space', b'xml', descriptors)
 
-    def test_synthetic_wgde_wires_shift_past_speedtree_and_empty_items(self):
+    def test_synthetic_wgde_wires_compact_empty_items(self):
         sections, descriptors = _synthetic_scene()
         data = self._bake_synthetic(sections, descriptors)
         by_file = {row[12]: row for row in data['instances']}
         self.assertEqual(3, len(data['instances']))
-        # Chunk 100 holds a SpeedTree item and an empty item before the
-        # fragile, so the fragile's native itemIndex is 2, not 0.
-        self.assertEqual([100, 2], by_file[SYNTH_FRAGILE][14:16])
+        # Chunk 100 holds a SpeedTree item and an empty WGDE row before the
+        # fragile. The streamed #1513 API keeps the tree but omits the empty
+        # row, so the fragile's native itemIndex is 1.
+        self.assertEqual([100, 1], by_file[SYNTH_FRAGILE][14:16])
         # Both shed module rows form one multi-reference native item.
         self.assertEqual([200, 0], by_file[SYNTH_SHED][14:16])
         self.assertIsNone(by_file[SYNTH_SHED][13])

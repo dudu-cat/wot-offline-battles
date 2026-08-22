@@ -60,6 +60,7 @@ CONTROL_FRAME_OFFSET = 0.01
 PANEL_WIDTH = 680
 PANEL_HEIGHT = 300
 POINTER_TICK_SECONDS = 0.03
+RANDOM_MAP_OPTION = 'server_random'
 
 _HOST_CONTROLS = ('previous', 'map', 'next', 'start')
 
@@ -79,6 +80,8 @@ def _log(message):
 
 def friendly_map_name(map_name):
     """Turn a server geometry name into a readable room label."""
+    if map_name == RANDOM_MAP_OPTION:
+        return 'Random'
     parts = str(map_name or '').split('_')
     prefix = ''
     if parts and parts[0].isdigit():
@@ -232,12 +235,13 @@ class WaitingRoomUI(object):
     guest_view = True
 
     def __init__(self, request_start, map_pool, status=None, on_close=None,
-                 host=None, surface=None):
+                 host=None, surface=None, random_supported=None):
         self._request_start = request_start
         self._map_pool = map_pool
         self._status = status or (lambda: '')
         self._on_close = on_close
         self._host = host or (lambda: False)
+        self._random_supported = random_supported or (lambda: True)
         self._surface = surface
         self._panel = None
         self._controls = {}
@@ -360,7 +364,11 @@ class WaitingRoomUI(object):
         return component
 
     def _options(self):
-        return [name for name in (self._map_pool() or ()) if name]
+        maps = [name for name in (self._map_pool() or ())
+                if name and name != RANDOM_MAP_OPTION]
+        if maps and self._random_supported():
+            return [RANDOM_MAP_OPTION] + maps
+        return maps
 
     def _sync_selection(self):
         options = self._options()

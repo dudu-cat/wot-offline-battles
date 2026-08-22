@@ -1,7 +1,7 @@
-"""Launcher logic shared by the 0.8.2 and 0.9.22 client ports.
+"""Launcher logic for the exact supported 0.9.22 client.
 
-This module keeps every version-specific contract explicit. It writes only the
-user-owned settings files that each port already reads at client startup.
+This module keeps the client contract explicit and writes only the user-owned
+settings files that the port already reads at client startup.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ElementTree
 
 PORT_0_8_2 = "0.8.2"
 PORT_0_9_22 = "0.9.22"
-SUPPORTED_PORTS = (PORT_0_8_2, PORT_0_9_22)
+SUPPORTED_PORTS = (PORT_0_9_22,)
 
 MODE_SINGLE = "single"
 MODE_HOST = "host"
@@ -108,12 +108,15 @@ _SERVER_PROBES = {
         "client_build": "1.8.60-native-experimental-20260815",
         "vehicle": "ussr:MS-1",
         "capabilities": None,
+        "server_capabilities": None,
     },
     PORT_0_9_22: {
         "protocol": 5,
         "client_build": "wot-0.9.22.0.1-cn-1513",
         "vehicle": "ussr:R11_MS-1",
-        "capabilities": ("projectile_ledger_v1",),
+        "capabilities": (
+            "projectile_ledger_v1", "destructible_catalog_v5"),
+        "server_capabilities": ("destructible_catalog_v5",),
     },
 }
 
@@ -258,8 +261,6 @@ def read_client_version(game_root):
 def port_for_version(version, build=None):
     if not version:
         return None
-    if version == PORT_0_8_2 or version.startswith(PORT_0_8_2 + "."):
-        return PORT_0_8_2
     if (version == _PINNED_0_9_22_VERSION and
             str(build or "") == _PINNED_0_9_22_BUILD):
         return PORT_0_9_22
@@ -979,6 +980,53 @@ def _isolated_0_9_22_preferences_path(environment=None):
     return preferences_overlay.profile_path(environment)
 
 
+def _normal_client_preferences_path(environment=None):
+    try:
+        from . import preferences_overlay
+    except ImportError:
+        import preferences_overlay
+
+    return preferences_overlay.normal_profile_path(environment)
+
+
+def backup_normal_client_preferences(game_root, is_running=None,
+                                     environment=None, timestamp=None):
+    """Move the stock client's preferences aside as a recoverable backup."""
+    import time
+
+    _require_0_9_22_maintenance_target(game_root, is_running)
+    path = _normal_client_preferences_path(environment)
+    if path is None:
+        raise LauncherError(
+            "The normal World of Tanks preferences path could not be "
+            "resolved from APPDATA.")
+    if not os.path.lexists(path):
+        return [
+            "The normal World of Tanks preferences.xml is already absent."
+        ]
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise LauncherError(
+            "The normal World of Tanks preferences path is not a regular "
+            "file; it was left unchanged.")
+
+    stamp = str(timestamp or time.strftime("%Y%m%d-%H%M%S"))
+    backup = "%s.wot-offline-backup-%s" % (path, stamp)
+    suffix = 1
+    while os.path.lexists(backup):
+        backup = "%s.wot-offline-backup-%s-%d" % (path, stamp, suffix)
+        suffix += 1
+    try:
+        os.replace(path, backup)
+    except (IOError, OSError) as error:
+        raise LauncherError(
+            "The normal World of Tanks preferences could not be backed up: "
+            "%s" % error)
+    return [
+        "Moved the normal World of Tanks preferences.xml to backup: %s" %
+        backup
+    ]
+
+
 def repair_0_9_22_startup(game_root, base_dir=None, is_running=None):
     """Refresh package-owned files and preserve every usable saved value."""
     _require_0_9_22_maintenance_target(game_root, is_running)
@@ -1234,6 +1282,10 @@ def probe_server_protocol(port_version, host, port, timeout=1.5, connect=None):
         capabilities = contract["capabilities"]
         compatible = (capabilities is None or set(capabilities).issubset(
             set(reply.get("capabilities") or ())))
+        server_capabilities = contract.get("server_capabilities")
+        compatible = (compatible and (
+            server_capabilities is None or set(server_capabilities).issubset(
+                set(reply.get("server_capabilities") or ()))))
         if compatible:
             try:
                 connection.sendall(b'{"type":"leave"}\n')

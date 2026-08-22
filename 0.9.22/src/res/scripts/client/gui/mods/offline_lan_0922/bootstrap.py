@@ -32,7 +32,7 @@ _worker_ready_signaled = False
 # Enough of every artefact that the garage never blocks a mount on stock.
 OFFLINE_ARTEFACT_STOCK = 200
 # Untrained skills offered per crewman before the player picks any.
-NEW_SKILL_SLOTS = 3
+NEW_SKILL_SLOTS = 8
 _NEW_SKILL_XP = {}
 _store = None
 _postbattle_store = None
@@ -429,10 +429,10 @@ def _selected_vehicle(config, restore_saved=True):
                                 vehicle_blacklist.missing_resources(
                                     descriptor.type.name))))
                 _install_top_modules(descriptor)
-                # generateTankmen filters this mask through each crew role;
-                # only the commander receives the offline Sixth Sense perk.
-                skills_mask = tankmen.getSkillsMask(
-                    ('commander_sixthSense',))
+                # A fresh offline crew starts without preselected perks.  The
+                # free-XP budget below exposes the requested empty slots, so
+                # the player remains the sole owner of every skill choice.
+                skills_mask = tankmen.getSkillsMask(())
                 crew_compact_descrs = list(tankmen.generateTankmen(
                     nation_id, vehicle_type_id, descriptor.type.crewRoles,
                     False, tankmen.MAX_SKILL_LEVEL, skills_mask, False))

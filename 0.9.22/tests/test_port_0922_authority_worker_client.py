@@ -198,7 +198,7 @@ class AuthorityWorkerClientTests(unittest.TestCase):
                 port_config.DEFAULT_CONFIG,
                 environ={port_config.CLIENT_MODE_ENV: 'unexpected'})
 
-    def test_player_hello_wire_shape_remains_unchanged(self):
+    def test_player_hello_wire_shape_advertises_required_capabilities(self):
         client = LANClient(
             '127.0.0.1', 28782, 'Player', 'ussr:R11_MS-1',
             max_health=90, account_key='account', outfits={})
@@ -349,6 +349,10 @@ class AuthorityWorkerClientTests(unittest.TestCase):
             'client_build': CLIENT_BUILD,
             'capabilities': list(CLIENT_CAPABILITIES) + [
                 SIMULATION_WORKER_CAPABILITY],
+            'server_capabilities': [
+                lan_client_module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                lan_client_module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
+                lan_client_module.RANDOM_MAP_CAPABILITY],
             'map': '01_karelia', 'map_pool': ['01_karelia'],
             'host_player_id': 1, 'phase': 'waiting', 'round_id': 0,
             'state_revision': 1,

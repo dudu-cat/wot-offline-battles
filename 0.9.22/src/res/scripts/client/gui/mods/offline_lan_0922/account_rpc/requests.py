@@ -163,10 +163,21 @@ def _add_tankman_skill(context, args):
 
 
 def _drop_tankman_skills(context, args):
-    if not args:
+    # Inventory.__dropSkillsTman_onShopSynced sends
+    # (shopRev, tmanInvID, dropSkillsCostIdx).
+    if len(args) < 3:
         return Result(commands.RES_FAILURE, 'INVALID_CREW_REQUEST')
     return _fitting(
-        context, lambda state: state.drop_tankman_skills(args[0]))
+        context, lambda state: state.drop_tankman_skills(args[1]))
+
+
+def _train_tankman(context, args):
+    # Inventory.__freeXPToTankman_onShopSynced sends
+    # (shopRev, tmanInvID, freeXP).
+    if len(args) < 3:
+        return Result(commands.RES_FAILURE, 'INVALID_CREW_REQUEST')
+    return _fitting(
+        context, lambda state: state.train_tankman(args[1], args[2]))
 
 
 def _buy_item(context, args):
@@ -375,6 +386,7 @@ HANDLERS = {
     commands.CMD_SET_AND_FILL_LAYOUTS: _set_and_fill_layouts,
     commands.CMD_TMAN_ADD_SKILL: _add_tankman_skill,
     commands.CMD_TMAN_DROP_SKILLS: _drop_tankman_skills,
+    commands.CMD_TRAINING_TMAN: _train_tankman,
     commands.CMD_BUY_ITEM: _buy_item,
     commands.CMD_BUY_AND_EQUIP_ITEM: _buy_and_equip_item,
     commands.CMD_VEH_SETTINGS: _vehicle_settings,

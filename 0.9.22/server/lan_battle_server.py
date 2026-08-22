@@ -141,6 +141,14 @@ PROJECTILE_MAX_GRAVITY = 500.0
 PROJECTILE_CLOCK_LEEWAY_MS = 250
 PROJECTILE_TOLERANCE = 0.001
 PROJECTILE_CAPABILITY = "projectile_ledger_v1"
+PROJECTILE_HIT_VEHICLE_CAPABILITY = "projectile_hit_vehicle_v1"
+RANDOM_MAP_CAPABILITY = "random_map_v1"
+DESTRUCTIBLE_CATALOG_V5_CAPABILITY = "destructible_catalog_v5"
+SERVER_CAPABILITIES = (
+    DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+    PROJECTILE_HIT_VEHICLE_CAPABILITY,
+    RANDOM_MAP_CAPABILITY,
+)
 MAX_MOTION_TIME_US = 10000000000000000
 # A source clock may span publications that were dropped or rejected, so its
 # delta can exceed one BotRuntime step. It may not, however, advance more than
@@ -1300,7 +1308,9 @@ class BattleState:
                         len(set(raw_capabilities)) != len(raw_capabilities)):
                     return None, "unsupported_capabilities"
                 capabilities = tuple(raw_capabilities)
-                if PROJECTILE_CAPABILITY not in capabilities:
+                if (PROJECTILE_CAPABILITY not in capabilities or
+                        DESTRUCTIBLE_CATALOG_V5_CAPABILITY not in
+                        capabilities):
                     return None, "unsupported_capabilities"
                 account_key = hello.get("account_key")
                 if account_key is None:
@@ -1410,6 +1420,7 @@ class BattleState:
                 return None, "unsupported_capabilities"
             capabilities = tuple(raw_capabilities)
             if (PROJECTILE_CAPABILITY not in capabilities or
+                    DESTRUCTIBLE_CATALOG_V5_CAPABILITY not in capabilities or
                     SIMULATION_WORKER_CAPABILITY not in capabilities):
                 return None, "unsupported_capabilities"
             if (self.client_build is not None and
@@ -1831,9 +1842,15 @@ class BattleState:
                 return None, "missing_projectile_capability"
             if requested_map not in (None, ""):
                 requested_map = str(requested_map)
-                if requested_map not in self._active_map_pool():
-                    return None, "invalid_map"
-                self.map_name = requested_map
+                active_map_pool = tuple(self._active_map_pool())
+                if requested_map == DEFAULT_MAP:
+                    if not active_map_pool:
+                        return None, "invalid_map"
+                    self.map_name = random.choice(active_map_pool)
+                else:
+                    if requested_map not in active_map_pool:
+                        return None, "invalid_map"
+                    self.map_name = requested_map
             connected = [p for p in self.players.values() if p.connected]
             self.round_start_time = int(time.time())
             for participant in connected:
@@ -3940,6 +3957,12 @@ class BattleState:
             event_kind = ("bot_human_hit" if target_kind == "player"
                           else "bot_bot_hit")
             attacker_key = "attacker_bot"
+        blocked_damage = 0
+        if (not proposal["splash"] and was_alive and
+                int(record["team"]) != int(proposal["target_team"]) and
+                proposal["shot_result"] != 2):
+            blocked_damage = max(
+                0, proposal["potential_damage"] - damage)
         event = {
             "kind": event_kind,
             attacker_key: record["shooter_id"],
@@ -3948,6 +3971,7 @@ class BattleState:
             "shot_seq": record["shot_seq"],
             "shell_index": record["shell_index"],
             "shot_result": proposal["shot_result"],
+            "blocked_damage": blocked_damage,
             "damage": applied, "health": health, "dead": not alive,
             "attack_reason": 0, "death_reason": 0,
             "source": "shot", "splash": proposal["splash"],
@@ -3981,9 +4005,9 @@ class BattleState:
             row["shots_hit"] += 1
             if proposal["shot_result"] == 2:
                 row["shots_penetrated"] += 1
-            elif was_alive:
-                self._statistics_row(*victim)["damage_blocked"] += max(
-                    0, proposal["potential_damage"] - damage)
+            elif blocked_damage:
+                self._statistics_row(*victim)[
+                    "damage_blocked"] += blocked_damage
         if was_alive and not alive:
             if target_kind == "player":
                 target.death_attacker_kind = record["shooter_kind"]
@@ -4010,8 +4034,9 @@ class BattleState:
                 "base_checked_ms", "outcome", "resolved_time_ms",
                 "checked_distance", "piercing_loss", "penetration_factor",
                 "impact", "direct", "splash", "destructibles",
+                "hit_vehicle",
             }
-            if set(message) != allowed:
+            if set(message) not in (allowed, allowed - {"hit_vehicle"}):
                 return False
             projectile_id = message.get("projectile_id")
             if (not isinstance(projectile_id, str) or not projectile_id or
@@ -4074,6 +4099,17 @@ class BattleState:
                     impact = None
                 if direct_raw is not None and outcome != "impact":
                     raise ValueError("direct effect without impact")
+                raw_hit_vehicle = message.get("hit_vehicle")
+                if raw_hit_vehicle is None and "hit_vehicle" not in message:
+                    hit_vehicle = direct_raw is not None
+                elif isinstance(raw_hit_vehicle, bool):
+                    hit_vehicle = raw_hit_vehicle
+                else:
+                    raise ValueError("invalid vehicle impact verdict")
+                if outcome != "impact" and hit_vehicle:
+                    raise ValueError("non-impact cannot hit a vehicle")
+                if direct_raw is not None and not hit_vehicle:
+                    raise ValueError("direct effect needs a vehicle impact")
                 direct = (self._normalize_projectile_effect(
                     direct_raw, record, impact, False)
                           if direct_raw is not None else None)
@@ -4101,6 +4137,7 @@ class BattleState:
                 "checked_distance": checked_distance,
                 "piercing_loss": piercing_loss,
                 "penetration_factor": penetration_factor,
+                "hit_vehicle": hit_vehicle,
                 "shooter_kind": record["shooter_kind"],
                 "shooter_id": record["shooter_id"],
                 "shot_seq": record["shot_seq"],
@@ -4156,6 +4193,7 @@ class BattleState:
                 "checked_distance": record["checked_distance"],
                 "piercing_loss": record["piercing_loss"],
                 "penetration_factor": record["penetration_factor"],
+                "hit_vehicle": False,
                 "shooter_kind": record["shooter_kind"],
                 "shooter_id": record["shooter_id"],
                 "shot_seq": record["shot_seq"],
@@ -5811,8 +5849,12 @@ class BattleState:
                 points = min(100, sum(
                     max(0, int(value or 0))
                     for value in contributors.values()))
-                state['stopped'] = bool(invader_keys and defenders > 0)
-                if invader_keys and not state['stopped'] and points < 100:
+                # Standard CTF bases do not stop capture merely because an
+                # owner enters its own circle.  Only an invader leaving,
+                # dying, or taking qualifying damage drops that vehicle's
+                # contribution.
+                state['stopped'] = False
+                if invader_keys and points < 100:
                     cursor = (self.capture_cursors[base_team] %
                               len(invader_keys))
                     budget = min(3, len(invader_keys), 100 - points)
@@ -6287,6 +6329,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
             "worker_id": worker.worker_id,
             "client_build": state.client_build,
             "capabilities": list(worker.capabilities),
+            "server_capabilities": list(SERVER_CAPABILITIES),
             "map": state.map_name,
             "map_pool": list(state._active_map_pool()),
             "host_player_id": state.host_player_id,
@@ -6569,6 +6612,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         welcome_message.update({
                             "authority_epoch": server.state.authority_epoch,
                             "capabilities": list(player.capabilities),
+                            "server_capabilities": list(SERVER_CAPABILITIES),
                         })
                     welcomed = player.send(welcome_message)
                     if welcomed:

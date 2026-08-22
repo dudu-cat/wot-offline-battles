@@ -129,9 +129,31 @@ class WaitingRoomTests(unittest.TestCase):
         self.room.open()
         for role in ('previous', 'map', 'next', 'start'):
             self.assertTrue(self._visible(role), role)
-        self.assertEqual('MAP: 01 - Karelia', self._label('map'))
+        self.assertEqual('MAP: Random', self._label('map'))
         self.assertEqual('LAN SERVER: 10.0.0.5:28782', self._label('room'))
         self.assertEqual('PLAYERS (2): Host, Guest', self._label('players'))
+
+    def test_random_is_the_first_map_option_and_starts_with_its_wire_name(self):
+        self.room.open()
+
+        self.assertEqual(self.module.RANDOM_MAP_OPTION,
+                         self.room._selected_map)
+        self.assertTrue(self.room.activate('start'))
+        self.assertEqual([self.module.RANDOM_MAP_OPTION], self.started)
+
+        self.assertTrue(self.room.activate('next'))
+        self.assertEqual('MAP: 01 - Karelia', self._label('map'))
+
+    def test_random_is_hidden_when_the_server_does_not_advertise_it(self):
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True,
+            surface=self.surface, random_supported=lambda: False)
+
+        self.assertTrue(room.open())
+        self.assertEqual('01_karelia', room._selected_map)
+        self.assertTrue(room.activate('start'))
+        self.assertEqual(['01_karelia'], self.started)
 
     def test_the_room_takes_and_releases_the_native_cursor(self):
         class _CursorSurface(_Surface):
@@ -371,6 +393,9 @@ class WaitingRoomTests(unittest.TestCase):
                          self.module.friendly_map_name('01_karelia'))
         self.assertEqual('Himmelsdorf Winter',
                          self.module.friendly_map_name('himmelsdorf_winter'))
+        self.assertEqual(
+            'Random', self.module.friendly_map_name(
+                self.module.RANDOM_MAP_OPTION))
         self.assertEqual('Unknown', self.module.friendly_map_name(''))
 
 

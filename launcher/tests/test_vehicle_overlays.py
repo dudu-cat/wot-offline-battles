@@ -141,6 +141,7 @@ class VehicleOverlayTest(unittest.TestCase):
         shell_record = packed.PackedElement(children=[
             (b"id", scalar(packed.TYPE_INTEGER, 1)),
             (b"caliber", scalar(packed.TYPE_INTEGER, 20)),
+            (b"explosionRadius", scalar(packed.TYPE_STRING, b"2.42")),
             (b"damage", element([
                 (b"armor", scalar(packed.TYPE_INTEGER, 10)),
                 (b"devices", scalar(packed.TYPE_INTEGER, 27)),
@@ -155,6 +156,10 @@ class VehicleOverlayTest(unittest.TestCase):
             (b"xmlns:xmlref", scalar(
                 packed.TYPE_STRING, b"http://www.w3.org/2001/XInclude")),
             (b"R11_MS-1", element([
+                (b"userString", scalar(
+                    packed.TYPE_STRING, b"#ussr_vehicles:R11_MS-1")),
+                (b"shortUserString", scalar(
+                    packed.TYPE_STRING, b"#ussr_vehicles:R11_MS-1_short")),
                 (b"tags", scalar(packed.TYPE_STRING, b"lightTank")),
             ])),
             (b"R12_Test", element([
@@ -287,6 +292,19 @@ class VehicleOverlayTest(unittest.TestCase):
         self.assertEqual("string", penetration["packedType"])
         self.assertIn("exactly two", penetration["constraint"])
 
+        shell_fields = vehicle_overlays.list_editable_fields(
+            self.game, self.SHELLS)
+        explosion_radius = next(
+            record for record in shell_fields
+            if record["fieldPath"] == "Shell-A/explosionRadius")
+        module_damage = next(
+            record for record in shell_fields
+            if record["fieldPath"] == "Shell-A/damage/devices")
+        self.assertEqual("2.42", explosion_radius["originalValue"])
+        self.assertIn("positive", explosion_radius["constraint"])
+        self.assertEqual("27", module_damage["originalValue"])
+        self.assertIn("positive", module_damage["constraint"])
+
         engine_paths = [
             record["fieldPath"] for record in
             vehicle_overlays.list_editable_fields(self.game, self.ENGINES)]
@@ -312,6 +330,9 @@ class VehicleOverlayTest(unittest.TestCase):
                    if record["fieldPath"] == "shared/Gun-A/reloadTime")
         shell = next(record for record in fields
                      if record["fieldPath"] == "Shell-A/damage/armor")
+        explosion_radius = next(
+            record for record in fields
+            if record["fieldPath"] == "Shell-A/explosionRadius")
 
         self.assertEqual("Vehicle", direct["categoryLabel"])
         self.assertFalse(direct["shared"])
@@ -329,6 +350,37 @@ class VehicleOverlayTest(unittest.TestCase):
         self.assertEqual(self.ENGINES, engine["member"])
         self.assertEqual(self.GUNS, gun["member"])
         self.assertEqual(self.SHELLS, shell["member"])
+        self.assertEqual("Shell-A / Explosion radius",
+                         explosion_radius["fieldLabel"])
+        self.assertEqual(self.SHELLS, explosion_radius["member"])
+
+    def test_vehicle_browser_shows_the_stock_name_and_exact_resource_id(self):
+        class _Translations(object):
+            @staticmethod
+            def gettext(key):
+                return "MS-1" if key == "R11_MS-1_short" else key
+
+        with mock.patch.object(
+                vehicle_overlays, "_vehicle_translations",
+                return_value=_Translations()):
+            choices = vehicle_overlays.list_vehicle_choices(self.game)
+
+        ms1 = next(choice for choice in choices
+                   if choice["vehicle"] == "R11_MS-1")
+        self.assertEqual("MS-1 (R11_MS-1)", ms1["label"])
+
+    def test_type_5_heavy_localized_label_remains_unambiguous(self):
+        class _Translations(object):
+            @staticmethod
+            def gettext(key):
+                return "五式重战" if key == "J20_Type_2605_short" else key
+
+        label = vehicle_overlays._vehicle_label({
+            "vehicle": "J20_Type_2605",
+            "shortUserString": "#japan_vehicles:J20_Type_2605_short",
+        }, _Translations())
+
+        self.assertEqual("五式重战 (J20_Type_2605)", label)
 
     def test_vehicle_local_gun_values_win_and_hull_health_is_editable(self):
         root = packed.read_packed_xml(self.members[self.VEHICLE])
@@ -403,6 +455,34 @@ class VehicleOverlayTest(unittest.TestCase):
         self.assertEqual("22 18", result["originalValue"])
         self.assertEqual("30 24", result["currentValue"])
 
+    def test_existing_shell_explosion_radius_is_safely_editable(self):
+        field_path = "Shell-A/explosionRadius"
+
+        result = vehicle_overlays.apply_vehicle_edit(
+            self.game, self.SHELLS, field_path, "3.5",
+            is_running=lambda: False)
+
+        value = vehicle_overlays._find_value(
+            self._root(self.SHELLS), field_path)
+        self.assertEqual(packed.TYPE_STRING, value.value_type)
+        self.assertEqual(b"3.5", value.value)
+        self.assertEqual("2.42", result["originalValue"])
+        self.assertEqual("3.5", result["currentValue"])
+
+    def test_existing_shell_module_damage_is_safely_editable(self):
+        field_path = "Shell-A/damage/devices"
+
+        result = vehicle_overlays.apply_vehicle_edit(
+            self.game, self.SHELLS, field_path, "30",
+            is_running=lambda: False)
+
+        value = vehicle_overlays._find_value(
+            self._root(self.SHELLS), field_path)
+        self.assertEqual(packed.TYPE_INTEGER, value.value_type)
+        self.assertEqual(30, value.value)
+        self.assertEqual("27", result["originalValue"])
+        self.assertEqual("30", result["currentValue"])
+
     def test_ids_resources_compressed_strings_and_missing_children_are_refused(self):
         refused = (
             (self.ENGINES, "ids/GAZ-M1"),
@@ -425,6 +505,7 @@ class VehicleOverlayTest(unittest.TestCase):
             (self.GUNS, "shared/Gun-A/reloadTime", "inf"),
             (self.GUNS, "shared/Gun-A/maxAmmo", str(1 << 63)),
             (self.SHELLS, "Shell-A/damage/armor", "-1"),
+            (self.SHELLS, "Shell-A/explosionRadius", "0"),
             (self.GUNS,
              "shared/Gun-A/shots/Shell-A/piercingPower", "30"),
             (self.GUNS,

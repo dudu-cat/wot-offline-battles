@@ -40,7 +40,7 @@ import navigation_graph_schema
 
 
 FORMAT_NAME = 'offline-lan-0922-destructible-catalog'
-FORMAT_VERSION = 4
+FORMAT_VERSION = 5
 MANIFEST_FORMAT = FORMAT_NAME + '-manifest'
 GAME_VERSION = '0.9.22.0.1-cn-1513'
 DECODER_VERSION = '0.9.22.0.1'
@@ -233,11 +233,12 @@ def _native_wires(compiled, bsmi_count):
     """Map each referenced BSMI row to its native (chunk_id, item_index).
 
     WGDE table "1" rows are (chunk_id, global_item_begin, item_count) and
-    must partition table "2" from zero.  Each table "2" row is one native
-    item spanning an inclusive reference range in table "3"; ref_begin >
-    ref_end is a valid empty item that still consumes an item index.  A
-    table "3" reference selects an SpTr row when bit 0x80000000 is set and
-    a BSMI row otherwise.
+    must partition table "2" from zero.  Each non-empty table "2" row is one
+    native item spanning an inclusive reference range in table "3".  The
+    stock #1513 streamed API compacts rows where ref_begin > ref_end, so an
+    empty WGDE row does not consume a native item index.  A table "3"
+    reference selects an SpTr row when bit 0x80000000 is set and a BSMI row
+    otherwise.
     """
     wgde = compiled.sections['WGDE']._data
     table1 = wgde.get('1')
@@ -249,17 +250,23 @@ def _native_wires(compiled, bsmi_count):
     sptr_count = len(compiled.sections['SpTr']._data['speedtree_list'])
     chunk_ranges = sorted((int(begin), int(count), int(chunk_id))
                           for chunk_id, begin, count in table1)
-    item_wires = []
     item_cursor = 0
     seen_chunk_ids = set()
     for begin, count, chunk_id in chunk_ranges:
         if begin != item_cursor or count < 0 or chunk_id in seen_chunk_ids:
             raise ValueError('WGDE chunk item ranges are not contiguous')
         seen_chunk_ids.add(chunk_id)
-        item_wires.extend((chunk_id, index) for index in range(count))
         item_cursor += count
     if item_cursor != len(table2):
         raise ValueError('WGDE chunk item ranges do not cover the item table')
+    item_wires = [None] * len(table2)
+    for begin, count, chunk_id in chunk_ranges:
+        native_index = 0
+        for position in range(begin, begin + count):
+            ref_begin, ref_end = table2[position]
+            if int(ref_begin) <= int(ref_end):
+                item_wires[position] = (chunk_id, native_index)
+                native_index += 1
     row_wires = {}
     wire_rows = {}
     sptr_seen = set()

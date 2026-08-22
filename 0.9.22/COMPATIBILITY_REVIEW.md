@@ -344,8 +344,10 @@ The complete streamed-slot boundary comes from the exact #1513 native path:
 that manager count and enumerates every native index. It uses
 `wg_getChunkDestrFilenames` only for its available filename prefix; a short
 prefix no longer proves that later fragile, structure or falling slots do not
-exist. A missing native count is retried after streaming rather than guessed,
-and a contradictory filename list fails closed.
+exist. A filename disagreement is retained as a diagnostic while the unique
+matrix signature, exact native wire and native effect category remain the
+fail-closed identity boundary. A missing native count is retried after
+streaming rather than guessed.
 
 For Windows verification, bounded `DESTR` lines report one aggregate for each
 newly scanned chunk plus each first distinct contact stage. The logger reuses
@@ -991,15 +993,15 @@ from the BSMO collision bounds of every plain-static and preserved-structure
 instance), with baked foliage concealment on top.
 
 The server destroys map objects with the retail laws over donated native
-values. The destructible catalogs (schema v4) bake every instance's native
+values. The destructible catalogs (schema v5) bake every instance's native
 wire identity and exact transform scale from the compiled `space.bin`:
 WGDE table "1" rows are `(chunk_id, global_item_begin, item_count)`, each
 table "2" row is one native item spanning an inclusive reference range in
-table "3" (`ref_begin > ref_end` is a valid empty item that still consumes
-an item index), and a table "3" reference selects an SpTr row when bit
-`0x80000000` is set and a BSMI row otherwise. All 61,625 emitted instances
-across the 41 shipped maps map one-to-one onto native wires under this
-contract. A loading client therefore donates each map's complete
+table "3" (`ref_begin > ref_end` is a valid empty WGDE row omitted from the
+stock streamed native index), and a table "3" reference selects an SpTr row
+when bit `0x80000000` is set and a BSMI row otherwise. All 61,625 emitted
+instances across the 41 shipped maps map one-to-one onto native wires under
+this contract. A loading client therefore donates each map's complete
 destructible identities immediately, without waiting for streamed chunks
 (`destructible_map`: locator signature, native `chunk_id`/`item_index`,
 healths pre-scaled by the native

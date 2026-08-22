@@ -401,6 +401,33 @@ class BattleProjectileTests(unittest.TestCase):
         battle._remote_factory.stop_projectile_tracer.assert_called_once_with(
             'player:7:1', [5.0, 0.875, 0.0], explosion=None)
 
+    def test_non_authority_snapshot_keeps_metadata_for_ground_terminal(self):
+        battle, unused_bigworld = _battle(now=1.0)
+        battle.client.is_bot_authority = lambda: False
+        battle._remote_factory = types.SimpleNamespace(
+            play_projectile_tracer=mock.Mock(return_value=True),
+            stop_projectile_tracer=mock.Mock(return_value=True))
+        snapshot_row = dict(_event())
+        snapshot_row['max_distance'] = snapshot_row.pop('maxDistance')
+        for name in ('kind', 'attacker', 'authority_epoch'):
+            snapshot_row.pop(name, None)
+        snapshot = {'projectiles': [snapshot_row]}
+
+        self.assertTrue(battle._reconcile_projectile_snapshot(snapshot))
+        battle._projectile_explosion = mock.Mock(return_value='ground-fx')
+        self.assertTrue(battle._apply_projectile_terminal_event({
+            'kind': 'projectile_impact',
+            'projectile_id': 'player:7:1', 'outcome': 'impact',
+            'resolved_time_ms': 500, 'impact': [5.0, 0.875, 0.0],
+            'hit_vehicle': False,
+        }))
+
+        battle._projectile_explosion.assert_called_once_with(
+            'player:7:1', [5.0, 0.875, 0.0])
+        battle._remote_factory.stop_projectile_tracer.assert_called_once_with(
+            'player:7:1', [5.0, 0.875, 0.0],
+            explosion='ground-fx')
+
     def test_a_world_terminal_carries_the_ground_explosion(self):
         battle, unused_bigworld = _battle(now=1.0)
         battle._remote_factory = types.SimpleNamespace(
@@ -540,6 +567,41 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertEqual(0, battle._projectile_candidate_count)
         self.assertTrue(queried)
         self.assertFalse(set(target_ids).intersection(queried))
+
+    def test_destroyed_vehicle_still_owns_projectile_collision(self):
+        battle, unused_bigworld = _battle()
+        self.assertTrue(battle._accept_projectile_event(_event()))
+        source = battle._server_entity(41)
+        wreck = types.SimpleNamespace(
+            id=42, isStarted=True,
+            position=_Vector((5.0, 1.0, 0.0)), isAlive=lambda: False,
+            collideSegmentExt=mock.Mock(return_value=(
+                types.SimpleNamespace(dist=5.0),)))
+        battle._records['bot:8'] = {
+            'engine_id': 42, 'network_id': 8, 'kind': 'bot',
+            'local': False, 'ready': True,
+            'state': {'health': 0, 'alive': False}}
+        battle._server_entity = lambda entity_id: (
+            source if entity_id == 41 else wreck if entity_id == 42 else None)
+        battle._projectile_current_positions = {
+            'player:7': (0.0, 0.0, 0.0),
+            'bot:8': (5.0, 1.0, 0.0),
+        }
+        battle._resolve_shot_scene = mock.Mock(return_value={
+            'piercing_loss': 0.0, 'penetration_factor': 1.0,
+            'world_distance': 99999.0,
+            'stopped_by_destructible': False,
+        })
+        state = battle._projectiles.get('player:7:1')
+
+        terminal = battle._projectile_chord(
+            state, (0.0, 1.0, 0.0), (10.0, 1.0, 0.0), 0.0, 0.1)
+
+        self.assertEqual({'reason': 'impact', 'fraction': 0.5}, terminal)
+        self.assertEqual(
+            'bot:8', battle._projectile_terminal_data[
+                'player:7:1']['target_key'])
+        wreck.collideSegmentExt.assert_called_once()
 
     def test_stock_max_29_projectile_debt_bounds_frame_and_reduces_scans(self):
         battle, bigworld = _battle()

@@ -16,7 +16,8 @@ sys.path.insert(0, str(ROOT / '0.9.22' / 'server'))
 from gui.mods.offline_lan_0922.account_rpc import commands, data, requests
 from gui.mods.offline_lan_0922.account_rpc import postbattle_store
 from lan_battle_server import (
-    BattleState, CLIENT_BUILD_0922, MAX_RESULT_RECEIPTS,
+    BattleState, CLIENT_BUILD_0922, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+    MAX_RESULT_RECEIPTS,
     PROJECTILE_CAPABILITY, Player)
 import lan_battle_server as lan_server_module
 from offline_rewards import compute_offline_rewards
@@ -294,7 +295,13 @@ class PostBattleContractTests(unittest.TestCase):
         self.assertEqual('AVATAR_FULL_RESULTS', avatar[0])
         self.assertEqual('VEH_FULL_RESULTS', vehicles[50001][0])
         self.assertEqual(4, len(public))
+        avatar_fields = packers.calls[0][1]
+        self.assertEqual(0, avatar_fields['avatarDamageDealt'])
+        self.assertEqual(0, avatar_fields['avatarKills'])
         vehicle_fields = packers.calls[1][1]
+        self.assertEqual(receipt['stats']['damage'],
+                         vehicle_fields['damageDealt'])
+        self.assertEqual(receipt['stats']['kills'], vehicle_fields['kills'])
         self.assertEqual(600, vehicle_fields['xp'])
         self.assertEqual(30, vehicle_fields['freeXP'])
         self.assertEqual(0, vehicle_fields['autoRepairCost'])
@@ -397,6 +404,8 @@ class PostBattleContractTests(unittest.TestCase):
                         if name == 'PLAYER_INFO']
         vehicle_calls = [value for name, value in packers.calls
                          if name == 'VEH_PUBLIC_RESULTS']
+        avatar_calls = [value for name, value in packers.calls
+                        if name == 'AVATAR_PUBLIC_RESULTS']
         common = [value for name, value in packers.calls
                   if name == 'COMMON_RESULTS'][0]
         self.assertEqual(
@@ -404,6 +413,12 @@ class PostBattleContractTests(unittest.TestCase):
             [value['name'] for value in player_calls])
         self.assertEqual([900, 250, 900],
                          [value['damageDealt'] for value in vehicle_calls])
+        self.assertEqual([2, 0, 1],
+                         [value['kills'] for value in vehicle_calls])
+        self.assertEqual(
+            [(0, 0), (0, 0), (0, 0)],
+            [(value['avatarDamageDealt'], value['avatarKills'])
+             for value in avatar_calls])
         self.assertEqual(3, vehicle_calls[0]['killerID'])
         self.assertEqual((60002, b'Atlas-17'), common['bots'][3])
 
@@ -610,7 +625,9 @@ class PostBattleContractTests(unittest.TestCase):
         rejoined, error = state.add_player(
             _Socket(), ('127.0.0.1', 3), {
                 'client_build': CLIENT_BUILD_0922,
-                'capabilities': [PROJECTILE_CAPABILITY],
+                'capabilities': [
+                    PROJECTILE_CAPABILITY,
+                    DESTRUCTIBLE_CATALOG_V5_CAPABILITY],
                 'account_key': first.account_key,
                 'name': 'A', 'vehicle': first.vehicle,
                 'max_health': first.max_health, 'outfits': {},
@@ -624,7 +641,9 @@ class PostBattleContractTests(unittest.TestCase):
         account_key = 'a' * 32
         hello = {
             'client_build': CLIENT_BUILD_0922,
-            'capabilities': [PROJECTILE_CAPABILITY],
+            'capabilities': [
+                PROJECTILE_CAPABILITY,
+                DESTRUCTIBLE_CATALOG_V5_CAPABILITY],
             'account_key': account_key,
             'name': 'A', 'vehicle': 'ussr:R11_MS-1',
             'max_health': 100, 'outfits': {},

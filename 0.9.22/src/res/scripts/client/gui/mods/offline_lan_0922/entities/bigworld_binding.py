@@ -32,11 +32,46 @@ except NameError:
 # members before handing the property dictionary to createEntity().
 _entity_string_types = (str,)
 
+# Exact #1513 ``WoT.unpackAuxVehiclePhysicsData`` layout.  The Avatar.def
+# property is UINT64; the six fields occupy every bit in this order.
+_AUX_PHYSICS_FIELDS = (
+    (15, -math.pi, math.pi),
+    (12, -math.pi / 2.0, math.pi / 2.0),
+    (13, -math.pi, math.pi),
+    (8, -15.0, 30.0),
+    (8, -15.0, 30.0),
+    (8, 0.0, 1.2),
+)
+
 
 def _entity_string(value):
     if _unicode_types and isinstance(value, _unicode_types):
         return value.encode('utf-8')
     return value
+
+
+def _encode_aux_physics_value(value, bits, minimum, maximum):
+    """Mirror #1513's restricted-value rounding for one packed field."""
+    value = float(value)
+    if math.isnan(value) or math.isinf(value):
+        raise CapabilityError('auxiliary vehicle physics value is not finite')
+    ratio = (value - minimum) / (maximum - minimum)
+    ratio = max(0.0, min(1.0, ratio))
+    mask = (1 << bits) - 1
+    return int(round(mask * ratio)) & mask
+
+
+def _pack_aux_physics_data(values):
+    if len(values) != len(_AUX_PHYSICS_FIELDS):
+        raise CapabilityError('auxiliary vehicle physics field count mismatch')
+    packed = 0
+    shift = 0
+    for value, field in zip(values, _AUX_PHYSICS_FIELDS):
+        bits, minimum, maximum = field
+        packed |= _encode_aux_physics_value(
+            value, bits, minimum, maximum) << shift
+        shift += bits
+    return packed
 
 
 class CapabilityError(RuntimeError):
@@ -161,7 +196,11 @@ class BigWorldVehicleBinding(object):
 
     def start_vehicle_visual(self, entity_id, is_immediate=True):
         """Register one remote presentation with #1513 battle feedback."""
-        entity = self._entity_or_fail(entity_id)
+        # BattleRuntime applies the spotting gate before it starts a marker.
+        # Resolve the corresponding presentation from the private registry so
+        # a dead vehicle (which the public AOI facade intentionally omits) can
+        # still register its wreck marker.
+        entity = self._authority_entity_or_fail(entity_id)
         self._need(entity, 'proxy')
         self._need(self._avatar, 'guiSessionProvider')
         provider = self._avatar.guiSessionProvider
@@ -239,6 +278,22 @@ class BigWorldVehicleBinding(object):
         self._need(entity.typeDescriptor.turret, 'circularVisionRadius')
         self._avatar.syncVehicleAttrs({'circularVisionRadius':
             entity.typeDescriptor.turret.circularVisionRadius})
+
+    def avatar_aux_physics(self, yaw, pitch, roll, left_scroll,
+                           right_scroll, normalised_rpm, gear):
+        """Publish the local engine inputs through exact #1513 properties.
+
+        ``ownVehicleGear`` is UINT8 and ``ownVehicleAuxPhysicsData`` is the
+        six-field UINT64 consumed by both ``DetailedEngineState`` and
+        ``PlayerAvatar.__onSetOwnVehicleAuxPhysicsData``.  Set the gear first
+        so the auxiliary-data notifier observes the matching engine state.
+        """
+        self._require_int('Avatar ownVehicleGear', gear, 0, 255)
+        packed = _pack_aux_physics_data((
+            yaw, pitch, roll, left_scroll, right_scroll, normalised_rpm))
+        self._set_avatar_property('ownVehicleGear', gear)
+        self._set_avatar_property('ownVehicleAuxPhysicsData', packed)
+        return packed
 
     def avatar_ready(self):
         self._avatar.updateArena(self._constants.ARENA_UPDATE.AVATAR_READY,
@@ -453,10 +508,11 @@ class BigWorldVehicleBinding(object):
     def _authority_entity_or_fail(self, entity_id):
         """Resolve simulation state without applying the stock AOI gate.
 
-        Synthetic remote Vehicles remain authoritative while unspotted.  The
-        public ``BigWorld.entity`` facade intentionally hides those objects
-        from stock aiming, collision and marker consumers, so internal pose,
-        aim and readiness operations must use the private registry resolver.
+        Synthetic remote Vehicles remain authoritative while unspotted or
+        dead.  The public ``BigWorld.entity`` facade intentionally hides those
+        objects from stock aiming, collision and marker consumers, so internal
+        pose, aim and explicitly visibility-gated presentation operations must
+        use the private registry resolver.
         """
         resolver = self._authority_entity_resolver
         entity = (resolver(entity_id) if resolver is not None else

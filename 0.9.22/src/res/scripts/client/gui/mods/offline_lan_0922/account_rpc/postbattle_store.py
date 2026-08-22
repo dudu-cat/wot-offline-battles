@@ -295,8 +295,11 @@ def pack_battle_result(receipt, packers=None, replay_types=None):
         'accountDBID': account_dbid, 'team': receipt['team'],
         'credits': rewards['credits'], 'xp': rewards['xp'],
         'freeXP': rewards['free_xp'], 'crystal': 0,
-        'avatarDamageDealt': stats['damage'],
-        'avatarKills': stats['kills'],
+        # These are damage and kills caused by the avatar outside its
+        # vehicles.  The stock result model adds them to the per-vehicle
+        # totals, so mirroring vehicle statistics here doubles both columns.
+        'avatarDamageDealt': 0,
+        'avatarKills': 0,
         'isPrematureLeave': receipt['premature_leave'],
         'watchedBattleToTheEnd': not receipt['premature_leave'],
     }
@@ -374,8 +377,11 @@ def pack_battle_result(receipt, packers=None, replay_types=None):
             'xp': row['xp'],
         }
         public_avatar = {
-            'avatarDamageDealt': row_stats['damage'],
-            'avatarKills': row_stats['kills'],
+            # Regular offline battles have no avatar-only combat.  Team
+            # results add these fields to VEH_PUBLIC_RESULTS, so keep the
+            # vehicle-owned damage and kills in exactly one native block.
+            'avatarDamageDealt': 0,
+            'avatarKills': 0,
         }
         player = {
             'name': _wire_utf8(row['name']),

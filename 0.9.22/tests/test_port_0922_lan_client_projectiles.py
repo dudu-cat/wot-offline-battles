@@ -52,6 +52,11 @@ class ProjectileWireTests(unittest.TestCase):
         client.bot_authority_id = 7
         client.authority_epoch = 4
         client.capabilities = [module.PROJECTILE_LEDGER_CAPABILITY]
+        client.server_capabilities = [
+            module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+            module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
+            module.RANDOM_MAP_CAPABILITY,
+        ]
         with client._outbound_lock:
             client._outbound_accepting = True
         return client
@@ -237,8 +242,10 @@ class ProjectileWireTests(unittest.TestCase):
             'type', 'round_id', 'authority_epoch', 'projectile_id',
             'base_checked_ms', 'outcome', 'resolved_time_ms',
             'checked_distance', 'piercing_loss', 'penetration_factor',
-            'impact', 'direct', 'splash', 'destructibles'}, set(message))
+            'hit_vehicle', 'impact', 'direct', 'splash', 'destructibles'},
+            set(message))
         self.assertEqual('player:7:1', message['projectile_id'])
+        self.assertTrue(message['hit_vehicle'])
 
         duplicate = self.effect('player', 8)
         self.assertFalse(client.send_projectile_resolve(
@@ -247,6 +254,29 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertFalse(client.send_projectile_resolve(
             4, 'player:7:2', 0, 'miss', 10,
             [0.0, 0.0, 0.0], direct, []))
+
+    def test_optional_terminal_field_is_omitted_without_server_support(self):
+        client = self.active_client()
+        client.server_capabilities = [
+            module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY]
+
+        self.assertTrue(client.send_projectile_resolve(
+            4, 'player:7:1', 0, 'impact', 10,
+            [0.0, 0.0, 0.0], None, [], hit_vehicle=True))
+
+        self.assertNotIn('hit_vehicle', client._outbound_queue[-1][1])
+
+    def test_random_map_requires_an_advertised_server_capability(self):
+        client = self.active_client()
+        client.phase = 'waiting'
+        client.host_player_id = client.player_id
+        client.map_pool = ['01_karelia']
+        client.server_capabilities = [
+            module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY]
+
+        self.assertFalse(client.request_start(module.RANDOM_MAP_OPTION))
+        client.server_capabilities.append(module.RANDOM_MAP_CAPABILITY)
+        self.assertTrue(client.request_start(module.RANDOM_MAP_OPTION))
 
     def test_resolve_critical_contract_and_plain_impact_are_strict(self):
         client = self.active_client()
@@ -271,6 +301,9 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertTrue(client.send_projectile_resolve(
             4, 'bot:17:2', 0, 'expired', 10,
             None, None, [], checked_distance=12.0))
+        self.assertFalse(client.send_projectile_resolve(
+            4, 'bot:17:3', 0, 'impact', 10,
+            [0.0, 0.0, 0.0], None, [], hit_vehicle='yes'))
 
     def test_hello_advertises_ledger_before_transport_is_published(self):
         client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
@@ -288,16 +321,22 @@ class ProjectileWireTests(unittest.TestCase):
         hello = json.loads(fake.sent[0].decode('utf-8'))
         self.assertEqual('hello', hello['type'])
         self.assertEqual(
-            [module.PROJECTILE_LEDGER_CAPABILITY], hello['capabilities'])
+            list(module.CLIENT_CAPABILITIES), hello['capabilities'])
 
     @staticmethod
-    def welcome(capabilities=None, authority_epoch=2):
+    def welcome(capabilities=None, authority_epoch=2,
+                server_capabilities=None):
         return {
             'type': 'welcome',
             'protocol': module.PROTOCOL_VERSION,
             'client_build': module.CLIENT_BUILD,
-            'capabilities': ([module.PROJECTILE_LEDGER_CAPABILITY]
+            'capabilities': (list(module.CLIENT_CAPABILITIES)
                              if capabilities is None else capabilities),
+            'server_capabilities': ([
+                module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
+                module.RANDOM_MAP_CAPABILITY,
+            ] if server_capabilities is None else server_capabilities),
             'player_id': 7,
             'host_player_id': 7,
             'bot_authority_id': 7,
@@ -318,6 +357,13 @@ class ProjectileWireTests(unittest.TestCase):
         client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
         client.running = True
         client._handle_message(self.welcome([]))
+        self.assertFalse(client.ready)
+        self.assertEqual(
+            'projectile ledger capability mismatch', client.last_error)
+
+        client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
+        client.running = True
+        client._handle_message(self.welcome(server_capabilities=[]))
         self.assertFalse(client.ready)
         self.assertEqual(
             'projectile ledger capability mismatch', client.last_error)

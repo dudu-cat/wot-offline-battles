@@ -219,8 +219,10 @@ _PORT_PACKAGE = 'gui.mods.offline_lan_0922'
 # Sizing these adds nothing and walking a string character by character is slow.
 _ATOMIC_TYPES = (bool, float, complex, bytes, bytearray)
 try:
+    _INTEGER_TYPES = (int, long)
     _ATOMIC_TYPES += (int, long, str, unicode)
 except NameError:
+    _INTEGER_TYPES = (int,)
     _ATOMIC_TYPES += (int, str)
 
 
@@ -2878,8 +2880,8 @@ class BattleRuntime(object):
         except (TypeError, ValueError, AttributeError):
             return None
 
-    def _normalised_rpm(self):
-        """Copy #1513's three-gear simulated RPM law for local physics."""
+    def _simulated_rpm_and_gear(self):
+        """Copy #1513's three-gear simulated engine law for local physics."""
         descriptor = self._local_descriptor
         if descriptor is None:
             raise RuntimeError('player descriptor is unavailable for RPM')
@@ -2892,31 +2894,41 @@ class BattleRuntime(object):
             raise RuntimeError('#1513 vehicle speed range is invalid')
         speed = abs(float(self._local_speed))
         if speed < 0.05:
-            return 0.0
+            return 0.0, 0
         gear = math.ceil(
             math.floor(speed * 50.0) / 50.0 / speed_range)
         gear = max(1.0, gear)
         rpm = abs(1.0 + (speed - gear * speed_range) / speed_range)
-        # Exact _RpmStateHandler shifts a running engine from the raw 0..1
-        # range to 0.3..1.0 before presenting it on the HUD.
-        return max(0.0, min(1.0, 0.3 + rpm * 0.7))
+        # The exact UINT64 field reserves 0.0..1.2 for normal and excess RPM.
+        # _RpmStateHandler owns the later 0.3 display shift; DetailedEngineState
+        # consumes this unshifted value directly for the player's engine sound.
+        return max(0.0, min(1.2, rpm)), min(255, int(gear))
 
     def _publish_rpm(self, now, force=False):
         if not force and now < self._next_rpm_time:
             return False
-        value = self._normalised_rpm()
+        value, gear = self._simulated_rpm_and_gear()
         self._next_rpm_time = now + RPM_PRESENTATION_SECONDS
-        if (not force and self._last_presented_rpm is not None and
-                abs(value - self._last_presented_rpm) <= 0.01):
+        left_scroll = 0.0
+        right_scroll = 0.0
+        if self._local_physics is not None:
+            left_scroll, right_scroll = vehicle_physics.track_scroll(
+                self._local_physics, self._local_speed,
+                self._local_turn_speed)
+            minimum, maximum = TRACK_SCROLL_LIMITS
+            left_scroll = max(minimum, min(maximum, left_scroll))
+            right_scroll = max(minimum, min(maximum, right_scroll))
+        payload = (
+            self._local_yaw, self._local_pitch, self._local_roll,
+            left_scroll, right_scroll, value, gear)
+        if not force and payload == self._last_presented_rpm:
             return False
-        provider = getattr(self._avatar, 'guiSessionProvider', None)
-        state = getattr(self._runtime, 'vehicle_view_state', None)
-        invalidate = getattr(provider, 'invalidateVehicleState', None)
-        if state is None or not callable(invalidate):
+        publish = getattr(self._binding, 'avatar_aux_physics', None)
+        if not callable(publish):
             raise RuntimeError(
-                '#1513 RPM vehicle-state presentation is unavailable')
-        invalidate(state.RPM, value)
-        self._last_presented_rpm = value
+                '#1513 own-vehicle auxiliary physics boundary is unavailable')
+        publish(*payload)
+        self._last_presented_rpm = payload
         return True
 
     def local_damage_report(self):
@@ -3918,10 +3930,11 @@ class BattleRuntime(object):
         """Feed the native track, wheel, spline and trace animation.
 
         Retail drives this from the cell-owned
-        ``Avatar.ownVehicleAuxPhysicsData``, which an offline client never
-        receives.  ``updateTracksScroll`` reaches the same
-        ``PyTrackScroll.setExternal`` boundary, but its native tick pins both
-        belts to zero while ``engineMode[0]`` is at most 1.
+        ``Avatar.ownVehicleAuxPhysicsData``.  The copied local physics now
+        publishes that property for engine sound, while this direct
+        ``updateTracksScroll`` path keeps the established track animation
+        boundary.  Its native tick pins both belts to zero while
+        ``engineMode[0]`` is at most 1.
         """
         appearance = getattr(entity, 'appearance', None)
         update_scroll = getattr(appearance, 'updateTracksScroll', None)
@@ -3994,6 +4007,14 @@ class BattleRuntime(object):
         if 'extinguisher' in name or any(
                 'extinguisher' in tag for tag in tags):
             return 'extinguisher'
+        # Food is a mounted consumable even though it has no activation
+        # action.  Publish it to the stock ammo panel while loadout.py owns
+        # its passive crew bonus.
+        ration_markers = (
+            'ration', 'chocolate', 'cola', 'coffee', 'pudding',
+            'stimulator', 'buchty', 'onigiri', 'gulaschkanone')
+        if any(marker in name for marker in ration_markers):
+            return 'passive'
         return None
 
     def _default_equipments(self):
@@ -4029,7 +4050,8 @@ class BattleRuntime(object):
                     continue
                 kind = self._equipment_kind(descriptor)
                 if kind is None:
-                    # A booster or a device this battle law cannot apply.
+                    # A booster or a special active device this battle law
+                    # cannot apply must not be advertised as functional.
                     continue
                 selected.append((
                     str(getattr(descriptor, 'name', '') or '').lower(),
@@ -5817,6 +5839,17 @@ class BattleRuntime(object):
             raise RuntimeError(
                 'ordered combat event source %s does not allow kind %s' %
                 (source, kind))
+        blocked_damage = event.get('blocked_damage', 0)
+        if (isinstance(blocked_damage, bool) or
+                not isinstance(blocked_damage, _INTEGER_TYPES) or
+                not 0 <= blocked_damage <= 5000):
+            raise RuntimeError(
+                'ordered combat event has invalid blocked_damage')
+        if (blocked_damage and
+                (source != 'shot' or bool(event.get('splash', False)) or
+                 int(event.get('shot_result', 2)) == 2)):
+            raise RuntimeError(
+                'ordered combat event has inconsistent blocked_damage')
         attacker_key = self._event_entity_key(event, 'attacker')
         if source in ('shot', 'fire', 'ram') and attacker_key is None:
             raise RuntimeError(
@@ -5904,6 +5937,14 @@ class BattleRuntime(object):
                 callback([(flags << 32) | target_id])
         if target_record.get('local') and enemy:
             attacker_id = int(attacker_record['engine_id'])
+            blocked_damage = max(
+                0, int(event.get('blocked_damage', 0) or 0))
+            if blocked_damage > 0:
+                output.append({
+                    'eventType': int(event_types.TANKING),
+                    'targetID': attacker_id, 'count': 1,
+                    'details': int(event_types.packDamage(
+                        blocked_damage, reason_id))})
             if damage > 0:
                 output.append({
                     'eventType': int(event_types.RECEIVED_DAMAGE),
@@ -6529,6 +6570,9 @@ class BattleRuntime(object):
             canonical = all(name in event for name in (
                 'origin', 'velocity', 'gravity', 'maxDistance'))
             if canonical:
+                normalized = self._projectile_wire_meta(event)
+                if normalized is not None:
+                    self._install_projectile_meta(normalized)
                 projectile_id = event.get('projectile_id')
                 origin = event.get('origin')
                 velocity = event.get('velocity')
@@ -6875,6 +6919,7 @@ class BattleRuntime(object):
                 raise RuntimeError('active projectile snapshot is malformed')
             projectile_id = normalized['projectile_id']
             active_ids.add(projectile_id)
+            self._install_projectile_meta(normalized)
             self._ensure_projectile_visual(normalized, now)
         if not self._projectile_is_authority():
             return True
@@ -6940,6 +6985,20 @@ class BattleRuntime(object):
         if projectile_id is None:
             raise RuntimeError('projectile terminal event has no id')
         projectile_id = str(projectile_id)
+        meta = self._projectile_meta.get(projectile_id)
+        if meta is not None and isinstance(event.get('hit_vehicle'), bool):
+            meta['hit_vehicle'] = event['hit_vehicle']
+            visual = self._projectile_visual_meta.get(projectile_id)
+            try:
+                elapsed = max(
+                    0.0, float(event.get('resolved_time_ms')) / 1000.0)
+            except (TypeError, ValueError, OverflowError):
+                elapsed = None
+            if visual is not None and elapsed is not None:
+                meta['terminal_velocity'] = (
+                    visual['velocity'][0],
+                    visual['velocity'][1] - visual['gravity'] * elapsed,
+                    visual['velocity'][2])
         self._stop_projectile_visual(projectile_id, event)
         if self._projectiles is not None:
             self._projectiles.remove(projectile_id)
@@ -7256,8 +7315,7 @@ class BattleRuntime(object):
                 continue
             self._projectile_candidate_count += 1
             target = self._server_entity(record.get('engine_id'))
-            if (target is None or not getattr(target, 'isStarted', False) or
-                    not self._record_alive(record, target)):
+            if target is None or not getattr(target, 'isStarted', False):
                 continue
             query_start = self._vector(adjusted_start)
             query_end = self._vector(adjusted_end)
@@ -7513,14 +7571,19 @@ class BattleRuntime(object):
             outcome = 'expired'
             direct = None
             splash = []
+        hit_vehicle = bool(
+            outcome == 'impact' and data is not None and
+            data.get('target_key') is not None)
         pending = {
             'state': state, 'outcome': outcome, 'impact': impact,
             'direct': direct, 'splash': splash,
+            'hit_vehicle': hit_vehicle,
         }
         # Retail plays a ground explosion only for a terminal on the world; a
         # vehicle terminal shows the armour-hit family instead.  Record the
-        # verdict now, because the relayed terminal event carries no target.
-        meta['hit_vehicle'] = direct is not None
+        # verdict now, because the relayed terminal event carries no target
+        # identity (only this presentation classification).
+        meta['hit_vehicle'] = hit_vehicle
         meta['terminal_velocity'] = tuple(state.get('velocity') or ())
         meta['pending_resolution'] = pending
         return self._submit_projectile_resolution(meta)
@@ -7549,6 +7612,7 @@ class BattleRuntime(object):
             piercing_loss=float(meta.get('piercing_loss', 0.0)),
             penetration_factor=float(
                 meta.get('penetration_factor', 1.0)),
+            hit_vehicle=bool(pending.get('hit_vehicle')),
             destructibles=[dict(value) for value in
                            meta.get('destructibles_pending', ())])
         if sent:
@@ -8277,6 +8341,29 @@ class BattleRuntime(object):
             raise RuntimeError('#1513 mouse targeting ray is empty')
         return start, direction
 
+    def _wreck_blocks_target_outline(self, start, end, target_depth):
+        """Return whether a retained wreck owns the nearer cursor hit."""
+        for record in self._records.values():
+            if (record.get('local') or record.get('tombstone') or
+                    not record.get('ready')):
+                continue
+            vehicle = self._server_entity(record.get('engine_id'))
+            if (vehicle is None or
+                    not getattr(vehicle, 'isStarted', False) or
+                    self._record_alive(record, vehicle)):
+                continue
+            if record.get('native_remote'):
+                collisions = collide_vehicle_at_matrix(
+                    vehicle, vehicle.matrix, start, end,
+                    self._runtime.math)
+            else:
+                collide = getattr(vehicle, 'collideSegmentExt', None)
+                collisions = collide(start, end) if callable(collide) else ()
+            if (collisions and min(float(item.dist) for item in collisions) +
+                    _SHOT_OCCLUSION_EPSILON < target_depth):
+                return True
+        return False
+
     def _update_target_outline(self, now):
         """Outline the vehicle the cursor ray actually strikes.
 
@@ -8383,6 +8470,15 @@ class BattleRuntime(object):
                     _SHOT_OCCLUSION_EPSILON < chosen_depth):
                 blocked_id = chosen
                 reason = 'is behind scenery'
+                if held_id == blocked_id:
+                    held_reason = reason
+                decline = (blocked_id, reason)
+                chosen = None
+                chosen_depth = None
+            elif self._wreck_blocks_target_outline(
+                    start, target_end, chosen_depth):
+                blocked_id = chosen
+                reason = 'is behind a wreck'
                 if held_id == blocked_id:
                     held_reason = reason
                 decline = (blocked_id, reason)
@@ -9669,7 +9765,10 @@ class BattleRuntime(object):
             presentation_position,
             self._vector(_engine_rotation(yaw)),
             self._local_speed, self._local_turn_speed)
-        self._publish_rpm(self._clock())
+        # Engine-free movement harnesses have no #1513 Entity binding.  A live
+        # battle installs it before the first copied-physics frame.
+        if self._binding is not None:
+            self._publish_rpm(self._clock())
         self._input_accumulator += dt
         if self._input_accumulator >= NETWORK_INPUT_SECONDS:
             # Preserve the nominal 30 Hz phase at render rates that are not a
@@ -10900,9 +10999,19 @@ class BattleRuntime(object):
         """Cache the player's own #1513 attribute factors for this round."""
         if self._local_factors_cache is None:
             snapshot = self._garage_loadout_snapshot()
+            # updateAttrFactorsWithSplit treats every supplied equipment as
+            # active.  That is correct for passive fuel and food, but would
+            # leave the trigger-only Removed RPM Limiter permanently on.
+            # Until its activation and engine-damage lifecycle is modelled,
+            # omit that one item rather than granting a silent 10% power buff.
+            equipments = tuple(
+                equipment for equipment in snapshot['equipments']
+                if not any(
+                    'removedrpmlimiter' in name for name in
+                    loadout_law.equipment_names((equipment,))))
             self._local_factors_cache = loadout_law.attribute_factors(
                 descriptor, snapshot['crew'] or None,
-                snapshot['equipments']) or False
+                equipments) or False
         return self._local_factors_cache or None
 
     def _vision_radius(self, descriptor, entity=None, still_seconds=0.0,
@@ -11419,7 +11528,7 @@ class BattleRuntime(object):
         entity_alive = getattr(entity, 'isAlive', None)
         if not (entity_alive() if callable(entity_alive) else entity_alive):
             # A dead vehicle cannot remain the live target even though its
-            # existing compound stays in place as non-blocking wreck cover.
+            # existing compound stays in place as wreck cover.
             if self._outlined_engine_id == engine_id:
                 self._clear_target_outline()
             self._release_target_lock(engine_id)

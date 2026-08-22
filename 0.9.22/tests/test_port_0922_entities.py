@@ -174,6 +174,7 @@ class _Avatar(object):
         self.updates = []
         self.synced = []
         self.changed = 0
+        self.property_notifiers = []
         self.visual_starts = []
         self.visual_stops = []
         self.view_points = types.SimpleNamespace(
@@ -194,6 +195,12 @@ class _Avatar(object):
 
     def onVehicleChanged(self):
         self.changed += 1
+
+    def set_ownVehicleGear(self, previous):
+        self.property_notifiers.append(('gear', previous))
+
+    def set_ownVehicleAuxPhysicsData(self, previous):
+        self.property_notifiers.append(('aux', previous))
 
 
 class _ConsistentMatrices(object):
@@ -222,6 +229,23 @@ class _VehicleDescr(object):
 
 
 class BigWorldBindingTests(unittest.TestCase):
+    def test_local_aux_physics_uses_exact_uint64_and_uint8_properties(self):
+        module = _binding_module()
+        avatar = _Avatar()
+        binding = module.BigWorldVehicleBinding(
+            _BigWorld(), avatar, _Constants, _VehicleDescr,
+            lambda yaw, pitch, limits: 321,
+            outfit_provider=lambda descriptor: '')
+
+        packed = binding.avatar_aux_physics(
+            0.0, 0.0, 0.0, -15.0, 30.0, 1.2, 3)
+
+        self.assertEqual(0xffff008004004000, packed)
+        self.assertEqual(packed, avatar.ownVehicleAuxPhysicsData)
+        self.assertEqual(3, avatar.ownVehicleGear)
+        self.assertEqual([('gear', 9), ('aux', 9)],
+                         avatar.property_notifiers)
+
     def test_local_vehicle_binds_stock_matrix_and_postmortem_cursor(self):
         module = _binding_module()
         bigworld = _BigWorld()
@@ -351,13 +375,16 @@ class BigWorldBindingTests(unittest.TestCase):
         self.assertEqual([(0.75, 0.9, -0.1)],
                          bigworld.entity_value.aims)
 
-    def test_hidden_remote_pose_uses_private_authority_without_widening_aoi(self):
+    def test_dead_remote_visual_uses_private_authority_without_widening_aoi(self):
         module = _binding_module()
         bigworld = _BigWorld()
         hidden = _Presentation()
         hidden.proxy = 'hidden-proxy'
+        hidden.health = 0
+        hidden.isAlive = lambda: False
+        avatar = _Avatar()
         binding = module.BigWorldVehicleBinding(
-            bigworld, _Avatar(), _Constants, _VehicleDescr,
+            bigworld, avatar, _Constants, _VehicleDescr,
             lambda yaw, pitch, limits: 321,
             outfit_provider=lambda descriptor: 'verified',
             authority_entity_resolver=(
@@ -367,13 +394,13 @@ class BigWorldBindingTests(unittest.TestCase):
         self.assertIsNone(bigworld.entity(1000))
         binding.set_vehicle_pose(1000, (4, 5, 6), (0, 0, 0.75))
         binding.update_vehicle_aim(1000, 0.75, 0.9, -0.1)
+        binding.start_vehicle_visual(1000, True)
 
         self.assertEqual([((4, 5, 6), (0, 0, 0.75))], hidden.poses)
         self.assertEqual([(0.75, 0.9, -0.1)], hidden.aims)
+        self.assertEqual([('hidden-proxy', True)], avatar.visual_starts)
+        self.assertIsNone(bigworld.entity(1000))
         self.assertFalse(binding.is_vehicle_ready(1000))
-        with self.assertRaisesRegex(module.CapabilityError,
-                                    'Vehicle entity 1000 is unavailable'):
-            binding.start_vehicle_visual(1000, True)
 
     def test_prebattle_period_carries_native_countdown_deadline(self):
         module = _binding_module()

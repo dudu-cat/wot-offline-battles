@@ -10,7 +10,8 @@ sys.path.insert(0, str(PORT_ROOT / 'server'))
 
 from lan_battle_server import (  # noqa: E402
     BattleState, CLIENT_BUILD_082, CLIENT_BUILD_0922, MAX_LINE_BYTES,
-    PREBATTLE_SECONDS, PROJECTILE_CAPABILITY, PROJECTILE_MAX_ACTIVE,
+    DESTRUCTIBLE_CATALOG_V5_CAPABILITY, PREBATTLE_SECONDS,
+    PROJECTILE_CAPABILITY, PROJECTILE_MAX_ACTIVE,
     Player, TICK_HZ,
 )
 
@@ -24,7 +25,8 @@ def _player(player_id, team=1, x=0.0):
     return Player(
         player_id, _Socket(), ('127.0.0.1', player_id), team=team,
         slot=(player_id - 1) % 15, x=x, client_position=True,
-        capabilities=(PROJECTILE_CAPABILITY,))
+        capabilities=(
+            PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY))
 
 
 def _state(players=2):
@@ -333,6 +335,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                   if event.get('projectile_id') == '1:p:1:1']
         self.assertEqual(['shot', 'projectile_impact', 'hit'],
                          [event['kind'] for event in events])
+        self.assertTrue(events[1]['hit_vehicle'])
         self.assertEqual('shot', events[-1]['source'])
 
         event_count = len(state.pending_events)
@@ -341,6 +344,34 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual(event_count, len(state.pending_events))
         self.assertFalse(state.resolve_projectile(
             1, dict(message, checked_distance=11.0)))
+
+    def test_wreck_terminal_can_have_no_damage_but_still_hit_a_vehicle(self):
+        state = _state()
+        self.assertTrue(state.launch_projectile(1, _launch()))
+        message = _resolve(
+            '1:p:1:1', direct=None, hit_vehicle=True)
+
+        self.assertTrue(state.resolve_projectile(1, message))
+
+        event = next(
+            value for value in state.pending_events
+            if value.get('kind') == 'projectile_impact')
+        self.assertTrue(event['hit_vehicle'])
+        self.assertEqual(1000, state.players[2].health)
+
+    def test_hit_event_reports_only_damage_the_target_had_left(self):
+        state = _state()
+        state.players[2].health = 200
+        self.assertTrue(state.launch_projectile(1, _launch()))
+
+        self.assertTrue(state.resolve_projectile(
+            1, _resolve('1:p:1:1', direct=_effect(damage=400))))
+
+        event = next(
+            value for value in state.pending_events
+            if value.get('kind') == 'hit')
+        self.assertEqual(200, event['damage'])
+        self.assertEqual(0, event['health'])
 
     def test_he_direct_target_cannot_repeat_in_splash(self):
         state = _state(players=3)
@@ -462,6 +493,13 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         player, error = modern.add_player(_Socket(), ('127.0.0.1', 1), {
             'client_build': CLIENT_BUILD_0922, 'name': 'P',
             'capabilities': [PROJECTILE_CAPABILITY]})
+        self.assertIsNone(player)
+        self.assertEqual('unsupported_capabilities', error)
+        player, error = modern.add_player(_Socket(), ('127.0.0.1', 1), {
+            'client_build': CLIENT_BUILD_0922, 'name': 'P',
+            'capabilities': [
+                PROJECTILE_CAPABILITY,
+                DESTRUCTIBLE_CATALOG_V5_CAPABILITY]})
         self.assertIsNotNone(player)
         self.assertIsNone(error)
 

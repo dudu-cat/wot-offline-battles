@@ -753,6 +753,10 @@ class VehicleStatisticsTest(unittest.TestCase):
             2, state.vehicle_statistics[('player', 1)]['shots_hit'])
         self.assertEqual(
             1, state.vehicle_statistics[('player', 1)]['shots_penetrated'])
+        combat = [event for event in state.pending_events
+                  if event.get('kind') == 'hit']
+        self.assertEqual([260, 0], [
+            event['blocked_damage'] for event in combat])
 
     def test_a_second_round_starts_from_zero(self):
         state = self._live_state()

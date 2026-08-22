@@ -188,6 +188,8 @@ def _diagnostic_chunk_1513(chunk_id, native_count, filenames, registry):
 		('names', len(filenames)),
 		('named', sum(1 for slot in ordered if slot['raw'] == 'named')),
 		('blank', sum(1 for slot in ordered if slot['raw'] == 'blank')),
+		('name_mismatch', sum(
+			1 for slot in ordered if slot.get('raw_mismatch'))),
 		('v3_unique', signatures.count('unique')),
 		('v3_ambig', signatures.count('ambig')),
 		('v3_miss', signatures.count('miss')),
@@ -257,6 +259,79 @@ def _clear_runtime_registry():
 			'g_offh_destr_diagnostics', 'g_offh_destr_diag_last_static',
 			'g_offh_destr_runtime_space'):
 		globals().pop(name, None)
+
+
+def _baked_world_boxes_1513(record, signature, box_index, quantization):
+	"""Rebuild one catalog instance OBB from its pinned world signature."""
+	scale = float(quantization)
+	origin = tuple(float(value) / scale for value in signature[:3])
+	basis = tuple(tuple(float(signature[3 + axis * 3 + component]) / scale
+		for component in range(3)) for axis in range(3))
+	boxes = record['boxes']
+	if record['kind'] != 'structure':
+		if box_index is None or box_index < 0 or box_index >= len(boxes):
+			raise ValueError('baked destructible box index is invalid')
+		boxes = (boxes[box_index],)
+	result = []
+	for box in boxes:
+		local_center = ((box[0] + box[3]) * 0.5,
+			(box[1] + box[4]) * 0.5,
+			(box[2] + box[5]) * 0.5)
+		center = tuple(origin[component] + sum(
+			basis[axis][component] * local_center[axis]
+			for axis in range(3)) for component in range(3))
+		half_sizes = ((box[3] - box[0]) * 0.5,
+			(box[4] - box[1]) * 0.5,
+			(box[5] - box[2]) * 0.5)
+		half_axes = tuple(tuple(
+			basis[axis][component] * half_sizes[axis]
+			for component in range(3)) for axis in range(3))
+		volume = abs(_vector_dot(
+			half_axes[0], _vector_cross(half_axes[1], half_axes[2])))
+		if volume <= 1.0e-9:
+			# Older unit/donation fixtures did not promise a usable transform.
+			# Keep their identity rows, but never expose invalid geometry to the
+			# projectile broad phase.
+			return ()
+		result.append((center, half_axes, box[6]))
+	return tuple(result)
+
+
+def _baked_quantization_margin_1513(record, box_index, quantization):
+	"""Bound world-space error introduced by the locator signature grid."""
+	import math
+	boxes = record['boxes']
+	if record['kind'] != 'structure':
+		boxes = (boxes[box_index],)
+	maximum_local_sum = max(
+		max(abs(box[0]), abs(box[3])) +
+		max(abs(box[1]), abs(box[4])) +
+		max(abs(box[2]), abs(box[5]))
+		for box in boxes)
+	# Origin and every basis component are rounded independently to the
+	# nearest 1/quantization.  The component error for a transformed point is
+	# therefore at most half a grid step times (1 + |x| + |y| + |z|).
+	# Convert that component bound to a conservative 3-D distance so both the
+	# footprint bins and ray prefilter contain every possible live OBB.
+	return (math.sqrt(3.0) * 0.5 / float(quantization) *
+		(1.0 + maximum_local_sum))
+
+
+def _baked_bin_keys_for_bounds_1513(
+		minimum_x, maximum_x, minimum_z, maximum_z):
+	"""Yield footprint bins without depending on Python 2-only ``xrange``."""
+	import math
+	minimum_bin_x = int(math.floor(minimum_x / _DESTRUCTIBLE_BIN_METRES))
+	maximum_bin_x = int(math.floor(maximum_x / _DESTRUCTIBLE_BIN_METRES))
+	minimum_bin_z = int(math.floor(minimum_z / _DESTRUCTIBLE_BIN_METRES))
+	maximum_bin_z = int(math.floor(maximum_z / _DESTRUCTIBLE_BIN_METRES))
+	bin_x = minimum_bin_x
+	while bin_x <= maximum_bin_x:
+		bin_z = minimum_bin_z
+		while bin_z <= maximum_bin_z:
+			yield bin_x, bin_z
+			bin_z += 1
+		bin_x += 1
 
 
 def set_catalog(catalog):
@@ -359,6 +434,8 @@ def set_catalog(catalog):
 		raw_ambiguous = raw_ambiguous or ()
 	import math
 	instance_index = {}
+	baked_instances = {}
+	baked_shot_bins = {}
 	seen_wires = set()
 	for row in raw_instances:
 		if (not isinstance(row, (list, tuple)) or len(row) != 17 or
@@ -396,11 +473,32 @@ def set_catalog(catalog):
 		if (math.isnan(item_scale) or math.isinf(item_scale) or
 				item_scale <= 0.0):
 			raise ValueError('destructible instance scale is invalid')
-		instance_index[signature] = {
+		instance = {
 			'filename': normalized, 'kind': record['kind'],
 			'box_index': box_index, 'wire': wire,
 			'exact_scale': item_scale,
 		}
+		instance_index[signature] = instance
+		world_boxes = _baked_world_boxes_1513(
+			record, signature, box_index, quantization)
+		broad_phase_margin = _baked_quantization_margin_1513(
+			record, box_index, quantization)
+		baked_instances[wire] = {
+			'filename': normalized,
+			'descriptor_filename': record['filename'],
+			'kind': record['kind'], 'boxes': world_boxes,
+			'item_scale': item_scale, 'box_index': box_index,
+			'signature': signature,
+			'broad_phase_margin': broad_phase_margin,
+		}
+		for world_box in world_boxes:
+			bounds = _box_xz_bounds(world_box)
+			for bin_key in _baked_bin_keys_for_bounds_1513(
+					bounds[0] - broad_phase_margin,
+					bounds[1] + broad_phase_margin,
+					bounds[2] - broad_phase_margin,
+					bounds[3] + broad_phase_margin):
+				baked_shot_bins.setdefault(bin_key, set()).add(wire)
 	ambiguous_signatures = set()
 	for row in raw_ambiguous:
 		if (not isinstance(row, (list, tuple)) or len(row) != 13 or
@@ -424,6 +522,8 @@ def set_catalog(catalog):
 		'max_radius': max_radius, 'instances': instance_index,
 		'ambiguous_instances': ambiguous_signatures,
 		'has_instance_index': catalog_version >= 3,
+		'baked_instances': baked_instances,
+		'baked_shot_bins': baked_shot_bins,
 	}
 	_clear_runtime_registry()
 
@@ -673,19 +773,170 @@ def _instance_descriptor_filename_1513(instance):
 	return record['filename'] if record is not None else instance['filename']
 
 
-def _catalog_shot_intersection(start, end, maximum_distance=None):
-	"""Resolve the nearest unique streamed catalog OBB along a shell ray."""
+def _stream_baked_shot_instance_1513(spaceID, identity):
+	"""Validate and register one baked wire when its chunk is streamed.
+
+	The complete catalog is safe for broad-phase geometry only.  A shell may
+	reach a visible chunk before the vehicle-near scanner visits it, so admit
+	the candidate only after the same live matrix, exact wire, descriptor kind
+	and native effect-category checks used by the proximity registry.
+	"""
+	instances = globals().setdefault('g_offh_destr_instances', {})
+	instance = instances.get(identity)
+	if instance is not None:
+		return instance
+	catalog = _destructible_catalog
+	if catalog is None:
+		return None
+	baked = catalog.get('baked_instances', {}).get(identity)
+	if baked is None:
+		return None
+	import AreaDestructibles
+	import BigWorld
+	import Math
+	mgr = getattr(AreaDestructibles, 'g_destructiblesManager', None)
+	if mgr is None or mgr.getSpaceID() != spaceID:
+		return None
+	chunk_id, item_index = identity
+	native_count = _native_chunk_destructible_count_1513(mgr, chunk_id)
+	if native_count is None:
+		return None
+	if item_index >= native_count:
+		raise RuntimeError(
+			'#1513 baked destructible wire exceeds streamed count: '
+			'chunk=%s item=%s count=%s' %
+			(chunk_id, item_index, native_count))
+	filenames = BigWorld.wg_getChunkDestrFilenames(spaceID, chunk_id)
+	if filenames is None:
+		return None
+	if not isinstance(filenames, (list, tuple)):
+		raise RuntimeError(
+			'#1513 destructible filename payload is invalid: chunk=%s' %
+			chunk_id)
+	if len(filenames) > native_count:
+		raise RuntimeError(
+			'#1513 destructible filename prefix exceeds native count: '
+			'chunk=%s names=%s count=%s' %
+			(chunk_id, len(filenames), native_count))
+	if item_index < len(filenames) and not isinstance(
+			filenames[item_index], _STRING_TYPES):
+		raise RuntimeError(
+			'#1513 destructible filename slot is invalid: chunk=%s item=%s' %
+			(chunk_id, item_index))
+	chunk_matrix = BigWorld.wg_getChunkMatrix(spaceID, chunk_id)
+	chunk_translation = getattr(chunk_matrix, 'translation', None)
+	if chunk_translation is None:
+		return None
+	matrix = Math.Matrix(BigWorld.wg_getDestructibleMatrix(
+		spaceID, chunk_id, item_index))
+	signature, located = _catalog_instance_for_matrix_1513(
+		matrix, chunk_translation, Math)
+	if located is None:
+		return None
+	if located['wire'] != identity:
+		raise RuntimeError(
+			'#1513 streamed destructible identity disagrees with the baked '
+			'wire: live=%r baked=%r' % (identity, located['wire']))
+	if signature != baked['signature']:
+		return None
+	record = catalog['resources'].get(located['filename'])
+	if record is None or record['kind'] != baked['kind']:
+		return None
+	filename = record['filename']
+	desc = AreaDestructibles.g_cache.getDescByFilename(filename)
+	if desc is None:
+		return None
+	expected_kind = _catalog_kind_for_type_1513(
+		AreaDestructibles, desc.get('type'))
+	if expected_kind != record['kind']:
+		return None
+	module_index = 0 if expected_kind == 'structure' else -1
+	try:
+		native_type = BigWorld.wg_getDestructibleEffectCategory(
+			spaceID, chunk_id, item_index, module_index)
+	except Exception as error:
+		raise RuntimeError(
+			'#1513 destructible effect category query failed: '
+			'chunk=%s item=%s module=%s: %s' %
+			(chunk_id, item_index, module_index, error))
+	if _catalog_kind_for_type_1513(
+			AreaDestructibles, native_type) != expected_kind:
+		return None
+	world_boxes = _world_catalog_boxes(
+		record, matrix, chunk_translation, Math, located['box_index'])
+	if not world_boxes:
+		return None
+	instance = {
+		'filename': located['filename'],
+		'descriptor_filename': filename,
+		'kind': expected_kind, 'boxes': world_boxes,
+		'item_scale': _matrix_item_scale_1513(matrix, Math),
+		'box_index': located['box_index'], 'signature': signature,
+		'chunk_translation': (
+			float(chunk_translation.x), float(chunk_translation.y),
+			float(chunk_translation.z)),
+	}
+	instances[identity] = instance
+	_index_catalog_instance_1513(
+		globals().setdefault('g_offh_destr_contact_bins', {}),
+		identity, instance)
+	return instance
+
+
+def _catalog_shot_intersection(spaceID, start, end, maximum_distance=None):
+	"""Resolve the nearest live-validated catalog OBB along a shell ray."""
 	segment = end - start
 	segment_length = segment.length
 	if segment_length <= 1.0e-9:
 		return None
 	instances = globals().get('g_offh_destr_instances', {})
-	if not instances:
+	catalog = _destructible_catalog or {}
+	baked_instances = catalog.get('baked_instances', {})
+	if not instances and not baked_instances:
 		return None
 	authority = _get_destr_authority()
+	identities = set(instances)
+	effective_end = end
+	if (maximum_distance is not None and
+			float(maximum_distance) < segment_length):
+		effective_end = start + segment.scale(
+			max(0.0, float(maximum_distance)) / segment_length)
+	bounds = (min(start.x, effective_end.x), max(start.x, effective_end.x),
+		min(start.z, effective_end.z), max(start.z, effective_end.z))
+	for bin_key in _baked_bin_keys_for_bounds_1513(*bounds):
+		identities.update(
+			catalog.get('baked_shot_bins', {}).get(bin_key, ()))
 	hits = {}
-	for identity in sorted(instances):
-		instance = instances[identity]
+	for identity in sorted(identities):
+		instance = instances.get(identity)
+		pending = False
+		if instance is None:
+			baked = baked_instances.get(identity)
+			if baked is None:
+				continue
+			intersects = False
+			for world_box in baked['boxes']:
+				mat_kind = (world_box[2]
+					if baked['kind'] == 'structure' else None)
+				if authority.is_destroyed(
+						identity[0], identity[1], mat_kind):
+					continue
+				interval = _segment_world_box_interval(
+					start, end, world_box,
+					baked['broad_phase_margin'])
+				if interval is None:
+					continue
+				distance = interval[0] * segment_length
+				if (maximum_distance is None or distance <=
+						float(maximum_distance) + 1.0e-6):
+					intersects = True
+					break
+			if not intersects:
+				continue
+			instance = _stream_baked_shot_instance_1513(spaceID, identity)
+			if instance is None:
+				instance = baked
+				pending = True
 		for world_box in instance['boxes']:
 			interval = _segment_world_box_interval(
 				start, end, world_box, 0.0)
@@ -704,22 +955,23 @@ def _catalog_shot_intersection(start, end, maximum_distance=None):
 			previous = hits.get(key)
 			if previous is None or distance < previous[0]:
 				point = start + segment.scale(entry)
-				candidate = identity + (
+				candidate = None if pending else identity + (
 					mat_kind, _instance_descriptor_filename_1513(instance),
 					instance['kind'], instance['item_scale'],
 					(float(point.x), float(point.y), float(point.z)))
-				hits[key] = (distance, exit * segment_length, candidate)
+				hits[key] = (
+					distance, exit * segment_length, candidate, pending)
 	if not hits:
 		return None
 	nearest_distance = min(value[0] for value in hits.values())
 	nearest = [value for value in hits.values()
 		if abs(value[0] - nearest_distance) <= _CATALOG_POINT_EPSILON]
-	if len(nearest) != 1:
+	if len(nearest) != 1 or nearest[0][3]:
 		return {
 			'candidate': None, 'distance': nearest_distance,
 			'exit_distance': nearest_distance, 'ambiguous': True,
 		}
-	distance, exit_distance, candidate = nearest[0]
+	distance, exit_distance, candidate, unused_pending = nearest[0]
 	return {
 		'candidate': candidate, 'distance': distance,
 		'exit_distance': exit_distance, 'ambiguous': False,
@@ -1892,6 +2144,7 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 							'effect_category': '-',
 							'result': 'pending',
 							'boxes': 0,
+							'raw_mismatch': False,
 						}
 						# Retained for the whole battle, one dict per native slot
 						# including every tree, so only keep it when a reader exists.
@@ -1932,9 +2185,11 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 						if _located is not None:
 							if (_raw_normalized and
 									_raw_normalized != _located['filename']):
-								raise RuntimeError(
-									'#1513 destructible filename disagrees with '
-									'catalog instance')
+								# This helper is only a partial diagnostic prefix in
+								# #1513. The checksum-pinned unique matrix signature,
+								# exact native wire and effect category below are the
+								# authoritative identity boundary.
+								_slot_diag['raw_mismatch'] = True
 							if _located['wire'] != (int(cid), int(_ti)):
 								raise RuntimeError(
 									'#1513 streamed destructible identity '
@@ -2633,7 +2888,7 @@ def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec,
 			}
 	if catalog_hit is None:
 		catalog_hit = _catalog_shot_intersection(
-			start_pos, end_pos,
+			spaceID, start_pos, end_pos,
 			world_dist if world_collision is not None else None)
 	if catalog_hit is None:
 		if world_collision is not None:

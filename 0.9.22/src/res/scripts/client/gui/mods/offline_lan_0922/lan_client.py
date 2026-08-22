@@ -11,9 +11,16 @@ import uuid
 
 PROTOCOL_VERSION = 5
 CLIENT_BUILD = 'wot-0.9.22.0.1-cn-1513'
+RANDOM_MAP_OPTION = 'server_random'
 PROJECTILE_LEDGER_CAPABILITY = 'projectile_ledger_v1'
+PROJECTILE_HIT_VEHICLE_CAPABILITY = 'projectile_hit_vehicle_v1'
+RANDOM_MAP_CAPABILITY = 'random_map_v1'
+DESTRUCTIBLE_CATALOG_V5_CAPABILITY = 'destructible_catalog_v5'
 SIMULATION_WORKER_CAPABILITY = 'simulation_worker_v1'
-CLIENT_CAPABILITIES = (PROJECTILE_LEDGER_CAPABILITY,)
+CLIENT_CAPABILITIES = (
+    PROJECTILE_LEDGER_CAPABILITY,
+    DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+)
 WORKER_AUTHORITY_ID = -1
 POLL_INTERVAL = 1.0 / 60.0
 PING_INTERVAL = 1.0
@@ -738,6 +745,7 @@ class LANClient(object):
         self.authority_epoch = None
         self.server_time_ms = None
         self.capabilities = []
+        self.server_capabilities = []
         self.last_snapshot = None
         self.last_error = None
         self.rtt_ms = None
@@ -782,6 +790,7 @@ class LANClient(object):
             self.last_error = None
             self.phase = 'connecting'
             self.capabilities = []
+            self.server_capabilities = []
             self.authority_epoch = None
             self.server_time_ms = None
         with self._pending_lock:
@@ -797,11 +806,12 @@ class LANClient(object):
         return True
 
     def _hello_payload(self):
-        """Return the unchanged player hello sent by the transport worker.
+        """Return the player hello sent by the transport worker.
 
         A simulation worker overrides this one construction boundary.  Keeping
         the ordinary payload here prevents the opt-in role from changing the
-        wire shape used by every player client and older v5 server.
+        player identity fields.  Capability negotiation separately fences the
+        schema-5 destructible and optional projectile/map wire extensions.
         """
         return {
             'type': 'hello',
@@ -901,7 +911,11 @@ class LANClient(object):
         message = {'type': 'start_battle', 'round_id': self.round_id}
         if map_name:
             map_name = _safe_text(map_name, '', 80)
-            if self.map_pool and map_name not in self.map_pool:
+            if (map_name == RANDOM_MAP_OPTION and
+                    not self.has_random_map()):
+                return False
+            if (self.map_pool and map_name not in self.map_pool and
+                    map_name != RANDOM_MAP_OPTION):
                 return False
             message['map'] = map_name
         return self._send(message)
@@ -1233,7 +1247,7 @@ class LANClient(object):
             self, authority_epoch, projectile_id, base_checked_ms, outcome,
             resolved_time_ms, impact, direct, splash, checked_distance=0.0,
             piercing_loss=0.0, penetration_factor=1.0,
-            destructibles=None):
+            destructibles=None, hit_vehicle=None):
         """Resolve one server-ledger projectile with an atomic effect set."""
         if self.phase != 'battle' or not self.is_bot_authority():
             return False
@@ -1252,6 +1266,12 @@ class LANClient(object):
             piercing_loss, 0.0, MAX_PROJECTILE_PIERCING_LOSS)
         parsed_factor = _projectile_float_range(
             penetration_factor, 0.0, 100.0)
+        if hit_vehicle is None:
+            parsed_hit_vehicle = direct is not None
+        elif isinstance(hit_vehicle, bool):
+            parsed_hit_vehicle = hit_vehicle
+        else:
+            return False
         if destructibles is None:
             destructibles = []
         if (not isinstance(destructibles, list) or
@@ -1272,6 +1292,7 @@ class LANClient(object):
                 (outcome != 'impact' and impact is not None) or
                 parsed_distance is None or
                 parsed_loss is None or parsed_factor is None or
+                (outcome != 'impact' and parsed_hit_vehicle) or
                 not isinstance(splash, list) or
                 len(splash) > MAX_PROJECTILE_BATCH):
             return False
@@ -1297,7 +1318,9 @@ class LANClient(object):
         if (outcome != 'impact' and
                 (parsed_direct is not None or parsed_splash)):
             return False
-        return self._send({
+        if parsed_direct is not None and not parsed_hit_vehicle:
+            return False
+        message = {
             'type': 'projectile_resolve',
             'round_id': self.round_id,
             'authority_epoch': parsed_epoch,
@@ -1312,7 +1335,10 @@ class LANClient(object):
             'direct': parsed_direct,
             'splash': parsed_splash,
             'destructibles': parsed_destructibles,
-        })
+        }
+        if self.has_projectile_hit_vehicle():
+            message['hit_vehicle'] = parsed_hit_vehicle
+        return self._send(message)
 
     def send_hit(self, target_id, shot_seq, damage, shot_result,
                  shell_index=0, impact_position=None, critical=None,
@@ -1379,6 +1405,13 @@ class LANClient(object):
 
     def has_projectile_ledger(self):
         return PROJECTILE_LEDGER_CAPABILITY in self.capabilities
+
+    def has_projectile_hit_vehicle(self):
+        return (PROJECTILE_HIT_VEHICLE_CAPABILITY in
+                self.server_capabilities)
+
+    def has_random_map(self):
+        return RANDOM_MAP_CAPABILITY in self.server_capabilities
 
     def send_bot_manifest(self, bots):
         if not self.is_bot_authority():
@@ -2087,8 +2120,13 @@ class LANClient(object):
                 self.stop()
                 return
             capabilities = _strict_capabilities(message.get('capabilities'))
+            server_capabilities = _strict_capabilities(
+                message.get('server_capabilities', []))
             if (capabilities is None or
-                    PROJECTILE_LEDGER_CAPABILITY not in capabilities):
+                    PROJECTILE_LEDGER_CAPABILITY not in capabilities or
+                    server_capabilities is None or
+                    DESTRUCTIBLE_CATALOG_V5_CAPABILITY not in
+                    server_capabilities):
                 self.last_error = 'projectile ledger capability mismatch'
                 self.stop()
                 return
@@ -2147,6 +2185,7 @@ class LANClient(object):
             self.bot_authority_id = message.get('bot_authority_id')
             self.authority_epoch = authority_epoch
             self.capabilities = capabilities
+            self.server_capabilities = server_capabilities
             self.server_time_ms = welcome_server_time
         elif kind == 'battle_receipt':
             if (not _valid_battle_receipt(message) or

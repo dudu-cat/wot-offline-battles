@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Copy the files the packaged launcher carries.
-
-The bundle holds two payloads: the LAN servers it runs, and the client mod it
-installs into the game folder. The 0.8.2 navigation graphs travel with the
-client mod, so the 0.8.2 server reads them from the installed client through
-`WOT_OFFLINE_NAVGRAPH_DIR`.
-"""
+"""Copy the 0.9.22 files the packaged launcher carries."""
 
 from __future__ import annotations
 
@@ -20,15 +14,6 @@ SERVER_DIR = "servers"
 CLIENT_DIR = "client"
 
 PAYLOAD_FILES = {
-    "0.8.2": (
-        "lan_battle_server.py",
-        "server_bot_ai.py",
-        "server_bot_navigation.py",
-        "scripts/client/gui/mods/__init__.py",
-        "scripts/client/gui/mods/offhangar/__init__.py",
-        "scripts/client/gui/mods/offhangar/bot_ai_cover.py",
-        "scripts/client/gui/mods/offhangar/bot_ai_navigation.py",
-    ),
     "0.9.22": (
         "server/descriptor_projection.py",
         "server/lan_battle_server.py",
@@ -46,14 +31,11 @@ PAYLOAD_TREES = {
 
 # Client mod trees, as (source directory, path inside the game folder).
 CLIENT_TREES = {
-    "0.8.2": (("scripts", "res_mods/0.8.2/scripts"),
-              ("gui", "res_mods/0.8.2/gui")),
     "0.9.22": (("mods", "mods"),
                ("res_mods/0.9.22.0.1", "res_mods/0.9.22.0.1")),
 }
 
 CLIENT_FILES = {
-    "0.8.2": (),
     "0.9.22": (("offline_worker_starter.exe",
                  "offline_worker_starter.exe"),),
 }
@@ -61,7 +43,6 @@ CLIENT_FILES = {
 CLIENT_0922_OVERLAY = "WoT-0.9.22-LAN-Client-*"
 
 CLIENT_FILE_SUFFIXES = {
-    "0.8.2": (".dds", ".json", ".png", ".py", ".pyc", ".pyd"),
     "0.9.22": (".exe", ".json", ".pyd", ".wotmod", ".xml"),
 }
 
@@ -73,8 +54,8 @@ def repository_root():
 def client_source(port_version, source_root=None):
     """Return the directory that holds one port's installable client mod."""
     source_root = source_root or repository_root()
-    if port_version == "0.8.2":
-        return os.path.join(source_root, "0.8.2")
+    if port_version != "0.9.22":
+        raise ValueError("unsupported client port: %s" % port_version)
     overlays = sorted(glob.glob(os.path.join(
         source_root, "0.9.22", "dist", CLIENT_0922_OVERLAY)))
     overlays = [path for path in overlays if os.path.isdir(path)]
@@ -93,8 +74,7 @@ def _copy_file(source, target):
     shutil.copy2(source, target)
 
 
-# The 0.8.2 client mod is loaded by CameraNode.pyc, so client trees keep their
-# bytecode. Stale bytecode, retired one-off tools, and local caches stay out.
+# Stale bytecode, retired one-off tools, and local caches stay out.
 SKIPPED_CLIENT_FILES = ("mod_offhangar.pyc",)
 SKIPPED_CLIENT_PREFIXES = (
     "bw_", "dis_", "fix_", "inject_", "patch_", "remove_", "test_",

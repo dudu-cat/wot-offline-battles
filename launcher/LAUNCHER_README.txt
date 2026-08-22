@@ -10,9 +10,8 @@ Tanks, and stops that server when the game closes.
 2. Select your World of Tanks folder. The list holds the folders you used
    before, plus any game the launcher finds in the usual install locations.
    Use Browse... for a folder that is not in the list. The launcher reports
-   which client it found. The supported clients are World of Tanks 0.8.2 and
-   the exact Chinese HD 0.9.22.0.1 #1513 build; another 0.9.22 build is not
-   compatible.
+   which client it found. The only supported client is the exact Chinese HD
+   0.9.22.0.1 #1513 build; another build is not compatible.
 3. Select a mode:
    - Single player: you play alone against bots. The launcher runs the LAN
      server for you, because every battle is a server battle.
@@ -49,6 +48,11 @@ client-preference files; it does not delete vehicle-data overrides, other mods
 or the normal World of Tanks profile. Both operations require the game to be
 closed and leave unrelated mods alone.
 
+If a normal, current World of Tanks client is stuck while loading, the repair
+tab can move its shared `%APPDATA%\Wargaming.net\WorldOfTanks\preferences.xml`
+aside. The launcher keeps the old file beside it as a timestamped backup; it
+does not delete the file or change offline saved data.
+
 The launcher gives the exact 0.9.22 client its own graphics, window, zoom and
 input settings. It creates a complete res_mods engine-config overlay from the
 installed stock file, changing only the preferences location to
@@ -63,14 +67,13 @@ The client sometimes closes its first process and starts another one while it
 starts up. The launcher waits half a minute after the last game process before
 it stops the server, so that restart does not end your battle.
 
-Your own files stay in place: 0.8.2 settings in offhangar_user, and the 0.9.22
-saved address, account state, garage, pending post-battle results and
-configuration in
+Your 0.9.22 saved address, account state, garage, pending post-battle results
+and configuration stay in
 mods\configs\offline_lan_0922. Other authors' .wotmod files stay where they
 are.
 
 Two limits to expect. Bot tracks and road wheels do not turn, so a broken enemy
-track has no visual cue. Both clients are 32-bit; the exact #1513 executable is
+track has no visual cue. The exact #1513 client is 32-bit; its executable is
 large-address-aware and can normally address about 4 GB on 64-bit Windows, but
 a very long session can still run out of memory and exit. Restart the client
 between long sessions.

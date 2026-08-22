@@ -187,7 +187,7 @@ class WindowTest(unittest.TestCase):
     def _log_text(self):
         return "".join(self.window.log_view.lines)
 
-    def _game(self, version="0.8.2", build="335"):
+    def _game(self, version="0.9.22.0.1", build="1513"):
         game_root = os.path.join(self.settings_dir, "game-" + version)
         os.makedirs(game_root)
         with open(os.path.join(game_root, core.GAME_EXECUTABLE), "w") as stream:
@@ -211,6 +211,27 @@ class WindowTest(unittest.TestCase):
         self.assertIs(
             self.window.vehicle_profile_box.master, self.window.vehicle_panel)
         self.assertIs(self.window.repair_button.master, self.window.repair_panel)
+        self.assertIs(
+            self.window.normal_preferences_button.master,
+            self.window.repair_panel)
+        self.assertIn("伪红学家", self.window.author_text.get())
+        self.assertIn("tiancaihb", self.window.author_text.get())
+        self.assertIn("QQ群：302519768", self.window.author_text.get())
+        self.assertIn(
+            "github.com/pengw0048/wot-offline-battles",
+            self.window.author_text.get())
+        self.assertEqual(
+            "本mod免费传播、开源、欢迎二创，使用无需付费，售卖与本人无关，仅供个人学习交流",
+            self.window.distribution_notice_text.get())
+        self.assertEqual("readonly", self.window.author_entry.cget("state"))
+        self.assertEqual(
+            "readonly", self.window.distribution_notice_entry.cget("state"))
+        self.assertIs(
+            self.window.author_text,
+            self.window.author_entry.cget("textvariable"))
+        self.assertIs(
+            self.window.distribution_notice_text,
+            self.window.distribution_notice_entry.cget("textvariable"))
 
     def test_old_host_setting_migrates_to_the_online_tab(self):
         core.save_settings({"mode": core.MODE_HOST})
@@ -262,7 +283,7 @@ class WindowTest(unittest.TestCase):
         self._game()
         self.window.join_address.set("10.0.0.5:1234")
         session = {
-            "client": core.PORT_0_8_2,
+            "client": core.PORT_0_9_22,
             "mode": core.MODE_JOIN,
             "host": "10.0.0.5",
             "tcp_port": 1234,
@@ -335,24 +356,23 @@ class WindowTest(unittest.TestCase):
             "%s:%d" % (core.LOCAL_HOST, core.DEFAULT_SERVER_PORT),
             self.window.join_address.get())
 
-    def test_0_8_2_server_button_ignores_hidden_team_size_text(self):
-        game_root = self._game("0.8.2", "335")
+    def test_0_8_2_folder_cannot_start_a_server(self):
+        self._game("0.8.2", "335")
         self.window.mode.set(core.MODE_JOIN)
-        self.window.team_size.set("not a team size")
         self.window._refresh_mode()
-        with mock.patch("core.install_client_mod", return_value=[]), \
-                mock.patch.object(
-                    self.window, "_start_server", return_value=True) \
-                as start_server:
-            self.assertTrue(self.window._toggle_lan_server())
-            for unused in range(200):
-                if not self.window._maintenance_busy:
-                    break
-                time.sleep(0.01)
+        with mock.patch.object(self.window, "_start_server") as start_server:
+            self.assertFalse(self.window._toggle_lan_server())
 
-        start_server.assert_called_once_with(
-            game_root, core.PORT_0_8_2, core.DEFAULT_TEAM_SIZE,
-            persistent=True)
+        start_server.assert_not_called()
+        self.assertIn("supported game folder", self._log_text())
+
+    def test_hidden_server_entry_rejects_0_8_2(self):
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(
+                2, wot_launcher._serve(
+                    [core.SERVE_FLAG, core.PORT_0_8_2]))
+
+        self.assertIn("Unsupported client version", output.call_args.args[0])
 
     def test_an_empty_folder_asks_for_the_game_executable(self):
         self.window.game_root.set("")
@@ -377,8 +397,6 @@ class WindowTest(unittest.TestCase):
 
     def test_start_reports_an_invalid_join_address(self):
         game_root = self._game()
-        os.makedirs(os.path.join(game_root, "res_mods", "0.8.2", "scripts",
-                                 "client", "gui", "mods", "offhangar"))
         self.window.mode.set(core.MODE_JOIN)
         self.window.join_address.set("")
         self.window._start()
@@ -424,13 +442,15 @@ class WindowTest(unittest.TestCase):
         self.assertEqual([], self.window._folders)
 
     def test_maintenance_buttons_are_only_enabled_for_0_9_22(self):
-        self._game()
+        self._game("0.8.2", "335")
         self.assertEqual("disabled",
                          self.window.repair_button.cget("state"))
         self.assertEqual("disabled",
                          self.window.vehicle_editor_button.cget("state"))
         self._game("0.9.22.0.1", "1513")
         self.assertEqual("normal", self.window.repair_button.cget("state"))
+        self.assertEqual(
+            "normal", self.window.normal_preferences_button.cget("state"))
         self.assertEqual("normal", self.window.reset_button.cget("state"))
         self.assertEqual(
             "readonly", self.window.vehicle_profile_box.cget("state"))
@@ -627,6 +647,23 @@ class WindowTest(unittest.TestCase):
         self.assertIn("repair complete", self._log_text())
         self.assertEqual("normal", self.window.start_button.cget("state"))
 
+    def test_normal_preferences_cleanup_runs_after_confirmation(self):
+        game_root = self._game("0.9.22.0.1", "1513")
+        with mock.patch.object(
+                self.window, "_confirm_normal_preferences_cleanup",
+                return_value=True), mock.patch(
+                "core.game_is_running", return_value=False), mock.patch(
+                "core.backup_normal_client_preferences",
+                return_value=["normal preferences backed up"]) as cleanup:
+            self.assertTrue(self.window._clean_normal_client_preferences())
+            for unused in range(200):
+                if not self.window._maintenance_busy:
+                    break
+                time.sleep(0.01)
+
+        cleanup.assert_called_once_with(game_root)
+        self.assertIn("normal preferences backed up", self._log_text())
+
     def test_reset_requires_confirmation(self):
         self._game("0.9.22.0.1", "1513")
         with mock.patch.object(
@@ -676,7 +713,7 @@ class WindowTest(unittest.TestCase):
             if probed:
                 break
             time.sleep(0.01)
-        self.assertEqual([(core.PORT_0_8_2, "10.0.0.5", 1234)], probed)
+        self.assertEqual([(core.PORT_0_9_22, "10.0.0.5", 1234)], probed)
         self.assertIn("Testing 10.0.0.5:1234", self._log_text())
 
     def test_the_test_button_reports_an_invalid_address(self):

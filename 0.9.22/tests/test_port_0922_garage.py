@@ -160,9 +160,11 @@ class _TankmanDescriptor(object):
         # The real TankmanDescr parses its skills out of the compact
         # descriptor, so the fake must round-trip them too.
         base, _, encoded = compact_descr.partition(b'|')
+        encoded, _, xp = encoded.partition(b'#')
         self.compact_descr = base
         self.skills = [name.decode('ascii')
                        for name in encoded.split(b',') if name]
+        self.free_xp = int(xp or 0)
 
     def addSkill(self, name):
         if name in self.skills:
@@ -172,9 +174,14 @@ class _TankmanDescriptor(object):
     def dropSkills(self, fraction, throw):
         self.skills = []
 
+    def addXP(self, amount):
+        self.free_xp += int(amount)
+
     def makeCompactDescr(self):
-        return self.compact_descr + b'|' + ','.join(
+        result = self.compact_descr + b'|' + ','.join(
             self.skills).encode('ascii')
+        return result if not self.free_xp else (
+            result + b'#' + str(self.free_xp).encode('ascii'))
 
 
 def _modules():
@@ -651,6 +658,26 @@ class FittingRequestTests(unittest.TestCase):
         self.assertEqual(self.commands.RES_SUCCESS, result.result_id)
         self.assertEqual(
             b'tman:101|repair',
+            self.state.snapshot()['vehicles'][0]['tankmen'][101])
+
+    def test_drop_skills_uses_shop_revision_then_tankman_id(self):
+        self.state.add_tankman_skill(101, 0)
+
+        result = self._dispatch(
+            self.commands.CMD_TMAN_DROP_SKILLS, (77, 101, 0))
+
+        self.assertEqual(self.commands.RES_SUCCESS, result.result_id)
+        self.assertEqual(
+            b'tman:101|',
+            self.state.snapshot()['vehicles'][0]['tankmen'][101])
+
+    def test_free_xp_training_uses_the_pinned_conversion_rate(self):
+        result = self._dispatch(
+            self.commands.CMD_TRAINING_TMAN, (77, 101, 25))
+
+        self.assertEqual(self.commands.RES_SUCCESS, result.result_id)
+        self.assertEqual(
+            b'tman:101|#250',
             self.state.snapshot()['vehicles'][0]['tankmen'][101])
 
     def test_set_and_fill_layouts_decodes_both_counted_blocks(self):

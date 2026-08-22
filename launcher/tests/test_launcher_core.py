@@ -52,7 +52,7 @@ class ServerRequirementTest(unittest.TestCase):
         for port_version in core.SUPPORTED_PORTS:
             self.assertFalse(core.server_required(port_version, core.MODE_JOIN))
 
-    def test_single_player_needs_a_server_in_both_clients(self):
+    def test_single_player_needs_a_server(self):
         for port_version in core.SUPPORTED_PORTS:
             self.assertTrue(
                 core.server_required(port_version, core.MODE_SINGLE))
@@ -124,14 +124,14 @@ class GameRootTest(unittest.TestCase):
         os.makedirs(os.path.join(self.root, "mods", "0.9.22.0.1"))
         self.assertIsNone(core.installed_port(self.root))
 
-    def test_inspection_reports_a_missing_executable_and_mod(self):
+    def test_0_8_2_is_not_a_supported_client(self):
         self._write("version.xml", "<version> v.0.8.2 #100 </version>")
         status = core.inspect_game_root(self.root)
         self.assertFalse(status["has_executable"])
         self.assertFalse(status["mod_installed"])
-        self.assertEqual(status["client"], core.PORT_0_8_2)
+        self.assertIsNone(status["client"])
 
-    def test_inspection_reports_a_complete_installation(self):
+    def test_an_old_0_8_2_install_marker_does_not_restore_support(self):
         self._write("version.xml", "<version> v.0.8.2 #100 </version>")
         self._write(core.GAME_EXECUTABLE)
         self._write(os.path.join(
@@ -139,7 +139,8 @@ class GameRootTest(unittest.TestCase):
             "offhangar", "__init__.py"))
         status = core.inspect_game_root(self.root)
         self.assertTrue(status["has_executable"])
-        self.assertTrue(status["mod_installed"])
+        self.assertIsNone(status["client"])
+        self.assertFalse(status["mod_installed"])
 
 
 class SessionPlanTest(unittest.TestCase):
@@ -171,12 +172,10 @@ class SessionPlanTest(unittest.TestCase):
         self.assertEqual(7, session["team_size"])
         self.assertEqual("Fast MS-1", session["vehicle_profile"])
 
-    def test_modified_profile_is_refused_for_lan_and_other_clients(self):
+    def test_modified_profile_is_refused_for_lan(self):
         for status, mode in (
                 (self._status(), core.MODE_HOST),
-                (self._status(), core.MODE_JOIN),
-                (self._status(client=core.PORT_0_8_2, version="0.8.2"),
-                 core.MODE_SINGLE)):
+                (self._status(), core.MODE_JOIN)):
             with self.assertRaisesRegex(
                     core.LauncherError, "limited to 0.9.22 single player"):
                 core.plan_session(
@@ -194,11 +193,12 @@ class SessionPlanTest(unittest.TestCase):
             self._status(), core.MODE_JOIN, "10.0.0.5", team_size="invalid")
         self.assertEqual(core.DEFAULT_TEAM_SIZE, session["team_size"])
 
-    def test_0_8_2_single_player_plan_starts_a_local_server(self):
-        session = core.plan_session(
-            self._status(client=core.PORT_0_8_2, version="0.8.2"),
-            core.MODE_SINGLE)
-        self.assertTrue(session["needs_server"])
+    def test_0_8_2_session_is_refused(self):
+        with self.assertRaisesRegex(
+                core.LauncherError, "not supported"):
+            core.plan_session(
+                self._status(client=core.PORT_0_8_2, version="0.8.2"),
+                core.MODE_SINGLE)
 
     def test_a_missing_executable_stops_the_session(self):
         self.assertRaises(core.LauncherError, core.plan_session,
@@ -695,6 +695,68 @@ class ClientInstallTest(unittest.TestCase):
             self.game, "mods", "configs", "offline_lan_0922",
             "config.json.invalid")))
 
+    def test_normal_client_preferences_are_moved_to_a_recoverable_backup(self):
+        self._make_0_9_22_target()
+        app_data = os.path.join(self.work, "app-data")
+        preferences = os.path.join(
+            app_data,
+            *preferences_overlay.NORMAL_PROFILE_RELATIVE_PATH.split("/"))
+        os.makedirs(os.path.dirname(preferences))
+        with open(preferences, "w") as stream:
+            stream.write("normal client settings")
+        first_backup = preferences + ".wot-offline-backup-20260822-120000"
+        with open(first_backup, "w") as stream:
+            stream.write("older backup")
+
+        actions = core.backup_normal_client_preferences(
+            self.game, is_running=lambda: False,
+            environment={"APPDATA": app_data},
+            timestamp="20260822-120000")
+
+        backup = first_backup + "-1"
+        self.assertFalse(os.path.lexists(preferences))
+        with open(first_backup) as stream:
+            self.assertEqual("older backup", stream.read())
+        with open(backup) as stream:
+            self.assertEqual("normal client settings", stream.read())
+        self.assertIn(backup, actions[0])
+
+    def test_normal_client_preferences_cleanup_is_idempotent(self):
+        self._make_0_9_22_target()
+        app_data = os.path.join(self.work, "empty-app-data")
+
+        actions = core.backup_normal_client_preferences(
+            self.game, is_running=lambda: False,
+            environment={"APPDATA": app_data},
+            timestamp="20260822-120000")
+
+        self.assertIn("already absent", actions[0])
+
+    def test_normal_client_preferences_cleanup_refuses_a_file_link(self):
+        self._make_0_9_22_target()
+        app_data = os.path.join(self.work, "linked-app-data")
+        preferences = os.path.join(
+            app_data,
+            *preferences_overlay.NORMAL_PROFILE_RELATIVE_PATH.split("/"))
+        os.makedirs(os.path.dirname(preferences))
+        target = os.path.join(self.work, "outside-preferences.xml")
+        with open(target, "w") as stream:
+            stream.write("outside")
+        try:
+            os.symlink(target, preferences)
+        except (AttributeError, NotImplementedError, OSError):
+            self.skipTest("symlinks are unavailable")
+
+        with self.assertRaisesRegex(core.LauncherError, "regular file"):
+            core.backup_normal_client_preferences(
+                self.game, is_running=lambda: False,
+                environment={"APPDATA": app_data},
+                timestamp="20260822-120000")
+
+        self.assertTrue(os.path.islink(preferences))
+        with open(target) as stream:
+            self.assertEqual("outside", stream.read())
+
     def test_reset_deletes_only_known_offline_state_after_confirmation(self):
         default_config = json.dumps({"enabled": True})
         self._stage_0_9_22(default_config)
@@ -1029,11 +1091,12 @@ class PayloadStagingTest(unittest.TestCase):
             with open(os.path.join(dataset_root, "manifest.json"), "w") as stream:
                 json.dump({"maps": records}, stream)
 
-    def test_both_server_entry_points_are_staged(self):
+    def test_supported_server_entry_points_are_staged(self):
         for port_version in core.SUPPORTED_PORTS:
             self.assertTrue(
                 os.path.isfile(core.server_script(port_version, self.target)),
                 port_version)
+        self.assertFalse(os.path.exists(os.path.join(self.target, "0.8.2")))
 
     def test_the_0_9_22_server_finds_its_client_modules(self):
         self.assertTrue(os.path.isfile(os.path.join(
@@ -1049,7 +1112,7 @@ class PayloadStagingTest(unittest.TestCase):
             os.path.sep + "navgraphs" + os.path.sep in path
             for path in self.written))
 
-    def test_client_staging_takes_both_mods_from_the_checkout(self):
+    def test_client_staging_carries_only_the_0_9_22_mod(self):
         source = os.path.join(tempfile.mkdtemp(), "repo")
         self.addCleanup(shutil.rmtree, os.path.dirname(source), True)
         overlay = os.path.join(source, "0.9.22", "dist",
@@ -1076,8 +1139,6 @@ class PayloadStagingTest(unittest.TestCase):
         target = os.path.join(source, "staged")
         stage_payload.stage_clients(target, source)
         expected = {
-            "0.8.2": ("res_mods/0.8.2/scripts/client/a.py",
-                      "res_mods/0.8.2/gui/maps/a.dds"),
             "0.9.22": ("mods/0.9.22.0.1/"
                        "org.peng.offline_lan_0922_0.6.0-alpha.1.wotmod",
                        "mods/configs/offline_lan_0922/config.json",
@@ -1097,6 +1158,7 @@ class PayloadStagingTest(unittest.TestCase):
                 archive.close()
             for member in members:
                 self.assertIn(member, names)
+        self.assertFalse(os.path.exists(os.path.join(target, "0.8.2.zip")))
 
     def test_client_staging_without_a_built_package_reports_it(self):
         source = tempfile.mkdtemp()
@@ -1183,7 +1245,6 @@ class ServerImportTest(unittest.TestCase):
     """
 
     ENTRY_POINTS = {
-        core.PORT_0_8_2: ('lan_battle_server.py',),
         core.PORT_0_9_22: ('server/windows_server.py',),
     }
 
@@ -1276,6 +1337,7 @@ class ListenerTest(unittest.TestCase):
                 "protocol": hello["protocol"],
                 "client_build": hello["client_build"],
                 "capabilities": hello.get("capabilities", []),
+                "server_capabilities": ["destructible_catalog_v5"],
             }
             reply.update(self.reply_overrides)
             self.reply = (json.dumps(reply) + "\n").encode("utf-8")
@@ -1329,6 +1391,12 @@ class ListenerTest(unittest.TestCase):
 
     def test_protocol_probe_rejects_an_unrelated_listener(self):
         connection = self._ProtocolConnection({"client_build": "wrong"})
+        self.assertFalse(core.probe_server_protocol(
+            core.PORT_0_9_22, "127.0.0.1", 28782,
+            connect=lambda address, timeout: connection))
+
+    def test_protocol_probe_rejects_a_pre_schema_5_server(self):
+        connection = self._ProtocolConnection({"server_capabilities": []})
         self.assertFalse(core.probe_server_protocol(
             core.PORT_0_9_22, "127.0.0.1", 28782,
             connect=lambda address, timeout: connection))
@@ -1392,6 +1460,12 @@ class ListenerTest(unittest.TestCase):
                          core._SERVER_PROBES[core.PORT_0_9_22]["client_build"])
         self.assertIn(server0922["PROJECTILE_CAPABILITY"],
                       core._SERVER_PROBES[core.PORT_0_9_22]["capabilities"])
+        self.assertIn(
+            server0922["DESTRUCTIBLE_CATALOG_V5_CAPABILITY"],
+            core._SERVER_PROBES[core.PORT_0_9_22]["capabilities"])
+        self.assertIn(
+            server0922["DESTRUCTIBLE_CATALOG_V5_CAPABILITY"],
+            core._SERVER_PROBES[core.PORT_0_9_22]["server_capabilities"])
 
 
 class ConnectionReportTest(unittest.TestCase):

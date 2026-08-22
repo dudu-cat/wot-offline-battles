@@ -1621,6 +1621,7 @@ EXPECTED_CLASS_CONSTANTS = {
     'scripts/common/BattleFeedbackCommon.pyc': {
         'BATTLE_EVENT_TYPE': {
             'SPOTTED': 0,
+            'TANKING': 5,
             'TARGET_VISIBILITY': 12,
         },
     },

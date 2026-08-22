@@ -26,9 +26,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Payload staging failed with exit code $LASTEXITCODE"
 }
 
-foreach ($entry in @("servers\0.8.2\lan_battle_server.py",
-                     "servers\0.9.22\server\windows_server.py",
-                     "client\0.8.2.zip",
+foreach ($entry in @("servers\0.9.22\server\windows_server.py",
                      "client\0.9.22.zip")) {
     if (-not (Test-Path -LiteralPath (Join-Path $PayloadRoot $entry))) {
         throw "Payload is incomplete: $entry"

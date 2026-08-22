@@ -235,6 +235,22 @@ class VehicleEditorWindowTest(unittest.TestCase):
                          self.window.vehicle_box.cget("values"))
         self.assertEqual("A01_T1_Cunningham", self.window.vehicle.get())
 
+    def test_localized_vehicle_label_selects_the_exact_internal_vehicle(self):
+        service = _Service()
+        service.choices[0]["label"] = "MS-1 (R11_MS-1)"
+
+        window = vehicle_editor_ui.VehicleEditorWindow(
+            self.parent, "C:/WoT", "Fast MS-1", _FakeTk, _FakeTtk,
+            self.messagebox, service=service)
+
+        self.assertEqual(
+            ("MS-1 (R11_MS-1)", "R12_Test"),
+            window.vehicle_box.cget("values"))
+        self.assertEqual("MS-1 (R11_MS-1)", window.vehicle.get())
+        self.assertEqual(
+            ("C:/WoT", vehicle_editor_ui.DEFAULT_MEMBER),
+            service.topology_calls[-1])
+
     def test_inspect_disables_apply_and_shows_a_conflict(self):
         self.service.conflict = (
             "Conflict: another tool owns this complete member.")
@@ -312,6 +328,18 @@ class VehicleEditorWindowTest(unittest.TestCase):
         self.assertIn("正数", window.constraint.get())
         self.assertIn("只影响该车", window.scope.get())
         self.assertIn("可以安全修改", window.status.get())
+        self.assertEqual(
+            "Shell-A / HE 溅射范围",
+            window._field_label("Shell-A / Explosion radius"))
+        self.assertEqual(
+            "Shell-A / Explosion radius",
+            self.window._field_label("Shell-A / Explosion radius"))
+        self.assertEqual(
+            "Shell-A / 伤害 / 模块伤害",
+            window._field_label("Shell-A / Damage / Module damage"))
+        self.assertEqual(
+            "Shell-A / Damage / Module damage",
+            self.window._field_label("Shell-A / Damage / Module damage"))
 
         self.assertFalse(window.restore_defaults())
         self.assertIn("清除", messagebox.calls[-1][0][0])

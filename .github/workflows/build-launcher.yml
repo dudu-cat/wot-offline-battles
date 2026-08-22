@@ -121,19 +121,14 @@ jobs:
           import core
 
           payload, fake082, fake0922 = sys.argv[1:4]
-          retired_prefixes = (
-              'bw_', 'dis_', 'fix_', 'inject_', 'patch_', 'remove_', 'test_')
           for port in core.SUPPORTED_PORTS:
               archive_path = os.path.join(payload, 'client', port + '.zip')
               with zipfile.ZipFile(archive_path) as archive:
                   names = archive.namelist()
               assert not any('__pycache__' in name or name.endswith('.sha256')
                              for name in names), port
-              if port == core.PORT_0_8_2:
-                  assert not any(name.rsplit('/', 1)[-1].startswith(
-                      retired_prefixes) for name in names)
-          cases = ((core.PORT_0_8_2, fake082),
-                   (core.PORT_0_9_22, fake0922))
+          assert core.inspect_game_root(fake082)['client'] is None
+          cases = ((core.PORT_0_9_22, fake0922),)
           for port, game_root in cases:
               status = core.inspect_game_root(game_root)
               assert status['client'] == port, status
@@ -141,15 +136,11 @@ jobs:
               assert core._installation_complete(
                   game_root, port, core._CLIENT_INSTALL[port])
 
-          data_root_082 = os.path.join(
-              fake082, 'res_mods', '0.8.2', 'scripts', 'client', 'gui',
-              'mods', 'offhangar', 'navgraphs')
           data_root_0922 = os.path.join(
               fake0922, 'mods', 'configs', 'offline_lan_0922')
-          inventories = [(data_root_082, 33)]
-          inventories.extend((os.path.join(data_root_0922, name), 41)
+          inventories = [(os.path.join(data_root_0922, name), 41)
               for name in
-              ('navgraphs', 'foliage', 'destructibles', 'occluders'))
+              ('navgraphs', 'foliage', 'destructibles', 'occluders')]
           for data_root, expected_count in inventories:
               manifest_path = os.path.join(data_root, 'manifest.json')
               with open(manifest_path, 'rb') as stream:
@@ -165,8 +156,6 @@ jobs:
               throw "Bundled client installation verification failed"
           }
 
-          $env:WOT_OFFLINE_NAVGRAPH_DIR = Join-Path $fake082 `
-              "res_mods\0.8.2\scripts\client\gui\mods\offhangar\navgraphs"
           $env:WOT_0922_SERVER_DATA = Join-Path $fake0922 `
               "mods\configs\offline_lan_0922"
           $ProtocolProbe = @'
@@ -177,7 +166,7 @@ jobs:
           raise SystemExit(0 if core.probe_server_protocol(
               sys.argv[1], '127.0.0.1', 28782, timeout=1.0) else 1)
           '@
-          foreach ($port in @("0.8.2", "0.9.22")) {
+          foreach ($port in @("0.9.22")) {
               $process = Start-Process -FilePath $launcher `
                   -ArgumentList "--serve", $port -PassThru
               try {

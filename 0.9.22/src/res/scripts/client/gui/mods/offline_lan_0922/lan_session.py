@@ -861,6 +861,10 @@ class LANSession(object):
             return None
         return list(self._map_pool)
 
+    def _server_supports_random_map(self):
+        supported = getattr(self.client, 'has_random_map', None)
+        return bool(callable(supported) and supported())
+
     def _ensure_queue(self):
         if self._queue is None:
             surface = self._new_room()
@@ -910,7 +914,9 @@ class LANSession(object):
             room = self._room_factory(self.request_start, self._map_pool_value,
                                       status=self._room_status,
                                       on_close=self.leave_room,
-                                      host=self._is_local_host)
+                                      host=self._is_local_host,
+                                      random_supported=(
+                                          self._server_supports_random_map))
             room.install()
         except Exception as error:
             sys.stdout.write(
@@ -1308,7 +1314,9 @@ class LANSession(object):
                     # provisional map choice into a start request.
                     self._sync_waiting_surface(previous_host_player_id)
                     return
-                if pending_map not in self._map_pool:
+                if (pending_map not in self._map_pool and not (
+                        pending_map == waiting_room_ui.RANDOM_MAP_OPTION and
+                        self._server_supports_random_map())):
                     self._status_notifier(
                         'The LAN server does not offer the selected map.')
                     self._sync_waiting_surface(previous_host_player_id)

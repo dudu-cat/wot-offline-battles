@@ -195,6 +195,32 @@ class PreferencesOverlayTest(unittest.TestCase):
         self.assertIsNone(preferences_overlay.profile_path(
             {"LOCALAPPDATA": local}))
 
+    def test_normal_profile_path_is_the_stock_appdata_location(self):
+        app_data = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, app_data, True)
+
+        self.assertEqual(
+            os.path.join(
+                os.path.realpath(app_data),
+                *preferences_overlay.NORMAL_PROFILE_RELATIVE_PATH.split("/")),
+            preferences_overlay.normal_profile_path({"APPDATA": app_data}))
+        self.assertIsNone(preferences_overlay.normal_profile_path({}))
+        self.assertIsNone(preferences_overlay.normal_profile_path(
+            {"APPDATA": "relative"}))
+
+    def test_normal_profile_path_rejects_an_escaping_parent_link(self):
+        app_data = tempfile.mkdtemp()
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, app_data, True)
+        self.addCleanup(shutil.rmtree, outside, True)
+        try:
+            os.symlink(outside, os.path.join(app_data, "Wargaming.net"))
+        except (AttributeError, NotImplementedError, OSError):
+            self.skipTest("symlinks are unavailable")
+
+        self.assertIsNone(preferences_overlay.normal_profile_path(
+            {"APPDATA": app_data}))
+
 
 if __name__ == "__main__":
     unittest.main()

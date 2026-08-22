@@ -14,7 +14,8 @@ sys.path.insert(0, str(SERVER_ROOT))
 
 import lan_battle_server as server_module  # noqa: E402
 from lan_battle_server import (  # noqa: E402
-    BattleState, CLIENT_BUILD_0922, ClientHandler, PROJECTILE_CAPABILITY,
+    BattleState, CLIENT_BUILD_0922, ClientHandler,
+    DESTRUCTIBLE_CATALOG_V5_CAPABILITY, PROJECTILE_CAPABILITY,
     Player, PREBATTLE_SECONDS,
     SimulationWorker,
     SIMULATION_WORKER_AUTHORITY_ID, SIMULATION_WORKER_CAPABILITY,
@@ -72,7 +73,8 @@ def _worker_hello():
         'role': SIMULATION_WORKER_ROLE,
         'client_build': CLIENT_BUILD_0922,
         'capabilities': [
-            PROJECTILE_CAPABILITY, SIMULATION_WORKER_CAPABILITY],
+            PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+            SIMULATION_WORKER_CAPABILITY],
     }
 
 
@@ -81,7 +83,8 @@ def _player_hello(name='Human'):
     return {
         'type': 'hello', 'protocol': 5,
         'client_build': CLIENT_BUILD_0922,
-        'capabilities': [PROJECTILE_CAPABILITY],
+        'capabilities': [
+            PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY],
         'name': name, 'vehicle': 'ussr:R11_MS-1', 'max_health': 90,
     }
 
@@ -985,7 +988,7 @@ class SimulationWorkerSocketTests(unittest.TestCase):
                 'vehicle', 'outfits', 'team', 'slot', 'max_health', 'map',
                 'map_pool', 'host_player_id', 'phase', 'round_id',
                 'state_revision', 'spawn', 'bot_authority_id', 'team_size',
-                'authority_epoch', 'capabilities',
+                'authority_epoch', 'capabilities', 'server_capabilities',
             }, set(welcome))
             roster = player.receive_until('roster')
             self.assertNotIn('worker_status', roster)
