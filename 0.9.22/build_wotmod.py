@@ -20,7 +20,7 @@ import navigation_graph_schema as _navigation_schema
 
 
 MOD_ID = 'org.peng.offline_lan_0922'
-MOD_VERSION = '0.5.0'
+MOD_VERSION = '0.6.0-alpha.1'
 NATIVE_BRIDGE_FILENAME = 'offline_instance_guard_native.pyd'
 WORKER_STARTER_FILENAME = 'offline_worker_starter.exe'
 SERVER_FILENAME = 'WoT-0.9.22-LAN-Server.exe'
