@@ -114,6 +114,14 @@ _FIELD_LABELS = {
     "maxRegenHealth": "Repair threshold",
     "power": "Power",
     "rotationSpeed": "Traverse speed",
+    "pitchLimits": "Gun elevation limits",
+    "minPitch": "Depression curve",
+    "maxPitch": "Elevation curve",
+    "turretYawLimits": "Horizontal traverse limits",
+    "hull_aiming": "Hull aiming",
+    "wheelsCorrectionAngles": "Suspension pitch limits",
+    "pitchMin": "Minimum pitch",
+    "pitchMax": "Maximum pitch",
     "reloadTime": "Reload time",
     "aimingTime": "Aiming time",
     "maxAmmo": "Ammunition capacity",
@@ -278,6 +286,25 @@ _PIERCING_PAIR = {
         "the first value must be no less than the second"),
     "arity": 2,
 }
+_PITCH_CURVE = {
+    "id": "pitch-curve",
+    "description": (
+        "angle may be one finite degree value or a complete 0..1 piecewise "
+        "curve; every angle must be between -90 and 90 degrees"),
+    "sequence": "pitch",
+}
+_YAW_LIMITS = {
+    "id": "yaw-limits",
+    "description": (
+        "horizontal traverse must contain exactly two finite degree values "
+        "between -180 and 180; minimum must not exceed maximum"),
+    "sequence": "yaw",
+}
+_PITCH_ANGLE = {
+    "id": "pitch-angle",
+    "description": "pitch angle must be finite and between -90 and 90 degrees",
+    "bounded": (-90.0, 90.0),
+}
 
 
 def _health_rule(name):
@@ -292,6 +319,11 @@ def _gun_value_rule(parts):
         return _POSITIVE
     if len(parts) == 1 and parts[-1] == "maxAmmo":
         return _MAX_AMMO
+    if (len(parts) == 2 and parts[0] == "pitchLimits" and
+            parts[-1] in ("minPitch", "maxPitch")):
+        return _PITCH_CURVE
+    if len(parts) == 1 and parts[-1] == "turretYawLimits":
+        return _YAW_LIMITS
     if (len(parts) == 3 and parts[0] == "shots" and
             parts[-1] in ("speed", "maxDistance")):
         return _POSITIVE
@@ -314,9 +346,21 @@ def _field_rule(member, field_path):
             return _POSITIVE
         if parts == ["hull", "maxHealth"]:
             return _MAX_HEALTH
+        if parts == ["hull", "weight"]:
+            return _POSITIVE
+        if (len(parts) == 3 and parts[0] == "hull" and
+                parts[1] == "armor"):
+            return _NONNEGATIVE
+        if (len(parts) == 4 and parts[:3] == [
+                "hull_aiming", "pitch", "wheelsCorrectionAngles"] and
+                parts[-1] in ("pitchMin", "pitchMax")):
+            return _PITCH_ANGLE
         if (len(parts) == 3 and parts[0] == "chassis" and
                 parts[2] in ("weight", "maxLoad")):
             return _POSITIVE
+        if (len(parts) == 4 and parts[0] == "chassis" and
+                parts[2] == "armor"):
+            return _NONNEGATIVE
         if parts in (["hull", "ammoBayHealth", "maxHealth"],
                      ["hull", "ammoBayHealth", "maxRegenHealth"]):
             return _health_rule(parts[-1])
@@ -326,6 +370,12 @@ def _field_rule(member, field_path):
         if (len(parts) == 3 and re.fullmatch(r"turrets\d+", parts[0]) and
                 parts[-1] in ("maxHealth", "maxRegenHealth")):
             return _health_rule(parts[-1])
+        if (len(parts) == 3 and re.fullmatch(r"turrets\d+", parts[0]) and
+                parts[-1] == "weight"):
+            return _POSITIVE
+        if (len(parts) == 4 and re.fullmatch(r"turrets\d+", parts[0]) and
+                parts[2] == "armor"):
+            return _NONNEGATIVE
         if (len(parts) == 4 and re.fullmatch(r"turrets\d+", parts[0]) and
                 parts[2] in _HEALTH_CONTAINERS and
                 parts[-1] in ("maxHealth", "maxRegenHealth")):
@@ -336,19 +386,29 @@ def _field_rule(member, field_path):
             rule = _gun_value_rule(parts[4:])
             if rule is not None:
                 return rule
+            if len(parts) == 6 and parts[4] == "armor":
+                return _NONNEGATIVE
 
     if member_kind == "component":
         if (component_name == "engines" and len(parts) == 3 and
-                parts[0] == "shared" and parts[-1] in ("power", "weight")):
+                parts[0] == "shared" and parts[-1] == "power"):
             return _POSITIVE
         if (component_name == "chassis" and len(parts) == 3 and
-                parts[0] == "shared" and
-                parts[-1] in ("weight", "maxLoad")):
+                parts[0] == "shared" and parts[-1] == "maxLoad"):
+            return _POSITIVE
+        if (component_name in (
+                "chassis", "engines", "fuelTanks", "guns", "radios",
+                "turrets") and len(parts) == 3 and
+                parts[0] == "shared" and parts[-1] == "weight"):
             return _POSITIVE
         if component_name == "guns" and parts[:1] == ["shared"]:
             rule = _gun_value_rule(parts[2:])
             if rule is not None:
                 return rule
+        if (component_name in ("chassis", "guns", "turrets") and
+                len(parts) == 4 and parts[0] == "shared" and
+                parts[2] == "armor"):
+            return _NONNEGATIVE
         if component_name == "shells":
             if len(parts) == 2 and parts[-1] == "caliber":
                 return _POSITIVE
@@ -490,6 +550,55 @@ def _normalize_piercing_pair(raw_value, label):
     return " ".join(format(number, ".15g") for number in numbers)
 
 
+def _finite_numbers(raw_value, label):
+    parts = str(raw_value).strip().split()
+    numbers = []
+    for part in parts:
+        try:
+            number = float(part)
+        except (TypeError, ValueError, OverflowError):
+            raise VehicleOverlayError("%s must contain finite numbers." % label)
+        if not math.isfinite(number):
+            raise VehicleOverlayError("%s must contain finite numbers." % label)
+        numbers.append(number)
+    return numbers
+
+
+def _normalize_pitch_curve(raw_value, label, scalar_shortcut=True):
+    numbers = _finite_numbers(raw_value, label)
+    if scalar_shortcut and len(numbers) == 1:
+        numbers = [0.0, numbers[0], 1.0, numbers[0]]
+    if len(numbers) < 4 or len(numbers) % 2:
+        raise VehicleOverlayError(
+            "%s must be one angle or complete position/angle pairs." % label)
+    positions = numbers[0::2]
+    angles = numbers[1::2]
+    if (positions[0] != 0.0 or positions[-1] != 1.0 or
+            any(position < 0.0 or position > 1.0
+                for position in positions) or
+            any(positions[index] >= positions[index + 1]
+                for index in range(len(positions) - 1))):
+        raise VehicleOverlayError(
+            "%s curve positions must start at 0, end at 1, and increase." %
+            label)
+    if any(angle < -90.0 or angle > 90.0 for angle in angles):
+        raise VehicleOverlayError(
+            "%s angles must be between -90 and 90 degrees." % label)
+    return " ".join(format(number, ".15g") for number in numbers)
+
+
+def _normalize_yaw_limits(raw_value, label):
+    numbers = _finite_numbers(raw_value, label)
+    if len(numbers) != 2:
+        raise VehicleOverlayError(
+            "%s must contain exactly two angles." % label)
+    if (numbers[0] < -180.0 or numbers[1] > 180.0 or
+            numbers[0] > numbers[1]):
+        raise VehicleOverlayError(
+            "%s must be ordered inside -180..180 degrees." % label)
+    return " ".join(format(number, ".15g") for number in numbers)
+
+
 def _validate_original(value, rule):
     if rule.get("arity") == 2:
         if value.value_type != packed_xml.TYPE_STRING:
@@ -497,7 +606,26 @@ def _validate_original(value, rule):
                 "piercingPower must use the stock Packed string type.")
         _normalize_piercing_pair(_scalar_text(value), "Original penetration")
         return
-    _numeric_value(value)
+    if rule.get("sequence") == "pitch":
+        if value.value_type != packed_xml.TYPE_STRING:
+            raise VehicleOverlayError(
+                "pitchLimits must use the stock Packed string type.")
+        _normalize_pitch_curve(
+            _scalar_text(value), "Original gun elevation curve",
+            scalar_shortcut=False)
+        return
+    if rule.get("sequence") == "yaw":
+        if value.value_type != packed_xml.TYPE_STRING:
+            raise VehicleOverlayError(
+                "turretYawLimits must use the stock Packed string type.")
+        _normalize_yaw_limits(
+            _scalar_text(value), "Original horizontal traverse")
+        return
+    numeric = _numeric_value(value)
+    if rule.get("bounded") is not None:
+        minimum, maximum = rule["bounded"]
+        if numeric < minimum or numeric > maximum:
+            raise VehicleOverlayError(rule["description"] + ".")
     if (rule.get("integerRequired") and
             value.value_type != packed_xml.TYPE_INTEGER):
         raise VehicleOverlayError(
@@ -843,17 +971,28 @@ def _field_label(category, field_path):
     elif (category == "guns" and len(parts) >= 5 and
           re.fullmatch(r"turrets\d+", parts[0]) and parts[2] == "guns"):
         parts = [parts[1], parts[3]] + parts[4:]
+    if (category != "shells" and len(parts) >= 2 and
+            parts[-2] == "armor"):
+        parts = parts[:-2] + ["Armor thickness (%s)" % parts[-1]]
     return " / ".join(_FIELD_LABELS.get(part, part) for part in parts)
 
 
 def _choice_record(nation, vehicle, category, member, field, shared,
-                   component, affected):
+                   component, affected, mode=None, paired_member=None):
     affected = tuple(sorted(affected))
     if shared:
         scope = ("Shared %s %s; affects %d vehicle%s in %s: %s" % (
             _CATEGORY_LABELS[category].lower(), component, len(affected),
             "" if len(affected) == 1 else "s", nation,
             ", ".join(affected)))
+    elif mode == "all":
+        scope = (
+            "Stored in both the travel-mode and Siege-mode descriptors for "
+            "%s; one edit is applied to both." % vehicle)
+    elif mode == "travel":
+        scope = "Stored in the travel-mode descriptor for %s only." % vehicle
+    elif mode == "siege":
+        scope = "Stored in the Siege-mode descriptor for %s only." % vehicle
     else:
         scope = "Stored in %s only; affects this vehicle only." % vehicle
         if (field["fieldPath"] == "hull/maxHealth" or
@@ -863,20 +1002,51 @@ def _choice_record(nation, vehicle, category, member, field, shared,
             scope += (
                 " Effective battle HP is hull maximum health plus the "
                 "mounted turret maximum health.")
+    field_label = _field_label(category, field["fieldPath"])
+    if mode == "travel":
+        field_label = "Travel mode / " + field_label
+    elif mode == "siege":
+        field_label = "Siege mode / " + field_label
     result = dict(field)
     result.update({
         "nation": nation,
         "vehicle": vehicle,
         "category": category,
         "categoryLabel": _CATEGORY_LABELS[category],
-        "fieldLabel": _field_label(category, field["fieldPath"]),
+        "fieldLabel": field_label,
         "member": member,
         "shared": bool(shared),
         "component": component,
         "affectedVehicles": affected,
         "scope": scope,
+        "mode": mode,
+        "pairedMember": paired_member,
     })
     return result
+
+
+def _siege_peer_member(member):
+    """Return the syntactic travel/Siege sibling for one vehicle member."""
+    match = _VEHICLE_MEMBER.fullmatch(member)
+    if match is None or "/components/" in member:
+        return None
+    nation, vehicle = match.groups()
+    suffix = "_siege_mode"
+    if vehicle.endswith(suffix):
+        vehicle = vehicle[:-len(suffix)]
+    else:
+        vehicle += suffix
+    if not vehicle:
+        return None
+    return "scripts/item_defs/vehicles/%s/%s.xml" % (nation, vehicle)
+
+
+def _same_field_contract(left, right):
+    return (
+        left.get("fieldPath") == right.get("fieldPath") and
+        left.get("originalValue") == right.get("originalValue") and
+        left.get("packedType") == right.get("packedType") and
+        left.get("constraint") == right.get("constraint"))
 
 
 def list_vehicle_field_choices(game_root, vehicle_member):
@@ -927,6 +1097,18 @@ def list_vehicle_field_choices(game_root, vehicle_member):
                 if counts.get(member) == 1:
                     component_roots[category] = packed_xml.read_packed_xml(
                         archive.read(member))
+
+            siege_member = _siege_peer_member(vehicle_member)
+            siege_root = None
+            if siege_member is not None:
+                siege_count = counts.get(siege_member, 0)
+                if siege_count > 1:
+                    raise VehicleOverlayError(
+                        "The paired Siege-mode vehicle definition is "
+                        "repeated in scripts.pkg.")
+                if siege_count == 1:
+                    siege_root = packed_xml.read_packed_xml(
+                        archive.read(siege_member))
     except VehicleOverlayError:
         raise
     except (IOError, OSError, KeyError, TypeError, ValueError,
@@ -961,12 +1143,42 @@ def list_vehicle_field_choices(game_root, vehicle_member):
                 ("shells", shell_name), set()).add(vehicle_name)
 
     records = []
-    for field in _editable_fields_from_root(
-            vehicle_member, roots[vehicle_member]):
-        category = _direct_category(field["fieldPath"])
-        records.append(_choice_record(
-            nation, vehicle, category, vehicle_member, field, False,
-            vehicle, (vehicle,)))
+    direct_fields = _editable_fields_from_root(
+        vehicle_member, roots[vehicle_member])
+    if siege_root is None:
+        for field in direct_fields:
+            category = _direct_category(field["fieldPath"])
+            records.append(_choice_record(
+                nation, vehicle, category, vehicle_member, field, False,
+                vehicle, (vehicle,)))
+    else:
+        siege_fields = _editable_fields_from_root(siege_member, siege_root)
+        direct_by_path = dict(
+            (field["fieldPath"], field) for field in direct_fields)
+        siege_by_path = dict(
+            (field["fieldPath"], field) for field in siege_fields)
+        all_paths = sorted(set(direct_by_path) | set(siege_by_path))
+        for field_path in all_paths:
+            travel_field = direct_by_path.get(field_path)
+            siege_field = siege_by_path.get(field_path)
+            if (travel_field is not None and siege_field is not None and
+                    _same_field_contract(travel_field, siege_field)):
+                category = _direct_category(field_path)
+                records.append(_choice_record(
+                    nation, vehicle, category, vehicle_member, travel_field,
+                    False, vehicle, (vehicle,), mode="all",
+                    paired_member=siege_member))
+                continue
+            if travel_field is not None:
+                category = _direct_category(field_path)
+                records.append(_choice_record(
+                    nation, vehicle, category, vehicle_member, travel_field,
+                    False, vehicle, (vehicle,), mode="travel"))
+            if siege_field is not None:
+                category = _direct_category(field_path)
+                records.append(_choice_record(
+                    nation, vehicle, category, siege_member, siege_field,
+                    False, vehicle, (vehicle,), mode="siege"))
 
     selected_components = dict(
         (category, set(names)) for category, names in selected_refs.items())
@@ -1044,6 +1256,21 @@ def _parse_replacement(raw_value, original, rule):
             packed_xml.TYPE_STRING, manifest_value.encode("ascii")),
                 manifest_value)
 
+    if rule.get("sequence") in ("pitch", "yaw"):
+        if original.value_type != packed_xml.TYPE_STRING:
+            raise VehicleOverlayError(
+                "This angle sequence must preserve the stock Packed string "
+                "type.")
+        if rule["sequence"] == "pitch":
+            manifest_value = _normalize_pitch_curve(
+                text, "Replacement gun elevation curve")
+        else:
+            manifest_value = _normalize_yaw_limits(
+                text, "Replacement horizontal traverse")
+        return (packed_xml.PackedValue(
+            packed_xml.TYPE_STRING, manifest_value.encode("ascii")),
+                manifest_value)
+
     if original.value_type == packed_xml.TYPE_INTEGER:
         try:
             value = int(text)
@@ -1073,6 +1300,11 @@ def _parse_replacement(raw_value, original, rule):
 
     if not math.isfinite(numeric):
         raise VehicleOverlayError("The replacement must be finite.")
+    if rule.get("bounded") is not None:
+        minimum, maximum = rule["bounded"]
+        if numeric < minimum or numeric > maximum:
+            raise VehicleOverlayError(rule["description"] + ".")
+        return replacement, manifest_value
     minimum = rule["minimum"]
     accepted = (numeric >= minimum if rule["inclusive"]
                 else numeric > minimum)
@@ -1275,6 +1507,80 @@ def _validate_health_relations(member, element, prefix=()):
                 member, value.value, prefix + (name.decode("utf-8"),))
 
 
+def _pitch_curve_points(value, label):
+    normalized = _normalize_pitch_curve(
+        _scalar_text(value), label, scalar_shortcut=False)
+    numbers = [float(part) for part in normalized.split()]
+    return tuple(zip(numbers[0::2], numbers[1::2]))
+
+
+def _curve_at(points, position):
+    for index in range(len(points) - 1):
+        left = points[index]
+        right = points[index + 1]
+        if position <= right[0]:
+            span = right[0] - left[0]
+            ratio = 0.0 if span <= 0.0 else (position - left[0]) / span
+            return left[1] + (right[1] - left[1]) * ratio
+    return points[-1][1]
+
+
+def _validate_angle_relations(element, prefix=()):
+    """Reject inverted gun/suspension limits after all edits are applied."""
+    direct = {}
+    for name, value in element.children:
+        direct.setdefault(name.decode("utf-8"), []).append(value)
+
+    pitch_limits = direct.get("pitchLimits", ())
+    if (len(pitch_limits) == 1 and
+            pitch_limits[0].value_type == packed_xml.TYPE_ELEMENT):
+        pitch = pitch_limits[0].value
+        values = {}
+        for name, value in pitch.children:
+            values.setdefault(name.decode("utf-8"), []).append(value)
+        if (len(values.get("minPitch", ())) == 1 and
+                len(values.get("maxPitch", ())) == 1):
+            try:
+                minimum = _pitch_curve_points(
+                    values["minPitch"][0], "Gun depression curve")
+                maximum = _pitch_curve_points(
+                    values["maxPitch"][0], "Gun elevation curve")
+            except VehicleOverlayError:
+                # A few stock local overrides are deliberately empty and
+                # inherit the shared gun curve. They are never offered by the
+                # editor, so leave that original inheritance contract intact.
+                minimum = maximum = None
+            if minimum is not None:
+                positions = sorted(set(
+                    [point[0] for point in minimum] +
+                    [point[0] for point in maximum]))
+                if any(_curve_at(minimum, position) >
+                       _curve_at(maximum, position) + 1e-9
+                       for position in positions):
+                    raise VehicleOverlayError(
+                        "%s gun depression must not exceed elevation." %
+                        "/".join(prefix + ("pitchLimits",)))
+
+    correction = direct.get("wheelsCorrectionAngles", ())
+    if (len(correction) == 1 and
+            correction[0].value_type == packed_xml.TYPE_ELEMENT):
+        values = {}
+        for name, value in correction[0].value.children:
+            values.setdefault(name.decode("utf-8"), []).append(value)
+        if (len(values.get("pitchMin", ())) == 1 and
+                len(values.get("pitchMax", ())) == 1 and
+                _numeric_value(values["pitchMin"][0]) >
+                _numeric_value(values["pitchMax"][0])):
+            raise VehicleOverlayError(
+                "%s suspension minimum pitch must not exceed maximum pitch." %
+                "/".join(prefix + ("wheelsCorrectionAngles",)))
+
+    for name, value in element.children:
+        if value.value_type == packed_xml.TYPE_ELEMENT:
+            _validate_angle_relations(
+                value.value, prefix + (name.decode("utf-8"),))
+
+
 def _build_member(package_path, entry):
     member = entry["sourceMember"]
     unused_source, original_root = _read_source_member(package_path, member)
@@ -1308,6 +1614,7 @@ def _build_member(package_path, entry):
         normalized_edits.append(normalized)
 
     _validate_health_relations(member, rebuilt_root)
+    _validate_angle_relations(rebuilt_root)
     try:
         output = packed_xml.write_packed_xml(rebuilt_root)
         reparsed = packed_xml.read_packed_xml(output)
@@ -1326,6 +1633,131 @@ def _build_member(package_path, entry):
                 "The rebuilt value did not round-trip for %s." %
                 edit["fieldPath"])
     return output, normalized_edits
+
+
+def _read_optional_source_root(package_path, member):
+    """Read one derived sibling only when it exists exactly once."""
+    _validate_member(member)
+    try:
+        with zipfile.ZipFile(package_path, "r") as archive:
+            matches = [info for info in archive.infolist()
+                       if info.filename == member]
+            if not matches:
+                return None
+            if len(matches) != 1:
+                raise VehicleOverlayError(
+                    "The original package must contain at most one %s." %
+                    member)
+            return packed_xml.read_packed_xml(archive.read(matches[0]))
+    except VehicleOverlayError:
+        raise
+    except (IOError, OSError, KeyError, TypeError, ValueError,
+            zipfile.BadZipFile) as error:
+        raise VehicleOverlayError(
+            "The original paired vehicle definition is unreadable: %s" %
+            error)
+
+
+def _equal_mode_peer(package_path, member, field_path):
+    """Return a travel/Siege peer only for one identical scalar contract."""
+    peer = _siege_peer_member(member)
+    if peer is None:
+        return None
+    peer_root = _read_optional_source_root(package_path, peer)
+    if peer_root is None:
+        return None
+    unused_data, source_root = _read_source_member(package_path, member)
+    try:
+        source_rule = _field_rule(member, field_path)
+        peer_rule = _field_rule(peer, field_path)
+        source = _find_value(source_root, field_path)
+        paired = _find_value(peer_root, field_path)
+        _validate_original(source, source_rule)
+        _validate_original(paired, peer_rule)
+    except VehicleOverlayError:
+        return None
+    if (source.value_type != paired.value_type or
+            source_rule != peer_rule or
+            not _same_recorded_value(
+                _manifest_scalar(source), _manifest_scalar(paired),
+                source.value_type)):
+        return None
+    return peer
+
+
+def _merge_saved_edit(entries, package_path, member, field_path,
+                      replacement_value):
+    """Merge one validated logical scalar edit into an entry dictionary."""
+    rule = _field_rule(member, field_path)
+    unused_data, source_root = _read_source_member(package_path, member)
+    original = _find_value(source_root, field_path)
+    _validate_original(original, rule)
+    replacement, manifest_value = _parse_replacement(
+        replacement_value, original, rule)
+    if replacement.value_type != original.value_type:
+        raise VehicleOverlayError("The replacement changed the Packed type.")
+
+    entry = entries.get(member)
+    if entry is None:
+        entry = {
+            "sourcePackage": SOURCE_PACKAGE,
+            "sourceMember": member,
+            "overlayRelativePath": member,
+            "overlaySha256": "0" * 64,
+            "edits": [],
+        }
+        entries[member] = entry
+    edits = dict((edit["fieldPath"], edit) for edit in entry["edits"])
+    existing = edits.get(field_path)
+    original_type = _TYPE_NAMES.get(original.value_type, "unknown")
+    original_value = _manifest_scalar(original)
+    if existing is not None:
+        if (existing.get("originalPackedType") != original_type or
+                not _same_recorded_value(
+                    existing.get("originalValue"), original_value,
+                    original.value_type)):
+            raise VehicleOverlayError(
+                "The original package contract changed for this saved edit.")
+    edits[field_path] = {
+        "fieldPath": field_path,
+        "originalPackedType": original_type,
+        "originalValue": original_value,
+        "replacementValue": manifest_value,
+        "constraint": rule["description"],
+    }
+    entry["edits"] = sorted(
+        edits.values(), key=lambda item: item["fieldPath"])
+    return manifest_value
+
+
+def _expand_equal_mode_edits(entries, package_path):
+    """Keep stock-identical travel/Siege scalar leaves synchronized."""
+    pending = []
+    snapshot = copy.deepcopy(entries)
+    for member in sorted(snapshot):
+        for edit in snapshot[member]["edits"]:
+            field_path = edit["fieldPath"]
+            peer = _equal_mode_peer(package_path, member, field_path)
+            if peer is None:
+                continue
+            peer_entry = snapshot.get(peer, {})
+            peer_edits = dict(
+                (item["fieldPath"], item)
+                for item in peer_entry.get("edits", ()))
+            existing = peer_edits.get(field_path)
+            if (existing is not None and
+                    existing.get("replacementValue") !=
+                    edit.get("replacementValue")):
+                raise VehicleOverlayError(
+                    "Travel-mode and Siege-mode copies of %s have "
+                    "conflicting saved values." % field_path)
+            if existing is None:
+                pending.append((
+                    peer, field_path, edit["replacementValue"]))
+    for member, field_path, replacement in pending:
+        _merge_saved_edit(
+            entries, package_path, member, field_path, replacement)
+    return entries
 
 
 def _write_staged(path, data):
@@ -1746,49 +2178,17 @@ def apply_vehicle_edit(game_root, member, field_path, replacement_value,
     """Merge one edit, rebuild every owned member, and commit atomically."""
     status, package_path = _require_target(
         game_root, require_closed=True, is_running=is_running)
-    rule = _field_rule(member, field_path)
-    unused_data, source_root = _read_source_member(package_path, member)
-    original = _find_value(source_root, field_path)
-    _validate_original(original, rule)
-    replacement, manifest_value = _parse_replacement(
-        replacement_value, original, rule)
-    if replacement.value_type != original.value_type:
-        raise VehicleOverlayError("The replacement changed the Packed type.")
 
     manifest, unused_exists = _load_manifest(status["path"])
     old_entries = _entry_map(manifest)
     entries = copy.deepcopy(old_entries)
-    entry = entries.get(member)
-    if entry is None:
-        entry = {
-            "sourcePackage": SOURCE_PACKAGE,
-            "sourceMember": member,
-            "overlayRelativePath": member,
-            # Filled after the complete member has been rebuilt.
-            "overlaySha256": "0" * 64,
-            "edits": [],
-        }
-        entries[member] = entry
-    edits = dict((edit["fieldPath"], edit) for edit in entry["edits"])
-    existing = edits.get(field_path)
-    original_type = _TYPE_NAMES.get(original.value_type, "unknown")
-    original_value = _manifest_scalar(original)
-    if existing is not None:
-        if (existing.get("originalPackedType") != original_type or
-                not _same_recorded_value(
-                    existing.get("originalValue"), original_value,
-                    original.value_type)):
-            raise VehicleOverlayError(
-                "The original package contract changed for this saved edit.")
-    edits[field_path] = {
-        "fieldPath": field_path,
-        "originalPackedType": original_type,
-        "originalValue": original_value,
-        "replacementValue": manifest_value,
-        "constraint": rule["description"],
-    }
-    entry["edits"] = sorted(
-        edits.values(), key=lambda item: item["fieldPath"])
+    manifest_value = _merge_saved_edit(
+        entries, package_path, member, field_path, replacement_value)
+    peer = _equal_mode_peer(package_path, member, field_path)
+    if peer is not None:
+        _merge_saved_edit(
+            entries, package_path, peer, field_path, manifest_value)
+    _expand_equal_mode_edits(entries, package_path)
 
     _assert_owned_files_safe(status["path"], old_entries, entries)
     rebuilt = {}
@@ -2199,50 +2599,18 @@ def apply_profile_edit(game_root, profile_name, member, field_path,
     """Save one logical edit without leaving modified data in res_mods."""
     status, package_path = _require_target(
         game_root, require_closed=True, is_running=is_running)
-    rule = _field_rule(member, field_path)
-    unused_data, source_root = _read_source_member(package_path, member)
-    original = _find_value(source_root, field_path)
-    _validate_original(original, rule)
-    replacement, manifest_value = _parse_replacement(
-        replacement_value, original, rule)
-    if replacement.value_type != original.value_type:
-        raise VehicleOverlayError("The replacement changed the Packed type.")
 
     store, unused_exists = _load_profile_store(status["path"])
     profile_index = _profile_index(store, profile_name)
     profile = store["profiles"][profile_index]
     entries = copy.deepcopy(_entry_map(_profile_manifest(profile)))
-    entry = entries.get(member)
-    if entry is None:
-        entry = {
-            "sourcePackage": SOURCE_PACKAGE,
-            "sourceMember": member,
-            "overlayRelativePath": member,
-            "overlaySha256": "0" * 64,
-            "edits": [],
-        }
-        entries[member] = entry
-
-    edits = dict((edit["fieldPath"], edit) for edit in entry["edits"])
-    existing = edits.get(field_path)
-    original_type = _TYPE_NAMES.get(original.value_type, "unknown")
-    original_value = _manifest_scalar(original)
-    if existing is not None:
-        if (existing.get("originalPackedType") != original_type or
-                not _same_recorded_value(
-                    existing.get("originalValue"), original_value,
-                    original.value_type)):
-            raise VehicleOverlayError(
-                "The original package contract changed for this saved edit.")
-    edits[field_path] = {
-        "fieldPath": field_path,
-        "originalPackedType": original_type,
-        "originalValue": original_value,
-        "replacementValue": manifest_value,
-        "constraint": rule["description"],
-    }
-    entry["edits"] = sorted(
-        edits.values(), key=lambda item: item["fieldPath"])
+    manifest_value = _merge_saved_edit(
+        entries, package_path, member, field_path, replacement_value)
+    peer = _equal_mode_peer(package_path, member, field_path)
+    if peer is not None:
+        _merge_saved_edit(
+            entries, package_path, peer, field_path, manifest_value)
+    _expand_equal_mode_edits(entries, package_path)
 
     for owned_member in sorted(entries):
         output, normalized_edits = _build_member(
@@ -2280,6 +2648,7 @@ def activate_vehicle_profile(game_root, profile_name, is_running=None):
     entries = copy.deepcopy(_entry_map(_profile_manifest(profile)))
     if not entries:
         return 0
+    _expand_equal_mode_edits(entries, package_path)
 
     rebuilt = {}
     for member in sorted(entries):

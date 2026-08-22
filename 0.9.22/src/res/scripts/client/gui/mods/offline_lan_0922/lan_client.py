@@ -15,6 +15,7 @@ RANDOM_MAP_OPTION = 'server_random'
 PROJECTILE_LEDGER_CAPABILITY = 'projectile_ledger_v1'
 PROJECTILE_HIT_VEHICLE_CAPABILITY = 'projectile_hit_vehicle_v1'
 RANDOM_MAP_CAPABILITY = 'random_map_v1'
+TEAM_SELECTION_CAPABILITY = 'team_selection_v1'
 DESTRUCTIBLE_CATALOG_V5_CAPABILITY = 'destructible_catalog_v5'
 SIMULATION_WORKER_CAPABILITY = 'simulation_worker_v1'
 CLIENT_CAPABILITIES = (
@@ -48,6 +49,26 @@ MAX_PROJECTILE_SPLASH_RADIUS = 100.0
 MAX_PROJECTILE_PIERCING_LOSS = 100000.0
 OUTFIT_SEASONS = frozenset((1, 2, 4))
 MAX_OUTFIT_BYTES = 64 * 1024
+RESULT_INTERACTION_LIMITS = {
+    'spotted': (0, 1),
+    'death_reason': (-1, 10),
+    'direct_hits': (0, 65535),
+    'explosion_hits': (0, 65535),
+    'piercings': (0, 65535),
+    'damage': (0, 65535),
+    'assist_track': (0, 65535),
+    'assist_radio': (0, 65535),
+    'assist_stun': (0, 65535),
+    'crits': (0, 4294967295),
+    'fire': (0, 65535),
+    'stun_num': (0, 65535),
+    'stun_duration': (0, 65535),
+    'damage_blocked': (0, 4294967295),
+    'damage_received': (0, 65535),
+    'ricochets_received': (0, 65535),
+    'no_damage_direct_hits_received': (0, 65535),
+    'target_kills': (0, 255),
+}
 SENDER_JOIN_TIMEOUT = 0.1
 SEND_STALL_TIMEOUT = 5.0
 LEAVE_SEND_TIMEOUT = 0.05
@@ -61,10 +82,11 @@ _BOT_STATE_WIRE_FIELDS = (
     'death_reason', 'display_health', 'world_pose')
 STATE_BARRIER_TYPES = frozenset((
     'welcome', 'roster', 'battle_start', 'battle_live',
-    'start_denied', 'events', 'error'))
+    'start_denied', 'team_denied', 'events', 'error'))
 SERVER_STATE_TYPES = frozenset((
     'welcome', 'roster', 'battle_start', 'battle_live', 'start_denied',
-    'snapshot', 'events', 'bot_observation', 'battle_receipt'))
+    'team_denied', 'snapshot', 'events', 'bot_observation',
+    'battle_receipt'))
 
 
 def _monotonic_time():
@@ -215,6 +237,50 @@ def _exact_int(value, default=None):
         return parsed
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _team_choice(value, default=0):
+    if value in (None, '', 'auto'):
+        return 0
+    parsed = _exact_int(value)
+    return parsed if parsed in (0, 1, 2) else default
+
+
+def _team_sizes(value, legacy=None, default=None):
+    """Validate the asymmetric shape, with the old scalar as fallback."""
+    if value is None:
+        parsed = _exact_int(legacy)
+        if parsed is not None and 1 <= parsed <= 15:
+            return {1: parsed, 2: parsed}
+        return dict(default or {1: 15, 2: 15})
+    if not isinstance(value, dict):
+        return None
+    result = {}
+    for team in (1, 2):
+        parsed = _exact_int(value.get(str(team), value.get(team)))
+        if parsed is None or not 1 <= parsed <= 15:
+            return None
+        result[team] = parsed
+    return result
+
+
+def _valid_player_siege_contract(player):
+    if not isinstance(player, dict):
+        return False
+    has_state = 'siege_state' in player
+    has_time = 'siege_time_left_ms' in player
+    if not has_state and not has_time:
+        return True
+    if has_state != has_time:
+        return False
+    state = _exact_int(player.get('siege_state'))
+    time_left = _exact_int(player.get('siege_time_left_ms'))
+    if state not in (0, 1, 2, 3) or time_left is None:
+        return False
+    if not 0 <= time_left <= 5000:
+        return False
+    return ((state in (1, 3) and time_left > 0) or
+            (state in (0, 2) and time_left == 0))
 
 
 def _exact_finite_float(value, default=None):
@@ -626,6 +692,7 @@ def _valid_battle_receipt(message):
             not 1 <= len(public_rows) <= 30):
         return False
     seen = set()
+    row_teams = {}
     personal_row = None
     for row in public_rows:
         if not isinstance(row, dict):
@@ -660,8 +727,32 @@ def _valid_battle_receipt(message):
                for stat_name in stat_names):
             return False
         seen.add(identity)
+        row_teams[identity] = row_team
         if identity == ('player', player_id):
             personal_row = row
+    interactions = message.get('interactions', [])
+    if (not isinstance(interactions, list) or
+            len(interactions) > len(public_rows)):
+        return False
+    interaction_keys = set(RESULT_INTERACTION_LIMITS) | {
+        'target_kind', 'target_id'}
+    interaction_targets = set()
+    for interaction in interactions:
+        if (not isinstance(interaction, dict) or
+                set(interaction) != interaction_keys):
+            return False
+        target = (
+            interaction.get('target_kind'),
+            _exact_int(interaction.get('target_id')))
+        if (target not in seen or target in interaction_targets or
+                target == ('player', player_id) or
+                row_teams[target] == team):
+            return False
+        for name, (minimum, maximum) in RESULT_INTERACTION_LIMITS.items():
+            field = _exact_int(interaction.get(name))
+            if field is None or field < minimum or field > maximum:
+                return False
+        interaction_targets.add(target)
     return bool(
         personal_row is not None and
         personal_row.get('name') == message.get('player_name') and
@@ -711,7 +802,7 @@ class LANClient(object):
 
     def __init__(self, host, port, name, vehicle, max_health=100,
                  on_event=None, bigworld=None, account_key=None,
-                 outfits=None):
+                 outfits=None, requested_team=0):
         self.host = _safe_text(host, '127.0.0.1', 255)
         self.port = int(port or 28782)
         self.name = _safe_text(name, 'Player')
@@ -720,6 +811,7 @@ class LANClient(object):
         self.account_key = _safe_text(
             account_key, uuid.uuid4().hex, 64)
         self.outfits = _canonical_wire_outfits(outfits or {}) or {}
+        self.requested_team = _team_choice(requested_team)
         self._published_player_outfits = {}
         self.on_event = on_event
         self.bigworld = bigworld
@@ -731,6 +823,7 @@ class LANClient(object):
         self.phase = 'disconnected'
         self.player_id = None
         self.team = None
+        self.team_sizes = {1: 15, 2: 15}
         self.slot = 0
         self.map_name = None
         self.map_pool = []
@@ -813,7 +906,7 @@ class LANClient(object):
         player identity fields.  Capability negotiation separately fences the
         schema-5 destructible and optional projectile/map wire extensions.
         """
-        return {
+        payload = {
             'type': 'hello',
             'protocol': PROTOCOL_VERSION,
             'client_build': CLIENT_BUILD,
@@ -824,6 +917,9 @@ class LANClient(object):
             'account_key': self.account_key,
             'outfits': dict(self.outfits),
         }
+        if self.requested_team in (1, 2):
+            payload['requested_team'] = self.requested_team
+        return payload
 
     def stop(self):
         with self._outbound_lock:
@@ -942,6 +1038,16 @@ class LANClient(object):
             message['outfits'] = outfits
         return self._send(message)
 
+    def select_team(self, team):
+        """Request a waiting-room team; the server owns the capacity check."""
+        team = _team_choice(team, None)
+        if (not self.ready or self.phase != 'waiting' or
+                team not in (1, 2) or not self.has_team_selection()):
+            return False
+        if team == self.team:
+            return True
+        return self._send({'type': 'select_team', 'team': team})
+
     def _adopt_published_vehicle(self, players):
         """Track the vehicle and HP the server holds for this client."""
         for entry in players or ():
@@ -953,6 +1059,12 @@ class LANClient(object):
                 self.vehicle = vehicle
             if max_health is not None and max_health > 0:
                 self.max_health = max_health
+            team = _exact_int(entry.get('team'))
+            slot = _exact_int(entry.get('slot'))
+            if team in (1, 2):
+                self.team = team
+            if slot is not None and 0 <= slot < 15:
+                self.slot = slot
             outfits = _canonical_wire_outfits(entry.get('outfits'))
             if outfits is not None:
                 self.outfits = outfits
@@ -997,7 +1109,7 @@ class LANClient(object):
                    reported_reason=None, reported_display_health=None,
                    reported_attacker=None, reported_attacker_bot=None,
                    reported_critical_base_revision=None,
-                   reported_critical_seq=None):
+                   reported_critical_seq=None, siege_enabled=None):
         if not self.ready or self.phase != 'battle':
             return False
         message = {
@@ -1043,6 +1155,10 @@ class LANClient(object):
         if reported_attacker_bot is not None:
             message['reported_attacker_bot'] = max(
                 0, int(reported_attacker_bot or 0))
+        if siege_enabled is not None:
+            if not isinstance(siege_enabled, bool):
+                raise ValueError('siege_enabled must be BOOL')
+            message['siege_enabled'] = siege_enabled
         return self._send(message)
 
     def send_battle_ready(self, bases=None):
@@ -1412,6 +1528,9 @@ class LANClient(object):
 
     def has_random_map(self):
         return RANDOM_MAP_CAPABILITY in self.server_capabilities
+
+    def has_team_selection(self):
+        return TEAM_SELECTION_CAPABILITY in self.server_capabilities
 
     def send_bot_manifest(self, bots):
         if not self.is_bot_authority():
@@ -2147,6 +2266,9 @@ class LANClient(object):
             map_name = _safe_text(message.get('map'), '')
             spawn = message.get('spawn')
             outfits = _canonical_wire_outfits(message.get('outfits'))
+            team_sizes = _team_sizes(
+                message.get('team_sizes'), message.get('team_size'),
+                self.team_sizes)
             if (player_id is None or state_revision is None or
                     state_revision < 0 or host_player_id is None or
                     host_player_id <= 0 or team not in (1, 2) or
@@ -2156,6 +2278,7 @@ class LANClient(object):
                     ('server_time_ms' in message and
                      welcome_server_time is None) or
                     phase != 'waiting' or not map_name or outfits is None or
+                    team_sizes is None or
                     not isinstance(spawn, dict) or
                     not all(axis in spawn for axis in ('x', 'y', 'z'))):
                 self.last_error = 'invalid welcome message'
@@ -2171,6 +2294,7 @@ class LANClient(object):
             self.name = _safe_text(message.get('name'), self.name)
             self.vehicle = _safe_text(message.get('vehicle'), self.vehicle)
             self.team = team
+            self.team_sizes = team_sizes
             self.slot = slot
             self.max_health = max_health
             self.outfits = outfits
@@ -2216,6 +2340,9 @@ class LANClient(object):
             host_player_id = _exact_int(message.get('host_player_id'))
             authority_epoch = _projectile_int_range(
                 message.get('authority_epoch'), 0, MAX_PROJECTILE_ID)
+            team_sizes = _team_sizes(
+                message.get('team_sizes'), message.get('team_size'),
+                self.team_sizes)
             roster_server_time = None
             if 'server_time_ms' in message:
                 roster_server_time = _projectile_int_range(
@@ -2225,9 +2352,14 @@ class LANClient(object):
             player_outfits_valid = all(
                 _canonical_wire_outfits(value.get('outfits')) is not None
                 for value in players or ())
+            player_siege_contract = all(
+                _valid_player_siege_contract(value)
+                for value in players or ())
             ledger_required = self.has_projectile_ledger()
             if (phase not in ('waiting', 'loading', 'battle') or not map_name or
                     players is None or not player_outfits_valid or
+                    not player_siege_contract or
+                    team_sizes is None or
                     host_player_id not in player_ids or
                     (ledger_required and authority_epoch is None) or
                     (ledger_required and round_id == self.round_id and
@@ -2266,6 +2398,7 @@ class LANClient(object):
                 self.map_pool = maps
             players = self._remember_player_outfits(players)
             self.roster = players
+            self.team_sizes = team_sizes
             self._adopt_published_vehicle(players)
             self.host_player_id = host_player_id
             self.bot_authority_id = message.get(
@@ -2319,10 +2452,16 @@ class LANClient(object):
             player_outfits_valid = all(
                 _canonical_wire_outfits(value.get('outfits')) is not None
                 for value in players or ())
+            player_siege_contract = all(
+                _valid_player_siege_contract(value)
+                for value in players or ())
             local_ids = set(_exact_int(value.get('id')) for value in players or ())
             host_player_id = _exact_int(message.get('host_player_id'))
             authority_epoch = _projectile_int_range(
                 message.get('authority_epoch'), 0, MAX_PROJECTILE_ID)
+            team_sizes = _team_sizes(
+                message.get('team_sizes'), message.get('team_size'),
+                self.team_sizes)
             start_server_time = None
             if 'server_time_ms' in message:
                 start_server_time = _projectile_int_range(
@@ -2330,6 +2469,8 @@ class LANClient(object):
             ledger_required = self.has_projectile_ledger()
             if (phase != 'loading' or
                     not map_name or not players or not player_outfits_valid or
+                    not player_siege_contract or
+                    team_sizes is None or
                     self.player_id not in local_ids or
                     host_player_id not in local_ids or
                     (ledger_required and authority_epoch is None) or
@@ -2357,6 +2498,7 @@ class LANClient(object):
             self.state_revision = state_revision
             players = self._remember_player_outfits(players)
             self.roster = players
+            self.team_sizes = team_sizes
             self._adopt_published_vehicle(players)
             self.host_player_id = host_player_id
             self._battle_start_round_id = round_id
@@ -2404,6 +2546,20 @@ class LANClient(object):
             round_id = _exact_int(message.get('round_id'))
             if round_id is None or round_id != self.round_id:
                 return
+        elif kind == 'team_denied':
+            round_id = _exact_int(message.get('round_id'))
+            team = _team_choice(message.get('team'), None)
+            code = _safe_text(message.get('code'), '', 32)
+            team_sizes = _team_sizes(
+                message.get('team_sizes'), None, self.team_sizes)
+            if (round_id is None or round_id != self.round_id or
+                    team not in (1, 2) or
+                    code not in ('team_full', 'invalid_team', 'not_waiting') or
+                    team_sizes is None):
+                self.last_error = 'invalid team_denied message'
+                self.stop()
+                return
+            self.team_sizes = team_sizes
         elif kind == 'snapshot':
             round_id = _exact_int(message.get('round_id'))
             if round_id is None:
@@ -2460,6 +2616,9 @@ class LANClient(object):
                 _exact_int(player.get('critical_base_revision')) >= 0 and
                 _exact_int(player.get('critical_ack_seq')) is not None and
                 _exact_int(player.get('critical_ack_seq')) >= 0
+                for player in players or ())
+            player_siege_contract = all(
+                _valid_player_siege_contract(player)
                 for player in players or ())
             bot_combat_contract = all(
                 _valid_bot_combat_contract(bot) for bot in bots or ())
@@ -2533,6 +2692,8 @@ class LANClient(object):
                 invalid_reasons.append('bots')
             if not player_critical_contract:
                 invalid_reasons.append('player_critical')
+            if not player_siege_contract:
+                invalid_reasons.append('player_siege')
             if not bot_combat_contract:
                 invalid_reasons.append('bot_combat')
             if 'bot_manifest' in message and manifest is None:
@@ -2686,7 +2847,10 @@ class LANClient(object):
         elif kind == 'error':
             error_message = _safe_text(
                 message.get('message'), message.get('code') or 'server error')
-            self._notify('error', {'message': error_message})
+            self._notify('error', {
+                'message': error_message,
+                'code': _safe_text(message.get('code'), '', 32),
+            })
             return
         self._notify(kind, message)
 

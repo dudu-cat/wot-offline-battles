@@ -107,7 +107,7 @@ def _archive_tree(source_root, destination):
 
 def _release_config():
     return {
-        'schema': 1,
+        'schema': 2,
         'enabled': True,
         'host': '127.0.0.1',
         'port': 28782,
@@ -120,6 +120,7 @@ def _release_config():
         'physics_tuning': {},
         'he_tuning': {},
         'perfect_accuracy': False,
+        'native_remote_vehicles': True,
         'authority_worker_probe': {
             'enabled': False,
             'stageSeconds': 15.0,

@@ -27,6 +27,7 @@ MODES = (MODE_SINGLE, MODE_HOST, MODE_JOIN)
 
 DEFAULT_SERVER_PORT = 28782
 DEFAULT_TEAM_SIZE = 15
+DEFAULT_PREFERRED_TEAM = 0
 MIN_TEAM_SIZE = 1
 MAX_TEAM_SIZE = 15
 LOCAL_HOST = "127.0.0.1"
@@ -66,10 +67,13 @@ _NAVGRAPH_RELATIVE_DIR = os.path.join(
 
 SERVER_DATA_ENV_0922 = "WOT_0922_SERVER_DATA"
 SERVER_TEAM_SIZE_ENV_0922 = "WOT_0922_TEAM_SIZE"
+SERVER_TEAM1_SIZE_ENV_0922 = "WOT_0922_TEAM1_SIZE"
+SERVER_TEAM2_SIZE_ENV_0922 = "WOT_0922_TEAM2_SIZE"
 SERVER_LOOPBACK_ONLY_ENV_0922 = "WOT_0922_LOOPBACK_ONLY"
 CLIENT_SERVER_HOST_ENV_0922 = "OFFLINE_LAN_0922_SERVER_HOST"
 CLIENT_SERVER_PORT_ENV_0922 = "OFFLINE_LAN_0922_SERVER_PORT"
 CLIENT_MODE_ENV_0922 = "OFFLINE_LAN_0922_CLIENT_MODE"
+CLIENT_PREFERRED_TEAM_ENV_0922 = "OFFLINE_LAN_0922_PREFERRED_TEAM"
 ALLOW_MULTIPLE_CLIENTS_ENV_0922 = "OFFLINE_LAN_0922_ALLOW_MULTIPLE_CLIENTS"
 HIDDEN_DESKTOP_ENV_0922 = "OFFLINE_LAN_0922_HIDDEN_DESKTOP"
 WORKER_READY_MARKER_ENV_0922 = "OFFLINE_LAN_0922_WORKER_READY_MARKER"
@@ -203,7 +207,8 @@ def visible_client_command(game_root, port_version, paired_worker=False):
 
 def visible_client_environment(port_version, host=LOCAL_HOST,
                                port=DEFAULT_SERVER_PORT,
-                               paired_worker=False, environment=None):
+                               paired_worker=False, environment=None,
+                               preferred_team=DEFAULT_PREFERRED_TEAM):
     """Keep worker-only state out of the visible game process."""
     environment = dict(os.environ if environment is None else environment)
     if port_version != PORT_0_9_22:
@@ -213,6 +218,8 @@ def visible_client_environment(port_version, host=LOCAL_HOST,
         environment.pop(name, None)
     environment[CLIENT_SERVER_HOST_ENV_0922] = str(host)
     environment[CLIENT_SERVER_PORT_ENV_0922] = str(int(port))
+    environment[CLIENT_PREFERRED_TEAM_ENV_0922] = str(
+        parse_preferred_team(preferred_team))
     if paired_worker:
         environment[ALLOW_MULTIPLE_CLIENTS_ENV_0922] = "1"
     else:
@@ -226,10 +233,12 @@ def worker_child_command(game_root):
 
 def worker_environment(game_root, host=LOCAL_HOST,
                        port=DEFAULT_SERVER_PORT,
-                       team_size=DEFAULT_TEAM_SIZE, environment=None):
+                       team_size=DEFAULT_TEAM_SIZE, environment=None,
+                       team1_size=None, team2_size=None):
     """Build the endpoint inherited by the hidden simulation client."""
     environment = server_environment(
-        PORT_0_9_22, game_root, environment, team_size=team_size)
+        PORT_0_9_22, game_root, environment, team_size=team_size,
+        team1_size=team1_size, team2_size=team2_size)
     environment[CLIENT_SERVER_HOST_ENV_0922] = str(host)
     environment[CLIENT_SERVER_PORT_ENV_0922] = str(int(port))
     return environment
@@ -305,7 +314,8 @@ def inspect_game_root(game_root):
 
 
 def plan_session(status, mode, join_text="", team_size=DEFAULT_TEAM_SIZE,
-                 vehicle_profile=None):
+                 vehicle_profile=None, team1_size=None, team2_size=None,
+                 preferred_team=DEFAULT_PREFERRED_TEAM):
     """Turn the window fields into one battle session, or explain the problem."""
     if not status.get("has_executable"):
         raise LauncherError(
@@ -317,8 +327,16 @@ def plan_session(status, mode, join_text="", team_size=DEFAULT_TEAM_SIZE,
         raise LauncherError("Select single player, host, or join.")
     host, tcp_port = endpoint_for_mode(mode, join_text)
     effective_team_size = DEFAULT_TEAM_SIZE
+    effective_team1_size = DEFAULT_TEAM_SIZE
+    effective_team2_size = DEFAULT_TEAM_SIZE
     if port_version == PORT_0_9_22 and mode != MODE_JOIN:
-        effective_team_size = parse_team_size(team_size)
+        effective_team1_size = parse_team_size(
+            team_size if team1_size is None else team1_size)
+        effective_team2_size = parse_team_size(
+            team_size if team2_size is None else team2_size)
+        effective_team_size = max(
+            effective_team1_size, effective_team2_size)
+    effective_preferred_team = parse_preferred_team(preferred_team)
     profile_name = str(vehicle_profile or "").strip() or None
     if profile_name is not None and (
             port_version != PORT_0_9_22 or mode != MODE_SINGLE):
@@ -331,6 +349,9 @@ def plan_session(status, mode, join_text="", team_size=DEFAULT_TEAM_SIZE,
         "tcp_port": tcp_port,
         "needs_server": server_required(port_version, mode),
         "team_size": effective_team_size,
+        "team1_size": effective_team1_size,
+        "team2_size": effective_team2_size,
+        "preferred_team": effective_preferred_team,
         "vehicle_profile": profile_name,
     }
 
@@ -369,6 +390,23 @@ def parse_team_size(value):
     if team_size < MIN_TEAM_SIZE or team_size > MAX_TEAM_SIZE:
         raise LauncherError("Tanks per team must be 1-15.")
     return team_size
+
+
+def parse_preferred_team(value):
+    """Return zero for automatic assignment, or the explicit team 1/2."""
+    if value in (None, "", "auto", "Auto"):
+        return DEFAULT_PREFERRED_TEAM
+    if isinstance(value, bool):
+        raise LauncherError("Preferred team must be Automatic, Team 1, or Team 2.")
+    try:
+        team = int(value)
+    except (TypeError, ValueError):
+        raise LauncherError("Preferred team must be Automatic, Team 1, or Team 2.")
+    if isinstance(value, float) and value != team:
+        raise LauncherError("Preferred team must be Automatic, Team 1, or Team 2.")
+    if team not in (0, 1, 2):
+        raise LauncherError("Preferred team must be Automatic, Team 1, or Team 2.")
+    return team
 
 
 def endpoint_for_mode(mode, join_text="", default_port=DEFAULT_SERVER_PORT):
@@ -1144,7 +1182,8 @@ def server_argv(port_version, base_dir=None):
 
 
 def server_environment(port_version, game_root, environment=None,
-                       team_size=DEFAULT_TEAM_SIZE, loopback_only=False):
+                       team_size=DEFAULT_TEAM_SIZE, loopback_only=False,
+                       team1_size=None, team2_size=None):
     """Point each server at the baked data installed with its client."""
     environment = dict(os.environ if environment is None else environment)
     if port_version == PORT_0_8_2:
@@ -1153,8 +1192,14 @@ def server_environment(port_version, game_root, environment=None,
     elif port_version == PORT_0_9_22:
         environment[SERVER_DATA_ENV_0922] = os.path.join(
             game_root, _SERVER_DATA_RELATIVE_DIR_0922)
+        team1_size = parse_team_size(
+            team_size if team1_size is None else team1_size)
+        team2_size = parse_team_size(
+            team_size if team2_size is None else team2_size)
         environment[SERVER_TEAM_SIZE_ENV_0922] = str(
-            parse_team_size(team_size))
+            max(team1_size, team2_size))
+        environment[SERVER_TEAM1_SIZE_ENV_0922] = str(team1_size)
+        environment[SERVER_TEAM2_SIZE_ENV_0922] = str(team2_size)
         if loopback_only:
             environment[SERVER_LOOPBACK_ONLY_ENV_0922] = "1"
         else:

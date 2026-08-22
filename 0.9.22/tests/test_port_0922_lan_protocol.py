@@ -79,6 +79,14 @@ class LanProtocolTests(unittest.TestCase):
         self.assertTrue(all(message['round_id'] == 7
                             for message in self.sent))
 
+    def test_siege_request_is_an_exact_boolean_input_field(self):
+        self.assertTrue(self.client.send_input(
+            0.0, 0.0, siege_enabled=True))
+
+        self.assertIs(True, self.sent[-1]['siege_enabled'])
+        with self.assertRaisesRegex(ValueError, 'BOOL'):
+            self.client.send_input(0.0, 0.0, siege_enabled=1)
+
     def test_waiting_room_publishes_one_changed_garage_vehicle(self):
         self.client.phase = 'waiting'
         self.client.vehicle = 'ussr:R11_MS-1'

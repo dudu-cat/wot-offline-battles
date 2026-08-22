@@ -1,11 +1,11 @@
-"""Isolated exact-#1513 experiment using stock remote ``Vehicle`` entities.
+"""Exact-#1513 stock presentation for remote ``Vehicle`` entities.
 
 The retail entity owns its CompoundAppearance, WGVehicleFilter and
 PyTrackScroll.  The LAN server still owns gameplay poses: #1513 exposes no
 legal transform setter for a client-created remote Vehicle, so the copied
 physics pose is published through the same narrow compatibility overlay used
-by the local tank.  This module is selected only by the explicit
-``native_remote_vehicles`` experiment flag.
+by the local tank. The compound-only implementation remains an explicit
+fallback for diagnostics and clients that cannot provide the pinned ABI.
 """
 
 from __future__ import print_function
@@ -30,13 +30,21 @@ class _AimTarget(object):
 
 class _NativeRemoteState(object):
 
-    def __init__(self, math_module, compatibility, position, rotation):
+    def __init__(self, bigworld, math_module, compatibility, data_links,
+                 position, rotation):
+        self._bigworld = bigworld
         self._math = math_module
         self._compatibility = compatibility
+        self._data_links = data_links
         self.position = math_module.Vector3(position)
         self.roll = float(rotation[0])
         self.pitch = float(rotation[1])
         self.yaw = float(rotation[2])
+        self.speed = 0.0
+        self.turn_speed = 0.0
+        self.velocity = math_module.Vector3(0.0, 0.0, 0.0)
+        self.acceleration = math_module.Vector3(0.0, 0.0, 0.0)
+        self._last_pose_time = None
         self.matrix = math_module.Matrix()
         self._write_matrix(self.matrix)
         self._key_from = math_module.Matrix(self.matrix)
@@ -59,6 +67,8 @@ class _NativeRemoteState(object):
         self.model_changed = None
         self.track_scroll = None
         self.track_mode = None
+        self.presentation_capabilities = {}
+        self.presentation_errors = {}
 
     def _write_matrix(self, matrix):
         matrix.setRotateYPR((self.yaw, self.pitch, self.roll))
@@ -131,6 +141,131 @@ class _NativeRemoteState(object):
         self._render_duration = relax_time
         return self._rekey(relax_time)
 
+    def _engine_owns_entity(self):
+        entity = self.entity
+        if entity is None:
+            return False
+        entities = getattr(self._bigworld, 'entities', None)
+        lookup = getattr(entities, 'get', None)
+        if not callable(lookup):
+            return False
+        try:
+            return (lookup(int(entity.id)) is entity and
+                    bool(getattr(entity, 'inWorld', False)) and
+                    bool(getattr(entity, 'isStarted', False)))
+        except (AttributeError, KeyError, TypeError, ValueError,
+                ReferenceError):
+            return False
+
+    def _record_capability(self, name, available, error=None):
+        self.presentation_capabilities[name] = bool(available)
+        if error is None:
+            self.presentation_errors.pop(name, None)
+        elif name not in self.presentation_errors:
+            self.presentation_errors[name] = str(error)
+        entity = self.entity
+        if entity is not None and self._engine_owns_entity():
+            entity._offlinePresentationCapabilities = \
+                self.presentation_capabilities
+            entity._offlinePresentationErrors = self.presentation_errors
+        return bool(available)
+
+    def _bind_stock_motion(self):
+        """Rebind stock #1513 presentation components to copied LAN motion."""
+        entity = self.entity
+        appearance = getattr(entity, 'appearance', None)
+        if appearance is None:
+            return False
+
+        detailed = getattr(appearance, 'detailedEngineState', None)
+        audition = getattr(appearance, 'engineAudition', None)
+        links = self._data_links
+        engine_ready = False
+        if detailed is not None and audition is not None and links is not None:
+            create_float_link = getattr(links, 'createFloatLink', None)
+            if callable(create_float_link):
+                try:
+                    detailed.vehicleSpeedLink = create_float_link(
+                        self, 'speed')
+                    detailed.rotationSpeedLink = create_float_link(
+                        self, 'turn_speed')
+                    engine_ready = True
+                except Exception as error:
+                    self._record_capability(
+                        'engine_audio_motion', False, error)
+        if engine_ready:
+            self._record_capability('engine_audio_motion', True)
+        elif 'engine_audio_motion' not in self.presentation_errors:
+            self._record_capability(
+                'engine_audio_motion', False,
+                'stock DetailedEngineState/DataLinks are unavailable')
+
+        swinging = getattr(appearance, 'swingingAnimator', None)
+        if swinging is not None:
+            try:
+                # CompoundAppearance initially binds this to the entity's
+                # native filter matrix.  Our model is driven by a copied LAN
+                # MatrixAnimation, so acceleration rocking must follow that
+                # same provider or it remains at the spawn pose.
+                swinging.worldMatrix = self.provider
+                self._record_capability('body_swinging', True)
+            except Exception as error:
+                self._record_capability('body_swinging', False, error)
+        else:
+            self._record_capability(
+                'body_swinging', False,
+                'stock SwingingAnimator is unavailable')
+
+        wheels = getattr(appearance, 'wheelsAnimator', None)
+        suspension = getattr(appearance, 'suspension', None)
+        if suspension is None:
+            suspension = getattr(appearance, 'leveredSuspension', None)
+        self._record_capability(
+            'stock_wheels', wheels is not None,
+            None if wheels is not None else
+            'stock WheelsAnimator is unavailable')
+        self._record_capability(
+            'stock_suspension', suspension is not None,
+            None if suspension is not None else
+            'stock suspension is unavailable')
+        return bool(engine_ready or swinging is not None or
+                    wheels is not None or suspension is not None)
+
+    def _publish_pose(self):
+        entity = self.entity
+        if entity is None:
+            return False
+        self._compatibility.set_vehicle_pose_overlay(
+            entity, self.position, self.yaw, self.provider,
+            self.speed, self.turn_speed, self.velocity, self.acceleration)
+        return True
+
+    def _update_motion(self, previous_position, previous_yaw, now):
+        velocity = self._math.Vector3(0.0, 0.0, 0.0)
+        acceleration = self._math.Vector3(0.0, 0.0, 0.0)
+        speed = 0.0
+        turn_speed = 0.0
+        if now is not None:
+            now = float(now)
+            previous_time = self._last_pose_time
+            if previous_time is not None and now > previous_time:
+                elapsed = now - previous_time
+                velocity = (self.position - previous_position).scale(
+                    1.0 / elapsed)
+                acceleration = (velocity - self.velocity).scale(
+                    1.0 / elapsed)
+                # BigWorld's yaw zero points down the model's +Z axis.
+                speed = (float(velocity.x) * math.sin(self.yaw) +
+                         float(velocity.z) * math.cos(self.yaw))
+                turn_speed = _blend_angle(
+                    previous_yaw, self.yaw, 1.0) - previous_yaw
+                turn_speed /= elapsed
+            self._last_pose_time = now
+        self.velocity = velocity
+        self.acceleration = acceleration
+        self.speed = float(speed)
+        self.turn_speed = float(turn_speed)
+
     def attach(self, entity):
         self.entity = entity
         entity._offlineNativeRemote = True
@@ -144,8 +279,7 @@ class _NativeRemoteState(object):
         entity.update_tracks = self.update_tracks
         entity.track_scroll_readback = self.track_scroll_readback
         entity.model.matrix = self.provider
-        self._compatibility.set_vehicle_pose_overlay(
-            entity, self.position, self.yaw, self.provider)
+        self._publish_pose()
         appearance = entity.appearance
         self.track_scroll = getattr(
             appearance, '_CompoundAppearance__trackScrollCtl', None)
@@ -155,10 +289,13 @@ class _NativeRemoteState(object):
             raise RuntimeError(
                 '#1513 CompoundAppearance aim-target boundary is unavailable')
         setup(self.aim)
+        self._bind_stock_motion()
 
         def on_model_changed(*unused_args, **unused_kwargs):
             if self.entity is not None and self.entity.appearance is not None:
+                self.entity.model.matrix = self.provider
                 self.entity.appearance.setupGunMatrixTargets(self.aim)
+                self._bind_stock_motion()
 
         changed = getattr(appearance, 'onModelChanged', None)
         if changed is not None:
@@ -167,19 +304,20 @@ class _NativeRemoteState(object):
         return entity
 
     def set_pose(self, position, rotation, relax_time=None, now=None):
-        unused_now = now
+        previous_position = self.position
+        previous_yaw = self.yaw
         self.position = self._math.Vector3(position)
         self.roll = float(rotation[0])
         self.pitch = float(rotation[1])
         self.yaw = float(rotation[2])
         self._write_matrix(self.matrix)
         self._retarget(relax_time, now)
+        self._update_motion(previous_position, previous_yaw, now)
         entity = self.entity
         if entity is not None:
             entity._aim_yaw = getattr(entity, '_aim_yaw', self.yaw)
             entity.model.matrix = self.provider
-            self._compatibility.set_vehicle_pose_overlay(
-                entity, self.position, self.yaw, self.provider)
+            self._publish_pose()
         return True
 
     def set_aim(self, hull_yaw, aim_yaw, gun_pitch):
@@ -194,13 +332,57 @@ class _NativeRemoteState(object):
 
     def update_tracks(self, left, right, mode):
         entity = self.entity
-        if entity is None or entity.appearance is None:
+        if entity is None:
             return False
+        if not self._engine_owns_entity():
+            # Once BigWorld releases the PyEntity, even reading a component
+            # can dereference native memory.  Record the fallback state only
+            # in Python and leave every engine object untouched.
+            self.presentation_capabilities[
+                'engine_owned_track_motion'] = False
+            self.presentation_errors.setdefault(
+                'engine_owned_track_motion',
+                'BigWorld no longer owns the Vehicle entity')
+            return False
+        appearance = getattr(entity, 'appearance', None)
+        if appearance is None:
+            return False
+        left = float(left)
+        right = float(right)
+        native_updated = False
+        vehicle_filter = getattr(entity, 'filter', None)
+        appearance_filter = getattr(appearance, 'filter', None)
+        setter = getattr(vehicle_filter, 'setTracksSpeed', None)
+        movement_info = getattr(vehicle_filter, 'movementInfo', None)
+        if (appearance_filter is vehicle_filter and callable(setter) and
+                movement_info is not None):
+            flying = getattr(appearance, 'flyingInfoProvider', None)
+            left_contact = not bool(getattr(
+                flying, 'isLeftSideFlying', False))
+            right_contact = not bool(getattr(
+                flying, 'isRightSideFlying', False))
+            try:
+                # This native call is fatal on an unattached WGVehicleFilter.
+                # The identity/ownership checks above are therefore part of
+                # the ABI boundary, not just a best-effort optimisation. The
+                # #1513 wrapper parses float/bool/float/bool in this order.
+                setter(left, left_contact, right, right_contact)
+                native_updated = True
+                self._record_capability('engine_owned_track_motion', True)
+            except Exception as error:
+                self._record_capability(
+                    'engine_owned_track_motion', False, error)
+        else:
+            self._record_capability(
+                'engine_owned_track_motion', False,
+                'Appearance/filter ownership or movementInfo is unavailable')
         if mode != self.track_mode:
-            entity.appearance.changeEngineMode(mode, True)
+            appearance.changeEngineMode(mode, True)
             self.track_mode = mode
-        entity.appearance.updateTracksScroll(float(left), float(right))
-        return True
+        # PyTrackScroll remains the safe belt/audio fallback when the exact
+        # native wheel input is absent.  It never calls WGVehicleFilter APIs.
+        appearance.updateTracksScroll(left, right)
+        return bool(native_updated or self.track_scroll is not None)
 
     def track_scroll_readback(self):
         if self.track_scroll is None:
@@ -214,16 +396,18 @@ class _NativeRemoteState(object):
 
     def detach(self):
         entity = self.entity
+        engine_owned = self._engine_owns_entity()
         self.entity = None
         if entity is None:
             return False
-        appearance = getattr(entity, 'appearance', None)
-        changed = getattr(appearance, 'onModelChanged', None)
-        if changed is not None and self.model_changed is not None:
-            try:
-                changed -= self.model_changed
-            except Exception:
-                pass
+        if engine_owned:
+            appearance = getattr(entity, 'appearance', None)
+            changed = getattr(appearance, 'onModelChanged', None)
+            if changed is not None and self.model_changed is not None:
+                try:
+                    changed -= self.model_changed
+                except Exception:
+                    pass
         self.model_changed = None
         self._compatibility.clear_vehicle_pose_overlay(entity)
         return True
@@ -235,12 +419,13 @@ class NativeRemoteVehicleFactory(object):
     native_entities = True
 
     def __init__(self, bigworld, math_module, model_assembler, space_id,
-                 binding, compatibility, **unused_kwargs):
+                 binding, compatibility, data_links=None, **unused_kwargs):
         unused_space_id = space_id
         self._bigworld = bigworld
         self._math = math_module
         self._binding = binding
         self._compatibility = compatibility
+        self._data_links = data_links
         self._states = {}
         self._vehicles = {}
         self._descriptors = {}
@@ -268,7 +453,8 @@ class NativeRemoteVehicleFactory(object):
             raise RuntimeError(
                 'native remote Vehicle entered before createEntity returned')
         self._states[int(entity_id)] = _NativeRemoteState(
-            self._math, self._compatibility, position, rotation)
+            self._bigworld, self._math, self._compatibility,
+            self._data_links, position, rotation)
         self._vehicles[int(entity_id)] = None
         self._binding.arena_vehicle_added(entity_id, {
             'properties': properties, 'team_killer': False})

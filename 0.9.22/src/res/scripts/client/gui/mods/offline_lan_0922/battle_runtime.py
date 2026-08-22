@@ -924,7 +924,7 @@ class _LANInputSender(object):
         self.aim_yaw = math.atan2(dx, dz)
         self.gun_pitch = math.atan2(dy, max(horizontal, 0.001))
 
-    def send_current(self):
+    def send_current(self, siege_enabled=None):
         position, yaw = self.owner.local_pose()
         health_getter = getattr(self.owner, 'local_health', None)
         health = health_getter() if callable(health_getter) else None
@@ -932,19 +932,25 @@ class _LANInputSender(object):
         report = report_getter() if callable(report_getter) else None
         ram_getter = getattr(self.owner, 'local_ram_contact', None)
         ram_contact = ram_getter() if callable(ram_getter) else None
+        keyword_args = {
+            'speed': getattr(self.owner, '_local_speed', 0.0),
+            'ram_contact': ram_contact,
+            'reported_health': health,
+            'reported_critical': (report or {}).get('critical'),
+            'reported_reason': (report or {}).get('reason'),
+            'reported_display_health': (
+                report or {}).get('display_health'),
+            'reported_attacker': (report or {}).get('attacker'),
+            'reported_attacker_bot': (report or {}).get('attacker_bot'),
+            'reported_critical_base_revision': (report or {}).get(
+                'critical_base_revision'),
+            'reported_critical_seq': (report or {}).get('critical_seq'),
+        }
+        if siege_enabled is not None:
+            keyword_args['siege_enabled'] = bool(siege_enabled)
         result = self.owner.client.send_input(
             self.forward, self.turn, self.aim_yaw, self.gun_pitch,
-            position, yaw, speed=getattr(self.owner, '_local_speed', 0.0),
-            ram_contact=ram_contact,
-            reported_health=health,
-            reported_critical=(report or {}).get('critical'),
-            reported_reason=(report or {}).get('reason'),
-            reported_display_health=(report or {}).get('display_health'),
-            reported_attacker=(report or {}).get('attacker'),
-            reported_attacker_bot=(report or {}).get('attacker_bot'),
-            reported_critical_base_revision=(report or {}).get(
-                'critical_base_revision'),
-            reported_critical_seq=(report or {}).get('critical_seq'))
+            position, yaw, **keyword_args)
         return result
 
 
@@ -1990,7 +1996,7 @@ class BattleRuntime(object):
                 authority_entity_resolver=self._server_entity)
             factory_type = (NativeRemoteVehicleFactory
                             if self._config.get(
-                                'native_remote_vehicles', False)
+                                'native_remote_vehicles', True)
                             else RemoteVehicleFactory)
             factory_kwargs = {
                 'camouflages': getattr(self._runtime, 'camouflages', None),
@@ -2007,8 +2013,8 @@ class BattleRuntime(object):
                     'binding': self._binding,
                     'compatibility': self._runtime.compatibility})
                 sys.stdout.write(
-                    '[Offline LAN 0.9.22] EXPERIMENT native remote Vehicle '
-                    'entities enabled; copied LAN physics remains active\n')
+                    '[Offline LAN 0.9.22] native remote Vehicle presentation '
+                    'enabled; copied LAN physics remains authoritative\n')
             self._remote_factory = factory_type(
                 self._runtime.bigworld, self._runtime.math,
                 self._runtime.model_assembler, self._avatar.spaceID,
@@ -2534,7 +2540,13 @@ class BattleRuntime(object):
             if self._server is not None:
                 self._spectated_engine_id = int(self._server.vehicle_id)
             return result
-        return self._assert_local_control_sources(handler, mode)
+        result = self._assert_local_control_sources(handler, mode)
+        # Strategic view is allowed to draw team-spotted artillery targets
+        # outside the ordinary 565 m vehicle AOI.  Re-evaluate the retained
+        # spotting memory on the next frame instead of leaving a distant
+        # target hidden for the remainder of the current 0.10 s HUD period.
+        self._next_spotting_time = 0.0
+        return result
 
     def _spectator_record(self, engine_id, allow_self=False):
         """Resolve one server-valid postmortem vehicle target."""
@@ -4007,6 +4019,8 @@ class BattleRuntime(object):
         if 'extinguisher' in name or any(
                 'extinguisher' in tag for tag in tags):
             return 'extinguisher'
+        if 'removedrpmlimiter' in name:
+            return 'rpm_limiter'
         # Food is a mounted consumable even though it has no activation
         # action.  Publish it to the stock ammo panel while loadout.py owns
         # its passive crew bonus.
@@ -4086,8 +4100,15 @@ class BattleRuntime(object):
                 'name': name, 'kind': kind,
                 'cooldown': max(0.0, cooldown),
                 # -1 is the client's unlimited-reuse marker; 0 means one shot.
-                'uses_left': -1 if reuse_count < 0 else max(1, reuse_count),
-                'ready_at': 0.0})
+                'uses_left': (-1 if kind == 'rpm_limiter' or reuse_count < 0
+                              else max(1, reuse_count)),
+                'ready_at': 0.0,
+                'active': False,
+                'engine_power_factor': max(1.0, _number(
+                    getattr(descriptor, 'enginePowerFactor', 1.0), 1.0)),
+                'engine_hp_loss_per_second': max(0.0, _number(
+                    getattr(descriptor, 'engineHpLossPerSecond', 0.0), 0.0)),
+            })
         return result
 
     def _garage_item(self):
@@ -4378,6 +4399,12 @@ class BattleRuntime(object):
         stages = self._equipment_stages()
         if equipment['uses_left'] == 0:
             return 0, int(stages.EXHAUSTED), 0
+        if (equipment.get('kind') == 'rpm_limiter' and
+                equipment.get('active')):
+            # #1513's trigger item interprets PREPARING with zero remaining
+            # time as the toggled-on state and sends the raw equipment id to
+            # deactivate it on the next click.
+            return 1, int(stages.PREPARING), 0
         remaining = _number(equipment.get('ready_at'), 0.0) - float(now)
         if remaining > 0.0:
             return 1, int(stages.COOLDOWN), int(math.ceil(remaining))
@@ -4452,6 +4479,14 @@ class BattleRuntime(object):
             return False
         if not self._record_alive(record, entity):
             return False
+        if equipment['kind'] == 'rpm_limiter':
+            requested_active = bool(extra_index)
+            if requested_active == bool(equipment.get('active')):
+                return False
+            equipment['active'] = requested_active
+            self._equipment_signature = None
+            self._present_equipments(now)
+            return True
         selected = self._critical_name_from_extra_index(
             entity.typeDescriptor, extra_index)
         if equipment['kind'] == 'extinguisher':
@@ -4478,6 +4513,44 @@ class BattleRuntime(object):
             record, payload.get('events'), record['engine_id'])
         self._queue_local_damage_report(critical=payload)
         self._present_equipments()
+        return True
+
+    def _active_engine_power_factor(self):
+        if not self._equipment_state:
+            return 1.0
+        for equipment in self._equipment_state:
+            if (equipment.get('kind') == 'rpm_limiter' and
+                    equipment.get('active')):
+                return max(1.0, _number(
+                    equipment.get('engine_power_factor'), 1.0))
+        return 1.0
+
+    def _tick_rpm_limiter(self, record, entity, dt, now):
+        if not self._battle_live or dt <= 0.0:
+            return False
+        if self._equipment_state is None:
+            self._equipment_state = self._default_equipments()
+        equipment = next((value for value in self._equipment_state
+                          if (value.get('kind') == 'rpm_limiter' and
+                              value.get('active'))), None)
+        if equipment is None:
+            return False
+        loss = max(0.0, _number(
+            equipment.get('engine_hp_loss_per_second'), 0.0)) * float(dt)
+        payload = critical_damage.damage_device_over_time(
+            entity, 'engineHealth', loss, 'removedRpmLimiter')
+        if payload is None:
+            return False
+        record['critical_state'] = self._critical_state(payload)
+        state = dict(record.get('state') or {})
+        state['critical'] = record['critical_state']
+        record['state'] = state
+        self._present_critical(
+            record, payload.get('events'), record['engine_id'])
+        if (payload.get('events') or now >= self._next_critical_report_time):
+            self._queue_local_damage_report(critical=payload)
+            self._next_critical_report_time = (
+                now + CRITICAL_REPAIR_NETWORK_SECONDS)
         return True
 
     def _publish_reload_event(self, time_left, base_time, force=False):
@@ -4705,6 +4778,17 @@ class BattleRuntime(object):
 
     def change_vehicle_setting(self, code, value):
         settings = self._runtime.constants.VEHICLE_SETTING
+        if code == getattr(settings, 'SIEGE_MODE_ENABLED', None):
+            if (not isinstance(value, _INTEGER_TYPES) or
+                    int(value) not in (0, 1)):
+                return False
+            if self._server is None:
+                return False
+            entity = self._server_entity(self._server.vehicle_id)
+            descriptor = getattr(entity, 'typeDescriptor', None)
+            if not bool(getattr(descriptor, 'hasSiegeMode', False)):
+                return False
+            return self._sender.send_current(siege_enabled=bool(value))
         if code == getattr(settings, 'ACTIVATE_EQUIPMENT', None):
             return self._activate_equipment(value)
         current_shells = getattr(settings, 'CURRENT_SHELLS', None)
@@ -4717,6 +4801,7 @@ class BattleRuntime(object):
             if int(_field(shell, 'compactDescr', 0)) != int(value):
                 continue
             previous_reload = state.reload_time
+            previous_duration = state.reload_duration
             if code == next_shells:
                 changed = state.request_shell_index(index)
             else:
@@ -4725,15 +4810,17 @@ class BattleRuntime(object):
                 if changed and instant:
                     self._present_loader_intuition()
             if changed:
-                self._publish_ammo_state(state, force=True)
                 # #1513 ReloadingTimeState retains its original _startTime
                 # while actualTime stays positive.  A shell switch during an
-                # active reload is a new cycle, so close the old cycle before
-                # publishing the new full duration.  This resets both stock
-                # HUD consumers (the ammo-slot fill and crosshair progress).
-                if previous_reload > 0.0 and state.reload_time > 0.0:
+                # active reload is a new cycle. Close that old cycle before
+                # CURRENT_SHELLS is republished, then start the new shell's
+                # cycle. This is the event order consumed by both stock HUD
+                # subscribers and prevents their -0.01 sentinel from becoming
+                # the lasting reload value for the newly selected shell.
+                if previous_reload > 0.0:
                     self._publish_reload_event(
-                        0.0, state.reload_duration, force=True)
+                        0.0, previous_duration, force=True)
+                self._publish_ammo_state(state, force=True)
                 self._publish_reload_event(
                     state.reload_time, state.reload_duration, force=True)
             # The stock ammo panel already blinks a queued shell locally.
@@ -6361,6 +6448,7 @@ class BattleRuntime(object):
             entity.maxHealth = int(entity.typeDescriptor.maxHealth)
         now = self._clock()
         loadout = self._local_loadout(entity.typeDescriptor)
+        self._tick_rpm_limiter(record, entity, dt, now)
         payload = critical_damage.tick_repair(
             entity, dt, has_big_kit=loadout['has_big_kit'],
             repair_factor=loadout['repair_factor'])
@@ -8804,14 +8892,15 @@ class BattleRuntime(object):
             if entity is None:
                 continue
             remembered = now < float(record.get('spot_until', 0.0))
-            within_aoi = _distance_2d(
-                self._local_position, _xyz(entity.position)) <= (
-                    spotting.VEHICLE_AOI_RADIUS)
-            visible = remembered and within_aoi
-            previous = bool(record.get('spot_visible', False))
+            previous = (
+                bool(record.get('spot_visible', False)),
+                bool(record.get(
+                    'spot_marker_visible',
+                    record.get('spot_visible', False))))
+            visible = self._apply_spot_presentation(
+                record, entity, remembered)
             if visible != previous:
                 changed = True
-            self._set_record_spot_visibility(record, visible)
         return changed
 
     def _observe_local_vehicle(self, message, now):
@@ -9342,8 +9431,16 @@ class BattleRuntime(object):
             return None
         return dict(self._local_ram_receipt)
 
-    def _terrain_support(self, position, yaw, descriptor=None):
-        """Copy 0.8.2 front/centre/back support and CoM ground probes."""
+    def _terrain_support(self, position, yaw, descriptor=None,
+                         maximum_y=None):
+        """Copy 0.8.2 layered front/centre/back support probes.
+
+        ``maximum_y`` asks the vertical ray to look below an upper hit which
+        is too tall to be support.  This is essential around trenches, wagon
+        decks and low ruins: horizontal hull rays still own the real wall,
+        while a harmless overhead/top face must not replace the floor and
+        trap the vehicle in an endless support rollback.
+        """
         half_length = 2.5
         try:
             hit_tester = _field(
@@ -9358,16 +9455,39 @@ class BattleRuntime(object):
         for distance in (half_length, 0.0, -half_length):
             x = position[0] + sine * distance
             z = position[2] + cosine * distance
-            try:
-                hit = self._collide_down(
-                    self._vector((x, position[1] + 2.0, z)),
-                    self._vector((x, -1000.0, z)),
-                    self._ground_filter(x, z))
-            except Exception:
-                hit = None
-            if hit is None:
+            ray_end = self._vector((x, -1000.0, z))
+            ray_start = self._vector((x, position[1] + 2.0, z))
+            ground_filter = self._ground_filter(x, z)
+            value = None
+            for unused_layer in range(4):
+                try:
+                    hit = self._collide_down(
+                        ray_start, ray_end, ground_filter)
+                except Exception:
+                    hit = None
+                if hit is None:
+                    break
+                candidate = float(hit[0].y)
+                above_limit = (maximum_y is not None and
+                               candidate > float(maximum_y))
+                ground_facing = True
+                try:
+                    ground_facing = float(hit[1].y) > 0.5
+                except (AttributeError, IndexError, TypeError, ValueError):
+                    # Engine-free compatibility probes historically supplied
+                    # only the hit point. Production #1513 always supplies the
+                    # normal, so this fallback cannot turn a live wall into
+                    # support.
+                    ground_facing = maximum_y is None
+                if not above_limit and ground_facing:
+                    value = candidate
+                    break
+                next_y = candidate - 0.05
+                if next_y <= float(ray_end.y) + 0.01:
+                    break
+                ray_start = self._vector((x, next_y, z))
+            if value is None:
                 continue
-            value = float(hit[0].y)
             if highest is None or value > highest:
                 highest = value
             if distance == 0.0:
@@ -9425,59 +9545,81 @@ class BattleRuntime(object):
                 self._local_vertical_speed = 0.0
                 self._local_airborne = False
                 self._local_fall_armed = True
-            elif tank_collision.support_rise_is_obstacle(
-                    position[1], centre, max_climb):
-                # Horizontal integration put the hull partly inside a wagon,
-                # roof, or large prop and the centre ray hit its top. Treat the
-                # rise as the hard obstacle it is; never lift the chassis onto
-                # that surface. The caller applies the existing hard-wall
-                # speed response after restoring this tick's starting pose.
-                tick_pose = getattr(self, '_local_support_tick_pose', None)
-                if tick_pose is not None:
-                    position = tuple(tick_pose)
-                self._local_vertical_speed = 0.0
-                self._local_airborne = False
-                self._local_support_rise_blocked = True
-                return position
-            elif (position[1] <= ground or
-                  (com_gap <= snap_gap and not self._local_airborne)):
-                if self._local_airborne and self._local_vertical_speed < 0.0:
-                    self._apply_landing_impact(
-                        entity, abs(self._local_vertical_speed))
-                if position[1] < ground:
-                    rise = ground - position[1]
-                    next_y = position[1] + min(rise, max_climb)
-                else:
-                    next_y = position[1] + (
-                        ground - position[1]) * min(1.0, dt * 15.0)
-                    next_y = min(next_y, ground + 0.12)
-                position = (position[0], next_y, position[2])
-                self._local_vertical_speed = 0.0
-                self._local_airborne = False
-                self._local_fall_armed = True
             else:
-                if not self._local_airborne:
-                    self._local_vertical_speed = (
-                        self._local_speed * math.sin(-self._local_last_pitch)
-                        if self._local_last_pitch < 0.0 else 0.0)
-                self._local_airborne = True
-                substeps = min(8, max(
-                    1, int(abs(self._local_vertical_speed * dt) / 0.5) + 1))
-                sub_dt = dt / float(substeps)
-                next_y = position[1]
-                for unused_step in range(substeps):
-                    self._local_vertical_speed -= (
-                        vehicle_physics.GRAVITY * sub_dt)
-                    next_y += self._local_vertical_speed * sub_dt
-                    if next_y <= land_y:
-                        next_y = land_y
-                        self._apply_landing_impact(
-                            entity, abs(self._local_vertical_speed))
+                if tank_collision.support_rise_is_obstacle(
+                        position[1], centre, max_climb):
+                    # The first ray may have met the top edge of a trench,
+                    # wagon deck or low ruin. Re-probe below the exact per-tick
+                    # climb limit, as the mature 0.8.2 path did. Static
+                    # horizontal hull collision remains authoritative for an
+                    # actual wall.
+                    maximum_support_y = (
+                        float(position[1]) +
+                        min(max(0.0, float(max_climb)), 0.85) + 0.02)
+                    lower_highest, lower_centre = self._terrain_support(
+                        position, yaw, entity.typeDescriptor,
+                        maximum_y=maximum_support_y)
+                    lower_ground = (
+                        lower_centre if lower_centre is not None
+                        else lower_highest)
+                    if (lower_ground is None or
+                            float(lower_ground) > maximum_support_y):
+                        tick_pose = getattr(
+                            self, '_local_support_tick_pose', None)
+                        if tick_pose is not None:
+                            position = tuple(tick_pose)
                         self._local_vertical_speed = 0.0
                         self._local_airborne = False
-                        self._local_fall_armed = True
-                        break
-                position = (position[0], next_y, position[2])
+                        self._local_support_rise_blocked = True
+                        return position
+                    highest, centre = lower_highest, lower_centre
+                    ground = lower_ground
+                    com_gap = (snap_gap if centre is None
+                               else position[1] - centre)
+                    land_y = ground if centre is None else centre
+                if (position[1] <= ground or
+                        (com_gap <= snap_gap and
+                         not self._local_airborne)):
+                    if (self._local_airborne and
+                            self._local_vertical_speed < 0.0):
+                        self._apply_landing_impact(
+                            entity, abs(self._local_vertical_speed))
+                    if position[1] < ground:
+                        rise = ground - position[1]
+                        next_y = position[1] + min(rise, max_climb)
+                    else:
+                        next_y = position[1] + (
+                            ground - position[1]) * min(1.0, dt * 15.0)
+                        next_y = min(next_y, ground + 0.12)
+                    position = (position[0], next_y, position[2])
+                    self._local_vertical_speed = 0.0
+                    self._local_airborne = False
+                    self._local_fall_armed = True
+                else:
+                    if not self._local_airborne:
+                        self._local_vertical_speed = (
+                            self._local_speed *
+                            math.sin(-self._local_last_pitch)
+                            if self._local_last_pitch < 0.0 else 0.0)
+                    self._local_airborne = True
+                    substeps = min(8, max(
+                        1, int(abs(self._local_vertical_speed * dt) /
+                               0.5) + 1))
+                    sub_dt = dt / float(substeps)
+                    next_y = position[1]
+                    for unused_step in range(substeps):
+                        self._local_vertical_speed -= (
+                            vehicle_physics.GRAVITY * sub_dt)
+                        next_y += self._local_vertical_speed * sub_dt
+                        if next_y <= land_y:
+                            next_y = land_y
+                            self._apply_landing_impact(
+                                entity, abs(self._local_vertical_speed))
+                            self._local_vertical_speed = 0.0
+                            self._local_airborne = False
+                            self._local_fall_armed = True
+                            break
+                    position = (position[0], next_y, position[2])
         elif self._local_fall_armed:
             self._local_airborne = True
             self._local_vertical_speed -= vehicle_physics.GRAVITY * dt
@@ -9657,8 +9799,13 @@ class BattleRuntime(object):
         # torque, so existing momentum continues to coast.
         handbrake = bool(self._sender.handbrake) or is_tracked
         previous_speed = self._local_speed
+        drive_physics = self._local_physics
+        power_factor = self._active_engine_power_factor()
+        if power_factor != 1.0:
+            drive_physics = dict(drive_physics)
+            drive_physics['powerW'] *= power_factor
         self._local_speed = vehicle_physics.longitudinal_step(
-            self._local_physics, self._local_speed,
+            drive_physics, self._local_speed,
             throttle, turn != 0.0,
             slope_pitch, dt, self._local_airborne, 0,
             handbrake)
@@ -10689,6 +10836,9 @@ class BattleRuntime(object):
             'spot_visible': bot_planner.bot_initially_visible(
                 int(state.get('team', 1)),
                 int(getattr(self.client, 'team', 1)), True),
+            'spot_marker_visible': bot_planner.bot_initially_visible(
+                int(state.get('team', 1)),
+                int(getattr(self.client, 'team', 1)), True),
             'spot_until': 0.0, 'spot_next': 0.0,
             'shot_penalty_until': float(
                 state.get('shot_penalty_until', 0.0) or 0.0),
@@ -10809,6 +10959,7 @@ class BattleRuntime(object):
         if pose is not None:
             self._apply_record_pose(record, pose)
         state = record.get('state') or {}
+        self._apply_siege_state(record, state)
         self._apply_vehicle_statistics(record, state)
         # Arena registration and the native Vehicle are now both complete.
         # Consume any ordered one-shot feedback before snapshot reconciliation
@@ -10828,6 +10979,63 @@ class BattleRuntime(object):
         self._apply_health(
             record, state, self._death_attacker_engine_id(state),
             max(0, int(state.get('death_reason', 0) or 0)))
+        return True
+
+    def _apply_siege_state(self, record, state):
+        """Apply a server-owned Siege transition through #1513's callback."""
+        siege_states = self._runtime.constants.VEHICLE_SIEGE_STATE
+        disabled = siege_states.DISABLED
+        siege_state = state.get('siege_state', disabled)
+        time_left_ms = state.get('siege_time_left_ms', 0)
+        if (isinstance(siege_state, bool) or
+                not isinstance(siege_state, _INTEGER_TYPES)):
+            raise RuntimeError('LAN snapshot has an invalid siege state')
+        allowed = (disabled, siege_states.SWITCHING_ON,
+                   siege_states.ENABLED, siege_states.SWITCHING_OFF)
+        if siege_state not in allowed:
+            raise RuntimeError('LAN snapshot has an unsupported siege state')
+        if (isinstance(time_left_ms, bool) or
+                not isinstance(time_left_ms, _INTEGER_TYPES) or
+                time_left_ms < 0):
+            raise RuntimeError(
+                'LAN snapshot has an invalid siege transition time')
+        switching = siege_state in (
+            siege_states.SWITCHING_ON, siege_states.SWITCHING_OFF)
+        if ((switching and time_left_ms <= 0) or
+                (not switching and time_left_ms != 0)):
+            raise RuntimeError(
+                'LAN snapshot has an inconsistent siege transition')
+        if record.get('presented_siege_state') == siege_state:
+            return False
+        # Vehicle construction already seeds DISABLED.  Skipping that first
+        # no-op also keeps an additive snapshot field compatible with records
+        # created by older peers and authority-only test doubles.
+        if (record.get('presented_siege_state') is None and
+                siege_state == disabled):
+            record['presented_siege_state'] = disabled
+            return False
+        entity = self._server_entity(record['engine_id'])
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        if descriptor is None:
+            raise RuntimeError('Siege vehicle descriptor is unavailable')
+        if (not bool(getattr(descriptor, 'hasSiegeMode', False)) and
+                siege_state != disabled):
+            raise RuntimeError(
+                'Vehicle without Siege mode received an active state')
+        if not bool(getattr(descriptor, 'hasSiegeMode', False)):
+            record['presented_siege_state'] = disabled
+            return False
+        self._binding.update_vehicle_siege_state(
+            record['engine_id'], siege_state,
+            float(time_left_ms) / 1000.0)
+        record['presented_siege_state'] = siege_state
+        if record.get('local') and self._gun_state is not None:
+            self._gun_state.adopt_descriptor(entity.typeDescriptor)
+            self._targeting_signature = None
+        if record.get('local') and self._local_physics is not None:
+            self._local_physics = vehicle_physics.derive_params(
+                entity.typeDescriptor,
+                self._local_factors(entity.typeDescriptor))
         return True
 
     def _apply_record_pose(self, record, pose):
@@ -10890,20 +11098,25 @@ class BattleRuntime(object):
             self._binding.destroy_entity(record['engine_id'])
         record['visible_destroy_requested'] = True
 
-    def _set_record_spot_visibility(self, record, visible):
-        """Keep the marker and minimap on one spotting boundary.
+    def _set_record_spot_visibility(self, record, visible,
+                                    marker_visible=None):
+        """Apply independent model and team-knowledge presentation gates.
 
         A destroyed vehicle keeps its model drawn as cover once the spotting
         gate closes, which is what retail does with a wreck.
         """
+        visible = bool(visible)
+        if marker_visible is None:
+            marker_visible = record.pop(
+                '_spot_marker_transition', visible)
+        marker_visible = bool(marker_visible)
+        record['spot_visible'] = visible
+        record['spot_marker_visible'] = marker_visible
         if not record.get('presentation') or not record.get('ready'):
-            record['spot_visible'] = bool(visible)
-            return bool(visible)
+            return visible
         vehicle = self._remote_factory.get(record['engine_id'])
         if vehicle is None or vehicle.model is None:
             raise RuntimeError('spotted remote vehicle has no model')
-        visible = bool(visible)
-        record['spot_visible'] = visible
         vehicle._spot_visible = visible
         draw_vehicle = visible or not self._record_alive(record, vehicle)
         if record.get('native_remote'):
@@ -10911,16 +11124,61 @@ class BattleRuntime(object):
             vehicle.targetCaps = [1] if visible else []
         else:
             vehicle.appearance.changeVisibility(draw_vehicle)
-        if visible and not record.get('visual_started'):
+        if marker_visible and not record.get('visual_started'):
             self._binding.start_vehicle_visual(record['engine_id'], True)
             record['visual_started'] = True
             if record.get('native_remote'):
                 vehicle._offlineNativeMarkerVisible = True
             if not self._record_alive(record, vehicle):
                 self._present_vehicle_dead(record, True)
-        elif not visible and record.get('visual_started'):
+        elif not marker_visible and record.get('visual_started'):
             self._stop_remote_visual(record)
         return visible
+
+    def _strategic_spg_view_active(self):
+        """Whether this client currently owns the stock SPG overhead camera."""
+        descriptor = self._local_descriptor
+        tags = _field(_field(descriptor, 'type', {}), 'tags', ()) or ()
+        if 'SPG' not in tags:
+            return False
+        handler = getattr(self._avatar, 'inputHandler', None)
+        modes = getattr(self._runtime.avatar_input_handler, '_CTRL_MODE', None)
+        if handler is None or modes is None:
+            return False
+        strategic = getattr(modes, 'STRATEGIC', 'strategic')
+        return getattr(
+            handler, '_AvatarInputHandler__ctrlModeName', None) == strategic
+
+    def _spot_presentation_visibility(self, entity, remembered):
+        """Return ``(model, marker)`` for one team-known enemy.
+
+        The minimap/marker follows team spotting memory.  The ordinary world
+        model remains bounded by the 565 m entity AOI, except that an SPG in
+        strategic view must be able to aim at every team-spotted target in its
+        shell range, which routinely extends beyond that circle.
+        """
+        remembered = bool(remembered)
+        within_aoi = _distance_2d(
+            self._local_position, _xyz(entity.position)) <= (
+                spotting.VEHICLE_AOI_RADIUS)
+        model_visible = remembered and (
+            within_aoi or self._strategic_spg_view_active())
+        return model_visible, remembered
+
+    def _apply_spot_presentation(self, record, entity, remembered):
+        """Publish a split spotting state through the legacy two-arg seam."""
+        model_visible, marker_visible = self._spot_presentation_visibility(
+            entity, remembered)
+        # A number of engine-free harnesses replace the historic two-argument
+        # method.  Store the marker edge first so those focused harnesses stay
+        # useful while production consumes both states below.
+        record['spot_marker_visible'] = marker_visible
+        record['_spot_marker_transition'] = marker_visible
+        try:
+            self._set_record_spot_visibility(record, model_visible)
+        finally:
+            record.pop('_spot_marker_transition', None)
+        return model_visible, marker_visible
 
     def _present_direct_spot(self, record):
         """Publish the one stock ribbon and sound for a first direct spot."""
@@ -11323,17 +11581,18 @@ class BattleRuntime(object):
             # it already has, so its marker survives long enough to show the
             # destroyed style instead of vanishing the frame it dies.
             remembered = now < float(record.get('spot_until', 0.0))
-            within_aoi = _distance_2d(
-                self._local_position, _xyz(entity.position)) <= (
-                    spotting.VEHICLE_AOI_RADIUS)
-            # Team relay owns spotting memory, while #1513's wider vehicle AOI
-            # independently owns whether this client may draw the model/marker.
-            visible = remembered and within_aoi
-            previous_visible = bool(record.get('spot_visible', False))
-            if visible != previous_visible:
+            # Team memory owns the marker.  The ordinary 565 m vehicle AOI
+            # owns the model except while an SPG is using strategic view.
+            previous = (
+                bool(record.get('spot_visible', False)),
+                bool(record.get(
+                    'spot_marker_visible',
+                    record.get('spot_visible', False))))
+            visible, marker_visible = self._apply_spot_presentation(
+                record, entity, remembered)
+            if (visible, marker_visible) != previous:
                 changed = True
-            self._set_record_spot_visibility(record, visible)
-            if visible and not previous_visible and direct_seen:
+            if visible and not previous[0] and direct_seen:
                 self._present_direct_spot(record)
             if visible and bool(record.get('direct_spot_visible', False)):
                 spotted_records.append(record)
@@ -11642,6 +11901,11 @@ class BattleRuntime(object):
             return False
         entity = self._server_entity(self._server.vehicle_id)
         if entity is None or entity.typeDescriptor is None:
+            return False
+        siege_states = self._runtime.constants.VEHICLE_SIEGE_STATE
+        if getattr(entity, 'siegeState', siege_states.DISABLED) in (
+                siege_states.SWITCHING_ON,
+                siege_states.SWITCHING_OFF):
             return False
         is_alive = getattr(entity, 'isAlive', None)
         if ((callable(is_alive) and not is_alive()) or

@@ -66,11 +66,18 @@ class _ArenaPeriod(object):
 
 
 class _SiegeState(object):
-    DISABLED = 6
+    DISABLED = 0
+    SWITCHING_ON = 1
+    ENABLED = 2
+    SWITCHING_OFF = 3
 
 
 class _PhysicsMode(object):
     STANDARD = 0
+
+
+class _MiscStatus(object):
+    SIEGE_MODE_STATE_CHANGED = 9
 
 
 class _Constants(object):
@@ -78,6 +85,7 @@ class _Constants(object):
     ARENA_PERIOD = _ArenaPeriod
     VEHICLE_PHYSICS_MODE = _PhysicsMode
     VEHICLE_SIEGE_STATE = _SiegeState
+    VEHICLE_MISC_STATUS = _MiscStatus
 
 
 class _Turret(object):
@@ -196,6 +204,9 @@ class _Avatar(object):
     def onVehicleChanged(self):
         self.changed += 1
 
+    def updateVehicleMiscStatus(self, vehicle_id, code, int_arg, float_args):
+        self.misc_status = (vehicle_id, code, int_arg, float_args)
+
     def set_ownVehicleGear(self, previous):
         self.property_notifiers.append(('gear', previous))
 
@@ -229,6 +240,66 @@ class _VehicleDescr(object):
 
 
 class BigWorldBindingTests(unittest.TestCase):
+    def test_siege_state_drives_exact_vehicle_callback_once_per_edge(self):
+        module = _binding_module()
+        bigworld = _BigWorld()
+        descriptor = types.SimpleNamespace(hasSiegeMode=True)
+        entity = bigworld.entity_value
+        entity.typeDescriptor = descriptor
+        entity.siegeState = _SiegeState.DISABLED
+        entity.onSiegeStateUpdated = mock.Mock()
+        binding = module.BigWorldVehicleBinding(
+            bigworld, _Avatar(), _Constants, _VehicleDescr,
+            lambda yaw, pitch, limits: 321,
+            outfit_provider=lambda unused_descriptor: '')
+
+        self.assertTrue(binding.update_vehicle_siege_state(
+            91, _SiegeState.SWITCHING_ON, 2.0))
+
+        self.assertEqual(_SiegeState.SWITCHING_ON, entity.siegeState)
+        entity.onSiegeStateUpdated.assert_called_once_with(
+            _SiegeState.SWITCHING_ON, 2.0)
+
+    def test_local_siege_state_uses_avatar_misc_status_consumer(self):
+        module = _binding_module()
+        bigworld = _BigWorld()
+        avatar = _Avatar()
+        avatar.playerVehicleID = 91
+        entity = bigworld.entity_value
+        entity.typeDescriptor = types.SimpleNamespace(hasSiegeMode=True)
+        entity.siegeState = _SiegeState.DISABLED
+        entity.onSiegeStateUpdated = mock.Mock()
+        binding = module.BigWorldVehicleBinding(
+            bigworld, avatar, _Constants, _VehicleDescr,
+            lambda yaw, pitch, limits: 321,
+            outfit_provider=lambda unused_descriptor: '')
+
+        self.assertTrue(binding.update_vehicle_siege_state(
+            91, _SiegeState.SWITCHING_ON, 2.0))
+
+        self.assertEqual(
+            (91, _MiscStatus.SIEGE_MODE_STATE_CHANGED,
+             _SiegeState.SWITCHING_ON, (2.0,)),
+            avatar.misc_status)
+        entity.onSiegeStateUpdated.assert_not_called()
+
+    def test_siege_state_rejects_inconsistent_transition_time(self):
+        module = _binding_module()
+        bigworld = _BigWorld()
+        bigworld.entity_value.typeDescriptor = types.SimpleNamespace(
+            hasSiegeMode=True)
+        bigworld.entity_value.siegeState = _SiegeState.DISABLED
+        bigworld.entity_value.onSiegeStateUpdated = mock.Mock()
+        binding = module.BigWorldVehicleBinding(
+            bigworld, _Avatar(), _Constants, _VehicleDescr,
+            lambda yaw, pitch, limits: 321,
+            outfit_provider=lambda unused_descriptor: '')
+
+        with self.assertRaisesRegex(
+                module.CapabilityError, 'transition time'):
+            binding.update_vehicle_siege_state(
+                91, _SiegeState.SWITCHING_ON, 0.0)
+
     def test_local_aux_physics_uses_exact_uint64_and_uint8_properties(self):
         module = _binding_module()
         avatar = _Avatar()
@@ -459,7 +530,8 @@ class BigWorldBindingTests(unittest.TestCase):
                 TEAM_KILLER=10, PERIOD=3),
             ARENA_PERIOD=_ArenaPeriod,
             VEHICLE_PHYSICS_MODE=_PhysicsMode,
-            VEHICLE_SIEGE_STATE=_SiegeState)
+            VEHICLE_SIEGE_STATE=_SiegeState,
+            VEHICLE_MISC_STATUS=_MiscStatus)
         binding = module.BigWorldVehicleBinding(
             _BigWorld(), _Avatar(), constants, _VehicleDescr,
             lambda *args: args, outfit_provider=lambda descriptor: '')

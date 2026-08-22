@@ -34,6 +34,27 @@ STATE_PATH = os.path.join(
 LEGACY_STATE_PATH = os.path.join(
     port_config.LEGACY_USER_DATA_DIR, 'postbattle_state.json')
 MAX_HISTORY = 256
+INTERACTION_FIELDS = (
+    ('spotted', 'spotted', 0, 1),
+    ('death_reason', 'deathReason', -1, 10),
+    ('direct_hits', 'directHits', 0, 65535),
+    ('explosion_hits', 'explosionHits', 0, 65535),
+    ('piercings', 'piercings', 0, 65535),
+    ('damage', 'damageDealt', 0, 65535),
+    ('assist_track', 'damageAssistedTrack', 0, 65535),
+    ('assist_radio', 'damageAssistedRadio', 0, 65535),
+    ('assist_stun', 'damageAssistedStun', 0, 65535),
+    ('crits', 'crits', 0, 4294967295),
+    ('fire', 'fire', 0, 65535),
+    ('stun_num', 'stunNum', 0, 65535),
+    ('stun_duration', 'stunDuration', 0, 65535),
+    ('damage_blocked', 'damageBlockedByArmor', 0, 4294967295),
+    ('damage_received', 'damageReceived', 0, 65535),
+    ('ricochets_received', 'rickochetsReceived', 0, 65535),
+    ('no_damage_direct_hits_received', 'noDamageDirectHitsReceived',
+     0, 65535),
+    ('target_kills', 'targetKills', 0, 255),
+)
 
 
 def _int(value, default=0):
@@ -171,6 +192,41 @@ def _receipt(value):
                 -1, min(_int(value.get('death_reason'), -1), 255)) or
             personal['xp'] != rewards['xp'] or personal['stats'] != stats):
         raise ValueError('battle receipt personal public row is inconsistent')
+    public_by_identity = dict(
+        ((row['actor_kind'], row['actor_id']), row)
+        for row in public_results)
+    interactions = []
+    raw_interactions = value.get('interactions', [])
+    if (not isinstance(raw_interactions, (list, tuple)) or
+            len(raw_interactions) > len(public_results)):
+        raise ValueError('battle receipt interaction details are invalid')
+    interaction_keys = set(field[0] for field in INTERACTION_FIELDS) | {
+        'target_kind', 'target_id'}
+    interaction_targets = set()
+    for raw in raw_interactions:
+        if not isinstance(raw, dict) or set(raw) != interaction_keys:
+            raise ValueError('battle receipt interaction row is invalid')
+        target = (
+            _bounded_text(raw.get('target_kind'), 8),
+            _int(raw.get('target_id'), -1))
+        target_public = public_by_identity.get(target)
+        if (target_public is None or target in interaction_targets or
+                target == ('player', player_id) or
+                target_public['team'] == team):
+            raise ValueError('battle receipt interaction target is invalid')
+        interaction = {
+            'target_kind': target[0], 'target_id': target[1],
+        }
+        for field_name, unused_native, minimum, maximum in INTERACTION_FIELDS:
+            raw_value = raw.get(field_name)
+            if (isinstance(raw_value, bool) or
+                    not isinstance(raw_value, integer_types) or
+                    raw_value < minimum or raw_value > maximum):
+                raise ValueError(
+                    'battle receipt interaction value is invalid')
+            interaction[field_name] = int(raw_value)
+        interactions.append(interaction)
+        interaction_targets.add(target)
     return {
         'receipt_id': receipt_id,
         'arena_unique_id': arena_unique_id,
@@ -190,6 +246,7 @@ def _receipt(value):
         'stats': stats,
         'rewards': rewards,
         'public_results': public_results,
+        'interactions': interactions,
     }
 
 
@@ -233,7 +290,28 @@ def _add_value_replays(packers, vehicle, replay_types=None):
         vehicle[result_name] = replay.pack()
 
 
-def pack_battle_result(receipt, packers=None, replay_types=None):
+def _pack_interaction_details(receipt, vehicle_ids, vehicle_type_cds,
+                              interaction_details_type=None):
+    """Pack receipt rows with #1513's native interaction serializer."""
+    if not receipt['interactions']:
+        return None
+    if interaction_details_type is None:
+        from battle_results_shared import VehicleInteractionDetails
+        interaction_details_type = VehicleInteractionDetails
+    details = interaction_details_type([], [])
+    for interaction in receipt['interactions']:
+        identity = (
+            interaction['target_kind'], interaction['target_id'])
+        record = details[(
+            vehicle_ids[identity], vehicle_type_cds[identity])]
+        for field_name, native_name, unused_minimum, unused_maximum in (
+                INTERACTION_FIELDS):
+            record[native_name] = interaction[field_name]
+    return details.pack()
+
+
+def pack_battle_result(receipt, packers=None, replay_types=None,
+                       interaction_details_type=None):
     """Build the four-tuple consumed by #1513 ``BattleResultsCache``.
 
     Every compact list comes from the stock packer.  Supplying ``packers`` is
@@ -325,6 +403,7 @@ def pack_battle_result(receipt, packers=None, replay_types=None):
         row['actor_id']))
     identity_to_vehicle_id = {}
     identity_to_account_dbid = {}
+    identity_to_vehicle_cd = {}
     for index, row in enumerate(rows):
         identity = (row['actor_kind'], row['actor_id'])
         # The #1513 main team iterator requires a positive account DBID.
@@ -333,6 +412,15 @@ def pack_battle_result(receipt, packers=None, replay_types=None):
         projected_id = index + 1
         identity_to_account_dbid[identity] = projected_id
         identity_to_vehicle_id[identity] = projected_id
+        identity_to_vehicle_cd[identity] = (
+            vehicle_type_cd if identity == personal_identity else
+            _vehicle_type_compact_descr(row['vehicle']))
+
+    packed_details = _pack_interaction_details(
+        receipt, identity_to_vehicle_id, identity_to_vehicle_cd,
+        interaction_details_type=interaction_details_type)
+    if packed_details is not None:
+        vehicle['details'] = packed_details
 
     personal_public = next(
         row for row in rows
@@ -351,7 +439,7 @@ def pack_battle_result(receipt, packers=None, replay_types=None):
         projected_account = identity_to_account_dbid[identity]
         projected_vehicle = identity_to_vehicle_id[identity]
         row_stats = row['stats']
-        row_vehicle_cd = _vehicle_type_compact_descr(row['vehicle'])
+        row_vehicle_cd = identity_to_vehicle_cd[identity]
         killer_identity = (row['killer_kind'], row['killer_id'])
         public_vehicle = {
             'accountDBID': projected_account,
@@ -423,7 +511,14 @@ class PostBattleStore(object):
         self._pending = {}
         self._history = []
         self._progress = self._empty_progress()
+        self._progress_applier = None
         self._load()
+
+    def set_progress_applier(self, callback):
+        """Bind the garage-owned, idempotent crew-XP transaction."""
+        if callback is not None and not callable(callback):
+            raise TypeError('postbattle progress applier must be callable')
+        self._progress_applier = callback
 
     @staticmethod
     def _empty_progress():
@@ -464,9 +559,14 @@ class PostBattleStore(object):
         arena_key = str(receipt['arena_unique_id'])
         if arena_key in self._pending:
             raise ValueError('arena already has a different receipt')
+        policy = {}
+        if self._progress_applier is not None:
+            policy = self._progress_applier(receipt) or {}
         previous = self._snapshot()
         self._pending[arena_key] = receipt
-        self._apply_progress(receipt)
+        self._apply_progress(
+            receipt, vehicle_xp=(0 if policy.get('accelerated') else
+                                 receipt['rewards']['xp']))
         try:
             self._save()
         except Exception:
@@ -474,7 +574,8 @@ class PostBattleStore(object):
             raise
         return True
 
-    def result(self, arena_unique_id, packers=None, replay_types=None):
+    def result(self, arena_unique_id, packers=None, replay_types=None,
+               interaction_details_type=None):
         arena_unique_id = _int(arena_unique_id, -1)
         receipt = self._pending.get(str(arena_unique_id))
         if receipt is None:
@@ -487,7 +588,8 @@ class PostBattleStore(object):
         if receipt is None:
             return None
         return pack_battle_result(
-            receipt, packers=packers, replay_types=replay_types)
+            receipt, packers=packers, replay_types=replay_types,
+            interaction_details_type=interaction_details_type)
 
     def service_message_data(self, arena_unique_id):
         """Return the exact BattleResultsFormatter input summary."""
@@ -552,7 +654,7 @@ class PostBattleStore(object):
             raise
         return True
 
-    def _apply_progress(self, receipt):
+    def _apply_progress(self, receipt, vehicle_xp=None):
         rewards = receipt['rewards']
         stats = receipt['stats']
         progress = self._progress
@@ -570,7 +672,9 @@ class PostBattleStore(object):
             'xp': 0, 'battles': 0, 'wins': 0, 'losses': 0,
             'damage': 0, 'kills': 0,
         })
-        row['xp'] += rewards['xp']
+        if vehicle_xp is None:
+            vehicle_xp = rewards['xp']
+        row['xp'] += max(0, _int(vehicle_xp))
         row['battles'] += 1
         row['wins'] += int(receipt['winner'] == receipt['team'])
         row['losses'] = int(row.get('losses', 0)) + int(

@@ -88,7 +88,12 @@ _FIELD_CHINESE = {
     "Turret traverse": "炮塔旋转机构", "Weight": "重量",
     "Load limit": "载重上限", "Maximum health": "最大耐久",
     "Repair threshold": "修复阈值", "Power": "功率",
-    "Traverse speed": "旋转速度", "Reload time": "装填时间",
+    "Traverse speed": "旋转速度", "Gun elevation limits": "火炮俯仰范围",
+    "Depression curve": "俯角曲线", "Elevation curve": "仰角曲线",
+    "Horizontal traverse limits": "水平射界", "Hull aiming": "车体瞄准",
+    "Suspension pitch limits": "悬挂俯仰范围", "Minimum pitch": "最小俯仰角",
+    "Maximum pitch": "最大俯仰角", "Travel mode": "行驶模式",
+    "Siege mode": "攻城模式", "Reload time": "装填时间",
     "Aiming time": "瞄准时间", "Ammunition capacity": "弹药容量",
     "Shell": "炮弹", "Projectile speed": "炮弹速度",
     "Maximum distance": "最大射程", "Gravity": "重力",
@@ -113,6 +118,14 @@ _CONSTRAINT_CHINESE = (
     ("penetration must contain exactly two positive finite numbers; the "
      "first value must be no less than the second",
      "穿深必须包含两个正的有限数，且第一个数不得小于第二个数"),
+    ("angle may be one finite degree value or a complete 0..1 piecewise "
+     "curve; every angle must be between -90 and 90 degrees",
+     "可填写一个有限角度，或完整的 0..1 分段曲线；所有角度须在 -90 到 90 度之间"),
+    ("horizontal traverse must contain exactly two finite degree values "
+     "between -180 and 180; minimum must not exceed maximum",
+     "水平射界须包含两个 -180 到 180 度之间的有限角度，且最小值不得大于最大值"),
+    ("pitch angle must be finite and between -90 and 90 degrees",
+     "俯仰角须为 -90 到 90 度之间的有限数值"),
     ("; finite value ", "；有限数值 "),
 )
 
@@ -253,8 +266,14 @@ class VehicleEditorWindow(object):
     def _field_label(self, label):
         if self._language != i18n.LANGUAGE_CHINESE:
             return label
-        return " / ".join(
-            _FIELD_CHINESE.get(part, part) for part in label.split(" / "))
+        translated = []
+        for part in label.split(" / "):
+            if part.startswith("Armor thickness (") and part.endswith(")"):
+                part = "装甲厚度（%s）" % part[len("Armor thickness ("):-1]
+            else:
+                part = _FIELD_CHINESE.get(part, part)
+            translated.append(part)
+        return " / ".join(translated)
 
     def _constraint_text(self, text):
         if self._language != i18n.LANGUAGE_CHINESE:
@@ -277,6 +296,13 @@ class VehicleEditorWindow(object):
                 component or "-", record.get("nation", self.nation.get()),
                 len(affected), ", ".join(affected))
         vehicle = record.get("vehicle", self.vehicle.get())
+        mode = record.get("mode")
+        if mode == "all":
+            return "同时存入 %s 的行驶模式与攻城模式数据；一次修改会应用到两者。" % vehicle
+        if mode == "travel":
+            return "仅存于 %s 的行驶模式数据。" % vehicle
+        if mode == "siege":
+            return "仅存于 %s 的攻城模式数据。" % vehicle
         result = "仅存于 %s；只影响该车。" % vehicle
         field_path = record.get("fieldPath", "")
         if (field_path == "hull/maxHealth" or

@@ -937,7 +937,7 @@ def _dispersed_barrel_angles(bot_id, round_id, fire_seq, yaw, pitch,
             math.atan2(direction[1], max(1e-9, horizontal)))
 
 
-def _overlay_live_target_pose(command, target):
+def _overlay_live_target_pose(command, target, source_position=None):
     """Replace a low-rate team-spotted order with the current target pose.
 
     A visible-but-occluded contact still needs a current approach goal. The
@@ -974,7 +974,32 @@ def _overlay_live_target_pose(command, target):
     if any(math.isnan(value) or math.isinf(value) for value in position):
         raise ValueError('canonical live target position must be finite')
     result['aim_position'] = position
-    result['face_position'] = position
+    angle_degrees = result.get('hull_angle_degrees')
+    if angle_degrees is None:
+        result['face_position'] = position
+    else:
+        origin = source_position
+        if isinstance(origin, dict):
+            origin = (origin.get('x'), origin.get('y'), origin.get('z'))
+        try:
+            origin = tuple(float(origin[index]) for index in range(3))
+            angle_degrees = float(angle_degrees)
+            if (math.isnan(angle_degrees) or math.isinf(angle_degrees) or
+                    abs(angle_degrees) > 45.0 or
+                    any(math.isnan(value) or math.isinf(value)
+                        for value in origin)):
+                raise ValueError
+            angle = math.radians(angle_degrees)
+            dx = position[0] - origin[0]
+            dz = position[2] - origin[2]
+            cosine = math.cos(angle)
+            sine = math.sin(angle)
+            result['face_position'] = (
+                origin[0] + dx * cosine - dz * sine,
+                origin[1],
+                origin[2] + dx * sine + dz * cosine)
+        except (TypeError, ValueError, OverflowError, IndexError):
+            raise ValueError('hull angle origin is invalid')
     if result.get('combat_mode') == 'advance_contact':
         result['move_position'] = position
     return result
@@ -4853,7 +4878,8 @@ class BotRuntime(object):
                             server_order.get('target_id'))
                     server_order = _overlay_live_target_pose(
                         server_order,
-                        targets.get(server_order.get('target_id')))
+                        targets.get(server_order.get('target_id')),
+                        position)
                     command = decide_with_order(
                         decision_state, server_order,
                         sample_clear)
@@ -4941,7 +4967,7 @@ class BotRuntime(object):
                     target_id, targets[target_id], live_players)
             else:
                 target = None
-            command = _overlay_live_target_pose(command, target)
+            command = _overlay_live_target_pose(command, target, position)
             state['target_kind'] = (
                 target.get('kind') if target is not None else None)
             state['target_id'] = (
@@ -5334,7 +5360,8 @@ class BotRuntime(object):
                     target is not None and target.get('visible') and
                     callable(self.cover_probe) and
                     (mode in ('take_cover', 'cover_hold', 'cover_peek',
-                              'cover_return') or
+                              'cover_return', 'under_fire_withdraw',
+                              'low_health_retreat', 'crossfire_withdraw') or
                      (command.get('fire_allowed') and mode in (
                          'engage', 'advance_contact', 'jiggle_forward',
                          'jiggle_back')))):

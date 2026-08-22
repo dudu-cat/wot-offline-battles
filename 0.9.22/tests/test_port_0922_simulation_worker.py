@@ -989,6 +989,7 @@ class SimulationWorkerSocketTests(unittest.TestCase):
                 'map_pool', 'host_player_id', 'phase', 'round_id',
                 'state_revision', 'spawn', 'bot_authority_id', 'team_size',
                 'authority_epoch', 'capabilities', 'server_capabilities',
+                'team_sizes',
             }, set(welcome))
             roster = player.receive_until('roster')
             self.assertNotIn('worker_status', roster)

@@ -113,6 +113,46 @@ def _battle_results_store():
     return _postbattle_store
 
 
+def _bind_battle_progress(context):
+    """Bind durable result receipts to the equally durable garage crew."""
+    garage_store = context.get('garage_store')
+    snapshot = context.get('selected_vehicle')
+    if garage_store is None or not isinstance(snapshot, dict):
+        # Hidden workers intentionally own no result or garage store.  If a
+        # live client changes mode in-process, retire an older binding without
+        # constructing a new persistent result owner for the worker.
+        if _postbattle_store is not None:
+            binder = getattr(
+                _postbattle_store, 'set_progress_applier', None)
+            if callable(binder):
+                binder(None)
+        return False
+    postbattle = _battle_results_store()
+    binder = getattr(postbattle, 'set_progress_applier', None)
+    if not callable(binder):
+        # Keeps narrow embedding/test stores source-compatible.  The real
+        # PostBattleStore always exposes this transaction boundary.
+        return False
+    touched = context.setdefault('postbattle_touched_vehicles', set())
+
+    def apply(receipt):
+        from AccountCommands import VEHICLE_SETTINGS_FLAG
+        from items import tankmen, vehicles
+        descriptor = vehicles.VehicleDescr(typeName=str(receipt['vehicle']))
+        nation_id, vehicle_type_id = descriptor.type.id
+        vehicle_type_cd = vehicles.makeIntCompactDescrByID(
+            'vehicle', nation_id, vehicle_type_id)
+        result = garage_store.apply_battle_crew_xp(
+            snapshot, receipt['receipt_id'], vehicle_type_cd,
+            receipt['rewards']['xp'], VEHICLE_SETTINGS_FLAG.XP_TO_TMAN,
+            tankmen_module=tankmen)
+        touched.add(int(result['vehicle_id']))
+        return result
+
+    binder(apply)
+    return True
+
+
 def _restore_garage(snapshot):
     store = _garage_store()
     if store is None:
@@ -1086,6 +1126,7 @@ def _run_once():
                 # local offline substitute beside config across restarts.
                 'account_state': account_state,
             }
+        _bind_battle_progress(_account_context)
         _deadline = 0.0
         _wait_for_login_space()
     except Exception as error:

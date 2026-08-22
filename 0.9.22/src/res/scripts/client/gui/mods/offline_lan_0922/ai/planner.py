@@ -1073,25 +1073,34 @@ class BattleDirector(object):
 
 	def _angled_face_position(self, agent, position, target_position):
 		"""Give armoured turreted tanks a stable 12-30 degree hull angle."""
-		profile = agent['profile']
-		if profile['class_tag'] in ('AT-SPG', 'SPG'):
-			return target_position
-		if profile['dominant_role'] not in ('brawler', 'support'):
+		angle_degrees = self._hull_angle_degrees(agent)
+		if angle_degrees is None:
 			return target_position
 		dx = target_position[0] - position[0]
 		dz = target_position[2] - position[2]
 		length = math.sqrt(dx * dx + dz * dz)
 		if length < 0.1:
 			return target_position
-		angle = math.radians(12.0 + agent['personality']['caution'] * 18.0)
-		if (agent['seed'] & 1) == 0:
-			angle = -angle
+		angle = math.radians(angle_degrees)
 		cosine = math.cos(angle)
 		sine = math.sin(angle)
 		angled_x = dx * cosine - dz * sine
 		angled_z = dx * sine + dz * cosine
 		return (position[0] + angled_x, target_position[1],
 		        position[2] + angled_z)
+
+	def _hull_angle_degrees(self, agent):
+		profile = agent['profile']
+		roles = profile.get('roles', {}) or {}
+		if profile['class_tag'] in ('AT-SPG', 'SPG'):
+			return None
+		if profile['dominant_role'] not in ('brawler', 'support'):
+			return None
+		if (_number(profile.get('armor')) < 60.0 and
+				_number(roles.get('brawler')) < 0.55):
+			return None
+		angle = 12.0 + agent['personality']['caution'] * 18.0
+		return -angle if (agent['seed'] & 1) == 0 else angle
 
 	def order_for(self, bot_id, position, hull_yaw, health, max_health, now):
 		agent = self.agents[int(bot_id)]
@@ -1130,6 +1139,9 @@ class BattleDirector(object):
 			order['aim_position'] = contact['position']
 			order['face_position'] = self._angled_face_position(
 				agent, position, contact['position'])
+			hull_angle = self._hull_angle_degrees(agent)
+			if hull_angle is not None:
+				order['hull_angle_degrees'] = hull_angle
 			order['fire_allowed'] = bool(contact.get('visible'))
 			order['shell_index'] = select_shell_index(profile, contact, personality)
 			if contact.get('visible'):

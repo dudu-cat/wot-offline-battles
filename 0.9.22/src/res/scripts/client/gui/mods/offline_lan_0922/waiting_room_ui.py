@@ -63,6 +63,7 @@ POINTER_TICK_SECONDS = 0.03
 RANDOM_MAP_OPTION = 'server_random'
 
 _HOST_CONTROLS = ('previous', 'map', 'next', 'start')
+_TEAM_CONTROLS = ('team1', 'team2')
 
 
 def _LEFT_MOUSE_KEY():
@@ -235,13 +236,16 @@ class WaitingRoomUI(object):
     guest_view = True
 
     def __init__(self, request_start, map_pool, status=None, on_close=None,
-                 host=None, surface=None, random_supported=None):
+                 host=None, surface=None, random_supported=None,
+                 request_team=None, team_status=None):
         self._request_start = request_start
         self._map_pool = map_pool
         self._status = status or (lambda: '')
         self._on_close = on_close
         self._host = host or (lambda: False)
         self._random_supported = random_supported or (lambda: True)
+        self._request_team = request_team
+        self._team_status = team_status or (lambda: {})
         self._surface = surface
         self._panel = None
         self._controls = {}
@@ -293,6 +297,8 @@ class WaitingRoomUI(object):
         self._make_control('previous', (-0.72, 0.05, CONTROL_Z), 0.20, 0.20)
         self._make_control('map', (0.0, 0.05, CONTROL_Z), 1.15, 0.20)
         self._make_control('next', (0.72, 0.05, CONTROL_Z), 0.20, 0.20)
+        self._make_control('team1', (-0.30, 0.27, CONTROL_Z), 0.52, 0.16)
+        self._make_control('team2', (0.30, 0.27, CONTROL_Z), 0.52, 0.16)
         self._make_control('start', (0.0, -0.40, CONTROL_Z), 1.20, 0.22)
         self._make_control('close', (0.0, -0.78, CONTROL_Z), 0.50, 0.18)
         self._make_label('title', 'LAN WAITING ROOM', (-0.86, 0.82, 0.0), 1.72,
@@ -307,6 +313,10 @@ class WaitingRoomUI(object):
                          anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
         self._make_label('next', '>', (0.72, 0.05, 0.0), 0.18, 0.12,
                          anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        self._make_label('team1', 'TEAM 1', (-0.30, 0.27, 0.0), 0.48,
+                         0.10, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        self._make_label('team2', 'TEAM 2', (0.30, 0.27, 0.0), 0.48,
+                         0.10, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
         self._make_label('start', 'START BATTLE', (0.0, -0.40, 0.0), 1.16,
                          0.12, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
         self._make_label('close', 'LEAVE', (0.0, -0.78, 0.0), 0.46, 0.12,
@@ -640,6 +650,18 @@ class WaitingRoomUI(object):
             return False
         options = self._sync_selection()
         is_host = bool(self._host())
+        team_status = self._team_status() or {}
+        team_supported = bool(
+            callable(self._request_team) and team_status.get('supported'))
+        current_team = team_status.get('team')
+        sizes = team_status.get('sizes') or {}
+        counts = team_status.get('counts') or {}
+        for team in (1, 2):
+            label = 'TEAM %d  %d/%d%s' % (
+                team, int(counts.get(team, 0)),
+                int(sizes.get(team, sizes.get(str(team), 15))),
+                '  SELECTED' if current_team == team else '')
+            self._set_text('team%d' % team, label)
         lines = str(self._status() or '').splitlines()
         self._set_text('room', lines[0] if lines else '')
         self._set_text('players', lines[1] if len(lines) > 1 else '')
@@ -652,7 +674,8 @@ class WaitingRoomUI(object):
                            'The room host starts the battle.')
         self._set_text('message', self._message)
         for role, component in self._controls.items():
-            visible = role == 'close' or is_host
+            visible = (team_supported if role in _TEAM_CONTROLS else
+                       role == 'close' or is_host)
             self._set(component, 'visible', visible)
             label = self._labels.get(role)
             if label is not None:
@@ -692,6 +715,8 @@ class WaitingRoomUI(object):
             if callable(self._on_close):
                 self._on_close()
             return True
+        if role in _TEAM_CONTROLS:
+            return self._select_team(int(role[-1]))
         if not self._host():
             return False
         if role == 'previous':
@@ -701,6 +726,22 @@ class WaitingRoomUI(object):
         if role == 'start':
             return self._start()
         return False
+
+    def _select_team(self, team):
+        status = self._team_status() or {}
+        if not callable(self._request_team) or not status.get('supported'):
+            return False
+        if status.get('team') == team:
+            self._message = 'Already on Team %d.' % team
+            self.refresh()
+            return True
+        self._message = 'Requesting Team %d...' % team
+        self.refresh()
+        if self._request_team(team) is False:
+            self._message = 'The server did not accept Team %d.' % team
+            self.refresh()
+            return False
+        return True
 
     def _cycle(self, step):
         options = self._options()

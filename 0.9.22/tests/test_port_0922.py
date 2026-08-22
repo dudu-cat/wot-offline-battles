@@ -681,6 +681,43 @@ class PortConfigTests(unittest.TestCase):
                 {'schema': 1, 'host': '10.20.30.40', 'port': 28782},
                 saved)
 
+    def test_old_config_defaults_to_auto_team_and_process_can_override_it(self):
+        config_module = _load_port_source('config')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'config.json'
+            path.write_text('{"enabled": true}', encoding='utf-8')
+
+            config = config_module.load(str(path))
+
+            self.assertEqual(0, config['preferred_team'])
+            self.assertEqual(0, config_module.preferred_team(config, {}))
+            self.assertEqual(
+                2,
+                config_module.preferred_team(
+                    config, {config_module.PREFERRED_TEAM_ENV: '2'}))
+            with self.assertRaises(ValueError):
+                config_module.preferred_team(
+                    config, {config_module.PREFERRED_TEAM_ENV: '3'})
+
+    def test_schema_one_migrates_completed_native_remote_presentation_on(self):
+        config_module = _load_port_source('config')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'config.json'
+            path.write_text(
+                '{"schema": 1, "native_remote_vehicles": false}',
+                encoding='utf-8')
+
+            migrated = config_module.load(str(path))
+
+            self.assertEqual(2, migrated['schema'])
+            self.assertTrue(migrated['native_remote_vehicles'])
+
+            path.write_text(
+                '{"schema": 2, "native_remote_vehicles": false}',
+                encoding='utf-8')
+            explicit_fallback = config_module.load(str(path))
+            self.assertFalse(explicit_fallback['native_remote_vehicles'])
+
     def test_user_endpoint_survives_release_config_replacement(self):
         config_module = _load_port_source('config')
         with tempfile.TemporaryDirectory() as directory:
@@ -4609,6 +4646,17 @@ class LANClientTests(unittest.TestCase):
                 client.thread.join(2.0)
             listener.close()
 
+    def test_requested_team_is_carried_only_when_explicit(self):
+        module = _load_port_source('lan_client')
+        automatic = module.LANClient(
+            '127.0.0.1', 28782, 'Auto', 'ussr:R11_MS-1')
+        selected = module.LANClient(
+            '127.0.0.1', 28782, 'TeamTwo', 'ussr:R11_MS-1',
+            requested_team=2)
+
+        self.assertNotIn('requested_team', automatic._hello_payload())
+        self.assertEqual(2, selected._hello_payload()['requested_team'])
+
     def test_projected_bot_state_send_does_not_project_a_second_time(self):
         module, client, unused_events, unused_bigworld = self._client()
         client.ready = True
@@ -4662,7 +4710,8 @@ class LANClientTests(unittest.TestCase):
             'server_capabilities': [
                 module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
                 module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
-                module.RANDOM_MAP_CAPABILITY],
+                module.RANDOM_MAP_CAPABILITY,
+                module.TEAM_SELECTION_CAPABILITY],
             'authority_epoch': 1,
             'player_id': 7,
             'host_player_id': 7,
@@ -4670,6 +4719,7 @@ class LANClientTests(unittest.TestCase):
             'vehicle': 'ussr:MS-1',
             'max_health': 100,
             'team': 1,
+            'team_sizes': {'1': 2, '2': 5},
             'slot': 0,
             'map': '01_karelia',
             'map_pool': ['01_karelia', '04_himmelsdorf'],
@@ -4695,6 +4745,7 @@ class LANClientTests(unittest.TestCase):
         self.assertEqual(7, client.player_id)
         self.assertTrue(client.is_room_host())
         self.assertEqual(2, len(client.roster))
+        self.assertEqual({1: 2, 2: 5}, client.team_sizes)
         self.assertFalse(client.request_start('99_missing'))
         self.assertTrue(client.request_start('04_himmelsdorf'))
         queued = client._outbound_queue[-1][1]
@@ -4702,6 +4753,11 @@ class LANClientTests(unittest.TestCase):
         self.assertEqual('04_himmelsdorf', queued['map'])
         self.assertEqual(['welcome', 'roster'],
                          [item[0] for item in events])
+
+        self.assertTrue(client.select_team(2))
+        self.assertEqual(
+            {'type': 'select_team', 'team': 2},
+            client._outbound_queue[-1][1])
 
     def test_guest_cannot_request_start_or_select_map(self):
         _, client, _, _ = self._client()

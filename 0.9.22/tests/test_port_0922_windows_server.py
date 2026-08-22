@@ -25,12 +25,9 @@ class WindowsServerLauncherTests(unittest.TestCase):
 
         ensure.assert_called_once_with(28782)
         run_server.assert_called_once_with(
-            '0.0.0.0',
-            28782,
-            'server_random',
-            30,
-            'client',
-            15,
+            '0.0.0.0', 28782, 'server_random', 30,
+            authority_mode='client', team_size=15,
+            team1_size=15, team2_size=15,
         )
 
     def test_firewall_request_precedes_server_bind(self):
@@ -39,10 +36,10 @@ class WindowsServerLauncherTests(unittest.TestCase):
         def ensure(port):
             events.append(('firewall', port))
 
-        def run_server(host, port, map_name, max_players, authority_mode,
-                       team_size):
+        def run_server(host, port, map_name, max_players, **options):
             events.append(('server', host, port, map_name, max_players,
-                           authority_mode, team_size))
+                           options['authority_mode'], options['team_size'],
+                           options['team1_size'], options['team2_size']))
 
         with mock.patch.object(
                 windows_server, '_load_server',
@@ -54,7 +51,8 @@ class WindowsServerLauncherTests(unittest.TestCase):
 
         self.assertEqual([
             ('firewall', 28782),
-            ('server', '0.0.0.0', 28782, 'server_random', 30, 'client', 15),
+            ('server', '0.0.0.0', 28782, 'server_random', 30, 'client',
+             15, 15, 15),
         ], events)
 
     def test_hidden_coordinator_loopback_mode_skips_firewall(self):
@@ -72,12 +70,9 @@ class WindowsServerLauncherTests(unittest.TestCase):
 
         ensure.assert_not_called()
         run_server.assert_called_once_with(
-            '127.0.0.1',
-            28782,
-            'server_random',
-            30,
-            'client',
-            15,
+            '127.0.0.1', 28782, 'server_random', 30,
+            authority_mode='client', team_size=15,
+            team1_size=15, team2_size=15,
         )
 
     def test_launcher_environment_selects_the_total_tanks_per_team(self):
@@ -91,7 +86,23 @@ class WindowsServerLauncherTests(unittest.TestCase):
                     windows_server, '_ensure_windows_firewall_rule'):
             self.assertEqual(0, windows_server.main())
 
-        self.assertEqual(4, run_server.call_args.args[-1])
+        self.assertEqual(4, run_server.call_args.kwargs['team1_size'])
+        self.assertEqual(4, run_server.call_args.kwargs['team2_size'])
+
+    def test_launcher_environment_selects_independent_team_capacities(self):
+        run_server = mock.Mock()
+        with mock.patch.dict(os.environ, {
+                windows_server.SERVER_TEAM1_SIZE_ENV: '3',
+                windows_server.SERVER_TEAM2_SIZE_ENV: '8',
+        }), mock.patch.object(
+                windows_server, '_load_server',
+                return_value=('server_random', run_server)), \
+                mock.patch.object(
+                    windows_server, '_ensure_windows_firewall_rule'):
+            self.assertEqual(0, windows_server.main())
+
+        self.assertEqual(3, run_server.call_args.kwargs['team1_size'])
+        self.assertEqual(8, run_server.call_args.kwargs['team2_size'])
 
     def test_invalid_launcher_team_size_fails_before_server_bind(self):
         run_server = mock.Mock()

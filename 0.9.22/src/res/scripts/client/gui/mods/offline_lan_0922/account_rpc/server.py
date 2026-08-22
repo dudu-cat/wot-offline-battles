@@ -148,8 +148,18 @@ class FakeServer(object):
         stats = snapshot['stats']
         diff = {'stats': dict((name, stats[name]) for name in (
             'credits', 'freeXP', 'vehTypeXP'))}
+        touched = self._context.get('postbattle_touched_vehicles')
+        touched = set(touched or ())
+        if touched:
+            diff.update(data.inventory(
+                self._context.get('selected_vehicle'), validate=False,
+                only_vehicles=touched, only_items={}))
 
         def resync_dossiers(player):
+            shared_touched = self._context.get(
+                'postbattle_touched_vehicles')
+            if shared_touched is not None:
+                shared_touched.difference_update(touched)
             resync = getattr(player, 'resyncDossiers', None)
             if callable(resync):
                 resync()

@@ -33,6 +33,9 @@ class VehicleOverlayTest(unittest.TestCase):
     LIST = "scripts/item_defs/vehicles/ussr/list.xml"
     VEHICLE = "scripts/item_defs/vehicles/ussr/R11_MS-1.xml"
     VEHICLE_TWO = "scripts/item_defs/vehicles/ussr/R12_Test.xml"
+    SIEGE_VEHICLE = "scripts/item_defs/vehicles/ussr/R13_Siege.xml"
+    SIEGE_MODE = (
+        "scripts/item_defs/vehicles/ussr/R13_Siege_siege_mode.xml")
     OBSERVER = "scripts/item_defs/vehicles/ussr/Observer.xml"
     ENGINES = "scripts/item_defs/vehicles/ussr/components/engines.xml"
     GUNS = "scripts/item_defs/vehicles/ussr/components/guns.xml"
@@ -78,6 +81,10 @@ class VehicleOverlayTest(unittest.TestCase):
         chassis_record = packed.PackedElement(children=[
             (b"weight", scalar(packed.TYPE_INTEGER, 1200)),
             (b"maxLoad", scalar(packed.TYPE_INTEGER, 6500)),
+            (b"armor", element([
+                (b"leftTrack", scalar(packed.TYPE_INTEGER, 15)),
+                (b"rightTrack", scalar(packed.TYPE_INTEGER, 15)),
+            ])),
             (b"maxHealth", scalar(packed.TYPE_INTEGER, 50)),
             (b"maxRegenHealth", scalar(packed.TYPE_INTEGER, 40)),
             (b"resource", scalar(
@@ -90,6 +97,14 @@ class VehicleOverlayTest(unittest.TestCase):
             ])),
             (b"turrets0", element([
                 (b"T-18_mod", element([
+                    (b"weight", scalar(packed.TYPE_INTEGER, 700)),
+                    (b"armor", element([
+                        (b"armor_1", scalar(packed.TYPE_INTEGER, 35)),
+                        (b"armor_2", element([
+                            (b"vehicleDamageFactor", scalar(
+                                packed.TYPE_STRING, b"0.0")),
+                        ])),
+                    ])),
                     (b"guns", element([
                         (b"Gun-A", element([])),
                     ])),
@@ -124,6 +139,17 @@ class VehicleOverlayTest(unittest.TestCase):
         ])
         gun = packed.PackedElement(children=[
             (b"rotationSpeed", scalar(packed.TYPE_STRING, b"35.5")),
+            (b"pitchLimits", element([
+                (b"minPitch", scalar(
+                    packed.TYPE_STRING, b"0 -10 1 -10")),
+                (b"maxPitch", scalar(
+                    packed.TYPE_STRING, b"0 20 1 20")),
+            ])),
+            (b"turretYawLimits", scalar(
+                packed.TYPE_STRING, b"-180 180")),
+            (b"armor", element([
+                (b"gun", scalar(packed.TYPE_INTEGER, 20)),
+            ])),
             (b"reloadTime", scalar(packed.TYPE_STRING, b"2.5")),
             (b"aimingTime", scalar(packed.TYPE_STRING, b"1.9")),
             (b"weight", scalar(packed.TYPE_INTEGER, 200)),
@@ -179,6 +205,47 @@ class VehicleOverlayTest(unittest.TestCase):
             self.GUNS: packed.write_packed_xml(guns),
             self.SHELLS: packed.write_packed_xml(shells),
         }
+
+    def _install_siege_pair(self):
+        normal = packed.read_packed_xml(self.members[self.VEHICLE])
+        normal.children.append((b"hull", element([
+            (b"weight", scalar(packed.TYPE_INTEGER, 2000)),
+            (b"armor", element([
+                (b"armor_1", scalar(packed.TYPE_INTEGER, 40)),
+            ])),
+        ])))
+        normal_gun = child(child(child(
+            child(normal, "turrets0").value,
+            "T-18_mod").value, "guns").value, "Gun-A")
+        normal_gun.value.children.extend((
+            (b"pitchLimits", element([
+                (b"minPitch", scalar(
+                    packed.TYPE_STRING, b"0 -1 1 -1")),
+                (b"maxPitch", scalar(
+                    packed.TYPE_STRING, b"0 -1 1 -1")),
+            ])),
+            (b"turretYawLimits", scalar(
+                packed.TYPE_STRING, b"-3 3")),
+        ))
+        siege = packed.read_packed_xml(packed.write_packed_xml(normal))
+        child(child(siege, "speedLimits").value, "forward").value = 8
+        child(child(siege, "speedLimits").value, "backward").value = 8
+        siege_gun = child(child(child(
+            child(siege, "turrets0").value,
+            "T-18_mod").value, "guns").value, "Gun-A")
+        pitch = child(siege_gun.value, "pitchLimits").value
+        child(pitch, "minPitch").value = b"0 -4 1 -4"
+        child(pitch, "maxPitch").value = b"0 2 1 2"
+
+        roster = packed.read_packed_xml(self.members[self.LIST])
+        roster.children.append((b"R13_Siege", element([
+            (b"tags", scalar(
+                packed.TYPE_STRING, b"AT-SPG siegeMode")),
+        ])))
+        self.members[self.LIST] = packed.write_packed_xml(roster)
+        self.members[self.SIEGE_VEHICLE] = packed.write_packed_xml(normal)
+        self.members[self.SIEGE_MODE] = packed.write_packed_xml(siege)
+        self._write_package()
 
     def _overlay(self, member):
         return os.path.join(
@@ -285,6 +352,10 @@ class VehicleOverlayTest(unittest.TestCase):
         self.assertIn("shared/Gun-A/reloadTime", paths)
         self.assertIn(
             "shared/Gun-A/shots/Shell-A/piercingPower", paths)
+        self.assertIn("shared/Gun-A/pitchLimits/minPitch", paths)
+        self.assertIn("shared/Gun-A/pitchLimits/maxPitch", paths)
+        self.assertIn("shared/Gun-A/turretYawLimits", paths)
+        self.assertIn("shared/Gun-A/armor/gun", paths)
         penetration = next(
             record for record in gun_fields
             if record["fieldPath"].endswith("piercingPower"))
@@ -310,6 +381,134 @@ class VehicleOverlayTest(unittest.TestCase):
             vehicle_overlays.list_editable_fields(self.game, self.ENGINES)]
         self.assertNotIn("shared/GAZ-M1/tags", engine_paths)
         self.assertNotIn("ids/GAZ-M1", engine_paths)
+
+    def test_armor_angles_and_component_weights_preserve_stock_types(self):
+        vehicle_root = packed.read_packed_xml(self.members[self.VEHICLE])
+        vehicle_root.children.extend((
+            (b"hull", element([
+                (b"weight", scalar(packed.TYPE_STRING, b"1650.5")),
+                (b"armor", element([
+                    (b"armor_1", scalar(packed.TYPE_STRING, b"16.5")),
+                ])),
+            ])),
+            (b"hull_aiming", element([
+                (b"pitch", element([
+                    (b"wheelsCorrectionAngles", element([
+                        (b"pitchMin", scalar(packed.TYPE_INTEGER, -11)),
+                        (b"pitchMax", scalar(packed.TYPE_INTEGER, 11)),
+                    ])),
+                ])),
+            ])),
+        ))
+        self.members[self.VEHICLE] = packed.write_packed_xml(vehicle_root)
+        self._write_package()
+
+        fields = vehicle_overlays.list_vehicle_field_choices(
+            self.game, self.VEHICLE)
+        paths = {record["fieldPath"]: record for record in fields}
+        expected = (
+            "hull/weight", "hull/armor/armor_1",
+            "chassis/T-18Bis/armor/leftTrack",
+            "turrets0/T-18_mod/weight",
+            "turrets0/T-18_mod/armor/armor_1",
+            "shared/Gun-A/armor/gun",
+            "shared/Gun-A/pitchLimits/minPitch",
+            "shared/Gun-A/pitchLimits/maxPitch",
+            "shared/Gun-A/turretYawLimits",
+            "hull_aiming/pitch/wheelsCorrectionAngles/pitchMin",
+            "hull_aiming/pitch/wheelsCorrectionAngles/pitchMax",
+        )
+        for field_path in expected:
+            self.assertIn(field_path, paths)
+        self.assertNotIn(
+            "turrets0/T-18_mod/armor/armor_2/vehicleDamageFactor", paths)
+        self.assertIn(
+            "Armor thickness (armor_1)",
+            paths["hull/armor/armor_1"]["fieldLabel"])
+
+        result = vehicle_overlays.apply_vehicle_edit(
+            self.game, self.GUNS,
+            "shared/Gun-A/pitchLimits/minPitch", "-12.5",
+            is_running=lambda: False)
+        self.assertEqual("0 -12.5 1 -12.5", result["currentValue"])
+        value = vehicle_overlays._find_value(
+            self._root(self.GUNS),
+            "shared/Gun-A/pitchLimits/minPitch")
+        self.assertEqual(packed.TYPE_STRING, value.value_type)
+        self.assertEqual(b"0 -12.5 1 -12.5", value.value)
+
+        vehicle_overlays.apply_vehicle_edit(
+            self.game, self.VEHICLE, "hull/armor/armor_1", "22.25",
+            is_running=lambda: False)
+        armor = vehicle_overlays._find_value(
+            self._root(self.VEHICLE), "hull/armor/armor_1")
+        self.assertEqual(packed.TYPE_STRING, armor.value_type)
+        self.assertEqual(b"22.25", armor.value)
+
+    def test_angle_relations_and_ranges_are_rejected_atomically(self):
+        refused = (
+            ("shared/Gun-A/pitchLimits/minPitch", "0 -10 0.5 -8"),
+            ("shared/Gun-A/pitchLimits/minPitch", "-91"),
+            ("shared/Gun-A/pitchLimits/minPitch", "25"),
+            ("shared/Gun-A/turretYawLimits", "20 -20"),
+            ("shared/Gun-A/turretYawLimits", "-181 20"),
+        )
+        for field_path, replacement in refused:
+            with self.assertRaises(vehicle_overlays.VehicleOverlayError,
+                                   msg=(field_path, replacement)):
+                vehicle_overlays.apply_vehicle_edit(
+                    self.game, self.GUNS, field_path, replacement,
+                    is_running=lambda: False)
+        self.assertFalse(os.path.exists(
+            vehicle_overlays.manifest_path(self.game)))
+
+    def test_siege_pair_exposes_mode_specific_angles_and_syncs_invariants(self):
+        self._install_siege_pair()
+
+        fields = vehicle_overlays.list_vehicle_field_choices(
+            self.game, self.SIEGE_VEHICLE)
+        hull_weight = next(
+            record for record in fields
+            if record["fieldPath"] == "hull/weight")
+        travel_pitch = next(
+            record for record in fields
+            if record["fieldPath"].endswith("pitchLimits/minPitch") and
+            record["mode"] == "travel")
+        siege_pitch = next(
+            record for record in fields
+            if record["fieldPath"].endswith("pitchLimits/minPitch") and
+            record["mode"] == "siege")
+
+        self.assertEqual("all", hull_weight["mode"])
+        self.assertEqual(self.SIEGE_MODE, hull_weight["pairedMember"])
+        self.assertIn("both the travel-mode and Siege-mode", hull_weight["scope"])
+        self.assertTrue(travel_pitch["fieldLabel"].startswith("Travel mode / "))
+        self.assertEqual("0 -1 1 -1", travel_pitch["originalValue"])
+        self.assertEqual(self.SIEGE_MODE, siege_pitch["member"])
+        self.assertTrue(siege_pitch["fieldLabel"].startswith("Siege mode / "))
+        self.assertEqual("0 -4 1 -4", siege_pitch["originalValue"])
+
+        vehicle_overlays.create_vehicle_profile(self.game, "Siege tuning")
+        vehicle_overlays.apply_profile_edit(
+            self.game, "Siege tuning", self.SIEGE_VEHICLE,
+            "hull/weight", "2500", is_running=lambda: False)
+        vehicle_overlays.apply_profile_edit(
+            self.game, "Siege tuning", self.SIEGE_MODE,
+            siege_pitch["fieldPath"], "-8", is_running=lambda: False)
+        self.assertFalse(os.path.exists(self._overlay(self.SIEGE_VEHICLE)))
+
+        self.assertEqual(2, vehicle_overlays.activate_vehicle_profile(
+            self.game, "Siege tuning", is_running=lambda: False))
+        self.assertEqual(2500, self._value(
+            self.SIEGE_VEHICLE, "hull/weight"))
+        self.assertEqual(2500, self._value(
+            self.SIEGE_MODE, "hull/weight"))
+        self.assertEqual(
+            b"0 -1 1 -1", self._value(
+                self.SIEGE_VEHICLE, travel_pitch["fieldPath"]))
+        self.assertEqual(
+            b"0 -8 1 -8", self._value(
+                self.SIEGE_MODE, siege_pitch["fieldPath"]))
 
     def test_vehicle_browser_resolves_shared_topology_and_impact(self):
         choices = vehicle_overlays.list_vehicle_choices(self.game)

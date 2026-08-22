@@ -136,6 +136,17 @@ class GarageState(object):
                 return record
         raise GarageError('unknown vehicle inventory id %d' % wanted)
 
+    def _record_by_vehicle_type(self, vehicle_type_compact_descr,
+                                touch=True):
+        wanted = _int(vehicle_type_compact_descr)
+        for record in self._records():
+            if _int(record.get('vehicleTypeCompactDescr', 0)) == wanted:
+                if touch:
+                    self._touched.add(_int(record.get('id', 0)))
+                return record
+        raise GarageError('unknown vehicle type compact descriptor %d' %
+                          wanted)
+
     def touched_vehicles(self):
         """Return the vehicle ids mutated since the last call, then reset."""
         touched = set(self._touched)
@@ -697,3 +708,60 @@ class GarageState(object):
             raise GarageError('the client refused crew training: %s' % error)
         self.revision += 1
         return record
+
+    def award_battle_crew_xp(self, vehicle_type_compact_descr, battle_xp,
+                             xp_to_tankman_flag):
+        """Apply one battle's crew XP and return the durable award summary.
+
+        Every crew member receives the battle XP.  On an elite vehicle with
+        accelerated training enabled, the vehicle XP is diverted to the least
+        experienced crew member as one additional equal award.  The offline
+        account publishes every vehicle as elite, so the persisted vehicle
+        setting is the remaining stock eligibility check.
+        """
+        amount = _int(battle_xp)
+        if amount < 0:
+            raise GarageError('battle crew XP cannot be negative')
+        record = self._record_by_vehicle_type(
+            vehicle_type_compact_descr, touch=False)
+        crew_ids = list(record.get('crew') or ())
+        tankman_rows = record.get('tankmen')
+        if not crew_ids or not isinstance(tankman_rows, dict):
+            raise GarageError('vehicle has no complete crew')
+
+        tankmen = self._tankmen_module()
+        descriptors = []
+        for slot, tankman_id in enumerate(crew_ids):
+            try:
+                descriptor = tankmen.TankmanDescr(tankman_rows[tankman_id])
+                total_xp = int(descriptor.totalXP())
+            except Exception as error:
+                raise GarageError(
+                    'the client refused battle crew XP: %s' % error)
+            descriptors.append((slot, tankman_id, total_xp, descriptor))
+
+        try:
+            setting_mask = int(record.get('settings', 0) or 0)
+            accelerated = bool(
+                setting_mask & max(0, _int(xp_to_tankman_flag)))
+        except (TypeError, ValueError):
+            accelerated = False
+        weakest = min(descriptors, key=lambda row: (row[2], row[0]))
+        try:
+            for unused_slot, unused_id, unused_total, descriptor in descriptors:
+                descriptor.addXP(amount)
+            if accelerated:
+                weakest[3].addXP(amount)
+            for unused_slot, tankman_id, unused_total, descriptor in descriptors:
+                tankman_rows[tankman_id] = descriptor.makeCompactDescr()
+        except Exception as error:
+            raise GarageError('the client refused battle crew XP: %s' % error)
+
+        vehicle_id = _int(record.get('id', 0))
+        self._touched.add(vehicle_id)
+        self.revision += 1
+        return {
+            'accelerated': accelerated,
+            'vehicle_id': vehicle_id,
+            'weakest_tankman_id': weakest[1] if accelerated else 0,
+        }

@@ -36,9 +36,10 @@ except NameError:
 # Schema 2 fixes schema 1's vehicle settings, which were stored as a shifted
 # bit index instead of a VEHICLE_SETTINGS_FLAG value.  Schema 3 drops files
 # written before every vehicle was fitted with its top modules and its three
-# consumables: a saved file covers the whole garage, so an older one would
-# restore the stock fitting over every new default.
-SCHEMA = 3
+# consumables.  Schema 4 adds the bounded receipt journal that makes battle
+# crew XP idempotent.  Schema 3 remains readable and upgrades on the next save.
+SCHEMA = 4
+READABLE_SCHEMAS = (3, SCHEMA)
 STATE_PATH = os.path.join(
     port_config.USER_DATA_DIR, 'garage_state.json')
 LEGACY_STATE_PATH = os.path.join(
@@ -47,6 +48,7 @@ LEGACY_STATE_PATH = os.path.join(
 _VEHICLE_INT_KEYS = ('eqs', 'eqsLayout', 'shells', 'shellsLayoutIdx')
 _ARTEFACT_ITEM_TYPES = (9, 10, 11)
 _CUSTOMIZATION_SEASONS = (1, 2, 4, 8, 15)
+MAX_BATTLE_RECEIPTS = 512
 
 
 def _log(message):
@@ -100,6 +102,8 @@ class GarageStore(object):
         self._path = (port_config.migrate_legacy_user_file(
             path, LEGACY_STATE_PATH) if path == STATE_PATH else path)
         self._dirty = False
+        self._battle_receipts = []
+        self._receipts_loaded = False
 
     # ---- writing --------------------------------------------------------
 
@@ -123,7 +127,7 @@ class GarageStore(object):
         self._dirty = False
         return True
 
-    def _payload(self, snapshot):
+    def _payload(self, snapshot, battle_receipts=None):
         vehicles = {}
         for record in _records(snapshot):
             key = record.get('vehicleTypeCompactDescr')
@@ -181,7 +185,58 @@ class GarageStore(object):
                     owned[str(item_type)] = dict(
                         (str(compact_descr), count)
                         for compact_descr, count in counts.items())
-        return {'schema': SCHEMA, 'vehicles': vehicles, 'owned': owned}
+        if battle_receipts is None:
+            battle_receipts = self._battle_receipts
+        return {
+            'schema': SCHEMA, 'vehicles': vehicles, 'owned': owned,
+            'battleCrewReceipts': list(battle_receipts)[
+                -MAX_BATTLE_RECEIPTS:],
+        }
+
+    def apply_battle_crew_xp(self, snapshot, receipt_id,
+                             vehicle_type_compact_descr, battle_xp,
+                             xp_to_tankman_flag, tankmen_module=None):
+        """Apply and persist one crew award exactly once.
+
+        The compact crew descriptors and their receipt marker share one JSON
+        replacement.  A receipt retried after a disconnect therefore either
+        applies the whole award or observes the durable marker; it can never
+        add the XP twice.
+        """
+        receipt_id = str(receipt_id or '')[:96]
+        if not receipt_id:
+            raise ValueError('battle crew receipt id is empty')
+        self._ensure_receipts_loaded()
+        for row in self._battle_receipts:
+            if row['receipt_id'] == receipt_id:
+                result = dict(row)
+                result['applied'] = False
+                return result
+
+        from gui.mods.offline_lan_0922.account_rpc.garage import GarageState
+        staged = copy.deepcopy(snapshot)
+        state = GarageState(staged, tankmen_module=tankmen_module)
+        result = state.award_battle_crew_xp(
+            vehicle_type_compact_descr, battle_xp, xp_to_tankman_flag)
+        staged = state.snapshot()
+        marker = {
+            'receipt_id': receipt_id,
+            'accelerated': bool(result['accelerated']),
+            'vehicle_id': int(result['vehicle_id']),
+        }
+        next_receipts = (list(self._battle_receipts) + [marker])[
+            -MAX_BATTLE_RECEIPTS:]
+        if self._path is not None:
+            port_config.write_json(
+                self._path, self._payload(staged, next_receipts))
+        snapshot.clear()
+        snapshot.update(staged)
+        self._battle_receipts = next_receipts
+        self._receipts_loaded = True
+        self._dirty = False
+        result['receipt_id'] = receipt_id
+        result['applied'] = True
+        return result
 
     # ---- reading --------------------------------------------------------
 
@@ -196,6 +251,7 @@ class GarageStore(object):
         """
         stored = self._read()
         if stored is None:
+            self._receipts_loaded = True
             return False
         staged = copy.deepcopy(snapshot)
         vehicles = stored.get('vehicles')
@@ -239,13 +295,50 @@ class GarageStore(object):
         except Exception as error:
             _log('the saved garage state is inconsistent; using the stock '
                  'garage (%s)' % error)
+            # Do not trust receipt markers whose matching crew descriptors
+            # could not be restored.  A pending server receipt may now safely
+            # rebuild the award on the fresh bootstrap garage.
+            self._battle_receipts = []
+            self._receipts_loaded = True
             return False
 
         snapshot.clear()
         snapshot.update(staged)
+        self._battle_receipts = self._validated_battle_receipts(
+            stored.get('battleCrewReceipts'))
+        self._receipts_loaded = True
         if applied:
             _log('restored the saved garage for %d vehicle(s)' % applied)
         return True
+
+    def _ensure_receipts_loaded(self):
+        if self._receipts_loaded:
+            return
+        stored = self._read()
+        if stored is not None:
+            self._battle_receipts = self._validated_battle_receipts(
+                stored.get('battleCrewReceipts'))
+        self._receipts_loaded = True
+
+    @staticmethod
+    def _validated_battle_receipts(value):
+        rows = []
+        for raw in value if isinstance(value, list) else ():
+            if not isinstance(raw, dict):
+                continue
+            receipt_id = str(raw.get('receipt_id') or '')[:96]
+            try:
+                vehicle_id = int(raw.get('vehicle_id', 0))
+            except (TypeError, ValueError):
+                continue
+            if not receipt_id or vehicle_id <= 0:
+                continue
+            rows.append({
+                'receipt_id': receipt_id,
+                'accelerated': bool(raw.get('accelerated', False)),
+                'vehicle_id': vehicle_id,
+            })
+        return rows[-MAX_BATTLE_RECEIPTS:]
 
     def _apply_vehicle(self, record, saved):
         changed = False
@@ -325,9 +418,10 @@ class GarageStore(object):
                 _log('the saved garage state has an unexpected shape; using '
                      'the stock garage')
                 continue
-            if value.get('schema') != SCHEMA:
-                _log('the saved garage state uses schema %r, not %d; using '
-                     'the stock garage' % (value.get('schema'), SCHEMA))
+            if value.get('schema') not in READABLE_SCHEMAS:
+                _log('the saved garage state uses schema %r, not one of %r; '
+                     'using the stock garage' % (
+                         value.get('schema'), READABLE_SCHEMAS))
                 return None
             return value
         return None

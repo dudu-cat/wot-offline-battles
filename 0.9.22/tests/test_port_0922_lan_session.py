@@ -61,6 +61,8 @@ class _Client(object):
         self.max_health = max_health
         self.on_event = on_event
         self.player_id = 'p1'
+        self.team = 1
+        self.team_sizes = {1: 2, 2: 5}
         self.host_player_id = 'p1'
         self.phase = 'waiting'
         self.map_pool = []
@@ -73,6 +75,7 @@ class _Client(object):
         self.leave_calls = 0
         self.requests = []
         self.selections = []
+        self.team_selections = []
         self.descriptor_bundles = []
         self.receipt_acks = []
 
@@ -99,6 +102,15 @@ class _Client(object):
         self.selections.append((vehicle, max_health))
         self.vehicle = vehicle
         self.max_health = max_health
+        return True
+
+    def has_team_selection(self):
+        return True
+
+    def select_team(self, team):
+        if not self.ready or self.phase != 'waiting':
+            return False
+        self.team_selections.append(team)
         return True
 
     def send_descriptor_bundle(self, projections, requested=None,
@@ -265,6 +277,17 @@ class LANSessionTests(unittest.TestCase):
         if 'players' in message:
             self.client.roster = list(message['players'])
         self.client.on_event(kind, message)
+
+    def test_waiting_room_team_selection_reaches_the_client(self):
+        self.client.ready = True
+        self.client.phase = 'waiting'
+        self.session.state = 'waiting'
+
+        self.assertTrue(self.session.select_team(2))
+
+        self.assertEqual([2], self.client.team_selections)
+        self.assertEqual(
+            {1: 0, 2: 0}, self.session._team_status()['counts'])
 
     def test_postbattle_request_retries_after_failure_then_completes_once(self):
         class Store(object):

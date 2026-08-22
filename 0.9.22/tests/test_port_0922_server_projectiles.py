@@ -12,7 +12,8 @@ from lan_battle_server import (  # noqa: E402
     BattleState, CLIENT_BUILD_082, CLIENT_BUILD_0922, MAX_LINE_BYTES,
     DESTRUCTIBLE_CATALOG_V5_CAPABILITY, PREBATTLE_SECONDS,
     PROJECTILE_CAPABILITY, PROJECTILE_MAX_ACTIVE,
-    Player, TICK_HZ,
+    Player, SIEGE_DISABLED, SIEGE_ENABLED, SIEGE_SWITCHING_OFF,
+    SIEGE_SWITCHING_ON, SIEGE_VEHICLE_PARAMS, TICK_HZ,
 )
 
 
@@ -96,6 +97,93 @@ def _destructible(chunk_id=7, item_index=3, **changes):
 
 
 class ServerProjectileLedgerTests(unittest.TestCase):
+    def test_1513_siege_transition_is_server_owned_and_caps_speed(self):
+        state = _state()
+        player = state.players[1]
+        player.vehicle = 'sweden:S21_UDES_03'
+
+        state.update_input(1, {
+            'round_id': state.round_id, 'siege_enabled': True,
+            'speed': 99.0})
+
+        self.assertEqual(SIEGE_SWITCHING_ON, player.siege_state)
+        self.assertEqual(60, player.siege_transition_ticks)
+        self.assertEqual(2000, state._public_player(
+            player)['siege_time_left_ms'])
+        for unused_tick in range(59):
+            state._advance_siege_states()
+        self.assertEqual(SIEGE_SWITCHING_ON, player.siege_state)
+        state._advance_siege_states()
+        self.assertEqual(SIEGE_ENABLED, player.siege_state)
+
+        state.update_input(1, {
+            'round_id': state.round_id, 'speed': 99.0})
+        self.assertAlmostEqual(5.0 / 3.6, player.speed)
+        state.update_input(1, {
+            'round_id': state.round_id, 'siege_enabled': False})
+        self.assertEqual(SIEGE_SWITCHING_OFF, player.siege_state)
+        for unused_tick in range(60):
+            state._advance_siege_states()
+        self.assertEqual(SIEGE_DISABLED, player.siege_state)
+        self.assertEqual(0, state._public_player(
+            player)['siege_time_left_ms'])
+
+    def test_1513_siege_vehicle_table_matches_pinned_xml(self):
+        self.assertEqual(
+            (2.0, 1.3, 10.0 / 3.6, 2.0),
+            SIEGE_VEHICLE_PARAMS['sweden:S10_Strv_103_0_Series'])
+        self.assertEqual(
+            (2.0, 1.3, 10.0 / 3.6, 2.0),
+            SIEGE_VEHICLE_PARAMS['sweden:S11_Strv_103B'])
+        self.assertEqual(
+            (2.0, 2.0, 5.0 / 3.6, 2.0),
+            SIEGE_VEHICLE_PARAMS['sweden:S21_UDES_03'])
+        self.assertEqual(
+            (2.0, 1.3, 8.0 / 3.6, 2.0),
+            SIEGE_VEHICLE_PARAMS['sweden:S22_Strv_S1'])
+
+    def test_siege_request_rejects_non_bool_and_destroyed_engine(self):
+        state = _state()
+        player = state.players[1]
+        player.vehicle = 'sweden:S11_Strv_103B'
+
+        state.update_input(1, {
+            'round_id': state.round_id, 'siege_enabled': 1})
+        self.assertEqual(SIEGE_DISABLED, player.siege_state)
+        player.critical = {
+            'destroyed': ['engineHealth'], 'devices': []}
+        state.update_input(1, {
+            'round_id': state.round_id, 'siege_enabled': True})
+        self.assertEqual(SIEGE_DISABLED, player.siege_state)
+
+    def test_damaged_engine_uses_pinned_siege_transition_coefficient(self):
+        state = _state()
+        player = state.players[1]
+        player.vehicle = 'sweden:S11_Strv_103B'
+        player.critical = {
+            'destroyed': [],
+            'devices': [{
+                'name': 'engineHealth', 'state': 'critical',
+                'hp': 20.0, 'max_hp': 100.0,
+            }],
+        }
+
+        state.update_input(1, {
+            'round_id': state.round_id, 'siege_enabled': True})
+
+        self.assertEqual(SIEGE_SWITCHING_ON, player.siege_state)
+        self.assertEqual(120, player.siege_transition_ticks)
+
+    def test_player_projectile_is_rejected_while_siege_mode_switches(self):
+        state = _state()
+        player = state.players[1]
+        player.vehicle = 'sweden:S22_Strv_S1'
+        player.siege_state = SIEGE_SWITCHING_ON
+
+        self.assertFalse(state.launch_projectile(1, _launch()))
+        player.siege_state = SIEGE_ENABLED
+        self.assertTrue(state.launch_projectile(1, _launch()))
+
     def test_modern_player_launch_is_atomic_and_idempotent(self):
         state = _state()
         message = _launch()
@@ -337,11 +425,20 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                          [event['kind'] for event in events])
         self.assertTrue(events[1]['hit_vehicle'])
         self.assertEqual('shot', events[-1]['source'])
+        outgoing = state.vehicle_interactions[
+            ('player', 1)]['player:2']
+        incoming = state.vehicle_interactions[
+            ('player', 2)]['player:1']
+        self.assertEqual(1, outgoing['direct_hits'])
+        self.assertEqual(1, outgoing['piercings'])
+        self.assertEqual(100, outgoing['damage'])
+        self.assertEqual(100, incoming['damage_received'])
 
         event_count = len(state.pending_events)
         self.assertTrue(state.resolve_projectile(1, dict(message)))
         self.assertEqual(900, state.players[2].health)
         self.assertEqual(event_count, len(state.pending_events))
+        self.assertEqual(100, outgoing['damage'])
         self.assertFalse(state.resolve_projectile(
             1, dict(message, checked_distance=11.0)))
 
@@ -372,6 +469,11 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             if value.get('kind') == 'hit')
         self.assertEqual(200, event['damage'])
         self.assertEqual(0, event['health'])
+        interaction = state.vehicle_interactions[
+            ('player', 1)]['player:2']
+        self.assertEqual(200, interaction['damage'])
+        self.assertEqual(1, interaction['target_kills'])
+        self.assertEqual(0, interaction['death_reason'])
 
     def test_he_direct_target_cannot_repeat_in_splash(self):
         state = _state(players=3)

@@ -40,6 +40,21 @@ def wire_copy(value):
 
 
 class ProjectileWireTests(unittest.TestCase):
+    def test_player_siege_snapshot_pair_is_strict_when_present(self):
+        self.assertTrue(module._valid_player_siege_contract({}))
+        self.assertTrue(module._valid_player_siege_contract({
+            'siege_state': 1, 'siege_time_left_ms': 2000}))
+        self.assertTrue(module._valid_player_siege_contract({
+            'siege_state': 2, 'siege_time_left_ms': 0}))
+        self.assertFalse(module._valid_player_siege_contract({
+            'siege_state': 1, 'siege_time_left_ms': 0}))
+        self.assertFalse(module._valid_player_siege_contract({
+            'siege_state': 2, 'siege_time_left_ms': 1}))
+        self.assertFalse(module._valid_player_siege_contract({
+            'siege_state': True, 'siege_time_left_ms': 0}))
+        self.assertFalse(module._valid_player_siege_contract({
+            'siege_state': 0}))
+
     def active_client(self):
         client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
         client.sock = RecordingSocket()

@@ -126,7 +126,12 @@ class BigWorldVehicleBinding(object):
         self._need(self._constants.ARENA_PERIOD, 'PREBATTLE')
         self._need(self._constants.ARENA_PERIOD, 'BATTLE')
         self._need(self._constants.VEHICLE_PHYSICS_MODE, 'STANDARD')
-        self._need(self._constants.VEHICLE_SIEGE_STATE, 'DISABLED')
+        for name in ('DISABLED', 'SWITCHING_ON', 'ENABLED',
+                     'SWITCHING_OFF'):
+            self._need(self._constants.VEHICLE_SIEGE_STATE, name)
+        self._need(
+            self._constants.VEHICLE_MISC_STATUS,
+            'SIEGE_MODE_STATE_CHANGED')
         if not callable(self._vehicle_descr_class):
             raise CapabilityError('VehicleDescr factory is unavailable')
         if not callable(self._encode_gun_angles):
@@ -381,6 +386,57 @@ class BigWorldVehicleBinding(object):
         notifier = getattr(entity, 'set_gunAnglesPacked', None)
         if callable(notifier):
             notifier(previous)
+
+    def update_vehicle_siege_state(self, entity_id, state,
+                                   time_to_next_mode):
+        """Drive the exact ``Vehicle.onSiegeStateUpdated`` consumer.
+
+        The retail server owns the four-state transition.  Client-created
+        entities have no real cell property stream, so the LAN snapshot must
+        assign ``siegeState`` and reproduce its consumer edge.  The player
+        takes the exact ``Avatar.updateVehicleMiscStatus`` route (HUD, cruise
+        reset, movement re-sample, then ``Vehicle.onSiegeStateUpdated``);
+        remote vehicles take the property callback directly.
+        """
+        states = self._constants.VEHICLE_SIEGE_STATE
+        allowed = (states.DISABLED, states.SWITCHING_ON,
+                   states.ENABLED, states.SWITCHING_OFF)
+        self._require_int('siegeState', state, 0, 255)
+        if state not in allowed:
+            raise CapabilityError('Vehicle siegeState is unsupported')
+        self._require_number('siege transition time', time_to_next_mode)
+        time_to_next_mode = float(time_to_next_mode)
+        switching = state in (states.SWITCHING_ON, states.SWITCHING_OFF)
+        if ((switching and time_to_next_mode <= 0.0) or
+                (not switching and time_to_next_mode != 0.0)):
+            raise CapabilityError('Vehicle siege transition time is invalid')
+        entity = self._authority_entity_or_fail(entity_id)
+        descriptor = self._need(entity, 'typeDescriptor')
+        has_siege_mode = bool(getattr(descriptor, 'hasSiegeMode', False))
+        if not has_siege_mode:
+            if state != states.DISABLED:
+                raise CapabilityError(
+                    'Vehicle without Siege mode received an active state')
+            return False
+        self._need(entity, 'siegeState')
+        previous = entity.siegeState
+        entity.siegeState = state
+        try:
+            if entity_id == self._avatar.playerVehicleID:
+                updater = self._need(
+                    self._avatar, 'updateVehicleMiscStatus')
+                updater(
+                    entity_id,
+                    self._constants.VEHICLE_MISC_STATUS.
+                    SIEGE_MODE_STATE_CHANGED,
+                    state, (time_to_next_mode,))
+            else:
+                callback = self._need(entity, 'onSiegeStateUpdated')
+                callback(state, time_to_next_mode)
+        except Exception:
+            entity.siegeState = previous
+            raise
+        return previous != state
 
     def send_vehicle_input(self, entity_id, command):
         if self._server_input is None:

@@ -1,4 +1,4 @@
-'''Uniform vehicle-physics laws for the offhangar mod (WoT 0.8.2 faithful).
+'''Uniform vehicle-physics laws for the offhangar mod (WoT 0.9.22 #1513).
 
 ONE set of formulas, applied identically to the player and every bot. All
 inputs come from the REAL vehicle descriptor (td.physics, built by
@@ -28,38 +28,28 @@ G = 9.81
 GRAVITY_FACTOR = 1.25          # WG: tanks live under 1.25 g 'arcade gravity'
 GRAVITY = G * GRAVITY_FACTOR   # 12.26 m/s^2 - falls, slopes, all force laws
 COHESION = 1.3                 # WG: physics.brakeFriction (brake/hold grip)
-# Drive (pulling) traction coefficient - track-vs-ground grip for CLIMBING.
-# Lower than the brake COHESION on purpose: a tank locks and holds a slope it
-# cannot power up.
-#
-# CALIBRATION (do not 'simplify' this to atan(DRIVE_TRACTION)): the drive is cut
-# when  DRIVE_TRACTION*g*cos(t) < g*sin(t) + rr,  so the EFFECTIVE limit is
-#     tan(t_max) = DRIVE_TRACTION - rr/(g*cos t)
-# and rolling resistance is NOT negligible: rr = specificFriction*GRAVITY_FACTOR
-# = 0.6867*1.25 = 0.86 m/s^2 on firm ground, i.e. it eats ~3.7 deg. Measured:
-#     0.43 -> 19.6 deg     0.47 -> 21.5 deg     0.54 -> 24.8 deg
-# WG's own threshold is physics_shared.RISE_FRICTION_Y = 0.906 = cos(25.04 deg)
-# (below that normal.y it applies RISE_FRICTION = 50.0, i.e. a wall), and 0.8.2
-# chassis maxClimbAngle is 25 deg. So 0.54 reproduces the stock climb ceiling;
-# lower values refuse slopes the map designers built to be drivable (Dragon Ridge
-# became near-unplayable at 0.43 = 19.6 deg). Raise drive_traction in config to
-# climb steeper.
-DRIVE_TRACTION = 0.54
+# Exact #1513 ``g_defaultTankXPhysicsCfg`` supplies longitudinal terrain grip
+# as a two-point curve over the ground normal's Y component. It keeps full
+# grip through 27.5 degrees, then linearly falls to 0.1 at 32 degrees. The
+# previous port retained a fixed 0.54 coefficient from the 0.8.2 model; after
+# rolling drag that cut drive around 24.8 degrees, before the #1513 curve even
+# starts releasing grip. ``DRIVE_TRACTION`` remains a live-tuning multiplier,
+# but its stock value must leave the recovered native curve unchanged.
+DRIVE_TRACTION = 1.0
+SLOPE_GRIP_LNG_FULL_Y = math.cos(math.radians(27.5))
+SLOPE_GRIP_LNG_FULL = 1.0
+SLOPE_GRIP_LNG_MIN_Y = math.cos(math.radians(32.0))
+SLOPE_GRIP_LNG_MIN = 0.1
 # Track-slip drag when rolling UP a grade past SLIP_THRESHOLD_TAN: extra
 # deceleration = SLIP_DRAG * (tan(grade) - SLIP_THRESHOLD_TAN) * g. Bleeds the
 # 'coast up a mountain on momentum' - real tracks slip and stop dead.
 #
-# The threshold must sit just above the EFFECTIVE climb limit (see DRIVE_TRACTION),
-# NOT above the naive atan(DRIVE_TRACTION). Any gap between the two is a window
-# where the drive is already cut but nothing bleeds speed - free momentum coasting.
-# That window, not a high climb ceiling, was what let a tank rush the Serene Coast
-# mountain: 0.47/0.50 left 21.5..26.6 deg (5.0 deg) wide open. 0.54/0.48 leaves
-# 24.8..25.6 deg = 0.8 deg, so momentum can no longer cheat a slope the engine
-# refuses.
-# SLIP_DRAG shapes the ramp above the threshold. 20.0 was a cliff (20 m/s^2 by
-# 28 deg) that killed every partial climb; 10.0 stays progressive - ~0.9 m/s^2 at
-# 26 deg (a near-limit slope still feels dynamic), 11.9 at 30 deg, 27 at 35 deg.
-SLIP_THRESHOLD_TAN = 0.48   # 25.6 deg: just above the 24.8 deg effective climb limit
+# The #1513 longitudinal grip starts falling at 27.5 degrees. Momentum bleed
+# starts at the same point: starting it at the former 25.6-degree threshold
+# made a still-full-grip native slope lose several m/s2 for no retail reason.
+# SLIP_DRAG shapes the ramp above the threshold. 10.0 stays progressive:
+# about 1.4 m/s2 at 28 degrees, 7.0 at 30 degrees and 22 at 35 degrees.
+SLIP_THRESHOLD_TAN = math.tan(math.radians(27.5))
 SLIP_DRAG = 10.0
 FORWARD_FRICTION = 0.07        # WG: physics.forwardFriction (rolling)
 # WG scales enginePower by GRAVITY_FACTOR_SCALED (0.00125) against masses in
@@ -69,11 +59,8 @@ BKWD_POWER_FRACTION = 1.0      # WG: reverse gets FULL engine power in 0.8.2
 ANG_ACCELERATION_TIME = 0.05   # WG: hull traverse reaches full rate in 50 ms
 SPEED_AFFECT_ROT_DECREASE = 0.0  # WG: driving speed does NOT slow the traverse
 ROTATION_POWER_FRACTION = 0.85   # WG: rotation may use 85% of engine power
-# WG slope-grip laws (physics_shared): track cohesion decays with the ground
-# normal - cubically below normal.y 0.969 (~14 deg), an extra 0.25 beyond
-# normal.y 0.72 (~44 deg), floored at 0.5. Per vehicle, chassis maxClimbAngle
-# (25 deg across 0.8.2 -> minPlaneNormalY = cos = 0.906) is the HARD climb
-# limit: steeper ground gives the engine no traction at all.
+# The brake/hold cohesion approximation is separate from #1513's recovered
+# longitudinal pulling-grip curve above.
 COH_DECAY_Y = 0.969
 COH_DECAY_FACTOR = 5.78
 COH_DECAY_POW = 3.0
@@ -113,7 +100,7 @@ SLIDE_DRAG = 1.5
 # the tracks perch only up to ~atan(SLIDE_HOLD_TAN); steeper ground slides off.
 # Gentler than the brake COHESION (~52 deg) so a tank cannot cling to steep
 # banks/cliffs. Deceleration (braking/coast) still uses the full COHESION grip.
-SLIDE_HOLD_TAN = 0.50   # 26.6 deg static perch - must exceed the 24.8 deg climb limit, else a hull slides off the very slope it just drove up
+SLIDE_HOLD_TAN = 0.50   # 26.6 deg static perch; a powered hull can briefly climb beyond the angle it can hold after release
 # Kinetic (slipping) track drag while the hull slides BACK down a grade it could
 # not climb - lower than the static hold so it does not hang mid-slope; it bleeds
 # down to the foot at a controlled speed. Lower = slides faster/further.
@@ -350,7 +337,8 @@ def derive_params(td, factors=None):
 			if 0.3 <= tc <= 3.0:
 				p['trackCenter'] = tc
 		if 'minPlaneNormalY' in tdp:
-			# = cos(chassis maxClimbAngle); the vehicle's hard climb limit
+			# Legacy descriptor observation retained for telemetry/compatibility.
+			# Detailed #1513 drive grip comes from the common curve above.
 			p['minPlaneNormalY'] = float(tdp['minPlaneNormalY'])
 	except Exception:
 		pass
@@ -389,20 +377,37 @@ def derive_params(td, factors=None):
 	return p
 
 
+def longitudinal_slope_grip(slope_pitch):
+	'''Return #1513's terrain pulling grip for this fore/aft slope.
+
+	The native configuration stores the curve as ``(normalY, grip)`` pairs and
+	the #1513 executable evaluates those pairs with clamped linear
+	interpolation. Ground flatter than 27.5 degrees therefore keeps grip 1.0;
+	ground at or beyond 32 degrees keeps only 0.1. ``DRIVE_TRACTION`` is an
+	explicit tuning multiplier around that recovered stock curve.
+	'''
+	ny = math.cos(slope_pitch)
+	if ny >= SLOPE_GRIP_LNG_FULL_Y:
+		grip = SLOPE_GRIP_LNG_FULL
+	elif ny <= SLOPE_GRIP_LNG_MIN_Y:
+		grip = SLOPE_GRIP_LNG_MIN
+	else:
+		span = SLOPE_GRIP_LNG_FULL_Y - SLOPE_GRIP_LNG_MIN_Y
+		progress = (ny - SLOPE_GRIP_LNG_MIN_Y) / span
+		grip = (SLOPE_GRIP_LNG_MIN + progress *
+			(SLOPE_GRIP_LNG_FULL - SLOPE_GRIP_LNG_MIN))
+	return grip * DRIVE_TRACTION
+
+
 def engine_force(p, v, throttle, slope_pitch=0.0):
 	'''F = P_eff / max(|v|, v_min), TRACTION-capped. P_eff = powerW x
 	POWER_FACTOR (WG scales engine power by GRAVITY_FACTOR). Reverse gets
-	BKWD_POWER_FRACTION (1.0 in 0.8.2 = full power).
+	BKWD_POWER_FRACTION (1.0 = full power).
 
-	Drive force can never exceed the DRIVE TRACTION on the current slope:
-	fmax = DRIVE_TRACTION * m * g * cos(theta) = drive traction x normal force.
-	DRIVE_TRACTION (0.54) is the track-vs-ground grip for PULLING, distinct
-	from and lower than the brake/hold COHESION (1.3): a tank can lock its
-	tracks and hold a slope it cannot power UP. This makes the climb limit
-	emergent AND realistic (~atan(0.54) ~= 28 deg before rolling resistance):
-	steeper than the resulting roughly 25-degree practical limit the
-	grip-limited drive can't beat m*g*sin(theta), the hull stalls - it does NOT
-	climb 40-50 deg walls the way a cohesion(1.3) cap wrongly allowed.'''
+	Drive force can never exceed the #1513 longitudinal terrain-grip curve
+	times the current normal force. The curve stays at 1.0 through 27.5 degrees
+	and releases to 0.1 at 32 degrees, so the selected engine and installed
+	mass govern ordinary climbs while very steep faces still lose drive.'''
 	if throttle == 0:
 		return 0.0
 	pw = p['powerW'] * POWER_FACTOR * p.get('nativePowerRatio', 1.0)
@@ -410,7 +415,8 @@ def engine_force(p, v, throttle, slope_pitch=0.0):
 		pw *= BKWD_POWER_FRACTION
 	f = pw / max(abs(v), ENGINE_MIN_V)
 	ny = math.cos(slope_pitch)
-	fmax = DRIVE_TRACTION * p['mass'] * GRAVITY * (ny if ny > 0.1 else 0.1)
+	fmax = (longitudinal_slope_grip(slope_pitch) * p['mass'] * GRAVITY *
+		(ny if ny > 0.1 else 0.1))
 	if f > fmax:
 		f = fmax
 	# The climb LIMIT is not a hard gate here (that oscillated at the boundary); it
@@ -497,7 +503,8 @@ def longitudinal_step(p, v, throttle, steering, slope_pitch, dt,
 		# foot of a descent' bug). Replaces the hard minPlaneNormalY gate the hull used
 		# to oscillate across.
 		_ny_c = math.cos(slope_pitch)
-		_max_climb = DRIVE_TRACTION * GRAVITY * (_ny_c if _ny_c > 0.1 else 0.1)
+		_max_climb = (longitudinal_slope_grip(slope_pitch) * GRAVITY *
+			(_ny_c if _ny_c > 0.1 else 0.1))
 		_cant_climb = throttle * grav_a < 0.0 and _max_climb < abs(grav_a) + rr
 		if _cant_climb:
 			_ef = 0.0                                  # can't power up -> cut drive; momentum does not drive the hull up a too-steep grade
@@ -693,4 +700,3 @@ def fall_damage(maxHealth, impact_speed):
 	if iv <= FALL_SAFE_SPEED:
 		return 0
 	return int(maxHealth * (iv - FALL_SAFE_SPEED) * FALL_DMG_PER_MS)
-

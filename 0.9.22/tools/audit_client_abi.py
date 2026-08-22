@@ -13,9 +13,15 @@ import json
 import marshal
 import opcode
 import os
+import struct
 import sys
 import types
 import zipfile
+
+try:
+    from cStringIO import StringIO
+except ImportError:
+    from io import BytesIO as StringIO
 
 
 EXPECTED_ABI = {
@@ -93,9 +99,12 @@ EXPECTED_ABI = {
             'itemTypeName', 'nationID', 'itemID'),
     },
     'scripts/common/items/vehicles.pyc': {
+        '_readSiegeModeParams': ('xmlCtx', 'section', 'vehType'),
         'VehicleDescr': ('compactDescr', 'typeID', 'typeName'),
         'getDefaultAmmoForGun': ('gunDescr',),
         'VehicleDescriptor.getHitTesters': ('self',),
+        'CompositeVehicleDescriptor.onSiegeStateChanged': (
+            'self', 'siegeMode'),
         'VehicleDescriptor.computeBaseInvisibility': (
             'self', 'crewFactor', 'camouflageId'),
         'getItemByCompactDescr': ('compactDescr',),
@@ -429,6 +438,7 @@ EXPECTED_ABI = {
         'PlayerAvatar.autoAim': ('self', 'target'),
         'PlayerAvatar.targetFocus': ('self', 'entity'),
         'PlayerAvatar.shoot': ('self', 'isRepeat'),
+        'PlayerAvatar.__isOwnVehicleSwitchingSiegeMode': ('self',),
         'PlayerAvatar.cancelWaitingForShot': ('self',),
         'PlayerAvatar.__showTimedOutShooting': ('self',),
         'PlayerAvatar.vehicle_onEnterWorld': ('self', 'vehicle'),
@@ -450,6 +460,8 @@ EXPECTED_ABI = {
             'self', 'vehicleID', 'code', 'value'),
         'PlayerAvatar.updateVehicleMiscStatus': (
             'self', 'vehicleID', 'code', 'intArg', 'floatArgs'),
+        'PlayerAvatar.__onSiegeStateUpdated': (
+            'self', 'vehicleID', 'newState', 'timeToNextState'),
         'PlayerAvatar.updateVehicleDestroyTimer': (
             'self', 'code', 'period', 'warnLvl'),
         'PlayerAvatar.showVehicleDamageInfo': (
@@ -478,6 +490,7 @@ EXPECTED_ABI = {
         'PlayerAvatar.onRoundFinished': ('self', 'winnerTeam', 'reason'),
     },
     'scripts/client/AvatarInputHandler/__init__.pyc': {
+        'AvatarInputHandler.__constructComponents': ('self',),
         'AvatarInputHandler.onControlModeChanged': (
             'self', 'eMode', '**args'),
         'AvatarInputHandler.activatePostmortem': (
@@ -491,11 +504,20 @@ EXPECTED_ABI = {
         '_Targeting.enable': ('self', 'flag'),
         '_Targeting.onRecreateDevice': ('self',),
     },
+    'scripts/client/AvatarInputHandler/commands/siege_mode_control.pyc': {
+        'SiegeModeControl.handleKeyEvent': (
+            'self', 'isDown', 'key', 'mods', 'event'),
+        'SiegeModeControl.notifySiegeModeChanged': (
+            'self', 'vehicle', 'newState', 'timeToNextMode'),
+        'SiegeModeControl.__switchSiegeMode': ('self',),
+    },
     'scripts/client/AvatarInputHandler/control_modes.pyc': {
         'ArcadeControlMode.handleKeyEvent': (
             'self', 'isDown', 'key', 'mods', 'event'),
         'SniperControlMode.handleKeyEvent': (
             'self', 'isDown', 'key', 'mods', 'event'),
+        'SniperControlMode.__siegeModeStateChanged': (
+            'self', 'newState', 'timeToNewMode'),
         'PostMortemControlMode.enable': ('self', '**args'),
         'PostMortemControlMode.handleKeyEvent': (
             'self', 'isDown', 'key', 'mods', 'event'),
@@ -524,6 +546,9 @@ EXPECTED_ABI = {
         'Vehicle.set_health': ('self', 'prev'),
         'Vehicle.set_isCrewActive': ('self', 'prev'),
         'Vehicle.set_gunAnglesPacked': ('self', 'prev'),
+        'Vehicle.set_siegeState': ('self', 'prev'),
+        'Vehicle.onSiegeStateUpdated': (
+            'self', 'newState', 'timeToNextMode'),
         'Vehicle.getServerGunAngles': ('self',),
         'Vehicle.getAimParams': ('self',),
         'Vehicle.collideSegmentExt': ('self', 'startPoint', 'endPoint'),
@@ -831,6 +856,12 @@ EXPECTED_CODE_LITERALS = {
         'NoLegacyStuff.values': ('Operation is not supported',),
         'NoLegacyStuff.items': ('Operation is not supported',),
     },
+    'scripts/common/items/vehicles.pyc': {
+        '_readSiegeModeParams': (
+            'siege_mode', 'switchOnTime', 'switchOffTime',
+            'switchCancelEnabled', 'engineDamageCoeff', 'normal',
+            'critical', 'destroyed'),
+    },
     'scripts/client/Avatar.pyc': {
         'PlayerAvatar.__onSetOwnVehicleAuxPhysicsData': (
             'syncStabilisedYPR',),
@@ -912,8 +943,14 @@ EXPECTED_CODE_NAMES = {
         'ModelHitTester.releaseBspModel': ('bbox',),
     },
     'scripts/common/items/vehicles.pyc': {
+        '_readSiegeModeParams': (
+            'readNonNegativeFloat', 'readBool', 'False', 'IS_CLIENT',
+            'VEHICLE_SIEGE_STATE', 'SWITCHING_ON', 'SWITCHING_OFF'),
         'VehicleDescriptor.getHitTesters': (
             'chassis', 'hull', 'turrets', 'hitTester', 'append'),
+        'CompositeVehicleDescriptor.onSiegeStateChanged': (
+            'VEHICLE_SIEGE_STATE', 'ENABLED', 'VEHICLE_MODE', 'SIEGE',
+            'DEFAULT'),
     },
     'scripts/common/physics_shared.pyc': {
         'configurePhysicsMode': (
@@ -1015,7 +1052,11 @@ EXPECTED_CODE_NAMES = {
             '_PlayerAvatar__vehicles', 'guiSessionProvider',
             'setTargetInFocus', 'drawEdge'),
         'PlayerAvatar.shoot': (
-            'base', 'vehicle_shoot', '_PlayerAvatar__startWaitingForShot'),
+            'base', 'vehicle_shoot', '_PlayerAvatar__startWaitingForShot',
+            '_PlayerAvatar__isOwnVehicleSwitchingSiegeMode'),
+        'PlayerAvatar.__isOwnVehicleSwitchingSiegeMode': (
+            'BigWorld', 'entity', 'playerVehicleID', 'isStarted',
+            'siegeState', 'VEHICLE_SIEGE_STATE', 'SWITCHING'),
         'PlayerAvatar.__showTimedOutShooting': (
             'typeDescriptor', 'gun', 'burst', 'showShooting'),
         'PlayerAvatar.cancelWaitingForShot': (
@@ -1023,7 +1064,13 @@ EXPECTED_CODE_NAMES = {
             'targetLastShotPoint'),
         'PlayerAvatar.updateVehicleMiscStatus': (
             'VEHICLE_MISC_STATUS', 'VEHICLE_DROWN_WARNING',
-            'updateVehicleDestroyTimer'),
+            'updateVehicleDestroyTimer', 'SIEGE_MODE_STATE_CHANGED',
+            'VEHICLE_SIEGE_STATE', 'SWITCHING_ON', 'SWITCHING_OFF',
+            'moveVehicleByCurrentKeys', 'SIEGE_MODE',
+            '_PlayerAvatar__onSiegeStateUpdated'),
+        'PlayerAvatar.__onSiegeStateUpdated': (
+            'BigWorld', 'entity', 'typeDescriptor', 'hasSiegeMode',
+            'onSiegeStateUpdated', 'isPlayerVehicle'),
         'PlayerAvatar.updateVehicleDestroyTimer': (
             'DROWN_WARNING_LEVEL', 'DANGER', 'CAUTION',
             'guiSessionProvider', 'invalidateVehicleState'),
@@ -1058,6 +1105,9 @@ EXPECTED_CODE_NAMES = {
         'SniperControlMode.handleKeyEvent': (
             'CMD_CM_LOCK_TARGET', 'BigWorld', 'target', 'autoAim',
             'CMD_CM_LOCK_TARGET_OFF'),
+        'SniperControlMode.__siegeModeStateChanged': (
+            'VEHICLE_SIEGE_STATE', 'ENABLED', 'DISABLED', '_cam',
+            'aimingSystem', 'forceFullStabilization'),
         'PostMortemControlMode.enable': (
             '_PostMortemControlMode__cam', 'consistentMatrices',
             'attachedVehicleMatrix', 'vehicleMProv', 'PostmortemDelay',
@@ -1086,6 +1136,9 @@ EXPECTED_CODE_NAMES = {
             '_PostmortemDelay__setCameraSettings'),
     },
     'scripts/client/AvatarInputHandler/__init__.pyc': {
+        'AvatarInputHandler.__constructComponents': (
+            'vehicleTypeDescriptor', 'hasSiegeMode', 'SiegeModeControl',
+            'siegeModeControl', 'onSiegeStateChanged'),
         'AvatarInputHandler.getAutorotation': (
             '_AvatarInputHandler__isAutorotation',),
         'AvatarInputHandler.setAutorotation': (
@@ -1106,6 +1159,19 @@ EXPECTED_CODE_NAMES = {
             'BigWorld', 'target', 'isEnabled', 'source', 'clear'),
         '_Targeting.onRecreateDevice': (
             'BigWorld', 'target', 'isEnabled', 'clear'),
+    },
+    'scripts/client/AvatarInputHandler/commands/siege_mode_control.pyc': {
+        'SiegeModeControl.handleKeyEvent': (
+            'CommandMapping', 'g_instance', 'isFired',
+            'CMD_CM_VEHICLE_SWITCH_AUTOROTATION', 'BigWorld', 'player',
+            'getVehicleAttached', 'isAlive'),
+        'SiegeModeControl.notifySiegeModeChanged': (
+            'isPlayerVehicle', 'onSiegeStateChanged'),
+        'SiegeModeControl.__switchSiegeMode': (
+            'BigWorld', 'player', 'deviceStates',
+            'VEHICLE_SIEGE_STATE', 'SWITCHING', 'SWITCHING_ON', 'ENABLED',
+            'vehicle_changeSetting', 'VEHICLE_SETTING',
+            'SIEGE_MODE_ENABLED'),
     },
     'scripts/client/CommandMapping.pyc': {
         'CommandMapping.isFired': (
@@ -1131,8 +1197,16 @@ EXPECTED_CODE_NAMES = {
             '_Vehicle__stopExtras', 'BigWorld', 'player',
             'vehicle_onLeaveWorld', 'isStarted'),
         'Vehicle.showShooting': (
+            'siegeState', 'VEHICLE_SIEGE_STATE', 'ENABLED', 'DISABLED',
             'typeDescriptor', 'extrasDict', 'stopFor', 'startFor',
             'isPlayerVehicle', 'cancelWaitingForShot'),
+        'Vehicle.set_siegeState': (
+            'isPlayerVehicle', 'onSiegeStateUpdated', 'siegeState'),
+        'Vehicle.onSiegeStateUpdated': (
+            'typeDescriptor', 'hasSiegeMode', 'onSiegeStateChanged',
+            'appearance', 'isPlayerVehicle', 'BigWorld', 'player',
+            'inputHandler', 'siegeModeControl',
+            'notifySiegeModeChanged'),
         'Vehicle.__stopExtras': (
             'typeDescriptor', 'extras', 'items', 'stop'),
         'Vehicle.showAmmoBayEffect': ('appearance', 'showAmmoBayEffect'),
@@ -1598,6 +1672,62 @@ EXPECTED_RESOURCE_STRINGS = {
 }
 
 
+EXPECTED_PACKED_XML_PATH_VALUES = {
+    'scripts/entity_defs/Avatar.def': {
+        ('BaseMethods', 'vehicle_changeSetting', 'Exposed'): (
+            (1, ''),),
+        ('BaseMethods', 'vehicle_changeSetting', 'Arg'): (
+            (1, 'UINT8'), (1, 'INT32')),
+        ('ClientMethods', 'updateVehicleMiscStatus', 'Arg'): (
+            (1, 'OBJECT_ID'), (1, 'UINT8'), (1, 'INT32'), (1, 'ARRAY')),
+        ('ClientMethods', 'updateVehicleMiscStatus', 'Arg', 'of'): (
+            (1, 'FLOAT32'),),
+    },
+    'scripts/entity_defs/Vehicle.def': {
+        ('Properties', 'siegeState', 'Type'): (
+            (1, 'UINT8'),),
+        ('Properties', 'siegeState', 'Flags'): (
+            (1, 'ALL_CLIENTS'),),
+    },
+    'scripts/item_defs/vehicles/sweden/S10_Strv_103_0_Series.xml': {
+        ('siege_mode', 'switchOnTime'): ((2, 2),),
+        ('siege_mode', 'switchOffTime'): ((1, '1.3'),),
+        ('siege_mode', 'engineDamageCoeff'): ((2, 2),),
+    },
+    'scripts/item_defs/vehicles/sweden/S10_Strv_103_0_Series_siege_mode.xml': {
+        ('speedLimits', 'forward'): ((2, 10),),
+        ('speedLimits', 'backward'): ((2, 10),),
+    },
+    'scripts/item_defs/vehicles/sweden/S11_Strv_103B.xml': {
+        ('siege_mode', 'switchOnTime'): ((2, 2),),
+        ('siege_mode', 'switchOffTime'): ((1, '1.3'),),
+        ('siege_mode', 'engineDamageCoeff'): ((2, 2),),
+    },
+    'scripts/item_defs/vehicles/sweden/S11_Strv_103B_siege_mode.xml': {
+        ('speedLimits', 'forward'): ((2, 10),),
+        ('speedLimits', 'backward'): ((2, 10),),
+    },
+    'scripts/item_defs/vehicles/sweden/S21_UDES_03.xml': {
+        ('siege_mode', 'switchOnTime'): ((2, 2),),
+        ('siege_mode', 'switchOffTime'): ((2, 2),),
+        ('siege_mode', 'engineDamageCoeff'): ((2, 2),),
+    },
+    'scripts/item_defs/vehicles/sweden/S21_UDES_03_siege_mode.xml': {
+        ('speedLimits', 'forward'): ((2, 5),),
+        ('speedLimits', 'backward'): ((2, 5),),
+    },
+    'scripts/item_defs/vehicles/sweden/S22_Strv_S1.xml': {
+        ('siege_mode', 'switchOnTime'): ((2, 2),),
+        ('siege_mode', 'switchOffTime'): ((1, '1.3'),),
+        ('siege_mode', 'engineDamageCoeff'): ((2, 2),),
+    },
+    'scripts/item_defs/vehicles/sweden/S22_Strv_S1_siege_mode.xml': {
+        ('speedLimits', 'forward'): ((2, 8),),
+        ('speedLimits', 'backward'): ((2, 8),),
+    },
+}
+
+
 EXPECTED_GLOBALS = {
     'scripts/common/AccountCommands.pyc': {
         'RES_FAILURE': -1,
@@ -1652,6 +1782,7 @@ EXPECTED_CLASS_CONSTANTS = {
         },
         'VEHICLE_MISC_STATUS': {
             'VEHICLE_DROWN_WARNING': 4,
+            'SIEGE_MODE_STATE_CHANGED': 9,
         },
         'ATTACK_REASON': {
             'SHOT': 'shot',
@@ -1668,6 +1799,12 @@ EXPECTED_CLASS_CONSTANTS = {
             'SIEGE_MODE_ENABLED': 3,
             'ACTIVATE_EQUIPMENT': 16,
             'RELOAD_PARTIAL_CLIP': 17,
+        },
+        'VEHICLE_SIEGE_STATE': {
+            'DISABLED': 0,
+            'SWITCHING_ON': 1,
+            'ENABLED': 2,
+            'SWITCHING_OFF': 3,
         },
         'AMMOBAY_DESTRUCTION_MODE': {
             'POWDER_BURN_OFF': 0,
@@ -2145,6 +2282,126 @@ def _find_filter_sync_calls(archive):
     return calls
 
 
+_PACKED_XML_MAGIC = '\x45\x4e\xa1\x62'
+_PACKED_XML_TYPE_ELEMENT = 0
+_PACKED_XML_TYPE_INTEGER = 2
+_PACKED_XML_TYPE_BOOLEAN = 4
+_PACKED_XML_OFFSET_MASK = 0x0fffffff
+
+
+def _packed_xml_read_exact(reader, size):
+    payload = reader.read(size)
+    if len(payload) != size:
+        raise ValueError('unexpected end of Packed XML')
+    return payload
+
+
+def _packed_xml_read_cstring(reader):
+    chunks = []
+    while True:
+        value = _packed_xml_read_exact(reader, 1)
+        if value == '\0':
+            return ''.join(chunks)
+        chunks.append(value)
+
+
+def _packed_xml_descriptor(raw):
+    return raw >> 28, raw & _PACKED_XML_OFFSET_MASK
+
+
+def _packed_xml_read_value(reader, dictionary, value_type, end_offset,
+                           current_offset):
+    size = end_offset - current_offset
+    if size < 0:
+        raise ValueError('Packed XML offsets are not monotonic')
+    start = reader.tell()
+    if value_type == _PACKED_XML_TYPE_ELEMENT:
+        value, unused_size = _packed_xml_read_element(reader, dictionary)
+    else:
+        value = _packed_xml_read_exact(reader, size)
+        if value_type == _PACKED_XML_TYPE_INTEGER:
+            if not value:
+                value = 0
+            elif len(value) in (1, 2, 4, 8):
+                value = struct.unpack(
+                    {1: '<b', 2: '<h', 4: '<i', 8: '<q'}[len(value)],
+                    value)[0]
+            else:
+                raise ValueError('invalid Packed XML integer length')
+        elif value_type == _PACKED_XML_TYPE_BOOLEAN:
+            if len(value) not in (0, 1):
+                raise ValueError('invalid Packed XML boolean length')
+            value = bool(value and ord(value))
+    consumed = reader.tell() - start
+    if consumed != size:
+        raise ValueError(
+            'Packed XML value consumed %d bytes, expected %d' %
+            (consumed, size))
+    return (value_type, value), end_offset
+
+
+def _packed_xml_read_element(reader, dictionary):
+    start = reader.tell()
+    child_count = struct.unpack(
+        '<H', _packed_xml_read_exact(reader, 2))[0]
+    root_descriptor = _packed_xml_descriptor(struct.unpack(
+        '<I', _packed_xml_read_exact(reader, 4))[0])
+    child_descriptors = []
+    for unused in xrange(child_count):
+        name_index, raw_descriptor = struct.unpack(
+            '<HI', _packed_xml_read_exact(reader, 6))
+        if name_index >= len(dictionary):
+            raise ValueError('Packed XML dictionary index out of range')
+        child_descriptors.append(
+            (dictionary[name_index], _packed_xml_descriptor(raw_descriptor)))
+    current_offset = 0
+    root_value, current_offset = _packed_xml_read_value(
+        reader, dictionary, root_descriptor[0], root_descriptor[1],
+        current_offset)
+    children = []
+    for name, descriptor in child_descriptors:
+        value, current_offset = _packed_xml_read_value(
+            reader, dictionary, descriptor[0], descriptor[1],
+            current_offset)
+        children.append((name, value))
+    return (root_value, children), reader.tell() - start
+
+
+def _read_packed_xml_path_values(payload):
+    reader = StringIO(payload)
+    if _packed_xml_read_exact(reader, 4) != _PACKED_XML_MAGIC:
+        raise ValueError('invalid Packed XML magic')
+    _packed_xml_read_exact(reader, 1)
+    dictionary = []
+    while True:
+        name = _packed_xml_read_cstring(reader)
+        if not name:
+            break
+        dictionary.append(name)
+    root, unused_size = _packed_xml_read_element(reader, dictionary)
+    if reader.read(1):
+        raise ValueError('trailing bytes after Packed XML root')
+    result = {}
+
+    def walk(element, prefix):
+        unused_root_value, children = element
+        for name, value in children:
+            value_type, item = value
+            path = prefix + (name,)
+            if value_type == _PACKED_XML_TYPE_ELEMENT:
+                root_value, unused_children = item
+                root_type, root_item = root_value
+                if root_type != 1 or root_item:
+                    result.setdefault(path, []).append(
+                        (root_type, root_item))
+                walk(item, path)
+            else:
+                result.setdefault(path, []).append((value_type, item))
+
+    walk(root, ())
+    return dict((path, tuple(values)) for path, values in result.items())
+
+
 def audit(client_root):
     package_path = os.path.join(
         os.path.abspath(client_root), 'res', 'packages', 'scripts.pkg')
@@ -2166,6 +2423,7 @@ def audit(client_root):
     checked_var_call_widths = []
     checked_equality_branches = []
     checked_resource_strings = []
+    checked_packed_xml_paths = []
     errors = []
     with zipfile.ZipFile(package_path, 'r') as archive:
         names = set(archive.namelist())
@@ -2401,6 +2659,28 @@ def audit(client_root):
                 else:
                     checked_resource_strings.append(
                         '%s:%s' % (member, value))
+        for member, expected_paths in sorted(
+                EXPECTED_PACKED_XML_PATH_VALUES.items()):
+            if member not in names:
+                errors.append('missing Packed XML member: %s' % member)
+                continue
+            try:
+                actual_paths = _read_packed_xml_path_values(
+                    archive.read(member))
+            except ValueError as error:
+                errors.append('%s: %s' % (member, error))
+                continue
+            for path, expected_values in sorted(expected_paths.items()):
+                actual_values = actual_paths.get(path)
+                if actual_values != expected_values:
+                    errors.append(
+                        '%s: Packed XML path %s is %r, expected %r' %
+                        (member, '/'.join(path), actual_values,
+                         expected_values))
+                else:
+                    checked_packed_xml_paths.append(
+                        '%s:%s=%r' %
+                        (member, '/'.join(path), expected_values))
         actual_filter_sync_calls = _find_filter_sync_calls(archive)
         missing_filter_calls = (
             EXPECTED_FILTER_SYNC_CALLS - actual_filter_sync_calls)
@@ -2436,6 +2716,7 @@ def audit(client_root):
         'checkedVarCallWidths': len(checked_var_call_widths),
         'checkedEqualityBranches': len(checked_equality_branches),
         'checkedResourceStrings': len(checked_resource_strings),
+        'checkedPackedXmlPaths': len(checked_packed_xml_paths),
         'contracts': checked,
         'consumerLiterals': checked_literals,
         'codeNames': checked_names,
@@ -2452,6 +2733,7 @@ def audit(client_root):
         'varCallWidths': checked_var_call_widths,
         'equalityBranches': checked_equality_branches,
         'resourceStrings': checked_resource_strings,
+        'packedXmlPaths': checked_packed_xml_paths,
     }
 
 

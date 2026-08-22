@@ -1517,11 +1517,14 @@ def _runtime():
             VEHICLE_KILLED=6, AVATAR_READY=7, TEAM_KILLER=10),
         ARENA_PERIOD=types.SimpleNamespace(PREBATTLE=2, BATTLE=3),
         VEHICLE_PHYSICS_MODE=types.SimpleNamespace(STANDARD=0),
-        VEHICLE_SIEGE_STATE=types.SimpleNamespace(DISABLED=0),
+        VEHICLE_SIEGE_STATE=types.SimpleNamespace(
+            DISABLED=0, SWITCHING_ON=1, ENABLED=2, SWITCHING_OFF=3),
         VEHICLE_SETTING=types.SimpleNamespace(
-            CURRENT_SHELLS=0, NEXT_SHELLS=1, ACTIVATE_EQUIPMENT=16),
+            CURRENT_SHELLS=0, NEXT_SHELLS=1, SIEGE_MODE_ENABLED=3,
+            ACTIVATE_EQUIPMENT=16),
         VEHICLE_MISC_STATUS=types.SimpleNamespace(
-            LOADER_INTUITION_WAS_USED=2, VEHICLE_DROWN_WARNING=4),
+            LOADER_INTUITION_WAS_USED=2, VEHICLE_DROWN_WARNING=4,
+            SIEGE_MODE_STATE_CHANGED=9),
         DROWN_WARNING_LEVEL=types.SimpleNamespace(
             SAFE=0, CAUTION=1, DANGER=2),
         ATTACK_REASON=types.SimpleNamespace(
@@ -1615,7 +1618,7 @@ def _runtime():
         avatar_input_handler=types.SimpleNamespace(
             _CTRL_MODE=types.SimpleNamespace(
                 ARCADE='arcade', SNIPER='sniper',
-                POSTMORTEM='postmortem')),
+                STRATEGIC='strategic', POSTMORTEM='postmortem')),
         aih_constants=types.SimpleNamespace(
             GUN_MARKER_FLAG=types.SimpleNamespace(
                 UNDEFINED=0, CONTROL_ENABLED=1, CLIENT_MODE_ENABLED=2,
@@ -1673,6 +1676,9 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
     def test_native_vehicle_owns_stock_appearance_and_lan_pose_overlay(self):
         runtime = _runtime()
         holder = {}
+        data_links = types.SimpleNamespace(
+            createFloatLink=mock.Mock(
+                side_effect=lambda owner, name: (owner, name)))
         binding = BigWorldVehicleBinding(
             runtime.bigworld, runtime.bigworld.avatar, runtime.constants,
             _VehicleDescr, runtime.encode_gun_angles,
@@ -1681,7 +1687,8 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
             holder['factory'].get(entity_id))
         factory = NativeRemoteVehicleFactory(
             runtime.bigworld, runtime.math, runtime.model_assembler, 7,
-            binding=binding, compatibility=runtime.compatibility)
+            binding=binding, compatibility=runtime.compatibility,
+            data_links=data_links)
         holder['factory'] = factory
         properties = binding.properties_from_compact_descr(
             'ussr:R11_MS-1', 2, 'Native remote')
@@ -1693,6 +1700,20 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
         self.assertIsNone(runtime.bigworld.entity(vehicle_id))
         self.assertEqual(runtime.constants.ARENA_UPDATE.VEHICLE_ADDED,
                          runtime.bigworld.avatar.arena_updates[-1][0])
+        pending = runtime.bigworld.pending_entities[vehicle_id]
+        pending.filter.movementInfo = object()
+        pending.filter.setTracksSpeed = mock.Mock()
+        pending.appearance.filter = pending.filter
+        pending.appearance.flyingInfoProvider = types.SimpleNamespace(
+            isLeftSideFlying=True, isRightSideFlying=False)
+        detailed_engine = types.SimpleNamespace(
+            vehicleSpeedLink=None, rotationSpeedLink=None)
+        pending.appearance.detailedEngineState = detailed_engine
+        pending.appearance.engineAudition = object()
+        pending.appearance.wheelsAnimator = object()
+        pending.appearance.suspension = object()
+        swinging = types.SimpleNamespace(worldMatrix=object())
+        pending.appearance.swingingAnimator = swinging
         runtime.bigworld.enter_pending_vehicle(vehicle_id)
         self.assertTrue(factory.is_ready(vehicle_id))
         vehicle = factory.get(vehicle_id)
@@ -1700,21 +1721,87 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
         self.assertIs(vehicle.model.matrix, vehicle.matrix)
         self.assertEqual(1, len(vehicle.aim_targets))
         self.assertIsNotNone(vehicle.track_scroll)
+        self.assertIs(swinging.worldMatrix, vehicle.model.matrix)
+        self.assertIs(detailed_engine.vehicleSpeedLink[0],
+                      factory._states[vehicle_id])
+        self.assertEqual('speed', detailed_engine.vehicleSpeedLink[1])
+        self.assertEqual(
+            {'engine_audio_motion': True, 'body_swinging': True,
+             'stock_wheels': True, 'stock_suspension': True},
+            dict(vehicle._offlinePresentationCapabilities))
 
         binding.set_vehicle_pose(
             vehicle_id, _Vector(8.0, 2.5, 9.0), (0.0, 0.0, 0.75),
             relax_time=0.1, now=10.0)
+        binding.set_vehicle_pose(
+            vehicle_id, _Vector(8.0, 2.5, 11.0), (0.0, 0.0, 1.0),
+            relax_time=0.1, now=11.0)
         binding.update_vehicle_aim(vehicle_id, 0.75, 1.0, -0.1)
-        self.assertEqual((8.0, 2.5, 9.0), tuple(vehicle.position))
+        self.assertEqual((8.0, 2.5, 11.0), tuple(vehicle.position))
+        overlay = runtime.compatibility.pose_overlays[id(vehicle)]
+        self.assertEqual((0.0, 0.0, 2.0), tuple(overlay['velocity']))
+        self.assertEqual((0.0, 0.0, 2.0), tuple(overlay['acceleration']))
+        self.assertAlmostEqual(2.0 * math.cos(1.0), overlay['speed'])
+        self.assertAlmostEqual(0.25, overlay['turn_speed'])
         self.assertAlmostEqual(1.0, vehicle._aim_yaw)
         self.assertAlmostEqual(-0.1, vehicle._gun_pitch)
         self.assertTrue(vehicle.update_tracks(
             2.0, 3.0, (ENGINE_MODE_RUNNING, 1)))
+        vehicle.filter.setTracksSpeed.assert_called_once_with(
+            2.0, False, 3.0, True)
         self.assertEqual([(2.0, 3.0)], vehicle.track_scrolls)
+
+        # Never call the fatal native WGVehicleFilter method after the engine
+        # table stops owning this exact PyEntity, including fallback methods
+        # on the now-invalid appearance.
+        runtime.bigworld.entities.pop(vehicle_id)
+        self.assertFalse(vehicle.update_tracks(
+            4.0, 5.0, (ENGINE_MODE_RUNNING, 1)))
+        vehicle.filter.setTracksSpeed.assert_called_once_with(
+            2.0, False, 3.0, True)
+        self.assertEqual([(2.0, 3.0)], vehicle.track_scrolls)
+        self.assertFalse(
+            vehicle._offlinePresentationCapabilities[
+                'engine_owned_track_motion'])
+        runtime.bigworld.entities[vehicle_id] = vehicle
 
         self.assertTrue(factory.destroy(vehicle_id))
         self.assertIsNone(runtime.bigworld.entity(vehicle_id))
         self.assertNotIn(id(vehicle), runtime.compatibility.pose_overlays)
+
+    def test_native_motion_capabilities_fall_back_without_stock_animators(self):
+        runtime = _runtime()
+        holder = {}
+        binding = BigWorldVehicleBinding(
+            runtime.bigworld, runtime.bigworld.avatar, runtime.constants,
+            _VehicleDescr, runtime.encode_gun_angles,
+            outfit_provider=lambda unused_descriptor: '',
+            authority_entity_resolver=lambda entity_id:
+            holder['factory'].get(entity_id))
+        factory = NativeRemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7,
+            binding=binding, compatibility=runtime.compatibility)
+        holder['factory'] = factory
+        properties = binding.properties_from_compact_descr(
+            'ussr:R11_MS-1', 2, 'Native fallback')
+
+        vehicle_id = factory.create(
+            _Descriptor(), properties, _Vector(), (0.0, 0.0, 0.0))
+        runtime.bigworld.enter_pending_vehicle(vehicle_id)
+        self.assertTrue(factory.is_ready(vehicle_id))
+        vehicle = factory.get(vehicle_id)
+
+        self.assertEqual(
+            {'engine_audio_motion': False, 'body_swinging': False,
+             'stock_wheels': False, 'stock_suspension': False},
+            dict(vehicle._offlinePresentationCapabilities))
+        self.assertTrue(vehicle.update_tracks(
+            1.0, 1.5, (ENGINE_MODE_RUNNING, 1)))
+        self.assertEqual([(1.0, 1.5)], vehicle.track_scrolls)
+        self.assertFalse(
+            vehicle._offlinePresentationCapabilities[
+                'engine_owned_track_motion'])
+        self.assertTrue(factory.destroy(vehicle_id))
 
 
 class RemoteVehicleFactoryTests(unittest.TestCase):
@@ -1954,6 +2041,30 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         with self.assertRaisesRegex(
                 RuntimeError, 'shot sound contract failed'):
             vehicle.showShooting(1, False)
+
+    def test_remote_siege_callback_swaps_descriptor_and_blocks_transition_shot(self):
+        descriptor = _Descriptor()
+        descriptor.hasSiegeMode = True
+        descriptor.siege_updates = []
+        descriptor.onSiegeStateChanged = (
+            lambda state: descriptor.siege_updates.append(state))
+        vehicle = RemoteVehicle(
+            1000, descriptor, {
+                'publicInfo': {'team': 2, 'name': 'Strv'},
+                'health': 500, 'isCrewActive': True,
+                'gunAnglesPacked': 0},
+            _Vector(), (0.0, 0.0, 0.0),
+            types.SimpleNamespace(Vector3=_Vector, Matrix=_Matrix))
+        vehicle.model = _Model()
+        vehicle.isStarted = True
+        vehicle.inWorld = True
+
+        self.assertTrue(vehicle.onSiegeStateUpdated(1, 2.0))
+
+        self.assertEqual([1], descriptor.siege_updates)
+        self.assertEqual(1, vehicle.siegeState)
+        self.assertEqual(1, vehicle.appearance.siegeState)
+        self.assertFalse(vehicle.showShooting(1, False))
 
     def test_remote_filter_implements_1513_three_argument_broad_phase(self):
         math_module = types.SimpleNamespace(Vector3=_Vector)
@@ -4145,6 +4256,91 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual((oil,), factors.call_args[0][2])
 
+    def test_removed_rpm_limiter_uses_exact_descriptor_trigger_values(self):
+        runtime = _runtime()
+        descriptor = types.SimpleNamespace(
+            id=(11, 12), compactDescr=401,
+            name='removedRpmLimiter', tags=('trigger',),
+            cooldownSeconds=0.0, reuseCount=0,
+            enginePowerFactor=1.1, engineHpLossPerSecond=1.5)
+        runtime.vehicles.g_cache.equipments = lambda: {401: descriptor}
+        battle = BattleRuntime(runtime)
+        battle._local_mounted_equipments = lambda: [401]
+
+        state = battle._default_equipments()
+
+        self.assertEqual('rpm_limiter', state[0]['kind'])
+        self.assertEqual(-1, state[0]['uses_left'])
+        self.assertEqual(1.1, state[0]['engine_power_factor'])
+        self.assertEqual(1.5, state[0]['engine_hp_loss_per_second'])
+
+    def test_removed_rpm_limiter_toggles_stock_trigger_stage(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._avatar = runtime.bigworld.avatar
+        battle.client = types.SimpleNamespace(player_id=1)
+        descriptor = _Descriptor()
+        entity = _Vehicle(10, descriptor, _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._records = {'player:1': {
+            'engine_id': 10, 'state': {'health': 500, 'alive': True},
+            'kind': 'player', 'network_id': 1, 'local': True}}
+        battle._equipment_state = [{
+            'id': 12, 'compact_descr': 401,
+            'name': 'removedrpmlimiter', 'kind': 'rpm_limiter',
+            'cooldown': 0.0, 'uses_left': -1, 'ready_at': 0.0,
+            'active': False, 'engine_power_factor': 1.1,
+            'engine_hp_loss_per_second': 1.5}]
+        battle._clock = lambda: 1000.0
+
+        self.assertTrue(battle._activate_equipment((1 << 16) | 12))
+        self.assertEqual(1.1, battle._active_engine_power_factor())
+        self.assertEqual(
+            (10, 401, 1,
+             runtime.constants.EQUIPMENT_STAGES.PREPARING, 0),
+            runtime.bigworld.avatar.ammo_updates[-1])
+        self.assertTrue(battle._activate_equipment(12))
+        self.assertEqual(1.0, battle._active_engine_power_factor())
+        self.assertEqual(
+            (10, 401, 1, runtime.constants.EQUIPMENT_STAGES.READY, 0),
+            runtime.bigworld.avatar.ammo_updates[-1])
+
+    def test_active_removed_rpm_limiter_damages_engine_at_exact_rate(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._battle_live = True
+        battle.client = types.SimpleNamespace(player_id=1)
+        descriptor = _Descriptor()
+        descriptor.engine = {'maxHealth': 100, 'maxRegenHealth': 50}
+        entity = _Vehicle(10, descriptor, _Vector(), (0, 0, 0),
+                          {'health': 500})
+        entity.devices_hp = {}
+        entity._destroyed_devices = set()
+        entity._crew_ko = set()
+        entity.is_on_fire = False
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        record = {
+            'engine_id': 10, 'state': {'health': 500, 'alive': True},
+            'kind': 'player', 'network_id': 1, 'local': True}
+        battle._records = {'player:1': record}
+        battle._equipment_state = [{
+            'kind': 'rpm_limiter', 'active': True,
+            'engine_power_factor': 1.1,
+            'engine_hp_loss_per_second': 1.5}]
+        battle._present_critical = mock.Mock(return_value=True)
+
+        self.assertTrue(battle._tick_rpm_limiter(
+            record, entity, 2.0, 1000.0))
+
+        self.assertEqual(97.0, entity.devices_hp['engineHealth'])
+        self.assertEqual(
+            97.0, record['critical_state']['devices'][0]['hp'])
+        self.assertIsNotNone(battle._local_damage_report)
+
     def _shell_change_battle(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -4200,8 +4396,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
     def test_second_press_mid_reload_restarts_the_native_hud_cycle(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
+        descriptor = _two_shell_descriptor()
         state = gun_mechanics.GunState(
-            _two_shell_descriptor(), ammo_layout={101: 20, 102: 10})
+            descriptor, ammo_layout={101: 20, 102: 10})
         state.reload = 6.0
         state.clip = 0
         state.reload_time = 3.0
@@ -4209,7 +4406,16 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._gun_state = state
         battle._avatar = runtime.bigworld.avatar
         battle._server = types.SimpleNamespace(vehicle_id=10)
-        battle._publish_ammo_state = mock.Mock()
+        native_events = []
+        publish_reload = battle._publish_reload_event
+
+        def record_reload(time_left, base_time, force=False):
+            native_events.append(('reload', time_left, base_time))
+            return publish_reload(time_left, base_time, force=force)
+
+        battle._publish_reload_event = record_reload
+        battle._publish_ammo_state = lambda current, force=False: (
+            native_events.append(('current_shell', current.shot_index)))
         settings = runtime.constants.VEHICLE_SETTING
 
         self.assertTrue(
@@ -4225,6 +4431,19 @@ class BattleRuntimeContractTests(unittest.TestCase):
             (10, 0.0, 6.0),
             (10, 6.0, 6.0),
         ], runtime.bigworld.avatar.reload_updates)
+        self.assertEqual([
+            ('reload', 0.0, 6.0),
+            ('current_shell', 1),
+            ('reload', 6.0, 6.0),
+        ], native_events)
+
+        # The newly selected round completes normally and becomes fireable;
+        # the HUD never needs a second shell switch to recover the gun.
+        state.tick(
+            6.01, True, 0.0, 0.0, 0.0, descriptor)
+        self.assertEqual(0.0, state.reload_time)
+        self.assertEqual(1, state.clip)
+        self.assertTrue(state.can_fire(True))
 
     def test_loader_intuition_swaps_at_once_and_notifies_the_hud(self):
         battle, state, settings = self._shell_change_battle()
@@ -4257,6 +4476,67 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertFalse(
             battle.change_vehicle_setting(settings.NEXT_SHELLS, 999))
         self.assertIsNone(state.pending_index)
+
+    def test_siege_setting_is_sent_as_an_authoritative_input_request(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = types.SimpleNamespace(
+            send_current=mock.Mock(return_value=True))
+        vehicle = types.SimpleNamespace(
+            typeDescriptor=types.SimpleNamespace(hasSiegeMode=True))
+        battle._server_entity = lambda unused_id: vehicle
+        setting = runtime.constants.VEHICLE_SETTING.SIEGE_MODE_ENABLED
+
+        self.assertTrue(battle.change_vehicle_setting(setting, True))
+        self.assertFalse(battle.change_vehicle_setting(setting, 2))
+
+        battle._sender.send_current.assert_called_once_with(
+            siege_enabled=True)
+
+    def test_snapshot_siege_edge_drives_binding_and_active_gun_law(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        descriptor = types.SimpleNamespace(hasSiegeMode=True)
+        vehicle = types.SimpleNamespace(typeDescriptor=descriptor)
+        battle._server_entity = lambda unused_id: vehicle
+        battle._binding = types.SimpleNamespace(
+            update_vehicle_siege_state=mock.Mock(return_value=True))
+        battle._gun_state = types.SimpleNamespace(
+            adopt_descriptor=mock.Mock(return_value=True))
+        battle._local_physics = {'speedFwd': 19.0}
+        battle._local_factors = mock.Mock(return_value={'engine/power': 1.0})
+        battle._targeting_signature = ('old',)
+        record = {'engine_id': 10, 'local': True}
+
+        with mock.patch.object(
+                vehicle_physics, 'derive_params',
+                return_value={'speedFwd': 5.0 / 3.6}) as derive:
+            self.assertTrue(battle._apply_siege_state(record, {
+                'siege_state': 1, 'siege_time_left_ms': 2000}))
+            self.assertFalse(battle._apply_siege_state(record, {
+                'siege_state': 1, 'siege_time_left_ms': 1500}))
+
+        battle._binding.update_vehicle_siege_state.assert_called_once_with(
+            10, 1, 2.0)
+        battle._gun_state.adopt_descriptor.assert_called_once_with(descriptor)
+        derive.assert_called_once_with(
+            descriptor, {'engine/power': 1.0})
+        self.assertEqual({'speedFwd': 5.0 / 3.6}, battle._local_physics)
+        self.assertIsNone(battle._targeting_signature)
+
+    def test_player_cannot_fire_during_a_siege_transition(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._battle_live = True
+        battle._battle_result = None
+        battle._drown_level = 0
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._server_entity = lambda unused_id: types.SimpleNamespace(
+            typeDescriptor=types.SimpleNamespace(), siegeState=1)
+
+        self.assertFalse(battle.shoot(0.0, 0.0))
 
     def test_bot_observation_drives_only_enemy_visibility_feedback(self):
         battle = BattleRuntime(_runtime())
@@ -5453,7 +5733,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertTrue(battle.start({
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
-            'name': 'Player'}, start, client))
+            'name': 'Player', 'native_remote_vehicles': False},
+            start, client))
         battle.on_snapshot({
             'round_id': 1, 'server_tick': 1,
             'players': [player], 'bots': []})
@@ -5529,7 +5810,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertTrue(battle.start({
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
-            'name': 'Player'}, start, client))
+            'name': 'Player', 'native_remote_vehicles': False},
+            start, client))
         runtime.bigworld.callbacks.pop(0)()
         runtime.bigworld.enter_pending_vehicle(battle._server.vehicle_id)
         runtime.bigworld.callbacks.pop(0)()
@@ -5616,7 +5898,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertTrue(battle.start({
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
-            'name': 'Player'}, start, client))
+            'name': 'Player', 'native_remote_vehicles': False},
+            start, client))
 
         # All selected descriptors submit immediately from _create_entities;
         # no bot-spawn timer has run and engine time has not advanced.
@@ -10002,6 +10285,66 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertFalse(battle._local_airborne)
         battle._motion_is_clear.assert_called_once()
 
+    def test_layered_support_skips_trench_edge_and_keeps_the_floor(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+
+        def collision(unused_space, start, unused_end, unused_mask,
+                      *unused_filter):
+            if start.y > 1.35:
+                return (_Vector(start.x, 1.4, start.z),
+                        _Vector(0.0, 1.0, 0.0))
+            return (_Vector(start.x, 0.0, start.z),
+                    _Vector(0.0, 1.0, 0.0))
+
+        runtime.bigworld.wg_collideSegment = collision
+
+        self.assertEqual(
+            (1.4, 1.4),
+            battle._terrain_support(
+                (0.0, 0.0, 0.0), 0.0, _Descriptor()))
+        self.assertEqual(
+            (0.0, 0.0),
+            battle._terrain_support(
+                (0.0, 0.0, 0.0), 0.0, _Descriptor(), maximum_y=0.62))
+
+    def test_trench_upper_support_does_not_rollback_clear_horizontal_drive(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        battle.client = client
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = types.SimpleNamespace(
+            forward=1.0, turn=0.0, handbrake=False,
+            send_current=lambda: client.send_input('current'))
+        battle._local_descriptor = entity.typeDescriptor
+        battle._attach_local_presentation()
+        battle._local_fall_armed = True
+        battle._motion_is_clear = mock.Mock(return_value=True)
+        battle._terrain_support = mock.Mock(
+            side_effect=((1.4, 1.4), (0.0, 0.0)))
+        battle._ground_pitch = mock.Mock(return_value=0.0)
+        battle._resolve_local_tank_contacts = mock.Mock(
+            side_effect=lambda unused_entity, position, unused_yaw,
+            unused_dt: position)
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.longitudinal_step', return_value=4.0):
+            battle._drive_local(0.02)
+
+        self.assertGreater(battle._local_position[2], 0.0)
+        self.assertEqual(0.0, battle._local_position[1])
+        self.assertFalse(battle._local_support_rise_blocked)
+        self.assertAlmostEqual(
+            0.62,
+            battle._terrain_support.call_args_list[1].kwargs['maximum_y'])
+
     def test_first_streamed_ground_snaps_spawn_without_fall_damage(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -11083,6 +11426,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(20.0, record['spot_until'])
         self.assertFalse(record['spot_visible'])
+        self.assertTrue(record['spot_marker_visible'])
 
         # Re-entering the local 565 m AOI uses the retained team-spot memory;
         # no second detection probe is needed.
@@ -11090,6 +11434,45 @@ class BattleRuntimeContractTests(unittest.TestCase):
         record['spot_next'] = 999.0
         battle._update_spotting(10.1)
         self.assertTrue(record['spot_visible'])
+
+    def test_strategic_spg_view_draws_team_spotted_target_beyond_aoi(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._local_descriptor = _Descriptor()
+        battle._local_descriptor.type.tags = ('SPG',)
+        battle._local_position = (0.0, 0.0, 0.0)
+        local = _Vehicle(
+            10, battle._local_descriptor, _Vector(), (0, 0, 0),
+            {'health': 500})
+        enemy = _Vehicle(
+            12, _Descriptor(), _Vector(700.0, 0.0, 0.0), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities.update({10: local, 12: enemy})
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._set_record_spot_visibility = lambda record, visible: \
+            record.update(spot_visible=bool(visible)) or bool(visible)
+        record = {
+            'engine_id': 12, 'network_id': 17, 'kind': 'bot',
+            'ready': True, 'local': False, 'presentation': True,
+            'tombstone': False, 'spot_visible': False,
+            'spot_marker_visible': True,
+            'spot_until': 20.0, 'spot_next': 999.0,
+            'state': {'team': 2, 'health': 500, 'alive': True}}
+        battle._records = {'bot:17': record}
+
+        battle._avatar.inputHandler._AvatarInputHandler__ctrlModeName = \
+            'strategic'
+        self.assertTrue(battle._update_spotting(10.0))
+        self.assertTrue(record['spot_visible'])
+        self.assertTrue(record['spot_marker_visible'])
+
+        battle._avatar.inputHandler._AvatarInputHandler__ctrlModeName = \
+            'arcade'
+        self.assertTrue(battle._update_spotting(10.1))
+        self.assertFalse(record['spot_visible'])
+        self.assertTrue(record['spot_marker_visible'])
 
     def test_dead_local_vehicle_uses_server_validated_ally_relay(self):
         runtime = _runtime()

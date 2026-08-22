@@ -245,6 +245,9 @@ class LANSession(object):
             vehicle,
             max_health=max_health,
             on_event=on_event)
+        # Keep custom test/embedding factories source-compatible: the team
+        # preference is ordinary client state consumed when hello is built.
+        client.requested_team = port_config.preferred_team(self._config)
         if self._postbattle_store is not None:
             client.account_key = self._postbattle_store.account_key
         client.outfits = self._outfit_provider()
@@ -865,6 +868,38 @@ class LANSession(object):
         supported = getattr(self.client, 'has_random_map', None)
         return bool(callable(supported) and supported())
 
+    def _server_supports_team_selection(self):
+        supported = getattr(self.client, 'has_team_selection', None)
+        return bool(callable(supported) and supported())
+
+    def _team_status(self):
+        sizes = dict(getattr(self.client, 'team_sizes', {}) or {})
+        counts = {1: 0, 2: 0}
+        for player in list(getattr(self.client, 'roster', ()) or ()):
+            if not isinstance(player, dict):
+                continue
+            team = player.get('team')
+            if team in counts:
+                counts[team] += 1
+        return {
+            'team': getattr(self.client, 'team', None),
+            'sizes': sizes,
+            'counts': counts,
+            'supported': self._server_supports_team_selection(),
+        }
+
+    def select_team(self, team):
+        """Ask the server to move this waiting-room player."""
+        if self._stopped or self.client is None or self.state != 'waiting':
+            return False
+        selector = getattr(self.client, 'select_team', None)
+        if not callable(selector) or not selector(team):
+            self._status_notifier(
+                'The LAN server did not accept that team selection.')
+            return False
+        self._status_notifier('Requesting Team %d...' % int(team))
+        return True
+
     def _ensure_queue(self):
         if self._queue is None:
             surface = self._new_room()
@@ -911,12 +946,19 @@ class LANSession(object):
         if self._room_factory is None:
             return None
         try:
-            room = self._room_factory(self.request_start, self._map_pool_value,
-                                      status=self._room_status,
-                                      on_close=self.leave_room,
-                                      host=self._is_local_host,
-                                      random_supported=(
-                                          self._server_supports_random_map))
+            options = {
+                'status': self._room_status,
+                'on_close': self.leave_room,
+                'host': self._is_local_host,
+                'random_supported': self._server_supports_random_map,
+            }
+            if self._room_factory is waiting_room_ui.WaitingRoomUI:
+                options.update({
+                    'request_team': self.select_team,
+                    'team_status': self._team_status,
+                })
+            room = self._room_factory(
+                self.request_start, self._map_pool_value, **options)
             room.install()
         except Exception as error:
             sys.stdout.write(
@@ -1721,6 +1763,18 @@ class LANSession(object):
                     'The LAN server refused the battle start (%s).' %
                     (_message_value(message, 'code') or 'unknown'))
             self._sync_waiting_surface()
+        elif kind == 'team_denied':
+            code = _message_value(message, 'code')
+            team = _message_value(message, 'team')
+            if code == 'team_full':
+                self._status_notifier(
+                    'Team %s is full. Choose the other team or wait for a '
+                    'slot.' % team)
+            else:
+                self._status_notifier(
+                    'The LAN server refused the team selection (%s).' %
+                    (code or 'unknown'))
+            self._refresh_surface()
         elif kind == 'battle_start':
             self._start_battle(message)
         elif kind == 'battle_live':
@@ -1784,6 +1838,19 @@ class LANSession(object):
                     bool(getattr(self.client, 'ready', False)) and
                     getattr(self.client, 'phase', None) == 'waiting'):
                 self._return_to_join_after_waiting_disconnect(message)
+            elif (kind == 'error' and not self._battle_started and
+                    not bool(getattr(self.client, 'ready', False)) and
+                    _message_value(message, 'code') in
+                    ('team_full', 'invalid_team')):
+                code = _message_value(message, 'code')
+                if code == 'team_full':
+                    self._status_notifier(
+                        'The selected LAN team is full. Choose the other '
+                        'team or Automatic in the launcher.')
+                else:
+                    self._status_notifier(
+                        'The launcher team selection is invalid.')
+                self.stop(show_login=True)
             elif (kind == 'error' and not self._battle_started and
                     not bool(getattr(self.client, 'ready', False)) and
                     self._retry_initial_connection(message)):

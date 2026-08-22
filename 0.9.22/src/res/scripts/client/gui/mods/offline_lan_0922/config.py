@@ -38,12 +38,13 @@ ENDPOINT_PREFIX = 'LAN SERVER:'
 CLIENT_MODE_ENV = 'OFFLINE_LAN_0922_CLIENT_MODE'
 SERVER_HOST_ENV = 'OFFLINE_LAN_0922_SERVER_HOST'
 SERVER_PORT_ENV = 'OFFLINE_LAN_0922_SERVER_PORT'
+PREFERRED_TEAM_ENV = 'OFFLINE_LAN_0922_PREFERRED_TEAM'
 PLAYER_MODE = 'player'
 SIMULATION_WORKER_MODE = 'simulation_worker'
 CLIENT_MODES = frozenset((PLAYER_MODE, SIMULATION_WORKER_MODE))
 
 DEFAULT_CONFIG = {
-    'schema': 1,
+    'schema': 2,
     'enabled': True,
     # The normal package remains a player client. A separate copied game
     # directory may opt into the native-space simulation worker explicitly.
@@ -53,6 +54,8 @@ DEFAULT_CONFIG = {
     'name': 'Player',
     'vehicle': 'ussr:R11_MS-1',
     'max_health': 90,
+    # Zero keeps the legacy automatic balancing behavior.
+    'preferred_team': 0,
     'startupTimeoutSeconds': 30.0,
     'prebattleCountdownSeconds': 15.0,
     'battleDurationSeconds': 900.0,
@@ -63,10 +66,11 @@ DEFAULT_CONFIG = {
     # engine-owned filter, so the belts cannot turn.  See
     # 0.9.22/COMPATIBILITY_REVIEW.md.
     'bot_track_animation': False,
-    # Exact-build experiment: stock remote Vehicle entities provide native
-    # compounds, stickers and engine-owned belt animation. Copied physics
-    # remains authoritative because #1513 has no legal remote pose setter.
-    'native_remote_vehicles': False,
+    # Stock remote Vehicle entities provide native wheels, suspension,
+    # acceleration swing and engine audio. Copied LAN physics remains
+    # authoritative because #1513 has no legal remote pose setter. The hidden
+    # simulation worker overrides this to False before any entities are made.
+    'native_remote_vehicles': True,
     # One-shot measurement for a future non-rendering authority process.
     # This is intentionally off and does not change LAN authority or launch a
     # second client. The hidden-window phase also requires the external tools/
@@ -107,9 +111,20 @@ def _load_config_file(path):
         value = json.load(stream)
     if not isinstance(value, dict):
         raise ValueError('config root must be an object')
+    try:
+        source_schema = int(value.get('schema', 1))
+    except (TypeError, ValueError, OverflowError):
+        source_schema = 1
     for key in DEFAULT_CONFIG:
         if key in value:
+            # Schema 1 shipped the native remote-vehicle implementation only
+            # as a disabled internal experiment. Schema 2 makes the completed
+            # stock presentation path the visible-client default, so an old
+            # generated ``false`` must not pin upgrades to compound models.
+            if key == 'native_remote_vehicles' and source_schema < 2:
+                continue
             config[key] = value[key]
+    config['schema'] = DEFAULT_CONFIG['schema']
     config['startupTimeoutSeconds'] = max(
         1.0, float(config['startupTimeoutSeconds']))
     config['prebattleCountdownSeconds'] = max(
@@ -124,6 +139,18 @@ def _load_config_file(path):
             DEFAULT_CONFIG['host'], DEFAULT_CONFIG['port'])
     config['host'], config['port'] = base_endpoint
     config['max_health'] = max(1, int(config['max_health']))
+    preferred = config.get('preferred_team', 0)
+    if preferred in ('auto', '', None):
+        preferred = 0
+    if isinstance(preferred, bool):
+        raise ValueError('preferred_team must be 0, 1, or 2')
+    try:
+        preferred = int(preferred)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('preferred_team must be 0, 1, or 2')
+    if preferred not in (0, 1, 2):
+        raise ValueError('preferred_team must be 0, 1, or 2')
+    config['preferred_team'] = preferred
     if not isinstance(config.get('enabled'), bool):
         raise ValueError('enabled must be true or false')
     if (not isinstance(config.get('client_mode'), string_types) or
@@ -180,6 +207,27 @@ def client_mode(config, environ=None):
         raise ValueError(
             '%s must be player or simulation_worker' % CLIENT_MODE_ENV)
     return mode
+
+
+def preferred_team(config, environ=None):
+    """Resolve the process-local team choice; zero preserves auto-balance."""
+    environ = os.environ if environ is None else environ
+    value = environ.get(
+        PREFERRED_TEAM_ENV, (config or {}).get('preferred_team', 0))
+    if value in ('auto', '', None):
+        return 0
+    if isinstance(value, bool):
+        raise ValueError(
+            '%s must be auto, 1, or 2' % PREFERRED_TEAM_ENV)
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            '%s must be auto, 1, or 2' % PREFERRED_TEAM_ENV)
+    if value not in (0, 1, 2):
+        raise ValueError(
+            '%s must be auto, 1, or 2' % PREFERRED_TEAM_ENV)
+    return value
 
 
 def _replace(temporary_path, path, write_through=True):

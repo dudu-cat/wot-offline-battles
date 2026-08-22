@@ -16,6 +16,8 @@ SERVER_PORT = 28782
 SERVER_MAX_PLAYERS = 30
 SERVER_TEAM_SIZE = 15
 SERVER_TEAM_SIZE_ENV = "WOT_0922_TEAM_SIZE"
+SERVER_TEAM1_SIZE_ENV = "WOT_0922_TEAM1_SIZE"
+SERVER_TEAM2_SIZE_ENV = "WOT_0922_TEAM2_SIZE"
 SERVER_LOOPBACK_ONLY_ENV = "WOT_0922_LOOPBACK_ONLY"
 WINDOWS_FIREWALL_RULE_PREFIX = "WoT 0.9.22 LAN Server"
 # Get-NetFirewallRule can take many seconds on a busy machine.
@@ -174,6 +176,25 @@ def _team_size_from_environment(environment=None):
     return team_size
 
 
+def _team_sizes_from_environment(environment=None):
+    """Read independent capacities, falling back to the legacy shared key."""
+    environment = os.environ if environment is None else environment
+    legacy = _team_size_from_environment(environment)
+    values = []
+    for name in (SERVER_TEAM1_SIZE_ENV, SERVER_TEAM2_SIZE_ENV):
+        raw_value = environment.get(name, legacy)
+        if isinstance(raw_value, bool):
+            raise ValueError("%s must be 1-15" % name)
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            raise ValueError("%s must be a number from 1 to 15" % name)
+        if not 1 <= value <= 15:
+            raise ValueError("%s must be 1-15" % name)
+        values.append(value)
+    return tuple(values)
+
+
 def _loopback_only_from_environment(environment=None):
     environment = os.environ if environment is None else environment
     return environment.get(SERVER_LOOPBACK_ONLY_ENV) == "1"
@@ -191,16 +212,16 @@ def main():
     print("Press Ctrl+C to stop the server.\n")
     try:
         default_map, run_server = _load_server()
-        team_size = _team_size_from_environment()
+        team1_size, team2_size = _team_sizes_from_environment()
         if not loopback_only:
             _ensure_windows_firewall_rule(SERVER_PORT)
         run_server(
-            server_host,
-            SERVER_PORT,
-            default_map,
-            SERVER_MAX_PLAYERS,
-            os.environ.get("WOT_LAN_AUTHORITY", "client"),
-            team_size,
+            server_host, SERVER_PORT, default_map, SERVER_MAX_PLAYERS,
+            authority_mode=os.environ.get(
+                "WOT_LAN_AUTHORITY", "client"),
+            team_size=SERVER_TEAM_SIZE,
+            team1_size=team1_size,
+            team2_size=team2_size,
         )
     except Exception:
         traceback.print_exc()

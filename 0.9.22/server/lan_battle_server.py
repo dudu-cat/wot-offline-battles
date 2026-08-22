@@ -62,6 +62,26 @@ MAX_LINE_BYTES = 256 * 1024
 MAX_RESULT_RECEIPTS = 256
 RESULT_RECEIPT_STATE_SCHEMA = 1
 RESULT_RECEIPT_STATE_FILE = "unacked_battle_receipts.json"
+RESULT_INTERACTION_LIMITS = {
+    "spotted": (0, 1),
+    "death_reason": (-1, 10),
+    "direct_hits": (0, 65535),
+    "explosion_hits": (0, 65535),
+    "piercings": (0, 65535),
+    "damage": (0, 65535),
+    "assist_track": (0, 65535),
+    "assist_radio": (0, 65535),
+    "assist_stun": (0, 65535),
+    "crits": (0, 4294967295),
+    "fire": (0, 65535),
+    "stun_num": (0, 65535),
+    "stun_duration": (0, 65535),
+    "damage_blocked": (0, 4294967295),
+    "damage_received": (0, 65535),
+    "ricochets_received": (0, 65535),
+    "no_damage_direct_hits_received": (0, 65535),
+    "target_kills": (0, 255),
+}
 DEFAULT_MAP = "server_random"
 CLIENT_BUILD_082 = "wot-0.8.2"
 CLIENT_BUILD_0922 = "wot-0.9.22.0.1-cn-1513"
@@ -148,7 +168,22 @@ SERVER_CAPABILITIES = (
     DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     PROJECTILE_HIT_VEHICLE_CAPABILITY,
     RANDOM_MAP_CAPABILITY,
+    "team_selection_v1",
 )
+SIEGE_DISABLED = 0
+SIEGE_SWITCHING_ON = 1
+SIEGE_ENABLED = 2
+SIEGE_SWITCHING_OFF = 3
+# Exact Chinese HD #1513 values from each stock vehicle definition and its
+# paired ``*_siege_mode.xml`` descriptor.  The standalone server does not load
+# client packages, so this small version-locked table owns only transition
+# time, damaged-engine coefficient and the final-mode movement ceiling.
+SIEGE_VEHICLE_PARAMS = {
+    "sweden:S10_Strv_103_0_Series": (2.0, 1.3, 10.0 / 3.6, 2.0),
+    "sweden:S11_Strv_103B": (2.0, 1.3, 10.0 / 3.6, 2.0),
+    "sweden:S21_UDES_03": (2.0, 2.0, 5.0 / 3.6, 2.0),
+    "sweden:S22_Strv_S1": (2.0, 1.3, 8.0 / 3.6, 2.0),
+}
 MAX_MOTION_TIME_US = 10000000000000000
 # A source clock may span publications that were dropped or rejected, so its
 # delta can exceed one BotRuntime step. It may not, however, advance more than
@@ -376,6 +411,36 @@ def _exact_int(value, low=None, high=None):
     return value
 
 
+def _team_capacity(value, name):
+    """Return one exact 1-15 team capacity without accepting booleans."""
+    if isinstance(value, bool):
+        raise ValueError("%s must be 1-15" % name)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("%s must be 1-15" % name)
+    if isinstance(value, float) and value != parsed:
+        raise ValueError("%s must be 1-15" % name)
+    if not 1 <= parsed <= 15:
+        raise ValueError("%s must be 1-15" % name)
+    return parsed
+
+
+def _requested_team(value):
+    """Normalize an optional player team preference; zero means automatic."""
+    if value in (None, "", "auto", 0, "0"):
+        return 0
+    if isinstance(value, bool):
+        raise ValueError("requested_team must be auto, 1, or 2")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("requested_team must be auto, 1, or 2")
+    if parsed not in (1, 2) or str(value).strip() not in ("1", "2"):
+        raise ValueError("requested_team must be auto, 1, or 2")
+    return parsed
+
+
 def _bounded_float(value, low, high, inclusive_low=True):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("expected finite number")
@@ -494,6 +559,7 @@ def _persisted_result_receipt(value):
     if not isinstance(public_rows, list) or not 1 <= len(public_rows) <= 30:
         raise ValueError("invalid persisted public result roster")
     seen = set()
+    row_teams = {}
     personal = None
     for row in public_rows:
         if not isinstance(row, dict):
@@ -532,6 +598,7 @@ def _persisted_result_receipt(value):
                 killer_id < 0 or bool(killer_kind) != bool(killer_id)):
             raise ValueError("invalid persisted public result killer")
         seen.add(identity)
+        row_teams[identity] = row["team"]
         if identity == ("player", value["player_id"]):
             personal = row
     if (personal is None or personal["name"] != value["player_name"] or
@@ -541,6 +608,30 @@ def _persisted_result_receipt(value):
             personal["xp"] != rewards["xp"] or
             personal["stats"] != stats):
         raise ValueError("inconsistent persisted personal result row")
+    interactions = value.get("interactions", [])
+    if (not isinstance(interactions, list) or
+            len(interactions) > len(public_rows)):
+        raise ValueError("invalid persisted interaction details")
+    interaction_fields = set(RESULT_INTERACTION_LIMITS)
+    interaction_keys = interaction_fields | {"target_kind", "target_id"}
+    interaction_targets = set()
+    for interaction in interactions:
+        if (not isinstance(interaction, dict) or
+                set(interaction) != interaction_keys):
+            raise ValueError("invalid persisted interaction row")
+        target = (interaction.get("target_kind"),
+                  interaction.get("target_id"))
+        if (target not in seen or target in interaction_targets or
+                target == ("player", value["player_id"]) or
+                row_teams[target] == value["team"]):
+            raise ValueError("invalid persisted interaction target")
+        for name, (minimum, maximum) in RESULT_INTERACTION_LIMITS.items():
+            field = interaction.get(name)
+            if (isinstance(field, bool) or not isinstance(field, int) or
+                    field < minimum or field > maximum):
+                raise ValueError("invalid persisted interaction value")
+        interaction_targets.add(target)
+    value["interactions"] = interactions
     encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
     if len(encoded.encode("utf-8")) + 1 > MAX_LINE_BYTES:
         raise ValueError("persisted battle receipt exceeds wire limit")
@@ -767,6 +858,8 @@ class Player:
     forward: float = 0.0
     turn: float = 0.0
     speed: float = 0.0
+    siege_state: int = SIEGE_DISABLED
+    siege_transition_ticks: int = 0
     fire_seq: int = 0
     shell_index: int = 0
     reported_hits: set = field(default_factory=set, repr=False)
@@ -878,20 +971,22 @@ class SimulationWorker:
 class BattleState:
     def __init__(self, map_name=DEFAULT_MAP, max_players=30, clock=None,
                  authority_mode="client", team_size=15,
-                 receipt_state_path=None):
+                 receipt_state_path=None, team1_size=None, team2_size=None):
         self.map_option = map_name
         self.map_name = self._choose_map()
         self.authority_mode = (
             "client" if str(authority_mode) == "client" else "server")
         self.client_build = None
         self.max_players = max(1, min(int(max_players), 30))
-        if isinstance(team_size, bool):
-            raise ValueError("team_size must be 1-15")
-        self.team_size = int(team_size)
-        if isinstance(team_size, float) and team_size != self.team_size:
-            raise ValueError("team_size must be 1-15")
-        if not 1 <= self.team_size <= 15:
-            raise ValueError("team_size must be 1-15")
+        legacy_team_size = _team_capacity(team_size, "team_size")
+        team1_size = (legacy_team_size if team1_size is None else
+                      _team_capacity(team1_size, "team1_size"))
+        team2_size = (legacy_team_size if team2_size is None else
+                      _team_capacity(team2_size, "team2_size"))
+        self.team_sizes = {1: team1_size, 2: team2_size}
+        # Keep the old scalar on the wire for older protocol-v5 consumers.
+        # New consumers use team_sizes; max remains a safe roster upper bound.
+        self.team_size = max(team1_size, team2_size)
         self.players: Dict[int, Player] = {}
         self.simulation_worker: Optional[SimulationWorker] = None
         self.worker_fallback_reason = ""
@@ -947,6 +1042,7 @@ class BattleState:
         self.bot_reported_rams = set()
         self.bot_ram_cooldowns = {}
         self.vehicle_statistics = {}
+        self.vehicle_interactions = {}
         self.round_participants = {}
         self.track_immobilisers = {}
         self.player_spotted = {}
@@ -1040,6 +1136,9 @@ class BattleState:
 
     def _active_map_pool(self):
         return CLIENT_MAP_POOLS.get(self.client_build, MAP_POOL)
+
+    def _team_sizes_wire(self):
+        return {str(team): self.team_sizes[team] for team in (1, 2)}
 
     def _server_time_ms(self):
         return max(0, int(round(float(self.tick) * 1000.0 / TICK_HZ)))
@@ -1174,7 +1273,7 @@ class BattleState:
         roster = []
         used = set()
         for team in (1, 2):
-            for slot in range(self.team_size):
+            for slot in range(self.team_sizes[team]):
                 if (team, slot) in occupied_slots:
                     continue
                 while True:
@@ -1297,6 +1396,11 @@ class BattleState:
             if (not isinstance(client_build, str) or
                     client_build not in CLIENT_MAP_POOLS):
                 return None, "unsupported_client_build"
+            try:
+                requested_team = _requested_team(
+                    hello.get("requested_team"))
+            except ValueError:
+                return None, "invalid_team"
             capabilities = ()
             if client_build == CLIENT_BUILD_0922:
                 raw_capabilities = hello.get("capabilities", ())
@@ -1359,12 +1463,17 @@ class BattleState:
                        if player.connected and player.team == team}
                 for team in (1, 2)}
             available = {
-                team: [slot for slot in range(self.team_size)
+                team: [slot for slot in range(self.team_sizes[team])
                        if slot not in occupied[team]]
                 for team in (1, 2)}
-            candidates = [team for team in (1, 2) if available[team]]
+            candidates = ([requested_team] if requested_team in (1, 2)
+                          else [team for team in (1, 2)
+                                if available[team]])
+            if (requested_team in (1, 2) and
+                    not available[requested_team]):
+                return None, "team_full"
             if not candidates:
-                return None, "full"
+                return None, "team_full"
             team = min(candidates, key=lambda value: (
                 len(occupied[value]), value))
             slot = available[team][0]
@@ -1395,6 +1504,38 @@ class BattleState:
                 self.host_player_id = player_id
             self.state_revision += 1
             return player, None
+
+    def select_team(self, player_id, requested_team):
+        """Move one waiting player to a requested team under capacity lock."""
+        with self.lock:
+            player = self.players.get(player_id)
+            if (player is None or not player.connected or
+                    self.phase != "waiting"):
+                return False, "not_waiting"
+            try:
+                team = _requested_team(requested_team)
+            except ValueError:
+                return False, "invalid_team"
+            if team not in (1, 2):
+                return False, "invalid_team"
+            if team == player.team:
+                return True, None
+            occupied = {
+                participant.slot for participant in self.players.values()
+                if participant.connected and participant.team == team
+            }
+            slots = [slot for slot in range(self.team_sizes[team])
+                     if slot not in occupied]
+            if not slots:
+                return False, "team_full"
+            player.team = team
+            player.slot = slots[0]
+            player.x, player.z, player.yaw = self._spawn_for(
+                player.slot, player.team)
+            player.y = 0.0
+            player.aim_yaw = player.yaw
+            self.state_revision += 1
+            return True, None
 
     def add_simulation_worker(self, conn, address, hello):
         """Admit one #1513 native worker without allocating a player slot."""
@@ -1494,6 +1635,8 @@ class BattleState:
             player.vehicle = vehicle
             player.max_health = max_health
             player.health = max_health
+            player.siege_state = SIEGE_DISABLED
+            player.siege_transition_ticks = 0
             player.outfits = outfits
             self.state_revision += 1
             return True
@@ -1628,6 +1771,8 @@ class BattleState:
             player.forward = 0.0
             player.turn = 0.0
             player.speed = 0.0
+            player.siege_state = SIEGE_DISABLED
+            player.siege_transition_ticks = 0
             player.fire_seq = 0
             player.shell_index = 0
             player.reported_hits.clear()
@@ -1679,6 +1824,7 @@ class BattleState:
         self.bot_reported_rams = set()
         self.bot_ram_cooldowns = {}
         self.vehicle_statistics = {}
+        self.vehicle_interactions = {}
         self.round_participants = {}
         self.track_immobilisers = {}
         self.player_spotted = {}
@@ -1817,6 +1963,7 @@ class BattleState:
                 "host_player_id": self.host_player_id,
                 "bot_authority_id": self.bot_authority_id,
                 "team_size": self.team_size,
+                "team_sizes": self._team_sizes_wire(),
                 "players": [self._public_player(p)
                             for p in self.players.values() if p.connected],
             }
@@ -1916,6 +2063,7 @@ class BattleState:
                 "players": [self._public_player(p) for p in connected],
                 "bots": list(self.bot_roster),
                 "team_size": self.team_size,
+                "team_sizes": self._team_sizes_wire(),
                 "bot_authority_id": self.bot_authority_id,
                 "bot_manifest": list(self.bot_manifest),
                 "bot_order_revision": self.bot_orders["revision"],
@@ -2633,6 +2781,7 @@ class BattleState:
                 "players": [self._public_player(p) for p in connected],
                 "bots": list(self.bot_roster),
                 "team_size": self.team_size,
+                "team_sizes": self._team_sizes_wire(),
                 "bot_authority_id": self.bot_authority_id,
                 "bot_manifest": list(self.bot_manifest),
                 "bot_order_revision": self.bot_orders["revision"],
@@ -3624,7 +3773,10 @@ class BattleState:
 
             if shooter_kind == "player":
                 if (not shooter.participating or
-                        not shooter.alive or shot_seq != shooter.fire_seq + 1):
+                        not shooter.alive or
+                        shooter.siege_state in (
+                            SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF) or
+                        shot_seq != shooter.fire_seq + 1):
                     return False
                 team = shooter.team
                 source_vehicle = shooter.vehicle
@@ -3999,15 +4151,32 @@ class BattleState:
         if _destroyed_tracks(admitted_critical) - _destroyed_tracks(
                 critical_before):
             self.track_immobilisers[victim] = shooter
-        if (not proposal["splash"] and
-                int(record["team"]) != int(proposal["target_team"])):
+        enemy_hit = (
+            int(record["team"]) != int(proposal["target_team"]))
+        if enemy_hit and proposal["splash"]:
+            self._increment_interaction(
+                shooter, victim, "explosion_hits")
+        if not proposal["splash"] and enemy_hit:
+            self._increment_interaction(
+                shooter, victim, "direct_hits")
             row = self._statistics_row(*shooter)
             row["shots_hit"] += 1
             if proposal["shot_result"] == 2:
                 row["shots_penetrated"] += 1
+                self._increment_interaction(
+                    shooter, victim, "piercings")
             elif blocked_damage:
                 self._statistics_row(*victim)[
                     "damage_blocked"] += blocked_damage
+                self._increment_interaction(
+                    victim, shooter, "damage_blocked", blocked_damage)
+            if proposal["shot_result"] == 0:
+                self._increment_interaction(
+                    victim, shooter, "ricochets_received")
+            elif proposal["shot_result"] == 1 and applied <= 0:
+                self._increment_interaction(
+                    victim, shooter,
+                    "no_damage_direct_hits_received")
         if was_alive and not alive:
             if target_kind == "player":
                 target.death_attacker_kind = record["shooter_kind"]
@@ -5066,6 +5235,8 @@ class BattleState:
                     "stats": dict(public_row["stats"]),
                     "rewards": rewards,
                     "public_results": public_results,
+                    "interactions": self._receipt_interactions(
+                        ("player", player_id)),
                 }
                 receipt_id = receipt["receipt_id"]
                 # One account may finish another arena before an earlier ACK
@@ -5145,6 +5316,11 @@ class BattleState:
             player = self.players.get(player_id)
             if player is None or not player.connected:
                 return
+            if (player.alive and self.phase == "battle" and
+                    self.battle_result is None and
+                    "siege_enabled" in message):
+                self._request_siege_state(
+                    player, message.get("siege_enabled"))
             if not self._combat_accepting() or self.battle_result is not None:
                 player.forward = 0.0
                 player.turn = 0.0
@@ -5155,8 +5331,10 @@ class BattleState:
                 if "turn" in message:
                     player.turn = _clamp(_finite_float(message.get("turn")), -1.0, 1.0)
                 if "speed" in message:
+                    speed_limit = self._siege_speed_limit(player)
                     player.speed = _clamp(
-                        _finite_float(message.get("speed")), -200.0, 200.0)
+                        _finite_float(message.get("speed")),
+                        -speed_limit, speed_limit)
                 if "aim_yaw" in message:
                     player.aim_yaw = _finite_float(message.get("aim_yaw"), player.aim_yaw)
                 if "gun_pitch" in message:
@@ -5244,6 +5422,76 @@ class BattleState:
                 # must not drag its marker away from the server-owned wreck.
                 player.forward = 0.0
                 player.turn = 0.0
+
+    @staticmethod
+    def _siege_params(player):
+        return SIEGE_VEHICLE_PARAMS.get(str(player.vehicle))
+
+    @staticmethod
+    def _engine_destroyed(player):
+        critical = player.critical if isinstance(player.critical, dict) else {}
+        if "engineHealth" in set(critical.get("destroyed") or ()):
+            return True
+        return any(
+            isinstance(device, dict) and
+            device.get("name") == "engineHealth" and
+            device.get("state") == "destroyed"
+            for device in critical.get("devices") or ())
+
+    @staticmethod
+    def _engine_damaged(player):
+        critical = player.critical if isinstance(player.critical, dict) else {}
+        return any(
+            isinstance(device, dict) and
+            device.get("name") == "engineHealth" and
+            device.get("state") == "critical"
+            for device in critical.get("devices") or ())
+
+    def _request_siege_state(self, player, enabled):
+        """Begin one #1513 four-state transition from an exact BOOL request."""
+        params = self._siege_params(player)
+        if (not player.participating or not isinstance(enabled, bool) or
+                params is None or self._engine_destroyed(player) or
+                player.siege_state in (
+                    SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF)):
+            return False
+        if enabled:
+            if player.siege_state == SIEGE_ENABLED:
+                return True
+            next_state = SIEGE_SWITCHING_ON
+            duration = params[0]
+        else:
+            if player.siege_state == SIEGE_DISABLED:
+                return True
+            next_state = SIEGE_SWITCHING_OFF
+            duration = params[1]
+        if self._engine_damaged(player):
+            duration *= params[3]
+        player.siege_state = next_state
+        player.siege_transition_ticks = max(
+            1, int(round(float(duration) * TICK_HZ)))
+        return True
+
+    def _siege_speed_limit(self, player):
+        params = self._siege_params(player)
+        if params is not None and player.siege_state == SIEGE_ENABLED:
+            return float(params[2])
+        return 200.0
+
+    def _advance_siege_states(self):
+        for player in self.players.values():
+            if player.siege_state not in (
+                    SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF):
+                player.siege_transition_ticks = 0
+                continue
+            player.siege_transition_ticks = max(
+                0, int(player.siege_transition_ticks) - 1)
+            if player.siege_transition_ticks != 0:
+                continue
+            player.siege_state = (
+                SIEGE_ENABLED
+                if player.siege_state == SIEGE_SWITCHING_ON
+                else SIEGE_DISABLED)
 
     @staticmethod
     def _commit_external_player_critical(player, critical):
@@ -5565,6 +5813,42 @@ class BattleState:
             row["team"] = self._vehicle_team(*key)
         return row
 
+    def _statistics_interaction(self, actor, target):
+        """Return one bounded per-target row owned by ``actor``."""
+        actor = (str(actor[0]), int(actor[1]))
+        self._statistics_row(*actor)
+        interactions = self.vehicle_interactions.setdefault(actor, {})
+        target = (str(target[0]), int(target[1]))
+        key = "%s:%d" % target
+        interaction = interactions.get(key)
+        if interaction is None:
+            interaction = {
+                "target_kind": target[0], "target_id": target[1],
+            }
+            for name, (minimum, unused_maximum) in (
+                    RESULT_INTERACTION_LIMITS.items()):
+                interaction[name] = minimum if name == "death_reason" else 0
+            interactions[key] = interaction
+        return interaction
+
+    def _increment_interaction(self, actor, target, name, amount=1):
+        minimum, maximum = RESULT_INTERACTION_LIMITS[name]
+        interaction = self._statistics_interaction(actor, target)
+        interaction[name] = max(minimum, min(
+            maximum, int(interaction.get(name, 0)) + int(amount)))
+        return interaction[name]
+
+    def _receipt_interactions(self, actor):
+        """Project mutable interaction maps into stable receipt rows."""
+        actor = (str(actor[0]), int(actor[1]))
+        interactions = self.vehicle_interactions.get(actor, {})
+        if not isinstance(interactions, dict):
+            return []
+        return [dict(value) for value in sorted(
+            interactions.values(), key=lambda value: (
+                0 if value.get("target_kind") == "player" else 1,
+                int(value.get("target_id", 0))))]
+
     def update_spotted_targets(self, player_id, message):
         """Store one player's own spotted set for assist accounting only.
 
@@ -5604,6 +5888,13 @@ class BattleState:
                     return False
                 spotted.add((kind, target_id))
             self.player_spotted[player_id] = frozenset(spotted)
+            reporter = ("player", int(player_id))
+            for target in spotted:
+                interaction = self._statistics_interaction(reporter, target)
+                if not interaction["spotted"]:
+                    interaction["spotted"] = 1
+                    row = self._statistics_row(*reporter)
+                    row["spotted"] = int(row.get("spotted", 0)) + 1
             return True
 
     def _radio_assisters(self, attacker, target, target_team):
@@ -5637,7 +5928,15 @@ class BattleState:
         target_team = self._vehicle_team(*target)
         if attacker is None or self._vehicle_team(*attacker) == target_team:
             return
+        if target[0] == "bot":
+            self.bot_planner.report_damage(
+                target[1], attacker[0], attacker[1], damage,
+                self._monotonic())
         self._statistics_row(*attacker)["damage_dealt"] += damage
+        self._increment_interaction(
+            attacker, target, "damage", damage)
+        self._increment_interaction(
+            target, attacker, "damage_received", damage)
         credits = []
         holder = self.track_immobilisers.get(target)
         if (holder is not None and holder != attacker and
@@ -5650,6 +5949,8 @@ class BattleState:
         for category, assister in credits:
             self._statistics_row(*assister)[
                 "damage_assisted_%s" % category] += damage
+            self._increment_interaction(
+                assister, target, "assist_%s" % category, damage)
             self.pending_events.append({
                 "kind": "assist",
                 "category": category,
@@ -5691,6 +5992,20 @@ class BattleState:
             return False
         if delta > 0:
             self._statistics_row(attacker_kind, attacker_id)["kills"] += 1
+            attacker = (str(attacker_kind), int(attacker_id))
+            victim = (str(victim_kind), int(victim_id))
+            interaction = self._statistics_interaction(attacker, victim)
+            self._increment_interaction(
+                attacker, victim, "target_kills")
+            if victim_kind == "player":
+                target = self.players.get(int(victim_id))
+                reason = getattr(target, "death_reason", 0)
+            else:
+                target = self.bot_states.get(int(victim_id))
+                reason = target.get("death_reason", 0) if target else 0
+            minimum, maximum = RESULT_INTERACTION_LIMITS["death_reason"]
+            interaction["death_reason"] = max(
+                minimum, min(maximum, int(reason)))
         self.pending_events.append({
             "kind": "vehicle_statistics",
             "actor_kind": attacker_kind,
@@ -5705,7 +6020,12 @@ class BattleState:
             return
         if not player.client_position:
             player.yaw += player.turn * 0.85 * dt
-            speed = 14.0 * player.forward
+            params = self._siege_params(player)
+            speed_limit = (float(params[2])
+                           if params is not None and
+                           player.siege_state == SIEGE_ENABLED
+                           else 14.0)
+            speed = speed_limit * player.forward
             player.x += math.sin(player.yaw) * speed * dt
             player.z += math.cos(player.yaw) * speed * dt
             player.x = _clamp(player.x, -220.0, 220.0)
@@ -5981,6 +6301,7 @@ class BattleState:
             if self.phase != "battle":
                 return
             self.tick += 1
+            self._advance_siege_states()
             self._prune_orphaned_bot_launch_edges()
             if (self.battle_result is None and
                     self.tick >= int(round(
@@ -6128,6 +6449,10 @@ class BattleState:
             "forward": round(player.forward, 4),
             "turn": round(player.turn, 4),
             "speed": round(player.speed, 4),
+            "siege_state": int(player.siege_state),
+            "siege_time_left_ms": int(math.ceil(
+                max(0, int(player.siege_transition_ticks)) *
+                1000.0 / TICK_HZ)),
             "fire_seq": player.fire_seq,
             "shell_index": player.shell_index,
             "health": player.health,
@@ -6191,6 +6516,11 @@ class BattleState:
                 _server_log("RESULT RECEIPT ack persistence failed: %s" % error)
                 return False
             self.result_receipts = remaining
+            # A player can own more than one durable result after an ACK was
+            # delayed across rounds.  The waiting room has no snapshot tick,
+            # so publish the next row on this same live connection instead of
+            # requiring another battle or reconnect to drain the queue.
+            self._deliver_result_receipt(player)
             return True
 
     def broadcast(self, message):
@@ -6282,6 +6612,7 @@ class BattleState:
                                 for player in connected],
                     "bots": list(self.bot_roster),
                     "team_size": self.team_size,
+                    "team_sizes": self._team_sizes_wire(),
                     "bot_authority_id": self.bot_authority_id,
                     "authority_epoch": self.authority_epoch,
                     "server_time_ms": self._server_time_ms(),
@@ -6340,6 +6671,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
             "authority_epoch": state.authority_epoch,
             "server_time_ms": state._server_time_ms(),
             "team_size": state.team_size,
+            "team_sizes": state._team_sizes_wire(),
         }
         message.update(state._authority_fields())
         return message
@@ -6607,6 +6939,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         "spawn": {"x": player.x, "y": player.y, "z": player.z, "yaw": player.yaw},
                         "bot_authority_id": server.state.bot_authority_id,
                         "team_size": server.state.team_size,
+                        "team_sizes": server.state._team_sizes_wire(),
                     }
                     if server.state.client_build == CLIENT_BUILD_0922:
                         welcome_message.update({
@@ -6621,6 +6954,8 @@ class ClientHandler(socketserver.BaseRequestHandler):
                 messages = {
                     "battle_in_progress": "battle already in progress",
                     "full": "server is full",
+                    "team_full": "requested team is full",
+                    "invalid_team": "team must be automatic, Team 1, or Team 2",
                     "unsupported_client_build": "unsupported or missing client build",
                     "incompatible_client_build": "this room is using a different client build",
                     "map_not_available_for_client": "the fixed server map is unavailable in this client build",
@@ -6894,6 +7229,23 @@ class ClientHandler(socketserver.BaseRequestHandler):
                                 player.player_id, player.vehicle,
                                 player.max_health))
                             server.state.broadcast_current_roster()
+                    elif message_type == "select_team":
+                        accepted, team_error = server.state.select_team(
+                            player.player_id, message.get("team"))
+                        if accepted:
+                            _server_log("TEAM id=%d team=%d slot=%d" % (
+                                player.player_id, player.team, player.slot))
+                            server.state.broadcast_current_roster()
+                        else:
+                            player.send({
+                                "type": "team_denied",
+                                "protocol": PROTOCOL_VERSION,
+                                "round_id": server.state.round_id,
+                                "state_revision": server.state.state_revision,
+                                "code": team_error,
+                                "team": message.get("team"),
+                                "team_sizes": server.state._team_sizes_wire(),
+                            })
                     elif message_type == "ping":
                         player.send({
                             "type": "pong",
@@ -6934,12 +7286,13 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 def run_server(host, port, map_name, max_players,
                authority_mode="client", team_size=15,
-               receipt_state_path=None):
+               receipt_state_path=None, team1_size=None, team2_size=None):
     if receipt_state_path is None:
         receipt_state_path = _default_result_receipt_state_path(port)
     state = BattleState(map_name=map_name, max_players=max_players,
                         authority_mode=authority_mode, team_size=team_size,
-                        receipt_state_path=receipt_state_path)
+                        receipt_state_path=receipt_state_path,
+                        team1_size=team1_size, team2_size=team2_size)
     tcp_server = ThreadedTCPServer((host, port), ClientHandler)
     tcp_server.game_server = type("GameServer", (), {"state": state})()
 
@@ -6960,8 +7313,9 @@ def run_server(host, port, map_name, max_players,
     thread.start()
     _server_log(
         "LAN battle server listening on %s:%d "
-        "(map=%s, max_players=%d, team_size=%d)" % (
-            host, port, state.map_name, state.max_players, state.team_size))
+        "(map=%s, max_players=%d, team_sizes=%d:%d)" % (
+            host, port, state.map_name, state.max_players,
+            state.team_sizes[1], state.team_sizes[2]))
     _server_log("Ready: clients click Battle! to join, choose a map, then click START BATTLE")
     try:
         tcp_server.serve_forever(poll_interval=0.5)
@@ -6984,7 +7338,13 @@ def main():
     parser.add_argument("--max-players", type=int, default=30, help="maximum connected clients")
     parser.add_argument(
         "--team-size", type=int, choices=range(1, 16), default=15,
-        help="total tanks per team, including players (default: 15)")
+        help="legacy default for both team capacities (default: 15)")
+    parser.add_argument(
+        "--team-1-size", type=int, choices=range(1, 16), default=None,
+        help="total Team 1 tanks, including players")
+    parser.add_argument(
+        "--team-2-size", type=int, choices=range(1, 16), default=None,
+        help="total Team 2 tanks, including players")
     parser.add_argument(
         "--authority", dest="authority_mode",
         choices=("server", "client"),
@@ -6992,8 +7352,10 @@ def main():
         help="who simulates bots in 0.9.22 rounds (default: client; "
              "WOT_LAN_AUTHORITY overrides)")
     args = parser.parse_args()
-    run_server(args.host, args.port, args.map_name, args.max_players,
-               args.authority_mode, args.team_size)
+    run_server(
+        args.host, args.port, args.map_name, args.max_players,
+        authority_mode=args.authority_mode, team_size=args.team_size,
+        team1_size=args.team_1_size, team2_size=args.team_2_size)
 
 
 if __name__ == "__main__":

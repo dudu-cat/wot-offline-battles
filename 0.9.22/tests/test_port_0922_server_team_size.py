@@ -21,8 +21,8 @@ class _Connection(object):
         self.messages.append(payload)
 
 
-def _hello(index):
-    return {
+def _hello(index, team=None):
+    result = {
         'client_build': CLIENT_BUILD_0922,
         'capabilities': [
             PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY],
@@ -30,6 +30,9 @@ def _hello(index):
         'vehicle': 'ussr:R11_MS-1',
         'max_health': 90,
     }
+    if team is not None:
+        result['requested_team'] = team
+    return result
 
 
 class ServerTeamSizeTests(unittest.TestCase):
@@ -87,7 +90,55 @@ class ServerTeamSizeTests(unittest.TestCase):
             _Connection(), ('10.0.0.9', 1009), _hello(9))
 
         self.assertIsNone(player)
-        self.assertEqual('full', error)
+        self.assertEqual('team_full', error)
+
+    def test_asymmetric_capacities_build_the_exact_two_rosters(self):
+        state = BattleState(team1_size=2, team2_size=5)
+
+        self.assertEqual({1: 2, 2: 5}, state.team_sizes)
+        self.assertEqual(5, state.team_size)
+        self.assertEqual(
+            {(1, 0), (1, 1)} |
+            {(2, slot) for slot in range(5)},
+            {(bot['team'], bot['slot']) for bot in state.bot_roster})
+        self.assertEqual(
+            {'1': 2, '2': 5}, state.lobby_message()['team_sizes'])
+
+    def test_explicit_team_is_authoritative_and_reports_team_full(self):
+        state = BattleState(team1_size=1, team2_size=3)
+        first, error = state.add_player(
+            _Connection(), ('10.0.0.1', 1001), _hello(1, 1))
+        self.assertIsNone(error)
+        self.assertEqual(1, first.team)
+
+        rejected, error = state.add_player(
+            _Connection(), ('10.0.0.2', 1002), _hello(2, 1))
+
+        self.assertIsNone(rejected)
+        self.assertEqual('team_full', error)
+        other, error = state.add_player(
+            _Connection(), ('10.0.0.3', 1003), _hello(3, 2))
+        self.assertIsNone(error)
+        self.assertEqual(2, other.team)
+
+    def test_waiting_player_can_switch_only_when_target_has_capacity(self):
+        state = BattleState(team1_size=2, team2_size=1)
+        one, error = state.add_player(
+            _Connection(), ('10.0.0.1', 1001), _hello(1, 1))
+        self.assertIsNone(error)
+        two, error = state.add_player(
+            _Connection(), ('10.0.0.2', 1002), _hello(2, 2))
+        self.assertIsNone(error)
+
+        accepted, error = state.select_team(one.player_id, 2)
+        self.assertFalse(accepted)
+        self.assertEqual('team_full', error)
+        state.remove_player(two.player_id)
+        accepted, error = state.select_team(one.player_id, 2)
+        self.assertTrue(accepted)
+        self.assertIsNone(error)
+        self.assertEqual(2, one.team)
+        self.assertEqual(0, one.slot)
 
     def test_invalid_team_sizes_are_rejected(self):
         for value in (0, 16, 'invalid', 1.5, True):

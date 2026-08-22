@@ -155,6 +155,28 @@ class WaitingRoomTests(unittest.TestCase):
         self.assertTrue(room.activate('start'))
         self.assertEqual(['01_karelia'], self.started)
 
+    def test_every_player_can_select_a_team_and_see_capacity(self):
+        selected = []
+        team_state = {
+            'team': 1, 'sizes': {1: 2, 2: 5},
+            'counts': {1: 1, 2: 3}, 'supported': True,
+        }
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: False,
+            surface=self.surface,
+            request_team=lambda team: selected.append(team) or True,
+            team_status=lambda: dict(team_state))
+
+        self.assertTrue(room.open())
+        self.assertTrue(room._controls['team1'].properties['visible'])
+        self.assertTrue(room._controls['team2'].properties['visible'])
+        self.assertIn('1/2', room._labels['team1'].properties['text'])
+        self.assertIn('SELECTED', room._labels['team1'].properties['text'])
+        self.assertIn('3/5', room._labels['team2'].properties['text'])
+        self.assertTrue(room.activate('team2'))
+        self.assertEqual([2], selected)
+
     def test_the_room_takes_and_releases_the_native_cursor(self):
         class _CursorSurface(_Surface):
             def __init__(self):

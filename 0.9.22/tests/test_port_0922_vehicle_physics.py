@@ -150,6 +150,58 @@ class VehiclePhysicsPinnedClimbTests(unittest.TestCase):
         self.assertGreater(copied, 3.0)
         self.assertLess(generic, 1.0)
 
+    def test_exact_1513_longitudinal_grip_curve_boundaries(self):
+        self.assertAlmostEqual(
+            1.0, vehicle_physics.longitudinal_slope_grip(0.0), places=12)
+        self.assertAlmostEqual(
+            1.0,
+            vehicle_physics.longitudinal_slope_grip(math.radians(27.5)),
+            places=12)
+        self.assertAlmostEqual(
+            0.1,
+            vehicle_physics.longitudinal_slope_grip(math.radians(32.0)),
+            places=12)
+        self.assertAlmostEqual(
+            0.1,
+            vehicle_physics.longitudinal_slope_grip(math.radians(45.0)),
+            places=12)
+
+        # The executable interpolates the two curve points by normal.y, not
+        # directly by the slope angle. The midpoint in normal.y is grip 0.55.
+        midpoint_y = (
+            vehicle_physics.SLOPE_GRIP_LNG_FULL_Y +
+            vehicle_physics.SLOPE_GRIP_LNG_MIN_Y) / 2.0
+        midpoint_angle = math.acos(midpoint_y)
+        self.assertAlmostEqual(
+            0.55,
+            vehicle_physics.longitudinal_slope_grip(midpoint_angle),
+            places=12)
+
+    def test_exact_1513_full_grip_region_does_not_cut_drive_early(self):
+        # The former fixed 0.54 cap stopped these vehicles before 27.5 degrees,
+        # while #1513 still supplies full longitudinal grip at this boundary.
+        expected_minimum_kmh = {
+            'Type 62': 10.0,
+            'T-34-85': 8.0,
+            'ISU-152': 6.0,
+        }
+        for row in self.PINNED_VEHICLES:
+            if row[0] == 'Maus':
+                continue
+            with self.subTest(vehicle=row[0]):
+                self.assertGreater(
+                    self._climb_speed(self._params(row), 27.5),
+                    expected_minimum_kmh[row[0]])
+
+        # Once the native curve has fallen to its 0.1 endpoint, the same
+        # vehicles cannot continue climbing under the copied force law.
+        for row in self.PINNED_VEHICLES:
+            if row[0] == 'Maus':
+                continue
+            with self.subTest(vehicle=row[0]):
+                self.assertLess(
+                    self._climb_speed(self._params(row), 32.0), 0.0)
+
 
 class VehiclePhysicsCoastTests(unittest.TestCase):
 

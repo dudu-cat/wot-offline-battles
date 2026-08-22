@@ -1102,6 +1102,44 @@ def tick_repair(vehicle, dt, repair_skill=100.0, has_big_kit=False,
     return _payload(before, after, descriptor, 'repair')
 
 
+def damage_device_over_time(vehicle, name, amount, cause='equipment'):
+    """Subtract deterministic HP from one module and return its state payload.
+
+    This is the server-side part of effects such as Removed RPM Limiter.  It
+    deliberately bypasses projectile saving throws: the equipment definition
+    already specifies direct engine HP loss per second.
+    """
+    if vehicle is None:
+        return None
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return None
+    if amount <= 0.0 or float(
+            getattr(vehicle, 'health', 0.0) or 0.0) <= 0.0:
+        return None
+    name = str(name or '')
+    if not name.endswith('Health'):
+        name += 'Health'
+    descriptor = getattr(vehicle, 'typeDescriptor', None)
+    maximum = _device_damage.device_max_hp(descriptor, name)
+    if maximum is None:
+        return None
+    before = _state(vehicle)
+    devices = dict(getattr(vehicle, 'devices_hp', None) or {})
+    destroyed = set(getattr(vehicle, '_destroyed_devices', None) or ())
+    current = max(0.0, float(devices.get(name, maximum)))
+    if current <= 0.0:
+        return None
+    devices[name] = max(0.0, current - amount)
+    if devices[name] <= 0.0:
+        destroyed.add(name)
+    vehicle.devices_hp = devices
+    vehicle._destroyed_devices = destroyed
+    _refresh_mobility_flags(vehicle)
+    return _payload(before, _state(vehicle), descriptor, cause)
+
+
 def _restore_fuel_regen_cap(vehicle):
     """Keep the copied fire-out law available to engine-free authorities."""
     descriptor = getattr(vehicle, 'typeDescriptor', None)

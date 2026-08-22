@@ -194,6 +194,10 @@ class _RemoteAppearance(object):
         """#1513 routes fire vibrations to the player's peripherals only."""
         return None
 
+    def onSiegeStateChanged(self, state):
+        """Mirror the CompoundAppearance hook used by stock Vehicle."""
+        self.siegeState = int(state)
+
     def attach(self, model):
         self.compoundModel = model
         self.models = [model]
@@ -1201,9 +1205,23 @@ class RemoteVehicle(object):
     def set_gunAnglesPacked(self, unused_previous):
         return None
 
+    def onSiegeStateUpdated(self, new_state, time_to_next_mode):
+        """Consume the same state edge as the exact #1513 Vehicle entity."""
+        if not bool(getattr(self.typeDescriptor, 'hasSiegeMode', False)):
+            return False
+        callback = getattr(
+            self.typeDescriptor, 'onSiegeStateChanged', None)
+        if not callable(callback):
+            raise RuntimeError(
+                '#1513 Siege descriptor has no state-change callback')
+        callback(int(new_state))
+        self.appearance.onSiegeStateChanged(int(new_state))
+        self.siegeState = int(new_state)
+        return True
+
     def showShooting(self, burst_count=1, is_predicted=False):
         if (not self.isStarted or not self.inWorld or self.model is None or
-                not self.isAlive()):
+                not self.isAlive() or self.siegeState not in (0, 2)):
             return False
         self.last_shot = (int(burst_count), bool(is_predicted))
         native_started = self._start_shooting_effect(max(1, int(burst_count)))

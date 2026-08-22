@@ -82,20 +82,75 @@ class GunState(object):
         self.loadout = dict(loadout_modifiers)
         crew_multiplier = _positive(
             self.loadout.get('crew_multiplier'), 1.0)
-        self.base_dispersion *= _positive(
+        self._dispersion_factor = _positive(
             self.loadout.get('dispersion_factor'), crew_multiplier)
-        self.aim_time *= _positive(
+        self._aim_time_factor = _positive(
             self.loadout.get('aim_time_factor'), crew_multiplier)
-        reload_factor = _positive(
+        self._reload_factor = _positive(
             self.loadout.get('reload_factor'), crew_multiplier)
-        self.reload *= reload_factor
-        self.clip_reload *= reload_factor
+        self.base_dispersion *= self._dispersion_factor
+        self.aim_time *= self._aim_time_factor
+        self.reload *= self._reload_factor
+        self.clip_reload *= self._reload_factor
         self.clip = 0
         self.reload_time = self.reload
         self.reload_duration = self.reload
         self.dispersion = self.base_dispersion
         self.load_started = False
         self.pending_index = None
+
+    @staticmethod
+    def _shot_compact_descrs(shots):
+        result = []
+        for shot in shots:
+            shell = _field(shot, 'shell', {})
+            try:
+                result.append(int(_field(shell, 'compactDescr', 0)))
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    '#1513 siege-mode gun has an invalid shell descriptor')
+        return tuple(result)
+
+    def adopt_descriptor(self, descriptor):
+        """Refresh mode-dependent gun law without resetting ammunition.
+
+        ``CompositeVehicleDescriptor`` swaps its active gun, chassis and
+        turret when the exact client receives a final Siege-mode state.  Ammo,
+        reload progress and bloom remain one continuous battle state, while
+        dispersion, aiming, reload and shell objects must come from the newly
+        active descriptor.
+        """
+        gun = descriptor.gun
+        shots = tuple(_field(gun, 'shots', ()) or ())
+        if (self._shot_compact_descrs(shots) !=
+                self._shot_compact_descrs(self.shots)):
+            raise RuntimeError(
+                '#1513 siege-mode gun changed its ammunition contract')
+        factors = _field(gun, 'shotDispersionFactors', {}) or {}
+        base_dispersion = (
+            _positive(_field(gun, 'shotDispersionAngle', 0.1), 0.1) *
+            self._dispersion_factor)
+        after_shot = _positive(_field(factors, 'afterShot', 1.5), 1.5)
+        aim_time = (_positive(_field(gun, 'aimingTime', 2.0), 2.0) *
+                    self._aim_time_factor)
+        reload_time = (_positive(_field(gun, 'reloadTime', 5.0), 5.0) *
+                       self._reload_factor)
+        clip = _field(gun, 'clip', (1, 2.0)) or (1, 2.0)
+        try:
+            clip_reload = _positive(clip[1], 2.0) * self._reload_factor
+        except (TypeError, ValueError, IndexError):
+            clip_reload = 2.0 * self._reload_factor
+        previous = (self.base_dispersion, self.after_shot, self.aim_time,
+                    self.reload, self.clip_reload)
+        self.shots = shots
+        self.base_dispersion = base_dispersion
+        self.after_shot = after_shot
+        self.aim_time = aim_time
+        self.reload = reload_time
+        self.clip_reload = clip_reload
+        return previous != (
+            self.base_dispersion, self.after_shot, self.aim_time,
+            self.reload, self.clip_reload)
 
     def _layout_ammo(self, ammo_layout):
         """Map a garage shell layout onto this gun's shot order.

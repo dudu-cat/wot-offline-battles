@@ -172,6 +172,15 @@ class SessionPlanTest(unittest.TestCase):
         self.assertEqual(7, session["team_size"])
         self.assertEqual("Fast MS-1", session["vehicle_profile"])
 
+    def test_0_9_22_plan_carries_independent_team_sizes_and_preference(self):
+        session = core.plan_session(
+            self._status(), core.MODE_HOST,
+            team1_size="3", team2_size="11", preferred_team="2")
+        self.assertEqual(11, session["team_size"])
+        self.assertEqual(3, session["team1_size"])
+        self.assertEqual(11, session["team2_size"])
+        self.assertEqual(2, session["preferred_team"])
+
     def test_modified_profile_is_refused_for_lan(self):
         for status, mode in (
                 (self._status(), core.MODE_HOST),
@@ -192,6 +201,21 @@ class SessionPlanTest(unittest.TestCase):
         session = core.plan_session(
             self._status(), core.MODE_JOIN, "10.0.0.5", team_size="invalid")
         self.assertEqual(core.DEFAULT_TEAM_SIZE, session["team_size"])
+
+    def test_join_keeps_team_preference_without_applying_local_capacities(self):
+        session = core.plan_session(
+            self._status(), core.MODE_JOIN, "10.0.0.5",
+            team1_size="invalid", team2_size="invalid", preferred_team="1")
+        self.assertEqual(core.DEFAULT_TEAM_SIZE, session["team1_size"])
+        self.assertEqual(core.DEFAULT_TEAM_SIZE, session["team2_size"])
+        self.assertEqual(1, session["preferred_team"])
+
+    def test_preferred_team_must_be_auto_one_or_two(self):
+        for value in ("three", 3, -1, 1.5, True):
+            with self.assertRaises(core.LauncherError, msg=value):
+                core.plan_session(
+                    self._status(), core.MODE_JOIN, "10.0.0.5",
+                    preferred_team=value)
 
     def test_0_8_2_session_is_refused(self):
         with self.assertRaisesRegex(
@@ -376,6 +400,14 @@ class ServerPayloadTest(unittest.TestCase):
             core.PORT_0_9_22, "/game", {}, team_size=4)
         self.assertEqual("4", environment[core.SERVER_TEAM_SIZE_ENV_0922])
 
+    def test_0_9_22_server_receives_independent_team_sizes(self):
+        environment = core.server_environment(
+            core.PORT_0_9_22, "/game", {},
+            team1_size=4, team2_size=9)
+        self.assertEqual("9", environment[core.SERVER_TEAM_SIZE_ENV_0922])
+        self.assertEqual("4", environment[core.SERVER_TEAM1_SIZE_ENV_0922])
+        self.assertEqual("9", environment[core.SERVER_TEAM2_SIZE_ENV_0922])
+
     def test_single_player_server_is_explicitly_loopback_only(self):
         environment = core.server_environment(
             core.PORT_0_9_22, "/game", {}, loopback_only=True)
@@ -398,6 +430,12 @@ class ServerPayloadTest(unittest.TestCase):
             [os.path.join("/game", core.WORKER_STARTER_FILENAME_0922),
              core.WORKER_ONLY_ARGUMENT_0922],
             core.worker_child_command("/game"))
+
+    def test_hidden_worker_inherits_independent_team_sizes(self):
+        environment = core.worker_environment(
+            "/game", team1_size=2, team2_size=8, environment={})
+        self.assertEqual("2", environment[core.SERVER_TEAM1_SIZE_ENV_0922])
+        self.assertEqual("8", environment[core.SERVER_TEAM2_SIZE_ENV_0922])
 
     def test_visible_0_9_22_client_uses_isolated_config_and_endpoint(self):
         command = core.visible_client_command("/game", core.PORT_0_9_22)
@@ -425,6 +463,12 @@ class ServerPayloadTest(unittest.TestCase):
                      core.HIDDEN_DESKTOP_ENV_0922,
                      core.WORKER_READY_MARKER_ENV_0922):
             self.assertNotIn(name, environment)
+
+    def test_visible_client_carries_the_preferred_team(self):
+        environment = core.visible_client_environment(
+            core.PORT_0_9_22, environment={}, preferred_team=2)
+        self.assertEqual(
+            "2", environment[core.CLIENT_PREFERRED_TEAM_ENV_0922])
 
     def test_missing_payload_reports_a_launcher_error(self):
         self.assertRaises(core.LauncherError, core.run_server_payload,

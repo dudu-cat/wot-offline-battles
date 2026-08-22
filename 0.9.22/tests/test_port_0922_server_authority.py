@@ -831,6 +831,27 @@ class VehicleStatisticsTest(unittest.TestCase):
 
         self.assertEqual([], self._assists(state))
 
+    def test_spotted_total_counts_each_enemy_only_once(self):
+        state = self._live_state()
+        enemy_bot_id = min(
+            bot_id for bot_id, bot in state.bot_states.items()
+            if int(bot['team']) == 2)
+
+        self.assertTrue(self._report_spotted(state, 3, [('player', 2)]))
+        self.assertTrue(self._report_spotted(state, 3, []))
+        self.assertTrue(self._report_spotted(
+            state, 3, [('player', 2), ('bot', enemy_bot_id)]))
+
+        self.assertEqual(
+            2, state.vehicle_statistics[('player', 3)]['spotted'])
+        self.assertEqual(
+            2, state._receipt_statistics(
+                state.vehicle_statistics[('player', 3)])['spotted'])
+        interactions = state.vehicle_interactions[('player', 3)]
+        self.assertEqual(1, interactions['player:2']['spotted'])
+        self.assertEqual(1, interactions[
+            'bot:%d' % enemy_bot_id]['spotted'])
+
     def test_first_spotted_report_is_accepted_during_shared_countdown(self):
         state = _state_with_authority()
         self.assertFalse(self._report_spotted(state, 1, []))
@@ -919,6 +940,42 @@ class VehicleStatisticsTest(unittest.TestCase):
         self.assertGreaterEqual(direct['potential_damage'], direct['damage'])
         self.assertEqual(
             1, state.vehicle_statistics[('player', 1)]['shots_hit'])
+
+    def test_full_health_400_alpha_penetration_never_reports_200_damage(self):
+        state = self._live_state()
+        alpha = _projection()
+        alpha['name'] = 'test:400-alpha'
+        alpha['gun']['shots'][0]['shell']['damage'] = [400.0, 165.0]
+        state.descriptor_store.add('test:400-alpha', alpha)
+        state.server_authority.descriptors.add('test:400-alpha', alpha)
+        state.players[1].vehicle = 'test:400-alpha'
+        state.players[2].health = 880
+        state.players[2].max_health = 880
+        captured = []
+        original = state.resolve_projectile
+
+        def capture(player_id, message):
+            captured.append(copy.deepcopy(message))
+            return original(player_id, message)
+
+        state.resolve_projectile = capture
+
+        with mock.patch.object(
+                server_battle_authority.random, 'uniform',
+                side_effect=lambda low, unused_high: low):
+            projectile_id = self._launch(state, 1)
+            for unused in range(30):
+                state.tick_once(1.0 / TICK_HZ)
+                if projectile_id in state.projectile_tombstones:
+                    break
+            else:
+                self.fail('projectile did not reach a terminal')
+
+        self.assertEqual(300, captured[-1]['direct']['potential_damage'])
+        self.assertEqual(300, captured[-1]['direct']['damage'])
+        self.assertEqual(580, state.players[2].health)
+        self.assertEqual(
+            300, state.vehicle_statistics[('player', 1)]['damage_dealt'])
 
     def test_a_kill_is_counted_once_for_the_attacker(self):
         state = self._live_state()

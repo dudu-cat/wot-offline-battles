@@ -57,6 +57,49 @@ def _descriptor(max_ammo=100, clip=(3, 1.0)):
 
 class GunMechanicsParityTests(unittest.TestCase):
 
+    def test_siege_descriptor_refresh_preserves_live_ammo_and_reload(self):
+        state = GunState(
+            _descriptor(clip=(1, 1.0)),
+            loadout_modifiers={
+                'dispersion_factor': 0.8,
+                'aim_time_factor': 0.9,
+                'reload_factor': 0.75,
+            },
+            ammo_layout={1: 20, 2: 10, 3: 5})
+        state.shot_index = 1
+        state.pending_index = 2
+        state.ammo = [19, 8, 4]
+        state.clip = 0
+        state.reload_time = 2.25
+        state.reload_duration = 4.5
+        state.dispersion = 0.42
+        siege_descriptor = _descriptor(clip=(1, 0.8))
+        siege_descriptor.gun.shotDispersionAngle = 0.08
+        siege_descriptor.gun.shotDispersionFactors['afterShot'] = 1.2
+        siege_descriptor.gun.aimingTime = 1.4
+        siege_descriptor.gun.reloadTime = 4.0
+
+        self.assertTrue(state.adopt_descriptor(siege_descriptor))
+
+        self.assertEqual((1, 2), (state.shot_index, state.pending_index))
+        self.assertEqual([19, 8, 4], state.ammo)
+        self.assertEqual(0, state.clip)
+        self.assertEqual(2.25, state.reload_time)
+        self.assertEqual(4.5, state.reload_duration)
+        self.assertEqual(0.42, state.dispersion)
+        self.assertAlmostEqual(0.08 * 0.8, state.base_dispersion)
+        self.assertAlmostEqual(1.4 * 0.9, state.aim_time)
+        self.assertAlmostEqual(4.0 * 0.75, state.reload)
+        self.assertAlmostEqual(0.8 * 0.75, state.clip_reload)
+
+    def test_siege_descriptor_rejects_an_ammunition_contract_change(self):
+        state = GunState(_descriptor())
+        siege_descriptor = _descriptor()
+        siege_descriptor.gun.shots[0].shell.compactDescr = 99
+
+        with self.assertRaisesRegex(RuntimeError, 'ammunition contract'):
+            state.adopt_descriptor(siege_descriptor)
+
     def test_dispersion_reads_native_1513_chassis_attributes(self):
         descriptor = _descriptor()
         descriptor.chassis = _Strict1513Component(

@@ -177,6 +177,9 @@ class _TankmanDescriptor(object):
     def addXP(self, amount):
         self.free_xp += int(amount)
 
+    def totalXP(self):
+        return self.free_xp
+
     def makeCompactDescr(self):
         result = self.compact_descr + b'|' + ','.join(
             self.skills).encode('ascii')
@@ -695,6 +698,40 @@ class FittingRequestTests(unittest.TestCase):
         self.assertEqual([11001, 0, 0], record['eqsLayout'])
         self.assertEqual([11001, 0, 0], record['eqs'])
 
+    def test_battle_xp_reaches_every_crew_member_and_accelerates_the_weakest(self):
+        snapshot = copy.deepcopy(SNAPSHOT)
+        snapshot['vehicles'][0]['settings'] = 1
+        snapshot['vehicles'][0]['tankmen'][102] = b'tman:102|#50'
+        vehicles, tankmen_module = _modules()
+        state = self.garage.GarageState(
+            snapshot, vehicles_module=vehicles,
+            tankmen_module=tankmen_module)
+
+        result = state.award_battle_crew_xp(50001, 100, 1)
+
+        tankmen = state.snapshot()['vehicles'][0]['tankmen']
+        self.assertTrue(result['accelerated'])
+        self.assertEqual(101, result['weakest_tankman_id'])
+        self.assertEqual(200, _TankmanDescriptor(tankmen[101]).totalXP())
+        self.assertEqual(150, _TankmanDescriptor(tankmen[102]).totalXP())
+
+    def test_battle_xp_does_not_accelerate_when_the_vehicle_setting_is_off(self):
+        snapshot = copy.deepcopy(SNAPSHOT)
+        snapshot['vehicles'][0]['settings'] = 0
+        vehicles, tankmen_module = _modules()
+        state = self.garage.GarageState(
+            snapshot, vehicles_module=vehicles,
+            tankmen_module=tankmen_module)
+
+        result = state.award_battle_crew_xp(50001, 75, 1)
+
+        self.assertFalse(result['accelerated'])
+        self.assertEqual(0, result['weakest_tankman_id'])
+        self.assertEqual(75, _TankmanDescriptor(
+            state.snapshot()['vehicles'][0]['tankmen'][101]).totalXP())
+        self.assertEqual(75, _TankmanDescriptor(
+            state.snapshot()['vehicles'][0]['tankmen'][102]).totalXP())
+
     def test_mounting_a_consumable_from_the_ammunition_window_succeeds(self):
         payload = [77, 9, 4, 10010, 20, 10011, 10, 0,
                    8, 11001, 1, 0, 0, 0, 0, 0, 0]
@@ -917,6 +954,52 @@ class GaragePersistenceTests(unittest.TestCase):
         restored = self._restart()['vehicles'][0]
 
         self.assertEqual(b'tman:101|brotherhood', restored['tankmen'][101])
+
+    def test_battle_crew_receipt_and_descriptors_commit_once_together(self):
+        snapshot = copy.deepcopy(SNAPSHOT)
+        snapshot['vehicles'][0]['settings'] = 1
+        unused_vehicles, tankmen = _modules()
+        store = self._store()
+
+        first = store.apply_battle_crew_xp(
+            snapshot, 'server:7:1', 50001, 100, 1,
+            tankmen_module=tankmen)
+        duplicate = store.apply_battle_crew_xp(
+            snapshot, 'server:7:1', 50001, 100, 1,
+            tankmen_module=tankmen)
+
+        self.assertTrue(first['applied'])
+        self.assertFalse(duplicate['applied'])
+        self.assertEqual(200, _TankmanDescriptor(
+            snapshot['vehicles'][0]['tankmen'][101]).totalXP())
+        restarted = copy.deepcopy(SNAPSHOT)
+        restarted['vehicles'][0]['settings'] = 1
+        restarted_store = self._store()
+        self.assertTrue(restarted_store.apply(restarted))
+        after_restart = restarted_store.apply_battle_crew_xp(
+            restarted, 'server:7:1', 50001, 100, 1,
+            tankmen_module=tankmen)
+        self.assertFalse(after_restart['applied'])
+        self.assertEqual(200, _TankmanDescriptor(
+            restarted['vehicles'][0]['tankmen'][101]).totalXP())
+        self.assertEqual(100, _TankmanDescriptor(
+            restarted['vehicles'][0]['tankmen'][102]).totalXP())
+
+    def test_schema_three_garage_upgrades_without_losing_the_loadout(self):
+        state = self._state()
+        state.equip_equipments(9, [11001, 0, 0])
+        store = self._store()
+        store.mark_dirty()
+        self.assertTrue(store.flush(state.snapshot()))
+        with io.open(self.path, 'r', encoding='utf-8') as stream:
+            saved = stream.read().replace('"schema": 4', '"schema": 3')
+        with io.open(self.path, 'w', encoding='utf-8') as stream:
+            stream.write(saved)
+
+        fresh = copy.deepcopy(SNAPSHOT)
+        self.assertTrue(self._store().apply(fresh))
+
+        self.assertEqual([11001, 0, 0], fresh['vehicles'][0]['eqs'])
 
     def test_a_saved_setting_wins_over_the_bootstrap_default(self):
         state = self._state()

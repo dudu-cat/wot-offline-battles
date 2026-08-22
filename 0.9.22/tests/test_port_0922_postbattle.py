@@ -70,6 +70,21 @@ class _Replay(object):
         )).encode('ascii')
 
 
+class _InteractionDetails(object):
+    instances = []
+
+    def __init__(self, unique_ids, values):
+        self.rows = {}
+        self.initial = (list(unique_ids), list(values))
+        self.__class__.instances.append(self)
+
+    def __getitem__(self, unique_id):
+        return self.rows.setdefault(unique_id, {})
+
+    def pack(self):
+        return b'exact-1513-interaction-details'
+
+
 def _receipt(account_key='account-key-123456'):
     receipt = {
         'receipt_id': 'server:7:1', 'arena_unique_id': (7 << 32) | 1,
@@ -98,6 +113,18 @@ def _receipt(account_key='account-key-123456'):
         'stats': dict(receipt['stats']),
     }]
     return receipt
+
+
+def _interaction(target_kind='bot', target_id=17, **updates):
+    value = dict(
+        (name, minimum if name == 'death_reason' else 0)
+        for name, unused_native, minimum, unused_maximum in
+        postbattle_store.INTERACTION_FIELDS)
+    value.update({
+        'target_kind': target_kind, 'target_id': target_id,
+    })
+    value.update(updates)
+    return value
 
 
 def _account_receipts(state, account_key):
@@ -170,6 +197,34 @@ class PostBattleContractTests(unittest.TestCase):
         self.assertEqual(receipt['stats']['shots'], vehicle['shots'])
         self.assertEqual(receipt['stats']['piercings'], vehicle['piercings'])
         self.assertEqual(1, vehicle['survivedBattles'])
+
+    def test_accelerated_training_diverts_vehicle_xp_once(self):
+        store = postbattle_store.PostBattleStore(path=None)
+        calls = []
+        store.set_progress_applier(
+            lambda receipt: (calls.append(receipt['receipt_id']) or
+                             {'accelerated': True}))
+        receipt = _receipt(store.account_key)
+
+        self.assertTrue(store.accept(receipt))
+        self.assertFalse(store.accept(receipt))
+
+        self.assertEqual([receipt['receipt_id']], calls)
+        self.assertEqual(
+            0, store.progress()['vehicles'][receipt['vehicle']]['xp'])
+        self.assertEqual(receipt['rewards']['credits'],
+                         store.progress()['credits'])
+
+    def test_ordinary_training_keeps_vehicle_xp(self):
+        store = postbattle_store.PostBattleStore(path=None)
+        store.set_progress_applier(lambda unused: {'accelerated': False})
+        receipt = _receipt(store.account_key)
+
+        self.assertTrue(store.accept(receipt))
+
+        self.assertEqual(
+            receipt['rewards']['xp'],
+            store.progress()['vehicles'][receipt['vehicle']]['xp'])
 
     def test_premature_disconnect_does_not_count_as_survived(self):
         store = postbattle_store.PostBattleStore(path=None)
@@ -265,6 +320,28 @@ class PostBattleContractTests(unittest.TestCase):
             self.assertTrue(final.acknowledge(receipt['arena_unique_id']))
             self.assertFalse(final.accept(receipt))
 
+    def test_client_store_reloads_nonempty_interaction_details(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / 'postbattle_state.json')
+            store = postbattle_store.PostBattleStore(path=path)
+            receipt = _receipt(store.account_key)
+            enemy_stats = dict((name, 0) for name in receipt['stats'])
+            receipt['public_results'].append({
+                'actor_kind': 'bot', 'actor_id': 17, 'name': 'Atlas-17',
+                'vehicle': 'germany:G04_PzVI_Tiger_I', 'team': 2,
+                'health': 100, 'death_reason': -1,
+                'killer_kind': '', 'killer_id': 0,
+                'is_team_killer': False, 'xp': 0, 'stats': enemy_stats,
+            })
+            receipt['interactions'] = [_interaction(
+                spotted=1, direct_hits=2, piercings=1, damage=240)]
+
+            self.assertTrue(store.accept(receipt))
+            restarted = postbattle_store.PostBattleStore(path=path)
+            persisted = restarted._pending[str(receipt['arena_unique_id'])]
+            self.assertEqual(receipt['interactions'],
+                             persisted['interactions'])
+
     def test_native_compact_contract_uses_all_six_stock_packers(self):
         packers = _Packers()
         receipt = _receipt()
@@ -312,6 +389,55 @@ class PostBattleContractTests(unittest.TestCase):
                             'goldReplay', 'crystalReplay'):
             self.assertTrue(vehicle_fields[replay_name])
 
+    def test_native_vehicle_details_keep_each_enemy_interaction(self):
+        receipt = _receipt()
+        enemy_stats = dict((name, 0) for name in receipt['stats'])
+        receipt['public_results'].append({
+            'actor_kind': 'bot', 'actor_id': 17, 'name': 'Atlas-17',
+            'vehicle': 'germany:G04_PzVI_Tiger_I', 'team': 2,
+            'health': 0, 'death_reason': 0,
+            'killer_kind': 'player', 'killer_id': 1,
+            'is_team_killer': False, 'xp': 220, 'stats': enemy_stats,
+        })
+        receipt['interactions'] = [_interaction(
+            spotted=1, death_reason=0, direct_hits=4,
+            piercings=3, damage=900, assist_track=120,
+            target_kills=1)]
+        compact_ids = {
+            'ussr:R11_MS-1': 50001,
+            'germany:G04_PzVI_Tiger_I': 60002,
+        }
+        packers = _Packers()
+        _InteractionDetails.instances[:] = []
+        original_vehicle = postbattle_store._vehicle_type_compact_descr
+        original_arena = postbattle_store._arena_type_id
+        try:
+            postbattle_store._vehicle_type_compact_descr = compact_ids.get
+            postbattle_store._arena_type_id = lambda unused: 70001
+            postbattle_store.pack_battle_result(
+                receipt, packers=packers,
+                replay_types=(_Replay, _ReplayConnector),
+                interaction_details_type=_InteractionDetails)
+        finally:
+            postbattle_store._vehicle_type_compact_descr = original_vehicle
+            postbattle_store._arena_type_id = original_arena
+
+        self.assertEqual(1, len(_InteractionDetails.instances))
+        details = _InteractionDetails.instances[0]
+        self.assertEqual(([], []), details.initial)
+        self.assertEqual({(2, 60002)}, set(details.rows))
+        target = details.rows[2, 60002]
+        self.assertEqual(4, target['directHits'])
+        self.assertEqual(3, target['piercings'])
+        self.assertEqual(900, target['damageDealt'])
+        self.assertEqual(120, target['damageAssistedTrack'])
+        self.assertEqual(1, target['targetKills'])
+        vehicle = next(
+            value for name, value in packers.calls
+            if name == 'VEH_FULL_RESULTS')
+        self.assertEqual(
+            b'exact-1513-interaction-details', vehicle['details'])
+
     def test_registered_1500_stream_and_1501_ack(self):
         class Store(object):
             def __init__(self):
@@ -351,6 +477,21 @@ class PostBattleContractTests(unittest.TestCase):
         inconsistent = json.loads(json.dumps(receipt))
         inconsistent['public_results'][0]['stats']['damage'] += 1
         self.assertFalse(lan_client_module._valid_battle_receipt(inconsistent))
+
+        detailed = json.loads(json.dumps(receipt))
+        enemy_stats = dict((name, 0) for name in receipt['stats'])
+        detailed['public_results'].append({
+            'actor_kind': 'bot', 'actor_id': 17, 'name': 'Atlas-17',
+            'vehicle': 'germany:G04_PzVI_Tiger_I', 'team': 2,
+            'health': 100, 'death_reason': -1,
+            'killer_kind': '', 'killer_id': 0,
+            'is_team_killer': False, 'xp': 0, 'stats': enemy_stats,
+        })
+        detailed['interactions'] = [_interaction(
+            direct_hits=1, damage=240)]
+        self.assertTrue(lan_client_module._valid_battle_receipt(detailed))
+        detailed['interactions'][0]['damage'] = 65536
+        self.assertFalse(lan_client_module._valid_battle_receipt(detailed))
 
     def test_native_public_payload_contains_both_humans_and_bots(self):
         receipt = _receipt()
@@ -508,6 +649,12 @@ class PostBattleContractTests(unittest.TestCase):
                             team=2, account_key='b' * 32)
             state.players = {1: first, 2: second}
             state._freeze_round_participants((first, second))
+            state._record_damage(
+                ('player', 1), ('player', 2), 240, {})
+            state._increment_interaction(
+                ('player', 1), ('player', 2), 'direct_hits')
+            state._increment_interaction(
+                ('player', 1), ('player', 2), 'piercings')
             self.assertTrue(state._finish_battle(1, 'elimination'))
             first_id = _latest_receipt(
                 state, first.account_key)['receipt_id']
@@ -516,6 +663,15 @@ class PostBattleContractTests(unittest.TestCase):
 
             restarted = BattleState(
                 map_name='01_karelia', receipt_state_path=path)
+            first_receipt = _latest_receipt(
+                restarted, first.account_key)
+            self.assertEqual(1, len(first_receipt['interactions']))
+            self.assertEqual(240, first_receipt[
+                'interactions'][0]['damage'])
+            self.assertEqual(1, first_receipt[
+                'interactions'][0]['direct_hits'])
+            self.assertEqual(1, first_receipt[
+                'interactions'][0]['piercings'])
             self.assertEqual(
                 [first.account_key, second.account_key],
                 [receipt['account_key']
@@ -753,6 +909,9 @@ class PostBattleContractTests(unittest.TestCase):
         self.assertEqual(1, len(socket_one.payloads))
         self.assertTrue(state.acknowledge_result_receipt(
             player_one.player_id, {'receipt_id': receipt['receipt_id']}))
+        self.assertEqual(2, len(socket_one.payloads))
+        self.assertEqual(second_receipt['receipt_id'], json.loads(
+            socket_one.payloads[-1].decode('utf-8'))['receipt_id'])
         self.assertTrue(state._deliver_result_receipt(player_one))
         self.assertEqual(2, len(socket_one.payloads))
         self.assertEqual(second_receipt['receipt_id'], json.loads(

@@ -140,6 +140,23 @@ class CriticalDamageTests(unittest.TestCase):
             set(critical_damage._OFFH_DEATH_DEVICES),
             vehicle._destroyed_devices)
 
+    def test_equipment_engine_loss_uses_module_hp_and_can_destroy_engine(self):
+        vehicle = types.SimpleNamespace(
+            typeDescriptor=_descriptor(), health=500,
+            devices_hp={}, _destroyed_devices=set(), _crew_ko=set(),
+            is_on_fire=False)
+
+        first = critical_damage.damage_device_over_time(
+            vehicle, 'engineHealth', 1.5, 'removedRpmLimiter')
+        final = critical_damage.damage_device_over_time(
+            vehicle, 'engineHealth', 200.0, 'removedRpmLimiter')
+
+        self.assertAlmostEqual(98.5, first['devices'][0]['hp'])
+        self.assertEqual(0.0, vehicle.devices_hp['engineHealth'])
+        self.assertIn('engineHealth', vehicle._destroyed_devices)
+        self.assertTrue(vehicle.is_engine_dead)
+        self.assertEqual('destroyed', final['events'][0]['state'])
+
     def test_critical_descriptor_adapter_uses_native_attributes(self):
         component = _Strict1513Component(
             itemTypeName='vehicleTurret', fireStartingChance=0.12)

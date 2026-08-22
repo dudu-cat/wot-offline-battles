@@ -37,6 +37,11 @@ CLOSE_THREAT_FOCUS_LIMIT = 4
 ROUTE_REBALANCE_SECONDS = 4.0
 ROUTE_LEASE_SECONDS = 6.0
 MAX_BASE_DEFENDERS = 3
+RECENT_HIT_SECONDS = 6.0
+RECENT_ATTACKER_SCORE_BONUS = 140.0
+LOW_HEALTH_BASE_FRACTION = 0.18
+CROSSFIRE_MIN_ANGLE = math.radians(55.0)
+CROSSFIRE_MAX_DISTANCE = 360.0
 
 
 def _number(value, default=0.0):
@@ -85,6 +90,7 @@ class BotPlanner(object):
         self._target_assignments = {}
         self._base_defense = {1: {}, 2: {}}
         self._artillery_anchors = {}
+        self._recent_hits = {}
 
     def reset(self):
         self.revision = 0
@@ -101,6 +107,26 @@ class BotPlanner(object):
         self._target_assignments = {}
         self._base_defense = {1: {}, 2: {}}
         self._artillery_anchors = {}
+        self._recent_hits = {}
+
+    def report_damage(self, victim_bot_id, attacker_kind, attacker_id,
+                      damage, now):
+        """Record one server-admitted hostile hit for tactical reactions."""
+        victim_bot_id = _integer(victim_bot_id)
+        attacker_id = _integer(attacker_id)
+        damage = max(0, _integer(damage))
+        kind = str(attacker_kind or "")
+        if kind == "player":
+            kind = "human"
+        if (victim_bot_id <= 0 or attacker_id <= 0 or damage <= 0 or
+                kind not in ("human", "bot")):
+            return False
+        self._recent_hits[victim_bot_id] = {
+            "attacker": (kind, attacker_id),
+            "reported_at": _number(now),
+            "damage": damage,
+        }
+        return True
 
     def report_contacts(self, contacts, known_targets, now,
                         accepted_visibility=None):
@@ -287,7 +313,8 @@ class BotPlanner(object):
                 order = self._order_for(
                     bot, index, len(team_bots), assignments.get(bot["id"]),
                     contacts[team], now,
-                    defenders.get(team, {}).get(bot["id"]), team_axis)
+                    defenders.get(team, {}).get(bot["id"]), team_axis,
+                    team_bots)
                 base = defenders.get(team, {}).get(bot["id"])
                 orders.append(order)
         orders.sort(key=lambda value: value["id"])
@@ -402,6 +429,11 @@ class BotPlanner(object):
         for bot_id in list(self._artillery_anchors):
             if bot_id not in live_bots:
                 del self._artillery_anchors[bot_id]
+        for bot_id, hit in list(self._recent_hits.items()):
+            if (bot_id not in live_bots or not isinstance(hit, dict) or
+                    _number(now) - _number(hit.get("reported_at")) >
+                    RECENT_HIT_SECONDS):
+                del self._recent_hits[bot_id]
         for bot_id, report in list(self._affordances.items()):
             bot = live_bots.get(bot_id)
             target_key = report.get("target") if isinstance(report, dict) else None
@@ -740,6 +772,84 @@ class BotPlanner(object):
                                      desired * 1.5 + mobility * 210.0))
         return distance
 
+    def _recent_hit(self, bot_id, now):
+        hit = self._recent_hits.get(_integer(bot_id))
+        if not isinstance(hit, dict):
+            return None
+        if (_number(now) - _number(hit.get("reported_at")) >
+                RECENT_HIT_SECONDS):
+            self._recent_hits.pop(_integer(bot_id), None)
+            return None
+        return hit
+
+    def _recent_threat_contact(self, bot, contacts, now):
+        hit = self._recent_hit(bot["id"], now)
+        if hit is None:
+            return None
+        key = hit.get("attacker")
+        for contact in contacts:
+            if (str(contact.get("target_kind") or ""),
+                    _integer(contact.get("id"))) == key:
+                return contact
+        return None
+
+    @staticmethod
+    def _ally_support_score(bot, team_bots, focus):
+        """Return nearby and forward ally support on a normalized scale."""
+        bx = _number(bot["state"].get("x"))
+        bz = _number(bot["state"].get("z"))
+        tx = _number(focus.get("position", {}).get("x"))
+        tz = _number(focus.get("position", {}).get("z"))
+        score = 0.0
+        for ally in team_bots or ():
+            if ally["id"] == bot["id"]:
+                continue
+            state = ally.get("state") if isinstance(
+                ally.get("state"), dict) else {}
+            health_fraction = (_number(state.get("health"), 1.0) /
+                               max(1.0, _number(
+                                   state.get("max_health"), 1.0)))
+            bot_distance = math.hypot(
+                _number(state.get("x")) - bx,
+                _number(state.get("z")) - bz)
+            target_distance = math.hypot(
+                _number(state.get("x")) - tx,
+                _number(state.get("z")) - tz)
+            score += health_fraction * max(
+                0.0, 1.0 - bot_distance / 130.0) * 0.55
+            score += health_fraction * max(
+                0.0, 1.0 - target_distance / 220.0) * 0.35
+        return round(_clamp(score, 0.0, 1.0), 3)
+
+    @staticmethod
+    def _crossfire_risk(bot, contacts):
+        """Estimate multi-direction exposure from current visible headings."""
+        bx = _number(bot["state"].get("x"))
+        bz = _number(bot["state"].get("z"))
+        bearings = []
+        for contact in contacts:
+            if (not contact.get("visible") or
+                    bot["id"] not in contact.get(
+                        "shootable_by_bot_ids", ())):
+                continue
+            dx = _number(contact.get("position", {}).get("x")) - bx
+            dz = _number(contact.get("position", {}).get("z")) - bz
+            distance = math.hypot(dx, dz)
+            if distance <= 1.0 or distance > CROSSFIRE_MAX_DISTANCE:
+                continue
+            bearings.append(math.atan2(dx, dz))
+        best = 0.0
+        for first_index, first in enumerate(bearings):
+            for second in bearings[first_index + 1:]:
+                separation = abs((first - second + math.pi) %
+                                 (math.pi * 2.0) - math.pi)
+                if separation < CROSSFIRE_MIN_ANGLE:
+                    continue
+                best = max(best, _clamp(
+                    (separation - CROSSFIRE_MIN_ANGLE) /
+                    math.radians(90.0), 0.0, 1.0))
+        return round(best, 3)
+
     def _assign_targets(self, bots, contacts, now):
         """Assign only locally shootable contacts, with a hard focus cap.
 
@@ -770,6 +880,12 @@ class BotPlanner(object):
                 score = 0.0
                 score += contact["health"] / float(max(1, contact["max_health"])) * 28.0
                 score += distance * 0.018
+                hit = self._recent_hit(bot["id"], now)
+                if (hit is not None and
+                        hit.get("attacker") == (
+                            str(contact.get("target_kind") or ""),
+                            _integer(contact.get("id")))):
+                    score -= RECENT_ATTACKER_SCORE_BONUS
                 if distance <= CLOSE_THREAT_DISTANCE:
                     # A point-blank enemy is an immediate self-defence problem,
                     # even while a previous long-range target still owns a
@@ -814,7 +930,11 @@ class BotPlanner(object):
                 best_candidate[3] <= CLOSE_THREAT_DISTANCE and
                 previous_candidate[3] > CLOSE_THREAT_DISTANCE
             )
-            if close_override:
+            hit = self._recent_hit(bot["id"], now)
+            attacker_override = bool(
+                hit is not None and best_key == hit.get("attacker") and
+                best_key != previous.get("target"))
+            if close_override or attacker_override:
                 continue
             if (lease_expired and
                     previous_candidate[0][0] >
@@ -1174,6 +1294,22 @@ class BotPlanner(object):
             anchor = _point(waypoints[max(0, index - 1)])
         return route_id, index, point, anchor, route_join
 
+    def _retreat_point(self, bot, route_anchor):
+        """Return the previous graph-validated route point when available."""
+        assignment = self._route_assignments.get(bot["id"])
+        route = assignment.get("route") if isinstance(
+            assignment, dict) else None
+        if not isinstance(route, dict):
+            route = bot.get("route") if isinstance(bot.get("route"), dict) else {}
+        waypoints = route.get("waypoints")
+        route_state = self._route_states.get(bot["id"])
+        if (not isinstance(waypoints, list) or not waypoints or
+                not isinstance(route_state, dict)):
+            return dict(route_anchor)
+        index = min(max(0, _integer(route_state.get("index"))),
+                    len(waypoints) - 1)
+        return _point(waypoints[max(0, index - 1)])
+
     @staticmethod
     def _flank_point(bot, contact, desired_range):
         bx = _number(bot["state"].get("x"))
@@ -1283,7 +1419,7 @@ class BotPlanner(object):
             return max(0, _integer(explosive.get("index")))
         return max(0, _integer(available[0].get("index")))
 
-    def _cover_candidate(self, bot, focus, personality, now):
+    def _cover_candidate(self, bot, focus, personality, now, urgent=False):
         report = self._affordances.get(bot["id"])
         target_key = (focus.get("target_kind"), focus["id"])
         if (report is None or report.get("target") != target_key or
@@ -1296,6 +1432,13 @@ class BotPlanner(object):
             "escape_feasible": 8.0 + personality["patience"] * 10.0,
             "peek_feasible": 6.0 + personality["aggression"] * 8.0,
         }
+        if urgent:
+            # A recently hit tank values nearby hard occlusion over a longer,
+            # prettier firing position.  The client still proves every point.
+            weights["enemy_occlusion"] += 22.0
+            weights["exposure"] = -48.0
+            weights["travel_distance"] -= 0.045
+            weights["escape_feasible"] += 10.0
         ranked = score_candidates(report.get("candidates"), weights)
         usable = [candidate for candidate in ranked
                   if candidate["water"] < 0.5 and candidate["slope"] <= 24.0 and
@@ -1338,8 +1481,10 @@ class BotPlanner(object):
                                       int(round(point["z"] / 8.0))))
         return selected, current
 
-    def _apply_cover_order(self, order, bot, focus, personality, now):
-        selected_state = self._cover_candidate(bot, focus, personality, now)
+    def _apply_cover_order(self, order, bot, focus, personality, now,
+                           urgent=False, hold_only=False):
+        selected_state = self._cover_candidate(
+            bot, focus, personality, now, urgent=urgent or hold_only)
         if selected_state is None:
             return False
         candidate, state = selected_state
@@ -1350,6 +1495,10 @@ class BotPlanner(object):
         cover_distance = math.hypot(cover["x"] - bx, cover["z"] - bz)
         peek_distance = math.hypot(peek["x"] - bx, peek["z"] - bz)
         phase = state.get("phase", "approach")
+        if (urgent or hold_only) and phase == "peek":
+            phase = "return"
+            state["phase"] = phase
+            state["phase_until"] = 0.0
         if phase in ("approach", "return") and cover_distance <= 4.5:
             completed_return = phase == "return"
             phase = "hold"
@@ -1358,7 +1507,8 @@ class BotPlanner(object):
                 state["refresh_candidate"] = True
             state["phase_until"] = (_number(now) + 0.65 +
                                     personality["patience"] * 1.35)
-        elif phase == "hold" and _number(now) >= _number(state.get("phase_until")):
+        elif (phase == "hold" and not urgent and not hold_only and
+              _number(now) >= _number(state.get("phase_until"))):
             phase = "peek"
             state["phase"] = phase
             state["phase_until"] = 0.0
@@ -1414,13 +1564,80 @@ class BotPlanner(object):
         if order.get("target_id") is None:
             order["face_position"] = dict(anchor["face"])
 
+    @staticmethod
+    def _set_target(order, bot, contact, profile, personality,
+                    fire_allowed):
+        order["target_id"] = contact["id"]
+        order["target_kind"] = contact.get("target_kind")
+        order["aim_position"] = dict(contact["position"])
+        order["face_position"] = dict(contact["position"])
+        order["fire_allowed"] = bool(fire_allowed)
+        order["shell_index"] = BotPlanner._shell_index(
+            profile, contact, personality, bot.get("state"))
+
+    @staticmethod
+    def _angled_face_point(bot, target, personality):
+        """Return a 12-30 degree hull face point for a stationary turret."""
+        bx = _number(bot["state"].get("x"))
+        by = _number(bot["state"].get("y"))
+        bz = _number(bot["state"].get("z"))
+        dx = _number(target.get("x")) - bx
+        dz = _number(target.get("z")) - bz
+        if math.hypot(dx, dz) <= 0.1:
+            return _point(target), 0.0
+        degrees = 12.0 + personality["caution"] * 18.0
+        if bot["id"] % 2:
+            degrees = -degrees
+        radians = math.radians(degrees)
+        cosine = math.cos(radians)
+        sine = math.sin(radians)
+        return _point({
+            "x": bx + dx * cosine - dz * sine,
+            "y": by,
+            "z": bz + dx * sine + dz * cosine,
+        }), round(degrees, 3)
+
+    @staticmethod
+    def _may_angle_hull(profile):
+        roles = profile.get("roles") if isinstance(
+            profile.get("roles"), dict) else {}
+        return bool(
+            str(profile.get("class_tag") or "") in (
+                "heavyTank", "mediumTank", "lightTank") and
+            (_number(profile.get("armor")) >= 60.0 or
+             _number(roles.get("brawler")) >= 0.55))
+
+    def _apply_stationary_angling(self, order, bot, profile, personality):
+        # Angling is intentionally limited to a stopped firing hold.  Movement,
+        # cover peeks, withdrawals and limited-traverse TDs keep their proven
+        # travel/weapon heading instead of rotating into nearby geometry.
+        if (order.get("combat_mode") != "engage" or
+                _number(order.get("throttle_override"), 1.0) != 0.0 or
+                not order.get("fire_allowed") or
+                not self._may_angle_hull(profile)):
+            return
+        point, degrees = self._angled_face_point(
+            bot, order.get("aim_position") or {}, personality)
+        if abs(degrees) <= 0.01:
+            return
+        order["face_position"] = point
+        order["hull_angle_degrees"] = degrees
+
     def _order_for(self, bot, index, count, focus, contacts, now,
-                   travel_override=None, team_axis=None):
+                   travel_override=None, team_axis=None, team_bots=None):
         route_id, route_index, move, route_anchor, route_join = self._route(bot, now)
+        retreat_point = self._retreat_point(bot, route_anchor)
         profile = dict(bot["profile"])
         desired_range = max(10.0, _number(profile.get("desired_range"), 180.0))
         fire_range = max(desired_range, _number(profile.get("fire_range"), 500.0))
         personality = self._personality(bot["id"])
+        state = bot.get("state") if isinstance(bot.get("state"), dict) else {}
+        health_fraction = (_number(state.get("health"), 1.0) /
+                           max(1.0, _number(state.get("max_health"), 1.0)))
+        low_health = health_fraction <= (
+            LOW_HEALTH_BASE_FRACTION + personality["caution"] * 0.18)
+        recent_hit = self._recent_hit(bot["id"], now)
+        threat_contact = self._recent_threat_contact(bot, contacts, now)
         order = {
             "id": bot["id"],
             "team": bot["team"],
@@ -1443,39 +1660,105 @@ class BotPlanner(object):
             "profile": profile,
             "shell_index": 0,
         }
-        if focus is None:
-            self._engage_anchors.pop(bot["id"], None)
-            self._cover_states.pop(bot["id"], None)
-            if travel_override is not None:
-                self._apply_base_defense_order(
-                    order, bot, travel_override)
-            elif str(profile.get("class_tag") or "") == "SPG":
-                self._apply_artillery_order(order, bot, team_axis)
-            return order
-        order["target_id"] = focus["id"]
-        order["target_kind"] = focus.get("target_kind")
-        order["aim_position"] = dict(focus["position"])
-        order["face_position"] = dict(focus["position"])
-        observers = focus.get("shootable_by_bot_ids")
-        locally_shootable = bool(focus.get("visible") and
-                                 bot["id"] in (observers or ()))
-        order["fire_allowed"] = locally_shootable
-        order["shell_index"] = self._shell_index(
-            profile, focus, personality, bot.get("state"))
         if travel_override is not None:
+            if focus is not None:
+                observers = focus.get("shootable_by_bot_ids")
+                self._set_target(
+                    order, bot, focus, profile, personality,
+                    bool(focus.get("visible") and
+                         bot["id"] in (observers or ())))
             self._apply_base_defense_order(order, bot, travel_override)
             return order
         if str(profile.get("class_tag") or "") == "SPG":
+            if focus is not None:
+                observers = focus.get("shootable_by_bot_ids")
+                self._set_target(
+                    order, bot, focus, profile, personality,
+                    bool(focus.get("visible") and
+                         bot["id"] in (observers or ())))
             self._apply_artillery_order(order, bot, team_axis)
             return order
-        bx = _number(bot["state"].get("x"))
-        bz = _number(bot["state"].get("z"))
+
+        if focus is None:
+            self._engage_anchors.pop(bot["id"], None)
+            if threat_contact is not None:
+                observers = threat_contact.get("shootable_by_bot_ids")
+                self._set_target(
+                    order, bot, threat_contact, profile, personality,
+                    bool(threat_contact.get("visible") and
+                         bot["id"] in (observers or ())))
+                if self._apply_cover_order(
+                        order, bot, threat_contact, personality, now,
+                        urgent=True, hold_only=low_health):
+                    return order
+            self._cover_states.pop(bot["id"], None)
+            if low_health:
+                order["combat_mode"] = "low_health_retreat"
+                order["move_position"] = dict(retreat_point)
+            elif recent_hit is not None:
+                order["combat_mode"] = "under_fire_withdraw"
+                order["move_position"] = dict(retreat_point)
+            return order
+
+        observers = focus.get("shootable_by_bot_ids")
+        locally_shootable = bool(focus.get("visible") and
+                                 bot["id"] in (observers or ()))
+        self._set_target(
+            order, bot, focus, profile, personality, locally_shootable)
+        bx = _number(state.get("x"))
+        bz = _number(state.get("z"))
         distance = math.hypot(focus["position"]["x"] - bx,
                               focus["position"]["z"] - bz)
         dominant = str(profile.get("dominant_role") or "support")
         roles = profile.get("roles") if isinstance(profile.get("roles"), dict) else {}
         far_limit = desired_range * (1.08 + personality["caution"] * 0.18)
         close_limit = desired_range * (0.48 + personality["aggression"] * 0.10)
+        support_score = self._ally_support_score(
+            bot, team_bots or (), focus)
+        crossfire_risk = self._crossfire_risk(bot, contacts)
+
+        if low_health:
+            self._engage_anchors.pop(bot["id"], None)
+            if (distance <= fire_range * 1.15 and
+                    self._apply_cover_order(
+                        order, bot, focus, personality, now,
+                        urgent=True, hold_only=True)):
+                return order
+            self._cover_states.pop(bot["id"], None)
+            order["combat_mode"] = "low_health_retreat"
+            order["move_position"] = dict(retreat_point)
+            order["throttle_override"] = None
+            return order
+
+        if recent_hit is not None:
+            cover_focus = threat_contact or focus
+            cover_observers = cover_focus.get("shootable_by_bot_ids")
+            self._set_target(
+                order, bot, cover_focus, profile, personality,
+                bool(cover_focus.get("visible") and
+                     bot["id"] in (cover_observers or ())))
+            self._engage_anchors.pop(bot["id"], None)
+            if self._apply_cover_order(
+                    order, bot, cover_focus, personality, now, urgent=True):
+                return order
+            self._cover_states.pop(bot["id"], None)
+            order["combat_mode"] = "under_fire_withdraw"
+            order["move_position"] = dict(retreat_point)
+            order["throttle_override"] = None
+            return order
+
+        if crossfire_risk >= 0.35 and support_score < 0.70:
+            self._engage_anchors.pop(bot["id"], None)
+            if (distance <= fire_range * 1.15 and
+                    self._apply_cover_order(
+                        order, bot, focus, personality, now, urgent=True)):
+                return order
+            self._cover_states.pop(bot["id"], None)
+            order["combat_mode"] = "crossfire_withdraw"
+            order["move_position"] = dict(retreat_point)
+            order["throttle_override"] = None
+            return order
+
         if not locally_shootable:
             self._engage_anchors.pop(bot["id"], None)
             self._cover_states.pop(bot["id"], None)
@@ -1490,12 +1773,28 @@ class BotPlanner(object):
             order["combat_mode"] = "route"
             order["move_position"] = dict(move)
             order["throttle_override"] = None
+        elif (bot["id"] in self._cover_states and
+              distance <= fire_range * 1.15 and
+              self._apply_cover_order(
+                  order, bot, focus, personality, now)):
+            self._engage_anchors.pop(bot["id"], None)
         elif distance > far_limit:
             self._engage_anchors.pop(bot["id"], None)
             self._cover_states.pop(bot["id"], None)
-            order["combat_mode"] = "advance_contact"
-            order["move_position"] = dict(focus["position"])
-            order["throttle_override"] = 0.72
+            advance_score = (
+                personality["aggression"] * 0.85 +
+                personality["initiative"] * 0.30 +
+                support_score * (0.35 + personality["teamwork"] * 0.25) -
+                personality["caution"] * 0.55)
+            threshold = 0.24 if dominant == "brawler" else 0.34
+            if advance_score >= threshold:
+                order["combat_mode"] = "advance_contact"
+                order["move_position"] = dict(focus["position"])
+                order["throttle_override"] = 0.72
+            else:
+                order["combat_mode"] = "support_hold"
+                order["move_position"] = _point(state)
+                order["throttle_override"] = 0.0
         elif (distance <= fire_range * 1.15 and
               self._apply_cover_order(order, bot, focus, personality, now)):
             self._engage_anchors.pop(bot["id"], None)
@@ -1545,6 +1844,8 @@ class BotPlanner(object):
             # oscillation and could reverse a tank toward an unprobed cliff or
             # traffic queue.
             order["throttle_override"] = 0.0
+        self._apply_stationary_angling(
+            order, bot, profile, personality)
         return order
 
     @staticmethod

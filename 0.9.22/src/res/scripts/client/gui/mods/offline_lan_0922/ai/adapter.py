@@ -147,6 +147,9 @@ class BotAdapter(object):
             'recovery_mode': recovery_mode,
             'movement_intent': movement_intent,
         }
+        if strategic.get('hull_angle_degrees') is not None:
+            result['hull_angle_degrees'] = float(
+                strategic.get('hull_angle_degrees'))
         difference = target_yaw - float(state.get('yaw', 0.0))
         while difference > math.pi:
             difference -= 2.0 * math.pi
