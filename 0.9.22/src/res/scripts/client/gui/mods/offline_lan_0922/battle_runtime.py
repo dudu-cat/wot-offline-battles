@@ -31,7 +31,7 @@ from gui.mods.offline_lan_0922.entities.native_remote_vehicle import \
     NativeRemoteVehicleFactory, set_draw_visibility
 from gui.mods.offline_lan_0922.entities.remote_vehicle import (
     RemoteVehicleFactory, _collide_vehicle_evidence_at_matrix,
-    collide_vehicle_at_matrix, pose_animation_writes,
+    _pose_components, collide_vehicle_at_matrix, pose_animation_writes,
     reset_pose_animation_writes)
 from gui.mods.offline_lan_0922.entities.runtime import EntityPropertyBuilder
 from gui.mods.offline_lan_0922.projectile_manager import InFlightProjectiles
@@ -109,6 +109,19 @@ EXPERT_DEVICE_DELAY_SECONDS = 4.0
 PROJECTILE_PROGRESS_SECONDS = 0.10
 PROJECTILE_MAX_TIME_MS = 20000
 PROJECTILE_MAX_ACTIVE = 128
+PROJECTILE_CHORDS_PER_FRAME = 32
+PROJECTILE_MAX_CHORDS_PER_FRAME = 256
+# A rotating target traces a curve in component-local space. Subdivide until
+# every frozen component query spans at most one degree; reject pathological
+# motion rather than silently treating one midpoint matrix as exact.
+PROJECTILE_POSE_MAX_ANGLE_STEP = math.pi / 180.0
+PROJECTILE_POSE_MAX_SWEEP_STEPS = 16
+# A process that stopped observing poses cannot reconstruct an arbitrary turn
+# across a long callback/network gap. Start a new coverage window instead.
+PROJECTILE_POSE_MAX_HISTORY_GAP_SECONDS = 1.0
+# Size the fair global budget for the observed low-FPS boundary without ever
+# exceeding the previous release's 256-chord hard cap.
+PROJECTILE_SUSTAIN_SECONDS = 1.0 / 15.0
 ARTILLERY_ARC_RAYS_PER_FRAME = 4
 STANDARD_GAMEPLAY = 'ctf'
 PREBATTLE_SECONDS = 15.0
@@ -714,6 +727,35 @@ def _number(value, default=0.0):
 
 def _angle_delta(current, target):
     return (target - current + math.pi) % (2.0 * math.pi) - math.pi
+
+
+class _ProjectileCollisionAppearance(object):
+    """Aim matrices frozen with one historical collision pose."""
+
+    def __init__(self, math_module, turret_yaw, gun_pitch):
+        self.turretMatrix = math_module.Matrix()
+        self.turretMatrix.setRotateYPR((float(turret_yaw), 0.0, 0.0))
+        self.gunMatrix = math_module.Matrix()
+        self.gunMatrix.setRotateYPR((0.0, float(gun_pitch), 0.0))
+
+
+class _ProjectileCollisionTarget(object):
+    """Read-only target view shared by armour and critical-hit geometry."""
+
+    def __init__(self, source, descriptor, matrix, position, appearance,
+                 math_module):
+        self._source = source
+        self.typeDescriptor = descriptor
+        self.matrix = matrix
+        self.position = position
+        self.appearance = appearance
+        self._math = math_module
+
+    def __getattr__(self, name):
+        return getattr(self._source, name)
+
+    def getComponents(self):
+        return _pose_components(self, self._math)
 
 
 def _field(value, name, default=None):
@@ -8534,8 +8576,10 @@ class BattleRuntime(object):
         self._projectile_epoch = epoch
         self._projectile_meta = {}
         self._projectile_terminal_data = {}
-        self._projectile_target_positions = {}
-        self._projectile_position_history = []
+        # An epoch change elects a new simulator inside the same battle. Keep
+        # observational target history across that handoff: restored shells
+        # resume from their last checked cursor, which can predate election.
+        # Battle start/stop owns the full history reset.
         if self._projectiles is not None:
             reset_at = max(float(now), self._projectiles.now)
             if not self._projectiles.reset(reset_at):
@@ -8936,6 +8980,11 @@ class BattleRuntime(object):
         if not accepted:
             self._projectile_meta.pop(projectile_id, None)
             raise RuntimeError('canonical projectile launch was not admitted')
+        if not self._projectile_position_history:
+            poses = self._projectile_record_poses()
+            self._sample_projectile_positions(now, poses)
+            self._projectile_target_positions = dict(
+                (key, _xyz(pose)) for key, pose in poses.items())
         meta['awaiting_resolution'] = False
         meta['awaiting_ricochet'] = False
         return True
@@ -9375,9 +9424,81 @@ class BattleRuntime(object):
         """Compatibility seam returning only the authority body pose."""
         return self._projectile_vehicle_matrices(record, vehicle)[0]
 
-    def _sample_projectile_positions(self, now, positions):
-        """Keep enough pose history for budgeted projectile catch-up."""
-        sample = (float(now), dict(positions or {}))
+    @staticmethod
+    def _projectile_plain_pose(position, state=None):
+        state = state if isinstance(state, dict) else {}
+        yaw = _number(state.get('yaw'))
+        aim_yaw = _number(state.get('aim_yaw'), yaw)
+        turret_yaw = _number(
+            state.get('turret_yaw'), _angle_delta(yaw, aim_yaw))
+        return {
+            'x': _number(position[0]), 'y': _number(position[1]),
+            'z': _number(position[2]), 'yaw': yaw,
+            'pitch': _number(state.get('pitch')),
+            'roll': _number(state.get('roll')),
+            'turret_yaw': turret_yaw,
+            'gun_pitch': _number(state.get('gun_pitch')),
+            'siege_state': int(state.get('siege_state', 0) or 0),
+        }
+
+    def _projectile_record_pose(self, key, record, position):
+        """Freeze one coherent hull, aim and mode sample for collision."""
+        state = record.get('state') or {}
+        source = record.get('projectile_collision_pose')
+        if not isinstance(source, dict):
+            source = state
+        source_position = position
+        if all(name in source for name in ('x', 'y', 'z')):
+            source_position = _xyz(source)
+        pose = self._projectile_plain_pose(source_position, source)
+        entity = self._server_entity(record.get('engine_id'))
+        if entity is None:
+            return None
+        if record.get('local'):
+            pose.update({
+                'x': _number(self._local_position[0]),
+                'y': _number(self._local_position[1]),
+                'z': _number(self._local_position[2]),
+                'yaw': _number(self._local_yaw),
+                'pitch': _number(self._local_pitch),
+                'roll': _number(self._local_roll),
+            })
+        aim = getattr(entity, 'getAimParams', None)
+        if (not isinstance(record.get('projectile_collision_pose'), dict) and
+                callable(aim)):
+            try:
+                turret_yaw, gun_pitch = aim()
+                pose['turret_yaw'] = _number(turret_yaw)
+                pose['gun_pitch'] = _number(gun_pitch)
+            except Exception:
+                pass
+        return pose
+
+    def _projectile_record_poses(self):
+        positions = self._projectile_record_positions()
+        result = {}
+        for key, position in positions.items():
+            record = self._records.get(key)
+            if record is None:
+                continue
+            pose = self._projectile_record_pose(key, record, position)
+            if pose is not None:
+                result[key] = pose
+        return result
+
+    def _sample_projectile_positions(self, now, poses):
+        """Keep atomic collision-pose history for projectile catch-up."""
+        frozen = {}
+        for key, pose in (poses or {}).items():
+            if isinstance(pose, dict):
+                frozen[key] = dict(pose)
+            else:
+                frozen[key] = self._projectile_plain_pose(pose)
+        sample = (float(now), frozen)
+        if (self._projectile_position_history and
+                sample[0] - self._projectile_position_history[-1][0] >
+                PROJECTILE_POSE_MAX_HISTORY_GAP_SECONDS):
+            self._projectile_position_history = []
         if (self._projectile_position_history and
                 abs(self._projectile_position_history[-1][0] -
                     sample[0]) <= 1.0e-9):
@@ -9391,46 +9512,65 @@ class BattleRuntime(object):
                self._projectile_position_history[1][0] < floor):
             self._projectile_position_history.pop(0)
 
-    def _projectile_historic_position(self, key, absolute_time, fallback):
+    def _projectile_historic_pose(self, key, absolute_time):
+        """Interpolate one covered pose; never invent pre-history state."""
         history = self._projectile_position_history
         if not history:
-            return fallback
+            return None
         wanted = float(absolute_time)
-        first_time, first_positions = history[0]
-        if wanted <= first_time:
-            return first_positions.get(key, fallback)
-        for index in range(1, len(history)):
-            right_time, right_positions = history[index]
-            if wanted > right_time:
-                continue
-            left_time, left_positions = history[index - 1]
-            left = left_positions.get(key)
-            right = right_positions.get(key)
-            if left is None:
-                return right if right is not None else fallback
-            if right is None or right_time <= left_time + 1.0e-9:
-                return left
-            return lerp3(
-                left, right,
-                (wanted - left_time) / (right_time - left_time))
-        return history[-1][1].get(key, fallback)
+        first_time, first_poses = history[0]
+        if wanted < first_time - 1.0e-9:
+            return None
+        if wanted <= first_time + 1.0e-9:
+            pose = first_poses.get(key)
+            return dict(pose) if pose is not None else None
+        low = 1
+        high = len(history)
+        while low < high:
+            middle = (low + high) // 2
+            if wanted > history[middle][0] + 1.0e-9:
+                low = middle + 1
+            else:
+                high = middle
+        if low >= len(history):
+            return None
+        right_time, right_poses = history[low]
+        left_time, left_poses = history[low - 1]
+        left = left_poses.get(key)
+        right = right_poses.get(key)
+        if left is None or right is None:
+            return None
+        if (wanted >= right_time - 1.0e-9 or
+                right_time <= left_time + 1.0e-9):
+            return dict(right)
+        progress = max(0.0, min(
+            (wanted - left_time) / (right_time - left_time), 1.0))
+        result = dict(left)
+        for name in ('x', 'y', 'z'):
+            result[name] = (_number(left.get(name)) +
+                            (_number(right.get(name)) -
+                             _number(left.get(name))) * progress)
+        for name in ('yaw', 'pitch', 'roll', 'turret_yaw', 'gun_pitch'):
+            result[name] = (_number(left.get(name)) + _angle_delta(
+                _number(left.get(name)),
+                _number(right.get(name))) * progress)
+        # Discrete descriptor state changes at its recorded sample, never
+        # halfway through the preceding interval.
+        result['siege_state'] = left.get('siege_state', 0)
+        return result
 
     def _prune_projectile_position_history(self):
         if not self._projectile_position_history or self._projectiles is None:
             return
         states = self._projectiles.snapshot()
         if not states:
-            # A non-authority client may be elected before the next network
-            # snapshot. Keep a short recent trail while canonical visual
-            # projectiles prove that takeover work can still arrive.
-            if not self._projectile_visual_meta:
-                self._projectile_position_history = (
-                    self._projectile_position_history[-1:])
-                return
-            floor = self._projectile_position_history[-1][0] - 1.0
-            while (len(self._projectile_position_history) > 2 and
-                   self._projectile_position_history[1][0] < floor):
-                self._projectile_position_history.pop(0)
+            # `_sample_projectile_positions` already owns the exact 21-second
+            # lifetime cap. An idle worker needs pre-launch history for a
+            # delayed canonical shot. Collapse only a truly inactive observer.
+            if (not self._projectile_is_authority() and
+                    not self._projectile_visual_meta):
+                self._projectile_position_history = \
+                    self._projectile_position_history[-1:]
             return
         floor = min(float(state['cursor_time']) for state in states)
         while (len(self._projectile_position_history) > 2 and
@@ -9445,10 +9585,12 @@ class BattleRuntime(object):
             return False
         self._flush_pending_projectile_resolutions()
         previous = self._projectile_target_positions
-        current = self._projectile_record_positions()
+        current_poses = self._projectile_record_poses()
+        current = dict(
+            (key, _xyz(pose)) for key, pose in current_poses.items())
         if (len(self._projectiles) or self._projectile_visual_meta or
                 self._projectile_is_authority()):
-            self._sample_projectile_positions(now, current)
+            self._sample_projectile_positions(now, current_poses)
             self._prune_projectile_position_history()
         if not self._projectile_is_authority():
             self._projectile_target_positions = current
@@ -9459,9 +9601,15 @@ class BattleRuntime(object):
         self._projectile_frame_end = max(
             self._projectile_frame_start, float(now))
         active = len(self._projectiles)
+        sustainable = self._projectiles.sustainable_chord_budget(
+            PROJECTILE_SUSTAIN_SECONDS)
+        chord_budget = min(
+            PROJECTILE_MAX_CHORDS_PER_FRAME,
+            max(PROJECTILE_CHORDS_PER_FRAME, active * 2, sustainable))
         advance_start = _PROFILE_CLOCK()
         advanced = self._projectiles.advance(
-            now, self._projectile_chord, self._projectile_terminal)
+            now, self._projectile_chord, self._projectile_terminal,
+            maximum_chords=chord_budget)
         advance_seconds = max(0.0, _PROFILE_CLOCK() - advance_start)
         metrics = self._projectiles.last_advance_metrics()
         self._projectile_perf = {
@@ -9481,8 +9629,167 @@ class BattleRuntime(object):
             self._publish_projectile_progress()
         return advanced
 
-    def _projectile_vehicle_collisions(self, record, target, start, end):
+    def _projectile_descriptor_at_pose(self, target, pose):
+        descriptor = getattr(target, 'typeDescriptor', None)
+        if descriptor is None or not bool(getattr(
+                descriptor, 'hasSiegeMode', False)):
+            return descriptor
+        default = getattr(descriptor, 'defaultVehicleDescr', None)
+        siege = getattr(descriptor, 'siegeVehicleDescr', None)
+        if default is None or siege is None:
+            return descriptor
+        siege_states = getattr(
+            getattr(self._runtime, 'constants', None),
+            'VEHICLE_SIEGE_STATE', None)
+        enabled = getattr(siege_states, 'ENABLED', 2)
+        return siege if int(pose.get('siege_state', 0)) == enabled else default
+
+    @staticmethod
+    def _projectile_pitch_hull_aiming(descriptor):
+        return bool(descriptor is not None and getattr(
+            descriptor, 'isPitchHullAimingAvailable', False))
+
+    @staticmethod
+    def _projectile_pose_interval_travel(first, second):
+        """Return a conservative composed-component angular travel bound."""
+        hull = sum(abs(_angle_delta(
+            _number(first.get(name)), _number(second.get(name))))
+            for name in ('yaw', 'pitch', 'roll'))
+        turret = hull + abs(_angle_delta(
+            _number(first.get('turret_yaw')),
+            _number(second.get('turret_yaw'))))
+        gun = turret + abs(_angle_delta(
+            _number(first.get('gun_pitch')),
+            _number(second.get('gun_pitch'))))
+        return max(hull, turret, gun)
+
+    def _projectile_pose_sweep_fractions(self, key, absolute_start,
+                                         absolute_end):
+        """Split at recorded samples, then enforce the component angle cap."""
+        start = float(absolute_start)
+        end = float(absolute_end)
+        duration = end - start
+        if duration <= 1.0e-12:
+            return (0.0, 1.0)
+        history = self._projectile_position_history
+        boundaries = [start]
+        low = 0
+        high = len(history)
+        while low < high:
+            middle = (low + high) // 2
+            if history[middle][0] <= start + 1.0e-9:
+                low = middle + 1
+            else:
+                high = middle
+        index = low
+        while index < len(history):
+            sample_time = float(history[index][0])
+            if sample_time >= end - 1.0e-9:
+                break
+            boundaries.append(sample_time)
+            index += 1
+        boundaries.append(end)
+        intervals = []
+        total_travel = 0.0
+        siege_boundaries = set()
+        for index in range(len(boundaries) - 1):
+            interval_start = boundaries[index]
+            interval_end = boundaries[index + 1]
+            first = self._projectile_historic_pose(key, interval_start)
+            second = self._projectile_historic_pose(key, interval_end)
+            if first is None or second is None:
+                return None
+            travel = self._projectile_pose_interval_travel(first, second)
+            intervals.append((interval_start, interval_end, travel))
+            total_travel += travel
+            if (index < len(boundaries) - 2 and
+                    int(first.get('siege_state', 0)) !=
+                    int(second.get('siege_state', 0))):
+                siege_boundaries.add(interval_end)
+        angular_steps = max(1, int(math.ceil(
+            total_travel / PROJECTILE_POSE_MAX_ANGLE_STEP - 1.0e-12)))
+        if angular_steps > PROJECTILE_POSE_MAX_SWEEP_STEPS:
+            return None
+        absolute_boundaries = set(siege_boundaries)
+        if total_travel > 1.0e-12:
+            threshold = PROJECTILE_POSE_MAX_ANGLE_STEP
+            travelled = 0.0
+            for interval_start, interval_end, travel in intervals:
+                if travel <= 1.0e-12:
+                    continue
+                while (threshold < total_travel - 1.0e-12 and
+                       threshold <= travelled + travel + 1.0e-12):
+                    ratio = max(0.0, min(
+                        1.0, (threshold - travelled) / travel))
+                    absolute_boundaries.add(
+                        interval_start +
+                        (interval_end - interval_start) * ratio)
+                    threshold += PROJECTILE_POSE_MAX_ANGLE_STEP
+                travelled += travel
+        fractions = [0.0]
+        for absolute in sorted(absolute_boundaries):
+            fraction = (absolute - start) / duration
+            if fraction > 1.0e-9 and fraction < 1.0 - 1.0e-9:
+                fractions.append(fraction)
+        fractions.append(1.0)
+        if len(fractions) - 1 > PROJECTILE_POSE_MAX_SWEEP_STEPS:
+            return None
+        return tuple(fractions)
+
+    def _projectile_frozen_target(self, target, pose):
+        """Build one target view whose outer and inner geometry agree."""
+        descriptor = self._projectile_descriptor_at_pose(target, pose)
+        matrix_factory = getattr(self._runtime.math, 'Matrix', None)
+        if descriptor is None or not callable(matrix_factory):
+            return None
+        matrix = matrix_factory()
+        matrix.setRotateYPR((
+            _number(pose.get('yaw')),
+            _number(pose.get('pitch')),
+            _number(pose.get('roll'))))
+        position = self._vector(_xyz(pose))
+        matrix.translation = position
+        appearance = _ProjectileCollisionAppearance(
+            self._runtime.math, pose.get('turret_yaw', 0.0),
+            pose.get('gun_pitch', 0.0))
+        return _ProjectileCollisionTarget(
+            target, descriptor, matrix, position, appearance,
+            self._runtime.math)
+
+    def _projectile_vehicle_collisions(self, record, target, start, end,
+                                       pose=None):
         """Return retail ABI collisions plus private world-normal evidence."""
+        if pose is not None:
+            descriptor = self._projectile_descriptor_at_pose(target, pose)
+            if self._projectile_pitch_hull_aiming(descriptor):
+                # #1513 uses separate bodyMatrix and groundPlacingMatrix bases
+                # for these vehicles. The LAN pose has neither correction, so
+                # reject this sample instead of fabricating a single-matrix
+                # Strv pose or falling back to mixed live render state.
+                record['projectile_collision_pose_boundary'] = \
+                    'pitch_hull_body_ground_unavailable'
+                return None, None
+            if bool(getattr(target, 'isTurretDetached', False)):
+                # The 0.9.22 LAN pose contract has no historical attachment
+                # field. A currently detached turret is therefore not safe to
+                # reinterpret at an older projectile cursor.
+                record['projectile_collision_pose_boundary'] = \
+                    'turret_attachment_history_unavailable'
+                return None, None
+            else:
+                record.pop('projectile_collision_pose_boundary', None)
+                frozen_target = self._projectile_frozen_target(target, pose)
+                if frozen_target is not None:
+                    evidence = tuple(_collide_vehicle_evidence_at_matrix(
+                        frozen_target, frozen_target.matrix, start, end,
+                        self._runtime.math) or ())
+                    return (tuple(item.collision for item in evidence), evidence)
+            # A historical query may never borrow a live render matrix or live
+            # aim as a fallback: that would combine two different instants in
+            # one armour sample.
+            record['projectile_collision_pose_boundary'] = \
+                'historic_component_matrix_unavailable'
+            return None, None
         body_matrix = None
         chassis_matrix = None
         if record.get('local') and self._local_matrix is not None:
@@ -9513,6 +9820,11 @@ class BattleRuntime(object):
             for index in range(3)))
         if chord_length <= 0.000001:
             return None
+        history = self._projectile_position_history
+        history_covers_chord = bool(
+            history and
+            float(absolute_start) >= history[0][0] - 1.0e-9 and
+            float(absolute_end) <= history[-1][0] + 1.0e-9)
         direction_tuple = tuple(
             (float(end[index]) - float(start[index])) / chord_length
             for index in range(3))
@@ -9524,55 +9836,202 @@ class BattleRuntime(object):
         nearest_evidence = None
         nearest_fraction = 1.0
         nearest_query = None
+        nearest_collision_pose = None
         broadphase_sq = PROJECTILE_BROADPHASE_RADIUS ** 2
         for key, record in tuple(self._records.items()):
             self._projectile_scan_count += 1
             if key == source_key or record.get('tombstone'):
                 continue
-            current_position = self._projectile_current_positions.get(key)
-            if current_position is None:
+            if not record.get('ready'):
                 continue
-            target_at_start = self._projectile_historic_position(
-                key, absolute_start, current_position)
-            target_at_end = self._projectile_historic_position(
-                key, absolute_end, current_position)
+            if self._worker_mode and record.get('local'):
+                continue
+            if not history_covers_chord:
+                # Static scenery can still be resolved without vehicle pose
+                # history. A live vehicle target cannot: retire the projectile
+                # instead of silently treating that target as absent.
+                target = self._server_entity(record.get('engine_id'))
+                if target is None or not getattr(target, 'isStarted', False):
+                    continue
+                record['projectile_collision_pose_boundary'] = \
+                    'historic_pose_unavailable'
+                return {'reason': 'callback_error', 'fraction': 0.0}
+            target_at_start = self._projectile_historic_pose(
+                key, absolute_start)
+            target_at_end = self._projectile_historic_pose(
+                key, absolute_end)
+            target_at_contact = self._projectile_historic_pose(
+                key, (float(absolute_start) + float(absolute_end)) * 0.5)
+            if (target_at_start is None or target_at_end is None or
+                    target_at_contact is None):
+                target = self._server_entity(record.get('engine_id'))
+                if target is None or not getattr(target, 'isStarted', False):
+                    continue
+                record['projectile_collision_pose_boundary'] = \
+                    'historic_pose_unavailable'
+                return {'reason': 'callback_error', 'fraction': 0.0}
+            # This conservative coarse pass avoids constructing native target
+            # objects for distant records. The exact pass below repeats it for
+            # every angularly bounded subsegment.
+            contact_position = _xyz(target_at_contact)
+            start_position = _xyz(target_at_start)
+            end_position = _xyz(target_at_end)
             adjusted_start = tuple(
-                float(start[index]) + float(current_position[index]) -
-                float(target_at_start[index]) for index in range(3))
+                float(start[index]) + float(contact_position[index]) -
+                float(start_position[index]) for index in range(3))
             adjusted_end = tuple(
-                float(end[index]) + float(current_position[index]) -
-                float(target_at_end[index]) for index in range(3))
+                float(end[index]) + float(contact_position[index]) -
+                float(end_position[index]) for index in range(3))
             if not point_in_expanded_segment_bounds(
-                    current_position, adjusted_start, adjusted_end,
+                    contact_position, adjusted_start, adjusted_end,
                     PROJECTILE_BROADPHASE_RADIUS):
                 continue
             if point_segment_distance_sq(
-                    current_position, adjusted_start,
+                    contact_position, adjusted_start,
                     adjusted_end) > broadphase_sq:
                 continue
-            self._projectile_candidate_count += 1
             target = self._server_entity(record.get('engine_id'))
             if target is None or not getattr(target, 'isStarted', False):
                 continue
-            query_start = self._vector(adjusted_start)
-            query_end = self._vector(adjusted_end)
-            collisions, evidence = self._projectile_vehicle_collisions(
-                record, target, query_start, query_end)
-            if not collisions:
+            descriptor = self._projectile_descriptor_at_pose(
+                target, target_at_contact)
+            unsupported_boundary = None
+            if self._projectile_pitch_hull_aiming(descriptor):
+                unsupported_boundary = \
+                    'pitch_hull_body_ground_unavailable_live_fallback'
+            elif bool(getattr(target, 'isTurretDetached', False)):
+                unsupported_boundary = \
+                    'turret_attachment_history_unavailable_live_fallback'
+            if unsupported_boundary is not None:
+                # Preserve the pre-history-pose gameplay path for unsupported
+                # #1513 contracts. Its live orientation is imperfect, but it
+                # keeps these vehicles hittable while explicitly recording
+                # the body/ground or attachment evidence boundary.
+                record['projectile_collision_pose_boundary'] = \
+                    unsupported_boundary
+                current_position = self._projectile_current_positions.get(key)
+                if current_position is None:
+                    current_position = _xyz(getattr(
+                        target, 'position', target_at_contact))
+                adjusted_start = tuple(
+                    float(start[index]) + float(current_position[index]) -
+                    float(start_position[index]) for index in range(3))
+                adjusted_end = tuple(
+                    float(end[index]) + float(current_position[index]) -
+                    float(end_position[index]) for index in range(3))
+                self._projectile_candidate_count += 1
+                query_start = self._vector(adjusted_start)
+                query_end = self._vector(adjusted_end)
+                collisions, evidence = self._projectile_vehicle_collisions(
+                    record, target, query_start, query_end)
+                if not collisions:
+                    continue
+                collisions = tuple(collisions)
+                nearest = min(collisions, key=lambda item: float(item.dist))
+                query_length = (query_end - query_start).length
+                if query_length <= 0.000001:
+                    continue
+                fraction = max(
+                    0.0, min(1.0, float(nearest.dist) / query_length))
+                if fraction < nearest_fraction:
+                    nearest_key = key
+                    nearest_collisions = collisions
+                    nearest_evidence = evidence
+                    nearest_fraction = fraction
+                    nearest_query = (query_start, query_end)
+                    nearest_collision_pose = None
                 continue
-            collisions = tuple(collisions)
-            nearest = min(collisions, key=lambda item: float(item.dist))
-            query_length = (query_end - query_start).length
-            if query_length <= 0.000001:
+            sweep_fractions = self._projectile_pose_sweep_fractions(
+                key, absolute_start, absolute_end)
+            if sweep_fractions is None:
+                record['projectile_collision_pose_boundary'] = \
+                    'angular_sweep_limit_exceeded'
+                return {'reason': 'callback_error', 'fraction': 0.0}
+            candidate_segments = []
+            for segment_index in range(len(sweep_fractions) - 1):
+                start_fraction = sweep_fractions[segment_index]
+                end_fraction = sweep_fractions[segment_index + 1]
+                segment_absolute_start = (
+                    float(absolute_start) +
+                    (float(absolute_end) - float(absolute_start)) *
+                    start_fraction)
+                segment_absolute_end = (
+                    float(absolute_start) +
+                    (float(absolute_end) - float(absolute_start)) *
+                    end_fraction)
+                segment_absolute_contact = (
+                    segment_absolute_start + segment_absolute_end) * 0.5
+                segment_target_start = self._projectile_historic_pose(
+                    key, segment_absolute_start)
+                segment_target_end = self._projectile_historic_pose(
+                    key, segment_absolute_end)
+                segment_target_contact = self._projectile_historic_pose(
+                    key, segment_absolute_contact)
+                if (segment_target_start is None or
+                        segment_target_end is None or
+                        segment_target_contact is None):
+                    record['projectile_collision_pose_boundary'] = \
+                        'historic_pose_unavailable'
+                    return {'reason': 'callback_error', 'fraction': 0.0}
+                projectile_start = lerp3(start, end, start_fraction)
+                projectile_end = lerp3(start, end, end_fraction)
+                segment_contact_position = _xyz(segment_target_contact)
+                segment_start_position = _xyz(segment_target_start)
+                segment_end_position = _xyz(segment_target_end)
+                segment_adjusted_start = tuple(
+                    float(projectile_start[index]) +
+                    float(segment_contact_position[index]) -
+                    float(segment_start_position[index])
+                    for index in range(3))
+                segment_adjusted_end = tuple(
+                    float(projectile_end[index]) +
+                    float(segment_contact_position[index]) -
+                    float(segment_end_position[index])
+                    for index in range(3))
+                if not point_in_expanded_segment_bounds(
+                        segment_contact_position, segment_adjusted_start,
+                        segment_adjusted_end, PROJECTILE_BROADPHASE_RADIUS):
+                    continue
+                if point_segment_distance_sq(
+                        segment_contact_position, segment_adjusted_start,
+                        segment_adjusted_end) > broadphase_sq:
+                    continue
+                candidate_segments.append((
+                    start_fraction, end_fraction,
+                    segment_adjusted_start, segment_adjusted_end,
+                    segment_target_contact))
+            if not candidate_segments:
                 continue
-            fraction = max(
-                0.0, min(1.0, float(nearest.dist) / query_length))
-            if fraction < nearest_fraction:
-                nearest_key = key
-                nearest_collisions = collisions
-                nearest_evidence = evidence
-                nearest_fraction = fraction
-                nearest_query = (query_start, query_end)
+            self._projectile_candidate_count += 1
+            for (segment_start_fraction, segment_end_fraction,
+                 segment_start, segment_end,
+                 segment_collision_pose) in candidate_segments:
+                query_start = self._vector(segment_start)
+                query_end = self._vector(segment_end)
+                collisions, evidence = self._projectile_vehicle_collisions(
+                    record, target, query_start, query_end,
+                    segment_collision_pose)
+                if collisions is None:
+                    return {'reason': 'callback_error', 'fraction': 0.0}
+                if not collisions:
+                    continue
+                collisions = tuple(collisions)
+                nearest = min(collisions, key=lambda item: float(item.dist))
+                query_length = (query_end - query_start).length
+                if query_length <= 0.000001:
+                    continue
+                local_fraction = max(
+                    0.0, min(1.0, float(nearest.dist) / query_length))
+                fraction = (segment_start_fraction +
+                            (segment_end_fraction - segment_start_fraction) *
+                            local_fraction)
+                if fraction < nearest_fraction:
+                    nearest_key = key
+                    nearest_collisions = collisions
+                    nearest_evidence = evidence
+                    nearest_fraction = fraction
+                    nearest_query = (query_start, query_end)
+                    nearest_collision_pose = segment_collision_pose
 
         scene_end_tuple = lerp3(start, end, nearest_fraction)
         if self._projectile_destructible_context is not None:
@@ -9617,6 +10076,7 @@ class BattleRuntime(object):
                 'collisions': nearest_collisions,
                 'collision_evidence': nearest_evidence,
                 'query': nearest_query,
+                'collision_pose': nearest_collision_pose,
                 'piercing_loss': meta['piercing_loss'],
                 'penetration_factor': meta.get('penetration_factor'),
             }
@@ -9742,6 +10202,13 @@ class BattleRuntime(object):
         if (target is None or not collisions or query is None or
                 not self._record_alive(record, target)):
             return None
+        critical_target = target
+        collision_pose = terminal_data.get('collision_pose')
+        if isinstance(collision_pose, dict):
+            critical_target = self._projectile_frozen_target(
+                target, collision_pose)
+            if critical_target is None:
+                return None
         collisions, trace_start, trace_end = self._vehicle_trace(
             shot, query[0], query[1], collisions)
         if not combat_rules.is_he(shot):
@@ -9750,7 +10217,8 @@ class BattleRuntime(object):
             if trace_length > original_length + 0.000001:
                 extended, extended_evidence = (
                     self._projectile_vehicle_collisions(
-                        record, target, query[0], trace_end))
+                        record, target, query[0], trace_end,
+                        collision_pose))
                 if extended:
                     collisions, trace_start, trace_end = self._vehicle_trace(
                         shot, query[0], trace_end, tuple(extended))
@@ -9780,7 +10248,7 @@ class BattleRuntime(object):
                 terminal_data['world_normal'] = _xyz(
                     matching[0].worldNormal)
         armor = combat_rules.he_nominal_armor(
-            collisions, getattr(target, 'typeDescriptor', None))
+            collisions, getattr(critical_target, 'typeDescriptor', None))
         damage = combat_rules.damage(shot, result, armor)
         hull_damage = damage
         legacy_shell = combat_rules.legacy_shot(shot).get('shell') or {}
@@ -9790,21 +10258,36 @@ class BattleRuntime(object):
         layers = combat_rules.collision_layers(collisions)
         critical = None
         critical_delta = {}
+        critical_impact = self._vector(terminal_data['impact'])
+        query_delta = query[1] - query[0]
+        query_length = float(query_delta.length)
+        if query_length > 0.000001:
+            contact_distance = None
+            if contact is not None:
+                contact_distance = contact.get('distance')
+            if contact_distance is None:
+                contact_distance = min(
+                    float(collision.dist) for collision in collisions)
+            contact_distance = max(
+                0.0, min(query_length, float(contact_distance)))
+            query_delta.normalise()
+            critical_impact = query[0] + query_delta.scale(contact_distance)
         if int(result) == 0:
             damage = 0
             hull_damage = 0
         if int(result) != 0 and combat_rules.is_he(shot):
             damage, critical, critical_delta = (
                 critical_damage.propose_explosion(
-                    target, layers, self._vector(terminal_data['impact']),
+                    critical_target, layers, critical_impact,
                     trace_end - trace_start, damage, legacy_shell,
                     attacker_id, deadeye=deadeye, with_delta=True))
         elif int(result) != 0:
             damage, critical, critical_delta = critical_damage.propose_direct(
-                target, layers, trace_start, trace_end, damage,
+                critical_target, layers, trace_start, trace_end, damage,
                 legacy_shell, attacker_id, penetrated=int(result) == 2,
                 deadeye=deadeye, with_delta=True)
-        critical = self._critical_with_crew_roster(target, critical)
+        critical = self._critical_with_crew_roster(
+            critical_target, critical)
         return self._projectile_effect(
             record, damage, result, terminal_data['impact'],
             critical, hull_damage, critical_delta)
@@ -13653,6 +14136,8 @@ class BattleRuntime(object):
                 record['engine_id'], yaw,
                 _number(state.get('aim_yaw', yaw)),
                 _number(state.get('gun_pitch')))
+            record['projectile_collision_pose'] = \
+                self._projectile_plain_pose((x, y, z), state)
             self._run_optional_feature(
                 'bot track animation', self._update_bot_tracks,
                 (record, state, now))
@@ -14631,7 +15116,9 @@ class BattleRuntime(object):
         state = dict(event.get('state') or {})
         pose = event.get('pose')
         if isinstance(pose, dict):
-            for name in ('x', 'y', 'z', 'yaw', 'aim_yaw', 'gun_pitch'):
+            for name in ('x', 'y', 'z', 'yaw', 'pitch', 'roll',
+                         'aim_yaw', 'turret_yaw', 'gun_pitch',
+                         'siege_state'):
                 if name in pose:
                     state[name] = pose[name]
         pending = self._pending_bot_creates.get(key)
@@ -14748,6 +15235,12 @@ class BattleRuntime(object):
                 state.get('shot_penalty_until', 0.0) or 0.0),
             'ready_deadline': self._clock() + float(
                 self._config.get('startupTimeoutSeconds', 30.0))}
+        seed_pose = dict(state)
+        seed_pose.update({
+            'x': position[0], 'y': position[1], 'z': position[2],
+            'yaw': yaw})
+        self._records[key]['projectile_collision_pose'] = \
+            self._projectile_plain_pose(position, seed_pose)
         self._materialize_record(self._records[key])
 
     def _update_entity(self, event):
@@ -15064,6 +15557,11 @@ class BattleRuntime(object):
             roll = _number(pose.get('roll'))
             aim_yaw = _number(pose.get('aim_yaw', yaw))
             gun_pitch = _number(pose.get('gun_pitch'))
+            collision_pose = self._projectile_plain_pose(
+                (x, y, z), pose)
+            collision_pose['siege_state'] = int(
+                pose.get('siege_state', state.get('siege_state', 0)) or 0)
+            record['projectile_collision_pose'] = collision_pose
             alive = bool(state.get('alive', True)) and int(
                 state.get('health', 1) or 0) > 0
             signature = (x, y, z, yaw, pitch, roll, aim_yaw, gun_pitch)
@@ -17041,6 +17539,7 @@ class BattleRuntime(object):
         self._projectile_visual_meta = {}
         self._projectile_terminal_data = {}
         self._projectile_target_positions = {}
+        self._projectile_position_history = []
         self._projectile_lineage = set()
         if self._artillery is not None:
             self._artillery.reset()

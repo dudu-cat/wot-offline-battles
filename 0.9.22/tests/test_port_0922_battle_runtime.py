@@ -6456,6 +6456,47 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._select_local_siege_pose.assert_called_once_with(vehicle, True)
         battle._update_local_hull_aiming.assert_called_once_with(vehicle)
 
+    def test_old_siege_echo_does_not_rewrite_atomic_projectile_pose(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._binding = mock.Mock()
+        record = {
+            'engine_id': 11, 'local': False,
+            'presented_siege_state': 1,
+            'projectile_collision_pose': {
+                'x': 7.0, 'y': 2.0, 'z': 9.0,
+                'yaw': 0.75, 'pitch': 0.2, 'roll': -0.3,
+                'turret_yaw': 0.15, 'gun_pitch': -0.1,
+                'siege_state': 2,
+            },
+        }
+
+        self.assertFalse(battle._apply_siege_state(record, {
+            'siege_state': 1, 'siege_time_left_ms': 2000}))
+
+        self.assertEqual(
+            2, record['projectile_collision_pose']['siege_state'])
+        battle._binding.update_vehicle_siege_state.assert_not_called()
+
+    def test_record_pose_keeps_its_own_siege_state_with_old_state_echo(self):
+        battle = BattleRuntime(_runtime())
+        battle._binding = mock.Mock()
+        record = {
+            'engine_id': 11, 'local': False,
+            'state': {'siege_state': 1},
+        }
+        pose = {
+            'x': 7.0, 'y': 2.0, 'z': 9.0,
+            'yaw': 0.75, 'pitch': 0.2, 'roll': -0.3,
+            'aim_yaw': 0.9, 'gun_pitch': -0.1,
+            'siege_state': 2,
+        }
+
+        battle._apply_record_pose(record, pose)
+
+        self.assertEqual(
+            2, record['projectile_collision_pose']['siege_state'])
+
     def test_player_cannot_fire_during_a_siege_transition(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -14471,14 +14512,25 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertTrue(battle._apply_authority_bot_poses([{
             'id': 17, 'alive': True, 'x': 7.0, 'y': 2.0, 'z': 9.0,
-            'yaw': 0.75, 'aim_yaw': 0.9, 'gun_pitch': -0.1}]))
+            'yaw': 0.75, 'pitch': 0.2, 'roll': -0.3,
+            'aim_yaw': 0.9, 'gun_pitch': -0.1, 'siege_state': 1}]))
 
         pose_call = battle._binding.set_vehicle_pose.call_args
         self.assertEqual(11, pose_call[0][0])
         self.assertEqual((7.0, 2.0, 9.0), tuple(pose_call[0][1]))
-        self.assertEqual((0.0, 0.0, 0.75), pose_call[0][2])
+        self.assertEqual((-0.3, 0.2, 0.75), pose_call[0][2])
         battle._binding.update_vehicle_aim.assert_called_once_with(
             11, 0.75, 0.9, -0.1)
+        collision_pose = battle._records['bot:17'][
+            'projectile_collision_pose']
+        self.assertEqual((7.0, 2.0, 9.0), (
+            collision_pose['x'], collision_pose['y'], collision_pose['z']))
+        self.assertEqual((0.75, 0.2, -0.3), (
+            collision_pose['yaw'], collision_pose['pitch'],
+            collision_pose['roll']))
+        self.assertAlmostEqual(0.15, collision_pose['turret_yaw'])
+        self.assertEqual(-0.1, collision_pose['gun_pitch'])
+        self.assertEqual(1, collision_pose['siege_state'])
 
     def test_hidden_worker_authority_pose_skips_track_presentation(self):
         battle = BattleRuntime(_runtime())

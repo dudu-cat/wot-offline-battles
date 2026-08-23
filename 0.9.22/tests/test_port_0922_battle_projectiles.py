@@ -862,6 +862,11 @@ class BattleProjectileTests(unittest.TestCase):
         battle._server_entity = server_entity
         battle._projectile_current_positions = current
         battle._projectile_position_history = []
+        poses = dict(
+            (key, battle._projectile_plain_pose(position))
+            for key, position in current.items())
+        battle._sample_projectile_positions(0.0, poses)
+        battle._sample_projectile_positions(0.05, poses)
         battle._projectile_scan_count = 0
         battle._projectile_candidate_count = 0
         state = battle._projectiles.get('player:7:1')
@@ -884,6 +889,8 @@ class BattleProjectileTests(unittest.TestCase):
         target = types.SimpleNamespace(
             id=42, isStarted=True, matrix=rendered_matrix,
             position=_Vector((5.0, 1.0, 0.0)), isAlive=lambda: True)
+        target.typeDescriptor = types.SimpleNamespace(
+            isPitchHullAimingAvailable=True)
         battle._records['player:8'] = {
             'engine_id': 42, 'network_id': 8, 'kind': 'player',
             'native_remote': True, 'local': False, 'ready': True,
@@ -898,6 +905,11 @@ class BattleProjectileTests(unittest.TestCase):
             'player:8': (5.0, 1.0, 0.0),
         }
         battle._projectile_position_history = []
+        source_pose = battle._projectile_plain_pose((0.0, 0.0, 0.0))
+        target_pose = battle._projectile_plain_pose((5.0, 1.0, 0.0))
+        for sample_time in (0.0, 0.1):
+            battle._sample_projectile_positions(sample_time, {
+                'player:7': source_pose, 'player:8': target_pose})
         battle._resolve_shot_scene = mock.Mock(return_value={
             'piercing_loss': 0.0, 'penetration_factor': 1.0,
             'world_distance': 99999.0,
@@ -944,11 +956,19 @@ class BattleProjectileTests(unittest.TestCase):
             'player:7': (0.0, 0.0, 0.0),
             'bot:8': (5.0, 1.0, 0.0),
         }
+        source_pose = battle._projectile_plain_pose((0.0, 0.0, 0.0))
+        wreck_pose = battle._projectile_plain_pose((5.0, 1.0, 0.0))
+        for sample_time in (0.0, 0.1):
+            battle._sample_projectile_positions(sample_time, {
+                'player:7': source_pose, 'bot:8': wreck_pose})
         battle._resolve_shot_scene = mock.Mock(return_value={
             'piercing_loss': 0.0, 'penetration_factor': 1.0,
             'world_distance': 99999.0,
             'stopped_by_destructible': False,
         })
+        collision = types.SimpleNamespace(dist=5.0)
+        battle._projectile_vehicle_collisions = mock.Mock(
+            return_value=((collision,), ()))
         state = battle._projectiles.get('player:7:1')
 
         terminal = battle._projectile_chord(
@@ -958,7 +978,8 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertEqual(
             'bot:8', battle._projectile_terminal_data[
                 'player:7:1']['target_key'])
-        wreck.collideSegmentExt.assert_called_once()
+        battle._projectile_vehicle_collisions.assert_called_once()
+        wreck.collideSegmentExt.assert_not_called()
 
         self.assertTrue(battle._projectile_terminal(
             state, {'reason': 'impact'}))
@@ -969,7 +990,7 @@ class BattleProjectileTests(unittest.TestCase):
             {'target_kind': 'bot', 'target_id': 8},
             kwargs['wreck_hit'])
 
-    def test_slow_frame_fully_advances_all_29_projectiles_before_return(self):
+    def test_stock_max_29_projectile_debt_bounds_frame_and_reduces_scans(self):
         battle, bigworld = _battle()
         source = battle._server_entity(41)
         entities = {41: source}
@@ -999,11 +1020,23 @@ class BattleProjectileTests(unittest.TestCase):
             self.assertTrue(battle._accept_projectile_event(event))
 
         bigworld.now = 1.0
-        self.assertTrue(battle._advance_projectiles(1.0))
+        totals = {'chords': 0, 'scans': 0}
+        invocations = 0
+        while True:
+            self.assertTrue(battle._advance_projectiles(1.0))
+            perf = battle._projectile_perf
+            totals['chords'] += perf['chords']
+            totals['scans'] += perf['scans']
+            invocations += 1
+            if perf['debt'] <= 1e-9:
+                break
+            self.assertLess(invocations, 11)
 
-        self.assertEqual(638, battle._projectile_perf['chords'])
-        self.assertEqual(19140, battle._projectile_perf['scans'])
-        self.assertAlmostEqual(0.0, battle._projectile_perf['debt'])
+        self.assertEqual(11, invocations)
+        self.assertEqual(638, totals['chords'])
+        self.assertEqual(19140, totals['scans'])
+        self.assertEqual(58, battle._projectile_perf['chords'])
+        self.assertEqual(1740, battle._projectile_perf['scans'])
         self.assertEqual(0, battle._projectile_perf['candidates'])
         for entity_id, entity in entities.items():
             if entity_id != 41:
@@ -1016,11 +1049,11 @@ class BattleProjectileTests(unittest.TestCase):
             isAlive=lambda: True)
         observed = []
 
-        def collide(start, end):
-            observed.append((tuple(start), tuple(end)))
-            return []
+        def collide(unused_record, unused_target, start, end, pose=None):
+            observed.append((tuple(start), tuple(end), dict(pose)))
+            return (), ()
 
-        target.collideSegmentExt = collide
+        battle._projectile_vehicle_collisions = collide
         battle._records['bot:8'] = {
             'engine_id': 42, 'network_id': 8, 'kind': 'bot',
             'local': False, 'ready': True,
@@ -1031,18 +1064,416 @@ class BattleProjectileTests(unittest.TestCase):
         battle._projectile_record_positions = mock.Mock(side_effect=[
             {'player:7': (0.0, 0.0, 0.0), 'bot:8': (10.0, 0.0, 0.0)},
             {'player:7': (0.0, 0.0, 0.0), 'bot:8': (20.0, 0.0, 0.0)},
+            {'player:7': (0.0, 0.0, 0.0), 'bot:8': (20.0, 0.0, 0.0)},
         ])
         self.assertTrue(battle._accept_projectile_event(_event()))
-        bigworld.now = 1.0
-        battle._advance_projectiles(1.0)
-        bigworld.now = 1.1
-        battle._advance_projectiles(1.1)
+        module = sys.modules[BattleRuntime.__module__]
+        old_budget = module.PROJECTILE_CHORDS_PER_FRAME
+        old_maximum = module.PROJECTILE_MAX_CHORDS_PER_FRAME
+        module.PROJECTILE_CHORDS_PER_FRAME = 1
+        module.PROJECTILE_MAX_CHORDS_PER_FRAME = 1
+        try:
+            bigworld.now = 1.0
+            battle._advance_projectiles(1.0)
+            bigworld.now = 1.1
+            battle._advance_projectiles(1.1)
+        finally:
+            module.PROJECTILE_CHORDS_PER_FRAME = old_budget
+            module.PROJECTILE_MAX_CHORDS_PER_FRAME = old_maximum
 
         self.assertGreaterEqual(len(observed), 2)
-        # The second delayed chord still belongs near launch time.  Its query
-        # must compensate from that historic pose into the target's current
-        # collision matrix instead of pretending the target stood still.
-        self.assertGreater(observed[-1][0][0], 9.0)
+        # The second delayed chord still belongs near launch time. Its collision
+        # pose must remain near that time instead of using the render target at
+        # x=20 from the newest authority sample.
+        self.assertGreater(observed[-1][2]['x'], 10.0)
+        self.assertLess(observed[-1][2]['x'], 12.0)
+
+    def test_collision_pose_history_interpolates_angles_and_steps_siege(self):
+        battle, unused_bigworld = _battle()
+        near_pi = math.radians(179.0)
+        first = {
+            'x': 0.0, 'y': 1.0, 'z': 2.0,
+            'yaw': near_pi, 'pitch': near_pi, 'roll': near_pi,
+            'turret_yaw': near_pi, 'gun_pitch': near_pi,
+            'siege_state': 1,
+        }
+        second = {
+            'x': 10.0, 'y': 3.0, 'z': 4.0,
+            'yaw': -near_pi, 'pitch': -near_pi, 'roll': -near_pi,
+            'turret_yaw': -near_pi, 'gun_pitch': -near_pi,
+            'siege_state': 2,
+        }
+        battle._sample_projectile_positions(1.0, {'bot:8': first})
+        battle._sample_projectile_positions(2.0, {'bot:8': second})
+
+        self.assertIsNone(battle._projectile_historic_pose('bot:8', 0.999))
+        middle = battle._projectile_historic_pose('bot:8', 1.5)
+        self.assertEqual((5.0, 2.0, 3.0), (
+            middle['x'], middle['y'], middle['z']))
+        for name in ('yaw', 'pitch', 'roll', 'turret_yaw', 'gun_pitch'):
+            self.assertAlmostEqual(math.pi, middle[name])
+        self.assertEqual(1, middle['siege_state'])
+        self.assertEqual(
+            1, battle._projectile_historic_pose('bot:8', 1.999)[
+                'siege_state'])
+        self.assertEqual(
+            2, battle._projectile_historic_pose('bot:8', 2.0)[
+                'siege_state'])
+        self.assertIsNone(battle._projectile_historic_pose('bot:8', 2.001))
+
+    def test_record_pose_does_not_mix_frozen_xyz_with_render_interpolation(
+            self):
+        battle, unused_bigworld = _battle()
+        target = types.SimpleNamespace(id=42, isStarted=True)
+        battle._server_entity = lambda entity_id: (
+            target if entity_id == 42 else None)
+        record = {
+            'engine_id': 42,
+            'state': {'x': 8.0, 'y': 2.0, 'z': 9.0},
+            'projectile_collision_pose': {
+                'x': 7.0, 'y': 2.0, 'z': 9.0,
+                'yaw': 0.75, 'pitch': 0.2, 'roll': -0.3,
+                'turret_yaw': 0.15, 'gun_pitch': -0.1,
+                'siege_state': 2,
+            },
+        }
+
+        pose = battle._projectile_record_pose(
+            'bot:8', record, (8.5, 2.0, 9.0))
+
+        self.assertEqual(
+            (7.0, 2.0, 9.0), (pose['x'], pose['y'], pose['z']))
+        self.assertEqual(2, pose['siege_state'])
+
+    def test_rotating_target_chord_queries_angle_bounded_pose_segments(self):
+        battle, unused_bigworld = _battle()
+        self.assertTrue(battle._accept_projectile_event(_event()))
+        source = battle._server_entity(41)
+        target = types.SimpleNamespace(
+            id=42, isStarted=True, position=_Vector((5.0, 1.0, 0.0)))
+        battle._records['bot:8'] = {
+            'engine_id': 42, 'network_id': 8, 'kind': 'bot',
+            'local': False, 'ready': True,
+            'state': {'health': 100, 'alive': True}}
+        battle._server_entity = lambda entity_id: (
+            source if entity_id == 41 else target if entity_id == 42 else None)
+        source_pose = battle._projectile_plain_pose((0.0, 0.0, 0.0))
+        target_start = battle._projectile_plain_pose((5.0, 1.0, 0.0))
+        target_end = dict(target_start)
+        target_end['yaw'] = math.radians(4.0)
+        battle._projectile_position_history = []
+        battle._sample_projectile_positions(0.0, {
+            'player:7': source_pose, 'bot:8': target_start})
+        battle._sample_projectile_positions(0.05, {
+            'player:7': source_pose, 'bot:8': target_end})
+        observed = []
+
+        def collide(unused_record, unused_target, unused_start, unused_end,
+                    pose=None):
+            observed.append(dict(pose))
+            return (), ()
+
+        battle._projectile_vehicle_collisions = collide
+        battle._resolve_shot_scene = mock.Mock(return_value={
+            'piercing_loss': 0.0, 'penetration_factor': 1.0,
+            'world_distance': 99999.0,
+            'stopped_by_destructible': False,
+        })
+
+        result = battle._projectile_chord(
+            battle._projectiles.get('player:7:1'),
+            (0.0, 1.0, 0.0), (10.0, 1.0, 0.0), 0.0, 0.05)
+
+        self.assertIsNone(result)
+        self.assertEqual(4, len(observed))
+        for index, pose in enumerate(observed):
+            self.assertAlmostEqual(
+                math.radians(index + 0.5), pose['yaw'])
+
+    def test_pose_sweep_bounds_composed_hull_turret_and_gun_rotation(self):
+        battle, unused_bigworld = _battle()
+        first = battle._projectile_plain_pose((5.0, 1.0, 0.0))
+        second = dict(first)
+        second.update({
+            'yaw': math.radians(0.6),
+            'turret_yaw': math.radians(0.6),
+            'gun_pitch': math.radians(0.6),
+        })
+        battle._sample_projectile_positions(0.0, {'bot:8': first})
+        battle._sample_projectile_positions(0.05, {'bot:8': second})
+
+        fractions = battle._projectile_pose_sweep_fractions(
+            'bot:8', 0.0, 0.05)
+
+        self.assertEqual(3, len(fractions))
+        self.assertEqual((0.0, 1.0), (fractions[0], fractions[-1]))
+
+    def test_pose_sweep_splits_at_intermediate_rotation_reversal(self):
+        battle, unused_bigworld = _battle()
+        first = battle._projectile_plain_pose((5.0, 1.0, 0.0))
+        middle = dict(first)
+        middle['yaw'] = math.radians(4.0)
+        battle._sample_projectile_positions(0.0, {'bot:8': first})
+        battle._sample_projectile_positions(0.025, {'bot:8': middle})
+        battle._sample_projectile_positions(0.05, {'bot:8': first})
+
+        fractions = battle._projectile_pose_sweep_fractions(
+            'bot:8', 0.0, 0.05)
+
+        self.assertEqual(9, len(fractions))
+        self.assertAlmostEqual(0.5, fractions[4])
+
+    def test_pose_sweep_does_not_count_stationary_high_rate_samples_as_steps(
+            self):
+        battle, unused_bigworld = _battle()
+        pose = battle._projectile_plain_pose((5.0, 1.0, 0.0))
+        for index in range(101):
+            battle._sample_projectile_positions(
+                float(index) / 2000.0, {'bot:8': pose})
+
+        fractions = battle._projectile_pose_sweep_fractions(
+            'bot:8', 0.0, 0.05)
+
+        self.assertEqual((0.0, 1.0), fractions)
+
+    def test_pose_history_does_not_interpolate_across_observation_gap(self):
+        battle, unused_bigworld = _battle()
+        first = battle._projectile_plain_pose((5.0, 1.0, 0.0))
+        second = battle._projectile_plain_pose((15.0, 1.0, 0.0))
+        battle._sample_projectile_positions(0.0, {'bot:8': first})
+        battle._sample_projectile_positions(2.0, {'bot:8': second})
+
+        self.assertIsNone(battle._projectile_historic_pose('bot:8', 1.0))
+        self.assertEqual(
+            15.0, battle._projectile_historic_pose('bot:8', 2.0)['x'])
+
+    def test_excessive_angular_target_sweep_fails_closed(self):
+        battle, unused_bigworld = _battle()
+        self.assertTrue(battle._accept_projectile_event(_event()))
+        source = battle._server_entity(41)
+        target = types.SimpleNamespace(
+            id=42, isStarted=True, position=_Vector((5.0, 1.0, 0.0)))
+        record = {
+            'engine_id': 42, 'network_id': 8, 'kind': 'bot',
+            'local': False, 'ready': True,
+            'state': {'health': 100, 'alive': True}}
+        battle._records['bot:8'] = record
+        battle._server_entity = lambda entity_id: (
+            source if entity_id == 41 else target if entity_id == 42 else None)
+        source_pose = battle._projectile_plain_pose((0.0, 0.0, 0.0))
+        target_start = battle._projectile_plain_pose((5.0, 1.0, 0.0))
+        target_end = dict(target_start)
+        target_end['yaw'] = math.radians(17.0)
+        battle._projectile_position_history = []
+        battle._sample_projectile_positions(0.0, {
+            'player:7': source_pose, 'bot:8': target_start})
+        battle._sample_projectile_positions(0.05, {
+            'player:7': source_pose, 'bot:8': target_end})
+        battle._projectile_vehicle_collisions = mock.Mock()
+
+        result = battle._projectile_chord(
+            battle._projectiles.get('player:7:1'),
+            (0.0, 1.0, 0.0), (10.0, 1.0, 0.0), 0.0, 0.05)
+
+        self.assertEqual(
+            {'reason': 'callback_error', 'fraction': 0.0}, result)
+        self.assertEqual(
+            'angular_sweep_limit_exceeded',
+            record['projectile_collision_pose_boundary'])
+        battle._projectile_vehicle_collisions.assert_not_called()
+
+    def test_chord_before_pose_history_coverage_fails_closed(self):
+        battle, unused_bigworld = _battle()
+        self.assertTrue(battle._accept_projectile_event(_event()))
+        source = battle._server_entity(41)
+        target = types.SimpleNamespace(id=42, isStarted=True)
+        state = battle._projectiles.get('player:7:1')
+        battle._records['bot:8'] = {
+            'engine_id': 42, 'network_id': 8, 'kind': 'bot',
+            'local': False, 'ready': True,
+            'state': {'health': 100, 'alive': True}}
+        battle._server_entity = lambda entity_id: (
+            source if entity_id == 41 else
+            target if entity_id == 42 else None)
+
+        result = battle._projectile_chord(
+            state, (0.0, 1.0, 0.0), (1.0, 1.0, 0.0), -0.05, 0.0)
+
+        self.assertEqual(
+            {'reason': 'callback_error', 'fraction': 0.0}, result)
+
+    def test_pending_record_without_pose_history_does_not_retire_projectile(
+            self):
+        battle, unused_bigworld = _battle()
+        self.assertTrue(battle._accept_projectile_event(_event()))
+        source_pose = battle._projectile_plain_pose((0.0, 0.0, 0.0))
+        battle._sample_projectile_positions(0.05, {
+            'player:7': source_pose})
+        battle._records['bot:8'] = {
+            'engine_id': 42, 'network_id': 8, 'kind': 'bot',
+            'local': False, 'ready': False,
+            'state': {'health': 100, 'alive': True}}
+        battle._resolve_shot_scene = mock.Mock(return_value={
+            'piercing_loss': 0.0, 'penetration_factor': 1.0,
+            'world_distance': 99999.0,
+            'stopped_by_destructible': False,
+        })
+
+        result = battle._projectile_chord(
+            battle._projectiles.get('player:7:1'),
+            (0.0, 1.0, 0.0), (1.0, 1.0, 0.0), 0.0, 0.05)
+
+        self.assertIsNone(result)
+
+    def test_worker_private_carrier_is_not_a_projectile_target(self):
+        battle, unused_bigworld = _battle()
+        self.assertTrue(battle._accept_projectile_event(_event()))
+        source_pose = battle._projectile_plain_pose((0.0, 0.0, 0.0))
+        battle._sample_projectile_positions(0.05, {
+            'player:7': source_pose})
+        battle._worker_mode = True
+        battle._records['player:-1'] = {
+            'engine_id': 42, 'network_id': -1, 'kind': 'player',
+            'local': True, 'ready': True,
+            'state': {'health': 100, 'alive': True}}
+        battle._resolve_shot_scene = mock.Mock(return_value={
+            'piercing_loss': 0.0, 'penetration_factor': 1.0,
+            'world_distance': 99999.0,
+            'stopped_by_destructible': False,
+        })
+
+        result = battle._projectile_chord(
+            battle._projectiles.get('player:7:1'),
+            (0.0, 1.0, 0.0), (1.0, 1.0, 0.0), 0.0, 0.05)
+
+        self.assertIsNone(result)
+
+    def test_historic_component_collision_uses_one_frozen_pose_and_four_fields(
+            self):
+        battle, unused_bigworld = _battle()
+
+        class _PoseMatrix(object):
+            def __init__(self):
+                self.ypr = None
+                self.translation = None
+
+            def setRotateYPR(self, value):
+                self.ypr = tuple(value)
+
+        battle._runtime.math.Matrix = _PoseMatrix
+        descriptor = types.SimpleNamespace(
+            hasSiegeMode=False, isPitchHullAimingAvailable=False)
+        target = types.SimpleNamespace(typeDescriptor=descriptor)
+        record = {}
+        collision = (0.25, 0.75, object(), 'vehicleHull')
+        evidence = types.SimpleNamespace(
+            collision=collision, worldNormal=_Vector((0.0, 0.0, 1.0)))
+        pose = {
+            'x': 4.0, 'y': 5.0, 'z': 6.0,
+            'yaw': 0.1, 'pitch': 0.2, 'roll': 0.3,
+            'turret_yaw': 0.4, 'gun_pitch': -0.5,
+            'siege_state': 0,
+        }
+        module = sys.modules[BattleRuntime.__module__]
+
+        with mock.patch.object(
+                module, '_collide_vehicle_evidence_at_matrix',
+                return_value=(evidence,)) as collide:
+            collisions, returned_evidence = \
+                battle._projectile_vehicle_collisions(
+                    record, target, _Vector(), _Vector((10.0, 0.0, 0.0)),
+                    pose)
+
+        frozen_target, matrix = collide.call_args[0][:2]
+        self.assertIs(descriptor, frozen_target.typeDescriptor)
+        self.assertEqual((0.1, 0.2, 0.3), matrix.ypr)
+        self.assertEqual((4.0, 5.0, 6.0), tuple(matrix.translation))
+        self.assertEqual((0.4, 0.0, 0.0),
+                         frozen_target.appearance.turretMatrix.ypr)
+        self.assertEqual((0.0, -0.5, 0.0),
+                         frozen_target.appearance.gunMatrix.ypr)
+        self.assertEqual((collision,), collisions)
+        self.assertEqual(4, len(collisions[0]))
+        self.assertEqual((evidence,), returned_evidence)
+
+    def test_unsupported_historic_pose_contracts_keep_live_collision_fallback(
+            self):
+        cases = (
+            (True, False,
+             'pitch_hull_body_ground_unavailable_live_fallback'),
+            (False, True,
+             'turret_attachment_history_unavailable_live_fallback'),
+        )
+        for pitch_hull, detached, boundary in cases:
+            with self.subTest(boundary=boundary):
+                battle, unused_bigworld = _battle()
+                self.assertTrue(battle._accept_projectile_event(_event()))
+                source = battle._server_entity(41)
+                collision = types.SimpleNamespace(dist=5.0)
+                target = types.SimpleNamespace(
+                    id=42, isStarted=True,
+                    typeDescriptor=types.SimpleNamespace(
+                        hasSiegeMode=False,
+                        isPitchHullAimingAvailable=pitch_hull),
+                    isTurretDetached=detached, matrix=None,
+                    position=_Vector((5.0, 1.0, 0.0)),
+                    collideSegmentExt=mock.Mock(
+                        return_value=(collision,)))
+                record = {
+                    'engine_id': 42, 'network_id': 8, 'kind': 'bot',
+                    'local': False, 'ready': True,
+                    'state': {'health': 100, 'alive': True}}
+                battle._records['bot:8'] = record
+                battle._server_entity = lambda entity_id: (
+                    source if entity_id == 41 else
+                    target if entity_id == 42 else None)
+                source_pose = battle._projectile_plain_pose(
+                    (0.0, 0.0, 0.0))
+                target_pose = battle._projectile_plain_pose(
+                    (5.0, 1.0, 0.0))
+                battle._projectile_position_history = []
+                battle._sample_projectile_positions(0.0, {
+                    'player:7': source_pose, 'bot:8': target_pose})
+                battle._sample_projectile_positions(0.05, {
+                    'player:7': source_pose, 'bot:8': target_pose})
+                battle._projectile_current_positions = {
+                    'bot:8': (5.0, 1.0, 0.0)}
+                battle._resolve_shot_scene = mock.Mock(return_value={
+                    'piercing_loss': 0.0, 'penetration_factor': 1.0,
+                    'world_distance': 99999.0,
+                    'stopped_by_destructible': False,
+                })
+
+                result = battle._projectile_chord(
+                    battle._projectiles.get('player:7:1'),
+                    (0.0, 1.0, 0.0), (10.0, 1.0, 0.0), 0.0, 0.05)
+
+                self.assertEqual('impact', result['reason'])
+                self.assertAlmostEqual(0.5, result['fraction'])
+                target.collideSegmentExt.assert_called_once()
+                self.assertEqual(
+                    boundary, record['projectile_collision_pose_boundary'])
+                self.assertIsNone(battle._projectile_terminal_data[
+                    'player:7:1']['collision_pose'])
+
+    def test_historic_collision_never_falls_back_to_live_matrix(self):
+        battle, unused_bigworld = _battle()
+        target = types.SimpleNamespace(
+            typeDescriptor=types.SimpleNamespace(
+                hasSiegeMode=False, isPitchHullAimingAvailable=False),
+            matrix=object(), collideSegmentExt=mock.Mock())
+        record = {}
+
+        collisions, evidence = battle._projectile_vehicle_collisions(
+            record, target, _Vector(), _Vector((1.0, 0.0, 0.0)),
+            battle._projectile_plain_pose((1.0, 2.0, 3.0)))
+
+        self.assertIsNone(collisions)
+        self.assertIsNone(evidence)
+        self.assertEqual(
+            'historic_component_matrix_unavailable',
+            record['projectile_collision_pose_boundary'])
+        target.collideSegmentExt.assert_not_called()
 
     def test_snapshot_restores_only_after_checked_cursor(self):
         battle, bigworld = _battle(now=10.0)
@@ -1069,6 +1500,111 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertEqual(9.0, state['cursor_time'])
         self.assertEqual(3.0, battle._projectile_meta[
             'player:7:1']['piercing_loss'])
+
+    def test_takeover_keeps_pose_history_for_restored_old_vehicle_cursor(self):
+        battle, unused_bigworld = _battle(now=10.0)
+        source = battle._server_entity(41)
+        target = types.SimpleNamespace(
+            id=42, isStarted=True,
+            typeDescriptor=types.SimpleNamespace(
+                hasSiegeMode=False,
+                isPitchHullAimingAvailable=False),
+            position=_Vector((0.5, 1.0, 0.0)))
+        battle._records['bot:8'] = {
+            'engine_id': 42, 'network_id': 8, 'kind': 'bot',
+            'local': False, 'ready': True,
+            'state': {'health': 100, 'alive': True}}
+        battle._server_entity = lambda entity_id: (
+            source if entity_id == 41 else
+            target if entity_id == 42 else None)
+        source_pose = battle._projectile_plain_pose((0.0, 0.0, 0.0))
+        target_pose = battle._projectile_plain_pose((0.5, 1.0, 0.0))
+        battle._sample_projectile_positions(8.0, {
+            'player:7': source_pose, 'bot:8': target_pose})
+        battle._sample_projectile_positions(9.0, {
+            'player:7': source_pose, 'bot:8': target_pose})
+        battle._sample_projectile_positions(10.0, {
+            'player:7': source_pose, 'bot:8': target_pose})
+        battle._projectile_target_positions = {
+            'player:7': (0.0, 0.0, 0.0),
+            'bot:8': (0.5, 1.0, 0.0),
+        }
+        battle._prune_projectile_position_history()
+        snapshot = {
+            'server_time_ms': 10000, 'authority_epoch': 2,
+            'projectile_revision': 4,
+            'projectiles': [dict(
+                _event(), max_distance=100.0,
+                launch_server_time_ms=7000,
+                checked_through_ms=1500, checked_distance=15.0,
+                piercing_loss=0.0, authority_epoch=2)]}
+        snapshot['projectiles'][0].pop('maxDistance')
+        snapshot['projectiles'][0].pop('kind')
+        snapshot['projectiles'][0].pop('attacker')
+        battle.client.authority_epoch = 2
+
+        battle._observe_projectile_message(snapshot)
+        self.assertTrue(battle._reconcile_projectile_snapshot(snapshot))
+        state = battle._projectiles.get('player:7:1')
+        battle._projectile_vehicle_collisions = mock.Mock(
+            return_value=((), ()))
+        battle._resolve_shot_scene = mock.Mock(return_value={
+            'piercing_loss': 0.0, 'penetration_factor': 1.0,
+            'world_distance': 99999.0,
+            'stopped_by_destructible': False,
+        })
+
+        result = battle._projectile_chord(
+            state, (0.0, 1.0, 0.0), (1.0, 1.0, 0.0), 8.5, 8.55)
+
+        self.assertIsNone(result)
+        self.assertEqual(3, len(battle._projectile_position_history))
+        battle._projectile_vehicle_collisions.assert_called_once()
+
+    def test_idle_authority_keeps_history_for_delayed_first_launch(self):
+        battle, unused_bigworld = _battle(now=10.0)
+        source = battle._server_entity(41)
+        target = types.SimpleNamespace(
+            id=42, isStarted=True,
+            typeDescriptor=types.SimpleNamespace(
+                hasSiegeMode=False,
+                isPitchHullAimingAvailable=False),
+            position=_Vector((0.5, 1.0, 0.0)))
+        battle._records['bot:8'] = {
+            'engine_id': 42, 'network_id': 8, 'kind': 'bot',
+            'local': False, 'ready': True,
+            'state': {'health': 100, 'alive': True}}
+        battle._server_entity = lambda entity_id: (
+            source if entity_id == 41 else
+            target if entity_id == 42 else None)
+        source_pose = battle._projectile_plain_pose((0.0, 0.0, 0.0))
+        target_pose = battle._projectile_plain_pose((0.5, 1.0, 0.0))
+        for sample_time in (8.0, 9.0, 10.0):
+            battle._sample_projectile_positions(sample_time, {
+                'player:7': source_pose, 'bot:8': target_pose})
+        battle._prune_projectile_position_history()
+        battle._projectile_server_time_ms = 10000
+        battle._projectile_server_local_time = 10.0
+        event = _event()
+        event['launch_server_time_ms'] = 8500
+
+        self.assertTrue(battle._accept_projectile_event(event))
+        state = battle._projectiles.get('player:7:1')
+        self.assertAlmostEqual(8.5, state['cursor_time'])
+        battle._projectile_vehicle_collisions = mock.Mock(
+            return_value=((), ()))
+        battle._resolve_shot_scene = mock.Mock(return_value={
+            'piercing_loss': 0.0, 'penetration_factor': 1.0,
+            'world_distance': 99999.0,
+            'stopped_by_destructible': False,
+        })
+
+        result = battle._projectile_chord(
+            state, (0.0, 1.0, 0.0), (1.0, 1.0, 0.0), 8.5, 8.55)
+
+        self.assertIsNone(result)
+        self.assertEqual(3, len(battle._projectile_position_history))
+        battle._projectile_vehicle_collisions.assert_called_once()
 
     def test_takeover_restores_disconnected_shooter_from_frozen_vehicle(self):
         battle, bigworld = _battle(now=10.0)
@@ -1461,6 +1997,57 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertEqual(2, len(critical.call_args.args[1]))
         self.assertAlmostEqual(10.8, critical.call_args.args[3].x)
 
+    def test_direct_hit_uses_same_frozen_target_for_armor_and_modules(self):
+        battle, unused_bigworld = _battle()
+        source = battle._server_entity(41)
+        live_descriptor = types.SimpleNamespace()
+        frozen_descriptor = types.SimpleNamespace()
+        target = types.SimpleNamespace(
+            id=55, isStarted=True, typeDescriptor=live_descriptor,
+            position=_Vector((10.0, 0.0, 0.0)), isAlive=lambda: True)
+        frozen_target = types.SimpleNamespace(
+            id=55, typeDescriptor=frozen_descriptor)
+        battle._records['bot:17'] = {
+            'engine_id': 55, 'network_id': 17, 'kind': 'bot',
+            'local': False, 'ready': True,
+            'state': {'health': 1000, 'alive': True}}
+        battle._server_entity = lambda entity_id: (
+            source if entity_id == 41 else target if entity_id == 55 else None)
+        battle._projectile_frozen_target = mock.Mock(
+            return_value=frozen_target)
+        meta = battle._projectile_wire_meta(_event())
+        collision = types.SimpleNamespace(
+            dist=5.0, hitAngleCos=1.0, matInfo=object(), compName='hull')
+        collision_pose = battle._projectile_plain_pose((10.0, 0.0, 0.0))
+        terminal = {
+            'target_key': 'bot:17', 'collisions': [collision],
+            'query': (_Vector(), _Vector((10.0, 0.0, 0.0))),
+            'impact': (5.0, 0.0, 0.0),
+            'collision_pose': collision_pose,
+            'piercing_loss': 0.0, 'penetration_factor': 1.0,
+        }
+
+        with mock.patch.object(
+                combat_rules, 'resolve_armor_contact', return_value={
+                    'result': 2, 'distance': 5.0}), \
+                mock.patch.object(
+                    combat_rules, 'he_nominal_armor',
+                    return_value=100.0) as nominal, \
+                mock.patch.object(
+                    combat_rules, 'damage', return_value=390), \
+                mock.patch.object(
+                    critical_damage, 'propose_direct',
+                    return_value=(390, None, None)) as critical:
+            effect = battle._projectile_direct_effect(
+                meta, {'start': (0.0, 0.0, 0.0), 'distance': 5.0},
+                terminal)
+
+        self.assertEqual(390, effect['damage'])
+        battle._projectile_frozen_target.assert_called_once_with(
+            target, collision_pose)
+        self.assertIs(frozen_descriptor, nominal.call_args.args[1])
+        self.assertIs(frozen_target, critical.call_args.args[0])
+
     def test_he_direct_hit_uses_the_finite_explosion_cone(self):
         battle, unused_bigworld = _battle()
         source = battle._server_entity(41)
@@ -1488,7 +2075,9 @@ class BattleProjectileTests(unittest.TestCase):
             'target_key': 'bot:17', 'collisions': [collision],
             'query': (_Vector((0.0, 1.0, 0.0)),
                       _Vector((10.0, 1.0, 0.0))),
-            'impact': (10.0, 1.0, 0.0),
+            # Visual impact stays on the actual projectile path. The critical
+            # cone must instead start at the collision point in query space.
+            'impact': (11.0, 1.0, 0.0),
             'piercing_loss': 0.0, 'penetration_factor': 1.0,
         }
 
@@ -1515,6 +2104,7 @@ class BattleProjectileTests(unittest.TestCase):
 
         self.assertEqual(200, effect['damage'])
         self.assertEqual(1, effect['shot_result'])
+        self.assertEqual(11.0, effect['x'])
         self.assertEqual((10.0, 1.0, 0.0), tuple(
             cone.call_args.args[2][index] for index in range(3)))
         self.assertGreater(cone.call_args.args[3].length, 0.0)
