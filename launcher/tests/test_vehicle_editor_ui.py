@@ -30,6 +30,15 @@ class _Widget(object):
     def cget(self, name):
         return self.options.get(name)
 
+    def current(self, index=None):
+        if index is None:
+            return self.options.get("current", -1)
+        values = self.options.get("values", ())
+        self.options["current"] = index
+        variable = self.options.get("textvariable")
+        if variable is not None and 0 <= index < len(values):
+            variable.set(values[index])
+
 
 class _Root(_Widget):
     def title(self, title):
@@ -217,6 +226,11 @@ class VehicleEditorWindowTest(unittest.TestCase):
                          self.window.nation_box.cget("values"))
         self.assertEqual(("MS-1", "Test"),
                          self.window.vehicle_box.cget("values"))
+        self.assertEqual("normal", self.window.vehicle_box.cget("state"))
+        self.assertEqual("readonly", self.window.nation_box.cget("state"))
+        self.assertEqual("readonly", self.window.category_box.cget("state"))
+        self.assertEqual("readonly", self.window.field_box.cget("state"))
+        self.assertFalse(hasattr(self.window, "inspect_button"))
         self.assertEqual(("Vehicle", "Gun"),
                          self.window.category_box.cget("values"))
         self.assertEqual(
@@ -247,6 +261,84 @@ class VehicleEditorWindowTest(unittest.TestCase):
         self.assertEqual(("T1_Cunningham",),
                          self.window.vehicle_box.cget("values"))
         self.assertEqual("T1_Cunningham", self.window.vehicle.get())
+
+    def test_typing_filters_without_loading_until_enter_is_pressed(self):
+        topology_count = len(self.service.topology_calls)
+        self.window.vehicle.set("tes")
+
+        self.assertTrue(self.window.filter_vehicles())
+
+        self.assertEqual(("Test",), self.window.vehicle_box.cget("values"))
+        self.assertEqual(topology_count, len(self.service.topology_calls))
+        self.assertEqual("disabled", self.window.apply_button.cget("state"))
+
+        self.assertTrue(self.window.commit_vehicle_search())
+
+        self.assertEqual("Test", self.window.vehicle.get())
+        self.assertEqual(
+            ("C:/WoT",
+             "scripts/item_defs/vehicles/ussr/R12_Test.xml"),
+            self.service.topology_calls[-1])
+        self.assertEqual(("MS-1", "Test"),
+                         self.window.vehicle_box.cget("values"))
+
+    def test_no_search_match_can_restore_the_loaded_vehicle(self):
+        self.window.vehicle.set("not a tank")
+
+        self.assertFalse(self.window.filter_vehicles())
+
+        self.assertEqual((), self.window.vehicle_box.cget("values"))
+        self.assertIn("No vehicles match", self.window.status.get())
+
+        self.assertTrue(self.window.restore_vehicle_selection())
+
+        self.assertEqual("MS-1", self.window.vehicle.get())
+        self.assertEqual(("MS-1", "Test"),
+                         self.window.vehicle_box.cget("values"))
+        self.assertEqual("normal", self.window.apply_button.cget("state"))
+
+    def test_search_uses_hidden_internal_name_but_does_not_display_it(self):
+        service = _Service()
+        service.choices[1]["label"] = "Experimental tank (Test)"
+        window = vehicle_editor_ui.VehicleEditorWindow(
+            self.parent, "C:/WoT", "Fast MS-1", _FakeTk, _FakeTtk,
+            self.messagebox, service=service)
+
+        self.assertEqual(("Experimental tank", "MS-1"),
+                         window.vehicle_box.cget("values"))
+        window.vehicle.set("R12_Test")
+
+        self.assertTrue(window.filter_vehicles())
+        self.assertEqual(("Experimental tank",),
+                         window.vehicle_box.cget("values"))
+        self.assertTrue(window.commit_vehicle_search())
+        self.assertEqual("Experimental tank", window.vehicle.get())
+
+    def test_dropdown_selects_the_exact_duplicate_label_by_index(self):
+        service = _Service()
+        service.choices[1]["label"] = "Duplicate"
+        service.choices.append({
+            "nation": "ussr",
+            "vehicle": "R13_Duplicate",
+            "label": "Duplicate",
+            "member": (
+                "scripts/item_defs/vehicles/ussr/R13_Duplicate.xml"),
+        })
+        window = vehicle_editor_ui.VehicleEditorWindow(
+            self.parent, "C:/WoT", "Fast MS-1", _FakeTk, _FakeTtk,
+            self.messagebox, service=service)
+        window.vehicle.set("dup")
+        self.assertTrue(window.filter_vehicles())
+        self.assertEqual(("Duplicate", "Duplicate"),
+                         window.vehicle_box.cget("values"))
+
+        window.vehicle_box.current(1)
+        self.assertTrue(window.select_vehicle_from_dropdown())
+
+        self.assertEqual(
+            ("C:/WoT",
+             "scripts/item_defs/vehicles/ussr/R13_Duplicate.xml"),
+            service.topology_calls[-1])
 
     def test_localized_vehicle_label_selects_the_exact_internal_vehicle(self):
         service = _Service()
@@ -331,8 +423,7 @@ class VehicleEditorWindowTest(unittest.TestCase):
         self.assertEqual(
             "0.9.22 车辆属性方案：Fast MS-1",
             window.root.cget("title"))
-        self.assertEqual("查看所选属性",
-                         window.inspect_button.cget("text"))
+        self.assertFalse(hasattr(window, "inspect_button"))
         self.assertEqual(("车辆", "火炮"),
                          window.category_box.cget("values"))
         self.assertEqual(("速度限制 / 前进速度",),

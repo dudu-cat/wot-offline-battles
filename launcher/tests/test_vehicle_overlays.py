@@ -39,6 +39,7 @@ class VehicleOverlayTest(unittest.TestCase):
     OBSERVER = "scripts/item_defs/vehicles/ussr/Observer.xml"
     ENGINES = "scripts/item_defs/vehicles/ussr/components/engines.xml"
     GUNS = "scripts/item_defs/vehicles/ussr/components/guns.xml"
+    RADIOS = "scripts/item_defs/vehicles/ussr/components/radios.xml"
     SHELLS = "scripts/item_defs/vehicles/ussr/components/shells.xml"
 
     def setUp(self):
@@ -604,7 +605,7 @@ class VehicleOverlayTest(unittest.TestCase):
 
         type5 = next(choice for choice in choices
                      if choice["vehicle"] == "J20_Type_2605")
-        self.assertEqual("五式重战 (Type_2605)", type5["label"])
+        self.assertEqual("五式重战", type5["label"])
         self.assertEqual(vehicle_member, type5["member"])
 
     def test_catalog_prefix_is_hidden_only_in_human_facing_fields(self):
@@ -691,6 +692,80 @@ class VehicleOverlayTest(unittest.TestCase):
 
         self.assertFalse(any(
             record["member"] == self.ENGINES for record in fields))
+
+    def test_vehicle_element_reference_keeps_shared_engine_fields(self):
+        root = packed.read_packed_xml(self.members[self.VEHICLE])
+        engines = child(root, "engines").value
+        engines.children = [
+            (name, element([
+                (b"unlocks", element([])),
+            ]) if name == b"GAZ-M1" else value)
+            for name, value in engines.children]
+        self.members[self.VEHICLE] = packed.write_packed_xml(root)
+        self._write_package()
+
+        fields = vehicle_overlays.list_vehicle_field_choices(
+            self.game, self.VEHICLE)
+
+        engine_paths = set(
+            record["fieldPath"] for record in fields
+            if record["member"] == self.ENGINES)
+        self.assertIn("shared/GAZ-M1/power", engine_paths)
+        self.assertIn("shared/GAZ-M1/maxHealth", engine_paths)
+
+    def test_vehicle_element_reference_keeps_shared_radio_fields(self):
+        root = packed.read_packed_xml(self.members[self.VEHICLE])
+        root.children.append((b"radios", element([
+            (b"10R", element([
+                (b"unlocks", element([])),
+            ])),
+        ])))
+        radios = packed.PackedElement(children=[
+            (b"shared", element([
+                (b"10R", element([
+                    (b"weight", scalar(packed.TYPE_INTEGER, 100)),
+                    (b"maxHealth", scalar(packed.TYPE_INTEGER, 30)),
+                    (b"maxRegenHealth", scalar(packed.TYPE_INTEGER, 15)),
+                ])),
+            ])),
+        ])
+        self.members[self.VEHICLE] = packed.write_packed_xml(root)
+        self.members[self.RADIOS] = packed.write_packed_xml(radios)
+        self._write_package()
+
+        fields = vehicle_overlays.list_vehicle_field_choices(
+            self.game, self.VEHICLE)
+
+        radio_paths = set(
+            record["fieldPath"] for record in fields
+            if record["member"] == self.RADIOS)
+        self.assertEqual({
+            "shared/10R/maxHealth",
+            "shared/10R/maxRegenHealth",
+            "shared/10R/weight",
+        }, radio_paths)
+
+    def test_vehicle_local_component_leaf_wins_over_shared_value(self):
+        root = packed.read_packed_xml(self.members[self.VEHICLE])
+        engines = child(root, "engines").value
+        engines.children = [
+            (name, element([
+                (b"power", scalar(packed.TYPE_INTEGER, 95)),
+                (b"unlocks", element([])),
+            ]) if name == b"GAZ-M1" else value)
+            for name, value in engines.children]
+        self.members[self.VEHICLE] = packed.write_packed_xml(root)
+        self._write_package()
+
+        fields = vehicle_overlays.list_vehicle_field_choices(
+            self.game, self.VEHICLE)
+
+        self.assertFalse(any(
+            record["fieldPath"] == "shared/GAZ-M1/power"
+            for record in fields))
+        self.assertTrue(any(
+            record["fieldPath"] == "shared/GAZ-M1/maxHealth"
+            for record in fields))
 
     def test_existing_two_value_string_penetration_is_safely_editable(self):
         field_path = "shared/Gun-A/shots/Shell-A/piercingPower"
