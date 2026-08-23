@@ -125,8 +125,12 @@ _SERVER_PROBES = {
         "client_build": "wot-0.9.22.0.1-cn-1513",
         "vehicle": "ussr:R11_MS-1",
         "capabilities": (
-            "projectile_ledger_v2", "destructible_catalog_v5"),
-        "server_capabilities": ("destructible_catalog_v5",),
+            "projectile_ledger_v2", "destructible_catalog_v5",
+            "ram_contact_ledger_v1", "human_ram_timeline_v1",
+            "player_fire_intent_v1"),
+        "server_capabilities": (
+            "destructible_catalog_v5", "ram_contact_ledger_v1",
+            "human_ram_timeline_v1", "player_fire_intent_v1"),
     },
 }
 
@@ -1558,6 +1562,8 @@ def probe_server_protocol(port_version, host, port, timeout=1.5, connect=None):
             "vehicle": contract["vehicle"],
             "max_health": 1,
         }
+        if port_version == PORT_0_9_22:
+            hello["vehicle_compact_descr"] = "AA=="
         if contract["capabilities"] is not None:
             hello["capabilities"] = list(contract["capabilities"])
         connection.sendall(

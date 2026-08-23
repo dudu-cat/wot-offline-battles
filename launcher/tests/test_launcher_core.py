@@ -1641,6 +1641,7 @@ class ListenerTest(unittest.TestCase):
         def __init__(self, reply_overrides=None):
             self.reply_overrides = dict(reply_overrides or {})
             self.reply = b""
+            self.hello = None
 
         def settimeout(self, unused):
             pass
@@ -1650,12 +1651,15 @@ class ListenerTest(unittest.TestCase):
             if hello.get("type") == "leave":
                 self.reply = b""
                 return
+            self.hello = hello
             reply = {
                 "type": "welcome",
                 "protocol": hello["protocol"],
                 "client_build": hello["client_build"],
                 "capabilities": hello.get("capabilities", []),
-                "server_capabilities": ["destructible_catalog_v5"],
+                "server_capabilities": [
+                    "destructible_catalog_v5", "ram_contact_ledger_v1",
+                    "human_ram_timeline_v1", "player_fire_intent_v1"],
             }
             reply.update(self.reply_overrides)
             self.reply = (json.dumps(reply) + "\n").encode("utf-8")
@@ -1719,6 +1723,14 @@ class ListenerTest(unittest.TestCase):
             core.PORT_0_9_22, "127.0.0.1", 28782,
             connect=lambda address, timeout: connection))
 
+    def test_0922_probe_sends_a_compact_vehicle_descriptor(self):
+        connection = self._ProtocolConnection()
+
+        self.assertTrue(core.probe_server_protocol(
+            core.PORT_0_9_22, "127.0.0.1", 28782,
+            connect=lambda address, timeout: connection))
+        self.assertEqual("AA==", connection.hello["vehicle_compact_descr"])
+
     def test_listener_status_distinguishes_protocol_from_raw_tcp(self):
         endpoint = lambda host, port, timeout=None: True
         compatible = lambda version, host, port, timeout=None: True
@@ -1776,14 +1788,20 @@ class ListenerTest(unittest.TestCase):
                          core._SERVER_PROBES[core.PORT_0_9_22]["protocol"])
         self.assertEqual(server0922["CLIENT_BUILD_0922"],
                          core._SERVER_PROBES[core.PORT_0_9_22]["client_build"])
-        self.assertIn(server0922["PROJECTILE_CAPABILITY"],
-                      core._SERVER_PROBES[core.PORT_0_9_22]["capabilities"])
-        self.assertIn(
-            server0922["DESTRUCTIBLE_CATALOG_V5_CAPABILITY"],
-            core._SERVER_PROBES[core.PORT_0_9_22]["capabilities"])
-        self.assertIn(
-            server0922["DESTRUCTIBLE_CATALOG_V5_CAPABILITY"],
-            core._SERVER_PROBES[core.PORT_0_9_22]["server_capabilities"])
+        probe = core._SERVER_PROBES[core.PORT_0_9_22]
+        for name in (
+                "PROJECTILE_CAPABILITY",
+                "DESTRUCTIBLE_CATALOG_V5_CAPABILITY",
+                "RAM_CONTACT_LEDGER_CAPABILITY",
+                "HUMAN_RAM_TIMELINE_CAPABILITY",
+                "PLAYER_FIRE_INTENT_CAPABILITY"):
+            self.assertIn(server0922[name], probe["capabilities"])
+        for name in (
+                "DESTRUCTIBLE_CATALOG_V5_CAPABILITY",
+                "RAM_CONTACT_LEDGER_CAPABILITY",
+                "HUMAN_RAM_TIMELINE_CAPABILITY",
+                "PLAYER_FIRE_INTENT_CAPABILITY"):
+            self.assertIn(server0922[name], probe["server_capabilities"])
 
 
 class ConnectionReportTest(unittest.TestCase):
