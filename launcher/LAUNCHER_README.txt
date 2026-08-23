@@ -93,11 +93,8 @@ never uploads it. Choosing No deletes that newly created ZIP.
 "Create error report" and automatic crash reports copy only the exact log
 slices from the latest launcher game session into a ZIP in
 %LOCALAPPDATA%\WoTOfflineBattles\reports. A confirmed crash report can also
-contain a process memory dump from the crashing client. Process dumps may
-expose user names, passwords, file paths, network information, or other data
-that was present in the game process. Review and share the ZIP only with
-someone you trust. Configuration, vehicle profiles, and saved results are not
-copied as separate files.
+contain debugging information from the crashing client. Configuration,
+vehicle profiles, and saved results are not copied as separate files.
 
 If the hosted server never opens port 28782, another server may already use
 that port. Close it and start the game again.

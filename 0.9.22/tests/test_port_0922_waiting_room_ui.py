@@ -155,6 +155,46 @@ class WaitingRoomTests(unittest.TestCase):
         self.assertTrue(room.activate('start'))
         self.assertEqual(['01_karelia'], self.started)
 
+    def test_saved_map_is_restored_and_new_choices_are_reported(self):
+        selected = []
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True,
+            surface=self.surface, initial_map='05_prohorovka',
+            on_map_selected=selected.append)
+
+        self.assertTrue(room.open())
+        self.assertEqual('05_prohorovka', room._selected_map)
+        self.assertEqual([], selected)
+        self.assertTrue(room.activate('next'))
+        self.assertEqual([self.module.RANDOM_MAP_OPTION], selected)
+
+    def test_unavailable_saved_map_falls_back_and_updates_the_saved_choice(self):
+        selected = []
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True,
+            surface=self.surface, initial_map='99_removed',
+            on_map_selected=selected.append)
+
+        self.assertTrue(room.open())
+
+        self.assertEqual(self.module.RANDOM_MAP_OPTION, room._selected_map)
+        self.assertEqual([self.module.RANDOM_MAP_OPTION], selected)
+
+    def test_saved_map_survives_until_the_server_publishes_its_pool(self):
+        pool = []
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(pool),
+            status=lambda: self.status, host=lambda: True,
+            surface=self.surface, initial_map='05_prohorovka')
+
+        self.assertTrue(room.open())
+        self.assertEqual('05_prohorovka', room._selected_map)
+        pool.extend(self.pool)
+        self.assertTrue(room.refresh())
+        self.assertEqual('05_prohorovka', room._selected_map)
+
     def test_every_player_can_select_a_team_and_see_capacity(self):
         selected = []
         team_state = {

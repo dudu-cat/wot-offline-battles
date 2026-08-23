@@ -13,6 +13,7 @@ except NameError:
 CONFIG_PATH = os.path.join(
     '.', 'mods', 'configs', 'offline_lan_0922', 'config.json')
 ENDPOINT_FILE_NAME = 'server_endpoint.json'
+WAITING_ROOM_STATE_FILE_NAME = 'waiting_room_state.json'
 LEGACY_USER_DATA_DIR = os.path.dirname(CONFIG_PATH)
 
 
@@ -32,6 +33,8 @@ def _default_user_data_dir(environ=None):
 
 USER_DATA_DIR = _default_user_data_dir()
 ENDPOINT_PATH = os.path.join(USER_DATA_DIR, ENDPOINT_FILE_NAME)
+WAITING_ROOM_STATE_PATH = os.path.join(
+    USER_DATA_DIR, WAITING_ROOM_STATE_FILE_NAME)
 LEGACY_ENDPOINT_PATH = os.path.join(
     LEGACY_USER_DATA_DIR, ENDPOINT_FILE_NAME)
 ENDPOINT_PREFIX = 'LAN SERVER:'
@@ -410,6 +413,81 @@ def save_endpoint(host, port, path=ENDPOINT_PATH):
                 os.unlink(temporary_path)
             except (IOError, OSError):
                 pass
+        return False
+    return True
+
+
+def _empty_waiting_room_state():
+    return {
+        'schema': 1,
+        'map': None,
+        'team': 0,
+        'team_sizes': {},
+    }
+
+
+def _normalise_waiting_room_state(value):
+    if not isinstance(value, dict) or value.get('schema') != 1:
+        raise ValueError('LAN waiting room settings are invalid')
+    state = _empty_waiting_room_state()
+    selected_map = value.get('map')
+    if selected_map is not None:
+        if not isinstance(selected_map, string_types) or not selected_map:
+            raise ValueError('LAN waiting room map is invalid')
+        state['map'] = selected_map
+    team = value.get('team', 0)
+    if isinstance(team, bool):
+        raise ValueError('LAN waiting room team is invalid')
+    try:
+        team = int(team)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('LAN waiting room team is invalid')
+    if team not in (0, 1, 2):
+        raise ValueError('LAN waiting room team is invalid')
+    state['team'] = team
+    sizes = value.get('team_sizes') or {}
+    if not isinstance(sizes, dict):
+        raise ValueError('LAN waiting room team sizes are invalid')
+    for team_number in (1, 2):
+        raw_size = sizes.get(str(team_number), sizes.get(team_number))
+        if raw_size is None:
+            continue
+        if isinstance(raw_size, bool):
+            raise ValueError('LAN waiting room team size is invalid')
+        try:
+            size = int(raw_size)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError('LAN waiting room team size is invalid')
+        if size < 1 or size > 15:
+            raise ValueError('LAN waiting room team size is invalid')
+        state['team_sizes'][team_number] = size
+    return state
+
+
+def load_waiting_room_state(path=WAITING_ROOM_STATE_PATH):
+    """Load optional player-owned LAN room choices without blocking login."""
+    if not os.path.isfile(path):
+        return _empty_waiting_room_state()
+    try:
+        with open(path, 'rb') as stream:
+            return _normalise_waiting_room_state(json.load(stream))
+    except (IOError, OSError, OverflowError, TypeError, ValueError):
+        return _empty_waiting_room_state()
+
+
+def save_waiting_room_state(value, path=WAITING_ROOM_STATE_PATH):
+    """Persist the last map, capacities and player team atomically."""
+    try:
+        state = _normalise_waiting_room_state(value)
+        payload = {
+            'schema': 1,
+            'map': state['map'],
+            'team': state['team'],
+            'team_sizes': dict((str(team), size) for team, size in
+                               state['team_sizes'].items()),
+        }
+        write_json(path, payload)
+    except (IOError, OSError, OverflowError, TypeError, ValueError):
         return False
     return True
 

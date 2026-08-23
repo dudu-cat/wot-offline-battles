@@ -165,6 +165,21 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertIn('return !timed_out && completed;', wait)
         self.assertNotIn('INFINITE', wait)
 
+    def test_procdump_status_cannot_discard_a_complete_dump(self):
+        source = SOURCE.read_text(encoding='utf-8')
+        close = source.split(
+            'static int close_finished_procdump', 1)[1].split(
+                'static HANDLE start_procdump_cancel', 1)[0]
+        finish = source.split(
+            'static DWORD finish_player_tracker', 1)[1].split(
+                'static int launch_player', 1)[0]
+
+        self.assertIn('GetExitCodeProcess(', close)
+        self.assertIn('*completed = TRUE;', close)
+        self.assertNotIn('exit_code != 0', close)
+        self.assertIn('complete_regular_dump_file(last->dump_path)', finish)
+        self.assertIn('player_dump_missing', finish)
+
     def test_both_player_modes_track_only_their_job_handoffs(self):
         source = SOURCE.read_text(encoding='utf-8')
         launch = source.split(

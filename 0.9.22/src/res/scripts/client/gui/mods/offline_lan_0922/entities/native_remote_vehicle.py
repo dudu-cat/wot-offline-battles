@@ -42,6 +42,11 @@ class _NativeRemoteState(object):
         self.yaw = float(rotation[2])
         self.speed = 0.0
         self.turn_speed = 0.0
+        # Keep stable callable objects alive for the native #1513 data-link
+        # setters.  Re-reading a bound method would create a temporary object.
+        self._vehicle_speed_link = self._read_vehicle_speed
+        self._vehicle_rotation_speed_link = \
+            self._read_vehicle_rotation_speed
         self.velocity = math_module.Vector3(0.0, 0.0, 0.0)
         self.acceleration = math_module.Vector3(0.0, 0.0, 0.0)
         self._last_pose_time = None
@@ -170,6 +175,12 @@ class _NativeRemoteState(object):
             entity._offlinePresentationErrors = self.presentation_errors
         return bool(available)
 
+    def _read_vehicle_speed(self):
+        return float(self.speed)
+
+    def _read_vehicle_rotation_speed(self):
+        return float(self.turn_speed)
+
     def _bind_stock_motion(self):
         """Rebind stock #1513 presentation components to copied LAN motion."""
         entity = self.entity
@@ -179,26 +190,26 @@ class _NativeRemoteState(object):
 
         detailed = getattr(appearance, 'detailedEngineState', None)
         audition = getattr(appearance, 'engineAudition', None)
-        links = self._data_links
         engine_ready = False
-        if detailed is not None and audition is not None and links is not None:
-            create_float_link = getattr(links, 'createFloatLink', None)
-            if callable(create_float_link):
-                try:
-                    detailed.vehicleSpeedLink = create_float_link(
-                        self, 'speed')
-                    detailed.rotationSpeedLink = create_float_link(
-                        self, 'turn_speed')
-                    engine_ready = True
-                except Exception as error:
-                    self._record_capability(
-                        'engine_audio_motion', False, error)
+        if detailed is not None and audition is not None:
+            try:
+                # #1513 accepts a callable here.  DataLinks.createFloatLink
+                # only supports native data-link owners; passing this plain
+                # Python state creates an empty std::function and crashes the
+                # next DetailedEngineState update with bad_function_call.
+                detailed.vehicleSpeedLink = self._vehicle_speed_link
+                detailed.rotationSpeedLink = \
+                    self._vehicle_rotation_speed_link
+                engine_ready = True
+            except Exception as error:
+                self._record_capability(
+                    'engine_audio_motion', False, error)
         if engine_ready:
             self._record_capability('engine_audio_motion', True)
         elif 'engine_audio_motion' not in self.presentation_errors:
             self._record_capability(
                 'engine_audio_motion', False,
-                'stock DetailedEngineState/DataLinks are unavailable')
+                'stock DetailedEngineState is unavailable')
 
         swinging = getattr(appearance, 'swingingAnimator', None)
         if swinging is not None:

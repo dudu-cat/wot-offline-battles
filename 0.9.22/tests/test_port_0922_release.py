@@ -18,7 +18,8 @@ class ReleaseBuilderTests(unittest.TestCase):
         """State files are created in the player's external data directory."""
         source = (PORT_ROOT / 'build_wotmod.py').read_text(encoding='utf-8')
         for name in ('server_endpoint.json', 'account_state.json',
-                     'garage_state.json', 'postbattle_state.json'):
+                     'garage_state.json', 'postbattle_state.json',
+                     'waiting_room_state.json'):
             self.assertNotIn(name, source, name)
 
     def test_the_state_owners_write_only_into_the_external_user_directory(self):

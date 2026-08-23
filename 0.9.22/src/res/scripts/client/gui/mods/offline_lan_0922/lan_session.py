@@ -166,6 +166,9 @@ class LANSession(object):
         self._vehicle_provider = vehicle_provider or _selected_vehicle_details
         self._outfit_provider = _selected_vehicle_outfits
         self._postbattle_store = postbattle_store
+        self._room_preferences = port_config.load_waiting_room_state()
+        self._restored_team_generation = None
+        self._restored_team_sizes_generation = None
         self._published_progress_battles = (
             -1 if postbattle_store is None else
             int(postbattle_store.progress().get('battles', 0)))
@@ -247,7 +250,9 @@ class LANSession(object):
             on_event=on_event)
         # Keep custom test/embedding factories source-compatible: the team
         # preference is ordinary client state consumed when hello is built.
-        client.requested_team = port_config.preferred_team(self._config)
+        saved_team = int(self._room_preferences.get('team', 0) or 0)
+        client.requested_team = (saved_team or
+                                 port_config.preferred_team(self._config))
         if self._postbattle_store is not None:
             client.account_key = self._postbattle_store.account_key
         client.outfits = self._outfit_provider()
@@ -902,6 +907,7 @@ class LANSession(object):
             self._status_notifier(
                 'The LAN server did not accept that team selection.')
             return False
+        self._remember_team(team)
         self._status_notifier('Requesting Team %d...' % int(team))
         return True
 
@@ -915,9 +921,81 @@ class LANSession(object):
             self._status_notifier(
                 'The LAN server did not accept that team size.')
             return False
+        self._remember_team_size(team, size)
         self._status_notifier(
             'Requesting Team %d size %d...' % (int(team), int(size)))
         return True
+
+    def _save_room_preferences(self):
+        if port_config.save_waiting_room_state(self._room_preferences):
+            return True
+        self._status_notifier(
+            'Could not save the LAN waiting room choices. Check that the '
+            'user data directory is writable.')
+        return False
+
+    def _remember_map(self, map_name):
+        if not map_name:
+            return False
+        if self._room_preferences.get('map') == map_name:
+            return True
+        self._room_preferences['map'] = map_name
+        return self._save_room_preferences()
+
+    def _remember_team(self, team):
+        try:
+            team = int(team)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if team not in (0, 1, 2):
+            return False
+        if self._room_preferences.get('team') == team:
+            return True
+        self._room_preferences['team'] = team
+        return self._save_room_preferences()
+
+    def _remember_team_size(self, team, size):
+        try:
+            team = int(team)
+            size = int(size)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if team not in (1, 2) or size < 1 or size > 15:
+            return False
+        sizes = self._room_preferences.setdefault('team_sizes', {})
+        if sizes.get(team, sizes.get(str(team))) == size:
+            return True
+        sizes[team] = size
+        return self._save_room_preferences()
+
+    def _restore_waiting_preferences(self):
+        """Apply saved capacities and team once after each connection."""
+        generation = self._client_generation
+        if (self._restored_team_sizes_generation != generation and
+                self._is_local_host() and
+                self._server_supports_team_size_selection()):
+            setter = getattr(self.client, 'set_team_size', None)
+            current_sizes = dict(
+                getattr(self.client, 'team_sizes', {}) or {})
+            restored = callable(setter)
+            if callable(setter):
+                for team, size in sorted(
+                        self._room_preferences.get('team_sizes', {}).items()):
+                    current = current_sizes.get(
+                        team, current_sizes.get(str(team)))
+                    if current != size and not setter(team, size):
+                        restored = False
+            if restored:
+                self._restored_team_sizes_generation = generation
+        if (self._restored_team_generation != generation and
+                self._server_supports_team_selection()):
+            team = int(self._room_preferences.get('team', 0) or 0)
+            selector = getattr(self.client, 'select_team', None)
+            restored = True
+            if team in (1, 2) and getattr(self.client, 'team', None) != team:
+                restored = callable(selector) and bool(selector(team))
+            if restored:
+                self._restored_team_generation = generation
 
     def _ensure_queue(self):
         if self._queue is None:
@@ -976,6 +1054,8 @@ class LANSession(object):
                     'request_team': self.select_team,
                     'team_status': self._team_status,
                     'request_team_size': self.set_team_size,
+                    'initial_map': self._room_preferences.get('map'),
+                    'on_map_selected': self._remember_map,
                 })
             room = self._room_factory(
                 self.request_start, self._map_pool_value, **options)
@@ -1279,6 +1359,7 @@ class LANSession(object):
             return False
         if self.state not in ('waiting', 'connecting', 'retrying'):
             return False
+        self._remember_map(map_name)
         if not bool(getattr(self.client, 'ready', False)):
             self._pending_map = map_name
             self._status_notifier(
@@ -1362,6 +1443,7 @@ class LANSession(object):
                 self.state = 'awaiting_battle_start'
                 return
             self.state = 'waiting'
+            self._restore_waiting_preferences()
             self._publish_postbattle_progress()
             self._publish_postbattle_results()
             self._publish_selected_vehicle()
@@ -1786,6 +1868,9 @@ class LANSession(object):
         elif kind == 'team_denied':
             code = _message_value(message, 'code')
             team = _message_value(message, 'team')
+            actual_team = getattr(self.client, 'team', None)
+            if actual_team in (1, 2):
+                self._remember_team(actual_team)
             if code == 'team_full':
                 self._status_notifier(
                     'Team %s is full. Choose the other team or wait for a '
@@ -1798,6 +1883,15 @@ class LANSession(object):
         elif kind == 'team_size_denied':
             code = _message_value(message, 'code')
             team = _message_value(message, 'team')
+            actual_sizes = dict(
+                getattr(self.client, 'team_sizes', {}) or {})
+            try:
+                actual_size = actual_sizes.get(
+                    int(team), actual_sizes.get(str(team)))
+            except (TypeError, ValueError, OverflowError):
+                actual_size = None
+            if actual_size is not None:
+                self._remember_team_size(team, actual_size)
             if code == 'host_only':
                 notice = 'Only the LAN room host can change team sizes.'
             elif code == 'team_occupied':

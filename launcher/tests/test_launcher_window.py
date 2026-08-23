@@ -490,16 +490,28 @@ class WindowTest(unittest.TestCase):
         select.assert_not_called()
         delete.assert_called_once_with(report_path)
 
-    def test_crash_consent_warns_that_dumps_may_contain_private_data(self):
+    def test_crash_prompt_explains_how_to_find_the_report(self):
         ask = mock.Mock(return_value=False)
         tkinter = mock.Mock(messagebox=mock.Mock(askyesno=ask))
         with mock.patch.dict("sys.modules", {"tkinter": tkinter}):
             self.assertFalse(self.window._confirm_crash_report())
 
-        warning = ask.call_args.args[1]
-        for detail in ("user names", "passwords", "file paths",
-                       "network information"):
-            self.assertIn(detail, warning)
+        message = ask.call_args.args[1]
+        self.assertIn("error report is ready", message)
+        self.assertIn("Windows Explorer", message)
+        self.assertNotIn("password", message)
+
+    def test_procdump_consent_explains_the_debugging_download(self):
+        ask = mock.Mock(return_value=False)
+        tkinter = mock.Mock(messagebox=mock.Mock(askyesno=ask))
+        with mock.patch.dict("sys.modules", {"tkinter": tkinter}):
+            self.assertFalse(self.window._confirm_enable_crash_capture())
+
+        title, message = ask.call_args.args[:2]
+        self.assertIn("crash diagnostics", title)
+        self.assertIn("debugging information", message)
+        self.assertIn("Microsoft's official site", message)
+        self.assertNotIn("password", message)
 
     def test_network_start_always_plans_a_join_session(self):
         self._game()

@@ -99,27 +99,24 @@ _CHINESE = {
         "无法在 Windows 资源管理器中选中报告：%s",
     "Could not delete the declined crash report: %s":
         "无法删除你拒绝上传的闪退报告：%s",
-    "Enable crash dumps?": "启用闪退转储？",
-    "To collect native crash dumps, the launcher will download Microsoft "
-    "Sysinternals ProcDump from Microsoft's official site and accept its "
-    "license terms at %s. Crash dumps may contain user names, passwords, file "
-    "paths, or network information. Download and enable it?":
-        "为了收集原生闪退转储，启动器会从微软官方网站下载 Microsoft "
-        "Sysinternals ProcDump，并接受此处的微软许可条款：%s。转储文件可能"
-        "包含用户名、密码、文件路径或网络信息。是否下载并启用？",
+    "Enable crash diagnostics?": "启用闪退调试信息？",
+    "To generate debugging information when the game crashes, the launcher "
+    "needs to download Microsoft Sysinternals ProcDump from Microsoft's "
+    "official site and accept its license terms at %s. Download and enable "
+    "it?":
+        "为了在游戏闪退时生成调试信息，启动器需要从微软官方网站下载 "
+        "Microsoft Sysinternals ProcDump，并接受此处的微软许可条款：%s。"
+        "是否下载并启用？",
     "Downloading ProcDump from Microsoft...":
         "正在从微软官方下载 ProcDump…",
     "ProcDump was downloaded and crash dumps are enabled.":
         "ProcDump 下载完成，闪退转储已启用。",
     "ProcDump could not be enabled: %s": "无法启用 ProcDump：%s",
     "Report game crash?": "是否汇报游戏闪退？",
-    "The game closed unexpectedly. The prepared ZIP may include a process "
-    "memory dump containing user names, passwords, file paths, or network "
-    "information. Share it only after reviewing it. Choose Yes to select the "
-    "ZIP; choosing No deletes it.":
-        "检测到游戏闪退。准备好的 ZIP 可能包含进程内存转储，其中可能有用户名、"
-        "密码、文件路径或网络信息。请检查后再分享。选择“是”会选中 ZIP；"
-        "选择“否”会删除它。",
+    "The game closed unexpectedly and an error report is ready. Choose Yes "
+    "to select the ZIP in Windows Explorer; choosing No deletes it.":
+        "检测到游戏闪退，错误报告已经准备好。选择“是”会在 Windows 资源管理器"
+        "中选中 ZIP，方便发送；选择“否”会删除它。",
 }
 
 
@@ -901,13 +898,12 @@ class LauncherWindow(object):
         from tkinter import messagebox
 
         return messagebox.askyesno(
-            self._t("Enable crash dumps?"),
+            self._t("Enable crash diagnostics?"),
             self._t(
-                "To collect native crash dumps, the launcher will download "
-                "Microsoft Sysinternals ProcDump from Microsoft's official "
-                "site and accept its license terms at %s. Crash dumps may "
-                "contain user names, passwords, file paths, or network "
-                "information. Download and enable it?") %
+                "To generate debugging information when the game crashes, "
+                "the launcher needs to download Microsoft Sysinternals "
+                "ProcDump from Microsoft's official site and accept its "
+                "license terms at %s. Download and enable it?") %
             core.PROCDUMP_LICENSE_URL,
             icon="warning")
 
@@ -1021,11 +1017,9 @@ class LauncherWindow(object):
         return messagebox.askyesno(
             self._t("Report game crash?"),
             self._t(
-                "The game closed unexpectedly. The prepared ZIP may include "
-                "a process memory dump containing user names, passwords, "
-                "file paths, or network information. Share it only after "
-                "reviewing it. Choose Yes to select the ZIP; choosing No "
-                "deletes it."),
+                "The game closed unexpectedly and an error report is ready. "
+                "Choose Yes to select the ZIP in Windows Explorer; choosing "
+                "No deletes it."),
             icon="warning")
 
     def _offer_crash_report(self, report_path):

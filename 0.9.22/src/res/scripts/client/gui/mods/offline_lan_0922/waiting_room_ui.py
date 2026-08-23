@@ -271,7 +271,8 @@ class WaitingRoomUI(object):
     def __init__(self, request_start, map_pool, status=None, on_close=None,
                  host=None, surface=None, random_supported=None,
                  request_team=None, team_status=None,
-                 request_team_size=None):
+                 request_team_size=None, initial_map=None,
+                 on_map_selected=None):
         self._request_start = request_start
         self._map_pool = map_pool
         self._status = status or (lambda: '')
@@ -281,6 +282,7 @@ class WaitingRoomUI(object):
         self._request_team = request_team
         self._request_team_size = request_team_size
         self._team_status = team_status or (lambda: {})
+        self._on_map_selected = on_map_selected
         self._surface = surface
         self._panel = None
         self._controls = {}
@@ -293,7 +295,7 @@ class WaitingRoomUI(object):
         self._pointer_ticks = 0
         self._open = False
         self._hovered = None
-        self._selected_map = None
+        self._selected_map = initial_map
         self._message = ''
         self._pending_team_sizes = {}
 
@@ -449,11 +451,21 @@ class WaitingRoomUI(object):
 
     def _sync_selection(self):
         options = self._options()
-        if not options:
-            self._selected_map = None
-        elif self._selected_map not in options:
-            self._selected_map = options[0]
+        if options and self._selected_map not in options:
+            self._set_selected_map(options[0])
         return options
+
+    def _set_selected_map(self, map_name):
+        if self._selected_map == map_name:
+            return False
+        self._selected_map = map_name
+        if callable(self._on_map_selected):
+            try:
+                self._on_map_selected(map_name)
+            except Exception as error:
+                _log('LAN waiting room could not save the selected map: %s' %
+                     error)
+        return True
 
     def open(self):
         if self._open:
@@ -875,7 +887,7 @@ class WaitingRoomUI(object):
             index = options.index(self._selected_map)
         except ValueError:
             index = 0
-        self._selected_map = options[(index + int(step)) % len(options)]
+        self._set_selected_map(options[(index + int(step)) % len(options)])
         self._message = ''
         self.refresh()
         return True

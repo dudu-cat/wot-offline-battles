@@ -194,10 +194,15 @@ static int close_finished_procdump(HANDLE *procdump_process,
 		log_failure("WaitForSingleObject(procdump)", GetLastError());
 	} else if (!GetExitCodeProcess(*procdump_process, &exit_code)) {
 		log_failure("GetExitCodeProcess(procdump)", GetLastError());
-	} else if (exit_code != 0) {
-		log_failure("procdump_exit", exit_code);
-	} else if (completed != 0) {
-		*completed = TRUE;
+	} else {
+		/* ProcDump uses non-zero process exit codes after successfully
+		 * handling some triggers (v12.01 returns -2 for a termination dump).
+		 * The exact fixed output file is validated before promotion below, so
+		 * process completion -- not ProcDump's status code -- is the reliable
+		 * boundary here. */
+		if (completed != 0) {
+			*completed = TRUE;
+		}
 	}
 	CloseHandle(*procdump_process);
 	*procdump_process = 0;
@@ -984,10 +989,12 @@ static DWORD finish_player_tracker(PlayerProcessTracker *tracker,
 	}
 	if (tracker->procdump_configured) {
 		DeleteFileW(tracker->final_dump_path);
-		if (!stopped && last != 0 && result != 0 &&
-				last->dump_complete && last->dump_path[0] != L'\0' &&
-				complete_regular_dump_file(last->dump_path)) {
-			if (!MoveFileExW(last->dump_path, tracker->final_dump_path,
+		if (!stopped && last != 0 && result != 0) {
+			if (!last->dump_complete || last->dump_path[0] == L'\0' ||
+					!complete_regular_dump_file(last->dump_path)) {
+				log_failure("player_dump_missing", ERROR_FILE_NOT_FOUND);
+			} else if (!MoveFileExW(
+					last->dump_path, tracker->final_dump_path,
 					MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
 				log_failure("promote_player_dump", GetLastError());
 			}
@@ -1548,9 +1555,11 @@ worker_cleanup:
 				process.dwProcessId);
 		}
 		DeleteFileW(worker_final_dump_path);
-		if (worker_crashed && worker_dump_complete &&
-				complete_regular_dump_file(worker_monitor_dump_path)) {
-			if (!MoveFileExW(worker_monitor_dump_path,
+		if (worker_crashed) {
+			if (!worker_dump_complete || !complete_regular_dump_file(
+					worker_monitor_dump_path)) {
+				log_failure("worker_dump_missing", ERROR_FILE_NOT_FOUND);
+			} else if (!MoveFileExW(worker_monitor_dump_path,
 					worker_final_dump_path,
 					MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
 				log_failure("promote_worker_dump", GetLastError());

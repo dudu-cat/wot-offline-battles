@@ -1709,7 +1709,8 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
         holder = {}
         data_links = types.SimpleNamespace(
             createFloatLink=mock.Mock(
-                side_effect=lambda owner, name: (owner, name)))
+                side_effect=AssertionError(
+                    'plain Python owners must not use DataLinks')))
         binding = BigWorldVehicleBinding(
             runtime.bigworld, runtime.bigworld.avatar, runtime.constants,
             _VehicleDescr, runtime.encode_gun_angles,
@@ -1753,9 +1754,11 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual(1, len(vehicle.aim_targets))
         self.assertIsNotNone(vehicle.track_scroll)
         self.assertIs(swinging.worldMatrix, vehicle.model.matrix)
-        self.assertIs(detailed_engine.vehicleSpeedLink[0],
-                      factory._states[vehicle_id])
-        self.assertEqual('speed', detailed_engine.vehicleSpeedLink[1])
+        self.assertTrue(callable(detailed_engine.vehicleSpeedLink))
+        self.assertTrue(callable(detailed_engine.rotationSpeedLink))
+        self.assertEqual(0.0, detailed_engine.vehicleSpeedLink())
+        self.assertEqual(0.0, detailed_engine.rotationSpeedLink())
+        data_links.createFloatLink.assert_not_called()
         self.assertEqual(
             {'engine_audio_motion': True, 'body_swinging': True,
              'stock_wheels': True, 'stock_suspension': True},
@@ -1774,6 +1777,10 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual((0.0, 0.0, 2.0), tuple(overlay['acceleration']))
         self.assertAlmostEqual(2.0 * math.cos(1.0), overlay['speed'])
         self.assertAlmostEqual(0.25, overlay['turn_speed'])
+        self.assertAlmostEqual(
+            overlay['speed'], detailed_engine.vehicleSpeedLink())
+        self.assertAlmostEqual(
+            overlay['turn_speed'], detailed_engine.rotationSpeedLink())
         self.assertAlmostEqual(1.0, vehicle._aim_yaw)
         self.assertAlmostEqual(-0.1, vehicle._gun_pitch)
         self.assertTrue(vehicle.update_tracks(
