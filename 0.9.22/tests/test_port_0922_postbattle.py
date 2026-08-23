@@ -21,7 +21,7 @@ from lan_battle_server import (
     HUMAN_RAM_TIMELINE_CAPABILITY, MAX_RESULT_RECEIPTS,
     PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
     PROJECTILE_CAPABILITY,
-    RAM_CONTACT_LEDGER_CAPABILITY, Player)
+    RAM_CONTACT_LEDGER_CAPABILITY, RICOCHET_CONTINUATION_CAPABILITY, Player)
 from effective_params_fixture import effective_params
 import lan_battle_server as lan_server_module
 from offline_rewards import compute_offline_rewards
@@ -792,7 +792,8 @@ class PostBattleContractTests(unittest.TestCase):
                     HUMAN_RAM_TIMELINE_CAPABILITY,
                     PLAYER_FIRE_INTENT_CAPABILITY,
                     PLAYER_ENVIRONMENT_CAPABILITY,
-                    EFFECTIVE_PARAMS_CAPABILITY],
+                    EFFECTIVE_PARAMS_CAPABILITY,
+                    RICOCHET_CONTINUATION_CAPABILITY],
                 'account_key': first.account_key,
                 'name': 'A', 'vehicle': first.vehicle,
                 'max_health': first.max_health, 'outfits': {},
@@ -815,7 +816,8 @@ class PostBattleContractTests(unittest.TestCase):
                 HUMAN_RAM_TIMELINE_CAPABILITY,
                 PLAYER_FIRE_INTENT_CAPABILITY,
                 PLAYER_ENVIRONMENT_CAPABILITY,
-                EFFECTIVE_PARAMS_CAPABILITY],
+                EFFECTIVE_PARAMS_CAPABILITY,
+                RICOCHET_CONTINUATION_CAPABILITY],
             'account_key': account_key,
             'name': 'A', 'vehicle': 'ussr:R11_MS-1',
             'max_health': 100, 'outfits': {},

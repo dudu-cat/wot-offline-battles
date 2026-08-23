@@ -64,6 +64,13 @@ _SegmentCollisionResultExt = namedtuple(
     'SegmentCollisionResultExt',
     ('dist', 'hitAngleCos', 'matInfo', 'compName'))
 
+# Authority-only evidence kept outside the exact retail collision ABI. The
+# native BSP tuple's second value is a component-local surface normal, not a
+# triangle. Keeping it in a wrapper prevents a five-field value from reaching
+# stock gun-marker and ProjectileMover callers that require exactly four.
+_VehicleCollisionEvidence = namedtuple(
+    'VehicleCollisionEvidence', ('collision', 'worldNormal'))
+
 
 class _AliveFlag(object):
 
@@ -339,7 +346,7 @@ class _RemoteShotPresenter(object):
     def play_canonical(self, descriptor, shell_index, origin, velocity,
                        gravity, max_distance, attacker_id,
                        projectile_id=None, reference_position=None,
-                       reference_velocity=None):
+                       reference_velocity=None, is_ricochet=False):
         """Present one canonical launch through the exact #1513 mover ABI.
 
         The origin and velocity belong to the authoritative launch event.
@@ -434,6 +441,11 @@ class _RemoteShotPresenter(object):
                     (not isinstance(active, dict) or shot_id not in active)):
                 self._report_failure('native add rejected')
                 return False
+            if is_ricochet:
+                hold = getattr(mover, 'hold', None)
+                if not callable(hold):
+                    return False
+                hold(shot_id)
             if projectile_id is not None:
                 self._projectile_shots[projectile_id] = (
                     shot_id, artillery)
@@ -782,8 +794,9 @@ def _pose_components(vehicle, math_module):
     return result
 
 
-def collide_vehicle_at_matrix(vehicle, vehicle_matrix, start_point,
-                              end_point, math_module, chassis_matrix=None):
+def _collide_vehicle_at_matrix(vehicle, vehicle_matrix, start_point,
+                               end_point, math_module, include_world_normal,
+                               chassis_matrix=None):
     """Run precise descriptor collision at supplied body/chassis matrices.
 
     #1513's native ``Vehicle.collideSegmentExt`` first rejects rays through
@@ -794,6 +807,11 @@ def collide_vehicle_at_matrix(vehicle, vehicle_matrix, start_point,
     vehicles use ``bodyMatrix`` for hull/turret/gun and the separate
     ``groundPlacingMatrix`` for chassis, matching stock ``getComponents``.
     """
+    vehicle_to_world = None
+    chassis_to_world = None
+    if include_world_normal:
+        vehicle_to_world = math_module.Matrix(vehicle_matrix)
+        chassis_to_world = vehicle_to_world
     world_to_vehicle = math_module.Matrix(vehicle_matrix)
     world_to_vehicle.invert()
     body_start = world_to_vehicle.applyPoint(start_point)
@@ -801,6 +819,8 @@ def collide_vehicle_at_matrix(vehicle, vehicle_matrix, start_point,
     chassis_start = body_start
     chassis_end = body_end
     if chassis_matrix is not None and chassis_matrix is not vehicle_matrix:
+        if include_world_normal:
+            chassis_to_world = math_module.Matrix(chassis_matrix)
         world_to_chassis = math_module.Matrix(chassis_matrix)
         world_to_chassis.invert()
         chassis_start = world_to_chassis.applyPoint(start_point)
@@ -818,9 +838,13 @@ def collide_vehicle_at_matrix(vehicle, vehicle_matrix, start_point,
         collisions = local_hit_test(
             component_matrix.applyPoint(start),
             component_matrix.applyPoint(end))
+        component_to_vehicle = None
+        if include_world_normal:
+            component_to_vehicle = math_module.Matrix(component_matrix)
+            component_to_vehicle.invert()
         for collision in collisions or ():
             try:
-                dist, unused_triangle, angle_cos, material_kind = collision
+                dist, local_normal, angle_cos, material_kind = collision
             except (TypeError, ValueError):
                 continue
             materials = _component_value(component, 'materials', {}) or {}
@@ -829,10 +853,47 @@ def collide_vehicle_at_matrix(vehicle, vehicle_matrix, start_point,
             if not isinstance(component_name, _STRING_TYPES):
                 raise RuntimeError(
                     '#1513 collision component has no itemTypeName')
-            hits.append(_SegmentCollisionResultExt(
-                float(dist), float(angle_cos), material, component_name))
-    hits.sort(key=lambda item: item.dist)
+            result = _SegmentCollisionResultExt(
+                float(dist), float(angle_cos), material, component_name)
+            if include_world_normal:
+                world_normal = None
+                if local_normal is not None:
+                    vehicle_normal = component_to_vehicle.applyVector(
+                        local_normal)
+                    root_to_world = (chassis_to_world
+                                     if component_index == 0 else
+                                     vehicle_to_world)
+                    world_normal = root_to_world.applyVector(
+                        vehicle_normal)
+                    world_normal = math_module.Vector3(world_normal)
+                    if world_normal.length > 0.0:
+                        world_normal.normalise()
+                    else:
+                        world_normal = None
+                result = _VehicleCollisionEvidence(result, world_normal)
+            hits.append(result)
+    if include_world_normal:
+        hits.sort(key=lambda item: item.collision.dist)
+    else:
+        hits.sort(key=lambda item: item.dist)
     return hits
+
+
+def _collide_vehicle_evidence_at_matrix(vehicle, vehicle_matrix, start_point,
+                                        end_point, math_module,
+                                        chassis_matrix=None):
+    """Return world-normal evidence for the authoritative shot resolver."""
+    return _collide_vehicle_at_matrix(
+        vehicle, vehicle_matrix, start_point, end_point, math_module, True,
+        chassis_matrix=chassis_matrix)
+
+
+def collide_vehicle_at_matrix(vehicle, vehicle_matrix, start_point,
+                              end_point, math_module, chassis_matrix=None):
+    """Return #1513's exact four-field collision values for public callers."""
+    return _collide_vehicle_at_matrix(
+        vehicle, vehicle_matrix, start_point, end_point, math_module, False,
+        chassis_matrix=chassis_matrix)
 
 
 class RemoteVehicle(object):
@@ -2061,12 +2122,13 @@ class RemoteVehicleFactory(object):
     def play_projectile_tracer(self, descriptor, shell_index, origin,
                                velocity, gravity, max_distance, attacker_id,
                                projectile_id=None, reference_position=None,
-                               reference_velocity=None):
+                               reference_velocity=None,
+                               is_ricochet=False):
         """Play one authoritative launch without consulting a vehicle pose."""
         return self._shot_presenter.play_canonical(
             descriptor, shell_index, origin, velocity, gravity,
             max_distance, attacker_id, projectile_id,
-            reference_position, reference_velocity)
+            reference_position, reference_velocity, is_ricochet)
 
     def stop_projectile_tracer(self, projectile_id, end_position,
                                explosion=None):

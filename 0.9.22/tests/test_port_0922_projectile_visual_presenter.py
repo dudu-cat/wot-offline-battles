@@ -66,6 +66,7 @@ class _ProjectileMover(object):
 
     def __init__(self):
         self.calls = []
+        self.hold_calls = []
         self.hide_calls = []
         self.hide_error = None
         self.explode_calls = []
@@ -87,6 +88,9 @@ class _ProjectileMover(object):
         self.space_ids.append(space_id)
         if self.__class__.space_error is not None:
             raise self.__class__.space_error
+
+    def hold(self, *args):
+        self.hold_calls.append(args)
 
     def hide(self, *args):
         self.hide_calls.append(args)
@@ -235,6 +239,20 @@ class ProjectileVisualPresenterTests(unittest.TestCase):
             self.assertEqual(visual_id, hidden_id)
             self.assertEqual((80.0, 12.0, 0.0),
                              (hidden_at.x, hidden_at.y, hidden_at.z))
+
+    def test_ricochet_segment_uses_exact_native_hold_contract(self):
+        with mock.patch.dict(sys.modules, _modules()):
+            factory = self._factory()
+
+            visual_id = factory.play_projectile_tracer(
+                _descriptor(), 0, (12.0, 3.0, 4.0),
+                (-80.0, 20.0, 0.0), 9.81, 488.0, 42,
+                'ricochet-shot', (12.0, 3.0, 4.0),
+                (-80.0, 20.0, 0.0), is_ricochet=True)
+
+            mover = _ProjectileMover.instances[0]
+            self.assertEqual(1000000, visual_id)
+            self.assertEqual([(visual_id,)], mover.hold_calls)
 
     def test_world_terminal_uses_native_explode_without_hiding_first(self):
         effects = {'groundHit': ('stages', 'effect', None)}

@@ -17,9 +17,10 @@ def projectile_range_distance(state, point):
     """Return straight 3-D range from one frozen range origin.
 
     The pinned #1513 client marker evaluates penetration falloff with a
-    Euclidean point-to-point distance. New projectile payloads freeze the
+    Euclidean point-to-point distance.  New projectile payloads freeze the
     source vehicle position as ``range_origin``; older states fall back to the
-    muzzle in ``start``. This does not replace travelled trajectory distance.
+    muzzle in ``start``.  This deliberately does not replace the manager's
+    travelled path distance.
     """
     payload = state.get('payload') or {}
     origin = (payload['range_origin']
@@ -32,7 +33,12 @@ def projectile_range_distance(state, point):
 
 
 def ideal_reflection_velocity(incoming_velocity, surface_normal):
-    """Reflect one finite 3-D velocity around a normalized surface normal."""
+    """Reflect a finite 3-D velocity around a normalized surface normal.
+
+    Returns ``None`` when either input is not exactly three finite components
+    or when the normal is numerically degenerate.  The returned vector follows
+    ``v - 2 * dot(v, n) * n`` and therefore preserves the incoming speed.
+    """
     try:
         if len(incoming_velocity) != 3 or len(surface_normal) != 3:
             return None

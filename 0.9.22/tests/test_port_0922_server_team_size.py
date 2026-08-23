@@ -14,6 +14,7 @@ from lan_battle_server import (  # noqa: E402
     EFFECTIVE_PARAMS_CAPABILITY,
     PLAYER_FIRE_INTENT_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY,
+    RICOCHET_CONTINUATION_CAPABILITY,
     SIMULATION_WORKER_CAPABILITY,
 )
 from effective_params_fixture import effective_params
@@ -35,7 +36,8 @@ def _hello(index, team=None):
             HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
             PLAYER_FIRE_INTENT_CAPABILITY,
             PLAYER_ENVIRONMENT_CAPABILITY,
-            EFFECTIVE_PARAMS_CAPABILITY],
+            EFFECTIVE_PARAMS_CAPABILITY,
+            RICOCHET_CONTINUATION_CAPABILITY],
         'name': 'Player-%d' % index,
         'vehicle': 'ussr:R11_MS-1',
         'max_health': 90,
@@ -61,6 +63,7 @@ def _attach_worker(state):
                 PLAYER_FIRE_INTENT_CAPABILITY,
                 PLAYER_ENVIRONMENT_CAPABILITY,
                 EFFECTIVE_PARAMS_CAPABILITY,
+                RICOCHET_CONTINUATION_CAPABILITY,
             ],
         })
     if error is not None:

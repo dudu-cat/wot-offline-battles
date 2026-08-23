@@ -13,9 +13,11 @@ sys.path.insert(0, str(PORT_ROOT / 'server'))
 
 from lan_battle_server import (
     BattleState, CLIENT_BUILD_0922, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+    EFFECTIVE_PARAMS_CAPABILITY,
     HUMAN_RAM_TIMELINE_CAPABILITY, PLAYER_ENVIRONMENT_CAPABILITY,
     PLAYER_FIRE_INTENT_CAPABILITY, Player,
     PROJECTILE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
+    RICOCHET_CONTINUATION_CAPABILITY,
     SIMULATION_WORKER_AUTHORITY_ID, SIMULATION_WORKER_CAPABILITY,
     SimulationWorker)
 from server_bot_ai import BotPlanner
@@ -316,6 +318,8 @@ class ServerBotStateRevisionTests(unittest.TestCase):
                 HUMAN_RAM_TIMELINE_CAPABILITY,
                 PLAYER_FIRE_INTENT_CAPABILITY,
                 PLAYER_ENVIRONMENT_CAPABILITY,
+                EFFECTIVE_PARAMS_CAPABILITY,
+                RICOCHET_CONTINUATION_CAPABILITY,
             ))
         server.bot_authority_id = SIMULATION_WORKER_AUTHORITY_ID
         server.bot_roster = [{

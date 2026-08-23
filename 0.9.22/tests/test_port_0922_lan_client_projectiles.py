@@ -134,6 +134,7 @@ class ProjectileWireTests(unittest.TestCase):
         client.capabilities = list(module.CLIENT_CAPABILITIES)
         client.server_capabilities = [
             module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+            module.RICOCHET_CONTINUATION_CAPABILITY,
             module.RAM_CONTACT_LEDGER_CAPABILITY,
             module.HUMAN_RAM_TIMELINE_CAPABILITY,
             module.PLAYER_FIRE_INTENT_CAPABILITY,
@@ -162,6 +163,7 @@ class ProjectileWireTests(unittest.TestCase):
             module.SIMULATION_WORKER_CAPABILITY]
         client.server_capabilities = [
             module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+            module.RICOCHET_CONTINUATION_CAPABILITY,
             module.RAM_CONTACT_LEDGER_CAPABILITY,
             module.HUMAN_RAM_TIMELINE_CAPABILITY,
             module.PLAYER_FIRE_INTENT_CAPABILITY,
@@ -511,6 +513,53 @@ class ProjectileWireTests(unittest.TestCase):
             4, 'player:7:2', 0, 'miss', 10,
             [0.0, 0.0, 0.0], direct, []))
 
+    def test_first_ricochet_wire_is_harmless_and_strict(self):
+        client = self.active_worker_client()
+        direct = self.effect('bot', 17, 11.0)
+        direct['damage'] = 0
+        direct['shot_result'] = 0
+
+        self.assertTrue(client.send_projectile_ricochet(
+            4, 'player:7:1', 150, 180,
+            [11.0, 2.0, 3.0], [11.002, 2.0, 3.0],
+            [-100.0, 20.0, 0.0], 0.75, direct,
+            checked_distance=61.0, piercing_loss=3.0,
+            penetration_factor=0.75))
+        message = wire_copy(client._outbound_queue[-1][1])
+        self.assertEqual({
+            'type', 'round_id', 'authority_epoch', 'projectile_id',
+            'base_checked_ms', 'resolved_time_ms', 'checked_distance',
+            'piercing_loss', 'penetration_factor', 'impact',
+            'segment_origin', 'segment_velocity',
+            'base_penetration_multiplier', 'direct', 'destructibles'},
+            set(message))
+
+        damaging = dict(direct, damage=1)
+        self.assertFalse(client.send_projectile_ricochet(
+            4, 'player:7:2', 150, 180,
+            [11.0, 2.0, 3.0], [11.002, 2.0, 3.0],
+            [-100.0, 20.0, 0.0], 0.75, damaging))
+        self.assertFalse(client.send_projectile_ricochet(
+            4, 'player:7:2', 150, 180,
+            [11.0, 2.0, 3.0], [11.2, 2.0, 3.0],
+            [-100.0, 20.0, 0.0], 0.75, direct))
+        critical = dict(direct, critical={'fire': True},
+                        critical_target_base_revision=3,
+                        critical_target_ack_seq=4, hull_damage=0,
+                        critical_delta={
+                            'devices': [], 'crew_ko': [], 'ignite': True})
+        forbidden = (
+            critical,
+            dict(direct, stun_end_server_time_ms=500),
+            dict(direct, target_x=11.0, target_y=2.0, target_z=3.0),
+        )
+        for proposal in forbidden:
+            with self.subTest(proposal=proposal):
+                self.assertFalse(client.send_projectile_ricochet(
+                    4, 'player:7:2', 150, 180,
+                    [11.0, 2.0, 3.0], [11.002, 2.0, 3.0],
+                    [-100.0, 20.0, 0.0], 0.75, proposal))
+
     def test_optional_terminal_field_is_omitted_without_server_support(self):
         client = self.active_worker_client()
         client.server_capabilities = [
@@ -627,6 +676,7 @@ class ProjectileWireTests(unittest.TestCase):
                              if capabilities is None else capabilities),
             'server_capabilities': ([
                 module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                module.RICOCHET_CONTINUATION_CAPABILITY,
                 module.RAM_CONTACT_LEDGER_CAPABILITY,
                 module.HUMAN_RAM_TIMELINE_CAPABILITY,
                 module.PLAYER_FIRE_INTENT_CAPABILITY,
@@ -741,6 +791,12 @@ class ProjectileWireTests(unittest.TestCase):
             'team': 1,
             'origin': [0.0, 2.0, 0.0],
             'velocity': [100.0, 10.0, 0.0],
+            'range_origin': [0.0, 0.0, 0.0],
+            'segment_origin': [0.0, 2.0, 0.0],
+            'segment_velocity': [100.0, 10.0, 0.0],
+            'segment_start_time_ms': 0,
+            'ricochet_count': 0,
+            'base_penetration_multiplier': 1.0,
             'gravity': 9.81,
             'max_distance': 500.0,
             'max_time_ms': 5000,

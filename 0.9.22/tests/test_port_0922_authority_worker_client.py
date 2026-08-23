@@ -396,6 +396,32 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         self.assertEqual([], client._outbound_queue)
         self.assertEqual(0, client._outbound_bytes)
 
+    def test_worker_welcome_requires_ricochet_capability_from_server(self):
+        client = AuthorityWorkerLANClient('127.0.0.1', 28782)
+        message = {
+            'protocol': PROTOCOL_VERSION,
+            'client_build': CLIENT_BUILD,
+            'role': WORKER_ROLE,
+            'worker_id': WORKER_AUTHORITY_ID,
+            'capabilities': list(CLIENT_CAPABILITIES) + [
+                SIMULATION_WORKER_CAPABILITY],
+            'server_capabilities': [
+                lan_client_module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                lan_client_module.RAM_CONTACT_LEDGER_CAPABILITY,
+                lan_client_module.HUMAN_RAM_TIMELINE_CAPABILITY,
+                lan_client_module.PLAYER_FIRE_INTENT_CAPABILITY,
+                lan_client_module.PLAYER_ENVIRONMENT_CAPABILITY,
+                lan_client_module.EFFECTIVE_PARAMS_CAPABILITY,
+            ],
+            'state_revision': 1, 'round_id': 0, 'host_player_id': 1,
+            'authority_epoch': 0, 'server_time_ms': 10, 'team_size': 15,
+            'bot_authority_id': WORKER_AUTHORITY_ID,
+            'phase': 'waiting', 'map': '01_karelia',
+        }
+
+        self.assertFalse(client._handle_worker_welcome(message))
+        self.assertEqual('invalid worker welcome', client.last_error)
+
     def test_welcome_roster_and_runtime_projection_keep_dummy_local(self):
         events = []
         human = _human()
@@ -421,6 +447,7 @@ class AuthorityWorkerClientTests(unittest.TestCase):
                 lan_client_module.PLAYER_FIRE_INTENT_CAPABILITY,
                 lan_client_module.PLAYER_ENVIRONMENT_CAPABILITY,
                 lan_client_module.EFFECTIVE_PARAMS_CAPABILITY,
+                lan_client_module.RICOCHET_CONTINUATION_CAPABILITY,
                 lan_client_module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
                 lan_client_module.RANDOM_MAP_CAPABILITY],
             'map': '01_karelia', 'map_pool': ['01_karelia'],

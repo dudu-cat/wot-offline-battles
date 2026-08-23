@@ -16,6 +16,7 @@ PROTOCOL_VERSION = 5
 CLIENT_BUILD = 'wot-0.9.22.0.1-cn-1513'
 RANDOM_MAP_OPTION = 'server_random'
 PROJECTILE_LEDGER_CAPABILITY = 'projectile_ledger_v2'
+RICOCHET_CONTINUATION_CAPABILITY = 'ricochet_continuation_v1'
 PROJECTILE_HIT_VEHICLE_CAPABILITY = 'projectile_hit_vehicle_v1'
 PROJECTILE_WRECK_HIT_CAPABILITY = 'projectile_wreck_hit_v1'
 RANDOM_MAP_CAPABILITY = 'random_map_v1'
@@ -31,6 +32,7 @@ EFFECTIVE_PARAMS_CAPABILITY = effective_params_wire.CAPABILITY
 SIMULATION_WORKER_CAPABILITY = 'simulation_worker_v1'
 CLIENT_CAPABILITIES = (
     PROJECTILE_LEDGER_CAPABILITY,
+    RICOCHET_CONTINUATION_CAPABILITY,
     DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     LEAN_SNAPSHOT_MANIFEST_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY,
@@ -992,6 +994,9 @@ def _valid_active_projectiles(value, authority_epoch, server_time_ms):
         'splash_radius',
         'penetration_factor', 'launch_server_time_ms',
         'checked_through_ms', 'checked_distance', 'piercing_loss',
+        'range_origin', 'segment_origin', 'segment_velocity',
+        'segment_start_time_ms', 'ricochet_count',
+        'base_penetration_multiplier',
         'authority_epoch'))
     seen = set()
     for projectile in value:
@@ -1017,6 +1022,11 @@ def _valid_active_projectiles(value, authority_epoch, server_time_ms):
         team = _projectile_int_range(projectile.get('team'), 1, 2)
         origin = _strict_world_position(projectile.get('origin'))
         velocity = _strict_launch_velocity(projectile.get('velocity'))
+        range_origin = _strict_world_position(projectile.get('range_origin'))
+        segment_origin = _strict_world_position(
+            projectile.get('segment_origin'))
+        segment_velocity = _strict_launch_velocity(
+            projectile.get('segment_velocity'))
         gravity = _projectile_float_range(
             projectile.get('gravity'), 0.000001, MAX_PROJECTILE_GRAVITY)
         max_distance = _projectile_float_range(
@@ -1035,6 +1045,13 @@ def _valid_active_projectiles(value, authority_epoch, server_time_ms):
         checked_through = _projectile_int_range(
             projectile.get('checked_through_ms'), 0,
             MAX_PROJECTILE_TIME_MS)
+        segment_start_time = _projectile_int_range(
+            projectile.get('segment_start_time_ms'), 0,
+            MAX_PROJECTILE_TIME_MS)
+        ricochet_count = _projectile_int_range(
+            projectile.get('ricochet_count'), 0, 1)
+        base_multiplier = _projectile_float_range(
+            projectile.get('base_penetration_multiplier'), 0.0, 1.0)
         checked_distance = _projectile_float_range(
             projectile.get('checked_distance'), 0.0,
             MAX_PROJECTILE_DISTANCE + 0.1)
@@ -1057,7 +1074,9 @@ def _valid_active_projectiles(value, authority_epoch, server_time_ms):
                 not source_vehicle or len(source_vehicle) > 128 or
                 shooter_id is None or shot_seq is None or
                 shell_index is None or team is None or origin is None or
-                velocity is None or gravity is None or
+                velocity is None or range_origin is None or
+                segment_origin is None or segment_velocity is None or
+                gravity is None or
                 max_distance is None or max_time_ms is None or
                 not isinstance(is_he, bool) or splash_radius is None or
                 not _projectile_source_shot_matches_launch(
@@ -1067,10 +1086,28 @@ def _valid_active_projectiles(value, authority_epoch, server_time_ms):
                 launch_time > server_time_ms or checked_through is None or
                 checked_through > max_time_ms or checked_distance is None or
                 checked_distance > max_distance + 0.1 or
+                segment_start_time is None or
+                segment_start_time > checked_through or
+                (ricochet_count == 1 and
+                 segment_start_time >= max_time_ms) or
+                ricochet_count is None or base_multiplier is None or
                 piercing_loss is None or epoch != authority_epoch or
                 (shooter_kind == 'player' and
                  (fire_intent_seq is None or fire_input_seq is None))):
             return False
+        if ricochet_count == 0:
+            if (segment_start_time != 0 or segment_origin != origin or
+                    segment_velocity != velocity or base_multiplier != 1.0):
+                return False
+        else:
+            shell_kind = (source_shot.get('shell') or {}).get('kind')
+            expected_multiplier = (
+                0.75 if shell_kind in (
+                    'ARMOR_PIERCING', 'ARMOR_PIERCING_CR') else
+                1.0 if shell_kind == 'HOLLOW_CHARGE' else None)
+            if (expected_multiplier is None or
+                    base_multiplier != expected_multiplier):
+                return False
         seen.add(projectile_id)
     return True
 
@@ -2237,6 +2274,81 @@ class LANClient(object):
             message['wreck_hit'] = parsed_wreck_hit
         return self._send(message)
 
+    def send_projectile_ricochet(
+            self, authority_epoch, projectile_id, base_checked_ms,
+            resolved_time_ms, impact, segment_origin, segment_velocity,
+            base_penetration_multiplier, direct, checked_distance=0.0,
+            piercing_loss=0.0, penetration_factor=1.0,
+            destructibles=None):
+        """Atomically replace a first-impact projectile with its ricochet."""
+        if self.phase != 'battle' or not self.is_bot_authority():
+            return False
+        parsed_epoch = _projectile_int_range(
+            authority_epoch, 0, MAX_PROJECTILE_ID)
+        parsed_projectile_id = _strict_projectile_id(projectile_id)
+        parsed_base = _projectile_int_range(
+            base_checked_ms, 0, MAX_PROJECTILE_TIME_MS)
+        parsed_time = _projectile_int_range(
+            resolved_time_ms, 0, MAX_PROJECTILE_TIME_MS)
+        parsed_impact = _strict_world_position(impact)
+        parsed_origin = _strict_world_position(segment_origin)
+        parsed_velocity = _strict_launch_velocity(segment_velocity)
+        parsed_multiplier = _projectile_float_range(
+            base_penetration_multiplier, 0.0, 1.0)
+        parsed_distance = _projectile_float_range(
+            checked_distance, 0.0, MAX_PROJECTILE_DISTANCE)
+        parsed_loss = _projectile_float_range(
+            piercing_loss, 0.0, MAX_PROJECTILE_PIERCING_LOSS)
+        parsed_factor = _projectile_float_range(
+            penetration_factor, 0.0, 100.0)
+        parsed_direct = _strict_projectile_effect(direct)
+        if destructibles is None:
+            destructibles = []
+        if (not isinstance(destructibles, list) or
+                len(destructibles) > MAX_PROJECTILE_DESTRUCTIBLES):
+            return False
+        parsed_destructibles = []
+        for raw in destructibles:
+            parsed = _strict_projectile_destructible(raw)
+            if parsed is None:
+                return False
+            parsed_destructibles.append(parsed)
+        if (parsed_epoch is None or parsed_epoch != _exact_int(
+                self.authority_epoch) or parsed_projectile_id is None or
+                parsed_base is None or parsed_time is None or
+                parsed_time < parsed_base or parsed_impact is None or
+                parsed_origin is None or parsed_velocity is None or
+                parsed_multiplier not in (0.75, 1.0) or
+                parsed_distance is None or parsed_loss is None or
+                parsed_factor is None or parsed_direct is None or
+                parsed_direct['damage'] != 0 or
+                parsed_direct['shot_result'] != 0 or
+                set(parsed_direct) != {
+                    'target_kind', 'target_id', 'damage', 'shot_result',
+                    'x', 'y', 'z'}):
+            return False
+        if math.sqrt(sum(
+                (parsed_origin[index] - parsed_impact[index]) ** 2
+                for index in range(3))) > 0.1:
+            return False
+        return self._send({
+            'type': 'projectile_ricochet',
+            'round_id': self.round_id,
+            'authority_epoch': parsed_epoch,
+            'projectile_id': parsed_projectile_id,
+            'base_checked_ms': parsed_base,
+            'resolved_time_ms': parsed_time,
+            'checked_distance': parsed_distance,
+            'piercing_loss': parsed_loss,
+            'penetration_factor': parsed_factor,
+            'impact': parsed_impact,
+            'segment_origin': parsed_origin,
+            'segment_velocity': parsed_velocity,
+            'base_penetration_multiplier': parsed_multiplier,
+            'direct': parsed_direct,
+            'destructibles': parsed_destructibles,
+        })
+
     def send_hit(self, target_id, shot_seq, damage, shot_result,
                  shell_index=0, impact_position=None, critical=None,
                  splash=False, critical_target_base_revision=None,
@@ -2319,6 +2431,11 @@ class LANClient(object):
 
     def has_projectile_ledger(self):
         return PROJECTILE_LEDGER_CAPABILITY in self.capabilities
+
+    def has_ricochet_continuation(self):
+        return (RICOCHET_CONTINUATION_CAPABILITY in self.capabilities and
+                RICOCHET_CONTINUATION_CAPABILITY in
+                self.server_capabilities)
 
     def has_projectile_hit_vehicle(self):
         return (PROJECTILE_HIT_VEHICLE_CAPABILITY in
@@ -3058,6 +3175,7 @@ class LANClient(object):
                     PLAYER_FIRE_INTENT_CAPABILITY not in capabilities or
                     PLAYER_ENVIRONMENT_CAPABILITY not in capabilities or
                     EFFECTIVE_PARAMS_CAPABILITY not in capabilities or
+                    RICOCHET_CONTINUATION_CAPABILITY not in capabilities or
                     server_capabilities is None or
                     DESTRUCTIBLE_CATALOG_V5_CAPABILITY not in
                     server_capabilities or
@@ -3070,6 +3188,8 @@ class LANClient(object):
                     PLAYER_ENVIRONMENT_CAPABILITY not in
                     server_capabilities or
                     EFFECTIVE_PARAMS_CAPABILITY not in
+                    server_capabilities or
+                    RICOCHET_CONTINUATION_CAPABILITY not in
                     server_capabilities):
                 self.last_error = 'required LAN capability mismatch'
                 self.stop()

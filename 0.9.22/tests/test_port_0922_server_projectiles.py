@@ -20,6 +20,7 @@ from lan_battle_server import (  # noqa: E402
     PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY,
     PROJECTILE_CAPABILITY, PROJECTILE_MAX_ACTIVE,
+    RICOCHET_CONTINUATION_CAPABILITY, SERVER_CAPABILITIES,
     Player, SimulationWorker, SIMULATION_WORKER_AUTHORITY_ID,
     SIEGE_DISABLED, SIEGE_ENABLED, SIEGE_SWITCHING_OFF,
     SIEGE_SWITCHING_ON, SIEGE_VEHICLE_PARAMS, TICK_HZ,
@@ -41,7 +42,8 @@ def _player(player_id, team=1, x=0.0):
             HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
             PLAYER_FIRE_INTENT_CAPABILITY,
             PLAYER_ENVIRONMENT_CAPABILITY,
-            EFFECTIVE_PARAMS_CAPABILITY),
+            EFFECTIVE_PARAMS_CAPABILITY,
+            RICOCHET_CONTINUATION_CAPABILITY),
         effective_params=effective_params())
 
 
@@ -76,7 +78,8 @@ def _attach_worker_authority(state):
             HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
             PLAYER_FIRE_INTENT_CAPABILITY,
             PLAYER_ENVIRONMENT_CAPABILITY,
-            EFFECTIVE_PARAMS_CAPABILITY))
+            EFFECTIVE_PARAMS_CAPABILITY,
+            RICOCHET_CONTINUATION_CAPABILITY))
     state.bot_authority_id = SIMULATION_WORKER_AUTHORITY_ID
     state.simulation_worker.offer_reliable = lambda unused_message: True
     return state.simulation_worker
@@ -155,7 +158,7 @@ def _launch(shooter_id=1, shot_seq=1, shooter_kind='player', **changes):
     return message
 
 
-def _launch_authority(state, message):
+def _launch_authority(state, message, before_launch=None):
     """Admit a player trigger, then let only worker -1 launch it."""
     if message.get('shooter_kind') == 'bot':
         return state.launch_projectile(
@@ -198,6 +201,8 @@ def _launch_authority(state, message):
             'fire_intent_seq': intent_seq,
             'fire_input_seq': input_seq,
         })
+    if callable(before_launch):
+        before_launch()
     return state.launch_projectile(
         SIMULATION_WORKER_AUTHORITY_ID, message)
 
@@ -227,6 +232,24 @@ def _resolve(projectile_id, epoch=1, **changes):
         'piercing_loss': 0.0, 'penetration_factor': 1.0,
         'impact': [10.0, 1.0, 0.0],
         'direct': _effect(), 'splash': [], 'destructibles': [],
+    }
+    message.update(changes)
+    return message
+
+
+def _ricochet(projectile_id, epoch=1, **changes):
+    message = {
+        'type': 'projectile_ricochet', 'round_id': 1,
+        'authority_epoch': epoch, 'projectile_id': projectile_id,
+        'base_checked_ms': 0, 'resolved_time_ms': 100,
+        'checked_distance': 10.0, 'piercing_loss': 0.0,
+        'penetration_factor': 1.0,
+        'impact': [10.0, 1.0, 0.0],
+        'segment_origin': [10.0, 1.0, 0.0],
+        'segment_velocity': [-100.0, 0.0, 0.0],
+        'base_penetration_multiplier': 0.75,
+        'direct': _effect(damage=0, shot_result=0),
+        'destructibles': [],
     }
     message.update(changes)
     return message
@@ -367,6 +390,16 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual('shot', shot['kind'])
         self.assertEqual([0.0, 1.0, 0.0], shot['origin'])
         self.assertEqual([100.0, 0.0, 0.0], shot['velocity'])
+        self.assertEqual([0.0, 0.0, 0.0], shot['range_origin'])
+        record = state.projectiles['1:p:1:1']
+        self.assertEqual([0.0, 0.0, 0.0], record['range_origin'])
+        self.assertEqual(message['origin'], record['segment_origin'])
+        self.assertEqual(message['velocity'], record['segment_velocity'])
+        self.assertEqual(0, record['segment_start_time_ms'])
+        self.assertEqual(0, record['ricochet_count'])
+        self.assertEqual(1.0, record['base_penetration_multiplier'])
+        for key, value in state._projectile_snapshot()[0].items():
+            self.assertEqual(value, shot[key])
         self.assertEqual(1.570796, shot['shot_yaw'])
         self.assertEqual(state._server_time_ms(),
                          shot['launch_server_time_ms'])
@@ -379,6 +412,30 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertFalse(state.launch_projectile(
             1, _launch(shot_seq=3)))
         self.assertEqual(1, state.players[1].fire_seq)
+
+    def test_launch_freezes_authoritative_player_range_origin(self):
+        state = _state()
+        state.players[1].x = 12.5
+        state.players[1].y = 2.25
+        state.players[1].z = -7.75
+        message = _launch(origin=[20.0, 3.0, 9.0])
+
+        self.assertTrue(_launch_authority(
+            state, message,
+            before_launch=lambda: setattr(state.players[1], 'x', 99.0)))
+
+        record = state.projectiles['1:p:1:1']
+        snapshot = state._projectile_snapshot()[0]
+        self.assertEqual([12.5, 2.25, -7.75], record['range_origin'])
+        self.assertEqual(record['range_origin'], snapshot['range_origin'])
+        self.assertEqual([20.0, 3.0, 9.0], record['origin'])
+        self.assertEqual([12.5, 2.25, -7.75],
+                         state.pending_events[-1]['range_origin'])
+
+        rejected = _state()
+        self.assertFalse(_launch_authority(
+            rejected, dict(_launch(), range_origin=[500.0, 0.0, 0.0])))
+        self.assertFalse(rejected.projectiles)
 
     def test_player_fire_intent_freezes_admitted_input_and_retries_exactly(self):
         state = _state()
@@ -620,6 +677,20 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             player.fire_intent_results[1])
         self.assertFalse(state.projectiles)
 
+    def test_rejected_worker_ricochet_terminates_the_worker_round(self):
+        state = _state()
+        self.assertTrue(_launch_authority(state, _launch()))
+        worker = state.simulation_worker
+        handler = object.__new__(ClientHandler)
+        malformed = _ricochet('1:p:1:1')
+        malformed['direct']['damage'] = 1
+
+        self.assertEqual(
+            'close', handler._dispatch_simulation_worker_message(
+                types.SimpleNamespace(state=state), worker, malformed))
+        self.assertIsNone(state.simulation_worker)
+        self.assertFalse(worker.connected)
+
     def test_launch_rejects_malformed_or_inconsistent_source_shot(self):
         valid = _launch()
         invalid = []
@@ -727,6 +798,12 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual('bot_shot', state.pending_events[-1]['kind'])
         self.assertEqual('1:b:16:1',
                          state.pending_events[-1]['projectile_id'])
+        self.assertEqual(
+            [20.0, 0.0, 0.0],
+            state.projectiles['1:b:16:1']['range_origin'])
+        self.assertEqual(
+            [20.0, 0.0, 0.0],
+            state._projectile_snapshot()[0]['range_origin'])
         self.assertTrue(_launch_authority(state, dict(launch)))
         self.assertFalse(state.launch_projectile(
             SIMULATION_WORKER_AUTHORITY_ID,
@@ -832,6 +909,137 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertTrue(state.progress_projectiles(SIMULATION_WORKER_AUTHORITY_ID, dict(message)))
         self.assertEqual(1, state.destructible_revision)
         self.assertEqual(events, len(state.pending_events))
+
+    def test_first_ricochet_advances_segment_and_is_idempotent(self):
+        state = _state()
+        message = _launch()
+        self.assertTrue(_launch_authority(state, message))
+        record = state.projectiles['1:p:1:1']
+        original_origin = list(record['origin'])
+        original_velocity = list(record['velocity'])
+        original_launch_time = record['launch_server_time_ms']
+        request = _ricochet(
+            '1:p:1:1', destructibles=[_destructible()])
+        revision = state.projectile_revision
+
+        self.assertTrue(state.ricochet_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID, request))
+
+        self.assertIn('1:p:1:1', state.projectiles)
+        self.assertEqual(original_origin, record['origin'])
+        self.assertEqual(original_velocity, record['velocity'])
+        self.assertEqual(original_launch_time, record['launch_server_time_ms'])
+        self.assertEqual(100, record['checked_through_ms'])
+        self.assertEqual(10.0, record['checked_distance'])
+        self.assertEqual([10.0, 1.0, 0.0], record['segment_origin'])
+        self.assertEqual([-100.0, 0.0, 0.0], record['segment_velocity'])
+        self.assertEqual(100, record['segment_start_time_ms'])
+        self.assertEqual(1, record['ricochet_count'])
+        self.assertEqual(0.75, record['base_penetration_multiplier'])
+        self.assertEqual(revision + 1, state.projectile_revision)
+        self.assertEqual(1, state.destructible_revision)
+        self.assertEqual(1000, state.players[2].health)
+        events = [event for event in state.pending_events
+                  if event.get('projectile_id') == '1:p:1:1']
+        self.assertEqual(['shot', 'projectile_ricochet', 'hit'],
+                         [event['kind'] for event in events])
+        self.assertEqual(0, events[-1]['damage'])
+        self.assertEqual(0, events[-1]['shot_result'])
+        snapshot = state._projectile_snapshot()[0]
+        for key, value in snapshot.items():
+            self.assertEqual(value, events[1][key])
+        self.assertEqual(request['impact'], events[1]['impact'])
+        self.assertEqual(request['direct'], events[1]['direct'])
+        self.assertEqual(request['resolved_time_ms'],
+                         events[1]['resolved_time_ms'])
+        self.assertEqual(record['segment_origin'], snapshot['segment_origin'])
+        self.assertEqual(record['segment_velocity'],
+                         snapshot['segment_velocity'])
+        self.assertEqual(100, snapshot['segment_start_time_ms'])
+        self.assertEqual(1, snapshot['ricochet_count'])
+        self.assertEqual(0.75,
+                         snapshot['base_penetration_multiplier'])
+        self.assertEqual(message['max_distance'], snapshot['max_distance'])
+        self.assertEqual(message['max_time_ms'], snapshot['max_time_ms'])
+
+        event_count = len(state.pending_events)
+        self.assertTrue(state.ricochet_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID, dict(request)))
+        self.assertEqual(event_count, len(state.pending_events))
+        self.assertEqual(revision + 1, state.projectile_revision)
+        self.assertEqual(1, state.destructible_revision)
+        self.assertFalse(state.ricochet_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            dict(request, checked_distance=10.000001)))
+
+        second = dict(
+            request, base_checked_ms=100, resolved_time_ms=101,
+            checked_distance=11.0, impact=[11.0, 1.0, 0.0],
+            segment_origin=[11.0, 1.0, 0.0])
+        self.assertFalse(state.ricochet_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID, second))
+        self.assertEqual(1, record['ricochet_count'])
+
+    def test_ricochet_rejects_wrong_multiplier_origin_and_direct_result(self):
+        mutations = (
+            {'base_penetration_multiplier': 0.750001},
+            {'segment_origin': [10.100001, 1.0, 0.0]},
+            {'direct': _effect(damage=1, shot_result=0)},
+            {'direct': _effect(damage=0, shot_result=1)},
+            {'direct': dict(
+                _effect(damage=0, shot_result=0), potential_damage=5000)},
+            {'segment_velocity': [0.0, 0.0, 0.0]},
+            {'segment_velocity': [3000.0, 0.0, 1.0]},
+            {'segment_velocity': [-90.0, 0.0, 0.0]},
+            {'penetration_factor': 0.999999},
+            {'base_checked_ms': 1},
+        )
+        for changes in mutations:
+            with self.subTest(changes=changes):
+                state = _state()
+                self.assertTrue(_launch_authority(state, _launch()))
+                revision = state.projectile_revision
+                self.assertFalse(state.ricochet_projectile(
+                    SIMULATION_WORKER_AUTHORITY_ID,
+                    _ricochet('1:p:1:1', **changes)))
+                record = state.projectiles['1:p:1:1']
+                self.assertEqual(0, record['ricochet_count'])
+                self.assertEqual(0, record['checked_through_ms'])
+                self.assertEqual(revision, state.projectile_revision)
+                self.assertEqual(1000, state.players[2].health)
+
+        for changes in (
+                {'resolved_time_ms': 10000},
+                {'checked_distance': 1000.0}):
+            with self.subTest(changes=changes):
+                state = _state()
+                self.assertTrue(_launch_authority(state, _launch()))
+                self.assertFalse(state.ricochet_projectile(
+                    SIMULATION_WORKER_AUTHORITY_ID,
+                    _ricochet('1:p:1:1', **changes)))
+
+    def test_ricochet_multiplier_is_version_locked_by_shell_kind(self):
+        for shell_kind, multiplier, accepted in (
+                ('ARMOR_PIERCING', 0.75, True),
+                ('ARMOR_PIERCING_CR', 0.75, True),
+                ('HOLLOW_CHARGE', 1.0, True),
+                ('HIGH_EXPLOSIVE', 0.75, False),
+                ('ARMOR_PIERCING_HE', 0.75, False)):
+            with self.subTest(shell_kind=shell_kind):
+                state = _state()
+                launch = _launch(
+                    is_he=shell_kind == 'HIGH_EXPLOSIVE',
+                    splash_radius=(1.0 if shell_kind ==
+                                   'HIGH_EXPLOSIVE' else 0.0))
+                launch['source_shot']['shell']['kind'] = shell_kind
+                self.assertTrue(_launch_authority(state, launch))
+                result = state.ricochet_projectile(
+                    SIMULATION_WORKER_AUTHORITY_ID, _ricochet(
+                        '1:p:1:1',
+                        base_penetration_multiplier=multiplier))
+                self.assertEqual(accepted, result)
+                self.assertEqual(int(accepted), state.projectiles[
+                    '1:p:1:1']['ricochet_count'])
 
     def test_progress_destructible_total_batch_cap_is_sixty_four(self):
         state = _state(players=3)
@@ -1429,6 +1637,9 @@ class ServerProjectileLedgerTests(unittest.TestCase):
 
     def test_capability_and_active_snapshot_wire_bound(self):
         self.assertEqual('projectile_ledger_v2', PROJECTILE_CAPABILITY)
+        self.assertEqual('ricochet_continuation_v1',
+                         RICOCHET_CONTINUATION_CAPABILITY)
+        self.assertIn(RICOCHET_CONTINUATION_CAPABILITY, SERVER_CAPABILITIES)
         modern = BattleState(map_name='04_himmelsdorf')
         player, error = modern.add_player(_Socket(), ('127.0.0.1', 1), {
             'client_build': CLIENT_BUILD_0922, 'name': 'P'})
@@ -1456,6 +1667,21 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                 PLAYER_FIRE_INTENT_CAPABILITY,
                 PLAYER_ENVIRONMENT_CAPABILITY,
                 EFFECTIVE_PARAMS_CAPABILITY],
+            'vehicle_compact_descr': 'dGVzdA==',
+            'effective_params': effective_params()})
+        self.assertIsNone(player)
+        self.assertEqual('unsupported_capabilities', error)
+        player, error = modern.add_player(_Socket(), ('127.0.0.1', 1), {
+            'client_build': CLIENT_BUILD_0922, 'name': 'P',
+            'capabilities': [
+                PROJECTILE_CAPABILITY,
+                DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                HUMAN_RAM_TIMELINE_CAPABILITY,
+                RAM_CONTACT_LEDGER_CAPABILITY,
+                PLAYER_FIRE_INTENT_CAPABILITY,
+                PLAYER_ENVIRONMENT_CAPABILITY,
+                EFFECTIVE_PARAMS_CAPABILITY,
+                RICOCHET_CONTINUATION_CAPABILITY],
             'vehicle_compact_descr': 'dGVzdA==',
             'effective_params': effective_params()})
         self.assertIsNotNone(player)

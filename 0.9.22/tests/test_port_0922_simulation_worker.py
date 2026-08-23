@@ -21,6 +21,7 @@ from lan_battle_server import (  # noqa: E402
     PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
     EFFECTIVE_PARAMS_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY,
+    RICOCHET_CONTINUATION_CAPABILITY,
     REPLICA_SNAPSHOT_TICKS,
     SimulationWorker,
     SIMULATION_WORKER_AUTHORITY_ID, SIMULATION_WORKER_CAPABILITY,
@@ -113,7 +114,8 @@ def _worker_hello():
             HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
             PLAYER_FIRE_INTENT_CAPABILITY,
             PLAYER_ENVIRONMENT_CAPABILITY,
-            EFFECTIVE_PARAMS_CAPABILITY],
+            EFFECTIVE_PARAMS_CAPABILITY,
+            RICOCHET_CONTINUATION_CAPABILITY],
     }
 
 
@@ -127,7 +129,8 @@ def _player_hello(name='Human'):
             HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
             PLAYER_FIRE_INTENT_CAPABILITY,
             PLAYER_ENVIRONMENT_CAPABILITY,
-            EFFECTIVE_PARAMS_CAPABILITY],
+            EFFECTIVE_PARAMS_CAPABILITY,
+            RICOCHET_CONTINUATION_CAPABILITY],
         'name': name, 'vehicle': 'ussr:R11_MS-1', 'max_health': 90,
         'vehicle_compact_descr': 'dGVzdA==',
         'effective_params': effective_params(),
@@ -189,6 +192,17 @@ def _wait_until(predicate, timeout=2.0):
 
 
 class SimulationWorkerStateTests(unittest.TestCase):
+    def test_worker_join_requires_ricochet_capability(self):
+        state = BattleState(map_name='01_karelia')
+        hello = _worker_hello()
+        hello['capabilities'].remove(RICOCHET_CONTINUATION_CAPABILITY)
+
+        worker, error = state.add_simulation_worker(
+            _Connection(), ('127.0.0.1', 1000), hello)
+
+        self.assertIsNone(worker)
+        self.assertEqual('unsupported_capabilities', error)
+
     def test_lifecycle_broadcasts_do_not_wait_for_a_slow_socket(self):
         def assert_nonblocking(publish):
             connection = _BlockingConnection()

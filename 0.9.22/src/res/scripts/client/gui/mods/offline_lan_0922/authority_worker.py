@@ -20,7 +20,8 @@ from gui.mods.offline_lan_0922.lan_client import (
     MAX_PROJECTILE_ID, PROTOCOL_VERSION, PROJECTILE_LEDGER_CAPABILITY,
     EFFECTIVE_PARAMS_CAPABILITY,
     PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
-    RAM_CONTACT_LEDGER_CAPABILITY, SIMULATION_WORKER_CAPABILITY,
+    RAM_CONTACT_LEDGER_CAPABILITY, RICOCHET_CONTINUATION_CAPABILITY,
+    SIMULATION_WORKER_CAPABILITY,
     WORKER_AUTHORITY_ID, LANClient,
     _BOT_STATE_WIRE_FIELDS,
     _canonical_effective_params, _canonical_vehicle_compact_descr,
@@ -199,6 +200,7 @@ class AuthorityWorkerLANClient(LANClient):
                 PLAYER_FIRE_INTENT_CAPABILITY not in capabilities or
                 PLAYER_ENVIRONMENT_CAPABILITY not in capabilities or
                 EFFECTIVE_PARAMS_CAPABILITY not in capabilities or
+                RICOCHET_CONTINUATION_CAPABILITY not in capabilities or
                 RAM_CONTACT_LEDGER_CAPABILITY not in server_capabilities or
                 HUMAN_RAM_TIMELINE_CAPABILITY not in server_capabilities or
                 PLAYER_FIRE_INTENT_CAPABILITY not in
@@ -206,6 +208,8 @@ class AuthorityWorkerLANClient(LANClient):
                 PLAYER_ENVIRONMENT_CAPABILITY not in
                 server_capabilities or
                 EFFECTIVE_PARAMS_CAPABILITY not in server_capabilities or
+                RICOCHET_CONTINUATION_CAPABILITY not in
+                server_capabilities or
                 state_revision is None or state_revision < 0 or
                 round_id is None or round_id < 0 or
                 (host_player_id is not None and host_player_id <= 0) or

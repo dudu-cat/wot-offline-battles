@@ -81,6 +81,7 @@ class _Client(object):
         self.authority_epoch = 1
         self.server_time_ms = 0
         self.resolutions = []
+        self.ricochets = []
         self.progress = []
         self.launches = []
 
@@ -89,6 +90,10 @@ class _Client(object):
 
     def send_projectile_resolve(self, *args, **kwargs):
         self.resolutions.append((args, kwargs))
+        return True
+
+    def send_projectile_ricochet(self, *args, **kwargs):
+        self.ricochets.append((args, kwargs))
         return True
 
     def send_projectile_progress(self, epoch, cursors):
@@ -158,6 +163,12 @@ def _event():
         'fire_intent_seq': 1, 'fire_input_seq': 1,
         'origin': [0.0, 1.0, 0.0],
         'velocity': [10.0, 0.0, 0.0],
+        'range_origin': [0.0, 0.0, 0.0],
+        'segment_origin': [0.0, 1.0, 0.0],
+        'segment_velocity': [10.0, 0.0, 0.0],
+        'segment_start_time_ms': 0,
+        'ricochet_count': 0,
+        'base_penetration_multiplier': 1.0,
         'gravity': 0.000001, 'maxDistance': 100.0,
         'max_time_ms': 20000, 'is_he': False,
         'splash_radius': 0.0, 'penetration_factor': 1.0,
@@ -695,6 +706,138 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertEqual([], args[7])
         self.assertAlmostEqual(5.0, kwargs['checked_distance'], places=4)
 
+    def test_first_ricochet_relaunches_once_and_second_ricochet_terminates(self):
+        battle, bigworld = _battle(now=0.5)
+        battle._projectile_server_time_ms = 500
+        battle._projectile_server_local_time = 0.5
+        event = _event()
+        self.assertTrue(battle._accept_projectile_event(event))
+        meta = battle._projectile_meta['player:7:1']
+        meta['destructibles_pending'] = [{
+            'destructible_kind': 'fragile', 'chunk_id': 7,
+            'item_index': 3, 'x': 1.0, 'y': 0.5, 'z': 0.0,
+            'fall_yaw': 0.2, 'speed': 12.0, 'is_shot': True,
+        }]
+        state = battle._projectiles.get('player:7:1')
+        state.update({
+            'cursor_time': 0.5,
+            'elapsed': 0.5,
+            'position': (5.0, 1.0, 0.0),
+            'distance': 5.0,
+        })
+        terminal_data = {
+            'impact': (5.0, 1.0, 0.0),
+            'target_key': 'bot:17',
+        }
+        battle._projectile_terminal_data['player:7:1'] = terminal_data
+
+        def ricochet_effect(unused_meta, unused_state, data):
+            data['world_normal'] = (1.0, 0.0, 0.0)
+            return {
+                'target_kind': 'bot', 'target_id': 17,
+                'damage': 0, 'shot_result': 0,
+                'x': 5.0, 'y': 1.0, 'z': 0.0,
+            }
+
+        battle._projectile_direct_effect = ricochet_effect
+        self.assertTrue(battle._projectile_terminal(
+            state, {'reason': 'impact'}))
+        self.assertEqual(1, len(battle.client.ricochets))
+        args, kwargs = battle.client.ricochets[0]
+        self.assertEqual(500, args[3])
+        self.assertAlmostEqual(-10.0, args[6][0], places=6)
+        self.assertEqual(0.75, args[7])
+        self.assertAlmostEqual(5.0, kwargs['checked_distance'])
+        first_request = battle.client.ricochets[0]
+        self.assertTrue(meta['awaiting_ricochet'])
+        self.assertIsNotNone(meta['pending_ricochet'])
+        self.assertTrue(meta['destructibles_pending'])
+
+        # The first-segment snapshot is the negative acknowledgement for the
+        # retained CAS request. Retry the byte-equivalent frozen proposal.
+        battle._projectiles.remove('player:7:1')
+        snapshot_row = dict(event)
+        snapshot_row['max_distance'] = snapshot_row.pop('maxDistance')
+        snapshot_row.pop('kind')
+        snapshot_row.pop('attacker')
+        snapshot_row.update({
+            'checked_through_ms': 0, 'checked_distance': 0.0,
+            'piercing_loss': 0.0,
+        })
+        self.assertTrue(battle._reconcile_projectile_snapshot({
+            'projectiles': [snapshot_row]}))
+        self.assertEqual(2, len(battle.client.ricochets))
+        self.assertEqual(first_request, battle.client.ricochets[1])
+
+        canonical = dict(event)
+        canonical.update({
+            'kind': 'projectile_ricochet',
+            'max_distance': canonical.pop('maxDistance'),
+            'checked_through_ms': 500,
+            'checked_distance': 5.0,
+            'piercing_loss': 0.0,
+            'segment_origin': list(args[5]),
+            'segment_velocity': list(args[6]),
+            'segment_start_time_ms': 500,
+            'ricochet_count': 1,
+            'base_penetration_multiplier': 0.75,
+            'resolved_time_ms': 500,
+            'impact': [5.0, 1.0, 0.0],
+            'direct': args[8],
+        })
+        self.assertTrue(battle._apply_projectile_ricochet_event(canonical))
+        self.assertIsNone(meta['pending_ricochet'])
+        self.assertFalse(meta['awaiting_ricochet'])
+        self.assertEqual([], meta['destructibles_pending'])
+        manager_key = ('player:7:1', 1)
+        self.assertFalse(battle._projectiles.contains('player:7:1'))
+        self.assertTrue(battle._projectiles.contains(manager_key))
+        second = battle._projectiles.get(manager_key)
+        self.assertEqual((0.0, 0.0, 0.0),
+                         second['payload']['range_origin'])
+        self.assertEqual(0.75,
+                         second['payload']['base_penetration_multiplier'])
+
+        battle._projectile_terminal_data['player:7:1'] = {
+            'impact': tuple(second['position']),
+            'target_key': 'bot:18',
+        }
+        self.assertTrue(battle._projectile_terminal(
+            second, {'reason': 'impact'}))
+        self.assertEqual(2, len(battle.client.ricochets))
+        self.assertEqual(1, len(battle.client.resolutions))
+        self.assertEqual('impact', battle.client.resolutions[0][0][3])
+
+    def test_over_limit_reflection_falls_back_to_terminal_resolution(self):
+        battle, unused_bigworld = _battle(now=1.0)
+        battle._projectile_server_time_ms = 1000
+        battle._projectile_server_local_time = 1.0
+        self.assertTrue(battle._accept_projectile_event(_event()))
+        state = battle._projectiles.get('player:7:1')
+        state.update({
+            'cursor_time': 1.0, 'elapsed': 1.0,
+            'position': (10.0, 1.0, 0.0), 'distance': 10.0,
+            'velocity': (3000.0, 0.0, 0.0),
+            'gravity': (0.0, -100.0, 0.0),
+        })
+        battle._projectile_terminal_data['player:7:1'] = {
+            'impact': (10.0, 1.0, 0.0), 'target_key': 'bot:17',
+        }
+
+        def ricochet_effect(unused_meta, unused_state, data):
+            data['world_normal'] = (1.0, 0.0, 0.0)
+            return {
+                'target_kind': 'bot', 'target_id': 17,
+                'damage': 0, 'shot_result': 0,
+                'x': 10.0, 'y': 1.0, 'z': 0.0,
+            }
+
+        battle._projectile_direct_effect = ricochet_effect
+        self.assertTrue(battle._projectile_terminal(
+            state, {'reason': 'impact'}))
+        self.assertEqual([], battle.client.ricochets)
+        self.assertEqual(1, len(battle.client.resolutions))
+
     def test_far_records_skip_native_entity_lookup_before_exact_broadphase(self):
         battle, unused_bigworld = _battle()
         self.assertTrue(battle._accept_projectile_event(_event()))
@@ -761,12 +904,14 @@ class BattleProjectileTests(unittest.TestCase):
             'stopped_by_destructible': False,
         })
         collision = types.SimpleNamespace(dist=5.0)
+        evidence = types.SimpleNamespace(
+            collision=collision, worldNormal=None)
         module = sys.modules[BattleRuntime.__module__]
         state = battle._projectiles.get('player:7:1')
 
         with mock.patch.object(
-                module, 'collide_vehicle_at_matrix',
-                return_value=(collision,)) as collide:
+                module, '_collide_vehicle_evidence_at_matrix',
+                return_value=(evidence,)) as collide:
             terminal = battle._projectile_chord(
                 state, (0.0, 1.0, 0.0), (10.0, 1.0, 0.0),
                 0.0, 0.1)
@@ -1217,6 +1362,54 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertEqual(
             [390.0, 150.0], critical.call_args.args[5]['damage'])
         self.assertFalse(critical.call_args.kwargs['deadeye'])
+
+    def test_ricochet_contact_keeps_world_normal_and_has_no_critical(self):
+        battle, unused_bigworld = _battle()
+        source = battle._server_entity(41)
+        target = types.SimpleNamespace(
+            id=55, isStarted=True, typeDescriptor=types.SimpleNamespace(),
+            position=_Vector((10.0, 0.0, 0.0)), isAlive=lambda: True)
+        battle._records['bot:17'] = {
+            'engine_id': 55, 'network_id': 17, 'kind': 'bot',
+            'local': False, 'ready': True,
+            'state': {'health': 1000, 'alive': True}}
+        battle._server_entity = lambda entity_id: (
+            source if entity_id == 41 else target if entity_id == 55 else None)
+        meta = battle._projectile_wire_meta(_event())
+        meta['base_penetration_multiplier'] = 0.75
+        collision = types.SimpleNamespace(
+            dist=10.0, hitAngleCos=0.1, matInfo=object(), compName='hull')
+        evidence = types.SimpleNamespace(
+            collision=collision, worldNormal=_Vector((1.0, 0.0, 0.0)))
+        terminal = {
+            'target_key': 'bot:17', 'collisions': [collision],
+            'collision_evidence': [evidence],
+            'query': (_Vector((0.0, 1.0, 0.0)),
+                      _Vector((12.0, 1.0, 0.0))),
+            'impact': (10.0, 1.0, 0.0),
+            'piercing_loss': 0.0, 'penetration_factor': 1.0,
+        }
+
+        with mock.patch.object(
+                combat_rules, 'resolve_armor_contact', return_value={
+                    'result': 0, 'component': 'hull', 'distance': 10.0,
+                }) as resolved, mock.patch.object(
+                    combat_rules, 'he_nominal_armor', return_value=100.0), \
+                mock.patch.object(
+                    critical_damage, 'propose_direct') as critical:
+            effect = battle._projectile_direct_effect(meta, {
+                'start': (0.0, 1.0, 0.0),
+                'payload': {'range_origin': (0.0, 0.0, 0.0)},
+                'distance': 10.0,
+            }, terminal)
+
+        self.assertEqual(0, effect['damage'])
+        self.assertEqual(0, effect['shot_result'])
+        self.assertEqual((1.0, 0.0, 0.0), terminal['world_normal'])
+        self.assertEqual(
+            0.75,
+            resolved.call_args.kwargs['base_penetration_multiplier'])
+        critical.assert_not_called()
 
     def test_ap_direct_hit_requeries_the_full_late_hit_trace_budget(self):
         battle, unused_bigworld = _battle()

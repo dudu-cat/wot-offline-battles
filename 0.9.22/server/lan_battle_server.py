@@ -165,7 +165,8 @@ ROUND_SCOPED_MESSAGE_TYPES = frozenset((
     "start_battle", "input", "hit_report", "bot_manifest", "bot_state",
     "bot_observation", "bot_hit_report", "bot_human_hit", "bot_ram_report",
     "spotted_report", "fire_intent", "fire_intent_result",
-    "projectile_launch", "projectile_progress", "projectile_resolve",
+    "projectile_launch", "projectile_progress", "projectile_ricochet",
+    "projectile_resolve",
     "rules_state", "destructible",
     "player_destructible_contact_result",
     "battle_result", "leave_battle", "battle_ready", "simulation_progress",
@@ -206,6 +207,7 @@ PROJECTILE_SHELL_KINDS = frozenset((
     "HOLLOW_CHARGE", "HIGH_EXPLOSIVE", "ARMOR_PIERCING",
     "ARMOR_PIERCING_HE", "ARMOR_PIERCING_CR"))
 PROJECTILE_CAPABILITY = "projectile_ledger_v2"
+RICOCHET_CONTINUATION_CAPABILITY = "ricochet_continuation_v1"
 PROJECTILE_HIT_VEHICLE_CAPABILITY = "projectile_hit_vehicle_v1"
 PROJECTILE_WRECK_HIT_CAPABILITY = "projectile_wreck_hit_v1"
 RANDOM_MAP_CAPABILITY = "random_map_v1"
@@ -231,6 +233,7 @@ SERVER_CAPABILITIES = (
     PLAYER_FIRE_INTENT_CAPABILITY,
     PLAYER_ENVIRONMENT_CAPABILITY,
     EFFECTIVE_PARAMS_CAPABILITY,
+    RICOCHET_CONTINUATION_CAPABILITY,
     PROJECTILE_HIT_VEHICLE_CAPABILITY,
     PROJECTILE_WRECK_HIT_CAPABILITY,
     RANDOM_MAP_CAPABILITY,
@@ -266,7 +269,7 @@ SIMULATION_WORKER_ADVANCEMENT_TYPES = frozenset((
     "simulation_progress", "bot_state", "bot_observation",
     "bot_hit_report", "bot_human_hit", "bot_ram_report", "rules_state",
     "destructible", "projectile_launch", "projectile_progress",
-    "projectile_resolve", "fire_intent_result",
+    "projectile_ricochet", "projectile_resolve", "fire_intent_result",
     "player_destructible_contact_result",
     "player_environment",
 ))
@@ -1810,40 +1813,46 @@ class BattleState:
             MAX_MOTION_TIME_US,
             int(raw_time_us) + int(self.motion_time_offset_us))
 
-    def _projectile_snapshot(self):
-        result = []
-        for projectile_id in sorted(self.projectiles):
-            record = self.projectiles[projectile_id]
-            result.append({
-                "projectile_id": record["projectile_id"],
-                "shooter_kind": record["shooter_kind"],
-                "shooter_id": record["shooter_id"],
-                "source_vehicle": record["source_vehicle"],
-                "source_shot": _projectile_source_shot(
-                    record["source_shot"]),
-                "shot_seq": record["shot_seq"],
-                "shell_index": record["shell_index"],
-                "team": record["team"],
-                "origin": list(record["origin"]),
-                "velocity": list(record["velocity"]),
-                "gravity": record["gravity"],
-                "max_distance": record["max_distance"],
-                "max_time_ms": record["max_time_ms"],
-                "is_he": record["is_he"],
-                "splash_radius": record["splash_radius"],
-                "penetration_factor": record["penetration_factor"],
-                "launch_server_time_ms": record["launch_server_time_ms"],
-                "checked_through_ms": record["checked_through_ms"],
-                "checked_distance": record["checked_distance"],
-                "piercing_loss": record["piercing_loss"],
-                "authority_epoch": self.authority_epoch,
-            })
-            if record.get("fire_intent_seq") is not None:
-                result[-1]["fire_intent_seq"] = int(
-                    record["fire_intent_seq"])
-                result[-1]["fire_input_seq"] = int(
-                    record["fire_input_seq"])
+    def _projectile_wire(self, record):
+        result = {
+            "projectile_id": record["projectile_id"],
+            "shooter_kind": record["shooter_kind"],
+            "shooter_id": record["shooter_id"],
+            "source_vehicle": record["source_vehicle"],
+            "source_shot": _projectile_source_shot(
+                record["source_shot"]),
+            "shot_seq": record["shot_seq"],
+            "shell_index": record["shell_index"],
+            "team": record["team"],
+            "origin": list(record["origin"]),
+            "velocity": list(record["velocity"]),
+            "range_origin": list(record["range_origin"]),
+            "segment_origin": list(record["segment_origin"]),
+            "segment_velocity": list(record["segment_velocity"]),
+            "segment_start_time_ms": record["segment_start_time_ms"],
+            "ricochet_count": record["ricochet_count"],
+            "base_penetration_multiplier": record[
+                "base_penetration_multiplier"],
+            "gravity": record["gravity"],
+            "max_distance": record["max_distance"],
+            "max_time_ms": record["max_time_ms"],
+            "is_he": record["is_he"],
+            "splash_radius": record["splash_radius"],
+            "penetration_factor": record["penetration_factor"],
+            "launch_server_time_ms": record["launch_server_time_ms"],
+            "checked_through_ms": record["checked_through_ms"],
+            "checked_distance": record["checked_distance"],
+            "piercing_loss": record["piercing_loss"],
+            "authority_epoch": self.authority_epoch,
+        }
+        if record.get("fire_intent_seq") is not None:
+            result["fire_intent_seq"] = int(record["fire_intent_seq"])
+            result["fire_input_seq"] = int(record["fire_input_seq"])
         return result
+
+    def _projectile_snapshot(self):
+        return [self._projectile_wire(self.projectiles[projectile_id])
+                for projectile_id in sorted(self.projectiles)]
 
     def _message_round_matches(self, message):
         """Fence round-aware clients while accepting 0.8.2 payloads."""
@@ -2093,7 +2102,8 @@ class BattleState:
                         HUMAN_RAM_TIMELINE_CAPABILITY not in capabilities or
                         PLAYER_FIRE_INTENT_CAPABILITY not in capabilities or
                         PLAYER_ENVIRONMENT_CAPABILITY not in capabilities or
-                        EFFECTIVE_PARAMS_CAPABILITY not in capabilities):
+                        EFFECTIVE_PARAMS_CAPABILITY not in capabilities or
+                        RICOCHET_CONTINUATION_CAPABILITY not in capabilities):
                     return None, "unsupported_capabilities"
                 account_key = hello.get("account_key")
                 if account_key is None:
@@ -2327,7 +2337,8 @@ class BattleState:
                     HUMAN_RAM_TIMELINE_CAPABILITY not in capabilities or
                     PLAYER_FIRE_INTENT_CAPABILITY not in capabilities or
                     PLAYER_ENVIRONMENT_CAPABILITY not in capabilities or
-                    EFFECTIVE_PARAMS_CAPABILITY not in capabilities):
+                    EFFECTIVE_PARAMS_CAPABILITY not in capabilities or
+                    RICOCHET_CONTINUATION_CAPABILITY not in capabilities):
                 return None, "unsupported_capabilities"
             if (self.client_build is not None and
                     self.client_build != client_build):
@@ -2788,6 +2799,15 @@ class BattleState:
                      EFFECTIVE_PARAMS_CAPABILITY not in
                      self.simulation_worker.capabilities)):
                 return None, "missing_effective_params_capability"
+            if (self.client_build == CLIENT_BUILD_0922 and
+                    (any(RICOCHET_CONTINUATION_CAPABILITY not in
+                         participant.capabilities
+                         for participant in self.players.values()
+                         if participant.connected) or
+                     self.simulation_worker is None or
+                     RICOCHET_CONTINUATION_CAPABILITY not in
+                     self.simulation_worker.capabilities)):
+                return None, "missing_ricochet_continuation_capability"
             if (self.client_build == CLIENT_BUILD_0922 and any(
                     effective_params_wire.canonical(
                         participant.effective_params) is None
@@ -5279,6 +5299,8 @@ class BattleState:
                     return False
                 team = shooter.team
                 source_vehicle = shooter.vehicle
+                shooter_position = [
+                    intent["x"], intent["y"], intent["z"]]
             else:
                 launch_edge = (shooter_id, shot_seq)
                 if (shooter is None or not shooter.get("alive") or
@@ -5291,7 +5313,16 @@ class BattleState:
                 if team not in (1, 2):
                     return False
                 source_vehicle = str(shooter.get("vehicle", ""))
+                shooter_position = [
+                    shooter.get("x"), shooter.get("y"), shooter.get("z")]
             if not source_vehicle or len(source_vehicle) > 128:
+                return False
+            try:
+                range_origin = _bounded_vector(
+                    shooter_position,
+                    (-5000.0, -1000.0, -5000.0),
+                    (5000.0, 3000.0, 5000.0))
+            except (TypeError, ValueError, OverflowError):
                 return False
 
             launch_server_time_ms = self._server_time_ms()
@@ -5300,6 +5331,12 @@ class BattleState:
                 "projectile_id": projectile_id,
                 "source_vehicle": source_vehicle,
                 "team": int(team),
+                "range_origin": range_origin,
+                "segment_origin": list(origin),
+                "segment_velocity": list(velocity),
+                "segment_start_time_ms": 0,
+                "ricochet_count": 0,
+                "base_penetration_multiplier": 1.0,
                 "launch_server_time_ms": launch_server_time_ms,
                 "checked_through_ms": 0,
                 "checked_distance": 0.0,
@@ -5335,29 +5372,14 @@ class BattleState:
             # positive is upward.  Rendered gun pitch uses the opposite sign,
             # but RemoteVehicle explicitly adapts between the two contracts.
             shot_pitch = math.atan2(velocity[1], horizontal)
-            event = {
+            event = self._projectile_wire(record)
+            event.update({
                 "kind": "shot" if shooter_kind == "player" else "bot_shot",
-                "projectile_id": projectile_id,
-                "shot_seq": shot_seq,
-                "shell_index": shell_index,
-                "origin": list(origin),
-                "velocity": list(velocity),
-                "gravity": gravity,
                 "maxDistance": max_distance,
-                "max_time_ms": max_time_ms,
-                "is_he": is_he,
-                "splash_radius": splash_radius,
-                "penetration_factor": penetration_factor,
-                "launch_server_time_ms": launch_server_time_ms,
-                "shooter_kind": shooter_kind,
-                "shooter_id": shooter_id,
-                "source_vehicle": source_vehicle,
-                "source_shot": source_shot,
-                "authority_epoch": self.authority_epoch,
                 "shot_yaw": round(
                     ((shot_yaw + math.pi) % (2.0 * math.pi)) - math.pi, 6),
                 "shot_pitch": round(_clamp(shot_pitch, -math.pi, math.pi), 6),
-            }
+            })
             event["attacker" if shooter_kind == "player"
                   else "attacker_bot"] = shooter_id
             if fire_intent_seq is not None:
@@ -5627,6 +5649,156 @@ class BattleState:
             "retired_target": retired_target,
             "stun_end_server_time_ms": stun_end_server_time_ms,
         }
+
+    def ricochet_projectile(self, player_id, message):
+        """Commit the first authority-resolved ricochet without retiring it."""
+        with self.lock:
+            if (self.client_build != CLIENT_BUILD_0922 or
+                    not self._message_round_matches(message) or
+                    not self._combat_accepting() or
+                    self.battle_result is not None or
+                    not self._projectile_message_fits(message) or
+                    not self._projectile_authority_matches(
+                        player_id, message)):
+                return False
+            allowed = {
+                "type", "round_id", "authority_epoch", "projectile_id",
+                "base_checked_ms", "resolved_time_ms", "checked_distance",
+                "piercing_loss", "penetration_factor", "impact",
+                "segment_origin", "segment_velocity",
+                "base_penetration_multiplier", "direct", "destructibles",
+            }
+            if set(message) != allowed or message.get("type") != (
+                    "projectile_ricochet"):
+                return False
+            projectile_id = message.get("projectile_id")
+            if (not isinstance(projectile_id, str) or not projectile_id or
+                    len(projectile_id) > 96):
+                return False
+            record = self.projectiles.get(projectile_id)
+            if record is None:
+                return False
+            request_fingerprint = _message_fingerprint(message)
+            if record["ricochet_count"]:
+                return record.get(
+                    "last_ricochet_fingerprint") == request_fingerprint
+            try:
+                base_checked_ms = _exact_int(
+                    message.get("base_checked_ms"), 0)
+                if base_checked_ms != record["checked_through_ms"]:
+                    raise ValueError("cursor compare-and-swap failed")
+                resolved_time_ms = _exact_int(
+                    message.get("resolved_time_ms"), base_checked_ms,
+                    record["max_time_ms"])
+                now_elapsed = max(
+                    0, self._server_time_ms() -
+                    record["launch_server_time_ms"])
+                if resolved_time_ms > (
+                        now_elapsed + PROJECTILE_CLOCK_LEEWAY_MS):
+                    raise ValueError("ricochet is ahead of server time")
+                if resolved_time_ms >= record["max_time_ms"]:
+                    raise ValueError("ricochet exhausted projectile time")
+                checked_distance = round(_bounded_float(
+                    message.get("checked_distance"),
+                    record["checked_distance"],
+                    record["max_distance"] + PROJECTILE_TOLERANCE), 6)
+                if checked_distance >= record["max_distance"]:
+                    raise ValueError("ricochet exhausted projectile range")
+                piercing_loss = round(_bounded_float(
+                    message.get("piercing_loss"), record["piercing_loss"],
+                    100000.0), 6)
+                penetration_factor = round(_bounded_float(
+                    message.get("penetration_factor"), 0.0, 100.0), 6)
+                if penetration_factor != record["penetration_factor"]:
+                    raise ValueError("penetration factor changed")
+                impact = _bounded_vector(
+                    message.get("impact"),
+                    (-5000.0, -1000.0, -5000.0),
+                    (5000.0, 3000.0, 5000.0))
+                segment_origin = _bounded_vector(
+                    message.get("segment_origin"),
+                    (-5000.0, -1000.0, -5000.0),
+                    (5000.0, 3000.0, 5000.0))
+                origin_gap = math.sqrt(sum(
+                    (float(message["segment_origin"][index]) -
+                     float(message["impact"][index])) ** 2
+                    for index in range(3)))
+                if origin_gap > 0.1:
+                    raise ValueError("segment origin is not the impact")
+                segment_velocity = _bounded_vector(
+                    message.get("segment_velocity"),
+                    (-PROJECTILE_MAX_VELOCITY,) * 3,
+                    (PROJECTILE_MAX_VELOCITY,) * 3)
+                raw_segment_speed = math.sqrt(sum(
+                    float(component) * float(component)
+                    for component in message["segment_velocity"]))
+                stored_segment_speed = math.sqrt(sum(
+                    component * component for component in segment_velocity))
+                if (stored_segment_speed <= 0.0 or
+                        raw_segment_speed > PROJECTILE_MAX_VELOCITY or
+                        stored_segment_speed > PROJECTILE_MAX_VELOCITY):
+                    raise ValueError("invalid ricochet speed")
+                segment_elapsed = float(
+                    resolved_time_ms - record["segment_start_time_ms"]) / 1000.0
+                incoming_velocity = list(record["segment_velocity"])
+                incoming_velocity[1] -= record["gravity"] * segment_elapsed
+                incoming_speed = math.sqrt(sum(
+                    component * component for component in incoming_velocity))
+                speed_tolerance = max(0.25, incoming_speed * 0.0001)
+                if abs(stored_segment_speed - incoming_speed) > speed_tolerance:
+                    raise ValueError("ricochet changed projectile speed")
+                shell_kind = record["source_shot"]["shell"]["kind"]
+                expected_multiplier = {
+                    "ARMOR_PIERCING": 0.75,
+                    "ARMOR_PIERCING_CR": 0.75,
+                    "HOLLOW_CHARGE": 1.0,
+                }.get(shell_kind)
+                if expected_multiplier is None:
+                    raise ValueError("shell cannot ricochet")
+                base_penetration_multiplier = _bounded_float(
+                    message.get("base_penetration_multiplier"),
+                    0.0, 1.0, False)
+                if base_penetration_multiplier != expected_multiplier:
+                    raise ValueError("invalid ricochet penetration multiplier")
+                raw_direct = message.get("direct")
+                if (not isinstance(raw_direct, dict) or set(raw_direct) != {
+                        "target_kind", "target_id", "damage", "shot_result",
+                        "x", "y", "z"}):
+                    raise ValueError(
+                        "ricochet direct effect has optional terminal fields")
+                direct = self._normalize_projectile_effect(
+                    raw_direct, record, impact, False)
+                if (direct["damage"] != 0 or direct["shot_result"] != 0 or
+                        direct["critical"] is not None):
+                    raise ValueError("ricochet direct effect must be harmless")
+                destructibles = self._normalize_projectile_destructibles(
+                    message.get("destructibles"))
+            except (TypeError, ValueError, OverflowError):
+                return False
+
+            record["checked_through_ms"] = resolved_time_ms
+            record["checked_distance"] = checked_distance
+            record["piercing_loss"] = piercing_loss
+            record["segment_origin"] = segment_origin
+            record["segment_velocity"] = segment_velocity
+            record["segment_start_time_ms"] = resolved_time_ms
+            record["ricochet_count"] = 1
+            record["base_penetration_multiplier"] = (
+                base_penetration_multiplier)
+            record["last_ricochet_fingerprint"] = request_fingerprint
+            self._commit_projectile_destructibles(
+                player_id, destructibles)
+            ricochet_event = self._projectile_wire(record)
+            ricochet_event.update({
+                "kind": "projectile_ricochet",
+                "resolved_time_ms": resolved_time_ms,
+                "impact": list(impact),
+                "direct": dict(message["direct"]),
+            })
+            self.pending_events.append(ricochet_event)
+            self._apply_projectile_effect(record, direct)
+            self.projectile_revision += 1
+            return True
 
     def _apply_projectile_effect(self, record, proposal):
         target_kind = proposal["target_kind"]
@@ -10234,6 +10406,15 @@ class ClientHandler(socketserver.BaseRequestHandler):
         elif message_type == "projectile_progress":
             accepted = server.state.progress_projectiles(
                 authority_id, message)
+        elif message_type == "projectile_ricochet":
+            accepted = server.state.ricochet_projectile(
+                authority_id, message)
+            if (not accepted and
+                    server.state.phase in ("loading", "battle") and
+                    server.state.battle_result is None):
+                server.state.remove_simulation_worker(
+                    worker, "projectile_ricochet_rejected")
+                return "close"
         elif message_type == "projectile_resolve":
             accepted = server.state.resolve_projectile(authority_id, message)
             if (not accepted and
@@ -10487,6 +10668,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     PLAYER_FIRE_INTENT_CAPABILITY,
                     PLAYER_ENVIRONMENT_CAPABILITY,
                     EFFECTIVE_PARAMS_CAPABILITY,
+                    RICOCHET_CONTINUATION_CAPABILITY,
                 )
                 valid_capabilities = (
                     isinstance(raw_capabilities, list) and

@@ -857,11 +857,12 @@ class NativeRemoteVehicleFactory(object):
     def play_projectile_tracer(self, descriptor, shell_index, origin,
                                velocity, gravity, max_distance, attacker_id,
                                projectile_id=None, reference_position=None,
-                               reference_velocity=None):
+                               reference_velocity=None,
+                               is_ricochet=False):
         return self._shot_presenter.play_canonical(
             descriptor, shell_index, origin, velocity, gravity,
             max_distance, attacker_id, projectile_id,
-            reference_position, reference_velocity)
+            reference_position, reference_velocity, is_ricochet)
 
     def stop_projectile_tracer(self, projectile_id, end_position,
                                explosion=None):

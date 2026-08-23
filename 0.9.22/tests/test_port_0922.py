@@ -5100,6 +5100,7 @@ class LANClientTests(unittest.TestCase):
             'capabilities': list(module.CLIENT_CAPABILITIES),
             'server_capabilities': [
                 module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                module.RICOCHET_CONTINUATION_CAPABILITY,
                 module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
                 module.RAM_CONTACT_LEDGER_CAPABILITY,
                 module.HUMAN_RAM_TIMELINE_CAPABILITY,
@@ -5388,6 +5389,7 @@ class LANClientTests(unittest.TestCase):
             'capabilities': list(module.CLIENT_CAPABILITIES),
             'server_capabilities': [
                 module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                module.RICOCHET_CONTINUATION_CAPABILITY,
                 module.RAM_CONTACT_LEDGER_CAPABILITY,
                 module.HUMAN_RAM_TIMELINE_CAPABILITY,
                 module.PLAYER_FIRE_INTENT_CAPABILITY,
@@ -5414,6 +5416,7 @@ class LANClientTests(unittest.TestCase):
             'capabilities': list(module.CLIENT_CAPABILITIES),
             'server_capabilities': [
                 module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                module.RICOCHET_CONTINUATION_CAPABILITY,
                 module.RAM_CONTACT_LEDGER_CAPABILITY,
                 module.HUMAN_RAM_TIMELINE_CAPABILITY,
                 module.PLAYER_FIRE_INTENT_CAPABILITY,

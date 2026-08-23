@@ -23,7 +23,8 @@ from lan_battle_server import (
     HUMAN_RAM_TIMELINE_CAPABILITY, PLAYER_ENVIRONMENT_CAPABILITY,
     PLAYER_FIRE_INTENT_CAPABILITY,
     PROJECTILE_CAPABILITY,
-    RAM_CONTACT_LEDGER_CAPABILITY)
+    RAM_CONTACT_LEDGER_CAPABILITY,
+    RICOCHET_CONTINUATION_CAPABILITY)
 
 
 class _Connection(object):
@@ -38,7 +39,8 @@ def _hello(params=None):
             PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
             HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
             PLAYER_FIRE_INTENT_CAPABILITY, PLAYER_ENVIRONMENT_CAPABILITY,
-            SERVER_EFFECTIVE_PARAMS_CAPABILITY],
+            SERVER_EFFECTIVE_PARAMS_CAPABILITY,
+            RICOCHET_CONTINUATION_CAPABILITY],
         'name': 'Player',
         'vehicle': 'ussr:R11_MS-1',
         'max_health': 90,
@@ -277,6 +279,9 @@ class EffectiveParamsContractTests(unittest.TestCase):
         player, error = state.add_player(
             _Connection(), ('127.0.0.1', 2000), _hello())
         self.assertIsNone(error)
+        state.simulation_worker = types.SimpleNamespace(
+            connected=True,
+            capabilities=tuple(_hello()['capabilities']))
 
         player.capabilities = tuple(
             value for value in player.capabilities

@@ -30,12 +30,14 @@ from gui.mods.offline_lan_0922.entities.bigworld_binding import \
 from gui.mods.offline_lan_0922.entities.native_remote_vehicle import \
     NativeRemoteVehicleFactory, set_draw_visibility
 from gui.mods.offline_lan_0922.entities.remote_vehicle import (
-    RemoteVehicleFactory, collide_vehicle_at_matrix, pose_animation_writes,
+    RemoteVehicleFactory, _collide_vehicle_evidence_at_matrix,
+    collide_vehicle_at_matrix, pose_animation_writes,
     reset_pose_animation_writes)
 from gui.mods.offline_lan_0922.entities.runtime import EntityPropertyBuilder
 from gui.mods.offline_lan_0922.projectile_manager import InFlightProjectiles
 from gui.mods.offline_lan_0922.projectile_runtime import (
     PROJECTILE_BROADPHASE_RADIUS, PROJECTILE_MAX_SUBSTEP_SECONDS, lerp3,
+    ideal_reflection_velocity,
     point_in_expanded_segment_bounds, point_segment_distance_sq,
     projectile_range_distance, trajectory_position)
 from gui.mods.offline_lan_0922.snapshot_sync import SnapshotSync
@@ -119,7 +121,8 @@ _SHOT_EVENT_KINDS = ('shot', 'bot_shot')
 # silently skipped authority event would desynchronise the battle.
 _SIMPLE_EVENT_KINDS = (
     'authority', 'bot_manifest', 'vehicle_statistics', 'destructible',
-    'projectile_impact', 'battle_result', 'assist', 'stun')
+    'projectile_ricochet', 'projectile_impact', 'battle_result', 'assist',
+    'stun')
 _COMBAT_EVENT_KINDS = (
     'health', 'hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit')
 _SHOT_OCCLUSION_EPSILON = 1.0e-3
@@ -6844,6 +6847,8 @@ class BattleRuntime(object):
             self._apply_stun_state(target, target.get('state') or {})
         elif kind == 'destructible':
             self._apply_destructible_event(event)
+        elif kind == 'projectile_ricochet':
+            self._apply_projectile_ricochet_event(event)
         elif kind == 'projectile_impact':
             self._apply_projectile_terminal_event(event)
         elif kind == 'battle_result':
@@ -8639,14 +8644,16 @@ class BattleRuntime(object):
             0.0, min(self._projectiles.now, float(now) - age))
 
     def _projectile_launch_age(self, raw, now):
-        """Return the canonical launch age shared by simulation and tracer."""
+        """Return the current canonical segment age for simulation/tracer."""
         if not isinstance(raw, dict):
             return 0.0
         launch_time = raw.get('launch_server_time_ms')
+        segment_start = raw.get('segment_start_time_ms', 0)
         max_time_ms = raw.get('max_time_ms', PROJECTILE_MAX_TIME_MS)
         try:
-            launch_time = int(launch_time)
-            maximum = max(0.0, float(max_time_ms) / 1000.0)
+            launch_time = int(launch_time) + int(segment_start)
+            maximum = max(
+                0.0, float(int(max_time_ms) - int(segment_start)) / 1000.0)
         except (TypeError, ValueError, OverflowError):
             return 0.0
         estimated = self._projectile_estimated_server_time(now)
@@ -8674,14 +8681,24 @@ class BattleRuntime(object):
             'projectile_id', 'source_vehicle', 'shot_seq', 'shell_index', 'origin',
             'velocity', 'gravity', 'max_time_ms', 'is_he',
             'splash_radius', 'penetration_factor', 'launch_server_time_ms',
-            'source_shot')
+            'source_shot', 'range_origin', 'segment_origin',
+            'segment_velocity', 'segment_start_time_ms', 'ricochet_count',
+            'base_penetration_multiplier')
         if (maximum is None or shooter_kind is None or shooter_id is None or
                 any(name not in raw for name in required)):
             return None
         try:
             origin = tuple(float(value) for value in raw['origin'])
             velocity = tuple(float(value) for value in raw['velocity'])
-            if len(origin) != 3 or len(velocity) != 3:
+            range_origin = tuple(
+                float(value) for value in raw['range_origin'])
+            segment_origin = tuple(
+                float(value) for value in raw['segment_origin'])
+            segment_velocity = tuple(
+                float(value) for value in raw['segment_velocity'])
+            if (len(origin) != 3 or len(velocity) != 3 or
+                    len(range_origin) != 3 or len(segment_origin) != 3 or
+                    len(segment_velocity) != 3):
                 return None
             gravity = float(raw['gravity'])
             maximum = float(maximum)
@@ -8693,14 +8710,19 @@ class BattleRuntime(object):
             shot_seq = int(raw['shot_seq'])
             shell_index = int(raw['shell_index'])
             launch_server_time = int(raw['launch_server_time_ms'])
+            segment_start_time = int(raw['segment_start_time_ms'])
+            ricochet_count = int(raw['ricochet_count'])
+            base_multiplier = float(raw['base_penetration_multiplier'])
             splash_radius = float(raw['splash_radius'])
             penetration_factor = float(raw['penetration_factor'])
             source_shot = lan_protocol._strict_projectile_source_shot(
                 raw['source_shot'])
         except (TypeError, ValueError, OverflowError):
             return None
-        values = (origin + velocity + (
-            gravity, maximum, splash_radius, penetration_factor))
+        values = (origin + velocity + range_origin + segment_origin +
+                  segment_velocity + (
+                      gravity, maximum, splash_radius, penetration_factor,
+                      base_multiplier))
         if (not projectile_id or not source_vehicle or
                 len(source_vehicle) > 128 or
                 shooter_kind not in ('player', 'bot') or
@@ -8708,7 +8730,12 @@ class BattleRuntime(object):
                 shell_index < 0 or shell_index > 9 or
                 gravity <= 0.0 or maximum <= 0.0 or
                 max_time_ms <= 0 or max_time_ms > PROJECTILE_MAX_TIME_MS or
-                launch_server_time < 0 or splash_radius < 0.0 or
+                launch_server_time < 0 or segment_start_time < 0 or
+                segment_start_time > max_time_ms or
+                (ricochet_count == 1 and
+                 segment_start_time >= max_time_ms) or
+                ricochet_count not in (0, 1) or
+                splash_radius < 0.0 or
                 penetration_factor < 0.0 or
                 not isinstance(raw['is_he'], bool) or
                 not lan_protocol._projectile_source_shot_matches_launch(
@@ -8716,6 +8743,20 @@ class BattleRuntime(object):
                     raw['is_he'], splash_radius) or
                 any(math.isnan(value) or math.isinf(value)
                     for value in values)):
+            return None
+        shell_kind = (source_shot.get('shell') or {}).get('kind')
+        expected_multiplier = (
+            1.0 if ricochet_count == 0 else
+            combat_rules.first_ricochet_penetration_multiplier(shell_kind))
+        if (expected_multiplier is None or
+                base_multiplier != expected_multiplier or
+                (ricochet_count == 0 and
+                 (segment_start_time != 0 or segment_origin != origin or
+                  segment_velocity != velocity))):
+            return None
+        base_checked_ms = max(
+            0, int(raw.get('checked_through_ms', 0) or 0))
+        if base_checked_ms < segment_start_time:
             return None
         result = {
             'projectile_id': projectile_id,
@@ -8727,6 +8768,12 @@ class BattleRuntime(object):
             'shell_index': shell_index,
             'origin': origin,
             'velocity': velocity,
+            'range_origin': range_origin,
+            'segment_origin': segment_origin,
+            'segment_velocity': segment_velocity,
+            'segment_start_time_ms': segment_start_time,
+            'ricochet_count': ricochet_count,
+            'base_penetration_multiplier': base_multiplier,
             'gravity': gravity,
             'max_distance': maximum,
             'max_time_ms': max_time_ms,
@@ -8734,8 +8781,7 @@ class BattleRuntime(object):
             'splash_radius': splash_radius,
             'penetration_factor': penetration_factor,
             'launch_server_time_ms': launch_server_time,
-            'base_checked_ms': max(
-                0, int(raw.get('checked_through_ms', 0) or 0)),
+            'base_checked_ms': base_checked_ms,
             'checked_distance': max(
                 0.0, _number(raw.get('checked_distance'), 0.0)),
             'piercing_loss': max(
@@ -8760,21 +8806,51 @@ class BattleRuntime(object):
         meta = self._projectile_meta.get(projectile_id)
         if meta is None:
             meta = dict(normalized)
+            meta['manager_key'] = (
+                projectile_id if normalized['ricochet_count'] == 0 else
+                (projectile_id, normalized['ricochet_count']))
             meta['destructibles_pending'] = []
             self._projectile_meta[projectile_id] = meta
         else:
             # Launch fields are immutable; only the server-acknowledged cursor
             # and accumulated penetration state may advance in snapshots.
+            current_count = int(meta.get('ricochet_count', 0))
+            meta.setdefault(
+                'manager_key', projectile_id if current_count == 0 else
+                (projectile_id, current_count))
             frozen = (
                 'shooter_kind', 'shooter_id', 'source_vehicle',
                 'source_shot', 'shot_seq', 'shell_index',
-                'origin', 'velocity', 'gravity', 'max_distance',
+                'origin', 'velocity', 'range_origin',
+                'gravity', 'max_distance',
                 'max_time_ms', 'is_he', 'splash_radius',
                 'penetration_factor', 'launch_server_time_ms',
                 'fire_intent_seq', 'fire_input_seq')
             if any(meta.get(name) != normalized.get(name)
                    for name in frozen):
                 raise RuntimeError('canonical projectile launch changed')
+            incoming_count = normalized['ricochet_count']
+            if incoming_count < current_count or incoming_count > (
+                    current_count + 1):
+                raise RuntimeError('canonical projectile segment regressed')
+            segment_fields = (
+                'segment_origin', 'segment_velocity',
+                'segment_start_time_ms', 'base_penetration_multiplier')
+            if incoming_count == current_count:
+                if any(meta.get(name) != normalized.get(name)
+                       for name in segment_fields):
+                    raise RuntimeError('canonical projectile segment changed')
+            else:
+                old_manager_key = meta.get('manager_key', projectile_id)
+                if self._projectiles is not None:
+                    self._projectiles.remove(old_manager_key)
+                for name in segment_fields:
+                    meta[name] = normalized[name]
+                meta['ricochet_count'] = incoming_count
+                meta['manager_key'] = (projectile_id, incoming_count)
+                meta['awaiting_ricochet'] = False
+                meta['pending_ricochet'] = None
+                meta['destructibles_pending'] = []
             if (normalized['base_checked_ms'] >=
                     meta.get('base_checked_ms', 0)):
                 meta['base_checked_ms'] = normalized['base_checked_ms']
@@ -8786,9 +8862,11 @@ class BattleRuntime(object):
                         pending['checked_through_ms']):
                     meta['progress_pending'] = None
                 active = (self._projectiles is not None and
-                          self._projectiles.contains(projectile_id))
+                          self._projectiles.contains(meta['manager_key']))
                 if (not active and
                         meta.get('pending_resolution') is None and
+                        meta.get('pending_ricochet') is None and
+                        not meta.get('awaiting_ricochet') and
                         not meta.get('awaiting_resolution')):
                     meta['checked_distance'] = normalized[
                         'checked_distance']
@@ -8808,25 +8886,58 @@ class BattleRuntime(object):
             raise RuntimeError('canonical projectile event is malformed')
         meta = self._install_projectile_meta(normalized)
         projectile_id = normalized['projectile_id']
-        if self._projectiles.contains(projectile_id):
+        manager_key = meta['manager_key']
+        if self._projectiles.contains(manager_key):
             return True
         now = self._clock()
         launch_time = self._projectile_local_launch_time(
-            normalized['launch_server_time_ms'], now)
-        accepted = self._projectiles.launch(
-            projectile_id, normalized['origin'], normalized['velocity'],
-            (0.0, -normalized['gravity'], 0.0), launch_time,
-            float(normalized['max_time_ms']) / 1000.0,
-            normalized['max_distance'], payload={
+            normalized['launch_server_time_ms'] +
+            normalized['segment_start_time_ms'], now)
+        payload = {
                 'shooter_kind': normalized['shooter_kind'],
                 'shooter_id': normalized['shooter_id'],
                 'shot_seq': normalized['shot_seq'],
                 'shell_index': normalized['shell_index'],
+                'range_origin': normalized['range_origin'],
+                'base_penetration_multiplier': normalized[
+                    'base_penetration_multiplier'],
+                'ricochet_count': normalized['ricochet_count'],
+                'segment_start_time_ms': normalized[
+                    'segment_start_time_ms'],
+            }
+        if normalized['ricochet_count'] == 0:
+            accepted = self._projectiles.launch(
+                manager_key, normalized['segment_origin'],
+                normalized['segment_velocity'],
+                (0.0, -normalized['gravity'], 0.0), launch_time,
+                float(normalized['max_time_ms']) / 1000.0,
+                normalized['max_distance'], payload=payload)
+        else:
+            cursor_time = min(
+                self._projectiles.now,
+                launch_time + max(
+                    0, normalized['base_checked_ms'] -
+                    normalized['segment_start_time_ms']) / 1000.0)
+            accepted = self._projectiles.restore({
+                'key': manager_key,
+                'start': normalized['segment_origin'],
+                'velocity': normalized['segment_velocity'],
+                'gravity': (0.0, -normalized['gravity'], 0.0),
+                'launch_time': launch_time,
+                'max_time': max(
+                    0.001, float(
+                        normalized['max_time_ms'] -
+                        normalized['segment_start_time_ms']) / 1000.0),
+                'max_distance': normalized['max_distance'],
+                'payload': payload,
+                'cursor_time': max(launch_time, cursor_time),
+                'distance': normalized['checked_distance'],
             })
         if not accepted:
             self._projectile_meta.pop(projectile_id, None)
             raise RuntimeError('canonical projectile launch was not admitted')
         meta['awaiting_resolution'] = False
+        meta['awaiting_ricochet'] = False
         return True
 
     def _reconcile_projectile_snapshot(self, message):
@@ -8852,7 +8963,14 @@ class BattleRuntime(object):
             normalized = self._projectile_wire_meta(raw)
             projectile_id = normalized['projectile_id']
             meta = self._install_projectile_meta(normalized)
-            if self._projectiles.contains(projectile_id):
+            if self._projectiles.contains(meta['manager_key']):
+                continue
+            if meta.get('pending_ricochet') is not None:
+                # The unchanged first-segment snapshot proves that the server
+                # has not committed this exact ricochet yet. Retry its frozen
+                # CAS payload without recomputing impact or destructibles.
+                meta['awaiting_ricochet'] = False
+                self._submit_projectile_ricochet(meta)
                 continue
             if meta.get('pending_resolution') is not None:
                 # Presence in the next authoritative snapshot means the
@@ -8874,23 +8992,35 @@ class BattleRuntime(object):
                 # only wait when even that canonical descriptor is unavailable.
                 continue
             launch_time = self._projectile_local_launch_time(
-                normalized['launch_server_time_ms'], now)
+                normalized['launch_server_time_ms'] +
+                normalized['segment_start_time_ms'], now)
             cursor_time = min(
                 self._projectiles.now,
-                launch_time + normalized['base_checked_ms'] / 1000.0)
+                launch_time + max(
+                    0, normalized['base_checked_ms'] -
+                    normalized['segment_start_time_ms']) / 1000.0)
             restored = self._projectiles.restore({
-                'key': projectile_id,
-                'start': normalized['origin'],
-                'velocity': normalized['velocity'],
+                'key': meta['manager_key'],
+                'start': normalized['segment_origin'],
+                'velocity': normalized['segment_velocity'],
                 'gravity': (0.0, -normalized['gravity'], 0.0),
                 'launch_time': launch_time,
-                'max_time': normalized['max_time_ms'] / 1000.0,
+                'max_time': max(
+                    0.001, float(
+                        normalized['max_time_ms'] -
+                        normalized['segment_start_time_ms']) / 1000.0),
                 'max_distance': normalized['max_distance'],
                 'payload': {
                     'shooter_kind': normalized['shooter_kind'],
                     'shooter_id': normalized['shooter_id'],
                     'shot_seq': normalized['shot_seq'],
                     'shell_index': normalized['shell_index'],
+                    'range_origin': normalized['range_origin'],
+                    'base_penetration_multiplier': normalized[
+                        'base_penetration_multiplier'],
+                    'ricochet_count': normalized['ricochet_count'],
+                    'segment_start_time_ms': normalized[
+                        'segment_start_time_ms'],
                 },
                 'cursor_time': max(launch_time, cursor_time),
                 'distance': normalized['checked_distance'],
@@ -8900,7 +9030,9 @@ class BattleRuntime(object):
         for projectile_id, meta in tuple(self._projectile_meta.items()):
             if (projectile_id not in active_ids and
                     (meta.get('awaiting_resolution') or
-                     meta.get('pending_resolution') is not None)):
+                     meta.get('pending_resolution') is not None or
+                     meta.get('awaiting_ricochet') or
+                     meta.get('pending_ricochet') is not None)):
                 self._projectile_meta.pop(projectile_id, None)
                 self._projectile_terminal_data.pop(projectile_id, None)
         try:
@@ -8909,6 +9041,27 @@ class BattleRuntime(object):
             revision = -1
         self._projectile_revision = max(
             self._projectile_revision, revision)
+        return True
+
+    def _apply_projectile_ricochet_event(self, event):
+        """Replace the first segment only after the server commits its CAS."""
+        normalized = self._projectile_wire_meta(event)
+        if normalized is None or normalized['ricochet_count'] != 1:
+            raise RuntimeError('canonical projectile ricochet is malformed')
+        projectile_id = normalized['projectile_id']
+        meta = self._projectile_meta.get(projectile_id)
+        if meta is None:
+            raise RuntimeError('canonical projectile ricochet lost its launch')
+        if int(meta.get('ricochet_count', 0)) == 0:
+            meta['hit_vehicle'] = True
+            self._stop_projectile_visual(projectile_id, event)
+        meta = self._install_projectile_meta(normalized)
+        meta['awaiting_ricochet'] = False
+        meta['pending_ricochet'] = None
+        now = self._clock()
+        self._ensure_projectile_visual(normalized, now)
+        if self._projectile_is_authority():
+            self._accept_projectile_event(event)
         return True
 
     def _apply_projectile_terminal_event(self, event):
@@ -8922,7 +9075,9 @@ class BattleRuntime(object):
             visual = self._projectile_visual_meta.get(projectile_id)
             try:
                 elapsed = max(
-                    0.0, float(event.get('resolved_time_ms')) / 1000.0)
+                    0.0, (float(event.get('resolved_time_ms')) -
+                          float(meta.get('segment_start_time_ms', 0))) /
+                    1000.0)
             except (TypeError, ValueError, OverflowError):
                 elapsed = None
             if visual is not None and elapsed is not None:
@@ -8934,7 +9089,9 @@ class BattleRuntime(object):
             self._present_projectile_wreck_hit(projectile_id, event)
         self._stop_projectile_visual(projectile_id, event)
         if self._projectiles is not None:
-            self._projectiles.remove(projectile_id)
+            manager_key = (meta.get('manager_key') if meta is not None else
+                           projectile_id)
+            self._projectiles.remove(manager_key)
         self._projectile_meta.pop(projectile_id, None)
         self._projectile_terminal_data.pop(projectile_id, None)
         return True
@@ -9021,19 +9178,35 @@ class BattleRuntime(object):
         descriptor = self._projectile_source_descriptor(normalized)
         if descriptor is None:
             return False
+        existing_visual = self._projectile_visual_meta.get(
+            normalized['projectile_id'])
+        if (existing_visual is not None and
+                int(existing_visual.get('ricochet_count', 0)) !=
+                normalized['ricochet_count']):
+            meta = self._projectile_meta.get(normalized['projectile_id'])
+            if meta is not None:
+                meta['hit_vehicle'] = True
+            self._stop_projectile_visual(
+                normalized['projectile_id'], {
+                    'impact': list(normalized['segment_origin']),
+                    'resolved_time_ms': normalized[
+                        'segment_start_time_ms'],
+                })
         elapsed = self._projectile_launch_age(normalized, now)
         gravity = normalized['gravity']
         reference_origin = trajectory_position(
-            normalized['origin'], normalized['velocity'],
+            normalized['segment_origin'], normalized['segment_velocity'],
             (0.0, -gravity, 0.0), elapsed)
         reference_velocity = (
-            normalized['velocity'][0],
-            normalized['velocity'][1] - gravity * elapsed,
-            normalized['velocity'][2])
+            normalized['segment_velocity'][0],
+            normalized['segment_velocity'][1] - gravity * elapsed,
+            normalized['segment_velocity'][2])
         self._projectile_visual_meta[normalized['projectile_id']] = {
-            'origin': tuple(normalized['origin']),
-            'velocity': tuple(normalized['velocity']),
+            'origin': tuple(normalized['segment_origin']),
+            'velocity': tuple(normalized['segment_velocity']),
             'gravity': gravity,
+            'segment_start_time_ms': normalized['segment_start_time_ms'],
+            'ricochet_count': normalized['ricochet_count'],
         }
         record = self._records.get('%s:%s' % (
             normalized['shooter_kind'], normalized['shooter_id']))
@@ -9045,10 +9218,14 @@ class BattleRuntime(object):
             # projectile restored from the durable snapshot.
             attacker_id = int(normalized['shooter_id'])
         return bool(self._remote_factory.play_projectile_tracer(
-            descriptor, normalized['shell_index'], normalized['origin'],
-            normalized['velocity'], gravity, normalized['max_distance'],
+            descriptor, normalized['shell_index'],
+            normalized['segment_origin'], normalized['segment_velocity'],
+            gravity, max(
+                0.001, normalized['max_distance'] -
+                normalized['checked_distance']),
             attacker_id, normalized['projectile_id'], reference_origin,
-            reference_velocity))
+            reference_velocity,
+            is_ricochet=bool(normalized['ricochet_count'])))
 
     def _projectile_explosion(self, projectile_id, impact):
         """Return ``(effectsDescr, effectMaterial, velocity)`` for a world hit.
@@ -9119,14 +9296,19 @@ class BattleRuntime(object):
             return False
         impact = event.get('impact') if isinstance(event, dict) else None
         if impact is None:
-            state = (self._projectiles.get(projectile_id)
+            meta = self._projectile_meta.get(projectile_id)
+            manager_key = (meta.get('manager_key') if meta is not None else
+                           projectile_id)
+            state = (self._projectiles.get(manager_key)
                      if self._projectiles is not None else None)
             impact = state.get('position') if state is not None else None
         if impact is None:
             visual = self._projectile_visual_meta.get(projectile_id)
             try:
                 elapsed = max(
-                    0.0, float(event.get('resolved_time_ms')) / 1000.0)
+                    0.0, (float(event.get('resolved_time_ms')) -
+                          float(visual.get(
+                              'segment_start_time_ms', 0))) / 1000.0)
             except (AttributeError, TypeError, ValueError, OverflowError):
                 elapsed = None
             if visual is not None and elapsed is not None:
@@ -9299,9 +9481,30 @@ class BattleRuntime(object):
             self._publish_projectile_progress()
         return advanced
 
+    def _projectile_vehicle_collisions(self, record, target, start, end):
+        """Return retail ABI collisions plus private world-normal evidence."""
+        body_matrix = None
+        chassis_matrix = None
+        if record.get('local') and self._local_matrix is not None:
+            body_matrix = self._local_body_pose()
+            chassis_matrix = self._local_matrix
+        elif record.get('native_remote'):
+            body_matrix, chassis_matrix = \
+                self._projectile_vehicle_matrices(record, target)
+        else:
+            body_matrix = getattr(target, 'matrix', None)
+        if body_matrix is not None:
+            evidence = tuple(_collide_vehicle_evidence_at_matrix(
+                target, body_matrix, start, end, self._runtime.math,
+                chassis_matrix=chassis_matrix) or ())
+            return (tuple(item.collision for item in evidence), evidence)
+        return (tuple(target.collideSegmentExt(start, end) or ()), ())
+
     def _projectile_chord(self, state, start, end,
                           absolute_start, absolute_end):
-        projectile_id = state.get('key')
+        manager_key = state.get('key')
+        projectile_id = (manager_key[0]
+                         if isinstance(manager_key, tuple) else manager_key)
         meta = self._projectile_meta.get(projectile_id)
         if meta is None:
             return {'reason': 'callback_error', 'fraction': 0.0}
@@ -9318,6 +9521,7 @@ class BattleRuntime(object):
             meta['shooter_kind'], meta['shooter_id'])
         nearest_key = None
         nearest_collisions = None
+        nearest_evidence = None
         nearest_fraction = 1.0
         nearest_query = None
         broadphase_sq = PROJECTILE_BROADPHASE_RADIUS ** 2
@@ -9352,20 +9556,8 @@ class BattleRuntime(object):
                 continue
             query_start = self._vector(adjusted_start)
             query_end = self._vector(adjusted_end)
-            if record.get('local') and self._local_matrix is not None:
-                collisions = collide_vehicle_at_matrix(
-                    target, self._local_body_pose(), query_start, query_end,
-                    self._runtime.math,
-                    chassis_matrix=self._local_matrix)
-            elif record.get('native_remote'):
-                body_matrix, chassis_matrix = \
-                    self._projectile_vehicle_matrices(record, target)
-                collisions = collide_vehicle_at_matrix(
-                    target, body_matrix, query_start, query_end,
-                    self._runtime.math, chassis_matrix=chassis_matrix)
-            else:
-                collisions = target.collideSegmentExt(
-                    query_start, query_end)
+            collisions, evidence = self._projectile_vehicle_collisions(
+                record, target, query_start, query_end)
             if not collisions:
                 continue
             collisions = tuple(collisions)
@@ -9378,6 +9570,7 @@ class BattleRuntime(object):
             if fraction < nearest_fraction:
                 nearest_key = key
                 nearest_collisions = collisions
+                nearest_evidence = evidence
                 nearest_fraction = fraction
                 nearest_query = (query_start, query_end)
 
@@ -9422,6 +9615,7 @@ class BattleRuntime(object):
                 'impact': lerp3(start, end, nearest_fraction),
                 'target_key': nearest_key,
                 'collisions': nearest_collisions,
+                'collision_evidence': nearest_evidence,
                 'query': nearest_query,
                 'piercing_loss': meta['piercing_loss'],
                 'penetration_factor': meta.get('penetration_factor'),
@@ -9542,6 +9736,8 @@ class BattleRuntime(object):
             return None
         target = self._server_entity(record.get('engine_id'))
         collisions = terminal_data.get('collisions')
+        collision_evidence = tuple(
+            terminal_data.get('collision_evidence') or ())
         query = terminal_data.get('query')
         if (target is None or not collisions or query is None or
                 not self._record_alive(record, target)):
@@ -9552,31 +9748,37 @@ class BattleRuntime(object):
             original_length = float((query[1] - query[0]).length)
             trace_length = float((trace_end - trace_start).length)
             if trace_length > original_length + 0.000001:
-                if record.get('local') and self._local_matrix is not None:
-                    extended = collide_vehicle_at_matrix(
-                        target, self._local_body_pose(), query[0], trace_end,
-                        self._runtime.math,
-                        chassis_matrix=self._local_matrix)
-                elif record.get('native_remote'):
-                    body_matrix, chassis_matrix = \
-                        self._projectile_vehicle_matrices(record, target)
-                    extended = collide_vehicle_at_matrix(
-                        target, body_matrix, query[0], trace_end,
-                        self._runtime.math, chassis_matrix=chassis_matrix)
-                else:
-                    extended = target.collideSegmentExt(
-                        query[0], trace_end)
+                extended, extended_evidence = (
+                    self._projectile_vehicle_collisions(
+                        record, target, query[0], trace_end))
                 if extended:
                     collisions, trace_start, trace_end = self._vehicle_trace(
                         shot, query[0], trace_end, tuple(extended))
+                    collision_evidence = tuple(extended_evidence)
         factor = terminal_data.get('penetration_factor')
         range_distance = projectile_range_distance(
             state, terminal_data['impact'])
         contact = combat_rules.resolve_armor_contact(
             shot, range_distance, collisions,
             pierce_loss=terminal_data.get('piercing_loss', 0.0),
-            penetration_factor=factor)
+            penetration_factor=factor,
+            base_penetration_multiplier=meta.get(
+                'base_penetration_multiplier', 1.0))
         result = 1 if contact is None else contact['result']
+        terminal_data['armor_contact'] = contact
+        terminal_data['world_normal'] = None
+        if contact is not None and collision_evidence:
+            matching = []
+            for evidence in collision_evidence:
+                collision = evidence.collision
+                if (collision.compName == contact.get('component') and
+                        abs(float(collision.dist) -
+                            float(contact.get('distance', 0.0))) <= 1.0e-5 and
+                        evidence.worldNormal is not None):
+                    matching.append(evidence)
+            if matching:
+                terminal_data['world_normal'] = _xyz(
+                    matching[0].worldNormal)
         armor = combat_rules.he_nominal_armor(
             collisions, getattr(target, 'typeDescriptor', None))
         damage = combat_rules.damage(shot, result, armor)
@@ -9588,6 +9790,9 @@ class BattleRuntime(object):
         layers = combat_rules.collision_layers(collisions)
         critical = None
         critical_delta = {}
+        if int(result) == 0:
+            damage = 0
+            hull_damage = 0
         if int(result) != 0 and combat_rules.is_he(shot):
             damage, critical, critical_delta = (
                 critical_damage.propose_explosion(
@@ -9672,7 +9877,9 @@ class BattleRuntime(object):
         return effects
 
     def _projectile_terminal(self, state, terminal):
-        projectile_id = state.get('key')
+        manager_key = state.get('key')
+        projectile_id = (manager_key[0]
+                         if isinstance(manager_key, tuple) else manager_key)
         meta = self._projectile_meta.get(projectile_id)
         if meta is None:
             return False
@@ -9700,6 +9907,48 @@ class BattleRuntime(object):
         hit_vehicle = bool(
             outcome == 'impact' and data is not None and
             data.get('target_key') is not None)
+        elapsed = max(0.0, float(state.get('elapsed', 0.0)))
+        initial_velocity = tuple(state.get('velocity') or ())
+        gravity = tuple(state.get('gravity') or ())
+        incoming = None
+        if len(initial_velocity) == 3 and len(gravity) == 3:
+            incoming = tuple(
+                float(initial_velocity[index]) +
+                float(gravity[index]) * elapsed
+                for index in range(3))
+        ricochet = None
+        if (outcome == 'impact' and hit_vehicle and direct is not None and
+                int(direct.get('shot_result', -1)) == 0 and
+                int(meta.get('ricochet_count', 0)) == 0 and
+                self._projectile_elapsed_ms(meta, state) <
+                int(meta.get('max_time_ms', 0)) and
+                float(state.get('distance', 0.0)) <
+                float(meta.get('max_distance', 0.0)) and
+                data.get('world_normal') is not None):
+            shot = self._projectile_shot(meta)
+            shell_kind = _field(_field(shot, 'shell', {}), 'kind', None)
+            multiplier = combat_rules.first_ricochet_penetration_multiplier(
+                shell_kind)
+            if incoming is not None:
+                reflected = ideal_reflection_velocity(
+                    incoming, data['world_normal'])
+            else:
+                reflected = None
+            if multiplier is not None and reflected is not None:
+                speed = math.sqrt(sum(value * value for value in reflected))
+                if 0.000001 < speed <= lan_protocol.MAX_PROJECTILE_VELOCITY:
+                    direction = tuple(value / speed for value in reflected)
+                    segment_origin = tuple(
+                        impact[index] + direction[index] * 0.002
+                        for index in range(3))
+                    ricochet = {
+                        'state': state,
+                        'impact': impact,
+                        'segment_origin': segment_origin,
+                        'segment_velocity': reflected,
+                        'base_penetration_multiplier': multiplier,
+                        'direct': direct,
+                    }
         wreck_hit = None
         if hit_vehicle and direct is None:
             target_record = self._records.get(data.get('target_key'))
@@ -9725,9 +9974,65 @@ class BattleRuntime(object):
         # verdict now; only a retained wreck additionally carries its bounded
         # presentation identity, never a damage proposal.
         meta['hit_vehicle'] = hit_vehicle
-        meta['terminal_velocity'] = tuple(state.get('velocity') or ())
+        meta['terminal_velocity'] = tuple(
+            incoming if incoming is not None else
+            state.get('velocity') or ())
+        if ricochet is not None:
+            meta['pending_ricochet'] = ricochet
+            return self._submit_projectile_ricochet(meta)
         meta['pending_resolution'] = pending
         return self._submit_projectile_resolution(meta)
+
+    @staticmethod
+    def _projectile_elapsed_ms(meta, state):
+        return max(
+            int(meta.get('base_checked_ms', 0)),
+            int(meta.get('segment_start_time_ms', 0)) +
+            int(round(float(state.get('elapsed', 0.0)) * 1000.0)))
+
+    def _submit_projectile_ricochet(self, meta):
+        pending = meta.get('pending_ricochet')
+        if (pending is None or meta.get('progress_pending') is not None or
+                meta.get('awaiting_ricochet') or
+                not self._projectile_is_authority()):
+            return False
+        sender = getattr(self.client, 'send_projectile_ricochet', None)
+        if not callable(sender):
+            return False
+        wire = pending.get('wire')
+        if wire is None:
+            state = pending['state']
+            wire = {
+                'authority_epoch': self._projectile_epoch,
+                'projectile_id': meta['projectile_id'],
+                'base_checked_ms': int(meta.get('base_checked_ms', 0)),
+                'resolved_time_ms': self._projectile_elapsed_ms(meta, state),
+                'impact': list(pending['impact']),
+                'segment_origin': list(pending['segment_origin']),
+                'segment_velocity': list(pending['segment_velocity']),
+                'base_penetration_multiplier': pending[
+                    'base_penetration_multiplier'],
+                'direct': copy.deepcopy(pending['direct']),
+                'checked_distance': float(state.get('distance', 0.0)),
+                'piercing_loss': float(meta.get('piercing_loss', 0.0)),
+                'penetration_factor': float(
+                    meta.get('penetration_factor', 1.0)),
+                'destructibles': copy.deepcopy(
+                    list(meta.get('destructibles_pending', ()))),
+            }
+            pending['wire'] = wire
+        sent = sender(
+            wire['authority_epoch'], wire['projectile_id'],
+            wire['base_checked_ms'], wire['resolved_time_ms'],
+            wire['impact'], wire['segment_origin'], wire['segment_velocity'],
+            wire['base_penetration_multiplier'], wire['direct'],
+            checked_distance=wire['checked_distance'],
+            piercing_loss=wire['piercing_loss'],
+            penetration_factor=wire['penetration_factor'],
+            destructibles=wire['destructibles'])
+        if sent:
+            meta['awaiting_ricochet'] = True
+        return bool(sent)
 
     def _submit_projectile_resolution(self, meta):
         pending = meta.get('pending_resolution')
@@ -9742,9 +10047,7 @@ class BattleRuntime(object):
         if wire is None:
             state = pending['state']
             base_checked_ms = int(meta.get('base_checked_ms', 0))
-            elapsed_ms = max(
-                base_checked_ms,
-                int(round(float(state.get('elapsed', 0.0)) * 1000.0)))
+            elapsed_ms = self._projectile_elapsed_ms(meta, state)
             wire = {
                 'authority_epoch': self._projectile_epoch,
                 'projectile_id': meta['projectile_id'],
@@ -9786,6 +10089,9 @@ class BattleRuntime(object):
             if (meta.get('pending_resolution') is not None and
                     not meta.get('awaiting_resolution')):
                 changed = self._submit_projectile_resolution(meta) or changed
+            if (meta.get('pending_ricochet') is not None and
+                    not meta.get('awaiting_ricochet')):
+                changed = self._submit_projectile_ricochet(meta) or changed
         return changed
 
     def _publish_projectile_progress(self):
@@ -9797,7 +10103,11 @@ class BattleRuntime(object):
         cursors = []
         active_ids = set()
         for state in self._projectiles.snapshot():
-            meta = self._projectile_meta.get(state.get('key'))
+            manager_key = state.get('key')
+            projectile_id = (manager_key[0]
+                             if isinstance(manager_key, tuple) else
+                             manager_key)
+            meta = self._projectile_meta.get(projectile_id)
             if meta is None:
                 continue
             active_ids.add(meta['projectile_id'])
@@ -9806,9 +10116,7 @@ class BattleRuntime(object):
                 cursors.append(dict(pending))
                 continue
             base_checked = int(meta.get('base_checked_ms', 0))
-            checked = max(
-                base_checked,
-                int(round(float(state.get('elapsed', 0.0)) * 1000.0)))
+            checked = self._projectile_elapsed_ms(meta, state)
             cursors.append({
                 'projectile_id': meta['projectile_id'],
                 'base_checked_ms': base_checked,
