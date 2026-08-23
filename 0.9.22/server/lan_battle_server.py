@@ -198,6 +198,7 @@ LEAN_SNAPSHOT_MANIFEST_CAPABILITY = "lean_snapshot_manifest_v1"
 RAM_CONTACT_LEDGER_CAPABILITY = "ram_contact_ledger_v1"
 HUMAN_RAM_TIMELINE_CAPABILITY = "human_ram_timeline_v1"
 PLAYER_FIRE_INTENT_CAPABILITY = "player_fire_intent_v1"
+TEAM_SIZE_SELECTION_CAPABILITY = "team_size_selection_v1"
 CLIENT_VERDICT_FIELDS = frozenset((
     "reported_health", "reported_critical", "reported_reason",
     "reported_display_health", "reported_attacker",
@@ -214,6 +215,7 @@ SERVER_CAPABILITIES = (
     PROJECTILE_WRECK_HIT_CAPABILITY,
     RANDOM_MAP_CAPABILITY,
     "team_selection_v1",
+    TEAM_SIZE_SELECTION_CAPABILITY,
 )
 SIEGE_DISABLED = 0
 SIEGE_SWITCHING_ON = 1
@@ -1960,6 +1962,56 @@ class BattleState:
             self.state_revision += 1
             return True, None
 
+    def set_team_size(self, player_id, requested_team, requested_size):
+        """Let the waiting-room host change one next-round team capacity."""
+        with self.lock:
+            player = self.players.get(player_id)
+            if (player is None or not player.connected or
+                    self.phase != "waiting"):
+                return False, "not_waiting"
+            if player_id != self.host_player_id:
+                return False, "host_only"
+            try:
+                team = _exact_int(requested_team, 1, 2)
+            except ValueError:
+                return False, "invalid_team"
+            try:
+                size = _exact_int(requested_size, 1, 15)
+            except ValueError:
+                return False, "invalid_size"
+
+            participants = sorted(
+                (participant for participant in self.players.values()
+                 if participant.connected and participant.team == team),
+                key=lambda participant: (
+                    participant.slot, participant.player_id))
+            if len(participants) > size:
+                return False, "team_occupied"
+            if self.team_sizes[team] == size:
+                return True, None
+
+            # Leaving players may create slot gaps. Compact only the affected
+            # waiting team before shrinking so every retained player remains
+            # inside the new capacity and receives the matching spawn.
+            for slot, participant in enumerate(participants):
+                if participant.slot == slot:
+                    continue
+                participant.slot = slot
+                participant.x, participant.z, participant.yaw = (
+                    self._spawn_for(slot, team))
+                participant.y = 0.0
+                participant.aim_yaw = participant.yaw
+            self.team_sizes[team] = size
+            self.team_size = max(self.team_sizes.values())
+            occupied_slots = {
+                (participant.team, participant.slot)
+                for participant in self.players.values()
+                if participant.connected
+            }
+            self.bot_roster = self._new_bot_roster(occupied_slots)
+            self.state_revision += 1
+            return True, None
+
     def add_simulation_worker(self, conn, address, hello):
         """Admit one #1513 native worker without allocating a player slot."""
         with self.lock:
@@ -2107,13 +2159,15 @@ class BattleState:
             if (self.server_authority is not None and
                     self.authority_status == "server_pending" and
                     player_id == self.host_player_id):
-                # The sole native-data donor left while either projection or
-                # destructible identities were pending. End the round rather
-                # than wait for an impossible retry.
-                reason = ("descriptor_donor_disconnected"
-                          if not self.server_authority.started()
-                          else "destructible_map_donor_disconnected")
-                self._fail_server_authority_round(reason)
+                if self.server_authority.started():
+                    # Destructibles are optional. The remaining players can
+                    # keep the server-hosted battle even when the sole native
+                    # identity donor leaves during loading.
+                    self._disable_server_destructibles(
+                        "destructible_map_donor_disconnected")
+                else:
+                    self._fail_server_authority_round(
+                        "descriptor_donor_disconnected")
             if player_id == self.host_player_id:
                 self._elect_room_host()
             if player_id == self.bot_authority_id:
@@ -2330,9 +2384,22 @@ class BattleState:
         self.state_revision += 1
 
     def _authority_fields(self):
+        destructibles_disabled_reason = ""
+        authority = self.server_authority
+        world = None if authority is None else authority.world
+        disabled_reason = getattr(
+            world, "destructibles_disabled_reason", None)
+        if callable(disabled_reason):
+            reason = disabled_reason()
+            if isinstance(reason, str):
+                destructibles_disabled_reason = reason
         fields = {
             "authority_status": self.authority_status,
             "authority_fallback_reason": self.authority_fallback_reason,
+            "destructibles_disabled": bool(
+                destructibles_disabled_reason),
+            "destructibles_disabled_reason":
+                destructibles_disabled_reason,
         }
         worker = self.simulation_worker
         if (self.authority_mode == "client" and
@@ -2372,6 +2439,26 @@ class BattleState:
         self.authority_status = "server"
         self.authority_fallback_reason = ""
         self.authority_prerequisite_deadline = None
+        return True
+
+    def _disable_server_destructibles(self, reason):
+        """Keep the round alive without untrusted native object identities."""
+        authority = self.server_authority
+        if authority is None:
+            return False
+        reason = str(reason or "destructible_data_unavailable")
+        changed = authority.world.disable_destructibles(reason)
+        self.destructible_maps.pop(self.map_name, None)
+        previous_status = self.authority_status
+        if (authority.started() and
+                not self._mark_server_authority_ready()):
+            return False
+        if changed:
+            _server_log(
+                "SERVER AUTHORITY destructibles disabled reason=%s round=%s; "
+                "continuing battle" % (reason, self.round_id))
+        if changed or previous_status != self.authority_status:
+            self.state_revision += 1
         return True
 
     def _fail_server_authority_round(self, reason):
@@ -2420,6 +2507,11 @@ class BattleState:
         reason = ("descriptor_timeout"
                   if authority is None or not authority.started()
                   else "destructible_map_timeout")
+        if reason == "destructible_map_timeout":
+            disabled = self._disable_server_destructibles(reason)
+            if disabled:
+                self._activate_battle_if_ready()
+            return disabled
         return self._fail_server_authority_round(reason)
 
     def lobby_message(self):
@@ -2661,6 +2753,10 @@ class BattleState:
             _server_log(
                 "server authority has no baked world for %s" % self.map_name)
             return "world_data_unavailable"
+        for warning in getattr(world, "optional_warnings", ()):
+            _server_log(
+                "SERVER AUTHORITY optional world feature disabled map=%s: %s" %
+                (self.map_name, warning))
         self.server_authority = ServerBattleAuthority(
             self, world, self.descriptor_store)
         self._wait_for_authority_prerequisite(restart=True)
@@ -2720,6 +2816,16 @@ class BattleState:
             map_name = str(message.get("map") or "")
             if not map_name:
                 return False
+            if message.get("unavailable") is True:
+                if (map_name != self.map_name or self.phase != "loading" or
+                        self.authority_status != "server_pending"):
+                    return False
+                if self._disable_server_destructibles(
+                        "client_destructible_map_unavailable"):
+                    if self._server_authority_prerequisites_ready():
+                        return "ready"
+                    return True
+                return False
             try:
                 part = int(message.get("part"))
                 parts = int(message.get("parts"))
@@ -2767,9 +2873,10 @@ class BattleState:
             if (map_name == self.map_name and
                     self.server_authority is not None and
                     not self.server_authority.world.destructible_identities_ready()):
-                self._fail_server_authority_round(
-                    "destructible_map_incomplete")
-                return "failed"
+                if self._disable_server_destructibles(
+                        "destructible_map_incomplete"):
+                    return "ready"
+                return False
             return True
 
     def _install_destructible_map(self, map_name):
@@ -3133,6 +3240,10 @@ class BattleState:
                     not self._combat_accepting() or
                     self.battle_result is not None):
                 return False
+            if (self.server_authority is not None and
+                    self.server_authority.world.
+                    destructibles_disabled_reason() is not None):
+                return True
             dedicated_authority = (
                 player_id == self.bot_authority_id and
                 player_id in (
@@ -7653,6 +7764,10 @@ class BattleState:
             authority_fallback = self._expire_authority_prerequisite()
         if authority_fallback:
             self.broadcast_current_roster()
+            # A disabled optional feature may have made the loading round ready
+            # and queued its tick-zero live barrier. Publish that barrier on the
+            # next tick before advancing simulation.
+            return
         with self.lock:
             if self.phase != "battle":
                 return
@@ -8744,6 +8859,27 @@ class ClientHandler(socketserver.BaseRequestHandler):
                                 "state_revision": server.state.state_revision,
                                 "code": team_error,
                                 "team": message.get("team"),
+                                "team_sizes": server.state._team_sizes_wire(),
+                            })
+                    elif message_type == "set_team_size":
+                        accepted, size_error = server.state.set_team_size(
+                            player.player_id, message.get("team"),
+                            message.get("size"))
+                        if accepted:
+                            _server_log(
+                                "TEAM SIZE id=%d team=%s size=%s" % (
+                                    player.player_id, message.get("team"),
+                                    message.get("size")))
+                            server.state.broadcast_current_roster()
+                        else:
+                            player.send({
+                                "type": "team_size_denied",
+                                "protocol": PROTOCOL_VERSION,
+                                "round_id": server.state.round_id,
+                                "state_revision": server.state.state_revision,
+                                "code": size_error,
+                                "team": message.get("team"),
+                                "size": message.get("size"),
                                 "team_sizes": server.state._team_sizes_wire(),
                             })
                     elif message_type == "ping":

@@ -46,11 +46,11 @@ def _sha256(path):
 
 
 def _manifest_entry(directory, map_name):
-	"""Validate the complete batch marker and return this map's record.
+	"""Validate and return only this map's manifest record.
 
 	A missing manifest remains valid for one-file developer builds. Once a batch
-	manifest is present, however, a partial copy or a stale/tampered graph must
-	not silently drive bots with mixed navigation data.
+	manifest is present, the selected map must still have a compatible record and
+	file. Build and install validation own whole-batch completeness.
 	"""
 	path = os.path.join(directory, 'manifest.json')
 	if not os.path.isfile(path):
@@ -65,28 +65,26 @@ def _manifest_entry(directory, map_name):
 			int(manifest.get('version', -1)) != FORMAT_VERSION or
 			str(manifest.get('game_version', '')) != GAME_VERSION):
 		raise ValueError('navigation manifest is incompatible')
-	records = manifest.get('maps') or ()
-	if len(records) != len(SUPPORTED_MAPS):
-		raise ValueError('navigation manifest is incomplete')
-	expected = set(SUPPORTED_MAPS)
-	seen = set()
+	records = manifest.get('maps')
+	if not isinstance(records, list):
+		raise ValueError('navigation manifest record list is invalid')
 	selected = None
 	for record in records:
-		if not isinstance(record, dict):
-			raise ValueError('navigation manifest record is invalid')
-		name = _short_map_name(record.get('map'))
-		filename = str(record.get('file') or '')
-		if (name not in expected or name in seen or
-				filename != name + '.json' or
-				len(str(record.get('sha256') or '')) != 64):
-			raise ValueError('navigation manifest record is invalid')
-		seen.add(name)
-		if not os.path.isfile(os.path.join(directory, filename)):
-			raise ValueError('navigation graph batch is incomplete')
-		if name == map_name:
-			selected = record
-	if seen != expected:
-		raise ValueError('navigation manifest is incomplete')
+		if (not isinstance(record, dict) or
+				_short_map_name(record.get('map')) != map_name):
+			continue
+		if selected is not None:
+			raise ValueError('navigation manifest record is duplicated')
+		selected = record
+	if selected is None:
+		raise ValueError('navigation manifest has no record for this map')
+	name = _short_map_name(selected.get('map'))
+	filename = str(selected.get('file') or '')
+	if (name not in SUPPORTED_MAPS or filename != name + '.json' or
+			len(str(selected.get('sha256') or '')) != 64):
+		raise ValueError('navigation manifest record is invalid')
+	if not os.path.isfile(os.path.join(directory, filename)):
+		raise ValueError('navigation graph is unavailable')
 	return selected
 
 

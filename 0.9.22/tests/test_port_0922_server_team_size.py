@@ -165,6 +165,75 @@ class ServerTeamSizeTests(unittest.TestCase):
         self.assertEqual(2, one.team)
         self.assertEqual(0, one.slot)
 
+    def test_host_can_resize_each_waiting_team_without_restarting(self):
+        state = BattleState(team1_size=3, team2_size=4)
+        _attach_worker(state)
+        host, error = state.add_player(
+            _Connection(), ('10.0.0.1', 1001), _hello(1, 1))
+        self.assertIsNone(error)
+
+        accepted, error = state.set_team_size(host.player_id, 1, 2)
+        self.assertTrue(accepted)
+        self.assertIsNone(error)
+        accepted, error = state.set_team_size(host.player_id, 2, 5)
+
+        self.assertTrue(accepted)
+        self.assertIsNone(error)
+        self.assertEqual({1: 2, 2: 5}, state.team_sizes)
+        self.assertEqual(5, state.team_size)
+        self.assertEqual(
+            {'1': 2, '2': 5}, state.lobby_message()['team_sizes'])
+        start, error = state.request_start(host.player_id)
+        self.assertIsNone(error)
+        self.assertEqual({'1': 2, '2': 5}, start['team_sizes'])
+        self.assertEqual(7 - 1, len(start['bots']))
+
+    def test_non_host_cannot_resize_a_team(self):
+        state = BattleState(team_size=3)
+        host, error = state.add_player(
+            _Connection(), ('10.0.0.1', 1001), _hello(1, 1))
+        self.assertIsNone(error)
+        guest, error = state.add_player(
+            _Connection(), ('10.0.0.2', 1002), _hello(2, 2))
+        self.assertIsNone(error)
+
+        accepted, error = state.set_team_size(guest.player_id, 1, 2)
+
+        self.assertFalse(accepted)
+        self.assertEqual('host_only', error)
+        self.assertEqual({1: 3, 2: 3}, state.team_sizes)
+
+    def test_team_cannot_shrink_below_its_connected_player_count(self):
+        state = BattleState(team_size=4)
+        host, error = state.add_player(
+            _Connection(), ('10.0.0.1', 1001), _hello(1, 1))
+        self.assertIsNone(error)
+        second, error = state.add_player(
+            _Connection(), ('10.0.0.2', 1002), _hello(2, 1))
+        self.assertIsNone(error)
+
+        accepted, error = state.set_team_size(host.player_id, 1, 1)
+
+        self.assertFalse(accepted)
+        self.assertEqual('team_occupied', error)
+        self.assertEqual(4, state.team_sizes[1])
+
+    def test_team_resize_rejects_non_integer_wire_values(self):
+        state = BattleState(team_size=2)
+        host, error = state.add_player(
+            _Connection(), ('10.0.0.1', 1001), _hello(1, 1))
+        self.assertIsNone(error)
+
+        for team, size, code in (
+                (0, 1, 'invalid_team'), (3, 1, 'invalid_team'),
+                (True, 1, 'invalid_team'), (1, 0, 'invalid_size'),
+                (1, 16, 'invalid_size'), (1, '2', 'invalid_size'),
+                (1, True, 'invalid_size')):
+            accepted, error = state.set_team_size(
+                host.player_id, team, size)
+            self.assertFalse(accepted)
+            self.assertEqual(code, error)
+
     def test_invalid_team_sizes_are_rejected(self):
         for value in (0, 16, 'invalid', 1.5, True):
             with self.assertRaises((TypeError, ValueError), msg=value):

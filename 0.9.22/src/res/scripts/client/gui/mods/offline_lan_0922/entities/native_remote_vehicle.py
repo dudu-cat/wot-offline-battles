@@ -31,7 +31,7 @@ class _AimTarget(object):
 class _NativeRemoteState(object):
 
     def __init__(self, bigworld, math_module, compatibility, data_links,
-                 position, rotation):
+                 position, rotation, interpolate_motion=True):
         self._bigworld = bigworld
         self._math = math_module
         self._compatibility = compatibility
@@ -42,6 +42,11 @@ class _NativeRemoteState(object):
         self.yaw = float(rotation[2])
         self.speed = 0.0
         self.turn_speed = 0.0
+        # Keep stable callable objects alive for the native #1513 data-link
+        # setters.  Re-reading a bound method would create a temporary object.
+        self._vehicle_speed_link = self._read_vehicle_speed
+        self._vehicle_rotation_speed_link = \
+            self._read_vehicle_rotation_speed
         self.velocity = math_module.Vector3(0.0, 0.0, 0.0)
         self.acceleration = math_module.Vector3(0.0, 0.0, 0.0)
         self._last_pose_time = None
@@ -58,15 +63,19 @@ class _NativeRemoteState(object):
         self._render_duration = 0.0
         animation_factory = getattr(math_module, 'MatrixAnimation', None)
         self.animation = (animation_factory()
-                          if callable(animation_factory) else None)
+                          if (interpolate_motion and
+                              callable(animation_factory)) else None)
         self.provider = self.animation or self.matrix
         if self.animation is not None:
             self._rekey(_MINIMUM_KEYFRAME_SECONDS)
         self.aim = _AimTarget(math_module)
+        self._aim_relative_yaw = None
+        self._aim_gun_pitch = None
         self.entity = None
         self.model_changed = None
         self.track_scroll = None
         self.track_mode = None
+        self._track_feed = None
         self.presentation_capabilities = {}
         self.presentation_errors = {}
 
@@ -86,8 +95,50 @@ class _NativeRemoteState(object):
         except Exception:
             self.animation = None
             self.provider = self.matrix
+            self._rebind_provider()
             return False
         return True
+
+    def _rebind_provider(self):
+        """Move every stock motion consumer to the current pose provider."""
+        entity = getattr(self, 'entity', None)
+        if entity is None or getattr(entity, 'model', None) is None:
+            return False
+        entity.model.matrix = self.provider
+        self._track_feed = None
+        self._bind_stock_motion()
+        self._publish_pose()
+        return True
+
+    def set_interpolate_motion(self, enabled):
+        """Follow live bot-authority handoffs without retaining two filters."""
+        enabled = bool(enabled)
+        if enabled == (self.animation is not None):
+            return False
+        previous = self.provider
+        pose = (
+            float(self.position.x), float(self.position.y),
+            float(self.position.z), self.yaw, self.pitch, self.roll)
+        self._render_pose = pose
+        self._render_from = None
+        self._render_to = None
+        self._render_duration = 0.0
+        self._write_pose(self._key_from, pose)
+        self._write_pose(self._key_to, pose)
+        if enabled:
+            animation_factory = getattr(
+                self._math, 'MatrixAnimation', None)
+            if callable(animation_factory):
+                self.animation = animation_factory()
+                self.provider = self.animation
+                self._rekey(_MINIMUM_KEYFRAME_SECONDS)
+        else:
+            self.animation = None
+            self.provider = self.matrix
+        if self.provider is not previous:
+            self._rebind_provider()
+            return True
+        return False
 
     @staticmethod
     def _write_pose(matrix, pose):
@@ -170,6 +221,12 @@ class _NativeRemoteState(object):
             entity._offlinePresentationErrors = self.presentation_errors
         return bool(available)
 
+    def _read_vehicle_speed(self):
+        return float(self.speed)
+
+    def _read_vehicle_rotation_speed(self):
+        return float(self.turn_speed)
+
     def _bind_stock_motion(self):
         """Rebind stock #1513 presentation components to copied LAN motion."""
         entity = self.entity
@@ -179,26 +236,26 @@ class _NativeRemoteState(object):
 
         detailed = getattr(appearance, 'detailedEngineState', None)
         audition = getattr(appearance, 'engineAudition', None)
-        links = self._data_links
         engine_ready = False
-        if detailed is not None and audition is not None and links is not None:
-            create_float_link = getattr(links, 'createFloatLink', None)
-            if callable(create_float_link):
-                try:
-                    detailed.vehicleSpeedLink = create_float_link(
-                        self, 'speed')
-                    detailed.rotationSpeedLink = create_float_link(
-                        self, 'turn_speed')
-                    engine_ready = True
-                except Exception as error:
-                    self._record_capability(
-                        'engine_audio_motion', False, error)
+        if detailed is not None and audition is not None:
+            try:
+                # #1513 accepts a callable here.  DataLinks.createFloatLink
+                # only supports native data-link owners; passing this plain
+                # Python state creates an empty std::function and crashes the
+                # next DetailedEngineState update with bad_function_call.
+                detailed.vehicleSpeedLink = self._vehicle_speed_link
+                detailed.rotationSpeedLink = \
+                    self._vehicle_rotation_speed_link
+                engine_ready = True
+            except Exception as error:
+                self._record_capability(
+                    'engine_audio_motion', False, error)
         if engine_ready:
             self._record_capability('engine_audio_motion', True)
         elif 'engine_audio_motion' not in self.presentation_errors:
             self._record_capability(
                 'engine_audio_motion', False,
-                'stock DetailedEngineState/DataLinks are unavailable')
+                'stock DetailedEngineState is unavailable')
 
         swinging = getattr(appearance, 'swingingAnimator', None)
         if swinging is not None:
@@ -270,6 +327,8 @@ class _NativeRemoteState(object):
         self.entity = entity
         entity._offlineNativeRemote = True
         entity._offlineNativeMarkerVisible = True
+        entity._offlineNativeDrawVisible = True
+        entity._offlineNativeMotionState = self
         entity._aim_yaw = self.yaw
         entity._gun_pitch = 0.0
         entity.team = int(entity.publicInfo['team'])
@@ -293,9 +352,16 @@ class _NativeRemoteState(object):
 
         def on_model_changed(*unused_args, **unused_kwargs):
             if self.entity is not None and self.entity.appearance is not None:
-                self.entity.model.matrix = self.provider
+                self._rebind_provider()
                 self.entity.appearance.setupGunMatrixTargets(self.aim)
-                self._bind_stock_motion()
+                # CompoundAppearance may replace the model after damage or a
+                # streaming refresh.  Stock startVisual makes that replacement
+                # visible again, so restore the runtime-owned spotting gates
+                # after every relink without touching marker registration.
+                self.entity.show(bool(getattr(
+                    self.entity, '_offlineNativeDrawVisible', True)))
+                self.entity.targetCaps = ([1] if bool(getattr(
+                    self.entity, '_spot_visible', True)) else [])
 
         changed = getattr(appearance, 'onModelChanged', None)
         if changed is not None:
@@ -316,18 +382,22 @@ class _NativeRemoteState(object):
         entity = self.entity
         if entity is not None:
             entity._aim_yaw = getattr(entity, '_aim_yaw', self.yaw)
-            entity.model.matrix = self.provider
             self._publish_pose()
         return True
 
     def set_aim(self, hull_yaw, aim_yaw, gun_pitch):
         relative = ((float(aim_yaw) - float(hull_yaw) + math.pi) %
                     (2.0 * math.pi) - math.pi)
-        self.aim.turretMatrix.setRotateYPR((relative, 0.0, 0.0))
-        self.aim.gunMatrix.setRotateYPR((0.0, float(gun_pitch), 0.0))
+        gun_pitch = float(gun_pitch)
+        if relative != self._aim_relative_yaw:
+            self.aim.turretMatrix.setRotateYPR((relative, 0.0, 0.0))
+            self._aim_relative_yaw = relative
+        if gun_pitch != self._aim_gun_pitch:
+            self.aim.gunMatrix.setRotateYPR((0.0, gun_pitch, 0.0))
+            self._aim_gun_pitch = gun_pitch
         if self.entity is not None:
             self.entity._aim_yaw = float(aim_yaw)
-            self.entity._gun_pitch = float(gun_pitch)
+            self.entity._gun_pitch = gun_pitch
         return True
 
     def update_tracks(self, left, right, mode):
@@ -349,6 +419,16 @@ class _NativeRemoteState(object):
             return False
         left = float(left)
         right = float(right)
+        flying = getattr(appearance, 'flyingInfoProvider', None)
+        left_contact = not bool(getattr(
+            flying, 'isLeftSideFlying', False))
+        right_contact = not bool(getattr(
+            flying, 'isRightSideFlying', False))
+        feed = (round(left, 3), round(right, 3), tuple(mode),
+                left_contact, right_contact)
+        if feed == self._track_feed:
+            return bool(self.presentation_capabilities.get(
+                'engine_owned_track_motion') or self.track_scroll is not None)
         native_updated = False
         vehicle_filter = getattr(entity, 'filter', None)
         appearance_filter = getattr(appearance, 'filter', None)
@@ -356,11 +436,6 @@ class _NativeRemoteState(object):
         movement_info = getattr(vehicle_filter, 'movementInfo', None)
         if (appearance_filter is vehicle_filter and callable(setter) and
                 movement_info is not None):
-            flying = getattr(appearance, 'flyingInfoProvider', None)
-            left_contact = not bool(getattr(
-                flying, 'isLeftSideFlying', False))
-            right_contact = not bool(getattr(
-                flying, 'isRightSideFlying', False))
             try:
                 # This native call is fatal on an unattached WGVehicleFilter.
                 # The identity/ownership checks above are therefore part of
@@ -382,6 +457,7 @@ class _NativeRemoteState(object):
         # PyTrackScroll remains the safe belt/audio fallback when the exact
         # native wheel input is absent.  It never calls WGVehicleFilter APIs.
         appearance.updateTracksScroll(left, right)
+        self._track_feed = feed
         return bool(native_updated or self.track_scroll is not None)
 
     def track_scroll_readback(self):
@@ -419,13 +495,15 @@ class NativeRemoteVehicleFactory(object):
     native_entities = True
 
     def __init__(self, bigworld, math_module, model_assembler, space_id,
-                 binding, compatibility, data_links=None, **unused_kwargs):
+                 binding, compatibility, data_links=None,
+                 interpolate_motion=True, **unused_kwargs):
         unused_space_id = space_id
         self._bigworld = bigworld
         self._math = math_module
         self._binding = binding
         self._compatibility = compatibility
         self._data_links = data_links
+        self._interpolate_motion = bool(interpolate_motion)
         self._states = {}
         self._vehicles = {}
         self._descriptors = {}
@@ -454,7 +532,8 @@ class NativeRemoteVehicleFactory(object):
                 'native remote Vehicle entered before createEntity returned')
         self._states[int(entity_id)] = _NativeRemoteState(
             self._bigworld, self._math, self._compatibility,
-            self._data_links, position, rotation)
+            self._data_links, position, rotation,
+            interpolate_motion=self._interpolate_motion)
         self._vehicles[int(entity_id)] = None
         self._binding.arena_vehicle_added(entity_id, {
             'properties': properties, 'team_killer': False})
@@ -487,6 +566,13 @@ class NativeRemoteVehicleFactory(object):
 
     def error(self, unused_entity_id):
         return None
+
+    def set_entity_interpolate_motion(self, entity_id, enabled):
+        """Switch one native presentation at an authority handoff."""
+        state = self._states.get(int(entity_id))
+        if state is None:
+            return False
+        return state.set_interpolate_motion(enabled)
 
     def request_wreck(self, unused_entity_id):
         # Vehicle.onHealthChanged owns stock damaged-model replacement.

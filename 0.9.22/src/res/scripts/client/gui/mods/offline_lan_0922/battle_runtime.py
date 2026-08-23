@@ -72,6 +72,8 @@ SPOTTING_PHASE_BUCKETS = 5
 # after the local map has entered the battle.  Read it infrequently and only
 # write when it no longer selects this arena's gameplay.
 SPACE_VISIBILITY_CHECK_SECONDS = 0.50
+OPTIONAL_WARNING_TEXT_LIMIT = 160
+DESTRUCTIBLE_UNAVAILABLE_REASON_LIMIT = 160
 
 class _LiveSpaceVisibilityPending(Exception):
     """The mapped native space has not reached BigWorld.spaces yet."""
@@ -127,6 +129,12 @@ TRACK_SCROLL_LIMITS = (-15.0, 30.0)
 VISION_PUBLISH_EPSILON = 0.5
 # Seconds between two bot-track diagnostic lines.
 TRACK_REPORT_SECONDS = 5.0
+# Maximum vertical disagreement between the suspension probes before they are
+# treated as different terrain layers rather than one drivable plane.
+GROUND_PLANE_EPSILON = 0.35
+# Above the old copied visual limit, smoothing itself can push a hull through
+# a real steep slope.  Continuous terrain past this angle uses its raw pose.
+GROUND_RAW_TILT_RADIANS = 0.61
 # Give the pose animation a little longer than the measured gap so it is
 # still interpolating when the next pose lands.
 POSE_RELAX_STRETCH = 1.35
@@ -1013,6 +1021,8 @@ class BattleRuntime(object):
         self._lobby_retire_started = False
         self._app_loader_guard = None
         self._damage_info_failure_reported = False
+        self._optional_failures_reported = set()
+        self._disabled_optional_features = set()
         self._avatar = None
         self._binding = None
         self._server = None
@@ -1106,6 +1116,8 @@ class BattleRuntime(object):
         self._local_slide_speed = 0.0
         self._local_downhill = (0.0, 0.0, 0.0)
         self._local_slope_tangent = 0.0
+        self._local_ground_plane = None
+        self._local_surface_up_cosine = None
         self._local_air_lateral = (0.0, 0.0)
         self._input_accumulator = 0.0
         self._gun_state = None
@@ -1257,6 +1269,9 @@ class BattleRuntime(object):
         combat_rules.apply_he_tuning(self._config.get('he_tuning'))
         self._start_message = dict(message or {})
         self.client = lan_client
+        self._damage_info_failure_reported = False
+        self._optional_failures_reported = set()
+        self._disabled_optional_features = set()
         self._sixth_sense = None
         self._has_sixth_sense = (
             False if self._worker_mode else
@@ -1326,6 +1341,8 @@ class BattleRuntime(object):
         self._local_slide_speed = 0.0
         self._local_downhill = (0.0, 0.0, 0.0)
         self._local_slope_tangent = 0.0
+        self._local_ground_plane = None
+        self._local_surface_up_cosine = None
         self._local_air_lateral = (0.0, 0.0)
         self._input_accumulator = 0.0
         self._gun_state = None
@@ -1442,19 +1459,27 @@ class BattleRuntime(object):
             foliage_loader = getattr(
                 self._runtime, 'foliage_loader',
                 prebaked_foliage.load_foliage)
-            self._foliage = foliage_loader(self._config.get('map'))
+            try:
+                self._foliage = foliage_loader(self._config.get('map'))
+            except Exception as error:
+                self._foliage = None
+                self._warn_optional_failure(
+                    'foliage camouflage', error)
             if self._destructibles is not None:
                 catalog_loader = getattr(
                     self._runtime, 'destructible_catalog_loader',
                     prebaked_destructibles.load_catalog)
-                destructible_catalog = catalog_loader(
-                    self._config.get('map'))
-                if (map_name in prebaked_navigation.SUPPORTED_MAPS and
-                        destructible_catalog is None):
-                    raise RuntimeError(
-                        'validated destructible catalog is unavailable for %s' %
-                        map_name)
-                self._destructibles.set_catalog(destructible_catalog)
+                try:
+                    destructible_catalog = catalog_loader(
+                        self._config.get('map'))
+                    if destructible_catalog is None:
+                        raise RuntimeError(
+                            'validated destructible catalog is unavailable '
+                            'for %s' % map_name)
+                    self._destructibles.set_catalog(destructible_catalog)
+                except Exception as error:
+                    self._disable_destructibles_for_round(error)
+            self._observe_destructibles_disabled(self._start_message)
             self._spawn_planner = SpawnPlanner(
                 arena_type,
                 tactical_maps.get_tactical_map(self._config['map']),
@@ -1947,9 +1972,107 @@ class BattleRuntime(object):
         if self._space_visibility_warning_reported:
             return
         self._space_visibility_warning_reported = True
+        self._warn_optional_failure('map visibility filtering', error)
+
+    @staticmethod
+    def _bounded_failure_reason(error, limit=OPTIONAL_WARNING_TEXT_LIMIT):
+        """Return one single-line diagnostic safe for logs and the wire."""
+        try:
+            message = str(error)
+        except Exception:
+            message = error.__class__.__name__
+        message = ' '.join(message.split())
+        if not message:
+            message = error.__class__.__name__
+        return message[:max(1, int(limit))]
+
+    def _optional_feature_enabled(self, feature):
+        disabled = getattr(self, '_disabled_optional_features', None)
+        if disabled is None:
+            disabled = set()
+            self._disabled_optional_features = disabled
+        return str(feature) not in disabled
+
+    def _warn_optional_failure(self, feature, error, disable=True):
+        """Log one bounded warning per feature and round."""
+        feature = str(feature)
+        disabled = getattr(self, '_disabled_optional_features', None)
+        if disabled is None:
+            disabled = set()
+            self._disabled_optional_features = disabled
+        if disable:
+            disabled.add(feature)
+        reported = getattr(self, '_optional_failures_reported', None)
+        if reported is None:
+            reported = set()
+            self._optional_failures_reported = reported
+        if feature in reported:
+            return False
+        reported.add(feature)
+        outcome = ('disabled for this round' if disable else
+                   'degraded for this round')
         sys.stdout.write(
-            '[Offline LAN 0.9.22] map visibility filtering is unavailable; '
-            'continuing the battle: %s\n' % error)
+            '[Offline LAN 0.9.22] optional %s %s: %s\n' % (
+                feature, outcome, self._bounded_failure_reason(error)))
+        return True
+
+    def _run_optional_feature(self, feature, callback, args=(),
+                              on_error=None):
+        """Run one presentation boundary without widening frame failure."""
+        if not self._optional_feature_enabled(feature):
+            return False
+        try:
+            return callback(*args)
+        except Exception as error:
+            if callable(on_error):
+                try:
+                    on_error()
+                except Exception as cleanup_error:
+                    error = RuntimeError(
+                        '%s; disable cleanup failed: %s' % (
+                            error, cleanup_error))
+            self._warn_optional_failure(feature, error)
+            return False
+
+    def _disable_standard_space_visibility(self):
+        self._standard_space_visibility = None
+        return True
+
+    def _disable_destructibles_for_round(self, error):
+        sensor = self._destructibles
+        self._destructibles = None
+        if sensor is not None:
+            for name, args in (
+                    ('set_event_sink', (None,)),
+                    ('reset', ()),
+                    ('set_catalog', (None,))):
+                callback = getattr(sensor, name, None)
+                if not callable(callback):
+                    continue
+                try:
+                    callback(*args)
+                except Exception:
+                    pass
+        self._warn_optional_failure('destructible interactions', error)
+        return True
+
+    def _observe_destructibles_disabled(self, message):
+        """Apply the server's round-wide optional-feature decision once."""
+        if (not isinstance(message, dict) or
+                message.get('destructibles_disabled') is not True):
+            return False
+        if self._start_message is None:
+            self._start_message = {}
+        self._start_message['destructibles_disabled'] = True
+        reason = self._bounded_failure_reason(
+            message.get('destructibles_disabled_reason') or
+            'server disabled destructible interactions')
+        self._start_message['destructibles_disabled_reason'] = reason
+        if self._destructibles is not None:
+            self._disable_destructibles_for_round(RuntimeError(
+                'LAN server disabled destructible interactions: %s' %
+                reason))
+        return True
 
     def _clock(self):
         function = getattr(self._runtime.bigworld, 'time', None)
@@ -2094,7 +2217,12 @@ class BattleRuntime(object):
             if factory_type is NativeRemoteVehicleFactory:
                 factory_kwargs.update({
                     'binding': self._binding,
-                    'compatibility': self._runtime.compatibility})
+                    'compatibility': self._runtime.compatibility,
+                    # SnapshotSync already supplies every guest pose on each
+                    # render frame. Authority Bots opt into interpolation per
+                    # entity after creation, so remote humans and live
+                    # authority handoffs never retain the wrong provider.
+                    'interpolate_motion': False})
                 sys.stdout.write(
                     '[Offline LAN 0.9.22] native remote Vehicle presentation '
                     'enabled; copied LAN physics remains authoritative\n')
@@ -2415,7 +2543,9 @@ class BattleRuntime(object):
             self.state = 'running'
             if not self._worker_mode:
                 self._bind_local_arcade_camera()
-                self._publish_rpm(self._clock(), force=True)
+                self._run_optional_feature(
+                    'engine RPM presentation', self._publish_rpm,
+                    (self._clock(), True))
             self._last_frame_time = self._clock()
             if not self._worker_mode:
                 self._ammo_tick()
@@ -2497,8 +2627,10 @@ class BattleRuntime(object):
 
     def on_battle_live(self, message):
         """Start the one server-owned countdown after every map is ready."""
-        if self.state != 'running' or self._battle_live:
+        if (self.state != 'running' or self._battle_live or
+                self._prebattle_deadline is not None):
             return False
+        self._observe_destructibles_disabled(message)
         countdown = max(0.0, _number(
             (message or {}).get('countdown_seconds'),
             self._prebattle_seconds()))
@@ -2513,12 +2645,61 @@ class BattleRuntime(object):
             duration = max(1.0, float(network_duration))
         self._config['battleDurationSeconds'] = duration
         self._binding.arena_period('prebattle', countdown)
+        self._reset_prebattle_native_visuals()
         self._show_prebattle_crosshair()
         self._prebattle_deadline = self._clock() + countdown
         self._last_frame_time = self._clock()
         if countdown <= 0.0:
             self._begin_battle()
         return True
+
+    def _reset_prebattle_native_visuals(self):
+        """Close stock's pre-attach visual race before countdown rendering.
+
+        All remote entities are ready at the server-owned countdown barrier.
+        Native ``Vehicle.startVisual`` has therefore finished and can no
+        longer overwrite these gates.  Enemies are forced out of both the
+        world and marker/minimap presentation, while friendly minimap entries
+        are rebound once to the LAN matrix installed after startVisual.
+        """
+        if (self._worker_mode or self._remote_factory is None or
+                self.client is None):
+            return False
+        local_team = int(getattr(self.client, 'team', 1))
+        changed = False
+        for record in self._records.values():
+            if (record.get('local') or not record.get('native_remote') or
+                    not record.get('ready') or record.get('tombstone')):
+                continue
+            vehicle = self._remote_factory.get(record['engine_id'])
+            if vehicle is None or getattr(vehicle, 'model', None) is None:
+                raise RuntimeError(
+                    'prebattle native vehicle presentation is unavailable')
+            state = record.get('state') or {}
+            if int(state.get('team', local_team)) == local_team:
+                if not record.get('native_minimap_rebound'):
+                    self._binding.refresh_vehicle_minimap(
+                        record['engine_id'])
+                    record['native_minimap_rebound'] = True
+                    changed = True
+                continue
+            record['spot_visible'] = False
+            record['spot_marker_visible'] = False
+            record['spot_until'] = 0.0
+            record['direct_spot_visible'] = False
+            vehicle._spot_visible = False
+            vehicle._offlineNativeDrawVisible = False
+            vehicle.show(False)
+            vehicle.targetCaps = []
+            # Runtime state may say it already stopped the marker while a
+            # later stock visual callback registered it again.  At this final
+            # ready barrier, stop the real adaptor unconditionally.
+            self._binding.stop_vehicle_visual(
+                record['engine_id'], False)
+            record['visual_started'] = False
+            vehicle._offlineNativeMarkerVisible = False
+            changed = True
+        return changed
 
     def _show_prebattle_crosshair(self):
         """Draw the aiming reticle during our own countdown.
@@ -3730,6 +3911,23 @@ class BattleRuntime(object):
             return -1.0
         return 20.0 - float(value)
 
+    def _native_drowning_level(self, entity):
+        """Read the local #1513 vehicle's assembled water sensor."""
+        appearance = getattr(entity, 'appearance', None)
+        try:
+            if (appearance is None or
+                    getattr(appearance, 'waterSensor', None) is None):
+                return None
+            if bool(appearance.isUnderwater):
+                return 2
+            if bool(appearance.isInWater):
+                return 1
+            return 0
+        except Exception:
+            # The sensor is native and can disappear during a model refresh.
+            # The point probe below remains valid while it is being rebuilt.
+            return None
+
     def _present_drowning_level(self, level, now):
         status_group = getattr(
             self._runtime.constants, 'VEHICLE_MISC_STATUS', None)
@@ -3774,26 +3972,26 @@ class BattleRuntime(object):
             return False
         elapsed = min(self._drown_check, 0.5)
         self._drown_check = 0.0
-        depth = self._water_depth(self.local_pose()[0])
-        if depth > 1.6:
+        level = self._native_drowning_level(entity)
+        if level is None:
+            depth = self._water_depth(self.local_pose()[0])
+            level = 2 if depth > 1.6 else (1 if depth > 0.5 else 0)
+        if level == 2:
             if self._drown_level != 2:
                 self._drown_started = self._server_clock()
             self._drown_time += elapsed
-            level = 2
-        elif depth > 0.5:
+        elif level == 1:
             self._drown_time = 0.0
             self._drown_started = None
-            level = 1
         else:
             self._drown_time = 0.0
             self._drown_started = None
-            level = 0
         self._avatar._offh_drowning = level == 2
         entity._offh_drowning = level == 2
         if level != self._drown_level:
             self._drown_level = level
             self._present_drowning_level(level, now)
-        if depth <= 1.6 or self._drown_time <= 10.0:
+        if level != 2 or self._drown_time <= 10.0:
             return False
         display_health = max(0, int(getattr(entity, 'health', 0) or 0))
         drowning_reason = self._attack_reason('DROWNING', 5)
@@ -3872,8 +4070,10 @@ class BattleRuntime(object):
             getattr(condition, 'ONBOARD_COSINE',
                     math.cos(math.radians(80.0))),
             math.cos(math.radians(80.0)))
-        up_cosine = math.cos(float(self._local_pitch)) * math.cos(
-            float(self._local_roll))
+        up_cosine = self._local_surface_up_cosine
+        if up_cosine is None:
+            up_cosine = math.cos(float(self._local_pitch)) * math.cos(
+                float(self._local_roll))
         if up_cosine <= onboard_cosine:
             level = 2
         elif up_cosine <= warning_cosine:
@@ -4143,7 +4343,8 @@ class BattleRuntime(object):
             velocity, acceleration)
         self._reset_full_turret_sniper_aim(previous_yaw)
         self._local_camera_velocity = velocity
-        self._update_local_tracks(entity)
+        self._run_optional_feature(
+            'local track animation', self._update_local_tracks, (entity,))
         return position
 
     def _reset_full_turret_sniper_aim(self, previous_yaw):
@@ -4264,7 +4465,10 @@ class BattleRuntime(object):
 
     def _on_client_ready(self):
         self._client_ready_received = True
-        self._enable_expert_visibility()
+        self._run_optional_feature(
+            'Expert damaged-device presentation',
+            self._enable_expert_visibility,
+            on_error=self._disable_expert_presentation)
         if self.state == 'running':
             self._sender.send_current()
             if self._ammo_callback_token is None:
@@ -4299,6 +4503,20 @@ class BattleRuntime(object):
             callback(int(vehicle_id or 0))
             return True
         return False
+
+    def _disable_expert_presentation(self):
+        previous = self._expert_target_id
+        self._has_expert = False
+        self._expert_visibility_enabled = False
+        self._expert_target_id = 0
+        self._expert_target_due = 0.0
+        self._expert_target_signature = None
+        if previous:
+            try:
+                self._hide_expert_devices(previous)
+            except Exception:
+                pass
+        return True
 
     def monitor_vehicle_damaged_devices(self, vehicle_id):
         """Own the cell half of #1513's Expert target-monitor mailbox."""
@@ -5128,7 +5346,9 @@ class BattleRuntime(object):
             # crew or module parameters change; the stock rotator owns live
             # mouse aim and convergence after the native BATTLE transition.
             self._publish_targeting_info(entity, state)
-            self._sync_local_server_marker()
+            self._run_optional_feature(
+                'server gun-marker presentation',
+                self._sync_local_server_marker)
         except Exception as error:
             self._fail(error)
             return
@@ -5253,6 +5473,7 @@ class BattleRuntime(object):
         try:
             self._last_snapshot = dict(message or {})
             self._ack_local_ram_contacts(self._last_snapshot)
+            self._observe_destructibles_disabled(self._last_snapshot)
             self._observe_projectile_message(self._last_snapshot)
             self._reconcile_projectile_snapshot(self._last_snapshot)
             if 'rules' in self._last_snapshot:
@@ -5473,6 +5694,7 @@ class BattleRuntime(object):
         if 'authority_fallback_reason' in message:
             self._start_message['authority_fallback_reason'] = message.get(
                 'authority_fallback_reason')
+        self._observe_destructibles_disabled(message)
         if self._bots is None:
             return True
         return self._reconcile_bot_authority(player_id)
@@ -5547,6 +5769,7 @@ class BattleRuntime(object):
             start['battle_result'] = snapshot.get('battle_result')
         for outgoing in self._bots.battle_start(start):
             self._send_bot_message(outgoing)
+        self._set_bot_presentation_interpolation(player_id)
         if self._bots.is_authority():
             for state in snapshot.get('bots') or ():
                 try:
@@ -5638,10 +5861,44 @@ class BattleRuntime(object):
         self._local_fire_intent = None
         return True
 
+    def _bot_authority_is_local(self, player_id):
+        local_id = getattr(self.client, 'player_id', None)
+        if player_id is None or local_id is None:
+            return False
+        try:
+            return int(player_id) == int(local_id)
+        except (TypeError, ValueError, OverflowError):
+            raise RuntimeError('bot authority identity is invalid')
+
+    def _set_bot_presentation_interpolation(self, player_id):
+        """Match native pose providers to the current bot authority."""
+        if self._remote_factory is None:
+            return False
+        setter = getattr(
+            self._remote_factory, 'set_entity_interpolate_motion', None)
+        if not callable(setter):
+            return False
+        enabled = self._bot_authority_is_local(player_id)
+        changed = False
+        for record in self._records.values():
+            if (record.get('kind') != 'bot' or
+                    not record.get('native_remote') or
+                    record.get('tombstone')):
+                continue
+            entity_changed = setter(record['engine_id'], enabled)
+            if not entity_changed:
+                continue
+            record.pop('track_pose_sample', None)
+            if record.get('ready') and record.get('visual_started'):
+                self._binding.refresh_vehicle_minimap(record['engine_id'])
+            changed = True
+        return changed
+
     def on_events(self, message):
         if self.state in ('failed', 'stopped'):
             return False
         try:
+            self._observe_destructibles_disabled(message)
             self._observe_projectile_message(message or {})
             for raw_event in (message or {}).get('events') or ():
                 if not isinstance(raw_event, dict):
@@ -6182,6 +6439,11 @@ class BattleRuntime(object):
 
     def _apply_destructible_event(self, event):
         if self._destructibles is None:
+            if ((self._start_message or {}).get(
+                    'destructibles_disabled') is True or
+                    not self._optional_feature_enabled(
+                        'destructible interactions')):
+                return False
             raise RuntimeError('#1513 destructible runtime is unavailable')
         from gui.mods.offline_lan_0922 import destructibles_authority
         kind = str(event.get('destructible_kind', ''))
@@ -6215,6 +6477,12 @@ class BattleRuntime(object):
         if not isinstance(is_shot, bool):
             raise RuntimeError(
                 'canonical destructible shot flag is invalid')
+        is_isolated = getattr(
+            self._destructibles, 'is_isolated_1513', None)
+        if callable(is_isolated) and is_isolated(chunk_id, item_index):
+            # Runtime validation already logged and quarantined this native
+            # identity. Never re-enter it through canonical event replay.
+            return False
         if destructibles_authority.is_destroyed(
                 chunk_id, item_index, mat_kind):
             return False
@@ -7133,28 +7401,29 @@ class BattleRuntime(object):
     def _show_damage_info(self, engine_id, damage_index, extra_index,
                           attacker_id):
         """Publish one stock damage-info notification, never fatally."""
-        codes = getattr(self._runtime.constants, 'DAMAGE_INFO_CODES', ())
-        extras = getattr(
-            self._avatar.vehicleTypeDescriptor, 'extras', ())
-        if not 0 <= damage_index < len(codes):
-            raise RuntimeError(
-                '#1513 damage-info index is out of range: %d' % damage_index)
-        if not 0 <= extra_index < len(extras):
-            raise RuntimeError(
-                '#1513 damage-info extra index is out of range: %d' %
-                extra_index)
+        if not self._optional_feature_enabled('damage-info presentation'):
+            return False
         try:
+            codes = getattr(self._runtime.constants, 'DAMAGE_INFO_CODES', ())
+            extras = getattr(
+                self._avatar.vehicleTypeDescriptor, 'extras', ())
+            if not 0 <= damage_index < len(codes):
+                raise RuntimeError(
+                    '#1513 damage-info index is out of range: %d' %
+                    damage_index)
+            if not 0 <= extra_index < len(extras):
+                raise RuntimeError(
+                    '#1513 damage-info extra index is out of range: %d' %
+                    extra_index)
             self._avatar.showVehicleDamageInfo(
                 int(engine_id), damage_index, extra_index,
                 int(attacker_id), 0)
         except Exception as error:
             # A repaint failure is presentation, not authority.  Ending the
             # round over it loses the whole battle.
-            if not self._damage_info_failure_reported:
-                self._damage_info_failure_reported = True
-                sys.stdout.write(
-                    '[Offline LAN 0.9.22] damage-info presentation failed: '
-                    '%s\n' % error)
+            self._damage_info_failure_reported = True
+            self._warn_optional_failure(
+                'damage-info presentation', error)
             return False
         return True
 
@@ -9042,7 +9311,10 @@ class BattleRuntime(object):
         projectile_perf = {}
         boundary = entry_wall
         try:
-            self._maintain_standard_space_visibility(now)
+            self._run_optional_feature(
+                'map visibility filtering',
+                self._maintain_standard_space_visibility, (now,),
+                self._disable_standard_space_visibility)
             self._flush_pending_bot_create(now)
             self._flush_pending_entities(now)
             self._drain_event_journal()
@@ -9066,7 +9338,10 @@ class BattleRuntime(object):
                 boundary = next_boundary
             if not self._worker_mode:
                 self._tick_critical_states(dt)
-                self._tick_expert_target(now)
+                self._run_optional_feature(
+                    'Expert damaged-device presentation',
+                    self._tick_expert_target, (now,),
+                    self._disable_expert_presentation)
             if profiling:
                 next_boundary = _PROFILE_CLOCK()
                 stages['critical'] = max(0.0, next_boundary - boundary)
@@ -9143,8 +9418,12 @@ class BattleRuntime(object):
                 stages['local'] = max(0.0, next_boundary - boundary)
                 boundary = next_boundary
             if self._battle_live and not self._worker_mode:
-                self._update_target_outline(now)
-                self._report_local_compound(now)
+                self._run_optional_feature(
+                    'target outline', self._update_target_outline, (now,),
+                    self._disable_target_outline_presentation)
+                self._run_optional_feature(
+                    'compound diagnostics', self._report_local_compound,
+                    (now,))
             if profiling:
                 next_boundary = _PROFILE_CLOCK()
                 stages['outline'] = max(0.0, next_boundary - boundary)
@@ -9855,6 +10134,18 @@ class BattleRuntime(object):
         self._report_edge('del id=%s' % engine_id)
         return True
 
+    def _disable_target_outline_presentation(self):
+        """Best-effort release of presentation state after an outline fault."""
+        try:
+            self._clear_target_outline()
+        except Exception:
+            # _clear_target_outline clears its Python ownership fields before
+            # crossing either optional native boundary.  Never retry a stale
+            # entity or compound after one of those boundaries rejects it.
+            pass
+        self._outline_blocked = True
+        return True
+
     def _apply_team_observation(self, message, now):
         """Apply server-validated team radio spotting to presentation.
 
@@ -9936,8 +10227,9 @@ class BattleRuntime(object):
         from constructing 29 HD compounds.  It now finishes behind the stock
         BattleLoading screen instead of spending the first countdown seconds
         loading the line-up that will shortly begin moving.  A server-requested
-        native destructible map is also a hard boundary: a transport refusal
-        is retried next frame, while invalid baked data fails the battle.
+        native destructible map is also a readiness boundary: a transport
+        refusal is retried next frame, while unavailable optional baked data
+        is reported explicitly for the server to resolve.
         """
         if self._ready_sent or self._battle_live:
             return False
@@ -9972,20 +10264,41 @@ class BattleRuntime(object):
     def _maybe_donate_destructible_map(self):
         """Send the map's complete baked destructible identities.
 
-        Invalid baked data fails the battle; only a transport refusal stays
-        retryable on the next frame.
+        A client that cannot project the optional map reports that bounded
+        state to the server.  Only transport refusal stays retryable here.
         """
         if not self._start_message.get('need_destructible_map'):
             return False
         sender = getattr(self.client, 'send_destructible_map', None)
-        if not callable(sender) or self._destructibles is None:
+        if not callable(sender):
             raise RuntimeError(
                 'LAN server requires a destructible map donation this '
                 'client cannot send')
-        donation = self._destructibles.donation_rows_1513()
+        donation_error = None
+        if self._destructibles is None:
+            donation = None
+            donation_error = RuntimeError(
+                'destructible catalog is unavailable')
+        else:
+            try:
+                donation = self._destructibles.donation_rows_1513()
+            except Exception as error:
+                donation = None
+                donation_error = error
         if not donation:
-            raise RuntimeError(
-                'destructible map donation requires the baked catalog')
+            if donation_error is None:
+                donation_error = RuntimeError(
+                    'destructible map donation requires the baked catalog')
+            self._warn_optional_failure(
+                'destructible map donation', donation_error,
+                disable=False)
+            return bool(sender(
+                self._start_message.get('map'), {
+                    'unavailable': True,
+                    'reason': self._bounded_failure_reason(
+                        donation_error,
+                        DESTRUCTIBLE_UNAVAILABLE_REASON_LIMIT),
+                }))
         rows = donation.pop('instances')
         part_size = 1000
         parts = max(1, (len(rows) + part_size - 1) // part_size)
@@ -9999,8 +10312,8 @@ class BattleRuntime(object):
                 return False
         return True
 
-    def _ground_pitch(self, position, yaw, descriptor=None):
-        """Sample the copied 0.8.2 four-point suspension pose."""
+    def _sample_ground_plane(self, position, yaw, descriptor=None):
+        """Fit one continuous terrain plane under the local suspension."""
         length = 5.0
         width = 3.0
         try:
@@ -10028,28 +10341,27 @@ class BattleRuntime(object):
         left_y = self._ground_y(
             position[0] - cos_yaw * half_width,
             position[2] + sin_yaw * half_width, position[1])
-        if None in (front_y, rear_y, right_y, left_y):
-            self._local_downhill = (0.0, 0.0, 0.0)
-            self._local_slope_tangent = 0.0
-            return self._local_pitch
-        pitch = -math.atan2(front_y - rear_y, length) * 0.9
-        roll = math.atan2(right_y - left_y, width) * 0.9
-        tilt = math.sqrt(pitch * pitch + roll * roll)
-        if tilt > 0.61:
-            scale = 0.61 / tilt
-            pitch *= scale
-            roll *= scale
-        self._local_pitch += (pitch - self._local_pitch) * 0.5
-        self._local_roll += (roll - self._local_roll) * 0.5
-        gradient_forward = (rear_y - front_y) / length
-        gradient_right = (left_y - right_y) / width
+        center_y = self._ground_y(
+            position[0], position[2], position[1])
+        if None in (front_y, rear_y, right_y, left_y, center_y):
+            return None
+        long_mid = (front_y + rear_y) * 0.5
+        side_mid = (right_y + left_y) * 0.5
+        if (abs(long_mid - side_mid) > GROUND_PLANE_EPSILON or
+                abs(center_y - long_mid) > GROUND_PLANE_EPSILON or
+                abs(center_y - side_mid) > GROUND_PLANE_EPSILON):
+            return None
+        height_forward = (front_y - rear_y) / length
+        height_right = (right_y - left_y) / width
+        gradient_x = (height_forward * sin_yaw +
+                      height_right * cos_yaw)
+        gradient_z = (height_forward * cos_yaw -
+                      height_right * sin_yaw)
         slope_tangent = math.sqrt(
-            gradient_forward * gradient_forward +
-            gradient_right * gradient_right)
-        downhill_x = (gradient_forward * sin_yaw +
-                      gradient_right * cos_yaw)
-        downhill_z = (gradient_forward * cos_yaw -
-                      gradient_right * sin_yaw)
+            height_forward * height_forward +
+            height_right * height_right)
+        downhill_x = -gradient_x
+        downhill_z = -gradient_z
         downhill_length = math.sqrt(
             downhill_x * downhill_x + downhill_z * downhill_z)
         if downhill_length > 0.001:
@@ -10057,9 +10369,53 @@ class BattleRuntime(object):
             downhill_z /= downhill_length
         else:
             downhill_x = downhill_z = 0.0
-        self._local_downhill = (downhill_x, 0.0, downhill_z)
-        self._local_slope_tangent = slope_tangent
+        return {
+            'center_y': center_y,
+            'gradient_x': gradient_x,
+            'gradient_z': gradient_z,
+            'pitch': -math.atan2(front_y - rear_y, length),
+            # BigWorld applies YPR as yaw, pitch and then roll.  Forward
+            # pitch therefore shortens the horizontal right axis used by the
+            # final roll; dividing by its plane length keeps the displayed
+            # hull normal identical to the fitted terrain normal.
+            'roll': math.atan2(
+                height_right, math.sqrt(
+                    1.0 + height_forward * height_forward)),
+            'slope_tangent': slope_tangent,
+            'up_cosine': 1.0 / math.sqrt(
+                1.0 + slope_tangent * slope_tangent),
+            'downhill': (downhill_x, 0.0, downhill_z),
+        }
+
+    def _commit_ground_plane(self, plane, force_raw=False):
+        """Publish one accepted terrain plane to pose and slide physics."""
+        pitch = float(plane['pitch'])
+        roll = float(plane['roll'])
+        if force_raw:
+            self._local_pitch = pitch
+            self._local_roll = roll
+        else:
+            self._local_pitch += (pitch - self._local_pitch) * 0.5
+            self._local_roll += (roll - self._local_roll) * 0.5
+        self._local_downhill = tuple(plane['downhill'])
+        self._local_slope_tangent = float(plane['slope_tangent'])
+        self._local_surface_up_cosine = float(plane['up_cosine'])
+        self._local_ground_plane = plane
         return self._local_pitch
+
+    def _ground_pitch(self, position, yaw, descriptor=None):
+        """Sample one continuous four-point suspension pose."""
+        plane = self._sample_ground_plane(position, yaw, descriptor)
+        if plane is None:
+            self._local_downhill = (0.0, 0.0, 0.0)
+            self._local_slope_tangent = 0.0
+            self._local_ground_plane = None
+            self._local_surface_up_cosine = None
+            return self._local_pitch
+        force_raw = (
+            math.atan(float(plane['slope_tangent'])) >
+            GROUND_RAW_TILT_RADIANS)
+        return self._commit_ground_plane(plane, force_raw=force_raw)
 
     def _drive_pitch(self, position, yaw):
         """Copy the 0.8.2 close-range drive slope probe exactly.
@@ -10716,9 +11072,6 @@ class BattleRuntime(object):
             return position
         next_x = position[0] + slide_x * self._local_slide_speed * dt
         next_z = position[2] + slide_z * self._local_slide_speed * dt
-        ground = self._ground_y(next_x, next_z, position[1])
-        if ground is None or position[1] - ground >= 4.0:
-            return position
         lateral_speed = abs(slide_dot) * self._local_slide_speed
         lateral_yaw = math.atan2(slide_x, slide_z)
         if (entity is not None and not self._motion_is_clear(
@@ -10727,10 +11080,26 @@ class BattleRuntime(object):
                 self._local_slide_speed = 0.0
                 self._local_air_lateral = (0.0, 0.0)
             return position
-        delta_y = max(-0.35, min(0.35, ground - position[1]))
+        old_plane = self._local_ground_plane
+        if old_plane is None:
+            return position
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        candidate = self._sample_ground_plane(
+            (next_x, position[1], next_z), yaw, descriptor)
+        if candidate is None:
+            return position
+        dx = next_x - position[0]
+        dz = next_z - position[2]
+        expected_y = (float(old_plane['center_y']) +
+                      float(old_plane['gradient_x']) * dx +
+                      float(old_plane['gradient_z']) * dz)
+        if (abs(float(candidate['center_y']) - expected_y) >
+                GROUND_PLANE_EPSILON):
+            return position
+        self._commit_ground_plane(candidate, force_raw=True)
         self._local_vertical_speed = 0.0
         self._local_airborne = False
-        return (next_x, position[1] + delta_y, next_z)
+        return (next_x, float(candidate['center_y']), next_z)
 
     def _local_autorotation_turn(self, entity, turn, drive_intent=0.0,
                                  tracks_blocked=False):
@@ -10964,7 +11333,9 @@ class BattleRuntime(object):
         # Engine-free movement harnesses have no #1513 Entity binding.  A live
         # battle installs it before the first copied-physics frame.
         if self._binding is not None:
-            self._publish_rpm(self._clock())
+            self._run_optional_feature(
+                'engine RPM presentation', self._publish_rpm,
+                (self._clock(),))
         self._input_accumulator += dt
         if self._input_accumulator >= NETWORK_INPUT_SECONDS:
             # Preserve the nominal 30 Hz phase at render rates that are not a
@@ -11065,7 +11436,9 @@ class BattleRuntime(object):
                 record['engine_id'], yaw,
                 _number(state.get('aim_yaw', yaw)),
                 _number(state.get('gun_pitch')))
-            self._update_bot_tracks(record, state, now)
+            self._run_optional_feature(
+                'bot track animation', self._update_bot_tracks,
+                (record, state, now))
             applied = True
         return applied
 
@@ -11075,6 +11448,19 @@ class BattleRuntime(object):
             params = vehicle_physics.derive_params(entity.typeDescriptor)
             record['track_params'] = params
         return params
+
+    def _remember_remote_track_turn(self, record, yaw, now):
+        """Measure guest-side belt turning from the interpolated hull pose."""
+        previous = record.get('track_pose_sample')
+        turn = 0.0
+        if previous is not None:
+            elapsed = max(
+                FRAME_SECONDS, min(0.5, float(now) - float(previous[0])))
+            turned = (float(yaw) - float(previous[1]) + math.pi) % (
+                2.0 * math.pi) - math.pi
+            turn = turned / elapsed
+        record['track_pose_sample'] = (float(now), float(yaw))
+        return turn
 
     def _bot_engine_mode(self, alive, speed, turn):
         """Return the exact #1513 ``(power, movementFlags)`` for one bot.
@@ -11098,7 +11484,7 @@ class BattleRuntime(object):
             return (ENGINE_MODE_RUNNING, flags)
         return (ENGINE_MODE_IDLE, 0)
 
-    def _update_bot_tracks(self, record, state, now):
+    def _update_bot_tracks(self, record, state, now, turn_override=None):
         """Drive one bot's belts from its authority speed and turn rate."""
         if self._remote_factory is None:
             return False
@@ -11108,7 +11494,9 @@ class BattleRuntime(object):
         alive = bool(state.get('alive', True)) and int(
             state.get('health', 1) or 0) > 0
         speed = _number(state.get('speed'))
-        turn = _number(self._bot_yaw_rates.get(state.get('id')))
+        turn = _number(
+            self._bot_yaw_rates.get(state.get('id'))
+            if turn_override is None else turn_override)
         mode = self._bot_engine_mode(alive, speed, turn)
         left, right = vehicle_physics.track_scroll(
             self._bot_track_params(record, vehicle), speed, turn)
@@ -11152,7 +11540,7 @@ class BattleRuntime(object):
             (hit[0] - start).length + 1.5 >= (end - start).length)
         foliage_bonus = 0.0
         if line_of_sight and self._foliage is not None:
-            foliage_bonus = self._foliage.camouflage_bonus(
+            foliage_bonus = self._foliage_camouflage_bonus(
                 source_position, target_position, fired_recently)
         return {
             'line_of_sight': line_of_sight,
@@ -12048,6 +12436,15 @@ class BattleRuntime(object):
             _engine_rotation(yaw))
         if engine_id is None:
             raise RuntimeError('remote presentation returned no vehicle id')
+        interpolation_setter = getattr(
+            self._remote_factory, 'set_entity_interpolate_motion', None)
+        if callable(interpolation_setter):
+            interpolate_motion = (
+                event.get('kind') == 'bot' and
+                self._bot_authority_is_local(
+                    (self._start_message or {}).get(
+                        'bot_authority_id')))
+            interpolation_setter(engine_id, interpolate_motion)
         self._records[key] = {
             'engine_id': engine_id, 'state': state,
             'kind': event.get('kind'), 'network_id': event.get('id'),
@@ -12139,6 +12536,7 @@ class BattleRuntime(object):
                 # battle UI or shot/sound presentation in the hidden worker.
                 record['simulation_entity'] = True
             elif record.get('native_remote'):
+                vehicle._offlineNativeDrawVisible = initially_visible
                 vehicle.show(initially_visible)
                 vehicle.targetCaps = [1] if initially_visible else []
                 # Stock Vehicle.startVisual registered the native marker.
@@ -12258,17 +12656,23 @@ class BattleRuntime(object):
             # rewinding the live C++ object.
             return
         else:
+            now = self._clock()
             self._binding.set_vehicle_pose(
                 record['engine_id'], self._vector((
                     _number(pose.get('x')), _number(pose.get('y')),
                     _number(pose.get('z')))), _engine_rotation(
                         yaw, _number(pose.get('pitch')),
                         _number(pose.get('roll'))),
-                now=self._clock())
+                now=now)
             self._binding.update_vehicle_aim(
                 record['engine_id'], yaw,
                 _number(pose.get('aim_yaw', yaw)),
                 _number(pose.get('gun_pitch')))
+            if record.get('kind') in ('bot', 'player'):
+                turn = self._remember_remote_track_turn(record, yaw, now)
+                self._run_optional_feature(
+                    'remote track animation', self._update_bot_tracks,
+                    (record, state, now, turn))
 
     def _flush_pending_entities(self, now):
         for unused_key, record in list(self._records.items()):
@@ -12338,6 +12742,7 @@ class BattleRuntime(object):
             'wreck_known', record.get('spot_marker_visible', visible)))
         draw_vehicle = visible or (not alive and wreck_known)
         if record.get('native_remote'):
+            vehicle._offlineNativeDrawVisible = draw_vehicle
             vehicle.show(draw_vehicle)
             vehicle.targetCaps = [1] if visible else []
         else:
@@ -12567,6 +12972,18 @@ class BattleRuntime(object):
         return spotting.clamp(
             _field(gun, 'invisibilityFactorAtShot', 1.0), 0.0, 1.0)
 
+    def _foliage_camouflage_bonus(self, observer, target, fired_recently):
+        if (self._foliage is None or not self._optional_feature_enabled(
+                'foliage camouflage')):
+            return 0.0
+        try:
+            return self._foliage.camouflage_bonus(
+                observer, target, fired_recently)
+        except Exception as error:
+            self._foliage = None
+            self._warn_optional_failure('foliage camouflage', error)
+            return 0.0
+
     def _spot_line_of_sight(self, observer, target, target_descriptor,
                             target_moving=False, fired_recently=False,
                             target_still_seconds=0.0):
@@ -12597,10 +13014,8 @@ class BattleRuntime(object):
             has_line_of_sight = False
         if not has_line_of_sight:
             return False
-        foliage_bonus = 0.0
-        if self._foliage is not None:
-            foliage_bonus = self._foliage.camouflage_bonus(
-                observer_position, target, fired_recently)
+        foliage_bonus = self._foliage_camouflage_bonus(
+            observer_position, target, fired_recently)
         target_profile = self._spotting_profile(target_descriptor)
         additive, multiplier = self._invisibility_aspect(
             target_profile, target_moving,
@@ -12676,11 +13091,9 @@ class BattleRuntime(object):
                     {'circularVisionRadius': radius})
                 self._published_vision_radius = radius
             self._publish_optional_devices(descriptor, still_seconds)
-        except Exception:
+        except Exception as error:
             self._vision_feed_failed = True
-            sys.stdout.write(
-                '[Offline LAN 0.9.22] battle HUD vision feed disabled for '
-                'this round: %s\n' % traceback.format_exc().rstrip())
+            self._warn_optional_failure('battle HUD vision feed', error)
             return False
         return True
 
@@ -12831,7 +13244,9 @@ class BattleRuntime(object):
             if (visible, marker_visible) != previous:
                 changed = True
             if visible and not previous[0] and direct_seen:
-                self._present_direct_spot(record)
+                self._run_optional_feature(
+                    'spotting feedback', self._present_direct_spot,
+                    (record,))
             if visible and bool(record.get('direct_spot_visible', False)):
                 spotted_records.append(record)
         self._publish_spotted_targets(spotted_records)
@@ -13843,6 +14258,8 @@ class BattleRuntime(object):
         self._local_slide_speed = 0.0
         self._local_downhill = (0.0, 0.0, 0.0)
         self._local_slope_tangent = 0.0
+        self._local_ground_plane = None
+        self._local_surface_up_cosine = None
         self._local_air_lateral = (0.0, 0.0)
         self._local_pitch = 0.0
         self._local_roll = 0.0

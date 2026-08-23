@@ -30,15 +30,14 @@ _CHINESE = {
     "Only nations found in the original vehicle definitions.":
         "只显示原始车辆数据中存在的系别。",
     "Vehicle": "车辆",
-    "Vehicle code from the selected nation's original data.":
-        "所选系别原始数据中的车辆代号。",
+    "Type to search the selected nation's vehicles, then choose one or press "
+    "Enter.": "输入名称搜索所选系别的车辆，然后选中或按回车。",
     "Category": "类别",
     "Only categories with an existing safe field are shown.":
         "只显示包含可安全修改属性的类别。",
     "Field": "属性",
     "The exact package member and field path stay internal.":
         "实际数据包成员和属性路径由程序内部管理。",
-    "Inspect selected field": "查看所选属性",
     "Impact": "影响范围",
     "Original value": "原始值",
     "Current value": "当前值",
@@ -58,6 +57,9 @@ _CHINESE = {
     "The selected nation has no supported vehicles.":
         "所选系别中没有受支持的车辆。",
     "Choose one listed vehicle.": "请选择列表中的一辆车。",
+    "No vehicles match this search.": "没有匹配当前搜索的车辆。",
+    "Choose a matching vehicle or press Enter to load the first result.":
+        "请选中匹配车辆，或按回车加载第一项。",
     "This vehicle has no existing fields in the safe allowlist.":
         "该车辆没有位于安全允许列表中的属性。",
     "This category has no existing fields in the safe allowlist.":
@@ -145,6 +147,8 @@ class VehicleEditorWindow(object):
         self._language = i18n.resolve_language(language)
         self._log = log or (lambda unused_message: None)
         self._vehicle_choices = []
+        self._selected_vehicle_choice = None
+        self._filtered_vehicle_choices = []
         self._fields = []
         self._field_by_label = {}
         self._build(parent)
@@ -193,7 +197,9 @@ class VehicleEditorWindow(object):
             self._t("Only nations found in the original vehicle definitions."))
         row, self.vehicle_box = self._selector_row(
             frame, row, self._t("Vehicle"), self.vehicle,
-            self._t("Vehicle code from the selected nation's original data."))
+            self._t(
+                "Type to search the selected nation's vehicles, then choose "
+                "one or press Enter."), editable=True)
         row, self.category_box = self._selector_row(
             frame, row, self._t("Category"), self.category,
             self._t("Only categories with an existing safe field are shown."))
@@ -202,15 +208,12 @@ class VehicleEditorWindow(object):
             self._t("The exact package member and field path stay internal."))
         self.nation_box.bind("<<ComboboxSelected>>", self.refresh_vehicles)
         self.vehicle_box.bind(
-            "<<ComboboxSelected>>", self.refresh_vehicle_fields)
+            "<<ComboboxSelected>>", self.select_vehicle_from_dropdown)
+        self.vehicle_box.bind("<KeyRelease>", self.filter_vehicles)
+        self.vehicle_box.bind("<Return>", self.commit_vehicle_search)
+        self.vehicle_box.bind("<Escape>", self.restore_vehicle_selection)
         self.category_box.bind("<<ComboboxSelected>>", self.refresh_fields)
         self.field_box.bind("<<ComboboxSelected>>", self.inspect)
-
-        self.inspect_button = tk.Button(
-            frame, text=self._t("Inspect selected field"),
-            command=self.inspect)
-        self.inspect_button.grid(row=row, column=1, sticky="w", pady=(4, 8))
-        row += 1
 
         for label, variable in (
                 (self._t("Impact"), self.scope),
@@ -323,13 +326,14 @@ class VehicleEditorWindow(object):
             return "冲突：" + message[len("Conflict:"):].lstrip()
         return message
 
-    def _selector_row(self, frame, row, label, variable, hint, button=None):
+    def _selector_row(self, frame, row, label, variable, hint, button=None,
+                      editable=False):
         tk = self._tk
         tk.Label(frame, text=label, anchor="w").grid(
             row=row, column=0, sticky="w")
         box = self._ttk.Combobox(
             frame, textvariable=variable, values=(), width=76,
-            state="readonly")
+            state="normal" if editable else "readonly")
         box.grid(row=row, column=1, columnspan=1 if button else 2,
                  sticky="we", padx=(8, 8 if button else 0))
         if button:
@@ -408,40 +412,158 @@ class VehicleEditorWindow(object):
 
     def refresh_vehicles(self, unused_event=None):
         nation = self.nation.get().strip()
-        choices = [choice for choice in self._vehicle_choices
-                   if choice["nation"] == nation]
-        labels = [self._choice_label(choice) for choice in choices]
-        self.vehicle_box.config(values=tuple(labels))
-        if not labels:
+        choices = self._nation_vehicle_choices(nation)
+        self._show_vehicle_choices(choices)
+        if not choices:
             return self._show_error(
                 self._t("The selected nation has no supported vehicles."),
                 clear_contract=True)
         selected = self.vehicle.get().strip()
-        selected_choice = next((
-            choice for choice in choices
-            if selected in (choice["vehicle"], self._choice_label(choice))),
-            None)
+        selected_choice = self._resolve_vehicle_choice(
+            selected, choices=choices)
         if selected_choice is None:
             selected_choice = next((
                 choice for choice in choices
                 if choice["vehicle"] == DEFAULT_VEHICLE), choices[0])
         self.vehicle.set(self._choice_label(selected_choice))
-        return self.refresh_vehicle_fields()
+        return self._load_vehicle_fields(selected_choice)
 
     @staticmethod
-    def _choice_label(choice):
-        return choice.get("label") or choice["vehicle"]
+    def _vehicle_display_id(vehicle):
+        value = str(vehicle or "")
+        prefix, separator, remainder = value.partition("_")
+        if (separator and remainder and
+                any(character.isdigit() for character in prefix)):
+            return remainder
+        return value
+
+    @classmethod
+    def _choice_label(cls, choice):
+        """Show the stock/localized name without repeating its resource ID."""
+        label = str(choice.get("label") or choice["vehicle"])
+        display_id = cls._vehicle_display_id(choice.get("vehicle", ""))
+        for opening, closing in ((" (", ")"), ("（", "）")):
+            suffix = opening + display_id + closing
+            if display_id and label.endswith(suffix):
+                return label[:-len(suffix)].rstrip()
+        return label
+
+    def _nation_vehicle_choices(self, nation=None):
+        nation = self.nation.get().strip() if nation is None else nation
+        return [choice for choice in self._vehicle_choices
+                if choice["nation"] == nation]
+
+    def _show_vehicle_choices(self, choices):
+        self._filtered_vehicle_choices = list(choices)
+        self.vehicle_box.config(values=tuple(
+            self._choice_label(choice) for choice in choices))
+
+    def _vehicle_search_matches(self, choice, query):
+        query = query.strip().casefold()
+        if not query:
+            return True
+        searchable = (
+            self._choice_label(choice), choice.get("label", ""),
+            choice.get("vehicle", ""),
+            self._vehicle_display_id(choice.get("vehicle", "")))
+        return any(query in str(value).casefold() for value in searchable)
+
+    def _resolve_vehicle_choice(self, value, choices=None,
+                                allow_partial=False):
+        choices = (self._nation_vehicle_choices() if choices is None
+                   else list(choices))
+        needle = value.strip().casefold()
+        exact = [
+            choice for choice in choices
+            if needle in (
+                self._choice_label(choice).casefold(),
+                str(choice.get("label", "")).casefold(),
+                str(choice.get("vehicle", "")).casefold(),
+                self._vehicle_display_id(
+                    choice.get("vehicle", "")).casefold())]
+        if exact:
+            if self._selected_vehicle_choice in exact:
+                return self._selected_vehicle_choice
+            return exact[0]
+        if allow_partial:
+            return next((choice for choice in choices
+                         if self._vehicle_search_matches(choice, value)), None)
+        return None
+
+    def filter_vehicles(self, event=None):
+        if getattr(event, "keysym", "") in (
+                "Return", "KP_Enter", "Escape", "Up", "Down", "Prior",
+                "Next"):
+            return True
+        query = self.vehicle.get().strip()
+        choices = [
+            choice for choice in self._nation_vehicle_choices()
+            if self._vehicle_search_matches(choice, query)]
+        self._show_vehicle_choices(choices)
+        selected_label = (
+            self._choice_label(self._selected_vehicle_choice)
+            if (self._selected_vehicle_choice is not None and
+                self._selected_vehicle_choice.get("nation") ==
+                self.nation.get().strip()) else None)
+        if selected_label == self.vehicle.get().strip():
+            return True
+        self.apply_button.config(state="disabled")
+        if not choices:
+            self.status.set(self._t("No vehicles match this search."))
+            return False
+        self.status.set(self._t(
+            "Choose a matching vehicle or press Enter to load the first "
+            "result."))
+        return True
+
+    def commit_vehicle_search(self, unused_event=None):
+        choice = self._resolve_vehicle_choice(
+            self.vehicle.get(), allow_partial=True)
+        if choice is None:
+            self._show_vehicle_choices(self._nation_vehicle_choices())
+            return self._show_error(
+                self._t("No vehicles match this search."))
+        self.vehicle.set(self._choice_label(choice))
+        self._show_vehicle_choices(self._nation_vehicle_choices())
+        return self._load_vehicle_fields(choice)
+
+    def restore_vehicle_selection(self, unused_event=None):
+        choices = self._nation_vehicle_choices()
+        self._show_vehicle_choices(choices)
+        choice = self._selected_vehicle_choice
+        if choice not in choices:
+            choice = choices[0] if choices else None
+        if choice is None:
+            return self._show_error(
+                self._t("The selected nation has no supported vehicles."),
+                clear_contract=True)
+        self.vehicle.set(self._choice_label(choice))
+        return self._load_vehicle_fields(choice)
+
+    def select_vehicle_from_dropdown(self, unused_event=None):
+        try:
+            index = int(self.vehicle_box.current())
+        except (AttributeError, TypeError, ValueError):
+            index = -1
+        if 0 <= index < len(self._filtered_vehicle_choices):
+            choice = self._filtered_vehicle_choices[index]
+            self.vehicle.set(self._choice_label(choice))
+            self._show_vehicle_choices(self._nation_vehicle_choices())
+            return self._load_vehicle_fields(choice)
+        return self.refresh_vehicle_fields()
 
     def refresh_vehicle_fields(self, unused_event=None):
-        nation = self.nation.get().strip()
         vehicle = self.vehicle.get().strip()
-        choice = next((item for item in self._vehicle_choices
-                       if item["nation"] == nation and
-                       vehicle in (
-                           item["vehicle"], self._choice_label(item))), None)
+        choice = self._resolve_vehicle_choice(vehicle)
         if choice is None:
             return self._show_error(
                 self._t("Choose one listed vehicle."), clear_contract=True)
+        self._show_vehicle_choices(self._nation_vehicle_choices())
+        return self._load_vehicle_fields(choice)
+
+    def _load_vehicle_fields(self, choice):
+        self._selected_vehicle_choice = choice
+        self.vehicle.set(self._choice_label(choice))
         try:
             fields = self._service.list_vehicle_field_choices(
                 self._game_root, choice["member"])

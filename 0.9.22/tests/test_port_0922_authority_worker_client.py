@@ -348,6 +348,12 @@ class AuthorityWorkerClientTests(unittest.TestCase):
 
     def test_welcome_roster_and_runtime_projection_keep_dummy_local(self):
         events = []
+        human = _human()
+        human.update({
+            'vehicle': 'germany:G54_E-50',
+            'health': 1750,
+            'max_health': 1750,
+        })
         client = AuthorityWorkerLANClient(
             '127.0.0.1', 28782,
             on_event=lambda kind, message: events.append((kind, message)))
@@ -378,7 +384,7 @@ class AuthorityWorkerClientTests(unittest.TestCase):
             'host_player_id': 1, 'phase': 'waiting', 'round_id': 0,
             'state_revision': 2,
             'bot_authority_id': WORKER_AUTHORITY_ID,
-            'authority_epoch': 0, 'players': [_human()],
+            'authority_epoch': 0, 'players': [dict(human)],
         }
         client._handle_message(roster)
 
@@ -386,7 +392,7 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         self.assertEqual(10, client.server_time_ms)
         self.assertEqual([1], [value['id'] for value in client.roster])
 
-        start_players = [_human()]
+        start_players = [dict(human)]
         start = {
             'type': 'battle_start', 'protocol': PROTOCOL_VERSION,
             'map': '01_karelia', 'phase': 'loading', 'round_id': 1,
@@ -405,6 +411,10 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         dummy = projected['players'][-1]
         self.assertEqual(WORKER_DUMMY_Y, dummy['y'])
         self.assertTrue(dummy['world_pose'])
+        self.assertEqual('germany:G54_E-50', dummy['vehicle'])
+        self.assertEqual(1, dummy['health'])
+        self.assertEqual(1, dummy['max_health'])
+        self.assertEqual(1, client.max_health)
         self.assertEqual(WORKER_AUTHORITY_ID, client.player_id)
 
         snapshot = {
@@ -413,7 +423,7 @@ class AuthorityWorkerClientTests(unittest.TestCase):
             'authority_epoch': 0, 'projectile_revision': 0,
             'bot_state_revision': 0,
             'bot_authority_id': WORKER_AUTHORITY_ID,
-            'bot_manifest': [], 'players': [_human()], 'bots': [],
+            'bot_manifest': [], 'players': [dict(human)], 'bots': [],
             'projectiles': [],
         }
         client._handle_message(snapshot)
@@ -421,6 +431,10 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         self.assertEqual('snapshot', events[-1][0])
         self.assertEqual([1, WORKER_AUTHORITY_ID], [
             value['id'] for value in client.last_snapshot['players']])
+        snapshot_dummy = client.last_snapshot['players'][-1]
+        self.assertEqual('germany:G54_E-50', snapshot_dummy['vehicle'])
+        self.assertEqual(1, snapshot_dummy['health'])
+        self.assertEqual(1, snapshot_dummy['max_health'])
         self.assertIsNone(client.last_error)
 
     def test_battle_ready_carries_no_dummy_or_participant_identity(self):

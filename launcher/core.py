@@ -86,10 +86,14 @@ WORKER_READY_MARKER_FILENAME_0922 = "offline-worker.ready"
 WORKER_FAILURE_LOG_FILENAME_0922 = "offline-worker-starter.log"
 SERVER_LOG_FILENAME = "server.log"
 PLAYER_ENGINE_CONFIG_0922 = "engine_config.offline-player.xml"
+PLAYER_ARGUMENT_0922 = "--player"
 WORKER_ONLY_ARGUMENT_0922 = "--worker-only"
 PAIRED_PLAYER_ARGUMENT_0922 = "--paired-player"
+STOP_STARTER_ARGUMENT_0922 = "--stop-starter"
 WORKER_READY_TIMEOUT_SECONDS_0922 = 60.0
 WORKER_FAILURE_DRAIN_SECONDS_0922 = 0.5
+STARTER_CONTROL_TIMEOUT_SECONDS_0922 = 5.0
+STARTER_SHUTDOWN_TIMEOUT_SECONDS_0922 = 45.0
 
 _CLIENT_RUNTIME_FILES_0_9_22 = (
     WORKER_STARTER_FILENAME_0922,
@@ -195,15 +199,11 @@ def server_log_path(executable=None, frozen=None):
 
 def visible_client_command(game_root, port_version, paired_worker=False):
     """Build the visible client command for one supported port."""
-    if port_version == PORT_0_9_22 and paired_worker:
-        return [worker_starter_executable(game_root),
-                PAIRED_PLAYER_ARGUMENT_0922]
-    command = [game_executable(game_root)]
     if port_version == PORT_0_9_22:
-        command.extend([
-            "--config", PLAYER_ENGINE_CONFIG_0922,
-            "--logFilePrefix", "offline-player-",
-        ])
+        argument = (PAIRED_PLAYER_ARGUMENT_0922 if paired_worker
+                    else PLAYER_ARGUMENT_0922)
+        return [worker_starter_executable(game_root), argument]
+    command = [game_executable(game_root)]
     return command
 
 
@@ -231,6 +231,17 @@ def visible_client_environment(port_version, host=LOCAL_HOST,
 
 def worker_child_command(game_root):
     return [worker_starter_executable(game_root), WORKER_ONLY_ARGUMENT_0922]
+
+
+def starter_stop_command(game_root, process_id):
+    try:
+        process_id = int(process_id)
+    except (TypeError, ValueError):
+        raise LauncherError("The starter process identifier is invalid.")
+    if process_id <= 0:
+        raise LauncherError("The starter process identifier is invalid.")
+    return [worker_starter_executable(game_root),
+            STOP_STARTER_ARGUMENT_0922, str(process_id)]
 
 
 def worker_environment(game_root, host=LOCAL_HOST,
@@ -508,6 +519,15 @@ def write_settings(game_root, port_version, mode, host, port, name=None):
 
 SERVER_PAYLOAD_DIR = "servers"
 CLIENT_PAYLOAD_DIR = "client"
+PROCDUMP_FILENAME = "procdump.exe"
+PROCDUMP_RUNTIME_DIR = "tools"
+PROCDUMP_DOWNLOAD_URL = (
+    "https://download.sysinternals.com/files/Procdump.zip")
+PROCDUMP_LICENSE_URL = (
+    "https://learn.microsoft.com/en-us/sysinternals/license-terms")
+PROCDUMP_DOWNLOAD_TIMEOUT_SECONDS = 30
+PROCDUMP_ARCHIVE_MAX_BYTES = 8 * 1024 * 1024
+PROCDUMP_EXECUTABLE_MAX_BYTES = 8 * 1024 * 1024
 INSTALL_MARKER_NAME = "launcher_install.json"
 
 # Where each port keeps the files the launcher must not delete, and the
@@ -572,6 +592,237 @@ _CLIENT_INSTALL = {
 
 def repository_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def procdump_executable(base_dir=None):
+    """Resolve the user-downloaded ProcDump executable."""
+    if base_dir is None:
+        base_dir = os.path.dirname(os.path.abspath(settings_path()))
+    return os.path.join(
+        base_dir, PROCDUMP_RUNTIME_DIR, PROCDUMP_FILENAME)
+
+
+def _is_x86_pe(payload):
+    """Recognize the 32-bit PE image required by the #1513 client."""
+    import struct
+
+    if len(payload) < 64 or payload[:2] != b"MZ":
+        return False
+    pe_offset = struct.unpack("<I", payload[60:64])[0]
+    if pe_offset < 64 or pe_offset + 26 > len(payload):
+        return False
+    if payload[pe_offset:pe_offset + 4] != b"PE\0\0":
+        return False
+    machine = struct.unpack("<H", payload[pe_offset + 4:pe_offset + 6])[0]
+    optional_magic = struct.unpack(
+        "<H", payload[pe_offset + 24:pe_offset + 26])[0]
+    return machine == 0x014C and optional_magic == 0x010B
+
+
+def _procdump_authenticode_is_trusted(path):
+    """Use Windows' Authenticode policy provider for downloaded code."""
+    if os.name != "nt":
+        return True
+
+    import ctypes
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = (
+            ("Data1", wintypes.DWORD),
+            ("Data2", wintypes.WORD),
+            ("Data3", wintypes.WORD),
+            ("Data4", ctypes.c_ubyte * 8),
+        )
+
+    class WINTRUST_FILE_INFO(ctypes.Structure):
+        _fields_ = (
+            ("cbStruct", wintypes.DWORD),
+            ("pcwszFilePath", wintypes.LPCWSTR),
+            ("hFile", wintypes.HANDLE),
+            ("pgKnownSubject", ctypes.POINTER(GUID)),
+        )
+
+    class WINTRUST_DATA(ctypes.Structure):
+        _fields_ = (
+            ("cbStruct", wintypes.DWORD),
+            ("pPolicyCallbackData", ctypes.c_void_p),
+            ("pSIPClientData", ctypes.c_void_p),
+            ("dwUIChoice", wintypes.DWORD),
+            ("fdwRevocationChecks", wintypes.DWORD),
+            ("dwUnionChoice", wintypes.DWORD),
+            ("pFile", ctypes.POINTER(WINTRUST_FILE_INFO)),
+            ("dwStateAction", wintypes.DWORD),
+            ("hWVTStateData", wintypes.HANDLE),
+            ("pwszURLReference", wintypes.LPCWSTR),
+            ("dwProvFlags", wintypes.DWORD),
+            ("dwUIContext", wintypes.DWORD),
+        )
+
+    policy = GUID(
+        0x00AAC56B, 0xCD44, 0x11D0,
+        (ctypes.c_ubyte * 8)(
+            0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE))
+    file_info = WINTRUST_FILE_INFO(
+        ctypes.sizeof(WINTRUST_FILE_INFO),
+        os.path.abspath(path), None, None)
+    trust_data = WINTRUST_DATA()
+    trust_data.cbStruct = ctypes.sizeof(WINTRUST_DATA)
+    trust_data.dwUIChoice = 2  # WTD_UI_NONE
+    trust_data.fdwRevocationChecks = 0  # WTD_REVOKE_NONE
+    trust_data.dwUnionChoice = 1  # WTD_CHOICE_FILE
+    trust_data.pFile = ctypes.pointer(file_info)
+    trust_data.dwStateAction = 1  # WTD_STATEACTION_VERIFY
+    # Do not make an additional network request while checking the signature.
+    trust_data.dwProvFlags = 0x10 | 0x1000
+
+    try:
+        verify = ctypes.windll.wintrust.WinVerifyTrust
+        verify.argtypes = (
+            wintypes.HWND, ctypes.POINTER(GUID), ctypes.c_void_p)
+        verify.restype = wintypes.LONG
+        result = verify(
+            wintypes.HWND(-1), ctypes.byref(policy),
+            ctypes.byref(trust_data))
+        return result == 0
+    except Exception:
+        return False
+    finally:
+        if "verify" in locals():
+            trust_data.dwStateAction = 2  # WTD_STATEACTION_CLOSE
+            try:
+                verify(
+                    wintypes.HWND(-1), ctypes.byref(policy),
+                    ctypes.byref(trust_data))
+            except Exception:
+                pass
+
+
+def procdump_is_installed(path=None):
+    """Accept only a regular x86 PE file at the launcher-owned cache path."""
+    path = path or procdump_executable()
+    try:
+        if not os.path.isfile(path):
+            return False
+        size = os.path.getsize(path)
+        if size <= 2 or size > PROCDUMP_EXECUTABLE_MAX_BYTES:
+            return False
+        with open(path, "rb") as stream:
+            valid_pe = _is_x86_pe(
+                stream.read(PROCDUMP_EXECUTABLE_MAX_BYTES + 1))
+        return valid_pe and _procdump_authenticode_is_trusted(path)
+    except (IOError, OSError):
+        return False
+
+
+def download_procdump(path=None, opener=None):
+    """Download ProcDump from Microsoft and install its 32-bit executable."""
+    import io
+    import tempfile
+    import urllib.parse
+    import urllib.request
+    import zipfile
+
+    path = path or procdump_executable()
+    if procdump_is_installed(path):
+        return path
+    opener = opener or urllib.request.urlopen
+    response = None
+    temporary = None
+    try:
+        response = opener(
+            PROCDUMP_DOWNLOAD_URL,
+            timeout=PROCDUMP_DOWNLOAD_TIMEOUT_SECONDS)
+        geturl = getattr(response, "geturl", None)
+        final_url = geturl() if callable(geturl) else PROCDUMP_DOWNLOAD_URL
+        parsed_url = urllib.parse.urlparse(final_url)
+        if (parsed_url.scheme.lower() != "https" or
+                (parsed_url.hostname or "").lower() !=
+                "download.sysinternals.com"):
+            raise LauncherError(
+                "Microsoft's ProcDump download redirected to an "
+                "unexpected site.")
+        headers = getattr(response, "headers", None)
+        declared_size = None
+        if headers is not None:
+            declared_size = headers.get("Content-Length")
+        if declared_size not in (None, ""):
+            try:
+                declared_size = int(declared_size)
+            except (TypeError, ValueError):
+                raise LauncherError(
+                    "Microsoft's ProcDump download has an invalid size.")
+            if (declared_size <= 0 or
+                    declared_size > PROCDUMP_ARCHIVE_MAX_BYTES):
+                raise LauncherError(
+                    "Microsoft's ProcDump download is unexpectedly large.")
+        payload = response.read(PROCDUMP_ARCHIVE_MAX_BYTES + 1)
+        if len(payload) > PROCDUMP_ARCHIVE_MAX_BYTES:
+            raise LauncherError(
+                "Microsoft's ProcDump download is unexpectedly large.")
+        if declared_size is not None and len(payload) != declared_size:
+            raise LauncherError(
+                "Microsoft's ProcDump download was incomplete.")
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(payload), "r")
+        except (IOError, OSError, zipfile.BadZipFile) as error:
+            raise LauncherError(
+                "Microsoft's ProcDump download is not a valid ZIP: %s" %
+                error)
+        try:
+            members = [
+                info for info in archive.infolist()
+                if info.filename.replace("\\", "/").lower() ==
+                PROCDUMP_FILENAME]
+            if len(members) != 1:
+                raise LauncherError(
+                    "Microsoft's ProcDump ZIP has no unique procdump.exe.")
+            member = members[0]
+            if (member.is_dir() or member.flag_bits & 0x1 or
+                    member.file_size <= 2 or
+                    member.file_size > PROCDUMP_EXECUTABLE_MAX_BYTES):
+                raise LauncherError(
+                    "Microsoft's ProcDump executable has an invalid size.")
+            executable = archive.read(member)
+        finally:
+            archive.close()
+        if (len(executable) != member.file_size or
+                not _is_x86_pe(executable)):
+            raise LauncherError(
+                "Microsoft's ProcDump executable is invalid.")
+
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".procdump-", suffix=".tmp", dir=directory or None)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(executable)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if not _procdump_authenticode_is_trusted(temporary):
+            raise LauncherError(
+                "Microsoft's ProcDump signature could not be verified by "
+                "Windows.")
+        os.replace(temporary, path)
+        temporary = None
+        return path
+    except LauncherError:
+        raise
+    except Exception as error:
+        raise LauncherError(
+            "ProcDump could not be downloaded from Microsoft: %s" % error)
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+        if temporary is not None:
+            try:
+                os.remove(temporary)
+            except (IOError, OSError):
+                pass
 
 
 def server_root(base_dir=None):
@@ -1599,23 +1850,25 @@ def game_window_is_visible(game_root, enumerator=None):
 def wait_for_paired_player_exit(
         process, game_root, window_visible=None, required_process=None,
         close_grace=PAIRED_PLAYER_WINDOW_CLOSE_GRACE_SECONDS,
-        poll=PAIRED_PLAYER_WINDOW_POLL_SECONDS, sleep=None, clock=None):
-    """Wait for the paired player and its required simulation process.
+        poll=PAIRED_PLAYER_WINDOW_POLL_SECONDS, sleep=None, clock=None,
+        stop_process=None,
+        shutdown_timeout=GAME_SHUTDOWN_TIMEOUT_SECONDS):
+    """Wait for the paired player's native starter process to exit.
 
-    The #1513 client can destroy its only visible window without terminating
-    its process. Only treat that as closure after a player window has first
-    appeared and then remained absent for the full grace period. If the
-    required worker exits first, terminate the visible client instead of
-    allowing it to continue without its authority.
+    The starter owns the complete visible-client job and follows process
+    handoffs. Its process handle is therefore the lifecycle authority. The
+    #1513 client destroys and recreates its top-level window while loading a
+    map, so window visibility must never terminate a still-live player job.
+
+    The unused compatibility arguments remain for older launcher integrations;
+    they no longer participate in the shutdown decision.
+
+    If the required hidden worker exits, retire the paired player job instead
+    of leaving a visible client running without its simulation authority.
     """
     import time as time_module
 
     sleep = sleep or time_module.sleep
-    clock = clock or time_module.monotonic
-    window_visible = window_visible or (
-        lambda: game_window_is_visible(game_root))
-    window_seen = False
-    missing_since = None
     while True:
         exit_code = process.poll()
         if exit_code is not None:
@@ -1633,29 +1886,6 @@ def wait_for_paired_player_exit(
                 process.kill()
                 exit_code = process.wait()
             return exit_code, False
-        visible = window_visible()
-        now = clock()
-        if visible is True:
-            window_seen = True
-            missing_since = None
-        elif visible is False and window_seen:
-            if missing_since is None:
-                missing_since = now
-            elif now - missing_since >= max(0.0, float(close_grace)):
-                try:
-                    process.terminate()
-                except OSError:
-                    pass
-                try:
-                    exit_code = process.wait(
-                        timeout=GAME_SHUTDOWN_TIMEOUT_SECONDS)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    exit_code = process.wait()
-                return exit_code, True
-        else:
-            # An unavailable lookup does not count toward a confirmed absence.
-            missing_since = None
         sleep(max(0.001, float(poll)))
 
 

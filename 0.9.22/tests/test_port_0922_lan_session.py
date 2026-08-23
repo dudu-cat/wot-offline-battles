@@ -76,6 +76,7 @@ class _Client(object):
         self.requests = []
         self.selections = []
         self.team_selections = []
+        self.team_size_selections = []
         self.descriptor_bundles = []
         self.receipt_acks = []
 
@@ -111,6 +112,16 @@ class _Client(object):
         if not self.ready or self.phase != 'waiting':
             return False
         self.team_selections.append(team)
+        return True
+
+    def has_team_size_selection(self):
+        return True
+
+    def set_team_size(self, team, size):
+        if (not self.ready or self.phase != 'waiting' or
+                self.player_id != self.host_player_id):
+            return False
+        self.team_size_selections.append((team, size))
         return True
 
     def send_descriptor_bundle(self, projections, requested=None,
@@ -229,6 +240,12 @@ class _BattleRuntime(object):
 class LANSessionTests(unittest.TestCase):
     def setUp(self):
         self.module = _load()
+        self.saved_room_states = []
+        self.module.port_config.load_waiting_room_state = mock.Mock(
+            return_value={
+                'schema': 1, 'map': None, 'team': 0, 'team_sizes': {}})
+        self.module.port_config.save_waiting_room_state = mock.Mock(
+            side_effect=self._save_room_state)
         self.clients = []
         self.queues = []
         self.opens = []
@@ -269,6 +286,15 @@ class LANSessionTests(unittest.TestCase):
         self.session._picker_requested = True
         self.client = self.clients[0]
 
+    def _save_room_state(self, value):
+        self.saved_room_states.append({
+            'schema': value.get('schema'),
+            'map': value.get('map'),
+            'team': value.get('team'),
+            'team_sizes': dict(value.get('team_sizes') or {}),
+        })
+        return True
+
     def emit(self, kind, message):
         if kind == 'welcome':
             self.client.ready = True
@@ -287,8 +313,71 @@ class LANSessionTests(unittest.TestCase):
         self.assertTrue(self.session.select_team(2))
 
         self.assertEqual([2], self.client.team_selections)
+        self.assertEqual(2, self.saved_room_states[-1]['team'])
         self.assertEqual(
             {1: 0, 2: 0}, self.session._team_status()['counts'])
+
+    def test_host_changes_team_sizes_without_restarting_the_session(self):
+        self.client.ready = True
+        self.client.phase = 'waiting'
+        self.session.state = 'waiting'
+
+        self.assertTrue(self.session.set_team_size(1, 4))
+        self.assertTrue(self.session.set_team_size(2, 9))
+
+        self.assertEqual([(1, 4), (2, 9)],
+                         self.client.team_size_selections)
+        self.assertEqual(
+            {1: 4, 2: 9}, self.saved_room_states[-1]['team_sizes'])
+        self.assertEqual(1, self.client.start_calls)
+        self.assertTrue(self.session._team_status()['size_supported'])
+
+    def test_saved_room_choices_are_applied_after_the_server_welcome(self):
+        self.module.port_config.load_waiting_room_state.return_value = {
+            'schema': 1,
+            'map': '05_prohorovka',
+            'team': 2,
+            'team_sizes': {1: 4, 2: 9},
+        }
+        clients = []
+
+        def client_factory(*args, **kwargs):
+            client = _Client(*args, **kwargs)
+            clients.append(client)
+            return client
+
+        session = self.module.LANSession(
+            {'host': '10.0.0.5', 'port': 28782, 'name': 'P',
+             'vehicle': 'ussr:MS-1'},
+            client_factory=client_factory,
+            vehicle_provider=lambda: ('ussr:R11_MS-1', 90),
+            queue_factory=lambda *args, **kwargs: _Queue(*args, **kwargs),
+            room_factory=lambda *args, **kwargs: _Room(*args, **kwargs),
+            queue_screen_factory=lambda on_exit: _QueueScreen(on_exit),
+            status_notifier=lambda unused: None)
+
+        self.assertTrue(session.start())
+        client = clients[0]
+        self.assertEqual(2, client.requested_team)
+        client.ready = True
+        client.on_event('welcome', {
+            'phase': 'waiting',
+            'map_pool': ['01_karelia', '05_prohorovka'],
+            'host_player_id': 'p1',
+        })
+
+        self.assertEqual([(1, 4), (2, 9)],
+                         client.team_size_selections)
+        self.assertEqual([2], client.team_selections)
+
+    def test_guest_cannot_change_team_sizes(self):
+        self.client.ready = True
+        self.client.phase = 'waiting'
+        self.client.host_player_id = 'someone-else'
+        self.session.state = 'waiting'
+
+        self.assertFalse(self.session.set_team_size(1, 4))
+        self.assertEqual([], self.client.team_size_selections)
 
     def test_postbattle_request_retries_after_failure_then_completes_once(self):
         class Store(object):
@@ -1528,6 +1617,7 @@ class LANSessionTests(unittest.TestCase):
         self.assertTrue(self.queues[0].request_start('01_karelia'))
         self.assertFalse(self.queues[0].request_start('01_karelia'))
         self.assertEqual(['01_karelia'], self.client.requests)
+        self.assertEqual('01_karelia', self.saved_room_states[-1]['map'])
         self.assertEqual([], self.battle_runtime.started)
 
         self.emit('start_denied', {'reason': 'host only'})
@@ -2452,6 +2542,11 @@ class LANSessionRoomTests(unittest.TestCase):
 
     def setUp(self):
         self.module = _load()
+        self.module.port_config.load_waiting_room_state = mock.Mock(
+            return_value={
+                'schema': 1, 'map': None, 'team': 0, 'team_sizes': {}})
+        self.module.port_config.save_waiting_room_state = mock.Mock(
+            return_value=True)
         self.clients = []
         self.queues = []
         self.rooms = []

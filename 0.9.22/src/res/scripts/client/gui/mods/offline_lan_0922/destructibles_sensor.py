@@ -22,6 +22,7 @@ _DIAGNOSTIC_EMIT_SECONDS = 0.25
 _DIAGNOSTIC_CHUNK_LIMIT = 24
 _DIAGNOSTIC_PENDING_LIMIT = 4
 _DIAGNOSTIC_CONTACT_LIMIT = 32
+_ISOLATION_LOG_TYPE_LIMIT = 11
 _destructible_catalog = None
 _diagnostic_writer = None
 
@@ -50,6 +51,127 @@ def _normalized_filename(filename):
 	return filename.replace('\\', '/').strip().lower()
 
 
+def _destructible_isolated_1513(chunk_id, item_index=None):
+	"""Return whether runtime validation quarantined this native identity."""
+	chunk_id = int(chunk_id)
+	if chunk_id in globals().get('g_offh_destr_isolated_chunks', ()):
+		return True
+	if item_index is None:
+		return False
+	return (chunk_id, int(item_index)) in globals().get(
+		'g_offh_destr_isolated_slots', ())
+
+
+def is_isolated_1513(chunk_id, item_index):
+	"""Expose the quarantine gate to canonical LAN event replay."""
+	return _destructible_isolated_1513(chunk_id, item_index)
+
+
+def _drop_isolated_destructible_1513(chunk_id, item_index=None):
+	"""Remove synthetic collision state without touching native authority."""
+	chunk_id = int(chunk_id)
+	identity = (chunk_id, int(item_index)) if item_index is not None else None
+	instances = globals().get('g_offh_destr_instances', {})
+	identities = [key for key in list(instances)
+		if key[0] == chunk_id and (identity is None or key == identity)]
+	active = globals().get('g_offh_destr_falling_active', {})
+	contact_bins = globals().get('g_offh_destr_contact_bins', {})
+	for isolated_identity in identities:
+		instance = instances.pop(isolated_identity)
+		bin_keys = (instance.get('bin_keys')
+			if isinstance(instance, dict) else None)
+		if bin_keys is None:
+			# Compatibility fixtures can install an instance without its reverse
+			# index.  Real registered instances always retain the exact bin keys.
+			bin_keys = list(contact_bins)
+		for bin_key in bin_keys:
+			members = contact_bins.get(bin_key)
+			if members is None:
+				continue
+			members.discard(isolated_identity)
+			if not members:
+				contact_bins.pop(bin_key, None)
+	for active_identity in list(active):
+		if (active_identity[0] == chunk_id and
+				(identity is None or active_identity == identity)):
+			active.pop(active_identity, None)
+	pending = globals().get('g_offh_destr_pending', {})
+	for key in list(pending):
+		if (key[0] == chunk_id and
+				(identity is None or key[:2] == identity)):
+			pending.pop(key, None)
+	globals().get('g_offh_destr_broken_cache', {}).pop(chunk_id, None)
+	if identity is None:
+		state = globals().get('g_offh_tree_state')
+		if isinstance(state, dict):
+			state.get('chunks', {}).pop(chunk_id, None)
+
+
+def _log_destructible_validation_1513(
+		failure_type, action, chunk_id, item_index=None, detail=None):
+	"""Emit one bounded sample per validation type and battle."""
+	chunk_id = int(chunk_id)
+	if item_index is not None:
+		item_index = int(item_index)
+	# A systemic offset can affect hundreds of slots at once.  Preserve the
+	# exact runtime action, but report only the first sample of each failure type.
+	key = str(failure_type)
+	logged = globals().setdefault('g_offh_destr_isolation_logs', set())
+	if key in logged:
+		return
+	if len(logged) >= _ISOLATION_LOG_TYPE_LIMIT:
+		if globals().get('g_offh_destr_isolation_log_capped'):
+			return
+		globals()['g_offh_destr_isolation_log_capped'] = True
+		try:
+			import sys
+			sys.stdout.write(
+				'[Offline LAN 0.9.22] DESTR validation logs capped '
+				'limit=12 additional_types=suppressed_for_battle\n')
+		except Exception:
+			pass
+		return
+	logged.add(key)
+	parts = [
+		'[Offline LAN 0.9.22] DESTR %s' % action,
+		'type=%s' % failure_type,
+		'scope=%s' % ('chunk' if item_index is None else 'slot'),
+		'chunk=%s' % chunk_id,
+	]
+	if item_index is not None:
+		parts.append('item=%s' % item_index)
+	parts.append('repeats=suppressed_for_battle')
+	if detail is not None:
+		try:
+			text = str(detail).replace('\n', '?').replace('\r', '?')[:240]
+		except Exception:
+			text = 'unavailable'
+		parts.append('detail=%s' % text)
+	try:
+		import sys
+		sys.stdout.write('%s\n' % ' '.join(parts))
+	except Exception:
+		# Runtime handling is authoritative; the log stream is observational.
+		pass
+
+
+def _isolate_destructible_1513(
+		failure_type, chunk_id, item_index=None, detail=None):
+	"""Quarantine one unsafe slot/chunk and emit one bounded English line."""
+	chunk_id = int(chunk_id)
+	if item_index is None:
+		globals().setdefault(
+			'g_offh_destr_isolated_chunks', set()).add(chunk_id)
+	else:
+		item_index = int(item_index)
+		globals().setdefault(
+			'g_offh_destr_isolated_slots', set()).add(
+				(chunk_id, item_index))
+	_drop_isolated_destructible_1513(chunk_id, item_index)
+	_log_destructible_validation_1513(
+		failure_type, 'isolated', chunk_id, item_index, detail)
+
+
 def _native_chunk_destructible_count_1513(manager, chunk_id):
 	"""Read the count written by ``game.wg_onChunkLoad`` on pinned #1513.
 
@@ -62,17 +184,19 @@ def _native_chunk_destructible_count_1513(manager, chunk_id):
 	loaded = getattr(
 		manager, '_DestructiblesManager__loadedChunkIDs', None)
 	if not isinstance(loaded, dict):
-		raise RuntimeError(
-			'#1513 destructibles manager loaded-count ABI is unavailable')
+		_isolate_destructible_1513(
+			'native_count_abi', chunk_id,
+			detail='manager loaded-count map is unavailable')
+		return None
 	chunk_id = int(chunk_id)
 	if chunk_id not in loaded:
 		return None
 	count = loaded[chunk_id]
 	if (isinstance(count, bool) or not isinstance(count, _INTEGER_TYPES) or
 			count < 0):
-		raise RuntimeError(
-			'#1513 native destructible count is invalid: chunk=%s value=%r' %
-			(chunk_id, count))
+		_isolate_destructible_1513(
+			'native_count_value', chunk_id, detail='value=%r' % (count,))
+		return None
 	return int(count)
 
 
@@ -256,6 +380,10 @@ def _clear_runtime_registry():
 			'g_offh_destr_contact_bins', 'g_offh_destr_pending',
 			'g_offh_destr_falling_active', 'g_offh_destr_ground_skips',
 			'g_offh_destr_broken_cache',
+			'g_offh_destr_isolated_chunks',
+			'g_offh_destr_isolated_slots',
+			'g_offh_destr_isolation_logs',
+			'g_offh_destr_isolation_log_capped',
 			'g_offh_destr_diagnostics', 'g_offh_destr_diag_last_static',
 			'g_offh_destr_runtime_space'):
 		globals().pop(name, None)
@@ -781,6 +909,9 @@ def _stream_baked_shot_instance_1513(spaceID, identity):
 	the candidate only after the same live matrix, exact wire, descriptor kind
 	and native effect-category checks used by the proximity registry.
 	"""
+	chunk_id, item_index = identity
+	if _destructible_isolated_1513(chunk_id, item_index):
+		return None
 	instances = globals().setdefault('g_offh_destr_instances', {})
 	instance = instances.get(identity)
 	if instance is not None:
@@ -795,48 +926,68 @@ def _stream_baked_shot_instance_1513(spaceID, identity):
 	import BigWorld
 	import Math
 	mgr = getattr(AreaDestructibles, 'g_destructiblesManager', None)
-	if mgr is None or mgr.getSpaceID() != spaceID:
+	try:
+		manager_space = None if mgr is None else mgr.getSpaceID()
+	except Exception as error:
+		if baked['kind'] == 'falling':
+			_isolate_destructible_1513(
+				'falling_manager', chunk_id, item_index, detail=error)
 		return None
-	chunk_id, item_index = identity
+	if mgr is None or manager_space != spaceID:
+		return None
 	native_count = _native_chunk_destructible_count_1513(mgr, chunk_id)
 	if native_count is None:
 		return None
 	if item_index >= native_count:
-		raise RuntimeError(
-			'#1513 baked destructible wire exceeds streamed count: '
-			'chunk=%s item=%s count=%s' %
-			(chunk_id, item_index, native_count))
+		_isolate_destructible_1513(
+			'native_count_range', chunk_id, item_index,
+			detail='count=%s' % native_count)
+		return None
 	filenames = BigWorld.wg_getChunkDestrFilenames(spaceID, chunk_id)
 	if filenames is None:
 		return None
 	if not isinstance(filenames, (list, tuple)):
-		raise RuntimeError(
-			'#1513 destructible filename payload is invalid: chunk=%s' %
-			chunk_id)
+		_isolate_destructible_1513(
+			'filename_payload', chunk_id,
+			detail='expected list or tuple')
+		return None
 	if len(filenames) > native_count:
-		raise RuntimeError(
-			'#1513 destructible filename prefix exceeds native count: '
-			'chunk=%s names=%s count=%s' %
-			(chunk_id, len(filenames), native_count))
+		_isolate_destructible_1513(
+			'filename_prefix', chunk_id,
+			detail='names=%s count=%s' % (len(filenames), native_count))
+		return None
 	if item_index < len(filenames) and not isinstance(
 			filenames[item_index], _STRING_TYPES):
-		raise RuntimeError(
-			'#1513 destructible filename slot is invalid: chunk=%s item=%s' %
-			(chunk_id, item_index))
+		_isolate_destructible_1513(
+			'filename_slot', chunk_id, item_index,
+			detail='expected string')
+		return None
 	chunk_matrix = BigWorld.wg_getChunkMatrix(spaceID, chunk_id)
 	chunk_translation = getattr(chunk_matrix, 'translation', None)
 	if chunk_translation is None:
 		return None
-	matrix = Math.Matrix(BigWorld.wg_getDestructibleMatrix(
-		spaceID, chunk_id, item_index))
-	signature, located = _catalog_instance_for_matrix_1513(
-		matrix, chunk_translation, Math)
+	try:
+		matrix = Math.Matrix(BigWorld.wg_getDestructibleMatrix(
+			spaceID, chunk_id, item_index))
+		signature, located = _catalog_instance_for_matrix_1513(
+			matrix, chunk_translation, Math)
+	except Exception as error:
+		if baked['kind'] != 'falling':
+			raise
+		_isolate_destructible_1513(
+			'falling_matrix_query', chunk_id, item_index, detail=error)
+		return None
 	if located is None:
 		return None
 	if located['wire'] != identity:
-		raise RuntimeError(
-			'#1513 streamed destructible identity disagrees with the baked '
-			'wire: live=%r baked=%r' % (identity, located['wire']))
+		baked_wire = located['wire']
+		_isolate_destructible_1513(
+			'wire_identity_mismatch', chunk_id, item_index,
+			detail='live=%r baked=%r' % (identity, baked_wire))
+		_isolate_destructible_1513(
+			'wire_identity_mismatch', baked_wire[0], baked_wire[1],
+			detail='live=%r baked=%r' % (identity, baked_wire))
+		return None
 	if signature != baked['signature']:
 		return None
 	record = catalog['resources'].get(located['filename'])
@@ -855,26 +1006,42 @@ def _stream_baked_shot_instance_1513(spaceID, identity):
 		native_type = BigWorld.wg_getDestructibleEffectCategory(
 			spaceID, chunk_id, item_index, module_index)
 	except Exception as error:
-		raise RuntimeError(
-			'#1513 destructible effect category query failed: '
-			'chunk=%s item=%s module=%s: %s' %
-			(chunk_id, item_index, module_index, error))
+		_isolate_destructible_1513(
+			'effect_query', chunk_id, item_index,
+			detail='module=%s error=%s' % (module_index, error))
+		return None
 	if _catalog_kind_for_type_1513(
 			AreaDestructibles, native_type) != expected_kind:
+		_isolate_destructible_1513(
+			'effect_category', chunk_id, item_index,
+			detail='expected=%s native=%r' % (expected_kind, native_type))
 		return None
-	world_boxes = _world_catalog_boxes(
-		record, matrix, chunk_translation, Math, located['box_index'])
+	try:
+		world_boxes = _world_catalog_boxes(
+			record, matrix, chunk_translation, Math, located['box_index'])
+		item_scale = _matrix_item_scale_1513(matrix, Math)
+		chunk_translation_value = (
+			float(chunk_translation.x), float(chunk_translation.y),
+			float(chunk_translation.z))
+	except Exception as error:
+		if record['kind'] != 'falling':
+			raise
+		_isolate_destructible_1513(
+			'falling_matrix_transform', chunk_id, item_index, detail=error)
+		return None
 	if not world_boxes:
+		if record['kind'] == 'falling':
+			_isolate_destructible_1513(
+				'falling_collision_boxes', chunk_id, item_index,
+				detail='collision box is unavailable')
 		return None
 	instance = {
 		'filename': located['filename'],
 		'descriptor_filename': filename,
 		'kind': expected_kind, 'boxes': world_boxes,
-		'item_scale': _matrix_item_scale_1513(matrix, Math),
+		'item_scale': item_scale,
 		'box_index': located['box_index'], 'signature': signature,
-		'chunk_translation': (
-			float(chunk_translation.x), float(chunk_translation.y),
-			float(chunk_translation.z)),
+		'chunk_translation': chunk_translation_value,
 	}
 	instances[identity] = instance
 	_index_catalog_instance_1513(
@@ -908,6 +1075,8 @@ def _catalog_shot_intersection(spaceID, start, end, maximum_distance=None):
 			catalog.get('baked_shot_bins', {}).get(bin_key, ()))
 	hits = {}
 	for identity in sorted(identities):
+		if _destructible_isolated_1513(identity[0], identity[1]):
+			continue
 		instance = instances.get(identity)
 		pending = False
 		if instance is None:
@@ -935,6 +1104,8 @@ def _catalog_shot_intersection(spaceID, start, end, maximum_distance=None):
 				continue
 			instance = _stream_baked_shot_instance_1513(spaceID, identity)
 			if instance is None:
+				if _destructible_isolated_1513(identity[0], identity[1]):
+					continue
 				instance = baked
 				pending = True
 		for world_box in instance['boxes']:
@@ -1061,6 +1232,8 @@ def note_destroyed(kind, chunkID, itemIndex, matKind=None, now=None):
 	"""Track native hide or falling-matrix collision after destruction."""
 	if kind not in ('fragile', 'module', 'column'):
 		return False
+	if _destructible_isolated_1513(chunkID, itemIndex):
+		return False
 	if now is None:
 		import BigWorld
 		now = BigWorld.time()
@@ -1086,6 +1259,8 @@ def _catalog_contact_candidates(vehicle_box):
 	for bin_key in _bin_keys_for_bounds(*_box_xz_bounds(vehicle_box)):
 		for chunk_id, item_index in sorted(contact_bins.get(bin_key, ())):
 			identity = (int(chunk_id), int(item_index))
+			if _destructible_isolated_1513(*identity):
+				continue
 			if identity in seen:
 				continue
 			seen.add(identity)
@@ -1135,6 +1310,8 @@ def _catalog_candidate_on_ray_1513(contact_pt, segment_start, segment_end):
 	bin_key = _destructible_bin_key(contact_pt.x, contact_pt.z)
 	candidates = []
 	for chunk_id, item_index in contact_bins.get(bin_key, ()):
+		if _destructible_isolated_1513(chunk_id, item_index):
+			continue
 		instance = instances.get((chunk_id, item_index))
 		if instance is None:
 			continue
@@ -1533,6 +1710,8 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 		for candidate, gate_speed, used_cap in commit_candidates:
 			chunk_id, item_index, mat_kind, unused_filename, kind = (
 				candidate[:5])
+			if _destructible_isolated_1513(chunk_id, item_index):
+				continue
 			mat_info = _synthetic_mat_info(candidate, Math)
 			point = mat_info[1]
 			if kind == 'fragile':
@@ -1580,6 +1759,8 @@ def _catalog_instance_boxes(chunkID, itemIndex, filename, kind,
 		matKind=None):
 	if _destructible_catalog is None:
 		return None
+	if _destructible_isolated_1513(chunkID, itemIndex):
+		return ()
 	normalized = _normalized_filename(filename)
 	record = _destructible_catalog['resources'].get(normalized)
 	instance = globals().get('g_offh_destr_instances', {}).get(
@@ -1601,6 +1782,8 @@ def _catalog_candidate_at_contact(contact_pt):
 	contact_bins = globals().get('g_offh_destr_contact_bins', {})
 	bin_key = _destructible_bin_key(contact_pt.x, contact_pt.z)
 	for chunk_id, item_index in contact_bins.get(bin_key, ()):
+		if _destructible_isolated_1513(chunk_id, item_index):
+			continue
 		instance = instances.get((chunk_id, item_index))
 		if instance is None:
 			continue
@@ -1622,6 +1805,8 @@ def _catalog_candidate_at_contact(contact_pt):
 def _catalog_candidate_for_native_identity_1513(
 		chunk_id, item_index, mat_kind, contact_pt):
 	"""Recover an anonymous native material hit without guessing identity."""
+	if _destructible_isolated_1513(chunk_id, item_index):
+		return None
 	instance = globals().get('g_offh_destr_instances', {}).get(
 		(int(chunk_id), int(item_index)))
 	if instance is None:
@@ -1664,23 +1849,33 @@ def _falling_initial_matrix_1513(spaceID, chunkID, itemIndex, math_module):
 	"""Read the exact pre-animation matrix cached by the pinned manager."""
 	import AreaDestructibles
 	mgr = getattr(AreaDestructibles, 'g_destructiblesManager', None)
-	if mgr is None or mgr.getSpaceID() != spaceID:
-		raise RuntimeError(
-			'#1513 falling destructibles manager is unavailable for space')
+	try:
+		manager_space = None if mgr is None else mgr.getSpaceID()
+	except Exception as error:
+		_isolate_destructible_1513(
+			'falling_manager', chunkID, itemIndex, detail=error)
+		return None
+	if mgr is None or manager_space != spaceID:
+		_isolate_destructible_1513(
+			'falling_manager', chunkID, itemIndex,
+			detail='manager is unavailable for space')
+		return None
 	matrices = getattr(
 		mgr, '_DestructiblesManager__destrInitialMatrices', None)
 	if not isinstance(matrices, dict):
-		raise RuntimeError(
-			'#1513 falling initial-matrix cache is unavailable')
+		_isolate_destructible_1513(
+			'falling_initial_cache', chunkID, itemIndex,
+			detail='initial-matrix cache is unavailable')
+		return None
 	raw_matrix = matrices.get((int(chunkID), int(itemIndex)))
 	if raw_matrix is None:
 		return None
 	try:
 		return math_module.Matrix(raw_matrix)
 	except Exception as error:
-		raise RuntimeError(
-			'#1513 falling initial matrix is invalid: chunk=%s item=%s: %s' %
-			(chunkID, itemIndex, error))
+		_isolate_destructible_1513(
+			'falling_initial_matrix', chunkID, itemIndex, detail=error)
+		return None
 
 
 def _falling_native_state_1513(spaceID, chunkID, itemIndex, math_module):
@@ -1701,20 +1896,32 @@ def _falling_native_state_1513(spaceID, chunkID, itemIndex, math_module):
 	bodies = getattr(
 		animator, '_DestructiblesAnimator__bodies', None)
 	if not isinstance(bodies, list):
-		raise RuntimeError('#1513 falling animator body list is unavailable')
+		_isolate_destructible_1513(
+			'falling_animator_bodies', chunkID, itemIndex,
+			detail='animator body list is unavailable')
+		return None, False
 	matches = []
 	for body in bodies:
 		if not isinstance(body, dict):
-			raise RuntimeError('#1513 falling animator body is invalid')
+			_isolate_destructible_1513(
+				'falling_animator_body', chunkID, itemIndex,
+				detail='animator body is not a dict')
+			return None, False
 		try:
 			body_identity = (int(body['spaceID']), int(body['chunkID']),
 				int(body['destrIndex']))
 		except (KeyError, TypeError, ValueError, OverflowError):
-			raise RuntimeError('#1513 falling animator body identity is invalid')
+			_isolate_destructible_1513(
+				'falling_animator_identity', chunkID, itemIndex,
+				detail='animator body identity is invalid')
+			return None, False
 		if body_identity == (int(spaceID), int(chunkID), int(itemIndex)):
 			matches.append(body)
 	if len(matches) > 1:
-		raise RuntimeError('#1513 falling animator identity is ambiguous')
+		_isolate_destructible_1513(
+			'falling_animator_ambiguity', chunkID, itemIndex,
+			detail='multiple animator bodies match the native identity')
+		return None, False
 	return initial_matrix, bool(
 		matches and 'touchdownCallback' in matches[0])
 
@@ -1725,13 +1932,32 @@ def _refresh_destroyed_falling_instances_1513(spaceID, authority, now):
 	active = globals().setdefault('g_offh_destr_falling_active', {})
 	identities = []
 	for identity in sorted(active):
+		if _destructible_isolated_1513(*identity):
+			continue
 		instance = instances.get(identity)
 		state = active[identity]
-		if (instance is None or instance.get('kind') != 'falling' or
-				not authority.is_destroyed(
-					identity[0], identity[1], None)):
+		if instance is None:
+			# Canonical destruction can arrive before this chunk is registered.
 			continue
-		last_refresh = state['last_refresh']
+		if not isinstance(instance, dict):
+			_isolate_destructible_1513(
+				'falling_instance_identity', identity[0], identity[1],
+				detail='registered instance is not a dict')
+			continue
+		if instance.get('kind') != 'falling':
+			_isolate_destructible_1513(
+				'falling_instance_kind', identity[0], identity[1],
+				detail='registered instance is not falling')
+			continue
+		if not authority.is_destroyed(identity[0], identity[1], None):
+			continue
+		try:
+			last_refresh = state['last_refresh']
+		except (KeyError, TypeError):
+			_isolate_destructible_1513(
+				'falling_refresh_state', identity[0], identity[1],
+				detail='last-refresh state is invalid')
+			continue
 		if (last_refresh is not None and
 				float(now) - last_refresh < _FALLING_REFRESH_SECONDS):
 			continue
@@ -1745,15 +1971,21 @@ def _refresh_destroyed_falling_instances_1513(spaceID, authority, now):
 	for identity in identities:
 		chunk_id, item_index = identity
 		instance = instances[identity]
-		record = _destructible_catalog['resources'].get(
-			instance['filename'])
+		try:
+			record = _destructible_catalog['resources'].get(
+				instance['filename'])
+		except (KeyError, TypeError):
+			record = None
 		if record is None or record['kind'] != 'falling':
-			raise RuntimeError(
-				'#1513 falling catalog identity is unavailable: '
-				'chunk=%s item=%s' % identity)
+			_isolate_destructible_1513(
+				'falling_catalog_identity', chunk_id, item_index,
+				detail='catalog record is unavailable or not falling')
+			continue
 		initial_matrix, synthetic_collision_active = _falling_native_state_1513(
 			spaceID, chunk_id, item_index, Math)
 		if initial_matrix is None:
+			if _destructible_isolated_1513(chunk_id, item_index):
+				continue
 			# The manager has admitted the canonical result but has not flushed its
 			# streamed-chunk queue yet.  Preserve the last exact OBB and retry.
 			active[identity]['last_refresh'] = float(now)
@@ -1762,28 +1994,53 @@ def _refresh_destroyed_falling_instances_1513(spaceID, authority, now):
 			matrix = Math.Matrix(BigWorld.wg_getDestructibleMatrix(
 				spaceID, chunk_id, item_index))
 		except Exception as error:
-			raise RuntimeError(
-				'#1513 falling destructible matrix query failed: '
-				'chunk=%s item=%s: %s' %
-				(chunk_id, item_index, error))
-		chunk_translation = Math.Vector3(*instance['chunk_translation'])
-		boxes = _world_catalog_boxes(
-			record, matrix, chunk_translation, Math,
-			instance.get('box_index'))
+			_isolate_destructible_1513(
+				'falling_matrix_query', chunk_id, item_index, detail=error)
+			continue
+		try:
+			chunk_translation = Math.Vector3(*instance['chunk_translation'])
+		except (KeyError, TypeError, ValueError) as error:
+			_isolate_destructible_1513(
+				'falling_chunk_translation', chunk_id, item_index,
+				detail=error)
+			continue
+		try:
+			boxes = _world_catalog_boxes(
+				record, matrix, chunk_translation, Math,
+				instance.get('box_index'))
+		except Exception as error:
+			_isolate_destructible_1513(
+				'falling_matrix_transform', chunk_id, item_index,
+				detail=error)
+			continue
 		if not boxes:
-			raise RuntimeError(
-				'#1513 falling destructible has no current collision box: '
-				'chunk=%s item=%s' % identity)
-		current_scale = _matrix_item_scale_1513(matrix, Math)
-		initial_scale = float(instance['item_scale'])
+			_isolate_destructible_1513(
+				'falling_collision_boxes', chunk_id, item_index,
+				detail='current collision box is unavailable')
+			continue
+		try:
+			current_scale = _matrix_item_scale_1513(matrix, Math)
+			initial_scale = float(instance['item_scale'])
+		except (KeyError, TypeError, ValueError, RuntimeError) as error:
+			_isolate_destructible_1513(
+				'falling_scale', chunk_id, item_index, detail=error)
+			continue
 		if abs(current_scale - initial_scale) > max(
 				1.0e-5, initial_scale * 1.0e-5):
-			raise RuntimeError(
-				'#1513 falling destructible changed scale: '
-				'chunk=%s item=%s' % identity)
+			_isolate_destructible_1513(
+				'falling_scale_change', chunk_id, item_index,
+				detail='initial=%s current=%s' %
+					(initial_scale, current_scale))
+			continue
 		# Validate the complete replacement index before mutating the live one.
 		# Any malformed native matrix therefore preserves the previous solid OBB.
-		new_bin_keys = _catalog_bin_keys_1513(boxes)
+		try:
+			new_bin_keys = _catalog_bin_keys_1513(boxes)
+		except Exception as error:
+			_isolate_destructible_1513(
+				'falling_collision_index', chunk_id, item_index,
+				detail=error)
+			continue
 
 		old_bin_keys = instance.get('bin_keys')
 		if old_bin_keys is None:
@@ -1918,12 +2175,14 @@ def _try_destroy_destructible(spaceID, matInfo, yaw, vel,
 	decoded = _decode_mat_info_1513(matInfo)
 	if decoded is None:
 		return False
+	hitPt, surfNormal, chunkID, itemIndex, matKind, fname = decoded
+	if _destructible_isolated_1513(chunkID, itemIndex):
+		return False
 	import AreaDestructibles
 	if (not hasattr(AreaDestructibles, 'g_destructiblesManager') or
 			not AreaDestructibles.g_destructiblesManager):
 		raise RuntimeError('destructibles manager is unavailable')
 
-	hitPt, surfNormal, chunkID, itemIndex, matKind, fname = decoded
 	_dseen = globals().setdefault('g_offh_destr_seen', set())
 	_dkey = (matKind, fname)
 	if _dkey not in _dseen:
@@ -2090,11 +2349,15 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 		contact_bins = globals().setdefault(
 			'g_offh_destr_contact_bins', {})
 		for cid in cids:
+			if _destructible_isolated_1513(cid):
+				continue
 			registry = _st['chunks'].get(cid)
 			if registry is None:
 				_native_count = _native_chunk_destructible_count_1513(
 					mgr, cid)
 				if _native_count is None:
+					if _destructible_isolated_1513(cid):
+						continue
 					if cid == _current_cid:
 						_diagnostic_chunk_pending_1513(
 							'count_pending', cid)
@@ -2109,14 +2372,16 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 							'names_pending', cid, _native_count)
 					continue # chunk not streamed in yet; retry next tick
 				if not isinstance(_dfn, (list, tuple)):
-					raise RuntimeError(
-						'#1513 destructible filename payload is invalid: chunk=%s' %
-						cid)
+					_isolate_destructible_1513(
+						'filename_payload', cid,
+						detail='expected list or tuple')
+					continue
 				if len(_dfn) > _native_count:
-					raise RuntimeError(
-						'#1513 destructible filename prefix exceeds native count: '
-						'chunk=%s names=%s count=%s' %
-						(cid, len(_dfn), _native_count))
+					_isolate_destructible_1513(
+						'filename_prefix', cid,
+						detail='names=%s count=%s' %
+							(len(_dfn), _native_count))
+					continue
 				registry = {
 					'bins': {}, 'extended_bins': {}, 'count': 0,
 					'max_radius': 0.0, 'slot_diagnostics': {},
@@ -2127,18 +2392,35 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 					continue
 				for _ti in xrange(_native_count):
 					try:
+						if _destructible_isolated_1513(cid, _ti):
+							continue
 						# #1513's offline chunk list keeps the native item slots,
 						# but returns blank filenames for many non-tree items.  Read
 						# the item matrix first and recover the resource only through
 						# the checksum-pinned whole-map instance signature.
-						_m = Math.Matrix(BigWorld.wg_getDestructibleMatrix(
-							spaceID, cid, _ti))
+						_is_active_falling = ((cid, _ti) in globals().setdefault(
+							'g_offh_destr_falling_active', {}))
+						_baked_slot = ((_destructible_catalog or {}).get(
+							'baked_instances', {}).get((int(cid), int(_ti))))
+						_is_known_falling = (_is_active_falling or
+							(_baked_slot is not None and
+								_baked_slot.get('kind') == 'falling'))
+						try:
+							_m = Math.Matrix(BigWorld.wg_getDestructibleMatrix(
+								spaceID, cid, _ti))
+						except Exception as error:
+							if not _is_known_falling:
+								raise
+							_isolate_destructible_1513(
+								'falling_matrix_query', cid, _ti, detail=error)
+							continue
 						_raw_filename = (
 							_dfn[_ti] if _ti < len(_dfn) else '')
 						if not isinstance(_raw_filename, _STRING_TYPES):
-							raise RuntimeError(
-								'#1513 destructible filename slot is invalid: '
-								'chunk=%s item=%s' % (cid, _ti))
+							_isolate_destructible_1513(
+								'filename_slot', cid, _ti,
+								detail='expected string')
+							continue
 						_raw_normalized = _normalized_filename(_raw_filename)
 						_slot_diag = {
 							'raw': 'named' if _raw_normalized else 'blank',
@@ -2152,8 +2434,7 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 						# including every tree, so only keep it when a reader exists.
 						if _DIAGNOSTICS_ENABLED:
 							registry['slot_diagnostics'][_ti] = _slot_diag
-						if ((cid, _ti) in globals().setdefault(
-								'g_offh_destr_falling_active', {})):
+						if _is_active_falling:
 							# A falling item's live matrix is no longer its catalog
 							# placement and can even quantize to another valid resource.
 							# Recover identity only from the exact pre-animation cache;
@@ -2161,12 +2442,22 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 							_initial_matrix = _falling_initial_matrix_1513(
 								spaceID, cid, _ti, Math)
 							if _initial_matrix is None:
+								if _destructible_isolated_1513(cid, _ti):
+									_slot_diag['result'] = 'isolated'
+									continue
 								_retry_registry = True
 								_slot_diag['result'] = 'native_matrix_pending'
 								continue
-							_signature, _located = (
-								_catalog_instance_for_matrix_1513(
-									_initial_matrix, _cm_t, Math))
+							try:
+								_signature, _located = (
+									_catalog_instance_for_matrix_1513(
+										_initial_matrix, _cm_t, Math))
+							except Exception as error:
+								_isolate_destructible_1513(
+									'falling_initial_matrix', cid, _ti,
+									detail=error)
+								_slot_diag['result'] = 'isolated'
+								continue
 						else:
 							_signature, _located = (
 								_catalog_instance_for_matrix_1513(
@@ -2192,12 +2483,24 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 								# exact native wire and effect category below are the
 								# authoritative identity boundary.
 								_slot_diag['raw_mismatch'] = True
+								_log_destructible_validation_1513(
+									'filename_mismatch', 'accepted_catalog_identity',
+									cid, _ti,
+									detail='native=%s catalog=%s' % (
+										_raw_normalized, _located['filename']))
 							if _located['wire'] != (int(cid), int(_ti)):
-								raise RuntimeError(
-									'#1513 streamed destructible identity '
-									'disagrees with the baked wire: live=%r '
-									'baked=%r' % ((int(cid), int(_ti)),
-										_located['wire']))
+								_live_wire = (int(cid), int(_ti))
+								_baked_wire = _located['wire']
+								_wire_detail = 'live=%r baked=%r' % (
+									_live_wire, _baked_wire)
+								_isolate_destructible_1513(
+									'wire_identity_mismatch', cid, _ti,
+									detail=_wire_detail)
+								_isolate_destructible_1513(
+									'wire_identity_mismatch', _baked_wire[0],
+									_baked_wire[1], detail=_wire_detail)
+								_slot_diag['result'] = 'isolated'
+								continue
 							_catalog_record = _destructible_catalog[
 								'resources'][_located['filename']]
 							_filename = _catalog_record['filename']
@@ -2239,14 +2542,20 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 										BigWorld.wg_getDestructibleEffectCategory(
 											spaceID, cid, _ti, _module_index))
 								except Exception as error:
-									raise RuntimeError(
-										'#1513 destructible effect category query '
-										'failed: chunk=%s item=%s module=%s: %s' %
-										(cid, _ti, _module_index, error))
+									_isolate_destructible_1513(
+										'effect_query', cid, _ti,
+										detail='module=%s error=%s' %
+											(_module_index, error))
+									_slot_diag['result'] = 'isolated'
+									continue
 								if _catalog_kind_for_type_1513(
 										AreaDestructibles, _native_type) != _expected_kind:
 									_slot_diag['effect_category'] = _native_type
 									_slot_diag['result'] = 'effect_mismatch'
+									_isolate_destructible_1513(
+										'effect_category', cid, _ti,
+										detail='expected=%s native=%r' %
+											(_expected_kind, _native_type))
 									continue
 								_slot_diag['effect_category'] = _native_type
 						elif typ not in (
@@ -2266,34 +2575,50 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 						# Destructible matrices are CHUNK-LOCAL: world pos =
 						# chunk translation + destructible translation
 						# (see AreaDestructibles.__launchEffect)
-						if _catalog_record is None:
-							_origin = (_cm_t.x + _m.translation.x,
-								_cm_t.y + _m.translation.y,
-								_cm_t.z + _m.translation.z)
-						else:
-							_origin = _matrix_point(
-								_m, Math, 0.0, 0.0, 0.0, _cm_t)
-						_world_boxes = ()
-						_contact_radius = 0.0
-						_item_scale = None
-						if _catalog_record is not None:
-							_item_scale = _matrix_item_scale_1513(_m, Math)
-							_world_boxes = _world_catalog_boxes(
-								_catalog_record, _m, _cm_t, Math,
-								_instance_box_index)
-							if not _world_boxes:
-								_slot_diag['result'] = 'boxes_empty'
-								continue
-							for _world_box in _world_boxes:
-								_center, _half_axes = _world_box[:2]
-								_center_radius = ((_center[0] - _origin[0]) ** 2 +
-									(_center[2] - _origin[2]) ** 2) ** 0.5
-								_horizontal_radius = sum(
-									(axis[0] * axis[0] + axis[2] * axis[2]) ** 0.5
-									for axis in _half_axes)
-								_contact_radius = max(
-									_contact_radius,
-									_center_radius + _horizontal_radius)
+						try:
+							if _catalog_record is None:
+								_origin = (_cm_t.x + _m.translation.x,
+									_cm_t.y + _m.translation.y,
+									_cm_t.z + _m.translation.z)
+							else:
+								_origin = _matrix_point(
+									_m, Math, 0.0, 0.0, 0.0, _cm_t)
+							_world_boxes = ()
+							_contact_radius = 0.0
+							_item_scale = None
+							if _catalog_record is not None:
+								_item_scale = _matrix_item_scale_1513(_m, Math)
+								_world_boxes = _world_catalog_boxes(
+									_catalog_record, _m, _cm_t, Math,
+									_instance_box_index)
+								if not _world_boxes:
+									if _catalog_record['kind'] == 'falling':
+										_isolate_destructible_1513(
+											'falling_collision_boxes', cid, _ti,
+											detail='collision box is unavailable')
+										_slot_diag['result'] = 'isolated'
+									else:
+										_slot_diag['result'] = 'boxes_empty'
+									continue
+								for _world_box in _world_boxes:
+									_center, _half_axes = _world_box[:2]
+									_center_radius = ((_center[0] - _origin[0]) ** 2 +
+										(_center[2] - _origin[2]) ** 2) ** 0.5
+									_horizontal_radius = sum(
+										(axis[0] * axis[0] + axis[2] * axis[2]) ** 0.5
+										for axis in _half_axes)
+									_contact_radius = max(
+										_contact_radius,
+										_center_radius + _horizontal_radius)
+						except Exception as error:
+							if (_catalog_record is None or
+									_catalog_record['kind'] != 'falling'):
+								raise
+							_isolate_destructible_1513(
+								'falling_matrix_transform', cid, _ti,
+								detail=error)
+							_slot_diag['result'] = 'isolated'
+							continue
 						_item = (
 							_ti, _origin[0], _origin[1], _origin[2], typ,
 							_filename, desc.get('health', 0),
@@ -2343,6 +2668,8 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 			for (_ti, _tx, _ty, _tz, _ttyp, _tfn, _thp, _tmass,
 					_world_boxes, _contact_radius) in _nearby_destructibles(
 						registry, pos, vehicle_box):
+				if _destructible_isolated_1513(cid, _ti):
+					continue
 				dx = _tx - pos.x; dz = _tz - pos.z
 				_origin_radius = (
 					_DESTRUCTIBLE_ORIGIN_RADIUS + _contact_radius)
@@ -2381,6 +2708,8 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 					_st['felled'].add(_key)
 					continue
 				_object_pos = Math.Vector3(_tx, _ty, _tz)
+				if _destructible_isolated_1513(cid, _ti):
+					continue
 				if _ttyp == AreaDestructibles.DESTR_TYPE_FRAGILE:
 					_ok = _auth.destroy_fragile(
 						spaceID, cid, _ti, _object_pos, False)
@@ -2418,6 +2747,8 @@ def _solid_destructible_candidate_1513(mat_info, contact_pt,
 	if decoded is None:
 		return False
 	hit_pt, surf_normal, chunkID, itemIndex, matKind, fname = decoded
+	if _destructible_isolated_1513(chunkID, itemIndex):
+		return False
 	if matKind < 71 or matKind > 130:
 		return False
 
@@ -2474,11 +2805,16 @@ def donation_rows_1513():
 	covers the complete baked catalog without waiting for streamed chunks,
 	and any inconsistent entry fails the whole donation.
 	"""
-	import AreaDestructibles
-	import DestructiblesCache
 	catalog = _destructible_catalog
 	if catalog is None or not catalog.get('has_instance_index'):
 		return None
+	if (globals().get('g_offh_destr_isolated_chunks') or
+			globals().get('g_offh_destr_isolated_slots')):
+		# One quarantined wire means this client can no longer claim that the
+		# donated native map is complete or safe for canonical replay.
+		return None
+	import AreaDestructibles
+	import DestructiblesCache
 	tree_type = getattr(AreaDestructibles, 'DESTR_TYPE_TREE', None)
 	falling_type = getattr(AreaDestructibles, 'DESTR_TYPE_FALLING_ATOM', None)
 	fragile_type = getattr(AreaDestructibles, 'DESTR_TYPE_FRAGILE', None)
@@ -2557,6 +2893,8 @@ def donation_rows_1513():
 
 
 def _registered_item_scale_1513(chunkID, itemIndex, filename):
+	if _destructible_isolated_1513(chunkID, itemIndex):
+		return None
 	instance = globals().get('g_offh_destr_instances', {}).get(
 		(chunkID, itemIndex))
 	if (instance is None or instance['filename'] !=
@@ -2574,6 +2912,8 @@ def _registered_item_scale_1513(chunkID, itemIndex, filename):
 def _registered_shot_exit_1513(chunkID, itemIndex, matKind, filename,
 		start_pos, end_pos, contact_pt):
 	"""Return one exact registered item/module OBB exit on a native hit."""
+	if _destructible_isolated_1513(chunkID, itemIndex):
+		return None
 	instance = globals().get('g_offh_destr_instances', {}).get(
 		(int(chunkID), int(itemIndex)))
 	if (instance is None or instance['filename'] !=

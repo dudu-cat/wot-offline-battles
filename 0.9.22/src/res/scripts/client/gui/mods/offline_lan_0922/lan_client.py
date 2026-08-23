@@ -17,6 +17,7 @@ PROJECTILE_HIT_VEHICLE_CAPABILITY = 'projectile_hit_vehicle_v1'
 PROJECTILE_WRECK_HIT_CAPABILITY = 'projectile_wreck_hit_v1'
 RANDOM_MAP_CAPABILITY = 'random_map_v1'
 TEAM_SELECTION_CAPABILITY = 'team_selection_v1'
+TEAM_SIZE_SELECTION_CAPABILITY = 'team_size_selection_v1'
 DESTRUCTIBLE_CATALOG_V5_CAPABILITY = 'destructible_catalog_v5'
 LEAN_SNAPSHOT_MANIFEST_CAPABILITY = 'lean_snapshot_manifest_v1'
 RAM_CONTACT_LEDGER_CAPABILITY = 'ram_contact_ledger_v1'
@@ -96,12 +97,12 @@ _BOT_STATE_WIRE_FIELDS = (
     'death_reason', 'display_health', 'world_pose')
 STATE_BARRIER_TYPES = frozenset((
     'welcome', 'roster', 'battle_start', 'battle_live',
-    'start_denied', 'team_denied', 'events', 'error'))
+    'start_denied', 'team_denied', 'team_size_denied', 'events', 'error'))
 ORDERED_RECEIVE_TYPES = STATE_BARRIER_TYPES | frozenset((
     'battle_receipt', 'fire_intent', 'fire_intent_result'))
 SERVER_STATE_TYPES = frozenset((
     'welcome', 'roster', 'battle_start', 'battle_live', 'start_denied',
-    'team_denied', 'snapshot', 'events', 'bot_observation',
+    'team_denied', 'team_size_denied', 'snapshot', 'events', 'bot_observation',
     'battle_receipt'))
 
 
@@ -1241,6 +1242,18 @@ class LANClient(object):
             return True
         return self._send({'type': 'select_team', 'team': team})
 
+    def set_team_size(self, team, size):
+        """Request one live waiting-room capacity as the elected host."""
+        team = _team_choice(team, None)
+        size = _exact_int(size)
+        if (not self.ready or self.phase != 'waiting' or
+                self.player_id != self.host_player_id or
+                team not in (1, 2) or size is None or not 1 <= size <= 15 or
+                not self.has_team_size_selection()):
+            return False
+        return self._send({
+            'type': 'set_team_size', 'team': team, 'size': size})
+
     def _adopt_published_vehicle(self, players):
         """Track the vehicle and HP the server holds for this client."""
         for entry in players or ():
@@ -1777,6 +1790,9 @@ class LANClient(object):
 
     def has_team_selection(self):
         return TEAM_SELECTION_CAPABILITY in self.server_capabilities
+
+    def has_team_size_selection(self):
+        return TEAM_SIZE_SELECTION_CAPABILITY in self.server_capabilities
 
     def send_bot_manifest(self, bots, player_collision_profiles=None):
         if not self.is_bot_authority():
@@ -2826,6 +2842,24 @@ class LANClient(object):
                     code not in ('team_full', 'invalid_team', 'not_waiting') or
                     team_sizes is None):
                 self.last_error = 'invalid team_denied message'
+                self.stop()
+                return
+            self.team_sizes = team_sizes
+        elif kind == 'team_size_denied':
+            round_id = _exact_int(message.get('round_id'))
+            team = _team_choice(message.get('team'), None)
+            size = _exact_int(message.get('size'))
+            code = _safe_text(message.get('code'), '', 32)
+            team_sizes = _team_sizes(
+                message.get('team_sizes'), None, self.team_sizes)
+            if (round_id is None or round_id != self.round_id or
+                    team not in (1, 2) or size is None or
+                    not 1 <= size <= 15 or
+                    code not in ('host_only', 'team_occupied',
+                                 'invalid_team', 'invalid_size',
+                                 'not_waiting') or
+                    team_sizes is None):
+                self.last_error = 'invalid team_size_denied message'
                 self.stop()
                 return
             self.team_sizes = team_sizes

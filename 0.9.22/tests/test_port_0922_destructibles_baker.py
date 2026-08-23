@@ -577,8 +577,9 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
                 loader_spec.loader.exec_module(loader)
                 target = Path(directory) / 'destructibles'
                 target.mkdir()
-                for path in DATA_ROOT.glob('*.json'):
-                    (target / path.name).write_bytes(path.read_bytes())
+                for filename in ('manifest.json', '06_ensk.json'):
+                    path = DATA_ROOT / filename
+                    (target / filename).write_bytes(path.read_bytes())
                 loaded = loader.load_catalog('spaces/06_ensk')
                 self.assertEqual('06_ensk', loaded['map'])
                 self.assertIn(
@@ -586,7 +587,18 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
                     'gaf011_FenceTile1.model', loaded['resources'])
 
                 manifest_path = target / 'manifest.json'
-                manifest = json.loads(manifest_path.read_text())
+                original_manifest = json.loads(manifest_path.read_text())
+                manifest = copy.deepcopy(original_manifest)
+                selected = next(
+                    record for record in manifest['maps']
+                    if record['map'] == '06_ensk')
+                selected['file'] = 'missing.json'
+                manifest_path.write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(
+                        ValueError, 'manifest record is invalid'):
+                    loader.load_catalog('06_ensk')
+
+                manifest = copy.deepcopy(original_manifest)
                 manifest['locator_quantization'] = 999
                 manifest_path.write_text(json.dumps(manifest))
                 with self.assertRaisesRegex(ValueError,
@@ -604,6 +616,39 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
                     path.unlink()
                 target.rmdir()
                 self.assertIsNone(loader.load_catalog('06_ensk'))
+
+                no_census = copy.deepcopy(loaded)
+                del no_census['census']
+                self.assertIs(
+                    no_census, loader._validate(no_census, '06_ensk'))
+
+                unsorted_instances = copy.deepcopy(loaded)
+                unsorted_instances['instances'][0:2] = reversed(
+                    unsorted_instances['instances'][0:2])
+                self.assertIs(
+                    unsorted_instances,
+                    loader._validate(unsorted_instances, '06_ensk'))
+
+                duplicate_signature = copy.deepcopy(loaded)
+                duplicate_signature['instances'][1][:12] = (
+                    duplicate_signature['instances'][0][:12])
+                with self.assertRaisesRegex(
+                        ValueError, 'signature is invalid'):
+                    loader._validate(duplicate_signature, '06_ensk')
+
+                ambiguous_index = json.loads(
+                    (DATA_ROOT / '101_dday.json').read_text())
+                self.assertGreater(
+                    len(ambiguous_index['ambiguous_instances']), 1)
+                ambiguous_index['ambiguous_instances'][0:2] = reversed(
+                    ambiguous_index['ambiguous_instances'][0:2])
+                self.assertIs(
+                    ambiguous_index,
+                    loader._validate(ambiguous_index, '101_dday'))
+                ambiguous_index['ambiguous_instances'][0][12].reverse()
+                self.assertIs(
+                    ambiguous_index,
+                    loader._validate(ambiguous_index, '101_dday'))
 
                 # Direct validation also fails closed on a degenerate box.
                 bad = copy.deepcopy(loaded)

@@ -39,7 +39,7 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertIn('OFFLINE_LAN_0922_WORKER_READY_MARKER', source)
         self.assertIn(
             'wait_for_worker_ready(\n\t\t\tprocess.hProcess, '
-            'server_process.hProcess)', source)
+            'server_process.hProcess, stop_event)', source)
         wait_body = source.split(
             'static int wait_for_worker_ready', 1)[1].split(
                 'static int launch_player', 1)[0]
@@ -56,12 +56,17 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertIn('lstrcmpiW(command_line, PLAYER_MODE)', source)
         self.assertIn(
             'lstrcmpiW(command_line, PAIRED_PLAYER_MODE)', source)
-        self.assertIn('result = launch_player(game_path, TRUE);', source)
-        self.assertIn('return launch_player(game_path, FALSE);', source)
-        self.assertIn('return launch_player(game_path, TRUE);', source)
+        self.assertIn(
+            'result = launch_player(game_path, TRUE, stop_event);', source)
+        self.assertIn(
+            'result = launch_player(game_path, FALSE, stop_event);', source)
         self.assertIn('TerminateJobObject(job, ERROR_PROCESS_ABORTED)', source)
-        self.assertLess(source.index('wait_for_worker_ready(\n'),
-                        source.index('result = launch_player(game_path, TRUE);'))
+        main = source.split('int WINAPI wWinMain', 1)[1]
+        worker_wait = main.index('wait_for_worker_ready(\n')
+        host_player = main.index(
+            'result = launch_player(game_path, TRUE, stop_event);',
+            worker_wait)
+        self.assertLess(worker_wait, host_player)
 
     def test_offline_host_owns_a_hidden_loopback_server_before_the_worker(self):
         source = SOURCE.read_text(encoding='utf-8')
@@ -72,7 +77,8 @@ class WorkerStarterTests(unittest.TestCase):
             'AssignProcessToJobObject(job, server_process.hProcess)',
             server_create)
         server_ready = main.index(
-            'wait_for_local_server(server_process.hProcess)', server_job)
+            'wait_for_local_server(\n\t\t\tserver_process.hProcess, '
+            'stop_event)', server_job)
         worker_create = main.index(
             'CreateProcessW(game_path, child_command', server_ready)
         self.assertLess(server_create, server_job)
@@ -112,30 +118,173 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertLess(launch.index('AssignProcessToJobObject'),
                         launch.index('ResumeThread'))
 
-    def test_paired_player_tracks_handoffs_outside_the_player_job(self):
+    def test_optional_procdump_attaches_before_clients_are_resumed(self):
+        source = SOURCE.read_text(encoding='utf-8')
+        capture = source.split(
+            'static HANDLE start_procdump_configured', 1)[1].split(
+                'static int starter_stop_event_name', 1)[0]
+        launch = source.split(
+            'static int launch_player', 1)[1].split(
+                'int WINAPI wWinMain', 1)[0]
+        main = source.split('int WINAPI wWinMain', 1)[1]
+
+        self.assertIn('WOT_OFFLINE_PROCDUMP_PATH', source)
+        self.assertIn('WOT_OFFLINE_CRASH_DUMP_PATH', source)
+        self.assertIn(
+            '-accepteula -mm -n 1 -e -t %lu', capture)
+        self.assertIn('CheckRemoteDebuggerPresent(', capture)
+        self.assertIn('WaitForSingleObject(process.hProcess, 0)', capture)
+        self.assertIn('procdump_exited_before_attach', capture)
+        self.assertIn('procdump_attach_timeout', capture)
+
+        player_assign = launch.index(
+            'AssignProcessToJobObject(player_job, process.hProcess)')
+        player_capture = launch.index(
+            'track_player_process(&tracker, process.dwProcessId, game_path)',
+            player_assign)
+        player_resume = launch.index(
+            'ResumeThread(process.hThread)', player_capture)
+        self.assertLess(player_assign, player_capture)
+        self.assertLess(player_capture, player_resume)
+
+        worker_assign = main.index(
+            'AssignProcessToJobObject(job, process.hProcess)')
+        worker_capture = main.index(
+            'procdump_process = start_procdump_configured(', worker_assign)
+        worker_resume = main.index(
+            'ResumeThread(process.hThread)', worker_capture)
+        self.assertLess(worker_assign, worker_capture)
+        self.assertLess(worker_capture, worker_resume)
+
+    def test_starter_bounds_procdump_completion_and_cancels_on_timeout(self):
+        source = SOURCE.read_text(encoding='utf-8')
+        wait = source.split(
+            'static BOOL wait_for_procdump', 1)[1].split(
+                'static void cancel_procdump_now', 1)[0]
+
+        self.assertIn('PROCDUMP_FINISH_TIMEOUT_MS', wait)
+        self.assertIn('start_procdump_cancel(', wait)
+        self.assertIn('-accepteula -cancel %lu', source)
+        self.assertIn('return !timed_out && completed;', wait)
+        self.assertNotIn('INFINITE', wait)
+
+    def test_procdump_status_cannot_discard_a_complete_dump(self):
+        source = SOURCE.read_text(encoding='utf-8')
+        close = source.split(
+            'static int close_finished_procdump', 1)[1].split(
+                'static HANDLE start_procdump_cancel', 1)[0]
+        finish = source.split(
+            'static DWORD finish_player_tracker', 1)[1].split(
+                'static int launch_player', 1)[0]
+
+        self.assertIn('GetExitCodeProcess(', close)
+        self.assertIn('*completed = TRUE;', close)
+        self.assertNotIn('exit_code != 0', close)
+        self.assertIn('complete_regular_dump_file(last->dump_path)', finish)
+        self.assertIn('player_dump_missing', finish)
+
+    def test_both_player_modes_track_only_their_job_handoffs(self):
         source = SOURCE.read_text(encoding='utf-8')
         launch = source.split(
             'static int launch_player', 1)[1].split(
                 'int WINAPI wWinMain', 1)[0]
-        process_scan = source.split(
-            'static int collect_game_processes', 1)[1].split(
+
+        self.assertIn('PLAYER_HANDOFF_GRACE_MS', launch)
+        self.assertIn('track_player_job_processes(', launch)
+        self.assertIn('JobObjectBasicProcessIdList', source)
+        self.assertIn('QueryFullProcessImageNameW(', source)
+        self.assertNotIn('CreateToolhelp32Snapshot(', source)
+        self.assertNotIn('track_external_player_processes(', source)
+        self.assertNotIn('collect_game_processes(', source)
+        self.assertNotIn('baseline_game_processes', source)
+        self.assertIn(
+            'result = launch_player(game_path, FALSE, stop_event);', source)
+        self.assertIn(
+            'result = launch_player(game_path, TRUE, stop_event);', source)
+
+    def test_terminal_player_exit_controls_result_and_only_complete_dump_moves(self):
+        source = SOURCE.read_text(encoding='utf-8')
+        exits = source.split(
+            'static int update_tracked_player_exits', 1)[1].split(
+                'static DWORD active_tracked_player_count', 1)[0]
+        finish = source.split(
+            'static DWORD finish_player_tracker', 1)[1].split(
                 'static int launch_player', 1)[0]
 
-        self.assertIn('CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)',
-                      process_scan)
-        self.assertIn('QueryFullProcessImageNameW(', process_scan)
-        self.assertIn('lstrcmpiW(process_path, game_path) == 0', process_scan)
-        self.assertIn('PLAYER_HANDOFF_GRACE_MS', process_scan)
-        self.assertIn('process_set_contains(', process_scan)
-        self.assertIn('has_new_game_process(', process_scan)
-        self.assertIn(
-            'has_new_game_process(&current_processes, baseline_processes)',
-            process_scan)
-        self.assertIn('baseline_collected = collect_game_processes(', launch)
-        self.assertIn('wait_for_paired_player_handoff(', launch)
+        self.assertIn('GetProcessTimes(', exits)
+        self.assertIn('tracker->last_exit_index = (int)index;', exits)
+        self.assertIn('result = last->exit_code;', finish)
+        self.assertIn('last->dump_complete', finish)
+        self.assertIn('complete_regular_dump_file(last->dump_path)', finish)
+        self.assertIn('result != 0', finish)
+        self.assertIn('MoveFileExW(', finish)
+        self.assertIn('MOVEFILE_WRITE_THROUGH', finish)
         self.assertLess(
-            launch.index('baseline_collected = collect_game_processes('),
-            launch.index('CreateProcessW(game_path'))
+            finish.index('last->dump_complete'),
+            finish.index('MoveFileExW('))
+
+    def test_dump_monitors_use_only_fixed_slots_and_clean_them(self):
+        source = SOURCE.read_text(encoding='utf-8')
+        slots = source.split(
+            'static int monitor_dump_path', 1)[1].split(
+                'static int complete_regular_dump_file', 1)[0]
+
+        self.assertIn('slot >= MAX_GAME_PROCESS_IDS', slots)
+        self.assertIn('.monitor-%02lu.tmp.dmp', slots)
+        self.assertIn(
+            'slot = 0; slot < MAX_GAME_PROCESS_IDS; ++slot', slots)
+        self.assertIn('cleanup_monitor_dump_slots(', source)
+        self.assertNotIn('.%lu.tmp.dmp', slots)
+
+    def test_normal_stop_cancels_monitors_before_terminating_targets(self):
+        source = SOURCE.read_text(encoding='utf-8')
+        launch = source.split(
+            'static int launch_player', 1)[1].split(
+                'int WINAPI wWinMain', 1)[0]
+        main = source.split('int WINAPI wWinMain', 1)[1]
+        player_stop = launch.index('WaitForSingleObject(stop_event, 0)')
+        player_cancel = launch.index(
+            'cancel_player_procdumps(&tracker);', player_stop)
+        player_terminate = launch.index(
+            'TerminateJobObject(\n\t\t\t\t\tplayer_job, '
+            'ERROR_PROCESS_ABORTED)',
+            player_cancel)
+        worker_stop = main.index('wait_state == WAIT_OBJECT_0 + 1')
+        worker_recheck = main.index(
+            'WaitForSingleObject(process.hProcess, 0)', worker_stop)
+        worker_cancel = main.index(
+            'cancel_procdump_now(&procdump_process,', worker_recheck)
+        worker_terminate = main.index(
+            'TerminateJobObject(job, ERROR_PROCESS_ABORTED);', worker_cancel)
+
+        self.assertIn('--stop-starter ', source)
+        self.assertIn('OpenEventW(EVENT_MODIFY_STATE', source)
+        self.assertIn('SetEvent(stop_event)', source)
+        self.assertLess(player_cancel, player_terminate)
+        self.assertLess(worker_recheck, worker_cancel)
+        self.assertLess(worker_cancel, worker_terminate)
+        self.assertIn('return stopped ? 0 : result;', source)
+
+    def test_player_stop_always_retires_job_and_preserves_observed_crash(self):
+        source = SOURCE.read_text(encoding='utf-8')
+        launch = source.split(
+            'static int launch_player', 1)[1].split(
+                'int WINAPI wWinMain', 1)[0]
+        stop = launch.split(
+            'WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0', 1)[1]
+        stop = stop.split('ZeroMemory(&accounting', 1)[0]
+
+        self.assertIn(
+            'preserved_crash_exit = latest_nonzero_player_exit(&tracker);',
+            stop)
+        self.assertIn('stopped = preserved_crash_exit < 0;', stop)
+        self.assertIn(
+            'TerminateJobObject(\n\t\t\t\t\tplayer_job, '
+            'ERROR_PROCESS_ABORTED)', stop)
+        self.assertIn('TerminateJobObject(player stop)', stop)
+        self.assertNotIn('active_tracked_player_count', stop)
+        self.assertIn(
+            'if (stop_failed && preserved_crash_exit < 0)', launch)
 
     def test_duplicate_host_cannot_erase_the_live_worker_ready_marker(self):
         source = SOURCE.read_text(encoding='utf-8')
@@ -174,8 +323,7 @@ class WorkerStarterTests(unittest.TestCase):
 
         lan_dispatch = main.index(
             'if (lstrcmpiW(command_line, PLAYER_MODE) == 0)')
-        lan_return = main.index(
-            'return launch_player(game_path, FALSE);', lan_dispatch)
+        lan_return = main.index('return result;', lan_dispatch)
         worker_mutex = main.index('CreateMutexW(', lan_return)
         worker_desktop = main.index('CreateDesktopW(', worker_mutex)
         worker_process = main.index(
@@ -221,11 +369,13 @@ class WorkerStarterTests(unittest.TestCase):
             '<H', payload, optional_offset + 68)[0])
         self.assertIn(b'CreateDesktopW', payload)
         self.assertIn(b'CreateProcessW', payload)
-        self.assertIn(b'CreateToolhelp32Snapshot', payload)
+        self.assertIn(b'CheckRemoteDebuggerPresent', payload)
+        self.assertNotIn(b'CreateToolhelp32Snapshot', payload)
         self.assertIn(b'QueryFullProcessImageNameW', payload)
         self.assertIn('--player'.encode('utf-16le'), payload)
         self.assertIn('--paired-player'.encode('utf-16le'), payload)
         self.assertIn('--worker-only'.encode('utf-16le'), payload)
+        self.assertIn('--stop-starter '.encode('utf-16le'), payload)
         self.assertIn(
             'engine_config.offline-player.xml'.encode('utf-16le'), payload)
         self.assertIn(
@@ -236,6 +386,13 @@ class WorkerStarterTests(unittest.TestCase):
             'WoT-0.9.22-LAN-Server.exe'.encode('utf-16le'), payload)
         self.assertIn('WOT_0922_LOOPBACK_ONLY'.encode('utf-16le'), payload)
         self.assertIn(b'player_mode', payload)
+        self.assertIn(
+            'WOT_OFFLINE_PROCDUMP_PATH'.encode('utf-16le'), payload)
+        self.assertIn(
+            'WOT_OFFLINE_CRASH_DUMP_PATH'.encode('utf-16le'), payload)
+        self.assertIn(
+            '.monitor-%02lu.tmp.dmp'.encode('utf-16le'), payload)
+        self.assertIn('-cancel %lu'.encode('utf-16le'), payload)
 
 
 if __name__ == '__main__':

@@ -1,7 +1,9 @@
 import hashlib
 import importlib.util
 import json
+import shutil
 import struct
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -11,6 +13,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / '0.9.22' / 'tools' / 'bake_foliage_0922.py'
 DATA_ROOT = ROOT / '0.9.22' / 'foliage'
+CLIENT_SCRIPTS = (ROOT / '0.9.22' / 'src' / 'res' /
+                  'scripts' / 'client')
+sys.path.insert(0, str(CLIENT_SCRIPTS))
+
+from gui.mods.offline_lan_0922 import prebaked_foliage
 
 
 def load_baker():
@@ -139,6 +146,30 @@ class FoliageBaker0922Tests(unittest.TestCase):
             self.assertEqual(self.baker.GAME_VERSION, data['game_version'])
             self.assertGreater(len(data['instances']), 0)
             self.assertTrue(all(len(row) == 10 for row in data['instances']))
+
+    def test_runtime_loader_only_validates_selected_foliage_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'foliage'
+            target.mkdir()
+            manifest_path = target / 'manifest.json'
+            shutil.copy2(DATA_ROOT / 'manifest.json', manifest_path)
+            shutil.copy2(DATA_ROOT / '06_ensk.json',
+                         target / '06_ensk.json')
+
+            loaded = prebaked_foliage.load_foliage(
+                '06_ensk', base_dir=directory)
+            self.assertEqual('06_ensk', loaded.map_name)
+
+            manifest = json.loads(manifest_path.read_text())
+            selected = next(
+                record for record in manifest['maps']
+                if record['map'] == '06_ensk')
+            selected['sha256'] = ''
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(
+                    ValueError, 'manifest record is invalid'):
+                prebaked_foliage.load_foliage(
+                    '06_ensk', base_dir=directory)
 
 
 if __name__ == '__main__':

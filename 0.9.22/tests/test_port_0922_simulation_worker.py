@@ -1394,6 +1394,8 @@ class SimulationWorkerSocketTests(unittest.TestCase):
                 'authority_epoch', 'capabilities', 'server_capabilities',
                 'team_sizes', 'authority_status',
                 'authority_fallback_reason', 'worker_status',
+                'destructibles_disabled',
+                'destructibles_disabled_reason',
                 'vehicle_compact_descr',
             }, set(welcome))
             roster = player.receive_until('roster')

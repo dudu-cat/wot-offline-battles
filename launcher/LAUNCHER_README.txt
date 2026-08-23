@@ -21,9 +21,7 @@ Tanks, and stops that server when the game closes.
      example 192.168.1.20 or 192.168.1.20:28782.
 4. Type a player name. Other players see it in the LAN room. Test connection
    checks the address you typed, or reports whether port 28782 on this PC is
-   already taken when you host. A 0.9.22 single-player or host session also
-   lets you choose the total tanks per team, including human players, from 1
-   through 15.
+   already taken when you host.
 5. Click Start game. The launcher removes older mod files, installs the mod
    for that client, and starts the game. This takes a few seconds. It validates
    and stages the complete package before replacing the old mod, and restores
@@ -31,7 +29,10 @@ Tanks, and stops that server when the game closes.
 
 In the game, fit a tank and click Battle!. Everyone lands in the LAN waiting
 room, drawn over the stock battle queue screen. The room host selects the map
-and clicks START BATTLE. LEAVE closes the room and returns you to the garage.
+and the total tanks for each team, including human players, from 1 through 15,
+then clicks START BATTLE. The room settings can be changed there without
+restarting the game or LAN server. LEAVE closes the room and returns you to
+the garage.
 
 On the 0.9.22 client the garage works offline. Every vehicle is owned and every
 module in its own tech tree is unlocked, each vehicle arrives with its top
@@ -82,11 +83,18 @@ Cancelling is nonfatal, but other PCs may remain unable to connect. Run this
 trusted-LAN server only on a network you trust.
 
 The launcher keeps its settings in
-%LOCALAPPDATA%\WoTOfflineBattles\launcher.json. "Create error report" copies
-only the exact log slices from the latest launcher game session into a ZIP in
-%LOCALAPPDATA%\WoTOfflineBattles\reports, then selects that ZIP in Windows
-Explorer. Player and hidden-worker logs are kept separate; configuration,
-vehicle profiles, saved results, and other user data are never included.
+%LOCALAPPDATA%\WoTOfflineBattles\launcher.json. For the exact 0.9.22 client,
+crash report collection is enabled by default on the launch page. It monitors
+both the visible client and the hidden simulation client. If either one closes
+unexpectedly, the launcher creates a ZIP and asks whether you want to report
+the crash. Choosing Yes only selects that ZIP in Windows Explorer; the launcher
+never uploads it. Choosing No deletes that newly created ZIP.
+
+"Create error report" and automatic crash reports copy only the exact log
+slices from the latest launcher game session into a ZIP in
+%LOCALAPPDATA%\WoTOfflineBattles\reports. A confirmed crash report can also
+contain debugging information from the crashing client. Configuration,
+vehicle profiles, and saved results are not copied as separate files.
 
 If the hosted server never opens port 28782, another server may already use
 that port. Close it and start the game again.
@@ -120,6 +128,17 @@ hooks are under Apache License 2.0, and the isolated helper is also available
 under MIT. The complete PyInstaller 6.21.0 licensing terms are available at:
 
 https://github.com/pyinstaller/pyinstaller/blob/v6.21.0/COPYING.txt
+
+Microsoft Sysinternals ProcDump is not included in this launcher. The first
+time the launcher asks about native crash dumps, choosing Enable downloads the
+32-bit ProcDump executable directly from Microsoft's official site to
+%LOCALAPPDATA%\WoTOfflineBattles\tools\procdump.exe. Choosing Enable also
+accepts Microsoft's license terms. If the download fails, crash-dump collection
+stays disabled and the game can still be launched normally.
+
+https://learn.microsoft.com/en-us/sysinternals/downloads/procdump
+https://learn.microsoft.com/en-us/sysinternals/license-faq
+https://learn.microsoft.com/en-us/sysinternals/license-terms
 
 World of Tanks and its assets are not included with this server. This project
 is unofficial and is not endorsed by Wargaming.

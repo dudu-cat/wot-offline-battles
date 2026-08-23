@@ -173,6 +173,49 @@ class LanProtocolTests(unittest.TestCase):
         self.assertFalse(self.client.select_vehicle('germany:G01_PzI', 150))
         self.assertEqual([], self.sent)
 
+    def test_host_can_set_each_team_size_during_the_waiting_room(self):
+        from gui.mods.offline_lan_0922 import lan_client
+        self.client.phase = 'waiting'
+        self.client.server_capabilities = [
+            lan_client.TEAM_SIZE_SELECTION_CAPABILITY]
+
+        self.assertTrue(self.client.set_team_size(1, 4))
+        self.assertTrue(self.client.set_team_size(2, 9))
+
+        self.assertEqual({
+            'type': 'set_team_size', 'team': 1, 'size': 4}, self.sent[-2])
+        self.assertEqual({
+            'type': 'set_team_size', 'team': 2, 'size': 9}, self.sent[-1])
+
+    def test_team_size_request_requires_host_waiting_and_capability(self):
+        from gui.mods.offline_lan_0922 import lan_client
+        self.client.phase = 'waiting'
+        self.client.server_capabilities = []
+        self.assertFalse(self.client.set_team_size(1, 4))
+        self.client.server_capabilities = [
+            lan_client.TEAM_SIZE_SELECTION_CAPABILITY]
+        self.client.host_player_id = 2
+        self.assertFalse(self.client.set_team_size(1, 4))
+        self.client.host_player_id = 1
+        self.assertFalse(self.client.set_team_size(1, 0))
+        self.assertFalse(self.client.set_team_size(3, 4))
+        self.assertEqual([], self.sent)
+
+    def test_team_size_denial_adopts_the_server_capacity(self):
+        self.client.phase = 'waiting'
+        events = []
+        self.client.on_event = lambda kind, message: events.append(kind)
+
+        self.client._handle_message({
+            'type': 'team_size_denied', 'protocol': 5, 'round_id': 7,
+            'state_revision': 5, 'team': 1, 'size': 2,
+            'code': 'team_occupied',
+            'team_sizes': {'1': 4, '2': 8},
+        })
+
+        self.assertEqual({1: 4, 2: 8}, self.client.team_sizes)
+        self.assertEqual(['team_size_denied'], events)
+
     def _room_with_one_player(self):
         state = BattleState(map_name='01_karelia')
         state.client_build = CLIENT_BUILD_0922

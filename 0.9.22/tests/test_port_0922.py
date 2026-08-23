@@ -627,6 +627,39 @@ class PortConfigTests(unittest.TestCase):
                          'offline_lan_0922'), path)
         self.assertNotIn(os.path.join('mods', 'configs'), path)
 
+    def test_waiting_room_choices_round_trip_in_player_owned_state(self):
+        config_module = _load_port_source('config')
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'waiting_room_state.json')
+            choices = {
+                'schema': 1,
+                'map': '05_prohorovka',
+                'team': 2,
+                'team_sizes': {1: 4, 2: 9},
+            }
+
+            self.assertTrue(config_module.save_waiting_room_state(
+                choices, path))
+
+            self.assertEqual(
+                choices, config_module.load_waiting_room_state(path))
+            self.assertEqual(
+                {'schema': 1, 'map': '05_prohorovka', 'team': 2,
+                 'team_sizes': {'1': 4, '2': 9}},
+                json.loads(Path(path).read_text(encoding='utf-8')))
+
+    def test_invalid_waiting_room_state_falls_back_without_blocking_login(self):
+        config_module = _load_port_source('config')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'waiting_room_state.json'
+            path.write_text(
+                '{"schema": 1, "map": "01_karelia", "team": 9, '
+                '"team_sizes": {"1": 99}}', encoding='utf-8')
+
+            self.assertEqual(
+                {'schema': 1, 'map': None, 'team': 0, 'team_sizes': {}},
+                config_module.load_waiting_room_state(str(path)))
+
     def test_legacy_user_state_is_copied_without_deleting_the_old_file(self):
         config_module = _load_port_source('config')
         with tempfile.TemporaryDirectory() as directory:

@@ -54,6 +54,17 @@ available under the MIT license. The complete version-pinned licensing terms
 are retained upstream in
 [`PyInstaller v6.21.0 COPYING.txt`](https://github.com/pyinstaller/pyinstaller/blob/v6.21.0/COPYING.txt).
 
+## Microsoft Sysinternals ProcDump
+
+Microsoft Sysinternals ProcDump is not distributed with this project. If a user
+chooses to enable native crash dumps, the launcher downloads the 32-bit
+executable directly from Microsoft's official download host into that user's
+local application-data directory. The download and use of ProcDump are governed
+by Microsoft's [license terms](https://learn.microsoft.com/en-us/sysinternals/license-terms).
+Official information is available from the
+[ProcDump documentation](https://learn.microsoft.com/en-us/sysinternals/downloads/procdump)
+and [Sysinternals licensing FAQ](https://learn.microsoft.com/en-us/sysinternals/license-faq).
+
 ## Wargaming intellectual property
 
 This project is an unofficial compatibility modification. It does not include

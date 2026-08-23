@@ -301,10 +301,11 @@ class ShotTraversalTest(unittest.TestCase):
 
 
 class DonationInstallTest(unittest.TestCase):
-    def test_partial_parts_accumulate_then_incomplete_map_fails(self):
+    def test_partial_parts_accumulate_then_incomplete_map_disables_feature(self):
         state = _state_with_authority(ready_world=False)
         state.request_start(1, '01_karelia')
         started_round = state.round_id
+        authority = state.server_authority
         world = state.server_authority.world
         catalog_rows = [
             [list(_signature(1.0, 0.0, 1.0)), 3, 0, 5.0, None],
@@ -325,28 +326,34 @@ class DonationInstallTest(unittest.TestCase):
             'unit_vehicle_mass': 8000.0, 'resources': {},
             'instances': [],
         })
-        self.assertEqual('failed', second)
-        self.assertIsNone(state.server_authority)
-        self.assertEqual('waiting', state.phase)
-        self.assertGreater(state.round_id, started_round)
-        self.assertEqual('failed', state.authority_status)
+        self.assertEqual('ready', second)
+        self.assertIs(state.server_authority, authority)
+        self.assertEqual('loading', state.phase)
+        self.assertEqual(started_round, state.round_id)
+        self.assertEqual('server', state.authority_status)
+        self.assertTrue(world.destructible_identities_ready())
+        self.assertFalse(world.has_destructible_identities())
         self.assertEqual('destructible_map_incomplete',
-                         state.authority_fallback_reason)
+                         world.destructibles_disabled_reason())
         self.assertNotIn('01_karelia', state.destructible_maps)
 
+    def test_client_can_explicitly_disable_unavailable_destructibles(self):
+        state = _state_with_authority(ready_world=False)
         start, error = state.request_start(1, '01_karelia')
         self.assertIsNone(error)
         self.assertTrue(start['need_destructible_map'])
-        signature = next(iter(state.server_authority.world._instances))
-        retry = state.store_destructible_map(1, {
+
+        accepted = state.store_destructible_map(1, {
             'type': 'destructible_map', 'round_id': state.round_id,
-            'map': '01_karelia', 'part': 0, 'parts': 1,
-            'unit_vehicle_mass': 8000.0, 'resources': {},
-            'instances': [[list(signature), 4, 0, 5.0, None]],
+            'map': '01_karelia', 'unavailable': True,
+            'reason': 'client detail is log-only',
         })
-        self.assertEqual('failed', retry)
-        self.assertEqual('destructible_map_incomplete',
-                         state.authority_fallback_reason)
+
+        self.assertEqual('ready', accepted)
+        self.assertEqual('server', state.authority_status)
+        self.assertEqual(
+            'client_destructible_map_unavailable',
+            state.server_authority.world.destructibles_disabled_reason())
 
     def test_non_host_bundle_cannot_pollute_or_fallback_authority(self):
         state = _state_with_authority(ready_world=False)
@@ -368,7 +375,7 @@ class DonationInstallTest(unittest.TestCase):
         self.assertEqual('server_pending', state.authority_status)
         self.assertNotIn('01_karelia', state.destructible_maps)
 
-    def test_pending_identity_donor_disconnect_fails_the_round(self):
+    def test_pending_identity_donor_disconnect_disables_destructibles(self):
         state = _state_with_authority(ready_world=False)
         state.players[2] = __import__(
             'test_port_0922_server_authority')._player(2, team=2)
@@ -385,12 +392,13 @@ class DonationInstallTest(unittest.TestCase):
 
         state.remove_player(1)
 
-        self.assertIsNone(state.server_authority)
+        self.assertIsNotNone(state.server_authority)
         self.assertNotIn('01_karelia', state.destructible_maps)
-        self.assertEqual('waiting', state.phase)
-        self.assertEqual('failed', state.authority_status)
+        self.assertEqual('loading', state.phase)
+        self.assertEqual('server', state.authority_status)
         self.assertEqual('destructible_map_donor_disconnected',
-                         state.authority_fallback_reason)
+                         state.server_authority.world.
+                         destructibles_disabled_reason())
 
     def test_visible_destructible_report_cannot_mark_the_world(self):
         world = _installed_world(fence_at=(24.0, 0.0, 24.0))
@@ -410,6 +418,34 @@ class DonationInstallTest(unittest.TestCase):
         self.assertTrue(state.report_destructible(
             SERVER_AUTHORITY_ID, event))
         self.assertTrue(world.is_destroyed(_signature(24.0, 0.0, 24.0)))
+
+    def test_human_destructible_report_is_ignored_after_disable(self):
+        world = _installed_world(fence_at=(24.0, 0.0, 24.0))
+        unused_driver, state = _driver(world)
+        state.players[2] = __import__(
+            'test_port_0922_server_authority')._player(2)
+        world.disable_destructibles('destructible_map_timeout')
+        state_revision = state.state_revision
+
+        accepted = state.report_destructible(2, {
+            'type': 'destructible', 'round_id': state.round_id,
+            'destructible_kind': 'fragile', 'chunk_id': 7,
+            'item_index': 0, 'x': 24.0, 'y': 0.0, 'z': 24.0,
+            'fall_yaw': 0.0, 'speed': 5.0, 'is_shot': False,
+        })
+
+        self.assertTrue(accepted)
+        self.assertEqual({}, state.destructibles)
+        self.assertEqual([], state.pending_events)
+        self.assertEqual(0, state.destructible_revision)
+        self.assertEqual(state_revision, state.state_revision)
+        self.assertFalse(world.is_destroyed(
+            _signature(24.0, 0.0, 24.0)))
+        self.assertEqual(True, state._authority_fields()[
+            'destructibles_disabled'])
+        self.assertEqual(
+            'destructible_map_timeout', state._authority_fields()[
+                'destructibles_disabled_reason'])
 
 
 if __name__ == '__main__':

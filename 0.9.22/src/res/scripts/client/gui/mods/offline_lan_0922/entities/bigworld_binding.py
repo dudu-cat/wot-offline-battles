@@ -219,6 +219,40 @@ class BigWorldVehicleBinding(object):
         self._need(provider, 'stopVehicleVisual')
         provider.stopVehicleVisual(int(entity_id), bool(is_player))
 
+    def refresh_vehicle_minimap(self, entity_id):
+        """Rebind one stock minimap entry to its current Vehicle matrix.
+
+        Native ``Vehicle.startVisual`` runs before the LAN pose overlay can be
+        attached.  Its first minimap entry therefore captures the inert spawn
+        matrix.  Replaying only the minimap-added signal after attach makes
+        #1513 rebuild that matrix provider without removing the 2D marker or
+        changing the feedback adaptor's visible-vehicle set.
+        """
+        entity = self._authority_entity_or_fail(entity_id)
+        self._need(entity, 'proxy')
+        provider = self._need(self._avatar, 'guiSessionProvider')
+        get_arena_dp = self._need(provider, 'getArenaDP')
+        if not callable(get_arena_dp):
+            raise CapabilityError(
+                'required #1513 capability is not callable: getArenaDP')
+        arena_dp = get_arena_dp()
+        get_vehicle_info = self._need(arena_dp, 'getVehicleInfo')
+        get_gui_props = self._need(arena_dp, 'getPlayerGuiProps')
+        if not callable(get_vehicle_info) or not callable(get_gui_props):
+            raise CapabilityError(
+                'required #1513 minimap arena capabilities are not callable')
+        vehicle_info = get_vehicle_info(int(entity_id))
+        gui_props = get_gui_props(int(entity_id), vehicle_info.team)
+        shared = self._need(provider, 'shared')
+        feedback = self._need(shared, 'feedback')
+        added = self._need(feedback, 'onMinimapVehicleAdded')
+        if not callable(added):
+            raise CapabilityError(
+                'required #1513 capability is not callable: '
+                'onMinimapVehicleAdded')
+        added(entity.proxy, vehicle_info, gui_props)
+        return True
+
     def arena_vehicle_killed(self, entity_id, attacker_id=0, reason=0):
         """Publish the exact uncompressed #1513 ClientArena kill tuple."""
         payload = (int(entity_id), int(attacker_id), 0, int(reason))

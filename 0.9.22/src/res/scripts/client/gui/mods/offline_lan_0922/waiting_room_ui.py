@@ -59,11 +59,19 @@ CONTROL_Z = 0.05
 CONTROL_FRAME_OFFSET = 0.01
 PANEL_WIDTH = 680
 PANEL_HEIGHT = 300
+PANEL_SAFE_MARGIN = 16
+PANEL_RAISE_PIXELS = 24
 POINTER_TICK_SECONDS = 0.03
 RANDOM_MAP_OPTION = 'server_random'
 
 _HOST_CONTROLS = ('previous', 'map', 'next', 'start')
-_TEAM_CONTROLS = ('team1', 'team2')
+_TEAM_SELECT_CONTROLS = ('team1', 'team2')
+_TEAM_SIZE_CONTROLS = (
+    'team1_down', 'team1_up', 'team2_down', 'team2_up')
+_TEAM_SIZE_ACTIONS = {
+    'team1_down': (1, -1), 'team1_up': (1, 1),
+    'team2_down': (2, -1), 'team2_up': (2, 1),
+}
 
 
 def _LEFT_MOUSE_KEY():
@@ -90,6 +98,31 @@ def friendly_map_name(map_name):
         parts = parts[1:]
     return prefix + (' '.join([part.capitalize() for part in parts]) or
                      'Unknown')
+
+
+def panel_geometry(screen_size):
+    """Return a compact panel geometry that stays inside the screen.
+
+    Native CLIP coordinates are resolution-independent, but the panel itself
+    has pixel dimensions.  Raising it by a fixed number of pixels keeps its
+    perceived position stable across aspect ratios, while the safe-margin
+    clamp prevents the move from pushing it off a short display.
+    """
+    try:
+        width, height = screen_size or (1024.0, 768.0)
+        width, height = float(width), float(height)
+    except (TypeError, ValueError):
+        width, height = 1024.0, 768.0
+    if width <= 0.0 or height <= 0.0:
+        width, height = 1024.0, 768.0
+    available_width = max(1.0, width - 2.0 * PANEL_SAFE_MARGIN)
+    available_height = max(1.0, height - 2.0 * PANEL_SAFE_MARGIN)
+    panel_width = min(float(PANEL_WIDTH), available_width)
+    panel_height = min(float(PANEL_HEIGHT), available_height)
+    raise_limit = max(
+        0.0, (height - panel_height) * 0.5 - PANEL_SAFE_MARGIN)
+    raise_pixels = min(float(PANEL_RAISE_PIXELS), raise_limit)
+    return panel_width, panel_height, 2.0 * raise_pixels / height
 
 
 class NativeSurface(object):
@@ -237,7 +270,9 @@ class WaitingRoomUI(object):
 
     def __init__(self, request_start, map_pool, status=None, on_close=None,
                  host=None, surface=None, random_supported=None,
-                 request_team=None, team_status=None):
+                 request_team=None, team_status=None,
+                 request_team_size=None, initial_map=None,
+                 on_map_selected=None):
         self._request_start = request_start
         self._map_pool = map_pool
         self._status = status or (lambda: '')
@@ -245,7 +280,9 @@ class WaitingRoomUI(object):
         self._host = host or (lambda: False)
         self._random_supported = random_supported or (lambda: True)
         self._request_team = request_team
+        self._request_team_size = request_team_size
         self._team_status = team_status or (lambda: {})
+        self._on_map_selected = on_map_selected
         self._surface = surface
         self._panel = None
         self._controls = {}
@@ -258,8 +295,9 @@ class WaitingRoomUI(object):
         self._pointer_ticks = 0
         self._open = False
         self._hovered = None
-        self._selected_map = None
+        self._selected_map = initial_map
         self._message = ''
+        self._pending_team_sizes = {}
 
     def install(self):
         """Build the native components without showing them."""
@@ -294,28 +332,45 @@ class WaitingRoomUI(object):
         # GUI.Window can never accept it.  Setting it only logged a skip.
         self._set(panel, 'visible', False)
         self._panel = panel
-        self._make_control('previous', (-0.72, 0.05, CONTROL_Z), 0.20, 0.20)
-        self._make_control('map', (0.0, 0.05, CONTROL_Z), 1.15, 0.20)
-        self._make_control('next', (0.72, 0.05, CONTROL_Z), 0.20, 0.20)
-        self._make_control('team1', (-0.30, 0.27, CONTROL_Z), 0.52, 0.16)
-        self._make_control('team2', (0.30, 0.27, CONTROL_Z), 0.52, 0.16)
+        self._apply_layout()
+        self._make_control('previous', (-0.72, 0.16, CONTROL_Z), 0.20, 0.20)
+        self._make_control('map', (0.0, 0.16, CONTROL_Z), 1.15, 0.20)
+        self._make_control('next', (0.72, 0.16, CONTROL_Z), 0.20, 0.20)
+        self._make_control('team1_down', (-0.82, -0.08, CONTROL_Z),
+                           0.12, 0.16)
+        self._make_control('team1', (-0.52, -0.08, CONTROL_Z), 0.42, 0.16)
+        self._make_control('team1_up', (-0.22, -0.08, CONTROL_Z),
+                           0.12, 0.16)
+        self._make_control('team2_down', (0.22, -0.08, CONTROL_Z),
+                           0.12, 0.16)
+        self._make_control('team2', (0.52, -0.08, CONTROL_Z), 0.42, 0.16)
+        self._make_control('team2_up', (0.82, -0.08, CONTROL_Z),
+                           0.12, 0.16)
         self._make_control('start', (0.0, -0.40, CONTROL_Z), 1.20, 0.22)
         self._make_control('close', (0.0, -0.78, CONTROL_Z), 0.50, 0.18)
         self._make_label('title', 'LAN WAITING ROOM', (-0.86, 0.82, 0.0), 1.72,
                          0.12, colour=(232, 244, 255, 255))
         self._make_label('room', '', (-0.86, 0.62, 0.0), 1.72, 0.11)
         self._make_label('players', '', (-0.86, 0.44, 0.0), 1.72, 0.11)
-        # These five sit on a textured button, which renders white until a
+        # These labels sit on textured buttons, which render white until a
         # tint is proved, so their text has to be dark to stay readable.
-        self._make_label('previous', '<', (-0.72, 0.05, 0.0), 0.18, 0.12,
+        self._make_label('previous', '<', (-0.72, 0.16, 0.0), 0.18, 0.12,
                          anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        self._make_label('map', '', (0.0, 0.05, 0.0), 1.10, 0.12,
+        self._make_label('map', '', (0.0, 0.16, 0.0), 1.10, 0.12,
                          anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        self._make_label('next', '>', (0.72, 0.05, 0.0), 0.18, 0.12,
+        self._make_label('next', '>', (0.72, 0.16, 0.0), 0.18, 0.12,
                          anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        self._make_label('team1', 'TEAM 1', (-0.30, 0.27, 0.0), 0.48,
+        self._make_label('team1_down', '-', (-0.82, -0.08, 0.0), 0.10,
                          0.10, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        self._make_label('team2', 'TEAM 2', (0.30, 0.27, 0.0), 0.48,
+        self._make_label('team1', 'TEAM 1', (-0.52, -0.08, 0.0), 0.40,
+                         0.10, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        self._make_label('team1_up', '+', (-0.22, -0.08, 0.0), 0.10,
+                         0.10, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        self._make_label('team2_down', '-', (0.22, -0.08, 0.0), 0.10,
+                         0.10, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        self._make_label('team2', 'TEAM 2', (0.52, -0.08, 0.0), 0.40,
+                         0.10, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        self._make_label('team2_up', '+', (0.82, -0.08, 0.0), 0.10,
                          0.10, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
         self._make_label('start', 'START BATTLE', (0.0, -0.40, 0.0), 1.16,
                          0.12, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
@@ -323,6 +378,20 @@ class WaitingRoomUI(object):
                          anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
         self._make_label('message', '', (-0.86, -0.60, 0.0), 1.72, 0.11,
                          colour=(184, 205, 222, 255))
+        return True
+
+    def _apply_layout(self):
+        if self._panel is None:
+            return False
+        reader = getattr(self._surface, 'screen_size', None)
+        try:
+            screen_size = reader() if callable(reader) else None
+        except Exception:
+            screen_size = None
+        width, height, y = panel_geometry(screen_size)
+        self._set(self._panel, 'width', width)
+        self._set(self._panel, 'height', height)
+        self._set(self._panel, 'position', (0.0, y, OVERLAY_Z))
         return True
 
     @staticmethod
@@ -382,11 +451,21 @@ class WaitingRoomUI(object):
 
     def _sync_selection(self):
         options = self._options()
-        if not options:
-            self._selected_map = None
-        elif self._selected_map not in options:
-            self._selected_map = options[0]
+        if options and self._selected_map not in options:
+            self._set_selected_map(options[0])
         return options
+
+    def _set_selected_map(self, map_name):
+        if self._selected_map == map_name:
+            return False
+        self._selected_map = map_name
+        if callable(self._on_map_selected):
+            try:
+                self._on_map_selected(map_name)
+            except Exception as error:
+                _log('LAN waiting room could not save the selected map: %s' %
+                     error)
+        return True
 
     def open(self):
         if self._open:
@@ -648,19 +727,30 @@ class WaitingRoomUI(object):
     def refresh(self):
         if not self._open:
             return False
+        self._apply_layout()
         options = self._sync_selection()
         is_host = bool(self._host())
         team_status = self._team_status() or {}
         team_supported = bool(
             callable(self._request_team) and team_status.get('supported'))
+        team_size_supported = bool(
+            is_host and callable(self._request_team_size) and
+            team_status.get('size_supported'))
         current_team = team_status.get('team')
         sizes = team_status.get('sizes') or {}
         counts = team_status.get('counts') or {}
         for team in (1, 2):
-            label = 'TEAM %d  %d/%d%s' % (
+            size = int(sizes.get(team, sizes.get(str(team), 15)))
+            pending = self._pending_team_sizes.get(team)
+            if pending == size:
+                self._pending_team_sizes.pop(team, None)
+                pending = None
+            shown_size = pending if pending is not None else size
+            label = 'TEAM %d  %d/%d%s%s' % (
                 team, int(counts.get(team, 0)),
-                int(sizes.get(team, sizes.get(str(team), 15))),
-                '  SELECTED' if current_team == team else '')
+                shown_size,
+                '  (YOU)' if current_team == team else '',
+                '...' if pending is not None else '')
             self._set_text('team%d' % team, label)
         lines = str(self._status() or '').splitlines()
         self._set_text('room', lines[0] if lines else '')
@@ -674,7 +764,8 @@ class WaitingRoomUI(object):
                            'The room host starts the battle.')
         self._set_text('message', self._message)
         for role, component in self._controls.items():
-            visible = (team_supported if role in _TEAM_CONTROLS else
+            visible = (team_supported if role in _TEAM_SELECT_CONTROLS else
+                       team_size_supported if role in _TEAM_SIZE_CONTROLS else
                        role == 'close' or is_host)
             self._set(component, 'visible', visible)
             label = self._labels.get(role)
@@ -715,8 +806,11 @@ class WaitingRoomUI(object):
             if callable(self._on_close):
                 self._on_close()
             return True
-        if role in _TEAM_CONTROLS:
+        if role in _TEAM_SELECT_CONTROLS:
             return self._select_team(int(role[-1]))
+        if role in _TEAM_SIZE_ACTIONS:
+            team, step = _TEAM_SIZE_ACTIONS[role]
+            return self._adjust_team_size(team, step)
         if not self._host():
             return False
         if role == 'previous':
@@ -743,6 +837,46 @@ class WaitingRoomUI(object):
             return False
         return True
 
+    def _adjust_team_size(self, team, step):
+        status = self._team_status() or {}
+        if (not self._host() or not callable(self._request_team_size) or
+                not status.get('size_supported')):
+            return False
+        sizes = status.get('sizes') or {}
+        counts = status.get('counts') or {}
+        current = self._pending_team_sizes.get(
+            team, int(sizes.get(team, sizes.get(str(team), 15))))
+        target = max(1, min(15, int(current) + int(step)))
+        if target < int(counts.get(team, 0)):
+            self._message = 'Team %d already has %d player(s).' % (
+                team, int(counts.get(team, 0)))
+            self.refresh()
+            return False
+        if target == current:
+            self._message = 'Team %d size is already %d.' % (team, target)
+            self.refresh()
+            return True
+        self._pending_team_sizes[team] = target
+        self._message = 'Setting Team %d size to %d...' % (team, target)
+        self.refresh()
+        if self._request_team_size(team, target) is False:
+            self._pending_team_sizes.pop(team, None)
+            self._message = 'The server did not accept that team size.'
+            self.refresh()
+            return False
+        return True
+
+    def reject_team_size(self, team, message=None):
+        """Retire one optimistic size after a server denial."""
+        try:
+            team = int(team)
+        except (TypeError, ValueError):
+            return False
+        self._pending_team_sizes.pop(team, None)
+        self._message = message or 'The server did not accept that team size.'
+        self.refresh()
+        return True
+
     def _cycle(self, step):
         options = self._options()
         if not options:
@@ -753,7 +887,7 @@ class WaitingRoomUI(object):
             index = options.index(self._selected_map)
         except ValueError:
             index = 0
-        self._selected_map = options[(index + int(step)) % len(options)]
+        self._set_selected_map(options[(index + int(step)) % len(options)])
         self._message = ''
         self.refresh()
         return True

@@ -297,10 +297,6 @@ class AuthorityWorkerLANClient(LANClient):
                 break
         if source is None:
             raise ValueError('worker round has no real player descriptor')
-        maximum = _exact_int(source.get('max_health'))
-        if maximum is None or maximum <= 0:
-            maximum = _exact_int(source.get('health'))
-        maximum = max(1, int(maximum or 1))
         dummy = {
             'id': WORKER_AUTHORITY_ID,
             'name': 'SimulationWorker',
@@ -311,14 +307,14 @@ class AuthorityWorkerLANClient(LANClient):
             'x': 0.0, 'y': WORKER_DUMMY_Y, 'z': 0.0,
             'yaw': 0.0, 'aim_yaw': 0.0, 'gun_pitch': 0.0,
             'speed': 0.0, 'world_pose': True,
-            'health': maximum, 'max_health': maximum, 'alive': True,
+            'health': 1, 'max_health': 1, 'alive': True,
             'critical': {}, 'critical_revision': 0,
             'critical_base_revision': 0, 'critical_ack_seq': 0,
             'outfits': {},
         }
         self._worker_avatar = dummy
         self.vehicle = dummy['vehicle']
-        self.max_health = maximum
+        self.max_health = 1
         self.team = dummy['team']
         self.spawn = {
             'x': dummy['x'], 'y': dummy['y'], 'z': dummy['z'],

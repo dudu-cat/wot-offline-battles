@@ -718,9 +718,7 @@ def _vehicle_label(record, translations):
         key = key.lstrip("#")
         localized = translations.gettext(key) if translations and key else key
         if localized and localized not in (key, vehicle):
-            if localized.casefold() == display_id.casefold():
-                return localized
-            return "%s (%s)" % (localized, display_id)
+            return localized
     return display_id
 
 
@@ -847,22 +845,79 @@ def _element_child(element, name):
     return values[0].value
 
 
-def _vehicle_component_references(root):
-    """Read only component references explicitly present in one vehicle."""
-    references = dict((name, set()) for name in (
-        "chassis", "engines", "fuelTanks", "guns", "radios", "turrets"))
-    for category in ("chassis", "engines", "fuelTanks", "radios"):
+def _shared_component_names(root):
+    """Return unambiguous element records from one component shared table."""
+    shared = _element_child(root, "shared")
+    if shared is None:
+        return set()
+    entries = {}
+    for raw_name, value in shared.children:
+        try:
+            name = raw_name.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if _SAFE_SEGMENT.fullmatch(name) is None:
+            continue
+        entries.setdefault(name, []).append(value)
+    return set(
+        name for name, values in entries.items()
+        if (len(values) == 1 and
+            values[0].value_type == packed_xml.TYPE_ELEMENT))
+
+
+def _element_leaf_paths(element, prefix=()):
+    paths = set()
+    for raw_name, value in element.children:
+        try:
+            name = raw_name.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        path = prefix + (name,)
+        if value.value_type == packed_xml.TYPE_ELEMENT:
+            paths.update(_element_leaf_paths(value.value, path))
+        else:
+            paths.add("/".join(path))
+    return paths
+
+
+def _vehicle_shared_component_occurrences(root, shared_components=None):
+    """Return stock shared references and any vehicle-local leaf overrides."""
+    shared_components = shared_components or {}
+    occurrences = dict((name, {}) for name in (
+        "chassis", "engines", "fuelTanks", "radios"))
+    for category in occurrences:
         container = _element_child(root, category)
         if container is None:
             continue
+        known = shared_components.get(category, set())
         for raw_name, value in container.children:
-            if value.value_type == packed_xml.TYPE_ELEMENT:
-                continue
             try:
-                if _scalar_text(value) == "shared":
-                    references[category].add(raw_name.decode("utf-8"))
-            except (UnicodeDecodeError, VehicleOverlayError):
+                name = raw_name.decode("utf-8")
+            except UnicodeDecodeError:
                 continue
+            if value.value_type == packed_xml.TYPE_ELEMENT:
+                if name not in known:
+                    continue
+                overrides = _element_leaf_paths(value.value)
+            else:
+                try:
+                    if _scalar_text(value) != "shared":
+                        continue
+                except VehicleOverlayError:
+                    continue
+                overrides = set()
+            occurrences[category].setdefault(name, []).append(overrides)
+    return occurrences
+
+
+def _vehicle_component_references(root, shared_components=None):
+    """Read only component references explicitly present in one vehicle."""
+    references = dict((name, set()) for name in (
+        "chassis", "engines", "fuelTanks", "guns", "radios", "turrets"))
+    shared_occurrences = _vehicle_shared_component_occurrences(
+        root, shared_components)
+    for category, components in shared_occurrences.items():
+        references[category].update(components)
 
     for raw_group, group_value in root.children:
         try:
@@ -899,20 +954,6 @@ def _vehicle_local_gun_overrides(root):
     """Return every gun occurrence and the leaves overriding shared data."""
     occurrences = {}
 
-    def leaf_paths(element, prefix=()):
-        paths = set()
-        for raw_name, value in element.children:
-            try:
-                name = raw_name.decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-            path = prefix + (name,)
-            if value.value_type == packed_xml.TYPE_ELEMENT:
-                paths.update(leaf_paths(value.value, path))
-            else:
-                paths.add("/".join(path))
-        return paths
-
     for raw_group, group_value in root.children:
         try:
             group_name = raw_group.decode("utf-8")
@@ -934,7 +975,7 @@ def _vehicle_local_gun_overrides(root):
                     continue
                 overrides = set()
                 if gun_value.value_type == packed_xml.TYPE_ELEMENT:
-                    overrides = leaf_paths(gun_value.value)
+                    overrides = _element_leaf_paths(gun_value.value)
                 occurrences.setdefault(gun_name, []).append(overrides)
     return occurrences
 
@@ -1105,21 +1146,32 @@ def list_vehicle_field_choices(game_root, vehicle_member):
                     "The selected vehicle is not in the stock vehicle roster.")
 
             roots = {}
-            references = {}
-            local_gun_overrides = {}
             for choice in roster:
                 member = choice["member"]
                 roots[member] = packed_xml.read_packed_xml(archive.read(member))
-                references[member] = _vehicle_component_references(
-                    roots[member])
-                local_gun_overrides[member] = _vehicle_local_gun_overrides(
-                    roots[member])
 
             component_roots = {}
             for category, member in component_members.items():
                 if counts.get(member) == 1:
                     component_roots[category] = packed_xml.read_packed_xml(
                         archive.read(member))
+
+            shared_components = dict(
+                (category, _shared_component_names(root))
+                for category, root in component_roots.items())
+            references = {}
+            local_component_overrides = {}
+            local_gun_overrides = {}
+            for choice in roster:
+                member = choice["member"]
+                root = roots[member]
+                references[member] = _vehicle_component_references(
+                    root, shared_components)
+                local_component_overrides[member] = (
+                    _vehicle_shared_component_occurrences(
+                        root, shared_components))
+                local_gun_overrides[member] = (
+                    _vehicle_local_gun_overrides(root))
 
             siege_member = _siege_peer_member(vehicle_member)
             siege_root = None
@@ -1224,7 +1276,17 @@ def list_vehicle_field_choices(game_root, vehicle_member):
             if component not in components:
                 continue
             users = affected.get((category, component), set())
-            if category == "guns":
+            if category in local_component_overrides[vehicle_member]:
+                shared_parts = _field_parts(field["fieldPath"])
+                shared_suffix = "/".join(shared_parts[2:])
+                users = set()
+                for choice in roster:
+                    occurrences = local_component_overrides[
+                        choice["member"]][category].get(component, ())
+                    if any(shared_suffix not in overrides
+                           for overrides in occurrences):
+                        users.add(choice["vehicle"])
+            elif category == "guns":
                 shared_parts = _field_parts(field["fieldPath"])
                 shared_suffix = "/".join(shared_parts[2:])
                 users = set()

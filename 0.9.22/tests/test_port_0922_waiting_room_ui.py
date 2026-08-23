@@ -155,6 +155,46 @@ class WaitingRoomTests(unittest.TestCase):
         self.assertTrue(room.activate('start'))
         self.assertEqual(['01_karelia'], self.started)
 
+    def test_saved_map_is_restored_and_new_choices_are_reported(self):
+        selected = []
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True,
+            surface=self.surface, initial_map='05_prohorovka',
+            on_map_selected=selected.append)
+
+        self.assertTrue(room.open())
+        self.assertEqual('05_prohorovka', room._selected_map)
+        self.assertEqual([], selected)
+        self.assertTrue(room.activate('next'))
+        self.assertEqual([self.module.RANDOM_MAP_OPTION], selected)
+
+    def test_unavailable_saved_map_falls_back_and_updates_the_saved_choice(self):
+        selected = []
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True,
+            surface=self.surface, initial_map='99_removed',
+            on_map_selected=selected.append)
+
+        self.assertTrue(room.open())
+
+        self.assertEqual(self.module.RANDOM_MAP_OPTION, room._selected_map)
+        self.assertEqual([self.module.RANDOM_MAP_OPTION], selected)
+
+    def test_saved_map_survives_until_the_server_publishes_its_pool(self):
+        pool = []
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(pool),
+            status=lambda: self.status, host=lambda: True,
+            surface=self.surface, initial_map='05_prohorovka')
+
+        self.assertTrue(room.open())
+        self.assertEqual('05_prohorovka', room._selected_map)
+        pool.extend(self.pool)
+        self.assertTrue(room.refresh())
+        self.assertEqual('05_prohorovka', room._selected_map)
+
     def test_every_player_can_select_a_team_and_see_capacity(self):
         selected = []
         team_state = {
@@ -172,10 +212,96 @@ class WaitingRoomTests(unittest.TestCase):
         self.assertTrue(room._controls['team1'].properties['visible'])
         self.assertTrue(room._controls['team2'].properties['visible'])
         self.assertIn('1/2', room._labels['team1'].properties['text'])
-        self.assertIn('SELECTED', room._labels['team1'].properties['text'])
+        self.assertIn('(YOU)', room._labels['team1'].properties['text'])
         self.assertIn('3/5', room._labels['team2'].properties['text'])
         self.assertTrue(room.activate('team2'))
         self.assertEqual([2], selected)
+
+    def test_host_can_adjust_both_team_sizes_without_an_extra_row(self):
+        requested = []
+        team_state = {
+            'team': 1, 'sizes': {1: 2, 2: 5},
+            'counts': {1: 1, 2: 3}, 'supported': True,
+            'size_supported': True,
+        }
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True,
+            surface=self.surface, request_team=lambda team: True,
+            request_team_size=lambda team, size: (
+                requested.append((team, size)) or True),
+            team_status=lambda: dict(team_state))
+
+        self.assertTrue(room.open())
+        for role in self.module._TEAM_SIZE_CONTROLS:
+            self.assertTrue(room._controls[role].properties['visible'])
+        self.assertTrue(room.activate('team1_down'))
+        self.assertTrue(room.activate('team2_up'))
+        # A second click uses the optimistic target, so the host need not wait
+        # for the roster echo between every step.
+        self.assertTrue(room.activate('team2_up'))
+        self.assertEqual([(1, 1), (2, 6), (2, 7)], requested)
+        self.assertIn('3/7', room._labels['team2'].properties['text'])
+
+    def test_non_host_sees_capacities_but_not_size_controls(self):
+        team_state = {
+            'team': 2, 'sizes': {1: 4, 2: 6},
+            'counts': {1: 1, 2: 2}, 'supported': True,
+            'size_supported': True,
+        }
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: False,
+            surface=self.surface, request_team=lambda team: True,
+            request_team_size=lambda team, size: True,
+            team_status=lambda: dict(team_state))
+
+        self.assertTrue(room.open())
+        self.assertIn('1/4', room._labels['team1'].properties['text'])
+        self.assertIn('2/6', room._labels['team2'].properties['text'])
+        for role in self.module._TEAM_SIZE_CONTROLS:
+            self.assertFalse(room._controls[role].properties['visible'])
+            self.assertFalse(room.activate(role))
+
+    def test_team_size_denial_retires_the_optimistic_value(self):
+        team_state = {
+            'team': 1, 'sizes': {1: 3, 2: 3},
+            'counts': {1: 1, 2: 1}, 'supported': True,
+            'size_supported': True,
+        }
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True,
+            surface=self.surface, request_team=lambda team: True,
+            request_team_size=lambda team, size: True,
+            team_status=lambda: dict(team_state))
+
+        room.open()
+        room.activate('team1_up')
+        self.assertEqual({1: 4}, room._pending_team_sizes)
+        self.assertTrue(room.reject_team_size(1, 'Refused.'))
+        self.assertEqual({}, room._pending_team_sizes)
+        self.assertEqual('Refused.', self._label_for(room, 'message'))
+
+    @staticmethod
+    def _label_for(room, role):
+        return room._labels[role].properties['text']
+
+    def test_panel_geometry_is_raised_and_bounded_at_common_resolutions(self):
+        for screen in ((800, 600), (1024, 768), (1280, 720),
+                       (1920, 1080), (2560, 1080), (3840, 2160)):
+            width, height, y = self.module.panel_geometry(screen)
+            center_y = y * screen[1] * 0.5
+            horizontal_margin = (screen[0] - width) * 0.5
+            top_margin = (screen[1] - height) * 0.5 - center_y
+            bottom_margin = (screen[1] - height) * 0.5 + center_y
+            self.assertGreaterEqual(
+                horizontal_margin, self.module.PANEL_SAFE_MARGIN)
+            self.assertGreaterEqual(top_margin,
+                                    self.module.PANEL_SAFE_MARGIN)
+            self.assertGreaterEqual(bottom_margin,
+                                    self.module.PANEL_SAFE_MARGIN)
+            self.assertGreater(y, 0.0)
 
     def test_the_room_takes_and_releases_the_native_cursor(self):
         class _CursorSurface(_Surface):
