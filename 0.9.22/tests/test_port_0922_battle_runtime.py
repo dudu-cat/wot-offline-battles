@@ -1669,6 +1669,7 @@ def _runtime():
                     'armorRicochet': ('ricochetStages', 'ricochetFx', None),
                     'armorResisted': ('resistedStages', 'resistedFx', None),
                     'armorHit': ('hitStages', 'hitFx', None),
+                    'armorSplashHit': ('splashStages', 'splashFx', None),
                 }})))
 
 
@@ -7050,6 +7051,67 @@ class BattleRuntimeContractTests(unittest.TestCase):
                          (effect.args[1], effect.args[2]))
         self.assertTrue(effect.kwargs['showShockWave'])
         self.assertTrue(effect.kwargs['showFlashBang'])
+
+    def test_he_splash_uses_the_stock_vehicle_explosion_effect(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        target = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        attacker = _Vehicle(11, _Descriptor(), _Vector(10, 0, 0),
+                            (0, 0, 0), {'health': 500})
+        runtime.bigworld.entities.update({10: target, 11: attacker})
+        target_record = {
+            'engine_id': 10, 'state': {'health': 500},
+            'kind': 'player', 'network_id': 1, 'local': True}
+        attacker_record = {
+            'engine_id': 11,
+            'state': {'health': 500, 'x': 10.0, 'y': 0.0, 'z': 0.0},
+            'kind': 'bot', 'network_id': 2, 'local': False}
+        event = {
+            'kind': 'bot_human_hit', 'world_pose': True,
+            'x': 0.5, 'y': 1.0, 'z': 0.0, 'shell_index': 0,
+            'shot_result': 2, 'damage': 40, 'source': 'shot',
+            'splash': True}
+
+        self.assertTrue(battle._present_combat_hit(
+            event, target_record, attacker_record, 11))
+
+        effect = battle._avatar.terrainEffects.addNew.call_args
+        self.assertEqual(('splashFx', 'splashStages'),
+                         (effect.args[1], effect.args[2]))
+
+    def test_direct_ricochet_and_resisted_hits_keep_stock_effects(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        target = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        attacker = _Vehicle(11, _Descriptor(), _Vector(10, 0, 0),
+                            (0, 0, 0), {'health': 500})
+        runtime.bigworld.entities.update({10: target, 11: attacker})
+        target_record = {
+            'engine_id': 10, 'state': {'health': 500},
+            'kind': 'player', 'network_id': 1, 'local': True}
+        attacker_record = {
+            'engine_id': 11,
+            'state': {'health': 500, 'x': 10.0, 'y': 0.0, 'z': 0.0},
+            'kind': 'bot', 'network_id': 2, 'local': False}
+
+        for shot_result, expected in (
+                (0, ('ricochetFx', 'ricochetStages')),
+                (1, ('resistedFx', 'resistedStages'))):
+            battle._avatar.terrainEffects.addNew.reset_mock()
+            event = {
+                'kind': 'bot_human_hit', 'world_pose': True,
+                'x': 0.5, 'y': 1.0, 'z': 0.0, 'shell_index': 0,
+                'shot_result': shot_result, 'damage': 0, 'source': 'shot'}
+
+            self.assertTrue(battle._present_combat_hit(
+                event, target_record, attacker_record, 11))
+
+            effect = battle._avatar.terrainEffects.addNew.call_args
+            self.assertEqual(expected, (effect.args[1], effect.args[2]))
 
     def test_an_unspotted_target_keeps_the_voice_and_loses_the_impact(self):
         """#1513 reaches the armour effect only through

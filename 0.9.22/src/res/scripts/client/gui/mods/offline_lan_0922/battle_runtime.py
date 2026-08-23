@@ -5765,8 +5765,12 @@ class BattleRuntime(object):
             raise RuntimeError('combat shell effects index is unavailable')
         effects_descr = self._runtime.vehicles.g_cache.shotEffects[
             effects_index]
-        effect_group = ('armorRicochet', 'armorResisted', 'armorHit')[
-            shot_result]
+        # Retail presents an HE near-miss through
+        # Vehicle.showDamageFromExplosion/armorSplashHit.  Direct hits keep
+        # the three protocol outcomes: ricochet, resisted and pierced.
+        effect_group = ('armorSplashHit' if event.get('splash', False) else
+                        ('armorRicochet', 'armorResisted', 'armorHit')[
+                            shot_result])
         stages, effects, unused = effects_descr[effect_group]
         hit_position = self._vector((
             _number(event.get('x')), _number(event.get('y')),

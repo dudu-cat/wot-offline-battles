@@ -157,6 +157,14 @@ EXPECTED_ABI = {
             'self', 'startPoint', 'endPoint', 'skipGun'),
     },
     'scripts/client/ProjectileMover.pyc': {
+        'ProjectileMover.add': (
+            'self', 'shotID', 'effectsDescr', 'gravity', 'refStartPoint',
+            'refVelocity', 'startPoint', 'maxDistance', 'attackerID',
+            'tracerCameraPos'),
+        'ProjectileMover.hide': ('self', 'shotID', 'endPoint'),
+        'ProjectileMover.explode': (
+            'self', 'shotID', 'effectsDescr', 'effectMaterial', 'endPoint',
+            'velocityDir'),
         'segmentMayHitEntity': ('entity', 'startPoint', 'endPoint'),
         'collideEntities': (
             'startPoint', 'endPoint', 'entities', 'skipGun'),
@@ -485,6 +493,10 @@ EXPECTED_ABI = {
         'PlayerAvatar.onBattleEvents': ('self', 'events'),
         'PlayerAvatar.getOwnVehicleShotDispersionAngle': (
             'self', 'turretRotationSpeed', 'withShot'),
+        'PlayerAvatar.stopTracer': ('self', 'shotID', 'endPoint'),
+        'PlayerAvatar.explodeProjectile': (
+            'self', 'shotID', 'effectsIndex', 'effectMaterialIndex',
+            'endPoint', 'velocityDir', 'damagedDestructibles'),
         'PlayerAvatar.syncVehicleAttrs': ('self', 'attrs'),
         'PlayerAvatar.updateArena': ('self', 'updateType', 'argStr'),
         'PlayerAvatar.onRoundFinished': ('self', 'winnerTeam', 'reason'),

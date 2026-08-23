@@ -411,14 +411,15 @@ class _RemoteShotPresenter(object):
 
     def stop_canonical(self, projectile_id, end_position,
                        explosion=None):
-        """Hide one authoritative tracer at its canonical terminal point.
+        """Retire one authoritative tracer at its canonical terminal point.
 
         ``explosion`` carries ``(effectsDescr, effectMaterial, velocityDir)``
-        for a terminal on the world.  Retail plays the ground explosion from
-        ``ProjectileMover.explode``; ``hide`` deliberately clears
-        ``showExplosion``, so hiding alone can never produce one.  A vehicle
-        terminal passes None, because retail plays only the ``armorHit`` family
-        through the vehicle's own bound effects there.
+        for a terminal on the world.  Retail sends that terminal straight to
+        ``ProjectileMover.explode`` so its native ballistics simulator can
+        correct the impact point and schedule the material effect.  ``hide``
+        deliberately clears ``showExplosion`` and is reserved for vehicle or
+        effect-free terminals.  If the explosion call itself fails, hiding is
+        the safe fallback so a tracer cannot remain alive indefinitely.
         """
         if self._closed or projectile_id is None:
             return False
@@ -432,6 +433,10 @@ class _RemoteShotPresenter(object):
             return False
         self._projectile_shots.pop(projectile_id, None)
         mover = self._mover
+        if mover is None:
+            return False
+        if self._explode_canonical(mover, shot_id, end, explosion):
+            return True
         callback = getattr(mover, 'hide', None) if mover is not None else None
         if not callable(callback):
             return False
@@ -439,16 +444,15 @@ class _RemoteShotPresenter(object):
             callback(shot_id, end)
         except Exception:
             return False
-        self._explode_canonical(mover, shot_id, end, explosion)
         return True
 
     def _explode_canonical(self, mover, shot_id, end, explosion):
         """Play the retail ground explosion for one world terminal.
 
-        ``hide`` re-keys the entry, so ``explode`` no longer finds the
-        projectile and takes its own synthetic-record branch, which reaches
-        ``__addExplosionEffect`` immediately.  The only difference from a
-        server-driven explosion is that the effect carries no attacker id.
+        Keeping the positive shot id alive is important: the retail method
+        first asks ``PyBallisticsSimulator.explodeProjectile`` for its corrected
+        terminal point and direction, or marks the live projectile to render
+        the explosion from the native terminal callback.
         """
         if not explosion:
             return False

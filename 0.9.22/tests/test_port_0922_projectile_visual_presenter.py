@@ -30,9 +30,13 @@ class _Vector(object):
     def scale(self, value):
         return _Vector(self.x * value, self.y * value, self.z * value)
 
+    @property
+    def length(self):
+        return math.sqrt(self.x * self.x + self.y * self.y +
+                         self.z * self.z)
+
     def normalise(self):
-        length = math.sqrt(self.x * self.x + self.y * self.y +
-                           self.z * self.z)
+        length = self.length
         if length:
             self.x /= length
             self.y /= length
@@ -61,6 +65,8 @@ class _ProjectileMover(object):
     def __init__(self):
         self.calls = []
         self.hide_calls = []
+        self.explode_calls = []
+        self.explode_error = None
         self.destroy_calls = 0
         self.__class__.instances.append(self)
 
@@ -69,6 +75,11 @@ class _ProjectileMover(object):
 
     def hide(self, *args):
         self.hide_calls.append(args)
+
+    def explode(self, *args):
+        self.explode_calls.append(args)
+        if self.explode_error is not None:
+            raise self.explode_error
 
     def destroy(self):
         self.destroy_calls += 1
@@ -202,6 +213,50 @@ class ProjectileVisualPresenterTests(unittest.TestCase):
             self.assertEqual(visual_id, hidden_id)
             self.assertEqual((80.0, 12.0, 0.0),
                              (hidden_at.x, hidden_at.y, hidden_at.z))
+
+    def test_world_terminal_uses_native_explode_without_hiding_first(self):
+        effects = {'groundHit': ('stages', 'effect', None)}
+        with mock.patch.dict(sys.modules, _modules({7: effects})):
+            factory = self._factory()
+            visual_id = factory.play_projectile_tracer(
+                _descriptor(), 0, (0.0, 1.0, 0.0),
+                (100.0, -5.0, 0.0), 9.81, 640.0, 42,
+                'world-shot')
+            mover = _ProjectileMover.instances[0]
+
+            self.assertTrue(factory.stop_projectile_tracer(
+                'world-shot', (12.0, 0.0, 3.0),
+                explosion=(effects, 'ground', (2.0, -2.0, 0.0))))
+
+            self.assertEqual([], mover.hide_calls)
+            self.assertEqual(1, len(mover.explode_calls))
+            args = mover.explode_calls[0]
+            self.assertEqual(visual_id, args[0])
+            self.assertIs(effects, args[1])
+            self.assertEqual('ground', args[2])
+            self.assertEqual((12.0, 0.0, 3.0),
+                             (args[3].x, args[3].y, args[3].z))
+            self.assertAlmostEqual(1.0, math.sqrt(
+                args[4].x ** 2 + args[4].y ** 2 + args[4].z ** 2))
+
+    def test_failed_world_explosion_hides_the_live_tracer(self):
+        effects = {'groundHit': ('stages', 'effect', None)}
+        with mock.patch.dict(sys.modules, _modules({7: effects})):
+            factory = self._factory()
+            visual_id = factory.play_projectile_tracer(
+                _descriptor(), 0, (0.0, 1.0, 0.0),
+                (100.0, -5.0, 0.0), 9.81, 640.0, 42,
+                'failed-world-shot')
+            mover = _ProjectileMover.instances[0]
+            mover.explode_error = RuntimeError('native explosion failed')
+
+            self.assertTrue(factory.stop_projectile_tracer(
+                'failed-world-shot', (12.0, 0.0, 3.0),
+                explosion=(effects, 'ground', (2.0, -2.0, 0.0))))
+
+            self.assertEqual(1, len(mover.explode_calls))
+            self.assertEqual(1, len(mover.hide_calls))
+            self.assertEqual(visual_id, mover.hide_calls[0][0])
 
     def test_remote_launch_without_transient_values_keeps_legacy_path(self):
         with mock.patch.dict(sys.modules, _modules()):
